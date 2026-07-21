@@ -1535,6 +1535,113 @@ mod tests {
         let (key_shape, _) = decode[3].try_extract_tensor::<f32>().unwrap();
         assert_eq!(conv_shape.as_ref(), &[3, 2]);
         assert_eq!(key_shape.as_ref(), &[2, 1, hidden as i64]);
+
+        let external = crate::encode_external_qwen_causal_lm(base).unwrap();
+        let directory = TestDirectory::new();
+        let model_path = directory.0.join("model.onnx");
+        std::fs::write(&model_path, external.model_bytes).unwrap();
+        std::fs::write(directory.0.join("weights.bin"), external.weights_bytes).unwrap();
+        let mut external_session = ort::session::Session::builder()
+            .unwrap()
+            .with_operators(tritium_operator_domain().unwrap())
+            .unwrap()
+            .commit_from_file(&model_path)
+            .unwrap();
+        let token = Tensor::from_array(([1], vec![0_i64])).unwrap();
+        let conv = Tensor::from_array(([3, 2], vec![0.0_f32; 6])).unwrap();
+        let recurrent = Tensor::from_array(([1, 1, 1], vec![0.0_f32])).unwrap();
+        let external_prompt = external_session
+            .run(ort::inputs![&token, &conv, &recurrent])
+            .unwrap();
+        let (_, external_logits) = external_prompt[0].try_extract_tensor::<f32>().unwrap();
+        assert_f32_close(external_logits, &[2.0, -2.0], 2.0e-5);
+        let (_, external_conv) = external_prompt[1].try_extract_tensor::<f32>().unwrap();
+        let (_, external_recurrent) = external_prompt[2].try_extract_tensor::<f32>().unwrap();
+        assert_f32_close(external_conv, &[0.0, 0.2, 0.0, -0.3, 0.0, 0.4], 1.0e-6);
+        assert_f32_close(external_recurrent, &[-0.111_317_93], 2.0e-6);
+
+        let mut mtp_fusion_rows = vec![zero(hidden * 2); hidden];
+        for (row, values) in mtp_fusion_rows.iter_mut().enumerate() {
+            values[row] = Trit::from_i8(1).unwrap();
+        }
+        let mtp_fusion_packed = pack_rows(&mtp_fusion_rows, format);
+        let mtp_fusion_scales = vec![1.0; hidden];
+        let mtp_model = crate::Qwen35MtpModel {
+            tokens: 1,
+            past_tokens: 0,
+            n_head: base.n_head,
+            n_kv_head: base.n_kv_head,
+            head_dim: base.head_dim,
+            rotary: base.rotary,
+            rms_epsilon: base.rms_epsilon,
+            embedding: base.embedding,
+            lm_head: base.embedding,
+            mtp: crate::Qwen35MtpDecoder {
+                pre_fc_norm_embedding: &zero_norm,
+                pre_fc_norm_hidden: &zero_norm,
+                fusion: matrix(hidden, hidden * 2, &mtp_fusion_packed, &mtp_fusion_scales),
+                layer: full,
+                final_norm: &final_norm,
+            },
+            identity,
+        };
+        let bundle = crate::encode_external_qwen35_bundle(
+            crate::QwenCausalLmModel {
+                lm_head: Some(base.embedding),
+                ..base
+            },
+            mtp_model,
+        )
+        .unwrap();
+        let bundle_directory = TestDirectory::new();
+        let language_path = bundle_directory.0.join("language.onnx");
+        let mtp_path = bundle_directory.0.join("mtp.onnx");
+        std::fs::write(&language_path, &bundle.language_model_bytes).unwrap();
+        std::fs::write(&mtp_path, &bundle.mtp_model_bytes).unwrap();
+        std::fs::write(
+            bundle_directory.0.join("weights.bin"),
+            &bundle.weights_bytes,
+        )
+        .unwrap();
+        let mut bundled_language = ort::session::Session::builder()
+            .unwrap()
+            .with_operators(tritium_operator_domain().unwrap())
+            .unwrap()
+            .commit_from_file(&language_path)
+            .unwrap();
+        let token = Tensor::from_array(([1], vec![0_i64])).unwrap();
+        let conv = Tensor::from_array(([3, 2], vec![0.0_f32; 6])).unwrap();
+        let recurrent = Tensor::from_array(([1, 1, 1], vec![0.0_f32])).unwrap();
+        let bundled_prompt = bundled_language
+            .run(ort::inputs![&token, &conv, &recurrent])
+            .unwrap();
+        let (_, bundled_logits) = bundled_prompt[0].try_extract_tensor::<f32>().unwrap();
+        assert_f32_close(bundled_logits, &[2.0, -2.0], 2.0e-5);
+
+        let inline_mtp = crate::encode_qwen35_mtp(mtp_model).unwrap();
+        let mut inline_mtp_session = ort::session::Session::builder()
+            .unwrap()
+            .with_operators(tritium_operator_domain().unwrap())
+            .unwrap()
+            .commit_from_memory(&inline_mtp)
+            .unwrap();
+        let mut bundled_mtp = ort::session::Session::builder()
+            .unwrap()
+            .with_operators(tritium_operator_domain().unwrap())
+            .unwrap()
+            .commit_from_file(&mtp_path)
+            .unwrap();
+        let shifted = Tensor::from_array(([1], vec![0_i64])).unwrap();
+        let target = Tensor::from_array(([1, hidden], vec![0.0_f32; hidden])).unwrap();
+        let inline_outputs = inline_mtp_session
+            .run(ort::inputs![&shifted, &target])
+            .unwrap();
+        let bundled_outputs = bundled_mtp.run(ort::inputs![&shifted, &target]).unwrap();
+        for index in 0..4 {
+            let (_, inline) = inline_outputs[index].try_extract_tensor::<f32>().unwrap();
+            let (_, bundled) = bundled_outputs[index].try_extract_tensor::<f32>().unwrap();
+            assert_f32_close(bundled, inline, 0.0);
+        }
     }
 
     #[test]
@@ -1605,13 +1712,31 @@ mod tests {
         let fused_query_gate_packed = pack_rows(&fused_query_gate_rows, format);
 
         let key_rows = (0..hidden)
-            .map(|row| basis((row + 1) % hidden, if row % 2 == 0 { 1 } else { -1 }, hidden))
+            .map(|row| {
+                basis(
+                    (row + 1) % hidden,
+                    if row % 2 == 0 { 1 } else { -1 },
+                    hidden,
+                )
+            })
             .collect::<Vec<_>>();
         let value_rows = (0..hidden)
-            .map(|row| basis((row + 4) % hidden, if row % 3 == 0 { -1 } else { 1 }, hidden))
+            .map(|row| {
+                basis(
+                    (row + 4) % hidden,
+                    if row % 3 == 0 { -1 } else { 1 },
+                    hidden,
+                )
+            })
             .collect::<Vec<_>>();
         let output_rows = (0..hidden)
-            .map(|row| basis((row + 2) % hidden, if row % 4 == 0 { -1 } else { 1 }, hidden))
+            .map(|row| {
+                basis(
+                    (row + 2) % hidden,
+                    if row % 4 == 0 { -1 } else { 1 },
+                    hidden,
+                )
+            })
             .collect::<Vec<_>>();
         let projection_scales = (0..hidden)
             .map(|row| 0.16 + 0.004 * row as f32)
@@ -1627,7 +1752,13 @@ mod tests {
             .map(|row| basis((row + 1) % hidden, 1, hidden))
             .collect::<Vec<_>>();
         let down_rows = (0..hidden)
-            .map(|row| basis((row + 3) % hidden, if row % 3 == 0 { -1 } else { 1 }, hidden))
+            .map(|row| {
+                basis(
+                    (row + 3) % hidden,
+                    if row % 3 == 0 { -1 } else { 1 },
+                    hidden,
+                )
+            })
             .collect::<Vec<_>>();
         let ffn_scales = (0..hidden)
             .map(|row| 0.11 + 0.005 * row as f32)
@@ -1723,8 +1854,7 @@ mod tests {
                 .iter()
                 .flat_map(|token| dense_embedding[*token as usize].iter().copied())
                 .collect::<Vec<_>>();
-            let normalized_embedding =
-                rms_norm(&embedded, &pre_embedding_norm, 1.0e-6, true);
+            let normalized_embedding = rms_norm(&embedded, &pre_embedding_norm, 1.0e-6, true);
             let normalized_target = rms_norm(target, &pre_hidden_norm, 1.0e-6, true);
             let concatenated = normalized_embedding
                 .chunks_exact(hidden)
@@ -1800,6 +1930,36 @@ mod tests {
         let (_, present_v) = prompt[3].try_extract_tensor::<f32>().unwrap();
         assert_f32_close(present_k, &expected_k, 2.0e-4);
         assert_f32_close(present_v, &expected_v, 2.0e-4);
+        let external = crate::encode_external_qwen35_mtp(base).unwrap();
+        let directory = TestDirectory::new();
+        let model_path = directory.0.join("model.onnx");
+        std::fs::write(&model_path, external.model_bytes).unwrap();
+        std::fs::write(directory.0.join("weights.bin"), external.weights_bytes).unwrap();
+        let mut external_session = ort::session::Session::builder()
+            .unwrap()
+            .with_operators(tritium_operator_domain().unwrap())
+            .unwrap()
+            .commit_from_file(&model_path)
+            .unwrap();
+        let shifted_tokens = Tensor::from_array(([2], vec![0_i64, 1])).unwrap();
+        let target_hidden = Tensor::from_array((
+            [2, hidden],
+            (0..2 * hidden)
+                .map(|lane| ((lane % 7) as f32 - 3.0) * 0.17)
+                .collect::<Vec<_>>(),
+        ))
+        .unwrap();
+        let external_prompt = external_session
+            .run(ort::inputs![&shifted_tokens, &target_hidden])
+            .unwrap();
+        let (_, external_logits) = external_prompt[0].try_extract_tensor::<f32>().unwrap();
+        let (_, external_hidden) = external_prompt[1].try_extract_tensor::<f32>().unwrap();
+        let (_, external_k) = external_prompt[2].try_extract_tensor::<f32>().unwrap();
+        let (_, external_v) = external_prompt[3].try_extract_tensor::<f32>().unwrap();
+        assert_f32_close(external_logits, &expected_logits, 2.0e-4);
+        assert_f32_close(external_hidden, &expected_logits, 2.0e-4);
+        assert_f32_close(external_k, &expected_k, 2.0e-4);
+        assert_f32_close(external_v, &expected_v, 2.0e-4);
         let present_k = present_k.to_vec();
         let present_v = present_v.to_vec();
         drop(prompt);
@@ -1828,7 +1988,10 @@ mod tests {
             &vec![0.0; present_k.len()],
             &vec![0.0; present_v.len()],
         );
-        assert_ne!(expected_logits, zero_cache_logits, "decode must consume KV cache");
+        assert_ne!(
+            expected_logits, zero_cache_logits,
+            "decode must consume KV cache"
+        );
         let shifted_tokens = Tensor::from_array(([1], decode_tokens.into_boxed_slice())).unwrap();
         let target_hidden =
             Tensor::from_array(([1, hidden], decode_target.into_boxed_slice())).unwrap();

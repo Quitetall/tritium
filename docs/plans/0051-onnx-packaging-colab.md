@@ -114,9 +114,8 @@ head-interleaved query/gate rows are split in graph before Q normalization and
 sigmoid output gating, with independent-reference ORT parity and a typed
 projection contract that makes contradictory separate gate weights
 unrepresentable. Residual and query widths are independent, covering Qwen's
-5120-wide stream and 24x256 query geometry. Multi-layer large-model external-data
-packaging, remaining Qwen graph extensions, dynamic axes and end-user
-generation APIs remain open.
+5120-wide stream and 24x256 query geometry. Dynamic axes and end-user generation
+APIs remain open.
 
 The projected Qwen Gated DeltaNet recurrent core is now a registered opset-2
 custom operator. Packed QKV/Z/beta/decay/output projections remain composable
@@ -142,8 +141,12 @@ final hidden rows and untied drafter logits execute for prompt and cached decode
 through real ORT. A nondegenerate dense oracle uses both fusion halves, nonzero
 Q/K/V/O and SwiGLU projections, and cache-sensitive continuation; logits, final
 hidden rows and every prompt/decode K/V value must match. External-data emission
-and packaging both language and MTP graphs into one admitted artifact remain
-open.
+now produces `language.onnx`, `mtp.onnx` and one authenticated `weights.bin`.
+Shared embedding/head ranges are stored once and referenced by both graphs;
+strict union-range admission rejects gaps, partial/unauthorized overlaps,
+identity/geometry/RMS-epsilon drift, noncanonical attention cadence and any of
+three manifest-digest mismatches. Real ORT loads both file-backed graphs from
+the shared arena and matches inline execution.
 
 Upgrade `tritium-onnx` from a single reference custom op to a versioned operator
 domain plus whole-model loader:

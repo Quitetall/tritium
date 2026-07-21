@@ -26,6 +26,12 @@ const EXTERNAL_DATA: i32 = 1;
 const EXTERNAL_WEIGHTS_FILE: &str = "weights.bin";
 const EXTERNAL_ALIGNMENT: usize = 64;
 const MAX_MODEL_BYTES: usize = 64 * 1024 * 1024;
+const QWEN_SHARED_EXTERNAL_INITIALIZERS: [&str; 4] = [
+    "tok_embeddings.packed",
+    "tok_embeddings.scales",
+    "lm_head.packed",
+    "lm_head.scales",
+];
 
 /// A deterministic tied packed embedding/head graph.
 ///
@@ -1654,6 +1660,30 @@ pub struct ExternalOnnxModel {
     pub weights_blake3: [u8; 32],
 }
 
+/// External Qwen language and MTP graphs sharing one deduplicated weight arena.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalQwen35Bundle {
+    /// Canonical `language.onnx` bytes.
+    pub language_model_bytes: Vec<u8>,
+    /// Canonical `mtp.onnx` bytes.
+    pub mtp_model_bytes: Vec<u8>,
+    /// Shared `weights.bin`; embedding/head ranges are referenced by both graphs.
+    pub weights_bytes: Vec<u8>,
+    /// BLAKE3 digest of shared `weights.bin`, bound by both graphs.
+    pub weights_blake3: [u8; 32],
+}
+
+/// Borrowed three-file Qwen language-plus-MTP package presented for admission.
+#[derive(Debug, Clone, Copy)]
+pub struct ExternalQwen35BundleFiles<'a> {
+    /// Candidate `language.onnx` bytes.
+    pub language_model_bytes: &'a [u8],
+    /// Candidate `mtp.onnx` bytes.
+    pub mtp_model_bytes: &'a [u8],
+    /// Candidate shared `weights.bin` bytes.
+    pub weights_bytes: &'a [u8],
+}
+
 /// Receipt from strict external ONNX model/data verification.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedExternalOnnxModel {
@@ -1731,6 +1761,26 @@ pub struct AdmittedExternalCausalLmDigests {
     pub model_blake3: [u8; 32],
     /// Admitted `weights.bin` BLAKE3.
     pub weights_blake3: [u8; 32],
+}
+
+/// Three Qwen ONNX file digests copied from one authenticated package manifest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdmittedExternalQwen35BundleDigests {
+    /// Admitted `language.onnx` BLAKE3.
+    pub language_model_blake3: [u8; 32],
+    /// Admitted `mtp.onnx` BLAKE3.
+    pub mtp_model_blake3: [u8; 32],
+    /// Admitted shared `weights.bin` BLAKE3.
+    pub weights_blake3: [u8; 32],
+}
+
+/// Receipt proving both external Qwen graphs belong to one admitted artifact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedExternalQwen35Bundle {
+    /// Verified heterogeneous language graph and external data.
+    pub language: VerifiedExternalCausalLmModel,
+    /// Verified one-layer MTP graph and external data.
+    pub mtp: VerifiedExternalCausalLmModel,
 }
 
 /// Category of one unsupported ONNX graph item.
@@ -2004,9 +2054,7 @@ pub fn diagnose_unsupported_graph(
                             subject,
                             reason: format!(
                                 "{} concat axis must be {}, got {}",
-                                role.label,
-                                role.axis,
-                                attribute.value
+                                role.label, role.axis, attribute.value
                             ),
                         });
                     }
@@ -2634,7 +2682,7 @@ pub fn encode_qwen_deltanet_layer(
 pub fn encode_qwen_causal_lm(model: QwenCausalLmModel<'_>) -> Result<Vec<u8>, OnnxModelError> {
     validate_qwen_causal_lm(&model)?;
     build_qwen_causal_lm_graph(model, CausalGraphBuilder::counting())?;
-    let protobuf = build_qwen_causal_lm_graph(model, CausalGraphBuilder::default())?;
+    let (protobuf, _) = build_qwen_causal_lm_graph(model, CausalGraphBuilder::default())?;
     let encoded = protobuf.encode_to_vec();
     if encoded.len() > MAX_MODEL_BYTES {
         return Err(OnnxModelError::InvalidModel(format!(
@@ -2655,7 +2703,7 @@ pub fn encode_qwen_causal_lm(model: QwenCausalLmModel<'_>) -> Result<Vec<u8>, On
 pub fn encode_qwen35_mtp(model: Qwen35MtpModel<'_>) -> Result<Vec<u8>, OnnxModelError> {
     validate_qwen35_mtp_model(&model)?;
     build_qwen35_mtp_graph(model, CausalGraphBuilder::counting())?;
-    let protobuf = build_qwen35_mtp_graph(model, CausalGraphBuilder::default())?;
+    let (protobuf, _) = build_qwen35_mtp_graph(model, CausalGraphBuilder::default())?;
     let encoded = protobuf.encode_to_vec();
     if encoded.len() > MAX_MODEL_BYTES {
         return Err(OnnxModelError::InvalidModel(format!(
@@ -2663,6 +2711,87 @@ pub fn encode_qwen35_mtp(model: Qwen35MtpModel<'_>) -> Result<Vec<u8>, OnnxModel
         )));
     }
     Ok(encoded)
+}
+
+/// Encode heterogeneous Qwen language graph with authenticated external data.
+///
+/// # Errors
+/// [`OnnxModelError`] if model validation, external allocation, or protobuf
+/// encoding fails.
+pub fn encode_external_qwen_causal_lm(
+    model: QwenCausalLmModel<'_>,
+) -> Result<ExternalOnnxModel, OnnxModelError> {
+    validate_qwen_causal_lm(&model)?;
+    let (protobuf, weights) = build_qwen_causal_lm_graph(model, CausalGraphBuilder::external())?;
+    finish_external_model(protobuf, weights)
+}
+
+/// Encode Qwen MTP graph with authenticated external data.
+///
+/// # Errors
+/// [`OnnxModelError`] if model validation, external allocation, or protobuf
+/// encoding fails.
+pub fn encode_external_qwen35_mtp(
+    model: Qwen35MtpModel<'_>,
+) -> Result<ExternalOnnxModel, OnnxModelError> {
+    validate_qwen35_mtp_model(&model)?;
+    let (protobuf, weights) = build_qwen35_mtp_graph(model, CausalGraphBuilder::external())?;
+    finish_external_model(protobuf, weights)
+}
+
+/// Encode matching Qwen language and MTP graphs as one three-file bundle.
+///
+/// # Errors
+/// [`OnnxModelError`] if graph identities, geometry, shared embedding/head, or
+/// external-data encoding differ from bundle contract.
+pub fn encode_external_qwen35_bundle(
+    language: QwenCausalLmModel<'_>,
+    mtp: Qwen35MtpModel<'_>,
+) -> Result<ExternalQwen35Bundle, OnnxModelError> {
+    validate_qwen35_bundle_pair(&language, &mtp)?;
+    let (language_protobuf, language_weights) =
+        build_qwen_causal_lm_graph(language, CausalGraphBuilder::external())?;
+    let language_weights = language_weights.ok_or_else(|| {
+        OnnxModelError::InvalidModel("Qwen language bundle used inline storage".to_owned())
+    })?;
+    let aliases = qwen_shared_external_aliases(&language_protobuf)?;
+    let (mtp_protobuf, weights) = build_qwen35_mtp_graph(
+        mtp,
+        CausalGraphBuilder::external_reusing(language_weights, aliases),
+    )?;
+    let weights_bytes = weights.ok_or_else(|| {
+        OnnxModelError::InvalidModel("Qwen MTP bundle used inline storage".to_owned())
+    })?;
+    let weights_blake3 = *blake3::hash(&weights_bytes).as_bytes();
+    Ok(ExternalQwen35Bundle {
+        language_model_bytes: bind_external_metadata(language_protobuf, &weights_bytes)?,
+        mtp_model_bytes: bind_external_metadata(mtp_protobuf, &weights_bytes)?,
+        weights_bytes,
+        weights_blake3,
+    })
+}
+
+fn qwen_shared_external_aliases(
+    protobuf: &ModelProto,
+) -> Result<BTreeMap<String, TensorProto>, OnnxModelError> {
+    let graph = protobuf
+        .graph
+        .as_ref()
+        .ok_or_else(|| OnnxModelError::InvalidModel("Qwen language graph is absent".to_owned()))?;
+    let mut aliases = BTreeMap::new();
+    for name in QWEN_SHARED_EXTERNAL_INITIALIZERS {
+        let tensor = graph
+            .initializer
+            .iter()
+            .find(|tensor| tensor.name == name)
+            .ok_or_else(|| {
+                OnnxModelError::InvalidModel(format!(
+                    "Qwen language graph lacks shared initializer {name}"
+                ))
+            })?;
+        aliases.insert(name.to_owned(), tensor.clone());
+    }
+    Ok(aliases)
 }
 
 /// Encode a causal LM with weight/value initializers in authenticated `weights.bin`.
@@ -2679,14 +2808,31 @@ pub fn encode_external_causal_lm(
     model: CausalLmModel<'_>,
 ) -> Result<ExternalOnnxModel, OnnxModelError> {
     validate_causal_lm(&model)?;
-    let (mut protobuf, weights) = build_causal_lm_graph(model, true)?;
+    let (protobuf, weights) = build_causal_lm_graph(model, true)?;
+    finish_external_model(protobuf, weights)
+}
+
+fn finish_external_model(
+    protobuf: ModelProto,
+    weights: Option<Vec<u8>>,
+) -> Result<ExternalOnnxModel, OnnxModelError> {
     let weights_bytes = weights.ok_or_else(|| {
         OnnxModelError::InvalidModel("external graph builder returned inline storage".to_owned())
     })?;
     let weights_blake3 = *blake3::hash(&weights_bytes).as_bytes();
-    let digest = blake3::Hash::from_bytes(weights_blake3)
-        .to_hex()
-        .to_string();
+    let model_bytes = bind_external_metadata(protobuf, &weights_bytes)?;
+    Ok(ExternalOnnxModel {
+        model_bytes,
+        weights_bytes,
+        weights_blake3,
+    })
+}
+
+fn bind_external_metadata(
+    mut protobuf: ModelProto,
+    weights_bytes: &[u8],
+) -> Result<Vec<u8>, OnnxModelError> {
+    let digest = blake3::hash(weights_bytes).to_hex().to_string();
     protobuf.metadata_props.extend([
         metadata("tritium.external_data.file", EXTERNAL_WEIGHTS_FILE),
         metadata(
@@ -2701,11 +2847,7 @@ pub fn encode_external_causal_lm(
             "protobuf exceeds {MAX_MODEL_BYTES} bytes"
         )));
     }
-    Ok(ExternalOnnxModel {
-        model_bytes,
-        weights_bytes,
-        weights_blake3,
-    })
+    Ok(model_bytes)
 }
 
 /// Verify an external causal-LM model before ONNX Runtime session creation.
@@ -2724,6 +2866,44 @@ pub fn verify_external_causal_lm(
     weights_bytes: &[u8],
     admitted: AdmittedExternalCausalLmDigests,
 ) -> Result<VerifiedExternalCausalLmModel, OnnxModelError> {
+    Ok(verify_external_decoder_graph(
+        model_bytes,
+        weights_bytes,
+        admitted,
+        "causal-lm",
+        ExternalRangePolicy::Exclusive,
+    )?
+    .receipt)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExternalRangePolicy {
+    Exclusive,
+    Shared,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VerifiedExternalInitializer {
+    name: String,
+    data_type: i32,
+    dimensions: Vec<i64>,
+    offset: usize,
+    length: usize,
+}
+
+struct VerifiedExternalDecoderGraph {
+    receipt: VerifiedExternalCausalLmModel,
+    metadata: BTreeMap<String, String>,
+    external_initializers: Vec<VerifiedExternalInitializer>,
+}
+
+fn verify_external_decoder_graph(
+    model_bytes: &[u8],
+    weights_bytes: &[u8],
+    admitted: AdmittedExternalCausalLmDigests,
+    expected_graph_kind: &str,
+    range_policy: ExternalRangePolicy,
+) -> Result<VerifiedExternalDecoderGraph, OnnxModelError> {
     if model_bytes.len() > MAX_MODEL_BYTES {
         return Err(OnnxModelError::InvalidModel(format!(
             "protobuf exceeds {MAX_MODEL_BYTES} bytes"
@@ -2756,7 +2936,7 @@ pub fn verify_external_causal_lm(
         }
     }
     require_metadata(&metadata, "tritium.schema_version", "2")?;
-    require_metadata(&metadata, "tritium.graph_kind", "causal-lm")?;
+    require_metadata(&metadata, "tritium.graph_kind", expected_graph_kind)?;
     require_metadata(
         &metadata,
         "tritium.external_data.file",
@@ -2789,6 +2969,7 @@ pub fn verify_external_causal_lm(
         .ok_or_else(|| OnnxModelError::InvalidModel("model has no graph".to_owned()))?;
     let mut cursor = 0_usize;
     let mut names = BTreeMap::new();
+    let mut external_initializers = Vec::new();
     for initializer in &graph.initializer {
         if names.insert(initializer.name.as_str(), ()).is_some() {
             return Err(OnnxModelError::InvalidModel(format!(
@@ -2836,76 +3017,18 @@ pub fn verify_external_causal_lm(
             }
             continue;
         }
-        if initializer.data_location != EXTERNAL_DATA || !initializer.raw_data.is_empty() {
-            return Err(OnnxModelError::ExternalDataMismatch(format!(
-                "initializer {} is not exclusively external",
-                initializer.name
-            )));
-        }
-        let mut entries = BTreeMap::new();
-        for entry in &initializer.external_data {
-            if entries
-                .insert(entry.key.as_str(), entry.value.as_str())
-                .is_some()
-            {
-                return Err(OnnxModelError::ExternalDataMismatch(format!(
-                    "initializer {} has duplicate external-data key {}",
-                    initializer.name, entry.key
-                )));
-            }
-        }
-        if entries.len() != 3 || entries.get("location") != Some(&EXTERNAL_WEIGHTS_FILE) {
-            return Err(OnnxModelError::ExternalDataMismatch(format!(
-                "initializer {} external-data descriptor is not canonical",
-                initializer.name
-            )));
-        }
-        let parse_range = |key: &str| {
-            let value = entries.get(key).ok_or_else(|| {
-                OnnxModelError::ExternalDataMismatch(format!(
-                    "initializer {} missing {key}",
-                    initializer.name
-                ))
-            })?;
-            let parsed = value.parse::<usize>().map_err(|_| {
-                OnnxModelError::ExternalDataMismatch(format!(
-                    "initializer {} {key} is not usize",
-                    initializer.name
-                ))
-            })?;
-            if parsed.to_string() != *value {
-                return Err(OnnxModelError::ExternalDataMismatch(format!(
-                    "initializer {} {key} is not canonical decimal",
-                    initializer.name
-                )));
-            }
-            Ok(parsed)
-        };
-        let offset = parse_range("offset")?;
-        let length = parse_range("length")?;
+        let (offset, length) = encoded_external_range(initializer)?;
         if length != expected_length {
             return Err(OnnxModelError::ExternalDataMismatch(format!(
                 "initializer {} length {length} differs from shape-derived {expected_length}",
                 initializer.name
             )));
         }
-        let expected_offset = align_up(cursor, EXTERNAL_ALIGNMENT)?;
-        if offset != expected_offset {
+        if offset % EXTERNAL_ALIGNMENT != 0 {
             return Err(OnnxModelError::ExternalDataMismatch(format!(
-                "initializer {} offset {offset} is not canonical {expected_offset}",
+                "initializer {} offset {offset} is not {EXTERNAL_ALIGNMENT}-byte aligned",
                 initializer.name
             )));
-        }
-        if offset > weights_bytes.len() {
-            return Err(OnnxModelError::ExternalDataMismatch(format!(
-                "initializer {} offset exceeds weights.bin",
-                initializer.name
-            )));
-        }
-        if weights_bytes[cursor..offset].iter().any(|&byte| byte != 0) {
-            return Err(OnnxModelError::ExternalDataMismatch(
-                "alignment padding is not zero".to_owned(),
-            ));
         }
         let end = offset
             .checked_add(length)
@@ -2916,9 +3039,30 @@ pub fn verify_external_causal_lm(
                 initializer.name
             )));
         }
-        cursor = end;
+        if range_policy == ExternalRangePolicy::Exclusive {
+            let expected_offset = align_up(cursor, EXTERNAL_ALIGNMENT)?;
+            if offset != expected_offset {
+                return Err(OnnxModelError::ExternalDataMismatch(format!(
+                    "initializer {} offset {offset} is not canonical {expected_offset}",
+                    initializer.name
+                )));
+            }
+            if weights_bytes[cursor..offset].iter().any(|&byte| byte != 0) {
+                return Err(OnnxModelError::ExternalDataMismatch(
+                    "alignment padding is not zero".to_owned(),
+                ));
+            }
+            cursor = end;
+        }
+        external_initializers.push(VerifiedExternalInitializer {
+            name: initializer.name.clone(),
+            data_type: initializer.data_type,
+            dimensions: initializer.dims.clone(),
+            offset,
+            length,
+        });
     }
-    if cursor != weights_bytes.len() {
+    if range_policy == ExternalRangePolicy::Exclusive && cursor != weights_bytes.len() {
         return Err(OnnxModelError::ExternalDataMismatch(
             "weights.bin has unreferenced trailing bytes".to_owned(),
         ));
@@ -2933,15 +3077,242 @@ pub fn verify_external_causal_lm(
             .to_owned(),
         deferred_coverage_id: metadata_value(&metadata, "tritium.coverage.deferred_id")?.to_owned(),
     };
-    Ok(VerifiedExternalCausalLmModel {
-        model_blake3: *actual_model_hash.as_bytes(),
-        weights_blake3: *actual_hash.as_bytes(),
-        weights_bytes: weights_bytes.len(),
-        tokens: parse_usize(&metadata, "tritium.tokens")?,
-        past_tokens: parse_usize(&metadata, "tritium.past_tokens")?,
-        layers: parse_usize(&metadata, "tritium.layers")?,
-        identity,
+    Ok(VerifiedExternalDecoderGraph {
+        receipt: VerifiedExternalCausalLmModel {
+            model_blake3: *actual_model_hash.as_bytes(),
+            weights_blake3: *actual_hash.as_bytes(),
+            weights_bytes: weights_bytes.len(),
+            tokens: parse_usize(&metadata, "tritium.tokens")?,
+            past_tokens: parse_usize(&metadata, "tritium.past_tokens")?,
+            layers: parse_usize(&metadata, "tritium.layers")?,
+            identity,
+        },
+        metadata,
+        external_initializers,
     })
+}
+
+/// Verify one externally admitted Qwen language-plus-MTP three-file bundle.
+///
+/// # Security
+/// `admitted` must come from one independently authenticated package manifest,
+/// never from candidate file metadata or the encoder's returned digests.
+///
+/// # Errors
+/// [`OnnxModelError`] if any digest, external range, graph role, identity, or
+/// shared execution geometry differs.
+pub fn verify_external_qwen35_bundle(
+    files: ExternalQwen35BundleFiles<'_>,
+    admitted: AdmittedExternalQwen35BundleDigests,
+) -> Result<VerifiedExternalQwen35Bundle, OnnxModelError> {
+    let require_digest = |bytes: &[u8], expected: [u8; 32], label: &str| {
+        if blake3::hash(bytes).as_bytes() != &expected {
+            return Err(OnnxModelError::ExternalDataMismatch(format!(
+                "{label} BLAKE3 differs from admitted package manifest"
+            )));
+        }
+        Ok(())
+    };
+    require_digest(
+        files.language_model_bytes,
+        admitted.language_model_blake3,
+        "language model",
+    )?;
+    require_digest(
+        files.mtp_model_bytes,
+        admitted.mtp_model_blake3,
+        "MTP model",
+    )?;
+    require_digest(
+        files.weights_bytes,
+        admitted.weights_blake3,
+        "bundle weights",
+    )?;
+    let language = verify_external_decoder_graph(
+        files.language_model_bytes,
+        files.weights_bytes,
+        AdmittedExternalCausalLmDigests {
+            model_blake3: admitted.language_model_blake3,
+            weights_blake3: admitted.weights_blake3,
+        },
+        "qwen-causal-lm",
+        ExternalRangePolicy::Shared,
+    )?;
+    let mtp = verify_external_decoder_graph(
+        files.mtp_model_bytes,
+        files.weights_bytes,
+        AdmittedExternalCausalLmDigests {
+            model_blake3: admitted.mtp_model_blake3,
+            weights_blake3: admitted.weights_blake3,
+        },
+        "qwen35-mtp",
+        ExternalRangePolicy::Shared,
+    )?;
+    verify_shared_qwen_ranges(&language, &mtp, files.weights_bytes)?;
+    require_metadata(
+        &language.metadata,
+        "tritium.rms_norm_weight_semantics",
+        "zero-centered-offset",
+    )?;
+    require_metadata(&language.metadata, "tritium.tied_embedding_head", "false")?;
+    require_metadata(
+        &mtp.metadata,
+        "tritium.input_alignment",
+        "caller-shifted-target-aligned",
+    )?;
+    require_metadata(
+        &mtp.metadata,
+        "tritium.rms_norm_weight_semantics",
+        "zero-centered-offset",
+    )?;
+    require_metadata(&mtp.metadata, "tritium.tied_embedding_head", "false")?;
+    if mtp.receipt.layers != 1 {
+        return Err(OnnxModelError::InvalidModel(format!(
+            "Qwen MTP bundle graph must contain one layer, got {}",
+            mtp.receipt.layers
+        )));
+    }
+    parse_positive_f32(&language.metadata, "tritium.rms_epsilon")?;
+    parse_positive_f32(&mtp.metadata, "tritium.rms_epsilon")?;
+    let interval = parse_usize(&language.metadata, "tritium.full_attention_interval")?;
+    let schedule = metadata_value(&language.metadata, "tritium.layer_schedule")?
+        .split(',')
+        .collect::<Vec<_>>();
+    if interval == 0
+        || !language.receipt.layers.is_multiple_of(interval)
+        || schedule.len() != language.receipt.layers
+        || schedule.iter().enumerate().any(|(index, layer)| {
+            let expected = if (index + 1).is_multiple_of(interval) {
+                "full_attention"
+            } else {
+                "linear_attention"
+            };
+            *layer != expected
+        })
+    {
+        return Err(OnnxModelError::InvalidModel(
+            "Qwen language layer schedule metadata is not canonical".to_owned(),
+        ));
+    }
+    if language.receipt.identity != mtp.receipt.identity
+        || language.receipt.tokens != mtp.receipt.tokens
+        || language.receipt.past_tokens != mtp.receipt.past_tokens
+    {
+        return Err(OnnxModelError::InvalidModel(
+            "Qwen language and MTP admission identity or execution shape differs".to_owned(),
+        ));
+    }
+    for key in [
+        "tritium.hidden",
+        "tritium.vocab",
+        "tritium.n_head",
+        "tritium.n_kv_head",
+        "tritium.head_dim",
+        "tritium.rotary_dim",
+        "tritium.rope_theta",
+        "tritium.rms_epsilon",
+    ] {
+        if metadata_value(&language.metadata, key)? != metadata_value(&mtp.metadata, key)? {
+            return Err(OnnxModelError::InvalidModel(format!(
+                "Qwen language and MTP metadata {key} differs"
+            )));
+        }
+    }
+    Ok(VerifiedExternalQwen35Bundle {
+        language: language.receipt,
+        mtp: mtp.receipt,
+    })
+}
+
+fn verify_shared_qwen_ranges(
+    language: &VerifiedExternalDecoderGraph,
+    mtp: &VerifiedExternalDecoderGraph,
+    weights: &[u8],
+) -> Result<(), OnnxModelError> {
+    let shared_names = QWEN_SHARED_EXTERNAL_INITIALIZERS;
+    fn find<'a>(
+        graph: &'a VerifiedExternalDecoderGraph,
+        name: &str,
+    ) -> Result<&'a VerifiedExternalInitializer, OnnxModelError> {
+        graph
+            .external_initializers
+            .iter()
+            .find(|initializer| initializer.name == name)
+            .ok_or_else(|| {
+                OnnxModelError::ExternalDataMismatch(format!(
+                    "Qwen bundle graph lacks shared initializer {name}"
+                ))
+            })
+    }
+    for name in shared_names {
+        if find(language, name)? != find(mtp, name)? {
+            return Err(OnnxModelError::ExternalDataMismatch(format!(
+                "Qwen shared initializer {name} has different descriptors"
+            )));
+        }
+    }
+    let mut ranges = language
+        .external_initializers
+        .iter()
+        .chain(&mtp.external_initializers)
+        .cloned()
+        .collect::<Vec<_>>();
+    ranges.sort_by(|left, right| {
+        (left.offset, left.length, left.name.as_str()).cmp(&(
+            right.offset,
+            right.length,
+            right.name.as_str(),
+        ))
+    });
+    let mut cursor = 0_usize;
+    let mut index = 0_usize;
+    while index < ranges.len() {
+        let range = &ranges[index];
+        let expected_offset = align_up(cursor, EXTERNAL_ALIGNMENT)?;
+        if range.offset != expected_offset {
+            return Err(OnnxModelError::ExternalDataMismatch(format!(
+                "shared initializer {} offset {} is not canonical {expected_offset}",
+                range.name, range.offset
+            )));
+        }
+        if weights[cursor..range.offset].iter().any(|&byte| byte != 0) {
+            return Err(OnnxModelError::ExternalDataMismatch(
+                "shared weights alignment padding is not zero".to_owned(),
+            ));
+        }
+        let mut next = index + 1;
+        while next < ranges.len() && ranges[next].offset == range.offset {
+            if ranges[next].length != range.length
+                || ranges[next].name != range.name
+                || !shared_names.contains(&range.name.as_str())
+            {
+                return Err(OnnxModelError::ExternalDataMismatch(format!(
+                    "initializer {} has noncanonical overlapping shared range",
+                    ranges[next].name
+                )));
+            }
+            next += 1;
+        }
+        if next - index > 2 {
+            return Err(OnnxModelError::ExternalDataMismatch(format!(
+                "initializer {} shared range is referenced more than twice",
+                range.name
+            )));
+        }
+        cursor = range
+            .offset
+            .checked_add(range.length)
+            .ok_or(OnnxModelError::ShapeOverflow(
+                "shared external initializer range",
+            ))?;
+        index = next;
+    }
+    if cursor != weights.len() {
+        return Err(OnnxModelError::ExternalDataMismatch(
+            "shared weights.bin has unreferenced trailing bytes".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 /// Encode a tied packed embedding/head graph with 64-byte-aligned initializers
@@ -3347,6 +3718,22 @@ fn parse_usize(metadata: &BTreeMap<String, String>, key: &str) -> Result<usize, 
     Ok(parsed)
 }
 
+fn parse_positive_f32(
+    metadata: &BTreeMap<String, String>,
+    key: &str,
+) -> Result<f32, OnnxModelError> {
+    let value = metadata_value(metadata, key)?;
+    let parsed = value
+        .parse::<f32>()
+        .map_err(|_| OnnxModelError::InvalidModel(format!("metadata {key} is not f32")))?;
+    if !parsed.is_finite() || parsed <= 0.0 || parsed.to_string() != value {
+        return Err(OnnxModelError::InvalidModel(format!(
+            "metadata {key} is not canonical positive f32"
+        )));
+    }
+    Ok(parsed)
+}
+
 fn encode_model(
     model: TiedEmbeddingHeadModel<'_>,
     initializer: Vec<TensorProto>,
@@ -3428,8 +3815,110 @@ struct CausalGraphBuilder {
 
 enum CausalInitializerStorage {
     Inline,
-    External(Vec<u8>),
+    External(ExternalInitializerStorage),
     Counting { bytes: usize },
+}
+
+struct ExternalInitializerStorage {
+    weights: Vec<u8>,
+    aliases: BTreeMap<String, TensorProto>,
+}
+
+fn encoded_external_range(tensor: &TensorProto) -> Result<(usize, usize), OnnxModelError> {
+    let mut entries = BTreeMap::new();
+    for entry in &tensor.external_data {
+        if entries
+            .insert(entry.key.as_str(), entry.value.as_str())
+            .is_some()
+        {
+            return Err(OnnxModelError::ExternalDataMismatch(format!(
+                "initializer {} has duplicate external-data key {}",
+                tensor.name, entry.key
+            )));
+        }
+    }
+    if tensor.data_location != EXTERNAL_DATA
+        || !tensor.raw_data.is_empty()
+        || entries.len() != 3
+        || entries.get("location") != Some(&EXTERNAL_WEIGHTS_FILE)
+    {
+        return Err(OnnxModelError::ExternalDataMismatch(format!(
+            "initializer {} external-data descriptor is not canonical",
+            tensor.name
+        )));
+    }
+    let parse = |key: &str| {
+        let value = entries.get(key).ok_or_else(|| {
+            OnnxModelError::ExternalDataMismatch(format!(
+                "initializer {} missing {key}",
+                tensor.name
+            ))
+        })?;
+        let parsed = value.parse::<usize>().map_err(|_| {
+            OnnxModelError::ExternalDataMismatch(format!(
+                "initializer {} {key} is not usize",
+                tensor.name
+            ))
+        })?;
+        if parsed.to_string() != *value {
+            return Err(OnnxModelError::ExternalDataMismatch(format!(
+                "initializer {} {key} is not canonical decimal",
+                tensor.name
+            )));
+        }
+        Ok(parsed)
+    };
+    Ok((parse("offset")?, parse("length")?))
+}
+
+fn take_external_alias(
+    storage: &mut ExternalInitializerStorage,
+    name: &str,
+    data_type: i32,
+    dimensions: &[i64],
+) -> Result<Option<(TensorProto, usize, usize)>, OnnxModelError> {
+    let Some(tensor) = storage.aliases.remove(name) else {
+        return Ok(None);
+    };
+    if tensor.data_type != data_type || tensor.dims != dimensions {
+        return Err(OnnxModelError::InvalidModel(format!(
+            "shared external initializer {name} dtype or shape differs"
+        )));
+    }
+    let (offset, length) = encoded_external_range(&tensor)?;
+    let end = offset
+        .checked_add(length)
+        .ok_or(OnnxModelError::ShapeOverflow(
+            "shared external initializer range",
+        ))?;
+    if end > storage.weights.len() {
+        return Err(OnnxModelError::ExternalDataMismatch(format!(
+            "shared external initializer {name} exceeds weight arena"
+        )));
+    }
+    Ok(Some((tensor, offset, length)))
+}
+
+fn external_storage_result(
+    storage: CausalInitializerStorage,
+) -> Result<Option<Vec<u8>>, OnnxModelError> {
+    match storage {
+        CausalInitializerStorage::External(storage) => {
+            if !storage.aliases.is_empty() {
+                return Err(OnnxModelError::InvalidModel(format!(
+                    "shared external initializers were not consumed: {}",
+                    storage
+                        .aliases
+                        .keys()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
+            }
+            Ok(Some(storage.weights))
+        }
+        CausalInitializerStorage::Inline | CausalInitializerStorage::Counting { .. } => Ok(None),
+    }
 }
 
 fn reserve_external_range(weights: &mut Vec<u8>, length: usize) -> Result<usize, OnnxModelError> {
@@ -3600,7 +4089,20 @@ impl CausalGraphBuilder {
 
     fn external() -> Self {
         Self {
-            storage: CausalInitializerStorage::External(Vec::new()),
+            storage: CausalInitializerStorage::External(ExternalInitializerStorage {
+                weights: Vec::new(),
+                aliases: BTreeMap::new(),
+            }),
+            ..Self::default()
+        }
+    }
+
+    fn external_reusing(weights: Vec<u8>, aliases: BTreeMap<String, TensorProto>) -> Self {
+        Self {
+            storage: CausalInitializerStorage::External(ExternalInitializerStorage {
+                weights,
+                aliases,
+            }),
             ..Self::default()
         }
     }
@@ -3644,34 +4146,55 @@ impl CausalGraphBuilder {
             CausalInitializerStorage::Inline => {
                 inline_tensor(name, data_type, dimensions, bytes.to_vec())
             }
-            CausalInitializerStorage::External(weights) => {
-                let offset = match reserve_external_range(weights, bytes.len()) {
-                    Ok(offset) => offset,
+            CausalInitializerStorage::External(storage) => {
+                match take_external_alias(storage, name, data_type, &dimensions) {
+                    Ok(Some((tensor, offset, length))) => {
+                        if length != bytes.len()
+                            || storage.weights[offset..offset + length] != *bytes
+                        {
+                            self.failure
+                                .get_or_insert(OnnxModelError::InvalidModel(format!(
+                                    "shared external initializer {name} bytes differ"
+                                )));
+                            return;
+                        }
+                        tensor
+                    }
+                    Ok(None) => {
+                        let offset = match reserve_external_range(&mut storage.weights, bytes.len())
+                        {
+                            Ok(offset) => offset,
+                            Err(error) => {
+                                self.failure.get_or_insert(error);
+                                return;
+                            }
+                        };
+                        storage.weights.extend_from_slice(bytes);
+                        let offset = match i64::try_from(offset) {
+                            Ok(offset) => offset,
+                            Err(_) => {
+                                self.failure.get_or_insert(OnnxModelError::ShapeOverflow(
+                                    "external initializer offset",
+                                ));
+                                return;
+                            }
+                        };
+                        let length = match i64::try_from(bytes.len()) {
+                            Ok(length) => length,
+                            Err(_) => {
+                                self.failure.get_or_insert(OnnxModelError::ShapeOverflow(
+                                    "external initializer length",
+                                ));
+                                return;
+                            }
+                        };
+                        external_tensor(name, data_type, dimensions, offset, length)
+                    }
                     Err(error) => {
                         self.failure.get_or_insert(error);
                         return;
                     }
-                };
-                weights.extend_from_slice(bytes);
-                let offset = match i64::try_from(offset) {
-                    Ok(offset) => offset,
-                    Err(_) => {
-                        self.failure.get_or_insert(OnnxModelError::ShapeOverflow(
-                            "external initializer offset",
-                        ));
-                        return;
-                    }
-                };
-                let length = match i64::try_from(bytes.len()) {
-                    Ok(length) => length,
-                    Err(_) => {
-                        self.failure.get_or_insert(OnnxModelError::ShapeOverflow(
-                            "external initializer length",
-                        ));
-                        return;
-                    }
-                };
-                external_tensor(name, data_type, dimensions, offset, length)
+                }
             }
             CausalInitializerStorage::Counting { .. } => unreachable!(),
         };
@@ -3731,10 +4254,34 @@ impl CausalGraphBuilder {
                 return;
             }
         };
-        let CausalInitializerStorage::External(weights) = &mut self.storage else {
+        let CausalInitializerStorage::External(storage) = &mut self.storage else {
             unreachable!();
         };
-        let offset = match reserve_external_range(weights, length) {
+        match take_external_alias(storage, name, TENSOR_FLOAT, &dimensions) {
+            Ok(Some((tensor, offset, alias_length))) => {
+                let bytes = &storage.weights[offset..offset + alias_length];
+                if alias_length != length
+                    || !bytes
+                        .chunks_exact(core::mem::size_of::<f32>())
+                        .zip(values)
+                        .all(|(bytes, value)| bytes == value.to_le_bytes())
+                {
+                    self.failure
+                        .get_or_insert(OnnxModelError::InvalidModel(format!(
+                            "shared external initializer {name} values differ"
+                        )));
+                    return;
+                }
+                self.initializers.push(tensor);
+                return;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                self.failure.get_or_insert(error);
+                return;
+            }
+        }
+        let offset = match reserve_external_range(&mut storage.weights, length) {
             Ok(offset) => offset,
             Err(error) => {
                 self.failure.get_or_insert(error);
@@ -3742,7 +4289,7 @@ impl CausalGraphBuilder {
             }
         };
         for value in values {
-            weights.extend_from_slice(&value.to_le_bytes());
+            storage.weights.extend_from_slice(&value.to_le_bytes());
         }
         let Ok(offset) = i64::try_from(offset) else {
             self.failure
@@ -3820,10 +4367,10 @@ impl CausalGraphBuilder {
                 return;
             }
         };
-        let CausalInitializerStorage::External(weights) = &mut self.storage else {
+        let CausalInitializerStorage::External(storage) = &mut self.storage else {
             unreachable!();
         };
-        let offset = match reserve_external_range(weights, length) {
+        let offset = match reserve_external_range(&mut storage.weights, length) {
             Ok(offset) => offset,
             Err(error) => {
                 self.failure.get_or_insert(error);
@@ -3845,7 +4392,7 @@ impl CausalGraphBuilder {
                 } else {
                     -1.0e9
                 };
-                weights.extend_from_slice(&value.to_le_bytes());
+                storage.weights.extend_from_slice(&value.to_le_bytes());
             }
         }
         self.initializers.push(external_tensor(
@@ -3883,13 +4430,13 @@ impl CausalGraphBuilder {
                 return;
             }
         };
-        let CausalInitializerStorage::External(weights) = &mut self.storage else {
+        let CausalInitializerStorage::External(storage) = &mut self.storage else {
             self.failure.get_or_insert(OnnxModelError::InvalidModel(
                 "direct RoPE table emission requires external storage".to_owned(),
             ));
             return;
         };
-        let offset = match reserve_external_range(weights, length) {
+        let offset = match reserve_external_range(&mut storage.weights, length) {
             Ok(offset) => offset,
             Err(error) => {
                 self.failure.get_or_insert(error);
@@ -3912,7 +4459,7 @@ impl CausalGraphBuilder {
                     }
                 };
                 let value = if cosine { pair.0 } else { pair.1 } as f32;
-                weights.extend_from_slice(&value.to_le_bytes());
+                storage.weights.extend_from_slice(&value.to_le_bytes());
             }
         }
         self.initializers.push(external_tensor(
@@ -5084,7 +5631,7 @@ impl CausalGraphBuilder {
 fn build_qwen35_mtp_graph(
     model: Qwen35MtpModel<'_>,
     mut graph: CausalGraphBuilder,
-) -> Result<ModelProto, OnnxModelError> {
+) -> Result<(ModelProto, Option<Vec<u8>>), OnnxModelError> {
     let tokens = as_i64(model.tokens, "MTP token count")?;
     let past_tokens = as_i64(model.past_tokens, "MTP past token count")?;
     let total_tokens = tokens
@@ -5220,66 +5767,72 @@ fn build_qwen35_mtp_graph(
         tensor_value("mtp.final_hidden", TENSOR_FLOAT, &[tokens, hidden]),
     ];
     outputs.extend(state_outputs);
-    Ok(ModelProto {
-        ir_version: ONNX_IR_VERSION,
-        producer_name: "tritium-onnx".to_owned(),
-        producer_version: env!("CARGO_PKG_VERSION").to_owned(),
-        domain: ONNX_DOMAIN.to_owned(),
-        model_version: 2,
-        graph: Some(GraphProto {
-            node: graph.nodes,
-            name: "tritium.qwen35_mtp".to_owned(),
-            initializer: graph.initializers,
-            input: inputs,
-            output: outputs,
-            value_info: Vec::new(),
-        }),
-        opset_import: vec![
-            OperatorSetIdProto {
-                domain: String::new(),
-                version: ONNX_OPSET,
-            },
-            OperatorSetIdProto {
-                domain: ONNX_DOMAIN.to_owned(),
-                version: 2,
-            },
-        ],
-        metadata_props: vec![
-            metadata("tritium.schema_version", "2"),
-            metadata("tritium.graph_kind", "qwen35-mtp"),
-            metadata("tritium.source_model_id", model.identity.source_model_id),
-            metadata("tritium.tokenizer_id", model.identity.tokenizer_id),
-            metadata("tritium.recipe_id", model.identity.recipe_id),
-            metadata("tritium.build_id", model.identity.tritium_build_id),
-            metadata("tritium.package_id", model.identity.package_id),
-            metadata(
-                "tritium.coverage.converted_id",
-                model.identity.converted_coverage_id,
-            ),
-            metadata(
-                "tritium.coverage.deferred_id",
-                model.identity.deferred_coverage_id,
-            ),
-            metadata("tritium.tokens", &model.tokens.to_string()),
-            metadata("tritium.past_tokens", &model.past_tokens.to_string()),
-            metadata("tritium.layers", "1"),
-            metadata("tritium.hidden", &model.embedding.columns.to_string()),
-            metadata("tritium.vocab", &model.embedding.rows.to_string()),
-            metadata("tritium.n_head", &model.n_head.to_string()),
-            metadata("tritium.n_kv_head", &model.n_kv_head.to_string()),
-            metadata("tritium.head_dim", &model.head_dim.to_string()),
-            metadata("tritium.input_alignment", "caller-shifted-target-aligned"),
-            metadata("tritium.rms_norm_weight_semantics", "zero-centered-offset"),
-            metadata("tritium.tied_embedding_head", "false"),
-            metadata("tritium.rope_theta", &model.rotary.theta.to_string()),
-        ],
-    })
+    let external_weights = external_storage_result(graph.storage)?;
+    Ok((
+        ModelProto {
+            ir_version: ONNX_IR_VERSION,
+            producer_name: "tritium-onnx".to_owned(),
+            producer_version: env!("CARGO_PKG_VERSION").to_owned(),
+            domain: ONNX_DOMAIN.to_owned(),
+            model_version: 2,
+            graph: Some(GraphProto {
+                node: graph.nodes,
+                name: "tritium.qwen35_mtp".to_owned(),
+                initializer: graph.initializers,
+                input: inputs,
+                output: outputs,
+                value_info: Vec::new(),
+            }),
+            opset_import: vec![
+                OperatorSetIdProto {
+                    domain: String::new(),
+                    version: ONNX_OPSET,
+                },
+                OperatorSetIdProto {
+                    domain: ONNX_DOMAIN.to_owned(),
+                    version: 2,
+                },
+            ],
+            metadata_props: vec![
+                metadata("tritium.schema_version", "2"),
+                metadata("tritium.graph_kind", "qwen35-mtp"),
+                metadata("tritium.source_model_id", model.identity.source_model_id),
+                metadata("tritium.tokenizer_id", model.identity.tokenizer_id),
+                metadata("tritium.recipe_id", model.identity.recipe_id),
+                metadata("tritium.build_id", model.identity.tritium_build_id),
+                metadata("tritium.package_id", model.identity.package_id),
+                metadata(
+                    "tritium.coverage.converted_id",
+                    model.identity.converted_coverage_id,
+                ),
+                metadata(
+                    "tritium.coverage.deferred_id",
+                    model.identity.deferred_coverage_id,
+                ),
+                metadata("tritium.tokens", &model.tokens.to_string()),
+                metadata("tritium.past_tokens", &model.past_tokens.to_string()),
+                metadata("tritium.layers", "1"),
+                metadata("tritium.hidden", &model.embedding.columns.to_string()),
+                metadata("tritium.vocab", &model.embedding.rows.to_string()),
+                metadata("tritium.n_head", &model.n_head.to_string()),
+                metadata("tritium.n_kv_head", &model.n_kv_head.to_string()),
+                metadata("tritium.head_dim", &model.head_dim.to_string()),
+                metadata("tritium.rotary_dim", &model.rotary.dimensions.to_string()),
+                metadata("tritium.rms_epsilon", &model.rms_epsilon.to_string()),
+                metadata("tritium.input_alignment", "caller-shifted-target-aligned"),
+                metadata("tritium.rms_norm_weight_semantics", "zero-centered-offset"),
+                metadata("tritium.tied_embedding_head", "false"),
+                metadata("tritium.rope_theta", &model.rotary.theta.to_string()),
+            ],
+        },
+        external_weights,
+    ))
 }
 
 fn build_qwen_causal_lm_graph(
     model: QwenCausalLmModel<'_>,
     mut graph: CausalGraphBuilder,
-) -> Result<ModelProto, OnnxModelError> {
+) -> Result<(ModelProto, Option<Vec<u8>>), OnnxModelError> {
     let tokens = as_i64(model.tokens, "token count")?;
     let past_tokens = as_i64(model.past_tokens, "past token count")?;
     let total_tokens = tokens
@@ -5419,70 +5972,81 @@ fn build_qwen_causal_lm_graph(
         })
         .collect::<Vec<_>>()
         .join(",");
+    let full_attention_interval = qwen_full_attention_interval(model.layers)?;
     if let Some(error) = graph.failure {
         return Err(error);
     }
-    Ok(ModelProto {
-        ir_version: ONNX_IR_VERSION,
-        producer_name: "tritium-onnx".to_owned(),
-        producer_version: env!("CARGO_PKG_VERSION").to_owned(),
-        domain: ONNX_DOMAIN.to_owned(),
-        model_version: 2,
-        graph: Some(GraphProto {
-            node: graph.nodes,
-            name: "tritium.qwen_causal_lm".to_owned(),
-            initializer: graph.initializers,
-            input: inputs,
-            output: outputs,
-            value_info: Vec::new(),
-        }),
-        opset_import: vec![
-            OperatorSetIdProto {
-                domain: String::new(),
-                version: ONNX_OPSET,
-            },
-            OperatorSetIdProto {
-                domain: ONNX_DOMAIN.to_owned(),
-                version: 2,
-            },
-        ],
-        metadata_props: vec![
-            metadata("tritium.schema_version", "2"),
-            metadata("tritium.graph_kind", "qwen-causal-lm"),
-            metadata("tritium.source_model_id", model.identity.source_model_id),
-            metadata("tritium.tokenizer_id", model.identity.tokenizer_id),
-            metadata("tritium.recipe_id", model.identity.recipe_id),
-            metadata("tritium.build_id", model.identity.tritium_build_id),
-            metadata("tritium.package_id", model.identity.package_id),
-            metadata(
-                "tritium.coverage.converted_id",
-                model.identity.converted_coverage_id,
-            ),
-            metadata(
-                "tritium.coverage.deferred_id",
-                model.identity.deferred_coverage_id,
-            ),
-            metadata("tritium.tokens", &model.tokens.to_string()),
-            metadata("tritium.past_tokens", &model.past_tokens.to_string()),
-            metadata("tritium.layers", &model.layers.len().to_string()),
-            metadata("tritium.hidden", &model.embedding.columns.to_string()),
-            metadata("tritium.vocab", &model.embedding.rows.to_string()),
-            metadata("tritium.n_head", &model.n_head.to_string()),
-            metadata("tritium.n_kv_head", &model.n_kv_head.to_string()),
-            metadata("tritium.head_dim", &model.head_dim.to_string()),
-            metadata("tritium.layer_schedule", &schedule),
-            metadata("tritium.rms_norm_weight_semantics", "zero-centered-offset"),
-            metadata(
-                "tritium.tied_embedding_head",
-                if model.lm_head.is_none() {
-                    "true"
-                } else {
-                    "false"
+    let external_weights = external_storage_result(graph.storage)?;
+    Ok((
+        ModelProto {
+            ir_version: ONNX_IR_VERSION,
+            producer_name: "tritium-onnx".to_owned(),
+            producer_version: env!("CARGO_PKG_VERSION").to_owned(),
+            domain: ONNX_DOMAIN.to_owned(),
+            model_version: 2,
+            graph: Some(GraphProto {
+                node: graph.nodes,
+                name: "tritium.qwen_causal_lm".to_owned(),
+                initializer: graph.initializers,
+                input: inputs,
+                output: outputs,
+                value_info: Vec::new(),
+            }),
+            opset_import: vec![
+                OperatorSetIdProto {
+                    domain: String::new(),
+                    version: ONNX_OPSET,
                 },
-            ),
-            metadata("tritium.rope_theta", &model.rotary.theta.to_string()),
-        ],
-    })
+                OperatorSetIdProto {
+                    domain: ONNX_DOMAIN.to_owned(),
+                    version: 2,
+                },
+            ],
+            metadata_props: vec![
+                metadata("tritium.schema_version", "2"),
+                metadata("tritium.graph_kind", "qwen-causal-lm"),
+                metadata("tritium.source_model_id", model.identity.source_model_id),
+                metadata("tritium.tokenizer_id", model.identity.tokenizer_id),
+                metadata("tritium.recipe_id", model.identity.recipe_id),
+                metadata("tritium.build_id", model.identity.tritium_build_id),
+                metadata("tritium.package_id", model.identity.package_id),
+                metadata(
+                    "tritium.coverage.converted_id",
+                    model.identity.converted_coverage_id,
+                ),
+                metadata(
+                    "tritium.coverage.deferred_id",
+                    model.identity.deferred_coverage_id,
+                ),
+                metadata("tritium.tokens", &model.tokens.to_string()),
+                metadata("tritium.past_tokens", &model.past_tokens.to_string()),
+                metadata("tritium.layers", &model.layers.len().to_string()),
+                metadata("tritium.hidden", &model.embedding.columns.to_string()),
+                metadata("tritium.vocab", &model.embedding.rows.to_string()),
+                metadata("tritium.n_head", &model.n_head.to_string()),
+                metadata("tritium.n_kv_head", &model.n_kv_head.to_string()),
+                metadata("tritium.head_dim", &model.head_dim.to_string()),
+                metadata("tritium.rotary_dim", &model.rotary.dimensions.to_string()),
+                metadata("tritium.rms_epsilon", &model.rms_epsilon.to_string()),
+                metadata(
+                    "tritium.full_attention_interval",
+                    &full_attention_interval.to_string(),
+                ),
+                metadata("tritium.layer_schedule", &schedule),
+                metadata("tritium.rms_norm_weight_semantics", "zero-centered-offset"),
+                metadata(
+                    "tritium.tied_embedding_head",
+                    if model.lm_head.is_none() {
+                        "true"
+                    } else {
+                        "false"
+                    },
+                ),
+                metadata("tritium.rope_theta", &model.rotary.theta.to_string()),
+            ],
+        },
+        external_weights,
+    ))
 }
 
 fn build_causal_lm_graph(
@@ -5672,11 +6236,7 @@ fn build_causal_lm_graph(
     if let Some(error) = graph.failure {
         return Err(error);
     }
-    let external_weights = match graph.storage {
-        CausalInitializerStorage::Inline => None,
-        CausalInitializerStorage::External(weights) => Some(weights),
-        CausalInitializerStorage::Counting { .. } => unreachable!("generic graph is not counted"),
-    };
+    let external_weights = external_storage_result(graph.storage)?;
     let protobuf = ModelProto {
         ir_version: ONNX_IR_VERSION,
         producer_name: "tritium-onnx".to_owned(),
@@ -6339,6 +6899,62 @@ fn validate_qwen35_mtp_model(model: &Qwen35MtpModel<'_>) -> Result<(), OnnxModel
     )
 }
 
+fn validate_qwen35_bundle_pair(
+    language: &QwenCausalLmModel<'_>,
+    mtp: &Qwen35MtpModel<'_>,
+) -> Result<(), OnnxModelError> {
+    validate_qwen_causal_lm(language)?;
+    validate_qwen35_mtp_model(mtp)?;
+    let same_identity = language.identity.source_model_id == mtp.identity.source_model_id
+        && language.identity.tokenizer_id == mtp.identity.tokenizer_id
+        && language.identity.recipe_id == mtp.identity.recipe_id
+        && language.identity.tritium_build_id == mtp.identity.tritium_build_id
+        && language.identity.package_id == mtp.identity.package_id
+        && language.identity.converted_coverage_id == mtp.identity.converted_coverage_id
+        && language.identity.deferred_coverage_id == mtp.identity.deferred_coverage_id;
+    if !same_identity {
+        return Err(OnnxModelError::InvalidModel(
+            "Qwen language and MTP artifact identities differ".to_owned(),
+        ));
+    }
+    if language.tokens != mtp.tokens
+        || language.past_tokens != mtp.past_tokens
+        || language.n_head != mtp.n_head
+        || language.n_kv_head != mtp.n_kv_head
+        || language.head_dim != mtp.head_dim
+        || language.rotary.dimensions != mtp.rotary.dimensions
+        || language.rotary.theta.to_bits() != mtp.rotary.theta.to_bits()
+        || language.rms_epsilon.to_bits() != mtp.rms_epsilon.to_bits()
+    {
+        return Err(OnnxModelError::InvalidModel(
+            "Qwen language and MTP execution geometry differs".to_owned(),
+        ));
+    }
+    let same_matrix = |left: PackedTernaryMatrix<'_>, right: PackedTernaryMatrix<'_>| {
+        left.rows == right.rows
+            && left.columns == right.columns
+            && left.format == right.format
+            && left.packed == right.packed
+            && left.scales == right.scales
+    };
+    if !same_matrix(language.embedding, mtp.embedding) {
+        return Err(OnnxModelError::InvalidModel(
+            "Qwen language and MTP shared embeddings differ".to_owned(),
+        ));
+    }
+    let Some(language_head) = language.lm_head else {
+        return Err(OnnxModelError::InvalidModel(
+            "Qwen language-plus-MTP bundle requires an untied language head".to_owned(),
+        ));
+    };
+    if !same_matrix(language_head, mtp.lm_head) {
+        return Err(OnnxModelError::InvalidModel(
+            "Qwen language and MTP language heads differ".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_qwen_causal_lm(model: &QwenCausalLmModel<'_>) -> Result<(), OnnxModelError> {
     if model.layers.is_empty() {
         return Err(OnnxModelError::InvalidModel(
@@ -6386,7 +7002,31 @@ fn validate_qwen_causal_lm(model: &QwenCausalLmModel<'_>) -> Result<(), OnnxMode
             "Qwen heterogeneous schedule requires DeltaNet and full-attention layers".to_owned(),
         ));
     }
+    qwen_full_attention_interval(model.layers)?;
     Ok(())
+}
+
+fn qwen_full_attention_interval(
+    layers: &[QwenCausalLmDecoderLayer<'_>],
+) -> Result<usize, OnnxModelError> {
+    let interval = layers
+        .iter()
+        .position(|layer| matches!(layer, QwenCausalLmDecoderLayer::FullAttention(_)))
+        .map(|index| index + 1)
+        .ok_or_else(|| {
+            OnnxModelError::InvalidModel("Qwen schedule lacks full attention".to_owned())
+        })?;
+    if !layers.len().is_multiple_of(interval)
+        || layers.iter().enumerate().any(|(index, layer)| {
+            let expected_full = (index + 1).is_multiple_of(interval);
+            matches!(layer, QwenCausalLmDecoderLayer::FullAttention(_)) != expected_full
+        })
+    {
+        return Err(OnnxModelError::InvalidModel(format!(
+            "Qwen layer schedule differs from canonical full-attention interval {interval}"
+        )));
+    }
+    Ok(interval)
 }
 
 fn validate_qwen_deltanet_initializer_budget(
@@ -7936,8 +8576,188 @@ mod tests {
         ));
         assert_eq!(mapped.mtp().fusion.rows, 256);
         assert_eq!(mapped.mtp().fusion.columns, 512);
+        let reordered_schedule = [mapped.layers()[1], mapped.layers()[0]];
+        assert!(matches!(
+            encode_qwen_causal_lm(QwenCausalLmModel {
+                layers: &reordered_schedule,
+                ..mapped.model(1, 0)
+            }),
+            Err(OnnxModelError::InvalidModel(reason))
+                if reason.contains("canonical full-attention interval")
+        ));
         assert!(encode_qwen_causal_lm(mapped.model(1, 0)).is_ok());
         assert!(encode_qwen35_mtp(mapped.mtp_model(1, 0)).is_ok());
+        let bundle =
+            encode_external_qwen35_bundle(mapped.model(1, 0), mapped.mtp_model(1, 0)).unwrap();
+        let standalone_language = encode_external_qwen_causal_lm(mapped.model(1, 0)).unwrap();
+        let standalone_mtp = encode_external_qwen35_mtp(mapped.mtp_model(1, 0)).unwrap();
+        assert!(
+            bundle.weights_bytes.len()
+                < standalone_language.weights_bytes.len() + standalone_mtp.weights_bytes.len(),
+            "shared embedding/head ranges must reduce physical package bytes"
+        );
+        assert_eq!(
+            bundle.weights_blake3,
+            *blake3::hash(&bundle.weights_bytes).as_bytes()
+        );
+        let admitted = AdmittedExternalQwen35BundleDigests {
+            language_model_blake3: *blake3::hash(&bundle.language_model_bytes).as_bytes(),
+            mtp_model_blake3: *blake3::hash(&bundle.mtp_model_bytes).as_bytes(),
+            weights_blake3: *blake3::hash(&bundle.weights_bytes).as_bytes(),
+        };
+        let files = ExternalQwen35BundleFiles {
+            language_model_bytes: &bundle.language_model_bytes,
+            mtp_model_bytes: &bundle.mtp_model_bytes,
+            weights_bytes: &bundle.weights_bytes,
+        };
+        let receipt = verify_external_qwen35_bundle(files, admitted).unwrap();
+        assert_eq!(receipt.language.layers, 2);
+        assert_eq!(receipt.mtp.layers, 1);
+        assert_eq!(receipt.language.tokens, receipt.mtp.tokens);
+        assert_eq!(receipt.language.past_tokens, receipt.mtp.past_tokens);
+        assert_eq!(receipt.language.identity, receipt.mtp.identity);
+
+        let mut corrupted_weights = bundle.weights_bytes.clone();
+        corrupted_weights[0] ^= 1;
+        assert!(matches!(
+            verify_external_qwen35_bundle(
+                ExternalQwen35BundleFiles {
+                    weights_bytes: &corrupted_weights,
+                    ..files
+                },
+                admitted,
+            ),
+            Err(OnnxModelError::ExternalDataMismatch(reason))
+                if reason.contains("bundle weights")
+                    && reason.contains("package manifest")
+        ));
+        let language_proto = ModelProto::decode(bundle.language_model_bytes.as_slice()).unwrap();
+        let mut mtp_proto = ModelProto::decode(bundle.mtp_model_bytes.as_slice()).unwrap();
+        for name in QWEN_SHARED_EXTERNAL_INITIALIZERS {
+            let descriptor = |protobuf: &ModelProto| {
+                protobuf
+                    .graph
+                    .as_ref()
+                    .unwrap()
+                    .initializer
+                    .iter()
+                    .find(|initializer| initializer.name == name)
+                    .unwrap()
+                    .external_data
+                    .clone()
+            };
+            assert_eq!(descriptor(&language_proto), descriptor(&mtp_proto));
+        }
+        mtp_proto
+            .metadata_props
+            .iter_mut()
+            .find(|entry| entry.key == "tritium.package_id")
+            .unwrap()
+            .value = "different-package".to_owned();
+        let mismatched_mtp = mtp_proto.encode_to_vec();
+        assert!(matches!(
+            verify_external_qwen35_bundle(
+                ExternalQwen35BundleFiles {
+                    mtp_model_bytes: &mismatched_mtp,
+                    ..files
+                },
+                AdmittedExternalQwen35BundleDigests {
+                    mtp_model_blake3: *blake3::hash(&mismatched_mtp).as_bytes(),
+                    ..admitted
+                },
+            ),
+            Err(OnnxModelError::InvalidModel(reason))
+                if reason.contains("identity or execution shape differs")
+        ));
+        let mut mismatched_epsilon = ModelProto::decode(bundle.mtp_model_bytes.as_slice()).unwrap();
+        mismatched_epsilon
+            .metadata_props
+            .iter_mut()
+            .find(|entry| entry.key == "tritium.rms_epsilon")
+            .unwrap()
+            .value = "0.000002".to_owned();
+        let mismatched_epsilon = mismatched_epsilon.encode_to_vec();
+        assert!(matches!(
+            verify_external_qwen35_bundle(
+                ExternalQwen35BundleFiles {
+                    mtp_model_bytes: &mismatched_epsilon,
+                    ..files
+                },
+                AdmittedExternalQwen35BundleDigests {
+                    mtp_model_blake3: *blake3::hash(&mismatched_epsilon).as_bytes(),
+                    ..admitted
+                },
+            ),
+            Err(OnnxModelError::InvalidModel(reason))
+                if reason.contains("metadata tritium.rms_epsilon differs")
+        ));
+        let mut bad_interval = ModelProto::decode(bundle.language_model_bytes.as_slice()).unwrap();
+        bad_interval
+            .metadata_props
+            .iter_mut()
+            .find(|entry| entry.key == "tritium.full_attention_interval")
+            .unwrap()
+            .value = "1".to_owned();
+        let bad_interval = bad_interval.encode_to_vec();
+        assert!(matches!(
+            verify_external_qwen35_bundle(
+                ExternalQwen35BundleFiles {
+                    language_model_bytes: &bad_interval,
+                    ..files
+                },
+                AdmittedExternalQwen35BundleDigests {
+                    language_model_blake3: *blake3::hash(&bad_interval).as_bytes(),
+                    ..admitted
+                },
+            ),
+            Err(OnnxModelError::InvalidModel(reason))
+                if reason.contains("layer schedule metadata is not canonical")
+        ));
+        let mut overlapping_mtp = ModelProto::decode(bundle.mtp_model_bytes.as_slice()).unwrap();
+        let initializer = overlapping_mtp
+            .graph
+            .as_mut()
+            .unwrap()
+            .initializer
+            .iter_mut()
+            .find(|initializer| {
+                initializer.data_location == EXTERNAL_DATA
+                    && !QWEN_SHARED_EXTERNAL_INITIALIZERS.contains(&initializer.name.as_str())
+            })
+            .unwrap();
+        initializer
+            .external_data
+            .iter_mut()
+            .find(|entry| entry.key == "offset")
+            .unwrap()
+            .value = "0".to_owned();
+        let overlapping_mtp = overlapping_mtp.encode_to_vec();
+        assert!(matches!(
+            verify_external_qwen35_bundle(
+                ExternalQwen35BundleFiles {
+                    mtp_model_bytes: &overlapping_mtp,
+                    ..files
+                },
+                AdmittedExternalQwen35BundleDigests {
+                    mtp_model_blake3: *blake3::hash(&overlapping_mtp).as_bytes(),
+                    ..admitted
+                },
+            ),
+            Err(OnnxModelError::ExternalDataMismatch(reason))
+                if reason.contains("overlapping shared range")
+                    || reason.contains("not canonical")
+        ));
+        assert!(matches!(
+            encode_external_qwen35_bundle(
+                mapped.model(1, 0),
+                Qwen35MtpModel {
+                    tokens: 2,
+                    ..mapped.mtp_model(1, 0)
+                },
+            ),
+            Err(OnnxModelError::InvalidModel(reason))
+                if reason.contains("execution geometry differs")
+        ));
 
         source
             .names
