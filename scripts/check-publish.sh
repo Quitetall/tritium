@@ -10,9 +10,12 @@
 # crates.io yet (a chicken-and-egg only resolvable by an ordered release-time
 # publish). `cargo package --workspace` packages all members together and resolves
 # the internal deps locally, validating packaging for every crate at once. The
-# verify-build is already covered by the cpu-only-green lane.
+# verify-build is already covered by the cpu-only-green lane. `--frozen` makes
+# archive assembly fail on lockfile drift or a network dependency; clean offline
+# installation of the resulting archives remains the stricter local-RC gate.
 set -euo pipefail
 
-echo "publish-readiness: cargo package --workspace --no-verify"
-cargo package --workspace --no-verify
+./scripts/check-release-version.py
+echo "publish-readiness: cargo package --workspace --frozen --no-verify"
+cargo package --workspace --frozen --no-verify
 echo "OK: every workspace crate packages cleanly (publish-ready manifests + files)."
