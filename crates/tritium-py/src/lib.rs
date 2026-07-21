@@ -257,6 +257,7 @@ fn _tritium(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(ternary_matmul, m)?)?;
     m.add_function(wrap_pyfunction!(onnx::verify_qwen35_onnx_bundle, m)?)?;
     m.add_function(wrap_pyfunction!(onnx::stage_qwen35_onnx_bundle, m)?)?;
+    m.add_function(wrap_pyfunction!(onnx::export_qwen35_onnx_bundle, m)?)?;
     // Autograd-op primitives (ADR 0030): forward/vjp for ternary Conv1d, FSQ, and STE.
     m.add_function(wrap_pyfunction!(ops::conv1d_forward, m)?)?;
     m.add_function(wrap_pyfunction!(ops::conv1d_vjp, m)?)?;

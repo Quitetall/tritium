@@ -57,3 +57,16 @@ def test_stage_keeps_output_separate_and_propagates_native_failure(monkeypatch, 
         assert str(error) == "native admission failed"
     else:
         raise AssertionError("native failure was swallowed")
+
+
+def test_native_export_rejects_invalid_bundle_without_publication(tmp_path: Path):
+    output = tmp_path / "published"
+    try:
+        onnx._tritium.export_qwen35_onnx_bundle(
+            str(tmp_path / "missing"), str(output)
+        )
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("invalid bundle was exported")
+    assert not output.exists()

@@ -185,6 +185,7 @@ def _read_manifest(requested: Path) -> OnnxBundleManifest:
     _inspect_regular(
         directory / "weights.bin",
         "weights.bin",
+        max_bytes=64 * 1024 * 1024 * 1024,
         expected_bytes=weights["bytes"],
     )
     return OnnxBundleManifest(
