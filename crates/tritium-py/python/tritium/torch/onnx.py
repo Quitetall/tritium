@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Union
@@ -153,11 +154,7 @@ def _read_manifest(requested: Path) -> OnnxBundleManifest:
     if not directory.is_dir():
         raise ValueError("ONNX artifact must be an ordinary directory")
     path = directory / _MANIFEST_FILE
-    metadata = path.lstat()
-    if path.is_symlink() or not path.is_file() or metadata.st_size > 1024 * 1024:
-        raise ValueError("ONNX manifest must be an ordinary file no larger than 1 MiB")
-    with path.open("r", encoding="utf-8") as stream:
-        value = json.load(stream, object_pairs_hook=_pairs_without_duplicates)
+    value = _read_json_regular(path, max_bytes=1024 * 1024, label="ONNX manifest")
     if not isinstance(value, dict) or set(value) != _TOP_FIELDS:
         raise ValueError("ONNX manifest top-level fields differ from schema v1")
     if value["schema"] != "tritium-qwen35-onnx-bundle-v1":
@@ -176,13 +173,20 @@ def _read_manifest(requested: Path) -> OnnxBundleManifest:
     conversion = _strings(value["conversion"], _CONVERSION_FIELDS, "conversion")
     if conversion["mode"] not in {"qat-hard", "ptq", "refined"}:
         raise ValueError("unsupported ONNX conversion mode")
-    for filename in ("language.onnx", "mtp.onnx", "weights.bin"):
-        candidate = directory / filename
-        candidate_metadata = candidate.lstat()
-        if candidate.is_symlink() or not candidate.is_file() or candidate_metadata.st_size == 0:
-            raise ValueError(f"{filename} must be a non-empty ordinary file")
-    if (directory / "weights.bin").stat().st_size != weights["bytes"]:
-        raise ValueError("weights.bin length differs from ONNX manifest")
+    # This descriptor preflight gives deterministic Python errors. The native
+    # runtime is still the security authority: it reopens and authenticates all
+    # three files immediately before creating the ORT sessions.
+    _inspect_regular(
+        directory / "language.onnx", "language.onnx", max_bytes=256 * 1024 * 1024
+    )
+    _inspect_regular(
+        directory / "mtp.onnx", "mtp.onnx", max_bytes=256 * 1024 * 1024
+    )
+    _inspect_regular(
+        directory / "weights.bin",
+        "weights.bin",
+        expected_bytes=weights["bytes"],
+    )
     return OnnxBundleManifest(
         directory=directory,
         language_blake3=language,
@@ -227,6 +231,86 @@ def _strings(value: Any, fields: set[str], label: str) -> Dict[str, str]:
     if any(not isinstance(item, str) or not item for item in value.values()):
         raise ValueError(f"ONNX {label} values must be non-empty strings")
     return value
+
+
+def _read_json_regular(path: Path, *, max_bytes: int, label: str) -> Any:
+    descriptor, before, opened = _open_regular(path, label, max_bytes=max_bytes)
+    try:
+        with os.fdopen(descriptor, "r", encoding="utf-8") as stream:
+            descriptor = -1
+            value = json.load(stream, object_pairs_hook=_pairs_without_duplicates)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    _require_unchanged(path, before, opened, label)
+    return value
+
+
+def _inspect_regular(
+    path: Path,
+    label: str,
+    *,
+    max_bytes: int | None = None,
+    expected_bytes: int | None = None,
+) -> None:
+    descriptor, before, opened = _open_regular(
+        path,
+        label,
+        max_bytes=max_bytes,
+        expected_bytes=expected_bytes,
+    )
+    os.close(descriptor)
+    _require_unchanged(path, before, opened, label)
+
+
+def _open_regular(
+    path: Path,
+    label: str,
+    *,
+    max_bytes: int | None = None,
+    expected_bytes: int | None = None,
+):
+    before = path.lstat()
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise ValueError(f"{label} cannot be opened as an ordinary file") from error
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or not stat.S_ISREG(opened.st_mode)
+            or not _same_file(before, opened)
+            or opened.st_size <= 0
+            or (max_bytes is not None and opened.st_size > max_bytes)
+            or (expected_bytes is not None and opened.st_size != expected_bytes)
+        ):
+            raise ValueError(f"{label} type, identity, or length is invalid")
+        return descriptor, before, opened
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _require_unchanged(
+    path: Path, before: os.stat_result, opened: os.stat_result, label: str
+) -> None:
+    after = path.lstat()
+    if (
+        not _same_file(before, after)
+        or before.st_size != opened.st_size
+        or after.st_size != opened.st_size
+    ):
+        raise ValueError(f"{label} changed while being inspected")
+
+
+def _same_file(left: os.stat_result, right: os.stat_result) -> bool:
+    return left.st_dev == right.st_dev and left.st_ino == right.st_ino
 
 
 __all__ = ["OnnxBundleManifest", "export_onnx", "load_onnx"]

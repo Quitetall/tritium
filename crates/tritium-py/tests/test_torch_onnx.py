@@ -82,6 +82,21 @@ def test_load_onnx_has_stable_capability_error(monkeypatch, tmp_path):
     assert caught.value.code == "onnx_runtime_unavailable"
 
 
+def test_load_onnx_rejects_symlinked_graph_before_runtime(monkeypatch, tmp_path):
+    root = tmp_path / "onnx"
+    _write_onnx_bundle(root)
+    (root / "language.onnx").unlink()
+    (root / "language.onnx").symlink_to(root / "mtp.onnx")
+    monkeypatch.setattr(
+        onnx._tritium,
+        "QwenOnnxModel",
+        SimpleNamespace(load=lambda *args, **kwargs: pytest.fail("must not load")),
+        raising=False,
+    )
+    with pytest.raises(ValueError, match="ordinary file"):
+        load_onnx(root)
+
+
 def test_export_onnx_rejects_latent_training_graph():
     source = PreparedModel(model=object(), config=object(), coverage=None)
     with pytest.raises(TritiumError) as caught:
