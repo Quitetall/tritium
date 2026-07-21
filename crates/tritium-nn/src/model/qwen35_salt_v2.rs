@@ -109,7 +109,10 @@ pub struct Qwen35SaltV2LoadReceipt {
     manifest_package_id: String,
     profile: String,
     source_revision: String,
+    declared_completion_id: String,
+    declared_campaign_id: String,
     declared_admission_id: String,
+    declared_selection_id: String,
     declared_source_model_id: String,
     declared_source_identity_status: String,
     declared_official_payload_authenticated: bool,
@@ -146,11 +149,29 @@ impl Qwen35SaltV2LoadReceipt {
         &self.source_revision
     }
 
+    /// Untrusted manifest declaration naming the completed additive campaign.
+    #[must_use]
+    pub fn declared_completion_id(&self) -> &str {
+        &self.declared_completion_id
+    }
+
+    /// Untrusted manifest declaration naming the PTQ campaign ancestry.
+    #[must_use]
+    pub fn declared_campaign_id(&self) -> &str {
+        &self.declared_campaign_id
+    }
+
     /// Untrusted manifest declaration. External admission must authorize
     /// [`Self::manifest_package_id`] before relying on this value.
     #[must_use]
     pub fn declared_admission_id(&self) -> &str {
         &self.declared_admission_id
+    }
+
+    /// Untrusted manifest declaration naming the selected physical allocation.
+    #[must_use]
+    pub fn declared_selection_id(&self) -> &str {
+        &self.declared_selection_id
     }
 
     /// Untrusted manifest declaration; not an independently authenticated ID.
@@ -408,7 +429,10 @@ impl Qwen35SaltV2LanguageMtpModel {
                 manifest_package_id,
                 profile: profile.to_owned(),
                 source_revision: manifest.source_revision,
+                declared_completion_id: manifest.completion_id,
+                declared_campaign_id: manifest.campaign_id,
                 declared_admission_id: manifest.admission_id,
+                declared_selection_id: manifest.selection_id,
                 declared_source_model_id: manifest.source_model_id,
                 declared_source_identity_status: manifest.source_identity_status,
                 declared_official_payload_authenticated: manifest.official_payload_authenticated,
@@ -1162,6 +1186,10 @@ mod tests {
         .unwrap();
         let receipt = model.receipt();
         assert_eq!(receipt.profile(), "compact-v1");
+        assert_eq!(receipt.declared_completion_id(), "test-completion");
+        assert_eq!(receipt.declared_campaign_id(), "test-campaign");
+        assert_eq!(receipt.declared_admission_id(), "test-admission");
+        assert_eq!(receipt.declared_selection_id(), "test-selection");
         assert_eq!(receipt.package_id(), profile_id);
         assert_eq!(receipt.preserved_package_id(), preserved_id);
         assert_eq!(receipt.matrix_tensors(), matrix_count);
