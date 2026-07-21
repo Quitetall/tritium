@@ -11748,6 +11748,21 @@ mod tests {
                 if reason.contains("model BLAKE3")
                     && reason.contains("package manifest")
         ));
+        let mut corrupted_dynamic_mtp = dynamic_bundle.mtp_model_bytes.clone();
+        corrupted_dynamic_mtp[0] ^= 1;
+        assert!(matches!(
+            verify_dynamic_external_qwen35_bundle(
+                ExternalQwen35BundleFiles {
+                    language_model_bytes: &dynamic_bundle.language_model_bytes,
+                    mtp_model_bytes: &corrupted_dynamic_mtp,
+                    weights_bytes: &dynamic_bundle.weights_bytes,
+                },
+                dynamic_admitted,
+            ),
+            Err(OnnxModelError::ExternalDataMismatch(reason))
+                if reason.contains("model BLAKE3")
+                    && reason.contains("package manifest")
+        ));
         assert!(matches!(
             verify_external_qwen35_bundle(
                 ExternalQwen35BundleFiles {
