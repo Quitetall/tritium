@@ -2129,10 +2129,10 @@ mod tests {
 
         let token = Tensor::from_array(([1], vec![1_i64])).unwrap();
         let two_past = Tensor::from_array(((), vec![2_i64])).unwrap();
-        let conv = Tensor::from_array(([3, 2], next_conv)).unwrap();
-        let recurrent = Tensor::from_array(([1, 1, 1], next_recurrent)).unwrap();
-        let past_k = Tensor::from_array(([2, 1, gqa_head_dim], present_k)).unwrap();
-        let past_v = Tensor::from_array(([2, 1, gqa_head_dim], present_v)).unwrap();
+        let conv = Tensor::from_array(([3, 2], next_conv.clone())).unwrap();
+        let recurrent = Tensor::from_array(([1, 1, 1], next_recurrent.clone())).unwrap();
+        let past_k = Tensor::from_array(([2, 1, gqa_head_dim], present_k.clone())).unwrap();
+        let past_v = Tensor::from_array(([2, 1, gqa_head_dim], present_v.clone())).unwrap();
         let decode = gqa_session
             .run(ort::inputs![
                 &token, &two_past, &conv, &recurrent, &past_k, &past_v
@@ -2140,8 +2140,33 @@ mod tests {
             .unwrap();
         let (_, logits) = decode[0].try_extract_tensor::<f32>().unwrap();
         assert!(logits.iter().all(|value| value.is_finite()));
-        let (present_shape, _) = decode[3].try_extract_tensor::<f32>().unwrap();
+        let cached_logits = logits.to_vec();
+        let (present_shape, decoded_k) = decode[3].try_extract_tensor::<f32>().unwrap();
         assert_eq!(present_shape.as_ref(), &[3, 1, gqa_head_dim as i64]);
+        assert_f32_close(&decoded_k[..present_k.len()], &present_k, 0.0);
+        drop(decode);
+
+        let token = Tensor::from_array(([1], vec![1_i64])).unwrap();
+        let two_past = Tensor::from_array(((), vec![2_i64])).unwrap();
+        let conv = Tensor::from_array(([3, 2], next_conv)).unwrap();
+        let recurrent = Tensor::from_array(([1, 1, 1], next_recurrent)).unwrap();
+        let zero_k =
+            Tensor::from_array(([2, 1, gqa_head_dim], vec![0.0_f32; 2 * gqa_head_dim])).unwrap();
+        let zero_v =
+            Tensor::from_array(([2, 1, gqa_head_dim], vec![0.0_f32; 2 * gqa_head_dim])).unwrap();
+        let zero_cache_decode = gqa_session
+            .run(ort::inputs![
+                &token, &two_past, &conv, &recurrent, &zero_k, &zero_v
+            ])
+            .unwrap();
+        let (_, zero_cache_logits) = zero_cache_decode[0].try_extract_tensor::<f32>().unwrap();
+        assert!(
+            cached_logits
+                .iter()
+                .zip(zero_cache_logits)
+                .any(|(cached, zero)| (cached - zero).abs() > 1.0e-6),
+            "dynamic GQA decode ignored carried KV cache"
+        );
 
         let external = crate::encode_external_qwen_causal_lm(base).unwrap();
         let directory = TestDirectory::new();
