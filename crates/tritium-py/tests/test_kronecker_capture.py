@@ -11,6 +11,7 @@ from tritium.torch import (
     bind_kronecker_activation_cache_digest,
     capture_kronecker_embedding,
     capture_kronecker_module,
+    capture_qwen36_kronecker_evidence,
 )
 from tritium.torch import ptq
 
@@ -182,6 +183,104 @@ def test_embedding_capture_rejects_input_hessian(tmp_path):
             writer=writer,
             curvature="input-hessian",
         )
+
+
+def test_qwen_capture_session_dispatches_embedding_and_output_head(tmp_path):
+    class Body(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed_tokens = torch.nn.Embedding(8, 128)
+
+    class TinyQwen(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = Body()
+            self.lm_head = torch.nn.Linear(128, 8, bias=False)
+
+        def forward(self, input_ids, attention_mask=None):
+            logits = self.lm_head(self.model.embed_tokens(input_ids))
+            return SimpleNamespace(logits=logits, loss=logits.square().mean())
+
+    class FakeSession:
+        def __init__(
+            self,
+            model_dir,
+            revision,
+            work_dir,
+            evidence_dir,
+            curvature,
+            activation_cache_digest,
+            token_stream_digest,
+            damping,
+            **kwargs,
+        ):
+            common = dict(
+                rows=8,
+                columns=128,
+                scope="language",
+                source_model_digest="01" * 32,
+                activation_cache_digest=activation_cache_digest,
+                token_stream_digest=token_stream_digest,
+                curvature=curvature,
+                damping=damping,
+            )
+            self.tasks = iter(
+                [
+                    SimpleNamespace(
+                        tensor_index=0,
+                        tensor_name="model.language_model.embed_tokens.weight",
+                        role="token-embedding",
+                        **common,
+                    ),
+                    SimpleNamespace(
+                        tensor_index=1,
+                        tensor_name="lm_head.weight",
+                        role="output-head",
+                        **common,
+                    ),
+                ]
+            )
+            self.current = None
+            self.accepted = 0
+
+        def next_request(self):
+            self.current = next(self.tasks, None)
+            return self.current
+
+        def accept_current(self):
+            assert self.current is not None
+            self.accepted += 1
+            self.current = None
+            return True
+
+        def finish(self):
+            assert self.accepted == 2
+            return SimpleNamespace(records=2, produced=2, reused=0)
+
+    model = TinyQwen()
+    receipt = capture_qwen36_kronecker_evidence(
+        model,
+        lambda task: [
+            {
+                "input_ids": torch.tensor([[1, 3]]),
+                "attention_mask": torch.tensor([[1, 1]]),
+            }
+        ],
+        model_dir=tmp_path / "model",
+        declared_revision="test-revision",
+        work_dir=tmp_path / "work",
+        evidence_dir=tmp_path / "evidence",
+        curvature="guided-fisher",
+        activation_cache_digest="02" * 32,
+        token_stream_digest="03" * 32,
+        damping=0.01,
+        guided_loss_reduction="mean-attention-mask",
+        _session_factory=FakeSession,
+    )
+
+    assert receipt.records == 2
+    assert (tmp_path / "evidence" / "000000.s2kf").is_file()
+    assert (tmp_path / "evidence" / "000001.s2kf").is_file()
 
 
 def test_capture_preserves_reused_module_call_order(tmp_path):

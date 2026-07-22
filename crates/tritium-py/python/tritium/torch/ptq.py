@@ -11,7 +11,7 @@ import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, Iterable, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -745,6 +745,167 @@ def capture_kronecker_embedding(
         output_segments=output_segments,
         record=record,
     )
+
+
+def _qwen36_module_candidates(tensor_name: str, scope: str) -> Tuple[str, ...]:
+    if not tensor_name.endswith(".weight"):
+        raise ValueError("Qwen capture task must name a weight tensor")
+    path = tensor_name.removesuffix(".weight")
+    candidates = [path]
+    if scope == "language" and path.startswith("model.language_model."):
+        suffix = path.removeprefix("model.language_model.")
+        candidates.extend((f"model.{suffix}", suffix))
+    elif scope == "mtp-drafter" and path.startswith("mtp."):
+        candidates.append(path.removeprefix("mtp."))
+    return tuple(dict.fromkeys(candidates))
+
+
+def _resolve_qwen36_capture_module(
+    task: Any,
+    language_model: nn.Module,
+    mtp_model: Optional[nn.Module],
+) -> Tuple[nn.Module, str, nn.Module]:
+    if task.scope == "language":
+        target = language_model
+    elif task.scope == "mtp-drafter":
+        if mtp_model is None:
+            raise ValueError("Qwen MTP capture task requires mtp_model")
+        target = mtp_model
+    else:
+        raise ValueError(f"unsupported Qwen capture scope {task.scope!r}")
+    modules = dict(target.named_modules(remove_duplicate=False))
+    matches = [
+        (candidate, modules[candidate])
+        for candidate in _qwen36_module_candidates(task.tensor_name, task.scope)
+        if candidate in modules
+    ]
+    unique = {id(value) for _, value in matches}
+    if not matches:
+        raise ValueError(f"cannot resolve Qwen capture module for {task.tensor_name}")
+    if len(unique) != 1:
+        raise ValueError(f"Qwen capture module aliases are ambiguous for {task.tensor_name}")
+    return target, matches[0][0], matches[0][1]
+
+
+def capture_qwen36_kronecker_evidence(
+    language_model: nn.Module,
+    data_factory: Callable[[Any], Iterable[Any]],
+    *,
+    model_dir: Pathish,
+    declared_revision: str,
+    work_dir: Pathish,
+    evidence_dir: Pathish,
+    curvature: str,
+    activation_cache_digest: str,
+    token_stream_digest: str,
+    damping: float,
+    mtp_model: Optional[nn.Module] = None,
+    guided_loss_reduction: Optional[str] = None,
+    max_evidence_bytes: int = 64 * 1024 * 1024,
+    max_batch_bytes: int = 256 * 1024 * 1024,
+    max_capture_bytes: Optional[int] = None,
+    max_objective_bytes: int = 256 * 1024 * 1024,
+    _session_factory=None,
+):
+    """Resume and complete the canonical pinned-Qwen grouped-evidence catalog.
+
+    ``data_factory(task)`` must return a fresh replayable calibration iterable
+    for each missing tensor. Existing records are reused by the native session.
+    Linear projections and the output head use dense factors; token embeddings
+    use sparse indexed factors. The source checkpoint is admitted before any
+    task is exposed.
+    """
+
+    if not isinstance(language_model, nn.Module):
+        raise TypeError("language_model must be a torch.nn.Module")
+    if mtp_model is not None and not isinstance(mtp_model, nn.Module):
+        raise TypeError("mtp_model must be a torch.nn.Module")
+    if not callable(data_factory):
+        raise TypeError("data_factory must be callable")
+    if curvature == "guided-fisher":
+        if guided_loss_reduction not in {
+            "sum",
+            "mean-attention-mask",
+            "mean-valid-causal-labels",
+        }:
+            raise ValueError("guided-Fisher requires an explicit supported loss reduction")
+        objective = f"tritium.model-loss-guided-fisher.{guided_loss_reduction}@1"
+    elif curvature == "forward-kl-kronecker":
+        if guided_loss_reduction is not None:
+            raise ValueError("guided_loss_reduction is valid only for guided-fisher")
+        objective = "tritium.softmax-fisher-rademacher.single-probe@1"
+    elif curvature == "input-hessian":
+        if guided_loss_reduction is not None:
+            raise ValueError("guided_loss_reduction is valid only for guided-fisher")
+        objective = "tritium.input-gram@1"
+    else:
+        raise ValueError("unsupported Kronecker curvature")
+    bound_cache_digest = bind_kronecker_activation_cache_digest(
+        activation_cache_digest, objective
+    )
+    session_type = _tritium.Qwen36KroneckerCaptureSession
+    if _session_factory is not None:
+        session_type = _session_factory
+    session = session_type(
+        os.fspath(model_dir),
+        declared_revision,
+        os.fspath(work_dir),
+        os.fspath(evidence_dir),
+        curvature,
+        bound_cache_digest,
+        token_stream_digest,
+        damping,
+        max_evidence_bytes=max_evidence_bytes,
+    )
+    while True:
+        task = session.next_request()
+        if task is None:
+            receipt = session.finish()
+            if receipt is None:
+                raise RuntimeError("Qwen evidence session did not seal a complete catalog")
+            return receipt
+        if (
+            task.curvature != curvature
+            or task.activation_cache_digest != bound_cache_digest
+            or task.token_stream_digest != token_stream_digest.lower()
+            or task.damping != damping
+        ):
+            raise RuntimeError("native Qwen capture task drifted from the session contract")
+        target, module_path, selected = _resolve_qwen36_capture_module(
+            task, language_model, mtp_model
+        )
+        indexed_output = isinstance(selected, nn.Embedding)
+        writer = KroneckerCalibrationWriter(
+            evidence_dir,
+            tensor_index=task.tensor_index,
+            tensor_name=task.tensor_name,
+            rows=task.rows,
+            columns=task.columns,
+            curvature=task.curvature,
+            source_model_digest=task.source_model_digest,
+            activation_cache_digest=activation_cache_digest,
+            token_stream_digest=task.token_stream_digest,
+            damping=task.damping,
+            objective_id=objective,
+            indexed_output=indexed_output,
+            max_evidence_bytes=max_evidence_bytes,
+            max_batch_bytes=max_batch_bytes,
+        )
+        capture = capture_kronecker_embedding if indexed_output else capture_kronecker_module
+        result = capture(
+            target,
+            data_factory(task),
+            module=module_path,
+            writer=writer,
+            curvature=curvature,
+            guided_loss_reduction=guided_loss_reduction,
+            max_capture_bytes=max_capture_bytes,
+            max_objective_bytes=max_objective_bytes,
+        )
+        if result.record.tensor_index != task.tensor_index:
+            raise RuntimeError("Qwen capture published the wrong tensor ordinal")
+        if not session.accept_current():
+            raise RuntimeError("Qwen evidence session refused the published record")
 
 
 def capture_kronecker_module(
