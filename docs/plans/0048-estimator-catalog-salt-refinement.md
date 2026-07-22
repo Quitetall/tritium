@@ -145,6 +145,13 @@ coverage and duplicate-plugin tests.
   producer allocation. Consuming finalization installs directly into the durable
   namespace. Runtime capture from the pinned model and collection of 506 real
   records remain open.
+- [x] Add pinned-Qwen capture orchestration that exposes canonical tensor
+  ordinal, name, geometry, scope, role, and source identity to one runtime
+  callback at a time; resumes strictly valid records without replay; rejects
+  hostile or stale evidence before overwrite; publishes no active tensor after
+  callback failure; validates the exact namespace; and derives an ordered
+  evidence-set digest. The PyTorch/CUDA hook and empirical 506-record run remain
+  open.
 - Keep calibration, reconstruction and validation datasets source-bound and
   disjoint where the recipe requires.
 

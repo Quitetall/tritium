@@ -20,9 +20,10 @@ pub use additive_master::{
     Qwen36SelectedAllocationSpec, Qwen36SelectedProfileReceipt,
 };
 pub use ptq_driver::{
-    Qwen36PtqDriverError, Qwen36PtqEvidenceDirectory, Qwen36PtqPackageError,
-    Qwen36PtqPackageLimits, Qwen36PtqPackagesReceipt, reconcile_qwen36_ptq,
-    reconcile_qwen36_ptq_packages,
+    Qwen36PtqDriverError, Qwen36PtqEvidenceCaptureError, Qwen36PtqEvidenceCaptureReceipt,
+    Qwen36PtqEvidenceCaptureRequest, Qwen36PtqEvidenceDirectory, Qwen36PtqPackageError,
+    Qwen36PtqPackageLimits, Qwen36PtqPackagesReceipt, collect_qwen36_ptq_evidence,
+    reconcile_qwen36_ptq, reconcile_qwen36_ptq_packages,
 };
 
 use core::{convert::Infallible, fmt, fmt::Write as _};

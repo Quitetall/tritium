@@ -811,8 +811,15 @@ logarithmic for contiguous samples; exact residency telemetry and a hard
 64-segment-per-accumulator ceiling also bound adversarial out-of-order shard
 state. Exact record bytes are rejected against the destination ceiling before
 accumulator construction. Consuming finalization releases accumulator state
-before direct durable installation. The runtime adapter that captures real checkpoint
-activations/output factors and collects all 506 records remains open. Its
+before direct durable installation. The pinned Qwen collection seam now walks
+the canonical 506-tensor catalog one tensor at a time, strictly reuses matching
+records, rejects hostile namespaces before replay, exposes exact scope, role,
+geometry, and provenance to a runtime callback, and returns an ordered
+evidence-set digest after strict completion. This bounds live producer state to
+one tensor and makes runtime failure resumable without publishing the active
+tensor. The PyTorch/CUDA adapter that captures real checkpoint activations and
+output factors through this seam, and the actual 506-record collection, remain
+open. Its
 publication boundary is available: on supported platforms the evidence
 directory installs each bounded canonical record through a verified inode in a
 managed, reserved in-root staging directory and a no-overwrite hard link, so a
@@ -841,7 +848,8 @@ counts, and provenance drift before the reopened record can drive an exact
 tensor-master fit. The restart API consumes the source/cache/token identities
 already bound by that record, so it does not reconstruct a model-sized
 activation cache merely to resume pure PTQ. Checkpoint-scale evidence
-collection remains open.
+collection remains open; only its bounded, resumable runtime callback boundary
+is implemented.
 Pipeline ownership is process-serialized through a reserved lock namespace.
 Compact packages remain exact prefixes of their near-lossless packages. ADR
 0028's 2026-07-15 amendments make the ordered-master prefix curve, rather than

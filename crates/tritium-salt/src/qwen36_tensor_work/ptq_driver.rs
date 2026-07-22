@@ -1,5 +1,12 @@
 //! Checkpoint-backed, resumable Qwen3.6 pure-PTQ campaign driver.
 
+mod capture;
+
+pub use capture::{
+    Qwen36PtqEvidenceCaptureError, Qwen36PtqEvidenceCaptureReceipt,
+    Qwen36PtqEvidenceCaptureRequest, collect_qwen36_ptq_evidence,
+};
+
 use core::fmt;
 use std::{
     fs::{self, File},
@@ -180,6 +187,26 @@ impl Qwen36PtqEvidenceDirectory {
     /// noncanonical filename, duplicate/out-of-range ordinal, symlink/special
     /// entry, or incomplete record set.
     pub fn validate_complete(&self, record_count: u64) -> Result<(), Qwen36PtqDriverError> {
+        self.validate_namespace(record_count, true).map(|_| ())
+    }
+
+    /// Verify every currently present entry belongs to a bounded zero-based namespace.
+    ///
+    /// Missing canonical records are allowed for resumable capture. Extra,
+    /// duplicate, noncanonical, symlinked, or special entries are rejected.
+    ///
+    /// # Errors
+    /// Rejects the same malformed namespace state as [`Self::validate_complete`]
+    /// while allowing missing records.
+    pub fn validate_partial(&self, record_count: u64) -> Result<u64, Qwen36PtqDriverError> {
+        self.validate_namespace(record_count, false)
+    }
+
+    fn validate_namespace(
+        &self,
+        record_count: u64,
+        require_complete: bool,
+    ) -> Result<u64, Qwen36PtqDriverError> {
         self.verify_root()?;
         let record_count = usize::try_from(record_count)
             .ok()
@@ -189,6 +216,7 @@ impl Qwen36PtqEvidenceDirectory {
         seen.try_reserve_exact(record_count)
             .map_err(|_| Qwen36PtqDriverError::AllocationFailed)?;
         seen.resize(record_count, false);
+        let mut present = 0_u64;
         let entries = fs::read_dir(&self.root)
             .map_err(|error| evidence_io("read evidence directory", None, error))?;
         for entry in entries {
@@ -227,14 +255,17 @@ impl Qwen36PtqEvidenceDirectory {
                 ));
             }
             seen[tensor_index] = true;
+            present = present
+                .checked_add(1)
+                .ok_or(Qwen36PtqDriverError::AllocationFailed)?;
         }
-        if seen.contains(&false) {
+        if require_complete && seen.contains(&false) {
             return Err(Qwen36PtqDriverError::InvalidEvidencePath(
                 "incomplete record namespace",
             ));
         }
         self.verify_root()?;
-        Ok(())
+        Ok(present)
     }
 
     /// Strictly read and verify one canonical evidence record.
