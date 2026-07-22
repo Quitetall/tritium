@@ -21,6 +21,7 @@ STATUS_MODULE = runpy.run_path(ROOT / "scripts" / "release-status")
 status_main = STATUS_MODULE["main"]
 WHEEL_MODULE = runpy.run_path(ROOT / "scripts" / "wheel-functional-smoke.py")
 MATRIX_MODULE = runpy.run_path(ROOT / "scripts" / "aggregate-wheel-smoke.py")
+CRATE_MODULE = runpy.run_path(ROOT / "scripts" / "qualify-crate-archives.py")
 
 
 def canonical(value) -> bytes:
@@ -146,6 +147,71 @@ def entry(
 
 
 class ReleaseEvidenceStatusTests(unittest.TestCase):
+    def test_crate_archive_receipt_binds_complete_candidate_inventory(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            candidate, document, old_artifact, evidence_root = release_fixture(root)
+            old_artifact.unlink()
+            document["artifacts"] = []
+            packages = []
+            for name in ("alpha", "beta"):
+                archive = candidate.parent / f"{name}-1.1.0-rc.0.crate"
+                archive.write_bytes(name.encode())
+                identity = {"sha256": sha256(archive), "bytes": archive.stat().st_size}
+                artifact_id = f"crate-{name}"
+                document["artifacts"].append(
+                    {
+                        "id": artifact_id, "kind": "rust-crate", "path": archive.name,
+                        "identity": identity, "sbom": {}, "provenance": {},
+                    }
+                )
+                packages.append(
+                    {
+                        "artifact_id": artifact_id, "name": name,
+                        "version": "1.1.0-rc.0", "archive": archive.name,
+                        "bytes": identity["bytes"], "sha256": identity["sha256"],
+                    }
+                )
+            candidate.write_bytes(canonical(document) + b"\n")
+            receipt = {
+                "schema": CRATE_MODULE["SCHEMA"], "release": "1.1.0-rc.0",
+                "source_revision": "a" * 40, "run_id": "crate-run-1",
+                "started_at_utc": "2026-07-21T12:00:00Z", "duration_ms": 100.0,
+                "machine": {
+                    "machine_id": "sha256:" + "b" * 64,
+                    "system": "Linux", "architecture": "x86_64",
+                },
+                "toolchain": {"cargo": "cargo 1.89.0", "rustc": "rustc 1.89.0"},
+                "commands": [
+                    ["cargo", "vendor", "--locked", "--versioned-dirs"],
+                    ["cargo", "generate-lockfile", "--offline"],
+                    ["cargo", "check", "--offline", "--locked", "--all-targets"],
+                ],
+                "dependency_lock_sha256": sha256(ROOT / "Cargo.lock"),
+                "offline": True, "isolated_cargo_home": True, "packages": packages,
+                "compiled_packages": ["alpha", "beta"], "result": "pass",
+            }
+            receipt["receipt_id"] = "sha256:" + hashlib.sha256(
+                canonical(receipt)
+            ).hexdigest()
+            receipt_path = evidence_root / "crates.json"
+            CRATE_MODULE["_atomic_write"](receipt_path, receipt)
+            registry_path = evidence_root / "registry.json"
+            registry(
+                registry_path, candidate,
+                [{**entry(receipt_path, receipt, kind="crate-archive"), "artifact_id": "crate-alpha"}],
+            )
+            report = evaluate(registry_path, candidate, document)
+            row = next(item for item in report["rows"] if item["id"] == "packages")
+            self.assertEqual(row["satisfied_kinds"], ["crate-archive"])
+            self.assertEqual(
+                row["missing_kinds"],
+                ["clean-install", "compatibility-matrix", "npm-archive"],
+            )
+            (candidate.parent / "beta-1.1.0-rc.0.crate").write_bytes(b"tampered")
+            with self.assertRaises(EvidenceError):
+                evaluate(registry_path, candidate, document)
+
     def test_complete_abi3_matrix_binds_three_candidate_wheels(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
@@ -222,7 +288,8 @@ class ReleaseEvidenceStatusTests(unittest.TestCase):
             packages = next(row for row in report["rows"] if row["id"] == "packages")
             self.assertEqual(packages["satisfied_kinds"], ["compatibility-matrix"])
             self.assertEqual(
-                packages["missing_kinds"], ["clean-install", "local-archive"]
+                packages["missing_kinds"],
+                ["clean-install", "crate-archive", "npm-archive"],
             )
             (candidate.parent / identities["windows-x86_64-cpu"][0]).write_bytes(
                 b"tampered"
@@ -266,7 +333,8 @@ class ReleaseEvidenceStatusTests(unittest.TestCase):
             self.assertEqual(packages["status"], "MISSING")
             self.assertEqual(packages["satisfied_kinds"], ["clean-install"])
             self.assertEqual(
-                packages["missing_kinds"], ["compatibility-matrix", "local-archive"]
+                packages["missing_kinds"],
+                ["compatibility-matrix", "crate-archive", "npm-archive"],
             )
 
     def test_gate_status_distinguishes_pass_missing_and_structural(self):

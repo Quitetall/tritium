@@ -375,12 +375,20 @@ jobs:
           --output crate-evidence
           --source-revision ${{ github.sha }}
           --source-date-epoch 0
+      - name: qualify exact crate archives in offline consumer
+        run: >-
+          python scripts/qualify-crate-archives.py
+          --archives target/package
+          --source-revision ${{ github.sha }}
+          --release 1.1.0-rc.0
+          --run-id github-${{ github.run_id }}-${{ github.run_attempt }}-crate-archives
+          --output crate-evidence/crate-archive-qualification.json
       - uses: actions/upload-artifact@v4
         with:
           name: crate-candidates-${{ github.sha }}
           path: |
             target/package/*.crate
-            crate-evidence/*.cdx.json
+            crate-evidence/*.json
           if-no-files-found: error
 
   # SBOM (ADR 0011 / v0.90): generate a CycloneDX software bill of materials for the

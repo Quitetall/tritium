@@ -81,6 +81,16 @@ exact wheel per target, and match Linux, Windows and macOS wheel identities in
 candidate manifest. Matrix evidence cannot substitute for local crate/npm/image
 archives.
 
+Rust archive qualification consumes exact candidate-version `.crate` set from
+one clean revision. Every archive must have safe topology, matching
+`Cargo.toml.orig`, clean `.cargo_vcs_info.json`, and exact bytes. Harness extracts
+all archives outside source checkout, patches internal registry dependencies to
+those extracted packages, stages exact `Cargo.lock` dependencies with
+`cargo vendor --locked`, then uses empty `CARGO_HOME` for locked
+`cargo check --offline --all-targets` across every library-bearing package.
+Registry requires receipt inventory equal
+candidate `rust-crate` inventory. Npm archive qualification remains independent.
+
 ```bash
 scripts/release-status \
   --candidate release/v1.1/manifest.json \

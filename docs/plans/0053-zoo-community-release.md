@@ -251,8 +251,9 @@ Current `release-status` covers artifact/SBOM/provenance admission only and
 returns `CANDIDATE_EVIDENCE_VALID` without a registry. Its optional strict
 registry mode now binds the exact candidate, hard-codes every ADR 0033 gate,
 admits artifact-bound CUDA training, installed-wheel clean-install and complete
-candidate-bound ABI3 matrix schemas, emits human and JSON blocker reports, and
-refuses `LOCAL_RC_READY` for empty or partial evidence. Remaining
+candidate-bound ABI3 matrix plus offline crate-archive schemas, emits human and
+JSON blocker reports, and refuses `LOCAL_RC_READY` for empty or partial evidence.
+Npm archive admission remains a separate package blocker. Remaining
 receipt-kind validators and generated-claim drift checks must land before every
 model-zoo, package, browser, serving, deployment, signing and second-machine
 receipt can produce `LOCAL_RC_READY`.

@@ -19,6 +19,9 @@ WheelReceiptError = WHEEL_RECEIPT["SmokeError"]
 MATRIX_RECEIPT = runpy.run_path(Path(__file__).with_name("aggregate-wheel-smoke.py"))
 validate_matrix_receipt = MATRIX_RECEIPT["validate_receipt"]
 MatrixReceiptError = MATRIX_RECEIPT["AggregateError"]
+CRATE_RECEIPT = runpy.run_path(Path(__file__).with_name("qualify-crate-archives.py"))
+validate_crate_receipt = CRATE_RECEIPT["validate_receipt"]
+CrateReceiptError = CRATE_RECEIPT["ArchiveError"]
 
 SCHEMA = "tritium.release-evidence-registry.v1"
 REPORT_SCHEMA = "tritium.release-gate-report.v1"
@@ -26,7 +29,9 @@ TOP_FIELDS = {
     "schema", "release", "source_revision", "candidate_manifest_sha256", "receipts"
 }
 RECEIPT_FIELDS = {"id", "kind", "path", "sha256", "artifact_id", "parents"}
-KNOWN_KINDS = frozenset({"cuda-training", "clean-install", "compatibility-matrix"})
+KNOWN_KINDS = frozenset(
+    {"cuda-training", "clean-install", "compatibility-matrix", "crate-archive"}
+)
 HEX = frozenset("0123456789abcdef")
 MAX_RECEIPT_BYTES = 32 * 1024 * 1024
 
@@ -42,7 +47,10 @@ GATES = (
     ("estimators-refinement", ("estimator-validation", "refinement", "baseline-ablation")),
     ("browser", ("browser-conformance",)),
     ("onnx", ("onnx-inference",)),
-    ("packages", ("clean-install", "compatibility-matrix", "local-archive")),
+    (
+        "packages",
+        ("clean-install", "compatibility-matrix", "crate-archive", "npm-archive"),
+    ),
     ("serving", ("serving-deployment",)),
     ("zoo-community", ("model-zoo", "generated-claims", "governance-docs")),
     ("reproduction-signoff", ("second-machine", "independent-review", "signature")),
@@ -205,8 +213,11 @@ def evaluate(registry: Path, candidate: Path, candidate_document: dict[str, Any]
         artifact = artifacts.get(artifact_id)
         if artifact is None:
             raise EvidenceError(f"{label}.artifact_id is absent from candidate")
-        if artifact.get("kind") != "python-wheel":
-            raise EvidenceError("CUDA training evidence must bind a candidate Python wheel")
+        expected_artifact_kind = "rust-crate" if kind == "crate-archive" else "python-wheel"
+        if artifact.get("kind") != expected_artifact_kind:
+            raise EvidenceError(
+                f"{kind} evidence must bind candidate {expected_artifact_kind}"
+            )
         artifact_path = candidate.parent / _string(artifact.get("path"), "candidate artifact path")
         try:
             if kind == "cuda-training":
@@ -219,9 +230,18 @@ def evaluate(registry: Path, candidate: Path, candidate_document: dict[str, Any]
                 )
             elif kind == "compatibility-matrix":
                 receipt = validate_matrix_receipt(receipt_path, revision, release)
+            elif kind == "crate-archive":
+                receipt = validate_crate_receipt(
+                    receipt_path, candidate.parent,
+                    Path(__file__).resolve().parent.parent / "Cargo.lock",
+                    revision, release,
+                )
             else:
                 raise EvidenceError(f"{label}.kind has no validator dispatch")
-        except (OSError, CudaReceiptError, WheelReceiptError, MatrixReceiptError) as error:
+        except (
+            OSError, CudaReceiptError, WheelReceiptError, MatrixReceiptError,
+            CrateReceiptError,
+        ) as error:
             raise EvidenceError(f"{label} failed {kind} validation: {error}") from error
         if receipt["receipt_id"] != receipt_id:
             raise EvidenceError(f"{label}.id does not match the receipt identity")
@@ -252,6 +272,28 @@ def evaluate(registry: Path, candidate: Path, candidate_document: dict[str, Any]
             )
             if anchor not in matrix_wheels:
                 raise EvidenceError("compatibility matrix anchor is not a matrix wheel")
+        elif kind == "crate-archive":
+            candidate_crates = {
+                (
+                    item.get("id"),
+                    Path(str(item.get("path", ""))).name,
+                    item.get("identity", {}).get("sha256"),
+                    item.get("identity", {}).get("bytes"),
+                )
+                for item in artifacts.values()
+                if item.get("kind") == "rust-crate"
+            }
+            receipt_crates = {
+                (
+                    package["artifact_id"], package["archive"],
+                    package["sha256"], package["bytes"],
+                )
+                for package in receipt["packages"]
+            }
+            if receipt_crates != candidate_crates:
+                raise EvidenceError("crate receipt does not match candidate crate inventory")
+            if artifact_id not in {package["artifact_id"] for package in receipt["packages"]}:
+                raise EvidenceError("crate receipt anchor is not a qualified crate")
         elif receipt["artifact"]["kind"] != "python-wheel":
             raise EvidenceError(f"{kind} receipt does not identify a Python wheel")
         run_id = receipt["run_id"]

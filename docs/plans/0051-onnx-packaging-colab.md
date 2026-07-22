@@ -268,6 +268,17 @@ digest and exact wheel name/SHA-256/bytes. Strict reload revalidates complete
 CPython 3.9+ Linux/Windows and available macOS arm64 matrix, target/platform
 contracts and single-wheel reuse. Release registry matches all three wheel
 identities to candidate manifest; local archive admission remains separate.
+
+Publish-readiness now follows crate assembly/SBOM generation with exact archive
+qualification. Harness rejects missing/stale archives, revalidates safe package
+and clean VCS metadata, extracts all current-version crates into an isolated
+consumer, patches internal registry dependencies to those exact sources, and
+stages external dependencies from exact workspace lock with `cargo vendor
+--locked`. Locked all-target check then runs with network disabled and empty
+`CARGO_HOME`. Content-addressed receipt binds source/release/run/machine and
+toolchain, Cargo.lock digest, every archive identity and compiled package set.
+Release registry requires exact equality with candidate `rust-crate` inventory.
+Npm archive receipt remains separate.
 The exact npm archive verifier now emits its own deterministic CycloneDX 1.6
 document into retained evidence. It binds archive SHA-256/bytes, package/version,
 source revision, WASM guest digest, every lockfile component with strong
