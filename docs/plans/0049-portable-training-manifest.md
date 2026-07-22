@@ -217,6 +217,11 @@ transfers, dtype/limit declarations and per-vector scratch ceilings. CPU, CUDA,
 ROCm, Metal, native wgpu, WASI and MCU are all mandatory; emulation/fallback
 markers and duplicate identities fail. This is validator infrastructure only:
 ROCm, Metal and MCU implementations/physical candidate receipts remain open.
+The clean-revision backend aggregator now consumes seven explicit
+family-to-candidate-artifact bindings in frozen order, rejects duplicate or
+misassigned bundles, derives every artifact identity from the candidate, and
+self-validates the final receipt before atomic publication. It cannot turn a
+missing target or emulated bundle into release evidence.
 Performance is a separate exact child receipt,
 `tritium.training-performance-qualification.v1`. It must measure the same seven
 candidate bundles and physical device identities under the complete 114-case
@@ -225,6 +230,14 @@ median throughput and CPU-relative speed, p95, resident/scratch peaks, zero host
 transfers/global synchronizations, native execution and a passing regression
 budget. Throughput and bounded-latency tiers remain distinct. No empirical
 seven-target performance receipt exists.
+The performance producer now consumes raw per-target traces rather than caller
+supplied aggregates, validates the exact backend-manifest parent and device,
+requires the complete workload with at least ten warmups and thirty samples,
+computes median, nearest-rank p95, throughput, CPU-relative speed, memory peaks,
+transfer/synchronization totals and energy, retains every trace byte, and
+self-validates the result. Receipt admission independently reopens those traces
+and recomputes the aggregates. Producer availability does not substitute for
+the seven physical target runs.
 Release admission accepts only a clean immutable Git commit identity. The shared
 build helper also fingerprints dirty development trees and registers git metadata
 plus every tracked and currently-untracked source path as Cargo rebuild inputs,

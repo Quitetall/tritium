@@ -37,11 +37,33 @@ def fixture(root: Path):
     candidate = root / "manifest.json"
     candidate.write_bytes(canonical({"artifacts": candidate_artifacts}))
     measurements = []
+    traces = root / "traces"
+    traces.mkdir()
     cpu_median = 100.0
     for ordinal, (family, artifact) in enumerate(
         zip(MODULE["FAMILIES"], records, strict=True)
     ):
         median = cpu_median / (ordinal + 1)
+        p95 = median * 1.2
+        trace_path = traces / f"{family}.json"
+        trace_path.write_bytes(canonical({
+            "schema": MODULE["TRACE_SCHEMA"], "family": family,
+            "artifact_id": artifact["id"],
+            "physical_device": f"{family}:device-{ordinal}",
+            "workload_id": "training-manifest-v1-full-114",
+            "budget_id": "sha256:" + "9" * 64,
+            "warmups_ms": [median] * 10,
+            "samples": [
+                {
+                    "elapsed_ms": value, "cases": 114,
+                    "peak_resident_bytes": 1000, "peak_scratch_bytes": 100,
+                    "host_transfers": 0, "global_synchronizations": 0,
+                    "native_execution": True, "budget_pass": True,
+                    "energy_joules": None,
+                }
+                for value in [*([median] * 28), p95, p95]
+            ],
+        }))
         measurements.append(
             {
                 "family": family,
@@ -49,12 +71,17 @@ def fixture(root: Path):
                 "artifact": artifact, "physical_device": f"{family}:device-{ordinal}",
                 "warmup_iterations": 10, "sample_count": 30,
                 "cases_per_sample": 114, "median_ms": median,
-                "p95_ms": median * 1.2, "cases_per_second": 114000 / median,
+                "p95_ms": p95, "cases_per_second": 114000 / median,
                 "cpu_relative_speed": cpu_median / median,
                 "peak_resident_bytes": 1000, "peak_scratch_bytes": 100,
                 "host_transfers": 0, "global_synchronizations": 0,
                 "native_execution": True, "budget_pass": True,
                 "energy_joules": None,
+                "trace": {
+                    "path": trace_path.relative_to(root).as_posix(),
+                    "bytes": trace_path.stat().st_size,
+                    "sha256": hashlib.sha256(trace_path.read_bytes()).hexdigest(),
+                },
             }
         )
     receipt = {

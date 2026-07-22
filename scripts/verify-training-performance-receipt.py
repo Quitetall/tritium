@@ -8,6 +8,7 @@ import json
 import math
 from pathlib import Path, PurePosixPath
 import re
+import statistics
 from typing import Any
 
 
@@ -23,8 +24,20 @@ MEASUREMENT_FIELDS = {
     "sample_count", "cases_per_sample", "median_ms", "p95_ms", "cases_per_second",
     "cpu_relative_speed", "peak_resident_bytes", "peak_scratch_bytes", "host_transfers",
     "global_synchronizations", "native_execution", "budget_pass", "energy_joules",
+    "trace",
 }
 ARTIFACT_FIELDS = {"id", "kind", "name", "bytes", "sha256", "blake3"}
+FILE_FIELDS = {"path", "bytes", "sha256"}
+TRACE_SCHEMA = "tritium.training-performance-samples.v1"
+TRACE_FIELDS = {
+    "schema", "family", "artifact_id", "physical_device", "workload_id",
+    "budget_id", "warmups_ms", "samples",
+}
+SAMPLE_FIELDS = {
+    "elapsed_ms", "cases", "peak_resident_bytes", "peak_scratch_bytes",
+    "host_transfers", "global_synchronizations", "native_execution",
+    "budget_pass", "energy_joules",
+}
 MAX_RECEIPT_BYTES = 32 * 1024 * 1024
 
 
@@ -104,6 +117,84 @@ def contained(root: Path, value: Any) -> Path:
     return path
 
 
+def support_file(root: Path, value: Any, label: str) -> Path:
+    record = object_(value, FILE_FIELDS, label)
+    path = contained(root, record["path"])
+    if (
+        path.stat().st_size > MAX_RECEIPT_BYTES
+        or path.stat().st_size != integer(record["bytes"], f"{label}.bytes", 1)
+        or sha256(path) != record["sha256"]
+    ):
+        raise TrainingPerformanceError(f"{label} bytes drifted")
+    return path
+
+
+def percentile95(values: list[float]) -> float:
+    ordered = sorted(values)
+    return ordered[math.ceil(0.95 * len(ordered)) - 1]
+
+
+def validate_trace(
+    path: Path, measurement: dict[str, Any], workload_id: str, budget_id: str
+) -> None:
+    try:
+        trace = object_(json.loads(path.read_bytes()), TRACE_FIELDS, "performance trace")
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise TrainingPerformanceError("performance trace is not UTF-8 JSON") from error
+    if (
+        trace["schema"] != TRACE_SCHEMA
+        or trace["family"] != measurement["family"]
+        or trace["artifact_id"] != measurement["artifact"]["id"]
+        or trace["physical_device"] != measurement["physical_device"]
+        or trace["workload_id"] != workload_id
+        or trace["budget_id"] != budget_id
+    ):
+        raise TrainingPerformanceError("performance trace identity differs")
+    warmups = trace["warmups_ms"]
+    if not isinstance(warmups, list) or len(warmups) != measurement["warmup_iterations"]:
+        raise TrainingPerformanceError("performance warmup trace is incomplete")
+    for value in warmups:
+        number(value, "warmup milliseconds", 1e-12)
+    samples = trace["samples"]
+    if not isinstance(samples, list) or len(samples) != measurement["sample_count"]:
+        raise TrainingPerformanceError("performance sample trace is incomplete")
+    elapsed = []
+    resident = []
+    scratch = []
+    transfers = 0
+    synchronizations = 0
+    energies = []
+    for ordinal, raw in enumerate(samples):
+        sample = object_(raw, SAMPLE_FIELDS, f"samples[{ordinal}]")
+        elapsed.append(number(sample["elapsed_ms"], "sample elapsed", 1e-12))
+        if integer(sample["cases"], "sample cases", 114) != 114:
+            raise TrainingPerformanceError("performance sample is not the full corpus")
+        resident.append(integer(sample["peak_resident_bytes"], "sample resident", 1))
+        scratch.append(integer(sample["peak_scratch_bytes"], "sample scratch", 0))
+        transfers += integer(sample["host_transfers"], "sample host transfers", 0)
+        synchronizations += integer(
+            sample["global_synchronizations"], "sample synchronizations", 0
+        )
+        if sample["native_execution"] is not True or sample["budget_pass"] is not True:
+            raise TrainingPerformanceError("performance sample is non-native or over budget")
+        energy = sample["energy_joules"]
+        if energy is not None:
+            energies.append(number(energy, "sample energy", 1e-12))
+    median = statistics.median(elapsed)
+    p95 = percentile95(elapsed)
+    expected_energy = sum(energies) if len(energies) == len(samples) else None
+    if (
+        not close(measurement["median_ms"], median)
+        or not close(measurement["p95_ms"], p95)
+        or measurement["peak_resident_bytes"] != max(resident)
+        or measurement["peak_scratch_bytes"] != max(scratch)
+        or measurement["host_transfers"] != transfers
+        or measurement["global_synchronizations"] != synchronizations
+        or measurement["energy_joules"] != expected_energy
+    ):
+        raise TrainingPerformanceError("performance aggregate differs from raw trace")
+
+
 def inventory(candidate: Path) -> dict[str, tuple[tuple[Any, ...], Path]]:
     if candidate.is_symlink() or not candidate.is_file():
         raise TrainingPerformanceError("candidate manifest must be ordinary")
@@ -167,6 +258,7 @@ def validate(
         raise TrainingPerformanceError("all seven backend measurements are required")
     cpu_median = None
     seen_devices = set()
+    support_root = receipt_path.parent.resolve(strict=True)
     for ordinal, family in enumerate(FAMILIES):
         measurement = object_(
             measurements[ordinal], MEASUREMENT_FIELDS, f"measurements[{ordinal}]"
@@ -228,6 +320,10 @@ def validate(
             or p95 < median
         ):
             raise TrainingPerformanceError("performance residency or budget gate failed")
+        trace_path = support_file(support_root, measurement["trace"], "performance trace")
+        validate_trace(
+            trace_path, measurement, receipt["workload_id"], receipt["budget_id"]
+        )
     unsigned = dict(receipt)
     receipt_id = unsigned.pop("receipt_id")
     expected_id = "sha256:" + hashlib.sha256(canonical(unsigned)).hexdigest()
