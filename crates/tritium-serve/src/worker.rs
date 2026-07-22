@@ -23,11 +23,15 @@
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use tokio::sync::mpsc;
 
 use crate::generator::{FinishReason, GenRequest, Generator, TreeOpError};
+
+pub(crate) const PHASE_IDLE: u8 = 0;
+pub(crate) const PHASE_PREFILL: u8 = 1;
+pub(crate) const PHASE_DECODE: u8 = 2;
 
 /// An event streamed from the worker to a request's response task.
 #[derive(Debug, Clone)]
@@ -83,6 +87,7 @@ pub(crate) fn spawn_worker(
     mut generator: Box<dyn Generator>,
     draining: Arc<AtomicBool>,
     worker_alive: Arc<AtomicBool>,
+    phase: Arc<AtomicU8>,
     queue_cap: usize,
 ) -> mpsc::Sender<Job> {
     let (job_tx, mut job_rx) = mpsc::channel::<Job>(queue_cap.max(1));
@@ -91,9 +96,21 @@ pub(crate) fn spawn_worker(
         .name("tritium-serve-decode".to_owned())
         .spawn(move || {
             let _alive = AliveGuard(worker_alive);
+            struct PhaseGuard(Arc<AtomicU8>);
+            impl Drop for PhaseGuard {
+                fn drop(&mut self) {
+                    self.0.store(PHASE_IDLE, Ordering::Release);
+                }
+            }
             while let Some(job) = job_rx.blocking_recv() {
                 match job {
                     Job::Generate { req, tx } => {
+                        if draining.load(Ordering::Acquire) {
+                            let _ = tx.try_send(GenEvent::Error("server draining".to_owned()));
+                            continue;
+                        }
+                        phase.store(PHASE_PREFILL, Ordering::Release);
+                        let _phase = PhaseGuard(phase.clone());
                         // Run the (panic-prone) generation under catch_unwind so one
                         // bad job can't kill the worker. `final_reason` lives inside
                         // the closure so its &mut borrow can't cross the unwind
@@ -101,6 +118,7 @@ pub(crate) fn spawn_worker(
                         let outcome = catch_unwind(AssertUnwindSafe(|| {
                             let mut final_reason = FinishReason::Stop;
                             let res = generator.generate(&req, &mut |step| {
+                                phase.store(PHASE_DECODE, Ordering::Release);
                                 if let Some(fr) = step.finish_reason {
                                     final_reason = fr;
                                 }
@@ -129,6 +147,13 @@ pub(crate) fn spawn_worker(
                         }
                     }
                     Job::OpenTreeSession { prompt, resp } => {
+                        if draining.load(Ordering::Acquire) {
+                            let _ =
+                                resp.send(Err(TreeOpError::Draining("server draining".to_owned())));
+                            continue;
+                        }
+                        phase.store(PHASE_PREFILL, Ordering::Release);
+                        let _phase = PhaseGuard(phase.clone());
                         let outcome =
                             catch_unwind(AssertUnwindSafe(|| generator.open_tree_session(&prompt)));
                         let _ = resp.send(match outcome {
@@ -143,6 +168,13 @@ pub(crate) fn spawn_worker(
                         parents,
                         resp,
                     } => {
+                        if draining.load(Ordering::Acquire) {
+                            let _ =
+                                resp.send(Err(TreeOpError::Draining("server draining".to_owned())));
+                            continue;
+                        }
+                        phase.store(PHASE_DECODE, Ordering::Release);
+                        let _phase = PhaseGuard(phase.clone());
                         let outcome = catch_unwind(AssertUnwindSafe(|| {
                             generator.tree_verify(&tokens, &parents)
                         }));

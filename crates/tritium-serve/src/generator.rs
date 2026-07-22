@@ -117,6 +117,8 @@ impl std::error::Error for GenError {}
 /// must not turn into a 501).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TreeOpError {
+    /// Work admitted before shutdown but cancelled while queued → HTTP 503.
+    Draining(String),
     /// The generator/backend cannot do tree-verify at all → HTTP 501.
     Unsupported(String),
     /// No open session (or it was invalidated by a generation) → HTTP 409.
@@ -130,7 +132,8 @@ pub enum TreeOpError {
 impl fmt::Display for TreeOpError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            TreeOpError::Unsupported(m)
+            TreeOpError::Draining(m)
+            | TreeOpError::Unsupported(m)
             | TreeOpError::Conflict(m)
             | TreeOpError::BadRequest(m)
             | TreeOpError::Internal(m) => f.write_str(m),

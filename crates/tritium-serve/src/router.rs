@@ -3,7 +3,7 @@
 //! drain flag for graceful shutdown.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::extract::State;
@@ -27,7 +27,7 @@ use crate::sse::{
     IncrementalDetok, StopMatcher, content_chunk, error_chunk, role_chunk, terminal_chunk,
 };
 use crate::startup::{AdmittedGeneratorV1, ProductionReadiness, prepare_production_generator};
-use crate::worker::{GenEvent, Job, spawn_worker};
+use crate::worker::{GenEvent, Job, PHASE_DECODE, PHASE_IDLE, PHASE_PREFILL, spawn_worker};
 
 /// How `/v1/chat/completions` renders `messages` into the prompt string
 /// handed to the tokenizer.
@@ -219,6 +219,7 @@ struct AppState {
 struct RuntimeState {
     draining: Arc<AtomicBool>,
     worker_alive: Arc<AtomicBool>,
+    phase: Arc<AtomicU8>,
     production: Option<ProductionReadiness>,
 }
 
@@ -242,10 +243,12 @@ pub fn build_router_with_limits(
 ) -> (Router, Arc<AtomicBool>) {
     let draining = Arc::new(AtomicBool::new(false));
     let worker_alive = Arc::new(AtomicBool::new(true));
+    let phase = Arc::new(AtomicU8::new(PHASE_IDLE));
     let jobs = spawn_worker(
         generator,
         draining.clone(),
         worker_alive.clone(),
+        phase.clone(),
         cfg.queue_cap,
     );
     let admission = Arc::new(Admission::legacy(cfg.auth_token.as_deref()));
@@ -258,6 +261,7 @@ pub fn build_router_with_limits(
         RuntimeState {
             draining,
             worker_alive,
+            phase,
             production: None,
         },
     )
@@ -278,10 +282,12 @@ pub fn build_router_governed(
     let admission = Arc::new(Admission::new(cfg.auth_token.as_deref(), policy)?);
     let draining = Arc::new(AtomicBool::new(false));
     let worker_alive = Arc::new(AtomicBool::new(true));
+    let phase = Arc::new(AtomicU8::new(PHASE_IDLE));
     let jobs = spawn_worker(
         generator,
         draining.clone(),
         worker_alive.clone(),
+        phase.clone(),
         cfg.queue_cap,
     );
     Ok(build_router_inner(
@@ -293,6 +299,7 @@ pub fn build_router_governed(
         RuntimeState {
             draining,
             worker_alive,
+            phase,
             production: None,
         },
     ))
@@ -313,10 +320,12 @@ pub fn build_router_production(
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     let draining = Arc::new(AtomicBool::new(false));
     let worker_alive = Arc::new(AtomicBool::new(true));
+    let phase = Arc::new(AtomicU8::new(PHASE_IDLE));
     let jobs = spawn_worker(
         generator,
         draining.clone(),
         worker_alive.clone(),
+        phase.clone(),
         cfg.queue_cap,
     );
     let (router, _) = build_router_inner(
@@ -328,6 +337,7 @@ pub fn build_router_production(
         RuntimeState {
             draining: draining.clone(),
             worker_alive,
+            phase,
             production: Some(production.clone()),
         },
     );
@@ -399,8 +409,10 @@ fn build_router_batched_inner(
     let (jobs_tx, jobs_rx) = tokio::sync::mpsc::channel(cfg.queue_cap);
     let worker_alive = Arc::new(AtomicBool::new(true));
     let draining = Arc::new(AtomicBool::new(false));
+    let phase = Arc::new(AtomicU8::new(PHASE_IDLE));
     let alive = worker_alive.clone();
     let drain_flag = draining.clone();
+    let worker_phase = phase.clone();
     let pool_tokens = cfg.kv_pool_tokens;
     std::thread::Builder::new()
         .name("tritium-serve-batch".into())
@@ -414,7 +426,15 @@ fn build_router_batched_inner(
                 }
             }
             let _guard = Guard(alive);
-            crate::batch::run_batched(runner, eos, slots, pool_tokens, jobs_rx, drain_flag);
+            crate::batch::run_batched(
+                runner,
+                eos,
+                slots,
+                pool_tokens,
+                jobs_rx,
+                drain_flag,
+                worker_phase,
+            );
         })?;
     Ok(build_router_inner(
         jobs_tx,
@@ -425,6 +445,7 @@ fn build_router_batched_inner(
         RuntimeState {
             draining,
             worker_alive,
+            phase,
             production: None,
         },
     ))
@@ -1219,6 +1240,7 @@ async fn readiness(State(st): State<AppState>) -> Response {
 /// Gauges are scrape-time reads; counters live in [`Metrics`].
 async fn metrics(State(st): State<AppState>) -> Response {
     let queue_depth = st.jobs.max_capacity() - st.jobs.capacity();
+    let phase = st.runtime.phase.load(Ordering::Acquire);
     let body = format!(
         "# HELP tritium_chat_requests_total Chat completions accepted into the queue.\n\
          # TYPE tritium_chat_requests_total counter\n\
@@ -1244,6 +1266,11 @@ async fn metrics(State(st): State<AppState>) -> Response {
          # HELP tritium_worker_alive Decode worker liveness (1 = alive).\n\
          # TYPE tritium_worker_alive gauge\n\
          tritium_worker_alive {}\n\
+         # HELP tritium_worker_phase Current decode-worker phase as one-hot fixed-cardinality gauges.\n\
+         # TYPE tritium_worker_phase gauge\n\
+         tritium_worker_phase{{phase=\"idle\"}} {}\n\
+         tritium_worker_phase{{phase=\"prefill\"}} {}\n\
+         tritium_worker_phase{{phase=\"decode\"}} {}\n\
          # HELP tritium_spec_verifies_total Spec-decode tree verifies.\n\
          # TYPE tritium_spec_verifies_total counter\n\
          tritium_spec_verifies_total {}\n\
@@ -1258,6 +1285,9 @@ async fn metrics(State(st): State<AppState>) -> Response {
         st.metrics.stream_disconnects.load(Ordering::Relaxed),
         queue_depth,
         u8::from(st.runtime.worker_alive.load(Ordering::Relaxed)),
+        u8::from(phase == PHASE_IDLE),
+        u8::from(phase == PHASE_PREFILL),
+        u8::from(phase == PHASE_DECODE),
         crate::generator::SPEC_VERIFIES.load(Ordering::Relaxed),
         crate::generator::SPEC_COMMITTED.load(Ordering::Relaxed),
     );
@@ -1407,6 +1437,7 @@ fn tree_queue_error(e: mpsc::error::TrySendError<Job>) -> Response {
 /// a CUDA driver message containing "not supported" stays a 500).
 fn tree_error(e: &TreeOpError) -> Response {
     let (code, kind) = match e {
+        TreeOpError::Draining(_) => (StatusCode::SERVICE_UNAVAILABLE, "draining"),
         TreeOpError::Unsupported(_) => (StatusCode::NOT_IMPLEMENTED, "tree_unsupported"),
         TreeOpError::Conflict(_) => (StatusCode::CONFLICT, "tree_session_closed"),
         TreeOpError::BadRequest(_) => (StatusCode::BAD_REQUEST, "tree_bad_request"),

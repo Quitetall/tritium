@@ -7,7 +7,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use axum::Router;
@@ -56,6 +56,104 @@ impl Generator for PanicGen {
     }
     fn vocab(&self) -> usize {
         128_256
+    }
+}
+
+struct PhaseGateGen {
+    calls: Arc<AtomicUsize>,
+    prefill_entered: Arc<AtomicBool>,
+    release_prefill: Arc<AtomicBool>,
+    decode_entered: Arc<AtomicBool>,
+    release_decode: Arc<AtomicBool>,
+}
+
+impl Generator for PhaseGateGen {
+    fn generate(
+        &mut self,
+        _req: &GenRequest,
+        on_step: &mut dyn FnMut(Step) -> bool,
+    ) -> Result<(), GenError> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        if call == 0 {
+            self.prefill_entered.store(true, Ordering::SeqCst);
+            while !self.release_prefill.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+            let _ = on_step(Step {
+                token: 10,
+                finished: false,
+                logprobs: None,
+                finish_reason: None,
+            });
+            self.decode_entered.store(true, Ordering::SeqCst);
+            while !self.release_decode.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+        }
+        Ok(())
+    }
+
+    fn n_ctx(&self) -> usize {
+        4096
+    }
+
+    fn vocab(&self) -> usize {
+        128_256
+    }
+}
+
+async fn wait_flag(flag: &AtomicBool) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !flag.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("worker phase transition timed out");
+}
+
+struct TreeGateGen {
+    open_entered: Arc<AtomicBool>,
+    release_open: Arc<AtomicBool>,
+    verify_entered: Arc<AtomicBool>,
+    release_verify: Arc<AtomicBool>,
+}
+
+impl Generator for TreeGateGen {
+    fn generate(
+        &mut self,
+        _req: &GenRequest,
+        _on_step: &mut dyn FnMut(Step) -> bool,
+    ) -> Result<(), GenError> {
+        Ok(())
+    }
+
+    fn n_ctx(&self) -> usize {
+        4096
+    }
+
+    fn vocab(&self) -> usize {
+        128_256
+    }
+
+    fn open_tree_session(&mut self, _prompt: &[u32]) -> Result<u32, tritium_serve::TreeOpError> {
+        self.open_entered.store(true, Ordering::SeqCst);
+        while !self.release_open.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        Ok(10)
+    }
+
+    fn tree_verify(
+        &mut self,
+        _tokens: &[u32],
+        _parents: &[i32],
+    ) -> Result<Vec<u32>, tritium_serve::TreeOpError> {
+        self.verify_entered.store(true, Ordering::SeqCst);
+        while !self.release_verify.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        Ok(vec![10])
     }
 }
 
@@ -639,6 +737,110 @@ async fn graceful_shutdown_midstream_is_wellformed() {
     );
 }
 
+#[tokio::test]
+async fn worker_phase_is_causal_and_drain_skips_queued_prefill() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let prefill_entered = Arc::new(AtomicBool::new(false));
+    let release_prefill = Arc::new(AtomicBool::new(false));
+    let decode_entered = Arc::new(AtomicBool::new(false));
+    let release_decode = Arc::new(AtomicBool::new(false));
+    let generator = PhaseGateGen {
+        calls: calls.clone(),
+        prefill_entered: prefill_entered.clone(),
+        release_prefill: release_prefill.clone(),
+        decode_entered: decode_entered.clone(),
+        release_decode: release_decode.clone(),
+    };
+    let cfg = ServeConfig {
+        queue_cap: 1,
+        ..ServeConfig::default()
+    };
+    let (router, draining) = build_router(Box::new(generator), shared_tok(), cfg);
+
+    let first = router
+        .clone()
+        .oneshot(chat(json!({
+            "model": "tritium",
+            "messages": [{"role": "user", "content": "1"}],
+            "stream": true
+        })))
+        .await
+        .unwrap();
+    let mut first_body = first.into_body();
+    assert!(first_body.frame().await.transpose().unwrap().is_some());
+    wait_flag(&prefill_entered).await;
+
+    let (_, metrics) = send(
+        &router,
+        Request::get("/metrics").body(Body::empty()).unwrap(),
+    )
+    .await;
+    let metrics = String::from_utf8(metrics).unwrap();
+    assert!(
+        metrics.contains("tritium_worker_phase{phase=\"prefill\"} 1\n"),
+        "{metrics}"
+    );
+
+    let second = router
+        .clone()
+        .oneshot(chat(json!({
+            "model": "tritium",
+            "messages": [{"role": "user", "content": "2"}],
+            "stream": true
+        })))
+        .await
+        .unwrap();
+    let mut second_body = second.into_body();
+    assert!(second_body.frame().await.transpose().unwrap().is_some());
+    let (_, metrics) = send(
+        &router,
+        Request::get("/metrics").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert!(
+        String::from_utf8(metrics)
+            .unwrap()
+            .contains("tritium_queue_depth 1\n")
+    );
+
+    release_prefill.store(true, Ordering::SeqCst);
+    wait_flag(&decode_entered).await;
+    let (_, metrics) = send(
+        &router,
+        Request::get("/metrics").body(Body::empty()).unwrap(),
+    )
+    .await;
+    let metrics = String::from_utf8(metrics).unwrap();
+    assert!(
+        metrics.contains("tritium_worker_phase{phase=\"decode\"} 1\n"),
+        "{metrics}"
+    );
+
+    draining.store(true, Ordering::SeqCst);
+    release_decode.store(true, Ordering::SeqCst);
+    let first_tail = tokio::time::timeout(Duration::from_secs(2), first_body.collect())
+        .await
+        .unwrap()
+        .unwrap()
+        .to_bytes();
+    let second_tail = tokio::time::timeout(Duration::from_secs(2), second_body.collect())
+        .await
+        .unwrap()
+        .unwrap()
+        .to_bytes();
+    assert!(!first_tail.is_empty());
+    assert!(
+        String::from_utf8_lossy(&second_tail).contains("\"finish_reason\":\"error\""),
+        "{}",
+        String::from_utf8_lossy(&second_tail)
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "queued request must not enter prefill after drain"
+    );
+}
+
 // ───────────────────── BASTION tree-verify surface (ADR 0014) ─────────────────────
 
 /// A session-capable test generator: scripted pending token + committed
@@ -717,6 +919,133 @@ async fn post_json(
         .to_bytes();
     let v = serde_json::from_slice(&bytes).unwrap_or(serde_json::json!(null));
     (status, v)
+}
+
+#[tokio::test]
+async fn tree_work_reports_phases_and_queued_drain_is_503() {
+    let open_entered = Arc::new(AtomicBool::new(false));
+    let release_open = Arc::new(AtomicBool::new(false));
+    let verify_entered = Arc::new(AtomicBool::new(false));
+    let release_verify = Arc::new(AtomicBool::new(false));
+    let tree = TreeGateGen {
+        open_entered: open_entered.clone(),
+        release_open: release_open.clone(),
+        verify_entered: verify_entered.clone(),
+        release_verify: release_verify.clone(),
+    };
+    let (router, _) = build_router(Box::new(tree), shared_tok(), ServeConfig::default());
+
+    let mut request_router = router.clone();
+    let open = tokio::spawn(async move {
+        post_json(
+            &mut request_router,
+            "/v1/tree/session",
+            json!({"prompt_tokens": [1]}),
+        )
+        .await
+    });
+    wait_flag(&open_entered).await;
+    let (_, metrics) = send(
+        &router,
+        Request::get("/metrics").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert!(
+        String::from_utf8(metrics)
+            .unwrap()
+            .contains("tritium_worker_phase{phase=\"prefill\"} 1\n")
+    );
+    release_open.store(true, Ordering::SeqCst);
+    assert_eq!(open.await.unwrap().0, 200);
+
+    let mut request_router = router.clone();
+    let verify = tokio::spawn(async move {
+        post_json(
+            &mut request_router,
+            "/v1/tree/verify",
+            json!({"tokens": [10], "parents": [-1]}),
+        )
+        .await
+    });
+    wait_flag(&verify_entered).await;
+    let (_, metrics) = send(
+        &router,
+        Request::get("/metrics").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert!(
+        String::from_utf8(metrics)
+            .unwrap()
+            .contains("tritium_worker_phase{phase=\"decode\"} 1\n")
+    );
+    release_verify.store(true, Ordering::SeqCst);
+    assert_eq!(verify.await.unwrap().0, 200);
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let prefill_entered = Arc::new(AtomicBool::new(false));
+    let release_prefill = Arc::new(AtomicBool::new(false));
+    let decode_entered = Arc::new(AtomicBool::new(false));
+    let release_decode = Arc::new(AtomicBool::new(false));
+    let generator = PhaseGateGen {
+        calls: calls.clone(),
+        prefill_entered: prefill_entered.clone(),
+        release_prefill: release_prefill.clone(),
+        decode_entered,
+        release_decode: release_decode.clone(),
+    };
+    let (router, draining) =
+        build_router(Box::new(generator), shared_tok(), ServeConfig::default());
+    let first = router
+        .clone()
+        .oneshot(chat(json!({
+            "model": "tritium",
+            "messages": [{"role": "user", "content": "1"}],
+            "stream": true
+        })))
+        .await
+        .unwrap();
+    let mut first_body = first.into_body();
+    assert!(first_body.frame().await.transpose().unwrap().is_some());
+    wait_flag(&prefill_entered).await;
+
+    let mut request_router = router.clone();
+    let queued = tokio::spawn(async move {
+        post_json(
+            &mut request_router,
+            "/v1/tree/session",
+            json!({"prompt_tokens": [1]}),
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let (_, metrics) = send(
+                &router,
+                Request::get("/metrics").body(Body::empty()).unwrap(),
+            )
+            .await;
+            if String::from_utf8(metrics)
+                .unwrap()
+                .contains("tritium_queue_depth 1\n")
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("tree request did not enter queue");
+    draining.store(true, Ordering::SeqCst);
+    release_prefill.store(true, Ordering::SeqCst);
+    release_decode.store(true, Ordering::SeqCst);
+    let (status, body) = tokio::time::timeout(Duration::from_secs(2), queued)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status, 503);
+    assert_eq!(body["error"]["type"], "draining");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    drop(first_body);
 }
 
 #[tokio::test]
@@ -1104,6 +1433,18 @@ async fn metrics_exposition() {
         "{text}"
     );
     assert!(text.contains("tritium_worker_alive 1\n"), "{text}");
+    assert!(
+        text.contains("tritium_worker_phase{phase=\"idle\"} 1\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("tritium_worker_phase{phase=\"prefill\"} 0\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("tritium_worker_phase{phase=\"decode\"} 0\n"),
+        "{text}"
+    );
     assert!(text.contains("# TYPE tritium_queue_depth gauge"), "{text}");
 
     // Auth uniformity: with a token configured, /metrics 401s like the rest.

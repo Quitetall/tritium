@@ -49,12 +49,12 @@
 //! Remaining phase-2 cost: free slots still burn their dense GEMM rows.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use tokio::sync::mpsc;
 
 use crate::generator::{FinishReason, GenRequest, Sampling};
-use crate::worker::{GenEvent, Job};
+use crate::worker::{GenEvent, Job, PHASE_DECODE, PHASE_IDLE, PHASE_PREFILL};
 
 /// Default prompt tokens per prefill chunk during admission (C1). 128 bounds a
 /// live slot's inter-token gap to one ~128-token prefill + one decode step.
@@ -140,14 +140,14 @@ impl Pending {
     }
 
     /// Fail because the server is draining — same classification a
-    /// queue-drained job gets (Unsupported/503-shaped, not Internal/500).
+    /// queue-drained job gets (Draining/503, not Internal/500).
     fn fail_draining(self) {
         match self.goal {
             PendingGoal::Admit { tx, .. } => {
                 let _ = tx.try_send(GenEvent::Error("server draining".into()));
             }
             PendingGoal::TreeOpen { resp, .. } => {
-                let _ = resp.send(Err(crate::generator::TreeOpError::Unsupported(
+                let _ = resp.send(Err(crate::generator::TreeOpError::Draining(
                     "server draining".into(),
                 )));
             }
@@ -253,7 +253,15 @@ pub(crate) fn run_batched(
     pool_tokens: Option<usize>,
     mut job_rx: mpsc::Receiver<Job>,
     draining: Arc<AtomicBool>,
+    phase: Arc<AtomicU8>,
 ) {
+    struct PhaseGuard(Arc<AtomicU8>);
+    impl Drop for PhaseGuard {
+        fn drop(&mut self) {
+            self.0.store(PHASE_IDLE, Ordering::Release);
+        }
+    }
+    let _phase_guard = PhaseGuard(phase.clone());
     if slots == 0 {
         eprintln!("tritium-serve: --batch-slots must be >= 1");
         return;
@@ -369,6 +377,7 @@ pub(crate) fn run_batched(
                     Err(mpsc::error::TryRecvError::Disconnected) => return,
                 }
             } else {
+                phase.store(PHASE_IDLE, Ordering::Release);
                 match job_rx.blocking_recv() {
                     Some(j) => j,
                     None => return,
@@ -384,12 +393,12 @@ pub(crate) fn run_batched(
                         let _ = tx.try_send(GenEvent::Error("server draining".into()));
                     }
                     Job::OpenTreeSession { resp, .. } => {
-                        let _ = resp.send(Err(crate::generator::TreeOpError::Unsupported(
+                        let _ = resp.send(Err(crate::generator::TreeOpError::Draining(
                             "server draining".into(),
                         )));
                     }
                     Job::TreeVerify { resp, .. } => {
-                        let _ = resp.send(Err(crate::generator::TreeOpError::Unsupported(
+                        let _ = resp.send(Err(crate::generator::TreeOpError::Draining(
                             "server draining".into(),
                         )));
                     }
@@ -494,6 +503,7 @@ pub(crate) fn run_batched(
                         )));
                         continue;
                     }
+                    let prior_phase = phase.swap(PHASE_DECODE, Ordering::AcqRel);
                     let out = runner
                         .tree_verify_greedy(&tokens, &parents)
                         .map_err(|e| match e {
@@ -507,6 +517,7 @@ pub(crate) fn run_batched(
                             ) => crate::generator::TreeOpError::BadRequest(m),
                             other => crate::generator::TreeOpError::Internal(other.to_string()),
                         });
+                    phase.store(prior_phase, Ordering::Release);
                     let _ = resp.send(out);
                 }
             }
@@ -528,6 +539,7 @@ pub(crate) fn run_batched(
                     release_slot(&mut batch, row);
                 }
             } else {
+                phase.store(PHASE_PREFILL, Ordering::Release);
                 let len = p.prompt().len();
                 let end = (p.done + chunk).min(len);
                 let positions: Vec<usize> = (p.done..end).collect();
@@ -633,6 +645,7 @@ pub(crate) fn run_batched(
         // their pad-token outputs are ignored. Liveness is re-derived from
         // the pool every step (self-healing; adoption/retirement need no
         // separate bookkeeping).
+        phase.store(PHASE_DECODE, Ordering::Release);
         let tokens: Vec<u32> = pool
             .iter()
             .map(|s| s.as_ref().map_or(0, |a| a.last_token))

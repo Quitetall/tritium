@@ -302,6 +302,14 @@ settled queue, a live worker and a bounded successful recovery generation. The
 receipt binds the queue capacity, hold duration, token progress and recovery
 latency. Remaining scenarios below still block this slice.
 
+SIGTERM phase qualification now has a causal runtime primitive:
+`tritium_worker_phase{phase="idle|prefill|decode"}` is a fixed-cardinality
+one-hot gauge across chat and tree work in both single and batched workers.
+Once drain begins, queued chat and tree jobs are rejected before model prefill;
+tree requests retain the same `503 draining` classification whether rejected
+at router admission or dequeued by the worker. Exact candidate SIGTERM receipts
+for all three phases remain required below.
+
 1. malformed/truncated/wrong-identity artifact at startup;
 2. missing secret, invalid config and unavailable requested backend;
 3. SIGTERM during queue, prefill and decode;
