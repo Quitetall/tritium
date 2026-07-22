@@ -87,7 +87,9 @@ class OciContractTests(unittest.TestCase):
                 "cap_drop: [ALL]",
                 "no-new-privileges:true",
                 "noexec,nosuid,nodev,size=64m",
-                ":/models/model.gguf:ro",
+                ":/models/bundle:ro",
+                "--bundle",
+                "--profile",
                 "127.0.0.1:",
             ):
                 self.assertIn(token, text)
@@ -96,8 +98,9 @@ class OciContractTests(unittest.TestCase):
         path = ROOT / "scripts/run-oci-compose"
         script = path.read_text(encoding="utf-8")
         self.assertIn("@sha256:[0-9a-f]{64}", script)
-        self.assertIn("TRITIUM_MODEL must be an ordinary model file", script)
-        self.assertIn('export TRITIUM_MODEL', script)
+        self.assertIn("TRITIUM_BUNDLE must be an ordinary schema-v3 bundle directory", script)
+        self.assertIn("TRITIUM_BUNDLE lacks ordinary required asset", script)
+        self.assertIn('export TRITIUM_BUNDLE TRITIUM_PROFILE', script)
         environment = os.environ.copy()
         environment["TRITIUM_IMAGE"] = "tritium:latest"
         result = subprocess.run(

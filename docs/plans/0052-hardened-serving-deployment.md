@@ -92,9 +92,11 @@ without implicit BOS injection. Main CLI now accepts exactly one strict
 `--bundle DIR --profile ...` or legacy `--model GGUF`, rejects unsupported
 strict-mode combinations and unknown arguments, parses tokenizer bytes retained
 by the authenticated load transaction, and invokes the production router with
-clean compile-time source plus physical backend identity. Container/chart
-profiles still target legacy single-file mounts and must switch to a safely
-staged bundle; real CPU/CUDA fixtures remain open. Until those gates pass,
+clean compile-time source plus physical backend identity. CPU/CUDA Compose now
+mount canonical schema-v3 directories read-only, preflight mandatory ordinary
+assets/profile, and invoke `--bundle`; the native loader remains the byte-level
+trust boundary. Helm still targets legacy single-file staging and must switch
+to a safely staged bundle. Real CPU/CUDA fixtures remain open. Until those gates pass,
 the production builder is a hardened seam, not release-gate evidence.
 
 ## Slice 2 — request security and resource governance

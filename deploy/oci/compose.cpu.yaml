@@ -8,12 +8,14 @@ services:
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=64m
     volumes:
-      - ${TRITIUM_MODEL:?set TRITIUM_MODEL to a GGUF path}:/models/model.gguf:ro
+      - ${TRITIUM_BUNDLE:?set TRITIUM_BUNDLE to a schema-v3 bundle directory}:/models/bundle:ro
     environment:
       TRITIUM_AUTH_TOKEN: ${TRITIUM_AUTH_TOKEN:?set TRITIUM_AUTH_TOKEN}
     command:
-      - --model
-      - /models/model.gguf
+      - --bundle
+      - /models/bundle
+      - --profile
+      - ${TRITIUM_PROFILE:-compact-v1}
       - --backend
       - cpu
       - --host

@@ -12,12 +12,23 @@ image="${TRITIUM_IMAGE:-}"
   echo "TRITIUM_IMAGE must be an exact name@sha256 digest" >&2
   exit 2
 }
-[[ -n "${TRITIUM_MODEL:-}" && -f "$TRITIUM_MODEL" && ! -L "$TRITIUM_MODEL" ]] || {
-  echo "TRITIUM_MODEL must be an ordinary model file" >&2
+[[ -n "${TRITIUM_BUNDLE:-}" && -d "$TRITIUM_BUNDLE" && ! -L "$TRITIUM_BUNDLE" ]] || {
+  echo "TRITIUM_BUNDLE must be an ordinary schema-v3 bundle directory" >&2
   exit 2
 }
-TRITIUM_MODEL="$(cd "$(dirname "$TRITIUM_MODEL")" && pwd -P)/$(basename "$TRITIUM_MODEL")"
-export TRITIUM_MODEL
+TRITIUM_BUNDLE="$(cd "$TRITIUM_BUNDLE" && pwd -P)"
+for asset in tritium.json config.json tokenizer.json tokenizer_config.json preserved.safetensors; do
+  [[ -f "$TRITIUM_BUNDLE/$asset" && ! -L "$TRITIUM_BUNDLE/$asset" ]] || {
+    echo "TRITIUM_BUNDLE lacks ordinary required asset $asset" >&2
+    exit 2
+  }
+done
+TRITIUM_PROFILE="${TRITIUM_PROFILE:-compact-v1}"
+[[ "$TRITIUM_PROFILE" == compact-v1 || "$TRITIUM_PROFILE" == near-lossless-v1 ]] || {
+  echo "TRITIUM_PROFILE must be compact-v1 or near-lossless-v1" >&2
+  exit 2
+}
+export TRITIUM_BUNDLE TRITIUM_PROFILE
 [[ -n "${TRITIUM_AUTH_TOKEN:-}" ]] || {
   echo "TRITIUM_AUTH_TOKEN is required" >&2
   exit 2
