@@ -57,6 +57,8 @@ class OciContractTests(unittest.TestCase):
             "rewrite-timestamp=true",
             'archive_sha256="$(sha256sum',
             '"archive_bytes":%s',
+            'scripts/verify-oci-archive.py',
+            '--package-candidate "$candidate"',
         ):
             self.assertIn(token, script)
         for flavor in ("cpu", "cuda"):

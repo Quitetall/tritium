@@ -178,8 +178,10 @@ locked Cargo graph, builds offline with frozen resolution and requests an OCI
 archive with BuildKit SBOM/provenance attestations. CPU/CUDA Compose profiles
 enforce arbitrary UID, read-only root, dropped capabilities,
 `no-new-privileges`, bounded tmpfs and read-only model mounts. Structural
-contract tests are local-green. Attestation subject parsing and image-manifest
-admission, exact-image runtime, vulnerability/secret scan, strict schema-v3
+contract tests are local-green. OCI archive admission now streams every blob
+digest, validates single-platform image/config identity, and requires in-toto
+SBOM plus SLSA predicates whose subjects bind exact image-manifest digest.
+Exact-image runtime, vulnerability/secret scan, strict schema-v3
 receipt parity, and NVIDIA evidence remain open gates.
 
 ## Slice 5 — Helm, autoscaling and serverless examples

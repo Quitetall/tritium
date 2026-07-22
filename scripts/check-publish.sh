@@ -18,6 +18,7 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 ./scripts/check-release-version.py
+python3 ./scripts/sync-packaged-training-spec.py --check
 unpublished=$(
   cargo metadata --locked --no-deps --format-version 1 |
     # cargo metadata encodes `publish = false` as []; null means publishable.

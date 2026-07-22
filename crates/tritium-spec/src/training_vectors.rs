@@ -9,7 +9,7 @@ use crate::{TrainExecutionV1, TrainingOpCategoryV1, TrainingOpManifestV1, Traini
 
 const SCHEMA_ID: &str = "tritium.training_vectors";
 const SCHEMA_VERSION: u32 = 1;
-const CANONICAL_JSON: &[u8] = include_bytes!("../../../spec/training/v1/vectors/v1.json");
+const CANONICAL_JSON: &[u8] = include_bytes!("../data/training/v1/vectors/v1.json");
 
 /// Exact or bounded comparison policy for one semantic vector.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

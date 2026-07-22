@@ -47,8 +47,8 @@ fn exact_fields(value: &Value, expected: &[&str], context: &str) {
 fn main() {
     tritium_build_info::emit_source_identity();
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("manifest dir"));
-    let catalog_path = manifest_dir.join("../../spec/training/v1/webgpu-dispatch-v1.json");
-    let manifest_path = manifest_dir.join("../../spec/training/v1/manifest.json");
+    let catalog_path = manifest_dir.join("data/training/v1/webgpu-dispatch-v1.json");
+    let manifest_path = manifest_dir.join("data/training/v1/manifest.json");
     println!("cargo:rerun-if-changed={}", catalog_path.display());
     println!("cargo:rerun-if-changed={}", manifest_path.display());
     let bytes = fs::read(&catalog_path).expect("read WebGPU dispatch catalog");

@@ -87,4 +87,8 @@ printf '%s  %s\n' "$archive_sha256" "$archive_name" > "$archive.sha256"
 printf '%s  %s\n' "$source_sha256" "$source_name" > "$source_archive.sha256"
 printf '{"schema":"tritium.oci-build.v1","release":"%s","flavor":"%s","candidate_manifest_sha256":"%s","source_revision":"%s","source_created":"%s","source_date_epoch":%s,"source_archive":"%s","source_archive_bytes":%s,"source_archive_sha256":"%s","platform":"linux/amd64","archive":"%s","archive_bytes":%s,"archive_sha256":"%s"}\n' \
   "$release" "$flavor" "$candidate_sha256" "$revision" "$created" "$epoch" "$source_name" "$source_bytes" "$source_sha256" "$archive_name" "$archive_bytes" "$archive_sha256" > "$output/build-receipt.json"
+python3 "$root/scripts/verify-oci-archive.py" \
+  --archive "$archive" \
+  --build-receipt "$output/build-receipt.json" \
+  --package-candidate "$candidate"
 echo "$archive"

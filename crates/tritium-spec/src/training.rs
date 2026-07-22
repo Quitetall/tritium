@@ -7,7 +7,7 @@ use serde::Deserialize;
 const SCHEMA_ID: &str = "tritium.training_op_manifest";
 const SCHEMA_VERSION: u32 = 1;
 const DTYPE: &str = "f32";
-const CANONICAL_JSON: &[u8] = include_bytes!("../../../spec/training/v1/manifest.json");
+const CANONICAL_JSON: &[u8] = include_bytes!("../data/training/v1/manifest.json");
 
 /// Semantic category for one portable training operation.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
