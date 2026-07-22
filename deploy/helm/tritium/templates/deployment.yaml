@@ -41,7 +41,7 @@ spec:
         tritium.ai/backend: {{ .Values.backend | quote }}
       annotations:
         tritium.ai/image-digest: {{ .Values.image.digest | quote }}
-        tritium.ai/artifact-sha256: {{ .Values.artifact.expectedSha256 | quote }}
+        tritium.ai/manifest-sha256: {{ .Values.artifact.expectedManifestSha256 | quote }}
         tritium.ai/drain-mode: sigterm-graceful
     spec:
       automountServiceAccountToken: false
@@ -69,14 +69,26 @@ spec:
           args:
             - >-
               umask 077;
-              cp "/source/${MODEL_FILE}" /staged/model.gguf;
-              printf '%s  %s\n' "${EXPECTED_SHA256}" /staged/model.gguf | sha256sum -c -;
-              chmod 0444 /staged/model.gguf
+              if find /source -type l -print -quit | grep -q .; then
+                echo "bundle contains a symlink" >&2; exit 1;
+              fi;
+              if find /source ! -type f ! -type d -print -quit | grep -q .; then
+                echo "bundle contains a special filesystem node" >&2; exit 1;
+              fi;
+              mkdir /staged/bundle;
+              cp -R /source/. /staged/bundle/;
+              if find /staged/bundle -type l -print -quit | grep -q .; then
+                echo "staged bundle contains a symlink" >&2; exit 1;
+              fi;
+              if find /staged/bundle ! -type f ! -type d -print -quit | grep -q .; then
+                echo "staged bundle contains a special filesystem node" >&2; exit 1;
+              fi;
+              printf '%s  %s\n' "${EXPECTED_MANIFEST_SHA256}" /staged/bundle/tritium.json
+                | sha256sum -c -;
+              chmod -R a-w /staged/bundle
           env:
-            - name: MODEL_FILE
-              value: {{ .Values.artifact.modelFile | quote }}
-            - name: EXPECTED_SHA256
-              value: {{ .Values.artifact.expectedSha256 | quote }}
+            - name: EXPECTED_MANIFEST_SHA256
+              value: {{ .Values.artifact.expectedManifestSha256 | quote }}
           securityContext:
             {{- toYaml .Values.containerSecurityContext | nindent 12 }}
           resources:
@@ -96,8 +108,10 @@ spec:
           image: {{ printf "%s@%s" .Values.image.repository .Values.image.digest | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
-            - --model
-            - /artifacts/model.gguf
+            - --bundle
+            - /artifacts/bundle
+            - --profile
+            - {{ .Values.artifact.profile | quote }}
             - --backend
             - {{ .Values.backend | quote }}
             - --host

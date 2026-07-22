@@ -1,15 +1,19 @@
 # Tritium Helm chart
 
-This chart is digest-only and stages one artifact from a read-only PVC into a
-bounded `emptyDir`; the serving container never downloads after startup. A
-pinned BusyBox init container checks the exact SHA-256 before publication. An
+This chart is digest-only and stages one schema-v3 bundle directory from a
+read-only PVC into a bounded `emptyDir`; serving never downloads after startup.
+A pinned BusyBox init container rejects links/special nodes and checks exact
+`tritium.json` SHA-256. Native loading then verifies every manifest-bound asset.
+An
 authenticated loopback probe sidecar reads the bearer token from a Secret so
 the Secret is never rendered into probe headers.
 The helper is also a same-UID watchdog: after bounded authenticated health
 failures it signals `tritium-serve`, allowing Kubernetes to restart the main
 container when its worker is dead but its TCP listener remains open.
 
-Default image and artifact digests are zero placeholders for lint/render only.
+`artifact.sourcePvc.subPath` identifies the bundle directory within the PVC;
+`artifact.profile` selects its admitted Compact or NearLossless package.
+Default image and manifest digests are zero placeholders for lint/render only.
 They are not deployable release identities. Override both with admitted values.
 The current binary path is legacy GGUF compatibility; schema-v3 production
 readiness and receipt parity remain binding gates. URI-to-PVC staging is not yet

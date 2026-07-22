@@ -18,7 +18,7 @@ class DeploymentContractTests(unittest.TestCase):
         self.assertEqual(self.schema["$schema"], "https://json-schema.org/draft/2020-12/schema")
         self.assertFalse(self.schema["additionalProperties"])
         self.assertIn("digest: sha256:" + "0" * 64, self.values)
-        self.assertIn('expectedSha256: "' + "0" * 64 + '"', self.values)
+        self.assertIn('expectedManifestSha256: "' + "0" * 64 + '"', self.values)
 
     def test_cuda_requires_gpu_and_keda_cannot_scale_to_zero(self):
         encoded = json.dumps(self.schema, sort_keys=True)
@@ -32,6 +32,10 @@ class DeploymentContractTests(unittest.TestCase):
         for token in (
             'printf "%s@%s" .Values.image.repository .Values.image.digest',
             "sha256sum -c -",
+            "bundle contains a symlink",
+            "staged bundle contains a symlink",
+            "--bundle",
+            ".Values.artifact.profile",
             "secretKeyRef:",
             "automountServiceAccountToken: false",
             "readOnlyRootFilesystem",

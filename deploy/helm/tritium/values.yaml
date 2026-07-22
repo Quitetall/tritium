@@ -15,8 +15,8 @@ artifact:
   sourcePvc:
     claimName: tritium-artifact
     subPath: ""
-  modelFile: model.gguf
-  expectedSha256: "0000000000000000000000000000000000000000000000000000000000000000"
+  profile: compact-v1
+  expectedManifestSha256: "0000000000000000000000000000000000000000000000000000000000000000"
   stagedSizeLimit: 64Gi
   verifierImage: docker.io/library/busybox:1.37.0-musl@sha256:6be969a074d06073a62ad8ccfd2ad6ec2790cae25d519d8df255ba24819d96f0
 

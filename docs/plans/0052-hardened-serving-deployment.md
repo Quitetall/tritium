@@ -95,8 +95,10 @@ by the authenticated load transaction, and invokes the production router with
 clean compile-time source plus physical backend identity. CPU/CUDA Compose now
 mount canonical schema-v3 directories read-only, preflight mandatory ordinary
 assets/profile, and invoke `--bundle`; the native loader remains the byte-level
-trust boundary. Helm still targets legacy single-file staging and must switch
-to a safely staged bundle. Real CPU/CUDA fixtures remain open. Until those gates pass,
+trust boundary. Helm now stages a bounded directory without archive extraction,
+rejects links/special nodes, pins copied `tritium.json`, then lets the native
+loader verify every referenced byte before readiness. Real CPU/CUDA fixtures
+remain open. Until those gates pass,
 the production builder is a hardened seam, not release-gate evidence.
 
 ## Slice 2 — request security and resource governance
