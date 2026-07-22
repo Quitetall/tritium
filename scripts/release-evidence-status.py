@@ -93,6 +93,11 @@ TRAINING_BACKEND_RECEIPT = runpy.run_path(
 )
 validate_training_backends = TRAINING_BACKEND_RECEIPT["validate"]
 TrainingBackendReceiptError = TRAINING_BACKEND_RECEIPT["TrainingBackendReceiptError"]
+TRAINING_PERFORMANCE_RECEIPT = runpy.run_path(
+    Path(__file__).with_name("verify-training-performance-receipt.py")
+)
+validate_training_performance = TRAINING_PERFORMANCE_RECEIPT["validate"]
+TrainingPerformanceError = TRAINING_PERFORMANCE_RECEIPT["TrainingPerformanceError"]
 
 SCHEMA = "tritium.release-evidence-registry.v1"
 REPORT_SCHEMA = "tritium.release-gate-report.v1"
@@ -123,6 +128,7 @@ KNOWN_KINDS = frozenset(
         "physical-bytes",
         "onnx-inference",
         "backend-manifest",
+        "performance",
     }
 )
 HEX = frozenset("0123456789abcdef")
@@ -334,7 +340,7 @@ def evaluate(
                 "physical-bytes",
             }
             else "onnx-bundle" if kind == "onnx-inference"
-            else "training-receipt-bundle" if kind == "backend-manifest"
+            else "training-receipt-bundle" if kind in {"backend-manifest", "performance"}
             else "python-wheel"
         )
         if artifact.get("kind") != expected_artifact_kind:
@@ -444,6 +450,10 @@ def evaluate(
                     receipt_path, revision, release, candidate,
                     Path(__file__).resolve().parent.parent,
                 )
+            elif kind == "performance":
+                receipt = validate_training_performance(
+                    receipt_path, revision, release, candidate
+                )
             elif kind in {"oci-runtime-cpu", "oci-runtime-cuda"}:
                 receipt = load_oci_runtime_receipt(
                     receipt_path, revision=revision, release=release,
@@ -521,6 +531,7 @@ def evaluate(
             FlagshipRuntimeError,
             OnnxReceiptError,
             TrainingBackendReceiptError,
+            TrainingPerformanceError,
             ValueError,
         ) as error:
             raise EvidenceError(f"{label} failed {kind} validation: {error}") from error
@@ -689,6 +700,21 @@ def evaluate(
             }
             if actual not in qualified:
                 raise EvidenceError("backend-manifest anchor is not a qualified bundle")
+        elif kind == "performance":
+            actual = (
+                artifact.get("id"), artifact.get("kind"), artifact_path.name,
+                artifact_path.stat().st_size, _sha256(artifact_path),
+            )
+            qualified = {
+                (
+                    measurement["artifact"]["id"], measurement["artifact"]["kind"],
+                    measurement["artifact"]["name"], measurement["artifact"]["bytes"],
+                    measurement["artifact"]["sha256"],
+                )
+                for measurement in receipt["measurements"]
+            }
+            if actual not in qualified:
+                raise EvidenceError("performance anchor is not a measured backend bundle")
         elif kind.startswith("oci-"):
             identity = artifact.get("identity", {})
             actual = (artifact_path.name, _sha256(artifact_path), artifact_path.stat().st_size)
@@ -732,6 +758,31 @@ def evaluate(
         paths.add(logical_path)
         portable_paths.add(portable_path)
     _check_ancestry(entries)
+    backend_ids = [
+        receipt_id for receipt_id, kind in kinds.items() if kind == "backend-manifest"
+    ]
+    performance_ids = [
+        receipt_id for receipt_id, kind in kinds.items() if kind == "performance"
+    ]
+    for receipt_id in performance_ids:
+        expected_parents = set(backend_ids)
+        performance = validated_receipts[receipt_id]
+        if (
+            len(expected_parents) != 1
+            or set(entries[receipt_id]["parents"]) != expected_parents
+            or performance["backend_manifest_receipt_id"] != next(iter(expected_parents))
+        ):
+            raise EvidenceError("performance must bind the exact backend-manifest parent")
+        backend = validated_receipts[next(iter(expected_parents))]
+        backend_artifacts = {
+            bundle["artifact"]["id"] for bundle in backend["bundles"]
+        }
+        performance_artifacts = {
+            measurement["artifact"]["id"]
+            for measurement in performance["measurements"]
+        }
+        if performance_artifacts != backend_artifacts:
+            raise EvidenceError("performance backend inventory differs from conformance")
     conversion_ids = [
         receipt_id for receipt_id, kind in kinds.items()
         if kind == "conversion-refinement"

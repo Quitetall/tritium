@@ -217,6 +217,14 @@ transfers, dtype/limit declarations and per-vector scratch ceilings. CPU, CUDA,
 ROCm, Metal, native wgpu, WASI and MCU are all mandatory; emulation/fallback
 markers and duplicate identities fail. This is validator infrastructure only:
 ROCm, Metal and MCU implementations/physical candidate receipts remain open.
+Performance is a separate exact child receipt,
+`tritium.training-performance-qualification.v1`. It must measure the same seven
+candidate bundles and physical device identities under the complete 114-case
+workload, with a content-bound budget, >=10 warmups, >=30 samples, recomputed
+median throughput and CPU-relative speed, p95, resident/scratch peaks, zero host
+transfers/global synchronizations, native execution and a passing regression
+budget. Throughput and bounded-latency tiers remain distinct. No empirical
+seven-target performance receipt exists.
 Release admission accepts only a clean immutable Git commit identity. The shared
 build helper also fingerprints dirty development trees and registers git metadata
 plus every tracked and currently-untracked source path as Cargo rebuild inputs,

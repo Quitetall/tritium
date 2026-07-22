@@ -314,6 +314,32 @@ class ReleaseEvidenceStatusTests(unittest.TestCase):
             row = next(item for item in report["rows"] if item["id"] == "native-backends")
             self.assertEqual(row["satisfied_kinds"], ["backend-manifest"])
 
+            performance_path = evidence_root / "performance.json"
+            performance_path.write_bytes(b"{}\n")
+            performance = {
+                "receipt_id": "sha256:" + "d" * 64, "run_id": "performance-1",
+                "backend_manifest_receipt_id": receipt["receipt_id"],
+                "measurements": [{"artifact": receipt["bundles"][0]["artifact"]}],
+            }
+            performance_entry = entry(
+                performance_path, performance, kind="performance",
+                parents=[receipt["receipt_id"]],
+            )
+            registry(
+                registry_path, candidate,
+                [entry(receipt_path, receipt, kind="backend-manifest"), performance_entry],
+            )
+            with mock.patch.dict(
+                evaluate.__globals__,
+                {
+                    "validate_training_backends": mock.Mock(return_value=receipt),
+                    "validate_training_performance": mock.Mock(return_value=performance),
+                },
+            ):
+                report = evaluate(registry_path, candidate, document)
+            row = next(item for item in report["rows"] if item["id"] == "native-backends")
+            self.assertEqual(row["satisfied_kinds"], ["backend-manifest", "performance"])
+
     def test_onnx_inference_requires_exact_conversion_lineage(self):
         with tempfile.TemporaryDirectory() as raw:
             candidate, document, old_artifact, evidence_root = release_fixture(Path(raw))
