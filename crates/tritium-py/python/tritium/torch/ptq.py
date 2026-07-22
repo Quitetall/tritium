@@ -136,6 +136,7 @@ class KroneckerCalibrationWriter:
         token_stream_digest: str,
         damping: float,
         objective_id: Optional[str] = None,
+        indexed_output: bool = False,
         max_evidence_bytes: int = 64 * 1024 * 1024,
         max_batch_bytes: int = 256 * 1024 * 1024,
     ) -> None:
@@ -143,6 +144,9 @@ class KroneckerCalibrationWriter:
         self._columns = columns
         self._curvature = curvature
         self._objective_id = objective_id
+        if type(indexed_output) is not bool:
+            raise TypeError("indexed_output must be a boolean")
+        self._indexed_output = indexed_output
         if objective_id is not None:
             activation_cache_digest = bind_kronecker_activation_cache_digest(
                 activation_cache_digest, objective_id
@@ -162,6 +166,7 @@ class KroneckerCalibrationWriter:
             damping,
             max_evidence_bytes=max_evidence_bytes,
             max_batch_bytes=max_batch_bytes,
+            indexed_output=indexed_output,
         )
 
     @staticmethod
@@ -184,6 +189,9 @@ class KroneckerCalibrationWriter:
         token_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[int, int]:
         """Append one canonical row-major batch and return retained segment counts."""
+
+        if self._indexed_output:
+            raise ValueError("indexed-output writers require append_indexed")
 
         if not isinstance(activations, torch.Tensor) or activations.ndim == 0:
             raise TypeError("activations must be a tensor with a feature dimension")
@@ -247,6 +255,102 @@ class KroneckerCalibrationWriter:
             token_mask_u8=mask_bytes,
         )
 
+    def append_indexed(
+        self,
+        activations: torch.Tensor,
+        output_indices: torch.Tensor,
+        output_factors: Optional[torch.Tensor] = None,
+        *,
+        token_weights: Optional[torch.Tensor] = None,
+        token_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[int, int]:
+        """Append one sparse output row and factor per activation sample."""
+
+        if not self._indexed_output:
+            raise ValueError("dense-output writers require append")
+        if not isinstance(activations, torch.Tensor) or activations.ndim == 0:
+            raise TypeError("activations must be a tensor with a feature dimension")
+        if activations.shape[-1] != self._columns:
+            raise ValueError(
+                f"activations last dimension must be {self._columns}, got {activations.shape[-1]}"
+            )
+        sample_shape = tuple(activations.shape[:-1])
+        samples = activations.numel() // self._columns
+        if (
+            not isinstance(output_indices, torch.Tensor)
+            or tuple(output_indices.shape) != sample_shape
+        ):
+            raise ValueError(f"output_indices must have shape {sample_shape}")
+        integer_dtypes = {
+            torch.int8,
+            torch.int16,
+            torch.int32,
+            torch.int64,
+            torch.uint8,
+        }
+        if output_indices.dtype not in integer_dtypes:
+            raise TypeError("output_indices must use an integer dtype")
+        if bool((output_indices < 0).any()) or bool(
+            (output_indices >= self._rows).any()
+        ):
+            raise ValueError(f"output_indices values must be in [0, {self._rows})")
+        if output_factors is not None and (
+            not isinstance(output_factors, torch.Tensor)
+            or tuple(output_factors.shape) != sample_shape
+        ):
+            raise ValueError(f"output_factors must have shape {sample_shape}")
+        if token_weights is not None and (
+            not isinstance(token_weights, torch.Tensor)
+            or tuple(token_weights.shape) != sample_shape
+        ):
+            raise ValueError(f"token_weights must have shape {sample_shape}")
+        if token_mask is not None and (
+            not isinstance(token_mask, torch.Tensor)
+            or tuple(token_mask.shape) != sample_shape
+        ):
+            raise ValueError(f"token_mask must have shape {sample_shape}")
+        required_bytes = activations.numel() * 4 + samples * (8 + 4)
+        if token_weights is not None:
+            required_bytes += token_weights.numel() * 8
+        if token_mask is not None:
+            required_bytes += token_mask.numel()
+        if required_bytes > self._max_batch_bytes:
+            raise ValueError(
+                f"batch requires {required_bytes} bytes, limit is {self._max_batch_bytes}"
+            )
+        indices_bytes = (
+            output_indices.detach()
+            .to(device="cpu", dtype=torch.int64)
+            .contiguous()
+            .numpy()
+            .astype("<u8", copy=False)
+            .tobytes()
+        )
+        factors_bytes = (
+            self._float_bytes(output_factors, torch.float32, "<f4")
+            if output_factors is not None
+            else None
+        )
+        weights_bytes = (
+            self._float_bytes(token_weights, torch.float64, "<f8")
+            if token_weights is not None
+            else None
+        )
+        mask_bytes = None
+        if token_mask is not None:
+            mask = token_mask.detach().to(device="cpu").contiguous().view(-1)
+            if not bool(((mask == 0) | (mask == 1)).all()):
+                raise ValueError("token_mask values must be boolean or 0/1")
+            mask_bytes = mask.to(torch.uint8).numpy().tobytes()
+        return self._native.append_indexed_batch(
+            self._float_bytes(activations, torch.float32, "<f4"),
+            indices_bytes,
+            samples,
+            output_factors_f32le=factors_bytes,
+            token_weights_f64le=weights_bytes,
+            token_mask_u8=mask_bytes,
+        )
+
     def finish(self):
         """Finalize and atomically publish one canonical native evidence record."""
 
@@ -282,6 +386,12 @@ class KroneckerCalibrationWriter:
     @property
     def objective_id(self) -> Optional[str]:
         return self._objective_id
+
+    @property
+    def indexed_output(self) -> bool:
+        """Whether this writer accepts sparse indexed output factors."""
+
+        return self._indexed_output
 
     @property
     def activation_cache_digest(self) -> str:
@@ -395,6 +505,246 @@ def _forward_kl_factors(
             )
             factors.view(samples, vocabulary)[offset:end].mul_(selected.view(-1, 1))
     return factors
+
+
+def capture_kronecker_embedding(
+    model: nn.Module,
+    data: Iterable[Any],
+    *,
+    module: str,
+    writer: KroneckerCalibrationWriter,
+    curvature: str,
+    guided_loss_reduction: Optional[str] = None,
+    max_capture_bytes: Optional[int] = None,
+    max_objective_bytes: int = 256 * 1024 * 1024,
+) -> KroneckerModuleCaptureReceipt:
+    """Capture embedding-table Fisher/KL factors without dense vocabulary rows.
+
+    The gradient with respect to each embedding output supplies the input-side
+    hidden-state factor. Its token id supplies a sparse one-hot output row.
+    Input-Hessian is rejected because token ids are not dense activation
+    vectors under the linear-module K-FAC contract.
+    """
+
+    if not isinstance(model, nn.Module):
+        raise TypeError("model must be a torch.nn.Module")
+    if not isinstance(writer, KroneckerCalibrationWriter):
+        raise TypeError("writer must be a KroneckerCalibrationWriter")
+    if curvature == "input-hessian":
+        writer.abort()
+        raise ValueError("embedding capture does not support input-hessian")
+    if curvature not in {"guided-fisher", "forward-kl-kronecker"}:
+        writer.abort()
+        raise ValueError("unsupported embedding Kronecker curvature")
+    if not writer.indexed_output:
+        writer.abort()
+        raise ValueError("embedding capture requires an indexed-output writer")
+    if writer.curvature != curvature:
+        writer.abort()
+        raise ValueError("capture curvature differs from writer curvature")
+    if curvature == "guided-fisher":
+        if guided_loss_reduction not in {
+            "sum",
+            "mean-attention-mask",
+            "mean-valid-causal-labels",
+        }:
+            writer.abort()
+            raise ValueError(
+                "guided-Fisher requires loss reduction sum, mean-attention-mask, "
+                "or mean-valid-causal-labels"
+            )
+        objective = f"tritium.model-loss-guided-fisher.{guided_loss_reduction}@1"
+    else:
+        if guided_loss_reduction is not None:
+            writer.abort()
+            raise ValueError("guided_loss_reduction is valid only for guided-fisher")
+        objective = "tritium.softmax-fisher-rademacher.single-probe@1"
+    if writer.objective_id != objective:
+        writer.abort()
+        raise ValueError("writer objective_id differs from the capture objective")
+    if max_capture_bytes is None:
+        max_capture_bytes = writer.max_batch_bytes
+    if type(max_capture_bytes) is not int or max_capture_bytes <= 0:
+        writer.abort()
+        raise ValueError("max_capture_bytes must be a positive integer")
+    if type(max_objective_bytes) is not int or max_objective_bytes <= 0:
+        writer.abort()
+        raise ValueError("max_objective_bytes must be a positive integer")
+
+    modules = [
+        value
+        for path, value in model.named_modules(remove_duplicate=False)
+        if path == module
+    ]
+    if len(modules) != 1:
+        writer.abort()
+        raise ValueError("module path must identify exactly one module")
+    selected = modules[0]
+    if not isinstance(selected, nn.Embedding) or tuple(selected.weight.shape) != (
+        writer.rows,
+        writer.columns,
+    ):
+        writer.abort()
+        raise ValueError("embedding weight geometry differs from the evidence writer")
+
+    pending: list[Tuple[torch.Tensor, torch.Tensor]] = []
+    pending_index_bytes = 0
+    token_mask: Optional[torch.Tensor] = None
+    causal_selection_mask: Optional[torch.Tensor] = None
+
+    def preflight_input(_selected, args):
+        if not args or not isinstance(args[0], torch.Tensor):
+            raise ValueError("selected embedding must receive tensor token ids")
+        if args[0].ndim == 0:
+            raise ValueError("selected embedding token ids must have a sample dimension")
+
+    def capture(_selected, args, output):
+        nonlocal pending_index_bytes
+        indices = args[0]
+        if not isinstance(output, torch.Tensor):
+            raise ValueError("selected embedding must return one tensor")
+        if tuple(output.shape) != tuple(indices.shape) + (writer.columns,):
+            raise ValueError("selected embedding output geometry changed")
+        if not output.requires_grad:
+            output.requires_grad_(True)
+        index_bytes = indices.numel() * indices.element_size()
+        required_bytes = pending_index_bytes + index_bytes
+        if required_bytes > max_capture_bytes:
+            raise ValueError(
+                f"capture snapshots require {required_bytes} bytes, limit is {max_capture_bytes}"
+            )
+        pending.append((indices.detach().clone(), output))
+        pending_index_bytes = required_bytes
+
+    pre_handle = selected.register_forward_pre_hook(preflight_input)
+    handle = selected.register_forward_hook(capture)
+    training_flags = tuple((component, component.training) for component in model.modules())
+    batches = 0
+    module_calls = 0
+    samples = 0
+    selected_samples = 0
+    input_segments = 0
+    output_segments = 0
+    finalizing = False
+    objective_sample_start = 0
+    try:
+        model.eval()
+        for batch in data:
+            pending.clear()
+            raw_mask = batch.get("attention_mask") if isinstance(batch, Mapping) else None
+            if raw_mask is not None and not isinstance(raw_mask, torch.Tensor):
+                raise ValueError("attention_mask must be a tensor")
+            if raw_mask is not None and not bool(((raw_mask == 0) | (raw_mask == 1)).all()):
+                raise ValueError("attention_mask values must be boolean or 0/1")
+            snapshot_bytes = 0 if raw_mask is None else raw_mask.numel() * raw_mask.element_size()
+            raw_labels = None
+            if guided_loss_reduction == "mean-valid-causal-labels":
+                raw_labels = batch.get("labels") if isinstance(batch, Mapping) else None
+                if not isinstance(raw_labels, torch.Tensor):
+                    raise ValueError(
+                        "mean-valid-causal-labels guided-Fisher requires tensor labels"
+                    )
+                snapshot_bytes += raw_labels.numel()
+            if snapshot_bytes > max_capture_bytes:
+                raise ValueError(
+                    f"capture metadata requires {snapshot_bytes} bytes, limit is {max_capture_bytes}"
+                )
+            token_mask = None if raw_mask is None else raw_mask.detach().clone()
+            causal_selection_mask = (
+                None
+                if raw_labels is None
+                else _causal_selection_mask(raw_labels, token_mask)
+            )
+            pending_index_bytes = snapshot_bytes
+            with torch.enable_grad():
+                output = _invoke_model(model, batch)
+                if not pending:
+                    raise ValueError("selected embedding was not exercised by a calibration batch")
+                if curvature == "guided-fisher":
+                    loss = _capture_output_tensor(output, "loss")
+                    if loss.numel() != 1 or not loss.isfinite().all():
+                        raise ValueError("guided-Fisher model loss must be one finite scalar")
+                    if guided_loss_reduction == "sum":
+                        denominator = 1
+                    elif guided_loss_reduction == "mean-attention-mask":
+                        if token_mask is None:
+                            raise ValueError(
+                                "mean-attention-mask guided-Fisher requires attention_mask"
+                            )
+                        denominator = int(token_mask.count_nonzero().item())
+                    else:
+                        assert causal_selection_mask is not None
+                        denominator = int(causal_selection_mask.count_nonzero().item())
+                    if denominator <= 0:
+                        raise ValueError("guided-Fisher loss denominator must be positive")
+                    gradients = torch.autograd.grad(
+                        loss * denominator, tuple(item[1] for item in pending)
+                    )
+                else:
+                    logits = _capture_output_tensor(output, "logits")
+                    factors = _forward_kl_factors(
+                        logits,
+                        objective_sample_start,
+                        token_mask,
+                        max_objective_bytes,
+                    )
+                    gradients = torch.autograd.grad(
+                        logits,
+                        tuple(item[1] for item in pending),
+                        grad_outputs=factors,
+                    )
+                    objective_sample_start += logits.numel() // logits.shape[-1]
+            for (indices, _), gradients_for_call in zip(pending, gradients):
+                sample_shape = tuple(indices.shape)
+                selected_mask = (
+                    causal_selection_mask
+                    if guided_loss_reduction == "mean-valid-causal-labels"
+                    else token_mask
+                )
+                mask = _capture_token_mask(selected_mask, sample_shape)
+                input_segments, output_segments = writer.append_indexed(
+                    gradients_for_call,
+                    indices,
+                    token_mask=mask,
+                )
+                count = indices.numel()
+                samples += count
+                selected_samples += count if mask is None else int(mask.count_nonzero().item())
+                module_calls += 1
+            batches += 1
+        if batches == 0:
+            raise ValueError("calibration data must yield at least one batch")
+        finalizing = True
+        record = writer.finish()
+    except BaseException as error:
+        retryable_finish = finalizing and writer.active and isinstance(
+            error,
+            (
+                _tritium.KroneckerPublicationError,
+                _tritium.KroneckerResourceError,
+            ),
+        )
+        if not retryable_finish:
+            writer.abort()
+        raise
+    finally:
+        pre_handle.remove()
+        handle.remove()
+        for component, training in training_flags:
+            component.training = training
+        pending.clear()
+    return KroneckerModuleCaptureReceipt(
+        module=module,
+        curvature=curvature,
+        objective=objective,
+        batches=batches,
+        module_calls=module_calls,
+        samples=samples,
+        selected_samples=selected_samples,
+        input_segments=input_segments,
+        output_segments=output_segments,
+        record=record,
+    )
 
 
 def capture_kronecker_module(

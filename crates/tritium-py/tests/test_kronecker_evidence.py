@@ -24,7 +24,7 @@ def _f64le(values):
     return struct.pack(f"<{len(values)}d", *values)
 
 
-def _builder(tmp_path, *, index=0, name="a.weight"):
+def _builder(tmp_path, *, index=0, name="a.weight", indexed_output=False):
     return KroneckerEvidenceBuilder(
         str(tmp_path / "evidence"),
         index,
@@ -37,6 +37,7 @@ def _builder(tmp_path, *, index=0, name="a.weight"):
         "03" * 32,
         0.25,
         max_batch_bytes=4096,
+        indexed_output=indexed_output,
     )
 
 
@@ -112,6 +113,48 @@ def test_invalid_binary_batch_is_rejected_before_native_mutation(tmp_path):
         output_factors_f32le=_f32le([1.0, 2.0]),
     ) == (1, 1)
     assert builder.finish().tensor_index == 1
+
+
+def test_indexed_binary_batches_bind_rows_without_dense_factors(tmp_path):
+    builder = _builder(
+        tmp_path,
+        index=4,
+        name="model.embed_tokens.weight",
+        indexed_output=True,
+    )
+    assert builder.append_indexed_batch(
+        _f32le([1.0] * 128 + [3.0] * 128),
+        struct.pack("<2Q", 1, 0),
+        2,
+        output_factors_f32le=_f32le([2.0, -3.0]),
+    ) == (1, 1)
+    assert builder.finish().tensor_index == 4
+
+    invalid = _builder(
+        tmp_path / "invalid",
+        index=5,
+        name="model.embed_tokens.weight",
+        indexed_output=True,
+    )
+    with pytest.raises(KroneckerContractError, match="outside"):
+        invalid.append_indexed_batch(
+            _f32le([1.0] * 128), struct.pack("<Q", 2), 1
+        )
+    assert invalid.append_indexed_batch(
+        _f32le([1.0] * 128), struct.pack("<Q", 1), 1
+    ) == (1, 1)
+
+    with pytest.raises(KroneckerContractError, match="encoding"):
+        invalid.append_batch(
+            _f32le([1.0] * 128),
+            1,
+            output_factors_f32le=_f32le([1.0, 0.0]),
+        )
+    dense = _builder(tmp_path / "dense", index=6)
+    with pytest.raises(KroneckerContractError, match="encoding"):
+        dense.append_indexed_batch(
+            _f32le([1.0] * 128), struct.pack("<Q", 1), 1
+        )
 
 
 def test_constructor_rejects_unbound_or_unsupported_contracts(tmp_path):
@@ -244,3 +287,30 @@ def test_pytorch_writer_checks_shapes_and_streams_tensor_bytes(tmp_path):
     )
     with pytest.raises(ValueError, match="batch requires 520 bytes"):
         bounded.append(torch.ones(1, 128), torch.ones(1, 2))
+
+
+def test_pytorch_writer_streams_indexed_embedding_factors(tmp_path):
+    torch = pytest.importorskip("torch")
+    writer = KroneckerCalibrationWriter(
+        tmp_path / "indexed",
+        tensor_index=7,
+        tensor_name="model.embed_tokens.weight",
+        rows=4,
+        columns=128,
+        curvature="guided-fisher",
+        source_model_digest="01" * 32,
+        activation_cache_digest="02" * 32,
+        token_stream_digest="03" * 32,
+        damping=0.25,
+        indexed_output=True,
+        max_batch_bytes=4096,
+    )
+    assert writer.append_indexed(
+        torch.ones(2, 128),
+        torch.tensor([3, 1]),
+        torch.tensor([2.0, -3.0]),
+        token_mask=torch.tensor([True, False]),
+    ) == (1, 1)
+    with pytest.raises(ValueError, match="output_indices must have shape"):
+        writer.append_indexed(torch.ones(2, 128), torch.tensor([[3, 1]]))
+    assert writer.finish().tensor_index == 7

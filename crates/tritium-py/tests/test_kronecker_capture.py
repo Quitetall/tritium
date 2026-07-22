@@ -9,6 +9,7 @@ from tritium.torch import (
     KroneckerCalibrationWriter,
     KroneckerModuleCaptureReceipt,
     bind_kronecker_activation_cache_digest,
+    capture_kronecker_embedding,
     capture_kronecker_module,
 )
 from tritium.torch import ptq
@@ -48,6 +49,28 @@ def _writer(tmp_path, curvature, guided_reduction="mean-attention-mask"):
         token_stream_digest="03" * 32,
         damping=0.01,
         objective_id=objective,
+        max_batch_bytes=16 * 1024,
+    )
+
+
+def _embedding_writer(tmp_path, curvature):
+    objective = {
+        "guided-fisher": "tritium.model-loss-guided-fisher.mean-attention-mask@1",
+        "forward-kl-kronecker": "tritium.softmax-fisher-rademacher.single-probe@1",
+    }[curvature]
+    return KroneckerCalibrationWriter(
+        tmp_path / f"embedding-{curvature}",
+        tensor_index=1,
+        tensor_name="embed.weight",
+        rows=8,
+        columns=128,
+        curvature=curvature,
+        source_model_digest="01" * 32,
+        activation_cache_digest="02" * 32,
+        token_stream_digest="03" * 32,
+        damping=0.01,
+        objective_id=objective,
+        indexed_output=True,
         max_batch_bytes=16 * 1024,
     )
 
@@ -96,6 +119,69 @@ def test_model_aware_capture_publishes_all_estimators(tmp_path, curvature):
     assert not writer.active
     assert model.training is True
     assert all(parameter.grad is None for parameter in model.parameters())
+
+
+@pytest.mark.parametrize("curvature", ["guided-fisher", "forward-kl-kronecker"])
+def test_embedding_capture_streams_sparse_vocabulary_factors(tmp_path, curvature):
+    class TinyEmbeddingModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = torch.nn.Embedding(8, 128)
+            self.head = torch.nn.Linear(128, 8, bias=False)
+
+        def forward(self, input_ids, labels=None, attention_mask=None):
+            hidden = self.embed(input_ids)
+            logits = self.head(hidden)
+            loss = logits.square().mean()
+            return SimpleNamespace(logits=logits, loss=loss)
+
+    model = TinyEmbeddingModel().train()
+    receipt = capture_kronecker_embedding(
+        model,
+        [
+            {
+                "input_ids": torch.tensor([[1, 3, 1]]),
+                "attention_mask": torch.tensor([[1, 1, 0]]),
+            }
+        ],
+        module="embed",
+        writer=_embedding_writer(tmp_path, curvature),
+        curvature=curvature,
+        guided_loss_reduction=(
+            "mean-attention-mask" if curvature == "guided-fisher" else None
+        ),
+    )
+
+    assert receipt.module == "embed"
+    assert receipt.samples == 3
+    assert receipt.selected_samples == 2
+    assert receipt.module_calls == 1
+    assert model.training is True
+    assert all(parameter.grad is None for parameter in model.parameters())
+
+
+def test_embedding_capture_rejects_input_hessian(tmp_path):
+    writer = KroneckerCalibrationWriter(
+        tmp_path / "bad-embedding",
+        tensor_index=2,
+        tensor_name="embed.weight",
+        rows=8,
+        columns=128,
+        curvature="input-hessian",
+        source_model_digest="01" * 32,
+        activation_cache_digest="02" * 32,
+        token_stream_digest="03" * 32,
+        damping=0.01,
+        objective_id="tritium.input-gram@1",
+    )
+    with pytest.raises(ValueError, match="does not support input-hessian"):
+        capture_kronecker_embedding(
+            torch.nn.Sequential(torch.nn.Embedding(8, 128)),
+            [torch.tensor([[1]])],
+            module="0",
+            writer=writer,
+            curvature="input-hessian",
+        )
 
 
 def test_capture_preserves_reused_module_call_order(tmp_path):
