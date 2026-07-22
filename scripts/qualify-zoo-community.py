@@ -31,6 +31,10 @@ sha256 = VERIFIER["sha256"]
 validate_zoo = VERIFIER["validate_zoo"]
 validate_claims = VERIFIER["validate_claims"]
 validate_governance = VERIFIER["validate_governance"]
+CLAIM_GENERATOR = runpy.run_path(
+    Path(__file__).with_name("generate-release-claims.py")
+)
+check_claim_documents = CLAIM_GENERATOR["check"]
 
 SOURCE_SCHEMA = "tritium.model-zoo-source.v1"
 REVIEW_SCHEMA = "tritium.governance-review-attestation.v1"
@@ -304,6 +308,10 @@ def assemble(
     if not isinstance(models, list) or len(models) != len(EXPECTED_MODELS):
         raise QualificationError("model-zoo source must contain four frozen models")
     validate_review(review_path, source_revision, release)
+    try:
+        check_claim_documents(repo)
+    except CLAIM_GENERATOR["ClaimGenerationError"] as error:
+        raise QualificationError("generated release claim documents are stale") from error
 
     stage.mkdir()
     cards_dir = stage / "cards"
@@ -380,7 +388,7 @@ def assemble(
         "registry_sha256": sha256(ordinary(registry_path, "source registry")),
         "entries": source_entries,
     })
-    generator_path = repo / "scripts" / "qualify-zoo-community.py"
+    generator_path = repo / "scripts" / "generate-release-claims.py"
     claims = seal({
         **common, "schema": CLAIMS_SCHEMA, "run_id": f"{run_id}-claims",
         "generator_id": GENERATOR_ID,

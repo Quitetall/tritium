@@ -136,7 +136,7 @@ class ZooCommunityReceiptTests(unittest.TestCase):
             repo = root / "repo"
             repo.mkdir()
             documents = [file_record(repo, path) for path in MODULE["CLAIM_DOCUMENTS"]]
-            generator_file = file_record(repo, "scripts/qualify-zoo-community.py")
+            generator_file = file_record(repo, "scripts/generate-release-claims.py")
             evidence_ids = [model["evidence_receipt_ids"][0] for model in models]
             source_registry = claim_snapshot(root, evidence_ids)
             claims = seal(
@@ -224,7 +224,7 @@ class ZooCommunityReceiptTests(unittest.TestCase):
             repo = root / "repo"
             repo.mkdir()
             documents = [file_record(repo, path) for path in MODULE["CLAIM_DOCUMENTS"]]
-            generator_file = file_record(repo, "scripts/qualify-zoo-community.py")
+            generator_file = file_record(repo, "scripts/generate-release-claims.py")
             evidence_ids = [model["evidence_receipt_ids"][0] for model in models]
             source_registry = claim_snapshot(root, evidence_ids)
             claims = seal(

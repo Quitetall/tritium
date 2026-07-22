@@ -9,6 +9,21 @@ book's CI does not have. The committed numbers live in code
 CPU-hosted CI can prove the *logic* of the gates without ever owning a GPU. The
 methodology follows the [v0.30 performance ADR](../../adr/0005-v030-performance.md).
 
+<!-- BEGIN TRITIUM GENERATED RELEASE CLAIMS -->
+## Release-claim boundary
+
+| Tier | Role | Frozen model | Admission rule |
+|---|---|---|---|
+| `accessible` | `tutorial` | `HuggingFaceTB/SmolLM2-135M-Instruct` | candidate artifact + admitted receipt ancestry |
+| `accessible` | `recipe` | `HuggingFaceTB/SmolLM2-1.7B` | candidate artifact + admitted receipt ancestry |
+| `native-reference` | `native` | `microsoft/bitnet-b1.58-2B-4T` | candidate artifact + admitted receipt ancestry |
+| `flagship` | `language+mtp` | `Qwen/Qwen3.6-27B` | candidate artifact + admitted receipt ancestry |
+
+No row authorizes a measured quality, speed, memory, energy, compression or
+SOTA statement by itself. Such statements must be projected from admitted
+candidate receipts with matched artifacts and physical denominators.
+<!-- END TRITIUM GENERATED RELEASE CLAIMS -->
+
 ## The two layers of measurement
 
 | Layer | Crate / file | Gate | Where it runs |

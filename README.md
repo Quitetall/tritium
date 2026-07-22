@@ -15,6 +15,21 @@ quality as one auditable artifact lifecycle—not as an informal `bits=2` label.
 > [compatibility matrix](docs/compatibility.md) is authoritative: `pending` is
 > not support, and no public registry artifact is claimed before activation.
 
+<!-- BEGIN TRITIUM GENERATED RELEASE CLAIMS -->
+### Audited v1.1 model ladder
+
+| Tier | Role | Frozen model | Admission rule |
+|---|---|---|---|
+| `accessible` | `tutorial` | `HuggingFaceTB/SmolLM2-135M-Instruct` | candidate artifact + admitted receipt ancestry |
+| `accessible` | `recipe` | `HuggingFaceTB/SmolLM2-1.7B` | candidate artifact + admitted receipt ancestry |
+| `native-reference` | `native` | `microsoft/bitnet-b1.58-2B-4T` | candidate artifact + admitted receipt ancestry |
+| `flagship` | `language+mtp` | `Qwen/Qwen3.6-27B` | candidate artifact + admitted receipt ancestry |
+
+This table is an admission inventory, not a support or SOTA claim. A row
+becomes releasable only when its exact candidate artifact, immutable source
+and tokenizer identity, model card, and required evidence ancestry validate.
+<!-- END TRITIUM GENERATED RELEASE CLAIMS -->
+
 ## What is implemented
 
 - Additive PTQ with one to three ternary planes, calibration receipts, strict

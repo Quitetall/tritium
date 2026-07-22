@@ -14,7 +14,7 @@ CLAIMS_SCHEMA = "tritium.generated-claims.v1"
 GOVERNANCE_SCHEMA = "tritium.governance-docs.v1"
 CLAIM_SOURCE_SCHEMA = "tritium.claim-source-snapshot.v1"
 REVIEW_SCHEMA = "tritium.governance-review-attestation.v1"
-GENERATOR_ID = "tritium-zoo-community-qualifier@1"
+GENERATOR_ID = "tritium-release-claims-generator@1"
 COMMON_FIELDS = {
     "schema",
     "receipt_id",
@@ -70,7 +70,7 @@ REVIEW_FIELDS = {
 }
 REVIEWER_FIELDS = {"id", "organization"}
 EXPECTED_MODELS = (
-    ("accessible", "tutorial", "HuggingFaceTB/SmolLM2-135M"),
+    ("accessible", "tutorial", "HuggingFaceTB/SmolLM2-135M-Instruct"),
     ("accessible", "recipe", "HuggingFaceTB/SmolLM2-1.7B"),
     ("native-reference", "native", "microsoft/bitnet-b1.58-2B-4T"),
     ("flagship", "language+mtp", "Qwen/Qwen3.6-27B"),
@@ -295,7 +295,7 @@ def validate_claims(
     if receipt["generator_id"] != GENERATOR_ID:
         raise ZooCommunityError("generated claim producer differs from policy")
     generator = validate_file(receipt["generator_file"], repo, "generator_file")
-    if generator[0] != "scripts/qualify-zoo-community.py":
+    if generator[0] != "scripts/generate-release-claims.py":
         raise ZooCommunityError("generated claim producer path differs from policy")
     documents = receipt["documents"]
     if not isinstance(documents, list) or len(documents) != len(CLAIM_DOCUMENTS):

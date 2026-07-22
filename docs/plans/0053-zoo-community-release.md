@@ -428,6 +428,15 @@ validation rechecks the fixed producer source, adjacent zoo ancestry, snapshot
 receipt identities and an explicit independent governance-review attestation.
 It cannot manufacture missing model evidence, activate community channels or
 substitute a policy checkbox for a retained review.
+The README, model-zoo and benchmark chapters now carry deterministic generated
+admission blocks, while the compatibility document remains wholly generated
+from its compatibility manifest. The zoo/community producer runs both drift
+checks before sealing claims and binds the exact generator source. Generated
+tables intentionally omit dynamic receipt IDs and measurements, avoiding a
+source-revision cycle; the claims receipt separately binds the exact zoo and
+model-evidence IDs. The tutorial row now names the actually executed pinned
+`HuggingFaceTB/SmolLM2-135M-Instruct` artifact rather than the non-Instruct
+repository alias.
 
 Exact-image serving admission now distinguishes CPU runtime, CUDA runtime and
 CPU/CUDA security scans, plus cluster deployment. Each runtime receipt must bind the candidate OCI archive,

@@ -32,7 +32,7 @@ def fixture(root: Path):
     repo.mkdir()
     for relative in (
         *MODULE["CLAIM_DOCUMENTS"], *MODULE["GOVERNANCE_FILES"],
-        "scripts/qualify-zoo-community.py",
+        "scripts/generate-release-claims.py",
     ):
         path = repo / relative
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -121,6 +121,13 @@ def fixture(root: Path):
 
 
 class QualifyZooCommunityTests(unittest.TestCase):
+    def setUp(self):
+        self.original_check = assemble.__globals__["check_claim_documents"]
+        assemble.__globals__["check_claim_documents"] = lambda repo: None
+
+    def tearDown(self):
+        assemble.__globals__["check_claim_documents"] = self.original_check
+
     def test_assembles_three_self_validating_receipts(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)

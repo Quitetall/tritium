@@ -11,6 +11,21 @@ exercises that exact artifact. The source of truth is the loader
 (`crates/tritium-format/src/gguf.rs`) — when this page and the code disagree, the
 code wins.
 
+<!-- BEGIN TRITIUM GENERATED RELEASE CLAIMS -->
+## Audited v1.1 admission ladder
+
+| Tier | Role | Frozen model | Admission rule |
+|---|---|---|---|
+| `accessible` | `tutorial` | `HuggingFaceTB/SmolLM2-135M-Instruct` | candidate artifact + admitted receipt ancestry |
+| `accessible` | `recipe` | `HuggingFaceTB/SmolLM2-1.7B` | candidate artifact + admitted receipt ancestry |
+| `native-reference` | `native` | `microsoft/bitnet-b1.58-2B-4T` | candidate artifact + admitted receipt ancestry |
+| `flagship` | `language+mtp` | `Qwen/Qwen3.6-27B` | candidate artifact + admitted receipt ancestry |
+
+The generated ladder names release targets only. The model-zoo receipt
+binds exact revisions, tokenizer digests, cards, candidate artifacts and
+evidence receipts; absent evidence remains `MISSING`.
+<!-- END TRITIUM GENERATED RELEASE CLAIMS -->
+
 ## What the loader accepts
 
 `ModelRunner::load` (and the convenience `ModelRunner::load_cpu`) read a parsed
