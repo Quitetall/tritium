@@ -127,6 +127,15 @@ coverage and duplicate-plugin tests.
     the exact block/window outputs represented by the selected candidate; this
     final-logit bridge must not be presented as block reconstruction proof.
 - Execute the bound output-reconstruction workflow on checkpoint-scale evidence.
+- [x] Provide the real calibration producer an immutable resumable `S2KF`
+  publication namespace: bounded records install atomically without overwrite,
+  crash staging stays inside a managed reserved directory and outside the exact
+  record namespace, byte-identical retries are idempotent, and conflicts and
+  replaced roots fail closed where stable directory identity is available.
+  Supported platforms durably sync both publication and staging cleanup;
+  unsupported directory-sync platforms reject publication instead of claiming
+  durability. Collection of the actual 506 checkpoint records remains open and
+  this storage seam is not empirical proof.
 - Keep calibration, reconstruction and validation datasets source-bound and
   disjoint where the recipe requires.
 

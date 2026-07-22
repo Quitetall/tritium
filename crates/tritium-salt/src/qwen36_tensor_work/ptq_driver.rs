@@ -10,7 +10,7 @@ use std::{
 use tritium_format::{ModelId, salt_v2::SaltV2Codec};
 use tritium_quantize::{
     PhysicalBytes, SaltV2Config, SaltV2Error, SaltV2KroneckerEvidence,
-    SaltV2KroneckerEvidenceError, SaltV2Packing, SaltV2Profile,
+    SaltV2KroneckerEvidenceError, SaltV2KroneckerEvidenceReceipt, SaltV2Packing, SaltV2Profile,
     SaltV2RestartableTensorMasterFitInput, fit_salt_v2_restartable_tensor_master,
     plan_salt_v2_restartable_tensor_master,
 };
@@ -19,17 +19,45 @@ use crate::{
     Qwen36AdditiveCampaignSpec, Qwen36AdditiveInstallError, Qwen36AdmittedSource,
     Qwen36CampaignPreflightError, Qwen36CompleteWorkspaceReceipt, Qwen36PackageAdmissionError,
     Qwen36PackageAdmissionReceipt, Qwen36PackageVisitError, Qwen36PhysicalAllocationError,
-    Qwen36SelectedAllocationSpec, Qwen36TensorWorkError, tensor_work_store::absolute_path,
+    Qwen36SelectedAllocationSpec, Qwen36TensorWorkError,
+    tensor_work_store::{absolute_path, create_temporary_file, ensure_durable_directory},
 };
 
 use super::{Qwen36AdditiveWorkSlot, Qwen36TensorWorkStore, same_file_identity};
 
 const DEFAULT_MAX_EVIDENCE_BYTES: u64 = 64 * 1024 * 1024;
 const EVIDENCE_EXTENSION: &str = "s2kf";
+const EVIDENCE_STAGING_DIRECTORY: &str = ".staging";
 const ALLOCATOR_ID_CONTEXT: &str = "tritium qwen3.6 physical allocator identity v1";
 const ALLOCATION_RECIPE_CONTEXT: &str = "tritium qwen3.6 physical allocation recipe v1";
 const ALLOCATOR_SCHEMA: &[u8] =
     b"exact full-tile nested Hessian prefix allocator; stable tensor/tile/plane ties; v1";
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_EVIDENCE_DIRECTORY_SYNC_AFTER: std::cell::Cell<u32> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+#[cfg(test)]
+type FinalPathCheckHook = (
+    PathBuf,
+    std::sync::Arc<std::sync::Barrier>,
+    std::sync::Arc<std::sync::Barrier>,
+);
+
+#[cfg(test)]
+static FINAL_PATH_CHECK_BARRIERS: std::sync::Mutex<Option<FinalPathCheckHook>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+static STAGED_PATH_LINK_BARRIERS: std::sync::Mutex<Option<FinalPathCheckHook>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+static STAGING_DIRECTORY_CREATE_BARRIERS: std::sync::Mutex<Option<FinalPathCheckHook>> =
+    std::sync::Mutex::new(None);
 
 /// Bounded canonical layout for per-tensor Kronecker evidence records.
 ///
@@ -40,9 +68,48 @@ const ALLOCATOR_SCHEMA: &[u8] =
 pub struct Qwen36PtqEvidenceDirectory {
     root: PathBuf,
     max_record_bytes: u64,
+    root_identity: EvidenceDirectoryIdentity,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EvidenceDirectoryIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
 }
 
 impl Qwen36PtqEvidenceDirectory {
+    /// Create or reopen an ordinary evidence publication directory.
+    ///
+    /// # Errors
+    /// Rejects empty/traversing/symlinked paths and filesystem failures.
+    pub fn create(root: impl AsRef<Path>) -> Result<Self, Qwen36PtqDriverError> {
+        Self::create_bounded(root, DEFAULT_MAX_EVIDENCE_BYTES)
+    }
+
+    /// Create or reopen an evidence directory under an explicit record bound.
+    ///
+    /// # Errors
+    /// Rejects invalid paths, a zero byte bound, or directory creation failures.
+    pub fn create_bounded(
+        root: impl AsRef<Path>,
+        max_record_bytes: u64,
+    ) -> Result<Self, Qwen36PtqDriverError> {
+        if root.as_ref().as_os_str().is_empty() || max_record_bytes == 0 {
+            return Err(Qwen36PtqDriverError::InvalidEvidencePath(
+                "empty path or zero record byte limit",
+            ));
+        }
+        let root = absolute_path(root.as_ref()).map_err(|source| {
+            Qwen36PtqDriverError::Workspace(Qwen36TensorWorkError::TensorStore(source))
+        })?;
+        ensure_durable_directory(&root, "PTQ evidence directory").map_err(|source| {
+            Qwen36PtqDriverError::Workspace(Qwen36TensorWorkError::TensorStore(source))
+        })?;
+        Self::open_bounded(root, max_record_bytes)
+    }
+
     /// Open an existing ordinary directory with the default 64 MiB record bound.
     ///
     /// # Errors
@@ -82,6 +149,7 @@ impl Qwen36PtqEvidenceDirectory {
         Ok(Self {
             root,
             max_record_bytes,
+            root_identity: evidence_directory_identity(&metadata),
         })
     }
 
@@ -111,6 +179,7 @@ impl Qwen36PtqEvidenceDirectory {
     /// noncanonical filename, duplicate/out-of-range ordinal, symlink/special
     /// entry, or incomplete record set.
     pub fn validate_complete(&self, record_count: u64) -> Result<(), Qwen36PtqDriverError> {
+        self.verify_root()?;
         let record_count = usize::try_from(record_count)
             .ok()
             .filter(|count| (1..1_000_000).contains(count))
@@ -125,6 +194,14 @@ impl Qwen36PtqEvidenceDirectory {
             let entry = entry.map_err(|error| evidence_io("read evidence entry", None, error))?;
             let metadata = fs::symlink_metadata(entry.path())
                 .map_err(|error| evidence_io("inspect evidence entry", None, error))?;
+            if entry.file_name() == EVIDENCE_STAGING_DIRECTORY {
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err(Qwen36PtqDriverError::InvalidEvidencePath(
+                        "staging directory type",
+                    ));
+                }
+                continue;
+            }
             if metadata.file_type().is_symlink() || !metadata.is_file() {
                 return Err(Qwen36PtqDriverError::InvalidEvidencePath(
                     "record entry type",
@@ -155,6 +232,7 @@ impl Qwen36PtqEvidenceDirectory {
                 "incomplete record namespace",
             ));
         }
+        self.verify_root()?;
         Ok(())
     }
 
@@ -167,16 +245,38 @@ impl Qwen36PtqEvidenceDirectory {
         &self,
         tensor_index: u64,
     ) -> Result<SaltV2KroneckerEvidence, Qwen36PtqDriverError> {
+        self.verify_root()?;
         let path = self.record_path(tensor_index);
-        let path_metadata = fs::symlink_metadata(&path)
-            .map_err(|error| evidence_io("inspect evidence record", Some(tensor_index), error))?;
-        if path_metadata.file_type().is_symlink() || !path_metadata.is_file() {
+        let record = read_evidence_path(&path, tensor_index, self.max_record_bytes)?;
+        self.verify_root()?;
+        Ok(record)
+    }
+
+    /// Atomically publish one immutable canonical evidence record.
+    ///
+    /// Reinstalling byte-identical evidence is idempotent. A conflicting record
+    /// at the same global tensor ordinal is never replaced. Publication writes
+    /// and verifies a private temporary inode, links it into the canonical
+    /// namespace without overwrite, and durably syncs the directory.
+    ///
+    /// # Errors
+    /// Rejects out-of-range ordinals, oversized/malformed evidence, directory
+    /// replacement, a conflicting existing record, or any write/sync failure.
+    pub fn install(
+        &self,
+        record: &SaltV2KroneckerEvidence,
+    ) -> Result<SaltV2KroneckerEvidenceReceipt, Qwen36PtqDriverError> {
+        self.verify_root()?;
+        let tensor_index = record.tensor_index();
+        preflight_evidence_directory_sync(tensor_index)?;
+        if tensor_index >= 1_000_000 {
             return Err(Qwen36PtqDriverError::EvidenceMismatch {
                 tensor_index,
-                field: "record path type",
+                field: "global tensor ordinal",
             });
         }
-        if path_metadata.len() > self.max_record_bytes {
+        let expected = evidence_receipt(record, tensor_index)?;
+        if expected.bytes() > self.max_record_bytes {
             return Err(Qwen36PtqDriverError::Evidence {
                 tensor_index,
                 source: SaltV2KroneckerEvidenceError::SizeLimitExceeded {
@@ -184,37 +284,547 @@ impl Qwen36PtqEvidenceDirectory {
                 },
             });
         }
+        let destination = self.record_path(tensor_index);
+        match fs::symlink_metadata(&destination) {
+            Ok(_) => return self.existing_receipt(record),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(evidence_io(
+                    "inspect evidence destination",
+                    Some(tensor_index),
+                    error,
+                ));
+            }
+        }
+        let staging = self.open_staging()?;
+        #[cfg(test)]
+        pause_before_staging_file_create(staging.path());
+        let (temporary, mut file) =
+            create_temporary_file(staging.path(), ".s2kf").map_err(|source| {
+                Qwen36PtqDriverError::Workspace(Qwen36TensorWorkError::TensorStore(source))
+            })?;
+        if let Err(error) = staging.verify() {
+            let _ = fs::remove_file(&temporary);
+            return Err(error);
+        }
+        let receipt = match record.write_to(&mut file).and_then(|receipt| {
+            file.sync_all()
+                .map_err(|error| SaltV2KroneckerEvidenceError::Io {
+                    operation: "sync evidence",
+                    kind: error.kind(),
+                })?;
+            Ok(receipt)
+        }) {
+            Ok(receipt) => receipt,
+            Err(source) => {
+                let _ = fs::remove_file(&temporary);
+                return Err(Qwen36PtqDriverError::Evidence {
+                    tensor_index,
+                    source,
+                });
+            }
+        };
+        drop(file);
+        let staged = match verify_written_evidence_path(
+            record,
+            &temporary,
+            tensor_index,
+            self.max_record_bytes,
+        ) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                let _ = fs::remove_file(&temporary);
+                return Err(error);
+            }
+        };
+        if staged.receipt != expected || receipt != expected {
+            let _ = fs::remove_file(&temporary);
+            return Err(Qwen36PtqDriverError::EvidenceMismatch {
+                tensor_index,
+                field: "staged canonical record",
+            });
+        }
+        if let Err(error) = self.verify_root() {
+            let _ = fs::remove_file(&temporary);
+            return Err(error);
+        }
+        if let Err(error) = staging.verify() {
+            let _ = fs::remove_file(&temporary);
+            return Err(error);
+        }
+        #[cfg(test)]
+        pause_before_staged_path_link(&temporary);
+        match fs::hard_link(&temporary, &destination) {
+            Ok(()) => {
+                if let Err(error) =
+                    verify_published_evidence_inode(&destination, &staged.file, tensor_index)
+                {
+                    let _ = fs::remove_file(&destination);
+                    let _ = fs::remove_file(&temporary);
+                    return Err(error);
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                let existing = match self.existing_receipt(record) {
+                    Ok(receipt) => receipt,
+                    Err(error) => {
+                        let _ = fs::remove_file(&temporary);
+                        return Err(error);
+                    }
+                };
+                remove_staging_link_durably(&temporary, &staging, tensor_index)?;
+                return Ok(existing);
+            }
+            Err(error) => {
+                let _ = fs::remove_file(&temporary);
+                return Err(evidence_io(
+                    "publish evidence record",
+                    Some(tensor_index),
+                    error,
+                ));
+            }
+        }
+        if let Err(error) = self.verify_root() {
+            let _ = fs::remove_file(&temporary);
+            return Err(error);
+        }
+        if let Err(error) = sync_evidence_directory(&self.root) {
+            let _ = fs::remove_file(&temporary);
+            return Err(evidence_io(
+                "sync evidence directory",
+                Some(tensor_index),
+                error,
+            ));
+        }
+        remove_staging_link_durably(&temporary, &staging, tensor_index)?;
+        let installed = self.reopen(tensor_index)?;
+        if evidence_receipt(&installed, tensor_index)? != expected {
+            return Err(Qwen36PtqDriverError::EvidenceMismatch {
+                tensor_index,
+                field: "published canonical record",
+            });
+        }
+        Ok(receipt)
+    }
 
-        let mut file = File::open(&path)
-            .map_err(|error| evidence_io("open evidence record", Some(tensor_index), error))?;
+    fn existing_receipt(
+        &self,
+        record: &SaltV2KroneckerEvidence,
+    ) -> Result<SaltV2KroneckerEvidenceReceipt, Qwen36PtqDriverError> {
+        let tensor_index = record.tensor_index();
+        let existing = self.reopen(tensor_index)?;
+        let expected = evidence_receipt(record, tensor_index)?;
+        if evidence_receipt(&existing, tensor_index)? != expected {
+            return Err(Qwen36PtqDriverError::EvidenceMismatch {
+                tensor_index,
+                field: "immutable record identity",
+            });
+        }
+        let staging = self.open_staging()?;
+        sync_evidence_directory(&self.root).map_err(|error| {
+            evidence_io(
+                "sync existing evidence directory",
+                Some(tensor_index),
+                error,
+            )
+        })?;
+        staging.sync(tensor_index)?;
+        self.verify_root()?;
+        staging.verify()?;
+        Ok(expected)
+    }
+
+    fn open_staging(&self) -> Result<PinnedEvidenceDirectory, Qwen36PtqDriverError> {
+        let staging = self.root.join(EVIDENCE_STAGING_DIRECTORY);
+        ensure_durable_directory(&staging, "PTQ evidence staging directory").map_err(|source| {
+            Qwen36PtqDriverError::Workspace(Qwen36TensorWorkError::TensorStore(source))
+        })?;
+        self.verify_root()?;
+        let pinned = PinnedEvidenceDirectory::open(staging)?;
+        self.verify_root()?;
+        Ok(pinned)
+    }
+
+    fn verify_root(&self) -> Result<(), Qwen36PtqDriverError> {
+        let metadata = fs::symlink_metadata(&self.root)
+            .map_err(|error| evidence_io("inspect evidence directory", None, error))?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_dir()
+            || evidence_directory_identity(&metadata) != self.root_identity
+        {
+            return Err(Qwen36PtqDriverError::InvalidEvidencePath(
+                "directory identity changed",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn evidence_receipt(
+    record: &SaltV2KroneckerEvidence,
+    tensor_index: u64,
+) -> Result<SaltV2KroneckerEvidenceReceipt, Qwen36PtqDriverError> {
+    record
+        .receipt()
+        .map_err(|source| Qwen36PtqDriverError::Evidence {
+            tensor_index,
+            source,
+        })
+}
+
+fn remove_staging_link_durably(
+    temporary: &Path,
+    staging: &PinnedEvidenceDirectory,
+    tensor_index: u64,
+) -> Result<(), Qwen36PtqDriverError> {
+    staging.verify()?;
+    fs::remove_file(temporary)
+        .map_err(|error| evidence_io("remove evidence staging link", Some(tensor_index), error))?;
+    staging.verify()?;
+    staging.sync(tensor_index)
+}
+
+struct PinnedEvidenceDirectory {
+    path: PathBuf,
+    file: File,
+    identity: EvidenceDirectoryIdentity,
+}
+
+impl PinnedEvidenceDirectory {
+    fn open(path: PathBuf) -> Result<Self, Qwen36PtqDriverError> {
+        let path_metadata = fs::symlink_metadata(&path)
+            .map_err(|error| evidence_io("inspect evidence staging directory", None, error))?;
+        if path_metadata.file_type().is_symlink() || !path_metadata.is_dir() {
+            return Err(Qwen36PtqDriverError::InvalidEvidencePath(
+                "staging directory type",
+            ));
+        }
+        let file = File::open(&path)
+            .map_err(|error| evidence_io("open evidence staging directory", None, error))?;
         let opened_metadata = file
             .metadata()
-            .map_err(|error| evidence_io("inspect opened evidence", Some(tensor_index), error))?;
-        if !opened_metadata.is_file() || !same_file_identity(&path_metadata, &opened_metadata) {
-            return Err(Qwen36PtqDriverError::EvidenceMismatch {
-                tensor_index,
-                field: "stable record identity",
-            });
+            .map_err(|error| evidence_io("inspect opened staging directory", None, error))?;
+        if !opened_metadata.is_dir() || !same_file_identity(&path_metadata, &opened_metadata) {
+            return Err(Qwen36PtqDriverError::InvalidEvidencePath(
+                "staging directory identity changed",
+            ));
         }
-        let record = SaltV2KroneckerEvidence::read_from(&mut file, self.max_record_bytes).map_err(
-            |source| Qwen36PtqDriverError::Evidence {
+        Ok(Self {
+            path,
+            file,
+            identity: evidence_directory_identity(&opened_metadata),
+        })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn verify(&self) -> Result<(), Qwen36PtqDriverError> {
+        let path_metadata = fs::symlink_metadata(&self.path)
+            .map_err(|error| evidence_io("reinspect evidence staging directory", None, error))?;
+        let opened_metadata = self
+            .file
+            .metadata()
+            .map_err(|error| evidence_io("reinspect opened staging directory", None, error))?;
+        if path_metadata.file_type().is_symlink()
+            || !path_metadata.is_dir()
+            || !opened_metadata.is_dir()
+            || evidence_directory_identity(&path_metadata) != self.identity
+            || evidence_directory_identity(&opened_metadata) != self.identity
+        {
+            return Err(Qwen36PtqDriverError::InvalidEvidencePath(
+                "staging directory identity changed",
+            ));
+        }
+        Ok(())
+    }
+
+    fn sync(&self, tensor_index: u64) -> Result<(), Qwen36PtqDriverError> {
+        sync_evidence_directory_file(&self.file).map_err(|error| {
+            evidence_io("sync evidence staging directory", Some(tensor_index), error)
+        })
+    }
+}
+
+struct VerifiedEvidenceFile {
+    receipt: SaltV2KroneckerEvidenceReceipt,
+    file: File,
+}
+
+fn read_evidence_path(
+    path: &Path,
+    tensor_index: u64,
+    max_record_bytes: u64,
+) -> Result<SaltV2KroneckerEvidence, Qwen36PtqDriverError> {
+    let path_metadata = fs::symlink_metadata(path)
+        .map_err(|error| evidence_io("inspect evidence record", Some(tensor_index), error))?;
+    if path_metadata.file_type().is_symlink() || !path_metadata.is_file() {
+        return Err(Qwen36PtqDriverError::EvidenceMismatch {
+            tensor_index,
+            field: "record path type",
+        });
+    }
+    if path_metadata.len() > max_record_bytes {
+        return Err(Qwen36PtqDriverError::Evidence {
+            tensor_index,
+            source: SaltV2KroneckerEvidenceError::SizeLimitExceeded {
+                max_bytes: max_record_bytes,
+            },
+        });
+    }
+
+    let mut file = File::open(path)
+        .map_err(|error| evidence_io("open evidence record", Some(tensor_index), error))?;
+    let opened_metadata = file
+        .metadata()
+        .map_err(|error| evidence_io("inspect opened evidence", Some(tensor_index), error))?;
+    if !opened_metadata.is_file() || !same_file_identity(&path_metadata, &opened_metadata) {
+        return Err(Qwen36PtqDriverError::EvidenceMismatch {
+            tensor_index,
+            field: "stable record identity",
+        });
+    }
+    let record =
+        SaltV2KroneckerEvidence::read_from(&mut file, max_record_bytes).map_err(|source| {
+            Qwen36PtqDriverError::Evidence {
                 tensor_index,
                 source,
-            },
-        )?;
-        let final_metadata = file
-            .metadata()
-            .map_err(|error| evidence_io("reinspect evidence record", Some(tensor_index), error))?;
-        if !same_file_identity(&opened_metadata, &final_metadata)
-            || opened_metadata.len() != final_metadata.len()
-        {
-            return Err(Qwen36PtqDriverError::EvidenceMismatch {
-                tensor_index,
-                field: "record changed while reading",
-            });
-        }
-        Ok(record)
+            }
+        })?;
+    let final_metadata = file
+        .metadata()
+        .map_err(|error| evidence_io("reinspect evidence record", Some(tensor_index), error))?;
+    if !same_file_identity(&opened_metadata, &final_metadata)
+        || opened_metadata.len() != final_metadata.len()
+    {
+        return Err(Qwen36PtqDriverError::EvidenceMismatch {
+            tensor_index,
+            field: "record changed while reading",
+        });
     }
+    #[cfg(test)]
+    pause_before_final_path_check(path);
+    let final_path_metadata = fs::symlink_metadata(path)
+        .map_err(|error| evidence_io("reinspect evidence path", Some(tensor_index), error))?;
+    if final_path_metadata.file_type().is_symlink()
+        || !final_path_metadata.is_file()
+        || !same_file_identity(&opened_metadata, &final_path_metadata)
+        || opened_metadata.len() != final_path_metadata.len()
+    {
+        return Err(Qwen36PtqDriverError::EvidenceMismatch {
+            tensor_index,
+            field: "record path changed while reading",
+        });
+    }
+    Ok(record)
+}
+
+#[cfg(test)]
+fn pause_before_final_path_check(path: &Path) {
+    let mut hook = FINAL_PATH_CHECK_BARRIERS
+        .lock()
+        .expect("final-path test hook lock poisoned");
+    let matches_path = hook
+        .as_ref()
+        .is_some_and(|(expected_path, _, _)| expected_path == path);
+    let barriers = matches_path.then(|| hook.take().expect("matched final-path test hook"));
+    drop(hook);
+    if let Some((_, ready, resume)) = barriers {
+        ready.wait();
+        resume.wait();
+    }
+}
+
+#[cfg(test)]
+fn pause_before_staged_path_link(path: &Path) {
+    let mut hook = STAGED_PATH_LINK_BARRIERS
+        .lock()
+        .expect("staged-path test hook lock poisoned");
+    let matches_directory = hook
+        .as_ref()
+        .is_some_and(|(directory, _, _)| path.parent().is_some_and(|parent| parent == directory));
+    let barriers = matches_directory.then(|| hook.take().expect("matched staged-path test hook"));
+    drop(hook);
+    if let Some((_, ready, resume)) = barriers {
+        ready.wait();
+        resume.wait();
+    }
+}
+
+#[cfg(test)]
+fn pause_before_staging_file_create(path: &Path) {
+    let mut hook = STAGING_DIRECTORY_CREATE_BARRIERS
+        .lock()
+        .expect("staging-directory test hook lock poisoned");
+    let matches_path = hook
+        .as_ref()
+        .is_some_and(|(expected_path, _, _)| expected_path == path);
+    let barriers = matches_path.then(|| hook.take().expect("matched staging-directory test hook"));
+    drop(hook);
+    if let Some((_, ready, resume)) = barriers {
+        ready.wait();
+        resume.wait();
+    }
+}
+
+fn verify_written_evidence_path(
+    expected: &SaltV2KroneckerEvidence,
+    path: &Path,
+    tensor_index: u64,
+    max_record_bytes: u64,
+) -> Result<VerifiedEvidenceFile, Qwen36PtqDriverError> {
+    let path_metadata = fs::symlink_metadata(path)
+        .map_err(|error| evidence_io("inspect staged evidence", Some(tensor_index), error))?;
+    if path_metadata.file_type().is_symlink() || !path_metadata.is_file() {
+        return Err(Qwen36PtqDriverError::EvidenceMismatch {
+            tensor_index,
+            field: "staged record path type",
+        });
+    }
+    if path_metadata.len() > max_record_bytes {
+        return Err(Qwen36PtqDriverError::Evidence {
+            tensor_index,
+            source: SaltV2KroneckerEvidenceError::SizeLimitExceeded {
+                max_bytes: max_record_bytes,
+            },
+        });
+    }
+    let mut file = File::open(path)
+        .map_err(|error| evidence_io("open staged evidence", Some(tensor_index), error))?;
+    let opened_metadata = file.metadata().map_err(|error| {
+        evidence_io("inspect opened staged evidence", Some(tensor_index), error)
+    })?;
+    if !opened_metadata.is_file() || !same_file_identity(&path_metadata, &opened_metadata) {
+        return Err(Qwen36PtqDriverError::EvidenceMismatch {
+            tensor_index,
+            field: "stable staged record identity",
+        });
+    }
+    let receipt =
+        expected
+            .verify_written(&mut file)
+            .map_err(|source| Qwen36PtqDriverError::Evidence {
+                tensor_index,
+                source,
+            })?;
+    let final_metadata = file
+        .metadata()
+        .map_err(|error| evidence_io("reinspect staged evidence", Some(tensor_index), error))?;
+    let final_path_metadata = fs::symlink_metadata(path)
+        .map_err(|error| evidence_io("reinspect staged path", Some(tensor_index), error))?;
+    if !same_file_identity(&opened_metadata, &final_metadata)
+        || opened_metadata.len() != final_metadata.len()
+        || final_path_metadata.file_type().is_symlink()
+        || !final_path_metadata.is_file()
+        || !same_file_identity(&opened_metadata, &final_path_metadata)
+        || opened_metadata.len() != final_path_metadata.len()
+        || receipt.bytes() != opened_metadata.len()
+    {
+        return Err(Qwen36PtqDriverError::EvidenceMismatch {
+            tensor_index,
+            field: "staged record changed while reading",
+        });
+    }
+    Ok(VerifiedEvidenceFile { receipt, file })
+}
+
+fn verify_published_evidence_inode(
+    destination: &Path,
+    staged_file: &File,
+    tensor_index: u64,
+) -> Result<(), Qwen36PtqDriverError> {
+    let staged_metadata = staged_file
+        .metadata()
+        .map_err(|error| evidence_io("reinspect verified evidence", Some(tensor_index), error))?;
+    let destination_metadata = fs::symlink_metadata(destination).map_err(|error| {
+        evidence_io(
+            "inspect published evidence inode",
+            Some(tensor_index),
+            error,
+        )
+    })?;
+    if destination_metadata.file_type().is_symlink()
+        || !destination_metadata.is_file()
+        || !same_file_identity(&staged_metadata, &destination_metadata)
+        || staged_metadata.len() != destination_metadata.len()
+    {
+        return Err(Qwen36PtqDriverError::EvidenceMismatch {
+            tensor_index,
+            field: "published inode identity",
+        });
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+const fn preflight_evidence_directory_sync(_tensor_index: u64) -> Result<(), Qwen36PtqDriverError> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn preflight_evidence_directory_sync(tensor_index: u64) -> Result<(), Qwen36PtqDriverError> {
+    Err(evidence_io(
+        "preflight durable evidence publication",
+        Some(tensor_index),
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            "durable evidence-directory sync is unavailable on this platform",
+        ),
+    ))
+}
+
+#[cfg(unix)]
+fn evidence_directory_identity(metadata: &fs::Metadata) -> EvidenceDirectoryIdentity {
+    use std::os::unix::fs::MetadataExt;
+    EvidenceDirectoryIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    }
+}
+
+#[cfg(not(unix))]
+const fn evidence_directory_identity(_metadata: &fs::Metadata) -> EvidenceDirectoryIdentity {
+    EvidenceDirectoryIdentity {}
+}
+
+#[cfg(unix)]
+fn sync_evidence_directory(path: &Path) -> io::Result<()> {
+    let file = File::open(path)?;
+    sync_evidence_directory_file(&file)
+}
+
+#[cfg(unix)]
+fn sync_evidence_directory_file(file: &File) -> io::Result<()> {
+    #[cfg(test)]
+    if FAIL_EVIDENCE_DIRECTORY_SYNC_AFTER.with(|remaining| {
+        let current = remaining.get();
+        if current == 0 {
+            false
+        } else {
+            remaining.set(current - 1);
+            current == 1
+        }
+    }) {
+        return Err(io::Error::other("injected evidence-directory sync failure"));
+    }
+    file.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_evidence_directory(_path: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "durable evidence-directory sync is unavailable on this platform",
+    ))
+}
+
+#[cfg(not(unix))]
+fn sync_evidence_directory_file(_file: &File) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "durable evidence-directory sync is unavailable on this platform",
+    ))
 }
 
 /// Exact physical ceilings for the two nested deployable profiles.
@@ -799,7 +1409,10 @@ impl std::error::Error for Qwen36PtqDriverError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{
+        Arc, Barrier,
+        atomic::{AtomicU64, Ordering},
+    };
 
     use tritium_quantize::{
         CurvatureSourceId, DensePsdMetric, PhysicalRateTarget, Qwen35SourceDtype, Qwen35TensorRole,
@@ -928,6 +1541,318 @@ mod tests {
         ));
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn evidence_install_is_atomic_idempotent_and_conflict_safe() {
+        let parent = temp_root("install");
+        let root = parent.join("records");
+        let directory = Qwen36PtqEvidenceDirectory::create(&root).unwrap();
+        let record = evidence(0, "a.weight", [1; 32]);
+
+        let first = directory.install(&record).unwrap();
+        let second = directory.install(&record).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.record_digest(), record.record_digest());
+        assert_eq!(
+            first.bytes(),
+            fs::metadata(directory.record_path(0)).unwrap().len()
+        );
+        assert!(root.join(EVIDENCE_STAGING_DIRECTORY).is_dir());
+        assert_eq!(
+            fs::read_dir(&root)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+                .count(),
+            1
+        );
+        directory.validate_complete(1).unwrap();
+        fs::write(
+            root.join(EVIDENCE_STAGING_DIRECTORY).join(".s2kf.orphan"),
+            b"interrupted staging bytes",
+        )
+        .unwrap();
+        directory.validate_complete(1).unwrap();
+
+        let conflict = evidence_with_token(0, "a.weight", [1; 32], [8; 32]);
+        assert!(matches!(
+            directory.install(&conflict),
+            Err(Qwen36PtqDriverError::EvidenceMismatch {
+                tensor_index: 0,
+                field: "immutable record identity"
+            })
+        ));
+        assert_eq!(
+            directory.reopen(0).unwrap().record_digest(),
+            first.record_digest()
+        );
+
+        let bounded_root = parent.join("bounded");
+        let bounded = Qwen36PtqEvidenceDirectory::create_bounded(&bounded_root, 16).unwrap();
+        assert!(matches!(
+            bounded.install(&record),
+            Err(Qwen36PtqDriverError::Evidence {
+                tensor_index: 0,
+                source: SaltV2KroneckerEvidenceError::SizeLimitExceeded { max_bytes: 16 }
+            })
+        ));
+        assert_eq!(fs::read_dir(&bounded_root).unwrap().count(), 0);
+
+        let out_of_range = evidence(1_000_000, "a.weight", [1; 32]);
+        assert!(matches!(
+            directory.install(&out_of_range),
+            Err(Qwen36PtqDriverError::EvidenceMismatch {
+                tensor_index: 1_000_000,
+                field: "global tensor ordinal"
+            })
+        ));
+
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn evidence_install_retry_makes_an_existing_link_durable() {
+        let parent = temp_root("install-sync-retry");
+        let root = parent.join("records");
+        let directory = Qwen36PtqEvidenceDirectory::create(&root).unwrap();
+        let record = evidence(0, "a.weight", [1; 32]);
+
+        FAIL_EVIDENCE_DIRECTORY_SYNC_AFTER.with(|remaining| remaining.set(1));
+        assert!(matches!(
+            directory.install(&record),
+            Err(Qwen36PtqDriverError::Io {
+                operation: "sync evidence directory",
+                tensor_index: Some(0),
+                ..
+            })
+        ));
+        assert!(directory.record_path(0).is_file());
+        assert_eq!(
+            directory.install(&record).unwrap(),
+            record.receipt().unwrap()
+        );
+        assert_eq!(
+            fs::read_dir(root.join(EVIDENCE_STAGING_DIRECTORY))
+                .unwrap()
+                .count(),
+            0
+        );
+        directory.validate_complete(1).unwrap();
+
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn evidence_retry_completes_a_failed_staging_cleanup_sync() {
+        let parent = temp_root("install-staging-sync-retry");
+        let root = parent.join("records");
+        let directory = Qwen36PtqEvidenceDirectory::create(&root).unwrap();
+        let record = evidence(0, "a.weight", [1; 32]);
+
+        FAIL_EVIDENCE_DIRECTORY_SYNC_AFTER.with(|remaining| remaining.set(2));
+        assert!(matches!(
+            directory.install(&record),
+            Err(Qwen36PtqDriverError::Io {
+                operation: "sync evidence staging directory",
+                tensor_index: Some(0),
+                ..
+            })
+        ));
+        assert!(directory.record_path(0).is_file());
+        assert_eq!(
+            directory.install(&record).unwrap(),
+            record.receipt().unwrap()
+        );
+        assert_eq!(
+            fs::read_dir(root.join(EVIDENCE_STAGING_DIRECTORY))
+                .unwrap()
+                .count(),
+            0
+        );
+        directory.validate_complete(1).unwrap();
+
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_identical_installers_both_observe_the_durable_record() {
+        let parent = temp_root("install-concurrent");
+        let root = parent.join("records");
+        let directory = Qwen36PtqEvidenceDirectory::create(&root).unwrap();
+        let record = evidence(0, "a.weight", [1; 32]);
+        let start = Arc::new(Barrier::new(3));
+        let workers = (0..2)
+            .map(|_| {
+                let directory = directory.clone();
+                let record = record.clone();
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    directory.install(&record)
+                })
+            })
+            .collect::<Vec<_>>();
+        start.wait();
+        for worker in workers {
+            assert_eq!(worker.join().unwrap().unwrap(), record.receipt().unwrap());
+        }
+        assert_eq!(
+            fs::read_dir(root.join(EVIDENCE_STAGING_DIRECTORY))
+                .unwrap()
+                .count(),
+            0
+        );
+        directory.validate_complete(1).unwrap();
+
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn evidence_reopen_rejects_path_replacement_after_opened_record_verifies() {
+        let parent = temp_root("reopen-path-race");
+        let root = parent.join("records");
+        let directory = Qwen36PtqEvidenceDirectory::create(&root).unwrap();
+        let record = evidence(0, "a.weight", [1; 32]);
+        directory.install(&record).unwrap();
+
+        let ready = Arc::new(Barrier::new(2));
+        let resume = Arc::new(Barrier::new(2));
+        let path = directory.record_path(0);
+        *FINAL_PATH_CHECK_BARRIERS.lock().unwrap() =
+            Some((path.clone(), Arc::clone(&ready), Arc::clone(&resume)));
+        let reader = {
+            let directory = directory.clone();
+            std::thread::spawn(move || directory.reopen(0))
+        };
+        ready.wait();
+        fs::rename(&path, root.join("replaced.s2kf")).unwrap();
+        let replacement = evidence_with_token(0, "a.weight", [1; 32], [8; 32]);
+        let mut file = File::create(&path).unwrap();
+        replacement.write_to(&mut file).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        resume.wait();
+
+        let result = reader.join().unwrap();
+        assert!(
+            matches!(
+                result,
+                Err(Qwen36PtqDriverError::EvidenceMismatch {
+                    tensor_index: 0,
+                    field: "record path changed while reading"
+                })
+            ),
+            "unexpected reopen result: {result:?}"
+        );
+
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn evidence_install_never_publishes_a_swapped_staging_path() {
+        let parent = temp_root("install-staging-race");
+        let root = parent.join("records");
+        let directory = Qwen36PtqEvidenceDirectory::create(&root).unwrap();
+        let record = evidence(0, "a.weight", [1; 32]);
+        let staging = root.join(EVIDENCE_STAGING_DIRECTORY);
+        let ready = Arc::new(Barrier::new(2));
+        let resume = Arc::new(Barrier::new(2));
+        *STAGED_PATH_LINK_BARRIERS.lock().unwrap() =
+            Some((staging.clone(), Arc::clone(&ready), Arc::clone(&resume)));
+        let installer = {
+            let directory = directory.clone();
+            std::thread::spawn(move || directory.install(&record))
+        };
+        ready.wait();
+        let temporary = fs::read_dir(&staging)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.is_file())
+            .expect("verified staging file");
+        fs::rename(&temporary, staging.join("verified-away.s2kf")).unwrap();
+        let replacement = evidence_with_token(0, "a.weight", [1; 32], [8; 32]);
+        let mut file = File::create(&temporary).unwrap();
+        replacement.write_to(&mut file).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        resume.wait();
+
+        assert!(matches!(
+            installer.join().unwrap(),
+            Err(Qwen36PtqDriverError::EvidenceMismatch {
+                tensor_index: 0,
+                field: "published inode identity"
+            })
+        ));
+        assert!(!directory.record_path(0).exists());
+
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn evidence_install_rejects_a_replaced_staging_directory_before_create() {
+        let parent = temp_root("install-staging-directory-race");
+        let root = parent.join("records");
+        let directory = Qwen36PtqEvidenceDirectory::create(&root).unwrap();
+        let record = evidence(0, "a.weight", [1; 32]);
+        let staging = root.join(EVIDENCE_STAGING_DIRECTORY);
+        let ready = Arc::new(Barrier::new(2));
+        let resume = Arc::new(Barrier::new(2));
+        *STAGING_DIRECTORY_CREATE_BARRIERS.lock().unwrap() =
+            Some((staging.clone(), Arc::clone(&ready), Arc::clone(&resume)));
+        let installer = {
+            let directory = directory.clone();
+            std::thread::spawn(move || directory.install(&record))
+        };
+        ready.wait();
+        fs::rename(&staging, root.join("pinned-staging-away")).unwrap();
+        fs::create_dir(&staging).unwrap();
+        resume.wait();
+
+        assert!(matches!(
+            installer.join().unwrap(),
+            Err(Qwen36PtqDriverError::InvalidEvidencePath(
+                "staging directory identity changed"
+            ))
+        ));
+        assert!(!directory.record_path(0).exists());
+
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn evidence_handle_rejects_replaced_root_before_read_or_publish() {
+        let parent = temp_root("replaced-root");
+        let root = parent.join("records");
+        let replaced = parent.join("replaced");
+        let directory = Qwen36PtqEvidenceDirectory::create(&root).unwrap();
+        fs::rename(&root, &replaced).unwrap();
+        fs::create_dir(&root).unwrap();
+        let record = evidence(0, "a.weight", [1; 32]);
+
+        assert!(matches!(
+            directory.install(&record),
+            Err(Qwen36PtqDriverError::InvalidEvidencePath(
+                "directory identity changed"
+            ))
+        ));
+        assert!(matches!(
+            directory.validate_complete(1),
+            Err(Qwen36PtqDriverError::InvalidEvidencePath(
+                "directory identity changed"
+            ))
+        ));
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+
+        fs::remove_dir_all(parent).unwrap();
     }
 
     #[test]

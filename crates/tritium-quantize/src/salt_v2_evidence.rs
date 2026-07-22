@@ -200,6 +200,88 @@ impl SaltV2KroneckerEvidence {
         self.record_digest
     }
 
+    /// Exact canonical identity and encoded length without materializing bytes.
+    ///
+    /// # Errors
+    /// Returns a checked-length failure if the validated geometry cannot be
+    /// represented by the canonical record layout.
+    pub fn receipt(&self) -> Result<SaltV2KroneckerEvidenceReceipt, SaltV2KroneckerEvidenceError> {
+        let bytes = payload_len(
+            self.tensor_name.len(),
+            self.input_groups.len(),
+            self.output_weights.len(),
+        )
+        .and_then(|bytes| bytes.checked_add(CHECKSUM_BYTES))
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or(SaltV2KroneckerEvidenceError::Malformed("encoded length"))?;
+        Ok(SaltV2KroneckerEvidenceReceipt {
+            record_digest: self.record_digest,
+            bytes,
+        })
+    }
+
+    /// Verify exact canonical bytes previously written for this record.
+    ///
+    /// Verification uses fixed memory: it hashes the expected payload length,
+    /// checks both the computed and terminal checksum against this record's
+    /// identity, and rejects truncation or trailing bytes without decoding or
+    /// re-encoding a second record-sized buffer.
+    ///
+    /// # Errors
+    /// Rejects I/O failure, truncation, trailing bytes, or any payload/checksum
+    /// mismatch with this validated record.
+    pub fn verify_written(
+        &self,
+        mut reader: impl Read,
+    ) -> Result<SaltV2KroneckerEvidenceReceipt, SaltV2KroneckerEvidenceError> {
+        const VERIFY_BUFFER_BYTES: usize = 8 * 1024;
+        let receipt = self.receipt()?;
+        let payload_bytes = receipt
+            .bytes
+            .checked_sub(CHECKSUM_BYTES as u64)
+            .ok_or(SaltV2KroneckerEvidenceError::Malformed("encoded length"))?;
+        let mut payload = (&mut reader).take(payload_bytes);
+        let mut buffer = [0_u8; VERIFY_BUFFER_BYTES];
+        let mut hasher = blake3::Hasher::new_derive_key(CHECKSUM_CONTEXT);
+        let mut consumed = 0_u64;
+        loop {
+            let count = payload
+                .read(&mut buffer)
+                .map_err(|error| evidence_io("verify written evidence", error))?;
+            if count == 0 {
+                break;
+            }
+            hasher.update(&buffer[..count]);
+            consumed = consumed
+                .checked_add(count as u64)
+                .ok_or(SaltV2KroneckerEvidenceError::Malformed("encoded length"))?;
+        }
+        if consumed != payload_bytes {
+            return Err(SaltV2KroneckerEvidenceError::Malformed(
+                "truncated written record",
+            ));
+        }
+        let mut terminal = [0_u8; CHECKSUM_BYTES];
+        read_exact_evidence(&mut reader, &mut terminal)?;
+        let computed = *hasher.finalize().as_bytes();
+        if computed != self.record_digest || terminal != self.record_digest {
+            return Err(SaltV2KroneckerEvidenceError::Malformed(
+                "written record identity",
+            ));
+        }
+        let mut trailing = [0_u8; 1];
+        if reader
+            .read(&mut trailing)
+            .map_err(|error| evidence_io("verify written evidence", error))?
+            != 0
+        {
+            return Err(SaltV2KroneckerEvidenceError::Malformed(
+                "trailing written record",
+            ));
+        }
+        Ok(receipt)
+    }
+
     /// Reconstruct the borrowed fit-time curvature artifact.
     #[must_use]
     pub fn artifact(&self) -> CurvatureArtifact<'_> {
@@ -432,10 +514,9 @@ impl SaltV2KroneckerEvidence {
         writer
             .write_all(&bytes)
             .map_err(|error| evidence_io("write evidence", error))?;
-        Ok(SaltV2KroneckerEvidenceReceipt {
-            record_digest: self.record_digest,
-            bytes: bytes.len() as u64,
-        })
+        let receipt = self.receipt()?;
+        debug_assert_eq!(receipt.bytes, bytes.len() as u64);
+        Ok(receipt)
     }
 
     fn encode_payload(&self) -> Result<Vec<u8>, SaltV2KroneckerEvidenceError> {
@@ -609,6 +690,24 @@ fn canonical_zero(value: f64) -> f64 {
     if value == 0.0 { 0.0 } else { value }
 }
 
+fn read_exact_evidence(
+    reader: &mut impl Read,
+    mut output: &mut [u8],
+) -> Result<(), SaltV2KroneckerEvidenceError> {
+    while !output.is_empty() {
+        match reader.read(output) {
+            Ok(0) => {
+                return Err(SaltV2KroneckerEvidenceError::Malformed(
+                    "truncated written record",
+                ));
+            }
+            Ok(count) => output = &mut output[count..],
+            Err(error) => return Err(evidence_io("verify written evidence", error)),
+        }
+    }
+    Ok(())
+}
+
 fn evidence_io(operation: &'static str, error: io::Error) -> SaltV2KroneckerEvidenceError {
     SaltV2KroneckerEvidenceError::Io {
         operation,
@@ -740,7 +839,11 @@ mod tests {
         let original = evidence();
         let bytes = original.canonical_bytes().unwrap();
         let reopened = SaltV2KroneckerEvidence::from_canonical_bytes(&bytes).unwrap();
+        let receipt = original.receipt().unwrap();
+        assert_eq!(receipt.record_digest(), original.record_digest());
+        assert_eq!(receipt.bytes(), bytes.len() as u64);
         assert_eq!(reopened.canonical_bytes().unwrap(), bytes);
+        assert_eq!(reopened.receipt().unwrap(), receipt);
         assert_eq!(reopened.record_digest(), original.record_digest());
         assert_eq!(reopened.tensor_index(), 17);
         assert_eq!(reopened.tensor_name(), original.tensor_name());
@@ -765,7 +868,12 @@ mod tests {
 
     #[test]
     fn bounded_reader_and_corruption_fail_closed() {
-        let bytes = evidence().canonical_bytes().unwrap();
+        let record = evidence();
+        let bytes = record.canonical_bytes().unwrap();
+        assert_eq!(
+            record.verify_written(bytes.as_slice()).unwrap(),
+            record.receipt().unwrap()
+        );
         assert!(matches!(
             SaltV2KroneckerEvidence::read_from(bytes.as_slice(), bytes.len() as u64 - 1),
             Err(SaltV2KroneckerEvidenceError::SizeLimitExceeded { .. })
@@ -775,10 +883,15 @@ mod tests {
             let mut corrupt = bytes.clone();
             corrupt[index] ^= 1;
             assert!(SaltV2KroneckerEvidence::from_canonical_bytes(&corrupt).is_err());
+            assert!(record.verify_written(corrupt.as_slice()).is_err());
         }
         for length in 0..bytes.len().min(256) {
             assert!(SaltV2KroneckerEvidence::from_canonical_bytes(&bytes[..length]).is_err());
+            assert!(record.verify_written(&bytes[..length]).is_err());
         }
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(record.verify_written(trailing.as_slice()).is_err());
 
         let mut forged = bytes;
         forged[16..24].copy_from_slice(&u64::MAX.to_le_bytes());

@@ -802,7 +802,17 @@ Qwen shards to an exact 506-record evidence namespace, rejects extra/missing or
 misordered records and mixed token streams, plans the immutable campaign while
 retaining only one widened matrix and one factor record, resumes only missing
 masters, and seals through the existing content-addressed store. The producer
-that collects all 506 `S2KF` records from real calibration remains open.
+that collects all 506 `S2KF` records from real calibration remains open. Its
+publication boundary is now available: on supported platforms the evidence
+directory installs each bounded canonical record through a verified inode in a
+managed, reserved in-root staging directory and a no-overwrite hard link, so a
+producer crash cannot poison the exact record namespace. Reinstallation is
+content-idempotent, conflicting ordinals fail closed, supported platforms fsync
+successful publication and staging cleanup, and live handles reject
+root-directory replacement where stable directory identity is available.
+Platforms without directory-sync support reject publication instead of
+claiming durability. This is producer storage infrastructure, not calibration
+evidence.
 The same driver is exposed to Python as
 `tritium.salt.reconcile_qwen36_ptq_masters`; its immutable receipt is explicitly
 rate-free and cannot be mistaken for a packaged model or evaluation result.
