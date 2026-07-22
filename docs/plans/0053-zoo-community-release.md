@@ -136,14 +136,28 @@ separate implemented capability from receipt-qualified support, route users to
 ADR 0033/current plans and expose
 flagship, package, browser, ONNX, multimodal, community and reproduction
 blockers. The installed-artifact quick starts, final guide qualification,
-migration, observability examples and full generated-claim drift gate remain
-open.
+migration, installed-artifact observability qualification and full
+generated-claim drift gate remain open.
 The book now also contains a comprehensive first draft of the "Definitive Guide
 to Ternary Deep Learning" covering representation, physical accounting,
 PTQ/QAT/refinement, estimator scale and threshold mechanics, additive
 allocation, sparse and S34 representations, whole-model semantics, evaluation,
 and failure diagnosis. Tutorial execution and final documentation-gate review
 remain open before this documentation slice can close.
+The public PyTorch facade now also has bounded, network-free ternary diagnostics
+and injected TensorBoard, Weights & Biases and OpenTelemetry adapters. They
+report deduplicated latent or hard trit distributions, scales, gradients,
+per-plane applicable saturation, reconstruction error and code-plus-scale
+bytes/rate; externally measured KL/runtime/resident-memory values remain
+explicitly caller-supplied. Preflight element/path budgets prevent accidental
+whole-model latent projection, external estimators require an explicit purity
+opt-in, W&B steps cannot decrease, and OpenTelemetry is aggregate-by-default
+with explicit series ceilings. Focused adapter tests use fakes rather than
+accounts, and the book documents cadence and physical-accounting limits. A
+source-tree adapter smoke passes
+offline with TensorBoard 2.21.0, W&B
+0.28.1 and OpenTelemetry 1.44.0. Candidate clean-wheel execution and an admitted
+release receipt remain open; this developer smoke is not substituted for them.
 
 Replace the current pre-alpha/v1.0-era narrative with tested v1.1 documentation:
 
