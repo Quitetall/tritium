@@ -136,6 +136,15 @@ coverage and duplicate-plugin tests.
   unsupported directory-sync platforms reject publication instead of claiming
   durability. Collection of the actual 506 checkpoint records remains open and
   this storage seam is not empirical proof.
+- [x] Provide bounded grouped-curvature production: source-bound activation and
+  output-factor batches update atomically, G128 input groups and output-row
+  Fisher/KL factors preserve canonical sample selection, out-of-order worker
+  shards merge to byte-identical evidence, fallible transaction copies preserve
+  allocation errors, canonical dyadic state is observable and capped at 64
+  segments per accumulator, and exact record geometry is preflighted before
+  producer allocation. Consuming finalization installs directly into the durable
+  namespace. Runtime capture from the pinned model and collection of 506 real
+  records remain open.
 - Keep calibration, reconstruction and validation datasets source-bound and
   disjoint where the recipe requires.
 

@@ -4,7 +4,9 @@ use core::{fmt, mem::size_of};
 use std::io::{self, Read, Write};
 
 use crate::{
-    CurvatureArtifact, CurvatureSourceId, DensePsdMetric, SaltV2Curvature, SaltV2TensorFitInput,
+    CurvatureArtifact, CurvatureError, CurvatureSourceId, DensePsdMetric, InputGram,
+    InputGramAccumulator, OutputFisher, OutputFisherAccumulator, SaltV2Curvature,
+    SaltV2TensorFitInput,
 };
 
 const MAGIC: [u8; 4] = *b"S2KF";
@@ -15,6 +17,739 @@ const MAX_NAME_BYTES: usize = 1024 * 1024;
 const GROUP_SIZE: usize = 128;
 const FIXED_PAYLOAD_BYTES: usize = 184;
 const GROUP_PAYLOAD_BYTES: usize = size_of::<u32>() + GROUP_SIZE * GROUP_SIZE * size_of::<f64>();
+const BUILDER_DIGEST_CONTEXT: &str = "tritium salt v2 kronecker evidence builder v1";
+/// Default hard ceiling for one canonical grouped-curvature record.
+pub const DEFAULT_MAX_KRONECKER_EVIDENCE_BYTES: u64 = 64 * 1024 * 1024;
+/// Maximum dyadic reduction segments retained by any one factor accumulator.
+pub const MAX_KRONECKER_REDUCTION_SEGMENTS: usize = 64;
+
+/// Immutable tensor and provenance contract for streamed Kronecker evidence.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SaltV2KroneckerEvidenceSpec {
+    kind: SaltV2Curvature,
+    source_id: CurvatureSourceId,
+    tensor_index: u64,
+    tensor_name: String,
+    rows: usize,
+    columns: usize,
+    damping: f64,
+    canonical_bytes: u64,
+}
+
+impl SaltV2KroneckerEvidenceSpec {
+    /// Validate one grouped evidence-production contract.
+    ///
+    /// # Errors
+    /// Rejects unsupported curvature, invalid names or geometry, and invalid damping.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        kind: SaltV2Curvature,
+        source_id: CurvatureSourceId,
+        tensor_index: u64,
+        tensor_name: impl Into<String>,
+        rows: usize,
+        columns: usize,
+        damping: f64,
+    ) -> Result<Self, SaltV2KroneckerEvidenceBuildError> {
+        Self::new_bounded(
+            kind,
+            source_id,
+            tensor_index,
+            tensor_name,
+            rows,
+            columns,
+            damping,
+            DEFAULT_MAX_KRONECKER_EVIDENCE_BYTES,
+        )
+    }
+
+    /// Validate one contract under an explicit canonical-record byte ceiling.
+    ///
+    /// # Errors
+    /// Rejects unsupported curvature, invalid names or geometry, invalid
+    /// damping, zero limit, arithmetic overflow, or record size above limit.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_bounded(
+        kind: SaltV2Curvature,
+        source_id: CurvatureSourceId,
+        tensor_index: u64,
+        tensor_name: impl Into<String>,
+        rows: usize,
+        columns: usize,
+        damping: f64,
+        max_record_bytes: u64,
+    ) -> Result<Self, SaltV2KroneckerEvidenceBuildError> {
+        if !matches!(
+            kind,
+            SaltV2Curvature::InputHessian
+                | SaltV2Curvature::GuidedFisher
+                | SaltV2Curvature::ForwardKlKronecker
+        ) {
+            return Err(SaltV2KroneckerEvidenceBuildError::Malformed(
+                "curvature kind",
+            ));
+        }
+        let tensor_name = tensor_name.into();
+        if tensor_name.is_empty() || tensor_name.len() > MAX_NAME_BYTES {
+            return Err(SaltV2KroneckerEvidenceBuildError::Malformed("tensor name"));
+        }
+        if rows == 0 || columns == 0 || !columns.is_multiple_of(GROUP_SIZE) {
+            return Err(SaltV2KroneckerEvidenceBuildError::Malformed(
+                "tensor geometry",
+            ));
+        }
+        if !damping.is_finite() || damping < 0.0 {
+            return Err(SaltV2KroneckerEvidenceBuildError::Malformed("damping"));
+        }
+        if max_record_bytes == 0 {
+            return Err(SaltV2KroneckerEvidenceBuildError::Malformed(
+                "record byte limit",
+            ));
+        }
+        let group_count = columns / GROUP_SIZE;
+        let canonical_bytes = payload_len(tensor_name.len(), group_count, rows)
+            .and_then(|bytes| bytes.checked_add(CHECKSUM_BYTES))
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or(SaltV2KroneckerEvidenceBuildError::Malformed(
+                "canonical record length",
+            ))?;
+        if canonical_bytes > max_record_bytes {
+            return Err(SaltV2KroneckerEvidenceBuildError::SizeLimitExceeded {
+                required_bytes: canonical_bytes,
+                max_bytes: max_record_bytes,
+            });
+        }
+        Ok(Self {
+            kind,
+            source_id,
+            tensor_index,
+            tensor_name,
+            rows,
+            columns,
+            damping: canonical_zero(damping),
+            canonical_bytes,
+        })
+    }
+
+    /// Curvature estimator represented by produced evidence.
+    #[must_use]
+    pub const fn kind(&self) -> SaltV2Curvature {
+        self.kind
+    }
+
+    /// Immutable checkpoint/cache/token-stream identity.
+    #[must_use]
+    pub const fn source_id(&self) -> CurvatureSourceId {
+        self.source_id
+    }
+
+    /// Global architecture tensor ordinal.
+    #[must_use]
+    pub const fn tensor_index(&self) -> u64 {
+        self.tensor_index
+    }
+
+    /// Canonical source tensor name.
+    #[must_use]
+    pub fn tensor_name(&self) -> &str {
+        &self.tensor_name
+    }
+
+    /// Output row count.
+    #[must_use]
+    pub const fn rows(&self) -> usize {
+        self.rows
+    }
+
+    /// G128-aligned input column count.
+    #[must_use]
+    pub const fn columns(&self) -> usize {
+        self.columns
+    }
+
+    /// Diagonal damping applied after Kronecker scaling.
+    #[must_use]
+    pub const fn damping(&self) -> f64 {
+        self.damping
+    }
+
+    /// Exact canonical S2KF bytes implied by this contract.
+    #[must_use]
+    pub const fn canonical_bytes(&self) -> u64 {
+        self.canonical_bytes
+    }
+}
+
+/// Streaming, source-bound producer for one factorized S2KF tensor record.
+///
+/// Producer keeps one G128 Gram accumulator per input group plus one output-row
+/// accumulator. Batch mutation is atomic: any malformed activation, gradient,
+/// weight, mask, or allocation leaves prior evidence unchanged.
+#[derive(Debug)]
+pub struct SaltV2KroneckerEvidenceBuilder {
+    spec: SaltV2KroneckerEvidenceSpec,
+    input_groups: Vec<InputGramAccumulator>,
+    output_fisher: Option<OutputFisherAccumulator>,
+}
+
+/// Exact retained reduction-tree state for one producer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SaltV2KroneckerEvidenceResidency {
+    input_segments: usize,
+    output_segments: usize,
+}
+
+impl SaltV2KroneckerEvidenceResidency {
+    /// Total segments across all G128 input accumulators.
+    #[must_use]
+    pub const fn input_segments(self) -> usize {
+        self.input_segments
+    }
+
+    /// Segments in the optional output-row accumulator.
+    #[must_use]
+    pub const fn output_segments(self) -> usize {
+        self.output_segments
+    }
+}
+
+impl SaltV2KroneckerEvidenceBuilder {
+    /// Start evidence production at global sample ordinal zero.
+    ///
+    /// # Errors
+    /// Rejects accumulator geometry or allocation failure.
+    pub fn new(
+        spec: SaltV2KroneckerEvidenceSpec,
+    ) -> Result<Self, SaltV2KroneckerEvidenceBuildError> {
+        Self::new_at(spec, 0)
+    }
+
+    /// Start one independently mergeable shard at a declared sample ordinal.
+    ///
+    /// # Errors
+    /// Rejects accumulator geometry or allocation failure.
+    pub fn new_at(
+        spec: SaltV2KroneckerEvidenceSpec,
+        sample_start: u64,
+    ) -> Result<Self, SaltV2KroneckerEvidenceBuildError> {
+        let group_count = spec.columns / GROUP_SIZE;
+        let mut input_groups = Vec::new();
+        input_groups
+            .try_reserve_exact(group_count)
+            .map_err(|_| SaltV2KroneckerEvidenceBuildError::AllocationFailed)?;
+        for _ in 0..group_count {
+            input_groups.push(InputGramAccumulator::new_bound(
+                GROUP_SIZE,
+                spec.source_id,
+                sample_start,
+            )?);
+        }
+        let output_fisher = (!matches!(spec.kind, SaltV2Curvature::InputHessian))
+            .then(|| OutputFisherAccumulator::new_bound(spec.rows, spec.source_id, sample_start))
+            .transpose()?;
+        Ok(Self {
+            spec,
+            input_groups,
+            output_fisher,
+        })
+    }
+
+    /// Immutable tensor/provenance contract.
+    #[must_use]
+    pub const fn spec(&self) -> &SaltV2KroneckerEvidenceSpec {
+        &self.spec
+    }
+
+    /// Report exact retained dyadic segments without materializing factors.
+    #[must_use]
+    pub fn residency(&self) -> SaltV2KroneckerEvidenceResidency {
+        SaltV2KroneckerEvidenceResidency {
+            input_segments: self
+                .input_groups
+                .iter()
+                .map(InputGramAccumulator::retained_reduction_segments)
+                .sum(),
+            output_segments: self
+                .output_fisher
+                .as_ref()
+                .map_or(0, OutputFisherAccumulator::retained_reduction_segments),
+        }
+    }
+
+    /// Atomically add one row-major activation/output-factor batch.
+    ///
+    /// Input-Hessian evidence requires no output factors. Guided-Fisher and
+    /// forward-KL Kronecker evidence require one factor per sample and output row.
+    ///
+    /// # Errors
+    /// Rejects wrong factor presence, malformed shapes, non-finite values,
+    /// invalid masks/weights, sample overflow, or allocation failure.
+    pub fn accumulate_batch(
+        &mut self,
+        activations: &[f32],
+        output_factors: Option<&[f32]>,
+        samples: usize,
+        token_weights: Option<&[f64]>,
+        token_mask: Option<&[bool]>,
+    ) -> Result<(), SaltV2KroneckerEvidenceBuildError> {
+        match (self.output_fisher.is_some(), output_factors) {
+            (true, None) => return Err(SaltV2KroneckerEvidenceBuildError::MissingOutputFactors),
+            (false, Some(_)) => {
+                return Err(SaltV2KroneckerEvidenceBuildError::UnexpectedOutputFactors);
+            }
+            _ => {}
+        }
+        let expected_activations = samples
+            .checked_mul(self.spec.columns)
+            .ok_or(SaltV2KroneckerEvidenceBuildError::AllocationFailed)?;
+        if activations.len() != expected_activations {
+            return Err(SaltV2KroneckerEvidenceBuildError::BatchLengthMismatch {
+                field: "activations",
+                expected: expected_activations,
+                got: activations.len(),
+            });
+        }
+        if samples == 0 {
+            return Err(CurvatureError::EmptyBatch.into());
+        }
+        if let Some(weights) = token_weights {
+            if weights.len() != samples {
+                return Err(CurvatureError::TokenWeightLengthMismatch {
+                    expected: samples,
+                    got: weights.len(),
+                }
+                .into());
+            }
+            if let Some(sample) = weights
+                .iter()
+                .position(|weight| !weight.is_finite() || *weight < 0.0)
+            {
+                return Err(CurvatureError::InvalidTokenWeight { sample }.into());
+            }
+        }
+        if let Some(mask) = token_mask
+            && mask.len() != samples
+        {
+            return Err(CurvatureError::TokenMaskLengthMismatch {
+                expected: samples,
+                got: mask.len(),
+            }
+            .into());
+        }
+        if let Some(index) = activations.iter().position(|value| !value.is_finite()) {
+            return Err(CurvatureError::NonFiniteActivation {
+                sample: index / self.spec.columns,
+                feature: index % self.spec.columns,
+            }
+            .into());
+        }
+        if let Some(factors) = output_factors {
+            let expected_factors = samples
+                .checked_mul(self.spec.rows)
+                .ok_or(SaltV2KroneckerEvidenceBuildError::AllocationFailed)?;
+            if factors.len() != expected_factors {
+                return Err(SaltV2KroneckerEvidenceBuildError::BatchLengthMismatch {
+                    field: "output factors",
+                    expected: expected_factors,
+                    got: factors.len(),
+                });
+            }
+            if let Some(index) = factors.iter().position(|value| !value.is_finite()) {
+                return Err(CurvatureError::NonFiniteGradient {
+                    sample: index / self.spec.rows,
+                    output_row: index % self.spec.rows,
+                }
+                .into());
+            }
+        }
+
+        let mut next_output = try_clone_output_accumulator(self.output_fisher.as_ref())?;
+        if let (Some(accumulator), Some(factors)) = (&mut next_output, output_factors) {
+            accumulator.accumulate_batch(factors, samples, token_weights, token_mask)?;
+        }
+        let mut next_inputs = try_clone_input_accumulators(&self.input_groups)?;
+        let scratch_len = samples
+            .checked_mul(GROUP_SIZE)
+            .ok_or(SaltV2KroneckerEvidenceBuildError::AllocationFailed)?;
+        let mut scratch = Vec::new();
+        scratch
+            .try_reserve_exact(scratch_len)
+            .map_err(|_| SaltV2KroneckerEvidenceBuildError::AllocationFailed)?;
+        for (group_index, accumulator) in next_inputs.iter_mut().enumerate() {
+            scratch.clear();
+            let column_start = group_index * GROUP_SIZE;
+            for sample in 0..samples {
+                let row_start = sample * self.spec.columns + column_start;
+                scratch.extend_from_slice(&activations[row_start..row_start + GROUP_SIZE]);
+            }
+            accumulator.accumulate_batch(&scratch, samples, token_weights, token_mask)?;
+        }
+        ensure_segment_limits(&next_inputs, next_output.as_ref())?;
+        self.input_groups = next_inputs;
+        self.output_fisher = next_output;
+        Ok(())
+    }
+
+    /// Atomically merge one independently accumulated canonical sample shard.
+    ///
+    /// Shards may arrive out of processing order. `declared_order` must equal
+    /// shard's first global sample ordinal; finalization restores canonical order.
+    ///
+    /// # Errors
+    /// Rejects tensor/provenance drift, wrong shard order, gaps, overlaps,
+    /// source mismatch, or allocation failure without changing prior evidence.
+    pub fn merge_shard(
+        &mut self,
+        declared_order: u64,
+        shard: &Self,
+    ) -> Result<(), SaltV2KroneckerEvidenceBuildError> {
+        if self.spec != shard.spec {
+            return Err(SaltV2KroneckerEvidenceBuildError::SpecMismatch);
+        }
+        let mut next_inputs = try_clone_input_accumulators(&self.input_groups)?;
+        let mut next_output = try_clone_output_accumulator(self.output_fisher.as_ref())?;
+        for (destination, source) in next_inputs.iter_mut().zip(&shard.input_groups) {
+            destination.merge_shard(declared_order, source)?;
+        }
+        match (&mut next_output, &shard.output_fisher) {
+            (Some(destination), Some(source)) => {
+                destination.merge_shard(declared_order, source)?;
+            }
+            (None, None) => {}
+            _ => return Err(SaltV2KroneckerEvidenceBuildError::SpecMismatch),
+        }
+        ensure_segment_limits(&next_inputs, next_output.as_ref())?;
+        self.input_groups = next_inputs;
+        self.output_fisher = next_output;
+        Ok(())
+    }
+
+    /// Finalize exact factorized curvature and its upstream builder identity.
+    ///
+    /// # Errors
+    /// Rejects empty/misaligned evidence, invalid PSD groups, invalid output
+    /// curvature, allocation failure, or canonical record failure.
+    pub fn finish(&self) -> Result<SaltV2KroneckerEvidence, SaltV2KroneckerEvidenceBuildError> {
+        let mut grams = Vec::new();
+        grams
+            .try_reserve_exact(self.input_groups.len())
+            .map_err(|_| SaltV2KroneckerEvidenceBuildError::AllocationFailed)?;
+        for accumulator in &self.input_groups {
+            grams.push(accumulator.finish()?);
+        }
+        let fisher = self
+            .output_fisher
+            .as_ref()
+            .map(OutputFisherAccumulator::finish)
+            .transpose()?;
+        finalize_builder_evidence(&self.spec, grams, fisher)
+    }
+
+    /// Consume producer state and finalize one canonical record at lower peak residency.
+    ///
+    /// Each accumulator is released after its normalized factor is materialized,
+    /// before canonical record encoding begins.
+    ///
+    /// # Errors
+    /// Rejects same malformed or incomplete evidence as [`Self::finish`].
+    pub fn into_evidence(
+        self,
+    ) -> Result<SaltV2KroneckerEvidence, SaltV2KroneckerEvidenceBuildError> {
+        let Self {
+            spec,
+            input_groups,
+            output_fisher,
+        } = self;
+        let mut grams = Vec::new();
+        grams
+            .try_reserve_exact(input_groups.len())
+            .map_err(|_| SaltV2KroneckerEvidenceBuildError::AllocationFailed)?;
+        for accumulator in input_groups {
+            grams.push(accumulator.finish()?);
+        }
+        let fisher = output_fisher
+            .map(|accumulator| accumulator.finish())
+            .transpose()?;
+        finalize_builder_evidence(&spec, grams, fisher)
+    }
+}
+
+fn ensure_segment_limits(
+    input_groups: &[InputGramAccumulator],
+    output_fisher: Option<&OutputFisherAccumulator>,
+) -> Result<(), SaltV2KroneckerEvidenceBuildError> {
+    let retained = input_groups
+        .iter()
+        .map(InputGramAccumulator::retained_reduction_segments)
+        .chain(
+            output_fisher
+                .into_iter()
+                .map(OutputFisherAccumulator::retained_reduction_segments),
+        )
+        .max()
+        .unwrap_or(0);
+    if retained > MAX_KRONECKER_REDUCTION_SEGMENTS {
+        return Err(
+            SaltV2KroneckerEvidenceBuildError::ReductionSegmentLimitExceeded {
+                retained,
+                max_segments: MAX_KRONECKER_REDUCTION_SEGMENTS,
+            },
+        );
+    }
+    Ok(())
+}
+
+fn try_clone_input_accumulators(
+    accumulators: &[InputGramAccumulator],
+) -> Result<Vec<InputGramAccumulator>, SaltV2KroneckerEvidenceBuildError> {
+    let mut cloned = Vec::new();
+    cloned
+        .try_reserve_exact(accumulators.len())
+        .map_err(|_| SaltV2KroneckerEvidenceBuildError::AllocationFailed)?;
+    for accumulator in accumulators {
+        cloned.push(
+            accumulator
+                .try_clone_transactional()
+                .map_err(|_| SaltV2KroneckerEvidenceBuildError::AllocationFailed)?,
+        );
+    }
+    Ok(cloned)
+}
+
+fn try_clone_output_accumulator(
+    accumulator: Option<&OutputFisherAccumulator>,
+) -> Result<Option<OutputFisherAccumulator>, SaltV2KroneckerEvidenceBuildError> {
+    accumulator
+        .map(|accumulator| {
+            accumulator
+                .try_clone_transactional()
+                .map_err(|_| SaltV2KroneckerEvidenceBuildError::AllocationFailed)
+        })
+        .transpose()
+}
+
+fn finalize_builder_evidence(
+    spec: &SaltV2KroneckerEvidenceSpec,
+    grams: Vec<InputGram>,
+    fisher: Option<OutputFisher>,
+) -> Result<SaltV2KroneckerEvidence, SaltV2KroneckerEvidenceBuildError> {
+    let first = grams
+        .first()
+        .ok_or(SaltV2KroneckerEvidenceBuildError::Malformed(
+            "input group count",
+        ))?;
+    for gram in &grams[1..] {
+        ensure_matching_selection(first, gram)?;
+    }
+    if let Some(fisher) = fisher.as_ref() {
+        ensure_fisher_selection(first, fisher)?;
+    }
+
+    let mut input_metrics = Vec::new();
+    input_metrics
+        .try_reserve_exact(grams.len())
+        .map_err(|_| SaltV2KroneckerEvidenceBuildError::AllocationFailed)?;
+    for gram in &grams {
+        input_metrics.push(
+            DensePsdMetric::new(GROUP_SIZE, gram.as_slice())
+                .map_err(|_| SaltV2KroneckerEvidenceBuildError::Malformed("input group metric"))?,
+        );
+    }
+    let mut output_weights = Vec::new();
+    output_weights
+        .try_reserve_exact(spec.rows)
+        .map_err(|_| SaltV2KroneckerEvidenceBuildError::AllocationFailed)?;
+    match fisher.as_ref() {
+        Some(fisher) => output_weights.extend_from_slice(fisher.as_slice()),
+        None => output_weights.resize(spec.rows, 1.0),
+    }
+    let upstream_evidence_digest = builder_digest(spec, &grams, fisher.as_ref());
+    SaltV2KroneckerEvidence::new(
+        spec.kind,
+        spec.source_id,
+        upstream_evidence_digest,
+        spec.tensor_index,
+        spec.tensor_name.clone(),
+        spec.rows,
+        spec.columns,
+        input_metrics,
+        output_weights,
+        spec.damping,
+    )
+    .map_err(SaltV2KroneckerEvidenceBuildError::Evidence)
+}
+
+fn ensure_matching_selection(
+    expected: &InputGram,
+    got: &InputGram,
+) -> Result<(), SaltV2KroneckerEvidenceBuildError> {
+    if expected.source_id() != got.source_id()
+        || expected.sample_count() != got.sample_count()
+        || expected.selected_count() != got.selected_count()
+        || expected.total_weight().to_bits() != got.total_weight().to_bits()
+        || expected.selection_digest() != got.selection_digest()
+    {
+        return Err(SaltV2KroneckerEvidenceBuildError::SelectionMismatch);
+    }
+    Ok(())
+}
+
+fn ensure_fisher_selection(
+    expected: &InputGram,
+    got: &OutputFisher,
+) -> Result<(), SaltV2KroneckerEvidenceBuildError> {
+    if expected.source_id() != got.source_id()
+        || expected.sample_count() != got.sample_count()
+        || expected.selected_count() != got.selected_count()
+        || expected.total_weight().to_bits() != got.total_weight().to_bits()
+        || expected.selection_digest() != got.selection_digest()
+    {
+        return Err(SaltV2KroneckerEvidenceBuildError::SelectionMismatch);
+    }
+    Ok(())
+}
+
+fn builder_digest(
+    spec: &SaltV2KroneckerEvidenceSpec,
+    grams: &[InputGram],
+    fisher: Option<&OutputFisher>,
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(BUILDER_DIGEST_CONTEXT);
+    hasher.update(&[kind_tag(spec.kind)]);
+    hasher.update(&spec.source_id.digest());
+    hasher.update(&spec.tensor_index.to_le_bytes());
+    hasher.update(&(spec.tensor_name.len() as u64).to_le_bytes());
+    hasher.update(spec.tensor_name.as_bytes());
+    hasher.update(&(spec.rows as u64).to_le_bytes());
+    hasher.update(&(spec.columns as u64).to_le_bytes());
+    hasher.update(&spec.damping.to_bits().to_le_bytes());
+    hasher.update(&(grams.len() as u64).to_le_bytes());
+    for gram in grams {
+        hasher.update(&gram.digest());
+    }
+    match fisher {
+        Some(fisher) => {
+            hasher.update(&[1]);
+            hasher.update(&fisher.digest());
+        }
+        None => {
+            hasher.update(&[0]);
+        }
+    };
+    *hasher.finalize().as_bytes()
+}
+
+/// Failure while producing one streamed factorized-curvature record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SaltV2KroneckerEvidenceBuildError {
+    /// Static producer contract was malformed.
+    Malformed(&'static str),
+    /// Input-Hessian evidence unexpectedly received output factors.
+    UnexpectedOutputFactors,
+    /// Fisher/KL evidence omitted required output factors.
+    MissingOutputFactors,
+    /// Row-major batch storage did not match declared samples and geometry.
+    BatchLengthMismatch {
+        /// Malformed input field.
+        field: &'static str,
+        /// Required scalar count.
+        expected: usize,
+        /// Supplied scalar count.
+        got: usize,
+    },
+    /// Exact canonical record exceeds configured resource ceiling.
+    SizeLimitExceeded {
+        /// Exact bytes required by geometry and name.
+        required_bytes: u64,
+        /// Maximum admitted bytes.
+        max_bytes: u64,
+    },
+    /// Out-of-order reduction state exceeded its fixed residency ceiling.
+    ReductionSegmentLimitExceeded {
+        /// Segments the operation would retain in one accumulator.
+        retained: usize,
+        /// Maximum admitted segments per accumulator.
+        max_segments: usize,
+    },
+    /// Shard tensor, estimator, geometry, or provenance differed.
+    SpecMismatch,
+    /// Input groups and output factors selected different samples.
+    SelectionMismatch,
+    /// Curvature accumulation failed.
+    Curvature(CurvatureError),
+    /// Canonical S2KF construction failed.
+    Evidence(SaltV2KroneckerEvidenceError),
+    /// Bounded owned storage could not be allocated.
+    AllocationFailed,
+}
+
+impl From<CurvatureError> for SaltV2KroneckerEvidenceBuildError {
+    fn from(error: CurvatureError) -> Self {
+        Self::Curvature(error)
+    }
+}
+
+impl fmt::Display for SaltV2KroneckerEvidenceBuildError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Malformed(field) => write!(formatter, "malformed Kronecker builder {field}"),
+            Self::UnexpectedOutputFactors => {
+                formatter.write_str("input-Hessian builder rejects output factors")
+            }
+            Self::MissingOutputFactors => {
+                formatter.write_str("Fisher/KL builder requires output factors")
+            }
+            Self::BatchLengthMismatch {
+                field,
+                expected,
+                got,
+            } => write!(
+                formatter,
+                "Kronecker builder {field} length mismatch: expected {expected}, got {got}"
+            ),
+            Self::SizeLimitExceeded {
+                required_bytes,
+                max_bytes,
+            } => write!(
+                formatter,
+                "Kronecker evidence requires {required_bytes} bytes, limit is {max_bytes}"
+            ),
+            Self::ReductionSegmentLimitExceeded {
+                retained,
+                max_segments,
+            } => write!(
+                formatter,
+                "Kronecker reduction would retain {retained} segments, limit is {max_segments}"
+            ),
+            Self::SpecMismatch => formatter.write_str("Kronecker builder shard spec mismatch"),
+            Self::SelectionMismatch => {
+                formatter.write_str("Kronecker builder sample selection mismatch")
+            }
+            Self::Curvature(error) => write!(formatter, "Kronecker curvature failed: {error}"),
+            Self::Evidence(error) => write!(formatter, "Kronecker evidence failed: {error}"),
+            Self::AllocationFailed => formatter.write_str("Kronecker builder allocation failed"),
+        }
+    }
+}
+
+impl std::error::Error for SaltV2KroneckerEvidenceBuildError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Curvature(error) => Some(error),
+            Self::Evidence(error) => Some(error),
+            Self::Malformed(_)
+            | Self::UnexpectedOutputFactors
+            | Self::MissingOutputFactors
+            | Self::BatchLengthMismatch { .. }
+            | Self::SizeLimitExceeded { .. }
+            | Self::ReductionSegmentLimitExceeded { .. }
+            | Self::SpecMismatch
+            | Self::SelectionMismatch
+            | Self::AllocationFailed => None,
+        }
+    }
+}
 
 /// Canonical, source-bound factorized curvature for one additive tensor.
 #[derive(Clone, Debug)]

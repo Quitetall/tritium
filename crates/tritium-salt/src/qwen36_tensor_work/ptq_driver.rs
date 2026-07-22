@@ -10,9 +10,10 @@ use std::{
 use tritium_format::{ModelId, salt_v2::SaltV2Codec};
 use tritium_quantize::{
     PhysicalBytes, SaltV2Config, SaltV2Error, SaltV2KroneckerEvidence,
-    SaltV2KroneckerEvidenceError, SaltV2KroneckerEvidenceReceipt, SaltV2Packing, SaltV2Profile,
-    SaltV2RestartableTensorMasterFitInput, fit_salt_v2_restartable_tensor_master,
-    plan_salt_v2_restartable_tensor_master,
+    SaltV2KroneckerEvidenceBuildError, SaltV2KroneckerEvidenceBuilder,
+    SaltV2KroneckerEvidenceError, SaltV2KroneckerEvidenceReceipt, SaltV2KroneckerEvidenceSpec,
+    SaltV2Packing, SaltV2Profile, SaltV2RestartableTensorMasterFitInput,
+    fit_salt_v2_restartable_tensor_master, plan_salt_v2_restartable_tensor_master,
 };
 
 use crate::{
@@ -250,6 +251,75 @@ impl Qwen36PtqEvidenceDirectory {
         let record = read_evidence_path(&path, tensor_index, self.max_record_bytes)?;
         self.verify_root()?;
         Ok(record)
+    }
+
+    /// Consume streamed producer state and atomically publish its canonical record.
+    ///
+    /// Consuming builder releases accumulation state before record publication.
+    ///
+    /// # Errors
+    /// Rejects producer finalization or any [`Self::install`] failure.
+    pub fn install_builder(
+        &self,
+        builder: SaltV2KroneckerEvidenceBuilder,
+    ) -> Result<SaltV2KroneckerEvidenceReceipt, Qwen36PtqDriverError> {
+        let tensor_index = builder.spec().tensor_index();
+        self.preflight_builder_spec(builder.spec())?;
+        let record =
+            builder
+                .into_evidence()
+                .map_err(|source| Qwen36PtqDriverError::EvidenceBuild {
+                    tensor_index,
+                    source,
+                })?;
+        self.install(&record)
+    }
+
+    /// Create a producer preflighted against this directory's record ceiling.
+    ///
+    /// # Errors
+    /// Rejects oversized geometry before accumulator construction.
+    pub fn create_builder(
+        &self,
+        spec: SaltV2KroneckerEvidenceSpec,
+    ) -> Result<SaltV2KroneckerEvidenceBuilder, Qwen36PtqDriverError> {
+        self.create_builder_at(spec, 0)
+    }
+
+    /// Create one mergeable producer shard under this directory's ceiling.
+    ///
+    /// # Errors
+    /// Rejects oversized geometry before accumulator construction or invalid
+    /// accumulator geometry.
+    pub fn create_builder_at(
+        &self,
+        spec: SaltV2KroneckerEvidenceSpec,
+        sample_start: u64,
+    ) -> Result<SaltV2KroneckerEvidenceBuilder, Qwen36PtqDriverError> {
+        self.preflight_builder_spec(&spec)?;
+        let tensor_index = spec.tensor_index();
+        SaltV2KroneckerEvidenceBuilder::new_at(spec, sample_start).map_err(|source| {
+            Qwen36PtqDriverError::EvidenceBuild {
+                tensor_index,
+                source,
+            }
+        })
+    }
+
+    fn preflight_builder_spec(
+        &self,
+        spec: &SaltV2KroneckerEvidenceSpec,
+    ) -> Result<(), Qwen36PtqDriverError> {
+        if spec.canonical_bytes() > self.max_record_bytes {
+            return Err(Qwen36PtqDriverError::EvidenceBuild {
+                tensor_index: spec.tensor_index(),
+                source: SaltV2KroneckerEvidenceBuildError::SizeLimitExceeded {
+                    required_bytes: spec.canonical_bytes(),
+                    max_bytes: self.max_record_bytes,
+                },
+            });
+        }
+        Ok(())
     }
 
     /// Atomically publish one immutable canonical evidence record.
@@ -1316,6 +1386,13 @@ pub enum Qwen36PtqDriverError {
         /// Typed evidence failure.
         source: SaltV2KroneckerEvidenceError,
     },
+    /// Streamed curvature production failed before publication.
+    EvidenceBuild {
+        /// Global additive-tensor ordinal.
+        tensor_index: u64,
+        /// Typed producer failure.
+        source: SaltV2KroneckerEvidenceBuildError,
+    },
     /// Reopened evidence contradicted the admitted Qwen slot.
     EvidenceMismatch {
         /// Global additive-tensor ordinal.
@@ -1365,6 +1442,13 @@ impl fmt::Display for Qwen36PtqDriverError {
                 formatter,
                 "Qwen3.6 PTQ tensor {tensor_index} evidence failed: {source}"
             ),
+            Self::EvidenceBuild {
+                tensor_index,
+                source,
+            } => write!(
+                formatter,
+                "Qwen3.6 PTQ tensor {tensor_index} evidence build failed: {source}"
+            ),
             Self::EvidenceMismatch {
                 tensor_index,
                 field,
@@ -1396,6 +1480,7 @@ impl std::error::Error for Qwen36PtqDriverError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Evidence { source, .. } => Some(source),
+            Self::EvidenceBuild { source, .. } => Some(source),
             Self::Source { source, .. } => Some(source),
             Self::Fit { source, .. } => Some(source),
             Self::Workspace(source) => Some(source),
@@ -1416,7 +1501,7 @@ mod tests {
 
     use tritium_quantize::{
         CurvatureSourceId, DensePsdMetric, PhysicalRateTarget, Qwen35SourceDtype, Qwen35TensorRole,
-        Qwen35TensorScope, SaltV2Curvature, SaltV2Packing,
+        Qwen35TensorScope, SaltV2Curvature, SaltV2KroneckerEvidenceSpec, SaltV2Packing,
     };
 
     use super::*;
@@ -1607,6 +1692,71 @@ mod tests {
                 field: "global tensor ordinal"
             })
         ));
+
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn evidence_builder_consumes_directly_into_durable_namespace() {
+        let parent = temp_root("builder-install");
+        let root = parent.join("records");
+        let directory = Qwen36PtqEvidenceDirectory::create(&root).unwrap();
+        let source = CurvatureSourceId::new([1; 32], [2; 32], [3; 32]).unwrap();
+        let spec = SaltV2KroneckerEvidenceSpec::new(
+            SaltV2Curvature::GuidedFisher,
+            source,
+            0,
+            "a.weight",
+            2,
+            128,
+            0.25,
+        )
+        .unwrap();
+        let mut builder = directory.create_builder(spec).unwrap();
+        let mut activations = vec![1.0; 128];
+        activations.extend(std::iter::repeat_n(3.0, 128));
+        builder
+            .accumulate_batch(&activations, Some(&[1.0, 2.0, 3.0, 4.0]), 2, None, None)
+            .unwrap();
+
+        let receipt = directory.install_builder(builder).unwrap();
+        let reopened = directory.reopen(0).unwrap();
+        assert_eq!(receipt, reopened.receipt().unwrap());
+        assert_eq!(reopened.output_weights(), &[5.0, 10.0]);
+        directory.validate_complete(1).unwrap();
+
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn evidence_directory_rejects_oversized_builder_before_accumulator_construction() {
+        let parent = temp_root("builder-preflight");
+        let root = parent.join("records");
+        let directory = Qwen36PtqEvidenceDirectory::create_bounded(&root, 16).unwrap();
+        let source = CurvatureSourceId::new([1; 32], [2; 32], [3; 32]).unwrap();
+        let spec = SaltV2KroneckerEvidenceSpec::new(
+            SaltV2Curvature::GuidedFisher,
+            source,
+            0,
+            "a.weight",
+            2,
+            128,
+            0.25,
+        )
+        .unwrap();
+        let required_bytes = spec.canonical_bytes();
+
+        assert!(matches!(
+            directory.create_builder(spec),
+            Err(Qwen36PtqDriverError::EvidenceBuild {
+                tensor_index: 0,
+                source: SaltV2KroneckerEvidenceBuildError::SizeLimitExceeded {
+                    required_bytes: got,
+                    max_bytes: 16
+                }
+            }) if got == required_bytes
+        ));
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
 
         fs::remove_dir_all(parent).unwrap();
     }

@@ -599,6 +599,22 @@ impl InputGramAccumulator {
         })
     }
 
+    pub(crate) fn try_clone_transactional(&self) -> Result<Self, CurvatureError> {
+        Ok(Self {
+            dimension: self.dimension,
+            source_id: self.source_id,
+            sample_start: self.sample_start,
+            next_sample_ordinal: self.next_sample_ordinal,
+            sample_count: self.sample_count,
+            local_segments: try_clone_input_segments(&self.local_segments)?,
+            merged_segments: try_clone_input_segments(&self.merged_segments)?,
+        })
+    }
+
+    pub(crate) fn retained_reduction_segments(&self) -> usize {
+        self.local_segments.len() + self.merged_segments.len()
+    }
+
     /// Add one row-major activation batch.
     ///
     /// `token_weights`, when absent, means unit weight. `token_mask`, when absent, selects every
@@ -930,6 +946,22 @@ impl OutputFisherAccumulator {
             local_segments: Vec::new(),
             merged_segments: Vec::new(),
         })
+    }
+
+    pub(crate) fn try_clone_transactional(&self) -> Result<Self, CurvatureError> {
+        Ok(Self {
+            output_rows: self.output_rows,
+            source_id: self.source_id,
+            sample_start: self.sample_start,
+            next_sample_ordinal: self.next_sample_ordinal,
+            sample_count: self.sample_count,
+            local_segments: try_clone_fisher_segments(&self.local_segments)?,
+            merged_segments: try_clone_fisher_segments(&self.merged_segments)?,
+        })
+    }
+
+    pub(crate) fn retained_reduction_segments(&self) -> usize {
+        self.local_segments.len() + self.merged_segments.len()
     }
 
     /// Add one row-major output-gradient batch.

@@ -801,9 +801,19 @@ producer boundary. `reconcile_qwen36_ptq` now joins the admitted seek-backed
 Qwen shards to an exact 506-record evidence namespace, rejects extra/missing or
 misordered records and mixed token streams, plans the immutable campaign while
 retaining only one widened matrix and one factor record, resumes only missing
-masters, and seals through the existing content-addressed store. The producer
-that collects all 506 `S2KF` records from real calibration remains open. Its
-publication boundary is now available: on supported platforms the evidence
+masters, and seals through the existing content-addressed store. The public
+producer core now consumes source-bound row-major activation and output-factor
+batches into one G128 Gram accumulator per input group plus one output-row
+Fisher/KL accumulator, applies batch mutation through a fallibly allocated
+transactional shadow, merges independently completed sample shards in canonical
+order, and finalizes a digest-bound `S2KF` record. Canonical dyadic reduction is
+logarithmic for contiguous samples; exact residency telemetry and a hard
+64-segment-per-accumulator ceiling also bound adversarial out-of-order shard
+state. Exact record bytes are rejected against the destination ceiling before
+accumulator construction. Consuming finalization releases accumulator state
+before direct durable installation. The runtime adapter that captures real checkpoint
+activations/output factors and collects all 506 records remains open. Its
+publication boundary is available: on supported platforms the evidence
 directory installs each bounded canonical record through a verified inode in a
 managed, reserved in-root staging directory and a no-overwrite hard link, so a
 producer crash cannot poison the exact record namespace. Reinstallation is

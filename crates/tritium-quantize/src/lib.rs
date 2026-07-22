@@ -100,7 +100,10 @@ pub use salt_v2_curvature::{
     OutputFisherAccumulator, build_kfac_metric,
 };
 pub use salt_v2_evidence::{
-    SaltV2KroneckerEvidence, SaltV2KroneckerEvidenceError, SaltV2KroneckerEvidenceReceipt,
+    DEFAULT_MAX_KRONECKER_EVIDENCE_BYTES, MAX_KRONECKER_REDUCTION_SEGMENTS,
+    SaltV2KroneckerEvidence, SaltV2KroneckerEvidenceBuildError, SaltV2KroneckerEvidenceBuilder,
+    SaltV2KroneckerEvidenceError, SaltV2KroneckerEvidenceReceipt, SaltV2KroneckerEvidenceResidency,
+    SaltV2KroneckerEvidenceSpec,
 };
 pub use salt_v2_feedback::{
     ColumnGroup, FeedbackError, FeedbackMetric, FeedbackProblem, FeedbackRunError, FeedbackState,
