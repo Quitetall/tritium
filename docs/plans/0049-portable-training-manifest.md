@@ -208,6 +208,15 @@ cases locally. Its emitted `DIGEST=PATH` binding is a local workflow convenience
 not a release trust root: candidate manifests must pin the digest independently.
 Binary/toolchain provenance, performance receipts, and checked-in release bundles
 remain pending candidate-revision runs on every required physical target.
+Release-registry admission now recognizes only
+`tritium.training-backend-qualification.v1`. Its independent parser binds the
+frozen manifest/vector bytes and all seven candidate receipt bundles, then
+rechecks 35-operation/114-case order, success/error outcomes, clean build
+revision, physical backend/device identity, resident execution, zero host
+transfers, dtype/limit declarations and per-vector scratch ceilings. CPU, CUDA,
+ROCm, Metal, native wgpu, WASI and MCU are all mandatory; emulation/fallback
+markers and duplicate identities fail. This is validator infrastructure only:
+ROCm, Metal and MCU implementations/physical candidate receipts remain open.
 Release admission accepts only a clean immutable Git commit identity. The shared
 build helper also fingerprints dirty development trees and registers git metadata
 plus every tracked and currently-untracked source path as Cargo rebuild inputs,

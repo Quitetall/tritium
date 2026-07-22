@@ -279,6 +279,41 @@ def entry(
 
 
 class ReleaseEvidenceStatusTests(unittest.TestCase):
+    def test_backend_manifest_requires_candidate_training_bundle(self):
+        with tempfile.TemporaryDirectory() as raw:
+            candidate, document, artifact, evidence_root = release_fixture(Path(raw))
+            document["artifacts"][0]["kind"] = "training-receipt-bundle"
+            document["artifacts"][0]["identity"] = {
+                "sha256": sha256(artifact), "bytes": artifact.stat().st_size,
+            }
+            candidate.write_bytes(canonical(document) + b"\n")
+            receipt_path = evidence_root / "backends.json"
+            receipt_path.write_bytes(b"{}\n")
+            receipt = {
+                "receipt_id": "sha256:" + "c" * 64, "run_id": "backends-1",
+                "bundles": [
+                    {
+                        "artifact": {
+                            "id": "cuda-wheel", "kind": "training-receipt-bundle",
+                            "name": artifact.name, "bytes": artifact.stat().st_size,
+                            "sha256": sha256(artifact),
+                        }
+                    }
+                ],
+            }
+            registry_path = evidence_root / "registry.json"
+            registry(
+                registry_path, candidate,
+                [entry(receipt_path, receipt, kind="backend-manifest")],
+            )
+            loader = mock.Mock(return_value=receipt)
+            with mock.patch.dict(
+                evaluate.__globals__, {"validate_training_backends": loader}
+            ):
+                report = evaluate(registry_path, candidate, document)
+            row = next(item for item in report["rows"] if item["id"] == "native-backends")
+            self.assertEqual(row["satisfied_kinds"], ["backend-manifest"])
+
     def test_onnx_inference_requires_exact_conversion_lineage(self):
         with tempfile.TemporaryDirectory() as raw:
             candidate, document, old_artifact, evidence_root = release_fixture(Path(raw))

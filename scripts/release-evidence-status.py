@@ -88,6 +88,11 @@ ONNX_RECEIPT = runpy.run_path(
 )
 validate_onnx_inference = ONNX_RECEIPT["validate"]
 OnnxReceiptError = ONNX_RECEIPT["OnnxReceiptError"]
+TRAINING_BACKEND_RECEIPT = runpy.run_path(
+    Path(__file__).with_name("verify-training-backend-receipt.py")
+)
+validate_training_backends = TRAINING_BACKEND_RECEIPT["validate"]
+TrainingBackendReceiptError = TRAINING_BACKEND_RECEIPT["TrainingBackendReceiptError"]
 
 SCHEMA = "tritium.release-evidence-registry.v1"
 REPORT_SCHEMA = "tritium.release-gate-report.v1"
@@ -117,6 +122,7 @@ KNOWN_KINDS = frozenset(
         "runtime",
         "physical-bytes",
         "onnx-inference",
+        "backend-manifest",
     }
 )
 HEX = frozenset("0123456789abcdef")
@@ -328,6 +334,7 @@ def evaluate(
                 "physical-bytes",
             }
             else "onnx-bundle" if kind == "onnx-inference"
+            else "training-receipt-bundle" if kind == "backend-manifest"
             else "python-wheel"
         )
         if artifact.get("kind") != expected_artifact_kind:
@@ -432,6 +439,11 @@ def evaluate(
                 receipt = validate_onnx_inference(
                     receipt_path, revision, release, candidate
                 )
+            elif kind == "backend-manifest":
+                receipt = validate_training_backends(
+                    receipt_path, revision, release, candidate,
+                    Path(__file__).resolve().parent.parent,
+                )
             elif kind in {"oci-runtime-cpu", "oci-runtime-cuda"}:
                 receipt = load_oci_runtime_receipt(
                     receipt_path, revision=revision, release=release,
@@ -508,6 +520,7 @@ def evaluate(
             FlagshipQualityError,
             FlagshipRuntimeError,
             OnnxReceiptError,
+            TrainingBackendReceiptError,
             ValueError,
         ) as error:
             raise EvidenceError(f"{label} failed {kind} validation: {error}") from error
@@ -661,6 +674,21 @@ def evaluate(
             )
             if actual != declared or actual != qualified:
                 raise EvidenceError("ONNX receipt does not bind candidate archive bytes")
+        elif kind == "backend-manifest":
+            actual = (
+                artifact.get("id"), artifact.get("kind"), artifact_path.name,
+                artifact_path.stat().st_size, _sha256(artifact_path),
+            )
+            qualified = {
+                (
+                    bundle["artifact"]["id"], bundle["artifact"]["kind"],
+                    bundle["artifact"]["name"], bundle["artifact"]["bytes"],
+                    bundle["artifact"]["sha256"],
+                )
+                for bundle in receipt["bundles"]
+            }
+            if actual not in qualified:
+                raise EvidenceError("backend-manifest anchor is not a qualified bundle")
         elif kind.startswith("oci-"):
             identity = artifact.get("identity", {})
             actual = (artifact_path.name, _sha256(artifact_path), artifact_path.stat().st_size)
