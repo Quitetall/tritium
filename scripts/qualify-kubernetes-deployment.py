@@ -33,7 +33,7 @@ manifest_identity = RUNTIME["manifest_identity"]
 OCI_ARCHIVE = runpy.run_path(Path(__file__).with_name("verify-oci-archive.py"))
 validate_oci_archive = OCI_ARCHIVE["validate"]
 
-SCHEMA = "tritium.kubernetes-deployment-qualification.v6"
+SCHEMA = "tritium.kubernetes-deployment-qualification.v7"
 HEX = frozenset("0123456789abcdef")
 SAFE_NAME = re.compile(r"[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?")
 SAFE_SECRET_KEY = re.compile(r"[A-Za-z0-9](?:[-._A-Za-z0-9]{0,251}[A-Za-z0-9])?")
@@ -58,6 +58,7 @@ CHECKS = (
     "namespace-preflight", "secret-binding", "pvc-preflight", "helm-install",
     "rollout-ready", "production-readiness", "buffered-generation", "metrics",
     "watchdog-replacement", "pod-restart", "artifact-volume-loss",
+    "memory-oom-recovery",
     "successful-update", "update-readiness", "failed-upgrade",
     "atomic-rollback", "rollback-readiness", "rollback-generation", "release-cleanup",
 )
@@ -67,6 +68,9 @@ WATCHDOG_FAULT_COMMAND = (
 )
 WATCHDOG_SCHEDULING_ALLOWANCE_MS = 60_000
 ARTIFACT_VOLUME_OBSERVATION_BUDGET_MS = 120_000
+OOM_OBSERVATION_BUDGET_MS = 120_000
+OOM_FAULT_LIMIT = "16Mi"
+OOM_SOURCE_LIMIT = "32Gi"
 QUALIFICATION_METRICS = {
     "tritium_chat_requests_total", "tritium_tokens_out_total",
     "tritium_worker_alive", "tritium_backend_faults_total",
@@ -75,6 +79,10 @@ QUALIFICATION_METRICS = {
 ARTIFACT_VOLUME_TRANSITIONS = [
     "baseline_ready", "absence_verified", "fault_applied",
     "unschedulable_observed", "source_restored", "recovery_ready",
+]
+OOM_TRANSITIONS = [
+    "baseline_ready", "fault_applied", "oom_observed", "limit_restored",
+    "pre_fault_pods_removed", "recovery_ready",
 ]
 
 
@@ -745,6 +753,165 @@ def artifact_volume_contract(document: dict[str, Any]) -> dict[str, Any]:
     return {"volume_index": index, "claim_name": claim}
 
 
+def memory_limit_contract(document: dict[str, Any]) -> dict[str, Any]:
+    containers = document.get("spec", {}).get("template", {}).get("spec", {}).get(
+        "containers", []
+    )
+    matches = [(index, container) for index, container in enumerate(containers)
+               if isinstance(container, dict) and container.get("name") == "tritium"]
+    if len(matches) != 1:
+        raise DeploymentError("Tritium memory-limit container differs")
+    index, container = matches[0]
+    limit = container.get("resources", {}).get("limits", {}).get("memory")
+    limit_bytes = resource_quantity(limit, cpu=False)
+    fault_bytes = resource_quantity(OOM_FAULT_LIMIT, cpu=False)
+    if index != 0 or limit != OOM_SOURCE_LIMIT or limit_bytes <= fault_bytes:
+        raise DeploymentError("Tritium memory limit cannot admit OOM fault delta")
+    return {
+        "container_index": index, "source_limit": limit,
+        "source_limit_bytes": limit_bytes, "fault_limit": OOM_FAULT_LIMIT,
+        "fault_limit_bytes": fault_bytes,
+    }
+
+
+def observed_oom_failure(document: dict[str, Any], *, previous_uids: set[str]) \
+        -> dict[str, Any] | None:
+    items = document.get("items")
+    if not isinstance(items, list):
+        raise DeploymentError("OOM pod listing is malformed")
+    for pod in items:
+        if not isinstance(pod, dict):
+            raise DeploymentError("OOM pod entry is malformed")
+        metadata = pod.get("metadata", {})
+        spec = pod.get("spec", {})
+        uid = metadata.get("uid")
+        name = metadata.get("name")
+        if uid in previous_uids:
+            continue
+        statuses = pod.get("status", {}).get("containerStatuses", [])
+        matches = [status for status in statuses if isinstance(status, dict)
+                   and status.get("name") == "tritium"]
+        if len(matches) != 1:
+            continue
+        status = matches[0]
+        terminated = status.get("lastState", {}).get("terminated", {})
+        restart_count = status.get("restartCount")
+        pod_containers = spec.get("containers", [])
+        main = [container for container in pod_containers if isinstance(container, dict)
+                and container.get("name") == "tritium"]
+        admitted_limit = (main[0].get("resources", {}).get("limits", {}).get("memory")
+                          if len(main) == 1 else None)
+        owners = metadata.get("ownerReferences", [])
+        replica_sets = [owner for owner in owners if isinstance(owner, dict)
+                        and owner.get("kind") == "ReplicaSet"
+                        and owner.get("controller") is True]
+        if (terminated.get("reason") == "OOMKilled"
+                and terminated.get("exitCode") == 137
+                and type(restart_count) is int and restart_count >= 1
+                and admitted_limit == OOM_FAULT_LIMIT
+                and len(replica_sets) == 1
+                and all(isinstance(replica_sets[0].get(key), str)
+                        and replica_sets[0][key]
+                        for key in ("name", "uid"))
+                and isinstance(metadata.get("labels", {}).get("pod-template-hash"), str)
+                and metadata["labels"]["pod-template-hash"]
+                and all(isinstance(value, str) and value for value in (
+                    uid, name, spec.get("nodeName")
+                ))):
+            return {
+                "pod_name": name, "pod_uid": uid, "node": spec["nodeName"],
+                "restart_count": restart_count, "reason": "OOMKilled",
+                "last_exit_code": 137, "memory_limit": admitted_limit,
+                "memory_limit_bytes": resource_quantity(admitted_limit, cpu=False),
+                "replica_set_name": replica_sets[0]["name"],
+                "replica_set_uid": replica_sets[0]["uid"],
+                "template_hash": metadata["labels"]["pod-template-hash"],
+            }
+    return None
+
+
+def oom_replica_set_lineage(document: dict[str, Any], *, observed: dict[str, Any],
+                            deployment_name: str, deployment_uid: str) -> dict[str, Any]:
+    metadata = document.get("metadata", {})
+    if (metadata.get("name") != observed.get("replica_set_name")
+            or metadata.get("uid") != observed.get("replica_set_uid")):
+        raise DeploymentError("OOM ReplicaSet identity differs from observed pod")
+    owners = metadata.get("ownerReferences", [])
+    controllers = [owner for owner in owners if isinstance(owner, dict)
+                   and owner.get("kind") == "Deployment"
+                   and owner.get("controller") is True]
+    if (len(controllers) != 1
+            or controllers[0].get("name") != deployment_name
+            or controllers[0].get("uid") != deployment_uid):
+        raise DeploymentError("OOM ReplicaSet is not owned by qualified Deployment")
+    template = document.get("spec", {}).get("template", {})
+    labels = template.get("metadata", {}).get("labels", {})
+    containers = template.get("spec", {}).get("containers", [])
+    main = [container for container in containers if isinstance(container, dict)
+            and container.get("name") == "tritium"]
+    limit = (main[0].get("resources", {}).get("limits", {}).get("memory")
+             if len(main) == 1 else None)
+    if (labels.get("pod-template-hash") != observed.get("template_hash")
+            or limit != OOM_FAULT_LIMIT):
+        raise DeploymentError("OOM ReplicaSet template differs from observed fault")
+    return {
+        "name": metadata["name"], "uid": metadata["uid"],
+        "deployment_name": deployment_name, "deployment_uid": deployment_uid,
+        "template_hash": observed["template_hash"], "memory_limit": limit,
+        "memory_limit_bytes": resource_quantity(limit, cpu=False),
+    }
+
+
+def replace_pre_oom_pods(kubectl_base: list[str], *, selector: str,
+                         previous: dict[str, Any], flavor: str,
+                         timeout: float) -> dict[str, Any]:
+    pods = previous.get("pods")
+    if not isinstance(pods, list) or not pods:
+        raise DeploymentError("pre-OOM pod identity is absent")
+    expected = {pod.get("uid"): pod.get("name") for pod in pods
+                if isinstance(pod, dict)}
+    if (len(expected) != len(pods) or any(not isinstance(uid, str) or not uid
+            or not isinstance(name, str) or not name for uid, name in expected.items())):
+        raise DeploymentError("pre-OOM pod identity is malformed")
+
+    def survivors() -> dict[str, str]:
+        items = run_json(
+            kubectl_base + ["get", "pods", "-l", selector, "-o", "json"]
+        ).get("items")
+        if not isinstance(items, list):
+            raise DeploymentError("pre-OOM pod listing is malformed")
+        result = {}
+        for item in items:
+            metadata = item.get("metadata", {}) if isinstance(item, dict) else {}
+            uid = metadata.get("uid")
+            name = metadata.get("name")
+            if uid in expected:
+                if name != expected[uid]:
+                    raise DeploymentError("pre-OOM pod name changed for retained UID")
+                result[uid] = name
+        return result
+
+    retained = survivors()
+    if flavor == "cpu":
+        if retained != expected:
+            raise DeploymentError("CPU OOM rollout did not retain the baseline pod")
+        for uid, name in sorted(retained.items()):
+            run(kubectl_base + ["delete", f"pod/{name}", "--wait=true"], timeout)
+        mode = "deleted_after_restore"
+    elif flavor == "cuda":
+        if retained:
+            raise DeploymentError("CUDA OOM Recreate rollout retained the baseline pod")
+        mode = "already_absent"
+    else:
+        raise DeploymentError("OOM cleanup flavor differs")
+    if survivors():
+        raise DeploymentError("pre-OOM pod remained after replacement cleanup")
+    return {
+        "mode": mode, "pod_names": sorted(expected.values()),
+        "pod_uids": sorted(expected),
+    }
+
+
 def pending_artifact_volume_failure(document: dict[str, Any], *, missing_claim: str,
                                     previous_uids: set[str]) -> dict[str, str] | None:
     items = document.get("items")
@@ -836,19 +1003,19 @@ def resource_usage_sample(document: dict[str, Any], *, allow_empty: bool = False
     }
 
 
-def validate_resource_sample(value: Any, label: str,
-                             *, allow_empty: bool = False) -> dict[str, Any]:
+def validate_resource_sample(value: Any, label: str, *, allow_empty: bool = False,
+                             scenario: str = "artifact-volume") -> dict[str, Any]:
     fields = {
         "sample_sha256", "sampled_at_utc", "pod_names", "pod_count",
         "container_count", "cpu_nanocores", "memory_bytes",
     }
     if not isinstance(value, dict) or set(value) != fields:
-        raise DeploymentError(f"artifact-volume {label} resource fields differ")
-    exact_hex(value.get("sample_sha256"), 64, f"artifact-volume {label} sample SHA-256")
+        raise DeploymentError(f"{scenario} {label} resource fields differ")
+    exact_hex(value.get("sample_sha256"), 64, f"{scenario} {label} sample SHA-256")
     try:
         timestamp = datetime.fromisoformat(value["sampled_at_utc"])
     except (TypeError, ValueError) as error:
-        raise DeploymentError(f"artifact-volume {label} timestamp is malformed") from error
+        raise DeploymentError(f"{scenario} {label} timestamp is malformed") from error
     names = value.get("pod_names")
     if (timestamp.tzinfo != timezone.utc or not isinstance(names, list)
             or names != sorted(set(names))
@@ -866,15 +1033,16 @@ def validate_resource_sample(value: Any, label: str,
             )
             or value["container_count"] == 0
             and (value["cpu_nanocores"] != 0 or value["memory_bytes"] != 0)):
-        raise DeploymentError(f"artifact-volume {label} resource evidence is malformed")
+        raise DeploymentError(f"{scenario} {label} resource evidence is malformed")
     return value
 
 
-def validate_transition_trace(value: Any) -> list[dict[str, Any]]:
-    if (not isinstance(value, list) or len(value) != len(ARTIFACT_VOLUME_TRANSITIONS)
+def validate_transition_trace(value: Any, *, expected: list[str] = ARTIFACT_VOLUME_TRANSITIONS,
+                              scenario: str = "artifact-volume") -> list[dict[str, Any]]:
+    if (not isinstance(value, list) or len(value) != len(expected)
             or [item.get("state") if isinstance(item, dict) else None for item in value]
-            != ARTIFACT_VOLUME_TRANSITIONS):
-        raise DeploymentError("artifact-volume transition sequence differs")
+            != expected):
+        raise DeploymentError(f"{scenario} transition sequence differs")
     elapsed = []
     observed = []
     for item in value:
@@ -883,17 +1051,17 @@ def validate_transition_trace(value: Any) -> list[dict[str, Any]]:
         } or type(item.get("elapsed_ms")) not in {int, float} or not math.isfinite(
             item["elapsed_ms"]
         ) or item["elapsed_ms"] < 0:
-            raise DeploymentError("artifact-volume transition evidence is malformed")
+            raise DeploymentError(f"{scenario} transition evidence is malformed")
         try:
             timestamp = datetime.fromisoformat(item["observed_at_utc"])
         except (TypeError, ValueError) as error:
-            raise DeploymentError("artifact-volume transition timestamp is malformed") from error
+            raise DeploymentError(f"{scenario} transition timestamp is malformed") from error
         if timestamp.tzinfo != timezone.utc:
-            raise DeploymentError("artifact-volume transition timestamp is not UTC")
+            raise DeploymentError(f"{scenario} transition timestamp is not UTC")
         elapsed.append(item["elapsed_ms"])
         observed.append(timestamp)
     if elapsed != sorted(elapsed) or observed != sorted(observed):
-        raise DeploymentError("artifact-volume transition timing is not ordered")
+        raise DeploymentError(f"{scenario} transition timing is not ordered")
     return value
 
 
@@ -913,6 +1081,81 @@ def collect_resource_usage(kubectl_base: list[str], *, namespace: str,
             return sample
         time.sleep(1)
     raise DeploymentError("Kubernetes resource metrics pod set did not converge")
+
+
+def qualify_memory_oom(kubectl_base: list[str], *, service: str, namespace: str,
+                       selector: str,
+                       contract: dict[str, Any], previous_uids: set[str],
+                       deployment_uid: str, timeout: float) -> dict[str, Any]:
+    started = time.monotonic()
+    transitions = []
+
+    def record_transition(state: str) -> None:
+        transitions.append({
+            "state": state,
+            "elapsed_ms": (time.monotonic() - started) * 1000,
+            "observed_at_utc": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+        })
+
+    record_transition("baseline_ready")
+    path = (
+        f'/spec/template/spec/containers/{contract["container_index"]}'
+        "/resources/limits/memory"
+    )
+    fault_patch = [{"op": "replace", "path": path, "value": contract["fault_limit"]}]
+    restore_patch = [{"op": "replace", "path": path, "value": contract["source_limit"]}]
+    fault_payload = canonical(fault_patch).decode().strip()
+    patched = False
+    observation = None
+    observation_ms = None
+    failure_resources = None
+    replica_set = None
+    try:
+        run(kubectl_base + ["patch", f"deployment/{service}", "--type=json",
+                            f"--patch={fault_payload}"], min(timeout, 60))
+        patched = True
+        record_transition("fault_applied")
+        deadline = started + min(timeout, OOM_OBSERVATION_BUDGET_MS / 1000)
+        while time.monotonic() < deadline:
+            observation = observed_oom_failure(
+                run_json(kubectl_base + ["get", "pods", "-l", selector, "-o", "json"]),
+                previous_uids=previous_uids,
+            )
+            if observation is not None:
+                observation_ms = (time.monotonic() - started) * 1000
+                record_transition("oom_observed")
+                failure_resources = collect_resource_usage(
+                    kubectl_base, namespace=namespace, selector=selector,
+                    timeout=min(timeout, 30), allow_empty=True,
+                )
+                replica_set = oom_replica_set_lineage(
+                    run_json(kubectl_base + [
+                        "get", f'replicaset/{observation["replica_set_name"]}',
+                        "-o", "json",
+                    ]),
+                    observed=observation, deployment_name=service,
+                    deployment_uid=deployment_uid,
+                )
+                break
+            time.sleep(1)
+        if observation is None:
+            raise DeploymentError("memory-limit fault did not produce OOMKilled")
+    finally:
+        if patched:
+            run(kubectl_base + ["patch", f"deployment/{service}", "--type=json",
+                                f"--patch={canonical(restore_patch).decode().strip()}"],
+                min(timeout, 60))
+            record_transition("limit_restored")
+    return {
+        **contract,
+        "fault_patch_sha256": hashlib.sha256(fault_payload.encode()).hexdigest(),
+        "observation_budget_ms": OOM_OBSERVATION_BUDGET_MS,
+        "observation_ms": observation_ms, "terminated": observation,
+        "replica_set": replica_set,
+        "cleanup": {"status": "restored", "memory_limit": contract["source_limit"]},
+        "transitions": transitions, "failure_resources": failure_resources,
+        "_scenario_started_monotonic": started,
+    }
 
 
 def qualify_artifact_volume_loss(kubectl_base: list[str], *, service: str,
@@ -1856,6 +2099,7 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
         )
         watchdog_policy = watchdog_contract(deployment)
         artifact_volume = artifact_volume_contract(deployment)
+        oom_contract = memory_limit_contract(deployment)
         update_before = deployment_update_identity(deployment)
         if update_before["rate_limit_burst"] != 8:
             raise DeploymentError("initial deployment rate-limit burst differs")
@@ -2129,6 +2373,105 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
                 },
             },
         })
+        oom_baseline_resources = artifact_recovered_resources
+        oom_fault = qualify_memory_oom(
+            kubectl_base, service=service, namespace=args.namespace, selector=selector,
+            contract=oom_contract,
+            previous_uids={pod["uid"] for pod in artifact_recovered["pods"]},
+            deployment_uid=deployment_uid, timeout=args.timeout,
+        )
+        oom_fault["pre_fault_cleanup"] = replace_pre_oom_pods(
+            kubectl_base, selector=selector, previous=artifact_recovered,
+            flavor=args.flavor, timeout=min(args.timeout, 60),
+        )
+        oom_fault["transitions"].append({
+            "state": "pre_fault_pods_removed",
+            "elapsed_ms": (
+                time.monotonic() - oom_fault["_scenario_started_monotonic"]
+            ) * 1000,
+            "observed_at_utc": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+        })
+        run(kubectl_base + ["rollout", "status", f"deployment/{service}",
+                            f"--timeout={timeout_value}"], args.timeout + 30)
+        oom_recovered = pod_snapshot(
+            run_json(kubectl_base + ["get", "pods", "-l", selector, "-o", "json"]),
+            args.flavor,
+        )
+        if {pod["uid"] for pod in artifact_recovered["pods"]} & {
+            pod["uid"] for pod in oom_recovered["pods"]
+        }:
+            raise DeploymentError("OOM recovery retained the pre-fault pod UID")
+        oom_recovered_resources = collect_resource_usage(
+            kubectl_base, namespace=args.namespace, selector=selector,
+            timeout=min(args.timeout, 30),
+            expected_pods={pod["name"] for pod in oom_recovered["pods"]},
+        )
+        oom_port = free_port()
+        oom_url = f"http://127.0.0.1:{oom_port}"
+        oom_process, oom_ready = port_forward(
+            kubectl_base + ["port-forward", f"service/{service}",
+                            f"{oom_port}:{service_port}", "--address", "127.0.0.1"],
+            time.monotonic() + args.timeout, oom_url, token,
+        )
+        oom_request = {
+            "model": model_id,
+            "messages": [{"role": "user", "content": args.prompt}],
+            "temperature": 0, "max_tokens": 1,
+        }
+        try:
+            oom_startup = validate_ready(
+                oom_ready, revision, args.flavor, args.profile,
+                manifest_id["blake3"], args.release,
+            )
+            oom_generation = request_json(
+                oom_url + "/v1/chat/completions", token, body=oom_request,
+                timeout=args.request_timeout,
+            )
+            if (not isinstance(oom_generation.get("choices"), list)
+                    or len(oom_generation["choices"]) != 1):
+                raise DeploymentError("OOM recovery generation differs")
+            oom_metrics = metrics_snapshot(request(
+                oom_url + "/metrics", token, timeout=args.request_timeout
+            ).decode("utf-8"))
+        finally:
+            stop_forward(oom_process)
+        if oom_startup != startup:
+            raise DeploymentError("OOM recovery changed startup receipt")
+        oom_started = oom_fault.pop("_scenario_started_monotonic")
+        oom_fault["transitions"].append({
+            "state": "recovery_ready",
+            "elapsed_ms": (time.monotonic() - oom_started) * 1000,
+            "observed_at_utc": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+        })
+        oom_failure_resources = oom_fault.pop("failure_resources")
+        oom_fault.update({
+            "recovered": oom_recovered,
+            "startup_receipt": oom_startup,
+            "generation_response_sha256": hashlib.sha256(
+                canonical(oom_generation)
+            ).hexdigest(),
+            "request": request_evidence(
+                model_id, args.prompt, temperature=0, max_tokens=1
+            ),
+            "metrics": oom_metrics,
+            "resources": {
+                "baseline": oom_baseline_resources,
+                "failure": oom_failure_resources,
+                "recovered": oom_recovered_resources,
+                "high_water": {
+                    "cpu_nanocores": max(
+                        oom_baseline_resources["cpu_nanocores"],
+                        oom_failure_resources["cpu_nanocores"],
+                        oom_recovered_resources["cpu_nanocores"],
+                    ),
+                    "memory_bytes": max(
+                        oom_baseline_resources["memory_bytes"],
+                        oom_failure_resources["memory_bytes"],
+                        oom_recovered_resources["memory_bytes"],
+                    ),
+                },
+            },
+        })
         update_before = deployment_update_identity(run_json(
             kubectl_base + ["get", f"deployment/{service}", "-o", "json"]
         ))
@@ -2154,7 +2497,7 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
             run_json(kubectl_base + ["get", "pods", "-l", selector, "-o", "json"]),
             args.flavor,
         )
-        if {pod["uid"] for pod in artifact_recovered["pods"]} & {
+        if {pod["uid"] for pod in oom_recovered["pods"]} & {
             pod["uid"] for pod in updated["pods"]
         }:
             raise DeploymentError("successful update retained the previous pod UID")
@@ -2176,10 +2519,12 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
         if update_startup != startup:
             raise DeploymentError("successful update changed immutable startup receipt")
         observed_pods = (initial["pods"] + restarted["pods"]
-                         + artifact_recovered["pods"] + updated["pods"])
+                         + artifact_recovered["pods"] + oom_recovered["pods"]
+                         + updated["pods"])
         if scale is not None:
             observed_pods += scale["scaled_pods"]["pods"]
         node_names = {pod["node"] for pod in observed_pods}
+        node_names.add(oom_fault["terminated"]["node"])
         nodes = [
             node_snapshot(run_json(kubectl_base + ["get", f"node/{name}", "-o", "json"]))
             for name in sorted(node_names)
@@ -2344,6 +2689,7 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
                      "initial": initial, "restarted": restarted, "updated": updated,
                      "watchdog_replacement": watchdog,
                      "artifact_volume_loss": artifact_fault,
+                     "memory_oom_recovery": oom_fault,
                      "startup_receipt": startup, "restart_startup_receipt": restart_startup,
                      "update_startup_receipt": update_startup,
                      "update_strategy": "Recreate" if args.flavor == "cuda" else "RollingUpdate",
@@ -2480,7 +2826,7 @@ def validate_receipt(receipt: dict[str, Any], *, chart_path: Path, image_path: P
         "release_name", "deployment_uid", "qualification_lock_uid",
         "source_pvc", "source_pvc_identity", "model_id", "service_port",
         "initial", "restarted", "updated",
-        "watchdog_replacement", "artifact_volume_loss",
+        "watchdog_replacement", "artifact_volume_loss", "memory_oom_recovery",
         "startup_receipt", "restart_startup_receipt", "update_startup_receipt",
         "update_strategy", "update_config", "rollback_startup_receipt", "metrics",
         "restart_recovery", "scale", "helm_history",
@@ -2742,6 +3088,156 @@ def validate_receipt(receipt: dict[str, Any], *, chart_path: Path, image_path: P
     }
     if resources["high_water"] != expected_high_water:
         raise DeploymentError("deployment artifact-volume high-water evidence differs")
+    oom = workload.get("memory_oom_recovery")
+    oom_fields = {
+        "container_index", "source_limit", "source_limit_bytes", "fault_limit",
+        "fault_limit_bytes", "fault_patch_sha256", "observation_budget_ms",
+        "observation_ms", "terminated", "replica_set", "cleanup", "pre_fault_cleanup",
+        "transitions", "recovered",
+        "startup_receipt", "generation_response_sha256", "request", "metrics",
+        "resources",
+    }
+    expected_source_bytes = resource_quantity(OOM_SOURCE_LIMIT, cpu=False)
+    expected_fault_bytes = resource_quantity(OOM_FAULT_LIMIT, cpu=False)
+    if (not isinstance(oom, dict) or set(oom) != oom_fields
+            or type(oom.get("container_index")) is not int
+            or oom.get("container_index") != 0
+            or oom.get("source_limit") != OOM_SOURCE_LIMIT
+            or type(oom.get("source_limit_bytes")) is not int
+            or oom.get("source_limit_bytes") != expected_source_bytes
+            or oom.get("fault_limit") != OOM_FAULT_LIMIT
+            or type(oom.get("fault_limit_bytes")) is not int
+            or oom.get("fault_limit_bytes") != expected_fault_bytes
+            or oom.get("observation_budget_ms") != OOM_OBSERVATION_BUDGET_MS
+            or type(oom.get("observation_ms")) not in {int, float}
+            or not math.isfinite(oom["observation_ms"])
+            or not 0 < oom["observation_ms"] <= OOM_OBSERVATION_BUDGET_MS):
+        raise DeploymentError("deployment OOM evidence is malformed")
+    oom_patch = canonical([{
+        "op": "replace",
+        "path": "/spec/template/spec/containers/0/resources/limits/memory",
+        "value": OOM_FAULT_LIMIT,
+    }]).decode().strip()
+    if oom.get("fault_patch_sha256") != hashlib.sha256(oom_patch.encode()).hexdigest():
+        raise DeploymentError("deployment OOM fault patch differs")
+    terminated = oom.get("terminated")
+    if (not isinstance(terminated, dict) or set(terminated) != {
+            "pod_name", "pod_uid", "node", "restart_count", "reason", "last_exit_code",
+            "memory_limit", "memory_limit_bytes", "replica_set_name", "replica_set_uid",
+            "template_hash",
+        } or any(not isinstance(terminated.get(key), str) or not terminated[key]
+                 for key in ("pod_name", "pod_uid", "node", "replica_set_name",
+                             "replica_set_uid", "template_hash"))
+            or type(terminated.get("restart_count")) is not int
+            or terminated["restart_count"] < 1
+            or terminated.get("reason") != "OOMKilled"
+            or terminated.get("last_exit_code") != 137
+            or terminated.get("memory_limit") != OOM_FAULT_LIMIT
+            or type(terminated.get("memory_limit_bytes")) is not int
+            or terminated.get("memory_limit_bytes") != expected_fault_bytes
+            or terminated["pod_uid"] in {
+                pod["uid"] for pod in artifact_recovered["pods"]
+            }):
+        raise DeploymentError("deployment OOM termination evidence differs")
+    replica_set = oom.get("replica_set")
+    if (not isinstance(replica_set, dict) or set(replica_set) != {
+            "name", "uid", "deployment_name", "deployment_uid", "template_hash",
+            "memory_limit", "memory_limit_bytes",
+        } or replica_set.get("name") != terminated["replica_set_name"]
+            or replica_set.get("uid") != terminated["replica_set_uid"]
+            or replica_set.get("deployment_name")
+            != f'{workload["release_name"]}-tritium'
+            or replica_set.get("deployment_uid") != workload["deployment_uid"]
+            or replica_set.get("template_hash") != terminated["template_hash"]
+            or replica_set.get("memory_limit") != OOM_FAULT_LIMIT
+            or type(replica_set.get("memory_limit_bytes")) is not int
+            or replica_set.get("memory_limit_bytes") != expected_fault_bytes):
+        raise DeploymentError("deployment OOM ReplicaSet lineage differs")
+    if oom.get("cleanup") != {
+        "status": "restored", "memory_limit": OOM_SOURCE_LIMIT
+    }:
+        raise DeploymentError("deployment OOM cleanup differs")
+    pre_fault_cleanup = oom.get("pre_fault_cleanup")
+    expected_pre_fault = {
+        "mode": "deleted_after_restore" if receipt["flavor"] == "cpu" else "already_absent",
+        "pod_names": sorted(pod["name"] for pod in artifact_recovered["pods"]),
+        "pod_uids": sorted(pod["uid"] for pod in artifact_recovered["pods"]),
+    }
+    if pre_fault_cleanup != expected_pre_fault:
+        raise DeploymentError("deployment pre-OOM pod cleanup differs")
+    oom_recovered = validate_receipt_snapshot(oom.get("recovered"), "OOM recovered")
+    if (terminated["pod_uid"] in {pod["uid"] for pod in oom_recovered["pods"]}
+            or {pod["uid"] for pod in artifact_recovered["pods"]}
+            & {pod["uid"] for pod in oom_recovered["pods"]}):
+        raise DeploymentError("deployment OOM recovery retained a fault-era pod")
+    validate_ready(
+        {"status": "ready", "release_gate": "production_artifact_admitted",
+         "startup_receipt": oom.get("startup_receipt")},
+        revision, receipt["flavor"], receipt["profile"], manifest["blake3"], release,
+    )
+    if oom["startup_receipt"] != workload["startup_receipt"]:
+        raise DeploymentError("deployment OOM recovery changed startup receipt")
+    exact_hex(
+        oom.get("generation_response_sha256"), 64,
+        "OOM recovery generation response SHA-256",
+    )
+    oom_request = oom.get("request")
+    if (not isinstance(oom_request, dict) or set(oom_request) != request_fields
+            or oom_request.get("model") != workload["model_id"]
+            or type(oom_request.get("prompt_bytes")) is not int
+            or not 0 < oom_request["prompt_bytes"] <= 1024 * 1024
+            or type(oom_request.get("temperature")) is not int
+            or type(oom_request.get("max_tokens")) is not int
+            or oom_request.get("temperature") != 0
+            or oom_request.get("max_tokens") != 1):
+        raise DeploymentError("deployment OOM request evidence is malformed")
+    exact_hex(oom_request.get("prompt_sha256"), 64, "OOM prompt SHA-256")
+    oom_descriptor = {
+        key: oom_request[key] for key in request_fields - {"descriptor_sha256"}
+    }
+    if oom_request.get("descriptor_sha256") != hashlib.sha256(
+        canonical(oom_descriptor)
+    ).hexdigest():
+        raise DeploymentError("deployment OOM request descriptor differs")
+    oom_transitions = validate_transition_trace(
+        oom.get("transitions"), expected=OOM_TRANSITIONS, scenario="OOM"
+    )
+    if oom_transitions[-1]["elapsed_ms"] > receipt["duration_ms"]:
+        raise DeploymentError("deployment OOM transitions exceed run duration")
+    oom_resources = oom.get("resources")
+    if not isinstance(oom_resources, dict) or set(oom_resources) != {
+        "baseline", "failure", "recovered", "high_water"
+    }:
+        raise DeploymentError("deployment OOM resource fields differ")
+    oom_baseline = validate_resource_sample(
+        oom_resources["baseline"], "baseline", scenario="OOM"
+    )
+    oom_failure = validate_resource_sample(
+        oom_resources["failure"], "failure", allow_empty=True, scenario="OOM"
+    )
+    oom_recovery = validate_resource_sample(
+        oom_resources["recovered"], "recovered", scenario="OOM"
+    )
+    allowed_failure_pods = {
+        pod["name"] for pod in artifact_recovered["pods"]
+    } | {terminated["pod_name"]}
+    if (set(oom_baseline["pod_names"])
+            != {pod["name"] for pod in artifact_recovered["pods"]}
+            or not set(oom_failure["pod_names"]).issubset(allowed_failure_pods)
+            or set(oom_recovery["pod_names"])
+            != {pod["name"] for pod in oom_recovered["pods"]}):
+        raise DeploymentError("deployment OOM resource pod identity differs")
+    oom_sample_times = [datetime.fromisoformat(sample["sampled_at_utc"]) for sample in (
+        oom_baseline, oom_failure, oom_recovery
+    )]
+    if oom_sample_times != sorted(oom_sample_times):
+        raise DeploymentError("deployment OOM resource timing differs")
+    expected_oom_high_water = {
+        name: max(sample[name] for sample in (oom_baseline, oom_failure, oom_recovery))
+        for name in ("cpu_nanocores", "memory_bytes")
+    }
+    if oom_resources["high_water"] != expected_oom_high_water:
+        raise DeploymentError("deployment OOM high-water evidence differs")
     validate_ready(
         {"status": "ready", "release_gate": "production_artifact_admitted",
          "startup_receipt": workload.get("update_startup_receipt")},
@@ -2785,6 +3281,7 @@ def validate_receipt(receipt: dict[str, Any], *, chart_path: Path, image_path: P
     validate_metrics_evidence(recovery.get("metrics"), "restart")
     validate_metrics_evidence(watchdog.get("metrics"), "watchdog")
     validate_metrics_evidence(artifact_fault.get("metrics"), "artifact-volume")
+    validate_metrics_evidence(oom.get("metrics"), "OOM recovery")
     if receipt["flavor"] == "cpu":
         scale_receipt = validate_scale_receipt(workload.get("scale"))
         expected_query = (
@@ -2811,10 +3308,12 @@ def validate_receipt(receipt: dict[str, Any], *, chart_path: Path, image_path: P
         raise DeploymentError("CUDA deployment cannot contain CPU KEDA scale evidence")
     validate_helm_history(workload.get("helm_history"), workload["prior_helm_revision"])
     observed_pods = (initial["pods"] + restarted["pods"]
-                     + artifact_recovered["pods"] + updated["pods"])
+                     + artifact_recovered["pods"] + oom_recovered["pods"]
+                     + updated["pods"])
     if receipt["flavor"] == "cpu":
         observed_pods += workload["scale"]["scaled_pods"]["pods"]
     node_names = {pod["node"] for pod in observed_pods}
+    node_names.add(terminated["node"])
     if node_names != {node["name"] for node in validated_nodes}:
         raise DeploymentError("deployment node identities differ from pod placement")
     cuda_node = cluster.get("cuda_node")

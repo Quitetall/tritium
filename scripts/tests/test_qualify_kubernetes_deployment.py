@@ -28,9 +28,14 @@ watchdog_contract = MODULE["watchdog_contract"]
 deployment_service_port = MODULE["deployment_service_port"]
 validate_service_port = MODULE["validate_service_port"]
 artifact_volume_contract = MODULE["artifact_volume_contract"]
+memory_limit_contract = MODULE["memory_limit_contract"]
+observed_oom_failure = MODULE["observed_oom_failure"]
+oom_replica_set_lineage = MODULE["oom_replica_set_lineage"]
+replace_pre_oom_pods = MODULE["replace_pre_oom_pods"]
 pending_artifact_volume_failure = MODULE["pending_artifact_volume_failure"]
 pvc_identity = MODULE["pvc_identity"]
 qualify_artifact_volume_loss = MODULE["qualify_artifact_volume_loss"]
+qualify_memory_oom = MODULE["qualify_memory_oom"]
 prove_absent = MODULE["prove_absent"]
 resource_quantity = MODULE["resource_quantity"]
 resource_usage_sample = MODULE["resource_usage_sample"]
@@ -216,6 +221,76 @@ def receipt(chart: Path, image_archive: Path, candidate: Path,
                     ),
                     "recovered": resource_sample(
                         recovered_name, "2026-07-21T12:00:03+00:00", "3"
+                    ),
+                    "high_water": {
+                        "cpu_nanocores": 10_000_000,
+                        "memory_bytes": 1_000_000_000,
+                    },
+                },
+            },
+            "memory_oom_recovery": {
+                "container_index": 0,
+                "source_limit": "32Gi", "source_limit_bytes": 32 * 1024 ** 3,
+                "fault_limit": "16Mi", "fault_limit_bytes": 16 * 1024 ** 2,
+                "fault_patch_sha256": hashlib.sha256(canonical([{
+                    "op": "replace",
+                    "path": "/spec/template/spec/containers/0/resources/limits/memory",
+                    "value": "16Mi",
+                }]).decode().strip().encode()).hexdigest(),
+                "observation_budget_ms": 120000, "observation_ms": 6000.0,
+                "terminated": {
+                    "pod_name": "pod-oom", "pod_uid": "pod-oom-uid",
+                    "node": "node-1", "restart_count": 1,
+                    "reason": "OOMKilled", "last_exit_code": 137,
+                    "memory_limit": "16Mi", "memory_limit_bytes": 16 * 1024 ** 2,
+                    "replica_set_name": "qualification-tritium-fault",
+                    "replica_set_uid": "oom-rs-uid",
+                    "template_hash": "fault-hash",
+                },
+                "replica_set": {
+                    "name": "qualification-tritium-fault", "uid": "oom-rs-uid",
+                    "deployment_name": "qualification-tritium",
+                    "deployment_uid": "deployment-uid", "template_hash": "fault-hash",
+                    "memory_limit": "16Mi", "memory_limit_bytes": 16 * 1024 ** 2,
+                },
+                "cleanup": {"status": "restored", "memory_limit": "32Gi"},
+                "pre_fault_cleanup": {
+                    "mode": ("deleted_after_restore" if flavor == "cpu"
+                             else "already_absent"),
+                    "pod_names": [recovered_name],
+                    "pod_uids": [("pod-artifact-recovered-uid" if flavor == "cuda"
+                                  else "pod-new-uid")],
+                },
+                "transitions": [
+                    {"state": state, "elapsed_ms": float(index),
+                     "observed_at_utc": f"2026-07-21T12:01:0{index}+00:00"}
+                    for index, state in enumerate(MODULE["OOM_TRANSITIONS"])
+                ],
+                "recovered": {"pods": [{
+                    "name": "pod-oom-recovered", "uid": "pod-oom-recovered-uid",
+                    "node": "node-1", "restarts": 0,
+                }]},
+                "startup_receipt": dict(startup_receipt),
+                "generation_response_sha256": "1" * 64,
+                "request": request_evidence(
+                    "tritium", "Hello", temperature=0, max_tokens=1
+                ),
+                "metrics": {"sha256": "2" * 64, "values": {
+                    "tritium_chat_requests_total": 1.0,
+                    "tritium_tokens_out_total": 1.0,
+                    "tritium_worker_alive": 1.0,
+                    "tritium_backend_faults_total": 0.0,
+                    "tritium_backend_faulted": 0.0,
+                }},
+                "resources": {
+                    "baseline": resource_sample(
+                        recovered_name, "2026-07-21T12:01:01+00:00", "4"
+                    ),
+                    "failure": resource_sample(
+                        None, "2026-07-21T12:01:02+00:00", "5"
+                    ),
+                    "recovered": resource_sample(
+                        "pod-oom-recovered", "2026-07-21T12:01:03+00:00", "6"
                     ),
                     "high_water": {
                         "cpu_nanocores": 10_000_000,
@@ -641,6 +716,83 @@ class QualifyKubernetesDeploymentTests(unittest.TestCase):
             pods, missing_claim="other-missing", previous_uids={"old-uid"}
         ))
 
+    def test_memory_oom_contract_and_observation_are_exact(self):
+        deployment = {"spec": {"template": {"spec": {"containers": [
+            {"name": "tritium", "resources": {"limits": {"memory": "32Gi"}}},
+            {"name": "authenticated-probe"},
+        ]}}}}
+        self.assertEqual(memory_limit_contract(deployment), {
+            "container_index": 0, "source_limit": "32Gi",
+            "source_limit_bytes": 32 * 1024 ** 3,
+            "fault_limit": "16Mi", "fault_limit_bytes": 16 * 1024 ** 2,
+        })
+        pods = {"items": [{
+            "metadata": {
+                "name": "pod-oom", "uid": "oom-uid",
+                "labels": {"pod-template-hash": "fault-hash"},
+                "ownerReferences": [{
+                    "kind": "ReplicaSet", "name": "tritium-fault",
+                    "uid": "rs-uid", "controller": True,
+                }],
+            },
+            "spec": {"nodeName": "node-1", "containers": [{
+                "name": "tritium", "resources": {"limits": {"memory": "16Mi"}},
+            }]},
+            "status": {"containerStatuses": [{
+                "name": "tritium", "restartCount": 2,
+                "lastState": {"terminated": {"reason": "OOMKilled", "exitCode": 137}},
+            }]},
+        }]}
+        self.assertEqual(observed_oom_failure(pods, previous_uids=set()), {
+            "pod_name": "pod-oom", "pod_uid": "oom-uid", "node": "node-1",
+            "restart_count": 2, "reason": "OOMKilled", "last_exit_code": 137,
+            "memory_limit": "16Mi", "memory_limit_bytes": 16 * 1024 ** 2,
+            "replica_set_name": "tritium-fault", "replica_set_uid": "rs-uid",
+            "template_hash": "fault-hash",
+        })
+        self.assertIsNone(observed_oom_failure(pods, previous_uids={"oom-uid"}))
+        wrong_limit = copy.deepcopy(pods)
+        wrong_limit["items"][0]["spec"]["containers"][0]["resources"]["limits"][
+            "memory"
+        ] = "32Gi"
+        self.assertIsNone(observed_oom_failure(wrong_limit, previous_uids=set()))
+        missing_owner = copy.deepcopy(pods)
+        missing_owner["items"][0]["metadata"]["ownerReferences"] = []
+        self.assertIsNone(observed_oom_failure(missing_owner, previous_uids=set()))
+
+    def test_oom_replica_set_must_belong_to_qualified_deployment(self):
+        observed = {
+            "replica_set_name": "tritium-fault", "replica_set_uid": "rs-uid",
+            "template_hash": "fault-hash",
+        }
+        replica_set = {
+            "metadata": {
+                "name": "tritium-fault", "uid": "rs-uid",
+                "ownerReferences": [{
+                    "kind": "Deployment", "name": "qualification-tritium",
+                    "uid": "deployment-uid", "controller": True,
+                }],
+            },
+            "spec": {"template": {
+                "metadata": {"labels": {"pod-template-hash": "fault-hash"}},
+                "spec": {"containers": [{
+                    "name": "tritium",
+                    "resources": {"limits": {"memory": "16Mi"}},
+                }]},
+            }},
+        }
+        self.assertEqual(oom_replica_set_lineage(
+            replica_set, observed=observed, deployment_name="qualification-tritium",
+            deployment_uid="deployment-uid",
+        )["deployment_uid"], "deployment-uid")
+        replica_set["metadata"]["ownerReferences"][0]["uid"] = "foreign-uid"
+        with self.assertRaisesRegex(DeploymentError, "qualified Deployment"):
+            oom_replica_set_lineage(
+                replica_set, observed=observed,
+                deployment_name="qualification-tritium",
+                deployment_uid="deployment-uid",
+            )
+
     def test_source_pvc_identity_requires_bound_storage(self):
         document = {
             "metadata": {"name": "tritium-artifact", "uid": "pvc-uid"},
@@ -680,6 +832,61 @@ class QualifyKubernetesDeploymentTests(unittest.TestCase):
         self.assertEqual(len(commands), 2)
         self.assertIn("tritium-missing-", commands[0][-1])
         self.assertIn("tritium-artifact", commands[1][-1])
+
+    def test_memory_oom_fault_always_restores_source_limit(self):
+        commands = []
+
+        def fake_run(command, _timeout):
+            commands.append(command)
+            return ""
+
+        with mock.patch.dict(qualify_memory_oom.__globals__, {
+            "run": fake_run,
+            "run_json": mock.Mock(return_value={"items": [None]}),
+            "collect_resource_usage": mock.Mock(),
+        }):
+            with self.assertRaisesRegex(DeploymentError, "pod entry"):
+                qualify_memory_oom(
+                    ["kubectl"], service="tritium", namespace="tritium-test",
+                    selector="app=tritium",
+                    contract={
+                        "container_index": 0, "source_limit": "32Gi",
+                        "source_limit_bytes": 32 * 1024 ** 3,
+                        "fault_limit": "16Mi", "fault_limit_bytes": 16 * 1024 ** 2,
+                    },
+                    previous_uids={"old-uid"}, deployment_uid="deployment-uid",
+                    timeout=10,
+                )
+        self.assertEqual(len(commands), 2)
+        self.assertIn('"value":"16Mi"', commands[0][-1])
+        self.assertIn('"value":"32Gi"', commands[1][-1])
+
+    def test_cpu_oom_cleanup_deletes_retained_baseline_pod(self):
+        listing = {"items": [{"metadata": {"name": "pod-old", "uid": "old-uid"}}]}
+        commands = []
+        with mock.patch.dict(replace_pre_oom_pods.__globals__, {
+            "run_json": mock.Mock(side_effect=[listing, {"items": []}]),
+            "run": mock.Mock(side_effect=lambda command, _timeout: commands.append(command)),
+        }):
+            result = replace_pre_oom_pods(
+                ["kubectl"], selector="app=tritium",
+                previous={"pods": [{"name": "pod-old", "uid": "old-uid"}]},
+                flavor="cpu", timeout=10,
+            )
+        self.assertEqual(result["mode"], "deleted_after_restore")
+        self.assertEqual(commands[0][2:4], ["pod/pod-old", "--wait=true"])
+
+    def test_cuda_oom_cleanup_requires_baseline_pod_already_absent(self):
+        with mock.patch.dict(replace_pre_oom_pods.__globals__, {
+            "run_json": mock.Mock(side_effect=[{"items": []}, {"items": []}]),
+            "run": mock.Mock(),
+        }):
+            result = replace_pre_oom_pods(
+                ["kubectl"], selector="app=tritium",
+                previous={"pods": [{"name": "pod-old", "uid": "old-uid"}]},
+                flavor="cuda", timeout=10,
+            )
+        self.assertEqual(result["mode"], "already_absent")
 
     def test_absence_proof_rejects_rbac_and_accepts_only_empty_success(self):
         completed = mock.Mock(returncode=0, stdout="", stderr="")
@@ -835,6 +1042,40 @@ class QualifyKubernetesDeploymentTests(unittest.TestCase):
                     DeploymentError, "request evidence|transition sequence"
                 ):
                     validate(value, chart, image, manifest, build, candidate)
+
+    def test_receipt_validator_binds_real_oom_termination_and_patch(self):
+        for target in ("reason", "patch", "lineage"):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as raw:
+                chart, image, manifest, build, candidate = candidate_inputs(raw)
+                value = receipt(chart, image, candidate)
+                oom = value["workload"]["memory_oom_recovery"]
+                if target == "reason":
+                    oom["terminated"]["reason"] = "Error"
+                elif target == "patch":
+                    oom["fault_patch_sha256"] = "0" * 64
+                else:
+                    oom["replica_set"]["deployment_uid"] = "foreign-uid"
+                del value["receipt_id"]
+                value["receipt_id"] = "sha256:" + hashlib.sha256(
+                    canonical(value)
+                ).hexdigest()
+                with self.assertRaisesRegex(
+                    DeploymentError,
+                    "OOM termination evidence|OOM fault patch|OOM ReplicaSet lineage",
+                ):
+                    validate(value, chart, image, manifest, build, candidate)
+
+    def test_receipt_validator_recomputes_oom_high_water(self):
+        with tempfile.TemporaryDirectory() as raw:
+            chart, image, manifest, build, candidate = candidate_inputs(raw)
+            value = receipt(chart, image, candidate)
+            value["workload"]["memory_oom_recovery"]["resources"]["high_water"][
+                "memory_bytes"
+            ] += 1
+            del value["receipt_id"]
+            value["receipt_id"] = "sha256:" + hashlib.sha256(canonical(value)).hexdigest()
+            with self.assertRaisesRegex(DeploymentError, "OOM high-water evidence"):
+                validate(value, chart, image, manifest, build, candidate)
 
     def test_receipt_validator_rejects_chart_or_image_drift(self):
         for target in ("chart", "image"):

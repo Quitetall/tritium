@@ -323,8 +323,8 @@ structurally configured to turn unhealthy state into process replacement;
 Kubernetes qualification separately proves manual replacement restores the
 same startup receipt, generation and a clean fault state. Unit fault injection
 pins backend-error and panic latching without adding a production fault
-endpoint. A causal latched-fault to watchdog replacement execution remains an
-open gate alongside external device/OOM and artifact-volume faults.
+endpoint. At this stage, causal latched-fault replacement, external device/OOM,
+and artifact-volume faults remained open.
 
 The Kubernetes v4 qualifier now adds a causal unresponsive-process gate without
 a production fault API: it sends `SIGSTOP` to the serving process from the
@@ -340,7 +340,7 @@ startup self-test; v6 binds its named-port TCP handler plus the sidecar's exact
 authenticated loopback health handler. It also binds both containers' probe
 values, their nominal 300-second probe window, the sidecar wait cadence, status
 predicate, configured service port, success reset and failure increment. A real
-latched backend/device fault and OOM execution remain open.
+latched backend/device fault and OOM execution were still open at this stage.
 
 Artifact-volume unavailability now has a separate Kubernetes v5 gate. The
 qualifier requires a successful empty `--ignore-not-found` response for a
@@ -360,9 +360,19 @@ digest/size, temperature and token limit. An ordered timestamped trace binds
 baseline readiness, absence proof, fault application, scheduler rejection,
 source restoration and recovered readiness.
 
+Memory exhaustion now has a real cgroup-backed Kubernetes v7 gate. The qualifier
+derives the Tritium container's exact `32Gi` release limit, patches only that
+limit to `16Mi`, and requires a new pod to report `OOMKilled`, exit 137 and at
+least one container restart within 120 seconds. A `finally` path restores the
+exact source limit. Qualification then requires a fresh ready pod, immutable
+startup receipt, successful generation, clean telemetry, ordered fault/recovery
+transitions, and Metrics API resource samples with an offline-recomputed high
+water mark. This proves host-memory OOM replacement for both CPU and CUDA lanes;
+CUDA device loss remains a distinct open gate.
+
 1. malformed/truncated/wrong-identity artifact at startup;
 2. missing secret, invalid config and unavailable requested backend;
-3. latched backend/device loss and OOM;
+3. latched backend/device loss;
 4. telemetry collector unavailable/slow and metrics scrape flood;
 5. failed rollout followed by digest-pinned rollback.
 
