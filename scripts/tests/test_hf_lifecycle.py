@@ -30,6 +30,18 @@ class HuggingFaceLifecycleWorkflowTests(unittest.TestCase):
         self.assertIn("AutoModelForCausalLM.from_pretrained", source)
         self.assertIn("safe_serialization=True", source)
 
+    def test_clean_wheel_job_runs_whole_model_hard_export(self):
+        workflow = (ROOT / ".github/workflows/wheels.yml").read_text(encoding="utf-8")
+        start = workflow.index("  tutorial-clean-wheel:")
+        match = re.search(r"(?m)^  [a-z0-9_-]+:\s*$", workflow[start + 3 :])
+        self.assertIsNotNone(match)
+        assert match is not None
+        job = workflow[start : start + 3 + match.start()]
+        self.assertNotIn("actions/checkout", job)
+        self.assertEqual(job.count("python -I -m tritium.torch.hf_export_lifecycle"), 2)
+        self.assertIn("evidence/hf-export-clean/receipt.json", job)
+        self.assertIn("evidence/hf-export-clean/**", job)
+
 
 if __name__ == "__main__":
     unittest.main()

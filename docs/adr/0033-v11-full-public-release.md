@@ -399,6 +399,16 @@ the candidate wheel, source, release, run and complete checkpoint tree. The
 registry admits this only as `frontend-lifecycle`; distributed training and
 whole-model export/reload remain independent requirements.
 
+Whole-model hard-artifact admission uses `tritium.hf-export-reload.v1`. A
+source-free installed wheel trains and hard-converts the complete tiny tied
+Llama fixture, atomically exports its immutable QAT-hard tree, strict-reloads a
+fresh Hugging Face shell, and proves exact logits, greedy token generation,
+shared packed input/output storage and absence of persistent dense shadows for
+converted weights. The receipt binds every artifact byte plus the exact wheel,
+source, release and run. The registry counts it only as `export-reload`; it is a
+representative language-model lifecycle gate, not flagship-Qwen or optimized
+native-kernel evidence.
+
 Multi-device admission uses
 `tritium.hf-distributed-qualification.v1`. The validator requires ordered DDP
 and FSDP NCCL/fp16 runs on two distinct physical GPU UUIDs, exact checkpoint

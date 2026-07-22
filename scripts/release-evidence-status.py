@@ -42,6 +42,7 @@ TUTORIAL_RECEIPT = runpy.run_path(
 )
 validate_tutorial_receipt = TUTORIAL_RECEIPT["validate_receipt"]
 validate_hf_lifecycle_receipt = TUTORIAL_RECEIPT["validate_hf_receipt"]
+validate_hf_export_receipt = TUTORIAL_RECEIPT["validate_export_receipt"]
 DISTRIBUTED_RECEIPT = runpy.run_path(
     Path(__file__).with_name("verify-hf-distributed-receipt.py")
 )
@@ -63,6 +64,7 @@ KNOWN_KINDS = frozenset(
         "installed-qat-tutorial",
         "frontend-lifecycle",
         "distributed-training",
+        "export-reload",
     }
 )
 HEX = frozenset("0123456789abcdef")
@@ -316,6 +318,13 @@ def evaluate(
                 receipt = validate_distributed_receipt(
                     receipt_path, revision, release, artifact_path
                 )
+            elif kind == "export-reload":
+                receipt = validate_hf_export_receipt(
+                    receipt_path,
+                    expected_wheel=artifact_path,
+                    expected_source_revision=revision,
+                    expected_release=release,
+                )
             elif kind in {"oci-runtime-cpu", "oci-runtime-cuda"}:
                 receipt = load_oci_runtime_receipt(
                     receipt_path, revision=revision, release=release,
@@ -449,7 +458,9 @@ def evaluate(
             )
             if actual != declared or actual != qualified:
                 raise EvidenceError("npm receipt does not bind candidate archive bytes")
-        elif kind in {"installed-qat-tutorial", "frontend-lifecycle"}:
+        elif kind in {
+            "installed-qat-tutorial", "frontend-lifecycle", "export-reload"
+        }:
             identity = artifact.get("identity", {})
             actual = (
                 artifact_path.name, _sha256(artifact_path), artifact_path.stat().st_size

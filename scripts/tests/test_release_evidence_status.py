@@ -358,6 +358,78 @@ class ReleaseEvidenceStatusTests(unittest.TestCase):
             self.assertEqual(frontend["satisfied_kinds"], ["frontend-lifecycle"])
             self.assertIn("installed-qat-tutorial", frontend["missing_kinds"])
 
+    def test_hf_export_binds_candidate_wheel_and_advances_frontend_gate(self):
+        with tempfile.TemporaryDirectory() as raw:
+            candidate, document, artifact, evidence_root = release_fixture(Path(raw))
+            document["artifacts"][0]["identity"] = {
+                "sha256": sha256(artifact), "bytes": artifact.stat().st_size,
+            }
+            candidate.write_bytes(canonical(document) + b"\n")
+            hard = evidence_root / "qat-hard"
+            hard.mkdir()
+            state = hard / "model.safetensors"
+            state.write_bytes(b"hard state")
+            manifest = {
+                "schema_version": 1,
+                "artifact_kind": "tritium.module-qat-hard-v1",
+                "artifact_id": "sha256:" + "1" * 64,
+                "conversion_artifact_id": "sha256:" + "2" * 64,
+                "source_checkpoint_digest": "sha256:" + "3" * 64,
+                "hard_state_digest": "sha256:" + "4" * 64,
+                "config": {"mode": "qat", "planes": 2},
+                "weights": [{} for _ in range(8)],
+                "state": {
+                    "file": state.name,
+                    "sha256": "sha256:" + sha256(state),
+                    "bytes": state.stat().st_size,
+                    "tensors": [{} for _ in range(8)],
+                },
+            }
+            (hard / "tritium-qat-hard.json").write_bytes(canonical(manifest))
+            tree = TUTORIAL_RECEIPT_MODULE["tree_identity"](hard)
+            receipt = {
+                "schema": "tritium.hf-export-reload.v1", "passed": True,
+                "device": "cpu", "seed": 101, "torch_version": "2.11.0",
+                "transformers_version": "5.5.3",
+                "distribution_version": "1.1.0rc0",
+                "tritium_module": "/venv/tritium/__init__.py",
+                "source_revision": "a" * 40, "release": "1.1.0-rc.0",
+                "run_id": "hf-export-run-1", "wheel_name": artifact.name,
+                "wheel_bytes": artifact.stat().st_size,
+                "wheel_sha256": "sha256:" + sha256(artifact),
+                "input_ids": [[1, 2, 3, 4]],
+                "generated_ids": [[1, 2, 3, 4, 5, 6]],
+                "initial_loss": 1.0, "gradient_norm": 1.0,
+                "optimizer_steps": 1, "converted_parameters": 8, "planes": 2,
+                "artifact_dir": "qat-hard", "artifact_id": "sha256:" + "1" * 64,
+                "conversion_artifact_id": "sha256:" + "2" * 64,
+                "source_checkpoint_digest": "sha256:" + "3" * 64,
+                "hard_state_digest": "sha256:" + "4" * 64,
+                "state_sha256": "sha256:" + sha256(state),
+                "state_bytes": state.stat().st_size, "state_tensors": 8,
+                "artifact_bytes": tree["bytes"],
+                "artifact_file_count": tree["file_count"],
+                "artifact_tree_sha256": tree["sha256"],
+                "tied_before_export": True, "tied_after_reload": True,
+                "no_dense_weight_shadows": True,
+                "logits_sha256": "sha256:" + "6" * 64,
+            }
+            receipt["receipt_id"] = TUTORIAL_RECEIPT_MODULE["receipt_id"](receipt)
+            receipt_path = evidence_root / "hf-export.json"
+            receipt_path.write_bytes(canonical(receipt) + b"\n")
+            registry_path = evidence_root / "registry.json"
+            registry(
+                registry_path, candidate,
+                [entry(receipt_path, receipt, kind="export-reload")],
+            )
+
+            report = evaluate(registry_path, candidate, document)
+            frontend = next(row for row in report["rows"] if row["id"] == "pytorch-hf")
+            self.assertEqual(frontend["satisfied_kinds"], ["export-reload"])
+            artifact.write_bytes(b"different candidate wheel")
+            with self.assertRaisesRegex(EvidenceError, "export|wheel"):
+                evaluate(registry_path, candidate, document)
+
     def test_installed_qat_tutorial_binds_candidate_wheel_and_advances_frontend_gate(self):
         with tempfile.TemporaryDirectory() as raw:
             candidate, document, artifact, evidence_root = release_fixture(Path(raw))

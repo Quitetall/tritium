@@ -11,6 +11,7 @@ from typing import Any
 
 SCHEMA = "tritium.installed-qat-tutorial.v3"
 HF_SCHEMA = "tritium.hf-lifecycle.v1"
+EXPORT_SCHEMA = "tritium.hf-export-reload.v1"
 EXPECTED_HF_RECIPE = {
     "quant_method": "tritium",
     "schema_version": 2,
@@ -87,6 +88,45 @@ HF_FIELDS = {
     "checkpoint_tree_sha256",
     "logits_sha256",
 }
+EXPORT_FIELDS = {
+    "schema",
+    "receipt_id",
+    "passed",
+    "device",
+    "seed",
+    "torch_version",
+    "transformers_version",
+    "distribution_version",
+    "tritium_module",
+    "source_revision",
+    "release",
+    "run_id",
+    "wheel_name",
+    "wheel_bytes",
+    "wheel_sha256",
+    "input_ids",
+    "generated_ids",
+    "initial_loss",
+    "gradient_norm",
+    "optimizer_steps",
+    "converted_parameters",
+    "planes",
+    "artifact_dir",
+    "artifact_id",
+    "conversion_artifact_id",
+    "source_checkpoint_digest",
+    "hard_state_digest",
+    "state_sha256",
+    "state_bytes",
+    "state_tensors",
+    "artifact_bytes",
+    "artifact_file_count",
+    "artifact_tree_sha256",
+    "tied_before_export",
+    "tied_after_reload",
+    "no_dense_weight_shadows",
+    "logits_sha256",
+}
 HEX = frozenset("0123456789abcdef")
 MAX_RECEIPT_BYTES = 1024 * 1024
 
@@ -98,6 +138,15 @@ def canonical(value: object) -> bytes:
 def receipt_id(receipt: dict[str, object]) -> str:
     unsigned = {key: value for key, value in receipt.items() if key != "receipt_id"}
     return "sha256:" + hashlib.sha256(canonical(unsigned)).hexdigest()
+
+
+def _pairs_without_duplicates(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate JSON field {key!r}")
+        value[key] = item
+    return value
 
 
 def _file_sha256(path: Path) -> str:
@@ -422,11 +471,197 @@ def validate_hf_receipt(
     return receipt
 
 
+def validate_export_receipt(
+    receipt_path: Path,
+    *,
+    expected_wheel: Path | None = None,
+    expected_source_revision: str | None = None,
+    expected_release: str | None = None,
+) -> dict[str, object]:
+    """Validate portable whole-model hard export/reload evidence."""
+
+    receipt_path = _ordinary_file(receipt_path, "Hugging Face export receipt")
+    if receipt_path.stat().st_size > MAX_RECEIPT_BYTES:
+        raise ValueError("Hugging Face export receipt exceeds metadata size limit")
+    try:
+        receipt = json.loads(receipt_path.read_bytes())
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(
+            "Hugging Face export receipt must contain UTF-8 JSON"
+        ) from error
+    if not isinstance(receipt, dict) or set(receipt) != EXPORT_FIELDS:
+        raise ValueError("Hugging Face export receipt fields do not match schema v1")
+    if receipt["schema"] != EXPORT_SCHEMA:
+        raise ValueError("unsupported Hugging Face export receipt schema")
+    if receipt["passed"] is not True or receipt["device"] != "cpu":
+        raise ValueError("Hugging Face export result or device mismatch")
+    if type(receipt["seed"]) is not int:
+        raise ValueError("Hugging Face export seed must be an integer")
+    for field in (
+        "torch_version",
+        "transformers_version",
+        "distribution_version",
+        "tritium_module",
+        "release",
+        "run_id",
+    ):
+        if not isinstance(receipt[field], str) or not receipt[field]:
+            raise ValueError(f"Hugging Face export {field} must be non-empty")
+    revision = receipt["source_revision"]
+    if (
+        not isinstance(revision, str)
+        or len(revision) != 40
+        or any(character not in HEX for character in revision)
+    ):
+        raise ValueError("Hugging Face export source revision is invalid")
+    if expected_source_revision is not None and revision != expected_source_revision:
+        raise ValueError("Hugging Face export source revision mismatch")
+    if expected_release is not None and receipt["release"] != expected_release:
+        raise ValueError("Hugging Face export release mismatch")
+    if receipt["input_ids"] != [[1, 2, 3, 4]]:
+        raise ValueError("Hugging Face export input fixture mismatch")
+    generated = receipt["generated_ids"]
+    if (
+        not isinstance(generated, list)
+        or len(generated) != 1
+        or not isinstance(generated[0], list)
+        or len(generated[0]) != 6
+        or generated[0][:4] != receipt["input_ids"][0]
+        or any(type(token) is not int or token < 0 for token in generated[0])
+    ):
+        raise ValueError("Hugging Face export generated-token fixture is invalid")
+    for field in ("initial_loss", "gradient_norm"):
+        value = receipt[field]
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or float(value) <= 0
+        ):
+            raise ValueError(f"Hugging Face export {field} must be finite and positive")
+    if receipt["optimizer_steps"] != 1:
+        raise ValueError("Hugging Face export optimizer step mismatch")
+    if receipt["converted_parameters"] != 8 or receipt["planes"] != 2:
+        raise ValueError("Hugging Face export conversion coverage mismatch")
+    if receipt["artifact_dir"] != "qat-hard":
+        raise ValueError("Hugging Face export artifact directory mismatch")
+    for field in (
+        "wheel_bytes",
+        "state_bytes",
+        "state_tensors",
+        "artifact_bytes",
+        "artifact_file_count",
+    ):
+        _positive_int(receipt[field], field)
+    for field in (
+        "wheel_sha256",
+        "artifact_id",
+        "conversion_artifact_id",
+        "source_checkpoint_digest",
+        "hard_state_digest",
+        "state_sha256",
+        "artifact_tree_sha256",
+        "logits_sha256",
+        "receipt_id",
+    ):
+        _digest(receipt[field], field)
+    for field in (
+        "tied_before_export",
+        "tied_after_reload",
+        "no_dense_weight_shadows",
+    ):
+        if receipt[field] is not True:
+            raise ValueError(f"Hugging Face export {field} must be true")
+    wheel_name = receipt["wheel_name"]
+    if (
+        not isinstance(wheel_name, str)
+        or Path(wheel_name).name != wheel_name
+        or not wheel_name.endswith(".whl")
+    ):
+        raise ValueError("Hugging Face export wheel name is invalid")
+    if receipt["receipt_id"] != receipt_id(receipt):
+        raise ValueError("Hugging Face export receipt identity mismatch")
+    artifact = receipt_path.parent.resolve(strict=True) / "qat-hard"
+    observed_tree = tree_identity(artifact)
+    declared_tree = {
+        "bytes": receipt["artifact_bytes"],
+        "file_count": receipt["artifact_file_count"],
+        "sha256": receipt["artifact_tree_sha256"],
+    }
+    if observed_tree != declared_tree:
+        raise ValueError("Hugging Face export artifact tree identity mismatch")
+    manifest_path = _ordinary_file(
+        artifact / "tritium-qat-hard.json", "Hugging Face export manifest"
+    )
+    if (
+        manifest_path.parent != artifact.resolve()
+        or manifest_path.stat().st_size > 1024**2
+    ):
+        raise ValueError("Hugging Face export manifest is outside its artifact")
+    try:
+        manifest = json.loads(
+            manifest_path.read_bytes(), object_pairs_hook=_pairs_without_duplicates
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(
+            "Hugging Face export manifest must contain UTF-8 JSON"
+        ) from error
+    state = manifest.get("state") if isinstance(manifest, dict) else None
+    config = manifest.get("config") if isinstance(manifest, dict) else None
+    weights = manifest.get("weights") if isinstance(manifest, dict) else None
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("schema_version") != 1
+        or manifest.get("artifact_kind") != "tritium.module-qat-hard-v1"
+        or not isinstance(state, dict)
+        or not isinstance(config, dict)
+        or not isinstance(weights, list)
+        or len(weights) != receipt["converted_parameters"]
+        or config.get("mode") != "qat"
+        or config.get("planes") != receipt["planes"]
+    ):
+        raise ValueError("Hugging Face export manifest semantics mismatch")
+    for field in (
+        "artifact_id",
+        "conversion_artifact_id",
+        "source_checkpoint_digest",
+        "hard_state_digest",
+    ):
+        if manifest.get(field) != receipt[field]:
+            raise ValueError(f"Hugging Face export manifest {field} mismatch")
+    if state.get("file") != "model.safetensors":
+        raise ValueError("Hugging Face export state filename mismatch")
+    state_path = _ordinary_file(artifact / "model.safetensors", "export state")
+    if state_path.parent != artifact.resolve():
+        raise ValueError("Hugging Face export state is outside its artifact")
+    tensors = state.get("tensors")
+    if (
+        state.get("sha256") != receipt["state_sha256"]
+        or state.get("bytes") != receipt["state_bytes"]
+        or not isinstance(tensors, list)
+        or len(tensors) != receipt["state_tensors"]
+        or state_path.stat().st_size != receipt["state_bytes"]
+        or _file_sha256(state_path) != receipt["state_sha256"]
+    ):
+        raise ValueError("Hugging Face export state ledger mismatch")
+    if expected_wheel is not None:
+        wheel = _ordinary_file(expected_wheel, "Hugging Face export candidate wheel")
+        if (
+            wheel.name != wheel_name
+            or wheel.stat().st_size != receipt["wheel_bytes"]
+            or _file_sha256(wheel) != receipt["wheel_sha256"]
+        ):
+            raise ValueError("Hugging Face export does not bind the candidate wheel")
+    return receipt
+
+
 __all__ = [
+    "EXPORT_SCHEMA",
     "HF_SCHEMA",
     "SCHEMA",
     "receipt_id",
     "tree_identity",
+    "validate_export_receipt",
     "validate_hf_receipt",
     "validate_receipt",
 ]

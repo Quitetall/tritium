@@ -201,6 +201,13 @@ reload, exact logits, recipe, alias-aware coverage and every checkpoint byte to
 the exact candidate wheel/source/release/run. The registry admits it as
 `frontend-lifecycle`; it does not substitute for multi-device distributed or
 whole-model export evidence.
+The source-free lane now separately emits `tritium.hf-export-reload.v1` from
+the exact candidate wheel. It trains and hard-converts the complete tiny tied
+Llama, atomically publishes and rehashes the QAT-hard tree, strict-reloads a
+fresh shell, and proves exact logits/generation, shared packed tying and no
+converted dense-weight shadows. Registry admission satisfies only
+`export-reload`; it does not make a flagship, large-model or fused-runtime
+claim.
 The evidence registry now also recognizes only strict
 `tritium.hf-distributed-qualification.v1` input for `distributed-training`.
 Its validator rejects shared-device ranks, absent DDP/FSDP modes, dirty or stale

@@ -51,6 +51,17 @@ after framework-native `tie_weights`, preventing stale pre-load topology from
 overcounting a tied parameter. Candidate-revision CI execution remains required
 for release admission.
 
+The distinct whole-model hard-export gate is now implemented as
+`tritium.hf-export-reload.v1`. The installed-only producer performs a QAT
+optimizer step on the complete tiny tied Llama, hard-converts all eight unique
+covered parameters, atomically exports the QAT-hard bundle, strict-reloads a
+fresh Hugging Face shell and requires bit-exact logits and greedy generation.
+It also proves the tied embedding/head share packed storage and that converted
+modules retain no dense weight parameters. The portable registry validator
+rehashes the entire artifact tree and binds it to the exact candidate wheel,
+revision, release and run; the installed validator additionally replays the
+strict load and model outputs.
+
 ## Step 2 — Trainer/Accelerate and distributed state
 
 - [x] Verify Trainer and direct Accelerate steps use ordinary optimizers.
@@ -178,6 +189,9 @@ python scripts/qualify-hf-distributed.py \
   artifact identities.
 - Treat existing `prepare_qat` as a convenience compatibility seam, not the
   sole stable lifecycle.
+- [x] Admit a candidate-bound installed-wheel whole-model hard export/reload
+  receipt with exact model outputs, generation, tie topology and no converted
+  dense-weight shadows.
 
 ## Verification
 

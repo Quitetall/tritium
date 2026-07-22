@@ -41,6 +41,8 @@ on:
       - "examples/python/installed_qat.py"
       - "scripts/tests/test_installed_qat_tutorial.py"
       - "scripts/tests/test_hf_lifecycle.py"
+      - "crates/tritium-py/python/tritium/torch/hf_export_lifecycle.py"
+      - "crates/tritium-py/tests/test_hf_export_lifecycle.py"
       - "scripts/qualify-hf-distributed.py"
       - "scripts/verify-hf-distributed-receipt.py"
       - "scripts/tests/test_qualify_hf_distributed.py"
@@ -352,12 +354,28 @@ jobs:
             --wheel-artifact dist/*.whl \
             --source-revision ${{ github.sha }} \
             --release 1.1.0-rc.0
+      - name: execute and validate whole-model hard export
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -I -m tritium.torch.hf_export_lifecycle \
+            --output-dir evidence/hf-export-clean \
+            --wheel-artifact dist/*.whl \
+            --source-revision ${{ github.sha }} \
+            --release 1.1.0-rc.0 \
+            --run-id github-${{ github.run_id }}-${{ github.run_attempt }}-hf-export-clean
+          python -I -m tritium.torch.hf_export_lifecycle \
+            --check-receipt evidence/hf-export-clean/receipt.json \
+            --wheel-artifact dist/*.whl \
+            --source-revision ${{ github.sha }} \
+            --release 1.1.0-rc.0
       - uses: actions/upload-artifact@v4
         with:
           name: wheel-tutorial-source-free-python-3.13
           path: |
             evidence/tutorial-clean/**
             evidence/hf-lifecycle-clean/**
+            evidence/hf-export-clean/**
           if-no-files-found: error
 
   cuda-wheel-smoke:
