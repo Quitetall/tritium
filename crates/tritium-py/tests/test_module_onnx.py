@@ -13,6 +13,7 @@ pytest.importorskip("onnxscript")
 
 from tritium.nn import AdditiveTernaryLinear  # noqa: E402
 from tritium.torch import (  # noqa: E402
+    ModuleOnnxLineage,
     TernaryConfig,
     TritiumError,
     calibrate,
@@ -56,8 +57,18 @@ def _external_data_model():
 def test_module_onnx_keeps_packed_state_runs_ort_and_supports_dynamic_batch(tmp_path):
     model = _model()
     example = torch.randn(2, 8)
-    artifact = export_module_onnx(model, example, tmp_path / "bundle")
+    lineage = ModuleOnnxLineage(
+        mode="qat-hard",
+        artifact_id="sha256:" + "11" * 32,
+        recipe_id="sha256:" + "22" * 32,
+        source_model_digest="sha256:" + "33" * 32,
+    )
+    artifact = export_module_onnx(
+        model, example, tmp_path / "bundle", lineage=lineage,
+    )
     assert artifact.checkpoint_digest.startswith("sha256:")
+    assert artifact.schema_version == 2
+    assert artifact.lineage == lineage
     assert load_module_onnx(artifact.artifact_dir, create_session=False) == artifact
 
     graph = onnx.load(artifact.artifact_dir / "model.onnx", load_external_data=False)

@@ -19,13 +19,15 @@ from ..nn import (
     AdditiveTernaryEmbedding,
     AdditiveTernaryLinear,
     AdditiveTernaryWeight,
+    TernaryEmbedding,
+    TernaryLinear,
 )
 from .errors import TritiumError
 
 Pathish = Union[str, os.PathLike[str]]
 _MANIFEST = "tritium-module-onnx.json"
 _GRAPH = "model.onnx"
-_TOP_FIELDS = {
+_TOP_FIELDS_V1 = {
     "schema_version",
     "artifact_kind",
     "artifact_id",
@@ -35,6 +37,15 @@ _TOP_FIELDS = {
     "output_names",
     "packed_modules",
     "files",
+}
+_TOP_FIELDS_V2 = _TOP_FIELDS_V1 | {"conversion"}
+_CONVERSION_FIELDS = {
+    "mode",
+    "artifact_id",
+    "recipe_id",
+    "source_model_digest",
+    "parent_artifact_id",
+    "ancestry",
 }
 
 
@@ -46,7 +57,85 @@ class ModuleOnnxArtifact:
     input_names: Tuple[str, ...]
     output_names: Tuple[str, ...]
     files: Tuple[Tuple[str, str, int], ...]
+    lineage: Optional["ModuleOnnxLineage"] = None
     schema_version: int = 1
+
+
+@dataclass(frozen=True)
+class ModuleOnnxLineage:
+    """Typed conversion identity embedded into a packed module graph."""
+
+    mode: str
+    artifact_id: str
+    recipe_id: str
+    source_model_digest: str
+    parent_artifact_id: Optional[str] = None
+    ancestry: Tuple[str, ...] = ()
+
+
+def _snapshot_lineage(value: Optional[ModuleOnnxLineage]) -> Optional[ModuleOnnxLineage]:
+    if value is None:
+        return None
+    if not isinstance(value, ModuleOnnxLineage):
+        raise TypeError("lineage must be a ModuleOnnxLineage")
+    lineage = ModuleOnnxLineage(
+        mode=value.mode,
+        artifact_id=value.artifact_id,
+        recipe_id=value.recipe_id,
+        source_model_digest=value.source_model_digest,
+        parent_artifact_id=value.parent_artifact_id,
+        ancestry=tuple(value.ancestry),
+    )
+    if (
+        lineage.mode not in {"qat-hard", "ptq", "scale-only", "hard-pv"}
+        or not _is_sha256(lineage.artifact_id)
+        or not _is_sha256(lineage.recipe_id)
+        or not _is_sha256(lineage.source_model_digest)
+        or any(not _is_sha256(item) for item in lineage.ancestry)
+        or len(set(lineage.ancestry)) != len(lineage.ancestry)
+    ):
+        raise ValueError("module ONNX conversion lineage is invalid")
+    if lineage.mode in {"scale-only", "hard-pv"}:
+        if (
+            not _is_sha256(lineage.parent_artifact_id)
+            or not lineage.ancestry
+            or lineage.ancestry[-1] != lineage.parent_artifact_id
+        ):
+            raise ValueError("refined module ONNX lineage must bind its immediate parent")
+    elif lineage.parent_artifact_id is not None or lineage.ancestry:
+        raise ValueError("unrefined module ONNX lineage cannot claim parents")
+    return lineage
+
+
+def _lineage_dict(lineage: ModuleOnnxLineage) -> dict[str, Any]:
+    return {
+        "mode": lineage.mode,
+        "artifact_id": lineage.artifact_id,
+        "recipe_id": lineage.recipe_id,
+        "source_model_digest": lineage.source_model_digest,
+        "parent_artifact_id": lineage.parent_artifact_id,
+        "ancestry": list(lineage.ancestry),
+    }
+
+
+def _lineage_from_dict(value: Any) -> ModuleOnnxLineage:
+    if not isinstance(value, dict) or set(value) != _CONVERSION_FIELDS:
+        raise ValueError("module ONNX conversion fields differ from schema")
+    ancestry = value["ancestry"]
+    if not isinstance(ancestry, list):
+        raise ValueError("module ONNX conversion ancestry must be a list")
+    lineage = _snapshot_lineage(
+        ModuleOnnxLineage(
+            mode=value["mode"],
+            artifact_id=value["artifact_id"],
+            recipe_id=value["recipe_id"],
+            source_model_digest=value["source_model_digest"],
+            parent_artifact_id=value["parent_artifact_id"],
+            ancestry=tuple(ancestry),
+        )
+    )
+    assert lineage is not None
+    return lineage
 
 
 class OnnxModule(nn.Module):
@@ -340,10 +429,27 @@ def export_module_onnx(
     opset: int = 18,
     rtol: float = 1e-4,
     atol: float = 1e-5,
+    lineage: Optional[ModuleOnnxLineage] = None,
 ) -> ModuleOnnxArtifact:
     """Export, audit, execute, and atomically publish one packed module graph."""
 
-    if not isinstance(model, nn.Module) or model.training:
+    lineage = _snapshot_lineage(lineage)
+    if not isinstance(model, nn.Module):
+        raise TritiumError(
+            "generic ONNX export requires an eval-mode torch.nn.Module",
+            code="invalid_state",
+            stage="export_module_onnx",
+        )
+    if any(
+        isinstance(module, (TernaryLinear, TernaryEmbedding))
+        for module in model.modules()
+    ):
+        raise TritiumError(
+            "trainable ONNX export requires Tritium v1.3",
+            code="trainable_onnx_requires_v1_3",
+            stage="export_module_onnx",
+        )
+    if model.training:
         raise TritiumError(
             "generic ONNX export requires an eval-mode torch.nn.Module",
             code="invalid_state",
@@ -397,8 +503,12 @@ def export_module_onnx(
     ):
         raise ValueError("output_names must be unique and match model outputs")
     specs = _packed_specs(model)
-    checkpoint_digest = getattr(
-        getattr(model, "config", None), "tritium_ptq_checkpoint_digest", None
+    checkpoint_digest = (
+        lineage.source_model_digest
+        if lineage is not None
+        else getattr(
+            getattr(model, "config", None), "tritium_ptq_checkpoint_digest", None
+        )
     )
     if checkpoint_digest is None:
         from .ptq import _source_model_digest
@@ -456,9 +566,10 @@ def export_module_onnx(
                 continue
             digest, byte_count = _digest_file(path)
             files.append({"file": path.name, "sha256": digest, "bytes": byte_count})
+        schema_version = 2 if lineage is not None else 1
         manifest = {
-            "schema_version": 1,
-            "artifact_kind": "tritium.packed-module-onnx-v1",
+            "schema_version": schema_version,
+            "artifact_kind": f"tritium.packed-module-onnx-v{schema_version}",
             "checkpoint_digest": checkpoint_digest,
             "opset": opset,
             "input_names": list(names_in),
@@ -466,6 +577,8 @@ def export_module_onnx(
             "packed_modules": specs,
             "files": files,
         }
+        if lineage is not None:
+            manifest["conversion"] = _lineage_dict(lineage)
         manifest["artifact_id"] = _digest_bytes(_canonical(manifest))
         (staging / _MANIFEST).write_bytes(_canonical(manifest))
         admitted = load_module_onnx(staging, create_session=False)
@@ -502,14 +615,16 @@ def load_module_onnx(
         manifest_bytes.decode("utf-8"),
         object_pairs_hook=_pairs_without_duplicates,
     )
-    if not isinstance(value, dict) or set(value) != _TOP_FIELDS:
+    if not isinstance(value, dict) or type(value.get("schema_version")) is not int:
+        raise ValueError("module ONNX manifest must declare an integer schema version")
+    schema_version = value["schema_version"]
+    expected_fields = {1: _TOP_FIELDS_V1, 2: _TOP_FIELDS_V2}.get(schema_version)
+    if expected_fields is None or set(value) != expected_fields:
         raise ValueError("module ONNX manifest fields differ from schema")
     if manifest_bytes != _canonical(value):
         raise ValueError("module ONNX manifest is not canonical")
     if (
-        type(value["schema_version"]) is not int
-        or value["schema_version"] != 1
-        or value["artifact_kind"] != "tritium.packed-module-onnx-v1"
+        value["artifact_kind"] != f"tritium.packed-module-onnx-v{schema_version}"
     ):
         raise ValueError("unsupported module ONNX artifact")
     identity = dict(value)
@@ -568,6 +683,13 @@ def load_module_onnx(
     ):
         raise ValueError("module ONNX interface or coverage is invalid")
     _validate_specs(specs)
+    lineage = (
+        _lineage_from_dict(value["conversion"])
+        if schema_version == 2
+        else None
+    )
+    if lineage is not None and lineage.source_model_digest != value["checkpoint_digest"]:
+        raise ValueError("module ONNX source identity differs from conversion lineage")
     onnx, ort = _runtime_dependencies()
     graph_path = directory / _GRAPH
     onnx.checker.check_model(str(graph_path))
@@ -597,6 +719,8 @@ def load_module_onnx(
         input_names=tuple(names_in),
         output_names=tuple(names_out),
         files=tuple(admitted_files),
+        lineage=lineage,
+        schema_version=schema_version,
     )
     if not create_session:
         return artifact
@@ -610,6 +734,7 @@ def load_module_onnx(
 
 __all__ = [
     "ModuleOnnxArtifact",
+    "ModuleOnnxLineage",
     "OnnxModule",
     "export_module_onnx",
     "load_module_onnx",

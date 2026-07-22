@@ -38,6 +38,7 @@ else:
 from .ops import reference_ternary_linear, ternary_linear
 from .module_onnx import (
     ModuleOnnxArtifact,
+    ModuleOnnxLineage,
     OnnxModule,
     export_module_onnx,
     load_module_onnx,
@@ -101,6 +102,7 @@ __all__ = [
     "LSQEstimator",
     "ModuleQuantizationResult",
     "ModuleOnnxArtifact",
+    "ModuleOnnxLineage",
     "OnnxBundleManifest",
     "OnnxCausalLMOutput",
     "OnnxMtpOutput",

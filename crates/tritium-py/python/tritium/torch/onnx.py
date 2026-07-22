@@ -11,7 +11,7 @@ import os
 import stat
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple, Union
 
 import torch
 from torch import Tensor, nn
@@ -20,6 +20,12 @@ from .. import _tritium
 from .artifacts import QuantizationResult
 from .conversion import PreparedModel
 from .errors import TritiumError
+from .module_artifacts import ModuleQuantizationResult
+from .module_onnx import ModuleOnnxLineage, export_module_onnx, load_module_onnx
+from .ptq import load_quantized_module
+from .qat import QatHardResult
+from .qat_artifacts import QatHardArtifact, load_qat_hard
+from .refinement import RefinementResult
 
 _MANIFEST_FILE = "tritium-onnx-manifest.json"
 _TOP_FIELDS_V1 = {"schema", "language", "mtp", "weights", "identity", "conversion"}
@@ -40,6 +46,13 @@ _CONVERSION_FIELDS = {
     "campaign_id",
     "admission_id",
     "selection_id",
+}
+_TRAINING_CHECKPOINT_FILES = {
+    "optimizer.pt",
+    "optimizer.bin",
+    "pytorch_model.bin",
+    "model.safetensors",
+    "trainer_state.json",
 }
 
 
@@ -245,21 +258,130 @@ def export_onnx(
     max_preserved_bytes: int = 8 * 1024 * 1024 * 1024,
     max_salt_resident_bytes: int = 32 * 1024 * 1024 * 1024,
     max_preserved_fp32_bytes: int = 8 * 1024 * 1024 * 1024,
+    example_inputs: Any = None,
+    model: Optional[nn.Module] = None,
+    input_names: Optional[Sequence[str]] = None,
+    output_names: Optional[Sequence[str]] = None,
+    dynamic_batch: bool = True,
+    dynamic_axes: Optional[Mapping[str, Mapping[int, str]]] = None,
+    opset: int = 18,
+    rtol: float = 1e-4,
+    atol: float = 1e-5,
 ) -> Any:
-    """Export one authenticated PTQ result as language, MTP, and shared weights.
+    """Export one typed hard artifact without changing its conversion lineage.
 
-    QAT graphs with latent floating masters and refined lineages are not
-    silently reinterpreted as PTQ. Their distinct producers must land before
-    this function accepts them.
+    Complete Qwen PTQ bundles use Tritium's dynamic language-plus-MTP dialect.
+    Generic module PTQ, QAT-hard, and refined results use the audited packed
+    module exporter with explicit example inputs. Latent training graphs remain
+    a v1.3 feature.
     """
-    if isinstance(source, PreparedModel):
+    if isinstance(source, (PreparedModel, nn.Module, torch.optim.Optimizer, Mapping)):
         raise TritiumError(
             "trainable ONNX export requires Tritium v1.3",
             code="trainable_onnx_requires_v1_3",
             stage="export_onnx",
         )
+    module_options = {
+        "input_names": input_names,
+        "output_names": output_names,
+        "dynamic_batch": dynamic_batch,
+        "dynamic_axes": dynamic_axes,
+        "opset": opset,
+        "rtol": rtol,
+        "atol": atol,
+    }
+
+    def export_module(hard_model: nn.Module, lineage: ModuleOnnxLineage) -> Any:
+        if example_inputs is None:
+            raise ValueError(f"{lineage.mode} ONNX export requires example_inputs")
+        if (
+            profile != "compact-v1"
+            or tokens != 1
+            or past_tokens != 0
+            or max_package_bytes != 32 * 1024 * 1024 * 1024
+            or max_preserved_bytes != 8 * 1024 * 1024 * 1024
+            or max_salt_resident_bytes != 32 * 1024 * 1024 * 1024
+            or max_preserved_fp32_bytes != 8 * 1024 * 1024 * 1024
+        ):
+            raise ValueError("generic module ONNX export does not accept Qwen bundle options")
+        return export_module_onnx(
+            hard_model,
+            example_inputs,
+            output_dir,
+            lineage=lineage,
+            **module_options,
+        )
+
+    if isinstance(source, QatHardResult):
+        if model is not None:
+            raise ValueError("QAT-hard ONNX export owns its model; model must be omitted")
+        return export_module(
+            source.model,
+            ModuleOnnxLineage(
+                mode=source.mode,
+                artifact_id=source.artifact_id,
+                recipe_id=source.recipe_id,
+                source_model_digest=source.source_checkpoint_digest,
+            ),
+        )
+    if isinstance(source, QatHardArtifact):
+        if not isinstance(model, nn.Module):
+            raise ValueError("QAT-hard artifact ONNX export requires model and example_inputs")
+        converted = load_qat_hard(source.artifact_dir, model, inplace=False).eval()
+        return export_module(
+            converted,
+            ModuleOnnxLineage(
+                mode=source.mode,
+                artifact_id=source.artifact_id,
+                recipe_id=source.recipe_id,
+                source_model_digest=source.source_checkpoint_digest,
+            ),
+        )
+    if isinstance(source, ModuleQuantizationResult):
+        if not isinstance(model, nn.Module):
+            raise ValueError("PTQ ONNX export requires model and example_inputs")
+        converted = load_quantized_module(model, source, inplace=False).eval()
+        return export_module(
+            converted,
+            ModuleOnnxLineage(
+                mode="ptq",
+                artifact_id=source.artifact_id,
+                recipe_id=source.recipe_id,
+                source_model_digest=source.source_model_digest,
+            ),
+        )
+    if isinstance(source, RefinementResult):
+        if not isinstance(model, nn.Module):
+            raise ValueError("refined ONNX export requires model and example_inputs")
+        converted = source.load_model(model, inplace=False).eval()
+        return export_module(
+            converted,
+            ModuleOnnxLineage(
+                mode=source.mode,
+                artifact_id=source.artifact_id,
+                recipe_id=source.conversion.recipe_id,
+                source_model_digest=source.source_model_digest,
+                parent_artifact_id=source.parent_artifact_id,
+                ancestry=source.ancestry,
+            ),
+        )
     if not isinstance(source, QuantizationResult):
-        raise TypeError("export_onnx requires a QuantizationResult")
+        raise TypeError(
+            "export_onnx requires a QuantizationResult, ModuleQuantizationResult, "
+            "QatHardResult, QatHardArtifact, or RefinementResult"
+        )
+    if (
+        model is not None
+        or example_inputs is not None
+        or input_names is not None
+        or output_names is not None
+        or dynamic_batch is not True
+        or dynamic_axes is not None
+        or opset != 18
+        or rtol != 1e-4
+        or atol != 1e-5
+    ):
+        raise ValueError("whole-Qwen ONNX export does not accept generic module options")
     if source.schema_version != 3 or source.preserved is None or not source.hf_assets:
         raise TritiumError(
             "ONNX export requires a complete schema-v3 language-plus-MTP bundle",
@@ -298,7 +420,36 @@ def export_onnx(
 def load_onnx(
     artifact_dir: Union[os.PathLike[str], str], *, device: str = "cpu"
 ) -> Any:
-    """Strictly admit a published bundle and create its native ORT generation runtime."""
+    """Strictly admit a typed Tritium ONNX bundle through one public facade."""
+    requested = Path(artifact_dir)
+    if requested.is_symlink():
+        raise ValueError("ONNX artifact must be an ordinary directory")
+    directory = requested.resolve(strict=True)
+    if not directory.is_dir():
+        raise ValueError("ONNX artifact must be an ordinary directory")
+    qwen_manifest = directory / _MANIFEST_FILE
+    module_manifest = directory / "tritium-module-onnx.json"
+    qwen_present = qwen_manifest.exists() or qwen_manifest.is_symlink()
+    module_present = module_manifest.exists() or module_manifest.is_symlink()
+    if qwen_present and module_present:
+        raise ValueError("ONNX artifact contains multiple bundle manifests")
+    if module_present:
+        if device != "cpu":
+            raise TritiumError(
+                "generic ONNX bundles currently admit CPU execution only",
+                code="onnx_device_unavailable",
+                stage="load_onnx",
+                details={"device": device},
+            )
+        return load_module_onnx(requested)
+    if not qwen_present and any(
+        (directory / name).exists() for name in _TRAINING_CHECKPOINT_FILES
+    ):
+        raise TritiumError(
+            "trainable ONNX import requires Tritium v1.3",
+            code="trainable_onnx_requires_v1_3",
+            stage="load_onnx",
+        )
     manifest = _read_manifest(Path(artifact_dir))
     native = getattr(_tritium, "QwenOnnxModel", None)
     if native is None:

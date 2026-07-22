@@ -206,6 +206,21 @@ a real tiny-Llama PTQ export; caller-declared symbolic input axes remain part of
 the graph identity. Batch dynamism is independently gated on the generic linear
 path because the tested upstream tiny-Llama export retains a batch-one
 `GatherND` specialization.
+The stable `export_onnx`/`load_onnx` facade now routes complete Qwen PTQ bundles,
+generic module PTQ results, QAT-hard results or reopened QAT-hard artifacts, and
+refined children without changing their claim type. Generic exports require an
+explicit model shell where architecture is not owned by the result plus explicit
+example inputs. Their canonical schema-v2 manifest binds conversion mode,
+source-model digest, recipe, exact input artifact, and complete refinement
+ancestry; strict reload cross-checks lineage against graph checkpoint identity
+before ORT session creation. Schema-v1 module bundles remain readable, while new
+typed exports write schema v2. Scale-only and hard-PV children retain those exact
+discriminants rather than collapsing to a generic refinement label. Dynamic
+batch/sequence names and parity tolerances flow through the same public facade
+instead of a separate untracked exporter.
+Latent QAT modules, prepared graphs, optimizer/checkpoint mappings, and
+checkpoint directories are rejected with `trainable_onnx_requires_v1_3` before
+an exporter or runtime is opened.
 This is a semantic generic-module fallback, not evidence of native fused custom
 operator execution, causal generation closure or Hugging Face whole-model ONNX
 support. Those remain binding below.

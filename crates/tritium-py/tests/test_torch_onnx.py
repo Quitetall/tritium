@@ -1,3 +1,4 @@
+import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -7,15 +8,25 @@ import pytest
 torch = pytest.importorskip("torch")
 
 import tritium.torch.onnx as onnx  # noqa: E402
+from tritium.nn import AdditiveTernaryLinear, TernaryLinear  # noqa: E402
 from tritium.torch import (  # noqa: E402
+    QatHardResult,
+    QatHardArtifact,
+    ModuleOnnxLineage,
+    RefinementConfig,
+    RefinementResult,
     QwenOnnxCausalLM,
     OnnxMtpOutput,
     TritiumError,
     export_onnx,
+    export_module_onnx,
     load_onnx,
+    load_module_onnx,
 )
+from tritium.torch.config import TernaryConfig  # noqa: E402
 from tritium.torch.artifacts import QuantizationResult  # noqa: E402
 from tritium.torch.conversion import PreparedModel  # noqa: E402
+from tritium.torch.module_artifacts import ModuleQuantizationResult  # noqa: E402
 
 
 def _write_onnx_bundle(root: Path, *, dynamic=False):
@@ -116,6 +127,277 @@ def test_export_onnx_rejects_latent_training_graph():
     with pytest.raises(TritiumError) as caught:
         export_onnx(source, "out")
     assert caught.value.code == "trainable_onnx_requires_v1_3"
+
+
+def test_export_onnx_routes_qat_hard_with_exact_lineage(monkeypatch, tmp_path):
+    source = QatHardResult(
+        model=torch.nn.Linear(2, 2).eval(),
+        artifact_id="sha256:" + "11" * 32,
+        source_checkpoint_digest="sha256:" + "22" * 32,
+        hard_state_digest="sha256:" + "33" * 32,
+        recipe_id="sha256:" + "44" * 32,
+        config=TernaryConfig.qat(),
+        source_coverage=SimpleNamespace(),
+        weights=(),
+    )
+    observed = {}
+
+    def export(*args, **kwargs):
+        observed.update(args=args, kwargs=kwargs)
+        return "qat-onnx"
+
+    monkeypatch.setattr(onnx, "export_module_onnx", export, raising=False)
+    example = torch.ones((1, 2))
+    assert export_onnx(
+        source,
+        tmp_path / "out",
+        example_inputs=example,
+        input_names=("hidden",),
+        output_names=("logits",),
+        dynamic_axes={"hidden": {1: "sequence"}},
+    ) == "qat-onnx"
+    assert observed["args"] == (source.model, example, tmp_path / "out")
+    assert observed["kwargs"]["lineage"].mode == "qat-hard"
+    assert observed["kwargs"]["lineage"].artifact_id == source.artifact_id
+    assert observed["kwargs"]["lineage"].recipe_id == source.recipe_id
+    assert (
+        observed["kwargs"]["lineage"].source_model_digest
+        == source.source_checkpoint_digest
+    )
+    assert observed["kwargs"]["input_names"] == ("hidden",)
+    assert observed["kwargs"]["output_names"] == ("logits",)
+    assert observed["kwargs"]["dynamic_axes"] == {"hidden": {1: "sequence"}}
+
+    with pytest.raises(ValueError, match="example_inputs"):
+        export_onnx(source, tmp_path / "missing")
+
+
+def test_export_onnx_routes_module_ptq_and_refinement_without_relabeling(
+    monkeypatch, tmp_path
+):
+    ptq = ModuleQuantizationResult(
+        artifact_dir=tmp_path / "ptq",
+        artifact_id="sha256:" + "10" * 32,
+        source_model_digest="sha256:" + "20" * 32,
+        evidence_id="sha256:" + "30" * 32,
+        algorithm_id="tritium.test@1",
+        recipe_id="sha256:" + "40" * 32,
+        config=TernaryConfig.ptq(profile="compact-v1"),
+        coverage=SimpleNamespace(),
+        weights=(),
+    )
+    refined = RefinementResult(
+        artifact_dir=tmp_path / "refined",
+        artifact_id="sha256:" + "50" * 32,
+        parent_artifact_id=ptq.artifact_id,
+        ancestry=(ptq.artifact_id,),
+        source_model_digest=ptq.source_model_digest,
+        teacher_digest="sha256:" + "60" * 32,
+        training_digest="sha256:" + "70" * 32,
+        training_batches=(),
+        validation_digest="sha256:" + "80" * 32,
+        validation_batches=(),
+        config=RefinementConfig.scale_only(),
+        conversion=SimpleNamespace(recipe_id="sha256:" + "90" * 32),
+        packed=None,
+        validation_loss_before=1.0,
+        validation_loss_after=0.9,
+        accepted_steps=1,
+    )
+    shell = torch.nn.Linear(2, 2).eval()
+    converted = torch.nn.Linear(2, 2).eval()
+    calls = []
+    monkeypatch.setattr(
+        onnx, "load_quantized_module", lambda model, source, inplace: converted,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        RefinementResult, "load_model", lambda self, model, inplace: converted,
+    )
+
+    def export(model, inputs, output, **kwargs):
+        calls.append((model, inputs, output, kwargs["lineage"]))
+        return kwargs["lineage"].mode
+
+    monkeypatch.setattr(onnx, "export_module_onnx", export, raising=False)
+    example = torch.ones((1, 2))
+    assert export_onnx(
+        ptq, tmp_path / "ptq-onnx", model=shell, example_inputs=example,
+    ) == "ptq"
+    assert export_onnx(
+        refined, tmp_path / "refined-onnx", model=shell, example_inputs=example,
+    ) == "scale-only"
+    assert calls[0][3].artifact_id == ptq.artifact_id
+    assert calls[0][3].parent_artifact_id is None
+    assert calls[1][3].artifact_id == refined.artifact_id
+    assert calls[1][3].mode == "scale-only"
+    assert calls[1][3].parent_artifact_id == ptq.artifact_id
+    assert calls[1][3].ancestry == refined.ancestry
+
+
+def test_load_onnx_routes_typed_module_bundle_through_public_facade(
+    monkeypatch, tmp_path
+):
+    root = tmp_path / "module-onnx"
+    root.mkdir()
+    (root / "tritium-module-onnx.json").write_text("{}", encoding="utf-8")
+    observed = {}
+    monkeypatch.setattr(
+        onnx,
+        "load_module_onnx",
+        lambda path: observed.update(path=path) or "module-runtime",
+        raising=False,
+    )
+    assert load_onnx(root) == "module-runtime"
+    assert observed == {"path": root}
+    with pytest.raises(TritiumError) as caught:
+        load_onnx(root, device="cuda:0")
+    assert caught.value.code == "onnx_device_unavailable"
+
+
+def test_onnx_facade_rejects_trainable_and_checkpoint_state_with_stable_code(tmp_path):
+    inputs = [torch.nn.Linear(2, 2), {"optimizer": {"state": {}}}]
+    for source in inputs:
+        with pytest.raises(TritiumError) as caught:
+            export_onnx(source, tmp_path / "out")
+        assert caught.value.code == "trainable_onnx_requires_v1_3"
+
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    (checkpoint / "optimizer.pt").write_bytes(b"state")
+    with pytest.raises(TritiumError) as caught:
+        load_onnx(checkpoint)
+    assert caught.value.code == "trainable_onnx_requires_v1_3"
+
+
+def test_module_export_rejects_latent_master_before_dependencies(tmp_path):
+    plane = SimpleNamespace(
+        trits=torch.ones((2, 2), dtype=torch.int8),
+        scales=torch.ones((2, 1), dtype=torch.float16),
+        group_size=2,
+    )
+
+    class Mixed(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.hard = AdditiveTernaryLinear((plane,)).eval()
+            self.latent = TernaryLinear(2, 2).eval()
+
+        def forward(self, value):
+            return self.hard(value)
+
+    with pytest.raises(TritiumError) as caught:
+        export_module_onnx(Mixed().eval(), torch.ones((1, 2)), tmp_path / "out")
+    assert caught.value.code == "trainable_onnx_requires_v1_3"
+
+
+def test_module_onnx_lineage_rejects_forged_parentage_before_export(tmp_path):
+    invalid = ModuleOnnxLineage(
+        mode="scale-only",
+        artifact_id="sha256:" + "11" * 32,
+        recipe_id="sha256:" + "22" * 32,
+        source_model_digest="sha256:" + "33" * 32,
+        parent_artifact_id="sha256:" + "44" * 32,
+        ancestry=("sha256:" + "55" * 32,),
+    )
+    with pytest.raises(ValueError, match="immediate parent"):
+        export_module_onnx(
+            torch.nn.Linear(2, 2).eval(),
+            torch.ones((1, 2)),
+            tmp_path / "forged",
+            lineage=invalid,
+        )
+
+
+def test_module_onnx_loader_rejects_forged_lineage_before_ort(tmp_path):
+    root = tmp_path / "module-onnx"
+    root.mkdir()
+    graph = root / "model.onnx"
+    graph.write_bytes(b"not parsed before lineage admission")
+    digest = lambda payload: "sha256:" + hashlib.sha256(payload).hexdigest()
+    value = {
+        "schema_version": 2,
+        "artifact_kind": "tritium.packed-module-onnx-v2",
+        "checkpoint_digest": "sha256:" + "11" * 32,
+        "opset": 18,
+        "input_names": ["input"],
+        "output_names": ["output"],
+        "packed_modules": [{
+            "path": "linear",
+            "storage_path": "linear._packed_weight",
+            "rows": 1,
+            "columns": 1,
+            "planes": 1,
+            "packed_initializers": ["packed"],
+            "scale_initializers": ["scale"],
+        }],
+        "files": [{
+            "file": "model.onnx",
+            "sha256": digest(graph.read_bytes()),
+            "bytes": graph.stat().st_size,
+        }],
+        "conversion": {
+            "mode": "scale-only",
+            "artifact_id": "sha256:" + "22" * 32,
+            "recipe_id": "sha256:" + "33" * 32,
+            "source_model_digest": "sha256:" + "11" * 32,
+            "parent_artifact_id": "sha256:" + "44" * 32,
+            "ancestry": ["sha256:" + "55" * 32],
+        },
+    }
+    canonical = lambda item: json.dumps(
+        item, sort_keys=True, separators=(",", ":")
+    ).encode()
+    value["artifact_id"] = digest(canonical(value))
+    (root / "tritium-module-onnx.json").write_bytes(canonical(value))
+    with pytest.raises(ValueError, match="immediate parent"):
+        load_module_onnx(root, create_session=False)
+
+
+def test_export_onnx_reopens_qat_hard_artifact_into_explicit_shell(
+    monkeypatch, tmp_path
+):
+    source = QatHardArtifact(
+        artifact_dir=tmp_path / "qat",
+        artifact_id="sha256:" + "11" * 32,
+        conversion_artifact_id="sha256:" + "22" * 32,
+        source_checkpoint_digest="sha256:" + "33" * 32,
+        hard_state_digest="sha256:" + "44" * 32,
+        recipe_id="sha256:" + "55" * 32,
+        config=TernaryConfig.qat(),
+        source_coverage=SimpleNamespace(),
+        weights=(),
+        state_digest="sha256:" + "66" * 32,
+        state_bytes=1,
+        state_tensors=1,
+        state_ledger=(),
+    )
+    shell = torch.nn.Linear(2, 2).eval()
+    loaded = torch.nn.Linear(2, 2).eval()
+    observed = {}
+    monkeypatch.setattr(
+        onnx,
+        "load_qat_hard",
+        lambda path, model, inplace: (
+            observed.update(load=(path, model, inplace)) or loaded
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        onnx,
+        "export_module_onnx",
+        lambda model, inputs, output, **kwargs: observed.update(
+            export=(model, inputs, output, kwargs["lineage"])
+        ) or "artifact-onnx",
+        raising=False,
+    )
+    example = torch.ones((1, 2))
+    assert export_onnx(
+        source, tmp_path / "out", model=shell, example_inputs=example,
+    ) == "artifact-onnx"
+    assert observed["load"] == (source.artifact_dir, shell, False)
+    assert observed["export"][3].artifact_id == source.artifact_id
+    assert observed["export"][3].mode == "qat-hard"
 
 
 def test_export_onnx_forwards_dynamic_ptq_bundle(monkeypatch, tmp_path):
