@@ -1,44 +1,154 @@
 # Tritium
 
-Foundational library for **ternary-model inference and training**, GPU + CPU
-first-class. Ternary weights live in `{-1, 0, +1}` (~1.58 bits/weight) — matmul
-collapses to add / subtract / skip, no multiplies. Tritium makes that fast
-everywhere: CUDA (addition-only **and** int8 tensor-core paths), CPU SIMD with
-LUT lookup (AVX2 / AVX-512 / NEON), with ONNX and PyTorch bindings.
+Tritium is Apache-2.0 infrastructure for converting dense neural networks into
+compact additive-ternary models, refining or training them with PyTorch, and
+executing their packed weights across native and portable runtimes.
 
-Consolidates prior art — BitNet/bitnet.cpp, T-MAC, BitBLAS, llama.cpp's
-TQ1_0/TQ2_0, GPTQ-Marlin, ExLlamaV2 — behind one Rust workspace.
+Weights use `{-1, 0, +1}` planes. One plane is the compact base model; additional
+residual planes trade physical bytes for quality. Tritium treats the recipe,
+calibration evidence, ancestry, packed bytes, runtime memory, and measured model
+quality as one auditable artifact lifecycle—not as an informal `bits=2` label.
 
-> Status: **pre-alpha**, scaffolding. `tritium-core` is the first real crate.
+> **Release status:** the repository uses the `1.1.0-rc.0` candidate version. It
+> is neither `LOCAL_RC_READY` nor a public v1.1 release. Package, browser,
+> flagship-model, deployment, and second-machine gates remain open. The generated
+> [compatibility matrix](docs/compatibility.md) is authoritative: `pending` is
+> not support, and no public registry artifact is claimed before activation.
+
+## What is implemented
+
+- Additive PTQ with one to three ternary planes, calibration receipts, strict
+  physical-byte accounting, packed artifacts, scale-only refinement, and hard-PV
+  refinement.
+- Differentiable PyTorch QAT with STE estimators, tied-weight preservation,
+  hard conversion, optimizer-compatible latent masters, strict checkpointing,
+  Hugging Face integration, and ternary diagnostics.
+- Packed inference kernels and runtime adapters for CPU, CUDA, Metal, ROCm,
+  wgpu, WASI/WASM, browser WebGPU, C, Candle, Burn, and ONNX at different
+  qualification levels.
+- Native SALT formats plus compact B3 packing, sparse/additive layouts,
+  seek-backed payloads, canonical manifests, digests, and bounded readers.
+- OpenAI-compatible serving with bounded requests, rotating bearer
+  authentication for exposed binds, per-principal admission, readiness,
+  metrics, hardened OCI/Kubernetes assets, and evidence-gated deployment.
+- Receipt-backed release tooling for wheels, crates, npm archives, OCI images,
+  SBOMs, provenance, compatibility, model evidence, and local-RC sign-off.
+
+Implementation is not the same as release qualification. See
+[ADR 0033](docs/adr/0033-v11-full-public-release.md) and the
+[v1.1 execution plan](docs/plans/0044-v11-full-public-release.md) for the gates.
+The [backend guide](docs/book/src/backends.md) describes source capabilities;
+an implementation without a generated compatibility cell and admitted receipt
+remains unqualified.
+
+## PyTorch PTQ in explicit phases
+
+The public API exposes preparation, calibration, conversion, refinement,
+export, load, and inspection as distinct typed phases:
+
+```python
+from pathlib import Path
+
+import torch
+from tritium.torch import (
+    TernaryConfig,
+    calibrate,
+    convert,
+    inspect,
+    load_quantized_module,
+    prepare,
+)
+
+dense = torch.nn.Linear(128, 64).eval()
+recipe = TernaryConfig.ptq(
+    profile="compact-v1",
+    target_modules=("Linear",),
+)
+prepared = prepare(dense, recipe, inplace=False)
+calibration = calibrate(
+    prepared,
+    [torch.randn(4, 128) for _ in range(4)],
+    evidence_dir=Path("work/calibration"),
+)
+result = convert(prepared, calibration, work_dir=Path("work/conversion"))
+ternary = load_quantized_module(dense, result, inplace=False).eval()
+
+print(result.artifact_id)
+print(inspect(prepared))
+print(ternary(torch.randn(2, 128)).shape)
+```
+
+For QAT, Hugging Face, refinement, ONNX, and browser workflows, use the
+[book](docs/book/src/SUMMARY.md). The pinned SmolLM2 tutorial is generated and
+headless-testable, but its clean candidate-wheel/Colab receipt is still a release
+gate rather than a published quick-start claim.
+
+## Native inference from source
+
+The default workspace build is CPU-only and uses Cargo—no CMake:
+
+```sh
+cargo build --locked
+cargo test --locked -p tritium-core -p tritium-format -p tritium-cpu
+cargo run --locked -p tritium-cli -- list-backends
+```
+
+CUDA and other accelerator adapters are feature-gated because their toolchains
+and physical device receipts are target-specific. Portable targets use their
+own target-build and package gates. The source-level CLI and server tutorial is
+in the [quickstart](docs/book/src/quickstart.md). Release users should install
+only exact artifacts admitted by the candidate manifest once those artifacts
+are authorized and published.
 
 ## Architecture
 
-Hexagonal / ports-and-adapters. Dependencies point **inward** only:
+Dependencies point inward:
 
-```
+```text
 foundation  (core · format · spec · testkit)
    ↑
-backends    (cpu · cuda · metal · rocm · wgpu)   — each impls tritium-spec
+backends    (cpu · cuda · metal · rocm · wgpu · wasm · mcu)
    ↑
-runtime     (runtime · quantize · nn · train)
+runtime     (runtime · quantize · salt · nn · train)
    ↑
-frontends   (ffi · py · onnx · candle · burn · wasm · cli · serve)
+frontends   (ffi · python · onnx · candle · burn · cli · serve · web)
 ```
 
-A frontend never depends on a concrete backend. A backend never depends on
-another backend. Every backend passes the **same** conformance vectors from
-`tritium-testkit`, so cross-backend bit-exactness is structural.
+A frontend does not own a concrete backend, and one backend does not depend on
+another. Shared schemas and conformance vectors define semantic portability;
+physical device claims additionally require target receipts.
 
-## Build
+## Evidence and limitations
 
-Cargo only — no CMake. CUDA crates shell `nvcc` from `build.rs` and load
-PTX/cubin at runtime via `cudarc`; feature flags gate every backend.
+The v1.0 codebase has real BitNet b1.58 2B4T CPU/CUDA evidence recorded in the
+[changelog](CHANGELOG.md). The v1.1 flagship target is a separately labeled
+Qwen3.6-27B language-plus-MTP additive-PTQ/refinement campaign. It is not a
+completed SOTA claim until its frozen quality, retention, runtime, memory, and
+reproduction gates pass.
 
-```sh
-cargo build                     # cpu-only foundation
-cargo test  -p tritium-core     # reference math + roundtrip
-```
+The `scripts/release-status` validator consumes an explicit candidate manifest
+and evidence registry and refuses incomplete gates. This working tree does not
+yet contain a sign-off candidate/registry. Current work-order blockers include:
 
-## License
+- whole-model Qwen/MTP quality and performance evidence is not yet admitted;
+- public wheel/crate/npm/container artifacts are not activated;
+- browser support awaits physical Chrome, Firefox, and Safari receipts;
+- whole-model Qwen/MTP inference and clean-wheel ONNX Runtime generation
+  receipts remain open;
+- trainable whole-model ONNX is intentionally deferred to v1.3;
+- vision/multimodal tensors are identity-bound but deferred from v1.1;
+- public links and community channels remain inactive while the repository is
+  private, and an independent conduct adjudicator must be designated first.
 
-[Apache-2.0](./LICENSE). Free and open source. Vendored upstreams attributed in [NOTICE](./NOTICE).
+## Project policies
+
+- [Contributing](CONTRIBUTING.md)
+- [Governance](GOVERNANCE.md)
+- [Code of Conduct](CODE_OF_CONDUCT.md)
+- [Support](SUPPORT.md)
+- [Security](SECURITY.md)
+- [Community channels](COMMUNITY.md)
+- [Citation](CITATION.cff)
+
+Tritium is licensed under [Apache-2.0](LICENSE). Vendored upstream work is
+attributed in [NOTICE](NOTICE).

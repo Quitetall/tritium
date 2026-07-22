@@ -130,6 +130,14 @@ covered, and the exact candidate runtime serves the strict artifact. “More tha
 
 ## Slice 5 — definitive documentation and examples
 
+Status: **IN PROGRESS** — the root README and book introduction now identify the
+exact `1.1.0-rc.0` candidate version without claiming local-RC readiness,
+separate implemented capability from receipt-qualified support, route users to
+ADR 0033/current plans and expose
+flagship, package, browser, ONNX, multimodal, community and reproduction
+blockers. The installed-artifact quick starts, definitive guide, migration,
+observability examples and full generated-claim drift gate remain open.
+
 Replace the current pre-alpha/v1.0-era narrative with tested v1.1 documentation:
 
 - README: honest product position, supported paths, five-minute quick start,

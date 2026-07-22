@@ -8,30 +8,37 @@ flag so the default build is CPU-only.
 
 ## What "ternary" means here
 
-Ternary weights live in `{-1, 0, +1}` — about **1.58 bits per weight**, the
-[BitNet b1.58](https://arxiv.org/abs/2402.17764) regime. Because every weight is
-`-1`, `0`, or `+1`, a matrix–vector product collapses from multiply-accumulate
-to **add / subtract / skip**: there are no multiplies in the weight contraction.
-Tritium's job is to make that multiply-free kernel fast everywhere — CUDA
-(an addition-only path **and** an int8 tensor-core path), CPU SIMD
-(AVX2 / AVX-512 / NEON with a scalar fallback), WebGPU (WGSL over Vulkan), and
-WebAssembly (a scalar reference path) — and to do so while staying
-bit-exact for the on-disk packing and within a documented tolerance for the
-floating-point accumulation.
+Ternary weights live in `{-1, 0, +1}`. A uniformly distributed trit has
+`log2(3) ≈ 1.585` bits of mathematical entropy, but that is not an artifact,
+resident-memory, or whole-model compression claim. Physical rate also includes
+packing, scales, indexes, metadata, preserved tensors, alignment, and codec
+overhead.
 
-The linear primitive is **W1.58A8**: ternary weights with int8-quantized
-activations. The activation is quantized per-token (absmax, `Qp = 127`), the
-ternary contraction runs add/sub/skip, and both the per-token activation scale
-and the per-channel weight scale are folded into the `f32` output. This is the
-BitNet linear layer.
+Tritium uses one to three additive ternary planes. The compact base plane is
+augmented only where a recipe and measured budget admit residual planes, so
+physical bytes and quality form an explicit tradeoff. Each plane turns the
+weight contraction into **add / subtract / skip**; scales and any activation
+quantization remain part of the numerical contract.
+
+W1.58A8 is one important native inference profile: activations are quantized
+per token, the ternary contraction uses add/subtract/skip, and activation and
+weight scales are folded into the floating output. It is not the only training
+or PTQ path. PyTorch research graphs retain floating latent masters during QAT,
+and additive PTQ/refinement recipes own their own precision and rate evidence.
+
+Implementations exist for CPU SIMD, CUDA, Metal, ROCm, native `wgpu`, WASI/WASM,
+and browser WebGPU at different qualification levels. Native `wgpu` evidence on
+Vulkan is not browser evidence, and browser WebGPU may map to Vulkan, Metal, or
+D3D12. A backend is supported only when its exact compatibility cell has a
+physical receipt.
 
 ## What is in the workspace
 
 Tritium consolidates prior art — BitNet / `bitnet.cpp`, T-MAC, BitBLAS,
 llama.cpp's `TQ1_0`/`TQ2_0`, GPTQ-Marlin, ExLlamaV2 — behind one Rust workspace.
-Each crate has a single responsibility:
+Each component has a single responsibility:
 
-| Crate | Responsibility |
+| Component | Responsibility |
 |-------|----------------|
 | `tritium-core` | Foundational ternary types, dtypes, scaling schemes, and the **reference math** every backend is graded against. |
 | `tritium-spec` | The object-safe `TernaryBackend` trait — the contract every backend implements. No implementations. |
@@ -40,11 +47,14 @@ Each crate has a single responsibility:
 | `tritium-runtime` | Backend registry and dispatch; backends self-register via `linkme` with no central edit. |
 | `tritium-cpu` | CPU backend: runtime-dispatched ternary mpGEMM — AVX-512 → AVX2 on x86-64, NEON on aarch64, scalar fallback. |
 | `tritium-cuda` | CUDA backend: `cudarc` host side + an addition-only `.cu` kernel built by `build.rs`/`nvcc`. |
-| `tritium-wgpu` | Cross-platform GPU backend: WGSL ternary mpGEMM over `wgpu` (validated on Vulkan). |
+| `tritium-metal` / `tritium-rocm` | Feature-gated Apple Metal and AMD HIP backends. |
+| `tritium-wgpu` | Native cross-platform WGSL backend over `wgpu`; target qualification is receipt-specific. |
 | `tritium-wasm` | Scalar `wasm32-wasip1` backend: the reference mpGEMM with no host-only deps. |
+| `tritium-mcu` | Fixed-arena `no_std` ternary-codec execution for constrained targets. |
 | `tritium-quantize` | SALT — sensitivity-allocated layered ternary quantization (residual planes + rate-distortion allocation). |
+| `tritium-salt` | SALT V2 orchestration and resumable campaign pipeline. |
 | `tritium-nn` | Inference layer over the backend: nn ops, KV cache, and the BitNet model runner. |
-| `tritium-train` | STE autograd, QAT, an optimizer, and LoRA for ternary BitNet models (single-node). |
+| `tritium-train` | STE autograd, QAT, optimizers, LoRA and distributed-training/checkpoint substrates. |
 | `tritium-cli` | The `tritium` command-line tool. |
 | `tritium-serve` | OpenAI-compatible HTTP/SSE inference server (axum, feature-gated). |
 | `tritium-ffi` | C ABI (`cdylib` + `staticlib`) for inference from C/C++/any language. |
@@ -52,6 +62,7 @@ Each crate has a single responsibility:
 | `tritium-burn` | A backend-generic burn op running Tritium's ternary mpGEMM, bit-exact with the reference. |
 | `tritium-onnx` | A bit-exact ternary mpGEMM kernel + an `ort` 2.x custom ONNX operator. |
 | `tritium-py` | PyO3 bindings (maturin wheel). |
+| `@tritium-ai/web` | Strict-TypeScript compiled training session with WASM and WebGPU adapters. |
 
 ## How this book is organized
 
@@ -62,17 +73,22 @@ Each crate has a single responsibility:
   `tritium` CLI.
 - **[Backends](./backends.md)** — what each backend does and how capability
   fallback works.
-- **[Quantization](./quantization.md)** — the SALT pipeline.
-- **[Training](./training.md)** — QAT / STE / LoRA.
+- **[Quantization](./quantization.md)** — additive SALT PTQ and physical rate.
+- **[Training](./training.md)** — QAT, estimators, refinement and distributed substrate.
 - **[Interop](./interop.md)** — serve, the C ABI, candle/burn ops, and the ONNX
   custom op, with real entry points.
+- **[Model Zoo](./model-zoo.md)** and **[Benchmarks](./benchmarks.md)** — admitted
+  artifacts, evidence rules and current blockers.
 - **[Conformance](./conformance.md)** and **[Contributing](./contributing.md)**.
 
-> **Project status.** Tritium is pre-1.0 and developed milestone-by-milestone
-> (see the [release roadmap ADR](../../adr/0002-release-roadmap.md) and
-> [`docs/ROADMAP.md`](../../ROADMAP.md)). v0.80 interop is complete on the 0.6.x
-> line; v0.90 hardening (this book is part of it) and v1.0 are in progress. APIs
-> may break between minor versions until 1.0.
+> **Project status.** The repository uses the `1.1.0-rc.0` candidate version; it
+> is neither `LOCAL_RC_READY` nor a qualified public v1.1 release. Stable-core
+> compatibility follows the v1.0 tier policy; evolving training, backend and
+> interop APIs retain the 1.x runway documented in
+> [ADR 0033](../../adr/0033-v11-full-public-release.md).
+> Package, flagship-model, browser, deployment and second-machine evidence gates
+> remain open. The generated [compatibility matrix](../../compatibility.md) is
+> authoritative: a pending cell is not support.
 
 ## License
 
