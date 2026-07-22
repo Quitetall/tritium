@@ -962,6 +962,12 @@ The following work deliberately remains open and keeps this plan in progress:
   not exist, and no paid campaign has been run;
 - no Qwen3.6-27B dense-parity, PTQ, refined, language-plus-MTP, or multimodal
   acceptance artifact exists;
+- the release registry now fail-closes conversion admission through
+  `tritium.qwen36-conversion-refinement.v1`: the exact pinned language-plus-MTP
+  source, 1,199-tensor coverage, 64-layer host/CUDA and MTP-oracle parity,
+  separate Compact PTQ/NearLossless PTQ/NearLossless refined candidate bundles,
+  refined-parent lineage, strict reload and repeat determinism are mandatory.
+  This is validator infrastructure only; no checkpoint-scale receipt exists;
 - no near-zero-divergence, additive-ternary SOTA, global Pareto, or cost result
   has been earned by this implementation alone.
 

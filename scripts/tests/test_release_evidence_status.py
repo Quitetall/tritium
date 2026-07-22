@@ -279,6 +279,53 @@ def entry(
 
 
 class ReleaseEvidenceStatusTests(unittest.TestCase):
+    def test_flagship_conversion_binds_model_bundle_and_advances_only_one_kind(self):
+        with tempfile.TemporaryDirectory() as raw:
+            candidate, document, old_artifact, evidence_root = release_fixture(Path(raw))
+            old_artifact.unlink()
+            artifact = candidate.parent / "qwen-near-lossless.salt"
+            artifact.write_bytes(b"qualified model bundle")
+            document["artifacts"] = [
+                {
+                    "id": "qwen-near", "kind": "model-bundle", "path": artifact.name,
+                    "identity": {"sha256": sha256(artifact), "bytes": artifact.stat().st_size},
+                    "sbom": {}, "provenance": {},
+                }
+            ]
+            candidate.write_bytes(canonical(document) + b"\n")
+            receipt_path = evidence_root / "conversion.json"
+            receipt_path.write_bytes(b"{}\n")
+            receipt = {
+                "receipt_id": "sha256:" + "5" * 64,
+                "run_id": "qwen-conversion-1",
+                "tracks": [
+                    {
+                        "artifact": {
+                            "id": "qwen-near", "kind": "model-bundle",
+                            "name": artifact.name, "bytes": artifact.stat().st_size,
+                            "sha256": sha256(artifact),
+                        }
+                    }
+                ],
+            }
+            registry_path = evidence_root / "registry.json"
+            receipt_entry = entry(
+                receipt_path, receipt, kind="conversion-refinement"
+            )
+            receipt_entry["artifact_id"] = "qwen-near"
+            registry(registry_path, candidate, [receipt_entry])
+            loader = mock.Mock(return_value=receipt)
+            with mock.patch.dict(
+                evaluate.__globals__, {"validate_flagship_conversion": loader}
+            ):
+                report = evaluate(registry_path, candidate, document)
+            flagship = next(row for row in report["rows"] if row["id"] == "flagship-qwen")
+            self.assertEqual(flagship["satisfied_kinds"], ["conversion-refinement"])
+            self.assertIn("quality", flagship["missing_kinds"])
+            loader.assert_called_once_with(
+                receipt_path.resolve(), "a" * 40, "1.1.0-rc.0", candidate
+            )
+
     def test_zoo_community_requires_evidence_ancestry_and_candidate_artifacts(self):
         with tempfile.TemporaryDirectory() as raw:
             candidate, document, artifact, evidence_root = release_fixture(Path(raw))

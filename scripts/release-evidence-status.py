@@ -66,6 +66,11 @@ validate_model_zoo = ZOO_COMMUNITY_RECEIPT["validate_zoo"]
 validate_generated_claims = ZOO_COMMUNITY_RECEIPT["validate_claims"]
 validate_governance_docs = ZOO_COMMUNITY_RECEIPT["validate_governance"]
 ZooCommunityError = ZOO_COMMUNITY_RECEIPT["ZooCommunityError"]
+FLAGSHIP_RECEIPT = runpy.run_path(
+    Path(__file__).with_name("verify-flagship-receipt.py")
+)
+validate_flagship_conversion = FLAGSHIP_RECEIPT["validate"]
+FlagshipReceiptError = FLAGSHIP_RECEIPT["FlagshipReceiptError"]
 
 SCHEMA = "tritium.release-evidence-registry.v1"
 REPORT_SCHEMA = "tritium.release-gate-report.v1"
@@ -89,6 +94,7 @@ KNOWN_KINDS = frozenset(
         "model-zoo",
         "generated-claims",
         "governance-docs",
+        "conversion-refinement",
     }
 )
 HEX = frozenset("0123456789abcdef")
@@ -295,6 +301,7 @@ def evaluate(
             else "oci-image" if (
                 kind.startswith("oci-") or kind.startswith("serving-deployment-")
             )
+            else "model-bundle" if kind == "conversion-refinement"
             else "python-wheel"
         )
         if artifact.get("kind") != expected_artifact_kind:
@@ -375,6 +382,10 @@ def evaluate(
                     receipt_path, revision, release, candidate, artifact_path,
                     Path(__file__).resolve().parent.parent,
                 )
+            elif kind == "conversion-refinement":
+                receipt = validate_flagship_conversion(
+                    receipt_path, revision, release, candidate
+                )
             elif kind in {"oci-runtime-cpu", "oci-runtime-cuda"}:
                 receipt = load_oci_runtime_receipt(
                     receipt_path, revision=revision, release=release,
@@ -447,6 +458,7 @@ def evaluate(
             BrowserReceiptError,
             ReproductionError,
             ZooCommunityError,
+            FlagshipReceiptError,
             ValueError,
         ) as error:
             raise EvidenceError(f"{label} failed {kind} validation: {error}") from error
@@ -547,6 +559,23 @@ def evaluate(
             )
             if actual != declared or actual != qualified:
                 raise EvidenceError(f"{kind} receipt does not bind candidate anchor bytes")
+        elif kind == "conversion-refinement":
+            qualified = {
+                (
+                    track["artifact"]["id"], track["artifact"]["kind"],
+                    track["artifact"]["name"], track["artifact"]["bytes"],
+                    track["artifact"]["sha256"],
+                )
+                for track in receipt["tracks"]
+            }
+            actual = (
+                artifact.get("id"), artifact.get("kind"), artifact_path.name,
+                artifact_path.stat().st_size, _sha256(artifact_path),
+            )
+            if actual not in qualified:
+                raise EvidenceError(
+                    "conversion-refinement anchor is not a qualified model bundle"
+                )
         elif kind.startswith("oci-"):
             identity = artifact.get("identity", {})
             actual = (artifact_path.name, _sha256(artifact_path), artifact_path.stat().st_size)
