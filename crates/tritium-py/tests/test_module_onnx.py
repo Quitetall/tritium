@@ -14,14 +14,18 @@ pytest.importorskip("onnxscript")
 from tritium.nn import AdditiveTernaryLinear  # noqa: E402
 from tritium.torch import (  # noqa: E402
     ModuleOnnxLineage,
+    RefinementConfig,
     TernaryConfig,
     TritiumError,
     calibrate,
     convert,
     export_module_onnx,
+    export_onnx,
+    load_onnx,
     load_quantized_module,
     load_module_onnx,
     prepare,
+    refine,
 )
 
 
@@ -97,6 +101,76 @@ def test_module_onnx_keeps_packed_state_runs_ort_and_supports_dynamic_batch(tmp_
     graph_path.write_bytes(payload)
     with pytest.raises(ValueError, match="file identity mismatch"):
         load_module_onnx(artifact.artifact_dir)
+
+
+def test_public_facade_executes_qat_ptq_and_refinement_artifacts_in_ort(tmp_path):
+    torch.manual_seed(131)
+    example = torch.randn(2, 8)
+
+    qat = prepare(
+        torch.nn.Linear(8, 2).eval(),
+        TernaryConfig.qat(target_modules=("Linear",)),
+        inplace=True,
+    )
+    qat.model.eval()
+    qat_hard = convert(qat)
+    qat_bundle = export_onnx(
+        qat_hard,
+        tmp_path / "qat-onnx",
+        example_inputs=example,
+    )
+    qat_runtime = load_onnx(qat_bundle.artifact_dir)
+    assert qat_runtime.artifact.lineage.mode == "qat-hard"
+    torch.testing.assert_close(
+        qat_runtime(example), qat_hard.model(example), rtol=1e-4, atol=1e-5
+    )
+
+    teacher = torch.nn.Linear(8, 2).eval()
+    prepared = prepare(
+        teacher,
+        TernaryConfig.ptq(profile="compact-v1", target_modules=("Linear",)),
+        inplace=False,
+    )
+    calibration = calibrate(
+        prepared,
+        [example],
+        evidence_dir=tmp_path / "calibration",
+    )
+    ptq = convert(prepared, calibration, work_dir=tmp_path / "ptq")
+    ptq_bundle = export_onnx(
+        ptq,
+        tmp_path / "ptq-onnx",
+        model=teacher,
+        example_inputs=example,
+    )
+    ptq_runtime = load_onnx(ptq_bundle.artifact_dir)
+    assert ptq_runtime.artifact.lineage.mode == "ptq"
+    ptq_model = load_quantized_module(teacher, ptq)
+    torch.testing.assert_close(
+        ptq_runtime(example), ptq_model(example), rtol=1e-4, atol=1e-5
+    )
+
+    refined = refine(
+        ptq,
+        teacher=teacher,
+        training=[torch.randn(2, 8)],
+        validation=[torch.randn(3, 8)],
+        config=RefinementConfig.scale_only(max_steps=1),
+        work_dir=tmp_path / "refinement",
+    )
+    refined_bundle = export_onnx(
+        refined,
+        tmp_path / "refined-onnx",
+        model=teacher,
+        example_inputs=example,
+    )
+    refined_runtime = load_onnx(refined_bundle.artifact_dir)
+    assert refined_runtime.artifact.lineage.mode == "scale-only"
+    assert refined_runtime.artifact.lineage.ancestry == refined.ancestry
+    refined_model = refined.load_model(teacher)
+    torch.testing.assert_close(
+        refined_runtime(example), refined_model(example), rtol=1e-4, atol=1e-5
+    )
 
 
 def test_module_onnx_rejects_optimizer_dense_shadow_and_rolls_back(monkeypatch, tmp_path):

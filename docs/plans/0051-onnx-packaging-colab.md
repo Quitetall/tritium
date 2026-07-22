@@ -221,6 +221,11 @@ instead of a separate untracked exporter.
 Latent QAT modules, prepared graphs, optimizer/checkpoint mappings, and
 checkpoint directories are rejected with `trainable_onnx_requires_v1_3` before
 an exporter or runtime is opened.
+An isolated environment pinned to ONNX 1.22.0, ONNX Runtime 1.27.0 and
+ONNXScript 0.7.1 now executes the public QAT-hard, module-PTQ and scale-only
+refinement routes through export, strict public reload and real ORT parity; the
+five focused packed-module ORT gates pass together. This remains tiny-module
+evidence, not a whole-model causal-generation qualification.
 This is a semantic generic-module fallback, not evidence of native fused custom
 operator execution, causal generation closure or Hugging Face whole-model ONNX
 support. Those remain binding below.
