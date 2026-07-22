@@ -30,6 +30,8 @@ OciError = OCI_ARCHIVE["OciError"]
 
 SCHEMA = "tritium.oci-runtime-qualification.v1"
 HEX = frozenset("0123456789abcdef")
+MAX_JSON_RESPONSE_BYTES = 16 * 1024 * 1024
+MAX_SSE_RESPONSE_BYTES = 1024 * 1024
 CHECKS = (
     "production-readiness", "models", "buffered-generation", "sse-generation",
     "readonly-rootfs", "drop-all-capabilities", "no-new-privileges",
@@ -88,7 +90,10 @@ def request_json(url: str, token: str, body: dict[str, Any] | None = None,
         request.add_header("Content-Type", "application/json")
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            value = json.loads(response.read())
+            payload = response.read(MAX_JSON_RESPONSE_BYTES + 1)
+            if len(payload) > MAX_JSON_RESPONSE_BYTES:
+                raise QualificationError(f"response exceeds byte limit: {url}")
+            value = json.loads(payload)
     except (OSError, urllib.error.URLError, json.JSONDecodeError) as error:
         raise QualificationError(f"request failed: {url}: {error}") from error
     if not isinstance(value, dict):
@@ -243,7 +248,10 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
             headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
         )
         with urllib.request.urlopen(stream_request, timeout=args.request_timeout) as response:
-            stream = response.read().decode("utf-8")
+            stream_payload = response.read(MAX_SSE_RESPONSE_BYTES + 1)
+        if len(stream_payload) > MAX_SSE_RESPONSE_BYTES:
+            raise QualificationError("streaming generation exceeded byte limit")
+        stream = stream_payload.decode("utf-8")
         if "data: [DONE]" not in stream or '"choices"' not in stream:
             raise QualificationError("streaming generation lacked choice data or terminal marker")
         container = run(compose + ["ps", "-q", "tritium"], env=environment)
@@ -268,12 +276,18 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
         if exit_code != "0" or shutdown_ms > args.shutdown_timeout * 1000:
             raise QualificationError("SIGTERM shutdown exceeded budget or exited unsuccessfully")
     finally:
+        active_error = sys.exc_info()[0] is not None
         try:
-            subprocess.run(compose + ["down", "--volumes", "--remove-orphans"], env=environment,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60,
-                           check=False)
-        except (OSError, subprocess.SubprocessError):
-            pass
+            cleanup = subprocess.run(
+                compose + ["down", "--volumes", "--remove-orphans"], env=environment,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60,
+                check=False,
+            )
+            if cleanup.returncode != 0 and not active_error:
+                raise QualificationError("Compose cleanup failed")
+        except (OSError, subprocess.SubprocessError) as error:
+            if not active_error:
+                raise QualificationError(f"Compose cleanup failed: {error}") from error
 
     machine_source = Path("/etc/machine-id").read_text(encoding="utf-8").strip()
     machine = hashlib.sha256(machine_source.encode()).hexdigest()

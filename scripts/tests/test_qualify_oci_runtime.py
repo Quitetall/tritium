@@ -4,6 +4,7 @@ from pathlib import Path
 import runpy
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -13,6 +14,7 @@ atomic_create = MODULE["atomic_create"]
 canonical = MODULE["canonical"]
 validate_ready = MODULE["validate_ready"]
 validate_receipt = MODULE["validate_receipt"]
+request_json = MODULE["request_json"]
 
 
 def readiness():
@@ -68,6 +70,21 @@ def runtime_receipt(artifact: Path) -> dict:
 
 
 class QualifyOciRuntimeTests(unittest.TestCase):
+    def test_json_client_rejects_oversized_response(self):
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, _limit):
+                return b"x" * (MODULE["MAX_JSON_RESPONSE_BYTES"] + 1)
+
+        with mock.patch.object(MODULE["urllib"].request, "urlopen", return_value=Response()):
+            with self.assertRaisesRegex(QualificationError, "byte limit"):
+                request_json("http://127.0.0.1/readyz", "token")
+
     def test_accepts_exact_production_readiness(self):
         receipt = validate_ready(
             readiness(), "a" * 40, "cpu", "compact-v1", "c" * 64, "1.1.0-rc.0"

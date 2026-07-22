@@ -128,6 +128,8 @@ class OciContractTests(unittest.TestCase):
             '"--signal", "TERM"',
             "nvidia-smi",
             "receipt_id",
+            "MAX_SSE_RESPONSE_BYTES",
+            "Compose cleanup failed",
         ):
             self.assertIn(token, script)
 
