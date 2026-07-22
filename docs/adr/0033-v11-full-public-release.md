@@ -392,6 +392,13 @@ remaining frontend, distributed, export, machine or compatibility gates.
 Earlier v1/v2 developer results are not admitted v1.1 receipts. Unknown or
 older tutorial-result schemas fail closed.
 
+The installed Hugging Face gate emits `tritium.hf-lifecycle.v1`. It binds a
+two-plane tied-Llama forward/backward/AdamW step, safe `save_pretrained`, native
+`AutoModelForCausalLM` reload, exact logits and current alias-aware coverage to
+the candidate wheel, source, release, run and complete checkpoint tree. The
+registry admits this only as `frontend-lifecycle`; distributed training and
+whole-model export/reload remain independent requirements.
+
 ## v1.1 release gate
 
 `v1.1.0` may publish only when all boxes are green:

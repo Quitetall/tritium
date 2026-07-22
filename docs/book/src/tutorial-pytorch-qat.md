@@ -91,3 +91,25 @@ This tiny workflow proves API, autograd, optimizer resume, tie, conversion,
 physical serialization, and strict-reload behavior. It does not prove flagship
 quality, performance, compression ratio, browser support, or public-release
 readiness.
+
+## Hugging Face native lifecycle gate
+
+The same compiler-free wheel job also runs an installed-only Hugging Face gate:
+
+```sh
+python -I -m tritium.torch.hf_lifecycle \
+  --output-dir ./hf-lifecycle-output \
+  --wheel-artifact "$TRITIUM_WHEEL" \
+  --source-revision "$TRITIUM_SOURCE_REVISION" \
+  --release 1.1.0-rc.0 \
+  --run-id local-hf-lifecycle-1
+```
+
+It prepares a tied tiny Llama with two additive planes, runs backward plus one
+AdamW step, uses native `save_pretrained(..., safe_serialization=True)`, reloads
+through `AutoModelForCausalLM`, and requires exact logits, recipe, conversion
+coverage, and weight-alias parity. The portable `tritium.hf-lifecycle.v1`
+receipt hashes the complete checkpoint tree and binds candidate wheel bytes,
+source, release, run, Torch, Transformers, and installed-package ownership.
+The release registry counts a strict result as `frontend-lifecycle`; distributed
+training and whole-model export remain separate gates.

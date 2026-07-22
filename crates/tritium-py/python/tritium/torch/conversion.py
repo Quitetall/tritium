@@ -329,6 +329,22 @@ def prepare_qat(
     return prepare(model, config, strict=strict, inplace=True).model
 
 
+def _current_qat_coverage(model: nn.Module) -> Optional[CoverageReport]:
+    """Re-derive QAT aliases after framework-native tie/untie operations."""
+
+    from ..nn import TernaryConv1d, TernaryConv2d, TernaryEmbedding, TernaryLinear
+
+    converted_types = (TernaryConv1d, TernaryConv2d, TernaryEmbedding, TernaryLinear)
+    converted_weights = {
+        f"{path}.weight" if path else "weight"
+        for path, module in model.named_modules(remove_duplicate=False)
+        if isinstance(module, converted_types)
+    }
+    if not converted_weights:
+        return None
+    return _parameter_coverage(model, converted_weights)
+
+
 def inspect(model: Union[nn.Module, PreparedModel]) -> CoverageReport:
     """Return the immutable coverage receipt for a prepared model."""
 
@@ -348,4 +364,8 @@ def inspect(model: Union[nn.Module, PreparedModel]) -> CoverageReport:
             code="coverage_missing",
             stage="inspect",
         )
+    current = _current_qat_coverage(model)
+    if current is not None and current != report:
+        model._tritium_coverage = current
+        return current
     return report

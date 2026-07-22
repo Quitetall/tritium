@@ -1,4 +1,4 @@
-"""Portable, dependency-free validator for installed QAT tutorial evidence."""
+"""Portable, dependency-free validators for installed frontend evidence."""
 
 from __future__ import annotations
 
@@ -10,6 +10,17 @@ from typing import Any
 
 
 SCHEMA = "tritium.installed-qat-tutorial.v3"
+HF_SCHEMA = "tritium.hf-lifecycle.v1"
+EXPECTED_HF_RECIPE = {
+    "quant_method": "tritium",
+    "schema_version": 2,
+    "mode": "qat",
+    "estimator": "salt-ste",
+    "target_modules": ["Linear", "Embedding"],
+    "planes": 2,
+    "profile": None,
+    "target_bpw": None,
+}
 FIELDS = {
     "schema",
     "receipt_id",
@@ -43,6 +54,38 @@ FIELDS = {
     "checkpoint_optimizer_sha256",
     "optimizer_state_entries",
     "resume_steps",
+}
+HF_FIELDS = {
+    "schema",
+    "receipt_id",
+    "passed",
+    "device",
+    "seed",
+    "torch_version",
+    "transformers_version",
+    "distribution_version",
+    "tritium_module",
+    "source_revision",
+    "release",
+    "run_id",
+    "wheel_name",
+    "wheel_bytes",
+    "wheel_sha256",
+    "input_ids",
+    "initial_loss",
+    "gradient_norm",
+    "optimizer_steps",
+    "converted_parameters",
+    "recipe",
+    "recipe_sha256",
+    "tied_before_save",
+    "tied_after_reload",
+    "safe_serialization",
+    "checkpoint_dir",
+    "checkpoint_bytes",
+    "checkpoint_file_count",
+    "checkpoint_tree_sha256",
+    "logits_sha256",
 }
 HEX = frozenset("0123456789abcdef")
 MAX_RECEIPT_BYTES = 1024 * 1024
@@ -238,7 +281,9 @@ def validate_receipt(
         or not checkpoint.is_dir()
         or checkpoint.resolve().parent != root
     ):
-        raise ValueError("tutorial checkpoint must be an ordinary directory contained in result")
+        raise ValueError(
+            "tutorial checkpoint must be an ordinary directory contained in result"
+        )
     for filename, bytes_field, digest_field in (
         ("model.safetensors", "checkpoint_model_bytes", "checkpoint_model_sha256"),
         ("optimizer.pt", "checkpoint_optimizer_bytes", "checkpoint_optimizer_sha256"),
@@ -262,4 +307,126 @@ def validate_receipt(
     return receipt
 
 
-__all__ = ["SCHEMA", "receipt_id", "tree_identity", "validate_receipt"]
+def validate_hf_receipt(
+    receipt_path: Path,
+    *,
+    expected_wheel: Path | None = None,
+    expected_source_revision: str | None = None,
+    expected_release: str | None = None,
+) -> dict[str, object]:
+    """Validate an installed-wheel Hugging Face lifecycle and checkpoint tree."""
+
+    receipt_path = _ordinary_file(receipt_path, "Hugging Face lifecycle receipt")
+    if receipt_path.stat().st_size > MAX_RECEIPT_BYTES:
+        raise ValueError("Hugging Face lifecycle receipt exceeds metadata size limit")
+    try:
+        receipt = json.loads(receipt_path.read_bytes())
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(
+            "Hugging Face lifecycle receipt must contain UTF-8 JSON"
+        ) from error
+    if not isinstance(receipt, dict) or set(receipt) != HF_FIELDS:
+        raise ValueError("Hugging Face lifecycle receipt fields do not match schema v1")
+    if receipt["schema"] != HF_SCHEMA:
+        raise ValueError("unsupported Hugging Face lifecycle receipt schema")
+    if receipt["passed"] is not True or receipt["device"] != "cpu":
+        raise ValueError("Hugging Face lifecycle result or device mismatch")
+    if type(receipt["seed"]) is not int:
+        raise ValueError("Hugging Face lifecycle seed must be an integer")
+    for field in (
+        "torch_version",
+        "transformers_version",
+        "distribution_version",
+        "tritium_module",
+        "release",
+        "run_id",
+    ):
+        if not isinstance(receipt[field], str) or not receipt[field]:
+            raise ValueError(f"Hugging Face lifecycle {field} must be non-empty")
+    revision = receipt["source_revision"]
+    if (
+        not isinstance(revision, str)
+        or len(revision) != 40
+        or any(character not in HEX for character in revision)
+    ):
+        raise ValueError("Hugging Face lifecycle source revision is invalid")
+    if expected_source_revision is not None and revision != expected_source_revision:
+        raise ValueError("Hugging Face lifecycle source revision mismatch")
+    if expected_release is not None and receipt["release"] != expected_release:
+        raise ValueError("Hugging Face lifecycle release mismatch")
+    if receipt["input_ids"] != [[1, 2, 3, 4]]:
+        raise ValueError("Hugging Face lifecycle input fixture mismatch")
+    for field in ("initial_loss", "gradient_norm"):
+        value = receipt[field]
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or float(value) <= 0
+        ):
+            raise ValueError(
+                f"Hugging Face lifecycle {field} must be finite and positive"
+            )
+    if receipt["optimizer_steps"] != 1:
+        raise ValueError("Hugging Face lifecycle optimizer step mismatch")
+    if receipt["converted_parameters"] != 8:
+        raise ValueError("Hugging Face lifecycle conversion coverage mismatch")
+    if receipt["recipe"] != EXPECTED_HF_RECIPE:
+        raise ValueError("Hugging Face lifecycle recipe mismatch")
+    expected_recipe_digest = (
+        "sha256:" + hashlib.sha256(canonical(EXPECTED_HF_RECIPE)).hexdigest()
+    )
+    if receipt["recipe_sha256"] != expected_recipe_digest:
+        raise ValueError("Hugging Face lifecycle recipe identity mismatch")
+    for field in ("tied_before_save", "tied_after_reload", "safe_serialization"):
+        if receipt[field] is not True:
+            raise ValueError(f"Hugging Face lifecycle {field} must be true")
+    if receipt["checkpoint_dir"] != "hf-checkpoint":
+        raise ValueError("Hugging Face lifecycle checkpoint directory mismatch")
+    for field in ("wheel_bytes", "checkpoint_bytes", "checkpoint_file_count"):
+        _positive_int(receipt[field], field)
+    for field in (
+        "wheel_sha256",
+        "recipe_sha256",
+        "checkpoint_tree_sha256",
+        "logits_sha256",
+        "receipt_id",
+    ):
+        _digest(receipt[field], field)
+    wheel_name = receipt["wheel_name"]
+    if (
+        not isinstance(wheel_name, str)
+        or Path(wheel_name).name != wheel_name
+        or not wheel_name.endswith(".whl")
+    ):
+        raise ValueError("Hugging Face lifecycle wheel name is invalid")
+    if receipt["receipt_id"] != receipt_id(receipt):
+        raise ValueError("Hugging Face lifecycle receipt identity mismatch")
+    checkpoint = receipt_path.parent.resolve(strict=True) / "hf-checkpoint"
+    observed_tree = tree_identity(checkpoint)
+    declared_tree = {
+        "bytes": receipt["checkpoint_bytes"],
+        "file_count": receipt["checkpoint_file_count"],
+        "sha256": receipt["checkpoint_tree_sha256"],
+    }
+    if observed_tree != declared_tree:
+        raise ValueError("Hugging Face lifecycle checkpoint tree identity mismatch")
+    if expected_wheel is not None:
+        wheel = _ordinary_file(expected_wheel, "Hugging Face lifecycle candidate wheel")
+        if (
+            wheel.name != wheel_name
+            or wheel.stat().st_size != receipt["wheel_bytes"]
+            or _file_sha256(wheel) != receipt["wheel_sha256"]
+        ):
+            raise ValueError("Hugging Face lifecycle does not bind the candidate wheel")
+    return receipt
+
+
+__all__ = [
+    "HF_SCHEMA",
+    "SCHEMA",
+    "receipt_id",
+    "tree_identity",
+    "validate_hf_receipt",
+    "validate_receipt",
+]

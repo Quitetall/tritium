@@ -279,6 +279,55 @@ def entry(
 
 
 class ReleaseEvidenceStatusTests(unittest.TestCase):
+    def test_hf_lifecycle_binds_candidate_wheel_and_advances_frontend_gate(self):
+        with tempfile.TemporaryDirectory() as raw:
+            candidate, document, artifact, evidence_root = release_fixture(Path(raw))
+            document["artifacts"][0]["identity"] = {
+                "sha256": sha256(artifact), "bytes": artifact.stat().st_size,
+            }
+            candidate.write_bytes(canonical(document) + b"\n")
+            checkpoint = evidence_root / "hf-checkpoint"
+            checkpoint.mkdir()
+            (checkpoint / "model.safetensors").write_bytes(b"HF checkpoint")
+            tree = TUTORIAL_RECEIPT_MODULE["tree_identity"](checkpoint)
+            receipt = {
+                "schema": "tritium.hf-lifecycle.v1", "passed": True,
+                "device": "cpu", "seed": 97, "torch_version": "2.11.0",
+                "transformers_version": "5.5.3",
+                "distribution_version": "1.1.0rc0",
+                "tritium_module": "/venv/tritium/__init__.py",
+                "source_revision": "a" * 40, "release": "1.1.0-rc.0",
+                "run_id": "hf-lifecycle-run-1", "wheel_name": artifact.name,
+                "wheel_bytes": artifact.stat().st_size,
+                "wheel_sha256": "sha256:" + sha256(artifact),
+                "input_ids": [[1, 2, 3, 4]], "initial_loss": 1.0,
+                "gradient_norm": 1.0, "optimizer_steps": 1,
+                "converted_parameters": 8,
+                "recipe": TUTORIAL_RECEIPT_MODULE["EXPECTED_HF_RECIPE"],
+                "recipe_sha256": "sha256:" + hashlib.sha256(canonical(
+                    TUTORIAL_RECEIPT_MODULE["EXPECTED_HF_RECIPE"]
+                )).hexdigest(),
+                "tied_before_save": True, "tied_after_reload": True,
+                "safe_serialization": True, "checkpoint_dir": "hf-checkpoint",
+                "checkpoint_bytes": tree["bytes"],
+                "checkpoint_file_count": tree["file_count"],
+                "checkpoint_tree_sha256": tree["sha256"],
+                "logits_sha256": "sha256:" + "2" * 64,
+            }
+            receipt["receipt_id"] = TUTORIAL_RECEIPT_MODULE["receipt_id"](receipt)
+            receipt_path = evidence_root / "hf-lifecycle.json"
+            receipt_path.write_bytes(canonical(receipt) + b"\n")
+            registry_path = evidence_root / "registry.json"
+            registry(
+                registry_path, candidate,
+                [entry(receipt_path, receipt, kind="frontend-lifecycle")],
+            )
+
+            report = evaluate(registry_path, candidate, document)
+            frontend = next(row for row in report["rows"] if row["id"] == "pytorch-hf")
+            self.assertEqual(frontend["satisfied_kinds"], ["frontend-lifecycle"])
+            self.assertIn("installed-qat-tutorial", frontend["missing_kinds"])
+
     def test_installed_qat_tutorial_binds_candidate_wheel_and_advances_frontend_gate(self):
         with tempfile.TemporaryDirectory() as raw:
             candidate, document, artifact, evidence_root = release_fixture(Path(raw))

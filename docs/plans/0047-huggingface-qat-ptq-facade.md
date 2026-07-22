@@ -42,6 +42,15 @@ Gate: a tiny tied-weight Llama model performs forward/backward/optimizer step,
 saves with safe serialization, automatically reloads through
 `AutoModelForCausalLM`, retains weight tying and matches logits exactly.
 
+Implementation evidence: the compiler-free Python 3.13 wheel lane executes
+`python -I -m tritium.torch.hf_lifecycle` without a checkout. Its portable
+`tritium.hf-lifecycle.v1` receipt binds the exact wheel/source/release/run and
+complete safe-serialization checkpoint tree, then replays AutoModel reload,
+exact logits, recipe, coverage and tying. Coverage inspection re-derives aliases
+after framework-native `tie_weights`, preventing stale pre-load topology from
+overcounting a tied parameter. Candidate-revision CI execution remains required
+for release admission.
+
 ## Step 2 — Trainer/Accelerate and distributed state
 
 - [x] Verify Trainer and direct Accelerate steps use ordinary optimizers.

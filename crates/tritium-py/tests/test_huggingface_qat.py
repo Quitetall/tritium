@@ -186,7 +186,7 @@ def test_hf_qat_save_reload_is_automatic_tied_and_exact(tmp_path: Path):
     assert isinstance(reloaded.model.embed_tokens, TernaryEmbedding)
     assert isinstance(reloaded.lm_head, TernaryLinear)
     assert reloaded.model.embed_tokens.weight is reloaded.lm_head.weight
-    assert inspect(reloaded).converted_parameters > 0
+    assert inspect(reloaded) == inspect(model)
     assert torch.equal(reloaded(input_ids=tokens).logits, expected)
 
 

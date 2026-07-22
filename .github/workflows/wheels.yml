@@ -40,6 +40,7 @@ on:
       - "examples/colab/tritium-smollm2-v11.ipynb"
       - "examples/python/installed_qat.py"
       - "scripts/tests/test_installed_qat_tutorial.py"
+      - "scripts/tests/test_hf_lifecycle.py"
       - ".github/workflows/wheels.yml"
   workflow_dispatch:
     inputs:
@@ -306,7 +307,7 @@ jobs:
           python -m pip install --disable-pip-version-check --only-binary=:all: \
             torch==2.11.0 --index-url https://download.pytorch.org/whl/cpu
           python -m pip install --disable-pip-version-check --only-binary=:all: \
-            safetensors==0.8.0
+            safetensors==0.8.0 transformers==5.5.3
           python -m pip install --isolated --disable-pip-version-check \
             --no-index --no-deps --only-binary=:all: dist/*.whl
       - name: execute and validate source-free installed tutorial
@@ -326,10 +327,27 @@ jobs:
             --wheel-artifact dist/*.whl \
             --source-revision ${{ github.sha }} \
             --release 1.1.0-rc.0
+      - name: execute and validate installed Hugging Face lifecycle
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -I -m tritium.torch.hf_lifecycle \
+            --output-dir evidence/hf-lifecycle-clean \
+            --wheel-artifact dist/*.whl \
+            --source-revision ${{ github.sha }} \
+            --release 1.1.0-rc.0 \
+            --run-id github-${{ github.run_id }}-${{ github.run_attempt }}-hf-lifecycle-clean
+          python -I -m tritium.torch.hf_lifecycle \
+            --check-receipt evidence/hf-lifecycle-clean/receipt.json \
+            --wheel-artifact dist/*.whl \
+            --source-revision ${{ github.sha }} \
+            --release 1.1.0-rc.0
       - uses: actions/upload-artifact@v4
         with:
           name: wheel-tutorial-source-free-python-3.13
-          path: evidence/tutorial-clean/**
+          path: |
+            evidence/tutorial-clean/**
+            evidence/hf-lifecycle-clean/**
           if-no-files-found: error
 
   cuda-wheel-smoke:

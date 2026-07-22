@@ -41,6 +41,7 @@ TUTORIAL_RECEIPT = runpy.run_path(
     / "crates/tritium-py/python/tritium/torch/tutorial_receipt.py"
 )
 validate_tutorial_receipt = TUTORIAL_RECEIPT["validate_receipt"]
+validate_hf_lifecycle_receipt = TUTORIAL_RECEIPT["validate_hf_receipt"]
 
 SCHEMA = "tritium.release-evidence-registry.v1"
 REPORT_SCHEMA = "tritium.release-gate-report.v1"
@@ -55,6 +56,7 @@ KNOWN_KINDS = frozenset(
         "oci-security-cpu", "oci-security-cuda",
         "serving-deployment-cpu", "serving-deployment-cuda",
         "installed-qat-tutorial",
+        "frontend-lifecycle",
     }
 )
 HEX = frozenset("0123456789abcdef")
@@ -297,6 +299,13 @@ def evaluate(
                     expected_source_revision=revision,
                     expected_release=release,
                 )
+            elif kind == "frontend-lifecycle":
+                receipt = validate_hf_lifecycle_receipt(
+                    receipt_path,
+                    expected_wheel=artifact_path,
+                    expected_source_revision=revision,
+                    expected_release=release,
+                )
             elif kind in {"oci-runtime-cpu", "oci-runtime-cuda"}:
                 receipt = load_oci_runtime_receipt(
                     receipt_path, revision=revision, release=release,
@@ -429,7 +438,7 @@ def evaluate(
             )
             if actual != declared or actual != qualified:
                 raise EvidenceError("npm receipt does not bind candidate archive bytes")
-        elif kind == "installed-qat-tutorial":
+        elif kind in {"installed-qat-tutorial", "frontend-lifecycle"}:
             identity = artifact.get("identity", {})
             actual = (
                 artifact_path.name, _sha256(artifact_path), artifact_path.stat().st_size
@@ -442,7 +451,7 @@ def evaluate(
                 receipt["wheel_bytes"],
             )
             if actual != declared or actual != qualified:
-                raise EvidenceError("tutorial receipt does not bind candidate wheel bytes")
+                raise EvidenceError(f"{kind} receipt does not bind candidate wheel bytes")
         elif kind.startswith("oci-"):
             identity = artifact.get("identity", {})
             actual = (artifact_path.name, _sha256(artifact_path), artifact_path.stat().st_size)

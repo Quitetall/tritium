@@ -195,6 +195,12 @@ byte. `scripts/release-evidence-status.py` admits it as
 `installed-qat-tutorial` evidence only after independently rechecking those
 bindings against the candidate manifest. This advances, but does not green, the
 PyTorch/Hugging Face gate.
+The same no-checkout lane now runs a native Hugging Face tied-Llama QAT
+lifecycle. `tritium.hf-lifecycle.v1` binds safe `save_pretrained`, AutoModel
+reload, exact logits, recipe, alias-aware coverage and every checkpoint byte to
+the exact candidate wheel/source/release/run. The registry admits it as
+`frontend-lifecycle`; it does not substitute for multi-device distributed or
+whole-model export evidence.
 
 Replace the current pre-alpha/v1.0-era narrative with tested v1.1 documentation:
 
