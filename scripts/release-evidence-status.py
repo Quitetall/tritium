@@ -53,6 +53,12 @@ BROWSER_RECEIPT = runpy.run_path(
 )
 validate_browser_receipt = BROWSER_RECEIPT["validate"]
 BrowserReceiptError = BROWSER_RECEIPT["BrowserReceiptError"]
+REPRODUCTION_RECEIPT = runpy.run_path(
+    Path(__file__).with_name("verify-release-reproduction.py")
+)
+validate_second_machine = REPRODUCTION_RECEIPT["validate_second_machine"]
+validate_independent_review = REPRODUCTION_RECEIPT["validate_independent_review"]
+ReproductionError = REPRODUCTION_RECEIPT["ReproductionError"]
 
 SCHEMA = "tritium.release-evidence-registry.v1"
 REPORT_SCHEMA = "tritium.release-gate-report.v1"
@@ -71,6 +77,8 @@ KNOWN_KINDS = frozenset(
         "distributed-training",
         "export-reload",
         "browser-conformance",
+        "second-machine",
+        "independent-review",
     }
 )
 HEX = frozenset("0123456789abcdef")
@@ -335,6 +343,14 @@ def evaluate(
                 receipt = validate_browser_receipt(
                     receipt_path, revision, release, artifact_path
                 )
+            elif kind == "second-machine":
+                receipt = validate_second_machine(
+                    receipt_path, revision, release, candidate, artifact_path
+                )
+            elif kind == "independent-review":
+                receipt = validate_independent_review(
+                    receipt_path, revision, release, candidate, artifact_path
+                )
             elif kind in {"oci-runtime-cpu", "oci-runtime-cuda"}:
                 receipt = load_oci_runtime_receipt(
                     receipt_path, revision=revision, release=release,
@@ -405,6 +421,7 @@ def evaluate(
             DeploymentError,
             DistributedReceiptError,
             BrowserReceiptError,
+            ReproductionError,
             ValueError,
         ) as error:
             raise EvidenceError(f"{label} failed {kind} validation: {error}") from error
@@ -485,6 +502,23 @@ def evaluate(
             )
             if actual != declared or actual != qualified:
                 raise EvidenceError(f"{kind} receipt does not bind candidate wheel bytes")
+        elif kind in {"second-machine", "independent-review"}:
+            identity = artifact.get("identity", {})
+            actual = (
+                artifact.get("id"), artifact.get("kind"), artifact_path.name,
+                artifact_path.stat().st_size, _sha256(artifact_path),
+            )
+            anchor = receipt["anchor_artifact"]
+            qualified = (
+                anchor["id"], anchor["kind"], anchor["name"],
+                anchor["bytes"], anchor["sha256"],
+            )
+            declared = (
+                artifact.get("id"), artifact.get("kind"), artifact_path.name,
+                identity.get("bytes"), identity.get("sha256"),
+            )
+            if actual != declared or actual != qualified:
+                raise EvidenceError(f"{kind} receipt does not bind candidate anchor bytes")
         elif kind.startswith("oci-"):
             identity = artifact.get("identity", {})
             actual = (artifact_path.name, _sha256(artifact_path), artifact_path.stat().st_size)
@@ -528,6 +562,26 @@ def evaluate(
         paths.add(logical_path)
         portable_paths.add(portable_path)
     _check_ancestry(entries)
+    review_ids = [receipt_id for receipt_id, kind in kinds.items() if kind == "independent-review"]
+    second_ids = [receipt_id for receipt_id, kind in kinds.items() if kind == "second-machine"]
+    if review_ids:
+        review_id = review_ids[0]
+        required_reviewed = set(entries) - {review_id}
+        reviewed = set(validated_receipts[review_id]["reviewed_receipt_ids"])
+        if reviewed != required_reviewed or set(entries[review_id]["parents"]) != required_reviewed:
+            raise EvidenceError(
+                "independent-review must review and parent every other registry receipt"
+            )
+    if review_ids and second_ids:
+        review_id = review_ids[0]
+        second_id = second_ids[0]
+        operator = validated_receipts[second_id]["operator"]
+        reviewer = validated_receipts[review_id]["reviewer"]
+        if (
+            operator["id"] == reviewer["id"]
+            or operator["organization"] == reviewer["organization"]
+        ):
+            raise EvidenceError("reviewer must be independent from reproduction operator")
     for receipt_id, kind in kinds.items():
         if not kind.startswith("serving-deployment-"):
             continue

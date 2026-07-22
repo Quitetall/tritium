@@ -308,6 +308,22 @@ Gate: all required reproduced values meet frozen tolerances and generated tables
 match the candidate claims. Any divergence is investigated and recorded; the
 threshold is not changed after seeing it.
 
+Second-machine admission is frozen as
+`tritium.second-machine-reproduction.v1`. It binds the complete candidate
+artifact inventory byte-for-byte, a distinct physical machine identity,
+independent operator, fixed command inventory, repository/compiler absence,
+tutorial/BitNet/Qwen/backend/ONNX/serving checks, regenerated claim tables and
+zero divergences. Browser may be explicitly `not-applicable`; no other required
+check may be skipped.
+
+Independent sign-off uses `tritium.independent-release-review.v1`. It binds the
+same candidate and exact anchor wheel, covers code/security/evidence, requires
+every verified finding fixed and zero open findings, and lists every reviewed
+receipt ID. Registry admission requires the review receipt to parent and review
+every other registry receipt. Reviewer ID and organization must differ from the
+second-machine operator. Validator presence remains structural: no independent
+second-machine run or passing independent review exists yet.
+
 ## Slice 8 — local release-candidate sign-off
 
 From a clean revision with no untracked release input:
@@ -369,8 +385,9 @@ empty or partial evidence. Npm admission landed in `cb34670` and `57a23ba`, but
 the aggregate package gate still requires its clean-install, compatibility-matrix
 and crate-archive receipts to coexist in the exact candidate registry. Remaining
 receipt-kind validators and generated-claim drift checks must land before every
-model-zoo, package, browser, serving, deployment, signing and second-machine
-receipt can produce `LOCAL_RC_READY`.
+model-zoo, package, serving, deployment and signing receipt can produce
+`LOCAL_RC_READY`. Browser, second-machine and independent-review kinds now fail
+closed through dedicated validators, but lack empirical candidate receipts.
 
 Exact-image serving admission now distinguishes CPU runtime, CUDA runtime and
 CPU/CUDA security scans, plus cluster deployment. Each runtime receipt must bind the candidate OCI archive,

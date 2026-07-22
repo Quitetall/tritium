@@ -465,6 +465,11 @@ under `python -I`; worker and interpreter substitution are not release seams.
       are public and generated claims match evidence receipts.
 - [ ] Independent fresh-environment reproduction passes on a second machine;
       release revision is clean, reviewed, signed and tagged `v1.1.0`.
+      `tritium.second-machine-reproduction.v1` must bind the complete candidate
+      inventory, distinct machine/operator, fixed reproduction commands,
+      regenerated tables and zero divergences. Final
+      `tritium.independent-release-review.v1` must cover every other evidence
+      receipt with code/security/evidence review and zero open findings.
 
 ## Binding post-v1.1 work
 

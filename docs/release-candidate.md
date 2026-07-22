@@ -141,6 +141,14 @@ python scripts/local-rc-signoff.py verify \
   --allowed-signers /secure/tritium-release-allowed-signers
 ```
 
+Before sealing, registry must contain admitted
+`tritium.second-machine-reproduction.v1` and
+`tritium.independent-release-review.v1` receipts. Independent-review entry must
+parent every other registry receipt and list same IDs in
+`reviewed_receipt_ids`; reviewer and reproduction operator identities and
+organizations must differ. Copied primary-host results or reviewer transport
+failure remain blockers, never passing evidence.
+
 The statement binds candidate-manifest, registry and report SHA-256 identities,
 release revision and signer principal. Any evidence change invalidates it. Key
 generation, signer authorization and the local tag remain explicit maintainer

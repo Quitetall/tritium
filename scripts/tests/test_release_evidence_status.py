@@ -279,6 +279,74 @@ def entry(
 
 
 class ReleaseEvidenceStatusTests(unittest.TestCase):
+    def test_reproduction_signoff_requires_complete_review_ancestry(self):
+        with tempfile.TemporaryDirectory() as raw:
+            candidate, document, artifact, evidence_root = release_fixture(Path(raw))
+            document["artifacts"][0]["identity"] = {
+                "sha256": sha256(artifact), "bytes": artifact.stat().st_size,
+            }
+            candidate.write_bytes(canonical(document) + b"\n")
+            second_path = evidence_root / "second.json"
+            review_path = evidence_root / "review.json"
+            second_path.write_bytes(b"{}\n")
+            review_path.write_bytes(b"{}\n")
+            anchor = {
+                "id": "cuda-wheel", "kind": "python-wheel", "name": artifact.name,
+                "bytes": artifact.stat().st_size, "sha256": sha256(artifact),
+            }
+            second = {
+                "receipt_id": "sha256:" + "6" * 64,
+                "run_id": "second-machine-run-1", "anchor_artifact": anchor,
+                "operator": {"id": "operator-2", "organization": "repro-lab"},
+            }
+            review = {
+                "receipt_id": "sha256:" + "7" * 64,
+                "run_id": "independent-review-run-1", "anchor_artifact": anchor,
+                "reviewed_receipt_ids": [second["receipt_id"]],
+                "reviewer": {"id": "reviewer-3", "organization": "audit-lab"},
+            }
+            registry_path = evidence_root / "registry.json"
+            registry(
+                registry_path, candidate,
+                [
+                    {
+                        "id": second["receipt_id"], "kind": "second-machine",
+                        "path": second_path.name, "sha256": sha256(second_path),
+                        "artifact_id": "cuda-wheel", "parents": [],
+                    },
+                    {
+                        "id": review["receipt_id"], "kind": "independent-review",
+                        "path": review_path.name, "sha256": sha256(review_path),
+                        "artifact_id": "cuda-wheel", "parents": [second["receipt_id"]],
+                    },
+                ],
+            )
+            with mock.patch.dict(
+                evaluate.__globals__,
+                {
+                    "validate_second_machine": mock.Mock(return_value=second),
+                    "validate_independent_review": mock.Mock(return_value=review),
+                },
+            ):
+                report = evaluate(registry_path, candidate, document)
+            row = next(
+                item for item in report["rows"] if item["id"] == "reproduction-signoff"
+            )
+            self.assertEqual(
+                row["satisfied_kinds"], ["independent-review", "second-machine"]
+            )
+
+            review["reviewed_receipt_ids"] = []
+            with mock.patch.dict(
+                evaluate.__globals__,
+                {
+                    "validate_second_machine": mock.Mock(return_value=second),
+                    "validate_independent_review": mock.Mock(return_value=review),
+                },
+            ):
+                with self.assertRaisesRegex(EvidenceError, "every other"):
+                    evaluate(registry_path, candidate, document)
+
     def test_browser_receipt_requires_strict_npm_dispatch(self):
         with tempfile.TemporaryDirectory() as raw:
             candidate, document, artifact, evidence_root = release_fixture(Path(raw))
