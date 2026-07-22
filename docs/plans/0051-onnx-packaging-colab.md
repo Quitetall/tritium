@@ -239,7 +239,12 @@ language/MTP external data, executed `com.tritium` opsets 1/2, zero dense weight
 initializers/shadows, prompt/cache/generation/MTP parity and a content-bound
 execution trace. Graph/weight corruption, path traversal, unknown operators and
 trainable export/import must all fail. Validator presence is structural; no
-candidate Qwen3.6 whole-model receipt exists.
+candidate Qwen3.6 whole-model receipt exists. The qualification producer now
+derives every summary from a retained structured execution trace: exact
+candidate artifacts/environment/model identity, physical ORT session, calls to
+all four required SALT/cache/DeltaNet custom operators, authenticated external
+data, two prompt/cache/generation/MTP cases each, and the six negative fault
+classes. Executing that producer against the final 27B candidate remains open.
 
 Add `tritium.torch.export_onnx` and `tritium.torch.load_onnx` over the stable
 plan-0047 results:
@@ -422,6 +427,8 @@ plan.
 cargo test -p tritium-onnx --features onnx
 cargo clippy -p tritium-onnx --features onnx --all-targets -- -D warnings
 PYTHONPATH=crates/tritium-py/python pytest -q crates/tritium-py/tests
+python -m unittest scripts.tests.test_qualify_onnx_inference
+python -m unittest scripts.tests.test_verify_onnx_inference_receipt
 npm --prefix packages/tritium-web ci
 npm --prefix packages/tritium-web run check
 ./scripts/check-semver.sh
