@@ -77,10 +77,16 @@ def inspect_archive(path: Path, name: str, version: str, revision: str) -> dict[
                     raise CrateSbomError(f"crate {relative} exceeds metadata bounds")
                 return extracted.read()
 
-            manifest = tomllib.loads(read_member("Cargo.toml.orig").decode("utf-8"))
-            package = manifest.get("package")
+            original = tomllib.loads(read_member("Cargo.toml.orig").decode("utf-8"))
+            original_package = original.get("package")
+            if not isinstance(original_package, dict) or original_package.get("name") != name:
+                raise CrateSbomError("Cargo.toml.orig name does not match archive")
+            # Cargo.toml.orig can inherit `version.workspace = true`; Cargo's
+            # normalized manifest resolves that value and is the registry identity.
+            normalized = tomllib.loads(read_member("Cargo.toml").decode("utf-8"))
+            package = normalized.get("package")
             if not isinstance(package, dict) or package.get("name") != name or package.get("version") != version:
-                raise CrateSbomError("Cargo.toml.orig identity does not match archive")
+                raise CrateSbomError("normalized Cargo.toml identity does not match archive")
             vcs = json.loads(read_member(".cargo_vcs_info.json"))
             git = vcs.get("git") if isinstance(vcs, dict) else None
             if (

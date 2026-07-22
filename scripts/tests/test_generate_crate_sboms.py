@@ -15,13 +15,25 @@ inspect_archive = MODULE["inspect_archive"]
 bind_sbom = MODULE["bind_sbom"]
 
 
-def crate_archive(path: Path, *, revision: str, dirty: bool = False, link: bool = False):
+def crate_archive(
+    path: Path,
+    *,
+    revision: str,
+    dirty: bool = False,
+    link: bool = False,
+    inherited_version: bool = False,
+):
     prefix = "demo-1.2.3"
     vcs = {"git": {"sha1": revision}, "path_in_vcs": "crates/demo"}
     if dirty:
         vcs["dirty"] = True
     files = {
-        "Cargo.toml.orig": b'[package]\nname = "demo"\nversion = "1.2.3"\n',
+        "Cargo.toml.orig": (
+            b'[package]\nname = "demo"\nversion.workspace = true\n'
+            if inherited_version
+            else b'[package]\nname = "demo"\nversion = "1.2.3"\n'
+        ),
+        "Cargo.toml": b'[package]\nname = "demo"\nversion = "1.2.3"\n',
         ".cargo_vcs_info.json": json.dumps(vcs).encode(),
         "src/lib.rs": b"pub fn demo() {}\n",
     }
@@ -56,6 +68,13 @@ class GenerateCrateSbomsTests(unittest.TestCase):
             crate_archive(linked, revision=revision, link=True)
             with self.assertRaisesRegex(CrateSbomError, "not a regular file"):
                 inspect_archive(linked, "demo", "1.2.3", revision)
+
+            inherited = root / "inherited" / "demo-1.2.3.crate"
+            inherited.parent.mkdir()
+            crate_archive(inherited, revision=revision, inherited_version=True)
+            self.assertGreater(
+                inspect_archive(inherited, "demo", "1.2.3", revision)["bytes"], 0
+            )
 
     def test_sbom_rewrites_all_local_paths_and_binds_archive(self):
         old = "path+file:///home/runner/Tritium/crates/demo#1.2.3"
