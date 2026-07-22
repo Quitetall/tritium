@@ -136,38 +136,110 @@ class RefinementConfig:
 
     kind: str
     structure: str
-    schema_version: int = 1
+    max_steps: int = 100
+    learning_rate: float = 1e-3
+    temperature: float = 1.0
+    pv_iterations: int = 0
+    schema_version: int = 2
 
     def __post_init__(self) -> None:
-        if self.schema_version != 1:
+        if self.schema_version != 2:
             raise ValueError("unsupported RefinementConfig schema_version")
         if self.kind not in {"scale-only", "hard-pv"}:
             raise ValueError("refinement kind must be 'scale-only' or 'hard-pv'")
         if self.structure not in {"dense", "s34"}:
             raise ValueError("refinement structure must be 'dense' or 's34'")
+        if type(self.max_steps) is not int or self.max_steps <= 0:
+            raise ValueError("refinement max_steps must be a positive integer")
+        if not math.isfinite(self.learning_rate) or self.learning_rate <= 0:
+            raise ValueError("refinement learning_rate must be finite and positive")
+        if not math.isfinite(self.temperature) or self.temperature <= 0:
+            raise ValueError("refinement temperature must be finite and positive")
+        if type(self.pv_iterations) is not int or self.pv_iterations < 0:
+            raise ValueError("refinement pv_iterations must be a nonnegative integer")
+        if self.kind == "scale-only" and self.structure != "dense":
+            raise ValueError("scale-only refinement has fixed dense structure")
+        if self.kind == "scale-only" and self.pv_iterations != 0:
+            raise ValueError("scale-only refinement does not accept pv_iterations")
+        if self.kind == "hard-pv" and self.pv_iterations == 0:
+            raise ValueError("hard-pv refinement requires pv_iterations")
 
     @classmethod
-    def scale_only(cls) -> "RefinementConfig":
-        return cls(kind="scale-only", structure="dense")
+    def scale_only(
+        cls,
+        *,
+        max_steps: int = 100,
+        learning_rate: float = 1e-3,
+        temperature: float = 1.0,
+    ) -> "RefinementConfig":
+        return cls(
+            kind="scale-only",
+            structure="dense",
+            max_steps=max_steps,
+            learning_rate=learning_rate,
+            temperature=temperature,
+            pv_iterations=0,
+        )
 
     @classmethod
-    def hard_pv(cls, *, structure: str = "dense") -> "RefinementConfig":
-        return cls(kind="hard-pv", structure=structure)
+    def hard_pv(
+        cls,
+        *,
+        structure: str = "dense",
+        max_steps: int = 100,
+        learning_rate: float = 1e-3,
+        temperature: float = 1.0,
+        pv_iterations: int = 4,
+    ) -> "RefinementConfig":
+        return cls(
+            kind="hard-pv",
+            structure=structure,
+            max_steps=max_steps,
+            learning_rate=learning_rate,
+            temperature=temperature,
+            pv_iterations=pv_iterations,
+        )
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "schema_version": self.schema_version,
             "kind": self.kind,
             "structure": self.structure,
+            "max_steps": self.max_steps,
+            "learning_rate": self.learning_rate,
+            "temperature": self.temperature,
+            "pv_iterations": self.pv_iterations,
         }
 
     @classmethod
     def from_dict(cls, value: Dict[str, Any]) -> "RefinementConfig":
-        expected = {"schema_version", "kind", "structure"}
+        if set(value) == {"schema_version", "kind", "structure"}:
+            if value["schema_version"] != 1:
+                raise ValueError("legacy RefinementConfig must use schema version 1")
+            kind = str(value["kind"])
+            structure = str(value["structure"])
+            if kind == "scale-only" and structure == "dense":
+                return cls.scale_only()
+            if kind == "hard-pv":
+                return cls.hard_pv(structure=structure)
+            raise ValueError("legacy RefinementConfig kind or structure is invalid")
+        expected = {
+            "schema_version",
+            "kind",
+            "structure",
+            "max_steps",
+            "learning_rate",
+            "temperature",
+            "pv_iterations",
+        }
         if set(value) != expected:
-            raise ValueError("RefinementConfig fields do not match schema version 1")
+            raise ValueError("RefinementConfig fields do not match schema version 2")
         return cls(
             schema_version=int(value["schema_version"]),
             kind=str(value["kind"]),
             structure=str(value["structure"]),
+            max_steps=int(value["max_steps"]),
+            learning_rate=float(value["learning_rate"]),
+            temperature=float(value["temperature"]),
+            pv_iterations=int(value["pv_iterations"]),
         )

@@ -1,327 +1,1034 @@
-"""Bounded hard-discrete refinement primitives for additive ternary weights."""
+"""Typed, parent-bound post-training refinement workflows."""
 
 from __future__ import annotations
 
-import itertools
+import copy
+import hashlib
+import json
 import math
+import os
+import shutil
+import tempfile
 from dataclasses import dataclass
-from typing import Sequence, Tuple
+from itertools import cycle
+from pathlib import Path
+from typing import Any, Dict, Iterable, Mapping, Optional, Tuple, Union
 
 import torch
+import torch.nn.functional as F
+from torch import nn
 
+from .. import _tritium
 from .config import RefinementConfig
+from .errors import TritiumError
+from .module_artifacts import (
+    ModuleQuantizationResult,
+    WeightCheckpointWriter,
+    load_module_conversion,
+    module_recipe_id,
+    seal_module_conversion,
+)
 from .projection import TernaryPlane
+from .ptq import _hash_value, _invoke_model, _source_model_digest
+from .refinement_core import RefinedWeight, refine_weight_diagonal
+
+Pathish = Union[str, os.PathLike[str]]
+_MANIFEST = "refinement.json"
+_CONVERSION_DIRECTORY = "conversion"
+_TOP_FIELDS = {
+    "schema_version",
+    "artifact_kind",
+    "artifact_id",
+    "parent_artifact_id",
+    "ancestry",
+    "source_model_digest",
+    "teacher_digest",
+    "training_digest",
+    "training_batches",
+    "validation_digest",
+    "validation_batches",
+    "config",
+    "child_conversion_artifact_id",
+    "validation_loss_before",
+    "validation_loss_after",
+    "accepted_steps",
+}
 
 
 @dataclass(frozen=True)
-class RefinedWeight:
-    """One hard child weight plus exact parent/child reconstruction losses."""
+class RefinementResult:
+    """One immutable refinement child with complete artifact ancestry."""
 
-    planes: Tuple[TernaryPlane, ...]
-    parent_weighted_mse: float
-    refined_weighted_mse: float
-    iterations: int
-    kind: str
-    structure: str
+    artifact_dir: Path
+    artifact_id: str
+    parent_artifact_id: str
+    ancestry: Tuple[str, ...]
+    source_model_digest: str
+    teacher_digest: str
+    training_digest: str
+    training_batches: Tuple[str, ...]
+    validation_digest: str
+    validation_batches: Tuple[str, ...]
+    config: RefinementConfig
+    conversion: ModuleQuantizationResult
+    validation_loss_before: float
+    validation_loss_after: float
+    accepted_steps: int
+    schema_version: int = 1
+
+    @property
+    def mode(self) -> str:
+        return self.config.kind
+
+    @property
+    def weight_names(self) -> Tuple[str, ...]:
+        return self.conversion.weight_names
+
+    def weight(self, path: str):
+        return self.conversion.weight(path)
+
+    def load_model(self, model: nn.Module, *, inplace: bool = False) -> nn.Module:
+        """Bind the hard child to an exact dense source shell."""
+
+        from .ptq import load_quantized_module
+
+        return load_quantized_module(model, self.conversion, inplace=inplace)
+
+    def export(self, output_dir: Pathish) -> "RefinementResult":
+        return export_refinement(self, output_dir)
 
 
-def _validate(
-    master: torch.Tensor,
-    planes: Sequence[TernaryPlane],
-    metric: torch.Tensor,
-    config: RefinementConfig,
-    iterations: int,
-    max_working_bytes: int,
-) -> None:
-    if (
-        not isinstance(master, torch.Tensor)
-        or master.ndim != 2
-        or not master.dtype.is_floating_point
-        or not bool(torch.isfinite(master).all())
-    ):
-        raise ValueError("refinement master must be one finite floating matrix")
-    if not 1 <= len(planes) <= 3:
-        raise ValueError("refinement requires one to three parent planes")
-    if (
-        not isinstance(metric, torch.Tensor)
-        or metric.ndim != 1
-        or metric.numel() != master.shape[1]
-        or not metric.dtype.is_floating_point
-        or not bool(torch.isfinite(metric).all())
-        or bool((metric < 0).any())
-        or not bool((metric > 0).any())
-    ):
-        raise ValueError("refinement metric must be finite nonnegative input curvature")
-    for plane in planes:
-        if (
-            plane.trits.dtype != torch.int8
-            or tuple(plane.trits.shape) != tuple(master.shape)
-            or plane.trits.device != master.device
-            or plane.scales.dtype != torch.float16
-            or tuple(plane.scales.shape) != (master.shape[0], 1)
-            or plane.scales.device != master.device
-            or plane.group_size != master.shape[1]
-            or plane.structure not in {"dense", "s34"}
-            or not bool(torch.all((plane.trits >= -1) & (plane.trits <= 1)))
-            or not bool(torch.isfinite(plane.scales).all())
-            or bool((plane.scales < 0).any())
-        ):
-            raise ValueError("refinement parent plane is not deployable row-scale SALT")
-        if plane.structure == "s34" and (
-            master.shape[1] % 4
-            or not bool(
-                torch.all(
-                    torch.count_nonzero(
-                        plane.trits.reshape(master.shape[0], -1, 4) == 0,
-                        dim=2,
-                    )
-                    == 1
+@dataclass(frozen=True)
+class _Record:
+    path: str
+    weight_aliases: Tuple[str, ...]
+    outputs: int
+    features: int
+
+
+class _ScaleOnlyWeight(nn.Module):
+    def __init__(self, planes: Tuple[TernaryPlane, ...]) -> None:
+        super().__init__()
+        self.plane_count = len(planes)
+        self.structures = tuple(plane.structure for plane in planes)
+        for index, plane in enumerate(planes):
+            self.register_buffer(f"trits_{index}", plane.trits.detach().clone())
+            self.register_parameter(
+                f"scale_{index}",
+                nn.Parameter(plane.scales.detach().to(torch.float32).clone()),
+            )
+
+    def decoded(self, dtype: torch.dtype) -> torch.Tensor:
+        decoded = None
+        for index in range(self.plane_count):
+            trits = getattr(self, f"trits_{index}").to(dtype=dtype)
+            scale = getattr(self, f"scale_{index}").clamp_min(0)
+            # The forward is exactly the eventual f16 artifact while gradients
+            # flow through the full-precision scale parameter.
+            stored = scale.to(torch.float16).to(scale.dtype)
+            quantized = scale + (stored - scale).detach()
+            plane = trits * quantized.to(dtype=dtype)
+            decoded = plane if decoded is None else decoded + plane
+        assert decoded is not None
+        return decoded
+
+    def hard_planes(self) -> Tuple[TernaryPlane, ...]:
+        planes = []
+        for index in range(self.plane_count):
+            trits = getattr(self, f"trits_{index}").detach().cpu().to(torch.int8)
+            scales = (
+                getattr(self, f"scale_{index}")
+                .detach()
+                .clamp_min(0)
+                .cpu()
+                .to(torch.float16)
+            )
+            planes.append(
+                TernaryPlane(
+                    trits,
+                    scales,
+                    trits.shape[1],
+                    structure=self.structures[index],
                 )
             )
-        ):
-            raise ValueError("refinement parent S34 plane violates one-zero groups")
-    if not isinstance(config, RefinementConfig):
-        raise TypeError("config must be RefinementConfig")
-    if type(iterations) is not int or iterations <= 0:
-        raise ValueError("iterations must be a positive integer")
-    if type(max_working_bytes) is not int or max_working_bytes < 1024:
-        raise ValueError("max_working_bytes must be at least 1024")
-    if config.structure == "s34" and master.shape[1] % 4:
-        raise ValueError("S34 refinement requires input width divisible by four")
-    if config.kind == "scale-only" and any(
-        plane.structure != config.structure for plane in planes
+        return tuple(planes)
+
+
+class _ScaleOnlyLinear(nn.Module):
+    def __init__(self, weight: _ScaleOnlyWeight, bias: torch.Tensor | None) -> None:
+        super().__init__()
+        object.__setattr__(self, "weight_store", weight)
+        self.register_buffer("bias", None if bias is None else bias.detach().clone())
+
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        return F.linear(value, self.weight_store.decoded(value.dtype), self.bias)
+
+
+class _ScaleOnlyEmbedding(nn.Module):
+    def __init__(self, weight: _ScaleOnlyWeight, source: nn.Embedding) -> None:
+        super().__init__()
+        object.__setattr__(self, "weight_store", weight)
+        self.padding_idx = source.padding_idx
+        self.max_norm = source.max_norm
+        self.norm_type = source.norm_type
+        self.scale_grad_by_freq = source.scale_grad_by_freq
+        self.sparse = source.sparse
+        self.weight_dtype = source.weight.dtype
+
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        return F.embedding(
+            value,
+            self.weight_store.decoded(self.weight_dtype),
+            self.padding_idx,
+            self.max_norm,
+            self.norm_type,
+            self.scale_grad_by_freq,
+            self.sparse,
+        )
+
+
+def _canonical(value: Any) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def _digest(value: Any) -> str:
+    return "sha256:" + hashlib.sha256(_canonical(value)).hexdigest()
+
+
+def _validate_digest(value: Any, field: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 71
+        or not value.startswith("sha256:")
     ):
-        raise ValueError("scale-only refinement must preserve parent structure")
-    if metric.device != master.device:
-        raise ValueError("refinement metric must share the master device")
-
-
-def _decoded(
-    trits: Sequence[torch.Tensor],
-    scales: Sequence[torch.Tensor],
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    value = torch.zeros_like(trits[0], dtype=dtype)
-    for codes, row_scales in zip(trits, scales):
-        value.add_(codes.to(dtype) * row_scales.to(dtype))
+        raise ValueError(f"invalid {field}")
+    try:
+        bytes.fromhex(value[7:])
+    except ValueError as error:
+        raise ValueError(f"invalid {field}") from error
     return value
 
 
-def _loss_rows(
-    master: torch.Tensor,
-    trits: Sequence[torch.Tensor],
-    scales: Sequence[torch.Tensor],
-    metric: torch.Tensor,
-) -> torch.Tensor:
-    dtype = torch.float64
-    residual = master.to(dtype) - _decoded(trits, scales, dtype)
-    return (residual.square() * metric.to(dtype)).sum(dim=1)
+def _pairs_without_duplicates(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate refinement manifest field {key!r}")
+        value[key] = item
+    return value
 
 
-def _solve_scales(
-    master: torch.Tensor,
-    trits: Sequence[torch.Tensor],
-    metric: torch.Tensor,
-) -> Tuple[torch.Tensor, ...]:
-    """Exact small-K nonnegative least squares, then deployment f16 rounding."""
-
-    dtype = torch.float64
-    codes = torch.stack(tuple(value.to(dtype) for value in trits), dim=1)
-    curvature = metric.to(dtype)
-    target = master.to(dtype)
-    gram = torch.einsum("rpi,i,rqi->rpq", codes, curvature, codes)
-    rhs = torch.einsum("rpi,i,ri->rp", codes, curvature, target)
-    rows, plane_count = rhs.shape
-    best = torch.zeros((rows, plane_count), dtype=dtype, device=master.device)
-    best_loss = (target.square() * curvature).sum(dim=1)
-    for mask in range(1, 1 << plane_count):
-        active = [index for index in range(plane_count) if mask & (1 << index)]
-        sub_gram = gram[:, active][:, :, active]
-        sub_rhs = rhs[:, active]
-        solution = torch.linalg.pinv(sub_gram) @ sub_rhs.unsqueeze(-1)
-        solution = solution.squeeze(-1)
-        feasible = torch.isfinite(solution).all(dim=1) & (solution >= 0).all(dim=1)
-        candidate = torch.zeros_like(best)
-        candidate[:, active] = solution
-        decoded = torch.einsum("rpi,rp->ri", codes, candidate)
-        loss = ((target - decoded).square() * curvature).sum(dim=1)
-        accept = feasible & (loss < best_loss)
-        best[accept] = candidate[accept]
-        best_loss[accept] = loss[accept]
-    stored = best.to(torch.float16)
-    return tuple(stored[:, index : index + 1] for index in range(plane_count))
+def _materialize(
+    data: Iterable[Any], role: str
+) -> Tuple[Tuple[Any, ...], str, Tuple[str, ...]]:
+    try:
+        batches = tuple(data)
+    except TypeError as error:
+        raise TypeError(f"{role} data must be iterable") from error
+    if not batches:
+        raise ValueError(f"{role} data must contain at least one batch")
+    members = []
+    for batch in batches:
+        digest = hashlib.sha256()
+        _hash_value(digest, "batch", batch)
+        members.append("sha256:" + digest.hexdigest())
+    identity = _digest({"schema_version": 1, "role": role, "batches": members})
+    return batches, identity, tuple(members)
 
 
-def _dense_sweep(
-    master: torch.Tensor,
-    trits: Sequence[torch.Tensor],
-    scales: Sequence[torch.Tensor],
-) -> Tuple[torch.Tensor, ...]:
-    dtype = torch.float64
-    result = [value.clone() for value in trits]
-    for plane_index, scale in enumerate(scales):
-        other = _decoded(
-            tuple(
-                value
-                for index, value in enumerate(result)
-                if index != plane_index
-            ),
-            tuple(
-                value
-                for index, value in enumerate(scales)
-                if index != plane_index
-            ),
-            dtype,
-        ) if len(result) > 1 else torch.zeros_like(master, dtype=dtype)
-        row_scale = scale.to(dtype)
-        residual = master.to(dtype) - other
-        negative = (residual + row_scale).square()
-        zero = residual.square()
-        positive = (residual - row_scale).square()
-        selected = (
-            torch.stack((negative, zero, positive), dim=0).argmin(dim=0) - 1
-        ).to(torch.int8)
-        selected[row_scale.squeeze(1) == 0] = 0
-        result[plane_index] = selected
-    return tuple(result)
-
-
-def _s34_patterns(device: torch.device) -> torch.Tensor:
-    values = [
-        pattern
-        for pattern in itertools.product((-1, 0, 1), repeat=4)
-        if pattern.count(0) == 1 and all(value != 0 for value in pattern if value)
-    ]
-    return torch.tensor(values, dtype=torch.float64, device=device)
-
-
-def _s34_sweep(
-    master: torch.Tensor,
-    trits: Sequence[torch.Tensor],
-    scales: Sequence[torch.Tensor],
-    metric: torch.Tensor,
-) -> Tuple[torch.Tensor, ...]:
-    dtype = torch.float64
-    patterns = _s34_patterns(master.device)
-    rows, columns = master.shape
-    groups = columns // 4
-    curvature = metric.to(dtype).reshape(1, groups, 4)
-    result = [value.clone() for value in trits]
-    for plane_index, scale in enumerate(scales):
-        other = _decoded(
-            tuple(
-                value
-                for index, value in enumerate(result)
-                if index != plane_index
-            ),
-            tuple(
-                value
-                for index, value in enumerate(scales)
-                if index != plane_index
-            ),
-            dtype,
-        ) if len(result) > 1 else torch.zeros_like(master, dtype=dtype)
-        residual = (master.to(dtype) - other).reshape(rows, groups, 4)
-        row_scale = scale.to(dtype).reshape(rows, 1, 1)
-        best_error = torch.full(
-            (rows, groups), math.inf, dtype=dtype, device=master.device
-        )
-        best_index = torch.zeros(
-            (rows, groups), dtype=torch.int64, device=master.device
-        )
-        for index, pattern in enumerate(patterns):
-            error = (
-                (residual - row_scale * pattern.reshape(1, 1, 4)).square()
-                * curvature
-            ).sum(dim=2)
-            accept = error < best_error
-            best_error[accept] = error[accept]
-            best_index[accept] = index
-        result[plane_index] = patterns[best_index].reshape(rows, columns).to(
-            torch.int8
-        )
-    return tuple(result)
-
-
-def refine_weight_diagonal(
-    master: torch.Tensor,
-    planes: Sequence[TernaryPlane],
-    metric: torch.Tensor,
-    config: RefinementConfig,
+def _evidence_id(
     *,
-    iterations: int = 4,
-    max_working_bytes: int = 64 * 1024 * 1024,
-) -> RefinedWeight:
-    """Refine one additive weight under streamed diagonal input curvature."""
+    parent_artifact_id: str,
+    teacher_digest: str,
+    training_digest: str,
+    training_batches: Tuple[str, ...],
+    validation_digest: str,
+    validation_batches: Tuple[str, ...],
+    config: RefinementConfig,
+) -> str:
+    return _digest(
+        {
+            "schema_version": 1,
+            "parent_artifact_id": parent_artifact_id,
+            "teacher_digest": teacher_digest,
+            "training_digest": training_digest,
+            "training_batches": list(training_batches),
+            "validation_digest": validation_digest,
+            "validation_batches": list(validation_batches),
+            "refinement": config.to_dict(),
+        }
+    )
 
-    _validate(master, planes, metric, config, iterations, max_working_bytes)
-    rows, columns = master.shape
-    plane_count = len(planes)
-    bytes_per_row = max(1, columns * (24 + 8 * plane_count))
-    chunk_rows = max(1, min(rows, max_working_bytes // bytes_per_row))
-    output_trits = [torch.empty_like(plane.trits) for plane in planes]
-    output_scales = [
-        torch.empty_like(plane.scales, dtype=torch.float16) for plane in planes
-    ]
-    parent_total = 0.0
-    refined_total = 0.0
-    denominator = float(metric.to(torch.float64).sum()) * rows
-    for start in range(0, rows, chunk_rows):
-        end = min(rows, start + chunk_rows)
-        chunk_master = master[start:end]
-        chunk_trits = tuple(plane.trits[start:end].clone() for plane in planes)
-        chunk_scales = tuple(plane.scales[start:end].clone() for plane in planes)
-        parent_loss = _loss_rows(chunk_master, chunk_trits, chunk_scales, metric)
-        if config.kind == "scale-only":
-            candidate_trits = chunk_trits
-            candidate_scales = _solve_scales(chunk_master, candidate_trits, metric)
-        else:
-            candidate_trits = chunk_trits
-            candidate_scales = chunk_scales
-            for _ in range(iterations):
-                if config.structure == "s34":
-                    candidate_trits = _s34_sweep(
-                        chunk_master, candidate_trits, candidate_scales, metric
-                    )
-                else:
-                    candidate_trits = _dense_sweep(
-                        chunk_master, candidate_trits, candidate_scales
-                    )
-                candidate_scales = _solve_scales(
-                    chunk_master, candidate_trits, metric
+
+def _output_tensor(value: Any) -> torch.Tensor:
+    if isinstance(value, torch.Tensor):
+        return value
+    if isinstance(value, Mapping) and isinstance(value.get("logits"), torch.Tensor):
+        return value["logits"]
+    logits = getattr(value, "logits", None)
+    if isinstance(logits, torch.Tensor):
+        return logits
+    if (
+        isinstance(value, (tuple, list))
+        and value
+        and isinstance(value[0], torch.Tensor)
+    ):
+        return value[0]
+    raise TritiumError(
+        "refinement model output has no tensor logits",
+        code="unsupported_output",
+        stage="refine",
+    )
+
+
+def _loss(
+    student: torch.Tensor, teacher: torch.Tensor, temperature: float
+) -> torch.Tensor:
+    if student.shape != teacher.shape:
+        raise TritiumError(
+            "student and teacher logits have different geometry",
+            code="output_geometry",
+            stage="refine",
+            details={"student": tuple(student.shape), "teacher": tuple(teacher.shape)},
+        )
+    if student.ndim > 0 and student.shape[-1] > 1:
+        return (
+            F.kl_div(
+                F.log_softmax(student.float() / temperature, dim=-1),
+                F.softmax(teacher.float() / temperature, dim=-1),
+                reduction="batchmean",
+            )
+            * temperature**2
+        )
+    return F.mse_loss(student.float(), teacher.float())
+
+
+def _evaluate(
+    student: nn.Module,
+    teacher: nn.Module,
+    batches: Tuple[Any, ...],
+    temperature: float,
+) -> float:
+    total = 0.0
+    with torch.no_grad():
+        for batch in batches:
+            total += float(
+                _loss(
+                    _output_tensor(_invoke_model(student, batch)),
+                    _output_tensor(_invoke_model(teacher, batch)),
+                    temperature,
                 )
-        candidate_loss = _loss_rows(
-            chunk_master, candidate_trits, candidate_scales, metric
+            )
+    value = total / len(batches)
+    if not math.isfinite(value):
+        raise TritiumError(
+            "refinement validation loss is non-finite",
+            code="nonfinite_loss",
+            stage="refine",
         )
-        if config.structure == "dense":
-            accept = candidate_loss <= parent_loss
-            for index in range(plane_count):
-                candidate_trits[index][~accept] = chunk_trits[index][~accept]
-                candidate_scales[index][~accept] = chunk_scales[index][~accept]
-            candidate_loss = torch.minimum(candidate_loss, parent_loss)
-        for index in range(plane_count):
-            output_trits[index][start:end] = candidate_trits[index]
-            output_scales[index][start:end] = candidate_scales[index]
-        parent_total += float(parent_loss.sum())
-        refined_total += float(candidate_loss.sum())
-    structure = config.structure
-    refined_planes = tuple(
-        TernaryPlane(
-            trits=trits,
-            scales=scales,
-            group_size=columns,
-            structure=structure,
+    return value
+
+
+def _parent_conversion(
+    parent: Union[ModuleQuantizationResult, RefinementResult],
+) -> Tuple[ModuleQuantizationResult, str, Tuple[str, ...]]:
+    if isinstance(parent, RefinementResult):
+        reopened = load_refinement(parent.artifact_dir)
+        if reopened != parent:
+            raise TritiumError(
+                "refinement parent changed after admission",
+                code="parent_changed",
+                stage="refine",
+            )
+        return (
+            parent.conversion,
+            parent.artifact_id,
+            (*parent.ancestry, parent.artifact_id),
         )
-        for trits, scales in zip(output_trits, output_scales)
-    )
-    return RefinedWeight(
-        planes=refined_planes,
-        parent_weighted_mse=parent_total / denominator,
-        refined_weighted_mse=refined_total / denominator,
-        iterations=0 if config.kind == "scale-only" else iterations,
-        kind=config.kind,
-        structure=structure,
+    if isinstance(parent, ModuleQuantizationResult):
+        reopened = load_module_conversion(parent.artifact_dir)
+        if reopened != parent:
+            raise TritiumError(
+                "PTQ parent changed after admission",
+                code="parent_changed",
+                stage="refine",
+            )
+        return parent, parent.artifact_id, (parent.artifact_id,)
+    raise TypeError(
+        "refine requires a ModuleQuantizationResult or RefinementResult parent"
     )
 
 
-__all__ = ["RefinedWeight", "refine_weight_diagonal"]
+def _build_scale_model(
+    teacher: nn.Module,
+    conversion: ModuleQuantizationResult,
+    plane_overrides: Optional[Dict[str, Tuple[TernaryPlane, ...]]] = None,
+) -> Tuple[nn.Module, Dict[str, _ScaleOnlyWeight]]:
+    try:
+        model = copy.deepcopy(teacher)
+    except Exception as error:
+        raise TritiumError(
+            "teacher could not be copied for refinement",
+            code="copy_failed",
+            stage="refine",
+        ) from error
+    model.requires_grad_(False)
+    modules = dict(model.named_modules(remove_duplicate=False))
+    stores: Dict[str, _ScaleOnlyWeight] = {}
+    replacements: Dict[str, nn.Module] = {}
+    replacement_by_module: Dict[int, nn.Module] = {}
+    for reference in conversion.weights:
+        fitted = conversion.weight(reference.path)
+        planes = (
+            fitted.planes
+            if plane_overrides is None
+            else plane_overrides[reference.path]
+        )
+        first_alias = reference.aliases[0]
+        first_path = (
+            "" if first_alias == "weight" else first_alias.removesuffix(".weight")
+        )
+        source = modules.get(first_path)
+        if type(source) not in {nn.Linear, nn.Embedding}:
+            raise TritiumError(
+                "refinement target is not an exact Linear or Embedding",
+                code="coverage_mismatch",
+                stage="refine",
+                module=first_path,
+            )
+        store = _ScaleOnlyWeight(planes).to(source.weight.device)
+        stores[reference.path] = store
+        for alias in reference.aliases:
+            path = "" if alias == "weight" else alias.removesuffix(".weight")
+            module = modules.get(path)
+            replacement = replacement_by_module.get(id(module))
+            if replacement is None:
+                if type(module) is nn.Linear:
+                    replacement = _ScaleOnlyLinear(store, module.bias)
+                elif type(module) is nn.Embedding:
+                    if module.max_norm is not None:
+                        raise TritiumError(
+                            "scale-only refinement cannot preserve mutating Embedding max_norm",
+                            code="unsupported_module_option",
+                            stage="refine",
+                            module=path,
+                        )
+                    replacement = _ScaleOnlyEmbedding(store, module)
+                else:
+                    raise TritiumError(
+                        "refinement alias does not resolve to a supported module",
+                        code="coverage_mismatch",
+                        stage="refine",
+                        module=path,
+                    )
+                replacement_by_module[id(module)] = replacement
+            replacements[path] = replacement
+    root = model
+    for path, replacement in replacements.items():
+        if path == "":
+            root = replacement
+            continue
+        parts = path.split(".")
+        owner = root
+        for part in parts[:-1]:
+            owner = owner._modules[part]
+        owner._modules[parts[-1]] = replacement
+    # Register each shared scale store exactly once after graph replacement.
+    for index, store in enumerate(stores.values()):
+        root.add_module(f"_tritium_scale_store_{index}", store)
+    root.eval()
+    return root, stores
+
+
+def _input_metrics(
+    teacher: nn.Module,
+    conversion: ModuleQuantizationResult,
+    batches: Tuple[Any, ...],
+) -> Dict[str, torch.Tensor]:
+    """Collect diagonal input curvature for each unique target weight."""
+
+    modules = dict(teacher.named_modules(remove_duplicate=False))
+    metrics: Dict[str, torch.Tensor] = {}
+    counts: Dict[str, int] = {}
+    handles = []
+    for reference in conversion.weights:
+        selected = []
+        seen_modules = set()
+        for alias in reference.aliases:
+            path = "" if alias == "weight" else alias.removesuffix(".weight")
+            module = modules.get(path)
+            if type(module) is nn.Linear and id(module) not in seen_modules:
+                selected.append(module)
+                seen_modules.add(id(module))
+        metrics[reference.path] = torch.zeros(reference.shape[1], dtype=torch.float64)
+        counts[reference.path] = 0
+        if not selected:
+            metrics[reference.path].fill_(1)
+            counts[reference.path] = 1
+            continue
+
+        def collect(module, inputs, path=reference.path, features=reference.shape[1]):
+            value = inputs[0]
+            if not isinstance(value, torch.Tensor) or value.shape[-1] != features:
+                raise TritiumError(
+                    "refinement Linear input geometry differs from parent",
+                    code="input_geometry",
+                    stage="refine",
+                    module=path,
+                )
+            flat = value.detach().reshape(-1, features)
+            metrics[path].add_(flat.to(torch.float64).square().sum(dim=0).cpu())
+            counts[path] += flat.shape[0]
+
+        handles.extend(module.register_forward_pre_hook(collect) for module in selected)
+    was_training = teacher.training
+    teacher.eval()
+    try:
+        with torch.no_grad():
+            for batch in batches:
+                _invoke_model(teacher, batch)
+    finally:
+        for handle in handles:
+            handle.remove()
+        teacher.train(was_training)
+    tiny = torch.finfo(torch.float64).tiny
+    for path, metric in metrics.items():
+        if counts[path] <= 0:
+            raise TritiumError(
+                "refinement collected no target activations",
+                code="empty_activations",
+                stage="refine",
+                module=path,
+            )
+        metrics[path] = (metric / counts[path]).clamp_min(tiny)
+    return metrics
+
+
+def _initial_refinement(
+    teacher: nn.Module,
+    conversion: ModuleQuantizationResult,
+    metrics: Dict[str, torch.Tensor],
+    config: RefinementConfig,
+) -> Tuple[Dict[str, Tuple[TernaryPlane, ...]], Dict[str, RefinedWeight]]:
+    modules = dict(teacher.named_modules(remove_duplicate=False))
+    planes = {}
+    receipts = {}
+    for reference in conversion.weights:
+        fitted = conversion.weight(reference.path)
+        alias = reference.aliases[0]
+        path = "" if alias == "weight" else alias.removesuffix(".weight")
+        module = modules.get(path)
+        if type(module) not in {nn.Linear, nn.Embedding}:
+            raise TritiumError(
+                "refinement target is not an exact Linear or Embedding",
+                code="coverage_mismatch",
+                stage="refine",
+                module=path,
+            )
+        receipt = refine_weight_diagonal(
+            module.weight.detach().cpu(),
+            fitted.planes,
+            metrics[reference.path],
+            config,
+            iterations=max(1, config.pv_iterations),
+        )
+        planes[reference.path] = receipt.planes
+        receipts[reference.path] = receipt
+    return planes, receipts
+
+
+def _snapshot(
+    stores: Dict[str, _ScaleOnlyWeight],
+) -> Dict[str, Tuple[TernaryPlane, ...]]:
+    return {path: store.hard_planes() for path, store in stores.items()}
+
+
+def _install(
+    stores: Dict[str, _ScaleOnlyWeight],
+    planes: Dict[str, Tuple[TernaryPlane, ...]],
+) -> None:
+    for path, store in stores.items():
+        for index, plane in enumerate(planes[path]):
+            trits = getattr(store, f"trits_{index}")
+            scale = getattr(store, f"scale_{index}")
+            trits.copy_(plane.trits.to(trits.device))
+            scale.data.copy_(plane.scales.to(scale.device))
+
+
+def _weight_mse(
+    master: torch.Tensor,
+    planes: Tuple[TernaryPlane, ...],
+    metric: torch.Tensor,
+) -> float:
+    total = 0.0
+    denominator = float(metric.sum()) * master.shape[0]
+    rows_per_chunk = max(1, (64 * 1024 * 1024) // max(1, master.shape[1] * 24))
+    for start in range(0, master.shape[0], rows_per_chunk):
+        end = min(master.shape[0], start + rows_per_chunk)
+        decoded = torch.zeros((end - start, master.shape[1]), dtype=torch.float64)
+        for plane in planes:
+            decoded.add_(
+                plane.trits[start:end].to(torch.float64)
+                * plane.scales[start:end].to(torch.float64)
+            )
+        residual = master[start:end].detach().cpu().to(torch.float64) - decoded
+        total += float((residual.square() * metric).sum())
+    return total / denominator
+
+
+def _manifest_value(result: RefinementResult) -> Dict[str, Any]:
+    return {
+        "schema_version": result.schema_version,
+        "artifact_kind": f"tritium.module-{result.config.kind}-refinement-v1",
+        "artifact_id": result.artifact_id,
+        "parent_artifact_id": result.parent_artifact_id,
+        "ancestry": list(result.ancestry),
+        "source_model_digest": result.source_model_digest,
+        "teacher_digest": result.teacher_digest,
+        "training_digest": result.training_digest,
+        "training_batches": list(result.training_batches),
+        "validation_digest": result.validation_digest,
+        "validation_batches": list(result.validation_batches),
+        "config": result.config.to_dict(),
+        "child_conversion_artifact_id": result.conversion.artifact_id,
+        "validation_loss_before": result.validation_loss_before,
+        "validation_loss_after": result.validation_loss_after,
+        "accepted_steps": result.accepted_steps,
+    }
+
+
+def load_refinement(artifact_dir: Pathish) -> RefinementResult:
+    requested = Path(artifact_dir)
+    if requested.is_symlink():
+        raise ValueError("refinement directory must not be a symlink")
+    directory = requested.resolve(strict=True)
+    if not directory.is_dir():
+        raise ValueError("refinement artifact must be an ordinary directory")
+    manifest_path = directory / _MANIFEST
+    metadata = manifest_path.lstat()
+    if (
+        manifest_path.is_symlink()
+        or not manifest_path.is_file()
+        or metadata.st_size > 1024**2
+    ):
+        raise ValueError("refinement manifest must be a bounded ordinary file")
+    with manifest_path.open("r", encoding="utf-8") as stream:
+        value = json.load(stream, object_pairs_hook=_pairs_without_duplicates)
+    if not isinstance(value, dict) or set(value) != _TOP_FIELDS:
+        raise ValueError("refinement manifest fields differ from schema")
+    if value["schema_version"] != 1:
+        raise ValueError("unsupported refinement schema_version")
+    config = RefinementConfig.from_dict(value["config"])
+    if value["artifact_kind"] != f"tritium.module-{config.kind}-refinement-v1":
+        raise ValueError("refinement kind differs from recipe")
+    for field in (
+        "artifact_id",
+        "parent_artifact_id",
+        "source_model_digest",
+        "teacher_digest",
+        "training_digest",
+        "validation_digest",
+        "child_conversion_artifact_id",
+    ):
+        _validate_digest(value[field], field)
+    training_batches = value["training_batches"]
+    validation_batches = value["validation_batches"]
+    if (
+        not isinstance(training_batches, list)
+        or not training_batches
+        or not isinstance(validation_batches, list)
+        or not validation_batches
+        or any(
+            _validate_digest(item, "batch digest") != item
+            for item in (*training_batches, *validation_batches)
+        )
+        or set(training_batches) & set(validation_batches)
+        or value["training_digest"]
+        != _digest(
+            {
+                "schema_version": 1,
+                "role": "training",
+                "batches": training_batches,
+            }
+        )
+        or value["validation_digest"]
+        != _digest(
+            {
+                "schema_version": 1,
+                "role": "validation",
+                "batches": validation_batches,
+            }
+        )
+    ):
+        raise ValueError("refinement dataset ledger is invalid")
+    ancestry = value["ancestry"]
+    if (
+        not isinstance(ancestry, list)
+        or not ancestry
+        or ancestry[-1] != value["parent_artifact_id"]
+        or any(_validate_digest(item, "ancestry") != item for item in ancestry)
+        or len(set(ancestry)) != len(ancestry)
+    ):
+        raise ValueError("refinement ancestry is invalid")
+    before = value["validation_loss_before"]
+    after = value["validation_loss_after"]
+    accepted = value["accepted_steps"]
+    if (
+        type(before) not in {int, float}
+        or type(after) not in {int, float}
+        or not math.isfinite(before)
+        or not math.isfinite(after)
+        or before < 0
+        or after < 0
+        or after > before
+        or type(accepted) is not int
+        or not 0 <= accepted <= config.max_steps
+    ):
+        raise ValueError("refinement metrics are invalid")
+    conversion_path = directory / _CONVERSION_DIRECTORY
+    if conversion_path.is_symlink() or not conversion_path.is_dir():
+        raise ValueError("refinement conversion must be an ordinary directory")
+    if {child.name for child in directory.iterdir()} != {
+        _MANIFEST,
+        _CONVERSION_DIRECTORY,
+    }:
+        raise ValueError("refinement directory contains unknown files")
+    conversion = load_module_conversion(conversion_path)
+    if conversion.artifact_id != value["child_conversion_artifact_id"]:
+        raise ValueError("refinement child conversion identity mismatch")
+    expected_evidence_id = _evidence_id(
+        parent_artifact_id=value["parent_artifact_id"],
+        teacher_digest=value["teacher_digest"],
+        training_digest=value["training_digest"],
+        training_batches=tuple(training_batches),
+        validation_digest=value["validation_digest"],
+        validation_batches=tuple(validation_batches),
+        config=config,
+    )
+    expected_algorithm = f"tritium.{config.kind}-{config.structure}-refinement@1"
+    expected_recipe = module_recipe_id(
+        conversion.source_model_digest,
+        expected_evidence_id,
+        expected_algorithm,
+        conversion.config,
+        conversion.coverage,
+    )
+    if (
+        value["teacher_digest"] != value["source_model_digest"]
+        or conversion.source_model_digest != value["source_model_digest"]
+        or conversion.evidence_id != expected_evidence_id
+        or conversion.algorithm_id != expected_algorithm
+        or conversion.recipe_id != expected_recipe
+    ):
+        raise ValueError("refinement child conversion ancestry mismatch")
+    if config.structure == "s34":
+        for reference in conversion.weights:
+            fitted = conversion.weight(reference.path)
+            if reference.shape[1] % 4:
+                raise ValueError("S34 refinement width is not divisible by four")
+            for plane in fitted.planes:
+                groups = plane.trits.reshape(reference.shape[0], -1, 4)
+                if not bool(torch.all(torch.count_nonzero(groups == 0, dim=2) == 1)):
+                    raise ValueError("S34 refinement child violates one-zero groups")
+    identity = dict(value)
+    artifact_id = identity.pop("artifact_id")
+    if artifact_id != _digest(identity):
+        raise ValueError("refinement artifact identity mismatch")
+    return RefinementResult(
+        artifact_dir=directory,
+        artifact_id=artifact_id,
+        parent_artifact_id=value["parent_artifact_id"],
+        ancestry=tuple(ancestry),
+        source_model_digest=value["source_model_digest"],
+        teacher_digest=value["teacher_digest"],
+        training_digest=value["training_digest"],
+        training_batches=tuple(training_batches),
+        validation_digest=value["validation_digest"],
+        validation_batches=tuple(validation_batches),
+        config=config,
+        conversion=conversion,
+        validation_loss_before=float(before),
+        validation_loss_after=float(after),
+        accepted_steps=accepted,
+    )
+
+
+def refine(
+    parent: Union[ModuleQuantizationResult, RefinementResult],
+    *,
+    teacher: nn.Module,
+    training: Iterable[Any],
+    validation: Iterable[Any],
+    config: RefinementConfig,
+    work_dir: Pathish,
+) -> RefinementResult:
+    """Refine a hard PTQ child while preserving explicit ancestry and claims."""
+
+    if not isinstance(teacher, nn.Module):
+        raise TypeError("refine teacher must be a torch.nn.Module")
+    if not isinstance(config, RefinementConfig):
+        raise TypeError("refine config must be a RefinementConfig")
+    conversion, parent_id, ancestry = _parent_conversion(parent)
+    teacher_digest = _source_model_digest(teacher)
+    if teacher_digest != conversion.source_model_digest:
+        raise TritiumError(
+            "teacher differs from the PTQ source checkpoint",
+            code="source_changed",
+            stage="refine",
+            details={
+                "expected": conversion.source_model_digest,
+                "observed": teacher_digest,
+            },
+        )
+    training_batches, training_digest, training_members = _materialize(
+        training, "training"
+    )
+    validation_batches, validation_digest, validation_members = _materialize(
+        validation, "validation"
+    )
+    if set(training_members) & set(validation_members):
+        raise TritiumError(
+            "training and validation data must be content-disjoint",
+            code="dataset_overlap",
+            stage="refine",
+        )
+    requested = Path(work_dir)
+    if requested.is_symlink():
+        raise ValueError("refinement work_dir must not be a symlink")
+    directory = requested.resolve()
+    if (directory / _MANIFEST).exists():
+        result = load_refinement(directory)
+        expected = (
+            parent_id,
+            ancestry,
+            teacher_digest,
+            training_digest,
+            training_members,
+            validation_digest,
+            validation_members,
+            config,
+        )
+        observed = (
+            result.parent_artifact_id,
+            result.ancestry,
+            result.teacher_digest,
+            result.training_digest,
+            result.training_batches,
+            result.validation_digest,
+            result.validation_batches,
+            result.config,
+        )
+        if observed != expected:
+            raise ValueError("sealed refinement belongs to another recipe or dataset")
+        return result
+    directory.mkdir(parents=True, exist_ok=True)
+    if any(directory.iterdir()):
+        raise ValueError("unsealed refinement work_dir must be empty")
+
+    teacher_was_training = teacher.training
+    teacher.eval()
+    try:
+        parent_student, _ = _build_scale_model(teacher, conversion)
+        before = _evaluate(
+            parent_student, teacher, validation_batches, config.temperature
+        )
+        del parent_student
+        metrics = _input_metrics(teacher, conversion, training_batches)
+        initial_planes, _ = _initial_refinement(teacher, conversion, metrics, config)
+        student, stores = _build_scale_model(teacher, conversion, initial_planes)
+        initial_loss = _evaluate(
+            student, teacher, validation_batches, config.temperature
+        )
+        best_planes = _snapshot(stores) if initial_loss <= before else None
+        best_loss = initial_loss if best_planes is not None else before
+        accepted_steps = 0
+        parameters = [
+            parameter for store in stores.values() for parameter in store.parameters()
+        ]
+        optimizer = torch.optim.AdamW(
+            parameters, lr=config.learning_rate, weight_decay=0.0
+        )
+        for batch in (
+            item for _, item in zip(range(config.max_steps), cycle(training_batches))
+        ):
+            optimizer.zero_grad(set_to_none=True)
+            with torch.no_grad():
+                teacher_output = _output_tensor(_invoke_model(teacher, batch))
+            student_output = _output_tensor(_invoke_model(student, batch))
+            loss = _loss(student_output, teacher_output, config.temperature)
+            if not bool(torch.isfinite(loss)):
+                raise TritiumError(
+                    "refinement training loss is non-finite",
+                    code="nonfinite_loss",
+                    stage="refine",
+                )
+            loss.backward()
+            optimizer.step()
+            candidate = _evaluate(
+                student, teacher, validation_batches, config.temperature
+            )
+            if candidate < best_loss and candidate <= before:
+                best_loss = candidate
+                accepted_steps += 1
+                best_planes = _snapshot(stores)
+        if best_planes is None:
+            if config.structure == "s34":
+                raise TritiumError(
+                    "S34 hard-PV produced no held-out improvement",
+                    code="no_admissible_refinement",
+                    stage="refine",
+                )
+            best_planes = {
+                reference.path: conversion.weight(reference.path).planes
+                for reference in conversion.weights
+            }
+        _install(stores, best_planes)
+        after = _evaluate(student, teacher, validation_batches, config.temperature)
+    finally:
+        teacher.train(teacher_was_training)
+    if after > before:
+        raise AssertionError("predecessor retention failed")
+
+    evidence_id = _evidence_id(
+        parent_artifact_id=parent_id,
+        teacher_digest=teacher_digest,
+        training_digest=training_digest,
+        training_batches=training_members,
+        validation_digest=validation_digest,
+        validation_batches=validation_members,
+        config=config,
+    )
+    algorithm_id = f"tritium.{config.kind}-{config.structure}-refinement@1"
+    recipe_id = module_recipe_id(
+        conversion.source_model_digest,
+        evidence_id,
+        algorithm_id,
+        conversion.config,
+        conversion.coverage,
+    )
+    records = tuple(
+        _Record(
+            reference.path,
+            reference.aliases,
+            reference.shape[0],
+            reference.shape[1],
+        )
+        for reference in conversion.weights
+    )
+    modules = dict(teacher.named_modules(remove_duplicate=False))
+    final_planes = _snapshot(stores)
+    weight_losses = {}
+    for reference in conversion.weights:
+        alias = reference.aliases[0]
+        path = "" if alias == "weight" else alias.removesuffix(".weight")
+        weight_losses[reference.path] = _weight_mse(
+            modules[path].weight,
+            final_planes[reference.path],
+            metrics[reference.path],
+        )
+
+    def fit_weight(record: _Record, writer: WeightCheckpointWriter) -> float:
+        planes = final_planes[record.path]
+        for start in range(0, record.outputs, writer.fit_chunk_rows):
+            end = min(record.outputs, start + writer.fit_chunk_rows)
+            writer.append(
+                tuple(
+                    TernaryPlane(
+                        trits=plane.trits[start:end],
+                        scales=plane.scales[start:end],
+                        group_size=plane.group_size,
+                        structure=plane.structure,
+                    )
+                    for plane in planes
+                )
+            )
+        return weight_losses[record.path]
+
+    max_working_bytes = 64 * 1024 * 1024
+
+    def fit_chunk_rows(record: _Record) -> int:
+        bytes_per_row = max(1, record.features * 3 + 6)
+        return max(1, min(record.outputs, max_working_bytes // bytes_per_row))
+
+    child = seal_module_conversion(
+        directory / _CONVERSION_DIRECTORY,
+        source_model_digest=conversion.source_model_digest,
+        evidence_id=evidence_id,
+        algorithm_id=algorithm_id,
+        recipe_id=recipe_id,
+        config=conversion.config,
+        coverage=conversion.coverage,
+        records=records,
+        fit_weight=fit_weight,
+        fit_chunk_rows=fit_chunk_rows,
+        max_working_bytes=max_working_bytes,
+    )
+    identity = {
+        "schema_version": 1,
+        "artifact_kind": f"tritium.module-{config.kind}-refinement-v1",
+        "parent_artifact_id": parent_id,
+        "ancestry": list(ancestry),
+        "source_model_digest": conversion.source_model_digest,
+        "teacher_digest": teacher_digest,
+        "training_digest": training_digest,
+        "training_batches": list(training_members),
+        "validation_digest": validation_digest,
+        "validation_batches": list(validation_members),
+        "config": config.to_dict(),
+        "child_conversion_artifact_id": child.artifact_id,
+        "validation_loss_before": before,
+        "validation_loss_after": after,
+        "accepted_steps": accepted_steps,
+    }
+    identity["artifact_id"] = _digest(identity)
+    manifest = directory / _MANIFEST
+    with manifest.open("xb") as stream:
+        stream.write(
+            json.dumps(identity, indent=2, sort_keys=True).encode("utf-8") + b"\n"
+        )
+        stream.flush()
+        os.fsync(stream.fileno())
+    descriptor = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    return load_refinement(directory)
+
+
+def export_refinement(
+    result: RefinementResult, output_dir: Pathish
+) -> RefinementResult:
+    """Atomically publish and strictly reopen a refinement artifact."""
+
+    if not isinstance(result, RefinementResult):
+        raise TypeError("export_refinement requires a RefinementResult")
+    current = load_refinement(result.artifact_dir)
+    if current != result:
+        raise TritiumError(
+            "RefinementResult fields differ from strict artifact reload",
+            code="artifact_changed",
+            stage="export",
+        )
+    target = Path(output_dir).absolute()
+    parent = target.parent.resolve(strict=True)
+    if target.exists() or target.is_symlink():
+        raise FileExistsError(f"output directory already exists: {target}")
+    staging = Path(tempfile.mkdtemp(prefix=".tritium-refine-", dir=parent))
+    published = False
+    try:
+        shutil.copytree(
+            current.artifact_dir / _CONVERSION_DIRECTORY,
+            staging / _CONVERSION_DIRECTORY,
+        )
+        shutil.copyfile(current.artifact_dir / _MANIFEST, staging / _MANIFEST)
+        load_refinement(staging)
+        _tritium.publish_directory_noreplace(str(staging), str(target))
+        published = True
+    finally:
+        if not published:
+            shutil.rmtree(staging, ignore_errors=True)
+    return load_refinement(target)
+
+
+__all__ = ["RefinementResult", "export_refinement", "load_refinement", "refine"]

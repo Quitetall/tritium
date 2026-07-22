@@ -6,7 +6,7 @@ torch = pytest.importorskip("torch")
 
 from tritium.torch import RefinementConfig  # noqa: E402
 from tritium.torch.projection import TernaryPlane  # noqa: E402
-from tritium.torch.refinement import refine_weight_diagonal  # noqa: E402
+from tritium.torch.refinement_core import refine_weight_diagonal  # noqa: E402
 
 
 def _planes(master, count=2):
@@ -15,8 +15,11 @@ def _planes(master, count=2):
     for _ in range(count):
         scales = residual.abs().mean(dim=1, keepdim=True).to(torch.float16)
         trits = (
-            residual / scales.to(residual.dtype).clamp_min(1e-12)
-        ).round().clamp(-1, 1).to(torch.int8)
+            (residual / scales.to(residual.dtype).clamp_min(1e-12))
+            .round()
+            .clamp(-1, 1)
+            .to(torch.int8)
+        )
         values.append(
             TernaryPlane(
                 trits=trits,

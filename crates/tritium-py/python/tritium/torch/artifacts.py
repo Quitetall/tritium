@@ -16,6 +16,7 @@ from .errors import TritiumError
 if TYPE_CHECKING:
     from .qat import QatHardResult
     from .qat_artifacts import QatHardArtifact
+    from .refinement import RefinementResult
 
 _ARTIFACT_KIND_V1 = "qwen3.6-language-mtp-salt-v2-matrix-profiles"
 _ARTIFACT_KIND_V2 = "qwen3.6-language-mtp-salt-v2-model-weights"
@@ -182,9 +183,7 @@ class QuantizationResult:
     def export(self, output_dir: Union[os.PathLike[str], str]) -> ExportReceipt:
         return export(self, output_dir)
 
-    def load_model(
-        self, *, profile: str = "compact-v1", device: str = "cpu"
-    ) -> Any:
+    def load_model(self, *, profile: str = "compact-v1", device: str = "cpu") -> Any:
         """Materialize the packed language runtime for one governed profile."""
         if self.schema_version != 3 or self.preserved is None or not self.hf_assets:
             raise TritiumError(
@@ -235,8 +234,14 @@ def _pairs_without_duplicates(pairs):
 def _read_manifest(directory: Path) -> Dict[str, Any]:
     manifest = directory / _MANIFEST
     metadata = manifest.lstat()
-    if manifest.is_symlink() or not manifest.is_file() or metadata.st_size > 1024 * 1024:
-        raise ValueError("tritium.json must be an ordinary manifest no larger than 1 MiB")
+    if (
+        manifest.is_symlink()
+        or not manifest.is_file()
+        or metadata.st_size > 1024 * 1024
+    ):
+        raise ValueError(
+            "tritium.json must be an ordinary manifest no larger than 1 MiB"
+        )
     with manifest.open("r", encoding="utf-8") as stream:
         value = json.load(stream, object_pairs_hook=_pairs_without_duplicates)
     if not isinstance(value, dict) or type(value.get("schema_version")) is not int:
@@ -250,7 +255,9 @@ def _read_manifest(directory: Path) -> Dict[str, Any]:
         3: _TOP_LEVEL_FIELDS_V3,
     }[version]
     if set(value) != fields:
-        raise ValueError(f"tritium.json fields do not match bundle schema version {version}")
+        raise ValueError(
+            f"tritium.json fields do not match bundle schema version {version}"
+        )
     expected_kind = {
         1: _ARTIFACT_KIND_V1,
         2: _ARTIFACT_KIND_V2,
@@ -259,7 +266,9 @@ def _read_manifest(directory: Path) -> Dict[str, Any]:
     if value["artifact_kind"] != expected_kind or value["complete_model"] is not False:
         raise ValueError("unsupported Tritium artifact kind")
     if version == 3 and value["source_revision"] != _QWEN36_REVISION:
-        raise ValueError("schema-v3 source_revision differs from pinned Qwen3.6 revision")
+        raise ValueError(
+            "schema-v3 source_revision differs from pinned Qwen3.6 revision"
+        )
     if value["packing"] not in {"d2", "b3", "s34"}:
         raise ValueError("invalid Tritium package codec")
     if type(value["official_payload_authenticated"]) is not bool:
@@ -288,7 +297,9 @@ def _load_hf_assets(directory: Path, value: Any) -> Tuple[HfAssetRef, ...]:
         if not isinstance(item, dict) or set(item) != _HF_ASSET_FIELDS:
             raise ValueError("HF asset fields do not match bundle schema version 3")
         if item["file"] != expected_file:
-            raise ValueError("HF assets are missing, duplicated, or out of canonical order")
+            raise ValueError(
+                "HF assets are missing, duplicated, or out of canonical order"
+            )
         package_id = item["package_id"]
         byte_count = item["bytes"]
         if not isinstance(package_id, str) or not package_id:
@@ -322,7 +333,9 @@ def _load_preserved(directory: Path, value: Any) -> PreservedRef:
     if any(type(item) is not int or item <= 0 for item in integers):
         raise ValueError("preserved tensor and byte ledgers must be positive integers")
     path = directory / _PRESERVED_FILE
-    actual = _tritium.verify_preserved_safetensors(path.as_posix(), package_id, *integers)
+    actual = _tritium.verify_preserved_safetensors(
+        path.as_posix(), package_id, *integers
+    )
     return PreservedRef(
         path=path,
         package_id=actual[0],
@@ -332,7 +345,9 @@ def _load_preserved(directory: Path, value: Any) -> PreservedRef:
     )
 
 
-def _load_profile(directory: Path, packing: str, profile: str, value: Any) -> ArtifactRef:
+def _load_profile(
+    directory: Path, packing: str, profile: str, value: Any
+) -> ArtifactRef:
     if not isinstance(value, dict) or set(value) != _PROFILE_FIELDS:
         raise ValueError(f"{profile} fields do not match bundle schema version 1")
     if value["file"] != _PROFILE_FILES[profile]:
@@ -348,9 +363,7 @@ def _load_profile(directory: Path, packing: str, profile: str, value: Any) -> Ar
         raise ValueError(f"{profile} physical bytes must be positive")
     path = directory / value["file"]
     actual_id, actual_packing, actual_serialized, actual_resident = (
-        _tritium.verify_salt_v2_package(
-            str(path), package_id, serialized, resident
-        )
+        _tritium.verify_salt_v2_package(str(path), package_id, serialized, resident)
     )
     if actual_packing != packing:
         raise ValueError(f"{profile} codec differs from the bundle recipe")
@@ -369,7 +382,7 @@ def load(
     *,
     device: Optional[str] = None,
     profile: str = "compact-v1",
-) -> Union[QuantizationResult, Any]:
+) -> Union[QuantizationResult, "RefinementResult", Any]:
     """Strictly reopen a two-profile Tritium PTQ bundle.
 
     Loading re-parses and hashes every package through the native seek-backed
@@ -382,13 +395,21 @@ def load(
     directory = requested.resolve(strict=True)
     if not directory.is_dir():
         raise ValueError("artifact must be an ordinary Tritium bundle directory")
+    if (directory / "refinement.json").is_file():
+        if device is not None:
+            raise TritiumError(
+                "generic refinement artifacts require an explicit source model shell",
+                code="model_shell_required",
+                stage="load",
+            )
+        from .refinement import load_refinement
+
+        return load_refinement(directory)
     if device is not None:
         # The native runtime performs the complete schema, identity, physical-
         # ledger, and selected-profile reopen itself. Avoid hashing both very
         # large profiles here and then hashing the selected profile again.
-        return _tritium.QwenModel.load(
-            str(directory), profile=profile, device=device
-        )
+        return _tritium.QwenModel.load(str(directory), profile=profile, device=device)
     value = _read_manifest(directory)
     compact = _load_profile(
         directory, value["packing"], "compact-v1", value["profiles"]["compact-v1"]
@@ -501,10 +522,16 @@ def export(
 ) -> "QatHardArtifact": ...
 
 
+@overload
 def export(
-    result: Union[QuantizationResult, "QatHardResult"],
+    result: "RefinementResult", output_dir: Union[os.PathLike[str], str]
+) -> "RefinementResult": ...
+
+
+def export(
+    result: Union[QuantizationResult, "QatHardResult", "RefinementResult"],
     output_dir: Union[os.PathLike[str], str],
-) -> Union[ExportReceipt, "QatHardArtifact"]:
+) -> Union[ExportReceipt, "QatHardArtifact", "RefinementResult"]:
     """Publish a typed PTQ or QAT-hard result without changing its claim."""
 
     from .qat import QatHardResult
@@ -514,8 +541,15 @@ def export(
 
         return export_qat_hard(result, output_dir)
 
+    from .refinement import RefinementResult, export_refinement
+
+    if isinstance(result, RefinementResult):
+        return export_refinement(result, output_dir)
+
     if not isinstance(result, QuantizationResult):
-        raise TypeError("export requires a QuantizationResult or QatHardResult")
+        raise TypeError(
+            "export requires a QuantizationResult, RefinementResult, or QatHardResult"
+        )
     current = load(result.artifact_dir)
     if current != result:
         raise TritiumError(
@@ -564,7 +598,8 @@ def export(
                 or staged.preserved.package_id != current.preserved.package_id
                 or staged.preserved.tensors != current.preserved.tensors
                 or staged.preserved.payload_bytes != current.preserved.payload_bytes
-                or staged.preserved.serialized_bytes != current.preserved.serialized_bytes
+                or staged.preserved.serialized_bytes
+                != current.preserved.serialized_bytes
             )
         staged_assets = tuple(
             (asset.file, asset.package_id, asset.bytes) for asset in staged.hf_assets

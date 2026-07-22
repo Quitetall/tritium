@@ -26,6 +26,7 @@ from .estimators import (
     register_estimator,
     registered_estimators,
 )
+
 try:
     from .hf import HfTritiumConfig, TritiumTrainer, register_huggingface
 except ImportError:  # transformers is an optional integration dependency
@@ -75,6 +76,12 @@ from .projection import (
     TernaryProjection,
     validate_projection,
 )
+from .refinement import (
+    RefinementResult,
+    export_refinement,
+    load_refinement,
+    refine,
+)
 
 __all__ = [
     "AbsMeanSTE",
@@ -106,6 +113,7 @@ __all__ = [
     "QuantizationResult",
     "QwenOnnxCausalLM",
     "RefinementConfig",
+    "RefinementResult",
     "SaltSTE",
     "SparseTernaryEstimator",
     "SMOLLM2_MODEL_ID",
@@ -123,6 +131,7 @@ __all__ = [
     "convert_qat_hard",
     "export",
     "export_qat_hard",
+    "export_refinement",
     "export_onnx",
     "export_module_onnx",
     "inspect",
@@ -131,11 +140,13 @@ __all__ = [
     "load_module_conversion",
     "load_module_onnx",
     "load_quantized_module",
+    "load_refinement",
     "load_qat_hard",
     "load_onnx",
     "prepare",
     "prepare_qat",
     "quantize",
+    "refine",
     "reference_ternary_linear",
     "register_estimator",
     "register_huggingface",
