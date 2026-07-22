@@ -1,5 +1,6 @@
 """Real ORT gates for packed generic module ONNX bundles."""
 
+import copy
 import json
 
 from types import SimpleNamespace
@@ -19,6 +20,7 @@ from tritium.torch import (  # noqa: E402
     TritiumError,
     calibrate,
     convert,
+    export,
     export_module_onnx,
     export_onnx,
     load_onnx,
@@ -107,8 +109,10 @@ def test_public_facade_executes_qat_ptq_and_refinement_artifacts_in_ort(tmp_path
     torch.manual_seed(131)
     example = torch.randn(2, 8)
 
+    qat_source = torch.nn.Linear(8, 2).eval()
+    qat_shell = copy.deepcopy(qat_source)
     qat = prepare(
-        torch.nn.Linear(8, 2).eval(),
+        qat_source,
         TernaryConfig.qat(target_modules=("Linear",)),
         inplace=True,
     )
@@ -123,6 +127,19 @@ def test_public_facade_executes_qat_ptq_and_refinement_artifacts_in_ort(tmp_path
     assert qat_runtime.artifact.lineage.mode == "qat-hard"
     torch.testing.assert_close(
         qat_runtime(example), qat_hard.model(example), rtol=1e-4, atol=1e-5
+    )
+    qat_artifact = export(qat_hard, tmp_path / "qat-hard")
+    reopened_bundle = export_onnx(
+        qat_artifact,
+        tmp_path / "reopened-qat-onnx",
+        model=qat_shell,
+        example_inputs=example,
+    )
+    reopened_runtime = load_onnx(reopened_bundle.artifact_dir)
+    assert reopened_runtime.artifact.lineage.artifact_id == qat_artifact.artifact_id
+    assert reopened_runtime.artifact.lineage.mode == "qat-hard"
+    torch.testing.assert_close(
+        reopened_runtime(example), qat_hard.model(example), rtol=1e-4, atol=1e-5
     )
 
     teacher = torch.nn.Linear(8, 2).eval()
@@ -170,6 +187,30 @@ def test_public_facade_executes_qat_ptq_and_refinement_artifacts_in_ort(tmp_path
     refined_model = refined.load_model(teacher)
     torch.testing.assert_close(
         refined_runtime(example), refined_model(example), rtol=1e-4, atol=1e-5
+    )
+
+    hard_pv = refine(
+        ptq,
+        teacher=teacher,
+        training=[torch.randn(2, 8)],
+        validation=[torch.randn(3, 8)],
+        config=RefinementConfig.hard_pv(max_steps=1, pv_iterations=1),
+        work_dir=tmp_path / "hard-pv",
+    )
+    hard_pv_bundle = export_onnx(
+        hard_pv,
+        tmp_path / "hard-pv-onnx",
+        model=teacher,
+        example_inputs=example,
+    )
+    hard_pv_runtime = load_onnx(hard_pv_bundle.artifact_dir)
+    assert hard_pv_runtime.artifact.lineage.mode == "hard-pv"
+    assert hard_pv_runtime.artifact.lineage.ancestry == hard_pv.ancestry
+    torch.testing.assert_close(
+        hard_pv_runtime(example),
+        hard_pv.load_model(teacher)(example),
+        rtol=1e-4,
+        atol=1e-5,
     )
 
 
