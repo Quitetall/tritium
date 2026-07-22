@@ -42,6 +42,11 @@ TUTORIAL_RECEIPT = runpy.run_path(
 )
 validate_tutorial_receipt = TUTORIAL_RECEIPT["validate_receipt"]
 validate_hf_lifecycle_receipt = TUTORIAL_RECEIPT["validate_hf_receipt"]
+DISTRIBUTED_RECEIPT = runpy.run_path(
+    Path(__file__).with_name("verify-hf-distributed-receipt.py")
+)
+validate_distributed_receipt = DISTRIBUTED_RECEIPT["validate"]
+DistributedReceiptError = DISTRIBUTED_RECEIPT["ReceiptError"]
 
 SCHEMA = "tritium.release-evidence-registry.v1"
 REPORT_SCHEMA = "tritium.release-gate-report.v1"
@@ -57,6 +62,7 @@ KNOWN_KINDS = frozenset(
         "serving-deployment-cpu", "serving-deployment-cuda",
         "installed-qat-tutorial",
         "frontend-lifecycle",
+        "distributed-training",
     }
 )
 HEX = frozenset("0123456789abcdef")
@@ -306,6 +312,10 @@ def evaluate(
                     expected_source_revision=revision,
                     expected_release=release,
                 )
+            elif kind == "distributed-training":
+                receipt = validate_distributed_receipt(
+                    receipt_path, revision, release, artifact_path
+                )
             elif kind in {"oci-runtime-cpu", "oci-runtime-cuda"}:
                 receipt = load_oci_runtime_receipt(
                     receipt_path, revision=revision, release=release,
@@ -374,6 +384,7 @@ def evaluate(
             OciRuntimeError,
             OciSecurityError,
             DeploymentError,
+            DistributedReceiptError,
             ValueError,
         ) as error:
             raise EvidenceError(f"{label} failed {kind} validation: {error}") from error

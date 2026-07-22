@@ -71,6 +71,15 @@ for release admission.
   two distinct physical devices. The current host exposes one RTX 4090, so a
   two-rank shared-device run cannot satisfy this gate.
 
+The release validator for that run is now frozen as
+`tritium.hf-distributed-qualification.v1`. It rejects duplicate physical GPU
+UUIDs and requires both ordered NCCL/fp16 DDP and FSDP results, exact checkpoint
+and RNG continuation, zero ternary-op host transfers, peak memory, exact
+candidate wheel/model provenance, consistent token arithmetic, and scaling
+efficiency of at least 70% (DDP) and 55% (FSDP) against a bound single-device
+baseline. `distributed-training` registry dispatch is live, but remains
+`MISSING` until the producer and a real two-device run land.
+
 ## Step 3 — resumable PTQ facade
 
 - [x] Add a bounded-memory Rust producer seam that plans each global tensor

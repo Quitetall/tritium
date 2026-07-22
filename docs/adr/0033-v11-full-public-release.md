@@ -399,6 +399,17 @@ the candidate wheel, source, release, run and complete checkpoint tree. The
 registry admits this only as `frontend-lifecycle`; distributed training and
 whole-model export/reload remain independent requirements.
 
+Multi-device admission uses
+`tritium.hf-distributed-qualification.v1`. The validator requires ordered DDP
+and FSDP NCCL/fp16 runs on two distinct physical GPU UUIDs, exact checkpoint
+and RNG continuation, zero profiled ternary-op host transfers, candidate-wheel
+and model identities, internally consistent token throughput, measured peak
+memory, and scaling efficiency of at least 70% for DDP and 55% for FSDP against
+the bound single-device baseline. Shared-device ranks, missing modes, dirty
+source, stale artifacts, copied arithmetic or lower efficiency fail closed.
+This schema and registry dispatch are structural until a qualified two-GPU run
+produces the receipt.
+
 ## v1.1 release gate
 
 `v1.1.0` may publish only when all boxes are green:

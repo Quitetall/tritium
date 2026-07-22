@@ -279,6 +279,36 @@ def entry(
 
 
 class ReleaseEvidenceStatusTests(unittest.TestCase):
+    def test_distributed_receipt_advances_frontend_gate_through_strict_dispatch(self):
+        with tempfile.TemporaryDirectory() as raw:
+            candidate, document, artifact, evidence_root = release_fixture(Path(raw))
+            receipt_path = evidence_root / "distributed.json"
+            receipt_path.write_bytes(b"{}\n")
+            receipt = {
+                "receipt_id": "sha256:" + "9" * 64,
+                "run_id": "two-gpu-run-1",
+                "artifact": {"kind": "python-wheel"},
+            }
+            registry_path = evidence_root / "registry.json"
+            registry(
+                registry_path, candidate,
+                [{
+                    "id": receipt["receipt_id"], "kind": "distributed-training",
+                    "path": receipt_path.name, "sha256": sha256(receipt_path),
+                    "artifact_id": "cuda-wheel", "parents": [],
+                }],
+            )
+            loader = mock.Mock(return_value=receipt)
+            with mock.patch.dict(
+                evaluate.__globals__, {"validate_distributed_receipt": loader}
+            ):
+                report = evaluate(registry_path, candidate, document)
+            frontend = next(row for row in report["rows"] if row["id"] == "pytorch-hf")
+            self.assertEqual(frontend["satisfied_kinds"], ["distributed-training"])
+            loader.assert_called_once_with(
+                receipt_path.resolve(), "a" * 40, "1.1.0-rc.0", artifact
+            )
+
     def test_hf_lifecycle_binds_candidate_wheel_and_advances_frontend_gate(self):
         with tempfile.TemporaryDirectory() as raw:
             candidate, document, artifact, evidence_root = release_fixture(Path(raw))

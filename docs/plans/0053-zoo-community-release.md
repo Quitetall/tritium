@@ -201,6 +201,13 @@ reload, exact logits, recipe, alias-aware coverage and every checkpoint byte to
 the exact candidate wheel/source/release/run. The registry admits it as
 `frontend-lifecycle`; it does not substitute for multi-device distributed or
 whole-model export evidence.
+The evidence registry now also recognizes only strict
+`tritium.hf-distributed-qualification.v1` input for `distributed-training`.
+Its validator rejects shared-device ranks, absent DDP/FSDP modes, dirty or stale
+wheel provenance, checkpoint/RNG or host-transfer failures, inconsistent
+throughput, and sub-gate scaling efficiency. No local receipt exists because
+this host has one physical GPU; validator presence is structural, not empirical
+distributed evidence.
 
 Replace the current pre-alpha/v1.0-era narrative with tested v1.1 documentation:
 
