@@ -236,6 +236,8 @@ jobs:
           --wheel dist
           --forbidden-root ${{ github.workspace }}
           --source-revision ${{ github.sha }}
+          --release 1.1.0-rc.0
+          --run-id github-${{ github.run_id }}-${{ github.run_attempt }}-cpu-functional
           --output evidence/torch-2.11-python-3.13.json
       - uses: actions/upload-artifact@v4
         with:
@@ -301,6 +303,8 @@ jobs:
           --forbidden-root ${{ github.workspace }}
           --source-revision ${{ github.sha }}
           --device cuda:0
+          --release 1.1.0-rc.0
+          --run-id github-${{ github.run_id }}-${{ github.run_attempt }}-cuda-functional
           --output evidence/cuda13-torch2.11-py3.13-sm89.json
       - name: qualify installed-wheel CUDA fp16 training
         shell: bash

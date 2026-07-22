@@ -19,6 +19,7 @@ render = MODULE["render"]
 gate_row = MODULE["_gate_row"]
 STATUS_MODULE = runpy.run_path(ROOT / "scripts" / "release-status")
 status_main = STATUS_MODULE["main"]
+WHEEL_MODULE = runpy.run_path(ROOT / "scripts" / "wheel-functional-smoke.py")
 
 
 def canonical(value) -> bytes:
@@ -129,10 +130,13 @@ def registry(
     )
 
 
-def entry(receipt_path: Path, receipt: dict, *, parents: list[str] | None = None) -> dict:
+def entry(
+    receipt_path: Path, receipt: dict, *, kind: str = "cuda-training",
+    parents: list[str] | None = None,
+) -> dict:
     return {
         "id": receipt["receipt_id"],
-        "kind": "cuda-training",
+        "kind": kind,
         "path": receipt_path.name,
         "sha256": sha256(receipt_path),
         "artifact_id": "cuda-wheel",
@@ -141,6 +145,43 @@ def entry(receipt_path: Path, receipt: dict, *, parents: list[str] | None = None
 
 
 class ReleaseEvidenceStatusTests(unittest.TestCase):
+    def test_clean_install_receipt_advances_package_gate_without_overclaim(self):
+        with tempfile.TemporaryDirectory() as raw:
+            candidate, document, artifact, evidence_root = release_fixture(Path(raw))
+            evidence = {
+                "schema": WHEEL_MODULE["SCHEMA"],
+                "source_revision": "a" * 40,
+                "passed": True,
+                "wheel": artifact.name,
+                "wheel_sha256": sha256(artifact),
+                "distribution_version": "1.1.0rc0",
+                "python_version": "3.13.5",
+                "torch_version": "2.11.0",
+                "transformers_version": "5.5.3",
+                "safetensors_version": "0.8.0",
+                "native_device": "cpu",
+                "compiled_backends": ["cpu"],
+                "tritium_module": "/venv/tritium/__init__.py",
+                "converted_parameters": 256,
+                "operations": sorted(WHEEL_MODULE["REQUIRED_OPERATIONS"]),
+            }
+            receipt = WHEEL_MODULE["build_receipt"](
+                evidence, artifact, "1.1.0-rc.0", "clean-run-1",
+                "2026-07-21T12:00:00Z", 100.0,
+            )
+            receipt_path = evidence_root / "clean.json"
+            WHEEL_MODULE["_atomic_write"](receipt_path, receipt)
+            registry_path = evidence_root / "registry.json"
+            registry(
+                registry_path, candidate,
+                [entry(receipt_path, receipt, kind="clean-install")],
+            )
+            report = evaluate(registry_path, candidate, document)
+            packages = next(row for row in report["rows"] if row["id"] == "packages")
+            self.assertEqual(packages["status"], "MISSING")
+            self.assertEqual(packages["satisfied_kinds"], ["clean-install"])
+            self.assertEqual(packages["missing_kinds"], ["local-archive"])
+
     def test_gate_status_distinguishes_pass_missing_and_structural(self):
         required = ("quality", "runtime")
         self.assertEqual(gate_row("gate", required, {})["status"], "MISSING")

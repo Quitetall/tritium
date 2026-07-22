@@ -10,17 +10,42 @@ import importlib.util
 import json
 import math
 import os
+import platform
 import re
 import tempfile
+import time
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 
 SCHEMA = "tritium.wheel-functional-smoke.v1"
+RECEIPT_SCHEMA = "tritium.wheel-functional-qualification.v1"
+RECEIPT_FIELDS = {
+    "schema", "receipt_id", "release", "run_id", "started_at_utc",
+    "duration_ms", "machine", "artifact", "evidence", "result",
+}
+MACHINE_FIELDS = {"machine_id", "system", "architecture"}
+ARTIFACT_FIELDS = {"kind", "name", "bytes", "sha256"}
+EVIDENCE_FIELDS = {
+    "schema", "source_revision", "passed", "wheel", "wheel_sha256",
+    "distribution_version", "python_version", "torch_version",
+    "transformers_version", "safetensors_version", "native_device",
+    "compiled_backends", "tritium_module", "converted_parameters", "operations",
+}
+REQUIRED_OPERATIONS = frozenset({
+    "native_ternary_matmul", "qat_forward_backward", "optimizer_step",
+    "optimizer_checkpoint_resume", "hf_safetensors_save_reload",
+    "tied_weight_identity",
+})
+MAX_RECEIPT_BYTES = 1024 * 1024
 
 
 class SmokeError(RuntimeError):
     """Installed wheel failed functional qualification."""
+
+
+def _canonical(value: object) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
 def _sha256(path: Path) -> str:
@@ -273,9 +298,137 @@ def _atomic_write(path: Path, document: dict[str, object]) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
     finally:
         if temporary.exists():
             temporary.unlink()
+
+
+def build_receipt(
+    evidence: dict[str, object], wheel: Path, release: str, run_id: str,
+    started_at_utc: str, duration_ms: float,
+) -> dict[str, object]:
+    if re.fullmatch(r"1\.1\.0-rc\.(0|[1-9][0-9]*)", release) is None:
+        raise SmokeError("release must be a canonical v1.1 candidate")
+    if not run_id:
+        raise SmokeError("run id must be non-empty")
+    if not math.isfinite(duration_ms) or duration_ms <= 0:
+        raise SmokeError("qualification duration must be finite and positive")
+    wheel = resolve_wheel(wheel)
+    machine_material = {
+        "node": platform.node(),
+        "system": platform.system(),
+        "architecture": platform.machine(),
+    }
+    receipt: dict[str, object] = {
+        "schema": RECEIPT_SCHEMA,
+        "release": release,
+        "run_id": run_id,
+        "started_at_utc": started_at_utc,
+        "duration_ms": duration_ms,
+        "machine": {
+            "machine_id": "sha256:" + hashlib.sha256(_canonical(machine_material)).hexdigest(),
+            "system": platform.system(),
+            "architecture": platform.machine(),
+        },
+        "artifact": {
+            "kind": "python-wheel",
+            "name": wheel.name,
+            "bytes": wheel.stat().st_size,
+            "sha256": _sha256(wheel),
+        },
+        "evidence": evidence,
+        "result": "pass",
+    }
+    receipt["receipt_id"] = "sha256:" + hashlib.sha256(_canonical(receipt)).hexdigest()
+    return receipt
+
+
+def validate_receipt(
+    path: Path, source_revision: str, release: str, wheel: Path,
+) -> dict[str, object]:
+    if path.is_symlink() or not path.is_file():
+        raise SmokeError("functional receipt must be a regular non-symlink file")
+    if path.stat().st_size > MAX_RECEIPT_BYTES:
+        raise SmokeError("functional receipt exceeds metadata size limit")
+    try:
+        receipt = json.loads(path.read_bytes())
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise SmokeError("functional receipt must contain UTF-8 JSON") from error
+    if not isinstance(receipt, dict) or set(receipt) != RECEIPT_FIELDS:
+        raise SmokeError("functional receipt fields do not match frozen schema")
+    if receipt["schema"] != RECEIPT_SCHEMA or receipt["result"] != "pass":
+        raise SmokeError("functional receipt is not passed qualification evidence")
+    if receipt["release"] != release or not isinstance(receipt["run_id"], str) or not receipt["run_id"]:
+        raise SmokeError("functional receipt release or run identity mismatch")
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", str(receipt["started_at_utc"])) is None:
+        raise SmokeError("functional receipt timestamp is not canonical UTC")
+    duration = receipt["duration_ms"]
+    if isinstance(duration, bool) or not isinstance(duration, (int, float)) or not math.isfinite(float(duration)) or duration <= 0:
+        raise SmokeError("functional receipt duration is invalid")
+    machine = receipt["machine"]
+    if not isinstance(machine, dict) or set(machine) != MACHINE_FIELDS or re.fullmatch(
+        r"sha256:[0-9a-f]{64}", str(machine.get("machine_id", ""))
+    ) is None or any(not isinstance(machine[field], str) or not machine[field] for field in ("system", "architecture")):
+        raise SmokeError("functional receipt machine identity is invalid")
+    wheel = resolve_wheel(wheel)
+    artifact = receipt["artifact"]
+    expected_artifact = {
+        "kind": "python-wheel", "name": wheel.name,
+        "bytes": wheel.stat().st_size, "sha256": _sha256(wheel),
+    }
+    if not isinstance(artifact, dict) or set(artifact) != ARTIFACT_FIELDS or artifact != expected_artifact:
+        raise SmokeError("functional receipt does not bind exact candidate wheel")
+    evidence = receipt["evidence"]
+    if not isinstance(evidence, dict) or set(evidence) != EVIDENCE_FIELDS:
+        raise SmokeError("functional evidence fields do not match frozen schema")
+    if evidence["schema"] != SCHEMA or evidence["passed"] is not True:
+        raise SmokeError("functional evidence did not pass")
+    if evidence["source_revision"] != source_revision:
+        raise SmokeError("functional evidence source revision mismatch")
+    if evidence["wheel"] != wheel.name or evidence["wheel_sha256"] != expected_artifact["sha256"]:
+        raise SmokeError("functional evidence wheel identity mismatch")
+    expected_version = release.replace("1.1.0-rc.", "1.1.0rc")
+    if evidence["distribution_version"] != expected_version:
+        raise SmokeError("functional evidence package version mismatch")
+    for field in (
+        "python_version", "torch_version", "transformers_version",
+        "safetensors_version", "tritium_module",
+    ):
+        if not isinstance(evidence[field], str) or not evidence[field]:
+            raise SmokeError(f"functional evidence {field} is invalid")
+    if not Path(evidence["tritium_module"]).is_absolute():
+        raise SmokeError("functional evidence module path is not absolute")
+    compiled = evidence["compiled_backends"]
+    if (
+        not isinstance(compiled, list)
+        or any(not isinstance(backend, str) or not backend for backend in compiled)
+        or len(set(compiled)) != len(compiled)
+    ):
+        raise SmokeError("functional evidence backend inventory is invalid")
+    device = evidence["native_device"]
+    if device not in {"cpu", "cuda:0"} or device.split(":", 1)[0] not in compiled:
+        raise SmokeError("functional evidence device was not compiled into wheel")
+    operations = evidence["operations"]
+    if (
+        not isinstance(operations, list)
+        or any(not isinstance(operation, str) for operation in operations)
+        or len(operations) != len(REQUIRED_OPERATIONS)
+        or set(operations) != REQUIRED_OPERATIONS
+    ):
+        raise SmokeError("functional evidence operation coverage is incomplete")
+    if type(evidence["converted_parameters"]) is not int or evidence["converted_parameters"] <= 0:
+        raise SmokeError("functional evidence converted no parameters")
+    unsigned = dict(receipt)
+    receipt_id = unsigned.pop("receipt_id")
+    expected_id = "sha256:" + hashlib.sha256(_canonical(unsigned)).hexdigest()
+    if receipt_id != expected_id:
+        raise SmokeError("functional receipt identity mismatch")
+    return receipt
 
 
 def main() -> int:
@@ -285,15 +438,26 @@ def main() -> int:
     parser.add_argument("--source-revision", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--device", choices=("cpu", "cuda:0"), default="cpu")
+    parser.add_argument("--release", required=True)
+    parser.add_argument("--run-id", required=True)
     args = parser.parse_args()
     try:
+        started_at_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        started = time.monotonic()
         evidence = run_smoke(
             args.wheel, args.forbidden_root, args.source_revision, args.device
         )
-        _atomic_write(args.output, evidence)
+        receipt = build_receipt(
+            evidence, args.wheel, args.release, args.run_id,
+            started_at_utc, (time.monotonic() - started) * 1000.0,
+        )
+        _atomic_write(args.output, receipt)
+        validate_receipt(
+            args.output, args.source_revision, args.release, resolve_wheel(args.wheel)
+        )
     except (OSError, SmokeError) as error:
         parser.error(str(error))
-    print(json.dumps(evidence))
+    print(json.dumps(receipt))
     return 0
 
 

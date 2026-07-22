@@ -254,6 +254,13 @@ CPU and CUDA wheel lanes now generate deterministic CycloneDX 1.6 inventories
 from each already-verified wheel. SBOM root binds exact release artifact ID,
 wheel SHA-256/bytes/platform, every RECORD-covered member digest and every
 declared `Requires-Dist`; CI uploads SBOM beside same wheel.
+
+Installed-wheel CPU/CUDA differentiable lifecycle runs now publish strict
+content-addressed qualification receipts binding source revision, candidate
+version, independent run/machine identity, exact wheel bytes, environment,
+native device/backend and frozen QAT/checkpoint/reload coverage. Release-registry
+admission rehashes candidate wheel and receipt; this closes one clean-install
+evidence kind but does not replace full interpreter/platform matrix admission.
 The exact npm archive verifier now emits its own deterministic CycloneDX 1.6
 document into retained evidence. It binds archive SHA-256/bytes, package/version,
 source revision, WASM guest digest, every lockfile component with strong

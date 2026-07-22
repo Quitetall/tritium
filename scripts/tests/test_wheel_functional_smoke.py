@@ -1,3 +1,4 @@
+import json
 import importlib.util
 import tempfile
 import unittest
@@ -12,6 +13,73 @@ SPEC.loader.exec_module(MODULE)
 
 
 class WheelFunctionalSmokeTests(unittest.TestCase):
+    def _evidence(self, wheel: Path) -> dict:
+        return {
+            "schema": MODULE.SCHEMA,
+            "source_revision": "a" * 40,
+            "passed": True,
+            "wheel": wheel.name,
+            "wheel_sha256": MODULE._sha256(wheel),
+            "distribution_version": "1.1.0rc0",
+            "python_version": "3.13.5",
+            "torch_version": "2.11.0",
+            "transformers_version": "5.5.3",
+            "safetensors_version": "0.8.0",
+            "native_device": "cpu",
+            "compiled_backends": ["cpu"],
+            "tritium_module": "/venv/tritium/__init__.py",
+            "converted_parameters": 256,
+            "operations": sorted(MODULE.REQUIRED_OPERATIONS),
+        }
+
+    def test_functional_receipt_binds_wheel_revision_run_and_coverage(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            wheel = root / "candidate.whl"
+            wheel.write_bytes(b"wheel")
+            receipt = MODULE.build_receipt(
+                self._evidence(wheel), wheel, "1.1.0-rc.0", "run-1",
+                "2026-07-21T12:00:00Z", 100.0,
+            )
+            path = root / "receipt.json"
+            MODULE._atomic_write(path, receipt)
+            self.assertEqual(
+                MODULE.validate_receipt(path, "a" * 40, "1.1.0-rc.0", wheel),
+                receipt,
+            )
+
+    def test_functional_receipt_rejects_artifact_and_coverage_drift(self):
+        for mutation in (
+            "artifact", "coverage", "identity", "backend", "backend-type",
+            "coverage-type", "version",
+        ):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw)
+                wheel = root / "candidate.whl"
+                wheel.write_bytes(b"wheel")
+                receipt = MODULE.build_receipt(
+                    self._evidence(wheel), wheel, "1.1.0-rc.0", "run-1",
+                    "2026-07-21T12:00:00Z", 100.0,
+                )
+                path = root / "receipt.json"
+                if mutation == "artifact":
+                    wheel.write_bytes(b"changed")
+                elif mutation == "coverage":
+                    receipt["evidence"]["operations"].pop()
+                elif mutation == "backend":
+                    receipt["evidence"]["compiled_backends"] = []
+                elif mutation == "backend-type":
+                    receipt["evidence"]["compiled_backends"] = [{}]
+                elif mutation == "coverage-type":
+                    receipt["evidence"]["operations"] = [{}]
+                elif mutation == "version":
+                    receipt["evidence"]["distribution_version"] = "1.1.0rc1"
+                else:
+                    receipt["receipt_id"] = "sha256:" + "0" * 64
+                path.write_text(json.dumps(receipt), encoding="utf-8")
+                with self.assertRaises(MODULE.SmokeError):
+                    MODULE.validate_receipt(path, "a" * 40, "1.1.0-rc.0", wheel)
+
     def test_resolve_wheel_requires_exactly_one_regular_file(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)

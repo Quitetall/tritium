@@ -12,6 +12,10 @@ from typing import Any
 
 CUDA_RECEIPT = runpy.run_path(Path(__file__).with_name("verify-cuda-training-receipt.py"))
 validate_cuda_receipt = CUDA_RECEIPT["validate"]
+CudaReceiptError = CUDA_RECEIPT["ReceiptError"]
+WHEEL_RECEIPT = runpy.run_path(Path(__file__).with_name("wheel-functional-smoke.py"))
+validate_wheel_receipt = WHEEL_RECEIPT["validate_receipt"]
+WheelReceiptError = WHEEL_RECEIPT["SmokeError"]
 
 SCHEMA = "tritium.release-evidence-registry.v1"
 REPORT_SCHEMA = "tritium.release-gate-report.v1"
@@ -19,7 +23,7 @@ TOP_FIELDS = {
     "schema", "release", "source_revision", "candidate_manifest_sha256", "receipts"
 }
 RECEIPT_FIELDS = {"id", "kind", "path", "sha256", "artifact_id", "parents"}
-KNOWN_KINDS = frozenset({"cuda-training"})
+KNOWN_KINDS = frozenset({"cuda-training", "clean-install"})
 HEX = frozenset("0123456789abcdef")
 MAX_RECEIPT_BYTES = 32 * 1024 * 1024
 
@@ -202,15 +206,20 @@ def evaluate(registry: Path, candidate: Path, candidate_document: dict[str, Any]
             raise EvidenceError("CUDA training evidence must bind a candidate Python wheel")
         artifact_path = candidate.parent / _string(artifact.get("path"), "candidate artifact path")
         try:
-            receipt = validate_cuda_receipt(
-                receipt_path, revision, release, artifact_path
-            )
-        except (OSError, ValueError) as error:
-            raise EvidenceError(f"{label} failed CUDA receipt validation: {error}") from error
+            if kind == "cuda-training":
+                receipt = validate_cuda_receipt(
+                    receipt_path, revision, release, artifact_path
+                )
+            else:
+                receipt = validate_wheel_receipt(
+                    receipt_path, revision, release, artifact_path
+                )
+        except (OSError, CudaReceiptError, WheelReceiptError) as error:
+            raise EvidenceError(f"{label} failed {kind} validation: {error}") from error
         if receipt["receipt_id"] != receipt_id:
             raise EvidenceError(f"{label}.id does not match the receipt identity")
         if receipt["artifact"]["kind"] != "python-wheel":
-            raise EvidenceError("CUDA training receipt does not identify a Python wheel")
+            raise EvidenceError(f"{kind} receipt does not identify a Python wheel")
         run_id = receipt["run_id"]
         if run_id in run_ids:
             raise EvidenceError(f"duplicate run id {run_id!r}")
