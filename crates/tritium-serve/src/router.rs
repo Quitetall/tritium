@@ -25,6 +25,7 @@ use crate::generator::{FinishReason, GenRequest, Generator, Sampling};
 use crate::sse::{
     IncrementalDetok, StopMatcher, content_chunk, error_chunk, role_chunk, terminal_chunk,
 };
+use crate::startup::{AdmittedGeneratorV1, ProductionReadiness, prepare_production_generator};
 use crate::worker::{GenEvent, Job, spawn_worker};
 
 /// How `/v1/chat/completions` renders `messages` into the prompt string
@@ -169,8 +170,7 @@ struct AppState {
     jobs: mpsc::Sender<Job>,
     tok: Arc<dyn Tokenizer + Send + Sync>,
     model_id: Arc<str>,
-    draining: Arc<AtomicBool>,
-    worker_alive: Arc<AtomicBool>,
+    runtime: RuntimeState,
     max_new_default: usize,
     max_messages: usize,
     max_prompt_bytes: usize,
@@ -180,6 +180,13 @@ struct AppState {
     request_timeout: Option<Duration>,
     chat_template: ChatTemplate,
     metrics: Arc<Metrics>,
+}
+
+#[derive(Clone)]
+struct RuntimeState {
+    draining: Arc<AtomicBool>,
+    worker_alive: Arc<AtomicBool>,
+    production: Option<ProductionReadiness>,
 }
 
 /// Build the router. Returns it plus the drain flag — set the flag (then run
@@ -209,7 +216,18 @@ pub fn build_router_with_limits(
         cfg.queue_cap,
     );
     let admission = Arc::new(Admission::legacy(cfg.auth_token.as_deref()));
-    build_router_inner(jobs, tok, cfg, limits, admission, draining, worker_alive)
+    build_router_inner(
+        jobs,
+        tok,
+        cfg,
+        limits,
+        admission,
+        RuntimeState {
+            draining,
+            worker_alive,
+            production: None,
+        },
+    )
 }
 
 /// Build the router with explicit request ceilings, rotating bearer keys and
@@ -239,9 +257,48 @@ pub fn build_router_governed(
         cfg,
         limits,
         admission,
-        draining,
-        worker_alive,
+        RuntimeState {
+            draining,
+            worker_alive,
+            production: None,
+        },
     ))
+}
+
+/// Build a production router only after strict schema-v3 load admission and a
+/// synchronous deterministic one-token self-test. No worker or listener-facing
+/// router exists when policy validation or self-test fails.
+pub fn build_router_production(
+    admitted: AdmittedGeneratorV1,
+    tok: Arc<dyn Tokenizer + Send + Sync>,
+    cfg: ServeConfig,
+    limits: RequestLimits,
+    policy: AdmissionPolicy,
+) -> std::io::Result<(Router, Arc<AtomicBool>, ProductionReadiness)> {
+    let admission = Arc::new(Admission::new(cfg.auth_token.as_deref(), policy)?);
+    let (generator, production) = prepare_production_generator(admitted)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let draining = Arc::new(AtomicBool::new(false));
+    let worker_alive = Arc::new(AtomicBool::new(true));
+    let jobs = spawn_worker(
+        generator,
+        draining.clone(),
+        worker_alive.clone(),
+        cfg.queue_cap,
+    );
+    let (router, _) = build_router_inner(
+        jobs,
+        tok,
+        cfg,
+        limits,
+        admission,
+        RuntimeState {
+            draining: draining.clone(),
+            worker_alive,
+            production: Some(production.clone()),
+        },
+    );
+    Ok((router, draining, production))
 }
 
 /// Continuous-batching router (`--batch-slots > 1`): spawns the batched
@@ -332,8 +389,11 @@ fn build_router_batched_inner(
         cfg,
         limits,
         admission,
-        draining,
-        worker_alive,
+        RuntimeState {
+            draining,
+            worker_alive,
+            production: None,
+        },
     ))
 }
 
@@ -343,16 +403,14 @@ fn build_router_inner(
     cfg: ServeConfig,
     limits: RequestLimits,
     admission: Arc<Admission>,
-    draining: Arc<AtomicBool>,
-    worker_alive: Arc<AtomicBool>,
+    runtime: RuntimeState,
 ) -> (Router, Arc<AtomicBool>) {
     let metrics_state = Arc::new(Metrics::default());
     let state = AppState {
         jobs,
         tok,
         model_id: Arc::from(cfg.model_id.as_str()),
-        draining: draining.clone(),
-        worker_alive,
+        runtime: runtime.clone(),
         max_new_default: cfg.max_new_default,
         max_messages: limits.max_messages,
         max_prompt_bytes: limits.max_prompt_bytes,
@@ -454,7 +512,7 @@ fn build_router_inner(
             }
         },
     ));
-    (router, draining)
+    (router, runtime.draining)
 }
 
 fn now_secs() -> u64 {
@@ -492,6 +550,16 @@ fn request_timeout_error() -> ApiError {
     error
 }
 
+fn request_ready(state: &AppState) -> bool {
+    state.runtime.worker_alive.load(Ordering::Relaxed)
+        && !state.runtime.draining.load(Ordering::Relaxed)
+        && state
+            .runtime
+            .production
+            .as_ref()
+            .is_none_or(ProductionReadiness::is_serving)
+}
+
 /// Lower the OpenAI sampling fields to the internal [`Sampling`]. `temperature
 /// <= 0` is deterministic greedy; otherwise top-p if given, else greedy (we do
 /// not invent a default top_p).
@@ -511,11 +579,19 @@ fn lower_sampling(req: &ChatRequest) -> Sampling {
 }
 
 async fn chat_completions(State(st): State<AppState>, Json(req): Json<ChatRequest>) -> Response {
-    if st.draining.load(Ordering::Relaxed) {
+    if st.runtime.draining.load(Ordering::Relaxed) {
         return api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "server_error",
             "server is draining",
+            None,
+        );
+    }
+    if !request_ready(&st) {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server_error",
+            "server is not ready",
             None,
         );
     }
@@ -1019,7 +1095,7 @@ async fn models(State(st): State<AppState>) -> Response {
 
 async fn health(State(st): State<AppState>) -> Response {
     let queue_depth = st.jobs.max_capacity() - st.jobs.capacity();
-    if !st.worker_alive.load(Ordering::Relaxed) {
+    if !st.runtime.worker_alive.load(Ordering::Relaxed) {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({
@@ -1034,17 +1110,22 @@ async fn health(State(st): State<AppState>) -> Response {
         "status": "ok",
         "model": &*st.model_id,
         "worker_alive": true,
-        "draining": st.draining.load(Ordering::Relaxed),
+        "draining": st.runtime.draining.load(Ordering::Relaxed),
         "queue_depth": queue_depth,
     }))
     .into_response()
 }
 
 async fn readiness(State(st): State<AppState>) -> Response {
-    let worker_alive = st.worker_alive.load(Ordering::Relaxed);
-    let draining = st.draining.load(Ordering::Relaxed);
+    let worker_alive = st.runtime.worker_alive.load(Ordering::Relaxed);
+    let draining = st.runtime.draining.load(Ordering::Relaxed);
     let queue_depth = st.jobs.max_capacity() - st.jobs.capacity();
-    let ready = worker_alive && !draining;
+    let artifact_ready = st
+        .runtime
+        .production
+        .as_ref()
+        .is_none_or(|state| state.is_serving());
+    let ready = worker_alive && !draining && artifact_ready;
     let status = if ready {
         StatusCode::OK
     } else {
@@ -1058,6 +1139,14 @@ async fn readiness(State(st): State<AppState>) -> Response {
             "worker_alive": worker_alive,
             "draining": draining,
             "queue_depth": queue_depth,
+            "production_artifact": st.runtime.production.is_some(),
+            "artifact_ready": artifact_ready,
+            "release_gate": if st.runtime.production.is_some() {
+                "production_artifact_admitted"
+            } else {
+                "legacy_compatibility"
+            },
+            "startup_receipt": st.runtime.production.as_ref().map(ProductionReadiness::receipt),
         })),
     )
         .into_response()
@@ -1101,7 +1190,7 @@ async fn metrics(State(st): State<AppState>) -> Response {
         st.metrics.tokens_out.load(Ordering::Relaxed),
         st.metrics.stream_timeouts.load(Ordering::Relaxed),
         queue_depth,
-        u8::from(st.worker_alive.load(Ordering::Relaxed)),
+        u8::from(st.runtime.worker_alive.load(Ordering::Relaxed)),
         crate::generator::SPEC_VERIFIES.load(Ordering::Relaxed),
         crate::generator::SPEC_COMMITTED.load(Ordering::Relaxed),
     );
@@ -1136,11 +1225,19 @@ struct TreeVerifyRequest {
 }
 
 async fn tree_session(State(st): State<AppState>, Json(req): Json<TreeSessionRequest>) -> Response {
-    if st.draining.load(std::sync::atomic::Ordering::Relaxed) {
+    if st.runtime.draining.load(Ordering::Relaxed) {
         return api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "draining",
             "server is draining",
+            None,
+        );
+    }
+    if !request_ready(&st) {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server_error",
+            "server is not ready",
             None,
         );
     }
@@ -1164,11 +1261,19 @@ async fn tree_session(State(st): State<AppState>, Json(req): Json<TreeSessionReq
 }
 
 async fn tree_verify(State(st): State<AppState>, Json(req): Json<TreeVerifyRequest>) -> Response {
-    if st.draining.load(std::sync::atomic::Ordering::Relaxed) {
+    if st.runtime.draining.load(Ordering::Relaxed) {
         return api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "draining",
             "server is draining",
+            None,
+        );
+    }
+    if !request_ready(&st) {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server_error",
+            "server is not ready",
             None,
         );
     }

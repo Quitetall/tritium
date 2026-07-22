@@ -36,6 +36,8 @@ mod router;
 #[cfg(feature = "serve")]
 mod sse;
 #[cfg(feature = "serve")]
+mod startup;
+#[cfg(feature = "serve")]
 mod worker;
 
 pub use generator::{
@@ -49,9 +51,14 @@ pub use admission::{AdmissionPolicy, MAX_BEARER_TOKENS, PrincipalRateLimit};
 #[cfg(feature = "serve")]
 pub use router::{
     ChatTemplate, RequestLimits, ServeConfig, build_router, build_router_governed,
-    build_router_with_limits,
+    build_router_production, build_router_with_limits,
 };
 #[cfg(feature = "cuda")]
 pub use router::{
     build_router_batched, build_router_batched_governed, build_router_batched_with_limits,
+};
+#[cfg(feature = "serve")]
+pub use startup::{
+    AdmittedArtifactV1, AdmittedGeneratorV1, ProductionReadiness, StartupError, StartupReceiptV1,
+    prepare_production_generator,
 };

@@ -303,6 +303,10 @@ async fn models_liveness_and_readiness_split_during_drain() {
     assert_eq!(ready, StatusCode::OK);
     let readiness: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(readiness["status"], "ready");
+    assert_eq!(readiness["production_artifact"], false);
+    assert_eq!(readiness["artifact_ready"], true);
+    assert_eq!(readiness["release_gate"], "legacy_compatibility");
+    assert!(readiness["startup_receipt"].is_null());
 
     draining.store(true, Ordering::Relaxed);
     let (alive, body) = send(

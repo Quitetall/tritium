@@ -75,6 +75,19 @@ identities; corrupt package bytes, asset digests, coverage, tokenizer or backend
 policy fail before readiness. A readiness test must use the actual native
 loader, not `MockGenerator`.
 
+Progress (2026-07-21): `tritium-serve` now has an unforgeable admission bridge
+from `Qwen35SaltV2LoadReceipt`, a versioned startup receipt, a synchronous
+deterministic one-token self-test before worker spawn, and a one-way production
+readiness revocation handle. The production builder accepts only an opaque
+admitted-generator capability, preventing artifact-A/generator-B receipt
+substitution. Production `/readyz` binds package/source/backend/
+device/byte-ledger identities and the self-test digest; legacy routers are
+explicitly labeled `legacy_compatibility` and cannot satisfy the production
+artifact gate. The remaining binding work is to construct the production
+generator from the same strict native load transaction and exercise real CPU
+and CUDA fixtures. Until that exists, the production builder is a hardened
+seam, not release-gate evidence.
+
 ## Slice 2 — request security and resource governance
 
 Close the actionable server residuals in `docs/security/threat-model.md`:
