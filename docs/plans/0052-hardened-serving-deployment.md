@@ -326,10 +326,18 @@ pins backend-error and panic latching without adding a production fault
 endpoint. A causal latched-fault to watchdog replacement execution remains an
 open gate alongside external device/OOM and artifact-volume faults.
 
+The Kubernetes v4 qualifier now adds a causal unresponsive-process gate without
+a production fault API: it sends `SIGSTOP` to the serving process from the
+same-UID watchdog container, requires authenticated health failures to drive
+bounded TERM-to-KILL escalation, observes the same pod UID with a new Tritium
+container ID and exactly one exit-137 restart, then proves immutable startup
+receipt parity, clean fault telemetry and recovered generation. This exercises
+the watchdog's worst-case replacement path; a real latched backend/device fault
+and OOM execution remain open.
+
 1. malformed/truncated/wrong-identity artifact at startup;
 2. missing secret, invalid config and unavailable requested backend;
-3. watchdog-triggered backend-fault replacement, device loss/OOM and artifact
-   volume loss;
+3. latched backend/device loss, OOM and artifact volume loss;
 4. telemetry collector unavailable/slow and metrics scrape flood;
 5. failed rollout followed by digest-pinned rollback.
 

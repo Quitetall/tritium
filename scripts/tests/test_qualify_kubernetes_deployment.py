@@ -13,6 +13,7 @@ MODULE = runpy.run_path(ROOT / "scripts" / "qualify-kubernetes-deployment.py")
 DeploymentError = MODULE["DeploymentError"]
 canonical = MODULE["canonical"]
 pod_snapshot = MODULE["pod_snapshot"]
+container_identity = MODULE["container_identity"]
 validate_deployment = MODULE["validate_deployment"]
 validate_receipt = MODULE["validate_receipt"]
 metrics_snapshot = MODULE["metrics_snapshot"]
@@ -21,6 +22,8 @@ scale_snapshot = MODULE["scale_snapshot"]
 prometheus_url = MODULE["prometheus_url"]
 deployment_update_identity = MODULE["deployment_update_identity"]
 validate_scale_contract = MODULE["validate_scale_contract"]
+WATCHDOG_FAULT_COMMAND = MODULE["WATCHDOG_FAULT_COMMAND"]
+watchdog_contract = MODULE["watchdog_contract"]
 
 
 def startup(flavor: str = "cpu") -> dict:
@@ -89,12 +92,38 @@ def receipt(chart: Path, image_archive: Path, candidate: Path,
             "release_name": "qualification", "deployment_uid": "deployment-uid",
             "qualification_lock_uid": "lock-uid",
             "initial": {"pods": [{"name": "pod-old", "uid": "pod-old-uid",
-                                    "node": "node-1", "restarts": 0}]},
+                                    "node": "node-1", "restarts": 1}]},
             "restarted": {"pods": [{"name": "pod-new", "uid": "pod-new-uid",
                                       "node": "node-1", "restarts": 0}]},
             "updated": {"pods": [{"name": "pod-updated", "uid": "pod-updated-uid",
                                     "node": "node-1", "restarts": 0}]},
             "startup_receipt": startup_receipt,
+            "watchdog_replacement": {
+                "pod_uid": "pod-old-uid",
+                "container_id_before": "containerd://old",
+                "container_id_after": "containerd://new",
+                "restart_count_before": 0,
+                "restart_count_after": 1,
+                "last_exit_code": 137,
+                "fault_command_sha256": hashlib.sha256(
+                    WATCHDOG_FAULT_COMMAND.encode()
+                ).hexdigest(),
+                "replacement_ms": 32000.0,
+                "watchdog": {
+                    "period_seconds": 10, "timeout_seconds": 2,
+                    "failure_threshold": 3, "escalation_seconds": 2,
+                    "scheduling_allowance_ms": 60000, "budget_ms": 98000,
+                },
+                "startup_receipt": dict(startup_receipt),
+                "generation_response_sha256": "a" * 64,
+                "metrics": {"sha256": "b" * 64, "values": {
+                    "tritium_chat_requests_total": 1.0,
+                    "tritium_tokens_out_total": 1.0,
+                    "tritium_worker_alive": 1.0,
+                    "tritium_backend_faults_total": 0.0,
+                    "tritium_backend_faulted": 0.0,
+                }},
+            },
             "restart_startup_receipt": dict(startup_receipt),
             "update_startup_receipt": dict(startup_receipt),
             "update_strategy": "Recreate" if flavor == "cuda" else "RollingUpdate",
@@ -365,6 +394,41 @@ class QualifyKubernetesDeploymentTests(unittest.TestCase):
         with self.assertRaisesRegex(DeploymentError, "NVIDIA GPU"):
             pod_snapshot(document, "cuda")
 
+    def test_watchdog_container_identity_binds_restart_and_exit(self):
+        document = {
+            "metadata": {"name": "pod", "uid": "pod-uid"},
+            "status": {"containerStatuses": [{
+                "name": "tritium", "containerID": "containerd://new",
+                "restartCount": 1,
+                "lastState": {"terminated": {"exitCode": 137}},
+            }]},
+        }
+        self.assertEqual(container_identity(document, "pod", "tritium"), {
+            "pod_uid": "pod-uid", "container_id": "containerd://new",
+            "restart_count": 1, "last_exit_code": 137,
+        })
+        document["status"]["containerStatuses"].append(
+            dict(document["status"]["containerStatuses"][0])
+        )
+        with self.assertRaisesRegex(DeploymentError, "status differs"):
+            container_identity(document, "pod", "tritium")
+
+    def test_watchdog_contract_derives_bounded_escalation_budget(self):
+        script = (
+            'while sleep 10; do wget --timeout=2 http://127.0.0.1/healthz; '
+            'if [ "$failures" -ge 3 ]; then pid="$(pidof tritium-serve)"; '
+            'kill $pid; sleep 2; kill -0 $pid && kill -KILL $pid || true; fi; done'
+        )
+        document = {"spec": {"template": {"spec": {"containers": [
+            {"name": "authenticated-probe", "args": [script]},
+        ]}}}}
+        self.assertEqual(watchdog_contract(document)["budget_ms"], 98000)
+        document["spec"]["template"]["spec"]["containers"][0]["args"][0] = (
+            script.replace("sleep 2; kill -0", "sleep 3; kill -0")
+        )
+        with self.assertRaisesRegex(DeploymentError, "bounds differ"):
+            watchdog_contract(document)
+
     def test_receipt_validator_binds_both_candidate_artifacts_and_restart(self):
         with tempfile.TemporaryDirectory() as raw:
             chart, image, manifest, build, candidate = candidate_inputs(raw)
@@ -386,6 +450,48 @@ class QualifyKubernetesDeploymentTests(unittest.TestCase):
             del value["receipt_id"]
             value["receipt_id"] = "sha256:" + hashlib.sha256(canonical(value)).hexdigest()
             with self.assertRaisesRegex(DeploymentError, "restart metrics"):
+                validate(value, chart, image, manifest, build, candidate)
+
+    def test_receipt_validator_binds_watchdog_process_replacement(self):
+        with tempfile.TemporaryDirectory() as raw:
+            chart, image, manifest, build, candidate = candidate_inputs(raw)
+            value = receipt(chart, image, candidate)
+            value["workload"]["watchdog_replacement"]["last_exit_code"] = 143
+            del value["receipt_id"]
+            value["receipt_id"] = "sha256:" + hashlib.sha256(canonical(value)).hexdigest()
+            with self.assertRaisesRegex(DeploymentError, "watchdog replacement"):
+                validate(value, chart, image, manifest, build, candidate)
+
+    def test_receipt_validator_binds_exact_watchdog_fault_command(self):
+        with tempfile.TemporaryDirectory() as raw:
+            chart, image, manifest, build, candidate = candidate_inputs(raw)
+            value = receipt(chart, image, candidate)
+            value["workload"]["watchdog_replacement"]["fault_command_sha256"] = "0" * 64
+            del value["receipt_id"]
+            value["receipt_id"] = "sha256:" + hashlib.sha256(canonical(value)).hexdigest()
+            with self.assertRaisesRegex(DeploymentError, "fault command differs"):
+                validate(value, chart, image, manifest, build, candidate)
+
+    def test_receipt_validator_rejects_over_budget_watchdog_replacement(self):
+        with tempfile.TemporaryDirectory() as raw:
+            chart, image, manifest, build, candidate = candidate_inputs(raw)
+            value = receipt(chart, image, candidate)
+            value["workload"]["watchdog_replacement"]["replacement_ms"] = 98001
+            del value["receipt_id"]
+            value["receipt_id"] = "sha256:" + hashlib.sha256(canonical(value)).hexdigest()
+            with self.assertRaisesRegex(DeploymentError, "exceeded its budget"):
+                validate(value, chart, image, manifest, build, candidate)
+
+    def test_receipt_validator_rejects_coordinated_watchdog_policy_tamper(self):
+        with tempfile.TemporaryDirectory() as raw:
+            chart, image, manifest, build, candidate = candidate_inputs(raw)
+            value = receipt(chart, image, candidate)
+            policy = value["workload"]["watchdog_replacement"]["watchdog"]
+            policy["period_seconds"] = 60
+            policy["budget_ms"] = 248000
+            del value["receipt_id"]
+            value["receipt_id"] = "sha256:" + hashlib.sha256(canonical(value)).hexdigest()
+            with self.assertRaisesRegex(DeploymentError, "policy differs"):
                 validate(value, chart, image, manifest, build, candidate)
 
     def test_receipt_validator_rejects_chart_or_image_drift(self):

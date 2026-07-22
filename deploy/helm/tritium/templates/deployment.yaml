@@ -192,7 +192,11 @@ spec:
                   failures=$((failures + 1));
                   if [ "$failures" -ge {{ int64 .Values.probes.watchdog.failureThreshold }} ]; then
                     pid="$(pidof tritium-serve || true)";
-                    [ -n "$pid" ] && kill $pid;
+                    if [ -n "$pid" ]; then
+                      kill $pid;
+                      sleep {{ int64 .Values.probes.watchdog.timeoutSeconds }};
+                      kill -0 $pid 2>/dev/null && kill -KILL $pid || true;
+                    fi;
                     exit 1;
                   fi;
                 fi;
@@ -211,10 +215,6 @@ spec:
             exec:
               command: ["sh", "-ec", "wget -qO- --header=\"Authorization: Bearer ${TRITIUM_AUTH_TOKEN}\" http://127.0.0.1:{{ .Values.service.port }}/readyz | grep -q '\"status\":\"ready\"'"]
             {{- toYaml .Values.probes.readiness | nindent 12 }}
-          livenessProbe:
-            exec:
-              command: ["sh", "-ec", "wget -qO- --header=\"Authorization: Bearer ${TRITIUM_AUTH_TOKEN}\" http://127.0.0.1:{{ .Values.service.port }}/healthz >/dev/null"]
-            {{- toYaml .Values.probes.liveness | nindent 12 }}
           securityContext:
             {{- toYaml .Values.containerSecurityContext | nindent 12 }}
           resources:

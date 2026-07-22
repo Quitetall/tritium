@@ -32,7 +32,7 @@ manifest_identity = RUNTIME["manifest_identity"]
 OCI_ARCHIVE = runpy.run_path(Path(__file__).with_name("verify-oci-archive.py"))
 validate_oci_archive = OCI_ARCHIVE["validate"]
 
-SCHEMA = "tritium.kubernetes-deployment-qualification.v3"
+SCHEMA = "tritium.kubernetes-deployment-qualification.v4"
 HEX = frozenset("0123456789abcdef")
 SAFE_NAME = re.compile(r"[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?")
 SAFE_SECRET_KEY = re.compile(r"[A-Za-z0-9](?:[-._A-Za-z0-9]{0,251}[A-Za-z0-9])?")
@@ -56,10 +56,22 @@ CUDA_PROBE_IMAGES = {
 CHECKS = (
     "namespace-preflight", "secret-binding", "pvc-preflight", "helm-install",
     "rollout-ready", "production-readiness", "buffered-generation", "metrics",
-    "pod-restart", "successful-update", "update-readiness", "failed-upgrade",
+    "watchdog-replacement", "pod-restart", "successful-update", "update-readiness", "failed-upgrade",
     "atomic-rollback", "rollback-readiness", "rollback-generation", "release-cleanup",
 )
 MAX_RESPONSE_BYTES = 16 * 1024 * 1024
+WATCHDOG_FAULT_COMMAND = (
+    'set -- $(pidof tritium-serve); [ "$#" -eq 1 ]; kill -STOP "$1"'
+)
+WATCHDOG_SCHEDULING_ALLOWANCE_MS = 60_000
+WATCHDOG_POLICY = {
+    "period_seconds": 10,
+    "timeout_seconds": 2,
+    "failure_threshold": 3,
+    "escalation_seconds": 2,
+    "scheduling_allowance_ms": WATCHDOG_SCHEDULING_ALLOWANCE_MS,
+    "budget_ms": 98_000,
+}
 
 
 def expected_checks(flavor: str) -> list[str]:
@@ -337,6 +349,72 @@ def pod_snapshot(document: dict[str, Any], flavor: str,
     return {"pods": sorted(pods, key=lambda item: item["uid"])}
 
 
+def container_identity(document: dict[str, Any], pod_name: str,
+                       container_name: str) -> dict[str, Any]:
+    metadata = document.get("metadata", {})
+    if metadata.get("name") != pod_name or not isinstance(metadata.get("uid"), str):
+        raise DeploymentError("watchdog pod identity differs")
+    statuses = document.get("status", {}).get("containerStatuses", [])
+    matches = [status for status in statuses if isinstance(status, dict)
+               and status.get("name") == container_name]
+    if len(matches) != 1:
+        raise DeploymentError("watchdog target container status differs")
+    status = matches[0]
+    container_id = status.get("containerID")
+    restarts = status.get("restartCount")
+    if (not isinstance(container_id, str) or not container_id
+            or type(restarts) is not int or restarts < 0):
+        raise DeploymentError("watchdog target container identity is malformed")
+    terminated = status.get("lastState", {}).get("terminated")
+    exit_code = terminated.get("exitCode") if isinstance(terminated, dict) else None
+    return {
+        "pod_uid": metadata["uid"], "container_id": container_id,
+        "restart_count": restarts, "last_exit_code": exit_code,
+    }
+
+
+def qualify_watchdog_restart(kubectl_base: list[str], *, pod_name: str,
+                             timeout: float,
+                             contract: dict[str, int]) -> dict[str, Any]:
+    before = container_identity(
+        run_json(kubectl_base + ["get", f"pod/{pod_name}", "-o", "json"]),
+        pod_name, "tritium",
+    )
+    fault_command = WATCHDOG_FAULT_COMMAND
+    started = time.monotonic()
+    run(kubectl_base + ["exec", f"pod/{pod_name}", "-c", "authenticated-probe",
+                        "--", "sh", "-ec", fault_command], min(timeout, 30.0))
+    deadline = started + min(timeout, contract["budget_ms"] / 1000)
+    while time.monotonic() < deadline:
+        current = container_identity(
+            run_json(kubectl_base + ["get", f"pod/{pod_name}", "-o", "json"]),
+            pod_name, "tritium",
+        )
+        if current["pod_uid"] != before["pod_uid"]:
+            raise DeploymentError("watchdog fault replaced the pod instead of the process")
+        if current["restart_count"] > before["restart_count"] + 1:
+            raise DeploymentError("watchdog fault caused repeated process restarts")
+        if current["restart_count"] == before["restart_count"] + 1:
+            if (current["container_id"] == before["container_id"]
+                    or current["last_exit_code"] != 137):
+                raise DeploymentError("watchdog process replacement identity differs")
+            return {
+                "pod_uid": before["pod_uid"],
+                "container_id_before": before["container_id"],
+                "container_id_after": current["container_id"],
+                "restart_count_before": before["restart_count"],
+                "restart_count_after": current["restart_count"],
+                "last_exit_code": current["last_exit_code"],
+                "fault_command_sha256": hashlib.sha256(
+                    fault_command.encode()
+                ).hexdigest(),
+                "replacement_ms": (time.monotonic() - started) * 1000,
+                "watchdog": contract,
+            }
+        time.sleep(1)
+    raise DeploymentError("watchdog did not replace the stopped serving process")
+
+
 def validate_receipt_snapshot(snapshot: Any, label: str,
                               expected_count: int = 1) -> dict[str, Any]:
     if not isinstance(snapshot, dict) or set(snapshot) != {"pods"}:
@@ -391,6 +469,45 @@ def validate_deployment(document: dict[str, Any], *, image: str,
     if strategy != expected_strategy:
         raise DeploymentError("deployment strategy differs")
     return uid
+
+
+def watchdog_contract(document: dict[str, Any]) -> dict[str, int]:
+    containers = document.get("spec", {}).get("template", {}).get("spec", {}).get(
+        "containers", []
+    )
+    matches = [container for container in containers if isinstance(container, dict)
+               and container.get("name") == "authenticated-probe"]
+    args = matches[0].get("args") if len(matches) == 1 else None
+    if not isinstance(args, list) or len(args) != 1 or not isinstance(args[0], str):
+        raise DeploymentError("deployed watchdog command is malformed")
+    script = args[0]
+    patterns = {
+        "period_seconds": r"while sleep ([0-9]+)",
+        "timeout_seconds": r"wget .*?--timeout=([0-9]+)",
+        "failure_threshold": r'failures" -ge ([0-9]+)',
+        "escalation_seconds": r"kill \$pid;\s*sleep ([0-9]+)",
+    }
+    values = {}
+    for field, pattern in patterns.items():
+        match = re.search(pattern, script, re.DOTALL)
+        if match is None:
+            raise DeploymentError(f"deployed watchdog {field} is absent")
+        values[field] = int(match.group(1))
+    if (not 1 <= values["period_seconds"] <= 60
+            or not 1 <= values["timeout_seconds"] <= 30
+            or not 1 <= values["failure_threshold"] <= 10
+            or values["escalation_seconds"] != values["timeout_seconds"]
+            or "kill -KILL $pid" not in script):
+        raise DeploymentError("deployed watchdog bounds differ")
+    values["scheduling_allowance_ms"] = WATCHDOG_SCHEDULING_ALLOWANCE_MS
+    values["budget_ms"] = (
+        values["failure_threshold"]
+        * (values["period_seconds"] + values["timeout_seconds"])
+        + values["escalation_seconds"]
+    ) * 1000 + WATCHDOG_SCHEDULING_ALLOWANCE_MS
+    if values != WATCHDOG_POLICY:
+        raise DeploymentError("deployed watchdog differs from release policy")
+    return values
 
 
 def deployment_update_identity(document: dict[str, Any]) -> dict[str, int]:
@@ -1233,6 +1350,7 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
         deployment_uid = validate_deployment(
             deployment, image=args.image, manifest_sha256=manifest_sha, flavor=args.flavor
         )
+        watchdog_policy = watchdog_contract(deployment)
         update_before = deployment_update_identity(deployment)
         if update_before["rate_limit_burst"] != 8:
             raise DeploymentError("initial deployment rate-limit burst differs")
@@ -1322,6 +1440,50 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
                 args.flavor,
             )
         first_pod = initial["pods"][0]["name"]
+        watchdog = qualify_watchdog_restart(
+            kubectl_base, pod_name=first_pod, timeout=args.timeout,
+            contract=watchdog_policy,
+        )
+        run(kubectl_base + ["rollout", "status", f"deployment/{service}",
+                            f"--timeout={timeout_value}"], args.timeout + 30)
+        watchdog_port = free_port()
+        watchdog_url = f"http://127.0.0.1:{watchdog_port}"
+        watchdog_process, watchdog_ready = port_forward(
+            kubectl_base + ["port-forward", f"service/{service}",
+                            f"{watchdog_port}:8080", "--address", "127.0.0.1"],
+            time.monotonic() + args.timeout, watchdog_url, token,
+        )
+        try:
+            watchdog_startup = validate_ready(
+                watchdog_ready, revision, args.flavor, args.profile,
+                manifest_id["blake3"], args.release,
+            )
+            watchdog_generation = request_json(
+                watchdog_url + "/v1/chat/completions", token,
+                body={"model": model_id,
+                      "messages": [{"role": "user", "content": args.prompt}],
+                      "temperature": 0, "max_tokens": 1},
+                timeout=args.request_timeout,
+            )
+            if (not isinstance(watchdog_generation.get("choices"), list)
+                    or len(watchdog_generation["choices"]) != 1):
+                raise DeploymentError("watchdog recovery generation did not return one choice")
+            watchdog_metrics = metrics_snapshot(request(
+                watchdog_url + "/metrics", token, timeout=args.request_timeout
+            ).decode("utf-8"))
+        finally:
+            stop_forward(watchdog_process)
+        if watchdog_startup != startup:
+            raise DeploymentError("watchdog replacement changed immutable startup receipt")
+        watchdog["startup_receipt"] = watchdog_startup
+        watchdog["generation_response_sha256"] = hashlib.sha256(
+            canonical(watchdog_generation)
+        ).hexdigest()
+        watchdog["metrics"] = watchdog_metrics
+        initial = pod_snapshot(
+            run_json(kubectl_base + ["get", "pods", "-l", selector, "-o", "json"]),
+            args.flavor,
+        )
         run(kubectl_base + ["delete", f"pod/{first_pod}", "--wait=true"], args.timeout)
         run(kubectl_base + ["rollout", "status", f"deployment/{service}",
                             f"--timeout={timeout_value}"], args.timeout + 30)
@@ -1571,6 +1733,7 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
         "workload": {"release_name": args.release_name, "deployment_uid": deployment_uid,
                      "qualification_lock_uid": lock_uid,
                      "initial": initial, "restarted": restarted, "updated": updated,
+                     "watchdog_replacement": watchdog,
                      "startup_receipt": startup, "restart_startup_receipt": restart_startup,
                      "update_startup_receipt": update_startup,
                      "update_strategy": "Recreate" if args.flavor == "cuda" else "RollingUpdate",
@@ -1706,6 +1869,7 @@ def validate_receipt(receipt: dict[str, Any], *, chart_path: Path, image_path: P
     if not isinstance(workload, dict) or set(workload) != {
         "release_name", "deployment_uid", "qualification_lock_uid",
         "initial", "restarted", "updated",
+        "watchdog_replacement",
         "startup_receipt", "restart_startup_receipt", "update_startup_receipt",
         "update_strategy", "update_config", "rollback_startup_receipt", "metrics",
         "restart_recovery", "scale", "helm_history",
@@ -1749,6 +1913,73 @@ def validate_receipt(receipt: dict[str, Any], *, chart_path: Path, image_path: P
     )
     if workload["restart_startup_receipt"] != workload["startup_receipt"]:
         raise DeploymentError("deployment restart changed startup receipt")
+    watchdog = workload.get("watchdog_replacement")
+    watchdog_fields = {
+        "pod_uid", "container_id_before", "container_id_after",
+        "restart_count_before", "restart_count_after", "last_exit_code",
+        "fault_command_sha256", "replacement_ms", "startup_receipt",
+        "generation_response_sha256", "metrics", "watchdog",
+    }
+    if (not isinstance(watchdog, dict) or set(watchdog) != watchdog_fields
+            or not isinstance(watchdog.get("pod_uid"), str) or not watchdog["pod_uid"]
+            or not isinstance(watchdog.get("container_id_before"), str)
+            or not watchdog["container_id_before"]
+            or not isinstance(watchdog.get("container_id_after"), str)
+            or not watchdog["container_id_after"]
+            or watchdog["container_id_before"] == watchdog["container_id_after"]
+            or type(watchdog.get("restart_count_before")) is not int
+            or type(watchdog.get("restart_count_after")) is not int
+            or watchdog["restart_count_before"] < 0
+            or watchdog["restart_count_after"] != watchdog["restart_count_before"] + 1
+            or watchdog.get("last_exit_code") != 137
+            or type(watchdog.get("replacement_ms")) not in {int, float}
+            or not math.isfinite(watchdog["replacement_ms"])
+            or watchdog["replacement_ms"] <= 0):
+        raise DeploymentError("deployment watchdog replacement evidence is malformed")
+    watchdog_policy = watchdog.get("watchdog")
+    policy_fields = {
+        "period_seconds", "timeout_seconds", "failure_threshold",
+        "escalation_seconds", "scheduling_allowance_ms", "budget_ms",
+    }
+    if (not isinstance(watchdog_policy, dict) or set(watchdog_policy) != policy_fields
+            or any(type(watchdog_policy.get(field)) is not int for field in policy_fields)
+            or not 1 <= watchdog_policy["period_seconds"] <= 60
+            or not 1 <= watchdog_policy["timeout_seconds"] <= 30
+            or not 1 <= watchdog_policy["failure_threshold"] <= 10
+            or watchdog_policy["escalation_seconds"] != watchdog_policy["timeout_seconds"]
+            or watchdog_policy["scheduling_allowance_ms"]
+            != WATCHDOG_SCHEDULING_ALLOWANCE_MS):
+        raise DeploymentError("deployment watchdog policy evidence is malformed")
+    expected_watchdog_budget = (
+        watchdog_policy["failure_threshold"]
+        * (watchdog_policy["period_seconds"] + watchdog_policy["timeout_seconds"])
+        + watchdog_policy["escalation_seconds"]
+    ) * 1000 + WATCHDOG_SCHEDULING_ALLOWANCE_MS
+    if watchdog_policy != WATCHDOG_POLICY:
+        raise DeploymentError("deployment watchdog policy differs from release policy")
+    if (watchdog_policy["budget_ms"] != expected_watchdog_budget
+            or watchdog["replacement_ms"] > expected_watchdog_budget):
+        raise DeploymentError("deployment watchdog replacement exceeded its budget")
+    fault_command_sha256 = exact_hex(
+        watchdog.get("fault_command_sha256"), 64, "watchdog fault command SHA-256"
+    )
+    if fault_command_sha256 != hashlib.sha256(WATCHDOG_FAULT_COMMAND.encode()).hexdigest():
+        raise DeploymentError("deployment watchdog fault command differs")
+    exact_hex(
+        watchdog.get("generation_response_sha256"), 64,
+        "watchdog generation response SHA-256",
+    )
+    validate_ready(
+        {"status": "ready", "release_gate": "production_artifact_admitted",
+         "startup_receipt": watchdog.get("startup_receipt")},
+        revision, receipt["flavor"], receipt["profile"], manifest["blake3"], release,
+    )
+    if watchdog["startup_receipt"] != workload["startup_receipt"]:
+        raise DeploymentError("deployment watchdog changed startup receipt")
+    initial_uids = {pod["uid"] for pod in initial["pods"]}
+    if (watchdog["pod_uid"] not in initial_uids
+            or initial["pods"][0]["restarts"] < watchdog["restart_count_after"]):
+        raise DeploymentError("deployment watchdog pod differs from initial snapshot")
     validate_ready(
         {"status": "ready", "release_gate": "production_artifact_admitted",
          "startup_receipt": workload.get("update_startup_receipt")},
@@ -1823,6 +2054,23 @@ def validate_receipt(receipt: dict[str, Any], *, chart_path: Path, image_path: P
         for name in ("tritium_backend_faults_total", "tritium_backend_faulted")
     ):
         raise DeploymentError("deployment restart metrics evidence is malformed")
+    watchdog_metrics = watchdog.get("metrics")
+    if not isinstance(watchdog_metrics, dict) or set(watchdog_metrics) != {
+        "sha256", "values"
+    }:
+        raise DeploymentError("deployment watchdog metrics fields differ")
+    exact_hex(watchdog_metrics.get("sha256"), 64, "watchdog metrics SHA-256")
+    watchdog_values = watchdog_metrics.get("values")
+    if not isinstance(watchdog_values, dict) or set(watchdog_values) != expected_metrics or any(
+        type(value) not in {int, float} or not math.isfinite(value) or value < 0
+        for value in watchdog_values.values()
+    ) or watchdog_values["tritium_chat_requests_total"] < 1 or (
+        watchdog_values["tritium_tokens_out_total"] < 1
+    ) or watchdog_values["tritium_worker_alive"] != 1 or any(
+        watchdog_values[name] != 0
+        for name in ("tritium_backend_faults_total", "tritium_backend_faulted")
+    ):
+        raise DeploymentError("deployment watchdog metrics evidence is malformed")
     if receipt["flavor"] == "cpu":
         scale_receipt = validate_scale_receipt(workload.get("scale"))
         expected_query = (

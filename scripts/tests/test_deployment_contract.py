@@ -46,6 +46,7 @@ class DeploymentContractTests(unittest.TestCase):
             "authenticated-probe",
             "shareProcessNamespace: true",
             "pidof tritium-serve",
+            "kill -KILL",
             "type: Recreate",
             "ephemeral-storage",
             "GPU resource limits require gpu.enabled=true",

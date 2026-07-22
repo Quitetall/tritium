@@ -8,8 +8,11 @@ An
 authenticated loopback probe sidecar reads the bearer token from a Secret so
 the Secret is never rendered into probe headers.
 The helper is also a same-UID watchdog: after bounded authenticated health
-failures it signals `tritium-serve`, allowing Kubernetes to restart the main
-container when its worker is dead but its TCP listener remains open.
+failures it sends TERM, waits one probe timeout, then sends KILL if the process
+cannot drain. Kubernetes restarts the main container when its worker is dead,
+its TCP listener remains open, or the process is otherwise unresponsive. The
+watchdog exits after acting and is restarted by the pod runtime; it has no
+competing server-health liveness probe.
 
 `artifact.sourcePvc.subPath` identifies the bundle directory within the PVC;
 `artifact.profile` selects its admitted Compact or NearLossless package.
