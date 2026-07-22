@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import importlib.metadata
 import json
 import math
 import os
-import re
 import tempfile
 from pathlib import Path
 
@@ -21,34 +19,12 @@ from .config import TernaryConfig
 from .conversion import inspect, prepare
 from .ptq import convert
 from .qat_artifacts import export_qat_hard, load_qat_hard
-
-
-_RECEIPT_FIELDS = {
-    "schema",
-    "receipt_id",
-    "passed",
-    "device",
-    "seed",
-    "torch_version",
-    "distribution_version",
-    "tritium_module",
-    "loss",
-    "gradient_norm",
-    "converted_parameters",
-    "aliases",
-    "algorithm_id",
-    "planes",
-    "artifact_id",
-    "hard_state_digest",
-    "artifact_dir",
-    "checkpoint_model_bytes",
-    "checkpoint_model_sha256",
-    "checkpoint_optimizer_bytes",
-    "checkpoint_optimizer_sha256",
-    "optimizer_state_entries",
-    "resume_steps",
-}
-_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+from .tutorial_receipt import (
+    SCHEMA as RECEIPT_SCHEMA,
+    receipt_id,
+    tree_identity,
+    validate_receipt,
+)
 
 
 class _TinyTiedModel(nn.Module):
@@ -79,16 +55,9 @@ def _installed_distribution() -> tuple[str, Path]:
     return distribution.version, module
 
 
-def _canonical(value: object) -> bytes:
-    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
-
-
-def _receipt_id(receipt: dict[str, object]) -> str:
-    unsigned = {key: value for key, value in receipt.items() if key != "receipt_id"}
-    return "sha256:" + hashlib.sha256(_canonical(unsigned)).hexdigest()
-
-
 def _sha256_file(path: Path) -> str:
+    import hashlib
+
     digest = hashlib.sha256()
     with path.open("rb") as stream:
         while chunk := stream.read(1024 * 1024):
@@ -97,7 +66,14 @@ def _sha256_file(path: Path) -> str:
 
 
 def run_installed_qat_tutorial(
-    output_dir: Path, *, device_name: str, seed: int = 73
+    output_dir: Path,
+    *,
+    device_name: str,
+    wheel_artifact: Path,
+    source_revision: str,
+    release: str,
+    run_id: str,
+    seed: int = 73,
 ) -> dict[str, object]:
     """Run one complete latent-QAT to strict-hard-artifact lifecycle."""
 
@@ -105,6 +81,18 @@ def run_installed_qat_tutorial(
         raise ValueError("device must be cpu or cuda:0")
     if output_dir.exists() or output_dir.is_symlink():
         raise FileExistsError(f"output directory already exists: {output_dir}")
+    if wheel_artifact.is_symlink() or not wheel_artifact.is_file():
+        raise ValueError("wheel artifact must be an ordinary file")
+    wheel_artifact = wheel_artifact.resolve(strict=True)
+    if not wheel_artifact.name.endswith(".whl"):
+        raise ValueError("wheel artifact must have a .whl filename")
+    if (
+        len(source_revision) != 40
+        or any(character not in "0123456789abcdef" for character in source_revision)
+    ):
+        raise ValueError("source revision must be 40 lowercase hexadecimal characters")
+    if not release or not run_id:
+        raise ValueError("release and run id must be non-empty")
     distribution_version, module_path = _installed_distribution()
     device = torch.device(device_name)
     if device.type == "cuda" and not torch.cuda.is_available():
@@ -210,14 +198,21 @@ def run_installed_qat_tutorial(
         raise RuntimeError("hard conversion used unexpected estimator identity")
     if weight.planes != 2:
         raise RuntimeError("hard conversion did not preserve two additive planes")
+    hard_tree = tree_identity(artifact.artifact_dir)
     receipt: dict[str, object] = {
-        "schema": "tritium.installed-qat-tutorial.v2",
+        "schema": RECEIPT_SCHEMA,
         "passed": True,
         "device": device_name,
         "seed": seed,
         "torch_version": torch.__version__,
         "distribution_version": distribution_version,
         "tritium_module": str(module_path),
+        "source_revision": source_revision,
+        "release": release,
+        "run_id": run_id,
+        "wheel_name": wheel_artifact.name,
+        "wheel_bytes": wheel_artifact.stat().st_size,
+        "wheel_sha256": _sha256_file(wheel_artifact),
         "loss": float(loss.detach()),
         "gradient_norm": gradient_norm,
         "converted_parameters": coverage.converted_parameters,
@@ -226,7 +221,10 @@ def run_installed_qat_tutorial(
         "planes": weight.planes,
         "artifact_id": artifact.artifact_id,
         "hard_state_digest": artifact.hard_state_digest,
-        "artifact_dir": str(artifact.artifact_dir.resolve()),
+        "artifact_dir": "qat-hard",
+        "hard_artifact_bytes": hard_tree["bytes"],
+        "hard_artifact_file_count": hard_tree["file_count"],
+        "hard_artifact_tree_sha256": hard_tree["sha256"],
         "checkpoint_model_bytes": model_checkpoint.stat().st_size,
         "checkpoint_model_sha256": _sha256_file(model_checkpoint),
         "checkpoint_optimizer_bytes": optimizer_checkpoint.stat().st_size,
@@ -234,100 +232,32 @@ def run_installed_qat_tutorial(
         "optimizer_state_entries": optimizer_state_entries,
         "resume_steps": 1,
     }
-    receipt["receipt_id"] = _receipt_id(receipt)
+    receipt["receipt_id"] = receipt_id(receipt)
     return receipt
 
 
 def validate_tutorial_receipt(
-    receipt_path: Path, *, expected_device: str
+    receipt_path: Path,
+    *,
+    expected_device: str,
+    expected_wheel: Path | None = None,
+    expected_source_revision: str | None = None,
+    expected_release: str | None = None,
 ) -> dict[str, object]:
     """Strictly validate one tutorial result and its hard artifact."""
-
-    if receipt_path.is_symlink() or not receipt_path.is_file():
-        raise ValueError("tutorial receipt must be a regular non-symlink file")
-    if receipt_path.stat().st_size > 1024 * 1024:
-        raise ValueError("tutorial receipt exceeds metadata size limit")
-    try:
-        receipt = json.loads(receipt_path.read_bytes())
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise ValueError("tutorial receipt must contain UTF-8 JSON") from error
-    if not isinstance(receipt, dict) or set(receipt) != _RECEIPT_FIELDS:
-        raise ValueError("tutorial receipt fields do not match schema version 2")
-    if receipt["schema"] != "tritium.installed-qat-tutorial.v2":
-        raise ValueError("unsupported tutorial receipt schema")
-    if receipt["passed"] is not True or receipt["device"] != expected_device:
-        raise ValueError("tutorial receipt result or device mismatch")
-    if type(receipt["seed"]) is not int:
-        raise ValueError("tutorial seed must be an integer")
-    for field in ("loss", "gradient_norm"):
-        value = receipt[field]
-        if (
-            isinstance(value, bool)
-            or not isinstance(value, (int, float))
-            or not math.isfinite(float(value))
-            or float(value) <= 0
-        ):
-            raise ValueError(f"tutorial {field} must be finite and positive")
-    if receipt["converted_parameters"] != 1:
-        raise ValueError("tutorial converted-parameter coverage mismatch")
-    if receipt["aliases"] != ["embed.weight", "head.weight"]:
-        raise ValueError("tutorial tied aliases mismatch")
-    if receipt["algorithm_id"] != "tritium.additive-2/tritium.salt-ste@1":
-        raise ValueError("tutorial estimator identity mismatch")
-    if receipt["planes"] != 2:
-        raise ValueError("tutorial plane count mismatch")
-    for field in ("checkpoint_model_bytes", "checkpoint_optimizer_bytes"):
-        if type(receipt[field]) is not int or receipt[field] <= 0:
-            raise ValueError(f"tutorial {field} must be a positive integer")
-    if receipt["optimizer_state_entries"] != 1:
-        raise ValueError("tutorial optimizer state entry count mismatch")
-    if receipt["resume_steps"] != 1:
-        raise ValueError("tutorial resume step count mismatch")
-    for field in (
-        "artifact_id",
-        "hard_state_digest",
-        "checkpoint_model_sha256",
-        "checkpoint_optimizer_sha256",
-        "receipt_id",
-    ):
-        if not isinstance(receipt[field], str) or _DIGEST.fullmatch(receipt[field]) is None:
-            raise ValueError(f"tutorial {field} is not a canonical digest")
-    if receipt["receipt_id"] != _receipt_id(receipt):
-        raise ValueError("tutorial receipt identity mismatch")
+    receipt = validate_receipt(
+        receipt_path,
+        expected_device=expected_device,
+        expected_wheel=expected_wheel,
+        expected_source_revision=expected_source_revision,
+        expected_release=expected_release,
+    )
     version, module_path = _installed_distribution()
     if receipt["distribution_version"] != version:
         raise ValueError("tutorial distribution version mismatch")
     if receipt["tritium_module"] != str(module_path):
         raise ValueError("tutorial package path mismatch")
-    artifact_dir = Path(str(receipt["artifact_dir"]))
-    if not artifact_dir.is_absolute():
-        raise ValueError("tutorial artifact path must be absolute")
-    expected_artifact_dir = receipt_path.parent.resolve() / "qat-hard"
-    if artifact_dir.resolve() != expected_artifact_dir:
-        raise ValueError("tutorial artifact path is outside its result directory")
-    result_dir = receipt_path.parent.resolve()
-    requested_checkpoint = receipt_path.parent / "latent-checkpoint"
-    if requested_checkpoint.is_symlink() or not requested_checkpoint.is_dir():
-        raise ValueError("tutorial checkpoint must be an ordinary directory")
-    checkpoint = requested_checkpoint.resolve()
-    if checkpoint.parent != result_dir:
-        raise ValueError("tutorial checkpoint is outside its result directory")
-    model_checkpoint = checkpoint / "model.safetensors"
-    optimizer_checkpoint = checkpoint / "optimizer.pt"
-    for path, field in (
-        (model_checkpoint, "checkpoint_model_bytes"),
-        (optimizer_checkpoint, "checkpoint_optimizer_bytes"),
-    ):
-        if (
-            path.is_symlink()
-            or not path.is_file()
-            or path.resolve().parent != checkpoint
-            or path.stat().st_size != receipt[field]
-        ):
-            raise ValueError(f"tutorial {field} file identity mismatch")
-        digest_field = field.replace("_bytes", "_sha256")
-        if _sha256_file(path) != receipt[digest_field]:
-            raise ValueError(f"tutorial {digest_field} file identity mismatch")
+    artifact_dir = receipt_path.parent.resolve() / str(receipt["artifact_dir"])
     artifact = load_qat_hard(artifact_dir)
     if (
         artifact.artifact_id != receipt["artifact_id"]
@@ -369,17 +299,40 @@ def main() -> int:
     mode.add_argument("--check-receipt", type=Path)
     parser.add_argument("--device", choices=("cpu", "cuda:0"), default="cpu")
     parser.add_argument("--seed", type=int, default=73)
+    parser.add_argument("--wheel-artifact", type=Path)
+    parser.add_argument("--source-revision")
+    parser.add_argument("--release")
+    parser.add_argument("--run-id")
     args = parser.parse_args()
     if args.check_receipt is not None:
         receipt = validate_tutorial_receipt(
-            args.check_receipt.absolute(), expected_device=args.device
+            args.check_receipt.absolute(),
+            expected_device=args.device,
+            expected_wheel=(
+                args.wheel_artifact.absolute()
+                if args.wheel_artifact is not None
+                else None
+            ),
+            expected_source_revision=args.source_revision,
+            expected_release=args.release,
         )
         print(json.dumps(receipt, sort_keys=True))
         return 0
     assert args.output_dir is not None
+    if None in (args.wheel_artifact, args.source_revision, args.release, args.run_id):
+        parser.error(
+            "--wheel-artifact, --source-revision, --release and --run-id are required "
+            "with --output-dir"
+        )
     output = args.output_dir.absolute()
     receipt = run_installed_qat_tutorial(
-        output, device_name=args.device, seed=args.seed
+        output,
+        device_name=args.device,
+        wheel_artifact=args.wheel_artifact.absolute(),
+        source_revision=args.source_revision,
+        release=args.release,
+        run_id=args.run_id,
+        seed=args.seed,
     )
     _write_receipt(output, receipt)
     print(json.dumps(receipt, sort_keys=True))

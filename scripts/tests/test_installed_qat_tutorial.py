@@ -52,10 +52,15 @@ class InstalledQatTutorialTests(unittest.TestCase):
         source = (
             ROOT / "crates/tritium-py/python/tritium/torch/tutorial_qat.py"
         ).read_text(encoding="utf-8")
+        receipt_source = (
+            ROOT / "crates/tritium-py/python/tritium/torch/tutorial_receipt.py"
+        ).read_text(encoding="utf-8")
         self.assertNotIn("sys.path", source)
         self.assertNotIn("PYTHONPATH", source)
         self.assertNotIn("allow-source", source)
-        self.assertIn("tritium.installed-qat-tutorial.v2", source)
+        self.assertIn("tritium.installed-qat-tutorial.v3", receipt_source)
+        self.assertIn("--wheel-artifact", source)
+        self.assertIn("--source-revision", source)
         self.assertIn('distribution("tritium-torch")', source)
         self.assertIn("not owned by tritium-torch", source)
         self.assertIn("export_qat_hard", source)

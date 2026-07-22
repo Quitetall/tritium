@@ -255,10 +255,17 @@ jobs:
           set -euo pipefail
           python -I ${{ github.workspace }}/examples/python/installed_qat.py \
             --output-dir evidence/tutorial-cpu \
-            --device cpu
+            --device cpu \
+            --wheel-artifact dist/*.whl \
+            --source-revision ${{ github.sha }} \
+            --release 1.1.0-rc.0 \
+            --run-id github-${{ github.run_id }}-${{ github.run_attempt }}-tutorial-cpu
           python -I -m tritium.torch.tutorial_qat \
             --check-receipt evidence/tutorial-cpu/receipt.json \
-            --device cpu
+            --device cpu \
+            --wheel-artifact dist/*.whl \
+            --source-revision ${{ github.sha }} \
+            --release 1.1.0-rc.0
       - uses: actions/upload-artifact@v4
         with:
           name: wheel-functional-torch-2.11-python-3.13
@@ -308,10 +315,17 @@ jobs:
           set -euo pipefail
           python -I -m tritium.torch.tutorial_qat \
             --output-dir evidence/tutorial-clean \
-            --device cpu
+            --device cpu \
+            --wheel-artifact dist/*.whl \
+            --source-revision ${{ github.sha }} \
+            --release 1.1.0-rc.0 \
+            --run-id github-${{ github.run_id }}-${{ github.run_attempt }}-tutorial-clean
           python -I -m tritium.torch.tutorial_qat \
             --check-receipt evidence/tutorial-clean/receipt.json \
-            --device cpu
+            --device cpu \
+            --wheel-artifact dist/*.whl \
+            --source-revision ${{ github.sha }} \
+            --release 1.1.0-rc.0
       - uses: actions/upload-artifact@v4
         with:
           name: wheel-tutorial-source-free-python-3.13
@@ -385,10 +399,17 @@ jobs:
           set -euo pipefail
           python -I ${{ github.workspace }}/examples/python/installed_qat.py \
             --output-dir evidence/tutorial-cuda \
-            --device cuda:0
+            --device cuda:0 \
+            --wheel-artifact dist-cuda/*.whl \
+            --source-revision ${{ github.sha }} \
+            --release 1.1.0-rc.0 \
+            --run-id github-${{ github.run_id }}-${{ github.run_attempt }}-tutorial-cuda
           python -I -m tritium.torch.tutorial_qat \
             --check-receipt evidence/tutorial-cuda/receipt.json \
-            --device cuda:0
+            --device cuda:0 \
+            --wheel-artifact dist-cuda/*.whl \
+            --source-revision ${{ github.sha }} \
+            --release 1.1.0-rc.0
       - name: qualify installed-wheel CUDA fp16 training
         shell: bash
         env:

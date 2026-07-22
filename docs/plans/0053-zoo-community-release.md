@@ -188,6 +188,13 @@ A local attempt to substitute the ad-hoc host `linux_x86_64` wheel in the slim
 container failed closed because that wheel required `GLIBC_2.43`; this is not
 clean-lane evidence and confirms why the job consumes the qualified manylinux
 artifact instead of a host-built development wheel.
+The portable result is now `tritium.installed-qat-tutorial.v3`: it removes the
+runner-local absolute artifact path, binds candidate wheel bytes, source,
+release and run ID, and hashes every contained hard-artifact and checkpoint
+byte. `scripts/release-evidence-status.py` admits it as
+`installed-qat-tutorial` evidence only after independently rechecking those
+bindings against the candidate manifest. This advances, but does not green, the
+PyTorch/Hugging Face gate.
 
 Replace the current pre-alpha/v1.0-era narrative with tested v1.1 documentation:
 

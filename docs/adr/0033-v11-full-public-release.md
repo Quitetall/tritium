@@ -382,13 +382,15 @@ verdicts.
 ### Implementation amendment: installed tutorial result
 
 The source-free PyTorch QAT tutorial emits
-`tritium.installed-qat-tutorial.v2`. Version 2 binds latent safetensors and
-optimizer checkpoint bytes plus SHA-256 identities, one resumed optimizer step,
-hard-artifact ancestry and installed-distribution ownership. The earlier v1
-developer result did not contain checkpoint/resume evidence and is not an
-admitted v1.1 release receipt. Unknown or older tutorial-result schemas fail
-closed; release admission remains a separate source/wheel/run/machine-bound
-receipt.
+`tritium.installed-qat-tutorial.v3`. Version 3 retains v2's latent safetensors,
+optimizer checkpoint identities and exact resumed step, replaces runner-local
+absolute paths with portable contained paths, hashes every hard-artifact file,
+and binds the exact candidate wheel bytes, source revision, release and run ID.
+The release-evidence registry independently revalidates those bindings and
+counts the result as `installed-qat-tutorial` evidence; it does not waive the
+remaining frontend, distributed, export, machine or compatibility gates.
+Earlier v1/v2 developer results are not admitted v1.1 receipts. Unknown or
+older tutorial-result schemas fail closed.
 
 ## v1.1 release gate
 

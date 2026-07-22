@@ -36,6 +36,11 @@ KUBERNETES_DEPLOYMENT = runpy.run_path(
 )
 load_deployment_receipt = KUBERNETES_DEPLOYMENT["load_receipt"]
 DeploymentError = KUBERNETES_DEPLOYMENT["DeploymentError"]
+TUTORIAL_RECEIPT = runpy.run_path(
+    Path(__file__).resolve().parent.parent
+    / "crates/tritium-py/python/tritium/torch/tutorial_receipt.py"
+)
+validate_tutorial_receipt = TUTORIAL_RECEIPT["validate_receipt"]
 
 SCHEMA = "tritium.release-evidence-registry.v1"
 REPORT_SCHEMA = "tritium.release-gate-report.v1"
@@ -49,6 +54,7 @@ KNOWN_KINDS = frozenset(
         "crate-archive", "npm-archive", "oci-runtime-cpu", "oci-runtime-cuda",
         "oci-security-cpu", "oci-security-cuda",
         "serving-deployment-cpu", "serving-deployment-cuda",
+        "installed-qat-tutorial",
     }
 )
 HEX = frozenset("0123456789abcdef")
@@ -61,7 +67,13 @@ GATES = (
         "flagship-qwen",
         ("conversion-refinement", "quality", "task-retention", "runtime", "physical-bytes"),
     ),
-    ("pytorch-hf", ("frontend-lifecycle", "distributed-training", "export-reload")),
+    (
+        "pytorch-hf",
+        (
+            "installed-qat-tutorial", "frontend-lifecycle",
+            "distributed-training", "export-reload",
+        ),
+    ),
     ("native-backends", ("backend-manifest", "cuda-training", "performance")),
     ("estimators-refinement", ("estimator-validation", "refinement", "baseline-ablation")),
     ("browser", ("browser-conformance",)),
@@ -277,6 +289,14 @@ def evaluate(
                 receipt = validate_npm_receipt(
                     receipt_path, artifact_path, revision, release
                 )
+            elif kind == "installed-qat-tutorial":
+                receipt = validate_tutorial_receipt(
+                    receipt_path,
+                    expected_device="cpu",
+                    expected_wheel=artifact_path,
+                    expected_source_revision=revision,
+                    expected_release=release,
+                )
             elif kind in {"oci-runtime-cpu", "oci-runtime-cuda"}:
                 receipt = load_oci_runtime_receipt(
                     receipt_path, revision=revision, release=release,
@@ -345,6 +365,7 @@ def evaluate(
             OciRuntimeError,
             OciSecurityError,
             DeploymentError,
+            ValueError,
         ) as error:
             raise EvidenceError(f"{label} failed {kind} validation: {error}") from error
         if receipt["receipt_id"] != receipt_id:
@@ -408,6 +429,20 @@ def evaluate(
             )
             if actual != declared or actual != qualified:
                 raise EvidenceError("npm receipt does not bind candidate archive bytes")
+        elif kind == "installed-qat-tutorial":
+            identity = artifact.get("identity", {})
+            actual = (
+                artifact_path.name, _sha256(artifact_path), artifact_path.stat().st_size
+            )
+            declared = (
+                artifact_path.name, identity.get("sha256"), identity.get("bytes")
+            )
+            qualified = (
+                receipt["wheel_name"], receipt["wheel_sha256"].removeprefix("sha256:"),
+                receipt["wheel_bytes"],
+            )
+            if actual != declared or actual != qualified:
+                raise EvidenceError("tutorial receipt does not bind candidate wheel bytes")
         elif kind.startswith("oci-"):
             identity = artifact.get("identity", {})
             actual = (artifact_path.name, _sha256(artifact_path), artifact_path.stat().st_size)
@@ -495,5 +530,5 @@ def render(report: dict[str, Any]) -> str:
     for row in report["rows"]:
         missing = ",".join(row["missing_kinds"] + row["structural_kinds"]) or "-"
         lines.append(f"{row['status']:<16} {row['id']:<21} {missing}")
-    lines.append(f"EXTERNAL_AUTH_REQUIRED public-activation     explicit-authorization")
+    lines.append("EXTERNAL_AUTH_REQUIRED public-activation     explicit-authorization")
     return "\n".join(lines)

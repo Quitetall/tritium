@@ -26,6 +26,9 @@ CRATE_MODULE = runpy.run_path(ROOT / "scripts" / "qualify-crate-archives.py")
 NPM_MODULE = runpy.run_path(ROOT / "scripts" / "verify-npm-archive-receipt.py")
 OCI_RUNTIME_MODULE = runpy.run_path(ROOT / "scripts" / "qualify-oci-runtime.py")
 OCI_SECURITY_MODULE = runpy.run_path(ROOT / "scripts" / "qualify-oci-security.py")
+TUTORIAL_RECEIPT_MODULE = runpy.run_path(
+    ROOT / "crates/tritium-py/python/tritium/torch/tutorial_receipt.py"
+)
 
 
 def canonical(value) -> bytes:
@@ -276,6 +279,74 @@ def entry(
 
 
 class ReleaseEvidenceStatusTests(unittest.TestCase):
+    def test_installed_qat_tutorial_binds_candidate_wheel_and_advances_frontend_gate(self):
+        with tempfile.TemporaryDirectory() as raw:
+            candidate, document, artifact, evidence_root = release_fixture(Path(raw))
+            document["artifacts"][0]["identity"] = {
+                "sha256": sha256(artifact),
+                "bytes": artifact.stat().st_size,
+            }
+            candidate.write_bytes(canonical(document) + b"\n")
+            artifact_dir = evidence_root / "qat-hard"
+            artifact_dir.mkdir()
+            (artifact_dir / "manifest.json").write_bytes(b"strict hard artifact")
+            checkpoint = evidence_root / "latent-checkpoint"
+            checkpoint.mkdir()
+            model = checkpoint / "model.safetensors"
+            optimizer = checkpoint / "optimizer.pt"
+            model.write_bytes(b"latent model")
+            optimizer.write_bytes(b"optimizer state")
+            tree = TUTORIAL_RECEIPT_MODULE["tree_identity"](artifact_dir)
+            receipt = {
+                "schema": "tritium.installed-qat-tutorial.v3",
+                "passed": True,
+                "device": "cpu",
+                "seed": 73,
+                "torch_version": "2.11.0",
+                "distribution_version": "1.1.0rc0",
+                "tritium_module": "/venv/tritium/__init__.py",
+                "source_revision": "a" * 40,
+                "release": "1.1.0-rc.0",
+                "run_id": "tutorial-run-1",
+                "wheel_name": artifact.name,
+                "wheel_bytes": artifact.stat().st_size,
+                "wheel_sha256": "sha256:" + sha256(artifact),
+                "loss": 1.0,
+                "gradient_norm": 1.0,
+                "converted_parameters": 1,
+                "aliases": ["embed.weight", "head.weight"],
+                "algorithm_id": "tritium.additive-2/tritium.salt-ste@1",
+                "planes": 2,
+                "artifact_id": "sha256:" + "1" * 64,
+                "hard_state_digest": "sha256:" + "2" * 64,
+                "artifact_dir": "qat-hard",
+                "hard_artifact_bytes": tree["bytes"],
+                "hard_artifact_file_count": tree["file_count"],
+                "hard_artifact_tree_sha256": tree["sha256"],
+                "checkpoint_model_bytes": model.stat().st_size,
+                "checkpoint_model_sha256": "sha256:" + sha256(model),
+                "checkpoint_optimizer_bytes": optimizer.stat().st_size,
+                "checkpoint_optimizer_sha256": "sha256:" + sha256(optimizer),
+                "optimizer_state_entries": 1,
+                "resume_steps": 1,
+            }
+            receipt["receipt_id"] = TUTORIAL_RECEIPT_MODULE["receipt_id"](receipt)
+            receipt_path = evidence_root / "tutorial.json"
+            receipt_path.write_bytes(canonical(receipt) + b"\n")
+            registry_path = evidence_root / "registry.json"
+            registry(
+                registry_path,
+                candidate,
+                [entry(receipt_path, receipt, kind="installed-qat-tutorial")],
+            )
+
+            report = evaluate(registry_path, candidate, document)
+            frontend = next(row for row in report["rows"] if row["id"] == "pytorch-hf")
+            self.assertEqual(frontend["satisfied_kinds"], ["installed-qat-tutorial"])
+            artifact.write_bytes(b"different candidate wheel")
+            with self.assertRaisesRegex(EvidenceError, "tutorial|wheel"):
+                evaluate(registry_path, candidate, document)
+
     def test_cpu_deployment_requires_exact_image_parents_and_support_bytes(self):
         with tempfile.TemporaryDirectory() as raw:
             candidate, document, old_artifact, evidence_root = release_fixture(Path(raw))
