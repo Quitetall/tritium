@@ -4580,6 +4580,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tower",
+ "tritium-build-info",
  "tritium-cpu",
  "tritium-cuda",
  "tritium-format",
