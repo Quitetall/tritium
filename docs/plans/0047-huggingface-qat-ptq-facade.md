@@ -55,7 +55,9 @@ saves with safe serialization, automatically reloads through
   currently segfaults on rank 0 and remains a red export gate.
 - [x] Run single-device CUDA fp16 Accelerate training on the local RTX 4090,
   including isolated ternary-operator zero-transfer profiling, full-step timing,
-  exact state restore and a content-addressed hardware receipt.
+  exact state restore and a content-addressed hardware receipt. The release
+  lane retains a strict source/release/run/device/environment/workload-bound
+  receipt and independently verifies its timing arithmetic and invariants.
 - [ ] Run accelerator DDP/FSDP mixed-precision and throughput gates on at least
   two distinct physical devices. The current host exposes one RTX 4090, so a
   two-rank shared-device run cannot satisfy this gate.

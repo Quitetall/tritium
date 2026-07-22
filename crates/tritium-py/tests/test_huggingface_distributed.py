@@ -86,6 +86,11 @@ def test_accelerate_cuda_fp16_checkpoint_and_residency(tmp_path: Path):
     env = os.environ.copy()
     env["TRITIUM_CUDA_CHECKPOINT"] = str(tmp_path / "cuda-state")
     env["TRITIUM_CUDA_RECEIPT"] = str(receipt)
+    env["TRITIUM_SOURCE_REVISION"] = "a" * 40
+    env["TRITIUM_RELEASE"] = "1.1.0-rc.0"
+    env["TRITIUM_RUN_ID"] = "pytest-cuda-qualification"
+    env["TRITIUM_QUALIFIED_ARTIFACT"] = str(worker)
+    env["TRITIUM_ARTIFACT_KIND"] = "source-test-worker"
     completed = subprocess.run(
         [sys.executable, str(worker)],
         env=env,
@@ -97,11 +102,12 @@ def test_accelerate_cuda_fp16_checkpoint_and_residency(tmp_path: Path):
     assert completed.returncode == 0, completed.stdout + completed.stderr
     assert "TRITIUM_ACCELERATE_CUDA_FP16_OK" in completed.stdout
     value = json.loads(receipt.read_text(encoding="utf-8"))
-    assert value["artifact_kind"] == "tritium-torch-cuda-qualification"
-    assert value["mixed_precision"] == "fp16"
-    assert value["ternary_operator_host_transfers"] == 0
-    assert value["checkpoint_exact"] is True
-    assert value["steps_per_second"] > 0
+    assert value["schema"] == "tritium.cuda-training-qualification.v1"
+    assert value["source_revision"] == "a" * 40
+    assert value["workload"]["mixed_precision"] == "fp16"
+    assert value["invariants"]["ternary_operator_host_transfers"] == 0
+    assert value["invariants"]["checkpoint_exact"] is True
+    assert value["measurements"]["steps_per_second"] > 0
     identity = dict(value)
     receipt_id = identity.pop("receipt_id")
     canonical = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode(

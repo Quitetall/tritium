@@ -6,8 +6,13 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import platform
+import re
+import subprocess
 import tempfile
+import time
 
+import accelerate
 import torch
 import transformers
 from accelerate import Accelerator
@@ -35,6 +40,16 @@ def _canonical(value) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
+def _artifact_identity(path: Path) -> dict[str, object]:
+    digest = hashlib.sha256()
+    size = 0
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            size += len(chunk)
+            digest.update(chunk)
+    return {"name": path.name, "bytes": size, "sha256": digest.hexdigest()}
+
+
 def _write_receipt(path: Path, value) -> None:
     identity = dict(value)
     identity["receipt_id"] = "sha256:" + hashlib.sha256(_canonical(value)).hexdigest()
@@ -49,21 +64,46 @@ def _write_receipt(path: Path, value) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise
 
 
 def main() -> None:
+    source_revision = os.environ.get("TRITIUM_SOURCE_REVISION", "")
+    release = os.environ.get("TRITIUM_RELEASE", "")
+    run_id = os.environ.get("TRITIUM_RUN_ID", "")
+    artifact_path = Path(os.environ.get("TRITIUM_QUALIFIED_ARTIFACT", ""))
+    artifact_kind = os.environ.get("TRITIUM_ARTIFACT_KIND", "")
+    if re.fullmatch(r"[0-9a-f]{40}", source_revision) is None:
+        raise RuntimeError("TRITIUM_SOURCE_REVISION must be a full Git object ID")
+    if re.fullmatch(r"1\.1\.0-rc\.(0|[1-9][0-9]*)", release) is None:
+        raise RuntimeError("TRITIUM_RELEASE must be a canonical v1.1 candidate")
+    if not run_id:
+        raise RuntimeError("TRITIUM_RUN_ID must identify this independent run")
+    if not artifact_kind or not artifact_path.is_file() or artifact_path.is_symlink():
+        raise RuntimeError("qualified artifact must be an ordinary named file")
+    artifact = {"kind": artifact_kind, **_artifact_identity(artifact_path)}
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA qualification requires a physical CUDA device")
+    started_at_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    qualification_started = time.monotonic()
     accelerator = Accelerator(mixed_precision="fp16")
     if accelerator.device.type != "cuda":
         raise RuntimeError("Accelerate did not select CUDA")
     torch.manual_seed(401)
     torch.cuda.manual_seed_all(401)
+    dense_model = _model()
+    model_config_sha256 = hashlib.sha256(
+        _canonical(dense_model.config.to_dict())
+    ).hexdigest()
     model = prepare_qat(
-        _model(),
+        dense_model,
         TernaryConfig.qat(
             estimator="salt-ste",
             target_modules=("Linear", "Embedding"),
@@ -125,7 +165,7 @@ def main() -> None:
     end.record()
     end.synchronize()
     elapsed_ms = float(start.elapsed_time(end))
-    if not elapsed_ms > 0:
+    if elapsed_ms <= 0:
         raise AssertionError("CUDA timing interval is not positive")
 
     checkpoint = Path(os.environ["TRITIUM_CUDA_CHECKPOINT"])
@@ -143,20 +183,77 @@ def main() -> None:
     ):
         raise AssertionError("Accelerate CUDA checkpoint did not restore exact state")
 
-    properties = torch.cuda.get_device_properties(accelerator.device)
+    device_index = accelerator.device.index or 0
+    properties = torch.cuda.get_device_properties(device_index)
+    device_uuid = str(getattr(properties, "uuid", ""))
+    if not device_uuid:
+        raise RuntimeError("CUDA device UUID is unavailable")
+    machine_material = {
+        "architecture": platform.machine(),
+        "device_uuid": device_uuid,
+        "node": platform.node(),
+        "system": platform.system(),
+    }
+    machine_id = "sha256:" + hashlib.sha256(_canonical(machine_material)).hexdigest()
+    cuda_driver = subprocess.check_output(
+        [
+            "nvidia-smi",
+            "--query-gpu=driver_version",
+            "--format=csv,noheader",
+            f"--id={device_index}",
+        ],
+        text=True,
+        timeout=30,
+    ).strip()
+    if not cuda_driver:
+        raise RuntimeError("CUDA driver version is unavailable")
     receipt = {
-        "schema_version": 1,
-        "artifact_kind": "tritium-torch-cuda-qualification",
-        "torch_version": torch.__version__,
-        "cuda_version": torch.version.cuda,
-        "device_name": properties.name,
-        "device_total_memory": properties.total_memory,
-        "mixed_precision": "fp16",
-        "steps": 5,
-        "elapsed_ms": elapsed_ms,
-        "steps_per_second": 5000.0 / elapsed_ms,
-        "ternary_operator_host_transfers": 0,
-        "checkpoint_exact": True,
+        "schema": "tritium.cuda-training-qualification.v1",
+        "source_revision": source_revision,
+        "release": release,
+        "run_id": run_id,
+        "started_at_utc": started_at_utc,
+        "duration_ms": (time.monotonic() - qualification_started) * 1000.0,
+        "command": ["python", "hf_cuda_worker.py"],
+        "artifact": artifact,
+        "machine": {
+            "machine_id": machine_id,
+            "system": platform.system(),
+            "architecture": platform.machine(),
+        },
+        "environment": {
+            "python_version": platform.python_version(),
+            "torch_version": torch.__version__,
+            "transformers_version": transformers.__version__,
+            "accelerate_version": accelerate.__version__,
+            "cuda_runtime": torch.version.cuda,
+            "cuda_driver": cuda_driver,
+        },
+        "device": {
+            "index": device_index,
+            "uuid": device_uuid,
+            "name": properties.name,
+            "compute_capability": f"{properties.major}.{properties.minor}",
+            "total_memory_bytes": properties.total_memory,
+        },
+        "workload": {
+            "seed": 401,
+            "mixed_precision": "fp16",
+            "steps": 5,
+            "batch_size": 1,
+            "sequence_length": 8,
+            "model_config_sha256": model_config_sha256,
+        },
+        "measurements": {
+            "elapsed_ms": elapsed_ms,
+            "steps_per_second": 5000.0 / elapsed_ms,
+        },
+        "invariants": {
+            "ternary_operator_host_transfers": 0,
+            "ternary_operator_dtype": "torch.float16",
+            "checkpoint_exact": True,
+        },
+        "result": "pass",
     }
     _write_receipt(Path(os.environ["TRITIUM_CUDA_RECEIPT"]), receipt)
     print("TRITIUM_ACCELERATE_CUDA_FP16_OK", flush=True)

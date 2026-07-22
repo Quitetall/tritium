@@ -290,7 +290,7 @@ jobs:
           python -m pip install --disable-pip-version-check --only-binary=:all: \
             torch==2.11.0 --index-url https://download.pytorch.org/whl/cu130
           python -m pip install --disable-pip-version-check --only-binary=:all: \
-            transformers==5.5.3 safetensors==0.8.0
+            transformers==5.5.3 safetensors==0.8.0 accelerate==1.10.0
           python -m pip install --isolated --disable-pip-version-check \
             --no-index --no-deps --only-binary=:all: --force-reinstall dist-cuda/*.whl
       - name: execute installed-wheel CUDA kernel and lifecycle
@@ -302,6 +302,26 @@ jobs:
           --source-revision ${{ github.sha }}
           --device cuda:0
           --output evidence/cuda13-torch2.11-py3.13-sm89.json
+      - name: qualify installed-wheel CUDA fp16 training
+        shell: bash
+        env:
+          TRITIUM_CUDA_CHECKPOINT: ${{ runner.temp }}/tritium-cuda-training-state
+          TRITIUM_CUDA_RECEIPT: ${{ github.workspace }}/evidence/cuda13-fp16-training.json
+          TRITIUM_SOURCE_REVISION: ${{ github.sha }}
+          TRITIUM_RELEASE: 1.1.0-rc.0
+          TRITIUM_RUN_ID: github-${{ github.run_id }}-${{ github.run_attempt }}-cuda-training
+        run: |
+          set -euo pipefail
+          wheels=(dist-cuda/*.whl)
+          test "${#wheels[@]}" -eq 1
+          export TRITIUM_QUALIFIED_ARTIFACT="${wheels[0]}"
+          export TRITIUM_ARTIFACT_KIND=python-wheel
+          python -I crates/tritium-py/tests/hf_cuda_worker.py
+          python scripts/verify-cuda-training-receipt.py \
+            evidence/cuda13-fp16-training.json \
+            --source-revision "${{ github.sha }}" \
+            --release 1.1.0-rc.0 \
+            --artifact "$TRITIUM_QUALIFIED_ARTIFACT"
       - name: execute generated five-minute SmolLM2 notebook
         shell: bash
         run: |
