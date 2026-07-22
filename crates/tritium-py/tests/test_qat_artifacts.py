@@ -30,6 +30,12 @@ class _TiedLanguageModel(torch.nn.Module):
         return self.head(self.norm(self.embed(tokens)))
 
 
+class _UntiedLanguageModel(_TiedLanguageModel):
+    def __init__(self):
+        super().__init__()
+        self.head.weight = torch.nn.Parameter(self.head.weight.detach().clone())
+
+
 def _hard_result():
     torch.manual_seed(83)
     prepared = prepare(
@@ -81,12 +87,28 @@ def test_qat_hard_artifact_rejects_corruption_unknown_files_and_wrong_shell(tmp_
     with pytest.raises(ValueError, match="unknown files"):
         load_qat_hard(artifact.artifact_dir)
     (artifact.artifact_dir / "unknown").unlink()
-    with pytest.raises(ValueError, match="supported module shell"):
+    with pytest.raises(ValueError, match="model shell"):
         load_qat_hard(
             artifact.artifact_dir,
             torch.nn.Sequential(torch.nn.Linear(7, 3)),
             inplace=True,
         )
+    with pytest.raises(ValueError, match="tie topology"):
+        load_qat_hard(
+            artifact.artifact_dir,
+            _UntiedLanguageModel(),
+            inplace=True,
+        )
+    wrong_preserved = _TiedLanguageModel()
+    wrong_preserved.norm = torch.nn.LayerNorm(7)
+    original_embed = wrong_preserved.embed
+    with pytest.raises(ValueError, match="preserved model shell state"):
+        load_qat_hard(
+            artifact.artifact_dir,
+            wrong_preserved,
+            inplace=True,
+        )
+    assert wrong_preserved.embed is original_embed
 
 
 def test_qat_hard_export_rolls_back_failed_state_serialization(monkeypatch, tmp_path):
@@ -138,6 +160,31 @@ def test_qat_hard_rejects_rehashed_ancestry_and_packed_domain_tampering(tmp_path
     manifest["artifact_id"] = _digest_bytes(_canonical(identity))
     manifest_path.write_bytes(_canonical(manifest))
     with pytest.raises(ValueError, match="invalid B3 bytes"):
+        load_qat_hard(artifact.artifact_dir)
+
+
+def test_qat_hard_rejects_rehashed_equal_count_tensor_substitution(tmp_path):
+    from safetensors.torch import load_file, save_file
+
+    artifact = export(_hard_result(), tmp_path / "artifact")
+    manifest_path = artifact.artifact_dir / "tritium-qat-hard.json"
+    state_path = artifact.artifact_dir / "model.safetensors"
+    state = load_file(state_path)
+    state["forged.bias"] = state.pop("norm.bias")
+    save_file(state, state_path, metadata={"format": "pt", "tritium_mode": "qat-hard"})
+
+    manifest = json.loads(manifest_path.read_text())
+    ledger = manifest["state"]["tensors"]
+    next(item for item in ledger if item["name"] == "norm.bias")["name"] = "forged.bias"
+    digest, byte_count = _digest_file(state_path, 128 * 1024**3)
+    manifest["state"]["sha256"] = digest
+    manifest["state"]["bytes"] = byte_count
+    identity = dict(manifest)
+    identity.pop("artifact_id")
+    manifest["artifact_id"] = _digest_bytes(_canonical(identity))
+    manifest_path.write_bytes(_canonical(manifest))
+
+    with pytest.raises(ValueError, match="hard-state identity"):
         load_qat_hard(artifact.artifact_dir)
 
 

@@ -32,6 +32,7 @@ class QatHardWeight:
 
     path: str
     aliases: Tuple[str, ...]
+    consumer_kinds: Tuple[str, ...]
     storage_path: str
     shape: Tuple[int, int]
     algorithm_id: str
@@ -41,6 +42,7 @@ class QatHardWeight:
         return {
             "path": self.path,
             "aliases": list(self.aliases),
+            "consumer_kinds": list(self.consumer_kinds),
             "storage_path": self.storage_path,
             "shape": list(self.shape),
             "algorithm_id": self.algorithm_id,
@@ -289,6 +291,14 @@ def convert_qat_hard(prepared: PreparedModel) -> QatHardResult:
                 QatHardWeight(
                     path=group.path,
                     aliases=group.aliases,
+                    consumer_kinds=tuple(
+                        (
+                            "linear"
+                            if isinstance(consumer.module, TernaryLinear)
+                            else "embedding"
+                        )
+                        for consumer in group.consumers
+                    ),
                     storage_path=(
                         f"{group.consumers[0].path}._packed_weight"
                         if group.consumers[0].path
