@@ -91,6 +91,16 @@ those extracted packages, stages exact `Cargo.lock` dependencies with
 Registry requires receipt inventory equal
 candidate `rust-crate` inventory. Npm archive qualification remains independent.
 
+Serving qualification is split by flavor. `serving-deployment-cpu` and
+`serving-deployment-cuda` each anchor one candidate OCI image plus the candidate
+Helm chart. Place the exact bundle manifest and OCI build receipt named and
+hashed by each deployment-v2 receipt beneath the evidence-registry directory.
+The deployment entry must name exactly the matching `oci-runtime-*` and
+`oci-security-*` receipt IDs as parents. Registry validation replays the full
+offline deployment validator, requires all three receipts to bind the same
+candidate image, and requires the runtime and Kubernetes startup receipts to be
+exactly equal. CPU evidence cannot satisfy the CUDA deployment gate.
+
 ```bash
 scripts/release-status \
   --candidate release/v1.1/manifest.json \

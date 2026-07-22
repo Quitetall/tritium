@@ -32,7 +32,7 @@ manifest_identity = RUNTIME["manifest_identity"]
 OCI_ARCHIVE = runpy.run_path(Path(__file__).with_name("verify-oci-archive.py"))
 validate_oci_archive = OCI_ARCHIVE["validate"]
 
-SCHEMA = "tritium.kubernetes-deployment-qualification.v1"
+SCHEMA = "tritium.kubernetes-deployment-qualification.v2"
 HEX = frozenset("0123456789abcdef")
 SAFE_NAME = re.compile(r"[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?")
 SAFE_SECRET_KEY = re.compile(r"[A-Za-z0-9](?:[-._A-Za-z0-9]{0,251}[A-Za-z0-9])?")
@@ -1533,6 +1533,8 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
         "started_at_utc": started_at, "duration_ms": (time.monotonic() - started) * 1000,
         "chart_artifact": {**initial_files["chart"], **chart_binding},
         "image_artifact": initial_files["image"],
+        "bundle_manifest_artifact": initial_files["manifest"],
+        "build_receipt_artifact": initial_files["build_receipt"],
         "image": args.image, "manifest": manifest_id,
         "cluster": {"context": args.context, "namespace": args.namespace,
                     "namespace_uid": namespace_uid,
@@ -1573,7 +1575,8 @@ def validate_receipt(receipt: dict[str, Any], *, chart_path: Path, image_path: P
     fields = {
         "schema", "receipt_id", "release", "source_revision", "run_id", "flavor",
         "profile", "started_at_utc", "duration_ms", "chart_artifact", "image_artifact",
-        "image", "manifest", "cluster", "tools", "workload", "checks", "result",
+        "bundle_manifest_artifact", "build_receipt_artifact", "image", "manifest",
+        "cluster", "tools", "workload", "checks", "result",
     }
     if not isinstance(receipt, dict) or set(receipt) != fields:
         raise DeploymentError("deployment receipt fields differ")
@@ -1602,7 +1605,11 @@ def validate_receipt(receipt: dict[str, Any], *, chart_path: Path, image_path: P
         raise DeploymentError("deployment receipt timestamp must be UTC")
     package_candidate = ordinary(package_candidate, "candidate package manifest")
     build_receipt = ordinary(build_receipt, "candidate OCI build receipt")
-    for key, path, kind in (("image_artifact", image_path, "oci-image"),):
+    for key, path, kind in (
+        ("image_artifact", image_path, "oci-image"),
+        ("bundle_manifest_artifact", manifest_path, "bundle-manifest"),
+        ("build_receipt_artifact", build_receipt, "oci-build-receipt"),
+    ):
         path = ordinary(path, f"candidate {kind}")
         artifact = receipt.get(key)
         if not isinstance(artifact, dict) or set(artifact) != {"kind", "name", "bytes", "sha256"}:

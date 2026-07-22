@@ -330,7 +330,9 @@ def main() -> int:
         return 0
     try:
         evidence = runpy.run_path(Path(__file__).with_name("release-evidence-status.py"))
-        report = evidence["evaluate"](args.registry, args.candidate, document)
+        report = evidence["evaluate"](
+            args.registry, args.candidate, document, args.digest_tool
+        )
         rendered = evidence["render"](report)
         if args.json_output is not None:
             _write_report(args.json_output, report)

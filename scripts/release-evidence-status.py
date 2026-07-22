@@ -31,6 +31,11 @@ OciRuntimeError = OCI_RUNTIME["QualificationError"]
 OCI_SECURITY = runpy.run_path(Path(__file__).with_name("qualify-oci-security.py"))
 load_oci_security_receipt = OCI_SECURITY["load_receipt"]
 OciSecurityError = OCI_SECURITY["SecurityScanError"]
+KUBERNETES_DEPLOYMENT = runpy.run_path(
+    Path(__file__).with_name("qualify-kubernetes-deployment.py")
+)
+load_deployment_receipt = KUBERNETES_DEPLOYMENT["load_receipt"]
+DeploymentError = KUBERNETES_DEPLOYMENT["DeploymentError"]
 
 SCHEMA = "tritium.release-evidence-registry.v1"
 REPORT_SCHEMA = "tritium.release-gate-report.v1"
@@ -43,6 +48,7 @@ KNOWN_KINDS = frozenset(
         "cuda-training", "clean-install", "compatibility-matrix",
         "crate-archive", "npm-archive", "oci-runtime-cpu", "oci-runtime-cuda",
         "oci-security-cpu", "oci-security-cuda",
+        "serving-deployment-cpu", "serving-deployment-cuda",
     }
 )
 HEX = frozenset("0123456789abcdef")
@@ -67,7 +73,8 @@ GATES = (
     (
         "serving",
         ("oci-runtime-cpu", "oci-runtime-cuda", "oci-security-cpu",
-         "oci-security-cuda", "serving-deployment"),
+         "oci-security-cuda", "serving-deployment-cpu",
+         "serving-deployment-cuda"),
     ),
     ("zoo-community", ("model-zoo", "generated-claims", "governance-docs")),
     ("reproduction-signoff", ("second-machine", "independent-review")),
@@ -168,7 +175,10 @@ def _check_ancestry(entries: dict[str, dict[str, Any]]) -> None:
         visit(receipt_id)
 
 
-def evaluate(registry: Path, candidate: Path, candidate_document: dict[str, Any]) -> dict[str, Any]:
+def evaluate(
+    registry: Path, candidate: Path, candidate_document: dict[str, Any],
+    digest_tool: str = "tritium",
+) -> dict[str, Any]:
     if registry.is_symlink() or not registry.is_file():
         raise EvidenceError("registry must be an ordinary file")
     if registry.stat().st_size > MAX_RECEIPT_BYTES:
@@ -203,6 +213,9 @@ def evaluate(registry: Path, candidate: Path, candidate_document: dict[str, Any]
         if isinstance(artifact, dict)
     }
     evidence: dict[str, str] = {}
+    validated_receipts: dict[str, dict[str, Any]] = {}
+    kinds: dict[str, str] = {}
+    artifact_ids: dict[str, str] = {}
     for ordinal, raw in enumerate(raw_receipts):
         label = f"registry.receipts[{ordinal}]"
         entry = _object(raw, RECEIPT_FIELDS, label)
@@ -233,7 +246,9 @@ def evaluate(registry: Path, candidate: Path, candidate_document: dict[str, Any]
         expected_artifact_kind = (
             "rust-crate" if kind == "crate-archive"
             else "npm-archive" if kind == "npm-archive"
-            else "oci-image" if kind.startswith("oci-")
+            else "oci-image" if (
+                kind.startswith("oci-") or kind.startswith("serving-deployment-")
+            )
             else "python-wheel"
         )
         if artifact.get("kind") != expected_artifact_kind:
@@ -276,6 +291,52 @@ def evaluate(registry: Path, candidate: Path, candidate_document: dict[str, Any]
                 )
                 if receipt["flavor"] != kind.removeprefix("oci-security-"):
                     raise OciSecurityError("security receipt flavor differs from evidence kind")
+            elif kind in {"serving-deployment-cpu", "serving-deployment-cuda"}:
+                try:
+                    raw_deployment = json.loads(receipt_path.read_bytes())
+                except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                    raise DeploymentError(
+                        "deployment receipt must contain UTF-8 JSON"
+                    ) from error
+                if not isinstance(raw_deployment, dict):
+                    raise DeploymentError("deployment receipt must be an object")
+                chart_record = raw_deployment.get("chart_artifact")
+                chart_id = chart_record.get("artifact_id") if isinstance(
+                    chart_record, dict
+                ) else None
+                chart_artifact = artifacts.get(chart_id)
+                if not isinstance(chart_artifact, dict) or chart_artifact.get(
+                    "kind"
+                ) != "helm-chart":
+                    raise DeploymentError("deployment chart is absent from candidate")
+                chart_path = _contained_file(
+                    candidate.parent, chart_artifact.get("path"),
+                    "candidate Helm chart path",
+                )
+                support_paths: dict[str, Path] = {}
+                for field in ("bundle_manifest_artifact", "build_receipt_artifact"):
+                    record = raw_deployment.get(field)
+                    if not isinstance(record, dict) or not isinstance(
+                        record.get("name"), str
+                    ):
+                        raise DeploymentError(f"deployment {field} is malformed")
+                    support = _contained_file(root, record["name"], f"deployment {field}")
+                    if (support.stat().st_size, _sha256(support)) != (
+                        record.get("bytes"), record.get("sha256")
+                    ):
+                        raise DeploymentError(f"deployment {field} bytes differ")
+                    support_paths[field] = support
+                receipt = load_deployment_receipt(
+                    receipt_path, chart_path=chart_path, image_path=artifact_path,
+                    manifest_path=support_paths["bundle_manifest_artifact"],
+                    build_receipt=support_paths["build_receipt_artifact"],
+                    package_candidate=candidate, digest_tool=digest_tool,
+                    revision=revision, release=release,
+                )
+                if receipt["flavor"] != kind.removeprefix("serving-deployment-"):
+                    raise DeploymentError(
+                        "deployment receipt flavor differs from evidence kind"
+                    )
             else:
                 raise EvidenceError(f"{label}.kind has no validator dispatch")
         except (
@@ -283,6 +344,7 @@ def evaluate(registry: Path, candidate: Path, candidate_document: dict[str, Any]
             CrateReceiptError, NpmReceiptError,
             OciRuntimeError,
             OciSecurityError,
+            DeploymentError,
         ) as error:
             raise EvidenceError(f"{label} failed {kind} validation: {error}") from error
         if receipt["receipt_id"] != receipt_id:
@@ -356,17 +418,63 @@ def evaluate(registry: Path, candidate: Path, candidate_document: dict[str, Any]
             )
             if actual != declared or actual != qualified:
                 raise EvidenceError("OCI receipt does not bind candidate image bytes")
+        elif kind.startswith("serving-deployment-"):
+            identity = artifact.get("identity", {})
+            actual = (
+                artifact_path.name, _sha256(artifact_path), artifact_path.stat().st_size
+            )
+            declared = (
+                artifact_path.name, identity.get("sha256"), identity.get("bytes")
+            )
+            qualified = (
+                receipt["image_artifact"]["name"],
+                receipt["image_artifact"]["sha256"],
+                receipt["image_artifact"]["bytes"],
+            )
+            if actual != declared or actual != qualified:
+                raise EvidenceError(
+                    "deployment receipt does not bind candidate image bytes"
+                )
         elif receipt["artifact"]["kind"] != "python-wheel":
             raise EvidenceError(f"{kind} receipt does not identify a Python wheel")
         run_id = receipt["run_id"]
         if run_id in run_ids:
             raise EvidenceError(f"duplicate run id {run_id!r}")
+        if kind in evidence:
+            raise EvidenceError(f"duplicate evidence kind {kind!r}")
         run_ids.add(run_id)
         evidence[kind] = "empirical"
         entries[receipt_id] = {**entry, "parents": list(parents)}
+        validated_receipts[receipt_id] = receipt
+        kinds[receipt_id] = kind
+        artifact_ids[receipt_id] = artifact_id
         paths.add(logical_path)
         portable_paths.add(portable_path)
     _check_ancestry(entries)
+    for receipt_id, kind in kinds.items():
+        if not kind.startswith("serving-deployment-"):
+            continue
+        flavor = kind.removeprefix("serving-deployment-")
+        required_parent_kinds = {f"oci-runtime-{flavor}", f"oci-security-{flavor}"}
+        parents = entries[receipt_id]["parents"]
+        if {kinds.get(parent) for parent in parents} != required_parent_kinds:
+            raise EvidenceError(
+                f"{kind} must have exact matching runtime and security parents"
+            )
+        if any(artifact_ids[parent] != artifact_ids[receipt_id] for parent in parents):
+            raise EvidenceError(f"{kind} parents must bind the same candidate image")
+        runtime_parent = next(
+            validated_receipts[parent]
+            for parent in parents
+            if kinds[parent] == f"oci-runtime-{flavor}"
+        )
+        deployment = validated_receipts[receipt_id]
+        if runtime_parent.get("startup_receipt") != deployment.get("workload", {}).get(
+            "startup_receipt"
+        ):
+            raise EvidenceError(
+                f"{kind} startup receipt differs from runtime parent"
+            )
 
     rows = [_gate_row(gate_id, required, evidence) for gate_id, required in GATES]
     ready = all(row["status"] == "PASS" for row in rows)

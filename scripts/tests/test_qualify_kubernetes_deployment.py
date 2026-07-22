@@ -48,6 +48,8 @@ def startup(flavor: str = "cpu") -> dict:
 def receipt(chart: Path, image_archive: Path, candidate: Path,
             flavor: str = "cpu") -> dict:
     startup_receipt = startup(flavor)
+    manifest = candidate.parent / "tritium.json"
+    build_receipt = candidate.parent / "build-receipt.json"
     value = {
         "schema": MODULE["SCHEMA"], "release": "1.1.0-rc.0",
         "source_revision": "a" * 40, "run_id": f"kubernetes-{flavor}-1",
@@ -61,6 +63,16 @@ def receipt(chart: Path, image_archive: Path, candidate: Path,
         "image_artifact": {"kind": "oci-image", "name": image_archive.name,
                            "bytes": image_archive.stat().st_size,
                            "sha256": hashlib.sha256(image_archive.read_bytes()).hexdigest()},
+        "bundle_manifest_artifact": {
+            "kind": "bundle-manifest", "name": manifest.name,
+            "bytes": manifest.stat().st_size,
+            "sha256": hashlib.sha256(manifest.read_bytes()).hexdigest(),
+        },
+        "build_receipt_artifact": {
+            "kind": "oci-build-receipt", "name": build_receipt.name,
+            "bytes": build_receipt.stat().st_size,
+            "sha256": hashlib.sha256(build_receipt.read_bytes()).hexdigest(),
+        },
         "image": "registry.example/tritium@sha256:" + "2" * 64,
         "manifest": {"schema": "tritium.file-identity.v1", "bytes": 42,
                      "sha256": "3" * 64, "blake3": "c" * 64},

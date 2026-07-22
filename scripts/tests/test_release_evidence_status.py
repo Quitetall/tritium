@@ -235,6 +235,116 @@ def entry(
 
 
 class ReleaseEvidenceStatusTests(unittest.TestCase):
+    def test_cpu_deployment_requires_exact_image_parents_and_support_bytes(self):
+        with tempfile.TemporaryDirectory() as raw:
+            candidate, document, old_artifact, evidence_root = release_fixture(Path(raw))
+            old_artifact.unlink()
+            image = candidate.parent / "tritium-cpu.oci.tar"
+            chart = candidate.parent / "tritium-1.1.0-rc.0.tgz"
+            image.write_bytes(b"qualified OCI archive")
+            chart.write_bytes(b"qualified Helm chart")
+            document["artifacts"] = [
+                {
+                    "id": "oci-cpu", "kind": "oci-image", "path": image.name,
+                    "identity": {"sha256": sha256(image), "bytes": image.stat().st_size},
+                    "sbom": {}, "provenance": {},
+                },
+                {
+                    "id": "helm-chart", "kind": "helm-chart", "path": chart.name,
+                    "identity": {"sha256": sha256(chart), "bytes": chart.stat().st_size},
+                    "sbom": {}, "provenance": {},
+                },
+            ]
+            candidate.write_bytes(canonical(document) + b"\n")
+            runtime_path = evidence_root / "runtime-cpu.json"
+            runtime = oci_runtime_receipt(runtime_path, image)
+            security_path = evidence_root / "security-cpu.json"
+            security = oci_security_receipt(security_path, image)
+            manifest = evidence_root / "bundle.manifest.json"
+            build = evidence_root / "oci-build-cpu.json"
+            manifest.write_bytes(b"bundle manifest")
+            build.write_bytes(b"OCI build receipt")
+            deployment_path = evidence_root / "deployment-cpu.json"
+            deployment_raw = {
+                "chart_artifact": {"artifact_id": "helm-chart"},
+                "bundle_manifest_artifact": {
+                    "name": manifest.name, "bytes": manifest.stat().st_size,
+                    "sha256": sha256(manifest),
+                },
+                "build_receipt_artifact": {
+                    "name": build.name, "bytes": build.stat().st_size,
+                    "sha256": sha256(build),
+                },
+            }
+            deployment_id = "sha256:" + hashlib.sha256(canonical(deployment_raw)).hexdigest()
+            deployment_raw["receipt_id"] = deployment_id
+            deployment_path.write_bytes(canonical(deployment_raw) + b"\n")
+            deployment = {
+                "receipt_id": deployment_id, "run_id": "deployment-cpu-1",
+                "flavor": "cpu",
+                "image_artifact": {
+                    "name": image.name, "sha256": sha256(image),
+                    "bytes": image.stat().st_size,
+                },
+                "workload": {"startup_receipt": runtime["startup_receipt"]},
+            }
+            runtime_entry = {
+                **entry(runtime_path, runtime, kind="oci-runtime-cpu"),
+                "artifact_id": "oci-cpu",
+            }
+            security_entry = {
+                **entry(security_path, security, kind="oci-security-cpu"),
+                "artifact_id": "oci-cpu",
+            }
+            deployment_entry = {
+                **entry(deployment_path, deployment_raw, kind="serving-deployment-cpu"),
+                "artifact_id": "oci-cpu",
+                "parents": [runtime["receipt_id"], security["receipt_id"]],
+            }
+            registry_path = evidence_root / "registry.json"
+            registry(
+                registry_path, candidate,
+                [deployment_entry, security_entry, runtime_entry],
+            )
+            loader = mock.Mock(return_value=deployment)
+            with mock.patch.dict(evaluate.__globals__, {"load_deployment_receipt": loader}):
+                report = evaluate(registry_path, candidate, document, "tritium-test")
+            serving = next(row for row in report["rows"] if row["id"] == "serving")
+            self.assertIn("serving-deployment-cpu", serving["satisfied_kinds"])
+            self.assertIn("serving-deployment-cuda", serving["missing_kinds"])
+            self.assertEqual(loader.call_args.kwargs["manifest_path"], manifest.resolve())
+            self.assertEqual(loader.call_args.kwargs["build_receipt"], build.resolve())
+
+            manifest.write_bytes(b"tampered bundle manifest")
+            with self.assertRaisesRegex(EvidenceError, "support|bytes differ"):
+                evaluate(registry_path, candidate, document, "tritium-test")
+            manifest.write_bytes(b"bundle manifest")
+
+            manifest.rename(evidence_root / "real-bundle.manifest.json")
+            manifest.symlink_to("real-bundle.manifest.json")
+            with self.assertRaisesRegex(EvidenceError, "symlink"):
+                evaluate(registry_path, candidate, document, "tritium-test")
+            manifest.unlink()
+            (evidence_root / "real-bundle.manifest.json").rename(manifest)
+
+            mismatched = {**deployment, "workload": {
+                "startup_receipt": {**runtime["startup_receipt"], "self_test_digest": "9" * 64}
+            }}
+            with mock.patch.dict(
+                evaluate.__globals__,
+                {"load_deployment_receipt": mock.Mock(return_value=mismatched)},
+            ), self.assertRaisesRegex(EvidenceError, "startup receipt differs"):
+                evaluate(registry_path, candidate, document, "tritium-test")
+
+            deployment_entry["parents"] = [runtime["receipt_id"]]
+            registry(
+                registry_path, candidate,
+                [deployment_entry, security_entry, runtime_entry],
+            )
+            with mock.patch.dict(evaluate.__globals__, {"load_deployment_receipt": loader}), \
+                    self.assertRaisesRegex(EvidenceError, "exact matching runtime"):
+                evaluate(registry_path, candidate, document, "tritium-test")
+
     def test_cpu_oci_security_advances_serving_without_waiving_other_gates(self):
         with tempfile.TemporaryDirectory() as raw:
             candidate, document, old_artifact, evidence_root = release_fixture(Path(raw))
@@ -259,7 +369,7 @@ class ReleaseEvidenceStatusTests(unittest.TestCase):
             self.assertEqual(
                 serving["missing_kinds"],
                 ["oci-runtime-cpu", "oci-runtime-cuda", "oci-security-cuda",
-                 "serving-deployment"],
+                 "serving-deployment-cpu", "serving-deployment-cuda"],
             )
             receipt_entry["kind"] = "oci-security-cuda"
             registry(registry_path, candidate, [receipt_entry])
@@ -290,7 +400,7 @@ class ReleaseEvidenceStatusTests(unittest.TestCase):
             self.assertEqual(
                 serving["missing_kinds"],
                 ["oci-runtime-cuda", "oci-security-cpu", "oci-security-cuda",
-                 "serving-deployment"],
+                 "serving-deployment-cpu", "serving-deployment-cuda"],
             )
             receipt_entry["kind"] = "oci-runtime-cuda"
             registry(registry_path, candidate, [receipt_entry])
@@ -635,6 +745,19 @@ class ReleaseEvidenceStatusTests(unittest.TestCase):
                 [entry(first_path, first), entry(second_path, second)],
             )
             with self.assertRaisesRegex(EvidenceError, "duplicate run id"):
+                evaluate(registry_path, candidate, document)
+
+            second["run_id"] = "run-18"
+            unsigned = dict(second)
+            unsigned.pop("receipt_id")
+            second["receipt_id"] = "sha256:" + hashlib.sha256(canonical(unsigned)).hexdigest()
+            second_path.write_bytes(canonical(second) + b"\n")
+            registry(
+                registry_path,
+                candidate,
+                [entry(first_path, first), entry(second_path, second)],
+            )
+            with self.assertRaisesRegex(EvidenceError, "duplicate evidence kind"):
                 evaluate(registry_path, candidate, document)
 
     def test_rejects_leaf_symlink_receipt(self):

@@ -276,7 +276,12 @@ also makes CPU qualification contingent on KEDA and external-metrics API
 preflight, a bounded Prometheus-backed generation load, an Active/Ready
 ScaledObject, HPA-backed scale-out from one to at least two ready replicas and
 settling back to one. Harness and receipt validator are local-green; empirical
-kind, Prometheus/KEDA and NVIDIA-cluster receipts remain open release gates.
+Prometheus/KEDA and NVIDIA-cluster receipts remain open release gates. The v2
+receipt also binds the exact bundle-manifest and OCI-build-receipt support
+bytes. Release-evidence admission is fail-closed and flavor-specific: separate
+CPU and CUDA deployment kinds each require the matching OCI runtime and
+security receipts as their only parents, all three bind the same candidate
+image, and the runtime/deployment startup receipts must be identical.
 
 ## Slice 6 — failure injection and release evidence
 
