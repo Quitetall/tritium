@@ -114,6 +114,23 @@ class OciContractTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("exact name@sha256 digest", result.stderr)
 
+    def test_runtime_qualifier_covers_production_and_hardening_gates(self):
+        script = (ROOT / "scripts/qualify-oci-runtime.py").read_text(encoding="utf-8")
+        for token in (
+            "production_artifact_admitted",
+            "startup_receipt",
+            "manifest_package_id",
+            "/v1/chat/completions",
+            "data: [DONE]",
+            "ReadonlyRootfs",
+            "CapDrop",
+            "no-new-privileges",
+            '"--signal", "TERM"',
+            "nvidia-smi",
+            "receipt_id",
+        ):
+            self.assertIn(token, script)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -197,6 +197,14 @@ SBOM plus SLSA predicates whose subjects bind exact image-manifest digest.
 Exact-image runtime, vulnerability/secret scan, strict schema-v3
 receipt parity, and NVIDIA evidence remain open gates.
 
+Runtime qualification harness now requires an exact Docker repository digest,
+strict bundle manifest identity, production `/readyz` receipt parity, singular
+model listing, one buffered and one SSE generation, read-only root/bundle,
+dropped capabilities, `no-new-privileges`, and bounded successful SIGTERM drain.
+CUDA runs additionally require physical GPU UUID/name/driver evidence. It emits
+a content-addressed receipt only after all checks pass; no qualifying image or
+27B bundle is present locally yet, so CPU/CUDA empirical receipts remain open.
+
 ## Slice 5 — Helm, autoscaling and serverless examples
 
 Add `deploy/helm/tritium`, `deploy/keda`, and `deploy/knative`:
