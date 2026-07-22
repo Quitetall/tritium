@@ -831,8 +831,12 @@ requests output VJPs without parameter gradient buffers, domain-binds the exact
 objective into cache provenance, snapshots aliased inputs under an explicit
 byte ceiling, uses batch-partition-independent global probe ordinals, bounds
 forward-KL factor and cross-device mask workspace, and aborts partial batches.
-The adapter that schedules those passes from the canonical pinned-Qwen catalog
-remains open.
+The canonical catalog traversal is now available to abi3 callers as a stateful
+session: it preflights hostile/stale partial namespaces, exposes one idempotent
+missing task, advances only after strict durable acceptance, resumes without
+replay, and freshly revalidates the ordered evidence-set digest at completion.
+The high-level PyTorch model/module resolver and calibration-replay loop over
+that session remain open.
 Its
 publication boundary is available: on supported platforms the evidence
 directory installs each bounded canonical record through a verified inode in a

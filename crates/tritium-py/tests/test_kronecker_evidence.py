@@ -9,6 +9,9 @@ from tritium import (
     KroneckerEvidenceReceipt,
     KroneckerPublicationError,
     KroneckerStateError,
+    Qwen36KroneckerCaptureReceipt,
+    Qwen36KroneckerCaptureSession,
+    Qwen36KroneckerCaptureTask,
 )
 from tritium.torch import KroneckerCalibrationWriter
 
@@ -35,6 +38,36 @@ def _builder(tmp_path, *, index=0, name="a.weight"):
         0.25,
         max_batch_bytes=4096,
     )
+
+
+def test_qwen_capture_session_rejects_invalid_contract_before_source_io(tmp_path):
+    assert Qwen36KroneckerCaptureSession.__name__ == "Qwen36KroneckerCaptureSession"
+    assert Qwen36KroneckerCaptureTask.__name__ == "Qwen36KroneckerCaptureTask"
+    assert Qwen36KroneckerCaptureReceipt.__name__ == "Qwen36KroneckerCaptureReceipt"
+    args = [
+        str(tmp_path / "model"),
+        "not-the-pinned-revision",
+        str(tmp_path / "work"),
+        str(tmp_path / "evidence"),
+        "guided-fisher",
+        "02" * 32,
+        "03" * 32,
+        0.25,
+    ]
+    with pytest.raises(KroneckerContractError, match="pinned Qwen3.6 revision"):
+        Qwen36KroneckerCaptureSession(*args)
+    args[1] = "6a9e13bd6fc8f0983b9b99948120bc37f49c13e9"
+    with pytest.raises(KroneckerContractError, match="max_evidence_bytes must be positive"):
+        Qwen36KroneckerCaptureSession(*args, max_evidence_bytes=0)
+    args[-1] = float("nan")
+    with pytest.raises(KroneckerContractError, match="damping must be finite"):
+        Qwen36KroneckerCaptureSession(*args)
+    args[-1] = 0.25
+    args[5] = "not-a-digest"
+    with pytest.raises(KroneckerContractError, match="activation_cache_digest"):
+        Qwen36KroneckerCaptureSession(*args)
+    assert not (tmp_path / "work").exists()
+    assert not (tmp_path / "evidence").exists()
 
 
 def test_binary_batches_publish_one_canonical_record(tmp_path):

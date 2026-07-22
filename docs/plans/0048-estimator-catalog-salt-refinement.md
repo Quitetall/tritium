@@ -152,6 +152,13 @@ coverage and duplicate-plugin tests.
   callback failure; validates the exact namespace; and derives an ordered
   evidence-set digest. The PyTorch/CUDA hook and empirical 506-record run remain
   open.
+- [x] Expose that same orchestration through a stateful abi3 session: reopening
+  preflights every present record before returning a missing task, repeated
+  `next_request()` calls are idempotent, advancement requires strict durable
+  acceptance of the pending ordinal, drop/reopen resumes without replay, and
+  finalization freshly revalidates all 506 records before returning the native
+  ordered evidence-set digest. The original callback collector now uses this
+  state machine rather than maintaining a second scheduler.
 - [x] Expose bounded abi3/PyTorch grouped-evidence ingestion: tensor batches are
   shape-checked and converted to canonical f32le/f64le buffers, token masks are
   strictly boolean, native accumulation releases the GIL, failed parsing or
@@ -168,8 +175,8 @@ coverage and duplicate-plugin tests.
   Attention masks, or shifted non-ignored labels for the causal-loss
   convention, bind the selected sample set; partial failures abort unpublished
   state; and completed state survives only retryable publication/resource
-  failures. Scheduling these passes from the canonical pinned-Qwen catalog
-  remains open.
+  failures. The high-level PyTorch model/module resolver and calibration-replay
+  loop over the native pinned-Qwen session remain open.
 - Keep calibration, reconstruction and validation datasets source-bound and
   disjoint where the recipe requires.
 

@@ -45,12 +45,12 @@ pub use qwen36_tensor_work::{
     Qwen36PreservedSafetensorsError, Qwen36PreservedSafetensorsReceipt,
     Qwen36PreservedTensorDescriptor, Qwen36PreservedVisitError, Qwen36PtqDriverError,
     Qwen36PtqEvidenceCaptureError, Qwen36PtqEvidenceCaptureReceipt,
-    Qwen36PtqEvidenceCaptureRequest, Qwen36PtqEvidenceDirectory, Qwen36PtqPackageError,
-    Qwen36PtqPackageLimits, Qwen36PtqPackagesReceipt, Qwen36ScaleOnlyCampaignStore,
-    Qwen36SelectedAllocationBindError, Qwen36SelectedAllocationReceipt,
-    Qwen36SelectedAllocationSpec, Qwen36SelectedProfileReceipt, Qwen36TensorWorkError,
-    Qwen36TensorWorkStore, Qwen36TensorWorkSummary, collect_qwen36_ptq_evidence,
-    reconcile_qwen36_ptq, reconcile_qwen36_ptq_packages,
+    Qwen36PtqEvidenceCaptureRequest, Qwen36PtqEvidenceCaptureSession, Qwen36PtqEvidenceCaptureTask,
+    Qwen36PtqEvidenceDirectory, Qwen36PtqPackageError, Qwen36PtqPackageLimits,
+    Qwen36PtqPackagesReceipt, Qwen36ScaleOnlyCampaignStore, Qwen36SelectedAllocationBindError,
+    Qwen36SelectedAllocationReceipt, Qwen36SelectedAllocationSpec, Qwen36SelectedProfileReceipt,
+    Qwen36TensorWorkError, Qwen36TensorWorkStore, Qwen36TensorWorkSummary,
+    collect_qwen36_ptq_evidence, reconcile_qwen36_ptq, reconcile_qwen36_ptq_packages,
 };
 pub use tensor_work_store::{
     TensorPayloadValidator, TensorPayloadWriter, TensorPutError, TensorRecordInfo,

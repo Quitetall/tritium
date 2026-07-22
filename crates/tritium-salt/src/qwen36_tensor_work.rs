@@ -21,9 +21,10 @@ pub use additive_master::{
 };
 pub use ptq_driver::{
     Qwen36PtqDriverError, Qwen36PtqEvidenceCaptureError, Qwen36PtqEvidenceCaptureReceipt,
-    Qwen36PtqEvidenceCaptureRequest, Qwen36PtqEvidenceDirectory, Qwen36PtqPackageError,
-    Qwen36PtqPackageLimits, Qwen36PtqPackagesReceipt, collect_qwen36_ptq_evidence,
-    reconcile_qwen36_ptq, reconcile_qwen36_ptq_packages,
+    Qwen36PtqEvidenceCaptureRequest, Qwen36PtqEvidenceCaptureSession, Qwen36PtqEvidenceCaptureTask,
+    Qwen36PtqEvidenceDirectory, Qwen36PtqPackageError, Qwen36PtqPackageLimits,
+    Qwen36PtqPackagesReceipt, collect_qwen36_ptq_evidence, reconcile_qwen36_ptq,
+    reconcile_qwen36_ptq_packages,
 };
 
 use core::{convert::Infallible, fmt, fmt::Write as _};

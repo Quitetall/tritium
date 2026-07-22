@@ -316,6 +316,9 @@ fn _tritium(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<module_package::ModuleSaltV2Receipt>()?;
     m.add_class::<kronecker::KroneckerEvidenceBuilder>()?;
     m.add_class::<kronecker::KroneckerEvidenceReceipt>()?;
+    m.add_class::<kronecker::Qwen36KroneckerCaptureTask>()?;
+    m.add_class::<kronecker::Qwen36KroneckerCaptureReceipt>()?;
+    m.add_class::<kronecker::Qwen36KroneckerCaptureSession>()?;
     kronecker::register_exceptions(m)?;
     m.add_function(wrap_pyfunction!(ternary_matmul, m)?)?;
     m.add_function(wrap_pyfunction!(compiled_backends, m)?)?;

@@ -6,11 +6,14 @@ use pyo3::{
     prelude::*,
 };
 use tritium_quantize::{
-    CurvatureSourceId, SaltV2Curvature, SaltV2KroneckerEvidenceBuildError,
-    SaltV2KroneckerEvidenceBuilder, SaltV2KroneckerEvidenceError, SaltV2KroneckerEvidenceSpec,
+    CurvatureSourceId, Qwen35TensorRole, Qwen35TensorScope, SaltV2Curvature,
+    SaltV2KroneckerEvidenceBuildError, SaltV2KroneckerEvidenceBuilder,
+    SaltV2KroneckerEvidenceError, SaltV2KroneckerEvidenceSpec,
 };
 use tritium_salt::{
-    Qwen36PtqDriverError, Qwen36PtqEvidenceDirectory, Qwen36TensorWorkError, TensorWorkError,
+    Qwen36AdmissionError, Qwen36AdmittedSource, Qwen36PtqDriverError,
+    Qwen36PtqEvidenceCaptureReceipt, Qwen36PtqEvidenceCaptureSession, Qwen36PtqEvidenceCaptureTask,
+    Qwen36PtqEvidenceDirectory, Qwen36TensorWorkError, TensorWorkError,
 };
 
 const DEFAULT_MAX_BATCH_BYTES: usize = 256 * 1024 * 1024;
@@ -79,6 +82,317 @@ impl KroneckerEvidenceReceipt {
         format!(
             "KroneckerEvidenceReceipt(tensor_index={}, bytes={}, record_digest='{}')",
             self.tensor_index, self.bytes, self.record_digest
+        )
+    }
+}
+
+/// One missing source-bound tensor in the canonical pinned-Qwen catalog.
+#[pyclass(frozen, module = "tritium._tritium", skip_from_py_object)]
+#[derive(Clone, Debug)]
+pub(crate) struct Qwen36KroneckerCaptureTask {
+    tensor_index: u64,
+    tensor_name: String,
+    rows: usize,
+    columns: usize,
+    scope: String,
+    role: String,
+    source_model_digest: String,
+    activation_cache_digest: String,
+    token_stream_digest: String,
+    curvature: String,
+    damping: f64,
+}
+
+impl From<Qwen36PtqEvidenceCaptureTask> for Qwen36KroneckerCaptureTask {
+    fn from(task: Qwen36PtqEvidenceCaptureTask) -> Self {
+        let source = task.source_id();
+        Self {
+            tensor_index: task.tensor_index(),
+            tensor_name: task.tensor_name().to_owned(),
+            rows: task.rows(),
+            columns: task.columns(),
+            scope: scope_label(task.scope()).to_owned(),
+            role: role_label(task.role()).to_owned(),
+            source_model_digest: encode_digest(&source.source_model_digest()),
+            activation_cache_digest: encode_digest(&source.activation_cache_digest()),
+            token_stream_digest: encode_digest(&source.token_stream_digest()),
+            curvature: curvature_label(task.curvature()).to_owned(),
+            damping: task.damping(),
+        }
+    }
+}
+
+#[pymethods]
+impl Qwen36KroneckerCaptureTask {
+    #[getter]
+    const fn tensor_index(&self) -> u64 {
+        self.tensor_index
+    }
+
+    #[getter]
+    fn tensor_name(&self) -> &str {
+        &self.tensor_name
+    }
+
+    #[getter]
+    const fn rows(&self) -> usize {
+        self.rows
+    }
+
+    #[getter]
+    const fn columns(&self) -> usize {
+        self.columns
+    }
+
+    #[getter]
+    fn scope(&self) -> &str {
+        &self.scope
+    }
+
+    #[getter]
+    fn role(&self) -> &str {
+        &self.role
+    }
+
+    #[getter]
+    fn source_model_digest(&self) -> &str {
+        &self.source_model_digest
+    }
+
+    #[getter]
+    fn activation_cache_digest(&self) -> &str {
+        &self.activation_cache_digest
+    }
+
+    #[getter]
+    fn token_stream_digest(&self) -> &str {
+        &self.token_stream_digest
+    }
+
+    #[getter]
+    fn curvature(&self) -> &str {
+        &self.curvature
+    }
+
+    #[getter]
+    const fn damping(&self) -> f64 {
+        self.damping
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "Qwen36KroneckerCaptureTask(tensor_index={}, tensor_name='{}', rows={}, columns={})",
+            self.tensor_index, self.tensor_name, self.rows, self.columns
+        )
+    }
+}
+
+/// Final ordered identity and resume accounting for the pinned-Qwen catalog.
+#[pyclass(frozen, module = "tritium._tritium", skip_from_py_object)]
+#[derive(Clone, Debug)]
+pub(crate) struct Qwen36KroneckerCaptureReceipt {
+    evidence_set_digest: String,
+    source_model_digest: String,
+    activation_cache_digest: String,
+    token_stream_digest: String,
+    curvature: String,
+    damping: f64,
+    records: u64,
+    produced: u64,
+    reused: u64,
+}
+
+impl From<Qwen36PtqEvidenceCaptureReceipt> for Qwen36KroneckerCaptureReceipt {
+    fn from(receipt: Qwen36PtqEvidenceCaptureReceipt) -> Self {
+        let source = receipt.source_id();
+        Self {
+            evidence_set_digest: encode_digest(receipt.evidence_set_digest()),
+            source_model_digest: encode_digest(&source.source_model_digest()),
+            activation_cache_digest: encode_digest(&source.activation_cache_digest()),
+            token_stream_digest: encode_digest(&source.token_stream_digest()),
+            curvature: curvature_label(receipt.curvature()).to_owned(),
+            damping: receipt.damping(),
+            records: receipt.records(),
+            produced: receipt.produced(),
+            reused: receipt.reused(),
+        }
+    }
+}
+
+#[pymethods]
+impl Qwen36KroneckerCaptureReceipt {
+    #[getter]
+    fn evidence_set_digest(&self) -> &str {
+        &self.evidence_set_digest
+    }
+
+    #[getter]
+    fn source_model_digest(&self) -> &str {
+        &self.source_model_digest
+    }
+
+    #[getter]
+    fn activation_cache_digest(&self) -> &str {
+        &self.activation_cache_digest
+    }
+
+    #[getter]
+    fn token_stream_digest(&self) -> &str {
+        &self.token_stream_digest
+    }
+
+    #[getter]
+    fn curvature(&self) -> &str {
+        &self.curvature
+    }
+
+    #[getter]
+    const fn damping(&self) -> f64 {
+        self.damping
+    }
+
+    #[getter]
+    const fn records(&self) -> u64 {
+        self.records
+    }
+
+    #[getter]
+    const fn produced(&self) -> u64 {
+        self.produced
+    }
+
+    #[getter]
+    const fn reused(&self) -> u64 {
+        self.reused
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "Qwen36KroneckerCaptureReceipt(records={}, produced={}, reused={}, evidence_set_digest='{}')",
+            self.records, self.produced, self.reused, self.evidence_set_digest
+        )
+    }
+}
+
+/// Stateful Python boundary for the native canonical pinned-Qwen scheduler.
+#[pyclass(module = "tritium._tritium")]
+pub(crate) struct Qwen36KroneckerCaptureSession {
+    session: Qwen36PtqEvidenceCaptureSession,
+}
+
+#[pymethods]
+impl Qwen36KroneckerCaptureSession {
+    #[new]
+    #[pyo3(signature = (
+        model_dir,
+        declared_revision,
+        work_dir,
+        evidence_dir,
+        curvature,
+        activation_cache_digest,
+        token_stream_digest,
+        damping,
+        *,
+        max_evidence_bytes = 67_108_864
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        py: Python<'_>,
+        model_dir: &str,
+        declared_revision: &str,
+        work_dir: &str,
+        evidence_dir: &str,
+        curvature: &str,
+        activation_cache_digest: &str,
+        token_stream_digest: &str,
+        damping: f64,
+        max_evidence_bytes: u64,
+    ) -> PyResult<Self> {
+        for (field, value) in [
+            ("model_dir", model_dir),
+            ("declared_revision", declared_revision),
+            ("work_dir", work_dir),
+            ("evidence_dir", evidence_dir),
+        ] {
+            if value.is_empty() {
+                return Err(contract_error(format!("{field} must not be empty")));
+            }
+        }
+        if declared_revision != tritium_nn::QWEN36_27B_REVISION {
+            return Err(contract_error(format!(
+                "declared_revision must equal the pinned Qwen3.6 revision {}",
+                tritium_nn::QWEN36_27B_REVISION
+            )));
+        }
+        if max_evidence_bytes == 0 {
+            return Err(contract_error("max_evidence_bytes must be positive"));
+        }
+        if !damping.is_finite() || damping < 0.0 {
+            return Err(contract_error(
+                "damping must be finite and greater than or equal to zero",
+            ));
+        }
+        let curvature = parse_curvature(curvature)?;
+        let activation_cache_digest =
+            parse_digest("activation_cache_digest", activation_cache_digest)?;
+        let token_stream_digest = parse_digest("token_stream_digest", token_stream_digest)?;
+        let model_dir = model_dir.to_owned();
+        let declared_revision = declared_revision.to_owned();
+        let work_dir = work_dir.to_owned();
+        let evidence_dir = evidence_dir.to_owned();
+        let session = py.detach(move || {
+            let admitted = Qwen36AdmittedSource::open(
+                model_dir.as_ref(),
+                &declared_revision,
+                work_dir.as_ref(),
+            )
+            .map_err(admission_error)?;
+            let evidence =
+                Qwen36PtqEvidenceDirectory::create_bounded(evidence_dir, max_evidence_bytes)
+                    .map_err(directory_error)?;
+            Qwen36PtqEvidenceCaptureSession::open(
+                &admitted,
+                evidence,
+                curvature,
+                activation_cache_digest,
+                token_stream_digest,
+                damping,
+            )
+            .map_err(directory_error)
+        })?;
+        Ok(Self { session })
+    }
+
+    /// Return the next missing canonical tensor, idempotently while pending.
+    fn next_request(&mut self, py: Python<'_>) -> PyResult<Option<Qwen36KroneckerCaptureTask>> {
+        py.detach(|| self.session.next_request())
+            .map(|task| task.map(Into::into))
+            .map_err(directory_error)
+    }
+
+    /// Advance only after the current exact record strictly reopens.
+    fn accept_current(&mut self, py: Python<'_>) -> PyResult<bool> {
+        py.detach(|| self.session.accept_current())
+            .map_err(directory_error)
+    }
+
+    /// Return total, newly accepted, and reused records for this invocation.
+    #[getter]
+    fn counts(&self) -> (u64, u64, u64) {
+        self.session.counts()
+    }
+
+    /// Seal only after every canonical record freshly validates.
+    fn finish(&mut self, py: Python<'_>) -> PyResult<Option<Qwen36KroneckerCaptureReceipt>> {
+        py.detach(|| self.session.finish())
+            .map(|receipt| receipt.map(Into::into))
+            .map_err(directory_error)
+    }
+
+    fn __repr__(&self) -> String {
+        let (records, produced, reused) = self.session.counts();
+        format!(
+            "Qwen36KroneckerCaptureSession(records={records}, produced={produced}, reused={reused})"
         )
     }
 }
@@ -334,6 +648,19 @@ fn directory_error(error: Qwen36PtqDriverError) -> PyErr {
     match &error {
         Qwen36PtqDriverError::InvalidEvidencePath(_) => contract_error(error),
         Qwen36PtqDriverError::AllocationFailed => resource_error(error),
+        Qwen36PtqDriverError::EvidenceMismatch { .. } => {
+            KroneckerConflictError::new_err(error.to_string())
+        }
+        Qwen36PtqDriverError::EvidenceBuild { .. } => driver_build_error(error),
+        Qwen36PtqDriverError::Evidence {
+            source: SaltV2KroneckerEvidenceError::AllocationFailed,
+            ..
+        } => resource_error(error),
+        Qwen36PtqDriverError::Evidence {
+            source: SaltV2KroneckerEvidenceError::Io { .. },
+            ..
+        } => KroneckerPublicationError::new_err(error.to_string()),
+        Qwen36PtqDriverError::Evidence { .. } => contract_error(error),
         Qwen36PtqDriverError::Workspace(source) if workspace_resource_failure(source) => {
             resource_error(error)
         }
@@ -341,6 +668,18 @@ fn directory_error(error: Qwen36PtqDriverError) -> PyErr {
             contract_error(error)
         }
         _ => KroneckerPublicationError::new_err(error.to_string()),
+    }
+}
+
+fn admission_error(error: Qwen36AdmissionError) -> PyErr {
+    match error {
+        Qwen36AdmissionError::Io { .. } | Qwen36AdmissionError::AlreadyLocked => {
+            KroneckerPublicationError::new_err(error.to_string())
+        }
+        Qwen36AdmissionError::ExistingProofMismatch => {
+            KroneckerConflictError::new_err(error.to_string())
+        }
+        _ => contract_error(error),
     }
 }
 
@@ -479,6 +818,43 @@ fn parse_curvature(value: &str) -> PyResult<SaltV2Curvature> {
         _ => Err(contract_error(
             "curvature must be input-hessian, guided-fisher, or forward-kl-kronecker",
         )),
+    }
+}
+
+const fn curvature_label(value: SaltV2Curvature) -> &'static str {
+    match value {
+        SaltV2Curvature::InputHessian => "input-hessian",
+        SaltV2Curvature::GuidedFisher => "guided-fisher",
+        SaltV2Curvature::ForwardKlKronecker => "forward-kl-kronecker",
+        SaltV2Curvature::DiagonalFisher => "diagonal-fisher",
+    }
+}
+
+const fn scope_label(value: Qwen35TensorScope) -> &'static str {
+    match value {
+        Qwen35TensorScope::Language => "language",
+        Qwen35TensorScope::MtpDrafter => "mtp-drafter",
+        Qwen35TensorScope::DeferredVision => "deferred-vision",
+    }
+}
+
+const fn role_label(value: Qwen35TensorRole) -> &'static str {
+    match value {
+        Qwen35TensorRole::TokenEmbedding => "token-embedding",
+        Qwen35TensorRole::OutputHead => "output-head",
+        Qwen35TensorRole::Normalization => "normalization",
+        Qwen35TensorRole::MlpProjection => "mlp-projection",
+        Qwen35TensorRole::FullAttentionProjection => "full-attention-projection",
+        Qwen35TensorRole::DeltaNetProjection => "delta-net-projection",
+        Qwen35TensorRole::DeltaNetState => "delta-net-state",
+        Qwen35TensorRole::DeltaNetConvolution => "delta-net-convolution",
+        Qwen35TensorRole::MtpFusionProjection => "mtp-fusion-projection",
+        Qwen35TensorRole::VisionAttentionProjection => "vision-attention-projection",
+        Qwen35TensorRole::VisionMlpProjection => "vision-mlp-projection",
+        Qwen35TensorRole::VisionPatchEmbedding => "vision-patch-embedding",
+        Qwen35TensorRole::VisionPositionalEmbedding => "vision-positional-embedding",
+        Qwen35TensorRole::VisionMergerProjection => "vision-merger-projection",
+        Qwen35TensorRole::Bias => "bias",
     }
 }
 

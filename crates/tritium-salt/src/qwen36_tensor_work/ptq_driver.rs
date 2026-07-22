@@ -4,7 +4,8 @@ mod capture;
 
 pub use capture::{
     Qwen36PtqEvidenceCaptureError, Qwen36PtqEvidenceCaptureReceipt,
-    Qwen36PtqEvidenceCaptureRequest, collect_qwen36_ptq_evidence,
+    Qwen36PtqEvidenceCaptureRequest, Qwen36PtqEvidenceCaptureSession, Qwen36PtqEvidenceCaptureTask,
+    collect_qwen36_ptq_evidence,
 };
 
 use core::fmt;
