@@ -73,6 +73,16 @@ coverage and duplicate-plugin tests.
   record_slot_mismatches_fail_before_source_widening` passes.
 - Bind the selected output candidate to its immutable tensor-master set through
   campaign-owned execution, not a caller-provided candidate label.
+  - First vertical slice: edit
+    `crates/tritium-nn/src/model/qwen35_execution.rs` to stream final logits
+    directly from `Qwen35SaltV2LanguageMtpModel`, bind exact loaded-package and
+    self-asserted backend identities, and emit an explicitly non-admissible
+    `TSQ35EX` v1 transcript with block coverage absent and an untrusted-backend
+    evidence class. Reopen must re-execute; no raw-logit constructor exists.
+    A hostile caller backend may create only this lower transcript, never an
+    admitted campaign receipt.
+    Expected output: `cargo test -p tritium-nn
+    complete_bundle_loads_and_executes_language` passes.
   - The runtime must derive student-output bytes from the sealed master/package
     handle and emit an execution receipt binding completion ID, master-set ID,
     runtime/backend identity and student-output digest.

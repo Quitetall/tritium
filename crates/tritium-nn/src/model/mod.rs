@@ -11,6 +11,7 @@ mod hf;
 mod hf_json_tokenizer;
 mod hf_shards;
 mod qwen35;
+mod qwen35_execution;
 mod qwen35_hf;
 mod qwen35_hf_source;
 mod qwen35_mtp;
@@ -30,6 +31,9 @@ pub use hf_json_tokenizer::HfJsonTokenizer;
 pub use qwen35::{
     Qwen35TextCache, Qwen35TextLayerWeights, Qwen35TextMixerWeights, Qwen35TextOutput,
     Qwen35TextRunner, Qwen35TextWeights,
+};
+pub use qwen35_execution::{
+    Qwen35ExecutionOutputBatch, Qwen35ExecutionVisitError, Qwen35UntrustedRuntimeTranscript,
 };
 pub use qwen35_hf::{
     Qwen35HfLanguageModel, Qwen35HfLanguageMtpModel, Qwen35HfLanguageMtpReceipt,

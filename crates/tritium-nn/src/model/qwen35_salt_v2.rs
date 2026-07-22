@@ -1232,10 +1232,44 @@ mod tests {
             SaltV2Package, SaltV2Plane, SaltV2Tensor, SaltV2Tile, write_salt_v2_package,
         },
     };
+    use tritium_spec::{BackendError, DeviceBuffer, DeviceCaps, GemmShape, MpGemm, TernaryFormat};
 
     use super::*;
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[derive(Debug)]
+    struct RelabelingBackend(tritium_cpu::CpuBackend);
+
+    impl TernaryBackend for RelabelingBackend {
+        fn device_id(&self) -> &str {
+            "cuda:0"
+        }
+
+        fn physical_device_id(&self) -> &str {
+            "cuda:0:GPU-forged"
+        }
+
+        fn capabilities(&self) -> DeviceCaps {
+            let mut capabilities = self.0.capabilities();
+            capabilities.backend = "cuda".to_owned();
+            capabilities.device_name = "forged GPU".to_owned();
+            capabilities
+        }
+
+        fn upload_weights(
+            &self,
+            packed: &[u8],
+            shape: GemmShape,
+            format: TernaryFormat,
+        ) -> Result<Box<dyn DeviceBuffer>, BackendError> {
+            self.0.upload_weights(packed, shape, format)
+        }
+
+        fn mpgemm(&self, parameters: MpGemm<'_>) -> Result<(), BackendError> {
+            self.0.mpgemm(parameters)
+        }
+    }
 
     struct TestFiles {
         directory: std::path::PathBuf,
@@ -1362,7 +1396,7 @@ mod tests {
     }
 
     #[test]
-    fn complete_bundle_loads_language_and_mtp_without_dense_matrix_shadows() {
+    fn complete_bundle_loads_and_executes_language_and_mtp_without_dense_matrix_shadows() {
         let files = TestFiles::new();
         let config_json = family_config_json();
         let config = Qwen35CheckpointConfig::from_hf_config(&config_json).unwrap();
@@ -1518,6 +1552,89 @@ mod tests {
         assert_eq!(output.last_logits(), &[0.0; 7]);
         assert_eq!(cache.len(), 2);
         assert!(!model.mtp().status().reason().is_empty());
+
+        let batches = [&[1_u32, 2][..], &[3_u32][..]];
+        let mut visited = 0_u64;
+        let execution = model
+            .try_visit_untrusted_final_logits(batches, |batch| {
+                assert_eq!(batch.batch_index(), visited);
+                assert_eq!(batch.logits(), &[0.0; 7]);
+                visited += 1;
+                Ok::<_, core::convert::Infallible>(())
+            })
+            .unwrap();
+        assert_eq!(visited, 2);
+        assert_eq!(execution.batch_count(), 2);
+        assert_eq!(execution.token_count(), 3);
+        assert_eq!(execution.logit_count(), 14);
+        assert_eq!(execution.package_id(), receipt.package_id());
+        assert!(execution.backend_claims_are_untrusted());
+        assert_eq!(execution.claimed_backend_id(), "cpu");
+        assert!(execution.has_final_logits());
+        assert!(!execution.has_block_outputs());
+
+        let canonical = execution.canonical_bytes().unwrap();
+        let reopened = model
+            .reexecute_untrusted_final_logits(batches, &canonical, |_| {
+                Ok::<_, core::convert::Infallible>(())
+            })
+            .unwrap();
+        assert_eq!(reopened, execution);
+
+        let changed = model
+            .try_visit_untrusted_final_logits([&[1_u32, 3][..], &[3_u32][..]], |_| {
+                Ok::<_, core::convert::Infallible>(())
+            })
+            .unwrap();
+        assert_ne!(
+            changed.token_stream_digest(),
+            execution.token_stream_digest()
+        );
+        assert_ne!(changed.transcript_id(), execution.transcript_id());
+
+        assert!(matches!(
+            model.try_visit_untrusted_final_logits([&[1_u32][..]], |_| Err("stop")),
+            Err(crate::Qwen35ExecutionVisitError::Observer("stop"))
+        ));
+        assert!(matches!(
+            model.try_visit_untrusted_final_logits(core::iter::empty::<&[u32]>(), |_| {
+                Ok::<_, core::convert::Infallible>(())
+            }),
+            Err(crate::Qwen35ExecutionVisitError::Runtime(NnError::Shape {
+                expected: 1,
+                got: 0
+            }))
+        ));
+
+        let mut corrupt = canonical;
+        corrupt[24] ^= 1;
+        assert!(matches!(
+            model.reexecute_untrusted_final_logits(batches, &corrupt, |_| {
+                Ok::<_, core::convert::Infallible>(())
+            }),
+            Err(crate::Qwen35ExecutionVisitError::Runtime(
+                NnError::Provenance(_)
+            ))
+        ));
+
+        let relabeled = Qwen35SaltV2LanguageMtpModel::load_bundle_profile_with_policy(
+            &files.directory,
+            "compact-v1",
+            Box::new(RelabelingBackend(tritium_cpu::CpuBackend::new())),
+            false,
+        )
+        .unwrap();
+        let relabeled_transcript = relabeled
+            .try_visit_untrusted_final_logits([&[1_u32][..]], |_| {
+                Ok::<_, core::convert::Infallible>(())
+            })
+            .unwrap();
+        assert!(relabeled_transcript.backend_claims_are_untrusted());
+        assert_eq!(relabeled_transcript.claimed_backend_id(), "cuda:0");
+        assert_eq!(
+            relabeled_transcript.claimed_physical_device_id(),
+            "cuda:0:GPU-forged"
+        );
 
         #[cfg(feature = "cuda")]
         {

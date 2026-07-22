@@ -436,6 +436,19 @@ and teacher drift between basins. This core receipt is not flagship evidence
 until plan 0043 binds its selected candidate to the corresponding immutable
 master campaign and executes it on source-bound checkpoint data.
 
+The generic Qwen runtime emits an opaque, non-constructible `TSQ35EX` v1
+transcript binding loaded profile/package/config/preserved bytes, self-asserted
+backend claims, exact token-batch boundaries and runtime-produced output bytes.
+Because the public backend trait is caller-implementable, this lower transcript
+is explicitly untrusted and cannot satisfy campaign admission. Its record
+reserves separate block-output and final-logit coverage/digests; absent scopes
+remain explicit. Durable comparison re-executes the loaded model over the same
+tokens and requires byte-identical canonical evidence. A separate SALT-owned
+sealed session must construct a built-in backend internally, bind the
+authoritative completion/master/package lineage, and re-execute before it can
+mint an admitted execution receipt. Caller-provided logits, candidate labels,
+backend identities, or lower transcript bytes never mint campaign provenance.
+
 Multi-device admission uses
 `tritium.hf-distributed-qualification.v1`. The validator requires ordered DDP
 and FSDP NCCL/fp16 runs on two distinct physical GPU UUIDs, exact checkpoint
