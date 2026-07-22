@@ -131,3 +131,30 @@ def test_refinement_rejects_overlap_hard_pv_and_rehashed_parent_claims(tmp_path)
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     with pytest.raises(ValueError, match="ancestry|identity"):
         load(result.artifact_dir)
+
+
+def test_g128_refinement_binds_seek_backed_salt_package(tmp_path):
+    torch.manual_seed(107)
+    teacher = torch.nn.Linear(128, 3)
+    parent = _parent(teacher, [torch.randn(2, 128)], tmp_path)
+    result = refine(
+        parent,
+        teacher=teacher,
+        training=[torch.randn(2, 128)],
+        validation=[torch.randn(3, 128)],
+        config=RefinementConfig.scale_only(max_steps=1),
+        work_dir=tmp_path / "refined",
+    )
+
+    assert result.schema_version == 2
+    assert result.packed is not None
+    assert result.packed.packing == "b3"
+    assert result.packed.conversion_artifact_id == result.conversion.artifact_id
+    assert result.packed.package_id
+
+    manifest = result.artifact_dir / "refinement.json"
+    value = json.loads(manifest.read_text(encoding="utf-8"))
+    value["packed_artifact_id"] = "sha256:" + "00" * 32
+    manifest.write_text(json.dumps(value), encoding="utf-8")
+    with pytest.raises(ValueError, match="packed package"):
+        load(result.artifact_dir)

@@ -24,8 +24,10 @@ from .errors import TritiumError
 from .module_artifacts import (
     FittedWeight,
     ModuleQuantizationResult,
+    PackedModuleArtifact,
     WeightCheckpointWriter,
     load_module_conversion,
+    load_packed_module,
     module_recipe_id,
     seal_module_conversion,
 )
@@ -36,6 +38,7 @@ from .refinement_core import RefinedWeight, refine_weight_diagonal
 Pathish = Union[str, os.PathLike[str]]
 _MANIFEST = "refinement.json"
 _CONVERSION_DIRECTORY = "conversion"
+_PACKED_DIRECTORY = "packed"
 _TOP_FIELDS = {
     "schema_version",
     "artifact_kind",
@@ -50,6 +53,8 @@ _TOP_FIELDS = {
     "validation_batches",
     "config",
     "child_conversion_artifact_id",
+    "packed_artifact_id",
+    "packing",
     "validation_loss_before",
     "validation_loss_after",
     "accepted_steps",
@@ -72,10 +77,11 @@ class RefinementResult:
     validation_batches: Tuple[str, ...]
     config: RefinementConfig
     conversion: ModuleQuantizationResult
+    packed: Optional[PackedModuleArtifact]
     validation_loss_before: float
     validation_loss_after: float
     accepted_steps: int
-    schema_version: int = 1
+    schema_version: int = 2
 
     @property
     def mode(self) -> str:
@@ -599,7 +605,7 @@ def _weight_mse(
 def _manifest_value(result: RefinementResult) -> Dict[str, Any]:
     return {
         "schema_version": result.schema_version,
-        "artifact_kind": f"tritium.module-{result.config.kind}-refinement-v1",
+        "artifact_kind": f"tritium.module-{result.config.kind}-refinement-v2",
         "artifact_id": result.artifact_id,
         "parent_artifact_id": result.parent_artifact_id,
         "ancestry": list(result.ancestry),
@@ -611,6 +617,10 @@ def _manifest_value(result: RefinementResult) -> Dict[str, Any]:
         "validation_batches": list(result.validation_batches),
         "config": result.config.to_dict(),
         "child_conversion_artifact_id": result.conversion.artifact_id,
+        "packed_artifact_id": (
+            None if result.packed is None else result.packed.artifact_id
+        ),
+        "packing": None if result.packed is None else result.packed.packing,
         "validation_loss_before": result.validation_loss_before,
         "validation_loss_after": result.validation_loss_after,
         "accepted_steps": result.accepted_steps,
@@ -636,10 +646,10 @@ def load_refinement(artifact_dir: Pathish) -> RefinementResult:
         value = json.load(stream, object_pairs_hook=_pairs_without_duplicates)
     if not isinstance(value, dict) or set(value) != _TOP_FIELDS:
         raise ValueError("refinement manifest fields differ from schema")
-    if value["schema_version"] != 1:
+    if value["schema_version"] != 2:
         raise ValueError("unsupported refinement schema_version")
     config = RefinementConfig.from_dict(value["config"])
-    if value["artifact_kind"] != f"tritium.module-{config.kind}-refinement-v1":
+    if value["artifact_kind"] != f"tritium.module-{config.kind}-refinement-v2":
         raise ValueError("refinement kind differs from recipe")
     for field in (
         "artifact_id",
@@ -651,6 +661,8 @@ def load_refinement(artifact_dir: Pathish) -> RefinementResult:
         "child_conversion_artifact_id",
     ):
         _validate_digest(value[field], field)
+    if value["packed_artifact_id"] is not None:
+        _validate_digest(value["packed_artifact_id"], "packed_artifact_id")
     training_batches = value["training_batches"]
     validation_batches = value["validation_batches"]
     if (
@@ -706,16 +718,39 @@ def load_refinement(artifact_dir: Pathish) -> RefinementResult:
     ):
         raise ValueError("refinement metrics are invalid")
     conversion_path = directory / _CONVERSION_DIRECTORY
+    packed_path = directory / _PACKED_DIRECTORY
     if conversion_path.is_symlink() or not conversion_path.is_dir():
         raise ValueError("refinement conversion must be an ordinary directory")
-    if {child.name for child in directory.iterdir()} != {
-        _MANIFEST,
-        _CONVERSION_DIRECTORY,
-    }:
+    expected_children = {_MANIFEST, _CONVERSION_DIRECTORY}
+    if value["packed_artifact_id"] is not None:
+        expected_children.add(_PACKED_DIRECTORY)
+        if packed_path.is_symlink() or not packed_path.is_dir():
+            raise ValueError("refinement packed package must be an ordinary directory")
+    if {child.name for child in directory.iterdir()} != expected_children:
         raise ValueError("refinement directory contains unknown files")
     conversion = load_module_conversion(conversion_path)
     if conversion.artifact_id != value["child_conversion_artifact_id"]:
         raise ValueError("refinement child conversion identity mismatch")
+    packable = all(reference.shape[1] % 128 == 0 for reference in conversion.weights)
+    packed = None
+    if packable:
+        if value["packed_artifact_id"] is None:
+            raise ValueError("G128 refinement is missing its packed package")
+        packed = load_packed_module(packed_path)
+        expected_packing = "s34" if config.structure == "s34" else "b3"
+        if (
+            value["packing"] != expected_packing
+            or packed.packing != expected_packing
+            or packed.artifact_id != value["packed_artifact_id"]
+            or packed.conversion_artifact_id != conversion.artifact_id
+            or packed.source_model_digest != conversion.source_model_digest
+            or packed.evidence_id != conversion.evidence_id
+            or packed.algorithm_id != conversion.algorithm_id
+            or packed.recipe_id != conversion.recipe_id
+        ):
+            raise ValueError("refinement packed package ancestry mismatch")
+    elif value["packed_artifact_id"] is not None or value["packing"] is not None:
+        raise ValueError("unaligned refinement cannot claim a SALT package")
     expected_evidence_id = _evidence_id(
         parent_artifact_id=value["parent_artifact_id"],
         teacher_digest=value["teacher_digest"],
@@ -767,6 +802,7 @@ def load_refinement(artifact_dir: Pathish) -> RefinementResult:
         validation_batches=tuple(validation_batches),
         config=config,
         conversion=conversion,
+        packed=packed,
         validation_loss_before=float(before),
         validation_loss_after=float(after),
         accepted_steps=accepted,
@@ -988,9 +1024,16 @@ def refine(
         fit_chunk_rows=fit_chunk_rows,
         max_working_bytes=max_working_bytes,
     )
+    packable = all(reference.shape[1] % 128 == 0 for reference in child.weights)
+    packing = ("s34" if config.structure == "s34" else "b3") if packable else None
+    packed = (
+        child.pack_native(directory / _PACKED_DIRECTORY, packing=packing)
+        if packing is not None
+        else None
+    )
     identity = {
-        "schema_version": 1,
-        "artifact_kind": f"tritium.module-{config.kind}-refinement-v1",
+        "schema_version": 2,
+        "artifact_kind": f"tritium.module-{config.kind}-refinement-v2",
         "parent_artifact_id": parent_id,
         "ancestry": list(ancestry),
         "source_model_digest": conversion.source_model_digest,
@@ -1001,6 +1044,8 @@ def refine(
         "validation_batches": list(validation_members),
         "config": config.to_dict(),
         "child_conversion_artifact_id": child.artifact_id,
+        "packed_artifact_id": None if packed is None else packed.artifact_id,
+        "packing": packing,
         "validation_loss_before": before,
         "validation_loss_after": after,
         "accepted_steps": accepted_steps,
@@ -1046,6 +1091,11 @@ def export_refinement(
             current.artifact_dir / _CONVERSION_DIRECTORY,
             staging / _CONVERSION_DIRECTORY,
         )
+        if current.packed is not None:
+            shutil.copytree(
+                current.artifact_dir / _PACKED_DIRECTORY,
+                staging / _PACKED_DIRECTORY,
+            )
         shutil.copyfile(current.artifact_dir / _MANIFEST, staging / _MANIFEST)
         load_refinement(staging)
         for root, directories, files in os.walk(staging, topdown=False):

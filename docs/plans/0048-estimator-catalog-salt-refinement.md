@@ -80,7 +80,10 @@ teacher loss, and emit a strict child conversion plus complete ancestry.
 Training/validation batches are individually hashed, aggregate-bound, and
 cross-split overlap is rejected. Strict reload and atomic export rehash the
 parent, evidence, child algorithm/recipe, S34 topology, payloads, and directory
-publication.
+publication. Every deployment-aligned G128 child additionally carries a native
+seek-backed SALT package bound to the child conversion identity; deliberately
+unaligned research fixtures retain the hard conversion but cannot claim a SALT
+package.
 
 - [x] Remove refinement from `TernaryConfig.ptq`; reject ambiguous legacy non-none
   refinement values instead of silently migrating them.
@@ -90,9 +93,10 @@ publication.
 - [x] Bind every child to its immediate parent and complete ancestry. Scale-only
   freezes trits/allocation; hard PV may change assignments only under its
   declared structure and frozen nested-prefix constraints.
-- [x] Export the hard package and prove reload parity; no latent residual may enter
-  a PTQ claim. QAT checkpoint, QAT export, PTQ, scale-only and hard-PV artifacts
-  remain separately typed.
+- [x] Export the G128 hard package and prove reload parity; no latent residual may
+  enter a PTQ claim. QAT checkpoint, QAT export, PTQ, scale-only and hard-PV
+  artifacts remain separately typed. Unaligned research-only children are
+  explicitly non-package artifacts.
 - Run matched-physical-byte ablations against RTN/AbsMean, GPTQ/AWQ-style
   second-order baselines and the frozen SALT variants.
 
