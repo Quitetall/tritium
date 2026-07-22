@@ -34,7 +34,7 @@ manifest_identity = RUNTIME["manifest_identity"]
 OCI_ARCHIVE = runpy.run_path(Path(__file__).with_name("verify-oci-archive.py"))
 validate_oci_archive = OCI_ARCHIVE["validate"]
 
-SCHEMA = "tritium.kubernetes-deployment-qualification.v11"
+SCHEMA = "tritium.kubernetes-deployment-qualification.v12"
 HEX = frozenset("0123456789abcdef")
 SAFE_NAME = re.compile(r"[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?")
 SAFE_SECRET_KEY = re.compile(r"[A-Za-z0-9](?:[-._A-Za-z0-9]{0,251}[A-Za-z0-9])?")
@@ -57,6 +57,7 @@ CUDA_PROBE_IMAGES = {
 }
 CHECKS = (
     "namespace-preflight", "secret-binding", "pvc-preflight", "helm-install",
+    "missing-secret-startup-failure",
     "rollout-ready", "production-readiness", "buffered-generation", "metrics",
     "watchdog-replacement", "pod-restart", "artifact-volume-loss",
     "memory-oom-recovery",
@@ -82,6 +83,7 @@ COLLECTOR_OUTAGE_BUDGET_MS = 120_000
 SLOW_COLLECTOR_CONNECTIONS = 8
 SLOW_COLLECTOR_HOLD_MS = 3_000
 SLOW_COLLECTOR_BUDGET_MS = 30_000
+STARTUP_FAILURE_BUDGET_MS = 120_000
 QUALIFICATION_METRICS = {
     "tritium_chat_requests_total", "tritium_tokens_out_total",
     "tritium_worker_alive", "tritium_backend_faults_total",
@@ -98,6 +100,10 @@ OOM_TRANSITIONS = [
 COLLECTOR_OUTAGE_TRANSITIONS = [
     "baseline_target", "selector_fault_applied", "target_absent",
     "serving_verified", "selector_restored", "target_recovered",
+]
+MISSING_SECRET_TRANSITIONS = [
+    "baseline_ready", "fault_applied", "config_error_observed",
+    "secret_restored", "recovery_ready",
 ]
 
 
@@ -448,6 +454,355 @@ def pod_snapshot(document: dict[str, Any], flavor: str,
             raise DeploymentError("CUDA pod does not bind one NVIDIA GPU")
         pods.append({"name": name, "uid": uid, "node": node, "restarts": restarts})
     return {"pods": sorted(pods, key=lambda item: item["uid"])}
+
+
+def auth_secret_contract(document: dict[str, Any]) -> dict[str, Any]:
+    metadata = document.get("metadata", {})
+    containers = document.get("spec", {}).get("template", {}).get(
+        "spec", {}
+    ).get("containers")
+    if (not isinstance(metadata.get("uid"), str) or not metadata["uid"]
+            or not isinstance(metadata.get("resourceVersion"), str)
+            or not metadata["resourceVersion"]
+            or not isinstance(containers, list)
+            or [item.get("name") if isinstance(item, dict) else None
+                for item in containers] != ["tritium", "authenticated-probe"]):
+        raise DeploymentError("startup secret baseline identity differs")
+    bindings = []
+    for container_index, container in enumerate(containers):
+        env = container.get("env")
+        matches = [(index, item) for index, item in enumerate(env or [])
+                   if isinstance(item, dict) and item.get("name") == "TRITIUM_AUTH_TOKEN"]
+        if not isinstance(env, list) or len(matches) != 1:
+            raise DeploymentError("startup auth Secret binding differs")
+        env_index, item = matches[0]
+        secret_ref = item.get("valueFrom", {}).get("secretKeyRef", {})
+        name = secret_ref.get("name")
+        key = secret_ref.get("key")
+        if any(not isinstance(value, str) or not value for value in (name, key)):
+            raise DeploymentError("startup auth Secret reference is malformed")
+        bindings.append({
+            "container": container["name"], "container_index": container_index,
+            "env_index": env_index, "secret_name": name, "secret_key": key,
+            "path": (f"/spec/template/spec/containers/{container_index}/env/"
+                     f"{env_index}/valueFrom/secretKeyRef/name"),
+        })
+    if [item["env_index"] for item in bindings] != [0, 0]:
+        raise DeploymentError("startup auth Secret must be first environment binding")
+    if len({(item["secret_name"], item["secret_key"]) for item in bindings}) != 1:
+        raise DeploymentError("startup containers do not share one auth Secret")
+    return {
+        "deployment_uid": metadata["uid"],
+        "resource_version": metadata["resourceVersion"],
+        "secret_name": bindings[0]["secret_name"],
+        "secret_key": bindings[0]["secret_key"], "bindings": bindings,
+    }
+
+
+def auth_secret_values(document: dict[str, Any], contract: dict[str, Any]) -> list[Any]:
+    containers = document.get("spec", {}).get("template", {}).get(
+        "spec", {}
+    ).get("containers")
+    values = []
+    for binding in contract["bindings"]:
+        try:
+            item = containers[binding["container_index"]]["env"][binding["env_index"]]
+            if item.get("name") != "TRITIUM_AUTH_TOKEN":
+                raise KeyError("name")
+            values.append(item["valueFrom"]["secretKeyRef"]["name"])
+        except (KeyError, IndexError, TypeError) as error:
+            raise DeploymentError("startup auth Secret path changed") from error
+    return values
+
+
+def missing_secret_failure(document: dict[str, Any], *, baseline_uids: set[str],
+                           missing_secret: str) -> dict[str, Any] | None:
+    items = document.get("items")
+    if not isinstance(items, list):
+        raise DeploymentError("startup failure pod listing is malformed")
+    matches = []
+    for item in items:
+        if not isinstance(item, dict):
+            raise DeploymentError("startup failure pod is malformed")
+        metadata = item.get("metadata", {})
+        uid = metadata.get("uid")
+        if uid in baseline_uids:
+            continue
+        statuses = item.get("status", {}).get("containerStatuses", [])
+        tritium = [status for status in statuses if isinstance(status, dict)
+                   and status.get("name") == "tritium"]
+        if len(tritium) != 1:
+            continue
+        waiting = tritium[0].get("state", {}).get("waiting")
+        if not isinstance(waiting, dict):
+            continue
+        reason = waiting.get("reason")
+        message = waiting.get("message")
+        expected_message = f'secret "{missing_secret}" not found'
+        if reason == "CreateContainerConfigError" and message == expected_message:
+            name = metadata.get("name")
+            if not isinstance(name, str) or not name or not isinstance(uid, str) or not uid:
+                raise DeploymentError("startup failure pod identity is malformed")
+            replica_set = controller_owner(metadata, "ReplicaSet")
+            matches.append({
+                "pod_name": name, "pod_uid": uid, "container": "tritium",
+                "reason": reason, "message_sha256": hashlib.sha256(
+                    message.encode()
+                ).hexdigest(),
+                "replica_set_name": replica_set["name"],
+                "replica_set_uid": replica_set["uid"],
+            })
+    if len(matches) > 1:
+        raise DeploymentError("multiple missing-Secret failure pods observed")
+    return matches[0] if matches else None
+
+
+def restore_missing_secret_refs(kubectl_base: list[str], *, service: str,
+                                contract: dict[str, Any], missing_secret: str,
+                                timeout: float) -> dict[str, Any]:
+    live = run_json(
+        kubectl_base + ["get", f"deployment/{service}", "-o", "json"], timeout,
+    )
+    if live.get("metadata", {}).get("uid") != contract["deployment_uid"]:
+        raise DeploymentError("missing-Secret cleanup Deployment identity differs")
+    values = auth_secret_values(live, contract)
+    owned = [index for index, value in enumerate(values) if value == missing_secret]
+    if owned:
+        cleanup_patch = [
+            {"op": "test", "path": "/metadata/uid",
+             "value": contract["deployment_uid"]},
+        ]
+        for index in owned:
+            binding = contract["bindings"][index]
+            cleanup_patch.extend([
+                {"op": "test", "path": binding["path"], "value": missing_secret},
+                {"op": "replace", "path": binding["path"],
+                 "value": contract["secret_name"]},
+            ])
+        cleanup_payload = canonical(cleanup_patch).decode().strip()
+        restore_error = None
+        try:
+            run(kubectl_base + [
+                "patch", f"deployment/{service}", "--type=json",
+                f"--patch={cleanup_payload}",
+            ], timeout)
+        except DeploymentError as error:
+            restore_error = error
+        live = run_json(
+            kubectl_base + ["get", f"deployment/{service}", "-o", "json"], timeout,
+        )
+        final_values = auth_secret_values(live, contract)
+        if (live.get("metadata", {}).get("uid") != contract["deployment_uid"]
+                or missing_secret in final_values):
+            message = "missing-Secret startup cleanup is unproven"
+            if restore_error is not None:
+                raise DeploymentError(message) from restore_error
+            raise DeploymentError(message)
+    else:
+        final_values = values
+    if final_values != [contract["secret_name"]] * len(final_values):
+        raise DeploymentError("missing-Secret startup cleanup preserved foreign drift")
+    return live
+
+
+def qualify_missing_secret_startup(
+        kubectl_base: list[str], *, service: str, selector: str,
+        deployment: dict[str, Any], baseline: dict[str, Any], image: str,
+        manifest_sha256: str, flavor: str, service_port: int, token: str,
+        model_id: str, prompt: str, timeout: float, request_timeout: float,
+        revision: str, profile: str, manifest_blake3: str, release: str,
+        expected_startup: dict[str, Any], qualification_started: float) -> dict[str, Any]:
+    began = time.monotonic()
+    started_elapsed_ms = (began - qualification_started) * 1000
+    if started_elapsed_ms <= 0:
+        raise DeploymentError("missing-Secret run-relative start differs")
+    deadline = began + min(timeout, STARTUP_FAILURE_BUDGET_MS / 1000)
+
+    def remaining() -> float:
+        value = deadline - time.monotonic()
+        if value <= 0:
+            raise DeploymentError("missing-Secret startup deadline expired")
+        return value
+
+    transitions = []
+
+    def record(state: str) -> None:
+        transitions.append({
+            "state": state, "elapsed_ms": (time.monotonic() - began) * 1000,
+            "observed_at_utc": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+        })
+
+    contract = auth_secret_contract(deployment)
+    baseline_uids = {pod["uid"] for pod in baseline["pods"]}
+    missing_secret = f"tritium-missing-auth-{secrets.token_hex(6)}"
+    absence = prove_absent(
+        kubectl_base + ["get", f"secret/{missing_secret}", "-o", "json"],
+        min(remaining(), 30),
+    )
+    record("baseline_ready")
+    fault_patch = [
+        {"op": "test", "path": "/metadata/uid",
+         "value": contract["deployment_uid"]},
+        {"op": "test", "path": "/metadata/resourceVersion",
+         "value": contract["resource_version"]},
+    ]
+    restore_patch = [
+        {"op": "test", "path": "/metadata/uid",
+         "value": contract["deployment_uid"]},
+    ]
+    for binding in contract["bindings"]:
+        fault_patch.extend([
+            {"op": "test", "path": binding["path"],
+             "value": contract["secret_name"]},
+            {"op": "replace", "path": binding["path"], "value": missing_secret},
+        ])
+        restore_patch.extend([
+            {"op": "test", "path": binding["path"], "value": missing_secret},
+            {"op": "replace", "path": binding["path"],
+             "value": contract["secret_name"]},
+        ])
+    fault_payload = canonical(fault_patch).decode().strip()
+    restore_payload = canonical(restore_patch).decode().strip()
+    patch_attempted = False
+    fault_version = None
+    restored = None
+    failure = None
+    try:
+        patch_attempted = True
+        run(kubectl_base + [
+            "patch", f"deployment/{service}", "--type=json",
+            f"--patch={fault_payload}",
+        ], remaining())
+        faulted = run_json(
+            kubectl_base + ["get", f"deployment/{service}", "-o", "json"], remaining()
+        )
+        fault_version = faulted.get("metadata", {}).get("resourceVersion")
+        if (faulted.get("metadata", {}).get("uid") != contract["deployment_uid"]
+                or not isinstance(fault_version, str) or not fault_version
+                or fault_version == contract["resource_version"]
+                or auth_secret_values(faulted, contract)
+                != [missing_secret] * len(contract["bindings"])):
+            raise DeploymentError("missing-Secret fault was not admitted exactly")
+        record("fault_applied")
+        while failure is None:
+            failure = missing_secret_failure(
+                run_json(
+                    kubectl_base + ["get", "pods", "-l", selector, "-o", "json"],
+                    remaining(),
+                ),
+                baseline_uids=baseline_uids, missing_secret=missing_secret,
+            )
+            if failure is None:
+                if remaining() <= 1:
+                    raise DeploymentError("missing-Secret startup failure was not observed")
+                time.sleep(1)
+        replica_set_doc = run_json(kubectl_base + [
+            "get", f"replicaset/{failure['replica_set_name']}", "-o", "json",
+        ], remaining())
+        replica_metadata = replica_set_doc.get("metadata", {})
+        replica_owner = controller_owner(replica_metadata, "Deployment")
+        if (replica_metadata.get("name") != failure["replica_set_name"]
+                or replica_metadata.get("uid") != failure["replica_set_uid"]
+                or replica_owner != {
+                    "name": service, "uid": contract["deployment_uid"]
+                }):
+            raise DeploymentError("missing-Secret failure pod lineage differs")
+        failure["replica_set_owner"] = {
+            "kind": "Deployment", "name": replica_owner["name"],
+            "uid": replica_owner["uid"],
+        }
+        record("config_error_observed")
+    finally:
+        if patch_attempted:
+            cleanup_timeout = min(timeout, 60)
+            restored = restore_missing_secret_refs(
+                kubectl_base, service=service, contract=contract,
+                missing_secret=missing_secret, timeout=cleanup_timeout,
+            )
+            record("secret_restored")
+    if restored is None or failure is None:
+        raise DeploymentError("missing-Secret startup evidence is incomplete")
+    restored_version = restored.get("metadata", {}).get("resourceVersion")
+    if (not isinstance(restored_version, str) or not restored_version
+            or restored_version in {contract["resource_version"], fault_version}):
+        raise DeploymentError("missing-Secret restore resource version differs")
+    run(kubectl_base + ["rollout", "status", f"deployment/{service}",
+                        f"--timeout={math.ceil(remaining())}s"], remaining())
+    while True:
+        try:
+            recovered = pod_snapshot(
+                run_json(
+                    kubectl_base + ["get", "pods", "-l", selector, "-o", "json"],
+                    remaining(),
+                ),
+                flavor,
+            )
+            break
+        except DeploymentError:
+            if remaining() <= 1:
+                raise
+            time.sleep(1)
+    if failure["pod_uid"] in {pod["uid"] for pod in recovered["pods"]}:
+        raise DeploymentError("missing-Secret failure pod survived recovery")
+    recovered_deployment = run_json(
+        kubectl_base + ["get", f"deployment/{service}", "-o", "json"], remaining()
+    )
+    if validate_deployment(
+        recovered_deployment, image=image, manifest_sha256=manifest_sha256,
+        flavor=flavor,
+    ) != contract["deployment_uid"]:
+        raise DeploymentError("missing-Secret recovery replaced Deployment identity")
+    port = free_port()
+    url = f"http://127.0.0.1:{port}"
+    process, ready = port_forward(
+        kubectl_base + ["port-forward", f"service/{service}",
+                        f"{port}:{service_port}", "--address", "127.0.0.1"],
+        time.monotonic() + remaining(), url, token,
+    )
+    try:
+        startup = validate_ready(
+            ready, revision, flavor, profile, manifest_blake3, release,
+        )
+        generation = request_json(
+            url + "/v1/chat/completions", token,
+            body={"model": model_id,
+                  "messages": [{"role": "user", "content": prompt}],
+                  "temperature": 0, "max_tokens": 1},
+            timeout=min(request_timeout, remaining()),
+        )
+        if not isinstance(generation.get("choices"), list) or len(generation["choices"]) != 1:
+            raise DeploymentError("missing-Secret recovery generation differs")
+        metrics = metrics_snapshot(request(
+            url + "/metrics", token, timeout=min(request_timeout, remaining())
+        ).decode("utf-8"))
+    finally:
+        stop_forward(process)
+    if startup != expected_startup:
+        raise DeploymentError("missing-Secret recovery changed startup receipt")
+    record("recovery_ready")
+    duration_ms = (time.monotonic() - began) * 1000
+    if duration_ms > STARTUP_FAILURE_BUDGET_MS:
+        raise DeploymentError("missing-Secret startup deadline expired")
+    return {
+        "deployment_uid": contract["deployment_uid"],
+        "baseline_resource_version": contract["resource_version"],
+        "fault_resource_version": fault_version,
+        "restored_resource_version": restored_version,
+        "secret_name": contract["secret_name"], "secret_key": contract["secret_key"],
+        "bindings": contract["bindings"],
+        "missing_secret": missing_secret, "absence": absence,
+        "fault_patch_sha256": hashlib.sha256(fault_payload.encode()).hexdigest(),
+        "restore_patch_sha256": hashlib.sha256(restore_payload.encode()).hexdigest(),
+        "observation_budget_ms": STARTUP_FAILURE_BUDGET_MS,
+        "duration_ms": duration_ms, "started_elapsed_ms": started_elapsed_ms,
+        "completed_elapsed_ms": (time.monotonic() - qualification_started) * 1000,
+        "failure": failure, "recovered": recovered,
+        "startup_receipt": startup,
+        "generation_response_sha256": hashlib.sha256(canonical(generation)).hexdigest(),
+        "request": request_evidence(model_id, prompt, temperature=0, max_tokens=1),
+        "metrics": metrics, "cleanup": {"status": "restored"},
+        "transitions": transitions,
+    }
 
 
 def controller_owner(metadata: dict[str, Any], kind: str) -> dict[str, str]:
@@ -2207,6 +2562,140 @@ def validate_collector_outage(value: Any, *, release_name: str, model_id: str,
     return value
 
 
+def validate_missing_secret_startup(
+        value: Any, *, model_id: str, startup_receipt: dict[str, Any],
+        deployment_name: str, deployment_uid: str,
+        run_duration_ms: float) -> dict[str, Any]:
+    fields = {
+        "deployment_uid", "baseline_resource_version", "fault_resource_version",
+        "restored_resource_version", "secret_name", "secret_key", "bindings",
+        "missing_secret", "absence", "fault_patch_sha256", "restore_patch_sha256",
+        "observation_budget_ms", "duration_ms", "failure", "recovered",
+        "started_elapsed_ms", "completed_elapsed_ms",
+        "startup_receipt", "generation_response_sha256", "request", "metrics",
+        "cleanup", "transitions",
+    }
+    if (not isinstance(value, dict) or set(value) != fields
+            or any(not isinstance(value.get(key), str) or not value[key]
+                   for key in ("deployment_uid", "baseline_resource_version",
+                               "fault_resource_version", "restored_resource_version",
+                               "secret_name", "secret_key", "missing_secret"))
+            or value.get("deployment_uid") != deployment_uid
+            or len({value["baseline_resource_version"], value["fault_resource_version"],
+                    value["restored_resource_version"]}) != 3
+            or SAFE_NAME.fullmatch(value["secret_name"]) is None
+            or SAFE_SECRET_KEY.fullmatch(value["secret_key"]) is None
+            or re.fullmatch(r"tritium-missing-auth-[0-9a-f]{12}",
+                            value["missing_secret"]) is None
+            or value.get("observation_budget_ms") != STARTUP_FAILURE_BUDGET_MS
+            or type(value.get("duration_ms")) not in {int, float}
+            or not math.isfinite(value["duration_ms"])
+            or not 0 < value["duration_ms"] <= min(
+                STARTUP_FAILURE_BUDGET_MS, run_duration_ms
+            )
+            or any(type(value.get(key)) not in {int, float}
+                   or not math.isfinite(value[key]) or value[key] <= 0
+                   for key in ("started_elapsed_ms", "completed_elapsed_ms"))
+            or not value["started_elapsed_ms"] < value["completed_elapsed_ms"]
+            <= run_duration_ms
+            or value["completed_elapsed_ms"] - value["started_elapsed_ms"]
+            < value["duration_ms"]):
+        raise DeploymentError("deployment missing-Secret identity or bounds differ")
+    expected_bindings = [
+        {"container": "tritium", "container_index": 0, "env_index": 0,
+         "secret_name": value["secret_name"], "secret_key": value["secret_key"],
+         "path": "/spec/template/spec/containers/0/env/0/valueFrom/secretKeyRef/name"},
+        {"container": "authenticated-probe", "container_index": 1, "env_index": 0,
+         "secret_name": value["secret_name"], "secret_key": value["secret_key"],
+         "path": "/spec/template/spec/containers/1/env/0/valueFrom/secretKeyRef/name"},
+    ]
+    if value.get("bindings") != expected_bindings:
+        raise DeploymentError("deployment missing-Secret bindings differ")
+    fault_patch = [
+        {"op": "test", "path": "/metadata/uid", "value": value["deployment_uid"]},
+        {"op": "test", "path": "/metadata/resourceVersion",
+         "value": value["baseline_resource_version"]},
+    ]
+    restore_patch = [
+        {"op": "test", "path": "/metadata/uid", "value": value["deployment_uid"]},
+    ]
+    for binding in expected_bindings:
+        fault_patch.extend([
+            {"op": "test", "path": binding["path"], "value": value["secret_name"]},
+            {"op": "replace", "path": binding["path"],
+             "value": value["missing_secret"]},
+        ])
+        restore_patch.extend([
+            {"op": "test", "path": binding["path"],
+             "value": value["missing_secret"]},
+            {"op": "replace", "path": binding["path"], "value": value["secret_name"]},
+        ])
+    fault_payload = canonical(fault_patch).decode().strip()
+    restore_payload = canonical(restore_patch).decode().strip()
+    if (value.get("fault_patch_sha256")
+            != hashlib.sha256(fault_payload.encode()).hexdigest()
+            or value.get("restore_patch_sha256")
+            != hashlib.sha256(restore_payload.encode()).hexdigest()):
+        raise DeploymentError("deployment missing-Secret patch evidence differs")
+    if value.get("absence") != {
+        "status": "NotFound", "output_sha256": hashlib.sha256(b"").hexdigest()
+    }:
+        raise DeploymentError("deployment missing-Secret absence proof differs")
+    failure = value.get("failure")
+    failure_fields = {
+        "pod_name", "pod_uid", "container", "reason", "message_sha256",
+        "replica_set_name", "replica_set_uid", "replica_set_owner",
+    }
+    if (not isinstance(failure, dict) or set(failure) != failure_fields
+            or any(not isinstance(failure.get(key), str) or not failure[key]
+                   for key in failure_fields - {"replica_set_owner"})
+            or failure["container"] != "tritium"
+            or failure["reason"] != "CreateContainerConfigError"
+            or failure.get("replica_set_owner") != {
+                "kind": "Deployment", "name": deployment_name,
+                "uid": deployment_uid,
+            }):
+        raise DeploymentError("deployment missing-Secret failure differs")
+    expected_message = f'secret "{value["missing_secret"]}" not found'
+    if failure["message_sha256"] != hashlib.sha256(expected_message.encode()).hexdigest():
+        raise DeploymentError("deployment missing-Secret failure message differs")
+    recovered = validate_receipt_snapshot(value.get("recovered"), "missing-Secret recovery")
+    if failure["pod_uid"] in {pod["uid"] for pod in recovered["pods"]}:
+        raise DeploymentError("deployment missing-Secret failure pod survived")
+    if value.get("startup_receipt") != startup_receipt:
+        raise DeploymentError("deployment missing-Secret changed startup receipt")
+    exact_hex(value.get("generation_response_sha256"), 64,
+              "missing-Secret generation response SHA-256")
+    request_value = value.get("request")
+    request_fields = {
+        "model", "prompt_sha256", "prompt_bytes", "temperature", "max_tokens",
+        "descriptor_sha256",
+    }
+    if (not isinstance(request_value, dict) or set(request_value) != request_fields
+            or request_value.get("model") != model_id
+            or type(request_value.get("prompt_bytes")) is not int
+            or not 0 < request_value["prompt_bytes"] <= 1024 * 1024
+            or type(request_value.get("temperature")) is not int
+            or request_value["temperature"] != 0
+            or type(request_value.get("max_tokens")) is not int
+            or request_value["max_tokens"] != 1):
+        raise DeploymentError("deployment missing-Secret request differs")
+    descriptor = {
+        key: request_value[key] for key in request_fields - {"descriptor_sha256"}
+    }
+    exact_hex(request_value.get("prompt_sha256"), 64, "missing-Secret prompt SHA-256")
+    if request_value["descriptor_sha256"] != hashlib.sha256(canonical(descriptor)).hexdigest():
+        raise DeploymentError("deployment missing-Secret request descriptor differs")
+    validate_metrics_evidence(value.get("metrics"), "missing-Secret recovery")
+    if value.get("cleanup") != {"status": "restored"}:
+        raise DeploymentError("deployment missing-Secret cleanup differs")
+    validate_transition_trace(
+        value.get("transitions"), expected=MISSING_SECRET_TRANSITIONS,
+        scenario="missing-Secret startup",
+    )
+    return value
+
+
 def deployed_revision(value: Any) -> int:
     if not isinstance(value, list) or not value:
         raise DeploymentError("Helm deployed history is absent")
@@ -3220,7 +3709,20 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
                 run_json(kubectl_base + ["get", "pods", "-l", selector, "-o", "json"]),
                 args.flavor,
             )
-        first_pod = initial["pods"][0]["name"]
+        missing_secret_startup = qualify_missing_secret_startup(
+            kubectl_base, service=service, selector=selector,
+            deployment=run_json(
+                kubectl_base + ["get", f"deployment/{service}", "-o", "json"]
+            ),
+            baseline=initial, image=args.image, manifest_sha256=manifest_sha,
+            flavor=args.flavor, service_port=service_port, token=token,
+            model_id=model_id, prompt=args.prompt, timeout=args.timeout,
+            request_timeout=args.request_timeout, revision=revision,
+            profile=args.profile, manifest_blake3=manifest_id["blake3"],
+            release=args.release, expected_startup=startup,
+            qualification_started=started,
+        )
+        first_pod = missing_secret_startup["recovered"]["pods"][0]["name"]
         watchdog = qualify_watchdog_restart(
             kubectl_base, pod_name=first_pod, timeout=args.timeout,
             contract=watchdog_policy,
@@ -3725,6 +4227,7 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
                      "watchdog_replacement": watchdog,
                      "artifact_volume_loss": artifact_fault,
                      "memory_oom_recovery": oom_fault,
+                     "missing_secret_startup": missing_secret_startup,
                      "startup_receipt": startup, "restart_startup_receipt": restart_startup,
                      "update_startup_receipt": update_startup,
                      "update_strategy": "Recreate" if args.flavor == "cuda" else "RollingUpdate",
@@ -3866,6 +4369,7 @@ def validate_receipt(receipt: dict[str, Any], *, chart_path: Path, image_path: P
         "source_pvc", "source_pvc_identity", "model_id", "service_port",
         "initial", "restarted", "updated",
         "watchdog_replacement", "artifact_volume_loss", "memory_oom_recovery",
+        "missing_secret_startup",
         "startup_receipt", "restart_startup_receipt", "update_startup_receipt",
         "update_strategy", "update_config", "rollback_startup_receipt",
         "rollback_runtime", "metrics",
@@ -4319,6 +4823,13 @@ def validate_receipt(receipt: dict[str, Any], *, chart_path: Path, image_path: P
     validate_metrics_evidence(metrics, "")
     validate_metrics_flood(
         workload.get("metrics_scrape_flood"), model_id=workload["model_id"]
+    )
+    validate_missing_secret_startup(
+        workload.get("missing_secret_startup"), model_id=workload["model_id"],
+        startup_receipt=workload["startup_receipt"],
+        deployment_name=f"{workload['release_name']}-tritium",
+        deployment_uid=workload["deployment_uid"],
+        run_duration_ms=receipt["duration_ms"],
     )
     if receipt["flavor"] == "cpu":
         validate_slow_collector(

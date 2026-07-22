@@ -46,6 +46,9 @@ qualify_metrics_scrape_flood = MODULE["qualify_metrics_scrape_flood"]
 validate_metrics_flood = MODULE["validate_metrics_flood"]
 qualify_slow_collector = MODULE["qualify_slow_collector"]
 validate_slow_collector = MODULE["validate_slow_collector"]
+auth_secret_contract = MODULE["auth_secret_contract"]
+missing_secret_failure = MODULE["missing_secret_failure"]
+restore_missing_secret_refs = MODULE["restore_missing_secret_refs"]
 prometheus_target_absence = MODULE["prometheus_target_absence"]
 qualify_collector_outage = MODULE["qualify_collector_outage"]
 collect_rollback_runtime = MODULE["collect_rollback_runtime"]
@@ -307,6 +310,94 @@ def receipt(chart: Path, image_archive: Path, candidate: Path,
                         "memory_bytes": 1_000_000_000,
                     },
                 },
+            },
+            "missing_secret_startup": {
+                "deployment_uid": "deployment-uid",
+                "baseline_resource_version": "20",
+                "fault_resource_version": "21",
+                "restored_resource_version": "22",
+                "secret_name": "tritium-auth", "secret_key": "token",
+                "bindings": [
+                    {"container": "tritium", "container_index": 0, "env_index": 0,
+                     "secret_name": "tritium-auth", "secret_key": "token",
+                     "path": ("/spec/template/spec/containers/0/env/0/"
+                              "valueFrom/secretKeyRef/name")},
+                    {"container": "authenticated-probe", "container_index": 1,
+                     "env_index": 0, "secret_name": "tritium-auth",
+                     "secret_key": "token",
+                     "path": ("/spec/template/spec/containers/1/env/0/"
+                              "valueFrom/secretKeyRef/name")},
+                ],
+                "missing_secret": "tritium-missing-auth-0123456789ab",
+                "absence": {"status": "NotFound",
+                            "output_sha256": hashlib.sha256(b"").hexdigest()},
+                "fault_patch_sha256": hashlib.sha256(canonical([
+                    {"op": "test", "path": "/metadata/uid",
+                     "value": "deployment-uid"},
+                    {"op": "test", "path": "/metadata/resourceVersion",
+                     "value": "20"},
+                    {"op": "test", "path": ("/spec/template/spec/containers/0/"
+                     "env/0/valueFrom/secretKeyRef/name"), "value": "tritium-auth"},
+                    {"op": "replace", "path": ("/spec/template/spec/containers/0/"
+                     "env/0/valueFrom/secretKeyRef/name"),
+                     "value": "tritium-missing-auth-0123456789ab"},
+                    {"op": "test", "path": ("/spec/template/spec/containers/1/"
+                     "env/0/valueFrom/secretKeyRef/name"), "value": "tritium-auth"},
+                    {"op": "replace", "path": ("/spec/template/spec/containers/1/"
+                     "env/0/valueFrom/secretKeyRef/name"),
+                     "value": "tritium-missing-auth-0123456789ab"},
+                ]).decode().strip().encode()).hexdigest(),
+                "restore_patch_sha256": hashlib.sha256(canonical([
+                    {"op": "test", "path": "/metadata/uid",
+                     "value": "deployment-uid"},
+                    {"op": "test", "path": ("/spec/template/spec/containers/0/"
+                     "env/0/valueFrom/secretKeyRef/name"),
+                     "value": "tritium-missing-auth-0123456789ab"},
+                    {"op": "replace", "path": ("/spec/template/spec/containers/0/"
+                     "env/0/valueFrom/secretKeyRef/name"), "value": "tritium-auth"},
+                    {"op": "test", "path": ("/spec/template/spec/containers/1/"
+                     "env/0/valueFrom/secretKeyRef/name"),
+                     "value": "tritium-missing-auth-0123456789ab"},
+                    {"op": "replace", "path": ("/spec/template/spec/containers/1/"
+                     "env/0/valueFrom/secretKeyRef/name"), "value": "tritium-auth"},
+                ]).decode().strip().encode()).hexdigest(),
+                "observation_budget_ms": 120000, "duration_ms": 5000.0,
+                "started_elapsed_ms": 2000.0, "completed_elapsed_ms": 7100.0,
+                "failure": {
+                    "pod_name": "pod-missing-secret", "pod_uid": "missing-secret-uid",
+                    "container": "tritium", "reason": "CreateContainerConfigError",
+                    "message_sha256": hashlib.sha256(
+                        b'secret "tritium-missing-auth-0123456789ab" not found'
+                    ).hexdigest(),
+                    "replica_set_name": "qualification-tritium-missing",
+                    "replica_set_uid": "missing-secret-rs-uid",
+                    "replica_set_owner": {
+                        "kind": "Deployment", "name": "qualification-tritium",
+                        "uid": "deployment-uid",
+                    },
+                },
+                "recovered": {"pods": [{
+                    "name": "pod-secret-recovered", "uid": "secret-recovered-uid",
+                    "node": "node-1", "restarts": 0,
+                }]},
+                "startup_receipt": dict(startup_receipt),
+                "generation_response_sha256": "b" * 64,
+                "request": request_evidence(
+                    "tritium", "Hello", temperature=0, max_tokens=1
+                ),
+                "metrics": {"sha256": "c" * 64, "values": {
+                    "tritium_chat_requests_total": 1.0,
+                    "tritium_tokens_out_total": 1.0,
+                    "tritium_worker_alive": 1.0,
+                    "tritium_backend_faults_total": 0.0,
+                    "tritium_backend_faulted": 0.0,
+                }},
+                "cleanup": {"status": "restored"},
+                "transitions": [
+                    {"state": state, "elapsed_ms": float(index * 1000),
+                     "observed_at_utc": f"2026-07-21T12:00:2{index}+00:00"}
+                    for index, state in enumerate(MODULE["MISSING_SECRET_TRANSITIONS"])
+                ],
             },
             "restart_startup_receipt": dict(startup_receipt),
             "update_startup_receipt": dict(startup_receipt),
@@ -749,6 +840,97 @@ class QualifyKubernetesDeploymentTests(unittest.TestCase):
         ]
         with self.assertRaisesRegex(DeploymentError, "absent or duplicated"):
             deployment_update_identity(document)
+
+    def test_startup_secret_contract_binds_both_container_paths(self):
+        document = {
+            "metadata": {"uid": "deployment-uid", "resourceVersion": "20"},
+            "spec": {"template": {"spec": {"containers": [
+                {"name": "tritium", "env": [{
+                    "name": "TRITIUM_AUTH_TOKEN", "valueFrom": {
+                        "secretKeyRef": {"name": "tritium-auth", "key": "token"}
+                    },
+                }]},
+                {"name": "authenticated-probe", "env": [{
+                    "name": "TRITIUM_AUTH_TOKEN", "valueFrom": {
+                        "secretKeyRef": {"name": "tritium-auth", "key": "token"}
+                    },
+                }]},
+            ]}}},
+        }
+        contract = auth_secret_contract(document)
+        self.assertEqual(contract["secret_name"], "tritium-auth")
+        self.assertEqual([item["container_index"] for item in contract["bindings"]], [0, 1])
+        document["spec"]["template"]["spec"]["containers"][1]["env"][0][
+            "valueFrom"
+        ]["secretKeyRef"]["name"] = "other-auth"
+        with self.assertRaisesRegex(DeploymentError, "do not share"):
+            auth_secret_contract(document)
+
+    def test_missing_secret_failure_requires_new_exact_config_error(self):
+        document = {"items": [{
+            "metadata": {"name": "pod-fault", "uid": "fault-uid",
+                         "ownerReferences": [{
+                             "kind": "ReplicaSet", "name": "tritium-rs",
+                             "uid": "rs-uid", "controller": True,
+                         }]},
+            "status": {"containerStatuses": [{
+                "name": "tritium", "state": {"waiting": {
+                    "reason": "CreateContainerConfigError",
+                    "message": 'secret "tritium-missing-auth-0123456789ab" not found',
+                }},
+            }]},
+        }]}
+        failure = missing_secret_failure(
+            document, baseline_uids={"baseline-uid"},
+            missing_secret="tritium-missing-auth-0123456789ab",
+        )
+        self.assertEqual(failure["pod_uid"], "fault-uid")
+        self.assertEqual(failure["reason"], "CreateContainerConfigError")
+        self.assertIsNone(missing_secret_failure(
+            document, baseline_uids={"fault-uid"},
+            missing_secret="tritium-missing-auth-0123456789ab",
+        ))
+
+    def test_missing_secret_cleanup_removes_owned_ref_and_preserves_foreign_drift(self):
+        baseline = {
+            "metadata": {"uid": "deployment-uid", "resourceVersion": "20"},
+            "spec": {"template": {"spec": {"containers": [
+                {"name": "tritium", "env": [{
+                    "name": "TRITIUM_AUTH_TOKEN", "valueFrom": {"secretKeyRef": {
+                        "name": "tritium-auth", "key": "token",
+                    }},
+                }]},
+                {"name": "authenticated-probe", "env": [{
+                    "name": "TRITIUM_AUTH_TOKEN", "valueFrom": {"secretKeyRef": {
+                        "name": "tritium-auth", "key": "token",
+                    }},
+                }]},
+            ]}}},
+        }
+        contract = auth_secret_contract(baseline)
+        mixed = copy.deepcopy(baseline)
+        mixed["spec"]["template"]["spec"]["containers"][0]["env"][0][
+            "valueFrom"
+        ]["secretKeyRef"]["name"] = "tritium-missing-auth-0123456789ab"
+        mixed["spec"]["template"]["spec"]["containers"][1]["env"][0][
+            "valueFrom"
+        ]["secretKeyRef"]["name"] = "foreign-auth"
+        cleaned = copy.deepcopy(mixed)
+        cleaned["spec"]["template"]["spec"]["containers"][0]["env"][0][
+            "valueFrom"
+        ]["secretKeyRef"]["name"] = "tritium-auth"
+        run_mock = mock.Mock(return_value="")
+        with mock.patch.dict(restore_missing_secret_refs.__globals__, {
+            "run": run_mock,
+            "run_json": mock.Mock(side_effect=[mixed, cleaned]),
+        }), self.assertRaisesRegex(DeploymentError, "preserved foreign drift"):
+            restore_missing_secret_refs(
+                ["kubectl"], service="qualification-tritium", contract=contract,
+                missing_secret="tritium-missing-auth-0123456789ab", timeout=10,
+            )
+        patch_payload = run_mock.call_args.args[0][-1]
+        self.assertIn("containers/0/env/0", patch_payload)
+        self.assertNotIn("containers/1/env/0", patch_payload)
 
     def test_scale_contract_binds_prometheus_trigger_and_authenticated_monitor(self):
         query = 'max(tritium_queue_depth{namespace="ns",service="qualification-tritium"})'
@@ -1592,6 +1774,64 @@ class QualifyKubernetesDeploymentTests(unittest.TestCase):
             value["receipt_id"] = "sha256:" + hashlib.sha256(canonical(value)).hexdigest()
             with self.assertRaisesRegex(DeploymentError, "retains old pod UID"):
                 validate(value, chart, image, manifest, build, candidate)
+
+    def test_receipt_validator_binds_missing_secret_startup_failure(self):
+        for target in ("patch", "reason", "failure_uid", "transition", "uid"):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as raw:
+                chart, image, manifest, build, candidate = candidate_inputs(raw)
+                value = receipt(chart, image, candidate)
+                fault = value["workload"]["missing_secret_startup"]
+                if target == "patch":
+                    fault["fault_patch_sha256"] = "0" * 64
+                elif target == "reason":
+                    fault["failure"]["reason"] = "ImagePullBackOff"
+                elif target == "failure_uid":
+                    fault["recovered"]["pods"][0]["uid"] = fault["failure"]["pod_uid"]
+                elif target == "uid":
+                    fault["deployment_uid"] = "foreign-deployment-uid"
+                    fault_patch = [
+                        {"op": "test", "path": "/metadata/uid",
+                         "value": fault["deployment_uid"]},
+                        {"op": "test", "path": "/metadata/resourceVersion",
+                         "value": fault["baseline_resource_version"]},
+                    ]
+                    restore_patch = [{
+                        "op": "test", "path": "/metadata/uid",
+                        "value": fault["deployment_uid"],
+                    }]
+                    for binding in fault["bindings"]:
+                        fault_patch.extend([
+                            {"op": "test", "path": binding["path"],
+                             "value": fault["secret_name"]},
+                            {"op": "replace", "path": binding["path"],
+                             "value": fault["missing_secret"]},
+                        ])
+                        restore_patch.extend([
+                            {"op": "test", "path": binding["path"],
+                             "value": fault["missing_secret"]},
+                            {"op": "replace", "path": binding["path"],
+                             "value": fault["secret_name"]},
+                        ])
+                    fault["fault_patch_sha256"] = hashlib.sha256(
+                        canonical(fault_patch).decode().strip().encode()
+                    ).hexdigest()
+                    fault["restore_patch_sha256"] = hashlib.sha256(
+                        canonical(restore_patch).decode().strip().encode()
+                    ).hexdigest()
+                else:
+                    fault["transitions"][1], fault["transitions"][2] = (
+                        fault["transitions"][2], fault["transitions"][1]
+                    )
+                del value["receipt_id"]
+                value["receipt_id"] = "sha256:" + hashlib.sha256(
+                    canonical(value)
+                ).hexdigest()
+                with self.assertRaisesRegex(
+                    DeploymentError,
+                    "missing-Secret patch|missing-Secret failure|survived|"
+                    "transition sequence|identity or bounds",
+                ):
+                    validate(value, chart, image, manifest, build, candidate)
 
     def test_receipt_validator_requires_clean_post_restart_recovery(self):
         with tempfile.TemporaryDirectory() as raw:

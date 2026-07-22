@@ -412,8 +412,18 @@ parent deadline guarantees non-cooperative sockets cannot strand qualification.
 This qualifies bounded slow-header collectors; it does not claim an unbounded
 slowloris defense at the accept loop.
 
+Missing authentication Secrets now have a Kubernetes v12 startup gate. The
+qualifier first proves a randomized Secret name is absent, then atomically
+replaces both main and watchdog `secretKeyRef` names under Deployment UID and
+resource-version guards. It requires a new pod to report
+`CreateContainerConfigError` naming that absent Secret. A fail-closed `finally`
+path restores only Tritium's exact injected references, after which the same
+Deployment identity must recover readiness, immutable startup receipt,
+generation and clean metrics. Receipt validation recomputes both guarded JSON
+patches and binds failed/recovered pod identities plus ordered transitions.
+
 1. malformed/truncated/wrong-identity artifact at startup;
-2. missing secret, invalid config and unavailable requested backend;
+2. invalid config and unavailable requested backend;
 3. latched backend/device loss;
 
 Every scenario records configuration, source/image/chart/artifact digests,
