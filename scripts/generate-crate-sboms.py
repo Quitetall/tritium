@@ -209,7 +209,10 @@ def generate_all(
             timeout=120,
         )
     )
-    packages = sorted(metadata["packages"], key=lambda package: package["name"])
+    packages = sorted(
+        (package for package in metadata["packages"] if package.get("publish") != []),
+        key=lambda package: package["name"],
+    )
     written = []
     for package in packages:
         name = package["name"]

@@ -18,6 +18,15 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 ./scripts/check-release-version.py
-echo "publish-readiness: cargo package --workspace --frozen --no-verify"
-cargo package --workspace --frozen --no-verify
-echo "OK: every workspace crate packages cleanly (publish-ready manifests + files)."
+unpublished=$(
+  cargo metadata --locked --no-deps --format-version 1 |
+    python -c 'import json,sys; print("\n".join(p["name"] for p in json.load(sys.stdin)["packages"] if p.get("publish") == []))'
+)
+exclude_args=()
+while IFS= read -r package; do
+  [[ -z "$package" ]] && continue
+  exclude_args+=(--exclude "$package")
+done <<< "$unpublished"
+echo "publish-readiness: cargo package --workspace --frozen --no-verify (publishable crates only)"
+cargo package --workspace "${exclude_args[@]}" --frozen --no-verify
+echo "OK: every publishable workspace crate packages cleanly (manifests + files)."

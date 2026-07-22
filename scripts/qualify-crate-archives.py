@@ -69,7 +69,10 @@ def _metadata(root: Path) -> list[dict[str, Any]]:
     packages = value.get("packages") if isinstance(value, dict) else None
     if not isinstance(packages, list) or not packages:
         raise ArchiveError("workspace metadata contains no packages")
-    return sorted(packages, key=lambda package: package["name"])
+    return sorted(
+        (package for package in packages if package.get("publish") != []),
+        key=lambda package: package["name"],
+    )
 
 
 def _extract(archive_path: Path, destination: Path, expected_prefix: str) -> Path:
