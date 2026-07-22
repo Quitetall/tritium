@@ -148,7 +148,7 @@ type PreparedStage = Readonly<{
   hasUniform: boolean;
 }>;
 
-function fail(code: "adapter_unavailable" | "capability_mismatch" | "device_lost" | "invalid_schema" | "memory_limit", message: string): never {
+function fail(code: "adapter_unavailable" | "adapter_failure" | "cancelled" | "capability_mismatch" | "device_lost" | "invalid_schema" | "memory_limit", message: string): never {
   throw new WebTrainingError(code, message);
 }
 
@@ -231,7 +231,7 @@ export function webGpuUniformSlotCapacityV1(plan: CompiledTrainingPlanV1): numbe
 
 export class WebGpuResidentRuntimeV1 {
   readonly #device: WebGpuDevicePortV1;
-  readonly #resident: ReadonlyMap<string, WebGpuBufferPortV1>;
+  readonly #resident: Map<string, WebGpuBufferPortV1>;
   readonly #zero: WebGpuBufferPortV1;
   readonly #uniformArena: WebGpuBufferPortV1;
   readonly #uniformSlots: number;
@@ -244,7 +244,7 @@ export class WebGpuResidentRuntimeV1 {
 
   private constructor(
     device: WebGpuDevicePortV1,
-    resident: ReadonlyMap<string, WebGpuBufferPortV1>,
+    resident: Map<string, WebGpuBufferPortV1>,
     zero: WebGpuBufferPortV1,
     uniformArena: WebGpuBufferPortV1,
     uniformSlots: number,
@@ -865,6 +865,109 @@ export class WebGpuResidentRuntimeV1 {
     const upload = new Uint8Array(paddedBytes(bytes.byteLength));
     upload.set(bytes);
     this.#device.queue.writeBuffer(this.#physicalBuffer(bufferId), 0, upload);
+  }
+
+  /** Replace complete root owners only after every candidate upload succeeds. */
+  async replace(
+    tensors: readonly WebGpuResidentTensorV1[],
+    budget: Readonly<{ residentPeakBytes: number; maxPeakBytes: number }>,
+    signal?: AbortSignal | null,
+  ): Promise<void> {
+    this.#ready();
+    if (!denseArray(tensors)) {
+      fail("invalid_schema", "WebGPU replacement tensors must be a dense array");
+    }
+    const captured = tensors.map((tensor) => {
+      if (!record(tensor) || typeof tensor.bufferId !== "string" ||
+          !(tensor.bytes instanceof Uint8Array)) {
+        fail("invalid_schema", "WebGPU replacement tensor is invalid");
+      }
+      const buffer = this.#buffers.get(tensor.bufferId);
+      if (buffer === undefined || buffer.ownerId !== buffer.id ||
+          tensor.bytes.byteLength !== buffer.byteLength) {
+        fail("invalid_schema", "WebGPU replacement differs from a root buffer");
+      }
+      return Object.freeze({ bufferId: buffer.id, bytes: Uint8Array.from(tensor.bytes) });
+    });
+    const ids = new Set(captured.map((tensor) => tensor.bufferId));
+    if (ids.size !== captured.length) {
+      fail("invalid_schema", "WebGPU replacement contains duplicate root buffers");
+    }
+    const residentPeakBytes = record(budget)
+      ? property(budget, "residentPeakBytes", "WebGPU replacement budget")
+      : undefined;
+    const maxPeakBytes = record(budget)
+      ? property(budget, "maxPeakBytes", "WebGPU replacement budget")
+      : undefined;
+    if (!record(budget) || !Number.isSafeInteger(residentPeakBytes) ||
+        !Number.isSafeInteger(maxPeakBytes) || (residentPeakBytes as number) < 0 ||
+        (maxPeakBytes as number) < 0) {
+      fail("invalid_schema", "WebGPU replacement budget is invalid");
+    }
+    const candidateBytes = captured.reduce((total, tensor) => {
+      const size = paddedBytes(tensor.bytes.byteLength);
+      if (total > Number.MAX_SAFE_INTEGER - size) {
+        fail("memory_limit", "WebGPU replacement candidate size overflowed");
+      }
+      return total + size;
+    }, 0);
+    if ((residentPeakBytes as number) > (maxPeakBytes as number) - candidateBytes) {
+      fail("memory_limit", "WebGPU atomic replacement exceeds maxPeakBytes");
+    }
+    if (signal?.aborted === true) {
+      fail("cancelled", "WebGPU replacement was cancelled before allocation");
+    }
+    const candidates = new Map<string, WebGpuBufferPortV1>();
+    let abort: (() => void) | null = null;
+    try {
+      for (const tensor of captured) {
+        const allocated = this.#device.createBuffer({
+          label: `tritium:replacement:${tensor.bufferId}`,
+          size: paddedBytes(tensor.bytes.byteLength),
+          usage: STORAGE | COPY_SRC | COPY_DST,
+        });
+        candidates.set(tensor.bufferId, allocated);
+        if (tensor.bytes.byteLength > 0) {
+          const upload = new Uint8Array(paddedBytes(tensor.bytes.byteLength));
+          upload.set(tensor.bytes);
+          this.#device.queue.writeBuffer(allocated, 0, upload);
+        }
+      }
+      const cancelled = new Promise<never>((_resolve, reject) => {
+        if (signal === null || signal === undefined) return;
+        abort = () => reject(new WebTrainingError(
+          "cancelled", "WebGPU replacement was cancelled before commit",
+        ));
+        signal.addEventListener("abort", abort, { once: true });
+      });
+      await Promise.race([
+        this.#device.queue.onSubmittedWorkDone().catch(() =>
+          fail("device_lost", "WebGPU replacement upload failed")
+        ),
+        this.#device.lost.then(() =>
+          fail("device_lost", "WebGPU device was lost during replacement")
+        ),
+        cancelled,
+      ]);
+    } catch (error) {
+      for (const candidate of candidates.values()) candidate.destroy();
+      if (error instanceof WebTrainingError) throw error;
+      fail("adapter_failure", `WebGPU replacement upload failed: ${String(error)}`);
+    } finally {
+      if (abort !== null) signal?.removeEventListener("abort", abort);
+    }
+    const replaced: WebGpuBufferPortV1[] = [];
+    for (const [bufferId, candidate] of candidates) {
+      const previous = this.#resident.get(bufferId);
+      if (previous === undefined) {
+        candidate.destroy();
+        fail("invalid_schema", `WebGPU resident owner ${bufferId} is missing`);
+      }
+      this.#resident.set(bufferId, candidate);
+      replaced.push(previous);
+    }
+    this.#bindGroups.clear();
+    for (const previous of replaced) previous.destroy();
   }
 
   async read(bufferId: string): Promise<Uint8Array> {

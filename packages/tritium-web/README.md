@@ -89,8 +89,11 @@ WebGPU gate. `createWebGpuTrainingAdapter(device, options)` accepts an
 already-authorized WebGPU device and supplies resident forward/backward/step
 execution to `prepareTraining`. The factory transfers exclusive device
 ownership; disposing the adapter destroys that device. Submitted phases await
-queue completion and fail terminally on device loss. It does not yet advertise GPU-native
-checkpoint/resume/export. When no adapter is supplied, `prepareTraining`
+queue completion and fail terminally on device loss. It advertises canonical
+checkpoint/resume/export: live optimizer planes cross the explicit readback
+boundary, strict Rust/WASM codecs admit them, resume swaps capacity-bound GPU
+candidates atomically, and SALT export proves guest and live-state bytes equal.
+Lifecycle cancellation preserves the last committed state. When no adapter is supplied, `prepareTraining`
 requests a high-performance device from `navigator.gpu`. `backend: "webgpu"`
 fails closed when acquisition fails; `backend: "auto"` may use deterministic
 WASM only when `allowWasmFallback` is true. The explicit factory remains the

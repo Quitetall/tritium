@@ -11,8 +11,27 @@ import {
   decodeWebTrainingPayload,
   WebTrainingPayloadError,
 } from "./payload.ts";
+import {
+  PortableWasmLifecycleError,
+  PortableWasmLifecycleState,
+} from "./portable-state.ts";
+import type {
+  PortableAdamLeafV1,
+  PortableCheckpointOptimizerV1,
+  PortableCheckpointStateV1,
+  PortableInt8AdamLeafV1,
+  PortableMuonLeafV1,
+  PortableSgdLeafV1,
+} from "./lifecycle-types.js";
+import {
+  compileSaltExportTargets,
+  encodeStateDerivedSaltV2,
+  SaltExportError,
+} from "./salt-export.ts";
 import type { PortableScheduleTensorV1 } from "./portable-schedule-types.js";
 import type {
+  CompiledTrainingBufferV1,
+  CompiledTrainingOperationV1,
   CompiledTrainingPlanV1,
   TrainingBatchV1,
   TrainingResultV1,
@@ -24,6 +43,7 @@ import type {
   WebTrainingReceiptV1,
 } from "./session.ts";
 import { WebTrainingError } from "./session.ts";
+import type { WebTrainingErrorCode } from "./session.ts";
 import { webGpuKernelCandidateBundleV1 } from "./webgpu-kernels.ts";
 import {
   WebGpuResidentRuntimeV1,
@@ -42,12 +62,31 @@ export interface WebGpuTrainingAdapterOptionsV1 {
   readonly maxResidentBytes?: number;
 }
 
-function fail(code: "cancelled" | "capability_mismatch" | "invalid_schema" | "invalid_state" | "memory_limit", message: string): never {
+function fail(code: WebTrainingErrorCode, message: string): never {
   throw new WebTrainingError(code, message);
 }
 
 function rejectPreDispatchCancellation(signal?: AbortSignal | null): void {
   if (signal?.aborted === true) fail("cancelled", "WebGPU operation was cancelled before dispatch");
+}
+
+async function cancellable<T>(
+  operation: () => Promise<T>, signal: AbortSignal | null | undefined, action: string,
+): Promise<T> {
+  rejectPreDispatchCancellation(signal);
+  if (signal === null || signal === undefined) return operation();
+  let abort: (() => void) | null = null;
+  try {
+    const cancelled = new Promise<never>((_resolve, reject) => {
+      abort = () => reject(new WebTrainingError(
+        "cancelled", `WebGPU ${action} was cancelled before commit`,
+      ));
+      signal.addEventListener("abort", abort, { once: true });
+    });
+    return await Promise.race([operation(), cancelled]);
+  } finally {
+    if (abort !== null) signal.removeEventListener("abort", abort);
+  }
 }
 
 function capturedProperty(
@@ -74,6 +113,59 @@ function bytes(tensor: PortableScheduleTensorV1): Uint8Array {
   return Uint8Array.from(
     new Uint8Array(tensor.buffer, tensor.byteOffset, tensor.byteLength),
   );
+}
+
+function optimizerKind(operation: string): PortableCheckpointOptimizerV1 {
+  const value = operation.slice("optimizer.".length);
+  if (["sgd", "adamw", "cautious_adamw", "int8_adamw", "muon"].includes(value)) {
+    return value as PortableCheckpointOptimizerV1;
+  }
+  fail("invalid_schema", `unsupported WebGPU checkpoint optimizer ${operation}`);
+}
+
+function rawF32Bits(value: Uint8Array, name: string): readonly number[] {
+  if (value.byteLength % 4 !== 0) {
+    fail("invalid_schema", `WebGPU checkpoint plane ${name} is not f32-aligned`);
+  }
+  const view = new DataView(value.buffer, value.byteOffset, value.byteLength);
+  return Object.freeze(
+    Array.from({ length: value.byteLength / 4 }, (_, index) => view.getUint32(index * 4, true)),
+  );
+}
+
+function f32Bytes(bits: readonly number[], name: string): Uint8Array {
+  const result = new Uint8Array(bits.length * 4);
+  const view = new DataView(result.buffer);
+  for (const [index, value] of bits.entries()) {
+    if (!Number.isSafeInteger(value) || value < 0 || value > 0xffff_ffff) {
+      fail("invalid_receipt", `WebGPU resume returned invalid ${name} bits`);
+    }
+    view.setUint32(index * 4, value, true);
+  }
+  return result;
+}
+
+function gpuBufferBytes(byteLength: number): number {
+  if (!Number.isSafeInteger(byteLength) || byteLength < 0 ||
+      byteLength > Number.MAX_SAFE_INTEGER - 3) {
+    fail("memory_limit", "WebGPU lifecycle buffer size exceeds the safe integer range");
+  }
+  return Math.max(4, Math.ceil(byteLength / 4) * 4);
+}
+
+function normalizeLifecycleError(error: unknown, action: string): never {
+  if (error instanceof WebTrainingError) throw error;
+  if (error instanceof SaltExportError) {
+    fail(error.code === "capacity" ? "memory_limit" : error.code, error.message);
+  }
+  if (error instanceof PortableWasmLifecycleError) {
+    fail(
+      error.code === "busy" ? "busy"
+        : error.code === "disposed" ? "disposed" : "invalid_receipt",
+      `WebGPU ${action} failed strict WASM admission: ${error.message}`,
+    );
+  }
+  fail("adapter_failure", `WebGPU ${action} failed: ${String(error)}`);
 }
 
 function receipt(
@@ -103,6 +195,7 @@ class ResidentWebGpuTrainingAdapter implements WebTrainingAdapterV1 {
   #plan: CompiledTrainingPlanV1 | null = null;
   #runtime: WebGpuResidentRuntimeV1 | null = null;
   #schedule: WebGpuResidentScheduleV1 | null = null;
+  #maxPeakBytes: number | null = null;
   #completedSteps = 0;
   #disposed = false;
 
@@ -162,6 +255,7 @@ class ResidentWebGpuTrainingAdapter implements WebTrainingAdapterV1 {
     );
     this.#schedule = schedule;
     this.#plan = plan;
+    this.#maxPeakBytes = config.maxResidentBytes;
     return receipt(this.capabilities, "session.prepare", 0, schedule.peakBytes());
   }
 
@@ -171,7 +265,8 @@ class ResidentWebGpuTrainingAdapter implements WebTrainingAdapterV1 {
     schedule: WebGpuResidentScheduleV1;
   }> {
     if (this.#disposed) fail("invalid_state", "WebGPU adapter is disposed");
-    if (this.#plan === null || this.#runtime === null || this.#schedule === null) {
+    if (this.#plan === null || this.#runtime === null || this.#schedule === null ||
+        this.#maxPeakBytes === null) {
       fail("invalid_state", "WebGPU adapter is not prepared");
     }
     return { plan: this.#plan, runtime: this.#runtime, schedule: this.#schedule };
@@ -263,16 +358,221 @@ class ResidentWebGpuTrainingAdapter implements WebTrainingAdapterV1 {
     return receipt(this.capabilities, "session.step", nextStep, schedule.peakBytes());
   }
 
-  async checkpoint(): Promise<WebBinaryResultV1> {
-    fail("capability_mismatch", "resident WebGPU checkpoint integration is not available");
+  async #lifecycleState(signal?: AbortSignal | null): Promise<Readonly<{
+    operations: readonly CompiledTrainingOperationV1[];
+    state: PortableCheckpointStateV1;
+  }>> {
+    const { plan, runtime } = this.#ready();
+    const operations = plan.operations.filter((operation) =>
+      operation.operation.startsWith("optimizer."),
+    );
+    if (operations.length === 0) fail("invalid_schema", "compiled plan has no optimizer operations");
+    const optimizer = optimizerKind(operations[0]!.operation);
+    if (operations.some((operation) => optimizerKind(operation.operation) !== optimizer)) {
+      fail("capability_mismatch", "WebGPU checkpoints require one optimizer kind");
+    }
+    const read = (id: string): Promise<Uint8Array> =>
+      cancellable(() => runtime.read(id), signal, `lifecycle read ${id}`);
+    let state: PortableCheckpointStateV1;
+    if (optimizer === "sgd") {
+      const leaves: PortableSgdLeafV1[] = [];
+      for (const operation of operations) {
+        const id = operation.inputs[0]!;
+        leaves.push(Object.freeze({ parameter: rawF32Bits(await read(id), id) }));
+      }
+      state = Object.freeze({ optimizer, step: this.#completedSteps, leaves: Object.freeze(leaves) });
+    } else if (optimizer === "adamw" || optimizer === "cautious_adamw") {
+      const leaves: PortableAdamLeafV1[] = [];
+      for (const operation of operations) {
+        const [parameter, , moment1, moment2] = operation.inputs;
+        leaves.push(Object.freeze({
+          parameter: rawF32Bits(await read(parameter!), parameter!),
+          moment1: rawF32Bits(await read(moment1!), moment1!),
+          moment2: rawF32Bits(await read(moment2!), moment2!),
+        }));
+      }
+      state = Object.freeze({ optimizer, step: this.#completedSteps, leaves: Object.freeze(leaves) });
+    } else if (optimizer === "int8_adamw") {
+      const leaves: PortableInt8AdamLeafV1[] = [];
+      for (const operation of operations) {
+        const [parameter, , moment1, moment2, moment1Scale, moment2Scale] = operation.inputs;
+        leaves.push(Object.freeze({
+          parameter: rawF32Bits(await read(parameter!), parameter!),
+          moment1Q8: Object.freeze(Array.from(await read(moment1!))),
+          moment2Q8: Object.freeze(Array.from(await read(moment2!))),
+          moment1Scale: rawF32Bits(await read(moment1Scale!), moment1Scale!),
+          moment2Scale: rawF32Bits(await read(moment2Scale!), moment2Scale!),
+        }));
+      }
+      state = Object.freeze({ optimizer, step: this.#completedSteps, leaves: Object.freeze(leaves) });
+    } else {
+      const leaves: PortableMuonLeafV1[] = [];
+      for (const operation of operations) {
+        const [parameter, , momentum] = operation.inputs;
+        leaves.push(Object.freeze({
+          parameter: rawF32Bits(await read(parameter!), parameter!),
+          momentum: rawF32Bits(await read(momentum!), momentum!),
+        }));
+      }
+      state = Object.freeze({ optimizer, step: this.#completedSteps, leaves: Object.freeze(leaves) });
+    }
+    return Object.freeze({ operations: Object.freeze(operations), state });
   }
 
-  async resume(_checkpoint: Uint8Array): Promise<WebTrainingReceiptV1> {
-    fail("capability_mismatch", "resident WebGPU resume integration is not available");
+  #rootBuffer(
+    buffers: ReadonlyMap<string, CompiledTrainingBufferV1>, id: string,
+  ): CompiledTrainingBufferV1 {
+    const buffer = buffers.get(id);
+    const root = buffer === undefined ? undefined : buffers.get(buffer.ownerId);
+    if (buffer === undefined || root === undefined || root.ownerId !== root.id) {
+      fail("invalid_schema", `WebGPU lifecycle buffer ${id} has no root owner`);
+    }
+    return root;
   }
 
-  async export(): Promise<WebBinaryResultV1> {
-    fail("capability_mismatch", "resident WebGPU SALT export integration is not available");
+  async #applyLifecycleState(
+    state: PortableCheckpointStateV1,
+    operations: readonly CompiledTrainingOperationV1[],
+    signal?: AbortSignal | null,
+  ): Promise<number> {
+    const { plan, runtime, schedule } = this.#ready();
+    if (state.leaves.length !== operations.length ||
+        operations.some((operation) => optimizerKind(operation.operation) !== state.optimizer)) {
+      fail("invalid_receipt", "WebGPU resume changed optimizer topology");
+    }
+    const buffers = new Map(plan.buffers.map((buffer) => [buffer.id, buffer] as const));
+    const candidates = new Map<string, Uint8Array>();
+    const stageRootReplacement = (id: string, value: Uint8Array): void => {
+      const root = this.#rootBuffer(buffers, id);
+      if (candidates.has(root.id) || value.byteLength !== root.byteLength) {
+        fail("invalid_receipt", `WebGPU resume changed ${id} layout or ownership`);
+      }
+      candidates.set(root.id, value);
+    };
+    for (const [index, operation] of operations.entries()) {
+      const leaf = state.leaves[index]!;
+      stageRootReplacement(operation.inputs[0]!, f32Bytes(leaf.parameter, operation.inputs[0]!));
+      if (state.optimizer === "adamw" || state.optimizer === "cautious_adamw") {
+        const typed = leaf as PortableAdamLeafV1;
+        stageRootReplacement(operation.inputs[2]!, f32Bytes(typed.moment1, operation.inputs[2]!));
+        stageRootReplacement(operation.inputs[3]!, f32Bytes(typed.moment2, operation.inputs[3]!));
+      } else if (state.optimizer === "int8_adamw") {
+        const typed = leaf as PortableInt8AdamLeafV1;
+        stageRootReplacement(operation.inputs[2]!, Uint8Array.from(typed.moment1Q8));
+        stageRootReplacement(operation.inputs[3]!, Uint8Array.from(typed.moment2Q8));
+        stageRootReplacement(operation.inputs[4]!, f32Bytes(typed.moment1Scale, operation.inputs[4]!));
+        stageRootReplacement(operation.inputs[5]!, f32Bytes(typed.moment2Scale, operation.inputs[5]!));
+      } else if (state.optimizer === "muon") {
+        const typed = leaf as PortableMuonLeafV1;
+        stageRootReplacement(operation.inputs[2]!, f32Bytes(typed.momentum, operation.inputs[2]!));
+      }
+    }
+    const candidateBytes = [...candidates.values()].reduce((total, value) => {
+      const size = gpuBufferBytes(value.byteLength);
+      if (total > Number.MAX_SAFE_INTEGER - size) {
+        fail("memory_limit", "WebGPU resume candidate size exceeds the safe integer range");
+      }
+      return total + size;
+    }, 0);
+    const maxPeakBytes = this.#maxPeakBytes!;
+    await runtime.replace(
+      [...candidates].map(([bufferId, value]) => Object.freeze({ bufferId, bytes: value })),
+      { residentPeakBytes: schedule.peakBytes(), maxPeakBytes },
+      signal,
+    );
+    return schedule.peakBytes() + candidateBytes;
+  }
+
+  async #lifecycleController(state: PortableCheckpointStateV1): Promise<PortableWasmLifecycleState> {
+    return PortableWasmLifecycleState.create({
+      source: new URL("./tritium_wasm_bg.wasm", import.meta.url),
+      state,
+      physicalDevice: `webgpu:${this.capabilities.physicalDevice ?? "unknown"}`,
+    });
+  }
+
+  async checkpoint(signal?: AbortSignal | null): Promise<WebBinaryResultV1> {
+    const { schedule } = this.#ready();
+    rejectPreDispatchCancellation(signal);
+    let controller: PortableWasmLifecycleState | null = null;
+    try {
+      const { state } = await this.#lifecycleState(signal);
+      controller = await this.#lifecycleController(state);
+      const result = await cancellable(() => controller!.checkpoint(), signal, "checkpoint");
+      return Object.freeze({
+        bytes: Uint8Array.from(result.bytes),
+        receipt: receipt(
+          this.capabilities, "session.checkpoint", this.#completedSteps, schedule.peakBytes(),
+        ),
+      });
+    } catch (error) {
+      return normalizeLifecycleError(error, "checkpoint");
+    } finally {
+      controller?.dispose();
+    }
+  }
+
+  async resume(
+    checkpoint: Uint8Array, signal?: AbortSignal | null,
+  ): Promise<WebTrainingReceiptV1> {
+    this.#ready();
+    rejectPreDispatchCancellation(signal);
+    if (!(checkpoint instanceof Uint8Array)) fail("invalid_schema", "checkpoint must be Uint8Array");
+    let controller: PortableWasmLifecycleState | null = null;
+    try {
+      const current = await this.#lifecycleState(signal);
+      controller = await this.#lifecycleController(current.state);
+      await cancellable(
+        () => controller!.resume(Uint8Array.from(checkpoint)), signal, "resume admission",
+      );
+      const candidate = controller.state;
+      const peakBytes = await this.#applyLifecycleState(candidate, current.operations, signal);
+      this.#completedSteps = candidate.step;
+      return receipt(
+        this.capabilities, "session.resume", candidate.step, peakBytes,
+      );
+    } catch (error) {
+      return normalizeLifecycleError(error, "resume");
+    } finally {
+      controller?.dispose();
+    }
+  }
+
+  async export(signal?: AbortSignal | null): Promise<WebBinaryResultV1> {
+    const { plan, runtime } = this.#ready();
+    rejectPreDispatchCancellation(signal);
+    let controller: PortableWasmLifecycleState | null = null;
+    try {
+      const lifecycle = await this.#lifecycleState(signal);
+      const targets = compileSaltExportTargets(plan, false);
+      const store: Record<string, PortableScheduleTensorV1> = {};
+      for (const target of targets) {
+        const value = await cancellable(
+          () => runtime.read(target.ownerId), signal, `export read ${target.ownerId}`,
+        );
+        if (value.byteLength % 4 !== 0) {
+          fail("invalid_state", `WebGPU export parameter ${target.ownerId} is not f32-aligned`);
+        }
+        store[target.ownerId] = new Float32Array(
+          value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength),
+        );
+      }
+      const artifact = encodeStateDerivedSaltV2(targets, store);
+      controller = await this.#lifecycleController(lifecycle.state);
+      const admitted = await cancellable(
+        () => controller!.admitExport(artifact), signal, "export admission",
+      );
+      return Object.freeze({
+        bytes: Uint8Array.from(admitted.bytes),
+        receipt: receipt(
+          this.capabilities, "session.export", this.#completedSteps, plan.exportPeakBytes,
+        ),
+      });
+    } catch (error) {
+      return normalizeLifecycleError(error, "export");
+    } finally {
+      controller?.dispose();
+    }
   }
 
   async dispose(): Promise<void> {
@@ -283,6 +583,7 @@ class ResidentWebGpuTrainingAdapter implements WebTrainingAdapterV1 {
     this.#runtime = null;
     this.#schedule = null;
     this.#plan = null;
+    this.#maxPeakBytes = null;
   }
 }
 
@@ -345,7 +646,6 @@ export function createWebGpuTrainingAdapter(
   }
   const supportedOperations = parseTrainingManifest(canonicalTrainingManifestJson())
     .operations
-    .filter((operation) => operation.category !== "lifecycle")
     .map((operation) => operation.id);
   const capabilities: WebTrainingCapabilitiesV1 = Object.freeze({
     schemaId: "tritium.web_training_capabilities",

@@ -18,7 +18,10 @@ class FakeBuffer {
     this.bytes = new Uint8Array(size);
     this.device = device;
   }
-  async mapAsync() { this.device.maps += 1; }
+  async mapAsync() {
+    this.device.maps += 1;
+    if (this.device.mapGate !== null) await this.device.mapGate;
+  }
   getMappedRange(offset = 0, size = this.size) {
     return this.bytes.slice(offset, offset + size).buffer;
   }
@@ -40,6 +43,7 @@ class FakeDevice {
       ...overrides,
     };
     this.maps = 0;
+    this.mapGate = null;
     this.submits = 0;
     this.bindGroups = 0;
     this.pipelines = 0;
@@ -202,6 +206,78 @@ test("resident WebGPU transactions cache bindings and never map or read back", a
   assert.equal(device.maps, 1, "only explicit readback maps a staging buffer");
   runtime.dispose();
   assert.equal(device.destroyed, true);
+});
+
+test("resident replacement preserves every owner when one candidate upload fails", async () => {
+  const device = new FakeDevice();
+  const runtime = await WebGpuResidentRuntimeV1.prepare(device, plan(), [
+    { bufferId: "left", bytes: Uint8Array.of(1, 2, 3, 4) },
+    { bufferId: "right", bytes: Uint8Array.of(5, 6, 7, 8) },
+    { bufferId: "result", bytes: Uint8Array.of(9, 10, 11, 12) },
+  ]);
+  const write = device.queue.writeBuffer;
+  let replacementWrites = 0;
+  device.queue.writeBuffer = (target, offset, data) => {
+    if (target.label.startsWith("tritium:replacement:")) {
+      replacementWrites += 1;
+      if (replacementWrites === 2) throw new Error("injected upload failure");
+    }
+    write(target, offset, data);
+  };
+  await assert.rejects(
+    runtime.replace([
+      { bufferId: "left", bytes: Uint8Array.of(13, 14, 15, 16) },
+      { bufferId: "right", bytes: Uint8Array.of(17, 18, 19, 20) },
+    ], { residentPeakBytes: 12, maxPeakBytes: 20 }),
+    (error) => error instanceof WebTrainingError && error.code === "adapter_failure",
+  );
+  assert.deepEqual(await runtime.read("left"), Uint8Array.of(1, 2, 3, 4));
+  assert.deepEqual(await runtime.read("right"), Uint8Array.of(5, 6, 7, 8));
+  runtime.dispose();
+});
+
+test("resident replacement rejects over-budget candidates before allocation", async () => {
+  const device = new FakeDevice();
+  const runtime = await WebGpuResidentRuntimeV1.prepare(device, plan(), [
+    { bufferId: "left", bytes: Uint8Array.of(1, 2, 3, 4) },
+    { bufferId: "right", bytes: Uint8Array.of(5, 6, 7, 8) },
+    { bufferId: "result", bytes: Uint8Array.of(9, 10, 11, 12) },
+  ]);
+  const allocatedBefore = device.buffers.size;
+  await assert.rejects(
+    runtime.replace(
+      [{ bufferId: "left", bytes: Uint8Array.of(13, 14, 15, 16) }],
+      { residentPeakBytes: 12, maxPeakBytes: 15 },
+    ),
+    (error) => error instanceof WebTrainingError && error.code === "memory_limit",
+  );
+  assert.equal(device.buffers.size, allocatedBefore);
+  assert.deepEqual(await runtime.read("left"), Uint8Array.of(1, 2, 3, 4));
+  runtime.dispose();
+});
+
+test("resident replacement cancellation preserves the committed owner", async () => {
+  const device = new FakeDevice();
+  const runtime = await WebGpuResidentRuntimeV1.prepare(device, plan(), [
+    { bufferId: "left", bytes: Uint8Array.of(1, 2, 3, 4) },
+    { bufferId: "right", bytes: Uint8Array.of(5, 6, 7, 8) },
+    { bufferId: "result", bytes: Uint8Array.of(9, 10, 11, 12) },
+  ]);
+  device.queue.onSubmittedWorkDone = () => new Promise(() => {});
+  const cancellation = new AbortController();
+  const replacing = runtime.replace(
+    [{ bufferId: "left", bytes: Uint8Array.of(13, 14, 15, 16) }],
+    { residentPeakBytes: 12, maxPeakBytes: 16 },
+    cancellation.signal,
+  );
+  cancellation.abort();
+  await assert.rejects(
+    replacing,
+    (error) => error instanceof WebTrainingError && error.code === "cancelled",
+  );
+  assert.deepEqual(await runtime.read("left"), Uint8Array.of(1, 2, 3, 4));
+  assert.equal(device.buffers.get("tritium:replacement:left").destroyed, true);
+  runtime.dispose();
 });
 
 test("auxiliary resources stay resident and receive same-submission GPU copies", async () => {
@@ -611,6 +687,150 @@ function adapterTrainingFixture() {
   return { model, config };
 }
 
+function adapterOptimizerFixture(optimizer) {
+  const fixture = adapterTrainingFixture();
+  if (optimizer === "sgd") return fixture;
+  const tensors = [...fixture.model.recipe.tensors];
+  const operation = { ...fixture.model.recipe.operations[2] };
+  const payload = { weight: new Float32Array([2]) };
+  if (optimizer === "adamw" || optimizer === "cautious_adamw") {
+    tensors.push(
+      { id: "moment1", dtype: "f32", shape: [1], role: "optimizer-state", aliasOf: null },
+      { id: "moment2", dtype: "f32", shape: [1], role: "optimizer-state", aliasOf: null },
+    );
+    payload.moment1 = new Float32Array([0]);
+    payload.moment2 = new Float32Array([0]);
+    Object.assign(operation, {
+      id: optimizer,
+      operation: `optimizer.${optimizer}`,
+      inputs: ["weight", "gradient", "moment1", "moment2"],
+      outputs: ["weight", "moment1", "moment2"],
+      attributes: [
+        { name: "step", kind: "u64", value: 0 },
+        { name: "lr", kind: "f32", value: 0.001 },
+        { name: "beta1", kind: "f32", value: 0.9 },
+        { name: "beta2", kind: "f32", value: 0.999 },
+        { name: "eps", kind: "f32", value: 1e-8 },
+        { name: "weight_decay", kind: "f32", value: 0 },
+      ],
+    });
+  } else if (optimizer === "int8_adamw") {
+    tensors.push(
+      { id: "moment1", dtype: "bytes", shape: [1], role: "optimizer-state", aliasOf: null },
+      { id: "moment2", dtype: "bytes", shape: [1], role: "optimizer-state", aliasOf: null },
+      { id: "moment1-scale", dtype: "f32", shape: [1], role: "optimizer-state", aliasOf: null },
+      { id: "moment2-scale", dtype: "f32", shape: [1], role: "optimizer-state", aliasOf: null },
+    );
+    payload.moment1 = new Uint8Array([0]);
+    payload.moment2 = new Uint8Array([0]);
+    payload["moment1-scale"] = new Float32Array([0]);
+    payload["moment2-scale"] = new Float32Array([0]);
+    Object.assign(operation, {
+      id: optimizer,
+      operation: `optimizer.${optimizer}`,
+      inputs: ["weight", "gradient", "moment1", "moment2", "moment1-scale", "moment2-scale"],
+      outputs: ["weight", "moment1", "moment2", "moment1-scale", "moment2-scale"],
+      attributes: [
+        { name: "step", kind: "u64", value: 0 },
+        { name: "lr", kind: "f32", value: 0.001 },
+        { name: "beta1", kind: "f32", value: 0.9 },
+        { name: "beta2", kind: "f32", value: 0.999 },
+        { name: "eps", kind: "f32", value: 1e-8 },
+        { name: "weight_decay", kind: "f32", value: 0 },
+      ],
+    });
+  } else {
+    for (const id of ["x", "target", "weight", "gradient", "sum"]) {
+      const index = tensors.findIndex((tensor) => tensor.id === id);
+      tensors[index] = { ...tensors[index], shape: [1, 1] };
+    }
+    tensors.push(
+      { id: "momentum", dtype: "f32", shape: [1, 1], role: "optimizer-state", aliasOf: null },
+    );
+    payload.momentum = new Float32Array([0]);
+    Object.assign(operation, {
+      id: optimizer,
+      operation: `optimizer.${optimizer}`,
+      inputs: ["weight", "gradient", "momentum"],
+      outputs: ["weight", "momentum"],
+      attributes: [
+        { name: "step", kind: "u64", value: 0 },
+        { name: "lr", kind: "f32", value: 0.01 },
+        { name: "momentum", kind: "f32", value: 0.95 },
+        { name: "weight_decay", kind: "f32", value: 0 },
+        { name: "rows", kind: "u64", value: 1 },
+        { name: "cols", kind: "u64", value: 1 },
+        { name: "ns_steps", kind: "u64", value: 5 },
+      ],
+    });
+  }
+  return {
+    model: {
+      ...fixture.model,
+      recipe: {
+        ...fixture.model.recipe,
+        tensors,
+        operations: [...fixture.model.recipe.operations.slice(0, 2), operation],
+      },
+      payload: encodeWebTrainingPayload(payload),
+    },
+    config: {
+      ...fixture.config,
+      requiredOperations: ["graph.add", "loss.mse", `optimizer.${optimizer}`],
+    },
+  };
+}
+
+function adapterSaltFixture() {
+  const width = 256;
+  const model = {
+    schemaId: "tritium.web_training_model",
+    schemaVersion: 1,
+    recipe: {
+      schemaId: "tritium.training_recipe",
+      schemaVersion: 1,
+      tensors: [
+        { id: "target", dtype: "f32", shape: [1, width], role: "batch", aliasOf: null },
+        { id: "weight", dtype: "f32", shape: [1, width], role: "parameter", aliasOf: null },
+        { id: "gradient", dtype: "f32", shape: [1, width], role: "gradient", aliasOf: null },
+        { id: "quant", dtype: "f32", shape: [1, width], role: "activation", aliasOf: null },
+        { id: "loss", dtype: "f32", shape: [], role: "result", aliasOf: null },
+      ],
+      operations: [
+        {
+          id: "salt", operation: "graph.salt_ste", inputs: ["weight"], outputs: ["quant"],
+          attributes: [
+            { name: "rows", kind: "u64", value: 1 },
+            { name: "cols", kind: "u64", value: width },
+            { name: "planes", kind: "u64", value: 2 },
+          ],
+        },
+        { id: "mse", operation: "loss.mse", inputs: ["quant", "target"], outputs: ["loss"], attributes: [] },
+        {
+          id: "sgd", operation: "optimizer.sgd", inputs: ["weight", "gradient"], outputs: ["weight"],
+          attributes: [
+            { name: "step", kind: "u64", value: 0 },
+            { name: "lr", kind: "f32", value: 0.1 },
+          ],
+        },
+      ],
+    },
+    payload: encodeWebTrainingPayload({
+      weight: Float32Array.from({ length: width }, (_, index) => (index % 9 - 4) / 8),
+    }),
+  };
+  const config = {
+    backend: "webgpu",
+    allowWasmFallback: false,
+    maxResidentBytes: 1 << 20,
+    seed: 7,
+    requiredOperations: [
+      "graph.salt_ste", "loss.mse", "optimizer.sgd", "lifecycle.export", "lifecycle.reload",
+    ],
+  };
+  return { model, config };
+}
+
 test("resident WebGPU adapter executes one command buffer per training phase", async () => {
   const device = new FakeDevice();
   const adapter = createWebGpuTrainingAdapter(device, {
@@ -654,6 +874,159 @@ test("resident WebGPU adapter executes one command buffer per training phase", a
   );
   assert.equal(session.state, "terminal");
   assert.equal(device.destroyed, true);
+});
+
+test("resident WebGPU checkpoint resumes exact optimizer state through public session", async () => {
+  const firstFixture = adapterTrainingFixture();
+  const first = await prepareTraining(
+    firstFixture.model,
+    firstFixture.config,
+    createWebGpuTrainingAdapter(new FakeDevice(), {
+      buildId: "test-webgpu-lifecycle",
+      physicalDevice: "fake-gpu-a",
+      maxResidentBytes: 1 << 20,
+    }),
+  );
+  const saved = await first.checkpoint();
+  assert.equal(saved.receipt.operation, "session.checkpoint");
+  assert.equal(saved.receipt.completedSteps, 0);
+
+  const secondFixture = adapterTrainingFixture();
+  const changedModel = {
+    ...secondFixture.model,
+    payload: encodeWebTrainingPayload({ weight: new Float32Array([9]) }),
+  };
+  const second = await prepareTraining(
+    changedModel,
+    secondFixture.config,
+    createWebGpuTrainingAdapter(new FakeDevice(), {
+      buildId: "test-webgpu-lifecycle",
+      physicalDevice: "fake-gpu-b",
+      maxResidentBytes: 1 << 20,
+    }),
+  );
+  const changed = await second.checkpoint();
+  assert.notDeepEqual(changed.bytes, saved.bytes);
+  const resumed = await second.resume(saved.bytes);
+  assert.equal(resumed.operation, "session.resume");
+  assert.equal(resumed.completedSteps, 0);
+  const restored = await second.checkpoint();
+  assert.deepEqual(restored.bytes, saved.bytes);
+
+  await first.dispose();
+  await second.dispose();
+});
+
+test("resident WebGPU resume honors the session ceiling before candidate allocation", async () => {
+  const fixture = adapterTrainingFixture();
+  const probe = await prepareTraining(
+    fixture.model,
+    fixture.config,
+    createWebGpuTrainingAdapter(new FakeDevice(), { maxResidentBytes: 1 << 20 }),
+  );
+  const saved = await probe.checkpoint();
+  const schedulePeak = compileWebGpuResidentScheduleV1(
+    probe.plan, { maxPeakBytes: 1 << 20 },
+  ).peakBytes();
+  await probe.dispose();
+
+  const device = new FakeDevice();
+  const limited = await prepareTraining(
+    fixture.model,
+    { ...fixture.config, maxResidentBytes: schedulePeak },
+    createWebGpuTrainingAdapter(device, { maxResidentBytes: 1 << 20 }),
+  );
+  await assert.rejects(
+    limited.resume(saved.bytes),
+    (error) => error instanceof WebTrainingError && error.code === "memory_limit",
+  );
+  assert.equal(limited.state, "prepared");
+  assert.equal(
+    [...device.buffers.keys()].some((label) => label.startsWith("tritium:replacement:")),
+    false,
+  );
+  await limited.dispose();
+});
+
+test("resident WebGPU lifecycle matches portable WASM for every optimizer layout", async () => {
+  for (const optimizer of ["sgd", "adamw", "cautious_adamw", "int8_adamw", "muon"]) {
+    const { model, config } = adapterOptimizerFixture(optimizer);
+    const portable = await prepareTraining(model, {
+      ...config,
+      backend: "wasm",
+      allowWasmFallback: true,
+    });
+    const expected = await portable.checkpoint();
+    const resident = await prepareTraining(
+      model,
+      config,
+      createWebGpuTrainingAdapter(new FakeDevice(), {
+        buildId: `test-webgpu-${optimizer}`,
+        physicalDevice: "fake-gpu",
+        maxResidentBytes: 1 << 20,
+      }),
+    );
+    const actual = await resident.checkpoint();
+    assert.deepEqual(actual.bytes, expected.bytes, optimizer);
+    const receipt = await resident.resume(expected.bytes);
+    assert.equal(receipt.completedSteps, 0, optimizer);
+    assert.ok(receipt.peakResidentBytes > resident.plan.peakBytes, optimizer);
+    assert.deepEqual((await resident.checkpoint()).bytes, expected.bytes, optimizer);
+    await resident.dispose();
+    await portable.dispose();
+  }
+});
+
+test("resident WebGPU checkpoint cancellation leaves the public session reusable", async () => {
+  const device = new FakeDevice();
+  let releaseMap;
+  device.mapGate = new Promise((resolve) => { releaseMap = resolve; });
+  const { model, config } = adapterTrainingFixture();
+  const session = await prepareTraining(
+    model,
+    config,
+    createWebGpuTrainingAdapter(device, {
+      buildId: "test-webgpu-cancellation",
+      physicalDevice: "fake-gpu",
+      maxResidentBytes: 1 << 20,
+    }),
+  );
+  const cancellation = new AbortController();
+  const checkpoint = session.checkpoint({ signal: cancellation.signal });
+  await new Promise((resolve) => setImmediate(resolve));
+  cancellation.abort();
+  await assert.rejects(
+    checkpoint,
+    (error) => error instanceof WebTrainingError && error.code === "cancelled",
+  );
+  assert.equal(session.state, "prepared");
+  releaseMap();
+  device.mapGate = null;
+  await new Promise((resolve) => setImmediate(resolve));
+  const saved = await session.checkpoint();
+  assert.equal(saved.receipt.operation, "session.checkpoint");
+  await session.dispose();
+});
+
+test("resident WebGPU export derives deterministic strict SALT from live parameters", async () => {
+  const { model, config } = adapterSaltFixture();
+  const session = await prepareTraining(
+    model,
+    config,
+    createWebGpuTrainingAdapter(new FakeDevice(), {
+      buildId: "test-webgpu-export",
+      physicalDevice: "fake-gpu",
+      maxResidentBytes: 1 << 20,
+    }),
+  );
+  const first = await session.export();
+  const second = await session.export();
+  assert.equal(new TextDecoder().decode(first.bytes.subarray(0, 8)), "TSLT2PKG");
+  assert.deepEqual(second.bytes, first.bytes);
+  assert.equal(first.receipt.operation, "session.export");
+  assert.equal(first.receipt.completedSteps, 0);
+  assert.equal(first.receipt.peakResidentBytes, session.plan.exportPeakBytes);
+  await session.dispose();
 });
 
 test("prepareTraining acquires WebGPU and preserves strict fallback policy", async () => {

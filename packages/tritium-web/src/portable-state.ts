@@ -19,7 +19,7 @@ import type {
   PortableWasmLifecycleErrorCode,
   PortableWasmLifecycleOptionsV1,
 } from "./portable-state-types.js";
-import { executePortableWasmRequest } from "./wasm.ts";
+import { executePortableWasmRequest, snapshotPortableWasmSource } from "./wasm.ts";
 
 export type {
   PortableWasmLifecycleBinaryV1,
@@ -89,21 +89,10 @@ function freezeState(state: OwnedState): PortableCheckpointStateV1 {
 }
 
 async function snapshotSource(source: PortableWasmSourceV1): Promise<ArrayBuffer> {
-  if (source instanceof Response) {
-    return source.arrayBuffer();
-  }
-  if (ArrayBuffer.isView(source)) {
-    return new Uint8Array(source.buffer, source.byteOffset, source.byteLength).slice().buffer;
-  }
-  if (source instanceof ArrayBuffer) return source.slice(0);
-  const response = await fetch(source);
-  if (!response.ok) {
-    throw new PortableWasmLifecycleError(
-      "backend",
-      `portable WASM fetch failed with HTTP ${response.status}`,
-    );
-  }
-  return response.arrayBuffer();
+  const bytes = await snapshotPortableWasmSource(source);
+  return bytes.buffer.slice(
+    bytes.byteOffset, bytes.byteOffset + bytes.byteLength,
+  ) as ArrayBuffer;
 }
 
 function requireSuccess(
@@ -341,13 +330,23 @@ export class PortableWasmLifecycleState {
           "SALT package must be a Uint8Array",
         );
       }
+      const expected = Uint8Array.from(packageBytes);
       const exported = requireSuccess(
         await executePortableWasmRequest(
-          compilePortableExportRequest(Uint8Array.from(packageBytes), this.#physicalDevice),
+          compilePortableExportRequest(expected, this.#physicalDevice),
           this.#guest,
         ),
       );
       const artifact = bytesOutput(exported, 0, "artifact");
+      if (
+        artifact.length !== expected.length ||
+        artifact.some((value, index) => value !== expected[index])
+      ) {
+        throw new PortableWasmLifecycleError(
+          "backend",
+          "portable WASM changed the state-derived SALT artifact",
+        );
+      }
       const reloaded = requireSuccess(
         await executePortableWasmRequest(
           compilePortableReloadRequest(artifact, this.#physicalDevice),

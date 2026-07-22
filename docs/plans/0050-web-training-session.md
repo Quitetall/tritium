@@ -270,8 +270,12 @@ boundary now connects an already-authorized device to the checked session. It
 uploads admitted batch roots, issues one command buffer for the complete
 graph/loss phase, one for the complete reverse phase (including same-submission
 gradient clears), and one transactional optimizer command buffer. Only the
-scalar loss crosses back to the host during the training loop. GPU-native
-checkpoint/resume/export, rollback for cancellation after GPU submission and
+scalar loss crosses back to the host during the training loop. Checkpoint/resume
+and SALT export now snapshot only at their explicit readback boundaries, use the
+canonical Rust/WASM codecs, compare live and guest artifact bytes, and atomically
+install capacity-bound candidate owners. All five optimizer layouts match
+portable WASM checkpoint bytes; cooperative lifecycle cancellation leaves the
+last committed state reusable. Compute-phase rollback after GPU submission and
 physical browser execution remain open. With no explicit adapter, the checked
 entry point now requests a high-performance device from `navigator.gpu`;
 strict WebGPU mode fails closed, while auto mode may fall back only under its
