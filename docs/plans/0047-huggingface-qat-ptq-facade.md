@@ -53,8 +53,12 @@ saves with safe serialization, automatically reloads through
   distributed tests are failures in the release lane. FSDP uses native sharded
   distributed-checkpoint resume; PyTorch 2.11 CPU full-state materialization
   currently segfaults on rank 0 and remains a red export gate.
-- [ ] Run accelerator DDP/FSDP mixed-precision and throughput gates on distinct
-  physical devices.
+- [x] Run single-device CUDA fp16 Accelerate training on the local RTX 4090,
+  including isolated ternary-operator zero-transfer profiling, full-step timing,
+  exact state restore and a content-addressed hardware receipt.
+- [ ] Run accelerator DDP/FSDP mixed-precision and throughput gates on at least
+  two distinct physical devices. The current host exposes one RTX 4090, so a
+  two-rank shared-device run cannot satisfy this gate.
 
 ## Step 3 — resumable PTQ facade
 
