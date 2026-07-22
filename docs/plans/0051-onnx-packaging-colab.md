@@ -242,9 +242,18 @@ trainable export/import must all fail. Validator presence is structural; no
 candidate Qwen3.6 whole-model receipt exists. The qualification producer now
 derives every summary from a retained structured execution trace: exact
 candidate artifacts/environment/model identity, physical ORT session, calls to
-all four required SALT/cache/DeltaNet custom operators, authenticated external
+all required packed/SALT/cache/DeltaNet custom operators, authenticated external
 data, two prompt/cache/generation/MTP cases each, and the six negative fault
-classes. Executing that producer against the final 27B candidate remains open.
+classes. The native packed language runtime now exposes a fresh-cache,
+read-only prompt/decode qualification oracle, and counted ORT domains publish
+per-model counters only after successful custom-kernel output. A source- and
+compiler-free installed-wheel worker executes native/ORT language parity,
+deterministic state replay, greedy generation, graph/external-data inspection
+and the negative gates; its producer runs it offline and retains the raw trace.
+The worker deliberately refuses to emit a passing trace while
+`QwenModel.mtp_verified` is false or `reference_mtp` is absent. Promoting the
+pinned production MTP oracle, binding unpacked bundle bytes to the candidate
+archives, and executing the worker against the final 27B candidate remain open.
 
 Add `tritium.torch.export_onnx` and `tritium.torch.load_onnx` over the stable
 plan-0047 results:
