@@ -258,6 +258,22 @@ local-green. Admin/preStop drain, schema-v3 loader wiring, kind install/rollout/
 rollback, URI-to-PVC staging, live Prometheus/KEDA, Knative cold start and NVIDIA
 Kubernetes evidence remain open gates.
 
+Deployment qualification is now automated by
+`scripts/qualify-kubernetes-deployment.py`. It binds exact chart and OCI
+archives, package lineage, bundle identity, namespace/PVC/Secret preconditions,
+the immutable image digest, Kubernetes node identities and tool binaries. The
+single-replica CPU or CUDA release must serve authenticated readiness, model
+listing, one-token generation and generation-bearing Prometheus metrics;
+survive a pod replacement without changing its startup receipt; then record a
+real failed atomic Helm upgrade that changes both image and artifact identities,
+the exact deployed rollback revision, restoration of the admitted pair and complete
+uninstall. CUDA additionally runs a release-policy-allowlisted,
+digest-addressed NVIDIA evidence image with a fixed `nvidia-smi` command on the
+node that served Tritium to capture the driver, CUDA runtime, GPU name and
+physical GPU UUID; that UUID must match the serving startup receipt. The harness
+and receipt validator are local-green; empirical kind and NVIDIA-cluster
+receipts remain open release gates.
+
 ## Slice 6 — failure injection and release evidence
 
 Run the exact local-RC image/chart through a sealed scenario matrix:

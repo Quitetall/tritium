@@ -90,6 +90,17 @@ class DeploymentContractTests(unittest.TestCase):
         self.assertIn("backend=cuda", checker)
         self.assertIn("scientific notation", checker)
 
+    def test_kubernetes_qualifier_is_fail_closed_and_content_addressed(self):
+        qualifier = (ROOT / "scripts/qualify-kubernetes-deployment.py").read_text(
+            encoding="utf-8"
+        )
+        for token in (
+            "validate_oci_archive", "--atomic", "helm_history", "pod-restart",
+            "failed-upgrade", "physical_device_id", "--cuda-probe-image",
+            "tritium_tokens_out_total", "receipt_id", "release-cleanup",
+        ):
+            self.assertIn(token, qualifier)
+
 
 if __name__ == "__main__":
     unittest.main()
