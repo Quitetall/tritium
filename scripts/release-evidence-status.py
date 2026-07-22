@@ -217,8 +217,10 @@ def evaluate(registry: Path, candidate: Path, candidate_document: dict[str, Any]
                 receipt = validate_wheel_receipt(
                     receipt_path, revision, release, artifact_path
                 )
-            else:
+            elif kind == "compatibility-matrix":
                 receipt = validate_matrix_receipt(receipt_path, revision, release)
+            else:
+                raise EvidenceError(f"{label}.kind has no validator dispatch")
         except (OSError, CudaReceiptError, WheelReceiptError, MatrixReceiptError) as error:
             raise EvidenceError(f"{label} failed {kind} validation: {error}") from error
         if receipt["receipt_id"] != receipt_id:
