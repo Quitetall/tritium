@@ -43,6 +43,19 @@ The current candidate passes all seven comparisons with no required SemVer
 update. CI must rerun that gate on the eventual release revision; this local
 result is not a publication receipt.
 
+The generated [v1.0 → v1.1 API diff](../../generated/api-diff-v1.0-v1.1.md)
+also verifies that the Python root namespace retains `Model` and
+`ternary_matmul` while listing the new v1.1 names. Regenerate or drift-check it
+with:
+
+```sh
+python scripts/generate-api-diff.py
+python scripts/generate-api-diff.py --check
+```
+
+That report is structural source evidence. The clean-wheel functional receipt
+remains the authority for installed imports and runtime behavior.
+
 The evolving tier includes `tritium-nn`, `tritium-train`, `tritium-cuda`, the
 framework/ONNX interop crates, and `tritium-serve`. v1.1 adds substantial model,
 portable-training, SALT V2, Qwen, and serving surfaces there. Those crates were

@@ -164,7 +164,12 @@ transitions, copy-on-write artifact migration, deprecation/support windows and
 an operator checklist. The SemVer gate's obsolete `v0.5.*` default is fixed to
 select the latest reachable stable release (`v1.0.0`), guarded by a regression;
 all seven frozen crates pass that actual comparison. Candidate-wheel migration
-execution and the generated release API-diff receipt remain open.
+execution and an installed-artifact API-signature receipt remain open.
+The deterministic API-diff generator now compares the tagged v1.0 PyO3
+registration with the candidate package's literal public namespace, fails if a
+v1 root name disappears, lists additions, records the seven-crate SemVer command
+and emits JSON plus Markdown with a content identity. Its report is structural;
+an exact clean-wheel runtime/signature receipt remains open.
 
 Replace the current pre-alpha/v1.0-era narrative with tested v1.1 documentation:
 
