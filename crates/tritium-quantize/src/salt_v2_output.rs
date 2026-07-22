@@ -177,6 +177,18 @@ impl OutputReconstructionSpec {
         &self.scopes
     }
 
+    /// Source-model semantic identity evaluated by this specification.
+    #[must_use]
+    pub const fn source_model_id(&self) -> ModelId {
+        self.source_model_id
+    }
+
+    /// Exact token-stream identity required by this specification.
+    #[must_use]
+    pub const fn token_stream_digest(&self) -> &[u8; 32] {
+        &self.token_stream_digest
+    }
+
     /// Required batches for each scope.
     #[must_use]
     pub const fn batches_per_scope(&self) -> u32 {
@@ -663,6 +675,12 @@ impl LegacyOutputReconstructionReceipt {
 }
 
 impl OutputReconstructionReceipt {
+    /// Frozen reconstruction specification identity.
+    #[must_use]
+    pub const fn spec_id(&self) -> &[u8; 32] {
+        &self.spec_id
+    }
+
     /// All candidates sorted by content identity, independent of evaluation order.
     #[must_use]
     pub fn candidates(&self) -> &[OutputCandidateReceipt] {

@@ -1,5 +1,11 @@
 //! Campaign-owned execution admission over exact selected Qwen packages.
 
+mod output_binding;
+
+pub use output_binding::{
+    Qwen36FinalLogitsOutputBindingError, Qwen36FinalLogitsOutputBindingReceipt,
+};
+
 use core::{convert::Infallible, fmt};
 use std::{error::Error, path::Path};
 

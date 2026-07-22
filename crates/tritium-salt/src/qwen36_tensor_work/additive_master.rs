@@ -5,11 +5,12 @@ mod selected_allocation;
 pub use selected_allocation::{
     Qwen36AdmittedExecutionReceipt, Qwen36AdmittedExecutionSession, Qwen36AllocatedCampaignStore,
     Qwen36ExecutionBackend, Qwen36ExecutionReplayError, Qwen36ExecutionSessionOpenError,
-    Qwen36ExecutionVisitError, Qwen36PackageAdmissionError, Qwen36PackageAdmissionReceipt,
-    Qwen36PackageAdmittedCampaignStore, Qwen36PackageProfileReceipt, Qwen36PackageRuntimeLedger,
-    Qwen36PackageScaleOnlyCampaignStore, Qwen36PackageVisitError, Qwen36PhysicalAllocationError,
-    Qwen36SelectedAllocationBindError, Qwen36SelectedAllocationReceipt,
-    Qwen36SelectedAllocationSpec, Qwen36SelectedProfileReceipt,
+    Qwen36ExecutionVisitError, Qwen36FinalLogitsOutputBindingError,
+    Qwen36FinalLogitsOutputBindingReceipt, Qwen36PackageAdmissionError,
+    Qwen36PackageAdmissionReceipt, Qwen36PackageAdmittedCampaignStore, Qwen36PackageProfileReceipt,
+    Qwen36PackageRuntimeLedger, Qwen36PackageScaleOnlyCampaignStore, Qwen36PackageVisitError,
+    Qwen36PhysicalAllocationError, Qwen36SelectedAllocationBindError,
+    Qwen36SelectedAllocationReceipt, Qwen36SelectedAllocationSpec, Qwen36SelectedProfileReceipt,
 };
 
 use core::fmt;
@@ -2498,8 +2499,10 @@ mod tests {
         Qwen35TensorStreamError, qwen35_language_mtp_tensor_schema,
     };
     use tritium_quantize::{
-        ByteDelta, NestedProfileBudgets, PhysicalBytes, ProfileBudget, Qwen35SourceDtype,
-        Qwen35TensorRole, Qwen35TensorScope, SaltV2Profile,
+        ByteDelta, NestedProfileBudgets, OutputObjectiveWeights, OutputReconstructionAccumulator,
+        OutputReconstructionSchedule, OutputReconstructionScope, OutputReconstructionSpec,
+        PhysicalBytes, ProfileBudget, Qwen35SourceDtype, Qwen35TensorRole, Qwen35TensorScope,
+        SaltV2Profile, select_output_reconstruction,
     };
 
     use super::super::{
@@ -2991,6 +2994,67 @@ mod tests {
         manifest
     }
 
+    fn qwen_output_reconstruction_bytes(
+        spec: &OutputReconstructionSpec,
+        candidate_id: [u8; 32],
+        final_logits: &[Vec<f32>],
+    ) -> Vec<u8> {
+        let mut candidate =
+            OutputReconstructionAccumulator::new(spec, candidate_id, 41).expect("candidate");
+        for scope in spec.scopes() {
+            for (batch_index, logits) in final_logits.iter().enumerate() {
+                let batch_index = u32::try_from(batch_index).expect("fixture batch index");
+                match scope {
+                    OutputReconstructionScope::Block { .. } => candidate
+                        .observe(*scope, batch_index, 1, 1, &[true], &[0.0], &[0.0])
+                        .expect("block observation"),
+                    OutputReconstructionScope::FinalLogits => candidate
+                        .observe(
+                            *scope,
+                            batch_index,
+                            1,
+                            logits.len(),
+                            &[true],
+                            logits,
+                            logits,
+                        )
+                        .expect("final-logit observation"),
+                }
+            }
+        }
+        let selected = select_output_reconstruction(
+            spec,
+            vec![candidate.finish().expect("complete output candidate")],
+        )
+        .expect("select output candidate");
+        selected.canonical_bytes().expect("canonical TSV2OUT v2")
+    }
+
+    fn legacy_output_reconstruction_bytes(v2: &[u8]) -> Vec<u8> {
+        const HEADER_BYTES: usize = 112;
+        const V2_CANDIDATE_BYTES: usize = 272;
+        const CANDIDATE_HASH_CONTEXT: &str = "tritium salt v2 output reconstruction candidate v1";
+        const RECEIPT_HASH_CONTEXT: &str = "tritium salt v2 output reconstruction receipt v1";
+        let mut legacy = v2[..HEADER_BYTES].to_vec();
+        legacy[8..10].copy_from_slice(&1_u16.to_le_bytes());
+        let legacy_start = legacy.len();
+        legacy.extend_from_slice(&v2[HEADER_BYTES..HEADER_BYTES + 136]);
+        legacy.extend_from_slice(&v2[HEADER_BYTES + 184..HEADER_BYTES + 240]);
+        let mut candidate = blake3::Hasher::new_derive_key(CANDIDATE_HASH_CONTEXT);
+        candidate.update(&legacy[legacy_start..]);
+        let candidate_receipt = *candidate.finalize().as_bytes();
+        legacy.extend_from_slice(&candidate_receipt);
+        debug_assert_eq!(v2.len(), HEADER_BYTES + V2_CANDIDATE_BYTES + 32);
+        let mut receipt = blake3::Hasher::new_derive_key(RECEIPT_HASH_CONTEXT);
+        receipt.update(&legacy[12..44]);
+        receipt.update(&legacy[44..76]);
+        receipt.update(&1_u64.to_le_bytes());
+        receipt.update(&candidate_receipt);
+        receipt.update(&legacy[76..108]);
+        legacy.extend_from_slice(receipt.finalize().as_bytes());
+        legacy
+    }
+
     #[test]
     fn admitted_qwen_execution_binds_campaign_packages_backend_tokens_and_outputs() {
         let root = fixture_root("admitted-execution");
@@ -3081,11 +3145,13 @@ mod tests {
         let first = [1_u32, 2];
         let second = [3_u32];
         let mut observed = 0_u64;
+        let mut runtime_logits = Vec::new();
         let receipt = session
             .try_visit_final_logits([first.as_slice(), second.as_slice()], |batch| {
                 assert_eq!(batch.batch_index(), observed);
                 assert_eq!(batch.logits().len(), 128);
                 assert!(batch.logits().iter().all(|value| value.is_finite()));
+                runtime_logits.push(batch.logits().to_vec());
                 observed += 1;
                 Ok::<_, Infallible>(())
             })
@@ -3106,6 +3172,144 @@ mod tests {
         assert_eq!(receipt.token_count(), 3);
         assert_eq!(receipt.logit_count(), 256);
 
+        let output_spec = OutputReconstructionSpec::new(
+            completion.source_model_id(),
+            [121; 32],
+            *receipt.token_stream_digest(),
+            [122; 32],
+            OutputReconstructionSchedule::Blocks { block_count: 1 },
+            OutputObjectiveWeights::new(1.0, 0.0, 1.0, 1.0).expect("output objective"),
+            2,
+            1,
+        )
+        .expect("output reconstruction spec");
+        let candidate_id = receipt
+            .output_candidate_id(&output_spec)
+            .expect("campaign-bound candidate identity");
+        let output_bytes =
+            qwen_output_reconstruction_bytes(&output_spec, candidate_id, &runtime_logits);
+        let binding = admitted
+            .bind_output_reconstruction_final_logits(&output_spec, &output_bytes, &receipt)
+            .expect("bind exact final logits to package execution");
+        assert_eq!(binding.completion_id(), completion.completion_id());
+        assert_eq!(binding.master_set_id(), &completion.master_set_id());
+        assert_eq!(binding.selected_candidate_id(), &candidate_id);
+        assert_eq!(
+            binding.execution_receipt_id(),
+            receipt.receipt_id().as_bytes()
+        );
+        assert_eq!(binding.final_logits_digest(), receipt.final_logits_digest());
+        assert_eq!(binding.batch_count(), receipt.batch_count());
+        assert_eq!(binding.logit_count(), receipt.logit_count());
+        assert!(binding.has_final_logits());
+        assert!(!binding.has_block_outputs());
+        let binding_bytes = binding.canonical_bytes().expect("canonical binding");
+        assert_eq!(binding.binding_id(), ContentId::of_bytes(&binding_bytes));
+        assert_eq!(
+            admitted
+                .reopen_output_reconstruction_final_logits_binding(
+                    &output_spec,
+                    &output_bytes,
+                    &receipt,
+                    &binding_bytes,
+                )
+                .expect("strictly reopen current output binding"),
+            binding
+        );
+        let mut corrupt_binding_bytes = binding_bytes.clone();
+        corrupt_binding_bytes[0] ^= 1;
+        assert!(matches!(
+            admitted.reopen_output_reconstruction_final_logits_binding(
+                &output_spec,
+                &output_bytes,
+                &receipt,
+                &corrupt_binding_bytes,
+            ),
+            Err(Qwen36FinalLogitsOutputBindingError::Runtime(
+                NnError::InvalidArtifact(_)
+            ))
+        ));
+
+        let relabeled_bytes =
+            qwen_output_reconstruction_bytes(&output_spec, [99; 32], &runtime_logits);
+        assert!(matches!(
+            admitted.bind_output_reconstruction_final_logits(
+                &output_spec,
+                &relabeled_bytes,
+                &receipt
+            ),
+            Err(Qwen36FinalLogitsOutputBindingError::Runtime(
+                NnError::Provenance(_)
+            ))
+        ));
+
+        let mut changed_logits = runtime_logits.clone();
+        changed_logits[0][0] += 1.0;
+        let changed_output_bytes =
+            qwen_output_reconstruction_bytes(&output_spec, candidate_id, &changed_logits);
+        assert!(matches!(
+            admitted.bind_output_reconstruction_final_logits(
+                &output_spec,
+                &changed_output_bytes,
+                &receipt
+            ),
+            Err(Qwen36FinalLogitsOutputBindingError::Runtime(
+                NnError::Provenance(_)
+            ))
+        ));
+
+        let wrong_token_spec = OutputReconstructionSpec::new(
+            completion.source_model_id(),
+            [121; 32],
+            [123; 32],
+            [122; 32],
+            OutputReconstructionSchedule::Blocks { block_count: 1 },
+            OutputObjectiveWeights::new(1.0, 0.0, 1.0, 1.0).expect("output objective"),
+            2,
+            1,
+        )
+        .expect("wrong-token output spec");
+        let wrong_token_candidate = receipt
+            .output_candidate_id(&wrong_token_spec)
+            .expect("campaign-bound wrong-token candidate");
+        let wrong_token_bytes = qwen_output_reconstruction_bytes(
+            &wrong_token_spec,
+            wrong_token_candidate,
+            &runtime_logits,
+        );
+        assert!(matches!(
+            admitted.bind_output_reconstruction_final_logits(
+                &wrong_token_spec,
+                &wrong_token_bytes,
+                &receipt
+            ),
+            Err(Qwen36FinalLogitsOutputBindingError::Runtime(
+                NnError::Provenance(_)
+            ))
+        ));
+
+        let mut corrupt_output_bytes = output_bytes.clone();
+        corrupt_output_bytes[0] ^= 1;
+        assert!(matches!(
+            admitted.bind_output_reconstruction_final_logits(
+                &output_spec,
+                &corrupt_output_bytes,
+                &receipt
+            ),
+            Err(Qwen36FinalLogitsOutputBindingError::Output(_))
+        ));
+        let legacy_output_bytes = legacy_output_reconstruction_bytes(&output_bytes);
+        assert!(matches!(
+            admitted.bind_output_reconstruction_final_logits(
+                &output_spec,
+                &legacy_output_bytes,
+                &receipt
+            ),
+            Err(Qwen36FinalLogitsOutputBindingError::Output(
+                tritium_quantize::OutputReconstructionError::LegacyReceiptMissingRuntimeEvidence
+            ))
+        ));
+
         let canonical = receipt.canonical_bytes().expect("encode admitted receipt");
         let changed = [1_u32, 3];
         let changed_receipt = session
@@ -3118,6 +3322,17 @@ mod tests {
             receipt.token_stream_digest()
         );
         assert_ne!(changed_receipt.receipt_id(), receipt.receipt_id());
+        assert!(matches!(
+            admitted.reopen_output_reconstruction_final_logits_binding(
+                &output_spec,
+                &output_bytes,
+                &changed_receipt,
+                &binding_bytes,
+            ),
+            Err(Qwen36FinalLogitsOutputBindingError::Runtime(
+                NnError::Provenance(_)
+            ))
+        ));
         drop(session);
 
         let replay = admitted

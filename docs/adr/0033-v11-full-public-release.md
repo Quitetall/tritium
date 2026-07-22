@@ -440,8 +440,8 @@ this is distinct from the aggregate block-plus-logit student digest. The shared
 domain makes execution equality testable without equating unlike hashes.
 Strict reopen rejects corruption, noncanonical candidate order, missing basins
 and teacher drift between basins. This core receipt is not flagship evidence
-until plan 0043 binds its selected candidate to the corresponding immutable
-master campaign and executes it on source-bound checkpoint data.
+until plan 0043 executes the bound workflow on source-bound checkpoint data and
+adds execution evidence for the block/window scopes it claims.
 
 The generic Qwen runtime emits an opaque, non-constructible `TSQ35EX` v1
 transcript binding loaded profile/package/config/preserved bytes, self-asserted
@@ -468,6 +468,22 @@ coverage. It currently admits final-position logits only; block output remains
 absent. Reopen recreates the sealed session and re-executes. Consistently
 rewriting a substituted bundle manifest cannot change the campaign's package or
 preserved authority.
+
+The campaign-owned bridge between these records is canonical `TSQ36OB` v1
+evidence. It strictly reopens `TSV2OUT` v2, derives the only admissible candidate
+identity from the immutable completion, campaign, admission, selection, source,
+master-set, selected-package, preserved-package, profile and reconstruction-spec
+identities, and requires that candidate's runtime-final-logit digest and exact
+batch/value counts to equal a currently revalidated `TSQ36EX` receipt. Relabeled
+candidates, changed token streams, altered logits, stale execution authority,
+corrupt output bytes and legacy v1 output receipts fail closed. The bridge does
+not equate the aggregate block-plus-logit student digest with the final-logit
+runtime digest and explicitly reports block-output coverage absent. It is
+therefore structural final-logit provenance, not checkpoint-scale quality proof
+or block/window execution admission. Persisted bridge evidence has an
+admission-owned strict reopen path: it validates the fixed header, reserved
+bytes, profile, checksum, counts and canonical re-encoding, then independently
+repeats the full output/execution binding against current campaign authority.
 
 Multi-device admission uses
 `tritium.hf-distributed-qualification.v1`. The validator requires ordered DDP

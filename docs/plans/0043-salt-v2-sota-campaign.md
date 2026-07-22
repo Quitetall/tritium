@@ -845,10 +845,11 @@ The following work deliberately remains open and keeps this plan in progress:
   it binds source/cache/token/validation identities, exact teacher and candidate
   outputs, final-logit CE/KL, every deterministic restart and selected basin.
   The resumable Qwen driver now rejects activation-cache as well as token-stream
-  drift across the evidence namespace. Output-to-master lineage remains open:
-  candidate-label equality is not proof that student outputs came from those
-  masters. A campaign-owned runtime execution receipt and pinned-checkpoint run
-  are still required;
+  drift across the evidence namespace. Campaign-owned `TSQ36EX` plus `TSQ36OB`
+  receipts now bind the selected candidate's exact final-logit digest/counts to
+  immutable completion/master/package lineage and reject label-only pairing.
+  Block/window outputs are still explicitly unbound, and a pinned-checkpoint run
+  is still required before this becomes production output-aware evidence;
 - `fit_salt_v2_master(...) -> SaltV2MasterFit` now invokes the standalone dense
   BlockLDLQ path, then
   `allocate_and_pack_salt_v2_master(...) -> SaltV2ModelFitResult` slices exact

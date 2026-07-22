@@ -66,14 +66,15 @@ coverage and duplicate-plugin tests.
     metric, traversal, teacher-drift, corruption, allocation-amplification and
     unreachable-state coverage.
   - Expected output: `cargo test -p tritium-quantize --test
-    output_reconstruction` reports six passed tests; `cargo clippy -p
+    output_reconstruction` passes; `cargo clippy -p
     tritium-quantize --all-targets -- -D warnings` exits zero.
 - [x] Reject activation-cache and token-stream drift across every reopened Qwen
   curvature record before planning the immutable master campaign. Expected
   output: `cargo test -p tritium-salt
   record_slot_mismatches_fail_before_source_widening` passes.
-- Bind the selected output candidate to its immutable tensor-master set through
-  campaign-owned execution, not a caller-provided candidate label.
+- [x] Bind the selected output candidate's final-logit evidence to its immutable
+  tensor-master set through campaign-owned execution, not a caller-provided
+  candidate label.
   - First vertical slice: edit
     `crates/tritium-nn/src/model/qwen35_execution.rs` to stream final logits
     directly from `Qwen35SaltV2LanguageMtpModel`, bind exact loaded-package and
@@ -108,11 +109,23 @@ coverage and duplicate-plugin tests.
     but bridge-ineligible because absent runtime evidence is never synthesized.
     Freeze both evidence-domain and complete v2 goldens; strict reopen rejects
     malformed counters.
-  - The driver may then admit `TSV2OUT` only when its selected runtime-final-logit
-    digest and exact batch/value counts equal the runtime execution receipt.
-    Candidate-label or aggregate-student-digest equality alone must fail closed.
-  - Add public-seam honest-execution, relabeling, corruption and strict-reopen
-    tests before marking this item complete.
+  - [x] Third vertical slice: canonical `TSQ36OB` v1 evidence strictly reopens
+    `TSV2OUT` v2, derives the admissible candidate identity from immutable
+    completion/campaign/admission/selection/source/master/package/preserved/
+    profile/spec lineage, revalidates the current `TSQ36EX` authority and admits
+    final logits only when digest plus exact batch/value counts agree. Candidate
+    relabeling, changed logits, token drift, corrupt bytes and bridge-ineligible
+    legacy v1 receipts fail closed. The frozen receipt reports block coverage
+    absent and never treats aggregate student-output identity as a runtime-logit
+    identity. Persisted bytes strictly reopen only after canonical decoding and
+    a fresh bind against current admission/execution authority. Expected output:
+    `cargo test -p tritium-salt
+    admitted_qwen_execution_binds_campaign_packages_backend_tokens_and_outputs`
+    and `cargo test -p tritium-salt
+    canonical_final_logits_binding_layout_is_frozen` pass.
+  - Full output-aware campaign admission remains open until the runtime seals
+    the exact block/window outputs represented by the selected candidate; this
+    final-logit bridge must not be presented as block reconstruction proof.
 - Execute the bound output-reconstruction workflow on checkpoint-scale evidence.
 - Keep calibration, reconstruction and validation datasets source-bound and
   disjoint where the recipe requires.
