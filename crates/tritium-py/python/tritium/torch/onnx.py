@@ -120,6 +120,17 @@ class QwenOnnxCausalLM(nn.Module):
     def device(self) -> torch.device:
         return torch.device(self._runtime.device)
 
+    def operator_counts(self) -> Dict[str, int]:
+        """Return successful custom-kernel calls for this loaded model."""
+        counts = self._runtime.operator_counts()
+        return {
+            "TritiumTernaryMpGemm": int(counts.ternary_mpgemm),
+            "TritiumSaltV2MpGemm": int(counts.salt_v2_mpgemm),
+            "TritiumSaltV2Embedding": int(counts.salt_v2_embedding),
+            "TritiumKvAttention": int(counts.kv_attention),
+            "TritiumQwenDeltaNet": int(counts.qwen_deltanet),
+        }
+
     def forward(
         self,
         input_ids: Tensor,

@@ -1256,11 +1256,12 @@ pub fn kv_attention_kernel(
 
 #[cfg(feature = "onnx")]
 pub use onnx_op::{
-    QwenDeltaNetInputs, QwenDeltaNetOutput, QwenDeltaNetTensor, TritiumKvAttentionKernel,
-    TritiumKvAttentionOp, TritiumQwenDeltaNetKernel, TritiumQwenDeltaNetOp,
-    TritiumSaltV2EmbeddingKernel, TritiumSaltV2EmbeddingOp, TritiumSaltV2MpGemmKernel,
-    TritiumSaltV2MpGemmOp, TritiumTernaryEmbeddingKernel, TritiumTernaryEmbeddingOp,
-    TritiumTernaryMpGemmKernel, TritiumTernaryMpGemmOp, tritium_operator_domain,
+    OnnxOperatorCountSnapshot, OnnxOperatorCounters, QwenDeltaNetInputs, QwenDeltaNetOutput,
+    QwenDeltaNetTensor, TritiumKvAttentionKernel, TritiumKvAttentionOp, TritiumQwenDeltaNetKernel,
+    TritiumQwenDeltaNetOp, TritiumSaltV2EmbeddingKernel, TritiumSaltV2EmbeddingOp,
+    TritiumSaltV2MpGemmKernel, TritiumSaltV2MpGemmOp, TritiumTernaryEmbeddingKernel,
+    TritiumTernaryEmbeddingOp, TritiumTernaryMpGemmKernel, TritiumTernaryMpGemmOp,
+    tritium_operator_domain, tritium_operator_domain_with_counters,
 };
 
 #[cfg(feature = "onnx")]

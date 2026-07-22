@@ -23,12 +23,13 @@ use tritium_nn::{
     qwen35_language_mtp_tensor_schema,
 };
 use tritium_onnx::{
-    AdmittedExternalQwen35BundleDigests, OnnxArtifactIdentityV2, Qwen35Config, Qwen35LayerType,
-    Qwen35OnnxAncestryV1, Qwen35PackageMatrixSpec, Qwen35PackagePreservedSpec,
-    Qwen35PackageSourceSpec, Qwen35SaltV2PackageSource, QwenDeltaNetGeometry,
-    VerifiedExternalQwen35Bundle, encode_dynamic_external_qwen35_bundle_to_file_with_ancestry,
-    map_qwen36_27b_packed_causal_lm, tritium_operator_domain,
-    verify_dynamic_external_qwen35_bundle_from_file, verify_external_qwen35_bundle_from_file,
+    AdmittedExternalQwen35BundleDigests, OnnxArtifactIdentityV2, OnnxOperatorCounters,
+    Qwen35Config, Qwen35LayerType, Qwen35OnnxAncestryV1, Qwen35PackageMatrixSpec,
+    Qwen35PackagePreservedSpec, Qwen35PackageSourceSpec, Qwen35SaltV2PackageSource,
+    QwenDeltaNetGeometry, VerifiedExternalQwen35Bundle,
+    encode_dynamic_external_qwen35_bundle_to_file_with_ancestry, map_qwen36_27b_packed_causal_lm,
+    tritium_operator_domain_with_counters, verify_dynamic_external_qwen35_bundle_from_file,
+    verify_external_qwen35_bundle_from_file,
 };
 
 const LANGUAGE_FILE: &str = "language.onnx";
@@ -176,8 +177,48 @@ pub(crate) struct QwenOnnxModel {
     language_outputs: Vec<String>,
     mtp_inputs: Vec<String>,
     mtp_outputs: Vec<String>,
+    operator_counters: OnnxOperatorCounters,
     language_session: Mutex<Session>,
     mtp_session: Mutex<Session>,
+}
+
+/// Successful custom-operator calls executed by one loaded ONNX model.
+#[pyclass(module = "tritium", frozen, skip_from_py_object)]
+#[derive(Clone, Copy)]
+pub(crate) struct QwenOnnxOperatorCounts {
+    ternary_mpgemm: u64,
+    salt_v2_mpgemm: u64,
+    salt_v2_embedding: u64,
+    kv_attention: u64,
+    qwen_deltanet: u64,
+}
+
+#[pymethods]
+impl QwenOnnxOperatorCounts {
+    #[getter]
+    const fn ternary_mpgemm(&self) -> u64 {
+        self.ternary_mpgemm
+    }
+
+    #[getter]
+    const fn salt_v2_mpgemm(&self) -> u64 {
+        self.salt_v2_mpgemm
+    }
+
+    #[getter]
+    const fn salt_v2_embedding(&self) -> u64 {
+        self.salt_v2_embedding
+    }
+
+    #[getter]
+    const fn kv_attention(&self) -> u64 {
+        self.kv_attention
+    }
+
+    #[getter]
+    const fn qwen_deltanet(&self) -> u64 {
+        self.qwen_deltanet
+    }
 }
 
 /// Owned output of one fixed-shape Qwen language graph execution.
@@ -320,6 +361,18 @@ impl QwenOnnxModel {
     #[getter]
     fn mtp_outputs(&self) -> Vec<String> {
         self.mtp_outputs.clone()
+    }
+
+    /// Snapshot successful custom-operator executions for this model instance.
+    fn operator_counts(&self) -> QwenOnnxOperatorCounts {
+        let counts = self.operator_counters.snapshot();
+        QwenOnnxOperatorCounts {
+            ternary_mpgemm: counts.ternary_mpgemm,
+            salt_v2_mpgemm: counts.salt_v2_mpgemm,
+            salt_v2_embedding: counts.salt_v2_embedding,
+            kv_attention: counts.kv_attention,
+            qwen_deltanet: counts.qwen_deltanet,
+        }
     }
 
     /// Execute authenticated dynamic-cache language graph.
@@ -492,19 +545,21 @@ fn load_onnx_runtime(requested: &Path) -> Result<QwenOnnxModel, String> {
     let receipt = verify_paths_with_mode(&inputs, sequence_mode)?;
     validate_manifest_receipt(&manifest, &receipt)?;
 
-    let language_session =
-        Session::builder()
-            .map_err(|error| format!("create language ORT session builder failed: {error}"))?
-            .with_operators(tritium_operator_domain().map_err(|error| {
+    let operator_counters = OnnxOperatorCounters::default();
+    let language_session = Session::builder()
+        .map_err(|error| format!("create language ORT session builder failed: {error}"))?
+        .with_operators(
+            tritium_operator_domain_with_counters(&operator_counters).map_err(|error| {
                 format!("create language Tritium operator domain failed: {error}")
-            })?)
-            .map_err(|error| format!("register language Tritium operators failed: {error}"))?
-            .commit_from_file(&inputs.language)
-            .map_err(|error| format!("open authenticated language ORT graph failed: {error}"))?;
+            })?,
+        )
+        .map_err(|error| format!("register language Tritium operators failed: {error}"))?
+        .commit_from_file(&inputs.language)
+        .map_err(|error| format!("open authenticated language ORT graph failed: {error}"))?;
     let mtp_session = Session::builder()
         .map_err(|error| format!("create MTP ORT session builder failed: {error}"))?
         .with_operators(
-            tritium_operator_domain()
+            tritium_operator_domain_with_counters(&operator_counters)
                 .map_err(|error| format!("create MTP Tritium operator domain failed: {error}"))?,
         )
         .map_err(|error| format!("register MTP Tritium operators failed: {error}"))?
@@ -552,6 +607,7 @@ fn load_onnx_runtime(requested: &Path) -> Result<QwenOnnxModel, String> {
         language_outputs,
         mtp_inputs,
         mtp_outputs,
+        operator_counters,
         language_session: Mutex::new(language_session),
         mtp_session: Mutex::new(mtp_session),
     })

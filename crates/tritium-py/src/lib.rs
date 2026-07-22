@@ -309,6 +309,7 @@ fn _tritium(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<qwen::QwenReferenceLanguageOutput>()?;
     m.add_class::<onnx::QwenOnnxBundleReceipt>()?;
     m.add_class::<onnx::QwenOnnxModel>()?;
+    m.add_class::<onnx::QwenOnnxOperatorCounts>()?;
     m.add_class::<onnx::QwenOnnxLanguageOutput>()?;
     m.add_class::<onnx::QwenOnnxMtpOutput>()?;
     m.add_class::<module_package::ModuleSaltV2Receipt>()?;

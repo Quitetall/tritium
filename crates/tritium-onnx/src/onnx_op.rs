@@ -32,9 +32,13 @@
 use ort::error::Error as OrtError;
 use ort::operator::{
     Kernel, KernelAttributes, KernelContext, Operator, OperatorDomain, OperatorInput,
-    OperatorOutput,
+    OperatorOutput, ShapeInferenceContext,
 };
 use ort::value::TensorElementType;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use tritium_core::TernaryFormat;
 
 use crate::{
@@ -47,6 +51,109 @@ use crate::{
     salt_v2_embedding_kernel_admitted, salt_v2_mpgemm_kernel, ternary_embedding_kernel,
     ternary_mpgemm_kernel,
 };
+
+#[derive(Debug, Default)]
+struct OperatorCounterSet {
+    ternary_mpgemm: Arc<AtomicU64>,
+    salt_v2_mpgemm: Arc<AtomicU64>,
+    salt_v2_embedding: Arc<AtomicU64>,
+    kv_attention: Arc<AtomicU64>,
+    qwen_deltanet: Arc<AtomicU64>,
+}
+
+/// Per-model successful custom-operator execution counters.
+///
+/// Clones share the same atomics. A count advances only after a kernel has
+/// produced all outputs successfully, so graph registration and failed calls
+/// cannot manufacture execution evidence.
+#[derive(Debug, Default, Clone)]
+pub struct OnnxOperatorCounters {
+    inner: Arc<OperatorCounterSet>,
+}
+
+/// One immutable custom-operator counter snapshot.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct OnnxOperatorCountSnapshot {
+    /// Successful `TritiumTernaryMpGemm` executions.
+    pub ternary_mpgemm: u64,
+    /// Successful `TritiumSaltV2MpGemm` executions.
+    pub salt_v2_mpgemm: u64,
+    /// Successful `TritiumSaltV2Embedding` executions.
+    pub salt_v2_embedding: u64,
+    /// Successful `TritiumKvAttention` executions.
+    pub kv_attention: u64,
+    /// Successful `TritiumQwenDeltaNet` executions.
+    pub qwen_deltanet: u64,
+}
+
+impl OnnxOperatorCounters {
+    /// Read a relaxed, monotonic snapshot suitable for qualification receipts.
+    #[must_use]
+    pub fn snapshot(&self) -> OnnxOperatorCountSnapshot {
+        OnnxOperatorCountSnapshot {
+            ternary_mpgemm: self.inner.ternary_mpgemm.load(Ordering::Relaxed),
+            salt_v2_mpgemm: self.inner.salt_v2_mpgemm.load(Ordering::Relaxed),
+            salt_v2_embedding: self.inner.salt_v2_embedding.load(Ordering::Relaxed),
+            kv_attention: self.inner.kv_attention.load(Ordering::Relaxed),
+            qwen_deltanet: self.inner.qwen_deltanet.load(Ordering::Relaxed),
+        }
+    }
+}
+
+struct CountingKernel {
+    inner: Box<dyn Kernel>,
+    successful_calls: Arc<AtomicU64>,
+}
+
+impl Kernel for CountingKernel {
+    fn compute(&mut self, ctx: &KernelContext) -> ort::Result<()> {
+        self.inner.compute(ctx)?;
+        self.successful_calls.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+struct CountingOperator<O> {
+    inner: O,
+    successful_calls: Arc<AtomicU64>,
+}
+
+impl<O: Operator> Operator for CountingOperator<O> {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn execution_provider_type(&self) -> Option<&str> {
+        self.inner.execution_provider_type()
+    }
+
+    fn inputs(&self) -> Vec<OperatorInput> {
+        self.inner.inputs()
+    }
+
+    fn outputs(&self) -> Vec<OperatorOutput> {
+        self.inner.outputs()
+    }
+
+    fn create_kernel(&self, attributes: &KernelAttributes) -> ort::Result<Box<dyn Kernel>> {
+        Ok(Box::new(CountingKernel {
+            inner: self.inner.create_kernel(attributes)?,
+            successful_calls: Arc::clone(&self.successful_calls),
+        }))
+    }
+
+    fn min_version(&self) -> i32 {
+        self.inner.min_version()
+    }
+
+    fn max_version(&self) -> i32 {
+        self.inner.max_version()
+    }
+
+    fn infer_shape(&self, ctx: &mut ShapeInferenceContext) -> ort::Result<()> {
+        self.inner.infer_shape(ctx)
+    }
+}
 
 /// Map the integer `format` node attribute to a [`TernaryFormat`].
 ///
@@ -1317,6 +1424,40 @@ pub fn tritium_operator_domain() -> ort::Result<OperatorDomain> {
         .add(TritiumQwenDeltaNetOp)
 }
 
+/// Build Tritium's custom domain with successful-execution accounting.
+///
+/// The returned domain shares `counters`; create one domain per ORT session
+/// with clones of the same counter set to obtain a per-model aggregate.
+///
+/// # Errors
+/// An [`ort::Error`] if the domain or an operator cannot be registered.
+pub fn tritium_operator_domain_with_counters(
+    counters: &OnnxOperatorCounters,
+) -> ort::Result<OperatorDomain> {
+    OperatorDomain::new(ONNX_DOMAIN)?
+        .add(CountingOperator {
+            inner: TritiumTernaryMpGemmOp,
+            successful_calls: Arc::clone(&counters.inner.ternary_mpgemm),
+        })?
+        .add(TritiumTernaryEmbeddingOp)?
+        .add(CountingOperator {
+            inner: TritiumSaltV2MpGemmOp,
+            successful_calls: Arc::clone(&counters.inner.salt_v2_mpgemm),
+        })?
+        .add(CountingOperator {
+            inner: TritiumSaltV2EmbeddingOp,
+            successful_calls: Arc::clone(&counters.inner.salt_v2_embedding),
+        })?
+        .add(CountingOperator {
+            inner: TritiumKvAttentionOp,
+            successful_calls: Arc::clone(&counters.inner.kv_attention),
+        })?
+        .add(CountingOperator {
+            inner: TritiumQwenDeltaNetOp,
+            successful_calls: Arc::clone(&counters.inner.qwen_deltanet),
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1500,9 +1641,10 @@ mod tests {
         let encoded = crate::model::encode_salt_v2_mpgemm_test_graph(matrix);
         let diagnostics = crate::diagnose_unsupported_graph(&encoded).unwrap();
         assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        let counters = OnnxOperatorCounters::default();
         let mut session = ort::session::Session::builder()
             .unwrap()
-            .with_operators(tritium_operator_domain().unwrap())
+            .with_operators(tritium_operator_domain_with_counters(&counters).unwrap())
             .unwrap()
             .commit_from_memory(&encoded)
             .unwrap();
@@ -1512,6 +1654,13 @@ mod tests {
             let (_, actual) = outputs[0].try_extract_tensor::<f32>().unwrap();
             assert_eq!(actual, expected);
         }
+        assert_eq!(
+            counters.snapshot(),
+            OnnxOperatorCountSnapshot {
+                salt_v2_mpgemm: 1,
+                ..OnnxOperatorCountSnapshot::default()
+            }
+        );
 
         let two_rows = [activation.as_slice(), activation.as_slice()].concat();
         let expected_two = crate::salt_v2_mpgemm_kernel(&two_rows, 2, matrix).unwrap();
@@ -1519,6 +1668,7 @@ mod tests {
         let outputs = session.run(ort::inputs![&act]).unwrap();
         let (_, actual) = outputs[0].try_extract_tensor::<f32>().unwrap();
         assert_eq!(actual, expected_two);
+        assert_eq!(counters.snapshot().salt_v2_mpgemm, 2);
     }
 
     #[test]

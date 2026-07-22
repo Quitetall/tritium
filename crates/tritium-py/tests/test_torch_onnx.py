@@ -83,6 +83,38 @@ def test_load_onnx_parses_exact_manifest_before_native_runtime(monkeypatch, tmp_
     assert observed == {"path": str(root.resolve()), "device": "cuda:0"}
 
 
+def test_onnx_runtime_publishes_named_successful_operator_counts(monkeypatch, tmp_path):
+    root = tmp_path / "onnx"
+    _write_onnx_bundle(root)
+
+    class Runtime:
+        device = "cpu"
+
+        @staticmethod
+        def load(path, *, device):
+            return Runtime()
+
+        @staticmethod
+        def operator_counts():
+            return SimpleNamespace(
+                ternary_mpgemm=1,
+                salt_v2_mpgemm=2,
+                salt_v2_embedding=3,
+                kv_attention=4,
+                qwen_deltanet=5,
+            )
+
+    monkeypatch.setattr(onnx._tritium, "QwenOnnxModel", Runtime, raising=False)
+    model = load_onnx(root)
+    assert model.operator_counts() == {
+        "TritiumTernaryMpGemm": 1,
+        "TritiumSaltV2MpGemm": 2,
+        "TritiumSaltV2Embedding": 3,
+        "TritiumKvAttention": 4,
+        "TritiumQwenDeltaNet": 5,
+    }
+
+
 def test_load_onnx_rejects_unknown_or_corrupt_manifest_before_runtime(monkeypatch, tmp_path):
     root = tmp_path / "onnx"
     value = _write_onnx_bundle(root)
