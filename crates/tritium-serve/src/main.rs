@@ -27,6 +27,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut backend_name = "cpu".to_owned();
     let mut spec: Option<String> = None;
     let mut batch_slots: usize = 1;
+    let mut queue_cap: usize = 32;
     let mut host = "127.0.0.1".to_owned();
     let mut port: u16 = 8080;
     let mut model_id = "tritium".to_owned();
@@ -63,6 +64,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--backend" => backend_name = val::<String>(args.next(), "--backend")?,
             "--spec" => spec = Some(val::<String>(args.next(), "--spec")?),
             "--batch-slots" => batch_slots = val::<usize>(args.next(), "--batch-slots")?,
+            "--queue-cap" => queue_cap = val::<usize>(args.next(), "--queue-cap")?,
             "--host" => host = val::<String>(args.next(), "--host")?,
             "--port" => port = val(args.next(), "--port")?,
             "--model-id" => model_id = val::<String>(args.next(), "--model-id")?,
@@ -100,7 +102,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!(
                     "usage: tritium-serve (--bundle <schema-v3-dir> [--profile compact-v1] | \
                      --model <legacy.gguf>) [--backend cpu|cuda] [--spec lookup] \
-                     [--batch-slots N] [--host 127.0.0.1] [--port 8080] [--model-id tritium] \
+                     [--batch-slots N] [--queue-cap 32] [--host 127.0.0.1] [--port 8080] \
+                     [--model-id tritium] \
                      [--max-new 256] [--max-messages 128] [--max-prompt-bytes 1048576] \
                      [--max-prompt-tokens 131072] [--max-completion-tokens 4096] \
                      [--max-total-tokens 131072] [--rate-limit-rpm 120] \
@@ -118,6 +121,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err(
             "provide exactly one of --bundle <schema-v3-dir> or --model <legacy.gguf>".into(),
         );
+    }
+    if queue_cap == 0 {
+        return Err("--queue-cap must be >= 1".into());
     }
     // Resolve the named backend from the runtime registry (the same owned-init
     // pattern the acceptance tests use). `cpu` is always linked; `cuda` needs
@@ -283,7 +289,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let cfg = ServeConfig {
         model_id,
-        queue_cap: 32,
+        queue_cap,
         max_new_default: max_new,
         // The v1.1 governed constructor owns rotating authentication. Keep the
         // legacy single-key field empty to make precedence unambiguous.

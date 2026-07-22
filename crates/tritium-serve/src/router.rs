@@ -179,6 +179,23 @@ pub(crate) struct Metrics {
     pub(crate) tokens_out: AtomicU64,
     /// Streaming generations cancelled after exceeding their lifetime budget.
     pub(crate) stream_timeouts: AtomicU64,
+    /// SSE bodies dropped before a terminal event, causing cooperative cancellation.
+    pub(crate) stream_disconnects: AtomicU64,
+}
+
+struct StreamDisconnectGuard {
+    metrics: Arc<Metrics>,
+    completed: bool,
+}
+
+impl Drop for StreamDisconnectGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.metrics
+                .stream_disconnects
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1006,6 +1023,10 @@ fn stream_response(
         now.checked_add(budget).unwrap_or(now)
     });
     let stream = async_stream::stream! {
+        let mut disconnect = StreamDisconnectGuard {
+            metrics: metrics.clone(),
+            completed: false,
+        };
         // 1. role-first chunk
         yield Ok::<Event, std::convert::Infallible>(sse_data(&role_chunk(&id, created, &model)));
 
@@ -1114,6 +1135,7 @@ fn stream_response(
                 )));
             }
         }
+        disconnect.completed = true;
         yield Ok(Event::default().data("[DONE]"));
     };
     Sse::new(stream)
@@ -1213,6 +1235,9 @@ async fn metrics(State(st): State<AppState>) -> Response {
          # HELP tritium_stream_timeouts_total Streaming generations cancelled at their lifetime deadline.\n\
          # TYPE tritium_stream_timeouts_total counter\n\
          tritium_stream_timeouts_total {}\n\
+         # HELP tritium_stream_disconnects_total SSE bodies dropped before terminal completion.\n\
+         # TYPE tritium_stream_disconnects_total counter\n\
+         tritium_stream_disconnects_total {}\n\
          # HELP tritium_queue_depth Jobs waiting in the decode queue.\n\
          # TYPE tritium_queue_depth gauge\n\
          tritium_queue_depth {}\n\
@@ -1230,6 +1255,7 @@ async fn metrics(State(st): State<AppState>) -> Response {
         st.metrics.rate_rejections.load(Ordering::Relaxed),
         st.metrics.tokens_out.load(Ordering::Relaxed),
         st.metrics.stream_timeouts.load(Ordering::Relaxed),
+        st.metrics.stream_disconnects.load(Ordering::Relaxed),
         queue_depth,
         u8::from(st.runtime.worker_alive.load(Ordering::Relaxed)),
         crate::generator::SPEC_VERIFIES.load(Ordering::Relaxed),

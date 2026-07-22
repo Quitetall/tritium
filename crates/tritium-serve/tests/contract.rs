@@ -938,6 +938,39 @@ async fn oversized_body_rejected() {
     );
 }
 
+#[tokio::test]
+async fn dropped_sse_body_records_client_disconnect() {
+    let mock = MockGenerator {
+        step_delay_ms: 100,
+        ..MockGenerator::new(vec![1, 2, 3, 4, 5, 6, 7, 8])
+    };
+    let (router, _) = router_with(mock, ServeConfig::default());
+    let response = router
+        .clone()
+        .oneshot(chat(json!({
+            "model": "tritium",
+            "messages": [{"role": "user", "content": "1"}],
+            "stream": true,
+            "max_tokens": 8
+        })))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body();
+    assert!(body.frame().await.transpose().unwrap().is_some());
+    drop(body);
+    tokio::task::yield_now().await;
+
+    let request = Request::get("/metrics").body(Body::empty()).unwrap();
+    let (status, body) = send(&router, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let text = String::from_utf8(body).unwrap();
+    assert!(
+        text.contains("tritium_stream_disconnects_total 1\n"),
+        "{text}"
+    );
+}
+
 /// Non-streaming requests are bounded by the request timeout: the handler
 /// awaits the full aggregation, so a generation slower than the deadline
 /// surfaces as 408.
@@ -1066,6 +1099,10 @@ async fn metrics_exposition() {
     );
     assert!(text.contains("tritium_rate_rejections_total 0\n"), "{text}");
     assert!(text.contains("tritium_stream_timeouts_total 0\n"), "{text}");
+    assert!(
+        text.contains("tritium_stream_disconnects_total 0\n"),
+        "{text}"
+    );
     assert!(text.contains("tritium_worker_alive 1\n"), "{text}");
     assert!(text.contains("# TYPE tritium_queue_depth gauge"), "{text}");
 

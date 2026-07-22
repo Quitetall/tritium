@@ -90,6 +90,8 @@ class OciContractTests(unittest.TestCase):
                 ":/models/bundle:ro",
                 "--bundle",
                 "--profile",
+                "--queue-cap",
+                "TRITIUM_QUEUE_CAP",
                 "127.0.0.1:",
             ):
                 self.assertIn(token, text)
@@ -132,9 +134,13 @@ class OciContractTests(unittest.TestCase):
             "auth-required",
             "malformed-json",
             "principal-rate-limit",
+            "queue-backpressure",
+            "slow-sse-disconnect",
             "TRITIUM_RATE_LIMIT_RPM",
             "retry-after",
             "tritium_rate_rejections_total",
+            "tritium_queue_rejections_total",
+            "tritium_stream_disconnects_total",
             "Compose cleanup failed",
         ):
             self.assertIn(token, script)

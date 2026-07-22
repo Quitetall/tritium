@@ -287,22 +287,27 @@ image, and the runtime/deployment startup receipts must be identical.
 
 Run the exact local-RC image/chart through a sealed scenario matrix:
 
-OCI runtime qualification v2 now executes the first production failure subset
+OCI runtime qualification v3 now executes the first production failure subset
 against exact CPU/CUDA candidate images: unauthenticated and wrong-token access,
 stable malformed-JSON envelopes, deterministic per-principal `429` plus
 `Retry-After`, second-principal isolation and an exact rejection-counter delta.
 The content-addressed receipt retains statuses, retry duration and counter
 baseline/final values. Oversized-body `413` and all
 three POST surfaces use the same bounded OpenAI JSON error envelope in router
-contract tests. Remaining scenarios below still block this slice.
+contract tests. It also uses a one-entry queue under synchronized slow SSE load,
+requires exactly one active and one queued admission plus exact capacity-`429`
+and queue-counter deltas, holds accepted streams unread after observed token
+progress, then closes them and requires disconnect-counter movement, an empty
+settled queue, a live worker and a bounded successful recovery generation. The
+receipt binds the queue capacity, hold duration, token progress and recovery
+latency. Remaining scenarios below still block this slice.
 
 1. malformed/truncated/wrong-identity artifact at startup;
 2. missing secret, invalid config and unavailable requested backend;
-3. queue flood, rate-limit flood, slow SSE reader and client disconnect;
-4. SIGTERM during queue, prefill and decode;
-5. worker panic/process restart, device loss/OOM and artifact volume loss;
-6. telemetry collector unavailable/slow and metrics scrape flood;
-7. failed rollout followed by digest-pinned rollback.
+3. SIGTERM during queue, prefill and decode;
+4. worker panic/process restart, device loss/OOM and artifact volume loss;
+5. telemetry collector unavailable/slow and metrics scrape flood;
+6. failed rollout followed by digest-pinned rollback.
 
 Every scenario records configuration, source/image/chart/artifact digests,
 hardware, requests, expected/observed state transitions, telemetry assertions,

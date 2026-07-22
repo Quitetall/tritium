@@ -23,6 +23,8 @@ services:
       - 0.0.0.0
       - --port
       - "8080"
+      - --queue-cap
+      - ${TRITIUM_QUEUE_CAP:-32}
       - --rate-limit-rpm
       - ${TRITIUM_RATE_LIMIT_RPM:-120}
       - --rate-limit-burst

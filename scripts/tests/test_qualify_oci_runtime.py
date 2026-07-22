@@ -66,6 +66,15 @@ def runtime_receipt(artifact: Path, flavor: str = "cpu") -> dict:
             "malformed_json_status": 400, "rate_limited_status": 429,
             "retry_after_seconds": 60, "rate_rejections_before": 0,
             "rate_rejections_after": 1, "replacement_principal_status": 400,
+            "queue_flood_clients": 3, "slow_reader_tokens": 32,
+            "queue_rejections_before": 0, "queue_rejections_after": 1,
+            "disconnects_before": 0, "disconnects_after": 1,
+            "accepted_streams": 2, "rejected_streams": 1,
+            "settled_queue_depth": 0, "worker_alive": 1,
+            "queue_capacity": 1, "saturated_queue_depth": 1, "slow_hold_ms": 1000,
+            "tokens_out_before_hold": 0, "tokens_out_after_hold": 1,
+            "recovery_status": 200, "recovery_ms": 1,
+            "recovery_timeout_ms": 60000,
         },
         "checks": list(MODULE["CHECKS"]),
         "started_at_utc": "2026-07-21T00:00:00+00:00",
@@ -171,6 +180,29 @@ class QualifyOciRuntimeTests(unittest.TestCase):
             receipt["receipt_id"] = "sha256:" + hashlib.sha256(canonical(receipt)).hexdigest()
             with self.assertRaisesRegex(QualificationError, "fault evidence"):
                 validate_receipt(receipt)
+
+            receipt = runtime_receipt(artifact)
+            receipt["faults"]["disconnects_after"] = 0
+            del receipt["receipt_id"]
+            receipt["receipt_id"] = "sha256:" + hashlib.sha256(canonical(receipt)).hexdigest()
+            with self.assertRaisesRegex(QualificationError, "queue/disconnect evidence"):
+                validate_receipt(receipt)
+
+            for field, value in (
+                ("queue_capacity", 2),
+                ("tokens_out_after_hold", 0),
+                ("recovery_ms", 60001),
+            ):
+                receipt = runtime_receipt(artifact)
+                receipt["faults"][field] = value
+                del receipt["receipt_id"]
+                receipt["receipt_id"] = "sha256:" + hashlib.sha256(
+                    canonical(receipt)
+                ).hexdigest()
+                with self.assertRaisesRegex(
+                    QualificationError, "queue/disconnect evidence"
+                ):
+                    validate_receipt(receipt)
 
     def test_receipt_validator_rejects_cross_artifact_bytes(self):
         with tempfile.TemporaryDirectory() as raw:

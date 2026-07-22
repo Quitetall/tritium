@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
@@ -18,6 +19,7 @@ import socket
 import subprocess
 import sys
 import tarfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -28,13 +30,14 @@ OCI_ARCHIVE = runpy.run_path(Path(__file__).with_name("verify-oci-archive.py"))
 validate_oci_archive = OCI_ARCHIVE["validate"]
 OciError = OCI_ARCHIVE["OciError"]
 
-SCHEMA = "tritium.oci-runtime-qualification.v2"
+SCHEMA = "tritium.oci-runtime-qualification.v3"
 HEX = frozenset("0123456789abcdef")
 MAX_JSON_RESPONSE_BYTES = 16 * 1024 * 1024
 MAX_SSE_RESPONSE_BYTES = 1024 * 1024
 CHECKS = (
     "production-readiness", "models", "buffered-generation", "sse-generation",
     "auth-required", "malformed-json", "principal-rate-limit",
+    "queue-backpressure", "slow-sse-disconnect",
     "readonly-rootfs", "drop-all-capabilities", "no-new-privileges",
     "readonly-bundle", "sigterm-drain",
 )
@@ -169,6 +172,184 @@ def metric_value(base_url: str, token: str, name: str, timeout: float) -> int:
     return int(match.group(1))
 
 
+def slow_stream_attempt(
+    url: str, token: str, payload: dict[str, Any], timeout: float,
+    barrier: threading.Barrier | None,
+) -> tuple[str, Any]:
+    request = urllib.request.Request(
+        url, data=canonical(payload),
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+    )
+    response = None
+    try:
+        if barrier is not None:
+            barrier.wait(timeout=timeout)
+        response = urllib.request.urlopen(request, timeout=timeout)
+        if response.status != 200 or not response.read(1):
+            response.close()
+            raise QualificationError("slow SSE request did not start streaming")
+        return "accepted", response
+    except urllib.error.HTTPError as error:
+        with error:
+            body = error.read(MAX_JSON_RESPONSE_BYTES + 1)
+        if len(body) > MAX_JSON_RESPONSE_BYTES:
+            raise QualificationError("queue rejection response exceeds byte limit")
+        try:
+            value = json.loads(body)
+        except (UnicodeDecodeError, json.JSONDecodeError) as decode_error:
+            raise QualificationError("queue rejection is not UTF-8 JSON") from decode_error
+        expected = {"error": {
+            "message": "server is at capacity; retry shortly",
+            "type": "rate_limit_exceeded",
+        }}
+        if (error.code != 429 or value != expected
+                or error.headers.get("Retry-After") != "1"):
+            raise QualificationError("queue rejection envelope differs")
+        return "rejected", None
+    except (OSError, urllib.error.URLError, threading.BrokenBarrierError) as error:
+        if response is not None:
+            response.close()
+        raise QualificationError(f"slow SSE request failed: {error}") from error
+
+
+def exercise_queue_disconnects(
+    *, base_url: str, token: str, metric_token: str, model_id: str,
+    prompt: str, clients: int, max_tokens: int, timeout: float,
+    hold_seconds: float, recovery_timeout: float,
+) -> dict[str, int]:
+    queue_before = metric_value(
+        base_url, metric_token, "tritium_queue_rejections_total", timeout
+    )
+    disconnects_before = metric_value(
+        base_url, metric_token, "tritium_stream_disconnects_total", timeout
+    )
+    tokens_before = metric_value(base_url, metric_token, "tritium_tokens_out_total", timeout)
+    payload = {
+        "model": model_id,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0,
+        "max_tokens": max_tokens,
+        "stream": True,
+    }
+    responses = []
+    outcomes = []
+    failures = []
+    tokens_after_hold = tokens_before
+    try:
+        first, response = slow_stream_attempt(
+            base_url + "/v1/chat/completions", token, payload, timeout, None
+        )
+        if first != "accepted" or response is None:
+            raise QualificationError("first slow SSE request was not admitted")
+        outcomes.append(first)
+        responses.append(response)
+        progress_deadline = time.monotonic() + min(timeout, 60.0)
+        while time.monotonic() < progress_deadline:
+            if metric_value(
+                base_url, metric_token, "tritium_tokens_out_total", timeout
+            ) > tokens_before:
+                break
+            time.sleep(0.1)
+        else:
+            raise QualificationError("active slow SSE request produced no model tokens")
+
+        second, response = slow_stream_attempt(
+            base_url + "/v1/chat/completions", token, payload, timeout, None
+        )
+        if second != "accepted" or response is None:
+            raise QualificationError("second slow SSE request did not fill the queue")
+        outcomes.append(second)
+        responses.append(response)
+        if metric_value(base_url, metric_token, "tritium_queue_depth", timeout) != 1:
+            raise QualificationError("one-entry queue was not observably saturated")
+
+        flood_clients = clients - 2
+        barrier = threading.Barrier(flood_clients)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=flood_clients) as pool:
+            futures = [
+                pool.submit(
+                    slow_stream_attempt,
+                    base_url + "/v1/chat/completions", token, payload, timeout, barrier,
+                )
+                for _ in range(flood_clients)
+            ]
+            for future in futures:
+                try:
+                    outcome, response = future.result()
+                    outcomes.append(outcome)
+                    if response is not None:
+                        responses.append(response)
+                except Exception as error:  # collect all results before cleanup
+                    failures.append(error)
+        if not failures:
+            time.sleep(hold_seconds)
+            tokens_after_hold = metric_value(
+                base_url, metric_token, "tritium_tokens_out_total", timeout
+            )
+    finally:
+        for response in responses:
+            response.close()
+    if failures:
+        raise failures[0]
+    accepted = outcomes.count("accepted")
+    rejected = outcomes.count("rejected")
+    if accepted != 2 or rejected != clients - 2:
+        raise QualificationError("slow SSE load did not prove one-entry queue saturation")
+    deadline = time.monotonic() + min(timeout, 60.0)
+    final = None
+    while time.monotonic() < deadline:
+        queue_depth = metric_value(base_url, metric_token, "tritium_queue_depth", timeout)
+        queue_after = metric_value(
+            base_url, metric_token, "tritium_queue_rejections_total", timeout
+        )
+        disconnects_after = metric_value(
+            base_url, metric_token, "tritium_stream_disconnects_total", timeout
+        )
+        worker_alive = metric_value(base_url, metric_token, "tritium_worker_alive", timeout)
+        if (queue_depth == 0 and queue_after - queue_before == rejected
+                and disconnects_after > disconnects_before and worker_alive == 1):
+            final = {
+                "queue_rejections_before": queue_before,
+                "queue_rejections_after": queue_after,
+                "disconnects_before": disconnects_before,
+                "disconnects_after": disconnects_after,
+                "accepted_streams": accepted,
+                "rejected_streams": rejected,
+                "settled_queue_depth": queue_depth,
+                "worker_alive": worker_alive,
+            }
+            break
+        time.sleep(0.25)
+    if final is None:
+        raise QualificationError("queue/disconnect telemetry did not settle causally")
+    recovery_started = time.monotonic()
+    recovery_status, recovery, _ = request_response(
+        base_url + "/v1/chat/completions", token=metric_token,
+        body=canonical({
+            "model": model_id,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0,
+            "max_tokens": 1,
+        }),
+        timeout=recovery_timeout,
+    )
+    recovery_ms = round((time.monotonic() - recovery_started) * 1000)
+    if (recovery_status != 200 or not isinstance(recovery.get("choices"), list)
+            or len(recovery["choices"]) != 1):
+        raise QualificationError("post-disconnect generation did not recover")
+    final.update({
+        "queue_capacity": 1,
+        "saturated_queue_depth": 1,
+        "slow_hold_ms": round(hold_seconds * 1000),
+        "tokens_out_before_hold": tokens_before,
+        "tokens_out_after_hold": tokens_after_hold,
+        "recovery_status": recovery_status,
+        "recovery_ms": recovery_ms,
+        "recovery_timeout_ms": round(recovery_timeout * 1000),
+    })
+    return final
+
+
 def validate_ready(value: dict[str, Any], revision: str, flavor: str,
                    profile: str, manifest_blake3: str,
                    release: str | None = None) -> dict[str, Any]:
@@ -239,6 +420,12 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
         raise QualificationError("run ID is not a safe canonical identifier")
     if min(args.startup_timeout, args.request_timeout, args.shutdown_timeout) <= 0:
         raise QualificationError("timeouts must be positive")
+    if not 3 <= args.queue_flood_clients <= 32:
+        raise QualificationError("queue flood clients must be in [3, 32]")
+    if not 32 <= args.slow_reader_tokens <= 4096:
+        raise QualificationError("slow reader tokens must be in [32, 4096]")
+    if args.slow_reader_hold < 1 or args.disconnect_recovery_timeout <= 0:
+        raise QualificationError("slow-reader hold must be >= 1s and recovery timeout positive")
     revision = exact_hex(args.source_revision, 40, "source revision")
     image_name, separator, image_digest = args.image.rpartition("@")
     if separator != "@" or not image_name or not image_digest.startswith("sha256:"):
@@ -281,7 +468,8 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
         "TRITIUM_AUTH_TOKENS": replacement_token,
         "TRITIUM_PORT": str(port),
         "TRITIUM_RATE_LIMIT_RPM": "1",
-        "TRITIUM_RATE_LIMIT_BURST": "8",
+        "TRITIUM_RATE_LIMIT_BURST": str(args.queue_flood_clients + 16),
+        "TRITIUM_QUEUE_CAP": "1",
     })
     compose = [str(Path(__file__).with_name("run-oci-compose")), args.flavor,
                "-p", project]
@@ -338,6 +526,17 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
         stream = stream_payload.decode("utf-8")
         if "data: [DONE]" not in stream or '"choices"' not in stream:
             raise QualificationError("streaming generation lacked choice data or terminal marker")
+        queue_faults = exercise_queue_disconnects(
+            base_url=f"http://127.0.0.1:{port}", token=token,
+            metric_token=replacement_token, model_id=model_id,
+            prompt=(
+                args.prompt
+                + " Continue for as many tokens as allowed; do not stop early."
+            ),
+            clients=args.queue_flood_clients, max_tokens=args.slow_reader_tokens,
+            timeout=args.request_timeout, hold_seconds=args.slow_reader_hold,
+            recovery_timeout=args.disconnect_recovery_timeout,
+        )
         request_error(
             f"http://127.0.0.1:{port}/v1/chat/completions", 400,
             "invalid_request_error", "request body must be valid application/json",
@@ -451,6 +650,9 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
             "rate_rejections_before": rate_rejections_before,
             "rate_rejections_after": rate_rejections_after,
             "replacement_principal_status": 400,
+            "queue_flood_clients": args.queue_flood_clients,
+            "slow_reader_tokens": args.slow_reader_tokens,
+            **queue_faults,
         },
         "checks": list(CHECKS),
         "started_at_utc": started_at_utc,
@@ -546,6 +748,12 @@ def validate_receipt(receipt: dict[str, Any], *, revision: str | None = None,
         "unauthenticated_status", "wrong_token_status", "malformed_json_status",
         "rate_limited_status", "retry_after_seconds", "rate_rejections_before",
         "rate_rejections_after", "replacement_principal_status",
+        "queue_flood_clients", "slow_reader_tokens", "queue_rejections_before",
+        "queue_rejections_after", "disconnects_before", "disconnects_after",
+        "accepted_streams", "rejected_streams", "settled_queue_depth", "worker_alive",
+        "queue_capacity", "saturated_queue_depth", "slow_hold_ms", "tokens_out_before_hold",
+        "tokens_out_after_hold", "recovery_status", "recovery_ms",
+        "recovery_timeout_ms",
     }
     if (not isinstance(faults, dict) or set(faults) != fault_fields
             or any(type(faults.get(field)) is not int for field in fault_fields)
@@ -558,6 +766,27 @@ def validate_receipt(receipt: dict[str, Any], *, revision: str | None = None,
             or faults["rate_rejections_before"] < 0
             or faults["rate_rejections_after"] - faults["rate_rejections_before"] != 1):
         raise QualificationError("runtime receipt fault evidence differs")
+    if (not 3 <= faults["queue_flood_clients"] <= 32
+            or not 32 <= faults["slow_reader_tokens"] <= 4096
+            or faults["queue_capacity"] != 1
+            or faults["saturated_queue_depth"] != 1
+            or faults["accepted_streams"] != 2
+            or faults["rejected_streams"] != faults["queue_flood_clients"] - 2
+            or faults["accepted_streams"] + faults["rejected_streams"]
+            != faults["queue_flood_clients"]
+            or faults["queue_rejections_before"] < 0
+            or faults["queue_rejections_after"] - faults["queue_rejections_before"]
+            != faults["rejected_streams"]
+            or faults["disconnects_before"] < 0
+            or faults["disconnects_after"] <= faults["disconnects_before"]
+            or faults["slow_hold_ms"] < 1000
+            or faults["tokens_out_before_hold"] < 0
+            or faults["tokens_out_after_hold"] <= faults["tokens_out_before_hold"]
+            or faults["recovery_status"] != 200 or faults["recovery_ms"] < 0
+            or faults["recovery_timeout_ms"] <= 0
+            or faults["recovery_ms"] > faults["recovery_timeout_ms"]
+            or faults["settled_queue_depth"] != 0 or faults["worker_alive"] != 1):
+        raise QualificationError("runtime receipt queue/disconnect evidence differs")
     try:
         timestamp = datetime.fromisoformat(
             str(receipt.get("started_at_utc")).replace("Z", "+00:00")
@@ -641,6 +870,10 @@ def main() -> int:
     parser.add_argument("--startup-timeout", type=float, default=1800)
     parser.add_argument("--request-timeout", type=float, default=600)
     parser.add_argument("--shutdown-timeout", type=float, default=35)
+    parser.add_argument("--queue-flood-clients", type=int, default=12)
+    parser.add_argument("--slow-reader-tokens", type=int, default=4096)
+    parser.add_argument("--slow-reader-hold", type=float, default=2.0)
+    parser.add_argument("--disconnect-recovery-timeout", type=float, default=60.0)
     args = parser.parse_args()
     try:
         receipt = qualify(args)
