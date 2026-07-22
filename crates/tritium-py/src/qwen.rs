@@ -229,6 +229,49 @@ pub(crate) struct QwenModel {
     device: String,
 }
 
+/// One native packed-language oracle transaction.
+///
+/// Exposes only published numeric outputs. Cache internals and runner identity
+/// remain opaque, so callers can compare ONNX prompt/decode semantics without
+/// manufacturing native cache state or bypassing MTP promotion.
+#[pyclass(module = "tritium", frozen, skip_from_py_object)]
+#[derive(Clone)]
+pub(crate) struct QwenReferenceLanguageOutput {
+    position_start: usize,
+    token_ids: Vec<u32>,
+    hidden_size: usize,
+    final_hidden_states: Vec<f32>,
+    last_logits: Vec<f32>,
+}
+
+#[pymethods]
+impl QwenReferenceLanguageOutput {
+    #[getter]
+    const fn position_start(&self) -> usize {
+        self.position_start
+    }
+
+    #[getter]
+    fn token_ids(&self) -> Vec<u32> {
+        self.token_ids.clone()
+    }
+
+    #[getter]
+    const fn hidden_size(&self) -> usize {
+        self.hidden_size
+    }
+
+    #[getter]
+    fn final_hidden_states(&self) -> Vec<f32> {
+        self.final_hidden_states.clone()
+    }
+
+    #[getter]
+    fn last_logits(&self) -> Vec<f32> {
+        self.last_logits.clone()
+    }
+}
+
 #[pymethods]
 impl QwenModel {
     /// Load one exact profile from a schema-v3 Tritium bundle.
@@ -327,6 +370,55 @@ impl QwenModel {
         })
     }
 
+    /// Run one native packed-language prefill followed by cached decode steps.
+    ///
+    /// Each invocation owns a fresh authenticated cache. The first transaction
+    /// may contain multiple prompt tokens; every later transaction must contain
+    /// exactly one token. This is a qualification oracle, not a mutable cache
+    /// escape hatch. MTP stays unavailable until its production oracle promotes
+    /// the loaded graph.
+    #[pyo3(signature = (transactions, max_context))]
+    fn reference_language(
+        &self,
+        py: Python<'_>,
+        transactions: Vec<Vec<i64>>,
+        max_context: usize,
+    ) -> PyResult<Vec<QwenReferenceLanguageOutput>> {
+        let (transactions, required_context) = reference_transactions(transactions)?;
+        if max_context < required_context {
+            return Err(PyValueError::new_err(format!(
+                "max_context {max_context} is smaller than transaction length {required_context}"
+            )));
+        }
+        py.detach(move || {
+            let model = self
+                .model
+                .lock()
+                .map_err(|_| PyRuntimeError::new_err("Qwen model mutex is poisoned"))?;
+            let runner = model.runner();
+            let mut cache = runner
+                .new_cache(max_context)
+                .map_err(|error| PyValueError::new_err(error.to_string()))?;
+            let mut outputs = Vec::new();
+            outputs.try_reserve_exact(transactions.len()).map_err(|_| {
+                PyRuntimeError::new_err("could not allocate Qwen reference output table")
+            })?;
+            for tokens in transactions {
+                let output = runner
+                    .forward(&tokens, &mut cache)
+                    .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+                outputs.push(QwenReferenceLanguageOutput {
+                    position_start: output.position_start(),
+                    token_ids: tokens,
+                    hidden_size: output.hidden_size(),
+                    final_hidden_states: output.final_hidden_states().to_vec(),
+                    last_logits: output.last_logits().to_vec(),
+                });
+            }
+            Ok(outputs)
+        })
+    }
+
     /// Selected governed profile filename.
     #[getter]
     fn profile(&self) -> &str {
@@ -417,6 +509,49 @@ fn qwen_backend(device: QwenDevice) -> Result<Box<dyn TernaryBackend>, String> {
     }
 }
 
+fn reference_transactions(transactions: Vec<Vec<i64>>) -> PyResult<(Vec<Vec<u32>>, usize)> {
+    if transactions.is_empty() {
+        return Err(PyValueError::new_err(
+            "reference transactions must not be empty",
+        ));
+    }
+    let mut total = 0usize;
+    let mut converted = Vec::new();
+    converted
+        .try_reserve_exact(transactions.len())
+        .map_err(|_| {
+            PyRuntimeError::new_err("could not allocate Qwen reference transaction table")
+        })?;
+    for (index, transaction) in transactions.into_iter().enumerate() {
+        if transaction.is_empty() {
+            return Err(PyValueError::new_err(format!(
+                "reference transaction {index} must not be empty"
+            )));
+        }
+        if index > 0 && transaction.len() != 1 {
+            return Err(PyValueError::new_err(
+                "cached reference transactions must contain exactly one token",
+            ));
+        }
+        total = total
+            .checked_add(transaction.len())
+            .ok_or_else(|| PyValueError::new_err("reference transaction length overflows usize"))?;
+        converted.push(
+            transaction
+                .into_iter()
+                .map(|token| {
+                    u32::try_from(token).map_err(|_| {
+                        PyValueError::new_err(format!(
+                            "token id {token} is outside unsigned 32-bit range"
+                        ))
+                    })
+                })
+                .collect::<PyResult<Vec<_>>>()?,
+        );
+    }
+    Ok((converted, total))
+}
+
 fn greedy_token(logits: &[f32]) -> Result<u32, String> {
     let (&first, remaining) = logits
         .split_first()
@@ -440,7 +575,7 @@ fn greedy_token(logits: &[f32]) -> Result<u32, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{greedy_token, parse_device};
+    use super::{greedy_token, parse_device, reference_transactions};
 
     #[test]
     fn greedy_token_uses_first_maximum_and_rejects_nonfinite_logits() {
@@ -461,5 +596,17 @@ mod tests {
         assert!(parse_device("cuda").is_err());
         assert!(parse_device("cuda:not-an-ordinal").is_err());
         assert!(parse_device("metal").is_err());
+    }
+
+    #[test]
+    fn reference_transactions_freeze_prefill_decode_shape_and_token_range() {
+        let (transactions, total) =
+            reference_transactions(vec![vec![1, 2, 3], vec![4], vec![5]]).unwrap();
+        assert_eq!(transactions, vec![vec![1, 2, 3], vec![4], vec![5]]);
+        assert_eq!(total, 5);
+        assert!(reference_transactions(vec![]).is_err());
+        assert!(reference_transactions(vec![vec![]]).is_err());
+        assert!(reference_transactions(vec![vec![1], vec![2, 3]]).is_err());
+        assert!(reference_transactions(vec![vec![-1]]).is_err());
     }
 }

@@ -306,6 +306,7 @@ fn _tritium(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Model>()?;
     m.add_class::<qwen::QwenModel>()?;
     m.add_class::<qwen::QwenLoadReceipt>()?;
+    m.add_class::<qwen::QwenReferenceLanguageOutput>()?;
     m.add_class::<onnx::QwenOnnxBundleReceipt>()?;
     m.add_class::<onnx::QwenOnnxModel>()?;
     m.add_class::<onnx::QwenOnnxLanguageOutput>()?;

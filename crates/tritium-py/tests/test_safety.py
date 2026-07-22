@@ -36,11 +36,13 @@ def test_module_surface():
     assert hasattr(tritium, "Model")
     assert hasattr(tritium, "QwenLoadReceipt")
     assert hasattr(tritium, "QwenModel")
+    assert hasattr(tritium, "QwenReferenceLanguageOutput")
     assert hasattr(tritium, "ternary_matmul")
     assert callable(tritium.ternary_matmul)
     assert tritium.compiled_backends() in (["cpu"], ["cpu", "cuda"])
     assert callable(tritium.Model.load)
     assert callable(tritium.QwenModel.load)
+    assert callable(tritium.QwenModel.reference_language)
 
 
 def test_ternary_matmul_correct():
