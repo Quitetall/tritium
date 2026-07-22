@@ -334,9 +334,8 @@ impl Qwen35SaltV2BundleAdmission {
             "near-lossless-v1" => &manifest.profiles.near_lossless,
             _ => unreachable!(),
         };
-        let (config_bytes, config_package_id, _) =
-            verify_hf_assets(bundle_dir, &manifest.hf_assets)?;
-        let config_text = std::str::from_utf8(&config_bytes)
+        let hf_assets = verify_hf_assets(bundle_dir, &manifest.hf_assets)?;
+        let config_text = std::str::from_utf8(&hf_assets.config)
             .map_err(|_| NnError::MissingConfig("config.json is not UTF-8".into()))?;
         let config = Qwen35CheckpointConfig::from_hf_config(config_text)?;
         if require_pinned_config {
@@ -400,7 +399,7 @@ impl Qwen35SaltV2BundleAdmission {
             admission_id: manifest.admission_id,
             selection_id: manifest.selection_id,
             source_model_id: manifest.source_model_id,
-            config_package_id,
+            config_package_id: hf_assets.config_package_id,
             package_id: profile_manifest.package_id.clone(),
             preserved_package_id: manifest.preserved.package_id,
             codec: package.codec(),
@@ -509,6 +508,8 @@ pub struct Qwen35SaltV2LanguageMtpModel {
     runner: Qwen35TextRunner,
     mtp: UnverifiedQwen35Mtp,
     receipt: Qwen35SaltV2LoadReceipt,
+    tokenizer_json: Vec<u8>,
+    tokenizer_config_json: Vec<u8>,
 }
 
 impl Qwen35SaltV2LanguageMtpModel {
@@ -554,9 +555,11 @@ impl Qwen35SaltV2LanguageMtpModel {
             "near-lossless-v1" => &manifest.profiles.near_lossless,
             _ => unreachable!(),
         };
-        let (config_bytes, config_package_id, hf_asset_bytes) =
-            verify_hf_assets(bundle_dir, &manifest.hf_assets)?;
-        let config_text = std::str::from_utf8(&config_bytes)
+        let hf_assets = verify_hf_assets(bundle_dir, &manifest.hf_assets)?;
+        let config_bytes = &hf_assets.config;
+        let config_package_id = hf_assets.config_package_id.clone();
+        let hf_asset_bytes = hf_assets.total_bytes;
+        let config_text = std::str::from_utf8(config_bytes)
             .map_err(|_| NnError::MissingConfig("config.json is not UTF-8".into()))?;
         let config = Qwen35CheckpointConfig::from_hf_config(config_text)?;
         if require_pinned_config {
@@ -675,6 +678,8 @@ impl Qwen35SaltV2LanguageMtpModel {
                 preserved_fp32_bytes,
                 resident_bytes,
             },
+            tokenizer_json: hf_assets.tokenizer_json,
+            tokenizer_config_json: hf_assets.tokenizer_config_json,
         })
     }
 
@@ -697,6 +702,33 @@ impl Qwen35SaltV2LanguageMtpModel {
     pub const fn receipt(&self) -> &Qwen35SaltV2LoadReceipt {
         &self.receipt
     }
+
+    /// Manifest-authenticated `tokenizer.json` bytes used by serving.
+    pub fn tokenizer_json(&self) -> &[u8] {
+        &self.tokenizer_json
+    }
+
+    /// Manifest-authenticated `tokenizer_config.json` bytes used by serving.
+    pub fn tokenizer_config_json(&self) -> &[u8] {
+        &self.tokenizer_config_json
+    }
+
+    /// Move authenticated tokenizer assets to serving without retaining a
+    /// second 30+ MiB serialized tokenizer copy beside its parsed graph.
+    #[must_use]
+    pub fn into_serving_assets(mut self) -> (Self, Vec<u8>, Vec<u8>) {
+        let tokenizer_json = std::mem::take(&mut self.tokenizer_json);
+        let tokenizer_config_json = std::mem::take(&mut self.tokenizer_config_json);
+        (self, tokenizer_json, tokenizer_config_json)
+    }
+}
+
+struct VerifiedHfAssets {
+    config: Vec<u8>,
+    config_package_id: String,
+    tokenizer_json: Vec<u8>,
+    tokenizer_config_json: Vec<u8>,
+    total_bytes: u64,
 }
 
 struct SaltV2QwenSource<'backend> {
@@ -1043,13 +1075,15 @@ fn validate_profile_manifest(profile: &ProfileManifest, file: &str) -> Result<()
 fn verify_hf_assets(
     bundle_dir: &Path,
     assets: &[HfAssetManifest],
-) -> Result<(Vec<u8>, String, u64), NnError> {
+) -> Result<VerifiedHfAssets, NnError> {
     if assets.len() != HF_ASSET_SPECS.len() {
         return Err(NnError::InvalidArtifact(
             "manifest HF asset catalog is incomplete".into(),
         ));
     }
     let mut config = None;
+    let mut tokenizer_json = None;
+    let mut tokenizer_config_json = None;
     let mut total_bytes = 0u64;
     for ((expected_file, max_bytes), asset) in HF_ASSET_SPECS.iter().zip(assets) {
         if asset.file != *expected_file
@@ -1074,11 +1108,25 @@ fn verify_hf_assets(
             .ok_or_else(|| NnError::ResourceExhausted("HF asset byte ledger overflow".into()))?;
         if *expected_file == CONFIG_FILE {
             config = Some((bytes, asset.package_id.clone()));
+        } else if *expected_file == "tokenizer.json" {
+            tokenizer_json = Some(bytes);
+        } else if *expected_file == "tokenizer_config.json" {
+            tokenizer_config_json = Some(bytes);
         }
     }
     let (config, package_id) = config
         .ok_or_else(|| NnError::InvalidArtifact("manifest has no config.json asset".into()))?;
-    Ok((config, package_id, total_bytes))
+    Ok(VerifiedHfAssets {
+        config,
+        config_package_id: package_id,
+        tokenizer_json: tokenizer_json.ok_or_else(|| {
+            NnError::InvalidArtifact("manifest has no tokenizer.json asset".into())
+        })?,
+        tokenizer_config_json: tokenizer_config_json.ok_or_else(|| {
+            NnError::InvalidArtifact("manifest has no tokenizer_config.json asset".into())
+        })?,
+        total_bytes,
+    })
 }
 
 fn codec_name(codec: SaltV2Codec) -> &'static str {

@@ -1,10 +1,9 @@
-//! The `tritium-serve` binary: load a GGUF model on a registry backend and serve
-//! it over the OpenAI HTTP/SSE protocol. Only built with `--features serve`.
+//! The `tritium-serve` binary: load a strict schema-v3 Qwen bundle or an
+//! explicitly legacy GGUF model and serve OpenAI HTTP/SSE.
 //!
-//! Usage: `tritium-serve --model <path.gguf> [--backend cpu|cuda] [--port 8080]
-//! [--model-id tritium] [--max-new 256] [--eos 128001]`. `--backend cuda` needs
-//! the `cuda` cargo feature (links tritium-cuda). Text input requires integer
-//! token IDs (the v0.80 id-passthrough tokenizer); inject a real BPE for prose.
+//! Production usage: `tritium-serve --bundle <schema-v3-dir> --profile
+//! compact-v1 [--backend cpu|cuda]`. `--model <path.gguf>` retains compatibility
+//! serving but cannot satisfy production readiness.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,6 +22,8 @@ use tritium_cuda as _;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut model_path: Option<String> = None;
+    let mut bundle_path: Option<String> = None;
+    let mut profile = "compact-v1".to_owned();
     let mut backend_name = "cpu".to_owned();
     let mut spec: Option<String> = None;
     let mut batch_slots: usize = 1;
@@ -57,6 +58,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     while let Some(a) = args.next() {
         match a.as_str() {
             "--model" => model_path = Some(val::<String>(args.next(), "--model")?),
+            "--bundle" => bundle_path = Some(val::<String>(args.next(), "--bundle")?),
+            "--profile" => profile = val::<String>(args.next(), "--profile")?,
             "--backend" => backend_name = val::<String>(args.next(), "--backend")?,
             "--spec" => spec = Some(val::<String>(args.next(), "--spec")?),
             "--batch-slots" => batch_slots = val::<usize>(args.next(), "--batch-slots")?,
@@ -95,7 +98,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             "-h" | "--help" => {
                 eprintln!(
-                    "usage: tritium-serve --model <gguf> [--backend cpu|cuda] [--spec lookup] \
+                    "usage: tritium-serve (--bundle <schema-v3-dir> [--profile compact-v1] | \
+                     --model <legacy.gguf>) [--backend cpu|cuda] [--spec lookup] \
                      [--batch-slots N] [--host 127.0.0.1] [--port 8080] [--model-id tritium] \
                      [--max-new 256] [--max-messages 128] [--max-prompt-bytes 1048576] \
                      [--max-prompt-tokens 131072] [--max-completion-tokens 4096] \
@@ -106,13 +110,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 return Ok(());
             }
-            other => eprintln!("tritium-serve: ignoring unknown arg {other:?}"),
+            other => return Err(format!("unknown argument {other:?}").into()),
         }
     }
 
-    let model_path = model_path.ok_or("missing --model <path-to-gguf>")?;
-    eprintln!("tritium-serve: loading {model_path} on the `{backend_name}` backend...");
-    let bytes = std::fs::read(&model_path)?;
+    if model_path.is_some() == bundle_path.is_some() {
+        return Err(
+            "provide exactly one of --bundle <schema-v3-dir> or --model <legacy.gguf>".into(),
+        );
+    }
     // Resolve the named backend from the runtime registry (the same owned-init
     // pattern the acceptance tests use). `cpu` is always linked; `cuda` needs
     // the `cuda` cargo feature and a working device.
@@ -131,40 +137,86 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .join(", ")
             )
         })?;
-    let backend = init().map_err(|e| format!("backend `{backend_name}` failed to init: {e}"))?;
-    let file = tritium_format::read_gguf(&bytes)?;
-    let runner = tritium_nn::ModelRunner::load(&file, &bytes, backend)?;
     let spec_lookup = match spec.as_deref() {
         None => false,
         Some("lookup") => true,
         Some(other) => return Err(format!("--spec: unknown mode {other:?} (try `lookup`)").into()),
     };
-    // Real text mode by default: rebuild the byte-level BPE the GGUF embeds
-    // (vocab + merges + control tokens) and render chat via the official
-    // template. `--raw-tokens` (or a GGUF without a gpt2 tokenizer) falls back
-    // to the id-passthrough MVP: whitespace-separated integer token ids.
-    let mut chat_template = tritium_serve::ChatTemplate::Concat;
-    let tok: Arc<dyn tritium_nn::Tokenizer + Send + Sync> = if raw_tokens {
-        eprintln!("tritium-serve: --raw-tokens — id-passthrough tokenizer");
-        Arc::new(IdPassthroughTokenizer::new(128_000, eos))
-    } else {
-        match tritium_nn::GgufBpeTokenizer::from_gguf(&file) {
-            Ok(t) => {
-                eos = tritium_nn::Tokenizer::eos(&t);
-                chat_template = tritium_serve::ChatTemplate::RoleEot;
-                eprintln!(
-                    "tritium-serve: GGUF-embedded BPE tokenizer (eos {eos}); chat template: role-eot"
-                );
-                Arc::new(t)
-            }
-            Err(e) => {
-                eprintln!(
-                    "tritium-serve: no usable embedded tokenizer ({e}); falling back to \
-                     id-passthrough (send integer token ids)"
-                );
-                Arc::new(IdPassthroughTokenizer::new(128_000, eos))
-            }
+    enum LoadedModel {
+        Legacy(Box<tritium_nn::ModelRunner>),
+        Production {
+            model: Box<tritium_nn::Qwen35SaltV2LanguageMtpModel>,
+            physical_device: String,
+        },
+    }
+    let (loaded, tok, chat_template): (
+        LoadedModel,
+        Arc<dyn tritium_nn::Tokenizer + Send + Sync>,
+        tritium_serve::ChatTemplate,
+    ) = if let Some(bundle) = bundle_path {
+        if raw_tokens
+            || spec_lookup
+            || draft_model.is_some()
+            || batch_slots != 1
+            || kv_pool_tokens.is_some()
+        {
+            return Err("--bundle forbids --raw-tokens, --spec, --draft-model, --batch-slots != 1, and --kv-pool-tokens".into());
         }
+        let bundle = std::path::Path::new(&bundle);
+        let backend =
+            init().map_err(|error| format!("backend `{backend_name}` failed to init: {error}"))?;
+        let physical_device = backend.device_id().to_owned();
+        eprintln!(
+            "tritium-serve: loading strict bundle {} profile {profile} on `{backend_name}` ({physical_device})...",
+            bundle.display()
+        );
+        let model = tritium_nn::Qwen35SaltV2LanguageMtpModel::load_bundle_profile(
+            bundle, &profile, backend,
+        )?;
+        let (model, tokenizer_json, tokenizer_config_json) = model.into_serving_assets();
+        let tokenizer =
+            tritium_nn::HfJsonTokenizer::from_bytes(&tokenizer_json, &tokenizer_config_json)?;
+        eos = tritium_nn::Tokenizer::eos(&tokenizer);
+        (
+            LoadedModel::Production {
+                model: Box::new(model),
+                physical_device,
+            },
+            Arc::new(tokenizer),
+            tritium_serve::ChatTemplate::QwenIm,
+        )
+    } else {
+        let model_path = model_path.expect("exactly-one validation established legacy path");
+        eprintln!("tritium-serve: loading legacy {model_path} on `{backend_name}`...");
+        let bytes = std::fs::read(&model_path)?;
+        let backend =
+            init().map_err(|error| format!("backend `{backend_name}` failed to init: {error}"))?;
+        let file = tritium_format::read_gguf(&bytes)?;
+        let runner = tritium_nn::ModelRunner::load(&file, &bytes, backend)?;
+        let (tokenizer, template): (Arc<dyn tritium_nn::Tokenizer + Send + Sync>, _) = if raw_tokens
+        {
+            (
+                Arc::new(IdPassthroughTokenizer::new(128_000, eos)),
+                tritium_serve::ChatTemplate::Concat,
+            )
+        } else {
+            match tritium_nn::GgufBpeTokenizer::from_gguf(&file) {
+                Ok(tokenizer) => {
+                    eos = tritium_nn::Tokenizer::eos(&tokenizer);
+                    (Arc::new(tokenizer), tritium_serve::ChatTemplate::RoleEot)
+                }
+                Err(error) => {
+                    eprintln!(
+                        "tritium-serve: legacy tokenizer unavailable ({error}); using raw token IDs"
+                    );
+                    (
+                        Arc::new(IdPassthroughTokenizer::new(128_000, eos)),
+                        tritium_serve::ChatTemplate::Concat,
+                    )
+                }
+            }
+        };
+        (LoadedModel::Legacy(Box::new(runner)), tokenizer, template)
     };
     // Binding beyond loopback requires at least one bearer key. The singular
     // variable preserves compatibility; the plural comma-separated variable
@@ -279,68 +331,115 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map_err(|e| format!("--draft-model {path}: {e}"))?;
             // A vocab mismatch degrades to silent per-call draft failures —
             // reject at startup instead.
-            if d.weights.vocab != runner.weights.vocab {
+            let target_vocab = match &loaded {
+                LoadedModel::Legacy(runner) => runner.weights.vocab,
+                LoadedModel::Production { .. } => unreachable!("bundle rejected draft model"),
+            };
+            if d.weights.vocab != target_vocab {
                 return Err(format!(
                     "--draft-model vocab {} != target vocab {} (the drafter must share \
                      the target's tokenizer, ADR 0021)",
-                    d.weights.vocab, runner.weights.vocab
+                    d.weights.vocab, target_vocab
                 )
                 .into());
             }
             Some(d)
         }
     };
-    #[cfg(feature = "cuda")]
-    let (router, draining) = if batch_slots > 1 {
-        // Continuous batching: a dedicated worker owns the runner + a fixed
-        // slot pool; requests stream through the same job queue + SSE plumbing.
-        if spec_lookup || draft_runner.is_some() {
-            return Err(
-                "--spec lookup / --draft-model and --batch-slots > 1 are mutually \
+    let (router, draining) = match loaded {
+        LoadedModel::Production {
+            model,
+            physical_device,
+        } => {
+            let source_identity = option_env!("TRITIUM_SOURCE_ID")
+                .ok_or("production binary lacks TRITIUM_SOURCE_ID")?;
+            let source_revision = source_identity
+                .strip_prefix("source-git:")
+                .filter(|revision| {
+                    revision.len() == 40
+                        && revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+                        && revision.bytes().all(|byte| !byte.is_ascii_uppercase())
+                })
+                .ok_or("production binary source identity is not one clean Git revision")?;
+            let build_id = format!(
+                "tritium-serve:{}:{source_revision}",
+                env!("CARGO_PKG_VERSION")
+            );
+            let admitted = tritium_serve::admit_qwen36_salt_v3(
+                *model,
+                eos,
+                source_revision,
+                &build_id,
+                &backend_name,
+                &backend_name,
+                &physical_device,
+            )?;
+            let (router, draining, _) = tritium_serve::build_router_production(
+                admitted,
+                tok,
+                cfg,
+                request_limits,
+                admission,
+            )?;
+            (router, draining)
+        }
+        LoadedModel::Legacy(runner) => {
+            #[cfg(feature = "cuda")]
+            let result = if batch_slots > 1 {
+                // Continuous batching: a dedicated worker owns the runner + a fixed
+                // slot pool; requests stream through the same job queue + SSE plumbing.
+                if spec_lookup || draft_runner.is_some() {
+                    return Err(
+                        "--spec lookup / --draft-model and --batch-slots > 1 are mutually \
                  exclusive (the IN-PROCESS spec loop drives a single sequence; \
                  batched spec decoding is served to EXTERNAL drafters via the \
                  /v1/tree endpoints, which DO work with --batch-slots — C4)"
-                    .into(),
-            );
+                            .into(),
+                    );
+                }
+                tritium_serve::build_router_batched_governed(
+                    *runner,
+                    eos,
+                    batch_slots,
+                    tok,
+                    cfg,
+                    request_limits,
+                    admission,
+                )?
+            } else {
+                let mut generator =
+                    RunnerGenerator::new(*runner, eos).with_spec_lookup(spec_lookup);
+                if let Some(d) = draft_runner {
+                    generator = generator.with_draft_model(d);
+                }
+                tritium_serve::build_router_governed(
+                    Box::new(generator),
+                    tok,
+                    cfg,
+                    request_limits,
+                    admission,
+                )?
+            };
+            #[cfg(not(feature = "cuda"))]
+            let result = {
+                if batch_slots > 1 {
+                    return Err("--batch-slots > 1 requires the cuda feature".into());
+                }
+                let mut generator =
+                    RunnerGenerator::new(*runner, eos).with_spec_lookup(spec_lookup);
+                if let Some(draft) = draft_runner {
+                    generator = generator.with_draft_model(draft);
+                }
+                tritium_serve::build_router_governed(
+                    Box::new(generator),
+                    tok,
+                    cfg,
+                    request_limits,
+                    admission,
+                )?
+            };
+            result
         }
-        tritium_serve::build_router_batched_governed(
-            runner,
-            eos,
-            batch_slots,
-            tok,
-            cfg,
-            request_limits,
-            admission,
-        )?
-    } else {
-        let mut generator = RunnerGenerator::new(runner, eos).with_spec_lookup(spec_lookup);
-        if let Some(d) = draft_runner {
-            generator = generator.with_draft_model(d);
-        }
-        tritium_serve::build_router_governed(
-            Box::new(generator),
-            tok,
-            cfg,
-            request_limits,
-            admission,
-        )?
-    };
-    #[cfg(not(feature = "cuda"))]
-    let (router, draining) = {
-        if batch_slots > 1 {
-            return Err("--batch-slots > 1 requires the cuda feature".into());
-        }
-        let mut generator = RunnerGenerator::new(runner, eos).with_spec_lookup(spec_lookup);
-        if let Some(d) = draft_runner {
-            generator = generator.with_draft_model(d);
-        }
-        tritium_serve::build_router_governed(
-            Box::new(generator),
-            tok,
-            cfg,
-            request_limits,
-            admission,
-        )?
     };
 
     let addr = std::net::SocketAddr::new(host_ip, port);

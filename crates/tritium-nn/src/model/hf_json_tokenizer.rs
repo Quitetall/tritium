@@ -48,11 +48,18 @@ impl HfJsonTokenizer {
     /// Qwen does not add BOS during chat encoding. When `bos_token` is absent,
     /// [`Tokenizer::bos`] returns EOS; encoding remains unaffected.
     pub fn from_files(tokenizer_json: &Path, tokenizer_config: &Path) -> Result<Self, NnError> {
-        let inner = InnerTokenizer::from_file(tokenizer_json)
-            .map_err(|error| NnError::Tokenizer(format!("load tokenizer.json: {error}")))?;
+        let tokenizer_bytes = std::fs::read(tokenizer_json)
+            .map_err(|error| NnError::Tokenizer(format!("read tokenizer.json: {error}")))?;
         let config_bytes = std::fs::read(tokenizer_config)
             .map_err(|error| NnError::Tokenizer(format!("read tokenizer_config.json: {error}")))?;
-        let config: Value = serde_json::from_slice(&config_bytes)
+        Self::from_bytes(&tokenizer_bytes, &config_bytes)
+    }
+
+    /// Parse already-authenticated tokenizer assets without reopening paths.
+    pub fn from_bytes(tokenizer_json: &[u8], tokenizer_config: &[u8]) -> Result<Self, NnError> {
+        let inner = InnerTokenizer::from_bytes(tokenizer_json)
+            .map_err(|error| NnError::Tokenizer(format!("load tokenizer.json: {error}")))?;
+        let config: Value = serde_json::from_slice(tokenizer_config)
             .map_err(|error| NnError::Tokenizer(format!("parse tokenizer_config.json: {error}")))?;
         let object = config
             .as_object()

@@ -88,8 +88,13 @@ implements bounded greedy/top-k/top-p decode plus logprobs; the only public
 admission function derives both generator and receipt from the same model
 value, closing artifact/generator substitution. Strict `tokenizer.json` plus
 `tokenizer_config.json` loading and Qwen `<|im_start|>` chat rendering now exist
-without implicit BOS injection. Main-binary schema-v3 CLI wiring and real
-CPU/CUDA fixtures remain open. Until those exist,
+without implicit BOS injection. Main CLI now accepts exactly one strict
+`--bundle DIR --profile ...` or legacy `--model GGUF`, rejects unsupported
+strict-mode combinations and unknown arguments, parses tokenizer bytes retained
+by the authenticated load transaction, and invokes the production router with
+clean compile-time source plus physical backend identity. Container/chart
+profiles still target legacy single-file mounts and must switch to a safely
+staged bundle; real CPU/CUDA fixtures remain open. Until those gates pass,
 the production builder is a hardened seam, not release-gate evidence.
 
 ## Slice 2 — request security and resource governance
