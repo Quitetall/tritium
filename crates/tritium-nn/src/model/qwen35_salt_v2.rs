@@ -532,6 +532,24 @@ impl Qwen35SaltV2LanguageMtpModel {
         Self::load_bundle_profile_with_policy(bundle_dir, profile, backend, true)
     }
 
+    /// Load a small non-pinned bundle for cross-crate integration tests.
+    ///
+    /// This API exists only with the `test-fixtures` feature and never changes
+    /// the strict production constructor or its pinned Qwen3.6-27B policy.
+    ///
+    /// # Errors
+    /// Returns the same structural, provenance, geometry, and backend errors as
+    /// [`Self::load_bundle_profile`].
+    #[cfg(feature = "test-fixtures")]
+    #[doc(hidden)]
+    pub fn load_bundle_profile_test_fixture(
+        bundle_dir: &Path,
+        profile: &str,
+        backend: Box<dyn TernaryBackend>,
+    ) -> Result<Self, NnError> {
+        Self::load_bundle_profile_with_policy(bundle_dir, profile, backend, false)
+    }
+
     fn load_bundle_profile_with_policy(
         bundle_dir: &Path,
         profile: &str,

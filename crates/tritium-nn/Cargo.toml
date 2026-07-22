@@ -57,6 +57,8 @@ default = []
 cuda = ["dep:tritium-cuda", "tritium-cuda/cuda"]
 # Real text tokenization (GGUF-embedded byte-level BPE via the `tokenizers` crate).
 tokenizer = ["dep:tokenizers"]
+# Small non-pinned Qwen bundle fixtures used only by cross-crate integration tests.
+test-fixtures = []
 
 [lints]
 workspace = true

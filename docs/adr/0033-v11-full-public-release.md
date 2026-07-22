@@ -449,6 +449,19 @@ authoritative completion/master/package lineage, and re-execute before it can
 mint an admitted execution receipt. Caller-provided logits, candidate labels,
 backend identities, or lower transcript bytes never mint campaign provenance.
 
+That SALT-owned record is canonical `TSQ36EX` v1 evidence. A live package-
+admission capability reconstructs the deterministic preserved companion,
+constructs only Tritium's built-in CPU or CUDA backend, strictly loads the exact
+selected profile, and verifies the declared source, completion, campaign,
+selection and admission lineage against authoritative campaign state. The
+receipt binds those identities plus the aggregate ordered master set, exact
+matrix and preserved packages, manifest/config identities, backend capability
+and physical-device claims, token stream, final logits and explicit scope/count
+coverage. It currently admits final-position logits only; block output remains
+absent. Reopen recreates the sealed session and re-executes. Consistently
+rewriting a substituted bundle manifest cannot change the campaign's package or
+preserved authority.
+
 Multi-device admission uses
 `tritium.hf-distributed-qualification.v1`. The validator requires ordered DDP
 and FSDP NCCL/fp16 runs on two distinct physical GPU UUIDs, exact checkpoint

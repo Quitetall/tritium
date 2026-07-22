@@ -1,5 +1,12 @@
 //! Exact SALT V2 package admission over a durable nested allocation.
 
+mod execution;
+
+pub use execution::{
+    Qwen36AdmittedExecutionReceipt, Qwen36AdmittedExecutionSession, Qwen36ExecutionBackend,
+    Qwen36ExecutionReplayError, Qwen36ExecutionSessionOpenError, Qwen36ExecutionVisitError,
+};
+
 use core::fmt;
 use std::{
     error::Error,

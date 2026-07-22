@@ -83,9 +83,22 @@ coverage and duplicate-plugin tests.
     admitted campaign receipt.
     Expected output: `cargo test -p tritium-nn
     complete_bundle_loads_and_executes_language` passes.
-  - The runtime must derive student-output bytes from the sealed master/package
-    handle and emit an execution receipt binding completion ID, master-set ID,
-    runtime/backend identity and student-output digest.
+  - [x] Second vertical slice: the SALT package-admission capability constructs
+    a built-in CPU/CUDA backend internally, reconstructs the authoritative
+    preserved companion, strictly loads the selected package, and emits
+    canonical `TSQ36EX` v1 evidence binding completion/campaign/admission/
+    selection/source IDs, ordered master-set ID, exact package/preserved/
+    manifest/config IDs, backend capabilities and physical identity, tokens,
+    final logits and explicit scope/count coverage. Reopen re-executes; no
+    caller backend, raw-logit or lower-transcript promotion seam exists.
+    Forged lineage, consistently relabeled preserved substitution, changed
+    tokens and corrupt replay evidence fail closed. Expected output: `cargo test
+    -p tritium-salt
+    admitted_qwen_execution_binds_campaign_packages_backend_tokens_and_outputs`
+    passes. This structural test uses an explicitly test-only small, non-pinned
+    Qwen configuration; successful production construction through the pinned
+    Qwen3.6-27B loader remains part of the checkpoint-scale evidence item below
+    and is not yet qualified.
   - The driver may then admit `TSV2OUT` only when its selected student digest and
     the runtime execution receipt agree. Label equality alone must fail closed.
   - Add public-seam honest-execution, relabeling, corruption and strict-reopen

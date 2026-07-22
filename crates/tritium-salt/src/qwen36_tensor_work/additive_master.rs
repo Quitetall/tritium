@@ -3,7 +3,9 @@
 mod selected_allocation;
 
 pub use selected_allocation::{
-    Qwen36AllocatedCampaignStore, Qwen36PackageAdmissionError, Qwen36PackageAdmissionReceipt,
+    Qwen36AdmittedExecutionReceipt, Qwen36AdmittedExecutionSession, Qwen36AllocatedCampaignStore,
+    Qwen36ExecutionBackend, Qwen36ExecutionReplayError, Qwen36ExecutionSessionOpenError,
+    Qwen36ExecutionVisitError, Qwen36PackageAdmissionError, Qwen36PackageAdmissionReceipt,
     Qwen36PackageAdmittedCampaignStore, Qwen36PackageProfileReceipt, Qwen36PackageRuntimeLedger,
     Qwen36PackageScaleOnlyCampaignStore, Qwen36PackageVisitError, Qwen36PhysicalAllocationError,
     Qwen36SelectedAllocationBindError, Qwen36SelectedAllocationReceipt,
@@ -2491,14 +2493,18 @@ mod tests {
             SaltV2Transform, SaltV2UniformRateModel, write_salt_v2_package,
         },
     };
-    use tritium_nn::{NnError, Qwen35TensorStreamError};
+    use tritium_nn::{
+        NnError, QWEN36_27B_REVISION, Qwen35CheckpointConfig, Qwen35TensorSchemaRole,
+        Qwen35TensorStreamError, qwen35_language_mtp_tensor_schema,
+    };
     use tritium_quantize::{
         ByteDelta, NestedProfileBudgets, PhysicalBytes, ProfileBudget, Qwen35SourceDtype,
         Qwen35TensorRole, Qwen35TensorScope, SaltV2Profile,
     };
 
     use super::super::{
-        PreservedTensorSource, Qwen36AdditiveSlotState, Qwen36AdditiveWorkSlot, WorkspacePlan,
+        PreservedPlanEntry, PreservedTensorSource, Qwen36AdditiveSlotState, Qwen36AdditiveWorkSlot,
+        WorkspacePlan,
     };
     use super::*;
 
@@ -2570,6 +2576,598 @@ mod tests {
             ],
             preserved: Vec::new(),
         }
+    }
+
+    #[derive(Debug)]
+    struct QwenExecutionFixtureTensor {
+        name: String,
+        shape: Vec<u64>,
+        payload: Vec<u8>,
+    }
+
+    #[derive(Debug)]
+    struct QwenExecutionFixtureSource {
+        tensors: Vec<QwenExecutionFixtureTensor>,
+    }
+
+    impl PreservedTensorSource for QwenExecutionFixtureSource {
+        fn try_visit_tensor_bytes(
+            &self,
+            name: &str,
+            max_chunk_bytes: usize,
+            visit: &mut dyn FnMut(&[u8]) -> io::Result<()>,
+        ) -> Result<u64, Qwen35TensorStreamError<io::Error>> {
+            if max_chunk_bytes == 0 {
+                return Err(Qwen35TensorStreamError::Source(NnError::Backend(
+                    "zero fixture chunk size".to_owned(),
+                )));
+            }
+            let tensor = self
+                .tensors
+                .iter()
+                .find(|tensor| tensor.name == name)
+                .ok_or_else(|| {
+                    Qwen35TensorStreamError::Source(NnError::MissingTensor(name.to_owned()))
+                })?;
+            for chunk in tensor.payload.chunks(max_chunk_bytes) {
+                visit(chunk).map_err(Qwen35TensorStreamError::Sink)?;
+            }
+            u64::try_from(tensor.payload.len()).map_err(|_| {
+                Qwen35TensorStreamError::Source(NnError::ResourceExhausted(
+                    "fixture tensor exceeds u64".to_owned(),
+                ))
+            })
+        }
+
+        fn source_tensor_semantic_hasher(
+            &self,
+            name: &str,
+        ) -> Result<SemanticTensorHasher, NnError> {
+            let tensor = self
+                .tensors
+                .iter()
+                .find(|tensor| tensor.name == name)
+                .ok_or_else(|| NnError::MissingTensor(name.to_owned()))?;
+            Ok(SemanticTensorHasher::new(
+                tensor.name.clone(),
+                tensor.shape.clone(),
+            ))
+        }
+    }
+
+    fn qwen_execution_config_json() -> String {
+        serde_json::json!({
+            "architectures": ["Qwen3_5ForConditionalGeneration"],
+            "language_model_only": false,
+            "model_type": "qwen3_5",
+            "text_config": {
+                "attention_bias": false,
+                "attention_dropout": 0.0,
+                "attn_output_gate": true,
+                "dtype": "bfloat16",
+                "full_attention_interval": 2,
+                "head_dim": 64,
+                "hidden_act": "silu",
+                "hidden_size": 128,
+                "intermediate_size": 128,
+                "layer_types": ["linear_attention", "full_attention"],
+                "linear_conv_kernel_dim": 4,
+                "linear_key_head_dim": 64,
+                "linear_num_key_heads": 1,
+                "linear_num_value_heads": 2,
+                "linear_value_head_dim": 64,
+                "mamba_ssm_dtype": "float32",
+                "max_position_embeddings": 32,
+                "model_type": "qwen3_5_text",
+                "mtp_num_hidden_layers": 1,
+                "mtp_use_dedicated_embeddings": false,
+                "num_attention_heads": 2,
+                "num_hidden_layers": 2,
+                "num_key_value_heads": 1,
+                "output_gate_type": "swish",
+                "partial_rotary_factor": 0.5,
+                "rms_norm_eps": 1e-6,
+                "rope_parameters": {
+                    "mrope_interleaved": true,
+                    "mrope_section": [8, 4, 4],
+                    "partial_rotary_factor": 0.5,
+                    "rope_theta": 10000.0,
+                    "rope_type": "default"
+                },
+                "tie_word_embeddings": false,
+                "use_cache": true,
+                "vocab_size": 128
+            },
+            "tie_word_embeddings": false,
+            "vision_config": {"model_type": "qwen3_5"}
+        })
+        .to_string()
+    }
+
+    fn qwen_execution_source_and_plan(
+        config: &Qwen35CheckpointConfig,
+    ) -> (QwenExecutionFixtureSource, WorkspacePlan) {
+        let schema = qwen35_language_mtp_tensor_schema(&config.text).unwrap();
+        let source_model_id = ModelId::from_digest([111; 32]);
+        let mut tensors = Vec::new();
+        let mut additive = Vec::new();
+        let mut preserved = Vec::new();
+        let mut active_coefficients = 0_u64;
+        let mut preserved_coefficients = 0_u64;
+        let mut preserved_payload_bytes = 0_u64;
+
+        for entry in schema {
+            let shape = entry
+                .shape
+                .iter()
+                .map(|dimension| u64::try_from(*dimension).unwrap())
+                .collect::<Vec<_>>();
+            let coefficients = shape
+                .iter()
+                .try_fold(1_u64, |product, dimension| product.checked_mul(*dimension));
+            let coefficients = coefficients.unwrap();
+            active_coefficients += coefficients;
+            let scope = if entry.name.starts_with("mtp.") {
+                Qwen35TensorScope::MtpDrafter
+            } else {
+                Qwen35TensorScope::Language
+            };
+            match entry.role {
+                Qwen35TensorSchemaRole::Matrix => {
+                    let source_digest = *ContentId::of_bytes(entry.name.as_bytes()).as_bytes();
+                    additive.push(Qwen36AdditiveWorkSlot {
+                        name: entry.name,
+                        dtype: Qwen35SourceDtype::Bfloat16,
+                        shape,
+                        coefficients,
+                        scope,
+                        role: if scope == Qwen35TensorScope::MtpDrafter {
+                            Qwen35TensorRole::MtpFusionProjection
+                        } else {
+                            Qwen35TensorRole::MlpProjection
+                        },
+                        source_tensor_digest: source_digest,
+                        state: Qwen36AdditiveSlotState::MissingCanonicalMaster,
+                    });
+                }
+                Qwen35TensorSchemaRole::Preserved => {
+                    let payload_len =
+                        usize::try_from(coefficients.checked_mul(2).unwrap()).unwrap();
+                    let payload = vec![0; payload_len];
+                    let mut semantic = SemanticTensorHasher::new(entry.name.clone(), shape.clone());
+                    semantic.update(&payload);
+                    let semantic = semantic.finalize().unwrap();
+                    preserved.push(PreservedPlanEntry {
+                        spec: TensorRecordSpec::new(
+                            ContentId::of_bytes(b"Qwen execution preserved fixture schema"),
+                            source_model_id,
+                            *semantic.content_digest(),
+                            entry.name.clone(),
+                            shape.clone(),
+                            b"Qwen execution preserved fixture metadata".to_vec(),
+                            payload.len() as u64,
+                        )
+                        .unwrap(),
+                    });
+                    preserved_coefficients += coefficients;
+                    preserved_payload_bytes += payload.len() as u64;
+                    tensors.push(QwenExecutionFixtureTensor {
+                        name: entry.name,
+                        shape,
+                        payload,
+                    });
+                }
+            }
+        }
+
+        let summary = Qwen36TensorWorkSummary {
+            active_tensors: u64::try_from(additive.len() + preserved.len()).unwrap(),
+            additive_required: u64::try_from(additive.len()).unwrap(),
+            additive_present: 0,
+            preserved_tensors: u64::try_from(preserved.len()).unwrap(),
+            deferred_vision_tensors: 0,
+            active_coefficients,
+            preserved_coefficients,
+            preserved_payload_bytes,
+        };
+        (
+            QwenExecutionFixtureSource { tensors },
+            WorkspacePlan {
+                proof_id: ContentId::of_bytes(b"Qwen execution fixture proof"),
+                manifest_content_id: ContentId::of_bytes(b"Qwen execution fixture manifest"),
+                source_model_id,
+                coverage_policy_digest: [112; 32],
+                identity_status: Qwen36SourceIdentityStatus::MeasuredAwaitingOfficialRegistration,
+                summary,
+                additive,
+                preserved,
+            },
+        )
+    }
+
+    fn qwen_execution_campaign_spec(plan: &WorkspacePlan) -> Qwen36AdditiveCampaignSpec {
+        let masters = plan
+            .additive
+            .iter()
+            .enumerate()
+            .map(|(ordinal, slot)| {
+                SaltV2MasterTensorSpec::new(
+                    slot.name.clone(),
+                    slot.shape.clone(),
+                    plan.source_model_id,
+                    slot.source_tensor_digest,
+                    *ContentId::of_bytes(format!("{} widened", slot.name).as_bytes()).as_bytes(),
+                    u64::try_from(ordinal).unwrap(),
+                    SaltV2MasterEvidence {
+                        recipe_id: [113; 32],
+                        solver_id: [114; 32],
+                        activation_digest: [115; 32],
+                        curvature_digest: *ContentId::of_bytes(
+                            format!("{} curvature", slot.name).as_bytes(),
+                        )
+                        .as_bytes(),
+                        feedback_digest: None,
+                        track: SaltV2MasterTrack::Ptq,
+                        parent_master_id: None,
+                    },
+                    SaltV2MasterGeometry {
+                        constraint: SaltV2FitConstraint::Dense,
+                        max_planes: 2,
+                    },
+                )
+                .unwrap()
+            })
+            .collect();
+        Qwen36AdditiveCampaignSpec::new(masters).unwrap()
+    }
+
+    fn write_qwen_execution_master(
+        spec: &SaltV2MasterTensorSpec,
+        writer: &mut TensorPayloadWriter<'_>,
+    ) -> Result<(), SaltV2MasterError> {
+        let losses = [
+            SaltV2PrefixLoss::new(1.0, 1.0)?,
+            SaltV2PrefixLoss::new(0.5, 0.5)?,
+        ];
+        let coefficients = spec
+            .shape()
+            .iter()
+            .try_fold(1_u64, |product, dimension| product.checked_mul(*dimension))
+            .unwrap();
+        let mut remaining = usize::try_from(coefficients).unwrap();
+        let mut encoder = SaltV2MasterTensorEncoder::new(spec, writer)?;
+        while remaining != 0 {
+            let logical_len = remaining.min(256);
+            let plane = SaltV2Plane::new(
+                vec![0; logical_len],
+                vec![f16::ZERO; logical_len.div_ceil(128)],
+            )?;
+            encoder.write_tile(1, &losses, &[plane.clone(), plane])?;
+            remaining -= logical_len;
+        }
+        encoder.finish()?;
+        Ok(())
+    }
+
+    fn qwen_execution_selection_spec(
+        campaign: &Qwen36AdditiveCampaignSpec,
+    ) -> Qwen36SelectedAllocationSpec {
+        let streams = campaign
+            .expected_masters()
+            .iter()
+            .map(|master| {
+                SaltV2StreamTensorSpec::new(
+                    master.name(),
+                    master.shape().to_vec(),
+                    SaltV2Transform::None,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let rate = SaltV2UniformRateModel::new(SaltV2Codec::B3, &streams).unwrap();
+        let one_plane = rate.physical_bytes(rate.tile_count()).unwrap();
+        Qwen36SelectedAllocationSpec::for_uniform_full_tiles(
+            SaltV2Codec::B3,
+            [116; 32],
+            [117; 32],
+            campaign.expected_masters(),
+            PhysicalBytes {
+                serialized: one_plane.serialized,
+                resident: one_plane.resident,
+            },
+            PhysicalBytes {
+                serialized: one_plane.serialized,
+                resident: one_plane.resident,
+            },
+        )
+        .unwrap()
+    }
+
+    fn write_qwen_execution_bundle(
+        bundle: &Path,
+        config_json: &str,
+        base: &Qwen36TensorWorkStore<'_>,
+        completion: &Qwen36CompleteWorkspaceReceipt,
+        admitted: &Qwen36PackageAdmittedCampaignStore<'_, '_, '_, '_>,
+    ) -> serde_json::Value {
+        fs::create_dir_all(bundle).expect("create Qwen execution bundle");
+        let mut compact = Vec::new();
+        admitted
+            .try_visit_package(SaltV2Profile::CompactV1, 64 * 1024, |chunk| {
+                compact.extend_from_slice(chunk);
+                Ok::<_, Infallible>(())
+            })
+            .expect("export compact package");
+        let mut near_lossless = Vec::new();
+        admitted
+            .try_visit_package(SaltV2Profile::NearLosslessV1, 64 * 1024, |chunk| {
+                near_lossless.extend_from_slice(chunk);
+                Ok::<_, Infallible>(())
+            })
+            .expect("export near-lossless package");
+        fs::write(bundle.join("compact.tsalt2"), &compact).expect("write compact package");
+        fs::write(bundle.join("near-lossless.tsalt2"), &near_lossless)
+            .expect("write near-lossless package");
+
+        let mut preserved = Vec::new();
+        let preserved_receipt = base
+            .try_write_preserved_safetensors(64 * 1024, |chunk| {
+                preserved.extend_from_slice(chunk);
+                Ok::<_, Infallible>(())
+            })
+            .expect("export preserved companion");
+        fs::write(bundle.join("preserved.safetensors"), &preserved)
+            .expect("write preserved companion");
+
+        let mut hf_assets = Vec::new();
+        for file in [
+            "chat_template.jinja",
+            "config.json",
+            "configuration.json",
+            "generation_config.json",
+            "merges.txt",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "vocab.json",
+        ] {
+            let bytes = if file == "config.json" {
+                config_json.as_bytes()
+            } else {
+                b"{}"
+            };
+            fs::write(bundle.join(file), bytes).expect("write HF asset");
+            hf_assets.push(serde_json::json!({
+                "file": file,
+                "package_id": PackageId::from_package_bytes(bytes).to_string(),
+                "bytes": u64::try_from(bytes.len()).unwrap(),
+            }));
+        }
+
+        let compact_receipt = admitted.receipt().compact();
+        let near_receipt = admitted.receipt().near_lossless();
+        let manifest = serde_json::json!({
+            "schema_version": 3,
+            "artifact_kind": "qwen3.6-language-mtp-salt-v2-hf-bundle",
+            "complete_model": false,
+            "packing": "b3",
+            "completion_id": completion.completion_id().to_string(),
+            "campaign_id": completion.campaign_id().to_string(),
+            "admission_id": admitted.receipt().admission_id().to_string(),
+            "selection_id": admitted.receipt().selection_id().to_string(),
+            "source_model_id": completion.source_model_id().to_string(),
+            "source_revision": QWEN36_27B_REVISION,
+            "source_identity_status": completion.identity_status().as_str(),
+            "official_payload_authenticated": completion
+                .identity_status()
+                .official_payload_authenticated(),
+            "preserved": {
+                "file": "preserved.safetensors",
+                "package_id": preserved_receipt.package_id().to_string(),
+                "tensors": preserved_receipt.tensor_count(),
+                "payload_bytes": preserved_receipt.payload_bytes(),
+                "serialized_bytes": preserved_receipt.total_bytes(),
+            },
+            "hf_assets": hf_assets,
+            "profiles": {
+                "compact-v1": {
+                    "file": "compact.tsalt2",
+                    "package_id": compact_receipt.package_id().to_string(),
+                    "serialized_bytes": compact_receipt.package_ledger().total_bytes,
+                    "resident_bytes": compact_receipt.runtime_ledger().steady_resident_bytes(),
+                },
+                "near-lossless-v1": {
+                    "file": "near-lossless.tsalt2",
+                    "package_id": near_receipt.package_id().to_string(),
+                    "serialized_bytes": near_receipt.package_ledger().total_bytes,
+                    "resident_bytes": near_receipt.runtime_ledger().steady_resident_bytes(),
+                },
+            },
+        });
+        fs::write(
+            bundle.join("tritium.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .expect("write Qwen bundle manifest");
+        manifest
+    }
+
+    #[test]
+    fn admitted_qwen_execution_binds_campaign_packages_backend_tokens_and_outputs() {
+        let root = fixture_root("admitted-execution");
+        let _ = fs::remove_dir_all(&root);
+        let config_json = qwen_execution_config_json();
+        let config = Qwen35CheckpointConfig::from_hf_config(&config_json).unwrap();
+        let (source, plan) = qwen_execution_source_and_plan(&config);
+        let base =
+            Qwen36TensorWorkStore::open_from_parts(&source, root.join("workspace"), plan.clone())
+                .expect("open Qwen execution workspace");
+        base.reconcile_preserved()
+            .expect("seal Qwen preserved tensors");
+        let campaign_spec = qwen_execution_campaign_spec(&plan);
+        let parent = base
+            .open_master_campaign(campaign_spec.clone())
+            .expect("open Qwen execution campaign");
+        for expected in campaign_spec.expected_masters() {
+            parent
+                .install_master(expected, |writer| {
+                    write_qwen_execution_master(expected, writer)
+                })
+                .expect("install Qwen execution master");
+        }
+        let completion = parent
+            .seal_complete()
+            .expect("seal Qwen execution campaign");
+        let allocated = parent
+            .allocate_selected_allocation(qwen_execution_selection_spec(&campaign_spec))
+            .expect("allocate Qwen execution packages");
+        let admitted = allocated
+            .materialize_and_admit_packages()
+            .expect("admit Qwen execution packages");
+        let bundle = root.join("bundle");
+        let manifest =
+            write_qwen_execution_bundle(&bundle, &config_json, &base, &completion, &admitted);
+
+        let mut forged_manifest = manifest.clone();
+        forged_manifest["completion_id"] = serde_json::Value::String("forged".to_owned());
+        fs::write(
+            bundle.join("tritium.json"),
+            serde_json::to_vec(&forged_manifest).unwrap(),
+        )
+        .expect("write forged lineage");
+        assert!(matches!(
+            admitted.open_cpu_execution_session_test_fixture(&bundle, SaltV2Profile::CompactV1),
+            Err(Qwen36ExecutionSessionOpenError::Runtime(
+                NnError::Provenance(_)
+            ))
+        ));
+        fs::write(
+            bundle.join("tritium.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .expect("restore authoritative lineage");
+
+        let preserved_path = bundle.join("preserved.safetensors");
+        let preserved = fs::read(&preserved_path).expect("read preserved companion");
+        let mut substituted = preserved.clone();
+        let last = substituted
+            .last_mut()
+            .expect("nonempty preserved companion");
+        *last ^= 1;
+        fs::write(&preserved_path, &substituted).expect("substitute preserved bytes");
+        let mut substituted_manifest = manifest.clone();
+        substituted_manifest["preserved"]["package_id"] =
+            serde_json::Value::String(PackageId::from_package_bytes(&substituted).to_string());
+        fs::write(
+            bundle.join("tritium.json"),
+            serde_json::to_vec(&substituted_manifest).unwrap(),
+        )
+        .expect("declare substituted preserved bytes");
+        assert!(matches!(
+            admitted.open_cpu_execution_session_test_fixture(&bundle, SaltV2Profile::CompactV1),
+            Err(Qwen36ExecutionSessionOpenError::Runtime(
+                NnError::Provenance(_)
+            ))
+        ));
+        fs::write(&preserved_path, &preserved).expect("restore preserved companion");
+        fs::write(
+            bundle.join("tritium.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .expect("restore authoritative manifest");
+
+        let session = admitted
+            .open_cpu_execution_session_test_fixture(&bundle, SaltV2Profile::CompactV1)
+            .expect("open sealed CPU execution session");
+        let first = [1_u32, 2];
+        let second = [3_u32];
+        let mut observed = 0_u64;
+        let receipt = session
+            .try_visit_final_logits([first.as_slice(), second.as_slice()], |batch| {
+                assert_eq!(batch.batch_index(), observed);
+                assert_eq!(batch.logits().len(), 128);
+                assert!(batch.logits().iter().all(|value| value.is_finite()));
+                observed += 1;
+                Ok::<_, Infallible>(())
+            })
+            .expect("execute admitted final logits");
+        assert_eq!(observed, 2);
+        assert_eq!(receipt.completion_id(), completion.completion_id());
+        assert_eq!(receipt.master_set_id(), &completion.master_set_id());
+        assert_eq!(
+            receipt.package_admission_id(),
+            admitted.receipt().admission_id()
+        );
+        assert_eq!(receipt.profile(), SaltV2Profile::CompactV1);
+        assert_eq!(receipt.backend(), Qwen36ExecutionBackend::Cpu);
+        assert!(!receipt.physical_device_id().is_empty());
+        assert!(receipt.has_final_logits());
+        assert!(!receipt.has_block_outputs());
+        assert_eq!(receipt.batch_count(), 2);
+        assert_eq!(receipt.token_count(), 3);
+        assert_eq!(receipt.logit_count(), 256);
+
+        let canonical = receipt.canonical_bytes().expect("encode admitted receipt");
+        let changed = [1_u32, 3];
+        let changed_receipt = session
+            .try_visit_final_logits([changed.as_slice(), second.as_slice()], |_| {
+                Ok::<_, Infallible>(())
+            })
+            .expect("execute changed tokens");
+        assert_ne!(
+            changed_receipt.token_stream_digest(),
+            receipt.token_stream_digest()
+        );
+        assert_ne!(changed_receipt.receipt_id(), receipt.receipt_id());
+        drop(session);
+
+        let replay = admitted
+            .reexecute_cpu_final_logits_test_fixture(
+                &bundle,
+                SaltV2Profile::CompactV1,
+                [first.as_slice(), second.as_slice()],
+                &canonical,
+                |_| Ok::<_, Infallible>(()),
+            )
+            .expect("reopen and reexecute exact admitted receipt");
+        assert_eq!(replay, receipt);
+
+        fs::remove_file(bundle.join("config.json")).expect("remove execution config");
+        assert!(matches!(
+            admitted.reexecute_cpu_final_logits_test_fixture(
+                &bundle,
+                SaltV2Profile::CompactV1,
+                [first.as_slice(), second.as_slice()],
+                &canonical,
+                |_| Ok::<_, Infallible>(())
+            ),
+            Err(Qwen36ExecutionReplayError::Open(
+                Qwen36ExecutionSessionOpenError::Runtime(_)
+            ))
+        ));
+        fs::write(bundle.join("config.json"), config_json.as_bytes())
+            .expect("restore execution config");
+
+        let mut corrupt_canonical = canonical;
+        corrupt_canonical[0] ^= 1;
+        assert!(matches!(
+            admitted.reexecute_cpu_final_logits_test_fixture(
+                &bundle,
+                SaltV2Profile::CompactV1,
+                [first.as_slice(), second.as_slice()],
+                &corrupt_canonical,
+                |_| Ok::<_, Infallible>(())
+            ),
+            Err(Qwen36ExecutionReplayError::Execute(
+                Qwen36ExecutionVisitError::Runtime(NnError::Provenance(_))
+            ))
+        ));
+
+        drop(admitted);
+        drop(allocated);
+        drop(parent);
+        drop(base);
+        drop(source);
+        let _ = fs::remove_dir_all(root);
     }
 
     fn fixture_master(
@@ -3614,6 +4212,15 @@ mod tests {
         let admitted = allocated
             .admit_packages(Cursor::new(compact), Cursor::new(near))
             .expect("admit exact selected packages");
+        assert!(matches!(
+            admitted.open_cpu_execution_session(
+                &root.join("missing-execution-bundle"),
+                SaltV2Profile::CompactV1,
+            ),
+            Err(Qwen36ExecutionSessionOpenError::Runtime(
+                NnError::InvalidArtifact(_)
+            ))
+        ));
         assert_eq!(
             admitted.receipt().selection_id(),
             allocated.receipt().selection_id()

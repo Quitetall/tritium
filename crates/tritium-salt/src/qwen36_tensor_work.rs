@@ -9,7 +9,9 @@ mod ptq_driver;
 
 pub use additive_master::{
     Qwen36AdditiveCampaignSpec, Qwen36AdditiveCampaignStore, Qwen36AdditiveInstallError,
-    Qwen36AdditiveMasterReceipt, Qwen36AllocatedCampaignStore, Qwen36CompleteWorkspaceReceipt,
+    Qwen36AdditiveMasterReceipt, Qwen36AdmittedExecutionReceipt, Qwen36AdmittedExecutionSession,
+    Qwen36AllocatedCampaignStore, Qwen36CompleteWorkspaceReceipt, Qwen36ExecutionBackend,
+    Qwen36ExecutionReplayError, Qwen36ExecutionSessionOpenError, Qwen36ExecutionVisitError,
     Qwen36PackageAdmissionError, Qwen36PackageAdmissionReceipt, Qwen36PackageAdmittedCampaignStore,
     Qwen36PackageProfileReceipt, Qwen36PackageRuntimeLedger, Qwen36PackageScaleOnlyCampaignStore,
     Qwen36PackageVisitError, Qwen36PhysicalAllocationError, Qwen36ScaleOnlyCampaignStore,

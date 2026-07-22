@@ -97,6 +97,18 @@ impl Qwen35UntrustedRuntimeTranscript {
         &self.package_id
     }
 
+    /// Exact preserved-companion package executed by the runtime.
+    #[must_use]
+    pub fn preserved_package_id(&self) -> &str {
+        &self.preserved_package_id
+    }
+
+    /// Exact execution-configuration package loaded by the runtime.
+    #[must_use]
+    pub fn config_package_id(&self) -> &str {
+        &self.config_package_id
+    }
+
     /// Exact bundle-manifest identity validated before model assembly.
     #[must_use]
     pub fn manifest_package_id(&self) -> &str {
