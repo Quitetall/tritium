@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import runpy
 import shutil
+import subprocess
 import tempfile
 from typing import Any
 
@@ -27,6 +28,7 @@ canonical = REPRODUCTION["canonical"]
 sha256 = REPRODUCTION["sha256"]
 candidate_artifacts = REPRODUCTION["candidate_artifacts"]
 validate_receipt = REPRODUCTION["validate_independent_review"]
+REVIEW_SIGNATURE_NAMESPACE = REPRODUCTION["REVIEW_SIGNATURE_NAMESPACE"]
 
 STATUS = runpy.run_path(Path(__file__).with_name("release-evidence-status.py"))
 REGISTRY_SCHEMA = STATUS["SCHEMA"]
@@ -170,9 +172,34 @@ def validate_attestation(
     return attestation
 
 
+def verify_signature(
+    attestation_path: Path, signature_path: Path, policy_path: Path,
+    principal: str,
+) -> None:
+    attestation_path = ordinary(attestation_path, "review attestation")
+    signature_path = ordinary(signature_path, "review signature")
+    policy_path = ordinary(policy_path, "reviewer signer policy")
+    string(principal, "review signer principal")
+    try:
+        result = subprocess.run(
+            [
+                "ssh-keygen", "-Y", "verify", "-f", str(policy_path),
+                "-I", principal, "-n", REVIEW_SIGNATURE_NAMESPACE,
+                "-s", str(signature_path),
+            ],
+            input=attestation_path.read_bytes(), capture_output=True,
+            check=False, timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise QualificationError("independent review signature verifier failed") from error
+    if result.returncode != 0:
+        raise QualificationError("independent review signature is not trusted")
+
+
 def assemble(
     stage: Path, *, candidate: Path, anchor: Path, registry_path: Path,
-    attestation_path: Path, source_revision: str, release: str, digest_tool: str,
+    attestation_path: Path, signature_path: Path, policy_path: Path,
+    signer_principal: str, source_revision: str, release: str, digest_tool: str,
 ) -> dict[str, Any]:
     candidate = ordinary(candidate, "candidate manifest")
     anchor = ordinary(anchor, "anchor wheel")
@@ -187,11 +214,18 @@ def assemble(
         attestation_path, revision=source_revision, release=release,
         candidate=candidate, reviewed_ids=reviewed_ids, scope_sha256=scope_sha256,
     )
+    verify_signature(
+        attestation_path, signature_path, policy_path, signer_principal
+    )
     stage.mkdir()
     support = stage / "support"
     support.mkdir()
     retained = support / "review-attestation.json"
     shutil.copyfile(ordinary(attestation_path, "review attestation"), retained)
+    retained_signature = support / "review-attestation.json.sig"
+    retained_policy = support / "trusted-reviewers.allowed_signers"
+    shutil.copyfile(ordinary(signature_path, "review signature"), retained_signature)
+    shutil.copyfile(ordinary(policy_path, "reviewer signer policy"), retained_policy)
     receipt: dict[str, Any] = {
         **{field: attestation[field] for field in REVIEW_ATTESTATION_FIELDS - {"schema"}},
         "schema": REVIEW_SCHEMA, "result": "pass",
@@ -200,6 +234,18 @@ def assemble(
             "path": retained.relative_to(stage).as_posix(),
             "bytes": retained.stat().st_size, "sha256": sha256(retained),
         },
+        "review_signature": {
+            "path": retained_signature.relative_to(stage).as_posix(),
+            "bytes": retained_signature.stat().st_size,
+            "sha256": sha256(retained_signature),
+        },
+        "signer_policy": {
+            "path": retained_policy.relative_to(stage).as_posix(),
+            "bytes": retained_policy.stat().st_size,
+            "sha256": sha256(retained_policy),
+        },
+        "signer_principal": signer_principal,
+        "signature_namespace": REVIEW_SIGNATURE_NAMESPACE,
     }
     receipt["receipt_id"] = "sha256:" + hashlib.sha256(canonical(receipt)).hexdigest()
     receipt_path = stage / "receipt.json"
@@ -210,7 +256,8 @@ def assemble(
 
 def qualify(
     output_dir: Path, *, candidate: Path, anchor: Path, registry_path: Path,
-    attestation_path: Path, source_revision: str, release: str, digest_tool: str,
+    attestation_path: Path, signature_path: Path, policy_path: Path,
+    signer_principal: str, source_revision: str, release: str, digest_tool: str,
 ) -> dict[str, Any]:
     if output_dir.exists() or output_dir.is_symlink():
         raise QualificationError(f"output directory already exists: {output_dir}")
@@ -220,7 +267,9 @@ def qualify(
     try:
         receipt = assemble(
             stage, candidate=candidate, anchor=anchor, registry_path=registry_path,
-            attestation_path=attestation_path, source_revision=source_revision,
+            attestation_path=attestation_path, signature_path=signature_path,
+            policy_path=policy_path, signer_principal=signer_principal,
+            source_revision=source_revision,
             release=release, digest_tool=digest_tool,
         )
         os.replace(stage, output_dir)
@@ -235,6 +284,12 @@ def main() -> int:
     parser.add_argument("--anchor-wheel", type=Path, required=True)
     parser.add_argument("--registry", type=Path, required=True)
     parser.add_argument("--attestation", type=Path, required=True)
+    parser.add_argument("--signature", type=Path, required=True)
+    parser.add_argument(
+        "--signer-policy", type=Path,
+        default=Path("release/trusted-reviewers-v1.1.allowed_signers"),
+    )
+    parser.add_argument("--signer-principal", required=True)
     parser.add_argument("--source-revision", required=True)
     parser.add_argument("--release", required=True)
     parser.add_argument("--digest-tool", default=os.environ.get("TRITIUM_BIN", "tritium"))
@@ -244,6 +299,9 @@ def main() -> int:
         args.output_dir.absolute(), candidate=args.candidate.absolute(),
         anchor=args.anchor_wheel.absolute(), registry_path=args.registry.absolute(),
         attestation_path=args.attestation.absolute(),
+        signature_path=args.signature.absolute(),
+        policy_path=args.signer_policy.absolute(),
+        signer_principal=args.signer_principal,
         source_revision=args.source_revision, release=args.release,
         digest_tool=args.digest_tool,
     )

@@ -736,6 +736,11 @@ class ReleaseEvidenceStatusTests(unittest.TestCase):
                 "run_id": "independent-review-run-1", "anchor_artifact": anchor,
                 "reviewed_receipt_ids": [second["receipt_id"]],
                 "reviewer": {"id": "reviewer-3", "organization": "audit-lab"},
+                "signer_policy": {
+                    "sha256": sha256(
+                        ROOT / "release/trusted-reviewers-v1.1.allowed_signers"
+                    )
+                },
             }
             registry_path = evidence_root / "registry.json"
             registry(

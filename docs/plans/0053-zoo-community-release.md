@@ -340,6 +340,13 @@ It binds a canonical pre-review scope digest (avoiding a circular final-registry
 hash), retains the exact reviewer attestation, and rejects unresolved or
 inconsistent findings before sealing. Reviewer selection and the review itself
 remain external evidence; no passing attestation exists locally.
+The attestation must also carry an OpenSSH detached signature in the
+`tritium-independent-review` namespace. Both producer and independent receipt
+validator verify it against the retained allowed-signers bytes, while registry
+admission requires those bytes to match
+`release/trusted-reviewers-v1.1.allowed_signers`. That policy intentionally has
+no authorized key until an independent reviewer is explicitly designated;
+self-selected or substituted reviewer keys cannot green the release.
 
 ## Slice 8 — local release-candidate sign-off
 

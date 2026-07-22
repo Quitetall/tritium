@@ -2,6 +2,7 @@ import hashlib
 import json
 from pathlib import Path
 import runpy
+import subprocess
 import tempfile
 import unittest
 
@@ -176,6 +177,25 @@ def review_receipt(manifest: Path, wheel: Path, reviewed):
     }
     attestation_path = manifest.parent / "review-attestation.json"
     write(attestation_path, attestation)
+    key = manifest.parent / "review-key"
+    subprocess.run(
+        ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key)],
+        check=True,
+    )
+    principal = attestation["reviewer"]["id"]
+    policy = manifest.parent / "trusted-reviewers.allowed_signers"
+    policy.write_text(
+        f"{principal} {key.with_suffix('.pub').read_text(encoding='utf-8')}",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        [
+            "ssh-keygen", "-Y", "sign", "-f", str(key), "-n",
+            MODULE["REVIEW_SIGNATURE_NAMESPACE"], str(attestation_path),
+        ],
+        check=True, capture_output=True,
+    )
+    signature = Path(str(attestation_path) + ".sig")
     value = {
         **attestation, "schema": MODULE["REVIEW_SCHEMA"], "result": "pass",
         "anchor_artifact": anchor_record(wheel),
@@ -183,6 +203,16 @@ def review_receipt(manifest: Path, wheel: Path, reviewed):
             "path": attestation_path.name, "bytes": attestation_path.stat().st_size,
             "sha256": hashlib.sha256(attestation_path.read_bytes()).hexdigest(),
         },
+        "review_signature": {
+            "path": signature.name, "bytes": signature.stat().st_size,
+            "sha256": hashlib.sha256(signature.read_bytes()).hexdigest(),
+        },
+        "signer_policy": {
+            "path": policy.name, "bytes": policy.stat().st_size,
+            "sha256": hashlib.sha256(policy.read_bytes()).hexdigest(),
+        },
+        "signer_principal": principal,
+        "signature_namespace": MODULE["REVIEW_SIGNATURE_NAMESPACE"],
     }
     value["receipt_id"] = "sha256:" + hashlib.sha256(canonical(value)).hexdigest()
     return value
@@ -263,6 +293,20 @@ class ReleaseReproductionTests(unittest.TestCase):
             value["review_attestation"]["bytes"] = attestation_path.stat().st_size
             value["review_attestation"]["sha256"] = hashlib.sha256(
                 attestation_path.read_bytes()
+            ).hexdigest()
+            signature_path = root / value["review_signature"]["path"]
+            signature_path.unlink()
+            subprocess.run(
+                [
+                    "ssh-keygen", "-Y", "sign", "-f", str(root / "review-key"),
+                    "-n", MODULE["REVIEW_SIGNATURE_NAMESPACE"],
+                    str(attestation_path),
+                ],
+                check=True, capture_output=True,
+            )
+            value["review_signature"]["bytes"] = signature_path.stat().st_size
+            value["review_signature"]["sha256"] = hashlib.sha256(
+                signature_path.read_bytes()
             ).hexdigest()
             value["receipt_id"] = (
                 "sha256:"

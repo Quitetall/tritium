@@ -4,6 +4,7 @@ import hashlib
 import json
 from pathlib import Path
 import runpy
+import subprocess
 import tempfile
 import unittest
 
@@ -58,7 +59,25 @@ def fixture(root: Path):
         "verdict": "pass",
     }
     write(attestation, value)
-    return candidate, wheel, registry, attestation, reviewed, scope
+    key = root / "review-key"
+    subprocess.run(
+        ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key)],
+        check=True,
+    )
+    policy = root / "trusted-reviewers.allowed_signers"
+    policy.write_text(
+        "reviewer-3 " + key.with_suffix(".pub").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    subprocess.run(
+        [
+            "ssh-keygen", "-Y", "sign", "-f", str(key), "-n",
+            MODULE["REVIEW_SIGNATURE_NAMESPACE"], str(attestation),
+        ],
+        check=True, capture_output=True,
+    )
+    signature = Path(str(attestation) + ".sig")
+    return candidate, wheel, registry, attestation, signature, policy, reviewed, scope
 
 
 class QualifyIndependentReviewTests(unittest.TestCase):
@@ -73,7 +92,7 @@ class QualifyIndependentReviewTests(unittest.TestCase):
     def test_pre_review_registry_requires_all_31_kinds(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
-            candidate, _, registry, _, _, _ = fixture(root)
+            candidate, _, registry, _, _, _, _, _ = fixture(root)
             entries = []
             for ordinal, kind in enumerate(
                 sorted(MODULE["KNOWN_KINDS"] - {"independent-review"}), start=1
@@ -124,7 +143,10 @@ class QualifyIndependentReviewTests(unittest.TestCase):
     def test_seals_exact_review_scope_and_retains_attestation(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
-            candidate, wheel, registry, attestation, reviewed, scope = fixture(root)
+            (
+                candidate, wheel, registry, attestation, signature, policy,
+                reviewed, scope,
+            ) = fixture(root)
             assemble.__globals__["validate_registry"] = (
                 lambda *args, **kwargs: ({}, reviewed, scope)
             )
@@ -132,6 +154,8 @@ class QualifyIndependentReviewTests(unittest.TestCase):
             receipt = assemble(
                 output, candidate=candidate, anchor=wheel,
                 registry_path=registry, attestation_path=attestation,
+                signature_path=signature, policy_path=policy,
+                signer_principal="reviewer-3",
                 source_revision="a" * 40, release="1.1.0-rc.0",
                 digest_tool="tritium",
             )
@@ -142,7 +166,10 @@ class QualifyIndependentReviewTests(unittest.TestCase):
     def test_rejects_open_findings(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
-            candidate, wheel, registry, attestation, reviewed, scope = fixture(root)
+            (
+                candidate, wheel, registry, attestation, signature, policy,
+                reviewed, scope,
+            ) = fixture(root)
             document = json.loads(attestation.read_bytes())
             document["findings"]["open"] = 1
             write(attestation, document)
@@ -153,6 +180,31 @@ class QualifyIndependentReviewTests(unittest.TestCase):
                 assemble(
                     root / "output", candidate=candidate, anchor=wheel,
                     registry_path=registry, attestation_path=attestation,
+                    signature_path=signature, policy_path=policy,
+                    signer_principal="reviewer-3",
+                    source_revision="a" * 40, release="1.1.0-rc.0",
+                    digest_tool="tritium",
+                )
+
+    def test_rejects_untrusted_signature(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            (
+                candidate, wheel, registry, attestation, signature, policy,
+                reviewed, scope,
+            ) = fixture(root)
+            lines = signature.read_text(encoding="utf-8").splitlines()
+            lines[1] = ("A" if lines[1][0] != "A" else "B") + lines[1][1:]
+            signature.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            assemble.__globals__["validate_registry"] = (
+                lambda *args, **kwargs: ({}, reviewed, scope)
+            )
+            with self.assertRaisesRegex(QualificationError, "not trusted"):
+                assemble(
+                    root / "output", candidate=candidate, anchor=wheel,
+                    registry_path=registry, attestation_path=attestation,
+                    signature_path=signature, policy_path=policy,
+                    signer_principal="reviewer-3",
                     source_revision="a" * 40, release="1.1.0-rc.0",
                     digest_tool="tritium",
                 )

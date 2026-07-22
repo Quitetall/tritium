@@ -953,6 +953,18 @@ def evaluate(
     second_ids = [receipt_id for receipt_id, kind in kinds.items() if kind == "second-machine"]
     if review_ids:
         review_id = review_ids[0]
+        reviewer_policy = (
+            Path(__file__).resolve().parent.parent
+            / "release/trusted-reviewers-v1.1.allowed_signers"
+        )
+        if (
+            reviewer_policy.is_symlink() or not reviewer_policy.is_file()
+            or validated_receipts[review_id]["signer_policy"]["sha256"]
+            != _sha256(reviewer_policy)
+        ):
+            raise EvidenceError(
+                "independent-review signer policy differs from repository policy"
+            )
         if validated_receipts[review_id]["review_scope_sha256"] != review_scope_sha256(
             document
         ):

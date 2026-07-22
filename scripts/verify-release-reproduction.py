@@ -9,6 +9,7 @@ import json
 import math
 from pathlib import Path, PurePosixPath
 import re
+import subprocess
 from typing import Any
 
 
@@ -45,6 +46,10 @@ REVIEW_FIELDS = {
     "review_scope_sha256",
     "anchor_artifact",
     "review_attestation",
+    "review_signature",
+    "signer_policy",
+    "signer_principal",
+    "signature_namespace",
     "reviewed_receipt_ids",
     "scopes",
     "findings",
@@ -90,6 +95,7 @@ REVIEW_ATTESTATION_FIELDS = {
     "candidate_manifest_sha256", "review_scope_sha256",
     "reviewed_receipt_ids", "scopes", "findings", "verdict",
 }
+REVIEW_SIGNATURE_NAMESPACE = "tritium-independent-review"
 COMMAND_ORDER = (
     "verify-source",
     "verify-artifacts",
@@ -470,6 +476,41 @@ def validate_independent_review(
             raise ReproductionError(
                 f"independent review attestation {field} differs from receipt"
             )
+    if receipt["signature_namespace"] != REVIEW_SIGNATURE_NAMESPACE:
+        raise ReproductionError("independent review signature namespace differs")
+    principal = string(receipt["signer_principal"], "review signer principal")
+    if principal != reviewer["id"]:
+        raise ReproductionError("review signer principal differs from reviewer id")
+    signature_record = object_(
+        receipt["review_signature"], FILE_FIELDS, "review signature"
+    )
+    policy_record = object_(receipt["signer_policy"], FILE_FIELDS, "signer policy")
+    signature_path = contained(
+        receipt_path.parent, signature_record["path"], "review signature"
+    )
+    policy_path = contained(
+        receipt_path.parent, policy_record["path"], "signer policy"
+    )
+    for record, path, label in (
+        (signature_record, signature_path, "review signature"),
+        (policy_record, policy_path, "signer policy"),
+    ):
+        if path.stat().st_size != record["bytes"] or sha256(path) != record["sha256"]:
+            raise ReproductionError(f"{label} bytes drifted")
+    try:
+        verified = subprocess.run(
+            [
+                "ssh-keygen", "-Y", "verify", "-f", str(policy_path),
+                "-I", principal, "-n", REVIEW_SIGNATURE_NAMESPACE,
+                "-s", str(signature_path),
+            ],
+            input=attestation_path.read_bytes(), capture_output=True,
+            check=False, timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise ReproductionError("independent review signature verifier failed") from error
+    if verified.returncode != 0:
+        raise ReproductionError("independent review signature is not trusted")
     reviewed = receipt["reviewed_receipt_ids"]
     if (
         not isinstance(reviewed, list)
