@@ -27,6 +27,9 @@ EVIDENCE_FIELDS = {
 }
 HEX = frozenset("0123456789abcdef")
 MAX_RECEIPT_BYTES = 1024 * 1024
+MAX_ARCHIVE_BYTES = 512 * 1024 * 1024
+# verify-pack.mjs freezes the exact public tarball inventory to 13 files.
+EXPECTED_ENTRY_COUNT = 13
 
 
 class NpmReceiptError(ValueError):
@@ -37,12 +40,16 @@ def _canonical(value: Any) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
+def _digest(path: Path, algorithm: str) -> bytes:
+    digest = hashlib.new(algorithm)
     with path.open("rb") as stream:
         while chunk := stream.read(1024 * 1024):
             digest.update(chunk)
-    return digest.hexdigest()
+    return digest.digest()
+
+
+def _sha256(path: Path) -> str:
+    return _digest(path, "sha256").hex()
 
 
 def _object(value: Any, fields: set[str], label: str) -> dict[str, Any]:
@@ -69,8 +76,13 @@ def validate_receipt(
 ) -> dict[str, Any]:
     if path.is_symlink() or not path.is_file() or path.stat().st_size > MAX_RECEIPT_BYTES:
         raise NpmReceiptError("npm receipt must be a bounded ordinary file")
-    if archive.is_symlink() or not archive.is_file():
-        raise NpmReceiptError("npm archive must be an ordinary file")
+    if (
+        archive.is_symlink()
+        or not archive.is_file()
+        or archive.stat().st_size <= 0
+        or archive.stat().st_size > MAX_ARCHIVE_BYTES
+    ):
+        raise NpmReceiptError("npm archive must be a bounded ordinary file")
     try:
         value = _object(json.loads(path.read_bytes()), TOP_FIELDS, "receipt")
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -114,7 +126,7 @@ def validate_receipt(
     if _hex(artifact["sha256"], 64, "receipt.artifact.sha256") != archive_sha256:
         raise NpmReceiptError("npm receipt archive digest mismatch")
     expected_integrity = "sha512-" + base64.b64encode(
-        hashlib.sha512(archive.read_bytes()).digest()
+        _digest(archive, "sha512")
     ).decode("ascii")
     if artifact["integrity"] != expected_integrity:
         raise NpmReceiptError("npm receipt archive integrity mismatch")
@@ -124,8 +136,13 @@ def validate_receipt(
         for field in ("source_free", "installed_offline", "strict_typescript")
     ):
         raise NpmReceiptError("npm receipt does not prove a clean qualified install")
-    if type(evidence["entry_count"]) is not int or evidence["entry_count"] != 13:
-        raise NpmReceiptError("npm receipt archive entry count is invalid")
+    if (
+        type(evidence["entry_count"]) is not int
+        or evidence["entry_count"] != EXPECTED_ENTRY_COUNT
+    ):
+        raise NpmReceiptError(
+            f"npm receipt must bind the frozen {EXPECTED_ENTRY_COUNT}-file archive inventory"
+        )
     expected_build = f"tritium-wasm@{release}+source-git:{revision}"
     if evidence["wasm_build_id"] != expected_build:
         raise NpmReceiptError("npm receipt WASM build identity mismatch")
