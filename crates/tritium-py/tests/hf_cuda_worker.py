@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import platform
@@ -78,7 +79,7 @@ def main() -> None:
     source_revision = os.environ.get("TRITIUM_SOURCE_REVISION", "")
     release = os.environ.get("TRITIUM_RELEASE", "")
     run_id = os.environ.get("TRITIUM_RUN_ID", "")
-    artifact_path = Path(os.environ.get("TRITIUM_QUALIFIED_ARTIFACT", ""))
+    artifact_name = os.environ.get("TRITIUM_QUALIFIED_ARTIFACT", "")
     artifact_kind = os.environ.get("TRITIUM_ARTIFACT_KIND", "")
     if re.fullmatch(r"[0-9a-f]{40}", source_revision) is None:
         raise RuntimeError("TRITIUM_SOURCE_REVISION must be a full Git object ID")
@@ -86,7 +87,10 @@ def main() -> None:
         raise RuntimeError("TRITIUM_RELEASE must be a canonical v1.1 candidate")
     if not run_id:
         raise RuntimeError("TRITIUM_RUN_ID must identify this independent run")
-    if not artifact_kind or not artifact_path.is_file() or artifact_path.is_symlink():
+    if not artifact_name or not artifact_kind:
+        raise RuntimeError("qualified artifact path and kind are required")
+    artifact_path = Path(artifact_name)
+    if not artifact_path.is_file() or artifact_path.is_symlink():
         raise RuntimeError("qualified artifact must be an ordinary named file")
     artifact = {"kind": artifact_kind, **_artifact_identity(artifact_path)}
     if not torch.cuda.is_available():
@@ -165,7 +169,7 @@ def main() -> None:
     end.record()
     end.synchronize()
     elapsed_ms = float(start.elapsed_time(end))
-    if elapsed_ms <= 0:
+    if not math.isfinite(elapsed_ms) or elapsed_ms <= 0:
         raise AssertionError("CUDA timing interval is not positive")
 
     checkpoint = Path(os.environ["TRITIUM_CUDA_CHECKPOINT"])
