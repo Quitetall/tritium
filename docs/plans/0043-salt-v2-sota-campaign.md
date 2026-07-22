@@ -824,7 +824,15 @@ open. Python now has a bounded native `KroneckerEvidenceBuilder` plus
 float32/float64 little-endian byte buffers instead of Python scalar lists,
 shape/mask/resource checks precede native mutation, Gram/Fisher accumulation
 runs without the GIL, and finish atomically publishes one `S2KF` record. The
-checkpoint-specific hook scheduler and objective/factor extraction remain open.
+model-aware pass now captures one selected projection with input-Gram, exact
+explicitly normalized model-loss guided-Fisher, or a deterministic stateless
+single-probe softmax-Fisher estimate, preserves repeated-module call order,
+requests output VJPs without parameter gradient buffers, domain-binds the exact
+objective into cache provenance, snapshots aliased inputs under an explicit
+byte ceiling, uses batch-partition-independent global probe ordinals, bounds
+forward-KL factor and cross-device mask workspace, and aborts partial batches.
+The adapter that schedules those passes from the canonical pinned-Qwen catalog
+remains open.
 Its
 publication boundary is available: on supported platforms the evidence
 directory installs each bounded canonical record through a verified inode in a

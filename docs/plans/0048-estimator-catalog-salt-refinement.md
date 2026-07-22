@@ -156,8 +156,20 @@ coverage and duplicate-plugin tests.
   shape-checked and converted to canonical f32le/f64le buffers, token masks are
   strictly boolean, native accumulation releases the GIL, failed parsing or
   accumulation leaves prior state unchanged, and explicit finish atomically
-  publishes one record. Checkpoint hook scheduling and estimator-specific
-  objective/factor extraction remain open.
+  publishes one record.
+- [x] Add the model-aware one-projection capture pass: forward-call order is
+  retained for reused modules; input-Gram, explicitly normalized model-loss
+  guided-Fisher, and a stateless single-probe softmax-Fisher Rademacher estimate
+  use only output VJPs and never allocate parameter gradients. The exact
+  objective ID is domain-bound into the activation-cache provenance, probe
+  identity uses the global sample ordinal rather than batch boundaries,
+  activation snapshots and forward-KL factor workspace have explicit byte
+  ceilings, and sharded-device masks move only through bounded chunks.
+  Attention masks, or shifted non-ignored labels for the causal-loss
+  convention, bind the selected sample set; partial failures abort unpublished
+  state; and completed state survives only retryable publication/resource
+  failures. Scheduling these passes from the canonical pinned-Qwen catalog
+  remains open.
 - Keep calibration, reconstruction and validation datasets source-bound and
   disjoint where the recipe requires.
 

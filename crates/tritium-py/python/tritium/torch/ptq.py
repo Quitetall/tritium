@@ -40,6 +40,33 @@ Pathish = Union[str, os.PathLike[str]]
 # Source weights and framework allocator overhead are intentionally excluded.
 _FIT_FIXED_BYTES_PER_FEATURE = 24
 _FIT_BYTES_PER_COEFFICIENT = 128
+_KRONECKER_OBJECTIVE_CONTEXT = b"tritium kronecker activation objective v1\0"
+
+
+def bind_kronecker_activation_cache_digest(
+    activation_cache_digest: str, objective_id: str
+) -> str:
+    """Bind an exact capture objective into a raw SHA-256 cache identity."""
+
+    if (
+        not isinstance(activation_cache_digest, str)
+        or len(activation_cache_digest) != 64
+        or any(byte not in "0123456789abcdefABCDEF" for byte in activation_cache_digest)
+    ):
+        raise ValueError("activation_cache_digest must be exactly 64 hexadecimal characters")
+    if (
+        not isinstance(objective_id, str)
+        or not objective_id
+        or len(objective_id.encode("utf-8")) > 1024
+    ):
+        raise ValueError("objective_id must be a nonempty UTF-8 string no larger than 1024 bytes")
+    encoded = objective_id.encode("utf-8")
+    digest = hashlib.sha256()
+    digest.update(_KRONECKER_OBJECTIVE_CONTEXT)
+    digest.update(bytes.fromhex(activation_cache_digest))
+    digest.update(struct.pack("<Q", len(encoded)))
+    digest.update(encoded)
+    return digest.hexdigest()
 
 
 @dataclass(frozen=True)
@@ -108,11 +135,19 @@ class KroneckerCalibrationWriter:
         activation_cache_digest: str,
         token_stream_digest: str,
         damping: float,
+        objective_id: Optional[str] = None,
         max_evidence_bytes: int = 64 * 1024 * 1024,
         max_batch_bytes: int = 256 * 1024 * 1024,
     ) -> None:
         self._rows = rows
         self._columns = columns
+        self._curvature = curvature
+        self._objective_id = objective_id
+        if objective_id is not None:
+            activation_cache_digest = bind_kronecker_activation_cache_digest(
+                activation_cache_digest, objective_id
+            )
+        self._activation_cache_digest = activation_cache_digest
         self._max_batch_bytes = max_batch_bytes
         self._native = _tritium.KroneckerEvidenceBuilder(
             os.fspath(evidence_dir),
@@ -227,6 +262,391 @@ class KroneckerCalibrationWriter:
         """Whether append/finalize operations are still admitted."""
 
         return self._native.active
+
+    @property
+    def rows(self) -> int:
+        return self._rows
+
+    @property
+    def columns(self) -> int:
+        return self._columns
+
+    @property
+    def curvature(self) -> str:
+        return self._curvature
+
+    @property
+    def max_batch_bytes(self) -> int:
+        return self._max_batch_bytes
+
+    @property
+    def objective_id(self) -> Optional[str]:
+        return self._objective_id
+
+    @property
+    def activation_cache_digest(self) -> str:
+        return self._activation_cache_digest
+
+
+@dataclass(frozen=True)
+class KroneckerModuleCaptureReceipt:
+    """Exact runtime coverage for one published module-curvature record."""
+
+    module: str
+    curvature: str
+    objective: str
+    batches: int
+    module_calls: int
+    samples: int
+    selected_samples: int
+    input_segments: int
+    output_segments: int
+    record: Any
+    schema_version: int = 1
+
+
+def _capture_output_tensor(output: Any, field: str) -> torch.Tensor:
+    value = output.get(field) if isinstance(output, Mapping) else getattr(output, field, None)
+    if not isinstance(value, torch.Tensor):
+        raise ValueError(f"model output must expose tensor {field!r}")
+    return value
+
+
+def _capture_token_mask(
+    mask: Optional[torch.Tensor], sample_shape: Tuple[int, ...]
+) -> Optional[torch.Tensor]:
+    if mask is None:
+        return None
+    samples = 1
+    for dimension in sample_shape:
+        samples *= dimension
+    if mask.numel() != samples:
+        raise ValueError(
+            f"attention_mask has {mask.numel()} values for module sample shape {sample_shape}"
+        )
+    return mask.reshape(sample_shape)
+
+
+def _causal_selection_mask(
+    labels: torch.Tensor, token_mask: Optional[torch.Tensor]
+) -> torch.Tensor:
+    if labels.ndim == 0:
+        raise ValueError("causal labels must have a sequence dimension")
+    if token_mask is not None and token_mask.shape != labels.shape:
+        raise ValueError("causal labels and attention_mask must have the same shape")
+    selected = torch.zeros_like(labels, dtype=torch.bool)
+    torch.ne(labels[..., 1:], -100, out=selected[..., :-1])
+    return selected
+
+
+def _forward_kl_factors(
+    logits: torch.Tensor,
+    sample_start: int,
+    token_mask: Optional[torch.Tensor],
+    max_objective_bytes: int,
+) -> torch.Tensor:
+    if logits.ndim < 2 or logits.shape[-1] < 2:
+        raise ValueError("forward-KL logits must have a nontrivial vocabulary dimension")
+    elements = logits.numel()
+    samples = elements // logits.shape[-1]
+    vocabulary = logits.shape[-1]
+    factor_bytes = elements * 4
+    center_bytes = samples * 4
+    fixed_bytes = factor_bytes + center_bytes
+    required_bytes = fixed_bytes + 64
+    if required_bytes > max_objective_bytes:
+        raise ValueError(
+            f"forward-KL factors require at least {required_bytes} bytes, "
+            f"limit is {max_objective_bytes}"
+        )
+    # The explicit hash/centering workspace uses at most 64 bytes per element.
+    # Keep it disjoint from the single retained f32 factor tensor.
+    chunk_elements = min(elements, (max_objective_bytes - fixed_bytes) // 64)
+    if chunk_elements == 0:
+        raise AssertionError("objective preflight admitted an empty workspace")
+    factors = torch.softmax(logits.detach(), dim=-1, dtype=torch.float32).sqrt_()
+    flat = factors.view(-1)
+    for offset in range(0, elements, chunk_elements):
+        end = min(elements, offset + chunk_elements)
+        indices = torch.arange(offset, end, device=logits.device, dtype=torch.int64)
+        sample_ids = torch.div(indices, vocabulary, rounding_mode="floor").add_(sample_start)
+        feature_ids = indices.remainder(vocabulary)
+        mixed = feature_ids.mul(1_103_515_245).add_(sample_ids * 2_654_435_761)
+        mixed.bitwise_xor_(torch.bitwise_right_shift(mixed, 16))
+        signs = ((mixed & 1) * 2 - 1).to(torch.float32)
+        flat[offset:end].mul_(signs)
+    centers = factors.sum(dim=-1, keepdim=True)
+    center_flat = centers.view(-1)
+    for offset in range(0, elements, chunk_elements):
+        end = min(elements, offset + chunk_elements)
+        indices = torch.arange(offset, end, device=logits.device, dtype=torch.int64)
+        sample_ids = torch.div(indices, vocabulary, rounding_mode="floor")
+        correction = flat[offset:end].square()
+        correction.mul_(center_flat[sample_ids])
+        flat[offset:end].sub_(correction)
+    mask = _capture_token_mask(token_mask, tuple(logits.shape[:-1]))
+    if mask is not None:
+        mask_flat = mask.reshape(-1)
+        mask_chunk_samples = max(1, chunk_elements // vocabulary)
+        for offset in range(0, samples, mask_chunk_samples):
+            end = min(samples, offset + mask_chunk_samples)
+            selected = mask_flat[offset:end].to(
+                device=factors.device, dtype=factors.dtype
+            )
+            factors.view(samples, vocabulary)[offset:end].mul_(selected.view(-1, 1))
+    return factors
+
+
+def capture_kronecker_module(
+    model: nn.Module,
+    data: Iterable[Any],
+    *,
+    module: str,
+    writer: KroneckerCalibrationWriter,
+    curvature: str,
+    guided_loss_reduction: Optional[str] = None,
+    max_capture_bytes: Optional[int] = None,
+    max_objective_bytes: int = 256 * 1024 * 1024,
+) -> KroneckerModuleCaptureReceipt:
+    """Capture one projection through a bounded model-aware PyTorch pass.
+
+    ``input-hessian`` accumulates input Gram factors without autograd.
+    ``guided-fisher`` differentiates the model's exact scalar ``loss`` output.
+    ``forward-kl-kronecker`` uses a stateless v1 Rademacher factor of the dense
+    softmax Fisher. Only gradients with respect to the selected module outputs
+    are requested, so parameter ``.grad`` buffers are never allocated.
+    """
+
+    if not isinstance(model, nn.Module):
+        raise TypeError("model must be a torch.nn.Module")
+    if not isinstance(writer, KroneckerCalibrationWriter):
+        raise TypeError("writer must be a KroneckerCalibrationWriter")
+    if curvature not in {
+        "input-hessian",
+        "guided-fisher",
+        "forward-kl-kronecker",
+    }:
+        raise ValueError("unsupported Kronecker curvature")
+    if writer.curvature != curvature:
+        writer.abort()
+        raise ValueError("capture curvature differs from writer curvature")
+    if curvature == "guided-fisher":
+        if guided_loss_reduction not in {
+            "sum",
+            "mean-attention-mask",
+            "mean-valid-causal-labels",
+        }:
+            writer.abort()
+            raise ValueError(
+                "guided-Fisher requires loss reduction sum, mean-attention-mask, "
+                "or mean-valid-causal-labels"
+            )
+        objective = f"tritium.model-loss-guided-fisher.{guided_loss_reduction}@1"
+    else:
+        if guided_loss_reduction is not None:
+            writer.abort()
+            raise ValueError("guided_loss_reduction is valid only for guided-fisher")
+        objective = {
+            "input-hessian": "tritium.input-gram@1",
+            "forward-kl-kronecker": "tritium.softmax-fisher-rademacher.single-probe@1",
+        }[curvature]
+    if writer.objective_id != objective:
+        writer.abort()
+        raise ValueError("writer objective_id differs from the capture objective")
+    if max_capture_bytes is None:
+        max_capture_bytes = writer.max_batch_bytes
+    if type(max_capture_bytes) is not int or max_capture_bytes <= 0:
+        writer.abort()
+        raise ValueError("max_capture_bytes must be a positive integer")
+    if type(max_objective_bytes) is not int or max_objective_bytes <= 0:
+        writer.abort()
+        raise ValueError("max_objective_bytes must be a positive integer")
+
+    modules = [
+        value
+        for path, value in model.named_modules(remove_duplicate=False)
+        if path == module
+    ]
+    if len(modules) != 1:
+        writer.abort()
+        raise ValueError("module path must identify exactly one module")
+    selected = modules[0]
+    weight = getattr(selected, "weight", None)
+    if (
+        not isinstance(weight, torch.Tensor)
+        or weight.ndim != 2
+        or tuple(weight.shape) != (writer.rows, writer.columns)
+    ):
+        writer.abort()
+        raise ValueError("module weight geometry differs from the evidence writer")
+
+    pending: list[Tuple[torch.Tensor, torch.Tensor]] = []
+    pending_activation_bytes = 0
+    token_mask: Optional[torch.Tensor] = None
+    causal_selection_mask: Optional[torch.Tensor] = None
+
+    def preflight_input(_selected, args):
+        if not args or not isinstance(args[0], torch.Tensor):
+            raise ValueError("selected module must receive a tensor first argument")
+        activations = args[0]
+        if activations.ndim == 0 or activations.shape[-1] != writer.columns:
+            raise ValueError("selected module input feature geometry changed")
+
+    def capture(_selected, args, output):
+        nonlocal pending_activation_bytes
+        activations = args[0]
+        if not isinstance(output, torch.Tensor):
+            raise ValueError("selected module must return one tensor")
+        if tuple(output.shape[:-1]) != tuple(activations.shape[:-1]) or output.shape[-1] != writer.rows:
+            raise ValueError("selected module output geometry changed")
+        if curvature != "input-hessian" and not output.requires_grad:
+            output.requires_grad_(True)
+        activation_bytes = activations.numel() * activations.element_size()
+        required_bytes = pending_activation_bytes + activation_bytes
+        if required_bytes > max_capture_bytes:
+            raise ValueError(
+                f"capture snapshots require {required_bytes} bytes, limit is {max_capture_bytes}"
+            )
+        pending.append((activations.detach().clone(), output))
+        pending_activation_bytes = required_bytes
+
+    pre_handle = selected.register_forward_pre_hook(preflight_input)
+    handle = selected.register_forward_hook(capture)
+    training_flags = tuple((component, component.training) for component in model.modules())
+    batches = 0
+    module_calls = 0
+    samples = 0
+    selected_samples = 0
+    input_segments = 0
+    output_segments = 0
+    finalizing = False
+    objective_sample_start = 0
+    try:
+        model.eval()
+        for batch in data:
+            pending.clear()
+            raw_mask = batch.get("attention_mask") if isinstance(batch, Mapping) else None
+            if raw_mask is not None and not isinstance(raw_mask, torch.Tensor):
+                raise ValueError("attention_mask must be a tensor")
+            if raw_mask is not None and not bool(
+                ((raw_mask == 0) | (raw_mask == 1)).all()
+            ):
+                raise ValueError("attention_mask values must be boolean or 0/1")
+            snapshot_bytes = (
+                0 if raw_mask is None else raw_mask.numel() * raw_mask.element_size()
+            )
+            raw_labels = None
+            if guided_loss_reduction == "mean-valid-causal-labels":
+                raw_labels = batch.get("labels") if isinstance(batch, Mapping) else None
+                if not isinstance(raw_labels, torch.Tensor):
+                    raise ValueError(
+                        "mean-valid-causal-labels guided-Fisher requires tensor labels"
+                    )
+                snapshot_bytes += raw_labels.numel()
+            if snapshot_bytes > max_capture_bytes:
+                raise ValueError(
+                    f"capture metadata requires {snapshot_bytes} bytes, "
+                    f"limit is {max_capture_bytes}"
+                )
+            token_mask = None if raw_mask is None else raw_mask.detach().clone()
+            causal_selection_mask = (
+                None
+                if raw_labels is None
+                else _causal_selection_mask(raw_labels, token_mask)
+            )
+            pending_activation_bytes = snapshot_bytes
+            context = torch.no_grad() if curvature == "input-hessian" else torch.enable_grad()
+            with context:
+                output = _invoke_model(model, batch)
+                if not pending:
+                    raise ValueError("selected module was not exercised by a calibration batch")
+                if curvature == "guided-fisher":
+                    loss = _capture_output_tensor(output, "loss")
+                    if loss.numel() != 1 or not loss.isfinite().all():
+                        raise ValueError("guided-Fisher model loss must be one finite scalar")
+                    if guided_loss_reduction == "sum":
+                        denominator = 1
+                    elif guided_loss_reduction == "mean-attention-mask":
+                        if token_mask is None:
+                            raise ValueError(
+                                "mean-attention-mask guided-Fisher requires attention_mask"
+                            )
+                        denominator = int(token_mask.count_nonzero().item())
+                    else:
+                        assert causal_selection_mask is not None
+                        denominator = int(causal_selection_mask.count_nonzero().item())
+                    if denominator <= 0:
+                        raise ValueError("guided-Fisher loss denominator must be positive")
+                    gradients = torch.autograd.grad(
+                        loss * denominator, tuple(item[1] for item in pending)
+                    )
+                elif curvature == "forward-kl-kronecker":
+                    logits = _capture_output_tensor(output, "logits")
+                    factors = _forward_kl_factors(
+                        logits,
+                        objective_sample_start,
+                        token_mask,
+                        max_objective_bytes,
+                    )
+                    gradients = torch.autograd.grad(
+                        logits,
+                        tuple(item[1] for item in pending),
+                        grad_outputs=factors,
+                    )
+                    objective_sample_start += logits.numel() // logits.shape[-1]
+                else:
+                    gradients = (None,) * len(pending)
+            for (activations, _), factors in zip(pending, gradients):
+                sample_shape = tuple(activations.shape[:-1])
+                selected_mask = (
+                    causal_selection_mask
+                    if guided_loss_reduction == "mean-valid-causal-labels"
+                    else token_mask
+                )
+                mask = _capture_token_mask(selected_mask, sample_shape)
+                input_segments, output_segments = writer.append(
+                    activations,
+                    factors,
+                    token_mask=mask,
+                )
+                count = activations.numel() // writer.columns
+                samples += count
+                selected_samples += count if mask is None else int(mask.count_nonzero().item())
+                module_calls += 1
+            batches += 1
+        if batches == 0:
+            raise ValueError("calibration data must yield at least one batch")
+        finalizing = True
+        record = writer.finish()
+    except BaseException as error:
+        retryable_finish = finalizing and writer.active and isinstance(
+            error,
+            (
+                _tritium.KroneckerPublicationError,
+                _tritium.KroneckerResourceError,
+            ),
+        )
+        if not retryable_finish:
+            writer.abort()
+        raise
+    finally:
+        pre_handle.remove()
+        handle.remove()
+        for component, training in training_flags:
+            component.training = training
+        pending.clear()
+    return KroneckerModuleCaptureReceipt(
+        module=module,
+        curvature=curvature,
+        objective=objective,
+        batches=batches,
+        module_calls=module_calls,
+        samples=samples,
+        selected_samples=selected_samples,
+        input_segments=input_segments,
+        output_segments=output_segments,
+        record=record,
+    )
 
 
 def _hash_field(digest: "hashlib._Hash", tag: str, payload: bytes) -> None:
