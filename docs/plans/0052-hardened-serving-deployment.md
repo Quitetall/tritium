@@ -381,12 +381,24 @@ that process at the deadline, so non-cooperative I/O cannot strand teardown.
 Qualification binds the
 client-task peak, wall and all per-call latencies, every response size and digest,
 the generation request/response, counter deltas and clean post-flood telemetry.
-Prometheus collector disappearance and recovery remain the CPU telemetry subgate.
+Prometheus collector disappearance and recovery are covered by v9 below; a slow
+collector remains a separate CPU telemetry subgate.
+
+CPU Prometheus collection now has a Kubernetes v9 disappearance/recovery gate.
+Qualification adds one randomized label to the bound ServiceMonitor selector,
+proves the live Prometheus API reports zero matching active Tritium targets, and
+while collection is absent proves direct authenticated readiness, generation and
+clean metrics. A `finally` path removes only the injected selector. The gate then
+requires the same ServiceMonitor UID, three distinct resource versions, exact
+original selector, and a fresh scrape from the same target within 120 seconds.
+The receipt binds Service/ServiceMonitor identity, exact fault/restore patches,
+absence response digest, ordered timestamps, request/response, startup parity,
+telemetry and recovered target. CUDA carries `null`, never CPU evidence.
 
 1. malformed/truncated/wrong-identity artifact at startup;
 2. missing secret, invalid config and unavailable requested backend;
 3. latched backend/device loss;
-4. telemetry collector unavailable/slow;
+4. slow Prometheus collector;
 5. failed rollout followed by digest-pinned rollback.
 
 Every scenario records configuration, source/image/chart/artifact digests,

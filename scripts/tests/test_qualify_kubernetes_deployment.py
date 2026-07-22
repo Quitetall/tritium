@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from datetime import datetime, timezone
 import hashlib
 from pathlib import Path
 import runpy
@@ -43,6 +44,8 @@ resource_usage_sample = MODULE["resource_usage_sample"]
 request_evidence = MODULE["request_evidence"]
 qualify_metrics_scrape_flood = MODULE["qualify_metrics_scrape_flood"]
 validate_metrics_flood = MODULE["validate_metrics_flood"]
+prometheus_target_absence = MODULE["prometheus_target_absence"]
+qualify_collector_outage = MODULE["qualify_collector_outage"]
 
 
 def startup(flavor: str = "cpu") -> dict:
@@ -344,6 +347,66 @@ def receipt(chart: Path, image_archive: Path, candidate: Path,
                     "tritium_backend_faulted": 0.0,
                 }},
             },
+            "collector_outage": ({
+                "service_monitor_name": "qualification-tritium",
+                "service_monitor_uid": "monitor-uid", "service_uid": "service-uid",
+                "baseline_resource_version": "10", "fault_resource_version": "11",
+                "restored_resource_version": "12",
+                "fault_label": "tritium-telemetry-fault",
+                "fault_value": "0123456789abcdef",
+                "fault_patch_sha256": hashlib.sha256(canonical([
+                    {"op": "test", "path": "/metadata/uid",
+                     "value": "monitor-uid"},
+                    {"op": "test", "path": "/metadata/resourceVersion",
+                     "value": "10"},
+                    {"op": "add",
+                     "path": "/spec/selector/matchLabels/tritium-telemetry-fault",
+                     "value": "0123456789abcdef"},
+                ]).decode().strip().encode()).hexdigest(),
+                "restore_patch_sha256": hashlib.sha256(canonical([
+                    {"op": "test", "path": "/metadata/uid",
+                     "value": "monitor-uid"},
+                    {"op": "test",
+                     "path": "/spec/selector/matchLabels/tritium-telemetry-fault",
+                     "value": "0123456789abcdef"},
+                    {"op": "remove",
+                     "path": "/spec/selector/matchLabels/tritium-telemetry-fault"},
+                ]).decode().strip().encode()).hexdigest(),
+                "observation_budget_ms": 120000, "duration_ms": 50.0,
+                "baseline_target": {
+                    "scrape_url": "http://10.0.0.2:8080/metrics",
+                    "last_scrape_utc": "2026-07-21T12:01:59+00:00",
+                },
+                "absence": {
+                    "active_matches": 0, "response_sha256": "6" * 64,
+                    "observed_at_utc": "2026-07-21T12:02:02+00:00",
+                },
+                "startup_receipt": dict(startup_receipt),
+                "generation_response_sha256": "7" * 64,
+                "request": request_evidence(
+                    "tritium", "Hello", temperature=0, max_tokens=1
+                ),
+                "metrics": {"sha256": "8" * 64, "values": {
+                    "tritium_chat_requests_total": 2.0,
+                    "tritium_tokens_out_total": 2.0,
+                    "tritium_worker_alive": 1.0,
+                    "tritium_backend_faults_total": 0.0,
+                    "tritium_backend_faulted": 0.0,
+                }},
+                "recovered_target": {
+                    "scrape_url": "http://10.0.0.2:8080/metrics",
+                    "last_scrape_utc": "2026-07-21T12:02:05+00:00",
+                },
+                "cleanup": {"status": "restored", "selector": {
+                    "app.kubernetes.io/name": "tritium",
+                    "app.kubernetes.io/instance": "qualification",
+                }},
+                "transitions": [
+                    {"state": state, "elapsed_ms": float(index),
+                     "observed_at_utc": f"2026-07-21T12:02:0{index}+00:00"}
+                    for index, state in enumerate(MODULE["COLLECTOR_OUTAGE_TRANSITIONS"])
+                ],
+            } if flavor == "cpu" else None),
             "restart_recovery": {
                 "generation_response_sha256": "7" * 64,
                 "metrics": {"sha256": "8" * 64, "values": {
@@ -442,6 +505,29 @@ def validate(value: dict, chart: Path, image: Path, manifest: Path,
 
 
 class QualifyKubernetesDeploymentTests(unittest.TestCase):
+    def test_prometheus_target_absence_requires_zero_matching_active_targets(self):
+        response = {"status": "success", "data": {"activeTargets": [{
+            "labels": {"namespace": "other", "service": "other-service"},
+        }]}}
+        with mock.patch.dict(prometheus_target_absence.__globals__, {
+            "public_json": mock.Mock(return_value=response),
+        }):
+            observed = prometheus_target_absence(
+                "http://prometheus", namespace="tritium-test",
+                service="qualification-tritium", timeout=1,
+            )
+        self.assertEqual(observed["active_matches"], 0)
+        response["data"]["activeTargets"][0]["labels"] = {
+            "namespace": "tritium-test", "service": "qualification-tritium",
+        }
+        with mock.patch.dict(prometheus_target_absence.__globals__, {
+            "public_json": mock.Mock(return_value=response),
+        }), self.assertRaisesRegex(DeploymentError, "still has an active"):
+            prometheus_target_absence(
+                "http://prometheus", namespace="tritium-test",
+                service="qualification-tritium", timeout=1,
+            )
+
     def test_metrics_scrape_flood_runs_synchronized_generation(self):
         baseline = "\n".join([
             "tritium_chat_requests_total 1",
@@ -1016,6 +1102,247 @@ class QualifyKubernetesDeploymentTests(unittest.TestCase):
             )
         self.assertEqual(result["mode"], "already_absent")
 
+    def test_collector_fault_always_restores_service_monitor_selector(self):
+        commands = []
+        monitor = {
+            "metadata": {"name": "qualification-tritium", "uid": "monitor-uid",
+                         "resourceVersion": "10"},
+            "spec": {"selector": {"matchLabels": {
+                "app.kubernetes.io/name": "tritium",
+                "app.kubernetes.io/instance": "qualification",
+            }}},
+        }
+        faulted = copy.deepcopy(monitor)
+        faulted["metadata"]["resourceVersion"] = "11"
+        faulted["spec"]["selector"]["matchLabels"] = {"wrong": "selector"}
+        injected = copy.deepcopy(monitor)
+        injected["metadata"]["resourceVersion"] = "11"
+        injected["spec"]["selector"]["matchLabels"][
+            "tritium-telemetry-fault"
+        ] = "0123456789abcdef"
+        restored = copy.deepcopy(monitor)
+        restored["metadata"]["resourceVersion"] = "12"
+
+        def fake_run(command, _timeout):
+            commands.append(command)
+            return ""
+
+        with mock.patch.dict(qualify_collector_outage.__globals__, {
+            "run": fake_run,
+            "run_json": mock.Mock(side_effect=[
+                {"metadata": {"uid": "service-uid", "labels": {
+                    "app.kubernetes.io/name": "tritium",
+                }}},
+                faulted,
+                injected,
+                restored,
+            ]),
+            "secrets": mock.Mock(token_hex=mock.Mock(
+                return_value="0123456789abcdef"
+            )),
+            "prometheus_target": mock.Mock(return_value={
+                "scrape_url": "http://pod:8080/metrics",
+                "last_scrape_utc": datetime.now(timezone.utc).isoformat(),
+            }),
+        }), self.assertRaisesRegex(DeploymentError, "not admitted exactly"):
+            qualify_collector_outage(
+                ["kubectl"], service="qualification-tritium",
+                namespace="tritium-test", service_port=8080,
+                service_monitor=monitor, prometheus_base_url="http://prometheus",
+                token="token", model_id="tritium", prompt="Hello", timeout=10,
+                request_timeout=1, revision="a" * 40, profile="compact-v1",
+                manifest_blake3="c" * 64, release="1.1.0-rc.0",
+                expected_startup=startup(),
+            )
+        self.assertEqual(len(commands), 2)
+        self.assertIn('"op":"add"', commands[0][-1])
+        self.assertIn('"op":"remove"', commands[1][-1])
+        self.assertIn('"path":"/metadata/uid"', commands[0][-1])
+        self.assertIn('"path":"/metadata/resourceVersion"', commands[0][-1])
+        self.assertIn('"value":"0123456789abcdef"', commands[1][-1])
+
+    def test_collector_fault_rejects_reserved_selector_without_patch(self):
+        monitor = {
+            "metadata": {"name": "qualification-tritium", "uid": "monitor-uid",
+                         "resourceVersion": "10"},
+            "spec": {"selector": {"matchLabels": {
+                "app.kubernetes.io/name": "tritium",
+                "app.kubernetes.io/instance": "qualification",
+                "tritium-telemetry-fault": "owned-by-someone-else",
+            }}},
+        }
+        run_mock = mock.Mock()
+        with mock.patch.dict(qualify_collector_outage.__globals__, {
+            "run": run_mock,
+            "run_json": mock.Mock(return_value={
+                "metadata": {"uid": "service-uid", "labels": {
+                    "app.kubernetes.io/name": "tritium",
+                }},
+            }),
+        }), self.assertRaisesRegex(DeploymentError, "selector precondition"):
+            qualify_collector_outage(
+                ["kubectl"], service="qualification-tritium",
+                namespace="tritium-test", service_port=8080,
+                service_monitor=monitor, prometheus_base_url="http://prometheus",
+                token="token", model_id="tritium", prompt="Hello", timeout=10,
+                request_timeout=1, revision="a" * 40, profile="compact-v1",
+                manifest_blake3="c" * 64, release="1.1.0-rc.0",
+                expected_startup=startup(),
+            )
+        run_mock.assert_not_called()
+
+    def test_collector_fault_restores_after_admitted_patch_response_loss(self):
+        original_selector = {
+            "app.kubernetes.io/name": "tritium",
+            "app.kubernetes.io/instance": "qualification",
+        }
+        monitor = {
+            "metadata": {"name": "qualification-tritium", "uid": "monitor-uid",
+                         "resourceVersion": "10"},
+            "spec": {"selector": {"matchLabels": original_selector}},
+        }
+        injected = copy.deepcopy(monitor)
+        injected["metadata"]["resourceVersion"] = "11"
+        injected["spec"]["selector"]["matchLabels"] = {
+            **original_selector, "tritium-telemetry-fault": "0123456789abcdef",
+        }
+        restored = copy.deepcopy(monitor)
+        restored["metadata"]["resourceVersion"] = "12"
+        commands = []
+
+        def fake_run(command, _timeout):
+            commands.append(command)
+            if len(commands) == 1:
+                raise DeploymentError("patch response lost")
+            return ""
+
+        with mock.patch.dict(qualify_collector_outage.__globals__, {
+            "run": fake_run,
+            "run_json": mock.Mock(side_effect=[
+                {"metadata": {"uid": "service-uid", "labels": {}}},
+                injected,
+                restored,
+            ]),
+            "secrets": mock.Mock(token_hex=mock.Mock(
+                return_value="0123456789abcdef"
+            )),
+            "prometheus_target": mock.Mock(return_value={
+                "scrape_url": "http://pod:8080/metrics",
+                "last_scrape_utc": datetime.now(timezone.utc).isoformat(),
+            }),
+        }), self.assertRaisesRegex(DeploymentError, "patch response lost"):
+            qualify_collector_outage(
+                ["kubectl"], service="qualification-tritium",
+                namespace="tritium-test", service_port=8080,
+                service_monitor=monitor, prometheus_base_url="http://prometheus",
+                token="token", model_id="tritium", prompt="Hello", timeout=10,
+                request_timeout=1, revision="a" * 40, profile="compact-v1",
+                manifest_blake3="c" * 64, release="1.1.0-rc.0",
+                expected_startup=startup(),
+            )
+        self.assertEqual(len(commands), 2)
+        self.assertIn('"op":"remove"', commands[1][-1])
+
+    def test_collector_fault_does_not_remove_concurrent_value(self):
+        original_selector = {
+            "app.kubernetes.io/name": "tritium",
+            "app.kubernetes.io/instance": "qualification",
+        }
+        monitor = {
+            "metadata": {"name": "qualification-tritium", "uid": "monitor-uid",
+                         "resourceVersion": "10"},
+            "spec": {"selector": {"matchLabels": original_selector}},
+        }
+        foreign = copy.deepcopy(monitor)
+        foreign["metadata"]["resourceVersion"] = "11"
+        foreign["spec"]["selector"]["matchLabels"] = {
+            **original_selector, "tritium-telemetry-fault": "foreign-value",
+        }
+        run_mock = mock.Mock(side_effect=DeploymentError("patch conflict"))
+        with mock.patch.dict(qualify_collector_outage.__globals__, {
+            "run": run_mock,
+            "run_json": mock.Mock(side_effect=[
+                {"metadata": {"uid": "service-uid", "labels": {}}}, foreign,
+            ]),
+            "secrets": mock.Mock(token_hex=mock.Mock(
+                return_value="0123456789abcdef"
+            )),
+            "prometheus_target": mock.Mock(return_value={
+                "scrape_url": "http://pod:8080/metrics",
+                "last_scrape_utc": datetime.now(timezone.utc).isoformat(),
+            }),
+        }), self.assertRaisesRegex(DeploymentError, "cleanup state is ambiguous"):
+            qualify_collector_outage(
+                ["kubectl"], service="qualification-tritium",
+                namespace="tritium-test", service_port=8080,
+                service_monitor=monitor, prometheus_base_url="http://prometheus",
+                token="token", model_id="tritium", prompt="Hello", timeout=10,
+                request_timeout=1, revision="a" * 40, profile="compact-v1",
+                manifest_blake3="c" * 64, release="1.1.0-rc.0",
+                expected_startup=startup(),
+            )
+        self.assertEqual(run_mock.call_count, 1)
+
+    def test_collector_fault_cleanup_preserves_concurrent_selector(self):
+        original_selector = {
+            "app.kubernetes.io/name": "tritium",
+            "app.kubernetes.io/instance": "qualification",
+        }
+        monitor = {
+            "metadata": {"name": "qualification-tritium", "uid": "monitor-uid",
+                         "resourceVersion": "10"},
+            "spec": {"selector": {"matchLabels": original_selector}},
+        }
+        injected = copy.deepcopy(monitor)
+        injected["metadata"]["resourceVersion"] = "11"
+        injected["spec"]["selector"]["matchLabels"] = {
+            **original_selector, "tritium-telemetry-fault": "0123456789abcdef",
+            "concurrent-owner": "preserve-me",
+        }
+        cleaned = copy.deepcopy(injected)
+        cleaned["metadata"]["resourceVersion"] = "12"
+        del cleaned["spec"]["selector"]["matchLabels"][
+            "tritium-telemetry-fault"
+        ]
+        commands = []
+
+        def fake_run(command, _timeout):
+            commands.append(command)
+            if len(commands) == 1:
+                raise DeploymentError("patch response lost")
+            return ""
+
+        with mock.patch.dict(qualify_collector_outage.__globals__, {
+            "run": fake_run,
+            "run_json": mock.Mock(side_effect=[
+                {"metadata": {"uid": "service-uid", "labels": {}}},
+                injected,
+                cleaned,
+            ]),
+            "secrets": mock.Mock(token_hex=mock.Mock(
+                return_value="0123456789abcdef"
+            )),
+            "prometheus_target": mock.Mock(return_value={
+                "scrape_url": "http://pod:8080/metrics",
+                "last_scrape_utc": datetime.now(timezone.utc).isoformat(),
+            }),
+        }), self.assertRaisesRegex(DeploymentError, "patch response lost"):
+            qualify_collector_outage(
+                ["kubectl"], service="qualification-tritium",
+                namespace="tritium-test", service_port=8080,
+                service_monitor=monitor, prometheus_base_url="http://prometheus",
+                token="token", model_id="tritium", prompt="Hello", timeout=10,
+                request_timeout=1, revision="a" * 40, profile="compact-v1",
+                manifest_blake3="c" * 64, release="1.1.0-rc.0",
+                expected_startup=startup(),
+            )
+        self.assertEqual(len(commands), 2)
+        self.assertIn('"op":"remove"', commands[1][-1])
+        self.assertEqual(
+            cleaned["spec"]["selector"]["matchLabels"]["concurrent-owner"],
+            "preserve-me",
+        )
+
     def test_absence_proof_rejects_rbac_and_accepts_only_empty_success(self):
         completed = mock.Mock(returncode=0, stdout="", stderr="")
         with mock.patch.object(prove_absent.__globals__["subprocess"], "run",
@@ -1221,6 +1548,27 @@ class QualifyKubernetesDeploymentTests(unittest.TestCase):
                 ).hexdigest()
                 with self.assertRaisesRegex(
                     DeploymentError, "metrics-flood bounds|metrics-flood responses"
+                ):
+                    validate(value, chart, image, manifest, build, candidate)
+
+    def test_receipt_validator_binds_collector_patch_and_recovery_causality(self):
+        for target in ("patch", "recovery"):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as raw:
+                chart, image, manifest, build, candidate = candidate_inputs(raw)
+                value = receipt(chart, image, candidate)
+                collector = value["workload"]["collector_outage"]
+                if target == "patch":
+                    collector["fault_patch_sha256"] = "0" * 64
+                else:
+                    collector["recovered_target"]["last_scrape_utc"] = (
+                        "2026-07-21T12:01:00+00:00"
+                    )
+                del value["receipt_id"]
+                value["receipt_id"] = "sha256:" + hashlib.sha256(
+                    canonical(value)
+                ).hexdigest()
+                with self.assertRaisesRegex(
+                    DeploymentError, "collector-outage patch|collector transition causality"
                 ):
                     validate(value, chart, image, manifest, build, candidate)
 

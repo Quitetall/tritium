@@ -34,7 +34,7 @@ manifest_identity = RUNTIME["manifest_identity"]
 OCI_ARCHIVE = runpy.run_path(Path(__file__).with_name("verify-oci-archive.py"))
 validate_oci_archive = OCI_ARCHIVE["validate"]
 
-SCHEMA = "tritium.kubernetes-deployment-qualification.v8"
+SCHEMA = "tritium.kubernetes-deployment-qualification.v9"
 HEX = frozenset("0123456789abcdef")
 SAFE_NAME = re.compile(r"[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?")
 SAFE_SECRET_KEY = re.compile(r"[A-Za-z0-9](?:[-._A-Za-z0-9]{0,251}[A-Za-z0-9])?")
@@ -77,6 +77,7 @@ METRICS_FLOOD_REQUESTS = 64
 METRICS_FLOOD_CONCURRENCY = 8
 METRICS_FLOOD_BUDGET_MS = 60_000
 METRICS_FLOOD_MAX_RESPONSE_BYTES = 1024 * 1024
+COLLECTOR_OUTAGE_BUDGET_MS = 120_000
 QUALIFICATION_METRICS = {
     "tritium_chat_requests_total", "tritium_tokens_out_total",
     "tritium_worker_alive", "tritium_backend_faults_total",
@@ -89,6 +90,10 @@ ARTIFACT_VOLUME_TRANSITIONS = [
 OOM_TRANSITIONS = [
     "baseline_ready", "fault_applied", "oom_observed", "limit_restored",
     "pre_fault_pods_removed", "recovery_ready",
+]
+COLLECTOR_OUTAGE_TRANSITIONS = [
+    "baseline_target", "selector_fault_applied", "target_absent",
+    "serving_verified", "selector_restored", "target_recovered",
 ]
 
 
@@ -134,7 +139,10 @@ def expected_watchdog_policy(port: int) -> dict[str, Any]:
 
 
 def expected_checks(flavor: str) -> list[str]:
-    return [*CHECKS, *(["keda-scale-signal"] if flavor == "cpu" else [])]
+    return [*CHECKS, *(
+        ["keda-scale-signal", "prometheus-collector-recovery"]
+        if flavor == "cpu" else []
+    )]
 
 
 class DeploymentError(ValueError):
@@ -1704,6 +1712,132 @@ def validate_metrics_flood(value: Any, *, model_id: str) -> dict[str, Any]:
     return value
 
 
+def validate_collector_outage(value: Any, *, release_name: str, model_id: str,
+                              startup_receipt: dict[str, Any], run_duration_ms: float) \
+        -> dict[str, Any]:
+    fields = {
+        "service_monitor_name", "service_monitor_uid", "service_uid",
+        "baseline_resource_version", "fault_resource_version",
+        "restored_resource_version", "fault_label", "fault_value",
+        "fault_patch_sha256", "restore_patch_sha256", "observation_budget_ms",
+        "duration_ms", "baseline_target", "absence", "startup_receipt",
+        "generation_response_sha256", "request", "metrics", "recovered_target",
+        "cleanup", "transitions",
+    }
+    service = f"{release_name}-tritium"
+    if (not isinstance(value, dict) or set(value) != fields
+            or value.get("service_monitor_name") != service
+            or any(not isinstance(value.get(key), str) or not value[key]
+                   for key in ("service_monitor_uid", "service_uid",
+                               "baseline_resource_version", "fault_resource_version",
+                               "restored_resource_version"))
+            or len({value["baseline_resource_version"], value["fault_resource_version"],
+                    value["restored_resource_version"]}) != 3
+            or value.get("fault_label") != "tritium-telemetry-fault"
+            or not isinstance(value.get("fault_value"), str)
+            or re.fullmatch(r"[0-9a-f]{16}", value["fault_value"]) is None
+            or value.get("observation_budget_ms") != COLLECTOR_OUTAGE_BUDGET_MS
+            or type(value.get("duration_ms")) not in {int, float}
+            or not math.isfinite(value["duration_ms"])
+            or not 0 < value["duration_ms"] <= COLLECTOR_OUTAGE_BUDGET_MS
+            or value["duration_ms"] > run_duration_ms):
+        raise DeploymentError("deployment collector-outage identity or bounds differ")
+    path = "/spec/selector/matchLabels/tritium-telemetry-fault"
+    fault_patch = canonical([
+        {"op": "test", "path": "/metadata/uid",
+         "value": value["service_monitor_uid"]},
+        {"op": "test", "path": "/metadata/resourceVersion",
+         "value": value["baseline_resource_version"]},
+        {"op": "add", "path": path, "value": value["fault_value"]},
+    ]).decode().strip()
+    restore_patch = canonical([
+        {"op": "test", "path": "/metadata/uid",
+         "value": value["service_monitor_uid"]},
+        {"op": "test", "path": path, "value": value["fault_value"]},
+        {"op": "remove", "path": path},
+    ]).decode().strip()
+    if (value.get("fault_patch_sha256")
+            != hashlib.sha256(fault_patch.encode()).hexdigest()
+            or value.get("restore_patch_sha256")
+            != hashlib.sha256(restore_patch.encode()).hexdigest()):
+        raise DeploymentError("deployment collector-outage patch evidence differs")
+    for key in ("baseline_target", "recovered_target"):
+        target = value.get(key)
+        if (not isinstance(target, dict) or set(target) != {
+                "scrape_url", "last_scrape_utc"
+            } or not isinstance(target.get("scrape_url"), str)
+                or not target["scrape_url"].endswith("/metrics")):
+            raise DeploymentError("deployment collector target evidence differs")
+        try:
+            scraped = datetime.fromisoformat(target["last_scrape_utc"])
+        except (TypeError, ValueError) as error:
+            raise DeploymentError("deployment collector target timestamp differs") from error
+        if scraped.tzinfo != timezone.utc:
+            raise DeploymentError("deployment collector target timestamp is not UTC")
+    if value["baseline_target"]["scrape_url"] != value["recovered_target"]["scrape_url"]:
+        raise DeploymentError("deployment recovered a different collector target")
+    absence = value.get("absence")
+    if (not isinstance(absence, dict) or set(absence) != {
+            "active_matches", "response_sha256", "observed_at_utc"
+        } or absence.get("active_matches") != 0):
+        raise DeploymentError("deployment collector target absence differs")
+    exact_hex(absence.get("response_sha256"), 64, "collector absence response SHA-256")
+    try:
+        absent_at = datetime.fromisoformat(absence["observed_at_utc"])
+    except (TypeError, ValueError) as error:
+        raise DeploymentError("deployment collector absence timestamp differs") from error
+    if absent_at.tzinfo != timezone.utc:
+        raise DeploymentError("deployment collector absence timestamp is not UTC")
+    selector = {
+        "app.kubernetes.io/name": "tritium",
+        "app.kubernetes.io/instance": release_name,
+    }
+    if value.get("cleanup") != {"status": "restored", "selector": selector}:
+        raise DeploymentError("deployment collector selector cleanup differs")
+    transitions = validate_transition_trace(
+        value.get("transitions"), expected=COLLECTOR_OUTAGE_TRANSITIONS,
+        scenario="collector-outage",
+    )
+    transition_times = [datetime.fromisoformat(item["observed_at_utc"])
+                        for item in transitions]
+    baseline_scrape = datetime.fromisoformat(value["baseline_target"]["last_scrape_utc"])
+    recovered_scrape = datetime.fromisoformat(value["recovered_target"]["last_scrape_utc"])
+    if (not transition_times[0] - timedelta(seconds=120) <= baseline_scrape
+            <= transition_times[0] + timedelta(seconds=5)
+            or not transition_times[1] <= absent_at <= transition_times[3]
+            or recovered_scrape < transition_times[4] - timedelta(seconds=1)
+            or recovered_scrape <= baseline_scrape):
+        raise DeploymentError("deployment collector transition causality differs")
+    if value.get("startup_receipt") != startup_receipt:
+        raise DeploymentError("deployment collector outage changed startup receipt")
+    exact_hex(
+        value.get("generation_response_sha256"), 64,
+        "collector-outage generation response SHA-256",
+    )
+    request_value = value.get("request")
+    request_fields = {
+        "model", "prompt_sha256", "prompt_bytes", "temperature", "max_tokens",
+        "descriptor_sha256",
+    }
+    if (not isinstance(request_value, dict) or set(request_value) != request_fields
+            or request_value.get("model") != model_id
+            or type(request_value.get("prompt_bytes")) is not int
+            or not 0 < request_value["prompt_bytes"] <= 1024 * 1024
+            or type(request_value.get("temperature")) is not int
+            or request_value["temperature"] != 0
+            or type(request_value.get("max_tokens")) is not int
+            or request_value["max_tokens"] != 1):
+        raise DeploymentError("deployment collector-outage request differs")
+    exact_hex(request_value.get("prompt_sha256"), 64, "collector-outage prompt SHA-256")
+    descriptor = {
+        key: request_value[key] for key in request_fields - {"descriptor_sha256"}
+    }
+    if request_value["descriptor_sha256"] != hashlib.sha256(canonical(descriptor)).hexdigest():
+        raise DeploymentError("deployment collector-outage request descriptor differs")
+    validate_metrics_evidence(value.get("metrics"), "collector-outage")
+    return value
+
+
 def deployed_revision(value: Any) -> int:
     if not isinstance(value, list) or not value:
         raise DeploymentError("Helm deployed history is absent")
@@ -1890,6 +2024,254 @@ def prometheus_target(base_url: str, *, namespace: str, service: str,
             or not isinstance(scrape_url, str) or not scrape_url.endswith("/metrics")):
         raise DeploymentError("Prometheus target scrape is stale or wrong")
     return {"scrape_url": scrape_url, "last_scrape_utc": last_scrape.isoformat()}
+
+
+def prometheus_target_absence(base_url: str, *, namespace: str, service: str,
+                              timeout: float) -> dict[str, Any]:
+    value = public_json(base_url + "/api/v1/targets?state=active", timeout)
+    targets = value.get("data", {}).get("activeTargets") if value.get("status") == "success" else None
+    if not isinstance(targets, list):
+        raise DeploymentError("Prometheus active target response is malformed")
+    matches = [target for target in targets if isinstance(target, dict)
+               and target.get("labels", {}).get("namespace") == namespace
+               and target.get("labels", {}).get("service") == service]
+    if matches:
+        raise DeploymentError("Prometheus still has an active Tritium target")
+    return {
+        "active_matches": 0,
+        "response_sha256": hashlib.sha256(canonical(value)).hexdigest(),
+        "observed_at_utc": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+    }
+
+
+def qualify_collector_outage(
+        kubectl_base: list[str], *, service: str, namespace: str,
+        service_port: int, service_monitor: dict[str, Any], prometheus_base_url: str,
+        token: str, model_id: str, prompt: str, timeout: float,
+        request_timeout: float, revision: str, profile: str, manifest_blake3: str,
+        release: str, expected_startup: dict[str, Any]) -> dict[str, Any]:
+    began = time.monotonic()
+    deadline = began + min(timeout, COLLECTOR_OUTAGE_BUDGET_MS / 1000)
+    transitions = []
+
+    def remaining() -> float:
+        value = deadline - time.monotonic()
+        if value <= 0:
+            raise DeploymentError("Prometheus collector outage deadline expired")
+        return value
+
+    def record(state: str) -> None:
+        transitions.append({
+            "state": state, "elapsed_ms": (time.monotonic() - began) * 1000,
+            "observed_at_utc": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+        })
+
+    metadata = service_monitor.get("metadata", {})
+    monitor_uid = metadata.get("uid")
+    baseline_version = metadata.get("resourceVersion")
+    monitor_name = metadata.get("name")
+    original_selector = service_monitor.get("spec", {}).get("selector", {}).get("matchLabels")
+    if (monitor_name != service or any(
+            not isinstance(value, str) or not value
+            for value in (monitor_uid, baseline_version)
+        ) or not isinstance(original_selector, dict) or not original_selector):
+        raise DeploymentError("ServiceMonitor outage baseline identity is malformed")
+    service_doc = run_json(
+        kubectl_base + ["get", f"service/{service}", "-o", "json"], remaining()
+    )
+    service_uid = service_doc.get("metadata", {}).get("uid")
+    service_labels = service_doc.get("metadata", {}).get("labels")
+    fault_label = "tritium-telemetry-fault"
+    fault_value = secrets.token_hex(8)
+    if (not isinstance(service_uid, str) or not service_uid
+            or not isinstance(service_labels, dict)
+            or fault_label in service_labels or fault_label in original_selector):
+        raise DeploymentError("Service outage selector precondition differs")
+    baseline_target = prometheus_target(
+        prometheus_base_url, namespace=namespace, service=service,
+        timeout=min(request_timeout, remaining()),
+    )
+    record("baseline_target")
+    path = f"/spec/selector/matchLabels/{fault_label}"
+    fault_patch = [
+        {"op": "test", "path": "/metadata/uid", "value": monitor_uid},
+        {"op": "test", "path": "/metadata/resourceVersion",
+         "value": baseline_version},
+        {"op": "add", "path": path, "value": fault_value},
+    ]
+    restore_patch = [
+        {"op": "test", "path": "/metadata/uid", "value": monitor_uid},
+        {"op": "test", "path": path, "value": fault_value},
+        {"op": "remove", "path": path},
+    ]
+    fault_payload = canonical(fault_patch).decode().strip()
+    restore_payload = canonical(restore_patch).decode().strip()
+    patch_attempted = False
+    absent = None
+    fault_version = None
+    restored_monitor = None
+    outage_generation = None
+    outage_metrics = None
+    outage_startup = None
+    expected_fault_selector = {**original_selector, fault_label: fault_value}
+    try:
+        patch_attempted = True
+        run(kubectl_base + [
+            "patch", f"servicemonitor/{service}", "--type=json",
+            f"--patch={fault_payload}",
+        ], remaining())
+        faulted_monitor = run_json(
+            kubectl_base + ["get", f"servicemonitor/{service}", "-o", "json"],
+            remaining(),
+        )
+        fault_version = faulted_monitor.get("metadata", {}).get("resourceVersion")
+        if (faulted_monitor.get("metadata", {}).get("uid") != monitor_uid
+                or not isinstance(fault_version, str) or not fault_version
+                or fault_version == baseline_version
+                or faulted_monitor.get("spec", {}).get("selector", {}).get("matchLabels")
+                != expected_fault_selector):
+            raise DeploymentError("ServiceMonitor fault selector was not admitted exactly")
+        record("selector_fault_applied")
+        while True:
+            try:
+                absent = prometheus_target_absence(
+                    prometheus_base_url, namespace=namespace, service=service,
+                    timeout=min(request_timeout, remaining()),
+                )
+                break
+            except DeploymentError:
+                if remaining() <= 1:
+                    raise
+                time.sleep(1)
+        record("target_absent")
+        local_port = free_port()
+        local_url = f"http://127.0.0.1:{local_port}"
+        forward, ready = port_forward(
+            kubectl_base + ["port-forward", f"service/{service}",
+                            f"{local_port}:{service_port}", "--address", "127.0.0.1"],
+            time.monotonic() + remaining(), local_url, token,
+        )
+        try:
+            outage_startup = validate_ready(
+                ready, revision, "cpu", profile, manifest_blake3, release,
+            )
+            outage_generation = request_json(
+                local_url + "/v1/chat/completions", token,
+                body={"model": model_id,
+                      "messages": [{"role": "user", "content": prompt}],
+                      "temperature": 0, "max_tokens": 1},
+                timeout=min(request_timeout, remaining()),
+            )
+            if (not isinstance(outage_generation.get("choices"), list)
+                    or len(outage_generation["choices"]) != 1):
+                raise DeploymentError("collector outage generation differs")
+            outage_metrics = metrics_snapshot(request(
+                local_url + "/metrics", token,
+                timeout=min(request_timeout, remaining()),
+            ).decode("utf-8"))
+        finally:
+            stop_forward(forward)
+        if outage_startup != expected_startup:
+            raise DeploymentError("collector outage changed startup receipt")
+        record("serving_verified")
+    finally:
+        if patch_attempted:
+            cleanup_timeout = min(timeout, 60)
+            live_monitor = run_json(
+                kubectl_base + ["get", f"servicemonitor/{service}", "-o", "json"],
+                cleanup_timeout,
+            )
+            live_metadata = live_monitor.get("metadata", {})
+            live_selector = live_monitor.get("spec", {}).get(
+                "selector", {}
+            ).get("matchLabels")
+            if live_metadata.get("uid") != monitor_uid:
+                raise DeploymentError("ServiceMonitor cleanup identity differs")
+            if (isinstance(live_selector, dict)
+                    and live_selector.get(fault_label) == fault_value):
+                selector_after_restore = {
+                    key: value for key, value in live_selector.items()
+                    if key != fault_label
+                }
+                restore_error = None
+                try:
+                    run(kubectl_base + [
+                        "patch", f"servicemonitor/{service}", "--type=json",
+                        f"--patch={restore_payload}",
+                    ], cleanup_timeout)
+                except DeploymentError as error:
+                    restore_error = error
+                live_monitor = run_json(
+                    kubectl_base + [
+                        "get", f"servicemonitor/{service}", "-o", "json"
+                    ], cleanup_timeout,
+                )
+                live_metadata = live_monitor.get("metadata", {})
+                live_selector = live_monitor.get("spec", {}).get(
+                    "selector", {}
+                ).get("matchLabels")
+                if (live_metadata.get("uid") != monitor_uid
+                        or live_selector != selector_after_restore):
+                    message = "ServiceMonitor selector restoration is unproven"
+                    if restore_error is not None:
+                        raise DeploymentError(message) from restore_error
+                    raise DeploymentError(message)
+            elif (not isinstance(live_selector, dict)
+                  or fault_label in live_selector):
+                raise DeploymentError("ServiceMonitor cleanup state is ambiguous")
+            restored_monitor = live_monitor
+            record("selector_restored")
+    if restored_monitor is None:
+        raise DeploymentError("ServiceMonitor selector restoration is unproven")
+    restored_version = restored_monitor.get("metadata", {}).get("resourceVersion")
+    if (restored_monitor.get("metadata", {}).get("uid") != monitor_uid
+            or not isinstance(restored_version, str) or not restored_version
+            or restored_version in {baseline_version, fault_version}
+            or restored_monitor.get("spec", {}).get("selector", {}).get("matchLabels")
+            != original_selector):
+        raise DeploymentError("ServiceMonitor selector restoration differs")
+    restored_after = datetime.now(timezone.utc)
+    recovered_target = None
+    while True:
+        try:
+            candidate = prometheus_target(
+                prometheus_base_url, namespace=namespace, service=service,
+                timeout=min(request_timeout, remaining()),
+            )
+            scraped_at = datetime.fromisoformat(candidate["last_scrape_utc"])
+            if scraped_at >= restored_after - timedelta(seconds=1):
+                recovered_target = candidate
+                break
+        except (DeploymentError, ValueError):
+            pass
+        if remaining() <= 1:
+            raise DeploymentError("Prometheus target did not recover after selector restore")
+        time.sleep(1)
+    record("target_recovered")
+    duration_ms = (time.monotonic() - began) * 1000
+    if duration_ms > COLLECTOR_OUTAGE_BUDGET_MS:
+        raise DeploymentError("Prometheus collector outage deadline expired")
+    return {
+        "service_monitor_name": monitor_name, "service_monitor_uid": monitor_uid,
+        "service_uid": service_uid,
+        "baseline_resource_version": baseline_version,
+        "fault_resource_version": fault_version,
+        "restored_resource_version": restored_version,
+        "fault_label": fault_label, "fault_value": fault_value,
+        "fault_patch_sha256": hashlib.sha256(fault_payload.encode()).hexdigest(),
+        "restore_patch_sha256": hashlib.sha256(restore_payload.encode()).hexdigest(),
+        "observation_budget_ms": COLLECTOR_OUTAGE_BUDGET_MS,
+        "duration_ms": duration_ms,
+        "baseline_target": baseline_target, "absence": absent,
+        "startup_receipt": outage_startup,
+        "generation_response_sha256": hashlib.sha256(
+            canonical(outage_generation)
+        ).hexdigest(),
+        "request": request_evidence(model_id, prompt, temperature=0, max_tokens=1),
+        "metrics": outage_metrics, "recovered_target": recovered_target,
+        "cleanup": {"status": "restored", "selector": original_selector},
+        "transitions": transitions,
+    }
 
 
 def scale_baseline(scaled_object: dict[str, Any], hpa: dict[str, Any],
@@ -2405,6 +2787,7 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
         finally:
             stop_forward(process)
         scale = None
+        collector_outage = None
         if args.flavor == "cpu":
             scaled_object = run_json(
                 kubectl_base + ["get", f"scaledobject/{service}", "-o", "json"]
@@ -2438,6 +2821,15 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
                     prometheus_query=prometheus_query_text,
                     namespace=args.namespace, selector=selector, flavor=args.flavor,
                     service_port=service_port,
+                )
+                collector_outage = qualify_collector_outage(
+                    kubectl_base, service=service, namespace=args.namespace,
+                    service_port=service_port, service_monitor=service_monitor,
+                    prometheus_base_url=prometheus_local, token=token,
+                    model_id=model_id, prompt=args.prompt, timeout=args.timeout,
+                    request_timeout=args.request_timeout, revision=revision,
+                    profile=args.profile, manifest_blake3=manifest_id["blake3"],
+                    release=args.release, expected_startup=startup,
                 )
             finally:
                 stop_forward(prometheus_process)
@@ -2959,6 +3351,7 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
                      "rollback_startup_receipt": rollback_startup,
                      "metrics": metric_evidence, "restart_recovery": restart_recovery,
                      "metrics_scrape_flood": metrics_flood,
+                     "collector_outage": collector_outage,
                      "scale": scale, "helm_history": history,
                      "prior_helm_revision": prior_revision,
                      "failed_manifest_sha256": wrong_manifest,
@@ -3094,6 +3487,7 @@ def validate_receipt(receipt: dict[str, Any], *, chart_path: Path, image_path: P
         "update_strategy", "update_config", "rollback_startup_receipt", "metrics",
         "restart_recovery", "scale", "helm_history",
         "metrics_scrape_flood",
+        "collector_outage",
         "prior_helm_revision", "failed_manifest_sha256", "failed_image_digest",
         "failed_upgrade_output_sha256",
     }:
@@ -3536,6 +3930,15 @@ def validate_receipt(receipt: dict[str, Any], *, chart_path: Path, image_path: P
     validate_metrics_flood(
         workload.get("metrics_scrape_flood"), model_id=workload["model_id"]
     )
+    if receipt["flavor"] == "cpu":
+        validate_collector_outage(
+            workload.get("collector_outage"), release_name=workload["release_name"],
+            model_id=workload["model_id"],
+            startup_receipt=workload["startup_receipt"],
+            run_duration_ms=receipt["duration_ms"],
+        )
+    elif workload.get("collector_outage") is not None:
+        raise DeploymentError("CUDA deployment cannot contain collector-outage evidence")
     recovery = workload.get("restart_recovery")
     if not isinstance(recovery, dict) or set(recovery) != {
         "generation_response_sha256", "metrics"
