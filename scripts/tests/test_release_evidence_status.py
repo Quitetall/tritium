@@ -279,6 +279,75 @@ def entry(
 
 
 class ReleaseEvidenceStatusTests(unittest.TestCase):
+    def test_onnx_inference_requires_exact_conversion_lineage(self):
+        with tempfile.TemporaryDirectory() as raw:
+            candidate, document, old_artifact, evidence_root = release_fixture(Path(raw))
+            old_artifact.unlink()
+            model_path = candidate.parent / "qwen-refined.salt"
+            onnx_path = candidate.parent / "qwen-onnx.tar.zst"
+            model_path.write_bytes(b"refined model")
+            onnx_path.write_bytes(b"onnx bundle")
+            document["artifacts"] = [
+                {
+                    "id": "qwen-refined", "kind": "model-bundle",
+                    "path": model_path.name,
+                    "identity": {
+                        "sha256": sha256(model_path), "bytes": model_path.stat().st_size,
+                    },
+                    "sbom": {}, "provenance": {},
+                },
+                {
+                    "id": "qwen-onnx", "kind": "onnx-bundle", "path": onnx_path.name,
+                    "identity": {
+                        "sha256": sha256(onnx_path), "bytes": onnx_path.stat().st_size,
+                    },
+                    "sbom": {}, "provenance": {},
+                },
+            ]
+            candidate.write_bytes(canonical(document) + b"\n")
+            model_artifact = {
+                "id": "qwen-refined", "kind": "model-bundle", "name": model_path.name,
+                "bytes": model_path.stat().st_size, "sha256": sha256(model_path),
+            }
+            conversion = {
+                "receipt_id": "sha256:" + "a" * 64, "run_id": "conversion-onnx-1",
+                "tracks": [{"artifact": model_artifact} for _ in range(3)],
+            }
+            onnx_artifact = {
+                "id": "qwen-onnx", "kind": "onnx-bundle", "name": onnx_path.name,
+                "bytes": onnx_path.stat().st_size, "sha256": sha256(onnx_path),
+            }
+            onnx = {
+                "receipt_id": "sha256:" + "b" * 64, "run_id": "onnx-1",
+                "artifact": onnx_artifact, "model_artifact_id": "qwen-refined",
+                "model": {"conversion_mode": "refined", "profile": "near-lossless-v1"},
+            }
+            conversion_path = evidence_root / "conversion-onnx.json"
+            onnx_receipt_path = evidence_root / "onnx.json"
+            conversion_path.write_bytes(b"{}\n")
+            onnx_receipt_path.write_bytes(b"{}\n")
+            conversion_entry = entry(
+                conversion_path, conversion, kind="conversion-refinement"
+            )
+            conversion_entry["artifact_id"] = "qwen-refined"
+            onnx_entry = entry(
+                onnx_receipt_path, onnx, kind="onnx-inference",
+                parents=[conversion["receipt_id"]],
+            )
+            onnx_entry["artifact_id"] = "qwen-onnx"
+            registry_path = evidence_root / "registry.json"
+            registry(registry_path, candidate, [conversion_entry, onnx_entry])
+            with mock.patch.dict(
+                evaluate.__globals__,
+                {
+                    "validate_flagship_conversion": mock.Mock(return_value=conversion),
+                    "validate_onnx_inference": mock.Mock(return_value=onnx),
+                },
+            ):
+                report = evaluate(registry_path, candidate, document)
+            row = next(item for item in report["rows"] if item["id"] == "onnx")
+            self.assertEqual(row["status"], "PASS")
+
     def test_flagship_conversion_binds_model_bundle_and_advances_only_one_kind(self):
         with tempfile.TemporaryDirectory() as raw:
             candidate, document, old_artifact, evidence_root = release_fixture(Path(raw))

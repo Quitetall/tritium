@@ -231,6 +231,16 @@ This is a semantic generic-module fallback, not evidence of native fused custom
 operator execution, causal generation closure or Hugging Face whole-model ONNX
 support. Those remain binding below.
 
+Release admission now fail-closes through
+`tritium.onnx-inference-qualification.v1`. It binds the exact installed wheel,
+candidate ONNX archive and conversion-parent model bundle; requires a source- and
+compiler-free environment, physical CPU ORT provider, authenticated schema-v2
+language/MTP external data, executed `com.tritium` opsets 1/2, zero dense weight
+initializers/shadows, prompt/cache/generation/MTP parity and a content-bound
+execution trace. Graph/weight corruption, path traversal, unknown operators and
+trainable export/import must all fail. Validator presence is structural; no
+candidate Qwen3.6 whole-model receipt exists.
+
 Add `tritium.torch.export_onnx` and `tritium.torch.load_onnx` over the stable
 plan-0047 results:
 

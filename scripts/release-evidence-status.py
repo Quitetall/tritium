@@ -83,6 +83,11 @@ FLAGSHIP_RUNTIME_RECEIPT = runpy.run_path(
 validate_flagship_runtime = FLAGSHIP_RUNTIME_RECEIPT["validate_runtime"]
 validate_flagship_physical = FLAGSHIP_RUNTIME_RECEIPT["validate_physical"]
 FlagshipRuntimeError = FLAGSHIP_RUNTIME_RECEIPT["FlagshipRuntimeError"]
+ONNX_RECEIPT = runpy.run_path(
+    Path(__file__).with_name("verify-onnx-inference-receipt.py")
+)
+validate_onnx_inference = ONNX_RECEIPT["validate"]
+OnnxReceiptError = ONNX_RECEIPT["OnnxReceiptError"]
 
 SCHEMA = "tritium.release-evidence-registry.v1"
 REPORT_SCHEMA = "tritium.release-gate-report.v1"
@@ -111,6 +116,7 @@ KNOWN_KINDS = frozenset(
         "task-retention",
         "runtime",
         "physical-bytes",
+        "onnx-inference",
     }
 )
 HEX = frozenset("0123456789abcdef")
@@ -321,6 +327,7 @@ def evaluate(
                 "conversion-refinement", "quality", "task-retention", "runtime",
                 "physical-bytes",
             }
+            else "onnx-bundle" if kind == "onnx-inference"
             else "python-wheel"
         )
         if artifact.get("kind") != expected_artifact_kind:
@@ -421,6 +428,10 @@ def evaluate(
                 receipt = validate_flagship_physical(
                     receipt_path, revision, release, candidate
                 )
+            elif kind == "onnx-inference":
+                receipt = validate_onnx_inference(
+                    receipt_path, revision, release, candidate
+                )
             elif kind in {"oci-runtime-cpu", "oci-runtime-cuda"}:
                 receipt = load_oci_runtime_receipt(
                     receipt_path, revision=revision, release=release,
@@ -496,6 +507,7 @@ def evaluate(
             FlagshipReceiptError,
             FlagshipQualityError,
             FlagshipRuntimeError,
+            OnnxReceiptError,
             ValueError,
         ) as error:
             raise EvidenceError(f"{label} failed {kind} validation: {error}") from error
@@ -631,6 +643,24 @@ def evaluate(
             )
             if actual != declared or actual != qualified:
                 raise EvidenceError(f"{kind} receipt does not bind candidate model bytes")
+        elif kind == "onnx-inference":
+            identity = artifact.get("identity", {})
+            actual = (
+                artifact.get("id"), artifact.get("kind"), artifact_path.name,
+                artifact_path.stat().st_size, _sha256(artifact_path),
+            )
+            qualified_artifact = receipt["artifact"]
+            qualified = (
+                qualified_artifact["id"], qualified_artifact["kind"],
+                qualified_artifact["name"], qualified_artifact["bytes"],
+                qualified_artifact["sha256"],
+            )
+            declared = (
+                artifact.get("id"), artifact.get("kind"), artifact_path.name,
+                identity.get("bytes"), identity.get("sha256"),
+            )
+            if actual != declared or actual != qualified:
+                raise EvidenceError("ONNX receipt does not bind candidate archive bytes")
         elif kind.startswith("oci-"):
             identity = artifact.get("identity", {})
             actual = (artifact_path.name, _sha256(artifact_path), artifact_path.stat().st_size)
@@ -688,6 +718,21 @@ def evaluate(
         refined_id = conversion["tracks"][2]["artifact"]["id"]
         if artifact_ids[receipt_id] != refined_id:
             raise EvidenceError(f"{kind} must bind the refined candidate model bundle")
+    onnx_ids = [receipt_id for receipt_id, kind in kinds.items() if kind == "onnx-inference"]
+    for receipt_id in onnx_ids:
+        expected_parents = set(conversion_ids)
+        if len(expected_parents) != 1 or set(entries[receipt_id]["parents"]) != expected_parents:
+            raise EvidenceError("onnx-inference must have the exact conversion parent")
+        conversion = validated_receipts[next(iter(expected_parents))]
+        onnx = validated_receipts[receipt_id]
+        if onnx["model"]["conversion_mode"] == "refined":
+            track = conversion["tracks"][2]
+        elif onnx["model"]["profile"] == "compact-v1":
+            track = conversion["tracks"][0]
+        else:
+            track = conversion["tracks"][1]
+        if onnx["model_artifact_id"] != track["artifact"]["id"]:
+            raise EvidenceError("ONNX source does not match conversion lineage")
     zoo_ids = [receipt_id for receipt_id, kind in kinds.items() if kind == "model-zoo"]
     claim_ids = [
         receipt_id for receipt_id, kind in kinds.items() if kind == "generated-claims"
