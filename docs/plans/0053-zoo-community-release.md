@@ -158,6 +158,13 @@ source-tree adapter smoke passes
 offline with TensorBoard 2.21.0, W&B
 0.28.1 and OpenTelemetry 1.44.0. Candidate clean-wheel execution and an admitted
 release receipt remain open; this developer smoke is not substituted for them.
+The v1.0 → v1.1 migration guide now records the frozen/evolving Rust tiers, C
+ABI continuity, Python distribution rename with stable imports, typed phase
+transitions, copy-on-write artifact migration, deprecation/support windows and
+an operator checklist. The SemVer gate's obsolete `v0.5.*` default is fixed to
+select the latest reachable stable release (`v1.0.0`), guarded by a regression;
+all seven frozen crates pass that actual comparison. Candidate-wheel migration
+execution and the generated release API-diff receipt remain open.
 
 Replace the current pre-alpha/v1.0-era narrative with tested v1.1 documentation:
 

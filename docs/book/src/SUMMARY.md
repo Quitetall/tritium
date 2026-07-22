@@ -8,6 +8,7 @@
 - [Quantization (SALT)](./quantization.md)
 - [Training (QAT / STE)](./training.md)
 - [Ternary observability](./observability.md)
+- [Migrating from v1.0 to v1.1](./migration-v1.1.md)
 - [Definitive Guide to Ternary Deep Learning](./ternary-deep-learning.md)
 - [Interop](./interop.md)
 - [Model Zoo](./model-zoo.md)

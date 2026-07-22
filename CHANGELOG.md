@@ -19,6 +19,10 @@ see `docs/v1.0-api-freeze-audit.md` for the tier policy.
   distribution name. The Rust workspace and wheel now share the
   `1.1.0-rc.0` candidate version (rendered as PEP 440 `1.1.0rc0` in wheel
   metadata).
+- **Stable API baseline:** `scripts/check-semver.sh` now compares the seven
+  frozen Rust crates with the latest reachable stable SemVer tag (`v1.0.0` for
+  this candidate), replacing the obsolete pre-freeze `v0.5.*` default. See the
+  [v1.0 → v1.1 migration guide](docs/book/src/migration-v1.1.md).
 
 ### Added
 
