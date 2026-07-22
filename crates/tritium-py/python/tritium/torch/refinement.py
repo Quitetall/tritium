@@ -481,6 +481,8 @@ def _input_metrics(
         metrics[reference.path] = torch.zeros(reference.shape[1], dtype=torch.float64)
         counts[reference.path] = 0
         if not selected:
+            # The core metric weights columns. Token frequency weights embedding
+            # rows, so it cannot substitute without changing the objective.
             metrics[reference.path].fill_(1)
             counts[reference.path] = 1
             continue
@@ -905,7 +907,12 @@ def refine(
     finally:
         teacher.train(teacher_was_training)
     if after > before:
-        raise AssertionError("predecessor retention failed")
+        raise TritiumError(
+            "held-out predecessor retention failed",
+            code="predecessor_retention_failed",
+            stage="refine",
+            details={"predecessor_loss": before, "retained_loss": after},
+        )
 
     evidence_id = _evidence_id(
         parent_artifact_id=parent_id,

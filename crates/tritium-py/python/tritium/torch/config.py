@@ -221,7 +221,10 @@ class RefinementConfig:
             if kind == "scale-only" and structure == "dense":
                 return cls.scale_only()
             if kind == "hard-pv":
-                return cls.hard_pv(structure=structure)
+                raise ValueError(
+                    "legacy hard-pv RefinementConfig has no explicit iteration schedule; "
+                    "create a schema-version-2 recipe"
+                )
             raise ValueError("legacy RefinementConfig kind or structure is invalid")
         expected = {
             "schema_version",
