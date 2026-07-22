@@ -1,5 +1,46 @@
 use super::*;
 
+#[cfg(feature = "device-loss-qualification")]
+fn qualification_fatal_driver_error(error: &DriverError) -> bool {
+    matches!(
+        error.0,
+        sys::CUresult::CUDA_ERROR_ILLEGAL_ADDRESS
+            | sys::CUresult::CUDA_ERROR_CONTEXT_IS_DESTROYED
+            | sys::CUresult::CUDA_ERROR_ASSERT
+            | sys::CUresult::CUDA_ERROR_HARDWARE_STACK_ERROR
+            | sys::CUresult::CUDA_ERROR_ILLEGAL_INSTRUCTION
+            | sys::CUresult::CUDA_ERROR_MISALIGNED_ADDRESS
+            | sys::CUresult::CUDA_ERROR_INVALID_ADDRESS_SPACE
+            | sys::CUresult::CUDA_ERROR_INVALID_PC
+            | sys::CUresult::CUDA_ERROR_LAUNCH_FAILED
+    )
+}
+
+#[cfg(all(test, feature = "device-loss-qualification"))]
+mod qualification_error_tests {
+    use super::*;
+
+    #[test]
+    fn fatal_cuda_execution_error_set_is_complete_and_bounded() {
+        for result in [
+            sys::CUresult::CUDA_ERROR_ILLEGAL_ADDRESS,
+            sys::CUresult::CUDA_ERROR_CONTEXT_IS_DESTROYED,
+            sys::CUresult::CUDA_ERROR_ASSERT,
+            sys::CUresult::CUDA_ERROR_HARDWARE_STACK_ERROR,
+            sys::CUresult::CUDA_ERROR_ILLEGAL_INSTRUCTION,
+            sys::CUresult::CUDA_ERROR_MISALIGNED_ADDRESS,
+            sys::CUresult::CUDA_ERROR_INVALID_ADDRESS_SPACE,
+            sys::CUresult::CUDA_ERROR_INVALID_PC,
+            sys::CUresult::CUDA_ERROR_LAUNCH_FAILED,
+        ] {
+            assert!(qualification_fatal_driver_error(&DriverError(result)));
+        }
+        assert!(!qualification_fatal_driver_error(&DriverError(
+            sys::CUresult::CUDA_ERROR_INVALID_VALUE
+        )));
+    }
+}
+
 /// Checked requested-device-allocation ledger for one SALT V2 row gather.
 ///
 /// The persistent component is the original encoded tensor. Per-call bytes are
@@ -87,6 +128,58 @@ impl SaltV2GatherReceipt {
 }
 
 impl CudaBackend {
+    #[cfg(feature = "device-loss-qualification")]
+    fn maybe_poison_context_for_qualification(&self) -> Result<(), BackendError> {
+        if !take_destructive_context_loss_qualification_request() {
+            return Ok(());
+        }
+        let cfg = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (1, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launch = self.stream.launch_builder(&self.func_qualification_poison);
+        // SAFETY: qualification kernel has no parameters and exactly one thread.
+        // Its intentional `trap` is destructive to this CUDA context, not host
+        // memory. Caller must replace the serving process after this returns.
+        #[allow(unsafe_code)]
+        unsafe { launch.launch(cfg) }.map_err(|error| {
+            BackendError::Backend(format!(
+                "destructive CUDA context-loss qualification trap did not launch: {error}"
+            ))
+        })?;
+        let failure = match self.stream.synchronize() {
+            Ok(()) => {
+                return Err(BackendError::Backend(
+                    "destructive CUDA context-loss qualification trap returned CUDA success".into(),
+                ));
+            }
+            Err(error) => error,
+        };
+        if !qualification_fatal_driver_error(&failure) {
+            return Err(BackendError::Backend(format!(
+                "destructive CUDA context-loss qualification observed non-fatal sync error: {failure}"
+            )));
+        }
+        let follow_up = match self.stream.synchronize() {
+            Ok(()) => {
+                return Err(BackendError::Backend(
+                    "destructive CUDA context-loss qualification context accepted follow-up synchronization"
+                        .into(),
+                ));
+            }
+            Err(error) => error,
+        };
+        if !qualification_fatal_driver_error(&follow_up) {
+            return Err(BackendError::Backend(format!(
+                "destructive CUDA context-loss qualification follow-up was not sticky: {follow_up}"
+            )));
+        }
+        Err(BackendError::Backend(format!(
+            "destructive CUDA context-loss qualification observed sticky driver failure: initial={failure}; follow_up={follow_up}"
+        )))
+    }
+
     fn validate_salt_v2_resident_context(
         &self,
         tensor: &SaltV2ResidentTensor,
@@ -189,6 +282,8 @@ impl CudaBackend {
         output_elements: usize,
         receipt: SaltV2ForwardReceipt,
     ) -> Result<Vec<f32>, BackendError> {
+        #[cfg(feature = "device-loss-qualification")]
+        self.maybe_poison_context_for_qualification()?;
         if output_elements == 0 {
             return Ok(Vec::new());
         }
@@ -301,6 +396,8 @@ impl CudaBackend {
         rows: &[u32],
         output: &mut [f32],
     ) -> Result<SaltV2GatherReceipt, BackendError> {
+        #[cfg(feature = "device-loss-qualification")]
+        self.maybe_poison_context_for_qualification()?;
         self.validate_salt_v2_resident_context(tensor)?;
         let output_elements = rows.len().checked_mul(tensor.columns).ok_or_else(|| {
             BackendError::InvalidInput("SALT V2 gather output length overflows usize".into())

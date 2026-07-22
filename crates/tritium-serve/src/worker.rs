@@ -179,6 +179,9 @@ pub(crate) fn spawn_worker(
                             }
                             Ok((Err(e), _)) => {
                                 if matches!(&e, GenError::Backend(_)) {
+                                    if latch_backend_faults {
+                                        eprintln!("tritium-serve: backend fault latched: {e}");
+                                    }
                                     record_backend_fault(
                                         &backend_faulted,
                                         &backend_faults,

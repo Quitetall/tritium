@@ -196,6 +196,38 @@ fn salt_v2_cuda_exact_forward_into_matches_allocating_api() {
     }
 }
 
+/// Destructive hardware gate: launch a real device trap and prove host output
+/// remains unpublished. Isolated test process must exit afterward because CUDA
+/// documents fatal device exceptions as sticky context failures.
+#[test]
+#[cfg(feature = "device-loss-qualification")]
+#[ignore = "destructively poisons this test process CUDA context"]
+fn destructive_context_loss_qualification_observes_driver_failure() {
+    let cuda = CudaBackend::new(0).expect("qualification requires a CUDA device");
+    let tensor = salt_v2_test_tensor(1, 4, &[1]);
+    let resident = cuda
+        .upload_salt_v2(&tensor, SaltV2Codec::D2)
+        .expect("upload qualification tensor");
+    let sentinel = f32::from_bits(0x3f12_3456);
+    let mut output = [sentinel];
+
+    assert!(request_destructive_context_loss_for_qualification());
+    let error = cuda
+        .salt_v2_forward_exact_into(&resident, &[1.0; 4], 1, &mut output)
+        .expect_err("device trap must surface as a CUDA driver failure");
+    assert!(
+        matches!(
+            error,
+            BackendError::Backend(ref message)
+                if message.starts_with(
+                    "destructive CUDA context-loss qualification observed sticky driver failure:"
+                )
+        ),
+        "unexpected qualification error: {error}"
+    );
+    assert_eq!(output[0].to_bits(), sentinel.to_bits());
+}
+
 #[test]
 fn salt_v2_cuda_forward_into_is_transactional_on_nonfinite_result() {
     let cuda = match CudaBackend::new(0) {

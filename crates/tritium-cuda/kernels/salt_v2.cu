@@ -102,6 +102,16 @@ __device__ __forceinline__ uint32_t plane_payload_bytes(
 
 }  // namespace
 
+#if defined(TRITIUM_DEVICE_LOSS_QUALIFICATION)
+// Release qualification only: a one-thread device trap poisons this CUDA
+// context, exercising the same sticky driver-error path as a fatal device
+// exception. Production code can launch this symbol only after its private,
+// signal-gated qualification arm is set; it is never part of model dispatch.
+extern "C" __global__ void tritium_qualification_poison_context() {
+  asm volatile("trap;");
+}
+#endif
+
 extern "C" __global__ void salt_v2_forward_exact(
     const float* activation,
     const unsigned char* payload,

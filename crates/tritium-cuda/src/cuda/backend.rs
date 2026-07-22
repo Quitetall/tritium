@@ -521,6 +521,9 @@ pub struct CudaBackend {
     pub(super) func_salt_v2_exact: CudaFunction,
     /// Exact selected-row reconstruction for SALT V2 token embeddings.
     pub(super) func_salt_v2_gather: CudaFunction,
+    /// Device trap used only by destructive release qualification.
+    #[cfg(feature = "device-loss-qualification")]
+    pub(super) func_qualification_poison: CudaFunction,
     /// Sparse-aware f32-tiled kernel: bitmap skip for zero blocks (P1 opt).
     #[allow(dead_code)]
     // validated sparse mpgemm kernel; auto-dispatch integration is future (1.x) work
@@ -1016,6 +1019,10 @@ impl CudaBackend {
         let func_salt_v2_gather = salt_v2_module
             .load_function(KERNEL_NAME_SALT_V2_GATHER)
             .map_err(|e| driver_err("resolve salt_v2_gather_rows kernel", &e))?;
+        #[cfg(feature = "device-loss-qualification")]
+        let func_qualification_poison = salt_v2_module
+            .load_function(KERNEL_NAME_QUALIFICATION_POISON)
+            .map_err(|e| driver_err("resolve qualification context-poison kernel", &e))?;
 
         let device_name = ctx
             .name()
@@ -1045,6 +1052,8 @@ impl CudaBackend {
             _salt_v2_module: salt_v2_module,
             func_salt_v2_exact,
             func_salt_v2_gather,
+            #[cfg(feature = "device-loss-qualification")]
+            func_qualification_poison,
             func_tiled_f32_sparse,
             func_tiled_i8_scaled_sparse,
             func_imma,

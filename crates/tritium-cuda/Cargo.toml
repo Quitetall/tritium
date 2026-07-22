@@ -82,6 +82,9 @@ half = { workspace = true, optional = true }
 [features]
 default = []
 cuda = ["dep:cudarc", "dep:tritium-format", "dep:tritium-train", "dep:linkme", "dep:serde", "dep:serde_json", "dep:half"]
+# Explicitly opt-in destructive release gate. Normal CUDA consumers cannot arm
+# or resolve the context-poison API.
+device-loss-qualification = ["cuda"]
 # Real NCCL collective backend (plan 0017): a `tritium_train::dist::ProcessGroup` impl over
 # `cudarc::nccl`, validated on a ≥2-GPU box against the deterministic simulated reference (0014).
 # cudarc's `nccl` feature pins the NCCL 2.30 bindings (`nccl-02030`) — the box needs `libnccl >= 2.30`

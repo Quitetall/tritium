@@ -121,12 +121,18 @@ fn main() {
 
     // SALT V2 freezes multiply/add rounding to the scalar CPU reference. The
     // first fast entry point deliberately aliases this exact image.
+    let salt_v2_flags: &[&str] =
+        if std::env::var_os("CARGO_FEATURE_DEVICE_LOSS_QUALIFICATION").is_some() {
+            &["--fmad=false", "-DTRITIUM_DEVICE_LOSS_QUALIFICATION=1"]
+        } else {
+            &["--fmad=false"]
+        };
     compile_ptx(
         &nvcc,
         Path::new("kernels/salt_v2.cu"),
         &out_dir.join("salt_v2.ptx"),
         add_min_arch,
-        &["--fmad=false"],
+        salt_v2_flags,
     );
 }
 

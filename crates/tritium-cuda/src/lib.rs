@@ -38,6 +38,9 @@
 #[cfg(feature = "cuda")]
 mod cuda;
 
+#[cfg(feature = "device-loss-qualification")]
+#[doc(hidden)]
+pub use cuda::request_destructive_context_loss_for_qualification;
 #[cfg(feature = "cuda")]
 pub use cuda::{CudaBackend, CudaDeviceIdentity, CudaMemorySnapshot, CudaMemoryTelemetry};
 

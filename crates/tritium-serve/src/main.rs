@@ -19,6 +19,24 @@ use tritium_cpu as _;
 #[cfg(feature = "cuda")]
 use tritium_cuda as _;
 
+const DESTRUCTIVE_CUDA_LOSS_ENV: &str = "TRITIUM_DESTRUCTIVE_CUDA_LOSS_QUALIFICATION";
+
+fn destructive_cuda_loss_enabled(
+    value: Option<&std::ffi::OsStr>,
+    backend: &str,
+) -> Result<bool, String> {
+    match value {
+        None => Ok(false),
+        Some(value) if value == "1" && backend == "cuda" => Ok(true),
+        Some(value) if value == "1" => Err(format!(
+            "{DESTRUCTIVE_CUDA_LOSS_ENV}=1 requires --backend cuda"
+        )),
+        Some(_) => Err(format!(
+            "{DESTRUCTIVE_CUDA_LOSS_ENV} must be unset or exactly `1`"
+        )),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut model_path: Option<String> = None;
@@ -145,6 +163,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if max_new > max_total_tokens {
         return Err("--max-new must not exceed --max-total-tokens".into());
+    }
+    let destructive_cuda_loss = destructive_cuda_loss_enabled(
+        std::env::var_os(DESTRUCTIVE_CUDA_LOSS_ENV).as_deref(),
+        &backend_name,
+    )?;
+    #[cfg(any(not(unix), not(feature = "device-loss-qualification")))]
+    if destructive_cuda_loss {
+        return Err(format!(
+            "{DESTRUCTIVE_CUDA_LOSS_ENV}=1 requires Unix and the `device-loss-qualification` feature"
+        )
+        .into());
     }
     // Resolve the named backend from the runtime registry (the same owned-init
     // pattern the acceptance tests use). `cpu` is always linked; `cuda` needs
@@ -452,12 +481,59 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let addr = std::net::SocketAddr::new(host_ip, port);
+    #[cfg(all(feature = "device-loss-qualification", unix))]
+    let destructive_signal = if destructive_cuda_loss {
+        Some(
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined2()).map_err(
+                |error| format!("install destructive CUDA qualification SIGUSR2 handler: {error}"),
+            )?,
+        )
+    } else {
+        None
+    };
     let listener = tokio::net::TcpListener::bind(addr).await?;
+    #[cfg(all(feature = "device-loss-qualification", unix))]
+    if let Some(mut signal) = destructive_signal {
+        tokio::spawn(async move {
+            if signal.recv().await.is_some() {
+                let armed = tritium_cuda::request_destructive_context_loss_for_qualification();
+                eprintln!(
+                    "tritium-serve: destructive CUDA context-loss qualification SIGUSR2 received; armed={armed}"
+                );
+            }
+        });
+    }
     eprintln!("tritium-serve: listening on http://{addr}/v1 (Ctrl-C to drain + stop)");
     axum::serve(listener, router)
         .with_graceful_shutdown(shutdown_signal(draining))
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn destructive_cuda_loss_gate_is_exact_and_cuda_only() {
+        assert_eq!(destructive_cuda_loss_enabled(None, "cpu"), Ok(false));
+        assert_eq!(
+            destructive_cuda_loss_enabled(Some(std::ffi::OsStr::new("1")), "cuda"),
+            Ok(true)
+        );
+        assert_eq!(
+            destructive_cuda_loss_enabled(Some(std::ffi::OsStr::new("1")), "cpu"),
+            Err(format!(
+                "{DESTRUCTIVE_CUDA_LOSS_ENV}=1 requires --backend cuda"
+            ))
+        );
+        assert_eq!(
+            destructive_cuda_loss_enabled(Some(std::ffi::OsStr::new("true")), "cuda"),
+            Err(format!(
+                "{DESTRUCTIVE_CUDA_LOSS_ENV} must be unset or exactly `1`"
+            ))
+        );
+    }
 }
 
 /// Resolve when Ctrl-C (or SIGTERM on unix) arrives, flagging `draining` so

@@ -282,6 +282,9 @@ pub(super) const KERNEL_NAME_ATTENTION_BWD: &str = "attention_backward_portable"
 pub(super) const KERNEL_NAME_SALT_V2_EXACT: &str = "salt_v2_forward_exact";
 /// Plan 0043 Stage 6: exact selected-row reconstruction for token embeddings.
 pub(super) const KERNEL_NAME_SALT_V2_GATHER: &str = "salt_v2_gather_rows";
+/// Destructive release-qualification kernel. Never used by model dispatch.
+#[cfg(feature = "device-loss-qualification")]
+pub(super) const KERNEL_NAME_QUALIFICATION_POISON: &str = "tritium_qualification_poison_context";
 /// Row-tile of [`KERNEL_NAME_LM_HEAD_TILED_F16`] — keep in sync with `LMHEAD_ROW_TILE` in decode.cu.
 pub(super) const LMHEAD_ROW_TILE: u32 = 8;
 /// Threads per block for `act_quant_int8_per_token` — must match the kernel's

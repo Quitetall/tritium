@@ -42,6 +42,8 @@
 
 use core::any::Any;
 use std::collections::HashMap;
+#[cfg(feature = "device-loss-qualification")]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cudarc::driver::{
@@ -67,6 +69,29 @@ mod kv;
 
 use consts::*;
 use kv::*;
+
+/// Process-local, one-shot arm for destructive CUDA context-loss qualification.
+/// Only `tritium-serve`'s explicitly enabled SIGUSR2 listener can set it.
+#[cfg(feature = "device-loss-qualification")]
+static QUALIFICATION_CONTEXT_LOSS_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Arm one destructive context-loss injection for release qualification.
+///
+/// This function does not touch CUDA and is safe from an async signal listener:
+/// the next SALT V2 execution on this process consumes the arm and launches a
+/// real device `trap`, making the CUDA context unusable until process restart.
+/// Returns `true` only for the first outstanding request.
+#[cfg(feature = "device-loss-qualification")]
+pub fn request_destructive_context_loss_for_qualification() -> bool {
+    QUALIFICATION_CONTEXT_LOSS_REQUESTED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+}
+
+#[cfg(feature = "device-loss-qualification")]
+fn take_destructive_context_loss_qualification_request() -> bool {
+    QUALIFICATION_CONTEXT_LOSS_REQUESTED.swap(false, Ordering::AcqRel)
+}
 
 /// Map a `cudarc` driver error to a [`BackendError`]. Allocation failures surface
 /// as [`BackendError::OutOfMemory`]; everything else is stringified into
