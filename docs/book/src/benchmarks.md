@@ -51,7 +51,7 @@ and printed by the always-on `roofline` bench.
 A batch-1 autoregressive step streams every weight from HBM exactly once, so it
 is bandwidth-bound:
 
-```
+```text
 decode_tok/s  ≤  peak_HBM_bandwidth / model_weight_bytes
 ```
 
@@ -68,7 +68,7 @@ e2e bench divides a measured rate into to report "% of roofline".
 
 Large-`M` prefill is bound by int8 tensor-core throughput, not bandwidth:
 
-```
+```text
 prefill_tok/s  ≤  peak_int8_TOPS / macs_per_token
 ```
 
