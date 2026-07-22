@@ -129,6 +129,12 @@ class OciContractTests(unittest.TestCase):
             "nvidia-smi",
             "receipt_id",
             "MAX_SSE_RESPONSE_BYTES",
+            "auth-required",
+            "malformed-json",
+            "principal-rate-limit",
+            "TRITIUM_RATE_LIMIT_RPM",
+            "retry-after",
+            "tritium_rate_rejections_total",
             "Compose cleanup failed",
         ):
             self.assertIn(token, script)

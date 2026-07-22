@@ -28,12 +28,13 @@ OCI_ARCHIVE = runpy.run_path(Path(__file__).with_name("verify-oci-archive.py"))
 validate_oci_archive = OCI_ARCHIVE["validate"]
 OciError = OCI_ARCHIVE["OciError"]
 
-SCHEMA = "tritium.oci-runtime-qualification.v1"
+SCHEMA = "tritium.oci-runtime-qualification.v2"
 HEX = frozenset("0123456789abcdef")
 MAX_JSON_RESPONSE_BYTES = 16 * 1024 * 1024
 MAX_SSE_RESPONSE_BYTES = 1024 * 1024
 CHECKS = (
     "production-readiness", "models", "buffered-generation", "sse-generation",
+    "auth-required", "malformed-json", "principal-rate-limit",
     "readonly-rootfs", "drop-all-capabilities", "no-new-privileges",
     "readonly-bundle", "sigterm-drain",
 )
@@ -99,6 +100,73 @@ def request_json(url: str, token: str, body: dict[str, Any] | None = None,
     if not isinstance(value, dict):
         raise QualificationError(f"response is not a JSON object: {url}")
     return value
+
+
+def request_response(
+    url: str, *, token: str | None, body: bytes | None = None,
+    timeout: float = 30.0,
+) -> tuple[int, dict[str, Any], dict[str, str]]:
+    request = urllib.request.Request(url, data=body)
+    if token is not None:
+        request.add_header("Authorization", f"Bearer {token}")
+    if body is not None:
+        request.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            status = response.status
+            headers = dict(response.headers.items())
+            payload = response.read(MAX_JSON_RESPONSE_BYTES + 1)
+    except urllib.error.HTTPError as error:
+        status = error.code
+        headers = dict(error.headers.items())
+        payload = error.read(MAX_JSON_RESPONSE_BYTES + 1)
+    except (OSError, urllib.error.URLError) as error:
+        raise QualificationError(f"request failed: {url}: {error}") from error
+    if len(payload) > MAX_JSON_RESPONSE_BYTES:
+        raise QualificationError(f"error response exceeds byte limit: {url}")
+    try:
+        value = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise QualificationError(f"error response is not UTF-8 JSON: {url}") from error
+    if not isinstance(value, dict):
+        raise QualificationError(f"error response is not a JSON object: {url}")
+    return status, value, {key.lower(): value for key, value in headers.items()}
+
+
+def request_error(
+    url: str, expected_status: int, expected_type: str, expected_message: str, *,
+    token: str | None,
+    body: bytes | None = None, timeout: float = 30.0,
+) -> tuple[dict[str, Any], dict[str, str]]:
+    status, value, headers = request_response(
+        url, token=token, body=body, timeout=timeout
+    )
+    expected = {"error": {"message": expected_message, "type": expected_type}}
+    if status != expected_status or value != expected:
+        raise QualificationError(
+            f"error response differs: {url}: status={status}, body={value!r}"
+        )
+    return value, headers
+
+
+def metric_value(base_url: str, token: str, name: str, timeout: float) -> int:
+    request = urllib.request.Request(base_url + "/metrics")
+    request.add_header("Authorization", f"Bearer {token}")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = response.read(MAX_SSE_RESPONSE_BYTES + 1)
+    except (OSError, urllib.error.URLError) as error:
+        raise QualificationError(f"metrics request failed: {error}") from error
+    if len(payload) > MAX_SSE_RESPONSE_BYTES:
+        raise QualificationError("metrics response exceeds byte limit")
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise QualificationError("metrics response is not UTF-8") from error
+    match = re.search(rf"(?m)^{re.escape(name)} ([0-9]+)$", text)
+    if match is None:
+        raise QualificationError(f"metrics response lacks integer {name}")
+    return int(match.group(1))
 
 
 def validate_ready(value: dict[str, Any], revision: str, flavor: str,
@@ -202,6 +270,7 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
 
     project = "tritium-qualify-" + secrets.token_hex(6)
     token = secrets.token_urlsafe(32)
+    replacement_token = secrets.token_urlsafe(32)
     port = free_port()
     environment = os.environ.copy()
     environment.update({
@@ -209,7 +278,10 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
         "TRITIUM_BUNDLE": str(bundle),
         "TRITIUM_PROFILE": args.profile,
         "TRITIUM_AUTH_TOKEN": token,
+        "TRITIUM_AUTH_TOKENS": replacement_token,
         "TRITIUM_PORT": str(port),
+        "TRITIUM_RATE_LIMIT_RPM": "1",
+        "TRITIUM_RATE_LIMIT_BURST": "8",
     })
     compose = [str(Path(__file__).with_name("run-oci-compose")), args.flavor,
                "-p", project]
@@ -231,6 +303,18 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
             ready, revision, args.flavor, args.profile, identity["blake3"], args.release
         )
         ready_at = time.monotonic()
+        _, unauthenticated_headers = request_error(
+            f"http://127.0.0.1:{port}/readyz", 401, "invalid_request_error",
+            "missing or invalid bearer token",
+            token=None,
+        )
+        if unauthenticated_headers.get("www-authenticate") != "Bearer":
+            raise QualificationError("authentication failure lacks Bearer challenge")
+        request_error(
+            f"http://127.0.0.1:{port}/v1/models", 401,
+            "invalid_request_error", "missing or invalid bearer token",
+            token="wrong-token",
+        )
         models = request_json(f"http://127.0.0.1:{port}/v1/models", token)
         entries = models.get("data")
         if not isinstance(entries, list) or len(entries) != 1 or not isinstance(entries[0], dict):
@@ -254,6 +338,52 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
         stream = stream_payload.decode("utf-8")
         if "data: [DONE]" not in stream or '"choices"' not in stream:
             raise QualificationError("streaming generation lacked choice data or terminal marker")
+        request_error(
+            f"http://127.0.0.1:{port}/v1/chat/completions", 400,
+            "invalid_request_error", "request body must be valid application/json",
+            token=token, body=b"{",
+        )
+        rate_rejections_before = metric_value(
+            f"http://127.0.0.1:{port}", token,
+            "tritium_rate_rejections_total", args.request_timeout,
+        )
+        rate_limited = None
+        for _ in range(32):
+            status, error, headers = request_response(
+                f"http://127.0.0.1:{port}/v1/chat/completions",
+                token=token, body=b"{",
+            )
+            rate_error = {"error": {
+                "message": "principal request rate exceeded; retry later",
+                "type": "rate_limit_exceeded",
+            }}
+            malformed_error = {"error": {
+                "message": "request body must be valid application/json",
+                "type": "invalid_request_error",
+            }}
+            if status == 429 and error == rate_error:
+                rate_limited = (error, headers)
+                break
+            if status != 400 or error != malformed_error:
+                raise QualificationError(
+                    "malformed JSON flood returned unexpected response"
+                )
+        if rate_limited is None or not rate_limited[1].get("retry-after", "").isdigit():
+            raise QualificationError("principal rate limit did not reject with Retry-After")
+        retry_after_seconds = int(rate_limited[1]["retry-after"])
+        if retry_after_seconds < 1:
+            raise QualificationError("principal rate limit returned invalid Retry-After")
+        request_error(
+            f"http://127.0.0.1:{port}/v1/chat/completions", 400,
+            "invalid_request_error", "request body must be valid application/json",
+            token=replacement_token, body=b"{",
+        )
+        rate_rejections_after = metric_value(
+            f"http://127.0.0.1:{port}", replacement_token,
+            "tritium_rate_rejections_total", args.request_timeout,
+        )
+        if rate_rejections_after - rate_rejections_before != 1:
+            raise QualificationError("rate-limit rejection metric delta differs")
         container = run(compose + ["ps", "-q", "tritium"], env=environment)
         container_inspect = json.loads(run(["docker", "inspect", container]))[0]
         host_config = container_inspect.get("HostConfig", {})
@@ -314,6 +444,14 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
                      "bytes": archive.stat().st_size, "sha256": sha256(archive)},
         "manifest": identity,
         "profile": args.profile, "startup_receipt": startup,
+        "faults": {
+            "unauthenticated_status": 401, "wrong_token_status": 401,
+            "malformed_json_status": 400, "rate_limited_status": 429,
+            "retry_after_seconds": retry_after_seconds,
+            "rate_rejections_before": rate_rejections_before,
+            "rate_rejections_after": rate_rejections_after,
+            "replacement_principal_status": 400,
+        },
         "checks": list(CHECKS),
         "started_at_utc": started_at_utc,
         "timing": {"startup_ms": (ready_at - started) * 1000, "shutdown_ms": shutdown_ms},
@@ -334,7 +472,8 @@ def validate_receipt(receipt: dict[str, Any], *, revision: str | None = None,
     expected = {
         "schema", "release", "source_revision", "run_id", "flavor", "image", "image_id",
         "image_manifest_digest", "artifact", "manifest", "profile", "startup_receipt",
-        "checks", "started_at_utc", "timing", "machine", "result", "receipt_id",
+        "faults", "checks", "started_at_utc", "timing", "machine", "result",
+        "receipt_id",
     }
     if set(receipt) != expected or receipt.get("schema") != SCHEMA or receipt.get("result") != "pass":
         raise QualificationError("runtime receipt fields or disposition differ")
@@ -402,6 +541,23 @@ def validate_receipt(receipt: dict[str, Any], *, revision: str | None = None,
         receipt_revision, receipt["flavor"], receipt["profile"], manifest["blake3"],
         receipt_release,
     )
+    faults = receipt.get("faults")
+    fault_fields = {
+        "unauthenticated_status", "wrong_token_status", "malformed_json_status",
+        "rate_limited_status", "retry_after_seconds", "rate_rejections_before",
+        "rate_rejections_after", "replacement_principal_status",
+    }
+    if (not isinstance(faults, dict) or set(faults) != fault_fields
+            or any(type(faults.get(field)) is not int for field in fault_fields)
+            or faults["unauthenticated_status"] != 401
+            or faults["wrong_token_status"] != 401
+            or faults["malformed_json_status"] != 400
+            or faults["rate_limited_status"] != 429
+            or faults["replacement_principal_status"] != 400
+            or faults["retry_after_seconds"] < 1
+            or faults["rate_rejections_before"] < 0
+            or faults["rate_rejections_after"] - faults["rate_rejections_before"] != 1):
+        raise QualificationError("runtime receipt fault evidence differs")
     try:
         timestamp = datetime.fromisoformat(
             str(receipt.get("started_at_utc")).replace("Z", "+00:00")

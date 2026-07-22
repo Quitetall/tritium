@@ -15,6 +15,7 @@ canonical = MODULE["canonical"]
 validate_ready = MODULE["validate_ready"]
 validate_receipt = MODULE["validate_receipt"]
 request_json = MODULE["request_json"]
+request_error = MODULE["request_error"]
 
 
 def readiness(flavor: str = "cpu"):
@@ -49,7 +50,7 @@ def runtime_receipt(artifact: Path, flavor: str = "cpu") -> dict:
     import hashlib
 
     value = {
-        "schema": "tritium.oci-runtime-qualification.v1", "release": "1.1.0-rc.0",
+        "schema": MODULE["SCHEMA"], "release": "1.1.0-rc.0",
         "source_revision": "a" * 40, "run_id": f"{flavor}-1", "flavor": flavor,
         "image": "example@sha256:" + "b" * 64,
         "image_id": "sha256:" + "c" * 64,
@@ -60,6 +61,12 @@ def runtime_receipt(artifact: Path, flavor: str = "cpu") -> dict:
         "manifest": {"schema": "tritium.file-identity.v1", "bytes": 42,
                      "sha256": "2" * 64, "blake3": "c" * 64},
         "profile": "compact-v1", "startup_receipt": readiness(flavor)["startup_receipt"],
+        "faults": {
+            "unauthenticated_status": 401, "wrong_token_status": 401,
+            "malformed_json_status": 400, "rate_limited_status": 429,
+            "retry_after_seconds": 60, "rate_rejections_before": 0,
+            "rate_rejections_after": 1, "replacement_principal_status": 400,
+        },
         "checks": list(MODULE["CHECKS"]),
         "started_at_utc": "2026-07-21T00:00:00+00:00",
         "timing": {"startup_ms": 10.0, "shutdown_ms": 5.0},
@@ -76,6 +83,32 @@ def runtime_receipt(artifact: Path, flavor: str = "cpu") -> dict:
 
 
 class QualifyOciRuntimeTests(unittest.TestCase):
+    def test_error_client_requires_stable_json_type_and_headers(self):
+        class Response:
+            status = 429
+            headers = {"Retry-After": "60"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, _limit):
+                return (
+                    b'{"error":{"message":"principal request rate exceeded; retry later",'
+                    b'"type":"rate_limit_exceeded"}}'
+                )
+
+        with mock.patch.object(MODULE["urllib"].request, "urlopen", return_value=Response()):
+            _, headers = request_error(
+                "http://127.0.0.1/v1/chat/completions", 429,
+                "rate_limit_exceeded",
+                "principal request rate exceeded; retry later",
+                token="token", body=b"{",
+            )
+        self.assertEqual(headers["retry-after"], "60")
+
     def test_json_client_rejects_oversized_response(self):
         class Response:
             def __enter__(self):
@@ -125,6 +158,18 @@ class QualifyOciRuntimeTests(unittest.TestCase):
             )
             receipt["run_id"] = "tampered"
             with self.assertRaisesRegex(QualificationError, "content digest"):
+                validate_receipt(receipt)
+
+    def test_receipt_validator_rejects_noncausal_fault_evidence(self):
+        with tempfile.TemporaryDirectory() as raw:
+            artifact = Path(raw) / "image.oci.tar"
+            artifact.write_bytes(b"qualified OCI bytes")
+            receipt = runtime_receipt(artifact)
+            receipt["faults"]["rate_rejections_after"] = 2
+            import hashlib
+            del receipt["receipt_id"]
+            receipt["receipt_id"] = "sha256:" + hashlib.sha256(canonical(receipt)).hexdigest()
+            with self.assertRaisesRegex(QualificationError, "fault evidence"):
                 validate_receipt(receipt)
 
     def test_receipt_validator_rejects_cross_artifact_bytes(self):

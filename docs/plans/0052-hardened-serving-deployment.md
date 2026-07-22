@@ -287,6 +287,15 @@ image, and the runtime/deployment startup receipts must be identical.
 
 Run the exact local-RC image/chart through a sealed scenario matrix:
 
+OCI runtime qualification v2 now executes the first production failure subset
+against exact CPU/CUDA candidate images: unauthenticated and wrong-token access,
+stable malformed-JSON envelopes, deterministic per-principal `429` plus
+`Retry-After`, second-principal isolation and an exact rejection-counter delta.
+The content-addressed receipt retains statuses, retry duration and counter
+baseline/final values. Oversized-body `413` and all
+three POST surfaces use the same bounded OpenAI JSON error envelope in router
+contract tests. Remaining scenarios below still block this slice.
+
 1. malformed/truncated/wrong-identity artifact at startup;
 2. missing secret, invalid config and unavailable requested backend;
 3. queue flood, rate-limit flood, slow SSE reader and client disconnect;

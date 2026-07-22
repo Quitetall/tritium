@@ -150,6 +150,12 @@ def oci_runtime_receipt(path: Path, artifact: Path, *, flavor: str = "cpu") -> d
         "manifest": {"schema": "tritium.file-identity.v1", "bytes": 42,
                      "sha256": "4" * 64, "blake3": "c" * 64},
         "profile": "compact-v1", "startup_receipt": startup,
+        "faults": {
+            "unauthenticated_status": 401, "wrong_token_status": 401,
+            "malformed_json_status": 400, "rate_limited_status": 429,
+            "retry_after_seconds": 60, "rate_rejections_before": 0,
+            "rate_rejections_after": 1, "replacement_principal_status": 400,
+        },
         "checks": list(OCI_RUNTIME_MODULE["CHECKS"]),
         "started_at_utc": "2026-07-21T12:00:00+00:00",
         "timing": {"startup_ms": 100.0, "shutdown_ms": 10.0},

@@ -338,6 +338,36 @@ async fn models_liveness_and_readiness_split_during_drain() {
 #[tokio::test]
 async fn invalid_requests_rejected() {
     let (router, _) = mock_router(vec![1], FinishReason::Stop);
+    for uri in [
+        "/v1/chat/completions",
+        "/v1/tree/session",
+        "/v1/tree/verify",
+    ] {
+        let request = Request::post(uri)
+            .header("content-type", "application/json")
+            .body(Body::from("{"))
+            .unwrap();
+        let (status, body) = send(&router, request).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let error: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["error"]["type"], "invalid_request_error");
+        assert_eq!(
+            error["error"]["message"],
+            "request body must be valid application/json"
+        );
+    }
+    let missing_content_type = Request::post("/v1/chat/completions")
+        .body(Body::from("{}"))
+        .unwrap();
+    let (status, body) = send(&router, missing_content_type).await;
+    assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    let error: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(error["error"]["type"], "invalid_request_error");
+    assert_eq!(
+        error["error"]["message"],
+        "content-type must be application/json"
+    );
+
     let (s, b) = send(&router, chat(json!({"model":"tritium","messages":[]}))).await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
     let v: Value = serde_json::from_slice(&b).unwrap();
@@ -898,8 +928,14 @@ async fn oversized_body_rejected() {
             r#"{{"model":"tritium","messages":[{{"role":"user","content":"{big}"}}]}}"#
         )))
         .unwrap();
-    let (status, _) = send(&router, req).await;
+    let (status, body) = send(&router, req).await;
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    let error: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(error["error"]["type"], "invalid_request_error");
+    assert_eq!(
+        error["error"]["message"],
+        "request body exceeds configured byte limit"
+    );
 }
 
 /// Non-streaming requests are bounded by the request timeout: the handler

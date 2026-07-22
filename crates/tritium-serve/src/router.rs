@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::extract::State;
+use axum::extract::rejection::JsonRejection;
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -575,6 +576,24 @@ fn request_ready(state: &AppState) -> bool {
             .is_none_or(ProductionReadiness::is_serving)
 }
 
+fn json_rejection(rejection: JsonRejection) -> Response {
+    let (status, message) = match rejection.status() {
+        StatusCode::PAYLOAD_TOO_LARGE => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request body exceeds configured byte limit",
+        ),
+        StatusCode::UNSUPPORTED_MEDIA_TYPE => (
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "content-type must be application/json",
+        ),
+        _ => (
+            StatusCode::BAD_REQUEST,
+            "request body must be valid application/json",
+        ),
+    };
+    api_error(status, "invalid_request_error", message, None)
+}
+
 /// Lower the OpenAI sampling fields to the internal [`Sampling`]. `temperature
 /// <= 0` is deterministic greedy; otherwise top-p if given, else greedy (we do
 /// not invent a default top_p).
@@ -593,7 +612,14 @@ fn lower_sampling(req: &ChatRequest) -> Sampling {
     }
 }
 
-async fn chat_completions(State(st): State<AppState>, Json(req): Json<ChatRequest>) -> Response {
+async fn chat_completions(
+    State(st): State<AppState>,
+    request: Result<Json<ChatRequest>, JsonRejection>,
+) -> Response {
+    let req = match request {
+        Ok(Json(req)) => req,
+        Err(rejection) => return json_rejection(rejection),
+    };
     if st.runtime.draining.load(Ordering::Relaxed) {
         return api_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1239,7 +1265,14 @@ struct TreeVerifyRequest {
     parents: Vec<i32>,
 }
 
-async fn tree_session(State(st): State<AppState>, Json(req): Json<TreeSessionRequest>) -> Response {
+async fn tree_session(
+    State(st): State<AppState>,
+    request: Result<Json<TreeSessionRequest>, JsonRejection>,
+) -> Response {
+    let req = match request {
+        Ok(Json(req)) => req,
+        Err(rejection) => return json_rejection(rejection),
+    };
     if st.runtime.draining.load(Ordering::Relaxed) {
         return api_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1275,7 +1308,14 @@ async fn tree_session(State(st): State<AppState>, Json(req): Json<TreeSessionReq
     }
 }
 
-async fn tree_verify(State(st): State<AppState>, Json(req): Json<TreeVerifyRequest>) -> Response {
+async fn tree_verify(
+    State(st): State<AppState>,
+    request: Result<Json<TreeVerifyRequest>, JsonRejection>,
+) -> Response {
+    let req = match request {
+        Ok(Json(req)) => req,
+        Err(rejection) => return json_rejection(rejection),
+    };
     if st.runtime.draining.load(Ordering::Relaxed) {
         return api_error(
             StatusCode::SERVICE_UNAVAILABLE,
