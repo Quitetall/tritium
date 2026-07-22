@@ -19,13 +19,13 @@ def sha256(path: Path) -> str:
 
 
 def mode(name: str) -> dict:
-    steps = 5
+    steps = 20
     batch = 2
-    sequence = 8
+    sequence = 128
     tokens = steps * batch * sequence
-    elapsed = 400.0 if name == "ddp" else 500.0
+    elapsed = 20_000.0 if name == "ddp" else 25_000.0
     throughput = tokens / (elapsed / 1000.0)
-    single_device = 125.0
+    single_device = 160.0
     return {
         "name": name,
         "backend": "nccl",
@@ -57,7 +57,7 @@ def receipt(artifact: Path) -> dict:
         "release": "1.1.0-rc.0",
         "run_id": "two-gpu-run-1",
         "started_at_utc": "2026-07-22T12:00:00Z",
-        "duration_ms": 12000.0,
+        "duration_ms": 60000.0,
         "source_dirty": False,
         "command_contract": "torchrun-nproc2-ddp-then-fsdp-v1",
         "artifact": {
@@ -135,7 +135,7 @@ class VerifyHfDistributedReceiptTests(unittest.TestCase):
                 elif mutation == "arithmetic":
                     value["modes"][0]["tokens_per_second"] += 1.0
                 elif mutation == "scaling":
-                    value["modes"][0]["single_device_tokens_per_second"] = 200.0
+                    value["modes"][0]["single_device_tokens_per_second"] = 256.0
                     value["modes"][0]["scaling_efficiency"] = 0.5
                 value["receipt_id"] = (
                     "sha256:"

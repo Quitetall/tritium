@@ -404,7 +404,8 @@ Multi-device admission uses
 and FSDP NCCL/fp16 runs on two distinct physical GPU UUIDs, exact checkpoint
 and RNG continuation, zero profiled ternary-op host transfers, candidate-wheel
 and model identities, internally consistent token throughput, measured peak
-memory, and scaling efficiency of at least 70% for DDP and 55% for FSDP against
+memory, a workload of at least 100M parameters, 20 measured steps at sequence
+length 128 or greater, and scaling efficiency of at least 70% for DDP and 55% for FSDP against
 the bound single-device baseline. Shared-device ranks, missing modes, dirty
 source, stale artifacts, copied arithmetic or lower efficiency fail closed.
 This schema and registry dispatch are structural until a qualified two-GPU run

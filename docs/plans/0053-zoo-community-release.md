@@ -205,7 +205,7 @@ The evidence registry now also recognizes only strict
 `tritium.hf-distributed-qualification.v1` input for `distributed-training`.
 Its validator rejects shared-device ranks, absent DDP/FSDP modes, dirty or stale
 wheel provenance, checkpoint/RNG or host-transfer failures, inconsistent
-throughput, and sub-gate scaling efficiency. No local receipt exists because
+throughput, sub-100M or short workloads, and sub-gate scaling efficiency. No local receipt exists because
 this host has one physical GPU; validator presence is structural, not empirical
 distributed evidence.
 

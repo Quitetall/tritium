@@ -146,10 +146,12 @@ def _validate_mode(raw: Any) -> dict[str, Any]:
     if mode["world_size"] != 2:
         raise ReceiptError(f"{name} must use world_size=2")
     steps = _positive_int(mode["steps"], f"{name}.steps")
-    if steps < 3:
-        raise ReceiptError(f"{name} must measure at least three steps")
+    if steps < 20:
+        raise ReceiptError(f"{name} must measure at least twenty steps")
     batch = _positive_int(mode["global_batch_size"], f"{name}.global_batch_size")
     sequence = _positive_int(mode["sequence_length"], f"{name}.sequence_length")
+    if sequence < 128:
+        raise ReceiptError(f"{name} sequence length is below the representative gate")
     measured_tokens = _positive_int(mode["measured_tokens"], f"{name}.measured_tokens")
     if measured_tokens != steps * batch * sequence:
         raise ReceiptError(f"{name} measured-token arithmetic is inconsistent")
@@ -224,7 +226,9 @@ def validate(
     if document["command_contract"] != "torchrun-nproc2-ddp-then-fsdp-v1":
         raise ReceiptError("distributed command contract mismatch")
     _digest(document["model_config_sha256"], "model_config_sha256")
-    _positive_int(document["model_parameters"], "model_parameters")
+    model_parameters = _positive_int(document["model_parameters"], "model_parameters")
+    if model_parameters < 100_000_000:
+        raise ReceiptError("distributed workload must contain at least 100M parameters")
     artifact = _object(document["artifact"], ARTIFACT_FIELDS, "artifact")
     if artifact["kind"] != "python-wheel":
         raise ReceiptError("distributed artifact must be a Python wheel")
