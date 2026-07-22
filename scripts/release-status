@@ -341,8 +341,8 @@ def main() -> int:
     if not report["ready"]:
         print(f"release-status: LOCAL_RC_BLOCKED: {document['release']}", file=sys.stderr)
         return 1
-    print(f"release-status: LOCAL_RC_READY: {document['release']}")
-    return 0
+    print(f"release-status: LOCAL_RC_EVIDENCE_READY_UNSIGNED: {document['release']}")
+    return 2
 
 
 if __name__ == "__main__":

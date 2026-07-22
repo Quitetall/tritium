@@ -53,7 +53,7 @@ GATES = (
     ),
     ("serving", ("serving-deployment",)),
     ("zoo-community", ("model-zoo", "generated-claims", "governance-docs")),
-    ("reproduction-signoff", ("second-machine", "independent-review", "signature")),
+    ("reproduction-signoff", ("second-machine", "independent-review")),
 )
 
 
@@ -313,6 +313,7 @@ def evaluate(registry: Path, candidate: Path, candidate_document: dict[str, Any]
         "release": release,
         "source_revision": revision,
         "candidate_manifest_sha256": expected_candidate,
+        "evidence_registry_sha256": _sha256(registry),
         "ready": ready,
         "rows": rows,
         "external_activation": "EXTERNAL_AUTH_REQUIRED",

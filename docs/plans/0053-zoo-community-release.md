@@ -258,6 +258,14 @@ receipt-kind validators and generated-claim drift checks must land before every
 model-zoo, package, browser, serving, deployment, signing and second-machine
 receipt can produce `LOCAL_RC_READY`.
 
+Progress (2026-07-21): aggregate sign-off now uses a non-circular two-layer
+contract. The registry report binds its own SHA-256 and can reach only
+`LOCAL_RC_EVIDENCE_READY_UNSIGNED` (exit 2). A detached SSH signature then binds
+the exact candidate manifest, evidence registry and report to an allowed signer
+principal; only successful detached verification emits `LOCAL_RC_READY`. No key,
+signature or tag is generated implicitly. The remaining receipt validators and
+empirical gates still block creation of a real passing report.
+
 Target-specific model, GPU, browser, package, container and cluster commands
 are invoked by the candidate manifest and must emit admitted receipts. A skipped
 test, absent target or zero-case report is not green.

@@ -481,6 +481,47 @@ class ReleaseEvidenceStatusTests(unittest.TestCase):
             self.assertIn("native-backends", stdout.getvalue())
             self.assertFalse(json.loads(output.read_text(encoding="utf-8"))["ready"])
 
+    def test_release_status_never_calls_unsigned_evidence_local_rc_ready(self):
+        with tempfile.TemporaryDirectory() as raw:
+            candidate, document, _, evidence_root = release_fixture(Path(raw))
+            registry_path = evidence_root / "registry.json"
+            registry(registry_path, candidate, [])
+            report = {
+                "schema": "tritium.release-gate-report.v1",
+                "release": document["release"],
+                "source_revision": document["source_revision"],
+                "candidate_manifest_sha256": sha256(candidate),
+                "evidence_registry_sha256": sha256(registry_path),
+                "ready": True,
+                "rows": [],
+                "external_activation": "EXTERNAL_AUTH_REQUIRED",
+            }
+            globals_ = status_main.__globals__
+            replacements = {
+                "validate": lambda _candidate, _tool: document,
+                "_git_gate": lambda _root, _revision: None,
+                "_version_gate": lambda _root, _release: None,
+            }
+            original = {name: globals_[name] for name in replacements}
+            globals_.update(replacements)
+            stdout = io.StringIO()
+            try:
+                with mock.patch.object(
+                    sys, "argv",
+                    ["release-status", "--candidate", str(candidate),
+                     "--registry", str(registry_path)],
+                ), mock.patch("sys.stdout", stdout), mock.patch.object(
+                    globals_["runpy"], "run_path",
+                    return_value={"evaluate": lambda *_args: report,
+                                  "render": lambda _report: "ALL GATES PASS"},
+                ):
+                    result = status_main()
+            finally:
+                globals_.update(original)
+            self.assertEqual(result, 2)
+            self.assertIn("LOCAL_RC_EVIDENCE_READY_UNSIGNED", stdout.getvalue())
+            self.assertNotIn("LOCAL_RC_READY", stdout.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

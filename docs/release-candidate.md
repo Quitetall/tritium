@@ -107,6 +107,31 @@ evidence.
 Public activation is always `EXTERNAL_AUTH_REQUIRED` and is not inferred from
 local evidence.
 
-Signing and aggregate release-gate admission remain open work. Never publish
-registry artifacts, push candidate tags or use maintainer signing identity
-without explicit authorization.
+## Local sign-off
+
+Evidence readiness and maintainer sign-off are separate layers. A complete
+registry produces `LOCAL_RC_EVIDENCE_READY_UNSIGNED` with exit status 2; it does
+not produce `LOCAL_RC_READY`. Seal that exact canonical report with an SSH
+signing key, then verify it against a reviewed `allowed_signers` file:
+
+```bash
+python scripts/local-rc-signoff.py seal \
+  --report release/v1.1-evidence/status.json \
+  --registry release/v1.1-evidence/registry.json \
+  --candidate release/v1.1/manifest.json \
+  --principal release-maintainer --key /secure/release-key \
+  --output release/v1.1-evidence/signoff.json
+python scripts/local-rc-signoff.py verify \
+  --report release/v1.1-evidence/status.json \
+  --registry release/v1.1-evidence/registry.json \
+  --candidate release/v1.1/manifest.json \
+  --principal release-maintainer \
+  --statement release/v1.1-evidence/signoff.json \
+  --signature release/v1.1-evidence/signoff.json.sig \
+  --allowed-signers /secure/tritium-release-allowed-signers
+```
+
+The statement binds candidate-manifest, registry and report SHA-256 identities,
+release revision and signer principal. Any evidence change invalidates it. Key
+generation, signer authorization and the local tag remain explicit maintainer
+actions; no publication or tag push is inferred.
