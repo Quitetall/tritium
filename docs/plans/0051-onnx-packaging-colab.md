@@ -258,8 +258,13 @@ The exact npm archive verifier now emits its own deterministic CycloneDX 1.6
 document into retained evidence. It binds archive SHA-256/bytes, package/version,
 source revision, WASM guest digest, every lockfile component with strong
 integrity, license and platform metadata, plus exact runtime dependency edges;
-development/build dependencies remain visible with excluded scope. Crate, OCI,
-chart, ONNX and model-artifact SBOM lanes remain open.
+development/build dependencies remain visible with excluded scope.
+Publish-readiness CI now retains every exact `.crate` beside a bound
+cargo-cyclonedx inventory. Admission checks archive name/size, complete safe tar
+topology, `Cargo.toml.orig`, clean exact `.cargo_vcs_info.json`, package/version,
+archive SHA-256 and source revision. Local `file://`/absolute-path component IDs,
+PURLs and dependency edges are canonically rewritten before upload. OCI, chart,
+ONNX and model-artifact SBOM lanes remain open.
 
 Set one candidate version source for Rust crates, Python metadata, npm metadata,
 CLI output, schemas, docs and user agent. `1.1.0-rc.N` archives advance during

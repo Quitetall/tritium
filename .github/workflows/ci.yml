@@ -366,7 +366,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - run: cargo install cargo-cyclonedx --locked
       - run: ./scripts/check-publish.sh
+      - name: bind exact crate archives to CycloneDX and source revision
+        run: >-
+          python scripts/generate-crate-sboms.py
+          --archives target/package
+          --output crate-evidence
+          --source-revision ${{ github.sha }}
+          --source-date-epoch 0
+      - uses: actions/upload-artifact@v4
+        with:
+          name: crate-candidates-${{ github.sha }}
+          path: |
+            target/package/*.crate
+            crate-evidence/*.cdx.json
+          if-no-files-found: error
 
   # SBOM (ADR 0011 / v0.90): generate a CycloneDX software bill of materials for the
   # whole workspace and upload it as a build artifact.
