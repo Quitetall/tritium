@@ -5,6 +5,7 @@ import hashlib
 from pathlib import Path
 import runpy
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -40,6 +41,8 @@ prove_absent = MODULE["prove_absent"]
 resource_quantity = MODULE["resource_quantity"]
 resource_usage_sample = MODULE["resource_usage_sample"]
 request_evidence = MODULE["request_evidence"]
+qualify_metrics_scrape_flood = MODULE["qualify_metrics_scrape_flood"]
+validate_metrics_flood = MODULE["validate_metrics_flood"]
 
 
 def startup(flavor: str = "cpu") -> dict:
@@ -313,6 +316,34 @@ def receipt(chart: Path, image_archive: Path, candidate: Path,
                 "tritium_backend_faults_total": 0.0,
                 "tritium_backend_faulted": 0.0,
             }},
+            "metrics_scrape_flood": {
+                "endpoint": "/metrics", "authentication": "bearer",
+                "requests": 64, "concurrency": 8, "peak_client_tasks": 8,
+                "budget_ms": 60000, "duration_ms": 1000.0,
+                "max_response_bytes": 1024 * 1024,
+                "response_bytes": [1024] * 64,
+                "response_sha256s": [f"{index:064x}" for index in range(64)],
+                "response_latency_ms": [500.0] * 64,
+                "max_scrape_latency_ms": 500.0, "generation_latency_ms": 750.0,
+                "generation_response_sha256": "3" * 64,
+                "request": request_evidence(
+                    "tritium", "Hello", temperature=0, max_tokens=1
+                ),
+                "baseline_metrics": {"sha256": "5" * 64, "values": {
+                    "tritium_chat_requests_total": 1.0,
+                    "tritium_tokens_out_total": 1.0,
+                    "tritium_worker_alive": 1.0,
+                    "tritium_backend_faults_total": 0.0,
+                    "tritium_backend_faulted": 0.0,
+                }},
+                "metrics": {"sha256": "4" * 64, "values": {
+                    "tritium_chat_requests_total": 2.0,
+                    "tritium_tokens_out_total": 2.0,
+                    "tritium_worker_alive": 1.0,
+                    "tritium_backend_faults_total": 0.0,
+                    "tritium_backend_faulted": 0.0,
+                }},
+            },
             "restart_recovery": {
                 "generation_response_sha256": "7" * 64,
                 "metrics": {"sha256": "8" * 64, "values": {
@@ -411,6 +442,103 @@ def validate(value: dict, chart: Path, image: Path, manifest: Path,
 
 
 class QualifyKubernetesDeploymentTests(unittest.TestCase):
+    def test_metrics_scrape_flood_runs_synchronized_generation(self):
+        baseline = "\n".join([
+            "tritium_chat_requests_total 1",
+            "tritium_tokens_out_total 1",
+            "tritium_worker_alive 1",
+            "tritium_backend_faults_total 0",
+            "tritium_backend_faulted 0",
+            "",
+        ]).encode()
+        metrics = "\n".join([
+            "tritium_chat_requests_total 2",
+            "tritium_tokens_out_total 2",
+            "tritium_worker_alive 1",
+            "tritium_backend_faults_total 0",
+            "tritium_backend_faulted 0",
+            "",
+        ]).encode()
+        with mock.patch.dict(qualify_metrics_scrape_flood.__globals__, {
+            "request": mock.Mock(side_effect=[baseline, *([metrics] * 65)]),
+            "request_json": mock.Mock(return_value={"choices": [{"message": {
+                "role": "assistant", "content": "ok",
+            }}]}),
+        }):
+            result = qualify_metrics_scrape_flood(
+                "http://127.0.0.1:8080", "token", model_id="tritium",
+                prompt="Hello", request_timeout=5,
+            )
+        self.assertEqual(result["requests"], 64)
+        self.assertEqual(result["peak_client_tasks"], 8)
+        self.assertEqual(len(result["response_sha256s"]), 64)
+
+    def test_metrics_scrape_flood_bounds_stalled_wave_by_one_deadline(self):
+        metrics = "\n".join([
+            "tritium_chat_requests_total 1", "tritium_tokens_out_total 1",
+            "tritium_worker_alive 1", "tritium_backend_faults_total 0",
+            "tritium_backend_faulted 0", "",
+        ]).encode()
+        calls = 0
+        lock = __import__("threading").Lock()
+
+        def stalled(_url, _token, *, timeout):
+            nonlocal calls
+            with lock:
+                calls += 1
+                call = calls
+            if call == 1:
+                return metrics
+            del timeout
+            __import__("threading").Event().wait()
+            raise AssertionError("unreachable")
+
+        began = time.monotonic()
+        with mock.patch.dict(qualify_metrics_scrape_flood.__globals__, {
+            "METRICS_FLOOD_BUDGET_MS": 50,
+            "request": stalled,
+            "request_json": mock.Mock(return_value={"choices": [{}]}),
+        }), self.assertRaisesRegex(DeploymentError, "wall deadline"):
+            qualify_metrics_scrape_flood(
+                "http://127.0.0.1:8080", "token", model_id="tritium",
+                prompt="Hello", request_timeout=5,
+            )
+        self.assertLess(time.monotonic() - began, 0.5)
+
+    def test_metrics_scrape_flood_final_scrape_uses_remaining_deadline(self):
+        baseline = "\n".join([
+            "tritium_chat_requests_total 1", "tritium_tokens_out_total 1",
+            "tritium_worker_alive 1", "tritium_backend_faults_total 0",
+            "tritium_backend_faulted 0", "",
+        ]).encode()
+        final = baseline.replace(b"total 1", b"total 2")
+        calls = 0
+        lock = __import__("threading").Lock()
+
+        def final_stall(_url, _token, *, timeout):
+            nonlocal calls
+            with lock:
+                calls += 1
+                call = calls
+            if call == 1:
+                return baseline
+            if call <= 65:
+                return final
+            time.sleep(timeout + 0.02)
+            raise DeploymentError("final metrics timeout")
+
+        began = time.monotonic()
+        with mock.patch.dict(qualify_metrics_scrape_flood.__globals__, {
+            "METRICS_FLOOD_BUDGET_MS": 100,
+            "request": final_stall,
+            "request_json": mock.Mock(return_value={"choices": [{}]}),
+        }), self.assertRaisesRegex(DeploymentError, "wall deadline"):
+            qualify_metrics_scrape_flood(
+                "http://127.0.0.1:8080", "token", model_id="tritium",
+                prompt="Hello", request_timeout=5,
+            )
+        self.assertLess(time.monotonic() - began, 0.5)
+
     def test_deployment_update_identity_binds_exact_rate_limit_delta(self):
         document = {
             "metadata": {"generation": 4},
@@ -1076,6 +1204,25 @@ class QualifyKubernetesDeploymentTests(unittest.TestCase):
             value["receipt_id"] = "sha256:" + hashlib.sha256(canonical(value)).hexdigest()
             with self.assertRaisesRegex(DeploymentError, "OOM high-water evidence"):
                 validate(value, chart, image, manifest, build, candidate)
+
+    def test_receipt_validator_binds_metrics_flood_concurrency_and_responses(self):
+        for target in ("peak", "response"):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as raw:
+                chart, image, manifest, build, candidate = candidate_inputs(raw)
+                value = receipt(chart, image, candidate)
+                flood = value["workload"]["metrics_scrape_flood"]
+                if target == "peak":
+                    flood["peak_client_tasks"] = 7
+                else:
+                    flood["response_sha256s"].pop()
+                del value["receipt_id"]
+                value["receipt_id"] = "sha256:" + hashlib.sha256(
+                    canonical(value)
+                ).hexdigest()
+                with self.assertRaisesRegex(
+                    DeploymentError, "metrics-flood bounds|metrics-flood responses"
+                ):
+                    validate(value, chart, image, manifest, build, candidate)
 
     def test_receipt_validator_rejects_chart_or_image_drift(self):
         for target in ("chart", "image"):

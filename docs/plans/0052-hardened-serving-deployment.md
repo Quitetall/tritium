@@ -370,10 +370,23 @@ transitions, and Metrics API resource samples with an offline-recomputed high
 water mark. This proves host-memory OOM replacement for both CPU and CUDA lanes;
 CUDA device loss remains a distinct open gate.
 
+Authenticated metrics resilience now has a backend-independent Kubernetes v8
+gate. Both CPU and CUDA lanes synchronize eight `/metrics` client tasks, execute
+64 bounded scrapes, and release a real one-token generation through the same
+client-side launch barrier as the first wave. This does not claim server-side
+request ordering. One absolute 60-second deadline covers the baseline, every
+wave, generation, executor shutdown and final scrape: the parent qualifier runs
+the threaded HTTP workload in an isolated Linux worker process and terminates
+that process at the deadline, so non-cooperative I/O cannot strand teardown.
+Qualification binds the
+client-task peak, wall and all per-call latencies, every response size and digest,
+the generation request/response, counter deltas and clean post-flood telemetry.
+Prometheus collector disappearance and recovery remain the CPU telemetry subgate.
+
 1. malformed/truncated/wrong-identity artifact at startup;
 2. missing secret, invalid config and unavailable requested backend;
 3. latched backend/device loss;
-4. telemetry collector unavailable/slow and metrics scrape flood;
+4. telemetry collector unavailable/slow;
 5. failed rollout followed by digest-pinned rollback.
 
 Every scenario records configuration, source/image/chart/artifact digests,

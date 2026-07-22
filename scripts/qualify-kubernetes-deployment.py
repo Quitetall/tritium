@@ -5,12 +5,13 @@ from __future__ import annotations
 
 import argparse
 import base64
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait as wait_futures
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 import hashlib
 import json
 import math
+import multiprocessing
 import os
 from pathlib import Path
 import re
@@ -33,7 +34,7 @@ manifest_identity = RUNTIME["manifest_identity"]
 OCI_ARCHIVE = runpy.run_path(Path(__file__).with_name("verify-oci-archive.py"))
 validate_oci_archive = OCI_ARCHIVE["validate"]
 
-SCHEMA = "tritium.kubernetes-deployment-qualification.v7"
+SCHEMA = "tritium.kubernetes-deployment-qualification.v8"
 HEX = frozenset("0123456789abcdef")
 SAFE_NAME = re.compile(r"[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?")
 SAFE_SECRET_KEY = re.compile(r"[A-Za-z0-9](?:[-._A-Za-z0-9]{0,251}[A-Za-z0-9])?")
@@ -59,6 +60,7 @@ CHECKS = (
     "rollout-ready", "production-readiness", "buffered-generation", "metrics",
     "watchdog-replacement", "pod-restart", "artifact-volume-loss",
     "memory-oom-recovery",
+    "metrics-scrape-flood",
     "successful-update", "update-readiness", "failed-upgrade",
     "atomic-rollback", "rollback-readiness", "rollback-generation", "release-cleanup",
 )
@@ -71,6 +73,10 @@ ARTIFACT_VOLUME_OBSERVATION_BUDGET_MS = 120_000
 OOM_OBSERVATION_BUDGET_MS = 120_000
 OOM_FAULT_LIMIT = "16Mi"
 OOM_SOURCE_LIMIT = "32Gi"
+METRICS_FLOOD_REQUESTS = 64
+METRICS_FLOOD_CONCURRENCY = 8
+METRICS_FLOOD_BUDGET_MS = 60_000
+METRICS_FLOOD_MAX_RESPONSE_BYTES = 1024 * 1024
 QUALIFICATION_METRICS = {
     "tritium_chat_requests_total", "tritium_tokens_out_total",
     "tritium_worker_alive", "tritium_backend_faults_total",
@@ -1427,6 +1433,178 @@ def metrics_snapshot(metrics: str) -> dict[str, Any]:
     return {"sha256": hashlib.sha256(metrics.encode()).hexdigest(), "values": values}
 
 
+def _qualify_metrics_scrape_flood(base_url: str, token: str, *, model_id: str,
+                                  prompt: str, request_timeout: float) -> dict[str, Any]:
+    began = time.monotonic()
+    deadline = began + METRICS_FLOOD_BUDGET_MS / 1000
+
+    def remaining() -> float:
+        value = deadline - time.monotonic()
+        if value <= 0:
+            raise DeploymentError("metrics flood wall deadline expired")
+        return min(request_timeout, value)
+
+    baseline_metrics = metrics_snapshot(request(
+        base_url + "/metrics", token, timeout=remaining()
+    ).decode("utf-8"))
+    start = threading.Event()
+    scrapes_ready = threading.Event()
+    launch = threading.Event()
+    scrape_wave = threading.Barrier(METRICS_FLOOD_CONCURRENCY)
+    lock = threading.Lock()
+    active = 0
+    peak = 0
+
+    def scrape() -> dict[str, Any]:
+        nonlocal active, peak
+        if not start.wait(timeout=remaining()):
+            raise DeploymentError("metrics flood launch did not start")
+        with lock:
+            active += 1
+            peak = max(peak, active)
+            if active == METRICS_FLOOD_CONCURRENCY:
+                scrapes_ready.set()
+        try:
+            scrape_wave.wait(timeout=remaining())
+            if not launch.wait(timeout=remaining()):
+                raise DeploymentError("metrics flood client barrier did not release")
+            call_began = time.monotonic()
+            payload = request(
+                base_url + "/metrics", token, timeout=remaining(),
+            )
+        finally:
+            with lock:
+                active -= 1
+        if not payload or len(payload) > METRICS_FLOOD_MAX_RESPONSE_BYTES:
+            raise DeploymentError("metrics flood response size differs")
+        text = payload.decode("utf-8")
+        metrics_snapshot(text)
+        return {
+            "bytes": len(payload), "sha256": hashlib.sha256(payload).hexdigest(),
+            "latency_ms": (time.monotonic() - call_began) * 1000,
+        }
+
+    request_body = {
+        "model": model_id,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0, "max_tokens": 1,
+    }
+
+    def generate() -> tuple[dict[str, Any], float]:
+        if not start.wait(timeout=remaining()):
+            raise DeploymentError("metrics flood generation launch did not start")
+        if not scrapes_ready.wait(timeout=remaining()):
+            raise DeploymentError("metrics flood clients did not synchronize")
+        launch.set()
+        call_began = time.monotonic()
+        response = request_json(
+            base_url + "/v1/chat/completions", token, body=request_body,
+            timeout=remaining(),
+        )
+        return response, (time.monotonic() - call_began) * 1000
+
+    generation_pool = ThreadPoolExecutor(max_workers=1)
+    scrape_pool = ThreadPoolExecutor(max_workers=METRICS_FLOOD_CONCURRENCY)
+    futures = []
+    try:
+        generation_future = generation_pool.submit(generate)
+        scrape_futures = [
+            scrape_pool.submit(scrape) for _ in range(METRICS_FLOOD_REQUESTS)
+        ]
+        futures = [generation_future, *scrape_futures]
+        start.set()
+        _, pending = wait_futures(futures, timeout=remaining())
+        if pending:
+            for future in pending:
+                future.cancel()
+            raise DeploymentError("metrics flood wall deadline expired")
+        responses = [future.result() for future in scrape_futures]
+        generation, generation_latency_ms = generation_future.result()
+    finally:
+        for future in futures:
+            future.cancel()
+        scrape_pool.shutdown(wait=True, cancel_futures=True)
+        generation_pool.shutdown(wait=True, cancel_futures=True)
+    if (peak != METRICS_FLOOD_CONCURRENCY
+            or not isinstance(generation.get("choices"), list)
+            or len(generation["choices"]) != 1):
+        raise DeploymentError("metrics flood did not preserve bounded generation")
+    final_metrics = metrics_snapshot(request(
+        base_url + "/metrics", token, timeout=remaining()
+    ).decode("utf-8"))
+    if (final_metrics["values"]["tritium_chat_requests_total"]
+            < baseline_metrics["values"]["tritium_chat_requests_total"] + 1
+            or final_metrics["values"]["tritium_tokens_out_total"]
+            < baseline_metrics["values"]["tritium_tokens_out_total"] + 1):
+        raise DeploymentError("metrics flood generation counters did not advance")
+    duration_ms = (time.monotonic() - began) * 1000
+    if duration_ms > METRICS_FLOOD_BUDGET_MS:
+        raise DeploymentError("metrics flood wall deadline expired")
+    latencies = [item["latency_ms"] for item in responses]
+    return {
+        "endpoint": "/metrics", "authentication": "bearer",
+        "requests": METRICS_FLOOD_REQUESTS,
+        "concurrency": METRICS_FLOOD_CONCURRENCY,
+        "peak_client_tasks": peak, "budget_ms": METRICS_FLOOD_BUDGET_MS,
+        "duration_ms": duration_ms,
+        "max_response_bytes": METRICS_FLOOD_MAX_RESPONSE_BYTES,
+        "response_bytes": [item["bytes"] for item in responses],
+        "response_sha256s": [item["sha256"] for item in responses],
+        "response_latency_ms": latencies,
+        "max_scrape_latency_ms": max(latencies),
+        "generation_latency_ms": generation_latency_ms,
+        "generation_response_sha256": hashlib.sha256(canonical(generation)).hexdigest(),
+        "request": request_evidence(model_id, prompt, temperature=0, max_tokens=1),
+        "baseline_metrics": baseline_metrics, "metrics": final_metrics,
+    }
+
+
+def _metrics_flood_process(connection: Any, base_url: str, token: str,
+                           model_id: str, prompt: str, request_timeout: float) -> None:
+    try:
+        connection.send((True, _qualify_metrics_scrape_flood(
+            base_url, token, model_id=model_id, prompt=prompt,
+            request_timeout=request_timeout,
+        )))
+    except BaseException as error:
+        connection.send((False, f"{type(error).__name__}: {error}"))
+    finally:
+        connection.close()
+
+
+def qualify_metrics_scrape_flood(base_url: str, token: str, *, model_id: str,
+                                 prompt: str, request_timeout: float) -> dict[str, Any]:
+    try:
+        context = multiprocessing.get_context("fork")
+    except ValueError as error:
+        raise DeploymentError("metrics flood requires Linux fork isolation") from error
+    receive, send = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_metrics_flood_process,
+        args=(send, base_url, token, model_id, prompt, request_timeout),
+        daemon=True,
+    )
+    process.start()
+    send.close()
+    process.join(METRICS_FLOOD_BUDGET_MS / 1000)
+    if process.is_alive():
+        process.terminate()
+        process.join(1)
+        if process.is_alive():
+            process.kill()
+            process.join(1)
+        receive.close()
+        raise DeploymentError("metrics flood wall deadline expired")
+    if process.exitcode != 0 or not receive.poll():
+        receive.close()
+        raise DeploymentError("metrics flood worker exited without evidence")
+    passed, payload = receive.recv()
+    receive.close()
+    if passed is not True or not isinstance(payload, dict):
+        raise DeploymentError(f"metrics flood worker failed: {payload}")
+    return payload
+
+
 def validate_metrics_evidence(value: Any, label: str) -> dict[str, float]:
     descriptor = f"{label} metrics" if label else "metrics"
     if not isinstance(value, dict) or set(value) != {"sha256", "values"}:
@@ -1444,6 +1622,86 @@ def validate_metrics_evidence(value: Any, label: str) -> dict[str, float]:
     ):
         raise DeploymentError(f"deployment {descriptor} evidence is malformed")
     return values
+
+
+def validate_metrics_flood(value: Any, *, model_id: str) -> dict[str, Any]:
+    fields = {
+        "endpoint", "authentication",
+        "requests", "concurrency", "peak_client_tasks", "budget_ms", "duration_ms",
+        "max_response_bytes", "response_bytes", "response_sha256s",
+        "response_latency_ms", "max_scrape_latency_ms", "generation_latency_ms",
+        "generation_response_sha256", "request", "baseline_metrics", "metrics",
+    }
+    numeric = ("duration_ms", "max_scrape_latency_ms", "generation_latency_ms")
+    if (not isinstance(value, dict) or set(value) != fields
+            or value.get("endpoint") != "/metrics"
+            or value.get("authentication") != "bearer"
+            or type(value.get("requests")) is not int
+            or value["requests"] != METRICS_FLOOD_REQUESTS
+            or type(value.get("concurrency")) is not int
+            or value["concurrency"] != METRICS_FLOOD_CONCURRENCY
+            or type(value.get("peak_client_tasks")) is not int
+            or value["peak_client_tasks"] != METRICS_FLOOD_CONCURRENCY
+            or type(value.get("budget_ms")) is not int
+            or value["budget_ms"] != METRICS_FLOOD_BUDGET_MS
+            or type(value.get("max_response_bytes")) is not int
+            or value["max_response_bytes"] != METRICS_FLOOD_MAX_RESPONSE_BYTES
+            or any(type(value.get(key)) not in {int, float}
+                   or not math.isfinite(value[key]) or value[key] <= 0
+                   for key in numeric)
+            or value["duration_ms"] > METRICS_FLOOD_BUDGET_MS
+            or value["max_scrape_latency_ms"] > value["duration_ms"]
+            or value["generation_latency_ms"] > value["duration_ms"]):
+        raise DeploymentError("deployment metrics-flood bounds differ")
+    sizes = value.get("response_bytes")
+    hashes = value.get("response_sha256s")
+    latencies = value.get("response_latency_ms")
+    if (not isinstance(sizes, list) or len(sizes) != METRICS_FLOOD_REQUESTS
+            or any(type(size) is not int or not 0 < size <= METRICS_FLOOD_MAX_RESPONSE_BYTES
+                   for size in sizes)
+            or not isinstance(hashes, list) or len(hashes) != METRICS_FLOOD_REQUESTS
+            or not isinstance(latencies, list) or len(latencies) != METRICS_FLOOD_REQUESTS
+            or any(type(latency) not in {int, float} or not math.isfinite(latency)
+                   or latency <= 0 or latency > value["duration_ms"]
+                   for latency in latencies)
+            or value["max_scrape_latency_ms"] != max(latencies)):
+        raise DeploymentError("deployment metrics-flood responses differ")
+    for digest in hashes:
+        exact_hex(digest, 64, "metrics-flood response SHA-256")
+    exact_hex(
+        value.get("generation_response_sha256"), 64,
+        "metrics-flood generation response SHA-256",
+    )
+    request_value = value.get("request")
+    request_fields = {
+        "model", "prompt_sha256", "prompt_bytes", "temperature", "max_tokens",
+        "descriptor_sha256",
+    }
+    if (not isinstance(request_value, dict) or set(request_value) != request_fields
+            or request_value.get("model") != model_id
+            or type(request_value.get("prompt_bytes")) is not int
+            or not 0 < request_value["prompt_bytes"] <= 1024 * 1024
+            or type(request_value.get("temperature")) is not int
+            or request_value["temperature"] != 0
+            or type(request_value.get("max_tokens")) is not int
+            or request_value["max_tokens"] != 1):
+        raise DeploymentError("deployment metrics-flood request differs")
+    exact_hex(request_value.get("prompt_sha256"), 64, "metrics-flood prompt SHA-256")
+    descriptor = {
+        key: request_value[key] for key in request_fields - {"descriptor_sha256"}
+    }
+    if request_value["descriptor_sha256"] != hashlib.sha256(canonical(descriptor)).hexdigest():
+        raise DeploymentError("deployment metrics-flood request descriptor differs")
+    baseline = validate_metrics_evidence(
+        value.get("baseline_metrics"), "metrics-flood baseline"
+    )
+    final = validate_metrics_evidence(value.get("metrics"), "metrics-flood")
+    if (final["tritium_chat_requests_total"]
+            < baseline["tritium_chat_requests_total"] + 1
+            or final["tritium_tokens_out_total"]
+            < baseline["tritium_tokens_out_total"] + 1):
+        raise DeploymentError("deployment metrics-flood counters did not advance")
+    return value
 
 
 def deployed_revision(value: Any) -> int:
@@ -2140,6 +2398,10 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
                 raise DeploymentError("cluster generation did not return one choice")
             metrics = request(url + "/metrics", token, timeout=args.request_timeout).decode("utf-8")
             metric_evidence = metrics_snapshot(metrics)
+            metrics_flood = qualify_metrics_scrape_flood(
+                url, token, model_id=model_id, prompt=args.prompt,
+                request_timeout=args.request_timeout,
+            )
         finally:
             stop_forward(process)
         scale = None
@@ -2696,6 +2958,7 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
                      "update_config": {"before": update_before, "after": update_after},
                      "rollback_startup_receipt": rollback_startup,
                      "metrics": metric_evidence, "restart_recovery": restart_recovery,
+                     "metrics_scrape_flood": metrics_flood,
                      "scale": scale, "helm_history": history,
                      "prior_helm_revision": prior_revision,
                      "failed_manifest_sha256": wrong_manifest,
@@ -2830,6 +3093,7 @@ def validate_receipt(receipt: dict[str, Any], *, chart_path: Path, image_path: P
         "startup_receipt", "restart_startup_receipt", "update_startup_receipt",
         "update_strategy", "update_config", "rollback_startup_receipt", "metrics",
         "restart_recovery", "scale", "helm_history",
+        "metrics_scrape_flood",
         "prior_helm_revision", "failed_manifest_sha256", "failed_image_digest",
         "failed_upgrade_output_sha256",
     }:
@@ -3269,6 +3533,9 @@ def validate_receipt(receipt: dict[str, Any], *, chart_path: Path, image_path: P
         raise DeploymentError("deployment rollback changed startup receipt")
     metrics = workload.get("metrics")
     validate_metrics_evidence(metrics, "")
+    validate_metrics_flood(
+        workload.get("metrics_scrape_flood"), model_id=workload["model_id"]
+    )
     recovery = workload.get("restart_recovery")
     if not isinstance(recovery, dict) or set(recovery) != {
         "generation_response_sha256", "metrics"
