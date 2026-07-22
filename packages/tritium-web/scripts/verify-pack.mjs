@@ -14,10 +14,12 @@ import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
+import { generateNpmSbom } from "./generate-npm-sbom.mjs";
 
 const run = promisify(execFile);
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const packageJson = JSON.parse(await readFile(resolve(root, "package.json"), "utf8"));
+const packageLock = JSON.parse(await readFile(resolve(root, "package-lock.json"), "utf8"));
 const MAX_COMMAND_OUTPUT_BYTES = 8 * 1024 * 1024;
 const expectedFiles = Object.freeze([
   "README.md",
@@ -225,6 +227,17 @@ void adapter;
     await writeFile(resolve(output, "npm-archive-receipt.json"), receiptJson, {
       flag: "wx",
     });
+    const sbom = generateNpmSbom(
+      packageJson,
+      packageLock,
+      receipt,
+      metadata.filename,
+    );
+    await writeFile(
+      resolve(output, "tritium-web-node22.cdx.json"),
+      `${JSON.stringify(sbom, null, 2)}\n`,
+      { flag: "wx" },
+    );
   }
   process.stdout.write(receiptJson);
 }

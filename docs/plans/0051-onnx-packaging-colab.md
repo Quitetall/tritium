@@ -253,7 +253,12 @@ open. Operator workflow is documented in
 CPU and CUDA wheel lanes now generate deterministic CycloneDX 1.6 inventories
 from each already-verified wheel. SBOM root binds exact release artifact ID,
 wheel SHA-256/bytes/platform, every RECORD-covered member digest and every
-declared `Requires-Dist`; CI uploads SBOM beside same wheel. Crate, npm, OCI,
+declared `Requires-Dist`; CI uploads SBOM beside same wheel.
+The exact npm archive verifier now emits its own deterministic CycloneDX 1.6
+document into retained evidence. It binds archive SHA-256/bytes, package/version,
+source revision, WASM guest digest, every lockfile component with strong
+integrity, license and platform metadata, plus exact runtime dependency edges;
+development/build dependencies remain visible with excluded scope. Crate, OCI,
 chart, ONNX and model-artifact SBOM lanes remain open.
 
 Set one candidate version source for Rust crates, Python metadata, npm metadata,
