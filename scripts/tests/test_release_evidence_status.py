@@ -29,6 +29,9 @@ OCI_SECURITY_MODULE = runpy.run_path(ROOT / "scripts" / "qualify-oci-security.py
 TUTORIAL_RECEIPT_MODULE = runpy.run_path(
     ROOT / "crates/tritium-py/python/tritium/torch/tutorial_receipt.py"
 )
+OBSERVABILITY_RECEIPT_MODULE = runpy.run_path(
+    ROOT / "crates/tritium-py/python/tritium/torch/observability_receipt.py"
+)
 
 
 def canonical(value) -> bytes:
@@ -1043,6 +1046,100 @@ class ReleaseEvidenceStatusTests(unittest.TestCase):
             artifact.write_bytes(b"different candidate wheel")
             with self.assertRaisesRegex(EvidenceError, "tutorial|wheel"):
                 evaluate(registry_path, candidate, document)
+
+    def test_observability_binds_candidate_wheel_and_advances_frontend_gate(self):
+        with tempfile.TemporaryDirectory() as raw:
+            candidate, document, artifact, evidence_root = release_fixture(Path(raw))
+            document["artifacts"][0]["identity"] = {
+                "sha256": sha256(artifact),
+                "bytes": artifact.stat().st_size,
+            }
+            candidate.write_bytes(canonical(document) + b"\n")
+            telemetry = evidence_root / "telemetry"
+            telemetry.mkdir()
+            (telemetry / "events.out.tfevents.1").write_bytes(b"events")
+            tree = OBSERVABILITY_RECEIPT_MODULE["tree_identity"](telemetry)
+            receipt = {
+                "schema": "tritium.installed-observability.v1",
+                "passed": True,
+                "source_revision": "a" * 40,
+                "release": "1.1.0-rc.0",
+                "run_id": "observability-run-1",
+                "wheel_name": artifact.name,
+                "wheel_bytes": artifact.stat().st_size,
+                "wheel_sha256": "sha256:" + sha256(artifact),
+                "distribution_version": "1.1.0rc0",
+                "tritium_module": "/venv/tritium/__init__.py",
+                "python_version": "3.13.5",
+                "torch_version": "2.11.0",
+                "tensorboard_version": "2.21.0",
+                "wandb_version": "0.28.1",
+                "opentelemetry_api_version": "1.44.0",
+                "opentelemetry_sdk_version": "1.44.0",
+                "environment": {
+                    "repository_absent": True,
+                    "compiler_absent": True,
+                    "network_mode": "offline",
+                },
+                "snapshot": {
+                    "schema_version": 1,
+                    "step": 17,
+                    "tensor_count": 1,
+                    "tensor_path": "left.weight",
+                    "aliases": ["left.weight", "right.weight"],
+                    "trit_counts": [2, 4, 2],
+                    "physical_bytes": 6,
+                    "code_scale_bpw": 6.0,
+                    "zero_rate": 0.5,
+                    "gradient_finite": True,
+                    "scalar_metric_count": 17,
+                },
+                "adapters": {
+                    "tensorboard": {
+                        "event_files": 1,
+                        "scalar_tags": 17,
+                        "histogram_tags": 1,
+                    },
+                    "wandb": {
+                        "mode": "offline",
+                        "log_calls": 1,
+                        "scalar_values": 17,
+                        "histograms": 1,
+                    },
+                    "opentelemetry": {
+                        "metric_names": OBSERVABILITY_RECEIPT_MODULE["OTEL_METRICS"],
+                        "data_points": 4,
+                    },
+                },
+                "telemetry_dir": "telemetry",
+                "telemetry_bytes": tree["bytes"],
+                "telemetry_file_count": tree["file_count"],
+                "telemetry_tree_sha256": tree["sha256"],
+            }
+            receipt["receipt_id"] = OBSERVABILITY_RECEIPT_MODULE["receipt_id"](
+                receipt
+            )
+            receipt_path = evidence_root / "observability.json"
+            receipt_path.write_bytes(canonical(receipt) + b"\n")
+            registry_path = evidence_root / "registry.json"
+            registry(
+                registry_path,
+                candidate,
+                [entry(receipt_path, receipt, kind="observability")],
+            )
+
+            loader = mock.Mock(return_value=receipt)
+            with mock.patch.dict(
+                evaluate.__globals__, {"validate_observability_receipt": loader}
+            ):
+                report = evaluate(registry_path, candidate, document)
+                frontend = next(
+                    row for row in report["rows"] if row["id"] == "pytorch-hf"
+                )
+                self.assertEqual(frontend["satisfied_kinds"], ["observability"])
+                artifact.write_bytes(b"different candidate wheel")
+                with self.assertRaisesRegex(EvidenceError, "observability|wheel"):
+                    evaluate(registry_path, candidate, document)
 
     def test_cpu_deployment_requires_exact_image_parents_and_support_bytes(self):
         with tempfile.TemporaryDirectory() as raw:

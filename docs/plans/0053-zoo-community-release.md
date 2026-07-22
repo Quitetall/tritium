@@ -158,6 +158,17 @@ source-tree adapter smoke passes
 offline with TensorBoard 2.21.0, W&B
 0.28.1 and OpenTelemetry 1.44.0. Candidate clean-wheel execution and an admitted
 release receipt remain open; this developer smoke is not substituted for them.
+The installed-wheel observability worker now executes those three real adapters
+from a compiler-free, source-free environment, forces W&B and model integrations
+offline, reopens TensorBoard events, reads OpenTelemetry measurements, and seals
+ordinary telemetry bytes without admitting W&B-created symlinks. Its strict
+`tritium.installed-observability.v1` validator binds the exact wheel, source,
+release, package ownership, adapter versions, diagnostics fixture and retained
+tree. `observability` is now a mandatory PyTorch/Hugging Face release-evidence
+kind, and the no-checkout wheel lane retains its receipt. An unretained local
+developer smoke exercised producer and independent recheck, but is not release
+evidence. Only a candidate-revision CI result may enter the registry, so the
+public gate remains open.
 The v1.0 → v1.1 migration guide now records the frozen/evolving Rust tiers, C
 ABI continuity, Python distribution rename with stable imports, typed phase
 transitions, copy-on-write artifact migration, deprecation/support windows and
@@ -333,7 +344,7 @@ seals and self-validates the complete candidate inventory atomically. This is
 producer implementation only; no distinct physical machine or independent
 operator has emitted an admitted receipt.
 The independent-review aggregator now revalidates the complete pre-review
-registry, requires each of the other 31 frozen receipt kinds exactly once,
+registry, requires each of the other 32 frozen receipt kinds exactly once,
 requires every gate except the review half of reproduction sign-off to be
 green, and derives the reviewed receipt list rather than accepting a subset.
 It binds a canonical pre-review scope digest (avoiding a circular final-registry

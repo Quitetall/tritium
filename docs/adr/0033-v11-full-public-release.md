@@ -1,6 +1,6 @@
 # ADR 0033 — Tritium v1.1 full public release: ternary research platform
 
-Status: **ACCEPTED** (2026-07-20; interface and release-gate reconciliation)
+Status: **ACCEPTED** (2026-07-22; installed-observability evidence amendment)
 
 - **Decider:** Brian Lam
 - **Research cutoff:** 2026-07-20, inclusive
@@ -408,6 +408,21 @@ converted weights. The receipt binds every artifact byte plus the exact wheel,
 source, release and run. The registry counts it only as `export-reload`; it is a
 representative language-model lifecycle gate, not flagship-Qwen or optimized
 native-kernel evidence.
+
+Installed diagnostics admission uses `tritium.installed-observability.v1` and
+the registry kind `observability`. It is a mandatory part of the `pytorch-hf`
+gate. A source-free, compiler-free installed candidate wheel must exercise real
+TensorBoard, offline Weights & Biases and OpenTelemetry adapters over one fixed
+tied-weight QAT fixture. Retained evidence must cover trit histograms, zero rate,
+planes, scales, saturation, gradients, reconstruction error, teacher KL,
+physical bpw, runtime and resident memory. Admission revalidates the candidate
+wheel `METADATA`/`RECORD`, the executed installation inventory, exact metric
+names and finite values, telemetry formats and every retained byte. A
+source-tree smoke, mocked adapter, online W&B run, copied counter, missing
+metric family or structurally substituted receipt cannot satisfy this kind.
+This receipt does not substitute for distributed training, optimized native
+dispatch, flagship quality/performance, serving telemetry or second-machine
+reproduction.
 
 Multi-device admission uses
 `tritium.hf-distributed-qualification.v1`. The validator requires ordered DDP

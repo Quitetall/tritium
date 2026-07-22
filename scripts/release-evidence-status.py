@@ -43,6 +43,11 @@ TUTORIAL_RECEIPT = runpy.run_path(
 validate_tutorial_receipt = TUTORIAL_RECEIPT["validate_receipt"]
 validate_hf_lifecycle_receipt = TUTORIAL_RECEIPT["validate_hf_receipt"]
 validate_hf_export_receipt = TUTORIAL_RECEIPT["validate_export_receipt"]
+OBSERVABILITY_RECEIPT = runpy.run_path(
+    Path(__file__).resolve().parent.parent
+    / "crates/tritium-py/python/tritium/torch/observability_receipt.py"
+)
+validate_observability_receipt = OBSERVABILITY_RECEIPT["validate_receipt"]
 DISTRIBUTED_RECEIPT = runpy.run_path(
     Path(__file__).with_name("verify-hf-distributed-receipt.py")
 )
@@ -122,6 +127,7 @@ KNOWN_KINDS = frozenset(
         "frontend-lifecycle",
         "distributed-training",
         "export-reload",
+        "observability",
         "browser-conformance",
         "second-machine",
         "independent-review",
@@ -156,6 +162,7 @@ GATES = (
         (
             "installed-qat-tutorial", "frontend-lifecycle",
             "distributed-training", "export-reload",
+            "observability",
         ),
     ),
     ("native-backends", ("backend-manifest", "cuda-training", "performance")),
@@ -419,6 +426,13 @@ def evaluate(
                     expected_source_revision=revision,
                     expected_release=release,
                 )
+            elif kind == "observability":
+                receipt = validate_observability_receipt(
+                    receipt_path,
+                    expected_wheel=artifact_path,
+                    expected_source_revision=revision,
+                    expected_release=release,
+                )
             elif kind == "browser-conformance":
                 receipt = validate_browser_receipt(
                     receipt_path, revision, release, artifact_path
@@ -634,7 +648,8 @@ def evaluate(
             if actual != declared or actual != qualified:
                 raise EvidenceError("npm receipt does not bind candidate archive bytes")
         elif kind in {
-            "installed-qat-tutorial", "frontend-lifecycle", "export-reload"
+            "installed-qat-tutorial", "frontend-lifecycle", "export-reload",
+            "observability",
         }:
             identity = artifact.get("identity", {})
             actual = (

@@ -319,7 +319,9 @@ jobs:
           python -m pip install --disable-pip-version-check --only-binary=:all: \
             torch==2.11.0 --index-url https://download.pytorch.org/whl/cpu
           python -m pip install --disable-pip-version-check --only-binary=:all: \
-            safetensors==0.8.0 transformers==5.5.3
+            safetensors==0.8.0 transformers==5.5.3 \
+            tensorboard==2.21.0 wandb==0.28.1 \
+            opentelemetry-api==1.44.0 opentelemetry-sdk==1.44.0
           python -m pip install --isolated --disable-pip-version-check \
             --no-index --no-deps --only-binary=:all: dist/*.whl
       - name: execute and validate source-free installed tutorial
@@ -369,6 +371,21 @@ jobs:
             --wheel-artifact dist/*.whl \
             --source-revision ${{ github.sha }} \
             --release 1.1.0-rc.0
+      - name: execute and validate installed observability adapters
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -I -m tritium.torch.qualify_observability \
+            --output-dir evidence/observability-clean \
+            --wheel-artifact dist/*.whl \
+            --source-revision ${{ github.sha }} \
+            --release 1.1.0-rc.0 \
+            --run-id github-${{ github.run_id }}-${{ github.run_attempt }}-observability-clean
+          python -I -m tritium.torch.qualify_observability \
+            --check-receipt evidence/observability-clean/receipt.json \
+            --wheel-artifact dist/*.whl \
+            --source-revision ${{ github.sha }} \
+            --release 1.1.0-rc.0
       - uses: actions/upload-artifact@v4
         with:
           name: wheel-tutorial-source-free-python-3.13
@@ -376,6 +393,7 @@ jobs:
             evidence/tutorial-clean/**
             evidence/hf-lifecycle-clean/**
             evidence/hf-export-clean/**
+            evidence/observability-clean/**
           if-no-files-found: error
 
   cuda-wheel-smoke:

@@ -89,7 +89,7 @@ class QualifyIndependentReviewTests(unittest.TestCase):
         assemble.__globals__["validate_registry"] = self.original
         self.original.__globals__["evaluate"] = self.original_evaluate
 
-    def test_pre_review_registry_requires_all_31_kinds(self):
+    def test_pre_review_registry_requires_all_32_kinds(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             candidate, _, registry, _, _, _, _, _ = fixture(root)
@@ -129,7 +129,7 @@ class QualifyIndependentReviewTests(unittest.TestCase):
                 registry, candidate, revision="a" * 40,
                 release="1.1.0-rc.0", digest_tool="tritium",
             )
-            self.assertEqual(len(ids), 31)
+            self.assertEqual(len(ids), 32)
             self.assertEqual(len(scope), 64)
             document = json.loads(registry.read_bytes())
             document["receipts"].pop()
