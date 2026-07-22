@@ -1,0 +1,52 @@
+name: Bug report
+description: Report a reproducible correctness, crash, or compatibility defect.
+title: "[bug] "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: "Do not disclose vulnerabilities here; follow SECURITY.md."
+  - type: input
+    id: version
+    attributes:
+      label: Version and revision
+      description: Tritium version plus full Git commit, wheel, crate, or archive identity.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, architecture, Python/Rust/Node versions, backend, device, driver, and installation method.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Minimal reproduction
+      description: Exact commands and the smallest code or artifact description that reproduces the issue.
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: Expected and observed result
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Logs and receipts
+      description: Paste safe logs or attach content-addressed receipts; remove secrets and private data.
+  - type: dropdown
+    id: evidence_level
+    attributes:
+      label: Evidence environment
+      description: Classify the strongest environment that reproduces the bug.
+      options:
+        - Structural or compile-only
+        - Emulated or synthetic runtime
+        - Physical CPU device
+        - Physical accelerator or browser device
+    validations:
+      required: true

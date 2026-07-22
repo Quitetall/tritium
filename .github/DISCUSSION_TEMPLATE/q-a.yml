@@ -1,0 +1,24 @@
+title: "[Q&A] "
+labels: [question]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Exact release, candidate or source revision.
+    validations:
+      required: true
+  - type: textarea
+    id: question
+    attributes:
+      label: Question
+      description: Include relevant environment, artifact identity, commands and documentation.
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety
+      options:
+        - label: I removed credentials, private data and undisclosed vulnerability details.
+          required: true

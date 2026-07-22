@@ -1,0 +1,17 @@
+cff-version: 1.2.0
+message: "If you use Tritium in research, cite this software and the exact release or commit used."
+title: "Tritium: ternary-model inference and training infrastructure"
+type: software
+authors:
+  - family-names: Lam
+    given-names: Brian
+repository-code: "https://github.com/Quitetall/tritium"
+url: "https://github.com/Quitetall/tritium"
+license: Apache-2.0
+version: 1.1.0-rc.0
+keywords:
+  - ternary neural networks
+  - quantization
+  - machine learning systems
+  - inference
+  - training

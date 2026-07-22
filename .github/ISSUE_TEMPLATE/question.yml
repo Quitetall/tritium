@@ -1,0 +1,33 @@
+name: Installation or usage question
+description: Ask for help with a supported Tritium release or qualified target.
+title: "[question] "
+labels: [question]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Version and revision
+      description: Tritium version plus full commit or installed artifact identity.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, architecture, installation method, language/runtime versions, backend and device.
+    validations:
+      required: true
+  - type: textarea
+    id: goal
+    attributes:
+      label: What are you trying to do?
+      description: Include the smallest safe example and what documentation you followed.
+    validations:
+      required: true
+  - type: textarea
+    id: observed
+    attributes:
+      label: What happened?
+      description: Include the full error and safe logs; remove secrets and private data.
+    validations:
+      required: true

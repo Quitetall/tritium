@@ -1,17 +1,29 @@
 # Contributing
 
+The authoritative contribution, governance, conduct, support, and security
+policies live at the repository root:
+
+- [`CONTRIBUTING.md`](../../../CONTRIBUTING.md)
+- [`GOVERNANCE.md`](../../../GOVERNANCE.md)
+- [`CODE_OF_CONDUCT.md`](../../../CODE_OF_CONDUCT.md)
+- [`SUPPORT.md`](../../../SUPPORT.md)
+- [`SECURITY.md`](../../../SECURITY.md)
+- [`COMMUNITY.md`](../../../COMMUNITY.md)
+
 Tritium is planned strategically and executed in small, gated steps. The map:
 
-- **Strategic** — `docs/adr/`: Architecture Decision Records covering the
-  0.1.0 → 1.0.0 arc, each milestone's scope and exit gates. Start at the
-  [release-roadmap ADR](../../adr/0002-release-roadmap.md).
+- **Strategic** — `docs/adr/`: Architecture Decision Records covering stable
+  contracts and release gates. For current platform work, start at
+  [ADR 0033](../../adr/0033-v11-full-public-release.md).
 - **Index** — [`docs/ROADMAP.md`](../../ROADMAP.md): the living, ordered set of
   tactical plans from now to done, with status.
 - **Tactical** — `docs/plans/NNNN-*.md`: one detailed, verification-gated plan
-  per point-release or coherent feature.
+  per point-release or coherent feature. The v1.1 umbrella is
+  [plan 0044](../../plans/0044-v11-full-public-release.md).
 
-Milestone work is **gate-blocked, not date-blocked**: no work on milestone N+1
-merges until N's gate is green and tagged.
+Milestone work is **gate-blocked, not date-blocked**. Independent work orders may
+proceed in parallel, but no downstream claim becomes green until every declared
+entry dependency and empirical gate passes.
 
 ## The conformance contract
 

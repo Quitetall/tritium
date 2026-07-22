@@ -1,9 +1,17 @@
 # Security policy & threat model
 
-Tritium is a from-scratch ternary-LLM inference + training library. This document
-states the trust model, the threat boundary for **untrusted model files**, the
-hardening that defends it, and how to report a vulnerability. It is the v0.90
-security gate (ADR 0011).
+Tritium is ternary-model inference and training infrastructure. This document
+states the supported-version policy, trust boundaries, hardening, and private
+vulnerability-reporting process for the v1.1 release line.
+
+## Supported versions
+
+The latest stable `1.x` minor receives correctness and security fixes. The
+immediately previous stable minor receives critical/high security fixes for 90
+days after the next stable minor. Release candidates receive development fixes
+but may change before the stable release. Exact details are in
+[SUPPORT.md](SUPPORT.md); a backend or package is supported only for cells marked
+`qualified` in the generated compatibility matrix.
 
 > **Full threat model:** the complete surface-by-surface analysis — 30 threats
 > across the model-file parsers, the C ABI / FFI, the HTTP server, the compute
@@ -58,22 +66,44 @@ untrusted bytes (model file / corpus)
   actual buffer length **before** allocation, so a malicious header cannot trigger
   an unbounded allocation; size arithmetic is overflow-checked.
 - **Supply chain.** `cargo-deny` gates licenses, RustSec advisories, and banned /
-  duplicate crates on every push; an SBOM (CycloneDX) is generated in CI; external
-  dependency versions are explicitly pinned (no wildcards).
+  duplicate crates on every push; an SBOM (CycloneDX) is generated in CI;
+  dependency requirements forbid wildcards, the workspace lockfile binds resolved
+  versions, and higher-risk native/network dependencies use exact requirements.
 
 ## Out of scope
 
 - **Model-output safety / alignment.** Tritium is an execution engine; it does not
   filter or align generated text.
-- **Resource limits on valid-but-huge models.** A legitimately enormous model can
-  exhaust memory; bounding that is the embedding application's concern (e.g. the
-  `tritium-serve` operator sets process limits).
+- **Operator-selected capacity.** Tritium validates declared artifact and runtime
+  ceilings, but the operator remains responsible for choosing limits appropriate
+  to the host and workload.
 - **The training/serving host.** Sandboxing the process (seccomp, cgroups,
   containers) is a deployment concern, not the library's.
 
 ## Reporting a vulnerability
 
-Report suspected vulnerabilities privately to the maintainer
-(briankhanglam@gmail.com) rather than via a public issue. Please include a
-reproduction (ideally a minimized input file) and the affected version/commit.
-Pre-1.0, there is no formal embargo SLA, but reports are triaged promptly.
+Report suspected vulnerabilities privately to `briankhanglam@gmail.com` rather
+than through an issue, discussion, or chat. Do not send proprietary model or
+dataset contents unless a safe transfer has been agreed.
+
+Include the affected version and full source/artifact identity, impact, minimal
+reproduction, required environment, and whether the issue is already public.
+You should receive acknowledgement within three business days and an initial
+severity/coordination assessment within seven business days. These are response
+targets, not a commercial SLA. Fix and disclosure timing depends on severity,
+exploitability, downstream coordination, and release readiness.
+
+The reporter and maintainer coordinate an embargo and advisory when warranted.
+Credit is offered unless the reporter prefers anonymity. Public disclosure
+before a mitigation is available may be necessary for active exploitation or
+material user risk, but the reason and remaining exposure will be documented.
+
+## Supply-chain and deployment boundary
+
+Release artifacts are admitted by digest, source revision, SBOM, provenance,
+and signature gates. Model/tokenizer licenses and authenticity remain separate
+from numerical compatibility: a loadable artifact is not automatically trusted
+or redistributable. Operators must verify candidate/public manifests and should
+run serving images with the documented non-root, read-only, bounded-resource
+posture. Compromised registries, CI identities, signing keys, model sources, and
+runtime dependencies are in scope for private reporting.

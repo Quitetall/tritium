@@ -1,0 +1,24 @@
+title: "[Idea] "
+labels: [idea]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: Describe the user or research problem, not only a preferred implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed direction
+      description: Include affected contracts, alternatives, compatibility and evidence needed.
+    validations:
+      required: true
+  - type: checkboxes
+    id: durable-record
+    attributes:
+      label: Durable record
+      options:
+        - label: I understand accepted decisions must move to an issue, pull request, RFC or ADR.
+          required: true

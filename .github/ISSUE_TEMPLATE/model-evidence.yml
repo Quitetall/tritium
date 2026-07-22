@@ -1,0 +1,50 @@
+name: Model or performance evidence
+description: Submit a model-zoo, quality, compression, or performance result.
+title: "[evidence] "
+labels: [evidence]
+body:
+  - type: textarea
+    id: identities
+    attributes:
+      label: Immutable identities
+      description: Source revision, model/tokenizer/data revisions, artifact digests, recipe, and ancestry.
+    validations:
+      required: true
+  - type: textarea
+    id: method
+    attributes:
+      label: Method and commands
+      description: Exact conversion, evaluation, warmup, repetitions, seeds, and failure handling.
+    validations:
+      required: true
+  - type: textarea
+    id: measurements
+    attributes:
+      label: Measurements
+      description: Quality, task retention, serialized/resident/peak bytes, latency/throughput, uncertainty, and baselines.
+    validations:
+      required: true
+  - type: textarea
+    id: hardware
+    attributes:
+      label: Environment and hardware
+      description: Machine/run identity, CPU/GPU, memory, OS, drivers, runtime, power/clock policy, and wall time.
+    validations:
+      required: true
+  - type: textarea
+    id: rights
+    attributes:
+      label: License, redistribution, and conflicts
+    validations:
+      required: true
+  - type: dropdown
+    id: evidence_level
+    attributes:
+      label: Evidence level
+      options:
+        - Structural artifact only
+        - Synthetic or emulated execution
+        - Primary physical-device measurement
+        - Independent physical-device reproduction
+    validations:
+      required: true

@@ -1,0 +1,43 @@
+name: Backend port
+description: Propose or report work on a native or portable backend.
+title: "[backend] "
+labels: [backend]
+body:
+  - type: input
+    id: target
+    attributes:
+      label: Target
+      description: OS, architecture, accelerator, API/runtime, driver, and minimum versions.
+    validations:
+      required: true
+  - type: textarea
+    id: operations
+    attributes:
+      label: Operation coverage
+      description: Manifest operations, dtypes, shapes, unsupported cases, and fallback policy.
+    validations:
+      required: true
+  - type: textarea
+    id: conformance
+    attributes:
+      label: Conformance and performance evidence
+      description: Exact vector version, physical device, commands, parity, memory, and benchmark method.
+    validations:
+      required: true
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: Toolchain, dependencies, and licenses
+    validations:
+      required: true
+  - type: dropdown
+    id: evidence_level
+    attributes:
+      label: Current evidence level
+      options:
+        - Compile-only
+        - Emulated or software adapter
+        - Physical target device
+        - Independent physical target reproduction
+    validations:
+      required: true

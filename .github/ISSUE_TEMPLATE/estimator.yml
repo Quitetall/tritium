@@ -1,0 +1,44 @@
+name: Estimator proposal
+description: Propose a ternary estimator or refinement algorithm with reproducible evidence.
+title: "[estimator] "
+labels: [research]
+body:
+  - type: input
+    id: reference
+    attributes:
+      label: Primary reference
+      description: Paper, specification, or canonical implementation and version.
+    validations:
+      required: true
+  - type: textarea
+    id: contract
+    attributes:
+      label: Algorithm and public contract
+      description: Forward projection, backward estimator, state, serialization, and failure behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Reproduction plan
+      description: Models, datasets, baselines, seeds, physical-byte accounting, quality gates, and hardware.
+    validations:
+      required: true
+  - type: textarea
+    id: license
+    attributes:
+      label: License and conflicts
+      description: Redistribution constraints and relevant authorship, employment, or financial conflicts.
+    validations:
+      required: true
+  - type: dropdown
+    id: evidence_level
+    attributes:
+      label: Current evidence level
+      options:
+        - Proposal only; no execution evidence
+        - Structural or synthetic evidence
+        - Physical-device experiment
+        - Independent physical-device reproduction
+    validations:
+      required: true

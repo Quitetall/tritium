@@ -154,6 +154,15 @@ numbers and source-checkout-only imports fail the documentation gate.
 
 ## Slice 6 — governance, security and support
 
+Status: **IN PROGRESS** — root contribution, conduct, maintainer-led governance,
+citation and version-support policies now exist; the security policy covers the
+v1.1 support window, private response targets, supply-chain and deployment
+boundaries. Evidence-oriented bug, estimator, backend, model/performance and
+pull-request templates require reproducible identities and distinguish skipped,
+structural and physical evidence. Channel activation, moderation, escalation and
+durable-archive rules are explicit. Repository-link validation and independent
+policy review remain open; no external community surface has been activated.
+
 Add the community contracts required for a durable research platform:
 
 - `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `GOVERNANCE.md`, `CITATION.cff`,

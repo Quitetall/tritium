@@ -104,7 +104,7 @@ Binds **loopback by default** and is **off by default** (`serve` not in default 
 
 | Threat | STRIDE | Severity | Mitigation (cited) | Residual risk |
 |---|---|---|---|---|
-| No authentication or authorization on any endpoint | Elevation of Privilege | low | Uniform middleware accepts a startup-validated rotation set of at most 32 bearer keys, stores only BLAKE3 digests, scans the full fixed digest set, returns 401 plus `WWW-Authenticate`, and protects health/readiness/metrics/404 as well as generation. Non-loopback bind requires at least one key. | Loopback may deliberately run anonymous, so every local user is one principal. Authenticated probes still need a static header until plan 0052's separate admin listener lands. Bearer transport requires TLS at the trusted proxy boundary. |
+| Missing or bypassed authentication | Elevation of Privilege | low | Uniform middleware accepts a startup-validated rotation set of at most 32 bearer keys, stores only BLAKE3 digests, scans the full fixed digest set, returns 401 plus `WWW-Authenticate`, and protects health/readiness/metrics/404 as well as generation. Non-loopback bind requires at least one key. | Loopback may deliberately run anonymous, so every local user is one principal. Authenticated probes still need a static header until plan 0052's separate admin listener lands. Bearer transport requires TLS at the trusted proxy boundary. |
 | No request timeout — slowloris / slow-send | DoS | low | Explicit 2 MiB `DefaultBodyLimit`; a local timeout middleware (default 600 s) bounds body extraction plus the non-streaming service future and returns a typed OpenAI 408 envelope; the lazy SSE body independently enforces the same absolute lifetime from queue admission, emits an OpenAI `request_timeout` error event, and drops its receiver to cancel generation; `ConcurrencyLimitLayer` (default 64) caps in-flight requests; generation uses a bounded queue. | Permit wait at the concurrency limiter is outside the timeout clock (mitigated by queue 429 backpressure). Header/read time before axum constructs the request is controlled by the deployment's HTTP edge. |
 | Unbounded prompt length & `max_tokens` value (compute exhaustion within 2MB body) | DoS | low | `RequestLimits` rejects excessive message count, aggregate role/content bytes, tokenized prompt length, explicit completion length and checked combined token budget before queue admission; the 2 MiB body limit bounds JSON parsing; excessive `max_tokens` is rejected instead of silently clamped; bounded queue returns 429. | Tokenization still occurs before the token-count limit can be applied. Single decode thread implies head-of-line blocking, bounded by queue, principal rate and request lifetime. |
 | Streaming (SSE) connection exhaustion via many concurrent streams | DoS | low | Bounded job queue returns 429 + Retry-After; expensive routes use fixed-point token buckets per authenticated key (or one anonymous bucket), with a fixed maximum of 32 configured principals and no attacker-created map entries; per-token `try_send` cancels stalled readers; global `ConcurrencyLimitLayer` caps in-flight requests; the absolute SSE lifetime cancels streams; graceful drain closes in-flight work. | 64-token-per-job buffer times active streams is bounded. An admitted SSE stream holds a concurrency permit until completion or deadline; operators must size burst/concurrency for the hardware and may still need an edge-wide distributed limiter across replicas. |
@@ -157,7 +157,11 @@ The boundary is the developer/CI build machine. Realistic attacker = a compromis
 ## 6. Explicitly out of scope
 
 - **TLS / HTTPS termination** for the server — none implemented; expected behind a reverse proxy if ever exposed. Operator's responsibility.
-- **Authentication / authorization** for the server — none implemented; loopback-trust is the design. Operator's responsibility.
+- **Fine-grained authorization and identity management** for the server — the
+  v1.1 server implements bounded rotating bearer authentication and per-principal
+  rate admission, and requires authentication for non-loopback binds. It does not
+  implement user accounts, roles, delegated identity, or tenant isolation;
+  operators terminate TLS and provide those controls at the trusted edge.
 - **A malicious *operator*** — the local operator who chooses what to load and run is trusted by definition.
 - **Model-output content safety / prompt injection / harmful generations** — a model is trusted to be the model the user intended; content-level trust is unsolvable at the parser layer (no signature scheme in GGUF/safetensors).
 - **Model-content provenance / backdoored weights** — structural parse safety is guaranteed; provenance is not. Mitigation is operational (trusted sources, out-of-band hash verification).
@@ -181,7 +185,7 @@ Honest list of gaps the audits flagged, ordered by actionability. None are criti
 **Server hardening (only needed if the loopback/off-by-default assumption is ever relaxed):**
 6. ~~**No auth gate.**~~ **DONE** — non-loopback bind requires uniform bearer authentication; loopback may opt in.
 7. ~~**No request timeout / connection cap.**~~ **DONE** — typed service and lazy-SSE deadlines plus a global in-flight cap are enforced.
-8. ~~**No explicit max-prompt-tokens / per-request decode budget.**~~ **DONE** — pre-admission message/byte/prompt/completion/combined ceilings reject rather than clamp; per-principal admission remains plan 0052 work.
+8. ~~**No explicit max-prompt-tokens / per-request decode budget.**~~ **DONE** — pre-admission message/byte/prompt/completion/combined ceilings reject rather than clamp; fixed-cardinality per-principal token buckets bound admitted generation requests.
 
 **Assurance / process:**
 9. **Sanitizer + miri lanes are weekly/manual, not required per-push gates** — a regression in an unsafe/parse path could merge and sit until the next scheduled run. Consider promoting at least a fast subset to a required gate.
