@@ -243,7 +243,13 @@ strict `scripts/release-status` gate. It rejects noncanonical versions, dirty or
 wrong source revisions, uncontained/symlinked/duplicate artifacts, byte or
 digest drift, unbound CycloneDX/SPDX documents, and provenance that does not
 bind the exact artifact SHA-256, source revision, and builder identity. Actual
-candidate artifacts and cross-platform receipts remain open.
+candidate artifacts and cross-platform receipts remain open. A deterministic
+assembler now sorts artifact inputs, generates canonical in-toto/SLSA v1
+statements, fsyncs metadata, rolls back failed publication, and strict-reloads
+the completed allowlisted candidate. `CANDIDATE_EVIDENCE_VALID` deliberately
+does not claim `LOCAL_RC_READY`; signing and aggregate release gates remain
+open. Operator workflow is documented in
+[`docs/release-candidate.md`](../release-candidate.md).
 
 Set one candidate version source for Rust crates, Python metadata, npm metadata,
 CLI output, schemas, docs and user agent. `1.1.0-rc.N` archives advance during

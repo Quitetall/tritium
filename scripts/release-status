@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import runpy
 import subprocess
 import sys
 from pathlib import Path, PurePosixPath
@@ -184,6 +185,7 @@ def validate(candidate: Path, digest_tool: str) -> dict[str, Any]:
         raise ReleaseError("candidate.artifacts must be a non-empty array")
     ids: set[str] = set()
     paths: set[str] = set()
+    admitted_files = {candidate.name}
     for ordinal, raw in enumerate(artifacts):
         label = f"candidate.artifacts[{ordinal}]"
         artifact = _object(raw, label)
@@ -195,6 +197,7 @@ def validate(candidate: Path, digest_tool: str) -> dict[str, Any]:
             raise ReleaseError("candidate artifact ids and paths must be unique")
         ids.add(artifact_id)
         paths.add(artifact_path)
+        admitted_files.add(artifact_path)
         path = _file(root, artifact_path, f"{label}.path")
         expected = _object(artifact["identity"], f"{label}.identity")
         _exact(expected, IDENTITY_FIELDS, f"{label}.identity")
@@ -208,10 +211,12 @@ def validate(candidate: Path, digest_tool: str) -> dict[str, Any]:
         if actual != expected:
             raise ReleaseError(f"{label}.identity does not match {artifact_path}")
         sbom_path, sbom = _reference(artifact["sbom"], root, f"{label}.sbom")
+        admitted_files.add(sbom_path.relative_to(root).as_posix())
         _validate_sbom(sbom, artifact_id, sbom_path.name)
         provenance_path, provenance = _reference(
             artifact["provenance"], root, f"{label}.provenance"
         )
+        admitted_files.add(provenance_path.relative_to(root).as_posix())
         _validate_provenance(
             provenance,
             artifact_path,
@@ -219,6 +224,34 @@ def validate(candidate: Path, digest_tool: str) -> dict[str, Any]:
             revision,
             provenance_path.name,
         )
+    actual_files: set[str] = set()
+    actual_directories: set[str] = set()
+    for path in root.rglob("*"):
+        if path.is_symlink():
+            raise ReleaseError("candidate directory must not contain symlinks")
+        if path.is_file():
+            actual_files.add(path.relative_to(root).as_posix())
+        elif path.is_dir():
+            actual_directories.add(path.relative_to(root).as_posix())
+        else:
+            raise ReleaseError("candidate directory contains a non-file entry")
+    if actual_files != admitted_files:
+        missing = admitted_files - actual_files
+        unknown = actual_files - admitted_files
+        details = []
+        if missing:
+            details.append(f"missing {', '.join(sorted(missing))}")
+        if unknown:
+            details.append(f"unknown {', '.join(sorted(unknown))}")
+        raise ReleaseError("candidate file allowlist mismatch: " + "; ".join(details))
+    admitted_directories = {
+        parent.as_posix()
+        for name in admitted_files
+        for parent in Path(name).parents
+        if parent != Path(".")
+    }
+    if actual_directories != admitted_directories:
+        raise ReleaseError("candidate directory topology does not match admitted files")
     return document
 
 
@@ -238,6 +271,16 @@ def _git_gate(root: Path, revision: str) -> None:
         raise ReleaseError("candidate worktree is dirty")
 
 
+def _version_gate(root: Path, release: str) -> None:
+    try:
+        module = runpy.run_path(root / "scripts" / "check-release-version.py")
+        current = module["check"](root)
+    except Exception as error:
+        raise ReleaseError(f"candidate version gate failed: {error}") from error
+    if current != release:
+        raise ReleaseError("candidate release does not match package version mirrors")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--candidate", type=Path, required=True)
@@ -245,11 +288,13 @@ def main() -> int:
     args = parser.parse_args()
     try:
         document = validate(args.candidate, args.digest_tool)
-        _git_gate(Path(__file__).resolve().parent.parent, document["source_revision"])
+        root = Path(__file__).resolve().parent.parent
+        _git_gate(root, document["source_revision"])
+        _version_gate(root, document["release"])
     except (OSError, ReleaseError) as error:
         print(f"release-status: BLOCKED: {error}", file=sys.stderr)
         return 1
-    print(f"release-status: LOCAL_RC_READY: {document['release']}")
+    print(f"release-status: CANDIDATE_EVIDENCE_VALID: {document['release']}")
     return 0
 
 

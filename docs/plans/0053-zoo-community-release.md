@@ -247,6 +247,11 @@ npm --prefix packages/tritium-web run check
 git diff --check
 ```
 
+Current `release-status` covers artifact/SBOM/provenance admission only and
+returns `CANDIDATE_EVIDENCE_VALID`. Slice 8 must extend or wrap it with every
+model-zoo, package, browser, serving, deployment, signing and second-machine
+receipt before any `LOCAL_RC_READY` result exists.
+
 Target-specific model, GPU, browser, package, container and cluster commands
 are invoked by the candidate manifest and must emit admitted receipts. A skipped
 test, absent target or zero-case report is not green.

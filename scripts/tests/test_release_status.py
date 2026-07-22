@@ -30,12 +30,14 @@ def fixture(root: Path) -> tuple[Path, Path, dict]:
         encoding="utf-8",
     )
     tool.chmod(0o755)
-    artifact = root / "wheel.whl"
+    candidate_root = root / "candidate"
+    candidate_root.mkdir()
+    artifact = candidate_root / "wheel.whl"
     artifact.write_bytes(b"wheel bytes")
     sha256 = hashlib.sha256(artifact.read_bytes()).hexdigest()
     artifact_id = "tritium-torch-linux-cpu"
     sbom_sha = write_json(
-        root / "wheel.cdx.json",
+        candidate_root / "wheel.cdx.json",
         {
             "bomFormat": "CycloneDX",
             "specVersion": "1.6",
@@ -44,7 +46,7 @@ def fixture(root: Path) -> tuple[Path, Path, dict]:
     )
     revision = "1" * 40
     provenance_sha = write_json(
-        root / "wheel.provenance.json",
+        candidate_root / "wheel.provenance.json",
         {
             "_type": "https://in-toto.io/Statement/v1",
             "subject": [{"name": "wheel.whl", "digest": {"sha256": sha256}}],
@@ -80,7 +82,7 @@ def fixture(root: Path) -> tuple[Path, Path, dict]:
             }
         ],
     }
-    candidate = root / "manifest.json"
+    candidate = candidate_root / "manifest.json"
     write_json(candidate, document)
     return candidate, tool, document
 
@@ -96,12 +98,13 @@ class ReleaseStatusTests(unittest.TestCase):
             with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as raw:
                 root = Path(raw)
                 candidate, tool, document = fixture(root)
+                candidate_root = candidate.parent
                 if mutation == "artifact":
-                    (root / "wheel.whl").write_bytes(b"changed")
+                    (candidate_root / "wheel.whl").write_bytes(b"changed")
                 elif mutation == "sbom":
-                    (root / "wheel.cdx.json").write_text("{}", encoding="utf-8")
+                    (candidate_root / "wheel.cdx.json").write_text("{}", encoding="utf-8")
                 elif mutation == "provenance":
-                    (root / "wheel.provenance.json").write_text("{}", encoding="utf-8")
+                    (candidate_root / "wheel.provenance.json").write_text("{}", encoding="utf-8")
                 else:
                     document["source_revision"] = "2" * 40
                     write_json(candidate, document)
@@ -112,10 +115,27 @@ class ReleaseStatusTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             candidate, tool, _ = fixture(root)
-            artifact = root / "wheel.whl"
-            artifact.rename(root / "real.whl")
+            candidate_root = candidate.parent
+            artifact = candidate_root / "wheel.whl"
+            artifact.rename(candidate_root / "real.whl")
             artifact.symlink_to("real.whl")
             with self.assertRaisesRegex(ReleaseError, "symlink"):
+                validate(candidate, str(tool))
+
+    def test_candidate_rejects_unmanifested_file(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            candidate, tool, _ = fixture(root)
+            (candidate.parent / "untracked.bin").write_bytes(b"not admitted")
+            with self.assertRaisesRegex(ReleaseError, "unknown untracked.bin"):
+                validate(candidate, str(tool))
+
+    def test_candidate_rejects_unmanifested_empty_directory(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            candidate, tool, _ = fixture(root)
+            (candidate.parent / "untracked").mkdir()
+            with self.assertRaisesRegex(ReleaseError, "directory topology"):
                 validate(candidate, str(tool))
 
 
