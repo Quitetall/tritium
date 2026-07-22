@@ -27,20 +27,35 @@ fixed-cardinality per-key token bucket by default (`--rate-limit-rpm 120`,
 
 ### Docker
 
-The repo ships a two-stage `Dockerfile` (CUDA devel build → slim runtime,
+The repo ships separate hardened CPU/CUDA definitions under `deploy/oci`
+(pinned build image → shell-free distroless runtime,
 model as a bind mount):
 
 ```sh
-docker build -t tritium-serve .
-docker run --gpus all -p 127.0.0.1:8080:8080 \
+(
+set -e
+test -z "$(git status --porcelain=v1 --untracked-files=all)" # exact developer source
+revision=$(git rev-parse HEAD)
+created=$(git show -s --format=%cI HEAD)
+docker build -f deploy/oci/Dockerfile.cuda \
+  --build-arg SOURCE_REVISION="$revision" --build-arg SOURCE_CREATED="$created" \
+  -t tritium-serve .
+docker run --rm --gpus all --user 10001:10001 --read-only --cap-drop ALL \
+  --security-opt no-new-privileges --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m \
+  -p 127.0.0.1:8080:8080 \
   -e TRITIUM_AUTH_TOKEN=change-me \
   -v ~/.cache/tritium-models:/models:ro \
-  tritium-serve --model /models/microsoft--bitnet-b1.58-2B-4T-gguf/ggml-model-i2_s.gguf --backend cuda
+  tritium-serve --model /models/microsoft--bitnet-b1.58-2B-4T-gguf/ggml-model-i2_s.gguf \
+  --backend cuda --host 0.0.0.0
+)
 ```
 
-The container entrypoint binds `0.0.0.0` (the `-p` mapping decides real
-exposure), so the server's exposure hardening requires the token — that is
-deliberate.
+The explicit non-loopback bind makes the `-p` mapping reachable and therefore
+requires the token; the server refuses to start without it.
+
+Release candidates use `scripts/build-oci-candidate`, which additionally
+requires a clean tree, vendors the locked dependency graph, disables build
+network access, and emits an attested OCI archive. See `deploy/oci/README.md`.
 
 ## Building from source
 

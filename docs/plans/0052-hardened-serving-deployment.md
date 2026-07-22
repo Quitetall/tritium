@@ -170,6 +170,18 @@ readiness, serves streaming and buffered requests, drains on SIGTERM within the
 budget, rejects write attempts and preserves the same startup/artifact receipt
 as the unpackaged binary.
 
+Progress (2026-07-21): digest-pinned Linux/amd64 CPU and CUDA Dockerfiles now
+use a shell-free distroless runtime, non-root ownership, immutable OCI metadata,
+and no implicit writable volume. A clean-tree builder admits the plan-0051
+candidate manifest, retains its exact source-revision archive, vendors the
+locked Cargo graph, builds offline with frozen resolution and requests an OCI
+archive with BuildKit SBOM/provenance attestations. CPU/CUDA Compose profiles
+enforce arbitrary UID, read-only root, dropped capabilities,
+`no-new-privileges`, bounded tmpfs and read-only model mounts. Structural
+contract tests are local-green. Attestation subject parsing and image-manifest
+admission, exact-image runtime, vulnerability/secret scan, strict schema-v3
+receipt parity, and NVIDIA evidence remain open gates.
+
 ## Slice 5 — Helm, autoscaling and serverless examples
 
 Add `deploy/helm/tritium`, `deploy/keda`, and `deploy/knative`:

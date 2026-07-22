@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -lt 1 || ( "$1" != cpu && "$1" != cuda ) ]]; then
+  echo "usage: scripts/run-oci-compose cpu|cuda [docker compose arguments...]" >&2
+  exit 2
+fi
+flavor="$1"
+shift
+image="${TRITIUM_IMAGE:-}"
+[[ "$image" =~ ^[^[:space:]@]+@sha256:[0-9a-f]{64}$ ]] || {
+  echo "TRITIUM_IMAGE must be an exact name@sha256 digest" >&2
+  exit 2
+}
+[[ -n "${TRITIUM_MODEL:-}" && -f "$TRITIUM_MODEL" && ! -L "$TRITIUM_MODEL" ]] || {
+  echo "TRITIUM_MODEL must be an ordinary model file" >&2
+  exit 2
+}
+TRITIUM_MODEL="$(cd "$(dirname "$TRITIUM_MODEL")" && pwd -P)/$(basename "$TRITIUM_MODEL")"
+export TRITIUM_MODEL
+[[ -n "${TRITIUM_AUTH_TOKEN:-}" ]] || {
+  echo "TRITIUM_AUTH_TOKEN is required" >&2
+  exit 2
+}
+if [[ $# -eq 0 ]]; then
+  set -- up
+fi
+exec docker compose -f "deploy/oci/compose.${flavor}.yaml" "$@"

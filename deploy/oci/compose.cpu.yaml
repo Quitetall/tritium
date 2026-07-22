@@ -1,0 +1,27 @@
+services:
+  tritium:
+    image: ${TRITIUM_IMAGE:?set TRITIUM_IMAGE to an exact image digest}
+    user: "${TRITIUM_UID:-10001}:${TRITIUM_GID:-10001}"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m
+    volumes:
+      - ${TRITIUM_MODEL:?set TRITIUM_MODEL to a GGUF path}:/models/model.gguf:ro
+    environment:
+      TRITIUM_AUTH_TOKEN: ${TRITIUM_AUTH_TOKEN:?set TRITIUM_AUTH_TOKEN}
+    command:
+      - --model
+      - /models/model.gguf
+      - --backend
+      - cpu
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+    ports:
+      - 127.0.0.1:${TRITIUM_PORT:-8080}:8080
+    stop_grace_period: 30s
+    healthcheck:
+      disable: true

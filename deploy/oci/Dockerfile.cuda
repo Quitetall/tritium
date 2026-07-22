@@ -1,0 +1,46 @@
+# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
+
+ARG SOURCE_DATE_EPOCH
+# Rust and CUDA are separate pinned inputs. The runtime dlopens the host driver;
+# the CUDA toolkit and build shell never enter the final image.
+FROM docker.io/library/rust:1.89.0-bookworm@sha256:c9ac3fa8945b61dede1e4500d25028aa8fd8a8fe46365fcf9c0422f8d999b9b0 AS rust-toolchain
+FROM docker.io/nvidia/cuda:13.0.1-devel-ubuntu22.04@sha256:bb3de902bc1b522231cffea98a4d25a16ddb9fc8685a958b48d83036f46fd0c2 AS build
+ARG SOURCE_REVISION
+ARG SOURCE_CREATED
+ARG SOURCE_DATE_EPOCH
+ARG CARGO_NET_OFFLINE=false
+COPY --from=rust-toolchain /usr/local/cargo /usr/local/cargo
+COPY --from=rust-toolchain /usr/local/rustup /usr/local/rustup
+ENV PATH=/usr/local/cargo/bin:${PATH} \
+    RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    CARGO_NET_OFFLINE=${CARGO_NET_OFFLINE} \
+    TRITIUM_SOURCE_ID=source-git:${SOURCE_REVISION}
+WORKDIR /src
+COPY . .
+RUN test "${#SOURCE_REVISION}" -eq 40 \
+    && printf '%s' "${SOURCE_REVISION}" | grep -Eq '^[0-9a-f]{40}$' \
+    && test -n "${SOURCE_CREATED}"
+RUN cargo build --frozen --profile dist -p tritium-serve --features cuda --bin tritium-serve
+
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:471dbca9cad607b9a32c10e9c31fb09ffaeb2d460e0afbff86c27abbc80b1b98
+ARG SOURCE_REVISION
+ARG SOURCE_CREATED
+LABEL org.opencontainers.image.title="Tritium Serve CUDA" \
+      org.opencontainers.image.description="Verified ternary-model inference server (CUDA)" \
+      org.opencontainers.image.source="https://github.com/Quitetall/tritium" \
+      org.opencontainers.image.revision="${SOURCE_REVISION}" \
+      org.opencontainers.image.created="${SOURCE_CREATED}" \
+      org.opencontainers.image.version="1.1.0-rc.0" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      io.tritium.backend="cuda" \
+      io.tritium.cuda.toolkit="13.0.1" \
+      io.tritium.artifact.schema="3" \
+      io.tritium.startup-receipt.schema="1"
+COPY --from=build --chown=65532:65532 /src/target/dist/tritium-serve /usr/local/bin/tritium-serve
+COPY --chown=65532:65532 LICENSE NOTICE /usr/share/licenses/tritium/
+COPY --chown=65532:65532 deploy/oci/models /models
+USER 65532:65532
+WORKDIR /
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/tritium-serve"]

@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  echo "usage: scripts/build-oci-candidate cpu|cuda CANDIDATE_MANIFEST ABSOLUTE_EMPTY_OUTPUT_DIR" >&2
+  exit 2
+}
+
+[[ $# -eq 3 ]] || usage
+flavor="$1"
+candidate="$2"
+output="$3"
+[[ "$flavor" == cpu || "$flavor" == cuda ]] || usage
+[[ "$output" == /* ]] || { echo "output directory must be absolute" >&2; exit 2; }
+
+root="$(git rev-parse --show-toplevel)"
+[[ -z "$(git -C "$root" status --porcelain=v1 --untracked-files=all)" ]] || {
+  echo "OCI release builds require a clean Git worktree" >&2
+  exit 1
+}
+[[ -f "$candidate" && ! -L "$candidate" ]] || { echo "candidate manifest must be an ordinary file" >&2; exit 1; }
+candidate="$(cd "$(dirname "$candidate")" && pwd -P)/$(basename "$candidate")"
+digest_tool="${TRITIUM_BIN:-$root/target/release/tritium}"
+candidate_sha256="$(sha256sum "$candidate" | cut -d ' ' -f 1)"
+"$root/scripts/release-status" --candidate "$candidate" --digest-tool "$digest_tool"
+[[ "$(sha256sum "$candidate" | cut -d ' ' -f 1)" == "$candidate_sha256" ]] || {
+  echo "candidate manifest changed during admission" >&2
+  exit 1
+}
+IFS=$'\t' read -r revision release < <(
+  python3 -c 'import json,sys; value=json.load(open(sys.argv[1], encoding="utf-8")); print(value["source_revision"], value["release"], sep="\t")' "$candidate"
+)
+[[ "$(sha256sum "$candidate" | cut -d ' ' -f 1)" == "$candidate_sha256" ]] || {
+  echo "candidate manifest changed while reading admitted fields" >&2
+  exit 1
+}
+head_revision="$(git -C "$root" rev-parse HEAD)"
+[[ "$revision" == "$head_revision" ]] || { echo "candidate source revision differs from HEAD" >&2; exit 1; }
+[[ "$revision" =~ ^[0-9a-f]{40}$ ]] || { echo "HEAD is not a full lowercase Git object ID" >&2; exit 1; }
+epoch="$(git -C "$root" show -s --format=%ct HEAD)"
+[[ "$epoch" =~ ^[0-9]+$ ]] || { echo "commit timestamp is invalid" >&2; exit 1; }
+created="$(date -u -d "@$epoch" '+%Y-%m-%dT%H:%M:%SZ')"
+
+mkdir -p "$output"
+output="$(cd "$output" && pwd -P)"
+[[ -z "$(find "$output" -mindepth 1 -maxdepth 1 -print -quit)" ]] || {
+  echo "output directory must be empty: $output" >&2
+  exit 1
+}
+
+context="$(mktemp -d)"
+trap 'rm -rf "$context"' EXIT
+source_archive="$output/tritium-${release}-source-${revision}.tar"
+git -C "$root" archive --format=tar --prefix="tritium-${release}/" --output="$source_archive" "$revision"
+tar -xf "$source_archive" --strip-components=1 -C "$context"
+(
+  cd "$context"
+  cargo vendor --locked --versioned-dirs vendor >> .cargo/config.toml
+)
+
+archive="$output/tritium-serve-${flavor}-${revision}.oci.tar"
+docker buildx build \
+  --platform linux/amd64 \
+  --network none \
+  --file "$context/deploy/oci/Dockerfile.${flavor}" \
+  --build-arg "SOURCE_REVISION=$revision" \
+  --build-arg "SOURCE_CREATED=$created" \
+  --build-arg "SOURCE_DATE_EPOCH=$epoch" \
+  --build-arg CARGO_NET_OFFLINE=true \
+  --attest type=sbom \
+  --attest type=provenance,mode=max \
+  --output "type=oci,dest=$archive,rewrite-timestamp=true" \
+  "$context"
+
+[[ -f "$archive" && ! -L "$archive" ]] || { echo "OCI archive was not created" >&2; exit 1; }
+archive_name="$(basename "$archive")"
+archive_sha256="$(sha256sum "$archive" | cut -d ' ' -f 1)"
+archive_bytes="$(stat -c %s "$archive")"
+source_name="$(basename "$source_archive")"
+source_sha256="$(sha256sum "$source_archive" | cut -d ' ' -f 1)"
+source_bytes="$(stat -c %s "$source_archive")"
+[[ "$(sha256sum "$candidate" | cut -d ' ' -f 1)" == "$candidate_sha256" ]] || {
+  echo "candidate manifest changed during OCI build" >&2
+  exit 1
+}
+printf '%s  %s\n' "$archive_sha256" "$archive_name" > "$archive.sha256"
+printf '%s  %s\n' "$source_sha256" "$source_name" > "$source_archive.sha256"
+printf '{"schema":"tritium.oci-build.v1","release":"%s","flavor":"%s","candidate_manifest_sha256":"%s","source_revision":"%s","source_created":"%s","source_date_epoch":%s,"source_archive":"%s","source_archive_bytes":%s,"source_archive_sha256":"%s","platform":"linux/amd64","archive":"%s","archive_bytes":%s,"archive_sha256":"%s"}\n' \
+  "$release" "$flavor" "$candidate_sha256" "$revision" "$created" "$epoch" "$source_name" "$source_bytes" "$source_sha256" "$archive_name" "$archive_bytes" "$archive_sha256" > "$output/build-receipt.json"
+echo "$archive"
