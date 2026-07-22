@@ -194,7 +194,7 @@ enforce arbitrary UID, read-only root, dropped capabilities,
 contract tests are local-green. OCI archive admission now streams every blob
 digest, validates single-platform image/config identity, and requires in-toto
 SBOM plus SLSA predicates whose subjects bind exact image-manifest digest.
-Exact-image runtime, vulnerability/secret scan, strict schema-v3
+Exact-image runtime, empirical vulnerability/secret scan, strict schema-v3
 receipt parity, and NVIDIA evidence remain open gates.
 
 Runtime qualification harness now requires an exact Docker repository digest,
@@ -207,6 +207,14 @@ candidate-archive-bound receipt only after all checks pass. The release registry
 admits CPU and CUDA runtime evidence separately and neither substitutes for the
 remaining deployment gate. No qualifying image or 27B bundle is present locally
 yet, so both empirical runtime receipts remain open.
+
+Security qualification now runs separate offline Trivy passes over exact OCI
+archive bytes: HIGH/CRITICAL vulnerability detection and unfiltered secret
+detection. Admission requires Trivy 0.69.0 or newer, a non-expired vulnerability
+database no more than 24 hours old, hashed scanner/DB inputs, zero findings and
+a content-addressed candidate-bound receipt. CPU and CUDA scan receipts are
+independent release gates. Trivy and its DB are absent locally, so no empirical
+security receipt exists; waiver schema remains intentionally unimplemented.
 
 ## Slice 5 — Helm, autoscaling and serverless examples
 

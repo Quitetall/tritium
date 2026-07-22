@@ -261,11 +261,13 @@ model-zoo, package, browser, serving, deployment, signing and second-machine
 receipt can produce `LOCAL_RC_READY`.
 
 Exact-image serving admission now distinguishes CPU runtime, CUDA runtime and
-cluster deployment. Each runtime receipt must bind the candidate OCI archive,
+CPU/CUDA security scans, plus cluster deployment. Each runtime receipt must bind the candidate OCI archive,
 the archive-verified image manifest digest, build lineage, strict model manifest,
 startup receipt, physical machine/device identity and hardened live-container
-checks. One flavor cannot satisfy the other, and neither can satisfy deployment.
-No empirical OCI runtime receipt exists locally yet.
+checks. Security receipts bind same candidate archive plus scanner binary,
+fresh database snapshots, offline commands and zero HIGH/CRITICAL vulnerability
+or secret findings. One flavor cannot satisfy another gate, and none can satisfy
+deployment. No empirical OCI runtime or security receipt exists locally yet.
 
 Progress (2026-07-21): aggregate sign-off now uses a non-circular two-layer
 contract. The registry report binds its own SHA-256 and can reach only

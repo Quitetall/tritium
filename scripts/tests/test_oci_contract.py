@@ -133,6 +133,21 @@ class OciContractTests(unittest.TestCase):
         ):
             self.assertIn(token, script)
 
+    def test_security_qualifier_is_offline_candidate_bound_and_zero_finding(self):
+        script = (ROOT / "scripts/qualify-oci-security.py").read_text(encoding="utf-8")
+        for token in (
+            '"--offline-scan"',
+            '"--skip-db-update"',
+            '"--scanners", "vuln"',
+            '"--severity", "HIGH,CRITICAL"',
+            '"--scanners", "secret"',
+            "trivy_db_sha256",
+            "executable_sha256",
+            "security receipt does not bind candidate OCI bytes",
+            "security receipt contains blocking findings",
+        ):
+            self.assertIn(token, script)
+
 
 if __name__ == "__main__":
     unittest.main()

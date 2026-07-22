@@ -25,6 +25,7 @@ MATRIX_MODULE = runpy.run_path(ROOT / "scripts" / "aggregate-wheel-smoke.py")
 CRATE_MODULE = runpy.run_path(ROOT / "scripts" / "qualify-crate-archives.py")
 NPM_MODULE = runpy.run_path(ROOT / "scripts" / "verify-npm-archive-receipt.py")
 OCI_RUNTIME_MODULE = runpy.run_path(ROOT / "scripts" / "qualify-oci-runtime.py")
+OCI_SECURITY_MODULE = runpy.run_path(ROOT / "scripts" / "qualify-oci-security.py")
 
 
 def canonical(value) -> bytes:
@@ -167,6 +168,41 @@ def oci_runtime_receipt(path: Path, artifact: Path, *, flavor: str = "cpu") -> d
     return value
 
 
+def oci_security_receipt(path: Path, artifact: Path, *, flavor: str = "cpu") -> dict:
+    common = [
+        "/usr/bin/trivy", "--cache-dir", "/cache", "image", "--input",
+        str(artifact.resolve()), "--format", "json", "--offline-scan",
+        "--skip-db-update", "--skip-java-db-update", "--skip-check-update",
+    ]
+    value = {
+        "schema": OCI_SECURITY_MODULE["SCHEMA"], "release": "1.1.0-rc.0",
+        "source_revision": "a" * 40, "run_id": f"security-{flavor}-1",
+        "flavor": flavor, "started_at_utc": "2026-07-21T12:00:00+00:00",
+        "duration_ms": 100.0,
+        "artifact": {"kind": "oci-image", "name": artifact.name,
+                     "bytes": artifact.stat().st_size, "sha256": sha256(artifact)},
+        "scanner": {"name": "trivy", "version": "0.69.1",
+                    "executable_sha256": "6" * 64,
+                    "commands": [
+                        common + ["--scanners", "vuln", "--severity", "HIGH,CRITICAL",
+                                  "--output", "/tmp/vulnerability.json"],
+                        common + ["--scanners", "secret", "--output", "/tmp/secret.json"],
+                    ]},
+        "database": {"updated_at": "2026-07-21T06:00:00Z",
+                     "downloaded_at": "2026-07-21T06:01:00Z",
+                     "next_update": "2026-07-21T12:00:01Z",
+                     "trivy_db_sha256": "7" * 64, "metadata_sha256": "8" * 64,
+                     "max_age_hours": 24.0},
+        "findings": {"high_or_critical_vulnerabilities": 0, "secret_findings": 0},
+        "result": "pass",
+    }
+    value["receipt_id"] = "sha256:" + hashlib.sha256(
+        OCI_SECURITY_MODULE["canonical"](value)
+    ).hexdigest()
+    path.write_bytes(OCI_SECURITY_MODULE["canonical"](value))
+    return value
+
+
 def registry(
     path: Path, candidate: Path, receipts: list[dict]
 ) -> None:
@@ -199,6 +235,37 @@ def entry(
 
 
 class ReleaseEvidenceStatusTests(unittest.TestCase):
+    def test_cpu_oci_security_advances_serving_without_waiving_other_gates(self):
+        with tempfile.TemporaryDirectory() as raw:
+            candidate, document, old_artifact, evidence_root = release_fixture(Path(raw))
+            old_artifact.unlink()
+            artifact = candidate.parent / "tritium-cpu.oci.tar"
+            artifact.write_bytes(b"qualified OCI archive")
+            document["artifacts"] = [{
+                "id": "oci-cpu", "kind": "oci-image", "path": artifact.name,
+                "identity": {"sha256": sha256(artifact), "bytes": artifact.stat().st_size},
+                "sbom": {}, "provenance": {},
+            }]
+            candidate.write_bytes(canonical(document) + b"\n")
+            receipt_path = evidence_root / "security-cpu.json"
+            receipt = oci_security_receipt(receipt_path, artifact)
+            receipt_entry = entry(receipt_path, receipt, kind="oci-security-cpu")
+            receipt_entry["artifact_id"] = "oci-cpu"
+            registry_path = evidence_root / "registry.json"
+            registry(registry_path, candidate, [receipt_entry])
+            report = evaluate(registry_path, candidate, document)
+            serving = next(row for row in report["rows"] if row["id"] == "serving")
+            self.assertEqual(serving["satisfied_kinds"], ["oci-security-cpu"])
+            self.assertEqual(
+                serving["missing_kinds"],
+                ["oci-runtime-cpu", "oci-runtime-cuda", "oci-security-cuda",
+                 "serving-deployment"],
+            )
+            receipt_entry["kind"] = "oci-security-cuda"
+            registry(registry_path, candidate, [receipt_entry])
+            with self.assertRaisesRegex(EvidenceError, "flavor differs"):
+                evaluate(registry_path, candidate, document)
+
     def test_cpu_oci_runtime_advances_serving_without_overclaiming_cuda_or_deployment(self):
         with tempfile.TemporaryDirectory() as raw:
             candidate, document, old_artifact, evidence_root = release_fixture(Path(raw))
@@ -221,7 +288,9 @@ class ReleaseEvidenceStatusTests(unittest.TestCase):
             serving = next(row for row in report["rows"] if row["id"] == "serving")
             self.assertEqual(serving["satisfied_kinds"], ["oci-runtime-cpu"])
             self.assertEqual(
-                serving["missing_kinds"], ["oci-runtime-cuda", "serving-deployment"]
+                serving["missing_kinds"],
+                ["oci-runtime-cuda", "oci-security-cpu", "oci-security-cuda",
+                 "serving-deployment"],
             )
             receipt_entry["kind"] = "oci-runtime-cuda"
             registry(registry_path, candidate, [receipt_entry])

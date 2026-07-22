@@ -28,6 +28,9 @@ NpmReceiptError = NPM_RECEIPT["NpmReceiptError"]
 OCI_RUNTIME = runpy.run_path(Path(__file__).with_name("qualify-oci-runtime.py"))
 load_oci_runtime_receipt = OCI_RUNTIME["load_receipt"]
 OciRuntimeError = OCI_RUNTIME["QualificationError"]
+OCI_SECURITY = runpy.run_path(Path(__file__).with_name("qualify-oci-security.py"))
+load_oci_security_receipt = OCI_SECURITY["load_receipt"]
+OciSecurityError = OCI_SECURITY["SecurityScanError"]
 
 SCHEMA = "tritium.release-evidence-registry.v1"
 REPORT_SCHEMA = "tritium.release-gate-report.v1"
@@ -39,6 +42,7 @@ KNOWN_KINDS = frozenset(
     {
         "cuda-training", "clean-install", "compatibility-matrix",
         "crate-archive", "npm-archive", "oci-runtime-cpu", "oci-runtime-cuda",
+        "oci-security-cpu", "oci-security-cuda",
     }
 )
 HEX = frozenset("0123456789abcdef")
@@ -60,7 +64,11 @@ GATES = (
         "packages",
         ("clean-install", "compatibility-matrix", "crate-archive", "npm-archive"),
     ),
-    ("serving", ("oci-runtime-cpu", "oci-runtime-cuda", "serving-deployment")),
+    (
+        "serving",
+        ("oci-runtime-cpu", "oci-runtime-cuda", "oci-security-cpu",
+         "oci-security-cuda", "serving-deployment"),
+    ),
     ("zoo-community", ("model-zoo", "generated-claims", "governance-docs")),
     ("reproduction-signoff", ("second-machine", "independent-review")),
 )
@@ -225,7 +233,7 @@ def evaluate(registry: Path, candidate: Path, candidate_document: dict[str, Any]
         expected_artifact_kind = (
             "rust-crate" if kind == "crate-archive"
             else "npm-archive" if kind == "npm-archive"
-            else "oci-image" if kind in {"oci-runtime-cpu", "oci-runtime-cuda"}
+            else "oci-image" if kind.startswith("oci-")
             else "python-wheel"
         )
         if artifact.get("kind") != expected_artifact_kind:
@@ -261,12 +269,20 @@ def evaluate(registry: Path, candidate: Path, candidate_document: dict[str, Any]
                 )
                 if receipt["flavor"] != kind.removeprefix("oci-runtime-"):
                     raise OciRuntimeError("runtime receipt flavor differs from evidence kind")
+            elif kind in {"oci-security-cpu", "oci-security-cuda"}:
+                receipt = load_oci_security_receipt(
+                    receipt_path, revision=revision, release=release,
+                    artifact_path=artifact_path,
+                )
+                if receipt["flavor"] != kind.removeprefix("oci-security-"):
+                    raise OciSecurityError("security receipt flavor differs from evidence kind")
             else:
                 raise EvidenceError(f"{label}.kind has no validator dispatch")
         except (
             OSError, CudaReceiptError, WheelReceiptError, MatrixReceiptError,
             CrateReceiptError, NpmReceiptError,
             OciRuntimeError,
+            OciSecurityError,
         ) as error:
             raise EvidenceError(f"{label} failed {kind} validation: {error}") from error
         if receipt["receipt_id"] != receipt_id:
@@ -330,7 +346,7 @@ def evaluate(registry: Path, candidate: Path, candidate_document: dict[str, Any]
             )
             if actual != declared or actual != qualified:
                 raise EvidenceError("npm receipt does not bind candidate archive bytes")
-        elif kind in {"oci-runtime-cpu", "oci-runtime-cuda"}:
+        elif kind.startswith("oci-"):
             identity = artifact.get("identity", {})
             actual = (artifact_path.name, _sha256(artifact_path), artifact_path.stat().st_size)
             declared = (artifact_path.name, identity.get("sha256"), identity.get("bytes"))
@@ -339,7 +355,7 @@ def evaluate(registry: Path, candidate: Path, candidate_document: dict[str, Any]
                 receipt["artifact"]["bytes"],
             )
             if actual != declared or actual != qualified:
-                raise EvidenceError("OCI runtime receipt does not bind candidate image bytes")
+                raise EvidenceError("OCI receipt does not bind candidate image bytes")
         elif receipt["artifact"]["kind"] != "python-wheel":
             raise EvidenceError(f"{kind} receipt does not identify a Python wheel")
         run_id = receipt["run_id"]
