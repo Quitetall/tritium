@@ -18,6 +18,7 @@ const SOURCE_ID_CONTEXT: &str = "tritium salt v2 curvature source id v1";
 const SELECTION_SAMPLE_CONTEXT: &str = "tritium salt v2 curvature selection sample v1";
 const INPUT_SAMPLE_CONTEXT: &str = "tritium salt v2 input curvature sample v1";
 const FISHER_SAMPLE_CONTEXT: &str = "tritium salt v2 fisher curvature sample v1";
+const INDEXED_FISHER_SAMPLE_CONTEXT: &str = "tritium salt v2 indexed fisher sample v1";
 
 /// Immutable identities that make a curvature sample stream auditable.
 ///
@@ -321,6 +322,16 @@ struct FisherSegment {
     data_trace: [u8; 32],
 }
 
+#[derive(Clone, Debug)]
+struct IndexedFisherSegment {
+    range: SampleRange,
+    entries: Vec<(usize, f64)>,
+    total_weight: f64,
+    selected_count: u64,
+    selection_trace: [u8; 32],
+    data_trace: [u8; 32],
+}
+
 fn zeroed_f64_values(length: usize) -> Result<Vec<f64>, CurvatureError> {
     let mut values = Vec::new();
     values
@@ -379,6 +390,31 @@ fn try_clone_fisher_segments(
     Ok(cloned)
 }
 
+fn try_clone_indexed_fisher_segments(
+    segments: &[IndexedFisherSegment],
+) -> Result<Vec<IndexedFisherSegment>, CurvatureError> {
+    let mut cloned = Vec::new();
+    cloned
+        .try_reserve_exact(segments.len())
+        .map_err(|_| CurvatureError::DimensionTooLarge)?;
+    for segment in segments {
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(segment.entries.len())
+            .map_err(|_| CurvatureError::DimensionTooLarge)?;
+        entries.extend_from_slice(&segment.entries);
+        cloned.push(IndexedFisherSegment {
+            range: segment.range,
+            entries,
+            total_weight: segment.total_weight,
+            selected_count: segment.selected_count,
+            selection_trace: segment.selection_trace,
+            data_trace: segment.data_trace,
+        });
+    }
+    Ok(cloned)
+}
+
 fn canonical_sample_range(range: SampleRange) -> bool {
     let length = range.end.saturating_sub(range.start);
     length.is_power_of_two() && range.start.is_multiple_of(length)
@@ -428,6 +464,55 @@ fn merge_fisher_segments(
     Ok(left)
 }
 
+fn merge_indexed_fisher_segments(
+    mut left: IndexedFisherSegment,
+    right: IndexedFisherSegment,
+) -> Result<IndexedFisherSegment, CurvatureError> {
+    debug_assert!(canonical_siblings(left.range, right.range));
+    let mut entries = Vec::new();
+    entries
+        .try_reserve_exact(
+            left.entries
+                .len()
+                .checked_add(right.entries.len())
+                .ok_or(CurvatureError::DimensionTooLarge)?,
+        )
+        .map_err(|_| CurvatureError::DimensionTooLarge)?;
+    let mut left_index = 0;
+    let mut right_index = 0;
+    while left_index < left.entries.len() && right_index < right.entries.len() {
+        let left_entry = left.entries[left_index];
+        let right_entry = right.entries[right_index];
+        match left_entry.0.cmp(&right_entry.0) {
+            core::cmp::Ordering::Less => {
+                entries.push(left_entry);
+                left_index += 1;
+            }
+            core::cmp::Ordering::Greater => {
+                entries.push(right_entry);
+                right_index += 1;
+            }
+            core::cmp::Ordering::Equal => {
+                entries.push((left_entry.0, finite_add(left_entry.1, right_entry.1)?));
+                left_index += 1;
+                right_index += 1;
+            }
+        }
+    }
+    entries.extend_from_slice(&left.entries[left_index..]);
+    entries.extend_from_slice(&right.entries[right_index..]);
+    left.entries = entries;
+    left.total_weight = finite_add(left.total_weight, right.total_weight)?;
+    left.selected_count = left
+        .selected_count
+        .checked_add(right.selected_count)
+        .ok_or(CurvatureError::DimensionTooLarge)?;
+    xor_digest(&mut left.selection_trace, right.selection_trace);
+    xor_digest(&mut left.data_trace, right.data_trace);
+    left.range.end = right.range.end;
+    Ok(left)
+}
+
 fn push_input_segment(
     stack: &mut Vec<InputSegment>,
     segment: InputSegment,
@@ -466,6 +551,27 @@ fn push_fisher_segment(
         let right = stack.pop().expect("length checked");
         let left = stack.pop().expect("length checked");
         stack.push(merge_fisher_segments(left, right)?);
+    }
+    Ok(())
+}
+
+fn push_indexed_fisher_segment(
+    stack: &mut Vec<IndexedFisherSegment>,
+    segment: IndexedFisherSegment,
+) -> Result<(), CurvatureError> {
+    stack
+        .try_reserve(1)
+        .map_err(|_| CurvatureError::DimensionTooLarge)?;
+    stack.push(segment);
+    while stack.len() >= 2 {
+        let right_index = stack.len() - 1;
+        let left_index = right_index - 1;
+        if !canonical_siblings(stack[left_index].range, stack[right_index].range) {
+            break;
+        }
+        let right = stack.pop().expect("length checked");
+        let left = stack.pop().expect("length checked");
+        stack.push(merge_indexed_fisher_segments(left, right)?);
     }
     Ok(())
 }
@@ -530,6 +636,38 @@ fn canonicalize_fisher_segments(
         }
         expected = segment.range.end;
         push_fisher_segment(&mut canonical, segment)?;
+    }
+    Ok(canonical)
+}
+
+fn canonicalize_indexed_fisher_segments(
+    mut segments: Vec<IndexedFisherSegment>,
+    sample_start: u64,
+) -> Result<Vec<IndexedFisherSegment>, CurvatureError> {
+    segments.sort_unstable_by_key(|segment| segment.range.start);
+    let mut canonical = Vec::new();
+    canonical
+        .try_reserve_exact(segments.len())
+        .map_err(|_| CurvatureError::DimensionTooLarge)?;
+    let mut expected = sample_start;
+    for segment in segments {
+        if !canonical_sample_range(segment.range) {
+            return Err(CurvatureError::NonCanonicalSampleRange {
+                start: segment.range.start,
+                end: segment.range.end,
+            });
+        }
+        if segment.range.start < expected {
+            return Err(CurvatureError::OverlappingSampleRange);
+        }
+        if segment.range.start != expected {
+            return Err(CurvatureError::NonContiguousSampleRange {
+                expected,
+                got: segment.range.start,
+            });
+        }
+        expected = segment.range.end;
+        push_indexed_fisher_segment(&mut canonical, segment)?;
     }
     Ok(canonical)
 }
@@ -1145,6 +1283,275 @@ impl OutputFisherAccumulator {
     }
 }
 
+/// Streaming accumulator for one indexed output factor per sample.
+///
+/// This is the sparse, vocabulary-scale equivalent of feeding a dense one-hot
+/// row to [`OutputFisherAccumulator`]. It produces the same normalized Fisher
+/// values while using a domain-separated sparse provenance trace and avoiding
+/// `output_rows` work and storage per sample or reduction segment.
+#[derive(Clone, Debug)]
+pub struct IndexedOutputFisherAccumulator {
+    output_rows: usize,
+    source_id: Option<CurvatureSourceId>,
+    sample_start: u64,
+    next_sample_ordinal: u64,
+    sample_count: u64,
+    local_segments: Vec<IndexedFisherSegment>,
+    merged_segments: Vec<IndexedFisherSegment>,
+}
+
+impl IndexedOutputFisherAccumulator {
+    /// Start an unbound diagnostic accumulator at sample ordinal zero.
+    ///
+    /// # Errors
+    /// Rejects a zero row count.
+    pub fn new(output_rows: usize) -> Result<Self, CurvatureError> {
+        Self::new_inner(output_rows, None, 0)
+    }
+
+    /// Start a source-bound indexed Fisher accumulator at a global sample ordinal.
+    ///
+    /// # Errors
+    /// Rejects a zero output-row count.
+    pub fn new_bound(
+        output_rows: usize,
+        source_id: CurvatureSourceId,
+        sample_start: u64,
+    ) -> Result<Self, CurvatureError> {
+        Self::new_inner(output_rows, Some(source_id), sample_start)
+    }
+
+    fn new_inner(
+        output_rows: usize,
+        source_id: Option<CurvatureSourceId>,
+        sample_start: u64,
+    ) -> Result<Self, CurvatureError> {
+        if output_rows == 0 {
+            return Err(CurvatureError::InvalidDimension);
+        }
+        Ok(Self {
+            output_rows,
+            source_id,
+            sample_start,
+            next_sample_ordinal: sample_start,
+            sample_count: 0,
+            local_segments: Vec::new(),
+            merged_segments: Vec::new(),
+        })
+    }
+
+    pub(crate) fn try_clone_transactional(&self) -> Result<Self, CurvatureError> {
+        Ok(Self {
+            output_rows: self.output_rows,
+            source_id: self.source_id,
+            sample_start: self.sample_start,
+            next_sample_ordinal: self.next_sample_ordinal,
+            sample_count: self.sample_count,
+            local_segments: try_clone_indexed_fisher_segments(&self.local_segments)?,
+            merged_segments: try_clone_indexed_fisher_segments(&self.merged_segments)?,
+        })
+    }
+
+    pub(crate) fn retained_reduction_segments(&self) -> usize {
+        self.local_segments.len() + self.merged_segments.len()
+    }
+
+    /// Add one indexed output-factor batch.
+    ///
+    /// Sample `i` represents a factor row containing `factors[i]` at
+    /// `output_indices[i]` and zero everywhere else.
+    ///
+    /// # Errors
+    /// Rejects empty or malformed batches, out-of-range rows, non-finite
+    /// factors, negative/non-finite weights, and overflow without mutation.
+    pub fn accumulate_batch(
+        &mut self,
+        output_indices: &[usize],
+        factors: &[f32],
+        samples: usize,
+        token_weights: Option<&[f64]>,
+        token_mask: Option<&[bool]>,
+    ) -> Result<(), CurvatureError> {
+        validate_batch_shape(
+            "output indices",
+            output_indices.len(),
+            samples,
+            1,
+            token_weights,
+            token_mask,
+        )?;
+        if factors.len() != samples {
+            return Err(CurvatureError::ShapeMismatch {
+                field: "indexed output factors",
+                expected: samples,
+                got: factors.len(),
+            });
+        }
+        for (sample, (&output_row, &factor)) in output_indices.iter().zip(factors).enumerate() {
+            if output_row >= self.output_rows {
+                return Err(CurvatureError::OutputRowOutOfRange {
+                    rows: self.output_rows,
+                    got: output_row,
+                });
+            }
+            if !factor.is_finite() {
+                return Err(CurvatureError::NonFiniteGradient { sample, output_row });
+            }
+        }
+
+        let added_samples =
+            u64::try_from(samples).map_err(|_| CurvatureError::SampleOrdinalOverflow)?;
+        let next_sample_ordinal = self
+            .next_sample_ordinal
+            .checked_add(added_samples)
+            .ok_or(CurvatureError::SampleOrdinalOverflow)?;
+        let added_range = SampleRange {
+            start: self.next_sample_ordinal,
+            end: next_sample_ordinal,
+        };
+        if self
+            .merged_segments
+            .iter()
+            .any(|segment| segment.range.overlaps(added_range))
+        {
+            return Err(CurvatureError::OverlappingSampleRange);
+        }
+
+        let mut next_segments = try_clone_indexed_fisher_segments(&self.local_segments)?;
+        for sample in 0..samples {
+            let ordinal = self
+                .next_sample_ordinal
+                .checked_add(
+                    u64::try_from(sample).map_err(|_| CurvatureError::SampleOrdinalOverflow)?,
+                )
+                .ok_or(CurvatureError::SampleOrdinalOverflow)?;
+            let weight = sample_weight(token_weights, sample);
+            let output_row = output_indices[sample];
+            let factor = factors[sample];
+            let is_selected = selected(token_mask, sample);
+            let selection_leaf =
+                selection_sample_digest(self.source_id, ordinal, weight, is_selected);
+            let data_trace =
+                indexed_fisher_sample_digest(self.output_rows, output_row, factor, selection_leaf);
+            let mut entries = Vec::new();
+            if is_selected {
+                let contribution = finite_product3(weight, f64::from(factor), f64::from(factor))?;
+                if contribution != 0.0 {
+                    entries
+                        .try_reserve_exact(1)
+                        .map_err(|_| CurvatureError::DimensionTooLarge)?;
+                    entries.push((output_row, contribution));
+                }
+            }
+            push_indexed_fisher_segment(
+                &mut next_segments,
+                IndexedFisherSegment {
+                    range: SampleRange {
+                        start: ordinal,
+                        end: ordinal + 1,
+                    },
+                    entries,
+                    total_weight: if is_selected { weight } else { 0.0 },
+                    selected_count: u64::from(is_selected),
+                    selection_trace: selection_leaf,
+                    data_trace,
+                },
+            )?;
+        }
+
+        self.sample_count = checked_sample_add(self.sample_count, samples)?;
+        self.local_segments = next_segments;
+        self.next_sample_ordinal = next_sample_ordinal;
+        Ok(())
+    }
+
+    /// Merge an indexed Fisher shard identified by its first sample ordinal.
+    ///
+    /// # Errors
+    /// Rejects incompatible, overlapping, or non-canonical evidence.
+    pub fn merge_shard(&mut self, declared_order: u64, shard: &Self) -> Result<(), CurvatureError> {
+        validate_merge(
+            self.output_rows,
+            shard.output_rows,
+            shard.sample_start,
+            declared_order,
+        )?;
+        if self.source_id != shard.source_id {
+            return Err(CurvatureError::SourceMismatch);
+        }
+        let segments = shard.canonical_segments()?;
+        let local_range = (self.sample_count != 0).then_some(SampleRange {
+            start: self.sample_start,
+            end: self.next_sample_ordinal,
+        });
+        for segment in &segments {
+            if local_range.is_some_and(|range| range.overlaps(segment.range))
+                || self
+                    .merged_segments
+                    .iter()
+                    .any(|existing| existing.range.overlaps(segment.range))
+            {
+                return Err(CurvatureError::OverlappingSampleRange);
+            }
+        }
+        self.merged_segments
+            .try_reserve_exact(segments.len())
+            .map_err(|_| CurvatureError::DimensionTooLarge)?;
+        self.merged_segments.extend(segments);
+        Ok(())
+    }
+
+    /// Materialize one dense normalized Fisher vector at finalization.
+    ///
+    /// # Errors
+    /// Rejects zero selected weight, invalid canonical ranges, and overflow.
+    pub fn finish(&self) -> Result<OutputFisher, CurvatureError> {
+        let segments = self.canonical_segments()?;
+        let mut sums = zeroed_f64_values(self.output_rows)?;
+        let mut total_weight = 0.0;
+        let mut sample_count = 0_u64;
+        let mut selected_count = 0_u64;
+        let mut selection_trace = [0; 32];
+        let mut data_trace = [0; 32];
+        for segment in segments {
+            for (output_row, value) in segment.entries {
+                sums[output_row] = finite_add(sums[output_row], value)?;
+            }
+            total_weight = finite_add(total_weight, segment.total_weight)?;
+            sample_count = sample_count
+                .checked_add(segment.range.end - segment.range.start)
+                .ok_or(CurvatureError::DimensionTooLarge)?;
+            selected_count = selected_count
+                .checked_add(segment.selected_count)
+                .ok_or(CurvatureError::DimensionTooLarge)?;
+            xor_digest(&mut selection_trace, segment.selection_trace);
+            xor_digest(&mut data_trace, segment.data_trace);
+        }
+        if total_weight == 0.0 {
+            return Err(CurvatureError::ZeroTotalWeight);
+        }
+        Ok(OutputFisher {
+            output_rows: self.output_rows,
+            values: normalized_values(&sums, total_weight)?,
+            total_weight,
+            sample_count,
+            selected_count,
+            source_id: self.source_id,
+            selection_trace,
+            data_trace,
+        })
+    }
+
+    fn canonical_segments(&self) -> Result<Vec<IndexedFisherSegment>, CurvatureError> {
+        let mut segments = try_clone_indexed_fisher_segments(&self.merged_segments)?;
+        segments
+            .try_reserve_exact(self.local_segments.len())
+            .map_err(|_| CurvatureError::DimensionTooLarge)?;
+        segments.extend(try_clone_indexed_fisher_segments(&self.local_segments)?);
+        canonicalize_indexed_fisher_segments(segments, self.sample_start)
+    }
+}
+
 /// Normalized output-gradient empirical-Fisher scalars.
 #[derive(Clone, Debug, PartialEq)]
 pub struct OutputFisher {
@@ -1562,6 +1969,20 @@ fn fisher_sample_digest(
     *hasher.finalize().as_bytes()
 }
 
+fn indexed_fisher_sample_digest(
+    output_rows: usize,
+    output_row: usize,
+    factor: f32,
+    selection_sample: [u8; 32],
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(INDEXED_FISHER_SAMPLE_CONTEXT);
+    hasher.update(&u64::try_from(output_rows).unwrap_or(u64::MAX).to_le_bytes());
+    hasher.update(&selection_sample);
+    hasher.update(&u64::try_from(output_row).unwrap_or(u64::MAX).to_le_bytes());
+    hasher.update(&canonical_f32_bits(factor).to_le_bytes());
+    *hasher.finalize().as_bytes()
+}
+
 fn xor_digest(trace: &mut [u8; 32], leaf: [u8; 32]) {
     for (trace, leaf) in trace.iter_mut().zip(leaf) {
         *trace ^= leaf;
@@ -1785,6 +2206,117 @@ mod tests {
         let kfac = build_kfac_metric(&input, &output, 0, 0.25).expect("damped PSD");
         assert_eq!(kfac.output_scalar(), 7.0);
         assert_eq!(kfac.metric().as_slice(), &[49.25, 66.5, 66.5, 91.25]);
+    }
+
+    #[test]
+    fn indexed_fisher_matches_dense_values_with_sparse_bound_identity() {
+        let binding = source(7);
+        let indices = [3_usize, 1, 3, 0, 2];
+        let factors = [2.0_f32, -3.0, 0.5, 4.0, -1.5];
+        let weights = [1.0, 2.0, 0.25, 3.0, 4.0];
+        let mask = [true, false, true, true, true];
+        let mut dense_values = vec![0.0_f32; indices.len() * 4];
+        for (sample, (&index, &factor)) in indices.iter().zip(&factors).enumerate() {
+            dense_values[sample * 4 + index] = factor;
+        }
+
+        let mut dense = OutputFisherAccumulator::new_bound(4, binding, 0).expect("dense");
+        dense
+            .accumulate_batch(&dense_values, indices.len(), Some(&weights), Some(&mask))
+            .expect("dense one-hot factors");
+        let mut indexed =
+            IndexedOutputFisherAccumulator::new_bound(4, binding, 0).expect("indexed");
+        indexed
+            .accumulate_batch(
+                &indices,
+                &factors,
+                indices.len(),
+                Some(&weights),
+                Some(&mask),
+            )
+            .expect("indexed factors");
+
+        let dense = dense.finish().expect("dense evidence");
+        let indexed = indexed.finish().expect("indexed evidence");
+        assert_eq!(indexed.as_slice(), dense.as_slice());
+        assert_eq!(indexed.total_weight(), dense.total_weight());
+        assert_eq!(indexed.sample_count(), dense.sample_count());
+        assert_eq!(indexed.selected_count(), dense.selected_count());
+        assert_eq!(indexed.selection_digest(), dense.selection_digest());
+        assert_ne!(indexed.digest(), dense.digest());
+    }
+
+    #[test]
+    fn indexed_fisher_is_chunk_resume_and_reverse_merge_invariant() {
+        let binding = source(8);
+        let indices = [3_usize, 1, 3, 0, 2];
+        let factors = [2.0_f32, -3.0, 0.5, 4.0, -1.5];
+
+        let mut one = IndexedOutputFisherAccumulator::new_bound(4, binding, 0).expect("one");
+        one.accumulate_batch(&indices, &factors, indices.len(), None, None)
+            .expect("one batch");
+
+        let mut resumed =
+            IndexedOutputFisherAccumulator::new_bound(4, binding, 0).expect("resumed");
+        resumed
+            .accumulate_batch(&indices[..2], &factors[..2], 2, None, None)
+            .expect("first batch");
+        let mut resumed = resumed.clone();
+        resumed
+            .accumulate_batch(&indices[2..], &factors[2..], 3, None, None)
+            .expect("second batch");
+
+        let mut first =
+            IndexedOutputFisherAccumulator::new_bound(4, binding, 0).expect("first shard");
+        first
+            .accumulate_batch(&indices[..2], &factors[..2], 2, None, None)
+            .expect("first shard data");
+        let mut second =
+            IndexedOutputFisherAccumulator::new_bound(4, binding, 2).expect("second shard");
+        second
+            .accumulate_batch(&indices[2..], &factors[2..], 3, None, None)
+            .expect("second shard data");
+        let mut merged = IndexedOutputFisherAccumulator::new_bound(4, binding, 0).expect("merged");
+        merged.merge_shard(2, &second).expect("second first");
+        merged.merge_shard(0, &first).expect("first second");
+
+        let expected = one.finish().expect("one evidence");
+        assert_eq!(resumed.finish().expect("resumed evidence"), expected);
+        assert_eq!(merged.finish().expect("merged evidence"), expected);
+    }
+
+    #[test]
+    fn indexed_fisher_rejects_bad_rows_and_factors_atomically() {
+        let mut indexed = IndexedOutputFisherAccumulator::new(4).expect("indexed");
+        assert_eq!(
+            indexed
+                .accumulate_batch(&[4], &[1.0], 1, None, None)
+                .unwrap_err(),
+            CurvatureError::OutputRowOutOfRange { rows: 4, got: 4 }
+        );
+        assert!(matches!(
+            indexed.accumulate_batch(&[1], &[f32::NAN], 1, None, None),
+            Err(CurvatureError::NonFiniteGradient {
+                sample: 0,
+                output_row: 1
+            })
+        ));
+        indexed
+            .accumulate_batch(&[2], &[3.0], 1, None, None)
+            .expect("valid after errors");
+        assert_eq!(
+            indexed.finish().expect("evidence").as_slice(),
+            &[0.0, 0.0, 9.0, 0.0]
+        );
+    }
+
+    #[test]
+    fn indexed_fisher_accumulation_does_not_materialize_output_rows() {
+        let mut indexed = IndexedOutputFisherAccumulator::new(1_000_000_000).expect("indexed");
+        indexed
+            .accumulate_batch(&[999_999_999], &[2.0], 1, None, None)
+            .expect("constant-space sparse append");
+        assert_eq!(indexed.retained_reduction_segments(), 1);
     }
 
     #[test]

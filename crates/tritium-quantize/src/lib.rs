@@ -96,8 +96,8 @@ pub use salt_v2_allocator::{
     UniformProfileAllocError, allocate_nested_profiles, allocate_uniform_profile_packed,
 };
 pub use salt_v2_curvature::{
-    CurvatureError, CurvatureSourceId, InputGram, InputGramAccumulator, KfacMetric, OutputFisher,
-    OutputFisherAccumulator, build_kfac_metric,
+    CurvatureError, CurvatureSourceId, IndexedOutputFisherAccumulator, InputGram,
+    InputGramAccumulator, KfacMetric, OutputFisher, OutputFisherAccumulator, build_kfac_metric,
 };
 pub use salt_v2_evidence::{
     DEFAULT_MAX_KRONECKER_EVIDENCE_BYTES, MAX_KRONECKER_REDUCTION_SEGMENTS,

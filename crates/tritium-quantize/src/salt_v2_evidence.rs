@@ -4,9 +4,9 @@ use core::{fmt, mem::size_of};
 use std::io::{self, Read, Write};
 
 use crate::{
-    CurvatureArtifact, CurvatureError, CurvatureSourceId, DensePsdMetric, InputGram,
-    InputGramAccumulator, OutputFisher, OutputFisherAccumulator, SaltV2Curvature,
-    SaltV2TensorFitInput,
+    CurvatureArtifact, CurvatureError, CurvatureSourceId, DensePsdMetric,
+    IndexedOutputFisherAccumulator, InputGram, InputGramAccumulator, OutputFisher,
+    OutputFisherAccumulator, SaltV2Curvature, SaltV2TensorFitInput,
 };
 
 const MAGIC: [u8; 4] = *b"S2KF";
@@ -189,7 +189,43 @@ impl SaltV2KroneckerEvidenceSpec {
 pub struct SaltV2KroneckerEvidenceBuilder {
     spec: SaltV2KroneckerEvidenceSpec,
     input_groups: Vec<InputGramAccumulator>,
-    output_fisher: Option<OutputFisherAccumulator>,
+    output_fisher: Option<OutputFisherBuilder>,
+}
+
+#[derive(Debug)]
+enum OutputFisherBuilder {
+    Dense(OutputFisherAccumulator),
+    Indexed(IndexedOutputFisherAccumulator),
+}
+
+impl OutputFisherBuilder {
+    fn retained_reduction_segments(&self) -> usize {
+        match self {
+            Self::Dense(accumulator) => accumulator.retained_reduction_segments(),
+            Self::Indexed(accumulator) => accumulator.retained_reduction_segments(),
+        }
+    }
+
+    fn try_clone_transactional(&self) -> Result<Self, CurvatureError> {
+        match self {
+            Self::Dense(accumulator) => accumulator.try_clone_transactional().map(Self::Dense),
+            Self::Indexed(accumulator) => accumulator.try_clone_transactional().map(Self::Indexed),
+        }
+    }
+
+    fn finish(&self) -> Result<OutputFisher, CurvatureError> {
+        match self {
+            Self::Dense(accumulator) => accumulator.finish(),
+            Self::Indexed(accumulator) => accumulator.finish(),
+        }
+    }
+
+    fn into_fisher(self) -> Result<OutputFisher, CurvatureError> {
+        match self {
+            Self::Dense(accumulator) => accumulator.finish(),
+            Self::Indexed(accumulator) => accumulator.finish(),
+        }
+    }
 }
 
 /// Exact retained reduction-tree state for one producer.
@@ -232,6 +268,43 @@ impl SaltV2KroneckerEvidenceBuilder {
         spec: SaltV2KroneckerEvidenceSpec,
         sample_start: u64,
     ) -> Result<Self, SaltV2KroneckerEvidenceBuildError> {
+        Self::new_at_with_output_encoding(spec, sample_start, false)
+    }
+
+    /// Start sparse indexed output-factor production at ordinal zero.
+    ///
+    /// The indexed contract is intended for embedding tables: every sample
+    /// names one output row and one scalar factor, avoiding a dense vocabulary
+    /// vector while producing numerically identical Fisher values under a
+    /// domain-separated sparse provenance identity.
+    ///
+    /// # Errors
+    /// Rejects input-Hessian curvature, invalid geometry, or allocation failure.
+    pub fn new_indexed_output(
+        spec: SaltV2KroneckerEvidenceSpec,
+    ) -> Result<Self, SaltV2KroneckerEvidenceBuildError> {
+        Self::new_indexed_output_at(spec, 0)
+    }
+
+    /// Start one independently mergeable indexed-output shard.
+    ///
+    /// # Errors
+    /// Rejects input-Hessian curvature, invalid geometry, or allocation failure.
+    pub fn new_indexed_output_at(
+        spec: SaltV2KroneckerEvidenceSpec,
+        sample_start: u64,
+    ) -> Result<Self, SaltV2KroneckerEvidenceBuildError> {
+        if matches!(spec.kind, SaltV2Curvature::InputHessian) {
+            return Err(SaltV2KroneckerEvidenceBuildError::WrongOutputFactorEncoding);
+        }
+        Self::new_at_with_output_encoding(spec, sample_start, true)
+    }
+
+    fn new_at_with_output_encoding(
+        spec: SaltV2KroneckerEvidenceSpec,
+        sample_start: u64,
+        indexed_output: bool,
+    ) -> Result<Self, SaltV2KroneckerEvidenceBuildError> {
         let group_count = spec.columns / GROUP_SIZE;
         let mut input_groups = Vec::new();
         input_groups
@@ -244,9 +317,17 @@ impl SaltV2KroneckerEvidenceBuilder {
                 sample_start,
             )?);
         }
-        let output_fisher = (!matches!(spec.kind, SaltV2Curvature::InputHessian))
-            .then(|| OutputFisherAccumulator::new_bound(spec.rows, spec.source_id, sample_start))
-            .transpose()?;
+        let output_fisher = if matches!(spec.kind, SaltV2Curvature::InputHessian) {
+            None
+        } else if indexed_output {
+            Some(OutputFisherBuilder::Indexed(
+                IndexedOutputFisherAccumulator::new_bound(spec.rows, spec.source_id, sample_start)?,
+            ))
+        } else {
+            Some(OutputFisherBuilder::Dense(
+                OutputFisherAccumulator::new_bound(spec.rows, spec.source_id, sample_start)?,
+            ))
+        };
         Ok(Self {
             spec,
             input_groups,
@@ -272,7 +353,7 @@ impl SaltV2KroneckerEvidenceBuilder {
             output_segments: self
                 .output_fisher
                 .as_ref()
-                .map_or(0, OutputFisherAccumulator::retained_reduction_segments),
+                .map_or(0, OutputFisherBuilder::retained_reduction_segments),
         }
     }
 
@@ -292,9 +373,14 @@ impl SaltV2KroneckerEvidenceBuilder {
         token_weights: Option<&[f64]>,
         token_mask: Option<&[bool]>,
     ) -> Result<(), SaltV2KroneckerEvidenceBuildError> {
-        match (self.output_fisher.is_some(), output_factors) {
-            (true, None) => return Err(SaltV2KroneckerEvidenceBuildError::MissingOutputFactors),
-            (false, Some(_)) => {
+        match (&self.output_fisher, output_factors) {
+            (Some(OutputFisherBuilder::Dense(_)), None) => {
+                return Err(SaltV2KroneckerEvidenceBuildError::MissingOutputFactors);
+            }
+            (Some(OutputFisherBuilder::Indexed(_)), _) => {
+                return Err(SaltV2KroneckerEvidenceBuildError::WrongOutputFactorEncoding);
+            }
+            (None, Some(_)) => {
                 return Err(SaltV2KroneckerEvidenceBuildError::UnexpectedOutputFactors);
             }
             _ => {}
@@ -364,7 +450,9 @@ impl SaltV2KroneckerEvidenceBuilder {
         }
 
         let mut next_output = try_clone_output_accumulator(self.output_fisher.as_ref())?;
-        if let (Some(accumulator), Some(factors)) = (&mut next_output, output_factors) {
+        if let (Some(OutputFisherBuilder::Dense(accumulator)), Some(factors)) =
+            (&mut next_output, output_factors)
+        {
             accumulator.accumulate_batch(factors, samples, token_weights, token_mask)?;
         }
         let mut next_inputs = try_clone_input_accumulators(&self.input_groups)?;
@@ -383,6 +471,88 @@ impl SaltV2KroneckerEvidenceBuilder {
                 scratch.extend_from_slice(&activations[row_start..row_start + GROUP_SIZE]);
             }
             accumulator.accumulate_batch(&scratch, samples, token_weights, token_mask)?;
+        }
+        ensure_segment_limits(&next_inputs, next_output.as_ref())?;
+        self.input_groups = next_inputs;
+        self.output_fisher = next_output;
+        Ok(())
+    }
+
+    /// Atomically add one sparse indexed output-factor batch.
+    ///
+    /// Each sample names exactly one output row and scalar factor. The input
+    /// activations retain the normal row-major `[samples, columns]` layout.
+    /// Its Fisher values match a dense one-hot output-factor batch, while its
+    /// provenance digest explicitly records sparse indexed capture.
+    ///
+    /// # Errors
+    /// Rejects a dense/input-Hessian builder, malformed arrays, out-of-range
+    /// output rows, non-finite values, invalid masks/weights, or allocation
+    /// failure without changing prior evidence.
+    #[allow(clippy::too_many_arguments)]
+    pub fn accumulate_indexed_output_batch(
+        &mut self,
+        activations: &[f32],
+        output_indices: &[usize],
+        output_factors: &[f32],
+        samples: usize,
+        token_weights: Option<&[f64]>,
+        token_mask: Option<&[bool]>,
+    ) -> Result<(), SaltV2KroneckerEvidenceBuildError> {
+        if !matches!(
+            self.output_fisher.as_ref(),
+            Some(OutputFisherBuilder::Indexed(_))
+        ) {
+            return Err(SaltV2KroneckerEvidenceBuildError::WrongOutputFactorEncoding);
+        }
+        let expected_activations = samples
+            .checked_mul(self.spec.columns)
+            .ok_or(SaltV2KroneckerEvidenceBuildError::AllocationFailed)?;
+        if activations.len() != expected_activations {
+            return Err(SaltV2KroneckerEvidenceBuildError::BatchLengthMismatch {
+                field: "activations",
+                expected: expected_activations,
+                got: activations.len(),
+            });
+        }
+        if samples == 0 {
+            return Err(CurvatureError::EmptyBatch.into());
+        }
+        if let Some(index) = activations.iter().position(|value| !value.is_finite()) {
+            return Err(CurvatureError::NonFiniteActivation {
+                sample: index / self.spec.columns,
+                feature: index % self.spec.columns,
+            }
+            .into());
+        }
+
+        let mut next_output = try_clone_output_accumulator(self.output_fisher.as_ref())?;
+        let Some(OutputFisherBuilder::Indexed(accumulator)) = &mut next_output else {
+            return Err(SaltV2KroneckerEvidenceBuildError::WrongOutputFactorEncoding);
+        };
+        accumulator.accumulate_batch(
+            output_indices,
+            output_factors,
+            samples,
+            token_weights,
+            token_mask,
+        )?;
+        let mut next_inputs = try_clone_input_accumulators(&self.input_groups)?;
+        let scratch_len = samples
+            .checked_mul(GROUP_SIZE)
+            .ok_or(SaltV2KroneckerEvidenceBuildError::AllocationFailed)?;
+        let mut scratch = Vec::new();
+        scratch
+            .try_reserve_exact(scratch_len)
+            .map_err(|_| SaltV2KroneckerEvidenceBuildError::AllocationFailed)?;
+        for (group_index, input) in next_inputs.iter_mut().enumerate() {
+            scratch.clear();
+            let column_start = group_index * GROUP_SIZE;
+            for sample in 0..samples {
+                let row_start = sample * self.spec.columns + column_start;
+                scratch.extend_from_slice(&activations[row_start..row_start + GROUP_SIZE]);
+            }
+            input.accumulate_batch(&scratch, samples, token_weights, token_mask)?;
         }
         ensure_segment_limits(&next_inputs, next_output.as_ref())?;
         self.input_groups = next_inputs;
@@ -412,9 +582,16 @@ impl SaltV2KroneckerEvidenceBuilder {
             destination.merge_shard(declared_order, source)?;
         }
         match (&mut next_output, &shard.output_fisher) {
-            (Some(destination), Some(source)) => {
+            (
+                Some(OutputFisherBuilder::Dense(destination)),
+                Some(OutputFisherBuilder::Dense(source)),
+            ) => {
                 destination.merge_shard(declared_order, source)?;
             }
+            (
+                Some(OutputFisherBuilder::Indexed(destination)),
+                Some(OutputFisherBuilder::Indexed(source)),
+            ) => destination.merge_shard(declared_order, source)?,
             (None, None) => {}
             _ => return Err(SaltV2KroneckerEvidenceBuildError::SpecMismatch),
         }
@@ -440,7 +617,7 @@ impl SaltV2KroneckerEvidenceBuilder {
         let fisher = self
             .output_fisher
             .as_ref()
-            .map(OutputFisherAccumulator::finish)
+            .map(OutputFisherBuilder::finish)
             .transpose()?;
         finalize_builder_evidence(&self.spec, grams, fisher)
     }
@@ -468,7 +645,7 @@ impl SaltV2KroneckerEvidenceBuilder {
             grams.push(accumulator.finish()?);
         }
         let fisher = output_fisher
-            .map(|accumulator| accumulator.finish())
+            .map(OutputFisherBuilder::into_fisher)
             .transpose()?;
         finalize_builder_evidence(&spec, grams, fisher)
     }
@@ -476,7 +653,7 @@ impl SaltV2KroneckerEvidenceBuilder {
 
 fn ensure_segment_limits(
     input_groups: &[InputGramAccumulator],
-    output_fisher: Option<&OutputFisherAccumulator>,
+    output_fisher: Option<&OutputFisherBuilder>,
 ) -> Result<(), SaltV2KroneckerEvidenceBuildError> {
     let retained = input_groups
         .iter()
@@ -484,7 +661,7 @@ fn ensure_segment_limits(
         .chain(
             output_fisher
                 .into_iter()
-                .map(OutputFisherAccumulator::retained_reduction_segments),
+                .map(OutputFisherBuilder::retained_reduction_segments),
         )
         .max()
         .unwrap_or(0);
@@ -517,8 +694,8 @@ fn try_clone_input_accumulators(
 }
 
 fn try_clone_output_accumulator(
-    accumulator: Option<&OutputFisherAccumulator>,
-) -> Result<Option<OutputFisherAccumulator>, SaltV2KroneckerEvidenceBuildError> {
+    accumulator: Option<&OutputFisherBuilder>,
+) -> Result<Option<OutputFisherBuilder>, SaltV2KroneckerEvidenceBuildError> {
     accumulator
         .map(|accumulator| {
             accumulator
@@ -649,6 +826,8 @@ pub enum SaltV2KroneckerEvidenceBuildError {
     UnexpectedOutputFactors,
     /// Fisher/KL evidence omitted required output factors.
     MissingOutputFactors,
+    /// The builder and append operation used different output-factor encodings.
+    WrongOutputFactorEncoding,
     /// Row-major batch storage did not match declared samples and geometry.
     BatchLengthMismatch {
         /// Malformed input field.
@@ -700,6 +879,9 @@ impl fmt::Display for SaltV2KroneckerEvidenceBuildError {
             Self::MissingOutputFactors => {
                 formatter.write_str("Fisher/KL builder requires output factors")
             }
+            Self::WrongOutputFactorEncoding => formatter.write_str(
+                "Kronecker builder output-factor encoding does not match append operation",
+            ),
             Self::BatchLengthMismatch {
                 field,
                 expected,
@@ -741,6 +923,7 @@ impl std::error::Error for SaltV2KroneckerEvidenceBuildError {
             Self::Malformed(_)
             | Self::UnexpectedOutputFactors
             | Self::MissingOutputFactors
+            | Self::WrongOutputFactorEncoding
             | Self::BatchLengthMismatch { .. }
             | Self::SizeLimitExceeded { .. }
             | Self::ReductionSegmentLimitExceeded { .. }

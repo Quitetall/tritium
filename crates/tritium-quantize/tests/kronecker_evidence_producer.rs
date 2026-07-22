@@ -267,3 +267,59 @@ fn reduction_state_is_logarithmic_and_hard_capped() {
     assert_eq!(merged.residency(), before);
     assert!(merged.finish().is_ok());
 }
+
+#[test]
+fn indexed_output_builder_matches_dense_values_with_distinct_provenance() {
+    let contract = SaltV2KroneckerEvidenceSpec::new(
+        SaltV2Curvature::GuidedFisher,
+        source(),
+        9,
+        "model.embed_tokens.weight",
+        4,
+        2 * GROUP,
+        0.25,
+    )
+    .unwrap();
+    let (activations, _) = samples();
+    let indices = [3_usize, 1];
+    let factors = [2.0_f32, -3.0];
+    let dense_factors = [0.0_f32, 0.0, 0.0, 2.0, 0.0, -3.0, 0.0, 0.0];
+
+    let mut dense = SaltV2KroneckerEvidenceBuilder::new(contract.clone()).unwrap();
+    dense
+        .accumulate_batch(&activations, Some(&dense_factors), 2, None, None)
+        .unwrap();
+    let mut indexed = SaltV2KroneckerEvidenceBuilder::new_indexed_output(contract.clone()).unwrap();
+    indexed
+        .accumulate_indexed_output_batch(&activations, &indices, &factors, 2, None, None)
+        .unwrap();
+
+    let indexed_evidence = indexed.finish().unwrap();
+    let dense_evidence = dense.finish().unwrap();
+    assert_eq!(
+        indexed_evidence.input_groups(),
+        dense_evidence.input_groups()
+    );
+    assert_eq!(
+        indexed_evidence.output_weights(),
+        dense_evidence.output_weights()
+    );
+    assert_ne!(
+        indexed_evidence.upstream_evidence_digest(),
+        dense_evidence.upstream_evidence_digest()
+    );
+    assert!(
+        indexed
+            .accumulate_batch(&activations, Some(&dense_factors), 2, None, None)
+            .is_err()
+    );
+    assert!(
+        dense
+            .accumulate_indexed_output_batch(&activations, &indices, &factors, 2, None, None,)
+            .is_err()
+    );
+    assert!(
+        SaltV2KroneckerEvidenceBuilder::new_indexed_output(spec(SaltV2Curvature::InputHessian))
+            .is_err()
+    );
+}

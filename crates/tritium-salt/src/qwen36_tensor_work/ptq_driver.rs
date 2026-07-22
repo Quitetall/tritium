@@ -338,6 +338,42 @@ impl Qwen36PtqEvidenceDirectory {
         })
     }
 
+    /// Create a producer using sparse indexed output factors.
+    ///
+    /// This is the vocabulary-scale path for embedding-table Fisher/KL
+    /// evidence. It is preflighted against the same canonical record ceiling
+    /// as the dense producer.
+    ///
+    /// # Errors
+    /// Rejects oversized geometry, input-Hessian curvature, or invalid
+    /// accumulator geometry before any evidence-directory mutation.
+    pub fn create_indexed_output_builder(
+        &self,
+        spec: SaltV2KroneckerEvidenceSpec,
+    ) -> Result<SaltV2KroneckerEvidenceBuilder, Qwen36PtqDriverError> {
+        self.create_indexed_output_builder_at(spec, 0)
+    }
+
+    /// Create one mergeable sparse indexed-output producer shard.
+    ///
+    /// # Errors
+    /// Rejects oversized geometry, input-Hessian curvature, or invalid
+    /// accumulator geometry before any evidence-directory mutation.
+    pub fn create_indexed_output_builder_at(
+        &self,
+        spec: SaltV2KroneckerEvidenceSpec,
+        sample_start: u64,
+    ) -> Result<SaltV2KroneckerEvidenceBuilder, Qwen36PtqDriverError> {
+        self.preflight_builder_spec(&spec)?;
+        let tensor_index = spec.tensor_index();
+        SaltV2KroneckerEvidenceBuilder::new_indexed_output_at(spec, sample_start).map_err(
+            |source| Qwen36PtqDriverError::EvidenceBuild {
+                tensor_index,
+                source,
+            },
+        )
+    }
+
     fn preflight_builder_spec(
         &self,
         spec: &SaltV2KroneckerEvidenceSpec,
@@ -1789,6 +1825,36 @@ mod tests {
             }) if got == required_bytes
         ));
         assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn indexed_embedding_builder_installs_canonical_evidence() {
+        let parent = temp_root("indexed-builder-install");
+        let root = parent.join("records");
+        let directory = Qwen36PtqEvidenceDirectory::create(&root).unwrap();
+        let source = CurvatureSourceId::new([1; 32], [2; 32], [3; 32]).unwrap();
+        let spec = SaltV2KroneckerEvidenceSpec::new(
+            SaltV2Curvature::GuidedFisher,
+            source,
+            0,
+            "model.embed_tokens.weight",
+            4,
+            128,
+            0.25,
+        )
+        .unwrap();
+        let mut builder = directory.create_indexed_output_builder(spec).unwrap();
+        let mut activations = vec![1.0; 128];
+        activations.extend(std::iter::repeat_n(3.0, 128));
+        builder
+            .accumulate_indexed_output_batch(&activations, &[3, 1], &[2.0, -3.0], 2, None, None)
+            .unwrap();
+
+        directory.install_builder(builder).unwrap();
+        let reopened = directory.reopen(0).unwrap();
+        assert_eq!(reopened.output_weights(), &[0.0, 4.5, 0.0, 2.0]);
 
         fs::remove_dir_all(parent).unwrap();
     }
