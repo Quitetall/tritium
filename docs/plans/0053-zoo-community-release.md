@@ -177,6 +177,17 @@ conversion, atomic safetensors export, strict artifact reload and exact output
 parity on CPU or CUDA, then writes a machine-readable tutorial result. Both
 wheel lanes execute the module after exact candidate installation. A local CPU
 candidate-wheel smoke passes; CI candidate-revision admission remains open.
+The tutorial now also safetensors-checkpoints latent tied state, saves and
+restores AdamW state, performs a resumed step, and requires exact equality with
+uninterrupted training before hard conversion. A dedicated Python 3.13 slim job
+downloads only the built wheel, contains no checkout, rejects Cargo/Rust/C/C++
+compilers, installs binary runtime dependencies, and runs the installed module.
+That lane must execute on the candidate revision before its retained result can
+close clean-environment evidence; workflow structure alone is not a receipt.
+A local attempt to substitute the ad-hoc host `linux_x86_64` wheel in the slim
+container failed closed because that wheel required `GLIBC_2.43`; this is not
+clean-lane evidence and confirms why the job consumes the qualified manylinux
+artifact instead of a host-built development wheel.
 
 Replace the current pre-alpha/v1.0-era narrative with tested v1.1 documentation:
 

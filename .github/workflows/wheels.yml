@@ -234,6 +234,12 @@ jobs:
         run: >-
           python -m pip install --isolated --disable-pip-version-check
           --no-index --no-deps --only-binary=:all: dist/*.whl
+      - name: test installed tutorial receipt admission
+        run: >-
+          python -m unittest discover
+          -s crates/tritium-py/tests
+          -p test_tutorial_qat.py
+          -v
       - name: run installed-wheel differentiable lifecycle
         run: >-
           python -I ${{ github.workspace }}/scripts/wheel-functional-smoke.py
@@ -260,6 +266,56 @@ jobs:
             evidence/torch-2.11-python-3.13.json
             evidence/tutorial-cpu/**
             evidence/tutorial-cpu/receipt.json
+          if-no-files-found: error
+
+  tutorial-clean-wheel:
+    name: source-free wheel tutorial · Python 3.13 slim
+    needs: wheels
+    runs-on: ubuntu-latest
+    container: python:3.13-slim
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheel-linux-x86_64
+          path: dist
+      - name: require source-free compiler-free environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          test ! -e "$GITHUB_WORKSPACE/.git"
+          test ! -e "$GITHUB_WORKSPACE/Cargo.toml"
+          ! command -v cargo
+          ! command -v rustc
+          ! command -v cc
+          ! command -v c++
+          ! command -v gcc
+          ! command -v g++
+          ! command -v clang
+          ! command -v clang++
+      - name: install pinned binary runtime and exact wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --only-binary=:all: \
+            torch==2.11.0 --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install --disable-pip-version-check --only-binary=:all: \
+            safetensors==0.8.0
+          python -m pip install --isolated --disable-pip-version-check \
+            --no-index --no-deps --only-binary=:all: dist/*.whl
+      - name: execute and validate source-free installed tutorial
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -I -m tritium.torch.tutorial_qat \
+            --output-dir evidence/tutorial-clean \
+            --device cpu
+          python -I -m tritium.torch.tutorial_qat \
+            --check-receipt evidence/tutorial-clean/receipt.json \
+            --device cpu
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-tutorial-source-free-python-3.13
+          path: evidence/tutorial-clean/**
           if-no-files-found: error
 
   cuda-wheel-smoke:

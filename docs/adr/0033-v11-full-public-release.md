@@ -379,6 +379,17 @@ multiple contexts/batches; export/reload identity; and second-machine
 reproduction. Additive-ternary SOTA and global low-bit Pareto are separate
 verdicts.
 
+### Implementation amendment: installed tutorial result
+
+The source-free PyTorch QAT tutorial emits
+`tritium.installed-qat-tutorial.v2`. Version 2 binds latent safetensors and
+optimizer checkpoint bytes plus SHA-256 identities, one resumed optimizer step,
+hard-artifact ancestry and installed-distribution ownership. The earlier v1
+developer result did not contain checkpoint/resume evidence and is not an
+admitted v1.1 release receipt. Unknown or older tutorial-result schemas fail
+closed; release admission remains a separate source/wheel/run/machine-bound
+receipt.
+
 ## v1.1 release gate
 
 `v1.1.0` may publish only when all boxes are green:

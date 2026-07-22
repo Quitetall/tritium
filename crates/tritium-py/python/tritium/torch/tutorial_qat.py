@@ -41,6 +41,12 @@ _RECEIPT_FIELDS = {
     "artifact_id",
     "hard_state_digest",
     "artifact_dir",
+    "checkpoint_model_bytes",
+    "checkpoint_model_sha256",
+    "checkpoint_optimizer_bytes",
+    "checkpoint_optimizer_sha256",
+    "optimizer_state_entries",
+    "resume_steps",
 }
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 
@@ -82,6 +88,14 @@ def _receipt_id(receipt: dict[str, object]) -> str:
     return "sha256:" + hashlib.sha256(_canonical(unsigned)).hexdigest()
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return "sha256:" + digest.hexdigest()
+
+
 def run_installed_qat_tutorial(
     output_dir: Path, *, device_name: str, seed: int = 73
 ) -> dict[str, object]:
@@ -97,13 +111,14 @@ def run_installed_qat_tutorial(
         raise RuntimeError("CUDA tutorial requested but torch.cuda.is_available() is false")
 
     torch.manual_seed(seed)
+    config = TernaryConfig.qat(
+        estimator="salt-ste",
+        target_modules=("Linear", "Embedding"),
+        planes=2,
+    )
     prepared = prepare(
         _TinyTiedModel(device=device),
-        TernaryConfig.qat(
-            estimator="salt-ste",
-            target_modules=("Linear", "Embedding"),
-            planes=2,
-        ),
+        config,
         inplace=True,
     )
     coverage = inspect(prepared.model)
@@ -124,12 +139,58 @@ def run_installed_qat_tutorial(
     optimizer.step()
     optimizer.zero_grad(set_to_none=True)
 
-    prepared.model.eval()
-    expected = prepared.model(tokens).detach()
-    hard = convert(prepared)
-    torch.testing.assert_close(hard.model(tokens), expected, rtol=0, atol=0)
+    from safetensors.torch import load_model, save_model
 
     output_dir.mkdir(parents=True)
+    checkpoint = output_dir / "latent-checkpoint"
+    checkpoint.mkdir()
+    model_checkpoint = checkpoint / "model.safetensors"
+    optimizer_checkpoint = checkpoint / "optimizer.pt"
+    save_model(
+        prepared.model,
+        model_checkpoint,
+        metadata={"format": "pt", "tritium_mode": "qat-latent"},
+    )
+    torch.save(optimizer.state_dict(), optimizer_checkpoint)
+
+    resumed = prepare(_TinyTiedModel(device=device), config, inplace=True)
+    missing, unexpected = load_model(resumed.model, model_checkpoint, strict=True)
+    if missing or unexpected:
+        raise RuntimeError("latent checkpoint did not strictly restore model state")
+    if resumed.model.embed.weight is not resumed.model.head.weight:
+        raise RuntimeError("latent checkpoint restore lost tied master identity")
+    resumed_optimizer = torch.optim.AdamW(resumed.model.parameters(), lr=1e-3)
+    resumed_optimizer.load_state_dict(
+        torch.load(optimizer_checkpoint, map_location=device, weights_only=True)
+    )
+    optimizer_state_entries = len(resumed_optimizer.state)
+    if optimizer_state_entries != 1:
+        raise RuntimeError("latent checkpoint restored unexpected optimizer state")
+    prepared.model.eval()
+    resumed.model.eval()
+    torch.testing.assert_close(resumed.model(tokens), prepared.model(tokens), rtol=0, atol=0)
+
+    prepared.model.train()
+    resumed.model.train()
+    prepared.model(tokens).square().mean().backward()
+    resumed.model(tokens).square().mean().backward()
+    optimizer.step()
+    resumed_optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+    resumed_optimizer.zero_grad(set_to_none=True)
+    expected_state = prepared.model.state_dict()
+    observed_state = resumed.model.state_dict()
+    if expected_state.keys() != observed_state.keys() or any(
+        not torch.equal(expected_state[name], observed_state[name])
+        for name in expected_state
+    ):
+        raise RuntimeError("resumed optimizer step diverged from uninterrupted QAT")
+
+    resumed.model.eval()
+    expected = resumed.model(tokens).detach()
+    hard = convert(resumed)
+    torch.testing.assert_close(hard.model(tokens), expected, rtol=0, atol=0)
+
     artifact = export_qat_hard(hard, output_dir / "qat-hard")
     if load_qat_hard(artifact.artifact_dir) != artifact:
         raise RuntimeError("strict QAT-hard artifact reload changed its identity")
@@ -150,7 +211,7 @@ def run_installed_qat_tutorial(
     if weight.planes != 2:
         raise RuntimeError("hard conversion did not preserve two additive planes")
     receipt: dict[str, object] = {
-        "schema": "tritium.installed-qat-tutorial.v1",
+        "schema": "tritium.installed-qat-tutorial.v2",
         "passed": True,
         "device": device_name,
         "seed": seed,
@@ -166,6 +227,12 @@ def run_installed_qat_tutorial(
         "artifact_id": artifact.artifact_id,
         "hard_state_digest": artifact.hard_state_digest,
         "artifact_dir": str(artifact.artifact_dir.resolve()),
+        "checkpoint_model_bytes": model_checkpoint.stat().st_size,
+        "checkpoint_model_sha256": _sha256_file(model_checkpoint),
+        "checkpoint_optimizer_bytes": optimizer_checkpoint.stat().st_size,
+        "checkpoint_optimizer_sha256": _sha256_file(optimizer_checkpoint),
+        "optimizer_state_entries": optimizer_state_entries,
+        "resume_steps": 1,
     }
     receipt["receipt_id"] = _receipt_id(receipt)
     return receipt
@@ -185,8 +252,8 @@ def validate_tutorial_receipt(
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ValueError("tutorial receipt must contain UTF-8 JSON") from error
     if not isinstance(receipt, dict) or set(receipt) != _RECEIPT_FIELDS:
-        raise ValueError("tutorial receipt fields do not match schema version 1")
-    if receipt["schema"] != "tritium.installed-qat-tutorial.v1":
+        raise ValueError("tutorial receipt fields do not match schema version 2")
+    if receipt["schema"] != "tritium.installed-qat-tutorial.v2":
         raise ValueError("unsupported tutorial receipt schema")
     if receipt["passed"] is not True or receipt["device"] != expected_device:
         raise ValueError("tutorial receipt result or device mismatch")
@@ -209,7 +276,20 @@ def validate_tutorial_receipt(
         raise ValueError("tutorial estimator identity mismatch")
     if receipt["planes"] != 2:
         raise ValueError("tutorial plane count mismatch")
-    for field in ("artifact_id", "hard_state_digest", "receipt_id"):
+    for field in ("checkpoint_model_bytes", "checkpoint_optimizer_bytes"):
+        if type(receipt[field]) is not int or receipt[field] <= 0:
+            raise ValueError(f"tutorial {field} must be a positive integer")
+    if receipt["optimizer_state_entries"] != 1:
+        raise ValueError("tutorial optimizer state entry count mismatch")
+    if receipt["resume_steps"] != 1:
+        raise ValueError("tutorial resume step count mismatch")
+    for field in (
+        "artifact_id",
+        "hard_state_digest",
+        "checkpoint_model_sha256",
+        "checkpoint_optimizer_sha256",
+        "receipt_id",
+    ):
         if not isinstance(receipt[field], str) or _DIGEST.fullmatch(receipt[field]) is None:
             raise ValueError(f"tutorial {field} is not a canonical digest")
     if receipt["receipt_id"] != _receipt_id(receipt):
@@ -222,6 +302,32 @@ def validate_tutorial_receipt(
     artifact_dir = Path(str(receipt["artifact_dir"]))
     if not artifact_dir.is_absolute():
         raise ValueError("tutorial artifact path must be absolute")
+    expected_artifact_dir = receipt_path.parent.resolve() / "qat-hard"
+    if artifact_dir.resolve() != expected_artifact_dir:
+        raise ValueError("tutorial artifact path is outside its result directory")
+    result_dir = receipt_path.parent.resolve()
+    requested_checkpoint = receipt_path.parent / "latent-checkpoint"
+    if requested_checkpoint.is_symlink() or not requested_checkpoint.is_dir():
+        raise ValueError("tutorial checkpoint must be an ordinary directory")
+    checkpoint = requested_checkpoint.resolve()
+    if checkpoint.parent != result_dir:
+        raise ValueError("tutorial checkpoint is outside its result directory")
+    model_checkpoint = checkpoint / "model.safetensors"
+    optimizer_checkpoint = checkpoint / "optimizer.pt"
+    for path, field in (
+        (model_checkpoint, "checkpoint_model_bytes"),
+        (optimizer_checkpoint, "checkpoint_optimizer_bytes"),
+    ):
+        if (
+            path.is_symlink()
+            or not path.is_file()
+            or path.resolve().parent != checkpoint
+            or path.stat().st_size != receipt[field]
+        ):
+            raise ValueError(f"tutorial {field} file identity mismatch")
+        digest_field = field.replace("_bytes", "_sha256")
+        if _sha256_file(path) != receipt[digest_field]:
+            raise ValueError(f"tutorial {digest_field} file identity mismatch")
     artifact = load_qat_hard(artifact_dir)
     if (
         artifact.artifact_id != receipt["artifact_id"]
