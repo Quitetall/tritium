@@ -383,11 +383,15 @@ candidate-bound ABI3 matrix, offline crate-archive and clean offline npm-archive
 schemas, emits human and JSON blocker reports, and refuses `LOCAL_RC_READY` for
 empty or partial evidence. Npm admission landed in `cb34670` and `57a23ba`, but
 the aggregate package gate still requires its clean-install, compatibility-matrix
-and crate-archive receipts to coexist in the exact candidate registry. Remaining
-receipt-kind validators and generated-claim drift checks must land before every
-model-zoo, package, serving, deployment and signing receipt can produce
-`LOCAL_RC_READY`. Browser, second-machine and independent-review kinds now fail
-closed through dedicated validators, but lack empirical candidate receipts.
+and crate-archive receipts to coexist in the exact candidate registry. All 32
+frozen gate kinds now have strict validator dispatch, including flagship
+conversion/quality/task/runtime/bytes, complete portable backends/performance,
+estimator/refinement/ablations, whole-model ONNX, zoo/generated claims/governance,
+browser and independent reproduction/review. The complete registry policy has
+no validator-less release kind and its 224-script-test suite passes. This closes
+schema reachability only: no single clean candidate registry contains all 32
+empirical receipts, and browser, second-machine, independent-review, flagship,
+seven-target backend/performance and other hardware gates remain missing.
 
 Progress (2026-07-22): the zoo/community gate now has three strict receipt
 contracts. `tritium.model-zoo-admission.v1` freezes the accessible tutorial and
