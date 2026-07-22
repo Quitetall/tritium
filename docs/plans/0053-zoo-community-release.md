@@ -323,6 +323,15 @@ receipt ID. Registry admission requires the review receipt to parent and review
 every other registry receipt. Reviewer ID and organization must differ from the
 second-machine operator. Validator presence remains structural: no independent
 second-machine run or passing independent review exists yet.
+The execution harness now consumes a frozen, candidate-identity-bound run spec,
+refuses a work directory inside a source repository or an environment exposing
+a compiler, removes credential-shaped environment variables, forces offline
+package/model modes, runs the exact 13-command sequence with per-command
+timeouts, retains bounded stdout/stderr bytes, and compares regenerated
+model-card, compatibility and release-status outputs byte-for-byte. It then
+seals and self-validates the complete candidate inventory atomically. This is
+producer implementation only; no distinct physical machine or independent
+operator has emitted an admitted receipt.
 
 ## Slice 8 — local release-candidate sign-off
 
@@ -403,6 +412,14 @@ model evidence. `tritium.governance-docs.v1` binds the complete community policy
 inventory and requires successful link/contact/independent-policy review while
 rejecting advertised unstaffed channels. These validators are structural until
 candidate-bound empirical receipts are produced.
+The clean-revision zoo/community producer now copies and hashes the four model
+cards, requires every model artifact in the exact candidate, resolves every
+model evidence ID through the input registry, and retains a self-contained
+claim-source snapshot containing the exact evidence receipt bytes. Independent
+validation rechecks the fixed producer source, adjacent zoo ancestry, snapshot
+receipt identities and an explicit independent governance-review attestation.
+It cannot manufacture missing model evidence, activate community channels or
+substitute a policy checkbox for a retained review.
 
 Exact-image serving admission now distinguishes CPU runtime, CUDA runtime and
 CPU/CUDA security scans, plus cluster deployment. Each runtime receipt must bind the candidate OCI archive,

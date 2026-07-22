@@ -58,6 +58,8 @@ COMMAND_FIELDS = {
     "duration_seconds",
     "stdout_sha256",
     "stderr_sha256",
+    "stdout_path",
+    "stderr_path",
 }
 CHECK_FIELDS = {
     "source_verified",
@@ -74,26 +76,27 @@ CHECK_FIELDS = {
     "browser",
     "generated_tables_exact",
 }
-OUTPUT_FIELDS = {"name", "expected_sha256", "observed_sha256", "bytes"}
+OUTPUT_FIELDS = {
+    "name", "expected_sha256", "observed_sha256", "bytes", "path"
+}
 REVIEWER_FIELDS = {"id", "organization", "independent", "tool", "model"}
 FINDING_FIELDS = {"total", "verified", "fixed", "false_positive", "open"}
-REQUIRED_COMMANDS = frozenset(
-    {
-        "verify-source",
-        "verify-artifacts",
-        "clean-install",
-        "tutorial",
-        "bitnet-native",
-        "qwen-flagship",
-        "bounded-validation",
-        "native-backend",
-        "onnx",
-        "serving",
-        "generate-model-card",
-        "generate-compatibility",
-        "generate-release-status",
-    }
+COMMAND_ORDER = (
+    "verify-source",
+    "verify-artifacts",
+    "clean-install",
+    "tutorial",
+    "bitnet-native",
+    "qwen-flagship",
+    "bounded-validation",
+    "native-backend",
+    "onnx",
+    "serving",
+    "generate-model-card",
+    "generate-compatibility",
+    "generate-release-status",
 )
+REQUIRED_COMMANDS = frozenset(COMMAND_ORDER)
 REQUIRED_OUTPUTS = frozenset({"model-card", "compatibility", "release-status"})
 REVIEW_SCOPES = ["code", "security", "evidence"]
 HEX = frozenset("0123456789abcdef")
@@ -166,6 +169,29 @@ def load(path: Path, fields: set[str], label: str) -> dict[str, Any]:
         return object_(json.loads(path.read_bytes()), fields, label)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ReproductionError(f"{label} must contain UTF-8 JSON") from error
+
+
+def contained(root: Path, logical_value: Any, label: str) -> Path:
+    text = string(logical_value, label)
+    logical = PurePosixPath(text)
+    if logical.is_absolute() or ".." in logical.parts or "\\" in text:
+        raise ReproductionError(f"{label} path is unsafe")
+    cursor = root.resolve(strict=True)
+    for part in logical.parts:
+        cursor /= part
+        if cursor.is_symlink():
+            raise ReproductionError(f"{label} traverses a symlink")
+    resolved = cursor.resolve(strict=True)
+    try:
+        resolved.relative_to(root.resolve(strict=True))
+    except ValueError as error:
+        raise ReproductionError(f"{label} escapes receipt root") from error
+    if (
+        resolved.is_symlink() or not resolved.is_file()
+        or resolved.stat().st_size > MAX_RECEIPT_BYTES
+    ):
+        raise ReproductionError(f"{label} must be a bounded ordinary file")
+    return resolved
 
 
 def validate_common(
@@ -329,6 +355,7 @@ def validate_second_machine(
     if not isinstance(commands, list):
         raise ReproductionError("receipt.commands must be an array")
     command_ids = set()
+    support_root = receipt_path.parent.resolve(strict=True)
     for ordinal, value in enumerate(commands):
         command = object_(value, COMMAND_FIELDS, f"receipt.commands[{ordinal}]")
         command_id = string(command["id"], "command.id")
@@ -344,8 +371,14 @@ def validate_second_machine(
         ):
             raise ReproductionError("reproduction command argv is invalid")
         positive(command["duration_seconds"], "command.duration_seconds")
-        digest(command["stdout_sha256"], "command.stdout_sha256")
-        digest(command["stderr_sha256"], "command.stderr_sha256")
+        stdout = contained(support_root, command["stdout_path"], "command.stdout_path")
+        stderr = contained(support_root, command["stderr_path"], "command.stderr_path")
+        if digest(command["stdout_sha256"], "command.stdout_sha256") != (
+            "sha256:" + sha256(stdout)
+        ) or digest(command["stderr_sha256"], "command.stderr_sha256") != (
+            "sha256:" + sha256(stderr)
+        ):
+            raise ReproductionError("reproduction command log bytes drifted")
     if command_ids != REQUIRED_COMMANDS:
         raise ReproductionError("reproduction command inventory is incomplete")
     checks = object_(receipt["checks"], CHECK_FIELDS, "receipt.checks")
@@ -367,6 +400,12 @@ def validate_second_machine(
             raise ReproductionError("regenerated output differs from candidate claim")
         if type(output["bytes"]) is not int or output["bytes"] <= 0:
             raise ReproductionError("regenerated output bytes must be positive")
+        output_path = contained(support_root, output["path"], "output.path")
+        if (
+            output_path.stat().st_size != output["bytes"]
+            or "sha256:" + sha256(output_path) != output["observed_sha256"]
+        ):
+            raise ReproductionError("regenerated output bytes drifted")
         output_names.add(name)
     if len(output_names) != len(outputs) or output_names != REQUIRED_OUTPUTS:
         raise ReproductionError("regenerated output inventory is incomplete")

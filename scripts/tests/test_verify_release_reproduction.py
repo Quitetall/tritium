@@ -69,27 +69,38 @@ def anchor_record(wheel: Path):
 
 
 def second_receipt(manifest: Path, wheel: Path, artifacts):
+    logs = manifest.parent / "logs"
+    outputs_dir = manifest.parent / "outputs"
+    logs.mkdir(exist_ok=True)
+    outputs_dir.mkdir(exist_ok=True)
     commands = []
     for command_id in sorted(MODULE["REQUIRED_COMMANDS"]):
+        stdout = logs / f"{command_id}.stdout"
+        stderr = logs / f"{command_id}.stderr"
+        stdout.write_bytes((command_id + " stdout").encode())
+        stderr.write_bytes((command_id + " stderr").encode())
         commands.append(
             {
                 "id": command_id,
                 "argv": ["tritium-reproduce", command_id],
                 "exit_code": 0,
                 "duration_seconds": 1.0,
-                "stdout_sha256": digest((command_id + " stdout").encode()),
-                "stderr_sha256": digest((command_id + " stderr").encode()),
+                "stdout_sha256": digest(stdout.read_bytes()),
+                "stderr_sha256": digest(stderr.read_bytes()),
+                "stdout_path": stdout.relative_to(manifest.parent).as_posix(),
+                "stderr_path": stderr.relative_to(manifest.parent).as_posix(),
             }
         )
-    outputs = [
-        {
-            "name": name,
-            "expected_sha256": digest(name.encode()),
-            "observed_sha256": digest(name.encode()),
-            "bytes": len(name),
-        }
-        for name in sorted(MODULE["REQUIRED_OUTPUTS"])
-    ]
+    outputs = []
+    for name in sorted(MODULE["REQUIRED_OUTPUTS"]):
+        path = outputs_dir / f"{name}.json"
+        path.write_bytes(name.encode())
+        outputs.append({
+            "name": name, "expected_sha256": digest(path.read_bytes()),
+            "observed_sha256": digest(path.read_bytes()),
+            "bytes": path.stat().st_size,
+            "path": path.relative_to(manifest.parent).as_posix(),
+        })
     value = {
         "schema": MODULE["SECOND_SCHEMA"],
         "result": "pass",
