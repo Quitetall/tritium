@@ -20,7 +20,8 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 ./scripts/check-release-version.py
 unpublished=$(
   cargo metadata --locked --no-deps --format-version 1 |
-    python -c 'import json,sys; print("\n".join(p["name"] for p in json.load(sys.stdin)["packages"] if p.get("publish") == []))'
+    # cargo metadata encodes `publish = false` as []; null means publishable.
+    python3 -c 'import json,sys; print("\n".join(p["name"] for p in json.load(sys.stdin)["packages"] if p.get("publish") == []))'
 )
 exclude_args=()
 while IFS= read -r package; do

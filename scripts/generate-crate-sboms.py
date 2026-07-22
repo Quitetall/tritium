@@ -209,6 +209,7 @@ def generate_all(
             timeout=120,
         )
     )
+    # cargo metadata encodes `publish = false` as []; null means publishable.
     packages = sorted(
         (package for package in metadata["packages"] if package.get("publish") != []),
         key=lambda package: package["name"],

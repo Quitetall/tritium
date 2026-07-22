@@ -69,6 +69,7 @@ def _metadata(root: Path) -> list[dict[str, Any]]:
     packages = value.get("packages") if isinstance(value, dict) else None
     if not isinstance(packages, list) or not packages:
         raise ArchiveError("workspace metadata contains no packages")
+    # cargo metadata encodes `publish = false` as []; null means publishable.
     return sorted(
         (package for package in packages if package.get("publish") != []),
         key=lambda package: package["name"],
