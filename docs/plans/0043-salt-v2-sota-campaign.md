@@ -784,7 +784,13 @@ configured Gated DeltaNet/full-attention language schedules, and exact-loads the
 compiled oracle ledger. Its only row is a reproducible synthetic fixture that
 binds official vLLM first-pass proposer inputs, target hidden/logit/token parity,
 MTP hidden/logit parity, and full prefill/decode KV caches; its receipt is
-explicitly ineligible for production.
+explicitly ineligible for production. The sealed v1 parser now also understands
+a distinct production-checkpoint prefill/decode coverage and evidence tuple,
+and parity receipts admit production only for that tuple after every lane
+passes. The compiled production ledger remains deliberately empty: the pinned
+Qwen3.6-27B source weights, production oracle body and implementation manifest
+have not been acquired, executed and reviewed, so fixture evidence cannot mint
+production MTP capability.
 The reference fitter now also exposes `plan_salt_v2_tensor_master` and
 `fit_salt_v2_tensor_master`: a source-bound global tensor ordinal can be
 cataloged before fitting, then its canonical rate-free Pmax master is emitted

@@ -108,10 +108,21 @@ impl Qwen35MtpParityReceipt {
         self.evidence_class
     }
 
-    /// Fixture evidence is intentionally insufficient for production admission.
+    /// Whether this receipt carries the compiled production checkpoint profile.
+    ///
+    /// Safe code can only obtain such a receipt after an exact body/source/
+    /// manifest tuple appears in the private compiled authorization ledger and
+    /// every registered lane passes the frozen tolerance.
     #[must_use]
     pub const fn qualifies_for_production(&self) -> bool {
-        false
+        matches!(
+            self.coverage_profile,
+            Qwen35MtpOracleCoverageProfile::ProductionCheckpointPrefillDecode
+        ) && matches!(
+            self.evidence_class,
+            Qwen35MtpOracleEvidenceClass::ProductionCheckpoint
+        ) && self.steps == 2
+            && self.max_absolute_error <= self.tolerance
     }
 }
 
@@ -1055,11 +1066,15 @@ mod tests {
     use tritium_core::{GemmShape, TernaryFormat, Trit};
     use tritium_spec::{BackendError, DeviceBuffer, DeviceCaps, MpGemm, TernaryBackend};
 
-    use super::{Qwen35MtpLayerWeights, Qwen35MtpWeights, UnverifiedQwen35Mtp, build_input_plan};
+    use super::{
+        Qwen35MtpLayerWeights, Qwen35MtpParityReceipt, Qwen35MtpWeights, UnverifiedQwen35Mtp,
+        build_input_plan,
+    };
     use crate::layers::{
         DenseLinear, Projection, Qwen35FullAttentionWeights, SwiGluMlp, TernaryLinear,
         TokenEmbedding,
     };
+    use crate::model::{Qwen35MtpOracleCoverageProfile, Qwen35MtpOracleEvidenceClass};
     use crate::model::{
         Qwen35TextLayerWeights, Qwen35TextMixerWeights, Qwen35TextRunner, Qwen35TextWeights,
     };
@@ -1234,6 +1249,24 @@ mod tests {
             ),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn only_production_checkpoint_receipt_qualifies_for_production() {
+        let mut receipt = Qwen35MtpParityReceipt {
+            source_model_id: tritium_format::ModelId::from_digest([1; 32]),
+            oracle_body_id: [2; 32],
+            oracle_manifest_id: [3; 32],
+            observed_digest: [4; 32],
+            coverage_profile: Qwen35MtpOracleCoverageProfile::ProductionCheckpointPrefillDecode,
+            evidence_class: Qwen35MtpOracleEvidenceClass::ProductionCheckpoint,
+            steps: 2,
+            tolerance: 2.0e-3,
+            max_absolute_error: 1.0e-3,
+        };
+        assert!(receipt.qualifies_for_production());
+        receipt.evidence_class = Qwen35MtpOracleEvidenceClass::Fixture;
+        assert!(!receipt.qualifies_for_production());
     }
 
     #[test]

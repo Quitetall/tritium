@@ -16,8 +16,8 @@ const ORACLE_MAGIC: &[u8; 8] = b"TRQ35MO\0";
 const ORACLE_VERSION: u16 = 1;
 const NUMERIC_PROFILE_FP32_STORAGE_TF32_ATTN_ABS_2E_NEG3: u16 = 1;
 const COVERAGE_PROFILE_FIXTURE_PREFILL_DECODE: u16 = 1;
+const COVERAGE_PROFILE_PRODUCTION_CHECKPOINT_PREFILL_DECODE: u16 = 2;
 const EVIDENCE_CLASS_FIXTURE: u16 = 1;
-#[cfg(test)]
 const EVIDENCE_CLASS_PRODUCTION: u16 = 2;
 const NUMERIC_ABSOLUTE_TOLERANCE: f32 = 2.0e-3;
 const MAX_ORACLE_BODY_BYTES: usize = 16 * 1024 * 1024;
@@ -46,6 +46,8 @@ const FIXTURE_ORACLE_MANIFEST_ID: [u8; 32] = [
 pub enum Qwen35MtpOracleCoverageProfile {
     /// Two-transaction fixture: multi-token prefill followed by one-token decode.
     FixturePrefillDecode = 1,
+    /// Pinned checkpoint: multi-token prefill followed by one-token decode.
+    ProductionCheckpointPrefillDecode = 2,
 }
 
 #[repr(u16)]
@@ -54,6 +56,8 @@ pub enum Qwen35MtpOracleCoverageProfile {
 pub enum Qwen35MtpOracleEvidenceClass {
     /// Small deterministic fixture evidence, not checkpoint-scale qualification.
     Fixture = 1,
+    /// Exact pinned production checkpoint and independently recorded runtime.
+    ProductionCheckpoint = 2,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -339,9 +343,21 @@ fn decode_authorized_vectors(
     body_id: [u8; 32],
     source_model_id: ModelId,
 ) -> Result<AuthorizedQwen35MtpTrace, NnError> {
+    let (coverage_profile, evidence_class) = match (header.coverage_profile, header.evidence_class)
+    {
+        (COVERAGE_PROFILE_FIXTURE_PREFILL_DECODE, EVIDENCE_CLASS_FIXTURE) => (
+            Qwen35MtpOracleCoverageProfile::FixturePrefillDecode,
+            Qwen35MtpOracleEvidenceClass::Fixture,
+        ),
+        (COVERAGE_PROFILE_PRODUCTION_CHECKPOINT_PREFILL_DECODE, EVIDENCE_CLASS_PRODUCTION) => (
+            Qwen35MtpOracleCoverageProfile::ProductionCheckpointPrefillDecode,
+            Qwen35MtpOracleEvidenceClass::ProductionCheckpoint,
+        ),
+        _ => return Err(invalid_oracle("unsupported oracle coverage/evidence tuple")),
+    };
     if header.step_count != 2 {
         return Err(invalid_oracle(
-            "fixture coverage requires exactly two transactions",
+            "prefill/decode coverage requires exactly two transactions",
         ));
     }
 
@@ -358,7 +374,7 @@ fn decode_authorized_vectors(
         let token_count = usize_from_u32(cursor.u32("step token count")?, "token_count")?;
         if (step_index == 0 && token_count < 2) || (step_index == 1 && token_count != 1) {
             return Err(invalid_oracle(
-                "fixture coverage requires a multi-token prefill then one-token decode",
+                "prefill/decode coverage requires a multi-token prefill then one-token decode",
             ));
         }
         cumulative_tokens = cumulative_tokens
@@ -425,8 +441,8 @@ fn decode_authorized_vectors(
         oracle_manifest_id: header.oracle_manifest_id,
         source_model_id,
         tolerance: NUMERIC_ABSOLUTE_TOLERANCE,
-        coverage_profile: Qwen35MtpOracleCoverageProfile::FixturePrefillDecode,
-        evidence_class: Qwen35MtpOracleEvidenceClass::Fixture,
+        coverage_profile,
+        evidence_class,
         max_context,
         hidden_size,
         vocab_size,
@@ -487,11 +503,17 @@ impl OracleHeader {
             return Err(invalid_oracle("reserved2 header field is non-zero"));
         }
         if numeric_profile != NUMERIC_PROFILE_FP32_STORAGE_TF32_ATTN_ABS_2E_NEG3
-            || coverage_profile != COVERAGE_PROFILE_FIXTURE_PREFILL_DECODE
-            || evidence_class != EVIDENCE_CLASS_FIXTURE
+            || !matches!(
+                (coverage_profile, evidence_class),
+                (
+                    COVERAGE_PROFILE_FIXTURE_PREFILL_DECODE,
+                    EVIDENCE_CLASS_FIXTURE
+                ) | (
+                    COVERAGE_PROFILE_PRODUCTION_CHECKPOINT_PREFILL_DECODE,
+                    EVIDENCE_CLASS_PRODUCTION
+                )
+            )
         {
-            // Intentional fixture-only gate: a future production ledger row is
-            // insufficient without a reviewed policy decoder in this branch.
             return Err(invalid_oracle("unsupported oracle profile tuple"));
         }
         Ok(Self {
@@ -754,6 +776,14 @@ mod tests {
         body_with_decode_token(3)
     }
 
+    fn production_profile_body() -> Vec<u8> {
+        let mut body = valid_body();
+        body[14..16]
+            .copy_from_slice(&COVERAGE_PROFILE_PRODUCTION_CHECKPOINT_PREFILL_DECODE.to_le_bytes());
+        body[16..18].copy_from_slice(&EVIDENCE_CLASS_PRODUCTION.to_le_bytes());
+        body
+    }
+
     fn decode_for_parser_test(body: &[u8]) -> Result<AuthorizedQwen35MtpTrace, NnError> {
         enforce_body_bound(body)?;
         let mut cursor = OracleCursor::new(body);
@@ -791,6 +821,28 @@ mod tests {
         assert_eq!(trace.steps()[1].expected_cache_keys().len(), 6);
         assert_eq!(trace.steps()[1].expected_cache_values().len(), 6);
         assert_ne!(trace.body_id(), [0; 32]);
+    }
+
+    #[test]
+    fn strict_parser_understands_production_profile_without_authorizing_it() {
+        let body = production_profile_body();
+        let trace = decode_for_parser_test(&body).expect("decode production wire profile");
+        assert_eq!(
+            trace.coverage_profile(),
+            Qwen35MtpOracleCoverageProfile::ProductionCheckpointPrefillDecode
+        );
+        assert_eq!(
+            trace.evidence_class(),
+            Qwen35MtpOracleEvidenceClass::ProductionCheckpoint
+        );
+        let error = load_authorized_qwen35_mtp_oracle_parts(
+            &body,
+            &test_config(),
+            ModelId::from_digest(FIXTURE_SOURCE_MODEL_ID),
+            TEST_CONFIG_DIGEST,
+        )
+        .expect_err("production profile without compiled row must not authorize");
+        assert!(error.to_string().contains("compiled allowlist"));
     }
 
     #[test]
