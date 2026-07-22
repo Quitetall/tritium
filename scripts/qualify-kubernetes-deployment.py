@@ -45,8 +45,8 @@ CUDA_PROBE_IMAGES = {
 CHECKS = (
     "namespace-preflight", "secret-binding", "pvc-preflight", "helm-install",
     "rollout-ready", "production-readiness", "buffered-generation", "metrics",
-    "pod-restart", "failed-upgrade", "atomic-rollback", "rollback-readiness",
-    "rollback-generation", "release-cleanup",
+    "pod-restart", "successful-update", "update-readiness", "failed-upgrade",
+    "atomic-rollback", "rollback-readiness", "rollback-generation", "release-cleanup",
 )
 MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 
@@ -693,7 +693,47 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
             stop_forward(restart_process)
         if restart_startup != startup:
             raise DeploymentError("restart changed immutable startup receipt")
-        node_names = {pod["node"] for pod in initial["pods"] + restarted["pods"]}
+        update_values = ["--set", "requestLimits.rateLimitBurst=9"]
+        run(helm_base + ["upgrade", args.release_name, str(chart), "--atomic", "--wait",
+                         "--timeout", timeout_value] + values + update_values,
+            args.timeout + 60)
+        run(kubectl_base + ["rollout", "status", f"deployment/{service}",
+                            f"--timeout={timeout_value}"], args.timeout + 30)
+        updated_deployment = run_json(
+            kubectl_base + ["get", f"deployment/{service}", "-o", "json"]
+        )
+        if validate_deployment(
+            updated_deployment, image=args.image, manifest_sha256=manifest_sha,
+            flavor=args.flavor,
+        ) != deployment_uid:
+            raise DeploymentError("successful update replaced deployment identity")
+        updated = pod_snapshot(
+            run_json(kubectl_base + ["get", "pods", "-l", selector, "-o", "json"]),
+            args.flavor,
+        )
+        if {pod["uid"] for pod in restarted["pods"]} & {
+            pod["uid"] for pod in updated["pods"]
+        }:
+            raise DeploymentError("successful update retained the previous pod UID")
+        update_port = free_port()
+        update_url = f"http://127.0.0.1:{update_port}"
+        update_process, update_ready = port_forward(
+            kubectl_base + ["port-forward", f"service/{service}", f"{update_port}:8080",
+                            "--address", "127.0.0.1"],
+            time.monotonic() + args.timeout, update_url, token,
+        )
+        try:
+            update_startup = validate_ready(
+                update_ready, revision, args.flavor, args.profile,
+                manifest_id["blake3"], args.release,
+            )
+        finally:
+            stop_forward(update_process)
+        if update_startup != startup:
+            raise DeploymentError("successful update changed immutable startup receipt")
+        node_names = {
+            pod["node"] for pod in initial["pods"] + restarted["pods"] + updated["pods"]
+        }
         nodes = [
             node_snapshot(run_json(kubectl_base + ["get", f"node/{name}", "-o", "json"]))
             for name in sorted(node_names)
@@ -713,7 +753,7 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
         wrong_image = "0" * 64 if image_digest[7:] != "0" * 64 else "f" * 64
         failure_sha = expect_failure(
             helm_base + ["upgrade", args.release_name, str(chart), "--atomic", "--wait",
-                         "--timeout", timeout_value] + values + [
+                         "--timeout", timeout_value] + values + update_values + [
                              "--set-string", f"artifact.expectedManifestSha256={wrong_manifest}",
                              "--set-string", f"image.digest=sha256:{wrong_image}",
                          ],
@@ -813,8 +853,10 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
         "tools": {"kubectl_sha256": sha256(kubectl), "helm_sha256": sha256(helm_bin),
                   "helm_version": run([str(helm_bin), "version", "--short"])},
         "workload": {"release_name": args.release_name, "deployment_uid": deployment_uid,
-                     "initial": initial, "restarted": restarted,
+                     "initial": initial, "restarted": restarted, "updated": updated,
                      "startup_receipt": startup, "restart_startup_receipt": restart_startup,
+                     "update_startup_receipt": update_startup,
+                     "update_strategy": "Recreate" if args.flavor == "cuda" else "RollingUpdate",
                      "rollback_startup_receipt": rollback_startup,
                      "metrics": metric_evidence, "helm_history": history,
                      "prior_helm_revision": prior_revision,
@@ -934,8 +976,9 @@ def validate_receipt(receipt: dict[str, Any], *, chart_path: Path, image_path: P
     exact_hex(tools.get("helm_sha256"), 64, "Helm SHA-256")
     workload = receipt.get("workload")
     if not isinstance(workload, dict) or set(workload) != {
-        "release_name", "deployment_uid", "initial", "restarted", "startup_receipt",
-        "restart_startup_receipt", "rollback_startup_receipt", "metrics", "helm_history",
+        "release_name", "deployment_uid", "initial", "restarted", "updated",
+        "startup_receipt", "restart_startup_receipt", "update_startup_receipt",
+        "update_strategy", "rollback_startup_receipt", "metrics", "helm_history",
         "prior_helm_revision", "failed_manifest_sha256", "failed_image_digest",
         "failed_upgrade_output_sha256",
     }:
@@ -957,10 +1000,13 @@ def validate_receipt(receipt: dict[str, Any], *, chart_path: Path, image_path: P
         raise DeploymentError("prior Helm revision is malformed")
     initial = validate_receipt_snapshot(workload.get("initial"), "initial")
     restarted = validate_receipt_snapshot(workload.get("restarted"), "restarted")
+    updated = validate_receipt_snapshot(workload.get("updated"), "updated")
     if {pod["uid"] for pod in initial["pods"]} & {
         pod.get("uid") for pod in restarted["pods"] if isinstance(pod, dict)
     }:
         raise DeploymentError("deployment restart evidence retains old pod UID")
+    if {pod["uid"] for pod in restarted["pods"]} & {pod["uid"] for pod in updated["pods"]}:
+        raise DeploymentError("deployment update evidence retains old pod UID")
     startup = validate_ready(
         {"status": "ready", "release_gate": "production_artifact_admitted",
          "startup_receipt": workload.get("startup_receipt")},
@@ -973,6 +1019,15 @@ def validate_receipt(receipt: dict[str, Any], *, chart_path: Path, image_path: P
     )
     if workload["restart_startup_receipt"] != workload["startup_receipt"]:
         raise DeploymentError("deployment restart changed startup receipt")
+    validate_ready(
+        {"status": "ready", "release_gate": "production_artifact_admitted",
+         "startup_receipt": workload.get("update_startup_receipt")},
+        revision, receipt["flavor"], receipt["profile"], manifest["blake3"], release,
+    )
+    expected_strategy = "Recreate" if receipt["flavor"] == "cuda" else "RollingUpdate"
+    if (workload["update_startup_receipt"] != workload["startup_receipt"]
+            or workload.get("update_strategy") != expected_strategy):
+        raise DeploymentError("deployment successful-update evidence differs")
     validate_ready(
         {"status": "ready", "release_gate": "production_artifact_admitted",
          "startup_receipt": workload.get("rollback_startup_receipt")},
@@ -996,7 +1051,9 @@ def validate_receipt(receipt: dict[str, Any], *, chart_path: Path, image_path: P
     ) or metric_values["tritium_worker_alive"] != 1:
         raise DeploymentError("deployment metrics evidence is malformed")
     validate_helm_history(workload.get("helm_history"), workload["prior_helm_revision"])
-    node_names = {pod["node"] for pod in initial["pods"] + restarted["pods"]}
+    node_names = {
+        pod["node"] for pod in initial["pods"] + restarted["pods"] + updated["pods"]
+    }
     if node_names != {node["name"] for node in validated_nodes}:
         raise DeploymentError("deployment node identities differ from pod placement")
     cuda_node = cluster.get("cuda_node")

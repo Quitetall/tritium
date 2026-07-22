@@ -264,7 +264,8 @@ archives, package lineage, bundle identity, namespace/PVC/Secret preconditions,
 the immutable image digest, Kubernetes node identities and tool binaries. The
 single-replica CPU or CUDA release must serve authenticated readiness, model
 listing, one-token generation and generation-bearing Prometheus metrics;
-survive a pod replacement without changing its startup receipt; then record a
+survive a pod replacement and a successful CPU `RollingUpdate` or CUDA
+`Recreate` update without changing its startup receipt; then record a
 real failed atomic Helm upgrade that changes both image and artifact identities,
 the exact deployed rollback revision, restoration of the admitted pair and complete
 uninstall. CUDA additionally runs a release-policy-allowlisted,
