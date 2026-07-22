@@ -41,6 +41,7 @@ serde = { workspace = true }
 # `generate` reads input token IDs from a reproducible JSON file.
 serde_json = { workspace = true }
 blake3 = { workspace = true }
+sha2 = { workspace = true }
 # `report salt-model` mmaps each (possibly sharded) safetensors file so a 50GB+ master is
 # never read fully into RAM.
 memmap2 = { workspace = true }

@@ -33,6 +33,7 @@ mod inspect;
 mod nvml_probe;
 mod pull;
 mod quantize;
+mod release;
 mod repack;
 mod report;
 mod salt;
@@ -113,6 +114,12 @@ enum Command {
         /// The report to run.
         #[command(subcommand)]
         report: ReportCommand,
+    },
+    /// Inspect and verify immutable release-candidate inputs.
+    Release {
+        /// Release evidence operation.
+        #[command(subcommand)]
+        release: release::ReleaseCommand,
     },
     /// Losslessly repack ternary GGUF tensors between formats (I2_S/TQ1_0/TQ2_0 in;
     /// TQ1_0 for ~18% smaller storage or TQ2_0 for the GPU compute layout out).
@@ -353,6 +360,7 @@ fn main() -> anyhow::Result<()> {
             generate::run(&model, &ids, max_new, greedy, eos)?;
         }
         Command::Repack { input, output, to } => repack::run(&input, &output, to)?,
+        Command::Release { release: command } => release::run(command)?,
         Command::Report { report: command } => match command {
             ReportCommand::Sparsity { model } => report::sparsity(&model)?,
             ReportCommand::Decode {

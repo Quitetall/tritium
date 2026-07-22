@@ -1,0 +1,257 @@
+#!/usr/bin/env python3
+"""Fail-closed admission of one Tritium local release-candidate manifest."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path, PurePosixPath
+from typing import Any
+
+
+SCHEMA = "tritium.release-candidate.v1"
+IDENTITY_SCHEMA = "tritium.file-identity.v1"
+TOP_FIELDS = {"schema", "release", "source_revision", "artifacts"}
+ARTIFACT_FIELDS = {"id", "kind", "path", "identity", "sbom", "provenance"}
+IDENTITY_FIELDS = {"schema", "bytes", "sha256", "blake3"}
+REFERENCE_FIELDS = {"path", "sha256"}
+HEX = frozenset("0123456789abcdef")
+MAX_METADATA_BYTES = 32 * 1024 * 1024
+RC_PATTERN = re.compile(r"1\.1\.0-rc\.(0|[1-9][0-9]*)")
+
+
+class ReleaseError(ValueError):
+    """Candidate evidence is incomplete, mutable, or contradictory."""
+
+
+def _object(value: Any, label: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ReleaseError(f"{label} must be an object")
+    return value
+
+
+def _exact(value: dict[str, Any], fields: set[str], label: str) -> None:
+    if set(value) != fields:
+        raise ReleaseError(f"{label} fields do not match the frozen schema")
+
+
+def _string(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ReleaseError(f"{label} must be a non-empty string")
+    return value
+
+
+def _hex(value: Any, length: int, label: str) -> str:
+    text = _string(value, label)
+    if len(text) != length or any(character not in HEX for character in text):
+        raise ReleaseError(f"{label} must be {length} lowercase hexadecimal characters")
+    return text
+
+
+def _file(root: Path, value: Any, label: str) -> Path:
+    text = _string(value, label)
+    logical = PurePosixPath(text)
+    if logical.is_absolute() or ".." in logical.parts or "\\" in text:
+        raise ReleaseError(f"{label} must be a contained POSIX path")
+    cursor = root
+    for part in logical.parts:
+        cursor /= part
+        if cursor.is_symlink():
+            raise ReleaseError(f"{label} must not traverse a symlink")
+    try:
+        resolved = cursor.resolve(strict=True)
+        resolved.relative_to(root.resolve(strict=True))
+    except (OSError, ValueError) as error:
+        raise ReleaseError(f"{label} is not contained below the candidate directory") from error
+    if not resolved.is_file() or resolved.is_symlink():
+        raise ReleaseError(f"{label} must name an ordinary file")
+    return resolved
+
+
+def _json_file(path: Path, label: str) -> dict[str, Any]:
+    if path.stat().st_size > MAX_METADATA_BYTES:
+        raise ReleaseError(f"{label} exceeds {MAX_METADATA_BYTES} bytes")
+    try:
+        return _object(json.loads(path.read_bytes()), label)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ReleaseError(f"{label} must contain UTF-8 JSON") from error
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _identity(path: Path, tool: str) -> dict[str, Any]:
+    try:
+        output = subprocess.check_output(
+            [tool, "release", "digest", str(path)],
+            text=True,
+            stderr=subprocess.PIPE,
+            timeout=3600,
+        )
+        value = _object(json.loads(output), f"identity for {path.name}")
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as error:
+        raise ReleaseError(f"digest tool failed for {path.name}: {error}") from error
+    _exact(value, IDENTITY_FIELDS, f"identity for {path.name}")
+    if value.get("schema") != IDENTITY_SCHEMA:
+        raise ReleaseError(f"identity for {path.name} has the wrong schema")
+    if type(value.get("bytes")) is not int or value["bytes"] < 0:
+        raise ReleaseError(f"identity for {path.name} has an invalid byte count")
+    _hex(value.get("sha256"), 64, f"identity for {path.name}.sha256")
+    _hex(value.get("blake3"), 64, f"identity for {path.name}.blake3")
+    return value
+
+
+def _reference(value: Any, root: Path, label: str) -> tuple[Path, dict[str, Any]]:
+    reference = _object(value, label)
+    _exact(reference, REFERENCE_FIELDS, label)
+    path = _file(root, reference["path"], f"{label}.path")
+    expected = _hex(reference["sha256"], 64, f"{label}.sha256")
+    if _sha256(path) != expected:
+        raise ReleaseError(f"{label}.sha256 does not match {reference['path']}")
+    return path, _json_file(path, label)
+
+
+def _validate_sbom(value: dict[str, Any], artifact_id: str, label: str) -> None:
+    if value.get("bomFormat") == "CycloneDX" and isinstance(
+        value.get("specVersion"), str
+    ):
+        metadata = _object(value.get("metadata"), f"{label}.metadata")
+        component = _object(metadata.get("component"), f"{label}.component")
+        bound_id = component.get("bom-ref")
+    elif (
+        isinstance(value.get("spdxVersion"), str)
+        and value.get("SPDXID") == "SPDXRef-DOCUMENT"
+    ):
+        bound_id = value.get("name")
+    else:
+        raise ReleaseError(f"{label} is neither a CycloneDX nor SPDX document")
+    if bound_id != artifact_id:
+        raise ReleaseError(f"{label} does not bind artifact id {artifact_id!r}")
+
+
+def _validate_provenance(
+    value: dict[str, Any], artifact_path: str, sha256: str, revision: str, label: str
+) -> None:
+    if value.get("_type") != "https://in-toto.io/Statement/v1":
+        raise ReleaseError(f"{label} must be an in-toto Statement v1")
+    if value.get("predicateType") != "https://slsa.dev/provenance/v1":
+        raise ReleaseError(f"{label} must contain SLSA provenance v1")
+    subjects = value.get("subject")
+    if not isinstance(subjects, list) or not any(
+        isinstance(subject, dict)
+        and subject.get("name") == artifact_path
+        and isinstance(subject.get("digest"), dict)
+        and subject["digest"].get("sha256") == sha256
+        for subject in subjects
+    ):
+        raise ReleaseError(f"{label} does not bind the artifact SHA-256")
+    predicate = _object(value.get("predicate"), f"{label}.predicate")
+    definition = _object(predicate.get("buildDefinition"), f"{label}.buildDefinition")
+    parameters = _object(
+        definition.get("externalParameters"), f"{label}.externalParameters"
+    )
+    if parameters.get("source_revision") != revision:
+        raise ReleaseError(f"{label} does not bind the candidate source revision")
+    details = _object(predicate.get("runDetails"), f"{label}.runDetails")
+    builder = _object(details.get("builder"), f"{label}.builder")
+    _string(builder.get("id"), f"{label}.builder.id")
+
+
+def validate(candidate: Path, digest_tool: str) -> dict[str, Any]:
+    if candidate.is_symlink() or not candidate.is_file():
+        raise ReleaseError("candidate must be an ordinary manifest file")
+    root = candidate.parent.resolve(strict=True)
+    document = _json_file(candidate.resolve(strict=True), "candidate")
+    _exact(document, TOP_FIELDS, "candidate")
+    if document.get("schema") != SCHEMA:
+        raise ReleaseError(f"candidate.schema must equal {SCHEMA!r}")
+    release = _string(document.get("release"), "candidate.release")
+    if RC_PATTERN.fullmatch(release) is None:
+        raise ReleaseError("candidate.release must be a 1.1.0-rc.N version")
+    revision = _hex(document.get("source_revision"), 40, "candidate.source_revision")
+    artifacts = document.get("artifacts")
+    if not isinstance(artifacts, list) or not artifacts:
+        raise ReleaseError("candidate.artifacts must be a non-empty array")
+    ids: set[str] = set()
+    paths: set[str] = set()
+    for ordinal, raw in enumerate(artifacts):
+        label = f"candidate.artifacts[{ordinal}]"
+        artifact = _object(raw, label)
+        _exact(artifact, ARTIFACT_FIELDS, label)
+        artifact_id = _string(artifact["id"], f"{label}.id")
+        _string(artifact["kind"], f"{label}.kind")
+        artifact_path = _string(artifact["path"], f"{label}.path")
+        if artifact_id in ids or artifact_path in paths:
+            raise ReleaseError("candidate artifact ids and paths must be unique")
+        ids.add(artifact_id)
+        paths.add(artifact_path)
+        path = _file(root, artifact_path, f"{label}.path")
+        expected = _object(artifact["identity"], f"{label}.identity")
+        _exact(expected, IDENTITY_FIELDS, f"{label}.identity")
+        if expected.get("schema") != IDENTITY_SCHEMA:
+            raise ReleaseError(f"{label}.identity has the wrong schema")
+        if type(expected.get("bytes")) is not int or expected["bytes"] < 0:
+            raise ReleaseError(f"{label}.identity.bytes must be a nonnegative integer")
+        _hex(expected.get("sha256"), 64, f"{label}.identity.sha256")
+        _hex(expected.get("blake3"), 64, f"{label}.identity.blake3")
+        actual = _identity(path, digest_tool)
+        if actual != expected:
+            raise ReleaseError(f"{label}.identity does not match {artifact_path}")
+        sbom_path, sbom = _reference(artifact["sbom"], root, f"{label}.sbom")
+        _validate_sbom(sbom, artifact_id, sbom_path.name)
+        provenance_path, provenance = _reference(
+            artifact["provenance"], root, f"{label}.provenance"
+        )
+        _validate_provenance(
+            provenance,
+            artifact_path,
+            expected["sha256"],
+            revision,
+            provenance_path.name,
+        )
+    return document
+
+
+def _git_gate(root: Path, revision: str) -> None:
+    try:
+        head = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=root, text=True, timeout=30
+        ).strip()
+        dirty = subprocess.check_output(
+            ["git", "status", "--porcelain=v1"], cwd=root, text=True, timeout=30
+        )
+    except subprocess.SubprocessError as error:
+        raise ReleaseError(f"Git candidate gate failed: {error}") from error
+    if head != revision:
+        raise ReleaseError("candidate source_revision is not the checked-out HEAD")
+    if dirty:
+        raise ReleaseError("candidate worktree is dirty")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--candidate", type=Path, required=True)
+    parser.add_argument("--digest-tool", default=os.environ.get("TRITIUM_BIN", "tritium"))
+    args = parser.parse_args()
+    try:
+        document = validate(args.candidate, args.digest_tool)
+        _git_gate(Path(__file__).resolve().parent.parent, document["source_revision"])
+    except (OSError, ReleaseError) as error:
+        print(f"release-status: BLOCKED: {error}", file=sys.stderr)
+        return 1
+    print(f"release-status: LOCAL_RC_READY: {document['release']}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

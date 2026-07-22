@@ -237,7 +237,13 @@ sm_89 runner. CUDA builds now run inside an immutable official
 contracts; the host CUDA 13 toolkit is mounted read-only, maturin/auditwheel
 enforce policy, and the verifier rejects any other platform tag. A local
 container build produced and admitted the expected tag. Candidate-revision
-CI/runtime receipts remain required before compatibility is claimed.
+CI/runtime receipts remain required before compatibility is claimed. Local-RC
+admission now has a shipped streaming SHA-256/BLAKE3 identity primitive and a
+strict `scripts/release-status` gate. It rejects noncanonical versions, dirty or
+wrong source revisions, uncontained/symlinked/duplicate artifacts, byte or
+digest drift, unbound CycloneDX/SPDX documents, and provenance that does not
+bind the exact artifact SHA-256, source revision, and builder identity. Actual
+candidate artifacts and cross-platform receipts remain open.
 
 Set one candidate version source for Rust crates, Python metadata, npm metadata,
 CLI output, schemas, docs and user agent. `1.1.0-rc.N` archives advance during
