@@ -219,6 +219,28 @@ def _digest(value: Any) -> str:
     return "sha256:" + hashlib.sha256(_canonical(value)).hexdigest()
 
 
+def _write_manifest_atomic(directory: Path, value: Dict[str, Any]) -> None:
+    payload = json.dumps(value, indent=2, sort_keys=True).encode("utf-8") + b"\n"
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".tmp-refinement-", dir=directory
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, directory / _MANIFEST)
+        directory_fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
 def _validate_digest(value: Any, field: str) -> str:
     if (
         not isinstance(value, str)
@@ -647,7 +669,9 @@ def load_refinement(artifact_dir: Pathish) -> RefinementResult:
     if not isinstance(value, dict) or set(value) != _TOP_FIELDS:
         raise ValueError("refinement manifest fields differ from schema")
     if value["schema_version"] != 2:
-        raise ValueError("unsupported refinement schema_version")
+        raise ValueError(
+            "unsupported refinement schema_version; pre-v2 artifacts must rerun refine"
+        )
     config = RefinementConfig.from_dict(value["config"])
     if value["artifact_kind"] != f"tritium.module-{config.kind}-refinement-v2":
         raise ValueError("refinement kind differs from recipe")
@@ -878,8 +902,22 @@ def refine(
             raise ValueError("sealed refinement belongs to another recipe or dataset")
         return result
     directory.mkdir(parents=True, exist_ok=True)
-    if any(directory.iterdir()):
-        raise ValueError("unsealed refinement work_dir must be empty")
+    for child in tuple(directory.iterdir()):
+        stale = child.name.startswith((".tmp-refinement-", ".tritium-module-stage-"))
+        if stale and not child.is_symlink():
+            if child.is_dir():
+                shutil.rmtree(child)
+            elif child.is_file():
+                child.unlink()
+    unknown = {
+        child.name
+        for child in directory.iterdir()
+        if child.name not in {_CONVERSION_DIRECTORY, _PACKED_DIRECTORY}
+        or child.is_symlink()
+        or not child.is_dir()
+    }
+    if unknown:
+        raise ValueError("unsealed refinement work_dir contains unknown state")
 
     teacher_was_training = teacher.training
     teacher.eval()
@@ -1026,11 +1064,24 @@ def refine(
     )
     packable = all(reference.shape[1] % 128 == 0 for reference in child.weights)
     packing = ("s34" if config.structure == "s34" else "b3") if packable else None
-    packed = (
-        child.pack_native(directory / _PACKED_DIRECTORY, packing=packing)
-        if packing is not None
-        else None
-    )
+    packed_path = directory / _PACKED_DIRECTORY
+    if packing is None:
+        if packed_path.exists() or packed_path.is_symlink():
+            raise ValueError("unaligned refinement has an unexpected packed package")
+        packed = None
+    elif packed_path.exists() or packed_path.is_symlink():
+        packed = load_packed_module(packed_path)
+        if (
+            packed.packing != packing
+            or packed.conversion_artifact_id != child.artifact_id
+            or packed.source_model_digest != child.source_model_digest
+            or packed.evidence_id != child.evidence_id
+            or packed.algorithm_id != child.algorithm_id
+            or packed.recipe_id != child.recipe_id
+        ):
+            raise ValueError("resumed packed package differs from refinement child")
+    else:
+        packed = child.pack_native(packed_path, packing=packing)
     identity = {
         "schema_version": 2,
         "artifact_kind": f"tritium.module-{config.kind}-refinement-v2",
@@ -1051,18 +1102,7 @@ def refine(
         "accepted_steps": accepted_steps,
     }
     identity["artifact_id"] = _digest(identity)
-    manifest = directory / _MANIFEST
-    with manifest.open("xb") as stream:
-        stream.write(
-            json.dumps(identity, indent=2, sort_keys=True).encode("utf-8") + b"\n"
-        )
-        stream.flush()
-        os.fsync(stream.fileno())
-    descriptor = os.open(directory, os.O_RDONLY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+    _write_manifest_atomic(directory, identity)
     return load_refinement(directory)
 
 

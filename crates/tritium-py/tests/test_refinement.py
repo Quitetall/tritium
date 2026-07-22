@@ -137,12 +137,15 @@ def test_g128_refinement_binds_seek_backed_salt_package(tmp_path):
     torch.manual_seed(107)
     teacher = torch.nn.Linear(128, 3)
     parent = _parent(teacher, [torch.randn(2, 128)], tmp_path)
+    training = [torch.randn(2, 128)]
+    validation = [torch.randn(3, 128)]
+    config = RefinementConfig.scale_only(max_steps=1)
     result = refine(
         parent,
         teacher=teacher,
-        training=[torch.randn(2, 128)],
-        validation=[torch.randn(3, 128)],
-        config=RefinementConfig.scale_only(max_steps=1),
+        training=training,
+        validation=validation,
+        config=config,
         work_dir=tmp_path / "refined",
     )
 
@@ -153,8 +156,25 @@ def test_g128_refinement_binds_seek_backed_salt_package(tmp_path):
     assert result.packed.package_id
 
     manifest = result.artifact_dir / "refinement.json"
+    manifest.unlink()
+    resumed = refine(
+        parent,
+        teacher=teacher,
+        training=training,
+        validation=validation,
+        config=config,
+        work_dir=result.artifact_dir,
+    )
+    assert resumed.artifact_id == result.artifact_id
+
     value = json.loads(manifest.read_text(encoding="utf-8"))
+    original = dict(value)
     value["packed_artifact_id"] = "sha256:" + "00" * 32
     manifest.write_text(json.dumps(value), encoding="utf-8")
+    with pytest.raises(ValueError, match="packed package"):
+        load(result.artifact_dir)
+
+    original["packing"] = "d2"
+    manifest.write_text(json.dumps(original), encoding="utf-8")
     with pytest.raises(ValueError, match="packed package"):
         load(result.artifact_dir)
