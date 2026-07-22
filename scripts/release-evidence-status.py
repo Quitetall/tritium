@@ -77,6 +77,12 @@ FLAGSHIP_QUALITY_RECEIPT = runpy.run_path(
 validate_flagship_quality = FLAGSHIP_QUALITY_RECEIPT["validate_quality"]
 validate_flagship_tasks = FLAGSHIP_QUALITY_RECEIPT["validate_tasks"]
 FlagshipQualityError = FLAGSHIP_QUALITY_RECEIPT["FlagshipQualityError"]
+FLAGSHIP_RUNTIME_RECEIPT = runpy.run_path(
+    Path(__file__).with_name("verify-flagship-runtime-receipt.py")
+)
+validate_flagship_runtime = FLAGSHIP_RUNTIME_RECEIPT["validate_runtime"]
+validate_flagship_physical = FLAGSHIP_RUNTIME_RECEIPT["validate_physical"]
+FlagshipRuntimeError = FLAGSHIP_RUNTIME_RECEIPT["FlagshipRuntimeError"]
 
 SCHEMA = "tritium.release-evidence-registry.v1"
 REPORT_SCHEMA = "tritium.release-gate-report.v1"
@@ -103,6 +109,8 @@ KNOWN_KINDS = frozenset(
         "conversion-refinement",
         "quality",
         "task-retention",
+        "runtime",
+        "physical-bytes",
     }
 )
 HEX = frozenset("0123456789abcdef")
@@ -310,7 +318,8 @@ def evaluate(
                 kind.startswith("oci-") or kind.startswith("serving-deployment-")
             )
             else "model-bundle" if kind in {
-                "conversion-refinement", "quality", "task-retention"
+                "conversion-refinement", "quality", "task-retention", "runtime",
+                "physical-bytes",
             }
             else "python-wheel"
         )
@@ -404,6 +413,14 @@ def evaluate(
                 receipt = validate_flagship_tasks(
                     receipt_path, revision, release, candidate
                 )
+            elif kind == "runtime":
+                receipt = validate_flagship_runtime(
+                    receipt_path, revision, release, candidate
+                )
+            elif kind == "physical-bytes":
+                receipt = validate_flagship_physical(
+                    receipt_path, revision, release, candidate
+                )
             elif kind in {"oci-runtime-cpu", "oci-runtime-cuda"}:
                 receipt = load_oci_runtime_receipt(
                     receipt_path, revision=revision, release=release,
@@ -478,6 +495,7 @@ def evaluate(
             ZooCommunityError,
             FlagshipReceiptError,
             FlagshipQualityError,
+            FlagshipRuntimeError,
             ValueError,
         ) as error:
             raise EvidenceError(f"{label} failed {kind} validation: {error}") from error
@@ -595,7 +613,7 @@ def evaluate(
                 raise EvidenceError(
                     "conversion-refinement anchor is not a qualified model bundle"
                 )
-        elif kind in {"quality", "task-retention"}:
+        elif kind in {"quality", "task-retention", "runtime", "physical-bytes"}:
             identity = artifact.get("identity", {})
             actual = (
                 artifact.get("id"), artifact.get("kind"), artifact_path.name,
@@ -661,7 +679,7 @@ def evaluate(
         if kind == "conversion-refinement"
     ]
     for receipt_id, kind in kinds.items():
-        if kind not in {"quality", "task-retention"}:
+        if kind not in {"quality", "task-retention", "runtime", "physical-bytes"}:
             continue
         expected_parents = set(conversion_ids)
         if len(expected_parents) != 1 or set(entries[receipt_id]["parents"]) != expected_parents:

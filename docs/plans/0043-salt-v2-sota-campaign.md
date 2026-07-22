@@ -976,6 +976,15 @@ The following work deliberately remains open and keeps this plan in progress:
   additive-ternary SOTA and global-low-bit Pareto verdicts independent. The
   task contract recomputes six individual and mean accuracy deltas and rejects
   confidence bounds above 1.0/0.5 percentage points. No empirical receipt exists;
+- native execution and accounting now fail-close through
+  `tritium.qwen36-runtime.v1` and `tritium.qwen36-physical-bytes.v1`. Runtime
+  admission requires a physical CUDA identity, direct ternary kernels, zero
+  dense materialization/host transfers, all three tracks across prefill/decode
+  and two context/batch regimes, >=20 iterations, <=10% PTQ slowdown versus
+  SALT V1, and measured MTP acceptance plus >1x speedup. Physical admission
+  rehashes all three candidate bundles, recomputes matrix/whole/resident bpw and
+  dense reduction ratios, enforces 2.25/4.0 matrix caps plus <=0.01 metadata bpw,
+  and requires host/device/transient peaks. These remain validator-only gates;
 - no near-zero-divergence, additive-ternary SOTA, global Pareto, or cost result
   has been earned by this implementation alone.
 

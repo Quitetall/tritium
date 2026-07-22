@@ -364,6 +364,42 @@ class ReleaseEvidenceStatusTests(unittest.TestCase):
                 ["conversion-refinement", "quality", "task-retention"],
             )
 
+            runtime_path = evidence_root / "runtime.json"
+            physical_path = evidence_root / "physical.json"
+            runtime_path.write_bytes(b"{}\n")
+            physical_path.write_bytes(b"{}\n")
+            runtime = {
+                "receipt_id": "sha256:" + "8" * 64,
+                "run_id": "qwen-runtime-1", "artifact": receipt["tracks"][2]["artifact"],
+            }
+            physical = {
+                "receipt_id": "sha256:" + "9" * 64,
+                "run_id": "qwen-physical-1", "artifact": receipt["tracks"][2]["artifact"],
+            }
+            runtime_entry = entry(
+                runtime_path, runtime, kind="runtime", parents=[receipt["receipt_id"]]
+            )
+            physical_entry = entry(
+                physical_path, physical, kind="physical-bytes",
+                parents=[receipt["receipt_id"]],
+            )
+            runtime_entry["artifact_id"] = "qwen-near"
+            physical_entry["artifact_id"] = "qwen-near"
+            registry(
+                registry_path, candidate,
+                [receipt_entry, quality_entry, tasks_entry, runtime_entry, physical_entry],
+            )
+            validators.update(
+                {
+                    "validate_flagship_runtime": mock.Mock(return_value=runtime),
+                    "validate_flagship_physical": mock.Mock(return_value=physical),
+                }
+            )
+            with mock.patch.dict(evaluate.__globals__, validators):
+                report = evaluate(registry_path, candidate, document)
+            flagship = next(row for row in report["rows"] if row["id"] == "flagship-qwen")
+            self.assertEqual(flagship["status"], "PASS")
+
     def test_zoo_community_requires_evidence_ancestry_and_candidate_artifacts(self):
         with tempfile.TemporaryDirectory() as raw:
             candidate, document, artifact, evidence_root = release_fixture(Path(raw))
