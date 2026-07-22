@@ -430,12 +430,14 @@ where
     expected_masters
         .try_reserve_exact(workspace.additive_slots().len())
         .map_err(|_| Qwen36PtqDriverError::AllocationFailed)?;
+    let mut activation_digest = None;
     let mut token_stream_digest = None;
     for (ordinal, slot) in workspace.additive_slots().iter().enumerate() {
         let tensor_index =
             u64::try_from(ordinal).map_err(|_| Qwen36PtqDriverError::AllocationFailed)?;
         let record = evidence.reopen(tensor_index)?;
         validate_record(slot, tensor_index, source_model_id, &record)?;
+        bind_activation_cache(&mut activation_digest, tensor_index, &record)?;
         bind_token_stream(&mut token_stream_digest, tensor_index, &record)?;
         let weights =
             admitted
@@ -611,6 +613,25 @@ fn bind_token_stream(
         Some(expected) if *expected != actual => Err(Qwen36PtqDriverError::EvidenceMismatch {
             tensor_index,
             field: "campaign token stream",
+        }),
+        Some(_) => Ok(()),
+        None => {
+            *expected = Some(actual);
+            Ok(())
+        }
+    }
+}
+
+fn bind_activation_cache(
+    expected: &mut Option<[u8; 32]>,
+    tensor_index: u64,
+    record: &SaltV2KroneckerEvidence,
+) -> Result<(), Qwen36PtqDriverError> {
+    let actual = record.source_id().activation_cache_digest();
+    match expected {
+        Some(expected) if *expected != actual => Err(Qwen36PtqDriverError::EvidenceMismatch {
+            tensor_index,
+            field: "campaign activation cache",
         }),
         Some(_) => Ok(()),
         None => {
@@ -827,13 +848,23 @@ mod tests {
         model_digest: [u8; 32],
         token_digest: [u8; 32],
     ) -> SaltV2KroneckerEvidence {
+        evidence_with_sources(index, name, model_digest, [2; 32], token_digest)
+    }
+
+    fn evidence_with_sources(
+        index: u64,
+        name: &str,
+        model_digest: [u8; 32],
+        activation_digest: [u8; 32],
+        token_digest: [u8; 32],
+    ) -> SaltV2KroneckerEvidence {
         let mut values = vec![0.0; 128 * 128];
         for index in 0..128 {
             values[index * 128 + index] = 1.0;
         }
         SaltV2KroneckerEvidence::new(
             SaltV2Curvature::GuidedFisher,
-            CurvatureSourceId::new(model_digest, [2; 32], token_digest).unwrap(),
+            CurvatureSourceId::new(model_digest, activation_digest, token_digest).unwrap(),
             [4; 32],
             index,
             name,
@@ -940,6 +971,22 @@ mod tests {
             Err(Qwen36PtqDriverError::EvidenceMismatch {
                 tensor_index: 1,
                 field: "campaign token stream",
+            })
+        ));
+
+        let mut expected_activation = None;
+        bind_activation_cache(
+            &mut expected_activation,
+            0,
+            &evidence(0, slot.name(), [1; 32]),
+        )
+        .unwrap();
+        let changed_activation = evidence_with_sources(1, "b.weight", [1; 32], [8; 32], [3; 32]);
+        assert!(matches!(
+            bind_activation_cache(&mut expected_activation, 1, &changed_activation),
+            Err(Qwen36PtqDriverError::EvidenceMismatch {
+                tensor_index: 1,
+                field: "campaign activation cache",
             })
         ));
     }

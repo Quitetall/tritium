@@ -67,8 +67,20 @@ coverage and duplicate-plugin tests.
   - Expected output: `cargo test -p tritium-quantize --test
     output_reconstruction` reports six passed tests; `cargo clippy -p
     tritium-quantize --all-targets -- -D warnings` exits zero.
-- Bind that receipt's selected candidate to its immutable tensor-master set in
-  the resumable plan-0043 driver; execute it on checkpoint-scale evidence.
+- [x] Reject activation-cache and token-stream drift across every reopened Qwen
+  curvature record before planning the immutable master campaign. Expected
+  output: `cargo test -p tritium-salt
+  record_slot_mismatches_fail_before_source_widening` passes.
+- Bind the selected output candidate to its immutable tensor-master set through
+  campaign-owned execution, not a caller-provided candidate label.
+  - The runtime must derive student-output bytes from the sealed master/package
+    handle and emit an execution receipt binding completion ID, master-set ID,
+    runtime/backend identity and student-output digest.
+  - The driver may then admit `TSV2OUT` only when its selected student digest and
+    the runtime execution receipt agree. Label equality alone must fail closed.
+  - Add public-seam honest-execution, relabeling, corruption and strict-reopen
+    tests before marking this item complete.
+- Execute the bound output-reconstruction workflow on checkpoint-scale evidence.
 - Keep calibration, reconstruction and validation datasets source-bound and
   disjoint where the recipe requires.
 

@@ -838,13 +838,16 @@ The following work deliberately remains open and keeps this plan in progress:
   production evidence row, so fixture success cannot admit Stage 8;
 - the production pure-PTQ driver now connects admitted checkpoint tensors to
   reopened factorized-curvature evidence and the canonical campaign store, but
-  checkpoint-scale evidence collection, campaign-bound output reconstruction,
-  scale-only teacher-KL, and hard PV updates remain open. The core now has a
+  checkpoint-scale evidence collection, scale-only teacher-KL, and hard PV
+  updates remain open. The core now has a
   bounded streamed block/sliding evaluator and canonical `TSV2OUT` v1 receipt:
   it binds source/cache/token/validation identities, exact teacher and candidate
   outputs, final-logit CE/KL, every deterministic restart and selected basin.
-  That receipt remains structural until its selected candidate is bound to the
-  corresponding immutable master set and run on the pinned checkpoint;
+  The resumable Qwen driver now rejects activation-cache as well as token-stream
+  drift across the evidence namespace. Output-to-master lineage remains open:
+  candidate-label equality is not proof that student outputs came from those
+  masters. A campaign-owned runtime execution receipt and pinned-checkpoint run
+  are still required;
 - `fit_salt_v2_master(...) -> SaltV2MasterFit` now invokes the standalone dense
   BlockLDLQ path, then
   `allocate_and_pack_salt_v2_master(...) -> SaltV2ModelFitResult` slices exact
