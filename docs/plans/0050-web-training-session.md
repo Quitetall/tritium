@@ -340,6 +340,22 @@ Safari must run on physical macOS, software-adapter markers fail closed, and all
 trace files are contained, size-bounded and rehashed. The release registry now
 dispatches this validator as `browser-conformance`, but the gate remains
 `MISSING` until the three physical lanes are actually run on candidate bytes.
+`scripts/qualify-browser-training.py` is the sole aggregator: on a clean exact
+revision it revalidates each ordered lane fragment in its original directory,
+copies and rehashes three distinct traces, assembles the candidate archive and
+frozen schema identities, validates the final receipt, fsyncs the evidence tree
+and atomically publishes it. It cannot replace the physical browser harness.
+
+```bash
+python scripts/qualify-browser-training.py \
+  --artifact dist/tritium-ai-web-1.1.0-rc.0.tgz \
+  --chrome-lane evidence/chrome/lane.json \
+  --firefox-lane evidence/firefox/lane.json \
+  --safari-lane evidence/safari/lane.json \
+  --source-revision "$(git rev-parse HEAD)" \
+  --release 1.1.0-rc.0 --run-id browser-candidate-1 \
+  --output-dir evidence/browser-qualified
+```
 
 ## Slice 6 — local archive and five-minute tutorial
 

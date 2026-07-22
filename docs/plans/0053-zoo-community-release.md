@@ -228,6 +228,10 @@ physical Chrome, Firefox and Safari identities, 70 valid plus 44 invalid
 canonical cases per lane, full lifecycle/fault coverage, and rehashed traces
 with no steady-state readback or WASM fallback. No physical three-browser
 receipt is present yet, so this remains `MISSING` rather than structural pass.
+The clean-revision browser aggregator revalidates lane fragments before copying
+and content-binding three distinct traces, then validates and atomically
+publishes the combined receipt. This closes the collection seam without
+manufacturing any physical result.
 
 Replace the current pre-alpha/v1.0-era narrative with tested v1.1 documentation:
 
