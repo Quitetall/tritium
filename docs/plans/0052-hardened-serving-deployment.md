@@ -198,12 +198,15 @@ Exact-image runtime, vulnerability/secret scan, strict schema-v3
 receipt parity, and NVIDIA evidence remain open gates.
 
 Runtime qualification harness now requires an exact Docker repository digest,
-strict bundle manifest identity, production `/readyz` receipt parity, singular
-model listing, one buffered and one SSE generation, read-only root/bundle,
-dropped capabilities, `no-new-privileges`, and bounded successful SIGTERM drain.
-CUDA runs additionally require physical GPU UUID/name/driver evidence. It emits
-a content-addressed receipt only after all checks pass; no qualifying image or
-27B bundle is present locally yet, so CPU/CUDA empirical receipts remain open.
+the verified OCI archive/build receipt/package-candidate lineage, strict bundle
+manifest identity, production `/readyz` receipt parity, singular model listing,
+one buffered and one SSE generation, read-only root/bundle, dropped capabilities,
+`no-new-privileges`, and bounded successful SIGTERM drain. CUDA runs additionally
+require physical GPU UUID/name/driver evidence. It emits a content-addressed,
+candidate-archive-bound receipt only after all checks pass. The release registry
+admits CPU and CUDA runtime evidence separately and neither substitutes for the
+remaining deployment gate. No qualifying image or 27B bundle is present locally
+yet, so both empirical runtime receipts remain open.
 
 ## Slice 5 — Helm, autoscaling and serverless examples
 

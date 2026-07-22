@@ -4,22 +4,29 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import platform
 import re
+import runpy
 import secrets
 import socket
 import subprocess
 import sys
+import tarfile
 import time
 import urllib.error
 import urllib.request
 from typing import Any
 
+
+OCI_ARCHIVE = runpy.run_path(Path(__file__).with_name("verify-oci-archive.py"))
+validate_oci_archive = OCI_ARCHIVE["validate"]
+OciError = OCI_ARCHIVE["OciError"]
 
 SCHEMA = "tritium.oci-runtime-qualification.v1"
 HEX = frozenset("0123456789abcdef")
@@ -168,6 +175,18 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
     if args.bundle.is_symlink() or not bundle.is_dir():
         raise QualificationError("bundle must be an ordinary directory")
     identity = manifest_identity(bundle / "tritium.json", args.digest_tool)
+    archive = args.oci_archive.resolve(strict=True)
+    if args.oci_archive.is_symlink() or not archive.is_file():
+        raise QualificationError("OCI archive must be an ordinary file")
+    archive_result = validate_oci_archive(
+        archive, args.build_receipt, args.package_candidate
+    )
+    if archive_result["image_manifest_digest"] != image_digest:
+        raise QualificationError("runtime image digest differs from qualified OCI archive")
+    if (archive_result["release"], archive_result["source_revision"], archive_result["flavor"]) != (
+        args.release, revision, args.flavor,
+    ):
+        raise QualificationError("runtime identity differs from qualified OCI build lineage")
     inspect = json.loads(run(["docker", "image", "inspect", args.image]))
     if not isinstance(inspect, list) or len(inspect) != 1:
         raise QualificationError("image reference did not resolve exactly once")
@@ -270,7 +289,10 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
     receipt = {
         "schema": SCHEMA, "release": args.release, "source_revision": revision,
         "run_id": args.run_id, "flavor": args.flavor, "image": args.image,
-        "image_id": inspect[0].get("Id"), "manifest": identity,
+        "image_id": inspect[0].get("Id"), "image_manifest_digest": image_digest,
+        "artifact": {"kind": "oci-image", "name": archive.name,
+                     "bytes": archive.stat().st_size, "sha256": sha256(archive)},
+        "manifest": identity,
         "profile": args.profile, "startup_receipt": startup,
         "checks": list(CHECKS),
         "started_at_utc": started_at_utc,
@@ -287,16 +309,116 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
     return receipt
 
 
-def validate_receipt(receipt: dict[str, Any]) -> None:
+def validate_receipt(receipt: dict[str, Any], *, revision: str | None = None,
+                     release: str | None = None, artifact_path: Path | None = None) -> None:
     expected = {
         "schema", "release", "source_revision", "run_id", "flavor", "image", "image_id",
-        "manifest", "profile", "startup_receipt", "checks", "started_at_utc", "timing",
-        "machine", "result", "receipt_id",
+        "image_manifest_digest", "artifact", "manifest", "profile", "startup_receipt",
+        "checks", "started_at_utc", "timing", "machine", "result", "receipt_id",
     }
     if set(receipt) != expected or receipt.get("schema") != SCHEMA or receipt.get("result") != "pass":
         raise QualificationError("runtime receipt fields or disposition differ")
     if receipt.get("checks") != list(CHECKS):
         raise QualificationError("runtime receipt checks differ")
+    receipt_revision = exact_hex(receipt.get("source_revision"), 40, "runtime source revision")
+    receipt_release = receipt.get("release")
+    if not isinstance(receipt_release, str) or re.fullmatch(
+        r"1\.1\.0-rc\.(0|[1-9][0-9]*)", receipt_release
+    ) is None:
+        raise QualificationError("runtime receipt release is malformed")
+    if not isinstance(receipt.get("run_id"), str) or re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", receipt["run_id"]
+    ) is None:
+        raise QualificationError("runtime receipt run ID is malformed")
+    if receipt.get("flavor") not in {"cpu", "cuda"}:
+        raise QualificationError("runtime receipt flavor is malformed")
+    if receipt.get("profile") not in {"compact-v1", "near-lossless-v1"}:
+        raise QualificationError("runtime receipt profile is malformed")
+    if revision is not None and receipt.get("source_revision") != revision:
+        raise QualificationError("runtime receipt source revision differs")
+    if release is not None and receipt.get("release") != release:
+        raise QualificationError("runtime receipt release differs")
+    image = receipt.get("image")
+    image_digest = receipt.get("image_manifest_digest")
+    if not isinstance(image, str) or "@" not in image or image.rpartition("@")[2] != image_digest:
+        raise QualificationError("runtime receipt image manifest binding differs")
+    if not isinstance(image_digest, str) or not image_digest.startswith("sha256:"):
+        raise QualificationError("runtime receipt image manifest digest is malformed")
+    exact_hex(image_digest[7:], 64, "runtime receipt image manifest digest")
+    image_id = receipt.get("image_id")
+    if not isinstance(image_id, str) or not image_id.startswith("sha256:"):
+        raise QualificationError("runtime receipt image ID is malformed")
+    exact_hex(image_id[7:], 64, "runtime receipt image ID")
+    artifact = receipt.get("artifact")
+    if not isinstance(artifact, dict) or set(artifact) != {"kind", "name", "bytes", "sha256"}:
+        raise QualificationError("runtime receipt artifact fields differ")
+    if (artifact.get("kind") != "oci-image" or not isinstance(artifact.get("name"), str)
+            or not artifact["name"]):
+        raise QualificationError("runtime receipt artifact identity is malformed")
+    if Path(artifact["name"]).name != artifact["name"]:
+        raise QualificationError("runtime receipt artifact name is unsafe")
+    if type(artifact.get("bytes")) is not int or artifact["bytes"] <= 0:
+        raise QualificationError("runtime receipt artifact byte count is invalid")
+    exact_hex(artifact.get("sha256"), 64, "runtime receipt artifact SHA-256")
+    if artifact_path is not None:
+        if artifact_path.is_symlink() or not artifact_path.is_file():
+            raise QualificationError("runtime candidate artifact must be an ordinary file")
+        actual = (artifact_path.name, artifact_path.stat().st_size, sha256(artifact_path))
+        declared = (artifact["name"], artifact["bytes"], artifact["sha256"])
+        if actual != declared:
+            raise QualificationError("runtime receipt does not bind candidate OCI bytes")
+    manifest = receipt.get("manifest")
+    if not isinstance(manifest, dict) or set(manifest) != {"schema", "bytes", "sha256", "blake3"}:
+        raise QualificationError("runtime receipt model manifest identity fields differ")
+    if manifest.get("schema") != "tritium.file-identity.v1":
+        raise QualificationError("runtime receipt model manifest identity schema differs")
+    if type(manifest.get("bytes")) is not int or manifest["bytes"] <= 0:
+        raise QualificationError("runtime receipt model manifest byte count is invalid")
+    exact_hex(manifest.get("sha256"), 64, "runtime model manifest SHA-256")
+    exact_hex(manifest.get("blake3"), 64, "runtime model manifest BLAKE3")
+    validate_ready(
+        {"status": "ready", "release_gate": "production_artifact_admitted",
+         "startup_receipt": receipt.get("startup_receipt")},
+        receipt_revision, receipt["flavor"], receipt["profile"], manifest["blake3"],
+        receipt_release,
+    )
+    try:
+        timestamp = datetime.fromisoformat(
+            str(receipt.get("started_at_utc")).replace("Z", "+00:00")
+        )
+    except ValueError as error:
+        raise QualificationError("runtime receipt timestamp is malformed") from error
+    if timestamp.tzinfo is None or timestamp.utcoffset() != timedelta(0):
+        raise QualificationError("runtime receipt timestamp must be UTC")
+    timing = receipt.get("timing")
+    if not isinstance(timing, dict) or set(timing) != {"startup_ms", "shutdown_ms"} or any(
+        type(timing.get(field)) not in {int, float} or not math.isfinite(timing[field])
+        or timing[field] < 0
+        for field in ("startup_ms", "shutdown_ms")
+    ):
+        raise QualificationError("runtime receipt timing is malformed")
+    machine = receipt.get("machine")
+    machine_fields = {"id", "system", "architecture", "docker_server", "gpu"}
+    if not isinstance(machine, dict) or set(machine) != machine_fields:
+        raise QualificationError("runtime receipt machine fields differ")
+    machine_id = machine.get("id")
+    if not isinstance(machine_id, str) or not machine_id.startswith("sha256:"):
+        raise QualificationError("runtime receipt machine ID is malformed")
+    exact_hex(machine_id[7:], 64, "runtime receipt machine ID")
+    for field in ("system", "architecture", "docker_server"):
+        if not isinstance(machine.get(field), str) or not machine[field]:
+            raise QualificationError(f"runtime receipt machine {field} is malformed")
+    gpu = machine.get("gpu")
+    if receipt["flavor"] == "cpu" and gpu is not None:
+        raise QualificationError("CPU runtime receipt must not claim a GPU")
+    if receipt["flavor"] == "cuda":
+        if not isinstance(gpu, dict) or set(gpu) != {"uuid", "name", "driver_version"}:
+            raise QualificationError("CUDA runtime receipt GPU fields differ")
+        if not isinstance(gpu.get("uuid"), str) or not gpu["uuid"].startswith("GPU-"):
+            raise QualificationError("CUDA runtime receipt GPU UUID is malformed")
+        if (not isinstance(gpu.get("name"), str) or not gpu["name"]
+                or not isinstance(gpu.get("driver_version"), str) or not gpu["driver_version"]):
+            raise QualificationError("CUDA runtime receipt GPU identity is malformed")
     supplied = receipt.get("receipt_id")
     if not isinstance(supplied, str) or not supplied.startswith("sha256:"):
         raise QualificationError("runtime receipt ID is malformed")
@@ -308,11 +430,28 @@ def validate_receipt(receipt: dict[str, Any]) -> None:
         raise QualificationError("runtime receipt content digest differs")
 
 
+def load_receipt(path: Path, *, revision: str, release: str,
+                 artifact_path: Path) -> dict[str, Any]:
+    if path.is_symlink() or not path.is_file() or path.stat().st_size > 32 * 1024 * 1024:
+        raise QualificationError("runtime receipt must be a bounded ordinary file")
+    try:
+        value = json.loads(path.read_bytes())
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise QualificationError("runtime receipt must contain UTF-8 JSON") from error
+    if not isinstance(value, dict):
+        raise QualificationError("runtime receipt must be a JSON object")
+    validate_receipt(value, revision=revision, release=release, artifact_path=artifact_path)
+    return value
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--flavor", required=True)
     parser.add_argument("--image", required=True)
     parser.add_argument("--bundle", type=Path, required=True)
+    parser.add_argument("--oci-archive", type=Path, required=True)
+    parser.add_argument("--build-receipt", type=Path, required=True)
+    parser.add_argument("--package-candidate", type=Path, required=True)
     parser.add_argument("--profile", default="compact-v1")
     parser.add_argument("--source-revision", required=True)
     parser.add_argument("--release", required=True)
@@ -327,7 +466,7 @@ def main() -> int:
     try:
         receipt = qualify(args)
         atomic_create(args.output, canonical(receipt))
-    except (OSError, ValueError, subprocess.SubprocessError) as error:
+    except (OSError, ValueError, tarfile.TarError, subprocess.SubprocessError) as error:
         print(f"qualify-oci-runtime: BLOCKED: {error}", file=sys.stderr)
         return 1
     print(f"qualify-oci-runtime: PASS: {receipt['receipt_id']}")

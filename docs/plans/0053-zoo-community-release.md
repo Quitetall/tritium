@@ -260,6 +260,13 @@ receipt-kind validators and generated-claim drift checks must land before every
 model-zoo, package, browser, serving, deployment, signing and second-machine
 receipt can produce `LOCAL_RC_READY`.
 
+Exact-image serving admission now distinguishes CPU runtime, CUDA runtime and
+cluster deployment. Each runtime receipt must bind the candidate OCI archive,
+the archive-verified image manifest digest, build lineage, strict model manifest,
+startup receipt, physical machine/device identity and hardened live-container
+checks. One flavor cannot satisfy the other, and neither can satisfy deployment.
+No empirical OCI runtime receipt exists locally yet.
+
 Progress (2026-07-21): aggregate sign-off now uses a non-circular two-layer
 contract. The registry report binds its own SHA-256 and can reach only
 `LOCAL_RC_EVIDENCE_READY_UNSIGNED` (exit 2). A detached SSH signature then binds

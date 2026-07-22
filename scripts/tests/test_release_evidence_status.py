@@ -24,6 +24,7 @@ WHEEL_MODULE = runpy.run_path(ROOT / "scripts" / "wheel-functional-smoke.py")
 MATRIX_MODULE = runpy.run_path(ROOT / "scripts" / "aggregate-wheel-smoke.py")
 CRATE_MODULE = runpy.run_path(ROOT / "scripts" / "qualify-crate-archives.py")
 NPM_MODULE = runpy.run_path(ROOT / "scripts" / "verify-npm-archive-receipt.py")
+OCI_RUNTIME_MODULE = runpy.run_path(ROOT / "scripts" / "qualify-oci-runtime.py")
 
 
 def canonical(value) -> bytes:
@@ -117,6 +118,55 @@ def cuda_receipt(path: Path, artifact: Path, *, run_id: str = "run-17") -> dict:
     return value
 
 
+def oci_runtime_receipt(path: Path, artifact: Path, *, flavor: str = "cpu") -> dict:
+    startup = {
+        "schema_version": 1,
+        "artifact_kind": "qwen3.6-language-mtp-salt-v2-hf-bundle",
+        "server_source_revision": "a" * 40,
+        "server_build_id": "tritium-serve:1.1.0-rc.0:" + "a" * 40,
+        "model_source_revision": "b" * 40,
+        "manifest_package_id": "c" * 64,
+        "salt_package_id": "d" * 64,
+        "preserved_package_id": "e" * 64,
+        "config_package_id": "f" * 64,
+        "profile": "compact-v1",
+        "codec": "b3",
+        "backend_policy": flavor,
+        "effective_backend": flavor,
+        "physical_device_id": "cpu" if flavor == "cpu" else "GPU-physical",
+        "loaded_bundle_bytes": 100,
+        "resident_bytes": 80,
+        "self_test_digest": "1" * 64,
+    }
+    value = {
+        "schema": OCI_RUNTIME_MODULE["SCHEMA"], "release": "1.1.0-rc.0",
+        "source_revision": "a" * 40, "run_id": f"oci-{flavor}-1", "flavor": flavor,
+        "image": "registry.example/tritium@sha256:" + "2" * 64,
+        "image_id": "sha256:" + "3" * 64,
+        "image_manifest_digest": "sha256:" + "2" * 64,
+        "artifact": {"kind": "oci-image", "name": artifact.name,
+                     "bytes": artifact.stat().st_size, "sha256": sha256(artifact)},
+        "manifest": {"schema": "tritium.file-identity.v1", "bytes": 42,
+                     "sha256": "4" * 64, "blake3": "c" * 64},
+        "profile": "compact-v1", "startup_receipt": startup,
+        "checks": list(OCI_RUNTIME_MODULE["CHECKS"]),
+        "started_at_utc": "2026-07-21T12:00:00+00:00",
+        "timing": {"startup_ms": 100.0, "shutdown_ms": 10.0},
+        "machine": {"id": "sha256:" + "5" * 64, "system": "Linux",
+                    "architecture": "x86_64", "docker_server": "28.0.0",
+                    "gpu": None if flavor == "cpu" else {
+                        "uuid": "GPU-physical", "name": "RTX 4090",
+                        "driver_version": "610.43.03",
+                    }},
+        "result": "pass",
+    }
+    value["receipt_id"] = "sha256:" + hashlib.sha256(
+        OCI_RUNTIME_MODULE["canonical"](value)
+    ).hexdigest()
+    path.write_bytes(OCI_RUNTIME_MODULE["canonical"](value))
+    return value
+
+
 def registry(
     path: Path, candidate: Path, receipts: list[dict]
 ) -> None:
@@ -149,6 +199,35 @@ def entry(
 
 
 class ReleaseEvidenceStatusTests(unittest.TestCase):
+    def test_cpu_oci_runtime_advances_serving_without_overclaiming_cuda_or_deployment(self):
+        with tempfile.TemporaryDirectory() as raw:
+            candidate, document, old_artifact, evidence_root = release_fixture(Path(raw))
+            old_artifact.unlink()
+            artifact = candidate.parent / "tritium-cpu.oci.tar"
+            artifact.write_bytes(b"qualified OCI archive")
+            document["artifacts"] = [{
+                "id": "oci-cpu", "kind": "oci-image", "path": artifact.name,
+                "identity": {"sha256": sha256(artifact), "bytes": artifact.stat().st_size},
+                "sbom": {}, "provenance": {},
+            }]
+            candidate.write_bytes(canonical(document) + b"\n")
+            receipt_path = evidence_root / "oci-cpu.json"
+            receipt = oci_runtime_receipt(receipt_path, artifact)
+            receipt_entry = entry(receipt_path, receipt, kind="oci-runtime-cpu")
+            receipt_entry["artifact_id"] = "oci-cpu"
+            registry_path = evidence_root / "registry.json"
+            registry(registry_path, candidate, [receipt_entry])
+            report = evaluate(registry_path, candidate, document)
+            serving = next(row for row in report["rows"] if row["id"] == "serving")
+            self.assertEqual(serving["satisfied_kinds"], ["oci-runtime-cpu"])
+            self.assertEqual(
+                serving["missing_kinds"], ["oci-runtime-cuda", "serving-deployment"]
+            )
+            receipt_entry["kind"] = "oci-runtime-cuda"
+            registry(registry_path, candidate, [receipt_entry])
+            with self.assertRaisesRegex(EvidenceError, "flavor differs"):
+                evaluate(registry_path, candidate, document)
+
     def test_crate_archive_receipt_binds_complete_candidate_inventory(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)

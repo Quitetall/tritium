@@ -25,6 +25,9 @@ CrateReceiptError = CRATE_RECEIPT["ArchiveError"]
 NPM_RECEIPT = runpy.run_path(Path(__file__).with_name("verify-npm-archive-receipt.py"))
 validate_npm_receipt = NPM_RECEIPT["validate_receipt"]
 NpmReceiptError = NPM_RECEIPT["NpmReceiptError"]
+OCI_RUNTIME = runpy.run_path(Path(__file__).with_name("qualify-oci-runtime.py"))
+load_oci_runtime_receipt = OCI_RUNTIME["load_receipt"]
+OciRuntimeError = OCI_RUNTIME["QualificationError"]
 
 SCHEMA = "tritium.release-evidence-registry.v1"
 REPORT_SCHEMA = "tritium.release-gate-report.v1"
@@ -35,7 +38,7 @@ RECEIPT_FIELDS = {"id", "kind", "path", "sha256", "artifact_id", "parents"}
 KNOWN_KINDS = frozenset(
     {
         "cuda-training", "clean-install", "compatibility-matrix",
-        "crate-archive", "npm-archive",
+        "crate-archive", "npm-archive", "oci-runtime-cpu", "oci-runtime-cuda",
     }
 )
 HEX = frozenset("0123456789abcdef")
@@ -57,7 +60,7 @@ GATES = (
         "packages",
         ("clean-install", "compatibility-matrix", "crate-archive", "npm-archive"),
     ),
-    ("serving", ("serving-deployment",)),
+    ("serving", ("oci-runtime-cpu", "oci-runtime-cuda", "serving-deployment")),
     ("zoo-community", ("model-zoo", "generated-claims", "governance-docs")),
     ("reproduction-signoff", ("second-machine", "independent-review")),
 )
@@ -222,6 +225,7 @@ def evaluate(registry: Path, candidate: Path, candidate_document: dict[str, Any]
         expected_artifact_kind = (
             "rust-crate" if kind == "crate-archive"
             else "npm-archive" if kind == "npm-archive"
+            else "oci-image" if kind in {"oci-runtime-cpu", "oci-runtime-cuda"}
             else "python-wheel"
         )
         if artifact.get("kind") != expected_artifact_kind:
@@ -250,11 +254,19 @@ def evaluate(registry: Path, candidate: Path, candidate_document: dict[str, Any]
                 receipt = validate_npm_receipt(
                     receipt_path, artifact_path, revision, release
                 )
+            elif kind in {"oci-runtime-cpu", "oci-runtime-cuda"}:
+                receipt = load_oci_runtime_receipt(
+                    receipt_path, revision=revision, release=release,
+                    artifact_path=artifact_path,
+                )
+                if receipt["flavor"] != kind.removeprefix("oci-runtime-"):
+                    raise OciRuntimeError("runtime receipt flavor differs from evidence kind")
             else:
                 raise EvidenceError(f"{label}.kind has no validator dispatch")
         except (
             OSError, CudaReceiptError, WheelReceiptError, MatrixReceiptError,
             CrateReceiptError, NpmReceiptError,
+            OciRuntimeError,
         ) as error:
             raise EvidenceError(f"{label} failed {kind} validation: {error}") from error
         if receipt["receipt_id"] != receipt_id:
@@ -318,6 +330,16 @@ def evaluate(registry: Path, candidate: Path, candidate_document: dict[str, Any]
             )
             if actual != declared or actual != qualified:
                 raise EvidenceError("npm receipt does not bind candidate archive bytes")
+        elif kind in {"oci-runtime-cpu", "oci-runtime-cuda"}:
+            identity = artifact.get("identity", {})
+            actual = (artifact_path.name, _sha256(artifact_path), artifact_path.stat().st_size)
+            declared = (artifact_path.name, identity.get("sha256"), identity.get("bytes"))
+            qualified = (
+                receipt["artifact"]["name"], receipt["artifact"]["sha256"],
+                receipt["artifact"]["bytes"],
+            )
+            if actual != declared or actual != qualified:
+                raise EvidenceError("OCI runtime receipt does not bind candidate image bytes")
         elif receipt["artifact"]["kind"] != "python-wheel":
             raise EvidenceError(f"{kind} receipt does not identify a Python wheel")
         run_id = receipt["run_id"]

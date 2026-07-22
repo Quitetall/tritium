@@ -41,6 +41,32 @@ def readiness():
     }
 
 
+def runtime_receipt(artifact: Path) -> dict:
+    import hashlib
+
+    value = {
+        "schema": "tritium.oci-runtime-qualification.v1", "release": "1.1.0-rc.0",
+        "source_revision": "a" * 40, "run_id": "cpu-1", "flavor": "cpu",
+        "image": "example@sha256:" + "b" * 64,
+        "image_id": "sha256:" + "c" * 64,
+        "image_manifest_digest": "sha256:" + "b" * 64,
+        "artifact": {"kind": "oci-image", "name": artifact.name,
+                     "bytes": artifact.stat().st_size,
+                     "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest()},
+        "manifest": {"schema": "tritium.file-identity.v1", "bytes": 42,
+                     "sha256": "2" * 64, "blake3": "c" * 64},
+        "profile": "compact-v1", "startup_receipt": readiness()["startup_receipt"],
+        "checks": list(MODULE["CHECKS"]),
+        "started_at_utc": "2026-07-21T00:00:00+00:00",
+        "timing": {"startup_ms": 10.0, "shutdown_ms": 5.0},
+        "machine": {"id": "sha256:" + "5" * 64, "system": "Linux",
+                    "architecture": "x86_64", "docker_server": "28.0.0", "gpu": None},
+        "result": "pass",
+    }
+    value["receipt_id"] = "sha256:" + hashlib.sha256(canonical(value)).hexdigest()
+    return value
+
+
 class QualifyOciRuntimeTests(unittest.TestCase):
     def test_accepts_exact_production_readiness(self):
         receipt = validate_ready(
@@ -66,21 +92,30 @@ class QualifyOciRuntimeTests(unittest.TestCase):
             self.assertEqual(path.read_bytes(), b"first\n")
 
     def test_receipt_validator_rejects_tampering(self):
-        import hashlib
+        with tempfile.TemporaryDirectory() as raw:
+            artifact = Path(raw) / "image.oci.tar"
+            artifact.write_bytes(b"qualified OCI bytes")
+            receipt = runtime_receipt(artifact)
+            validate_receipt(
+                receipt, revision="a" * 40, release="1.1.0-rc.0",
+                artifact_path=artifact,
+            )
+            receipt["run_id"] = "tampered"
+            with self.assertRaisesRegex(QualificationError, "content digest"):
+                validate_receipt(receipt)
 
-        receipt = {
-            "schema": "tritium.oci-runtime-qualification.v1", "release": "1.1.0-rc.0",
-            "source_revision": "a" * 40, "run_id": "cpu-1", "flavor": "cpu",
-            "image": "example@sha256:" + "b" * 64, "image_id": "sha256:" + "c" * 64,
-            "manifest": {}, "profile": "compact-v1", "startup_receipt": {},
-            "checks": list(MODULE["CHECKS"]), "started_at_utc": "2026-07-21T00:00:00+00:00",
-            "timing": {}, "machine": {}, "result": "pass",
-        }
-        receipt["receipt_id"] = "sha256:" + hashlib.sha256(canonical(receipt)).hexdigest()
-        validate_receipt(receipt)
-        receipt["run_id"] = "tampered"
-        with self.assertRaisesRegex(QualificationError, "content digest"):
-            validate_receipt(receipt)
+    def test_receipt_validator_rejects_cross_artifact_bytes(self):
+        with tempfile.TemporaryDirectory() as raw:
+            artifact = Path(raw) / "image.oci.tar"
+            artifact.write_bytes(b"wrong bytes")
+            receipt = runtime_receipt(artifact)
+            receipt["artifact"]["bytes"] = 4
+            receipt["artifact"]["sha256"] = "0" * 64
+            import hashlib
+            del receipt["receipt_id"]
+            receipt["receipt_id"] = "sha256:" + hashlib.sha256(canonical(receipt)).hexdigest()
+            with self.assertRaisesRegex(QualificationError, "candidate OCI bytes"):
+                validate_receipt(receipt, artifact_path=artifact)
 
 
 if __name__ == "__main__":

@@ -191,7 +191,13 @@ def validate(archive: Path, receipt_path: Path, candidate: Path) -> dict[str, An
             predicates.add(predicate)
     if not any("spdx" in value.lower() for value in predicates) or not any("slsa" in value.lower() for value in predicates):
         raise OciError("OCI archive lacks image-bound SBOM and provenance attestations")
-    return {"image_manifest_digest": image_digest, "predicates": sorted(predicates)}
+    return {
+        "image_manifest_digest": image_digest,
+        "predicates": sorted(predicates),
+        "release": receipt["release"],
+        "source_revision": receipt["source_revision"],
+        "flavor": receipt["flavor"],
+    }
 
 
 def main() -> int:
