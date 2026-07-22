@@ -381,8 +381,8 @@ that process at the deadline, so non-cooperative I/O cannot strand teardown.
 Qualification binds the
 client-task peak, wall and all per-call latencies, every response size and digest,
 the generation request/response, counter deltas and clean post-flood telemetry.
-Prometheus collector disappearance and recovery are covered by v9 below; a slow
-collector remains a separate CPU telemetry subgate.
+Prometheus collector disappearance and recovery are covered by v9 below; slow
+collector transport is covered by v11.
 
 CPU Prometheus collection now has a Kubernetes v9 disappearance/recovery gate.
 Qualification adds one randomized label to the bound ServiceMonitor selector,
@@ -402,10 +402,19 @@ requires both the pod spec and CRI `imageID` to bind the admitted repository
 digest. The offline receipt validator recomputes the accepted runtime identity
 forms and rejects tag-only, foreign-controller or mismatched-digest evidence.
 
+Slow Prometheus clients now have a Kubernetes v11 transport gate. Eight
+authenticated `/metrics` connections deliberately hold incomplete final
+headers for three seconds while a one-token generation completes through the
+same port-forward. The gate proves every connection remains pending for the
+full hold, then completes all scrapes, validates each metrics body and seals
+their sizes/digests plus ordered timing evidence. A fork-isolated 30-second
+parent deadline guarantees non-cooperative sockets cannot strand qualification.
+This qualifies bounded slow-header collectors; it does not claim an unbounded
+slowloris defense at the accept loop.
+
 1. malformed/truncated/wrong-identity artifact at startup;
 2. missing secret, invalid config and unavailable requested backend;
 3. latched backend/device loss;
-4. slow Prometheus collector;
 
 Every scenario records configuration, source/image/chart/artifact digests,
 hardware, requests, expected/observed state transitions, telemetry assertions,

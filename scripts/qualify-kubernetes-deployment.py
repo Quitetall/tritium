@@ -34,7 +34,7 @@ manifest_identity = RUNTIME["manifest_identity"]
 OCI_ARCHIVE = runpy.run_path(Path(__file__).with_name("verify-oci-archive.py"))
 validate_oci_archive = OCI_ARCHIVE["validate"]
 
-SCHEMA = "tritium.kubernetes-deployment-qualification.v10"
+SCHEMA = "tritium.kubernetes-deployment-qualification.v11"
 HEX = frozenset("0123456789abcdef")
 SAFE_NAME = re.compile(r"[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?")
 SAFE_SECRET_KEY = re.compile(r"[A-Za-z0-9](?:[-._A-Za-z0-9]{0,251}[A-Za-z0-9])?")
@@ -79,6 +79,9 @@ METRICS_FLOOD_CONCURRENCY = 8
 METRICS_FLOOD_BUDGET_MS = 60_000
 METRICS_FLOOD_MAX_RESPONSE_BYTES = 1024 * 1024
 COLLECTOR_OUTAGE_BUDGET_MS = 120_000
+SLOW_COLLECTOR_CONNECTIONS = 8
+SLOW_COLLECTOR_HOLD_MS = 3_000
+SLOW_COLLECTOR_BUDGET_MS = 30_000
 QUALIFICATION_METRICS = {
     "tritium_chat_requests_total", "tritium_tokens_out_total",
     "tritium_worker_alive", "tritium_backend_faults_total",
@@ -141,7 +144,8 @@ def expected_watchdog_policy(port: int) -> dict[str, Any]:
 
 def expected_checks(flavor: str) -> list[str]:
     return [*CHECKS, *(
-        ["keda-scale-signal", "prometheus-collector-recovery"]
+        ["keda-scale-signal", "prometheus-collector-recovery",
+         "slow-prometheus-collector"]
         if flavor == "cpu" else []
     )]
 
@@ -1738,6 +1742,166 @@ def qualify_metrics_scrape_flood(base_url: str, token: str, *, model_id: str,
     return payload
 
 
+def _slow_http_response(connection: Any, timeout: float) -> bytes:
+    connection.settimeout(timeout)
+    payload = bytearray()
+    while True:
+        chunk = connection.recv(64 * 1024)
+        if not chunk:
+            break
+        payload.extend(chunk)
+        if len(payload) > METRICS_FLOOD_MAX_RESPONSE_BYTES:
+            raise DeploymentError("slow collector response exceeds byte limit")
+    marker = payload.find(b"\r\n\r\n")
+    if marker < 0 or not payload.startswith(b"HTTP/1.1 200 "):
+        raise DeploymentError("slow collector HTTP response differs")
+    return bytes(payload[marker + 4:])
+
+
+def _qualify_slow_collector(base_url: str, token: str, *, model_id: str,
+                            prompt: str, request_timeout: float) -> dict[str, Any]:
+    import socket
+
+    began = time.monotonic()
+    deadline = began + SLOW_COLLECTOR_BUDGET_MS / 1000
+
+    def remaining() -> float:
+        value = deadline - time.monotonic()
+        if value <= 0:
+            raise DeploymentError("slow collector wall deadline expired")
+        return min(request_timeout, value)
+
+    parsed = urllib.parse.urlparse(base_url)
+    if parsed.scheme != "http" or parsed.hostname != "127.0.0.1" or parsed.port is None:
+        raise DeploymentError("slow collector requires loopback HTTP port-forward")
+    prefix = (
+        f"GET /metrics HTTP/1.1\r\nHost: {parsed.hostname}:{parsed.port}\r\n"
+        f"Authorization: Bearer {token}\r\nConnection: close\r\n"
+        "X-Tritium-Slow-Collector: "
+    ).encode()
+    connections = []
+    responses = []
+    transitions = []
+
+    def record(state: str) -> None:
+        transitions.append({"state": state,
+                            "elapsed_ms": (time.monotonic() - began) * 1000})
+
+    try:
+        for _ in range(SLOW_COLLECTOR_CONNECTIONS):
+            connection = socket.create_connection(
+                (parsed.hostname, parsed.port), timeout=remaining()
+            )
+            connection.sendall(prefix)
+            connections.append(connection)
+        hold_started = time.monotonic()
+        record("partial_headers_open")
+        generation_began = time.monotonic()
+        generation = request_json(
+            base_url + "/v1/chat/completions", token,
+            body={"model": model_id,
+                  "messages": [{"role": "user", "content": prompt}],
+                  "temperature": 0, "max_tokens": 1},
+            timeout=remaining(),
+        )
+        generation_latency_ms = (time.monotonic() - generation_began) * 1000
+        if not isinstance(generation.get("choices"), list) or len(generation["choices"]) != 1:
+            raise DeploymentError("slow collector blocked bounded generation")
+        record("generation_complete")
+        hold_deadline = hold_started + SLOW_COLLECTOR_HOLD_MS / 1000
+        while time.monotonic() < hold_deadline:
+            time.sleep(min(0.05, hold_deadline - time.monotonic()))
+        for connection in connections:
+            connection.setblocking(False)
+            try:
+                peek = connection.recv(1, socket.MSG_PEEK)
+            except BlockingIOError:
+                peek = None
+            finally:
+                connection.setblocking(True)
+            if peek is not None:
+                raise DeploymentError("slow collector connection closed or responded early")
+        record("hold_complete")
+        for connection in connections:
+            connection.sendall(b"qualified\r\n\r\n")
+        for connection in connections:
+            payload = _slow_http_response(connection, remaining())
+            metrics_snapshot(payload.decode("utf-8"))
+            responses.append({
+                "bytes": len(payload), "sha256": hashlib.sha256(payload).hexdigest(),
+            })
+        record("scrapes_complete")
+    finally:
+        for connection in connections:
+            connection.close()
+    duration_ms = (time.monotonic() - began) * 1000
+    if duration_ms > SLOW_COLLECTOR_BUDGET_MS:
+        raise DeploymentError("slow collector wall deadline expired")
+    return {
+        "endpoint": "/metrics", "authentication": "bearer",
+        "connections": SLOW_COLLECTOR_CONNECTIONS,
+        "hold_ms": SLOW_COLLECTOR_HOLD_MS, "budget_ms": SLOW_COLLECTOR_BUDGET_MS,
+        "duration_ms": duration_ms, "generation_latency_ms": generation_latency_ms,
+        "generation_response_sha256": hashlib.sha256(canonical(generation)).hexdigest(),
+        "request": request_evidence(model_id, prompt, temperature=0, max_tokens=1),
+        "response_bytes": [item["bytes"] for item in responses],
+        "response_sha256s": [item["sha256"] for item in responses],
+        "transitions": transitions,
+    }
+
+
+def _slow_collector_process(connection: Any, base_url: str, token: str,
+                            model_id: str, prompt: str, request_timeout: float) -> None:
+    try:
+        connection.send((True, _qualify_slow_collector(
+            base_url, token, model_id=model_id, prompt=prompt,
+            request_timeout=request_timeout,
+        )))
+    except BaseException as error:
+        connection.send((False, f"{type(error).__name__}: {error}"))
+    finally:
+        connection.close()
+
+
+def qualify_slow_collector(base_url: str, token: str, *, model_id: str,
+                           prompt: str, request_timeout: float,
+                           qualification_started: float) -> dict[str, Any]:
+    started_elapsed_ms = (time.monotonic() - qualification_started) * 1000
+    if started_elapsed_ms <= 0:
+        raise DeploymentError("slow collector run-relative start differs")
+    try:
+        context = multiprocessing.get_context("fork")
+    except ValueError as error:
+        raise DeploymentError("slow collector requires Linux fork isolation") from error
+    receive, send = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_slow_collector_process,
+        args=(send, base_url, token, model_id, prompt, request_timeout), daemon=True,
+    )
+    process.start()
+    send.close()
+    process.join(SLOW_COLLECTOR_BUDGET_MS / 1000)
+    if process.is_alive():
+        process.terminate()
+        process.join(1)
+        if process.is_alive():
+            process.kill()
+            process.join(1)
+        receive.close()
+        raise DeploymentError("slow collector wall deadline expired")
+    if process.exitcode != 0 or not receive.poll():
+        receive.close()
+        raise DeploymentError("slow collector worker exited without evidence")
+    passed, payload = receive.recv()
+    receive.close()
+    if passed is not True or not isinstance(payload, dict):
+        raise DeploymentError(f"slow collector worker failed: {payload}")
+    return {
+        **payload, "started_elapsed_ms": started_elapsed_ms,
+        "completed_elapsed_ms": (time.monotonic() - qualification_started) * 1000,
+    }
+
+
 def validate_metrics_evidence(value: Any, label: str) -> dict[str, float]:
     descriptor = f"{label} metrics" if label else "metrics"
     if not isinstance(value, dict) or set(value) != {"sha256", "values"}:
@@ -1834,6 +1998,86 @@ def validate_metrics_flood(value: Any, *, model_id: str) -> dict[str, Any]:
             or final["tritium_tokens_out_total"]
             < baseline["tritium_tokens_out_total"] + 1):
         raise DeploymentError("deployment metrics-flood counters did not advance")
+    return value
+
+
+def validate_slow_collector(value: Any, *, model_id: str,
+                            run_duration_ms: float) -> dict[str, Any]:
+    fields = {
+        "endpoint", "authentication", "connections", "hold_ms", "budget_ms",
+        "duration_ms", "generation_latency_ms", "generation_response_sha256",
+        "request", "response_bytes", "response_sha256s", "transitions",
+        "started_elapsed_ms", "completed_elapsed_ms",
+    }
+    if (not isinstance(value, dict) or set(value) != fields
+            or value.get("endpoint") != "/metrics"
+            or value.get("authentication") != "bearer"
+            or value.get("connections") != SLOW_COLLECTOR_CONNECTIONS
+            or value.get("hold_ms") != SLOW_COLLECTOR_HOLD_MS
+            or value.get("budget_ms") != SLOW_COLLECTOR_BUDGET_MS
+            or any(type(value.get(key)) not in {int, float}
+                   or not math.isfinite(value[key]) or value[key] <= 0
+                   for key in ("duration_ms", "generation_latency_ms",
+                               "started_elapsed_ms", "completed_elapsed_ms"))
+            or not SLOW_COLLECTOR_HOLD_MS <= value["duration_ms"]
+            <= min(SLOW_COLLECTOR_BUDGET_MS, run_duration_ms)
+            or value["generation_latency_ms"] > value["duration_ms"]
+            or not value["started_elapsed_ms"] < value["completed_elapsed_ms"]
+            <= run_duration_ms
+            or value["completed_elapsed_ms"] - value["started_elapsed_ms"]
+            < value["duration_ms"]):
+        raise DeploymentError("deployment slow-collector bounds differ")
+    sizes = value.get("response_bytes")
+    hashes = value.get("response_sha256s")
+    if (not isinstance(sizes, list) or len(sizes) != SLOW_COLLECTOR_CONNECTIONS
+            or any(type(size) is not int or not 0 < size <= METRICS_FLOOD_MAX_RESPONSE_BYTES
+                   for size in sizes)
+            or not isinstance(hashes, list) or len(hashes) != SLOW_COLLECTOR_CONNECTIONS):
+        raise DeploymentError("deployment slow-collector responses differ")
+    for digest in hashes:
+        exact_hex(digest, 64, "slow-collector response SHA-256")
+    exact_hex(value.get("generation_response_sha256"), 64,
+              "slow-collector generation response SHA-256")
+    request_value = value.get("request")
+    request_fields = {
+        "model", "prompt_sha256", "prompt_bytes", "temperature", "max_tokens",
+        "descriptor_sha256",
+    }
+    if (not isinstance(request_value, dict) or set(request_value) != request_fields
+            or request_value.get("model") != model_id
+            or type(request_value.get("prompt_bytes")) is not int
+            or not 0 < request_value["prompt_bytes"] <= 1024 * 1024
+            or type(request_value.get("temperature")) is not int
+            or request_value["temperature"] != 0
+            or type(request_value.get("max_tokens")) is not int
+            or request_value["max_tokens"] != 1):
+        raise DeploymentError("deployment slow-collector request differs")
+    descriptor = {
+        key: request_value[key] for key in request_fields - {"descriptor_sha256"}
+    }
+    exact_hex(request_value.get("prompt_sha256"), 64, "slow-collector prompt SHA-256")
+    if request_value["descriptor_sha256"] != hashlib.sha256(canonical(descriptor)).hexdigest():
+        raise DeploymentError("deployment slow-collector request descriptor differs")
+    transitions = value.get("transitions")
+    expected = [
+        "partial_headers_open", "generation_complete", "hold_complete",
+        "scrapes_complete",
+    ]
+    if (not isinstance(transitions, list) or len(transitions) != len(expected)
+            or [item.get("state") if isinstance(item, dict) else None
+                for item in transitions] != expected):
+        raise DeploymentError("deployment slow-collector transitions differ")
+    elapsed = []
+    for item in transitions:
+        if (set(item) != {"state", "elapsed_ms"}
+                or type(item.get("elapsed_ms")) not in {int, float}
+                or not math.isfinite(item["elapsed_ms"]) or item["elapsed_ms"] < 0):
+            raise DeploymentError("deployment slow-collector transition is malformed")
+        elapsed.append(item["elapsed_ms"])
+    if (elapsed != sorted(elapsed)
+            or elapsed[2] - elapsed[0] < SLOW_COLLECTOR_HOLD_MS
+            or elapsed[-1] > value["duration_ms"]):
+        raise DeploymentError("deployment slow-collector transition causality differs")
     return value
 
 
@@ -2880,6 +3124,7 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
                             "--address", "127.0.0.1"],
             time.monotonic() + args.timeout, url, token,
         )
+        slow_collector = None
         try:
             startup = validate_ready(
                 ready, revision, args.flavor, args.profile, manifest_id["blake3"], args.release
@@ -2909,6 +3154,12 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
                 url, token, model_id=model_id, prompt=args.prompt,
                 request_timeout=args.request_timeout,
             )
+            if args.flavor == "cpu":
+                slow_collector = qualify_slow_collector(
+                    url, token, model_id=model_id, prompt=args.prompt,
+                    request_timeout=args.request_timeout,
+                    qualification_started=started,
+                )
         finally:
             stop_forward(process)
         scale = None
@@ -3482,6 +3733,7 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
                      "rollback_runtime": rollback_runtime,
                      "metrics": metric_evidence, "restart_recovery": restart_recovery,
                      "metrics_scrape_flood": metrics_flood,
+                     "slow_collector": slow_collector,
                      "collector_outage": collector_outage,
                      "scale": scale, "helm_history": history,
                      "prior_helm_revision": prior_revision,
@@ -3618,7 +3870,7 @@ def validate_receipt(receipt: dict[str, Any], *, chart_path: Path, image_path: P
         "update_strategy", "update_config", "rollback_startup_receipt",
         "rollback_runtime", "metrics",
         "restart_recovery", "scale", "helm_history",
-        "metrics_scrape_flood",
+        "metrics_scrape_flood", "slow_collector",
         "collector_outage",
         "prior_helm_revision", "failed_manifest_sha256", "failed_image_digest",
         "failed_upgrade_output_sha256",
@@ -4069,14 +4321,19 @@ def validate_receipt(receipt: dict[str, Any], *, chart_path: Path, image_path: P
         workload.get("metrics_scrape_flood"), model_id=workload["model_id"]
     )
     if receipt["flavor"] == "cpu":
+        validate_slow_collector(
+            workload.get("slow_collector"), model_id=workload["model_id"],
+            run_duration_ms=receipt["duration_ms"],
+        )
         validate_collector_outage(
             workload.get("collector_outage"), release_name=workload["release_name"],
             model_id=workload["model_id"],
             startup_receipt=workload["startup_receipt"],
             run_duration_ms=receipt["duration_ms"],
         )
-    elif workload.get("collector_outage") is not None:
-        raise DeploymentError("CUDA deployment cannot contain collector-outage evidence")
+    elif (workload.get("collector_outage") is not None
+          or workload.get("slow_collector") is not None):
+        raise DeploymentError("CUDA deployment cannot contain CPU collector evidence")
     recovery = workload.get("restart_recovery")
     if not isinstance(recovery, dict) or set(recovery) != {
         "generation_response_sha256", "metrics"

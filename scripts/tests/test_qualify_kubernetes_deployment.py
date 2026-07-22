@@ -44,6 +44,8 @@ resource_usage_sample = MODULE["resource_usage_sample"]
 request_evidence = MODULE["request_evidence"]
 qualify_metrics_scrape_flood = MODULE["qualify_metrics_scrape_flood"]
 validate_metrics_flood = MODULE["validate_metrics_flood"]
+qualify_slow_collector = MODULE["qualify_slow_collector"]
+validate_slow_collector = MODULE["validate_slow_collector"]
 prometheus_target_absence = MODULE["prometheus_target_absence"]
 qualify_collector_outage = MODULE["qualify_collector_outage"]
 collect_rollback_runtime = MODULE["collect_rollback_runtime"]
@@ -92,7 +94,7 @@ def receipt(chart: Path, image_archive: Path, candidate: Path,
         "schema": MODULE["SCHEMA"], "release": "1.1.0-rc.0",
         "source_revision": "a" * 40, "run_id": f"kubernetes-{flavor}-1",
         "flavor": flavor, "profile": "compact-v1",
-        "started_at_utc": "2026-07-21T12:00:00+00:00", "duration_ms": 100.0,
+        "started_at_utc": "2026-07-21T12:00:00+00:00", "duration_ms": 10_000.0,
         "chart_artifact": {"kind": "helm-chart", "name": chart.name,
                            "bytes": chart.stat().st_size,
                            "sha256": hashlib.sha256(chart.read_bytes()).hexdigest(),
@@ -369,6 +371,25 @@ def receipt(chart: Path, image_archive: Path, candidate: Path,
                     "tritium_backend_faulted": 0.0,
                 }},
             },
+            "slow_collector": ({
+                "endpoint": "/metrics", "authentication": "bearer",
+                "connections": 8, "hold_ms": 3000, "budget_ms": 30000,
+                "duration_ms": 4000.0, "generation_latency_ms": 500.0,
+                "started_elapsed_ms": 1000.0, "completed_elapsed_ms": 5100.0,
+                "generation_response_sha256": "9" * 64,
+                "request": request_evidence(
+                    "tritium", "Hello", temperature=0, max_tokens=1
+                ),
+                "response_bytes": [1024] * 8,
+                "response_sha256s": [f"{index + 20:064x}" for index in range(8)],
+                "transitions": [
+                    {"state": state, "elapsed_ms": elapsed}
+                    for state, elapsed in zip((
+                        "partial_headers_open", "generation_complete",
+                        "hold_complete", "scrapes_complete",
+                    ), (100.0, 600.0, 3100.0, 3900.0), strict=True)
+                ],
+            } if flavor == "cpu" else None),
             "collector_outage": ({
                 "service_monitor_name": "qualification-tritium",
                 "service_monitor_uid": "monitor-uid", "service_uid": "service-uid",
@@ -646,6 +667,70 @@ class QualifyKubernetesDeploymentTests(unittest.TestCase):
                 prompt="Hello", request_timeout=5,
             )
         self.assertLess(time.monotonic() - began, 0.5)
+
+    def test_slow_collector_has_absolute_process_deadline(self):
+        def stalled(*_args, **_kwargs):
+            __import__("threading").Event().wait()
+
+        began = time.monotonic()
+        with mock.patch.dict(qualify_slow_collector.__globals__, {
+            "SLOW_COLLECTOR_BUDGET_MS": 50,
+            "_qualify_slow_collector": stalled,
+        }), self.assertRaisesRegex(DeploymentError, "wall deadline"):
+            qualify_slow_collector(
+                "http://127.0.0.1:8080", "token", model_id="tritium",
+                prompt="Hello", request_timeout=5,
+                qualification_started=time.monotonic() - 0.01,
+            )
+        self.assertLess(time.monotonic() - began, 0.5)
+
+    def test_slow_collector_validator_binds_hold_and_transition_causality(self):
+        value = {
+            "endpoint": "/metrics", "authentication": "bearer",
+            "connections": 8, "hold_ms": 3000, "budget_ms": 30000,
+            "duration_ms": 4000.0, "generation_latency_ms": 500.0,
+            "started_elapsed_ms": 1000.0, "completed_elapsed_ms": 5100.0,
+            "generation_response_sha256": "9" * 64,
+            "request": request_evidence(
+                "tritium", "Hello", temperature=0, max_tokens=1
+            ),
+            "response_bytes": [1024] * 8,
+            "response_sha256s": [f"{index + 20:064x}" for index in range(8)],
+            "transitions": [
+                {"state": state, "elapsed_ms": elapsed}
+                for state, elapsed in zip((
+                    "partial_headers_open", "generation_complete",
+                    "hold_complete", "scrapes_complete",
+                ), (100.0, 600.0, 3100.0, 3900.0), strict=True)
+            ],
+        }
+        self.assertEqual(validate_slow_collector(
+            value, model_id="tritium", run_duration_ms=6000.0
+        ), value)
+        value["transitions"][2]["elapsed_ms"] = 3099.0
+        with self.assertRaisesRegex(DeploymentError, "transition causality"):
+            validate_slow_collector(
+                value, model_id="tritium", run_duration_ms=6000.0
+            )
+        value["transitions"][2]["elapsed_ms"] = 3100.0
+        value["completed_elapsed_ms"] = 6001.0
+        with self.assertRaisesRegex(DeploymentError, "bounds differ"):
+            validate_slow_collector(
+                value, model_id="tritium", run_duration_ms=6000.0
+            )
+        value["completed_elapsed_ms"] = 5100.0
+        value["request"]["temperature"] = False
+        descriptor = {
+            key: value["request"][key]
+            for key in value["request"] if key != "descriptor_sha256"
+        }
+        value["request"]["descriptor_sha256"] = hashlib.sha256(
+            canonical(descriptor)
+        ).hexdigest()
+        with self.assertRaisesRegex(DeploymentError, "request differs"):
+            validate_slow_collector(
+                value, model_id="tritium", run_duration_ms=6000.0
+            )
 
     def test_deployment_update_identity_binds_exact_rate_limit_delta(self):
         document = {
