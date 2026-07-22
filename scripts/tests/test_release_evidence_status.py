@@ -326,6 +326,44 @@ class ReleaseEvidenceStatusTests(unittest.TestCase):
                 receipt_path.resolve(), "a" * 40, "1.1.0-rc.0", candidate
             )
 
+            receipt["tracks"] = receipt["tracks"] * 3
+            quality_path = evidence_root / "quality.json"
+            tasks_path = evidence_root / "tasks.json"
+            quality_path.write_bytes(b"{}\n")
+            tasks_path.write_bytes(b"{}\n")
+            quality = {
+                "receipt_id": "sha256:" + "6" * 64,
+                "run_id": "qwen-quality-1", "artifact": receipt["tracks"][2]["artifact"],
+            }
+            tasks = {
+                "receipt_id": "sha256:" + "7" * 64,
+                "run_id": "qwen-tasks-1", "artifact": receipt["tracks"][2]["artifact"],
+            }
+            quality_entry = entry(
+                quality_path, quality, kind="quality", parents=[receipt["receipt_id"]]
+            )
+            quality_entry["artifact_id"] = "qwen-near"
+            tasks_entry = entry(
+                tasks_path, tasks, kind="task-retention",
+                parents=[receipt["receipt_id"]],
+            )
+            tasks_entry["artifact_id"] = "qwen-near"
+            registry(
+                registry_path, candidate, [receipt_entry, quality_entry, tasks_entry]
+            )
+            validators = {
+                "validate_flagship_conversion": mock.Mock(return_value=receipt),
+                "validate_flagship_quality": mock.Mock(return_value=quality),
+                "validate_flagship_tasks": mock.Mock(return_value=tasks),
+            }
+            with mock.patch.dict(evaluate.__globals__, validators):
+                report = evaluate(registry_path, candidate, document)
+            flagship = next(row for row in report["rows"] if row["id"] == "flagship-qwen")
+            self.assertEqual(
+                flagship["satisfied_kinds"],
+                ["conversion-refinement", "quality", "task-retention"],
+            )
+
     def test_zoo_community_requires_evidence_ancestry_and_candidate_artifacts(self):
         with tempfile.TemporaryDirectory() as raw:
             candidate, document, artifact, evidence_root = release_fixture(Path(raw))

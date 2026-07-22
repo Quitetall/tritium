@@ -71,6 +71,12 @@ FLAGSHIP_RECEIPT = runpy.run_path(
 )
 validate_flagship_conversion = FLAGSHIP_RECEIPT["validate"]
 FlagshipReceiptError = FLAGSHIP_RECEIPT["FlagshipReceiptError"]
+FLAGSHIP_QUALITY_RECEIPT = runpy.run_path(
+    Path(__file__).with_name("verify-flagship-quality-receipt.py")
+)
+validate_flagship_quality = FLAGSHIP_QUALITY_RECEIPT["validate_quality"]
+validate_flagship_tasks = FLAGSHIP_QUALITY_RECEIPT["validate_tasks"]
+FlagshipQualityError = FLAGSHIP_QUALITY_RECEIPT["FlagshipQualityError"]
 
 SCHEMA = "tritium.release-evidence-registry.v1"
 REPORT_SCHEMA = "tritium.release-gate-report.v1"
@@ -95,6 +101,8 @@ KNOWN_KINDS = frozenset(
         "generated-claims",
         "governance-docs",
         "conversion-refinement",
+        "quality",
+        "task-retention",
     }
 )
 HEX = frozenset("0123456789abcdef")
@@ -301,7 +309,9 @@ def evaluate(
             else "oci-image" if (
                 kind.startswith("oci-") or kind.startswith("serving-deployment-")
             )
-            else "model-bundle" if kind == "conversion-refinement"
+            else "model-bundle" if kind in {
+                "conversion-refinement", "quality", "task-retention"
+            }
             else "python-wheel"
         )
         if artifact.get("kind") != expected_artifact_kind:
@@ -386,6 +396,14 @@ def evaluate(
                 receipt = validate_flagship_conversion(
                     receipt_path, revision, release, candidate
                 )
+            elif kind == "quality":
+                receipt = validate_flagship_quality(
+                    receipt_path, revision, release, candidate
+                )
+            elif kind == "task-retention":
+                receipt = validate_flagship_tasks(
+                    receipt_path, revision, release, candidate
+                )
             elif kind in {"oci-runtime-cpu", "oci-runtime-cuda"}:
                 receipt = load_oci_runtime_receipt(
                     receipt_path, revision=revision, release=release,
@@ -459,6 +477,7 @@ def evaluate(
             ReproductionError,
             ZooCommunityError,
             FlagshipReceiptError,
+            FlagshipQualityError,
             ValueError,
         ) as error:
             raise EvidenceError(f"{label} failed {kind} validation: {error}") from error
@@ -576,6 +595,24 @@ def evaluate(
                 raise EvidenceError(
                     "conversion-refinement anchor is not a qualified model bundle"
                 )
+        elif kind in {"quality", "task-retention"}:
+            identity = artifact.get("identity", {})
+            actual = (
+                artifact.get("id"), artifact.get("kind"), artifact_path.name,
+                artifact_path.stat().st_size, _sha256(artifact_path),
+            )
+            qualified_artifact = receipt["artifact"]
+            qualified = (
+                qualified_artifact["id"], qualified_artifact["kind"],
+                qualified_artifact["name"], qualified_artifact["bytes"],
+                qualified_artifact["sha256"],
+            )
+            declared = (
+                artifact.get("id"), artifact.get("kind"), artifact_path.name,
+                identity.get("bytes"), identity.get("sha256"),
+            )
+            if actual != declared or actual != qualified:
+                raise EvidenceError(f"{kind} receipt does not bind candidate model bytes")
         elif kind.startswith("oci-"):
             identity = artifact.get("identity", {})
             actual = (artifact_path.name, _sha256(artifact_path), artifact_path.stat().st_size)
@@ -619,6 +656,20 @@ def evaluate(
         paths.add(logical_path)
         portable_paths.add(portable_path)
     _check_ancestry(entries)
+    conversion_ids = [
+        receipt_id for receipt_id, kind in kinds.items()
+        if kind == "conversion-refinement"
+    ]
+    for receipt_id, kind in kinds.items():
+        if kind not in {"quality", "task-retention"}:
+            continue
+        expected_parents = set(conversion_ids)
+        if len(expected_parents) != 1 or set(entries[receipt_id]["parents"]) != expected_parents:
+            raise EvidenceError(f"{kind} must have the exact conversion-refinement parent")
+        conversion = validated_receipts[next(iter(expected_parents))]
+        refined_id = conversion["tracks"][2]["artifact"]["id"]
+        if artifact_ids[receipt_id] != refined_id:
+            raise EvidenceError(f"{kind} must bind the refined candidate model bundle")
     zoo_ids = [receipt_id for receipt_id, kind in kinds.items() if kind == "model-zoo"]
     claim_ids = [
         receipt_id for receipt_id, kind in kinds.items() if kind == "generated-claims"

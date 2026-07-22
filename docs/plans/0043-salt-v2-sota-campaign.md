@@ -968,6 +968,14 @@ The following work deliberately remains open and keeps this plan in progress:
   separate Compact PTQ/NearLossless PTQ/NearLossless refined candidate bundles,
   refined-parent lineage, strict reload and repeat determinism are mandatory.
   This is validator infrastructure only; no checkpoint-scale receipt exists;
+- held-out admission now separately requires `tritium.qwen36-quality.v1` and
+  `tritium.qwen36-task-retention.v1`, exact children of that conversion receipt
+  and bound to its refined candidate bundle. The quality contract recomputes
+  50% PTQ gap closure and the <=1% refined perplexity/CI gate, requires a
+  complete preregistered matched-byte baseline inventory, and keeps near-zero,
+  additive-ternary SOTA and global-low-bit Pareto verdicts independent. The
+  task contract recomputes six individual and mean accuracy deltas and rejects
+  confidence bounds above 1.0/0.5 percentage points. No empirical receipt exists;
 - no near-zero-divergence, additive-ternary SOTA, global Pareto, or cost result
   has been earned by this implementation alone.
 
