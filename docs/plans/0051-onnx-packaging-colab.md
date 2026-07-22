@@ -250,6 +250,11 @@ the completed allowlisted candidate. `CANDIDATE_EVIDENCE_VALID` deliberately
 does not claim `LOCAL_RC_READY`; signing and aggregate release gates remain
 open. Operator workflow is documented in
 [`docs/release-candidate.md`](../release-candidate.md).
+CPU and CUDA wheel lanes now generate deterministic CycloneDX 1.6 inventories
+from each already-verified wheel. SBOM root binds exact release artifact ID,
+wheel SHA-256/bytes/platform, every RECORD-covered member digest and every
+declared `Requires-Dist`; CI uploads SBOM beside same wheel. Crate, npm, OCI,
+chart, ONNX and model-artifact SBOM lanes remain open.
 
 Set one candidate version source for Rust crates, Python metadata, npm metadata,
 CLI output, schemas, docs and user agent. `1.1.0-rc.N` archives advance during

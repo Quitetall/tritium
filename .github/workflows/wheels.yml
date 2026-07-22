@@ -33,6 +33,8 @@ on:
       - "scripts/tests/test_wheel_functional_smoke.py"
       - "scripts/build-cuda-manylinux-wheel.sh"
       - "scripts/tests/test_build_cuda_manylinux_wheel.py"
+      - "scripts/generate-wheel-sbom.py"
+      - "scripts/tests/test_generate_wheel_sbom.py"
       - "scripts/generate-colab-notebook.py"
       - "scripts/tests/test_generate_colab_notebook.py"
       - "examples/colab/tritium-smollm2-v11.ipynb"
@@ -98,6 +100,13 @@ jobs:
           --target-id ${{ matrix.platform.target_id }}
           --source-revision ${{ github.sha }}
           --receipt dist/${{ matrix.platform.target_id }}.json
+      - name: generate exact-wheel CycloneDX SBOM
+        shell: bash
+        run: >-
+          python scripts/generate-wheel-sbom.py
+          --wheel dist
+          --artifact-id tritium-torch-${{ matrix.platform.target_id }}
+          --output dist/tritium-torch-${{ matrix.platform.target_id }}.cdx.json
       - name: upload wheel artifact
         uses: actions/upload-artifact@v4
         with:
@@ -268,6 +277,12 @@ jobs:
         run: >-
           python scripts/verify-wheel.py dist-cuda
           --require-platform-tag manylinux_2_28_x86_64
+      - name: generate exact CUDA-wheel CycloneDX SBOM
+        run: >-
+          python scripts/generate-wheel-sbom.py
+          --wheel dist-cuda
+          --artifact-id tritium-torch-linux-cuda13-sm89
+          --output dist-cuda/tritium-torch-linux-cuda13-sm89.cdx.json
       - name: install pinned CUDA PyTorch and Hugging Face stack
         shell: bash
         run: |
@@ -306,5 +321,6 @@ jobs:
           name: wheel-cuda13-torch2.11-python3.13-sm89
           path: |
             dist-cuda/*.whl
+            dist-cuda/*.cdx.json
             evidence/**
           if-no-files-found: error
