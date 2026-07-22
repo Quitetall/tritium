@@ -139,6 +139,9 @@ def oci_runtime_receipt(path: Path, artifact: Path, *, flavor: str = "cpu") -> d
         "resident_bytes": 80,
         "self_test_digest": "1" * 64,
     }
+    startup_sha256 = hashlib.sha256(
+        OCI_RUNTIME_MODULE["canonical"](startup)
+    ).hexdigest()
     value = {
         "schema": OCI_RUNTIME_MODULE["SCHEMA"], "release": "1.1.0-rc.0",
         "source_revision": "a" * 40, "run_id": f"oci-{flavor}-1", "flavor": flavor,
@@ -165,9 +168,32 @@ def oci_runtime_receipt(path: Path, artifact: Path, *, flavor: str = "cpu") -> d
             "recovery_status": 200, "recovery_ms": 1,
             "recovery_timeout_ms": 60000,
         },
+        "shutdown_scenarios": [
+            {"phase": "queue", "observed_worker_phase": "decode", "queue_depth": 1,
+             "signal": "SIGTERM", "container_id": "1" * 64,
+             "image_id": "sha256:" + "3" * 64,
+             "startup_receipt_sha256": startup_sha256, "prompt_sha256": "4" * 64,
+             "prompt_bytes": 4, "prompt_repetitions": 1, "max_tokens": 32,
+             "observation_to_signal_ms": 5, "observation_budget_ms": 2000,
+             "exit_code": 0, "shutdown_ms": 10, "budget_ms": 35000},
+            {"phase": "prefill", "observed_worker_phase": "prefill", "queue_depth": 0,
+             "signal": "SIGTERM", "container_id": "2" * 64,
+             "image_id": "sha256:" + "3" * 64,
+             "startup_receipt_sha256": startup_sha256, "prompt_sha256": "5" * 64,
+             "prompt_bytes": 40, "prompt_repetitions": 256, "max_tokens": 1,
+             "observation_to_signal_ms": 5, "observation_budget_ms": 2000,
+             "exit_code": 0, "shutdown_ms": 20, "budget_ms": 35000},
+            {"phase": "decode", "observed_worker_phase": "decode", "queue_depth": 0,
+             "signal": "SIGTERM", "container_id": "3" * 64,
+             "image_id": "sha256:" + "3" * 64,
+             "startup_receipt_sha256": startup_sha256, "prompt_sha256": "4" * 64,
+             "prompt_bytes": 4, "prompt_repetitions": 1, "max_tokens": 32,
+             "observation_to_signal_ms": 5, "observation_budget_ms": 2000,
+             "exit_code": 0, "shutdown_ms": 10, "budget_ms": 35000},
+        ],
         "checks": list(OCI_RUNTIME_MODULE["CHECKS"]),
         "started_at_utc": "2026-07-21T12:00:00+00:00",
-        "timing": {"startup_ms": 100.0, "shutdown_ms": 10.0},
+        "timing": {"startup_ms": 100.0, "shutdown_ms": 20},
         "machine": {"id": "sha256:" + "5" * 64, "system": "Linux",
                     "architecture": "x86_64", "docker_server": "28.0.0",
                     "gpu": None if flavor == "cpu" else {

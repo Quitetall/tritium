@@ -287,7 +287,7 @@ image, and the runtime/deployment startup receipts must be identical.
 
 Run the exact local-RC image/chart through a sealed scenario matrix:
 
-OCI runtime qualification v3 now executes the first production failure subset
+OCI runtime qualification v4 now executes the first production failure subset
 against exact CPU/CUDA candidate images: unauthenticated and wrong-token access,
 stable malformed-JSON envelopes, deterministic per-principal `429` plus
 `Retry-After`, second-principal isolation and an exact rejection-counter delta.
@@ -307,15 +307,19 @@ SIGTERM phase qualification now has a causal runtime primitive:
 one-hot gauge across chat and tree work in both single and batched workers.
 Once drain begins, queued chat and tree jobs are rejected before model prefill;
 tree requests retain the same `503 draining` classification whether rejected
-at router admission or dequeued by the worker. Exact candidate SIGTERM receipts
-for all three phases remain required below.
+at router admission or dequeued by the worker. Runtime qualification recreates
+the same digest-pinned candidate, observes each causal phase, sends SIGTERM,
+and binds queue depth, exit code, shutdown latency and budget for queued,
+prefill and decode scenarios into the receipt. It re-observes the target phase
+immediately before signal dispatch, bounds observation-to-signal latency, and
+binds a long-prefill repetition count plus prompt/config digests so a short or
+mislabeled workload cannot satisfy the matrix.
 
 1. malformed/truncated/wrong-identity artifact at startup;
 2. missing secret, invalid config and unavailable requested backend;
-3. SIGTERM during queue, prefill and decode;
-4. worker panic/process restart, device loss/OOM and artifact volume loss;
-5. telemetry collector unavailable/slow and metrics scrape flood;
-6. failed rollout followed by digest-pinned rollback.
+3. worker panic/process restart, device loss/OOM and artifact volume loss;
+4. telemetry collector unavailable/slow and metrics scrape flood;
+5. failed rollout followed by digest-pinned rollback.
 
 Every scenario records configuration, source/image/chart/artifact digests,
 hardware, requests, expected/observed state transitions, telemetry assertions,

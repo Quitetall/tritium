@@ -136,11 +136,16 @@ class OciContractTests(unittest.TestCase):
             "principal-rate-limit",
             "queue-backpressure",
             "slow-sse-disconnect",
+            "sigterm-queue",
+            "sigterm-prefill",
+            "sigterm-decode",
             "TRITIUM_RATE_LIMIT_RPM",
             "retry-after",
             "tritium_rate_rejections_total",
             "tritium_queue_rejections_total",
             "tritium_stream_disconnects_total",
+            "tritium_worker_phase",
+            "shutdown_scenarios",
             "Compose cleanup failed",
         ):
             self.assertIn(token, script)

@@ -30,7 +30,7 @@ OCI_ARCHIVE = runpy.run_path(Path(__file__).with_name("verify-oci-archive.py"))
 validate_oci_archive = OCI_ARCHIVE["validate"]
 OciError = OCI_ARCHIVE["OciError"]
 
-SCHEMA = "tritium.oci-runtime-qualification.v3"
+SCHEMA = "tritium.oci-runtime-qualification.v4"
 HEX = frozenset("0123456789abcdef")
 MAX_JSON_RESPONSE_BYTES = 16 * 1024 * 1024
 MAX_SSE_RESPONSE_BYTES = 1024 * 1024
@@ -39,7 +39,7 @@ CHECKS = (
     "auth-required", "malformed-json", "principal-rate-limit",
     "queue-backpressure", "slow-sse-disconnect",
     "readonly-rootfs", "drop-all-capabilities", "no-new-privileges",
-    "readonly-bundle", "sigterm-drain",
+    "readonly-bundle", "sigterm-queue", "sigterm-prefill", "sigterm-decode",
 )
 REQUIRED_STARTUP = {
     "schema_version", "artifact_kind", "server_source_revision", "server_build_id",
@@ -170,6 +170,51 @@ def metric_value(base_url: str, token: str, name: str, timeout: float) -> int:
     if match is None:
         raise QualificationError(f"metrics response lacks integer {name}")
     return int(match.group(1))
+
+
+def wait_metric(
+    base_url: str, token: str, name: str, expected: int, timeout: float,
+) -> int:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            value = metric_value(base_url, token, name, min(timeout, 5.0))
+            if value == expected:
+                return value
+        except QualificationError:
+            pass
+        time.sleep(0.05)
+    raise QualificationError(f"metric {name} did not reach {expected}")
+
+
+def wait_production_ready(
+    base_url: str, token: str, timeout: float, revision: str, flavor: str,
+    profile: str, manifest_blake3: str, release: str,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            ready = request_json(base_url + "/readyz", token, timeout=min(timeout, 5.0))
+        except QualificationError:
+            time.sleep(1)
+            continue
+        return validate_ready(
+            ready, revision, flavor, profile, manifest_blake3, release
+        )
+    raise QualificationError("production readiness deadline expired")
+
+
+def terminate_container(
+    container: str, timeout: float, observed_at: float,
+) -> tuple[int, int, int]:
+    stopped = time.monotonic()
+    run(["docker", "kill", "--signal", "TERM", container])
+    observation_to_signal_ms = round((time.monotonic() - observed_at) * 1000)
+    exit_code = int(run(["docker", "wait", container], timeout=timeout))
+    shutdown_ms = round((time.monotonic() - stopped) * 1000)
+    if exit_code != 0 or shutdown_ms > round(timeout * 1000):
+        raise QualificationError("SIGTERM shutdown exceeded budget or exited unsuccessfully")
+    return exit_code, shutdown_ms, observation_to_signal_ms
 
 
 def slow_stream_attempt(
@@ -350,6 +395,88 @@ def exercise_queue_disconnects(
     return final
 
 
+def qualify_sigterm_phase(
+    *, phase: str, base_url: str, token: str, metric_token: str,
+    model_id: str, prompt: str, max_tokens: int, timeout: float,
+    shutdown_timeout: float, container: str, startup_receipt_sha256: str,
+    expected_image_id: str, prompt_repetitions: int,
+    observation_budget_ms: int,
+) -> dict[str, Any]:
+    container_image_id = run([
+        "docker", "inspect", "--format", "{{.Image}}", container,
+    ])
+    if container_image_id != expected_image_id:
+        raise QualificationError("SIGTERM container image identity differs")
+    payload = {
+        "model": model_id,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0,
+        "max_tokens": max_tokens,
+        "stream": True,
+    }
+    responses = []
+    try:
+        outcome, response = slow_stream_attempt(
+            base_url + "/v1/chat/completions", token, payload, timeout, None
+        )
+        if outcome != "accepted" or response is None:
+            raise QualificationError(f"SIGTERM {phase} request was not admitted")
+        responses.append(response)
+        wait_metric(
+            base_url, metric_token,
+            f'tritium_worker_phase{{phase="{phase if phase != "queue" else "decode"}"}}',
+            1, min(timeout, 60.0),
+        )
+        queue_depth = metric_value(
+            base_url, metric_token, "tritium_queue_depth", timeout
+        )
+        if phase == "queue":
+            outcome, response = slow_stream_attempt(
+                base_url + "/v1/chat/completions", token, payload, timeout, None
+            )
+            if outcome != "accepted" or response is None:
+                raise QualificationError("SIGTERM queue request was not admitted")
+            responses.append(response)
+            queue_depth = wait_metric(
+                base_url, metric_token, "tritium_queue_depth", 1, min(timeout, 60.0)
+            )
+        elif queue_depth != 0:
+            raise QualificationError(f"SIGTERM {phase} scenario unexpectedly queued work")
+        observed_phase = "decode" if phase == "queue" else phase
+        wait_metric(
+            base_url, metric_token,
+            f'tritium_worker_phase{{phase="{observed_phase}"}}',
+            1, min(timeout, 5.0),
+        )
+        observed_at = time.monotonic()
+        exit_code, shutdown_ms, observation_to_signal_ms = terminate_container(
+            container, shutdown_timeout, observed_at
+        )
+        if observation_to_signal_ms > observation_budget_ms:
+            raise QualificationError("phase observation-to-SIGTERM latency exceeded budget")
+        return {
+            "phase": phase,
+            "observed_worker_phase": observed_phase,
+            "queue_depth": queue_depth,
+            "signal": "SIGTERM",
+            "container_id": container,
+            "image_id": container_image_id,
+            "startup_receipt_sha256": startup_receipt_sha256,
+            "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
+            "prompt_bytes": len(prompt.encode()),
+            "prompt_repetitions": prompt_repetitions,
+            "max_tokens": max_tokens,
+            "exit_code": exit_code,
+            "shutdown_ms": shutdown_ms,
+            "budget_ms": round(shutdown_timeout * 1000),
+            "observation_to_signal_ms": observation_to_signal_ms,
+            "observation_budget_ms": observation_budget_ms,
+        }
+    finally:
+        for response in responses:
+            response.close()
+
+
 def validate_ready(value: dict[str, Any], revision: str, flavor: str,
                    profile: str, manifest_blake3: str,
                    release: str | None = None) -> dict[str, Any]:
@@ -426,6 +553,10 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
         raise QualificationError("slow reader tokens must be in [32, 4096]")
     if args.slow_reader_hold < 1 or args.disconnect_recovery_timeout <= 0:
         raise QualificationError("slow-reader hold must be >= 1s and recovery timeout positive")
+    if not 256 <= args.sigterm_prefill_repetitions <= 8192:
+        raise QualificationError("SIGTERM prefill repetitions must be in [256, 8192]")
+    if not 100 <= args.phase_signal_latency_ms <= 10000:
+        raise QualificationError("phase-to-signal latency budget must be in [100, 10000] ms")
     revision = exact_hex(args.source_revision, 40, "source revision")
     image_name, separator, image_digest = args.image.rpartition("@")
     if separator != "@" or not image_name or not image_digest.startswith("sha256:"):
@@ -477,19 +608,11 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
     started = time.monotonic()
     try:
         run(compose + ["up", "-d"], env=environment, timeout=args.startup_timeout)
-        deadline = time.monotonic() + args.startup_timeout
-        ready = None
-        while time.monotonic() < deadline:
-            try:
-                ready = request_json(f"http://127.0.0.1:{port}/readyz", token, timeout=5)
-                break
-            except QualificationError:
-                time.sleep(1)
-        if ready is None:
-            raise QualificationError("production readiness deadline expired")
-        startup = validate_ready(
-            ready, revision, args.flavor, args.profile, identity["blake3"], args.release
+        startup = wait_production_ready(
+            f"http://127.0.0.1:{port}", token, args.startup_timeout,
+            revision, args.flavor, args.profile, identity["blake3"], args.release,
         )
+        startup_receipt_sha256 = hashlib.sha256(canonical(startup)).hexdigest()
         ready_at = time.monotonic()
         _, unauthenticated_headers = request_error(
             f"http://127.0.0.1:{port}/readyz", 401, "invalid_request_error",
@@ -598,12 +721,42 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
             raise QualificationError("container lacks no-new-privileges")
         if not any(item.get("Destination") == "/models/bundle" and item.get("RW") is False for item in mounts):
             raise QualificationError("bundle mount is not read-only")
-        stopped = time.monotonic()
-        run(["docker", "kill", "--signal", "TERM", container])
-        exit_code = run(["docker", "wait", container], timeout=args.shutdown_timeout)
-        shutdown_ms = (time.monotonic() - stopped) * 1000
-        if exit_code != "0" or shutdown_ms > args.shutdown_timeout * 1000:
-            raise QualificationError("SIGTERM shutdown exceeded budget or exited unsuccessfully")
+        shutdown_scenarios = []
+        base_url = f"http://127.0.0.1:{port}"
+        for index, phase in enumerate(("queue", "prefill", "decode")):
+            if index > 0:
+                run(
+                    compose + ["up", "-d", "--force-recreate"], env=environment,
+                    timeout=args.startup_timeout,
+                )
+                restarted = wait_production_ready(
+                    base_url, token, args.startup_timeout, revision, args.flavor,
+                    args.profile, identity["blake3"], args.release,
+                )
+                if restarted != startup:
+                    raise QualificationError("restart changed startup artifact identity")
+                container = run(compose + ["ps", "-q", "tritium"], env=environment)
+            phase_prompt = args.prompt
+            if phase == "prefill":
+                phase_prompt = " ".join(
+                    args.prompt for _ in range(args.sigterm_prefill_repetitions)
+                )
+            shutdown_scenarios.append(qualify_sigterm_phase(
+                phase=phase, base_url=base_url,
+                token=replacement_token if index == 0 else token,
+                metric_token=token if index == 0 else replacement_token,
+                model_id=model_id, prompt=phase_prompt,
+                max_tokens=args.slow_reader_tokens if phase != "prefill" else 1,
+                timeout=args.request_timeout,
+                shutdown_timeout=args.shutdown_timeout, container=container,
+                startup_receipt_sha256=startup_receipt_sha256,
+                expected_image_id=inspect[0]["Id"],
+                prompt_repetitions=(
+                    args.sigterm_prefill_repetitions if phase == "prefill" else 1
+                ),
+                observation_budget_ms=args.phase_signal_latency_ms,
+            ))
+        shutdown_ms = max(item["shutdown_ms"] for item in shutdown_scenarios)
     finally:
         active_error = sys.exc_info()[0] is not None
         try:
@@ -654,6 +807,7 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
             "slow_reader_tokens": args.slow_reader_tokens,
             **queue_faults,
         },
+        "shutdown_scenarios": shutdown_scenarios,
         "checks": list(CHECKS),
         "started_at_utc": started_at_utc,
         "timing": {"startup_ms": (ready_at - started) * 1000, "shutdown_ms": shutdown_ms},
@@ -674,7 +828,7 @@ def validate_receipt(receipt: dict[str, Any], *, revision: str | None = None,
     expected = {
         "schema", "release", "source_revision", "run_id", "flavor", "image", "image_id",
         "image_manifest_digest", "artifact", "manifest", "profile", "startup_receipt",
-        "faults", "checks", "started_at_utc", "timing", "machine", "result",
+        "faults", "shutdown_scenarios", "checks", "started_at_utc", "timing", "machine", "result",
         "receipt_id",
     }
     if set(receipt) != expected or receipt.get("schema") != SCHEMA or receipt.get("result") != "pass":
@@ -787,6 +941,63 @@ def validate_receipt(receipt: dict[str, Any], *, revision: str | None = None,
             or faults["recovery_ms"] > faults["recovery_timeout_ms"]
             or faults["settled_queue_depth"] != 0 or faults["worker_alive"] != 1):
         raise QualificationError("runtime receipt queue/disconnect evidence differs")
+    shutdown_scenarios = receipt.get("shutdown_scenarios")
+    if (not isinstance(shutdown_scenarios, list) or len(shutdown_scenarios) != 3
+            or [item.get("phase") if isinstance(item, dict) else None
+                for item in shutdown_scenarios] != ["queue", "prefill", "decode"]):
+        raise QualificationError("runtime receipt SIGTERM phase ordering differs")
+    for item in shutdown_scenarios:
+        expected_fields = {
+            "phase", "observed_worker_phase", "queue_depth", "exit_code",
+            "shutdown_ms", "budget_ms", "signal", "container_id",
+            "image_id", "startup_receipt_sha256", "prompt_sha256", "prompt_bytes",
+            "prompt_repetitions", "max_tokens", "observation_to_signal_ms",
+            "observation_budget_ms",
+        }
+        if (set(item) != expected_fields
+                or item["observed_worker_phase"]
+                != ("decode" if item["phase"] == "queue" else item["phase"])
+                or type(item["queue_depth"]) is not int
+                or item["queue_depth"] != (1 if item["phase"] == "queue" else 0)
+                or item["signal"] != "SIGTERM"
+                or not isinstance(item["container_id"], str)
+                or len(item["container_id"]) != 64
+                or any(char not in HEX for char in item["container_id"])
+                or item["image_id"] != receipt["image_id"]
+                or item["startup_receipt_sha256"]
+                != hashlib.sha256(canonical(receipt["startup_receipt"])).hexdigest()
+                or not isinstance(item["prompt_sha256"], str)
+                or len(item["prompt_sha256"]) != 64
+                or any(char not in HEX for char in item["prompt_sha256"])
+                or type(item["prompt_bytes"]) is not int or item["prompt_bytes"] <= 0
+                or type(item["prompt_repetitions"]) is not int
+                or item["prompt_repetitions"] <= 0
+                or type(item["max_tokens"]) is not int or item["max_tokens"] <= 0
+                or type(item["exit_code"]) is not int or item["exit_code"] != 0
+                or type(item["shutdown_ms"]) is not int or item["shutdown_ms"] < 0
+                or type(item["budget_ms"]) is not int or item["budget_ms"] <= 0
+                or type(item["observation_to_signal_ms"]) is not int
+                or item["observation_to_signal_ms"] < 0
+                or type(item["observation_budget_ms"]) is not int
+                or item["observation_budget_ms"] <= 0
+                or item["observation_to_signal_ms"] > item["observation_budget_ms"]
+                or item["shutdown_ms"] > item["budget_ms"]):
+            raise QualificationError("runtime receipt SIGTERM evidence differs")
+    if len({item["container_id"] for item in shutdown_scenarios}) != 3:
+        raise QualificationError("runtime receipt SIGTERM containers were not recreated")
+    queue, prefill, decode = shutdown_scenarios
+    if (queue["prompt_sha256"] != decode["prompt_sha256"]
+            or queue["prompt_bytes"] != decode["prompt_bytes"]
+            or queue["max_tokens"] != decode["max_tokens"]
+            or not 32 <= queue["max_tokens"] <= 4096
+            or queue["prompt_repetitions"] != 1 or decode["prompt_repetitions"] != 1
+            or not 256 <= prefill["prompt_repetitions"] <= 8192
+            or prefill["prompt_bytes"] <= queue["prompt_bytes"]
+            or prefill["max_tokens"] != 1
+            or len({item["budget_ms"] for item in shutdown_scenarios}) != 1
+            or len({item["observation_budget_ms"] for item in shutdown_scenarios}) != 1
+            or not 100 <= queue["observation_budget_ms"] <= 10000):
+        raise QualificationError("runtime receipt SIGTERM workload matrix differs")
     try:
         timestamp = datetime.fromisoformat(
             str(receipt.get("started_at_utc")).replace("Z", "+00:00")
@@ -802,6 +1013,10 @@ def validate_receipt(receipt: dict[str, Any], *, revision: str | None = None,
         for field in ("startup_ms", "shutdown_ms")
     ):
         raise QualificationError("runtime receipt timing is malformed")
+    if timing["shutdown_ms"] != max(
+        item["shutdown_ms"] for item in shutdown_scenarios
+    ):
+        raise QualificationError("runtime receipt shutdown summary differs")
     machine = receipt.get("machine")
     machine_fields = {"id", "system", "architecture", "docker_server", "gpu"}
     if not isinstance(machine, dict) or set(machine) != machine_fields:
@@ -874,6 +1089,8 @@ def main() -> int:
     parser.add_argument("--slow-reader-tokens", type=int, default=4096)
     parser.add_argument("--slow-reader-hold", type=float, default=2.0)
     parser.add_argument("--disconnect-recovery-timeout", type=float, default=60.0)
+    parser.add_argument("--sigterm-prefill-repetitions", type=int, default=1024)
+    parser.add_argument("--phase-signal-latency-ms", type=int, default=2000)
     args = parser.parse_args()
     try:
         receipt = qualify(args)
