@@ -208,6 +208,12 @@ wheel provenance, checkpoint/RNG or host-transfer failures, inconsistent
 throughput, sub-100M or short workloads, and sub-gate scaling efficiency. No local receipt exists because
 this host has one physical GPU; validator presence is structural, not empirical
 distributed evidence.
+The corresponding producer now runs a fixed 127,943,680-parameter two-plane
+Llama under installed-only DDP and FSDP, binds the single-device comparison,
+and atomically retains all four exact rank checkpoint files. Those support
+bytes are independently contained and re-hashed during registry admission.
+Producer implementation does not change the gate status without its two-GPU
+candidate-revision result.
 
 Replace the current pre-alpha/v1.0-era narrative with tested v1.1 documentation:
 

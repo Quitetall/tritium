@@ -410,6 +410,15 @@ the bound single-device baseline. Shared-device ranks, missing modes, dirty
 source, stale artifacts, copied arithmetic or lower efficiency fail closed.
 This schema and registry dispatch are structural until a qualified two-GPU run
 produces the receipt.
+The producer runs an isolated installed-wheel worker under two-rank `torchrun`
+for each mode, benchmarks the same 127,943,680-parameter two-plane Llama against
+a rank-zero single-device baseline, profiles host transfers, exercises DDP
+rank checkpoints and FSDP distributed-checkpoint restore including RNG state,
+and atomically publishes the receipt plus all four content-bound rank checkpoint
+files. The producer refuses a dirty or mismatched checkout and fewer than two
+visible, distinct GPU UUIDs. It creates an isolated runtime, installs only the
+named candidate wheel without dependency resolution, and runs the frozen worker
+under `python -I`; worker and interpreter substitution are not release seams.
 
 ## v1.1 release gate
 

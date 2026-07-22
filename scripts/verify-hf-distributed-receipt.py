@@ -7,7 +7,7 @@ import argparse
 import hashlib
 import json
 import math
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 
@@ -30,6 +30,7 @@ TOP_FIELDS = {
     "world_size",
     "devices",
     "modes",
+    "support_artifacts",
     "result",
 }
 ARTIFACT_FIELDS = {"kind", "name", "bytes", "sha256"}
@@ -72,6 +73,7 @@ MODE_FIELDS = {
     "global_state_sha256",
     "rank_checkpoint_sha256",
 }
+SUPPORT_FIELDS = {"mode", "rank", "path", "bytes", "sha256"}
 HEX = frozenset("0123456789abcdef")
 MAX_RECEIPT_BYTES = 1024 * 1024
 
@@ -134,6 +136,26 @@ def _sha256(path: Path) -> str:
         while chunk := stream.read(1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _contained_file(root: Path, value: Any, label: str) -> Path:
+    text = _string(value, label)
+    logical = PurePosixPath(text)
+    if logical.is_absolute() or ".." in logical.parts or "\\" in text:
+        raise ReceiptError(f"{label} must be a contained POSIX path")
+    cursor = root
+    for part in logical.parts:
+        cursor /= part
+        if cursor.is_symlink():
+            raise ReceiptError(f"{label} must not traverse a symlink")
+    try:
+        resolved = cursor.resolve(strict=True)
+        resolved.relative_to(root.resolve(strict=True))
+    except (OSError, ValueError) as error:
+        raise ReceiptError(f"{label} is outside the receipt directory") from error
+    if resolved.is_symlink() or not resolved.is_file():
+        raise ReceiptError(f"{label} must name an ordinary file")
+    return resolved
 
 
 def _validate_mode(raw: Any) -> dict[str, Any]:
@@ -273,6 +295,43 @@ def validate(
     modes = [_validate_mode(raw) for raw in modes_raw]
     if [mode["name"] for mode in modes] != ["ddp", "fsdp"]:
         raise ReceiptError("distributed modes must be exactly ordered ddp,fsdp")
+    support_raw = document["support_artifacts"]
+    if not isinstance(support_raw, list) or len(support_raw) != 4:
+        raise ReceiptError("distributed receipt must bind four rank checkpoints")
+    expected_support = [(mode, rank) for mode in ("ddp", "fsdp") for rank in (0, 1)]
+    observed_support = []
+    support_digests: dict[str, list[str]] = {"ddp": [], "fsdp": []}
+    paths = set()
+    root = receipt_path.parent.resolve(strict=True)
+    for index, raw in enumerate(support_raw):
+        support = _object(raw, SUPPORT_FIELDS, f"support_artifacts[{index}]")
+        mode_name = support["mode"]
+        rank = support["rank"]
+        if mode_name not in {"ddp", "fsdp"} or rank not in {0, 1}:
+            raise ReceiptError("distributed checkpoint support mode or rank is invalid")
+        observed_support.append((mode_name, rank))
+        logical_path = _string(support["path"], f"support_artifacts[{index}].path")
+        portable_path = logical_path.casefold()
+        if portable_path in paths:
+            raise ReceiptError("distributed checkpoint support paths must be unique")
+        paths.add(portable_path)
+        path = _contained_file(root, logical_path, f"support_artifacts[{index}].path")
+        _positive_int(support["bytes"], f"support_artifacts[{index}].bytes")
+        _hex(support["sha256"], 64, f"support_artifacts[{index}].sha256")
+        if support["bytes"] != path.stat().st_size or support["sha256"] != _sha256(
+            path
+        ):
+            raise ReceiptError("distributed checkpoint support bytes changed")
+        support_digests[str(mode_name)].append("sha256:" + support["sha256"])
+    if observed_support != expected_support:
+        raise ReceiptError(
+            "distributed checkpoint support must be ordered ddp/fsdp ranks"
+        )
+    for mode in modes:
+        if support_digests[mode["name"]] != mode["rank_checkpoint_sha256"]:
+            raise ReceiptError(
+                f"{mode['name']} checkpoint digests differ from support bytes"
+            )
     if duration_ms < sum(float(mode["elapsed_ms"]) for mode in modes):
         raise ReceiptError("distributed duration is shorter than measured mode time")
     if document["result"] != "pass":

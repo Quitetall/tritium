@@ -50,7 +50,28 @@ def mode(name: str) -> dict:
     }
 
 
-def receipt(artifact: Path) -> dict:
+def receipt(artifact: Path, root: Path) -> dict:
+    support = []
+    for mode_name in ("ddp", "fsdp"):
+        for rank in (0, 1):
+            path = root / f"{mode_name}-rank-{rank}.checkpoint"
+            path.write_bytes(f"{mode_name} rank {rank} checkpoint".encode())
+            support.append(
+                {
+                    "mode": mode_name,
+                    "rank": rank,
+                    "path": path.name,
+                    "bytes": path.stat().st_size,
+                    "sha256": sha256(path),
+                }
+            )
+    modes = [mode("ddp"), mode("fsdp")]
+    for value in modes:
+        value["rank_checkpoint_sha256"] = [
+            "sha256:" + item["sha256"]
+            for item in support
+            if item["mode"] == value["name"]
+        ]
     value = {
         "schema": "tritium.hf-distributed-qualification.v1",
         "source_revision": "a" * 40,
@@ -99,7 +120,8 @@ def receipt(artifact: Path) -> dict:
                 "total_memory_bytes": 80_000_000_000,
             },
         ],
-        "modes": [mode("ddp"), mode("fsdp")],
+        "modes": modes,
+        "support_artifacts": support,
         "result": "pass",
     }
     value["receipt_id"] = "sha256:" + hashlib.sha256(canonical(value)).hexdigest()
@@ -112,7 +134,7 @@ class VerifyHfDistributedReceiptTests(unittest.TestCase):
             root = Path(raw)
             artifact = root / "tritium_torch.whl"
             artifact.write_bytes(b"candidate wheel")
-            value = receipt(artifact)
+            value = receipt(artifact, root)
             path = root / "receipt.json"
             path.write_bytes(canonical(value) + b"\n")
 
@@ -120,14 +142,19 @@ class VerifyHfDistributedReceiptTests(unittest.TestCase):
 
     def test_rejects_shared_device_missing_mode_bad_arithmetic_and_wheel_drift(self):
         mutations = (
-            "shared-device", "missing-mode", "arithmetic", "scaling", "wheel"
+            "shared-device",
+            "missing-mode",
+            "arithmetic",
+            "scaling",
+            "wheel",
+            "support",
         )
         for mutation in mutations:
             with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as raw:
                 root = Path(raw)
                 artifact = root / "tritium_torch.whl"
                 artifact.write_bytes(b"candidate wheel")
-                value = receipt(artifact)
+                value = receipt(artifact, root)
                 if mutation == "shared-device":
                     value["devices"][1]["uuid"] = value["devices"][0]["uuid"]
                 elif mutation == "missing-mode":
@@ -153,6 +180,11 @@ class VerifyHfDistributedReceiptTests(unittest.TestCase):
                 path.write_bytes(canonical(value) + b"\n")
                 if mutation == "wheel":
                     artifact.write_bytes(b"different wheel")
+                elif mutation == "support":
+                    support = root / value["support_artifacts"][0]["path"]
+                    payload = bytearray(support.read_bytes())
+                    payload[-1] ^= 1
+                    support.write_bytes(payload)
 
                 with self.assertRaises(ReceiptError):
                     validate(path, "a" * 40, "1.1.0-rc.0", artifact)

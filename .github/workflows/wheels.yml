@@ -41,6 +41,10 @@ on:
       - "examples/python/installed_qat.py"
       - "scripts/tests/test_installed_qat_tutorial.py"
       - "scripts/tests/test_hf_lifecycle.py"
+      - "scripts/qualify-hf-distributed.py"
+      - "scripts/verify-hf-distributed-receipt.py"
+      - "scripts/tests/test_qualify_hf_distributed.py"
+      - "scripts/tests/test_verify_hf_distributed_receipt.py"
       - ".github/workflows/wheels.yml"
   workflow_dispatch:
     inputs:
@@ -240,6 +244,12 @@ jobs:
           python -m unittest discover
           -s crates/tritium-py/tests
           -p test_tutorial_qat.py
+          -v
+      - name: test two-GPU qualification contracts
+        run: >-
+          python -m unittest
+          scripts.tests.test_qualify_hf_distributed
+          scripts.tests.test_verify_hf_distributed_receipt
           -v
       - name: run installed-wheel differentiable lifecycle
         run: >-

@@ -79,7 +79,23 @@ candidate wheel/model provenance, at least 100M parameters with 20 measured
 steps at sequence length 128 or greater, consistent token arithmetic, and scaling
 efficiency of at least 70% (DDP) and 55% (FSDP) against a bound single-device
 baseline. `distributed-training` registry dispatch is live, but remains
-`MISSING` until the producer and a real two-device run land.
+`MISSING` until a real two-device run lands. The producer is
+`scripts/qualify-hf-distributed.py`; it launches the installed-only worker under
+isolated two-rank `torchrun`, measures the frozen 127,943,680-parameter workload,
+restores DDP and FSDP state plus RNG, and atomically retains four rank checkpoint
+files whose bytes the registry re-hashes. It creates an isolated runtime, installs
+the exact candidate wheel with dependency resolution disabled, and invokes the
+frozen clean-revision worker with `python -I`; custom worker or interpreter
+substitution is not an admitted option.
+
+```bash
+python scripts/qualify-hf-distributed.py \
+  --artifact dist-cuda/tritium_torch-1.1.0rc0-cp39-abi3-manylinux_2_28_x86_64.whl \
+  --source-revision "$(git rev-parse HEAD)" \
+  --release 1.1.0-rc.0 \
+  --run-id two-gpu-candidate-1 \
+  --output-dir evidence/hf-distributed
+```
 
 ## Step 3 — resumable PTQ facade
 
