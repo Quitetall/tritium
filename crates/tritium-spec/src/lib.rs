@@ -117,6 +117,14 @@ pub trait TernaryBackend: Send + Sync {
     /// Stable identifier for this backend instance, e.g. `"cpu"` or `"cuda:0"`.
     fn device_id(&self) -> &str;
 
+    /// Physical device identity for release evidence and cross-process admission.
+    ///
+    /// Backends without a stronger hardware identity use [`Self::device_id`].
+    /// CUDA implementations override this with the driver-reported GPU UUID.
+    fn physical_device_id(&self) -> &str {
+        self.device_id()
+    }
+
     /// What this device can do — used by the runtime to pick a backend.
     fn capabilities(&self) -> DeviceCaps;
 

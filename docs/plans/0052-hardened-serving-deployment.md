@@ -208,6 +208,12 @@ admits CPU and CUDA runtime evidence separately and neither substitutes for the
 remaining deployment gate. No qualifying image or 27B bundle is present locally
 yet, so both empirical runtime receipts remain open.
 
+CUDA backend identity now separates logical selection (`cuda:<ordinal>`) from
+driver-reported physical identity (`cuda:<ordinal>:GPU-<uuid>`). Strict serving
+uses physical identity in startup receipts, and runtime qualification rejects a
+receipt unless that UUID matches independent `nvidia-smi` evidence. This closes
+ordinal-only substitution structurally; actual CUDA image evidence remains open.
+
 Security qualification now runs separate offline Trivy passes over exact OCI
 archive bytes: HIGH/CRITICAL vulnerability detection and unfiltered secret
 detection. Admission requires Trivy 0.69.0 or newer, a non-expired vulnerability

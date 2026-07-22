@@ -39,6 +39,18 @@ fn cuda_driver_major_parses_driver_version() {
     assert_eq!(cuda_driver_major(0), None);
 }
 
+#[test]
+fn physical_device_id_matches_nvidia_uuid_spelling() {
+    let bytes = [
+        0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+        0x88,
+    ];
+    assert_eq!(
+        format_cuda_physical_id(3, bytes),
+        "cuda:3:GPU-12345678-9abc-def0-1122-334455667788"
+    );
+}
+
 /// Deterministic xorshift f32 fill in `[lo, hi)` — no `rand` dep.
 fn seeded_f32(seed: u64, len: usize, lo: f32, hi: f32) -> Vec<f32> {
     let mut s = seed | 1;

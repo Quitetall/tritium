@@ -165,7 +165,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let bundle = std::path::Path::new(&bundle);
         let backend =
             init().map_err(|error| format!("backend `{backend_name}` failed to init: {error}"))?;
-        let physical_device = backend.device_id().to_owned();
+        let physical_device = backend.physical_device_id().to_owned();
         eprintln!(
             "tritium-serve: loading strict bundle {} profile {profile} on `{backend_name}` ({physical_device})...",
             bundle.display()

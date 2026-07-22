@@ -293,13 +293,19 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
     machine = hashlib.sha256(machine_source.encode()).hexdigest()
     gpu = None
     if args.flavor == "cuda":
-        fields = run([
+        rows = run([
             "nvidia-smi", "--query-gpu=uuid,name,driver_version",
-            "--format=csv,noheader", "--id=0",
-        ]).split(", ")
-        if len(fields) != 3 or not fields[0].startswith("GPU-"):
+            "--format=csv,noheader",
+        ]).splitlines()
+        devices = [row.split(", ", 2) for row in rows]
+        if not devices or any(len(fields) != 3 or not fields[0].startswith("GPU-")
+                              for fields in devices):
             raise QualificationError("CUDA qualification lacks physical NVIDIA identity")
-        gpu = {"uuid": fields[0], "name": fields[1], "driver_version": fields[2]}
+        startup_uuid = startup["physical_device_id"].rsplit(":", 1)[-1]
+        match = next((fields for fields in devices if fields[0] == startup_uuid), None)
+        if match is None:
+            raise QualificationError("startup receipt does not bind physical NVIDIA UUID")
+        gpu = {"uuid": match[0], "name": match[1], "driver_version": match[2]}
     receipt = {
         "schema": SCHEMA, "release": args.release, "source_revision": revision,
         "run_id": args.run_id, "flavor": args.flavor, "image": args.image,
@@ -433,6 +439,9 @@ def validate_receipt(receipt: dict[str, Any], *, revision: str | None = None,
         if (not isinstance(gpu.get("name"), str) or not gpu["name"]
                 or not isinstance(gpu.get("driver_version"), str) or not gpu["driver_version"]):
             raise QualificationError("CUDA runtime receipt GPU identity is malformed")
+        physical_device = receipt["startup_receipt"]["physical_device_id"]
+        if physical_device.rsplit(":", 1)[-1] != gpu["uuid"]:
+            raise QualificationError("runtime receipt physical NVIDIA UUID differs")
     supplied = receipt.get("receipt_id")
     if not isinstance(supplied, str) or not supplied.startswith("sha256:"):
         raise QualificationError("runtime receipt ID is malformed")

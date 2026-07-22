@@ -489,7 +489,8 @@ pub(crate) struct EmbedSegments {
 /// A CUDA execution backend bound to a single device ordinal.
 ///
 /// Construct with [`CudaBackend::new`]; it opens the context, loads the PTX module,
-/// resolves the kernel, and caches a friendly `device_id` like `"cuda:0"`. The
+/// resolves the kernel, and caches a friendly `device_id` like `"cuda:0"` plus
+/// the driver-reported physical GPU UUID. The
 /// underlying [`CudaContext`], [`CudaStream`], and [`CudaModule`] are all
 /// reference-counted (`Arc`) by `cudarc`.
 #[derive(Debug)]
@@ -681,6 +682,8 @@ pub struct CudaBackend {
     pub(super) func_attention_bwd: CudaFunction,
     /// Backend identifier, e.g. `"cuda:0"`.
     pub(super) device_id: String,
+    /// Driver-reported immutable device UUID, qualified by visible ordinal.
+    pub(super) physical_device_id: String,
     /// Human-readable device name reported by the driver, e.g. `"NVIDIA H100"`.
     pub(super) device_name: String,
     /// The device's SM arch tag (`"sm_89"` on the 4090), part of the autotune
@@ -1017,6 +1020,11 @@ impl CudaBackend {
         let device_name = ctx
             .name()
             .unwrap_or_else(|_| "unknown CUDA device".to_owned());
+        let device_uuid = ctx
+            .uuid()
+            .map_err(|e| driver_err("query CUDA device UUID", &e))?;
+        let physical_device_id =
+            format_cuda_physical_id(ordinal, device_uuid.bytes.map(|byte| byte as u8));
 
         // SM arch tag for the autotune cache key (e.g. "sm_89" on the 4090). Read the
         // device's compute capability via the driver attributes; default to the IMMA
@@ -1124,6 +1132,7 @@ impl CudaBackend {
             func_attention_fwd,
             func_attention_bwd,
             device_id: format!("cuda:{ordinal}"),
+            physical_device_id,
             device_name,
             sm_arch,
             cuda_version,
@@ -7694,6 +7703,30 @@ const IMMA_DTYPE_TAG: &str = "i2sint8";
 const IMMA_JIT_ARCH: &str = "compute_80";
 const CUDARC_BINDING_CUDA_MAJOR: u32 = 13;
 
+/// Format CUDA's 16-byte driver UUID exactly like `nvidia-smi` so receipts from
+/// inside and outside a container can bind the same physical device.
+pub(super) fn format_cuda_physical_id(ordinal: usize, bytes: [u8; 16]) -> String {
+    format!(
+        "cuda:{ordinal}:GPU-{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15],
+    )
+}
+
 /// Read the device compute capability and format it as an `sm_XY` tag for the
 /// autotune cache key. Falls back to the IMMA floor `sm_80` if the query fails (the
 /// kernel needs sm_80+ regardless, so this is the most conservative correct default).
@@ -7757,6 +7790,10 @@ pub(super) enum AddKernel {
 impl TernaryBackend for CudaBackend {
     fn device_id(&self) -> &str {
         &self.device_id
+    }
+
+    fn physical_device_id(&self) -> &str {
+        &self.physical_device_id
     }
 
     /// Opt into the downcast hook so the runner can recover `&CudaBackend` from its

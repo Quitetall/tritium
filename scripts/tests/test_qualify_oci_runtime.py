@@ -17,7 +17,7 @@ validate_receipt = MODULE["validate_receipt"]
 request_json = MODULE["request_json"]
 
 
-def readiness():
+def readiness(flavor: str = "cpu"):
     return {
         "status": "ready",
         "release_gate": "production_artifact_admitted",
@@ -33,9 +33,11 @@ def readiness():
             "config_package_id": "f" * 64,
             "profile": "compact-v1",
             "codec": "b3",
-            "backend_policy": "cpu",
-            "effective_backend": "cpu",
-            "physical_device_id": "cpu",
+            "backend_policy": flavor,
+            "effective_backend": flavor,
+            "physical_device_id": (
+                "cpu" if flavor == "cpu" else "cuda:0:GPU-physical"
+            ),
             "loaded_bundle_bytes": 100,
             "resident_bytes": 80,
             "self_test_digest": "1" * 64,
@@ -43,12 +45,12 @@ def readiness():
     }
 
 
-def runtime_receipt(artifact: Path) -> dict:
+def runtime_receipt(artifact: Path, flavor: str = "cpu") -> dict:
     import hashlib
 
     value = {
         "schema": "tritium.oci-runtime-qualification.v1", "release": "1.1.0-rc.0",
-        "source_revision": "a" * 40, "run_id": "cpu-1", "flavor": "cpu",
+        "source_revision": "a" * 40, "run_id": f"{flavor}-1", "flavor": flavor,
         "image": "example@sha256:" + "b" * 64,
         "image_id": "sha256:" + "c" * 64,
         "image_manifest_digest": "sha256:" + "b" * 64,
@@ -57,12 +59,16 @@ def runtime_receipt(artifact: Path) -> dict:
                      "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest()},
         "manifest": {"schema": "tritium.file-identity.v1", "bytes": 42,
                      "sha256": "2" * 64, "blake3": "c" * 64},
-        "profile": "compact-v1", "startup_receipt": readiness()["startup_receipt"],
+        "profile": "compact-v1", "startup_receipt": readiness(flavor)["startup_receipt"],
         "checks": list(MODULE["CHECKS"]),
         "started_at_utc": "2026-07-21T00:00:00+00:00",
         "timing": {"startup_ms": 10.0, "shutdown_ms": 5.0},
         "machine": {"id": "sha256:" + "5" * 64, "system": "Linux",
-                    "architecture": "x86_64", "docker_server": "28.0.0", "gpu": None},
+                    "architecture": "x86_64", "docker_server": "28.0.0",
+                    "gpu": None if flavor == "cpu" else {
+                        "uuid": "GPU-physical", "name": "RTX 4090",
+                        "driver_version": "610.43.03",
+                    }},
         "result": "pass",
     }
     value["receipt_id"] = "sha256:" + hashlib.sha256(canonical(value)).hexdigest()
@@ -132,6 +138,19 @@ class QualifyOciRuntimeTests(unittest.TestCase):
             del receipt["receipt_id"]
             receipt["receipt_id"] = "sha256:" + hashlib.sha256(canonical(receipt)).hexdigest()
             with self.assertRaisesRegex(QualificationError, "candidate OCI bytes"):
+                validate_receipt(receipt, artifact_path=artifact)
+
+    def test_cuda_receipt_binds_startup_to_physical_gpu_uuid(self):
+        with tempfile.TemporaryDirectory() as raw:
+            artifact = Path(raw) / "image.oci.tar"
+            artifact.write_bytes(b"qualified OCI bytes")
+            receipt = runtime_receipt(artifact, "cuda")
+            validate_receipt(receipt, artifact_path=artifact)
+            receipt["startup_receipt"]["physical_device_id"] = "cuda:0:GPU-other"
+            import hashlib
+            del receipt["receipt_id"]
+            receipt["receipt_id"] = "sha256:" + hashlib.sha256(canonical(receipt)).hexdigest()
+            with self.assertRaisesRegex(QualificationError, "physical NVIDIA UUID"):
                 validate_receipt(receipt, artifact_path=artifact)
 
 

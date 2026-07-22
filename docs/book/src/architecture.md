@@ -33,7 +33,9 @@ downcasts it to its concrete buffer via `core::any::Any`.
 
 The trait's load-bearing methods:
 
-- `device_id(&self) -> &str` — a stable identifier such as `"cpu"` or `"cuda:0"`.
+- `device_id(&self) -> &str` — stable logical identifier such as `"cpu"` or `"cuda:0"`.
+- `physical_device_id(&self) -> &str` — release-evidence identity; CUDA includes
+  driver UUID in `cuda:<ordinal>:GPU-...` form.
 - `capabilities(&self) -> DeviceCaps` — what the device can do (see below).
 - `upload_weights(packed, shape, format) -> Box<dyn DeviceBuffer>` — upload
   host-side **already-packed** weight bytes (`TQ1_0`/`TQ2_0`) and get back an

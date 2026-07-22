@@ -134,7 +134,7 @@ def oci_runtime_receipt(path: Path, artifact: Path, *, flavor: str = "cpu") -> d
         "codec": "b3",
         "backend_policy": flavor,
         "effective_backend": flavor,
-        "physical_device_id": "cpu" if flavor == "cpu" else "GPU-physical",
+        "physical_device_id": "cpu" if flavor == "cpu" else "cuda:0:GPU-physical",
         "loaded_bundle_bytes": 100,
         "resident_bytes": 80,
         "self_test_digest": "1" * 64,
