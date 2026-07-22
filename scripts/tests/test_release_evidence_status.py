@@ -20,6 +20,7 @@ gate_row = MODULE["_gate_row"]
 STATUS_MODULE = runpy.run_path(ROOT / "scripts" / "release-status")
 status_main = STATUS_MODULE["main"]
 WHEEL_MODULE = runpy.run_path(ROOT / "scripts" / "wheel-functional-smoke.py")
+MATRIX_MODULE = runpy.run_path(ROOT / "scripts" / "aggregate-wheel-smoke.py")
 
 
 def canonical(value) -> bytes:
@@ -145,6 +146,90 @@ def entry(
 
 
 class ReleaseEvidenceStatusTests(unittest.TestCase):
+    def test_complete_abi3_matrix_binds_three_candidate_wheels(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            candidate, document, old_artifact, evidence_root = release_fixture(root)
+            old_artifact.unlink()
+            document["artifacts"] = []
+            identities = {}
+            platforms = {
+                "linux-x86_64-cpu": ("linux", "x86_64", "manylinux_2_28_x86_64"),
+                "windows-x86_64-cpu": ("win32", "amd64", "win_amd64"),
+                "macos-arm64-cpu": ("darwin", "arm64", "macosx_11_0_universal2"),
+            }
+            for target, (_, _, platform_tag) in platforms.items():
+                wheel = candidate.parent / (
+                    f"tritium_torch-1.1.0rc0-cp39-abi3-{platform_tag}.whl"
+                )
+                wheel.write_bytes(target.encode())
+                identity = (wheel.name, sha256(wheel), wheel.stat().st_size)
+                identities[target] = identity
+                document["artifacts"].append(
+                    {
+                        "id": f"wheel-{target}",
+                        "kind": "python-wheel",
+                        "path": wheel.name,
+                        "identity": {"sha256": identity[1], "bytes": identity[2]},
+                        "sbom": {},
+                        "provenance": {},
+                    }
+                )
+            candidate.write_bytes(canonical(document) + b"\n")
+            cells = root / "cells"
+            cells.mkdir()
+            for target, minors in MATRIX_MODULE["VERSIONS"].items():
+                host_os, host_arch, platform_tag = platforms[target]
+                wheel_name, wheel_sha, wheel_bytes = identities[target]
+                for minor in minors:
+                    cell_id = f"{target}-cp3.{minor}"
+                    value = {
+                        "schema": MATRIX_MODULE["SCHEMA"],
+                        "cell_id": cell_id,
+                        "target_id": target,
+                        "source_revision": "a" * 40,
+                        "passed": True,
+                        "python_implementation": "CPython",
+                        "python_version": f"3.{minor}.7",
+                        "host_os": host_os,
+                        "host_arch": host_arch,
+                        "wheel": wheel_name,
+                        "sha256": wheel_sha,
+                        "bytes": wheel_bytes,
+                        "version": "1.1.0rc0",
+                        "platform_tag": platform_tag,
+                    }
+                    (cells / f"{cell_id}.json").write_bytes(canonical(value) + b"\n")
+            receipt = MATRIX_MODULE["aggregate"](
+                cells, "a" * 40, "1.1.0-rc.0", "matrix-run-1"
+            )
+            receipt_path = evidence_root / "matrix.json"
+            MATRIX_MODULE["_atomic_write"](receipt_path, receipt)
+            registry_path = evidence_root / "registry.json"
+            registry(
+                registry_path,
+                candidate,
+                [
+                    {
+                        **entry(
+                            receipt_path, receipt, kind="compatibility-matrix"
+                        ),
+                        "artifact_id": "wheel-linux-x86_64-cpu",
+                    }
+                ],
+            )
+            report = evaluate(registry_path, candidate, document)
+            packages = next(row for row in report["rows"] if row["id"] == "packages")
+            self.assertEqual(packages["satisfied_kinds"], ["compatibility-matrix"])
+            self.assertEqual(
+                packages["missing_kinds"], ["clean-install", "local-archive"]
+            )
+            (candidate.parent / identities["windows-x86_64-cpu"][0]).write_bytes(
+                b"tampered"
+            )
+            with self.assertRaisesRegex(EvidenceError, "candidate wheel bytes"):
+                evaluate(registry_path, candidate, document)
+
     def test_clean_install_receipt_advances_package_gate_without_overclaim(self):
         with tempfile.TemporaryDirectory() as raw:
             candidate, document, artifact, evidence_root = release_fixture(Path(raw))
@@ -180,7 +265,9 @@ class ReleaseEvidenceStatusTests(unittest.TestCase):
             packages = next(row for row in report["rows"] if row["id"] == "packages")
             self.assertEqual(packages["status"], "MISSING")
             self.assertEqual(packages["satisfied_kinds"], ["clean-install"])
-            self.assertEqual(packages["missing_kinds"], ["local-archive"])
+            self.assertEqual(
+                packages["missing_kinds"], ["compatibility-matrix", "local-archive"]
+            )
 
     def test_gate_status_distinguishes_pass_missing_and_structural(self):
         required = ("quality", "runtime")

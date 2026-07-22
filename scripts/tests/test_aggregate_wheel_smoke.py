@@ -11,6 +11,7 @@ assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 REVISION = "ab" * 20
+RELEASE = "1.1.0-rc.0"
 
 
 def write_matrix(root):
@@ -47,7 +48,7 @@ class AggregateWheelSmokeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             write_matrix(root)
-            receipt = MODULE.aggregate(root, REVISION)
+            receipt = MODULE.aggregate(root, REVISION, RELEASE, "run-1")
             self.assertTrue(receipt["passed"])
             self.assertEqual(receipt["target_id"], MODULE.TARGET_ID)
             self.assertEqual(len(receipt["cells"]), len(MODULE.expected_cells()))
@@ -58,7 +59,7 @@ class AggregateWheelSmokeTests(unittest.TestCase):
             write_matrix(root)
             next(root.glob("linux-x86_64-cpu-cp3.9.json")).unlink()
             with self.assertRaisesRegex(MODULE.AggregateError, "matrix mismatch"):
-                MODULE.aggregate(root, REVISION)
+                MODULE.aggregate(root, REVISION, RELEASE, "run-1")
 
     def test_forged_runtime_cell_fails(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -69,7 +70,7 @@ class AggregateWheelSmokeTests(unittest.TestCase):
             value["cell_id"] = "linux-x86_64-cpu-cp3.14"
             path.write_text(json.dumps(value), encoding="utf-8")
             with self.assertRaisesRegex(MODULE.AggregateError, "runtime-derived"):
-                MODULE.aggregate(root, REVISION)
+                MODULE.aggregate(root, REVISION, RELEASE, "run-1")
 
     def test_target_must_reuse_exact_wheel(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -80,7 +81,7 @@ class AggregateWheelSmokeTests(unittest.TestCase):
             value["sha256"] = "44" * 32
             path.write_text(json.dumps(value), encoding="utf-8")
             with self.assertRaisesRegex(MODULE.AggregateError, "one exact wheel"):
-                MODULE.aggregate(root, REVISION)
+                MODULE.aggregate(root, REVISION, RELEASE, "run-1")
 
     def test_target_revalidates_host_and_platform(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -94,7 +95,7 @@ class AggregateWheelSmokeTests(unittest.TestCase):
             value["wheel"] = "tritium_torch-1.1.0rc0-cp39-abi3-win_amd64.whl"
             path.write_text(json.dumps(value), encoding="utf-8")
             with self.assertRaisesRegex(MODULE.AggregateError, "host does not match"):
-                MODULE.aggregate(root, REVISION)
+                MODULE.aggregate(root, REVISION, RELEASE, "run-1")
 
     def test_all_targets_require_one_candidate_version(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -106,7 +107,28 @@ class AggregateWheelSmokeTests(unittest.TestCase):
                 value["wheel"] = value["wheel"].replace("1.1.0rc0", "1.1.0rc1")
                 path.write_text(json.dumps(value), encoding="utf-8")
             with self.assertRaisesRegex(MODULE.AggregateError, "one candidate version"):
-                MODULE.aggregate(root, REVISION)
+                MODULE.aggregate(root, REVISION, RELEASE, "run-1")
+
+    def test_receipt_strict_reload_rejects_identity_and_cell_drift(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            evidence = root / "evidence"
+            evidence.mkdir()
+            write_matrix(evidence)
+            receipt = MODULE.aggregate(evidence, REVISION, RELEASE, "run-1")
+            path = root / "receipt.json"
+            MODULE._atomic_write(path, receipt)
+            self.assertEqual(MODULE.validate_receipt(path, REVISION, RELEASE), receipt)
+            for mutation in ("identity", "cell"):
+                changed = json.loads(path.read_text())
+                if mutation == "identity":
+                    changed["receipt_id"] = "sha256:" + "0" * 64
+                else:
+                    changed["cells"][0]["wheel_sha256"] = "0" * 64
+                path.write_text(json.dumps(changed), encoding="utf-8")
+                with self.assertRaises(MODULE.AggregateError):
+                    MODULE.validate_receipt(path, REVISION, RELEASE)
+                MODULE._atomic_write(path, receipt)
 
 
 if __name__ == "__main__":

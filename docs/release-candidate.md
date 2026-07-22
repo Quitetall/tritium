@@ -75,6 +75,12 @@ clean-install lifecycle receipts. Each binds source/release/run/machine identity
 exact wheel bytes and frozen operation coverage. Unrecognized or self-asserted
 kinds fail closed.
 
+Python abi3 matrix qualification is separate evidence: one content-addressed,
+run-bound receipt must contain every admitted CPython/platform cell, reuse one
+exact wheel per target, and match Linux, Windows and macOS wheel identities in
+candidate manifest. Matrix evidence cannot substitute for local crate/npm/image
+archives.
+
 ```bash
 scripts/release-status \
   --candidate release/v1.1/manifest.json \
@@ -86,7 +92,8 @@ scripts/release-status \
 The ADR 0033 gate list is compiled into the status tool rather than supplied by
 the registry. Empty and partial registries therefore enumerate `MISSING` gates;
 one valid CUDA receipt cannot green the broader native-backend gate, and one
-functional wheel cannot replace complete local-archive/package-matrix evidence.
+functional wheel or compatibility matrix cannot replace complete local-archive
+evidence.
 Public activation is always `EXTERNAL_AUTH_REQUIRED` and is not inferred from
 local evidence.
 

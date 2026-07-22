@@ -16,6 +16,9 @@ CudaReceiptError = CUDA_RECEIPT["ReceiptError"]
 WHEEL_RECEIPT = runpy.run_path(Path(__file__).with_name("wheel-functional-smoke.py"))
 validate_wheel_receipt = WHEEL_RECEIPT["validate_receipt"]
 WheelReceiptError = WHEEL_RECEIPT["SmokeError"]
+MATRIX_RECEIPT = runpy.run_path(Path(__file__).with_name("aggregate-wheel-smoke.py"))
+validate_matrix_receipt = MATRIX_RECEIPT["validate_receipt"]
+MatrixReceiptError = MATRIX_RECEIPT["AggregateError"]
 
 SCHEMA = "tritium.release-evidence-registry.v1"
 REPORT_SCHEMA = "tritium.release-gate-report.v1"
@@ -23,7 +26,7 @@ TOP_FIELDS = {
     "schema", "release", "source_revision", "candidate_manifest_sha256", "receipts"
 }
 RECEIPT_FIELDS = {"id", "kind", "path", "sha256", "artifact_id", "parents"}
-KNOWN_KINDS = frozenset({"cuda-training", "clean-install"})
+KNOWN_KINDS = frozenset({"cuda-training", "clean-install", "compatibility-matrix"})
 HEX = frozenset("0123456789abcdef")
 MAX_RECEIPT_BYTES = 32 * 1024 * 1024
 
@@ -39,7 +42,7 @@ GATES = (
     ("estimators-refinement", ("estimator-validation", "refinement", "baseline-ablation")),
     ("browser", ("browser-conformance",)),
     ("onnx", ("onnx-inference",)),
-    ("packages", ("clean-install", "local-archive")),
+    ("packages", ("clean-install", "compatibility-matrix", "local-archive")),
     ("serving", ("serving-deployment",)),
     ("zoo-community", ("model-zoo", "generated-claims", "governance-docs")),
     ("reproduction-signoff", ("second-machine", "independent-review", "signature")),
@@ -210,15 +213,44 @@ def evaluate(registry: Path, candidate: Path, candidate_document: dict[str, Any]
                 receipt = validate_cuda_receipt(
                     receipt_path, revision, release, artifact_path
                 )
-            else:
+            elif kind == "clean-install":
                 receipt = validate_wheel_receipt(
                     receipt_path, revision, release, artifact_path
                 )
-        except (OSError, CudaReceiptError, WheelReceiptError) as error:
+            else:
+                receipt = validate_matrix_receipt(receipt_path, revision, release)
+        except (OSError, CudaReceiptError, WheelReceiptError, MatrixReceiptError) as error:
             raise EvidenceError(f"{label} failed {kind} validation: {error}") from error
         if receipt["receipt_id"] != receipt_id:
             raise EvidenceError(f"{label}.id does not match the receipt identity")
-        if receipt["artifact"]["kind"] != "python-wheel":
+        if kind == "compatibility-matrix":
+            candidate_wheels: set[tuple[object, object, object]] = set()
+            for item in artifacts.values():
+                if item.get("kind") != "python-wheel":
+                    continue
+                wheel_path = _contained_file(
+                    candidate.parent, item.get("path"), "candidate wheel path"
+                )
+                identity = item.get("identity", {})
+                actual = (wheel_path.name, _sha256(wheel_path), wheel_path.stat().st_size)
+                declared = (wheel_path.name, identity.get("sha256"), identity.get("bytes"))
+                if actual != declared:
+                    raise EvidenceError("candidate wheel bytes contradict candidate identity")
+                candidate_wheels.add(actual)
+            matrix_wheels = {
+                (cell["wheel"], cell["wheel_sha256"], cell["wheel_bytes"])
+                for cell in receipt["cells"]
+            }
+            if len(matrix_wheels) != 3 or not matrix_wheels.issubset(candidate_wheels):
+                raise EvidenceError("compatibility matrix does not bind three candidate wheels")
+            anchor = (
+                artifact_path.name,
+                artifact.get("identity", {}).get("sha256"),
+                artifact.get("identity", {}).get("bytes"),
+            )
+            if anchor not in matrix_wheels:
+                raise EvidenceError("compatibility matrix anchor is not a matrix wheel")
+        elif receipt["artifact"]["kind"] != "python-wheel":
             raise EvidenceError(f"{kind} receipt does not identify a Python wheel")
         run_id = receipt["run_id"]
         if run_id in run_ids:

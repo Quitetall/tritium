@@ -13,7 +13,7 @@ from pathlib import Path
 
 
 SCHEMA = "tritium.wheel-smoke.v1"
-RECEIPT_SCHEMA = "tritium.compatibility-receipt.v1"
+RECEIPT_SCHEMA = "tritium.abi3-matrix-qualification.v1"
 TARGET_ID = "python-abi3-39-plus"
 MAX_EVIDENCE_BYTES = 1024 * 1024
 VERSIONS = {
@@ -42,6 +42,14 @@ FIELDS = {
     "version",
     "platform_tag",
 }
+RECEIPT_FIELDS = {
+    "schema", "receipt_id", "target_id", "source_revision", "release",
+    "run_id", "passed", "matrix_schema", "cells",
+}
+CELL_FIELDS = {
+    "cell_id", "path", "sha256", "python_version", "target_id", "wheel",
+    "wheel_sha256", "wheel_bytes",
+}
 
 
 class AggregateError(ValueError):
@@ -62,6 +70,10 @@ def _sha256(path: Path) -> str:
         while chunk := handle.read(64 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _canonical(value: object) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
 def _load(path: Path) -> dict[str, object]:
@@ -134,9 +146,15 @@ def _validate_cell(value: dict[str, object], revision: str, path: Path) -> str:
     return cell
 
 
-def aggregate(evidence_dir: Path, revision: str) -> dict[str, object]:
+def aggregate(
+    evidence_dir: Path, revision: str, release: str, run_id: str,
+) -> dict[str, object]:
     if re.fullmatch(r"[0-9a-f]{40}", revision) is None:
         raise AggregateError("source revision must be a full lowercase Git object ID")
+    if re.fullmatch(r"1\.1\.0-rc\.(0|[1-9][0-9]*)", release) is None:
+        raise AggregateError("release must be a canonical v1.1 candidate")
+    if not run_id:
+        raise AggregateError("run id must be non-empty")
     paths = sorted(evidence_dir.glob("*.json"))
     cells: dict[str, tuple[Path, dict[str, object]]] = {}
     wheels: dict[str, tuple[object, ...]] = {}
@@ -171,18 +189,110 @@ def aggregate(evidence_dir: Path, revision: str) -> dict[str, object]:
             "path": path.name,
             "sha256": _sha256(path),
             "python_version": value["python_version"],
+            "target_id": value["target_id"],
+            "wheel": value["wheel"],
             "wheel_sha256": value["sha256"],
+            "wheel_bytes": value["bytes"],
         }
         for cell, (path, value) in sorted(cells.items())
     ]
-    return {
+    receipt: dict[str, object] = {
         "schema": RECEIPT_SCHEMA,
         "target_id": TARGET_ID,
         "source_revision": revision,
+        "release": release,
+        "run_id": run_id,
         "passed": True,
         "matrix_schema": SCHEMA,
         "cells": evidence,
     }
+    receipt["receipt_id"] = "sha256:" + hashlib.sha256(_canonical(receipt)).hexdigest()
+    return receipt
+
+
+def validate_receipt(
+    path: Path, revision: str, release: str,
+) -> dict[str, object]:
+    value = _load_receipt(path)
+    if value["schema"] != RECEIPT_SCHEMA or value["passed"] is not True:
+        raise AggregateError("compatibility receipt did not pass")
+    if value["source_revision"] != revision or value["release"] != release:
+        raise AggregateError("compatibility receipt release identity mismatch")
+    if value["target_id"] != TARGET_ID or value["matrix_schema"] != SCHEMA:
+        raise AggregateError("compatibility receipt matrix identity mismatch")
+    if not isinstance(value["run_id"], str) or not value["run_id"]:
+        raise AggregateError("compatibility receipt run id is invalid")
+    cells = value["cells"]
+    if not isinstance(cells, list) or len(cells) != len(expected_cells()):
+        raise AggregateError("compatibility receipt cell count mismatch")
+    observed: set[str] = set()
+    paths: set[str] = set()
+    portable_paths: set[str] = set()
+    target_wheels: dict[str, tuple[object, object, object]] = {}
+    for ordinal, cell in enumerate(cells):
+        if not isinstance(cell, dict) or set(cell) != CELL_FIELDS:
+            raise AggregateError(f"compatibility receipt cell {ordinal} fields mismatch")
+        cell_id = _string(cell["cell_id"], f"cells[{ordinal}].cell_id")
+        logical_path = _string(cell["path"], f"cells[{ordinal}].path")
+        portable_path = logical_path.casefold()
+        if (
+            Path(logical_path).name != logical_path
+            or "\\" in logical_path
+            or cell_id in observed
+            or logical_path in paths
+            or portable_path in portable_paths
+        ):
+            raise AggregateError("compatibility receipt has duplicate cell or path")
+        observed.add(cell_id)
+        paths.add(logical_path)
+        portable_paths.add(portable_path)
+        for field in ("sha256", "wheel_sha256"):
+            if re.fullmatch(r"[0-9a-f]{64}", str(cell[field])) is None:
+                raise AggregateError(f"compatibility receipt {field} is invalid")
+        if type(cell["wheel_bytes"]) is not int or cell["wheel_bytes"] <= 0:
+            raise AggregateError("compatibility receipt wheel byte count is invalid")
+        target = _string(cell["target_id"], f"cells[{ordinal}].target_id")
+        wheel = _string(cell["wheel"], f"cells[{ordinal}].wheel")
+        _string(cell["python_version"], f"cells[{ordinal}].python_version")
+        if target not in VERSIONS or not cell_id.startswith(f"{target}-cp3."):
+            raise AggregateError("compatibility receipt target/cell identity mismatch")
+        platform_pattern = TARGET_CONTRACTS[target][2]
+        wheel_match = re.fullmatch(
+            r"tritium_torch-(?P<version>[^-]+)-cp39-abi3-(?P<platform>[^-]+)\.whl",
+            wheel,
+        )
+        if (
+            wheel_match is None
+            or wheel_match.group("version") != release.replace("1.1.0-rc.", "1.1.0rc")
+            or re.fullmatch(platform_pattern, wheel_match.group("platform")) is None
+        ):
+            raise AggregateError("compatibility receipt wheel target/version mismatch")
+        identity = (wheel, cell["wheel_sha256"], cell["wheel_bytes"])
+        if target in target_wheels and target_wheels[target] != identity:
+            raise AggregateError("compatibility receipt target reused different wheels")
+        target_wheels[target] = identity
+    if observed != expected_cells():
+        raise AggregateError("compatibility receipt cell identities mismatch")
+    if set(target_wheels) != set(VERSIONS):
+        raise AggregateError("compatibility receipt target inventory mismatch")
+    unsigned = dict(value)
+    receipt_id = unsigned.pop("receipt_id")
+    expected_id = "sha256:" + hashlib.sha256(_canonical(unsigned)).hexdigest()
+    if receipt_id != expected_id:
+        raise AggregateError("compatibility receipt identity mismatch")
+    return value
+
+
+def _load_receipt(path: Path) -> dict[str, object]:
+    if path.is_symlink() or not path.is_file() or path.stat().st_size > MAX_EVIDENCE_BYTES:
+        raise AggregateError("compatibility receipt must be a bounded ordinary file")
+    try:
+        value = json.loads(path.read_bytes())
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise AggregateError("compatibility receipt must contain UTF-8 JSON") from error
+    if not isinstance(value, dict) or set(value) != RECEIPT_FIELDS:
+        raise AggregateError("compatibility receipt fields do not match frozen schema")
+    return value
 
 
 def _atomic_write(path: Path, document: dict[str, object]) -> None:
@@ -196,6 +306,11 @@ def _atomic_write(path: Path, document: dict[str, object]) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
     finally:
         if temporary.exists():
             temporary.unlink()
@@ -205,11 +320,16 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("evidence_dir", type=Path)
     parser.add_argument("--source-revision", required=True)
+    parser.add_argument("--release", required=True)
+    parser.add_argument("--run-id", required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     try:
-        receipt = aggregate(args.evidence_dir, args.source_revision)
+        receipt = aggregate(
+            args.evidence_dir, args.source_revision, args.release, args.run_id
+        )
         _atomic_write(args.output, receipt)
+        validate_receipt(args.output, args.source_revision, args.release)
     except (OSError, AggregateError) as error:
         parser.error(str(error))
     print(json.dumps(receipt))

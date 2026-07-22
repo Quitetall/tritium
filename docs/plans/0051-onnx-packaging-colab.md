@@ -261,6 +261,13 @@ version, independent run/machine identity, exact wheel bytes, environment,
 native device/backend and frozen QAT/checkpoint/reload coverage. Release-registry
 admission rehashes candidate wheel and receipt; this closes one clean-install
 evidence kind but does not replace full interpreter/platform matrix admission.
+
+ABI3 aggregation now emits dedicated `tritium.abi3-matrix-qualification.v1`
+evidence bound to release, source revision, workflow run, every cell-evidence
+digest and exact wheel name/SHA-256/bytes. Strict reload revalidates complete
+CPython 3.9+ Linux/Windows and available macOS arm64 matrix, target/platform
+contracts and single-wheel reuse. Release registry matches all three wheel
+identities to candidate manifest; local archive admission remains separate.
 The exact npm archive verifier now emits its own deterministic CycloneDX 1.6
 document into retained evidence. It binds archive SHA-256/bytes, package/version,
 source revision, WASM guest digest, every lockfile component with strong
