@@ -32,6 +32,7 @@ class QatHardWeight:
 
     path: str
     aliases: Tuple[str, ...]
+    storage_path: str
     shape: Tuple[int, int]
     algorithm_id: str
     planes: int
@@ -40,6 +41,7 @@ class QatHardWeight:
         return {
             "path": self.path,
             "aliases": list(self.aliases),
+            "storage_path": self.storage_path,
             "shape": list(self.shape),
             "algorithm_id": self.algorithm_id,
             "planes": self.planes,
@@ -61,6 +63,13 @@ class QatHardResult:
     mode: str = "qat-hard"
     schema_version: int = 1
 
+    def export(self, output_dir):
+        """Atomically publish this hard result as a strict state bundle."""
+
+        from .qat_artifacts import export_qat_hard
+
+        return export_qat_hard(self, output_dir)
+
 
 @dataclass(frozen=True)
 class _Consumer:
@@ -81,6 +90,33 @@ def _canonical(value: Any) -> bytes:
 
 def _digest(value: Any) -> str:
     return "sha256:" + hashlib.sha256(_canonical(value)).hexdigest()
+
+
+def _qat_hard_ids(
+    *,
+    source_checkpoint_digest: str,
+    hard_state_digest: str,
+    config: TernaryConfig,
+    source_coverage: CoverageReport,
+    weights: Tuple[QatHardWeight, ...],
+) -> Tuple[str, str]:
+    recipe_value = {
+        "schema_version": 1,
+        "mode": "qat-hard",
+        "source_checkpoint_digest": source_checkpoint_digest,
+        "config": config.to_dict(),
+        "source_coverage": source_coverage.to_dict(),
+        "weights": [receipt.to_dict() for receipt in weights],
+    }
+    recipe_id = _digest(recipe_value)
+    artifact_id = _digest(
+        {
+            **recipe_value,
+            "recipe_id": recipe_id,
+            "hard_state_digest": hard_state_digest,
+        }
+    )
+    return recipe_id, artifact_id
 
 
 def _parent_and_child(root: nn.Module, path: str):
@@ -253,6 +289,11 @@ def convert_qat_hard(prepared: PreparedModel) -> QatHardResult:
                 QatHardWeight(
                     path=group.path,
                     aliases=group.aliases,
+                    storage_path=(
+                        f"{group.consumers[0].path}._packed_weight"
+                        if group.consumers[0].path
+                        else "_packed_weight"
+                    ),
                     shape=(packed.out_features, packed.in_features),
                     algorithm_id=projection.algorithm_id,
                     planes=packed.plane_count,
@@ -300,21 +341,12 @@ def convert_qat_hard(prepared: PreparedModel) -> QatHardResult:
     model = root_replacement if root_replacement is not None else prepared.model
     model.eval()
     hard_digest = _source_model_digest(model)
-    recipe_value = {
-        "schema_version": 1,
-        "mode": "qat-hard",
-        "source_checkpoint_digest": source_digest,
-        "config": prepared.config.to_dict(),
-        "source_coverage": prepared.coverage.to_dict(),
-        "weights": [receipt.to_dict() for receipt in receipts],
-    }
-    recipe_id = _digest(recipe_value)
-    artifact_id = _digest(
-        {
-            **recipe_value,
-            "recipe_id": recipe_id,
-            "hard_state_digest": hard_digest,
-        }
+    recipe_id, artifact_id = _qat_hard_ids(
+        source_checkpoint_digest=source_digest,
+        hard_state_digest=hard_digest,
+        config=prepared.config,
+        source_coverage=prepared.coverage,
+        weights=tuple(receipts),
     )
     model._tritium_qat_hard_artifact_id = artifact_id
     model._tritium_qat_checkpoint_digest = source_digest

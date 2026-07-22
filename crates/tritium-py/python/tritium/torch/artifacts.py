@@ -8,10 +8,14 @@ import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple, Union, overload
 
 from .. import _tritium
 from .errors import TritiumError
+
+if TYPE_CHECKING:
+    from .qat import QatHardResult
+    from .qat_artifacts import QatHardArtifact
 
 _ARTIFACT_KIND_V1 = "qwen3.6-language-mtp-salt-v2-matrix-profiles"
 _ARTIFACT_KIND_V2 = "qwen3.6-language-mtp-salt-v2-model-weights"
@@ -485,13 +489,33 @@ def _manifest_bytes(result: QuantizationResult) -> bytes:
     return (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
 
 
+@overload
 def export(
     result: QuantizationResult, output_dir: Union[os.PathLike[str], str]
-) -> ExportReceipt:
-    """Verify, stage, sync, and atomically copy one complete matrix bundle."""
+) -> ExportReceipt: ...
+
+
+@overload
+def export(
+    result: "QatHardResult", output_dir: Union[os.PathLike[str], str]
+) -> "QatHardArtifact": ...
+
+
+def export(
+    result: Union[QuantizationResult, "QatHardResult"],
+    output_dir: Union[os.PathLike[str], str],
+) -> Union[ExportReceipt, "QatHardArtifact"]:
+    """Publish a typed PTQ or QAT-hard result without changing its claim."""
+
+    from .qat import QatHardResult
+
+    if isinstance(result, QatHardResult):
+        from .qat_artifacts import export_qat_hard
+
+        return export_qat_hard(result, output_dir)
 
     if not isinstance(result, QuantizationResult):
-        raise TypeError("export requires a QuantizationResult")
+        raise TypeError("export requires a QuantizationResult or QatHardResult")
     current = load(result.artifact_dir)
     if current != result:
         raise TritiumError(

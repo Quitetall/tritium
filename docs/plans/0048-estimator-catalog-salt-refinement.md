@@ -66,9 +66,14 @@ mutation, packs tied Linear/Embedding masters once and binds source-checkpoint,
 recipe and compact-state identities. Built-in hard forwards now decode exact
 stored f16 scales. TTQ's asymmetric positive/negative values are represented as
 two honest row-scale planes and therefore require `planes=2`; the prior
-per-element-scale pseudo-plane could not enter SALT. Generic QAT-hard durable
-export/reload, convolution lowering and public HF checkpoint registration remain
-open and are not relabeled as PTQ.
+per-element-scale pseudo-plane could not enter SALT. Generic QAT-hard state now
+exports through the shared `export` seam into a canonical SHA-256-ledgered
+safetensors bundle, strict-reloads evidence without a source model, or binds to
+an explicit dense/QAT shell with tied compact storage and exact hard-state
+parity. Rehashed ancestry, latent masters, estimator state, invalid B3/scales,
+unknown files, corrupt payloads and wrong shells fail closed. Convolution
+lowering and public HF checkpoint registration remain open; none are relabeled
+as PTQ.
 
 - Remove refinement from `TernaryConfig.ptq`; reject ambiguous legacy non-none
   refinement values instead of silently migrating them.
