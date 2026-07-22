@@ -83,10 +83,12 @@ admitted-generator capability, preventing artifact-A/generator-B receipt
 substitution. Production `/readyz` binds package/source/backend/
 device/byte-ledger identities and the self-test digest; legacy routers are
 explicitly labeled `legacy_compatibility` and cannot satisfy the production
-artifact gate. The remaining binding work is to construct the production
-generator from the same strict native load transaction and exercise real CPU
-and CUDA fixtures. Until that exists, the production builder is a hardened
-seam, not release-gate evidence.
+artifact gate. A dedicated `QwenGenerator` now owns that exact strict model and
+implements bounded greedy/top-k/top-p decode plus logprobs; the only public
+admission function derives both generator and receipt from the same model
+value, closing artifact/generator substitution. Main-binary schema-v3 CLI,
+tokenizer binding, and real CPU/CUDA fixtures remain open. Until those exist,
+the production builder is a hardened seam, not release-gate evidence.
 
 ## Slice 2 — request security and resource governance
 

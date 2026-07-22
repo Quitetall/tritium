@@ -9,6 +9,7 @@ use tritium_format::salt_v2::SaltV2Codec;
 use tritium_nn::Qwen35SaltV2LoadReceipt;
 
 use crate::generator::{GenRequest, Generator, Sampling, Step};
+use crate::qwen_generator::QwenGenerator;
 
 const IDENTITY_HEX_CHARS: usize = 64;
 const REVISION_HEX_CHARS: usize = 40;
@@ -121,6 +122,31 @@ impl AdmittedArtifactV1 {
             resident_bytes: receipt.resident_bytes(),
         })
     }
+}
+
+/// Bind one strict Qwen bundle and its exact load receipt into an opaque
+/// production-serving capability.
+pub fn admit_qwen36_salt_v3(
+    model: tritium_nn::Qwen35SaltV2LanguageMtpModel,
+    eos: u32,
+    server_source_revision: &str,
+    server_build_id: &str,
+    backend_policy: &str,
+    effective_backend: &str,
+    physical_device_id: &str,
+) -> Result<AdmittedGeneratorV1, StartupError> {
+    let artifact = AdmittedArtifactV1::from_qwen36_salt_v3(
+        model.receipt(),
+        server_source_revision,
+        server_build_id,
+        backend_policy,
+        effective_backend,
+        physical_device_id,
+    )?;
+    Ok(AdmittedGeneratorV1 {
+        generator: Box::new(QwenGenerator::new(model, eos)),
+        artifact,
+    })
 }
 
 /// Immutable evidence returned by a successful production startup.

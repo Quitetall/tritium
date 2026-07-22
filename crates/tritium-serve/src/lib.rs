@@ -25,6 +25,7 @@
 
 pub mod dto;
 pub mod generator;
+mod qwen_generator;
 pub mod tokenizer_passthrough;
 
 #[cfg(feature = "serve")]
@@ -44,6 +45,7 @@ pub use generator::{
     FinishReason, GenError, GenRequest, Generator, MockGenerator, RunnerGenerator, Sampling, Step,
     TreeOpError,
 };
+pub use qwen_generator::QwenGenerator;
 pub use tokenizer_passthrough::IdPassthroughTokenizer;
 
 #[cfg(feature = "serve")]
@@ -60,5 +62,5 @@ pub use router::{
 #[cfg(feature = "serve")]
 pub use startup::{
     AdmittedArtifactV1, AdmittedGeneratorV1, ProductionReadiness, StartupError, StartupReceiptV1,
-    prepare_production_generator,
+    admit_qwen36_salt_v3, prepare_production_generator,
 };
