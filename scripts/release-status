@@ -11,6 +11,7 @@ import re
 import runpy
 import subprocess
 import sys
+import tempfile
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -89,6 +90,31 @@ def _sha256(path: Path) -> str:
         while chunk := stream.read(1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _write_report(path: Path, report: dict[str, Any]) -> None:
+    if path.is_symlink():
+        raise ReleaseError("JSON output must not be a symlink")
+    parent = path.parent.resolve(strict=True)
+    if not parent.is_dir():
+        raise ReleaseError("JSON output parent must be a directory")
+    descriptor, temporary_name = tempfile.mkstemp(prefix=".release-status-", dir=parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(report, stream, indent=2, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        directory = os.open(parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
 
 
 def _identity(path: Path, tool: str) -> dict[str, Any]:
@@ -285,6 +311,8 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--candidate", type=Path, required=True)
     parser.add_argument("--digest-tool", default=os.environ.get("TRITIUM_BIN", "tritium"))
+    parser.add_argument("--registry", type=Path)
+    parser.add_argument("--json-output", type=Path)
     args = parser.parse_args()
     try:
         document = validate(args.candidate, args.digest_tool)
@@ -294,7 +322,26 @@ def main() -> int:
     except (OSError, ReleaseError) as error:
         print(f"release-status: BLOCKED: {error}", file=sys.stderr)
         return 1
-    print(f"release-status: CANDIDATE_EVIDENCE_VALID: {document['release']}")
+    if args.registry is None:
+        if args.json_output is not None:
+            print("release-status: BLOCKED: --json-output requires --registry", file=sys.stderr)
+            return 1
+        print(f"release-status: CANDIDATE_EVIDENCE_VALID: {document['release']}")
+        return 0
+    try:
+        evidence = runpy.run_path(Path(__file__).with_name("release-evidence-status.py"))
+        report = evidence["evaluate"](args.registry, args.candidate, document)
+        rendered = evidence["render"](report)
+        if args.json_output is not None:
+            _write_report(args.json_output, report)
+    except (OSError, ReleaseError, ValueError) as error:
+        print(f"release-status: BLOCKED: {error}", file=sys.stderr)
+        return 1
+    print(rendered)
+    if not report["ready"]:
+        print(f"release-status: LOCAL_RC_BLOCKED: {document['release']}", file=sys.stderr)
+        return 1
+    print(f"release-status: LOCAL_RC_READY: {document['release']}")
     return 0
 
 

@@ -65,6 +65,28 @@ Verification requires:
 - digest-bound in-toto/SLSA v1 provenance tied to artifact SHA-256, source
   revision and builder identity.
 
+## Aggregate evidence status
+
+An evidence registry lives outside the candidate directory, whose closed file
+allowlist remains unchanged. It binds the exact candidate-manifest SHA-256 and
+references only validated receipt schemas and candidate artifact IDs. The first
+admitted empirical kind is the artifact-bound CUDA fp16 training receipt;
+unrecognized or self-asserted kinds fail closed.
+
+```bash
+scripts/release-status \
+  --candidate release/v1.1/manifest.json \
+  --registry release/v1.1-evidence/registry.json \
+  --json-output release/v1.1-evidence/status.json \
+  --digest-tool target/release/tritium
+```
+
+The ADR 0033 gate list is compiled into the status tool rather than supplied by
+the registry. Empty and partial registries therefore enumerate `MISSING` gates;
+one valid CUDA receipt cannot green the broader native-backend gate. Public
+activation is always `EXTERNAL_AUTH_REQUIRED` and is not inferred from local
+evidence.
+
 Signing and aggregate release-gate admission remain open work. Never publish
 registry artifacts, push candidate tags or use maintainer signing identity
 without explicit authorization.

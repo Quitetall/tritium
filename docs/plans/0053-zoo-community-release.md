@@ -248,9 +248,13 @@ git diff --check
 ```
 
 Current `release-status` covers artifact/SBOM/provenance admission only and
-returns `CANDIDATE_EVIDENCE_VALID`. Slice 8 must extend or wrap it with every
+returns `CANDIDATE_EVIDENCE_VALID` without a registry. Its optional strict
+registry mode now binds the exact candidate, hard-codes every ADR 0033 gate,
+admits the artifact-bound CUDA training schema, emits human and JSON blocker
+reports, and refuses `LOCAL_RC_READY` for empty or partial evidence. Remaining
+receipt-kind validators and generated-claim drift checks must land before every
 model-zoo, package, browser, serving, deployment, signing and second-machine
-receipt before any `LOCAL_RC_READY` result exists.
+receipt can produce `LOCAL_RC_READY`.
 
 Target-specific model, GPU, browser, package, container and cluster commands
 are invoked by the candidate manifest and must emit admitted receipts. A skipped

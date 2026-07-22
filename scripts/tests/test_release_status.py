@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parents[2]
 MODULE = runpy.run_path(ROOT / "scripts" / "release-status")
 ReleaseError = MODULE["ReleaseError"]
 validate = MODULE["validate"]
+write_report = MODULE["_write_report"]
 
 
 def write_json(path: Path, value: object) -> str:
@@ -88,6 +89,20 @@ def fixture(root: Path) -> tuple[Path, Path, dict]:
 
 
 class ReleaseStatusTests(unittest.TestCase):
+    def test_json_report_publish_is_atomic_and_rejects_symlink(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            output = root / "status.json"
+            write_report(output, {"ready": False})
+            self.assertEqual(json.loads(output.read_text()), {"ready": False})
+            output.unlink()
+            target = root / "target.json"
+            target.write_text("unchanged", encoding="utf-8")
+            output.symlink_to(target)
+            with self.assertRaises(MODULE["ReleaseError"]):
+                write_report(output, {"ready": True})
+            self.assertEqual(target.read_text(encoding="utf-8"), "unchanged")
+
     def test_candidate_binds_artifact_sbom_and_provenance(self):
         with tempfile.TemporaryDirectory() as raw:
             candidate, tool, document = fixture(Path(raw))
