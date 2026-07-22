@@ -395,11 +395,17 @@ The receipt binds Service/ServiceMonitor identity, exact fault/restore patches,
 absence response digest, ordered timestamps, request/response, startup parity,
 telemetry and recovered target. CUDA carries `null`, never CPU evidence.
 
+Digest-pinned rollback now has a Kubernetes v10 runtime-identity gate. After
+the exact failed Helm revision and atomic rollback, qualification walks each
+ready pod through its controller ReplicaSet to the original Deployment UID and
+requires both the pod spec and CRI `imageID` to bind the admitted repository
+digest. The offline receipt validator recomputes the accepted runtime identity
+forms and rejects tag-only, foreign-controller or mismatched-digest evidence.
+
 1. malformed/truncated/wrong-identity artifact at startup;
 2. missing secret, invalid config and unavailable requested backend;
 3. latched backend/device loss;
 4. slow Prometheus collector;
-5. failed rollout followed by digest-pinned rollback.
 
 Every scenario records configuration, source/image/chart/artifact digests,
 hardware, requests, expected/observed state transitions, telemetry assertions,

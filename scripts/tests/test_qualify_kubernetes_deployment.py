@@ -46,6 +46,8 @@ qualify_metrics_scrape_flood = MODULE["qualify_metrics_scrape_flood"]
 validate_metrics_flood = MODULE["validate_metrics_flood"]
 prometheus_target_absence = MODULE["prometheus_target_absence"]
 qualify_collector_outage = MODULE["qualify_collector_outage"]
+collect_rollback_runtime = MODULE["collect_rollback_runtime"]
+validate_rollback_runtime = MODULE["validate_rollback_runtime"]
 
 
 def startup(flavor: str = "cpu") -> dict:
@@ -312,6 +314,26 @@ def receipt(chart: Path, image_archive: Path, candidate: Path,
                 "after": {"generation": 2, "rate_limit_burst": 9},
             },
             "rollback_startup_receipt": dict(startup_receipt),
+            "rollback_runtime": {
+                "image": "registry.example/tritium@sha256:" + "2" * 64,
+                "image_digest": "sha256:" + "2" * 64,
+                "deployment_name": "qualification-tritium",
+                "deployment_uid": "deployment-uid",
+                "elapsed_ms": 75.0,
+                "observed_at_utc": "2026-07-21T12:03:00+00:00",
+                "pods": [{
+                    "pod_name": "qualification-tritium-rollback",
+                    "pod_uid": "rollback-pod-uid",
+                    "replica_set_name": "qualification-tritium-abc123",
+                    "replica_set_uid": "rollback-rs-uid",
+                    "replica_set_owner": {
+                        "kind": "Deployment", "name": "qualification-tritium",
+                        "uid": "deployment-uid",
+                    },
+                    "image": "registry.example/tritium@sha256:" + "2" * 64,
+                    "image_id": "containerd://sha256:" + "2" * 64,
+                }],
+            },
             "metrics": {"sha256": "6" * 64, "values": {
                 "tritium_chat_requests_total": 1.0,
                 "tritium_tokens_out_total": 1.0,
@@ -741,6 +763,110 @@ class QualifyKubernetesDeploymentTests(unittest.TestCase):
         history[1]["status"] = "superseded"
         with self.assertRaisesRegex(DeploymentError, "failed upgrade and rollback"):
             validate_helm_history(history, 1)
+
+    def test_rollback_runtime_binds_cri_digest_and_controller_lineage(self):
+        image = "registry.example/tritium@sha256:" + "2" * 64
+        pod = {
+            "metadata": {
+                "name": "pod", "uid": "pod-uid",
+                "ownerReferences": [{
+                    "kind": "ReplicaSet", "name": "tritium-rs", "uid": "rs-uid",
+                    "controller": True,
+                }],
+            },
+            "spec": {"nodeName": "node-1", "containers": [
+                {"name": "tritium", "image": image},
+                {"name": "authenticated-probe"},
+            ]},
+            "status": {
+                "conditions": [{"type": "Ready", "status": "True"}],
+                "containerStatuses": [
+                    {"name": "tritium", "image": image,
+                     "imageID": "containerd://sha256:" + "2" * 64,
+                     "ready": True, "restartCount": 0},
+                    {"name": "authenticated-probe", "restartCount": 0},
+                ],
+            },
+        }
+        replica_set = {
+            "metadata": {
+                "name": "tritium-rs", "uid": "rs-uid",
+                "ownerReferences": [{
+                    "kind": "Deployment", "name": "tritium",
+                    "uid": "deployment-uid", "controller": True,
+                }],
+            },
+        }
+        with mock.patch.dict(collect_rollback_runtime.__globals__, {
+            "run_json": mock.Mock(side_effect=[{"items": [pod]}, replica_set]),
+        }):
+            evidence = collect_rollback_runtime(
+                ["kubectl"], selector="app=tritium", image=image,
+                deployment_name="tritium", deployment_uid="deployment-uid",
+                flavor="cpu", run_elapsed_ms=50.0,
+            )
+        self.assertEqual(evidence["image_digest"], "sha256:" + "2" * 64)
+        self.assertEqual(evidence["pods"][0]["replica_set_uid"], "rs-uid")
+        self.assertEqual(
+            validate_rollback_runtime(
+                evidence, image=image, deployment_name="tritium",
+                deployment_uid="deployment-uid", run_duration_ms=100.0,
+            ), evidence,
+        )
+        evidence["pods"][0]["image_id"] = "containerd://sha256:" + "3" * 64
+        with self.assertRaisesRegex(DeploymentError, "runtime pod identity"):
+            validate_rollback_runtime(
+                evidence, image=image, deployment_name="tritium",
+                deployment_uid="deployment-uid", run_duration_ms=100.0,
+            )
+        evidence["pods"][0]["image_id"] = "containerd://sha256:" + "2" * 64
+        evidence["pods"][0]["replica_set_owner"]["uid"] = "foreign-uid"
+        with self.assertRaisesRegex(DeploymentError, "runtime pod identity"):
+            validate_rollback_runtime(
+                evidence, image=image, deployment_name="tritium",
+                deployment_uid="deployment-uid", run_duration_ms=100.0,
+            )
+        evidence["pods"][0]["replica_set_owner"]["uid"] = "deployment-uid"
+        evidence["elapsed_ms"] = 101.0
+        with self.assertRaisesRegex(DeploymentError, "identity fields"):
+            validate_rollback_runtime(
+                evidence, image=image, deployment_name="tritium",
+                deployment_uid="deployment-uid", run_duration_ms=100.0,
+            )
+
+    def test_rollback_runtime_rejects_foreign_deployment_owner(self):
+        image = "registry.example/tritium@sha256:" + "2" * 64
+        pod = {
+            "metadata": {"name": "pod", "uid": "pod-uid", "ownerReferences": [{
+                "kind": "ReplicaSet", "name": "tritium-rs", "uid": "rs-uid",
+                "controller": True,
+            }]},
+            "spec": {"nodeName": "node-1", "containers": [
+                {"name": "tritium", "image": image}, {"name": "authenticated-probe"},
+            ]},
+            "status": {
+                "conditions": [{"type": "Ready", "status": "True"}],
+                "containerStatuses": [
+                    {"name": "tritium", "image": image,
+                     "imageID": "containerd://sha256:" + "2" * 64,
+                     "ready": True, "restartCount": 0},
+                    {"name": "authenticated-probe", "restartCount": 0},
+                ],
+            },
+        }
+        replica_set = {"metadata": {"name": "tritium-rs", "uid": "rs-uid",
+                                    "ownerReferences": [{
+            "kind": "Deployment", "name": "foreign", "uid": "foreign-uid",
+            "controller": True,
+        }]}}
+        with mock.patch.dict(collect_rollback_runtime.__globals__, {
+            "run_json": mock.Mock(side_effect=[{"items": [pod]}, replica_set]),
+        }), self.assertRaisesRegex(DeploymentError, "another Deployment"):
+            collect_rollback_runtime(
+                ["kubectl"], selector="app=tritium", image=image,
+                deployment_name="tritium", deployment_uid="deployment-uid",
+                flavor="cpu", run_elapsed_ms=50.0,
+            )
 
     def test_deployment_snapshot_binds_digest_manifest_replicas_and_strategy(self):
         image = "registry.example/tritium@sha256:" + "2" * 64

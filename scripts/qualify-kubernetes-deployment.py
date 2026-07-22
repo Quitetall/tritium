@@ -34,7 +34,7 @@ manifest_identity = RUNTIME["manifest_identity"]
 OCI_ARCHIVE = runpy.run_path(Path(__file__).with_name("verify-oci-archive.py"))
 validate_oci_archive = OCI_ARCHIVE["validate"]
 
-SCHEMA = "tritium.kubernetes-deployment-qualification.v9"
+SCHEMA = "tritium.kubernetes-deployment-qualification.v10"
 HEX = frozenset("0123456789abcdef")
 SAFE_NAME = re.compile(r"[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?")
 SAFE_SECRET_KEY = re.compile(r"[A-Za-z0-9](?:[-._A-Za-z0-9]{0,251}[A-Za-z0-9])?")
@@ -62,7 +62,8 @@ CHECKS = (
     "memory-oom-recovery",
     "metrics-scrape-flood",
     "successful-update", "update-readiness", "failed-upgrade",
-    "atomic-rollback", "rollback-readiness", "rollback-generation", "release-cleanup",
+    "atomic-rollback", "digest-pinned-rollback", "rollback-readiness",
+    "rollback-generation", "release-cleanup",
 )
 MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 WATCHDOG_FAULT_COMMAND = (
@@ -443,6 +444,130 @@ def pod_snapshot(document: dict[str, Any], flavor: str,
             raise DeploymentError("CUDA pod does not bind one NVIDIA GPU")
         pods.append({"name": name, "uid": uid, "node": node, "restarts": restarts})
     return {"pods": sorted(pods, key=lambda item: item["uid"])}
+
+
+def controller_owner(metadata: dict[str, Any], kind: str) -> dict[str, str]:
+    references = metadata.get("ownerReferences")
+    matches = [reference for reference in references or []
+               if isinstance(reference, dict) and reference.get("controller") is True]
+    if (not isinstance(references, list) or len(matches) != 1
+            or matches[0].get("kind") != kind
+            or any(not isinstance(matches[0].get(key), str) or not matches[0][key]
+                   for key in ("name", "uid"))):
+        raise DeploymentError(f"{kind} controller ownership differs")
+    return {"name": matches[0]["name"], "uid": matches[0]["uid"]}
+
+
+def collect_rollback_runtime(kubectl_base: list[str], *, selector: str, image: str,
+                             deployment_name: str, deployment_uid: str, flavor: str,
+                             run_elapsed_ms: float) -> dict[str, Any]:
+    if (type(run_elapsed_ms) not in {int, float} or not math.isfinite(run_elapsed_ms)
+            or run_elapsed_ms <= 0):
+        raise DeploymentError("rollback runtime elapsed time differs")
+    document = run_json(
+        kubectl_base + ["get", "pods", "-l", selector, "-o", "json"]
+    )
+    ready = pod_snapshot(document, flavor)
+    items = document["items"]
+    by_uid = {item.get("metadata", {}).get("uid"): item for item in items}
+    expected_digest = image.rpartition("@")[2]
+    accepted_image_ids = {
+        image, f"docker-pullable://{image}", f"containerd://{expected_digest}",
+        f"cri-o://{expected_digest}",
+    }
+    pods = []
+    for identity in ready["pods"]:
+        item = by_uid.get(identity["uid"])
+        if not isinstance(item, dict):
+            raise DeploymentError("rollback pod identity lookup differs")
+        metadata = item.get("metadata", {})
+        replica_set = controller_owner(metadata, "ReplicaSet")
+        replica_set_doc = run_json(kubectl_base + [
+            "get", f"replicaset/{replica_set['name']}", "-o", "json",
+        ])
+        if (replica_set_doc.get("metadata", {}).get("uid") != replica_set["uid"]
+                or replica_set_doc.get("metadata", {}).get("name") != replica_set["name"]):
+            raise DeploymentError("rollback ReplicaSet identity differs")
+        deployment = controller_owner(replica_set_doc.get("metadata", {}), "Deployment")
+        if (deployment != {"name": deployment_name, "uid": deployment_uid}):
+            raise DeploymentError("rollback pod belongs to another Deployment")
+        spec_matches = [container for container in item.get("spec", {}).get("containers", [])
+                        if isinstance(container, dict) and container.get("name") == "tritium"]
+        status_matches = [status for status in item.get("status", {}).get(
+            "containerStatuses", []) if isinstance(status, dict)
+                          and status.get("name") == "tritium"]
+        if (len(spec_matches) != 1 or spec_matches[0].get("image") != image
+                or len(status_matches) != 1
+                or status_matches[0].get("image") != image
+                or status_matches[0].get("imageID") not in accepted_image_ids
+                or status_matches[0].get("ready") is not True):
+            raise DeploymentError("rollback runtime image identity differs")
+        pods.append({
+            "pod_name": identity["name"], "pod_uid": identity["uid"],
+            "replica_set_name": replica_set["name"],
+            "replica_set_uid": replica_set["uid"],
+            "replica_set_owner": {
+                "kind": "Deployment", "name": deployment["name"],
+                "uid": deployment["uid"],
+            },
+            "image": image,
+            "image_id": status_matches[0]["imageID"],
+        })
+    return {
+        "image": image, "image_digest": expected_digest,
+        "deployment_name": deployment_name, "deployment_uid": deployment_uid,
+        "elapsed_ms": run_elapsed_ms,
+        "observed_at_utc": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+        "pods": sorted(pods, key=lambda item: item["pod_uid"]),
+    }
+
+
+def validate_rollback_runtime(value: Any, *, image: str,
+                              deployment_name: str, deployment_uid: str,
+                              run_duration_ms: float) -> dict[str, Any]:
+    fields = {
+        "image", "image_digest", "deployment_name", "deployment_uid",
+        "elapsed_ms", "observed_at_utc", "pods",
+    }
+    expected_digest = image.rpartition("@")[2]
+    if (not isinstance(value, dict) or set(value) != fields
+            or value.get("image") != image or value.get("image_digest") != expected_digest
+            or value.get("deployment_name") != deployment_name
+            or value.get("deployment_uid") != deployment_uid
+            or type(value.get("elapsed_ms")) not in {int, float}
+            or not math.isfinite(value["elapsed_ms"])
+            or not 0 < value["elapsed_ms"] <= run_duration_ms):
+        raise DeploymentError("rollback runtime identity fields differ")
+    try:
+        observed = datetime.fromisoformat(value["observed_at_utc"])
+    except (TypeError, ValueError) as error:
+        raise DeploymentError("rollback runtime timestamp differs") from error
+    if observed.tzinfo != timezone.utc:
+        raise DeploymentError("rollback runtime timestamp is not UTC")
+    pods = value.get("pods")
+    if not isinstance(pods, list) or len(pods) != 1:
+        raise DeploymentError("rollback runtime must bind exactly one pod")
+    accepted_image_ids = {
+        image, f"docker-pullable://{image}", f"containerd://{expected_digest}",
+        f"cri-o://{expected_digest}",
+    }
+    pod_fields = {
+        "pod_name", "pod_uid", "replica_set_name", "replica_set_uid",
+        "replica_set_owner", "image", "image_id",
+    }
+    expected_owner = {
+        "kind": "Deployment", "name": deployment_name, "uid": deployment_uid,
+    }
+    for pod in pods:
+        if (not isinstance(pod, dict) or set(pod) != pod_fields
+                or any(not isinstance(pod.get(key), str) or not pod[key]
+                       for key in pod_fields - {"replica_set_owner"})
+                or pod["replica_set_owner"] != expected_owner
+                or pod["image"] != image or pod["image_id"] not in accepted_image_ids):
+            raise DeploymentError("rollback runtime pod identity differs")
+    if pods != sorted(pods, key=lambda item: item["pod_uid"]):
+        raise DeploymentError("rollback runtime pods are not canonical")
+    return value
 
 
 def container_identity(document: dict[str, Any], pod_name: str,
@@ -3214,6 +3339,11 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
         )
         if rollback_uid != deployment_uid:
             raise DeploymentError("atomic rollback replaced deployment identity")
+        rollback_runtime = collect_rollback_runtime(
+            kubectl_base, selector=selector, image=args.image,
+            deployment_name=service, deployment_uid=deployment_uid, flavor=args.flavor,
+            run_elapsed_ms=(time.monotonic() - started) * 1000,
+        )
         rollback_port = free_port()
         rollback_url = f"http://127.0.0.1:{rollback_port}"
         rollback_process, rollback_ready = port_forward(
@@ -3349,6 +3479,7 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
                      "update_strategy": "Recreate" if args.flavor == "cuda" else "RollingUpdate",
                      "update_config": {"before": update_before, "after": update_after},
                      "rollback_startup_receipt": rollback_startup,
+                     "rollback_runtime": rollback_runtime,
                      "metrics": metric_evidence, "restart_recovery": restart_recovery,
                      "metrics_scrape_flood": metrics_flood,
                      "collector_outage": collector_outage,
@@ -3484,7 +3615,8 @@ def validate_receipt(receipt: dict[str, Any], *, chart_path: Path, image_path: P
         "initial", "restarted", "updated",
         "watchdog_replacement", "artifact_volume_loss", "memory_oom_recovery",
         "startup_receipt", "restart_startup_receipt", "update_startup_receipt",
-        "update_strategy", "update_config", "rollback_startup_receipt", "metrics",
+        "update_strategy", "update_config", "rollback_startup_receipt",
+        "rollback_runtime", "metrics",
         "restart_recovery", "scale", "helm_history",
         "metrics_scrape_flood",
         "collector_outage",
@@ -3925,6 +4057,12 @@ def validate_receipt(receipt: dict[str, Any], *, chart_path: Path, image_path: P
     )
     if workload["rollback_startup_receipt"] != workload["startup_receipt"]:
         raise DeploymentError("deployment rollback changed startup receipt")
+    validate_rollback_runtime(
+        workload.get("rollback_runtime"), image=receipt["image"],
+        deployment_name=f"{workload['release_name']}-tritium",
+        deployment_uid=workload["deployment_uid"],
+        run_duration_ms=receipt["duration_ms"],
+    )
     metrics = workload.get("metrics")
     validate_metrics_evidence(metrics, "")
     validate_metrics_flood(
