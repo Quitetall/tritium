@@ -76,6 +76,7 @@ jobs:
         working-directory: packages/tritium-web
         env:
           TRITIUM_NPM_EVIDENCE_DIR: ${{ runner.temp }}/tritium-npm-evidence
+          TRITIUM_NPM_RUN_ID: github-${{ github.run_id }}-${{ github.run_attempt }}-npm-archive
         run: npm run check
       - name: retain local-RC archive and receipt
         uses: actions/upload-artifact@v4

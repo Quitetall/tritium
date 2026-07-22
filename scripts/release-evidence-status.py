@@ -22,6 +22,9 @@ MatrixReceiptError = MATRIX_RECEIPT["AggregateError"]
 CRATE_RECEIPT = runpy.run_path(Path(__file__).with_name("qualify-crate-archives.py"))
 validate_crate_receipt = CRATE_RECEIPT["validate_receipt"]
 CrateReceiptError = CRATE_RECEIPT["ArchiveError"]
+NPM_RECEIPT = runpy.run_path(Path(__file__).with_name("verify-npm-archive-receipt.py"))
+validate_npm_receipt = NPM_RECEIPT["validate_receipt"]
+NpmReceiptError = NPM_RECEIPT["NpmReceiptError"]
 
 SCHEMA = "tritium.release-evidence-registry.v1"
 REPORT_SCHEMA = "tritium.release-gate-report.v1"
@@ -30,7 +33,10 @@ TOP_FIELDS = {
 }
 RECEIPT_FIELDS = {"id", "kind", "path", "sha256", "artifact_id", "parents"}
 KNOWN_KINDS = frozenset(
-    {"cuda-training", "clean-install", "compatibility-matrix", "crate-archive"}
+    {
+        "cuda-training", "clean-install", "compatibility-matrix",
+        "crate-archive", "npm-archive",
+    }
 )
 HEX = frozenset("0123456789abcdef")
 MAX_RECEIPT_BYTES = 32 * 1024 * 1024
@@ -213,7 +219,11 @@ def evaluate(registry: Path, candidate: Path, candidate_document: dict[str, Any]
         artifact = artifacts.get(artifact_id)
         if artifact is None:
             raise EvidenceError(f"{label}.artifact_id is absent from candidate")
-        expected_artifact_kind = "rust-crate" if kind == "crate-archive" else "python-wheel"
+        expected_artifact_kind = (
+            "rust-crate" if kind == "crate-archive"
+            else "npm-archive" if kind == "npm-archive"
+            else "python-wheel"
+        )
         if artifact.get("kind") != expected_artifact_kind:
             raise EvidenceError(
                 f"{kind} evidence must bind candidate {expected_artifact_kind}"
@@ -236,11 +246,15 @@ def evaluate(registry: Path, candidate: Path, candidate_document: dict[str, Any]
                     Path(__file__).resolve().parent.parent / "Cargo.lock",
                     revision, release,
                 )
+            elif kind == "npm-archive":
+                receipt = validate_npm_receipt(
+                    receipt_path, artifact_path, revision, release
+                )
             else:
                 raise EvidenceError(f"{label}.kind has no validator dispatch")
         except (
             OSError, CudaReceiptError, WheelReceiptError, MatrixReceiptError,
-            CrateReceiptError,
+            CrateReceiptError, NpmReceiptError,
         ) as error:
             raise EvidenceError(f"{label} failed {kind} validation: {error}") from error
         if receipt["receipt_id"] != receipt_id:
@@ -294,6 +308,16 @@ def evaluate(registry: Path, candidate: Path, candidate_document: dict[str, Any]
                 raise EvidenceError("crate receipt does not match candidate crate inventory")
             if artifact_id not in {package["artifact_id"] for package in receipt["packages"]}:
                 raise EvidenceError("crate receipt anchor is not a qualified crate")
+        elif kind == "npm-archive":
+            identity = artifact.get("identity", {})
+            actual = (artifact_path.name, _sha256(artifact_path), artifact_path.stat().st_size)
+            declared = (artifact_path.name, identity.get("sha256"), identity.get("bytes"))
+            qualified = (
+                receipt["artifact"]["name"], receipt["artifact"]["sha256"],
+                receipt["artifact"]["bytes"],
+            )
+            if actual != declared or actual != qualified:
+                raise EvidenceError("npm receipt does not bind candidate archive bytes")
         elif receipt["artifact"]["kind"] != "python-wheel":
             raise EvidenceError(f"{kind} receipt does not identify a Python wheel")
         run_id = receipt["run_id"]

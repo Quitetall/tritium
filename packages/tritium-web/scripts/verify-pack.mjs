@@ -10,7 +10,7 @@ import {
   rm,
   writeFile,
 } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { arch, hostname, platform, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
@@ -64,6 +64,16 @@ function digest(algorithm, bytes, encoding = "hex") {
   return createHash(algorithm).update(bytes).digest(encoding);
 }
 
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value !== null && typeof value === "object") {
+    return `{${Object.keys(value).sort().map((key) =>
+      `${JSON.stringify(key)}:${canonicalJson(value[key])}`
+    ).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
 function assertRelativeFile(path) {
   if (typeof path !== "string" || path.length === 0 || path.includes("\\") ||
       path.includes("\0") || path.startsWith("/") || path.split("/").some((part) =>
@@ -73,7 +83,7 @@ function assertRelativeFile(path) {
   }
 }
 
-async function verifyArchive(temporary) {
+async function verifyArchive(temporary, startedAtUtc, started) {
   const archiveDirectory = resolve(temporary, "archive");
   await mkdir(archiveDirectory);
   const { stdout } = await run("npm", [
@@ -196,20 +206,54 @@ void adapter;
     resolve(root, "node_modules/typescript/bin/tsc"), "-p", resolve(consumer, "tsconfig.json"),
   ], { cwd: consumer, maxBuffer: MAX_COMMAND_OUTPUT_BYTES });
 
+  const npmVersion = (await run("npm", ["--version"], {
+    maxBuffer: MAX_COMMAND_OUTPUT_BYTES,
+  })).stdout.trim();
+  const machineMaterial = {
+    node: hostname(),
+    system: platform(),
+    architecture: arch(),
+  };
+  const runId = process.env.TRITIUM_NPM_RUN_ID ?? (
+    process.env.GITHUB_RUN_ID !== undefined && process.env.GITHUB_RUN_ATTEMPT !== undefined
+      ? `github-${process.env.GITHUB_RUN_ID}-${process.env.GITHUB_RUN_ATTEMPT}-npm-archive`
+      : `local-${process.pid}`
+  );
+  const unsignedReceipt = {
+    schema: "tritium.npm-archive-qualification.v1",
+    release: packageJson.version,
+    source_revision: sourceIdentity[1],
+    run_id: runId,
+    started_at_utc: startedAtUtc,
+    duration_ms: Number(process.hrtime.bigint() - started) / 1e6,
+    machine: {
+      machine_id: `sha256:${digest("sha256", Buffer.from(canonicalJson(machineMaterial)))}`,
+      system: machineMaterial.system,
+      architecture: machineMaterial.architecture,
+    },
+    toolchain: { node: process.version, npm: npmVersion },
+    artifact: {
+      kind: "npm-archive",
+      name: metadata.filename,
+      package: `${packageJson.name}@${packageJson.version}`,
+      bytes: archiveBytes.byteLength,
+      sha256: digest("sha256", archiveBytes),
+      integrity: metadata.integrity,
+    },
+    evidence: {
+      source_dirty: sourceIdentity[2] !== undefined,
+      entry_count: files.length,
+      source_free: true,
+      installed_offline: true,
+      strict_typescript: true,
+      wasm_build_id: wasmReceipt.buildId,
+      wasm_guest_digest: wasmReceipt.guestDigest,
+    },
+    result: "pass",
+  };
   const receipt = Object.freeze({
-    schemaId: "tritium.npm_archive_receipt",
-    schemaVersion: 1,
-    package: `${packageJson.name}@${packageJson.version}`,
-    sourceRevision: sourceIdentity[1],
-    sourceDirty: sourceIdentity[2] !== undefined,
-    archiveSha256: digest("sha256", archiveBytes),
-    archiveBytes: archiveBytes.byteLength,
-    entryCount: files.length,
-    sourceFree: true,
-    installedOffline: true,
-    strictTypeScript: true,
-    wasmBuildId: wasmReceipt.buildId,
-    wasmGuestDigest: wasmReceipt.guestDigest,
+    ...unsignedReceipt,
+    receipt_id: `sha256:${digest("sha256", Buffer.from(canonicalJson(unsignedReceipt)))}`,
   });
   const receiptJson = `${JSON.stringify(receipt, null, 2)}\n`;
   const evidenceDirectory = process.env.TRITIUM_NPM_EVIDENCE_DIR;
@@ -244,9 +288,11 @@ void adapter;
 
 async function main() {
   if (packageJson.private !== true) fail("publication guard is not enabled");
+  const startedAtUtc = new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
+  const started = process.hrtime.bigint();
   const temporary = await mkdtemp(join(tmpdir(), "tritium-npm-pack-"));
   try {
-    await verifyArchive(temporary);
+    await verifyArchive(temporary, startedAtUtc, started);
   } finally {
     await rm(temporary, { force: true, recursive: true });
   }

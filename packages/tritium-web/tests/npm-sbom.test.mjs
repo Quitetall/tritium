@@ -28,12 +28,13 @@ const packageLock = {
   },
 };
 const receipt = {
-  package: "@tritium-ai/web@1.1.0-rc.0",
-  archiveSha256: "a".repeat(64),
-  archiveBytes: 123,
-  sourceRevision: "b".repeat(40),
-  sourceDirty: false,
-  wasmGuestDigest: "c".repeat(64),
+  source_revision: "b".repeat(40),
+  artifact: {
+    package: "@tritium-ai/web@1.1.0-rc.0",
+    sha256: "a".repeat(64),
+    bytes: 123,
+  },
+  evidence: { source_dirty: false, wasm_guest_digest: "c".repeat(64) },
 };
 
 test("npm SBOM binds archive, locked dependencies and runtime edge", () => {
@@ -41,7 +42,7 @@ test("npm SBOM binds archive, locked dependencies and runtime edge", () => {
   const second = generateNpmSbom(packageJson, packageLock, receipt, "web.tgz");
   assert.deepEqual(first, second);
   assert.equal(first.metadata.component["bom-ref"], "tritium-web-node22");
-  assert.equal(first.metadata.component.hashes[0].content, receipt.archiveSha256);
+  assert.equal(first.metadata.component.hashes[0].content, receipt.artifact.sha256);
   assert.deepEqual(first.dependencies, [
     { ref: "tritium-web-node22", dependsOn: ["npm:runtime@1.2.3"] },
   ]);
@@ -65,7 +66,12 @@ test("npm SBOM rejects weak integrity, drift and unbound receipts", () => {
     /SHA-256 or stronger/,
   );
   assert.throws(
-    () => generateNpmSbom(packageJson, packageLock, { ...receipt, archiveBytes: 0 }, "web.tgz"),
+    () => generateNpmSbom(
+      packageJson,
+      packageLock,
+      { ...receipt, artifact: { ...receipt.artifact, bytes: 0 } },
+      "web.tgz",
+    ),
     /archive receipt/,
   );
 });

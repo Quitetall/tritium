@@ -71,10 +71,14 @@ export function generateNpmSbom(packageJson, packageLock, receipt, archiveFile,
       packageLock.version !== packageJson.version) {
     fail("package-lock identity differs from package.json");
   }
-  if (receipt.package !== `${packageJson.name}@${packageJson.version}` ||
-      !DIGEST.test(receipt.archiveSha256) || !Number.isSafeInteger(receipt.archiveBytes) ||
-      receipt.archiveBytes <= 0 || !/^[0-9a-f]{40}$/.test(receipt.sourceRevision) ||
-      typeof receipt.sourceDirty !== "boolean" || !DIGEST.test(receipt.wasmGuestDigest) ||
+  const artifact = receipt.artifact;
+  const evidence = receipt.evidence;
+  if (artifact === null || typeof artifact !== "object" ||
+      evidence === null || typeof evidence !== "object" ||
+      artifact.package !== `${packageJson.name}@${packageJson.version}` ||
+      !DIGEST.test(artifact.sha256) || !Number.isSafeInteger(artifact.bytes) ||
+      artifact.bytes <= 0 || !/^[0-9a-f]{40}$/.test(receipt.source_revision) ||
+      typeof evidence.source_dirty !== "boolean" || !DIGEST.test(evidence.wasm_guest_digest) ||
       typeof archiveFile !== "string" ||
       !/^[A-Za-z0-9][A-Za-z0-9._+-]*\.tgz$/.test(archiveFile)) {
     fail("archive receipt does not bind package identity and bytes");
@@ -116,13 +120,13 @@ export function generateNpmSbom(packageJson, packageLock, receipt, archiveFile,
         "bom-ref": artifactId,
         name: packageJson.name,
         version: packageJson.version,
-        hashes: [{ alg: "SHA-256", content: receipt.archiveSha256 }],
+        hashes: [{ alg: "SHA-256", content: artifact.sha256 }],
         properties: [
           { name: "tritium:artifact:file", value: archiveFile },
-          { name: "tritium:artifact:bytes", value: String(receipt.archiveBytes) },
-          { name: "tritium:source:revision", value: receipt.sourceRevision },
-          { name: "tritium:source:dirty", value: String(receipt.sourceDirty) },
-          { name: "tritium:wasm:guest-digest", value: receipt.wasmGuestDigest },
+          { name: "tritium:artifact:bytes", value: String(artifact.bytes) },
+          { name: "tritium:source:revision", value: receipt.source_revision },
+          { name: "tritium:source:dirty", value: String(evidence.source_dirty) },
+          { name: "tritium:wasm:guest-digest", value: evidence.wasm_guest_digest },
         ],
       },
       tools: { components: [{ type: "application", name: "tritium-npm-sbom", version: "1" }] },

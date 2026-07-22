@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import io
 import json
@@ -22,6 +23,7 @@ status_main = STATUS_MODULE["main"]
 WHEEL_MODULE = runpy.run_path(ROOT / "scripts" / "wheel-functional-smoke.py")
 MATRIX_MODULE = runpy.run_path(ROOT / "scripts" / "aggregate-wheel-smoke.py")
 CRATE_MODULE = runpy.run_path(ROOT / "scripts" / "qualify-crate-archives.py")
+NPM_MODULE = runpy.run_path(ROOT / "scripts" / "verify-npm-archive-receipt.py")
 
 
 def canonical(value) -> bytes:
@@ -334,6 +336,66 @@ class ReleaseEvidenceStatusTests(unittest.TestCase):
                 packages["missing_kinds"],
                 ["compatibility-matrix", "crate-archive", "npm-archive"],
             )
+
+    def test_npm_receipt_binds_candidate_archive_and_advances_package_gate(self):
+        with tempfile.TemporaryDirectory() as raw:
+            candidate, document, old_artifact, evidence_root = release_fixture(Path(raw))
+            old_artifact.unlink()
+            archive = candidate.parent / "tritium-ai-web-1.1.0-rc.0.tgz"
+            archive.write_bytes(b"qualified npm bytes")
+            archive_sha = sha256(archive)
+            document["artifacts"] = [{
+                "id": "tritium-web-node22", "kind": "npm-archive",
+                "path": archive.name,
+                "identity": {"sha256": archive_sha, "bytes": archive.stat().st_size},
+                "sbom": {}, "provenance": {},
+            }]
+            candidate.write_bytes(canonical(document) + b"\n")
+            receipt = {
+                "schema": NPM_MODULE["SCHEMA"], "release": "1.1.0-rc.0",
+                "source_revision": "a" * 40, "run_id": "npm-run-1",
+                "started_at_utc": "2026-07-21T12:00:00Z", "duration_ms": 100.0,
+                "machine": {
+                    "machine_id": "sha256:" + "b" * 64,
+                    "system": "linux", "architecture": "x64",
+                },
+                "toolchain": {"node": "v22.18.0", "npm": "11.5.2"},
+                "artifact": {
+                    "kind": "npm-archive", "name": archive.name,
+                    "package": "@tritium-ai/web@1.1.0-rc.0",
+                    "bytes": archive.stat().st_size, "sha256": archive_sha,
+                    "integrity": "sha512-" + base64.b64encode(
+                        hashlib.sha512(archive.read_bytes()).digest()
+                    ).decode("ascii"),
+                },
+                "evidence": {
+                    "source_dirty": False, "entry_count": 13,
+                    "source_free": True, "installed_offline": True,
+                    "strict_typescript": True,
+                    "wasm_build_id": "tritium-wasm@1.1.0-rc.0+source-git:" + "a" * 40,
+                    "wasm_guest_digest": "c" * 64,
+                },
+                "result": "pass",
+            }
+            receipt["receipt_id"] = "sha256:" + hashlib.sha256(
+                canonical(receipt)
+            ).hexdigest()
+            receipt_path = evidence_root / "npm.json"
+            receipt_path.write_bytes(canonical(receipt) + b"\n")
+            registry_path = evidence_root / "registry.json"
+            registry(
+                registry_path, candidate,
+                [{
+                    **entry(receipt_path, receipt, kind="npm-archive"),
+                    "artifact_id": "tritium-web-node22",
+                }],
+            )
+            report = evaluate(registry_path, candidate, document)
+            packages = next(row for row in report["rows"] if row["id"] == "packages")
+            self.assertEqual(packages["satisfied_kinds"], ["npm-archive"])
+            archive.write_bytes(b"tampered")
+            with self.assertRaisesRegex(EvidenceError, "npm-archive validation"):
+                evaluate(registry_path, candidate, document)
 
     def test_gate_status_distinguishes_pass_missing_and_structural(self):
         required = ("quality", "runtime")
