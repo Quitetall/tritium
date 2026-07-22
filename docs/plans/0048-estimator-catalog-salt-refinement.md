@@ -55,7 +55,8 @@ coverage and duplicate-plugin tests.
   gated-attention training remain a separate open integration.
 - [x] Add a bounded-memory block/sliding-window evaluator with exact teacher and
   student stream identities, final-logit teacher CE/KL, complete deterministic
-  multi-start selection and a strict canonical `TSV2OUT` v1 receipt.
+  multi-start selection and a strict canonical `TSV2OUT` v2 receipt. Legacy v1
+  remains strictly inspectable but cannot claim runtime binding.
   - Edit `crates/tritium-quantize/src/salt_v2_output.rs` for the public frozen
     schedule/spec, streamed accumulator, metric calculation and deterministic
     restart-selection seams.
@@ -99,8 +100,17 @@ coverage and duplicate-plugin tests.
     Qwen configuration; successful production construction through the pinned
     Qwen3.6-27B loader remains part of the checkpoint-scale evidence item below
     and is not yet qualified.
-  - The driver may then admit `TSV2OUT` only when its selected student digest and
-    the runtime execution receipt agree. Label equality alone must fail closed.
+  - [x] Bridge foundation: move ordered final-logit hashing into a shared format
+    contract used byte-for-byte by both Qwen execution and output reconstruction.
+    Extend each canonical `TSV2OUT` v2 candidate with its runtime-comparable
+    final-logit digest and exact batch/value counts while retaining the distinct
+    aggregate block-plus-logit student digest. V1 remains strictly inspectable
+    but bridge-ineligible because absent runtime evidence is never synthesized.
+    Freeze both evidence-domain and complete v2 goldens; strict reopen rejects
+    malformed counters.
+  - The driver may then admit `TSV2OUT` only when its selected runtime-final-logit
+    digest and exact batch/value counts equal the runtime execution receipt.
+    Candidate-label or aggregate-student-digest equality alone must fail closed.
   - Add public-seam honest-execution, relabeling, corruption and strict-reopen
     tests before marking this item complete.
 - Execute the bound output-reconstruction workflow on checkpoint-scale evidence.

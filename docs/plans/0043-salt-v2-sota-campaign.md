@@ -840,7 +840,8 @@ The following work deliberately remains open and keeps this plan in progress:
   reopened factorized-curvature evidence and the canonical campaign store, but
   checkpoint-scale evidence collection, scale-only teacher-KL, and hard PV
   updates remain open. The core now has a
-  bounded streamed block/sliding evaluator and canonical `TSV2OUT` v1 receipt:
+  bounded streamed block/sliding evaluator and canonical `TSV2OUT` v2 receipt
+  (legacy v1 remains strictly inspectable but bridge-ineligible):
   it binds source/cache/token/validation identities, exact teacher and candidate
   outputs, final-logit CE/KL, every deterministic restart and selected basin.
   The resumable Qwen driver now rejects activation-cache as well as token-stream

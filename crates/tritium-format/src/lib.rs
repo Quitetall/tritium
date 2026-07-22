@@ -43,6 +43,7 @@ mod i2s;
 mod i2s_int8;
 mod le_cursor;
 mod rows;
+mod runtime_evidence;
 mod safetensors;
 mod salt;
 mod salt_bundle;
@@ -82,6 +83,9 @@ pub use i2s_int8::{
     I2sInt8Weights, IMMA_K, IMMA_N, IMMA_WTILE_BYTES, convert_i2s_to_int8, convert_i2s_to_tq2_0,
 };
 pub use rows::{num_blocks, pack_tq1_0_row, pack_tq2_0_row, unpack_tq1_0_row, unpack_tq2_0_row};
+pub use runtime_evidence::{
+    RuntimeEvidenceError, RuntimeFinalLogitsAccumulator, RuntimeFinalLogitsEvidence,
+};
 pub use safetensors::{
     SafeTensors, SafeTensorsError, SafeTensorsReader, VisitTensorBytesError, read_safetensors,
 };

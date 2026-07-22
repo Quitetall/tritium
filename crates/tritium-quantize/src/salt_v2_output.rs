@@ -3,7 +3,7 @@
 use core::fmt;
 use std::collections::BTreeSet;
 
-use tritium_format::ModelId;
+use tritium_format::{ModelId, RuntimeEvidenceError, RuntimeFinalLogitsAccumulator};
 
 mod codec;
 
@@ -268,6 +268,7 @@ pub struct OutputReconstructionAccumulator {
     final_tokens: u64,
     teacher_hasher: blake3::Hasher,
     student_hasher: blake3::Hasher,
+    runtime_final_logits: RuntimeFinalLogitsAccumulator,
 }
 
 impl OutputReconstructionAccumulator {
@@ -303,6 +304,7 @@ impl OutputReconstructionAccumulator {
             final_tokens: 0,
             teacher_hasher,
             student_hasher,
+            runtime_final_logits: RuntimeFinalLogitsAccumulator::new(),
         })
     }
 
@@ -411,6 +413,9 @@ impl OutputReconstructionAccumulator {
                         continue;
                     }
                     let start = row * columns;
+                    self.runtime_final_logits
+                        .observe(&student[start..start + columns])
+                        .map_err(map_runtime_evidence_error)?;
                     let (cross_entropy, kl) = distillation_losses(
                         &teacher[start..start + columns],
                         &student[start..start + columns],
@@ -462,12 +467,19 @@ impl OutputReconstructionAccumulator {
         }
         let teacher_evidence_digest = *self.teacher_hasher.finalize().as_bytes();
         let student_output_digest = *self.student_hasher.finalize().as_bytes();
+        let runtime_final_logits = self
+            .runtime_final_logits
+            .finish()
+            .map_err(map_runtime_evidence_error)?;
         let mut receipt = OutputCandidateReceipt {
             spec_id: self.spec.spec_id,
             candidate_id: self.candidate_id,
             initialization_seed: self.initialization_seed,
             teacher_evidence_digest,
             student_output_digest,
+            runtime_final_logits_digest: *runtime_final_logits.digest(),
+            runtime_batch_count: runtime_final_logits.batch_count(),
+            runtime_logit_count: runtime_final_logits.logit_count(),
             observations: self.observations,
             block_elements: self.block_elements,
             final_tokens: self.final_tokens,
@@ -490,6 +502,9 @@ pub struct OutputCandidateReceipt {
     initialization_seed: u64,
     teacher_evidence_digest: [u8; 32],
     student_output_digest: [u8; 32],
+    runtime_final_logits_digest: [u8; 32],
+    runtime_batch_count: u64,
+    runtime_logit_count: u64,
     observations: u64,
     block_elements: u64,
     final_tokens: u64,
@@ -511,6 +526,30 @@ impl OutputCandidateReceipt {
     #[must_use]
     pub const fn teacher_evidence_digest(&self) -> &[u8; 32] {
         &self.teacher_evidence_digest
+    }
+
+    /// Aggregate block-plus-logit student stream identity used by reconstruction.
+    #[must_use]
+    pub const fn student_output_digest(&self) -> &[u8; 32] {
+        &self.student_output_digest
+    }
+
+    /// Final-logit identity in the shared runtime execution domain.
+    #[must_use]
+    pub const fn runtime_final_logits_digest(&self) -> &[u8; 32] {
+        &self.runtime_final_logits_digest
+    }
+
+    /// Runtime-comparable final-logit batch count.
+    #[must_use]
+    pub const fn runtime_batch_count(&self) -> u64 {
+        self.runtime_batch_count
+    }
+
+    /// Runtime-comparable final-logit value count.
+    #[must_use]
+    pub const fn runtime_logit_count(&self) -> u64 {
+        self.runtime_logit_count
     }
 
     /// Mean squared error across selected block outputs.
@@ -550,6 +589,9 @@ impl OutputCandidateReceipt {
         hasher.update(&self.initialization_seed.to_le_bytes());
         hasher.update(&self.teacher_evidence_digest);
         hasher.update(&self.student_output_digest);
+        hasher.update(&self.runtime_final_logits_digest);
+        hasher.update(&self.runtime_batch_count.to_le_bytes());
+        hasher.update(&self.runtime_logit_count.to_le_bytes());
         hasher.update(&self.observations.to_le_bytes());
         hasher.update(&self.block_elements.to_le_bytes());
         hasher.update(&self.final_tokens.to_le_bytes());
@@ -573,6 +615,51 @@ pub struct OutputReconstructionReceipt {
     candidates: Vec<OutputCandidateReceipt>,
     selected_candidate_id: [u8; 32],
     receipt_id: [u8; 32],
+}
+
+/// Strictly validated legacy `TSV2OUT` v1 identity.
+///
+/// Version 1 predates runtime-comparable final-logit fields. It remains
+/// inspectable for audit continuity but cannot satisfy execution admission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LegacyOutputReconstructionReceipt {
+    spec_id: [u8; 32],
+    teacher_evidence_digest: [u8; 32],
+    selected_candidate_id: [u8; 32],
+    candidate_count: u32,
+    receipt_id: [u8; 32],
+}
+
+impl LegacyOutputReconstructionReceipt {
+    /// Frozen reconstruction specification identity.
+    #[must_use]
+    pub const fn spec_id(&self) -> &[u8; 32] {
+        &self.spec_id
+    }
+
+    /// Shared teacher stream identity across the legacy restart set.
+    #[must_use]
+    pub const fn teacher_evidence_digest(&self) -> &[u8; 32] {
+        &self.teacher_evidence_digest
+    }
+
+    /// Legacy winning candidate identity.
+    #[must_use]
+    pub const fn selected_candidate_id(&self) -> &[u8; 32] {
+        &self.selected_candidate_id
+    }
+
+    /// Number of complete deterministic legacy candidates.
+    #[must_use]
+    pub const fn candidate_count(self) -> u32 {
+        self.candidate_count
+    }
+
+    /// Legacy v1 receipt content identity.
+    #[must_use]
+    pub const fn receipt_id(&self) -> &[u8; 32] {
+        &self.receipt_id
+    }
 }
 
 impl OutputReconstructionReceipt {
@@ -812,6 +899,17 @@ const fn canonical_zero(value: f64) -> f64 {
     if value == 0.0 { 0.0 } else { value }
 }
 
+const fn map_runtime_evidence_error(error: RuntimeEvidenceError) -> OutputReconstructionError {
+    match error {
+        RuntimeEvidenceError::EmptyBatch => OutputReconstructionError::InvalidGeometry,
+        RuntimeEvidenceError::NonFiniteOutput => {
+            OutputReconstructionError::NonFiniteOutput { teacher: false }
+        }
+        RuntimeEvidenceError::CountOverflow => OutputReconstructionError::CountOverflow,
+        RuntimeEvidenceError::EmptyStream => OutputReconstructionError::IncompleteCandidate,
+    }
+}
+
 /// Invalid output-reconstruction specification, stream, or candidate set.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -875,6 +973,8 @@ pub enum OutputReconstructionError {
     ReceiptAllocationFailed,
     /// Canonical receipt bytes are malformed or noncanonical.
     MalformedReceipt(&'static str),
+    /// A valid legacy v1 receipt lacks runtime-comparable final-logit evidence.
+    LegacyReceiptMissingRuntimeEvidence,
 }
 
 impl fmt::Display for OutputReconstructionError {
@@ -944,6 +1044,9 @@ impl fmt::Display for OutputReconstructionError {
                     "output-reconstruction receipt {field} is malformed"
                 )
             }
+            Self::LegacyReceiptMissingRuntimeEvidence => formatter.write_str(
+                "legacy TSV2OUT v1 receipt has no runtime-comparable final-logit evidence",
+            ),
         }
     }
 }

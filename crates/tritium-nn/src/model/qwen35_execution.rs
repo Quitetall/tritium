@@ -2,13 +2,13 @@
 
 use core::fmt;
 
+use tritium_format::RuntimeFinalLogitsAccumulator;
 use tritium_spec::{DeviceCaps, TernaryBackend};
 
 use super::Qwen35SaltV2LanguageMtpModel;
 use crate::NnError;
 
 const TOKEN_STREAM_CONTEXT: &str = "tritium qwen3.5 runtime token stream v1";
-const FINAL_LOGITS_CONTEXT: &str = "tritium qwen3.5 runtime final logits v1";
 const BACKEND_CAPS_CONTEXT: &str = "tritium qwen3.5 runtime backend capabilities v1";
 const TRANSCRIPT_ID_CONTEXT: &str = "tritium qwen3.5 salt v2 untrusted runtime transcript v1";
 const TRANSCRIPT_CHECKSUM_CONTEXT: &str =
@@ -336,7 +336,7 @@ impl Qwen35SaltV2LanguageMtpModel {
         let backend_before = BackendIdentity::capture(self.runner().execution_backend())
             .map_err(Qwen35ExecutionVisitError::Runtime)?;
         let mut token_hasher = blake3::Hasher::new_derive_key(TOKEN_STREAM_CONTEXT);
-        let mut logits_hasher = blake3::Hasher::new_derive_key(FINAL_LOGITS_CONTEXT);
+        let mut runtime_final_logits = RuntimeFinalLogitsAccumulator::new();
         let mut batch_count = 0_u64;
         let mut token_count = 0_u64;
         let mut logit_count = 0_u64;
@@ -382,7 +382,11 @@ impl Qwen35SaltV2LanguageMtpModel {
                 ))
             })?;
             hash_batch_tokens(&mut token_hasher, batch_count, tokens);
-            hash_batch_logits(&mut logits_hasher, batch_count, logits);
+            runtime_final_logits.observe(logits).map_err(|error| {
+                Qwen35ExecutionVisitError::Runtime(NnError::Provenance(format!(
+                    "Qwen runtime final-logit evidence failed: {error}"
+                )))
+            })?;
             observer(Qwen35ExecutionOutputBatch {
                 batch_index: batch_count,
                 tokens,
@@ -413,8 +417,18 @@ impl Qwen35SaltV2LanguageMtpModel {
         }
         token_hasher.update(&batch_count.to_le_bytes());
         token_hasher.update(&token_count.to_le_bytes());
-        logits_hasher.update(&batch_count.to_le_bytes());
-        logits_hasher.update(&logit_count.to_le_bytes());
+        let runtime_final_logits = runtime_final_logits.finish().map_err(|error| {
+            Qwen35ExecutionVisitError::Runtime(NnError::Provenance(format!(
+                "Qwen runtime final-logit evidence failed: {error}"
+            )))
+        })?;
+        if runtime_final_logits.batch_count() != batch_count
+            || runtime_final_logits.logit_count() != logit_count
+        {
+            return Err(Qwen35ExecutionVisitError::Runtime(NnError::Provenance(
+                "Qwen runtime final-logit evidence counters differ".to_owned(),
+            )));
+        }
 
         let backend_after = BackendIdentity::capture(self.runner().execution_backend())
             .map_err(Qwen35ExecutionVisitError::Runtime)?;
@@ -439,7 +453,7 @@ impl Qwen35SaltV2LanguageMtpModel {
             backend_caps_digest: backend_before.capabilities_digest,
             token_stream_digest: *token_hasher.finalize().as_bytes(),
             block_output_digest: [0; 32],
-            final_logits_digest: *logits_hasher.finalize().as_bytes(),
+            final_logits_digest: *runtime_final_logits.digest(),
             scope_coverage: FINAL_LOGITS_COVERAGE,
             batch_count,
             token_count,
@@ -550,14 +564,6 @@ fn hash_batch_tokens(hasher: &mut blake3::Hasher, batch_index: u64, tokens: &[u3
     hasher.update(&(tokens.len() as u64).to_le_bytes());
     for token in tokens {
         hasher.update(&token.to_le_bytes());
-    }
-}
-
-fn hash_batch_logits(hasher: &mut blake3::Hasher, batch_index: u64, logits: &[f32]) {
-    hasher.update(&batch_index.to_le_bytes());
-    hasher.update(&(logits.len() as u64).to_le_bytes());
-    for logit in logits {
-        hasher.update(&logit.to_bits().to_le_bytes());
     }
 }
 

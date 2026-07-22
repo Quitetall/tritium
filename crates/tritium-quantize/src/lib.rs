@@ -121,10 +121,12 @@ pub use salt_v2_model::{
     plan_salt_v2_restartable_tensor_master, plan_salt_v2_tensor_master,
 };
 pub use salt_v2_output::{
-    OutputCandidateReceipt, OutputObjectiveWeights, OutputReconstructionAccumulator,
-    OutputReconstructionError, OutputReconstructionReceipt, OutputReconstructionSchedule,
-    OutputReconstructionScope, OutputReconstructionSpec, select_output_reconstruction,
+    LegacyOutputReconstructionReceipt, OutputCandidateReceipt, OutputObjectiveWeights,
+    OutputReconstructionAccumulator, OutputReconstructionError, OutputReconstructionReceipt,
+    OutputReconstructionSchedule, OutputReconstructionScope, OutputReconstructionSpec,
+    select_output_reconstruction,
 };
 pub use training_export::{
     TrainingSaltExportError, TrainingSaltExportStats, export_training_salt_row,
 };
+pub use tritium_format::{RuntimeFinalLogitsAccumulator, RuntimeFinalLogitsEvidence};

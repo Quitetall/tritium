@@ -424,13 +424,20 @@ This receipt does not substitute for distributed training, optimized native
 dispatch, flagship quality/performance, serving telemetry or second-machine
 reproduction.
 
-Production output-aware search uses the canonical `TSV2OUT` version-1 receipt.
+Production output-aware search uses the canonical `TSV2OUT` version-2 receipt.
+The earlier v1 layout remains strictly inspectable for audit continuity but is
+bridge-ineligible because it predates runtime-comparable final-logit evidence;
+missing evidence is never synthesized during reopen.
 Its source model, activation cache, token stream, held-out validation set,
 block/sliding-window schedule, objective weights, temperature, batch count and
 restart count form one immutable specification identity. Candidate evaluation
 streams one output batch at a time, binds exact teacher/student bytes, reports
 block MSE plus final-logit teacher cross-entropy and temperature-scaled KL, and
 selects a complete deterministic restart set with content-ID tie breaking.
+Every candidate also carries a final-logit-only digest and exact batch/value
+counts in the same ordered f32 evidence domain used by Qwen runtime execution;
+this is distinct from the aggregate block-plus-logit student digest. The shared
+domain makes execution equality testable without equating unlike hashes.
 Strict reopen rejects corruption, noncanonical candidate order, missing basins
 and teacher drift between basins. This core receipt is not flagship evidence
 until plan 0043 binds its selected candidate to the corresponding immutable
