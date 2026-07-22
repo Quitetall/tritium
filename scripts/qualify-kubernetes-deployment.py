@@ -34,7 +34,7 @@ manifest_identity = RUNTIME["manifest_identity"]
 OCI_ARCHIVE = runpy.run_path(Path(__file__).with_name("verify-oci-archive.py"))
 validate_oci_archive = OCI_ARCHIVE["validate"]
 
-SCHEMA = "tritium.kubernetes-deployment-qualification.v13"
+SCHEMA = "tritium.kubernetes-deployment-qualification.v14"
 HEX = frozenset("0123456789abcdef")
 SAFE_NAME = re.compile(r"[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?")
 SAFE_SECRET_KEY = re.compile(r"[A-Za-z0-9](?:[-._A-Za-z0-9]{0,251}[A-Za-z0-9])?")
@@ -85,6 +85,11 @@ SLOW_COLLECTOR_CONNECTIONS = 8
 SLOW_COLLECTOR_HOLD_MS = 3_000
 SLOW_COLLECTOR_BUDGET_MS = 30_000
 STARTUP_FAILURE_BUDGET_MS = 120_000
+CUDA_DEVICE_LOSS_BUDGET_MS = 300_000
+CUDA_DEVICE_LOSS_ENV = "TRITIUM_DESTRUCTIVE_CUDA_LOSS_QUALIFICATION"
+CUDA_DEVICE_LOSS_SIGNAL_COMMAND = (
+    'set -- $(pidof tritium-serve); [ "$#" -eq 1 ]; kill -USR2 "$1"'
+)
 QUALIFICATION_METRICS = {
     "tritium_chat_requests_total", "tritium_tokens_out_total",
     "tritium_worker_alive", "tritium_backend_faults_total",
@@ -109,6 +114,11 @@ MISSING_SECRET_TRANSITIONS = [
 STARTUP_ARGUMENT_TRANSITIONS = [
     "baseline_ready", "fault_applied", "process_exit_observed",
     "argument_restored", "recovery_ready",
+]
+CUDA_DEVICE_LOSS_TRANSITIONS = [
+    "baseline_ready", "qualification_gate_enabled", "fault_baseline_ready",
+    "signal_sent", "backend_fault_latched", "watchdog_replaced",
+    "process_recovered", "qualification_gate_removed", "recovery_ready",
 ]
 
 
@@ -157,7 +167,7 @@ def expected_checks(flavor: str) -> list[str]:
     return [*CHECKS, *(
         ["keda-scale-signal", "prometheus-collector-recovery",
          "slow-prometheus-collector"]
-        if flavor == "cpu" else []
+        if flavor == "cpu" else ["cuda-device-loss-recovery"]
     )]
 
 
@@ -382,6 +392,71 @@ def request_json(url: str, token: str, *, body: dict[str, Any] | None = None,
     if not isinstance(value, dict):
         raise DeploymentError(f"response is not a JSON object: {url}")
     return value
+
+
+def request_error_json(url: str, token: str, *, expected_status: int,
+                       body: dict[str, Any] | None = None,
+                       timeout: float = 30.0) -> dict[str, Any]:
+    payload = None if body is None else canonical(body)
+    req = urllib.request.Request(url, data=payload)
+    req.add_header("Authorization", f"Bearer {token}")
+    if payload is not None:
+        req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            status = response.status
+            raw = response.read(MAX_RESPONSE_BYTES + 1)
+    except urllib.error.HTTPError as error:
+        status = error.code
+        raw = error.read(MAX_RESPONSE_BYTES + 1)
+    except (OSError, urllib.error.URLError) as error:
+        raise DeploymentError(f"request failed: {url}: {error}") from error
+    if len(raw) > MAX_RESPONSE_BYTES:
+        raise DeploymentError(f"response exceeds byte limit: {url}")
+    if status != expected_status:
+        raise DeploymentError(
+            f"request status {status} differs from expected {expected_status}: {url}"
+        )
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise DeploymentError(f"error response is malformed JSON: {url}") from error
+    if not isinstance(value, dict):
+        raise DeploymentError(f"error response is not a JSON object: {url}")
+    return {
+        "status": status, "body": value,
+        "body_sha256": hashlib.sha256(canonical(value)).hexdigest(),
+    }
+
+
+def qualified_generation_sha256(value: Any, scenario: str, model_id: str) -> str:
+    fields = {"id", "object", "created", "model", "choices", "usage"}
+    choices = value.get("choices") if isinstance(value, dict) else None
+    choice = choices[0] if isinstance(choices, list) and len(choices) == 1 else None
+    message = choice.get("message") if isinstance(choice, dict) else None
+    usage = value.get("usage") if isinstance(value, dict) else None
+    if (not isinstance(value, dict) or set(value) != fields
+            or not isinstance(value.get("id"), str)
+            or not value["id"].startswith("chatcmpl-")
+            or value.get("object") != "chat.completion"
+            or type(value.get("created")) is not int or value["created"] < 0
+            or value.get("model") != model_id
+            or not isinstance(choice, dict)
+            or set(choice) != {"index", "message", "finish_reason"}
+            or type(choice.get("index")) is not int or choice["index"] != 0
+            or not isinstance(message, dict)
+            or set(message) != {"role", "content"}
+            or message.get("role") != "assistant"
+            or not isinstance(message.get("content"), str)
+            or choice.get("finish_reason") not in {"stop", "length"}
+            or not isinstance(usage, dict)
+            or set(usage) != {"prompt_tokens", "completion_tokens", "total_tokens"}
+            or any(type(usage.get(key)) is not int or usage[key] < 0 for key in usage)
+            or usage["prompt_tokens"] < 1 or usage["completion_tokens"] != 1
+            or usage["total_tokens"] !=
+            usage["prompt_tokens"] + usage["completion_tokens"]):
+        raise DeploymentError(f"{scenario} generation response differs")
+    return hashlib.sha256(canonical(value)).hexdigest()
 
 
 def public_json(url: str, timeout: float) -> dict[str, Any]:
@@ -1393,6 +1468,454 @@ def qualify_watchdog_restart(kubectl_base: list[str], *, pod_name: str,
     raise DeploymentError("watchdog did not replace the stopped serving process")
 
 
+def cuda_device_loss_env_contract(document: dict[str, Any]) -> dict[str, Any]:
+    metadata = document.get("metadata", {})
+    containers = document.get("spec", {}).get("template", {}).get(
+        "spec", {}
+    ).get("containers")
+    if (not isinstance(metadata.get("uid"), str) or not metadata["uid"]
+            or not isinstance(metadata.get("resourceVersion"), str)
+            or not metadata["resourceVersion"]
+            or not isinstance(containers, list)):
+        raise DeploymentError("CUDA device-loss Deployment identity differs")
+    matches = [(index, container) for index, container in enumerate(containers)
+               if isinstance(container, dict) and container.get("name") == "tritium"]
+    if len(matches) != 1:
+        raise DeploymentError("CUDA device-loss main container identity differs")
+    container_index, container = matches[0]
+    env = container.get("env")
+    if not isinstance(env, list) or any(not isinstance(item, dict) for item in env):
+        raise DeploymentError("CUDA device-loss baseline environment differs")
+    if any(item.get("name") == CUDA_DEVICE_LOSS_ENV for item in env):
+        raise DeploymentError("CUDA device-loss gate is already present")
+    if len(env) != 1 or env[0].get("name") != "TRITIUM_AUTH_TOKEN":
+        raise DeploymentError("CUDA device-loss baseline environment differs")
+    secret_ref = env[0].get("valueFrom", {}).get("secretKeyRef", {})
+    if (set(env[0]) != {"name", "valueFrom"}
+            or set(env[0]["valueFrom"]) != {"secretKeyRef"}
+            or set(secret_ref) != {"name", "key"}
+            or any(not isinstance(secret_ref.get(key), str) or not secret_ref[key]
+                   for key in ("name", "key"))):
+        raise DeploymentError("CUDA device-loss auth environment differs")
+    return {
+        "deployment_uid": metadata["uid"],
+        "resource_version": metadata["resourceVersion"],
+        "container_index": container_index,
+        "env_path": f"/spec/template/spec/containers/{container_index}/env",
+        "baseline_env": env, "gate_index": len(env),
+    }
+
+
+def restore_cuda_device_loss_env(kubectl_base: list[str], *, service: str,
+                                 contract: dict[str, Any], timeout: float) -> tuple[dict[str, Any], str]:
+    live = run_json(
+        kubectl_base + ["get", f"deployment/{service}", "-o", "json"], timeout,
+    )
+    containers = live.get("spec", {}).get("template", {}).get(
+        "spec", {}
+    ).get("containers", [])
+    if live.get("metadata", {}).get("uid") != contract["deployment_uid"]:
+        raise DeploymentError("CUDA device-loss cleanup Deployment identity differs")
+    index = contract["container_index"]
+    env = containers[index].get("env") if index < len(containers) else None
+    if not isinstance(env, list):
+        raise DeploymentError("CUDA device-loss cleanup environment differs")
+    owned = [position for position, item in enumerate(env)
+             if isinstance(item, dict) and item.get("name") == CUDA_DEVICE_LOSS_ENV]
+    restore_patch = []
+    if owned:
+        if (len(owned) != 1 or env[owned[0]] != {
+            "name": CUDA_DEVICE_LOSS_ENV, "value": "1",
+        }):
+            raise DeploymentError("CUDA device-loss cleanup found ambiguous gate state")
+        path = f"{contract['env_path']}/{owned[0]}"
+        restore_patch = [
+            {"op": "test", "path": "/metadata/uid",
+             "value": contract["deployment_uid"]},
+            {"op": "test", "path": path, "value": env[owned[0]]},
+            {"op": "remove", "path": path},
+        ]
+        payload = canonical(restore_patch).decode().strip()
+        restore_error = None
+        try:
+            run(kubectl_base + [
+                "patch", f"deployment/{service}", "--type=json", f"--patch={payload}",
+            ], timeout)
+        except DeploymentError as error:
+            restore_error = error
+        live = run_json(
+            kubectl_base + ["get", f"deployment/{service}", "-o", "json"], timeout,
+        )
+        containers = live.get("spec", {}).get("template", {}).get(
+            "spec", {}
+        ).get("containers", [])
+        final_env = containers[index].get("env") if index < len(containers) else None
+        if (live.get("metadata", {}).get("uid") != contract["deployment_uid"]
+                or final_env != contract["baseline_env"]):
+            if restore_error is not None:
+                raise DeploymentError("CUDA device-loss cleanup is unproven") from restore_error
+            raise DeploymentError("CUDA device-loss cleanup preserved foreign drift")
+    else:
+        if env != contract["baseline_env"]:
+            raise DeploymentError("CUDA device-loss gate vanished with foreign drift")
+    return live, hashlib.sha256(
+        canonical(restore_patch).decode().strip().encode()
+    ).hexdigest()
+
+
+def wait_for_device_loss_replacement(kubectl_base: list[str], *, pod_name: str,
+                                     before: dict[str, Any], deadline: float,
+                                     watchdog: dict[str, Any]) -> dict[str, Any]:
+    while time.monotonic() < deadline:
+        current = container_identity(
+            run_json(kubectl_base + ["get", f"pod/{pod_name}", "-o", "json"],
+                     max(1, deadline - time.monotonic())),
+            pod_name, "tritium",
+        )
+        if current["pod_uid"] != before["pod_uid"]:
+            raise DeploymentError("CUDA device loss replaced the pod instead of the process")
+        if current["restart_count"] > before["restart_count"] + 1:
+            raise DeploymentError("CUDA device loss caused repeated process restarts")
+        if current["restart_count"] == before["restart_count"] + 1:
+            if (current["container_id"] == before["container_id"]
+                    or current["last_exit_code"] != 0):
+                raise DeploymentError("CUDA device-loss process replacement differs")
+            return {
+                "pod_uid": before["pod_uid"],
+                "container_id_before": before["container_id"],
+                "container_id_after": current["container_id"],
+                "restart_count_before": before["restart_count"],
+                "restart_count_after": current["restart_count"],
+                "last_exit_code": current["last_exit_code"],
+                "watchdog": watchdog,
+            }
+        time.sleep(1)
+    raise DeploymentError("watchdog did not replace the CUDA-faulted serving process")
+
+
+def collect_device_loss_lineage(kubectl_base: list[str], *, pod_name: str,
+                                service: str, deployment_uid: str,
+                                timeout: float) -> dict[str, Any]:
+    pod = run_json(kubectl_base + ["get", f"pod/{pod_name}", "-o", "json"], timeout)
+    pod_metadata = pod.get("metadata", {})
+    replica_set = controller_owner(pod_metadata, "ReplicaSet")
+    replica = run_json(kubectl_base + [
+        "get", f"replicaset/{replica_set['name']}", "-o", "json",
+    ], timeout)
+    if replica.get("metadata", {}).get("uid") != replica_set["uid"]:
+        raise DeploymentError("CUDA device-loss ReplicaSet identity differs")
+    deployment = controller_owner(replica.get("metadata", {}), "Deployment")
+    if deployment != {"name": service, "uid": deployment_uid}:
+        raise DeploymentError("CUDA device-loss pod lineage differs")
+    return {
+        "pod_name": pod_name, "pod_uid": pod_metadata.get("uid"),
+        "replica_set_name": replica_set["name"],
+        "replica_set_uid": replica_set["uid"],
+        "replica_set_owner": {
+            "kind": "Deployment", "name": deployment["name"],
+            "uid": deployment["uid"],
+        },
+    }
+
+
+def qualify_cuda_device_loss(
+        kubectl_base: list[str], *, service: str, selector: str,
+        deployment: dict[str, Any], baseline: dict[str, Any], service_port: int,
+        token: str, model_id: str, prompt: str, timeout: float,
+        request_timeout: float, revision: str, profile: str, manifest_blake3: str,
+        release: str, expected_startup: dict[str, Any],
+        watchdog: dict[str, Any], qualification_started: float) -> dict[str, Any]:
+    began = time.monotonic()
+    started_elapsed_ms = (began - qualification_started) * 1000
+    deadline = began + min(timeout, CUDA_DEVICE_LOSS_BUDGET_MS / 1000)
+    if started_elapsed_ms <= 0:
+        raise DeploymentError("CUDA device-loss run-relative start differs")
+
+    def remaining() -> float:
+        value = deadline - time.monotonic()
+        if value <= 0:
+            raise DeploymentError("CUDA device-loss deadline expired")
+        return value
+
+    transitions = []
+
+    def record(state: str) -> None:
+        transitions.append({
+            "state": state, "elapsed_ms": (time.monotonic() - began) * 1000,
+            "observed_at_utc": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+        })
+
+    contract = cuda_device_loss_env_contract(deployment)
+    record("baseline_ready")
+    gate = {"name": CUDA_DEVICE_LOSS_ENV, "value": "1"}
+    fault_patch = [
+        {"op": "test", "path": "/metadata/uid",
+         "value": contract["deployment_uid"]},
+        {"op": "test", "path": "/metadata/resourceVersion",
+         "value": contract["resource_version"]},
+        {"op": "add", "path": f"{contract['env_path']}/-", "value": gate},
+    ]
+    fault_payload = canonical(fault_patch).decode().strip()
+    patch_attempted = False
+    fault_version = None
+    restored = None
+    restore_patch_sha256 = None
+    evidence = None
+    try:
+        patch_attempted = True
+        run(kubectl_base + [
+            "patch", f"deployment/{service}", "--type=json", f"--patch={fault_payload}",
+        ], remaining())
+        faulted = run_json(
+            kubectl_base + ["get", f"deployment/{service}", "-o", "json"], remaining(),
+        )
+        fault_version = faulted.get("metadata", {}).get("resourceVersion")
+        containers = faulted.get("spec", {}).get("template", {}).get(
+            "spec", {}
+        ).get("containers", [])
+        fault_env = containers[contract["container_index"]].get("env")
+        if (faulted.get("metadata", {}).get("uid") != contract["deployment_uid"]
+                or not isinstance(fault_version, str)
+                or fault_version in {"", contract["resource_version"]}
+                or fault_env != [*contract["baseline_env"], gate]):
+            raise DeploymentError("CUDA device-loss gate patch was not admitted exactly")
+        record("qualification_gate_enabled")
+        run(kubectl_base + ["rollout", "status", f"deployment/{service}",
+                            f"--timeout={math.ceil(remaining())}s"], remaining())
+        fault_baseline = pod_snapshot(run_json(
+            kubectl_base + ["get", "pods", "-l", selector, "-o", "json"], remaining(),
+        ), "cuda")
+        record("fault_baseline_ready")
+        pod_name = fault_baseline["pods"][0]["name"]
+        lineage = collect_device_loss_lineage(
+            kubectl_base, pod_name=pod_name, service=service,
+            deployment_uid=contract["deployment_uid"], timeout=remaining(),
+        )
+        before = container_identity(
+            run_json(kubectl_base + ["get", f"pod/{pod_name}", "-o", "json"], remaining()),
+            pod_name, "tritium",
+        )
+        port = free_port()
+        url = f"http://127.0.0.1:{port}"
+        process, ready = port_forward(
+            kubectl_base + ["port-forward", f"pod/{pod_name}",
+                            f"{port}:{service_port}", "--address", "127.0.0.1"],
+            deadline, url, token,
+        )
+        request_body = {
+            "model": model_id,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0, "max_tokens": 1,
+        }
+        try:
+            fault_startup = validate_ready(
+                ready, revision, "cuda", profile, manifest_blake3, release,
+            )
+            if fault_startup != expected_startup:
+                raise DeploymentError("CUDA device-loss baseline startup receipt differs")
+            baseline_generation = request_json(
+                url + "/v1/chat/completions", token, body=request_body,
+                timeout=min(request_timeout, remaining()),
+            )
+            baseline_generation_sha256 = qualified_generation_sha256(
+                baseline_generation, "CUDA device-loss baseline", model_id,
+            )
+            baseline_metrics = metrics_snapshot(request(
+                url + "/metrics", token, timeout=min(request_timeout, remaining())
+            ).decode("utf-8"))
+            run(kubectl_base + [
+                "exec", f"pod/{pod_name}", "-c", "authenticated-probe", "--",
+                "sh", "-ec", CUDA_DEVICE_LOSS_SIGNAL_COMMAND,
+            ], min(30, remaining()))
+            record("signal_sent")
+            fault_response = request_error_json(
+                url + "/v1/chat/completions", token, expected_status=500,
+                body=request_body, timeout=min(request_timeout, remaining()),
+            )
+            error = fault_response.get("body", {}).get("error")
+            message = error.get("message") if isinstance(error, dict) else None
+            if (not isinstance(error, dict)
+                    or set(error) != {"message", "type", "param", "code"}
+                    or error.get("type") != "server_error"
+                    or error.get("param") is not None or error.get("code") is not None
+                    or not isinstance(message, str)
+                    or "destructive CUDA context-loss qualification observed sticky driver failure:" not in message):
+                raise DeploymentError("CUDA device-loss fault response differs")
+            health = request_error_json(
+                url + "/healthz", token, expected_status=503,
+                timeout=min(request_timeout, remaining()),
+            )
+            readiness = request_error_json(
+                url + "/readyz", token, expected_status=503,
+                timeout=min(request_timeout, remaining()),
+            )
+            latched = request_error_json(
+                url + "/v1/chat/completions", token, expected_status=503,
+                body=request_body, timeout=min(request_timeout, remaining()),
+            )
+            fault_metrics = fault_metrics_snapshot(request(
+                url + "/metrics", token, timeout=min(request_timeout, remaining())
+            ).decode("utf-8"), baseline_metrics)
+            if health["body"] != {
+                "status": "unhealthy", "detail": "backend fault latched",
+                "model": model_id, "worker_alive": True,
+            }:
+                raise DeploymentError("CUDA device-loss health latch differs")
+            ready_body = readiness["body"]
+            if (set(ready_body) != {
+                    "status", "model", "worker_alive", "draining",
+                    "backend_faulted", "queue_depth", "production_artifact",
+                    "artifact_ready", "release_gate", "startup_receipt"}
+                    or ready_body.get("status") != "not_ready"
+                    or ready_body.get("model") != model_id
+                    or ready_body.get("worker_alive") is not True
+                    or ready_body.get("draining") is not False
+                    or ready_body.get("backend_faulted") is not True
+                    or ready_body.get("queue_depth") != 0
+                    or ready_body.get("production_artifact") is not True
+                    or ready_body.get("artifact_ready") is not True
+                    or ready_body.get("release_gate") != "production_artifact_admitted"
+                    or ready_body.get("startup_receipt") != expected_startup):
+                raise DeploymentError("CUDA device-loss readiness latch differs")
+            if latched["body"] != {
+                "error": {"message": "server is not ready", "type": "server_error",
+                          "param": None, "code": None},
+            }:
+                raise DeploymentError("CUDA device-loss new-work rejection differs")
+            record("backend_fault_latched")
+        finally:
+            stop_forward(process)
+        replacement_started = time.monotonic()
+        replacement = wait_for_device_loss_replacement(
+            kubectl_base, pod_name=pod_name, before=before,
+            deadline=min(deadline, replacement_started + watchdog["budget_ms"] / 1000),
+            watchdog=watchdog,
+        )
+        replacement["replacement_ms"] = (time.monotonic() - replacement_started) * 1000
+        previous_log = run(kubectl_base + [
+            "logs", f"pod/{pod_name}", "--container=tritium", "--previous",
+        ], remaining())
+        armed_lines = [line for line in previous_log.splitlines()
+                       if "destructive CUDA context-loss qualification SIGUSR2 received; armed=true" in line]
+        fault_lines = [line for line in previous_log.splitlines()
+                       if "backend fault latched:" in line and
+                       "observed sticky driver failure:" in line]
+        if len(armed_lines) != 1 or len(fault_lines) != 1:
+            raise DeploymentError("CUDA device-loss previous logs differ")
+        logs = {
+            "sha256": hashlib.sha256(previous_log.encode()).hexdigest(),
+            "armed_line": armed_lines[0], "fault_line": fault_lines[0],
+        }
+        record("watchdog_replaced")
+        recovery_port = free_port()
+        recovery_url = f"http://127.0.0.1:{recovery_port}"
+        recovery_process, recovery_ready = port_forward(
+            kubectl_base + ["port-forward", f"pod/{pod_name}",
+                            f"{recovery_port}:{service_port}", "--address", "127.0.0.1"],
+            deadline, recovery_url, token,
+        )
+        try:
+            process_startup = validate_ready(
+                recovery_ready, revision, "cuda", profile, manifest_blake3, release,
+            )
+            if process_startup != expected_startup:
+                raise DeploymentError("CUDA device-loss process recovery startup differs")
+            process_generation = request_json(
+                recovery_url + "/v1/chat/completions", token, body=request_body,
+                timeout=min(request_timeout, remaining()),
+            )
+            process_generation_sha256 = qualified_generation_sha256(
+                process_generation, "CUDA device-loss process recovery", model_id,
+            )
+            process_metrics = metrics_snapshot(request(
+                recovery_url + "/metrics", token,
+                timeout=min(request_timeout, remaining()),
+            ).decode("utf-8"))
+        finally:
+            stop_forward(recovery_process)
+        record("process_recovered")
+        evidence = {
+            "baseline": baseline, "fault_baseline": fault_baseline, "lineage": lineage,
+            "container_before": before, "fault_startup_receipt": fault_startup,
+            "baseline_generation_response_sha256": baseline_generation_sha256,
+            "baseline_metrics": baseline_metrics, "fault_response": fault_response,
+            "health": health, "readiness": readiness,
+            "latched_generation": latched, "fault_metrics": fault_metrics,
+            "replacement": replacement, "logs": logs,
+            "process_startup_receipt": process_startup,
+            "process_generation_response_sha256": process_generation_sha256,
+            "process_metrics": process_metrics,
+        }
+    finally:
+        if patch_attempted:
+            restored, restore_patch_sha256 = restore_cuda_device_loss_env(
+                kubectl_base, service=service, contract=contract,
+                timeout=min(timeout, 60),
+            )
+            record("qualification_gate_removed")
+    if evidence is None or restored is None or restore_patch_sha256 is None:
+        raise DeploymentError("CUDA device-loss evidence is incomplete")
+    restored_version = restored.get("metadata", {}).get("resourceVersion")
+    if (not isinstance(restored_version, str) or not restored_version
+            or restored_version in {contract["resource_version"], fault_version}):
+        raise DeploymentError("CUDA device-loss restore resource version differs")
+    run(kubectl_base + ["rollout", "status", f"deployment/{service}",
+                        f"--timeout={math.ceil(remaining())}s"], remaining())
+    recovered = pod_snapshot(run_json(
+        kubectl_base + ["get", "pods", "-l", selector, "-o", "json"], remaining(),
+    ), "cuda")
+    port = free_port()
+    url = f"http://127.0.0.1:{port}"
+    process, ready = port_forward(
+        kubectl_base + ["port-forward", f"service/{service}",
+                        f"{port}:{service_port}", "--address", "127.0.0.1"],
+        deadline, url, token,
+    )
+    try:
+        startup = validate_ready(ready, revision, "cuda", profile, manifest_blake3, release)
+        if startup != expected_startup:
+            raise DeploymentError("CUDA device-loss final recovery startup differs")
+        generation = request_json(
+            url + "/v1/chat/completions", token,
+            body={"model": model_id,
+                  "messages": [{"role": "user", "content": prompt}],
+                  "temperature": 0, "max_tokens": 1},
+            timeout=min(request_timeout, remaining()),
+        )
+        generation_sha256 = qualified_generation_sha256(
+            generation, "CUDA device-loss final recovery", model_id,
+        )
+        metrics = metrics_snapshot(request(
+            url + "/metrics", token, timeout=min(request_timeout, remaining())
+        ).decode("utf-8"))
+    finally:
+        stop_forward(process)
+    record("recovery_ready")
+    return {
+        "deployment_uid": contract["deployment_uid"],
+        "baseline_resource_version": contract["resource_version"],
+        "fault_resource_version": fault_version,
+        "restored_resource_version": restored_version,
+        "container_index": contract["container_index"],
+        "env_path": contract["env_path"], "gate_index": contract["gate_index"],
+        "env_name": CUDA_DEVICE_LOSS_ENV, "env_value": "1",
+        "fault_patch_sha256": hashlib.sha256(fault_payload.encode()).hexdigest(),
+        "restore_patch_sha256": restore_patch_sha256,
+        "signal_command_sha256": hashlib.sha256(
+            CUDA_DEVICE_LOSS_SIGNAL_COMMAND.encode()
+        ).hexdigest(),
+        "observation_budget_ms": CUDA_DEVICE_LOSS_BUDGET_MS,
+        "started_elapsed_ms": started_elapsed_ms,
+        "duration_ms": (time.monotonic() - began) * 1000,
+        **evidence,
+        "request": request_evidence(model_id, prompt, temperature=0, max_tokens=1),
+        "cleanup": {"status": "restored"}, "recovered": recovered,
+        "startup_receipt": startup,
+        "generation_response_sha256": generation_sha256,
+        "metrics": metrics, "transitions": transitions,
+    }
+
+
 def validate_receipt_snapshot(snapshot: Any, label: str,
                               expected_count: int = 1) -> dict[str, Any]:
     if not isinstance(snapshot, dict) or set(snapshot) != {"pods"}:
@@ -2306,13 +2829,18 @@ def collect_cuda_node_evidence(kubectl_base: list[str], *, node: str, image: str
             "output_sha256": hashlib.sha256(output.encode()).hexdigest()}
 
 
-def metrics_snapshot(metrics: str) -> dict[str, Any]:
+def qualification_metric_values(metrics: str) -> dict[str, float]:
     values = {}
     for name in sorted(QUALIFICATION_METRICS):
         match = re.search(rf"(?m)^{name} ([0-9]+(?:\.[0-9]+)?)$", metrics)
         if match is None:
             raise DeploymentError(f"cluster metrics lack {name}")
         values[name] = float(match.group(1))
+    return values
+
+
+def metrics_snapshot(metrics: str) -> dict[str, Any]:
+    values = qualification_metric_values(metrics)
     if values["tritium_chat_requests_total"] < 1 or values["tritium_tokens_out_total"] < 1:
         raise DeploymentError("cluster metrics did not observe generation")
     if values["tritium_worker_alive"] != 1:
@@ -2320,6 +2848,24 @@ def metrics_snapshot(metrics: str) -> dict[str, Any]:
     if (values["tritium_backend_faults_total"] != 0
             or values["tritium_backend_faulted"] != 0):
         raise DeploymentError("cluster metrics report a backend fault")
+    return {"sha256": hashlib.sha256(metrics.encode()).hexdigest(), "values": values}
+
+
+def fault_metrics_snapshot(metrics: str, baseline: dict[str, Any]) -> dict[str, Any]:
+    values = qualification_metric_values(metrics)
+    baseline_values = baseline.get("values") if isinstance(baseline, dict) else None
+    if not isinstance(baseline_values, dict):
+        raise DeploymentError("CUDA device-loss baseline metrics are malformed")
+    if values["tritium_worker_alive"] != 1:
+        raise DeploymentError("CUDA device-loss metrics report a dead worker")
+    if (values["tritium_backend_faults_total"] != 1
+            or values["tritium_backend_faulted"] != 1):
+        raise DeploymentError("CUDA device-loss metrics do not report one latched fault")
+    if (values["tritium_chat_requests_total"] !=
+            baseline_values.get("tritium_chat_requests_total", -1) + 1
+            or values["tritium_tokens_out_total"] !=
+            baseline_values.get("tritium_tokens_out_total")):
+        raise DeploymentError("CUDA device-loss request accounting differs")
     return {"sha256": hashlib.sha256(metrics.encode()).hexdigest(), "values": values}
 
 
@@ -3247,6 +3793,240 @@ def validate_startup_argument_failure(
     )
     if trace[-1]["elapsed_ms"] > value["duration_ms"]:
         raise DeploymentError(f"deployment {scenario} transition exceeds duration")
+    return value
+
+
+def validate_cuda_device_loss(
+        value: Any, *, model_id: str, deployment_name: str,
+        deployment_uid: str, startup_receipt: dict[str, Any],
+        service_port: int, run_duration_ms: float) -> dict[str, Any]:
+    fields = {
+        "deployment_uid", "baseline_resource_version", "fault_resource_version",
+        "restored_resource_version", "container_index", "env_path", "env_name",
+        "env_value", "fault_patch_sha256", "restore_patch_sha256",
+        "signal_command_sha256", "observation_budget_ms", "started_elapsed_ms",
+        "duration_ms", "baseline", "fault_baseline", "lineage", "container_before",
+        "fault_startup_receipt", "baseline_generation_response_sha256",
+        "baseline_metrics", "fault_response", "health", "readiness",
+        "latched_generation", "fault_metrics", "replacement", "logs",
+        "process_startup_receipt", "process_generation_response_sha256",
+        "process_metrics", "request", "cleanup", "recovered", "startup_receipt",
+        "generation_response_sha256", "metrics", "transitions", "gate_index",
+    }
+    versions = [value.get(key) if isinstance(value, dict) else None for key in (
+        "baseline_resource_version", "fault_resource_version",
+        "restored_resource_version",
+    )]
+    if (not isinstance(value, dict) or set(value) != fields
+            or value.get("deployment_uid") != deployment_uid
+            or any(not isinstance(version, str) or not version for version in versions)
+            or len(set(versions)) != 3
+            or value.get("container_index") != 0
+            or value.get("env_path") != "/spec/template/spec/containers/0/env"
+            or value.get("gate_index") != 1
+            or value.get("env_name") != CUDA_DEVICE_LOSS_ENV
+            or value.get("env_value") != "1"
+            or value.get("observation_budget_ms") != CUDA_DEVICE_LOSS_BUDGET_MS
+            or any(type(value.get(key)) not in {int, float}
+                   or not math.isfinite(value[key]) or value[key] <= 0
+                   for key in ("started_elapsed_ms", "duration_ms"))
+            or value["duration_ms"] > CUDA_DEVICE_LOSS_BUDGET_MS
+            or value["started_elapsed_ms"] + value["duration_ms"] > run_duration_ms):
+        raise DeploymentError("deployment CUDA device-loss identity or bounds differ")
+    gate = {"name": CUDA_DEVICE_LOSS_ENV, "value": "1"}
+    fault_patch = canonical([
+        {"op": "test", "path": "/metadata/uid", "value": deployment_uid},
+        {"op": "test", "path": "/metadata/resourceVersion", "value": versions[0]},
+        {"op": "add", "path": f"{value['env_path']}/-", "value": gate},
+    ]).decode().strip()
+    restore_patch = canonical([
+        {"op": "test", "path": "/metadata/uid", "value": deployment_uid},
+        {"op": "test", "path": f"{value['env_path']}/{value['gate_index']}",
+         "value": gate},
+        {"op": "remove", "path": f"{value['env_path']}/{value['gate_index']}"},
+    ]).decode().strip()
+    if (value.get("fault_patch_sha256") != hashlib.sha256(
+            fault_patch.encode()
+        ).hexdigest() or value.get("restore_patch_sha256") != hashlib.sha256(
+            restore_patch.encode()
+        ).hexdigest() or value.get("signal_command_sha256") != hashlib.sha256(
+            CUDA_DEVICE_LOSS_SIGNAL_COMMAND.encode()
+        ).hexdigest()):
+        raise DeploymentError("deployment CUDA device-loss mutation evidence differs")
+    baseline = validate_receipt_snapshot(
+        value.get("baseline"), "CUDA device-loss baseline",
+    )
+    fault_baseline = validate_receipt_snapshot(
+        value.get("fault_baseline"), "CUDA device-loss fault baseline",
+    )
+    recovered = validate_receipt_snapshot(
+        value.get("recovered"), "CUDA device-loss recovery",
+    )
+    fault_pod = fault_baseline["pods"][0]
+    baseline_uids = {pod["uid"] for pod in baseline["pods"]}
+    fault_uids = {fault_pod["uid"]}
+    recovered_uids = {pod["uid"] for pod in recovered["pods"]}
+    if baseline_uids & fault_uids or fault_uids & recovered_uids:
+        raise DeploymentError("deployment CUDA device-loss rollout retained a pod UID")
+    lineage = value.get("lineage")
+    if (not isinstance(lineage, dict) or set(lineage) != {
+            "pod_name", "pod_uid", "replica_set_name", "replica_set_uid",
+            "replica_set_owner"}
+            or lineage.get("pod_name") != fault_pod["name"]
+            or lineage.get("pod_uid") != fault_pod["uid"]
+            or any(not isinstance(lineage.get(key), str) or not lineage[key]
+                   for key in ("replica_set_name", "replica_set_uid"))
+            or lineage.get("replica_set_owner") != {
+                "kind": "Deployment", "name": deployment_name,
+                "uid": deployment_uid,
+            }):
+        raise DeploymentError("deployment CUDA device-loss controller lineage differs")
+    before = value.get("container_before")
+    if (not isinstance(before, dict) or set(before) != {
+            "pod_uid", "container_id", "restart_count", "last_exit_code"}
+            or before.get("pod_uid") != fault_pod["uid"]
+            or not isinstance(before.get("container_id"), str) or not before["container_id"]
+            or type(before.get("restart_count")) is not int
+            or before["restart_count"] < 0
+            or before.get("last_exit_code") is not None):
+        raise DeploymentError("deployment CUDA device-loss baseline process differs")
+    for key in ("fault_startup_receipt", "process_startup_receipt", "startup_receipt"):
+        if value.get(key) != startup_receipt:
+            raise DeploymentError("deployment CUDA device-loss changed startup receipt")
+    for key in (
+        "baseline_generation_response_sha256",
+        "process_generation_response_sha256", "generation_response_sha256",
+    ):
+        exact_hex(value.get(key), 64, f"CUDA device-loss {key} SHA-256")
+    baseline_values = validate_metrics_evidence(
+        value.get("baseline_metrics"), "CUDA device-loss baseline",
+    )
+    validate_metrics_evidence(value.get("process_metrics"), "CUDA device-loss process recovery")
+    validate_metrics_evidence(value.get("metrics"), "CUDA device-loss final recovery")
+
+    def validate_error_response(response: Any, status: int, label: str) -> dict[str, Any]:
+        if (not isinstance(response, dict) or set(response) != {
+                "status", "body", "body_sha256"}
+                or response.get("status") != status
+                or not isinstance(response.get("body"), dict)):
+            raise DeploymentError(f"deployment CUDA device-loss {label} response differs")
+        exact_hex(response.get("body_sha256"), 64,
+                  f"CUDA device-loss {label} body SHA-256")
+        if response["body_sha256"] != hashlib.sha256(
+                canonical(response["body"])
+            ).hexdigest():
+            raise DeploymentError(
+                f"deployment CUDA device-loss {label} body digest differs"
+            )
+        return response["body"]
+
+    fault_body = validate_error_response(value.get("fault_response"), 500, "fault")
+    fault_error = fault_body.get("error") if isinstance(fault_body, dict) else None
+    if (not isinstance(fault_error, dict)
+            or set(fault_error) != {"message", "type", "param", "code"}
+            or fault_error.get("type") != "server_error"
+            or fault_error.get("param") is not None or fault_error.get("code") is not None
+            or not isinstance(fault_error.get("message"), str)
+            or "destructive CUDA context-loss qualification observed sticky driver failure:"
+            not in fault_error["message"]):
+        raise DeploymentError("deployment CUDA device-loss fault grammar differs")
+    if validate_error_response(value.get("health"), 503, "health") != {
+        "status": "unhealthy", "detail": "backend fault latched",
+        "model": model_id, "worker_alive": True,
+    }:
+        raise DeploymentError("deployment CUDA device-loss health evidence differs")
+    ready = validate_error_response(value.get("readiness"), 503, "readiness")
+    if (set(ready) != {
+            "status", "model", "worker_alive", "draining", "backend_faulted",
+            "queue_depth", "production_artifact", "artifact_ready", "release_gate",
+            "startup_receipt"}
+            or ready.get("status") != "not_ready" or ready.get("model") != model_id
+            or ready.get("worker_alive") is not True or ready.get("draining") is not False
+            or ready.get("backend_faulted") is not True or ready.get("queue_depth") != 0
+            or ready.get("production_artifact") is not True
+            or ready.get("artifact_ready") is not True
+            or ready.get("release_gate") != "production_artifact_admitted"
+            or ready.get("startup_receipt") != startup_receipt):
+        raise DeploymentError("deployment CUDA device-loss readiness evidence differs")
+    if validate_error_response(value.get("latched_generation"), 503, "latched") != {
+        "error": {"message": "server is not ready", "type": "server_error",
+                  "param": None, "code": None},
+    }:
+        raise DeploymentError("deployment CUDA device-loss new-work rejection differs")
+    fault_metrics = value.get("fault_metrics")
+    fault_values = fault_metrics.get("values") if isinstance(fault_metrics, dict) else None
+    if (not isinstance(fault_metrics, dict) or set(fault_metrics) != {"sha256", "values"}
+            or not isinstance(fault_values, dict)
+            or set(fault_values) != QUALIFICATION_METRICS
+            or fault_values.get("tritium_worker_alive") != 1
+            or fault_values.get("tritium_backend_faults_total") != 1
+            or fault_values.get("tritium_backend_faulted") != 1
+            or fault_values.get("tritium_chat_requests_total") !=
+            baseline_values["tritium_chat_requests_total"] + 1
+            or fault_values.get("tritium_tokens_out_total") !=
+            baseline_values["tritium_tokens_out_total"]):
+        raise DeploymentError("deployment CUDA device-loss fault metrics differ")
+    exact_hex(fault_metrics.get("sha256"), 64, "CUDA device-loss metrics SHA-256")
+    replacement = value.get("replacement")
+    if (not isinstance(replacement, dict) or set(replacement) != {
+            "pod_uid", "container_id_before", "container_id_after",
+            "restart_count_before", "restart_count_after", "last_exit_code",
+            "watchdog", "replacement_ms"}
+            or replacement.get("pod_uid") != before["pod_uid"]
+            or replacement.get("container_id_before") != before["container_id"]
+            or not isinstance(replacement.get("container_id_after"), str)
+            or not replacement["container_id_after"]
+            or replacement["container_id_after"] == before["container_id"]
+            or replacement.get("restart_count_before") != before["restart_count"]
+            or replacement.get("restart_count_after") != before["restart_count"] + 1
+            or replacement.get("last_exit_code") != 0
+            or replacement.get("watchdog") != expected_watchdog_policy(service_port)
+            or type(replacement.get("replacement_ms")) not in {int, float}
+            or not math.isfinite(replacement["replacement_ms"])
+            or not 0 < replacement["replacement_ms"]
+            <= min(replacement["watchdog"]["budget_ms"], value["duration_ms"])):
+        raise DeploymentError("deployment CUDA device-loss process replacement differs")
+    logs = value.get("logs")
+    if (not isinstance(logs, dict) or set(logs) != {
+            "sha256", "armed_line", "fault_line"}
+            or not isinstance(logs.get("armed_line"), str)
+            or "destructive CUDA context-loss qualification SIGUSR2 received; armed=true"
+            not in logs["armed_line"]
+            or not isinstance(logs.get("fault_line"), str)
+            or "backend fault latched:" not in logs["fault_line"]
+            or "observed sticky driver failure:" not in logs["fault_line"]):
+        raise DeploymentError("deployment CUDA device-loss log evidence differs")
+    exact_hex(logs.get("sha256"), 64, "CUDA device-loss log SHA-256")
+    request_value = value.get("request")
+    request_fields = {
+        "model", "prompt_sha256", "prompt_bytes", "temperature", "max_tokens",
+        "descriptor_sha256",
+    }
+    if (not isinstance(request_value, dict) or set(request_value) != request_fields
+            or request_value.get("model") != model_id
+            or type(request_value.get("prompt_bytes")) is not int
+            or not 0 < request_value["prompt_bytes"] <= 1024 * 1024
+            or type(request_value.get("temperature")) is not int
+            or request_value["temperature"] != 0
+            or type(request_value.get("max_tokens")) is not int
+            or request_value["max_tokens"] != 1):
+        raise DeploymentError("deployment CUDA device-loss request differs")
+    exact_hex(request_value.get("prompt_sha256"), 64,
+              "CUDA device-loss prompt SHA-256")
+    descriptor = {key: request_value[key]
+                  for key in request_fields - {"descriptor_sha256"}}
+    if request_value.get("descriptor_sha256") != hashlib.sha256(
+            canonical(descriptor)
+        ).hexdigest():
+        raise DeploymentError("deployment CUDA device-loss request descriptor differs")
+    if value.get("cleanup") != {"status": "restored"}:
+        raise DeploymentError("deployment CUDA device-loss cleanup differs")
+    trace = validate_transition_trace(
+        value.get("transitions"), expected=CUDA_DEVICE_LOSS_TRANSITIONS,
+        scenario="CUDA device-loss",
+    )
+    if trace[-1]["elapsed_ms"] > value["duration_ms"]:
+        raise DeploymentError("deployment CUDA device-loss transition exceeds duration")
     return value
 
 
@@ -4304,7 +5084,23 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
             release=args.release, expected_startup=startup,
             qualification_started=started,
         )
-        first_pod = unavailable_backend_startup["recovered"]["pods"][0]["name"]
+        cuda_device_loss = None
+        post_device_loss = unavailable_backend_startup["recovered"]
+        if args.flavor == "cuda":
+            cuda_device_loss = qualify_cuda_device_loss(
+                kubectl_base, service=service, selector=selector,
+                deployment=run_json(
+                    kubectl_base + ["get", f"deployment/{service}", "-o", "json"]
+                ), baseline=post_device_loss, service_port=service_port,
+                token=token, model_id=model_id, prompt=args.prompt,
+                timeout=args.timeout, request_timeout=args.request_timeout,
+                revision=revision, profile=args.profile,
+                manifest_blake3=manifest_id["blake3"], release=args.release,
+                expected_startup=startup, watchdog=watchdog_policy,
+                qualification_started=started,
+            )
+            post_device_loss = cuda_device_loss["recovered"]
+        first_pod = post_device_loss["pods"][0]["name"]
         watchdog = qualify_watchdog_restart(
             kubectl_base, pod_name=first_pod, timeout=args.timeout,
             contract=watchdog_policy,
@@ -4812,6 +5608,7 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
                      "missing_secret_startup": missing_secret_startup,
                      "invalid_config_startup": invalid_config_startup,
                      "unavailable_backend_startup": unavailable_backend_startup,
+                     "cuda_device_loss": cuda_device_loss,
                      "startup_receipt": startup, "restart_startup_receipt": restart_startup,
                      "update_startup_receipt": update_startup,
                      "update_strategy": "Recreate" if args.flavor == "cuda" else "RollingUpdate",
@@ -4955,6 +5752,7 @@ def validate_receipt(receipt: dict[str, Any], *, chart_path: Path, image_path: P
         "watchdog_replacement", "artifact_volume_loss", "memory_oom_recovery",
         "missing_secret_startup",
         "invalid_config_startup", "unavailable_backend_startup",
+        "cuda_device_loss",
         "startup_receipt", "restart_startup_receipt", "update_startup_receipt",
         "update_strategy", "update_config", "rollback_startup_receipt",
         "rollback_runtime", "metrics",
@@ -5435,6 +6233,17 @@ def validate_receipt(receipt: dict[str, Any], *, chart_path: Path, image_path: P
         startup_receipt=workload["startup_receipt"],
         run_duration_ms=receipt["duration_ms"],
     )
+    if receipt["flavor"] == "cuda":
+        validate_cuda_device_loss(
+            workload.get("cuda_device_loss"), model_id=workload["model_id"],
+            deployment_name=f"{workload['release_name']}-tritium",
+            deployment_uid=workload["deployment_uid"],
+            startup_receipt=workload["startup_receipt"],
+            service_port=workload["service_port"],
+            run_duration_ms=receipt["duration_ms"],
+        )
+    elif workload.get("cuda_device_loss") is not None:
+        raise DeploymentError("CPU deployment cannot contain CUDA device-loss evidence")
     if receipt["flavor"] == "cpu":
         validate_slow_collector(
             workload.get("slow_collector"), model_id=workload["model_id"],

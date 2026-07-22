@@ -434,8 +434,24 @@ responses; readiness, immutable startup identity, generation and clean metrics
 must recover before the next fault. Offline validation recomputes patches,
 controller lineage, error grammar, timing and cleanup for both CPU and CUDA.
 
+Destructive CUDA device loss now has a Kubernetes v14 qualification gate. CUDA
+receipts enable the release-only trap path through an exact guarded Deployment
+environment mutation, deliver one `SIGUSR2` from the shared-process probe, and
+require the next generation to expose a fatal, sticky driver failure. The gate
+then proves the initial `500`, latched health/readiness and new-work `503`s,
+single fault/counter deltas, exact prior-container log grammar, and watchdog
+replacement of the serving process without replacing its pod. A `finally` path
+removes only Tritium's exact injected gate even after environment reordering;
+foreign drift still fails after safe removal. The same process and the clean
+post-cleanup rollout must each preserve startup identity, complete one real
+generation and expose clean metrics. Schema-v14 offline validation recomputes
+mutation/response digests, binds Pod-to-ReplicaSet-to-Deployment lineage, and
+rejects CUDA evidence in CPU receipts. The isolated CUDA hardware test exercises
+the same trap and sticky-context contract; a schema-v14 receipt from a real
+NVIDIA Kubernetes cluster remains an empirical release gate.
+
 1. malformed/truncated/wrong-identity artifact at startup;
-2. latched backend/device loss;
+2. admitted schema-v14 CUDA device-loss receipt from a real NVIDIA cluster;
 
 Every scenario records configuration, source/image/chart/artifact digests,
 hardware, requests, expected/observed state transitions, telemetry assertions,

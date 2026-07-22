@@ -46,6 +46,10 @@ qualify_metrics_scrape_flood = MODULE["qualify_metrics_scrape_flood"]
 validate_metrics_flood = MODULE["validate_metrics_flood"]
 qualify_slow_collector = MODULE["qualify_slow_collector"]
 validate_slow_collector = MODULE["validate_slow_collector"]
+cuda_device_loss_env_contract = MODULE["cuda_device_loss_env_contract"]
+restore_cuda_device_loss_env = MODULE["restore_cuda_device_loss_env"]
+validate_cuda_device_loss = MODULE["validate_cuda_device_loss"]
+qualified_generation_sha256 = MODULE["qualified_generation_sha256"]
 auth_secret_contract = MODULE["auth_secret_contract"]
 missing_secret_failure = MODULE["missing_secret_failure"]
 restore_missing_secret_refs = MODULE["restore_missing_secret_refs"]
@@ -180,6 +184,146 @@ def startup_argument_receipt(scenario: str, flavor: str,
     }
 
 
+def cuda_device_loss_receipt(startup_receipt: dict) -> dict:
+    env_path = "/spec/template/spec/containers/0/env"
+    gate = {
+        "name": MODULE["CUDA_DEVICE_LOSS_ENV"], "value": "1",
+    }
+    fault_patch = [
+        {"op": "test", "path": "/metadata/uid", "value": "deployment-uid"},
+        {"op": "test", "path": "/metadata/resourceVersion", "value": "50"},
+        {"op": "add", "path": f"{env_path}/-", "value": gate},
+    ]
+    restore_patch = [
+        {"op": "test", "path": "/metadata/uid", "value": "deployment-uid"},
+        {"op": "test", "path": f"{env_path}/1", "value": gate},
+        {"op": "remove", "path": f"{env_path}/1"},
+    ]
+
+    def metrics(seed: str, *, requests: float = 1.0, tokens: float = 1.0,
+                faults: float = 0.0, faulted: float = 0.0) -> dict:
+        return {"sha256": seed * 64, "values": {
+            "tritium_chat_requests_total": requests,
+            "tritium_tokens_out_total": tokens,
+            "tritium_worker_alive": 1.0,
+            "tritium_backend_faults_total": faults,
+            "tritium_backend_faulted": faulted,
+        }}
+
+    fault_message = (
+        "backend error: destructive CUDA context-loss qualification observed sticky "
+        "driver failure: initial=CUDA_ERROR_LAUNCH_FAILED; "
+        "follow_up=CUDA_ERROR_LAUNCH_FAILED"
+    )
+    ready_body = {
+        "status": "not_ready", "model": "tritium", "worker_alive": True,
+        "draining": False, "backend_faulted": True, "queue_depth": 0,
+        "production_artifact": True, "artifact_ready": True,
+        "release_gate": "production_artifact_admitted",
+        "startup_receipt": dict(startup_receipt),
+    }
+    def error_response(status: int, body: dict) -> dict:
+        return {
+            "status": status, "body": body,
+            "body_sha256": hashlib.sha256(canonical(body)).hexdigest(),
+        }
+
+    return {
+        "deployment_uid": "deployment-uid",
+        "baseline_resource_version": "50", "fault_resource_version": "51",
+        "restored_resource_version": "52", "container_index": 0, "gate_index": 1,
+        "env_path": env_path, "env_name": MODULE["CUDA_DEVICE_LOSS_ENV"],
+        "env_value": "1",
+        "fault_patch_sha256": hashlib.sha256(
+            canonical(fault_patch).decode().strip().encode()
+        ).hexdigest(),
+        "restore_patch_sha256": hashlib.sha256(
+            canonical(restore_patch).decode().strip().encode()
+        ).hexdigest(),
+        "signal_command_sha256": hashlib.sha256(
+            MODULE["CUDA_DEVICE_LOSS_SIGNAL_COMMAND"].encode()
+        ).hexdigest(),
+        "observation_budget_ms": MODULE["CUDA_DEVICE_LOSS_BUDGET_MS"],
+        "started_elapsed_ms": 20_000.0, "duration_ms": 60_000.0,
+        "baseline": {"pods": [{
+            "name": "pod-cuda-baseline", "uid": "cuda-baseline-uid",
+            "node": "node-1", "restarts": 0,
+        }]},
+        "fault_baseline": {"pods": [{
+            "name": "pod-cuda-fault", "uid": "cuda-fault-uid",
+            "node": "node-1", "restarts": 0,
+        }]},
+        "lineage": {
+            "pod_name": "pod-cuda-fault", "pod_uid": "cuda-fault-uid",
+            "replica_set_name": "qualification-tritium-cuda",
+            "replica_set_uid": "cuda-rs-uid",
+            "replica_set_owner": {
+                "kind": "Deployment", "name": "qualification-tritium",
+                "uid": "deployment-uid",
+            },
+        },
+        "container_before": {
+            "pod_uid": "cuda-fault-uid", "container_id": "containerd://cuda-old",
+            "restart_count": 0, "last_exit_code": None,
+        },
+        "fault_startup_receipt": dict(startup_receipt),
+        "baseline_generation_response_sha256": "1" * 64,
+        "baseline_metrics": metrics("2"),
+        "fault_response": error_response(500, {"error": {
+            "message": fault_message, "type": "server_error",
+            "param": None, "code": None,
+        }}),
+        "health": error_response(503, {
+            "status": "unhealthy", "detail": "backend fault latched",
+            "model": "tritium", "worker_alive": True,
+        }),
+        "readiness": error_response(503, ready_body),
+        "latched_generation": error_response(503, {"error": {
+            "message": "server is not ready", "type": "server_error",
+            "param": None, "code": None,
+        }}),
+        "fault_metrics": metrics(
+            "7", requests=2.0, tokens=1.0, faults=1.0, faulted=1.0,
+        ),
+        "replacement": {
+            "pod_uid": "cuda-fault-uid",
+            "container_id_before": "containerd://cuda-old",
+            "container_id_after": "containerd://cuda-new",
+            "restart_count_before": 0, "restart_count_after": 1,
+            "last_exit_code": 0,
+            "watchdog": MODULE["expected_watchdog_policy"](8080),
+            "replacement_ms": 32000.0,
+        },
+        "logs": {
+            "sha256": "8" * 64,
+            "armed_line": (
+                "tritium-serve: destructive CUDA context-loss qualification "
+                "SIGUSR2 received; armed=true"
+            ),
+            "fault_line": f"tritium-serve: backend fault latched: {fault_message}",
+        },
+        "process_startup_receipt": dict(startup_receipt),
+        "process_generation_response_sha256": "9" * 64,
+        "process_metrics": metrics("a"),
+        "request": request_evidence(
+            "tritium", "Hello", temperature=0, max_tokens=1
+        ),
+        "cleanup": {"status": "restored"},
+        "recovered": {"pods": [{
+            "name": "pod-cuda-recovered", "uid": "cuda-recovered-uid",
+            "node": "node-1", "restarts": 0,
+        }]},
+        "startup_receipt": dict(startup_receipt),
+        "generation_response_sha256": "b" * 64,
+        "metrics": metrics("c"),
+        "transitions": [
+            {"state": state, "elapsed_ms": float(index * 5_000),
+             "observed_at_utc": f"2026-07-21T12:02:0{index}+00:00"}
+            for index, state in enumerate(MODULE["CUDA_DEVICE_LOSS_TRANSITIONS"])
+        ],
+    }
+
+
 def receipt(chart: Path, image_archive: Path, candidate: Path,
             flavor: str = "cpu") -> dict:
     startup_receipt = startup(flavor)
@@ -200,7 +344,7 @@ def receipt(chart: Path, image_archive: Path, candidate: Path,
         "schema": MODULE["SCHEMA"], "release": "1.1.0-rc.0",
         "source_revision": "a" * 40, "run_id": f"kubernetes-{flavor}-1",
         "flavor": flavor, "profile": "compact-v1",
-        "started_at_utc": "2026-07-21T12:00:00+00:00", "duration_ms": 10_000.0,
+        "started_at_utc": "2026-07-21T12:00:00+00:00", "duration_ms": 120_000.0,
         "chart_artifact": {"kind": "helm-chart", "name": chart.name,
                            "bytes": chart.stat().st_size,
                            "sha256": hashlib.sha256(chart.read_bytes()).hexdigest(),
@@ -508,6 +652,10 @@ def receipt(chart: Path, image_archive: Path, candidate: Path,
             "unavailable_backend_startup": startup_argument_receipt(
                 "unavailable_backend", flavor, startup_receipt
             ),
+            "cuda_device_loss": (
+                cuda_device_loss_receipt(startup_receipt)
+                if flavor == "cuda" else None
+            ),
             "restart_startup_receipt": dict(startup_receipt),
             "update_startup_receipt": dict(startup_receipt),
             "update_strategy": "Recreate" if flavor == "cuda" else "RollingUpdate",
@@ -748,6 +896,128 @@ def validate(value: dict, chart: Path, image: Path, manifest: Path,
 
 
 class QualifyKubernetesDeploymentTests(unittest.TestCase):
+    def test_qualified_generation_requires_one_choice(self):
+        response = {
+            "id": "chatcmpl-test", "object": "chat.completion", "created": 1,
+            "model": "tritium", "choices": [{
+                "index": 0, "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "length",
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }
+        self.assertEqual(
+            qualified_generation_sha256(response, "test", "tritium"),
+            hashlib.sha256(canonical(response)).hexdigest(),
+        )
+        malformed_responses = [
+            {}, {**response, "choices": []}, {**response, "choices": [None]},
+            {**response, "choices": [{}]},
+            {**response, "choices": [response["choices"][0], response["choices"][0]]},
+            {**response, "usage": {
+                "prompt_tokens": 1, "completion_tokens": 0, "total_tokens": 1,
+            }},
+        ]
+        for malformed in malformed_responses:
+            with self.subTest(malformed=malformed), self.assertRaisesRegex(
+                DeploymentError, "test generation response differs",
+            ):
+                qualified_generation_sha256(malformed, "test", "tritium")
+
+    def test_cuda_device_loss_env_contract_and_cleanup_are_exact(self):
+        auth_env = {
+            "name": "TRITIUM_AUTH_TOKEN",
+            "valueFrom": {"secretKeyRef": {"name": "auth", "key": "token"}},
+        }
+        deployment = {
+            "metadata": {"uid": "deployment-uid", "resourceVersion": "50"},
+            "spec": {"template": {"spec": {"containers": [
+                {"name": "tritium", "env": [auth_env]},
+                {"name": "authenticated-probe", "env": [auth_env]},
+            ]}}},
+        }
+        contract = cuda_device_loss_env_contract(deployment)
+        self.assertEqual(contract["container_index"], 0)
+        self.assertEqual(contract["gate_index"], 1)
+
+        gate = {"name": MODULE["CUDA_DEVICE_LOSS_ENV"], "value": "1"}
+        faulted = copy.deepcopy(deployment)
+        faulted["metadata"]["resourceVersion"] = "51"
+        faulted["spec"]["template"]["spec"]["containers"][0]["env"].append(gate)
+        cleaned = copy.deepcopy(deployment)
+        cleaned["metadata"]["resourceVersion"] = "52"
+        run_mock = mock.Mock(return_value="")
+        with mock.patch.dict(restore_cuda_device_loss_env.__globals__, {
+            "run": run_mock,
+            "run_json": mock.Mock(side_effect=[faulted, cleaned]),
+        }):
+            restored, patch_sha = restore_cuda_device_loss_env(
+                ["kubectl"], service="qualification-tritium",
+                contract=contract, timeout=10,
+            )
+        self.assertEqual(restored, cleaned)
+        payload = run_mock.call_args.args[0][-1]
+        self.assertIn("/spec/template/spec/containers/0/env/1", payload)
+        self.assertEqual(
+            patch_sha,
+            hashlib.sha256(payload.removeprefix("--patch=").encode()).hexdigest(),
+        )
+
+        contaminated = copy.deepcopy(deployment)
+        contaminated["spec"]["template"]["spec"]["containers"][0]["env"].append(gate)
+        with self.assertRaisesRegex(DeploymentError, "already present"):
+            cuda_device_loss_env_contract(contaminated)
+
+        replacement = copy.deepcopy(deployment)
+        replacement["metadata"] = {"uid": "replacement-uid", "resourceVersion": "60"}
+        with mock.patch.dict(restore_cuda_device_loss_env.__globals__, {
+            "run_json": mock.Mock(return_value=replacement),
+        }), self.assertRaisesRegex(DeploymentError, "Deployment identity"):
+            restore_cuda_device_loss_env(
+                ["kubectl"], service="qualification-tritium",
+                contract=contract, timeout=10,
+            )
+
+    def test_cuda_device_loss_cleanup_removes_reordered_owned_gate(self):
+        auth_env = {
+            "name": "TRITIUM_AUTH_TOKEN",
+            "valueFrom": {"secretKeyRef": {"name": "auth", "key": "token"}},
+        }
+        deployment = {
+            "metadata": {"uid": "deployment-uid", "resourceVersion": "50"},
+            "spec": {"template": {"spec": {"containers": [
+                {"name": "tritium", "env": [auth_env]},
+                {"name": "authenticated-probe", "env": [auth_env]},
+            ]}}},
+        }
+        contract = cuda_device_loss_env_contract(deployment)
+        gate = {"name": MODULE["CUDA_DEVICE_LOSS_ENV"], "value": "1"}
+        foreign = {"name": "FOREIGN_CONTROLLER_VALUE", "value": "1"}
+        for env, expected_index in (
+            ([foreign, auth_env, gate], 2), ([auth_env, gate, foreign], 1),
+        ):
+            with self.subTest(expected_index=expected_index):
+                faulted = copy.deepcopy(deployment)
+                faulted["metadata"]["resourceVersion"] = "51"
+                faulted["spec"]["template"]["spec"]["containers"][0]["env"] = env
+                cleaned = copy.deepcopy(faulted)
+                cleaned["metadata"]["resourceVersion"] = "52"
+                cleaned["spec"]["template"]["spec"]["containers"][0]["env"] = [
+                    item for item in env if item != gate
+                ]
+                run_mock = mock.Mock(return_value="")
+                with mock.patch.dict(restore_cuda_device_loss_env.__globals__, {
+                    "run": run_mock,
+                    "run_json": mock.Mock(side_effect=[faulted, cleaned]),
+                }), self.assertRaisesRegex(DeploymentError, "foreign drift"):
+                    restore_cuda_device_loss_env(
+                        ["kubectl"], service="qualification-tritium",
+                        contract=contract, timeout=10,
+                    )
+                self.assertIn(
+                    f"/spec/template/spec/containers/0/env/{expected_index}",
+                    run_mock.call_args.args[0][-1],
+                )
+
     def test_prometheus_target_absence_requires_zero_matching_active_targets(self):
         response = {"status": "success", "data": {"activeTargets": [{
             "labels": {"namespace": "other", "service": "other-service"},
@@ -2373,6 +2643,80 @@ class QualifyKubernetesDeploymentTests(unittest.TestCase):
             del value["receipt_id"]
             value["receipt_id"] = "sha256:" + hashlib.sha256(canonical(value)).hexdigest()
             with self.assertRaisesRegex(DeploymentError, "deployed hardware"):
+                validate(value, chart, image, manifest, build, candidate)
+
+    def test_receipt_validator_binds_cuda_device_loss_evidence(self):
+        for target in (
+            "patch", "fault_message", "metrics", "replacement", "transition",
+            "baseline", "timing", "bool_request",
+        ):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as raw:
+                chart, image, manifest, build, candidate = candidate_inputs(raw, "cuda")
+                value = receipt(chart, image, candidate, "cuda")
+                value["cluster"]["cuda_node"] = {
+                    "node_name": "node-1",
+                    "gpu_uuid": "GPU-12345678-1234-1234-1234-123456789abc",
+                    "gpu_name": "NVIDIA Test GPU", "driver_version": "999.0",
+                    "cuda_runtime": "13.0.1",
+                    "probe_image": next(iter(MODULE["CUDA_PROBE_IMAGES"])),
+                    "probe_pod_uid": "probe-pod-uid", "output_sha256": "8" * 64,
+                }
+                evidence = value["workload"]["cuda_device_loss"]
+                if target == "patch":
+                    evidence["fault_patch_sha256"] = "0" * 64
+                elif target == "fault_message":
+                    evidence["fault_response"]["body"]["error"]["message"] = "unrelated"
+                    evidence["fault_response"]["body_sha256"] = hashlib.sha256(
+                        canonical(evidence["fault_response"]["body"])
+                    ).hexdigest()
+                elif target == "metrics":
+                    evidence["fault_metrics"]["values"]["tritium_backend_faulted"] = 0
+                elif target == "replacement":
+                    evidence["replacement"]["container_id_after"] = evidence[
+                        "replacement"
+                    ]["container_id_before"]
+                elif target == "transition":
+                    evidence["transitions"][1], evidence["transitions"][2] = (
+                        evidence["transitions"][2], evidence["transitions"][1]
+                    )
+                elif target == "baseline":
+                    evidence["baseline"]["pods"][0]["uid"] = evidence[
+                        "fault_baseline"
+                    ]["pods"][0]["uid"]
+                elif target == "timing":
+                    evidence["replacement"]["replacement_ms"] = (
+                        evidence["duration_ms"] + 1
+                    )
+                else:
+                    evidence["request"]["max_tokens"] = True
+                    descriptor = {
+                        key: evidence["request"][key]
+                        for key in set(evidence["request"]) - {"descriptor_sha256"}
+                    }
+                    evidence["request"]["descriptor_sha256"] = hashlib.sha256(
+                        canonical(descriptor)
+                    ).hexdigest()
+                del value["receipt_id"]
+                value["receipt_id"] = "sha256:" + hashlib.sha256(
+                    canonical(value)
+                ).hexdigest()
+                with self.assertRaisesRegex(
+                    DeploymentError,
+                    "CUDA device-loss mutation|fault grammar|fault metrics|"
+                    "process replacement|transition sequence|rollout retained|request differs",
+                ):
+                    validate(value, chart, image, manifest, build, candidate)
+
+    def test_cpu_receipt_rejects_cuda_device_loss_evidence(self):
+        with tempfile.TemporaryDirectory() as raw:
+            chart, image, manifest, build, candidate = candidate_inputs(raw)
+            value = receipt(chart, image, candidate)
+            value["workload"]["cuda_device_loss"] = cuda_device_loss_receipt(
+                value["workload"]["startup_receipt"]
+            )
+            del value["receipt_id"]
+            value["receipt_id"] = "sha256:" + hashlib.sha256(canonical(value)).hexdigest()
+            with self.assertRaisesRegex(DeploymentError, "CPU deployment"):
                 validate(value, chart, image, manifest, build, candidate)
 
 
