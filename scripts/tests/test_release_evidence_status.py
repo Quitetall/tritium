@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 from pathlib import Path
 import runpy
+import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -14,6 +17,8 @@ EvidenceError = MODULE["EvidenceError"]
 evaluate = MODULE["evaluate"]
 render = MODULE["render"]
 gate_row = MODULE["_gate_row"]
+STATUS_MODULE = runpy.run_path(ROOT / "scripts" / "release-status")
+status_main = STATUS_MODULE["main"]
 
 
 def canonical(value) -> bytes:
@@ -227,6 +232,60 @@ class ReleaseEvidenceStatusTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(EvidenceError, "duplicate run id"):
                 evaluate(registry_path, candidate, document)
+
+    def test_rejects_leaf_symlink_receipt(self):
+        with tempfile.TemporaryDirectory() as raw:
+            candidate, document, artifact, evidence_root = release_fixture(Path(raw))
+            target = evidence_root / "actual.json"
+            receipt = cuda_receipt(target, artifact)
+            linked = evidence_root / "linked.json"
+            linked.symlink_to(target.name)
+            receipt_entry = entry(target, receipt)
+            receipt_entry["path"] = linked.name
+            registry_path = evidence_root / "registry.json"
+            registry(registry_path, candidate, [receipt_entry])
+            with self.assertRaisesRegex(EvidenceError, "symlink"):
+                evaluate(registry_path, candidate, document)
+
+    def test_release_status_registry_wiring_emits_partial_json_and_nonzero(self):
+        with tempfile.TemporaryDirectory() as raw:
+            candidate, document, artifact, evidence_root = release_fixture(Path(raw))
+            receipt_path = evidence_root / "cuda.json"
+            receipt = cuda_receipt(receipt_path, artifact)
+            registry_path = evidence_root / "registry.json"
+            registry(registry_path, candidate, [entry(receipt_path, receipt)])
+            output = evidence_root / "status.json"
+            globals_ = status_main.__globals__
+            replacements = {
+                "validate": lambda _candidate, _tool: document,
+                "_git_gate": lambda _root, _revision: None,
+                "_version_gate": lambda _root, _release: None,
+            }
+            original = {name: globals_[name] for name in replacements}
+            globals_.update(replacements)
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            try:
+                with mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "release-status",
+                        "--candidate",
+                        str(candidate),
+                        "--registry",
+                        str(registry_path),
+                        "--json-output",
+                        str(output),
+                    ],
+                ), mock.patch("sys.stdout", stdout), mock.patch("sys.stderr", stderr):
+                    result = status_main()
+            finally:
+                globals_.update(original)
+            self.assertEqual(result, 1)
+            self.assertIn("LOCAL_RC_BLOCKED", stderr.getvalue())
+            self.assertIn("native-backends", stdout.getvalue())
+            self.assertFalse(json.loads(output.read_text(encoding="utf-8"))["ready"])
 
 
 if __name__ == "__main__":
