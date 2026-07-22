@@ -48,6 +48,11 @@ DISTRIBUTED_RECEIPT = runpy.run_path(
 )
 validate_distributed_receipt = DISTRIBUTED_RECEIPT["validate"]
 DistributedReceiptError = DISTRIBUTED_RECEIPT["ReceiptError"]
+BROWSER_RECEIPT = runpy.run_path(
+    Path(__file__).with_name("verify-browser-training-receipt.py")
+)
+validate_browser_receipt = BROWSER_RECEIPT["validate"]
+BrowserReceiptError = BROWSER_RECEIPT["BrowserReceiptError"]
 
 SCHEMA = "tritium.release-evidence-registry.v1"
 REPORT_SCHEMA = "tritium.release-gate-report.v1"
@@ -65,6 +70,7 @@ KNOWN_KINDS = frozenset(
         "frontend-lifecycle",
         "distributed-training",
         "export-reload",
+        "browser-conformance",
     }
 )
 HEX = frozenset("0123456789abcdef")
@@ -267,7 +273,7 @@ def evaluate(
             raise EvidenceError(f"{label}.artifact_id is absent from candidate")
         expected_artifact_kind = (
             "rust-crate" if kind == "crate-archive"
-            else "npm-archive" if kind == "npm-archive"
+            else "npm-archive" if kind in {"npm-archive", "browser-conformance"}
             else "oci-image" if (
                 kind.startswith("oci-") or kind.startswith("serving-deployment-")
             )
@@ -324,6 +330,10 @@ def evaluate(
                     expected_wheel=artifact_path,
                     expected_source_revision=revision,
                     expected_release=release,
+                )
+            elif kind == "browser-conformance":
+                receipt = validate_browser_receipt(
+                    receipt_path, revision, release, artifact_path
                 )
             elif kind in {"oci-runtime-cpu", "oci-runtime-cuda"}:
                 receipt = load_oci_runtime_receipt(
@@ -394,6 +404,7 @@ def evaluate(
             OciSecurityError,
             DeploymentError,
             DistributedReceiptError,
+            BrowserReceiptError,
             ValueError,
         ) as error:
             raise EvidenceError(f"{label} failed {kind} validation: {error}") from error
@@ -448,7 +459,7 @@ def evaluate(
                 raise EvidenceError("crate receipt does not match candidate crate inventory")
             if artifact_id not in {package["artifact_id"] for package in receipt["packages"]}:
                 raise EvidenceError("crate receipt anchor is not a qualified crate")
-        elif kind == "npm-archive":
+        elif kind in {"npm-archive", "browser-conformance"}:
             identity = artifact.get("identity", {})
             actual = (artifact_path.name, _sha256(artifact_path), artifact_path.stat().st_size)
             declared = (artifact_path.name, identity.get("sha256"), identity.get("bytes"))

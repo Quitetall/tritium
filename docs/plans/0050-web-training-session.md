@@ -330,6 +330,17 @@ Software adapters, headless no-GPU modes, emulators and WASM fallback are
 structural evidence only. Missing physical identity, skipped tests or a zero
 case count fail the release lane.
 
+Admission is frozen as `tritium.browser-training-qualification.v1`. One
+candidate-npm-bound receipt must contain ordered Chrome, Firefox and Safari
+lanes. Every lane executes exactly 70 successful and 44 expected-error vectors,
+the complete training/checkpoint/export lifecycle and all six fault classes;
+records physical adapter/OS/browser identity and admitted limits; and retains a
+content-bound trace proving zero steady-state readbacks and zero WASM dispatch.
+Safari must run on physical macOS, software-adapter markers fail closed, and all
+trace files are contained, size-bounded and rehashed. The release registry now
+dispatches this validator as `browser-conformance`, but the gate remains
+`MISSING` until the three physical lanes are actually run on candidate bytes.
+
 ## Slice 6 — local archive and five-minute tutorial
 
 Status: **IN PROGRESS** — `npm run check` now creates an exact 13-file archive,

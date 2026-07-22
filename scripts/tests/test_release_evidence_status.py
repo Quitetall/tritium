@@ -279,6 +279,44 @@ def entry(
 
 
 class ReleaseEvidenceStatusTests(unittest.TestCase):
+    def test_browser_receipt_requires_strict_npm_dispatch(self):
+        with tempfile.TemporaryDirectory() as raw:
+            candidate, document, artifact, evidence_root = release_fixture(Path(raw))
+            document["artifacts"][0]["kind"] = "npm-archive"
+            document["artifacts"][0]["identity"] = {
+                "sha256": sha256(artifact), "bytes": artifact.stat().st_size,
+            }
+            candidate.write_bytes(canonical(document) + b"\n")
+            receipt_path = evidence_root / "browser.json"
+            receipt_path.write_bytes(b"{}\n")
+            receipt = {
+                "receipt_id": "sha256:" + "8" * 64,
+                "run_id": "physical-browser-run-1",
+                "artifact": {
+                    "kind": "npm-archive", "name": artifact.name,
+                    "sha256": sha256(artifact), "bytes": artifact.stat().st_size,
+                },
+            }
+            registry_path = evidence_root / "registry.json"
+            registry(
+                registry_path, candidate,
+                [{
+                    "id": receipt["receipt_id"], "kind": "browser-conformance",
+                    "path": receipt_path.name, "sha256": sha256(receipt_path),
+                    "artifact_id": "cuda-wheel", "parents": [],
+                }],
+            )
+            loader = mock.Mock(return_value=receipt)
+            with mock.patch.dict(
+                evaluate.__globals__, {"validate_browser_receipt": loader}
+            ):
+                report = evaluate(registry_path, candidate, document)
+            browser = next(row for row in report["rows"] if row["id"] == "browser")
+            self.assertEqual(browser["satisfied_kinds"], ["browser-conformance"])
+            loader.assert_called_once_with(
+                receipt_path.resolve(), "a" * 40, "1.1.0-rc.0", artifact
+            )
+
     def test_distributed_receipt_advances_frontend_gate_through_strict_dispatch(self):
         with tempfile.TemporaryDirectory() as raw:
             candidate, document, artifact, evidence_root = release_fixture(Path(raw))

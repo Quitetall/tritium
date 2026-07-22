@@ -221,6 +221,13 @@ and atomically retains all four exact rank checkpoint files. Those support
 bytes are independently contained and re-hashed during registry admission.
 Producer implementation does not change the gate status without its two-GPU
 candidate-revision result.
+Browser admission is likewise fail-closed. Only
+`tritium.browser-training-qualification.v1` can satisfy
+`browser-conformance`: it binds the exact npm archive and requires complete
+physical Chrome, Firefox and Safari identities, 70 valid plus 44 invalid
+canonical cases per lane, full lifecycle/fault coverage, and rehashed traces
+with no steady-state readback or WASM fallback. No physical three-browser
+receipt is present yet, so this remains `MISSING` rather than structural pass.
 
 Replace the current pre-alpha/v1.0-era narrative with tested v1.1 documentation:
 

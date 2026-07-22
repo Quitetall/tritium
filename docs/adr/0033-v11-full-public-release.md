@@ -449,6 +449,11 @@ under `python -I`; worker and interpreter substitution are not release seams.
 - [ ] Compiled TypeScript `WebTrainingSession` passes the whole manifest in
       Chrome, Firefox and Safari WebGPU, including checkpoint/export/native
       reload; WASM fallback is reported separately.
+      Admission uses `tritium.browser-training-qualification.v1`: three ordered
+      physical-engine lanes bound to the exact npm candidate, all 114 vectors,
+      complete lifecycle and fault injection, and content-hashed traces with no
+      steady-state readback or hidden WASM dispatch. Structural emulation cannot
+      satisfy this box.
 - [ ] Whole-model ONNX inference interoperability passes; trainable ONNX remains
       labeled v1.3.
 - [ ] Local RC archives install without a source checkout or compiler; after
