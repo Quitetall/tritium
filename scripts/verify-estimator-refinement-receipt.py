@@ -8,6 +8,7 @@ import json
 import math
 from pathlib import Path, PurePosixPath
 import re
+import statistics
 from typing import Any
 
 
@@ -37,9 +38,23 @@ TRACE_FIELDS = {
 }
 TRACE_WHEEL_FIELDS = {"name", "bytes", "sha256"}
 ENVIRONMENT_FIELDS = {"python", "torch", "tritium", "device"}
+REFINEMENT_TRACE_SCHEMA = "tritium.refinement-execution.v1"
+REFINEMENT_TRACE_FIELDS = {
+    "schema", "result", "release", "source_revision", "run_id", "environment",
+    "parent_artifact_id", "training_set_id", "training_members",
+    "validation_set_id", "validation_members", "hard_candidate_set_id",
+    "hard_candidate_members", "children",
+}
+REFINEMENT_TRACE_CHILD_FIELDS = {
+    "mode", "artifact_id", "parent_artifact_id", "work_id", "recipe_id",
+    "ancestry", "group_sizes", "packing", "package_artifact_id",
+    "trits_changed", "allocations_changed", "reload_samples",
+    "reload_max_abs_error", "reload_tolerance", "latent_residuals",
+    "validation_loss_before", "validation_loss_after",
+}
 REFINEMENT_FIELDS = COMMON_FIELDS | {
     "parent_artifact_id", "training_set_id", "validation_set_id", "splits_disjoint",
-    "children",
+    "children", "trace",
 }
 CHILD_FIELDS = {
     "mode", "artifact", "parent_artifact_id", "work_id", "recipe_id", "ancestry_id",
@@ -48,12 +63,23 @@ CHILD_FIELDS = {
 }
 ABLATION_FIELDS = COMMON_FIELDS | {
     "model_artifact_id", "evaluation_id", "baseline_set_id", "inventory_complete",
-    "baselines",
+    "baselines", "trace",
 }
 BASELINE_FIELDS = {
     "method", "family", "artifact_bytes", "target_bytes", "rate_gap_bpw",
     "quality_score", "runtime_ms", "resident_bytes", "reproduced", "same_box",
     "publishable_recipe", "eligible_for_claim",
+}
+ABLATION_TRACE_SCHEMA = "tritium.baseline-ablation-execution.v1"
+ABLATION_TRACE_FIELDS = {
+    "schema", "result", "release", "source_revision", "run_id", "environment",
+    "model_artifact_id", "evaluation_id", "baseline_set_id", "target_bytes",
+    "target_bpw", "baselines",
+}
+ABLATION_TRACE_BASELINE_FIELDS = {
+    "method", "family", "recipe_id", "artifact_bytes", "parameter_count",
+    "quality_score", "elapsed_samples_ms", "resident_samples_bytes",
+    "physical_device", "reproduced", "publishable_recipe",
 }
 ESTIMATORS = (
     ("absmean-ste", "tritium.absmean-ste", 1),
@@ -75,6 +101,7 @@ BASELINES = (
     ("greedy-salt-v1", "ablation"),
 )
 MAX_RECEIPT_BYTES = 32 * 1024 * 1024
+MAX_RELOAD_TOLERANCE = 1e-4
 
 
 class EstimatorRefinementError(ValueError):
@@ -121,6 +148,22 @@ def number(value: Any, label: str, minimum: float = 0.0) -> float:
     ):
         raise EstimatorRefinementError(f"{label} must be finite and at least {minimum}")
     return float(value)
+
+
+def integer(value: Any, label: str, minimum: int = 0) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise EstimatorRefinementError(f"{label} must be an integer at least {minimum}")
+    return value
+
+
+def ledger_id(members: Any, label: str) -> tuple[str, tuple[str, ...]]:
+    if not isinstance(members, list) or not members:
+        raise EstimatorRefinementError(f"{label} ledger must be non-empty")
+    values = tuple(digest(value, f"{label} member") for value in members)
+    if len(set(values)) != len(values):
+        raise EstimatorRefinementError(f"{label} ledger contains duplicate members")
+    value = "sha256:" + hashlib.sha256(canonical(list(values))).hexdigest()
+    return value, values
 
 
 def contained(root: Path, value: Any) -> Path:
@@ -281,6 +324,148 @@ def validate_estimators(
     return finish(receipt, "estimator")
 
 
+def derive_refinement_trace(
+    trace_path: Path,
+    *,
+    receipt: dict[str, Any],
+    artifacts: dict[str, tuple[Any, ...]],
+    revision: str,
+    release: str,
+) -> dict[str, Any]:
+    try:
+        trace = object_(
+            json.loads(trace_path.read_bytes()),
+            REFINEMENT_TRACE_FIELDS,
+            "refinement trace",
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise EstimatorRefinementError(
+            "refinement trace must contain UTF-8 JSON"
+        ) from error
+    environment = object_(
+        trace["environment"], ENVIRONMENT_FIELDS, "refinement environment"
+    )
+    if (
+        trace["schema"] != REFINEMENT_TRACE_SCHEMA
+        or trace["result"] != "pass"
+        or trace["release"] != release
+        or trace["source_revision"] != revision
+        or trace["run_id"] != receipt["run_id"]
+        or trace["parent_artifact_id"] != receipt["parent_artifact_id"]
+        or environment["tritium"] != release.replace("-rc.", "rc")
+    ):
+        raise EstimatorRefinementError("refinement trace identity differs")
+    for field in ("python", "torch", "device"):
+        string(environment[field], f"refinement environment {field}")
+
+    training_id, training = ledger_id(trace["training_members"], "training")
+    validation_id, validation = ledger_id(trace["validation_members"], "validation")
+    hard_id, hard_candidates = ledger_id(
+        trace["hard_candidate_members"], "hard candidate"
+    )
+    if (
+        trace["training_set_id"] != training_id
+        or trace["validation_set_id"] != validation_id
+        or trace["hard_candidate_set_id"] != hard_id
+        or set(training) & set(validation)
+        or set(hard_candidates) & (set(training) | set(validation))
+    ):
+        raise EstimatorRefinementError(
+            "refinement data ledgers overlap or differ from their identities"
+        )
+
+    raw_children = trace["children"]
+    if not isinstance(raw_children, list) or len(raw_children) != len(CHILDREN):
+        raise EstimatorRefinementError("refinement trace requires all three children")
+    children = []
+    parent = receipt["parent_artifact_id"]
+    for ordinal, mode in enumerate(CHILDREN):
+        raw = object_(
+            raw_children[ordinal],
+            REFINEMENT_TRACE_CHILD_FIELDS,
+            f"refinement trace children[{ordinal}]",
+        )
+        if (
+            raw["mode"] != mode
+            or raw["parent_artifact_id"] != parent
+            or artifacts.get(raw["artifact_id"], (None, None))[1] != "model-bundle"
+        ):
+            raise EstimatorRefinementError("refinement trace child lineage differs")
+        artifact = artifacts[raw["artifact_id"]]
+        for field in ("work_id", "recipe_id", "package_artifact_id"):
+            digest(raw[field], f"refinement child {field}")
+        ancestry = raw["ancestry"]
+        if (
+            not isinstance(ancestry, list)
+            or not ancestry
+            or any(not isinstance(value, str) or not value for value in ancestry)
+            or ancestry[-1] != parent
+        ):
+            raise EstimatorRefinementError("refinement child ancestry is incomplete")
+        group_sizes = raw["group_sizes"]
+        if (
+            not isinstance(group_sizes, list)
+            or not group_sizes
+            or any(integer(value, "refinement group size", 1) != 128 for value in group_sizes)
+        ):
+            raise EstimatorRefinementError("refinement child is not G128 aligned")
+        expected_packing = "s34" if mode == "s34" else "b3"
+        if raw["packing"] != expected_packing:
+            raise EstimatorRefinementError("refinement package packing differs")
+        trits_changed = integer(raw["trits_changed"], "changed trits")
+        allocations_changed = integer(
+            raw["allocations_changed"], "changed allocations"
+        )
+        if (
+            (mode == "scale-only" and (trits_changed != 0 or allocations_changed != 0))
+            or (mode == "hard-pv" and trits_changed == 0)
+            or (mode == "s34" and (trits_changed == 0 or allocations_changed == 0))
+        ):
+            raise EstimatorRefinementError("refinement hard-structure delta differs")
+        reload_samples = integer(raw["reload_samples"], "reload samples", 32)
+        reload_error = number(raw["reload_max_abs_error"], "reload error")
+        reload_tolerance = number(raw["reload_tolerance"], "reload tolerance")
+        before = number(raw["validation_loss_before"], "validation loss before")
+        after = number(raw["validation_loss_after"], "validation loss after")
+        latent_residuals = integer(raw["latent_residuals"], "latent residuals")
+        if (
+            reload_tolerance > MAX_RELOAD_TOLERANCE
+            or reload_error > reload_tolerance
+            or after > before
+            or latent_residuals != 0
+        ):
+            raise EstimatorRefinementError(
+                "refinement reload, validation, or hard-artifact gate failed"
+            )
+        children.append(
+            {
+                "mode": mode,
+                "artifact": {
+                    "id": artifact[0], "kind": artifact[1], "name": artifact[2],
+                    "bytes": artifact[3], "sha256": artifact[4],
+                },
+                "parent_artifact_id": parent,
+                "work_id": raw["work_id"],
+                "recipe_id": raw["recipe_id"],
+                "ancestry_id": "sha256:"
+                + hashlib.sha256(canonical(ancestry)).hexdigest(),
+                "trits_frozen": trits_changed == 0,
+                "allocation_frozen": allocations_changed == 0,
+                "hard_candidates_held_out": True,
+                "g128_aligned": True,
+                "native_salt_package": True,
+                "strict_reload": reload_samples >= 32 and reload_error <= reload_tolerance,
+                "latent_residuals": latent_residuals,
+            }
+        )
+    return {
+        "training_set_id": training_id,
+        "validation_set_id": validation_id,
+        "splits_disjoint": True,
+        "children": children,
+    }
+
+
 def validate_refinement(
     path: Path, revision: str, release: str, candidate: Path
 ) -> dict[str, Any]:
@@ -327,7 +512,150 @@ def validate_refinement(
             raise EstimatorRefinementError("hard refinement did not declare assignment changes")
     if receipt["anchor_artifact"]["id"] != children[-1]["artifact"]["id"]:
         raise EstimatorRefinementError("refinement anchor is not the final S34 child")
+    trace_record = object_(receipt["trace"], FILE_FIELDS, "refinement trace")
+    trace_path = contained(path.parent, trace_record["path"])
+    if (
+        trace_path.stat().st_size <= 0
+        or trace_path.stat().st_size > MAX_RECEIPT_BYTES
+        or trace_path.stat().st_size != trace_record["bytes"]
+        or sha256(trace_path) != trace_record["sha256"]
+    ):
+        raise EstimatorRefinementError("refinement trace bytes drifted")
+    derived = derive_refinement_trace(
+        trace_path,
+        receipt=receipt,
+        artifacts=artifacts,
+        revision=revision,
+        release=release,
+    )
+    if any(receipt[field] != derived[field] for field in derived):
+        raise EstimatorRefinementError("refinement receipt differs from raw trace")
     return finish(receipt, "refinement")
+
+
+def derive_ablation_trace(
+    trace_path: Path,
+    *,
+    receipt: dict[str, Any],
+    revision: str,
+    release: str,
+) -> dict[str, Any]:
+    try:
+        trace = object_(
+            json.loads(trace_path.read_bytes()),
+            ABLATION_TRACE_FIELDS,
+            "baseline ablation trace",
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise EstimatorRefinementError(
+            "baseline ablation trace must contain UTF-8 JSON"
+        ) from error
+    environment = object_(
+        trace["environment"], ENVIRONMENT_FIELDS, "baseline environment"
+    )
+    if (
+        trace["schema"] != ABLATION_TRACE_SCHEMA
+        or trace["result"] != "pass"
+        or trace["release"] != release
+        or trace["source_revision"] != revision
+        or trace["run_id"] != receipt["run_id"]
+        or trace["model_artifact_id"] != receipt["model_artifact_id"]
+        or environment["tritium"] != release.replace("-rc.", "rc")
+    ):
+        raise EstimatorRefinementError("baseline ablation trace identity differs")
+    for field in ("python", "torch", "device"):
+        string(environment[field], f"baseline environment {field}")
+    evaluation_id = digest(trace["evaluation_id"], "baseline evaluation id")
+    target_bytes = integer(trace["target_bytes"], "baseline target bytes", 1)
+    target_bpw = number(trace["target_bpw"], "baseline target bpw", 1e-12)
+    raw_baselines = trace["baselines"]
+    if not isinstance(raw_baselines, list) or len(raw_baselines) != len(BASELINES):
+        raise EstimatorRefinementError("baseline trace inventory is incomplete")
+    baselines = []
+    set_identity = []
+    shared_parameter_count = None
+    for ordinal, expected in enumerate(BASELINES):
+        raw = object_(
+            raw_baselines[ordinal],
+            ABLATION_TRACE_BASELINE_FIELDS,
+            f"baseline trace baselines[{ordinal}]",
+        )
+        if (raw["method"], raw["family"]) != expected:
+            raise EstimatorRefinementError("baseline trace identity/order differs")
+        recipe_id = digest(raw["recipe_id"], "baseline recipe id")
+        artifact_bytes = integer(raw["artifact_bytes"], "baseline artifact bytes", 1)
+        parameter_count = integer(
+            raw["parameter_count"], "baseline parameter count", 1
+        )
+        if shared_parameter_count is None:
+            shared_parameter_count = parameter_count
+        elif parameter_count != shared_parameter_count:
+            raise EstimatorRefinementError("baseline parameter inventories differ")
+        quality_score = number(raw["quality_score"], "baseline quality score", 1e-12)
+        elapsed = raw["elapsed_samples_ms"]
+        resident = raw["resident_samples_bytes"]
+        if (
+            not isinstance(elapsed, list)
+            or len(elapsed) < 30
+            or not isinstance(resident, list)
+            or len(resident) != len(elapsed)
+        ):
+            raise EstimatorRefinementError(
+                "baseline trace requires thirty matched timing and residency samples"
+            )
+        elapsed_values = [
+            number(value, "baseline elapsed sample", 1e-12) for value in elapsed
+        ]
+        resident_values = [
+            integer(value, "baseline resident sample", 1) for value in resident
+        ]
+        if (
+            raw["physical_device"] != environment["device"]
+            or raw["reproduced"] is not True
+            or raw["publishable_recipe"] is not True
+        ):
+            raise EstimatorRefinementError(
+                "baseline trace is not reproduced on the frozen device"
+            )
+        rate_gap = abs(artifact_bytes * 8.0 / parameter_count - target_bpw)
+        eligible = rate_gap <= 0.05 and artifact_bytes <= target_bytes
+        baselines.append(
+            {
+                "method": raw["method"], "family": raw["family"],
+                "artifact_bytes": artifact_bytes, "target_bytes": target_bytes,
+                "rate_gap_bpw": rate_gap, "quality_score": quality_score,
+                "runtime_ms": statistics.median(elapsed_values),
+                "resident_bytes": max(resident_values),
+                "reproduced": True, "same_box": True,
+                "publishable_recipe": True, "eligible_for_claim": eligible,
+            }
+        )
+        set_identity.append(
+            {"method": raw["method"], "family": raw["family"], "recipe_id": recipe_id}
+        )
+    if not math.isclose(
+        target_bpw,
+        target_bytes * 8.0 / shared_parameter_count,
+        rel_tol=1e-12,
+        abs_tol=1e-12,
+    ):
+        raise EstimatorRefinementError("baseline byte and bpw targets differ")
+    set_scope = {
+        "model_artifact_id": trace["model_artifact_id"],
+        "evaluation_id": evaluation_id,
+        "target_bytes": target_bytes,
+        "target_bpw": target_bpw,
+        "recipes": set_identity,
+    }
+    baseline_set_id = "sha256:" + hashlib.sha256(canonical(set_scope)).hexdigest()
+    if trace["baseline_set_id"] != baseline_set_id:
+        raise EstimatorRefinementError("baseline set identity differs from recipes")
+    return {
+        "evaluation_id": evaluation_id,
+        "baseline_set_id": baseline_set_id,
+        "inventory_complete": True,
+        "baselines": baselines,
+    }
 
 
 def validate_ablation(
@@ -364,4 +692,21 @@ def validate_ablation(
             or baseline["eligible_for_claim"] is not eligible
         ):
             raise EstimatorRefinementError("baseline reproduction or byte matching failed")
+    trace_record = object_(receipt["trace"], FILE_FIELDS, "baseline ablation trace")
+    trace_path = contained(path.parent, trace_record["path"])
+    if (
+        trace_path.stat().st_size <= 0
+        or trace_path.stat().st_size > MAX_RECEIPT_BYTES
+        or trace_path.stat().st_size != trace_record["bytes"]
+        or sha256(trace_path) != trace_record["sha256"]
+    ):
+        raise EstimatorRefinementError("baseline ablation trace bytes drifted")
+    derived = derive_ablation_trace(
+        trace_path,
+        receipt=receipt,
+        revision=revision,
+        release=release,
+    )
+    if any(receipt[field] != derived[field] for field in derived):
+        raise EstimatorRefinementError("baseline ablation receipt differs from raw trace")
     return finish(receipt, "baseline-ablation")

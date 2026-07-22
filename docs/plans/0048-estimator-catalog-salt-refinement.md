@@ -114,15 +114,20 @@ flagship NearLossless PTQ artifact and the estimator receipt.
 `tritium.baseline-ablation-qualification.v1` freezes RTN/AbsMean,
 GPTQ/AWQ-style, SALT V1 and three mechanism ablations, recomputes matched-byte
 claim eligibility, and binds the exact refined model/evaluation lineage. These
-contracts and the estimator producer are implemented; executing the producer
-against the final candidate wheel and producing checkpoint-scale empirical
-refinement/ablation receipts remain open.
+contracts and producers are implemented. Refinement receipts are derived from
+retained dataset/candidate ledgers, hard-structure deltas, package identities,
+reload samples and validation losses. Ablation receipts are derived from
+retained matched-byte timing/residency samples and frozen recipe identities.
+Executing them against the final candidate wheel and checkpoint-scale campaign
+artifacts remains open.
 
 ## Verification
 
 ```bash
 PYTHONPATH=crates/tritium-py/python pytest -q crates/tritium-py/tests
 python -m unittest scripts.tests.test_qualify_estimator_catalog
+python -m unittest scripts.tests.test_qualify_refinement_campaign
+python -m unittest scripts.tests.test_qualify_baseline_ablation
 python -m unittest scripts.tests.test_verify_estimator_refinement_receipt
 python -m compileall -q crates/tritium-py/python/tritium
 cargo fmt --check
