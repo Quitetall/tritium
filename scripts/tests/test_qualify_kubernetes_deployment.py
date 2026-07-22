@@ -17,6 +17,10 @@ validate_deployment = MODULE["validate_deployment"]
 validate_receipt = MODULE["validate_receipt"]
 metrics_snapshot = MODULE["metrics_snapshot"]
 validate_helm_history = MODULE["validate_helm_history"]
+scale_snapshot = MODULE["scale_snapshot"]
+prometheus_url = MODULE["prometheus_url"]
+deployment_update_identity = MODULE["deployment_update_identity"]
+validate_scale_contract = MODULE["validate_scale_contract"]
 
 
 def startup(flavor: str = "cpu") -> dict:
@@ -71,6 +75,7 @@ def receipt(chart: Path, image_archive: Path, candidate: Path,
                   "helm_version": "v3.18.0"},
         "workload": {
             "release_name": "qualification", "deployment_uid": "deployment-uid",
+            "qualification_lock_uid": "lock-uid",
             "initial": {"pods": [{"name": "pod-old", "uid": "pod-old-uid",
                                     "node": "node-1", "restarts": 0}]},
             "restarted": {"pods": [{"name": "pod-new", "uid": "pod-new-uid",
@@ -81,12 +86,46 @@ def receipt(chart: Path, image_archive: Path, candidate: Path,
             "restart_startup_receipt": dict(startup_receipt),
             "update_startup_receipt": dict(startup_receipt),
             "update_strategy": "Recreate" if flavor == "cuda" else "RollingUpdate",
+            "update_config": {
+                "before": {"generation": 1, "rate_limit_burst": 8},
+                "after": {"generation": 2, "rate_limit_burst": 9},
+            },
             "rollback_startup_receipt": dict(startup_receipt),
             "metrics": {"sha256": "6" * 64, "values": {
                 "tritium_chat_requests_total": 1.0,
                 "tritium_tokens_out_total": 1.0,
                 "tritium_worker_alive": 1.0,
             }},
+            "scale": ({
+                "scaled_object_uid": "scaled-object-uid", "hpa_uid": "hpa-uid",
+                "external_metric": "s0-prometheus-tritium_queue_pressure",
+                "scaled_replicas": 2, "settled_replicas": 1,
+                "load_requests": 8, "load_concurrency": 8, "max_tokens": 256,
+                "prometheus_server": "http://prometheus.monitoring.svc:9090",
+                "prometheus_service": "prometheus", "prometheus_port": 9090,
+                "monitoring_namespace": "monitoring",
+                "service_monitor_label": "release=kube-prometheus-stack",
+                "query": ('max(tritium_queue_depth{namespace="tritium-test",'
+                          'service="qualification-tritium"})'),
+                "target": {"scrape_url": "http://10.0.0.2:8080/metrics",
+                           "last_scrape_utc": "1970-01-01T00:16:35+00:00"},
+                "final_target": {"scrape_url": "http://10.0.0.2:8080/metrics",
+                                 "last_scrape_utc": "1970-01-01T00:17:15+00:00"},
+                "baseline_sample": {"timestamp": 990.0, "value": 0.0},
+                "peak_sample": {"timestamp": 1020.0, "value": 3.0},
+                "settled_sample": {"timestamp": 1030.0, "value": 0.0},
+                "load_started_unix": 1000.0, "load_finished_unix": 1030.0,
+                "observation_started_unix": 980.0,
+                "observation_finished_unix": 1040.0,
+                "scaled_pods": {"pods": [
+                    {"name": "pod-scale-1", "uid": "pod-scale-uid-1",
+                     "node": "node-1", "restarts": 0},
+                    {"name": "pod-scale-2", "uid": "pod-scale-uid-2",
+                     "node": "node-1", "restarts": 0},
+                ]},
+                "settled_active": False, "settled_hpa_current": 1,
+                "settled_hpa_desired": 1,
+            } if flavor == "cpu" else None),
             "helm_history": [
                 {"revision": 1, "status": "superseded"},
                 {"revision": 2, "status": "failed"},
@@ -97,7 +136,7 @@ def receipt(chart: Path, image_archive: Path, candidate: Path,
             "failed_image_digest": "sha256:" + "0" * 64,
             "failed_upgrade_output_sha256": "7" * 64,
         },
-        "checks": list(MODULE["CHECKS"]), "result": "pass",
+        "checks": MODULE["expected_checks"](flavor), "result": "pass",
     }
     value["receipt_id"] = "sha256:" + hashlib.sha256(canonical(value)).hexdigest()
     return value
@@ -145,6 +184,96 @@ def validate(value: dict, chart: Path, image: Path, manifest: Path,
 
 
 class QualifyKubernetesDeploymentTests(unittest.TestCase):
+    def test_deployment_update_identity_binds_exact_rate_limit_delta(self):
+        document = {
+            "metadata": {"generation": 4},
+            "spec": {"template": {"spec": {"containers": [
+                {"name": "tritium", "args": ["--rate-limit-burst", "9"]},
+                {"name": "authenticated-probe"},
+            ]}}},
+        }
+        self.assertEqual(
+            deployment_update_identity(document),
+            {"generation": 4, "rate_limit_burst": 9},
+        )
+        document["spec"]["template"]["spec"]["containers"][0]["args"] += [
+            "--rate-limit-burst", "10"
+        ]
+        with self.assertRaisesRegex(DeploymentError, "absent or duplicated"):
+            deployment_update_identity(document)
+
+    def test_scale_contract_binds_prometheus_trigger_and_authenticated_monitor(self):
+        query = 'max(tritium_queue_depth{namespace="ns",service="qualification-tritium"})'
+        scaled = {"spec": {
+            "scaleTargetRef": {"name": "qualification-tritium"},
+            "pollingInterval": 5, "cooldownPeriod": 30,
+            "minReplicaCount": 1, "maxReplicaCount": 2,
+            "triggers": [{"type": "prometheus", "metadata": {
+                "serverAddress": "http://prometheus.monitoring.svc:9090",
+                "metricName": "tritium_queue_pressure", "threshold": "1",
+                "query": query,
+            }}],
+        }}
+        monitor = {
+            "metadata": {"labels": {"release": "stack"}},
+            "spec": {
+                "selector": {"matchLabels": {
+                    "app.kubernetes.io/name": "tritium",
+                    "app.kubernetes.io/instance": "qualification",
+                }},
+                "endpoints": [{"path": "/metrics", "port": "http", "interval": "30s",
+                    "authorization": {
+                    "credentials": {"name": "auth", "key": "token"},
+                }}],
+            },
+        }
+        validate_scale_contract(
+            scaled, monitor, service="qualification-tritium",
+            server="http://prometheus.monitoring.svc:9090", query=query,
+            auth_secret="auth", auth_key="token", monitor_label=("release", "stack"),
+        )
+        scaled["spec"]["triggers"][0]["metadata"]["query"] = "vector(100)"
+        with self.assertRaisesRegex(DeploymentError, "KEDA trigger"):
+            validate_scale_contract(
+                scaled, monitor, service="qualification-tritium",
+                server="http://prometheus.monitoring.svc:9090", query=query,
+                auth_secret="auth", auth_key="token",
+                monitor_label=("release", "stack"),
+            )
+
+    def test_prometheus_url_rejects_helm_value_injection(self):
+        self.assertEqual(
+            prometheus_url("http://prometheus.monitoring.svc:9090"),
+            "http://prometheus.monitoring.svc:9090",
+        )
+        for value in (
+            "http://prometheus:9090,networkPolicy.enabled=false",
+            "http://user:password@prometheus:9090",
+            "http://prometheus:9090/?query=unsafe",
+        ):
+            with self.subTest(value=value), self.assertRaises(DeploymentError):
+                prometheus_url(value)
+
+    def test_scale_snapshot_requires_active_ready_keda_and_two_ready_replicas(self):
+        scaled = {
+            "metadata": {"uid": "scaled-uid"},
+            "spec": {"minReplicaCount": 1, "maxReplicaCount": 2},
+            "status": {
+                "conditions": [{"type": "Ready", "status": "True"},
+                               {"type": "Active", "status": "True"}],
+                "externalMetricNames": ["s0-prometheus-tritium_queue_pressure"],
+            },
+        }
+        hpa = {"metadata": {"uid": "hpa-uid", "ownerReferences": [{
+                    "kind": "ScaledObject", "uid": "scaled-uid", "controller": True,
+                }]},
+               "status": {"currentReplicas": 2, "desiredReplicas": 2}}
+        deployment = {"spec": {"replicas": 2}, "status": {"readyReplicas": 2}}
+        self.assertEqual(scale_snapshot(scaled, hpa, deployment)["scaled_replicas"], 2)
+        scaled["status"]["conditions"][1]["status"] = "False"
+        with self.assertRaisesRegex(DeploymentError, "not active"):
+            scale_snapshot(scaled, hpa, deployment)
+
     def test_metrics_snapshot_requires_observed_generation_and_live_worker(self):
         metrics = (
             "tritium_chat_requests_total 1\n"

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
@@ -17,8 +18,10 @@ import secrets
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any
 
@@ -33,10 +36,18 @@ SCHEMA = "tritium.kubernetes-deployment-qualification.v1"
 HEX = frozenset("0123456789abcdef")
 SAFE_NAME = re.compile(r"[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?")
 SAFE_SECRET_KEY = re.compile(r"[A-Za-z0-9](?:[-._A-Za-z0-9]{0,251}[A-Za-z0-9])?")
+LABEL_KEY = re.compile(
+    r"(?:[a-z0-9](?:[-a-z0-9.]{0,251}[a-z0-9])?/)?"
+    r"[A-Za-z0-9](?:[-._A-Za-z0-9]{0,61}[A-Za-z0-9])?"
+)
 RUN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 RELEASE = re.compile(r"1\.1\.0-rc\.(0|[1-9][0-9]*)")
 GPU_UUID = re.compile(
     r"cuda:[0-9]+:GPU-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+)
+OCI_REPOSITORY = re.compile(
+    r"[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?(?::[0-9]{1,5})?"
+    r"(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)+"
 )
 CUDA_PROBE_IMAGES = {
     "docker.io/nvidia/cuda:13.0.1-devel-ubuntu22.04@sha256:"
@@ -49,6 +60,10 @@ CHECKS = (
     "atomic-rollback", "rollback-readiness", "rollback-generation", "release-cleanup",
 )
 MAX_RESPONSE_BYTES = 16 * 1024 * 1024
+
+
+def expected_checks(flavor: str) -> list[str]:
+    return [*CHECKS, *(["keda-scale-signal"] if flavor == "cpu" else [])]
 
 
 class DeploymentError(ValueError):
@@ -84,6 +99,48 @@ def exact_hex(value: Any, length: int, label: str) -> str:
     if not isinstance(value, str) or len(value) != length or any(c not in HEX for c in value):
         raise DeploymentError(f"{label} must be {length} lowercase hexadecimal characters")
     return value
+
+
+def label_assignment(value: str) -> tuple[str, str]:
+    key, separator, label_value = value.partition("=")
+    if (separator != "=" or LABEL_KEY.fullmatch(key) is None
+            or not label_value or len(label_value) > 63
+            or re.fullmatch(r"[A-Za-z0-9](?:[-._A-Za-z0-9]{0,61}[A-Za-z0-9])?", label_value) is None):
+        raise DeploymentError("ServiceMonitor label must be a Kubernetes key=value")
+    return key, label_value
+
+
+def helm_key(value: str) -> str:
+    return value.replace(".", "\\.")
+
+
+def prometheus_url(value: Any) -> str:
+    if not isinstance(value, str) or len(value) > 512:
+        raise DeploymentError("Prometheus URL is malformed")
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        port = parsed.port
+    except ValueError as error:
+        raise DeploymentError("Prometheus URL is malformed") from error
+    if (parsed.scheme not in {"http", "https"} or parsed.username is not None
+            or parsed.password is not None or parsed.query or parsed.fragment
+            or not parsed.hostname or port is None or not 1 <= port <= 65535
+            or re.fullmatch(r"[a-z0-9](?:[-a-z0-9.]{0,251}[a-z0-9])?", parsed.hostname) is None
+            or not re.fullmatch(r"(?:/[A-Za-z0-9._~/-]*)?", parsed.path)):
+        raise DeploymentError("Prometheus URL is malformed")
+    return value
+
+
+def bind_prometheus_endpoint(value: Any, service: str, namespace: str, port: int) -> str:
+    server = prometheus_url(value)
+    parsed = urllib.parse.urlsplit(server)
+    admitted_hosts = {
+        f"{service}.{namespace}.svc",
+        f"{service}.{namespace}.svc.cluster.local",
+    }
+    if parsed.hostname not in admitted_hosts or parsed.port != port or parsed.path not in {"", "/"}:
+        raise DeploymentError("KEDA Prometheus URL differs from observed Service")
+    return server
 
 
 def bind_chart_to_candidate(candidate: Path, chart: Path) -> dict[str, Any]:
@@ -203,6 +260,23 @@ def request_json(url: str, token: str, *, body: dict[str, Any] | None = None,
     return value
 
 
+def public_json(url: str, timeout: float) -> dict[str, Any]:
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as response:
+            payload = response.read(MAX_RESPONSE_BYTES + 1)
+    except (OSError, urllib.error.URLError) as error:
+        raise DeploymentError(f"public request failed: {url}: {error}") from error
+    if len(payload) > MAX_RESPONSE_BYTES:
+        raise DeploymentError(f"public response exceeds byte limit: {url}")
+    try:
+        value = json.loads(payload)
+    except json.JSONDecodeError as error:
+        raise DeploymentError(f"public response is malformed JSON: {url}") from error
+    if not isinstance(value, dict):
+        raise DeploymentError(f"public response is not an object: {url}")
+    return value
+
+
 def free_port() -> int:
     import socket
 
@@ -219,10 +293,11 @@ def helm(helm_bin: Path, context: str, namespace: str) -> list[str]:
     return [str(helm_bin), "--kube-context", context, "--namespace", namespace]
 
 
-def pod_snapshot(document: dict[str, Any], flavor: str) -> dict[str, Any]:
+def pod_snapshot(document: dict[str, Any], flavor: str,
+                 expected_count: int = 1) -> dict[str, Any]:
     items = document.get("items")
-    if not isinstance(items, list) or len(items) != 1:
-        raise DeploymentError("deployment must have exactly one pod")
+    if not isinstance(items, list) or len(items) != expected_count:
+        raise DeploymentError(f"deployment must have exactly {expected_count} pod(s)")
     pods = []
     for item in items:
         if not isinstance(item, dict):
@@ -262,12 +337,13 @@ def pod_snapshot(document: dict[str, Any], flavor: str) -> dict[str, Any]:
     return {"pods": sorted(pods, key=lambda item: item["uid"])}
 
 
-def validate_receipt_snapshot(snapshot: Any, label: str) -> dict[str, Any]:
+def validate_receipt_snapshot(snapshot: Any, label: str,
+                              expected_count: int = 1) -> dict[str, Any]:
     if not isinstance(snapshot, dict) or set(snapshot) != {"pods"}:
         raise DeploymentError(f"{label} pod snapshot fields differ")
     pods = snapshot.get("pods")
-    if not isinstance(pods, list) or len(pods) != 1:
-        raise DeploymentError(f"{label} must contain exactly one pod")
+    if not isinstance(pods, list) or len(pods) != expected_count:
+        raise DeploymentError(f"{label} must contain exactly {expected_count} pod(s)")
     uids = set()
     for pod in pods:
         if not isinstance(pod, dict) or set(pod) != {"name", "uid", "node", "restarts"}:
@@ -317,6 +393,31 @@ def validate_deployment(document: dict[str, Any], *, image: str,
     return uid
 
 
+def deployment_update_identity(document: dict[str, Any]) -> dict[str, int]:
+    metadata = document.get("metadata", {})
+    generation = metadata.get("generation")
+    containers = document.get("spec", {}).get("template", {}).get("spec", {}).get(
+        "containers", []
+    )
+    if type(generation) is not int or generation < 1 or not isinstance(containers, list):
+        raise DeploymentError("deployment update identity is malformed")
+    tritium = next(
+        (container for container in containers
+         if isinstance(container, dict) and container.get("name") == "tritium"), None
+    )
+    args = tritium.get("args") if isinstance(tritium, dict) else None
+    if not isinstance(args, list):
+        raise DeploymentError("deployment Tritium arguments are malformed")
+    indices = [index for index, value in enumerate(args) if value == "--rate-limit-burst"]
+    if len(indices) != 1 or indices[0] + 1 >= len(args):
+        raise DeploymentError("deployment rate-limit argument is absent or duplicated")
+    try:
+        burst = int(args[indices[0] + 1])
+    except (TypeError, ValueError) as error:
+        raise DeploymentError("deployment rate-limit burst is malformed") from error
+    return {"generation": generation, "rate_limit_burst": burst}
+
+
 def port_forward(command: list[str], deadline: float, url: str, token: str) -> tuple[subprocess.Popen, dict]:
     try:
         process = subprocess.Popen(
@@ -351,6 +452,29 @@ def stop_forward(process: subprocess.Popen) -> None:
     except subprocess.TimeoutExpired:
         process.kill()
         process.wait(timeout=10)
+
+
+def public_port_forward(command: list[str], deadline: float, url: str) -> subprocess.Popen:
+    try:
+        process = subprocess.Popen(
+            command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True
+        )
+    except OSError as error:
+        raise DeploymentError(f"public port-forward failed to start: {error}") from error
+    try:
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                raise DeploymentError("public port-forward exited before readiness")
+            try:
+                value = public_json(url + "/api/v1/status/buildinfo", 5)
+                if value.get("status") == "success":
+                    return process
+            except DeploymentError:
+                time.sleep(1)
+        raise DeploymentError("public port-forward readiness deadline expired")
+    except BaseException:
+        stop_forward(process)
+        raise
 
 
 def node_snapshot(document: dict[str, Any]) -> dict[str, str]:
@@ -497,6 +621,409 @@ def validate_helm_history(value: Any, prior_revision: int) -> list[dict[str, Any
     return value
 
 
+def scale_snapshot(scaled_object: dict[str, Any], hpa: dict[str, Any],
+                   deployment: dict[str, Any]) -> dict[str, Any]:
+    scaled_metadata = scaled_object.get("metadata", {})
+    scaled_spec = scaled_object.get("spec", {})
+    conditions = scaled_object.get("status", {}).get("conditions", [])
+    active = any(
+        isinstance(condition, dict) and condition.get("type") == "Active"
+        and condition.get("status") == "True"
+        for condition in conditions
+    )
+    ready = any(
+        isinstance(condition, dict) and condition.get("type") == "Ready"
+        and condition.get("status") == "True"
+        for condition in conditions
+    )
+    external_metrics = scaled_object.get("status", {}).get("externalMetricNames")
+    if not active or not ready or external_metrics != ["s0-prometheus-tritium_queue_pressure"]:
+        raise DeploymentError("KEDA scale signal is not active and ready")
+    if (scaled_spec.get("minReplicaCount"), scaled_spec.get("maxReplicaCount")) != (1, 2):
+        raise DeploymentError("KEDA replica bounds differ")
+    hpa_metadata = hpa.get("metadata", {})
+    hpa_status = hpa.get("status", {})
+    deployment_status = deployment.get("status", {})
+    deployment_spec = deployment.get("spec", {})
+    scaled_uid = scaled_metadata.get("uid")
+    owners = hpa_metadata.get("ownerReferences")
+    if not isinstance(owners, list) or not any(
+        isinstance(owner, dict) and owner.get("kind") == "ScaledObject"
+        and owner.get("uid") == scaled_uid and owner.get("controller") is True
+        for owner in owners
+    ):
+        raise DeploymentError("KEDA HPA is not owned by the qualified ScaledObject")
+    replicas = deployment_status.get("readyReplicas")
+    if (type(replicas) is not int or replicas < 2
+            or deployment_spec.get("replicas") != replicas
+            or hpa_status.get("currentReplicas") != replicas
+            or hpa_status.get("desiredReplicas") != replicas):
+        raise DeploymentError("KEDA did not produce a ready scale-out")
+    result = {
+        "scaled_object_uid": scaled_uid,
+        "hpa_uid": hpa_metadata.get("uid"),
+        "external_metric": external_metrics[0],
+        "scaled_replicas": replicas,
+    }
+    if any(not isinstance(result.get(key), str) or not result[key]
+           for key in ("scaled_object_uid", "hpa_uid", "external_metric")):
+        raise DeploymentError("KEDA scale object identity is incomplete")
+    return result
+
+
+def condition(document: dict[str, Any], kind: str) -> bool:
+    return any(
+        isinstance(item, dict) and item.get("type") == kind and item.get("status") == "True"
+        for item in document.get("status", {}).get("conditions", [])
+    )
+
+
+def validate_scale_contract(scaled_object: dict[str, Any], service_monitor: dict[str, Any],
+                            *, service: str, server: str, query: str,
+                            auth_secret: str, auth_key: str,
+                            monitor_label: tuple[str, str]) -> None:
+    spec = scaled_object.get("spec", {})
+    triggers = spec.get("triggers")
+    expected_trigger = {"type": "prometheus", "metadata": {
+        "serverAddress": server, "metricName": "tritium_queue_pressure",
+        "threshold": "1", "query": query,
+    }}
+    if (spec.get("scaleTargetRef", {}).get("name") != service
+            or spec.get("pollingInterval") != 5 or spec.get("cooldownPeriod") != 30
+            or spec.get("minReplicaCount") != 1 or spec.get("maxReplicaCount") != 2
+            or triggers != [expected_trigger]):
+        raise DeploymentError("rendered KEDA trigger differs from qualification contract")
+    metadata = service_monitor.get("metadata", {})
+    monitor_spec = service_monitor.get("spec", {})
+    endpoints = monitor_spec.get("endpoints")
+    key, value = monitor_label
+    if (metadata.get("labels", {}).get(key) != value
+            or monitor_spec.get("selector", {}).get("matchLabels") != {
+                "app.kubernetes.io/name": "tritium",
+                "app.kubernetes.io/instance": service.removesuffix("-tritium"),
+            }
+            or not isinstance(endpoints, list) or len(endpoints) != 1
+            or endpoints[0].get("path") != "/metrics"
+            or endpoints[0].get("port") != "http"
+            or endpoints[0].get("interval") != "30s"
+            or endpoints[0].get("authorization", {}).get("credentials") != {
+                "name": auth_secret, "key": auth_key,
+            }):
+        raise DeploymentError("rendered ServiceMonitor differs from qualification contract")
+
+
+def prometheus_sample(base_url: str, query: str, timeout: float) -> dict[str, float]:
+    url = base_url + "/api/v1/query?" + urllib.parse.urlencode({"query": query})
+    value = public_json(url, timeout)
+    result = value.get("data", {}).get("result") if value.get("status") == "success" else None
+    if not isinstance(result, list) or len(result) != 1:
+        raise DeploymentError("Prometheus query did not return one series")
+    sample = result[0].get("value") if isinstance(result[0], dict) else None
+    try:
+        timestamp = float(sample[0])
+        number = float(sample[1])
+    except (TypeError, ValueError, IndexError) as error:
+        raise DeploymentError("Prometheus sample is malformed") from error
+    if not math.isfinite(timestamp) or not math.isfinite(number) or number < 0:
+        raise DeploymentError("Prometheus sample is non-finite or negative")
+    return {"timestamp": timestamp, "value": number}
+
+
+def prometheus_peak(base_url: str, query: str, start: float, end: float,
+                    timeout: float) -> dict[str, float]:
+    url = base_url + "/api/v1/query_range?" + urllib.parse.urlencode({
+        "query": query, "start": str(start), "end": str(end), "step": "5s",
+    })
+    value = public_json(url, timeout)
+    result = value.get("data", {}).get("result") if value.get("status") == "success" else None
+    if not isinstance(result, list) or len(result) != 1:
+        raise DeploymentError("Prometheus range query did not return one series")
+    samples = result[0].get("values") if isinstance(result[0], dict) else None
+    if not isinstance(samples, list) or not samples:
+        raise DeploymentError("Prometheus range query contains no samples")
+    parsed = []
+    try:
+        for sample in samples:
+            parsed.append((float(sample[0]), float(sample[1])))
+    except (TypeError, ValueError, IndexError) as error:
+        raise DeploymentError("Prometheus range sample is malformed") from error
+    if any(not math.isfinite(ts) or not math.isfinite(number) or number < 0
+           for ts, number in parsed):
+        raise DeploymentError("Prometheus range sample is non-finite or negative")
+    timestamp, number = max(parsed, key=lambda item: item[1])
+    return {"timestamp": timestamp, "value": number}
+
+
+def prometheus_target(base_url: str, *, namespace: str, service: str,
+                      timeout: float) -> dict[str, Any]:
+    value = public_json(base_url + "/api/v1/targets?state=active", timeout)
+    targets = value.get("data", {}).get("activeTargets") if value.get("status") == "success" else None
+    matches = [target for target in targets or [] if isinstance(target, dict)
+               and target.get("labels", {}).get("namespace") == namespace
+               and target.get("labels", {}).get("service") == service]
+    if len(matches) != 1 or matches[0].get("health") != "up":
+        raise DeploymentError("Prometheus does not have one healthy Tritium target")
+    target = matches[0]
+    try:
+        last_scrape = datetime.fromisoformat(target["lastScrape"].replace("Z", "+00:00"))
+    except (KeyError, AttributeError, ValueError) as error:
+        raise DeploymentError("Prometheus target scrape timestamp is malformed") from error
+    age = datetime.now(timezone.utc) - last_scrape.astimezone(timezone.utc)
+    scrape_url = target.get("scrapeUrl")
+    if (age < timedelta(seconds=-5) or age > timedelta(seconds=120)
+            or not isinstance(scrape_url, str) or not scrape_url.endswith("/metrics")):
+        raise DeploymentError("Prometheus target scrape is stale or wrong")
+    return {"scrape_url": scrape_url, "last_scrape_utc": last_scrape.isoformat()}
+
+
+def scale_baseline(scaled_object: dict[str, Any], hpa: dict[str, Any],
+                   deployment: dict[str, Any]) -> bool:
+    hpa_status = hpa.get("status", {})
+    return (condition(scaled_object, "Ready") and not condition(scaled_object, "Active")
+            and hpa_status.get("currentReplicas") == 1
+            and hpa_status.get("desiredReplicas") == 1
+            and deployment.get("spec", {}).get("replicas") == 1
+            and deployment.get("status", {}).get("readyReplicas") == 1)
+
+
+def validate_scale_receipt(value: Any) -> dict[str, Any]:
+    fields = {
+        "scaled_object_uid", "hpa_uid", "external_metric", "scaled_replicas",
+        "settled_replicas", "load_requests", "load_concurrency", "max_tokens",
+        "prometheus_server", "monitoring_namespace", "service_monitor_label",
+        "query", "target", "baseline_sample", "peak_sample", "settled_sample",
+        "load_started_unix", "load_finished_unix", "scaled_pods",
+        "settled_active", "settled_hpa_current", "settled_hpa_desired",
+        "prometheus_service", "prometheus_port", "observation_started_unix",
+        "observation_finished_unix", "final_target",
+    }
+    if not isinstance(value, dict) or set(value) != fields:
+        raise DeploymentError("KEDA scale evidence fields differ")
+    for key in ("scaled_object_uid", "hpa_uid", "external_metric"):
+        if not isinstance(value.get(key), str) or not value[key]:
+            raise DeploymentError("KEDA scale identity is malformed")
+    prometheus_url(value.get("prometheus_server"))
+    if (not isinstance(value.get("monitoring_namespace"), str)
+            or SAFE_NAME.fullmatch(value["monitoring_namespace"]) is None
+            or not isinstance(value.get("service_monitor_label"), str)):
+        raise DeploymentError("KEDA Prometheus binding is malformed")
+    label_assignment(value["service_monitor_label"])
+    if (not isinstance(value.get("prometheus_service"), str)
+            or SAFE_NAME.fullmatch(value["prometheus_service"]) is None
+            or type(value.get("prometheus_port")) is not int):
+        raise DeploymentError("KEDA observed Prometheus Service is malformed")
+    bind_prometheus_endpoint(
+        value["prometheus_server"], value["prometheus_service"],
+        value["monitoring_namespace"], value["prometheus_port"],
+    )
+    if not isinstance(value.get("query"), str) or not value["query"]:
+        raise DeploymentError("KEDA Prometheus query is malformed")
+    for key in ("scaled_replicas", "settled_replicas", "load_requests",
+                "load_concurrency", "max_tokens"):
+        if type(value.get(key)) is not int or value[key] < 1:
+            raise DeploymentError("KEDA scale counts are malformed")
+    if (value["external_metric"] != "s0-prometheus-tritium_queue_pressure"
+            or value["scaled_replicas"] < 2 or value["settled_replicas"] != 1
+            or value["load_requests"] < value["load_concurrency"]):
+        raise DeploymentError("KEDA scale transition is incomplete")
+    started = value.get("load_started_unix")
+    finished = value.get("load_finished_unix")
+    observed_started = value.get("observation_started_unix")
+    observed_finished = value.get("observation_finished_unix")
+    if (any(type(item) not in {int, float} or not math.isfinite(item)
+            for item in (started, finished, observed_started, observed_finished))
+            or not observed_started <= started <= finished <= observed_finished):
+        raise DeploymentError("KEDA load timestamps are malformed")
+    samples = []
+    for key in ("baseline_sample", "peak_sample", "settled_sample"):
+        sample = value.get(key)
+        if not isinstance(sample, dict) or set(sample) != {"timestamp", "value"}:
+            raise DeploymentError("KEDA Prometheus sample fields differ")
+        if any(type(sample.get(field)) not in {int, float}
+               or not math.isfinite(sample[field]) for field in sample) or sample["value"] < 0:
+            raise DeploymentError("KEDA Prometheus sample is malformed")
+        samples.append(sample)
+    baseline, peak, settled = samples
+    if (not observed_started <= baseline["timestamp"] <= started + 5
+            or baseline["value"] > 1 or not started - 5 <= peak["timestamp"] <= finished + 5
+            or peak["value"] <= 1 or settled["timestamp"] < finished - 5
+            or settled["timestamp"] > observed_finished + 5 or settled["value"] > 1):
+        raise DeploymentError("KEDA Prometheus samples do not prove scale causality")
+    target = value.get("target")
+    final_target = value.get("final_target")
+    for observed_target in (target, final_target):
+        if (not isinstance(observed_target, dict)
+                or set(observed_target) != {"scrape_url", "last_scrape_utc"}
+                or not isinstance(observed_target.get("scrape_url"), str)
+                or not observed_target["scrape_url"].endswith("/metrics")
+                or not isinstance(observed_target.get("last_scrape_utc"), str)):
+            raise DeploymentError("KEDA Prometheus target is malformed")
+    validate_receipt_snapshot(value.get("scaled_pods"), "scaled", value["scaled_replicas"])
+    if (value.get("settled_active") is not False
+            or value.get("settled_hpa_current") != 1
+            or value.get("settled_hpa_desired") != 1):
+        raise DeploymentError("KEDA controller did not prove settled scale-down")
+    return value
+
+
+def exercise_keda_scale(*, kubectl_base: list[str], service: str, token: str,
+                        model_id: str, prompt: str, concurrency: int,
+                        max_tokens: int, timeout: float,
+                        request_timeout: float, prometheus_base_url: str,
+                        prometheus_query: str, namespace: str, selector: str,
+                        flavor: str) -> dict[str, Any]:
+    stop = threading.Event()
+    count_lock = threading.Lock()
+    completed = 0
+    observation_started = time.time()
+    baseline = None
+    target = None
+    baseline_deadline = time.monotonic() + timeout
+    while time.monotonic() < baseline_deadline:
+        try:
+            scaled = run_json(
+                kubectl_base + ["get", f"scaledobject/{service}", "-o", "json"]
+            )
+            hpa = run_json(kubectl_base + ["get", f"hpa/keda-hpa-{service}", "-o", "json"])
+            deployment = run_json(
+                kubectl_base + ["get", f"deployment/{service}", "-o", "json"]
+            )
+            candidate_target = prometheus_target(
+                prometheus_base_url, namespace=namespace, service=service,
+                timeout=request_timeout,
+            )
+            candidate_sample = prometheus_sample(
+                prometheus_base_url, prometheus_query, request_timeout
+            )
+            target_time = datetime.fromisoformat(
+                candidate_target["last_scrape_utc"]
+            ).timestamp()
+            if (scale_baseline(scaled, hpa, deployment)
+                    and candidate_sample["value"] <= 1
+                    and candidate_sample["timestamp"] >= observation_started
+                    and target_time >= observation_started):
+                baseline = candidate_sample
+                target = candidate_target
+                break
+        except DeploymentError:
+            pass
+        time.sleep(5)
+    if baseline is None or target is None:
+        raise DeploymentError("fresh Prometheus/KEDA baseline deadline expired")
+
+    def generate() -> None:
+        nonlocal completed
+        while not stop.is_set():
+            port = free_port()
+            url = f"http://127.0.0.1:{port}"
+            process, _ = port_forward(
+                kubectl_base + ["port-forward", f"service/{service}", f"{port}:8080",
+                                "--address", "127.0.0.1"],
+                time.monotonic() + min(timeout, 60), url, token,
+            )
+            try:
+                result = request_json(
+                    url + "/v1/chat/completions", token,
+                    body={"model": model_id,
+                          "messages": [{"role": "user", "content": prompt}],
+                          "temperature": 0, "max_tokens": max_tokens},
+                    timeout=request_timeout,
+                )
+                if not isinstance(result.get("choices"), list) or len(result["choices"]) != 1:
+                    raise DeploymentError("KEDA load request returned malformed generation")
+                with count_lock:
+                    completed += 1
+            finally:
+                stop_forward(process)
+
+    load_started = time.time()
+    deadline = time.monotonic() + timeout
+    observed = None
+    errors: list[BaseException] = []
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        futures = [pool.submit(generate) for _ in range(concurrency)]
+        try:
+            while time.monotonic() < deadline:
+                try:
+                    observed = scale_snapshot(
+                        run_json(kubectl_base + ["get", f"scaledobject/{service}", "-o", "json"]),
+                        run_json(kubectl_base + ["get", f"hpa/keda-hpa-{service}", "-o", "json"]),
+                        run_json(kubectl_base + ["get", f"deployment/{service}", "-o", "json"]),
+                    )
+                    observed["scaled_pods"] = pod_snapshot(
+                        run_json(kubectl_base + ["get", "pods", "-l", selector, "-o", "json"]),
+                        flavor, observed["scaled_replicas"],
+                    )
+                    break
+                except DeploymentError:
+                    time.sleep(5)
+            if observed is None:
+                raise DeploymentError("KEDA scale-out deadline expired")
+        finally:
+            stop.set()
+        for future in as_completed(futures):
+            try:
+                future.result()
+            except BaseException as error:
+                errors.append(error)
+    if errors:
+        raise DeploymentError(f"KEDA load generation failed: {errors[0]}") from errors[0]
+    load_finished = time.time()
+    peak = prometheus_peak(
+        prometheus_base_url, prometheus_query, load_started, load_finished,
+        request_timeout,
+    )
+    if peak["value"] <= 1 or peak["timestamp"] < load_started - 5:
+        raise DeploymentError("Prometheus did not record queue pressure above threshold")
+    settle_deadline = time.monotonic() + timeout
+    while time.monotonic() < settle_deadline:
+        scaled = run_json(
+            kubectl_base + ["get", f"scaledobject/{service}", "-o", "json"]
+        )
+        hpa = run_json(kubectl_base + ["get", f"hpa/keda-hpa-{service}", "-o", "json"])
+        deployment = run_json(
+            kubectl_base + ["get", f"deployment/{service}", "-o", "json"]
+        )
+        try:
+            settled = prometheus_sample(
+                prometheus_base_url, prometheus_query, request_timeout
+            )
+        except DeploymentError:
+            time.sleep(5)
+            continue
+        hpa_status = hpa.get("status", {})
+        if (scale_baseline(scaled, hpa, deployment)
+                and settled["timestamp"] >= load_finished
+                and settled["value"] <= 1):
+            final_target = prometheus_target(
+                prometheus_base_url, namespace=namespace, service=service,
+                timeout=request_timeout,
+            )
+            final_target_time = datetime.fromisoformat(
+                final_target["last_scrape_utc"]
+            ).timestamp()
+            if final_target_time < load_finished:
+                time.sleep(5)
+                continue
+            observation_finished = time.time()
+            return {
+                **observed, "settled_replicas": 1, "load_requests": completed,
+                "load_concurrency": concurrency, "max_tokens": max_tokens,
+                "query": prometheus_query, "target": target,
+                "baseline_sample": baseline, "peak_sample": peak,
+                "settled_sample": settled, "load_started_unix": load_started,
+                "load_finished_unix": load_finished,
+                "settled_active": condition(scaled, "Active"),
+                "settled_hpa_current": hpa_status.get("currentReplicas"),
+                "settled_hpa_desired": hpa_status.get("desiredReplicas"),
+                "observation_started_unix": observation_started,
+                "observation_finished_unix": observation_finished,
+                "final_target": final_target,
+            }
+        time.sleep(5)
+    raise DeploymentError("KEDA scale-down deadline expired")
+
+
 def atomic_create(path: Path, payload: bytes) -> None:
     if path.exists() or path.is_symlink():
         raise DeploymentError("refusing to overwrite output")
@@ -530,8 +1057,8 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
     ):
         if SAFE_NAME.fullmatch(value) is None:
             raise DeploymentError(f"{label} is not a safe Kubernetes name")
-    if len(args.release_name) > 55:
-        raise DeploymentError("release name is too long for the Tritium chart fullname")
+    if len(args.release_name) > 46:
+        raise DeploymentError("release name is too long for Tritium KEDA resource names")
     if SAFE_SECRET_KEY.fullmatch(args.auth_key) is None:
         raise DeploymentError("auth key is not a safe Secret key")
     if not args.context or len(args.context) > 256 or "\x00" in args.context:
@@ -542,6 +1069,8 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
     if separator != "@" or not repository or not image_digest.startswith("sha256:"):
         raise DeploymentError("image must be an exact repository digest")
     exact_hex(image_digest[7:], 64, "image digest")
+    if OCI_REPOSITORY.fullmatch(repository) is None:
+        raise DeploymentError("image repository is not canonical or Helm-safe")
     if not math.isfinite(args.timeout) or not 0 < args.timeout <= 7200:
         raise DeploymentError("timeout must be finite and in (0, 7200]")
     if not math.isfinite(args.request_timeout) or not 0 < args.request_timeout <= 1800:
@@ -550,6 +1079,34 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
         raise DeploymentError("CUDA qualification requires a pinned probe image")
     if args.flavor == "cpu" and args.cuda_probe_image is not None:
         raise DeploymentError("CPU qualification cannot accept a CUDA probe image")
+    if args.flavor == "cpu":
+        prometheus_url(args.keda_prometheus_server)
+        if SAFE_NAME.fullmatch(args.monitoring_namespace or "") is None:
+            raise DeploymentError("CPU qualification requires a safe monitoring namespace")
+        if SAFE_NAME.fullmatch(args.prometheus_service or "") is None:
+            raise DeploymentError("CPU qualification requires a safe Prometheus service")
+        if type(args.prometheus_port) is not int or not 1 <= args.prometheus_port <= 65535:
+            raise DeploymentError("Prometheus port must be in [1, 65535]")
+        bind_prometheus_endpoint(
+            args.keda_prometheus_server, args.prometheus_service,
+            args.monitoring_namespace, args.prometheus_port,
+        )
+        monitor_label_key, monitor_label_value = label_assignment(
+            args.service_monitor_label or ""
+        )
+    elif any(value is not None for value in (
+        args.keda_prometheus_server, args.monitoring_namespace,
+        args.service_monitor_label, args.prometheus_service,
+    )):
+        raise DeploymentError("CUDA qualification cannot claim CPU KEDA scale evidence")
+    if type(args.scale_concurrency) is not int or not 2 <= args.scale_concurrency <= 32:
+        raise DeploymentError("scale concurrency must be in [2, 32]")
+    if type(args.scale_max_tokens) is not int or not 2 <= args.scale_max_tokens <= 256:
+        raise DeploymentError("scale max tokens must be in [2, 256]")
+    if not math.isfinite(args.scale_timeout) or not 60 <= args.scale_timeout <= 1800:
+        raise DeploymentError("scale timeout must be finite and in [60, 1800]")
+    if not isinstance(args.prompt, str) or not args.prompt or len(args.prompt.encode()) > 1024 * 1024:
+        raise DeploymentError("prompt must be non-empty and at most 1 MiB")
     chart = ordinary(args.chart_archive, "Helm chart archive")
     image_archive = ordinary(args.image_archive, "OCI image archive")
     build_receipt = ordinary(args.build_receipt, "OCI build receipt")
@@ -588,6 +1145,13 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
         raise DeploymentError("namespace UID is absent")
     if run(helm_base + ["list", "--filter", f"^{args.release_name}$", "-q"]):
         raise DeploymentError("Helm release already exists")
+    if args.flavor == "cpu":
+        run_json(kubectl_base + ["get", "customresourcedefinition/scaledobjects.keda.sh",
+                                  "-o", "json"])
+        run_json(kubectl_base + ["get", "customresourcedefinition/servicemonitors.monitoring.coreos.com",
+                                  "-o", "json"])
+        run_json(kubectl_base + ["get", "namespace", args.monitoring_namespace, "-o", "json"])
+        run(kubectl_base + ["get", "--raw", "/apis/external.metrics.k8s.io/v1beta1"])
     run_json(kubectl_base + ["get", "persistentvolumeclaim", args.source_pvc, "-o", "json"])
     secret_doc = run_json(kubectl_base + ["get", "secret", args.auth_secret, "-o", "json"])
     encoded_token = secret_doc.get("data", {}).get(args.auth_key)
@@ -600,6 +1164,9 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
 
     service = f"{args.release_name}-tritium"
     selector = f"app.kubernetes.io/name=tritium,app.kubernetes.io/instance={args.release_name}"
+    prometheus_query_text = (
+        f'max(tritium_queue_depth{{namespace="{args.namespace}",service="{service}"}})'
+    )
     timeout_value = f"{math.ceil(args.timeout)}s"
     values = [
         "--set-string", f"image.repository={repository}",
@@ -613,10 +1180,40 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
     ]
     if args.flavor == "cuda":
         values += ["--set", "gpu.enabled=true"]
+    else:
+        values += [
+            "--set", "keda.enabled=true",
+            "--set", "keda.minReplicaCount=1",
+            "--set", "keda.maxReplicaCount=2",
+            "--set", "keda.pollingInterval=5",
+            "--set", "keda.cooldownPeriod=30",
+            "--set", "keda.stabilizationWindowSeconds=30",
+            "--set-string", f"keda.prometheus.serverAddress={args.keda_prometheus_server}",
+            "--set-string", "keda.prometheus.threshold=1",
+            "--set", "serviceMonitor.enabled=true",
+            "--set-string", f"serviceMonitor.labels.{helm_key(monitor_label_key)}={monitor_label_value}",
+            "--set-string", "serviceMonitor.ingressNamespaceSelector.matchLabels."
+                            f"kubernetes\\.io/metadata\\.name={args.monitoring_namespace}",
+        ]
     install = helm_base + [
         "install", args.release_name, str(chart), "--atomic", "--wait",
         "--timeout", timeout_value,
     ] + values
+    lock_name = "tritium-qualify-" + hashlib.sha256(
+        f"{args.context}\0{args.namespace}\0{args.release_name}".encode()
+    ).hexdigest()[:16]
+    lock = run_json(kubectl_base + [
+        "create", "configmap", lock_name, f"--from-literal=run-id={args.run_id}",
+        "-o", "json",
+    ], 30)
+    lock_uid = lock.get("metadata", {}).get("uid")
+    if (not isinstance(lock_uid, str) or not lock_uid
+            or lock.get("data") != {"run-id": args.run_id}):
+        try:
+            run(kubectl_base + ["delete", f"configmap/{lock_name}", "--wait=true"], 30)
+        except DeploymentError:
+            pass
+        raise DeploymentError("qualification lock identity is malformed")
     started_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     started = time.monotonic()
     install_attempted = False
@@ -630,6 +1227,9 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
         deployment_uid = validate_deployment(
             deployment, image=args.image, manifest_sha256=manifest_sha, flavor=args.flavor
         )
+        update_before = deployment_update_identity(deployment)
+        if update_before["rate_limit_burst"] != 8:
+            raise DeploymentError("initial deployment rate-limit burst differs")
         initial = pod_snapshot(
             run_json(kubectl_base + ["get", "pods", "-l", selector, "-o", "json"]),
             args.flavor,
@@ -654,9 +1254,10 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
                 or not entries[0]["id"]
             ):
                 raise DeploymentError("cluster model listing is not singular")
+            model_id = entries[0]["id"]
             generation = request_json(
                 url + "/v1/chat/completions", token,
-                body={"model": entries[0].get("id"),
+                body={"model": model_id,
                       "messages": [{"role": "user", "content": args.prompt}],
                       "temperature": 0, "max_tokens": 1},
                 timeout=args.request_timeout,
@@ -667,6 +1268,53 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
             metric_evidence = metrics_snapshot(metrics)
         finally:
             stop_forward(process)
+        scale = None
+        if args.flavor == "cpu":
+            scaled_object = run_json(
+                kubectl_base + ["get", f"scaledobject/{service}", "-o", "json"]
+            )
+            service_monitor = run_json(
+                kubectl_base + ["get", f"servicemonitor/{service}", "-o", "json"]
+            )
+            validate_scale_contract(
+                scaled_object, service_monitor, service=service,
+                server=args.keda_prometheus_server, query=prometheus_query_text,
+                auth_secret=args.auth_secret, auth_key=args.auth_key,
+                monitor_label=(monitor_label_key, monitor_label_value),
+            )
+            prometheus_kubectl = kube(kubectl, args.context, args.monitoring_namespace)
+            prometheus_port = free_port()
+            prometheus_local = f"http://127.0.0.1:{prometheus_port}"
+            prometheus_process = public_port_forward(
+                prometheus_kubectl + [
+                    "port-forward", f"service/{args.prometheus_service}",
+                    f"{prometheus_port}:{args.prometheus_port}", "--address", "127.0.0.1",
+                ],
+                time.monotonic() + args.timeout, prometheus_local,
+            )
+            try:
+                scale = exercise_keda_scale(
+                    kubectl_base=kubectl_base, service=service, token=token,
+                    model_id=model_id, prompt=args.prompt,
+                    concurrency=args.scale_concurrency, max_tokens=args.scale_max_tokens,
+                    timeout=args.scale_timeout, request_timeout=args.request_timeout,
+                    prometheus_base_url=prometheus_local,
+                    prometheus_query=prometheus_query_text,
+                    namespace=args.namespace, selector=selector, flavor=args.flavor,
+                )
+            finally:
+                stop_forward(prometheus_process)
+            scale.update({
+                "prometheus_server": args.keda_prometheus_server,
+                "prometheus_service": args.prometheus_service,
+                "prometheus_port": args.prometheus_port,
+                "monitoring_namespace": args.monitoring_namespace,
+                "service_monitor_label": args.service_monitor_label,
+            })
+            initial = pod_snapshot(
+                run_json(kubectl_base + ["get", "pods", "-l", selector, "-o", "json"]),
+                args.flavor,
+            )
         first_pod = initial["pods"][0]["name"]
         run(kubectl_base + ["delete", f"pod/{first_pod}", "--wait=true"], args.timeout)
         run(kubectl_base + ["rollout", "status", f"deployment/{service}",
@@ -707,6 +1355,10 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
             flavor=args.flavor,
         ) != deployment_uid:
             raise DeploymentError("successful update replaced deployment identity")
+        update_after = deployment_update_identity(updated_deployment)
+        if (update_after["rate_limit_burst"] != 9
+                or update_after["generation"] <= update_before["generation"]):
+            raise DeploymentError("successful update did not apply intended config delta")
         updated = pod_snapshot(
             run_json(kubectl_base + ["get", "pods", "-l", selector, "-o", "json"]),
             args.flavor,
@@ -731,9 +1383,10 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
             stop_forward(update_process)
         if update_startup != startup:
             raise DeploymentError("successful update changed immutable startup receipt")
-        node_names = {
-            pod["node"] for pod in initial["pods"] + restarted["pods"] + updated["pods"]
-        }
+        observed_pods = initial["pods"] + restarted["pods"] + updated["pods"]
+        if scale is not None:
+            observed_pods += scale["scaled_pods"]["pods"]
+        node_names = {pod["node"] for pod in observed_pods}
         nodes = [
             node_snapshot(run_json(kubectl_base + ["get", f"node/{name}", "-o", "json"]))
             for name in sorted(node_names)
@@ -807,7 +1460,18 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
         ), prior_revision)
     finally:
         active_error = sys.exc_info()[0] is not None
-        if install_attempted:
+        owns_lock = False
+        try:
+            current_lock = run_json(
+                kubectl_base + ["get", f"configmap/{lock_name}", "-o", "json"]
+            )
+            owns_lock = (current_lock.get("metadata", {}).get("uid") == lock_uid
+                         and current_lock.get("data") == {"run-id": args.run_id})
+        except DeploymentError:
+            owns_lock = False
+        if not owns_lock and not active_error:
+            raise DeploymentError("qualification lock ownership was lost")
+        if install_attempted and owns_lock:
             try:
                 run(helm_base + ["uninstall", args.release_name, "--wait",
                                  "--ignore-not-found", "--timeout", timeout_value],
@@ -815,14 +1479,39 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
                 cleanup_passed = not run(
                     helm_base + ["list", "--filter", f"^{args.release_name}$", "-q"]
                 )
-                remaining = run(kubectl_base + [
-                    "get", "deployment,service,pod,pdb,networkpolicy", "-l", selector,
-                    "-o", "name", "--ignore-not-found=true",
+                exact_resources = [
+                    f"deployment/{service}", f"service/{service}", f"pdb/{service}",
+                    f"networkpolicy/{service}",
+                ]
+                if args.flavor == "cpu":
+                    exact_resources += [
+                        f"hpa/keda-hpa-{service}", f"scaledobject/{service}",
+                        f"servicemonitor/{service}",
+                    ]
+                remaining_exact = run(
+                    kubectl_base + ["get", *exact_resources, "-o", "name",
+                                    "--ignore-not-found=true"]
+                )
+                remaining_pods = run(kubectl_base + [
+                    "get", "pods", "-l", selector, "-o", "name",
+                    "--ignore-not-found=true",
                 ])
-                cleanup_passed = cleanup_passed and not remaining
+                cleanup_passed = cleanup_passed and not remaining_exact and not remaining_pods
                 if not cleanup_passed and not active_error:
                     raise DeploymentError("Helm release cleanup is incomplete")
             except DeploymentError:
+                if not active_error:
+                    raise
+        if owns_lock:
+            try:
+                run(kubectl_base + ["delete", f"configmap/{lock_name}", "--wait=true"], 30)
+                lock_remaining = run(kubectl_base + [
+                    "get", f"configmap/{lock_name}", "-o", "name",
+                    "--ignore-not-found=true",
+                ])
+                cleanup_passed = cleanup_passed and not lock_remaining
+            except DeploymentError:
+                cleanup_passed = False
                 if not active_error:
                     raise
     if not cleanup_passed:
@@ -853,17 +1542,19 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
         "tools": {"kubectl_sha256": sha256(kubectl), "helm_sha256": sha256(helm_bin),
                   "helm_version": run([str(helm_bin), "version", "--short"])},
         "workload": {"release_name": args.release_name, "deployment_uid": deployment_uid,
+                     "qualification_lock_uid": lock_uid,
                      "initial": initial, "restarted": restarted, "updated": updated,
                      "startup_receipt": startup, "restart_startup_receipt": restart_startup,
                      "update_startup_receipt": update_startup,
                      "update_strategy": "Recreate" if args.flavor == "cuda" else "RollingUpdate",
+                     "update_config": {"before": update_before, "after": update_after},
                      "rollback_startup_receipt": rollback_startup,
-                     "metrics": metric_evidence, "helm_history": history,
+                     "metrics": metric_evidence, "scale": scale, "helm_history": history,
                      "prior_helm_revision": prior_revision,
                      "failed_manifest_sha256": wrong_manifest,
                      "failed_image_digest": "sha256:" + wrong_image,
                      "failed_upgrade_output_sha256": failure_sha},
-        "checks": list(CHECKS), "result": "pass",
+        "checks": expected_checks(args.flavor), "result": "pass",
     }
     receipt["receipt_id"] = "sha256:" + hashlib.sha256(canonical(receipt)).hexdigest()
     validate_receipt(
@@ -890,7 +1581,8 @@ def validate_receipt(receipt: dict[str, Any], *, chart_path: Path, image_path: P
         raise DeploymentError("deployment receipt schema or result differs")
     if receipt.get("release") != release or receipt.get("source_revision") != revision:
         raise DeploymentError("deployment receipt release identity differs")
-    if receipt.get("checks") != list(CHECKS) or receipt.get("flavor") not in {"cpu", "cuda"}:
+    if (receipt.get("flavor") not in {"cpu", "cuda"}
+            or receipt.get("checks") != expected_checks(receipt["flavor"])):
         raise DeploymentError("deployment receipt checks or flavor differ")
     if receipt.get("profile") not in {"compact-v1", "near-lossless-v1"}:
         raise DeploymentError("deployment receipt profile differs")
@@ -932,6 +1624,9 @@ def validate_receipt(receipt: dict[str, Any], *, chart_path: Path, image_path: P
     image = receipt.get("image")
     if not isinstance(image, str) or not re.fullmatch(r"[^\s@]+@sha256:[0-9a-f]{64}", image):
         raise DeploymentError("deployment image reference is mutable")
+    receipt_repository = image.rpartition("@")[0]
+    if OCI_REPOSITORY.fullmatch(receipt_repository) is None:
+        raise DeploymentError("deployment image repository is not canonical")
     manifest = receipt.get("manifest")
     if not isinstance(manifest, dict) or set(manifest) != {"schema", "bytes", "sha256", "blake3"}:
         raise DeploymentError("deployment manifest identity fields differ")
@@ -976,14 +1671,16 @@ def validate_receipt(receipt: dict[str, Any], *, chart_path: Path, image_path: P
     exact_hex(tools.get("helm_sha256"), 64, "Helm SHA-256")
     workload = receipt.get("workload")
     if not isinstance(workload, dict) or set(workload) != {
-        "release_name", "deployment_uid", "initial", "restarted", "updated",
+        "release_name", "deployment_uid", "qualification_lock_uid",
+        "initial", "restarted", "updated",
         "startup_receipt", "restart_startup_receipt", "update_startup_receipt",
-        "update_strategy", "rollback_startup_receipt", "metrics", "helm_history",
+        "update_strategy", "update_config", "rollback_startup_receipt", "metrics",
+        "scale", "helm_history",
         "prior_helm_revision", "failed_manifest_sha256", "failed_image_digest",
         "failed_upgrade_output_sha256",
     }:
         raise DeploymentError("deployment workload fields differ")
-    for key in ("deployment_uid", "release_name"):
+    for key in ("deployment_uid", "qualification_lock_uid", "release_name"):
         if not isinstance(workload.get(key), str) or not workload[key]:
             raise DeploymentError("deployment workload identity is malformed")
     exact_hex(workload.get("failed_upgrade_output_sha256"), 64, "failed-upgrade SHA-256")
@@ -1028,6 +1725,19 @@ def validate_receipt(receipt: dict[str, Any], *, chart_path: Path, image_path: P
     if (workload["update_startup_receipt"] != workload["startup_receipt"]
             or workload.get("update_strategy") != expected_strategy):
         raise DeploymentError("deployment successful-update evidence differs")
+    update_config = workload.get("update_config")
+    if not isinstance(update_config, dict) or set(update_config) != {"before", "after"}:
+        raise DeploymentError("deployment update config fields differ")
+    before = update_config.get("before")
+    after = update_config.get("after")
+    if (not isinstance(before, dict) or not isinstance(after, dict)
+            or set(before) != {"generation", "rate_limit_burst"}
+            or set(after) != {"generation", "rate_limit_burst"}
+            or before.get("rate_limit_burst") != 8 or after.get("rate_limit_burst") != 9
+            or type(before.get("generation")) is not int
+            or type(after.get("generation")) is not int
+            or after["generation"] <= before["generation"]):
+        raise DeploymentError("deployment intended update delta is malformed")
     validate_ready(
         {"status": "ready", "release_gate": "production_artifact_admitted",
          "startup_receipt": workload.get("rollback_startup_receipt")},
@@ -1050,10 +1760,35 @@ def validate_receipt(receipt: dict[str, Any], *, chart_path: Path, image_path: P
         metric_values["tritium_tokens_out_total"] < 1
     ) or metric_values["tritium_worker_alive"] != 1:
         raise DeploymentError("deployment metrics evidence is malformed")
+    if receipt["flavor"] == "cpu":
+        scale_receipt = validate_scale_receipt(workload.get("scale"))
+        expected_query = (
+            f'max(tritium_queue_depth{{namespace="{cluster["namespace"]}",'
+            f'service="{workload["release_name"]}-tritium"}})'
+        )
+        if scale_receipt["query"] != expected_query:
+            raise DeploymentError("KEDA query does not bind deployed namespace and service")
+        try:
+            target_scrape = datetime.fromisoformat(
+                scale_receipt["target"]["last_scrape_utc"]
+            ).timestamp()
+            final_target_scrape = datetime.fromisoformat(
+                scale_receipt["final_target"]["last_scrape_utc"]
+            ).timestamp()
+        except ValueError as error:
+            raise DeploymentError("KEDA target timestamp is malformed") from error
+        if (not scale_receipt["observation_started_unix"] <= target_scrape
+                <= scale_receipt["load_started_unix"] + 5
+                or not scale_receipt["load_finished_unix"] <= final_target_scrape
+                <= scale_receipt["observation_finished_unix"] + 5):
+            raise DeploymentError("KEDA target timestamp is outside qualification window")
+    elif workload.get("scale") is not None:
+        raise DeploymentError("CUDA deployment cannot contain CPU KEDA scale evidence")
     validate_helm_history(workload.get("helm_history"), workload["prior_helm_revision"])
-    node_names = {
-        pod["node"] for pod in initial["pods"] + restarted["pods"] + updated["pods"]
-    }
+    observed_pods = initial["pods"] + restarted["pods"] + updated["pods"]
+    if receipt["flavor"] == "cpu":
+        observed_pods += workload["scale"]["scaled_pods"]["pods"]
+    node_names = {pod["node"] for pod in observed_pods}
     if node_names != {node["name"] for node in validated_nodes}:
         raise DeploymentError("deployment node identities differ from pod placement")
     cuda_node = cluster.get("cuda_node")
@@ -1128,6 +1863,14 @@ def main() -> int:
     parser.add_argument("--auth-key", default="token")
     parser.add_argument("--auth-token-file", type=Path, required=True)
     parser.add_argument("--cuda-probe-image")
+    parser.add_argument("--keda-prometheus-server")
+    parser.add_argument("--monitoring-namespace")
+    parser.add_argument("--prometheus-service")
+    parser.add_argument("--prometheus-port", type=int, default=9090)
+    parser.add_argument("--service-monitor-label")
+    parser.add_argument("--scale-timeout", type=float, default=600)
+    parser.add_argument("--scale-concurrency", type=int, default=8)
+    parser.add_argument("--scale-max-tokens", type=int, default=256)
     parser.add_argument("--source-revision", required=True)
     parser.add_argument("--release", required=True)
     parser.add_argument("--run-id", required=True)

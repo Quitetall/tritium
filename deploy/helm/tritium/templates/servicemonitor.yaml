@@ -6,7 +6,7 @@ metadata:
   labels:
     {{- include "tritium.labels" . | nindent 4 }}
     {{- with .Values.serviceMonitor.labels }}
-    {{- toYaml .Values.serviceMonitor.labels | nindent 4 }}
+    {{- toYaml . | nindent 4 }}
     {{- end }}
 spec:
   selector:

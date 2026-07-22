@@ -65,6 +65,9 @@ class DeploymentContractTests(unittest.TestCase):
         self.assertIn("maxReplicaCount", keda)
         for template in ("pdb.yaml", "networkpolicy.yaml", "servicemonitor.yaml"):
             self.assertTrue((CHART / "templates" / template).is_file())
+        service_monitor = (CHART / "templates/servicemonitor.yaml").read_text(encoding="utf-8")
+        self.assertIn("with .Values.serviceMonitor.labels", service_monitor)
+        self.assertIn("toYaml . | nindent 4", service_monitor)
         network = (CHART / "templates/networkpolicy.yaml").read_text(encoding="utf-8")
         self.assertIn("kubernetes.io/metadata.name: kube-system", network)
         self.assertIn("k8s-app: kube-dns", network)
@@ -98,6 +101,8 @@ class DeploymentContractTests(unittest.TestCase):
             "validate_oci_archive", "--atomic", "helm_history", "pod-restart",
             "failed-upgrade", "physical_device_id", "--cuda-probe-image",
             "tritium_tokens_out_total", "receipt_id", "release-cleanup",
+            "qualification_lock_uid", "query_range", "servicemonitor/",
+            "keda-hpa-", "load_started_unix",
         ):
             self.assertIn(token, qualifier)
 

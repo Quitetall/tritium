@@ -272,8 +272,11 @@ uninstall. CUDA additionally runs a release-policy-allowlisted,
 digest-addressed NVIDIA evidence image with a fixed `nvidia-smi` command on the
 node that served Tritium to capture the driver, CUDA runtime, GPU name and
 physical GPU UUID; that UUID must match the serving startup receipt. The harness
-and receipt validator are local-green; empirical kind and NVIDIA-cluster
-receipts remain open release gates.
+also makes CPU qualification contingent on KEDA and external-metrics API
+preflight, a bounded Prometheus-backed generation load, an Active/Ready
+ScaledObject, HPA-backed scale-out from one to at least two ready replicas and
+settling back to one. Harness and receipt validator are local-green; empirical
+kind, Prometheus/KEDA and NVIDIA-cluster receipts remain open release gates.
 
 ## Slice 6 — failure injection and release evidence
 
