@@ -14,7 +14,7 @@ class InstalledQatTutorialTests(unittest.TestCase):
         validator = "python -I -m tritium.torch.tutorial_qat"
         self.assertEqual(workflow.count(example), 2)
         self.assertEqual(workflow.count(validator), 4)
-        self.assertEqual(workflow.count("--check-receipt"), 4)
+        self.assertEqual(workflow.count("--check-receipt"), 5)
         self.assertIn("--device cpu", workflow)
         self.assertIn("--device cuda:0", workflow)
         self.assertIn("evidence/tutorial-cpu/receipt.json", workflow)
