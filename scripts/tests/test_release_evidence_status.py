@@ -182,11 +182,9 @@ class ReleaseEvidenceStatusTests(unittest.TestCase):
                     "system": "Linux", "architecture": "x86_64",
                 },
                 "toolchain": {"cargo": "cargo 1.89.0", "rustc": "rustc 1.89.0"},
-                "commands": [
-                    ["cargo", "vendor", "--locked", "--versioned-dirs"],
-                    ["cargo", "generate-lockfile", "--offline"],
-                    ["cargo", "check", "--offline", "--locked", "--all-targets"],
-                ],
+                "command_contract": (
+                    "vendor-locked_then_empty-cargo-home_offline-locked-all-targets-v1"
+                ),
                 "dependency_lock_sha256": sha256(ROOT / "Cargo.lock"),
                 "offline": True, "isolated_cargo_home": True, "packages": packages,
                 "compiled_packages": ["alpha", "beta"], "result": "pass",

@@ -21,11 +21,14 @@ REVISION = "a" * 40
 RELEASE = "1.1.0-rc.0"
 
 
-def crate_archive(path: Path) -> None:
-    prefix = f"demo-{RELEASE}"
+def crate_archive(path: Path, name: str) -> None:
+    prefix = f"{name}-{RELEASE}"
     with tarfile.open(path, "w:gz") as archive:
         for name, payload in (
-            (f"{prefix}/Cargo.toml", b"[package]\nname='demo'\nversion='1.1.0-rc.0'\n"),
+            (
+                f"{prefix}/Cargo.toml",
+                f"[package]\nname='{name}'\nversion='1.1.0-rc.0'\n".encode(),
+            ),
             (f"{prefix}/src/lib.rs", b"pub fn demo() {}\n"),
         ):
             info = tarfile.TarInfo(name)
@@ -39,7 +42,12 @@ def package_metadata() -> list[dict]:
             "name": "demo",
             "version": RELEASE,
             "targets": [{"kind": ["lib"]}],
-        }
+        },
+        {
+            "name": "demo-cli",
+            "version": RELEASE,
+            "targets": [{"kind": ["bin"]}],
+        },
     ]
 
 
@@ -48,14 +56,16 @@ class QualifyCrateArchivesTests(unittest.TestCase):
         (root / "Cargo.lock").write_text("# locked\n", encoding="utf-8")
         archives = root / "archives"
         archives.mkdir()
-        archive = archives / f"demo-{RELEASE}.crate"
-        crate_archive(archive)
-        identity = {"bytes": archive.stat().st_size, "sha256": MODULE["_sha256"](archive)}
+        for name in ("demo", "demo-cli"):
+            crate_archive(archives / f"{name}-{RELEASE}.crate", name)
         with mock.patch.dict(
             qualify.__globals__,
             {
                 "_metadata": lambda _root: package_metadata(),
-                "inspect_archive": lambda *_args: identity,
+                "inspect_archive": lambda path, *_args: {
+                    "bytes": path.stat().st_size,
+                    "sha256": MODULE["_sha256"](path),
+                },
             },
         ), mock.patch.object(MODULE["subprocess"], "run"), mock.patch.object(
             MODULE["subprocess"], "check_output",
@@ -80,7 +90,7 @@ class QualifyCrateArchivesTests(unittest.TestCase):
                 receipt,
             )
             self.assertTrue(receipt["offline"])
-            self.assertEqual(receipt["compiled_packages"], ["demo"])
+            self.assertEqual(receipt["compiled_packages"], ["demo", "demo-cli"])
             self.assertEqual(receipt["packages"][0]["artifact_id"], "crate-demo")
 
     def test_receipt_rejects_archive_and_identity_drift(self):
@@ -94,7 +104,7 @@ class QualifyCrateArchivesTests(unittest.TestCase):
                 elif mutation == "identity":
                     receipt["receipt_id"] = "sha256:" + "0" * 64
                 else:
-                    receipt["commands"] = [["cargo", "check"]]
+                    receipt["command_contract"] = "weak"
                 path.write_text(json.dumps(receipt), encoding="utf-8")
                 with self.assertRaises(ArchiveError):
                     validate_receipt(

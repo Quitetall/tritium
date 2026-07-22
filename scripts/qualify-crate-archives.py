@@ -8,7 +8,7 @@ import hashlib
 import json
 import math
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import platform
 import re
 import runpy
@@ -28,7 +28,7 @@ CrateSbomError = CRATE_SBOM["CrateSbomError"]
 SCHEMA = "tritium.crate-archive-qualification.v1"
 TOP_FIELDS = {
     "schema", "receipt_id", "release", "source_revision", "run_id",
-    "started_at_utc", "duration_ms", "machine", "toolchain", "commands",
+    "started_at_utc", "duration_ms", "machine", "toolchain", "command_contract",
     "dependency_lock_sha256", "offline", "isolated_cargo_home", "packages",
     "compiled_packages", "result",
 }
@@ -72,13 +72,25 @@ def _metadata(root: Path) -> list[dict[str, Any]]:
     return sorted(packages, key=lambda package: package["name"])
 
 
-def _extract(archive_path: Path, destination: Path) -> Path:
+def _extract(archive_path: Path, destination: Path, expected_prefix: str) -> Path:
     try:
         with tarfile.open(archive_path, "r:gz") as archive:
             members = archive.getmembers()
-            prefix = members[0].name.split("/", 1)[0]
             for member in members:
+                logical = PurePosixPath(member.name)
+                if (
+                    logical.is_absolute()
+                    or ".." in logical.parts
+                    or "\\" in member.name
+                    or not logical.parts
+                    or logical.parts[0] != expected_prefix
+                ):
+                    raise ArchiveError(f"unsafe crate member {member.name!r}")
                 target = destination / member.name
+                try:
+                    target.resolve().relative_to(destination.resolve())
+                except ValueError as error:
+                    raise ArchiveError(f"crate member escapes extraction root: {member.name!r}") from error
                 if member.isdir():
                     target.mkdir(parents=True, exist_ok=True)
                 elif member.isfile():
@@ -92,7 +104,7 @@ def _extract(archive_path: Path, destination: Path) -> Path:
                     raise ArchiveError(f"crate member is not regular: {member.name}")
     except (OSError, tarfile.TarError) as error:
         raise ArchiveError(f"cannot extract {archive_path.name}: {error}") from error
-    root = destination / prefix
+    root = destination / expected_prefix
     if not root.is_dir():
         raise ArchiveError(f"crate {archive_path.name} has no package root")
     return root
@@ -106,8 +118,8 @@ def _consumer_manifest(
     compiled = []
     for ordinal, package in enumerate(packages):
         name = package["name"]
-        source = sources[name].as_posix()
-        patches.append(f'"{name}" = {{ path = "{source}" }}')
+        source = json.dumps(sources[name].as_posix())
+        patches.append(f'{json.dumps(name)} = {{ path = {source} }}')
         kinds = {
             kind
             for target in package.get("targets", [])
@@ -115,7 +127,7 @@ def _consumer_manifest(
         }
         if kinds.intersection({"lib", "rlib"}):
             dependencies.append(
-                f'archive_{ordinal} = {{ package = "{name}", path = "{source}", '
+                f'archive_{ordinal} = {{ package = {json.dumps(name)}, path = {source}, '
                 "default-features = false }"
             )
             compiled.append(name)
@@ -123,7 +135,7 @@ def _consumer_manifest(
         raise ArchiveError("archive inventory contains no library packages")
     return (
         '[package]\nname = "tritium-archive-smoke"\nversion = "0.0.0"\n'
-        'edition = "2024"\npublish = false\n\n[dependencies]\n'
+        'edition = "2021"\npublish = false\n\n[dependencies]\n'
         + "\n".join(dependencies)
         + "\n\n[patch.crates-io]\n"
         + "\n".join(patches)
@@ -192,7 +204,9 @@ def qualify(
                 )
             except (OSError, CrateSbomError) as error:
                 raise ArchiveError(f"crate {name} failed admission: {error}") from error
-            sources[name] = _extract(archive_path, source_parent)
+            sources[name] = _extract(
+                archive_path, source_parent, f"{name}-{expected_version}"
+            )
             inventory.append(
                 {
                     "artifact_id": f"crate-{name}",
@@ -228,6 +242,40 @@ def qualify(
                 )
         except (OSError, subprocess.SubprocessError) as error:
             raise ArchiveError(f"offline archive consumer failed: {error}") from error
+        patch_table = manifest.split("\n[patch.crates-io]\n", 1)[1]
+        binary_packages = []
+        for package in packages:
+            kinds = {
+                kind
+                for target in package.get("targets", [])
+                for kind in target.get("kind", [])
+            }
+            if "bin" not in kinds or kinds.intersection({"lib", "rlib"}):
+                continue
+            name = package["name"]
+            binary_manifest = sources[name] / "Cargo.toml"
+            with binary_manifest.open("a", encoding="utf-8") as stream:
+                stream.write("\n[patch.crates-io]\n" + patch_table)
+            binary_commands = (
+                [
+                    "cargo", "generate-lockfile", "--offline",
+                    "--manifest-path", str(binary_manifest),
+                ],
+                [
+                    "cargo", "check", "--offline", "--locked", "--all-targets",
+                    "--manifest-path", str(binary_manifest),
+                    "--target-dir", str(work / "target-bin"),
+                ],
+            )
+            try:
+                for command in binary_commands:
+                    subprocess.run(
+                        command, cwd=work, env=environment, check=True, timeout=3600
+                    )
+            except (OSError, subprocess.SubprocessError) as error:
+                raise ArchiveError(f"offline binary archive {name} failed: {error}") from error
+            binary_packages.append(name)
+        compiled.extend(binary_packages)
     machine_material = {
         "node": platform.node(), "system": platform.system(),
         "architecture": platform.machine(),
@@ -248,11 +296,7 @@ def qualify(
             "cargo": subprocess.check_output(["cargo", "--version"], text=True, timeout=30).strip(),
             "rustc": subprocess.check_output(["rustc", "--version"], text=True, timeout=30).strip(),
         },
-        "commands": [
-            ["cargo", "vendor", "--locked", "--versioned-dirs"],
-            ["cargo", "generate-lockfile", "--offline"],
-            ["cargo", "check", "--offline", "--locked", "--all-targets"],
-        ],
+        "command_contract": "vendor-locked_then_empty-cargo-home_offline-locked-all-targets-v1",
         "dependency_lock_sha256": lock_digest,
         "offline": True,
         "isolated_cargo_home": True,
@@ -345,14 +389,12 @@ def validate_receipt(
     compiled = value["compiled_packages"]
     if not isinstance(compiled, list) or any(
         not isinstance(name, str) or name not in names for name in compiled
-    ) or len(set(compiled)) != len(compiled):
+    ) or len(set(compiled)) != len(compiled) or set(compiled) != names:
         raise ArchiveError("crate receipt compiled package inventory is invalid")
-    if value["commands"] != [
-        ["cargo", "vendor", "--locked", "--versioned-dirs"],
-        ["cargo", "generate-lockfile", "--offline"],
-        ["cargo", "check", "--offline", "--locked", "--all-targets"],
-    ]:
-        raise ArchiveError("crate receipt commands are not frozen offline workflow")
+    if value["command_contract"] != (
+        "vendor-locked_then_empty-cargo-home_offline-locked-all-targets-v1"
+    ):
+        raise ArchiveError("crate receipt command contract mismatch")
     if (
         lockfile.is_symlink()
         or not lockfile.is_file()
