@@ -7,6 +7,7 @@
 - [Backends](./backends.md)
 - [Quantization (SALT)](./quantization.md)
 - [Training (QAT / STE)](./training.md)
+- [Definitive Guide to Ternary Deep Learning](./ternary-deep-learning.md)
 - [Interop](./interop.md)
 - [Model Zoo](./model-zoo.md)
 - [Benchmarks](./benchmarks.md)

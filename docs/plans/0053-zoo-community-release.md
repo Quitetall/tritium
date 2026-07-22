@@ -135,8 +135,15 @@ exact `1.1.0-rc.0` candidate version without claiming local-RC readiness,
 separate implemented capability from receipt-qualified support, route users to
 ADR 0033/current plans and expose
 flagship, package, browser, ONNX, multimodal, community and reproduction
-blockers. The installed-artifact quick starts, definitive guide, migration,
-observability examples and full generated-claim drift gate remain open.
+blockers. The installed-artifact quick starts, final guide qualification,
+migration, observability examples and full generated-claim drift gate remain
+open.
+The book now also contains a comprehensive first draft of the "Definitive Guide
+to Ternary Deep Learning" covering representation, physical accounting,
+PTQ/QAT/refinement, estimator scale and threshold mechanics, additive
+allocation, sparse and S34 representations, whole-model semantics, evaluation,
+and failure diagnosis. Tutorial execution and final documentation-gate review
+remain open before this documentation slice can close.
 
 Replace the current pre-alpha/v1.0-era narrative with tested v1.1 documentation:
 
