@@ -152,6 +152,12 @@ coverage and duplicate-plugin tests.
   callback failure; validates the exact namespace; and derives an ordered
   evidence-set digest. The PyTorch/CUDA hook and empirical 506-record run remain
   open.
+- [x] Expose bounded abi3/PyTorch grouped-evidence ingestion: tensor batches are
+  shape-checked and converted to canonical f32le/f64le buffers, token masks are
+  strictly boolean, native accumulation releases the GIL, failed parsing or
+  accumulation leaves prior state unchanged, and explicit finish atomically
+  publishes one record. Checkpoint hook scheduling and estimator-specific
+  objective/factor extraction remain open.
 - Keep calibration, reconstruction and validation datasets source-bound and
   disjoint where the recipe requires.
 

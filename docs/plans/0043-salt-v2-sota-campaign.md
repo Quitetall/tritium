@@ -819,7 +819,13 @@ evidence-set digest after strict completion. This bounds live producer state to
 one tensor and makes runtime failure resumable without publishing the active
 tensor. The PyTorch/CUDA adapter that captures real checkpoint activations and
 output factors through this seam, and the actual 506-record collection, remain
-open. Its
+open. Python now has a bounded native `KroneckerEvidenceBuilder` plus
+`KroneckerCalibrationWriter`: contiguous PyTorch batches cross as canonical
+float32/float64 little-endian byte buffers instead of Python scalar lists,
+shape/mask/resource checks precede native mutation, Gram/Fisher accumulation
+runs without the GIL, and finish atomically publishes one `S2KF` record. The
+checkpoint-specific hook scheduler and objective/factor extraction remain open.
+Its
 publication boundary is available: on supported platforms the evidence
 directory installs each bounded canonical record through a verified inode in a
 managed, reserved in-root staging directory and a no-overwrite hard link, so a
@@ -849,7 +855,7 @@ tensor-master fit. The restart API consumes the source/cache/token identities
 already bound by that record, so it does not reconstruct a model-sized
 activation cache merely to resume pure PTQ. Checkpoint-scale evidence
 collection remains open; only its bounded, resumable runtime callback boundary
-is implemented.
+and per-tensor Python ingestion boundary are implemented.
 Pipeline ownership is process-serialized through a reserved lock namespace.
 Compact packages remain exact prefixes of their near-lossless packages. ADR
 0028's 2026-07-15 amendments make the ordered-master prefix curve, rather than

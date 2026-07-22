@@ -29,6 +29,7 @@
 #![allow(unreachable_pub)] // pyo3's `#[pymethods]` expansion emits `pub` items.
 
 mod hf_assets;
+mod kronecker;
 mod module_package;
 mod onnx;
 mod ops;
@@ -313,6 +314,9 @@ fn _tritium(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<onnx::QwenOnnxLanguageOutput>()?;
     m.add_class::<onnx::QwenOnnxMtpOutput>()?;
     m.add_class::<module_package::ModuleSaltV2Receipt>()?;
+    m.add_class::<kronecker::KroneckerEvidenceBuilder>()?;
+    m.add_class::<kronecker::KroneckerEvidenceReceipt>()?;
+    kronecker::register_exceptions(m)?;
     m.add_function(wrap_pyfunction!(ternary_matmul, m)?)?;
     m.add_function(wrap_pyfunction!(compiled_backends, m)?)?;
     m.add_function(wrap_pyfunction!(onnx::verify_qwen35_onnx_bundle, m)?)?;

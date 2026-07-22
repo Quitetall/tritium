@@ -87,6 +87,148 @@ class ActivationCalibrationReceipt:
     schema_version: int = 2
 
 
+class KroneckerCalibrationWriter:
+    """Stream one tensor's grouped curvature into the native S2KF producer.
+
+    This is the low-level PyTorch runtime hook used by checkpoint-specific
+    calibration drivers. It retains only one caller batch plus the native
+    dyadic G128 state and atomically publishes only on :meth:`finish`.
+    """
+
+    def __init__(
+        self,
+        evidence_dir: Pathish,
+        *,
+        tensor_index: int,
+        tensor_name: str,
+        rows: int,
+        columns: int,
+        curvature: str,
+        source_model_digest: str,
+        activation_cache_digest: str,
+        token_stream_digest: str,
+        damping: float,
+        max_evidence_bytes: int = 64 * 1024 * 1024,
+        max_batch_bytes: int = 256 * 1024 * 1024,
+    ) -> None:
+        self._rows = rows
+        self._columns = columns
+        self._max_batch_bytes = max_batch_bytes
+        self._native = _tritium.KroneckerEvidenceBuilder(
+            os.fspath(evidence_dir),
+            tensor_index,
+            tensor_name,
+            rows,
+            columns,
+            curvature,
+            source_model_digest,
+            activation_cache_digest,
+            token_stream_digest,
+            damping,
+            max_evidence_bytes=max_evidence_bytes,
+            max_batch_bytes=max_batch_bytes,
+        )
+
+    @staticmethod
+    def _float_bytes(value: torch.Tensor, dtype: torch.dtype, numpy_dtype: str) -> bytes:
+        return (
+            value.detach()
+            .to(device="cpu", dtype=dtype)
+            .contiguous()
+            .numpy()
+            .astype(numpy_dtype, copy=False)
+            .tobytes()
+        )
+
+    def append(
+        self,
+        activations: torch.Tensor,
+        output_factors: Optional[torch.Tensor] = None,
+        *,
+        token_weights: Optional[torch.Tensor] = None,
+        token_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[int, int]:
+        """Append one canonical row-major batch and return retained segment counts."""
+
+        if not isinstance(activations, torch.Tensor) or activations.ndim == 0:
+            raise TypeError("activations must be a tensor with a feature dimension")
+        if activations.shape[-1] != self._columns:
+            raise ValueError(
+                f"activations last dimension must be {self._columns}, got {activations.shape[-1]}"
+            )
+        sample_shape = tuple(activations.shape[:-1])
+        samples = activations.numel() // self._columns
+        required_bytes = activations.numel() * 4
+        if output_factors is not None:
+            if not isinstance(output_factors, torch.Tensor) or output_factors.ndim == 0:
+                raise TypeError("output_factors must be a tensor with an output dimension")
+            if (
+                tuple(output_factors.shape[:-1]) != sample_shape
+                or output_factors.shape[-1] != self._rows
+            ):
+                raise ValueError(
+                    f"output_factors must have shape {sample_shape + (self._rows,)}"
+                )
+            required_bytes += output_factors.numel() * 4
+        if token_weights is not None:
+            if (
+                not isinstance(token_weights, torch.Tensor)
+                or tuple(token_weights.shape) != sample_shape
+            ):
+                raise ValueError(f"token_weights must have shape {sample_shape}")
+            required_bytes += token_weights.numel() * 8
+        if token_mask is not None:
+            if (
+                not isinstance(token_mask, torch.Tensor)
+                or tuple(token_mask.shape) != sample_shape
+            ):
+                raise ValueError(f"token_mask must have shape {sample_shape}")
+            required_bytes += token_mask.numel()
+        if required_bytes > self._max_batch_bytes:
+            raise ValueError(
+                f"batch requires {required_bytes} bytes, limit is {self._max_batch_bytes}"
+            )
+        factors_bytes = (
+            self._float_bytes(output_factors, torch.float32, "<f4")
+            if output_factors is not None
+            else None
+        )
+        weights_bytes = (
+            self._float_bytes(token_weights, torch.float64, "<f8")
+            if token_weights is not None
+            else None
+        )
+        mask_bytes = None
+        if token_mask is not None:
+            mask = token_mask.detach().to(device="cpu").contiguous().view(-1)
+            if not bool(((mask == 0) | (mask == 1)).all()):
+                raise ValueError("token_mask values must be boolean or 0/1")
+            mask_bytes = mask.to(torch.uint8).numpy().tobytes()
+        return self._native.append_batch(
+            self._float_bytes(activations, torch.float32, "<f4"),
+            samples,
+            output_factors_f32le=factors_bytes,
+            token_weights_f64le=weights_bytes,
+            token_mask_u8=mask_bytes,
+        )
+
+    def finish(self):
+        """Finalize and atomically publish one canonical native evidence record."""
+
+        return self._native.finish()
+
+    def abort(self) -> None:
+        """Drop unpublished native accumulator state."""
+
+        self._native.abort()
+
+    @property
+    def active(self) -> bool:
+        """Whether append/finalize operations are still admitted."""
+
+        return self._native.active
+
+
 def _hash_field(digest: "hashlib._Hash", tag: str, payload: bytes) -> None:
     encoded = tag.encode("utf-8")
     digest.update(struct.pack("<Q", len(encoded)))

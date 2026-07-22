@@ -6,6 +6,13 @@ PyTorch is installed — the :mod:`tritium.torch` research facade, :mod:`tritium
 """
 
 from ._tritium import (
+    KroneckerConflictError,
+    KroneckerContractError,
+    KroneckerEvidenceBuilder,
+    KroneckerEvidenceReceipt,
+    KroneckerPublicationError,
+    KroneckerResourceError,
+    KroneckerStateError,
     Model,
     QwenLoadReceipt,
     QwenModel,
@@ -25,6 +32,13 @@ from ._tritium import (
 from . import onnx, portable, salt
 
 __all__ = [
+    "KroneckerConflictError",
+    "KroneckerContractError",
+    "KroneckerEvidenceBuilder",
+    "KroneckerEvidenceReceipt",
+    "KroneckerPublicationError",
+    "KroneckerResourceError",
+    "KroneckerStateError",
     "Model",
     "QwenLoadReceipt",
     "QwenModel",
