@@ -38,6 +38,8 @@ on:
       - "scripts/generate-colab-notebook.py"
       - "scripts/tests/test_generate_colab_notebook.py"
       - "examples/colab/tritium-smollm2-v11.ipynb"
+      - "examples/python/installed_qat.py"
+      - "scripts/tests/test_installed_qat_tutorial.py"
       - ".github/workflows/wheels.yml"
   workflow_dispatch:
     inputs:
@@ -241,10 +243,23 @@ jobs:
           --release 1.1.0-rc.0
           --run-id github-${{ github.run_id }}-${{ github.run_attempt }}-cpu-functional
           --output evidence/torch-2.11-python-3.13.json
+      - name: execute installed-wheel PyTorch QAT tutorial
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -I ${{ github.workspace }}/examples/python/installed_qat.py \
+            --output-dir evidence/tutorial-cpu \
+            --device cpu
+          python -I -m tritium.torch.tutorial_qat \
+            --check-receipt evidence/tutorial-cpu/receipt.json \
+            --device cpu
       - uses: actions/upload-artifact@v4
         with:
           name: wheel-functional-torch-2.11-python-3.13
-          path: evidence/torch-2.11-python-3.13.json
+          path: |
+            evidence/torch-2.11-python-3.13.json
+            evidence/tutorial-cpu/**
+            evidence/tutorial-cpu/receipt.json
           if-no-files-found: error
 
   cuda-wheel-smoke:
@@ -308,6 +323,16 @@ jobs:
           --release 1.1.0-rc.0
           --run-id github-${{ github.run_id }}-${{ github.run_attempt }}-cuda-functional
           --output evidence/cuda13-torch2.11-py3.13-sm89.json
+      - name: execute installed-wheel CUDA PyTorch QAT tutorial
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -I ${{ github.workspace }}/examples/python/installed_qat.py \
+            --output-dir evidence/tutorial-cuda \
+            --device cuda:0
+          python -I -m tritium.torch.tutorial_qat \
+            --check-receipt evidence/tutorial-cuda/receipt.json \
+            --device cuda:0
       - name: qualify installed-wheel CUDA fp16 training
         shell: bash
         env:

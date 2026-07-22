@@ -170,6 +170,13 @@ registration with the candidate package's literal public namespace, fails if a
 v1 root name disappears, lists additions, records the seven-crate SemVer command
 and emits JSON plus Markdown with a content identity. Its report is structural;
 an exact clean-wheel runtime/signature receipt remains open.
+An installed-wheel PyTorch QAT tutorial now ships inside the Python package and
+runs source-free with `python -I -m tritium.torch.tutorial_qat`. It exercises a
+tied language-shaped graph through forward/backward, AdamW, two-plane hard
+conversion, atomic safetensors export, strict artifact reload and exact output
+parity on CPU or CUDA, then writes a machine-readable tutorial result. Both
+wheel lanes execute the module after exact candidate installation. A local CPU
+candidate-wheel smoke passes; CI candidate-revision admission remains open.
 
 Replace the current pre-alpha/v1.0-era narrative with tested v1.1 documentation:
 

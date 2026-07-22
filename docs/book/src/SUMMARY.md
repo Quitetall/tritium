@@ -4,6 +4,7 @@
 
 - [Architecture](./architecture.md)
 - [Quickstart](./quickstart.md)
+- [Installed-wheel PyTorch QAT](./tutorial-pytorch-qat.md)
 - [Backends](./backends.md)
 - [Quantization (SALT)](./quantization.md)
 - [Training (QAT / STE)](./training.md)

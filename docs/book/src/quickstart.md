@@ -1,5 +1,9 @@
 # Quickstart
 
+For differentiable PyTorch training from a binary wheel, use the
+[installed-wheel QAT tutorial](./tutorial-pytorch-qat.md). It runs without a
+source checkout or compiler and strict-reloads its hard artifact.
+
 ## Chat with a model in three commands
 
 ```sh
