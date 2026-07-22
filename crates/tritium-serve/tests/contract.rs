@@ -1433,6 +1433,8 @@ async fn metrics_exposition() {
         "{text}"
     );
     assert!(text.contains("tritium_worker_alive 1\n"), "{text}");
+    assert!(text.contains("tritium_backend_faults_total 0\n"), "{text}");
+    assert!(text.contains("tritium_backend_faulted 0\n"), "{text}");
     assert!(
         text.contains("tritium_worker_phase{phase=\"idle\"} 1\n"),
         "{text}"

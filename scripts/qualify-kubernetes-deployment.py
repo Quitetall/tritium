@@ -32,7 +32,7 @@ manifest_identity = RUNTIME["manifest_identity"]
 OCI_ARCHIVE = runpy.run_path(Path(__file__).with_name("verify-oci-archive.py"))
 validate_oci_archive = OCI_ARCHIVE["validate"]
 
-SCHEMA = "tritium.kubernetes-deployment-qualification.v2"
+SCHEMA = "tritium.kubernetes-deployment-qualification.v3"
 HEX = frozenset("0123456789abcdef")
 SAFE_NAME = re.compile(r"[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?")
 SAFE_SECRET_KEY = re.compile(r"[A-Za-z0-9](?:[-._A-Za-z0-9]{0,251}[A-Za-z0-9])?")
@@ -575,8 +575,11 @@ def collect_cuda_node_evidence(kubectl_base: list[str], *, node: str, image: str
 
 def metrics_snapshot(metrics: str) -> dict[str, Any]:
     values = {}
-    for name in ("tritium_chat_requests_total", "tritium_tokens_out_total",
-                 "tritium_worker_alive"):
+    for name in (
+        "tritium_chat_requests_total", "tritium_tokens_out_total",
+        "tritium_worker_alive", "tritium_backend_faults_total",
+        "tritium_backend_faulted",
+    ):
         match = re.search(rf"(?m)^{name} ([0-9]+(?:\.[0-9]+)?)$", metrics)
         if match is None:
             raise DeploymentError(f"cluster metrics lack {name}")
@@ -585,6 +588,9 @@ def metrics_snapshot(metrics: str) -> dict[str, Any]:
         raise DeploymentError("cluster metrics did not observe generation")
     if values["tritium_worker_alive"] != 1:
         raise DeploymentError("cluster metrics report a dead worker")
+    if (values["tritium_backend_faults_total"] != 0
+            or values["tritium_backend_faulted"] != 0):
+        raise DeploymentError("cluster metrics report a backend fault")
     return {"sha256": hashlib.sha256(metrics.encode()).hexdigest(), "values": values}
 
 
@@ -1337,6 +1343,25 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
                 restart_ready, revision, args.flavor, args.profile,
                 manifest_id["blake3"], args.release,
             )
+            restart_generation = request_json(
+                restart_url + "/v1/chat/completions", token,
+                body={"model": model_id,
+                      "messages": [{"role": "user", "content": args.prompt}],
+                      "temperature": 0, "max_tokens": 1},
+                timeout=args.request_timeout,
+            )
+            if (not isinstance(restart_generation.get("choices"), list)
+                    or len(restart_generation["choices"]) != 1):
+                raise DeploymentError("restart generation did not return one choice")
+            restart_metrics_text = request(
+                restart_url + "/metrics", token, timeout=args.request_timeout
+            ).decode("utf-8")
+            restart_recovery = {
+                "generation_response_sha256": hashlib.sha256(
+                    canonical(restart_generation)
+                ).hexdigest(),
+                "metrics": metrics_snapshot(restart_metrics_text),
+            }
         finally:
             stop_forward(restart_process)
         if restart_startup != startup:
@@ -1551,7 +1576,8 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
                      "update_strategy": "Recreate" if args.flavor == "cuda" else "RollingUpdate",
                      "update_config": {"before": update_before, "after": update_after},
                      "rollback_startup_receipt": rollback_startup,
-                     "metrics": metric_evidence, "scale": scale, "helm_history": history,
+                     "metrics": metric_evidence, "restart_recovery": restart_recovery,
+                     "scale": scale, "helm_history": history,
                      "prior_helm_revision": prior_revision,
                      "failed_manifest_sha256": wrong_manifest,
                      "failed_image_digest": "sha256:" + wrong_image,
@@ -1682,7 +1708,7 @@ def validate_receipt(receipt: dict[str, Any], *, chart_path: Path, image_path: P
         "initial", "restarted", "updated",
         "startup_receipt", "restart_startup_receipt", "update_startup_receipt",
         "update_strategy", "update_config", "rollback_startup_receipt", "metrics",
-        "scale", "helm_history",
+        "restart_recovery", "scale", "helm_history",
         "prior_helm_revision", "failed_manifest_sha256", "failed_image_digest",
         "failed_upgrade_output_sha256",
     }:
@@ -1758,15 +1784,45 @@ def validate_receipt(receipt: dict[str, Any], *, chart_path: Path, image_path: P
     exact_hex(metrics.get("sha256"), 64, "metrics SHA-256")
     metric_values = metrics.get("values")
     expected_metrics = {
-        "tritium_chat_requests_total", "tritium_tokens_out_total", "tritium_worker_alive"
+        "tritium_chat_requests_total", "tritium_tokens_out_total", "tritium_worker_alive",
+        "tritium_backend_faults_total", "tritium_backend_faulted",
     }
     if not isinstance(metric_values, dict) or set(metric_values) != expected_metrics or any(
         type(value) not in {int, float} or not math.isfinite(value) or value < 0
         for value in metric_values.values()
     ) or metric_values["tritium_chat_requests_total"] < 1 or (
         metric_values["tritium_tokens_out_total"] < 1
-    ) or metric_values["tritium_worker_alive"] != 1:
+    ) or metric_values["tritium_worker_alive"] != 1 or any(
+        metric_values[name] != 0
+        for name in ("tritium_backend_faults_total", "tritium_backend_faulted")
+    ):
         raise DeploymentError("deployment metrics evidence is malformed")
+    recovery = workload.get("restart_recovery")
+    if not isinstance(recovery, dict) or set(recovery) != {
+        "generation_response_sha256", "metrics"
+    }:
+        raise DeploymentError("deployment restart recovery fields differ")
+    exact_hex(
+        recovery.get("generation_response_sha256"), 64,
+        "restart generation response SHA-256",
+    )
+    recovery_metrics = recovery.get("metrics")
+    if not isinstance(recovery_metrics, dict) or set(recovery_metrics) != {
+        "sha256", "values"
+    }:
+        raise DeploymentError("deployment restart metrics fields differ")
+    exact_hex(recovery_metrics.get("sha256"), 64, "restart metrics SHA-256")
+    recovery_values = recovery_metrics.get("values")
+    if not isinstance(recovery_values, dict) or set(recovery_values) != expected_metrics or any(
+        type(value) not in {int, float} or not math.isfinite(value) or value < 0
+        for value in recovery_values.values()
+    ) or recovery_values["tritium_chat_requests_total"] < 1 or (
+        recovery_values["tritium_tokens_out_total"] < 1
+    ) or recovery_values["tritium_worker_alive"] != 1 or any(
+        recovery_values[name] != 0
+        for name in ("tritium_backend_faults_total", "tritium_backend_faulted")
+    ):
+        raise DeploymentError("deployment restart metrics evidence is malformed")
     if receipt["flavor"] == "cpu":
         scale_receipt = validate_scale_receipt(workload.get("scale"))
         expected_query = (

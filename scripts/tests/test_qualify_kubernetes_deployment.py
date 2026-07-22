@@ -107,7 +107,19 @@ def receipt(chart: Path, image_archive: Path, candidate: Path,
                 "tritium_chat_requests_total": 1.0,
                 "tritium_tokens_out_total": 1.0,
                 "tritium_worker_alive": 1.0,
+                "tritium_backend_faults_total": 0.0,
+                "tritium_backend_faulted": 0.0,
             }},
+            "restart_recovery": {
+                "generation_response_sha256": "7" * 64,
+                "metrics": {"sha256": "8" * 64, "values": {
+                    "tritium_chat_requests_total": 1.0,
+                    "tritium_tokens_out_total": 1.0,
+                    "tritium_worker_alive": 1.0,
+                    "tritium_backend_faults_total": 0.0,
+                    "tritium_backend_faulted": 0.0,
+                }},
+            },
             "scale": ({
                 "scaled_object_uid": "scaled-object-uid", "hpa_uid": "hpa-uid",
                 "external_metric": "s0-prometheus-tritium_queue_pressure",
@@ -291,12 +303,16 @@ class QualifyKubernetesDeploymentTests(unittest.TestCase):
             "tritium_chat_requests_total 1\n"
             "tritium_tokens_out_total 1\n"
             "tritium_worker_alive 1\n"
+            "tritium_backend_faults_total 0\n"
+            "tritium_backend_faulted 0\n"
         )
         self.assertEqual(
             metrics_snapshot(metrics)["values"]["tritium_tokens_out_total"], 1.0
         )
         with self.assertRaisesRegex(DeploymentError, "did not observe generation"):
             metrics_snapshot(metrics.replace("tokens_out_total 1", "tokens_out_total 0"))
+        with self.assertRaisesRegex(DeploymentError, "backend fault"):
+            metrics_snapshot(metrics.replace("backend_faulted 0", "backend_faulted 1"))
 
     def test_helm_history_proves_atomic_failure_and_recovery(self):
         history = [
@@ -358,6 +374,18 @@ class QualifyKubernetesDeploymentTests(unittest.TestCase):
             del value["receipt_id"]
             value["receipt_id"] = "sha256:" + hashlib.sha256(canonical(value)).hexdigest()
             with self.assertRaisesRegex(DeploymentError, "retains old pod UID"):
+                validate(value, chart, image, manifest, build, candidate)
+
+    def test_receipt_validator_requires_clean_post_restart_recovery(self):
+        with tempfile.TemporaryDirectory() as raw:
+            chart, image, manifest, build, candidate = candidate_inputs(raw)
+            value = receipt(chart, image, candidate)
+            value["workload"]["restart_recovery"]["metrics"]["values"][
+                "tritium_backend_faulted"
+            ] = 1.0
+            del value["receipt_id"]
+            value["receipt_id"] = "sha256:" + hashlib.sha256(canonical(value)).hexdigest()
+            with self.assertRaisesRegex(DeploymentError, "restart metrics"):
                 validate(value, chart, image, manifest, build, candidate)
 
     def test_receipt_validator_rejects_chart_or_image_drift(self):

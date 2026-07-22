@@ -315,9 +315,21 @@ immediately before signal dispatch, bounds observation-to-signal latency, and
 binds a long-prefill repetition count plus prompt/config digests so a short or
 mislabeled workload cannot satisfy the matrix.
 
+Production workers now latch backend errors and isolated generator panics as a
+permanent unhealthy/not-ready state, expose bounded backend-fault counter and
+gauge telemetry, and fail queued or new work without re-entering the backend
+until orchestration replaces the process. The authenticated Helm watchdog is
+structurally configured to turn unhealthy state into process replacement;
+Kubernetes qualification separately proves manual replacement restores the
+same startup receipt, generation and a clean fault state. Unit fault injection
+pins backend-error and panic latching without adding a production fault
+endpoint. A causal latched-fault to watchdog replacement execution remains an
+open gate alongside external device/OOM and artifact-volume faults.
+
 1. malformed/truncated/wrong-identity artifact at startup;
 2. missing secret, invalid config and unavailable requested backend;
-3. worker panic/process restart, device loss/OOM and artifact volume loss;
+3. watchdog-triggered backend-fault replacement, device loss/OOM and artifact
+   volume loss;
 4. telemetry collector unavailable/slow and metrics scrape flood;
 5. failed rollout followed by digest-pinned rollback.
 

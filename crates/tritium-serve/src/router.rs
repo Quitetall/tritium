@@ -27,7 +27,9 @@ use crate::sse::{
     IncrementalDetok, StopMatcher, content_chunk, error_chunk, role_chunk, terminal_chunk,
 };
 use crate::startup::{AdmittedGeneratorV1, ProductionReadiness, prepare_production_generator};
-use crate::worker::{GenEvent, Job, PHASE_DECODE, PHASE_IDLE, PHASE_PREFILL, spawn_worker};
+use crate::worker::{
+    GenEvent, Job, PHASE_DECODE, PHASE_IDLE, PHASE_PREFILL, WorkerSignals, spawn_worker,
+};
 
 /// How `/v1/chat/completions` renders `messages` into the prompt string
 /// handed to the tokenizer.
@@ -220,6 +222,8 @@ struct RuntimeState {
     draining: Arc<AtomicBool>,
     worker_alive: Arc<AtomicBool>,
     phase: Arc<AtomicU8>,
+    backend_faulted: Arc<AtomicBool>,
+    backend_faults: Arc<AtomicU64>,
     production: Option<ProductionReadiness>,
 }
 
@@ -244,11 +248,18 @@ pub fn build_router_with_limits(
     let draining = Arc::new(AtomicBool::new(false));
     let worker_alive = Arc::new(AtomicBool::new(true));
     let phase = Arc::new(AtomicU8::new(PHASE_IDLE));
+    let backend_faulted = Arc::new(AtomicBool::new(false));
+    let backend_faults = Arc::new(AtomicU64::new(0));
     let jobs = spawn_worker(
         generator,
-        draining.clone(),
-        worker_alive.clone(),
-        phase.clone(),
+        WorkerSignals {
+            draining: draining.clone(),
+            worker_alive: worker_alive.clone(),
+            phase: phase.clone(),
+            backend_faulted: backend_faulted.clone(),
+            backend_faults: backend_faults.clone(),
+            latch_backend_faults: false,
+        },
         cfg.queue_cap,
     );
     let admission = Arc::new(Admission::legacy(cfg.auth_token.as_deref()));
@@ -262,6 +273,8 @@ pub fn build_router_with_limits(
             draining,
             worker_alive,
             phase,
+            backend_faulted,
+            backend_faults,
             production: None,
         },
     )
@@ -283,11 +296,18 @@ pub fn build_router_governed(
     let draining = Arc::new(AtomicBool::new(false));
     let worker_alive = Arc::new(AtomicBool::new(true));
     let phase = Arc::new(AtomicU8::new(PHASE_IDLE));
+    let backend_faulted = Arc::new(AtomicBool::new(false));
+    let backend_faults = Arc::new(AtomicU64::new(0));
     let jobs = spawn_worker(
         generator,
-        draining.clone(),
-        worker_alive.clone(),
-        phase.clone(),
+        WorkerSignals {
+            draining: draining.clone(),
+            worker_alive: worker_alive.clone(),
+            phase: phase.clone(),
+            backend_faulted: backend_faulted.clone(),
+            backend_faults: backend_faults.clone(),
+            latch_backend_faults: false,
+        },
         cfg.queue_cap,
     );
     Ok(build_router_inner(
@@ -300,6 +320,8 @@ pub fn build_router_governed(
             draining,
             worker_alive,
             phase,
+            backend_faulted,
+            backend_faults,
             production: None,
         },
     ))
@@ -321,11 +343,18 @@ pub fn build_router_production(
     let draining = Arc::new(AtomicBool::new(false));
     let worker_alive = Arc::new(AtomicBool::new(true));
     let phase = Arc::new(AtomicU8::new(PHASE_IDLE));
+    let backend_faulted = Arc::new(AtomicBool::new(false));
+    let backend_faults = Arc::new(AtomicU64::new(0));
     let jobs = spawn_worker(
         generator,
-        draining.clone(),
-        worker_alive.clone(),
-        phase.clone(),
+        WorkerSignals {
+            draining: draining.clone(),
+            worker_alive: worker_alive.clone(),
+            phase: phase.clone(),
+            backend_faulted: backend_faulted.clone(),
+            backend_faults: backend_faults.clone(),
+            latch_backend_faults: true,
+        },
         cfg.queue_cap,
     );
     let (router, _) = build_router_inner(
@@ -338,6 +367,8 @@ pub fn build_router_production(
             draining: draining.clone(),
             worker_alive,
             phase,
+            backend_faulted,
+            backend_faults,
             production: Some(production.clone()),
         },
     );
@@ -410,6 +441,8 @@ fn build_router_batched_inner(
     let worker_alive = Arc::new(AtomicBool::new(true));
     let draining = Arc::new(AtomicBool::new(false));
     let phase = Arc::new(AtomicU8::new(PHASE_IDLE));
+    let backend_faulted = Arc::new(AtomicBool::new(false));
+    let backend_faults = Arc::new(AtomicU64::new(0));
     let alive = worker_alive.clone();
     let drain_flag = draining.clone();
     let worker_phase = phase.clone();
@@ -446,6 +479,8 @@ fn build_router_batched_inner(
             draining,
             worker_alive,
             phase,
+            backend_faulted,
+            backend_faults,
             production: None,
         },
     ))
@@ -606,6 +641,7 @@ fn request_timeout_error() -> ApiError {
 
 fn request_ready(state: &AppState) -> bool {
     state.runtime.worker_alive.load(Ordering::Relaxed)
+        && !state.runtime.backend_faulted.load(Ordering::Acquire)
         && !state.runtime.draining.load(Ordering::Relaxed)
         && state
             .runtime
@@ -1190,6 +1226,18 @@ async fn health(State(st): State<AppState>) -> Response {
         )
             .into_response();
     }
+    if st.runtime.backend_faulted.load(Ordering::Acquire) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "status": "unhealthy",
+                "detail": "backend fault latched",
+                "model": &*st.model_id,
+                "worker_alive": true,
+            })),
+        )
+            .into_response();
+    }
     Json(serde_json::json!({
         "status": "ok",
         "model": &*st.model_id,
@@ -1203,13 +1251,14 @@ async fn health(State(st): State<AppState>) -> Response {
 async fn readiness(State(st): State<AppState>) -> Response {
     let worker_alive = st.runtime.worker_alive.load(Ordering::Relaxed);
     let draining = st.runtime.draining.load(Ordering::Relaxed);
+    let backend_faulted = st.runtime.backend_faulted.load(Ordering::Acquire);
     let queue_depth = st.jobs.max_capacity() - st.jobs.capacity();
     let artifact_ready = st
         .runtime
         .production
         .as_ref()
         .is_none_or(|state| state.is_serving());
-    let ready = worker_alive && !draining && artifact_ready;
+    let ready = worker_alive && !draining && !backend_faulted && artifact_ready;
     let status = if ready {
         StatusCode::OK
     } else {
@@ -1222,6 +1271,7 @@ async fn readiness(State(st): State<AppState>) -> Response {
             "model": &*st.model_id,
             "worker_alive": worker_alive,
             "draining": draining,
+            "backend_faulted": backend_faulted,
             "queue_depth": queue_depth,
             "production_artifact": st.runtime.production.is_some(),
             "artifact_ready": artifact_ready,
@@ -1266,6 +1316,12 @@ async fn metrics(State(st): State<AppState>) -> Response {
          # HELP tritium_worker_alive Decode worker liveness (1 = alive).\n\
          # TYPE tritium_worker_alive gauge\n\
          tritium_worker_alive {}\n\
+         # HELP tritium_backend_faults_total Backend faults observed by the decode worker.\n\
+         # TYPE tritium_backend_faults_total counter\n\
+         tritium_backend_faults_total {}\n\
+         # HELP tritium_backend_faulted Latched production backend fault state.\n\
+         # TYPE tritium_backend_faulted gauge\n\
+         tritium_backend_faulted {}\n\
          # HELP tritium_worker_phase Current decode-worker phase as one-hot fixed-cardinality gauges.\n\
          # TYPE tritium_worker_phase gauge\n\
          tritium_worker_phase{{phase=\"idle\"}} {}\n\
@@ -1285,6 +1341,8 @@ async fn metrics(State(st): State<AppState>) -> Response {
         st.metrics.stream_disconnects.load(Ordering::Relaxed),
         queue_depth,
         u8::from(st.runtime.worker_alive.load(Ordering::Relaxed)),
+        st.runtime.backend_faults.load(Ordering::Relaxed),
+        u8::from(st.runtime.backend_faulted.load(Ordering::Acquire)),
         u8::from(phase == PHASE_IDLE),
         u8::from(phase == PHASE_PREFILL),
         u8::from(phase == PHASE_DECODE),
@@ -1448,7 +1506,78 @@ fn tree_error(e: &TreeOpError) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::ChatTemplate;
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    struct BackendFail;
+
+    impl Generator for BackendFail {
+        fn generate(
+            &mut self,
+            _req: &GenRequest,
+            _on_step: &mut dyn FnMut(crate::generator::Step) -> bool,
+        ) -> Result<(), crate::generator::GenError> {
+            Err(crate::generator::GenError::Backend(
+                "device lost".to_owned(),
+            ))
+        }
+
+        fn n_ctx(&self) -> usize {
+            4096
+        }
+
+        fn vocab(&self) -> usize {
+            128_256
+        }
+    }
+
+    fn latching_router() -> Router {
+        let cfg = ServeConfig::default();
+        let draining = Arc::new(AtomicBool::new(false));
+        let worker_alive = Arc::new(AtomicBool::new(true));
+        let phase = Arc::new(AtomicU8::new(PHASE_IDLE));
+        let backend_faulted = Arc::new(AtomicBool::new(false));
+        let backend_faults = Arc::new(AtomicU64::new(0));
+        let jobs = spawn_worker(
+            Box::new(BackendFail),
+            WorkerSignals {
+                draining: draining.clone(),
+                worker_alive: worker_alive.clone(),
+                phase: phase.clone(),
+                backend_faulted: backend_faulted.clone(),
+                backend_faults: backend_faults.clone(),
+                latch_backend_faults: true,
+            },
+            cfg.queue_cap,
+        );
+        build_router_inner(
+            jobs,
+            Arc::new(crate::IdPassthroughTokenizer::default()),
+            cfg,
+            RequestLimits::default(),
+            Arc::new(Admission::legacy(None)),
+            RuntimeState {
+                draining,
+                worker_alive,
+                phase,
+                backend_faulted,
+                backend_faults,
+                production: None,
+            },
+        )
+        .0
+    }
+
+    fn chat_request() -> Request<Body> {
+        Request::post("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"tritium","messages":[{"role":"user","content":"1"}]}"#,
+            ))
+            .unwrap()
+    }
 
     #[test]
     fn qwen_template_preserves_roles_and_adds_generation_prefix() {
@@ -1460,5 +1589,31 @@ mod tests {
              <|im_start|>user\nhello<|im_end|>\n\
              <|im_start|>assistant\n"
         );
+    }
+
+    #[tokio::test]
+    async fn production_backend_latch_fails_health_readiness_and_new_work() {
+        let router = latching_router();
+        assert_eq!(
+            router
+                .clone()
+                .oneshot(chat_request())
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        );
+        for path in ["/healthz", "/readyz", "/v1/chat/completions"] {
+            let request = if path == "/v1/chat/completions" {
+                chat_request()
+            } else {
+                Request::get(path).body(Body::empty()).unwrap()
+            };
+            assert_eq!(
+                router.clone().oneshot(request).await.unwrap().status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{path} must fail closed after a production backend fault",
+            );
+        }
     }
 }
