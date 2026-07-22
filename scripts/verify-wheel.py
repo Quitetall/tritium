@@ -329,12 +329,21 @@ def main() -> int:
     parser.add_argument("--smoke-evidence", type=Path)
     parser.add_argument("--target-id")
     parser.add_argument("--source-revision")
+    parser.add_argument("--require-platform-tag")
     args = parser.parse_args()
     try:
         if args.receipt and args.smoke_evidence:
             raise WheelError("choose either --receipt or --smoke-evidence")
         wheel = resolve_wheel(args.wheel)
         result = inspect_wheel(wheel, _workspace_version(args.workspace))
+        if (
+            args.require_platform_tag
+            and result["platform_tag"] != args.require_platform_tag
+        ):
+            raise WheelError(
+                f"wheel platform {result['platform_tag']!r} != required "
+                f"{args.require_platform_tag!r}"
+            )
         if args.install_smoke:
             clean_install_smoke(wheel, args.workspace)
         if args.receipt:

@@ -178,6 +178,24 @@ class VerifyWheelTests(unittest.TestCase):
             MODULE.main()
         self.assertIn("choose either --receipt or --smoke-evidence", stderr.getvalue())
 
+    def test_required_platform_tag_fails_closed(self):
+        with tempfile.TemporaryDirectory() as raw:
+            wheel = Path(raw) / "tritium_torch-1.1.0rc0-cp39-abi3-linux_x86_64.whl"
+            build_wheel(wheel)
+            stderr = io.StringIO()
+            with mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "verify-wheel.py",
+                    str(wheel),
+                    "--require-platform-tag",
+                    "manylinux_2_28_x86_64",
+                ],
+            ), mock.patch("sys.stderr", stderr), self.assertRaises(SystemExit):
+                MODULE.main()
+            self.assertIn("!= required", stderr.getvalue())
+
     def test_runtime_cell_id_is_derived_from_interpreter(self):
         self.assertEqual(
             MODULE.runtime_cell_id("linux-x86_64-cpu", "CPython", (3, 14)),

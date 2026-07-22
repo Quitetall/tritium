@@ -31,6 +31,8 @@ on:
       - "scripts/tests/test_aggregate_wheel_smoke.py"
       - "scripts/wheel-functional-smoke.py"
       - "scripts/tests/test_wheel_functional_smoke.py"
+      - "scripts/build-cuda-manylinux-wheel.sh"
+      - "scripts/tests/test_build_cuda_manylinux_wheel.py"
       - "scripts/generate-colab-notebook.py"
       - "scripts/tests/test_generate_colab_notebook.py"
       - "examples/colab/tritium-smollm2-v11.ipynb"
@@ -241,6 +243,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.89.0"
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
@@ -252,15 +256,18 @@ jobs:
           test -x "$NVCC"
           "$NVCC" --version | grep -E 'release 13\.'
           nvidia-smi --query-gpu=name,compute_cap,driver_version --format=csv
-      - name: build CUDA abi3 wheel
+      - name: test CUDA manylinux build contract
+        run: >-
+          python -m unittest
+          scripts.tests.test_build_cuda_manylinux_wheel
+          scripts.tests.test_verify_wheel -v
+      - name: build CUDA manylinux abi3 wheel
         shell: bash
-        run: |
-          set -euo pipefail
-          python -m pip install --disable-pip-version-check 'maturin>=1.7,<2'
-          maturin build --release --features cuda --manylinux off \
-            --manifest-path crates/tritium-py/Cargo.toml --out dist-cuda
+        run: scripts/build-cuda-manylinux-wheel.sh dist-cuda
       - name: verify CUDA wheel structure
-        run: python scripts/verify-wheel.py dist-cuda
+        run: >-
+          python scripts/verify-wheel.py dist-cuda
+          --require-platform-tag manylinux_2_28_x86_64
       - name: install pinned CUDA PyTorch and Hugging Face stack
         shell: bash
         run: |

@@ -229,12 +229,15 @@ failed final parity run.
 ## Slice 3 — version and package closure
 
 Status: **IN PROGRESS** — CPU abi3 wheels retain the manylinux/macOS/Windows
-matrix. A separate Linux CUDA 13 wheel now compiles the `tritium-py/cuda`
-feature, declares its compiled backend inventory, and must execute the native
-Rust CUDA mpGEMM plus the installed-wheel Torch/Hugging Face lifecycle on the
-qualified sm_89 runner. The host-built CUDA artifact is honestly tagged
-`linux_x86_64`; a CUDA-toolkit-equipped manylinux build container remains open
-and no CUDA manylinux compatibility is claimed yet.
+matrix. A separate Linux CUDA 13 wheel compiles the `tritium-py/cuda` feature,
+declares its compiled backend inventory, and executes the native Rust CUDA
+mpGEMM plus the installed-wheel Torch/Hugging Face lifecycle on the qualified
+sm_89 runner. CUDA builds now run inside an immutable official
+`manylinux_2_28_x86_64` image with exact Rust, maturin and C++ toolchain
+contracts; the host CUDA 13 toolkit is mounted read-only, maturin/auditwheel
+enforce policy, and the verifier rejects any other platform tag. A local
+container build produced and admitted the expected tag. Candidate-revision
+CI/runtime receipts remain required before compatibility is claimed.
 
 Set one candidate version source for Rust crates, Python metadata, npm metadata,
 CLI output, schemas, docs and user agent. `1.1.0-rc.N` archives advance during
