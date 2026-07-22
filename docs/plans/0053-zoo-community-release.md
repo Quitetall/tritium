@@ -389,6 +389,17 @@ model-zoo, package, serving, deployment and signing receipt can produce
 `LOCAL_RC_READY`. Browser, second-machine and independent-review kinds now fail
 closed through dedicated validators, but lack empirical candidate receipts.
 
+Progress (2026-07-22): the zoo/community gate now has three strict receipt
+contracts. `tritium.model-zoo-admission.v1` freezes the accessible tutorial and
+recipe models, native BitNet reference and Qwen3.6-27B language-plus-MTP
+flagship, including immutable model/tokenizer identities, content-bound cards,
+candidate artifacts and evidence ancestry. `tritium.generated-claims.v1` binds
+README, model-zoo, benchmark and compatibility documents to the zoo plus all
+model evidence. `tritium.governance-docs.v1` binds the complete community policy
+inventory and requires successful link/contact/independent-policy review while
+rejecting advertised unstaffed channels. These validators are structural until
+candidate-bound empirical receipts are produced.
+
 Exact-image serving admission now distinguishes CPU runtime, CUDA runtime and
 CPU/CUDA security scans, plus cluster deployment. Each runtime receipt must bind the candidate OCI archive,
 the archive-verified image manifest digest, build lineage, strict model manifest,

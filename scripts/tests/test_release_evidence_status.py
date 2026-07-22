@@ -279,6 +279,80 @@ def entry(
 
 
 class ReleaseEvidenceStatusTests(unittest.TestCase):
+    def test_zoo_community_requires_evidence_ancestry_and_candidate_artifacts(self):
+        with tempfile.TemporaryDirectory() as raw:
+            candidate, document, artifact, evidence_root = release_fixture(Path(raw))
+            document["artifacts"][0]["identity"] = {
+                "sha256": sha256(artifact), "bytes": artifact.stat().st_size,
+            }
+            candidate.write_bytes(canonical(document) + b"\n")
+            anchor = {
+                "id": "cuda-wheel", "kind": "python-wheel", "name": artifact.name,
+                "bytes": artifact.stat().st_size, "sha256": sha256(artifact),
+            }
+            paths = {
+                name: evidence_root / f"{name}.json"
+                for name in ("model", "zoo", "claims", "governance")
+            }
+            for path in paths.values():
+                path.write_bytes(b"{}\n")
+            model = {
+                "receipt_id": "sha256:" + "1" * 64,
+                "run_id": "model-evidence-1",
+                "wheel_name": artifact.name,
+                "wheel_bytes": artifact.stat().st_size,
+                "wheel_sha256": "sha256:" + sha256(artifact),
+            }
+            zoo = {
+                "receipt_id": "sha256:" + "2" * 64,
+                "run_id": "zoo-1", "anchor_artifact": anchor,
+                "models": [
+                    {
+                        "artifact_ids": ["cuda-wheel"],
+                        "evidence_receipt_ids": [model["receipt_id"]],
+                    }
+                    for _ in range(4)
+                ],
+            }
+            claims = {
+                "receipt_id": "sha256:" + "3" * 64,
+                "run_id": "claims-1", "anchor_artifact": anchor,
+                "source_receipt_ids": [zoo["receipt_id"], model["receipt_id"]],
+            }
+            governance = {
+                "receipt_id": "sha256:" + "4" * 64,
+                "run_id": "governance-1", "anchor_artifact": anchor,
+            }
+            entries = [
+                entry(paths["model"], model, kind="frontend-lifecycle"),
+                entry(
+                    paths["zoo"], zoo, kind="model-zoo",
+                    parents=[model["receipt_id"]],
+                ),
+                entry(
+                    paths["claims"], claims, kind="generated-claims",
+                    parents=[zoo["receipt_id"], model["receipt_id"]],
+                ),
+                entry(paths["governance"], governance, kind="governance-docs"),
+            ]
+            registry_path = evidence_root / "registry.json"
+            registry(registry_path, candidate, entries)
+            validators = {
+                "validate_hf_lifecycle_receipt": mock.Mock(return_value=model),
+                "validate_model_zoo": mock.Mock(return_value=zoo),
+                "validate_generated_claims": mock.Mock(return_value=claims),
+                "validate_governance_docs": mock.Mock(return_value=governance),
+            }
+            with mock.patch.dict(evaluate.__globals__, validators):
+                report = evaluate(registry_path, candidate, document)
+            row = next(item for item in report["rows"] if item["id"] == "zoo-community")
+            self.assertEqual(row["status"], "PASS")
+
+            zoo["models"][0]["artifact_ids"] = ["absent-model-artifact"]
+            with mock.patch.dict(evaluate.__globals__, validators), \
+                    self.assertRaisesRegex(EvidenceError, "candidate artifacts"):
+                evaluate(registry_path, candidate, document)
+
     def test_reproduction_signoff_requires_complete_review_ancestry(self):
         with tempfile.TemporaryDirectory() as raw:
             candidate, document, artifact, evidence_root = release_fixture(Path(raw))

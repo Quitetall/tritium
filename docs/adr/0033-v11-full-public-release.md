@@ -463,6 +463,13 @@ under `python -I`; worker and interpreter substitution are not release seams.
       deployment and failure-injection gates.
 - [ ] Three-tier model zoo, guides, governance/community and compatibility docs
       are public and generated claims match evidence receipts.
+      Admission is fail-closed through `tritium.model-zoo-admission.v1`,
+      `tritium.generated-claims.v1` and `tritium.governance-docs.v1`. The frozen
+      four-model ladder binds immutable model/tokenizer revisions, model cards,
+      candidate artifacts and admitted evidence ancestry. Generated README,
+      model-zoo, benchmark and compatibility claims bind those same receipts;
+      the governance inventory must pass link, contact and independent policy
+      review and cannot advertise unstaffed channels.
 - [ ] Independent fresh-environment reproduction passes on a second machine;
       release revision is clean, reviewed, signed and tagged `v1.1.0`.
       `tritium.second-machine-reproduction.v1` must bind the complete candidate

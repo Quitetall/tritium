@@ -59,6 +59,13 @@ REPRODUCTION_RECEIPT = runpy.run_path(
 validate_second_machine = REPRODUCTION_RECEIPT["validate_second_machine"]
 validate_independent_review = REPRODUCTION_RECEIPT["validate_independent_review"]
 ReproductionError = REPRODUCTION_RECEIPT["ReproductionError"]
+ZOO_COMMUNITY_RECEIPT = runpy.run_path(
+    Path(__file__).with_name("verify-zoo-community-receipt.py")
+)
+validate_model_zoo = ZOO_COMMUNITY_RECEIPT["validate_zoo"]
+validate_generated_claims = ZOO_COMMUNITY_RECEIPT["validate_claims"]
+validate_governance_docs = ZOO_COMMUNITY_RECEIPT["validate_governance"]
+ZooCommunityError = ZOO_COMMUNITY_RECEIPT["ZooCommunityError"]
 
 SCHEMA = "tritium.release-evidence-registry.v1"
 REPORT_SCHEMA = "tritium.release-gate-report.v1"
@@ -79,6 +86,9 @@ KNOWN_KINDS = frozenset(
         "browser-conformance",
         "second-machine",
         "independent-review",
+        "model-zoo",
+        "generated-claims",
+        "governance-docs",
     }
 )
 HEX = frozenset("0123456789abcdef")
@@ -351,6 +361,20 @@ def evaluate(
                 receipt = validate_independent_review(
                     receipt_path, revision, release, candidate, artifact_path
                 )
+            elif kind == "model-zoo":
+                receipt = validate_model_zoo(
+                    receipt_path, revision, release, candidate, artifact_path
+                )
+            elif kind == "generated-claims":
+                receipt = validate_generated_claims(
+                    receipt_path, revision, release, candidate, artifact_path,
+                    Path(__file__).resolve().parent.parent,
+                )
+            elif kind == "governance-docs":
+                receipt = validate_governance_docs(
+                    receipt_path, revision, release, candidate, artifact_path,
+                    Path(__file__).resolve().parent.parent,
+                )
             elif kind in {"oci-runtime-cpu", "oci-runtime-cuda"}:
                 receipt = load_oci_runtime_receipt(
                     receipt_path, revision=revision, release=release,
@@ -422,6 +446,7 @@ def evaluate(
             DistributedReceiptError,
             BrowserReceiptError,
             ReproductionError,
+            ZooCommunityError,
             ValueError,
         ) as error:
             raise EvidenceError(f"{label} failed {kind} validation: {error}") from error
@@ -502,7 +527,10 @@ def evaluate(
             )
             if actual != declared or actual != qualified:
                 raise EvidenceError(f"{kind} receipt does not bind candidate wheel bytes")
-        elif kind in {"second-machine", "independent-review"}:
+        elif kind in {
+            "second-machine", "independent-review", "model-zoo",
+            "generated-claims", "governance-docs",
+        }:
             identity = artifact.get("identity", {})
             actual = (
                 artifact.get("id"), artifact.get("kind"), artifact_path.name,
@@ -562,6 +590,43 @@ def evaluate(
         paths.add(logical_path)
         portable_paths.add(portable_path)
     _check_ancestry(entries)
+    zoo_ids = [receipt_id for receipt_id, kind in kinds.items() if kind == "model-zoo"]
+    claim_ids = [
+        receipt_id for receipt_id, kind in kinds.items() if kind == "generated-claims"
+    ]
+    if zoo_ids:
+        zoo_id = zoo_ids[0]
+        zoo = validated_receipts[zoo_id]
+        model_evidence = {
+            evidence_id
+            for model in zoo["models"]
+            for evidence_id in model["evidence_receipt_ids"]
+        }
+        model_artifacts = {
+            candidate_id
+            for model in zoo["models"]
+            for candidate_id in model["artifact_ids"]
+        }
+        if (
+            not model_evidence.issubset(entries)
+            or set(entries[zoo_id]["parents"]) != model_evidence
+            or not model_artifacts.issubset(artifacts)
+        ):
+            raise EvidenceError(
+                "model-zoo must parent admitted evidence and bind candidate artifacts"
+            )
+    if claim_ids:
+        claim_id = claim_ids[0]
+        claims = validated_receipts[claim_id]
+        required_sources = set(claims["source_receipt_ids"])
+        expected_sources = ({zoo_ids[0]} | model_evidence) if zoo_ids else set()
+        if (
+            required_sources != expected_sources
+            or set(entries[claim_id]["parents"]) != expected_sources
+        ):
+            raise EvidenceError(
+                "generated-claims must derive from model-zoo and its evidence"
+            )
     review_ids = [receipt_id for receipt_id, kind in kinds.items() if kind == "independent-review"]
     second_ids = [receipt_id for receipt_id, kind in kinds.items() if kind == "second-machine"]
     if review_ids:
