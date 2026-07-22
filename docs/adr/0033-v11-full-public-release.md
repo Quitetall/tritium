@@ -424,6 +424,18 @@ This receipt does not substitute for distributed training, optimized native
 dispatch, flagship quality/performance, serving telemetry or second-machine
 reproduction.
 
+Production output-aware search uses the canonical `TSV2OUT` version-1 receipt.
+Its source model, activation cache, token stream, held-out validation set,
+block/sliding-window schedule, objective weights, temperature, batch count and
+restart count form one immutable specification identity. Candidate evaluation
+streams one output batch at a time, binds exact teacher/student bytes, reports
+block MSE plus final-logit teacher cross-entropy and temperature-scaled KL, and
+selects a complete deterministic restart set with content-ID tie breaking.
+Strict reopen rejects corruption, noncanonical candidate order, missing basins
+and teacher drift between basins. This core receipt is not flagship evidence
+until plan 0043 binds its selected candidate to the corresponding immutable
+master campaign and executes it on source-bound checkpoint data.
+
 Multi-device admission uses
 `tritium.hf-distributed-qualification.v1`. The validator requires ordered DDP
 and FSDP NCCL/fp16 runs on two distinct physical GPU UUIDs, exact checkpoint

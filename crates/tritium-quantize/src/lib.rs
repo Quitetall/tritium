@@ -49,6 +49,7 @@ mod salt_v2_curvature;
 mod salt_v2_evidence;
 mod salt_v2_feedback;
 mod salt_v2_model;
+mod salt_v2_output;
 mod training_export;
 
 pub use allocate::{AllocConfig, AllocError, Allocation, GroupInput, TRIT_BITS, allocate};
@@ -118,6 +119,11 @@ pub use salt_v2_model::{
     allocate_and_pack_salt_v2_master_with_packing, fit_salt_v2_master, fit_salt_v2_model,
     fit_salt_v2_restartable_tensor_master, fit_salt_v2_tensor_master,
     plan_salt_v2_restartable_tensor_master, plan_salt_v2_tensor_master,
+};
+pub use salt_v2_output::{
+    OutputCandidateReceipt, OutputObjectiveWeights, OutputReconstructionAccumulator,
+    OutputReconstructionError, OutputReconstructionReceipt, OutputReconstructionSchedule,
+    OutputReconstructionScope, OutputReconstructionSpec, select_output_reconstruction,
 };
 pub use training_export::{
     TrainingSaltExportError, TrainingSaltExportStats, export_training_salt_row,

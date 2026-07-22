@@ -53,8 +53,22 @@ coverage and duplicate-plugin tests.
   constants through semantic identity, exact dense reconstruction, and
   replayable resident/packed CUDA training graphs. Qwen3.6 hybrid DeltaNet and
   gated-attention training remain a separate open integration.
-- Bind block/sliding reconstruction, output-aware initialization and final
-  teacher-logit loss into the resumable plan-0043 driver.
+- [x] Add a bounded-memory block/sliding-window evaluator with exact teacher and
+  student stream identities, final-logit teacher CE/KL, complete deterministic
+  multi-start selection and a strict canonical `TSV2OUT` v1 receipt.
+  - Edit `crates/tritium-quantize/src/salt_v2_output.rs` for the public frozen
+    schedule/spec, streamed accumulator, metric calculation and deterministic
+    restart-selection seams.
+  - Edit `crates/tritium-quantize/src/salt_v2_output/codec.rs` for the bounded,
+    canonical receipt encoder and fail-closed strict reopen path.
+  - Edit `crates/tritium-quantize/tests/output_reconstruction.rs` for literal
+    metric, traversal, teacher-drift, corruption, allocation-amplification and
+    unreachable-state coverage.
+  - Expected output: `cargo test -p tritium-quantize --test
+    output_reconstruction` reports six passed tests; `cargo clippy -p
+    tritium-quantize --all-targets -- -D warnings` exits zero.
+- Bind that receipt's selected candidate to its immutable tensor-master set in
+  the resumable plan-0043 driver; execute it on checkpoint-scale evidence.
 - Keep calibration, reconstruction and validation datasets source-bound and
   disjoint where the recipe requires.
 
