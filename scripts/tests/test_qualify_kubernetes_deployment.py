@@ -24,6 +24,14 @@ deployment_update_identity = MODULE["deployment_update_identity"]
 validate_scale_contract = MODULE["validate_scale_contract"]
 WATCHDOG_FAULT_COMMAND = MODULE["WATCHDOG_FAULT_COMMAND"]
 watchdog_contract = MODULE["watchdog_contract"]
+artifact_volume_contract = MODULE["artifact_volume_contract"]
+pending_artifact_volume_failure = MODULE["pending_artifact_volume_failure"]
+pvc_identity = MODULE["pvc_identity"]
+qualify_artifact_volume_loss = MODULE["qualify_artifact_volume_loss"]
+prove_absent = MODULE["prove_absent"]
+resource_quantity = MODULE["resource_quantity"]
+resource_usage_sample = MODULE["resource_usage_sample"]
+request_evidence = MODULE["request_evidence"]
 
 
 def startup(flavor: str = "cpu") -> dict:
@@ -51,6 +59,17 @@ def startup(flavor: str = "cpu") -> dict:
 def receipt(chart: Path, image_archive: Path, candidate: Path,
             flavor: str = "cpu") -> dict:
     startup_receipt = startup(flavor)
+    recovered_name = "pod-artifact-recovered" if flavor == "cuda" else "pod-new"
+
+    def resource_sample(name: str | None, timestamp: str, seed: str) -> dict:
+        return {
+            "sample_sha256": seed * 64, "sampled_at_utc": timestamp,
+            "pod_names": ([] if name is None else [name]),
+            "pod_count": 0 if name is None else 1,
+            "container_count": 0 if name is None else 2,
+            "cpu_nanocores": 0 if name is None else 10_000_000,
+            "memory_bytes": 0 if name is None else 1_000_000_000,
+        }
     manifest = candidate.parent / "tritium.json"
     build_receipt = candidate.parent / "build-receipt.json"
     value = {
@@ -90,7 +109,14 @@ def receipt(chart: Path, image_archive: Path, candidate: Path,
                   "helm_version": "v3.18.0"},
         "workload": {
             "release_name": "qualification", "deployment_uid": "deployment-uid",
-            "qualification_lock_uid": "lock-uid",
+            "qualification_lock_uid": "lock-uid", "source_pvc": "tritium-artifact",
+            "model_id": "tritium",
+            "source_pvc_identity": {
+                "name": "tritium-artifact", "uid": "pvc-uid",
+                "volume_name": "pv-artifact", "storage_class": "standard",
+                "access_modes": ["ReadWriteOnce"], "capacity": "64Gi",
+                "phase": "Bound",
+            },
             "initial": {"pods": [{"name": "pod-old", "uid": "pod-old-uid",
                                     "node": "node-1", "restarts": 1}]},
             "restarted": {"pods": [{"name": "pod-new", "uid": "pod-new-uid",
@@ -123,6 +149,65 @@ def receipt(chart: Path, image_archive: Path, candidate: Path,
                     "tritium_backend_faults_total": 0.0,
                     "tritium_backend_faulted": 0.0,
                 }},
+            },
+            "artifact_volume_loss": {
+                "source_claim": "tritium-artifact",
+                "missing_claim": "tritium-missing-123456789abc",
+                "volume_index": 0,
+                "absence": {
+                    "status": "NotFound",
+                    "output_sha256": hashlib.sha256(b"").hexdigest(),
+                },
+                "fault_patch_sha256": hashlib.sha256(canonical([{
+                    "op": "replace",
+                    "path": "/spec/template/spec/volumes/0/persistentVolumeClaim/claimName",
+                    "value": "tritium-missing-123456789abc",
+                }]).decode().strip().encode()).hexdigest(),
+                "observation_budget_ms": 120000,
+                "observation_ms": 5000.0,
+                "pending": {
+                    "pod_name": "pod-missing", "pod_uid": "pod-missing-uid",
+                    "reason": "Unschedulable", "message_sha256": "d" * 64,
+                },
+                "recovered": {"pods": [{
+                    "name": recovered_name,
+                    "uid": ("pod-artifact-recovered-uid" if flavor == "cuda"
+                            else "pod-new-uid"),
+                    "node": "node-1", "restarts": 0,
+                }]},
+                "cleanup": {"status": "restored", "source_claim": "tritium-artifact"},
+                "startup_receipt": dict(startup_receipt),
+                "generation_response_sha256": "e" * 64,
+                "request": request_evidence(
+                    "tritium", "Hello", temperature=0, max_tokens=1
+                ),
+                "transitions": [
+                    {"state": state, "elapsed_ms": float(index),
+                     "observed_at_utc": f"2026-07-21T12:00:0{index}+00:00"}
+                    for index, state in enumerate(MODULE["ARTIFACT_VOLUME_TRANSITIONS"])
+                ],
+                "metrics": {"sha256": "f" * 64, "values": {
+                    "tritium_chat_requests_total": 1.0,
+                    "tritium_tokens_out_total": 1.0,
+                    "tritium_worker_alive": 1.0,
+                    "tritium_backend_faults_total": 0.0,
+                    "tritium_backend_faulted": 0.0,
+                }},
+                "resources": {
+                    "baseline": resource_sample(
+                        "pod-new", "2026-07-21T12:00:01+00:00", "1"
+                    ),
+                    "failure": resource_sample(
+                        None, "2026-07-21T12:00:02+00:00", "2"
+                    ),
+                    "recovered": resource_sample(
+                        recovered_name, "2026-07-21T12:00:03+00:00", "3"
+                    ),
+                    "high_water": {
+                        "cpu_nanocores": 10_000_000,
+                        "memory_bytes": 1_000_000_000,
+                    },
+                },
             },
             "restart_startup_receipt": dict(startup_receipt),
             "update_startup_receipt": dict(startup_receipt),
@@ -429,6 +514,99 @@ class QualifyKubernetesDeploymentTests(unittest.TestCase):
         with self.assertRaisesRegex(DeploymentError, "bounds differ"):
             watchdog_contract(document)
 
+    def test_artifact_volume_contract_and_pending_failure_are_exact(self):
+        deployment = {"spec": {"template": {"spec": {"volumes": [
+            {"name": "source-artifact", "persistentVolumeClaim": {
+                "claimName": "tritium-artifact"
+            }},
+        ]}}}}
+        self.assertEqual(artifact_volume_contract(deployment), {
+            "volume_index": 0, "claim_name": "tritium-artifact",
+        })
+        pods = {"items": [{
+            "metadata": {"name": "pending", "uid": "new-uid"},
+            "status": {"conditions": [{
+                "type": "PodScheduled", "status": "False",
+                "reason": "Unschedulable",
+                "message": 'persistentvolumeclaim "tritium-missing-abc" not found',
+            }]},
+        }]}
+        observed = pending_artifact_volume_failure(
+            pods, missing_claim="tritium-missing-abc", previous_uids={"old-uid"}
+        )
+        self.assertEqual(observed["pod_uid"], "new-uid")
+        self.assertIsNone(pending_artifact_volume_failure(
+            pods, missing_claim="other-missing", previous_uids={"old-uid"}
+        ))
+
+    def test_source_pvc_identity_requires_bound_storage(self):
+        document = {
+            "metadata": {"name": "tritium-artifact", "uid": "pvc-uid"},
+            "spec": {"volumeName": "pv-artifact", "storageClassName": "standard",
+                     "accessModes": ["ReadWriteOnce"]},
+            "status": {"phase": "Bound", "capacity": {"storage": "64Gi"}},
+        }
+        self.assertEqual(
+            pvc_identity(document, "tritium-artifact")["volume_name"], "pv-artifact"
+        )
+        document["status"]["phase"] = "Pending"
+        with self.assertRaisesRegex(DeploymentError, "not fully bound"):
+            pvc_identity(document, "tritium-artifact")
+
+    def test_artifact_volume_fault_always_restores_source_claim(self):
+        commands = []
+
+        def fake_run(command, _timeout):
+            commands.append(command)
+            return ""
+
+        with mock.patch.dict(qualify_artifact_volume_loss.__globals__, {
+            "prove_absent": mock.Mock(return_value={
+                "status": "NotFound", "output_sha256": hashlib.sha256(b"").hexdigest()
+            }),
+            "collect_resource_usage": mock.Mock(),
+            "run": fake_run,
+            "run_json": mock.Mock(return_value={"items": [None]}),
+        }):
+            with self.assertRaisesRegex(DeploymentError, "pod entry"):
+                qualify_artifact_volume_loss(
+                    ["kubectl"], service="tritium", namespace="tritium-test",
+                    selector="app=tritium",
+                    contract={"volume_index": 0, "claim_name": "tritium-artifact"},
+                    previous_uids={"old-uid"}, timeout=10,
+                )
+        self.assertEqual(len(commands), 2)
+        self.assertIn("tritium-missing-", commands[0][-1])
+        self.assertIn("tritium-artifact", commands[1][-1])
+
+    def test_absence_proof_rejects_rbac_and_accepts_only_empty_success(self):
+        completed = mock.Mock(returncode=0, stdout="", stderr="")
+        with mock.patch.object(prove_absent.__globals__["subprocess"], "run",
+                               return_value=completed):
+            self.assertEqual(prove_absent(["kubectl", "get", "pvc/x"], 1)["status"],
+                             "NotFound")
+        completed.returncode = 1
+        completed.stderr = "Error from server (Forbidden)"
+        with mock.patch.object(prove_absent.__globals__["subprocess"], "run",
+                               return_value=completed), self.assertRaisesRegex(
+                                   DeploymentError, "exact empty success"
+                               ):
+            prove_absent(["kubectl", "get", "pvc/x"], 1)
+
+    def test_resource_usage_sample_normalizes_cpu_and_memory(self):
+        self.assertEqual(resource_quantity("12m", cpu=True), 12_000_000)
+        self.assertEqual(resource_quantity("2Mi", cpu=False), 2 * 1024 * 1024)
+        document = {"items": [{
+            "metadata": {"name": "pod"},
+            "containers": [
+                {"usage": {"cpu": "12m", "memory": "2Mi"}},
+                {"usage": {"cpu": "500u", "memory": "1Mi"}},
+            ],
+        }]}
+        sample = resource_usage_sample(document)
+        self.assertEqual(sample["cpu_nanocores"], 12_500_000)
+        self.assertEqual(sample["memory_bytes"], 3 * 1024 * 1024)
+
     def test_receipt_validator_binds_both_candidate_artifacts_and_restart(self):
         with tempfile.TemporaryDirectory() as raw:
             chart, image, manifest, build, candidate = candidate_inputs(raw)
@@ -493,6 +671,68 @@ class QualifyKubernetesDeploymentTests(unittest.TestCase):
             value["receipt_id"] = "sha256:" + hashlib.sha256(canonical(value)).hexdigest()
             with self.assertRaisesRegex(DeploymentError, "policy differs"):
                 validate(value, chart, image, manifest, build, candidate)
+
+    def test_receipt_validator_binds_artifact_volume_fault_patch(self):
+        with tempfile.TemporaryDirectory() as raw:
+            chart, image, manifest, build, candidate = candidate_inputs(raw)
+            value = receipt(chart, image, candidate)
+            value["workload"]["artifact_volume_loss"]["fault_patch_sha256"] = "0" * 64
+            del value["receipt_id"]
+            value["receipt_id"] = "sha256:" + hashlib.sha256(canonical(value)).hexdigest()
+            with self.assertRaisesRegex(DeploymentError, "fault patch differs"):
+                validate(value, chart, image, manifest, build, candidate)
+
+    def test_receipt_validator_rejects_artifact_observation_over_budget(self):
+        with tempfile.TemporaryDirectory() as raw:
+            chart, image, manifest, build, candidate = candidate_inputs(raw)
+            value = receipt(chart, image, candidate)
+            value["workload"]["artifact_volume_loss"]["observation_ms"] = 120001
+            del value["receipt_id"]
+            value["receipt_id"] = "sha256:" + hashlib.sha256(canonical(value)).hexdigest()
+            with self.assertRaisesRegex(DeploymentError, "artifact-volume evidence"):
+                validate(value, chart, image, manifest, build, candidate)
+
+    def test_receipt_validator_recomputes_artifact_resource_high_water(self):
+        with tempfile.TemporaryDirectory() as raw:
+            chart, image, manifest, build, candidate = candidate_inputs(raw)
+            value = receipt(chart, image, candidate)
+            value["workload"]["artifact_volume_loss"]["resources"]["high_water"][
+                "memory_bytes"
+            ] += 1
+            del value["receipt_id"]
+            value["receipt_id"] = "sha256:" + hashlib.sha256(canonical(value)).hexdigest()
+            with self.assertRaisesRegex(DeploymentError, "high-water evidence"):
+                validate(value, chart, image, manifest, build, candidate)
+
+    def test_receipt_validator_binds_artifact_request_and_transition_order(self):
+        for target in ("request", "boolean_request", "transition"):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as raw:
+                chart, image, manifest, build, candidate = candidate_inputs(raw)
+                value = receipt(chart, image, candidate)
+                artifact = value["workload"]["artifact_volume_loss"]
+                if target == "request":
+                    artifact["request"]["max_tokens"] = 2
+                elif target == "boolean_request":
+                    request = artifact["request"]
+                    request["temperature"] = False
+                    request["max_tokens"] = True
+                    descriptor = {
+                        key: value for key, value in request.items()
+                        if key != "descriptor_sha256"
+                    }
+                    request["descriptor_sha256"] = hashlib.sha256(
+                        canonical(descriptor)
+                    ).hexdigest()
+                else:
+                    artifact["transitions"][2], artifact["transitions"][3] = (
+                        artifact["transitions"][3], artifact["transitions"][2]
+                    )
+                del value["receipt_id"]
+                value["receipt_id"] = "sha256:" + hashlib.sha256(canonical(value)).hexdigest()
+                with self.assertRaisesRegex(
+                    DeploymentError, "request evidence|transition sequence"
+                ):
+                    validate(value, chart, image, manifest, build, candidate)
 
     def test_receipt_validator_rejects_chart_or_image_drift(self):
         for target in ("chart", "image"):

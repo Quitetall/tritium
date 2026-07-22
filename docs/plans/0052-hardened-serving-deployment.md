@@ -335,9 +335,27 @@ receipt parity, clean fault telemetry and recovered generation. This exercises
 the watchdog's worst-case replacement path; a real latched backend/device fault
 and OOM execution remain open.
 
+Artifact-volume unavailability now has a separate Kubernetes v5 gate. The
+qualifier requires a successful empty `--ignore-not-found` response for a
+randomized source PVC (RBAC/API failures cannot substitute for absence), patches only the deployed
+`source-artifact` claim, and requires a new pod to become `Unschedulable` with
+the missing claim in its scheduler evidence within 120 seconds. A `finally`
+path restores the exact admitted claim before any result can pass. Qualification
+then binds the failed patch, pending-pod identity, recovered pod set, immutable
+startup receipt, clean telemetry and successful generation. CPU rolling-update
+profiles may retain the serving pod during failure; CUDA `Recreate` profiles
+must replace it. Source bytes remain untouched.
+The v5 receipt also binds the source PVC UID/PV/storage class/capacity, explicit
+restoration state, and Metrics API samples before, during and after the fault;
+CPU nanocores and memory bytes are normalized and their observed high-water
+marks are recomputed offline. Recovery request evidence pins model, prompt
+digest/size, temperature and token limit. An ordered timestamped trace binds
+baseline readiness, absence proof, fault application, scheduler rejection,
+source restoration and recovered readiness.
+
 1. malformed/truncated/wrong-identity artifact at startup;
 2. missing secret, invalid config and unavailable requested backend;
-3. latched backend/device loss, OOM and artifact volume loss;
+3. latched backend/device loss and OOM;
 4. telemetry collector unavailable/slow and metrics scrape flood;
 5. failed rollout followed by digest-pinned rollback.
 

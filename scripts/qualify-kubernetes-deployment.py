@@ -7,6 +7,7 @@ import argparse
 import base64
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 import hashlib
 import json
 import math
@@ -32,7 +33,7 @@ manifest_identity = RUNTIME["manifest_identity"]
 OCI_ARCHIVE = runpy.run_path(Path(__file__).with_name("verify-oci-archive.py"))
 validate_oci_archive = OCI_ARCHIVE["validate"]
 
-SCHEMA = "tritium.kubernetes-deployment-qualification.v4"
+SCHEMA = "tritium.kubernetes-deployment-qualification.v5"
 HEX = frozenset("0123456789abcdef")
 SAFE_NAME = re.compile(r"[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?")
 SAFE_SECRET_KEY = re.compile(r"[A-Za-z0-9](?:[-._A-Za-z0-9]{0,251}[A-Za-z0-9])?")
@@ -56,7 +57,8 @@ CUDA_PROBE_IMAGES = {
 CHECKS = (
     "namespace-preflight", "secret-binding", "pvc-preflight", "helm-install",
     "rollout-ready", "production-readiness", "buffered-generation", "metrics",
-    "watchdog-replacement", "pod-restart", "successful-update", "update-readiness", "failed-upgrade",
+    "watchdog-replacement", "pod-restart", "artifact-volume-loss",
+    "successful-update", "update-readiness", "failed-upgrade",
     "atomic-rollback", "rollback-readiness", "rollback-generation", "release-cleanup",
 )
 MAX_RESPONSE_BYTES = 16 * 1024 * 1024
@@ -72,6 +74,16 @@ WATCHDOG_POLICY = {
     "scheduling_allowance_ms": WATCHDOG_SCHEDULING_ALLOWANCE_MS,
     "budget_ms": 98_000,
 }
+ARTIFACT_VOLUME_OBSERVATION_BUDGET_MS = 120_000
+QUALIFICATION_METRICS = {
+    "tritium_chat_requests_total", "tritium_tokens_out_total",
+    "tritium_worker_alive", "tritium_backend_faults_total",
+    "tritium_backend_faulted",
+}
+ARTIFACT_VOLUME_TRANSITIONS = [
+    "baseline_ready", "absence_verified", "fault_applied",
+    "unschedulable_observed", "source_restored", "recovery_ready",
+]
 
 
 def expected_checks(flavor: str) -> list[str]:
@@ -84,6 +96,16 @@ class DeploymentError(ValueError):
 
 def canonical(value: Any) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+
+
+def request_evidence(model_id: str, prompt: str, *, temperature: int,
+                     max_tokens: int) -> dict[str, Any]:
+    descriptor = {
+        "model": model_id, "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
+        "prompt_bytes": len(prompt.encode()), "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    return {**descriptor, "descriptor_sha256": hashlib.sha256(canonical(descriptor)).hexdigest()}
 
 
 def sha256(path: Path) -> str:
@@ -242,6 +264,25 @@ def expect_failure(command: list[str], timeout: float) -> str:
     if len(output.encode()) > MAX_RESPONSE_BYTES:
         raise DeploymentError("failed-upgrade output exceeds byte limit")
     return hashlib.sha256(output.encode()).hexdigest()
+
+
+def prove_absent(command: list[str], timeout: float) -> dict[str, str]:
+    try:
+        result = subprocess.run(
+            command + ["--ignore-not-found=true"], text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=timeout, check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise DeploymentError(f"absence check could not run: {error}") from error
+    stdout = result.stdout.strip()
+    stderr = result.stderr.strip()
+    if result.returncode != 0 or stdout or stderr:
+        raise DeploymentError("resource absence check did not return exact empty success")
+    return {
+        "status": "NotFound",
+        "output_sha256": hashlib.sha256(b"").hexdigest(),
+    }
 
 
 def request(url: str, token: str, *, body: dict[str, Any] | None = None,
@@ -438,6 +479,45 @@ def validate_receipt_snapshot(snapshot: Any, label: str,
     return snapshot
 
 
+def pvc_identity(document: dict[str, Any], expected_name: str) -> dict[str, Any]:
+    metadata = document.get("metadata", {})
+    spec = document.get("spec", {})
+    status = document.get("status", {})
+    modes = spec.get("accessModes")
+    result = {
+        "name": metadata.get("name"), "uid": metadata.get("uid"),
+        "volume_name": spec.get("volumeName"),
+        "storage_class": spec.get("storageClassName"),
+        "access_modes": sorted(modes) if isinstance(modes, list) else modes,
+        "capacity": status.get("capacity", {}).get("storage"),
+        "phase": status.get("phase"),
+    }
+    if (result["name"] != expected_name
+            or any(not isinstance(result.get(key), str) or not result[key]
+                   for key in ("uid", "volume_name", "storage_class", "capacity"))
+            or not isinstance(result["access_modes"], list) or not result["access_modes"]
+            or any(not isinstance(mode, str) or not mode for mode in result["access_modes"])
+            or result["phase"] != "Bound"):
+        raise DeploymentError("source artifact PVC is not fully bound")
+    return result
+
+
+def validate_pvc_identity(value: Any, expected_name: str) -> dict[str, Any]:
+    fields = {
+        "name", "uid", "volume_name", "storage_class", "access_modes",
+        "capacity", "phase",
+    }
+    if (not isinstance(value, dict) or set(value) != fields
+            or value.get("name") != expected_name or value.get("phase") != "Bound"
+            or any(not isinstance(value.get(key), str) or not value[key]
+                   for key in ("uid", "volume_name", "storage_class", "capacity"))
+            or not isinstance(value.get("access_modes"), list) or not value["access_modes"]
+            or value["access_modes"] != sorted(value["access_modes"])
+            or any(not isinstance(mode, str) or not mode for mode in value["access_modes"])):
+        raise DeploymentError("deployment source PVC identity is malformed")
+    return value
+
+
 def validate_deployment(document: dict[str, Any], *, image: str,
                         manifest_sha256: str, flavor: str) -> str:
     metadata = document.get("metadata", {})
@@ -508,6 +588,263 @@ def watchdog_contract(document: dict[str, Any]) -> dict[str, int]:
     if values != WATCHDOG_POLICY:
         raise DeploymentError("deployed watchdog differs from release policy")
     return values
+
+
+def artifact_volume_contract(document: dict[str, Any]) -> dict[str, Any]:
+    volumes = document.get("spec", {}).get("template", {}).get("spec", {}).get(
+        "volumes", []
+    )
+    matches = [(index, volume) for index, volume in enumerate(volumes)
+               if isinstance(volume, dict) and volume.get("name") == "source-artifact"]
+    if len(matches) != 1:
+        raise DeploymentError("source artifact volume contract differs")
+    index, volume = matches[0]
+    claim = volume.get("persistentVolumeClaim", {}).get("claimName")
+    if not isinstance(claim, str) or SAFE_NAME.fullmatch(claim) is None:
+        raise DeploymentError("source artifact PVC identity is malformed")
+    return {"volume_index": index, "claim_name": claim}
+
+
+def pending_artifact_volume_failure(document: dict[str, Any], *, missing_claim: str,
+                                    previous_uids: set[str]) -> dict[str, str] | None:
+    items = document.get("items")
+    if not isinstance(items, list):
+        raise DeploymentError("artifact-volume pod listing is malformed")
+    for pod in items:
+        if not isinstance(pod, dict):
+            raise DeploymentError("artifact-volume pod entry is malformed")
+        metadata = pod.get("metadata", {})
+        uid = metadata.get("uid")
+        name = metadata.get("name")
+        if uid in previous_uids:
+            continue
+        conditions = pod.get("status", {}).get("conditions", [])
+        failures = [condition for condition in conditions if isinstance(condition, dict)
+                    and condition.get("type") == "PodScheduled"
+                    and condition.get("status") == "False"
+                    and condition.get("reason") == "Unschedulable"
+                    and isinstance(condition.get("message"), str)
+                    and missing_claim in condition["message"]]
+        if len(failures) == 1 and all(isinstance(value, str) and value
+                                      for value in (uid, name)):
+            return {
+                "pod_name": name, "pod_uid": uid, "reason": "Unschedulable",
+                "message_sha256": hashlib.sha256(
+                    failures[0]["message"].encode()
+                ).hexdigest(),
+            }
+    return None
+
+
+def resource_quantity(value: Any, *, cpu: bool) -> int:
+    if not isinstance(value, str):
+        raise DeploymentError("Kubernetes resource quantity is malformed")
+    match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)([A-Za-z]*)", value)
+    if match is None:
+        raise DeploymentError("Kubernetes resource quantity is malformed")
+    factors = (
+        {"": 1_000_000_000, "m": 1_000_000, "u": 1_000, "n": 1}
+        if cpu else
+        {"": 1, "K": 1_000, "M": 1_000_000, "G": 1_000_000_000,
+         "Ki": 1024, "Mi": 1024 ** 2, "Gi": 1024 ** 3}
+    )
+    suffix = match.group(2)
+    if suffix not in factors:
+        raise DeploymentError("Kubernetes resource quantity suffix is unsupported")
+    try:
+        scaled = Decimal(match.group(1)) * factors[suffix]
+    except InvalidOperation as error:
+        raise DeploymentError("Kubernetes resource quantity is malformed") from error
+    if scaled != scaled.to_integral_value() or scaled < 0:
+        raise DeploymentError("Kubernetes resource quantity is not integral")
+    return int(scaled)
+
+
+def resource_usage_sample(document: dict[str, Any], *, allow_empty: bool = False) -> dict[str, Any]:
+    items = document.get("items")
+    if not isinstance(items, list) or len(items) > 16:
+        raise DeploymentError("Kubernetes resource metrics pod set is malformed")
+    cpu_nanocores = 0
+    memory_bytes = 0
+    containers = 0
+    pod_names = []
+    for pod in items:
+        name = pod.get("metadata", {}).get("name") if isinstance(pod, dict) else None
+        if not isinstance(name, str) or not name or name in pod_names:
+            raise DeploymentError("Kubernetes resource metrics pod identity differs")
+        pod_names.append(name)
+        entries = pod.get("containers") if isinstance(pod, dict) else None
+        if not isinstance(entries, list) or len(entries) > 8:
+            raise DeploymentError("Kubernetes resource metrics containers differ")
+        for container in entries:
+            usage = container.get("usage") if isinstance(container, dict) else None
+            if not isinstance(usage, dict) or set(usage) != {"cpu", "memory"}:
+                raise DeploymentError("Kubernetes resource metrics usage differs")
+            cpu_nanocores += resource_quantity(usage["cpu"], cpu=True)
+            memory_bytes += resource_quantity(usage["memory"], cpu=False)
+            containers += 1
+    if ((not allow_empty and (not items or containers == 0))
+            or (items and containers == 0)
+            or (containers > 0 and (cpu_nanocores <= 0 or memory_bytes <= 0))):
+        raise DeploymentError("Kubernetes resource metrics sample is empty")
+    return {
+        "sample_sha256": hashlib.sha256(canonical(document)).hexdigest(),
+        "sampled_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "pod_names": sorted(pod_names), "pod_count": len(items),
+        "container_count": containers,
+        "cpu_nanocores": cpu_nanocores, "memory_bytes": memory_bytes,
+    }
+
+
+def validate_resource_sample(value: Any, label: str,
+                             *, allow_empty: bool = False) -> dict[str, Any]:
+    fields = {
+        "sample_sha256", "sampled_at_utc", "pod_names", "pod_count",
+        "container_count", "cpu_nanocores", "memory_bytes",
+    }
+    if not isinstance(value, dict) or set(value) != fields:
+        raise DeploymentError(f"artifact-volume {label} resource fields differ")
+    exact_hex(value.get("sample_sha256"), 64, f"artifact-volume {label} sample SHA-256")
+    try:
+        timestamp = datetime.fromisoformat(value["sampled_at_utc"])
+    except (TypeError, ValueError) as error:
+        raise DeploymentError(f"artifact-volume {label} timestamp is malformed") from error
+    names = value.get("pod_names")
+    if (timestamp.tzinfo != timezone.utc or not isinstance(names, list)
+            or names != sorted(set(names))
+            or any(not isinstance(name, str) or not name for name in names)
+            or type(value.get("pod_count")) is not int
+            or value["pod_count"] != len(names)
+            or type(value.get("container_count")) is not int
+            or type(value.get("cpu_nanocores")) is not int
+            or type(value.get("memory_bytes")) is not int
+            or min(value["container_count"], value["cpu_nanocores"],
+                   value["memory_bytes"]) < 0
+            or not allow_empty and (
+                value["pod_count"] < 1 or value["container_count"] < 1
+                or value["cpu_nanocores"] < 1 or value["memory_bytes"] < 1
+            )
+            or value["container_count"] == 0
+            and (value["cpu_nanocores"] != 0 or value["memory_bytes"] != 0)):
+        raise DeploymentError(f"artifact-volume {label} resource evidence is malformed")
+    return value
+
+
+def validate_transition_trace(value: Any) -> list[dict[str, Any]]:
+    if (not isinstance(value, list) or len(value) != len(ARTIFACT_VOLUME_TRANSITIONS)
+            or [item.get("state") if isinstance(item, dict) else None for item in value]
+            != ARTIFACT_VOLUME_TRANSITIONS):
+        raise DeploymentError("artifact-volume transition sequence differs")
+    elapsed = []
+    observed = []
+    for item in value:
+        if not isinstance(item, dict) or set(item) != {
+            "state", "elapsed_ms", "observed_at_utc"
+        } or type(item.get("elapsed_ms")) not in {int, float} or not math.isfinite(
+            item["elapsed_ms"]
+        ) or item["elapsed_ms"] < 0:
+            raise DeploymentError("artifact-volume transition evidence is malformed")
+        try:
+            timestamp = datetime.fromisoformat(item["observed_at_utc"])
+        except (TypeError, ValueError) as error:
+            raise DeploymentError("artifact-volume transition timestamp is malformed") from error
+        if timestamp.tzinfo != timezone.utc:
+            raise DeploymentError("artifact-volume transition timestamp is not UTC")
+        elapsed.append(item["elapsed_ms"])
+        observed.append(timestamp)
+    if elapsed != sorted(elapsed) or observed != sorted(observed):
+        raise DeploymentError("artifact-volume transition timing is not ordered")
+    return value
+
+
+def collect_resource_usage(kubectl_base: list[str], *, namespace: str,
+                           selector: str, timeout: float,
+                           allow_empty: bool = False,
+                           expected_pods: set[str] | None = None) -> dict[str, Any]:
+    encoded = urllib.parse.quote(selector, safe="")
+    path = f"/apis/metrics.k8s.io/v1beta1/namespaces/{namespace}/pods?labelSelector={encoded}"
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        sample = resource_usage_sample(
+            run_json(kubectl_base + ["get", "--raw", path], min(timeout, 30)),
+            allow_empty=allow_empty,
+        )
+        if expected_pods is None or set(sample["pod_names"]) == expected_pods:
+            return sample
+        time.sleep(1)
+    raise DeploymentError("Kubernetes resource metrics pod set did not converge")
+
+
+def qualify_artifact_volume_loss(kubectl_base: list[str], *, service: str,
+                                 namespace: str, selector: str, contract: dict[str, Any],
+                                 previous_uids: set[str], timeout: float) -> dict[str, Any]:
+    started = time.monotonic()
+    transitions = []
+
+    def record_transition(state: str) -> None:
+        transitions.append({
+            "state": state,
+            "elapsed_ms": (time.monotonic() - started) * 1000,
+            "observed_at_utc": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+        })
+
+    record_transition("baseline_ready")
+    missing_claim = f"tritium-missing-{secrets.token_hex(6)}"
+    absence = prove_absent(
+        kubectl_base + ["get", f"pvc/{missing_claim}", "-o", "name"], min(timeout, 30)
+    )
+    record_transition("absence_verified")
+    path = (
+        f'/spec/template/spec/volumes/{contract["volume_index"]}'
+        "/persistentVolumeClaim/claimName"
+    )
+    fault_patch = [{"op": "replace", "path": path, "value": missing_claim}]
+    restore_patch = [{"op": "replace", "path": path, "value": contract["claim_name"]}]
+    fault_payload = canonical(fault_patch).decode().strip()
+    patched = False
+    observation = None
+    observation_ms = None
+    failure_resources = None
+    try:
+        run(kubectl_base + ["patch", f"deployment/{service}", "--type=json",
+                            f"--patch={fault_payload}"], min(timeout, 60))
+        patched = True
+        record_transition("fault_applied")
+        deadline = started + min(timeout, ARTIFACT_VOLUME_OBSERVATION_BUDGET_MS / 1000)
+        while time.monotonic() < deadline:
+            observation = pending_artifact_volume_failure(
+                run_json(kubectl_base + ["get", "pods", "-l", selector, "-o", "json"]),
+                missing_claim=missing_claim, previous_uids=previous_uids,
+            )
+            if observation is not None:
+                observation_ms = (time.monotonic() - started) * 1000
+                record_transition("unschedulable_observed")
+                failure_resources = collect_resource_usage(
+                    kubectl_base, namespace=namespace, selector=selector,
+                    timeout=min(timeout, 30), allow_empty=True,
+                )
+                break
+            time.sleep(1)
+        if observation is None:
+            raise DeploymentError("missing artifact PVC did not produce Unschedulable pod")
+    finally:
+        if patched:
+            run(kubectl_base + ["patch", f"deployment/{service}", "--type=json",
+                                f"--patch={canonical(restore_patch).decode().strip()}"],
+                min(timeout, 60))
+            record_transition("source_restored")
+    return {
+        "source_claim": contract["claim_name"], "missing_claim": missing_claim,
+        "volume_index": contract["volume_index"],
+        "absence": absence,
+        "fault_patch_sha256": hashlib.sha256(fault_payload.encode()).hexdigest(),
+        "observation_budget_ms": ARTIFACT_VOLUME_OBSERVATION_BUDGET_MS,
+        "observation_ms": observation_ms,
+        "pending": observation,
+        "failure_resources": failure_resources,
+        "transitions": transitions,
+        "_scenario_started_monotonic": started,
+    }
 
 
 def deployment_update_identity(document: dict[str, Any]) -> dict[str, int]:
@@ -692,11 +1029,7 @@ def collect_cuda_node_evidence(kubectl_base: list[str], *, node: str, image: str
 
 def metrics_snapshot(metrics: str) -> dict[str, Any]:
     values = {}
-    for name in (
-        "tritium_chat_requests_total", "tritium_tokens_out_total",
-        "tritium_worker_alive", "tritium_backend_faults_total",
-        "tritium_backend_faulted",
-    ):
+    for name in sorted(QUALIFICATION_METRICS):
         match = re.search(rf"(?m)^{name} ([0-9]+(?:\.[0-9]+)?)$", metrics)
         if match is None:
             raise DeploymentError(f"cluster metrics lack {name}")
@@ -709,6 +1042,25 @@ def metrics_snapshot(metrics: str) -> dict[str, Any]:
             or values["tritium_backend_faulted"] != 0):
         raise DeploymentError("cluster metrics report a backend fault")
     return {"sha256": hashlib.sha256(metrics.encode()).hexdigest(), "values": values}
+
+
+def validate_metrics_evidence(value: Any, label: str) -> dict[str, float]:
+    descriptor = f"{label} metrics" if label else "metrics"
+    if not isinstance(value, dict) or set(value) != {"sha256", "values"}:
+        raise DeploymentError(f"deployment {descriptor} fields differ")
+    exact_hex(value.get("sha256"), 64, f"{descriptor} SHA-256")
+    values = value.get("values")
+    if not isinstance(values, dict) or set(values) != QUALIFICATION_METRICS or any(
+        type(metric) not in {int, float} or not math.isfinite(metric) or metric < 0
+        for metric in values.values()
+    ) or values["tritium_chat_requests_total"] < 1 or (
+        values["tritium_tokens_out_total"] < 1
+    ) or values["tritium_worker_alive"] != 1 or any(
+        values[name] != 0
+        for name in ("tritium_backend_faults_total", "tritium_backend_faulted")
+    ):
+        raise DeploymentError(f"deployment {descriptor} evidence is malformed")
+    return values
 
 
 def deployed_revision(value: Any) -> int:
@@ -1268,6 +1620,7 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
         raise DeploymentError("namespace UID is absent")
     if run(helm_base + ["list", "--filter", f"^{args.release_name}$", "-q"]):
         raise DeploymentError("Helm release already exists")
+    run(kubectl_base + ["get", "--raw", "/apis/metrics.k8s.io/v1beta1"])
     if args.flavor == "cpu":
         run_json(kubectl_base + ["get", "customresourcedefinition/scaledobjects.keda.sh",
                                   "-o", "json"])
@@ -1275,7 +1628,12 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
                                   "-o", "json"])
         run_json(kubectl_base + ["get", "namespace", args.monitoring_namespace, "-o", "json"])
         run(kubectl_base + ["get", "--raw", "/apis/external.metrics.k8s.io/v1beta1"])
-    run_json(kubectl_base + ["get", "persistentvolumeclaim", args.source_pvc, "-o", "json"])
+    source_pvc_identity = pvc_identity(
+        run_json(kubectl_base + [
+            "get", "persistentvolumeclaim", args.source_pvc, "-o", "json"
+        ]),
+        args.source_pvc,
+    )
     secret_doc = run_json(kubectl_base + ["get", "secret", args.auth_secret, "-o", "json"])
     encoded_token = secret_doc.get("data", {}).get(args.auth_key)
     try:
@@ -1351,6 +1709,7 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
             deployment, image=args.image, manifest_sha256=manifest_sha, flavor=args.flavor
         )
         watchdog_policy = watchdog_contract(deployment)
+        artifact_volume = artifact_volume_contract(deployment)
         update_before = deployment_update_identity(deployment)
         if update_before["rate_limit_burst"] != 8:
             raise DeploymentError("initial deployment rate-limit burst differs")
@@ -1528,6 +1887,100 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
             stop_forward(restart_process)
         if restart_startup != startup:
             raise DeploymentError("restart changed immutable startup receipt")
+        artifact_baseline_resources = collect_resource_usage(
+            kubectl_base, namespace=args.namespace, selector=selector,
+            timeout=min(args.timeout, 30),
+            expected_pods={pod["name"] for pod in restarted["pods"]},
+        )
+        artifact_fault = qualify_artifact_volume_loss(
+            kubectl_base, service=service, namespace=args.namespace, selector=selector,
+            contract=artifact_volume,
+            previous_uids={pod["uid"] for pod in restarted["pods"]},
+            timeout=args.timeout,
+        )
+        run(kubectl_base + ["rollout", "status", f"deployment/{service}",
+                            f"--timeout={timeout_value}"], args.timeout + 30)
+        artifact_recovered = pod_snapshot(
+            run_json(kubectl_base + ["get", "pods", "-l", selector, "-o", "json"]),
+            args.flavor,
+        )
+        artifact_recovered_resources = collect_resource_usage(
+            kubectl_base, namespace=args.namespace, selector=selector,
+            timeout=min(args.timeout, 30),
+            expected_pods={pod["name"] for pod in artifact_recovered["pods"]},
+        )
+        artifact_port = free_port()
+        artifact_url = f"http://127.0.0.1:{artifact_port}"
+        artifact_process, artifact_ready = port_forward(
+            kubectl_base + ["port-forward", f"service/{service}",
+                            f"{artifact_port}:8080", "--address", "127.0.0.1"],
+            time.monotonic() + args.timeout, artifact_url, token,
+        )
+        artifact_request = {
+            "model": model_id,
+            "messages": [{"role": "user", "content": args.prompt}],
+            "temperature": 0,
+            "max_tokens": 1,
+        }
+        try:
+            artifact_startup = validate_ready(
+                artifact_ready, revision, args.flavor, args.profile,
+                manifest_id["blake3"], args.release,
+            )
+            artifact_generation = request_json(
+                artifact_url + "/v1/chat/completions", token,
+                body=artifact_request,
+                timeout=args.request_timeout,
+            )
+            if (not isinstance(artifact_generation.get("choices"), list)
+                    or len(artifact_generation["choices"]) != 1):
+                raise DeploymentError("artifact-volume recovery generation differs")
+            artifact_metrics = metrics_snapshot(request(
+                artifact_url + "/metrics", token, timeout=args.request_timeout
+            ).decode("utf-8"))
+        finally:
+            stop_forward(artifact_process)
+        if artifact_startup != startup:
+            raise DeploymentError("artifact-volume recovery changed startup receipt")
+        artifact_scenario_started = artifact_fault.pop("_scenario_started_monotonic")
+        artifact_fault["transitions"].append({
+            "state": "recovery_ready",
+            "elapsed_ms": (time.monotonic() - artifact_scenario_started) * 1000,
+            "observed_at_utc": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+        })
+        artifact_failure_resources = artifact_fault.pop("failure_resources")
+        artifact_fault.update({
+            "recovered": artifact_recovered,
+            "cleanup": {"status": "restored", "source_claim": args.source_pvc},
+            "startup_receipt": artifact_startup,
+            "generation_response_sha256": hashlib.sha256(
+                canonical(artifact_generation)
+            ).hexdigest(),
+            "request": request_evidence(
+                model_id, args.prompt, temperature=0, max_tokens=1
+            ),
+            "metrics": artifact_metrics,
+            "resources": {
+                "baseline": artifact_baseline_resources,
+                "failure": artifact_failure_resources,
+                "recovered": artifact_recovered_resources,
+                "high_water": {
+                    "cpu_nanocores": max(
+                        artifact_baseline_resources["cpu_nanocores"],
+                        artifact_failure_resources["cpu_nanocores"],
+                        artifact_recovered_resources["cpu_nanocores"],
+                    ),
+                    "memory_bytes": max(
+                        artifact_baseline_resources["memory_bytes"],
+                        artifact_failure_resources["memory_bytes"],
+                        artifact_recovered_resources["memory_bytes"],
+                    ),
+                },
+            },
+        })
+        update_before = deployment_update_identity(run_json(
+            kubectl_base + ["get", f"deployment/{service}", "-o", "json"]
+        ))
         update_values = ["--set", "requestLimits.rateLimitBurst=9"]
         run(helm_base + ["upgrade", args.release_name, str(chart), "--atomic", "--wait",
                          "--timeout", timeout_value] + values + update_values,
@@ -1550,7 +2003,7 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
             run_json(kubectl_base + ["get", "pods", "-l", selector, "-o", "json"]),
             args.flavor,
         )
-        if {pod["uid"] for pod in restarted["pods"]} & {
+        if {pod["uid"] for pod in artifact_recovered["pods"]} & {
             pod["uid"] for pod in updated["pods"]
         }:
             raise DeploymentError("successful update retained the previous pod UID")
@@ -1570,7 +2023,8 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
             stop_forward(update_process)
         if update_startup != startup:
             raise DeploymentError("successful update changed immutable startup receipt")
-        observed_pods = initial["pods"] + restarted["pods"] + updated["pods"]
+        observed_pods = (initial["pods"] + restarted["pods"]
+                         + artifact_recovered["pods"] + updated["pods"])
         if scale is not None:
             observed_pods += scale["scaled_pods"]["pods"]
         node_names = {pod["node"] for pod in observed_pods}
@@ -1731,9 +2185,12 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
         "tools": {"kubectl_sha256": sha256(kubectl), "helm_sha256": sha256(helm_bin),
                   "helm_version": run([str(helm_bin), "version", "--short"])},
         "workload": {"release_name": args.release_name, "deployment_uid": deployment_uid,
-                     "qualification_lock_uid": lock_uid,
+                     "qualification_lock_uid": lock_uid, "source_pvc": args.source_pvc,
+                     "source_pvc_identity": source_pvc_identity,
+                     "model_id": model_id,
                      "initial": initial, "restarted": restarted, "updated": updated,
                      "watchdog_replacement": watchdog,
+                     "artifact_volume_loss": artifact_fault,
                      "startup_receipt": startup, "restart_startup_receipt": restart_startup,
                      "update_startup_receipt": update_startup,
                      "update_strategy": "Recreate" if args.flavor == "cuda" else "RollingUpdate",
@@ -1868,8 +2325,9 @@ def validate_receipt(receipt: dict[str, Any], *, chart_path: Path, image_path: P
     workload = receipt.get("workload")
     if not isinstance(workload, dict) or set(workload) != {
         "release_name", "deployment_uid", "qualification_lock_uid",
+        "source_pvc", "source_pvc_identity", "model_id",
         "initial", "restarted", "updated",
-        "watchdog_replacement",
+        "watchdog_replacement", "artifact_volume_loss",
         "startup_receipt", "restart_startup_receipt", "update_startup_receipt",
         "update_strategy", "update_config", "rollback_startup_receipt", "metrics",
         "restart_recovery", "scale", "helm_history",
@@ -1877,9 +2335,14 @@ def validate_receipt(receipt: dict[str, Any], *, chart_path: Path, image_path: P
         "failed_upgrade_output_sha256",
     }:
         raise DeploymentError("deployment workload fields differ")
-    for key in ("deployment_uid", "qualification_lock_uid", "release_name"):
+    for key in (
+        "deployment_uid", "qualification_lock_uid", "release_name", "source_pvc", "model_id"
+    ):
         if not isinstance(workload.get(key), str) or not workload[key]:
             raise DeploymentError("deployment workload identity is malformed")
+    if SAFE_NAME.fullmatch(workload["source_pvc"]) is None:
+        raise DeploymentError("deployment source PVC identity is malformed")
+    validate_pvc_identity(workload.get("source_pvc_identity"), workload["source_pvc"])
     exact_hex(workload.get("failed_upgrade_output_sha256"), 64, "failed-upgrade SHA-256")
     exact_hex(workload.get("failed_manifest_sha256"), 64, "failed manifest SHA-256")
     failed_image = workload.get("failed_image_digest")
@@ -1980,6 +2443,125 @@ def validate_receipt(receipt: dict[str, Any], *, chart_path: Path, image_path: P
     if (watchdog["pod_uid"] not in initial_uids
             or initial["pods"][0]["restarts"] < watchdog["restart_count_after"]):
         raise DeploymentError("deployment watchdog pod differs from initial snapshot")
+    artifact_fault = workload.get("artifact_volume_loss")
+    artifact_fields = {
+        "source_claim", "missing_claim", "volume_index", "absence",
+        "fault_patch_sha256", "observation_budget_ms", "observation_ms", "pending",
+        "recovered", "cleanup", "startup_receipt", "generation_response_sha256",
+        "metrics", "resources", "request", "transitions",
+    }
+    if (not isinstance(artifact_fault, dict) or set(artifact_fault) != artifact_fields
+            or artifact_fault.get("source_claim") != workload["source_pvc"]
+            or not isinstance(artifact_fault.get("missing_claim"), str)
+            or SAFE_NAME.fullmatch(artifact_fault["missing_claim"]) is None
+            or not artifact_fault["missing_claim"].startswith("tritium-missing-")
+            or artifact_fault["missing_claim"] == artifact_fault["source_claim"]
+            or artifact_fault.get("volume_index") != 0
+            or artifact_fault.get("observation_budget_ms")
+            != ARTIFACT_VOLUME_OBSERVATION_BUDGET_MS
+            or type(artifact_fault.get("observation_ms")) not in {int, float}
+            or not math.isfinite(artifact_fault["observation_ms"])
+            or not 0 < artifact_fault["observation_ms"]
+            <= ARTIFACT_VOLUME_OBSERVATION_BUDGET_MS):
+        raise DeploymentError("deployment artifact-volume evidence is malformed")
+    absence = artifact_fault.get("absence")
+    if absence != {
+        "status": "NotFound", "output_sha256": hashlib.sha256(b"").hexdigest()
+    }:
+        raise DeploymentError("deployment missing artifact PVC evidence differs")
+    patch_payload = canonical([{
+        "op": "replace",
+        "path": "/spec/template/spec/volumes/0/persistentVolumeClaim/claimName",
+        "value": artifact_fault["missing_claim"],
+    }]).decode().strip()
+    if artifact_fault.get("fault_patch_sha256") != hashlib.sha256(
+        patch_payload.encode()
+    ).hexdigest():
+        raise DeploymentError("deployment artifact-volume fault patch differs")
+    pending = artifact_fault.get("pending")
+    if (not isinstance(pending, dict) or set(pending) != {
+            "pod_name", "pod_uid", "reason", "message_sha256"
+        } or any(not isinstance(pending.get(key), str) or not pending[key]
+                 for key in ("pod_name", "pod_uid"))
+            or pending.get("reason") != "Unschedulable"
+            or pending["pod_uid"] in {pod["uid"] for pod in restarted["pods"]}):
+        raise DeploymentError("deployment artifact-volume pending pod differs")
+    exact_hex(pending.get("message_sha256"), 64, "artifact-volume scheduler message SHA-256")
+    artifact_recovered = validate_receipt_snapshot(
+        artifact_fault.get("recovered"), "artifact-volume recovered"
+    )
+    if pending["pod_uid"] in {pod["uid"] for pod in artifact_recovered["pods"]}:
+        raise DeploymentError("deployment retained artifact-volume failure pod")
+    if (receipt["flavor"] == "cuda"
+            and {pod["uid"] for pod in restarted["pods"]}
+            & {pod["uid"] for pod in artifact_recovered["pods"]}):
+        raise DeploymentError("CUDA artifact-volume recovery retained old pod")
+    validate_ready(
+        {"status": "ready", "release_gate": "production_artifact_admitted",
+         "startup_receipt": artifact_fault.get("startup_receipt")},
+        revision, receipt["flavor"], receipt["profile"], manifest["blake3"], release,
+    )
+    if artifact_fault["startup_receipt"] != workload["startup_receipt"]:
+        raise DeploymentError("deployment artifact-volume recovery changed startup receipt")
+    if artifact_fault.get("cleanup") != {
+        "status": "restored", "source_claim": workload["source_pvc"]
+    }:
+        raise DeploymentError("deployment artifact-volume cleanup differs")
+    exact_hex(
+        artifact_fault.get("generation_response_sha256"), 64,
+        "artifact-volume generation response SHA-256",
+    )
+    request = artifact_fault.get("request")
+    request_fields = {
+        "model", "prompt_sha256", "prompt_bytes", "temperature", "max_tokens",
+        "descriptor_sha256",
+    }
+    if (not isinstance(request, dict) or set(request) != request_fields
+            or request.get("model") != workload["model_id"]
+            or type(request.get("prompt_bytes")) is not int
+            or not 0 < request["prompt_bytes"] <= 1024 * 1024
+            or type(request.get("temperature")) is not int
+            or type(request.get("max_tokens")) is not int
+            or request["temperature"] != 0 or request["max_tokens"] != 1):
+        raise DeploymentError("deployment artifact-volume request evidence is malformed")
+    exact_hex(request.get("prompt_sha256"), 64, "artifact-volume prompt SHA-256")
+    descriptor = {key: request[key] for key in request_fields - {"descriptor_sha256"}}
+    if request.get("descriptor_sha256") != hashlib.sha256(canonical(descriptor)).hexdigest():
+        raise DeploymentError("deployment artifact-volume request descriptor differs")
+    transitions = validate_transition_trace(artifact_fault.get("transitions"))
+    if transitions[-1]["elapsed_ms"] > receipt["duration_ms"]:
+        raise DeploymentError("deployment artifact-volume transitions exceed run duration")
+    resources = artifact_fault.get("resources")
+    if not isinstance(resources, dict) or set(resources) != {
+        "baseline", "failure", "recovered", "high_water"
+    }:
+        raise DeploymentError("deployment artifact-volume resource fields differ")
+    baseline_resources = validate_resource_sample(resources["baseline"], "baseline")
+    failure_resources = validate_resource_sample(
+        resources["failure"], "failure", allow_empty=True
+    )
+    recovered_resources = validate_resource_sample(resources["recovered"], "recovered")
+    if (set(baseline_resources["pod_names"])
+            != {pod["name"] for pod in restarted["pods"]}
+            or not set(failure_resources["pod_names"]).issubset(
+                {pod["name"] for pod in restarted["pods"]}
+            )
+            or set(recovered_resources["pod_names"])
+            != {pod["name"] for pod in artifact_recovered["pods"]}):
+        raise DeploymentError("deployment artifact-volume resource pod identity differs")
+    sample_times = [datetime.fromisoformat(sample["sampled_at_utc"]) for sample in (
+        baseline_resources, failure_resources, recovered_resources
+    )]
+    if sample_times != sorted(sample_times):
+        raise DeploymentError("deployment artifact-volume resource timing differs")
+    expected_high_water = {
+        name: max(sample[name] for sample in (
+            baseline_resources, failure_resources, recovered_resources
+        ))
+        for name in ("cpu_nanocores", "memory_bytes")
+    }
+    if resources["high_water"] != expected_high_water:
+        raise DeploymentError("deployment artifact-volume high-water evidence differs")
     validate_ready(
         {"status": "ready", "release_gate": "production_artifact_admitted",
          "startup_receipt": workload.get("update_startup_receipt")},
@@ -2010,24 +2592,7 @@ def validate_receipt(receipt: dict[str, Any], *, chart_path: Path, image_path: P
     if workload["rollback_startup_receipt"] != workload["startup_receipt"]:
         raise DeploymentError("deployment rollback changed startup receipt")
     metrics = workload.get("metrics")
-    if not isinstance(metrics, dict) or set(metrics) != {"sha256", "values"}:
-        raise DeploymentError("deployment metrics evidence fields differ")
-    exact_hex(metrics.get("sha256"), 64, "metrics SHA-256")
-    metric_values = metrics.get("values")
-    expected_metrics = {
-        "tritium_chat_requests_total", "tritium_tokens_out_total", "tritium_worker_alive",
-        "tritium_backend_faults_total", "tritium_backend_faulted",
-    }
-    if not isinstance(metric_values, dict) or set(metric_values) != expected_metrics or any(
-        type(value) not in {int, float} or not math.isfinite(value) or value < 0
-        for value in metric_values.values()
-    ) or metric_values["tritium_chat_requests_total"] < 1 or (
-        metric_values["tritium_tokens_out_total"] < 1
-    ) or metric_values["tritium_worker_alive"] != 1 or any(
-        metric_values[name] != 0
-        for name in ("tritium_backend_faults_total", "tritium_backend_faulted")
-    ):
-        raise DeploymentError("deployment metrics evidence is malformed")
+    validate_metrics_evidence(metrics, "")
     recovery = workload.get("restart_recovery")
     if not isinstance(recovery, dict) or set(recovery) != {
         "generation_response_sha256", "metrics"
@@ -2037,40 +2602,9 @@ def validate_receipt(receipt: dict[str, Any], *, chart_path: Path, image_path: P
         recovery.get("generation_response_sha256"), 64,
         "restart generation response SHA-256",
     )
-    recovery_metrics = recovery.get("metrics")
-    if not isinstance(recovery_metrics, dict) or set(recovery_metrics) != {
-        "sha256", "values"
-    }:
-        raise DeploymentError("deployment restart metrics fields differ")
-    exact_hex(recovery_metrics.get("sha256"), 64, "restart metrics SHA-256")
-    recovery_values = recovery_metrics.get("values")
-    if not isinstance(recovery_values, dict) or set(recovery_values) != expected_metrics or any(
-        type(value) not in {int, float} or not math.isfinite(value) or value < 0
-        for value in recovery_values.values()
-    ) or recovery_values["tritium_chat_requests_total"] < 1 or (
-        recovery_values["tritium_tokens_out_total"] < 1
-    ) or recovery_values["tritium_worker_alive"] != 1 or any(
-        recovery_values[name] != 0
-        for name in ("tritium_backend_faults_total", "tritium_backend_faulted")
-    ):
-        raise DeploymentError("deployment restart metrics evidence is malformed")
-    watchdog_metrics = watchdog.get("metrics")
-    if not isinstance(watchdog_metrics, dict) or set(watchdog_metrics) != {
-        "sha256", "values"
-    }:
-        raise DeploymentError("deployment watchdog metrics fields differ")
-    exact_hex(watchdog_metrics.get("sha256"), 64, "watchdog metrics SHA-256")
-    watchdog_values = watchdog_metrics.get("values")
-    if not isinstance(watchdog_values, dict) or set(watchdog_values) != expected_metrics or any(
-        type(value) not in {int, float} or not math.isfinite(value) or value < 0
-        for value in watchdog_values.values()
-    ) or watchdog_values["tritium_chat_requests_total"] < 1 or (
-        watchdog_values["tritium_tokens_out_total"] < 1
-    ) or watchdog_values["tritium_worker_alive"] != 1 or any(
-        watchdog_values[name] != 0
-        for name in ("tritium_backend_faults_total", "tritium_backend_faulted")
-    ):
-        raise DeploymentError("deployment watchdog metrics evidence is malformed")
+    validate_metrics_evidence(recovery.get("metrics"), "restart")
+    validate_metrics_evidence(watchdog.get("metrics"), "watchdog")
+    validate_metrics_evidence(artifact_fault.get("metrics"), "artifact-volume")
     if receipt["flavor"] == "cpu":
         scale_receipt = validate_scale_receipt(workload.get("scale"))
         expected_query = (
@@ -2096,7 +2630,8 @@ def validate_receipt(receipt: dict[str, Any], *, chart_path: Path, image_path: P
     elif workload.get("scale") is not None:
         raise DeploymentError("CUDA deployment cannot contain CPU KEDA scale evidence")
     validate_helm_history(workload.get("helm_history"), workload["prior_helm_revision"])
-    observed_pods = initial["pods"] + restarted["pods"] + updated["pods"]
+    observed_pods = (initial["pods"] + restarted["pods"]
+                     + artifact_recovered["pods"] + updated["pods"])
     if receipt["flavor"] == "cpu":
         observed_pods += workload["scale"]["scaled_pods"]["pods"]
     node_names = {pod["node"] for pod in observed_pods}
