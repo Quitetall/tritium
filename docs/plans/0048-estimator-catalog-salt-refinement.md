@@ -73,17 +73,24 @@ an explicit dense/QAT shell with tied compact storage and exact hard-state
 parity. Rehashed ancestry, latent masters, estimator state, invalid B3/scales,
 unknown files, corrupt payloads and wrong shells fail closed. Convolution
 lowering and public HF checkpoint registration remain open; none are relabeled
-as PTQ.
+as PTQ. The post-PTQ refinement lifecycle is implemented: versioned scale-only
+and hard-PV/S34 recipes consume an immutable PTQ/refinement parent, use bounded
+row-wise second-order fitting, optimize hard candidates against held-out
+teacher loss, and emit a strict child conversion plus complete ancestry.
+Training/validation batches are individually hashed, aggregate-bound, and
+cross-split overlap is rejected. Strict reload and atomic export rehash the
+parent, evidence, child algorithm/recipe, S34 topology, payloads, and directory
+publication.
 
-- Remove refinement from `TernaryConfig.ptq`; reject ambiguous legacy non-none
+- [x] Remove refinement from `TernaryConfig.ptq`; reject ambiguous legacy non-none
   refinement values instead of silently migrating them.
-- Implement `refine(parent, teacher, training, validation, config, work_dir)`.
+- [x] Implement `refine(parent, teacher, training, validation, config, work_dir)`.
   Scale-only, true alternating hard PV and S34 refinement are distinct child
   work identities and result discriminants.
-- Bind every child to its immediate parent and complete ancestry. Scale-only
+- [x] Bind every child to its immediate parent and complete ancestry. Scale-only
   freezes trits/allocation; hard PV may change assignments only under its
   declared structure and frozen nested-prefix constraints.
-- Export the hard package and prove reload parity; no latent residual may enter
+- [x] Export the hard package and prove reload parity; no latent residual may enter
   a PTQ claim. QAT checkpoint, QAT export, PTQ, scale-only and hard-PV artifacts
   remain separately typed.
 - Run matched-physical-byte ablations against RTN/AbsMean, GPTQ/AWQ-style

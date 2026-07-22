@@ -26,6 +26,17 @@ def test_ptq_recipe_and_refinement_are_distinct_versioned_schemas():
     assert RefinementConfig.from_dict(hard_pv.to_dict()) == hard_pv
     assert scale_only.kind == "scale-only"
     assert hard_pv.kind == "hard-pv"
+    assert RefinementConfig.from_dict(
+        {"schema_version": 1, "kind": "scale-only", "structure": "dense"}
+    ) == RefinementConfig.scale_only()
+    with pytest.raises(ValueError, match="legacy RefinementConfig"):
+        RefinementConfig.from_dict(
+            {"schema_version": 1, "kind": "unknown", "structure": "dense"}
+        )
+    with pytest.raises(ValueError, match="legacy RefinementConfig"):
+        RefinementConfig.from_dict(
+            {"schema_version": 1, "kind": "scale-only", "structure": "s34"}
+        )
 
     with pytest.raises(TypeError):
         TernaryConfig.ptq(profile="compact-v1", refinement="hard-pv")

@@ -22,6 +22,7 @@ from .. import _tritium
 from .config import RefinementConfig
 from .errors import TritiumError
 from .module_artifacts import (
+    FittedWeight,
     ModuleQuantizationResult,
     WeightCheckpointWriter,
     load_module_conversion,
@@ -84,8 +85,25 @@ class RefinementResult:
     def weight_names(self) -> Tuple[str, ...]:
         return self.conversion.weight_names
 
-    def weight(self, path: str):
-        return self.conversion.weight(path)
+    def weight(self, path: str) -> FittedWeight:
+        """Load one child weight while restoring its refinement structure."""
+
+        weight = self.conversion.weight(path)
+        planes = tuple(
+            TernaryPlane(
+                trits=plane.trits,
+                scales=plane.scales,
+                group_size=plane.group_size,
+                structure=self.config.structure,
+            )
+            for plane in weight.planes
+        )
+        return FittedWeight(
+            path=weight.path,
+            aliases=weight.aliases,
+            planes=planes,
+            weighted_mse=weight.weighted_mse,
+        )
 
     def load_model(self, model: nn.Module, *, inplace: bool = False) -> nn.Module:
         """Bind the hard child to an exact dense source shell."""
@@ -1023,7 +1041,30 @@ def export_refinement(
         )
         shutil.copyfile(current.artifact_dir / _MANIFEST, staging / _MANIFEST)
         load_refinement(staging)
+        for root, directories, files in os.walk(staging, topdown=False):
+            for name in files:
+                descriptor = os.open(Path(root) / name, os.O_RDONLY)
+                try:
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+            for name in directories:
+                descriptor = os.open(Path(root) / name, os.O_RDONLY)
+                try:
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+        descriptor = os.open(staging, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
         _tritium.publish_directory_noreplace(str(staging), str(target))
+        descriptor = os.open(parent, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
         published = True
     finally:
         if not published:
