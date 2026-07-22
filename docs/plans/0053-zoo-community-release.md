@@ -253,7 +253,9 @@ registry mode now binds the exact candidate, hard-codes every ADR 0033 gate,
 admits artifact-bound CUDA training, installed-wheel clean-install, complete
 candidate-bound ABI3 matrix, offline crate-archive and clean offline npm-archive
 schemas, emits human and JSON blocker reports, and refuses `LOCAL_RC_READY` for
-empty or partial evidence. Remaining
+empty or partial evidence. Npm admission landed in `cb34670` and `57a23ba`, but
+the aggregate package gate still requires its clean-install, compatibility-matrix
+and crate-archive receipts to coexist in the exact candidate registry. Remaining
 receipt-kind validators and generated-claim drift checks must land before every
 model-zoo, package, browser, serving, deployment, signing and second-machine
 receipt can produce `LOCAL_RC_READY`.

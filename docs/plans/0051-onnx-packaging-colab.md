@@ -283,6 +283,11 @@ receipt after a source-free offline install, 114-vector WASM conformance and
 strict TypeScript consumer check. Independent admission rehashes SHA-256 and npm
 SHA-512 integrity, requires the frozen 13-file inventory and clean WASM Git
 identity, and matches exact bytes to the candidate `npm-archive` artifact.
+This landed in `cb34670` with bounded streaming artifact validation in
+`57a23ba`. A clean detached run at `cb34670` produced and re-admitted receipt
+`sha256:87d018deda50ba199a15b1ce523ddeff87546e32ccbeea142a3945f6a3785bcf`;
+this closes only the npm evidence kind, not the aggregate package or public
+activation gates.
 The exact npm archive verifier now emits its own deterministic CycloneDX 1.6
 document and content-addressed qualification receipt into retained evidence. It
 binds archive SHA-256/bytes and SHA-512 integrity, package/version, clean source
