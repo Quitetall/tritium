@@ -279,6 +279,113 @@ def entry(
 
 
 class ReleaseEvidenceStatusTests(unittest.TestCase):
+    def test_estimator_refinement_ablation_requires_exact_lineage(self):
+        with tempfile.TemporaryDirectory() as raw:
+            candidate, document, old_artifact, evidence_root = release_fixture(Path(raw))
+            wheel = old_artifact
+            parent_model = candidate.parent / "near-ptq.salt"
+            s34_model = candidate.parent / "s34.salt"
+            parent_model.write_bytes(b"near PTQ")
+            s34_model.write_bytes(b"S34 child")
+            document["artifacts"] = [
+                {
+                    "id": "wheel", "kind": "python-wheel", "path": wheel.name,
+                    "identity": {"sha256": sha256(wheel), "bytes": wheel.stat().st_size},
+                    "sbom": {}, "provenance": {},
+                },
+                {
+                    "id": "near", "kind": "model-bundle", "path": parent_model.name,
+                    "identity": {
+                        "sha256": sha256(parent_model), "bytes": parent_model.stat().st_size,
+                    },
+                    "sbom": {}, "provenance": {},
+                },
+                {
+                    "id": "s34", "kind": "model-bundle", "path": s34_model.name,
+                    "identity": {
+                        "sha256": sha256(s34_model), "bytes": s34_model.stat().st_size,
+                    },
+                    "sbom": {}, "provenance": {},
+                },
+            ]
+            candidate.write_bytes(canonical(document) + b"\n")
+            wheel_artifact = {
+                "id": "wheel", "kind": "python-wheel", "name": wheel.name,
+                "bytes": wheel.stat().st_size, "sha256": sha256(wheel),
+            }
+            near_artifact = {
+                "id": "near", "kind": "model-bundle", "name": parent_model.name,
+                "bytes": parent_model.stat().st_size, "sha256": sha256(parent_model),
+            }
+            s34_artifact = {
+                "id": "s34", "kind": "model-bundle", "name": s34_model.name,
+                "bytes": s34_model.stat().st_size, "sha256": sha256(s34_model),
+            }
+            conversion = {
+                "receipt_id": "sha256:" + "1" * 64, "run_id": "conversion-er-1",
+                "tracks": [
+                    {"artifact": near_artifact}, {"artifact": near_artifact},
+                    {"artifact": near_artifact},
+                ],
+            }
+            estimator = {
+                "receipt_id": "sha256:" + "2" * 64, "run_id": "estimator-1",
+                "anchor_artifact": wheel_artifact,
+            }
+            quality = {
+                "receipt_id": "sha256:" + "3" * 64, "run_id": "quality-er-1",
+                "artifact": near_artifact, "evaluation_id": "sha256:" + "9" * 64,
+            }
+            refinement = {
+                "receipt_id": "sha256:" + "4" * 64, "run_id": "refinement-1",
+                "anchor_artifact": s34_artifact, "parent_artifact_id": "near",
+                "children": [{"artifact": s34_artifact}],
+            }
+            ablation = {
+                "receipt_id": "sha256:" + "5" * 64, "run_id": "ablation-1",
+                "anchor_artifact": s34_artifact, "model_artifact_id": "s34",
+                "evaluation_id": quality["evaluation_id"],
+            }
+            receipts = {
+                "conversion-refinement": conversion, "estimator-validation": estimator,
+                "quality": quality, "refinement": refinement,
+                "baseline-ablation": ablation,
+            }
+            entries = []
+            for kind, receipt in receipts.items():
+                path = evidence_root / f"{kind}.json"
+                path.write_bytes(b"{}\n")
+                parents = {
+                    "quality": [conversion["receipt_id"]],
+                    "refinement": [conversion["receipt_id"], estimator["receipt_id"]],
+                    "baseline-ablation": [
+                        conversion["receipt_id"], refinement["receipt_id"],
+                        quality["receipt_id"],
+                    ],
+                }.get(kind, [])
+                item = entry(path, receipt, kind=kind, parents=parents)
+                item["artifact_id"] = (
+                    "wheel" if kind == "estimator-validation"
+                    else "s34" if kind in {"refinement", "baseline-ablation"}
+                    else "near"
+                )
+                entries.append(item)
+            registry_path = evidence_root / "registry.json"
+            registry(registry_path, candidate, entries)
+            validators = {
+                "validate_flagship_conversion": mock.Mock(return_value=conversion),
+                "validate_estimators": mock.Mock(return_value=estimator),
+                "validate_flagship_quality": mock.Mock(return_value=quality),
+                "validate_refinement": mock.Mock(return_value=refinement),
+                "validate_baseline_ablation": mock.Mock(return_value=ablation),
+            }
+            with mock.patch.dict(evaluate.__globals__, validators):
+                report = evaluate(registry_path, candidate, document)
+            row = next(
+                item for item in report["rows"] if item["id"] == "estimators-refinement"
+            )
+            self.assertEqual(row["status"], "PASS")
+
     def test_backend_manifest_requires_candidate_training_bundle(self):
         with tempfile.TemporaryDirectory() as raw:
             candidate, document, artifact, evidence_root = release_fixture(Path(raw))

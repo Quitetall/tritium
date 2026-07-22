@@ -100,6 +100,20 @@ package.
 - Run matched-physical-byte ablations against RTN/AbsMean, GPTQ/AWQ-style
   second-order baselines and the frozen SALT variants.
 
+Release admission now has three separate fail-closed contracts.
+`tritium.estimator-catalog-qualification.v1` binds the exact candidate wheel and
+all seven built-ins, hard trits/scales, gradients/state/ties/coverage and
+external-plugin rejection behavior. `tritium.refinement-qualification.v1`
+requires disjoint source-bound splits and distinct scale-only, hard-PV and S34
+children with exact ancestry, held-out hard candidates, G128 native SALT
+packages, strict reload and no latent residuals; it must descend from the
+flagship NearLossless PTQ artifact and the estimator receipt.
+`tritium.baseline-ablation-qualification.v1` freezes RTN/AbsMean,
+GPTQ/AWQ-style, SALT V1 and three mechanism ablations, recomputes matched-byte
+claim eligibility, and binds the exact refined model/evaluation lineage. These
+are validators only; checkpoint-scale empirical refinement/ablation receipts
+remain open.
+
 ## Verification
 
 ```bash

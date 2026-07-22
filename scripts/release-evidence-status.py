@@ -98,6 +98,13 @@ TRAINING_PERFORMANCE_RECEIPT = runpy.run_path(
 )
 validate_training_performance = TRAINING_PERFORMANCE_RECEIPT["validate"]
 TrainingPerformanceError = TRAINING_PERFORMANCE_RECEIPT["TrainingPerformanceError"]
+ESTIMATOR_REFINEMENT_RECEIPT = runpy.run_path(
+    Path(__file__).with_name("verify-estimator-refinement-receipt.py")
+)
+validate_estimators = ESTIMATOR_REFINEMENT_RECEIPT["validate_estimators"]
+validate_refinement = ESTIMATOR_REFINEMENT_RECEIPT["validate_refinement"]
+validate_baseline_ablation = ESTIMATOR_REFINEMENT_RECEIPT["validate_ablation"]
+EstimatorRefinementError = ESTIMATOR_REFINEMENT_RECEIPT["EstimatorRefinementError"]
 
 SCHEMA = "tritium.release-evidence-registry.v1"
 REPORT_SCHEMA = "tritium.release-gate-report.v1"
@@ -129,6 +136,9 @@ KNOWN_KINDS = frozenset(
         "onnx-inference",
         "backend-manifest",
         "performance",
+        "estimator-validation",
+        "refinement",
+        "baseline-ablation",
     }
 )
 HEX = frozenset("0123456789abcdef")
@@ -341,6 +351,7 @@ def evaluate(
             }
             else "onnx-bundle" if kind == "onnx-inference"
             else "training-receipt-bundle" if kind in {"backend-manifest", "performance"}
+            else "model-bundle" if kind in {"refinement", "baseline-ablation"}
             else "python-wheel"
         )
         if artifact.get("kind") != expected_artifact_kind:
@@ -454,6 +465,18 @@ def evaluate(
                 receipt = validate_training_performance(
                     receipt_path, revision, release, candidate
                 )
+            elif kind == "estimator-validation":
+                receipt = validate_estimators(
+                    receipt_path, revision, release, candidate
+                )
+            elif kind == "refinement":
+                receipt = validate_refinement(
+                    receipt_path, revision, release, candidate
+                )
+            elif kind == "baseline-ablation":
+                receipt = validate_baseline_ablation(
+                    receipt_path, revision, release, candidate
+                )
             elif kind in {"oci-runtime-cpu", "oci-runtime-cuda"}:
                 receipt = load_oci_runtime_receipt(
                     receipt_path, revision=revision, release=release,
@@ -532,6 +555,7 @@ def evaluate(
             OnnxReceiptError,
             TrainingBackendReceiptError,
             TrainingPerformanceError,
+            EstimatorRefinementError,
             ValueError,
         ) as error:
             raise EvidenceError(f"{label} failed {kind} validation: {error}") from error
@@ -715,6 +739,23 @@ def evaluate(
             }
             if actual not in qualified:
                 raise EvidenceError("performance anchor is not a measured backend bundle")
+        elif kind in {"estimator-validation", "refinement", "baseline-ablation"}:
+            identity = artifact.get("identity", {})
+            actual = (
+                artifact.get("id"), artifact.get("kind"), artifact_path.name,
+                artifact_path.stat().st_size, _sha256(artifact_path),
+            )
+            anchor = receipt["anchor_artifact"]
+            qualified = (
+                anchor["id"], anchor["kind"], anchor["name"],
+                anchor["bytes"], anchor["sha256"],
+            )
+            declared = (
+                artifact.get("id"), artifact.get("kind"), artifact_path.name,
+                identity.get("bytes"), identity.get("sha256"),
+            )
+            if actual != declared or actual != qualified:
+                raise EvidenceError(f"{kind} does not bind candidate anchor bytes")
         elif kind.startswith("oci-"):
             identity = artifact.get("identity", {})
             actual = (artifact_path.name, _sha256(artifact_path), artifact_path.stat().st_size)
@@ -812,6 +853,52 @@ def evaluate(
             track = conversion["tracks"][1]
         if onnx["model_artifact_id"] != track["artifact"]["id"]:
             raise EvidenceError("ONNX source does not match conversion lineage")
+    estimator_ids = [
+        receipt_id for receipt_id, kind in kinds.items() if kind == "estimator-validation"
+    ]
+    refinement_ids = [
+        receipt_id for receipt_id, kind in kinds.items() if kind == "refinement"
+    ]
+    ablation_ids = [
+        receipt_id for receipt_id, kind in kinds.items() if kind == "baseline-ablation"
+    ]
+    for receipt_id in refinement_ids:
+        expected_parents = set(estimator_ids + conversion_ids)
+        if (
+            len(estimator_ids) != 1
+            or len(conversion_ids) != 1
+            or set(entries[receipt_id]["parents"]) != expected_parents
+        ):
+            raise EvidenceError(
+                "refinement must have exact estimator and conversion parents"
+            )
+        conversion = validated_receipts[conversion_ids[0]]
+        if (
+            validated_receipts[receipt_id]["parent_artifact_id"]
+            != conversion["tracks"][1]["artifact"]["id"]
+        ):
+            raise EvidenceError("refinement does not descend from NearLossless PTQ")
+    quality_ids = [receipt_id for receipt_id, kind in kinds.items() if kind == "quality"]
+    for receipt_id in ablation_ids:
+        expected_parents = set(conversion_ids + refinement_ids + quality_ids)
+        if (
+            len(conversion_ids) != 1
+            or len(refinement_ids) != 1
+            or len(quality_ids) != 1
+            or set(entries[receipt_id]["parents"]) != expected_parents
+        ):
+            raise EvidenceError(
+                "baseline-ablation must have exact conversion, refinement, and quality parents"
+            )
+        refinement = validated_receipts[refinement_ids[0]]
+        ablation = validated_receipts[receipt_id]
+        if (
+            ablation["model_artifact_id"]
+            != refinement["children"][-1]["artifact"]["id"]
+            or ablation["evaluation_id"]
+            != validated_receipts[quality_ids[0]]["evaluation_id"]
+        ):
+            raise EvidenceError("baseline-ablation model or evaluation lineage differs")
     zoo_ids = [receipt_id for receipt_id, kind in kinds.items() if kind == "model-zoo"]
     claim_ids = [
         receipt_id for receipt_id, kind in kinds.items() if kind == "generated-claims"
