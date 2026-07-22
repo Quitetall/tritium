@@ -278,12 +278,19 @@ stages external dependencies from exact workspace lock with `cargo vendor
 `CARGO_HOME`. Content-addressed receipt binds source/release/run/machine and
 toolchain, Cargo.lock digest, every archive identity and compiled package set.
 Release registry requires exact equality with candidate `rust-crate` inventory.
-Npm archive receipt remains separate.
+The exact npm archive now emits a release/source/run/machine-bound qualification
+receipt after a source-free offline install, 114-vector WASM conformance and
+strict TypeScript consumer check. Independent admission rehashes SHA-256 and npm
+SHA-512 integrity, requires the frozen 13-file inventory and clean WASM Git
+identity, and matches exact bytes to the candidate `npm-archive` artifact.
 The exact npm archive verifier now emits its own deterministic CycloneDX 1.6
-document into retained evidence. It binds archive SHA-256/bytes, package/version,
-source revision, WASM guest digest, every lockfile component with strong
+document and content-addressed qualification receipt into retained evidence. It
+binds archive SHA-256/bytes and SHA-512 integrity, package/version, clean source
+revision, run/machine/toolchain identity, WASM build and guest digests, every
+lockfile component with strong
 integrity, license and platform metadata, plus exact runtime dependency edges;
-development/build dependencies remain visible with excluded scope.
+development/build dependencies remain visible with excluded scope. The release
+registry admits this schema and matches it to the candidate npm archive.
 Publish-readiness CI now retains every exact `.crate` beside a bound
 cargo-cyclonedx inventory. Admission checks archive name/size, complete safe tar
 topology, `Cargo.toml.orig`, clean exact `.cargo_vcs_info.json`, package/version,
