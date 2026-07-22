@@ -33,7 +33,7 @@ manifest_identity = RUNTIME["manifest_identity"]
 OCI_ARCHIVE = runpy.run_path(Path(__file__).with_name("verify-oci-archive.py"))
 validate_oci_archive = OCI_ARCHIVE["validate"]
 
-SCHEMA = "tritium.kubernetes-deployment-qualification.v5"
+SCHEMA = "tritium.kubernetes-deployment-qualification.v6"
 HEX = frozenset("0123456789abcdef")
 SAFE_NAME = re.compile(r"[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?")
 SAFE_SECRET_KEY = re.compile(r"[A-Za-z0-9](?:[-._A-Za-z0-9]{0,251}[A-Za-z0-9])?")
@@ -66,14 +66,6 @@ WATCHDOG_FAULT_COMMAND = (
     'set -- $(pidof tritium-serve); [ "$#" -eq 1 ]; kill -STOP "$1"'
 )
 WATCHDOG_SCHEDULING_ALLOWANCE_MS = 60_000
-WATCHDOG_POLICY = {
-    "period_seconds": 10,
-    "timeout_seconds": 2,
-    "failure_threshold": 3,
-    "escalation_seconds": 2,
-    "scheduling_allowance_ms": WATCHDOG_SCHEDULING_ALLOWANCE_MS,
-    "budget_ms": 98_000,
-}
 ARTIFACT_VOLUME_OBSERVATION_BUDGET_MS = 120_000
 QUALIFICATION_METRICS = {
     "tritium_chat_requests_total", "tritium_tokens_out_total",
@@ -84,6 +76,47 @@ ARTIFACT_VOLUME_TRANSITIONS = [
     "baseline_ready", "absence_verified", "fault_applied",
     "unschedulable_observed", "source_restored", "recovery_ready",
 ]
+
+
+def health_gate_descriptor(port: int, order: str) -> dict[str, Any]:
+    if type(port) is not int or not 1 <= port <= 65535:
+        raise DeploymentError("watchdog service port is malformed")
+    return {
+        "authorization": "Bearer ${TRITIUM_AUTH_TOKEN}",
+        "url": f"http://127.0.0.1:{port}/healthz",
+        "predicate": '"status":"ok"',
+        "order": order,
+    }
+
+
+def startup_probe_handlers(port: int) -> dict[str, Any]:
+    gate = health_gate_descriptor(port, "kubelet_startup_probe")
+    return {
+        "main": {"type": "tcp_socket", "port": "http"},
+        "watchdog": {
+            "type": "exec", "authorization": gate["authorization"],
+            "url": gate["url"], "predicate": gate["predicate"],
+        },
+    }
+
+
+def expected_watchdog_policy(port: int) -> dict[str, Any]:
+    return {
+        "startup_failure_threshold": 60,
+        "startup_period_seconds": 5,
+        "startup_timeout_seconds": 2,
+        "startup_probe_window_ms": 300_000,
+        "startup_wait_period_seconds": 5,
+        "startup_gate": health_gate_descriptor(port, "before_failure_monitoring"),
+        "startup_probe_handlers": startup_probe_handlers(port),
+        "period_seconds": 10,
+        "timeout_seconds": 2,
+        "failure_threshold": 3,
+        "escalation_seconds": 2,
+        "scheduling_allowance_ms": WATCHDOG_SCHEDULING_ALLOWANCE_MS,
+        "budget_ms": 98_000,
+        "monitor_gate": health_gate_descriptor(port, "steady_state_monitoring"),
+    }
 
 
 def expected_checks(flavor: str) -> list[str]:
@@ -551,20 +584,84 @@ def validate_deployment(document: dict[str, Any], *, image: str,
     return uid
 
 
-def watchdog_contract(document: dict[str, Any]) -> dict[str, int]:
+def deployment_service_port(document: dict[str, Any]) -> int:
+    containers = document.get("spec", {}).get("template", {}).get("spec", {}).get(
+        "containers", []
+    )
+    main = [container for container in containers if isinstance(container, dict)
+            and container.get("name") == "tritium"]
+    ports = main[0].get("ports") if len(main) == 1 else None
+    if (not isinstance(ports, list) or len(ports) != 1
+            or ports[0].get("name") != "http"
+            or type(ports[0].get("containerPort")) is not int
+            or not 1 <= ports[0]["containerPort"] <= 65535):
+        raise DeploymentError("deployed Tritium service port differs")
+    return ports[0]["containerPort"]
+
+
+def validate_service_port(document: dict[str, Any], expected: int) -> None:
+    ports = document.get("spec", {}).get("ports")
+    if (not isinstance(ports, list) or len(ports) != 1
+            or ports[0].get("name") != "http"
+            or ports[0].get("port") != expected
+            or ports[0].get("targetPort") != "http"):
+        raise DeploymentError("Kubernetes Service port differs from deployment")
+
+
+def watchdog_contract(document: dict[str, Any]) -> dict[str, Any]:
     containers = document.get("spec", {}).get("template", {}).get("spec", {}).get(
         "containers", []
     )
     matches = [container for container in containers if isinstance(container, dict)
                and container.get("name") == "authenticated-probe"]
+    main = [container for container in containers if isinstance(container, dict)
+            and container.get("name") == "tritium"]
     args = matches[0].get("args") if len(matches) == 1 else None
     if not isinstance(args, list) or len(args) != 1 or not isinstance(args[0], str):
         raise DeploymentError("deployed watchdog command is malformed")
+    if len(main) != 1:
+        raise DeploymentError("deployed Tritium container is absent")
+    service_port = deployment_service_port(document)
     script = args[0]
+    startup_begin = script.find("until wget")
+    monitoring_begin = script.find("failures=0;", startup_begin)
+    monitoring_loop_begin = script.find("while sleep", monitoring_begin)
+    monitoring_threshold = script.find('if [ "$failures" -ge', monitoring_loop_begin)
+    if (startup_begin < 0 or monitoring_begin < 0 or script.count("until wget") != 1
+            or monitoring_loop_begin < 0 or monitoring_threshold < 0
+            or script[monitoring_begin:monitoring_loop_begin].strip() != "failures=0;"
+            or len(re.findall(r"(?<!startup_)failures=0;", script)) != 2):
+        raise DeploymentError("deployed watchdog startup gate ordering differs")
+    startup_gate = script[startup_begin:monitoring_begin]
+    startup_descriptor = health_gate_descriptor(service_port, "before_failure_monitoring")
+    gate_tokens = [
+        '--header="Authorization: Bearer ${TRITIUM_AUTH_TOKEN}"',
+        startup_descriptor["url"],
+        r"""grep -q '\"status\":\"ok\"'""",
+    ]
+    positions = [startup_gate.find(token) for token in gate_tokens]
+    if any(position < 0 for position in positions) or positions != sorted(positions):
+        raise DeploymentError("deployed watchdog startup gate semantics differ")
+    if any(token in startup_gate for token in (
+        "terminate_tritium", "startup_failures", "kill "
+    )):
+        raise DeploymentError("deployed watchdog startup gate can terminate Tritium")
+    monitoring_gate = script[monitoring_loop_begin:monitoring_threshold]
+    monitor_descriptor = health_gate_descriptor(service_port, "steady_state_monitoring")
+    monitor_tokens = [
+        gate_tokens[0], monitor_descriptor["url"], gate_tokens[2],
+        "then failures=0;", "else failures=$((failures + 1));",
+    ]
+    monitor_positions = [monitoring_gate.find(token) for token in monitor_tokens]
+    if (any(position < 0 for position in monitor_positions)
+            or monitor_positions != sorted(monitor_positions)):
+        raise DeploymentError("deployed watchdog monitor gate semantics differ")
     patterns = {
+        "startup_timeout_seconds": r"until wget .*?--timeout=([0-9]+)",
+        "startup_wait_period_seconds": r"until wget .*?; do\s*sleep ([0-9]+);\s*done;",
         "period_seconds": r"while sleep ([0-9]+)",
-        "timeout_seconds": r"wget .*?--timeout=([0-9]+)",
-        "failure_threshold": r'failures" -ge ([0-9]+)',
+        "timeout_seconds": r"while sleep [0-9]+; do\s*if wget .*?--timeout=([0-9]+)",
+        "failure_threshold": r'(?<!startup_)failures" -ge ([0-9]+)',
         "escalation_seconds": r"kill \$pid;\s*sleep ([0-9]+)",
     }
     values = {}
@@ -573,19 +670,62 @@ def watchdog_contract(document: dict[str, Any]) -> dict[str, int]:
         if match is None:
             raise DeploymentError(f"deployed watchdog {field} is absent")
         values[field] = int(match.group(1))
-    if (not 1 <= values["period_seconds"] <= 60
+    probe_values = []
+    probes = []
+    for container in (main[0], matches[0]):
+        probe = container.get("startupProbe")
+        if not isinstance(probe, dict):
+            raise DeploymentError("deployed startup probe is absent")
+        fields = tuple(probe.get(field) for field in (
+            "failureThreshold", "periodSeconds", "timeoutSeconds"
+        ))
+        if any(type(value) is not int for value in fields):
+            raise DeploymentError("deployed startup probe bounds are malformed")
+        probe_values.append(fields)
+        probes.append(probe)
+    handlers = startup_probe_handlers(service_port)
+    if (set(probes[0]) != {
+            "failureThreshold", "periodSeconds", "timeoutSeconds", "tcpSocket"
+        } or probes[0].get("tcpSocket") != {"port": handlers["main"]["port"]}):
+        raise DeploymentError("deployed main startup probe handler differs")
+    expected_exec = (
+        'wget -qO- --header="Authorization: Bearer ${TRITIUM_AUTH_TOKEN}" '
+        f'http://127.0.0.1:{service_port}/healthz | grep -q \'"status":"ok"\''
+    )
+    if (set(probes[1]) != {
+            "failureThreshold", "periodSeconds", "timeoutSeconds", "exec"
+        } or probes[1].get("exec") != {"command": ["sh", "-ec", expected_exec]}):
+        raise DeploymentError("deployed watchdog startup probe handler differs")
+    if probe_values[0] != probe_values[1]:
+        raise DeploymentError("deployed startup probes differ from watchdog gate")
+    expected_probe = probe_values[0]
+    if expected_probe[2] != values["startup_timeout_seconds"]:
+        raise DeploymentError("deployed startup probes differ from watchdog gate")
+    values["startup_failure_threshold"] = expected_probe[0]
+    values["startup_period_seconds"] = expected_probe[1]
+    if (not 1 <= values["startup_wait_period_seconds"] <= 60
+            or not 1 <= values["startup_timeout_seconds"] <= 30
+            or not 1 <= values["period_seconds"] <= 60
             or not 1 <= values["timeout_seconds"] <= 30
             or not 1 <= values["failure_threshold"] <= 10
             or values["escalation_seconds"] != values["timeout_seconds"]
             or "kill -KILL $pid" not in script):
         raise DeploymentError("deployed watchdog bounds differ")
     values["scheduling_allowance_ms"] = WATCHDOG_SCHEDULING_ALLOWANCE_MS
+    values["startup_probe_window_ms"] = (
+        values["startup_failure_threshold"]
+        * values["startup_period_seconds"]
+        * 1000
+    )
+    values["startup_gate"] = startup_descriptor
+    values["startup_probe_handlers"] = handlers
     values["budget_ms"] = (
         values["failure_threshold"]
         * (values["period_seconds"] + values["timeout_seconds"])
         + values["escalation_seconds"]
     ) * 1000 + WATCHDOG_SCHEDULING_ALLOWANCE_MS
-    if values != WATCHDOG_POLICY:
+    values["monitor_gate"] = monitor_descriptor
+    if values != expected_watchdog_policy(service_port):
         raise DeploymentError("deployed watchdog differs from release policy")
     return values
 
@@ -1346,7 +1486,7 @@ def exercise_keda_scale(*, kubectl_base: list[str], service: str, token: str,
                         max_tokens: int, timeout: float,
                         request_timeout: float, prometheus_base_url: str,
                         prometheus_query: str, namespace: str, selector: str,
-                        flavor: str) -> dict[str, Any]:
+                        flavor: str, service_port: int) -> dict[str, Any]:
     stop = threading.Event()
     count_lock = threading.Lock()
     completed = 0
@@ -1392,7 +1532,8 @@ def exercise_keda_scale(*, kubectl_base: list[str], service: str, token: str,
             port = free_port()
             url = f"http://127.0.0.1:{port}"
             process, _ = port_forward(
-                kubectl_base + ["port-forward", f"service/{service}", f"{port}:8080",
+                kubectl_base + ["port-forward", f"service/{service}",
+                                f"{port}:{service_port}",
                                 "--address", "127.0.0.1"],
                 time.monotonic() + min(timeout, 60), url, token,
             )
@@ -1708,6 +1849,11 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
         deployment_uid = validate_deployment(
             deployment, image=args.image, manifest_sha256=manifest_sha, flavor=args.flavor
         )
+        service_port = deployment_service_port(deployment)
+        validate_service_port(
+            run_json(kubectl_base + ["get", f"service/{service}", "-o", "json"]),
+            service_port,
+        )
         watchdog_policy = watchdog_contract(deployment)
         artifact_volume = artifact_volume_contract(deployment)
         update_before = deployment_update_identity(deployment)
@@ -1720,7 +1866,8 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
         port = free_port()
         url = f"http://127.0.0.1:{port}"
         process, ready = port_forward(
-            kubectl_base + ["port-forward", f"service/{service}", f"{port}:8080",
+            kubectl_base + ["port-forward", f"service/{service}",
+                            f"{port}:{service_port}",
                             "--address", "127.0.0.1"],
             time.monotonic() + args.timeout, url, token,
         )
@@ -1784,6 +1931,7 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
                     prometheus_base_url=prometheus_local,
                     prometheus_query=prometheus_query_text,
                     namespace=args.namespace, selector=selector, flavor=args.flavor,
+                    service_port=service_port,
                 )
             finally:
                 stop_forward(prometheus_process)
@@ -1809,7 +1957,8 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
         watchdog_url = f"http://127.0.0.1:{watchdog_port}"
         watchdog_process, watchdog_ready = port_forward(
             kubectl_base + ["port-forward", f"service/{service}",
-                            f"{watchdog_port}:8080", "--address", "127.0.0.1"],
+                            f"{watchdog_port}:{service_port}",
+                            "--address", "127.0.0.1"],
             time.monotonic() + args.timeout, watchdog_url, token,
         )
         try:
@@ -1855,7 +2004,8 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
         restart_port = free_port()
         restart_url = f"http://127.0.0.1:{restart_port}"
         restart_process, restart_ready = port_forward(
-            kubectl_base + ["port-forward", f"service/{service}", f"{restart_port}:8080",
+            kubectl_base + ["port-forward", f"service/{service}",
+                            f"{restart_port}:{service_port}",
                             "--address", "127.0.0.1"],
             time.monotonic() + args.timeout, restart_url, token,
         )
@@ -1913,7 +2063,8 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
         artifact_url = f"http://127.0.0.1:{artifact_port}"
         artifact_process, artifact_ready = port_forward(
             kubectl_base + ["port-forward", f"service/{service}",
-                            f"{artifact_port}:8080", "--address", "127.0.0.1"],
+                            f"{artifact_port}:{service_port}",
+                            "--address", "127.0.0.1"],
             time.monotonic() + args.timeout, artifact_url, token,
         )
         artifact_request = {
@@ -2010,7 +2161,8 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
         update_port = free_port()
         update_url = f"http://127.0.0.1:{update_port}"
         update_process, update_ready = port_forward(
-            kubectl_base + ["port-forward", f"service/{service}", f"{update_port}:8080",
+            kubectl_base + ["port-forward", f"service/{service}",
+                            f"{update_port}:{service_port}",
                             "--address", "127.0.0.1"],
             time.monotonic() + args.timeout, update_url, token,
         )
@@ -2067,7 +2219,8 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
         rollback_url = f"http://127.0.0.1:{rollback_port}"
         rollback_process, rollback_ready = port_forward(
             kubectl_base + ["port-forward", f"service/{service}",
-                            f"{rollback_port}:8080", "--address", "127.0.0.1"],
+                            f"{rollback_port}:{service_port}",
+                            "--address", "127.0.0.1"],
             time.monotonic() + args.timeout, rollback_url, token,
         )
         try:
@@ -2187,7 +2340,7 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
         "workload": {"release_name": args.release_name, "deployment_uid": deployment_uid,
                      "qualification_lock_uid": lock_uid, "source_pvc": args.source_pvc,
                      "source_pvc_identity": source_pvc_identity,
-                     "model_id": model_id,
+                     "model_id": model_id, "service_port": service_port,
                      "initial": initial, "restarted": restarted, "updated": updated,
                      "watchdog_replacement": watchdog,
                      "artifact_volume_loss": artifact_fault,
@@ -2325,7 +2478,7 @@ def validate_receipt(receipt: dict[str, Any], *, chart_path: Path, image_path: P
     workload = receipt.get("workload")
     if not isinstance(workload, dict) or set(workload) != {
         "release_name", "deployment_uid", "qualification_lock_uid",
-        "source_pvc", "source_pvc_identity", "model_id",
+        "source_pvc", "source_pvc_identity", "model_id", "service_port",
         "initial", "restarted", "updated",
         "watchdog_replacement", "artifact_volume_loss",
         "startup_receipt", "restart_startup_receipt", "update_startup_receipt",
@@ -2342,6 +2495,9 @@ def validate_receipt(receipt: dict[str, Any], *, chart_path: Path, image_path: P
             raise DeploymentError("deployment workload identity is malformed")
     if SAFE_NAME.fullmatch(workload["source_pvc"]) is None:
         raise DeploymentError("deployment source PVC identity is malformed")
+    if (type(workload.get("service_port")) is not int
+            or not 1 <= workload["service_port"] <= 65535):
+        raise DeploymentError("deployment service port is malformed")
     validate_pvc_identity(workload.get("source_pvc_identity"), workload["source_pvc"])
     exact_hex(workload.get("failed_upgrade_output_sha256"), 64, "failed-upgrade SHA-256")
     exact_hex(workload.get("failed_manifest_sha256"), 64, "failed manifest SHA-256")
@@ -2400,25 +2556,49 @@ def validate_receipt(receipt: dict[str, Any], *, chart_path: Path, image_path: P
             or watchdog["replacement_ms"] <= 0):
         raise DeploymentError("deployment watchdog replacement evidence is malformed")
     watchdog_policy = watchdog.get("watchdog")
-    policy_fields = {
+    numeric_policy_fields = {
+        "startup_failure_threshold", "startup_period_seconds", "startup_timeout_seconds",
+        "startup_probe_window_ms", "startup_wait_period_seconds",
         "period_seconds", "timeout_seconds", "failure_threshold",
         "escalation_seconds", "scheduling_allowance_ms", "budget_ms",
     }
-    if (not isinstance(watchdog_policy, dict) or set(watchdog_policy) != policy_fields
-            or any(type(watchdog_policy.get(field)) is not int for field in policy_fields)
+    if (not isinstance(watchdog_policy, dict)
+            or set(watchdog_policy) != numeric_policy_fields | {
+                "startup_gate", "startup_probe_handlers", "monitor_gate"
+            }
+            or any(type(watchdog_policy.get(field)) is not int
+                   for field in numeric_policy_fields)
+            or not 1 <= watchdog_policy["startup_failure_threshold"] <= 120
+            or not 1 <= watchdog_policy["startup_period_seconds"] <= 60
+            or not 1 <= watchdog_policy["startup_timeout_seconds"] <= 30
             or not 1 <= watchdog_policy["period_seconds"] <= 60
             or not 1 <= watchdog_policy["timeout_seconds"] <= 30
             or not 1 <= watchdog_policy["failure_threshold"] <= 10
             or watchdog_policy["escalation_seconds"] != watchdog_policy["timeout_seconds"]
             or watchdog_policy["scheduling_allowance_ms"]
-            != WATCHDOG_SCHEDULING_ALLOWANCE_MS):
+            != WATCHDOG_SCHEDULING_ALLOWANCE_MS
+            or watchdog_policy.get("startup_gate") != health_gate_descriptor(
+                workload["service_port"], "before_failure_monitoring"
+            )
+            or watchdog_policy.get("startup_probe_handlers") != startup_probe_handlers(
+                workload["service_port"]
+            )
+            or watchdog_policy.get("monitor_gate") != health_gate_descriptor(
+                workload["service_port"], "steady_state_monitoring"
+            )):
         raise DeploymentError("deployment watchdog policy evidence is malformed")
+    expected_startup_window = (
+        watchdog_policy["startup_failure_threshold"]
+        * watchdog_policy["startup_period_seconds"]
+        * 1000
+    )
     expected_watchdog_budget = (
         watchdog_policy["failure_threshold"]
         * (watchdog_policy["period_seconds"] + watchdog_policy["timeout_seconds"])
         + watchdog_policy["escalation_seconds"]
     ) * 1000 + WATCHDOG_SCHEDULING_ALLOWANCE_MS
-    if watchdog_policy != WATCHDOG_POLICY:
+    if (watchdog_policy["startup_probe_window_ms"] != expected_startup_window
+            or watchdog_policy != expected_watchdog_policy(workload["service_port"])):
         raise DeploymentError("deployment watchdog policy differs from release policy")
     if (watchdog_policy["budget_ms"] != expected_watchdog_budget
             or watchdog["replacement_ms"] > expected_watchdog_budget):

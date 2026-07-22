@@ -13,6 +13,10 @@ cannot drain. Kubernetes restarts the main container when its worker is dead,
 its TCP listener remains open, or the process is otherwise unresponsive. The
 watchdog exits after acting and is restarted by the pod runtime; it has no
 competing server-health liveness probe.
+Failure counting begins only after the first authenticated healthy response.
+During large-model loading the sidecar only waits; Kubernetes startup probes own
+startup replacement, avoiding a second timer racing the kubelet. TERM/KILL
+escalation arms only after startup succeeds.
 
 `artifact.sourcePvc.subPath` identifies the bundle directory within the PVC;
 `artifact.profile` selects its admitted Compact or NearLossless package.

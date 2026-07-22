@@ -332,8 +332,15 @@ same-UID watchdog container, requires authenticated health failures to drive
 bounded TERM-to-KILL escalation, observes the same pod UID with a new Tritium
 container ID and exactly one exit-137 restart, then proves immutable startup
 receipt parity, clean fault telemetry and recovered generation. This exercises
-the watchdog's worst-case replacement path; a real latched backend/device fault
-and OOM execution remain open.
+the watchdog's worst-case replacement path. The v6 contract quarantines this
+failure monitor until the first authenticated healthy response and leaves startup
+replacement solely to Kubernetes probes instead of racing them with a second
+termination clock. The main listener opens only after artifact admission and the
+startup self-test; v6 binds its named-port TCP handler plus the sidecar's exact
+authenticated loopback health handler. It also binds both containers' probe
+values, their nominal 300-second probe window, the sidecar wait cadence, status
+predicate, configured service port, success reset and failure increment. A real
+latched backend/device fault and OOM execution remain open.
 
 Artifact-volume unavailability now has a separate Kubernetes v5 gate. The
 qualifier requires a successful empty `--ignore-not-found` response for a
@@ -345,7 +352,7 @@ then binds the failed patch, pending-pod identity, recovered pod set, immutable
 startup receipt, clean telemetry and successful generation. CPU rolling-update
 profiles may retain the serving pod during failure; CUDA `Recreate` profiles
 must replace it. Source bytes remain untouched.
-The v5 receipt also binds the source PVC UID/PV/storage class/capacity, explicit
+The v6 receipt also binds the source PVC UID/PV/storage class/capacity, explicit
 restoration state, and Metrics API samples before, during and after the fault;
 CPU nanocores and memory bytes are normalized and their observed high-water
 marks are recomputed offline. Recovery request evidence pins model, prompt

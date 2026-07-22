@@ -46,6 +46,7 @@ class DeploymentContractTests(unittest.TestCase):
             "authenticated-probe",
             "shareProcessNamespace: true",
             "pidof tritium-serve",
+            "until wget",
             "kill -KILL",
             "type: Recreate",
             "ephemeral-storage",

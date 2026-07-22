@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 from pathlib import Path
 import runpy
@@ -24,6 +25,8 @@ deployment_update_identity = MODULE["deployment_update_identity"]
 validate_scale_contract = MODULE["validate_scale_contract"]
 WATCHDOG_FAULT_COMMAND = MODULE["WATCHDOG_FAULT_COMMAND"]
 watchdog_contract = MODULE["watchdog_contract"]
+deployment_service_port = MODULE["deployment_service_port"]
+validate_service_port = MODULE["validate_service_port"]
 artifact_volume_contract = MODULE["artifact_volume_contract"]
 pending_artifact_volume_failure = MODULE["pending_artifact_volume_failure"]
 pvc_identity = MODULE["pvc_identity"]
@@ -110,7 +113,7 @@ def receipt(chart: Path, image_archive: Path, candidate: Path,
         "workload": {
             "release_name": "qualification", "deployment_uid": "deployment-uid",
             "qualification_lock_uid": "lock-uid", "source_pvc": "tritium-artifact",
-            "model_id": "tritium",
+            "model_id": "tritium", "service_port": 8080,
             "source_pvc_identity": {
                 "name": "tritium-artifact", "uid": "pvc-uid",
                 "volume_name": "pv-artifact", "storage_class": "standard",
@@ -136,9 +139,20 @@ def receipt(chart: Path, image_archive: Path, candidate: Path,
                 ).hexdigest(),
                 "replacement_ms": 32000.0,
                 "watchdog": {
+                    "startup_period_seconds": 5, "startup_timeout_seconds": 2,
+                    "startup_failure_threshold": 60,
+                    "startup_probe_window_ms": 300000,
+                    "startup_wait_period_seconds": 5,
+                    "startup_gate": MODULE["health_gate_descriptor"](
+                        8080, "before_failure_monitoring"
+                    ),
+                    "startup_probe_handlers": MODULE["startup_probe_handlers"](8080),
                     "period_seconds": 10, "timeout_seconds": 2,
                     "failure_threshold": 3, "escalation_seconds": 2,
                     "scheduling_allowance_ms": 60000, "budget_ms": 98000,
+                    "monitor_gate": MODULE["health_gate_descriptor"](
+                        8080, "steady_state_monitoring"
+                    ),
                 },
                 "startup_receipt": dict(startup_receipt),
                 "generation_response_sha256": "a" * 64,
@@ -500,19 +514,107 @@ class QualifyKubernetesDeploymentTests(unittest.TestCase):
 
     def test_watchdog_contract_derives_bounded_escalation_budget(self):
         script = (
-            'while sleep 10; do wget --timeout=2 http://127.0.0.1/healthz; '
+            'terminate_tritium() { pid="$(pidof tritium-serve)"; kill $pid; sleep 2; '
+            'kill -0 $pid && kill -KILL $pid || true; }; '
+            'until wget --timeout=2 '
+            '--header="Authorization: Bearer ${TRITIUM_AUTH_TOKEN}" '
+            'http://127.0.0.1:8080/healthz | grep -q \'\\"status\\":\\"ok\\"\'; do '
+            'sleep 5; done; failures=0; '
+            'while sleep 10; do if wget --timeout=2 '
+            '--header="Authorization: Bearer ${TRITIUM_AUTH_TOKEN}" '
+            'http://127.0.0.1:8080/healthz | grep -q \'\\"status\\":\\"ok\\"\'; '
+            'then failures=0; else failures=$((failures + 1)); fi; '
             'if [ "$failures" -ge 3 ]; then pid="$(pidof tritium-serve)"; '
-            'kill $pid; sleep 2; kill -0 $pid && kill -KILL $pid || true; fi; done'
+            'terminate_tritium; fi; done'
         )
         document = {"spec": {"template": {"spec": {"containers": [
-            {"name": "authenticated-probe", "args": [script]},
+            {"name": "tritium", "ports": [{"name": "http", "containerPort": 8080}],
+             "startupProbe": {"failureThreshold": 60, "periodSeconds": 5,
+                              "timeoutSeconds": 2, "tcpSocket": {"port": "http"}}},
+            {"name": "authenticated-probe", "args": [script],
+             "startupProbe": {"failureThreshold": 60, "periodSeconds": 5,
+                              "timeoutSeconds": 2, "exec": {"command": [
+                                  "sh", "-ec",
+                                  'wget -qO- --header="Authorization: Bearer '
+                                  '${TRITIUM_AUTH_TOKEN}" '
+                                  'http://127.0.0.1:8080/healthz | grep -q '
+                                  '\'"status":"ok"\'',
+                              ]}}},
         ]}}}}
         self.assertEqual(watchdog_contract(document)["budget_ms"], 98000)
-        document["spec"]["template"]["spec"]["containers"][0]["args"][0] = (
+        wrong_probe = copy.deepcopy(document)
+        wrong_probe["spec"]["template"]["spec"]["containers"][0]["startupProbe"][
+            "failureThreshold"
+        ] = 1
+        with self.assertRaisesRegex(DeploymentError, "startup probes differ"):
+            watchdog_contract(wrong_probe)
+        wrong_main_handler = copy.deepcopy(document)
+        wrong_main_handler["spec"]["template"]["spec"]["containers"][0][
+            "startupProbe"
+        ] = {"failureThreshold": 60, "periodSeconds": 5, "timeoutSeconds": 2,
+             "exec": {"command": ["true"]}}
+        with self.assertRaisesRegex(DeploymentError, "main startup probe handler"):
+            watchdog_contract(wrong_main_handler)
+        wrong_watchdog_handler = copy.deepcopy(document)
+        wrong_watchdog_handler["spec"]["template"]["spec"]["containers"][1][
+            "startupProbe"
+        ]["exec"]["command"] = ["true"]
+        with self.assertRaisesRegex(DeploymentError, "watchdog startup probe handler"):
+            watchdog_contract(wrong_watchdog_handler)
+        wrong_auth = copy.deepcopy(document)
+        wrong_auth["spec"]["template"]["spec"]["containers"][1]["args"][0] = (
+            script.replace("Authorization: Bearer", "Authorization: Basic")
+        )
+        with self.assertRaisesRegex(DeploymentError, "gate semantics differ"):
+            watchdog_contract(wrong_auth)
+        wrong_monitor_auth = copy.deepcopy(document)
+        monitor_prefix, monitor_suffix = script.rsplit("Authorization: Bearer", 1)
+        wrong_monitor_auth["spec"]["template"]["spec"]["containers"][1]["args"][0] = (
+            monitor_prefix + "Authorization: Basic" + monitor_suffix
+        )
+        with self.assertRaisesRegex(DeploymentError, "monitor gate semantics differ"):
+            watchdog_contract(wrong_monitor_auth)
+        terminating_startup = copy.deepcopy(document)
+        terminating_startup["spec"]["template"]["spec"]["containers"][1]["args"][0] = (
+            script.replace("sleep 5; done", "terminate_tritium; sleep 5; done")
+        )
+        with self.assertRaisesRegex(DeploymentError, "can terminate Tritium"):
+            watchdog_contract(terminating_startup)
+        dynamic_port = copy.deepcopy(document)
+        dynamic_port["spec"]["template"]["spec"]["containers"][0]["ports"][0][
+            "containerPort"
+        ] = 9090
+        dynamic_port["spec"]["template"]["spec"]["containers"][1]["args"][0] = (
+            script.replace(":8080/healthz", ":9090/healthz")
+        )
+        dynamic_port["spec"]["template"]["spec"]["containers"][1]["startupProbe"][
+            "exec"
+        ]["command"][2] = dynamic_port["spec"]["template"]["spec"]["containers"][1][
+            "startupProbe"
+        ]["exec"]["command"][2].replace(":8080/healthz", ":9090/healthz")
+        self.assertEqual(
+            watchdog_contract(dynamic_port)["startup_gate"]["url"],
+            "http://127.0.0.1:9090/healthz",
+        )
+        document["spec"]["template"]["spec"]["containers"][1]["args"][0] = (
             script.replace("sleep 2; kill -0", "sleep 3; kill -0")
         )
         with self.assertRaisesRegex(DeploymentError, "bounds differ"):
             watchdog_contract(document)
+
+    def test_service_port_contract_binds_named_service_target(self):
+        deployment = {"spec": {"template": {"spec": {"containers": [{
+            "name": "tritium",
+            "ports": [{"name": "http", "containerPort": 9090}],
+        }]}}}}
+        service = {"spec": {"ports": [{
+            "name": "http", "port": 9090, "targetPort": "http",
+        }]}}
+        self.assertEqual(deployment_service_port(deployment), 9090)
+        validate_service_port(service, 9090)
+        service["spec"]["ports"][0]["targetPort"] = 9090
+        with self.assertRaisesRegex(DeploymentError, "Service port differs"):
+            validate_service_port(service, 9090)
 
     def test_artifact_volume_contract_and_pending_failure_are_exact(self):
         deployment = {"spec": {"template": {"spec": {"volumes": [
