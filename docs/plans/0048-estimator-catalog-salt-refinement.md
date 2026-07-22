@@ -103,7 +103,10 @@ package.
 Release admission now has three separate fail-closed contracts.
 `tritium.estimator-catalog-qualification.v1` binds the exact candidate wheel and
 all seven built-ins, hard trits/scales, gradients/state/ties/coverage and
-external-plugin rejection behavior. `tritium.refinement-qualification.v1`
+external-plugin rejection behavior. The installed-wheel worker emits the
+retained `tritium.estimator-catalog-execution.v1` trace; the qualifier binds its
+wheel hash, CPU environment and exact results into the release receipt.
+`tritium.refinement-qualification.v1`
 requires disjoint source-bound splits and distinct scale-only, hard-PV and S34
 children with exact ancestry, held-out hard candidates, G128 native SALT
 packages, strict reload and no latent residuals; it must descend from the
@@ -111,13 +114,16 @@ flagship NearLossless PTQ artifact and the estimator receipt.
 `tritium.baseline-ablation-qualification.v1` freezes RTN/AbsMean,
 GPTQ/AWQ-style, SALT V1 and three mechanism ablations, recomputes matched-byte
 claim eligibility, and binds the exact refined model/evaluation lineage. These
-are validators only; checkpoint-scale empirical refinement/ablation receipts
-remain open.
+contracts and the estimator producer are implemented; executing the producer
+against the final candidate wheel and producing checkpoint-scale empirical
+refinement/ablation receipts remain open.
 
 ## Verification
 
 ```bash
 PYTHONPATH=crates/tritium-py/python pytest -q crates/tritium-py/tests
+python -m unittest scripts.tests.test_qualify_estimator_catalog
+python -m unittest scripts.tests.test_verify_estimator_refinement_receipt
 python -m compileall -q crates/tritium-py/python/tritium
 cargo fmt --check
 git diff --check

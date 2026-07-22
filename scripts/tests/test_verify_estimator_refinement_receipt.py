@@ -1,4 +1,5 @@
 import hashlib
+import json
 from pathlib import Path
 import runpy
 import tempfile
@@ -59,25 +60,52 @@ class EstimatorRefinementReceiptTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             candidate, common, records = fixture(root)
+            cases = [
+                {
+                    "name": name, "algorithm_id": algorithm,
+                    "schema_version": 1, "physical_planes": planes,
+                    "hard_trits_exact": True, "finite_nonnegative_scales": True,
+                    "master_gradients_finite": True, "state_gradients_finite": True,
+                    "state_roundtrip_exact": True, "tied_identity_preserved": True,
+                    "coverage_exact": True,
+                }
+                for name, algorithm, planes in MODULE["ESTIMATORS"]
+            ]
+            plugin = {
+                "registered": True, "duplicate_rejected": True,
+                "contract_validated": True, "purity_opt_in_required": True,
+                "invalid_projection_rejected": True,
+            }
+            trace = {
+                "schema": MODULE["TRACE_SCHEMA"], "result": "pass",
+                "release": common["release"],
+                "source_revision": common["source_revision"],
+                "run_id": common["run_id"],
+                "wheel": {
+                    field: records["wheel"][field]
+                    for field in ("name", "bytes", "sha256")
+                },
+                "environment": {
+                    "python": "3.13.5", "torch": "2.7.1",
+                    "tritium": "1.1.0rc0", "device": "cpu",
+                },
+                "estimators": cases, "external_plugin": plugin,
+            }
+            trace_path = root / "estimator-execution.json"
+            trace_path.write_text(
+                json.dumps(trace, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
             estimators = seal(
                 {
                     **common, "schema": MODULE["ESTIMATOR_SCHEMA"],
                     "anchor_artifact": records["wheel"],
-                    "estimators": [
-                        {
-                            "name": name, "algorithm_id": algorithm,
-                            "schema_version": 1, "physical_planes": planes,
-                            "hard_trits_exact": True, "finite_nonnegative_scales": True,
-                            "master_gradients_finite": True, "state_gradients_finite": True,
-                            "state_roundtrip_exact": True, "tied_identity_preserved": True,
-                            "coverage_exact": True,
-                        }
-                        for name, algorithm, planes in MODULE["ESTIMATORS"]
-                    ],
-                    "external_plugin": {
-                        "registered": True, "duplicate_rejected": True,
-                        "contract_validated": True, "purity_opt_in_required": True,
-                        "invalid_projection_rejected": True,
+                    "estimators": cases,
+                    "external_plugin": plugin,
+                    "trace": {
+                        "path": trace_path.name,
+                        "bytes": trace_path.stat().st_size,
+                        "sha256": hashlib.sha256(trace_path.read_bytes()).hexdigest(),
                     },
                 }
             )

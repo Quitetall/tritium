@@ -19,7 +19,7 @@ COMMON_FIELDS = {
     "candidate_manifest_sha256", "anchor_artifact",
 }
 ARTIFACT_FIELDS = {"id", "kind", "name", "bytes", "sha256"}
-ESTIMATOR_FIELDS = COMMON_FIELDS | {"estimators", "external_plugin"}
+ESTIMATOR_FIELDS = COMMON_FIELDS | {"estimators", "external_plugin", "trace"}
 ESTIMATOR_CASE_FIELDS = {
     "name", "algorithm_id", "schema_version", "physical_planes", "hard_trits_exact",
     "finite_nonnegative_scales", "master_gradients_finite", "state_gradients_finite",
@@ -29,6 +29,14 @@ PLUGIN_FIELDS = {
     "registered", "duplicate_rejected", "contract_validated", "purity_opt_in_required",
     "invalid_projection_rejected",
 }
+FILE_FIELDS = {"path", "bytes", "sha256"}
+TRACE_SCHEMA = "tritium.estimator-catalog-execution.v1"
+TRACE_FIELDS = {
+    "schema", "result", "release", "source_revision", "run_id", "wheel",
+    "environment", "estimators", "external_plugin",
+}
+TRACE_WHEEL_FIELDS = {"name", "bytes", "sha256"}
+ENVIRONMENT_FIELDS = {"python", "torch", "tritium", "device"}
 REFINEMENT_FIELDS = COMMON_FIELDS | {
     "parent_artifact_id", "training_set_id", "validation_set_id", "splits_disjoint",
     "children",
@@ -236,6 +244,40 @@ def validate_estimators(
     plugin = object_(receipt["external_plugin"], PLUGIN_FIELDS, "external plugin")
     if any(plugin[field] is not True for field in PLUGIN_FIELDS):
         raise EstimatorRefinementError("external estimator safety gate failed")
+    trace_record = object_(receipt["trace"], FILE_FIELDS, "estimator trace")
+    trace_path = contained(path.parent, trace_record["path"])
+    if (
+        trace_path.stat().st_size <= 0
+        or trace_path.stat().st_size > MAX_RECEIPT_BYTES
+        or trace_path.stat().st_size != trace_record["bytes"]
+        or sha256(trace_path) != trace_record["sha256"]
+    ):
+        raise EstimatorRefinementError("estimator trace bytes drifted")
+    try:
+        trace = object_(json.loads(trace_path.read_bytes()), TRACE_FIELDS, "estimator trace")
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise EstimatorRefinementError("estimator trace must contain UTF-8 JSON") from error
+    wheel = object_(trace["wheel"], TRACE_WHEEL_FIELDS, "trace wheel")
+    environment = object_(trace["environment"], ENVIRONMENT_FIELDS, "trace environment")
+    if (
+        trace["schema"] != TRACE_SCHEMA
+        or trace["result"] != "pass"
+        or trace["release"] != release
+        or trace["source_revision"] != revision
+        or trace["run_id"] != receipt["run_id"]
+        or wheel != {
+            "name": receipt["anchor_artifact"]["name"],
+            "bytes": receipt["anchor_artifact"]["bytes"],
+            "sha256": receipt["anchor_artifact"]["sha256"],
+        }
+        or trace["estimators"] != cases
+        or trace["external_plugin"] != plugin
+        or environment["device"] != "cpu"
+        or environment["tritium"] != release.replace("-rc.", "rc")
+    ):
+        raise EstimatorRefinementError("estimator trace identity or results differ")
+    for field in ("python", "torch"):
+        string(environment[field], f"trace environment {field}")
     return finish(receipt, "estimator")
 
 
