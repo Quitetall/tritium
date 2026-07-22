@@ -86,8 +86,10 @@ explicitly labeled `legacy_compatibility` and cannot satisfy the production
 artifact gate. A dedicated `QwenGenerator` now owns that exact strict model and
 implements bounded greedy/top-k/top-p decode plus logprobs; the only public
 admission function derives both generator and receipt from the same model
-value, closing artifact/generator substitution. Main-binary schema-v3 CLI,
-tokenizer binding, and real CPU/CUDA fixtures remain open. Until those exist,
+value, closing artifact/generator substitution. Strict `tokenizer.json` plus
+`tokenizer_config.json` loading and Qwen `<|im_start|>` chat rendering now exist
+without implicit BOS injection. Main-binary schema-v3 CLI wiring and real
+CPU/CUDA fixtures remain open. Until those exist,
 the production builder is a hardened seam, not release-gate evidence.
 
 ## Slice 2 — request security and resource governance

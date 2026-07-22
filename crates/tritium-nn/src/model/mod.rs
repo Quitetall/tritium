@@ -7,6 +7,8 @@
 #[cfg(feature = "tokenizer")]
 mod bpe_tokenizer;
 mod hf;
+#[cfg(feature = "tokenizer")]
+mod hf_json_tokenizer;
 mod hf_shards;
 mod qwen35;
 mod qwen35_hf;
@@ -23,6 +25,8 @@ mod weights;
 
 #[cfg(feature = "tokenizer")]
 pub use bpe_tokenizer::GgufBpeTokenizer;
+#[cfg(feature = "tokenizer")]
+pub use hf_json_tokenizer::HfJsonTokenizer;
 pub use qwen35::{
     Qwen35TextCache, Qwen35TextLayerWeights, Qwen35TextMixerWeights, Qwen35TextOutput,
     Qwen35TextRunner, Qwen35TextWeights,

@@ -42,6 +42,9 @@ pub enum ChatTemplate {
     /// encode. Requires a real BPE tokenizer (the special tokens must map
     /// to their control ids).
     RoleEot,
+    /// Qwen chat format: one `<|im_start|>role` block per message, terminated
+    /// by `<|im_end|>`, followed by assistant generation prefix.
+    QwenIm,
 }
 
 impl ChatTemplate {
@@ -67,6 +70,18 @@ impl ChatTemplate {
                     out.push_str("<|eot_id|>");
                 }
                 out.push_str("Assistant: ");
+                out
+            }
+            ChatTemplate::QwenIm => {
+                let mut out = String::new();
+                for (role, content) in messages {
+                    out.push_str("<|im_start|>");
+                    out.push_str(role);
+                    out.push('\n');
+                    out.push_str(content.trim());
+                    out.push_str("<|im_end|>\n");
+                }
+                out.push_str("<|im_start|>assistant\n");
                 out
             }
         }
@@ -1332,4 +1347,21 @@ fn tree_error(e: &TreeOpError) -> Response {
         TreeOpError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
     };
     api_error(code, kind, e.to_string(), None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ChatTemplate;
+
+    #[test]
+    fn qwen_template_preserves_roles_and_adds_generation_prefix() {
+        let rendered =
+            ChatTemplate::QwenIm.render([("system", " be safe "), ("user", " hello ")].into_iter());
+        assert_eq!(
+            rendered,
+            "<|im_start|>system\nbe safe<|im_end|>\n\
+             <|im_start|>user\nhello<|im_end|>\n\
+             <|im_start|>assistant\n"
+        );
+    }
 }
