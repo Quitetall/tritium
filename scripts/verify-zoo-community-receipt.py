@@ -12,6 +12,9 @@ from typing import Any
 ZOO_SCHEMA = "tritium.model-zoo-admission.v1"
 CLAIMS_SCHEMA = "tritium.generated-claims.v1"
 GOVERNANCE_SCHEMA = "tritium.governance-docs.v1"
+CLAIM_SOURCE_SCHEMA = "tritium.claim-source-snapshot.v1"
+REVIEW_SCHEMA = "tritium.governance-review-attestation.v1"
+GENERATOR_ID = "tritium-zoo-community-qualifier@1"
 COMMON_FIELDS = {
     "schema",
     "receipt_id",
@@ -23,9 +26,16 @@ COMMON_FIELDS = {
     "anchor_artifact",
 }
 ZOO_FIELDS = COMMON_FIELDS | {"models"}
-CLAIMS_FIELDS = COMMON_FIELDS | {"generator_id", "documents", "source_receipt_ids"}
+CLAIMS_FIELDS = COMMON_FIELDS | {
+    "generator_id",
+    "generator_file",
+    "source_registry",
+    "documents",
+    "source_receipt_ids",
+}
 GOVERNANCE_FIELDS = COMMON_FIELDS | {
     "files",
+    "review_attestation",
     "repository_links_checked",
     "contacts_checked",
     "independent_policy_review",
@@ -44,6 +54,21 @@ MODEL_FIELDS = {
     "evidence_receipt_ids",
 }
 FILE_FIELDS = {"path", "bytes", "sha256"}
+CLAIM_SOURCE_FIELDS = {
+    "schema",
+    "release",
+    "source_revision",
+    "candidate_manifest_sha256",
+    "registry_sha256",
+    "entries",
+}
+CLAIM_SOURCE_ENTRY_FIELDS = {"id", "kind", "artifact_id", "receipt"}
+REVIEW_FIELDS = {
+    "schema", "release", "source_revision", "reviewed_at_utc", "reviewer",
+    "reviewed_files", "repository_links_checked", "contacts_checked",
+    "independent_from_maintainers", "unstaffed_channels_advertised", "result",
+}
+REVIEWER_FIELDS = {"id", "organization"}
 EXPECTED_MODELS = (
     ("accessible", "tutorial", "HuggingFaceTB/SmolLM2-135M"),
     ("accessible", "recipe", "HuggingFaceTB/SmolLM2-1.7B"),
@@ -267,7 +292,11 @@ def validate_claims(
         candidate,
         anchor,
     )
-    string(receipt["generator_id"], "receipt.generator_id")
+    if receipt["generator_id"] != GENERATOR_ID:
+        raise ZooCommunityError("generated claim producer differs from policy")
+    generator = validate_file(receipt["generator_file"], repo, "generator_file")
+    if generator[0] != "scripts/qualify-zoo-community.py":
+        raise ZooCommunityError("generated claim producer path differs from policy")
     documents = receipt["documents"]
     if not isinstance(documents, list) or len(documents) != len(CLAIM_DOCUMENTS):
         raise ZooCommunityError("generated claim document inventory is incomplete")
@@ -286,6 +315,62 @@ def validate_claims(
         raise ZooCommunityError("generated claims require unique source receipts")
     for value in sources:
         digest(value, "claim source receipt id")
+    zoo_path = receipt_path.with_name("model-zoo.json")
+    zoo = validate_zoo(zoo_path, revision, release, candidate, anchor)
+    model_sources = list(
+        dict.fromkeys(
+            evidence_id
+            for model in zoo["models"]
+            for evidence_id in model["evidence_receipt_ids"]
+        )
+    )
+    if sources != [zoo["receipt_id"], *model_sources]:
+        raise ZooCommunityError("generated claims do not descend from adjacent model zoo")
+    source_record = object_(receipt["source_registry"], FILE_FIELDS, "source_registry")
+    source_path = contained(receipt_path.parent, source_record["path"], "source_registry")
+    if (source_path.stat().st_size, sha256(source_path)) != (
+        source_record["bytes"], source_record["sha256"]
+    ):
+        raise ZooCommunityError("claim source snapshot bytes drifted")
+    source = load(source_path, CLAIM_SOURCE_FIELDS, "claim source snapshot")
+    if (
+        source["schema"] != CLAIM_SOURCE_SCHEMA
+        or source["release"] != release
+        or source["source_revision"] != revision
+        or source["candidate_manifest_sha256"] != sha256(candidate)
+    ):
+        raise ZooCommunityError("claim source snapshot identity differs")
+    hex_(source["registry_sha256"], 64, "claim source registry digest")
+    entries = source["entries"]
+    if not isinstance(entries, list) or len(entries) != len(sources) - 1:
+        raise ZooCommunityError("claim source snapshot inventory is incomplete")
+    if [entry.get("id") for entry in entries if isinstance(entry, dict)] != sources[1:]:
+        raise ZooCommunityError("claim source snapshot order differs from claims")
+    for ordinal, raw in enumerate(entries):
+        entry = object_(raw, CLAIM_SOURCE_ENTRY_FIELDS, f"claim sources[{ordinal}]")
+        digest(entry["id"], "claim source id")
+        string(entry["kind"], "claim source kind")
+        string(entry["artifact_id"], "claim source artifact id")
+        _, _, expected_sha = validate_file(
+            entry["receipt"], source_path.parent, f"claim sources[{ordinal}].receipt"
+        )
+        support_path = contained(
+            source_path.parent, entry["receipt"]["path"],
+            f"claim sources[{ordinal}].receipt",
+        )
+        try:
+            support = json.loads(support_path.read_bytes())
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ZooCommunityError("claim source receipt must contain UTF-8 JSON") from error
+        if (
+            not isinstance(support, dict)
+            or support.get("receipt_id") != entry["id"]
+            or support.get("result") != "pass"
+            or support.get("release") != release
+            or support.get("source_revision") != revision
+            or sha256(support_path) != expected_sha
+        ):
+            raise ZooCommunityError("claim source receipt identity differs")
     return finish(receipt, "generated-claims")
 
 
@@ -314,6 +399,36 @@ def validate_governance(
         raise ZooCommunityError("governance file order differs from policy")
     for ordinal, document in enumerate(files):
         validate_file(document, repo, f"files[{ordinal}]")
+    review_record = object_(
+        receipt["review_attestation"], FILE_FIELDS, "review_attestation"
+    )
+    review_path = contained(
+        receipt_path.parent, review_record["path"], "review_attestation"
+    )
+    if (review_path.stat().st_size, sha256(review_path)) != (
+        review_record["bytes"], review_record["sha256"]
+    ):
+        raise ZooCommunityError("governance review attestation bytes drifted")
+    review = load(review_path, REVIEW_FIELDS, "governance review attestation")
+    reviewer = object_(review["reviewer"], REVIEWER_FIELDS, "governance reviewer")
+    string(reviewer["id"], "governance reviewer id")
+    string(reviewer["organization"], "governance reviewer organization")
+    if (
+        review["schema"] != REVIEW_SCHEMA
+        or review["release"] != release
+        or review["source_revision"] != revision
+        or review["result"] != "pass"
+        or review["reviewed_files"] != list(GOVERNANCE_FILES)
+    ):
+        raise ZooCommunityError("governance review identity or inventory differs")
+    string(review["reviewed_at_utc"], "governance reviewed_at_utc")
+    for field in (
+        "repository_links_checked", "contacts_checked", "independent_from_maintainers"
+    ):
+        if review[field] is not True:
+            raise ZooCommunityError(f"governance review {field} must pass")
+    if review["unstaffed_channels_advertised"] is not False:
+        raise ZooCommunityError("governance review advertises an unstaffed channel")
     for field in (
         "repository_links_checked",
         "contacts_checked",

@@ -58,6 +58,54 @@ def write(path: Path, value):
     path.write_bytes(canonical(value) + b"\n")
 
 
+def claim_snapshot(root: Path, evidence_ids):
+    support = root / "support"
+    evidence = support / "evidence"
+    evidence.mkdir(parents=True, exist_ok=True)
+    entries = []
+    for ordinal, evidence_id in enumerate(evidence_ids):
+        receipt = evidence / f"{ordinal:02d}.json"
+        write(receipt, {
+            "receipt_id": evidence_id, "result": "pass",
+            "release": "1.1.0-rc.0", "source_revision": "a" * 40,
+        })
+        entries.append({
+            "id": evidence_id, "kind": "model-evidence",
+            "artifact_id": f"artifact-{ordinal}",
+            "receipt": {
+                "path": f"evidence/{ordinal:02d}.json",
+                "bytes": receipt.stat().st_size,
+                "sha256": hashlib.sha256(receipt.read_bytes()).hexdigest(),
+            },
+        })
+    snapshot = support / "source-registry.json"
+    write(snapshot, {
+        "schema": MODULE["CLAIM_SOURCE_SCHEMA"], "release": "1.1.0-rc.0",
+        "source_revision": "a" * 40,
+        "candidate_manifest_sha256": hashlib.sha256(
+            (root / "manifest.json").read_bytes()
+        ).hexdigest(),
+        "registry_sha256": "9" * 64, "entries": entries,
+    })
+    return file_record(root, "support/source-registry.json")
+
+
+def governance_review(root: Path, *, independent=True):
+    path = root / "support/governance-review.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write(path, {
+        "schema": MODULE["REVIEW_SCHEMA"], "release": "1.1.0-rc.0",
+        "source_revision": "a" * 40,
+        "reviewed_at_utc": "2026-07-22T12:00:00Z",
+        "reviewer": {"id": "reviewer-1", "organization": "Independent Lab"},
+        "reviewed_files": list(MODULE["GOVERNANCE_FILES"]),
+        "repository_links_checked": True, "contacts_checked": True,
+        "independent_from_maintainers": independent,
+        "unstaffed_channels_advertised": False, "result": "pass",
+    })
+    return file_record(root, "support/governance-review.json")
+
+
 class ZooCommunityReceiptTests(unittest.TestCase):
     def test_accepts_frozen_zoo_claim_and_governance_inventories(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -79,7 +127,7 @@ class ZooCommunityReceiptTests(unittest.TestCase):
                     }
                 )
             zoo = seal({**common, "schema": MODULE["ZOO_SCHEMA"], "models": models})
-            zoo_path = root / "zoo.json"
+            zoo_path = root / "model-zoo.json"
             write(zoo_path, zoo)
             self.assertEqual(
                 validate_zoo(zoo_path, "a" * 40, "1.1.0-rc.0", candidate, wheel), zoo
@@ -88,14 +136,19 @@ class ZooCommunityReceiptTests(unittest.TestCase):
             repo = root / "repo"
             repo.mkdir()
             documents = [file_record(repo, path) for path in MODULE["CLAIM_DOCUMENTS"]]
+            generator_file = file_record(repo, "scripts/qualify-zoo-community.py")
+            evidence_ids = [model["evidence_receipt_ids"][0] for model in models]
+            source_registry = claim_snapshot(root, evidence_ids)
             claims = seal(
                 {
                     **common,
                     "schema": MODULE["CLAIMS_SCHEMA"],
                     "run_id": "claims-1",
-                    "generator_id": "tritium-claims@1",
+                    "generator_id": MODULE["GENERATOR_ID"],
+                    "generator_file": generator_file,
+                    "source_registry": source_registry,
                     "documents": documents,
-                    "source_receipt_ids": [zoo["receipt_id"]],
+                    "source_receipt_ids": [zoo["receipt_id"], *evidence_ids],
                 }
             )
             claims_path = root / "claims.json"
@@ -106,14 +159,23 @@ class ZooCommunityReceiptTests(unittest.TestCase):
                 ),
                 claims,
             )
+            (root / "support/evidence/00.json").write_text(
+                "{}\n", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(ZooCommunityError, "drifted"):
+                validate_claims(
+                    claims_path, "a" * 40, "1.1.0-rc.0", candidate, wheel, repo
+                )
 
             files = [file_record(repo, path) for path in MODULE["GOVERNANCE_FILES"]]
+            review_attestation = governance_review(root)
             governance = seal(
                 {
                     **common,
                     "schema": MODULE["GOVERNANCE_SCHEMA"],
                     "run_id": "governance-1",
                     "files": files,
+                    "review_attestation": review_attestation,
                     "repository_links_checked": True,
                     "contacts_checked": True,
                     "independent_policy_review": True,
@@ -150,22 +212,31 @@ class ZooCommunityReceiptTests(unittest.TestCase):
                 )
             models[-1]["evidence_receipt_ids"] = []
             zoo = seal({**common, "schema": MODULE["ZOO_SCHEMA"], "models": models})
-            zoo_path = root / "zoo.json"
+            zoo_path = root / "model-zoo.json"
             write(zoo_path, zoo)
             with self.assertRaisesRegex(ZooCommunityError, "evidence_receipt_ids"):
                 validate_zoo(zoo_path, "a" * 40, "1.1.0-rc.0", candidate, wheel)
 
+            models[-1]["evidence_receipt_ids"] = ["sha256:" + "8" * 64]
+            zoo = seal({**common, "schema": MODULE["ZOO_SCHEMA"], "models": models})
+            write(zoo_path, zoo)
+
             repo = root / "repo"
             repo.mkdir()
             documents = [file_record(repo, path) for path in MODULE["CLAIM_DOCUMENTS"]]
+            generator_file = file_record(repo, "scripts/qualify-zoo-community.py")
+            evidence_ids = [model["evidence_receipt_ids"][0] for model in models]
+            source_registry = claim_snapshot(root, evidence_ids)
             claims = seal(
                 {
                     **common,
                     "schema": MODULE["CLAIMS_SCHEMA"],
                     "run_id": "claims-1",
-                    "generator_id": "tritium-claims@1",
+                    "generator_id": MODULE["GENERATOR_ID"],
+                    "generator_file": generator_file,
+                    "source_registry": source_registry,
                     "documents": documents,
-                    "source_receipt_ids": ["sha256:" + "8" * 64],
+                    "source_receipt_ids": [zoo["receipt_id"], *evidence_ids],
                 }
             )
             claims_path = root / "claims.json"
@@ -179,12 +250,14 @@ class ZooCommunityReceiptTests(unittest.TestCase):
                 )
 
             files = [file_record(repo, path) for path in MODULE["GOVERNANCE_FILES"]]
+            review_attestation = governance_review(root)
             governance = seal(
                 {
                     **common,
                     "schema": MODULE["GOVERNANCE_SCHEMA"],
                     "run_id": "governance-1",
                     "files": files,
+                    "review_attestation": review_attestation,
                     "repository_links_checked": True,
                     "contacts_checked": True,
                     "independent_policy_review": False,
