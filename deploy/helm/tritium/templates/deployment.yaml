@@ -1,0 +1,239 @@
+{{- if or (hasPrefix "/" .Values.artifact.sourcePvc.subPath) (contains ".." .Values.artifact.sourcePvc.subPath) }}
+{{- fail "artifact.sourcePvc.subPath must be a contained relative path" }}
+{{- end }}
+{{- if gt (int64 .Values.requestLimits.maxNew) (int64 .Values.requestLimits.maxCompletionTokens) }}
+{{- fail "requestLimits.maxNew must not exceed maxCompletionTokens" }}
+{{- end }}
+{{- if gt (int64 .Values.requestLimits.maxNew) (int64 .Values.requestLimits.maxTotalTokens) }}
+{{- fail "requestLimits.maxNew must not exceed maxTotalTokens" }}
+{{- end }}
+{{- if and .Values.keda.enabled (gt (int64 .Values.keda.minReplicaCount) (int64 .Values.keda.maxReplicaCount)) }}
+{{- fail "keda.minReplicaCount must not exceed maxReplicaCount" }}
+{{- end }}
+{{- if and (not .Values.gpu.enabled) (hasKey .Values.resources.limits .Values.gpu.resourceName) }}
+{{- fail "GPU resource limits require gpu.enabled=true" }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "tritium.fullname" . }}
+  labels:
+    {{- include "tritium.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  revisionHistoryLimit: {{ .Values.revisionHistoryLimit }}
+  strategy:
+    {{- if .Values.gpu.enabled }}
+    type: Recreate
+    {{- else }}
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+    {{- end }}
+  selector:
+    matchLabels:
+      {{- include "tritium.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "tritium.selectorLabels" . | nindent 8 }}
+        tritium.ai/backend: {{ .Values.backend | quote }}
+      annotations:
+        tritium.ai/image-digest: {{ .Values.image.digest | quote }}
+        tritium.ai/artifact-sha256: {{ .Values.artifact.expectedSha256 | quote }}
+        tritium.ai/drain-mode: sigterm-graceful
+    spec:
+      automountServiceAccountToken: false
+      shareProcessNamespace: true
+      {{- with .Values.serviceAccountName }}
+      serviceAccountName: {{ . }}
+      {{- end }}
+      {{- with .Values.runtimeClassName }}
+      runtimeClassName: {{ . }}
+      {{- end }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- range . }}
+        - name: {{ . }}
+        {{- end }}
+      {{- end }}
+      initContainers:
+        - name: stage-verified-artifact
+          image: {{ .Values.artifact.verifierImage | quote }}
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-ec"]
+          args:
+            - >-
+              umask 077;
+              cp "/source/${MODEL_FILE}" /staged/model.gguf;
+              printf '%s  %s\n' "${EXPECTED_SHA256}" /staged/model.gguf | sha256sum -c -;
+              chmod 0444 /staged/model.gguf
+          env:
+            - name: MODEL_FILE
+              value: {{ .Values.artifact.modelFile | quote }}
+            - name: EXPECTED_SHA256
+              value: {{ .Values.artifact.expectedSha256 | quote }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          resources:
+            requests: {cpu: 10m, memory: 16Mi, ephemeral-storage: 64Gi}
+            limits: {cpu: 500m, memory: 256Mi, ephemeral-storage: 66Gi}
+          volumeMounts:
+            - name: source-artifact
+              mountPath: /source
+              readOnly: true
+              {{- with .Values.artifact.sourcePvc.subPath }}
+              subPath: {{ . }}
+              {{- end }}
+            - name: staged-artifact
+              mountPath: /staged
+      containers:
+        - name: tritium
+          image: {{ printf "%s@%s" .Values.image.repository .Values.image.digest | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --model
+            - /artifacts/model.gguf
+            - --backend
+            - {{ .Values.backend | quote }}
+            - --host
+            - 0.0.0.0
+            - --port
+            - {{ int64 .Values.service.port | quote }}
+            - --model-id
+            - {{ .Values.modelId | quote }}
+            - --max-new
+            - {{ int64 .Values.requestLimits.maxNew | quote }}
+            - --max-messages
+            - {{ int64 .Values.requestLimits.maxMessages | quote }}
+            - --max-prompt-bytes
+            - {{ int64 .Values.requestLimits.maxPromptBytes | quote }}
+            - --max-prompt-tokens
+            - {{ int64 .Values.requestLimits.maxPromptTokens | quote }}
+            - --max-completion-tokens
+            - {{ int64 .Values.requestLimits.maxCompletionTokens | quote }}
+            - --max-total-tokens
+            - {{ int64 .Values.requestLimits.maxTotalTokens | quote }}
+            - --rate-limit-rpm
+            - {{ int64 .Values.requestLimits.rateLimitRpm | quote }}
+            - --rate-limit-burst
+            - {{ int64 .Values.requestLimits.rateLimitBurst | quote }}
+          env:
+            - name: TRITIUM_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.auth.existingSecret }}
+                  key: {{ .Values.auth.key }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.port }}
+              protocol: TCP
+          startupProbe:
+            tcpSocket: {port: http}
+            {{- toYaml .Values.probes.startup | nindent 12 }}
+          livenessProbe:
+            tcpSocket: {port: http}
+            {{- toYaml .Values.probes.liveness | nindent 12 }}
+          readinessProbe:
+            tcpSocket: {port: http}
+            {{- toYaml .Values.probes.readiness | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          resources:
+            requests:
+              {{- toYaml .Values.resources.requests | nindent 14 }}
+            limits:
+              {{- range $key, $value := .Values.resources.limits }}
+              {{- if ne $key $.Values.gpu.resourceName }}
+              {{ $key }}: {{ $value | quote }}
+              {{- end }}
+              {{- end }}
+              {{- if .Values.gpu.enabled }}
+              {{ .Values.gpu.resourceName }}: {{ .Values.gpu.count }}
+              {{- end }}
+          volumeMounts:
+            - name: staged-artifact
+              mountPath: /artifacts
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+        - name: authenticated-probe
+          image: {{ .Values.artifact.verifierImage | quote }}
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-ec"]
+          args:
+            - >-
+              failures=0;
+              while sleep {{ int64 .Values.probes.watchdog.periodSeconds }}; do
+                if wget -qO- --timeout={{ int64 .Values.probes.watchdog.timeoutSeconds }}
+                  --header="Authorization: Bearer ${TRITIUM_AUTH_TOKEN}"
+                  http://127.0.0.1:{{ .Values.service.port }}/healthz
+                  | grep -q '\"status\":\"ok\"'; then
+                  failures=0;
+                else
+                  failures=$((failures + 1));
+                  if [ "$failures" -ge {{ int64 .Values.probes.watchdog.failureThreshold }} ]; then
+                    pid="$(pidof tritium-serve || true)";
+                    [ -n "$pid" ] && kill $pid;
+                    exit 1;
+                  fi;
+                fi;
+              done
+          env:
+            - name: TRITIUM_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.auth.existingSecret }}
+                  key: {{ .Values.auth.key }}
+          startupProbe:
+            exec:
+              command: ["sh", "-ec", "wget -qO- --header=\"Authorization: Bearer ${TRITIUM_AUTH_TOKEN}\" http://127.0.0.1:{{ .Values.service.port }}/healthz | grep -q '\"status\":\"ok\"'"]
+            {{- toYaml .Values.probes.startup | nindent 12 }}
+          readinessProbe:
+            exec:
+              command: ["sh", "-ec", "wget -qO- --header=\"Authorization: Bearer ${TRITIUM_AUTH_TOKEN}\" http://127.0.0.1:{{ .Values.service.port }}/readyz | grep -q '\"status\":\"ready\"'"]
+            {{- toYaml .Values.probes.readiness | nindent 12 }}
+          livenessProbe:
+            exec:
+              command: ["sh", "-ec", "wget -qO- --header=\"Authorization: Bearer ${TRITIUM_AUTH_TOKEN}\" http://127.0.0.1:{{ .Values.service.port }}/healthz >/dev/null"]
+            {{- toYaml .Values.probes.liveness | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          resources:
+            requests: {cpu: 5m, memory: 8Mi}
+            limits: {cpu: 100m, memory: 32Mi}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: source-artifact
+          persistentVolumeClaim:
+            claimName: {{ .Values.artifact.sourcePvc.claimName }}
+            readOnly: true
+        - name: staged-artifact
+          emptyDir:
+            sizeLimit: {{ .Values.artifact.stagedSizeLimit }}
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Mi
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

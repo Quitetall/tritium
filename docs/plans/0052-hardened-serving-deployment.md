@@ -206,6 +206,18 @@ install, request, scale signal, restart, rolling update, failed update and
 rollback. The CUDA lane runs on an actual NVIDIA Kubernetes node and records
 driver/runtime/GPU identity; CPU structural rendering cannot green it.
 
+Progress (2026-07-21): a strict-schema Helm chart now covers digest-only images,
+PVC-to-bounded-emptyDir artifact staging with SHA-256 verification, CPU/CUDA
+resources, runtime class and scheduling, pod/container security, Secret-backed
+auth, authenticated readiness plus bounded worker-death restart through a
+same-UID loopback watchdog sidecar, GPU-safe `Recreate` updates, PDB,
+NetworkPolicy, ServiceMonitor and bounded KEDA scaling. Standalone KEDA and
+Knative CPU tutorial examples are explicitly non-zero-scale compatibility
+profiles. Pinned offline Helm lint/render and Python schema contracts are
+local-green. Admin/preStop drain, schema-v3 loader wiring, kind install/rollout/
+rollback, URI-to-PVC staging, live Prometheus/KEDA, Knative cold start and NVIDIA
+Kubernetes evidence remain open gates.
+
 ## Slice 6 — failure injection and release evidence
 
 Run the exact local-RC image/chart through a sealed scenario matrix:

@@ -1,0 +1,29 @@
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: tritium
+  labels:
+    app.kubernetes.io/name: tritium
+    tritium.ai/example: queue-pressure
+spec:
+  scaleTargetRef: {name: tritium}
+  pollingInterval: 15
+  cooldownPeriod: 300
+  minReplicaCount: 1
+  maxReplicaCount: 4
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 300
+          policies: [{type: Percent, value: 25, periodSeconds: 60}]
+        scaleUp:
+          stabilizationWindowSeconds: 30
+          policies: [{type: Pods, value: 1, periodSeconds: 60}]
+  triggers:
+    - type: prometheus
+      metadata:
+        serverAddress: http://prometheus.monitoring.svc:9090
+        metricName: tritium_queue_pressure
+        threshold: "8"
+        query: max(tritium_queue_depth{namespace="tritium",service="tritium"})

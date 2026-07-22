@@ -1,0 +1,113 @@
+replicaCount: 1
+
+image:
+  repository: example.invalid/tritium-serve
+  digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+
+backend: cpu
+modelId: tritium
+serviceAccountName: ""
+runtimeClassName: ""
+
+artifact:
+  sourcePvc:
+    claimName: tritium-artifact
+    subPath: ""
+  modelFile: model.gguf
+  expectedSha256: "0000000000000000000000000000000000000000000000000000000000000000"
+  stagedSizeLimit: 64Gi
+  verifierImage: docker.io/library/busybox:1.37.0-musl@sha256:6be969a074d06073a62ad8ccfd2ad6ec2790cae25d519d8df255ba24819d96f0
+
+auth:
+  existingSecret: tritium-auth
+  key: token
+
+service:
+  type: ClusterIP
+  port: 8080
+  annotations: {}
+
+requestLimits:
+  maxNew: 256
+  maxMessages: 128
+  maxPromptBytes: 1048576
+  maxPromptTokens: 131072
+  maxCompletionTokens: 4096
+  maxTotalTokens: 131072
+  rateLimitRpm: 120
+  rateLimitBurst: 8
+
+resources:
+  requests:
+    cpu: "2"
+    memory: 8Gi
+    ephemeral-storage: 64Gi
+  limits:
+    cpu: "8"
+    memory: 32Gi
+    ephemeral-storage: 66Gi
+
+gpu:
+  enabled: false
+  resourceName: nvidia.com/gpu
+  count: 1
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  fsGroupChangePolicy: OnRootMismatch
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]
+
+terminationGracePeriodSeconds: 60
+revisionHistoryLimit: 3
+
+probes:
+  startup: {failureThreshold: 60, periodSeconds: 5, timeoutSeconds: 2}
+  readiness: {failureThreshold: 1, periodSeconds: 5, timeoutSeconds: 2}
+  liveness: {failureThreshold: 3, periodSeconds: 10, timeoutSeconds: 2}
+  watchdog: {failureThreshold: 3, periodSeconds: 10, timeoutSeconds: 2}
+
+nodeSelector:
+  kubernetes.io/arch: amd64
+affinity: {}
+tolerations: []
+topologySpreadConstraints: []
+
+pdb:
+  enabled: true
+  minAvailable: 1
+
+networkPolicy:
+  enabled: true
+  ingressNamespaceSelector: {}
+
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  labels: {}
+  ingressNamespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: monitoring
+
+keda:
+  enabled: false
+  minReplicaCount: 1
+  maxReplicaCount: 4
+  pollingInterval: 15
+  cooldownPeriod: 300
+  stabilizationWindowSeconds: 300
+  prometheus:
+    serverAddress: http://prometheus.monitoring.svc:9090
+    threshold: "8"
+    query: max(tritium_queue_depth{namespace="{{ .Release.Namespace }}",service="{{ include "tritium.fullname" . }}"})

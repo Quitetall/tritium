@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root="$(git rev-parse --show-toplevel)"
+image="docker.io/alpine/helm:3.18.4@sha256:1e4409103989b4ed9e34c132c2ac350b744ce2514aaa1440df0ea59063d83ae6"
+render="$(mktemp)"
+trap 'rm -f "$render"' EXIT
+docker run --rm --pull=never --network none --volume "$root:/src:ro" --workdir /src "$image" \
+  lint deploy/helm/tritium
+if docker run --rm --pull=never --network none --volume "$root:/src:ro" --workdir /src "$image" \
+  template tritium deploy/helm/tritium --set backend=cuda >/dev/null 2>&1; then
+  echo "chart schema admitted CUDA without GPU resources" >&2
+  exit 1
+fi
+docker run --rm --pull=never --network none --volume "$root:/src:ro" --workdir /src "$image" \
+  template tritium deploy/helm/tritium --namespace tritium >"$render"
+if grep -Eq '"[0-9]+\.[0-9]+e\+[0-9]+"' "$render"; then
+  echo "rendered CLI argument uses scientific notation" >&2
+  exit 1
+fi
+docker run --rm --pull=never --network none --volume "$root:/src:ro" --workdir /src "$image" \
+  template tritium deploy/helm/tritium --namespace tritium \
+  --set backend=cuda --set gpu.enabled=true --set keda.enabled=true \
+  --set serviceMonitor.enabled=true >"$render"
+if ! grep -q 'type: Recreate' "$render"; then
+  echo "rendered CUDA deployment does not use the bounded Recreate strategy" >&2
+  exit 1
+fi
+if grep -Eq '"[0-9]+\.[0-9]+e\+[0-9]+"' "$render"; then
+  echo "rendered CUDA CLI argument uses scientific notation" >&2
+  exit 1
+fi

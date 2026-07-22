@@ -1,0 +1,33 @@
+{{- if .Values.keda.enabled }}
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: {{ include "tritium.fullname" . }}
+  labels:
+    {{- include "tritium.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    name: {{ include "tritium.fullname" . }}
+  pollingInterval: {{ .Values.keda.pollingInterval }}
+  cooldownPeriod: {{ .Values.keda.cooldownPeriod }}
+  minReplicaCount: {{ .Values.keda.minReplicaCount }}
+  maxReplicaCount: {{ .Values.keda.maxReplicaCount }}
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: {{ .Values.keda.stabilizationWindowSeconds }}
+          policies:
+            - {type: Percent, value: 25, periodSeconds: 60}
+        scaleUp:
+          stabilizationWindowSeconds: 30
+          policies:
+            - {type: Pods, value: 1, periodSeconds: 60}
+  triggers:
+    - type: prometheus
+      metadata:
+        serverAddress: {{ .Values.keda.prometheus.serverAddress | quote }}
+        metricName: tritium_queue_pressure
+        threshold: {{ .Values.keda.prometheus.threshold | quote }}
+        query: {{ tpl .Values.keda.prometheus.query . | quote }}
+{{- end }}
