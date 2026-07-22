@@ -125,6 +125,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if queue_cap == 0 {
         return Err("--queue-cap must be >= 1".into());
     }
+    // Reject configuration before backend initialization or multi-gigabyte
+    // artifact loading. Startup qualification depends on malformed limits
+    // failing fast, without touching model/device state.
+    if [
+        max_new,
+        max_messages,
+        max_prompt_bytes,
+        max_prompt_tokens,
+        max_new_tokens,
+        max_total_tokens,
+    ]
+    .contains(&0)
+    {
+        return Err("all request and prompt limits must be >= 1".into());
+    }
+    if max_new > max_new_tokens {
+        return Err("--max-new must not exceed --max-completion-tokens".into());
+    }
+    if max_new > max_total_tokens {
+        return Err("--max-new must not exceed --max-total-tokens".into());
+    }
     // Resolve the named backend from the runtime registry (the same owned-init
     // pattern the acceptance tests use). `cpu` is always linked; `cuda` needs
     // the `cuda` cargo feature and a working device.
@@ -268,24 +289,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     batched worker's pool)"
                 .into(),
         );
-    }
-    if [
-        max_new,
-        max_messages,
-        max_prompt_bytes,
-        max_prompt_tokens,
-        max_new_tokens,
-        max_total_tokens,
-    ]
-    .contains(&0)
-    {
-        return Err("all request and prompt limits must be >= 1".into());
-    }
-    if max_new > max_new_tokens {
-        return Err("--max-new must not exceed --max-completion-tokens".into());
-    }
-    if max_new > max_total_tokens {
-        return Err("--max-new must not exceed --max-total-tokens".into());
     }
     let cfg = ServeConfig {
         model_id,

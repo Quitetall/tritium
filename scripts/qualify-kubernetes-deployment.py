@@ -34,7 +34,7 @@ manifest_identity = RUNTIME["manifest_identity"]
 OCI_ARCHIVE = runpy.run_path(Path(__file__).with_name("verify-oci-archive.py"))
 validate_oci_archive = OCI_ARCHIVE["validate"]
 
-SCHEMA = "tritium.kubernetes-deployment-qualification.v12"
+SCHEMA = "tritium.kubernetes-deployment-qualification.v13"
 HEX = frozenset("0123456789abcdef")
 SAFE_NAME = re.compile(r"[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?")
 SAFE_SECRET_KEY = re.compile(r"[A-Za-z0-9](?:[-._A-Za-z0-9]{0,251}[A-Za-z0-9])?")
@@ -58,6 +58,7 @@ CUDA_PROBE_IMAGES = {
 CHECKS = (
     "namespace-preflight", "secret-binding", "pvc-preflight", "helm-install",
     "missing-secret-startup-failure",
+    "invalid-config-startup-failure", "unavailable-backend-startup-failure",
     "rollout-ready", "production-readiness", "buffered-generation", "metrics",
     "watchdog-replacement", "pod-restart", "artifact-volume-loss",
     "memory-oom-recovery",
@@ -104,6 +105,10 @@ COLLECTOR_OUTAGE_TRANSITIONS = [
 MISSING_SECRET_TRANSITIONS = [
     "baseline_ready", "fault_applied", "config_error_observed",
     "secret_restored", "recovery_ready",
+]
+STARTUP_ARGUMENT_TRANSITIONS = [
+    "baseline_ready", "fault_applied", "process_exit_observed",
+    "argument_restored", "recovery_ready",
 ]
 
 
@@ -603,6 +608,399 @@ def restore_missing_secret_refs(kubectl_base: list[str], *, service: str,
     if final_values != [contract["secret_name"]] * len(final_values):
         raise DeploymentError("missing-Secret startup cleanup preserved foreign drift")
     return live
+
+
+def startup_argument_contract(document: dict[str, Any], *, flag: str,
+                              source_value: str) -> dict[str, Any]:
+    metadata = document.get("metadata", {})
+    containers = document.get("spec", {}).get("template", {}).get(
+        "spec", {}
+    ).get("containers")
+    if (not isinstance(metadata.get("uid"), str) or not metadata["uid"]
+            or not isinstance(metadata.get("resourceVersion"), str)
+            or not metadata["resourceVersion"]
+            or not isinstance(containers, list)
+            or [item.get("name") if isinstance(item, dict) else None
+                for item in containers] != ["tritium", "authenticated-probe"]):
+        raise DeploymentError("startup argument baseline identity differs")
+    args = containers[0].get("args")
+    if (not isinstance(args, list) or any(not isinstance(item, str) for item in args)):
+        raise DeploymentError("startup argument vector is malformed")
+    positions = [index for index, item in enumerate(args) if item == flag]
+    if (len(positions) != 1 or positions[0] + 1 >= len(args)
+            or args[positions[0] + 1] != source_value):
+        raise DeploymentError(f"startup argument {flag} binding differs")
+    value_index = positions[0] + 1
+    return {
+        "deployment_uid": metadata["uid"],
+        "resource_version": metadata["resourceVersion"],
+        "container": "tritium", "container_index": 0, "flag": flag,
+        "flag_index": positions[0], "flag_path": (
+            f"/spec/template/spec/containers/0/args/{positions[0]}"
+        ),
+        "value_index": value_index, "source_value": source_value, "args": args,
+        "path": f"/spec/template/spec/containers/0/args/{value_index}",
+    }
+
+
+def startup_argument_value(document: dict[str, Any], contract: dict[str, Any]) -> Any:
+    try:
+        container = document["spec"]["template"]["spec"]["containers"][
+            contract["container_index"]
+        ]
+        args = container["args"]
+        if container.get("name") != contract["container"]:
+            raise KeyError("container")
+        return args[contract["value_index"]]
+    except (KeyError, IndexError, TypeError) as error:
+        raise DeploymentError("startup argument path changed") from error
+
+
+def startup_argument_vector(document: dict[str, Any], contract: dict[str, Any]) -> list[str]:
+    try:
+        container = document["spec"]["template"]["spec"]["containers"][
+            contract["container_index"]
+        ]
+        args = container["args"]
+    except (KeyError, IndexError, TypeError) as error:
+        raise DeploymentError("startup argument vector path changed") from error
+    if (container.get("name") != contract["container"] or not isinstance(args, list)
+            or any(not isinstance(item, str) for item in args)):
+        raise DeploymentError("startup argument vector changed shape")
+    return args
+
+
+def startup_process_failure(document: dict[str, Any], *, baseline_uids: set[str]) \
+        -> dict[str, Any] | None:
+    items = document.get("items")
+    if not isinstance(items, list):
+        raise DeploymentError("startup process-failure pod listing is malformed")
+    matches = []
+    for item in items:
+        if not isinstance(item, dict):
+            raise DeploymentError("startup process-failure pod is malformed")
+        metadata = item.get("metadata", {})
+        uid = metadata.get("uid")
+        if uid in baseline_uids:
+            continue
+        statuses = item.get("status", {}).get("containerStatuses", [])
+        tritium = [status for status in statuses if isinstance(status, dict)
+                   and status.get("name") == "tritium"]
+        if len(tritium) != 1:
+            continue
+        status = tritium[0]
+        terminated = status.get("state", {}).get("terminated")
+        termination_source = "current"
+        if not isinstance(terminated, dict):
+            terminated = status.get("lastState", {}).get("terminated")
+            termination_source = "last_state"
+        if not isinstance(terminated, dict):
+            continue
+        exit_code = terminated.get("exitCode")
+        restart_count = status.get("restartCount")
+        reason = terminated.get("reason")
+        if (type(exit_code) is not int or exit_code == 0
+                or type(restart_count) is not int or restart_count < 0
+                or not isinstance(reason, str) or not reason):
+            raise DeploymentError("startup process termination is malformed")
+        name = metadata.get("name")
+        if not isinstance(name, str) or not name or not isinstance(uid, str) or not uid:
+            raise DeploymentError("startup process-failure pod identity is malformed")
+        replica_set = controller_owner(metadata, "ReplicaSet")
+        matches.append({
+            "pod_name": name, "pod_uid": uid, "container": "tritium",
+            "exit_code": exit_code, "reason": reason,
+            "restart_count": restart_count, "termination_source": termination_source,
+            "replica_set_name": replica_set["name"],
+            "replica_set_uid": replica_set["uid"],
+        })
+    if len(matches) > 1:
+        raise DeploymentError("multiple startup process-failure pods observed")
+    return matches[0] if matches else None
+
+
+def startup_error_line(output: str, *, scenario: str, flavor: str) -> str:
+    if not isinstance(output, str) or len(output.encode()) > 64 * 1024:
+        raise DeploymentError(f"{scenario} startup log exceeds byte limit")
+    lines = [line for line in output.splitlines() if line]
+    if scenario == "invalid_config":
+        expected = 'Error: "all request and prompt limits must be >= 1"'
+        matches = [line for line in lines if line == expected]
+    elif scenario == "unavailable_backend":
+        pattern = re.compile(
+            r'^Error: "backend `tritium-unavailable` is not in the registry '
+            r'\(linked backends: ([a-z0-9]+(?:, [a-z0-9]+)*)\); for cuda, build with '
+            r'`--features cuda`"$'
+        )
+        matches = []
+        expected_backends = {"cpu"} if flavor == "cpu" else {"cpu", "cuda"}
+        for line in lines:
+            match = pattern.fullmatch(line)
+            if match is not None:
+                observed = match.group(1).split(", ")
+                if len(observed) == len(set(observed)) and set(observed) == expected_backends:
+                    matches.append(line)
+    else:
+        raise DeploymentError("startup argument scenario is unknown")
+    if len(matches) != 1:
+        raise DeploymentError(f"{scenario} startup error line differs")
+    return matches[0]
+
+
+def restore_startup_argument(kubectl_base: list[str], *, service: str,
+                             contract: dict[str, Any], fault_value: str,
+                             timeout: float) -> dict[str, Any]:
+    live = run_json(
+        kubectl_base + ["get", f"deployment/{service}", "-o", "json"], timeout,
+    )
+    if live.get("metadata", {}).get("uid") != contract["deployment_uid"]:
+        raise DeploymentError("startup argument cleanup Deployment identity differs")
+    args = startup_argument_vector(live, contract)
+    baseline_args = contract["args"]
+    candidates = [index for index in range(len(args) - 1)
+                  if args[index] == contract["flag"] and args[index + 1] == fault_value]
+    if len(candidates) > 1:
+        raise DeploymentError("startup argument cleanup has duplicate injected bindings")
+    if candidates:
+        flag_index = candidates[0]
+        value_index = flag_index + 1
+        flag_path = f"/spec/template/spec/containers/0/args/{flag_index}"
+        value_path = f"/spec/template/spec/containers/0/args/{value_index}"
+        patch = [
+            {"op": "test", "path": "/metadata/uid",
+             "value": contract["deployment_uid"]},
+            {"op": "test", "path": flag_path, "value": contract["flag"]},
+            {"op": "test", "path": value_path, "value": fault_value},
+            {"op": "replace", "path": value_path,
+             "value": contract["source_value"]},
+        ]
+        payload = canonical(patch).decode().strip()
+        restore_error = None
+        try:
+            run(kubectl_base + [
+                "patch", f"deployment/{service}", "--type=json", f"--patch={payload}",
+            ], timeout)
+        except DeploymentError as error:
+            restore_error = error
+        live = run_json(
+            kubectl_base + ["get", f"deployment/{service}", "-o", "json"], timeout,
+        )
+        final_args = startup_argument_vector(live, contract)
+        if (live.get("metadata", {}).get("uid") != contract["deployment_uid"]
+                or any(final_args[index] == contract["flag"]
+                       and final_args[index + 1] == fault_value
+                       for index in range(len(final_args) - 1))):
+            message = "startup argument cleanup is unproven"
+            if restore_error is not None:
+                raise DeploymentError(message) from restore_error
+            raise DeploymentError(message)
+    else:
+        final_args = args
+    if final_args != baseline_args:
+        raise DeploymentError("startup argument cleanup preserved foreign drift")
+    return live
+
+
+def startup_log_command(kubectl_base: list[str], *, pod_name: str,
+                        termination_source: str) -> list[str]:
+    if termination_source not in {"current", "last_state"}:
+        raise DeploymentError("startup log termination source differs")
+    command = kubectl_base + ["logs", f"pod/{pod_name}", "--container=tritium"]
+    if termination_source == "last_state":
+        command.append("--previous")
+    return command
+
+
+def qualify_startup_argument_failure(
+        kubectl_base: list[str], *, scenario: str, flag: str, source_value: str,
+        fault_value: str, service: str, selector: str, deployment: dict[str, Any],
+        baseline: dict[str, Any], image: str, manifest_sha256: str, flavor: str,
+        service_port: int, token: str, model_id: str, prompt: str, timeout: float,
+        request_timeout: float, revision: str, profile: str, manifest_blake3: str,
+        release: str, expected_startup: dict[str, Any],
+        qualification_started: float) -> dict[str, Any]:
+    began = time.monotonic()
+    started_elapsed_ms = (began - qualification_started) * 1000
+    deadline = began + min(timeout, STARTUP_FAILURE_BUDGET_MS / 1000)
+    if started_elapsed_ms <= 0:
+        raise DeploymentError(f"{scenario} run-relative start differs")
+
+    def remaining() -> float:
+        value = deadline - time.monotonic()
+        if value <= 0:
+            raise DeploymentError(f"{scenario} startup deadline expired")
+        return value
+
+    transitions = []
+
+    def record(state: str) -> None:
+        transitions.append({
+            "state": state, "elapsed_ms": (time.monotonic() - began) * 1000,
+            "observed_at_utc": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+        })
+
+    if scenario not in {"invalid_config", "unavailable_backend"}:
+        raise DeploymentError("startup argument scenario is unknown")
+    contract = startup_argument_contract(
+        deployment, flag=flag, source_value=source_value,
+    )
+    baseline_uids = {pod["uid"] for pod in baseline["pods"]}
+    record("baseline_ready")
+    fault_patch = [
+        {"op": "test", "path": "/metadata/uid", "value": contract["deployment_uid"]},
+        {"op": "test", "path": "/metadata/resourceVersion",
+         "value": contract["resource_version"]},
+        {"op": "test", "path": contract["flag_path"], "value": flag},
+        {"op": "test", "path": contract["path"], "value": source_value},
+        {"op": "replace", "path": contract["path"], "value": fault_value},
+    ]
+    restore_patch = [
+        {"op": "test", "path": "/metadata/uid", "value": contract["deployment_uid"]},
+        {"op": "test", "path": contract["flag_path"], "value": flag},
+        {"op": "test", "path": contract["path"], "value": fault_value},
+        {"op": "replace", "path": contract["path"], "value": source_value},
+    ]
+    fault_payload = canonical(fault_patch).decode().strip()
+    restore_payload = canonical(restore_patch).decode().strip()
+    patch_attempted = False
+    failure = None
+    fault_version = None
+    restored = None
+    try:
+        patch_attempted = True
+        run(kubectl_base + [
+            "patch", f"deployment/{service}", "--type=json", f"--patch={fault_payload}",
+        ], remaining())
+        faulted = run_json(
+            kubectl_base + ["get", f"deployment/{service}", "-o", "json"], remaining(),
+        )
+        fault_version = faulted.get("metadata", {}).get("resourceVersion")
+        if (faulted.get("metadata", {}).get("uid") != contract["deployment_uid"]
+                or not isinstance(fault_version, str) or not fault_version
+                or fault_version == contract["resource_version"]):
+            raise DeploymentError(f"{scenario} startup fault was not admitted exactly")
+        expected_fault_args = list(contract["args"])
+        expected_fault_args[contract["value_index"]] = fault_value
+        if startup_argument_vector(faulted, contract) != expected_fault_args:
+            raise DeploymentError(f"{scenario} startup argument vector differs")
+        record("fault_applied")
+        while failure is None:
+            failure = startup_process_failure(
+                run_json(
+                    kubectl_base + ["get", "pods", "-l", selector, "-o", "json"],
+                    remaining(),
+                ), baseline_uids=baseline_uids,
+            )
+            if failure is None:
+                if remaining() <= 1:
+                    raise DeploymentError(f"{scenario} startup exit was not observed")
+                time.sleep(1)
+        replica_set_doc = run_json(kubectl_base + [
+            "get", f"replicaset/{failure['replica_set_name']}", "-o", "json",
+        ], remaining())
+        replica_metadata = replica_set_doc.get("metadata", {})
+        replica_owner = controller_owner(replica_metadata, "Deployment")
+        if (replica_metadata.get("name") != failure["replica_set_name"]
+                or replica_metadata.get("uid") != failure["replica_set_uid"]
+                or replica_owner != {"name": service, "uid": contract["deployment_uid"]}):
+            raise DeploymentError(f"{scenario} startup failure pod lineage differs")
+        failure["replica_set_owner"] = {
+            "kind": "Deployment", "name": replica_owner["name"],
+            "uid": replica_owner["uid"],
+        }
+        output = run(startup_log_command(
+            kubectl_base, pod_name=failure["pod_name"],
+            termination_source=failure["termination_source"],
+        ), remaining())
+        failure["error_line"] = startup_error_line(
+            output, scenario=scenario, flavor=flavor,
+        )
+        failure["normalized_log_sha256"] = hashlib.sha256(output.encode()).hexdigest()
+        record("process_exit_observed")
+    finally:
+        if patch_attempted:
+            restored = restore_startup_argument(
+                kubectl_base, service=service, contract=contract,
+                fault_value=fault_value, timeout=min(timeout, 60),
+            )
+            record("argument_restored")
+    if restored is None or failure is None:
+        raise DeploymentError(f"{scenario} startup evidence is incomplete")
+    restored_version = restored.get("metadata", {}).get("resourceVersion")
+    if (not isinstance(restored_version, str) or not restored_version
+            or restored_version in {contract["resource_version"], fault_version}):
+        raise DeploymentError(f"{scenario} restore resource version differs")
+    run(kubectl_base + ["rollout", "status", f"deployment/{service}",
+                        f"--timeout={math.ceil(remaining())}s"], remaining())
+    while True:
+        try:
+            recovered = pod_snapshot(run_json(
+                kubectl_base + ["get", "pods", "-l", selector, "-o", "json"],
+                remaining(),
+            ), flavor)
+            break
+        except DeploymentError:
+            if remaining() <= 1:
+                raise
+            time.sleep(1)
+    if failure["pod_uid"] in {pod["uid"] for pod in recovered["pods"]}:
+        raise DeploymentError(f"{scenario} failure pod survived recovery")
+    recovered_deployment = run_json(
+        kubectl_base + ["get", f"deployment/{service}", "-o", "json"], remaining(),
+    )
+    if validate_deployment(
+        recovered_deployment, image=image, manifest_sha256=manifest_sha256,
+        flavor=flavor,
+    ) != contract["deployment_uid"]:
+        raise DeploymentError(f"{scenario} recovery replaced Deployment identity")
+    port = free_port()
+    url = f"http://127.0.0.1:{port}"
+    process, ready = port_forward(
+        kubectl_base + ["port-forward", f"service/{service}",
+                        f"{port}:{service_port}", "--address", "127.0.0.1"],
+        time.monotonic() + remaining(), url, token,
+    )
+    try:
+        startup = validate_ready(
+            ready, revision, flavor, profile, manifest_blake3, release,
+        )
+        generation = request_json(
+            url + "/v1/chat/completions", token,
+            body={"model": model_id,
+                  "messages": [{"role": "user", "content": prompt}],
+                  "temperature": 0, "max_tokens": 1},
+            timeout=min(request_timeout, remaining()),
+        )
+        if not isinstance(generation.get("choices"), list) or len(generation["choices"]) != 1:
+            raise DeploymentError(f"{scenario} recovery generation differs")
+        metrics = metrics_snapshot(request(
+            url + "/metrics", token, timeout=min(request_timeout, remaining())
+        ).decode("utf-8"))
+    finally:
+        stop_forward(process)
+    if startup != expected_startup:
+        raise DeploymentError(f"{scenario} recovery changed startup receipt")
+    record("recovery_ready")
+    duration_ms = (time.monotonic() - began) * 1000
+    if duration_ms > STARTUP_FAILURE_BUDGET_MS:
+        raise DeploymentError(f"{scenario} startup deadline expired")
+    return {
+        "scenario": scenario, "deployment_uid": contract["deployment_uid"],
+        "baseline_resource_version": contract["resource_version"],
+        "fault_resource_version": fault_version,
+        "restored_resource_version": restored_version,
+        "binding": contract, "fault_value": fault_value,
+        "fault_patch_sha256": hashlib.sha256(fault_payload.encode()).hexdigest(),
+        "restore_patch_sha256": hashlib.sha256(restore_payload.encode()).hexdigest(),
+        "observation_budget_ms": STARTUP_FAILURE_BUDGET_MS,
+        "duration_ms": duration_ms, "started_elapsed_ms": started_elapsed_ms,
+        "completed_elapsed_ms": (time.monotonic() - qualification_started) * 1000,
+        "failure": failure, "recovered": recovered, "startup_receipt": startup,
+        "generation_response_sha256": hashlib.sha256(canonical(generation)).hexdigest(),
+        "request": request_evidence(model_id, prompt, temperature=0, max_tokens=1),
+        "metrics": metrics, "cleanup": {"status": "restored"},
+        "transitions": transitions,
+    }
 
 
 def qualify_missing_secret_startup(
@@ -2696,6 +3094,162 @@ def validate_missing_secret_startup(
     return value
 
 
+def validate_startup_argument_failure(
+        value: Any, *, scenario: str, flavor: str, model_id: str,
+        profile: str, service_port: int, deployment_name: str, deployment_uid: str,
+        startup_receipt: dict[str, Any], run_duration_ms: float) -> dict[str, Any]:
+    fields = {
+        "scenario", "deployment_uid", "baseline_resource_version",
+        "fault_resource_version", "restored_resource_version", "binding",
+        "fault_value", "fault_patch_sha256", "restore_patch_sha256",
+        "observation_budget_ms", "duration_ms", "started_elapsed_ms",
+        "completed_elapsed_ms", "failure", "recovered", "startup_receipt",
+        "generation_response_sha256", "request", "metrics", "cleanup",
+        "transitions",
+    }
+    settings = {
+        "invalid_config": {
+            "flag": "--max-new", "source": "256", "fault": "0", "index": 13,
+        },
+        "unavailable_backend": {
+            "flag": "--backend", "source": flavor,
+            "fault": "tritium-unavailable", "index": 5,
+        },
+    }
+    expected = settings.get(scenario)
+    if expected is None:
+        raise DeploymentError("deployment startup argument scenario is unknown")
+    if (not isinstance(value, dict) or set(value) != fields
+            or value.get("scenario") != scenario
+            or value.get("deployment_uid") != deployment_uid
+            or any(not isinstance(value.get(key), str) or not value[key]
+                   for key in ("baseline_resource_version", "fault_resource_version",
+                               "restored_resource_version", "fault_value"))
+            or len({value["baseline_resource_version"], value["fault_resource_version"],
+                    value["restored_resource_version"]}) != 3
+            or value["fault_value"] != expected["fault"]
+            or value.get("observation_budget_ms") != STARTUP_FAILURE_BUDGET_MS
+            or any(type(value.get(key)) not in {int, float}
+                   or not math.isfinite(value[key]) or value[key] <= 0
+                   for key in ("duration_ms", "started_elapsed_ms",
+                               "completed_elapsed_ms"))
+            or value["duration_ms"] > STARTUP_FAILURE_BUDGET_MS
+            or not value["started_elapsed_ms"] < value["completed_elapsed_ms"]
+            <= run_duration_ms
+            or value["completed_elapsed_ms"] - value["started_elapsed_ms"]
+            < value["duration_ms"]):
+        raise DeploymentError(f"deployment {scenario} identity or bounds differ")
+    expected_args = [
+        "--bundle", "/artifacts/bundle", "--profile", profile,
+        "--backend", flavor, "--host", "0.0.0.0", "--port", str(service_port),
+        "--model-id", model_id, "--max-new", "256", "--max-messages", "128",
+        "--max-prompt-bytes", "1048576", "--max-prompt-tokens", "131072",
+        "--max-completion-tokens", "4096", "--max-total-tokens", "131072",
+        "--rate-limit-rpm", "120", "--rate-limit-burst", "8",
+    ]
+    binding = value.get("binding")
+    expected_binding = {
+        "deployment_uid": deployment_uid,
+        "resource_version": value["baseline_resource_version"],
+        "container": "tritium", "container_index": 0,
+        "flag": expected["flag"], "flag_index": expected["index"] - 1,
+        "flag_path": (f"/spec/template/spec/containers/0/args/"
+                      f"{expected['index'] - 1}"),
+        "value_index": expected["index"],
+        "source_value": expected["source"],
+        "args": expected_args,
+        "path": f"/spec/template/spec/containers/0/args/{expected['index']}",
+    }
+    if binding != expected_binding:
+        raise DeploymentError(f"deployment {scenario} argument binding differs")
+    fault_patch = [
+        {"op": "test", "path": "/metadata/uid", "value": deployment_uid},
+        {"op": "test", "path": "/metadata/resourceVersion",
+         "value": value["baseline_resource_version"]},
+        {"op": "test", "path": binding["flag_path"], "value": expected["flag"]},
+        {"op": "test", "path": binding["path"], "value": expected["source"]},
+        {"op": "replace", "path": binding["path"], "value": expected["fault"]},
+    ]
+    restore_patch = [
+        {"op": "test", "path": "/metadata/uid", "value": deployment_uid},
+        {"op": "test", "path": binding["flag_path"], "value": expected["flag"]},
+        {"op": "test", "path": binding["path"], "value": expected["fault"]},
+        {"op": "replace", "path": binding["path"], "value": expected["source"]},
+    ]
+    if (value.get("fault_patch_sha256") != hashlib.sha256(
+            canonical(fault_patch).decode().strip().encode()
+        ).hexdigest() or value.get("restore_patch_sha256") != hashlib.sha256(
+            canonical(restore_patch).decode().strip().encode()
+        ).hexdigest()):
+        raise DeploymentError(f"deployment {scenario} patch evidence differs")
+    failure = value.get("failure")
+    failure_fields = {
+        "pod_name", "pod_uid", "container", "exit_code", "reason",
+        "restart_count", "termination_source", "replica_set_name",
+        "replica_set_uid", "replica_set_owner", "error_line",
+        "normalized_log_sha256",
+    }
+    if (not isinstance(failure, dict) or set(failure) != failure_fields
+            or any(not isinstance(failure.get(key), str) or not failure[key]
+                   for key in failure_fields - {
+                       "exit_code", "restart_count", "replica_set_owner"
+                   })
+            or failure["container"] != "tritium"
+            or type(failure.get("exit_code")) is not int or failure["exit_code"] != 1
+            or type(failure.get("restart_count")) is not int
+            or failure["restart_count"] < 0
+            or failure["reason"] != "Error"
+            or failure["termination_source"] not in {"current", "last_state"}
+            or failure.get("replica_set_owner") != {
+                "kind": "Deployment", "name": deployment_name,
+                "uid": deployment_uid,
+            }):
+        raise DeploymentError(f"deployment {scenario} process failure differs")
+    exact_hex(failure.get("normalized_log_sha256"), 64,
+              f"{scenario} normalized startup log SHA-256")
+    if startup_error_line(
+        failure["error_line"] + "\n", scenario=scenario, flavor=flavor,
+    ) != failure["error_line"]:
+        raise DeploymentError(f"deployment {scenario} error line differs")
+    recovered = validate_receipt_snapshot(value.get("recovered"), f"{scenario} recovery")
+    if failure["pod_uid"] in {pod["uid"] for pod in recovered["pods"]}:
+        raise DeploymentError(f"deployment {scenario} failure pod survived")
+    if value.get("startup_receipt") != startup_receipt:
+        raise DeploymentError(f"deployment {scenario} changed startup receipt")
+    exact_hex(value.get("generation_response_sha256"), 64,
+              f"{scenario} generation response SHA-256")
+    request_value = value.get("request")
+    request_fields = {
+        "model", "prompt_sha256", "prompt_bytes", "temperature", "max_tokens",
+        "descriptor_sha256",
+    }
+    if (not isinstance(request_value, dict) or set(request_value) != request_fields
+            or request_value.get("model") != model_id
+            or type(request_value.get("prompt_bytes")) is not int
+            or not 0 < request_value["prompt_bytes"] <= 1024 * 1024
+            or type(request_value.get("temperature")) is not int
+            or request_value["temperature"] != 0
+            or type(request_value.get("max_tokens")) is not int
+            or request_value["max_tokens"] != 1):
+        raise DeploymentError(f"deployment {scenario} request differs")
+    descriptor = {
+        key: request_value[key] for key in request_fields - {"descriptor_sha256"}
+    }
+    exact_hex(request_value.get("prompt_sha256"), 64, f"{scenario} prompt SHA-256")
+    if request_value["descriptor_sha256"] != hashlib.sha256(canonical(descriptor)).hexdigest():
+        raise DeploymentError(f"deployment {scenario} request descriptor differs")
+    validate_metrics_evidence(value.get("metrics"), f"{scenario} recovery")
+    if value.get("cleanup") != {"status": "restored"}:
+        raise DeploymentError(f"deployment {scenario} cleanup differs")
+    trace = validate_transition_trace(
+        value.get("transitions"), expected=STARTUP_ARGUMENT_TRANSITIONS,
+        scenario=f"{scenario} startup",
+    )
+    if trace[-1]["elapsed_ms"] > value["duration_ms"]:
+        raise DeploymentError(f"deployment {scenario} transition exceeds duration")
+    return value
+
+
 def deployed_revision(value: Any) -> int:
     if not isinstance(value, list) or not value:
         raise DeploymentError("Helm deployed history is absent")
@@ -3722,7 +4276,35 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
             release=args.release, expected_startup=startup,
             qualification_started=started,
         )
-        first_pod = missing_secret_startup["recovered"]["pods"][0]["name"]
+        invalid_config_startup = qualify_startup_argument_failure(
+            kubectl_base, scenario="invalid_config", flag="--max-new",
+            source_value="256", fault_value="0", service=service,
+            selector=selector, deployment=run_json(
+                kubectl_base + ["get", f"deployment/{service}", "-o", "json"]
+            ), baseline=missing_secret_startup["recovered"], image=args.image,
+            manifest_sha256=manifest_sha, flavor=args.flavor,
+            service_port=service_port, token=token, model_id=model_id,
+            prompt=args.prompt, timeout=args.timeout,
+            request_timeout=args.request_timeout, revision=revision,
+            profile=args.profile, manifest_blake3=manifest_id["blake3"],
+            release=args.release, expected_startup=startup,
+            qualification_started=started,
+        )
+        unavailable_backend_startup = qualify_startup_argument_failure(
+            kubectl_base, scenario="unavailable_backend", flag="--backend",
+            source_value=args.flavor, fault_value="tritium-unavailable",
+            service=service, selector=selector, deployment=run_json(
+                kubectl_base + ["get", f"deployment/{service}", "-o", "json"]
+            ), baseline=invalid_config_startup["recovered"], image=args.image,
+            manifest_sha256=manifest_sha, flavor=args.flavor,
+            service_port=service_port, token=token, model_id=model_id,
+            prompt=args.prompt, timeout=args.timeout,
+            request_timeout=args.request_timeout, revision=revision,
+            profile=args.profile, manifest_blake3=manifest_id["blake3"],
+            release=args.release, expected_startup=startup,
+            qualification_started=started,
+        )
+        first_pod = unavailable_backend_startup["recovered"]["pods"][0]["name"]
         watchdog = qualify_watchdog_restart(
             kubectl_base, pod_name=first_pod, timeout=args.timeout,
             contract=watchdog_policy,
@@ -4228,6 +4810,8 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
                      "artifact_volume_loss": artifact_fault,
                      "memory_oom_recovery": oom_fault,
                      "missing_secret_startup": missing_secret_startup,
+                     "invalid_config_startup": invalid_config_startup,
+                     "unavailable_backend_startup": unavailable_backend_startup,
                      "startup_receipt": startup, "restart_startup_receipt": restart_startup,
                      "update_startup_receipt": update_startup,
                      "update_strategy": "Recreate" if args.flavor == "cuda" else "RollingUpdate",
@@ -4370,6 +4954,7 @@ def validate_receipt(receipt: dict[str, Any], *, chart_path: Path, image_path: P
         "initial", "restarted", "updated",
         "watchdog_replacement", "artifact_volume_loss", "memory_oom_recovery",
         "missing_secret_startup",
+        "invalid_config_startup", "unavailable_backend_startup",
         "startup_receipt", "restart_startup_receipt", "update_startup_receipt",
         "update_strategy", "update_config", "rollback_startup_receipt",
         "rollback_runtime", "metrics",
@@ -4829,6 +5414,25 @@ def validate_receipt(receipt: dict[str, Any], *, chart_path: Path, image_path: P
         startup_receipt=workload["startup_receipt"],
         deployment_name=f"{workload['release_name']}-tritium",
         deployment_uid=workload["deployment_uid"],
+        run_duration_ms=receipt["duration_ms"],
+    )
+    validate_startup_argument_failure(
+        workload.get("invalid_config_startup"), scenario="invalid_config",
+        flavor=receipt["flavor"], model_id=workload["model_id"],
+        profile=receipt["profile"], service_port=workload["service_port"],
+        deployment_name=f"{workload['release_name']}-tritium",
+        deployment_uid=workload["deployment_uid"],
+        startup_receipt=workload["startup_receipt"],
+        run_duration_ms=receipt["duration_ms"],
+    )
+    validate_startup_argument_failure(
+        workload.get("unavailable_backend_startup"),
+        scenario="unavailable_backend", flavor=receipt["flavor"],
+        model_id=workload["model_id"],
+        profile=receipt["profile"], service_port=workload["service_port"],
+        deployment_name=f"{workload['release_name']}-tritium",
+        deployment_uid=workload["deployment_uid"],
+        startup_receipt=workload["startup_receipt"],
         run_duration_ms=receipt["duration_ms"],
     )
     if receipt["flavor"] == "cpu":

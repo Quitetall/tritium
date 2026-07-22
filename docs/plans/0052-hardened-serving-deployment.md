@@ -422,9 +422,20 @@ Deployment identity must recover readiness, immutable startup receipt,
 generation and clean metrics. Receipt validation recomputes both guarded JSON
 patches and binds failed/recovered pod identities plus ordered transitions.
 
+Invalid startup configuration and unavailable requested backends now have
+Kubernetes v13 gates. Each gate atomically replaces one exact rendered argument
+under Deployment UID/resource-version guards (`--max-new=0` or an unregistered
+backend), then requires a new owned pod to exit nonzero with the scenario's exact
+bounded startup error. Evidence walks Pod to ReplicaSet to the original
+Deployment and retains the validated error line plus normalized `kubectl logs`
+output digest. Independent
+`finally` cleanup restores only Tritium's injected argument after ambiguous API
+responses; readiness, immutable startup identity, generation and clean metrics
+must recover before the next fault. Offline validation recomputes patches,
+controller lineage, error grammar, timing and cleanup for both CPU and CUDA.
+
 1. malformed/truncated/wrong-identity artifact at startup;
-2. invalid config and unavailable requested backend;
-3. latched backend/device loss;
+2. latched backend/device loss;
 
 Every scenario records configuration, source/image/chart/artifact digests,
 hardware, requests, expected/observed state transitions, telemetry assertions,

@@ -49,6 +49,11 @@ validate_slow_collector = MODULE["validate_slow_collector"]
 auth_secret_contract = MODULE["auth_secret_contract"]
 missing_secret_failure = MODULE["missing_secret_failure"]
 restore_missing_secret_refs = MODULE["restore_missing_secret_refs"]
+startup_argument_contract = MODULE["startup_argument_contract"]
+startup_process_failure = MODULE["startup_process_failure"]
+startup_error_line = MODULE["startup_error_line"]
+restore_startup_argument = MODULE["restore_startup_argument"]
+startup_log_command = MODULE["startup_log_command"]
 prometheus_target_absence = MODULE["prometheus_target_absence"]
 qualify_collector_outage = MODULE["qualify_collector_outage"]
 collect_rollback_runtime = MODULE["collect_rollback_runtime"]
@@ -74,6 +79,104 @@ def startup(flavor: str = "cpu") -> dict:
         ),
         "loaded_bundle_bytes": 100, "resident_bytes": 80,
         "self_test_digest": "1" * 64,
+    }
+
+
+def startup_argument_receipt(scenario: str, flavor: str,
+                             startup_receipt: dict) -> dict:
+    if scenario == "invalid_config":
+        flag, source, fault, index = "--max-new", "256", "0", 13
+        versions = ("30", "31", "32")
+        error_line = 'Error: "all request and prompt limits must be >= 1"'
+        elapsed = (3000.0, 8100.0)
+    else:
+        flag, source, fault, index = (
+            "--backend", flavor, "tritium-unavailable", 5
+        )
+        versions = ("40", "41", "42")
+        backends = "cpu" if flavor == "cpu" else "cpu, cuda"
+        error_line = (
+            'Error: "backend `tritium-unavailable` is not in the registry '
+            f'(linked backends: {backends}); for cuda, build with `--features cuda`"'
+        )
+        elapsed = (4000.0, 9100.0)
+    path = f"/spec/template/spec/containers/0/args/{index}"
+    args = [
+        "--bundle", "/artifacts/bundle", "--profile", "compact-v1",
+        "--backend", flavor, "--host", "0.0.0.0", "--port", "8080",
+        "--model-id", "tritium", "--max-new", "256", "--max-messages", "128",
+        "--max-prompt-bytes", "1048576", "--max-prompt-tokens", "131072",
+        "--max-completion-tokens", "4096", "--max-total-tokens", "131072",
+        "--rate-limit-rpm", "120", "--rate-limit-burst", "8",
+    ]
+    binding = {
+        "deployment_uid": "deployment-uid", "resource_version": versions[0],
+        "container": "tritium", "container_index": 0, "flag": flag,
+        "flag_index": index - 1,
+        "flag_path": f"/spec/template/spec/containers/0/args/{index - 1}",
+        "value_index": index, "source_value": source, "args": args, "path": path,
+    }
+    fault_patch = [
+        {"op": "test", "path": "/metadata/uid", "value": "deployment-uid"},
+        {"op": "test", "path": "/metadata/resourceVersion", "value": versions[0]},
+        {"op": "test", "path": binding["flag_path"], "value": flag},
+        {"op": "test", "path": path, "value": source},
+        {"op": "replace", "path": path, "value": fault},
+    ]
+    restore_patch = [
+        {"op": "test", "path": "/metadata/uid", "value": "deployment-uid"},
+        {"op": "test", "path": binding["flag_path"], "value": flag},
+        {"op": "test", "path": path, "value": fault},
+        {"op": "replace", "path": path, "value": source},
+    ]
+    return {
+        "scenario": scenario, "deployment_uid": "deployment-uid",
+        "baseline_resource_version": versions[0],
+        "fault_resource_version": versions[1],
+        "restored_resource_version": versions[2],
+        "binding": binding, "fault_value": fault,
+        "fault_patch_sha256": hashlib.sha256(
+            canonical(fault_patch).decode().strip().encode()
+        ).hexdigest(),
+        "restore_patch_sha256": hashlib.sha256(
+            canonical(restore_patch).decode().strip().encode()
+        ).hexdigest(),
+        "observation_budget_ms": 120000, "duration_ms": 5000.0,
+        "started_elapsed_ms": elapsed[0], "completed_elapsed_ms": elapsed[1],
+        "failure": {
+            "pod_name": f"pod-{scenario}", "pod_uid": f"{scenario}-pod-uid",
+            "container": "tritium", "exit_code": 1, "reason": "Error",
+            "restart_count": 1, "termination_source": "last_state",
+            "replica_set_name": f"qualification-tritium-{scenario}",
+            "replica_set_uid": f"{scenario}-rs-uid",
+            "replica_set_owner": {
+                "kind": "Deployment", "name": "qualification-tritium",
+                "uid": "deployment-uid",
+            },
+            "error_line": error_line, "normalized_log_sha256": "d" * 64,
+        },
+        "recovered": {"pods": [{
+            "name": f"pod-{scenario}-recovered",
+            "uid": f"{scenario}-recovered-uid", "node": "node-1", "restarts": 0,
+        }]},
+        "startup_receipt": dict(startup_receipt),
+        "generation_response_sha256": "e" * 64,
+        "request": request_evidence(
+            "tritium", "Hello", temperature=0, max_tokens=1
+        ),
+        "metrics": {"sha256": "f" * 64, "values": {
+            "tritium_chat_requests_total": 1.0,
+            "tritium_tokens_out_total": 1.0,
+            "tritium_worker_alive": 1.0,
+            "tritium_backend_faults_total": 0.0,
+            "tritium_backend_faulted": 0.0,
+        }},
+        "cleanup": {"status": "restored"},
+        "transitions": [
+            {"state": state, "elapsed_ms": float(index * 1000),
+             "observed_at_utc": f"2026-07-21T12:00:3{index}+00:00"}
+            for index, state in enumerate(MODULE["STARTUP_ARGUMENT_TRANSITIONS"])
+        ],
     }
 
 
@@ -399,6 +502,12 @@ def receipt(chart: Path, image_archive: Path, candidate: Path,
                     for index, state in enumerate(MODULE["MISSING_SECRET_TRANSITIONS"])
                 ],
             },
+            "invalid_config_startup": startup_argument_receipt(
+                "invalid_config", flavor, startup_receipt
+            ),
+            "unavailable_backend_startup": startup_argument_receipt(
+                "unavailable_backend", flavor, startup_receipt
+            ),
             "restart_startup_receipt": dict(startup_receipt),
             "update_startup_receipt": dict(startup_receipt),
             "update_strategy": "Recreate" if flavor == "cuda" else "RollingUpdate",
@@ -931,6 +1040,162 @@ class QualifyKubernetesDeploymentTests(unittest.TestCase):
         patch_payload = run_mock.call_args.args[0][-1]
         self.assertIn("containers/0/env/0", patch_payload)
         self.assertNotIn("containers/1/env/0", patch_payload)
+
+    def test_startup_argument_contract_binds_exact_chart_positions(self):
+        args = [
+            "--bundle", "/artifacts/bundle", "--profile", "compact-v1",
+            "--backend", "cpu", "--host", "0.0.0.0", "--port", "8080",
+            "--model-id", "tritium", "--max-new", "256",
+        ]
+        document = {
+            "metadata": {"uid": "deployment-uid", "resourceVersion": "30"},
+            "spec": {"template": {"spec": {"containers": [
+                {"name": "tritium", "args": args},
+                {"name": "authenticated-probe"},
+            ]}}},
+        }
+        backend = startup_argument_contract(
+            document, flag="--backend", source_value="cpu"
+        )
+        invalid = startup_argument_contract(
+            document, flag="--max-new", source_value="256"
+        )
+        self.assertEqual((backend["value_index"], invalid["value_index"]), (5, 13))
+        args[13] = "255"
+        with self.assertRaisesRegex(DeploymentError, "binding differs"):
+            startup_argument_contract(
+                document, flag="--max-new", source_value="256"
+            )
+
+    def test_startup_error_line_binds_scenario_and_linked_backends(self):
+        invalid = 'Error: "all request and prompt limits must be >= 1"\n'
+        self.assertEqual(startup_error_line(
+            invalid, scenario="invalid_config", flavor="cpu"
+        ), invalid.strip())
+        cuda = (
+            'Error: "backend `tritium-unavailable` is not in the registry '
+            '(linked backends: cuda, cpu); for cuda, build with `--features cuda`"\n'
+        )
+        self.assertEqual(startup_error_line(
+            cuda, scenario="unavailable_backend", flavor="cuda"
+        ), cuda.strip())
+        with self.assertRaisesRegex(DeploymentError, "error line differs"):
+            startup_error_line(
+                cuda, scenario="unavailable_backend", flavor="cpu"
+            )
+        duplicate = cuda.replace("cuda, cpu", "cuda, cpu, cpu")
+        with self.assertRaisesRegex(DeploymentError, "error line differs"):
+            startup_error_line(
+                duplicate, scenario="unavailable_backend", flavor="cuda"
+            )
+
+    def test_startup_log_command_tracks_terminated_container_instance(self):
+        current = startup_log_command(
+            ["kubectl"], pod_name="pod-fault", termination_source="current"
+        )
+        previous = startup_log_command(
+            ["kubectl"], pod_name="pod-fault", termination_source="last_state"
+        )
+        self.assertNotIn("--previous", current)
+        self.assertEqual(previous[-1], "--previous")
+
+    def test_startup_process_failure_binds_new_pod_controller(self):
+        document = {"items": [{
+            "metadata": {"name": "pod-fault", "uid": "fault-uid",
+                         "ownerReferences": [{
+                             "kind": "ReplicaSet", "name": "tritium-rs",
+                             "uid": "rs-uid", "controller": True,
+                         }]},
+            "status": {"containerStatuses": [{
+                "name": "tritium", "restartCount": 1,
+                "state": {"waiting": {"reason": "CrashLoopBackOff"}},
+                "lastState": {"terminated": {"exitCode": 1, "reason": "Error"}},
+            }]},
+        }]}
+        failure = startup_process_failure(document, baseline_uids={"baseline-uid"})
+        self.assertEqual(failure["termination_source"], "last_state")
+        self.assertEqual(failure["replica_set_uid"], "rs-uid")
+
+    def test_startup_argument_cleanup_handles_admitted_response_loss(self):
+        args = [
+            "--bundle", "/artifacts/bundle", "--profile", "compact-v1",
+            "--backend", "tritium-unavailable",
+        ]
+        faulted = {
+            "metadata": {"uid": "deployment-uid", "resourceVersion": "31"},
+            "spec": {"template": {"spec": {"containers": [
+                {"name": "tritium", "args": args},
+                {"name": "authenticated-probe"},
+            ]}}},
+        }
+        contract = {
+            "deployment_uid": "deployment-uid", "resource_version": "30",
+            "container": "tritium", "container_index": 0, "flag": "--backend",
+            "flag_index": 4,
+            "flag_path": "/spec/template/spec/containers/0/args/4",
+            "value_index": 5, "source_value": "cpu",
+            "args": [
+                "--bundle", "/artifacts/bundle", "--profile", "compact-v1",
+                "--backend", "cpu",
+            ],
+            "path": "/spec/template/spec/containers/0/args/5",
+        }
+        restored = copy.deepcopy(faulted)
+        restored["metadata"]["resourceVersion"] = "32"
+        restored["spec"]["template"]["spec"]["containers"][0]["args"][5] = "cpu"
+        with mock.patch.dict(restore_startup_argument.__globals__, {
+            "run": mock.Mock(side_effect=DeploymentError("response lost")),
+            "run_json": mock.Mock(side_effect=[faulted, restored]),
+        }):
+            self.assertEqual(restore_startup_argument(
+                ["kubectl"], service="qualification-tritium", contract=contract,
+                fault_value="tritium-unavailable", timeout=10,
+            ), restored)
+
+    def test_startup_argument_cleanup_restores_injection_then_rejects_vector_drift(self):
+        baseline_args = [
+            "--bundle", "/artifacts/bundle", "--profile", "compact-v1",
+            "--backend", "cpu",
+        ]
+        contract = {
+            "deployment_uid": "deployment-uid", "resource_version": "30",
+            "container": "tritium", "container_index": 0, "flag": "--backend",
+            "flag_index": 4,
+            "flag_path": "/spec/template/spec/containers/0/args/4",
+            "value_index": 5, "source_value": "cpu", "args": baseline_args,
+            "path": "/spec/template/spec/containers/0/args/5",
+        }
+        cases = [
+            ["--bundle", "/artifacts/bundle", "--profile", "foreign-profile",
+             "--backend", "tritium-unavailable"],
+            ["--backend", "tritium-unavailable", "--bundle", "/artifacts/bundle",
+             "--profile", "compact-v1"],
+        ]
+        for faulted_args in cases:
+            with self.subTest(args=faulted_args):
+                faulted = {
+                    "metadata": {"uid": "deployment-uid", "resourceVersion": "31"},
+                    "spec": {"template": {"spec": {"containers": [
+                        {"name": "tritium", "args": faulted_args},
+                        {"name": "authenticated-probe"},
+                    ]}}},
+                }
+                cleaned = copy.deepcopy(faulted)
+                clean_args = cleaned["spec"]["template"]["spec"]["containers"][0]["args"]
+                injected = clean_args.index("tritium-unavailable")
+                clean_args[injected] = "cpu"
+                run_mock = mock.Mock(return_value="")
+                with mock.patch.dict(restore_startup_argument.__globals__, {
+                    "run": run_mock,
+                    "run_json": mock.Mock(side_effect=[faulted, cleaned]),
+                }), self.assertRaisesRegex(DeploymentError, "foreign drift"):
+                    restore_startup_argument(
+                        ["kubectl"], service="qualification-tritium",
+                        contract=contract, fault_value="tritium-unavailable", timeout=10,
+                    )
+                payload = run_mock.call_args.args[0][-1]
+                expected_value_index = faulted_args.index("tritium-unavailable")
+                self.assertIn(f"args/{expected_value_index}", payload)
 
     def test_scale_contract_binds_prometheus_trigger_and_authenticated_monitor(self):
         query = 'max(tritium_queue_depth{namespace="ns",service="qualification-tritium"})'
@@ -1832,6 +2097,33 @@ class QualifyKubernetesDeploymentTests(unittest.TestCase):
                     "transition sequence|identity or bounds",
                 ):
                     validate(value, chart, image, manifest, build, candidate)
+
+    def test_receipt_validator_binds_startup_argument_failures(self):
+        for scenario in ("invalid_config", "unavailable_backend"):
+            for target in ("patch", "error", "owner", "timing"):
+                with (self.subTest(scenario=scenario, target=target),
+                      tempfile.TemporaryDirectory() as raw):
+                    chart, image, manifest, build, candidate = candidate_inputs(raw)
+                    value = receipt(chart, image, candidate)
+                    evidence = value["workload"][f"{scenario}_startup"]
+                    if target == "patch":
+                        evidence["fault_patch_sha256"] = "0" * 64
+                    elif target == "error":
+                        evidence["failure"]["error_line"] = "Error: unrelated"
+                    elif target == "owner":
+                        evidence["failure"]["replica_set_owner"]["uid"] = "foreign-uid"
+                    else:
+                        evidence["completed_elapsed_ms"] = value["duration_ms"] + 1
+                    del value["receipt_id"]
+                    value["receipt_id"] = "sha256:" + hashlib.sha256(
+                        canonical(value)
+                    ).hexdigest()
+                    with self.assertRaisesRegex(
+                        DeploymentError,
+                        f"{scenario} patch|{scenario} startup error|"
+                        f"{scenario} process failure|{scenario} identity or bounds",
+                    ):
+                        validate(value, chart, image, manifest, build, candidate)
 
     def test_receipt_validator_requires_clean_post_restart_recovery(self):
         with tempfile.TemporaryDirectory() as raw:
