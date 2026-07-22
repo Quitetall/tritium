@@ -70,6 +70,10 @@ function rejectPreDispatchCancellation(signal?: AbortSignal | null): void {
   if (signal?.aborted === true) fail("cancelled", "WebGPU operation was cancelled before dispatch");
 }
 
+function rejectBeforeCommitCancellation(signal?: AbortSignal | null): void {
+  if (signal?.aborted === true) fail("cancelled", "WebGPU lifecycle was cancelled before commit");
+}
+
 async function cancellable<T>(
   operation: () => Promise<T>, signal: AbortSignal | null | undefined, action: string,
 ): Promise<T> {
@@ -498,7 +502,9 @@ class ResidentWebGpuTrainingAdapter implements WebTrainingAdapterV1 {
     try {
       const { state } = await this.#lifecycleState(signal);
       controller = await this.#lifecycleController(state);
-      const result = await cancellable(() => controller!.checkpoint(), signal, "checkpoint");
+      rejectBeforeCommitCancellation(signal);
+      const result = await controller.checkpoint();
+      rejectBeforeCommitCancellation(signal);
       return Object.freeze({
         bytes: Uint8Array.from(result.bytes),
         receipt: receipt(
@@ -522,9 +528,9 @@ class ResidentWebGpuTrainingAdapter implements WebTrainingAdapterV1 {
     try {
       const current = await this.#lifecycleState(signal);
       controller = await this.#lifecycleController(current.state);
-      await cancellable(
-        () => controller!.resume(Uint8Array.from(checkpoint)), signal, "resume admission",
-      );
+      rejectBeforeCommitCancellation(signal);
+      await controller.resume(Uint8Array.from(checkpoint));
+      rejectBeforeCommitCancellation(signal);
       const candidate = controller.state;
       const peakBytes = await this.#applyLifecycleState(candidate, current.operations, signal);
       this.#completedSteps = candidate.step;
@@ -559,9 +565,9 @@ class ResidentWebGpuTrainingAdapter implements WebTrainingAdapterV1 {
       }
       const artifact = encodeStateDerivedSaltV2(targets, store);
       controller = await this.#lifecycleController(lifecycle.state);
-      const admitted = await cancellable(
-        () => controller!.admitExport(artifact), signal, "export admission",
-      );
+      rejectBeforeCommitCancellation(signal);
+      const admitted = await controller.admitExport(artifact);
+      rejectBeforeCommitCancellation(signal);
       return Object.freeze({
         bytes: Uint8Array.from(admitted.bytes),
         receipt: receipt(
