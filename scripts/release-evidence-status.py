@@ -271,6 +271,19 @@ def _check_ancestry(entries: dict[str, dict[str, Any]]) -> None:
         visit(receipt_id)
 
 
+def review_scope_sha256(document: dict[str, Any]) -> str:
+    scope = {
+        **{field: document[field] for field in TOP_FIELDS - {"receipts"}},
+        "receipts": [
+            entry for entry in document["receipts"]
+            if entry.get("kind") != "independent-review"
+        ],
+    }
+    return hashlib.sha256(
+        json.dumps(scope, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
 def evaluate(
     registry: Path, candidate: Path, candidate_document: dict[str, Any],
     digest_tool: str = "tritium",
@@ -940,6 +953,12 @@ def evaluate(
     second_ids = [receipt_id for receipt_id, kind in kinds.items() if kind == "second-machine"]
     if review_ids:
         review_id = review_ids[0]
+        if validated_receipts[review_id]["review_scope_sha256"] != review_scope_sha256(
+            document
+        ):
+            raise EvidenceError(
+                "independent-review must bind the exact pre-review registry scope"
+            )
         required_reviewed = set(entries) - {review_id}
         reviewed = set(validated_receipts[review_id]["reviewed_receipt_ids"])
         if reviewed != required_reviewed or set(entries[review_id]["parents"]) != required_reviewed:

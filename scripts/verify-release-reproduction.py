@@ -42,7 +42,9 @@ REVIEW_FIELDS = {
     "run_id",
     "reviewer",
     "candidate_manifest_sha256",
+    "review_scope_sha256",
     "anchor_artifact",
+    "review_attestation",
     "reviewed_receipt_ids",
     "scopes",
     "findings",
@@ -81,6 +83,13 @@ OUTPUT_FIELDS = {
 }
 REVIEWER_FIELDS = {"id", "organization", "independent", "tool", "model"}
 FINDING_FIELDS = {"total", "verified", "fixed", "false_positive", "open"}
+FILE_FIELDS = {"path", "bytes", "sha256"}
+REVIEW_ATTESTATION_SCHEMA = "tritium.independent-review-attestation.v1"
+REVIEW_ATTESTATION_FIELDS = {
+    "schema", "release", "source_revision", "run_id", "reviewer",
+    "candidate_manifest_sha256", "review_scope_sha256",
+    "reviewed_receipt_ids", "scopes", "findings", "verdict",
+}
 COMMAND_ORDER = (
     "verify-source",
     "verify-artifacts",
@@ -439,6 +448,28 @@ def validate_independent_review(
         raise ReproductionError("release reviewer must be independent")
     for field in REVIEWER_FIELDS - {"independent"}:
         string(reviewer[field], f"receipt.reviewer.{field}")
+    hex_(receipt["review_scope_sha256"], 64, "review scope sha256")
+    attestation_record = object_(
+        receipt["review_attestation"], FILE_FIELDS, "review attestation"
+    )
+    attestation_path = contained(
+        receipt_path.parent, attestation_record["path"], "review attestation"
+    )
+    if (
+        attestation_path.stat().st_size != attestation_record["bytes"]
+        or sha256(attestation_path) != attestation_record["sha256"]
+    ):
+        raise ReproductionError("independent review attestation bytes drifted")
+    attestation = load(
+        attestation_path, REVIEW_ATTESTATION_FIELDS, "review attestation"
+    )
+    if attestation["schema"] != REVIEW_ATTESTATION_SCHEMA:
+        raise ReproductionError("independent review attestation schema differs")
+    for field in REVIEW_ATTESTATION_FIELDS - {"schema"}:
+        if attestation[field] != receipt[field]:
+            raise ReproductionError(
+                f"independent review attestation {field} differs from receipt"
+            )
     reviewed = receipt["reviewed_receipt_ids"]
     if (
         not isinstance(reviewed, list)

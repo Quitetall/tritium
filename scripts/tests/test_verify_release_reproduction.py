@@ -149,9 +149,8 @@ def second_receipt(manifest: Path, wheel: Path, artifacts):
 
 
 def review_receipt(manifest: Path, wheel: Path, reviewed):
-    value = {
-        "schema": MODULE["REVIEW_SCHEMA"],
-        "result": "pass",
+    attestation = {
+        "schema": MODULE["REVIEW_ATTESTATION_SCHEMA"],
         "release": "1.1.0-rc.0",
         "source_revision": "a" * 40,
         "run_id": "independent-review-1",
@@ -163,7 +162,7 @@ def review_receipt(manifest: Path, wheel: Path, reviewed):
             "model": "human+static",
         },
         "candidate_manifest_sha256": hashlib.sha256(manifest.read_bytes()).hexdigest(),
-        "anchor_artifact": anchor_record(wheel),
+        "review_scope_sha256": "9" * 64,
         "reviewed_receipt_ids": reviewed,
         "scopes": ["code", "security", "evidence"],
         "findings": {
@@ -174,6 +173,16 @@ def review_receipt(manifest: Path, wheel: Path, reviewed):
             "open": 0,
         },
         "verdict": "pass",
+    }
+    attestation_path = manifest.parent / "review-attestation.json"
+    write(attestation_path, attestation)
+    value = {
+        **attestation, "schema": MODULE["REVIEW_SCHEMA"], "result": "pass",
+        "anchor_artifact": anchor_record(wheel),
+        "review_attestation": {
+            "path": attestation_path.name, "bytes": attestation_path.stat().st_size,
+            "sha256": hashlib.sha256(attestation_path.read_bytes()).hexdigest(),
+        },
     }
     value["receipt_id"] = "sha256:" + hashlib.sha256(canonical(value)).hexdigest()
     return value
@@ -247,6 +256,14 @@ class ReleaseReproductionTests(unittest.TestCase):
             manifest, wheel, _ = candidate(root)
             value = review_receipt(manifest, wheel, ["sha256:" + "7" * 64])
             value["findings"]["open"] = 1
+            attestation_path = root / value["review_attestation"]["path"]
+            attestation = json.loads(attestation_path.read_bytes())
+            attestation["findings"]["open"] = 1
+            write(attestation_path, attestation)
+            value["review_attestation"]["bytes"] = attestation_path.stat().st_size
+            value["review_attestation"]["sha256"] = hashlib.sha256(
+                attestation_path.read_bytes()
+            ).hexdigest()
             value["receipt_id"] = (
                 "sha256:"
                 + hashlib.sha256(

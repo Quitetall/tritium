@@ -753,6 +753,9 @@ class ReleaseEvidenceStatusTests(unittest.TestCase):
                     },
                 ],
             )
+            review["review_scope_sha256"] = MODULE["review_scope_sha256"](
+                json.loads(registry_path.read_bytes())
+            )
             with mock.patch.dict(
                 evaluate.__globals__,
                 {

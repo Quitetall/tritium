@@ -332,6 +332,14 @@ model-card, compatibility and release-status outputs byte-for-byte. It then
 seals and self-validates the complete candidate inventory atomically. This is
 producer implementation only; no distinct physical machine or independent
 operator has emitted an admitted receipt.
+The independent-review aggregator now revalidates the complete pre-review
+registry, requires each of the other 31 frozen receipt kinds exactly once,
+requires every gate except the review half of reproduction sign-off to be
+green, and derives the reviewed receipt list rather than accepting a subset.
+It binds a canonical pre-review scope digest (avoiding a circular final-registry
+hash), retains the exact reviewer attestation, and rejects unresolved or
+inconsistent findings before sealing. Reviewer selection and the review itself
+remain external evidence; no passing attestation exists locally.
 
 ## Slice 8 — local release-candidate sign-off
 
