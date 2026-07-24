@@ -65,7 +65,9 @@ def load_text(path: str) -> str:
     if path.endswith(".parquet"):
         import pandas as pd  # local: only needed for the parquet path
 
-        return "".join(pd.read_parquet(path)["text"].tolist())
+        # fillna("") guards exporters (some C4 shards) that store empty lines as NaN, which would
+        # otherwise make tolist() yield floats and "".join raise TypeError.
+        return "".join(pd.read_parquet(path)["text"].fillna("").tolist())
     raw = open(path, encoding="utf-8", errors="ignore").read()
     s = raw.find("*** START")
     if s != -1:
