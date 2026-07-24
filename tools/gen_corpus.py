@@ -59,30 +59,57 @@ def arg(flag: str, default):
     return sys.argv[sys.argv.index(flag) + 1] if flag in sys.argv else default
 
 
+def load_text(path: str) -> str:
+    """Read a corpus source into one string. `.parquet` reads the `text` column (WikiText/C4 layout);
+    any other file is read raw with Project Gutenberg START/END boilerplate stripped."""
+    if path.endswith(".parquet"):
+        import pandas as pd  # local: only needed for the parquet path
+
+        return "".join(pd.read_parquet(path)["text"].tolist())
+    raw = open(path, encoding="utf-8", errors="ignore").read()
+    s = raw.find("*** START")
+    if s != -1:
+        raw = raw[raw.find("\n", s) + 1 :]
+    e = raw.find("*** END")
+    if e != -1:
+        raw = raw[:e]
+    return raw
+
+
 def main() -> None:
+    # Usage: gen_corpus.py <tokenizer.json> <out.json>
+    #          [--file TRAIN] [--eval-file EVAL] [--pool N] [--heldout N]
+    # --file / --eval-file may be raw text or .parquet (WikiText/C4). With --eval-file the held-out set
+    # is a SEPARATE corpus (e.g. WikiText test split) — a stronger disjointness than the tail split.
     tok_path = sys.argv[1]
     out_path = sys.argv[2]
-    pool = int(arg("--pool", 8192))       # train pool = first `pool` tokens
-    heldout = int(arg("--heldout", 256))  # held-out = the next `heldout` tokens (disjoint)
-    text = TEXT
-    if "--file" in sys.argv:
-        raw = open(arg("--file", ""), encoding="utf-8", errors="ignore").read()
-        # Strip Project Gutenberg boilerplate: keep the body between the START/END markers.
-        s = raw.find("*** START")
-        if s != -1:
-            raw = raw[raw.find("\n", s) + 1 :]
-        e = raw.find("*** END")
-        if e != -1:
-            raw = raw[:e]
-        text = raw
+    pool = int(arg("--pool", 8192))       # train pool = first `pool` train tokens
+    heldout = int(arg("--heldout", 256))  # held-out = `heldout` tokens (disjoint from train)
     tok = Tokenizer.from_file(tok_path)
-    ids = tok.encode(" ".join(text.split())).ids
-    assert len(ids) >= pool + heldout, f"corpus too short: {len(ids)} < {pool + heldout}"
-    out = {"train_ids": ids[:pool], "eval_ids": ids[pool : pool + heldout]}
+    encode = lambda t: tok.encode(" ".join(t.split())).ids  # noqa: E731
+
+    train_text = load_text(arg("--file", "")) if "--file" in sys.argv else TEXT
+    train_ids = encode(train_text)
+
+    if "--eval-file" in sys.argv:
+        # Held-out from a distinct corpus (fully disjoint from train).
+        eval_ids_all = encode(load_text(arg("--eval-file", "")))
+        assert len(train_ids) >= pool, f"train too short: {len(train_ids)} < {pool}"
+        assert len(eval_ids_all) >= heldout, f"eval too short: {len(eval_ids_all)} < {heldout}"
+        out = {"train_ids": train_ids[:pool], "eval_ids": eval_ids_all[:heldout]}
+        src = f"train {len(train_ids)} / eval {len(eval_ids_all)} tokens (separate corpora)"
+    else:
+        # Single corpus: held-out is the tail slice just past the train pool (disjoint).
+        assert len(train_ids) >= pool + heldout, (
+            f"corpus too short: {len(train_ids)} < {pool + heldout}"
+        )
+        out = {"train_ids": train_ids[:pool], "eval_ids": train_ids[pool : pool + heldout]}
+        src = f"{len(train_ids)} tokens (tail-split)"
+
     with open(out_path, "w") as f:
         json.dump(out, f)
     print(
-        f"{len(ids)} tokens → train pool {len(out['train_ids'])}, "
+        f"{src} → train pool {len(out['train_ids'])}, "
         f"held-out {len(out['eval_ids'])} (disjoint) → {out_path}"
     )
 
