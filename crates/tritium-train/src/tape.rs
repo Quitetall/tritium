@@ -649,4 +649,29 @@ impl Tape {
             }),
         )
     }
+
+    /// Top-k knowledge-distillation loss (Lever 3, scalar output). The teacher target is sparse per-row
+    /// `(index, probability)` top-k **data** (owned, moved into the tape), not another tape value — so a
+    /// distillation campaign streams only `k` probs+indices per position instead of the full vocabulary.
+    pub fn topk_kd(
+        &mut self,
+        logits: ValueId,
+        idx: Vec<u32>,
+        prob: Vec<f32>,
+        rows: usize,
+        cols: usize,
+        k: usize,
+    ) -> ValueId {
+        let out = loss::topk_kd_forward(&self.values[logits], &idx, &prob, rows, cols, k);
+        self.record(
+            vec![logits],
+            out,
+            Box::new(move |ins, g, grads, ids| {
+                let gp = loss::topk_kd_vjp(ins[0], &idx, &prob, rows, cols, k, g);
+                for (j, &v) in gp[0].iter().enumerate() {
+                    grads[ids[0]][j] += v;
+                }
+            }),
+        )
+    }
 }

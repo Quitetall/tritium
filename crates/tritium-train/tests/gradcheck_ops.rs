@@ -101,6 +101,56 @@ fn softmax_xent_grad_wrt_logits() {
 }
 
 #[test]
+fn topk_kd_grad_wrt_logits() {
+    const ROWS: usize = 2;
+    const COLS: usize = 6;
+    const K: usize = 3;
+    let logits = seeded(11, ROWS * COLS, -2.0, 2.0);
+    let inputs = vec![logits];
+    // Per-row teacher top-k: indices into [0,COLS) with (unnormalized) probs. Row 1 repeats index 2 to
+    // exercise duplicate-index accumulation.
+    let idx: Vec<u32> = vec![0, 2, 5, 1, 2, 2];
+    let prob: Vec<f32> = vec![0.6, 0.25, 0.1, 0.4, 0.2, 0.2];
+    check_op(
+        |ins| loss::topk_kd_forward(ins[0], &idx, &prob, ROWS, COLS, K),
+        |ins, g| loss::topk_kd_vjp(ins[0], &idx, &prob, ROWS, COLS, K, g),
+        &inputs,
+        &[0], // wrt logits only
+        GradCheckCfg::default(),
+    )
+    .expect("top-k KD grad wrt logits must match finite difference");
+}
+
+/// Top-k KD equals full softmax-cross-entropy when the top-k is expanded to a dense target — the sparse
+/// form is only a teacher-storage optimization, not a different loss (forward and gradient both match).
+#[test]
+fn topk_kd_matches_dense_softmax_xent() {
+    const ROWS: usize = 2;
+    const COLS: usize = 5;
+    const K: usize = 2;
+    let logits = seeded(12, ROWS * COLS, -2.0, 2.0);
+    let idx: Vec<u32> = vec![0, 3, 4, 1];
+    let prob: Vec<f32> = vec![0.7, 0.2, 0.5, 0.35];
+    let mut dense = vec![0.0f32; ROWS * COLS];
+    for r in 0..ROWS {
+        for j in 0..K {
+            dense[r * COLS + idx[r * K + j] as usize] += prob[r * K + j];
+        }
+    }
+    let l_topk = loss::topk_kd_forward(&logits, &idx, &prob, ROWS, COLS, K)[0];
+    let l_dense = loss::softmax_xent_forward(&logits, &dense, ROWS, COLS)[0];
+    assert!(
+        (l_topk - l_dense).abs() < 1e-6,
+        "forward: top-k {l_topk} vs dense {l_dense}"
+    );
+    let g_topk = loss::topk_kd_vjp(&logits, &idx, &prob, ROWS, COLS, K, &[1.0]).remove(0);
+    let g_dense = loss::softmax_xent_vjp(&logits, &dense, ROWS, COLS, &[1.0]).remove(0);
+    for (a, b) in g_topk.iter().zip(&g_dense) {
+        assert!((a - b).abs() < 1e-6, "grad: {a} vs {b}");
+    }
+}
+
+#[test]
 fn elementwise_add_grad() {
     let a = seeded(7, 10, -2.0, 2.0);
     let b = seeded(8, 10, -2.0, 2.0);
