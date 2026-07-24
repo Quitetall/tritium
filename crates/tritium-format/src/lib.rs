@@ -56,6 +56,7 @@ pub mod salt_v2_package;
 mod sparse;
 mod tb1;
 mod teacher_cache;
+mod topk_teacher_cache;
 mod tq1;
 mod tq2;
 mod tqbin;
@@ -118,6 +119,11 @@ pub use tb1::{TB1_PRESENCE_BYTES, pack_tb1_row, tb1_row_bytes, unpack_tb1_row};
 pub use teacher_cache::{
     TEACHER_CACHE_HEADER_BYTES, TEACHER_CACHE_MAGIC, TEACHER_CACHE_VERSION, TeacherCacheHeader,
     read_teacher_cache_header, write_teacher_cache_header,
+};
+pub use topk_teacher_cache::{
+    TOPK_TEACHER_CACHE_HEADER_BYTES, TOPK_TEACHER_CACHE_MAGIC, TOPK_TEACHER_CACHE_VERSION,
+    TopkTeacherCacheHeader, decode_topk_window, encode_topk_window, read_topk_teacher_cache_header,
+    write_topk_teacher_cache_header,
 };
 pub use tq1::{pack_tq1_0_block, unpack_tq1_0_block};
 pub use tq2::{compute_zero_bitmap, compute_zero_bitmaps, pack_tq2_0_block, unpack_tq2_0_block};
