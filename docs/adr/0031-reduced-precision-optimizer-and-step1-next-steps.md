@@ -37,14 +37,15 @@ recognized corpus.
 ## Decision — the next steps, in priority order
 
 ### 1. Standard-corpus Step-1 run (f32) — the field-comparable number (highest value)
-Wire a recognized LM corpus (WikiText-103 slice, or a C4 shard) tokenized with the SmolLM2 tokenizer into
-the distillation harness (extend `tools/gen_corpus.py` / the `TRITIUM_CORPUS` override), run the 135M
-distill-to-convergence on the **f32 path** with `TRITIUM_DISTILL_CURVE` checkpointing, and report the
-held-out ppl vs fp (19.73) and vs published SmolLM2-135M numbers. This is the paper's headline
-generalization result and needs none of the reduced-precision work (int8/bf16 VRAM wins are irrelevant at
-135M). Consider adding LR warmup + a deterministic teacher cache (`TRITIUM_TEACHER_CACHE`) for a cleaner,
-reproducible curve — the constant-LR/online-teacher recipe is numerically chaotic early (the f32 control
-itself swings to ppl 4.4e9 by step 3).
+**Corpus prep DONE (2026-07-24, commit 2e91147, compute-free).** `tools/gen_corpus.py` now reads
+`.parquet` (WikiText/C4 `text` column) and takes a separate `--eval-file` for the held-out split; a
+WikiText-2-raw corpus is generated locally — 500k-token train pool + 8192 held-out from the disjoint
+test split, all ids in-vocab (61× the committed 8k Alice fixture). **What remains is the GPU run:** point
+`TRITIUM_CORPUS` at that JSON and run the 135M distill-to-convergence on the **f32 path** with
+`TRITIUM_DISTILL_CURVE` checkpointing; report held-out ppl vs fp (19.73) and vs published SmolLM2-135M.
+Needs none of the reduced-precision work (int8/bf16 VRAM wins are irrelevant at 135M). Consider LR warmup +
+a deterministic teacher cache (`TRITIUM_TEACHER_CACHE`) for a cleaner curve — the constant-LR/online-
+teacher recipe is numerically chaotic early (the f32 control itself swings to ppl 4.4e9 by step 3).
 
 ### 2. `u16` bf16-master storage swap — VRAM realization (do when it matters at scale)
 Make the persistent master actually bf16 to halve its VRAM. This is the central-path ripple deferred from
@@ -78,8 +79,13 @@ wired. Needed before any long multi-session reduced-precision campaign.
 - **Lever 6 — launch-overhead reduction (CUDA graphs / fusion):** the biggest remaining *full-step* lever.
   65×-per-GEMM ≠ 65×-per-step because the step is launch/glue-bound; Lever 6 is what actually moves the
   full-step wall-clock. Highest-leverage throughput work after Step-1.
-- **Lever 3 — top-k sparse KD loss + teacher cache:** cuts teacher I/O; note the lm-head gradient stays
-  dense (softmax normalizer).
+- **Lever 3 — top-k sparse KD loss + teacher cache: CPU half DONE (2026-07-24, compute-free).** The loss
+  op `topk_kd_forward`/`vjp` + `Tape::topk_kd` (commit 177f734, gradchecked + proven identical to dense
+  softmax-xent) and the `TTPK` top-k teacher-cache format `topk_teacher_cache.rs` (commit 601c38a, a
+  vocab/(2k)=384× byte shrink at k=64, round-trip tested). Both reviewed clean. The lm-head gradient stays
+  dense (softmax normalizer) — the win is teacher-cache I/O, not backward FLOPs. **Remaining (GPU):** the
+  producer that writes `TTPK` from the teacher forward's top-k, and the nn-side reader that feeds the pairs
+  into `topk_kd` in the distill loop.
 - **Lever 7 — 2:4 structured sparsity (ADR 0024):** payoff gated on Lever 6 + scale.
 
 ## Consequences
