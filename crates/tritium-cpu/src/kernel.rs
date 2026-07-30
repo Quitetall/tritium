@@ -26,6 +26,7 @@
 
 use rayon::prelude::*;
 use tritium_core::{GemmShape, Trit, reference_mpgemm};
+use tritium_format::{QK_K, TQ2_0_BLOCK_BYTES};
 
 use tritium_spec::BackendError;
 
@@ -186,6 +187,263 @@ pub(crate) fn dispatch_mpgemm_projected_vjp(
         });
     }
     Ok(())
+}
+
+/// TQ2_0 projected VJP decoded directly from packed bytes.
+///
+/// Caller supplies bytes whose TQ2_0 codes were validated when their
+/// [`crate::CpuBuffer`] was uploaded. Shape lengths are revalidated here before
+/// writing any output, without allocating an `N*K` dense trit shadow.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dispatch_tq2_projected_vjp(
+    act: &[f32],
+    packed_weights: &[u8],
+    scales: &[f32],
+    grad_output: &[f32],
+    shape: GemmShape,
+    grad_act: &mut [f32],
+    grad_projected_weight: &mut [f32],
+    grad_bias: Option<&mut [f32]>,
+) -> Result<(), BackendError> {
+    let GemmShape { m, n, k } = shape;
+    let blocks = k.div_ceil(QK_K);
+    let row_bytes = blocks.checked_mul(TQ2_0_BLOCK_BYTES).ok_or_else(|| {
+        BackendError::InvalidInput("TQ2_0 packed row byte count overflows".to_owned())
+    })?;
+    let packed_len = n.checked_mul(row_bytes).ok_or_else(|| {
+        BackendError::InvalidInput("TQ2_0 packed weight byte count overflows".to_owned())
+    })?;
+    if packed_weights.len() != packed_len {
+        return Err(BackendError::ShapeMismatch {
+            expected: packed_len,
+            got: packed_weights.len(),
+        });
+    }
+
+    let mk = m
+        .checked_mul(k)
+        .ok_or_else(|| BackendError::InvalidInput("M*K element count overflows".to_owned()))?;
+    let nk = n
+        .checked_mul(k)
+        .ok_or_else(|| BackendError::InvalidInput("N*K element count overflows".to_owned()))?;
+    let mn = m
+        .checked_mul(n)
+        .ok_or_else(|| BackendError::InvalidInput("M*N element count overflows".to_owned()))?;
+    let lengths = [
+        (act.len(), mk),
+        (scales.len(), n),
+        (grad_output.len(), mn),
+        (grad_act.len(), mk),
+        (grad_projected_weight.len(), nk),
+    ];
+    if let Some(&(got, expected)) = lengths.iter().find(|(got, expected)| got != expected) {
+        return Err(BackendError::ShapeMismatch { expected, got });
+    }
+    if let Some(values) = grad_bias.as_ref()
+        && values.len() != n
+    {
+        return Err(BackendError::ShapeMismatch {
+            expected: n,
+            got: values.len(),
+        });
+    }
+
+    grad_act.fill(0.0);
+    grad_projected_weight.fill(0.0);
+    if m == 0 || n == 0 {
+        if let Some(values) = grad_bias {
+            values.fill(0.0);
+        }
+        return Ok(());
+    }
+
+    if k > 0 {
+        #[cfg(target_arch = "x86_64")]
+        let used_simd = if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            avx2_tq2_projected_vjp(
+                act,
+                packed_weights,
+                scales,
+                grad_output,
+                shape,
+                row_bytes,
+                grad_act,
+                grad_projected_weight,
+            );
+            true
+        } else {
+            false
+        };
+        #[cfg(not(target_arch = "x86_64"))]
+        let used_simd = false;
+
+        if !used_simd {
+            grad_act
+                .par_chunks_mut(k)
+                .enumerate()
+                .for_each(|(mi, grad_row)| {
+                    for ni in 0..n {
+                        let upstream = grad_output[mi * n + ni];
+                        let row = &packed_weights[ni * row_bytes..(ni + 1) * row_bytes];
+                        for (ki, grad_value) in grad_row.iter_mut().enumerate() {
+                            let trit = decode_tq2_trit(row, ki);
+                            *grad_value += upstream * (trit * scales[ni]);
+                        }
+                    }
+                });
+
+            grad_projected_weight
+                .par_chunks_mut(k)
+                .enumerate()
+                .for_each(|(ni, grad_row)| {
+                    for mi in 0..m {
+                        let upstream = grad_output[mi * n + ni];
+                        let act_row = &act[mi * k..(mi + 1) * k];
+                        for (grad_value, &act_value) in grad_row.iter_mut().zip(act_row) {
+                            *grad_value += upstream * act_value;
+                        }
+                    }
+                });
+        }
+    }
+
+    if let Some(values) = grad_bias {
+        values.par_iter_mut().enumerate().for_each(|(ni, value)| {
+            let mut acc = 0.0f32;
+            for mi in 0..m {
+                acc += grad_output[mi * n + ni];
+            }
+            *value = acc;
+        });
+    }
+    Ok(())
+}
+
+#[inline]
+fn decode_tq2_trit(row: &[u8], ki: usize) -> f32 {
+    let block = ki / QK_K;
+    let element = ki % QK_K;
+    let chunk = element >> 7;
+    let lane = (element & 127) >> 5;
+    let byte = element & 31;
+    let packed = row[block * TQ2_0_BLOCK_BYTES + chunk * 32 + byte];
+    f32::from((packed >> (2 * lane)) & 3) - 1.0
+}
+
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::too_many_arguments)]
+fn avx2_tq2_projected_vjp(
+    act: &[f32],
+    packed_weights: &[u8],
+    scales: &[f32],
+    grad_output: &[f32],
+    shape: GemmShape,
+    row_bytes: usize,
+    grad_act: &mut [f32],
+    grad_projected_weight: &mut [f32],
+) {
+    let GemmShape { m, n, k } = shape;
+    grad_act
+        .par_chunks_mut(k)
+        .enumerate()
+        .for_each(|(mi, grad_row)| {
+            // SAFETY: runtime dispatch checked AVX2+FMA. Packed payload and
+            // output lengths were validated before parallel work began.
+            unsafe {
+                avx2_tq2_grad_act_row(
+                    grad_row,
+                    packed_weights,
+                    scales,
+                    &grad_output[mi * n..(mi + 1) * n],
+                    n,
+                    k,
+                    row_bytes,
+                );
+            }
+        });
+    grad_projected_weight
+        .par_chunks_mut(k)
+        .enumerate()
+        .for_each(|(ni, grad_row)| {
+            // SAFETY: same AVX2+FMA dispatch and validated slices.
+            unsafe {
+                avx2_grad_projected_weight_row(grad_row, act, grad_output, ni, m, n, k);
+            }
+        });
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn avx2_tq2_grad_act_row(
+    grad_row: &mut [f32],
+    packed_weights: &[u8],
+    scales: &[f32],
+    upstream: &[f32],
+    n: usize,
+    k: usize,
+    row_bytes: usize,
+) {
+    use core::arch::x86_64::{
+        _mm_and_si128, _mm_loadl_epi64, _mm_set1_epi8, _mm_srli_epi16, _mm_sub_epi8,
+        _mm256_cvtepi8_epi32, _mm256_cvtepi32_ps, _mm256_fmadd_ps, _mm256_loadu_ps, _mm256_mul_ps,
+        _mm256_set1_ps, _mm256_storeu_ps,
+    };
+
+    const LANES: usize = 8;
+    let code_mask = _mm_set1_epi8(3);
+    let one = _mm_set1_epi8(1);
+    for ni in 0..n {
+        let upstream_vector = _mm256_set1_ps(upstream[ni]);
+        let scale_vector = _mm256_set1_ps(scales[ni]);
+        let row = &packed_weights[ni * row_bytes..(ni + 1) * row_bytes];
+        for block_index in 0..k.div_ceil(QK_K) {
+            let block_offset = block_index * TQ2_0_BLOCK_BYTES;
+            let block_k = block_index * QK_K;
+            for chunk in 0..2 {
+                for lane in 0..4 {
+                    let group_k = block_k + chunk * 128 + lane * 32;
+                    if group_k >= k {
+                        continue;
+                    }
+                    let group_len = (k - group_k).min(32);
+                    let simd_len = group_len - group_len % LANES;
+                    let mut byte_index = 0;
+                    while byte_index < simd_len {
+                        let packed_offset = block_offset + chunk * 32 + byte_index;
+                        // SAFETY: one TQ2_0 block has 64 qs bytes; byte_index
+                        // advances through at most 32 bytes in this chunk.
+                        let bytes =
+                            unsafe { _mm_loadl_epi64(row.as_ptr().add(packed_offset).cast()) };
+                        let shifted = match lane {
+                            0 => bytes,
+                            1 => _mm_srli_epi16::<2>(bytes),
+                            2 => _mm_srli_epi16::<4>(bytes),
+                            3 => _mm_srli_epi16::<6>(bytes),
+                            _ => unreachable!(),
+                        };
+                        let codes = _mm_and_si128(shifted, code_mask);
+                        let trits = _mm_sub_epi8(codes, one);
+                        let trits = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(trits));
+                        let projected = _mm256_mul_ps(trits, scale_vector);
+                        let grad_offset = group_k + byte_index;
+                        // SAFETY: group_len is clipped to logical K.
+                        let prior = unsafe { _mm256_loadu_ps(grad_row.as_ptr().add(grad_offset)) };
+                        let next = _mm256_fmadd_ps(upstream_vector, projected, prior);
+                        // SAFETY: same clipped bound covers output store.
+                        unsafe {
+                            _mm256_storeu_ps(grad_row.as_mut_ptr().add(grad_offset), next);
+                        }
+                        byte_index += LANES;
+                    }
+                    for tail in simd_len..group_len {
+                        let ki = group_k + tail;
+                        let trit = decode_tq2_trit(row, ki);
+                        grad_row[ki] += upstream[ni] * (trit * scales[ni]);
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(target_arch = "x86_64")]

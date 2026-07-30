@@ -73,8 +73,8 @@ CPU vertical slice landed:
 - non-compact upstream gradients are compacted on-device before the native call;
   higher-order-gradient recording retains the composite fallback;
 - unsupported dtype/layout/device cases retain the exact composite fallback;
-- no persistent dense weight shadow or transposed packed copy is cached; current
-  CPU backend unpack scratch remains transient per call.
+- no persistent dense weight shadow or transposed packed copy is cached; forward
+  and the less-common TQ1_0 VJP still use transient unpack scratch.
 
 The CPU cache now also retains the strict clipped-STE mask as one bit per master
 weight. Warm backward applies this compact mask directly to the projected-weight
@@ -83,8 +83,19 @@ mask is about 3.06 bits/weight before the amortized row scales (more than 10x
 smaller than fp32 for representative transformer widths), and mask lifetime and
 invalidation are identical to packed trits. Zero-scale rows, strict boundary
 values, 64-bit word tails, optimizer mutation, and storage replacement remain
-covered by dispatcher parity tests. Direct packed CPU VJP and retained
-performance qualification remain open.
+covered by dispatcher parity tests.
+
+TQ2_0 CPU backward now decodes activation-gradient weights directly from packed
+bytes. AVX2+FMA widens eight 2-bit codes at a time; the portable scalar path uses
+the same block mapping. Projected-weight gradients remain independent of the
+weight encoding. Complete payload validation is cached once on immutable buffer
+upload, avoiding another `O(N*K)` scan on every warm VJP; a reserved code in
+logical data or tail padding still fails before output writes with the same
+typed backend error as the canonical unpacker. Ragged `K=257`, reserved codes,
+zero inner dimensions, and an explicit no-dense-unpack route assertion are
+covered. The CPU crate passes 50 tests with one declared benchmark ignore;
+aarch64 GNU and x86_64 musl cross-checks pass. No performance claim is admitted
+until the retained qualifier controls threads, warmup, and sampling.
 
 At native CPU-backward landing, the dispatcher suite passed 18 tests; 40
 frozen-seed spot checks bounded observed forward/gradient drift to `4.77e-6`;
@@ -156,8 +167,8 @@ skip; the CUDA library passes 130 unit tests with six declared ignores plus four
 physical integration tests. These results are not admitted release receipts or
 performance claims.
 
-Remaining before Step 2 closes: CPU performance optimization/qualification and
-retained representative-shape wrapper-overhead plus physical-CUDA receipts.
+Remaining before Step 2 closes: retained representative-shape CPU
+wrapper-overhead qualification plus physical-CUDA receipts.
 Exploratory release-build timings are not a gate receipt:
 pre-mask and post-mask runs show material host variance, so no CPU speedup claim
 is permitted until the frozen qualifier controls threads, warmup and sampling.

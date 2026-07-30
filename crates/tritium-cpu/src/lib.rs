@@ -54,6 +54,11 @@ use tritium_spec::{
     BackendError, DeviceBuffer, DeviceCaps, MpGemm, MpGemmProjectedVjp, TernaryBackend,
 };
 
+#[cfg(test)]
+std::thread_local! {
+    static UNPACK_WEIGHT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 // The kernel module holds the only hand-written `unsafe` in the crate: the AVX2
 // intrinsic kernel (its `unsafe fn` plus the raw-pointer loads/stores). The
 // crate-level `deny(unsafe_code)` is relaxed for exactly this module; each unsafe
@@ -84,19 +89,49 @@ pub mod salt_v2;
 #[derive(Debug, Clone)]
 pub struct CpuBuffer {
     bytes: Vec<u8>,
+    n: usize,
+    k: usize,
+    format: TernaryFormat,
+    tq2_invalid_row: Option<usize>,
 }
 
 impl CpuBuffer {
     /// Wrap already-packed bytes in a buffer.
     #[must_use]
-    fn new(bytes: Vec<u8>) -> Self {
-        Self { bytes }
+    fn new(
+        bytes: Vec<u8>,
+        n: usize,
+        k: usize,
+        format: TernaryFormat,
+        tq2_invalid_row: Option<usize>,
+    ) -> Self {
+        Self {
+            bytes,
+            n,
+            k,
+            format,
+            tq2_invalid_row,
+        }
     }
 
     /// The packed bytes this buffer holds.
     #[must_use]
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
+    }
+
+    fn validate_identity(
+        &self,
+        shape: GemmShape,
+        format: TernaryFormat,
+    ) -> Result<(), BackendError> {
+        if self.n != shape.n || self.k != shape.k || self.format != format {
+            return Err(BackendError::InvalidInput(format!(
+                "buffer identity N={} K={} format={:?} does not match N={} K={} format={format:?}",
+                self.n, self.k, self.format, shape.n, shape.k
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -148,6 +183,10 @@ impl CpuBackend {
         shape: GemmShape,
         format: TernaryFormat,
     ) -> Result<Vec<Trit>, BackendError> {
+        #[cfg(test)]
+        UNPACK_WEIGHT_CALLS.with(|calls| calls.set(calls.get() + 1));
+
+        buf.validate_identity(shape, format)?;
         let GemmShape { n, k, .. } = shape;
         let nb = num_blocks(k);
         let row_bytes = nb * block_bytes(format)?;
@@ -228,15 +267,36 @@ impl TernaryBackend for CpuBackend {
     ) -> Result<Box<dyn DeviceBuffer>, BackendError> {
         let GemmShape { n, k, .. } = shape;
         let nb = num_blocks(k);
-        let row_bytes = nb * block_bytes(format)?;
-        let expected = n * row_bytes;
+        let row_bytes = nb.checked_mul(block_bytes(format)?).ok_or_else(|| {
+            BackendError::InvalidInput("packed row byte count overflows".to_owned())
+        })?;
+        let expected = n.checked_mul(row_bytes).ok_or_else(|| {
+            BackendError::InvalidInput("packed weight byte count overflows".to_owned())
+        })?;
         if packed.len() != expected {
             return Err(BackendError::InvalidInput(format!(
                 "packed len {} != expected {expected} for shape {shape:?} format {format:?}",
                 packed.len()
             )));
         }
-        Ok(Box::new(CpuBuffer::new(packed.to_vec())))
+        let tq2_invalid_row = if format == TernaryFormat::Tq2_0 && row_bytes != 0 {
+            packed.chunks_exact(row_bytes).position(|row| {
+                row.chunks_exact(TQ2_0_BLOCK_BYTES).any(|block| {
+                    block[..tritium_format::QK_K / 4]
+                        .iter()
+                        .any(|&byte| byte & (byte >> 1) & 0x55 != 0)
+                })
+            })
+        } else {
+            None
+        };
+        Ok(Box::new(CpuBuffer::new(
+            packed.to_vec(),
+            n,
+            k,
+            format,
+            tq2_invalid_row,
+        )))
     }
 
     fn mpgemm(&self, p: tritium_spec::MpGemm<'_>) -> Result<(), BackendError> {
@@ -252,6 +312,7 @@ impl TernaryBackend for CpuBackend {
             .as_any()
             .downcast_ref::<CpuBuffer>()
             .ok_or_else(|| BackendError::InvalidInput("buffer is not a CpuBuffer".to_owned()))?;
+        buf.validate_identity(shape, format)?;
 
         let GemmShape { m, n, k } = shape;
         // Validate operand lengths against the shape before any kernel runs.
@@ -299,17 +360,40 @@ impl TernaryBackend for CpuBackend {
             .as_any()
             .downcast_ref::<CpuBuffer>()
             .ok_or_else(|| BackendError::InvalidInput("buffer is not a CpuBuffer".to_owned()))?;
-        let trits = Self::unpack_weights(buffer, shape, format)?;
-        kernel::dispatch_mpgemm_projected_vjp(
-            act,
-            &trits,
-            scales,
-            grad_output,
-            shape,
-            grad_act,
-            grad_projected_weight,
-            grad_bias,
-        )
+        buffer.validate_identity(shape, format)?;
+        match format {
+            TernaryFormat::Tq2_0 => {
+                if let Some(ni) = buffer.tq2_invalid_row {
+                    return Err(BackendError::Backend(format!(
+                        "unpack row {ni}: decoded value 2 outside ternary range"
+                    )));
+                }
+                kernel::dispatch_tq2_projected_vjp(
+                    act,
+                    buffer.bytes(),
+                    scales,
+                    grad_output,
+                    shape,
+                    grad_act,
+                    grad_projected_weight,
+                    grad_bias,
+                )
+            }
+            TernaryFormat::Tq1_0 => {
+                let trits = Self::unpack_weights(buffer, shape, format)?;
+                kernel::dispatch_mpgemm_projected_vjp(
+                    act,
+                    &trits,
+                    scales,
+                    grad_output,
+                    shape,
+                    grad_act,
+                    grad_projected_weight,
+                    grad_bias,
+                )
+            }
+            other => Err(BackendError::UnsupportedFormat(other)),
+        }
     }
 }
 
@@ -445,6 +529,140 @@ mod tests {
         assert_eq!(grad_act, vec![7.0, -1.0, -7.0, 7.5, 0.5, -7.5]);
         assert_eq!(grad_weight, vec![-1.0, 22.0, 11.0, -3.0, 0.0, -5.5]);
         assert_eq!(grad_bias, vec![7.0, -1.0]);
+    }
+
+    #[test]
+    fn tq2_projected_vjp_decodes_packed_weights_without_dense_unpack() {
+        let shape = GemmShape::new(2, 3, 257);
+        let weights: Vec<Trit> = (0..shape.n * shape.k)
+            .map(|i| Trit::from_i8(((i * 17 + 5) % 3) as i8 - 1).unwrap())
+            .collect();
+        let packed = pack(&weights, shape, TernaryFormat::Tq2_0);
+        let backend = CpuBackend::new();
+        let buffer = backend
+            .upload_weights(&packed, shape, TernaryFormat::Tq2_0)
+            .unwrap();
+        let act: Vec<f32> = (0..shape.m * shape.k)
+            .map(|i| (i % 23) as f32 * 0.125 - 1.0)
+            .collect();
+        let scales = [0.25, -1.5, 2.0];
+        let grad_output = [0.5, -2.0, 1.25, -0.75, 3.0, -0.5];
+        let mut want_grad_act = vec![0.0; shape.m * shape.k];
+        let mut want_grad_weight = vec![0.0; shape.n * shape.k];
+        kernel::dispatch_mpgemm_projected_vjp(
+            &act,
+            &weights,
+            &scales,
+            &grad_output,
+            shape,
+            &mut want_grad_act,
+            &mut want_grad_weight,
+            None,
+        )
+        .unwrap();
+
+        let mut got_grad_act = vec![f32::NAN; shape.m * shape.k];
+        let mut got_grad_weight = vec![f32::NAN; shape.n * shape.k];
+        UNPACK_WEIGHT_CALLS.with(|calls| calls.set(0));
+        backend
+            .mpgemm_projected_vjp(MpGemmProjectedVjp {
+                act: &act,
+                weights: buffer.as_ref(),
+                scales: &scales,
+                grad_output: &grad_output,
+                shape,
+                format: TernaryFormat::Tq2_0,
+                grad_act: &mut got_grad_act,
+                grad_projected_weight: &mut got_grad_weight,
+                grad_bias: None,
+            })
+            .unwrap();
+
+        UNPACK_WEIGHT_CALLS.with(|calls| {
+            assert_eq!(
+                calls.get(),
+                0,
+                "TQ2_0 projected VJP must decode directly from packed bytes"
+            );
+        });
+        for (got, want) in got_grad_act.iter().zip(&want_grad_act) {
+            assert!(close(*got, *want), "grad_act: got {got}, want {want}");
+        }
+        for (got, want) in got_grad_weight.iter().zip(&want_grad_weight) {
+            assert!(
+                close(*got, *want),
+                "grad_projected_weight: got {got}, want {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn tq2_projected_vjp_rejects_reserved_code_before_writing_outputs() {
+        let shape = GemmShape::new(1, 1, 1);
+        let backend = CpuBackend::new();
+        for corrupt_byte in [0, 1] {
+            let mut packed = pack(&[Trit::POS], shape, TernaryFormat::Tq2_0);
+            // Byte 0/lane 0 is the logical trit; byte 1/lane 0 is tail padding.
+            packed[corrupt_byte] = packed[corrupt_byte] & !0b11 | 0b11;
+            let buffer = backend
+                .upload_weights(&packed, shape, TernaryFormat::Tq2_0)
+                .unwrap();
+            let mut grad_act = [41.0];
+            let mut grad_weight = [42.0];
+            let mut grad_bias = [43.0];
+
+            let error = backend
+                .mpgemm_projected_vjp(MpGemmProjectedVjp {
+                    act: &[1.0],
+                    weights: buffer.as_ref(),
+                    scales: &[1.0],
+                    grad_output: &[1.0],
+                    shape,
+                    format: TernaryFormat::Tq2_0,
+                    grad_act: &mut grad_act,
+                    grad_projected_weight: &mut grad_weight,
+                    grad_bias: Some(&mut grad_bias),
+                })
+                .unwrap_err();
+
+            assert_eq!(
+                error,
+                BackendError::Backend(
+                    "unpack row 0: decoded value 2 outside ternary range".to_owned()
+                )
+            );
+            assert_eq!(grad_act, [41.0]);
+            assert_eq!(grad_weight, [42.0]);
+            assert_eq!(grad_bias, [43.0]);
+        }
+    }
+
+    #[test]
+    fn tq2_projected_vjp_handles_zero_inner_dimension() {
+        let shape = GemmShape::new(2, 3, 0);
+        let backend = CpuBackend::new();
+        let buffer = backend
+            .upload_weights(&[], shape, TernaryFormat::Tq2_0)
+            .unwrap();
+        let mut grad_act = [];
+        let mut grad_weight = [];
+        let mut grad_bias = [f32::NAN; 3];
+
+        backend
+            .mpgemm_projected_vjp(MpGemmProjectedVjp {
+                act: &[],
+                weights: buffer.as_ref(),
+                scales: &[1.0, 2.0, 3.0],
+                grad_output: &[1.0, 2.0, 3.0, -1.0, -2.0, -3.0],
+                shape,
+                format: TernaryFormat::Tq2_0,
+                grad_act: &mut grad_act,
+                grad_projected_weight: &mut grad_weight,
+                grad_bias: Some(&mut grad_bias),
+            })
+            .unwrap();
+
+        assert_eq!(grad_bias, [0.0, 0.0, 0.0]);
     }
 
     #[test]
