@@ -7,7 +7,12 @@
 //! - **TQ2_0** — 2 bits/trit, 4/byte. `qs[64] + f16 scale` per 256-trit block (66 B).
 //! - **TQ1_0** — base-3, 5 trits/byte. `qs[48] + qh[4] + f16 scale` per block (54 B).
 //!
-//! Both are faithful ports of ggml's reference implementation, so packed bytes are
+//! plus llama.cpp's official group-64 ternary-capable format:
+//!
+//! - **Q2_0** — 2 bits/element, `f16 scale + qs[16]` per 64-element block (18 B,
+//!   scale-first). Ternary subset only: code 3 (ggml's `+2` level) is rejected.
+//!
+//! All are faithful ports of ggml's reference implementation, so packed bytes are
 //! byte-compatible with llama.cpp. Backends consume already-packed bytes; they do
 //! not pack themselves.
 //!
@@ -42,6 +47,7 @@ mod gguf_write;
 mod i2s;
 mod i2s_int8;
 mod le_cursor;
+mod q2_0;
 mod rows;
 mod runtime_evidence;
 mod safetensors;
@@ -72,8 +78,8 @@ pub use codec_bundle::{
     read_codec_bundle, write_codec_bundle,
 };
 pub use gguf::{
-    DEFAULT_ALIGNMENT, GGML_TYPE_TQ1_0, GGML_TYPE_TQ2_0, GgufError, GgufFile, GgufValue,
-    TensorInfo, read_gguf,
+    DEFAULT_ALIGNMENT, GGML_TYPE_Q2_0, GGML_TYPE_TQ1_0, GGML_TYPE_TQ2_0, GgufError, GgufFile,
+    GgufValue, TensorInfo, read_gguf,
 };
 pub use gguf_write::{GgufStreamWriter, GgufTensorSpec, GgufWriteError, TensorOut, write_gguf};
 pub use i2s::{
@@ -82,6 +88,10 @@ pub use i2s::{
 };
 pub use i2s_int8::{
     I2sInt8Weights, IMMA_K, IMMA_N, IMMA_WTILE_BYTES, convert_i2s_to_int8, convert_i2s_to_tq2_0,
+};
+pub use q2_0::{
+    Q2_0_BLOCK_BYTES, Q2_0_GROUP_SIZE, pack_q2_0_block, pack_q2_0_row, q2_0_num_blocks,
+    unpack_q2_0_block, unpack_q2_0_row,
 };
 pub use rows::{num_blocks, pack_tq1_0_row, pack_tq2_0_row, unpack_tq1_0_row, unpack_tq2_0_row};
 pub use runtime_evidence::{
@@ -143,9 +153,10 @@ pub const TQ1_0_BLOCK_BYTES: usize = (QK_K - 4 * QK_K / 64) / 5 + QK_K / 64 + 2;
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum FormatError {
-    /// A pack/unpack call received other than [`QK_K`] trits.
+    /// A pack/unpack call received other than the format's block size in trits
+    /// ([`QK_K`] for TQ1_0/TQ2_0, [`Q2_0_GROUP_SIZE`] for Q2_0).
     WrongTritCount {
-        /// Required count ([`QK_K`]).
+        /// Required count (the format's block size).
         expected: usize,
         /// Count supplied.
         got: usize,
@@ -380,6 +391,24 @@ mod roundtrip {
             let mut out = vec![Trit::ZERO; QK_K];
             let mut got_scale = f16::ZERO;
             unpack_tq2_0_block(&packed, &mut out, &mut got_scale).unwrap();
+
+            prop_assert_eq!(out, trits);
+            prop_assert_eq!(got_scale.to_bits(), scale.to_bits());
+        }
+
+        #[test]
+        fn q2_0_roundtrip(
+            raw in prop::collection::vec(-1i8..=1, Q2_0_GROUP_SIZE),
+            scale_bits in any::<u16>(),
+        ) {
+            let trits: Vec<Trit> = raw.iter().map(|&v| Trit::from_i8(v).unwrap()).collect();
+            let scale = f16::from_bits(scale_bits);
+            let mut packed = vec![0u8; Q2_0_BLOCK_BYTES];
+            pack_q2_0_block(&trits, scale, &mut packed).unwrap();
+
+            let mut out = vec![Trit::ZERO; Q2_0_GROUP_SIZE];
+            let mut got_scale = f16::ZERO;
+            unpack_q2_0_block(&packed, &mut out, &mut got_scale).unwrap();
 
             prop_assert_eq!(out, trits);
             prop_assert_eq!(got_scale.to_bits(), scale.to_bits());

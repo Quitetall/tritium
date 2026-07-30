@@ -25,6 +25,10 @@ pub const GGML_TYPE_TQ1_0: u32 = 34;
 /// `enum ggml_type` in `ggml.h`.
 pub const GGML_TYPE_TQ2_0: u32 = 35;
 
+/// ggml type-id for `Q2_0` (2 bits/element, group 64, scale-first). Verified
+/// against the `enum ggml_type` addition in llama.cpp PR #24448.
+pub const GGML_TYPE_Q2_0: u32 = 42;
+
 /// Default tensor-data alignment when `general.alignment` is absent (ggml convention).
 pub const DEFAULT_ALIGNMENT: u64 = 32;
 
@@ -411,6 +415,7 @@ fn type_block_layout(ggml_type: u32) -> Option<(u64, u64)> {
         30 => Some((2, 1)),                 // BF16
         GGML_TYPE_TQ1_0 => Some((54, 256)), // qs[48]+qh[4]+f16
         GGML_TYPE_TQ2_0 => Some((66, 256)), // qs[64]+f16
+        GGML_TYPE_Q2_0 => Some((18, 64)),   // f16+qs[16]
         _ => None,
     }
 }
