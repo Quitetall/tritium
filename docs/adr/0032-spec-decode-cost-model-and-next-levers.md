@@ -84,7 +84,35 @@ to ~parity; the levers below attack `d`, `V`, and the amortization of both.
 
 ## Decision: the ranked levers (each falsifiable, measure-first)
 
-### L1 — Ternary drafter LM head (attacks `d`, the dominant term)
+### L1 — Ternary drafter LM head — **REFUTED BY MEASUREMENT (2026-07-30)**
+
+Tested end-to-end: untied ternary-head 8L/768 trained from scratch on the
+stage-3 mix (same data/epochs as the tied τ=4.23 run; final loss 2.34 vs
+1.81 tied), exported with `output.weight` I2_S, served via the loader's new
+untied path, measured on the standard prose set:
+
+- **τ = 3.23 vs 4.23 tied — a −24% acceptance hit** (12/12 lossless, as
+  structurally guaranteed). Far past this ADR's "<10% still wins" line.
+- The `d` saving is smaller than projected: the head's table read (~0.23 ms
+  warm) is only ~15% of the ~1.7 ms drafter step — the GPU-share numbers
+  above are shares of GPU-busy time, but the step's WALL time is dominated
+  by per-token host orchestration (two stream syncs + ctrl H2D + readback
+  ≈ 1.2 ms), which a ternary head does not touch.
+- Cost model, both idealized on-device: f16 head (10 + 4.2·0.45)/4.23 =
+  2.81 ms/tok (1.39×) vs ternary head (10 + 3.2·0.22)/3.23 = 3.31 ms/tok
+  (1.18×). **The f16 head wins in every regime — τ dominates.**
+
+Consequence: do NOT build the resident ternary-head GEMV (the premise-first
+sequencing saved that effort). The loader half stays (untied ternary heads
+now load and serve correctly — useful substrate, zero regression). The wall
+decomposition above REDIRECTS the drafter lever: the true dominant `d` term
+is the per-token host round-trip, so the "graph-capturing the k-step draft"
+rejection below is retracted — a CHAINED k-step draft (k tokens in one
+device-side loop/graph, argmax fed back to embed on-device, one host
+round-trip per k instead of per token) attacks ~1.2 ms × k directly and is
+the new L1'.
+
+### ~~L1 (original projection, kept for the record)~~ — attacks `d`, the dominant term
 
 The drafter's per-token head reads a 197 MB **f16** table. Make it **ternary
 I2_S** (the substrate this whole engine is built on) and the read drops ~8× to
@@ -138,9 +166,12 @@ after L1 makes `d` cheap, at which point a bigger, higher-τ drafter is affordab
 
 ## Non-goals / rejected here
 
-- **Graph-capturing the k-step draft as one replay:** the drafter step is
-  table-read-bound, not launch-bound (proven: `d` is memory time, not launch
-  count). No win; do not build.
+- ~~**Graph-capturing the k-step draft as one replay**~~ — RETRACTED
+  2026-07-30: the ternary-head experiment decomposed `d` and showed the
+  per-token host round-trip (~1.2 ms), not the table read (~0.23 ms), is the
+  dominant term. A chained k-step device-side draft is now L1' (see the L1
+  refutation above). The original "table-read-bound" claim conflated
+  GPU-busy-share with wall share.
 - **Reducing the drafter's proposal vocab (top-N frequency prune):** argmax
   over a pruned table saves read proportionally, but a wrong-vocab argmax can
   propose a token the target would never rank first, dropping τ unpredictably;
@@ -156,3 +187,19 @@ after L1 makes `d` cheap, at which point a bigger, higher-τ drafter is affordab
   drafter/verifier change — record `V`, `d`, `k`, `τ` per experiment.
 - Losslessness is invariant across all four levers (the verifier is the sole
   source of truth); none of them needs a numerics RFC.
+
+## Amendment 1 — tree width from measured margins (2026-07-30)
+
+Authorized by [ADR 0035](./0035-frontier-methods-integration.md), from the
+[ADR 0034](./0034-next-gen-ternary-research.md) research intake:
+
+Acceptance theory (arXiv 2606.30265) closes a free parameter in this cost model.
+The required target margin for guaranteed greedy acceptance falls with tree width
+as `√(4ε/(m+1))` (ε = drafter KL bound), so **m is selectable from the measured
+margin distribution of the target on the serving corpus** instead of grid search:
+choose the smallest m whose implied margin threshold covers the desired acceptance
+mass, then price it with this ADR's existing `(V + k·d)/τ < P` lens (larger m
+raises k and V; the margin curve says what τ it buys). Record the margin
+distribution alongside `V`, `d`, `k`, `τ` per experiment. The parity verdict and
+lever ranking of this ADR are unchanged; this only replaces how m is picked when
+the ADR 0021 drafter lands.
