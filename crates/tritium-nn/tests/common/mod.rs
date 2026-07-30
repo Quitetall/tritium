@@ -304,3 +304,43 @@ pub fn perplexity(logits: &[f32], tokens: &[u32], vocab: usize) -> f64 {
     }
     (nll / (seq - 1) as f64).exp()
 }
+
+/// Teacher-forced perplexity over a held-out set evaluated in **non-overlapping windows** of
+/// `window` tokens — the standard windowed-perplexity protocol, and the only tractable one here.
+///
+/// [`logits_of`] runs the whole token slice through one autograd [`Tape`], which retains a
+/// `[seq, seq]` attention matrix **per head per layer**: memory is *quadratic* in the evaluated
+/// length. At SmolLM2-135M (30 layers × 9 heads) a 4096-token held-out set costs
+/// `30·9·4096²·4 B ≈ 18 GB` and OOMs the machine, while 256 tokens costs 71 MB. Windowing bounds
+/// the peak at `30·9·window²·4 B` (≈283 MB at `window = 512`) no matter how large the held-out set
+/// is, because each window's tape is dropped before the next is built.
+///
+/// NLL is accumulated across windows and exponentiated once at the end, so the result is the
+/// token-averaged perplexity over every scored position (each window scores its own `len-1`
+/// next-token predictions). Applying the identical windowing to the fp, PTQ, and distilled models
+/// keeps their comparison exact.
+pub fn perplexity_windowed(weights: &[Vec<f32>], a: &Arch, eval_ids: &[u32], window: usize) -> f64 {
+    assert!(window >= 2, "a window must score at least one next-token");
+    let mut nll = 0.0f64;
+    let mut scored = 0usize;
+    for chunk in eval_ids.chunks(window) {
+        if chunk.len() < 2 {
+            continue; // a 1-token tail scores nothing
+        }
+        // Build, score, and drop one window's tape before the next allocates.
+        let logits = logits_of(weights, a, chunk);
+        for tpos in 0..chunk.len() - 1 {
+            let row = &logits[tpos * a.vocab..tpos * a.vocab + a.vocab];
+            let m = row.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+            let lse = m + row
+                .iter()
+                .map(|&x| (f64::from(x) - m).exp())
+                .sum::<f64>()
+                .ln();
+            nll += lse - f64::from(row[chunk[tpos + 1] as usize]);
+        }
+        scored += chunk.len() - 1;
+    }
+    assert!(scored > 0, "held-out set scored no positions");
+    (nll / scored as f64).exp()
+}

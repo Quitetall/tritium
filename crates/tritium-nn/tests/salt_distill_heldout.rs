@@ -15,7 +15,7 @@ mod common;
 
 use std::path::PathBuf;
 
-use common::{extract, forward, logits_of, perplexity};
+use common::{extract, forward, logits_of, perplexity_windowed};
 use tritium_nn::ModelRunner;
 use tritium_train::ops::ste;
 use tritium_train::{AdamW, Optimizer, Tape};
@@ -24,6 +24,13 @@ const T: usize = 2;
 const TRAIN_SEQ: usize = 32; // window length for the training corpus
 const STEPS: u64 = 40; // committed-gate default; TRITIUM_DISTILL_STEPS overrides for a real run
 const LR: f32 = 2e-3;
+/// Held-out perplexity is scored in non-overlapping windows of this many tokens. CPU eval memory is
+/// QUADRATIC in the evaluated length — the tape retains one `[seq, seq]` attention matrix per head
+/// per layer — so a single-shot eval of a large held-out set OOMs the machine: 4096 tokens costs
+/// `30 layers · 9 heads · 4096² · 4 B ≈ 18 GB`. A 512-token window bounds the peak at ~283 MB.
+/// Chosen ≥ the committed fixture's 256-token eval so that corpus still scores in ONE window — the
+/// committed gate numbers are therefore unchanged by the switch to windowed scoring.
+const EVAL_WINDOW: usize = 512;
 
 fn model_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_default();
@@ -98,13 +105,13 @@ fn salt_distillation_recovers_heldout_perplexity() {
     assert!(!windows.is_empty(), "train corpus shorter than one window");
 
     // Held-out baselines (fp + full PTQ), on the disjoint eval split.
-    let ppl_fp = perplexity(&logits_of(&fp, &a, &eval_ids), &eval_ids, a.vocab);
+    let ppl_fp = perplexity_windowed(&fp, &a, &eval_ids, EVAL_WINDOW);
     let ptq: Vec<Vec<f32>> = fp
         .iter()
         .zip(&shapes)
         .map(|(wf, &(n, k))| ste::salt_quantize_forward(wf, n, k, T))
         .collect();
-    let ppl_ptq = perplexity(&logits_of(&ptq, &a, &eval_ids), &eval_ids, a.vocab);
+    let ppl_ptq = perplexity_windowed(&ptq, &a, &eval_ids, EVAL_WINDOW);
 
     // Distill on the TRAIN windows (cycled), AdamW; eval held-out afterwards.
     let mut lat = fp.clone();
@@ -175,7 +182,7 @@ fn salt_distillation_recovers_heldout_perplexity() {
         .zip(&shapes)
         .map(|(wf, &(n, k))| ste::salt_quantize_forward(wf, n, k, T))
         .collect();
-    let ppl_distilled = perplexity(&logits_of(&distilled, &a, &eval_ids), &eval_ids, a.vocab);
+    let ppl_distilled = perplexity_windowed(&distilled, &a, &eval_ids, EVAL_WINDOW);
 
     println!(
         "0042 HELD-OUT SmolLM2 distillation (T={T}, {steps} steps, train {} tok / {} windows, eval {} HELD-OUT tok): \
@@ -242,13 +249,13 @@ fn salt_distillation_device_tape_recovers_heldout() {
     let backend = CudaBackend::new(0).expect("open CUDA device");
 
     // Held-out baselines (fp + full PTQ) on the disjoint eval split.
-    let ppl_fp = perplexity(&logits_of(&fp, &a, &eval_ids), &eval_ids, a.vocab);
+    let ppl_fp = perplexity_windowed(&fp, &a, &eval_ids, EVAL_WINDOW);
     let ptq: Vec<Vec<f32>> = fp
         .iter()
         .zip(&shapes)
         .map(|(wf, &(n, k))| ste::salt_quantize_forward(wf, n, k, T))
         .collect();
-    let ppl_ptq = perplexity(&logits_of(&ptq, &a, &eval_ids), &eval_ids, a.vocab);
+    let ppl_ptq = perplexity_windowed(&ptq, &a, &eval_ids, EVAL_WINDOW);
 
     let mut lat = fp.clone();
     let opt = AdamW::new(LR);
@@ -290,7 +297,7 @@ fn salt_distillation_device_tape_recovers_heldout() {
         .zip(&shapes)
         .map(|(wf, &(n, k))| ste::salt_quantize_forward(wf, n, k, T))
         .collect();
-    let ppl_distilled = perplexity(&logits_of(&distilled, &a, &eval_ids), &eval_ids, a.vocab);
+    let ppl_distilled = perplexity_windowed(&distilled, &a, &eval_ids, EVAL_WINDOW);
     println!(
         "0043 P2.5d DEVICE SALT distillation (T={T}, {steps} steps, {} tok / {} win, eval {} HELD-OUT): \
          fp ppl {ppl_fp:.3} | PTQ ppl {ppl_ptq:.3e} | distilled ppl {ppl_distilled:.3}. \
@@ -365,13 +372,13 @@ fn salt_distillation_device_trainer_recovers_heldout() {
     let tc = std::env::var("TRITIUM_DISTILL_TF32")
         .is_ok()
         .then(|| TensorCoreGemm::new(&backend).expect("cuBLASLt tensor-core tier"));
-    let ppl_fp = perplexity(&logits_of(&fp, &a, &eval_ids), &eval_ids, a.vocab);
+    let ppl_fp = perplexity_windowed(&fp, &a, &eval_ids, EVAL_WINDOW);
     let ptq: Vec<Vec<f32>> = fp
         .iter()
         .zip(&shapes)
         .map(|(wf, &(n, k))| ste::salt_quantize_forward(wf, n, k, T))
         .collect();
-    let ppl_ptq = perplexity(&logits_of(&ptq, &a, &eval_ids), &eval_ids, a.vocab);
+    let ppl_ptq = perplexity_windowed(&ptq, &a, &eval_ids, EVAL_WINDOW);
 
     let opt = AdamW::new(LR);
     let specs: Vec<_> = fp
@@ -484,7 +491,7 @@ fn salt_distillation_device_trainer_recovers_heldout() {
                     .zip(&shapes)
                     .map(|(wf, &(n, kk))| ste::salt_quantize_forward(&wf, n, kk, T))
                     .collect();
-                let ppl = perplexity(&logits_of(&ckpt, &a, &eval_ids), &eval_ids, a.vocab);
+                let ppl = perplexity_windowed(&ckpt, &a, &eval_ids, EVAL_WINDOW);
                 let tokens = step as usize * TRAIN_SEQ;
                 println!(
                     "curve: {step},{tokens},{ppl:.3},{:.1},{:.3}",
@@ -503,7 +510,7 @@ fn salt_distillation_device_trainer_recovers_heldout() {
         .zip(&shapes)
         .map(|(wf, &(n, k))| ste::salt_quantize_forward(wf, n, k, T))
         .collect();
-    let ppl_distilled = perplexity(&logits_of(&distilled, &a, &eval_ids), &eval_ids, a.vocab);
+    let ppl_distilled = perplexity_windowed(&distilled, &a, &eval_ids, EVAL_WINDOW);
     let recovery = ppl_ptq / ppl_distilled;
     let mean_ms = step_ms / steps as f64;
     let host_probability_copies = if teacher_cache.is_some() { 1 } else { 2 };
