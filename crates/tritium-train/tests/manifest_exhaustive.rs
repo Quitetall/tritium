@@ -74,6 +74,10 @@ fn every_public_tape_operation_has_one_frozen_manifest_id() {
         "value",
         "backward",
         "try_conv2d",
+        // Semantic op awaiting its frozen id in manifest V3 (ADR 0035 WS-C3 /
+        // plan 0054): V2 is digest-frozen, so registration lands with the V3
+        // vectors. WS-C3 MUST move this to TAPE_METHODS and delete this entry.
+        "hestia_relax",
     ];
     let semantic: BTreeSet<_> = actual
         .into_iter()

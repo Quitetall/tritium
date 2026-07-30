@@ -20,8 +20,8 @@ pub use crate::ops::conv1d::Conv1dCfg;
 pub use crate::ops::conv2d::{Conv2dCfg, Conv2dError};
 pub use crate::ops::fsq::{FsqBound, FsqCfg, FsqSte};
 use crate::ops::{
-    act, bias, conv1d, conv2d, dense, elementwise, embed, fsq, loss, matmul, norm, rope, shape,
-    softmax, ste,
+    act, bias, conv1d, conv2d, dense, elementwise, embed, fsq, hestia, loss, matmul, norm, rope,
+    shape, softmax, ste,
 };
 
 /// Index of a value buffer in a [`Tape`]'s arena.
@@ -182,6 +182,40 @@ impl Tape {
             out,
             Box::new(move |ins, g, grads, ids| {
                 let gs = ste::lsq_vjp(ins[0], ins[1], rows, cols, g);
+                for (k, gv) in gs.into_iter().enumerate() {
+                    for (j, &v) in gv.iter().enumerate() {
+                        grads[ids[k]][j] += v;
+                    }
+                }
+            }),
+        )
+    }
+
+    /// HESTIA differentiable ternarization (ADR 0035 WS-C1): the softmax-expected trit at shared
+    /// temperature `tau` (`[1]`, trainable anneal knob), scaled back by the per-row `s` (`[rows]`;
+    /// AbsMean, stop-gradient — its grad is all-zero). Unlike the STE ops the forward is smooth,
+    /// so the backward is its exact gradient in both `wf` and `tau`. Use the output as a dense
+    /// weight (e.g. via [`dense_matmul`](Self::dense_matmul)).
+    pub fn hestia_relax(
+        &mut self,
+        wf: ValueId,
+        s: ValueId,
+        tau: ValueId,
+        rows: usize,
+        cols: usize,
+    ) -> ValueId {
+        let out = hestia::hestia_forward(
+            &self.values[wf],
+            &self.values[s],
+            &self.values[tau],
+            rows,
+            cols,
+        );
+        self.record(
+            vec![wf, s, tau],
+            out,
+            Box::new(move |ins, g, grads, ids| {
+                let gs = hestia::hestia_vjp(ins[0], ins[1], ins[2], rows, cols, g);
                 for (k, gv) in gs.into_iter().enumerate() {
                     for (j, &v) in gv.iter().enumerate() {
                         grads[ids[k]][j] += v;
