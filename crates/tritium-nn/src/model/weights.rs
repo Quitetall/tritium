@@ -110,9 +110,18 @@ impl ModelWeights {
         // P2e: one config-driven skeleton for every loading path — the GGUF
         // dialect supplies the name schema, `load_dense` the norms/embedding,
         // and `load_ternary` (backend upload) the projections.
+        //
+        // Untied ternary head (ADR 0032 L1): BitNet ties by default, but a GGUF
+        // carrying an explicit `output.weight` is UNTIED — load that tensor as
+        // a separate (ternary) lm_head instead of dotting against token_embd.
+        // The tensor's presence is the source of truth, not the arch default.
+        let mut arch = ArchSpec::bitnet();
+        if file.tensor("output.weight").is_some() {
+            arch.tied_embeddings = false;
+        }
         crate::model::hf::build_standard_model(
             config,
-            &ArchSpec::bitnet(),
+            &arch,
             crate::model::hf::NameSchema::Gguf,
             |name, _expected_len| load_dense(file, bytes, name),
             // Shape hints unused: load_ternary derives [N, K] from the
