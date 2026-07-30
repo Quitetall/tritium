@@ -341,6 +341,10 @@ fn _tritium(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
+        torch_native::_ternary_linear_backward_cpu_dlpack,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
         torch_native::_ternary_linear_cache_clear,
         m
     )?)?;

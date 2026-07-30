@@ -50,7 +50,9 @@ use tritium_format::{
     TQ1_0_BLOCK_BYTES, TQ2_0_BLOCK_BYTES, num_blocks, unpack_tq1_0_row, unpack_tq2_0_row,
 };
 use tritium_runtime::BackendEntry;
-use tritium_spec::{BackendError, DeviceBuffer, DeviceCaps, MpGemm, TernaryBackend};
+use tritium_spec::{
+    BackendError, DeviceBuffer, DeviceCaps, MpGemm, MpGemmProjectedVjp, TernaryBackend,
+};
 
 // The kernel module holds the only hand-written `unsafe` in the crate: the AVX2
 // intrinsic kernel (its `unsafe fn` plus the raw-pointer loads/stores). The
@@ -280,6 +282,35 @@ impl TernaryBackend for CpuBackend {
         // detection (results must stay bit-parity with the scalar reference).
         kernel::dispatch_mpgemm(act, &trits, scales, shape, out)
     }
+
+    fn mpgemm_projected_vjp(&self, p: MpGemmProjectedVjp<'_>) -> Result<(), BackendError> {
+        let MpGemmProjectedVjp {
+            act,
+            weights,
+            scales,
+            grad_output,
+            shape,
+            format,
+            grad_act,
+            grad_projected_weight,
+            grad_bias,
+        } = p;
+        let buffer = weights
+            .as_any()
+            .downcast_ref::<CpuBuffer>()
+            .ok_or_else(|| BackendError::InvalidInput("buffer is not a CpuBuffer".to_owned()))?;
+        let trits = Self::unpack_weights(buffer, shape, format)?;
+        kernel::dispatch_mpgemm_projected_vjp(
+            act,
+            &trits,
+            scales,
+            grad_output,
+            shape,
+            grad_act,
+            grad_projected_weight,
+            grad_bias,
+        )
+    }
 }
 
 /// A human-readable host arch name with the SIMD tier appended when known.
@@ -379,6 +410,75 @@ mod tests {
     /// Relative-tolerance assertion matching ADR 0002 (`1e-4`).
     fn close(got: f32, want: f32) -> bool {
         (got - want).abs() <= 1e-4 * want.abs().max(1.0)
+    }
+
+    #[test]
+    fn packed_projected_vjp_matches_dense_contract() {
+        let shape = GemmShape::new(2, 2, 3);
+        let weights = trits(&[1, 0, -1, -1, 1, 1]);
+        let packed = pack(&weights, shape, TernaryFormat::Tq2_0);
+        let backend = CpuBackend::new();
+        let buffer = backend
+            .upload_weights(&packed, shape, TernaryFormat::Tq2_0)
+            .unwrap();
+        let act = [1.0, 2.0, 3.0, -1.0, 4.0, 0.5];
+        let scales = [2.0, 0.5];
+        let grad_output = [3.0, -2.0, 4.0, 1.0];
+        let mut grad_act = vec![f32::NAN; shape.m * shape.k];
+        let mut grad_weight = vec![f32::NAN; shape.n * shape.k];
+        let mut grad_bias = vec![f32::NAN; shape.n];
+
+        backend
+            .mpgemm_projected_vjp(MpGemmProjectedVjp {
+                act: &act,
+                weights: buffer.as_ref(),
+                scales: &scales,
+                grad_output: &grad_output,
+                shape,
+                format: TernaryFormat::Tq2_0,
+                grad_act: &mut grad_act,
+                grad_projected_weight: &mut grad_weight,
+                grad_bias: Some(&mut grad_bias),
+            })
+            .unwrap();
+
+        assert_eq!(grad_act, vec![7.0, -1.0, -7.0, 7.5, 0.5, -7.5]);
+        assert_eq!(grad_weight, vec![-1.0, 22.0, 11.0, -3.0, 0.0, -5.5]);
+        assert_eq!(grad_bias, vec![7.0, -1.0]);
+    }
+
+    #[test]
+    fn packed_projected_vjp_rejects_bad_output_shape() {
+        let shape = GemmShape::new(1, 1, 1);
+        let packed = pack(&[Trit::POS], shape, TernaryFormat::Tq2_0);
+        let backend = CpuBackend::new();
+        let buffer = backend
+            .upload_weights(&packed, shape, TernaryFormat::Tq2_0)
+            .unwrap();
+        let mut grad_act = [];
+        let mut grad_weight = [0.0];
+
+        let error = backend
+            .mpgemm_projected_vjp(MpGemmProjectedVjp {
+                act: &[1.0],
+                weights: buffer.as_ref(),
+                scales: &[1.0],
+                grad_output: &[1.0],
+                shape,
+                format: TernaryFormat::Tq2_0,
+                grad_act: &mut grad_act,
+                grad_projected_weight: &mut grad_weight,
+                grad_bias: None,
+            })
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            BackendError::ShapeMismatch {
+                expected: 1,
+                got: 0
+            }
+        ));
     }
 
     // ---- the conformance gate ------------------------------------------------

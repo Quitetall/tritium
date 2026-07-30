@@ -89,6 +89,55 @@ impl fmt::Debug for MpGemm<'_> {
     }
 }
 
+/// Inputs and outputs for the VJP of one packed ternary mpGEMM.
+///
+/// `grad_projected_weight` is the gradient with respect to the dense projected
+/// weight `P[n,k] = scales[n] * trit[n,k]`. Framework adapters apply their
+/// estimator-specific STE after this backend-neutral primitive.
+pub struct MpGemmProjectedVjp<'a> {
+    /// Forward activation `[M, K]`.
+    pub act: &'a [f32],
+    /// Packed ternary weight `[N, K]`.
+    pub weights: &'a dyn DeviceBuffer,
+    /// Per-output-channel scale `[N]`.
+    pub scales: &'a [f32],
+    /// Upstream gradient `[M, N]`.
+    pub grad_output: &'a [f32],
+    /// Shared matrix dimensions.
+    pub shape: GemmShape,
+    /// Packed ternary format.
+    pub format: TernaryFormat,
+    /// Output gradient with respect to `act`, shape `[M, K]`.
+    pub grad_act: &'a mut [f32],
+    /// Output gradient with respect to projected weight, shape `[N, K]`.
+    pub grad_projected_weight: &'a mut [f32],
+    /// Optional output bias gradient `[N]`.
+    pub grad_bias: Option<&'a mut [f32]>,
+}
+
+impl fmt::Debug for MpGemmProjectedVjp<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MpGemmProjectedVjp")
+            .field("act_len", &self.act.len())
+            .field("weights_len_bytes", &self.weights.len_bytes())
+            .field("scales_len", &self.scales.len())
+            .field("grad_output_len", &self.grad_output.len())
+            .field("shape", &self.shape)
+            .field("format", &self.format)
+            .field("grad_act_len", &self.grad_act.len())
+            .field(
+                "grad_projected_weight_len",
+                &self.grad_projected_weight.len(),
+            )
+            .field(
+                "grad_bias_len",
+                &self.grad_bias.as_ref().map(|values| values.len()),
+            )
+            .finish()
+    }
+}
+
 /// Opaque handle to device-resident memory owned by a backend.
 ///
 /// The runtime treats this as an opaque token; the owning backend downcasts it
@@ -156,6 +205,24 @@ pub trait TernaryBackend: Send + Sync {
     /// [`BackendError::ShapeMismatch`] if buffer lengths disagree with `shape`;
     /// [`BackendError::Backend`] for device-specific failures.
     fn mpgemm(&self, p: MpGemm<'_>) -> Result<(), BackendError>;
+
+    /// Compute activation, dense projected-weight, and optional bias VJPs for
+    /// one packed ternary mpGEMM.
+    ///
+    /// Backends with a native training path override this method. Default
+    /// returns [`BackendError::Backend`], preserving source compatibility for
+    /// inference-only third-party backends.
+    ///
+    /// # Errors
+    /// [`BackendError::ShapeMismatch`] for invalid operand lengths;
+    /// [`BackendError::Backend`] when this backend has no packed VJP path or its
+    /// device execution fails.
+    fn mpgemm_projected_vjp(&self, _p: MpGemmProjectedVjp<'_>) -> Result<(), BackendError> {
+        Err(BackendError::Backend(format!(
+            "backend `{}` does not implement packed mpGEMM VJP",
+            self.device_id()
+        )))
+    }
 
     /// Ternary mpGEMM with **W1.58A8** activation quantization fused in: quantize
     /// `act` to per-token int8 (absmax, `Qp = 127`), contract against the ternary
@@ -465,6 +532,32 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    #[test]
+    fn inference_backend_default_rejects_packed_vjp_explicitly() {
+        let backend = MockBackend;
+        let buffer = MockBuffer { trits: vec![1] };
+        let mut grad_act = [0.0];
+        let mut grad_weight = [0.0];
+        let error = backend
+            .mpgemm_projected_vjp(MpGemmProjectedVjp {
+                act: &[1.0],
+                weights: &buffer,
+                scales: &[1.0],
+                grad_output: &[1.0],
+                shape: GemmShape::new(1, 1, 1),
+                format: TernaryFormat::Tq2_0,
+                grad_act: &mut grad_act,
+                grad_projected_weight: &mut grad_weight,
+                grad_bias: None,
+            })
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            BackendError::Backend("backend `mock` does not implement packed mpGEMM VJP".to_owned())
+        );
     }
 
     /// `mpgemm_with_act_quant` = quantize → contract → fold per-token scale.

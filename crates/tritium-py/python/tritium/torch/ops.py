@@ -87,6 +87,18 @@ def _native_cpu_supported(
     )
 
 
+def _native_cpu_backward_supported(
+    grad_output: torch.Tensor, input: torch.Tensor, master: torch.Tensor
+) -> bool:
+    return (
+        getattr(_native, "_ternary_linear_backward_cpu_dlpack", None) is not None
+        and not torch.is_grad_enabled()
+        and grad_output.device.type == "cpu"
+        and grad_output.dtype == torch.float32
+        and _native_cpu_supported(input, master, None)
+    )
+
+
 @torch.library.custom_op(
     "tritium::ternary_linear",
     mutates_args=(),
@@ -120,9 +132,8 @@ def ternary_linear(
         if capsule is None:
             scales = detached_master.abs().mean(dim=1)
             capsule = call_native(scales)
-            if capsule is None:
-                raise RuntimeError("native ternary Linear cache fill did not publish")
-        return torch.from_dlpack(capsule)
+        if capsule is not None:
+            return torch.from_dlpack(capsule)
     projected, _mask = _projection_components(master)
     return F.linear(input, projected, bias)
 
@@ -149,6 +160,37 @@ def _setup_ternary_linear_context(ctx, inputs, output) -> None:
 
 def _ternary_linear_backward(ctx, grad_output: torch.Tensor):
     input, master = ctx.saved_tensors
+    if _native_cpu_backward_supported(grad_output, input, master):
+        detached_grad = grad_output.detach().contiguous()
+        detached_input = input.detach()
+        detached_master = master.detach()
+        version = int(master._version)
+        storage_identity = int(master.untyped_storage()._cdata)
+
+        def call_native(scales: Optional[torch.Tensor]):
+            return _native._ternary_linear_backward_cpu_dlpack(
+                detached_grad,
+                detached_input,
+                detached_master,
+                scales,
+                master,
+                version,
+                storage_identity,
+                ctx.has_bias,
+            )
+
+        capsules = call_native(None)
+        if capsules is None:
+            scales = detached_master.abs().mean(dim=1)
+            capsules = call_native(scales)
+        if capsules is not None:
+            grad_input, grad_master, grad_bias = capsules
+            return (
+                torch.from_dlpack(grad_input),
+                torch.from_dlpack(grad_master),
+                torch.from_dlpack(grad_bias) if grad_bias is not None else None,
+            )
+
     projected, mask = _projection_components(master)
     input_2d = input.reshape(-1, input.shape[-1])
     grad_2d = grad_output.reshape(-1, grad_output.shape[-1])

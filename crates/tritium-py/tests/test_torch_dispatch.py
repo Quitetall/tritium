@@ -10,6 +10,7 @@ from tritium import _tritium as _native  # noqa: E402
 
 
 def test_ternary_linear_op_matches_literal_forward_and_masked_backward():
+    _native._ternary_linear_cache_clear()
     weight = torch.tensor(
         [[-2.0, -0.4, 0.3, 2.1], [0.0, 1.0, -1.0, 0.2]], requires_grad=True
     )
@@ -27,6 +28,7 @@ def test_ternary_linear_op_matches_literal_forward_and_masked_backward():
     )
     assert torch.equal(bias.grad, torch.ones(2))
     assert x.grad is not None and torch.isfinite(x.grad).all()
+    assert _native._ternary_linear_cache_info()["hits"] == 1
 
 
 def test_native_cpu_forward_caches_packed_weight_and_invalidates_on_mutation():
@@ -154,6 +156,32 @@ def test_native_cpu_uses_pytorch_scale_reduction_at_rounding_threshold():
     assert torch.equal(actual, expected)
 
 
+def test_native_cpu_uses_pytorch_safe_scale_for_subnormal_rows():
+    weight = torch.full((1, 4), 1.0e-40, requires_grad=True)
+    x = torch.ones(1, 4, requires_grad=True)
+
+    expected = reference_ternary_linear(x, weight)
+    actual = ternary_linear(x, weight)
+    assert torch.equal(actual, expected)
+    assert actual.item() == 0.0
+
+    actual.backward(torch.ones_like(actual))
+    assert torch.equal(weight.grad, torch.ones_like(weight))
+
+
+@pytest.mark.parametrize(
+    ("x", "weight"),
+    [
+        (torch.tensor([[float("nan"), 2.0]]), torch.tensor([[0.0, 1.0]])),
+        (torch.tensor([[1.0, 2.0]]), torch.tensor([[float("nan"), 1.0]])),
+    ],
+)
+def test_native_cpu_falls_back_for_nonfinite_dense_semantics(x, weight):
+    expected = reference_ternary_linear(x, weight)
+    actual = ternary_linear(x, weight)
+    assert torch.equal(torch.isnan(actual), torch.isnan(expected))
+
+
 def test_native_cpu_cache_hit_profiles_without_projection_or_copy_ops():
     x = torch.randn(4, 16)
     weight = torch.randn(8, 16)
@@ -176,6 +204,75 @@ def test_native_cpu_cache_hit_profiles_without_projection_or_copy_ops():
     }
     assert event_names.isdisjoint(forbidden)
     assert not any("memcpy" in name or "synchronize" in name for name in event_names)
+
+
+def test_native_cpu_backward_reuses_packed_weight_without_projection_or_matmul():
+    torch.manual_seed(23)
+    _native._ternary_linear_cache_clear()
+    x = torch.randn(3, 2, 16, requires_grad=True)
+    weight = torch.randn(8, 16, requires_grad=True)
+    bias = torch.randn(8, requires_grad=True)
+    grad_output = torch.randn(3, 2, 8)
+
+    expected_x = x.detach().clone().requires_grad_()
+    expected_weight = weight.detach().clone().requires_grad_()
+    expected_bias = bias.detach().clone().requires_grad_()
+    reference_ternary_linear(expected_x, expected_weight, expected_bias).backward(grad_output)
+
+    output = ternary_linear(x, weight, bias)
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU],
+        acc_events=True,
+    ) as profile:
+        output.backward(grad_output)
+
+    assert torch.allclose(x.grad, expected_x.grad, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(weight.grad, expected_weight.grad, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(bias.grad, expected_bias.grad, atol=1e-6, rtol=1e-6)
+    assert _native._ternary_linear_cache_info() == {
+        "capacity": 4096,
+        "entries": 1,
+        "hits": 1,
+        "invalidations": 0,
+        "misses": 1,
+    }
+
+    event_names = {event.key.lower() for event in profile.key_averages()}
+    forbidden = {
+        "aten::abs",
+        "aten::clamp",
+        "aten::matmul",
+        "aten::mean",
+        "aten::mm",
+        "aten::round",
+    }
+    assert event_names.isdisjoint(forbidden)
+
+
+@pytest.mark.parametrize("seed", [0, 1, 7, 23])
+def test_native_cpu_backward_randomized_parity(seed):
+    torch.manual_seed(seed)
+    m = 1 + seed % 7
+    n = 1 + (seed * 3) % 11
+    k = 1 + (seed * 7) % 33
+    x = torch.randn(m, k, requires_grad=True)
+    weight = torch.randn(n, k, requires_grad=True)
+    bias = torch.randn(n, requires_grad=True) if seed % 2 else None
+    grad_output = torch.randn(m, n)
+
+    expected_x = x.detach().clone().requires_grad_()
+    expected_weight = weight.detach().clone().requires_grad_()
+    expected_bias = bias.detach().clone().requires_grad_() if bias is not None else None
+    reference_ternary_linear(expected_x, expected_weight, expected_bias).backward(grad_output)
+
+    _native._ternary_linear_cache_clear()
+    ternary_linear(x, weight, bias).backward(grad_output)
+
+    assert torch.allclose(x.grad, expected_x.grad, atol=2e-5, rtol=2e-5)
+    assert torch.allclose(weight.grad, expected_weight.grad, atol=2e-5, rtol=2e-5)
+    if bias is not None:
+        assert torch.allclose(bias.grad, expected_bias.grad, atol=2e-5, rtol=2e-5)
+    assert _native._ternary_linear_cache_info()["hits"] == 1
 
 
 def test_ternary_linear_opcheck_and_fullgraph_compile():

@@ -66,13 +66,27 @@ CPU vertical slice landed:
   byte offset, and shape; both ordinary optimizer mutation and storage replacement
   invalidate before the next forward;
 - output storage is Rust-owned and transferred to PyTorch through DLPack;
+- first-order CPU backward reuses the same packed-cache entry, computes
+  activation/projected-weight/bias VJPs in Rust, applies the strict STE mask
+  natively through the backend-neutral `mpgemm_projected_vjp` port, and returns
+  three Rust-owned gradients through DLPack;
+- non-compact upstream gradients are compacted on-device before the native call;
+  higher-order-gradient recording retains the composite fallback;
 - unsupported dtype/layout/device cases retain the exact composite fallback;
-- no persistent dense weight shadow is cached; current CPU backend unpack
-  scratch remains transient per call.
+- no persistent dense weight shadow or transposed packed copy is cached; current
+  CPU backend unpack scratch remains transient per call.
 
-Remaining before Step 2 closes: native backward, stream-aware CUDA input/output,
-CUDA packed-cache residency, sanitizer/profile evidence, and retained
-representative-shape performance receipts.
+Native CPU backward gate: dispatcher suite passes 18 tests; 40 frozen-seed spot
+checks bound observed forward/gradient drift to `4.77e-6`; full wheel suite
+passes 241 tests plus 9 subtests (one prerequisite skip). Warm backward profiles
+contain no Torch projection or matrix-multiply operators.
+
+Remaining before Step 2 closes: stream-aware CUDA input/output, CUDA packed-cache
+residency, sanitizer evidence, CPU performance optimization/qualification, and
+retained representative-shape performance receipts. Exploratory release-build
+timings are not a gate receipt: native forward+backward remained 2.6–3.7× slower
+than this host's MKL-backed composite at `M=32`, so no CPU speedup claim is
+permitted yet.
 
 ## Verification
 

@@ -76,6 +76,234 @@ pub(crate) fn dispatch_mpgemm(
         })
 }
 
+/// VJP for `Y = A · (scale * trit)ᵀ`, retaining no dense weight shadow.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dispatch_mpgemm_projected_vjp(
+    act: &[f32],
+    weights: &[Trit],
+    scales: &[f32],
+    grad_output: &[f32],
+    shape: GemmShape,
+    grad_act: &mut [f32],
+    grad_projected_weight: &mut [f32],
+    grad_bias: Option<&mut [f32]>,
+) -> Result<(), BackendError> {
+    let GemmShape { m, n, k } = shape;
+    let mk = m
+        .checked_mul(k)
+        .ok_or_else(|| BackendError::InvalidInput("M*K element count overflows".to_owned()))?;
+    let nk = n
+        .checked_mul(k)
+        .ok_or_else(|| BackendError::InvalidInput("N*K element count overflows".to_owned()))?;
+    let mn = m
+        .checked_mul(n)
+        .ok_or_else(|| BackendError::InvalidInput("M*N element count overflows".to_owned()))?;
+    let lengths = [
+        (act.len(), mk),
+        (weights.len(), nk),
+        (scales.len(), n),
+        (grad_output.len(), mn),
+        (grad_act.len(), mk),
+        (grad_projected_weight.len(), nk),
+    ];
+    if let Some(&(got, expected)) = lengths.iter().find(|(got, expected)| got != expected) {
+        return Err(BackendError::ShapeMismatch { expected, got });
+    }
+    if let Some(values) = grad_bias.as_ref()
+        && values.len() != n
+    {
+        return Err(BackendError::ShapeMismatch {
+            expected: n,
+            got: values.len(),
+        });
+    }
+
+    grad_act.fill(0.0);
+    grad_projected_weight.fill(0.0);
+    if m == 0 || n == 0 {
+        if let Some(values) = grad_bias {
+            values.fill(0.0);
+        }
+        return Ok(());
+    }
+
+    if k > 0 {
+        #[cfg(target_arch = "x86_64")]
+        let used_simd = if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            avx2_projected_vjp(
+                act,
+                weights,
+                scales,
+                grad_output,
+                shape,
+                grad_act,
+                grad_projected_weight,
+            );
+            true
+        } else {
+            false
+        };
+        #[cfg(not(target_arch = "x86_64"))]
+        let used_simd = false;
+
+        if !used_simd {
+            grad_act
+                .par_chunks_mut(k)
+                .enumerate()
+                .for_each(|(mi, grad_row)| {
+                    for ni in 0..n {
+                        let upstream = grad_output[mi * n + ni];
+                        let weight_row = &weights[ni * k..(ni + 1) * k];
+                        for (grad_value, &trit) in grad_row.iter_mut().zip(weight_row) {
+                            let projected = trit.to_f32() * scales[ni];
+                            *grad_value += upstream * projected;
+                        }
+                    }
+                });
+
+            grad_projected_weight
+                .par_chunks_mut(k)
+                .enumerate()
+                .for_each(|(ni, grad_row)| {
+                    for mi in 0..m {
+                        let upstream = grad_output[mi * n + ni];
+                        let act_row = &act[mi * k..(mi + 1) * k];
+                        for (grad_value, &act_value) in grad_row.iter_mut().zip(act_row) {
+                            *grad_value += upstream * act_value;
+                        }
+                    }
+                });
+        }
+    }
+
+    if let Some(values) = grad_bias {
+        values.par_iter_mut().enumerate().for_each(|(ni, value)| {
+            let mut acc = 0.0f32;
+            for mi in 0..m {
+                acc += grad_output[mi * n + ni];
+            }
+            *value = acc;
+        });
+    }
+    Ok(())
+}
+
+#[cfg(target_arch = "x86_64")]
+fn avx2_projected_vjp(
+    act: &[f32],
+    weights: &[Trit],
+    scales: &[f32],
+    grad_output: &[f32],
+    shape: GemmShape,
+    grad_act: &mut [f32],
+    grad_projected_weight: &mut [f32],
+) {
+    let GemmShape { m, n, k } = shape;
+    grad_act
+        .par_chunks_mut(k)
+        .enumerate()
+        .for_each(|(mi, grad_row)| {
+            // SAFETY: runtime dispatch checked AVX2+FMA; validated slices cover
+            // this complete output row and all shared inputs.
+            unsafe {
+                avx2_grad_act_row(
+                    grad_row,
+                    weights,
+                    scales,
+                    &grad_output[mi * n..(mi + 1) * n],
+                    n,
+                    k,
+                );
+            }
+        });
+    grad_projected_weight
+        .par_chunks_mut(k)
+        .enumerate()
+        .for_each(|(ni, grad_row)| {
+            // SAFETY: same AVX2+FMA dispatch; validated slices cover every
+            // strided upstream value and activation row.
+            unsafe {
+                avx2_grad_projected_weight_row(grad_row, act, grad_output, ni, m, n, k);
+            }
+        });
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn avx2_grad_act_row(
+    grad_row: &mut [f32],
+    weights: &[Trit],
+    scales: &[f32],
+    upstream: &[f32],
+    n: usize,
+    k: usize,
+) {
+    use core::arch::x86_64::{
+        _mm_loadl_epi64, _mm256_cvtepi8_epi32, _mm256_cvtepi32_ps, _mm256_fmadd_ps,
+        _mm256_loadu_ps, _mm256_mul_ps, _mm256_set1_ps, _mm256_storeu_ps,
+    };
+
+    const LANES: usize = 8;
+    let simd_k = k - k % LANES;
+    for ni in 0..n {
+        let upstream_vector = _mm256_set1_ps(upstream[ni]);
+        let scale_vector = _mm256_set1_ps(scales[ni]);
+        let weight_row = &weights[ni * k..(ni + 1) * k];
+        let mut ki = 0;
+        while ki < simd_k {
+            // SAFETY: loop keeps `ki + LANES <= k`; Trit is repr-transparent i8.
+            let trits = unsafe { _mm_loadl_epi64(weight_row.as_ptr().add(ki).cast()) };
+            let trits = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(trits));
+            let projected = _mm256_mul_ps(trits, scale_vector);
+            // SAFETY: grad row has k elements; same loop bound covers load/store.
+            let prior = unsafe { _mm256_loadu_ps(grad_row.as_ptr().add(ki)) };
+            let next = _mm256_fmadd_ps(upstream_vector, projected, prior);
+            // SAFETY: `ki + LANES <= k`; store stays within grad row.
+            unsafe { _mm256_storeu_ps(grad_row.as_mut_ptr().add(ki), next) };
+            ki += LANES;
+        }
+        for ki in simd_k..k {
+            grad_row[ki] += upstream[ni] * (weight_row[ki].to_f32() * scales[ni]);
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn avx2_grad_projected_weight_row(
+    grad_row: &mut [f32],
+    act: &[f32],
+    grad_output: &[f32],
+    ni: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+) {
+    use core::arch::x86_64::{_mm256_fmadd_ps, _mm256_loadu_ps, _mm256_set1_ps, _mm256_storeu_ps};
+
+    const LANES: usize = 8;
+    let simd_k = k - k % LANES;
+    for mi in 0..m {
+        let upstream = grad_output[mi * n + ni];
+        let upstream_vector = _mm256_set1_ps(upstream);
+        let act_row = &act[mi * k..(mi + 1) * k];
+        let mut ki = 0;
+        while ki < simd_k {
+            // SAFETY: loop keeps `ki + LANES <= k` for all three row slices.
+            let activation = unsafe { _mm256_loadu_ps(act_row.as_ptr().add(ki)) };
+            // SAFETY: same bound keeps read within grad row.
+            let prior = unsafe { _mm256_loadu_ps(grad_row.as_ptr().add(ki)) };
+            let next = _mm256_fmadd_ps(upstream_vector, activation, prior);
+            // SAFETY: same bound keeps write within grad row.
+            unsafe { _mm256_storeu_ps(grad_row.as_mut_ptr().add(ki), next) };
+            ki += LANES;
+        }
+        for ki in simd_k..k {
+            grad_row[ki] += upstream * act_row[ki];
+        }
+    }
+}
+
 /// Rows per parallel task. A coarse heuristic: keep at least a few thousand
 /// add/sub/skip ops per task so the rayon overhead is amortised, and never split
 /// finer than one row.

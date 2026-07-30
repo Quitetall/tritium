@@ -18,11 +18,20 @@ use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyAnyMethods, PyWeakrefMethods, PyWeakrefReference};
 use tritium_core::{GemmShape, TernaryFormat, Trit};
 use tritium_format::{TQ2_0_BLOCK_BYTES, num_blocks, pack_tq2_0_row};
-use tritium_spec::{DeviceBuffer, MpGemm, TernaryBackend};
+use tritium_spec::{DeviceBuffer, MpGemm, MpGemmProjectedVjp, TernaryBackend};
 
 use crate::cpu_backend;
-
 const CACHE_CAPACITY: usize = 4096;
+type LinearBackwardCapsules = (Py<PyAny>, Py<PyAny>, Option<Py<PyAny>>);
+
+#[derive(Debug)]
+struct LinearGeometry {
+    input_shape: Vec<usize>,
+    master_shape: Vec<usize>,
+    m: usize,
+    n: usize,
+    k: usize,
+}
 
 struct PackedLinear {
     weights: Box<dyn DeviceBuffer>,
@@ -100,6 +109,65 @@ fn checked_product(dimensions: &[usize], label: &str) -> PyResult<usize> {
     })
 }
 
+fn linear_geometry(input: &Dlpack, master: &Dlpack) -> PyResult<LinearGeometry> {
+    let input_shape = tensor_shape(input, "input")?;
+    let master_shape = tensor_shape(master, "master")?;
+    if input_shape.is_empty() {
+        return Err(PyValueError::new_err(
+            "ternary Linear input must have at least one dimension",
+        ));
+    }
+    if master_shape.len() != 2 {
+        return Err(PyValueError::new_err(
+            "ternary Linear master must have rank 2",
+        ));
+    }
+    let n = master_shape[0];
+    let k = master_shape[1];
+    if input_shape[input_shape.len() - 1] != k {
+        return Err(PyValueError::new_err(
+            "ternary Linear input width does not match master weight",
+        ));
+    }
+    let m = checked_product(&input_shape[..input_shape.len() - 1], "input batch")?;
+    Ok(LinearGeometry {
+        input_shape,
+        master_shape,
+        m,
+        n,
+        k,
+    })
+}
+
+fn projection_scale_values(scales: Option<&Dlpack>, n: usize) -> PyResult<Option<&[f32]>> {
+    match scales {
+        Some(tensor) => {
+            let shape = tensor_shape(tensor, "projection scales")?;
+            if shape.as_slice() != [n] {
+                return Err(PyValueError::new_err(
+                    "projection scale shape does not match output width",
+                ));
+            }
+            Ok(Some(cpu_f32(tensor, "projection scales")?))
+        }
+        None => Ok(None),
+    }
+}
+
+fn export_array(
+    py: Python<'_>,
+    shape: &[usize],
+    values: Vec<f32>,
+    label: &str,
+) -> PyResult<Py<PyAny>> {
+    let array = ArrayD::from_shape_vec(IxDyn(shape), values)
+        .map_err(|error| PyRuntimeError::new_err(format!("cannot shape {label}: {error}")))?;
+    let dlpack: Dlpack = Builder::from(Box::new(array))
+        .try_build()
+        .map_err(|error| PyRuntimeError::new_err(format!("cannot export {label}: {error}")))?;
+    Ok(dlpack.into_pyobject(py)?.unbind())
+}
+
 fn build_packed(
     backend: &dyn TernaryBackend,
     master: &[f32],
@@ -147,8 +215,9 @@ fn build_packed(
         if scale == 0.0 {
             row_trits.fill(Trit::ZERO);
         } else {
+            let denominator = scale.max(f32::MIN_POSITIVE);
             for (trit, &value) in row_trits.iter_mut().zip(row) {
-                let quantized = (value / scale).round_ties_even().clamp(-1.0, 1.0) as i8;
+                let quantized = (value / denominator).round_ties_even().clamp(-1.0, 1.0) as i8;
                 *trit = Trit::from_i8(quantized)
                     .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
             }
@@ -249,40 +318,21 @@ pub(crate) fn _ternary_linear_cpu_dlpack(
         .map(|tensor| tensor.extract::<Dlpack>())
         .transpose()?;
 
-    let input_shape = tensor_shape(&input_tensor, "input")?;
-    let master_shape = tensor_shape(&master_tensor, "master")?;
-    if input_shape.is_empty() {
-        return Err(PyValueError::new_err(
-            "ternary Linear input must have at least one dimension",
-        ));
-    }
-    if master_shape.len() != 2 {
-        return Err(PyValueError::new_err(
-            "ternary Linear master must have rank 2",
-        ));
-    }
-    let n = master_shape[0];
-    let k = master_shape[1];
-    if input_shape[input_shape.len() - 1] != k {
-        return Err(PyValueError::new_err(
-            "ternary Linear input width does not match master weight",
-        ));
-    }
-    let m = checked_product(&input_shape[..input_shape.len() - 1], "input batch")?;
+    let LinearGeometry {
+        input_shape,
+        master_shape: _,
+        m,
+        n,
+        k,
+    } = linear_geometry(&input_tensor, &master_tensor)?;
     let input_values = cpu_f32(&input_tensor, "input")?;
     let master_values = cpu_f32(&master_tensor, "master")?;
-    let scale_values = match scales_tensor.as_ref() {
-        Some(tensor) => {
-            let shape = tensor_shape(tensor, "projection scales")?;
-            if shape.as_slice() != [n] {
-                return Err(PyValueError::new_err(
-                    "projection scale shape does not match output width",
-                ));
-            }
-            Some(cpu_f32(tensor, "projection scales")?)
-        }
-        None => None,
-    };
+    let scale_values = projection_scale_values(scales_tensor.as_ref(), n)?;
+    if input_values.iter().any(|value| !value.is_finite())
+        || (scale_values.is_some() && master_values.iter().any(|value| !value.is_finite()))
+    {
+        return Ok(None);
+    }
     let bias_values = match bias_tensor.as_ref() {
         Some(tensor) => {
             let shape = tensor_shape(tensor, "bias")?;
@@ -345,14 +395,118 @@ pub(crate) fn _ternary_linear_cpu_dlpack(
     let mut output_shape = input_shape;
     let output_rank = output_shape.len();
     output_shape[output_rank - 1] = n;
-    let array = ArrayD::from_shape_vec(IxDyn(&output_shape), output)
-        .map_err(|error| PyRuntimeError::new_err(format!("cannot shape native output: {error}")))?;
-    let dlpack: Dlpack = Builder::from(Box::new(array))
-        .try_build()
-        .map_err(|error| {
-            PyRuntimeError::new_err(format!("cannot export native output: {error}"))
-        })?;
-    Ok(Some(dlpack.into_pyobject(py)?.unbind()))
+    Ok(Some(export_array(
+        py,
+        &output_shape,
+        output,
+        "native output",
+    )?))
+}
+
+/// Run one compact CPU float32 ternary Linear VJP from cached packed weights.
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn _ternary_linear_backward_cpu_dlpack(
+    py: Python<'_>,
+    grad_output: &Bound<'_, PyAny>,
+    input: &Bound<'_, PyAny>,
+    master: &Bound<'_, PyAny>,
+    projection_scales: Option<&Bound<'_, PyAny>>,
+    master_owner: &Bound<'_, PyAny>,
+    parameter_version: u64,
+    storage_identity: u64,
+    has_bias: bool,
+) -> PyResult<Option<LinearBackwardCapsules>> {
+    let grad_output_tensor: Dlpack = grad_output.extract()?;
+    let input_tensor: Dlpack = input.extract()?;
+    let master_tensor: Dlpack = master.extract()?;
+    let scales_tensor: Option<Dlpack> = projection_scales
+        .map(|tensor| tensor.extract::<Dlpack>())
+        .transpose()?;
+
+    let LinearGeometry {
+        input_shape,
+        master_shape,
+        m,
+        n,
+        k,
+    } = linear_geometry(&input_tensor, &master_tensor)?;
+    let grad_output_shape = tensor_shape(&grad_output_tensor, "grad_output")?;
+    let mut expected_grad_shape = input_shape.clone();
+    let output_rank = expected_grad_shape.len();
+    expected_grad_shape[output_rank - 1] = n;
+    if grad_output_shape != expected_grad_shape {
+        return Err(PyValueError::new_err(
+            "ternary Linear grad_output shape does not match forward output",
+        ));
+    }
+    let grad_output_values = cpu_f32(&grad_output_tensor, "grad_output")?;
+    let input_values = cpu_f32(&input_tensor, "input")?;
+    let master_values = cpu_f32(&master_tensor, "master")?;
+    let scale_values = projection_scale_values(scales_tensor.as_ref(), n)?;
+    if scale_values.is_some() && master_values.iter().any(|value| !value.is_finite()) {
+        return Ok(None);
+    }
+
+    let backend = cpu_backend().map_err(PyRuntimeError::new_err)?;
+    let tensor = master_tensor.tensor();
+    let Some(packed) = cached_packed(
+        py,
+        master_owner,
+        master_values,
+        scale_values,
+        parameter_version,
+        storage_identity,
+        tensor.data_ptr() as usize,
+        tensor.byte_offset,
+        n,
+        k,
+        backend.as_ref(),
+    )?
+    else {
+        return Ok(None);
+    };
+
+    let mut grad_input = vec![0.0f32; m * k];
+    let mut grad_master = vec![0.0f32; n * k];
+    let mut grad_bias = has_bias.then(|| vec![0.0f32; n]);
+    py.detach(|| {
+        backend
+            .mpgemm_projected_vjp(MpGemmProjectedVjp {
+                act: input_values,
+                weights: packed.weights.as_ref(),
+                scales: &packed.scales,
+                grad_output: grad_output_values,
+                shape: GemmShape::new(m, n, k),
+                format: TernaryFormat::Tq2_0,
+                grad_act: &mut grad_input,
+                grad_projected_weight: &mut grad_master,
+                grad_bias: grad_bias.as_deref_mut(),
+            })
+            .map_err(|error| {
+                PyRuntimeError::new_err(format!("native ternary Linear backward failed: {error}"))
+            })
+    })?;
+
+    for ((master_row, grad_row), &scale) in master_values
+        .chunks_exact(k)
+        .zip(grad_master.chunks_exact_mut(k))
+        .zip(&packed.scales)
+    {
+        let denominator = scale.max(f32::MIN_POSITIVE);
+        for (&master_value, grad_value) in master_row.iter().zip(grad_row) {
+            if !(scale > 0.0 && (master_value / denominator).abs() < 1.0) {
+                *grad_value = 0.0;
+            }
+        }
+    }
+
+    let grad_input = export_array(py, &input_shape, grad_input, "native grad_input")?;
+    let grad_master = export_array(py, &master_shape, grad_master, "native grad_master")?;
+    let grad_bias = grad_bias
+        .map(|values| export_array(py, &[n], values, "native grad_bias"))
+        .transpose()?;
+    Ok(Some((grad_input, grad_master, grad_bias)))
 }
 
 /// Reset native packed-weight cache and deterministic diagnostics counters.

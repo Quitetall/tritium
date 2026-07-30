@@ -1,6 +1,6 @@
 # ADR 0033 — Tritium v1.1 full public release: ternary research platform
 
-Status: **ACCEPTED** (2026-07-22; installed-observability evidence amendment)
+Status: **ACCEPTED** (2026-07-30; backend-neutral packed-VJP amendment)
 
 - **Decider:** Brian Lam
 - **Research cutoff:** 2026-07-20, inclusive
@@ -213,6 +213,10 @@ Public-interface maturity is explicit. All rows block v1.1:
 - PyTorch operators register real kernels, autograd, fake/meta behavior,
   autocast and `torch.compile` support through the dispatcher. CPU/CUDA tensor
   ownership and CUDA stream ordering are explicit and adversarially tested.
+- Native packed first-order gradients use the object-safe
+  `TernaryBackend::mpgemm_projected_vjp` port. Training-capable backends
+  override it; inference-only third-party backends retain an explicit
+  unsupported default. Frontends never construct a concrete backend.
 - Optimized and composite reference adapters must match forward and first-order
   gradients. Python wrapper overhead is at most 5% versus the direct Tritium
   backend at representative ternary-linear shapes after warmup.

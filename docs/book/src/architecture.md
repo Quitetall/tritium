@@ -43,6 +43,9 @@ The trait's load-bearing methods:
   lives host-side in `tritium-format`, the single source of truth.
 - `mpgemm(act, weights, scales, shape, format, out)` — the plain ternary
   matmul: `out[m,n] = scale[n] · Σ_k act[m,k] · w[n,k]`.
+- optional `mpgemm_projected_vjp(...)` — backend-neutral activation,
+  dense-projected-weight, and bias gradients for packed ternary training;
+  inference-only third-party backends inherit an explicit unsupported default.
 - the fused **W1.58A8** path — quantize `act` to per-token int8 (absmax,
   `Qp = 127`), run the ternary contraction, and fold both the per-token
   activation scale and the per-channel weight scale into the `f32` output. This
