@@ -103,6 +103,11 @@ TRAINING_PERFORMANCE_RECEIPT = runpy.run_path(
 )
 validate_training_performance = TRAINING_PERFORMANCE_RECEIPT["validate"]
 TrainingPerformanceError = TRAINING_PERFORMANCE_RECEIPT["TrainingPerformanceError"]
+TORCH_DISPATCH_RECEIPT = runpy.run_path(
+    Path(__file__).with_name("verify-torch-dispatch-overhead-receipt.py")
+)
+validate_torch_dispatch_overhead = TORCH_DISPATCH_RECEIPT["validate"]
+DispatchOverheadError = TORCH_DISPATCH_RECEIPT["DispatchOverheadError"]
 ESTIMATOR_REFINEMENT_RECEIPT = runpy.run_path(
     Path(__file__).with_name("verify-estimator-refinement-receipt.py")
 )
@@ -142,6 +147,7 @@ KNOWN_KINDS = frozenset(
         "onnx-inference",
         "backend-manifest",
         "performance",
+        "torch-dispatch-overhead",
         "estimator-validation",
         "refinement",
         "baseline-ablation",
@@ -162,7 +168,7 @@ GATES = (
         (
             "installed-qat-tutorial", "frontend-lifecycle",
             "distributed-training", "export-reload",
-            "observability",
+            "observability", "torch-dispatch-overhead",
         ),
     ),
     ("native-backends", ("backend-manifest", "cuda-training", "performance")),
@@ -492,6 +498,13 @@ def evaluate(
                 receipt = validate_training_performance(
                     receipt_path, revision, release, candidate
                 )
+            elif kind == "torch-dispatch-overhead":
+                receipt = validate_torch_dispatch_overhead(
+                    receipt_path,
+                    expected_revision=revision,
+                    expected_release=release,
+                    expected_wheel=artifact_path,
+                )
             elif kind == "estimator-validation":
                 receipt = validate_estimators(
                     receipt_path, revision, release, candidate
@@ -582,6 +595,7 @@ def evaluate(
             OnnxReceiptError,
             TrainingBackendReceiptError,
             TrainingPerformanceError,
+            DispatchOverheadError,
             EstimatorRefinementError,
             ValueError,
         ) as error:
@@ -664,6 +678,27 @@ def evaluate(
             )
             if actual != declared or actual != qualified:
                 raise EvidenceError(f"{kind} receipt does not bind candidate wheel bytes")
+        elif kind == "torch-dispatch-overhead":
+            identity = artifact.get("identity", {})
+            actual = (
+                artifact_path.name,
+                _sha256(artifact_path),
+                artifact_path.stat().st_size,
+            )
+            declared = (
+                artifact_path.name,
+                identity.get("sha256"),
+                identity.get("bytes"),
+            )
+            qualified = (
+                receipt["wheel"]["name"],
+                receipt["wheel"]["sha256"],
+                receipt["wheel"]["bytes"],
+            )
+            if actual != declared or actual != qualified:
+                raise EvidenceError(
+                    "torch-dispatch-overhead receipt does not bind candidate wheel bytes"
+                )
         elif kind in {
             "second-machine", "independent-review", "model-zoo",
             "generated-claims", "governance-docs",

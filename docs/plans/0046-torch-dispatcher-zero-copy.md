@@ -167,9 +167,28 @@ skip; the CUDA library passes 130 unit tests with six declared ignores plus four
 physical integration tests. These results are not admitted release receipts or
 performance claims.
 
-Remaining before Step 2 closes: retained representative-shape CPU
-wrapper-overhead qualification plus physical-CUDA receipts.
-Exploratory release-build timings are not a gate receipt:
+The retained CPU wrapper-overhead gate now has a source-free installed-wheel
+runner, canonical qualifier, independent verifier, and release-registry kind
+`torch-dispatch-overhead`. Frozen decode, training-microbatch, and prefill
+shapes each measure forward and backward. Every case pins one allowed logical
+CPU, one Rayon/Torch/OMP/MKL thread, ten AB/BA warmups, 31 alternating paired
+samples, exact direct/wrapper parity, exact native cache-hit accounting, and a
+deterministic 10,000-resample paired bootstrap. Both median ratio and 95%
+bootstrap upper bound must be at most `1.05`. Candidate METADATA, WHEEL, RECORD,
+canonical name, release version, payload inventory, and compiled source identity
+must match the installed distribution and requested clean revision. Receipt
+identity binds wheel, source, runtime, hardware, raw samples, aggregation, and
+policy; anonymous-file/no-replace publication prevents clobber.
+
+One unretained development-wheel run on an Intel i5-13600K exercised all six
+cases source-free. Observed bootstrap upper ratios ranged from `1.0101` to
+`1.0430`, below the frozen limit. This is runner validation, not an admitted
+release claim: the wheel included uncommitted qualifier source and used a
+non-release source identity.
+
+Remaining before Step 2 closes: run the qualifier against an exact clean,
+committed candidate wheel and retain its receipt; retain physical-CUDA receipts.
+Exploratory earlier release-build timings are not a gate receipt:
 pre-mask and post-mask runs show material host variance, so no CPU speedup claim
 is permitted until the frozen qualifier controls threads, warmup and sampling.
 
@@ -177,6 +196,9 @@ is permitted until the frozen qualifier controls threads, warmup and sampling.
 
 ```bash
 PYTHONPATH=crates/tritium-py/python pytest -q crates/tritium-py/tests
+python -m unittest \
+  scripts.tests.test_verify_torch_dispatch_overhead_receipt \
+  scripts.tests.test_qualify_torch_dispatch_overhead
 python -m compileall -q crates/tritium-py/python/tritium
 cargo fmt --check
 git diff --check

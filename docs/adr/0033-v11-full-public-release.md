@@ -511,6 +511,22 @@ visible, distinct GPU UUIDs. It creates an isolated runtime, installs only the
 named candidate wheel without dependency resolution, and runs the frozen worker
 under `python -I`; worker and interpreter substitution are not release seams.
 
+Native PyTorch wrapper-overhead admission uses
+`tritium.torch-dispatch-overhead-qualification.v1` and release-registry kind
+`torch-dispatch-overhead`. A source-free installed candidate wheel runs six
+frozen direct-adapter-versus-public-dispatch cases: decode, training microbatch
+and prefill, each in forward and backward. One logical CPU and one
+Rayon/Torch/OMP/MKL thread are pinned; ten AB/BA warmups precede 31 alternating
+paired samples. Exact output parity and exact packed-cache hit deltas prove both
+arms used the same warm native state. Admission recomputes medians and a
+deterministic 10,000-resample paired 95% bootstrap upper bound; both ratios must
+be at most `1.05` for every case. The retained canonical trace binds canonical
+wheel name, METADATA/WHEEL/RECORD inventory, installed candidate payloads,
+compiled clean source identity, release version, runtime, CPU identity,
+affinity, policy and every raw timing. Aggregate-only, source-tree, unpinned,
+cache-missing, renamed-wheel, reordered, partial or over-budget results fail
+closed. Anonymous-file and no-replace publication prevent evidence clobber.
+
 ## v1.1 release gate
 
 `v1.1.0` may publish only when all boxes are green:

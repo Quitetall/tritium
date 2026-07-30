@@ -238,6 +238,15 @@ fn ternary_matmul(
     Ok(flat.chunks_exact(n).map(<[f32]>::to_vec).collect())
 }
 
+/// Return exact source identity embedded into this extension at build time.
+///
+/// Release qualification uses this value to prove that measured wheel bytes
+/// were built from the source revision named by their retained receipt.
+#[pyfunction]
+fn source_identity() -> &'static str {
+    env!("TRITIUM_SOURCE_ID")
+}
+
 #[pyfunction]
 fn compiled_backends() -> Vec<&'static str> {
     #[cfg(feature = "cuda")]
@@ -322,6 +331,7 @@ fn _tritium(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<kronecker::Qwen36KroneckerCaptureReceipt>()?;
     m.add_class::<kronecker::Qwen36KroneckerCaptureSession>()?;
     kronecker::register_exceptions(m)?;
+    m.add_function(wrap_pyfunction!(source_identity, m)?)?;
     m.add_function(wrap_pyfunction!(ternary_matmul, m)?)?;
     m.add_function(wrap_pyfunction!(compiled_backends, m)?)?;
     m.add_function(wrap_pyfunction!(onnx::verify_qwen35_onnx_bundle, m)?)?;
