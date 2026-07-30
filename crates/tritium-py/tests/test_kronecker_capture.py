@@ -4,13 +4,19 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from tritium import KroneckerPublicationError, KroneckerStateError
+from tritium import (
+    KroneckerEvidenceBuilder,
+    KroneckerPublicationError,
+    KroneckerSharedForwardGroup,
+    KroneckerStateError,
+)
 from tritium.torch import (
     KroneckerCalibrationWriter,
     KroneckerModuleCaptureReceipt,
     bind_kronecker_activation_cache_digest,
     capture_kronecker_embedding,
     capture_kronecker_module,
+    capture_kronecker_module_group,
     capture_qwen36_kronecker_evidence,
 )
 from tritium.torch import ptq
@@ -281,6 +287,230 @@ def test_qwen_capture_session_dispatches_embedding_and_output_head(tmp_path):
     assert receipt.records == 2
     assert (tmp_path / "evidence" / "000000.s2kf").is_file()
     assert (tmp_path / "evidence" / "000001.s2kf").is_file()
+
+
+class _TwoLinearModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.proj1 = torch.nn.Linear(128, 128, bias=False)
+        self.proj2 = torch.nn.Linear(128, 4, bias=False)
+
+    def forward(self, values, labels=None, attention_mask=None):
+        hidden = torch.nn.functional.silu(self.proj1(values))
+        logits = self.proj2(hidden)
+        loss = None
+        if labels is not None:
+            per_token = (logits - labels).square().mean(dim=-1)
+            if attention_mask is not None:
+                per_token = per_token[attention_mask.bool()]
+            loss = per_token.mean()
+        return SimpleNamespace(logits=logits, loss=loss)
+
+
+def _module_writer(evidence_dir, curvature, *, tensor_index, tensor_name, rows):
+    objective = {
+        "input-hessian": "tritium.input-gram@1",
+        "guided-fisher": "tritium.model-loss-guided-fisher.mean-attention-mask@1",
+        "forward-kl-kronecker": "tritium.softmax-fisher-rademacher.single-probe@1",
+    }[curvature]
+    return KroneckerCalibrationWriter(
+        evidence_dir,
+        tensor_index=tensor_index,
+        tensor_name=tensor_name,
+        rows=rows,
+        columns=128,
+        curvature=curvature,
+        source_model_digest="01" * 32,
+        activation_cache_digest="02" * 32,
+        token_stream_digest="03" * 32,
+        damping=0.01,
+        objective_id=objective,
+        max_batch_bytes=256 * 1024,
+    )
+
+
+@pytest.mark.parametrize(
+    "curvature", ["input-hessian", "guided-fisher", "forward-kl-kronecker"]
+)
+def test_shared_forward_capture_records_are_byte_identical(tmp_path, curvature):
+    # WS-A2/A3 gate: ONE forward pass feeding both tensors must publish
+    # byte-identical records to one-full-replay-per-tensor. Evidence identity
+    # is keyed on global sample ordinals, never batch/orchestration
+    # boundaries, so identity is required, not merely approximate.
+    torch.manual_seed(7)
+    model = _TwoLinearModel().train()
+    reduction = "mean-attention-mask" if curvature == "guided-fisher" else None
+    tensors = (
+        {"tensor_index": 0, "tensor_name": "proj1.weight", "rows": 128},
+        {"tensor_index": 1, "tensor_name": "proj2.weight", "rows": 4},
+    )
+
+    solo_receipts = []
+    for module, spec in zip(("proj1", "proj2"), tensors):
+        solo_receipts.append(
+            capture_kronecker_module(
+                model,
+                _batches(),
+                module=module,
+                writer=_module_writer(tmp_path / "solo", curvature, **spec),
+                curvature=curvature,
+                guided_loss_reduction=reduction,
+            )
+        )
+    group_receipts = capture_kronecker_module_group(
+        model,
+        _batches(),
+        modules=["proj1", "proj2"],
+        writers=[
+            _module_writer(tmp_path / "group", curvature, **spec) for spec in tensors
+        ],
+        curvature=curvature,
+        guided_loss_reduction=reduction,
+    )
+
+    assert len(group_receipts) == 2
+    assert model.training is True
+    assert all(parameter.grad is None for parameter in model.parameters())
+    for solo, group, spec in zip(solo_receipts, group_receipts, tensors):
+        assert group.batches == solo.batches == 2
+        assert group.module_calls == solo.module_calls
+        assert group.samples == solo.samples == 5
+        assert group.selected_samples == solo.selected_samples == 4
+        assert group.record.record_digest == solo.record.record_digest
+        record = f"{spec['tensor_index']:06d}.s2kf"
+        assert (tmp_path / "group" / record).read_bytes() == (
+            tmp_path / "solo" / record
+        ).read_bytes()
+
+
+def test_group_capture_aborts_all_writers_on_contract_errors(tmp_path):
+    model = _TwoLinearModel()
+    writers = [
+        _module_writer(tmp_path / "abort", "guided-fisher", **spec)
+        for spec in (
+            {"tensor_index": 0, "tensor_name": "proj1.weight", "rows": 128},
+            {"tensor_index": 1, "tensor_name": "proj2.weight", "rows": 4},
+        )
+    ]
+    with pytest.raises(ValueError, match="module path"):
+        capture_kronecker_module_group(
+            model,
+            _batches(),
+            modules=["proj1", "missing"],
+            writers=writers,
+            curvature="guided-fisher",
+            guided_loss_reduction="mean-attention-mask",
+        )
+    assert all(not writer.active for writer in writers)
+
+    embedding_writer = _embedding_writer(tmp_path, "guided-fisher")
+    with pytest.raises(ValueError, match="dense writers"):
+        capture_kronecker_module_group(
+            model,
+            _batches(),
+            modules=["proj1"],
+            writers=[embedding_writer],
+            curvature="guided-fisher",
+            guided_loss_reduction="mean-attention-mask",
+        )
+    assert not embedding_writer.active
+
+
+def _le_bytes(value, dtype, numpy_dtype):
+    return (
+        value.detach()
+        .to(device="cpu", dtype=dtype)
+        .contiguous()
+        .numpy()
+        .astype(numpy_dtype, copy=False)
+        .tobytes()
+    )
+
+
+def test_native_shared_forward_group_matches_standalone_builders(tmp_path):
+    # Two members share input stream 0 and one member reads stream 1; the
+    # native fan-out must reproduce the standalone builder records exactly.
+    members = [
+        (0, "a.weight", 3, 128, 0),
+        (1, "b.weight", 2, 128, 0),
+        (2, "c.weight", 4, 256, 1),
+    ]
+    provenance = ("01" * 32, "02" * 32, "03" * 32)
+    group = KroneckerSharedForwardGroup(
+        str(tmp_path / "group"),
+        members,
+        "guided-fisher",
+        *provenance,
+        0.01,
+    )
+    samples = 2
+    stream0 = torch.stack(
+        [torch.full((128,), 1.0 + sample) for sample in range(samples)]
+    )
+    stream1 = torch.stack(
+        [
+            torch.cat(
+                (torch.full((128,), 3.0 + sample), torch.full((128,), 0.5 + sample))
+            )
+            for sample in range(samples)
+        ]
+    )
+    factors = [
+        torch.arange(samples * rows, dtype=torch.float32).view(samples, rows) / 4
+        for (_, _, rows, _, _) in members
+    ]
+    weights = torch.tensor([1.0, 2.0], dtype=torch.float64)
+    mask = torch.tensor([1, 1], dtype=torch.uint8)
+
+    with pytest.raises(Exception, match="stream buffers"):
+        group.append_group([_le_bytes(stream0, torch.float32, "<f4")], samples)
+    residency = group.append_group(
+        [
+            _le_bytes(stream0, torch.float32, "<f4"),
+            _le_bytes(stream1, torch.float32, "<f4"),
+        ],
+        samples,
+        output_factors_f32le=[
+            _le_bytes(member_factors, torch.float32, "<f4")
+            for member_factors in factors
+        ],
+        token_weights_f64le=_le_bytes(weights, torch.float64, "<f8"),
+        token_mask_u8=mask.numpy().tobytes(),
+    )
+    assert len(residency) == len(members)
+    receipts = group.finish()
+    assert not group.active
+    with pytest.raises(KroneckerStateError):
+        group.finish()
+
+    streams = (stream0, stream1)
+    for (tensor_index, tensor_name, rows, columns, stream), member_factors, receipt in zip(
+        members, factors, receipts
+    ):
+        solo = KroneckerEvidenceBuilder(
+            str(tmp_path / f"solo-{tensor_index}"),
+            tensor_index,
+            tensor_name,
+            rows,
+            columns,
+            "guided-fisher",
+            *provenance,
+            0.01,
+        )
+        solo.append_batch(
+            _le_bytes(streams[stream], torch.float32, "<f4"),
+            samples,
+            output_factors_f32le=_le_bytes(member_factors, torch.float32, "<f4"),
+            token_weights_f64le=_le_bytes(weights, torch.float64, "<f8"),
+            token_mask_u8=mask.numpy().tobytes(),
+        )
+        solo_receipt = solo.finish()
+        assert receipt.tensor_index == tensor_index
+        assert receipt.record_digest == solo_receipt.record_digest
+        record = f"{tensor_index:06d}.s2kf"
+        assert (tmp_path / "group" / record).read_bytes() == (
+            tmp_path / f"solo-{tensor_index}" / record
+        ).read_bytes()
 
 
 def test_capture_preserves_reused_module_call_order(tmp_path):

@@ -11,7 +11,17 @@ import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, Optional, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 import torch
 from torch import nn
@@ -1157,6 +1167,324 @@ def capture_kronecker_module(
         input_segments=input_segments,
         output_segments=output_segments,
         record=record,
+    )
+
+
+def capture_kronecker_module_group(
+    model: nn.Module,
+    data: Iterable[Any],
+    *,
+    modules: Sequence[str],
+    writers: Sequence[KroneckerCalibrationWriter],
+    curvature: str,
+    guided_loss_reduction: Optional[str] = None,
+    max_capture_bytes: Optional[int] = None,
+    max_objective_bytes: int = 256 * 1024 * 1024,
+) -> Tuple[KroneckerModuleCaptureReceipt, ...]:
+    """Capture several projections through one shared bounded PyTorch pass.
+
+    One forward pass per calibration batch feeds every target module's writer,
+    replacing one full-calibration replay per tensor. Guided-Fisher and
+    forward-KL obtain every module-output gradient in one backward via
+    ``torch.autograd.grad``, so parameter ``.grad`` buffers are never
+    allocated. Each writer receives exactly the activations, factors, masks,
+    and global sample ordinals the per-tensor :func:`capture_kronecker_module`
+    path would produce, so published records are byte-identical to per-tensor
+    records for the same frozen inputs (ADR 0035 WS-A3).
+    """
+
+    if not isinstance(model, nn.Module):
+        raise TypeError("model must be a torch.nn.Module")
+    if isinstance(modules, str) or not isinstance(modules, Sequence):
+        raise TypeError("modules must be a sequence of module paths")
+    if not isinstance(writers, Sequence):
+        raise TypeError("writers must be a sequence of KroneckerCalibrationWriter")
+    if any(not isinstance(writer, KroneckerCalibrationWriter) for writer in writers):
+        raise TypeError("writers must be a sequence of KroneckerCalibrationWriter")
+
+    def abort_all() -> None:
+        for writer in writers:
+            writer.abort()
+
+    if len(modules) == 0 or len(modules) != len(writers):
+        abort_all()
+        raise ValueError("modules and writers must be equal-length and nonempty")
+    if any(not isinstance(path, str) for path in modules):
+        abort_all()
+        raise ValueError("modules must be a sequence of module paths")
+    if len(set(modules)) != len(modules):
+        abort_all()
+        raise ValueError("modules must not repeat one module path")
+    if len({id(writer) for writer in writers}) != len(writers):
+        abort_all()
+        raise ValueError("writers must not repeat one writer")
+    if curvature not in {
+        "input-hessian",
+        "guided-fisher",
+        "forward-kl-kronecker",
+    }:
+        abort_all()
+        raise ValueError("unsupported Kronecker curvature")
+    if curvature == "guided-fisher":
+        if guided_loss_reduction not in {
+            "sum",
+            "mean-attention-mask",
+            "mean-valid-causal-labels",
+        }:
+            abort_all()
+            raise ValueError(
+                "guided-Fisher requires loss reduction sum, mean-attention-mask, "
+                "or mean-valid-causal-labels"
+            )
+        objective = f"tritium.model-loss-guided-fisher.{guided_loss_reduction}@1"
+    else:
+        if guided_loss_reduction is not None:
+            abort_all()
+            raise ValueError("guided_loss_reduction is valid only for guided-fisher")
+        objective = {
+            "input-hessian": "tritium.input-gram@1",
+            "forward-kl-kronecker": "tritium.softmax-fisher-rademacher.single-probe@1",
+        }[curvature]
+    for writer in writers:
+        if writer.curvature != curvature:
+            abort_all()
+            raise ValueError("capture curvature differs from writer curvature")
+        if writer.objective_id != objective:
+            abort_all()
+            raise ValueError("writer objective_id differs from the capture objective")
+        if writer.indexed_output:
+            abort_all()
+            raise ValueError(
+                "group capture supports dense writers; embeddings use "
+                "capture_kronecker_embedding"
+            )
+    if max_capture_bytes is None:
+        max_capture_bytes = min(writer.max_batch_bytes for writer in writers)
+    if type(max_capture_bytes) is not int or max_capture_bytes <= 0:
+        abort_all()
+        raise ValueError("max_capture_bytes must be a positive integer")
+    if type(max_objective_bytes) is not int or max_objective_bytes <= 0:
+        abort_all()
+        raise ValueError("max_objective_bytes must be a positive integer")
+
+    selected_modules = []
+    for path, writer in zip(modules, writers):
+        candidates = [
+            value
+            for candidate, value in model.named_modules(remove_duplicate=False)
+            if candidate == path
+        ]
+        if len(candidates) != 1:
+            abort_all()
+            raise ValueError("module path must identify exactly one module")
+        selected = candidates[0]
+        weight = getattr(selected, "weight", None)
+        if (
+            not isinstance(weight, torch.Tensor)
+            or weight.ndim != 2
+            or tuple(weight.shape) != (writer.rows, writer.columns)
+        ):
+            abort_all()
+            raise ValueError("module weight geometry differs from the evidence writer")
+        selected_modules.append(selected)
+    if len({id(module) for module in selected_modules}) != len(selected_modules):
+        abort_all()
+        raise ValueError("module paths must identify distinct modules")
+
+    pending: list[list[Tuple[torch.Tensor, torch.Tensor]]] = [[] for _ in modules]
+    pending_activation_bytes = 0
+    token_mask: Optional[torch.Tensor] = None
+    causal_selection_mask: Optional[torch.Tensor] = None
+
+    def preflight_for(index: int):
+        writer = writers[index]
+
+        def preflight_input(_selected, args):
+            if not args or not isinstance(args[0], torch.Tensor):
+                raise ValueError("selected module must receive a tensor first argument")
+            activations = args[0]
+            if activations.ndim == 0 or activations.shape[-1] != writer.columns:
+                raise ValueError("selected module input feature geometry changed")
+
+        return preflight_input
+
+    def capture_for(index: int):
+        writer = writers[index]
+
+        def capture(_selected, args, output):
+            nonlocal pending_activation_bytes
+            activations = args[0]
+            if not isinstance(output, torch.Tensor):
+                raise ValueError("selected module must return one tensor")
+            if (
+                tuple(output.shape[:-1]) != tuple(activations.shape[:-1])
+                or output.shape[-1] != writer.rows
+            ):
+                raise ValueError("selected module output geometry changed")
+            if curvature != "input-hessian" and not output.requires_grad:
+                output.requires_grad_(True)
+            activation_bytes = activations.numel() * activations.element_size()
+            required_bytes = pending_activation_bytes + activation_bytes
+            if required_bytes > max_capture_bytes:
+                raise ValueError(
+                    f"capture snapshots require {required_bytes} bytes, "
+                    f"limit is {max_capture_bytes}"
+                )
+            pending[index].append((activations.detach().clone(), output))
+            pending_activation_bytes = required_bytes
+
+        return capture
+
+    handles = []
+    for index, selected in enumerate(selected_modules):
+        handles.append(selected.register_forward_pre_hook(preflight_for(index)))
+        handles.append(selected.register_forward_hook(capture_for(index)))
+    training_flags = tuple((component, component.training) for component in model.modules())
+    batches = 0
+    module_calls = [0] * len(modules)
+    samples = [0] * len(modules)
+    selected_samples = [0] * len(modules)
+    segments = [(0, 0)] * len(modules)
+    finalizing = False
+    objective_sample_start = 0
+    records = []
+    try:
+        model.eval()
+        for batch in data:
+            for slot in pending:
+                slot.clear()
+            raw_mask = batch.get("attention_mask") if isinstance(batch, Mapping) else None
+            if raw_mask is not None and not isinstance(raw_mask, torch.Tensor):
+                raise ValueError("attention_mask must be a tensor")
+            if raw_mask is not None and not bool(
+                ((raw_mask == 0) | (raw_mask == 1)).all()
+            ):
+                raise ValueError("attention_mask values must be boolean or 0/1")
+            snapshot_bytes = (
+                0 if raw_mask is None else raw_mask.numel() * raw_mask.element_size()
+            )
+            raw_labels = None
+            if guided_loss_reduction == "mean-valid-causal-labels":
+                raw_labels = batch.get("labels") if isinstance(batch, Mapping) else None
+                if not isinstance(raw_labels, torch.Tensor):
+                    raise ValueError(
+                        "mean-valid-causal-labels guided-Fisher requires tensor labels"
+                    )
+                snapshot_bytes += raw_labels.numel()
+            if snapshot_bytes > max_capture_bytes:
+                raise ValueError(
+                    f"capture metadata requires {snapshot_bytes} bytes, "
+                    f"limit is {max_capture_bytes}"
+                )
+            token_mask = None if raw_mask is None else raw_mask.detach().clone()
+            causal_selection_mask = (
+                None
+                if raw_labels is None
+                else _causal_selection_mask(raw_labels, token_mask)
+            )
+            pending_activation_bytes = snapshot_bytes
+            context = torch.no_grad() if curvature == "input-hessian" else torch.enable_grad()
+            with context:
+                output = _invoke_model(model, batch)
+                if any(not slot for slot in pending):
+                    raise ValueError("selected module was not exercised by a calibration batch")
+                flat_outputs = tuple(item[1] for slot in pending for item in slot)
+                if curvature == "guided-fisher":
+                    loss = _capture_output_tensor(output, "loss")
+                    if loss.numel() != 1 or not loss.isfinite().all():
+                        raise ValueError("guided-Fisher model loss must be one finite scalar")
+                    if guided_loss_reduction == "sum":
+                        denominator = 1
+                    elif guided_loss_reduction == "mean-attention-mask":
+                        if token_mask is None:
+                            raise ValueError(
+                                "mean-attention-mask guided-Fisher requires attention_mask"
+                            )
+                        denominator = int(token_mask.count_nonzero().item())
+                    else:
+                        assert causal_selection_mask is not None
+                        denominator = int(causal_selection_mask.count_nonzero().item())
+                    if denominator <= 0:
+                        raise ValueError("guided-Fisher loss denominator must be positive")
+                    gradients = torch.autograd.grad(loss * denominator, flat_outputs)
+                elif curvature == "forward-kl-kronecker":
+                    logits = _capture_output_tensor(output, "logits")
+                    factors = _forward_kl_factors(
+                        logits,
+                        objective_sample_start,
+                        token_mask,
+                        max_objective_bytes,
+                    )
+                    gradients = torch.autograd.grad(
+                        logits,
+                        flat_outputs,
+                        grad_outputs=factors,
+                    )
+                    objective_sample_start += logits.numel() // logits.shape[-1]
+                else:
+                    gradients = (None,) * len(flat_outputs)
+            cursor = 0
+            for index, slot in enumerate(pending):
+                writer = writers[index]
+                for activations, _ in slot:
+                    factors = gradients[cursor]
+                    cursor += 1
+                    sample_shape = tuple(activations.shape[:-1])
+                    selected_mask = (
+                        causal_selection_mask
+                        if guided_loss_reduction == "mean-valid-causal-labels"
+                        else token_mask
+                    )
+                    mask = _capture_token_mask(selected_mask, sample_shape)
+                    segments[index] = writer.append(
+                        activations,
+                        factors,
+                        token_mask=mask,
+                    )
+                    count = activations.numel() // writer.columns
+                    samples[index] += count
+                    selected_samples[index] += (
+                        count if mask is None else int(mask.count_nonzero().item())
+                    )
+                    module_calls[index] += 1
+            batches += 1
+        if batches == 0:
+            raise ValueError("calibration data must yield at least one batch")
+        finalizing = True
+        for writer in writers:
+            records.append(writer.finish())
+    except BaseException as error:
+        retryable_finish = finalizing and isinstance(
+            error,
+            (
+                _tritium.KroneckerPublicationError,
+                _tritium.KroneckerResourceError,
+            ),
+        ) and any(writer.active for writer in writers)
+        if not retryable_finish:
+            abort_all()
+        raise
+    finally:
+        for handle in handles:
+            handle.remove()
+        for component, training in training_flags:
+            component.training = training
+        for slot in pending:
+            slot.clear()
+    return tuple(
+        KroneckerModuleCaptureReceipt(
+            module=path,
+            curvature=curvature,
+            objective=objective,
+            batches=batches,
+            module_calls=module_calls[index],
+            samples=samples[index],
+            selected_samples=selected_samples[index],
+            input_segments=segments[index][0],
+            output_segments=segments[index][1],
+            record=records[index],
+        )
+        for index, path in enumerate(modules)
     )
 
 

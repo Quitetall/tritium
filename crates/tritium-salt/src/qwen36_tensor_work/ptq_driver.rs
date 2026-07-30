@@ -1,11 +1,16 @@
 //! Checkpoint-backed, resumable Qwen3.6 pure-PTQ campaign driver.
 
 mod capture;
+mod grouping;
 
 pub use capture::{
     Qwen36PtqEvidenceCaptureError, Qwen36PtqEvidenceCaptureReceipt,
     Qwen36PtqEvidenceCaptureRequest, Qwen36PtqEvidenceCaptureSession, Qwen36PtqEvidenceCaptureTask,
     collect_qwen36_ptq_evidence,
+};
+pub use grouping::{
+    SharedForwardCaptureGroup, SharedForwardPlanError, SharedForwardTensor,
+    plan_shared_forward_groups,
 };
 
 use core::fmt;

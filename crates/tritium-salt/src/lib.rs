@@ -50,7 +50,9 @@ pub use qwen36_tensor_work::{
     Qwen36PtqPackagesReceipt, Qwen36ScaleOnlyCampaignStore, Qwen36SelectedAllocationBindError,
     Qwen36SelectedAllocationReceipt, Qwen36SelectedAllocationSpec, Qwen36SelectedProfileReceipt,
     Qwen36TensorWorkError, Qwen36TensorWorkStore, Qwen36TensorWorkSummary,
-    collect_qwen36_ptq_evidence, reconcile_qwen36_ptq, reconcile_qwen36_ptq_packages,
+    SharedForwardCaptureGroup, SharedForwardPlanError, SharedForwardTensor,
+    collect_qwen36_ptq_evidence, plan_shared_forward_groups, reconcile_qwen36_ptq,
+    reconcile_qwen36_ptq_packages,
 };
 pub use tensor_work_store::{
     TensorPayloadValidator, TensorPayloadWriter, TensorPutError, TensorRecordInfo,

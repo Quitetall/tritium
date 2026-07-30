@@ -326,6 +326,7 @@ fn _tritium(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<onnx::QwenOnnxMtpOutput>()?;
     m.add_class::<module_package::ModuleSaltV2Receipt>()?;
     m.add_class::<kronecker::KroneckerEvidenceBuilder>()?;
+    m.add_class::<kronecker::KroneckerSharedForwardGroup>()?;
     m.add_class::<kronecker::KroneckerEvidenceReceipt>()?;
     m.add_class::<kronecker::Qwen36KroneckerCaptureTask>()?;
     m.add_class::<kronecker::Qwen36KroneckerCaptureReceipt>()?;

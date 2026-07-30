@@ -4,9 +4,10 @@ use pyo3::{
     create_exception,
     exceptions::{PyRuntimeError, PyValueError},
     prelude::*,
+    pybacked::PyBackedBytes,
 };
 use tritium_quantize::{
-    CurvatureSourceId, Qwen35TensorRole, Qwen35TensorScope, SaltV2Curvature,
+    CurvatureError, CurvatureSourceId, Qwen35TensorRole, Qwen35TensorScope, SaltV2Curvature,
     SaltV2KroneckerEvidenceBuildError, SaltV2KroneckerEvidenceBuilder,
     SaltV2KroneckerEvidenceError, SaltV2KroneckerEvidenceSpec,
 };
@@ -708,6 +709,528 @@ impl KroneckerEvidenceBuilder {
     }
 }
 
+/// Plain-Rust shared-forward fan-out over per-tensor evidence builders.
+///
+/// One validated activation batch per input stream feeds every member builder
+/// with exactly the bytes and global sample ordinals a standalone builder
+/// would receive: evidence identity is keyed on sample ordinals, never batch
+/// or orchestration boundaries, so shared-forward records stay byte-identical
+/// to per-tensor records (ADR 0035 WS-A2).
+#[derive(Debug)]
+struct SharedForwardGroupCore {
+    members: Vec<SharedForwardMember>,
+    stream_columns: Vec<usize>,
+}
+
+#[derive(Debug)]
+struct SharedForwardMember {
+    builder: SaltV2KroneckerEvidenceBuilder,
+    input_stream: usize,
+}
+
+/// Group append failure split by whether member ordinals may have diverged.
+#[derive(Debug)]
+enum SharedForwardAppendError {
+    /// Preflight rejected the batch; no member builder was touched.
+    Rejected(SaltV2KroneckerEvidenceBuildError),
+    /// A member mutation failed after an earlier member advanced; ordinals
+    /// across members are inconsistent and the group must become terminal.
+    Poisoned(SaltV2KroneckerEvidenceBuildError),
+}
+
+impl SharedForwardAppendError {
+    fn into_build_error(self) -> SaltV2KroneckerEvidenceBuildError {
+        match self {
+            Self::Rejected(error) | Self::Poisoned(error) => error,
+        }
+    }
+}
+
+impl SharedForwardGroupCore {
+    /// Validate one dense shared-forward group over contiguous input streams.
+    fn new(
+        members: Vec<(SaltV2KroneckerEvidenceBuilder, usize)>,
+    ) -> Result<Self, SaltV2KroneckerEvidenceBuildError> {
+        if members.is_empty() {
+            return Err(SaltV2KroneckerEvidenceBuildError::Malformed(
+                "shared-forward member count",
+            ));
+        }
+        // Streams must be densely indexed: the zero-coverage check below already
+        // rejects any gap, so an index >= member count can never pass — reject it
+        // BEFORE it sizes the allocation (a hostile index would otherwise drive an
+        // infallible multi-TB vec!).
+        if members.iter().any(|(_, stream)| *stream >= members.len()) {
+            return Err(SaltV2KroneckerEvidenceBuildError::Malformed(
+                "shared-forward stream index",
+            ));
+        }
+        let stream_count = members
+            .iter()
+            .map(|(_, stream)| *stream)
+            .max()
+            .map_or(0, |last| last + 1);
+        let mut stream_columns = vec![0_usize; stream_count];
+        for (builder, stream) in &members {
+            let columns = builder.spec().columns();
+            match stream_columns[*stream] {
+                0 => stream_columns[*stream] = columns,
+                existing if existing != columns => {
+                    return Err(SaltV2KroneckerEvidenceBuildError::Malformed(
+                        "shared-forward stream columns",
+                    ));
+                }
+                _ => {}
+            }
+        }
+        if stream_columns.contains(&0) {
+            return Err(SaltV2KroneckerEvidenceBuildError::Malformed(
+                "shared-forward stream coverage",
+            ));
+        }
+        let input_hessian_members = members
+            .iter()
+            .filter(|(builder, _)| matches!(builder.spec().kind(), SaltV2Curvature::InputHessian))
+            .count();
+        if input_hessian_members != 0 && input_hessian_members != members.len() {
+            return Err(SaltV2KroneckerEvidenceBuildError::Malformed(
+                "shared-forward curvature mix",
+            ));
+        }
+        Ok(Self {
+            members: members
+                .into_iter()
+                .map(|(builder, input_stream)| SharedForwardMember {
+                    builder,
+                    input_stream,
+                })
+                .collect(),
+            stream_columns,
+        })
+    }
+
+    fn needs_output_factors(&self) -> bool {
+        !matches!(
+            self.members[0].builder.spec().kind(),
+            SaltV2Curvature::InputHessian
+        )
+    }
+
+    /// Preflight one batch so member mutation can only fail on resources.
+    ///
+    /// Every builder-level contract check (shape, finiteness, weights, mask)
+    /// runs before any member advances; contract violations therefore reject
+    /// atomically for the whole group.
+    fn preflight(
+        &self,
+        streams: &[Vec<f32>],
+        samples: usize,
+        output_factors: Option<&[Vec<f32>]>,
+        token_weights: Option<&[f64]>,
+        token_mask: Option<&[bool]>,
+    ) -> Result<(), SaltV2KroneckerEvidenceBuildError> {
+        if streams.len() != self.stream_columns.len() {
+            return Err(SaltV2KroneckerEvidenceBuildError::Malformed(
+                "shared-forward stream count",
+            ));
+        }
+        if samples == 0 {
+            return Err(CurvatureError::EmptyBatch.into());
+        }
+        for (stream, columns) in streams.iter().zip(&self.stream_columns) {
+            let expected = samples
+                .checked_mul(*columns)
+                .ok_or(SaltV2KroneckerEvidenceBuildError::AllocationFailed)?;
+            if stream.len() != expected {
+                return Err(SaltV2KroneckerEvidenceBuildError::BatchLengthMismatch {
+                    field: "activations",
+                    expected,
+                    got: stream.len(),
+                });
+            }
+            if let Some(index) = stream.iter().position(|value| !value.is_finite()) {
+                return Err(CurvatureError::NonFiniteActivation {
+                    sample: index / columns,
+                    feature: index % columns,
+                }
+                .into());
+            }
+        }
+        match (self.needs_output_factors(), output_factors) {
+            (true, None) => {
+                return Err(SaltV2KroneckerEvidenceBuildError::MissingOutputFactors);
+            }
+            (false, Some(_)) => {
+                return Err(SaltV2KroneckerEvidenceBuildError::UnexpectedOutputFactors);
+            }
+            (true, Some(factors)) => {
+                if factors.len() != self.members.len() {
+                    return Err(SaltV2KroneckerEvidenceBuildError::Malformed(
+                        "shared-forward output factor count",
+                    ));
+                }
+                for (member, member_factors) in self.members.iter().zip(factors) {
+                    let rows = member.builder.spec().rows();
+                    let expected = samples
+                        .checked_mul(rows)
+                        .ok_or(SaltV2KroneckerEvidenceBuildError::AllocationFailed)?;
+                    if member_factors.len() != expected {
+                        return Err(SaltV2KroneckerEvidenceBuildError::BatchLengthMismatch {
+                            field: "output factors",
+                            expected,
+                            got: member_factors.len(),
+                        });
+                    }
+                    if let Some(index) = member_factors.iter().position(|value| !value.is_finite())
+                    {
+                        return Err(CurvatureError::NonFiniteGradient {
+                            sample: index / rows,
+                            output_row: index % rows,
+                        }
+                        .into());
+                    }
+                }
+            }
+            (false, None) => {}
+        }
+        if let Some(weights) = token_weights {
+            if weights.len() != samples {
+                return Err(CurvatureError::TokenWeightLengthMismatch {
+                    expected: samples,
+                    got: weights.len(),
+                }
+                .into());
+            }
+            if let Some(sample) = weights
+                .iter()
+                .position(|weight| !weight.is_finite() || *weight < 0.0)
+            {
+                return Err(CurvatureError::InvalidTokenWeight { sample }.into());
+            }
+        }
+        if let Some(mask) = token_mask
+            && mask.len() != samples
+        {
+            return Err(CurvatureError::TokenMaskLengthMismatch {
+                expected: samples,
+                got: mask.len(),
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Feed one shared batch to every member and report retained segments.
+    fn append(
+        &mut self,
+        streams: &[Vec<f32>],
+        samples: usize,
+        output_factors: Option<&[Vec<f32>]>,
+        token_weights: Option<&[f64]>,
+        token_mask: Option<&[bool]>,
+    ) -> Result<Vec<(usize, usize)>, SharedForwardAppendError> {
+        self.preflight(streams, samples, output_factors, token_weights, token_mask)
+            .map_err(SharedForwardAppendError::Rejected)?;
+        let mut residency = Vec::with_capacity(self.members.len());
+        for (index, member) in self.members.iter_mut().enumerate() {
+            let member_factors = output_factors.map(|factors| factors[index].as_slice());
+            if let Err(error) = member.builder.accumulate_batch(
+                &streams[member.input_stream],
+                member_factors,
+                samples,
+                token_weights,
+                token_mask,
+            ) {
+                // Every remaining failure mode is resource-shaped; only a
+                // first-member failure leaves the whole group untouched.
+                return Err(if index == 0 {
+                    SharedForwardAppendError::Rejected(error)
+                } else {
+                    SharedForwardAppendError::Poisoned(error)
+                });
+            }
+            let segments = member.builder.residency();
+            residency.push((segments.input_segments(), segments.output_segments()));
+        }
+        Ok(residency)
+    }
+}
+
+enum SharedForwardFinishError {
+    Build(SaltV2KroneckerEvidenceBuildError),
+    Publish(Qwen36PtqDriverError),
+}
+
+/// Shared-forward producer group: one calibration batch feeds many tensors.
+///
+/// Dense output factors only; embedding tables keep the standalone
+/// indexed-output [`KroneckerEvidenceBuilder`] path.
+#[pyclass(module = "tritium._tritium")]
+pub(crate) struct KroneckerSharedForwardGroup {
+    directory: Qwen36PtqEvidenceDirectory,
+    core: Option<SharedForwardGroupCore>,
+    max_batch_bytes: usize,
+}
+
+#[pymethods]
+impl KroneckerSharedForwardGroup {
+    /// Create one source-bound builder per `(tensor_index, tensor_name, rows,
+    /// columns, input_stream)` member under shared record and batch ceilings.
+    #[new]
+    #[pyo3(signature = (
+        evidence_dir,
+        members,
+        curvature,
+        source_model_digest,
+        activation_cache_digest,
+        token_stream_digest,
+        damping,
+        *,
+        max_evidence_bytes = 67_108_864,
+        max_batch_bytes = DEFAULT_MAX_BATCH_BYTES
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        evidence_dir: &str,
+        members: Vec<(u64, String, usize, usize, usize)>,
+        curvature: &str,
+        source_model_digest: &str,
+        activation_cache_digest: &str,
+        token_stream_digest: &str,
+        damping: f64,
+        max_evidence_bytes: u64,
+        max_batch_bytes: usize,
+    ) -> PyResult<Self> {
+        if max_batch_bytes == 0 {
+            return Err(contract_error("max_batch_bytes must be positive"));
+        }
+        if members.is_empty() {
+            return Err(contract_error("members must not be empty"));
+        }
+        let curvature = parse_curvature(curvature)?;
+        let source_id = CurvatureSourceId::new(
+            parse_digest("source_model_digest", source_model_digest)?,
+            parse_digest("activation_cache_digest", activation_cache_digest)?,
+            parse_digest("token_stream_digest", token_stream_digest)?,
+        )
+        .map_err(contract_error)?;
+        let directory =
+            Qwen36PtqEvidenceDirectory::create_bounded(evidence_dir, max_evidence_bytes)
+                .map_err(directory_error)?;
+        let mut seen_indices = std::collections::BTreeSet::new();
+        let mut builders = Vec::with_capacity(members.len());
+        for (tensor_index, tensor_name, rows, columns, input_stream) in members {
+            if tensor_index >= 1_000_000 {
+                return Err(contract_error(
+                    "tensor_index must fit the six-digit Qwen evidence namespace",
+                ));
+            }
+            if !seen_indices.insert(tensor_index) {
+                return Err(contract_error(
+                    "members must not repeat one global tensor ordinal",
+                ));
+            }
+            let spec = SaltV2KroneckerEvidenceSpec::new_bounded(
+                curvature,
+                source_id,
+                tensor_index,
+                tensor_name,
+                rows,
+                columns,
+                damping,
+                max_evidence_bytes,
+            )
+            .map_err(build_error)?;
+            let builder = directory.create_builder(spec).map_err(driver_build_error)?;
+            builders.push((builder, input_stream));
+        }
+        let core = SharedForwardGroupCore::new(builders).map_err(build_error)?;
+        Ok(Self {
+            directory,
+            core: Some(core),
+            max_batch_bytes,
+        })
+    }
+
+    /// Atomically append one shared batch: one buffer per input stream, one
+    /// dense output-factor buffer per member (omitted for input-hessian).
+    #[pyo3(signature = (
+        activations_f32le,
+        samples,
+        *,
+        output_factors_f32le = None,
+        token_weights_f64le = None,
+        token_mask_u8 = None
+    ))]
+    fn append_group(
+        &mut self,
+        py: Python<'_>,
+        activations_f32le: Vec<PyBackedBytes>,
+        samples: usize,
+        output_factors_f32le: Option<Vec<PyBackedBytes>>,
+        token_weights_f64le: Option<&[u8]>,
+        token_mask_u8: Option<&[u8]>,
+    ) -> PyResult<Vec<(usize, usize)>> {
+        let core = self
+            .core
+            .as_ref()
+            .ok_or_else(|| KroneckerStateError::new_err("evidence group is already finished"))?;
+        if activations_f32le.len() != core.stream_columns.len() {
+            return Err(contract_error(format!(
+                "activations_f32le requires {} stream buffers, got {}",
+                core.stream_columns.len(),
+                activations_f32le.len()
+            )));
+        }
+        if core.needs_output_factors() {
+            let factor_buffers = output_factors_f32le
+                .as_ref()
+                .map_or(0, |factors| factors.len());
+            if factor_buffers != core.members.len() {
+                return Err(contract_error(format!(
+                    "output_factors_f32le requires {} member buffers, got {factor_buffers}",
+                    core.members.len()
+                )));
+            }
+        } else if output_factors_f32le.is_some() {
+            return Err(contract_error(
+                "input-Hessian builder rejects output factors",
+            ));
+        }
+        let mut total_bytes = 0_usize;
+        for buffer in activations_f32le
+            .iter()
+            .map(|buffer| &buffer[..])
+            .chain(
+                output_factors_f32le
+                    .iter()
+                    .flatten()
+                    .map(|buffer| &buffer[..]),
+            )
+            .chain(token_weights_f64le)
+            .chain(token_mask_u8)
+        {
+            total_bytes = total_bytes
+                .checked_add(buffer.len())
+                .filter(|bytes| *bytes <= self.max_batch_bytes)
+                .ok_or_else(|| contract_error("batch exceeds max_batch_bytes"))?;
+        }
+        let mut streams = Vec::with_capacity(activations_f32le.len());
+        for (buffer, columns) in activations_f32le.iter().zip(&core.stream_columns) {
+            let expected = checked_elements(samples, *columns, "activations")?;
+            streams.push(decode_f32le("activations", buffer, expected)?);
+        }
+        let output_factors = match &output_factors_f32le {
+            Some(factor_buffers) => {
+                let mut decoded = Vec::with_capacity(factor_buffers.len());
+                for (buffer, member) in factor_buffers.iter().zip(&core.members) {
+                    let expected =
+                        checked_elements(samples, member.builder.spec().rows(), "output factors")?;
+                    decoded.push(decode_f32le("output factors", buffer, expected)?);
+                }
+                Some(decoded)
+            }
+            None => None,
+        };
+        let token_weights = token_weights_f64le
+            .map(|bytes| decode_f64le("token weights", bytes, samples))
+            .transpose()?;
+        let token_mask = token_mask_u8
+            .map(|bytes| decode_mask(bytes, samples))
+            .transpose()?;
+        let core = self.core.as_mut().expect("checked active group");
+        let outcome = py.detach(move || {
+            core.append(
+                &streams,
+                samples,
+                output_factors.as_deref(),
+                token_weights.as_deref(),
+                token_mask.as_deref(),
+            )
+        });
+        match outcome {
+            Ok(residency) => Ok(residency),
+            Err(error @ SharedForwardAppendError::Rejected(_)) => {
+                Err(build_error(error.into_build_error()))
+            }
+            Err(error @ SharedForwardAppendError::Poisoned(_)) => {
+                self.core = None;
+                Err(build_error(error.into_build_error()))
+            }
+        }
+    }
+
+    /// Finalize and atomically publish every member record in member order.
+    ///
+    /// Reinstalling byte-identical records is idempotent, so a retryable
+    /// publication failure keeps the group active and a retried finish
+    /// republishes already-installed members without conflict.
+    fn finish(&mut self, py: Python<'_>) -> PyResult<Vec<KroneckerEvidenceReceipt>> {
+        let core = self
+            .core
+            .as_ref()
+            .ok_or_else(|| KroneckerStateError::new_err("evidence group is already finished"))?;
+        let directory = self.directory.clone();
+        let outcome = py.detach(move || {
+            let mut receipts = Vec::with_capacity(core.members.len());
+            for member in &core.members {
+                let record = member
+                    .builder
+                    .finish()
+                    .map_err(SharedForwardFinishError::Build)?;
+                let receipt = directory
+                    .install(&record)
+                    .map_err(SharedForwardFinishError::Publish)?;
+                receipts.push((member.builder.spec().tensor_index(), receipt));
+            }
+            Ok(receipts)
+        });
+        match outcome {
+            Ok(receipts) => {
+                self.core = None;
+                Ok(receipts
+                    .into_iter()
+                    .map(|(tensor_index, receipt)| KroneckerEvidenceReceipt {
+                        tensor_index,
+                        record_digest: encode_digest(&receipt.record_digest()),
+                        bytes: receipt.bytes(),
+                    })
+                    .collect())
+            }
+            Err(SharedForwardFinishError::Build(error)) => Err(build_error(error)),
+            Err(SharedForwardFinishError::Publish(error)) => {
+                if terminal_publication_error(&error) {
+                    self.core = None;
+                }
+                Err(publication_error(error))
+            }
+        }
+    }
+
+    /// Drop unpublished accumulator state and make this group terminal.
+    fn abort(&mut self) {
+        self.core = None;
+    }
+
+    /// Whether append/finalize operations are still admitted.
+    #[getter]
+    fn active(&self) -> bool {
+        self.core.is_some()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "KroneckerSharedForwardGroup(members={}, streams={}, active={}, max_batch_bytes={})",
+            self.core.as_ref().map_or(0, |core| core.members.len()),
+            self.core
+                .as_ref()
+                .map_or(0, |core| core.stream_columns.len()),
+            self.core.is_some(),
+            self.max_batch_bytes
+        )
+    }
+}
+
 pub(crate) fn register_exceptions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = m.py();
     m.add(
@@ -1012,6 +1535,250 @@ mod tests {
         assert!(decode_f32le("values", &f32_bytes, 3).is_err());
         assert_eq!(decode_mask(&[1, 0, 1], 3).unwrap(), [true, false, true]);
         assert!(decode_mask(&[2], 1).is_err());
+    }
+
+    fn group_spec(
+        kind: SaltV2Curvature,
+        tensor_index: u64,
+        name: &str,
+        rows: usize,
+        columns: usize,
+    ) -> SaltV2KroneckerEvidenceSpec {
+        SaltV2KroneckerEvidenceSpec::new(
+            kind,
+            CurvatureSourceId::new([1; 32], [2; 32], [3; 32]).unwrap(),
+            tensor_index,
+            name,
+            rows,
+            columns,
+            0.125,
+        )
+        .unwrap()
+    }
+
+    fn ramp(count: usize, scale: f32) -> Vec<f32> {
+        (0..count).map(|index| index as f32 * scale + 0.5).collect()
+    }
+
+    // Constant within each G128 group per sample: group Grams stay numerically
+    // inside the strict PSD admission tolerance while differing across
+    // samples, groups, and streams.
+    fn grouped_rows(samples: usize, columns: usize, seed: f32) -> Vec<f32> {
+        let mut values = Vec::with_capacity(samples * columns);
+        for sample in 0..samples {
+            for column in 0..columns {
+                let group = column / 128;
+                values.push(seed + sample as f32 + group as f32 * 0.5);
+            }
+        }
+        values
+    }
+
+    #[test]
+    fn shared_forward_group_records_are_byte_identical_to_standalone() {
+        // Two tensors on one shared stream plus one tensor on a second stream,
+        // fed in two batches, must reproduce standalone records exactly.
+        let specs = [
+            (
+                group_spec(SaltV2Curvature::GuidedFisher, 0, "a.weight", 3, 128),
+                0_usize,
+            ),
+            (
+                group_spec(SaltV2Curvature::GuidedFisher, 1, "b.weight", 2, 128),
+                0_usize,
+            ),
+            (
+                group_spec(SaltV2Curvature::GuidedFisher, 2, "c.weight", 4, 256),
+                1_usize,
+            ),
+        ];
+        let batches = [(2_usize, 0.25_f32), (3_usize, -0.5_f32)];
+        let weights = [1.0_f64, 2.0, 0.5, 1.0, 3.0];
+        let mask = [true, false, true, true, true];
+
+        let mut group = SharedForwardGroupCore::new(
+            specs
+                .iter()
+                .map(|(spec, stream)| {
+                    (
+                        SaltV2KroneckerEvidenceBuilder::new(spec.clone()).unwrap(),
+                        *stream,
+                    )
+                })
+                .collect(),
+        )
+        .unwrap();
+        let mut standalone = specs
+            .iter()
+            .map(|(spec, _)| SaltV2KroneckerEvidenceBuilder::new(spec.clone()).unwrap())
+            .collect::<Vec<_>>();
+
+        let mut offset = 0;
+        for (samples, scale) in batches {
+            let streams = [
+                grouped_rows(samples, 128, scale),
+                grouped_rows(samples, 256, -scale),
+            ];
+            let factors = specs
+                .iter()
+                .map(|(spec, _)| ramp(samples * spec.rows(), scale * 2.0))
+                .collect::<Vec<_>>();
+            let batch_weights = &weights[offset..offset + samples];
+            let batch_mask = &mask[offset..offset + samples];
+            group
+                .append(
+                    &streams,
+                    samples,
+                    Some(&factors),
+                    Some(batch_weights),
+                    Some(batch_mask),
+                )
+                .unwrap();
+            for ((builder, (_, stream)), member_factors) in
+                standalone.iter_mut().zip(&specs).zip(&factors)
+            {
+                builder
+                    .accumulate_batch(
+                        &streams[*stream],
+                        Some(member_factors),
+                        samples,
+                        Some(batch_weights),
+                        Some(batch_mask),
+                    )
+                    .unwrap();
+            }
+            offset += samples;
+        }
+
+        for (member, builder) in group.members.iter().zip(&standalone) {
+            let grouped = member.builder.finish().unwrap();
+            let solo = builder.finish().unwrap();
+            assert_eq!(grouped.record_digest(), solo.record_digest());
+            assert_eq!(
+                grouped.canonical_bytes().unwrap(),
+                solo.canonical_bytes().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn shared_forward_group_preflight_rejects_without_member_drift() {
+        let mut group = SharedForwardGroupCore::new(vec![
+            (
+                SaltV2KroneckerEvidenceBuilder::new(group_spec(
+                    SaltV2Curvature::GuidedFisher,
+                    0,
+                    "a.weight",
+                    2,
+                    128,
+                ))
+                .unwrap(),
+                0,
+            ),
+            (
+                SaltV2KroneckerEvidenceBuilder::new(group_spec(
+                    SaltV2Curvature::GuidedFisher,
+                    1,
+                    "b.weight",
+                    2,
+                    128,
+                ))
+                .unwrap(),
+                0,
+            ),
+        ])
+        .unwrap();
+        let stream = [ramp(128, 1.0)];
+        let good = [ramp(2, 1.0), ramp(2, 2.0)];
+        group.append(&stream, 1, Some(&good), None, None).unwrap();
+        let baseline = group
+            .members
+            .iter()
+            .map(|member| member.builder.finish().unwrap().record_digest())
+            .collect::<Vec<_>>();
+
+        // Second member's factors are malformed: length, then finiteness.
+        let short = [ramp(2, 1.0), ramp(1, 2.0)];
+        assert!(matches!(
+            group.append(&stream, 1, Some(&short), None, None),
+            Err(SharedForwardAppendError::Rejected(
+                SaltV2KroneckerEvidenceBuildError::BatchLengthMismatch { .. }
+            ))
+        ));
+        let non_finite = [ramp(2, 1.0), vec![1.0, f32::NAN]];
+        assert!(matches!(
+            group.append(&stream, 1, Some(&non_finite), None, None),
+            Err(SharedForwardAppendError::Rejected(
+                SaltV2KroneckerEvidenceBuildError::Curvature(_)
+            ))
+        ));
+        assert!(matches!(
+            group.append(&stream, 1, None, None, None),
+            Err(SharedForwardAppendError::Rejected(
+                SaltV2KroneckerEvidenceBuildError::MissingOutputFactors
+            ))
+        ));
+
+        // No member ordinal advanced through any rejected batch.
+        let after = group
+            .members
+            .iter()
+            .map(|member| member.builder.finish().unwrap().record_digest())
+            .collect::<Vec<_>>();
+        assert_eq!(baseline, after);
+    }
+
+    #[test]
+    fn shared_forward_group_rejects_malformed_membership() {
+        let builder = || {
+            SaltV2KroneckerEvidenceBuilder::new(group_spec(
+                SaltV2Curvature::GuidedFisher,
+                0,
+                "a.weight",
+                2,
+                128,
+            ))
+            .unwrap()
+        };
+        assert!(SharedForwardGroupCore::new(Vec::new()).is_err());
+        // Stream 0 has no member, so its column width is undefined.
+        assert!(SharedForwardGroupCore::new(vec![(builder(), 1)]).is_err());
+        // One stream cannot serve two different column widths.
+        assert!(
+            SharedForwardGroupCore::new(vec![
+                (builder(), 0),
+                (
+                    SaltV2KroneckerEvidenceBuilder::new(group_spec(
+                        SaltV2Curvature::GuidedFisher,
+                        1,
+                        "b.weight",
+                        2,
+                        256,
+                    ))
+                    .unwrap(),
+                    0,
+                ),
+            ])
+            .is_err()
+        );
+        // Input-Hessian members cannot mix with factor-bearing members.
+        assert!(
+            SharedForwardGroupCore::new(vec![
+                (builder(), 0),
+                (
+                    SaltV2KroneckerEvidenceBuilder::new(group_spec(
+                        SaltV2Curvature::InputHessian,
+                        1,
+                        "b.weight",
+                        2,
+                        128,
+                    ))
+                    .unwrap(),
+                    0,
+                ),
+            ])
+            .is_err()
+        );
     }
 
     #[test]
