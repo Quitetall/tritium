@@ -4,8 +4,8 @@ import {
 } from "../../../bindings/typescript/src/training_manifest.ts";
 
 import {
-  TRAINING_MANIFEST_DIGEST_V1,
-  TRAINING_VECTOR_DIGEST_V1,
+  TRAINING_MANIFEST_DIGEST_V2,
+  TRAINING_VECTOR_DIGEST_V2,
 } from "./identity.ts";
 import {
   decodeWebTrainingPayload,
@@ -182,8 +182,8 @@ function receipt(
     schemaId: "tritium.web_training_receipt",
     schemaVersion: 1,
     implementation: capabilities.implementation,
-    manifestDigest: TRAINING_MANIFEST_DIGEST_V1,
-    vectorDigest: TRAINING_VECTOR_DIGEST_V1,
+    manifestDigest: TRAINING_MANIFEST_DIGEST_V2,
+    vectorDigest: TRAINING_VECTOR_DIGEST_V2,
     buildId: capabilities.buildId,
     physicalDevice: capabilities.physicalDevice,
     operation,
@@ -657,8 +657,8 @@ export function createWebGpuTrainingAdapter(
     schemaId: "tritium.web_training_capabilities",
     schemaVersion: 1,
     implementation: "webgpu",
-    manifestDigest: TRAINING_MANIFEST_DIGEST_V1,
-    vectorDigest: TRAINING_VECTOR_DIGEST_V1,
+    manifestDigest: TRAINING_MANIFEST_DIGEST_V2,
+    vectorDigest: TRAINING_VECTOR_DIGEST_V2,
     buildId,
     physicalDevice,
     supportedOperations: Object.freeze(supportedOperations),

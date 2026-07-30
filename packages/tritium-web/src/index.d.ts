@@ -81,6 +81,12 @@ export interface TrainingOpDescriptorV1 {
   readonly checkpoint_planes: readonly string[];
 }
 
+export interface TrainingOpManifestV2 {
+  readonly schema_id: "tritium.training_op_manifest";
+  readonly schema_version: 2;
+  readonly dtype: "f32";
+  readonly operations: readonly TrainingOpDescriptorV1[];
+}
 export interface TrainingOpManifestV1 {
   readonly schema_id: "tritium.training_op_manifest";
   readonly schema_version: 1;
@@ -93,10 +99,15 @@ export declare class TrainingManifestError extends Error {
 }
 
 export declare function canonicalTrainingManifestJson(): Uint8Array;
+export declare function canonicalTrainingManifestV1Json(): Uint8Array;
 export declare function parseTrainingManifest(
   data: string | Uint8Array,
-): TrainingOpManifestV1;
+): TrainingOpManifestV1 | TrainingOpManifestV2;
 
+export declare const TRAINING_MANIFEST_DIGEST_V2:
+  "9093a1a7f9a3422c399943782aadf4df6b11833cf2253db0db56ff2d9dedb098";
+export declare const TRAINING_VECTOR_DIGEST_V2:
+  "38b17f4c76c1d2f85cb35c713652a3d77627d02ba47933d2c8f31a88e0c594a7";
 export declare const TRAINING_MANIFEST_DIGEST_V1:
   "aefb352d04db145e48394b392a106ab0ad831e09e62d8c76ceddedb36a564083";
 export declare const TRAINING_VECTOR_DIGEST_V1:
@@ -211,6 +222,8 @@ export type WebTrainingErrorCode =
   | "device_lost"
   | "disposed"
   | "invalid_config"
+  | "attribute_value.indices.in_range"
+  | "attribute_value.probabilities.finite_nonnegative"
   | "invalid_receipt"
   | "invalid_schema"
   | "invalid_state"
@@ -232,8 +245,8 @@ export interface WebTrainingFailureReceiptV1 {
   readonly schemaId: "tritium.web_training_failure_receipt";
   readonly schemaVersion: 1;
   readonly implementation: WebTrainingImplementationV1;
-  readonly manifestDigest: typeof TRAINING_MANIFEST_DIGEST_V1;
-  readonly vectorDigest: typeof TRAINING_VECTOR_DIGEST_V1;
+  readonly manifestDigest: typeof TRAINING_MANIFEST_DIGEST_V2;
+  readonly vectorDigest: typeof TRAINING_VECTOR_DIGEST_V2;
   readonly buildId: string;
   readonly physicalDevice: string | null;
   readonly operation: string;
@@ -321,7 +334,7 @@ export interface CompiledBackwardOperationV1 {
 export interface CompiledTrainingPlanV1 {
   readonly schemaId: "tritium.compiled_training_plan";
   readonly schemaVersion: 1;
-  readonly manifestDigest: typeof TRAINING_MANIFEST_DIGEST_V1;
+  readonly manifestDigest: typeof TRAINING_MANIFEST_DIGEST_V2;
   readonly buffers: readonly CompiledTrainingBufferV1[];
   readonly operations: readonly CompiledTrainingOperationV1[];
   readonly backwardOperations: readonly CompiledBackwardOperationV1[];
@@ -359,8 +372,8 @@ export interface WebTrainingCapabilitiesV1 {
   readonly schemaId: "tritium.web_training_capabilities";
   readonly schemaVersion: 1;
   readonly implementation: WebTrainingImplementationV1;
-  readonly manifestDigest: typeof TRAINING_MANIFEST_DIGEST_V1;
-  readonly vectorDigest: typeof TRAINING_VECTOR_DIGEST_V1;
+  readonly manifestDigest: typeof TRAINING_MANIFEST_DIGEST_V2;
+  readonly vectorDigest: typeof TRAINING_VECTOR_DIGEST_V2;
   readonly buildId: string;
   readonly physicalDevice: string | null;
   readonly supportedOperations: readonly string[];
@@ -371,8 +384,8 @@ export interface WebTrainingReceiptV1 {
   readonly schemaId: "tritium.web_training_receipt";
   readonly schemaVersion: 1;
   readonly implementation: WebTrainingImplementationV1;
-  readonly manifestDigest: typeof TRAINING_MANIFEST_DIGEST_V1;
-  readonly vectorDigest: typeof TRAINING_VECTOR_DIGEST_V1;
+  readonly manifestDigest: typeof TRAINING_MANIFEST_DIGEST_V2;
+  readonly vectorDigest: typeof TRAINING_VECTOR_DIGEST_V2;
   readonly buildId: string;
   readonly physicalDevice: string | null;
   readonly operation: string;
@@ -504,14 +517,14 @@ export interface WebGpuDispatchFormV1 {
   readonly stages: readonly WebGpuDispatchStageV1[];
 }
 
-export interface WebGpuDispatchCatalogV1 {
+export interface WebGpuDispatchCatalogV2 {
   readonly schemaId: "tritium.webgpu_dispatch_catalog";
-  readonly schemaVersion: 1;
+  readonly schemaVersion: 2;
   readonly sha256: string;
   readonly forms: Readonly<Record<string, WebGpuDispatchFormV1>>;
 }
 
-export declare function webGpuDispatchCatalogV1(): WebGpuDispatchCatalogV1;
+export declare function webGpuDispatchCatalogV2(): WebGpuDispatchCatalogV2;
 export declare function webGpuDispatchFormV1(
   operation: string,
   execution: WebGpuDispatchExecutionV1,

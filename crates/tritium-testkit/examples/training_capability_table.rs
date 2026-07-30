@@ -1,14 +1,14 @@
 use std::fs;
 
-use tritium_spec::TrainingVectorSetV1;
+use tritium_spec::TrainingVectorSetV2;
 use tritium_testkit::{
     TrainingReceiptSourcePolicyV1, admit_training_receipts,
     render_development_training_capability_table, render_training_capability_table,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let vectors = TrainingVectorSetV1::parse_json(include_bytes!(
-        "../../../spec/training/v1/vectors/v1.json"
+    let vectors = TrainingVectorSetV2::parse_json(include_bytes!(
+        "../../../spec/training/v2/vectors/v2.json"
     ))?;
     let mut arguments: Vec<_> = std::env::args().skip(1).collect();
     let source_policy = if arguments

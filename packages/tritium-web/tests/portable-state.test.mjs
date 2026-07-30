@@ -134,7 +134,7 @@ test("portable lifecycle export is admitted by strict reload before release", as
   });
   const vectors = JSON.parse(
     await readFile(
-      new URL("../../../spec/training/v1/vectors/v1.json", import.meta.url),
+      new URL("../../../spec/training/v2/vectors/v2.json", import.meta.url),
       "utf8",
     ),
   );

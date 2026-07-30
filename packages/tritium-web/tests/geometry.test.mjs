@@ -8,7 +8,7 @@ import {
 } from "../src/geometry.ts";
 
 const corpus = JSON.parse(
-  readFileSync(new URL("../../../spec/training/v1/vectors/v1.json", import.meta.url), "utf8"),
+  readFileSync(new URL("../../../spec/training/v2/vectors/v2.json", import.meta.url), "utf8"),
 );
 
 function f32(bits) {
@@ -74,7 +74,7 @@ test("geometry validator admits every canonical forward and step success", () =>
     validateTrainingOperationGeometry(candidate.operation, candidate.inputs, candidate.outputs);
     covered.add(item.operation);
   }
-  assert.equal(covered.size, 31);
+  assert.equal(covered.size, 32);
 });
 
 test("every operation rejects output geometry drift", () => {
@@ -105,6 +105,7 @@ const INVALID_ATTRIBUTE = {
   "graph.softmax": ["cols", 0],
   "graph.rmsnorm": ["eps", -1],
   "loss.softmax_cross_entropy": ["rows", 0],
+  "loss.topk_knowledge_distillation": ["k", 0],
   "graph.bias": ["cols", 0],
   "graph.transpose": ["rows", 0],
   "graph.slice_cols": ["len", 0],

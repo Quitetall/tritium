@@ -1,8 +1,21 @@
 import {
+  canonicalTrainingManifestV1Json,
   canonicalTrainingManifestJson,
   parseTrainingManifest,
   TrainingManifestError,
 } from "../src/training_manifest.ts";
+
+Deno.test("TypeScript reader preserves frozen V1", async () => {
+  const fixture = await Deno.readFile("spec/training/v1/manifest.json");
+  assert(
+    new TextDecoder().decode(canonicalTrainingManifestV1Json()) ===
+      new TextDecoder().decode(fixture),
+    "V1 canonical bytes differ",
+  );
+  const parsed = parseTrainingManifest(fixture);
+  assert(parsed.schema_version === 1, "V1 schema version differs");
+  assert(parsed.operations.length === 35, "V1 operation count differs");
+});
 
 function assert(condition: boolean, message: string): void {
   if (!condition) throw new Error(message);
@@ -22,25 +35,25 @@ function assertRejects(data: string | Uint8Array): void {
 }
 
 Deno.test("TypeScript canonical bytes equal language-neutral fixture", async () => {
-  const fixture = await Deno.readFile("spec/training/v1/manifest.json");
+  const fixture = await Deno.readFile("spec/training/v2/manifest.json");
   assert(
     new TextDecoder().decode(canonicalTrainingManifestJson()) ===
       new TextDecoder().decode(fixture),
     "canonical bytes differ",
   );
   assert(
-    parseTrainingManifest(fixture).operations.length === 35,
+    parseTrainingManifest(fixture).operations.length === 36,
     "operation count differs",
   );
 });
 
 Deno.test("TypeScript parser rejects drift, duplicates and bad UTF-8", async () => {
-  const fixture = await Deno.readTextFile("spec/training/v1/manifest.json");
+  const fixture = await Deno.readTextFile("spec/training/v2/manifest.json");
   const value = JSON.parse(fixture) as {
     schema_version: number;
     operations: Array<Record<string, unknown>>;
   };
-  value.schema_version = 2;
+  value.schema_version = 1;
   assertRejects(JSON.stringify(value));
   assertRejects('{"schema_id":"x","schema_id":"y"}');
   assertRejects('{"schema_id":"x","schema\\u005fid":"y"}');
@@ -52,7 +65,7 @@ Deno.test("TypeScript parser rejects drift, duplicates and bad UTF-8", async () 
 });
 
 Deno.test("TypeScript parser accepts noncanonical field order then re-emits canonical bytes", async () => {
-  const fixture = await Deno.readTextFile("spec/training/v1/manifest.json");
+  const fixture = await Deno.readTextFile("spec/training/v2/manifest.json");
   const value = JSON.parse(fixture) as Record<string, unknown>;
   const reordered = JSON.stringify({
     operations: value.operations,
@@ -61,7 +74,7 @@ Deno.test("TypeScript parser accepts noncanonical field order then re-emits cano
     schema_id: value.schema_id,
   });
   assert(
-    parseTrainingManifest(reordered).operations.length === 35,
+    parseTrainingManifest(reordered).operations.length === 36,
     "reordered fields rejected",
   );
   assert(

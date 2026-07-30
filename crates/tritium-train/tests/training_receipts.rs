@@ -1,4 +1,4 @@
-use tritium_spec::{TrainBackendV1, TrainingVectorSetV1};
+use tritium_spec::{TrainBackendV1, TrainingVectorSetV2};
 use tritium_testkit::{
     TrainingReceiptBundleError, TrainingReceiptSourcePolicyV1, admit_training_receipts,
     render_development_training_capability_table, render_training_capability_table,
@@ -6,8 +6,8 @@ use tritium_testkit::{
 };
 use tritium_train::CpuTrainBackendV1;
 
-fn vectors() -> TrainingVectorSetV1 {
-    TrainingVectorSetV1::parse_json(include_bytes!("../../../spec/training/v1/vectors/v1.json"))
+fn vectors() -> TrainingVectorSetV2 {
+    TrainingVectorSetV2::parse_json(include_bytes!("../../../spec/training/v2/vectors/v2.json"))
         .expect("canonical vectors")
 }
 
@@ -27,8 +27,8 @@ fn cpu_report_seals_reopens_and_generates_table() {
     )
     .expect("admit receipts");
     assert_eq!(admitted.backend_id(), backend.capabilities().backend_id);
-    assert_eq!(admitted.operation_count(), 35);
-    assert_eq!(admitted.case_count(), 114);
+    assert_eq!(admitted.operation_count(), 36);
+    assert_eq!(admitted.case_count(), 117);
     assert_eq!(admitted.bundle_digest(), sealed.digest());
 
     assert_eq!(
@@ -39,7 +39,7 @@ fn cpu_report_seals_reopens_and_generates_table() {
         .expect("render development table");
     assert!(table.starts_with("> **Development evidence only.**"));
     assert!(table.contains("| cpu.reference.v1 |"));
-    assert!(table.contains("| 35 | 114 |"));
+    assert!(table.contains("| 36 | 117 |"));
     assert!(table.ends_with('\n'));
 }
 

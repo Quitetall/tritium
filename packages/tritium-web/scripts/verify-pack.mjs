@@ -157,8 +157,8 @@ import { runPortableWasmConformance } from "@tritium-ai/web";
 const resolved = import.meta.resolve("@tritium-ai/web");
 assert.ok(resolved.startsWith(${JSON.stringify(installedRootUrl)}));
 const receipt = await runPortableWasmConformance();
-assert.equal(receipt.operationCount, 35);
-assert.equal(receipt.caseCount, 114);
+assert.equal(receipt.operationCount, 36);
+assert.equal(receipt.caseCount, 117);
 process.stdout.write(JSON.stringify(receipt));
 `);
   const smoke = await run(process.execPath, [resolve(consumer, "smoke.mjs")], {

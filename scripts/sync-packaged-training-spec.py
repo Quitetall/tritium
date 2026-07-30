@@ -27,6 +27,22 @@ MAPPINGS = (
         ROOT / "spec/training/v1/webgpu-dispatch-v1.json",
         ROOT / "crates/tritium-wgpu/data/training/v1/webgpu-dispatch-v1.json",
     ),
+    (
+        ROOT / "spec/training/v2/manifest.json",
+        ROOT / "crates/tritium-spec/data/training/v2/manifest.json",
+    ),
+    (
+        ROOT / "spec/training/v2/vectors/v2.json",
+        ROOT / "crates/tritium-spec/data/training/v2/vectors/v2.json",
+    ),
+    (
+        ROOT / "spec/training/v2/manifest.json",
+        ROOT / "crates/tritium-wgpu/data/training/v2/manifest.json",
+    ),
+    (
+        ROOT / "spec/training/v2/webgpu-dispatch-v2.json",
+        ROOT / "crates/tritium-wgpu/data/training/v2/webgpu-dispatch-v2.json",
+    ),
 )
 
 

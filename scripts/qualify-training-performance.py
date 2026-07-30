@@ -39,7 +39,7 @@ BACKENDS = runpy.run_path(
 )
 validate_backends = BACKENDS["validate"]
 
-WORKLOAD_ID = "training-manifest-v1-full-114"
+WORKLOAD_ID = "training-manifest-v2-full-117"
 MAX_TRACE_BYTES = 32 * 1024 * 1024
 
 
@@ -110,8 +110,8 @@ def aggregate_trace(trace: dict[str, Any]) -> dict[str, Any]:
     for ordinal, raw in enumerate(samples):
         sample = object_(raw, SAMPLE_FIELDS, f"samples[{ordinal}]")
         elapsed.append(number(sample["elapsed_ms"], "sample elapsed", 1e-12))
-        if integer(sample["cases"], "sample cases", 114) != 114:
-            raise QualificationError("performance sample is not the full 114-case corpus")
+        if integer(sample["cases"], "sample cases", 117) != 117:
+            raise QualificationError("performance sample is not the full 117-case corpus")
         resident.append(integer(sample["peak_resident_bytes"], "resident bytes", 1))
         scratch.append(integer(sample["peak_scratch_bytes"], "scratch bytes", 0))
         transfers += integer(sample["host_transfers"], "host transfers", 0)
@@ -126,9 +126,9 @@ def aggregate_trace(trace: dict[str, Any]) -> dict[str, Any]:
     median = statistics.median(elapsed)
     return {
         "warmup_iterations": len(warmups), "sample_count": len(samples),
-        "cases_per_sample": 114, "median_ms": median,
+        "cases_per_sample": 117, "median_ms": median,
         "p95_ms": percentile95(elapsed),
-        "cases_per_second": 114000.0 / median,
+        "cases_per_second": 117000.0 / median,
         "peak_resident_bytes": max(resident), "peak_scratch_bytes": max(scratch),
         "host_transfers": transfers, "global_synchronizations": synchronizations,
         "native_execution": True, "budget_pass": True,

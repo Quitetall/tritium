@@ -3,7 +3,7 @@
 use tritium_spec::{
     BackendError, TrainAttributeValueV1, TrainBackendError, TrainBackendV1, TrainBufferDataMutV1,
     TrainBufferDataRefV1, TrainCapabilitiesV1, TrainDTypeV1, TrainExecutionV1, TrainLimitsV1,
-    TrainOperationErrorV1, TrainOutputV1, TrainReceiptV1, TrainRequestV1, TrainingOpManifestV1,
+    TrainOperationErrorV1, TrainOutputV1, TrainReceiptV1, TrainRequestV1, TrainingOpManifestV2,
     train_output_digest_v1, train_request_digest_v1,
 };
 
@@ -40,6 +40,7 @@ const OPERATIONS: &[&str] = &[
     "graph.softmax",
     "loss.mse",
     "loss.softmax_cross_entropy",
+    "loss.topk_knowledge_distillation",
     "optimizer.sgd",
     "optimizer.adamw",
     "optimizer.cautious_adamw",
@@ -892,6 +893,120 @@ impl WgpuTrainBackendV1 {
                 (&[], 1)
             } else {
                 (&shape, elements as usize)
+            };
+        output_f32(output, output_name, output_shape, output_len)?.copy_from_slice(&result);
+        Ok(())
+    }
+
+    fn execute_topk_kd(
+        &self,
+        request: &TrainRequestV1<'_>,
+        output: &mut TrainOutputV1<'_>,
+    ) -> Result<(), TrainBackendError> {
+        let expected_inputs: &[&str] = match request.execution {
+            TrainExecutionV1::Forward => &["logits", "indices", "probabilities"],
+            TrainExecutionV1::Vjp => &["logits", "indices", "probabilities", "grad_output"],
+            _ => {
+                return Err(invariant(
+                    "top-k knowledge distillation received an illegal phase",
+                ));
+            }
+        };
+        let output_name = if request.execution == TrainExecutionV1::Forward {
+            "result"
+        } else {
+            "grad_logits"
+        };
+        require_names(
+            request.inputs.iter().map(|buffer| buffer.name),
+            expected_inputs,
+            "inputs",
+        )?;
+        require_names(
+            request.attributes.iter().map(|attribute| attribute.name),
+            &["rows", "cols", "k"],
+            "attributes",
+        )?;
+        require_names(
+            output.buffers.iter().map(|buffer| buffer.name),
+            &[output_name],
+            "outputs",
+        )?;
+        let rows = attribute_u64(request, "rows")?;
+        let cols = attribute_u64(request, "cols")?;
+        let k = attribute_u64(request, "k")?;
+        if rows == 0 {
+            return Err(attribute_value("rows", "positive"));
+        }
+        if cols == 0 {
+            return Err(attribute_value("cols", "positive"));
+        }
+        if k == 0 {
+            return Err(attribute_value("k", "positive"));
+        }
+        if k > cols {
+            return Err(attribute_value("k", "at_most_cols"));
+        }
+        let dense_elements = rows.checked_mul(cols).ok_or_else(shape_error)?;
+        let sparse_elements = rows.checked_mul(k).ok_or_else(shape_error)?;
+        if rows > u32::MAX as u64
+            || cols > u32::MAX as u64
+            || k > u32::MAX as u64
+            || dense_elements > u32::MAX as u64
+            || sparse_elements > u32::MAX as u64
+        {
+            return Err(shape_error());
+        }
+        let dense_shape = [rows, cols];
+        let sparse_shape = [rows, k];
+        let (logits_shape, logits) = input_f32(request, "logits")?;
+        let (indices_shape, indices) = input_u32(request, "indices")?;
+        let (probabilities_shape, probabilities) = input_f32(request, "probabilities")?;
+        if logits_shape != dense_shape
+            || indices_shape != sparse_shape
+            || probabilities_shape != sparse_shape
+            || logits.len() != dense_elements as usize
+            || indices.len() != sparse_elements as usize
+            || probabilities.len() != sparse_elements as usize
+        {
+            return Err(shape_error());
+        }
+        require_finite("logits", logits)?;
+        require_finite("probabilities", probabilities)?;
+        if probabilities.iter().any(|&probability| probability < 0.0) {
+            return Err(attribute_value("probabilities", "nonnegative"));
+        }
+        if indices.iter().any(|&index| u64::from(index) >= cols) {
+            return Err(attribute_value("indices", "in_range"));
+        }
+        let grad_output = if request.execution == TrainExecutionV1::Vjp {
+            let (gradient_shape, gradient) = input_f32(request, "grad_output")?;
+            if !gradient_shape.is_empty() || gradient.len() != 1 {
+                return Err(shape_error());
+            }
+            require_finite("grad_output", gradient)?;
+            gradient
+        } else {
+            logits
+        };
+        let result = self
+            .backend
+            .topk_kd(
+                logits,
+                indices,
+                probabilities,
+                grad_output,
+                rows as u32,
+                cols as u32,
+                k as u32,
+                request.execution == TrainExecutionV1::Vjp,
+            )
+            .map_err(wgpu_error)?;
+        let (output_shape, output_len): (&[u64], usize) =
+            if request.execution == TrainExecutionV1::Forward {
+                (&[], 1)
+            } else {
+                (&dense_shape, dense_elements as usize)
             };
         output_f32(output, output_name, output_shape, output_len)?.copy_from_slice(&result);
         Ok(())
@@ -2496,7 +2611,7 @@ impl TrainBackendV1 for WgpuTrainBackendV1 {
     fn capabilities(&self) -> TrainCapabilitiesV1 {
         TrainCapabilitiesV1 {
             backend_id: "wgpu.portable.v1:wgpu".to_owned(),
-            manifest_digest: TrainingOpManifestV1::digest(),
+            manifest_digest: TrainingOpManifestV2::digest(),
             supported_operations: OPERATIONS
                 .iter()
                 .map(|operation| (*operation).to_owned())
@@ -2531,6 +2646,9 @@ impl TrainBackendV1 for WgpuTrainBackendV1 {
             0
         } else if request.operation == "loss.softmax_cross_entropy" {
             self.execute_softmax_xent(&request, output)?;
+            0
+        } else if request.operation == "loss.topk_knowledge_distillation" {
+            self.execute_topk_kd(&request, output)?;
             0
         } else if request.operation == "graph.bias" {
             self.execute_bias(&request, output)?;
@@ -2596,7 +2714,7 @@ impl TrainBackendV1 for WgpuTrainBackendV1 {
             backend_id: "wgpu.portable.v1:wgpu".to_owned(),
             backend_build: backend_build_identity(),
             physical_device: Some(self.physical_device.clone()),
-            manifest_digest: TrainingOpManifestV1::digest(),
+            manifest_digest: TrainingOpManifestV2::digest(),
             vector_digest: request.vector_digest,
             operation: request.operation.to_owned(),
             execution: request.execution,

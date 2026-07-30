@@ -2,7 +2,7 @@
 //!
 //! Versioned contracts every Tritium execution backend implements. This crate
 //! owns [`TernaryBackend`], its buffer/capability vocabulary, and the frozen
-//! [`TrainingOpManifestV1`] portable-training registry. No implementations live
+//! versioned portable-training registries. No implementations live
 //! here — device crates provide adapters and `tritium-runtime` selects them.
 //!
 //! ## Object safety
@@ -43,13 +43,14 @@ pub use train_backend::{
 mod training;
 pub use training::{
     TrainingManifestError, TrainingOpCategoryV1, TrainingOpDescriptorV1, TrainingOpManifestV1,
-    TrainingVjpV1,
+    TrainingOpManifestV2, TrainingVjpV1,
 };
 mod training_vectors;
 pub use training_vectors::{
     TrainingToleranceV1, TrainingVectorAttributeV1, TrainingVectorAttributeValueV1,
     TrainingVectorBufferDataV1, TrainingVectorBufferV1, TrainingVectorCaseV1, TrainingVectorError,
     TrainingVectorErrorCategoryV1, TrainingVectorExpectedV1, TrainingVectorSetV1,
+    TrainingVectorSetV2,
 };
 
 /// Parameters for a ternary mixed-precision GEMM call.

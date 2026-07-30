@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate complete TrainingOpManifestV1 backend release evidence."""
+"""Validate complete TrainingOpManifestV2 backend release evidence."""
 
 from __future__ import annotations
 
@@ -11,10 +11,10 @@ from typing import Any
 
 
 SCHEMA = "tritium.training-backend-qualification.v1"
-MANIFEST_BLAKE3 = "aefb352d04db145e48394b392a106ab0ad831e09e62d8c76ceddedb36a564083"
-VECTOR_BLAKE3 = "fcb250733b991aac165871f8c54b0b063337a3ed01bd1da02de220916887fbd6"
-MANIFEST_SHA256 = "b6a2d6a77eb6b655c4392682b37ea0efa4c64b9da8cd380014bdc757b56dbad1"
-VECTOR_SHA256 = "9ae03fbf2b9bdf39532906eeb1d370864f5c526c155d9a3427986f21b1f72a49"
+MANIFEST_BLAKE3 = "9093a1a7f9a3422c399943782aadf4df6b11833cf2253db0db56ff2d9dedb098"
+VECTOR_BLAKE3 = "38b17f4c76c1d2f85cb35c713652a3d77627d02ba47933d2c8f31a88e0c594a7"
+MANIFEST_SHA256 = "05c70f733e28069879a651e5e6465b04ab559b5f5b0e3162692b67cc2236db2d"
+VECTOR_SHA256 = "eae8fab4778ad00f32a5ee0984ae6620960751029118dd9d7b97ffd36a502d0d"
 FAMILIES = ("cpu", "cuda", "rocm", "metal", "wgpu", "wasi", "mcu")
 BACKEND_PREFIXES = {
     "cpu": "cpu.reference.v1",
@@ -109,8 +109,8 @@ def contained(root: Path, value: Any, label: str) -> Path:
 
 
 def source_contract(repo: Path) -> tuple[list[str], list[dict[str, Any]]]:
-    manifest_path = repo / "spec/training/v1/manifest.json"
-    vectors_path = repo / "spec/training/v1/vectors/v1.json"
+    manifest_path = repo / "spec/training/v2/manifest.json"
+    vectors_path = repo / "spec/training/v2/vectors/v2.json"
     if sha256(manifest_path) != MANIFEST_SHA256 or sha256(vectors_path) != VECTOR_SHA256:
         raise TrainingBackendReceiptError("frozen manifest or vector bytes drifted")
     try:
@@ -123,7 +123,7 @@ def source_contract(repo: Path) -> tuple[list[str], list[dict[str, Any]]]:
     if not isinstance(operations, list) or not isinstance(cases, list):
         raise TrainingBackendReceiptError("frozen training corpus inventory is malformed")
     operation_ids = [item.get("id") for item in operations if isinstance(item, dict)]
-    if len(operation_ids) != 35 or len(cases) != 114 or len(set(operation_ids)) != 35:
+    if len(operation_ids) != 36 or len(cases) != 117 or len(set(operation_ids)) != 36:
         raise TrainingBackendReceiptError("frozen operation/case counts drifted")
     if vectors.get("manifest_digest") != MANIFEST_BLAKE3:
         raise TrainingBackendReceiptError("vector manifest identity drifted")

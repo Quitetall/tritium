@@ -6,9 +6,9 @@ import { fileURLToPath } from "node:url";
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const repoRoot = resolve(packageRoot, "../..");
 const shaderRoot = resolve(repoRoot, "crates/tritium-wgpu/src");
-const manifestPath = resolve(repoRoot, "spec/training/v1/manifest.json");
+const manifestPath = resolve(repoRoot, "spec/training/v2/manifest.json");
 const outputPath = resolve(packageRoot, "src/generated-webgpu-kernels.ts");
-const dispatchPath = resolve(repoRoot, "spec/training/v1/webgpu-dispatch-v1.json");
+const dispatchPath = resolve(repoRoot, "spec/training/v2/webgpu-dispatch-v2.json");
 
 const OPERATION_MODULES = Object.freeze({
   "graph.ste_surrogate": ["pointwise"],
@@ -37,6 +37,7 @@ const OPERATION_MODULES = Object.freeze({
   "graph.softmax": ["pointwise"],
   "loss.mse": ["pointwise"],
   "loss.softmax_cross_entropy": ["softmax_xent"],
+  "loss.topk_knowledge_distillation": ["topk_kd"],
   "optimizer.sgd": ["pointwise"],
   "optimizer.adamw": ["adamw", "adamw_terms", "adamw_variance", "adamw_finish"],
   "optimizer.cautious_adamw": [
@@ -132,6 +133,8 @@ const DISPATCH_FORMS = Object.freeze({
   "loss.mse|vjp": [pw(17)],
   "loss.softmax_cross_entropy|forward": [one("softmax_xent", "single")],
   "loss.softmax_cross_entropy|vjp": [one("softmax_xent", "single")],
+  "loss.topk_knowledge_distillation|forward": [one("topk_kd", "single")],
+  "loss.topk_knowledge_distillation|vjp": [one("topk_kd", "single")],
   "optimizer.sgd|step": [pw(21, "linear_parameter_64")],
   "optimizer.adamw|step": [
     one("adamw", "linear_parameter_64"),
@@ -282,13 +285,13 @@ async function generate() {
     .filter((operation) => !operation.startsWith("lifecycle."));
   const mapped = Object.keys(OPERATION_MODULES);
   if (
-    tensorOperations.length !== 31 ||
+    tensorOperations.length !== 32 ||
     mapped.length !== tensorOperations.length ||
     tensorOperations.some((operation) => !mapped.includes(operation)) ||
     mapped.some((operation) => !tensorOperations.includes(operation))
   ) {
     throw new Error(
-      "WebGPU candidate dependency index must key the 31 frozen tensor operations",
+      "WebGPU candidate dependency index must key the 32 frozen tensor operations",
     );
   }
 
@@ -337,8 +340,8 @@ async function generate() {
       forms.push({ operation: descriptor.id, execution, stages });
     }
   }
-  if (forms.length !== 57 || Object.keys(DISPATCH_FORMS).length !== forms.length) {
-    throw new Error("WebGPU dispatch catalog must contain exactly 57 execution forms");
+  if (forms.length !== 59 || Object.keys(DISPATCH_FORMS).length !== forms.length) {
+    throw new Error("WebGPU dispatch catalog must contain exactly 59 execution forms");
   }
   const moduleById = new Map(modules.map((module) => [module.id, module]));
   for (const form of forms) {
@@ -363,7 +366,7 @@ async function generate() {
   );
   const catalog = {
     schema_id: "tritium.webgpu_dispatch_catalog",
-    schema_version: 1,
+    schema_version: 2,
     forms,
   };
   const catalogJson = `${JSON.stringify(catalog, null, 2)}\n`;

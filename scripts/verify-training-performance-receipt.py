@@ -167,7 +167,7 @@ def validate_trace(
     for ordinal, raw in enumerate(samples):
         sample = object_(raw, SAMPLE_FIELDS, f"samples[{ordinal}]")
         elapsed.append(number(sample["elapsed_ms"], "sample elapsed", 1e-12))
-        if integer(sample["cases"], "sample cases", 114) != 114:
+        if integer(sample["cases"], "sample cases", 117) != 117:
             raise TrainingPerformanceError("performance sample is not the full corpus")
         resident.append(integer(sample["peak_resident_bytes"], "sample resident", 1))
         scratch.append(integer(sample["peak_scratch_bytes"], "sample scratch", 0))
@@ -249,7 +249,7 @@ def validate(
     if receipt["candidate_manifest_sha256"] != sha256(candidate):
         raise TrainingPerformanceError("receipt does not bind candidate manifest")
     digest(receipt["backend_manifest_receipt_id"], "backend manifest receipt id")
-    if receipt["workload_id"] != "training-manifest-v1-full-114":
+    if receipt["workload_id"] != "training-manifest-v2-full-117":
         raise TrainingPerformanceError("performance workload or budget is not frozen")
     digest(receipt["budget_id"], "budget id")
     artifacts = inventory(candidate)
@@ -292,8 +292,8 @@ def validate(
         seen_devices.add(device)
         integer(measurement["warmup_iterations"], "warmup iterations", 10)
         integer(measurement["sample_count"], "sample count", 30)
-        cases = integer(measurement["cases_per_sample"], "cases per sample", 114)
-        if cases != 114:
+        cases = integer(measurement["cases_per_sample"], "cases per sample", 117)
+        if cases != 117:
             raise TrainingPerformanceError("performance sample is not the full corpus")
         median = number(measurement["median_ms"], "median milliseconds", 1e-12)
         p95 = number(measurement["p95_ms"], "p95 milliseconds", median)

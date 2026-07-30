@@ -1,13 +1,13 @@
 #![cfg(feature = "wgpu")]
 
-use tritium_spec::{TrainBackendV1, TrainingVectorSetV1};
+use tritium_spec::{TrainBackendV1, TrainingVectorSetV2};
 use tritium_testkit::run_supported_training_conformance;
 use tritium_wgpu::WgpuTrainBackendV1;
 
 #[test]
 fn wgpu_executes_every_vector_for_its_advertised_operations() {
-    let vectors = TrainingVectorSetV1::parse_json(include_bytes!(
-        "../../../spec/training/v1/vectors/v1.json"
+    let vectors = TrainingVectorSetV2::parse_json(include_bytes!(
+        "../../../spec/training/v2/vectors/v2.json"
     ))
     .expect("parse canonical training vectors");
     let backend = WgpuTrainBackendV1::new().expect("open native wgpu adapter");
@@ -21,7 +21,7 @@ fn wgpu_executes_every_vector_for_its_advertised_operations() {
         report.failed.len(),
         report.failed
     );
-    assert_eq!(report.passed.len(), 114);
+    assert_eq!(report.passed.len(), 117);
     assert_eq!(
         backend.capabilities().supported_operations,
         [
@@ -51,6 +51,7 @@ fn wgpu_executes_every_vector_for_its_advertised_operations() {
             "graph.softmax",
             "loss.mse",
             "loss.softmax_cross_entropy",
+            "loss.topk_knowledge_distillation",
             "optimizer.sgd",
             "optimizer.adamw",
             "optimizer.cautious_adamw",

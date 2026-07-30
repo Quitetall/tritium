@@ -1,4 +1,4 @@
-import { TRAINING_MANIFEST_DIGEST_V1, TRAINING_VECTOR_DIGEST_V1 } from "./identity.ts";
+import { TRAINING_MANIFEST_DIGEST_V2, TRAINING_VECTOR_DIGEST_V2 } from "./identity.ts";
 import { PORTABLE_OPERATION_BINDINGS_V1 } from "./operation-bindings.ts";
 import type {
   PortableAttributeV1,
@@ -69,7 +69,7 @@ function checkPlan(plan: CompiledTrainingPlanV1): void {
     plan === null ||
     plan.schemaId !== "tritium.compiled_training_plan" ||
     plan.schemaVersion !== 1 ||
-    plan.manifestDigest !== TRAINING_MANIFEST_DIGEST_V1 ||
+    plan.manifestDigest !== TRAINING_MANIFEST_DIGEST_V2 ||
     !Array.isArray(plan.buffers) ||
     !isDenseArray(plan.buffers) ||
     !Array.isArray(plan.operations) ||
@@ -399,7 +399,7 @@ function preflightRequest(
     physicalDevice: "wasm32:browser",
     operation,
     execution,
-    vectorDigest: TRAINING_VECTOR_DIGEST_V1,
+    vectorDigest: TRAINING_VECTOR_DIGEST_V2,
     inputs: [],
     attributes: attributes.map(portableAttribute),
     outputs: [],
@@ -513,7 +513,7 @@ function compile(
     physicalDevice,
     operation,
     execution: execution as PortableExecutionV1,
-    vectorDigest: TRAINING_VECTOR_DIGEST_V1,
+    vectorDigest: TRAINING_VECTOR_DIGEST_V2,
     inputs: Object.freeze(
       inputIds.map((id, index) => portableInput(roles.inputs[index]!, id, buffers, store)),
     ),

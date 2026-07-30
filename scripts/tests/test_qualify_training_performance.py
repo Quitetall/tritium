@@ -34,7 +34,7 @@ def traces(root: Path, *, host_transfer_family: str | None = None):
             "samples": [
                 {
                     "elapsed_ms": median if sample < 28 else median * 1.2,
-                    "cases": 114, "peak_resident_bytes": 1000,
+                    "cases": 117, "peak_resident_bytes": 1000,
                     "peak_scratch_bytes": 100,
                     "host_transfers": 1
                     if family == host_transfer_family and sample == 0 else 0,

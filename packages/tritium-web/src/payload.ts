@@ -1,6 +1,6 @@
 import { blake3 } from "@noble/hashes/blake3.js";
 
-import { TRAINING_MANIFEST_DIGEST_V1 } from "./identity.ts";
+import { TRAINING_MANIFEST_DIGEST_V2 } from "./identity.ts";
 import type {
   WebTrainingInitialTensorsV1,
   WebTrainingPayloadErrorCode,

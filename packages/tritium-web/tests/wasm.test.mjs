@@ -5,8 +5,8 @@ import test from "node:test";
 import {
   executePortableWasmRequest,
   runPortableWasmConformance,
-  TRAINING_MANIFEST_DIGEST_V1,
-  TRAINING_VECTOR_DIGEST_V1,
+  TRAINING_MANIFEST_DIGEST_V2,
+  TRAINING_VECTOR_DIGEST_V2,
 } from "../dist/index.js";
 
 const sgdRequest = {
@@ -63,10 +63,10 @@ test("bundled wasm32-unknown guest passes the complete corpus twice", async () =
     buildId: receipt.buildId,
     guestDigest: receipt.guestDigest,
     executionDigest: receipt.executionDigest,
-    manifestDigest: TRAINING_MANIFEST_DIGEST_V1,
-    vectorDigest: TRAINING_VECTOR_DIGEST_V1,
-    operationCount: 35,
-    caseCount: 114,
+    manifestDigest: TRAINING_MANIFEST_DIGEST_V2,
+    vectorDigest: TRAINING_VECTOR_DIGEST_V2,
+    operationCount: 36,
+    caseCount: 117,
     maxCallerBytes: 64 * 1024 * 1024,
     maxLinearMemoryBytes: 192 * 1024 * 1024,
     repeatedExecutions: 2,
@@ -102,7 +102,7 @@ test("bundled guest executes strict portable requests", async () => {
     physicalDevice: "node:test-wasm",
     operation: "graph.fsq",
     execution: "forward",
-    vectorDigest: TRAINING_VECTOR_DIGEST_V1,
+    vectorDigest: TRAINING_VECTOR_DIGEST_V2,
     inputs: [
       {
         name: "x",

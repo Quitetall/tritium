@@ -12,7 +12,7 @@ Status: **IN PROGRESS** (2026-07-20)
 ## Goal
 
 Ship a strict-TypeScript browser product that executes a compiled ternary
-training recipe through the frozen `TrainingOpManifestV1`. WebGPU is the
+training recipe through current frozen `TrainingOpManifestV2`. WebGPU is the
 accelerated implementation; deterministic WASM is a separately receipted
 fallback. Neither path exposes an arbitrary JavaScript autograd graph.
 
@@ -72,7 +72,7 @@ Create the package without a repository-relative runtime dependency:
 - `packages/tritium-web/package.json`, strict `tsconfig` files and deterministic
   ESM build;
 - generated copies of the canonical manifest, vector digest and shared public
-  schemas, plus a generator that refuses drift from `spec/training/v1`;
+  schemas, plus a generator that refuses drift from `spec/training/v2`;
 - package exports for browser ESM, types and the WASM asset;
 - tests for exact Rust/Python/TypeScript fixture parity and unknown-schema
   rejection.
@@ -92,7 +92,7 @@ npm --prefix packages/tritium-web pack --dry-run
 
 Status: **IN PROGRESS** — `tritium-wasm` now builds as an actual
 `wasm32-unknown-unknown` cdylib, the local npm archive bundles the bindgen guest,
-and Node instantiation executes all 35 operations / 114 canonical cases twice
+and Node instantiation executes all 36 operations / 117 canonical cases twice
 with zero failures under the guest's 64 MiB caller-buffer ceiling. The receipt
 binds the exact guest bytes, embedded manifest/vector identities, deterministic
 normalized execution digest and linker-enforced 192 MiB linear-memory maximum.
@@ -109,7 +109,7 @@ all five optimizers and strict SALT V2 export/reload requests, with exact-state
 round trips through the admitted guest. A bounded lifecycle state owner copies
 optimizer planes and commits and resumes only after canonical guest success; a
 separate boundary admits caller-supplied SALT packages through strict reload.
-The canonical corpus now generates the 31-operation / 57-execution role
+The canonical corpus now generates the 32-operation / 59-execution role
 registry used to compile immutable typed-array stores into exact forward, VJP
 and optimizer-step portable requests. The package gate rejects registry drift,
 unknown buffers, role drift, dtype/shape mismatches and malformed compiled
@@ -137,7 +137,7 @@ Explicit disposal terminalizes before cleanup and permits only cleanup retry
 after failure.
 These structural receipts are not substitutes for the still-open physical
 browser memory and device-loss evidence.
-All 31 non-lifecycle operations now receive allocation-free canonical ABI,
+All 32 non-lifecycle operations now receive allocation-free canonical ABI,
 forward-shape, attribute-domain and worst-case scratch validation before any
 adapter allocation. Physical Chrome/Firefox runs remain open.
 
@@ -172,7 +172,7 @@ one-optimizer ownership for each tied-parameter group fail closed.
 The adapter boundary now separates allocation-free, non-mutating, non-retaining
 structural/subset validation from persistent preparation; preparation may
 allocate decoded state but may not mutate or retain its inputs. The complete
-31-operation geometry/attribute catalog is checked against every canonical
+32-operation geometry/attribute catalog is checked against every canonical
 forward/step success, output-shape drift and bounded attribute failures.
 Preparation peak accounting includes the isolated validation and preparation
 payloads. The compiler now derives the reachable reverse-mode VJP schedule from
@@ -227,17 +227,17 @@ byte with the CPU adapter.
 
 Status: **IN PROGRESS** — the npm archive now embeds a curated portable-training
 candidate set copied byte-for-byte from `tritium-wgpu`, and binds those bytes
-plus a candidate 31-operation module-dependency index into one SHA-256 identity.
+plus a candidate 32-operation module-dependency index into one SHA-256 identity.
 Generation fails on manifest drift or missing candidate modules. The native
 inference-only `mpgemm.wgsl` is intentionally outside this training candidate
-set. A generated, schema-versioned catalog now freezes all 57 execution forms,
+set. A generated, schema-versioned catalog now freezes all 59 execution forms,
 including ordered stages, native pointwise selectors, entry points, dispatch
 geometry and repeated-stage policy. The browser bundle derives immutable
 binding declarations and workgroup sizes from the exact bundled WGSL and
 generation rejects missing modules or entry points. Native `tritium-wgpu`
 consumes the same catalog for pointwise selector selection and compiles every
 unique catalog module/entry-point pair on the selected physical adapter before
-running all 114 portable-training vectors. A low-level resident runtime now
+running all 117 portable-training vectors. A low-level resident runtime now
 admits declared WebGPU limits, compiles
 catalog pipelines, allocates zero-offset GPU buffers per root tensor owner,
 uses a device-aligned uniform arena, caches bind groups and submits multi-stage
@@ -254,9 +254,10 @@ transactions without exposing packing details to session callers. Compilation
 captures the caller plan once and admits the plan peak, auxiliary resources,
 uniform arena and zero binding against an explicit `maxPeakBytes` ceiling before
 materializing constants. Softmax cross
-entropy VJP now consumes its scalar cotangent through resident storage in both
-native and browser WGSL. This covers all 52 graph/loss catalog forms plus
-transactional SGD, AdamW, cautious AdamW, int8 AdamW and Muon (all 57 catalog forms).
+entropy and sparse top-k knowledge-distillation VJPs consume scalar cotangents
+through resident storage in both native and browser WGSL. This covers all 54
+graph/loss catalog forms plus transactional SGD, AdamW, cautious AdamW, int8
+AdamW and Muon (all 59 catalog forms).
 Optimizer transactions require a positive runtime step,
 compute into auxiliary candidates, then commit into live owners only after all
 compute dispatches complete in the same submission. Compact int8 AdamW state is
@@ -289,10 +290,10 @@ packing, stage-specific lengths, workgroups, resident bindings and operation
 geometry from the compiled plan without tensor values. MSE and softmax cross
 entropy VJPs read scalar cotangents from resident storage bindings instead of
 requiring host scalar readback. Column concat forward packs resident parts with
-same-submission GPU copies and its VJP emits ordered resident slices. All 57 catalog
+same-submission GPU copies and its VJP emits ordered resident slices. All 59 catalog
 forms now lower; the core forward/backward/step session adapter is integrated.
 
-Implement all 35 manifest operations with WGSL compute pipelines and explicit
+Implement all 36 manifest operations with WGSL compute pipelines and explicit
 VJPs. Kernels may be fused after semantic parity, but the frozen public
 operation IDs and vector behavior cannot change.
 
@@ -332,7 +333,7 @@ case count fail the release lane.
 
 Admission is frozen as `tritium.browser-training-qualification.v1`. One
 candidate-npm-bound receipt must contain ordered Chrome, Firefox and Safari
-lanes. Every lane executes exactly 70 successful and 44 expected-error vectors,
+lanes. Every lane executes exactly 72 successful and 45 expected-error vectors,
 the complete training/checkpoint/export lifecycle and all six fault classes;
 records physical adapter/OS/browser identity and admitted limits; and retains a
 content-bound trace proving zero steady-state readbacks and zero WASM dispatch.
@@ -363,7 +364,7 @@ Status: **IN PROGRESS** — `npm run check` now creates an exact 13-file archive
 rejects file-set, mode, path, npm-integrity and embedded-source drift, installs
 that tarball offline with lifecycle scripts disabled into a fresh project,
 proves ESM resolution stays under the consumer's `node_modules`, executes the
-bundled 114-case WASM corpus twice and compiles the installed declarations with
+bundled 117-case WASM corpus twice and compiles the installed declarations with
 strict TypeScript. A clean-revision CI receipt, physical-browser tutorial and
 five-minute hardware timing remain open.
 

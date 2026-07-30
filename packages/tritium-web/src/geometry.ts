@@ -282,6 +282,19 @@ export function validateTrainingOperationGeometry(
       requireShape(operation, outputs[0]!, [], "result");
       return;
     }
+    case "loss.topk_knowledge_distillation": {
+      const rows = requirePositiveU32(operation, values, "rows");
+      const cols = requirePositiveU32(operation, values, "cols");
+      const k = requirePositiveU32(operation, values, "k");
+      if (k > cols) fail(operation, "k must not exceed cols");
+      checkedProduct(operation, [rows, cols], MAX_U32);
+      checkedProduct(operation, [rows, k], MAX_U32);
+      requireShape(operation, inputs[0]!, [rows, cols], "logits");
+      requireShape(operation, inputs[1]!, [rows, k], "indices");
+      requireShape(operation, inputs[2]!, [rows, k], "probabilities");
+      requireShape(operation, outputs[0]!, [], "result");
+      return;
+    }
     case "graph.bias": {
       const rows = requirePositiveU32(operation, values, "rows");
       const cols = requirePositiveU32(operation, values, "cols");

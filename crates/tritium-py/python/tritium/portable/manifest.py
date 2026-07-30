@@ -1,4 +1,4 @@
-"""Strict parser for the frozen portable-training manifest v1."""
+"""Strict parser for frozen portable-training manifest v2."""
 
 from __future__ import annotations
 
@@ -10,7 +10,8 @@ from typing import Any, Dict, Iterable, Tuple, Union
 
 
 _SCHEMA_ID = "tritium.training_op_manifest"
-_SCHEMA_VERSION = 1
+_CURRENT_SCHEMA_VERSION = 2
+_SUPPORTED_SCHEMA_VERSIONS = {1, 2}
 _DTYPE = "f32"
 _TOP_LEVEL_FIELDS = {"schema_id", "schema_version", "dtype", "operations"}
 _OPERATION_FIELDS = {
@@ -26,7 +27,7 @@ _VJPS = {"none", "first_order"}
 
 
 class TrainingManifestError(ValueError):
-    """The supplied bytes are not the exact frozen v1 training registry."""
+    """Supplied bytes are not exact frozen v2 training registry."""
 
 
 @dataclass(frozen=True)
@@ -43,7 +44,22 @@ class TrainingOpDescriptorV1:
 
 @dataclass(frozen=True)
 class TrainingOpManifestV1:
-    """Validated immutable view of ``TrainingOpManifestV1``."""
+    """Validated immutable view of frozen ``TrainingOpManifestV1``."""
+
+    schema_id: str
+    schema_version: int
+    dtype: str
+    operations: Tuple[TrainingOpDescriptorV1, ...]
+
+    def canonical_json(self) -> bytes:
+        """Return packaged canonical V1 bytes, including terminal newline."""
+
+        return canonical_training_manifest_v1_json()
+
+
+@dataclass(frozen=True)
+class TrainingOpManifestV2:
+    """Validated immutable view of ``TrainingOpManifestV2``."""
 
     schema_id: str
     schema_version: int
@@ -57,7 +73,17 @@ class TrainingOpManifestV1:
 
 
 def canonical_training_manifest_json() -> bytes:
-    """Return the byte-identical manifest copy shipped in the Python package."""
+    """Return current byte-identical V2 manifest shipped in Python package."""
+
+    return (
+        resources.files(__package__)
+        .joinpath("training_manifest_v2.json")
+        .read_bytes()
+    )
+
+
+def canonical_training_manifest_v1_json() -> bytes:
+    """Return backward-readable frozen V1 manifest bytes."""
 
     return (
         resources.files(__package__)
@@ -99,14 +125,16 @@ def _decode_json(data: bytes) -> Dict[str, Any]:
     return value
 
 
-def _validate_wire(value: Dict[str, Any]) -> None:
+def _validate_wire(value: Dict[str, Any], schema_version: int) -> None:
     if set(value) != _TOP_LEVEL_FIELDS:
-        raise TrainingManifestError("training manifest top-level fields differ from v1")
+        raise TrainingManifestError(
+            f"training manifest top-level fields differ from v{schema_version}"
+        )
     if type(value["schema_id"]) is not str or value["schema_id"] != _SCHEMA_ID:
         raise TrainingManifestError("unsupported training manifest schema_id")
     if type(value["schema_version"]) is not int:
         raise TrainingManifestError("training manifest schema_version must be an integer")
-    if value["schema_version"] != _SCHEMA_VERSION:
+    if value["schema_version"] != schema_version:
         raise TrainingManifestError("unsupported training manifest schema_version")
     if type(value["dtype"]) is not str or value["dtype"] != _DTYPE:
         raise TrainingManifestError("unsupported training manifest dtype")
@@ -116,7 +144,7 @@ def _validate_wire(value: Dict[str, Any]) -> None:
     for index, operation in enumerate(operations):
         if not isinstance(operation, dict) or set(operation) != _OPERATION_FIELDS:
             raise TrainingManifestError(
-                f"training operation {index} fields differ from v1"
+                f"training operation {index} fields differ from v{schema_version}"
             )
         if type(operation["id"]) is not str or not operation["id"]:
             raise TrainingManifestError(f"training operation {index} has invalid id")
@@ -144,17 +172,22 @@ def _validate_wire(value: Dict[str, Any]) -> None:
             )
 
 
-@lru_cache(maxsize=1)
-def _canonical_wire() -> Dict[str, Any]:
-    value = _decode_json(canonical_training_manifest_json())
-    _validate_wire(value)
+@lru_cache(maxsize=2)
+def _canonical_wire(schema_version: int) -> Dict[str, Any]:
+    source = (
+        canonical_training_manifest_v1_json()
+        if schema_version == 1
+        else canonical_training_manifest_json()
+    )
+    value = _decode_json(source)
+    _validate_wire(value, schema_version)
     return value
 
 
 def parse_training_manifest(
     data: Union[str, bytes, bytearray, memoryview],
-) -> TrainingOpManifestV1:
-    """Parse text/bytes and require exact v1 fields, types, operations and order."""
+) -> Union[TrainingOpManifestV1, TrainingOpManifestV2]:
+    """Parse exact V1 or V2 fields, types, operations and order."""
 
     if isinstance(data, str):
         encoded = data.encode("utf-8")
@@ -163,13 +196,21 @@ def parse_training_manifest(
     else:
         raise TypeError("training manifest must be str or bytes-like")
     value = _decode_json(encoded)
-    _validate_wire(value)
-    expected = _canonical_wire()
+    schema_version = value.get("schema_version")
+    if type(schema_version) is not int:
+        raise TrainingManifestError(
+            "training manifest schema_version must be an integer"
+        )
+    if schema_version not in _SUPPORTED_SCHEMA_VERSIONS:
+        raise TrainingManifestError("unsupported training manifest schema_version")
+    _validate_wire(value, schema_version)
+    expected = _canonical_wire(schema_version)
     if value != expected:
         raise TrainingManifestError(
-            "training manifest operations differ from the frozen v1 registry"
+            f"training manifest operations differ from frozen v{schema_version} registry"
         )
-    return TrainingOpManifestV1(
+    manifest_type = TrainingOpManifestV1 if schema_version == 1 else TrainingOpManifestV2
+    return manifest_type(
         schema_id=value["schema_id"],
         schema_version=value["schema_version"],
         dtype=value["dtype"],

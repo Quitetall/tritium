@@ -5,11 +5,14 @@ use std::collections::HashSet;
 
 use serde::Deserialize;
 
-use crate::{TrainExecutionV1, TrainingOpCategoryV1, TrainingOpManifestV1, TrainingVjpV1};
+use crate::{
+    TrainExecutionV1, TrainingOpCategoryV1, TrainingOpDescriptorV1, TrainingOpManifestV1,
+    TrainingOpManifestV2, TrainingVjpV1,
+};
 
 const SCHEMA_ID: &str = "tritium.training_vectors";
-const SCHEMA_VERSION: u32 = 1;
-const CANONICAL_JSON: &[u8] = include_bytes!("../data/training/v1/vectors/v1.json");
+const CANONICAL_JSON_V1: &[u8] = include_bytes!("../data/training/v1/vectors/v1.json");
+const CANONICAL_JSON_V2: &[u8] = include_bytes!("../data/training/v2/vectors/v2.json");
 
 /// Exact or bounded comparison policy for one semantic vector.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -145,21 +148,20 @@ impl TrainingVectorSetV1 {
     /// Permanent schema identifier.
     pub const SCHEMA_ID: &'static str = SCHEMA_ID;
     /// Frozen schema version.
-    pub const SCHEMA_VERSION: u32 = SCHEMA_VERSION;
+    pub const SCHEMA_VERSION: u32 = 1;
 
     /// Exact canonical tracer-corpus bytes, including one terminal newline.
     ///
-    /// The v1 file grows monotonically until plan 0049 freezes all operations;
-    /// its digest identifies the exact corpus used by a backend receipt.
+    /// Its digest identifies exact corpus used by a backend receipt.
     #[must_use]
     pub const fn canonical_json() -> &'static [u8] {
-        CANONICAL_JSON
+        CANONICAL_JSON_V1
     }
 
     /// BLAKE3 digest of exact canonical corpus bytes.
     #[must_use]
     pub fn digest() -> [u8; 32] {
-        *blake3::hash(CANONICAL_JSON).as_bytes()
+        *blake3::hash(CANONICAL_JSON_V1).as_bytes()
     }
 
     /// Parse and validate a vector corpus.
@@ -168,73 +170,16 @@ impl TrainingVectorSetV1 {
     /// Returns [`TrainingVectorError`] for malformed JSON, schema/manifest
     /// drift, duplicate identifiers, illegal phases or invalid payloads.
     pub fn parse_json(bytes: &[u8]) -> Result<Self, TrainingVectorError> {
-        let wire: VectorSetWire = serde_json::from_slice(bytes)
-            .map_err(|error| TrainingVectorError::InvalidJson(error.to_string()))?;
-        if wire.schema_id != SCHEMA_ID {
-            return Err(TrainingVectorError::UnsupportedSchemaId(wire.schema_id));
-        }
-        if wire.schema_version != SCHEMA_VERSION {
-            return Err(TrainingVectorError::UnsupportedSchemaVersion(
-                wire.schema_version,
-            ));
-        }
-        let manifest_digest = parse_digest(&wire.manifest_digest)?;
-        if manifest_digest != TrainingOpManifestV1::digest() {
-            return Err(TrainingVectorError::ManifestDigestMismatch);
-        }
-        if wire.cases.is_empty() {
-            return Err(TrainingVectorError::EmptyCases);
-        }
-
-        let mut case_ids = HashSet::with_capacity(wire.cases.len());
-        let mut cases = Vec::with_capacity(wire.cases.len());
-        for case in wire.cases {
-            validate_identifier("case", &case.case_id, true)?;
-            if !case_ids.insert(case.case_id.clone()) {
-                return Err(TrainingVectorError::DuplicateCaseId(case.case_id));
-            }
-            let descriptor = TrainingOpManifestV1::operations()
-                .iter()
-                .find(|descriptor| descriptor.id == case.operation)
-                .ok_or_else(|| TrainingVectorError::UnknownOperation(case.operation.clone()))?;
-            let execution = case.execution.into();
-            if !execution_allowed(
-                descriptor.id,
-                descriptor.category,
-                descriptor.forward,
-                descriptor.vjp,
-                execution,
-            ) {
-                return Err(TrainingVectorError::IllegalExecution {
-                    operation: case.operation,
-                    execution,
-                });
-            }
-            let tolerance = validate_tolerance(case.tolerance)?;
-            let carries_invalid_request = matches!(
-                &case.expected,
-                ExpectedWire::Error {
-                    category: ErrorCategoryWire::InvalidRequest,
-                    ..
-                }
-            );
-            let inputs = validate_buffers("input", case.inputs, carries_invalid_request)?;
-            let attributes = validate_attributes(case.attributes, carries_invalid_request)?;
-            let expected = validate_expected(case.expected)?;
-            cases.push(TrainingVectorCaseV1 {
-                case_id: case.case_id,
-                operation: descriptor.id.to_owned(),
-                execution,
-                tolerance,
-                inputs,
-                attributes,
-                expected,
-            });
-        }
+        let parsed = parse_vector_set(
+            bytes,
+            Self::SCHEMA_VERSION,
+            TrainingOpManifestV1::digest(),
+            TrainingOpManifestV1::operations(),
+        )?;
         Ok(Self {
-            manifest_digest,
-            source_digest: *blake3::hash(bytes).as_bytes(),
-            cases,
+            manifest_digest: parsed.manifest_digest,
+            source_digest: parsed.source_digest,
+            cases: parsed.cases,
         })
     }
 
@@ -244,17 +189,163 @@ impl TrainingVectorSetV1 {
         self.manifest_digest
     }
 
-    /// BLAKE3 digest of the exact source bytes accepted by the parser.
+    /// BLAKE3 digest of exact source bytes accepted by parser.
     #[must_use]
     pub const fn source_digest(&self) -> [u8; 32] {
         self.source_digest
     }
 
-    /// Canonically ordered cases as parsed from the corpus.
+    /// Canonically ordered cases as parsed from corpus.
     #[must_use]
     pub fn cases(&self) -> &[TrainingVectorCaseV1] {
         &self.cases
     }
+}
+
+/// Parsed v2 semantic-vector corpus bound to exact v2 manifest.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TrainingVectorSetV2 {
+    manifest_digest: [u8; 32],
+    source_digest: [u8; 32],
+    cases: Vec<TrainingVectorCaseV1>,
+}
+
+impl TrainingVectorSetV2 {
+    /// Permanent schema identifier.
+    pub const SCHEMA_ID: &'static str = SCHEMA_ID;
+    /// Frozen schema version.
+    pub const SCHEMA_VERSION: u32 = 2;
+
+    /// Exact canonical corpus bytes, including one terminal newline.
+    #[must_use]
+    pub const fn canonical_json() -> &'static [u8] {
+        CANONICAL_JSON_V2
+    }
+
+    /// BLAKE3 digest of exact canonical corpus bytes.
+    #[must_use]
+    pub fn digest() -> [u8; 32] {
+        *blake3::hash(CANONICAL_JSON_V2).as_bytes()
+    }
+
+    /// Parse and validate a v2 vector corpus.
+    ///
+    /// # Errors
+    /// Returns [`TrainingVectorError`] for malformed JSON, schema/manifest
+    /// drift, duplicate identifiers, illegal phases or invalid payloads.
+    pub fn parse_json(bytes: &[u8]) -> Result<Self, TrainingVectorError> {
+        let parsed = parse_vector_set(
+            bytes,
+            Self::SCHEMA_VERSION,
+            TrainingOpManifestV2::digest(),
+            TrainingOpManifestV2::operations(),
+        )?;
+        Ok(Self {
+            manifest_digest: parsed.manifest_digest,
+            source_digest: parsed.source_digest,
+            cases: parsed.cases,
+        })
+    }
+
+    /// Exact manifest digest declared by this corpus.
+    #[must_use]
+    pub const fn manifest_digest(&self) -> [u8; 32] {
+        self.manifest_digest
+    }
+
+    /// BLAKE3 digest of exact source bytes accepted by parser.
+    #[must_use]
+    pub const fn source_digest(&self) -> [u8; 32] {
+        self.source_digest
+    }
+
+    /// Canonically ordered cases as parsed from corpus.
+    #[must_use]
+    pub fn cases(&self) -> &[TrainingVectorCaseV1] {
+        &self.cases
+    }
+}
+
+struct ParsedVectorSet {
+    manifest_digest: [u8; 32],
+    source_digest: [u8; 32],
+    cases: Vec<TrainingVectorCaseV1>,
+}
+
+fn parse_vector_set(
+    bytes: &[u8],
+    schema_version: u32,
+    expected_manifest_digest: [u8; 32],
+    operations: &[TrainingOpDescriptorV1],
+) -> Result<ParsedVectorSet, TrainingVectorError> {
+    let wire: VectorSetWire = serde_json::from_slice(bytes)
+        .map_err(|error| TrainingVectorError::InvalidJson(error.to_string()))?;
+    if wire.schema_id != SCHEMA_ID {
+        return Err(TrainingVectorError::UnsupportedSchemaId(wire.schema_id));
+    }
+    if wire.schema_version != schema_version {
+        return Err(TrainingVectorError::UnsupportedSchemaVersion(
+            wire.schema_version,
+        ));
+    }
+    let manifest_digest = parse_digest(&wire.manifest_digest)?;
+    if manifest_digest != expected_manifest_digest {
+        return Err(TrainingVectorError::ManifestDigestMismatch);
+    }
+    if wire.cases.is_empty() {
+        return Err(TrainingVectorError::EmptyCases);
+    }
+
+    let mut case_ids = HashSet::with_capacity(wire.cases.len());
+    let mut cases = Vec::with_capacity(wire.cases.len());
+    for case in wire.cases {
+        validate_identifier("case", &case.case_id, true)?;
+        if !case_ids.insert(case.case_id.clone()) {
+            return Err(TrainingVectorError::DuplicateCaseId(case.case_id));
+        }
+        let descriptor = operations
+            .iter()
+            .find(|descriptor| descriptor.id == case.operation)
+            .ok_or_else(|| TrainingVectorError::UnknownOperation(case.operation.clone()))?;
+        let execution = case.execution.into();
+        if !execution_allowed(
+            descriptor.id,
+            descriptor.category,
+            descriptor.forward,
+            descriptor.vjp,
+            execution,
+        ) {
+            return Err(TrainingVectorError::IllegalExecution {
+                operation: case.operation,
+                execution,
+            });
+        }
+        let tolerance = validate_tolerance(case.tolerance)?;
+        let carries_invalid_request = matches!(
+            &case.expected,
+            ExpectedWire::Error {
+                category: ErrorCategoryWire::InvalidRequest,
+                ..
+            }
+        );
+        let inputs = validate_buffers("input", case.inputs, carries_invalid_request)?;
+        let attributes = validate_attributes(case.attributes, carries_invalid_request)?;
+        let expected = validate_expected(case.expected)?;
+        cases.push(TrainingVectorCaseV1 {
+            case_id: case.case_id,
+            operation: descriptor.id.to_owned(),
+            execution,
+            tolerance,
+            inputs,
+            attributes,
+            expected,
+        });
+    }
+    Ok(ParsedVectorSet {
+        manifest_digest,
+        source_digest: *blake3::hash(bytes).as_bytes(),
+        cases,
+    })
 }
 
 /// Strict semantic-vector parse or validation failure.
@@ -262,9 +353,9 @@ impl TrainingVectorSetV1 {
 pub enum TrainingVectorError {
     /// Input is not valid strict vector JSON.
     InvalidJson(String),
-    /// Schema identifier is not the frozen v1 identifier.
+    /// Schema identifier is unsupported.
     UnsupportedSchemaId(String),
-    /// Schema version is not one.
+    /// Schema version is unsupported by requested reader.
     UnsupportedSchemaVersion(u32),
     /// Manifest digest is not 64 lowercase hexadecimal characters.
     InvalidManifestDigest(String),

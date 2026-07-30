@@ -1,4 +1,4 @@
-// Generated from spec/training/v1/manifest.json and vectors/v1.json.
+// Generated from spec/training/v2/manifest.json and vectors/v2.json.
 // Run `npm run generate:bindings`; manual edits fail `npm run check`.
 
 export const PORTABLE_OPERATION_BINDINGS_V1 = {
@@ -1240,6 +1240,57 @@ export const PORTABLE_OPERATION_BINDINGS_V1 = {
         },
         {
           "name": "cols",
+          "kind": "u64"
+        }
+      ],
+      "outputs": [
+        "grad_logits"
+      ]
+    }
+  },
+  "loss.topk_knowledge_distillation": {
+    "forward": {
+      "inputs": [
+        "logits",
+        "indices",
+        "probabilities"
+      ],
+      "attributes": [
+        {
+          "name": "rows",
+          "kind": "u64"
+        },
+        {
+          "name": "cols",
+          "kind": "u64"
+        },
+        {
+          "name": "k",
+          "kind": "u64"
+        }
+      ],
+      "outputs": [
+        "result"
+      ]
+    },
+    "vjp": {
+      "inputs": [
+        "logits",
+        "indices",
+        "probabilities",
+        "grad_output"
+      ],
+      "attributes": [
+        {
+          "name": "rows",
+          "kind": "u64"
+        },
+        {
+          "name": "cols",
+          "kind": "u64"
+        },
+        {
+          "name": "k",
           "kind": "u64"
         }
       ],

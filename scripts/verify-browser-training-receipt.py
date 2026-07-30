@@ -12,8 +12,8 @@ from typing import Any
 
 
 SCHEMA = "tritium.browser-training-qualification.v1"
-MANIFEST_DIGEST = "aefb352d04db145e48394b392a106ab0ad831e09e62d8c76ceddedb36a564083"
-VECTOR_DIGEST = "fcb250733b991aac165871f8c54b0b063337a3ed01bd1da02de220916887fbd6"
+MANIFEST_DIGEST = "9093a1a7f9a3422c399943782aadf4df6b11833cf2253db0db56ff2d9dedb098"
+VECTOR_DIGEST = "38b17f4c76c1d2f85cb35c713652a3d77627d02ba47933d2c8f31a88e0c594a7"
 TOP_FIELDS = {
     "schema",
     "receipt_id",
@@ -183,8 +183,8 @@ def validate_lane(value: Any, ordinal: int, root: Path) -> dict[str, Any]:
     for field in LIMIT_FIELDS:
         positive(limits[field], f"{label}.limits.{field}")
     cases = object_(lane["case_counts"], CASE_FIELDS, f"{label}.case_counts")
-    if cases != {"valid": 70, "invalid": 44, "skipped": 0}:
-        raise BrowserReceiptError(f"{label} must execute all 114 canonical vectors")
+    if cases != {"valid": 72, "invalid": 45, "skipped": 0}:
+        raise BrowserReceiptError(f"{label} must execute all 117 canonical vectors")
     lifecycle = object_(lane["lifecycle"], LIFECYCLE_FIELDS, f"{label}.lifecycle")
     if any(lifecycle[field] is not True for field in LIFECYCLE_FIELDS):
         raise BrowserReceiptError(f"{label} lifecycle is incomplete")

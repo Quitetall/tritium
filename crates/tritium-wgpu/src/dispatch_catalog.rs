@@ -43,8 +43,8 @@ mod tests {
     use super::{PORTABLE_DISPATCH_FORMS_V1, portable_dispatch_form_v1};
 
     #[test]
-    fn shared_catalog_covers_fifty_seven_forms_and_phase_specific_stages() {
-        assert_eq!(PORTABLE_DISPATCH_FORMS_V1.len(), 57);
+    fn shared_catalog_covers_fifty_nine_forms_and_phase_specific_stages() {
+        assert_eq!(PORTABLE_DISPATCH_FORMS_V1.len(), 59);
         let salt_vjp = portable_dispatch_form_v1("graph.salt_ste", "vjp").unwrap();
         assert_eq!(salt_vjp.stages[0].module_id, "pointwise");
         assert_eq!(salt_vjp.stages[0].selector, Some(0));

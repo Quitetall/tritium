@@ -1,4 +1,5 @@
 export {
+  canonicalTrainingManifestV1Json,
   canonicalTrainingManifestJson,
   parseTrainingManifest,
   TrainingManifestError,
@@ -7,11 +8,14 @@ export type {
   TrainingOpCategoryV1,
   TrainingOpDescriptorV1,
   TrainingOpManifestV1,
+  TrainingOpManifestV2,
   TrainingVjpV1,
 } from "../../../bindings/typescript/src/training_manifest.ts";
 export {
   TRAINING_MANIFEST_DIGEST_V1,
+  TRAINING_MANIFEST_DIGEST_V2,
   TRAINING_VECTOR_DIGEST_V1,
+  TRAINING_VECTOR_DIGEST_V2,
 } from "./identity.ts";
 export {
   WebTrainingError,
@@ -22,7 +26,7 @@ export {
 export { executePortableWasmRequest, runPortableWasmConformance } from "./wasm.ts";
 export { createPortableWasmTrainingAdapter } from "./wasm-adapter.ts";
 export {
-  webGpuDispatchCatalogV1,
+  webGpuDispatchCatalogV2,
   webGpuDispatchFormV1,
   webGpuCandidateModulesForOperationV1,
   webGpuKernelCandidateBundleV1,
@@ -117,7 +121,7 @@ export type {
   WebTrainingState,
 } from "./session.ts";
 export type {
-  WebGpuDispatchCatalogV1,
+  WebGpuDispatchCatalogV2,
   WebGpuDispatchExecutionV1,
   WebGpuDispatchFormV1,
   WebGpuDispatchGeometryV1,

@@ -235,7 +235,7 @@ candidate-revision result.
 Browser admission is likewise fail-closed. Only
 `tritium.browser-training-qualification.v1` can satisfy
 `browser-conformance`: it binds the exact npm archive and requires complete
-physical Chrome, Firefox and Safari identities, 70 valid plus 44 invalid
+physical Chrome, Firefox and Safari identities, 72 valid plus 45 invalid
 canonical cases per lane, full lifecycle/fault coverage, and rehashed traces
 with no steady-state readback or WASM fallback. No physical three-browser
 receipt is present yet, so this remains `MISSING` rather than structural pass.

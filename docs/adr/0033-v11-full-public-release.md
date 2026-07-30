@@ -276,7 +276,8 @@ v1.1 does not clone `DataLoader` or optimizers. It provides:
 
 ### 6. Whole-Tape portable training and browser product
 
-v1.1 freezes a language-neutral `TrainingOpManifestV1` and a fallible internal
+v1.1 reads frozen `TrainingOpManifestV1` artifacts and writes the language-neutral
+`TrainingOpManifestV2` plus a fallible internal
 `TrainBackendV1` conformance seam. This is not the public native Tensor frontend
 scheduled for v1.2. The manifest covers every current public `Tape` operation
 and first-order VJP:
@@ -287,7 +288,7 @@ and first-order VJP:
 - Conv1d plus the v1.1 Conv2d extension;
 - ReLU-squared, SiLU, RMSNorm, softmax, causal mask, RoPE and composed
   attention;
-- MSE and softmax cross-entropy;
+- MSE, softmax cross-entropy and sparse top-k knowledge distillation;
 - SGD plus AdamW, CautiousAdamW, Int8AdamW and Muon steps;
 - checkpoint/resume and canonical artifact export/reload.
 
@@ -522,7 +523,7 @@ under `python -I`; worker and interpreter substitution are not release seams.
       their one-call PyTorch/HF facades preserve tied weights/state, compile,
       distribute, export and reload. PTQ and refined lineages remain distinct.
 - [ ] Steady-state optimized CPU/CUDA paths show no hidden host transfer or
-      dense runtime shadow; `TrainingOpManifestV1` passes every declared native
+      dense runtime shadow; `TrainingOpManifestV2` passes every declared native
       backend and performance tiers are receipted.
 - [ ] Core estimator catalog, external-estimator validation, production SALT
       reconstruction/refinement and reproduced baseline harness pass.
@@ -530,7 +531,7 @@ under `python -I`; worker and interpreter substitution are not release seams.
       Chrome, Firefox and Safari WebGPU, including checkpoint/export/native
       reload; WASM fallback is reported separately.
       Admission uses `tritium.browser-training-qualification.v1`: three ordered
-      physical-engine lanes bound to the exact npm candidate, all 114 vectors,
+      physical-engine lanes bound to the exact npm candidate, all 117 vectors,
       complete lifecycle and fault injection, and content-hashed traces with no
       steady-state readback or hidden WASM dispatch. Structural emulation cannot
       satisfy this box.

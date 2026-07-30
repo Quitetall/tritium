@@ -14,8 +14,8 @@ TrainingBackendReceiptError = MODULE["TrainingBackendReceiptError"]
 
 
 def fixture(root: Path):
-    manifest = json.loads((ROOT / "spec/training/v1/manifest.json").read_bytes())
-    vectors = json.loads((ROOT / "spec/training/v1/vectors/v1.json").read_bytes())
+    manifest = json.loads((ROOT / "spec/training/v2/manifest.json").read_bytes())
+    vectors = json.loads((ROOT / "spec/training/v2/vectors/v2.json").read_bytes())
     operations = [item["id"] for item in manifest["operations"]]
     artifacts = []
     bundles = []

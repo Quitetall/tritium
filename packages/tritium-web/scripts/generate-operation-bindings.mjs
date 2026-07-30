@@ -4,8 +4,8 @@ import { fileURLToPath } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const repository = resolve(root, "../..");
-const manifestPath = resolve(repository, "spec/training/v1/manifest.json");
-const vectorsPath = resolve(repository, "spec/training/v1/vectors/v1.json");
+const manifestPath = resolve(repository, "spec/training/v2/manifest.json");
+const vectorsPath = resolve(repository, "spec/training/v2/vectors/v2.json");
 const outputPath = resolve(root, "src/operation-bindings.ts");
 
 const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
@@ -66,7 +66,7 @@ for (const key of successful.keys()) {
 }
 
 const lines = [
-  "// Generated from spec/training/v1/manifest.json and vectors/v1.json.",
+  "// Generated from spec/training/v2/manifest.json and vectors/v2.json.",
   "// Run `npm run generate:bindings`; manual edits fail `npm run check`.",
   "",
   "export const PORTABLE_OPERATION_BINDINGS_V1 = " +

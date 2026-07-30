@@ -4,7 +4,7 @@ use core::fmt;
 
 use blake3::Hasher;
 
-use crate::{TrainingOpCategoryV1, TrainingOpManifestV1, TrainingVjpV1};
+use crate::{TrainingOpCategoryV1, TrainingOpManifestV2, TrainingVjpV1};
 
 /// Portable tensor/storage dtype.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -306,7 +306,7 @@ impl<'a> TrainRequestV1<'a> {
         output: &TrainOutputV1<'_>,
         limits: TrainLimitsV1,
     ) -> Result<(), TrainRequestError> {
-        let descriptor = TrainingOpManifestV1::operations()
+        let descriptor = TrainingOpManifestV2::operations()
             .iter()
             .find(|descriptor| descriptor.id == self.operation)
             .ok_or_else(|| TrainRequestError::UnknownOperation(self.operation.to_owned()))?;
@@ -472,7 +472,7 @@ impl std::error::Error for TrainRequestError {}
 pub struct TrainCapabilitiesV1 {
     /// Stable physical/backend identity.
     pub backend_id: String,
-    /// Exact [`TrainingOpManifestV1`] digest.
+    /// Exact [`TrainingOpManifestV2`] digest.
     pub manifest_digest: [u8; 32],
     /// Manifest IDs this adapter executes without fallback.
     pub supported_operations: Vec<String>,

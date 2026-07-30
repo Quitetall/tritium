@@ -1,4 +1,4 @@
-import { TRAINING_VECTOR_DIGEST_V1 } from "./identity.ts";
+import { TRAINING_VECTOR_DIGEST_V2 } from "./identity.ts";
 import type {
   PortableAdamLeafV1,
   PortableCheckpointOptimizerV1,
@@ -255,7 +255,7 @@ function baseRequest(
     physicalDevice,
     operation,
     execution,
-    vectorDigest: TRAINING_VECTOR_DIGEST_V1,
+    vectorDigest: TRAINING_VECTOR_DIGEST_V2,
     inputs,
     attributes,
     outputs,

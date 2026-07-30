@@ -4,7 +4,7 @@ import test from "node:test";
 import {
   canonicalTrainingManifestJson,
   parseTrainingManifest,
-  webGpuDispatchCatalogV1,
+  webGpuDispatchCatalogV2,
   webGpuDispatchFormV1,
   webGpuCandidateModulesForOperationV1,
   webGpuKernelCandidateBundleV1,
@@ -21,7 +21,7 @@ test("WGSL candidate dependency index keys every frozen tensor operation", () =>
   assert.equal(bundle.schemaVersion, 1);
   assert.match(bundle.bundleSha256, /^[0-9a-f]{64}$/);
   assert.deepEqual(Object.keys(bundle.candidateOperationModuleDependencies), expected);
-  assert.equal(expected.length, 31);
+  assert.equal(expected.length, 32);
   assert.ok(Object.isFrozen(bundle));
   assert.ok(Object.isFrozen(bundle.modules));
   assert.ok(Object.isFrozen(bundle.candidateOperationModuleDependencies));
@@ -76,7 +76,7 @@ test("WGSL candidate dependency index keys every frozen tensor operation", () =>
   );
 });
 
-test("WebGPU dispatch catalog covers all 57 frozen execution forms", () => {
+test("WebGPU dispatch catalog covers all 59 frozen execution forms", () => {
   const manifest = parseTrainingManifest(canonicalTrainingManifestJson());
   const expected = [];
   for (const operation of manifest.operations) {
@@ -88,12 +88,12 @@ test("WebGPU dispatch catalog covers all 57 frozen execution forms", () => {
         : ["forward"];
     for (const execution of executions) expected.push(`${operation.id}|${execution}`);
   }
-  const catalog = webGpuDispatchCatalogV1();
+  const catalog = webGpuDispatchCatalogV2();
   assert.equal(catalog.schemaId, "tritium.webgpu_dispatch_catalog");
-  assert.equal(catalog.schemaVersion, 1);
+  assert.equal(catalog.schemaVersion, 2);
   assert.match(catalog.sha256, /^[0-9a-f]{64}$/);
   assert.deepEqual(Object.keys(catalog.forms), expected);
-  assert.equal(expected.length, 57);
+  assert.equal(expected.length, 59);
   assert.ok(Object.isFrozen(catalog));
   assert.ok(Object.isFrozen(catalog.forms));
   for (const key of expected) {

@@ -3,8 +3,8 @@ import {
   parseTrainingManifest,
 } from "../../../bindings/typescript/src/training_manifest.ts";
 import {
-  TRAINING_MANIFEST_DIGEST_V1,
-  TRAINING_VECTOR_DIGEST_V1,
+  TRAINING_MANIFEST_DIGEST_V2,
+  TRAINING_VECTOR_DIGEST_V2,
 } from "./identity.ts";
 import {
   compilePortableCheckpointRequest,
@@ -103,7 +103,7 @@ function probeRequest(): PortableTrainingRequestV1 {
     physicalDevice: PHYSICAL_DEVICE,
     operation: "graph.add",
     execution: "forward",
-    vectorDigest: TRAINING_VECTOR_DIGEST_V1,
+    vectorDigest: TRAINING_VECTOR_DIGEST_V2,
     inputs: Object.freeze([scalar("left"), scalar("right")]),
     attributes: Object.freeze([]),
     outputs: Object.freeze([scalar("result")]),
@@ -132,8 +132,8 @@ function webReceipt(
     schemaId: "tritium.web_training_receipt",
     schemaVersion: 1,
     implementation: "wasm-fallback",
-    manifestDigest: TRAINING_MANIFEST_DIGEST_V1,
-    vectorDigest: TRAINING_VECTOR_DIGEST_V1,
+    manifestDigest: TRAINING_MANIFEST_DIGEST_V2,
+    vectorDigest: TRAINING_VECTOR_DIGEST_V2,
     buildId: capabilities.buildId,
     physicalDevice: capabilities.physicalDevice,
     operation,
@@ -264,8 +264,8 @@ class PortableWasmTrainingAdapter implements WebTrainingAdapterV1 {
       schemaId: "tritium.web_training_capabilities",
       schemaVersion: 1,
       implementation: "wasm-fallback",
-      manifestDigest: TRAINING_MANIFEST_DIGEST_V1,
-      vectorDigest: TRAINING_VECTOR_DIGEST_V1,
+      manifestDigest: TRAINING_MANIFEST_DIGEST_V2,
+      vectorDigest: TRAINING_VECTOR_DIGEST_V2,
       buildId: executor.buildId,
       physicalDevice: PHYSICAL_DEVICE,
       supportedOperations: Object.freeze(supportedOperations),

@@ -60,9 +60,9 @@ export interface WebGpuDispatchFormV1 {
   readonly stages: readonly WebGpuDispatchStageV1[];
 }
 
-export interface WebGpuDispatchCatalogV1 {
+export interface WebGpuDispatchCatalogV2 {
   readonly schemaId: "tritium.webgpu_dispatch_catalog";
-  readonly schemaVersion: 1;
+  readonly schemaVersion: 2;
   readonly sha256: string;
   readonly forms: Readonly<Record<string, WebGpuDispatchFormV1>>;
 }
@@ -75,9 +75,9 @@ const BUNDLE: WebGpuKernelCandidateBundleV1 = Object.freeze({
   candidateOperationModuleDependencies: WEBGPU_OPERATION_MODULE_DEPENDENCIES_V1,
 });
 
-const DISPATCH_CATALOG: WebGpuDispatchCatalogV1 = Object.freeze({
+const DISPATCH_CATALOG: WebGpuDispatchCatalogV2 = Object.freeze({
   schemaId: "tritium.webgpu_dispatch_catalog",
-  schemaVersion: 1,
+  schemaVersion: 2,
   sha256: WEBGPU_DISPATCH_CATALOG_SHA256_V1,
   forms: WEBGPU_DISPATCH_FORMS_V1,
 });
@@ -87,8 +87,8 @@ export function webGpuKernelCandidateBundleV1(): WebGpuKernelCandidateBundleV1 {
   return BUNDLE;
 }
 
-/** Return immutable 57-form WebGPU pipeline-stage metadata. */
-export function webGpuDispatchCatalogV1(): WebGpuDispatchCatalogV1 {
+/** Return immutable 59-form WebGPU pipeline-stage metadata. */
+export function webGpuDispatchCatalogV2(): WebGpuDispatchCatalogV2 {
   return DISPATCH_CATALOG;
 }
 

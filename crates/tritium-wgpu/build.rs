@@ -47,17 +47,17 @@ fn exact_fields(value: &Value, expected: &[&str], context: &str) {
 fn main() {
     tritium_build_info::emit_source_identity();
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("manifest dir"));
-    let catalog_path = manifest_dir.join("data/training/v1/webgpu-dispatch-v1.json");
-    let manifest_path = manifest_dir.join("data/training/v1/manifest.json");
+    let catalog_path = manifest_dir.join("data/training/v2/webgpu-dispatch-v2.json");
+    let manifest_path = manifest_dir.join("data/training/v2/manifest.json");
     println!("cargo:rerun-if-changed={}", catalog_path.display());
     println!("cargo:rerun-if-changed={}", manifest_path.display());
     let bytes = fs::read(&catalog_path).expect("read WebGPU dispatch catalog");
     let value: Value = serde_json::from_slice(&bytes).expect("parse dispatch catalog");
     exact_fields(&value, &["schema_id", "schema_version", "forms"], "catalog");
     assert_eq!(value["schema_id"], "tritium.webgpu_dispatch_catalog");
-    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["schema_version"], 2);
     let forms = value["forms"].as_array().expect("dispatch forms array");
-    assert_eq!(forms.len(), 57, "frozen WebGPU dispatch form count");
+    assert_eq!(forms.len(), 59, "frozen WebGPU dispatch form count");
 
     let manifest: Value =
         serde_json::from_slice(&fs::read(&manifest_path).expect("read portable training manifest"))

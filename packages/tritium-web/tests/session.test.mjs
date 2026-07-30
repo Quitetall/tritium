@@ -5,8 +5,8 @@ import {
   canonicalTrainingManifestJson,
   parseTrainingManifest,
   prepareTraining,
-  TRAINING_MANIFEST_DIGEST_V1,
-  TRAINING_VECTOR_DIGEST_V1,
+  TRAINING_MANIFEST_DIGEST_V2,
+  TRAINING_VECTOR_DIGEST_V2,
   WebTrainingError,
 } from "../dist/index.js";
 
@@ -82,8 +82,8 @@ function capabilities(implementation = "webgpu") {
     schemaId: "tritium.web_training_capabilities",
     schemaVersion: 1,
     implementation,
-    manifestDigest: TRAINING_MANIFEST_DIGEST_V1,
-    vectorDigest: TRAINING_VECTOR_DIGEST_V1,
+    manifestDigest: TRAINING_MANIFEST_DIGEST_V2,
+    vectorDigest: TRAINING_VECTOR_DIGEST_V2,
     buildId: "test-adapter-v1",
     physicalDevice: implementation === "webgpu" ? "test-gpu" : "test-wasm",
     supportedOperations: operations,
@@ -96,8 +96,8 @@ function receipt(operation, implementation = "webgpu", overrides = {}) {
     schemaId: "tritium.web_training_receipt",
     schemaVersion: 1,
     implementation,
-    manifestDigest: TRAINING_MANIFEST_DIGEST_V1,
-    vectorDigest: TRAINING_VECTOR_DIGEST_V1,
+    manifestDigest: TRAINING_MANIFEST_DIGEST_V2,
+    vectorDigest: TRAINING_VECTOR_DIGEST_V2,
     buildId: "test-adapter-v1",
     physicalDevice: implementation === "webgpu" ? "test-gpu" : "test-wasm",
     operation,
@@ -309,6 +309,61 @@ test("backend policy and manifest coverage fail before adapter preparation", asy
   };
   await assert.rejects(prepareTraining(model, config, validator), /invalid geometry/);
   assert.deepEqual(validator.calls, ["validate"]);
+});
+
+test("top-k sparse targets reject invalid values before adapter dispatch", async () => {
+  const topkModel = {
+    schemaId: "tritium.web_training_model",
+    schemaVersion: 1,
+    recipe: {
+      schemaId: "tritium.training_recipe",
+      schemaVersion: 1,
+      tensors: [
+        { id: "logits", dtype: "f32", shape: [1, 3], role: "batch", aliasOf: null },
+        { id: "indices", dtype: "u32", shape: [1, 2], role: "batch", aliasOf: null },
+        {
+          id: "probabilities",
+          dtype: "f32",
+          shape: [1, 2],
+          role: "batch",
+          aliasOf: null,
+        },
+        { id: "loss", dtype: "f32", shape: [], role: "result", aliasOf: null },
+      ],
+      operations: [{
+        id: "topk",
+        operation: "loss.topk_knowledge_distillation",
+        inputs: ["logits", "indices", "probabilities"],
+        outputs: ["loss"],
+        attributes: [
+          { name: "rows", kind: "u64", value: 1 },
+          { name: "cols", kind: "u64", value: 3 },
+          { name: "k", kind: "u64", value: 2 },
+        ],
+      }],
+    },
+    payload: Buffer.from([1]),
+  };
+  const adapter = new MockAdapter();
+  const session = await prepareTraining(topkModel, config, adapter);
+  const topkBatch = (indices, probabilities) => ({
+    inputs: {
+      logits: new Float32Array([1, 2, 3]),
+      indices: new Uint32Array(indices),
+      probabilities: new Float32Array(probabilities),
+    },
+  });
+  await rejectsCode(
+    session.forward(topkBatch([0, 3], [0.5, 0.5])),
+    "attribute_value.indices.in_range",
+  );
+  await rejectsCode(
+    session.forward(topkBatch([0, 2], [0.5, -0.5])),
+    "attribute_value.probabilities.finite_nonnegative",
+  );
+  assert.equal(session.state, "prepared");
+  assert.equal(adapter.calls.filter((call) => call === "forward").length, 0);
+  await session.dispose();
 });
 
 test("device loss during preparation returns a terminal failure receipt", async () => {

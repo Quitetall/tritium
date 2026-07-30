@@ -113,6 +113,19 @@ struct SoftmaxXentParams {
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct TopkKdParams {
+    rows: u32,
+    cols: u32,
+    k: u32,
+    execution: u32,
+    padding_0: f32,
+    padding_1: f32,
+    padding_2: f32,
+    padding_3: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 /// Validated grouped-convolution geometry for one native dispatch.
 pub(crate) struct ConvParams {
     pub(crate) batch: u32,
@@ -351,6 +364,8 @@ pub struct WgpuBackend {
     rope_bind_group_layout: wgpu::BindGroupLayout,
     softmax_xent_pipeline: wgpu::ComputePipeline,
     softmax_xent_bind_group_layout: wgpu::BindGroupLayout,
+    topk_kd_pipeline: wgpu::ComputePipeline,
+    topk_kd_bind_group_layout: wgpu::BindGroupLayout,
     conv_pipeline: wgpu::ComputePipeline,
     conv_bind_group_layout: wgpu::BindGroupLayout,
     attention_pipeline: wgpu::ComputePipeline,
@@ -851,6 +866,36 @@ impl WgpuBackend {
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
                     cache: None,
                 });
+            let topk_kd_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("portable-topk-kd"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("topk_kd.wgsl").into()),
+            });
+            let topk_kd_bind_group_layout =
+                device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("portable-topk-kd-bgl"),
+                    entries: &[
+                        entry(0, uni),
+                        entry(1, ro),
+                        entry(2, ro),
+                        entry(3, ro),
+                        entry(4, ro),
+                        entry(5, rw),
+                    ],
+                });
+            let topk_kd_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("portable-topk-kd-pl"),
+                bind_group_layouts: &[&topk_kd_bind_group_layout],
+                push_constant_ranges: &[],
+            });
+            let topk_kd_pipeline =
+                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("portable-topk-kd-pipe"),
+                    layout: Some(&topk_kd_layout),
+                    module: &topk_kd_shader,
+                    entry_point: Some("main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    cache: None,
+                });
             let conv_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("portable-conv"),
                 source: wgpu::ShaderSource::Wgsl(include_str!("conv.wgsl").into()),
@@ -946,6 +991,8 @@ impl WgpuBackend {
                 rope_bind_group_layout,
                 softmax_xent_pipeline,
                 softmax_xent_bind_group_layout,
+                topk_kd_pipeline,
+                topk_kd_bind_group_layout,
                 conv_pipeline,
                 conv_bind_group_layout,
                 attention_pipeline,
@@ -2938,6 +2985,156 @@ impl WgpuBackend {
         if let Some(error) = self.device.pop_error_scope().block_on() {
             return Err(BackendError::Backend(format!(
                 "wgpu softmax xent device error: {error}"
+            )));
+        }
+        rx.recv()
+            .map_err(|error| BackendError::Backend(format!("map channel: {error}")))?
+            .map_err(|error| BackendError::Backend(format!("buffer map: {error}")))?;
+        let data = slice.get_mapped_range();
+        let values = bytemuck::cast_slice(&data).to_vec();
+        drop(data);
+        staging.unmap();
+        Ok(values)
+    }
+
+    /// Execute sparse top-k knowledge-distillation forward or logits VJP on device.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn topk_kd(
+        &self,
+        logits: &[f32],
+        indices: &[u32],
+        probabilities: &[f32],
+        grad_output: &[f32],
+        rows: u32,
+        cols: u32,
+        k: u32,
+        backward: bool,
+    ) -> Result<Vec<f32>, BackendError> {
+        let dense_elements = (rows as usize)
+            .checked_mul(cols as usize)
+            .ok_or_else(|| BackendError::InvalidInput("top-k KD shape overflow".to_owned()))?;
+        let sparse_elements = (rows as usize)
+            .checked_mul(k as usize)
+            .ok_or_else(|| BackendError::InvalidInput("top-k KD shape overflow".to_owned()))?;
+        if logits.len() != dense_elements
+            || indices.len() != sparse_elements
+            || probabilities.len() != sparse_elements
+            || dense_elements == 0
+            || sparse_elements == 0
+            || grad_output.is_empty()
+            || (backward && grad_output.len() != 1)
+        {
+            return Err(BackendError::ShapeMismatch {
+                expected: dense_elements.max(sparse_elements),
+                got: logits.len(),
+            });
+        }
+        let params = TopkKdParams {
+            rows,
+            cols,
+            k,
+            execution: u32::from(backward),
+            padding_0: 0.0,
+            padding_1: 0.0,
+            padding_2: 0.0,
+            padding_3: 0.0,
+        };
+        let storage = wgpu::BufferUsages::STORAGE;
+        let params_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("portable-topk-kd-params"),
+                contents: bytemuck::bytes_of(&params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let f32_input = |label, values: &[f32]| {
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some(label),
+                    contents: bytemuck::cast_slice(values),
+                    usage: storage,
+                })
+        };
+        let logits_buf = f32_input("portable-topk-kd-logits", logits);
+        let indices_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("portable-topk-kd-indices"),
+                contents: bytemuck::cast_slice(indices),
+                usage: storage,
+            });
+        let probabilities_buf = f32_input("portable-topk-kd-probabilities", probabilities);
+        let grad_output_buf = f32_input("portable-topk-kd-grad-output", grad_output);
+        let output_len = if backward { dense_elements } else { 1 };
+        let bytes = (output_len * core::mem::size_of::<f32>()) as u64;
+        let result = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("portable-topk-kd-result"),
+            size: bytes,
+            usage: storage | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("portable-topk-kd-staging"),
+            size: bytes,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("portable-topk-kd-bg"),
+            layout: &self.topk_kd_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: logits_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: indices_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: probabilities_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: grad_output_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: result.as_entire_binding(),
+                },
+            ],
+        });
+        self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("portable-topk-kd-encoder"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("portable-topk-kd-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.topk_kd_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        encoder.copy_buffer_to_buffer(&result, 0, &staging, 0, bytes);
+        self.queue.submit(Some(encoder.finish()));
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |mapped| {
+            let _ = tx.send(mapped);
+        });
+        self.device.poll(wgpu::Maintain::Wait).panic_on_timeout();
+        if let Some(error) = self.device.pop_error_scope().block_on() {
+            return Err(BackendError::Backend(format!(
+                "wgpu top-k KD device error: {error}"
             )));
         }
         rx.recv()

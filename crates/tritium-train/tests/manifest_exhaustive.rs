@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use tritium_spec::TrainingOpManifestV1;
+use tritium_spec::TrainingOpManifestV2;
 
 const TAPE_METHODS: &[(&str, &str)] = &[
     ("ste_surrogate", "graph.ste_surrogate"),
@@ -30,6 +30,7 @@ const TAPE_METHODS: &[(&str, &str)] = &[
     ("rope", "graph.rope"),
     ("mse", "loss.mse"),
     ("softmax_xent", "loss.softmax_cross_entropy"),
+    ("topk_kd", "loss.topk_knowledge_distillation"),
 ];
 
 const OPTIMIZERS: &[(&str, &str)] = &[
@@ -84,7 +85,7 @@ fn every_public_tape_operation_has_one_frozen_manifest_id() {
         "public Tape surface changed; amend manifest mapping"
     );
 
-    let manifest: BTreeSet<_> = TrainingOpManifestV1::operations()
+    let manifest: BTreeSet<_> = TrainingOpManifestV2::operations()
         .iter()
         .map(|operation| operation.id)
         .collect();
@@ -106,7 +107,7 @@ fn every_optimizer_implementation_has_one_frozen_manifest_id() {
         "Optimizer implementation set changed; amend manifest mapping"
     );
 
-    let manifest: BTreeSet<_> = TrainingOpManifestV1::operations()
+    let manifest: BTreeSet<_> = TrainingOpManifestV2::operations()
         .iter()
         .map(|operation| operation.id)
         .collect();
@@ -120,7 +121,7 @@ fn every_optimizer_implementation_has_one_frozen_manifest_id() {
 
 #[test]
 fn lifecycle_registry_is_complete() {
-    let manifest: BTreeSet<_> = TrainingOpManifestV1::operations()
+    let manifest: BTreeSet<_> = TrainingOpManifestV2::operations()
         .iter()
         .map(|operation| operation.id)
         .collect();

@@ -1305,6 +1305,29 @@ extern "C" __global__ void softmax_xent_forward(
     loss[0] = total / (float)rows;
 }
 
+extern "C" __global__ void topk_kd_forward(
+    const float* __restrict__ logits, const unsigned int* __restrict__ indices,
+    const float* __restrict__ probabilities, float* __restrict__ loss,
+    int rows, int cols, int k)
+{
+    if (blockIdx.x || threadIdx.x) return;
+    float total = 0.0f;
+    for (int row = 0; row < rows; ++row) {
+        const float* lr = logits + (long)row * cols;
+        const unsigned int* ir = indices + (long)row * k;
+        const float* pr = probabilities + (long)row * k;
+        float maximum = -INFINITY;
+        for (int col = 0; col < cols; ++col) maximum = fmaxf(maximum, lr[col]);
+        float sum = 0.0f;
+        for (int col = 0; col < cols; ++col) sum += expf(lr[col] - maximum);
+        for (int sparse_col = 0; sparse_col < k; ++sparse_col) {
+            float probability = expf(lr[ir[sparse_col]] - maximum) / sum;
+            total -= pr[sparse_col] * logf(fmaxf(probability, 1.17549435e-38f));
+        }
+    }
+    loss[0] = total / (float)rows;
+}
+
 extern "C" __global__ void ste_surrogate_forward(
     const float* __restrict__ weight, const float* __restrict__ scale,
     float* __restrict__ result, int rows, int cols)
@@ -1926,5 +1949,33 @@ extern "C" __global__ void softmax_xent_backward(
     for (int c = 0; c < cols; ++c) {
         float p = expf(lr[c] - m) / sum;
         gr[c] = gscale * (p * sum_t - tr[c]);
+    }
+}
+
+extern "C" __global__ void topk_kd_backward(
+    const float* __restrict__ logits, const unsigned int* __restrict__ indices,
+    const float* __restrict__ probabilities, float* __restrict__ g_logits,
+    int rows, int cols, int k, float gscale)
+{
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= rows) return;
+    const float* lr = logits + (long)row * cols;
+    const unsigned int* ir = indices + (long)row * k;
+    const float* pr = probabilities + (long)row * k;
+    float* gr = g_logits + (long)row * cols;
+    float maximum = -INFINITY;
+    for (int col = 0; col < cols; ++col) maximum = fmaxf(maximum, lr[col]);
+    float sum = 0.0f;
+    for (int col = 0; col < cols; ++col) sum += expf(lr[col] - maximum);
+    float probability_sum = 0.0f;
+    for (int sparse_col = 0; sparse_col < k; ++sparse_col) {
+        probability_sum += pr[sparse_col];
+    }
+    for (int col = 0; col < cols; ++col) {
+        float probability = expf(lr[col] - maximum) / sum;
+        gr[col] = gscale * probability * probability_sum;
+    }
+    for (int sparse_col = 0; sparse_col < k; ++sparse_col) {
+        gr[ir[sparse_col]] -= gscale * pr[sparse_col];
     }
 }

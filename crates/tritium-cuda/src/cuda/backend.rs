@@ -657,6 +657,7 @@ pub struct CudaBackend {
     /// ADR 0027 Track B: deterministic segmented embedding gradient.
     pub(super) func_embed_gather_bwd_segmented: CudaFunction,
     pub(super) func_softmax_xent_bwd: CudaFunction,
+    pub(super) func_topk_kd_bwd: CudaFunction,
     pub(super) func_scale_const: CudaFunction,
     pub(super) func_bias_fwd: CudaFunction,
     pub(super) func_bias_bwd: CudaFunction,
@@ -665,6 +666,7 @@ pub struct CudaBackend {
     pub(super) func_mse_fwd: CudaFunction,
     pub(super) func_mse_bwd: CudaFunction,
     pub(super) func_softmax_xent_fwd: CudaFunction,
+    pub(super) func_topk_kd_fwd: CudaFunction,
     pub(super) func_ste_fwd: CudaFunction,
     pub(super) func_ste_bwd: CudaFunction,
     pub(super) func_lsq_fwd: CudaFunction,
@@ -931,6 +933,9 @@ impl CudaBackend {
         let func_softmax_xent_bwd = grad_module
             .load_function(KERNEL_NAME_SOFTMAX_XENT_BWD)
             .map_err(|e| driver_err("resolve softmax_xent_backward kernel", &e))?;
+        let func_topk_kd_bwd = grad_module
+            .load_function(KERNEL_NAME_TOPK_KD_BWD)
+            .map_err(|e| driver_err("resolve topk_kd_backward kernel", &e))?;
         let func_scale_const = grad_module
             .load_function(KERNEL_NAME_SCALE_CONST)
             .map_err(|e| driver_err("resolve scale_const kernel", &e))?;
@@ -955,6 +960,9 @@ impl CudaBackend {
         let func_softmax_xent_fwd = grad_module
             .load_function(KERNEL_NAME_SOFTMAX_XENT_FWD)
             .map_err(|e| driver_err("resolve softmax_xent_forward kernel", &e))?;
+        let func_topk_kd_fwd = grad_module
+            .load_function(KERNEL_NAME_TOPK_KD_FWD)
+            .map_err(|e| driver_err("resolve topk_kd_forward kernel", &e))?;
         let func_ste_fwd = grad_module
             .load_function(KERNEL_NAME_STE_FWD)
             .map_err(|e| driver_err("resolve ste_surrogate_forward kernel", &e))?;
@@ -1114,6 +1122,7 @@ impl CudaBackend {
             func_embed_gather_bwd,
             func_embed_gather_bwd_segmented,
             func_softmax_xent_bwd,
+            func_topk_kd_bwd,
             func_scale_const,
             func_bias_fwd,
             func_bias_bwd,
@@ -1122,6 +1131,7 @@ impl CudaBackend {
             func_mse_fwd,
             func_mse_bwd,
             func_softmax_xent_fwd,
+            func_topk_kd_fwd,
             func_ste_fwd,
             func_ste_bwd,
             func_lsq_fwd,
@@ -4027,6 +4037,62 @@ impl CudaBackend {
         Ok(())
     }
 
+    pub(crate) fn topk_kd_forward_dev(
+        &self,
+        logits: &CudaSlice<f32>,
+        indices: &CudaSlice<u32>,
+        probabilities: &CudaSlice<f32>,
+        loss: &mut CudaSlice<f32>,
+        rows: usize,
+        cols: usize,
+        k: usize,
+    ) -> Result<(), BackendError> {
+        let dense = rows.checked_mul(cols).ok_or_else(|| {
+            BackendError::InvalidInput("top-k KD geometry overflows usize".into())
+        })?;
+        let sparse = rows.checked_mul(k).ok_or_else(|| {
+            BackendError::InvalidInput("top-k KD geometry overflows usize".into())
+        })?;
+        if rows == 0
+            || cols == 0
+            || k == 0
+            || logits.len() < dense
+            || indices.len() < sparse
+            || probabilities.len() < sparse
+            || loss.is_empty()
+        {
+            return Err(BackendError::ShapeMismatch {
+                expected: dense.max(sparse).max(1),
+                got: loss.len(),
+            });
+        }
+        let (rows, cols, k) = (
+            i32::try_from(rows)
+                .map_err(|_| BackendError::InvalidInput("top-k KD rows exceed i32".into()))?,
+            i32::try_from(cols)
+                .map_err(|_| BackendError::InvalidInput("top-k KD cols exceed i32".into()))?,
+            i32::try_from(k)
+                .map_err(|_| BackendError::InvalidInput("top-k KD k exceeds i32".into()))?,
+        );
+        let mut launch = self.stream.launch_builder(&self.func_topk_kd_fwd);
+        launch
+            .arg(logits)
+            .arg(indices)
+            .arg(probabilities)
+            .arg(loss)
+            .arg(&rows)
+            .arg(&cols)
+            .arg(&k);
+        #[allow(unsafe_code)]
+        // SAFETY: validated dense/sparse spans; exactly one deterministic reduction thread.
+        unsafe {
+            launch
+                .launch(Self::elementwise_cfg(1))
+                .map_err(|e| driver_err("launch topk_kd_forward_dev", &e))?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn ste_surrogate_forward_dev(
         &self,
         weight: &CudaSlice<f32>,
@@ -4889,6 +4955,64 @@ impl CudaBackend {
             launch
                 .launch(Self::elementwise_cfg(rows))
                 .map_err(|e| driver_err("launch softmax_xent_backward_dev", &e))?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn topk_kd_backward_dev(
+        &self,
+        logits: &CudaSlice<f32>,
+        indices: &CudaSlice<u32>,
+        probabilities: &CudaSlice<f32>,
+        grad_logits: &mut CudaSlice<f32>,
+        rows: usize,
+        cols: usize,
+        k: usize,
+        gscale: f32,
+    ) -> Result<(), BackendError> {
+        let dense = rows.checked_mul(cols).ok_or_else(|| {
+            BackendError::InvalidInput("top-k KD geometry overflows usize".into())
+        })?;
+        let sparse = rows.checked_mul(k).ok_or_else(|| {
+            BackendError::InvalidInput("top-k KD geometry overflows usize".into())
+        })?;
+        if rows == 0
+            || cols == 0
+            || k == 0
+            || logits.len() < dense
+            || indices.len() < sparse
+            || probabilities.len() < sparse
+            || grad_logits.len() < dense
+        {
+            return Err(BackendError::ShapeMismatch {
+                expected: dense.max(sparse),
+                got: grad_logits.len(),
+            });
+        }
+        let (rows_i32, cols_i32, k_i32) = (
+            i32::try_from(rows)
+                .map_err(|_| BackendError::InvalidInput("top-k KD rows exceed i32".into()))?,
+            i32::try_from(cols)
+                .map_err(|_| BackendError::InvalidInput("top-k KD cols exceed i32".into()))?,
+            i32::try_from(k)
+                .map_err(|_| BackendError::InvalidInput("top-k KD k exceeds i32".into()))?,
+        );
+        let mut launch = self.stream.launch_builder(&self.func_topk_kd_bwd);
+        launch
+            .arg(logits)
+            .arg(indices)
+            .arg(probabilities)
+            .arg(grad_logits)
+            .arg(&rows_i32)
+            .arg(&cols_i32)
+            .arg(&k_i32)
+            .arg(&gscale);
+        #[allow(unsafe_code)]
+        // SAFETY: validated dense/sparse spans; one thread owns each output row.
+        unsafe {
+            launch
+                .launch(Self::elementwise_cfg(rows))
+                .map_err(|e| driver_err("launch topk_kd_backward_dev", &e))?;
         }
         Ok(())
     }

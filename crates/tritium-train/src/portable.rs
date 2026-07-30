@@ -8,7 +8,7 @@ use tritium_format::salt_v2_package::SaltV2PackageReader;
 use tritium_spec::{
     TrainAttributeValueV1, TrainBackendError, TrainBackendV1, TrainBufferDataMutV1,
     TrainBufferDataRefV1, TrainCapabilitiesV1, TrainDTypeV1, TrainExecutionV1, TrainLimitsV1,
-    TrainOperationErrorV1, TrainOutputV1, TrainReceiptV1, TrainRequestV1, TrainingOpManifestV1,
+    TrainOperationErrorV1, TrainOutputV1, TrainReceiptV1, TrainRequestV1, TrainingOpManifestV2,
     train_output_digest_v1, train_request_digest_v1,
 };
 
@@ -63,6 +63,7 @@ enum CpuOperation {
     Attention,
     Mse,
     SoftmaxCrossEntropy,
+    TopkKnowledgeDistillation,
     Sgd,
     AdamW,
     CautiousAdamW,
@@ -184,6 +185,10 @@ const CPU_OPERATIONS: &[CpuOperationEntry] = &[
     CpuOperationEntry {
         id: "loss.softmax_cross_entropy",
         operation: CpuOperation::SoftmaxCrossEntropy,
+    },
+    CpuOperationEntry {
+        id: "loss.topk_knowledge_distillation",
+        operation: CpuOperation::TopkKnowledgeDistillation,
     },
     CpuOperationEntry {
         id: "optimizer.sgd",
@@ -489,6 +494,16 @@ const SOFTMAX_XENT_VJP: OperationSchema = OperationSchema {
     attributes: &["rows", "cols"],
     outputs: &["grad_logits"],
 };
+const TOPK_KD_FORWARD: OperationSchema = OperationSchema {
+    inputs: &["logits", "indices", "probabilities"],
+    attributes: &["rows", "cols", "k"],
+    outputs: &["result"],
+};
+const TOPK_KD_VJP: OperationSchema = OperationSchema {
+    inputs: &["logits", "indices", "probabilities", "grad_output"],
+    attributes: &["rows", "cols", "k"],
+    outputs: &["grad_logits"],
+};
 const SGD_STEP: OperationSchema = OperationSchema {
     inputs: &["parameter", "gradient"],
     attributes: &["step", "lr"],
@@ -561,7 +576,7 @@ impl TrainBackendV1 for CpuTrainBackendV1 {
     fn capabilities(&self) -> TrainCapabilitiesV1 {
         TrainCapabilitiesV1 {
             backend_id: BACKEND_ID.to_owned(),
-            manifest_digest: TrainingOpManifestV1::digest(),
+            manifest_digest: TrainingOpManifestV2::digest(),
             supported_operations: CPU_OPERATIONS
                 .iter()
                 .map(|operation| operation.id.to_owned())
@@ -755,6 +770,12 @@ impl TrainBackendV1 for CpuTrainBackendV1 {
             (CpuOperation::SoftmaxCrossEntropy, TrainExecutionV1::Vjp) => {
                 softmax_xent_vjp(&request, output)?;
             }
+            (CpuOperation::TopkKnowledgeDistillation, TrainExecutionV1::Forward) => {
+                topk_kd_forward(&request, output)?;
+            }
+            (CpuOperation::TopkKnowledgeDistillation, TrainExecutionV1::Vjp) => {
+                topk_kd_vjp(&request, output)?;
+            }
             (CpuOperation::Sgd, TrainExecutionV1::Step) => sgd_step(&request, output)?,
             (CpuOperation::AdamW, TrainExecutionV1::Step) => adamw_step(&request, output)?,
             (CpuOperation::CautiousAdamW, TrainExecutionV1::Step) => {
@@ -787,7 +808,7 @@ impl TrainBackendV1 for CpuTrainBackendV1 {
             backend_id: BACKEND_ID.to_owned(),
             backend_build: backend_build_identity(),
             physical_device: Some(cpu_physical_device().to_owned()),
-            manifest_digest: TrainingOpManifestV1::digest(),
+            manifest_digest: TrainingOpManifestV2::digest(),
             vector_digest: request.vector_digest,
             operation: request.operation.to_owned(),
             execution: request.execution,
@@ -2282,6 +2303,146 @@ fn softmax_xent_vjp(
         for column in 0..cols_usize {
             let index = row_start + column;
             grad_logits[index] = upstream * (grad_logits[index] * target_sum - target[index]);
+        }
+    }
+    Ok(())
+}
+
+fn topk_kd_geometry(
+    request: &TrainRequestV1<'_>,
+) -> Result<(u64, u64, u64, usize, usize, usize), TrainBackendError> {
+    let (rows, cols, rows_usize, cols_usize) = matrix_attributes(request)?;
+    let k = attribute_u64(request, "k")?;
+    let k_usize = usize::try_from(k).map_err(|_| attribute_value("k", "usize"))?;
+    if rows_usize == 0 {
+        return Err(attribute_value("rows", "positive"));
+    }
+    if cols_usize == 0 {
+        return Err(attribute_value("cols", "positive"));
+    }
+    if k_usize == 0 {
+        return Err(attribute_value("k", "positive"));
+    }
+    if k_usize > cols_usize {
+        return Err(attribute_value("k", "at_most_cols"));
+    }
+    rows_usize
+        .checked_mul(k_usize)
+        .ok_or_else(|| attribute_value("rows", "rows_times_k"))?;
+    Ok((rows, cols, k, rows_usize, cols_usize, k_usize))
+}
+
+struct TopkKdInputs<'a> {
+    logits: &'a [f32],
+    indices: &'a [u32],
+    probabilities: &'a [f32],
+    rows: usize,
+    cols: usize,
+    k: usize,
+}
+
+fn topk_kd_inputs<'a>(
+    request: &'a TrainRequestV1<'a>,
+) -> Result<TopkKdInputs<'a>, TrainBackendError> {
+    let (logits_shape, logits) = input_f32(request, "logits")?;
+    let (indices_shape, indices) = input_u32(request, "indices")?;
+    let (probabilities_shape, probabilities) = input_f32(request, "probabilities")?;
+    let (rows, cols, k, rows_usize, cols_usize, k_usize) = topk_kd_geometry(request)?;
+    if logits_shape != [rows, cols]
+        || indices_shape != [rows, k]
+        || probabilities_shape != [rows, k]
+    {
+        return Err(shape_error());
+    }
+    reject_nonfinite("logits", logits)?;
+    reject_nonfinite("probabilities", probabilities)?;
+    if probabilities.iter().any(|&probability| probability < 0.0) {
+        return Err(attribute_value("probabilities", "nonnegative"));
+    }
+    if indices.iter().any(|&index| u64::from(index) >= cols) {
+        return Err(attribute_value("indices", "in_range"));
+    }
+    Ok(TopkKdInputs {
+        logits,
+        indices,
+        probabilities,
+        rows: rows_usize,
+        cols: cols_usize,
+        k: k_usize,
+    })
+}
+
+fn topk_kd_forward(
+    request: &TrainRequestV1<'_>,
+    output: &mut TrainOutputV1<'_>,
+) -> Result<(), TrainBackendError> {
+    require_contract(request, output, &TOPK_KD_FORWARD)?;
+    let TopkKdInputs {
+        logits,
+        indices,
+        probabilities,
+        rows,
+        cols,
+        k,
+    } = topk_kd_inputs(request)?;
+    require_f32_output(output, "result", &[])?;
+    let mut loss = 0.0_f32;
+    for row in 0..rows {
+        let logits_start = row * cols;
+        let sparse_start = row * k;
+        let logits_row = &logits[logits_start..logits_start + cols];
+        let maximum = logits_row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let sum = logits_row
+            .iter()
+            .map(|value| (*value - maximum).exp())
+            .sum::<f32>();
+        for sparse_column in 0..k {
+            let column = indices[sparse_start + sparse_column] as usize;
+            let probability = (logits_row[column] - maximum).exp() / sum;
+            loss -= probabilities[sparse_start + sparse_column]
+                * probability.max(f32::MIN_POSITIVE).ln();
+        }
+    }
+    output_f32(output, "result")?[0] = loss / rows as f32;
+    Ok(())
+}
+
+fn topk_kd_vjp(
+    request: &TrainRequestV1<'_>,
+    output: &mut TrainOutputV1<'_>,
+) -> Result<(), TrainBackendError> {
+    require_contract(request, output, &TOPK_KD_VJP)?;
+    let TopkKdInputs {
+        logits,
+        indices,
+        probabilities,
+        rows,
+        cols,
+        k,
+    } = topk_kd_inputs(request)?;
+    let (grad_shape, grad_output) = input_f32(request, "grad_output")?;
+    if !grad_shape.is_empty() {
+        return Err(shape_error());
+    }
+    reject_nonfinite("grad_output", grad_output)?;
+    require_f32_output(output, "grad_logits", &[rows as u64, cols as u64])?;
+    let grad_logits = output_f32(output, "grad_logits")?;
+    softmax_rows_into(logits, rows, cols, grad_logits);
+    let upstream = grad_output[0] / rows as f32;
+    for row in 0..rows {
+        let logits_start = row * cols;
+        let sparse_start = row * k;
+        let probability_sum = probabilities[sparse_start..sparse_start + k]
+            .iter()
+            .sum::<f32>();
+        for column in 0..cols {
+            let index = logits_start + column;
+            grad_logits[index] *= upstream * probability_sum;
+        }
+        for sparse_column in 0..k {
+            let column = indices[sparse_start + sparse_column] as usize;
+            grad_logits[logits_start + column] -=
+                upstream * probabilities[sparse_start + sparse_column];
         }
     }
     Ok(())

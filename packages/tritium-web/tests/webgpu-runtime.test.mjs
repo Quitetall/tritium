@@ -6,7 +6,7 @@ import {
   createWebGpuTrainingAdapter,
   encodeWebTrainingPayload,
   prepareTraining,
-  TRAINING_MANIFEST_DIGEST_V1,
+  TRAINING_MANIFEST_DIGEST_V2,
   WebGpuResidentRuntimeV1,
   WebTrainingError,
 } from "../dist/index.js";
@@ -607,7 +607,7 @@ test("ordered phase submission copies a produced value only after its producer d
   const dependentPlan = {
     schemaId: "tritium.compiled_training_plan",
     schemaVersion: 1,
-    manifestDigest: TRAINING_MANIFEST_DIGEST_V1,
+    manifestDigest: TRAINING_MANIFEST_DIGEST_V2,
     buffers,
     operations: [
       { id: "produce", operation: "graph.add", inputs: ["left", "right"], outputs: ["produced"], attributes: [] },
@@ -1147,7 +1147,7 @@ test("resident int8 AdamW binds each auto-layout entry point exactly", async () 
   const int8Plan = {
     schemaId: "tritium.compiled_training_plan",
     schemaVersion: 1,
-    manifestDigest: TRAINING_MANIFEST_DIGEST_V1,
+    manifestDigest: TRAINING_MANIFEST_DIGEST_V2,
     buffers,
     operations: [{
       id: "int8-step",

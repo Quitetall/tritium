@@ -44,7 +44,7 @@ class BrowserTrainingReceiptTests(unittest.TestCase):
                         "max_compute_workgroups_per_dimension": 65535,
                         "max_storage_buffers_per_shader_stage": 10,
                     },
-                    "case_counts": {"valid": 70, "invalid": 44, "skipped": 0},
+                    "case_counts": {"valid": 72, "invalid": 45, "skipped": 0},
                     "lifecycle": {
                         "prepare": True,
                         "forward": True,
@@ -113,7 +113,7 @@ class BrowserTrainingReceiptTests(unittest.TestCase):
                 lambda value: value["lanes"][1]["case_counts"].__setitem__(
                     "invalid", 43
                 ),
-                "114",
+                "117",
             ),
             (
                 lambda value: value["lanes"][2]["faults"].__setitem__(

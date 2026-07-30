@@ -4,7 +4,7 @@ use tritium_spec::{
     TrainAttributeV1, TrainAttributeValueV1, TrainBackendError, TrainBackendV1,
     TrainBufferDataMutV1, TrainBufferDataRefV1, TrainDTypeV1, TrainExecutionV1,
     TrainNamedBufferMutV1, TrainNamedBufferRefV1, TrainOutputV1, TrainRequestV1,
-    TrainingOpManifestV1,
+    TrainingOpManifestV2,
 };
 use tritium_train::CpuTrainBackendV1;
 
@@ -45,6 +45,7 @@ fn cpu_add_forward_and_vjp_match_literal_vectors_and_emit_receipts() {
             "graph.attention",
             "loss.mse",
             "loss.softmax_cross_entropy",
+            "loss.topk_knowledge_distillation",
             "optimizer.sgd",
             "optimizer.adamw",
             "optimizer.cautious_adamw",
@@ -56,7 +57,7 @@ fn cpu_add_forward_and_vjp_match_literal_vectors_and_emit_receipts() {
             "lifecycle.reload",
         ]
     );
-    assert_eq!(capabilities.manifest_digest, TrainingOpManifestV1::digest());
+    assert_eq!(capabilities.manifest_digest, TrainingOpManifestV2::digest());
 
     let left = [1.0_f32, -2.0, 0.5];
     let right = [3.0_f32, 4.0, -1.5];

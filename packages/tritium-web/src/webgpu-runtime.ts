@@ -1,7 +1,7 @@
 import type { CompiledTrainingPlanV1 } from "./session.ts";
 import { WebTrainingError } from "./session.ts";
 import {
-  webGpuDispatchCatalogV1,
+  webGpuDispatchCatalogV2,
   webGpuDispatchFormV1,
   webGpuKernelCandidateBundleV1,
 } from "./webgpu-kernels.ts";
@@ -351,7 +351,7 @@ export class WebGpuResidentRuntimeV1 {
       }
       reachableForms.add(`${operation.operation}|${operation.execution}`);
     }
-    const catalogForms = webGpuDispatchCatalogV1().forms;
+    const catalogForms = webGpuDispatchCatalogV2().forms;
     for (const form of reachableForms) {
       if (catalogForms[form] === undefined) {
         fail("invalid_schema", `compiled plan references unknown WebGPU form ${form}`);

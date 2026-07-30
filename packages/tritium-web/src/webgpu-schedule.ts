@@ -64,6 +64,7 @@ const SPECIALIZED = new Set([
   "graph.conv2d",
   "graph.attention",
   "loss.softmax_cross_entropy",
+  "loss.topk_knowledge_distillation",
   "optimizer.sgd",
   "optimizer.adamw",
   "optimizer.cautious_adamw",
@@ -1026,6 +1027,70 @@ export function compileWebGpuResidentScheduleV1(
             "softmax_xent",
             params,
             { 1: logits, 2: target, 3: gradOutput, 4: result },
+            [1, 1, 1],
+          )]),
+          copies: Object.freeze([]),
+        });
+      }
+      case "loss.topk_knowledge_distillation|forward":
+      case "loss.topk_knowledge_distillation|vjp": {
+        const rows = positiveU32(attributes.rows, "rows");
+        const cols = positiveU32(attributes.cols, "cols");
+        const k = positiveU32(attributes.k, "k");
+        product("top-k knowledge distillation logits", rows, cols);
+        product("top-k knowledge distillation sparse target", rows, k);
+        if (k > cols) fail("invalid_schema", "top-k knowledge distillation k exceeds cols");
+        const logits = requiredWebGpuRoleV1(input, "logits");
+        const indices = requiredWebGpuRoleV1(input, "indices");
+        const probabilities = requiredWebGpuRoleV1(input, "probabilities");
+        const gradOutput = invocation.execution === "forward"
+          ? logits
+          : requiredWebGpuRoleV1(input, "grad_output");
+        const result = requiredWebGpuRoleV1(
+          output,
+          invocation.execution === "forward" ? "result" : "grad_logits",
+        );
+        expect(buffers, logits, "f32", [rows, cols], "top-k logits");
+        expect(buffers, indices, "u32", [rows, k], "top-k indices");
+        expect(buffers, probabilities, "f32", [rows, k], "top-k probabilities");
+        expect(
+          buffers,
+          gradOutput,
+          "f32",
+          invocation.execution === "forward" ? [rows, cols] : [],
+          "top-k cotangent",
+        );
+        expect(
+          buffers,
+          result,
+          "f32",
+          invocation.execution === "forward" ? [] : [rows, cols],
+          "top-k result",
+        );
+        requireDisjointWrites(
+          buffers,
+          [logits, indices, probabilities, gradOutput],
+          [result],
+          invocation.operation,
+        );
+        const params = uniform(32, (view) => {
+          view.setUint32(0, rows, true);
+          view.setUint32(4, cols, true);
+          view.setUint32(8, k, true);
+          view.setUint32(12, Number(invocation.execution === "vjp"), true);
+        });
+        return Object.freeze({
+          commands: Object.freeze([stage(
+            invocation,
+            "topk_kd",
+            params,
+            {
+              1: logits,
+              2: indices,
+              3: probabilities,
+              4: gradOutput,
+              5: result,
+            },
             [1, 1, 1],
           )]),
           copies: Object.freeze([]),

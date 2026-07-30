@@ -43,7 +43,7 @@ export interface PortableTrainingRequestV1 {
   readonly operation: string;
   readonly execution: PortableExecutionV1;
   readonly vectorDigest:
-    | "fcb250733b991aac165871f8c54b0b063337a3ed01bd1da02de220916887fbd6"
+    | "38b17f4c76c1d2f85cb35c713652a3d77627d02ba47933d2c8f31a88e0c594a7"
     | null;
   readonly inputs: readonly PortableBufferV1[];
   readonly attributes: readonly PortableAttributeV1[];
@@ -55,9 +55,9 @@ export interface PortableTrainingReceiptV1 {
   readonly backendBuild: string;
   readonly physicalDevice: string;
   readonly manifestDigest:
-    "aefb352d04db145e48394b392a106ab0ad831e09e62d8c76ceddedb36a564083";
+    "9093a1a7f9a3422c399943782aadf4df6b11833cf2253db0db56ff2d9dedb098";
   readonly vectorDigest:
-    | "fcb250733b991aac165871f8c54b0b063337a3ed01bd1da02de220916887fbd6"
+    | "38b17f4c76c1d2f85cb35c713652a3d77627d02ba47933d2c8f31a88e0c594a7"
     | null;
   readonly operation: string;
   readonly execution: PortableExecutionV1;
@@ -104,9 +104,9 @@ export interface PortableWasmConformanceReceiptV1 {
   readonly guestDigest: string;
   readonly executionDigest: string;
   readonly manifestDigest:
-    "aefb352d04db145e48394b392a106ab0ad831e09e62d8c76ceddedb36a564083";
+    "9093a1a7f9a3422c399943782aadf4df6b11833cf2253db0db56ff2d9dedb098";
   readonly vectorDigest:
-    "fcb250733b991aac165871f8c54b0b063337a3ed01bd1da02de220916887fbd6";
+    "38b17f4c76c1d2f85cb35c713652a3d77627d02ba47933d2c8f31a88e0c594a7";
   readonly operationCount: number;
   readonly caseCount: number;
   readonly maxCallerBytes: number;

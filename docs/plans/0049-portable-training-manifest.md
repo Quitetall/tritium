@@ -15,6 +15,15 @@ Freeze one language-neutral `TrainingOpManifestV1`, one fallible
 backend must execute that same corpus without hidden host execution. Receipts,
 not compile success or skipped tests, prove support.
 
+### V1 to V2 migration
+
+V1 remains byte-frozen at 35 operations and 114 cases. Sparse top-k knowledge
+distillation changes operation and conformance-vector registries, so current
+writes use `TrainingOpManifestV2`, vector schema V2 and WebGPU dispatch catalog
+V2 under `spec/training/v2/`. Rust retains strict V1 readers and exact V1
+canonical bytes. Backends, receipts and generated browser/Python/TypeScript
+bindings target V2. V1 artifacts never receive silent regeneration.
+
 This plan owns semantic portability. Plan 0050 owns browser product packaging
 and WebGPU session orchestration; plan 0051 owns public package publication.
 
@@ -34,8 +43,10 @@ is the seam shared by training and all backend adapters; no backend
 implementation enters that crate. `tritium-train` owns reference semantics and
 the CPU reference adapter. Device crates own their adapters.
 
-Canonical fixtures live under `spec/training/v1/`. Source-tree tests read that
-one copy; packaged copies must be byte-identical and digest-verified. Divergent
+Canonical fixtures live under versioned `spec/training/v1/` and
+`spec/training/v2/` roots. Source-tree tests read current V2 bytes while
+compatibility tests preserve exact V1 reads. Packaged copies
+must be byte-identical and digest-verified. Divergent
 generated fixtures are forbidden.
 
 Stable interface:
@@ -87,7 +98,8 @@ operations declare mutation and checkpoint planes explicitly.
 - `graph.conv1d`, `graph.conv2d`
 - `graph.relu2`, `graph.silu`, `graph.rmsnorm`, `graph.softmax`
 - `graph.causal_mask`, `graph.rope`, `graph.attention`
-- `loss.mse`, `loss.softmax_cross_entropy`
+- `loss.mse`, `loss.softmax_cross_entropy`,
+  `loss.topk_knowledge_distillation`
 
 ### Optimizer and lifecycle
 
@@ -113,14 +125,15 @@ canonical JSON. Python passed the complete 92-test suite; Deno type-check and
 three parser tests passed. Slice 2 and the CPU semantic matrix are complete;
 accelerator adapters are next.
 
-The Slice 2 tracer corpus now carries 114 cases across all 35 operations. In
+The Slice 2 tracer corpus now carries 117 cases across all 36 operations. In
 addition to the primitive and shape clusters, it covers `graph.ste_surrogate`,
 bounded multi-plane `graph.salt_ste`, `graph.lsq_ste`, configurable `graph.fsq`,
 grouped/depthwise asymmetric `graph.conv1d` and `graph.conv2d`, `graph.dense_matmul`,
 scale-bearing `graph.ternary_matmul`, `graph.rmsnorm`, row-wise `graph.softmax`,
 `graph.causal_mask`, zero-scratch `graph.rope` with target-independent `u32`
 positions, and projection-free causal/noncausal grouped-query
-`graph.attention`, plus `loss.softmax_cross_entropy` forward/VJP semantics,
+`graph.attention`, plus `loss.softmax_cross_entropy` and sparse top-k knowledge
+distillation forward/VJP semantics,
 `graph.transpose`, repeated
 `graph.embedding_gather`, `graph.slice_cols`, and dynamic-role
 `graph.concat_cols`, each in forward and VJP phases. Stateful vectors exercise
@@ -139,11 +152,12 @@ This closes Slice 2 corpus coverage and the CPU semantic matrix; accelerator and
 constrained-target receipts remain required for release closure.
 
 CUDA adapter work has started against the same seam. Current actual-RTX-4090
-evidence covers all 114 canonical cases across 35/35 operations: STE surrogate, SALT
+evidence covers all 117 canonical cases across 36/36 operations: STE surrogate, SALT
 STE, LSQ, FSQ, dense and scale-bearing ternary matmul, transpose, embedding,
 column slice/concat, detach,
 scale, bias, add, multiply, ReLU2, SiLU, RMSNorm, softmax, causal mask, and RoPE.
-MSE and softmax cross-entropy forward/VJP plus SGD, AdamW, cautious AdamW, and
+MSE, softmax cross-entropy and sparse top-k distillation forward/VJP plus SGD,
+AdamW, cautious AdamW, and
 blockwise int8 AdamW steps are resident as well. Cautious AdamW uses a resident
 two-pass masked update; int8 AdamW keeps blockwise moments and scales resident.
 Muon uses a deterministic resident Newton--Schulz kernel with bounded global
@@ -167,16 +181,18 @@ the CUDA semantic matrix itself is complete.
 
 The constrained WASI/WASM adapter is complete for the frozen corpus. It compiles
 the deterministic scalar semantic executor into the guest rather than calling a
-host fallback, advertises all 35 operations, enforces 8 MiB per-buffer and
+host fallback, advertises all 36 operations, enforces 8 MiB per-buffer and
 64 MiB aggregate caller-payload ceilings before mutation, and rebinds receipts
 to the actual engine identity. Native structural tests and an actual
-`wasm32-wasip1` run under wasmtime 46.0.0/Cranelift both pass all 114 cases.
+`wasm32-wasip1` run under wasmtime 46.0.0/Cranelift both pass all 117 cases.
 This closes WASI/WASM semantic parity; browser WASM packaging remains plan 0050,
 and MCU constrained-target parity remains open.
 
 Native wgpu work has begun on the RTX 4090 Vulkan adapter. Current evidence
-covers all 114 vectors and 35 operations across STE surrogate, multi-plane SALT STE, LSQ, FSQ, dense and scale-bearing ternary matmul, embedding gather, transpose, column slice/concat, detach, constant scale, bias, add, multiply, grouped Conv1d/Conv2d and grouped-query attention forward and VJP, ReLU2,
-SiLU, RMSNorm, causal masking, RoPE, row softmax, MSE and softmax cross-entropy losses, SGD, AdamW, cautious AdamW, int8 AdamW, Muon, and all four lifecycle operations. Pointwise tensor work executes through resident WGSL
+covers all 117 vectors and 36 operations across STE surrogate, multi-plane SALT STE, LSQ, FSQ, dense and scale-bearing ternary matmul, embedding gather, transpose, column slice/concat, detach, constant scale, bias, add, multiply, grouped Conv1d/Conv2d and grouped-query attention forward and VJP, ReLU2,
+SiLU, RMSNorm, causal masking, RoPE, row softmax, MSE, softmax cross-entropy and
+sparse top-k distillation losses, SGD, AdamW, cautious AdamW, int8 AdamW, Muon,
+and all four lifecycle operations. Pointwise tensor work executes through resident WGSL
 storage buffers; lifecycle uses the shared canonical control-plane byte
 implementation. AdamW uses ordered storage passes to preserve the frozen f32
 rounding points without a host tensor roundtrip; cautious AdamW adds a native
@@ -203,7 +219,7 @@ scratch ledger. Admission requires a separately trusted expected bundle digest
 and rejects unknown/noncanonical JSON, partial or reordered coverage,
 anonymous/nonresident targets, request/resident-byte drift, scratch overruns and
 duplicate backend identities. Capability Markdown is generated only from
-content-addressed admitted bundles. The CPU example sealed and reopened 114/114
+content-addressed admitted bundles. The CPU example sealed and reopened 117/117
 cases locally. Its emitted `DIGEST=PATH` binding is a local workflow convenience,
 not a release trust root: candidate manifests must pin the digest independently.
 Binary/toolchain provenance, performance receipts, and checked-in release bundles
@@ -211,7 +227,7 @@ remain pending candidate-revision runs on every required physical target.
 Release-registry admission now recognizes only
 `tritium.training-backend-qualification.v1`. Its independent parser binds the
 frozen manifest/vector bytes and all seven candidate receipt bundles, then
-rechecks 35-operation/114-case order, success/error outcomes, clean build
+rechecks 36-operation/117-case order, success/error outcomes, clean build
 revision, physical backend/device identity, resident execution, zero host
 transfers, dtype/limit declarations and per-vector scratch ceilings. CPU, CUDA,
 ROCm, Metal, native wgpu, WASI and MCU are all mandatory; emulation/fallback
@@ -224,7 +240,7 @@ self-validates the final receipt before atomic publication. It cannot turn a
 missing target or emulated bundle into release evidence.
 Performance is a separate exact child receipt,
 `tritium.training-performance-qualification.v1`. It must measure the same seven
-candidate bundles and physical device identities under the complete 114-case
+candidate bundles and physical device identities under the complete 117-case
 workload, with a content-bound budget, >=10 warmups, >=30 samples, recomputed
 median throughput and CPU-relative speed, p95, resident/scratch peaks, zero host
 transfers/global synchronizations, native execution and a passing regression
@@ -248,6 +264,8 @@ Edits:
 
 - Add strict manifest types/parser to `tritium-spec/src/training.rs`.
 - Add `spec/training/v1/manifest.json` as canonical bytes.
+- Add V2 manifest/vector/dispatch roots for top-k distillation without changing
+  V1 bytes.
 - Add Python dataclasses/parser under
   `crates/tritium-py/python/tritium/portable/manifest.py`.
 - Add dependency-free strict TypeScript parser under

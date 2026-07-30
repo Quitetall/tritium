@@ -1,8 +1,9 @@
 //! Public schema tests for plan-0049 portable training vectors.
 
 use tritium_spec::{
-    TrainExecutionV1, TrainingOpManifestV1, TrainingToleranceV1, TrainingVectorBufferDataV1,
-    TrainingVectorErrorCategoryV1, TrainingVectorExpectedV1, TrainingVectorSetV1,
+    TrainExecutionV1, TrainingOpManifestV1, TrainingOpManifestV2, TrainingToleranceV1,
+    TrainingVectorBufferDataV1, TrainingVectorErrorCategoryV1, TrainingVectorExpectedV1,
+    TrainingVectorSetV1, TrainingVectorSetV2,
 };
 
 fn hex(bytes: &[u8]) -> String {
@@ -11,11 +12,11 @@ fn hex(bytes: &[u8]) -> String {
 
 #[test]
 fn expected_invalid_request_preserves_duplicate_roles_for_backend_replay() {
-    let manifest_digest = hex(&TrainingOpManifestV1::digest());
+    let manifest_digest = hex(&TrainingOpManifestV2::digest());
     let json = format!(
         r#"{{
   "schema_id": "tritium.training_vectors",
-  "schema_version": 1,
+  "schema_version": 2,
   "manifest_digest": "{manifest_digest}",
   "cases": [
     {{
@@ -41,7 +42,7 @@ fn expected_invalid_request_preserves_duplicate_roles_for_backend_replay() {
 }}"#
     );
 
-    let vectors = TrainingVectorSetV1::parse_json(json.as_bytes()).unwrap();
+    let vectors = TrainingVectorSetV2::parse_json(json.as_bytes()).unwrap();
     assert!(matches!(
         &vectors.cases()[0].expected,
         TrainingVectorExpectedV1::Error {
@@ -54,11 +55,11 @@ fn expected_invalid_request_preserves_duplicate_roles_for_backend_replay() {
 
 #[test]
 fn parses_one_exact_forward_vector_bound_to_the_manifest() {
-    let manifest_digest = hex(&TrainingOpManifestV1::digest());
+    let manifest_digest = hex(&TrainingOpManifestV2::digest());
     let json = format!(
         r#"{{
   "schema_id": "tritium.training_vectors",
-  "schema_version": 1,
+  "schema_version": 2,
   "manifest_digest": "{manifest_digest}",
   "cases": [
     {{
@@ -83,8 +84,8 @@ fn parses_one_exact_forward_vector_bound_to_the_manifest() {
 }}"#
     );
 
-    let vectors = TrainingVectorSetV1::parse_json(json.as_bytes()).unwrap();
-    assert_eq!(vectors.manifest_digest(), TrainingOpManifestV1::digest());
+    let vectors = TrainingVectorSetV2::parse_json(json.as_bytes()).unwrap();
+    assert_eq!(vectors.manifest_digest(), TrainingOpManifestV2::digest());
     assert_eq!(vectors.cases().len(), 1);
     let case = &vectors.cases()[0];
     assert_eq!(case.case_id, "graph.add.forward.basic");
@@ -106,9 +107,9 @@ fn parses_one_exact_forward_vector_bound_to_the_manifest() {
 
 #[test]
 fn canonical_partial_tracer_corpus_has_frozen_seed_order() {
-    let bytes = TrainingVectorSetV1::canonical_json();
+    let bytes = TrainingVectorSetV2::canonical_json();
     assert_eq!(bytes.last(), Some(&b'\n'));
-    let vectors = TrainingVectorSetV1::parse_json(bytes).unwrap();
+    let vectors = TrainingVectorSetV2::parse_json(bytes).unwrap();
     assert_eq!(
         vectors
             .cases()
@@ -177,6 +178,8 @@ fn canonical_partial_tracer_corpus_has_frozen_seed_order() {
             "loss.mse.vjp.basic",
             "loss.softmax_cross_entropy.forward.basic",
             "loss.softmax_cross_entropy.vjp.basic",
+            "loss.topk_knowledge_distillation.forward.duplicate_indices",
+            "loss.topk_knowledge_distillation.vjp.duplicate_indices",
             "optimizer.sgd.step.basic",
             "optimizer.adamw.step.resumed_state",
             "optimizer.cautious_adamw.step.masked_state",
@@ -198,6 +201,7 @@ fn canonical_partial_tracer_corpus_has_frozen_seed_order() {
             "graph.softmax.forward.shape_error",
             "graph.causal_mask.forward.shape_error",
             "loss.softmax_cross_entropy.forward.shape_error",
+            "loss.topk_knowledge_distillation.forward.index_out_of_range",
             "graph.rope.forward.odd_head_dim",
             "loss.softmax_cross_entropy.forward.zero_rows",
             "loss.softmax_cross_entropy.forward.zero_cols",
@@ -232,9 +236,19 @@ fn canonical_partial_tracer_corpus_has_frozen_seed_order() {
             "graph.attention.forward.product_limit",
         ]
     );
-    assert_eq!(vectors.source_digest(), TrainingVectorSetV1::digest());
+    assert_eq!(vectors.source_digest(), TrainingVectorSetV2::digest());
     assert_eq!(
-        hex(&TrainingVectorSetV1::digest()),
-        "fcb250733b991aac165871f8c54b0b063337a3ed01bd1da02de220916887fbd6"
+        hex(&TrainingVectorSetV2::digest()),
+        "38b17f4c76c1d2f85cb35c713652a3d77627d02ba47933d2c8f31a88e0c594a7"
     );
+}
+
+#[test]
+fn v1_corpus_remains_backward_readable_and_distinct_from_v2() {
+    let vectors = TrainingVectorSetV1::parse_json(TrainingVectorSetV1::canonical_json()).unwrap();
+    assert_eq!(vectors.cases().len(), 114);
+    assert_eq!(vectors.manifest_digest(), TrainingOpManifestV1::digest());
+    assert_eq!(TrainingVectorSetV2::canonical_json().last(), Some(&b'\n'));
+    assert!(TrainingVectorSetV1::parse_json(TrainingVectorSetV2::canonical_json()).is_err());
+    assert!(TrainingVectorSetV2::parse_json(TrainingVectorSetV1::canonical_json()).is_err());
 }

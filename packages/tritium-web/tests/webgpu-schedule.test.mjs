@@ -4,13 +4,13 @@ import test from "node:test";
 
 import {
   compileWebGpuResidentScheduleV1,
-  TRAINING_MANIFEST_DIGEST_V1,
+  TRAINING_MANIFEST_DIGEST_V2,
   webGpuDispatchFormV1,
   WebTrainingError,
 } from "../dist/index.js";
 
 const corpus = JSON.parse(readFileSync(
-  new URL("../../../spec/training/v1/vectors/v1.json", import.meta.url),
+  new URL("../../../spec/training/v2/vectors/v2.json", import.meta.url),
   "utf8",
 ));
 const BUDGET = Object.freeze({ maxPeakBytes: 64 * 1024 * 1024 });
@@ -25,7 +25,7 @@ function plan(buffers, operations, backwardOperations = []) {
   return {
     schemaId: "tritium.compiled_training_plan",
     schemaVersion: 1,
-    manifestDigest: TRAINING_MANIFEST_DIGEST_V1,
+    manifestDigest: TRAINING_MANIFEST_DIGEST_V2,
     buffers: placedBuffers,
     operations,
     backwardOperations,
@@ -132,7 +132,7 @@ test("resident schedule admits the captured physical uniform stride", () => {
   );
 });
 
-test("resident schedule covers all 52 graph/loss forms and five transactional optimizers", () => {
+test("resident schedule covers all 54 graph/loss forms and five transactional optimizers", () => {
   const supported = new Set([
     "graph.detach", "graph.scale_const", "graph.add", "graph.mul", "graph.relu2",
     "graph.silu", "graph.causal_mask", "graph.softmax", "graph.rmsnorm", "loss.mse",
@@ -141,7 +141,7 @@ test("resident schedule covers all 52 graph/loss forms and five transactional op
     "graph.salt_ste", "graph.fsq", "graph.embedding_gather", "graph.rope",
     "graph.concat_cols",
     "graph.conv1d", "graph.conv2d", "graph.attention",
-    "loss.softmax_cross_entropy",
+    "loss.softmax_cross_entropy", "loss.topk_knowledge_distillation",
     "optimizer.sgd", "optimizer.adamw", "optimizer.cautious_adamw",
     "optimizer.int8_adamw", "optimizer.muon",
   ]);
@@ -151,7 +151,7 @@ test("resident schedule covers all 52 graph/loss forms and five transactional op
     if (supported.has(item.operation) && item.expected.kind === "success" &&
         !representatives.has(key)) representatives.set(key, item);
   }
-  assert.equal(representatives.size, 57);
+  assert.equal(representatives.size, 59);
   for (const [key, item] of representatives) {
     const representative = representativePlan(item);
     const schedule = compileWebGpuResidentScheduleV1(representative.plan, BUDGET);
@@ -216,6 +216,24 @@ test("SALT allocates bounded scratch and softmax VJP keeps cotangent resident", 
   assert.equal(command.storageBindings[4], "grad_logits");
   assert.equal(view(command).getUint32(8, true), 1);
   assert.equal(view(command).getFloat32(12, true), 0);
+});
+
+test("top-k distillation lowers sparse targets and cotangent without host staging", () => {
+  const item = corpus.cases.find((candidate) =>
+    candidate.operation === "loss.topk_knowledge_distillation" &&
+    candidate.execution === "vjp" && candidate.expected.kind === "success");
+  const representative = representativePlan(item);
+  const command = compileWebGpuResidentScheduleV1(representative.plan, BUDGET)
+    .transaction(representative.phase, representative.operationId, 0).commands[0];
+  assert.equal(command.storageBindings[1], "logits");
+  assert.equal(command.storageBindings[2], "indices");
+  assert.equal(command.storageBindings[3], "probabilities");
+  assert.equal(command.storageBindings[4], "grad_output");
+  assert.equal(command.storageBindings[5], "grad_logits");
+  assert.equal(view(command).getUint32(0, true), 2);
+  assert.equal(view(command).getUint32(4, true), 3);
+  assert.equal(view(command).getUint32(8, true), 2);
+  assert.equal(view(command).getUint32(12, true), 1);
 });
 
 test("concat packs forward parts with GPU copies and emits ordered VJP slices", () => {

@@ -149,7 +149,7 @@ mod tests {
         let backend = WasmTrainBackendV1::new("wasm32:test").expect("valid identity");
         let capabilities = backend.capabilities();
         assert_eq!(capabilities.backend_id, BACKEND_ID);
-        assert_eq!(capabilities.supported_operations.len(), 35);
+        assert_eq!(capabilities.supported_operations.len(), 36);
         assert_eq!(capabilities.limits, LIMITS);
         assert!(capabilities.device_resident);
         assert_eq!(WasmTrainBackendV1::max_caller_bytes(), 64 * 1024 * 1024);

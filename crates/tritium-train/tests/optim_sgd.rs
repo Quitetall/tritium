@@ -1,4 +1,4 @@
-//! Portable SGD behavior required by TrainingOpManifestV1.
+//! Portable SGD behavior required by current training manifest.
 
 use tritium_train::{Optimizer, Sgd, checkpoint};
 

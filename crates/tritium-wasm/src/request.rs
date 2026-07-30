@@ -631,7 +631,7 @@ fn execute(request_json: &str) -> ResponseWire {
             Err(value) => return response_error(Vec::new(), value),
         },
     };
-    if vector_digest.is_some_and(|digest| digest != tritium_spec::TrainingVectorSetV1::digest()) {
+    if vector_digest.is_some_and(|digest| digest != tritium_spec::TrainingVectorSetV2::digest()) {
         return response_error(
             Vec::new(),
             error(
@@ -705,10 +705,10 @@ pub fn tritium_execute_portable_request_json(request_json: &str) -> String {
 mod tests {
     use serde_json::{Value, json};
     use tritium_spec::{
-        TrainingOpManifestV1, TrainingVectorAttributeV1, TrainingVectorAttributeValueV1,
-        TrainingVectorBufferDataV1, TrainingVectorBufferV1, TrainingVectorCaseV1,
-        TrainingVectorErrorCategoryV1, TrainingVectorExpectedV1, TrainingVectorSetV1,
-        train_output_digest_v1, train_request_digest_v1,
+        TrainingOpManifestV2, TrainingToleranceV1, TrainingVectorAttributeV1,
+        TrainingVectorAttributeValueV1, TrainingVectorBufferDataV1, TrainingVectorBufferV1,
+        TrainingVectorCaseV1, TrainingVectorErrorCategoryV1, TrainingVectorExpectedV1,
+        TrainingVectorSetV2, train_output_digest_v1, train_request_digest_v1,
     };
 
     use super::*;
@@ -765,6 +765,65 @@ mod tests {
             }
         };
         json!({ "name": value.name, "shape": value.shape, "data": data })
+    }
+
+    fn outputs_match_tolerance(
+        actual: &Value,
+        expected: &[TrainingVectorBufferV1],
+        tolerance: TrainingToleranceV1,
+    ) -> bool {
+        let Some(actual) = actual.as_array() else {
+            return false;
+        };
+        if actual.len() != expected.len() {
+            return false;
+        }
+        actual.iter().zip(expected).all(|(actual, expected)| {
+            if actual["name"] != json!(expected.name) || actual["shape"] != json!(expected.shape) {
+                return false;
+            }
+            match &expected.data {
+                TrainingVectorBufferDataV1::F32Bits(expected_bits) => {
+                    if actual["data"]["dtype"] != "f32" {
+                        return false;
+                    }
+                    let Some(actual_bits) = actual["data"]["bits"].as_array() else {
+                        return false;
+                    };
+                    if actual_bits.len() != expected_bits.len() {
+                        return false;
+                    }
+                    actual_bits
+                        .iter()
+                        .zip(expected_bits)
+                        .all(|(actual, expected)| {
+                            let Some(actual) =
+                                actual.as_u64().and_then(|value| u32::try_from(value).ok())
+                            else {
+                                return false;
+                            };
+                            match tolerance {
+                                TrainingToleranceV1::BitExact => actual == *expected,
+                                TrainingToleranceV1::AbsoluteRelative {
+                                    absolute_bits,
+                                    relative_bits,
+                                } => {
+                                    let actual = f32::from_bits(actual);
+                                    let expected = f32::from_bits(*expected);
+                                    actual.is_finite()
+                                        && expected.is_finite()
+                                        && (actual - expected).abs()
+                                            <= f32::from_bits(absolute_bits)
+                                                + f32::from_bits(relative_bits) * expected.abs()
+                                }
+                            }
+                        })
+                }
+                TrainingVectorBufferDataV1::U32(_) | TrainingVectorBufferDataV1::Bytes(_) => {
+                    actual == &vector_buffer(expected)
+                }
+            }
+        })
     }
 
     fn vector_attribute(value: &TrainingVectorAttributeV1) -> Value {
@@ -844,7 +903,7 @@ mod tests {
         }
     }
 
-    fn case_input_digest(case: &TrainingVectorCaseV1, vectors: &TrainingVectorSetV1) -> String {
+    fn case_input_digest(case: &TrainingVectorCaseV1, vectors: &TrainingVectorSetV2) -> String {
         let inputs: Vec<_> = case.inputs.iter().map(owned_vector_buffer).collect();
         let attributes: Vec<_> = case.attributes.iter().map(owned_vector_attribute).collect();
         let input_views: Vec<_> = inputs.iter().map(OwnedBuffer::as_ref).collect();
@@ -859,8 +918,10 @@ mod tests {
         digest_hex(train_request_digest_v1(&request))
     }
 
-    fn expected_output_digest(outputs: &[TrainingVectorBufferV1]) -> String {
-        let mut buffers: Vec<_> = outputs.iter().map(owned_vector_buffer).collect();
+    fn response_output_digest(outputs: &Value) -> String {
+        let buffers: Vec<BufferWire> =
+            serde_json::from_value(outputs.clone()).expect("strict response outputs");
+        let mut buffers: Vec<OwnedBuffer> = buffers.into_iter().map(OwnedBuffer::from).collect();
         let mut views: Vec<_> = buffers.iter_mut().map(OwnedBuffer::as_mut).collect();
         let output = TrainOutputV1::new(&mut views);
         digest_hex(train_output_digest_v1(&output))
@@ -951,7 +1012,7 @@ mod tests {
 
     #[test]
     fn strict_bridge_reaches_every_canonical_case() {
-        let vectors = TrainingVectorSetV1::parse_json(TrainingVectorSetV1::canonical_json())
+        let vectors = TrainingVectorSetV2::parse_json(TrainingVectorSetV2::canonical_json())
             .expect("canonical vectors");
         for case in vectors.cases() {
             let expected_outputs = match &case.expected {
@@ -976,11 +1037,12 @@ mod tests {
                     scratch_bytes_max,
                 } => {
                     assert_eq!(response["status"], "ok", "case {}", case.case_id);
-                    assert_eq!(
+                    assert!(
+                        outputs_match_tolerance(&response["outputs"], outputs, case.tolerance),
+                        "case {} output mismatch: actual={}, expected={}",
+                        case.case_id,
                         response["outputs"],
                         Value::Array(outputs.iter().map(vector_buffer).collect()),
-                        "case {} output mismatch",
-                        case.case_id
                     );
                     let receipt = &response["receipt"];
                     assert_eq!(receipt["backendId"], "wasm.portable.v1");
@@ -996,7 +1058,7 @@ mod tests {
                     assert_eq!(receipt["physicalDevice"], "wasm32:bridge-test");
                     assert_eq!(
                         receipt["manifestDigest"],
-                        digest_hex(TrainingOpManifestV1::digest())
+                        digest_hex(TrainingOpManifestV2::digest())
                     );
                     assert_eq!(receipt["vectorDigest"], digest_hex(vectors.source_digest()));
                     assert_eq!(receipt["operation"], case.operation);
@@ -1020,7 +1082,10 @@ mod tests {
                             .is_some_and(|value| value <= *scratch_bytes_max)
                     );
                     assert_eq!(receipt["inputDigest"], case_input_digest(case, &vectors));
-                    assert_eq!(receipt["outputDigest"], expected_output_digest(outputs));
+                    assert_eq!(
+                        receipt["outputDigest"],
+                        response_output_digest(&response["outputs"])
+                    );
                 }
                 TrainingVectorExpectedV1::Error {
                     category,

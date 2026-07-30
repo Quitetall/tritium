@@ -7,7 +7,7 @@ use tritium_spec::{
     BackendError, TernaryBackend, TrainAttributeValueV1, TrainBackendError, TrainBackendV1,
     TrainBufferDataMutV1, TrainBufferDataRefV1, TrainCapabilitiesV1, TrainDTypeV1,
     TrainExecutionV1, TrainLimitsV1, TrainOperationErrorV1, TrainOutputV1, TrainReceiptV1,
-    TrainRequestV1, TrainingOpManifestV1, train_output_digest_v1, train_request_digest_v1,
+    TrainRequestV1, TrainingOpManifestV2, train_output_digest_v1, train_request_digest_v1,
 };
 
 use super::DeviceTape;
@@ -45,6 +45,7 @@ const OPERATIONS: &[&str] = &[
     "graph.rope",
     "loss.mse",
     "loss.softmax_cross_entropy",
+    "loss.topk_knowledge_distillation",
     "optimizer.sgd",
     "optimizer.adamw",
     "optimizer.cautious_adamw",
@@ -1699,6 +1700,117 @@ impl CudaTrainBackendV1 {
         Ok(())
     }
 
+    fn execute_topk_kd(
+        &self,
+        request: &TrainRequestV1<'_>,
+        output: &mut TrainOutputV1<'_>,
+    ) -> Result<(), TrainBackendError> {
+        let expected_inputs: &[&str] = match request.execution {
+            TrainExecutionV1::Forward => &["logits", "indices", "probabilities"],
+            TrainExecutionV1::Vjp => &["logits", "indices", "probabilities", "grad_output"],
+            _ => {
+                return Err(invariant(
+                    "topk_knowledge_distillation received an illegal phase",
+                ));
+            }
+        };
+        require_names(
+            request.inputs.iter().map(|buffer| buffer.name),
+            expected_inputs,
+            "inputs",
+        )?;
+        require_names(
+            request.attributes.iter().map(|attribute| attribute.name),
+            &["rows", "cols", "k"],
+            "attributes",
+        )?;
+        let output_name = if request.execution == TrainExecutionV1::Forward {
+            "result"
+        } else {
+            "grad_logits"
+        };
+        require_names(
+            output.buffers.iter().map(|buffer| buffer.name),
+            &[output_name],
+            "outputs",
+        )?;
+        let rows = attribute_usize(request, "rows")?;
+        let cols = attribute_usize(request, "cols")?;
+        let k = attribute_usize(request, "k")?;
+        if rows == 0 {
+            return Err(attribute_value("rows", "positive"));
+        }
+        if cols == 0 {
+            return Err(attribute_value("cols", "positive"));
+        }
+        if k == 0 {
+            return Err(attribute_value("k", "positive"));
+        }
+        if k > cols {
+            return Err(attribute_value("k", "at_most_cols"));
+        }
+        let dense_elements = rows.checked_mul(cols).ok_or_else(shape_error)?;
+        let sparse_elements = rows.checked_mul(k).ok_or_else(shape_error)?;
+        let dense_shape = [rows as u64, cols as u64];
+        let sparse_shape = [rows as u64, k as u64];
+        let logits = input_f32(request, "logits", &dense_shape)?;
+        let (indices_shape, indices) = input_u32_any_shape(request, "indices")?;
+        let probabilities = input_f32(request, "probabilities", &sparse_shape)?;
+        if indices_shape != sparse_shape || indices.len() != sparse_elements {
+            return Err(shape_error());
+        }
+        require_finite("logits", logits)?;
+        require_finite("probabilities", probabilities)?;
+        if probabilities.iter().any(|&probability| probability < 0.0) {
+            return Err(attribute_value("probabilities", "nonnegative"));
+        }
+        if indices.iter().any(|&index| index as usize >= cols) {
+            return Err(attribute_value("indices", "in_range"));
+        }
+        let device_logits = self.backend.dev_upload(logits).map_err(cuda_error)?;
+        let device_indices = self.backend.dev_upload_u32(indices).map_err(cuda_error)?;
+        let device_probabilities = self.backend.dev_upload(probabilities).map_err(cuda_error)?;
+        if request.execution == TrainExecutionV1::Forward {
+            let mut device_loss = self.backend.dev_alloc_zeros(1).map_err(cuda_error)?;
+            self.backend
+                .topk_kd_forward_dev(
+                    &device_logits,
+                    &device_indices,
+                    &device_probabilities,
+                    &mut device_loss,
+                    rows,
+                    cols,
+                    k,
+                )
+                .map_err(cuda_error)?;
+            let loss = download_device(&self.backend, &device_loss, 1)?;
+            output_f32(output, "result", &[], 1)?.copy_from_slice(&loss);
+        } else {
+            let upstream = input_f32(request, "grad_output", &[])?;
+            require_finite("grad_output", upstream)?;
+            let mut device_gradient = self
+                .backend
+                .dev_alloc_zeros(dense_elements)
+                .map_err(cuda_error)?;
+            self.backend
+                .topk_kd_backward_dev(
+                    &device_logits,
+                    &device_indices,
+                    &device_probabilities,
+                    &mut device_gradient,
+                    rows,
+                    cols,
+                    k,
+                    upstream[0] / rows as f32,
+                )
+                .map_err(cuda_error)?;
+            let gradient = download_device(&self.backend, &device_gradient, dense_elements)?;
+            output_f32(output, "grad_logits", &dense_shape, dense_elements)?
+                .copy_from_slice(&gradient);
+        }
+        Ok(())
+    }
+
     fn execute_sgd(
         &self,
         request: &TrainRequestV1<'_>,
@@ -2459,12 +2571,12 @@ impl TrainBackendV1 for CudaTrainBackendV1 {
     fn capabilities(&self) -> TrainCapabilitiesV1 {
         TrainCapabilitiesV1 {
             backend_id: self.backend_id.clone(),
-            manifest_digest: TrainingOpManifestV1::digest(),
+            manifest_digest: TrainingOpManifestV2::digest(),
             supported_operations: OPERATIONS
                 .iter()
                 .map(|operation| (*operation).to_owned())
                 .collect(),
-            dtypes: vec![TrainDTypeV1::F32, TrainDTypeV1::Bytes],
+            dtypes: vec![TrainDTypeV1::F32, TrainDTypeV1::U32, TrainDTypeV1::Bytes],
             limits: LIMITS,
             device_resident: true,
         }
@@ -2504,6 +2616,7 @@ impl TrainBackendV1 for CudaTrainBackendV1 {
             "graph.rope" => self.execute_rope(&request, output)?,
             "loss.mse" => self.execute_mse(&request, output)?,
             "loss.softmax_cross_entropy" => self.execute_softmax_xent(&request, output)?,
+            "loss.topk_knowledge_distillation" => self.execute_topk_kd(&request, output)?,
             "optimizer.sgd" => self.execute_sgd(&request, output)?,
             "optimizer.adamw" => self.execute_adamw(&request, output, false)?,
             "optimizer.cautious_adamw" => self.execute_adamw(&request, output, true)?,
@@ -2584,7 +2697,7 @@ impl TrainBackendV1 for CudaTrainBackendV1 {
             backend_id: self.backend_id.clone(),
             backend_build: backend_build_identity(),
             physical_device: Some(self.physical_device.clone()),
-            manifest_digest: TrainingOpManifestV1::digest(),
+            manifest_digest: TrainingOpManifestV2::digest(),
             vector_digest: request.vector_digest,
             operation: request.operation.to_owned(),
             execution: request.execution,

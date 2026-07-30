@@ -1,4 +1,4 @@
-/** Strict TypeScript representation of TrainingOpManifestV1. */
+/** Strict TypeScript representation of TrainingOpManifestV2. */
 
 export type TrainingOpCategoryV1 = "graph" | "loss" | "optimizer" | "lifecycle";
 export type TrainingVjpV1 = "none" | "first_order";
@@ -10,6 +10,13 @@ export interface TrainingOpDescriptorV1 {
   readonly vjp: TrainingVjpV1;
   readonly mutates: boolean;
   readonly checkpoint_planes: readonly string[];
+}
+
+export interface TrainingOpManifestV2 {
+  readonly schema_id: "tritium.training_op_manifest";
+  readonly schema_version: 2;
+  readonly dtype: "f32";
+  readonly operations: readonly TrainingOpDescriptorV1[];
 }
 
 export interface TrainingOpManifestV1 {
@@ -53,7 +60,11 @@ const GRAPH_IDS = [
   "graph.attention",
 ] as const;
 
-const LOSS_IDS = ["loss.mse", "loss.softmax_cross_entropy"] as const;
+const LOSS_IDS = [
+  "loss.mse",
+  "loss.softmax_cross_entropy",
+  "loss.topk_knowledge_distillation",
+] as const;
 const OPTIMIZERS = [
   ["optimizer.sgd", ["parameter"]],
   ["optimizer.adamw", ["parameter", "moment1", "moment2"]],
@@ -114,9 +125,20 @@ const operations: readonly TrainingOpDescriptorV1[] = Object.freeze([
   ),
 ]);
 
-const MANIFEST: TrainingOpManifestV1 = Object.freeze({
+const MANIFEST_V1: TrainingOpManifestV1 = Object.freeze({
   schema_id: "tritium.training_op_manifest",
   schema_version: 1,
+  dtype: "f32",
+  operations: Object.freeze(
+    operations.filter((operation) =>
+      operation.id !== "loss.topk_knowledge_distillation"
+    ),
+  ),
+});
+
+const MANIFEST_V2: TrainingOpManifestV2 = Object.freeze({
+  schema_id: "tritium.training_op_manifest",
+  schema_version: 2,
   dtype: "f32",
   operations,
 });
@@ -149,21 +171,32 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-/** Return byte-identical canonical manifest JSON with terminal LF. */
-export function canonicalTrainingManifestJson(): Uint8Array {
+function canonicalManifestJson(
+  manifest: TrainingOpManifestV1 | TrainingOpManifestV2,
+): Uint8Array {
   const lines = [
     "{",
-    `  "schema_id": ${JSON.stringify(MANIFEST.schema_id)},`,
-    '  "schema_version": 1,',
-    `  "dtype": ${JSON.stringify(MANIFEST.dtype)},`,
+    `  "schema_id": ${JSON.stringify(manifest.schema_id)},`,
+    `  "schema_version": ${manifest.schema_version},`,
+    `  "dtype": ${JSON.stringify(manifest.dtype)},`,
     '  "operations": [',
   ];
-  MANIFEST.operations.forEach((operation, index) => {
-    const suffix = index + 1 < MANIFEST.operations.length ? "," : "";
+  manifest.operations.forEach((operation, index) => {
+    const suffix = index + 1 < manifest.operations.length ? "," : "";
     lines.push(`    ${JSON.stringify(operation)}${suffix}`);
   });
   lines.push("  ]", "}");
   return new TextEncoder().encode(`${lines.join("\n")}\n`);
+}
+
+/** Return byte-identical current V2 manifest JSON with terminal LF. */
+export function canonicalTrainingManifestJson(): Uint8Array {
+  return canonicalManifestJson(MANIFEST_V2);
+}
+
+/** Return byte-identical backward-readable V1 manifest JSON with terminal LF. */
+export function canonicalTrainingManifestV1Json(): Uint8Array {
+  return canonicalManifestJson(MANIFEST_V1);
 }
 
 class DuplicateKeyScanner {
@@ -293,15 +326,21 @@ class DuplicateKeyScanner {
   }
 }
 
-function validateOperation(value: unknown, index: number): void {
+function validateOperation(
+  value: unknown,
+  index: number,
+  manifest: TrainingOpManifestV1 | TrainingOpManifestV2,
+): void {
   if (!isRecord(value) || !sameKeys(value, OP_FIELDS)) {
     throw new TrainingManifestError(
-      `operation ${index} fields differ from v1 contract`,
+      `operation ${index} fields differ from v${manifest.schema_version} contract`,
     );
   }
-  const expected = MANIFEST.operations[index];
+  const expected = manifest.operations[index];
   if (expected === undefined) {
-    throw new TrainingManifestError("operation count differs from v1");
+    throw new TrainingManifestError(
+      `operation count differs from v${manifest.schema_version}`,
+    );
   }
   if (
     value.id !== expected.id ||
@@ -318,15 +357,15 @@ function validateOperation(value: unknown, index: number): void {
     )
   ) {
     throw new TrainingManifestError(
-      `operation ${index} differs from frozen v1 descriptor`,
+      `operation ${index} differs from frozen v${manifest.schema_version} descriptor`,
     );
   }
 }
 
-/** Parse exact v1 semantics; JSON whitespace and field order may differ. */
+/** Parse exact V1 or V2 semantics; JSON whitespace and field order may differ. */
 export function parseTrainingManifest(
   data: string | Uint8Array,
-): TrainingOpManifestV1 {
+): TrainingOpManifestV1 | TrainingOpManifestV2 {
   let text: string;
   try {
     text = typeof data === "string"
@@ -346,20 +385,27 @@ export function parseTrainingManifest(
   new DuplicateKeyScanner(text).scan();
   if (!isRecord(value) || !sameKeys(value, ROOT_FIELDS)) {
     throw new TrainingManifestError(
-      "manifest root fields differ from v1 contract",
+      "manifest root fields differ from supported contract",
     );
   }
+  const manifest = value.schema_version === 1
+    ? MANIFEST_V1
+    : value.schema_version === 2
+    ? MANIFEST_V2
+    : null;
   if (
-    value.schema_id !== MANIFEST.schema_id ||
-    value.schema_version !== MANIFEST.schema_version ||
-    value.dtype !== MANIFEST.dtype ||
+    manifest === null ||
+    value.schema_id !== manifest.schema_id ||
+    value.dtype !== manifest.dtype ||
     !Array.isArray(value.operations) ||
-    value.operations.length !== MANIFEST.operations.length
+    value.operations.length !== manifest.operations.length
   ) {
     throw new TrainingManifestError(
-      "manifest header or operation count differs from v1 contract",
+      "manifest header or operation count differs from supported contract",
     );
   }
-  value.operations.forEach(validateOperation);
-  return MANIFEST;
+  value.operations.forEach((operation, index) =>
+    validateOperation(operation, index, manifest)
+  );
+  return manifest;
 }

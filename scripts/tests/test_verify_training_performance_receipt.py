@@ -50,12 +50,12 @@ def fixture(root: Path):
             "schema": MODULE["TRACE_SCHEMA"], "family": family,
             "artifact_id": artifact["id"],
             "physical_device": f"{family}:device-{ordinal}",
-            "workload_id": "training-manifest-v1-full-114",
+            "workload_id": "training-manifest-v2-full-117",
             "budget_id": "sha256:" + "9" * 64,
             "warmups_ms": [median] * 10,
             "samples": [
                 {
-                    "elapsed_ms": value, "cases": 114,
+                    "elapsed_ms": value, "cases": 117,
                     "peak_resident_bytes": 1000, "peak_scratch_bytes": 100,
                     "host_transfers": 0, "global_synchronizations": 0,
                     "native_execution": True, "budget_pass": True,
@@ -70,8 +70,8 @@ def fixture(root: Path):
                 "tier": "throughput" if ordinal < 5 else "bounded-latency",
                 "artifact": artifact, "physical_device": f"{family}:device-{ordinal}",
                 "warmup_iterations": 10, "sample_count": 30,
-                "cases_per_sample": 114, "median_ms": median,
-                "p95_ms": p95, "cases_per_second": 114000 / median,
+                "cases_per_sample": 117, "median_ms": median,
+                "p95_ms": p95, "cases_per_second": 117000 / median,
                 "cpu_relative_speed": cpu_median / median,
                 "peak_resident_bytes": 1000, "peak_scratch_bytes": 100,
                 "host_transfers": 0, "global_synchronizations": 0,
@@ -90,7 +90,7 @@ def fixture(root: Path):
         "run_id": "training-performance-1",
         "candidate_manifest_sha256": hashlib.sha256(candidate.read_bytes()).hexdigest(),
         "backend_manifest_receipt_id": "sha256:" + "8" * 64,
-        "workload_id": "training-manifest-v1-full-114",
+        "workload_id": "training-manifest-v2-full-117",
         "budget_id": "sha256:" + "9" * 64, "measurements": measurements,
     }
     receipt["receipt_id"] = "sha256:" + hashlib.sha256(canonical(receipt)).hexdigest()

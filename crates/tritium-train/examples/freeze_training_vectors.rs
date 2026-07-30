@@ -14,7 +14,7 @@ use tritium_format::salt_v2::SaltV2Codec;
 use tritium_format::salt_v2_package::{
     SaltV2Package, SaltV2Plane, SaltV2Tensor, SaltV2Tile, write_salt_v2_package,
 };
-use tritium_spec::{TrainingOpManifestV1, TrainingVectorSetV1};
+use tritium_spec::{TrainingOpManifestV2, TrainingVectorSetV2};
 use tritium_train::{
     AdamState, AdamW, CautiousAdamW, Int8AdamW, Muon, Optimizer, Sgd,
     checkpoint::{Checkpoint, LeafCheckpoint, write_checkpoint},
@@ -513,6 +513,18 @@ fn main() {
     let xent_grad_output = [0.75_f32];
     let xent = loss::softmax_xent_forward(&logits, &class_target, 2, 3);
     let xent_grad = loss::softmax_xent_vjp(&logits, &class_target, 2, 3, &xent_grad_output);
+    let topk_indices = [1_u32, 1, 0, 2];
+    let topk_probabilities = [0.6_f32, 0.4, 0.25, 0.75];
+    let topk_loss = loss::topk_kd_forward(&logits, &topk_indices, &topk_probabilities, 2, 3, 2);
+    let topk_grad = loss::topk_kd_vjp(
+        &logits,
+        &topk_indices,
+        &topk_probabilities,
+        2,
+        3,
+        2,
+        &xent_grad_output,
+    );
 
     let rope_input = [1.0_f32, 2.0, 3.0, 4.0, -1.0, 0.5, 2.0, -3.0];
     let rope_positions = [0_usize, 3];
@@ -651,9 +663,9 @@ fn main() {
     corrupt_artifact[0] ^= u8::MAX;
 
     let corpus = Corpus {
-        schema_id: TrainingVectorSetV1::SCHEMA_ID,
-        schema_version: TrainingVectorSetV1::SCHEMA_VERSION,
-        manifest_digest: hex(&TrainingOpManifestV1::digest()),
+        schema_id: TrainingVectorSetV2::SCHEMA_ID,
+        schema_version: TrainingVectorSetV2::SCHEMA_VERSION,
+        manifest_digest: hex(&TrainingOpManifestV2::digest()),
         cases: vec![
             Case {
                 case_id: "graph.add.forward.basic",
@@ -2078,6 +2090,71 @@ fn main() {
                 },
             },
             Case {
+                case_id: "loss.topk_knowledge_distillation.forward.duplicate_indices",
+                operation: "loss.topk_knowledge_distillation",
+                execution: "forward",
+                tolerance: Tolerance::AbsoluteRelative {
+                    absolute_bits: 1.0e-6_f32.to_bits(),
+                    relative_bits: 1.0e-6_f32.to_bits(),
+                },
+                inputs: vec![
+                    f32_buffer("logits", &[2, 3], &logits),
+                    u32_buffer("indices", &[2, 2], &topk_indices),
+                    f32_buffer("probabilities", &[2, 2], &topk_probabilities),
+                ],
+                attributes: vec![
+                    Attribute::U64 {
+                        name: "rows",
+                        value: 2,
+                    },
+                    Attribute::U64 {
+                        name: "cols",
+                        value: 3,
+                    },
+                    Attribute::U64 {
+                        name: "k",
+                        value: 2,
+                    },
+                ],
+                expected: Expected::Success {
+                    outputs: vec![f32_buffer("result", &[], &topk_loss)],
+                    scratch_bytes_max: 0,
+                },
+            },
+            Case {
+                case_id: "loss.topk_knowledge_distillation.vjp.duplicate_indices",
+                operation: "loss.topk_knowledge_distillation",
+                execution: "vjp",
+                tolerance: Tolerance::AbsoluteRelative {
+                    absolute_bits: 1.0e-6_f32.to_bits(),
+                    relative_bits: 1.0e-6_f32.to_bits(),
+                },
+                inputs: vec![
+                    f32_buffer("logits", &[2, 3], &logits),
+                    u32_buffer("indices", &[2, 2], &topk_indices),
+                    f32_buffer("probabilities", &[2, 2], &topk_probabilities),
+                    f32_buffer("grad_output", &[], &xent_grad_output),
+                ],
+                attributes: vec![
+                    Attribute::U64 {
+                        name: "rows",
+                        value: 2,
+                    },
+                    Attribute::U64 {
+                        name: "cols",
+                        value: 3,
+                    },
+                    Attribute::U64 {
+                        name: "k",
+                        value: 2,
+                    },
+                ],
+                expected: Expected::Success {
+                    outputs: vec![f32_buffer("grad_logits", &[2, 3], &topk_grad[0])],
+                    scratch_bytes_max: 0,
+                },
+            },
+            Case {
                 case_id: "optimizer.sgd.step.basic",
                 operation: "optimizer.sgd",
                 execution: "step",
@@ -2562,6 +2639,36 @@ fn main() {
                 expected: Expected::Error {
                     category: "invalid_operation",
                     code: "shape",
+                    outputs: vec![f32_buffer("result", &[], &[123.0])],
+                },
+            },
+            Case {
+                case_id: "loss.topk_knowledge_distillation.forward.index_out_of_range",
+                operation: "loss.topk_knowledge_distillation",
+                execution: "forward",
+                tolerance: Tolerance::BitExact,
+                inputs: vec![
+                    f32_buffer("logits", &[2, 3], &logits),
+                    u32_buffer("indices", &[2, 2], &[1, 3, 0, 2]),
+                    f32_buffer("probabilities", &[2, 2], &topk_probabilities),
+                ],
+                attributes: vec![
+                    Attribute::U64 {
+                        name: "rows",
+                        value: 2,
+                    },
+                    Attribute::U64 {
+                        name: "cols",
+                        value: 3,
+                    },
+                    Attribute::U64 {
+                        name: "k",
+                        value: 2,
+                    },
+                ],
+                expected: Expected::Error {
+                    category: "invalid_operation",
+                    code: "attribute_value.indices.in_range",
                     outputs: vec![f32_buffer("result", &[], &[123.0])],
                 },
             },
@@ -3289,9 +3396,9 @@ fn main() {
 
     let mut bytes = serde_json::to_vec_pretty(&corpus).expect("serialize tracer corpus");
     bytes.push(b'\n');
-    TrainingVectorSetV1::parse_json(&bytes).expect("generated corpus must validate");
+    TrainingVectorSetV2::parse_json(&bytes).expect("generated corpus must validate");
 
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../spec/training/v1/vectors/v1.json");
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../spec/training/v2/vectors/v2.json");
     let temporary = path.with_extension("json.tmp");
     std::fs::write(&temporary, &bytes).expect("write temporary vector corpus");
     std::fs::rename(&temporary, &path).expect("atomically replace vector corpus");

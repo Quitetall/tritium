@@ -15,8 +15,8 @@ import { blake3 } from "@noble/hashes/blake3.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
 
 import {
-  TRAINING_MANIFEST_DIGEST_V1,
-  TRAINING_VECTOR_DIGEST_V1,
+  TRAINING_MANIFEST_DIGEST_V2,
+  TRAINING_VECTOR_DIGEST_V2,
 } from "./identity.ts";
 import type {
   PortableBufferV1,
@@ -118,8 +118,8 @@ async function initializeGuest(source: PortableWasmSourceV1): Promise<string> {
     });
   }
   if (
-    manifestDigest !== TRAINING_MANIFEST_DIGEST_V1 ||
-    vectorDigest !== TRAINING_VECTOR_DIGEST_V1 ||
+    manifestDigest !== TRAINING_MANIFEST_DIGEST_V2 ||
+    vectorDigest !== TRAINING_VECTOR_DIGEST_V2 ||
     maxCallerBytes !== MAX_CALLER_BYTES ||
     maxLinearMemoryBytes !== MAX_LINEAR_MEMORY_BYTES
   ) {
@@ -411,7 +411,7 @@ function validateResponse(
       ]) ||
       value.receipt.backendId !== "wasm.portable.v1" ||
       value.receipt.backendBuild !== backendBuild ||
-      value.receipt.manifestDigest !== TRAINING_MANIFEST_DIGEST_V1 ||
+      value.receipt.manifestDigest !== TRAINING_MANIFEST_DIGEST_V2 ||
       value.receipt.vectorDigest !== request.vectorDigest ||
       value.receipt.operation !== request.operation ||
       value.receipt.execution !== request.execution ||
@@ -629,12 +629,12 @@ export async function runPortableWasmConformance(
     });
   }
   if (
-    operationCount !== 35 ||
-    caseCount !== 114 ||
+    operationCount !== 36 ||
+    caseCount !== 117 ||
     maxCallerBytes !== MAX_CALLER_BYTES ||
     maxLinearMemoryBytes !== MAX_LINEAR_MEMORY_BYTES ||
-    guestManifestDigest !== TRAINING_MANIFEST_DIGEST_V1 ||
-    guestVectorDigest !== TRAINING_VECTOR_DIGEST_V1 ||
+    guestManifestDigest !== TRAINING_MANIFEST_DIGEST_V2 ||
+    guestVectorDigest !== TRAINING_VECTOR_DIGEST_V2 ||
     !/^[0-9a-f]{64}$/.test(firstExecutionDigest) ||
     secondExecutionDigest !== firstExecutionDigest
   ) {
@@ -650,8 +650,8 @@ export async function runPortableWasmConformance(
     buildId,
     guestDigest: WASM_GUEST_DIGEST_V1,
     executionDigest: firstExecutionDigest,
-    manifestDigest: TRAINING_MANIFEST_DIGEST_V1,
-    vectorDigest: TRAINING_VECTOR_DIGEST_V1,
+    manifestDigest: TRAINING_MANIFEST_DIGEST_V2,
+    vectorDigest: TRAINING_VECTOR_DIGEST_V2,
     operationCount,
     caseCount,
     maxCallerBytes,

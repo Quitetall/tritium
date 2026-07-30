@@ -7,12 +7,16 @@ import pytest
 
 from tritium.portable import (  # noqa: E402
     TrainingManifestError,
+    canonical_training_manifest_v1_json,
     canonical_training_manifest_json,
     parse_training_manifest,
 )
 
 
 ROOT_MANIFEST = (
+    Path(__file__).resolve().parents[3] / "spec" / "training" / "v2" / "manifest.json"
+)
+ROOT_MANIFEST_V1 = (
     Path(__file__).resolve().parents[3] / "spec" / "training" / "v1" / "manifest.json"
 )
 
@@ -21,6 +25,14 @@ def test_python_canonical_bytes_equal_language_neutral_fixture():
     expected = ROOT_MANIFEST.read_bytes()
     assert canonical_training_manifest_json() == expected
     parsed = parse_training_manifest(expected)
+    assert parsed.schema_version == 2
+    assert len(parsed.operations) == 36
+
+
+def test_python_reader_preserves_frozen_v1():
+    expected = ROOT_MANIFEST_V1.read_bytes()
+    assert canonical_training_manifest_v1_json() == expected
+    parsed = parse_training_manifest(expected)
     assert parsed.schema_version == 1
     assert len(parsed.operations) == 35
 
@@ -28,7 +40,7 @@ def test_python_canonical_bytes_equal_language_neutral_fixture():
 @pytest.mark.parametrize(
     "mutate",
     [
-        lambda value: value.update(schema_version=2),
+        lambda value: value.update(schema_version=1),
         lambda value: value.update(dtype="f16"),
         lambda value: value.update(extra=True),
         lambda value: value["operations"].pop(),

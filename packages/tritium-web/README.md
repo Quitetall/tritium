@@ -8,13 +8,13 @@ violations. Recipes compile before `adapter.prepare` may allocate into an immuta
 16-byte-aligned buffer/schedule plan. Tensor owners are explicit, tied
 parameters share one allocation and one compiled gradient/optimizer owner, and
 batch names/dtypes/shapes are checked against the plan. Structural planning and
-all 31 non-lifecycle operations pass allocation-free canonical ABI, shape,
+all 32 non-lifecycle operations pass allocation-free canonical ABI, shape,
 attribute-domain and scratch-ceiling validation before adapter allocation. The
 built-in adapter additionally applies optimizer-subset, portable-buffer,
 worst-case request JSON and lifecycle-capacity gates before guest creation.
 Model/batch bytes are isolated from adapter mutation. Failed
 adapter calls do not advance session state. The archive also bundles a real
-`wasm32-unknown-unknown` guest; `runPortableWasmConformance()` executes all 114
+`wasm32-unknown-unknown` guest; `runPortableWasmConformance()` executes all 117
 canonical cases twice inside that guest and returns a source-bound structural
 receipt. `executePortableWasmRequest()` sends strict bit-pattern JSON through
 the same admitted guest; Rust owns schema validation, typed capacity/error
@@ -29,8 +29,8 @@ canonical request/output digests, exact dtype, build identity and memory bounds.
 Typed lifecycle compilers build canonical checkpoint/resume buffers for SGD,
 AdamW, cautious AdamW, int8 AdamW and Muon, and strict SALT V2 export/reload
 requests without exposing backend role names or encoded-size arithmetic.
-The canonical vectors also generate all 31 non-lifecycle operation bindings
-(57 forward/VJP/step signatures). Typed schedule compilers copy caller-owned
+The canonical vectors also generate all 32 non-lifecycle operation bindings
+(59 forward/VJP/step signatures). Typed schedule compilers copy caller-owned
 buffers into immutable portable requests, resolve tied tensors through their
 canonical owner, preserve exact f32 bits, return explicit destination buffer
 IDs and fail closed on binding, dtype, shape or compiled-plan drift. Generated
@@ -50,9 +50,9 @@ receipts remain a separate acceptance gate.
 
 The package bundles a curated portable-training WGSL candidate set copied
 byte-for-byte from `tritium-wgpu`, with a SHA-256-bound candidate dependency
-index for all 31 tensor operations. `webGpuKernelCandidateBundleV1()` exposes
+index for all 32 tensor operations. `webGpuKernelCandidateBundleV1()` exposes
 those staged build inputs. It is not a validated source set or execution plan:
-the shared 57-form phase/selector/entry-point/binding/dispatch catalog, device
+the shared 59-form phase/selector/entry-point/binding/dispatch catalog, device
 admission, resident dispatch and physical-browser conformance are still release
 gates. Candidate presence alone is not a WebGPU execution receipt.
 
@@ -108,7 +108,7 @@ Archive consumers need neither Rust nor wasm-bindgen.
 
 `npm run check` finishes by packing the exact 13-file archive, verifying its
 npm integrity metadata and source-free map, installing it offline with
-lifecycle scripts disabled into a new project, running the bundled 114-case
+lifecycle scripts disabled into a new project, running the bundled 117-case
 WASM corpus from `node_modules`, and compiling the installed declarations under
 strict TypeScript. This is a local-RC qualification gate; publication remains
 disabled.

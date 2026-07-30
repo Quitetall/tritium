@@ -1,13 +1,13 @@
 #![cfg(feature = "cuda")]
 
 use tritium_cuda::train::CudaTrainBackendV1;
-use tritium_spec::{TrainBackendV1, TrainingVectorSetV1};
+use tritium_spec::{TrainBackendV1, TrainingVectorSetV2};
 use tritium_testkit::run_supported_training_conformance;
 
 #[test]
 fn cuda_executes_every_vector_for_its_advertised_operations() {
-    let vectors = TrainingVectorSetV1::parse_json(include_bytes!(
-        "../../../spec/training/v1/vectors/v1.json"
+    let vectors = TrainingVectorSetV2::parse_json(include_bytes!(
+        "../../../spec/training/v2/vectors/v2.json"
     ))
     .expect("parse canonical training vectors");
     let backend = CudaTrainBackendV1::new(0).expect("open CUDA device 0");
@@ -18,7 +18,7 @@ fn cuda_executes_every_vector_for_its_advertised_operations() {
         report.failed.len(),
         report.failed
     );
-    assert_eq!(report.passed.len(), 114);
+    assert_eq!(report.passed.len(), 117);
     assert_eq!(
         backend.capabilities().supported_operations,
         [
@@ -48,6 +48,7 @@ fn cuda_executes_every_vector_for_its_advertised_operations() {
             "graph.rope",
             "loss.mse",
             "loss.softmax_cross_entropy",
+            "loss.topk_knowledge_distillation",
             "optimizer.sgd",
             "optimizer.adamw",
             "optimizer.cautious_adamw",

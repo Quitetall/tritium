@@ -60,10 +60,10 @@ pub fn tritium_admit_salt_v2_package(bytes: &[u8]) -> Result<Vec<u8>, wasm_bindg
 #[cfg(target_arch = "wasm32")]
 fn portable_training_conformance_report()
 -> Result<tritium_testkit::TrainingConformanceReport, String> {
-    use tritium_spec::TrainingVectorSetV1;
+    use tritium_spec::TrainingVectorSetV2;
     use tritium_testkit::run_training_conformance;
 
-    let vectors = TrainingVectorSetV1::parse_json(TrainingVectorSetV1::canonical_json())
+    let vectors = TrainingVectorSetV2::parse_json(TrainingVectorSetV2::canonical_json())
         .map_err(|error| error.to_string())?;
     let backend =
         WasmTrainBackendV1::new("wasm32-unknown-unknown").map_err(|error| error.to_string())?;
@@ -89,8 +89,8 @@ fn hash_field(hasher: &mut blake3::Hasher, value: &[u8]) {
 #[cfg(target_arch = "wasm32")]
 fn portable_training_report_digest() -> Result<String, String> {
     let report = portable_training_conformance_report()?;
-    let expected_cases = tritium_spec::TrainingVectorSetV1::parse_json(
-        tritium_spec::TrainingVectorSetV1::canonical_json(),
+    let expected_cases = tritium_spec::TrainingVectorSetV2::parse_json(
+        tritium_spec::TrainingVectorSetV2::canonical_json(),
     )
     .map_err(|error| error.to_string())?
     .cases()
@@ -104,8 +104,8 @@ fn portable_training_report_digest() -> Result<String, String> {
     }
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"tritium.portable-wasm-conformance-report.v1\0");
-    hasher.update(&tritium_spec::TrainingOpManifestV1::digest());
-    hasher.update(&tritium_spec::TrainingVectorSetV1::digest());
+    hasher.update(&tritium_spec::TrainingOpManifestV2::digest());
+    hasher.update(&tritium_spec::TrainingVectorSetV2::digest());
     hasher.update(&(report.passed.len() as u64).to_le_bytes());
     hasher.update(&(report.failed.len() as u64).to_le_bytes());
     for pass in report.passed {
@@ -171,9 +171,9 @@ pub fn tritium_portable_conformance_status() -> u32 {
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen::prelude::wasm_bindgen]
 pub fn tritium_portable_conformance_case_count() -> u32 {
-    use tritium_spec::TrainingVectorSetV1;
+    use tritium_spec::TrainingVectorSetV2;
 
-    TrainingVectorSetV1::parse_json(TrainingVectorSetV1::canonical_json()).map_or(0, |vectors| {
+    TrainingVectorSetV2::parse_json(TrainingVectorSetV2::canonical_json()).map_or(0, |vectors| {
         u32::try_from(vectors.cases().len()).unwrap_or(0)
     })
 }
@@ -182,7 +182,7 @@ pub fn tritium_portable_conformance_case_count() -> u32 {
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen::prelude::wasm_bindgen]
 pub fn tritium_portable_operation_count() -> u32 {
-    u32::try_from(tritium_spec::TrainingOpManifestV1::operations().len()).unwrap_or(0)
+    u32::try_from(tritium_spec::TrainingOpManifestV2::operations().len()).unwrap_or(0)
 }
 
 /// Combined caller-buffer ceiling enforced by the portable guest.
@@ -215,14 +215,14 @@ pub fn tritium_portable_build_id() -> String {
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen::prelude::wasm_bindgen]
 pub fn tritium_portable_manifest_digest() -> String {
-    digest_hex(tritium_spec::TrainingOpManifestV1::digest())
+    digest_hex(tritium_spec::TrainingOpManifestV2::digest())
 }
 
 /// Guest-embedded digest of the exact canonical semantic-vector corpus.
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen::prelude::wasm_bindgen]
 pub fn tritium_portable_vector_digest() -> String {
-    digest_hex(tritium_spec::TrainingVectorSetV1::digest())
+    digest_hex(tritium_spec::TrainingVectorSetV2::digest())
 }
 
 /// Digest of ordered case identities and every normalized execution receipt.
@@ -371,7 +371,7 @@ pub fn init_wasm() -> Result<Box<dyn TernaryBackend>, BackendError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tritium_spec::{TrainBackendV1, TrainingVectorSetV1};
+    use tritium_spec::{TrainBackendV1, TrainingVectorSetV2};
     use tritium_testkit::{
         FROZEN_COUNT, FROZEN_SEED, Tolerance, generate_vectors, run_conformance,
         run_fused_fallback_contract, run_training_conformance,
@@ -450,8 +450,8 @@ mod tests {
 
     #[test]
     fn portable_training_manifest_is_complete() {
-        let vectors = TrainingVectorSetV1::parse_json(include_bytes!(
-            "../../../spec/training/v1/vectors/v1.json"
+        let vectors = TrainingVectorSetV2::parse_json(include_bytes!(
+            "../../../spec/training/v2/vectors/v2.json"
         ))
         .expect("parse canonical training vectors");
         let physical_device = if cfg!(target_arch = "wasm32") {
@@ -468,7 +468,7 @@ mod tests {
             report.failed
         );
         assert_eq!(report.passed.len(), vectors.cases().len());
-        assert_eq!(backend.capabilities().supported_operations.len(), 35);
+        assert_eq!(backend.capabilities().supported_operations.len(), 36);
         assert!(
             report
                 .passed

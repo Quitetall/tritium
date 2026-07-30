@@ -4,13 +4,13 @@ import test from "node:test";
 
 import {
   lowerPointwiseWebGpuOperationV1,
-  TRAINING_MANIFEST_DIGEST_V1,
+  TRAINING_MANIFEST_DIGEST_V2,
   webGpuDispatchFormV1,
   WebTrainingError,
 } from "../dist/index.js";
 
 const corpus = JSON.parse(readFileSync(
-  new URL("../../../spec/training/v1/vectors/v1.json", import.meta.url),
+  new URL("../../../spec/training/v2/vectors/v2.json", import.meta.url),
   "utf8",
 ));
 
@@ -36,7 +36,7 @@ function plan(buffers, operations, backwardOperations = []) {
   return {
     schemaId: "tritium.compiled_training_plan",
     schemaVersion: 1,
-    manifestDigest: TRAINING_MANIFEST_DIGEST_V1,
+    manifestDigest: TRAINING_MANIFEST_DIGEST_V2,
     buffers: placedBuffers,
     operations,
     backwardOperations,

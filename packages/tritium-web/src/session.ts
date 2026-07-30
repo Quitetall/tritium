@@ -4,8 +4,8 @@ import {
 } from "../../../bindings/typescript/src/training_manifest.ts";
 
 import {
-  TRAINING_MANIFEST_DIGEST_V1,
-  TRAINING_VECTOR_DIGEST_V1,
+  TRAINING_MANIFEST_DIGEST_V2,
+  TRAINING_VECTOR_DIGEST_V2,
 } from "./identity.ts";
 import {
   TrainingGeometryError,
@@ -37,6 +37,8 @@ export type WebTrainingErrorCode =
   | "device_lost"
   | "disposed"
   | "invalid_config"
+  | "attribute_value.indices.in_range"
+  | "attribute_value.probabilities.finite_nonnegative"
   | "invalid_receipt"
   | "invalid_schema"
   | "invalid_state"
@@ -65,8 +67,8 @@ export interface WebTrainingFailureReceiptV1 {
   readonly schemaId: "tritium.web_training_failure_receipt";
   readonly schemaVersion: 1;
   readonly implementation: WebTrainingImplementationV1;
-  readonly manifestDigest: typeof TRAINING_MANIFEST_DIGEST_V1;
-  readonly vectorDigest: typeof TRAINING_VECTOR_DIGEST_V1;
+  readonly manifestDigest: typeof TRAINING_MANIFEST_DIGEST_V2;
+  readonly vectorDigest: typeof TRAINING_VECTOR_DIGEST_V2;
   readonly buildId: string;
   readonly physicalDevice: string | null;
   readonly operation: string;
@@ -154,7 +156,7 @@ export interface CompiledBackwardOperationV1 {
 export interface CompiledTrainingPlanV1 {
   readonly schemaId: "tritium.compiled_training_plan";
   readonly schemaVersion: 1;
-  readonly manifestDigest: typeof TRAINING_MANIFEST_DIGEST_V1;
+  readonly manifestDigest: typeof TRAINING_MANIFEST_DIGEST_V2;
   readonly buffers: readonly CompiledTrainingBufferV1[];
   readonly operations: readonly CompiledTrainingOperationV1[];
   readonly backwardOperations: readonly CompiledBackwardOperationV1[];
@@ -192,8 +194,8 @@ export interface WebTrainingCapabilitiesV1 {
   readonly schemaId: "tritium.web_training_capabilities";
   readonly schemaVersion: 1;
   readonly implementation: WebTrainingImplementationV1;
-  readonly manifestDigest: typeof TRAINING_MANIFEST_DIGEST_V1;
-  readonly vectorDigest: typeof TRAINING_VECTOR_DIGEST_V1;
+  readonly manifestDigest: typeof TRAINING_MANIFEST_DIGEST_V2;
+  readonly vectorDigest: typeof TRAINING_VECTOR_DIGEST_V2;
   readonly buildId: string;
   readonly physicalDevice: string | null;
   readonly supportedOperations: readonly string[];
@@ -204,8 +206,8 @@ export interface WebTrainingReceiptV1 {
   readonly schemaId: "tritium.web_training_receipt";
   readonly schemaVersion: 1;
   readonly implementation: WebTrainingImplementationV1;
-  readonly manifestDigest: typeof TRAINING_MANIFEST_DIGEST_V1;
-  readonly vectorDigest: typeof TRAINING_VECTOR_DIGEST_V1;
+  readonly manifestDigest: typeof TRAINING_MANIFEST_DIGEST_V2;
+  readonly vectorDigest: typeof TRAINING_VECTOR_DIGEST_V2;
   readonly buildId: string;
   readonly physicalDevice: string | null;
   readonly operation: string;
@@ -364,6 +366,37 @@ function validateAndCopyBatch(
       );
     }
     copied[buffer.id] = copyTypedArray(value);
+  }
+  for (const operation of plan.operations) {
+    if (operation.operation !== "loss.topk_knowledge_distillation") continue;
+    const cols = operation.attributes.find((attribute) => attribute.name === "cols")?.value;
+    const indices = copied[operation.inputs[1]!];
+    const probabilities = copied[operation.inputs[2]!];
+    if (
+      typeof cols !== "number" ||
+      !(indices instanceof Uint32Array) ||
+      !(probabilities instanceof Float32Array)
+    ) {
+      fail(
+        "invalid_schema",
+        `${operation.id} sparse targets must be batch-owned u32/f32 tensors`,
+        state,
+      );
+    }
+    if (indices.some((index) => index >= cols)) {
+      fail(
+        "attribute_value.indices.in_range",
+        `${operation.id} top-k index must be smaller than cols`,
+        state,
+      );
+    }
+    if (probabilities.some((probability) => !Number.isFinite(probability) || probability < 0)) {
+      fail(
+        "attribute_value.probabilities.finite_nonnegative",
+        `${operation.id} top-k probabilities must be finite and nonnegative`,
+        state,
+      );
+    }
   }
   return Object.freeze({ inputs: Object.freeze(copied) });
 }
@@ -630,6 +663,8 @@ function operationDTypes(
     case "loss.mse":
     case "loss.softmax_cross_entropy":
       return { inputs: ["f32", "f32"], outputs: ["f32"] };
+    case "loss.topk_knowledge_distillation":
+      return { inputs: ["f32", "u32", "f32"], outputs: ["f32"] };
     case "graph.attention":
     case "graph.conv1d":
     case "graph.conv2d":
@@ -788,6 +823,12 @@ function differentiationRule(operation: string): DifferentiationRuleV1 {
         gradientInputIndexes: [0],
         gradientOutputRoles: ["grad_logits"],
       };
+    case "loss.topk_knowledge_distillation":
+      return {
+        savedInputRoles: ["logits", "indices", "probabilities"],
+        gradientInputIndexes: [0],
+        gradientOutputRoles: ["grad_logits"],
+      };
     default:
       fail("invalid_schema", `operation ${operation} has no first-order VJP rule`);
   }
@@ -906,6 +947,15 @@ export function compileTrainingPlan(
       }
       return tensor;
     });
+    if (
+      operation.operation === "loss.topk_knowledge_distillation" &&
+      (inputTensors[1]!.role !== "batch" || inputTensors[2]!.role !== "batch")
+    ) {
+      fail(
+        "invalid_schema",
+        `${operation.id} sparse indices and probabilities must be batch tensors`,
+      );
+    }
     const outputTensors = operation.outputs.map((tensorId, index) => {
       const tensor = tensors.get(tensorId);
       if (tensor === undefined) {
@@ -1295,7 +1345,7 @@ export function compileTrainingPlan(
   const provisionalPlan: CompiledTrainingPlanV1 = Object.freeze({
     schemaId: "tritium.compiled_training_plan",
     schemaVersion: 1,
-    manifestDigest: TRAINING_MANIFEST_DIGEST_V1,
+    manifestDigest: TRAINING_MANIFEST_DIGEST_V2,
     buffers: Object.freeze(buffers),
     operations: Object.freeze(operations),
     backwardOperations: Object.freeze(backwardOperations),
@@ -1374,8 +1424,8 @@ function validateCapabilities(
   if (
     capabilities.schemaId !== "tritium.web_training_capabilities" ||
     capabilities.schemaVersion !== 1 ||
-    capabilities.manifestDigest !== TRAINING_MANIFEST_DIGEST_V1 ||
-    capabilities.vectorDigest !== TRAINING_VECTOR_DIGEST_V1 ||
+    capabilities.manifestDigest !== TRAINING_MANIFEST_DIGEST_V2 ||
+    capabilities.vectorDigest !== TRAINING_VECTOR_DIGEST_V2 ||
     !(["webgpu", "wasm-fallback"] as const).includes(
       capabilities.implementation,
     ) ||
@@ -1454,8 +1504,8 @@ function validateReceipt(
   if (
     receipt.schemaId !== "tritium.web_training_receipt" ||
     receipt.schemaVersion !== 1 ||
-    receipt.manifestDigest !== TRAINING_MANIFEST_DIGEST_V1 ||
-    receipt.vectorDigest !== TRAINING_VECTOR_DIGEST_V1 ||
+    receipt.manifestDigest !== TRAINING_MANIFEST_DIGEST_V2 ||
+    receipt.vectorDigest !== TRAINING_VECTOR_DIGEST_V2 ||
     receipt.implementation !== capabilities.implementation ||
     receipt.buildId !== capabilities.buildId ||
     receipt.physicalDevice !== capabilities.physicalDevice ||
@@ -1558,8 +1608,8 @@ function failureReceipt(
     schemaId: "tritium.web_training_failure_receipt",
     schemaVersion: 1,
     implementation: capabilities.implementation,
-    manifestDigest: TRAINING_MANIFEST_DIGEST_V1,
-    vectorDigest: TRAINING_VECTOR_DIGEST_V1,
+    manifestDigest: TRAINING_MANIFEST_DIGEST_V2,
+    vectorDigest: TRAINING_VECTOR_DIGEST_V2,
     buildId: capabilities.buildId,
     physicalDevice: capabilities.physicalDevice,
     operation,
