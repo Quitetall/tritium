@@ -207,10 +207,16 @@ pub(super) const KERNEL_NAME_GRAD_A: &str = "ternary_matmul_grad_a";
 pub(super) const KERNEL_NAME_GRAD_W: &str = "ternary_matmul_grad_w";
 pub(super) const KERNEL_NAME_GRAD_S: &str = "ternary_matmul_grad_s";
 pub(super) const KERNEL_NAME_PROJECTED_GRAD_A: &str = "tq2_projected_grad_a";
+pub(super) const KERNEL_NAME_PROJECTED_GRAD_A_F16: &str = "tq2_projected_grad_a_f16";
 pub(super) const KERNEL_NAME_PROJECTED_GRAD_WEIGHT: &str = "linear_grad_projected_weight";
 pub(super) const KERNEL_NAME_EXTERNAL_PACK: &str = "tq2_pack_from_master_scale";
+pub(super) const KERNEL_NAME_EXTERNAL_PACK_F16: &str = "tq2_pack_from_master_scale_f16";
 pub(super) const KERNEL_NAME_EXTERNAL_FORWARD: &str = "tq2_projected_linear_forward";
+pub(super) const KERNEL_NAME_EXTERNAL_FORWARD_F16: &str = "tq2_projected_linear_forward_f16";
 pub(super) const KERNEL_NAME_EXTERNAL_GRAD_MASTER: &str = "linear_grad_master_ste";
+pub(super) const KERNEL_NAME_EXTERNAL_GRAD_MASTER_F16: &str = "linear_grad_master_ste_f16";
+pub(super) const KERNEL_NAME_EXTERNAL_GRAD_MASTER_AUTOCAST: &str =
+    "linear_grad_master_ste_autocast";
 /// ADR 0027 Track A: resident per-row multi-plane SALT quantization.
 pub(super) const KERNEL_NAME_SALT_QUANTIZE_FWD: &str = "salt_quantize_forward";
 /// ADR 0027 Track A: fused resident AdamW parameter/moment update.
@@ -261,6 +267,7 @@ pub(super) const KERNEL_NAME_TOPK_KD_BWD: &str = "topk_kd_backward";
 pub(super) const KERNEL_NAME_SCALE_CONST: &str = "scale_const";
 pub(super) const KERNEL_NAME_BIAS_FWD: &str = "bias_forward";
 pub(super) const KERNEL_NAME_BIAS_BWD: &str = "bias_backward";
+pub(super) const KERNEL_NAME_BIAS_BWD_F16: &str = "bias_backward_f16";
 pub(super) const KERNEL_NAME_RELU2_FWD: &str = "relu2_forward";
 pub(super) const KERNEL_NAME_RELU2_BWD: &str = "relu2_backward";
 pub(super) const KERNEL_NAME_MSE_FWD: &str = "mse_forward";

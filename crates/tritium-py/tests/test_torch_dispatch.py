@@ -336,6 +336,13 @@ def test_ternary_linear_cuda_stays_resident_and_autocasts():
         autocast_output = ternary_linear(x.detach(), weight.detach(), bias.detach())
     assert autocast_output.dtype == torch.float16
 
+    compiled = torch.compile(
+        lambda a, w, b: ternary_linear(a, w, b), fullgraph=True
+    )
+    with torch.autocast("cuda", dtype=torch.float16):
+        compiled_output = compiled(x.detach(), weight.detach(), bias.detach())
+    assert torch.equal(compiled_output, autocast_output)
+
 
 @pytest.mark.skipif(
     not torch.cuda.is_available() or "cuda" not in _native.compiled_backends(),
@@ -403,6 +410,176 @@ def test_native_cuda_warm_forward_backward_avoids_composite_tensor_ops():
     }
     assert len(native_resources) == 1
     assert native_resources == sentinel_resources
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or "cuda" not in _native.compiled_backends(),
+    reason="CUDA-enabled Tritium extension unavailable",
+)
+def test_native_cuda_autocast_warm_forward_backward_uses_fp16_kernels():
+    torch.manual_seed(31)
+    x = torch.randn(4, 3, 257, device="cuda", requires_grad=True)
+    weight = torch.randn(33, 257, device="cuda", requires_grad=True)
+    bias = torch.randn(33, device="cuda", requires_grad=True)
+    grad_output = torch.randn(4, 3, 33, device="cuda", dtype=torch.float16)
+
+    expected_x = x.detach().clone().half().requires_grad_()
+    expected_weight = weight.detach().clone().requires_grad_()
+    expected_bias = bias.detach().clone().half().requires_grad_()
+    scales = expected_weight.detach().abs().mean(dim=1, keepdim=True)
+    normalized = expected_weight / scales.clamp_min(torch.finfo(torch.float32).tiny)
+    projected = normalized.round().clamp(-1.0, 1.0) * scales
+    mask = ((normalized.abs() < 1.0) & (scales > 0)).to(torch.float32)
+    differentiable = (
+        projected.detach()
+        + (expected_weight - expected_weight.detach()) * mask
+    )
+    expected = torch.nn.functional.linear(
+        expected_x.float(), differentiable, expected_bias.float()
+    ).half()
+    expected.backward(grad_output)
+
+    stream = torch.cuda.Stream(device=x.device)
+    stream.wait_stream(torch.cuda.current_stream(x.device))
+    with torch.autocast("cuda", dtype=torch.float16), torch.cuda.stream(stream):
+        # Tritium preserves the original fp32 master as cache owner, allowing
+        # resident TQ2_0 state to warm before profiling.
+        ternary_linear(x, weight, bias)
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            acc_events=True,
+        ) as profile:
+            output = ternary_linear(x, weight, bias)
+            output.backward(grad_output)
+            torch.cuda._sleep(1)
+        stream.synchronize()
+
+    assert output.dtype == torch.float16
+    torch.testing.assert_close(output, expected, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(x.grad, expected_x.grad.float(), atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(
+        weight.grad, expected_weight.grad.float(), atol=2e-2, rtol=2e-2
+    )
+    torch.testing.assert_close(
+        bias.grad, expected_bias.grad.float(), atol=2e-2, rtol=2e-2
+    )
+
+    event_names = {event.key.lower() for event in profile.key_averages()}
+    forbidden = {
+        "aten::abs",
+        "aten::clamp",
+        "aten::matmul",
+        "aten::mean",
+        "aten::mm",
+        "aten::round",
+    }
+    assert event_names.isdisjoint(forbidden)
+    assert not any("memcpy dtoh" in name or "memcpy htod" in name for name in event_names)
+    native_kernel_names = {
+        "tq2_projected_linear_forward_f16",
+        "tq2_projected_grad_a_f16",
+        "linear_grad_master_ste_autocast",
+        "bias_backward_f16",
+    }
+    native_resources = {
+        event.device_resource_id
+        for event in profile.events()
+        if event.name in native_kernel_names
+    }
+    sentinel_resources = {
+        event.device_resource_id
+        for event in profile.events()
+        if "spin_kernel" in event.name
+    }
+    assert len(native_resources) == 1
+    assert native_resources == sentinel_resources
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or "cuda" not in _native.compiled_backends(),
+    reason="CUDA-enabled Tritium extension unavailable",
+)
+def test_native_cuda_fp16_tail_paths_for_memcheck():
+    torch.manual_seed(35)
+    subnormal_x = torch.ones(
+        1, 3, device="cuda", dtype=torch.float16, requires_grad=True
+    )
+    subnormal_weight = torch.full(
+        (1, 3), 2**-24, device="cuda", dtype=torch.float16, requires_grad=True
+    )
+    expected_subnormal_x = subnormal_x.detach().clone().requires_grad_()
+    expected_subnormal_weight = (
+        subnormal_weight.detach().clone().requires_grad_()
+    )
+    subnormal_output = ternary_linear(subnormal_x, subnormal_weight)
+    expected_subnormal_output = reference_ternary_linear(
+        expected_subnormal_x, expected_subnormal_weight
+    )
+    subnormal_output.backward(torch.ones_like(subnormal_output))
+    expected_subnormal_output.backward(torch.ones_like(expected_subnormal_output))
+    torch.testing.assert_close(subnormal_output, expected_subnormal_output)
+    torch.testing.assert_close(subnormal_x.grad, expected_subnormal_x.grad)
+    torch.testing.assert_close(
+        subnormal_weight.grad, expected_subnormal_weight.grad
+    )
+
+    bad_master = torch.zeros(1, 3, device="cuda", dtype=torch.bfloat16)
+    scales = torch.ones(1, device="cuda", dtype=torch.float32)
+    packed = torch.empty(1, 66, device="cuda", dtype=torch.uint8)
+    with pytest.raises(ValueError, match="torch.float16"):
+        _native._ternary_linear_cuda_pack(
+            bad_master,
+            scales,
+            packed,
+            1,
+            3,
+            66,
+            2,
+            torch.cuda.current_stream(),
+            torch.cuda.current_device(),
+        )
+
+    x = torch.randn(2, 257, device="cuda", dtype=torch.float16, requires_grad=True)
+    weight = torch.randn(
+        33, 257, device="cuda", dtype=torch.float16, requires_grad=True
+    )
+    bias = torch.randn(33, device="cuda", dtype=torch.float16, requires_grad=True)
+    grad_output = torch.randn(2, 33, device="cuda", dtype=torch.float16)
+    expected_x = x.detach().clone().requires_grad_()
+    expected_weight = weight.detach().clone().requires_grad_()
+    expected_bias = bias.detach().clone().requires_grad_()
+
+    output = ternary_linear(x, weight, bias)
+    expected = reference_ternary_linear(
+        expected_x, expected_weight, expected_bias
+    )
+    output.backward(grad_output)
+    expected.backward(grad_output)
+
+    torch.testing.assert_close(output, expected, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(x.grad, expected_x.grad, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(
+        weight.grad, expected_weight.grad, atol=2e-2, rtol=2e-2
+    )
+    torch.testing.assert_close(bias.grad, expected_bias.grad, atol=2e-2, rtol=2e-2)
+
+    mixed_x = torch.randn(2, 257, device="cuda", requires_grad=True)
+    mixed_weight = torch.randn(33, 257, device="cuda", requires_grad=True)
+    mixed_bias = torch.randn(33, device="cuda", requires_grad=True)
+    with torch.autocast("cuda", dtype=torch.float16):
+        mixed_output = ternary_linear(mixed_x, mixed_weight, mixed_bias)
+    mixed_output.backward(grad_output)
+    assert mixed_output.dtype == torch.float16
+    assert mixed_x.grad is not None and mixed_x.grad.dtype == torch.float32
+    assert mixed_weight.grad is not None and mixed_weight.grad.dtype == torch.float32
+    assert mixed_bias.grad is not None and mixed_bias.grad.dtype == torch.float32
+    assert torch.isfinite(mixed_output).all()
+    assert torch.isfinite(mixed_x.grad).all()
+    assert torch.isfinite(mixed_weight.grad).all()
+    assert torch.isfinite(mixed_bias.grad).all()
 
 
 @pytest.mark.skipif(
@@ -486,6 +663,19 @@ def test_native_cuda_cache_invalidates_on_mutation_and_storage_replacement():
     third = ternary_linear(x, weight)
     torch.testing.assert_close(third, reference_ternary_linear(x, weight))
     assert not torch.equal(third, second)
+
+    dtype_swap_version = weight._version
+    dtype_swap_storage = int(weight.untyped_storage()._cdata)
+    dtype_swap_pointer = weight.data_ptr()
+    shape = weight.shape
+    stride = weight.stride()
+    weight.data = weight.data.view(torch.float16).as_strided(shape, stride)
+    assert weight._version == dtype_swap_version
+    assert int(weight.untyped_storage()._cdata) == dtype_swap_storage
+    assert weight.data_ptr() == dtype_swap_pointer
+    assert weight.shape == shape
+    fourth = ternary_linear(x.half(), weight)
+    torch.testing.assert_close(fourth, reference_ternary_linear(x.half(), weight))
 
 
 @pytest.mark.skipif(

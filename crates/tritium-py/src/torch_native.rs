@@ -535,20 +535,26 @@ fn cuda_tensor_pointer(
     tensor: &Bound<'_, PyAny>,
     elements: usize,
     element_bytes: usize,
+    expected_dtype: &str,
     label: &str,
 ) -> PyResult<usize> {
     let actual_element_bytes: usize = tensor.call_method0("element_size")?.extract()?;
     let actual_elements: usize = tensor.call_method0("numel")?.extract()?;
     let contiguous: bool = tensor.call_method0("is_contiguous")?.extract()?;
+    let actual_dtype: String = tensor.getattr("dtype")?.str()?.extract()?;
     let required_bytes = elements
         .checked_mul(element_bytes)
         .ok_or_else(|| PyValueError::new_err(format!("{label} byte count overflows")))?;
     let actual_bytes = actual_elements
         .checked_mul(actual_element_bytes)
         .ok_or_else(|| PyValueError::new_err(format!("{label} storage size overflows")))?;
-    if !contiguous || actual_element_bytes != element_bytes || actual_bytes < required_bytes {
+    if !contiguous
+        || actual_element_bytes != element_bytes
+        || actual_dtype != expected_dtype
+        || actual_bytes < required_bytes
+    {
         return Err(PyValueError::new_err(format!(
-            "{label} must be contiguous and cover {required_bytes} bytes in {element_bytes}-byte elements"
+            "{label} must be contiguous {expected_dtype} and cover {required_bytes} bytes"
         )));
     }
     tensor.call_method0("data_ptr")?.extract()
@@ -565,7 +571,26 @@ fn record_cuda_stream(tensor: &Bound<'_, PyAny>, stream: &Bound<'_, PyAny>) -> P
     Ok(())
 }
 
-/// Pack a framework-owned fp32 CUDA master into framework-owned TQ2_0 bytes.
+#[cfg(feature = "cuda")]
+fn external_linear_scalar(item_size: usize) -> PyResult<tritium_cuda::ExternalLinearScalar> {
+    match item_size {
+        4 => Ok(tritium_cuda::ExternalLinearScalar::F32),
+        2 => Ok(tritium_cuda::ExternalLinearScalar::F16),
+        _ => Err(PyValueError::new_err(
+            "CUDA ternary Linear item size must be 2 (fp16) or 4 (fp32)",
+        )),
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn external_linear_dtype(scalar: tritium_cuda::ExternalLinearScalar) -> &'static str {
+    match scalar {
+        tritium_cuda::ExternalLinearScalar::F32 => "torch.float32",
+        tritium_cuda::ExternalLinearScalar::F16 => "torch.float16",
+    }
+}
+
+/// Pack a framework-owned fp16/fp32 CUDA master into framework-owned TQ2_0 bytes.
 #[cfg(feature = "cuda")]
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
@@ -577,6 +602,7 @@ pub(crate) fn _ternary_linear_cuda_pack(
     n: usize,
     k: usize,
     row_bytes: usize,
+    item_size: usize,
     stream: &Bound<'_, PyAny>,
     device: usize,
 ) -> PyResult<()> {
@@ -586,9 +612,17 @@ pub(crate) fn _ternary_linear_cuda_pack(
     let packed_elements = n
         .checked_mul(row_bytes)
         .ok_or_else(|| PyValueError::new_err("packed byte count overflows"))?;
-    let master_ptr = cuda_tensor_pointer(master, nk, 4, "master")?;
-    let scales_ptr = cuda_tensor_pointer(scales, n, 4, "scales")?;
-    let packed_ptr = cuda_tensor_pointer(packed, packed_elements, 1, "packed weights")?;
+    let scalar = external_linear_scalar(item_size)?;
+    let master_ptr = cuda_tensor_pointer(
+        master,
+        nk,
+        item_size,
+        external_linear_dtype(scalar),
+        "master",
+    )?;
+    let scales_ptr = cuda_tensor_pointer(scales, n, 4, "torch.float32", "scales")?;
+    let packed_ptr =
+        cuda_tensor_pointer(packed, packed_elements, 1, "torch.uint8", "packed weights")?;
     let stream_ptr = cuda_stream_pointer(stream)?;
     record_cuda_stream(master, stream)?;
     record_cuda_stream(scales, stream)?;
@@ -607,13 +641,14 @@ pub(crate) fn _ternary_linear_cuda_pack(
                 n,
                 k,
                 row_bytes,
+                scalar,
             })
         }
         .map_err(|error| PyRuntimeError::new_err(error.to_string()))
     })
 }
 
-/// Run fp32 projected ternary Linear on framework-owned CUDA storage/stream.
+/// Run fp16/fp32 projected ternary Linear on framework-owned CUDA storage/stream.
 #[cfg(feature = "cuda")]
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
@@ -628,6 +663,7 @@ pub(crate) fn _ternary_linear_cuda_forward(
     n: usize,
     k: usize,
     row_bytes: usize,
+    item_size: usize,
     stream: &Bound<'_, PyAny>,
     device: usize,
 ) -> PyResult<()> {
@@ -640,13 +676,16 @@ pub(crate) fn _ternary_linear_cuda_forward(
     let packed_elements = n
         .checked_mul(row_bytes)
         .ok_or_else(|| PyValueError::new_err("packed byte count overflows"))?;
-    let input_ptr = cuda_tensor_pointer(input, mk, 4, "input")?;
-    let packed_ptr = cuda_tensor_pointer(packed, packed_elements, 1, "packed weights")?;
-    let scales_ptr = cuda_tensor_pointer(scales, n, 4, "scales")?;
+    let scalar = external_linear_scalar(item_size)?;
+    let dtype = external_linear_dtype(scalar);
+    let input_ptr = cuda_tensor_pointer(input, mk, item_size, dtype, "input")?;
+    let packed_ptr =
+        cuda_tensor_pointer(packed, packed_elements, 1, "torch.uint8", "packed weights")?;
+    let scales_ptr = cuda_tensor_pointer(scales, n, 4, "torch.float32", "scales")?;
     let bias_ptr = bias
-        .map(|tensor| cuda_tensor_pointer(tensor, n, 4, "bias"))
+        .map(|tensor| cuda_tensor_pointer(tensor, n, item_size, dtype, "bias"))
         .transpose()?;
-    let output_ptr = cuda_tensor_pointer(output, mn, 4, "output")?;
+    let output_ptr = cuda_tensor_pointer(output, mn, item_size, dtype, "output")?;
     let stream_ptr = cuda_stream_pointer(stream)?;
     for tensor in [input, packed, scales, output] {
         record_cuda_stream(tensor, stream)?;
@@ -668,13 +707,14 @@ pub(crate) fn _ternary_linear_cuda_forward(
                 bias: bias_ptr,
                 output: output_ptr,
                 geometry: tritium_cuda::ExternalLinearGeometry { m, n, k, row_bytes },
+                scalar,
             })
         }
         .map_err(|error| PyRuntimeError::new_err(error.to_string()))
     })
 }
 
-/// Run fp32 activation/master/bias VJPs on framework-owned CUDA storage/stream.
+/// Run fp16/fp32 activation/master/bias VJPs on framework-owned CUDA storage/stream.
 #[cfg(feature = "cuda")]
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
@@ -692,6 +732,8 @@ pub(crate) fn _ternary_linear_cuda_backward(
     n: usize,
     k: usize,
     row_bytes: usize,
+    item_size: usize,
+    master_item_size: usize,
     stream: &Bound<'_, PyAny>,
     device: usize,
 ) -> PyResult<()> {
@@ -707,15 +749,26 @@ pub(crate) fn _ternary_linear_cuda_backward(
     let packed_elements = n
         .checked_mul(row_bytes)
         .ok_or_else(|| PyValueError::new_err("packed byte count overflows"))?;
-    let grad_output_ptr = cuda_tensor_pointer(grad_output, mn, 4, "grad_output")?;
-    let input_ptr = cuda_tensor_pointer(input, mk, 4, "input")?;
-    let master_ptr = cuda_tensor_pointer(master, nk, 4, "master")?;
-    let packed_ptr = cuda_tensor_pointer(packed, packed_elements, 1, "packed weights")?;
-    let scales_ptr = cuda_tensor_pointer(scales, n, 4, "scales")?;
-    let grad_input_ptr = cuda_tensor_pointer(grad_input, mk, 4, "grad_input")?;
-    let grad_master_ptr = cuda_tensor_pointer(grad_master, nk, 4, "grad_master")?;
+    let scalar = external_linear_scalar(item_size)?;
+    let master_scalar = external_linear_scalar(master_item_size)?;
+    let dtype = external_linear_dtype(scalar);
+    let master_dtype = external_linear_dtype(master_scalar);
+    let grad_output_ptr = cuda_tensor_pointer(grad_output, mn, item_size, dtype, "grad_output")?;
+    let input_ptr = cuda_tensor_pointer(input, mk, item_size, dtype, "input")?;
+    let master_ptr = cuda_tensor_pointer(master, nk, master_item_size, master_dtype, "master")?;
+    let packed_ptr =
+        cuda_tensor_pointer(packed, packed_elements, 1, "torch.uint8", "packed weights")?;
+    let scales_ptr = cuda_tensor_pointer(scales, n, 4, "torch.float32", "scales")?;
+    let grad_input_ptr = cuda_tensor_pointer(grad_input, mk, item_size, dtype, "grad_input")?;
+    let grad_master_ptr = cuda_tensor_pointer(
+        grad_master,
+        nk,
+        master_item_size,
+        master_dtype,
+        "grad_master",
+    )?;
     let grad_bias_ptr = grad_bias
-        .map(|tensor| cuda_tensor_pointer(tensor, n, 4, "grad_bias"))
+        .map(|tensor| cuda_tensor_pointer(tensor, n, item_size, dtype, "grad_bias"))
         .transpose()?;
     let stream_ptr = cuda_stream_pointer(stream)?;
     for tensor in [
@@ -749,6 +802,8 @@ pub(crate) fn _ternary_linear_cuda_backward(
                 grad_master: grad_master_ptr,
                 grad_bias: grad_bias_ptr,
                 geometry: tritium_cuda::ExternalLinearGeometry { m, n, k, row_bytes },
+                scalar,
+                master_scalar,
             })
         }
         .map_err(|error| PyRuntimeError::new_err(error.to_string()))

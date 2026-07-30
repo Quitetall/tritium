@@ -10,6 +10,8 @@
 //
 // All buffers row-major. gy = grad_out [M,N].
 
+#include <cuda_fp16.h>
+
 // Y[m,n] = s[n] * sum_k A[m,k] * W[n,k]      (A:[M,K], W:[N,K], s:[N], Y:[M,N])
 // The forward companion to the grad kernels above: same f32 layout, same sequential
 // reduction order, same --fmad=false rounding, so it reproduces tritium_train::ops::matmul::forward
@@ -119,6 +121,45 @@ extern "C" __global__ void tq2_pack_from_master_scale(
     }
 }
 
+// Autocast companion: fp16 master with fp32 row scales and packed output.
+extern "C" __global__ void tq2_pack_from_master_scale_f16(
+    const __half* __restrict__ master,         // [N, K]
+    const float* __restrict__ scales,          // [N]
+    unsigned char* __restrict__ weights,       // [N, row_bytes]
+    int n, int k, int row_bytes)
+{
+    int ni = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ni >= n) return;
+    const float scale = scales[ni];
+    const float denominator = fmaxf(scale, 6.103515625e-5f);
+    unsigned char* row = weights + (long)ni * row_bytes;
+    const int blocks = (k + PROJECTED_VJP_QK - 1) / PROJECTED_VJP_QK;
+
+    for (int block = 0; block < blocks; ++block) {
+        unsigned char* packed = row + block * PROJECTED_VJP_TQ2_BLOCK_BYTES;
+        for (int byte = 0; byte < 64; ++byte) packed[byte] = 0x55u;
+        packed[64] = 0x00u;
+        packed[65] = 0x3cu;
+    }
+
+    if (!(scale > 0.0f) || !isfinite(scale)) return;
+    for (int ki = 0; ki < k; ++ki) {
+        float value = __half2float(master[(long)ni * k + ki]);
+        float quantized = nearbyintf(value / denominator);
+        quantized = fminf(1.0f, fmaxf(-1.0f, quantized));
+        unsigned int code = quantized < 0.0f ? 0u : (quantized > 0.0f ? 2u : 1u);
+        int block = ki / PROJECTED_VJP_QK;
+        int e = ki - block * PROJECTED_VJP_QK;
+        int c = e >> 7;
+        int mm = e & 31;
+        int l = (e & 127) >> 5;
+        unsigned char* byte =
+            row + block * PROJECTED_VJP_TQ2_BLOCK_BYTES + c * 32 + mm;
+        unsigned char mask = (unsigned char)(3u << (2 * l));
+        *byte = (unsigned char)((*byte & ~mask) | (code << (2 * l)));
+    }
+}
+
 // Stream-native framework forward. `bias` may be null. Packed weights and
 // scales remain resident across calls; output storage belongs to framework.
 extern "C" __global__ void tq2_projected_linear_forward(
@@ -159,6 +200,47 @@ extern "C" __global__ void tq2_projected_linear_forward(
     y[idx] = bias ? value + bias[ni] : value;
 }
 
+// Native CUDA autocast forward. Products accumulate in fp32; framework-visible
+// input, bias, and output remain fp16.
+extern "C" __global__ void tq2_projected_linear_forward_f16(
+    const __half* __restrict__ a,              // [M, K]
+    const unsigned char* __restrict__ weights, // [N, row_bytes]
+    const float* __restrict__ scales,          // [N]
+    const __half* __restrict__ bias,            // [N] or null
+    __half* __restrict__ y,                     // [M, N]
+    int m, int n, int k, int row_bytes)
+{
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (long)m * n) return;
+    int mi = idx / n;
+    int ni = idx % n;
+    const unsigned char* row = weights + (long)ni * row_bytes;
+    if (!isfinite(scales[ni])) {
+        y[idx] = __float2half(NAN);
+        return;
+    }
+    float acc = 0.0f;
+    for (int ki = 0; ki < k; ++ki) {
+        int block = ki / PROJECTED_VJP_QK;
+        int e = ki - block * PROJECTED_VJP_QK;
+        int c = e >> 7;
+        int mm = e & 31;
+        int l = (e & 127) >> 5;
+        int byte_off = block * PROJECTED_VJP_TQ2_BLOCK_BYTES + c * 32 + mm;
+        unsigned int code = ((unsigned int)row[byte_off] >> (2 * l)) & 3u;
+        float av = __half2float(a[(long)mi * k + ki]);
+        if (!isfinite(av)) {
+            acc = NAN;
+            break;
+        }
+        if (code == 2u) acc += av;
+        else if (code == 0u) acc -= av;
+    }
+    float value = scales[ni] * acc;
+    if (bias) value += __half2float(bias[ni]);
+    y[idx] = __float2half(value);
+}
+
 extern "C" __global__ void tq2_projected_grad_a(
     const float* __restrict__ gy,              // [M, N]
     const unsigned char* __restrict__ weights, // [N, row_bytes]
@@ -193,6 +275,40 @@ extern "C" __global__ void tq2_projected_grad_a(
         }
     }
     ga[idx] = acc;
+}
+
+extern "C" __global__ void tq2_projected_grad_a_f16(
+    const __half* __restrict__ gy,             // [M, N]
+    const unsigned char* __restrict__ weights, // [N, row_bytes]
+    const float* __restrict__ scales,          // [N]
+    __half* __restrict__ ga,                    // [M, K]
+    int m, int n, int k, int row_bytes)
+{
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (long)m * k) return;
+    int mi = idx / k;
+    int ki = idx % k;
+    int block = ki / PROJECTED_VJP_QK;
+    int e = ki - block * PROJECTED_VJP_QK;
+    int c = e >> 7;
+    int mm = e & 31;
+    int l = (e & 127) >> 5;
+    int byte_off = block * PROJECTED_VJP_TQ2_BLOCK_BYTES + c * 32 + mm;
+
+    float acc = 0.0f;
+    for (int ni = 0; ni < n; ++ni) {
+        const unsigned char* wrow = weights + (long)ni * row_bytes;
+        unsigned int code = ((unsigned int)wrow[byte_off] >> (2 * l)) & 3u;
+        float upstream_value = __half2float(gy[(long)mi * n + ni]);
+        float upstream = upstream_value * scales[ni];
+        if (!isfinite(upstream_value) || !isfinite(scales[ni])) {
+            acc = NAN;
+            break;
+        }
+        if (code == 2u) acc += upstream;
+        else if (code == 0u) acc -= upstream;
+    }
+    ga[idx] = __float2half(acc);
 }
 
 // VJP with respect to the dense projected weight P (not latent trits/scales):
@@ -236,6 +352,57 @@ extern "C" __global__ void linear_grad_master_ste(
     float acc = 0.0f;
     for (int mi = 0; mi < m; ++mi) {
         acc += gy[(long)mi * n + ni] * a[(long)mi * k + ki];
+    }
+    gm[idx] = acc * mask;
+}
+
+extern "C" __global__ void linear_grad_master_ste_f16(
+    const __half* __restrict__ gy,      // [M, N]
+    const __half* __restrict__ a,       // [M, K]
+    const __half* __restrict__ master,  // [N, K]
+    const float* __restrict__ scales,   // [N]
+    __half* __restrict__ gm,            // [N, K]
+    int m, int n, int k)
+{
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (long)n * k) return;
+    int ni = idx / k;
+    int ki = idx % k;
+    float scale = scales[ni];
+    float denominator = fmaxf(scale, 6.103515625e-5f);
+    float master_value = __half2float(master[idx]);
+    float mask =
+        scale > 0.0f && fabsf(master_value / denominator) < 1.0f ? 1.0f : 0.0f;
+    float acc = 0.0f;
+    for (int mi = 0; mi < m; ++mi) {
+        acc += __half2float(gy[(long)mi * n + ni])
+            * __half2float(a[(long)mi * k + ki]);
+    }
+    gm[idx] = __float2half(acc * mask);
+}
+
+// Autocast keeps fp32 master weights/optimizer gradients while activations and
+// upstream gradients use fp16.
+extern "C" __global__ void linear_grad_master_ste_autocast(
+    const __half* __restrict__ gy,     // [M, N]
+    const __half* __restrict__ a,      // [M, K]
+    const float* __restrict__ master,  // [N, K]
+    const float* __restrict__ scales,  // [N]
+    float* __restrict__ gm,            // [N, K]
+    int m, int n, int k)
+{
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (long)n * k) return;
+    int ni = idx / k;
+    int ki = idx % k;
+    float scale = scales[ni];
+    float denominator = fmaxf(scale, 1.1754943508222875e-38f);
+    float mask =
+        scale > 0.0f && fabsf(master[idx] / denominator) < 1.0f ? 1.0f : 0.0f;
+    float acc = 0.0f;
+    for (int mi = 0; mi < m; ++mi) {
+        acc += __half2float(gy[(long)mi * n + ni])
+            * __half2float(a[(long)mi * k + ki]);
     }
     gm[idx] = acc * mask;
 }
@@ -1419,6 +1586,17 @@ extern "C" __global__ void bias_backward(
     float acc = 0.0f;
     for (int row = 0; row < rows; ++row) acc += gy[(long)row * cols + col];
     gb[col] = acc;
+}
+
+extern "C" __global__ void bias_backward_f16(
+    const __half* __restrict__ gy, __half* __restrict__ gb, int rows, int cols)
+{
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= cols) return;
+    float acc = 0.0f;
+    for (int row = 0; row < rows; ++row)
+        acc += __half2float(gy[(long)row * cols + col]);
+    gb[col] = __float2half(acc);
 }
 
 extern "C" __global__ void relu2_forward(

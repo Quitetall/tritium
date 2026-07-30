@@ -22,6 +22,7 @@ class _CudaPackedLinear:
         "storage_identity",
         "data_ptr",
         "shape",
+        "dtype",
         "device",
         "scales",
         "packed",
@@ -36,6 +37,7 @@ class _CudaPackedLinear:
         storage_identity,
         data_ptr,
         shape,
+        dtype,
         device,
         scales,
         packed,
@@ -47,6 +49,7 @@ class _CudaPackedLinear:
         self.storage_identity = storage_identity
         self.data_ptr = data_ptr
         self.shape = shape
+        self.dtype = dtype
         self.device = device
         self.scales = scales
         self.packed = packed
@@ -63,12 +66,15 @@ def _drop_cuda_packed(owner_id: int, owner_ref) -> None:
 def _native_cuda_supported(
     input: torch.Tensor, master: torch.Tensor, bias: Optional[torch.Tensor]
 ) -> bool:
+    supported_pair = master.dtype == input.dtype or (
+        input.dtype == torch.float16 and master.dtype == torch.float32
+    )
     return (
         getattr(_native, "_ternary_linear_cuda_pack", None) is not None
         and getattr(_native, "_ternary_linear_cuda_forward", None) is not None
         and input.device.type == "cuda"
-        and input.dtype == torch.float32
-        and master.dtype == torch.float32
+        and input.dtype in {torch.float16, torch.float32}
+        and supported_pair
         and input.is_contiguous()
         and master.is_contiguous()
         and input.numel() > 0
@@ -77,7 +83,7 @@ def _native_cuda_supported(
         and (
             bias is None
             or (
-                bias.dtype == torch.float32
+                bias.dtype == input.dtype
                 and bias.device == input.device
                 and bias.is_contiguous()
             )
@@ -92,7 +98,7 @@ def _native_cuda_backward_supported(
         getattr(_native, "_ternary_linear_cuda_backward", None) is not None
         and not torch.is_grad_enabled()
         and grad_output.device.type == "cuda"
-        and grad_output.dtype == torch.float32
+        and grad_output.dtype == input.dtype
         and grad_output.is_contiguous()
         and _native_cuda_supported(input, master, None)
     )
@@ -113,6 +119,7 @@ def _cuda_packed_linear(master: torch.Tensor) -> _CudaPackedLinear:
     storage_identity = int(master.untyped_storage()._cdata)
     data_ptr = int(master.data_ptr())
     shape = tuple(master.shape)
+    dtype = master.dtype
     device = _cuda_device_ordinal(master)
     entry = _CUDA_PACKED_CACHE.pop(owner_id, None)
     if (
@@ -122,6 +129,7 @@ def _cuda_packed_linear(master: torch.Tensor) -> _CudaPackedLinear:
         and entry.storage_identity == storage_identity
         and entry.data_ptr == data_ptr
         and entry.shape == shape
+        and entry.dtype == dtype
         and entry.device == device
     ):
         _cuda_stream(master).wait_event(entry.ready)
@@ -131,7 +139,14 @@ def _cuda_packed_linear(master: torch.Tensor) -> _CudaPackedLinear:
     detached = master.detach()
     n, k = shape
     row_bytes = ((k + 255) // 256) * 66
-    scales = detached.abs().mean(dim=1).contiguous()
+    scales = (
+        detached.float()
+        .abs()
+        .mean(dim=1)
+        .to(detached.dtype)
+        .float()
+        .contiguous()
+    )
     packed = torch.empty((n, row_bytes), dtype=torch.uint8, device=master.device)
     stream = _cuda_stream(master)
     _native._ternary_linear_cuda_pack(
@@ -141,6 +156,7 @@ def _cuda_packed_linear(master: torch.Tensor) -> _CudaPackedLinear:
         n,
         k,
         row_bytes,
+        detached.element_size(),
         stream,
         device,
     )
@@ -155,6 +171,7 @@ def _cuda_packed_linear(master: torch.Tensor) -> _CudaPackedLinear:
         storage_identity,
         data_ptr,
         shape,
+        dtype,
         device,
         scales,
         packed,
@@ -178,8 +195,16 @@ def _validate_linear_inputs(
         raise ValueError("ternary_linear input width does not match master weight")
     if not input.dtype.is_floating_point or not master.dtype.is_floating_point:
         raise TypeError("ternary_linear requires floating input and master weight")
-    if input.dtype != master.dtype:
-        raise TypeError("ternary_linear input and master weight must have the same dtype")
+    mixed_cuda_autocast = (
+        input.device.type == "cuda"
+        and input.dtype == torch.float16
+        and master.dtype == torch.float32
+    )
+    if input.dtype != master.dtype and not mixed_cuda_autocast:
+        raise TypeError(
+            "ternary_linear input and master weight must have the same dtype, "
+            "except fp16 CUDA input with an fp32 master"
+        )
     if input.device != master.device:
         raise ValueError("ternary_linear input and master weight must share a device")
     if bias is not None:
@@ -216,6 +241,13 @@ def reference_ternary_linear(
     _validate_linear_inputs(input, master, bias)
     projected, mask = _projection_components(master)
     differentiable = projected.detach() + (master - master.detach()) * mask
+    if input.dtype != master.dtype:
+        output = F.linear(
+            input.float(),
+            differentiable,
+            bias.float() if bias is not None else None,
+        )
+        return output.to(input.dtype)
     return F.linear(input, differentiable, bias)
 
 
@@ -286,6 +318,7 @@ def ternary_linear(
             master.shape[0],
             master.shape[1],
             packed.row_bytes,
+            detached_input.element_size(),
             _cuda_stream(input),
             packed.device,
         )
@@ -315,6 +348,11 @@ def ternary_linear(
         if capsule is not None:
             return torch.from_dlpack(capsule)
     projected, _mask = _projection_components(master)
+    if input.dtype != master.dtype:
+        output = F.linear(
+            input.float(), projected, bias.float() if bias is not None else None
+        )
+        return output.to(input.dtype)
     return F.linear(input, projected, bias)
 
 
@@ -349,7 +387,7 @@ def _ternary_linear_backward(ctx, grad_output: torch.Tensor):
         grad_master = torch.empty_like(detached_master)
         grad_bias = (
             torch.empty(
-                master.shape[0], dtype=master.dtype, device=master.device
+                master.shape[0], dtype=input.dtype, device=master.device
             )
             if ctx.has_bias
             else None
@@ -368,6 +406,8 @@ def _ternary_linear_backward(ctx, grad_output: torch.Tensor):
             master.shape[0],
             master.shape[1],
             packed.row_bytes,
+            detached_input.element_size(),
+            detached_master.element_size(),
             _cuda_stream(input),
             packed.device,
         )
@@ -406,6 +446,16 @@ def _ternary_linear_backward(ctx, grad_output: torch.Tensor):
     projected, mask = _projection_components(master)
     input_2d = input.reshape(-1, input.shape[-1])
     grad_2d = grad_output.reshape(-1, grad_output.shape[-1])
+    if input.dtype != master.dtype:
+        grad_2d_master = grad_2d.float()
+        grad_input = (grad_2d_master @ projected).to(input.dtype).reshape(input.shape)
+        grad_master = (
+            grad_2d_master.transpose(0, 1) @ input_2d.float()
+        ) * mask
+        grad_bias = (
+            grad_2d_master.sum(dim=0).to(input.dtype) if ctx.has_bias else None
+        )
+        return grad_input, grad_master, grad_bias
     grad_input = (grad_2d @ projected).reshape(input.shape)
     grad_master = (grad_2d.transpose(0, 1) @ input_2d) * mask
     grad_bias = grad_2d.sum(dim=0) if ctx.has_bias else None
@@ -418,4 +468,27 @@ torch.library.register_autograd(
     setup_context=_setup_ternary_linear_context,
 )
 torch.library.register_autocast(ternary_linear, "cpu", torch.bfloat16)
-torch.library.register_autocast(ternary_linear, "cuda", torch.float16)
+
+
+def _ternary_linear_cuda_autocast(
+    input: torch.Tensor, master: torch.Tensor, bias: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    # Preserve fp32 master/optimizer state. Only activation-facing tensors use
+    # fp16; disabling autocast around redispatch prevents recursion.
+    with torch.autocast("cuda", enabled=False):
+        cast_input = input.to(torch.float16)
+        cast_bias = bias.to(torch.float16) if bias is not None else None
+        native_mixed = (
+            getattr(_native, "_ternary_linear_cuda_pack", None) is not None
+            and getattr(_native, "_ternary_linear_cuda_forward", None) is not None
+            and getattr(_native, "_ternary_linear_cuda_backward", None) is not None
+            and master.dtype == torch.float32
+        )
+        cast_master = master if native_mixed else master.to(torch.float16)
+        return ternary_linear(cast_input, cast_master, cast_bias)
+
+
+_CUDA_AUTOCAST_LIBRARY = torch.library.Library("tritium", "FRAGMENT")
+_CUDA_AUTOCAST_LIBRARY.impl(
+    "ternary_linear", _ternary_linear_cuda_autocast, "AutocastCUDA"
+)

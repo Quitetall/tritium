@@ -3693,6 +3693,7 @@ mod framework_external;
 use framework_external::{CurrentContextRestore, ExternalCudaKernels};
 pub use framework_external::{
     ExternalLinearBackward, ExternalLinearForward, ExternalLinearGeometry, ExternalLinearPack,
+    ExternalLinearScalar,
 };
 mod graph_raw;
 pub use graph_raw::BatchKv;

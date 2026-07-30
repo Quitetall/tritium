@@ -9,6 +9,13 @@ use super::*;
 
 const THREADS: u32 = 256;
 
+/// Framework tensor scalar type accepted by external ternary Linear kernels.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExternalLinearScalar {
+    F32,
+    F16,
+}
+
 /// Shared MxNxK geometry for external ternary Linear launches.
 #[derive(Clone, Copy, Debug)]
 pub struct ExternalLinearGeometry {
@@ -28,6 +35,7 @@ pub struct ExternalLinearPack {
     pub n: usize,
     pub k: usize,
     pub row_bytes: usize,
+    pub scalar: ExternalLinearScalar,
 }
 
 /// Framework-owned buffers used by one projected ternary forward.
@@ -40,6 +48,7 @@ pub struct ExternalLinearForward {
     pub bias: Option<usize>,
     pub output: usize,
     pub geometry: ExternalLinearGeometry,
+    pub scalar: ExternalLinearScalar,
 }
 
 /// Framework-owned buffers used by one first-order projected VJP.
@@ -55,6 +64,8 @@ pub struct ExternalLinearBackward {
     pub grad_master: usize,
     pub grad_bias: Option<usize>,
     pub geometry: ExternalLinearGeometry,
+    pub scalar: ExternalLinearScalar,
+    pub master_scalar: ExternalLinearScalar,
 }
 
 #[derive(Debug)]
@@ -62,10 +73,16 @@ pub(super) struct ExternalCudaKernels {
     context: Arc<CudaContext>,
     module: sys::CUmodule,
     pack: sys::CUfunction,
+    pack_f16: sys::CUfunction,
     forward: sys::CUfunction,
+    forward_f16: sys::CUfunction,
     grad_input: sys::CUfunction,
+    grad_input_f16: sys::CUfunction,
     grad_master: sys::CUfunction,
+    grad_master_f16: sys::CUfunction,
+    grad_master_autocast: sys::CUfunction,
     grad_bias: sys::CUfunction,
+    grad_bias_f16: sys::CUfunction,
 }
 
 // SAFETY: handles are immutable process-valid driver handles. CUDA Driver API
@@ -102,10 +119,16 @@ impl ExternalCudaKernels {
                 context: Arc::clone(ctx),
                 module,
                 pack: get(KERNEL_NAME_EXTERNAL_PACK)?,
+                pack_f16: get(KERNEL_NAME_EXTERNAL_PACK_F16)?,
                 forward: get(KERNEL_NAME_EXTERNAL_FORWARD)?,
+                forward_f16: get(KERNEL_NAME_EXTERNAL_FORWARD_F16)?,
                 grad_input: get(KERNEL_NAME_PROJECTED_GRAD_A)?,
+                grad_input_f16: get(KERNEL_NAME_PROJECTED_GRAD_A_F16)?,
                 grad_master: get(KERNEL_NAME_EXTERNAL_GRAD_MASTER)?,
+                grad_master_f16: get(KERNEL_NAME_EXTERNAL_GRAD_MASTER_F16)?,
+                grad_master_autocast: get(KERNEL_NAME_EXTERNAL_GRAD_MASTER_AUTOCAST)?,
                 grad_bias: get(KERNEL_NAME_BIAS_BWD)?,
+                grad_bias_f16: get(KERNEL_NAME_BIAS_BWD_F16)?,
             })
         })();
         if loaded.is_err() {
@@ -181,6 +204,49 @@ impl ExternalLinearGeometry {
 fn bytes_f32(elements: usize, label: &str) -> Result<usize, BackendError> {
     elements
         .checked_mul(size_of::<f32>())
+        .ok_or_else(|| BackendError::InvalidInput(format!("{label} byte count overflows")))
+}
+
+impl ExternalLinearScalar {
+    fn bytes(self) -> usize {
+        match self {
+            Self::F32 => size_of::<f32>(),
+            Self::F16 => size_of::<u16>(),
+        }
+    }
+
+    fn select(self, f32_kernel: sys::CUfunction, f16_kernel: sys::CUfunction) -> sys::CUfunction {
+        match self {
+            Self::F32 => f32_kernel,
+            Self::F16 => f16_kernel,
+        }
+    }
+
+    fn select_grad_master(
+        self,
+        master: Self,
+        f32_kernel: sys::CUfunction,
+        f16_kernel: sys::CUfunction,
+        autocast_kernel: sys::CUfunction,
+    ) -> Result<sys::CUfunction, BackendError> {
+        match (self, master) {
+            (Self::F32, Self::F32) => Ok(f32_kernel),
+            (Self::F16, Self::F16) => Ok(f16_kernel),
+            (Self::F16, Self::F32) => Ok(autocast_kernel),
+            (Self::F32, Self::F16) => Err(BackendError::InvalidInput(
+                "fp32 activations with fp16 master weights are unsupported".into(),
+            )),
+        }
+    }
+}
+
+fn bytes_scalar(
+    elements: usize,
+    scalar: ExternalLinearScalar,
+    label: &str,
+) -> Result<usize, BackendError> {
+    elements
+        .checked_mul(scalar.bytes())
         .ok_or_else(|| BackendError::InvalidInput(format!("{label} byte count overflows")))
 }
 
@@ -324,8 +390,8 @@ impl CudaBackend {
         let stream = self.validated_external_stream(request.stream)?;
         let master = self.validate_external_span(
             request.master,
-            bytes_f32(nk, "master")?,
-            align_of::<f32>(),
+            bytes_scalar(nk, request.scalar, "master")?,
+            request.scalar.bytes(),
             "master",
         )?;
         let scales = self.validate_external_span(
@@ -349,7 +415,7 @@ impl CudaBackend {
             pp(&row_bytes),
         ];
         raw_launch(
-            kernels.pack,
+            request.scalar.select(kernels.pack, kernels.pack_f16),
             grid(geometry.n)?,
             (THREADS, 1, 1),
             0,
@@ -378,8 +444,8 @@ impl CudaBackend {
         let stream = self.validated_external_stream(request.stream)?;
         let input = self.validate_external_span(
             request.input,
-            bytes_f32(mk, "input")?,
-            align_of::<f32>(),
+            bytes_scalar(mk, request.scalar, "input")?,
+            request.scalar.bytes(),
             "input",
         )?;
         let packed_bytes = geometry
@@ -397,16 +463,16 @@ impl CudaBackend {
         let bias = match request.bias {
             Some(pointer) => self.validate_external_span(
                 pointer,
-                bytes_f32(geometry.n, "bias")?,
-                align_of::<f32>(),
+                bytes_scalar(geometry.n, request.scalar, "bias")?,
+                request.scalar.bytes(),
                 "bias",
             )?,
             None => 0,
         };
         let output = self.validate_external_span(
             request.output,
-            bytes_f32(mn, "output")?,
-            align_of::<f32>(),
+            bytes_scalar(mn, request.scalar, "output")?,
+            request.scalar.bytes(),
             "output",
         )?;
         let mut params = [
@@ -421,7 +487,7 @@ impl CudaBackend {
             pp(&row_bytes),
         ];
         raw_launch(
-            kernels.forward,
+            request.scalar.select(kernels.forward, kernels.forward_f16),
             grid(mn)?,
             (THREADS, 1, 1),
             0,
@@ -451,23 +517,38 @@ impl CudaBackend {
         let span = |pointer, elements, label| {
             self.validate_external_span(
                 pointer,
-                bytes_f32(elements, label)?,
-                align_of::<f32>(),
+                bytes_scalar(elements, request.scalar, label)?,
+                request.scalar.bytes(),
                 label,
             )
         };
         let grad_output = span(request.grad_output, mn, "grad_output")?;
         let input = span(request.input, mk, "input")?;
-        let master = span(request.master, nk, "master")?;
+        let master = self.validate_external_span(
+            request.master,
+            bytes_scalar(nk, request.master_scalar, "master")?,
+            request.master_scalar.bytes(),
+            "master",
+        )?;
         let packed_bytes = geometry
             .n
             .checked_mul(geometry.row_bytes)
             .ok_or_else(|| BackendError::InvalidInput("packed byte count overflows".into()))?;
         let packed =
             self.validate_external_span(request.packed, packed_bytes, 1, "packed weights")?;
-        let scales = span(request.scales, geometry.n, "scales")?;
+        let scales = self.validate_external_span(
+            request.scales,
+            bytes_f32(geometry.n, "scales")?,
+            align_of::<f32>(),
+            "scales",
+        )?;
         let grad_input = span(request.grad_input, mk, "grad_input")?;
-        let grad_master = span(request.grad_master, nk, "grad_master")?;
+        let grad_master = self.validate_external_span(
+            request.grad_master,
+            bytes_scalar(nk, request.master_scalar, "grad_master")?,
+            request.master_scalar.bytes(),
+            "grad_master",
+        )?;
         let grad_bias = request
             .grad_bias
             .map(|pointer| span(pointer, geometry.n, "grad_bias"))
@@ -484,7 +565,9 @@ impl CudaBackend {
             pp(&row_bytes),
         ];
         raw_launch(
-            kernels.grad_input,
+            request
+                .scalar
+                .select(kernels.grad_input, kernels.grad_input_f16),
             grid(mk)?,
             (THREADS, 1, 1),
             0,
@@ -503,7 +586,12 @@ impl CudaBackend {
             pp(&k),
         ];
         raw_launch(
-            kernels.grad_master,
+            request.scalar.select_grad_master(
+                request.master_scalar,
+                kernels.grad_master,
+                kernels.grad_master_f16,
+                kernels.grad_master_autocast,
+            )?,
             grid(nk)?,
             (THREADS, 1, 1),
             0,
@@ -514,7 +602,9 @@ impl CudaBackend {
         if let Some(grad_bias) = grad_bias {
             let mut bias_params = [pp(&grad_output), pp(&grad_bias), pp(&m), pp(&n)];
             raw_launch(
-                kernels.grad_bias,
+                request
+                    .scalar
+                    .select(kernels.grad_bias, kernels.grad_bias_f16),
                 grid(geometry.n)?,
                 (THREADS, 1, 1),
                 0,

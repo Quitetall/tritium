@@ -122,10 +122,30 @@ CUDA-wheel suite (247 tests plus nine subtests; one prerequisite skip), and
 compute-sanitizer memcheck on the native adversarial tests. This is unretained
 development evidence, not an admitted release receipt or performance claim.
 
-Remaining before Step 2 closes: native CUDA fp16/autocast optimization, CPU
-performance optimization/qualification, and retained representative-shape
-wrapper-overhead plus physical-CUDA receipts. Exploratory
-release-build timings are not a gate receipt:
+Native CUDA autocast now preserves the persistent `float32` master and optimizer
+gradient while casting only activation-facing input/bias/output to `float16`.
+Resident packing remains keyed to the original master, so repeated autocast
+forwards reuse TQ2_0 state instead of rebuilding projection tensors. Dedicated
+fp16 forward, packed activation VJP, bias VJP, direct-fp16 master VJP, and
+mixed-fp16/fp32 master VJP kernels accumulate in fp32 and write framework-owned
+outputs on the caller stream. Warm profiler coverage requires all four fp16
+kernels, rejects Torch projection/matmul and host transfers, and binds their
+resource ID to the non-default-stream sentinel. Tail-shape direct-fp16 and
+mixed-master cases pass compute-sanitizer with zero errors. Direct fp16 uses the
+fp16 minimum normal for safe-scale projection; smallest-subnormal
+forward/backward parity is explicit. Cache identity includes scalar dtype, and
+the native binding rejects same-width bfloat/integer reinterpretation before
+launch.
+
+Current unretained RTX 4090 development evidence: 25 dispatcher tests pass; the
+installed CUDA wheel passes 249 tests plus nine subtests with one prerequisite
+skip; the CUDA library passes 130 unit tests with six declared ignores plus four
+physical integration tests. These results are not admitted release receipts or
+performance claims.
+
+Remaining before Step 2 closes: CPU performance optimization/qualification and
+retained representative-shape wrapper-overhead plus physical-CUDA receipts.
+Exploratory release-build timings are not a gate receipt:
 native forward+backward remained 2.6–3.7× slower than this host's MKL-backed
 composite at `M=32`, so no CPU speedup claim is permitted yet.
 

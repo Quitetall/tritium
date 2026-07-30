@@ -47,6 +47,7 @@ pub use cuda::{CudaBackend, CudaDeviceIdentity, CudaMemorySnapshot, CudaMemoryTe
 #[doc(hidden)]
 pub use cuda::{
     ExternalLinearBackward, ExternalLinearForward, ExternalLinearGeometry, ExternalLinearPack,
+    ExternalLinearScalar,
 };
 
 // v0.3.1 (ADR 0013): the device-resident M=1 decode forward. The runner downcasts
