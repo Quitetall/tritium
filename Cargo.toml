@@ -93,6 +93,11 @@ metal = "=0.33.0"
 # pyo3 0.29.x: clears RUSTSEC-2025-0020 + RUSTSEC-2026-0176 (PyList/PyTuple nth OOB) +
 # the missing-Sync PyCFunction advisory. tritium-py uses the modern Bound API (stable here).
 pyo3 = "0.29"
+# DLPack ownership bridge for zero-copy PyTorch CPU tensors. Exact pins keep
+# wheel ABI/source review deterministic; `dlpark` 0.8 is the first release on
+# PyO3 0.29 and keeps all capsule unsafe inside the audited dependency.
+dlpark = { version = "=0.8.0", features = ["ndarray", "pyo3"] }
+ndarray = { version = "=0.17.2", default-features = false, features = ["std"] }
 # onnx interop (tritium-onnx, behind its `onnx` feature). default-features off so the crate opts
 # into exactly download-binaries + tls-rustls (fetch a prebuilt onnxruntime at build — no system
 # lib). Exact pin keeps cargo-deny wildcards=deny meaningful. rc.12 wraps ONNX Runtime 1.24.

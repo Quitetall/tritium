@@ -7,6 +7,8 @@ from typing import Optional, Tuple
 import torch
 import torch.nn.functional as F
 
+from tritium import _tritium as _native
+
 
 def _validate_linear_inputs(
     input: torch.Tensor, master: torch.Tensor, bias: Optional[torch.Tensor]
@@ -60,6 +62,31 @@ def reference_ternary_linear(
     return F.linear(input, differentiable, bias)
 
 
+def _native_cpu_supported(
+    input: torch.Tensor, master: torch.Tensor, bias: Optional[torch.Tensor]
+) -> bool:
+    native = getattr(_native, "_ternary_linear_cpu_dlpack", None)
+    return (
+        native is not None
+        and input.device.type == "cpu"
+        and input.dtype == torch.float32
+        and master.dtype == torch.float32
+        and input.is_contiguous()
+        and master.is_contiguous()
+        and input.numel() > 0
+        and master.shape[0] > 0
+        and master.shape[1] > 0
+        and (
+            bias is None
+            or (
+                bias.dtype == torch.float32
+                and bias.device.type == "cpu"
+                and bias.is_contiguous()
+            )
+        )
+    )
+
+
 @torch.library.custom_op(
     "tritium::ternary_linear",
     mutates_args=(),
@@ -71,6 +98,31 @@ def ternary_linear(
     """Hard ternary Linear over tensors resident on the current CPU/CUDA device."""
 
     _validate_linear_inputs(input, master, bias)
+    if _native_cpu_supported(input, master, bias):
+        detached_input = input.detach()
+        detached_master = master.detach()
+        detached_bias = bias.detach() if bias is not None else None
+        version = int(master._version)
+        storage_identity = int(master.untyped_storage()._cdata)
+
+        def call_native(scales: Optional[torch.Tensor]):
+            return _native._ternary_linear_cpu_dlpack(
+                detached_input,
+                detached_master,
+                detached_bias,
+                scales,
+                master,
+                version,
+                storage_identity,
+            )
+
+        capsule = call_native(None)
+        if capsule is None:
+            scales = detached_master.abs().mean(dim=1)
+            capsule = call_native(scales)
+            if capsule is None:
+                raise RuntimeError("native ternary Linear cache fill did not publish")
+        return torch.from_dlpack(capsule)
     projected, _mask = _projection_components(master)
     return F.linear(input, projected, bias)
 

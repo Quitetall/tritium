@@ -44,6 +44,8 @@ half = { workspace = true }
 ort = { workspace = true }
 # `abi3-py39`: build one wheel that works on CPython 3.9+ (forward-compatible).
 pyo3 = { workspace = true, features = ["extension-module", "abi3-py39"] }
+dlpark = { workspace = true }
+ndarray = { workspace = true }
 
 [build-dependencies]
 tritium-build-info = { workspace = true }

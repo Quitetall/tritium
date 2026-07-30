@@ -57,6 +57,23 @@ Gate: profiler records zero H2D/D2H copies or global synchronizations after
 setup; direct-adapter forward/backward parity passes; wrapper overhead is within
 5% of direct Tritium execution at frozen representative Linear shapes.
 
+CPU vertical slice landed:
+
+- compact CPU `float32` inputs and detached masters enter Rust through
+  single-consumer DLPack capsules without list, NumPy, or tensor copies;
+- TQ2_0 weights and per-row scales are retained in a bounded 4096-entry weak-owner cache
+  keyed by parameter identity, mutation version, storage identity, data pointer,
+  byte offset, and shape; both ordinary optimizer mutation and storage replacement
+  invalidate before the next forward;
+- output storage is Rust-owned and transferred to PyTorch through DLPack;
+- unsupported dtype/layout/device cases retain the exact composite fallback;
+- no persistent dense weight shadow is cached; current CPU backend unpack
+  scratch remains transient per call.
+
+Remaining before Step 2 closes: native backward, stream-aware CUDA input/output,
+CUDA packed-cache residency, sanitizer/profile evidence, and retained
+representative-shape performance receipts.
+
 ## Verification
 
 ```bash

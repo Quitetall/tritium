@@ -35,6 +35,7 @@ mod onnx;
 mod ops;
 mod qwen;
 mod salt;
+mod torch_native;
 
 use std::sync::Mutex;
 
@@ -335,6 +336,18 @@ fn _tritium(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(ops::ste_quantize_vjp, m)?)?;
     m.add_function(wrap_pyfunction!(ops::lsq_forward, m)?)?;
     m.add_function(wrap_pyfunction!(ops::lsq_vjp, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        torch_native::_ternary_linear_cpu_dlpack,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        torch_native::_ternary_linear_cache_clear,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        torch_native::_ternary_linear_cache_info,
+        m
+    )?)?;
     m.add_class::<salt::Qwen36PtqMasterReceipt>()?;
     m.add_class::<salt::Qwen36PtqPackageReceipt>()?;
     m.add_function(wrap_pyfunction!(salt::reconcile_qwen36_ptq_masters, m)?)?;
