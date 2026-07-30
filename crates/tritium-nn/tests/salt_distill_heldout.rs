@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use common::{extract, forward, logits_of, perplexity_windowed};
 use tritium_nn::ModelRunner;
 use tritium_train::ops::ste;
-use tritium_train::{AdamW, Optimizer, Tape};
+use tritium_train::{AdamW, LrSchedule, Optimizer, Tape};
 
 const T: usize = 2;
 const TRAIN_SEQ: usize = 32; // window length for the training corpus
@@ -440,9 +440,27 @@ fn salt_distillation_device_trainer_recovers_heldout() {
         );
     }
 
+    // Optional LR schedule (linear warmup → cosine decay). At the gate's constant LR the run descends
+    // fast then oscillates on a plateau without settling (WikiText-2: 3250 → 431 by step 2800, then
+    // flat at 460–570 for 2200 more steps) — decaying the LR is the standard remedy. Opt-in via
+    // TRITIUM_DISTILL_WARMUP=<steps>, so the committed gate's constant-LR behaviour is unchanged.
+    let lr_sched = std::env::var("TRITIUM_DISTILL_WARMUP")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(|warmup| LrSchedule::new(LR, LR * 0.05, warmup.min(steps), steps.max(1)));
+    if lr_sched.is_some() {
+        println!(
+            "lr schedule: warmup+cosine, peak {LR:e} → min {:e}",
+            LR * 0.05
+        );
+    }
+
     let mut step_ms = 0.0f64;
     for step in 1..=steps {
         let t0 = Instant::now();
+        if let Some(sched) = lr_sched.as_ref() {
+            trainer.set_lr(sched.lr(step - 1)); // `step` is 1-based; the schedule is 0-based
+        }
         let wi = ((step - 1) as usize) % windows.len();
         let toks = windows[wi];
         let tokens_i32: Vec<i32> = toks.iter().map(|&t| t as i32).collect();

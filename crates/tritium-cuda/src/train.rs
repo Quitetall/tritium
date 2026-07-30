@@ -1753,6 +1753,18 @@ impl<'a> DeviceTrainer<'a> {
         Ok(())
     }
 
+    /// Set the learning rate on every resident parameter's optimizer, for the **next** [`step`](Self::step).
+    ///
+    /// The [`LrSchedule`] (warmup + cosine decay) is deliberately outside the `Optimizer` trait, so a
+    /// campaign drives it by calling this with `schedule.lr(step)` before each step. Only `lr` changes;
+    /// betas/eps/weight-decay and all moment state are untouched, so a schedule can be introduced
+    /// mid-run without disturbing the optimizer's history.
+    pub fn set_lr(&mut self, lr: f32) {
+        for param in &mut self.params {
+            param.optimizer.lr = lr;
+        }
+    }
+
     /// Download one latent master for evaluation or checkpointing.
     pub fn download_master(&self, index: usize) -> Result<Vec<f32>, BackendError> {
         self.ensure_usable()?;
