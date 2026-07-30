@@ -76,10 +76,21 @@ CPU vertical slice landed:
 - no persistent dense weight shadow or transposed packed copy is cached; current
   CPU backend unpack scratch remains transient per call.
 
-Native CPU backward gate: dispatcher suite passes 18 tests; 40 frozen-seed spot
-checks bound observed forward/gradient drift to `4.77e-6`; full wheel suite
-passes 241 tests plus 9 subtests (one prerequisite skip). Warm backward profiles
-contain no Torch projection or matrix-multiply operators.
+The CPU cache now also retains the strict clipped-STE mask as one bit per master
+weight. Warm backward applies this compact mask directly to the projected-weight
+VJP, eliminating the repeated dense-master division and scan. TQ2_0 payload plus
+mask is about 3.06 bits/weight before the amortized row scales (more than 10x
+smaller than fp32 for representative transformer widths), and mask lifetime and
+invalidation are identical to packed trits. Zero-scale rows, strict boundary
+values, 64-bit word tails, optimizer mutation, and storage replacement remain
+covered by dispatcher parity tests. Direct packed CPU VJP and retained
+performance qualification remain open.
+
+At native CPU-backward landing, the dispatcher suite passed 18 tests; 40
+frozen-seed spot checks bounded observed forward/gradient drift to `4.77e-6`;
+the full wheel suite passed 241 tests plus 9 subtests with one prerequisite
+skip. Warm backward profiles contain no Torch projection or matrix-multiply
+operators.
 
 CUDA's backend-neutral packed VJP slice also landed. `CudaBackend` now overrides
 `mpgemm_projected_vjp`, consumes the existing resident TQ2_0 allocation, and
@@ -104,9 +115,10 @@ dispatcher schema:
   padding, and no dense projected-weight shadow;
 - a bounded weak-owner 4096-entry Python cache keys packed bytes/scales by
   parameter identity, mutation version, storage identity, data pointer, shape,
-  and device; optimizer mutation or storage replacement repacks before reuse.
-  Producer events order first-pack state across streams, and allocator stream
-  records keep evicted entries alive through queued reads;
+  scalar dtype, and device; optimizer mutation, storage replacement, or dtype
+  reinterpretation repacks before reuse. Producer events order first-pack state
+  across streams, and allocator stream records keep evicted entries alive
+  through queued reads;
 - native forward, packed activation VJP, strict masked master VJP, and bias VJP
   write directly into PyTorch allocations on the caller's current CUDA stream;
   scoped driver guards restore the caller's prior CUDA context;
@@ -117,10 +129,11 @@ dispatcher schema:
   forward/backward emits no projection/matmul Torch operators or H2D/D2H
   transfer.
 
-Local iteration on one RTX 4090 passed all 23 dispatcher tests, an installed
-CUDA-wheel suite (247 tests plus nine subtests; one prerequisite skip), and
-compute-sanitizer memcheck on the native adversarial tests. This is unretained
-development evidence, not an admitted release receipt or performance claim.
+At the float32 CUDA-slice landing, local iteration on one RTX 4090 passed all 23
+dispatcher tests, an installed CUDA-wheel suite (247 tests plus nine subtests;
+one prerequisite skip), and compute-sanitizer memcheck on the native adversarial
+tests. This was unretained development evidence, not an admitted release receipt
+or performance claim.
 
 Native CUDA autocast now preserves the persistent `float32` master and optimizer
 gradient while casting only activation-facing input/bias/output to `float16`.
@@ -137,8 +150,8 @@ forward/backward parity is explicit. Cache identity includes scalar dtype, and
 the native binding rejects same-width bfloat/integer reinterpretation before
 launch.
 
-Current unretained RTX 4090 development evidence: 25 dispatcher tests pass; the
-installed CUDA wheel passes 249 tests plus nine subtests with one prerequisite
+Current unretained RTX 4090 development evidence: 26 dispatcher tests pass; the
+installed CUDA wheel passes 250 tests plus nine subtests with one prerequisite
 skip; the CUDA library passes 130 unit tests with six declared ignores plus four
 physical integration tests. These results are not admitted release receipts or
 performance claims.
@@ -146,8 +159,8 @@ performance claims.
 Remaining before Step 2 closes: CPU performance optimization/qualification and
 retained representative-shape wrapper-overhead plus physical-CUDA receipts.
 Exploratory release-build timings are not a gate receipt:
-native forward+backward remained 2.6–3.7× slower than this host's MKL-backed
-composite at `M=32`, so no CPU speedup claim is permitted yet.
+pre-mask and post-mask runs show material host variance, so no CPU speedup claim
+is permitted until the frozen qualifier controls threads, warmup and sampling.
 
 ## Verification
 

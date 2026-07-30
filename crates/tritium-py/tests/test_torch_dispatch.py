@@ -31,6 +31,19 @@ def test_ternary_linear_op_matches_literal_forward_and_masked_backward():
     assert _native._ternary_linear_cache_info()["hits"] == 1
 
 
+def test_native_cpu_cached_ste_mask_handles_zero_scale_and_word_tail():
+    x = torch.ones(1, 65, requires_grad=True)
+    weight = torch.zeros(2, 65, requires_grad=True)
+    with torch.no_grad():
+        weight[1, -1] = 1.0
+
+    ternary_linear(x, weight).sum().backward()
+
+    assert torch.equal(weight.grad[0], torch.zeros(65))
+    assert torch.equal(weight.grad[1, :-1], torch.ones(64))
+    assert weight.grad[1, -1].item() == 0.0
+
+
 def test_native_cpu_forward_caches_packed_weight_and_invalidates_on_mutation():
     _native._ternary_linear_cache_clear()
     weight = torch.tensor(
@@ -73,6 +86,11 @@ def test_native_cpu_forward_caches_packed_weight_and_invalidates_on_mutation():
         "invalidations": 1,
         "misses": 2,
     }
+    expected_weight = weight.detach().clone().requires_grad_()
+    reference_ternary_linear(x, expected_weight, bias).sum().backward()
+    third.sum().backward()
+    torch.testing.assert_close(weight.grad, expected_weight.grad)
+    weight.grad = None
 
     # Replacing storage through the legacy `.data` escape hatch does not bump
     # PyTorch's version counter. Native cache keys also bind the DLPack storage
@@ -82,10 +100,12 @@ def test_native_cpu_forward_caches_packed_weight_and_invalidates_on_mutation():
     assert weight._version == version_before_storage_swap
     fourth = ternary_linear(x, weight, bias)
     assert torch.allclose(fourth, torch.tensor([[10.1, 9.8]]), atol=1e-6)
+    fourth.sum().backward()
+    assert torch.equal(weight.grad, torch.zeros_like(weight))
     assert _native._ternary_linear_cache_info() == {
         "capacity": 4096,
         "entries": 1,
-        "hits": 1,
+        "hits": 3,
         "invalidations": 2,
         "misses": 3,
     }

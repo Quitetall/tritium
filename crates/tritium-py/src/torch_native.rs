@@ -2,8 +2,9 @@
 //!
 //! Inputs arrive through DLPack and remain owned by PyTorch. Outputs are
 //! Rust-owned ndarrays exported through a single-use DLPack capsule. Packed
-//! TQ2_0 weights are cached by Python parameter identity, storage identity,
-//! shape, and PyTorch's mutation version. No dense weight shadow is retained.
+//! TQ2_0 weights and one-bit strict-STE masks are cached by Python parameter
+//! identity, storage identity, shape, and PyTorch's mutation version. No dense
+//! weight shadow is retained.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -36,6 +37,7 @@ struct LinearGeometry {
 struct PackedLinear {
     weights: Box<dyn DeviceBuffer>,
     scales: Vec<f32>,
+    strict_ste_mask: Vec<u64>,
     n: usize,
     k: usize,
 }
@@ -188,6 +190,55 @@ fn export_array(
     Ok(dlpack.into_pyobject(py)?.unbind())
 }
 
+fn strict_ste_mask_words(master: &[f32], scales: &[f32], n: usize, k: usize) -> PyResult<Vec<u64>> {
+    let elements = n
+        .checked_mul(k)
+        .ok_or_else(|| PyValueError::new_err("strict STE mask element count overflows"))?;
+    if master.len() != elements || scales.len() != n {
+        return Err(PyValueError::new_err(
+            "strict STE mask inputs do not match linear geometry",
+        ));
+    }
+    let mut words = vec![0u64; elements.div_ceil(u64::BITS as usize)];
+    for (ni, (row, &scale)) in master.chunks_exact(k).zip(scales).enumerate() {
+        if scale.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
+            continue;
+        }
+        let denominator = scale.max(f32::MIN_POSITIVE);
+        for (ki, &value) in row.iter().enumerate() {
+            if (value / denominator).abs() < 1.0 {
+                let index = ni * k + ki;
+                words[index / u64::BITS as usize] |= 1u64 << (index % u64::BITS as usize);
+            }
+        }
+    }
+    Ok(words)
+}
+
+fn apply_strict_ste_mask(words: &[u64], gradients: &mut [f32]) {
+    debug_assert_eq!(words.len(), gradients.len().div_ceil(u64::BITS as usize));
+    for (word, chunk) in words.iter().copied().zip(gradients.chunks_mut(64)) {
+        let valid = if chunk.len() == 64 {
+            u64::MAX
+        } else {
+            (1u64 << chunk.len()) - 1
+        };
+        let word = word & valid;
+        if word == valid {
+            continue;
+        }
+        if word == 0 {
+            chunk.fill(0.0);
+            continue;
+        }
+        for (bit, gradient) in chunk.iter_mut().enumerate() {
+            if word & (1u64 << bit) == 0 {
+                *gradient = 0.0;
+            }
+        }
+    }
+}
+
 fn build_packed(
     backend: &dyn TernaryBackend,
     master: &[f32],
@@ -246,6 +297,7 @@ fn build_packed(
             .map_err(|error| PyRuntimeError::new_err(format!("cannot pack master row: {error}")))?;
     }
 
+    let strict_ste_mask = strict_ste_mask_words(master, scales, n, k)?;
     let shape = GemmShape::new(0, n, k);
     let weights = backend
         .upload_weights(&packed, shape, TernaryFormat::Tq2_0)
@@ -253,6 +305,7 @@ fn build_packed(
     Ok(Arc::new(PackedLinear {
         weights,
         scales: scales.to_vec(),
+        strict_ste_mask,
         n,
         k,
     }))
@@ -508,18 +561,7 @@ pub(crate) fn _ternary_linear_backward_cpu_dlpack(
             })
     })?;
 
-    for ((master_row, grad_row), &scale) in master_values
-        .chunks_exact(k)
-        .zip(grad_master.chunks_exact_mut(k))
-        .zip(&packed.scales)
-    {
-        let denominator = scale.max(f32::MIN_POSITIVE);
-        for (&master_value, grad_value) in master_row.iter().zip(grad_row) {
-            if !(scale > 0.0 && (master_value / denominator).abs() < 1.0) {
-                *grad_value = 0.0;
-            }
-        }
-    }
+    apply_strict_ste_mask(&packed.strict_ste_mask, &mut grad_master);
 
     let grad_input = export_array(py, &input_shape, grad_input, "native grad_input")?;
     let grad_master = export_array(py, &master_shape, grad_master, "native grad_master")?;
