@@ -44,7 +44,7 @@ use core::any::Any;
 use std::collections::HashMap;
 #[cfg(feature = "device-loss-qualification")]
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaGraph, CudaModule, CudaSlice, CudaStream, CudaView, DevicePtr,
@@ -3689,6 +3689,11 @@ impl CudaDecodeModel {
     }
 }
 
+mod framework_external;
+use framework_external::{CurrentContextRestore, ExternalCudaKernels};
+pub use framework_external::{
+    ExternalLinearBackward, ExternalLinearForward, ExternalLinearGeometry, ExternalLinearPack,
+};
 mod graph_raw;
 pub use graph_raw::BatchKv;
 use graph_raw::*;

@@ -152,6 +152,25 @@ fn salt_v2_dense_weights(tensor: &SaltV2Tensor) -> Vec<f32> {
     dense
 }
 
+#[test]
+fn backend_creation_restores_callers_current_context() {
+    if result::init().is_err() {
+        eprintln!("skipping context-restoration gate: CUDA driver unavailable");
+        return;
+    }
+    let before = result::ctx::get_current().expect("query context before backend construction");
+    let backend = match CudaBackend::new(0) {
+        Ok(backend) => backend,
+        Err(error) => {
+            eprintln!("skipping context-restoration gate: no device ({error})");
+            return;
+        }
+    };
+    let after = result::ctx::get_current().expect("query context after backend construction");
+    assert_eq!(after, before);
+    drop(backend);
+}
+
 /// Plan 0043 model-loader seam: a caller-owned host output can be reused across
 /// SALT V2 projections. The returned receipt remains identical to the allocating
 /// API and no dense weight allocation is introduced.

@@ -57,6 +57,9 @@ struct CacheStats {
 }
 
 static CACHE: OnceLock<Mutex<VecDeque<CacheEntry>>> = OnceLock::new();
+#[cfg(feature = "cuda")]
+static CUDA_BACKENDS: OnceLock<Mutex<BTreeMap<usize, Arc<tritium_cuda::CudaBackend>>>> =
+    OnceLock::new();
 static CACHE_STATS: CacheStats = CacheStats {
     hits: AtomicU64::new(0),
     misses: AtomicU64::new(0),
@@ -71,6 +74,23 @@ fn cache_lock() -> PyResult<std::sync::MutexGuard<'static, VecDeque<CacheEntry>>
     cache()
         .lock()
         .map_err(|_| PyRuntimeError::new_err("ternary packed-weight cache lock is poisoned"))
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_backend(ordinal: usize) -> PyResult<Arc<tritium_cuda::CudaBackend>> {
+    let cache = CUDA_BACKENDS.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut cache = cache
+        .lock()
+        .map_err(|_| PyRuntimeError::new_err("CUDA backend cache lock is poisoned"))?;
+    if let Some(backend) = cache.get(&ordinal) {
+        return Ok(Arc::clone(backend));
+    }
+    let backend = Arc::new(
+        tritium_cuda::CudaBackend::new(ordinal)
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?,
+    );
+    cache.insert(ordinal, Arc::clone(&backend));
+    Ok(backend)
 }
 
 fn tensor_shape(tensor: &Dlpack, label: &str) -> PyResult<Vec<usize>> {
@@ -507,6 +527,232 @@ pub(crate) fn _ternary_linear_backward_cpu_dlpack(
         .map(|values| export_array(py, &[n], values, "native grad_bias"))
         .transpose()?;
     Ok(Some((grad_input, grad_master, grad_bias)))
+}
+
+/// Pack a framework-owned fp32 CUDA master into framework-owned TQ2_0 bytes.
+#[cfg(feature = "cuda")]
+fn cuda_tensor_pointer(
+    tensor: &Bound<'_, PyAny>,
+    elements: usize,
+    element_bytes: usize,
+    label: &str,
+) -> PyResult<usize> {
+    let actual_element_bytes: usize = tensor.call_method0("element_size")?.extract()?;
+    let actual_elements: usize = tensor.call_method0("numel")?.extract()?;
+    let contiguous: bool = tensor.call_method0("is_contiguous")?.extract()?;
+    let required_bytes = elements
+        .checked_mul(element_bytes)
+        .ok_or_else(|| PyValueError::new_err(format!("{label} byte count overflows")))?;
+    let actual_bytes = actual_elements
+        .checked_mul(actual_element_bytes)
+        .ok_or_else(|| PyValueError::new_err(format!("{label} storage size overflows")))?;
+    if !contiguous || actual_element_bytes != element_bytes || actual_bytes < required_bytes {
+        return Err(PyValueError::new_err(format!(
+            "{label} must be contiguous and cover {required_bytes} bytes in {element_bytes}-byte elements"
+        )));
+    }
+    tensor.call_method0("data_ptr")?.extract()
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_stream_pointer(stream: &Bound<'_, PyAny>) -> PyResult<usize> {
+    stream.getattr("cuda_stream")?.extract()
+}
+
+#[cfg(feature = "cuda")]
+fn record_cuda_stream(tensor: &Bound<'_, PyAny>, stream: &Bound<'_, PyAny>) -> PyResult<()> {
+    tensor.call_method1("record_stream", (stream,))?;
+    Ok(())
+}
+
+/// Pack a framework-owned fp32 CUDA master into framework-owned TQ2_0 bytes.
+#[cfg(feature = "cuda")]
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn _ternary_linear_cuda_pack(
+    py: Python<'_>,
+    master: &Bound<'_, PyAny>,
+    scales: &Bound<'_, PyAny>,
+    packed: &Bound<'_, PyAny>,
+    n: usize,
+    k: usize,
+    row_bytes: usize,
+    stream: &Bound<'_, PyAny>,
+    device: usize,
+) -> PyResult<()> {
+    let nk = n
+        .checked_mul(k)
+        .ok_or_else(|| PyValueError::new_err("master element count overflows"))?;
+    let packed_elements = n
+        .checked_mul(row_bytes)
+        .ok_or_else(|| PyValueError::new_err("packed byte count overflows"))?;
+    let master_ptr = cuda_tensor_pointer(master, nk, 4, "master")?;
+    let scales_ptr = cuda_tensor_pointer(scales, n, 4, "scales")?;
+    let packed_ptr = cuda_tensor_pointer(packed, packed_elements, 1, "packed weights")?;
+    let stream_ptr = cuda_stream_pointer(stream)?;
+    record_cuda_stream(master, stream)?;
+    record_cuda_stream(scales, stream)?;
+    record_cuda_stream(packed, stream)?;
+    let backend = cuda_backend(device)?;
+    py.detach(|| {
+        // SAFETY: live PyTorch owners cover each checked contiguous span and
+        // `record_stream` defers allocator reuse until caller-stream completion.
+        #[allow(unsafe_code)]
+        unsafe {
+            backend.external_linear_pack(tritium_cuda::ExternalLinearPack {
+                stream: stream_ptr,
+                master: master_ptr,
+                scales: scales_ptr,
+                packed: packed_ptr,
+                n,
+                k,
+                row_bytes,
+            })
+        }
+        .map_err(|error| PyRuntimeError::new_err(error.to_string()))
+    })
+}
+
+/// Run fp32 projected ternary Linear on framework-owned CUDA storage/stream.
+#[cfg(feature = "cuda")]
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn _ternary_linear_cuda_forward(
+    py: Python<'_>,
+    input: &Bound<'_, PyAny>,
+    packed: &Bound<'_, PyAny>,
+    scales: &Bound<'_, PyAny>,
+    bias: Option<&Bound<'_, PyAny>>,
+    output: &Bound<'_, PyAny>,
+    m: usize,
+    n: usize,
+    k: usize,
+    row_bytes: usize,
+    stream: &Bound<'_, PyAny>,
+    device: usize,
+) -> PyResult<()> {
+    let mk = m
+        .checked_mul(k)
+        .ok_or_else(|| PyValueError::new_err("input element count overflows"))?;
+    let mn = m
+        .checked_mul(n)
+        .ok_or_else(|| PyValueError::new_err("output element count overflows"))?;
+    let packed_elements = n
+        .checked_mul(row_bytes)
+        .ok_or_else(|| PyValueError::new_err("packed byte count overflows"))?;
+    let input_ptr = cuda_tensor_pointer(input, mk, 4, "input")?;
+    let packed_ptr = cuda_tensor_pointer(packed, packed_elements, 1, "packed weights")?;
+    let scales_ptr = cuda_tensor_pointer(scales, n, 4, "scales")?;
+    let bias_ptr = bias
+        .map(|tensor| cuda_tensor_pointer(tensor, n, 4, "bias"))
+        .transpose()?;
+    let output_ptr = cuda_tensor_pointer(output, mn, 4, "output")?;
+    let stream_ptr = cuda_stream_pointer(stream)?;
+    for tensor in [input, packed, scales, output] {
+        record_cuda_stream(tensor, stream)?;
+    }
+    if let Some(tensor) = bias {
+        record_cuda_stream(tensor, stream)?;
+    }
+    let backend = cuda_backend(device)?;
+    py.detach(|| {
+        // SAFETY: live PyTorch owners cover each checked contiguous span and
+        // `record_stream` defers allocator reuse until caller-stream completion.
+        #[allow(unsafe_code)]
+        unsafe {
+            backend.external_linear_forward(tritium_cuda::ExternalLinearForward {
+                stream: stream_ptr,
+                input: input_ptr,
+                packed: packed_ptr,
+                scales: scales_ptr,
+                bias: bias_ptr,
+                output: output_ptr,
+                geometry: tritium_cuda::ExternalLinearGeometry { m, n, k, row_bytes },
+            })
+        }
+        .map_err(|error| PyRuntimeError::new_err(error.to_string()))
+    })
+}
+
+/// Run fp32 activation/master/bias VJPs on framework-owned CUDA storage/stream.
+#[cfg(feature = "cuda")]
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn _ternary_linear_cuda_backward(
+    py: Python<'_>,
+    grad_output: &Bound<'_, PyAny>,
+    input: &Bound<'_, PyAny>,
+    master: &Bound<'_, PyAny>,
+    packed: &Bound<'_, PyAny>,
+    scales: &Bound<'_, PyAny>,
+    grad_input: &Bound<'_, PyAny>,
+    grad_master: &Bound<'_, PyAny>,
+    grad_bias: Option<&Bound<'_, PyAny>>,
+    m: usize,
+    n: usize,
+    k: usize,
+    row_bytes: usize,
+    stream: &Bound<'_, PyAny>,
+    device: usize,
+) -> PyResult<()> {
+    let mk = m
+        .checked_mul(k)
+        .ok_or_else(|| PyValueError::new_err("activation element count overflows"))?;
+    let mn = m
+        .checked_mul(n)
+        .ok_or_else(|| PyValueError::new_err("upstream element count overflows"))?;
+    let nk = n
+        .checked_mul(k)
+        .ok_or_else(|| PyValueError::new_err("master element count overflows"))?;
+    let packed_elements = n
+        .checked_mul(row_bytes)
+        .ok_or_else(|| PyValueError::new_err("packed byte count overflows"))?;
+    let grad_output_ptr = cuda_tensor_pointer(grad_output, mn, 4, "grad_output")?;
+    let input_ptr = cuda_tensor_pointer(input, mk, 4, "input")?;
+    let master_ptr = cuda_tensor_pointer(master, nk, 4, "master")?;
+    let packed_ptr = cuda_tensor_pointer(packed, packed_elements, 1, "packed weights")?;
+    let scales_ptr = cuda_tensor_pointer(scales, n, 4, "scales")?;
+    let grad_input_ptr = cuda_tensor_pointer(grad_input, mk, 4, "grad_input")?;
+    let grad_master_ptr = cuda_tensor_pointer(grad_master, nk, 4, "grad_master")?;
+    let grad_bias_ptr = grad_bias
+        .map(|tensor| cuda_tensor_pointer(tensor, n, 4, "grad_bias"))
+        .transpose()?;
+    let stream_ptr = cuda_stream_pointer(stream)?;
+    for tensor in [
+        grad_output,
+        input,
+        master,
+        packed,
+        scales,
+        grad_input,
+        grad_master,
+    ] {
+        record_cuda_stream(tensor, stream)?;
+    }
+    if let Some(tensor) = grad_bias {
+        record_cuda_stream(tensor, stream)?;
+    }
+    let backend = cuda_backend(device)?;
+    py.detach(|| {
+        // SAFETY: live PyTorch owners cover each checked contiguous span and
+        // `record_stream` defers allocator reuse until caller-stream completion.
+        #[allow(unsafe_code)]
+        unsafe {
+            backend.external_linear_backward(tritium_cuda::ExternalLinearBackward {
+                stream: stream_ptr,
+                grad_output: grad_output_ptr,
+                input: input_ptr,
+                master: master_ptr,
+                packed: packed_ptr,
+                scales: scales_ptr,
+                grad_input: grad_input_ptr,
+                grad_master: grad_master_ptr,
+                grad_bias: grad_bias_ptr,
+                geometry: tritium_cuda::ExternalLinearGeometry { m, n, k, row_bytes },
+            })
+        }
+        .map_err(|error| PyRuntimeError::new_err(error.to_string()))
+    })
 }
 
 /// Reset native packed-weight cache and deterministic diagnostics counters.

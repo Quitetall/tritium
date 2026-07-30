@@ -15,8 +15,9 @@
 //! Every fallible Rust path returns a `Result`; the boundary converts each error
 //! into a Python exception ([`PyValueError`] / [`PyRuntimeError`]) rather than
 //! unwinding. A wrong dtype, a wrong shape, or a malformed model therefore raises a
-//! catchable Python exception — never a segfault or an abort. The crate carries no
-//! hand-written `unsafe`; the GIL release uses the safe [`Python::detach`].
+//! catchable Python exception — never a segfault or an abort. Unsafe code is
+//! denied by default; the CUDA framework adapter has three scoped, documented
+//! calls after tensor-span validation and allocator stream tracking.
 //!
 //! ## Threading
 //!
@@ -25,7 +26,7 @@
 //! the lock, so concurrent `generate` calls from multiple Python threads serialize
 //! on the model (correct, deadlock-free) while *other* Python work proceeds freely
 //! during the compute.
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 #![allow(unreachable_pub)] // pyo3's `#[pymethods]` expansion emits `pub` items.
 
 mod hf_assets;
@@ -352,6 +353,21 @@ fn _tritium(m: &Bound<'_, PyModule>) -> PyResult<()> {
         torch_native::_ternary_linear_cache_info,
         m
     )?)?;
+    #[cfg(feature = "cuda")]
+    {
+        m.add_function(wrap_pyfunction!(
+            torch_native::_ternary_linear_cuda_pack,
+            m
+        )?)?;
+        m.add_function(wrap_pyfunction!(
+            torch_native::_ternary_linear_cuda_forward,
+            m
+        )?)?;
+        m.add_function(wrap_pyfunction!(
+            torch_native::_ternary_linear_cuda_backward,
+            m
+        )?)?;
+    }
     m.add_class::<salt::Qwen36PtqMasterReceipt>()?;
     m.add_class::<salt::Qwen36PtqPackageReceipt>()?;
     m.add_function(wrap_pyfunction!(salt::reconcile_qwen36_ptq_masters, m)?)?;

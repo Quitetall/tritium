@@ -598,6 +598,8 @@ pub struct CudaBackend {
     /// Packed TQ2_0 first-order VJP kernels for framework-native ternary Linear.
     pub(super) func_projected_grad_a: CudaFunction,
     pub(super) func_projected_grad_weight: CudaFunction,
+    /// Raw handles for validated framework-owned pointers and caller streams.
+    pub(super) external_kernels: OnceLock<ExternalCudaKernels>,
     /// ADR 0027 Track A: per-row SALT residual quantization on resident f32 buffers.
     #[allow(dead_code)] // consumed by DeviceTrainer in the next Track A slice
     pub(super) func_salt_quantize_fwd: CudaFunction,
@@ -724,6 +726,8 @@ impl CudaBackend {
     /// fails to load, or the kernel symbol is missing (no driver, no GPU, malformed
     /// PTX, …).
     pub fn new(ordinal: usize) -> Result<Self, BackendError> {
+        result::init().map_err(|e| driver_err("initialize CUDA driver", &e))?;
+        let _context = CurrentContextRestore::capture()?;
         let ctx = CudaContext::new(ordinal).map_err(|e| driver_err("open cuda device", &e))?;
         let stream = ctx.default_stream();
 
@@ -1096,6 +1100,7 @@ impl CudaBackend {
             func_grad_s,
             func_projected_grad_a,
             func_projected_grad_weight,
+            external_kernels: OnceLock::new(),
             func_salt_quantize_fwd,
             func_adamw_step,
             func_adamw_step_8bit,

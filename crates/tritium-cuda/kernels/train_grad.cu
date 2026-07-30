@@ -78,6 +78,87 @@ extern "C" __global__ void ternary_matmul_grad_w(
 #define PROJECTED_VJP_QK 256
 #define PROJECTED_VJP_TQ2_BLOCK_BYTES 66
 
+// Framework adapter: pack one dense fp32 master row into inference-native
+// TQ2_0. One thread owns a row, so no atomics or cross-thread reduction can
+// change projection semantics. Block scales stay 1.0 because row scales live
+// in the separate fp32 scale tensor.
+extern "C" __global__ void tq2_pack_from_master_scale(
+    const float* __restrict__ master,          // [N, K]
+    const float* __restrict__ scales,          // [N]
+    unsigned char* __restrict__ weights,       // [N, row_bytes]
+    int n, int k, int row_bytes)
+{
+    int ni = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ni >= n) return;
+    const float scale = scales[ni];
+    const float denominator = fmaxf(scale, 1.1754943508222875e-38f);
+    unsigned char* row = weights + (long)ni * row_bytes;
+    const int blocks = (k + PROJECTED_VJP_QK - 1) / PROJECTED_VJP_QK;
+
+    for (int block = 0; block < blocks; ++block) {
+        unsigned char* packed = row + block * PROJECTED_VJP_TQ2_BLOCK_BYTES;
+        for (int byte = 0; byte < 64; ++byte) packed[byte] = 0x55u;
+        packed[64] = 0x00u; // IEEE-f16 1.0, little endian.
+        packed[65] = 0x3cu;
+    }
+
+    if (!(scale > 0.0f) || !isfinite(scale)) return;
+    for (int ki = 0; ki < k; ++ki) {
+        float quantized = nearbyintf(master[(long)ni * k + ki] / denominator);
+        quantized = fminf(1.0f, fmaxf(-1.0f, quantized));
+        unsigned int code = quantized < 0.0f ? 0u : (quantized > 0.0f ? 2u : 1u);
+        int block = ki / PROJECTED_VJP_QK;
+        int e = ki - block * PROJECTED_VJP_QK;
+        int c = e >> 7;
+        int mm = e & 31;
+        int l = (e & 127) >> 5;
+        unsigned char* byte =
+            row + block * PROJECTED_VJP_TQ2_BLOCK_BYTES + c * 32 + mm;
+        unsigned char mask = (unsigned char)(3u << (2 * l));
+        *byte = (unsigned char)((*byte & ~mask) | (code << (2 * l)));
+    }
+}
+
+// Stream-native framework forward. `bias` may be null. Packed weights and
+// scales remain resident across calls; output storage belongs to framework.
+extern "C" __global__ void tq2_projected_linear_forward(
+    const float* __restrict__ a,               // [M, K]
+    const unsigned char* __restrict__ weights, // [N, row_bytes]
+    const float* __restrict__ scales,           // [N]
+    const float* __restrict__ bias,             // [N] or null
+    float* __restrict__ y,                      // [M, N]
+    int m, int n, int k, int row_bytes)
+{
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (long)m * n) return;
+    int mi = idx / n;
+    int ni = idx % n;
+    const unsigned char* row = weights + (long)ni * row_bytes;
+    if (!isfinite(scales[ni])) {
+        y[idx] = NAN;
+        return;
+    }
+    float acc = 0.0f;
+    for (int ki = 0; ki < k; ++ki) {
+        int block = ki / PROJECTED_VJP_QK;
+        int e = ki - block * PROJECTED_VJP_QK;
+        int c = e >> 7;
+        int mm = e & 31;
+        int l = (e & 127) >> 5;
+        int byte_off = block * PROJECTED_VJP_TQ2_BLOCK_BYTES + c * 32 + mm;
+        unsigned int code = ((unsigned int)row[byte_off] >> (2 * l)) & 3u;
+        float av = a[(long)mi * k + ki];
+        if (!isfinite(av)) {
+            acc = NAN;
+            break;
+        }
+        if (code == 2u) acc += av;
+        else if (code == 0u) acc -= av;
+    }
+    float value = scales[ni] * acc;
+    y[idx] = bias ? value + bias[ni] : value;
+}
+
 extern "C" __global__ void tq2_projected_grad_a(
     const float* __restrict__ gy,              // [M, N]
     const unsigned char* __restrict__ weights, // [N, row_bytes]
@@ -101,6 +182,10 @@ extern "C" __global__ void tq2_projected_grad_a(
         const unsigned char* wrow = weights + (long)ni * row_bytes;
         unsigned int code = ((unsigned int)wrow[byte_off] >> (2 * l)) & 3u;
         float upstream = gy[(long)mi * n + ni] * scales[ni];
+        if (!isfinite(gy[(long)mi * n + ni]) || !isfinite(scales[ni])) {
+            acc = NAN;
+            break;
+        }
         if (code == 2u) {
             acc += upstream;
         } else if (code == 0u) {
@@ -127,6 +212,32 @@ extern "C" __global__ void linear_grad_projected_weight(
         acc += gy[(long)mi * n + ni] * a[(long)mi * k + ki];
     }
     gp[idx] = acc;
+}
+
+// Dense-master VJP with frozen AbsMean scale and strict clipped STE mask:
+// gMaster[n,k] = sum_m gy[m,n] * A[m,k] when
+// abs(master[n,k] / max(scale[n], FLT_MIN)) < 1 and scale[n] > 0.
+extern "C" __global__ void linear_grad_master_ste(
+    const float* __restrict__ gy,      // [M, N]
+    const float* __restrict__ a,       // [M, K]
+    const float* __restrict__ master,  // [N, K]
+    const float* __restrict__ scales,  // [N]
+    float* __restrict__ gm,            // [N, K]
+    int m, int n, int k)
+{
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (long)n * k) return;
+    int ni = idx / k;
+    int ki = idx % k;
+    float scale = scales[ni];
+    float denominator = fmaxf(scale, 1.1754943508222875e-38f);
+    float mask =
+        scale > 0.0f && fabsf(master[idx] / denominator) < 1.0f ? 1.0f : 0.0f;
+    float acc = 0.0f;
+    for (int mi = 0; mi < m; ++mi) {
+        acc += gy[(long)mi * n + ni] * a[(long)mi * k + ki];
+    }
+    gm[idx] = acc * mask;
 }
 
 // gs[n] = sum_m gy[m,n] * P[m,n],  P[m,n] = sum_k A[m,k] * W[n,k]  (unscaled)   (shape [N])

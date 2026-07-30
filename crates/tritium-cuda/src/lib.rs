@@ -43,6 +43,11 @@ mod cuda;
 pub use cuda::request_destructive_context_loss_for_qualification;
 #[cfg(feature = "cuda")]
 pub use cuda::{CudaBackend, CudaDeviceIdentity, CudaMemorySnapshot, CudaMemoryTelemetry};
+#[cfg(feature = "cuda")]
+#[doc(hidden)]
+pub use cuda::{
+    ExternalLinearBackward, ExternalLinearForward, ExternalLinearGeometry, ExternalLinearPack,
+};
 
 // v0.3.1 (ADR 0013): the device-resident M=1 decode forward. The runner downcasts
 // its `dyn TernaryBackend` to `CudaBackend`, builds a `CudaDecodeModel` once from a

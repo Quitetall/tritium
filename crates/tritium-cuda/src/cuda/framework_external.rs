@@ -1,0 +1,558 @@
+//! Validated CUDA adapter for framework-owned tensor storage and streams.
+//!
+//! PyTorch retains allocation and lifetime ownership. Every public safe call
+//! validates context, allocation range, alignment, and geometry before the
+//! narrow raw-driver launch. No synchronization or host transfer occurs.
+
+use super::graph_raw::{pp, raw_launch};
+use super::*;
+
+const THREADS: u32 = 256;
+
+/// Shared MxNxK geometry for external ternary Linear launches.
+#[derive(Clone, Copy, Debug)]
+pub struct ExternalLinearGeometry {
+    pub m: usize,
+    pub n: usize,
+    pub k: usize,
+    pub row_bytes: usize,
+}
+
+/// Framework-owned buffers used to pack one dense master weight.
+#[derive(Clone, Copy, Debug)]
+pub struct ExternalLinearPack {
+    pub stream: usize,
+    pub master: usize,
+    pub scales: usize,
+    pub packed: usize,
+    pub n: usize,
+    pub k: usize,
+    pub row_bytes: usize,
+}
+
+/// Framework-owned buffers used by one projected ternary forward.
+#[derive(Clone, Copy, Debug)]
+pub struct ExternalLinearForward {
+    pub stream: usize,
+    pub input: usize,
+    pub packed: usize,
+    pub scales: usize,
+    pub bias: Option<usize>,
+    pub output: usize,
+    pub geometry: ExternalLinearGeometry,
+}
+
+/// Framework-owned buffers used by one first-order projected VJP.
+#[derive(Clone, Copy, Debug)]
+pub struct ExternalLinearBackward {
+    pub stream: usize,
+    pub grad_output: usize,
+    pub input: usize,
+    pub master: usize,
+    pub packed: usize,
+    pub scales: usize,
+    pub grad_input: usize,
+    pub grad_master: usize,
+    pub grad_bias: Option<usize>,
+    pub geometry: ExternalLinearGeometry,
+}
+
+#[derive(Debug)]
+pub(super) struct ExternalCudaKernels {
+    context: Arc<CudaContext>,
+    module: sys::CUmodule,
+    pack: sys::CUfunction,
+    forward: sys::CUfunction,
+    grad_input: sys::CUfunction,
+    grad_master: sys::CUfunction,
+    grad_bias: sys::CUfunction,
+}
+
+// SAFETY: handles are immutable process-valid driver handles. CUDA Driver API
+// permits launches from multiple host threads; each call supplies and validates
+// its own stream. Module unload happens only after owning backend is dropped.
+#[allow(unsafe_code)]
+unsafe impl Send for ExternalCudaKernels {}
+// SAFETY: same invariant; shared access mutates no Rust memory.
+#[allow(unsafe_code)]
+unsafe impl Sync for ExternalCudaKernels {}
+
+impl ExternalCudaKernels {
+    pub(super) fn load(ctx: &Arc<CudaContext>) -> Result<Self, BackendError> {
+        ctx.bind_to_thread()
+            .map_err(|error| driver_err("external kernels bind", &error))?;
+        let ptx = CString::new(TRAIN_GRAD_PTX)
+            .map_err(|_| BackendError::InvalidInput("training PTX has an interior NUL".into()))?;
+        // SAFETY: `ptx` is a live NUL-terminated PTX image. Returned module is
+        // owned by this value and unloaded exactly once in Drop.
+        #[allow(unsafe_code)]
+        let module = unsafe { result::module::load_data(ptx.as_ptr().cast()) }
+            .map_err(|error| driver_err("external module load_data", &error))?;
+        let get = |name: &str| -> Result<sys::CUfunction, BackendError> {
+            let name = CString::new(name).map_err(|_| {
+                BackendError::InvalidInput("kernel name has an interior NUL".into())
+            })?;
+            // SAFETY: module stays live; names are frozen extern-C PTX symbols.
+            #[allow(unsafe_code)]
+            unsafe { result::module::get_function(module, name) }
+                .map_err(|error| driver_err("external module get_function", &error))
+        };
+        let loaded = (|| {
+            Ok(Self {
+                context: Arc::clone(ctx),
+                module,
+                pack: get(KERNEL_NAME_EXTERNAL_PACK)?,
+                forward: get(KERNEL_NAME_EXTERNAL_FORWARD)?,
+                grad_input: get(KERNEL_NAME_PROJECTED_GRAD_A)?,
+                grad_master: get(KERNEL_NAME_EXTERNAL_GRAD_MASTER)?,
+                grad_bias: get(KERNEL_NAME_BIAS_BWD)?,
+            })
+        })();
+        if loaded.is_err() {
+            // SAFETY: ownership has not escaped; unload failed partial module.
+            #[allow(unsafe_code)]
+            unsafe {
+                let _ = result::module::unload(module);
+            }
+        }
+        loaded
+    }
+}
+
+impl Drop for ExternalCudaKernels {
+    fn drop(&mut self) {
+        if !self.module.is_null() {
+            let _context = CurrentContextRestore::bind(&self.context).ok();
+            // SAFETY: module was loaded by `load`, is owned here, and no launch
+            // can outlive the backend borrow required to start it.
+            #[allow(unsafe_code)]
+            unsafe {
+                let _ = result::module::unload(self.module);
+            }
+        }
+    }
+}
+
+impl ExternalLinearGeometry {
+    fn validate(self) -> Result<(i32, i32, i32, i32), BackendError> {
+        if self.m == 0 || self.n == 0 || self.k == 0 {
+            return Err(BackendError::InvalidInput(
+                "external ternary Linear dimensions must be non-zero".into(),
+            ));
+        }
+        let expected_row_bytes = num_blocks(self.k)
+            .checked_mul(TQ2_0_BLOCK_BYTES)
+            .ok_or_else(|| BackendError::InvalidInput("packed row bytes overflow".into()))?;
+        if self.row_bytes != expected_row_bytes {
+            return Err(BackendError::ShapeMismatch {
+                expected: expected_row_bytes,
+                got: self.row_bytes,
+            });
+        }
+        let to_i32 = |value: usize, label: &str| {
+            i32::try_from(value)
+                .map_err(|_| BackendError::InvalidInput(format!("{label} does not fit i32")))
+        };
+        Ok((
+            to_i32(self.m, "M")?,
+            to_i32(self.n, "N")?,
+            to_i32(self.k, "K")?,
+            to_i32(self.row_bytes, "packed row bytes")?,
+        ))
+    }
+
+    fn elements(self) -> Result<(usize, usize, usize), BackendError> {
+        let mk = self
+            .m
+            .checked_mul(self.k)
+            .ok_or_else(|| BackendError::InvalidInput("M*K overflows".into()))?;
+        let mn = self
+            .m
+            .checked_mul(self.n)
+            .ok_or_else(|| BackendError::InvalidInput("M*N overflows".into()))?;
+        let nk = self
+            .n
+            .checked_mul(self.k)
+            .ok_or_else(|| BackendError::InvalidInput("N*K overflows".into()))?;
+        Ok((mk, mn, nk))
+    }
+}
+
+fn bytes_f32(elements: usize, label: &str) -> Result<usize, BackendError> {
+    elements
+        .checked_mul(size_of::<f32>())
+        .ok_or_else(|| BackendError::InvalidInput(format!("{label} byte count overflows")))
+}
+
+fn grid(elements: usize) -> Result<(u32, u32, u32), BackendError> {
+    let blocks = elements
+        .checked_add(THREADS as usize - 1)
+        .ok_or_else(|| BackendError::InvalidInput("launch size overflows".into()))?
+        / THREADS as usize;
+    Ok((
+        u32::try_from(blocks)
+            .map_err(|_| BackendError::InvalidInput("launch grid does not fit u32".into()))?,
+        1,
+        1,
+    ))
+}
+
+impl CudaBackend {
+    fn bind_external_context(&self) -> Result<CurrentContextRestore, BackendError> {
+        CurrentContextRestore::bind(self.stream.context())
+    }
+
+    fn external_kernels(&self) -> Result<&ExternalCudaKernels, BackendError> {
+        if let Some(kernels) = self.external_kernels.get() {
+            return Ok(kernels);
+        }
+        let candidate = ExternalCudaKernels::load(self.stream.context())?;
+        // Another caller may win this race. Its module becomes authoritative;
+        // dropping our candidate safely unloads only the losing duplicate.
+        let _ = self.external_kernels.set(candidate);
+        self.external_kernels.get().ok_or_else(|| {
+            BackendError::Backend("external CUDA kernel cache failed to initialize".into())
+        })
+    }
+
+    fn validated_external_stream(&self, stream: usize) -> Result<sys::CUstream, BackendError> {
+        let ctx = self.stream.context();
+        let raw = stream as sys::CUstream;
+        if raw.is_null() {
+            // Legacy default stream belongs to context current on this thread.
+            return Ok(raw);
+        }
+        let mut stream_ctx = std::ptr::null_mut();
+        // SAFETY: `raw` is not dereferenced by Rust; driver validates handle and
+        // writes one CUcontext into live storage.
+        #[allow(unsafe_code)]
+        unsafe { sys::cuStreamGetCtx(raw, &mut stream_ctx).result() }
+            .map_err(|error| driver_err("external stream context query", &error))?;
+        if stream_ctx != ctx.cu_ctx() {
+            return Err(BackendError::InvalidInput(
+                "external CUDA stream belongs to another context".into(),
+            ));
+        }
+        Ok(raw)
+    }
+
+    fn validate_external_span(
+        &self,
+        pointer: usize,
+        bytes: usize,
+        alignment: usize,
+        label: &str,
+    ) -> Result<sys::CUdeviceptr, BackendError> {
+        if pointer == 0 || bytes == 0 || !pointer.is_multiple_of(alignment) {
+            return Err(BackendError::InvalidInput(format!(
+                "{label} has null, empty, or misaligned CUDA storage"
+            )));
+        }
+        let ptr = pointer as sys::CUdeviceptr;
+        let mut pointer_ctx = std::ptr::null_mut();
+        let mut range_start: sys::CUdeviceptr = 0;
+        let mut range_size = 0usize;
+        // SAFETY: output variables have attribute-matching types and remain
+        // live. Driver validates `ptr`; no pointed-to tensor memory is read.
+        #[allow(unsafe_code)]
+        unsafe {
+            sys::cuPointerGetAttribute(
+                (&mut pointer_ctx as *mut sys::CUcontext).cast(),
+                sys::CUpointer_attribute::CU_POINTER_ATTRIBUTE_CONTEXT,
+                ptr,
+            )
+            .result()
+            .and_then(|()| {
+                sys::cuPointerGetAttribute(
+                    (&mut range_start as *mut sys::CUdeviceptr).cast(),
+                    sys::CUpointer_attribute::CU_POINTER_ATTRIBUTE_RANGE_START_ADDR,
+                    ptr,
+                )
+                .result()
+            })
+            .and_then(|()| {
+                sys::cuPointerGetAttribute(
+                    (&mut range_size as *mut usize).cast(),
+                    sys::CUpointer_attribute::CU_POINTER_ATTRIBUTE_RANGE_SIZE,
+                    ptr,
+                )
+                .result()
+            })
+        }
+        .map_err(|error| driver_err(&format!("{label} pointer query"), &error))?;
+        if pointer_ctx != self.stream.context().cu_ctx() {
+            return Err(BackendError::InvalidInput(format!(
+                "{label} belongs to another CUDA context"
+            )));
+        }
+        let allocation_end = (range_start as usize)
+            .checked_add(range_size)
+            .ok_or_else(|| BackendError::InvalidInput(format!("{label} allocation overflows")))?;
+        let span_end = pointer
+            .checked_add(bytes)
+            .ok_or_else(|| BackendError::InvalidInput(format!("{label} span overflows")))?;
+        if pointer < range_start as usize || span_end > allocation_end {
+            return Err(BackendError::InvalidInput(format!(
+                "{label} declared span exceeds CUDA allocation"
+            )));
+        }
+        Ok(ptr)
+    }
+
+    /// Pack fp32 master weights into framework-owned TQ2_0 storage on caller stream.
+    ///
+    /// # Safety
+    ///
+    /// Every pointer must retain a live allocation of the declared size until
+    /// stream work completes. Read/write aliases must obey kernel contracts.
+    /// Caller must also keep this backend alive until completion.
+    #[allow(unsafe_code)]
+    pub unsafe fn external_linear_pack(
+        &self,
+        request: ExternalLinearPack,
+    ) -> Result<(), BackendError> {
+        let _context = self.bind_external_context()?;
+        let kernels = self.external_kernels()?;
+        let geometry = ExternalLinearGeometry {
+            m: 1,
+            n: request.n,
+            k: request.k,
+            row_bytes: request.row_bytes,
+        };
+        let (_, n, k, row_bytes) = geometry.validate()?;
+        let (_, _, nk) = geometry.elements()?;
+        let stream = self.validated_external_stream(request.stream)?;
+        let master = self.validate_external_span(
+            request.master,
+            bytes_f32(nk, "master")?,
+            align_of::<f32>(),
+            "master",
+        )?;
+        let scales = self.validate_external_span(
+            request.scales,
+            bytes_f32(geometry.n, "scales")?,
+            align_of::<f32>(),
+            "scales",
+        )?;
+        let packed_bytes = geometry
+            .n
+            .checked_mul(geometry.row_bytes)
+            .ok_or_else(|| BackendError::InvalidInput("packed byte count overflows".into()))?;
+        let packed =
+            self.validate_external_span(request.packed, packed_bytes, 1, "packed weights")?;
+        let mut params = [
+            pp(&master),
+            pp(&scales),
+            pp(&packed),
+            pp(&n),
+            pp(&k),
+            pp(&row_bytes),
+        ];
+        raw_launch(
+            kernels.pack,
+            grid(geometry.n)?,
+            (THREADS, 1, 1),
+            0,
+            stream,
+            &mut params,
+        )
+    }
+
+    /// Run projected fp32 ternary Linear directly into framework-owned output.
+    ///
+    /// # Safety
+    ///
+    /// Every pointer must retain a live allocation of the declared size until
+    /// stream work completes. Read/write aliases must obey kernel contracts.
+    /// Caller must also keep this backend alive until completion.
+    #[allow(unsafe_code)]
+    pub unsafe fn external_linear_forward(
+        &self,
+        request: ExternalLinearForward,
+    ) -> Result<(), BackendError> {
+        let _context = self.bind_external_context()?;
+        let kernels = self.external_kernels()?;
+        let geometry = request.geometry;
+        let (m, n, k, row_bytes) = geometry.validate()?;
+        let (mk, mn, _) = geometry.elements()?;
+        let stream = self.validated_external_stream(request.stream)?;
+        let input = self.validate_external_span(
+            request.input,
+            bytes_f32(mk, "input")?,
+            align_of::<f32>(),
+            "input",
+        )?;
+        let packed_bytes = geometry
+            .n
+            .checked_mul(geometry.row_bytes)
+            .ok_or_else(|| BackendError::InvalidInput("packed byte count overflows".into()))?;
+        let packed =
+            self.validate_external_span(request.packed, packed_bytes, 1, "packed weights")?;
+        let scales = self.validate_external_span(
+            request.scales,
+            bytes_f32(geometry.n, "scales")?,
+            align_of::<f32>(),
+            "scales",
+        )?;
+        let bias = match request.bias {
+            Some(pointer) => self.validate_external_span(
+                pointer,
+                bytes_f32(geometry.n, "bias")?,
+                align_of::<f32>(),
+                "bias",
+            )?,
+            None => 0,
+        };
+        let output = self.validate_external_span(
+            request.output,
+            bytes_f32(mn, "output")?,
+            align_of::<f32>(),
+            "output",
+        )?;
+        let mut params = [
+            pp(&input),
+            pp(&packed),
+            pp(&scales),
+            pp(&bias),
+            pp(&output),
+            pp(&m),
+            pp(&n),
+            pp(&k),
+            pp(&row_bytes),
+        ];
+        raw_launch(
+            kernels.forward,
+            grid(mn)?,
+            (THREADS, 1, 1),
+            0,
+            stream,
+            &mut params,
+        )
+    }
+
+    /// Run first-order activation, dense-master STE, and optional bias VJPs.
+    ///
+    /// # Safety
+    ///
+    /// Every pointer must retain a live allocation of the declared size until
+    /// stream work completes. Read/write aliases must obey kernel contracts.
+    /// Caller must also keep this backend alive until completion.
+    #[allow(unsafe_code)]
+    pub unsafe fn external_linear_backward(
+        &self,
+        request: ExternalLinearBackward,
+    ) -> Result<(), BackendError> {
+        let _context = self.bind_external_context()?;
+        let kernels = self.external_kernels()?;
+        let geometry = request.geometry;
+        let (m, n, k, row_bytes) = geometry.validate()?;
+        let (mk, mn, nk) = geometry.elements()?;
+        let stream = self.validated_external_stream(request.stream)?;
+        let span = |pointer, elements, label| {
+            self.validate_external_span(
+                pointer,
+                bytes_f32(elements, label)?,
+                align_of::<f32>(),
+                label,
+            )
+        };
+        let grad_output = span(request.grad_output, mn, "grad_output")?;
+        let input = span(request.input, mk, "input")?;
+        let master = span(request.master, nk, "master")?;
+        let packed_bytes = geometry
+            .n
+            .checked_mul(geometry.row_bytes)
+            .ok_or_else(|| BackendError::InvalidInput("packed byte count overflows".into()))?;
+        let packed =
+            self.validate_external_span(request.packed, packed_bytes, 1, "packed weights")?;
+        let scales = span(request.scales, geometry.n, "scales")?;
+        let grad_input = span(request.grad_input, mk, "grad_input")?;
+        let grad_master = span(request.grad_master, nk, "grad_master")?;
+        let grad_bias = request
+            .grad_bias
+            .map(|pointer| span(pointer, geometry.n, "grad_bias"))
+            .transpose()?;
+
+        let mut input_params = [
+            pp(&grad_output),
+            pp(&packed),
+            pp(&scales),
+            pp(&grad_input),
+            pp(&m),
+            pp(&n),
+            pp(&k),
+            pp(&row_bytes),
+        ];
+        raw_launch(
+            kernels.grad_input,
+            grid(mk)?,
+            (THREADS, 1, 1),
+            0,
+            stream,
+            &mut input_params,
+        )?;
+
+        let mut master_params = [
+            pp(&grad_output),
+            pp(&input),
+            pp(&master),
+            pp(&scales),
+            pp(&grad_master),
+            pp(&m),
+            pp(&n),
+            pp(&k),
+        ];
+        raw_launch(
+            kernels.grad_master,
+            grid(nk)?,
+            (THREADS, 1, 1),
+            0,
+            stream,
+            &mut master_params,
+        )?;
+
+        if let Some(grad_bias) = grad_bias {
+            let mut bias_params = [pp(&grad_output), pp(&grad_bias), pp(&m), pp(&n)];
+            raw_launch(
+                kernels.grad_bias,
+                grid(geometry.n)?,
+                (THREADS, 1, 1),
+                0,
+                stream,
+                &mut bias_params,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+pub(super) struct CurrentContextRestore {
+    previous: Option<sys::CUcontext>,
+}
+
+impl CurrentContextRestore {
+    pub(super) fn capture() -> Result<Self, BackendError> {
+        let previous = result::ctx::get_current()
+            .map_err(|error| driver_err("query current CUDA context", &error))?;
+        Ok(Self { previous })
+    }
+
+    fn bind(ctx: &Arc<CudaContext>) -> Result<Self, BackendError> {
+        let restore = Self::capture()?;
+        ctx.bind_to_thread()
+            .map_err(|error| driver_err("bind external CUDA context", &error))?;
+        Ok(restore)
+    }
+}
+
+impl Drop for CurrentContextRestore {
+    fn drop(&mut self) {
+        let previous = self.previous.unwrap_or(std::ptr::null_mut());
+        // SAFETY: `previous` was returned by `cuCtxGetCurrent` on this thread
+        // moments ago. Restoring it neither transfers nor destroys ownership.
+        #[allow(unsafe_code)]
+        unsafe {
+            let _ = result::ctx::set_current(previous);
+        }
+    }
+}

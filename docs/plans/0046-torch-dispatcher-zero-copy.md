@@ -91,10 +91,41 @@ trait method still accepts host slices and therefore performs explicit
 activation/upstream uploads and gradient downloads; it is a native packed
 backend primitive, not the PyTorch zero-copy CUDA bridge.
 
-Remaining before Step 2 closes: stream-aware PyTorch CUDA input/output, external
-stream ordering, CUDA packed-cache residency, sanitizer evidence, CPU
+The first PyTorch CUDA-native vertical slice now lands behind the same public
+dispatcher schema:
+
+- compact CUDA `float32` inputs, masters, bias, outputs, and gradients remain
+  PyTorch-owned; the binding validates logical tensor spans, registers every
+  allocation with PyTorch's caching allocator on the caller stream, and Tritium
+  validates allocation range, alignment, primary context, and stream before an
+  explicitly unsafe launch boundary;
+- one-thread-per-row projection packs masters directly into resident TQ2_0 with
+  PyTorch-computed AbsMean scales, round-to-nearest-even trits, canonical tail
+  padding, and no dense projected-weight shadow;
+- a bounded weak-owner 4096-entry Python cache keys packed bytes/scales by
+  parameter identity, mutation version, storage identity, data pointer, shape,
+  and device; optimizer mutation or storage replacement repacks before reuse.
+  Producer events order first-pack state across streams, and allocator stream
+  records keep evicted entries alive through queued reads;
+- native forward, packed activation VJP, strict masked master VJP, and bias VJP
+  write directly into PyTorch allocations on the caller's current CUDA stream;
+  scoped driver guards restore the caller's prior CUDA context;
+- adversarial tests use `K=257`, `N=33`, leading dimensions, bias, a
+  non-default stream, cross-stream first-pack consumption, owner eviction while
+  work is queued, mutation/storage replacement, and non-finite values. Profiler
+  resource IDs bind every native kernel to a same-stream sentinel. Warm
+  forward/backward emits no projection/matmul Torch operators or H2D/D2H
+  transfer.
+
+Local iteration on one RTX 4090 passed all 23 dispatcher tests, an installed
+CUDA-wheel suite (247 tests plus nine subtests; one prerequisite skip), and
+compute-sanitizer memcheck on the native adversarial tests. This is unretained
+development evidence, not an admitted release receipt or performance claim.
+
+Remaining before Step 2 closes: native CUDA fp16/autocast optimization, CPU
 performance optimization/qualification, and retained representative-shape
-performance receipts. Exploratory release-build timings are not a gate receipt:
+wrapper-overhead plus physical-CUDA receipts. Exploratory
+release-build timings are not a gate receipt:
 native forward+backward remained 2.6–3.7× slower than this host's MKL-backed
 composite at `M=32`, so no CPU speedup claim is permitted yet.
 

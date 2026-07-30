@@ -337,6 +337,195 @@ def test_ternary_linear_cuda_stays_resident_and_autocasts():
     assert autocast_output.dtype == torch.float16
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or "cuda" not in _native.compiled_backends(),
+    reason="CUDA-enabled Tritium extension unavailable",
+)
+def test_native_cuda_warm_forward_backward_avoids_composite_tensor_ops():
+    torch.manual_seed(29)
+    x = torch.randn(4, 3, 257, device="cuda", requires_grad=True)
+    weight = torch.randn(33, 257, device="cuda", requires_grad=True)
+    bias = torch.randn(33, device="cuda", requires_grad=True)
+    grad_output = torch.randn(4, 3, 33, device="cuda")
+
+    expected_x = x.detach().clone().requires_grad_()
+    expected_weight = weight.detach().clone().requires_grad_()
+    expected_bias = bias.detach().clone().requires_grad_()
+    reference_ternary_linear(
+        expected_x, expected_weight, expected_bias
+    ).backward(grad_output)
+
+    # First forward builds resident packed TQ2_0 state. Profile only warm
+    # forward/backward, where projection and matrix contractions must be native.
+    stream = torch.cuda.Stream(device=x.device)
+    stream.wait_stream(torch.cuda.current_stream(x.device))
+    with torch.cuda.stream(stream), torch.no_grad():
+        ternary_linear(x, weight, bias)
+    stream.synchronize()
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+        acc_events=True,
+    ) as profile:
+        with torch.cuda.stream(stream):
+            ternary_linear(x, weight, bias).backward(grad_output)
+            torch.cuda._sleep(1)
+        stream.synchronize()
+
+    assert torch.allclose(x.grad, expected_x.grad, atol=2e-5, rtol=2e-5)
+    assert torch.allclose(weight.grad, expected_weight.grad, atol=2e-5, rtol=2e-5)
+    assert torch.allclose(bias.grad, expected_bias.grad, atol=2e-5, rtol=2e-5)
+    event_names = {event.key.lower() for event in profile.key_averages()}
+    forbidden = {
+        "aten::abs",
+        "aten::clamp",
+        "aten::matmul",
+        "aten::mean",
+        "aten::mm",
+        "aten::round",
+    }
+    assert event_names.isdisjoint(forbidden)
+    assert not any("memcpy dtoh" in name or "memcpy htod" in name for name in event_names)
+    native_kernel_names = {
+        "tq2_projected_linear_forward",
+        "tq2_projected_grad_a",
+        "linear_grad_master_ste",
+        "bias_backward",
+    }
+    native_resources = {
+        event.device_resource_id
+        for event in profile.events()
+        if event.name in native_kernel_names
+    }
+    sentinel_resources = {
+        event.device_resource_id
+        for event in profile.events()
+        if "spin_kernel" in event.name
+    }
+    assert len(native_resources) == 1
+    assert native_resources == sentinel_resources
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or "cuda" not in _native.compiled_backends(),
+    reason="CUDA-enabled Tritium extension unavailable",
+)
+def test_native_cuda_tail_forward_backward_parity_for_memcheck():
+    torch.manual_seed(37)
+    x = torch.randn(4, 3, 257, device="cuda", requires_grad=True)
+    weight = torch.randn(33, 257, device="cuda", requires_grad=True)
+    bias = torch.randn(33, device="cuda", requires_grad=True)
+    grad_output = torch.randn(4, 3, 33, device="cuda")
+    expected_x = x.detach().clone().requires_grad_()
+    expected_weight = weight.detach().clone().requires_grad_()
+    expected_bias = bias.detach().clone().requires_grad_()
+
+    output = ternary_linear(x, weight, bias)
+    expected = reference_ternary_linear(expected_x, expected_weight, expected_bias)
+    output.backward(grad_output)
+    expected.backward(grad_output)
+
+    torch.testing.assert_close(output, expected, atol=2e-5, rtol=2e-5)
+    torch.testing.assert_close(x.grad, expected_x.grad, atol=2e-5, rtol=2e-5)
+    torch.testing.assert_close(weight.grad, expected_weight.grad, atol=2e-5, rtol=2e-5)
+    torch.testing.assert_close(bias.grad, expected_bias.grad, atol=2e-5, rtol=2e-5)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or "cuda" not in _native.compiled_backends(),
+    reason="CUDA-enabled Tritium extension unavailable",
+)
+def test_native_cuda_preserves_nonfinite_dense_semantics():
+    cases = (
+        (
+            torch.tensor([[0.25, -0.5, 1.0], [1.0, 2.0, -3.0]]),
+            torch.tensor([[float("inf"), 1.0, -1.0], [0.5, -0.5, 0.0]]),
+        ),
+        (
+            torch.tensor([[float("nan"), -0.5, 1.0], [1.0, 2.0, -3.0]]),
+            torch.tensor([[0.25, 1.0, -1.0], [0.5, -0.5, 0.0]]),
+        ),
+    )
+    grad_output = torch.tensor([[0.5, -1.0], [2.0, 0.25]], device="cuda")
+
+    for input_values, weight_values in cases:
+        x = input_values.cuda().requires_grad_()
+        weight = weight_values.cuda().requires_grad_()
+        expected_x = x.detach().clone().requires_grad_()
+        expected_weight = weight.detach().clone().requires_grad_()
+
+        output = ternary_linear(x, weight)
+        expected = reference_ternary_linear(expected_x, expected_weight)
+        output.backward(grad_output)
+        expected.backward(grad_output)
+
+        torch.testing.assert_close(output, expected, equal_nan=True)
+        torch.testing.assert_close(x.grad, expected_x.grad, equal_nan=True)
+        torch.testing.assert_close(weight.grad, expected_weight.grad, equal_nan=True)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or "cuda" not in _native.compiled_backends(),
+    reason="CUDA-enabled Tritium extension unavailable",
+)
+def test_native_cuda_cache_invalidates_on_mutation_and_storage_replacement():
+    x = torch.tensor([[1.0, -2.0, 0.5]], device="cuda")
+    weight = torch.tensor(
+        [[0.1, 0.2, 0.3], [-0.75, 0.5, 0.25]], device="cuda"
+    )
+
+    first = ternary_linear(x, weight)
+    with torch.no_grad():
+        weight[0, 1] = -1.4
+    second = ternary_linear(x, weight)
+    torch.testing.assert_close(second, reference_ternary_linear(x, weight))
+    assert not torch.equal(second, first)
+
+    version_before_storage_swap = weight._version
+    weight.data = torch.ones_like(weight)
+    assert weight._version == version_before_storage_swap
+    third = ternary_linear(x, weight)
+    torch.testing.assert_close(third, reference_ternary_linear(x, weight))
+    assert not torch.equal(third, second)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or "cuda" not in _native.compiled_backends(),
+    reason="CUDA-enabled Tritium extension unavailable",
+)
+def test_native_cuda_cache_orders_cross_stream_pack_and_survives_owner_drop():
+    import gc
+
+    torch.manual_seed(31)
+    x = torch.randn(8, 257, device="cuda")
+    weight = torch.randn(33, 257, device="cuda")
+    expected = reference_ternary_linear(x, weight)
+    pack_stream = torch.cuda.Stream(device=x.device)
+    consume_stream = torch.cuda.Stream(device=x.device)
+    current = torch.cuda.current_stream(x.device)
+    pack_stream.wait_stream(current)
+    consume_stream.wait_stream(current)
+
+    # Pack remains queued behind a long kernel. Cache-hit consumption on another
+    # stream must wait for its private ready event without host synchronization.
+    with torch.cuda.stream(pack_stream), torch.no_grad():
+        torch.cuda._sleep(100_000_000)
+        ternary_linear(x, weight)
+    with torch.cuda.stream(consume_stream), torch.no_grad():
+        output = ternary_linear(x, weight)
+
+    # Dropping owner evicts hidden cache state while its raw-stream read remains
+    # queued. Native binding's record_stream calls must prevent allocator reuse.
+    del weight
+    gc.collect()
+    churn = [
+        torch.empty((33, 132), dtype=torch.uint8, device=x.device)
+        for _ in range(16)
+    ]
+    consume_stream.synchronize()
+    assert churn
+    torch.testing.assert_close(output, expected, atol=2e-5, rtol=2e-5)
+
+
 def test_builtin_ternary_linear_module_compiles_as_one_full_graph():
     torch.manual_seed(17)
     layer = TernaryLinear(4, 3)
