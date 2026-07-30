@@ -159,7 +159,22 @@ the Step-1 recovery-vs-tokens curve runs next on the f32 path.
   2205 → 729 → 439 → **298**, still descending. A 2304-step / 9-epoch plateau run then bottomed out:
   final **224.8 ppl (11.4× fp)**, recovery-vs-PTQ **9453×**, oscillating in a 220–290 floor. **So on
   the 8k-token corpus, SALT distillation drives ternary-135M monotonically down but plateaus at
-  ~11–13× fp — the generalization ceiling of the data, not the method** (the falling held-out curve is
-  genuine generalization; the plateau is data-bound). Closing toward fp needs a **bigger, recognized
-  corpus** (WikiText/C4) so the number can be positioned against the field — the chosen next step,
-  after Lever 5.
+  ~11–13× fp** — at the time read as the data's ceiling; the WikiText-2 run below shows the plateau
+  was substantially an LR artifact.
+
+- **Step 1 — FIELD-COMPARABLE RESULT (2026-07-30, WikiText-2, f32).** The first run on a recognized
+  corpus (500k-token train pool + 4096 held-out from the disjoint **WikiText-2 test split**, SmolLM2
+  tokenizer). Required fixing an O(seq²) eval OOM first (commit `c0dae70`, see below).
+  **fp SmolLM2-135M = 23.827 ppl | ternary PTQ = 3.281e6 (catastrophic).** Two 5000-step runs:
+
+  | recipe | final ppl | best | gap to fp | recovery vs PTQ | tail oscillation |
+  |---|---|---|---|---|---|
+  | constant LR 2e-3 (gate default) | 563.3 | 431.2 @2800 | 23.6× | 5824× | ±25% |
+  | **warmup 200 + cosine → 1e-4** | **266.9** | **265.8** | **11.2×** | **12 292×** | **±8%** |
+
+  **The constant-LR plateau was an optimization artifact, not a data or method limit.** The baseline
+  descended 3250 → 431 by step 2800 then oscillated flat for 2200 steps; adding the (already
+  implemented but unused) `LrSchedule` beat it at *every* checkpoint, broke through the 431 floor at
+  step 2400, and settled at **266.9 ppl — 2.1× better final, 2.1× more recovery, 3× less oscillation**.
+  Only **160k of the 500k-token pool** was consumed (⅓ epoch), so the run is still token-limited: more
+  steps (and `T`>2 SALT planes) are the untested levers before any claim about the ternary floor.
