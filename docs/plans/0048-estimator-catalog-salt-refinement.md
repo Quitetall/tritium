@@ -219,8 +219,13 @@ package.
   enter a PTQ claim. QAT checkpoint, QAT export, PTQ, scale-only and hard-PV
   artifacts remain separately typed. Unaligned research-only children are
   explicitly non-package artifacts.
-- Run matched-physical-byte ablations against RTN/AbsMean, GPTQ/AWQ-style
-  second-order baselines and the frozen SALT variants.
+- [x] Implement a fail-closed matched-physical-byte execution worker for
+  RTN/AbsMean, GPTQ/AWQ-style second-order baselines and frozen SALT variants.
+  It runs the exact retained argv recipes without a shell, measures thirty
+  same-device evaluation samples, hashes every physical artifact, and rejects
+  byte mismatch, identity drift, cross-device samples or artifact mutation.
+- Execute that worker against final refined Qwen3.6 candidate and frozen
+  evaluation ledger.
 
 Release admission now has three separate fail-closed contracts.
 `tritium.estimator-catalog-qualification.v1` binds the exact candidate wheel and
@@ -236,10 +241,13 @@ flagship NearLossless PTQ artifact and the estimator receipt.
 `tritium.baseline-ablation-qualification.v1` freezes RTN/AbsMean,
 GPTQ/AWQ-style, SALT V1 and three mechanism ablations, recomputes matched-byte
 claim eligibility, and binds the exact refined model/evaluation lineage. These
-contracts and producers are implemented. Refinement receipts are derived from
-retained dataset/candidate ledgers, hard-structure deltas, package identities,
-reload samples and validation losses. Ablation receipts are derived from
-retained matched-byte timing/residency samples and frozen recipe identities.
+contracts and producers are implemented. Raw ablation evidence now retains
+each publishable recipe body, build/evaluation argv, artifact path and physical
+artifact SHA-256; verifier recomputes recipe identities instead of trusting
+claimed digests. Refinement receipts are derived from retained
+dataset/candidate ledgers, hard-structure deltas, package identities, reload
+samples and validation losses. Ablation receipts are derived from retained
+matched-byte timing/residency samples and frozen recipe identities.
 Executing them against the final candidate wheel and checkpoint-scale campaign
 artifacts remains open.
 
@@ -249,6 +257,7 @@ artifacts remains open.
 PYTHONPATH=crates/tritium-py/python pytest -q crates/tritium-py/tests
 python -m unittest scripts.tests.test_qualify_estimator_catalog
 python -m unittest scripts.tests.test_qualify_refinement_campaign
+python -m unittest scripts.tests.test_run_baseline_ablation
 python -m unittest scripts.tests.test_qualify_baseline_ablation
 python -m unittest scripts.tests.test_verify_estimator_refinement_receipt
 python -m compileall -q crates/tritium-py/python/tritium

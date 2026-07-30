@@ -98,6 +98,50 @@ class QualifyBaselineAblationTests(unittest.TestCase):
                     run_id="ablation-1",
                 )
 
+    def test_rejects_recipe_body_that_does_not_match_identity(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            candidate, common, _ = fixture(root)
+            trace_path = ablation_trace(root, common)
+            trace = json.loads(trace_path.read_bytes())
+            trace["baselines"][0]["recipe"]["arguments"]["target_bytes"] = 99
+            trace_path.write_bytes(MODULE["canonical"](trace) + b"\n")
+            with self.assertRaisesRegex(
+                MODULE["VERIFIER"]["EstimatorRefinementError"], "recipe identity"
+            ):
+                assemble(
+                    root / "qualification",
+                    candidate=candidate,
+                    trace_path=trace_path,
+                    model_artifact_id="s34",
+                    source_revision="a" * 40,
+                    release="1.1.0-rc.0",
+                    run_id="ablation-1",
+                )
+
+    def test_rejects_more_than_thirty_measurement_samples(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            candidate, common, _ = fixture(root)
+            trace_path = ablation_trace(root, common)
+            trace = json.loads(trace_path.read_bytes())
+            for row in trace["baselines"]:
+                row["elapsed_samples_ms"].append(1.0)
+                row["resident_samples_bytes"].append(100)
+            trace_path.write_bytes(MODULE["canonical"](trace) + b"\n")
+            with self.assertRaisesRegex(
+                MODULE["VERIFIER"]["EstimatorRefinementError"], "exactly thirty"
+            ):
+                assemble(
+                    root / "qualification",
+                    candidate=candidate,
+                    trace_path=trace_path,
+                    model_artifact_id="s34",
+                    source_revision="a" * 40,
+                    release="1.1.0-rc.0",
+                    run_id="ablation-1",
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

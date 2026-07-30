@@ -104,12 +104,33 @@ def refinement_trace(root: Path, common):
 
 def ablation_trace(root: Path, common):
     evaluation_id = "sha256:" + "3" * 64
+    recipes = []
+    for ordinal, (method, family) in enumerate(MODULE["BASELINES"]):
+        recipe = {
+            "implementation": f"reference/{method}",
+            "revision": "sha256:" + f"{ordinal + 5:x}" * 64,
+            "arguments": {"target_bytes": 100},
+        }
+        build_command = ["baseline-tool", "build", method]
+        evaluation_command = ["baseline-tool", "evaluate", method]
+        artifact = f"{ordinal:02d}-{method}.bin"
+        scope = {
+            "method": method, "family": family, "recipe": recipe,
+            "build_command": build_command,
+            "evaluation_command": evaluation_command, "artifact": artifact,
+        }
+        recipes.append(
+            {
+                **scope,
+                "recipe_id": "sha256:" + hashlib.sha256(canonical(scope)).hexdigest(),
+            }
+        )
     identities = [
         {
-            "method": method, "family": family,
-            "recipe_id": "sha256:" + f"{ordinal + 5:x}" * 64,
+            "method": recipe["method"], "family": recipe["family"],
+            "recipe_id": recipe["recipe_id"],
         }
-        for ordinal, (method, family) in enumerate(MODULE["BASELINES"])
+        for recipe in recipes
     ]
     trace = {
         "schema": MODULE["ABLATION_TRACE_SCHEMA"], "result": "pass",
@@ -137,15 +158,19 @@ def ablation_trace(root: Path, common):
         "target_bytes": 100, "target_bpw": 2.0,
         "baselines": [
             {
-                **identity,
-                "artifact_bytes": 100, "parameter_count": 400,
+                **recipe,
+                "artifact_bytes": 100,
+                "artifact_sha256": hashlib.sha256(
+                    bytes([ordinal + 1]) * 100
+                ).hexdigest(),
+                "parameter_count": 400,
                 "quality_score": 1.0,
                 "elapsed_samples_ms": [float(ordinal + 1)] * 30,
                 "resident_samples_bytes": [100 + ordinal] * 30,
                 "physical_device": "cuda:0:GPU-1",
                 "reproduced": True, "publishable_recipe": True,
             }
-            for ordinal, identity in enumerate(identities)
+            for ordinal, recipe in enumerate(recipes)
         ],
     }
     path = root / "baseline-ablation-execution.json"

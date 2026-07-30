@@ -77,9 +77,11 @@ ABLATION_TRACE_FIELDS = {
     "target_bpw", "baselines",
 }
 ABLATION_TRACE_BASELINE_FIELDS = {
-    "method", "family", "recipe_id", "artifact_bytes", "parameter_count",
-    "quality_score", "elapsed_samples_ms", "resident_samples_bytes",
-    "physical_device", "reproduced", "publishable_recipe",
+    "method", "family", "recipe", "build_command", "evaluation_command",
+    "artifact", "recipe_id", "artifact_bytes", "artifact_sha256",
+    "parameter_count", "quality_score", "elapsed_samples_ms",
+    "resident_samples_bytes", "physical_device", "reproduced",
+    "publishable_recipe",
 }
 ESTIMATORS = (
     ("absmean-ste", "tritium.absmean-ste", 1),
@@ -137,6 +139,49 @@ def digest(value: Any, label: str) -> str:
     if re.fullmatch(r"sha256:[0-9a-f]{64}", text) is None:
         raise EstimatorRefinementError(f"{label} must be a canonical SHA-256 digest")
     return text
+
+
+def command(value: Any, label: str) -> list[str]:
+    if not isinstance(value, list) or not value:
+        raise EstimatorRefinementError(f"{label} must be a nonempty argv list")
+    result = [string(item, f"{label} argument") for item in value]
+    if any("\0" in item for item in result):
+        raise EstimatorRefinementError(f"{label} arguments may not contain NUL")
+    return result
+
+
+def recipe_scope(raw: dict[str, Any]) -> dict[str, Any]:
+    recipe = raw["recipe"]
+    if not isinstance(recipe, dict) or not recipe:
+        raise EstimatorRefinementError(
+            "baseline trace recipe must be a nonempty JSON object"
+        )
+    try:
+        json.dumps(
+            recipe, sort_keys=True, separators=(",", ":"), allow_nan=False
+        ).encode()
+    except (TypeError, ValueError) as error:
+        raise EstimatorRefinementError(
+            "baseline trace recipe must be canonical JSON"
+        ) from error
+    artifact = string(raw["artifact"], "baseline recipe artifact")
+    if "\0" in artifact:
+        raise EstimatorRefinementError(
+            "baseline recipe artifact path may not contain NUL"
+        )
+    logical = PurePosixPath(artifact)
+    if logical.is_absolute() or ".." in logical.parts or "\\" in artifact:
+        raise EstimatorRefinementError("baseline recipe artifact path is unsafe")
+    return {
+        "method": raw["method"],
+        "family": raw["family"],
+        "recipe": recipe,
+        "build_command": command(raw["build_command"], "baseline build command"),
+        "evaluation_command": command(
+            raw["evaluation_command"], "baseline evaluation command"
+        ),
+        "artifact": artifact,
+    }
 
 
 def number(value: Any, label: str, minimum: float = 0.0) -> float:
@@ -583,7 +628,21 @@ def derive_ablation_trace(
         if (raw["method"], raw["family"]) != expected:
             raise EstimatorRefinementError("baseline trace identity/order differs")
         recipe_id = digest(raw["recipe_id"], "baseline recipe id")
+        expected_recipe_id = "sha256:" + hashlib.sha256(
+            canonical(recipe_scope(raw))
+        ).hexdigest()
+        if recipe_id != expected_recipe_id:
+            raise EstimatorRefinementError(
+                "baseline recipe identity differs from retained recipe"
+            )
         artifact_bytes = integer(raw["artifact_bytes"], "baseline artifact bytes", 1)
+        artifact_sha256 = string(
+            raw["artifact_sha256"], "baseline artifact SHA-256"
+        )
+        if re.fullmatch(r"[0-9a-f]{64}", artifact_sha256) is None:
+            raise EstimatorRefinementError(
+                "baseline artifact SHA-256 must be lowercase hexadecimal"
+            )
         parameter_count = integer(
             raw["parameter_count"], "baseline parameter count", 1
         )
@@ -596,12 +655,12 @@ def derive_ablation_trace(
         resident = raw["resident_samples_bytes"]
         if (
             not isinstance(elapsed, list)
-            or len(elapsed) < 30
+            or len(elapsed) != 30
             or not isinstance(resident, list)
             or len(resident) != len(elapsed)
         ):
             raise EstimatorRefinementError(
-                "baseline trace requires thirty matched timing and residency samples"
+                "baseline trace requires exactly thirty matched timing and residency samples"
             )
         elapsed_values = [
             number(value, "baseline elapsed sample", 1e-12) for value in elapsed
