@@ -1,0 +1,163 @@
+{
+ "schema": "tritium.ws-a1-cost-baseline.v1",
+ "model": "/home/brianklam/.cache/huggingface/hub/models--HuggingFaceTB--SmolLM2-1.7B/snapshots/effd688a12921b4cc83e3312b6feb579f70f9c71",
+ "device": "cuda",
+ "curvature": "input-hessian",
+ "calibration": {
+  "sequences": 64,
+  "seq_len": 512,
+  "batch_size": 8,
+  "seed": 12648430,
+  "tokens": 32768
+ },
+ "targets": {
+  "tensors": 24,
+  "layers": [
+   0,
+   3,
+   6,
+   9,
+   12,
+   15,
+   18,
+   21
+  ],
+  "shapes": [
+   [
+    "model.layers.0.self_attn.q_proj",
+    2048,
+    2048
+   ],
+   [
+    "model.layers.0.self_attn.k_proj",
+    2048,
+    2048
+   ],
+   [
+    "model.layers.0.self_attn.v_proj",
+    2048,
+    2048
+   ],
+   [
+    "model.layers.3.self_attn.q_proj",
+    2048,
+    2048
+   ],
+   [
+    "model.layers.3.self_attn.k_proj",
+    2048,
+    2048
+   ],
+   [
+    "model.layers.3.self_attn.v_proj",
+    2048,
+    2048
+   ],
+   [
+    "model.layers.6.self_attn.q_proj",
+    2048,
+    2048
+   ],
+   [
+    "model.layers.6.self_attn.k_proj",
+    2048,
+    2048
+   ],
+   [
+    "model.layers.6.self_attn.v_proj",
+    2048,
+    2048
+   ],
+   [
+    "model.layers.9.self_attn.q_proj",
+    2048,
+    2048
+   ],
+   [
+    "model.layers.9.self_attn.k_proj",
+    2048,
+    2048
+   ],
+   [
+    "model.layers.9.self_attn.v_proj",
+    2048,
+    2048
+   ],
+   [
+    "model.layers.12.self_attn.q_proj",
+    2048,
+    2048
+   ],
+   [
+    "model.layers.12.self_attn.k_proj",
+    2048,
+    2048
+   ],
+   [
+    "model.layers.12.self_attn.v_proj",
+    2048,
+    2048
+   ],
+   [
+    "model.layers.15.self_attn.q_proj",
+    2048,
+    2048
+   ],
+   [
+    "model.layers.15.self_attn.k_proj",
+    2048,
+    2048
+   ],
+   [
+    "model.layers.15.self_attn.v_proj",
+    2048,
+    2048
+   ],
+   [
+    "model.layers.18.self_attn.q_proj",
+    2048,
+    2048
+   ],
+   [
+    "model.layers.18.self_attn.k_proj",
+    2048,
+    2048
+   ],
+   [
+    "model.layers.18.self_attn.v_proj",
+    2048,
+    2048
+   ],
+   [
+    "model.layers.21.self_attn.q_proj",
+    2048,
+    2048
+   ],
+   [
+    "model.layers.21.self_attn.k_proj",
+    2048,
+    2048
+   ],
+   [
+    "model.layers.21.self_attn.v_proj",
+    2048,
+    2048
+   ]
+  ]
+ },
+ "per_tensor": {
+  "replays": 24,
+  "wall_s": 605.316,
+  "peak_bytes": 11853898752,
+  "artifact_bytes": 50732380
+ },
+ "shared_forward": {
+  "replays": 8,
+  "wall_s": 515.969,
+  "peak_bytes": 12055225344,
+  "artifact_bytes": 50732380
+ },
+ "speedup_wall": 1.173,
+ "replay_reduction": 3.0,
+ "byte_identity": true
+}
