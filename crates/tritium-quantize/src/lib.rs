@@ -82,8 +82,9 @@ pub use qwen35_coverage::{
 pub use recon::{ReconAccum, ReconError, ReconStats, reconstruction_stats};
 pub use salt_v2::{
     DensePsdMetric, JointFitConfig, JointFitError, JointFitMetric, JointFitRestartReceipt,
-    JointFitStartKind, JointFitUpdatePhase, JointFitUpdateReceipt, JointTernaryFit, ScalePrecision,
-    ScaleSolveReceipt, ScaleSolveTelemetry, exact_ternary_assignment, fit_joint_ternary,
+    JointFitStartKind, JointFitUpdatePhase, JointFitUpdateReceipt, JointTernaryFit, RelayBasins,
+    ScalePrecision, ScaleSolveReceipt, ScaleSolveTelemetry, exact_ternary_assignment,
+    fit_joint_ternary,
 };
 pub use salt_v2_activation::{
     ActivationByteLedger, ActivationCache, ActivationCacheBuilder, ActivationCacheError,

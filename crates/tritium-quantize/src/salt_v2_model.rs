@@ -18,7 +18,7 @@ use tritium_format::salt_v2_package::{
 use tritium_format::{ModelId, PackageId};
 
 use crate::salt_v2::{
-    DensePsdMetric, JointFitConfig, JointFitError, JointFitMetric, ScalePrecision,
+    DensePsdMetric, JointFitConfig, JointFitError, JointFitMetric, RelayBasins, ScalePrecision,
     fit_joint_ternary,
 };
 use crate::salt_v2_activation::ActivationCache;
@@ -35,7 +35,8 @@ use crate::salt_v2_feedback::{
 const REFERENCE_SOLVER_VERSION: &str = "tritium-salt-v2-reference-model-fit-v2";
 const REFERENCE_SOLVER_ID_CONTEXT: &str = "tritium salt v2 solver identity v1";
 const RECEIPT_HASH_CONTEXT: &str = "tritium salt v2 model fit receipt v2";
-const RECIPE_HASH_CONTEXT: &str = "tritium salt v2 model fit recipe v1";
+// v2: hashed field set extended with the relay-basin flags (plan 0054 WS-B).
+const RECIPE_HASH_CONTEXT: &str = "tritium salt v2 model fit recipe v2";
 const SOURCE_TENSOR_HASH_CONTEXT: &str = "tritium salt v2 source tensor v1";
 const CURVATURE_HASH_CONTEXT: &str = "tritium salt v2 bound curvature artifact v2";
 const FEEDBACK_HASH_CONTEXT: &str = "tritium salt v2 bound feedback artifact v1";
@@ -164,6 +165,8 @@ pub struct SaltV2Config {
     pub transform_seed: Option<u64>,
     /// Deterministic output-aware OA-EM restart count.
     pub em_restarts: usize,
+    /// Extra deterministic CAT-Q relay initialization basins evaluated per group.
+    pub relay_basins: RelayBasins,
     /// Maximum joint assignment/scale coordinate sweeps.
     pub coordinate_sweeps: usize,
     /// Finite positive condition threshold used to derive the reference solve ridge.
@@ -184,6 +187,7 @@ impl Default for SaltV2Config {
             curvature: SaltV2Curvature::DiagonalFisher,
             transform_seed: None,
             em_restarts: 4,
+            relay_basins: RelayBasins::default(),
             coordinate_sweeps: 10,
             ridge_condition_limit: 1_000_000.0,
             rate: PhysicalRateTarget::default(),
@@ -2639,6 +2643,7 @@ fn fit_feedback_group(
                 em_restarts: if provisional { 1 } else { config.em_restarts },
                 ridge_condition_limit: config.ridge_condition_limit,
                 scale_precision: ScalePrecision::F16,
+                relay_basins: config.relay_basins,
             };
             let (scales, trits, order) = if config.packing.fit_constraint()
                 == SaltV2FitConstraint::S34
@@ -2914,6 +2919,7 @@ fn fit_tile_frontier(
                     em_restarts: config.em_restarts,
                     ridge_condition_limit: config.ridge_condition_limit,
                     scale_precision: ScalePrecision::F16,
+                    relay_basins: config.relay_basins,
                 },
             )
             .map_err(|source| SaltV2Error::JointFit {
@@ -2935,6 +2941,7 @@ fn fit_tile_frontier(
                     em_restarts: config.em_restarts,
                     ridge_condition_limit: config.ridge_condition_limit,
                     scale_precision: ScalePrecision::F16,
+                    relay_basins: config.relay_basins,
                 },
             )
             .map_err(|source| SaltV2Error::JointFit {
@@ -4095,6 +4102,12 @@ fn hash_search_recipe_tail(hasher: &mut blake3::Hasher, config: &SaltV2Config) {
         }
     }
     write_len_hash(hasher, config.em_restarts);
+    // Adding the relay-basin flags extends the hashed recipe field set: every recipe and master
+    // digest — including default-off recipes — migrates at this revision.
+    hasher.update(&[
+        u8::from(config.relay_basins.softened),
+        u8::from(config.relay_basins.modulated),
+    ]);
     write_len_hash(hasher, config.coordinate_sweeps);
     hasher.update(&config.ridge_condition_limit.to_bits().to_le_bytes());
     match config.refinement {
@@ -5815,6 +5828,7 @@ mod tests {
             em_restarts: 3,
             ridge_condition_limit: 1_000_000.0,
             scale_precision: ScalePrecision::F16,
+            relay_basins: RelayBasins::default(),
         };
         let left = fit_progressive_s34(&target, JointFitMetric::Dense(&dense), config)
             .expect("left dense S34 fit");

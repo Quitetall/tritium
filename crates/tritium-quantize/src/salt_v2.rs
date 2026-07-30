@@ -12,6 +12,17 @@ pub enum ScalePrecision {
     F16,
 }
 
+/// Extra deterministic CAT-Q relay initialization basins appended after the OA-EM restarts.
+///
+/// Both basins default to off, which reproduces the historical restart set exactly.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RelayBasins {
+    /// Softened-relay basin: fixed `0.5` normalized threshold, scale-only soft descent.
+    pub softened: bool,
+    /// Modulated basin: scale, threshold, and shift all soft-descended.
+    pub modulated: bool,
+}
+
 /// Configuration for [`fit_joint_ternary`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct JointFitConfig {
@@ -27,6 +38,8 @@ pub struct JointFitConfig {
     pub ridge_condition_limit: f64,
     /// Precision at which scales are scored and returned.
     pub scale_precision: ScalePrecision,
+    /// Extra deterministic CAT-Q relay initialization basins.
+    pub relay_basins: RelayBasins,
 }
 
 impl Default for JointFitConfig {
@@ -38,6 +51,7 @@ impl Default for JointFitConfig {
             em_restarts: 4,
             ridge_condition_limit: 1e6,
             scale_precision: ScalePrecision::F32,
+            relay_basins: RelayBasins::default(),
         }
     }
 }
@@ -290,6 +304,10 @@ pub struct ScaleSolveReceipt {
 pub enum JointFitStartKind {
     /// Output-aware EM basin with the given deterministic restart index.
     DeterministicRestart(usize),
+    /// CAT-Q softened-relay basin: fixed normalized threshold, scale-only soft descent.
+    SoftenedRelayBasin,
+    /// CAT-Q modulated relay basin: scale, threshold, and shift soft-descended.
+    ModulatedRelayBasin,
     /// Embedded best solution with one fewer active plane and a zero final plane.
     LowerPlaneFallback,
 }
@@ -628,7 +646,10 @@ pub fn fit_joint_ternary(
     if !metric_sum.is_finite() {
         return Err(JointFitError::ScaleSolveFailed);
     }
-    let mut starts = Vec::with_capacity(config.em_restarts + usize::from(config.planes > 1));
+    let relay_starts =
+        usize::from(config.relay_basins.softened) + usize::from(config.relay_basins.modulated);
+    let mut starts =
+        Vec::with_capacity(config.em_restarts + relay_starts + usize::from(config.planes > 1));
     for restart in 0..config.em_restarts {
         let scales = deterministic_initial_scales(weights, &metric_diagonal, config, restart)?;
         starts.push(optimize_start(
@@ -638,6 +659,30 @@ pub fn fit_joint_ternary(
             scales,
             JointFitStartKind::DeterministicRestart(restart),
         )?);
+    }
+
+    // Relay basins are extra candidates appended after the configured OA-EM restarts, so the
+    // deterministic restart indices and receipts are byte-identical when both basins are off.
+    for (enabled, kind) in [
+        (
+            config.relay_basins.softened,
+            JointFitStartKind::SoftenedRelayBasin,
+        ),
+        (
+            config.relay_basins.modulated,
+            JointFitStartKind::ModulatedRelayBasin,
+        ),
+    ] {
+        if !enabled {
+            continue;
+        }
+        let scales = relay::basin_scales(
+            weights,
+            config.planes,
+            kind == JointFitStartKind::ModulatedRelayBasin,
+            config.scale_precision,
+        )?;
+        starts.push(optimize_start(weights, fit_metric, config, scales, kind)?);
     }
 
     // A lower-plane embedding is an additional basin, not one of the configured OA-EM restarts.
@@ -1253,6 +1298,172 @@ fn accumulate_objective_term(objective: &mut f64, term: f64) -> Result<(), Joint
     Ok(())
 }
 
+/// CAT-Q softened two-sided-relay initialization basins (arXiv 2606.26650).
+///
+/// Each basin soft-fits sequential residual planes with the smooth relay surrogate and hands the
+/// exact E/M solver only the fitted per-plane scale magnitudes as one extra restart candidate.
+/// The surrogate's normalized threshold `delta` and (modulated variant) shift `mu` are
+/// basin-internal: they shape which scales come out and are neither stored nor returned, so the
+/// emitted representation stays pure scales-and-trits and the ADR 0028 zero-point ban holds.
+///
+/// The soft objective is plain squared error in absmean-normalized units — the basin is only an
+/// initializer; the exact solver applies the configured curvature metric. Everything is
+/// bit-repeatable: no RNG, fixed iteration counts, fixed step size, and a fixed sharpness
+/// schedule.
+mod relay {
+    use super::{JointFitError, ScalePrecision, deployment_scale};
+
+    /// Fixed number of analytic gradient-descent steps per plane.
+    const STEPS: usize = 12;
+    /// Fixed descent step size applied to mean gradients in normalized units.
+    const STEP_SIZE: f64 = 0.05;
+    /// Initial relay sharpness `s0`. The schedule doubles it every four steps:
+    /// steps 0-3 use 30, steps 4-7 use 60, steps 8-11 use 120.
+    const INITIAL_SHARPNESS: f64 = 30.0;
+    /// Normalized scale bounds. The residual absmean is 1 by construction, so these bound the
+    /// fitted scale to a sane multiple of it and keep `u = c / scale` finite.
+    const SCALE_BOUNDS: (f64, f64) = (1e-3, 8.0);
+    /// Normalized threshold bounds inside the open interval `(0, 1)`.
+    const THRESHOLD_BOUNDS: (f64, f64) = (0.05, 0.95);
+    /// Normalized shift bounds for the modulated variant.
+    const SHIFT_BOUNDS: (f64, f64) = (-2.0, 2.0);
+
+    /// Deployment-signature wrapper over the f64 relay core, exercised by the property tests;
+    /// the descent evaluates the core directly.
+    #[cfg(test)]
+    pub(super) fn two_sided_relay(v: f32, sharpness: f32, delta: f32) -> f32 {
+        relay(f64::from(v), f64::from(sharpness), f64::from(delta)) as f32
+    }
+
+    /// CAT-Q softened ternarization
+    /// `(tanh(s * (v - delta)) + tanh(s * (v + delta))) / (2 * tanh(s))`.
+    ///
+    /// Odd-symmetric with `f(0) = 0`, bounded by `|f| <= 1` on `|v| <= 1` for
+    /// `delta` in `[0, 1]`, and approaching the hard ternary indicator with
+    /// threshold `delta` as `sharpness -> inf`.
+    fn relay(v: f64, sharpness: f64, delta: f64) -> f64 {
+        (((v - delta) * sharpness).tanh() + ((v + delta) * sharpness).tanh())
+            / (2.0 * sharpness.tanh())
+    }
+
+    // `1 - tanh^2` saturates to exactly zero for large inputs instead of overflowing like
+    // `cosh`-based forms, which keeps every descent step finite.
+    fn sech_squared(x: f64) -> f64 {
+        let tanh = x.tanh();
+        1.0 - tanh * tanh
+    }
+
+    const fn sharpness_at(step: usize) -> f64 {
+        INITIAL_SHARPNESS * (1 << (step / 4)) as f64
+    }
+
+    /// Fitted soft-plane parameters in absmean-normalized units.
+    struct PlaneFit {
+        scale: f64,
+        threshold: f64,
+        shift: f64,
+    }
+
+    /// Sequential per-plane residual soft fit returning `planes` deployment-rounded scale
+    /// magnitudes, canonicalized descending like every other deterministic basin.
+    ///
+    /// After each plane the HARD projection of the soft fit — the exact ternary assignment of
+    /// the shift-centered residual at the fitted scale and threshold — is subtracted, so only
+    /// the `scale * trit` contribution ever leaves the basin.
+    pub(super) fn basin_scales(
+        weights: &[f32],
+        planes: usize,
+        modulated: bool,
+        precision: ScalePrecision,
+    ) -> Result<Vec<f32>, JointFitError> {
+        let mut residual = weights.to_vec();
+        let mut scales = Vec::with_capacity(planes);
+        for plane in 0..planes {
+            let absmean = residual
+                .iter()
+                .map(|value| f64::from(value.abs()))
+                .sum::<f64>()
+                / residual.len() as f64;
+            if absmean <= 0.0 {
+                scales.push(deployment_scale(0.0, precision, plane)?);
+                continue;
+            }
+            let normalized: Vec<f64> = residual
+                .iter()
+                .map(|value| f64::from(*value) / absmean)
+                .collect();
+            let fit = descend(&normalized, modulated);
+            let scale = deployment_scale((fit.scale * absmean) as f32, precision, plane)?;
+            scales.push(scale);
+            if scale > 0.0 {
+                let shift = (fit.shift * absmean) as f32;
+                let threshold = scale * fit.threshold as f32;
+                for value in &mut residual {
+                    let centered = *value - shift;
+                    let trit = if centered > threshold {
+                        1.0
+                    } else if centered < -threshold {
+                        -1.0
+                    } else {
+                        0.0
+                    };
+                    *value -= scale * trit;
+                }
+            }
+        }
+        scales.sort_by(|left, right| right.total_cmp(left));
+        Ok(scales)
+    }
+
+    /// Minimize `L = mean_i (c_i - a * relay(c_i / a, s_k, delta))^2` with `c_i = w_i - mu` by
+    /// `STEPS` analytic gradient steps of fixed size `STEP_SIZE` under the documented sharpness
+    /// schedule. The softened variant descends only `a`; the modulated variant also descends
+    /// `delta` and `mu`. Every parameter is clamped to its bounds after each step.
+    fn descend(normalized: &[f64], modulated: bool) -> PlaneFit {
+        let count = normalized.len() as f64;
+        let mut scale = 1.0_f64;
+        let mut threshold = 0.5_f64;
+        let mut shift = if modulated {
+            (normalized.iter().sum::<f64>() / count).clamp(SHIFT_BOUNDS.0, SHIFT_BOUNDS.1)
+        } else {
+            0.0
+        };
+        for step in 0..STEPS {
+            let sharpness = sharpness_at(step);
+            let norm = 2.0 * sharpness.tanh();
+            let mut grad_scale = 0.0_f64;
+            let mut grad_threshold = 0.0_f64;
+            let mut grad_shift = 0.0_f64;
+            for &value in normalized {
+                let centered = value - shift;
+                let u = centered / scale;
+                let lower = (u - threshold) * sharpness;
+                let upper = (u + threshold) * sharpness;
+                let soft = relay(u, sharpness, threshold);
+                let soft_du = sharpness * (sech_squared(lower) + sech_squared(upper)) / norm;
+                let soft_dthreshold =
+                    sharpness * (sech_squared(upper) - sech_squared(lower)) / norm;
+                let error = centered - scale * soft;
+                grad_scale += error * (u * soft_du - soft);
+                grad_threshold -= error * scale * soft_dthreshold;
+                grad_shift += error * (soft_du - 1.0);
+            }
+            let step_factor = 2.0 * STEP_SIZE / count;
+            scale = (scale - step_factor * grad_scale).clamp(SCALE_BOUNDS.0, SCALE_BOUNDS.1);
+            if modulated {
+                threshold = (threshold - step_factor * grad_threshold)
+                    .clamp(THRESHOLD_BOUNDS.0, THRESHOLD_BOUNDS.1);
+                shift = (shift - step_factor * grad_shift).clamp(SHIFT_BOUNDS.0, SHIFT_BOUNDS.1);
+            }
+        }
+        PlaneFit {
+            scale,
+            threshold,
+            shift,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1475,24 +1686,38 @@ mod tests {
     fn fitting_is_bitwise_deterministic() {
         let weights = [-2.4, -1.1, -0.2, 0.0, 0.35, 0.9, 1.8, 3.2];
         let metric = [1.0, 4.0, 0.5, 2.0, 1.0, 3.0, 0.25, 5.0];
-        let config = JointFitConfig {
-            planes: 2,
-            max_iterations: 12,
-            ridge: 1e-7,
-            scale_precision: ScalePrecision::F32,
-            ..JointFitConfig::default()
-        };
+        for relay_basins in [
+            RelayBasins::default(),
+            RelayBasins {
+                softened: true,
+                modulated: true,
+            },
+        ] {
+            let config = JointFitConfig {
+                planes: 2,
+                max_iterations: 12,
+                ridge: 1e-7,
+                scale_precision: ScalePrecision::F32,
+                relay_basins,
+                ..JointFitConfig::default()
+            };
 
-        let first = fit_joint_ternary(&weights, JointFitMetric::Diagonal(&metric), config)
-            .expect("first fit");
-        let second = fit_joint_ternary(&weights, JointFitMetric::Diagonal(&metric), config)
-            .expect("second fit");
+            let first = fit_joint_ternary(&weights, JointFitMetric::Diagonal(&metric), config)
+                .expect("first fit");
+            let second = fit_joint_ternary(&weights, JointFitMetric::Diagonal(&metric), config)
+                .expect("second fit");
 
-        assert_eq!(first, second);
-        assert!(first.scales.iter().any(|scale| *scale > 0.0));
-        assert!(first.reconstruction.iter().any(|weight| *weight != 0.0));
-        assert_eq!(first.restart_receipts.len(), config.em_restarts + 1);
-        assert!(first.selected_start < first.restart_receipts.len());
+            assert_eq!(first, second);
+            assert!(first.scales.iter().any(|scale| *scale > 0.0));
+            assert!(first.reconstruction.iter().any(|weight| *weight != 0.0));
+            let relay_starts =
+                usize::from(relay_basins.softened) + usize::from(relay_basins.modulated);
+            assert_eq!(
+                first.restart_receipts.len(),
+                config.em_restarts + relay_starts + 1
+            );
+            assert!(first.selected_start < first.restart_receipts.len());
+        }
     }
 
     #[test]
@@ -1515,32 +1740,73 @@ mod tests {
     #[test]
     fn oa_em_evaluates_every_configured_restart_for_p1_through_p3() {
         let weights = [-2.9, -1.1, -0.18, 0.33, 0.95, 2.4];
-        for planes in 1..=3 {
-            let config = JointFitConfig {
-                planes,
-                em_restarts: 3,
-                ..JointFitConfig::default()
-            };
-            let fit = fit_joint_ternary(&weights, JointFitMetric::Identity, config)
-                .expect("deterministic multi-start fit");
-            let restart_kinds: Vec<_> = fit
-                .restart_receipts
-                .iter()
-                .filter_map(|receipt| match receipt.kind {
-                    JointFitStartKind::DeterministicRestart(index) => Some(index),
-                    JointFitStartKind::LowerPlaneFallback => None,
-                })
-                .collect();
-            assert_eq!(restart_kinds, vec![0, 1, 2]);
-            assert_eq!(
-                fit.restart_receipts.len(),
-                config.em_restarts + usize::from(planes > 1)
-            );
-            assert!(
-                fit.restart_receipts
+        for relay_basins in [
+            RelayBasins::default(),
+            RelayBasins {
+                softened: true,
+                modulated: false,
+            },
+            RelayBasins {
+                softened: false,
+                modulated: true,
+            },
+            RelayBasins {
+                softened: true,
+                modulated: true,
+            },
+        ] {
+            for planes in 1..=3 {
+                let config = JointFitConfig {
+                    planes,
+                    em_restarts: 3,
+                    relay_basins,
+                    ..JointFitConfig::default()
+                };
+                let fit = fit_joint_ternary(&weights, JointFitMetric::Identity, config)
+                    .expect("deterministic multi-start fit");
+                let restart_kinds: Vec<_> = fit
+                    .restart_receipts
                     .iter()
-                    .all(|receipt| receipt.final_objective <= receipt.initial_objective)
-            );
+                    .filter_map(|receipt| match receipt.kind {
+                        JointFitStartKind::DeterministicRestart(index) => Some(index),
+                        JointFitStartKind::SoftenedRelayBasin
+                        | JointFitStartKind::ModulatedRelayBasin
+                        | JointFitStartKind::LowerPlaneFallback => None,
+                    })
+                    .collect();
+                assert_eq!(restart_kinds, vec![0, 1, 2]);
+                let relay_kinds: Vec<_> = fit
+                    .restart_receipts
+                    .iter()
+                    .filter(|receipt| {
+                        matches!(
+                            receipt.kind,
+                            JointFitStartKind::SoftenedRelayBasin
+                                | JointFitStartKind::ModulatedRelayBasin
+                        )
+                    })
+                    .map(|receipt| receipt.kind)
+                    .collect();
+                let mut expected_relay_kinds = Vec::new();
+                if relay_basins.softened {
+                    expected_relay_kinds.push(JointFitStartKind::SoftenedRelayBasin);
+                }
+                if relay_basins.modulated {
+                    expected_relay_kinds.push(JointFitStartKind::ModulatedRelayBasin);
+                }
+                assert_eq!(relay_kinds, expected_relay_kinds);
+                let relay_starts =
+                    usize::from(relay_basins.softened) + usize::from(relay_basins.modulated);
+                assert_eq!(
+                    fit.restart_receipts.len(),
+                    config.em_restarts + relay_starts + usize::from(planes > 1)
+                );
+                assert!(
+                    fit.restart_receipts
+                        .iter()
+                        .all(|receipt| receipt.final_objective <= receipt.initial_objective)
+                );
+            }
         }
     }
 
@@ -1616,35 +1882,44 @@ mod tests {
 
     #[test]
     fn every_accepted_e_and_m_update_is_strictly_monotone() {
-        let fit = fit_joint_ternary(
-            &[-3.1, -1.4, -0.45, 0.15, 0.8, 2.2, 4.0],
-            JointFitMetric::Identity,
-            JointFitConfig {
-                planes: 3,
-                ..JointFitConfig::default()
+        for relay_basins in [
+            RelayBasins::default(),
+            RelayBasins {
+                softened: true,
+                modulated: true,
             },
-        )
-        .expect("joint fit");
+        ] {
+            let fit = fit_joint_ternary(
+                &[-3.1, -1.4, -0.45, 0.15, 0.8, 2.2, 4.0],
+                JointFitMetric::Identity,
+                JointFitConfig {
+                    planes: 3,
+                    relay_basins,
+                    ..JointFitConfig::default()
+                },
+            )
+            .expect("joint fit");
 
-        for restart in &fit.restart_receipts {
-            for update in &restart.accepted_updates {
-                assert!(update.objective_after < update.objective_before);
+            for restart in &fit.restart_receipts {
+                for update in &restart.accepted_updates {
+                    assert!(update.objective_after < update.objective_before);
+                }
+                assert!(
+                    restart
+                        .accepted_updates
+                        .windows(2)
+                        .all(|pair| pair[1].objective_before <= pair[0].objective_after)
+                );
+                for solve in &restart.scale_solves {
+                    assert!(solve.telemetry.ridge_used >= 1e-8);
+                }
             }
             assert!(
-                restart
-                    .accepted_updates
+                fit.accepted_objectives
                     .windows(2)
-                    .all(|pair| pair[1].objective_before <= pair[0].objective_after)
+                    .all(|pair| pair[1] < pair[0])
             );
-            for solve in &restart.scale_solves {
-                assert!(solve.telemetry.ridge_used >= 1e-8);
-            }
         }
-        assert!(
-            fit.accepted_objectives
-                .windows(2)
-                .all(|pair| pair[1] < pair[0])
-        );
     }
 
     #[test]
@@ -1754,35 +2029,49 @@ mod tests {
     #[test]
     fn accepted_iterations_are_monotone_and_p2_dominates_baselines() {
         let weights = [-3.0, -1.7, -0.8, -0.15, 0.2, 0.65, 1.4, 2.8, 4.1];
-        let p1 = fit_joint_ternary(
-            &weights,
-            JointFitMetric::Identity,
-            JointFitConfig::default(),
-        )
-        .expect("P1 fit");
-        let p2 = fit_joint_ternary(
-            &weights,
-            JointFitMetric::Identity,
-            JointFitConfig {
-                planes: 2,
-                ..JointFitConfig::default()
+        for relay_basins in [
+            RelayBasins::default(),
+            RelayBasins {
+                softened: true,
+                modulated: true,
             },
-        )
-        .expect("P2 fit");
-        let greedy = greedy_residual_reconstruction(&weights, 2);
-        let greedy_error = squared_error(&weights, &greedy);
+        ] {
+            let p1 = fit_joint_ternary(
+                &weights,
+                JointFitMetric::Identity,
+                JointFitConfig {
+                    relay_basins,
+                    ..JointFitConfig::default()
+                },
+            )
+            .expect("P1 fit");
+            let p2 = fit_joint_ternary(
+                &weights,
+                JointFitMetric::Identity,
+                JointFitConfig {
+                    planes: 2,
+                    relay_basins,
+                    ..JointFitConfig::default()
+                },
+            )
+            .expect("P2 fit");
+            let greedy = greedy_residual_reconstruction(&weights, 2);
+            let greedy_error = squared_error(&weights, &greedy);
 
-        assert!(p2.objective <= p1.objective);
-        assert!(p2.objective <= greedy_error);
-        assert!(
-            p2.accepted_objectives.len() >= 2,
-            "worked sample must exercise an update"
-        );
-        assert!(
-            p2.accepted_objectives
-                .windows(2)
-                .all(|pair| pair[1] < pair[0])
-        );
+            assert!(p2.objective <= p1.objective);
+            assert!(p2.objective <= greedy_error);
+            if relay_basins == RelayBasins::default() {
+                assert!(
+                    p2.accepted_objectives.len() >= 2,
+                    "worked sample must exercise an update"
+                );
+            }
+            assert!(
+                p2.accepted_objectives
+                    .windows(2)
+                    .all(|pair| pair[1] < pair[0])
+            );
+        }
     }
 
     #[test]
@@ -1803,5 +2092,117 @@ mod tests {
                 .iter()
                 .all(|scale| { half::f16::from_f32(*scale).to_f32().to_bits() == scale.to_bits() })
         );
+    }
+
+    // Deterministic modular pseudo-random groups, the same seedless synthetic-weight pattern the
+    // model-fit tests use.
+    fn deterministic_group(seed: usize, len: usize) -> Vec<f32> {
+        (0..len)
+            .map(|index| {
+                let value = (index * (2 * seed + 3) + 5 * seed) % 31;
+                (value as f32 - 15.0) / (4.0 + seed as f32)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn two_sided_relay_is_odd_zero_at_zero_and_bounded() {
+        for sharpness in [5.0_f32, 30.0, 120.0] {
+            for delta in [0.1_f32, 0.5, 0.9] {
+                assert!(relay::two_sided_relay(0.0, sharpness, delta).abs() <= 1e-7);
+                for step in 0..=40 {
+                    let v = -1.0 + 0.05 * step as f32;
+                    let forward = relay::two_sided_relay(v, sharpness, delta);
+                    let mirrored = relay::two_sided_relay(-v, sharpness, delta);
+                    assert!(
+                        (forward + mirrored).abs() <= 1e-6,
+                        "odd symmetry broken at v = {v}, s = {sharpness}, delta = {delta}"
+                    );
+                    assert!(
+                        forward.abs() <= 1.0 + 1e-6,
+                        "|f| > 1 at v = {v}, s = {sharpness}, delta = {delta}: {forward}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn two_sided_relay_sharp_limit_matches_hard_ternary_off_threshold() {
+        // Every probe sits at least 0.05 from the |v| = 0.5 threshold, so the tanh terms
+        // saturate at sharpness 4096 and the relay collapses to the hard ternary indicator.
+        for v in [-0.95_f32, -0.6, -0.2, 0.0, 0.3, 0.55, 0.95] {
+            let hard = if v > 0.5 {
+                1.0
+            } else if v < -0.5 {
+                -1.0
+            } else {
+                0.0
+            };
+            let soft = relay::two_sided_relay(v, 4096.0, 0.5);
+            assert!(
+                (soft - hard).abs() <= 1e-6,
+                "v = {v}: soft {soft} vs hard {hard}"
+            );
+        }
+    }
+
+    #[test]
+    fn relay_basin_scales_are_deterministic_descending_and_non_negative() {
+        for seed in [1_usize, 4, 7] {
+            let weights = deterministic_group(seed, 24);
+            for modulated in [false, true] {
+                let first = relay::basin_scales(&weights, 3, modulated, ScalePrecision::F32)
+                    .expect("first basin fit");
+                let second = relay::basin_scales(&weights, 3, modulated, ScalePrecision::F32)
+                    .expect("second basin fit");
+                let first_bits: Vec<u32> = first.iter().map(|scale| scale.to_bits()).collect();
+                let second_bits: Vec<u32> = second.iter().map(|scale| scale.to_bits()).collect();
+                assert_eq!(first_bits, second_bits);
+                assert_eq!(first.len(), 3);
+                assert!(first.iter().all(|scale| *scale >= 0.0));
+                assert!(first.windows(2).all(|pair| pair[0] >= pair[1]));
+            }
+        }
+    }
+
+    #[test]
+    fn relay_basins_never_worsen_the_final_objective() {
+        // Extra accept-only-if-improves basins can only widen the minimized start set, so the
+        // selected objective with basins enabled is bounded by the baseline. Exact determinism
+        // makes the f64 comparison stable.
+        for seed in 0..10 {
+            let weights = deterministic_group(seed, 16);
+            for planes in 1..=3 {
+                let baseline = fit_joint_ternary(
+                    &weights,
+                    JointFitMetric::Identity,
+                    JointFitConfig {
+                        planes,
+                        ..JointFitConfig::default()
+                    },
+                )
+                .expect("baseline fit");
+                let relayed = fit_joint_ternary(
+                    &weights,
+                    JointFitMetric::Identity,
+                    JointFitConfig {
+                        planes,
+                        relay_basins: RelayBasins {
+                            softened: true,
+                            modulated: true,
+                        },
+                        ..JointFitConfig::default()
+                    },
+                )
+                .expect("relay-basin fit");
+                assert!(
+                    relayed.objective <= baseline.objective,
+                    "seed {seed} P{planes}: relay {} > baseline {}",
+                    relayed.objective,
+                    baseline.objective
+                );
+            }
+        }
     }
 }
