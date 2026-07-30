@@ -91,7 +91,12 @@ fn main() {
         .copied()
         .unwrap_or(0.0);
     let max = rel_improvements.last().copied().unwrap_or(0.0);
-    println!("tensors={} groups={} planes={}", picked.len(), total, planes);
+    println!(
+        "tensors={} groups={} planes={}",
+        picked.len(),
+        total,
+        planes
+    );
     println!(
         "basin wins={} ({:.1}%) ties={} median-rel-improvement={:.3e} max={:.3e}",
         wins,
