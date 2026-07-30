@@ -56,7 +56,9 @@ use std::ffi::{CString, c_void};
 use tritium_core::{GemmShape, TernaryFormat};
 use tritium_format::{IMMA_K, IMMA_N, IMMA_WTILE_BYTES, TQ2_0_BLOCK_BYTES, num_blocks};
 use tritium_runtime::BackendEntry;
-use tritium_spec::{BackendError, DeviceBuffer, DeviceCaps, MpGemm, TernaryBackend};
+use tritium_spec::{
+    BackendError, DeviceBuffer, DeviceCaps, MpGemm, MpGemmProjectedVjp, TernaryBackend,
+};
 
 use crate::autotune::{
     CacheKey, CandidateResult, ShapeBucket, TileConfig, cache_dir, tune_or_load,

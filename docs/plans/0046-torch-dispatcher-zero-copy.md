@@ -81,12 +81,22 @@ checks bound observed forward/gradient drift to `4.77e-6`; full wheel suite
 passes 241 tests plus 9 subtests (one prerequisite skip). Warm backward profiles
 contain no Torch projection or matrix-multiply operators.
 
-Remaining before Step 2 closes: stream-aware CUDA input/output, CUDA packed-cache
-residency, sanitizer evidence, CPU performance optimization/qualification, and
-retained representative-shape performance receipts. Exploratory release-build
-timings are not a gate receipt: native forward+backward remained 2.6–3.7× slower
-than this host's MKL-backed composite at `M=32`, so no CPU speedup claim is
-permitted yet.
+CUDA's backend-neutral packed VJP slice also landed. `CudaBackend` now overrides
+`mpgemm_projected_vjp`, consumes the existing resident TQ2_0 allocation, and
+launches packed activation-gradient, dense projected-weight-gradient and bias
+reduction kernels without materializing a dense CUDA weight. Physical RTX 4090
+parity covers packed-block-tail and output-channel-tail shapes; the CUDA library reports
+129 passed and six explicitly ignored benchmark/known-capability tests. This
+trait method still accepts host slices and therefore performs explicit
+activation/upstream uploads and gradient downloads; it is a native packed
+backend primitive, not the PyTorch zero-copy CUDA bridge.
+
+Remaining before Step 2 closes: stream-aware PyTorch CUDA input/output, external
+stream ordering, CUDA packed-cache residency, sanitizer evidence, CPU
+performance optimization/qualification, and retained representative-shape
+performance receipts. Exploratory release-build timings are not a gate receipt:
+native forward+backward remained 2.6–3.7× slower than this host's MKL-backed
+composite at `M=32`, so no CPU speedup claim is permitted yet.
 
 ## Verification
 

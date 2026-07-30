@@ -70,6 +70,65 @@ extern "C" __global__ void ternary_matmul_grad_w(
     gw[idx] = acc;
 }
 
+// Packed TQ2_0 activation VJP for the backend-neutral projected-weight contract:
+// gA[m,k] = sum_n gy[m,n] * scale[n] * trit[n,k].
+//
+// Unlike `ternary_matmul_grad_a`, this consumes the inference packing already
+// resident in `CudaBuffer`; no dense f32 weight shadow is materialized.
+#define PROJECTED_VJP_QK 256
+#define PROJECTED_VJP_TQ2_BLOCK_BYTES 66
+
+extern "C" __global__ void tq2_projected_grad_a(
+    const float* __restrict__ gy,              // [M, N]
+    const unsigned char* __restrict__ weights, // [N, row_bytes]
+    const float* __restrict__ scales,          // [N]
+    float* __restrict__ ga,                    // [M, K]
+    int m, int n, int k, int row_bytes)
+{
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (long)m * k) return;
+    int mi = idx / k;
+    int ki = idx % k;
+    int block = ki / PROJECTED_VJP_QK;
+    int e = ki - block * PROJECTED_VJP_QK;
+    int c = e >> 7;
+    int mm = e & 31;
+    int l = (e & 127) >> 5;
+    int byte_off = block * PROJECTED_VJP_TQ2_BLOCK_BYTES + c * 32 + mm;
+
+    float acc = 0.0f;
+    for (int ni = 0; ni < n; ++ni) {
+        const unsigned char* wrow = weights + (long)ni * row_bytes;
+        unsigned int code = ((unsigned int)wrow[byte_off] >> (2 * l)) & 3u;
+        float upstream = gy[(long)mi * n + ni] * scales[ni];
+        if (code == 2u) {
+            acc += upstream;
+        } else if (code == 0u) {
+            acc -= upstream;
+        }
+    }
+    ga[idx] = acc;
+}
+
+// VJP with respect to the dense projected weight P (not latent trits/scales):
+// gP[n,k] = sum_m gy[m,n] * A[m,k].
+extern "C" __global__ void linear_grad_projected_weight(
+    const float* __restrict__ gy, // [M, N]
+    const float* __restrict__ a,  // [M, K]
+    float* __restrict__ gp,       // [N, K]
+    int m, int n, int k)
+{
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (long)n * k) return;
+    int ni = idx / k;
+    int ki = idx % k;
+    float acc = 0.0f;
+    for (int mi = 0; mi < m; ++mi) {
+        acc += gy[(long)mi * n + ni] * a[(long)mi * k + ki];
+    }
+    gp[idx] = acc;
+}
+
 // gs[n] = sum_m gy[m,n] * P[m,n],  P[m,n] = sum_k A[m,k] * W[n,k]  (unscaled)   (shape [N])
 extern "C" __global__ void ternary_matmul_grad_s(
     const float* __restrict__ gy,   // [M, N]

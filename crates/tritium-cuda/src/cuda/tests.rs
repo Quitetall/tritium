@@ -699,6 +699,88 @@ fn train_backward_matches_cpu_vjp() {
     }
 }
 
+/// Plan 0046: packed backend-neutral VJP must consume the existing TQ2_0
+/// allocation and match CPU without materializing a dense CUDA weight.
+#[test]
+fn packed_projected_vjp_matches_cpu_backend() {
+    let cuda = match CudaBackend::new(0) {
+        Ok(backend) => backend,
+        Err(error) => {
+            eprintln!("skipping packed projected VJP parity: no device ({error})");
+            return;
+        }
+    };
+    let cpu = CpuBackend::new();
+    let tolerance = Tolerance::relative(1e-4);
+    for (case, (m, n, k)) in [(2, 3, 5), (7, 4, 257), (1, 33, 64)]
+        .into_iter()
+        .enumerate()
+    {
+        let shape = GemmShape::new(m, n, k);
+        let trits = (0..n * k)
+            .map(|index| match (index + case) % 3 {
+                0 => tritium_core::Trit::NEG,
+                1 => tritium_core::Trit::ZERO,
+                _ => tritium_core::Trit::POS,
+            })
+            .collect::<Vec<_>>();
+        let packed = pack_tq2_0(&trits, shape);
+        let cpu_weights = cpu
+            .upload_weights(&packed, shape, TernaryFormat::Tq2_0)
+            .expect("CPU upload");
+        let cuda_weights = cuda
+            .upload_weights(&packed, shape, TernaryFormat::Tq2_0)
+            .expect("CUDA upload");
+        let act = seeded_f32(11 + case as u64, m * k, -2.0, 2.0);
+        let scales = seeded_f32(21 + case as u64, n, 0.05, 1.5);
+        let grad_output = seeded_f32(31 + case as u64, m * n, -1.0, 1.0);
+        let mut cpu_grad_act = vec![f32::NAN; m * k];
+        let mut cpu_grad_weight = vec![f32::NAN; n * k];
+        let mut cpu_grad_bias = vec![f32::NAN; n];
+        let mut cuda_grad_act = vec![f32::NAN; m * k];
+        let mut cuda_grad_weight = vec![f32::NAN; n * k];
+        let mut cuda_grad_bias = vec![f32::NAN; n];
+
+        cpu.mpgemm_projected_vjp(MpGemmProjectedVjp {
+            act: &act,
+            weights: cpu_weights.as_ref(),
+            scales: &scales,
+            grad_output: &grad_output,
+            shape,
+            format: TernaryFormat::Tq2_0,
+            grad_act: &mut cpu_grad_act,
+            grad_projected_weight: &mut cpu_grad_weight,
+            grad_bias: Some(&mut cpu_grad_bias),
+        })
+        .expect("CPU projected VJP");
+        cuda.mpgemm_projected_vjp(MpGemmProjectedVjp {
+            act: &act,
+            weights: cuda_weights.as_ref(),
+            scales: &scales,
+            grad_output: &grad_output,
+            shape,
+            format: TernaryFormat::Tq2_0,
+            grad_act: &mut cuda_grad_act,
+            grad_projected_weight: &mut cuda_grad_weight,
+            grad_bias: Some(&mut cuda_grad_bias),
+        })
+        .expect("CUDA projected VJP");
+
+        for (label, expected, actual) in [
+            ("grad_act", &cpu_grad_act, &cuda_grad_act),
+            ("grad_projected_weight", &cpu_grad_weight, &cuda_grad_weight),
+            ("grad_bias", &cpu_grad_bias, &cuda_grad_bias),
+        ] {
+            for (index, (&expected, &actual)) in expected.iter().zip(actual).enumerate() {
+                assert!(
+                    tolerance.accepts(actual, expected),
+                    "case {case} {label}[{index}]: CUDA {actual} vs CPU {expected}"
+                );
+            }
+        }
+    }
+}
+
 /// ADR 0027 Track D: the compact training-specific SALT planes must preserve
 /// Track A's per-row greedy quantizer while eliminating the dense quantized
 /// weight. Exercise every supported plane count, TQ2 tails, and the K>8192

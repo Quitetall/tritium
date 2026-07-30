@@ -595,6 +595,9 @@ pub struct CudaBackend {
     pub(super) func_grad_a: CudaFunction,
     pub(super) func_grad_w: CudaFunction,
     pub(super) func_grad_s: CudaFunction,
+    /// Packed TQ2_0 first-order VJP kernels for framework-native ternary Linear.
+    pub(super) func_projected_grad_a: CudaFunction,
+    pub(super) func_projected_grad_weight: CudaFunction,
     /// ADR 0027 Track A: per-row SALT residual quantization on resident f32 buffers.
     #[allow(dead_code)] // consumed by DeviceTrainer in the next Track A slice
     pub(super) func_salt_quantize_fwd: CudaFunction,
@@ -820,6 +823,12 @@ impl CudaBackend {
         let func_grad_s = grad_module
             .load_function(KERNEL_NAME_GRAD_S)
             .map_err(|e| driver_err("resolve grad_s kernel", &e))?;
+        let func_projected_grad_a = grad_module
+            .load_function(KERNEL_NAME_PROJECTED_GRAD_A)
+            .map_err(|e| driver_err("resolve tq2_projected_grad_a kernel", &e))?;
+        let func_projected_grad_weight = grad_module
+            .load_function(KERNEL_NAME_PROJECTED_GRAD_WEIGHT)
+            .map_err(|e| driver_err("resolve linear_grad_projected_weight kernel", &e))?;
         let func_salt_quantize_fwd = grad_module
             .load_function(KERNEL_NAME_SALT_QUANTIZE_FWD)
             .map_err(|e| driver_err("resolve salt_quantize_forward kernel", &e))?;
@@ -1085,6 +1094,8 @@ impl CudaBackend {
             func_grad_a,
             func_grad_w,
             func_grad_s,
+            func_projected_grad_a,
+            func_projected_grad_weight,
             func_salt_quantize_fwd,
             func_adamw_step,
             func_adamw_step_8bit,
@@ -4037,6 +4048,7 @@ impl CudaBackend {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn topk_kd_forward_dev(
         &self,
         logits: &CudaSlice<f32>,
@@ -4959,6 +4971,7 @@ impl CudaBackend {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn topk_kd_backward_dev(
         &self,
         logits: &CudaSlice<f32>,
@@ -8020,6 +8033,178 @@ impl TernaryBackend for CudaBackend {
         // All validation + the launch live in `mpgemm_kernel`.
         let kernel = Self::select_add_kernel(shape.m, shape.k);
         self.mpgemm_kernel(act, weights, scales, shape, format, out, kernel)
+    }
+
+    fn mpgemm_projected_vjp(&self, p: MpGemmProjectedVjp<'_>) -> Result<(), BackendError> {
+        let MpGemmProjectedVjp {
+            act,
+            weights,
+            scales,
+            grad_output,
+            shape,
+            format,
+            grad_act,
+            grad_projected_weight,
+            grad_bias,
+        } = p;
+        let GemmShape { m, n, k } = shape;
+        let mk = m
+            .checked_mul(k)
+            .ok_or_else(|| BackendError::InvalidInput("M*K element count overflows".to_owned()))?;
+        let nk = n
+            .checked_mul(k)
+            .ok_or_else(|| BackendError::InvalidInput("N*K element count overflows".to_owned()))?;
+        let mn = m
+            .checked_mul(n)
+            .ok_or_else(|| BackendError::InvalidInput("M*N element count overflows".to_owned()))?;
+        let lengths = [
+            (act.len(), mk),
+            (scales.len(), n),
+            (grad_output.len(), mn),
+            (grad_act.len(), mk),
+            (grad_projected_weight.len(), nk),
+        ];
+        if let Some(&(got, expected)) = lengths.iter().find(|(got, expected)| got != expected) {
+            return Err(BackendError::ShapeMismatch { expected, got });
+        }
+        if let Some(values) = grad_bias.as_ref()
+            && values.len() != n
+        {
+            return Err(BackendError::ShapeMismatch {
+                expected: n,
+                got: values.len(),
+            });
+        }
+        if format != TernaryFormat::Tq2_0 {
+            return Err(BackendError::UnsupportedFormat(format));
+        }
+        let buffer = weights
+            .as_any()
+            .downcast_ref::<CudaBuffer>()
+            .ok_or_else(|| BackendError::InvalidInput("buffer is not a CudaBuffer".to_owned()))?;
+        if buffer.format != format || buffer.n != n || buffer.k != k {
+            return Err(BackendError::InvalidInput(
+                "packed CUDA weight metadata does not match projected VJP geometry".to_owned(),
+            ));
+        }
+        let Stride::Tq2_0 { row_bytes } = buffer.stride else {
+            return Err(BackendError::UnsupportedFormat(buffer.format));
+        };
+
+        Self::check_grad_launch_bounds(m, n, k)?;
+        grad_act.fill(0.0);
+        grad_projected_weight.fill(0.0);
+        if m == 0 || n == 0 {
+            if let Some(values) = grad_bias {
+                values.fill(0.0);
+            }
+            return Ok(());
+        }
+        if k == 0 {
+            if let Some(values) = grad_bias {
+                for (ni, value) in values.iter_mut().enumerate() {
+                    *value = grad_output.chunks_exact(n).map(|row| row[ni]).sum::<f32>();
+                }
+            }
+            return Ok(());
+        }
+
+        let d_act = self
+            .stream
+            .clone_htod(act)
+            .map_err(|error| driver_err("projected_vjp htod act", &error))?;
+        let d_scales = self
+            .stream
+            .clone_htod(scales)
+            .map_err(|error| driver_err("projected_vjp htod scales", &error))?;
+        let d_grad_output = self
+            .stream
+            .clone_htod(grad_output)
+            .map_err(|error| driver_err("projected_vjp htod grad_output", &error))?;
+        let mut d_grad_act = self
+            .stream
+            .alloc_zeros::<f32>(mk)
+            .map_err(|error| driver_err("projected_vjp alloc grad_act", &error))?;
+        let mut d_grad_projected_weight = self
+            .stream
+            .alloc_zeros::<f32>(nk)
+            .map_err(|error| driver_err("projected_vjp alloc grad_projected_weight", &error))?;
+        let mut d_grad_bias = if grad_bias.is_some() {
+            Some(
+                self.stream
+                    .alloc_zeros::<f32>(n)
+                    .map_err(|error| driver_err("projected_vjp alloc grad_bias", &error))?,
+            )
+        } else {
+            None
+        };
+
+        let (mi, ni, ki, row_bytes_i32) = (
+            i32::try_from(m).map_err(|_| {
+                BackendError::InvalidInput("projected VJP M does not fit i32".to_owned())
+            })?,
+            i32::try_from(n).map_err(|_| {
+                BackendError::InvalidInput("projected VJP N does not fit i32".to_owned())
+            })?,
+            i32::try_from(k).map_err(|_| {
+                BackendError::InvalidInput("projected VJP K does not fit i32".to_owned())
+            })?,
+            i32::try_from(row_bytes).map_err(|_| {
+                BackendError::InvalidInput(
+                    "projected VJP packed row byte count does not fit i32".to_owned(),
+                )
+            })?,
+        );
+        let mut grad_act_launch = self.stream.launch_builder(&self.func_projected_grad_a);
+        grad_act_launch
+            .arg(&d_grad_output)
+            .arg(buffer.device.as_ref())
+            .arg(&d_scales)
+            .arg(&mut d_grad_act)
+            .arg(&mi)
+            .arg(&ni)
+            .arg(&ki)
+            .arg(&row_bytes_i32);
+        #[allow(unsafe_code)]
+        // SAFETY: validated buffers cover M*N, packed N rows, N scales and M*K
+        // outputs. Kernel guards flat M*K index and decodes only K trits.
+        unsafe {
+            grad_act_launch
+                .launch(Self::elementwise_cfg(mk))
+                .map_err(|error| driver_err("launch tq2_projected_grad_a", &error))?;
+        }
+
+        let mut grad_weight_launch = self.stream.launch_builder(&self.func_projected_grad_weight);
+        grad_weight_launch
+            .arg(&d_grad_output)
+            .arg(&d_act)
+            .arg(&mut d_grad_projected_weight)
+            .arg(&mi)
+            .arg(&ni)
+            .arg(&ki);
+        #[allow(unsafe_code)]
+        // SAFETY: validated buffers cover M*N, M*K and N*K. Kernel guards N*K.
+        unsafe {
+            grad_weight_launch
+                .launch(Self::elementwise_cfg(nk))
+                .map_err(|error| driver_err("launch linear_grad_projected_weight", &error))?;
+        }
+
+        if let Some(device_bias) = d_grad_bias.as_mut() {
+            self.bias_backward_dev(&d_grad_output, device_bias, m, n)?;
+        }
+        self.stream
+            .memcpy_dtoh(&d_grad_act, grad_act)
+            .map_err(|error| driver_err("projected_vjp dtoh grad_act", &error))?;
+        self.stream
+            .memcpy_dtoh(&d_grad_projected_weight, grad_projected_weight)
+            .map_err(|error| driver_err("projected_vjp dtoh grad_projected_weight", &error))?;
+        if let (Some(device_bias), Some(host_bias)) = (d_grad_bias.as_ref(), grad_bias) {
+            self.stream
+                .memcpy_dtoh(device_bias, host_bias)
+                .map_err(|error| driver_err("projected_vjp dtoh grad_bias", &error))?;
+        }
+        Ok(())
     }
 
     /// CUDA override of the fused W1.58A8 path. For an [`TernaryFormat::I2sInt8`]
