@@ -1234,3 +1234,97 @@ fn cuda_decode_greedy_step_matches_host_argmax() {
         tok = host_next;
     }
 }
+
+/// ADR 0032 L1' gate: `decode_greedy_chain(k)` must produce token-for-token
+/// what `k` calls of `decode_greedy_step` produce (same graph, same argmax
+/// kernels — the chain only moves the feedback loop on-device), across
+/// chain lengths, back-to-back chains, and the EOS-truncation semantics
+/// (a chain whose eos equals its own first id must return exactly that one
+/// id and leave the KV watermark consistent for the NEXT chain).
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_draft_chain_matches_per_step() {
+    let _gpu = gpu_serial();
+    let Some((reference, bytes)) = maybe_load() else {
+        return;
+    };
+    let Some(mut r_step) = load_on("cuda", &bytes) else {
+        return;
+    };
+    let Some(mut r_chain) = load_on("cuda", &bytes) else {
+        return;
+    };
+    let prompt: Vec<u32> = reference.token_ids.clone();
+    let positions: Vec<usize> = (0..prompt.len()).collect();
+    let l0 = r_step.forward(&prompt, &positions).expect("prefill A");
+    let _ = r_chain.forward(&prompt, &positions).expect("prefill B");
+    let mut tok = argmax(&l0) as u32;
+    let never_eos = u32::MAX; // no id can match: pure no-truncation chains
+
+    // Back-to-back chains of varied k, both runners kept in lockstep.
+    let mut pos = prompt.len();
+    for &k in &[1usize, 4, 7, 16] {
+        let mut per_step = Vec::with_capacity(k);
+        let mut t = tok;
+        for i in 0..k {
+            let id = r_step
+                .decode_greedy_step(t, pos + i)
+                .expect("step ok")
+                .expect("resident");
+            per_step.push(id);
+            t = id;
+        }
+        let chained = r_chain
+            .decode_greedy_chain(tok, pos, k, never_eos)
+            .expect("chain ok")
+            .expect("resident");
+        assert_eq!(
+            chained, per_step,
+            "chain(k={k}) diverged from per-step at pos {pos}"
+        );
+        pos += k;
+        tok = *per_step.last().expect("k >= 1");
+    }
+
+    // EOS semantics: fresh third runner, chain with eos == the known first
+    // drafted id -> exactly one id back, watermark advanced by one, and the
+    // NEXT chain continues bit-identically with the lockstep runner.
+    let Some(mut r_eos) = load_on("cuda", &bytes) else {
+        return;
+    };
+    let _ = r_eos.forward(&prompt, &positions).expect("prefill C");
+    let mut t = argmax(&l0) as u32;
+    // Recompute the first two drafted ids on the lockstep runner's history:
+    // r_step already advanced; rebuild from a fresh fourth runner instead.
+    let Some(mut r_ref) = load_on("cuda", &bytes) else {
+        return;
+    };
+    let _ = r_ref.forward(&prompt, &positions).expect("prefill D");
+    let a0 = r_ref
+        .decode_greedy_step(t, prompt.len())
+        .expect("ref step0")
+        .expect("resident");
+    let a1 = r_ref
+        .decode_greedy_step(a0, prompt.len() + 1)
+        .expect("ref step1")
+        .expect("resident");
+
+    let first = r_eos
+        .decode_greedy_chain(t, prompt.len(), 8, a0)
+        .expect("eos chain ok")
+        .expect("resident");
+    assert_eq!(first, vec![a0], "eos-truncated chain must stop at [a0]");
+    // The truncated chain fed only `t` (a0 was drafted, never fed) — so the
+    // next chain feeds a0 at prompt.len()+1 and must produce a1 first.
+    let second = r_eos
+        .decode_greedy_chain(a0, prompt.len() + 1, 2, u32::MAX)
+        .expect("post-eos chain ok")
+        .expect("resident");
+    assert_eq!(
+        second.first(),
+        Some(&a1),
+        "watermark after an eos-truncated chain must be consistent"
+    );
+    t = a1; // silence unused on non-assert builds
+    let _ = t;
+}

@@ -403,6 +403,21 @@ impl RunnerGenerator {
     }
 }
 
+/// `TRITIUM_DRAFT_CHAIN=0` disables the L1' chained device-side draft
+/// (per-step ladder instead) — the A/B baseline + kill switch, the
+/// TRITIUM_DRAFT_K pattern. Loud-reject on anything else.
+fn draft_chain_from_env() -> Result<bool, GenError> {
+    match std::env::var("TRITIUM_DRAFT_CHAIN") {
+        Err(std::env::VarError::NotPresent) => Ok(true),
+        Ok(v) if v == "1" => Ok(true),
+        Ok(v) if v == "0" => Ok(false),
+        Ok(v) => Err(GenError::Backend(format!(
+            "TRITIUM_DRAFT_CHAIN={v:?} — use 1 (default) or 0"
+        ))),
+        Err(e) => Err(GenError::Backend(format!("TRITIUM_DRAFT_CHAIN: {e}"))),
+    }
+}
+
 /// Adaptive draft-length policy for the two-runner spec loops.
 ///
 /// The accept walk is per-token Bernoulli-like: each drafted token survives
@@ -554,7 +569,7 @@ impl RunnerGenerator {
     /// `draft_pos` for why that is always correct. Stops early at the draft's
     /// own EOS. Returns `[]` on any draft error (caller falls back to a plain
     /// step; drafting must never break generation).
-    fn model_draft(&mut self, history: &[u32], max_draft: usize) -> Vec<u32> {
+    fn model_draft(&mut self, history: &[u32], max_draft: usize, chain: bool) -> Vec<u32> {
         let Some(draft) = self.draft.as_mut() else {
             return Vec::new();
         };
@@ -599,6 +614,32 @@ impl RunnerGenerator {
         }
         let mut out = Vec::with_capacity(max_draft);
         let mut tok = history[p];
+        // L1' fastest path (ADR 0032): the whole k-token draft as ONE chained
+        // device-side loop — a single host round-trip instead of one per
+        // token (the measured ~1.2 ms/token host cost that held spec decode
+        // at parity). Drafts are bit-identical to the per-step path (gated by
+        // cuda_draft_chain_matches_per_step). Ok(None) = no resident decoder;
+        // Err = state untouched (cache_len only advances on success) — both
+        // fall through to the per-step ladder below.
+        let chained = if chain {
+            draft.decode_greedy_chain(tok, p, max_draft, self.eos)
+        } else {
+            Ok(None) // TRITIUM_DRAFT_CHAIN=0: per-step ladder (A/B + kill switch)
+        };
+        if let Ok(Some(ids)) = chained {
+            // The chain fed [tok, ids[0..len-1]] (the last id — possibly
+            // EOS — was drafted, never fed); record exactly those feeds.
+            self.draft_fed.push(tok);
+            for (i, &id) in ids.iter().enumerate() {
+                out.push(id);
+                if i + 1 < ids.len() {
+                    self.draft_fed.push(id);
+                }
+            }
+            return out;
+        }
+        // Ok(None) (no resident decoder) or Err (state untouched): fall
+        // through to the per-step ladder.
         for i in 0..max_draft {
             // Fast path: graph replay + device argmax, 4 bytes back per step
             // (the logits download + host scan dominated the drafter's cost).
@@ -662,6 +703,7 @@ impl RunnerGenerator {
         let stats = std::env::var("TRITIUM_SPEC_STATS").as_deref() == Ok("1");
         // Acceptance-adaptive draft length (see DraftPolicy).
         let mut policy = DraftPolicy::from_env()?;
+        let chain = draft_chain_from_env()?;
         let (mut n_verify, mut n_committed, mut n_plain, mut t_verify, mut t_plain) = (
             0usize,
             0usize,
@@ -710,7 +752,7 @@ impl RunnerGenerator {
             let budget = max_new - emitted;
             let max_draft = policy.len().min(kv_room).min(budget.saturating_sub(1));
             let drafts = if self.draft.is_some() {
-                self.model_draft(&history, max_draft)
+                self.model_draft(&history, max_draft, chain)
             } else {
                 Self::lookup_draft(&history, max_draft)
             };
@@ -889,6 +931,7 @@ impl RunnerGenerator {
         let mut emitted = 0usize;
         // Acceptance-adaptive draft length (see DraftPolicy).
         let mut policy = DraftPolicy::from_env()?;
+        let chain = draft_chain_from_env()?;
         // Every random decision gets a fresh salt so draws are independent.
         let mut salt = 0u64;
 
@@ -923,7 +966,7 @@ impl RunnerGenerator {
             let budget = max_new - emitted;
             let max_draft = policy.len().min(kv_room).min(budget.saturating_sub(1));
             let drafts = if self.draft.is_some() {
-                self.model_draft(&history, max_draft)
+                self.model_draft(&history, max_draft, chain)
             } else {
                 Self::lookup_draft(&history, max_draft)
             };
@@ -955,12 +998,11 @@ impl RunnerGenerator {
             // node j's child in the chain is node j+1.
             let mut path = vec![0usize];
             let mut final_token: Option<u32> = None;
-            for child in 1..tokens.len() {
+            for (child, &d) in tokens.iter().enumerate().skip(1) {
                 let node = child - 1;
                 let row = &logits_all[node * vocab..(node + 1) * vocab];
                 let (idx, probs) = Self::truncated(row, &req.sampling)
                     .ok_or_else(|| GenError::Backend("sampler produced no token".into()))?;
-                let d = tokens[child];
                 salt += 1;
                 let u = Self::spec_uniform(seed, salt);
                 salt += 1;
@@ -1176,8 +1218,7 @@ impl Generator for RunnerGenerator {
         }
         #[cfg(feature = "cuda")]
         {
-            return self
-                .runner
+            self.runner
                 .tree_verify_greedy(tokens, parents)
                 .map_err(|e| match e {
                     tritium_nn::ResidentOpError::Unavailable => TreeOpError::Unsupported(
@@ -1189,7 +1230,7 @@ impl Generator for RunnerGenerator {
                         m,
                     )) => TreeOpError::BadRequest(m),
                     other => TreeOpError::Internal(other.to_string()),
-                });
+                })
         }
         #[cfg(not(feature = "cuda"))]
         {

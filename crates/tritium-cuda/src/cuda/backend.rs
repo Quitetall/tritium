@@ -6449,6 +6449,8 @@ impl CudaBackend {
             f_argmax_partial: f(dm, KERNEL_NAME_ARGMAX_PARTIAL)?,
             f_argmax_combine: f(dm, KERNEL_NAME_ARGMAX_COMBINE)?,
             am_scratch: None,
+            f_draft_chain_advance: f(dm, KERNEL_NAME_DRAFT_CHAIN_ADVANCE)?,
+            chain_scratch: None,
             f_lm_head_tiled: f(dm, KERNEL_NAME_LM_HEAD_TILED_F16)?,
             f_lm_head_f16: f(dm, KERNEL_NAME_LM_HEAD_WARP_F16)?,
             f_kv_append_mdecode: f(dm, KERNEL_NAME_KV_APPEND_MDECODE)?,

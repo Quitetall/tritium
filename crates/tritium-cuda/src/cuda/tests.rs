@@ -4353,14 +4353,15 @@ fn adr_0022_twin_family_table_matches_decode_cu() {
     }
     assert_eq!(
         names.len(),
-        70,
+        71,
         "decode.cu kernel count drifted from ADR 0022 — update the ADR \
          (65 → 64: gqa_attention_mdecode_f32 retired; 64 → 66: paged KV \
          twins added, ADR 0025 step 2; rmsnorm_quant_i8_fast was added and \
          DELETED by measurement — ADR 0023 rejected, +1.75% < the 3% bar; \
          66 → 68: gqa_attention_batch_v2 f32/h twins added — order-preserving \
          prefill attention, bit-identical to rev 1 by to_bits gate; 68 → 70: \
-         gqa_attention_batch_v3 Q-blocked twins, same bit-identity gate)"
+         gqa_attention_batch_v3 Q-blocked twins, same bit-identity gate; \
+         70 → 71: draft_chain_advance — the L1' chained-draft glue, ADR 0032)"
     );
 }
 

@@ -663,6 +663,40 @@ impl ModelRunner {
             .map_err(|e| NnError::Backend(e.to_string()))
     }
 
+    /// (cuda) L1' chained greedy draft (ADR 0032): draft `k` tokens in ONE
+    /// device-side loop — the captured decode graph replays `k` times with
+    /// each step's device argmax fed into the next step's control block on
+    /// device, so the host pays a single sync + `k`×4 B readback instead of
+    /// one round-trip per token. Returns the drafted ids truncated at the
+    /// first EOS inclusive (the host per-step loop's exact semantics; the KV
+    /// watermark advances by the returned length). `Ok(None)` when no
+    /// resident decoder is available — the caller falls back to the per-step
+    /// path. Drafts are bit-identical to `k` calls of
+    /// [`decode_greedy_step`](Self::decode_greedy_step).
+    ///
+    /// # Errors
+    /// As [`forward`](Self::forward) on device failures / position guards.
+    #[cfg(feature = "cuda")]
+    pub fn decode_greedy_chain(
+        &mut self,
+        token: u32,
+        position: usize,
+        k: usize,
+        eos: u32,
+    ) -> Result<Option<Vec<u32>>, NnError> {
+        if !self.ensure_resident()? {
+            return Ok(None);
+        }
+        let model = self
+            .resident
+            .as_mut()
+            .expect("ensure_resident returned true so resident is built");
+        model
+            .draft_chain(token, position, k, eos)
+            .map(Some)
+            .map_err(|e| NnError::Backend(e.to_string()))
+    }
+
     /// (cuda) Build the device-resident decoder on first use. Returns `true` if a
     /// resident decoder is available (already built or built now), `false` if the
     /// backend is not a CUDA backend (probed once, then cached).

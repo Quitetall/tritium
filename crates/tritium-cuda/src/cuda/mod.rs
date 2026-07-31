@@ -744,6 +744,10 @@ pub struct CudaDecodeModel {
     /// Lazy m=1 argmax scratch for `step_graph_argmax`:
     /// (pvals `[1, ARGMAX_CHUNKS]`, pidx `[1, ARGMAX_CHUNKS]`, out `[1]`).
     am_scratch: Option<(CudaSlice<f32>, CudaSlice<i32>, CudaSlice<i32>)>,
+    /// L1' chained-draft glue (ADR 0032): the `draft_chain_advance` kernel and
+    /// its lazy scratch — (`chain_out` `[DRAFT_CHAIN_MAX]` i32, `halt` `[1]` i32).
+    f_draft_chain_advance: CudaFunction,
+    chain_scratch: Option<(CudaSlice<i32>, CudaSlice<i32>)>,
     f_lm_head_tiled: CudaFunction,
     f_lm_head_f16: CudaFunction,
     f_kv_append_mdecode: CudaFunction,
@@ -1711,22 +1715,7 @@ impl CudaDecodeModel {
     /// row (state stays consistent).
     pub fn step_graph_argmax(&mut self, token: u32, pos: usize) -> Result<u32, BackendError> {
         self.step_graph_replay(token, pos)?;
-        // Lazy m=1 scratch: pvals/pidx are [1, ARGMAX_CHUNKS], out one i32.
-        if self.am_scratch.is_none() {
-            let pvals = self
-                .cap_stream
-                .alloc_zeros::<f32>(ARGMAX_CHUNKS)
-                .map_err(|e| driver_err("argmax pvals alloc", &e))?;
-            let pidx = self
-                .cap_stream
-                .alloc_zeros::<i32>(ARGMAX_CHUNKS)
-                .map_err(|e| driver_err("argmax pidx alloc", &e))?;
-            let out = self
-                .cap_stream
-                .alloc_zeros::<i32>(1)
-                .map_err(|e| driver_err("argmax out alloc", &e))?;
-            self.am_scratch = Some((pvals, pidx, out));
-        }
+        self.ensure_am_scratch()?;
         let (pvals, pidx, out) = self.am_scratch.as_mut().expect("just seeded");
         // Same stream as the graph replay, so ordering needs no sync.
         Self::bl_argmax_rows_chunked(
@@ -1799,6 +1788,162 @@ impl CudaDecodeModel {
             .expect("graph captured above")
             .launch()
             .map_err(|e| driver_err("decode graph launch", &e))?;
+        Ok(())
+    }
+
+    /// L1' chained k-step greedy draft (ADR 0032): replay the captured M=1
+    /// decode graph `k` times back-to-back on `cap_stream`, feeding each
+    /// step's device argmax into the next step's control block ON DEVICE
+    /// (`draft_chain_advance`) — one host round-trip (a single trailing sync
+    /// plus a `k`-int readback) per CHAIN instead of one per token. The
+    /// measured per-token host round-trip (~1.2 ms of two syncs, ctrl H2D and
+    /// readback) was the dominant drafter-step term; this collapses it to ~1/k.
+    ///
+    /// Returns the drafted ids, truncated at the first EOS **inclusive** —
+    /// exactly the host loop's "the draft believes the turn ends here"
+    /// semantics (the EOS is drafted, never fed; post-halt replays rewrite
+    /// the same KV row with identical values, unobserved past the watermark).
+    /// The KV watermark advances by the returned length. Drafts are
+    /// bit-identical to `k` calls of [`step_graph_argmax`] (same graph, same
+    /// argmax kernels, same inputs — gated by the acceptance test).
+    ///
+    /// # Errors
+    /// As [`step_graph`](Self::step_graph), plus `k` guards; `k` must fit the
+    /// remaining KV room in FULL (`cache_len + k <= max_ctx`) so no replay
+    /// can overflow the arena mid-chain.
+    pub fn draft_chain(
+        &mut self,
+        token: u32,
+        pos: usize,
+        k: usize,
+        eos: u32,
+    ) -> Result<Vec<u32>, BackendError> {
+        if k == 0 || k > DRAFT_CHAIN_MAX {
+            return Err(BackendError::InvalidInput(format!(
+                "draft_chain k={k} out of range (1..={DRAFT_CHAIN_MAX})"
+            )));
+        }
+        if self.cache_len + k > self.max_ctx {
+            return Err(BackendError::InvalidInput(format!(
+                "draft_chain overflow: cache_len={} + k={k} > max_ctx={}",
+                self.cache_len, self.max_ctx
+            )));
+        }
+        // Guards + capture + pre-graph drain + ctrl H2D + replay 0 (consumes
+        // `token` at `pos`). Includes the pos == cache_len invariant.
+        self.step_graph_replay(token, pos)?;
+        self.ensure_am_scratch()?;
+        if self.chain_scratch.is_none() {
+            let chain = self
+                .cap_stream
+                .alloc_zeros::<i32>(DRAFT_CHAIN_MAX)
+                .map_err(|e| driver_err("draft chain alloc", &e))?;
+            let halt = self
+                .cap_stream
+                .alloc_zeros::<i32>(1)
+                .map_err(|e| driver_err("draft halt alloc", &e))?;
+            self.chain_scratch = Some((chain, halt));
+        }
+        {
+            // Reset the halt flag (stream-ordered before replay 0's argmax
+            // consumers — it is only read by chain_advance, launched below).
+            let (_, halt) = self.chain_scratch.as_mut().expect("just seeded");
+            self.cap_stream
+                .memcpy_htod(&[0i32], halt)
+                .map_err(|e| driver_err("draft halt htod", &e))?;
+        }
+
+        for step in 0..k {
+            if step > 0 {
+                // Replays 1..k read the ctrl that chain_advance(step-1) wrote
+                // on-device; all stream-ordered on cap_stream.
+                self.graph
+                    .as_ref()
+                    .expect("graph captured in step_graph_replay")
+                    .launch()
+                    .map_err(|e| driver_err("draft chain graph launch", &e))?;
+            }
+            let (pvals, pidx, out) = self.am_scratch.as_mut().expect("seeded above");
+            Self::bl_argmax_rows_chunked(
+                &self.cap_stream,
+                &self.f_argmax_partial,
+                &self.f_argmax_combine,
+                &self.d_logits,
+                self.vocab,
+                1,
+                pvals,
+                pidx,
+                out,
+            )?;
+            let (chain, halt) = self.chain_scratch.as_mut().expect("seeded above");
+            let (step_i, eos_i) = (step as i32, eos as i32);
+            let cfg = LaunchConfig {
+                grid_dim: (1, 1, 1),
+                block_dim: (1, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let out_ref: &CudaSlice<i32> = &*out;
+            let mut l = self.cap_stream.launch_builder(&self.f_draft_chain_advance);
+            l.arg(&mut self.d_ctrl)
+                .arg(out_ref)
+                .arg(&mut *chain)
+                .arg(&mut *halt)
+                .arg(&step_i)
+                .arg(&eos_i);
+            // SAFETY: `draft_chain_advance(int* ctrl, const int* am_out,
+            // int* chain_out, int* halt, int step, int eos)` — d_ctrl is the
+            // 4-int control block, am_out the 1-int argmax result, chain_out
+            // DRAFT_CHAIN_MAX ints with step < k <= DRAFT_CHAIN_MAX, halt one
+            // int. Single thread; scalars outlive the launch.
+            #[allow(unsafe_code)]
+            unsafe {
+                l.launch(cfg)
+                    .map_err(|e| driver_err("launch draft_chain_advance", &e))?;
+            }
+        }
+
+        self.cap_stream
+            .synchronize()
+            .map_err(|e| driver_err("draft chain sync", &e))?;
+        let mut ids = vec![0i32; k];
+        {
+            let (chain, _) = self.chain_scratch.as_ref().expect("seeded above");
+            let view = chain
+                .try_slice(0..k)
+                .ok_or_else(|| BackendError::Backend("draft chain slice".into()))?;
+            self.cap_stream
+                .memcpy_dtoh(&view, &mut ids)
+                .map_err(|e| driver_err("draft chain dtoh", &e))?;
+        }
+        // -1 sentinels mark frozen (post-EOS) steps; everything before the
+        // first sentinel was genuinely fed/produced.
+        let out: Vec<u32> = ids
+            .iter()
+            .take_while(|&&x| x >= 0)
+            .map(|&x| x as u32)
+            .collect();
+        self.cache_len += out.len();
+        Ok(out)
+    }
+
+    /// Seed the lazy m=1 argmax scratch (shared by [`step_graph_argmax`] and
+    /// [`draft_chain`]).
+    fn ensure_am_scratch(&mut self) -> Result<(), BackendError> {
+        if self.am_scratch.is_none() {
+            let pvals = self
+                .cap_stream
+                .alloc_zeros::<f32>(ARGMAX_CHUNKS)
+                .map_err(|e| driver_err("argmax pvals alloc", &e))?;
+            let pidx = self
+                .cap_stream
+                .alloc_zeros::<i32>(ARGMAX_CHUNKS)
+                .map_err(|e| driver_err("argmax pidx alloc", &e))?;
+            let out = self
+                .cap_stream
+                .alloc_zeros::<i32>(1)
+                .map_err(|e| driver_err("argmax out alloc", &e))?;
+            self.am_scratch = Some((pvals, pidx, out));
+        }
         Ok(())
     }
 

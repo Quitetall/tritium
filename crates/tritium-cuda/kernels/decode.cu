@@ -3674,4 +3674,43 @@ __global__ void gqa_attention_combine_f32(const float* __restrict__ partials,
   }
 }
 
+// draft_chain_advance — the L1' chained-draft glue (ADR 0032): between two
+// replays of the captured M=1 decode graph, feed the device argmax result
+// back into the control block ON DEVICE, so a k-token greedy draft costs ONE
+// host round-trip (final sync + k*4B readback) instead of one per token.
+// Launched single-thread, stream-ordered between replays on the capture
+// stream: [graph replay] -> [argmax partial/combine] -> [this] -> [replay]...
+//
+//   halt[0] != 0 -> frozen: store the -1 sentinel and touch nothing else.
+//                   Later replays re-run with a STALE ctrl — they rewrite the
+//                   same KV row with the same values (deterministic kernels),
+//                   which is idempotent and unobserved past the watermark.
+//   id == eos    -> store the id, then halt BEFORE advancing ctrl (matches
+//                   the host loop's "the draft believes the turn ends here"
+//                   early break: the EOS itself is drafted, never fed).
+//   otherwise    -> store the id and advance ctrl = [id, pos+1, cache_len+1]
+//                   for the next replay (pos == cache_len in decode).
+__global__ void draft_chain_advance(int* __restrict__ ctrl,
+                                    const int* __restrict__ am_out,
+                                    int* __restrict__ chain_out,
+                                    int* __restrict__ halt,
+                                    const int step, const int eos) {
+  if (threadIdx.x != 0 || blockIdx.x != 0) {
+    return;
+  }
+  if (halt[0] != 0) {
+    chain_out[step] = -1;
+    return;
+  }
+  const int t = am_out[0];
+  chain_out[step] = t;
+  if (t == eos) {
+    halt[0] = 1;
+    return;
+  }
+  ctrl[0] = t;
+  ctrl[1] += 1;
+  ctrl[2] += 1;
+}
+
 }  // extern "C"

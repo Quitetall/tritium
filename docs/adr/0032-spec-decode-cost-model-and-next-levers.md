@@ -112,6 +112,27 @@ device-side loop/graph, argmax fed back to embed on-device, one host
 round-trip per k instead of per token) attacks ~1.2 ms × k directly and is
 the new L1'.
 
+**L1' BUILT + MEASURED (2026-07-30): the first real spec-decode speedup.**
+`draft_chain` replays the captured M=1 graph k times back-to-back with a
+single-thread `draft_chain_advance` kernel feeding each device argmax into
+the next replay's control block on-device — one host round-trip per chain.
+EOS semantics match the host loop exactly (drafted, never fed; post-halt
+replays are idempotent rewrites). Gated: `cuda_draft_chain_matches_per_step`
+(token-exact vs the per-step ladder at k=1/4/7/16, back-to-back chains, EOS
+truncation + watermark consistency). Same-session three-way interleaved A/B
+(stage-3 f16-head drafter, 12×256 greedy prose, 12/12 output-identical):
+
+| config | vs plain decode |
+|---|---:|
+| per-step ladder (`TRITIUM_DRAFT_CHAIN=0`) | 0.913× |
+| **chained draft (default)** | **1.144×** |
+| chain vs per-step | **1.253×** |
+
+Spec decode beats plain decode for the first time in the campaign. The
+remaining gap to the cost model's ~1.34× warm-clock projection is the
+verify cycle's own host overhead (V ≈ 10-20 ms wall vs ~2 ms GPU) — L2's
+territory, now the top open lever alongside L3 batch-slots.
+
 ### ~~L1 (original projection, kept for the record)~~ — attacks `d`, the dominant term
 
 The drafter's per-token head reads a 197 MB **f16** table. Make it **ternary

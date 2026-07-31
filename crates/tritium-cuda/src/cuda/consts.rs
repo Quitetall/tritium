@@ -136,6 +136,11 @@ pub(super) const KERNEL_NAME_ATTN_TREE_SCORES: &str = "gqa_attention_tree_scores
 pub(super) const KERNEL_NAME_KV_APPEND_TREE: &str = "kv_append_tree_g";
 pub(super) const KERNEL_NAME_ARGMAX_PARTIAL: &str = "argmax_rows_partial_f32";
 pub(super) const KERNEL_NAME_ARGMAX_COMBINE: &str = "argmax_rows_combine_f32";
+/// L1' chained-draft glue kernel (ADR 0032): advances the decode control
+/// block from the device argmax between graph replays.
+pub(super) const KERNEL_NAME_DRAFT_CHAIN_ADVANCE: &str = "draft_chain_advance";
+/// Max tokens per device-side draft chain (the DraftPolicy cap is 40).
+pub(super) const DRAFT_CHAIN_MAX: usize = 64;
 /// Keep in sync with `ARGMAX_CHUNKS` in decode.cu.
 pub(super) const ARGMAX_CHUNKS: usize = 16;
 pub(super) const KERNEL_NAME_ATTN_TREE_SCORES_CTRL: &str = "gqa_attention_tree_scores_ctrl_g";
