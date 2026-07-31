@@ -10,6 +10,8 @@
 //! to `+2·d`); Tritium is ternary, so pack only ever emits codes `{0, 1, 2}`
 //! and unpack rejects code 3 as [`FormatError::DecodedOutOfRange`].
 
+// Portions ported from llama.cpp/ggml — Copyright (c) 2023-2026 The ggml authors.
+// Licensed MIT (see llama.cpp/LICENSE); listed in this repository's NOTICE.
 use half::f16;
 use tritium_core::Trit;
 

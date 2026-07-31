@@ -18,7 +18,7 @@ the source files of the integrating crates.
       Mixed-precision GEMM kernel codegen + autotuning.
       https://github.com/microsoft/BitBLAS
   - llama.cpp / ggml — (MIT)
-      TQ1_0 / TQ2_0 ternary block-quantization formats; GGUF.
+      TQ1_0 / TQ2_0 / Q2_0 (g64) ternary block-quantization formats; GGUF.
       https://github.com/ggml-org/llama.cpp
   - GPTQ-Marlin — (Apache-2.0)
       4-bit GPU kernel design.

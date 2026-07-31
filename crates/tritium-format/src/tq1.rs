@@ -6,6 +6,8 @@
 //! trit). Encode is `(acc*256 + 242)/243`; decode is `((byte*pow3[n]) as u8 * 3) >> 8`,
 //! relying on `u8` wraparound — replicated exactly.
 
+// Portions ported from llama.cpp/ggml — Copyright (c) 2023-2026 The ggml authors.
+// Licensed MIT (see llama.cpp/LICENSE); listed in this repository's NOTICE.
 use half::f16;
 use tritium_core::Trit;
 

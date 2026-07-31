@@ -1,6 +1,8 @@
 //! TQ2_0: 2 bits per trit, 4 trits per byte. Port of ggml `quantize_row_tq2_0_ref`
 //! / `dequantize_row_tq2_0` (block of 256, `qs[64]` then `f16` scale).
 
+// Portions ported from llama.cpp/ggml — Copyright (c) 2023-2026 The ggml authors.
+// Licensed MIT (see llama.cpp/LICENSE); listed in this repository's NOTICE.
 use half::f16;
 use tritium_core::Trit;
 
