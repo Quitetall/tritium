@@ -1,0 +1,4 @@
+# No end-of-line conversion anywhere. Tests bind blake3 digests over the exact
+# bytes of committed fixtures (oracle manifests, generator scripts, conformance
+# vectors); autocrlf checkouts on windows would silently change those bytes.
+* -text

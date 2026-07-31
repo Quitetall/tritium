@@ -59,7 +59,9 @@ impl TensorPayloadValidator for ExactPayloadValidator {
 }
 
 fn fixture_root(label: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!(
+    // macos temp_dir sits under the /var -> /private/var symlink; the store's
+    // symlink-ancestor rejection is deliberate, so tests must canonicalize.
+    std::env::temp_dir().canonicalize().unwrap().join(format!(
         "tritium-tensor-work-{label}-{}-{}",
         std::process::id(),
         std::thread::current().name().unwrap_or("test")
