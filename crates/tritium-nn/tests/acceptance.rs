@@ -1101,11 +1101,11 @@ fn cuda_tree_verify_greedy_lossless() {
     let want_tail = runner3
         .generate(&prompt, c_full + 4, u32::MAX)
         .expect("tail reference");
-    let mut pos = prompt.len() + c_full - 1; // == cache_len (pending not yet forwarded)
+    let pos0 = prompt.len() + c_full - 1; // == cache_len (pending not yet forwarded)
     let mut pending = *committed.last().expect("non-empty");
     for step in 0..4 {
         let logits = rm
-            .step_graph(pending, pos)
+            .step_graph(pending, pos0 + step)
             .expect("graph step after tree verify");
         let next = argmax(&logits) as u32;
         assert_eq!(
@@ -1114,7 +1114,6 @@ fn cuda_tree_verify_greedy_lossless() {
             "post-tree graph decode diverged at tail step {step} — KV promote corruption"
         );
         pending = next;
-        pos += 1;
     }
 }
 
@@ -1294,7 +1293,7 @@ fn cuda_draft_chain_matches_per_step() {
         return;
     };
     let _ = r_eos.forward(&prompt, &positions).expect("prefill C");
-    let mut t = argmax(&l0) as u32;
+    let t = argmax(&l0) as u32;
     // Recompute the first two drafted ids on the lockstep runner's history:
     // r_step already advanced; rebuild from a fresh fourth runner instead.
     let Some(mut r_ref) = load_on("cuda", &bytes) else {
