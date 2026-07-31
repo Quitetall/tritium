@@ -175,4 +175,4 @@ tritium report decode --model ggml-model-i2_s.gguf --tokens tokens.json \
 - **Pre-1.0.** A real-model, fresh-environment capstone (download → infer →
   SALT-quantize → fine-tune) is a **v1.0 exit gate** that requires hardware this
   book's CI does not have; it is tracked in
-  [ADR 0012](../../adr/0012-v100-release.md) and is **not** claimed complete here.
+  ADR 0012 (see the [research repository](https://github.com/Quitetall/tritium-research)) and is **not** claimed complete here.

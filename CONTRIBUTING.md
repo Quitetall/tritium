@@ -8,7 +8,7 @@ gate. Small bug fixes may go directly to a pull request.
 ## Before opening a change
 
 - Read [GOVERNANCE.md](GOVERNANCE.md) and the applicable ADR or work order in
-  [`docs/`](docs/ROADMAP.md).
+  the [research repository](https://github.com/Quitetall/tritium-research) (see [docs/RESEARCH.md](docs/RESEARCH.md)).
 - Keep dependencies pointing inward as described in the
   [architecture guide](docs/book/src/architecture.md).
 - Do not weaken a frozen conformance, quality, physical-byte, or security gate to
@@ -55,7 +55,7 @@ licenses you do not have authority to redistribute.
 
 Public API, schema, backend-semantic, governance, and release-gate changes need
 an ADR or an amendment to an accepted ADR. Implementations should follow a
-reviewed work order under `docs/plans/`. Reviewers verify findings against the
+reviewed work order in the [research repository](https://github.com/Quitetall/tritium-research). Reviewers verify findings against the
 source and evidence before requesting changes; automated review output is not a
 verdict by itself.
 

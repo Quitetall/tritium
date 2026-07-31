@@ -85,7 +85,7 @@ Each component has a single responsibility:
 > is neither `LOCAL_RC_READY` nor a qualified public v1.1 release. Stable-core
 > compatibility follows the v1.0 tier policy; evolving training, backend and
 > interop APIs retain the 1.x runway documented in
-> [ADR 0033](../../adr/0033-v11-full-public-release.md).
+> ADR 0033 (see the [research repository](https://github.com/Quitetall/tritium-research)).
 > Package, flagship-model, browser, deployment and second-machine evidence gates
 > remain open. The generated [compatibility matrix](../../compatibility.md) is
 > authoritative: a pending cell is not support.

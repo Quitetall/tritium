@@ -57,8 +57,8 @@ and tokenizer identity, model card, and required evidence ancestry validate.
   SBOMs, provenance, compatibility, model evidence, and local-RC sign-off.
 
 Implementation is not the same as release qualification. See
-[ADR 0033](docs/adr/0033-v11-full-public-release.md) and the
-[v1.1 execution plan](docs/plans/0044-v11-full-public-release.md) for the gates.
+the release ADR and execution plan in the
+[research repository](https://github.com/Quitetall/tritium-research) for the gates (see [docs/RESEARCH.md](docs/RESEARCH.md)).
 The [backend guide](docs/book/src/backends.md) describes source capabilities;
 an implementation without a generated compatibility cell and admitted receipt
 remains unqualified.

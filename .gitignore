@@ -54,3 +54,16 @@ crates/*/fuzz/target/
 .codex/
 graphify-out/
 scratch_st/
+
+# Research/ADR/plan docs live in the private tritium-research repo (docs/RESEARCH.md);
+# working copies remain on disk for active sessions but are untracked.
+docs/adr/
+docs/plans/
+docs/paper/
+docs/research-*.md
+docs/ROADMAP.md
+docs/EXECUTOR.md
+docs/OPTIMIZATION-LOG.md
+docs/receipts-ws-*
+docs/bastion-lamu-integration.md
+docs/drafter-blut-handoff.md

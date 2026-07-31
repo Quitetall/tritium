@@ -14,12 +14,12 @@ Tritium is planned strategically and executed in small, gated steps. The map:
 
 - **Strategic** — `docs/adr/`: Architecture Decision Records covering stable
   contracts and release gates. For current platform work, start at
-  [ADR 0033](../../adr/0033-v11-full-public-release.md).
-- **Index** — [`docs/ROADMAP.md`](../../ROADMAP.md): the living, ordered set of
+  ADR 0033 (see the [research repository](https://github.com/Quitetall/tritium-research)).
+- **Index** — the roadmap in the [research repository](https://github.com/Quitetall/tritium-research): the living, ordered set of
   tactical plans from now to done, with status.
 - **Tactical** — `docs/plans/NNNN-*.md`: one detailed, verification-gated plan
   per point-release or coherent feature. The v1.1 umbrella is
-  [plan 0044](../../plans/0044-v11-full-public-release.md).
+  plan 0044 (see the [research repository](https://github.com/Quitetall/tritium-research)).
 
 Milestone work is **gate-blocked, not date-blocked**. Independent work orders may
 proceed in parallel, but no downstream claim becomes green until every declared
@@ -68,8 +68,9 @@ mdbook build docs/book      # one-shot build; runs the link checker
 
 `mdbook build` runs the link checker as a backend (configured in
 `docs/book/book.toml`), so a dead link fails locally exactly as it does in CI
-(the `docs.yml` workflow). Cross-links to ADRs use relative paths
-(`../../adr/NNNN-*.md`) that resolve to the real files under `docs/adr/`.
+(the `docs.yml` workflow). Decision records live in the
+[research repository](https://github.com/Quitetall/tritium-research) and are
+referenced by absolute URL, not relative path (see `docs/RESEARCH.md`).
 
 ## License of contributions
 

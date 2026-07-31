@@ -6,7 +6,7 @@
 # behaves identically here and on a contributor's machine. `follow-web-links` is
 # off in book.toml, so the gate is deterministic and offline: it never flakes on a
 # third-party 5xx, and only the links Tritium owns (relative links to chapters and
-# to the ADRs under docs/adr/) are checked. CPU-only, on every push + PR.
+# within the book tree) are checked. CPU-only, on every push + PR.
 name: docs
 
 on:

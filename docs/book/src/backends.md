@@ -55,7 +55,7 @@ constructed explicitly instead of self-registering. Its conformance suite runs
 ## Planned
 
 `tritium-metal` (Apple) and `tritium-rocm` (AMD) are planned platform backends
-(see the [backend-breadth ADR](../../adr/0009-v070-backend-breadth.md)); they are
+(see the backend-breadth ADR (see the [research repository](https://github.com/Quitetall/tritium-research))); they are
 fenced behind the per-platform hardware they need.
 
 ## Capability fallback

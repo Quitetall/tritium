@@ -95,7 +95,7 @@ activations, ternary weights, per-channel scales, the packing `format`, and the
 `expected` output computed once from `tritium_core::reference_mpgemm`. A backend
 passes a vector iff its output is within `Tolerance` of `expected`. The default
 `Tolerance` is `relative = 1e-4`, not bit-exact (the fp32-accumulate matmul bar
-from the [release-roadmap ADR](../../adr/0002-release-roadmap.md)); packing
+from the release-roadmap ADR (see the [research repository](https://github.com/Quitetall/tritium-research))); packing
 paths set `bit_exact = true`.
 
 Freezing matters because backend breadth (`tritium-wgpu`, `tritium-wasm`, and the
@@ -109,5 +109,5 @@ Widening coverage is a deliberate **re-freeze**: regenerate via the
 `VECTOR_SET_VERSION`.
 
 See [Conformance](./conformance.md) for how a backend author wires the harness
-in, and the [backend-breadth ADR](../../adr/0009-v070-backend-breadth.md) for the
+in, and the backend-breadth ADR (see the [research repository](https://github.com/Quitetall/tritium-research)) for the
 rationale.

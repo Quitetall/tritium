@@ -7,7 +7,7 @@ comparison requires the pinned RTX 4090 plus the BitNet 2B4T model, which this
 book's CI does not have. The committed numbers live in code
 (`benches/src/lib.rs`) with explicit provenance, and the harness is built so a
 CPU-hosted CI can prove the *logic* of the gates without ever owning a GPU. The
-methodology follows the [v0.30 performance ADR](../../adr/0005-v030-performance.md).
+methodology follows the v0.30 performance ADR (see the [research repository](https://github.com/Quitetall/tritium-research)).
 
 <!-- BEGIN TRITIUM GENERATED RELEASE CLAIMS -->
 ## Release-claim boundary
@@ -177,8 +177,8 @@ both via `--format`). The implementation is `crates/tritium-cli/src/report.rs`.
 
 ## Regimes of ternary advantage (research, attributed)
 
-The repository carries research notes — `docs/research-ternary-optimization.md`
-and `docs/research-ternary-mathematical-advantage.md` — that analyse *where*
+The repository carries research notes — the ternary-optimization research notes
+and the mathematical-advantage research notes — that analyse *where*
 ternary's advantages actually pay off. These are **research/analysis documents,
 not measured Tritium results**; summarised here with attribution, they frame why
 the methodology above splits decode from prefill:
@@ -203,7 +203,7 @@ the methodology above splits decode from prefill:
 > zero-sparsity is exploited" is the central claim of those research docs, and
 > the corollary is that **Tritium does not yet exploit P1 (sparsity)** — its CUDA
 > kernels do not skip zeros. That is a documented gap, not a shipped capability.
-> The research docs live at `docs/research-*.md` in the repository tree (they are
+> The research notes live in the [research repository](https://github.com/Quitetall/tritium-research) (they are
 > working analysis, not part of this guide), so they are referenced by path
 > rather than linked here.
 
@@ -224,5 +224,5 @@ ceiling formula, the gate arithmetic, the baseline provenance, the SALT error
 math) runs on the hosted CPU lane, so a regression in the *methodology* fails
 fast and free. The *physical* numbers — and any claim of beating a competitor —
 are fenced behind the pinned hardware, exactly as the
-[v1.0 release gate](../../adr/0012-v100-release.md) requires for a
+v1.0 release gate (see the [research repository](https://github.com/Quitetall/tritium-research)) requires for a
 third-party-reproducible benchmark report.

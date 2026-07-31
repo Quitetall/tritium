@@ -1,6 +1,6 @@
 # Interop
 
-The v0.80 interop milestone ([ADR 0010](../../adr/0010-v080-interop.md)) exposes
+The v0.80 interop milestone (ADR 0010 (see the [research repository](https://github.com/Quitetall/tritium-research))) exposes
 Tritium through the seams other ecosystems already speak: an OpenAI-compatible
 HTTP server, a C ABI, candle/burn ops, and an ONNX custom operator. Each is
 feature-gated so the default workspace build stays free of the heavy deps; each
