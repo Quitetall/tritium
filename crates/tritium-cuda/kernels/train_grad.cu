@@ -482,6 +482,108 @@ extern "C" __global__ void salt_quantize_forward(
 // Portable-training SALT variant with one-row scratch. A single thread walks
 // rows in contract order so the peak scratch is cols*sizeof(float), independent
 // of row count, while preserving the reference reduction order exactly.
+// Grouped SALT with an optional per-group Hadamard rotation — the fitter configuration that took
+// PTQ from 10786x to 1.74x fp on SmolLM2-135M. Mirrors
+// tritium_train::ops::ste::salt_quantize_forward_grouped.
+//
+// ONE BLOCK PER GROUP. The group is staged in shared memory so the Hadamard butterfly and the AbsMean
+// reductions are block-cooperative. `rotate_mask[g] != 0` selects rotation for group g; the mask is
+// decided ONCE on the host (a group's tail weight is a property of its distribution, not of the step),
+// so the kernel never has to fit a group twice.
+//
+// H is an involution at this normalization, so the same transform runs before and after quantizing and
+// the reconstruction lands back in the original basis. Rotation only ever touches power-of-two groups;
+// a ragged tail is left unrotated, matching the host.
+#define SALT_GROUP_MAX 256
+extern "C" __global__ void salt_quantize_forward_grouped(
+    const float* __restrict__ master,        // [rows, cols]
+    float* __restrict__ quantized,           // [rows, cols]
+    const unsigned char* __restrict__ rotate_mask, // [total_groups] 0/1, may be null
+    int rows, int cols, int planes, int group)
+{
+    extern __shared__ float sh[];            // group floats, then blockDim.x for the reduction
+    const int groups_per_row = (cols + group - 1) / group;
+    const int gid = blockIdx.x;              // one block per group
+    if (gid >= rows * groups_per_row) return;
+    const int row = gid / groups_per_row;
+    const int gcol = (gid % groups_per_row) * group;
+    const int n = min(group, cols - gcol);   // ragged tail
+    const long base = (long)row * cols + gcol;
+    float* red = sh + SALT_GROUP_MAX;        // reduction scratch
+
+    // Rotation only for power-of-two groups, matching the host.
+    const bool pow2 = (n > 1) && ((n & (n - 1)) == 0);
+    const bool rot = pow2 && rotate_mask != nullptr && rotate_mask[gid] != 0;
+
+    for (int i = threadIdx.x; i < n; i += blockDim.x) sh[i] = master[base + i];
+    __syncthreads();
+
+    // Forward Hadamard (normalized), in shared memory.
+    if (rot) {
+        for (int len = 1; len < n; len <<= 1) {
+            for (int idx = threadIdx.x; idx < (n >> 1); idx += blockDim.x) {
+                int blk = idx / len, off = idx % len;
+                int i = blk * (len << 1) + off;
+                float a = sh[i], b = sh[i + len];
+                sh[i] = a + b; sh[i + len] = a - b;
+            }
+            __syncthreads();
+        }
+        float s = rsqrtf((float)n);
+        for (int i = threadIdx.x; i < n; i += blockDim.x) sh[i] *= s;
+        __syncthreads();
+    }
+
+    // Residual expansion in place: sh holds the running residual, `acc` the reconstruction.
+    // Each thread owns a strided slice, so per-thread partial sums are deterministic.
+    float acc[8];                             // up to SALT_GROUP_MAX/32 elements per thread
+    int owned = 0;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) { acc[owned] = 0.0f; owned++; }
+
+    for (int p = 0; p < planes; ++p) {
+        float partial = 0.0f;
+        for (int i = threadIdx.x; i < n; i += blockDim.x) partial += fabsf(sh[i]);
+        red[threadIdx.x] = partial;
+        __syncthreads();
+        for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+            if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
+            __syncthreads();
+        }
+        float scale = red[0] / (float)n;
+        if (scale > 0.0f) {
+            int k = 0;
+            for (int i = threadIdx.x; i < n; i += blockDim.x) {
+                float trit = fminf(1.0f, fmaxf(-1.0f, roundf(sh[i] / scale)));
+                float contrib = scale * trit;
+                acc[k] += contrib;
+                sh[i] -= contrib;
+                k++;
+            }
+        }
+        __syncthreads();
+    }
+
+    // Put the reconstruction back into shared, un-rotate, and store.
+    { int k = 0;
+      for (int i = threadIdx.x; i < n; i += blockDim.x) { sh[i] = acc[k]; k++; } }
+    __syncthreads();
+    if (rot) {
+        for (int len = 1; len < n; len <<= 1) {
+            for (int idx = threadIdx.x; idx < (n >> 1); idx += blockDim.x) {
+                int blk = idx / len, off = idx % len;
+                int i = blk * (len << 1) + off;
+                float a = sh[i], b = sh[i + len];
+                sh[i] = a + b; sh[i + len] = a - b;
+            }
+            __syncthreads();
+        }
+        float s = rsqrtf((float)n);
+        for (int i = threadIdx.x; i < n; i += blockDim.x) sh[i] *= s;
+        __syncthreads();
+    }
+    for (int i = threadIdx.x; i < n; i += blockDim.x) quantized[base + i] = sh[i];
+}
+
 extern "C" __global__ void salt_quantize_forward_bounded(
     const float* __restrict__ master, float* __restrict__ residual,
     float* __restrict__ quantized, int rows, int cols, int planes)

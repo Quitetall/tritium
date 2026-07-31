@@ -6433,6 +6433,92 @@ mod tests {
     /// Gate (plan 0043 P2.2): the device-resident glue kernels (silu, elementwise mul/add, grad
     /// accumulate) match their `tritium-train` CPU ops. The pure `+`/`*` ops are BIT-EXACT; silu
     /// carries `expf` (device vs host libm ~1 ULP) so it is gated device==CPU within 1e-4.
+    /// The grouped SALT kernel (finer scale groups + optional per-group Hadamard) must match the CPU
+    /// oracle `ste::salt_quantize_forward_grouped`. This is the fitter that took PTQ from 10786× to
+    /// 1.74× fp, so the device has to reproduce it before any distillation run can use it.
+    #[test]
+    fn salt_quantize_grouped_matches_cpu_oracle() {
+        use tritium_train::ops::ste::{self, RotationPolicy};
+        let backend = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!(
+                    "skipping salt_quantize_grouped_matches_cpu_oracle: no CUDA device ({e})"
+                );
+                return;
+            }
+        };
+        // Include a shape whose row is NOT a multiple of the group, to exercise the ragged tail
+        // (which must stay unrotated on both sides).
+        for &(rows, cols) in &[(4usize, 256usize), (3, 128), (5, 576)] {
+            let master = seeded_uniform(0x9A17 ^ cols as u64, rows * cols, -2.0, 2.0);
+            let d_master = backend.dev_upload(&master).unwrap();
+            let mut d_out = backend.dev_alloc_zeros(rows * cols).unwrap();
+
+            for group in [128usize, 256] {
+                let groups_per_row = cols.div_ceil(group);
+                let groups = rows * groups_per_row;
+                for planes in 1..=3 {
+                    // (a) no rotation
+                    backend
+                        .salt_quantize_forward_grouped_dev(
+                            &d_master, &mut d_out, None, rows, cols, planes, group,
+                        )
+                        .unwrap();
+                    let mut got = vec![0.0f32; rows * cols];
+                    backend.dev_download(&d_out, &mut got).unwrap();
+                    let want = ste::salt_quantize_forward_grouped(
+                        &master,
+                        rows,
+                        cols,
+                        planes,
+                        group,
+                        0,
+                        RotationPolicy::Never,
+                    );
+                    let d = max_abs_diff(&got, &want);
+                    assert!(
+                        d < 1e-4,
+                        "grouped (no rot) {rows}x{cols} g{group} T{planes}: max|delta| {d:.3e}"
+                    );
+
+                    // (b) rotate every group -> compare against the host Always policy
+                    let mask = vec![1u8; groups];
+                    let d_mask = backend.stream().clone_htod(&mask).unwrap();
+                    backend
+                        .salt_quantize_forward_grouped_dev(
+                            &d_master,
+                            &mut d_out,
+                            Some(&d_mask),
+                            rows,
+                            cols,
+                            planes,
+                            group,
+                        )
+                        .unwrap();
+                    backend.dev_download(&d_out, &mut got).unwrap();
+                    let want_rot = ste::salt_quantize_forward_grouped(
+                        &master,
+                        rows,
+                        cols,
+                        planes,
+                        group,
+                        0,
+                        RotationPolicy::Always,
+                    );
+                    let d = max_abs_diff(&got, &want_rot);
+                    assert!(
+                        d < 1e-3,
+                        "grouped (rotated) {rows}x{cols} g{group} T{planes}: max|delta| {d:.3e}"
+                    );
+                }
+            }
+        }
+        eprintln!(
+            "grouped SALT kernel matches the CPU oracle (rotated and not, incl. ragged tails)"
+        );
+    }
+
     #[test]
     fn resident_glue_ops_match_cpu() {
         use tritium_train::ops::{act, elementwise};

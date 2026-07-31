@@ -606,6 +606,9 @@ pub struct CudaBackend {
     /// ADR 0027 Track A: fused AdamW update on resident master/moment buffers.
     #[allow(dead_code)] // consumed by DeviceTrainer in the next Track A slice
     pub(super) func_adamw_step: CudaFunction,
+    /// Grouped SALT quantize with optional per-group Hadamard rotation.
+    #[allow(dead_code)] // consumed by the grouped-fitter parity gate and DeviceTrainer
+    pub(super) func_salt_quantize_grouped: CudaFunction,
     /// Lever 5: block-wise int8 AdamW update (int8 moments + per-block scales).
     #[allow(dead_code)] // consumed by the int8-Adam gate and DeviceTrainer int8 path
     pub(super) func_adamw_step_8bit: CudaFunction,
@@ -839,6 +842,9 @@ impl CudaBackend {
         let func_adamw_step = grad_module
             .load_function(KERNEL_NAME_ADAMW_STEP)
             .map_err(|e| driver_err("resolve adamw_step kernel", &e))?;
+        let func_salt_quantize_grouped = grad_module
+            .load_function(KERNEL_NAME_SALT_QUANTIZE_GROUPED)
+            .map_err(|e| driver_err("resolve salt_quantize_forward_grouped kernel", &e))?;
         let func_adamw_step_8bit = grad_module
             .load_function(KERNEL_NAME_ADAMW_STEP_8BIT)
             .map_err(|e| driver_err("resolve adamw_step_8bit kernel", &e))?;
@@ -1103,6 +1109,7 @@ impl CudaBackend {
             external_kernels: OnceLock::new(),
             func_salt_quantize_fwd,
             func_adamw_step,
+            func_salt_quantize_grouped,
             func_adamw_step_8bit,
             func_adamw_step_bf16_master,
             func_sr_round_to_bf16grid,
@@ -2992,6 +2999,105 @@ impl CudaBackend {
                     shared_mem_bytes: 0,
                 })
                 .map_err(|e| driver_err("launch attention_backward_portable", &e))?;
+        }
+        Ok(())
+    }
+
+    /// Grouped SALT quantize with an optional per-group Hadamard rotation — the fixed fitter that took
+    /// PTQ from 10786× to 1.74× fp. One CUDA block per group; the group is staged in shared memory so
+    /// the butterfly and the AbsMean reductions are block-cooperative. `d_rotate` is a per-group 0/1
+    /// mask decided once on the host (a group's tail weight is a property of its distribution), or an
+    /// empty slice for no rotation. Mirrors `ste::salt_quantize_forward_grouped`.
+    ///
+    /// # Errors
+    /// [`BackendError`] on a bad plane count or group size, a shape overflow, an undersized buffer, or
+    /// a launch failure.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)] // consumed by the parity gate and the DeviceTrainer grouped path
+    pub(crate) fn salt_quantize_forward_grouped_dev(
+        &self,
+        d_master: &CudaSlice<f32>,
+        d_quantized: &mut CudaSlice<f32>,
+        d_rotate: Option<&CudaSlice<u8>>,
+        rows: usize,
+        cols: usize,
+        planes: usize,
+        group: usize,
+    ) -> Result<(), BackendError> {
+        if !(1..=3).contains(&planes) {
+            return Err(BackendError::InvalidInput(format!(
+                "SALT plane count must be in 1..=3, got {planes}"
+            )));
+        }
+        if group == 0 || group > 256 {
+            return Err(BackendError::InvalidInput(format!(
+                "SALT group must be in 1..=256 (shared-memory bound), got {group}"
+            )));
+        }
+        let len = rows
+            .checked_mul(cols)
+            .ok_or_else(|| BackendError::InvalidInput("SALT shape overflows usize".into()))?;
+        if d_master.len() < len || d_quantized.len() < len {
+            return Err(BackendError::ShapeMismatch {
+                expected: len,
+                got: d_master.len().min(d_quantized.len()),
+            });
+        }
+        if len == 0 {
+            return Ok(());
+        }
+        let groups = rows * cols.div_ceil(group);
+        if let Some(mask) = d_rotate {
+            if mask.len() < groups {
+                return Err(BackendError::ShapeMismatch {
+                    expected: groups,
+                    got: mask.len(),
+                });
+            }
+        }
+        let rows_i = i32::try_from(rows)
+            .map_err(|_| BackendError::InvalidInput("SALT rows exceed i32::MAX".into()))?;
+        let cols_i = i32::try_from(cols)
+            .map_err(|_| BackendError::InvalidInput("SALT cols exceed i32::MAX".into()))?;
+        let planes_i = planes as i32;
+        let group_i = group as i32;
+
+        // 128 threads: a power of two for the tree reduction, and <= 8 owned elements per thread at
+        // the 256 group cap (the kernel's per-thread accumulator bound).
+        const THREADS: u32 = 128;
+        let cfg = LaunchConfig {
+            grid_dim: (u32::try_from(groups).unwrap_or(u32::MAX), 1, 1),
+            block_dim: (THREADS, 1, 1),
+            shared_mem_bytes: (256 + THREADS as usize) as u32 * 4,
+        };
+        // cudarc needs a real slice for the pointer argument. The kernel indexes `rotate_mask[gid]` for
+        // every group, so a stand-in must be FULL LENGTH (a 1-byte dummy would read out of bounds);
+        // all-zero means "rotate nothing".
+        let zeros = match d_rotate {
+            Some(_) => None,
+            None => Some(
+                self.stream
+                    .alloc_zeros::<u8>(groups)
+                    .map_err(|e| driver_err("alloc rotation mask", &e))?,
+            ),
+        };
+        let mask = d_rotate.or(zeros.as_ref()).expect("one of the two is Some");
+        let mut launch = self.stream.launch_builder(&self.func_salt_quantize_grouped);
+        launch
+            .arg(d_master)
+            .arg(d_quantized)
+            .arg(mask)
+            .arg(&rows_i)
+            .arg(&cols_i)
+            .arg(&planes_i)
+            .arg(&group_i);
+        // SAFETY: one block per group with 128 threads and the declared shared bytes; every buffer
+        // length is validated above and the scalars match the kernel ABI.
+        #[allow(unsafe_code)]
+        unsafe {
+            launch
+                .launch(cfg)
+                .map_err(|e| driver_err("launch salt_quantize_forward_grouped_dev", &e))?;
         }
         Ok(())
     }
