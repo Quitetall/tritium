@@ -348,6 +348,19 @@ fn salt_distillation_device_trainer_recovers_heldout() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(STEPS);
+    // Sweepable SALT plane count and training-window length, shadowing the file consts so the whole
+    // test body (including the summary format strings) picks them up with no other edits. Defaults
+    // are the committed const values, so the gate is unchanged when neither var is set.
+    let planes: usize = std::env::var("TRITIUM_DISTILL_PLANES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|t| (1..=3).contains(t)) // the SALT residual stack supports 1..=3 planes
+        .unwrap_or(T);
+    let seq_len: usize = std::env::var("TRITIUM_DISTILL_SEQ")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&s| s >= 2)
+        .unwrap_or(TRAIN_SEQ);
     let (config, spec, weights) = ModelWeights::load_hf(&dir).expect("load_hf");
     let training_model =
         TiedSwiGluTrainingModel::extract(&config, &spec, &weights).expect("training model");
@@ -362,7 +375,7 @@ fn salt_distillation_device_trainer_recovers_heldout() {
     {
         train_ids.truncate(n);
     }
-    let windows: Vec<&[u32]> = train_ids.chunks_exact(TRAIN_SEQ).collect();
+    let windows: Vec<&[u32]> = train_ids.chunks_exact(seq_len).collect();
     assert!(!windows.is_empty(), "train corpus shorter than one window");
 
     let backend = CudaBackend::new(0).expect("open CUDA device");
@@ -376,7 +389,7 @@ fn salt_distillation_device_trainer_recovers_heldout() {
     let ptq: Vec<Vec<f32>> = fp
         .iter()
         .zip(&shapes)
-        .map(|(wf, &(n, k))| ste::salt_quantize_forward(wf, n, k, T))
+        .map(|(wf, &(n, k))| ste::salt_quantize_forward(wf, n, k, planes))
         .collect();
     let ppl_ptq = perplexity_windowed(&ptq, &a, &eval_ids, EVAL_WINDOW);
 
@@ -388,7 +401,7 @@ fn salt_distillation_device_trainer_recovers_heldout() {
             master,
             rows,
             cols,
-            salt_planes: T,
+            salt_planes: planes,
             optimizer: opt,
         })
         .collect();
@@ -416,15 +429,15 @@ fn salt_distillation_device_trainer_recovers_heldout() {
     .expect("upload resident state");
     let mut teacher_cache = std::env::var_os("TRITIUM_TEACHER_CACHE").map(|path| {
         let expected = TeacherCacheHeader {
-            seq_len: TRAIN_SEQ as u32,
+            seq_len: seq_len as u32,
             vocab: a.vocab as u32,
             windows: windows.len() as u64,
             model_hash: teacher_model_digest,
-            corpus_hash: hash_teacher_corpus(&train_ids, TRAIN_SEQ as u32),
+            corpus_hash: hash_teacher_corpus(&train_ids, seq_len as u32),
         };
         TeacherCacheReader::open(path, &expected).expect("open matching teacher cache")
     });
-    let mut cached_target = vec![0.0; TRAIN_SEQ * a.vocab];
+    let mut cached_target = vec![0.0; seq_len * a.vocab];
 
     // Step-1 recovery-vs-tokens curve (plan 0042): set TRITIUM_DISTILL_CURVE=K to evaluate held-out
     // ppl every K steps and print one curve point per checkpoint, tracing the whole convergence in a
@@ -472,7 +485,7 @@ fn salt_distillation_device_trainer_recovers_heldout() {
             // Keep the online teacher as the Track-0-compatible fallback.
             let tprobs = {
                 let mut tape = DeviceTape::new(&backend, a.vocab).unwrap();
-                let (logits, _) = device_forward(&mut tape, &a, &fp, &tokens_i32, TRAIN_SEQ);
+                let (logits, _) = device_forward(&mut tape, &a, &fp, &tokens_i32, seq_len);
                 row_softmax(&tape.value(logits).unwrap(), a.vocab)
             };
             DeviceTensor::upload(&backend, &tprobs).unwrap()
@@ -488,8 +501,8 @@ fn salt_distillation_device_trainer_recovers_heldout() {
                 tape = tape.with_tensor_core(tc);
             }
             let (logits, wids) =
-                device_forward_resident(&mut tape, &a, &resident, &tokens_i32, TRAIN_SEQ);
-            tape.xent_backward_device(logits, &target, TRAIN_SEQ, a.vocab, &wids)
+                device_forward_resident(&mut tape, &a, &resident, &tokens_i32, seq_len);
+            tape.xent_backward_device(logits, &target, seq_len, a.vocab, &wids)
                 .unwrap()
         };
         drop(resident);
@@ -507,10 +520,10 @@ fn salt_distillation_device_trainer_recovers_heldout() {
                 let ckpt: Vec<Vec<f32>> = (0..fp.len())
                     .map(|i| trainer.download_master(i).unwrap())
                     .zip(&shapes)
-                    .map(|(wf, &(n, kk))| ste::salt_quantize_forward(&wf, n, kk, T))
+                    .map(|(wf, &(n, kk))| ste::salt_quantize_forward(&wf, n, kk, planes))
                     .collect();
                 let ppl = perplexity_windowed(&ckpt, &a, &eval_ids, EVAL_WINDOW);
-                let tokens = step as usize * TRAIN_SEQ;
+                let tokens = step as usize * seq_len;
                 println!(
                     "curve: {step},{tokens},{ppl:.3},{:.1},{:.3}",
                     ppl_ptq / ppl,
@@ -526,13 +539,13 @@ fn salt_distillation_device_trainer_recovers_heldout() {
     let distilled: Vec<Vec<f32>> = lat
         .iter()
         .zip(&shapes)
-        .map(|(wf, &(n, k))| ste::salt_quantize_forward(wf, n, k, T))
+        .map(|(wf, &(n, k))| ste::salt_quantize_forward(wf, n, k, planes))
         .collect();
     let ppl_distilled = perplexity_windowed(&distilled, &a, &eval_ids, EVAL_WINDOW);
     let recovery = ppl_ptq / ppl_distilled;
     let mean_ms = step_ms / steps as f64;
     let host_probability_copies = if teacher_cache.is_some() { 1 } else { 2 };
-    let host_mib = (host_probability_copies * TRAIN_SEQ * a.vocab * std::mem::size_of::<f32>())
+    let host_mib = (host_probability_copies * seq_len * a.vocab * std::mem::size_of::<f32>())
         as f64
         / (1024.0 * 1024.0);
     let teacher_source = if teacher_cache.is_some() {
@@ -541,7 +554,7 @@ fn salt_distillation_device_trainer_recovers_heldout() {
         "online device teacher"
     };
     println!(
-        "0027 A RESIDENT SALT distillation (T={T}, {steps} steps): fp ppl {ppl_fp:.3} | \
+        "0027 A RESIDENT SALT distillation (planes={planes}, {steps} steps): fp ppl {ppl_fp:.3} | \
          PTQ ppl {ppl_ptq:.3e} | distilled ppl {ppl_distilled:.3} | recovers {recovery:.0}x. \
          Mean step {mean_ms:.0}ms vs Track-0 {TRACK0_STEP_MS:.0}ms; student parameter path 100% \
          device-resident, {teacher_source}, remaining teacher probability traffic {host_mib:.1} \
