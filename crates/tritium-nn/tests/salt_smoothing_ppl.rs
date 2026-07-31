@@ -255,12 +255,16 @@ fn quantize_split(
 }
 
 /// Parameter-weighted bpw when the tied embed/head runs at `t_head` planes and the body at `t_body`.
+///
+/// The two costs scale differently and must not be merged: trits plus their f16 scale are charged
+/// **per plane**, but `RotationPolicy::Auto`'s choice bit is decided once per group for the whole
+/// stack of planes (see `ste::salt_quantize_forward_grouped`), so it is charged **once**.
 fn split_bpw(shapes: &[(usize, usize)], t_head: usize, t_body: usize, group: usize) -> f64 {
-    let per_plane = ste::ternary_bits_per_weight(1, group) + 1.0 / group as f64;
     let n: Vec<usize> = shapes.iter().map(|&(a, b)| a * b).collect();
     let total: usize = n.iter().sum();
     let body: usize = n[1..].iter().sum();
-    per_plane * (t_head as f64 * n[0] as f64 + t_body as f64 * body as f64) / total as f64
+    let planes = t_head as f64 * n[0] as f64 + t_body as f64 * body as f64;
+    ste::ternary_bits_per_weight(1, group) * planes / total as f64 + 1.0 / group as f64
 }
 
 /// Everything a sweep needs: the fp model, its shapes, the calibration statistics, and the held-out
@@ -297,6 +301,11 @@ fn setup() -> Option<Fixture> {
 /// **The gate.** The fold is an algebraic reparameterisation: with quantization off it must leave
 /// the model's output unchanged. Anything else means the inverse landed in the wrong tensor, and
 /// every quality number measured on top of it would be measuring that bug instead.
+///
+/// The tolerance is `1e-6` relative — tight enough that a swapped `*`/`÷`, a fold applied to the
+/// wrong axis, or an inverse dropped on one of the six projections all fail it, while still leaving
+/// room for f32 rounding accumulated through 30 layers of scaled norms. The observed drift is ~4e-8
+/// relative, two orders of magnitude inside the bound.
 #[test]
 #[ignore = "needs SmolLM2-135M; run explicitly"]
 fn fold_is_exact_in_fp() {
@@ -307,9 +316,9 @@ fn fold_is_exact_in_fp() {
     for alpha in [0.5f64, 1.0] {
         let (folded, farch) = fold(&fp, &shapes, &arch, &calib, alpha);
         let got = perplexity_windowed(&folded, &farch, &eval, EVAL_WINDOW);
-        println!("α={alpha}: fp {reference:.6} → folded {got:.6}");
+        println!("α={alpha}: fp {reference:.9} → folded {got:.9}");
         assert!(
-            (got - reference).abs() < 1e-3 * reference,
+            (got - reference).abs() < 1e-6 * reference,
             "the fold must be function-preserving in fp: {got} vs {reference}"
         );
     }
