@@ -176,5 +176,17 @@ the Step-1 recovery-vs-tokens curve runs next on the f32 path.
   descended 3250 → 431 by step 2800 then oscillated flat for 2200 steps; adding the (already
   implemented but unused) `LrSchedule` beat it at *every* checkpoint, broke through the 431 floor at
   step 2400, and settled at **266.9 ppl — 2.1× better final, 2.1× more recovery, 3× less oscillation**.
-  Only **160k of the 500k-token pool** was consumed (⅓ epoch), so the run is still token-limited: more
-  steps (and `T`>2 SALT planes) are the untested levers before any claim about the ternary floor.
+
+  **Full-pool run (15000 steps, all 480k train tokens, warmup 500 + cosine) — the headline number:**
+
+  | budget | ppl | gap to fp | recovery vs PTQ |
+  |---|---|---|---|
+  | 160k tok, constant LR | 563.3 | 23.6× | 5 824× |
+  | 160k tok, + LR schedule | 266.9 | 11.2× | 12 292× |
+  | **480k tok, + LR schedule** | **148.5** (best **139.6** @14500) | **6.2×** (best **5.9×**) | **22 097×** (best **23 493×**) |
+
+  **Confirmed token-limited:** tripling the tokens took the gap 11.2× → 5.9× fp, and the curve was
+  **still descending when the pool ran out** (1286 @500 → 365 @5000 → 194 @11000 → 140 @14500), never
+  flattening. Each lever roughly halves the gap and **neither is exhausted**. Untested next: a larger
+  corpus slice (WikiText-103/C4), `T`>2 SALT planes, and the 1.7B/32B scale-up. No claim about a
+  "ternary floor" is warranted from this data — nothing here has plateaued.
