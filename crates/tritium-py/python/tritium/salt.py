@@ -13,8 +13,14 @@ from ._tritium import (
     Qwen36PtqMasterReceipt,
     Qwen36PtqPackageReceipt,
     reconcile_qwen36_ptq_masters as _reconcile_qwen36_ptq_masters,
-    reconcile_qwen36_ptq_packages as _reconcile_qwen36_ptq_packages,
 )
+
+try:
+    from ._tritium import (
+        reconcile_qwen36_ptq_packages as _reconcile_qwen36_ptq_packages,
+    )
+except ImportError:  # non-unix wheels omit the native symbol (unix-only staging)
+    _reconcile_qwen36_ptq_packages = None
 
 Pathish = Union[str, PathLike[str]]
 
@@ -73,6 +79,11 @@ def reconcile_qwen36_ptq_packages(
     assets. Qwen3.6 runtime wiring remains a separate release gate.
     """
 
+    if _reconcile_qwen36_ptq_packages is None:
+        raise RuntimeError(
+            "reconcile_qwen36_ptq_packages requires a unix platform; this wheel "
+            "was built without the native symbol"
+        )
     return _reconcile_qwen36_ptq_packages(
         str(model_dir),
         revision,

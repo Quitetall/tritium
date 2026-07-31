@@ -1998,7 +1998,7 @@ mod tests {
     fn workspace_manifest_round_trips_all_preserved_receipts_canonically() {
         let proof = test_fixture_source_proof();
         let plan = WorkspacePlan::from_proof(&proof).unwrap();
-        let root = std::env::temp_dir().join(format!(
+        let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "tritium-qwen36-workspace-manifest-{}",
             std::process::id()
         ));
@@ -2179,7 +2179,7 @@ mod tests {
     }
 
     fn fixture_workspace_root(label: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
+        std::env::temp_dir().canonicalize().unwrap().join(format!(
             "tritium-qwen36-{label}-{}-{:?}",
             std::process::id(),
             std::thread::current().id()

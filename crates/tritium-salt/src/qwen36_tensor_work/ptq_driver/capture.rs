@@ -851,7 +851,7 @@ mod tests {
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn temp_root(label: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!(
+        let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "tritium-qwen36-capture-{label}-{}-{}",
             std::process::id(),
             TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)

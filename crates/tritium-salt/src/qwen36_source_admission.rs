@@ -1248,7 +1248,7 @@ mod tests {
     fn durable_proof_is_idempotent_locked_and_tamper_evident() {
         let proof = fixture_proof();
         let bytes = proof.canonical_bytes().unwrap();
-        let root = std::env::temp_dir().join(format!(
+        let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "tritium-qwen36-admission-{}-{}",
             std::process::id(),
             TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)

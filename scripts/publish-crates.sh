@@ -2,27 +2,35 @@
 # Ordered crates.io publication for the Tritium workspace (plan 0053 / launch).
 #
 # IRREVERSIBLE: crates.io versions cannot be deleted, only yanked. Run only on
-# the exact revision being released, from a clean tree, after ./scripts/
-# check-publish.sh passes and CI is green on that revision.
+# the exact revision being released, after ./scripts/check-publish.sh passes
+# and CI is green on that revision.
 #
-# Order is the dependency topological order (deps first) — a crate can only be
-# published once every internal dependency it names is live on the registry.
-# crates.io indexes new versions within seconds, but under load a downstream
-# publish can race the index; the retry loop below absorbs that.
+# Order is the dependency topological order (deps first) over ALL retained dep
+# kinds — including dev-dependencies that carry a version requirement (cargo
+# keeps those in the published manifest, and the registry rejects manifests
+# naming crates it does not know). Verified against `cargo metadata`:
+# tritium-testkit must precede tritium-mcu (mcu dev-depends on testkit).
+#
+# crates.io rate-limits NEW crate names (a small burst, then ~1 per 10
+# minutes). A cold 23-crate launch therefore takes hours; the loop below waits
+# out rate limits instead of aborting, and skips versions that are already
+# live so the script is resumable after any interruption.
 #
 # Excluded: tritium-py (PyPI is its registry: tritium-torch wheels),
 # tritium-benches (publish = false).
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
+VERSION="$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
+
 ORDER=(
   tritium-build-info
   tritium-core
   tritium-format
-  tritium-mcu
   tritium-quantize
   tritium-spec
   tritium-testkit
+  tritium-mcu
   tritium-train
   tritium-wasm
   tritium-burn
@@ -41,6 +49,15 @@ ORDER=(
   tritium-ffi
 )
 
+# True when $1@$VERSION is already live on crates.io (sparse index; the path
+# scheme for names >= 4 chars is <first-2>/<next-2>/<name>).
+already_published() {
+  local name="$1"
+  local prefix="${name:0:2}/${name:2:2}"
+  curl -sf "https://index.crates.io/${prefix}/${name}" 2>/dev/null \
+    | grep -q "\"vers\":\"${VERSION}\""
+}
+
 if [[ "${1:-}" != "--yes-publish" ]]; then
   echo "DRY RUN preflight: packaging every crate in publish order (no upload)."
   echo "To actually publish: $0 --yes-publish"
@@ -49,24 +66,55 @@ if [[ "${1:-}" != "--yes-publish" ]]; then
   exit 0
 fi
 
-if [[ -n "$(git status --porcelain)" ]]; then
-  echo "REFUSING: working tree is dirty. Publish only from the release revision." >&2
-  exit 1
+# The published crate directories must be clean; unrelated dirt (e.g. tritium-py
+# python sources, scripts/) is tolerated and reported.
+DIRT="$(git status --porcelain)"
+if [[ -n "${DIRT}" ]]; then
+  BAD=""
+  while IFS= read -r line; do
+    f="${line:3}"
+    case "$f" in
+      crates/tritium-py/*|crates/tritium-benches/*|benches/*|scripts/*|docs/*) ;;
+      *) BAD+="${line}"$'\n' ;;
+    esac
+  done <<< "${DIRT}"
+  if [[ -n "${BAD}" ]]; then
+    echo "REFUSING: uncommitted changes touch published crates:" >&2
+    echo "${BAD}" >&2
+    exit 1
+  fi
+  echo "note: tree has dirt outside the published crates (tolerated):"
+  echo "${DIRT}"
 fi
 
 for crate in "${ORDER[@]}"; do
-  echo "=== publishing ${crate} ==="
-  for attempt in 1 2 3 4 5; do
-    if cargo publish -p "${crate}" --no-verify; then
+  if already_published "${crate}"; then
+    echo "=== ${crate}@${VERSION} already live — skipping ==="
+    continue
+  fi
+  echo "=== publishing ${crate}@${VERSION} ==="
+  attempt=0
+  until out="$(cargo publish -p "${crate}" --no-verify 2>&1)"; do
+    echo "${out}" | tail -5
+    attempt=$((attempt + 1))
+    if echo "${out}" | grep -qi "already uploaded\|already exists"; then
+      echo "${crate}: version already on the registry — continuing."
       break
     fi
-    if [[ "${attempt}" == 5 ]]; then
-      echo "FAILED after 5 attempts: ${crate} — stopping (already-published crates stay live)." >&2
+    if echo "${out}" | grep -qi "rate limit\|429\|too many"; then
+      echo "rate-limited: waiting 620s before retrying ${crate} (attempt ${attempt})..."
+      sleep 620
+      continue
+    fi
+    if [[ "${attempt}" -ge 5 ]]; then
+      echo "FAILED after ${attempt} attempts: ${crate} — stopping." >&2
+      echo "Already-published crates stay live; re-run to resume from here." >&2
       exit 1
     fi
-    echo "retry ${attempt}: waiting for the registry index..."
+    echo "retry ${attempt}: waiting 30s (index propagation)..."
     sleep 30
   done
+  [[ -n "${out:-}" ]] && echo "${out}" | tail -2
 done
 
-echo "ALL ${#ORDER[@]} crates published. Record the revision in the release evidence."
+echo "ALL ${#ORDER[@]} crates published at ${VERSION}. Record the revision in the release evidence."

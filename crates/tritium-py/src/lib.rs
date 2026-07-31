@@ -26,6 +26,11 @@
 //! the lock, so concurrent `generate` calls from multiple Python threads serialize
 //! on the model (correct, deadlock-free) while *other* Python work proceeds freely
 //! during the compute.
+
+// reconcile_qwen36_ptq_packages and its staging helpers are unix-only (the
+// tritium-salt admission stack is cfg(unix)-gated); their support code still
+// compiles on other platforms but is unreferenced there.
+#![cfg_attr(not(unix), allow(dead_code, unused_imports))]
 #![deny(unsafe_code)]
 #![allow(unreachable_pub)] // pyo3's `#[pymethods]` expansion emits `pub` items.
 

@@ -3693,7 +3693,7 @@ mod tests {
     }
 
     fn fixture_root(label: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
+        std::env::temp_dir().canonicalize().unwrap().join(format!(
             "tritium-qwen36-additive-{label}-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
