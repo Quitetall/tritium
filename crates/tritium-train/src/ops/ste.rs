@@ -162,6 +162,155 @@ pub fn salt_quantize_vjp(
     grad_out.to_vec()
 }
 
+// ── Tequila: deadzone bias (leaky STE) ───────────────────────────────────────────────────────────
+// The plain STE masks the saturated region: a weight with `|Wf/s| >= 1` receives EXACTLY zero
+// gradient, so once it saturates nothing can ever pull it back — it is dead for the rest of training.
+// "Tequila" leaks a fraction `leak` of the incoming gradient through that region (the STE analogue of
+// LeakyReLU), letting saturated weights recover. `leak = 0` reproduces the hard mask exactly;
+// `leak = 1` is the fully-transparent estimator [`salt_quantize_vjp`] already uses.
+//
+// NOTE: this only changes the *masked* estimators — [`quantize_vjp`] (single-plane QAT) and
+// [`lsq_vjp`] (the LamQuant learned-scale path). The multi-plane [`salt_quantize_vjp`] is already
+// identity, so SALT distillation is unaffected by any `leak`.
+
+/// Leaky straight-through surrogate: `clamp(x,-1,1) + leak·(x − clamp(x,-1,1))` with `x = Wf/s_q`,
+/// scaled back by `s_q`. Slope 1 in-band, `leak` in the saturated region — the exact
+/// finite-difference oracle for [`quantize_vjp_leaky`]. `leak = 0` is [`quantize_surrogate`].
+#[must_use]
+#[allow(clippy::needless_range_loop)]
+pub fn quantize_surrogate_leaky(
+    wf: &[f32],
+    s_q: &[f32],
+    rows: usize,
+    cols: usize,
+    leak: f32,
+) -> Vec<f32> {
+    let mut out = vec![0.0f32; rows * cols];
+    for r in 0..rows {
+        let s = s_q[r];
+        if s == 0.0 {
+            continue;
+        }
+        for c in 0..cols {
+            let i = r * cols + c;
+            let x = wf[i] / s;
+            let clamped = x.clamp(-1.0, 1.0);
+            out[i] = clamped + leak * (x - clamped);
+        }
+    }
+    out
+}
+
+/// vjp of [`quantize_surrogate_leaky`]: `gWf[i] = g[i]/s_q[r] · (1 in-band, else `leak`)`.
+/// Returns `[gWf, g_sq]` with `g_sq` all-zero (stop-gradient on the scale), matching
+/// [`quantize_vjp`], which this generalizes (`leak = 0`).
+#[must_use]
+#[allow(clippy::needless_range_loop)]
+pub fn quantize_vjp_leaky(
+    wf: &[f32],
+    s_q: &[f32],
+    rows: usize,
+    cols: usize,
+    grad_out: &[f32],
+    leak: f32,
+) -> Vec<Vec<f32>> {
+    let mut g_wf = vec![0.0f32; rows * cols];
+    for r in 0..rows {
+        let s = s_q[r];
+        if s == 0.0 {
+            continue;
+        }
+        for c in 0..cols {
+            let i = r * cols + c;
+            let slope = if (wf[i] / s).abs() < 1.0 { 1.0 } else { leak };
+            g_wf[i] = grad_out[i] * slope / s;
+        }
+    }
+    let g_sq = vec![0.0f32; rows];
+    vec![g_wf, g_sq]
+}
+
+/// [`lsq_vjp`] with the Tequila deadzone leak on the **weight** gradient. The `α` gradient is the
+/// unchanged LSQ estimator (it is already defined in the saturated region — that is where `α` gets
+/// its signal), so only `gWf` differs: `leak·g` instead of `0` outside the clamp band. `leak = 0`
+/// reproduces [`lsq_vjp`] exactly.
+#[must_use]
+#[allow(clippy::needless_range_loop)]
+pub fn lsq_vjp_leaky(
+    wf: &[f32],
+    alpha: &[f32],
+    rows: usize,
+    cols: usize,
+    grad_out: &[f32],
+    leak: f32,
+) -> Vec<Vec<f32>> {
+    let mut g_wf = vec![0.0f32; rows * cols];
+    let mut g_a = vec![0.0f32; rows];
+    let grad_scale = 1.0 / (cols as f32).sqrt();
+    for r in 0..rows {
+        let a = alpha[r];
+        if a <= 0.0 {
+            continue;
+        }
+        let mut ga = 0.0f32;
+        for c in 0..cols {
+            let i = r * cols + c;
+            let v = wf[i] / a;
+            let g = grad_out[i];
+            if v.abs() < 1.0 {
+                g_wf[i] = g;
+                ga += g * (v.round() - v);
+            } else {
+                g_wf[i] = leak * g; // Tequila: saturated weights stay reachable
+                ga += g * v.signum();
+            }
+        }
+        g_a[r] = ga * grad_scale;
+    }
+    vec![g_wf, g_a]
+}
+
+// ── Sherry: cosine-annealed fp residual ──────────────────────────────────────────────────────────
+// Quantizing hard from step 0 homogenizes gradients: every weight in a row is forced onto the same
+// coarse ternary grid through one shared scale, so the loss surface the optimizer sees early is far
+// rougher than the fp one. "Sherry" blends a *decaying* fraction of the untouched fp weight into the
+// reconstruction — `(1-α)·Ŵ + α·Wf` — so training starts near the smooth fp landscape and anneals to
+// pure ternary. At `α = 0` the forward is bit-identical to [`salt_quantize_forward`], so a run that
+// finishes its anneal ends fully ternary with nothing left to remove.
+
+/// Blend the fp weight into a SALT reconstruction: `(1-α)·Ŵ + α·Wf`, `α ∈ [0,1]`.
+/// `α = 0` ⇒ exactly [`salt_quantize_forward`]; `α = 1` ⇒ the fp weight untouched.
+///
+/// The straight-through backward is unchanged (identity, as in [`salt_quantize_vjp`]): the blend is a
+/// *forward-only* smoothing of the landscape, and both terms already pass gradient with slope 1.
+#[must_use]
+pub fn salt_quantize_forward_sherry(
+    wf: &[f32],
+    rows: usize,
+    cols: usize,
+    t: usize,
+    alpha: f32,
+) -> Vec<f32> {
+    let mut recon = salt_quantize_forward(wf, rows, cols, t);
+    if alpha != 0.0 {
+        for (r, &w) in recon.iter_mut().zip(wf) {
+            *r += alpha * (w - *r); // (1-α)·recon + α·wf, one rounding
+        }
+    }
+    recon
+}
+
+/// Cosine anneal of the Sherry fp-mix from `start` at step 0 down to 0 at `total` (held at 0 after).
+/// Mirrors the [`LrSchedule`](crate::LrSchedule) shape so a campaign can drive both off the step index.
+#[must_use]
+pub fn sherry_alpha(start: f32, step: u64, total: u64) -> f32 {
+    if total == 0 || step >= total {
+        return 0.0;
+    }
+    let progress = step as f32 / total as f32;
+    start * 0.5 * (1.0 + (std::f32::consts::PI * progress).cos())
+}
+
 // ── LSQ (Learned Step-Size Quantization) ─────────────────────────────────────────────────────────
 // A *trainable* per-row step size `α` replacing the fixed AbsMean scale (Esser et al. 2020,
 // specialized to the ternary grid `Qn=Qp=1`). Both the latent weight `Wf` and `α` receive gradients:
