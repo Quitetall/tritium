@@ -215,6 +215,17 @@ pub(crate) fn run(input: &Path, output: &Path, to: RepackTarget) -> anyhow::Resu
 mod tests {
     use super::*;
 
+    /// Model cache root: override via `TRITIUM_MODEL_DIR`; default `~/.cache/tritium-models`; tests skip cleanly when absent.
+    static GGUF: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        let dir = std::env::var("TRITIUM_MODEL_DIR").unwrap_or_else(|_| {
+            format!(
+                "{}/.cache/tritium-models",
+                std::env::var("HOME").unwrap_or_default()
+            )
+        });
+        format!("{dir}/bitnet-2b4t-gguf/ggml-model-i2_s.gguf")
+    });
+
     /// Deterministic trits.
     fn trits(n: usize, seed: u64) -> Vec<Trit> {
         let mut s = seed;
@@ -281,12 +292,10 @@ mod tests {
     /// Diagnostic: are the real model's I2_S f32 scales f16-representable?
     #[test]
     fn probe_i2s_scales_f16_exact() {
-        const GGUF: &str =
-            "/home/brianklam/.cache/tritium-models/bitnet-2b4t-gguf/ggml-model-i2_s.gguf";
-        if !Path::new(GGUF).exists() {
+        if !Path::new(&*GGUF).exists() {
             return;
         }
-        let bytes = std::fs::read(GGUF).expect("read");
+        let bytes = std::fs::read(&*GGUF).expect("read");
         let file = read_gguf(&bytes).expect("parse");
         for name in ["blk.0.attn_q.weight", "blk.0.ffn_down.weight"] {
             let info = file.tensor(name).expect("tensor");
@@ -319,16 +328,14 @@ mod tests {
     /// construction; this catches any packing/eq drift).
     #[test]
     fn repacked_tq1_model_loads_bit_identical() {
-        const GGUF: &str =
-            "/home/brianklam/.cache/tritium-models/bitnet-2b4t-gguf/ggml-model-i2_s.gguf";
-        if !Path::new(GGUF).exists() {
-            eprintln!("skipping: {GGUF} absent (gated real-model test)");
+        if !Path::new(&*GGUF).exists() {
+            eprintln!("skipping: {} absent (gated real-model test)", &*GGUF);
             return;
         }
         let dir = std::env::temp_dir().join("tritium-repack-model-test");
         std::fs::create_dir_all(&dir).expect("mkdir");
         let tq1 = dir.join("bitnet-tq1.gguf");
-        run(Path::new(GGUF), &tq1, RepackTarget::Tq1).expect("repack real model");
+        run(Path::new(&*GGUF), &tq1, RepackTarget::Tq1).expect("repack real model");
 
         let load = |path: &Path| {
             let bytes = std::fs::read(path).expect("read gguf");
@@ -341,7 +348,7 @@ mod tests {
             let backend = init().expect("init cpu");
             tritium_nn::ModelRunner::load(&file, &bytes, backend).expect("load model")
         };
-        let mut a = load(Path::new(GGUF));
+        let mut a = load(Path::new(&*GGUF));
         let mut b = load(&tq1);
         let tokens = [128000u32, 791, 6864, 315, 9822, 374];
         let positions: Vec<usize> = (0..tokens.len()).collect();

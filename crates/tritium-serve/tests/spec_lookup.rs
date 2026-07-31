@@ -15,8 +15,16 @@ use tritium_serve::{GenRequest, Generator, RunnerGenerator, Sampling};
 use tritium_cpu as _;
 use tritium_cuda as _;
 
-const GGUF_PATH: &str =
-    "/home/brianklam/.cache/tritium-models/bitnet-2b4t-gguf/ggml-model-i2_s.gguf";
+/// Model cache root: override via `TRITIUM_MODEL_DIR`; default `~/.cache/tritium-models`; tests skip cleanly when absent.
+static GGUF_PATH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let dir = std::env::var("TRITIUM_MODEL_DIR").unwrap_or_else(|_| {
+        format!(
+            "{}/.cache/tritium-models",
+            std::env::var("HOME").unwrap_or_default()
+        )
+    });
+    format!("{dir}/bitnet-2b4t-gguf/ggml-model-i2_s.gguf")
+});
 const REF_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tools/reference/bitnet_accept.json"
@@ -56,8 +64,8 @@ fn collect(generator: &mut dyn Generator, req: &GenRequest) -> (Vec<u32>, std::t
 /// deterministic and must reproduce the plain greedy stream token-for-token.
 #[test]
 fn cuda_spec_sampled_topk1_matches_plain_greedy() {
-    if !Path::new(GGUF_PATH).exists() {
-        eprintln!("skipping: {GGUF_PATH} absent (gated real-model test)");
+    if !Path::new(&*GGUF_PATH).exists() {
+        eprintln!("skipping: {} absent (gated real-model test)", &*GGUF_PATH);
         return;
     }
     let reference: serde_json::Value =
@@ -69,7 +77,7 @@ fn cuda_spec_sampled_topk1_matches_plain_greedy() {
         .iter()
         .map(|v| v.as_u64().expect("id") as u32)
         .collect();
-    let bytes = std::fs::read(GGUF_PATH).expect("read gguf");
+    let bytes = std::fs::read(&*GGUF_PATH).expect("read gguf");
 
     let greedy_req = GenRequest {
         prompt_tokens: prompt.clone(),
@@ -118,8 +126,8 @@ fn cuda_spec_sampled_topk1_matches_plain_greedy() {
 
 #[test]
 fn cuda_spec_lookup_matches_plain_greedy() {
-    if !Path::new(GGUF_PATH).exists() {
-        eprintln!("skipping: {GGUF_PATH} absent (gated real-model test)");
+    if !Path::new(&*GGUF_PATH).exists() {
+        eprintln!("skipping: {} absent (gated real-model test)", &*GGUF_PATH);
         return;
     }
     let reference: serde_json::Value =
@@ -131,7 +139,7 @@ fn cuda_spec_lookup_matches_plain_greedy() {
         .iter()
         .map(|v| v.as_u64().expect("id") as u32)
         .collect();
-    let bytes = std::fs::read(GGUF_PATH).expect("read gguf");
+    let bytes = std::fs::read(&*GGUF_PATH).expect("read gguf");
 
     let req = GenRequest {
         prompt_tokens: prompt.clone(),

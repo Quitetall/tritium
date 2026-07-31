@@ -30,8 +30,16 @@ use tritium_serve::{
 use tritium_cpu as _;
 use tritium_cuda as _;
 
-const GGUF_PATH: &str =
-    "/home/brianklam/.cache/tritium-models/bitnet-2b4t-gguf/ggml-model-i2_s.gguf";
+/// Model cache root: override via `TRITIUM_MODEL_DIR`; default `~/.cache/tritium-models`; tests skip cleanly when absent.
+static GGUF_PATH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let dir = std::env::var("TRITIUM_MODEL_DIR").unwrap_or_else(|_| {
+        format!(
+            "{}/.cache/tritium-models",
+            std::env::var("HOME").unwrap_or_default()
+        )
+    });
+    format!("{dir}/bitnet-2b4t-gguf/ggml-model-i2_s.gguf")
+});
 const REF_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tools/reference/bitnet_accept.json"
@@ -75,8 +83,8 @@ async fn chat(router: &Router, prompt_ids: &str, max_tokens: usize) -> String {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn cuda_batched_serve_matches_single_sequence_greedy() {
-    if !Path::new(GGUF_PATH).exists() {
-        eprintln!("skipping: {GGUF_PATH} absent (gated real-model test)");
+    if !Path::new(&*GGUF_PATH).exists() {
+        eprintln!("skipping: {} absent (gated real-model test)", &*GGUF_PATH);
         return;
     }
     let reference: serde_json::Value =
@@ -88,7 +96,7 @@ async fn cuda_batched_serve_matches_single_sequence_greedy() {
         .iter()
         .map(|v| v.as_u64().expect("id") as u32)
         .collect();
-    let bytes = std::fs::read(GGUF_PATH).expect("read gguf");
+    let bytes = std::fs::read(&*GGUF_PATH).expect("read gguf");
 
     // Six DIFFERENT prompts (the reference ids cycled to different lengths,
     // rotated so each prompt starts differently) through a 4-slot pool:
@@ -238,8 +246,8 @@ async fn tree_post(
 ///     session — the next verify gets 409 Conflict.
 #[tokio::test(flavor = "multi_thread")]
 async fn cuda_batched_tree_session_coexists() {
-    if !Path::new(GGUF_PATH).exists() {
-        eprintln!("skipping: {GGUF_PATH} absent (gated real-model test)");
+    if !Path::new(&*GGUF_PATH).exists() {
+        eprintln!("skipping: {} absent (gated real-model test)", &*GGUF_PATH);
         return;
     }
     let reference: serde_json::Value =
@@ -251,7 +259,7 @@ async fn cuda_batched_tree_session_coexists() {
         .iter()
         .map(|v| v.as_u64().expect("id") as u32)
         .collect();
-    let bytes = std::fs::read(GGUF_PATH).expect("read gguf");
+    let bytes = std::fs::read(&*GGUF_PATH).expect("read gguf");
     let session_prompt: Vec<u32> = base.iter().cycle().take(16).copied().collect();
     let drafts: Vec<u32> = base.iter().cycle().skip(2).take(2).copied().collect();
 
@@ -458,8 +466,8 @@ async fn cuda_batched_tree_session_coexists() {
 /// slot would imply a free page — review finding on the first version.)
 #[tokio::test(flavor = "multi_thread")]
 async fn cuda_batched_paged_streams_equal_dense() {
-    if !Path::new(GGUF_PATH).exists() {
-        eprintln!("skipping: {GGUF_PATH} absent (gated real-model test)");
+    if !Path::new(&*GGUF_PATH).exists() {
+        eprintln!("skipping: {} absent (gated real-model test)", &*GGUF_PATH);
         return;
     }
     let reference: serde_json::Value =
@@ -471,7 +479,7 @@ async fn cuda_batched_paged_streams_equal_dense() {
         .iter()
         .map(|v| v.as_u64().expect("id") as u32)
         .collect();
-    let bytes = std::fs::read(GGUF_PATH).expect("read gguf");
+    let bytes = std::fs::read(&*GGUF_PATH).expect("read gguf");
     let prompts: Vec<Vec<u32>> = (0..6usize)
         .map(|i| {
             base.iter()
@@ -604,8 +612,8 @@ fn spawn_stream(
 /// `TRITIUM_PREFILL_CHUNK` huge to reproduce the "before" behavior.
 #[tokio::test(flavor = "multi_thread")]
 async fn cuda_batched_admission_interleaves_live_slot() {
-    if !Path::new(GGUF_PATH).exists() {
-        eprintln!("skipping: {GGUF_PATH} absent (gated real-model test)");
+    if !Path::new(&*GGUF_PATH).exists() {
+        eprintln!("skipping: {} absent (gated real-model test)", &*GGUF_PATH);
         return;
     }
     let reference: serde_json::Value =
@@ -617,7 +625,7 @@ async fn cuda_batched_admission_interleaves_live_slot() {
         .iter()
         .map(|v| v.as_u64().expect("id") as u32)
         .collect();
-    let bytes = std::fs::read(GGUF_PATH).expect("read gguf");
+    let bytes = std::fs::read(&*GGUF_PATH).expect("read gguf");
     let Some(runner) = load_runner(&bytes) else {
         return;
     };
@@ -707,7 +715,7 @@ async fn cuda_batched_admission_interleaves_live_slot() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "throughput bench: run with --ignored --nocapture"]
 async fn cuda_batched_throughput_vs_sequential() {
-    if !Path::new(GGUF_PATH).exists() {
+    if !Path::new(&*GGUF_PATH).exists() {
         return;
     }
     let reference: serde_json::Value =
@@ -719,7 +727,7 @@ async fn cuda_batched_throughput_vs_sequential() {
         .iter()
         .map(|v| v.as_u64().expect("id") as u32)
         .collect();
-    let bytes = std::fs::read(GGUF_PATH).expect("read gguf");
+    let bytes = std::fs::read(&*GGUF_PATH).expect("read gguf");
     let n = 8usize;
     let max_tokens = 64usize;
     let prompts: Vec<String> = (0..n)

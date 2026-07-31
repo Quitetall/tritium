@@ -13,8 +13,16 @@
 
 use std::path::Path;
 
-const GGUF_PATH: &str =
-    "/home/brianklam/.cache/tritium-models/bitnet-2b4t-gguf/ggml-model-i2_s.gguf";
+/// Model cache root: override via `TRITIUM_MODEL_DIR`; default `~/.cache/tritium-models`; tests skip cleanly when absent.
+static GGUF_PATH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let dir = std::env::var("TRITIUM_MODEL_DIR").unwrap_or_else(|_| {
+        format!(
+            "{}/.cache/tritium-models",
+            std::env::var("HOME").unwrap_or_default()
+        )
+    });
+    format!("{dir}/bitnet-2b4t-gguf/ggml-model-i2_s.gguf")
+});
 const REF_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tools/reference/bitnet_accept.json"
@@ -23,8 +31,8 @@ const REF_PATH: &str = concat!(
 #[test]
 #[ignore = "long-context bench: run explicitly with --ignored --nocapture"]
 fn cuda_long_ctx_decode_bench() {
-    if !Path::new(GGUF_PATH).exists() {
-        eprintln!("skipping: {GGUF_PATH} absent (gated real-model bench)");
+    if !Path::new(&*GGUF_PATH).exists() {
+        eprintln!("skipping: {} absent (gated real-model bench)", &*GGUF_PATH);
         return;
     }
     let reference: serde_json::Value =
@@ -36,7 +44,7 @@ fn cuda_long_ctx_decode_bench() {
         .iter()
         .map(|v| v.as_u64().expect("id") as u32)
         .collect();
-    let bytes = std::fs::read(GGUF_PATH).expect("read gguf");
+    let bytes = std::fs::read(&*GGUF_PATH).expect("read gguf");
     let file = tritium_format::read_gguf(&bytes).expect("parse gguf");
     let init = tritium_runtime::BACKENDS
         .iter()

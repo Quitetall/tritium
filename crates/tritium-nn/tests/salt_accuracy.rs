@@ -269,8 +269,16 @@ fn salt_accuracy_curve() {
     );
 }
 
-const GGUF_PATH: &str =
-    "/home/brianklam/.cache/tritium-models/bitnet-2b4t-gguf/ggml-model-i2_s.gguf";
+/// Model cache root: override via `TRITIUM_MODEL_DIR`; default `~/.cache/tritium-models`; tests skip cleanly when absent.
+static GGUF_PATH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let dir = std::env::var("TRITIUM_MODEL_DIR").unwrap_or_else(|_| {
+        format!(
+            "{}/.cache/tritium-models",
+            std::env::var("HOME").unwrap_or_default()
+        )
+    });
+    format!("{dir}/bitnet-2b4t-gguf/ggml-model-i2_s.gguf")
+});
 
 /// Reference: the deployed GGUF I2_S perplexity on the SAME `EVAL_LEN` tokens the curve
 /// uses (the committed 1.4028 is over the full 262-token set; a short prefix scores
@@ -280,8 +288,8 @@ const GGUF_PATH: &str =
 #[test]
 #[ignore = "loads the GGUF + one CPU forward; run explicitly"]
 fn gguf_eval_perplexity() {
-    if !std::path::Path::new(GGUF_PATH).exists() {
-        eprintln!("skipping: {GGUF_PATH} absent");
+    if !std::path::Path::new(&*GGUF_PATH).exists() {
+        eprintln!("skipping: {} absent", &*GGUF_PATH);
         return;
     }
     let ref_raw = match std::fs::read(reference_path()) {
@@ -300,7 +308,7 @@ fn gguf_eval_perplexity() {
         .collect();
     let eval_ids = &all_ids[..EVAL_LEN.min(all_ids.len())];
 
-    let gbytes = std::fs::read(GGUF_PATH).expect("read gguf");
+    let gbytes = std::fs::read(&*GGUF_PATH).expect("read gguf");
     let mut gg = ModelRunner::load_cpu(&gbytes).expect("load gguf cpu");
     let ppl = perplexity(&mut gg, eval_ids);
     println!(
@@ -333,8 +341,8 @@ fn salt_fp_vs_gguf_stage_dump() {
         eprintln!("skipping: {} absent", path.display());
         return;
     }
-    if !std::path::Path::new(GGUF_PATH).exists() {
-        eprintln!("skipping: {GGUF_PATH} absent");
+    if !std::path::Path::new(&*GGUF_PATH).exists() {
+        eprintln!("skipping: {} absent", &*GGUF_PATH);
         return;
     }
     let cfg = config();
@@ -349,7 +357,7 @@ fn salt_fp_vs_gguf_stage_dump() {
         Box::new(tritium_cpu::CpuBackend::new()),
     );
 
-    let gbytes = std::fs::read(GGUF_PATH).expect("read gguf");
+    let gbytes = std::fs::read(&*GGUF_PATH).expect("read gguf");
     let mut gg = ModelRunner::load_cpu(&gbytes).expect("load gguf cpu");
 
     let mut dh = ForwardDump::default();

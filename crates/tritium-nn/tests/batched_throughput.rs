@@ -55,8 +55,16 @@ use std::time::Instant;
 use tritium_cuda::{BatchKv, CudaDecodeModel};
 use tritium_nn::ModelRunner;
 
-const GGUF_PATH: &str =
-    "/home/brianklam/.cache/tritium-models/bitnet-2b4t-gguf/ggml-model-i2_s.gguf";
+/// Model cache root: override via `TRITIUM_MODEL_DIR`; default `~/.cache/tritium-models`; tests skip cleanly when absent.
+static GGUF_PATH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let dir = std::env::var("TRITIUM_MODEL_DIR").unwrap_or_else(|_| {
+        format!(
+            "{}/.cache/tritium-models",
+            std::env::var("HOME").unwrap_or_default()
+        )
+    });
+    format!("{dir}/bitnet-2b4t-gguf/ggml-model-i2_s.gguf")
+});
 
 /// Small KV window: we decode `WARM + STEPS` (~72) positions, so 512 is ample and
 /// keeps `N × max_ctx` arenas inside 24 GB for large `N`.
@@ -66,11 +74,11 @@ const STEPS: usize = 64;
 const NS: &[usize] = &[1, 2, 4, 8, 16, 32, 64];
 
 fn load_cuda() -> Option<ModelRunner> {
-    if !Path::new(GGUF_PATH).exists() {
-        eprintln!("skipping: {GGUF_PATH} absent");
+    if !Path::new(&*GGUF_PATH).exists() {
+        eprintln!("skipping: {} absent", &*GGUF_PATH);
         return None;
     }
-    let bytes = std::fs::read(GGUF_PATH).ok()?;
+    let bytes = std::fs::read(&*GGUF_PATH).ok()?;
     let init = tritium_runtime::BACKENDS
         .iter()
         .find(|e| e.name == "cuda")

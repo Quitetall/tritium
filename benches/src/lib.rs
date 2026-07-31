@@ -332,8 +332,8 @@ pub const LLAMA_CPP_2B4T_DECODE: Baseline = Baseline {
 /// trips the `>5%` gate; a real regression still fails CI.
 ///
 /// **Why there is no `BuiltOnBox` GPU *competitor*.** A same-HW llama.cpp CUDA
-/// baseline for this artifact is **not obtainable**, confirmed on the local
-/// CUDA-enabled llama.cpp fork (`/home/brianklam/llama.cpp`, `libggml-cuda.so`,
+/// baseline for this artifact is **not obtainable**, confirmed on a local
+/// CUDA-enabled llama.cpp checkout (`libggml-cuda.so`,
 /// 4090): (1) the `ggml-model-i2_s.gguf` will not load — GGUF quant type-id `36` is
 /// the removed `IQ4_NL_4_4` in current ggml, not BitNet `I2_S` (a fork-specific
 /// assignment), so the loader rejects it before any kernel runs; (2) even

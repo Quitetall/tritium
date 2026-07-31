@@ -31,9 +31,26 @@ use tritium_cpu as _;
 use tritium_cuda as _;
 use tritium_runtime as _;
 
-const GGUF_PATH: &str =
-    "/home/brianklam/.cache/tritium-models/bitnet-2b4t-gguf/ggml-model-i2_s.gguf";
-const BF16_PATH: &str = "/home/brianklam/.cache/tritium-models/bitnet-2b4t-bf16/model.safetensors";
+/// Model cache root: override via `TRITIUM_MODEL_DIR`; default `~/.cache/tritium-models`; tests skip cleanly when absent.
+static GGUF_PATH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let dir = std::env::var("TRITIUM_MODEL_DIR").unwrap_or_else(|_| {
+        format!(
+            "{}/.cache/tritium-models",
+            std::env::var("HOME").unwrap_or_default()
+        )
+    });
+    format!("{dir}/bitnet-2b4t-gguf/ggml-model-i2_s.gguf")
+});
+/// Model cache root: override via `TRITIUM_MODEL_DIR`; default `~/.cache/tritium-models`; tests skip cleanly when absent.
+static BF16_PATH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let dir = std::env::var("TRITIUM_MODEL_DIR").unwrap_or_else(|_| {
+        format!(
+            "{}/.cache/tritium-models",
+            std::env::var("HOME").unwrap_or_default()
+        )
+    });
+    format!("{dir}/bitnet-2b4t-bf16/model.safetensors")
+});
 const REF_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tools/reference/bitnet_accept.json"
@@ -53,8 +70,8 @@ struct Reference {
 
 fn maybe_load() -> Option<(Vec<u32>, Vec<u8>, Vec<u8>)> {
     for (p, what) in [
-        (GGUF_PATH, "gguf model"),
-        (BF16_PATH, "bf16 master"),
+        (GGUF_PATH.as_str(), "gguf model"),
+        (BF16_PATH.as_str(), "bf16 master"),
         (REF_PATH, "reference json"),
     ] {
         if !Path::new(p).exists() {
@@ -67,8 +84,8 @@ fn maybe_load() -> Option<(Vec<u32>, Vec<u8>, Vec<u8>)> {
             .expect("parse ref");
     Some((
         reference.eval_ids,
-        std::fs::read(GGUF_PATH).expect("read gguf"),
-        std::fs::read(BF16_PATH).expect("read bf16"),
+        std::fs::read(&*GGUF_PATH).expect("read gguf"),
+        std::fs::read(&*BF16_PATH).expect("read bf16"),
     ))
 }
 

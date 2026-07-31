@@ -49,8 +49,16 @@ mod cuda_e2e {
     // Pull the CUDA backend's registration into the bench binary.
     use tritium_cuda as _;
 
-    const GGUF_PATH: &str =
-        "/home/brianklam/.cache/tritium-models/bitnet-2b4t-gguf/ggml-model-i2_s.gguf";
+    /// Model cache root: override via `TRITIUM_MODEL_DIR`; default `~/.cache/tritium-models`; benches skip cleanly when absent.
+    static GGUF_PATH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        let dir = std::env::var("TRITIUM_MODEL_DIR").unwrap_or_else(|_| {
+            format!(
+                "{}/.cache/tritium-models",
+                std::env::var("HOME").unwrap_or_default()
+            )
+        });
+        format!("{dir}/bitnet-2b4t-gguf/ggml-model-i2_s.gguf")
+    });
     const REF_PATH: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../tools/reference/bitnet_accept.json"
@@ -75,8 +83,11 @@ mod cuda_e2e {
     /// Load the reference + model bytes, or `None` (with a printed reason) if either
     /// is absent — the offline/model-less skip path.
     fn maybe_load() -> Option<(Reference, Vec<u8>)> {
-        if !Path::new(GGUF_PATH).exists() {
-            eprintln!("skipping e2e bench: {GGUF_PATH} absent (gated real-model bench)");
+        if !Path::new(&*GGUF_PATH).exists() {
+            eprintln!(
+                "skipping e2e bench: {} absent (gated real-model bench)",
+                &*GGUF_PATH
+            );
             return None;
         }
         if !Path::new(REF_PATH).exists() {
@@ -86,7 +97,7 @@ mod cuda_e2e {
         let reference: Reference =
             serde_json::from_slice(&std::fs::read(REF_PATH).expect("read reference"))
                 .expect("parse reference json");
-        let bytes = std::fs::read(GGUF_PATH).expect("read GGUF");
+        let bytes = std::fs::read(&*GGUF_PATH).expect("read GGUF");
         Some((reference, bytes))
     }
 

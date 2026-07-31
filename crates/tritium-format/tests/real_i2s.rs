@@ -18,17 +18,28 @@ use std::path::Path;
 use tritium_core::Trit;
 use tritium_format::{GGML_TYPE_I2_S, read_gguf, unpack_i2s_tensor};
 
-const GGUF_PATH: &str =
-    "/home/brianklam/.cache/tritium-models/bitnet-2b4t-gguf/ggml-model-i2_s.gguf";
+/// Model cache root: override via `TRITIUM_MODEL_DIR`; default `~/.cache/tritium-models`; tests skip cleanly when absent.
+static GGUF_PATH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let dir = std::env::var("TRITIUM_MODEL_DIR").unwrap_or_else(|_| {
+        format!(
+            "{}/.cache/tritium-models",
+            std::env::var("HOME").unwrap_or_default()
+        )
+    });
+    format!("{dir}/bitnet-2b4t-gguf/ggml-model-i2_s.gguf")
+});
 
 #[test]
 fn decodes_real_bitnet_i2s_tensor() {
-    if !Path::new(GGUF_PATH).exists() {
-        eprintln!("skipping: {GGUF_PATH} not present (gated real-file test)");
+    if !Path::new(&*GGUF_PATH).exists() {
+        eprintln!(
+            "skipping: {} not present (gated real-file test)",
+            &*GGUF_PATH
+        );
         return;
     }
 
-    let bytes = std::fs::read(GGUF_PATH).expect("read real GGUF");
+    let bytes = std::fs::read(&*GGUF_PATH).expect("read real GGUF");
     let f = read_gguf(&bytes).expect("parse real GGUF");
 
     assert_eq!(

@@ -4,8 +4,16 @@
 #![cfg(feature = "cuda")]
 use std::path::Path;
 
-const GGUF_PATH: &str =
-    "/home/brianklam/.cache/tritium-models/bitnet-2b4t-gguf/ggml-model-i2_s.gguf";
+/// Model cache root: override via `TRITIUM_MODEL_DIR`; default `~/.cache/tritium-models`; tests skip cleanly when absent.
+static GGUF_PATH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let dir = std::env::var("TRITIUM_MODEL_DIR").unwrap_or_else(|_| {
+        format!(
+            "{}/.cache/tritium-models",
+            std::env::var("HOME").unwrap_or_default()
+        )
+    });
+    format!("{dir}/bitnet-2b4t-gguf/ggml-model-i2_s.gguf")
+});
 
 /// Both tests here load a full model (~2.5 GB VRAM) — serialize them within
 /// this binary (same OOM-flake pattern the acceptance suite guards against).
@@ -20,11 +28,11 @@ fn gpu_serial() -> std::sync::MutexGuard<'static, ()> {
 #[test]
 fn adopt_copy_is_bit_exact() {
     let _gpu = gpu_serial();
-    if !Path::new(GGUF_PATH).exists() {
-        eprintln!("skipping: {GGUF_PATH} absent (gated real-model test)");
+    if !Path::new(&*GGUF_PATH).exists() {
+        eprintln!("skipping: {} absent (gated real-model test)", &*GGUF_PATH);
         return;
     }
-    let bytes = std::fs::read(GGUF_PATH).expect("read");
+    let bytes = std::fs::read(&*GGUF_PATH).expect("read");
     let file = tritium_format::read_gguf(&bytes).expect("parse");
     let init = tritium_runtime::BACKENDS
         .iter()
@@ -62,11 +70,11 @@ fn adopt_copy_is_bit_exact() {
 #[test]
 fn failed_capture_does_not_poison_the_stream() {
     let _gpu = gpu_serial();
-    if !Path::new(GGUF_PATH).exists() {
-        eprintln!("skipping: {GGUF_PATH} absent (gated real-model test)");
+    if !Path::new(&*GGUF_PATH).exists() {
+        eprintln!("skipping: {} absent (gated real-model test)", &*GGUF_PATH);
         return;
     }
-    let bytes = std::fs::read(GGUF_PATH).expect("read");
+    let bytes = std::fs::read(&*GGUF_PATH).expect("read");
     let file = tritium_format::read_gguf(&bytes).expect("parse");
     let init = tritium_runtime::BACKENDS
         .iter()
