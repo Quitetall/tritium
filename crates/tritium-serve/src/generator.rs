@@ -626,7 +626,11 @@ impl RunnerGenerator {
         } else {
             Ok(None) // TRITIUM_DRAFT_CHAIN=0: per-step ladder (A/B + kill switch)
         };
-        if let Ok(Some(ids)) = chained {
+        if let Ok(Some(ids)) = chained
+            && !ids.is_empty()
+        {
+            // (Empty ids — only reachable from poisoned all-NaN logits —
+            // falls through to the ladder without recording a feed.)
             // The chain fed [tok, ids[0..len-1]] (the last id — possibly
             // EOS — was drafted, never fed); record exactly those feeds.
             self.draft_fed.push(tok);

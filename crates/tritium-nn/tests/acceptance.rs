@@ -140,9 +140,10 @@ fn maybe_load() -> Option<(Reference, Vec<u8>)> {
     Some((reference, bytes))
 }
 
-/// Index of the maximum element (greedy argmax), ties broken by lowest index —
-/// matching `sample_greedy` and torch's `argmax`. Used only by the CUDA parity
-/// test.
+/// Index of the maximum element (greedy argmax). Tie-break is lowest index
+/// here vs `sample_greedy`/the device pair's highest-index `max_by` — a
+/// theoretical divergence only (real logits carry no exact f32 ties; noted
+/// per the 067ce79 review). Used only by the CUDA parity tests.
 #[cfg(feature = "cuda")]
 fn argmax(v: &[f32]) -> usize {
     let mut best = 0usize;
@@ -1325,6 +1326,4 @@ fn cuda_draft_chain_matches_per_step() {
         Some(&a1),
         "watermark after an eos-truncated chain must be consistent"
     );
-    t = a1; // silence unused on non-assert builds
-    let _ = t;
 }
