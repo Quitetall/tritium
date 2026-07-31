@@ -43,7 +43,11 @@ jobs:
     name: compatibility matrix (receipt-backed)
     runs-on: ubuntu-latest
     steps:
+      # fetch-depth 0: the api-diff tests resolve the v1.0.0 baseline tag,
+      # which a shallow checkout does not have.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -371,6 +375,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo install cargo-cyclonedx --locked
+      # check-publish packages with --frozen (offline); prefetch the workspace's
+      # locked deps so a cache-less runner has the registry entries it needs.
+      - run: cargo fetch --locked
       - run: ./scripts/check-publish.sh
       - name: bind exact crate archives to CycloneDX and source revision
         run: >-
