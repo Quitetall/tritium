@@ -162,6 +162,124 @@ pub fn salt_quantize_vjp(
     grad_out.to_vec()
 }
 
+// ── ITF: iterative ternary fitting ───────────────────────────────────────────────────────────────
+// [`salt_quantize_forward`] fits each plane in ONE greedy pass: take `s = AbsMean(residual)`, then
+// `t = clamp(round(residual/s))`. AbsMean is a heuristic (the flat BitNet b1.58 contract) — it is *not*
+// the scale that minimizes the plane's reconstruction error.
+//
+// For a fixed trit vector `t`, the least-squares optimal scalar is the projection
+//
+//     s* = <r, t> / <t, t>        (NOT mean|r|)
+//
+// and for a fixed `s`, the optimal ternary assignment is exactly `clamp(round(r/s))`. Both half-steps
+// are therefore *exact* minimizations of the same objective `||r − s·t||²`, so alternating them is
+// monotone non-increasing — the PT²-LLM "Iterative Ternary Fitting" idea, specialized to a SALT plane.
+// The output is an ordinary `(scale, trits)` pair, so the packed format is unchanged: this is a better
+// fit at identical bits, not a new representation.
+//
+// NOTE: better weight-space reconstruction does not automatically mean better end-task quality (the
+// documented "proxy gap": per-layer MSE can anti-correlate with perplexity). ITF must be judged on
+// downstream ppl, not on the MSE it is guaranteed to improve.
+
+/// Least-squares optimal scale for a fixed ternary assignment: `<r,t>/<t,t>`, or `None` if `t` is
+/// all-zero (no information) or the projection is non-positive (degenerate).
+/// Both sums accumulate in ascending order so a device mirror can reproduce them exactly (ADR 0018).
+fn ls_optimal_scale(residual: &[f32], trits: &[f32]) -> Option<f32> {
+    let mut num = 0.0f32;
+    let mut den = 0.0f32;
+    for (&r, &t) in residual.iter().zip(trits) {
+        num += r * t;
+        den += t * t;
+    }
+    if den <= 0.0 {
+        return None;
+    }
+    let s = num / den;
+    (s > 0.0 && s.is_finite()).then_some(s)
+}
+
+/// Sum of squared reconstruction error for one plane, `Σ (r − s·t)²`, ascending order.
+fn plane_sse(residual: &[f32], trits: &[f32], scale: f32) -> f32 {
+    let mut e = 0.0f32;
+    for (&r, &t) in residual.iter().zip(trits) {
+        let d = r - scale * t;
+        e += d * d;
+    }
+    e
+}
+
+/// Fit ONE plane to `residual` by iterative ternary fitting, returning `(scale, trits)`.
+///
+/// Starts from the AbsMean fit (so `iters == 0` is exactly the greedy behaviour) and alternates
+/// `scale ← <r,t>/<t,t>` with `trits ← clamp(round(r/scale))`, keeping a candidate **only when it
+/// strictly reduces** the plane's squared error. That accept-on-improvement guard makes the result
+/// provably never worse than AbsMean, even under float noise.
+fn fit_plane_itf(residual: &[f32], iters: usize) -> (f32, Vec<f32>) {
+    let quantize = |s: f32| -> Vec<f32> {
+        residual
+            .iter()
+            .map(|&r| (r / s).round().clamp(-1.0, 1.0))
+            .collect()
+    };
+    let mut scale = residual.iter().map(|&v| v.abs()).sum::<f32>() / residual.len() as f32;
+    if scale <= 0.0 || !scale.is_finite() {
+        return (0.0, vec![0.0; residual.len()]); // dead row: matches the greedy path's early-out
+    }
+    let mut trits = quantize(scale);
+    let mut best_sse = plane_sse(residual, &trits, scale);
+    for _ in 0..iters {
+        let Some(cand_scale) = ls_optimal_scale(residual, &trits) else {
+            break;
+        };
+        let cand_trits = quantize(cand_scale);
+        let cand_sse = plane_sse(residual, &cand_trits, cand_scale);
+        if cand_sse >= best_sse {
+            break; // converged (or float noise) — keep the better pair
+        }
+        scale = cand_scale;
+        trits = cand_trits;
+        best_sse = cand_sse;
+    }
+    (scale, trits)
+}
+
+/// [`salt_quantize_forward`] with **iterative ternary fitting** per plane. `iters == 0` reproduces the
+/// greedy AbsMean expansion bit-for-bit; higher values refine each plane's scale toward the
+/// least-squares optimum before the residual is passed to the next plane.
+///
+/// Returns the same dense reconstruction `Ŵ = Σ_p s_p·trit_p` in the same layout, so every downstream
+/// consumer (packing, the STE backward, the device kernels) is unchanged.
+#[must_use]
+pub fn salt_quantize_forward_itf(
+    wf: &[f32],
+    rows: usize,
+    cols: usize,
+    t: usize,
+    iters: usize,
+) -> Vec<f32> {
+    if iters == 0 {
+        return salt_quantize_forward(wf, rows, cols, t);
+    }
+    let mut residual = wf.to_vec();
+    let mut recon = vec![0.0f32; rows * cols];
+    for _plane in 0..t {
+        for r in 0..rows {
+            let lo = r * cols;
+            let hi = lo + cols;
+            let (scale, trits) = fit_plane_itf(&residual[lo..hi], iters);
+            if scale == 0.0 {
+                continue;
+            }
+            for (c, tr) in trits.iter().enumerate() {
+                let contribution = scale * tr;
+                recon[lo + c] += contribution;
+                residual[lo + c] -= contribution;
+            }
+        }
+    }
+    recon
+}
+
 // ── Tequila: deadzone bias (leaky STE) ───────────────────────────────────────────────────────────
 // The plain STE masks the saturated region: a weight with `|Wf/s| >= 1` receives EXACTLY zero
 // gradient, so once it saturates nothing can ever pull it back — it is dead for the rest of training.
