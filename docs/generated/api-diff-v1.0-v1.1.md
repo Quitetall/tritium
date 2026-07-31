@@ -1,6 +1,6 @@
 # Generated v1.0 to v1.1 API diff
 
-Report identity: `sha256:afe79ffe88b120831301334ffb73e9f82003b01855043768ff38c3bfe32a3c5c`
+Report identity: `sha256:afe24d28fc0f9b066c55722d32e58204b9e8ff5543240f78c911fef96c5db654`
 
 This is a structural source report for candidate `1.1.0-rc.0`
 against `v1.0.0`. It is not a package-install or runtime receipt.
@@ -19,8 +19,20 @@ Retained v1 names: `Model`, `ternary_matmul`.
 
 Added in v1.1:
 
+- `KroneckerConflictError`
+- `KroneckerContractError`
+- `KroneckerEvidenceBuilder`
+- `KroneckerEvidenceReceipt`
+- `KroneckerPublicationError`
+- `KroneckerResourceError`
+- `KroneckerSharedForwardGroup`
+- `KroneckerStateError`
+- `Qwen36KroneckerCaptureReceipt`
+- `Qwen36KroneckerCaptureSession`
+- `Qwen36KroneckerCaptureTask`
 - `QwenLoadReceipt`
 - `QwenModel`
+- `QwenReferenceLanguageOutput`
 - `autograd`
 - `compiled_backends`
 - `conv1d_forward`

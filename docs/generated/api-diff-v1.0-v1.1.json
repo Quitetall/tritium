@@ -3,8 +3,20 @@
   "candidate_version": "1.1.0-rc.0",
   "python": {
     "added": [
+      "KroneckerConflictError",
+      "KroneckerContractError",
+      "KroneckerEvidenceBuilder",
+      "KroneckerEvidenceReceipt",
+      "KroneckerPublicationError",
+      "KroneckerResourceError",
+      "KroneckerSharedForwardGroup",
+      "KroneckerStateError",
+      "Qwen36KroneckerCaptureReceipt",
+      "Qwen36KroneckerCaptureSession",
+      "Qwen36KroneckerCaptureTask",
       "QwenLoadReceipt",
       "QwenModel",
+      "QwenReferenceLanguageOutput",
       "autograd",
       "compiled_backends",
       "conv1d_forward",
@@ -28,7 +40,7 @@
       "ternary_matmul"
     ]
   },
-  "report_id": "sha256:afe79ffe88b120831301334ffb73e9f82003b01855043768ff38c3bfe32a3c5c",
+  "report_id": "sha256:afe24d28fc0f9b066c55722d32e58204b9e8ff5543240f78c911fef96c5db654",
   "rust": {
     "frozen_crates": [
       "tritium-core",
