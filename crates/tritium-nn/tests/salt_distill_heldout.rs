@@ -480,11 +480,27 @@ fn salt_distillation_device_trainer_recovers_heldout() {
     if data_seed != 0 {
         eprintln!("data-order seed: {data_seed} (window rotation)");
     }
+    // Sherry (annealed fp residual): TRITIUM_DISTILL_SHERRY=<alpha0> blends `alpha*master` into each
+    // reconstruction, cosine-annealed to 0 over the FIRST HALF of training so the model trains as pure
+    // ternary for the whole back half (and the final eval, which always quantizes hard, is honest).
+    // Off by default.
+    let sherry_start: Option<f32> = std::env::var("TRITIUM_DISTILL_SHERRY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|a: &f32| *a > 0.0 && *a <= 1.0);
+    let sherry_total = steps.div_ceil(2).max(1);
+    if let Some(a0) = sherry_start {
+        println!("sherry: fp-residual alpha {a0} → 0 (cosine) over the first {sherry_total} steps");
+    }
+
     let mut step_ms = 0.0f64;
     for step in 1..=steps {
         let t0 = Instant::now();
         if let Some(sched) = lr_sched.as_ref() {
             trainer.set_lr(sched.lr(step - 1)); // `step` is 1-based; the schedule is 0-based
+        }
+        if let Some(a0) = sherry_start {
+            trainer.set_sherry_alpha(ste::sherry_alpha(a0, step - 1, sherry_total));
         }
         let wi = ((step - 1) as usize + data_seed) % windows.len();
         let toks = windows[wi];

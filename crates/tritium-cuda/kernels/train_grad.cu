@@ -437,7 +437,8 @@ extern "C" __global__ void salt_quantize_forward(
     const float* __restrict__ master,       // [rows, cols]
     float* __restrict__ residual,           // [rows, cols] scratch
     float* __restrict__ quantized,          // [rows, cols]
-    int rows, int cols, int planes)
+    int rows, int cols, int planes,
+    float sherry_alpha)                     // 0 = pure ternary (the committed behaviour)
 {
     int row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= rows) return;
@@ -463,6 +464,17 @@ extern "C" __global__ void salt_quantize_forward(
             float contribution = scale * trit;
             quantized[idx] += contribution;
             residual[idx] -= contribution;
+        }
+    }
+
+    // Sherry (annealed fp residual): blend a decaying fraction of the untouched fp master back in,
+    // `(1-a)*Q + a*master`, mirroring tritium_train::ops::ste::salt_quantize_forward_sherry exactly
+    // (same single-rounding `q += a*(m-q)` form). Guarded so a==0 leaves `quantized` BIT-IDENTICAL to
+    // the pure-ternary path — including the -0.0 case, where `q + 0.0f*(...)` would flip the sign bit.
+    if (sherry_alpha != 0.0f) {
+        for (int col = 0; col < cols; ++col) {
+            long idx = base + col;
+            quantized[idx] += sherry_alpha * (master[idx] - quantized[idx]);
         }
     }
 }

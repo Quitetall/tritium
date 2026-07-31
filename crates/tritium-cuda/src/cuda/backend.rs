@@ -1728,6 +1728,36 @@ impl CudaBackend {
         cols: usize,
         planes: usize,
     ) -> Result<(), BackendError> {
+        // Pure ternary: alpha 0 leaves the reconstruction bit-identical to the pre-Sherry kernel.
+        self.salt_quantize_forward_sherry_dev(
+            d_master,
+            d_residual,
+            d_quantized,
+            rows,
+            cols,
+            planes,
+            0.0,
+        )
+    }
+
+    /// [`salt_quantize_forward_dev`](Self::salt_quantize_forward_dev) with the **Sherry** annealed fp
+    /// residual: the reconstruction is `(1-alpha)*Q + alpha*master`, so training can start near the
+    /// smooth fp landscape and anneal to pure ternary. `alpha == 0` is the plain path, bit-for-bit.
+    /// Mirrors `tritium_train::ops::ste::salt_quantize_forward_sherry`.
+    ///
+    /// # Errors
+    /// [`BackendError`] on a bad plane count, a shape overflow, an undersized buffer, or a launch failure.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn salt_quantize_forward_sherry_dev(
+        &self,
+        d_master: &CudaSlice<f32>,
+        d_residual: &mut CudaSlice<f32>,
+        d_quantized: &mut CudaSlice<f32>,
+        rows: usize,
+        cols: usize,
+        planes: usize,
+        sherry_alpha: f32,
+    ) -> Result<(), BackendError> {
         if !(1..=3).contains(&planes) {
             return Err(BackendError::InvalidInput(format!(
                 "SALT plane count must be in 1..=3, got {planes}"
@@ -1759,7 +1789,8 @@ impl CudaBackend {
             .arg(d_quantized)
             .arg(&rows_i)
             .arg(&cols_i)
-            .arg(&planes_i);
+            .arg(&planes_i)
+            .arg(&sherry_alpha);
         // SAFETY: kernel receives three buffers of at least rows*cols and one
         // thread per row; all dimensions fit its signed 32-bit ABI.
         #[allow(unsafe_code)]

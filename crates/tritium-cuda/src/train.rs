@@ -1375,6 +1375,8 @@ pub struct DeviceTrainer<'a> {
     loading: Option<ResidentLoadState>,
     /// Lever 5: when `Bf16`, each step confines the master to the bf16 grid with stochastic rounding.
     master_precision: MasterPrecision,
+    /// Sherry annealed fp residual mixed into each reconstruction; `0.0` = pure ternary.
+    sherry_alpha: f32,
 }
 
 impl core::fmt::Debug for DeviceTrainer<'_> {
@@ -1519,6 +1521,7 @@ impl<'a> DeviceTrainer<'a> {
             poisoned: false,
             loading: None,
             master_precision,
+            sherry_alpha: 0.0,
         })
     }
 
@@ -1649,17 +1652,26 @@ impl<'a> DeviceTrainer<'a> {
                     "dense quantized storage is disabled for this resident trainer".into(),
                 )
             })?;
-            self.backend.salt_quantize_forward_dev(
+            self.backend.salt_quantize_forward_sherry_dev(
                 &param.master.buf,
                 &mut self.residual,
                 &mut quantized.buf,
                 param.rows,
                 param.cols,
                 param.salt_planes,
+                self.sherry_alpha,
             )?;
         }
         self.quantized_prepared = true;
         Ok(())
+    }
+
+    /// Set the **Sherry** fp-residual mix used by the next [`prepare_quantized`](Self::prepare_quantized):
+    /// the student's weights become `(1-alpha)*Ŵ + alpha*master`. Drive it from
+    /// [`ste::sherry_alpha`](tritium_train::ops::ste::sherry_alpha) so it cosine-anneals to 0, leaving a
+    /// purely ternary model. `0.0` (the default) is the plain ternary path, bit-for-bit.
+    pub fn set_sherry_alpha(&mut self, alpha: f32) {
+        self.sherry_alpha = alpha;
     }
 
     /// Borrow a prepared quantized weight for zero-copy insertion into a tape.
@@ -6505,6 +6517,97 @@ mod tests {
     /// per-row f32 AbsMean oracle for every supported plane count. The
     /// 257-column case guards against accidentally switching this first
     /// resident path to the deployed per-256-block format from Track D.
+    /// Sherry on the device: `(1-a)*Q + a*master` must match the CPU oracle
+    /// `ste::salt_quantize_forward_sherry` for every alpha, and `a = 0` must be **bit-identical** to the
+    /// pure-ternary path (the guard in the kernel exists precisely so a==0 cannot perturb `-0.0`).
+    #[test]
+    fn resident_salt_quantize_sherry_matches_cpu() {
+        use tritium_train::ops::ste;
+
+        let backend = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!(
+                    "skipping resident_salt_quantize_sherry_matches_cpu: no CUDA device ({e})"
+                );
+                return;
+            }
+        };
+
+        for &(rows, cols) in &[(5usize, 7usize), (3, 257), (128, 576)] {
+            let mut master =
+                seeded_uniform(0x5EA1 ^ rows as u64 ^ cols as u64, rows * cols, -2.0, 2.0);
+            master[..cols].fill(0.0); // zero-scale row: the early-stop path must blend correctly too
+            let d_master = backend.dev_upload(&master).unwrap();
+            let mut d_residual = backend.dev_alloc_zeros(rows * cols).unwrap();
+            let mut d_quantized = backend.dev_alloc_zeros(rows * cols).unwrap();
+
+            for planes in 1..=3 {
+                // alpha = 0 must reproduce the plain kernel BIT-for-bit.
+                backend
+                    .salt_quantize_forward_dev(
+                        &d_master,
+                        &mut d_residual,
+                        &mut d_quantized,
+                        rows,
+                        cols,
+                        planes,
+                    )
+                    .unwrap();
+                let mut plain = vec![0.0f32; rows * cols];
+                backend.dev_download(&d_quantized, &mut plain).unwrap();
+                backend
+                    .salt_quantize_forward_sherry_dev(
+                        &d_master,
+                        &mut d_residual,
+                        &mut d_quantized,
+                        rows,
+                        cols,
+                        planes,
+                        0.0,
+                    )
+                    .unwrap();
+                let mut at_zero = vec![0.0f32; rows * cols];
+                backend.dev_download(&d_quantized, &mut at_zero).unwrap();
+                assert_eq!(
+                    at_zero, plain,
+                    "alpha=0 must be bit-identical to the pure-ternary kernel (rows={rows} cols={cols} planes={planes})"
+                );
+
+                for alpha in [0.25f32, 0.5, 1.0] {
+                    backend
+                        .salt_quantize_forward_sherry_dev(
+                            &d_master,
+                            &mut d_residual,
+                            &mut d_quantized,
+                            rows,
+                            cols,
+                            planes,
+                            alpha,
+                        )
+                        .unwrap();
+                    let mut got = vec![0.0f32; rows * cols];
+                    backend.dev_download(&d_quantized, &mut got).unwrap();
+                    let want =
+                        ste::salt_quantize_forward_sherry(&master, rows, cols, planes, alpha);
+                    let delta = max_abs_diff(&got, &want);
+                    assert!(
+                        delta < 1e-4,
+                        "sherry rows={rows} cols={cols} planes={planes} alpha={alpha}: max|delta|={delta:.3e}"
+                    );
+                    // alpha=1 is the fp master itself.
+                    if alpha == 1.0 {
+                        let d = max_abs_diff(&got, &master);
+                        assert!(
+                            d < 1e-4,
+                            "alpha=1 must return the fp master: max|delta|={d:.3e}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn resident_salt_quantize_matches_cpu() {
         use tritium_train::ops::ste;
