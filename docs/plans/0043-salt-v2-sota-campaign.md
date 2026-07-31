@@ -101,6 +101,89 @@ Individual results may retain their narrow labels. The public umbrella claim
 [ADR 0028](../adr/0028-salt-v2-additive-ternarization.md) is green and the
 claim is generated from the evidence ledger.
 
+## Amendment 1 — frontier-methods candidates and preflight gate (2026-07-30)
+
+Authorized by [ADR 0035](../adr/0035-frontier-methods-integration.md) (executing
+[ADR 0034](../adr/0034-next-gen-ternary-research.md)); implementation in
+[plan 0054](./0054-frontier-methods-integration.md). This amendment lands before any
+rung-2 scoring run. **It changes no frozen threshold, no successive-halving
+protocol, no token cap, no PTQ/refined separation rule, and no spend policy.** Any
+change to those requires a new preregistration.
+
+### A1.1 Stage-7 grid additions
+
+The `solver ablation` axis gains two values:
+
+```text
+solver ablation:  greedy, joint, joint+feedback, joint+feedback+output recon,
+                  +softened-relay-basin, +modulated-basin
+```
+
+- `+softened-relay-basin`: the joint solve seeded by a continuous two-sided-tanh
+  relay fit (annealed sharpness, s0 = 30), projected through the unchanged exact
+  E/M solver (accept-only-if-improves guard applies).
+- `+modulated-basin`: the relay basin with basin-internal learnable modulation
+  (delta-mu, delta-alpha, delta-Delta). Nothing is stored: the projected result is
+  plain trits plus non-negative fp16 scales; the ADR 0028 zero-point ban is
+  respected by construction.
+
+The refined-track soft-phase mechanism becomes an A/B within the existing
+refinement selection (no new track): `ste-soft` (current) vs `hestia-relaxation`
+(temperature-controlled softmax relaxation over the ternary states, per-tensor
+temperature scheduled from the S2KF curvature evidence; temperature reaches its
+floor at or before the frozen 80% Hard boundary; the Hard phase and hard-export
+contract are unchanged).
+
+The `curvature` axis is unchanged. Shared-forward capture (plan 0054 WS-A) changes
+capture cost only; its records are gated byte-identical to per-tensor records, so
+evidence identity is unaffected.
+
+Every added variant is a new `SaltV2Config` surface and must be folded into
+`recipe_digest`, and receives ablation rows in the frozen `BASELINES` tuple of both
+`scripts/run-baseline-ablation.py` and
+`scripts/verify-estimator-refinement-receipt.py` in lockstep.
+
+### A1.2 GDN-sensitivity preflight gate (new, before Stage 8)
+
+Inserted between the Stage-7 freeze gate and Stage 8. Protocol and threshold are
+frozen by this amendment **before any probe executes**:
+
+- Probe set: 4 Gated DeltaNet-block matrices and 4 full-attention-block matrices
+  from the pinned checkpoint (exact tensor names recorded in the probe receipt
+  schema at execution time from the pinned index; one q/k/v-class, one output-class,
+  one gate/up-class, one down-class per block family), each PTQ-ternarized at
+  matched bpw with the frozen recipe while every other tensor stays at source
+  precision.
+- Binding metric: divergence growth along the recurrence — the content-bound
+  Qwen3.5-family reference adapter rolls frozen calibration sequences and records
+  state/output divergence versus depth-in-sequence for probed versus control
+  blocks. Per-layer weight/output MSE is recorded but non-binding (recurrent-error
+  proxy failure, Ternary Mamba).
+- Threshold: a probed DeltaNet block fails the gate if its terminal-depth output
+  divergence exceeds 2x the matched full-attention probe median at the same bpw.
+- Routing rule: failing tensor classes carry refined-track evidence expectations;
+  the PTQ track records the negative honestly. Coverage policy (all 506 matrices)
+  is unchanged either way. Probe receipts land in the evidence directory; the
+  routing decision is recorded before any Stage-8 spend.
+
+### A1.3 Stage-8 baseline matrix addition
+
+The Ternary/additive baseline class gains a required row:
+
+| Class | Added baseline |
+|---|---|
+| Ternary/additive | Ternary Bonsai 27B (`prism-ml/Ternary-Bonsai-27B-gguf`, pinned digest), evaluated as shipped under its documented runtime (PrismML llama.cpp fork), actual artifact bytes, same frozen evaluation harness |
+
+Reproduced-baseline rules apply verbatim (local artifact, local eval outputs,
+runtime captured). Vendor-published numbers remain context only.
+
+### A1.4 Reporting schema addition (score@budget)
+
+Thinking-mode evaluations additionally report, per task: accuracy, cap rate
+(fraction of samples terminated by token budget), and the stated token budget.
+Task thresholds and the six-task aggregate definition are unchanged; the new fields
+are report-side only.
+
 ## Outcome
 
 Build and evaluate a zero-point-free SALT V2 converter and native inference

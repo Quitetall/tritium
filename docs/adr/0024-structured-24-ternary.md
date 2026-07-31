@@ -78,3 +78,32 @@ produces 42% zeros; the question is only their PLACEMENT.
 - If accepted end-to-end, ternary's "sparsity advantage" claim becomes
   concrete: structured placement, tensor-core execution, smaller packing —
   all from zeros the training already produces.
+
+## Amendment 1 — target ratio re-specified to 6:8 via SlideSparse (2026-07-30)
+
+Authorized by [ADR 0035](./0035-frontier-methods-integration.md), from the
+[ADR 0034](./0034-next-gen-ternary-research.md) research intake (verified 3-0):
+
+- **SlideSparse** (MSR BitNet group, ICML 2026, arXiv 2603.05232) shows strict 2:4
+  (50% pruning) collapses BF16 Qwen3 reasoning (54% → 15% under identical
+  fine-tuning; 6:8 retains 51.6%), and its companion Sparse-BitNet (arXiv
+  2603.05168) shows ternary tolerates 2:4 better (+5.7% vs +18.8% degradation)
+  but still degrades — the BitNet team themselves chose 6:8 over 2:4 for sparse
+  training.
+- SlideSparse's Sliding Window Decomposition **losslessly** re-expresses any
+  (2N−2):2N block as N−1 overlapping 2:4-compliant windows, so **6:8 (25%
+  pruning) executes on existing NVIDIA sparse tensor cores** — measured 1.33×
+  end-to-end at 6:8 (A100 INT8), 1.18–1.19× on RTX 4090 FP8.
+- This ADR's own 4-group census supports the milder ratio: only 12.9% of
+  BitNet-2B4T's 4-groups have zero zeros, i.e. the checkpoint is far closer to
+  6:8-compliant (25% pruning) than to 2:4 (50%).
+
+**Amended decision:** the target sparsity specification becomes **6:8, executed via
+SlideSparse-style sliding-window decomposition on 2:4 sparse tensor cores**. The
+plan-0039 trainer hook targets 6:8 masks (3 non-zeros per 6:8 block equivalent —
+concretely: at most 6 non-zeros per 8-group, enforced groupwise in the
+quantize-forward mask). Everything else stands verbatim: **no kernel work before a
+sparsity-trained checkpoint exists**, no format fork, census-auditable compliance,
+and the same honest gate (one student run with the mask vs without). The expected
+speedup bound changes from 2× (2:4 mma.sp) to the SlideSparse N/(N−1) = 4/3 bound
+at 6:8; the quality risk drops correspondingly.

@@ -75,3 +75,29 @@ Why this shape wins here:
   beside the 1.2 GB target with room to spare.
 - The drafter inherits every engine improvement automatically (f16 KV,
   future rungs, kernel work).
+
+## Amendment 1 — training objective and novelty reframe (2026-07-30)
+
+Authorized by [ADR 0035](./0035-frontier-methods-integration.md), from the
+[ADR 0034](./0034-next-gen-ternary-research.md) research intake:
+
+- **Novelty reframe.** Fermion Neutrino-1 (2026-07-27) shipped a natively-trained
+  ternary 8B with a 0.6B certified ternary drafter (single-path argmax-match
+  acceptance, bit-exact drafted decode). "First ternary drafter of a ternary
+  target" is therefore taken. Tritium's remaining defensible claim is
+  **tree-verified ternary spec-decode**: BASTION-style budget-controlled tree
+  verification (ADR 0014, live) driven by a ternary drafter — plus the
+  theory-grounded objective below, which single-path argmax drafters do not use.
+- **Training objective (for the BLUT run).** Acceptance theory (arXiv 2606.30265)
+  gives exact KL certificates: greedy acceptance is guaranteed when
+  `KL(p||q) ≤ ε` and the target margin satisfies `γ_p > √(2ε)`; tree branching
+  with m candidates reduces the required margin to `√(4ε/(m+1))`. The drafter
+  objective becomes **per-position forward KL to the target, weighted by measured
+  target margins** (low-margin positions need proportionally lower draft KL —
+  weight them harder), rather than uniform distillation loss. Record measured
+  margin distributions from the target on the training corpus as part of the
+  recipe.
+
+Everything else in this ADR stands: architecture (~100–200M ternary AR model,
+LLaMA-3 tokenizer, same engine, second `ModelRunner`), serving plumbing, and the
+BLUT ownership of the training run.
