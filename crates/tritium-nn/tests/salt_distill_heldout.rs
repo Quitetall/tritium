@@ -468,13 +468,22 @@ fn salt_distillation_device_trainer_recovers_heldout() {
         );
     }
 
+    // TRITIUM_DISTILL_SEED rotates the training-window order (data-order seed) — the
+    // stochasticity axis for paper error bars. Default 0 reproduces the committed runs.
+    let data_seed: usize = std::env::var("TRITIUM_DISTILL_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    if data_seed != 0 {
+        eprintln!("data-order seed: {data_seed} (window rotation)");
+    }
     let mut step_ms = 0.0f64;
     for step in 1..=steps {
         let t0 = Instant::now();
         if let Some(sched) = lr_sched.as_ref() {
             trainer.set_lr(sched.lr(step - 1)); // `step` is 1-based; the schedule is 0-based
         }
-        let wi = ((step - 1) as usize) % windows.len();
+        let wi = ((step - 1) as usize + data_seed) % windows.len();
         let toks = windows[wi];
         let tokens_i32: Vec<i32> = toks.iter().map(|&t| t as i32).collect();
 
