@@ -57,7 +57,7 @@ fn rtn4(w: &[f32], rows: usize, cols: usize) -> Vec<f32> {
             let lo = gs.iter().copied().fold(f32::INFINITY, f32::min);
             let hi = gs.iter().copied().fold(f32::NEG_INFINITY, f32::max);
             let s = (hi - lo) / levels;
-            if !(s > 0.0) {
+            if s <= 0.0 || s.is_nan() {
                 gd.fill(lo);
                 continue;
             }
@@ -84,7 +84,10 @@ fn salt_full_stack_quality() {
     let eval = eval_ids();
     let ppl_fp = perplexity_windowed(&fp, &arch, &eval, EVAL_WINDOW);
     println!("fp reference {ppl_fp:.3} ppl\n");
-    println!("{:<40} {:>8} {:>14} {:>11}", "configuration", "bpw", "ppl", "× fp");
+    println!(
+        "{:<40} {:>8} {:>14} {:>11}",
+        "configuration", "bpw", "ppl", "× fp"
+    );
     println!("{}", "-".repeat(78));
 
     let rtn: Vec<Vec<f32>> = fp
@@ -95,7 +98,10 @@ fn salt_full_stack_quality() {
     let p = perplexity_windowed(&rtn, &arch, &eval, EVAL_WINDOW);
     println!(
         "{:<40} {:>8.2} {:>14.3} {:>10.2}×   (needs multipliers)",
-        "RTN int4 g128 [reference]", 4.25, p, p / ppl_fp
+        "RTN int4 g128 [reference]",
+        4.25,
+        p,
+        p / ppl_fp
     );
 
     for t in 1..=3usize {

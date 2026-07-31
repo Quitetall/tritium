@@ -3047,13 +3047,13 @@ impl CudaBackend {
             return Ok(());
         }
         let groups = rows * cols.div_ceil(group);
-        if let Some(mask) = d_rotate {
-            if mask.len() < groups {
-                return Err(BackendError::ShapeMismatch {
-                    expected: groups,
-                    got: mask.len(),
-                });
-            }
+        if let Some(mask) = d_rotate
+            && mask.len() < groups
+        {
+            return Err(BackendError::ShapeMismatch {
+                expected: groups,
+                got: mask.len(),
+            });
         }
         let rows_i = i32::try_from(rows)
             .map_err(|_| BackendError::InvalidInput("SALT rows exceed i32::MAX".into()))?;

@@ -69,7 +69,10 @@ fn itf_ptq_beats_greedy_ptq_on_held_out_perplexity() {
     let eval = eval_ids();
 
     let ppl_fp = perplexity_windowed(&fp, &arch, &eval, EVAL_WINDOW);
-    println!("fp reference: {ppl_fp:.3} ppl over {} held-out tokens", eval.len());
+    println!(
+        "fp reference: {ppl_fp:.3} ppl over {} held-out tokens",
+        eval.len()
+    );
 
     // Same weights, same bits, same plane count — only the per-plane fitter differs.
     for t in 1..=3 {
