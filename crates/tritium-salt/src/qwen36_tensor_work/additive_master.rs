@@ -2,14 +2,18 @@
 
 mod selected_allocation;
 
+// Admission/execution symbols are unix-only (see selected_allocation).
+#[cfg(unix)]
 pub use selected_allocation::{
-    Qwen36AdmittedExecutionReceipt, Qwen36AdmittedExecutionSession, Qwen36AllocatedCampaignStore,
-    Qwen36ExecutionBackend, Qwen36ExecutionReplayError, Qwen36ExecutionSessionOpenError,
-    Qwen36ExecutionVisitError, Qwen36FinalLogitsOutputBindingError,
-    Qwen36FinalLogitsOutputBindingReceipt, Qwen36PackageAdmissionError,
-    Qwen36PackageAdmissionReceipt, Qwen36PackageAdmittedCampaignStore, Qwen36PackageProfileReceipt,
-    Qwen36PackageRuntimeLedger, Qwen36PackageScaleOnlyCampaignStore, Qwen36PackageVisitError,
-    Qwen36PhysicalAllocationError, Qwen36SelectedAllocationBindError,
+    Qwen36AdmittedExecutionReceipt, Qwen36AdmittedExecutionSession, Qwen36ExecutionBackend,
+    Qwen36ExecutionReplayError, Qwen36ExecutionSessionOpenError, Qwen36ExecutionVisitError,
+    Qwen36FinalLogitsOutputBindingError, Qwen36FinalLogitsOutputBindingReceipt,
+    Qwen36PackageAdmissionError, Qwen36PackageAdmissionReceipt, Qwen36PackageAdmittedCampaignStore,
+    Qwen36PackageProfileReceipt, Qwen36PackageRuntimeLedger, Qwen36PackageScaleOnlyCampaignStore,
+    Qwen36PackageVisitError,
+};
+pub use selected_allocation::{
+    Qwen36AllocatedCampaignStore, Qwen36PhysicalAllocationError, Qwen36SelectedAllocationBindError,
     Qwen36SelectedAllocationReceipt, Qwen36SelectedAllocationSpec, Qwen36SelectedProfileReceipt,
 };
 

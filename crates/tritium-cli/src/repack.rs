@@ -329,7 +329,7 @@ mod tests {
     #[test]
     fn repacked_tq1_model_loads_bit_identical() {
         if !Path::new(&*GGUF).exists() {
-            eprintln!("skipping: {} absent (gated real-model test)", &*GGUF);
+            eprintln!("skipping: {} absent (gated real-model test)", *GGUF);
             return;
         }
         let dir = std::env::temp_dir().join("tritium-repack-model-test");

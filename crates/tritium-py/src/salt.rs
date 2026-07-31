@@ -15,10 +15,12 @@ use pyo3::{
 };
 use tritium_format::{PackageHasher, salt_v2::SaltV2Codec, salt_v2_package::SaltV2PackageReader};
 use tritium_quantize::{PhysicalBytes, SaltV2Config, SaltV2Curvature, SaltV2Packing};
+#[cfg(unix)]
+use tritium_salt::Qwen36PtqPackagesReceipt;
 use tritium_salt::{
     ContentId, Qwen36AdmittedSource, Qwen36CompleteWorkspaceReceipt,
     Qwen36PreservedSafetensorsReceipt, Qwen36PtqEvidenceDirectory, Qwen36PtqPackageLimits,
-    Qwen36PtqPackagesReceipt, Qwen36TensorWorkStore,
+    Qwen36TensorWorkStore,
 };
 
 use crate::hf_assets::{HfAssetReceipt, stage_language_assets, verify_language_asset};
@@ -186,6 +188,7 @@ pub(crate) struct Qwen36PtqPackageReceipt {
 }
 
 impl Qwen36PtqPackageReceipt {
+    #[cfg(unix)]
     fn from_native(
         artifact_dir: &Path,
         receipt: &Qwen36PtqPackagesReceipt,
@@ -470,6 +473,7 @@ pub(crate) fn reconcile_qwen36_ptq_masters(
 }
 
 /// Reconcile and atomically publish both exact Qwen3.6 matrix-package profiles.
+#[cfg(unix)]
 #[pyfunction]
 #[pyo3(signature = (
     model_dir,

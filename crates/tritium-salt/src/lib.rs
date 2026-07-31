@@ -4,6 +4,11 @@
 //! implement fitting, evaluation, packing, or publication. Those operations are
 //! supplied through a driver boundary and produce content-addressed evidence.
 
+// The Qwen3.6 admission/execution stack builds on unix-only staging primitives
+// and is cfg(unix)-gated; the internals that exist to serve it still compile on
+// other platforms but are unreferenced there.
+#![cfg_attr(not(unix), allow(dead_code, unused_imports))]
+
 use std::{
     fmt, fs,
     io::{self, Read},
@@ -32,26 +37,31 @@ pub use qwen36_source_admission::{
     Qwen36AdmissionError, Qwen36AdmissionReceipt, Qwen36AdmittedSource, Qwen36LanguageCoverage,
     Qwen36SourceProof, Qwen36SourceProofError,
 };
+// Admission/execution symbols are unix-only (see qwen36_tensor_work).
 pub use qwen36_tensor_work::{
     Qwen36AdditiveCampaignSpec, Qwen36AdditiveCampaignStore, Qwen36AdditiveInstallError,
     Qwen36AdditiveMasterReceipt, Qwen36AdditiveSlotState, Qwen36AdditiveWorkSlot,
-    Qwen36AdmittedExecutionReceipt, Qwen36AdmittedExecutionSession, Qwen36AllocatedCampaignStore,
-    Qwen36CompleteWorkspaceReceipt, Qwen36ExecutionBackend, Qwen36ExecutionReplayError,
-    Qwen36ExecutionSessionOpenError, Qwen36ExecutionVisitError,
-    Qwen36FinalLogitsOutputBindingError, Qwen36FinalLogitsOutputBindingReceipt,
-    Qwen36LanguageMtpWorkspaceReceipt, Qwen36PackageAdmissionError, Qwen36PackageAdmissionReceipt,
-    Qwen36PackageAdmittedCampaignStore, Qwen36PackageProfileReceipt, Qwen36PackageRuntimeLedger,
-    Qwen36PackageScaleOnlyCampaignStore, Qwen36PackageVisitError, Qwen36PhysicalAllocationError,
+    Qwen36AllocatedCampaignStore, Qwen36CompleteWorkspaceReceipt,
+    Qwen36LanguageMtpWorkspaceReceipt, Qwen36PhysicalAllocationError,
     Qwen36PreservedSafetensorsError, Qwen36PreservedSafetensorsReceipt,
     Qwen36PreservedTensorDescriptor, Qwen36PreservedVisitError, Qwen36PtqDriverError,
     Qwen36PtqEvidenceCaptureError, Qwen36PtqEvidenceCaptureReceipt,
     Qwen36PtqEvidenceCaptureRequest, Qwen36PtqEvidenceCaptureSession, Qwen36PtqEvidenceCaptureTask,
-    Qwen36PtqEvidenceDirectory, Qwen36PtqPackageError, Qwen36PtqPackageLimits,
-    Qwen36PtqPackagesReceipt, Qwen36ScaleOnlyCampaignStore, Qwen36SelectedAllocationBindError,
-    Qwen36SelectedAllocationReceipt, Qwen36SelectedAllocationSpec, Qwen36SelectedProfileReceipt,
-    Qwen36TensorWorkError, Qwen36TensorWorkStore, Qwen36TensorWorkSummary,
-    SharedForwardCaptureGroup, SharedForwardPlanError, SharedForwardTensor,
-    collect_qwen36_ptq_evidence, plan_shared_forward_groups, reconcile_qwen36_ptq,
+    Qwen36PtqEvidenceDirectory, Qwen36PtqPackageLimits, Qwen36ScaleOnlyCampaignStore,
+    Qwen36SelectedAllocationBindError, Qwen36SelectedAllocationReceipt,
+    Qwen36SelectedAllocationSpec, Qwen36SelectedProfileReceipt, Qwen36TensorWorkError,
+    Qwen36TensorWorkStore, Qwen36TensorWorkSummary, SharedForwardCaptureGroup,
+    SharedForwardPlanError, SharedForwardTensor, collect_qwen36_ptq_evidence,
+    plan_shared_forward_groups, reconcile_qwen36_ptq,
+};
+#[cfg(unix)]
+pub use qwen36_tensor_work::{
+    Qwen36AdmittedExecutionReceipt, Qwen36AdmittedExecutionSession, Qwen36ExecutionBackend,
+    Qwen36ExecutionReplayError, Qwen36ExecutionSessionOpenError, Qwen36ExecutionVisitError,
+    Qwen36FinalLogitsOutputBindingError, Qwen36FinalLogitsOutputBindingReceipt,
+    Qwen36PackageAdmissionError, Qwen36PackageAdmissionReceipt, Qwen36PackageAdmittedCampaignStore,
+    Qwen36PackageProfileReceipt, Qwen36PackageRuntimeLedger, Qwen36PackageScaleOnlyCampaignStore,
+    Qwen36PackageVisitError, Qwen36PtqPackageError, Qwen36PtqPackagesReceipt,
     reconcile_qwen36_ptq_packages,
 };
 pub use tensor_work_store::{

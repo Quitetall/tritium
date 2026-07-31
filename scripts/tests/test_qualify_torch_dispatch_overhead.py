@@ -22,6 +22,15 @@ MODULE = runpy.run_path(
 )
 assemble = MODULE["assemble"]
 publish_directory_noreplace = MODULE["publish_directory_noreplace"]
+# The runner imports torch at module scope; CI's script lane is stdlib-only
+# (plus nbformat), so this suite is skipped there and runs wherever torch
+# exists — the same environment-gating every other hardware/dep-gated test
+# uses. unittest.SkipTest at import time skips the whole module.
+try:
+    import torch as _torch  # noqa: F401
+except ModuleNotFoundError as _err:
+    raise unittest.SkipTest("torch unavailable: " + str(_err)) from _err
+
 RUNNER = runpy.run_path(
     ROOT
     / "crates"

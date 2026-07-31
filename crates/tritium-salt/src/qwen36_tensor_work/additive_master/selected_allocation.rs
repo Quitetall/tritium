@@ -1,7 +1,11 @@
 //! Parent-bound CompactV1/NearLosslessV1 allocation selection.
 
+// The admission/execution stack builds on unix-only staging primitives
+// (create_temporary_file, PackedMapCursor et al.); gate the module with them.
+#[cfg(unix)]
 mod package_admission;
 
+#[cfg(unix)]
 pub use package_admission::{
     Qwen36AdmittedExecutionReceipt, Qwen36AdmittedExecutionSession, Qwen36ExecutionBackend,
     Qwen36ExecutionReplayError, Qwen36ExecutionSessionOpenError, Qwen36ExecutionVisitError,
@@ -1010,7 +1014,7 @@ impl<'store, 'source> Qwen36AdditiveCampaignStore<'store, 'source> {
         #[cfg(not(unix))]
         {
             let _ = (expected, parent_completion);
-            return Err(Qwen36TensorWorkError::AdditiveCampaignUnsupportedPlatform);
+            Err(Qwen36TensorWorkError::AdditiveCampaignUnsupportedPlatform)
         }
         #[cfg(unix)]
         {

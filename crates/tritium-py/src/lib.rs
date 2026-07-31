@@ -382,6 +382,7 @@ fn _tritium(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<salt::Qwen36PtqMasterReceipt>()?;
     m.add_class::<salt::Qwen36PtqPackageReceipt>()?;
     m.add_function(wrap_pyfunction!(salt::reconcile_qwen36_ptq_masters, m)?)?;
+    #[cfg(unix)]
     m.add_function(wrap_pyfunction!(salt::reconcile_qwen36_ptq_packages, m)?)?;
     m.add_function(wrap_pyfunction!(salt::verify_salt_v2_package, m)?)?;
     m.add_function(wrap_pyfunction!(salt::verify_preserved_safetensors, m)?)?;

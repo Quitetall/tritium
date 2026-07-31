@@ -31,11 +31,12 @@ use tritium_quantize::{
 
 use crate::{
     Qwen36AdditiveCampaignSpec, Qwen36AdditiveInstallError, Qwen36AdmittedSource,
-    Qwen36CampaignPreflightError, Qwen36CompleteWorkspaceReceipt, Qwen36PackageAdmissionError,
-    Qwen36PackageAdmissionReceipt, Qwen36PackageVisitError, Qwen36PhysicalAllocationError,
+    Qwen36CampaignPreflightError, Qwen36CompleteWorkspaceReceipt, Qwen36PhysicalAllocationError,
     Qwen36SelectedAllocationSpec, Qwen36TensorWorkError,
     tensor_work_store::{absolute_path, create_temporary_file, ensure_durable_directory},
 };
+#[cfg(unix)]
+use crate::{Qwen36PackageAdmissionError, Qwen36PackageAdmissionReceipt, Qwen36PackageVisitError};
 
 use super::{Qwen36AdditiveWorkSlot, Qwen36TensorWorkStore, same_file_identity};
 
@@ -1000,6 +1001,7 @@ impl Qwen36PtqPackageLimits {
     }
 }
 
+#[cfg(unix)]
 /// Owned proof that fitting, exact allocation, admission, and export completed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Qwen36PtqPackagesReceipt {
@@ -1007,6 +1009,7 @@ pub struct Qwen36PtqPackagesReceipt {
     admission: Qwen36PackageAdmissionReceipt,
 }
 
+#[cfg(unix)]
 impl Qwen36PtqPackagesReceipt {
     /// Complete verified rate-free language-plus-MTP master campaign.
     #[must_use]
@@ -1021,6 +1024,7 @@ impl Qwen36PtqPackagesReceipt {
     }
 }
 
+#[cfg(unix)]
 /// Failure while reconciling and exporting exact Qwen3.6 PTQ packages.
 #[derive(Debug)]
 #[non_exhaustive]
@@ -1042,6 +1046,7 @@ pub enum Qwen36PtqPackageError {
     },
 }
 
+#[cfg(unix)]
 impl fmt::Display for Qwen36PtqPackageError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1062,6 +1067,7 @@ impl fmt::Display for Qwen36PtqPackageError {
     }
 }
 
+#[cfg(unix)]
 impl std::error::Error for Qwen36PtqPackageError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
@@ -1073,18 +1079,21 @@ impl std::error::Error for Qwen36PtqPackageError {
     }
 }
 
+#[cfg(unix)]
 impl From<Qwen36PtqDriverError> for Qwen36PtqPackageError {
     fn from(error: Qwen36PtqDriverError) -> Self {
         Self::Driver(error)
     }
 }
 
+#[cfg(unix)]
 impl From<Qwen36PhysicalAllocationError> for Qwen36PtqPackageError {
     fn from(error: Qwen36PhysicalAllocationError) -> Self {
         Self::Physical(error)
     }
 }
 
+#[cfg(unix)]
 impl From<Qwen36PackageAdmissionError> for Qwen36PtqPackageError {
     fn from(error: Qwen36PackageAdmissionError) -> Self {
         Self::Admission(error)
@@ -1111,6 +1120,7 @@ pub fn reconcile_qwen36_ptq(
     with_reconciled_qwen36_ptq_campaign(admitted, evidence, config, |_, receipt| Ok(receipt))
 }
 
+#[cfg(unix)]
 /// Reconcile masters, allocate two exact profiles, and export admitted packages.
 ///
 /// Both package outputs are visited from their verified content-addressed records
@@ -1290,6 +1300,7 @@ fn physical_allocation_recipe_id(
     *hasher.finalize().as_bytes()
 }
 
+#[cfg(unix)]
 fn export_admitted_package(
     admitted: &crate::Qwen36PackageAdmittedCampaignStore<'_, '_, '_, '_>,
     profile: SaltV2Profile,

@@ -7,25 +7,32 @@
 mod additive_master;
 mod ptq_driver;
 
+// Admission/execution symbols are unix-only (see additive_master).
 pub use additive_master::{
     Qwen36AdditiveCampaignSpec, Qwen36AdditiveCampaignStore, Qwen36AdditiveInstallError,
-    Qwen36AdditiveMasterReceipt, Qwen36AdmittedExecutionReceipt, Qwen36AdmittedExecutionSession,
-    Qwen36AllocatedCampaignStore, Qwen36CompleteWorkspaceReceipt, Qwen36ExecutionBackend,
+    Qwen36AdditiveMasterReceipt, Qwen36AllocatedCampaignStore, Qwen36CompleteWorkspaceReceipt,
+    Qwen36PhysicalAllocationError, Qwen36ScaleOnlyCampaignStore, Qwen36SelectedAllocationBindError,
+    Qwen36SelectedAllocationReceipt, Qwen36SelectedAllocationSpec, Qwen36SelectedProfileReceipt,
+};
+#[cfg(unix)]
+pub use additive_master::{
+    Qwen36AdmittedExecutionReceipt, Qwen36AdmittedExecutionSession, Qwen36ExecutionBackend,
     Qwen36ExecutionReplayError, Qwen36ExecutionSessionOpenError, Qwen36ExecutionVisitError,
     Qwen36FinalLogitsOutputBindingError, Qwen36FinalLogitsOutputBindingReceipt,
     Qwen36PackageAdmissionError, Qwen36PackageAdmissionReceipt, Qwen36PackageAdmittedCampaignStore,
     Qwen36PackageProfileReceipt, Qwen36PackageRuntimeLedger, Qwen36PackageScaleOnlyCampaignStore,
-    Qwen36PackageVisitError, Qwen36PhysicalAllocationError, Qwen36ScaleOnlyCampaignStore,
-    Qwen36SelectedAllocationBindError, Qwen36SelectedAllocationReceipt,
-    Qwen36SelectedAllocationSpec, Qwen36SelectedProfileReceipt,
+    Qwen36PackageVisitError,
 };
 pub use ptq_driver::{
     Qwen36PtqDriverError, Qwen36PtqEvidenceCaptureError, Qwen36PtqEvidenceCaptureReceipt,
     Qwen36PtqEvidenceCaptureRequest, Qwen36PtqEvidenceCaptureSession, Qwen36PtqEvidenceCaptureTask,
-    Qwen36PtqEvidenceDirectory, Qwen36PtqPackageError, Qwen36PtqPackageLimits,
-    Qwen36PtqPackagesReceipt, SharedForwardCaptureGroup, SharedForwardPlanError,
-    SharedForwardTensor, collect_qwen36_ptq_evidence, plan_shared_forward_groups,
-    reconcile_qwen36_ptq, reconcile_qwen36_ptq_packages,
+    Qwen36PtqEvidenceDirectory, Qwen36PtqPackageLimits, SharedForwardCaptureGroup,
+    SharedForwardPlanError, SharedForwardTensor, collect_qwen36_ptq_evidence,
+    plan_shared_forward_groups, reconcile_qwen36_ptq,
+};
+#[cfg(unix)]
+pub use ptq_driver::{
+    Qwen36PtqPackageError, Qwen36PtqPackagesReceipt, reconcile_qwen36_ptq_packages,
 };
 
 use core::{convert::Infallible, fmt, fmt::Write as _};
