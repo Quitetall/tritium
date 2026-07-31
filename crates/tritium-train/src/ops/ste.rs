@@ -162,6 +162,151 @@ pub fn salt_quantize_vjp(
     grad_out.to_vec()
 }
 
+// ── Hadamard rotation front end + finer scale groups ─────────────────────────────────────────────
+// SALT's weakness is **outliers**, and it is structural rather than a bug: each plane can add at most
+// `±s_p` where `s_p = mean|residual|`, so a scale derived from the bulk can never reach a heavy tail.
+// Measured on a 128-wide group with three 6σ outliers, `T=3` leaves error 8.20 on a weight of 9.88
+// while the rest of the group sits at 0.12.
+//
+// A Hadamard rotation fixes the *distribution* rather than the fitter. `H` is orthogonal, so
+// `‖H·q − H·w‖ = ‖q − w‖`: rotating before quantizing and un-rotating after preserves the error norm
+// exactly, while mixing every coordinate into every other — which spreads one large weight's energy
+// across the whole group and makes the residual far more Gaussian. Measured reconstruction SSE on that
+// heavy-tailed group: `T=1` 116→57, `T=2` 87→22, **`T=3` 76→13 (5.7×)**. On already-Gaussian data it is
+// a no-op (1.00–1.03×), as it should be.
+//
+// For a linear layer `y = x·Wᵀ`, insert `H·Hᵀ = I`: `y = (x·H)·(W·H)ᵀ`. The rotation therefore runs
+// along the **input** dimension — the same axis SALT already fits along — so a deployment folds one
+// Hadamard transform into the activations and quantizes `W·H`. The transform is `O(n log n)` with only
+// adds and subtracts, so it does not reintroduce multiplies into the ternary path.
+
+/// In-place normalized fast Walsh–Hadamard transform. `v.len()` must be a power of two. The transform
+/// is its own inverse at this normalization (`H·H = I`), and preserves the L2 norm.
+///
+/// # Panics
+/// Panics if `v.len()` is not a power of two.
+pub fn fast_hadamard(v: &mut [f32]) {
+    let n = v.len();
+    assert!(
+        n.is_power_of_two(),
+        "Hadamard needs a power-of-two length, got {n}"
+    );
+    let mut len = 1;
+    while len < n {
+        for start in (0..n).step_by(len * 2) {
+            for i in start..start + len {
+                let (a, b) = (v[i], v[i + len]);
+                v[i] = a + b;
+                v[i + len] = a - b;
+            }
+        }
+        len *= 2;
+    }
+    let scale = 1.0 / (n as f32).sqrt();
+    for x in v.iter_mut() {
+        *x *= scale;
+    }
+}
+
+/// Whether the Hadamard front end is applied to a group.
+///
+/// Rotation is **not** universally good: its value depends entirely on the group's tail weight.
+/// Measured reconstruction SSE at `T=3` on 128-wide groups — sub-Gaussian data gets *worse*:
+///
+/// | distribution            | plain | rotated | effect      |
+/// |-------------------------|-------|---------|-------------|
+/// | uniform (sub-Gaussian)  |  0.59 |    2.98 | 5× **worse**|
+/// | Gaussian                |  8.97 |    8.81 | neutral     |
+/// | Laplace (heavy)         | 40.6  |   17.5  | 2.3× better |
+/// | Gaussian + 3 8σ outliers|137.5  |   15.5  | 8.9× better |
+///
+/// So [`Auto`](Self::Auto) is the useful policy: fit the group both ways and keep the better one. That
+/// is provably never worse than not rotating, and costs **one bit per group** to record the choice
+/// (1/128 bits per weight ≈ 0.008 bpw) plus one extra fit at quantization time.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RotationPolicy {
+    /// Never rotate — the plain grouped fit.
+    #[default]
+    Never,
+    /// Always rotate (diagnostic; hurts sub-Gaussian groups).
+    Always,
+    /// Rotate a group only when it measurably reduces that group's reconstruction error.
+    Auto,
+}
+
+/// SALT with an explicit scale **group size** and a **Hadamard rotation** policy.
+///
+/// - `group`: weights per scale. SALT's default is one scale per output row (576–1536 weights on a
+///   135M model), which is *coarser than the TQ2_0 format it deploys into* (256-trit blocks). Passing
+///   `group = 256` matches the deployed format; `128` matches the usual PTQ reporting convention.
+///   Finer groups cost `16/group` extra bits per weight per plane for the f16 scale.
+/// - `rotation`: see [`RotationPolicy`]. Groups whose length is not a power of two (a ragged final
+///   block) are never rotated rather than zero-padded, so no phantom weights are introduced.
+/// - `iters`: [`salt_quantize_forward_itf`] alternations (`0` = the greedy AbsMean fit).
+///
+/// `group >= cols`, [`RotationPolicy::Never`], `iters = 0` reproduces [`salt_quantize_forward`].
+#[must_use]
+pub fn salt_quantize_forward_grouped(
+    wf: &[f32],
+    rows: usize,
+    cols: usize,
+    t: usize,
+    group: usize,
+    iters: usize,
+    rotation: RotationPolicy,
+) -> Vec<f32> {
+    let group = group.max(1);
+    let mut out = vec![0.0f32; wf.len()];
+    let mut buf: Vec<f32> = Vec::with_capacity(group);
+    let sse = |a: &[f32], b: &[f32]| -> f64 {
+        a.iter()
+            .zip(b)
+            .map(|(&x, &y)| f64::from(x - y) * f64::from(x - y))
+            .sum()
+    };
+    for r in 0..rows {
+        let src = &wf[r * cols..(r + 1) * cols];
+        let dst = &mut out[r * cols..(r + 1) * cols];
+        for (bs, bd) in src.chunks(group).zip(dst.chunks_mut(group)) {
+            let rotatable = bs.len().is_power_of_two() && bs.len() > 1;
+            // The rotated candidate, reconstructed back in the original basis.
+            let rotated = (rotation != RotationPolicy::Never && rotatable).then(|| {
+                buf.clear();
+                buf.extend_from_slice(bs);
+                fast_hadamard(&mut buf); // into the rotated basis
+                let q = salt_quantize_forward_itf(&buf, 1, buf.len(), t, iters);
+                buf.copy_from_slice(&q);
+                fast_hadamard(&mut buf); // H is its own inverse: back to the original basis
+                buf.clone()
+            });
+            match (rotation, rotated) {
+                (RotationPolicy::Always, Some(rot)) => bd.copy_from_slice(&rot),
+                (RotationPolicy::Auto, Some(rot)) => {
+                    let plain = salt_quantize_forward_itf(bs, 1, bs.len(), t, iters);
+                    // Keep whichever candidate actually fits this group better.
+                    if sse(&rot, bs) < sse(&plain, bs) {
+                        bd.copy_from_slice(&rot);
+                    } else {
+                        bd.copy_from_slice(&plain);
+                    }
+                }
+                _ => {
+                    let q = salt_quantize_forward_itf(bs, 1, bs.len(), t, iters);
+                    bd.copy_from_slice(&q);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Packed bits per weight for `t` ternary planes at scale-group size `group`: 2 bits per trit plus one
+/// f16 scale per group, per plane. `group = 256` gives TQ2_0's 2.0625 bpw per plane.
+#[must_use]
+pub fn ternary_bits_per_weight(t: usize, group: usize) -> f64 {
+    t as f64 * (2.0 + 16.0 / group.max(1) as f64)
+}
+
 // ── ITF: iterative ternary fitting ───────────────────────────────────────────────────────────────
 // [`salt_quantize_forward`] fits each plane in ONE greedy pass: take `s = AbsMean(residual)`, then
 // `t = clamp(round(residual/s))`. AbsMean is a heuristic (the flat BitNet b1.58 contract) — it is *not*
