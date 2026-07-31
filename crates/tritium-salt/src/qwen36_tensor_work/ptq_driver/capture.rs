@@ -835,7 +835,9 @@ const fn curvature_tag(curvature: SaltV2Curvature) -> u8 {
     }
 }
 
-#[cfg(test)]
+// Evidence capture asserts strict directory durability, which is unix-only by
+// design (sync_evidence_directory returns Unsupported elsewhere).
+#[cfg(all(test, unix))]
 mod tests {
     use std::{
         fs,

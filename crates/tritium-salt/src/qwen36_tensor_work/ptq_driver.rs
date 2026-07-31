@@ -1576,7 +1576,9 @@ impl std::error::Error for Qwen36PtqDriverError {
     }
 }
 
-#[cfg(test)]
+// Evidence installation asserts strict directory durability, which is
+// unix-only by design (preflight_evidence_directory_sync fails elsewhere).
+#[cfg(all(test, unix))]
 mod tests {
     use std::sync::{
         Arc, Barrier,
