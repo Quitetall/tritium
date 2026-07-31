@@ -1,5 +1,12 @@
 # Tritium
 
+[![CI](https://github.com/Quitetall/tritium/actions/workflows/ci.yml/badge.svg)](https://github.com/Quitetall/tritium/actions/workflows/ci.yml)
+[![Docs](https://github.com/Quitetall/tritium/actions/workflows/docs.yml/badge.svg)](https://github.com/Quitetall/tritium/actions/workflows/docs.yml)
+[![Sanitizers](https://github.com/Quitetall/tritium/actions/workflows/sanitizers.yml/badge.svg)](https://github.com/Quitetall/tritium/actions/workflows/sanitizers.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-2024-orange.svg)](Cargo.toml)
+[![Benchmarks](https://img.shields.io/badge/benchmarks-reproducible_ledger-informational.svg)](docs/BENCHMARKS.md)
+
 Tritium is Apache-2.0 infrastructure for converting dense neural networks into
 compact additive-ternary models, refining or training them with PyTorch, and
 executing their packed weights across native and portable runtimes.
