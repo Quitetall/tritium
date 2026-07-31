@@ -2112,6 +2112,10 @@ fn atomic_write(work_dir: &Path, bytes: &[u8]) -> Result<(), SaltError> {
         let _ = fs::remove_file(&temp_path);
         return Err(fs_error("replace pipeline state", error));
     }
+    // Directory sync is best-effort durability, like tensor_work_store's
+    // sync_directory: windows cannot open a directory handle via File::open,
+    // so the rename above is the strongest portable guarantee there.
+    #[cfg(unix)]
     fs::File::open(work_dir)
         .and_then(|directory| directory.sync_all())
         .map_err(|error| fs_error("sync pipeline state directory", error))?;
