@@ -93,26 +93,35 @@ for crate in "${ORDER[@]}"; do
     continue
   fi
   echo "=== publishing ${crate}@${VERSION} ==="
+  # The new-crate rate limit (burst of ~5, refill ~1 per 10 min) surfaces as a
+  # CDN 503, not a labeled 429 — so after one quick retry, every further
+  # failure waits out a refill interval. The cap only stops persistent
+  # failures that survive multiple full refill windows.
   attempt=0
   until out="$(cargo publish -p "${crate}" --no-verify 2>&1)"; do
-    echo "${out}" | tail -5
+    echo "${out}" | grep -E "^error|Caused by|response, got" | head -3
     attempt=$((attempt + 1))
     if echo "${out}" | grep -qi "already uploaded\|already exists"; then
       echo "${crate}: version already on the registry — continuing."
       break
     fi
-    if echo "${out}" | grep -qi "rate limit\|429\|too many"; then
-      echo "rate-limited: waiting 620s before retrying ${crate} (attempt ${attempt})..."
-      sleep 620
-      continue
-    fi
-    if [[ "${attempt}" -ge 5 ]]; then
+    if [[ "${attempt}" -ge 8 ]]; then
       echo "FAILED after ${attempt} attempts: ${crate} — stopping." >&2
       echo "Already-published crates stay live; re-run to resume from here." >&2
       exit 1
     fi
-    echo "retry ${attempt}: waiting 30s (index propagation)..."
-    sleep 30
+    # A CDN error page can mask an upload that actually landed — recheck.
+    if already_published "${crate}"; then
+      echo "${crate}: registry shows the version live despite the error — continuing."
+      break
+    fi
+    if [[ "${attempt}" -eq 1 ]]; then
+      echo "retry 1: waiting 30s..."
+      sleep 30
+    else
+      echo "retry ${attempt}: waiting 620s (new-crate rate-limit refill)..."
+      sleep 620
+    fi
   done
   [[ -n "${out:-}" ]] && echo "${out}" | tail -2
 done

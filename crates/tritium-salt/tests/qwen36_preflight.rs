@@ -69,10 +69,15 @@ fn real_revision_declared_checkpoint_earns_candidate_receipt() {
         preflight.source_manifest().model_id()
     );
 
-    let work_root = std::env::temp_dir().join(format!(
-        "tritium-qwen36-real-admission-{}",
-        std::process::id()
-    ));
+    // Canonicalize: macos temp_dir sits under the /var symlink and the store
+    // rejects symlinked ancestors.
+    let work_root = std::env::temp_dir()
+        .canonicalize()
+        .expect("canonicalize temp dir")
+        .join(format!(
+            "tritium-qwen36-real-admission-{}",
+            std::process::id()
+        ));
     let _ = std::fs::remove_dir_all(&work_root);
     let admitted =
         Qwen36AdmittedSource::admit(preflight, &work_root).expect("durable candidate admission");
