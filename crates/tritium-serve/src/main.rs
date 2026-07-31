@@ -510,6 +510,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Resolve when Ctrl-C (or SIGTERM on unix) arrives, flagging `draining` so
+/// in-flight SSE streams close cleanly and new requests get 503.
+async fn shutdown_signal(draining: Arc<AtomicBool>) {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let term = async {
+        if let Ok(mut s) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            s.recv().await;
+        }
+    };
+    #[cfg(not(unix))]
+    let term = std::future::pending::<()>();
+
+    tokio::select! {
+        () = ctrl_c => {}
+        () = term => {}
+    }
+    eprintln!("tritium-serve: draining...");
+    draining.store(true, Ordering::Relaxed);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -534,28 +558,4 @@ mod tests {
             ))
         );
     }
-}
-
-/// Resolve when Ctrl-C (or SIGTERM on unix) arrives, flagging `draining` so
-/// in-flight SSE streams close cleanly and new requests get 503.
-async fn shutdown_signal(draining: Arc<AtomicBool>) {
-    let ctrl_c = async {
-        let _ = tokio::signal::ctrl_c().await;
-    };
-    #[cfg(unix)]
-    let term = async {
-        if let Ok(mut s) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        {
-            s.recv().await;
-        }
-    };
-    #[cfg(not(unix))]
-    let term = std::future::pending::<()>();
-
-    tokio::select! {
-        () = ctrl_c => {}
-        () = term => {}
-    }
-    eprintln!("tritium-serve: draining...");
-    draining.store(true, Ordering::Relaxed);
 }

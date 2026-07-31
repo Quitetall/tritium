@@ -485,9 +485,9 @@ fn parse_device(device: &str) -> PyResult<(QwenDevice, String)> {
     }
     #[cfg(feature = "cuda")]
     if let Some(ordinal) = device.strip_prefix("cuda:") {
-        let ordinal = ordinal.parse::<usize>().map_err(|_| {
-            PyValueError::new_err("CUDA device must be `cuda` or `cuda:<ordinal>`")
-        })?;
+        let ordinal = ordinal
+            .parse::<usize>()
+            .map_err(|_| PyValueError::new_err("CUDA device must be `cuda` or `cuda:<ordinal>`"))?;
         return Ok((QwenDevice::Cuda(ordinal), format!("cuda:{ordinal}")));
     }
     #[cfg(feature = "cuda")]
