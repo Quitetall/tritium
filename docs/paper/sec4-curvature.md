@@ -32,7 +32,8 @@ $$
 M_{r,g} \;=\; f_r\, G_g \;+\; \lambda I ,
 $$
 
-with damping $\lambda \ge 0$. A tensor's complete curvature evidence is
+with damping $\lambda \ge 0$; $M_{r,g}$ is the matrix supplied to Section 3's
+fitter as its metric $H$. A tensor's complete curvature evidence is
 therefore its group-diagonal Gram blocks plus one $f_r$ per row — about
 2.11 MB for a $2048 \times 2048$ projection in the S2KF record format
 <!-- receipt: docs/receipts-ws-a1-cost-baseline-17b.json (artifact_bytes 50,732,380 / 24 tensors); format constants in crates/tritium-quantize/src/salt_v2_evidence.rs (GROUP_SIZE=128, GROUP_PAYLOAD_BYTES) -->

@@ -38,8 +38,9 @@ receipt path or a BENCHMARKS.md ledger entry.
       claims. (This is the paper's quiet thesis: the field's comparison
       hygiene problem is fixable mechanically.)
   C6. Systems: the native engine executing packed planes without dense
-      materialization — 4090: ~280-300 tok/s decode on 2B4T (~474 GiB/s
-      effective weight stream), 12.3K pp512 via bit-identical IMMA.
+      materialization — 4090: ~273-303 tok/s decode medians on 2B4T (~474 GiB/s
+      effective weight stream at the contended-day median), 12.3K pp512 via
+      bit-identical IMMA.
 
 ### 2. Method — SALT representation (from ADR 0001/0028)
 - Format: planes + non-negative f16 group scales; G128; D2/B3/S34 codecs;
@@ -93,6 +94,6 @@ receipt path or a BENCHMARKS.md ledger entry.
 1. [ ] Rerun Step-1 figure data with error bars (3 seeds) — the only new
        compute this paper needs (~GPU-hours, local).
 2. [ ] Quiet-box rerun of the llama.cpp comparison (owed in ledger anyway).
-3. [ ] T>2 planes on Step-1 corpus (cheap, strengthens C1+C4 link).
+3. [ ] P>2 planes on Step-1 corpus (cheap, strengthens C1+C4 link).
 4. [ ] Freeze paper-repo revision; regenerate all tables from it.
 5. [ ] Draft §2-5 from ADR 0001/0028 + code comments (no new results needed).

@@ -11,8 +11,8 @@ discipline of Section 1 has teeth.
 ## 5.1 Protocol
 
 The recovery loop is SALT-aware straight-through distillation (SALT-STE). The student holds fp32
-latent masters $W$ for every 2-D projection; each forward pass quantizes them through the $T$-plane
-residual ternarizer of Section 2, $\hat{W} = Q_T(W)$, and the backward pass applies the
+latent masters $W$ for every 2-D projection; each forward pass quantizes them through the $P$-plane
+residual ternarizer of Section 2, $\hat{W} = Q_P(W)$, and the backward pass applies the
 straight-through estimator [REF:bengio2013ste]: because the reconstruction tracks the latent, the
 gradient with respect to $\hat{W}$ is passed to $W$ unchanged,
 $\partial\mathcal{L}/\partial W := \partial\mathcal{L}/\partial\hat{W}$.
@@ -30,14 +30,14 @@ for these numbers). <!-- receipt: docs/adr/0029-training-throughput-tensor-cores
 The mechanism was gated bottom-up before any model-level claim: the atomic SALT-STE loop — one
 projection, one target, the toy layerwise distillation of the training-plan gate — recovers 92.6%
 of the PTQ-induced output error, establishing that the biased STE gradient learns through the
-$T$-plane quantizer at all. <!-- receipt: docs/plans/0038-salt-distillation.md:46 -->
+$P$-plane quantizer at all. <!-- receipt: docs/plans/0038-salt-distillation.md:46 -->
 
 Corpus discipline is the load-bearing part of the protocol. Early in-sample experiments (train and
 evaluate on the same tokens) measure memorization, not recovery; every number below is held-out.
 The corpus generator tokenizes WikiText-2-raw [REF:merity2016wikitext] with the student's own
 tokenizer and emits a train pool and an evaluation set drawn from the *disjoint test split* — a
-stronger separation than a tail split of one document. The runs below use a 500k-token train pool
-and a 4,096-token held-out set. <!-- receipt: tools/gen_corpus.py:96-102; docs/adr/0029-training-throughput-tensor-cores.md:165-167 -->
+stronger separation than a tail split of one document. The runs below draw on a 500k-token train
+pool, of which 480k tokens are consumed as training windows, and a 4,096-token held-out set. <!-- receipt: tools/gen_corpus.py:96-102; docs/adr/0029-training-throughput-tensor-cores.md:165-167 -->
 Held-out perplexity is scored in non-overlapping 512-token windows; the window bound exists because
 tape-based evaluation memory is quadratic in evaluated length, and the window was chosen so the
 committed regression-gate numbers are unchanged. <!-- receipt: crates/tritium-nn/tests/salt_distill_heldout.rs:30-36 -->
@@ -48,18 +48,19 @@ error-bar runs. <!-- receipt: crates/tritium-nn/tests/salt_distill_heldout.rs:44
 
 ## 5.2 The headline arc
 
-The student is SmolLM2-135M [REF:smollm2] at $T{=}2$ SALT planes. Direct PTQ at this scale is not
+The student is SmolLM2-135M [REF:smollm2] at $P{=}2$ SALT planes. Direct PTQ at this scale is not
 merely lossy but catastrophic: held-out perplexity rises from 23.827 (fp teacher) to $3.281\times
 10^6$ — a factor of roughly $1.4\times 10^5$, i.e. the quantized model retains essentially no
 predictive structure. <!-- receipt: docs/adr/0029-training-throughput-tensor-cores.md:168 -->
-Table 5.1 gives the recovery arc; we write recovery $R = \mathrm{ppl}_{\text{PTQ}} /
-\mathrm{ppl}_{\text{student}}$ and gap $G = \mathrm{ppl}_{\text{student}} /
-\mathrm{ppl}_{\text{fp}}$.
+Table 5.1 gives the recovery arc; we write recovery $\rho = \mathrm{ppl}_{\text{PTQ}} /
+\mathrm{ppl}_{\text{student}}$ and gap $\gamma = \mathrm{ppl}_{\text{student}} /
+\mathrm{ppl}_{\text{fp}}$ (the symbols $R$ and $G$ are already taken by the rate
+points of Section 2.5 and the group geometry).
 
-**Table 5.1 — WikiText-2 held-out perplexity, SmolLM2-135M, $T{=}2$.**
+**Table 5.1 — WikiText-2 held-out perplexity, SmolLM2-135M, $P{=}2$.**
 <!-- receipt: docs/adr/0029-training-throughput-tensor-cores.md:168-189 -->
 
-| configuration | held-out ppl | gap to fp $G$ | recovery vs PTQ $R$ |
+| configuration | held-out ppl | gap to fp $\gamma$ | recovery vs PTQ $\rho$ |
 |---|---|---|---|
 | fp teacher | 23.827 | 1× | — |
 | ternary PTQ | $3.281\times 10^6$ | $\sim 1.4\times 10^5$× | 1× |
@@ -108,7 +109,7 @@ exhausted. The honest consequence cuts both ways: we cannot claim the method con
 we equally cannot claim a "small-model ternary floor" exists at this scale — nothing in this data
 has plateaued. The recovery curves in this paper are token-limited measurements, not asymptotes,
 and we make no floor claim of either sign. Untested levers recorded for follow-up: a larger corpus
-slice (WikiText-103/C4), $T > 2$ planes, and larger students.
+slice (WikiText-103/C4), $P > 2$ planes, and larger students.
 <!-- receipt: docs/adr/0029-training-throughput-tensor-cores.md:190-192 -->
 
 ## 5.5 Negative results: the acceptance discipline binds

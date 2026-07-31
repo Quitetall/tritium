@@ -11,8 +11,8 @@ $$
 $$
 
 where $H$ is the identity, a non-negative diagonal, or a validated dense
-symmetric PSD matrix (the per-group K-FAC block of Section 4
-[REF:kfac]). <!-- receipt: crates/tritium-quantize/src/salt_v2.rs (fit_joint_ternary, JointFitMetric, DensePsdMetric) -->
+symmetric PSD matrix (the per-group K-FAC block that Section 4 constructs
+and writes $M_{r,g}$ [REF:kfac2015]). <!-- receipt: crates/tritium-quantize/src/salt_v2.rs (fit_joint_ternary, JointFitMetric, DensePsdMetric) -->
 This is a mixed-integer non-convex problem; we do not claim to solve it
 globally. What we do claim — and test — is that the assignment subproblem is
 solved exactly under separable metrics, that the scale subproblem is solved in
@@ -50,11 +50,11 @@ monotone even though it is no longer provably optimal.
 
 ## 3.2 M step: conditioned scale solve
 
-For fixed trits, collect the planes as $G = [T_1 \cdots T_P] \in
+For fixed trits, collect the planes as $A = [T_1 \cdots T_P] \in
 \{-1,0,+1\}^{d \times P}$. The scale subproblem is a $P$-dimensional convex
 quadratic solved through the weighted normal equations
 
-$$ (G^\top H G + \lambda I)\, s = G^\top H w, \qquad P \le 3 . $$
+$$ (A^\top H A + \lambda I)\, s = A^\top H w, \qquad P \le 3 . $$
 
 The accumulated normal matrix is symmetrized deterministically, its extremal
 eigenvalues are computed by classical (largest-off-diagonal-pivot) Jacobi
