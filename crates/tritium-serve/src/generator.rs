@@ -406,6 +406,8 @@ impl RunnerGenerator {
 /// `TRITIUM_DRAFT_CHAIN=0` disables the L1' chained device-side draft
 /// (per-step ladder instead) — the A/B baseline + kill switch, the
 /// TRITIUM_DRAFT_K pattern. Loud-reject on anything else.
+// Consumed only by the cuda-gated spec-decode generators.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 fn draft_chain_from_env() -> Result<bool, GenError> {
     match std::env::var("TRITIUM_DRAFT_CHAIN") {
         Err(std::env::VarError::NotPresent) => Ok(true),

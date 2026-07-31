@@ -18,7 +18,10 @@ use std::path::PathBuf;
 use common::{extract, forward, logits_of, perplexity_windowed};
 use tritium_nn::ModelRunner;
 use tritium_train::ops::ste;
-use tritium_train::{AdamW, LrSchedule, Optimizer, Tape};
+use tritium_train::{AdamW, Optimizer, Tape};
+// The LR schedule is consumed only by the cuda-gated resident-trainer path.
+#[cfg(feature = "cuda")]
+use tritium_train::LrSchedule;
 
 const T: usize = 2;
 const TRAIN_SEQ: usize = 32; // window length for the training corpus
@@ -524,21 +527,21 @@ fn salt_distillation_device_trainer_recovers_heldout() {
 
         // Checkpoint eval: download the resident masters (read-only copy — training state is
         // untouched), quantize, and score the disjoint held-out set. One point on the curve.
-        if let Some(k) = curve_every {
-            if step % k == 0 || step == steps {
-                let ckpt: Vec<Vec<f32>> = (0..fp.len())
-                    .map(|i| trainer.download_master(i).unwrap())
-                    .zip(&shapes)
-                    .map(|(wf, &(n, kk))| ste::salt_quantize_forward(&wf, n, kk, planes))
-                    .collect();
-                let ppl = perplexity_windowed(&ckpt, &a, &eval_ids, EVAL_WINDOW);
-                let tokens = step as usize * seq_len;
-                println!(
-                    "curve: {step},{tokens},{ppl:.3},{:.1},{:.3}",
-                    ppl_ptq / ppl,
-                    ppl / ppl_fp as f64
-                );
-            }
+        if let Some(k) = curve_every
+            && (step % k == 0 || step == steps)
+        {
+            let ckpt: Vec<Vec<f32>> = (0..fp.len())
+                .map(|i| trainer.download_master(i).unwrap())
+                .zip(&shapes)
+                .map(|(wf, &(n, kk))| ste::salt_quantize_forward(&wf, n, kk, planes))
+                .collect();
+            let ppl = perplexity_windowed(&ckpt, &a, &eval_ids, EVAL_WINDOW);
+            let tokens = step as usize * seq_len;
+            println!(
+                "curve: {step},{tokens},{ppl:.3},{:.1},{:.3}",
+                ppl_ptq / ppl,
+                ppl / ppl_fp
+            );
         }
     }
 
