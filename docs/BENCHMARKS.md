@@ -36,6 +36,34 @@ JSON is the artifact; the tables below are transcriptions of it.
 
 ## Ledger
 
+### 2026-07-30 — llama.cpp Q2_0 CUDA merged upstream (PR #25707, merged TODAY) — first same-box head-to-head
+
+The mainstream-ternary-CUDA gap closed this morning. Same box (RTX 4090, ~5.3 GB
+co-resident desktop load — CONTENDED, both engines equally), same day, ABBA
+interleaved. llama.cpp = upstream master 5f55650a7 (build 1212), fresh CUDA build.
+Tritium @ HEAD via the ledger decode command (256 steps, 16 warmup).
+
+| engine | model | weights | decode tok/s (spread) | eff. weight stream |
+|---|---|---|---:|---:|
+| Tritium CUDA | BitNet 2B4T ternary I2_S | 1.71 GiB | 264-281 (median ~277) | ~474 GiB/s |
+| llama.cpp CUDA (NEW Q2_0) | Qwen3.5-4B Q2_0 g64 | 1.42 GiB | 223-264 (mean-of-runs 248) | ~352 GiB/s |
+| llama.cpp CUDA (prior ledger line) | Qwen3.5-4B TQ2_0 | 1.35 GiB | 24.0 | ~32 GiB/s |
+
+Reading, honestly: llama.cpp's new Q2_0 CUDA path is REAL — a ~10x jump over its
+TQ2_0 line, landing within ~25-35% of Tritium's bandwidth-normalized decode
+efficiency on its first day. Tritium still leads (~474 vs ~352 GiB/s effective),
+but "only ternary CUDA engine" is retired as a claim as of 2026-07-30. Different
+models/architectures (2.4B BitNet vs 4B Qwen) — bandwidth normalization is the
+comparison basis; a same-model run (Bonsai Q2_0 vs its Tritium import via the new
+q2_0 reader) is the clean follow-up. pp512 for Q2_0: 12,199 +- 1,109 (llama.cpp
+MMQ-class; Tritium's ledger pp512 12,275 sustained — parity band).
+
+Repro: `llama-bench -m qwen35-4b-q2_0.gguf -p 512 -n 128 -ngl 99` (master
+5f55650a7); Tritium ledger command above. Contention disclosed; quiet-box rerun
+owed before any published table.
+
+
+
 <!-- Newest first. Each entry: date, git commit, environment line, table, JSON path/attachment. -->
 
 ### 2026-07-12 — IMMA prefill live (ADR 0026 Track P steps 1-4)
