@@ -29,7 +29,7 @@ fn gpu_serial() -> std::sync::MutexGuard<'static, ()> {
 fn adopt_copy_is_bit_exact() {
     let _gpu = gpu_serial();
     if !Path::new(&*GGUF_PATH).exists() {
-        eprintln!("skipping: {} absent (gated real-model test)", &*GGUF_PATH);
+        eprintln!("skipping: {} absent (gated real-model test)", *GGUF_PATH);
         return;
     }
     let bytes = std::fs::read(&*GGUF_PATH).expect("read");
@@ -71,7 +71,7 @@ fn adopt_copy_is_bit_exact() {
 fn failed_capture_does_not_poison_the_stream() {
     let _gpu = gpu_serial();
     if !Path::new(&*GGUF_PATH).exists() {
-        eprintln!("skipping: {} absent (gated real-model test)", &*GGUF_PATH);
+        eprintln!("skipping: {} absent (gated real-model test)", *GGUF_PATH);
         return;
     }
     let bytes = std::fs::read(&*GGUF_PATH).expect("read");

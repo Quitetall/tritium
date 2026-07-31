@@ -34,7 +34,7 @@ fn decodes_real_bitnet_i2s_tensor() {
     if !Path::new(&*GGUF_PATH).exists() {
         eprintln!(
             "skipping: {} not present (gated real-file test)",
-            &*GGUF_PATH
+            *GGUF_PATH
         );
         return;
     }

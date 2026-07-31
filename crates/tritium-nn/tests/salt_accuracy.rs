@@ -289,7 +289,7 @@ static GGUF_PATH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
 #[ignore = "loads the GGUF + one CPU forward; run explicitly"]
 fn gguf_eval_perplexity() {
     if !std::path::Path::new(&*GGUF_PATH).exists() {
-        eprintln!("skipping: {} absent", &*GGUF_PATH);
+        eprintln!("skipping: {} absent", *GGUF_PATH);
         return;
     }
     let ref_raw = match std::fs::read(reference_path()) {
@@ -342,7 +342,7 @@ fn salt_fp_vs_gguf_stage_dump() {
         return;
     }
     if !std::path::Path::new(&*GGUF_PATH).exists() {
-        eprintln!("skipping: {} absent", &*GGUF_PATH);
+        eprintln!("skipping: {} absent", *GGUF_PATH);
         return;
     }
     let cfg = config();

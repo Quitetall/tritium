@@ -84,7 +84,7 @@ async fn chat(router: &Router, prompt_ids: &str, max_tokens: usize) -> String {
 #[tokio::test(flavor = "multi_thread")]
 async fn cuda_batched_serve_matches_single_sequence_greedy() {
     if !Path::new(&*GGUF_PATH).exists() {
-        eprintln!("skipping: {} absent (gated real-model test)", &*GGUF_PATH);
+        eprintln!("skipping: {} absent (gated real-model test)", *GGUF_PATH);
         return;
     }
     let reference: serde_json::Value =
@@ -247,7 +247,7 @@ async fn tree_post(
 #[tokio::test(flavor = "multi_thread")]
 async fn cuda_batched_tree_session_coexists() {
     if !Path::new(&*GGUF_PATH).exists() {
-        eprintln!("skipping: {} absent (gated real-model test)", &*GGUF_PATH);
+        eprintln!("skipping: {} absent (gated real-model test)", *GGUF_PATH);
         return;
     }
     let reference: serde_json::Value =
@@ -467,7 +467,7 @@ async fn cuda_batched_tree_session_coexists() {
 #[tokio::test(flavor = "multi_thread")]
 async fn cuda_batched_paged_streams_equal_dense() {
     if !Path::new(&*GGUF_PATH).exists() {
-        eprintln!("skipping: {} absent (gated real-model test)", &*GGUF_PATH);
+        eprintln!("skipping: {} absent (gated real-model test)", *GGUF_PATH);
         return;
     }
     let reference: serde_json::Value =
@@ -613,7 +613,7 @@ fn spawn_stream(
 #[tokio::test(flavor = "multi_thread")]
 async fn cuda_batched_admission_interleaves_live_slot() {
     if !Path::new(&*GGUF_PATH).exists() {
-        eprintln!("skipping: {} absent (gated real-model test)", &*GGUF_PATH);
+        eprintln!("skipping: {} absent (gated real-model test)", *GGUF_PATH);
         return;
     }
     let reference: serde_json::Value =

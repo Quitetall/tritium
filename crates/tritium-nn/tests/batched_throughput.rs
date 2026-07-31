@@ -75,7 +75,7 @@ const NS: &[usize] = &[1, 2, 4, 8, 16, 32, 64];
 
 fn load_cuda() -> Option<ModelRunner> {
     if !Path::new(&*GGUF_PATH).exists() {
-        eprintln!("skipping: {} absent", &*GGUF_PATH);
+        eprintln!("skipping: {} absent", *GGUF_PATH);
         return None;
     }
     let bytes = std::fs::read(&*GGUF_PATH).ok()?;

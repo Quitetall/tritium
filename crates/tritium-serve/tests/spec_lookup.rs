@@ -65,7 +65,7 @@ fn collect(generator: &mut dyn Generator, req: &GenRequest) -> (Vec<u32>, std::t
 #[test]
 fn cuda_spec_sampled_topk1_matches_plain_greedy() {
     if !Path::new(&*GGUF_PATH).exists() {
-        eprintln!("skipping: {} absent (gated real-model test)", &*GGUF_PATH);
+        eprintln!("skipping: {} absent (gated real-model test)", *GGUF_PATH);
         return;
     }
     let reference: serde_json::Value =
@@ -127,7 +127,7 @@ fn cuda_spec_sampled_topk1_matches_plain_greedy() {
 #[test]
 fn cuda_spec_lookup_matches_plain_greedy() {
     if !Path::new(&*GGUF_PATH).exists() {
-        eprintln!("skipping: {} absent (gated real-model test)", &*GGUF_PATH);
+        eprintln!("skipping: {} absent (gated real-model test)", *GGUF_PATH);
         return;
     }
     let reference: serde_json::Value =

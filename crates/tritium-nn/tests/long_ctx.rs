@@ -32,7 +32,7 @@ const REF_PATH: &str = concat!(
 #[ignore = "long-context bench: run explicitly with --ignored --nocapture"]
 fn cuda_long_ctx_decode_bench() {
     if !Path::new(&*GGUF_PATH).exists() {
-        eprintln!("skipping: {} absent (gated real-model bench)", &*GGUF_PATH);
+        eprintln!("skipping: {} absent (gated real-model bench)", *GGUF_PATH);
         return;
     }
     let reference: serde_json::Value =

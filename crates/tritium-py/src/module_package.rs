@@ -715,11 +715,14 @@ fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
 
 #[cfg(windows)]
 fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
-    left.volume_serial_number().is_some()
-        && left.volume_serial_number() == right.volume_serial_number()
-        && left.file_index().is_some()
-        && left.file_index() == right.file_index()
-        && left.file_size() == right.file_size()
+    // volume_serial_number()/file_index() are the true identity pair but sit
+    // behind the unstable windows_by_handle feature; the stable size,
+    // timestamp, and attribute fields still catch a file swapped between open
+    // and re-inspection.
+    left.file_size() == right.file_size()
+        && left.creation_time() == right.creation_time()
+        && left.last_write_time() == right.last_write_time()
+        && left.file_attributes() == right.file_attributes()
 }
 
 #[cfg(not(any(unix, windows)))]

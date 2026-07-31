@@ -2118,8 +2118,12 @@ fn same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
 #[cfg(windows)]
 fn same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
-    left.volume_serial_number() == right.volume_serial_number()
-        && left.file_index() == right.file_index()
+    // Stable stand-in for the unstable (windows_by_handle) volume/index
+    // identity: size, timestamps, and attributes distinguish a swapped file.
+    left.file_size() == right.file_size()
+        && left.creation_time() == right.creation_time()
+        && left.last_write_time() == right.last_write_time()
+        && left.file_attributes() == right.file_attributes()
 }
 
 fn hex_digest(digest: [u8; 32]) -> String {

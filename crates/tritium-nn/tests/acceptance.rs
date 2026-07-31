@@ -134,7 +134,7 @@ fn gpu_serial() -> std::sync::MutexGuard<'static, ()> {
 /// is absent — the offline/cpu-only skip path shared by every test here.
 fn maybe_load() -> Option<(Reference, Vec<u8>)> {
     if !Path::new(&*GGUF_PATH).exists() {
-        eprintln!("skipping: {} absent (gated real-model test)", &*GGUF_PATH);
+        eprintln!("skipping: {} absent (gated real-model test)", *GGUF_PATH);
         return None;
     }
     if !Path::new(REF_PATH).exists() {

@@ -86,7 +86,7 @@ mod cuda_e2e {
         if !Path::new(&*GGUF_PATH).exists() {
             eprintln!(
                 "skipping e2e bench: {} absent (gated real-model bench)",
-                &*GGUF_PATH
+                *GGUF_PATH
             );
             return None;
         }

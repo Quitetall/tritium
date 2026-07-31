@@ -103,7 +103,7 @@ struct Reference {
 #[test]
 fn fidelity_ladder_cpu() {
     if !Path::new(&*GGUF_PATH).exists() {
-        eprintln!("skipping: {} absent (gated real-model test)", &*GGUF_PATH);
+        eprintln!("skipping: {} absent (gated real-model test)", *GGUF_PATH);
         return;
     }
     if !Path::new(REF_PATH).exists() {

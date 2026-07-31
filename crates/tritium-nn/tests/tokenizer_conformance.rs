@@ -29,7 +29,7 @@ const REF_PATH: &str = concat!(
 #[test]
 fn bpe_matches_transformers_reference() {
     if !Path::new(&*GGUF_PATH).exists() {
-        eprintln!("skipping: {} absent (gated real-model test)", &*GGUF_PATH);
+        eprintln!("skipping: {} absent (gated real-model test)", *GGUF_PATH);
         return;
     }
     let bytes = std::fs::read(&*GGUF_PATH).expect("read gguf");
