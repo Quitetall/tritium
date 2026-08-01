@@ -13,6 +13,7 @@
 
 use rayon::prelude::*;
 use tritium_core::absmean;
+use tritium_format::salt_v2::SaltV2Codec;
 
 /// Parallelize a weight's SALT quantization above this element count (per-row work is independent
 /// ⇒ bit-identical to the serial loop). Set high: quantization runs on every weight every step
@@ -395,11 +396,49 @@ pub fn rotation_mask(
     mask
 }
 
-/// Packed bits per weight for `t` ternary planes at scale-group size `group`: 2 bits per trit plus one
-/// f16 scale per group, per plane. `group = 256` gives TQ2_0's 2.0625 bpw per plane.
+/// Packed bits per weight for `t` ternary planes at scale-group size `group` under the **D2** codec:
+/// 2 bits per trit plus one f16 scale per group, per plane. `group = 256` gives TQ2_0's 2.0625 bpw
+/// per plane.
+///
+/// D2 wastes ~20% of its trit bits: a trit carries `log2(3) = 1.585` bits of entropy but D2 spends 2.
+/// See [`ternary_bits_per_weight_codec`] for the rate an actual packer achieves.
 #[must_use]
 pub fn ternary_bits_per_weight(t: usize, group: usize) -> f64 {
-    t as f64 * (2.0 + 16.0 / group.max(1) as f64)
+    ternary_bits_per_weight_codec(t, group, SaltV2Codec::D2, group)
+}
+
+/// Packed bits per weight for `t` planes, taken from the **packer's own byte ledger** rather than a
+/// hand-derived constant — so a reported bpw cannot drift from what the artifact actually costs.
+///
+/// `run` is the number of trits packed as one contiguous codec run (for a row-major weight this is
+/// the row length, or `group` when each group is packed independently). It matters because every
+/// codec pads its final unit: B3 packs five trits per byte, so a 128-trit run costs
+/// `ceil(128/5) = 26` bytes = 1.625 bits/trit, not the asymptotic 1.6.
+///
+/// | codec | bits/trit (asymptotic) | T=3 g128 |
+/// |---|---|---|
+/// | `D2` | 2.0 | 6.38 bpw |
+/// | `B3` | 1.6 | **5.20 bpw** |
+/// | `S34` | 1.25 | 4.13 bpw (structured: one forced zero per four trits) |
+///
+/// The `16/group` scale term is unchanged — codecs compress trits, not the f16 group scales.
+#[must_use]
+pub fn ternary_bits_per_weight_codec(
+    t: usize,
+    group: usize,
+    codec: SaltV2Codec,
+    run: usize,
+) -> f64 {
+    let group = group.max(1);
+    let run = run.max(1);
+    // Ask the packer, do not re-derive: `ledger` is the same code path `pack_b3` uses to size its
+    // output buffer, so this figure is the artifact's real cost including terminal padding.
+    let bits_per_trit = match codec.ledger(run) {
+        Ok(l) => (l.physical_bytes * 8) as f64 / run as f64,
+        // A length the codec cannot account for; fall back to the dense rate rather than lie low.
+        Err(_) => 2.0,
+    };
+    t as f64 * (bits_per_trit + 16.0 / group as f64)
 }
 
 // ── ITF: iterative ternary fitting ───────────────────────────────────────────────────────────────
