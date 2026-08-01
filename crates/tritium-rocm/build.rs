@@ -27,8 +27,9 @@ use std::process::Command;
 /// Covers GCN5 (Vega, `gfx900`), CDNA (MI100 `gfx908`, MI200 `gfx90a`, MI300
 /// `gfx942`), and RDNA2/3 consumer (`gfx1030`, `gfx1100`). Extend as new AMD
 /// hardware is validated on the ROCm CI lane.
-const SUPPORTED_GFX_ARCHS: &[&str] =
-    &["gfx900", "gfx908", "gfx90a", "gfx942", "gfx1030", "gfx1100", "gfx1201"];
+const SUPPORTED_GFX_ARCHS: &[&str] = &[
+    "gfx900", "gfx908", "gfx90a", "gfx942", "gfx1030", "gfx1100", "gfx1201",
+];
 
 fn main() {
     // Rebuild triggers regardless of feature state: cheap, and correct when the
