@@ -171,3 +171,63 @@ fn finer_groups_reduce_error_and_cost_bits() {
     );
     assert!(ste::ternary_bits_per_weight(3, 128) > ste::ternary_bits_per_weight(3, 256));
 }
+
+/// `rotation_mask` must report exactly the decisions the fitter acted on. A GPU trainer decides
+/// rotation once on the host and ships the mask to the device; if the mask and the reconstruction
+/// could disagree, the device would quantize in a different basis than the host chose and training
+/// would corrupt silently rather than fail. Reconstructing each group by hand from the mask (rotate
+/// iff the bit is set) must reproduce `Auto` byte-for-byte.
+#[test]
+fn rotation_mask_matches_the_decisions_the_fitter_made() {
+    for &(rows, cols, group) in &[(4usize, 128usize, 128usize), (3, 512, 256), (5, 576, 128)] {
+        // Heavy tails on some rows and not others, so Auto genuinely splits both ways.
+        let mut w = seeded(0x5EED ^ cols as u64, rows * cols, -1.0, 1.0);
+        for r in (0..rows).step_by(2) {
+            for k in [3usize, 57, 100] {
+                if r * cols + k < w.len() {
+                    w[r * cols + k] *= 9.0;
+                }
+            }
+        }
+        for t in 1..=3 {
+            let auto = ste::salt_quantize_forward_grouped(
+                &w,
+                rows,
+                cols,
+                t,
+                group,
+                5,
+                RotationPolicy::Auto,
+            );
+            let mask = ste::rotation_mask(&w, rows, cols, t, group, 5, RotationPolicy::Auto);
+            let per_row = cols.div_ceil(group);
+            assert_eq!(mask.len(), rows * per_row, "one byte per group");
+
+            // Rebuild from the mask alone, forcing each group down the branch the bit names.
+            let mut rebuilt = vec![0.0f32; w.len()];
+            for r in 0..rows {
+                let src = &w[r * cols..(r + 1) * cols];
+                let dst = &mut rebuilt[r * cols..(r + 1) * cols];
+                for (b, (bs, bd)) in src.chunks(group).zip(dst.chunks_mut(group)).enumerate() {
+                    let policy = if mask[r * per_row + b] == 1 {
+                        RotationPolicy::Always
+                    } else {
+                        RotationPolicy::Never
+                    };
+                    let q =
+                        ste::salt_quantize_forward_grouped(bs, 1, bs.len(), t, group, 5, policy);
+                    bd.copy_from_slice(&q);
+                }
+            }
+            assert_eq!(
+                auto, rebuilt,
+                "mask must reproduce Auto exactly ({rows}x{cols} g{group} T{t})"
+            );
+            let rotated = mask.iter().filter(|&&b| b == 1).count();
+            println!(
+                "{rows}x{cols} g{group} T{t}: {rotated}/{} groups rotated",
+                mask.len()
+            );
+        }
+    }
+}

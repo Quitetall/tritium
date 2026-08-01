@@ -258,46 +258,89 @@ pub fn salt_quantize_forward_grouped(
     let group = group.max(1);
     let mut out = vec![0.0f32; wf.len()];
     let mut buf: Vec<f32> = Vec::with_capacity(group);
+    for r in 0..rows {
+        let src = &wf[r * cols..(r + 1) * cols];
+        let dst = &mut out[r * cols..(r + 1) * cols];
+        for (bs, bd) in src.chunks(group).zip(dst.chunks_mut(group)) {
+            let (fit, _) = fit_group(bs, t, iters, rotation, &mut buf);
+            bd.copy_from_slice(&fit);
+        }
+    }
+    out
+}
+
+/// Fit one scale group, returning `(reconstruction, was_rotated)`.
+///
+/// This is the **single** place the rotation decision is made. Both
+/// [`salt_quantize_forward_grouped`] and [`rotation_mask`] go through it, so a mask shipped to a
+/// device backend cannot disagree with the reconstruction the host fitter would have produced —
+/// a divergence that would be silent and would corrupt training rather than fail a gate.
+fn fit_group(
+    bs: &[f32],
+    t: usize,
+    iters: usize,
+    rotation: RotationPolicy,
+    buf: &mut Vec<f32>,
+) -> (Vec<f32>, bool) {
     let sse = |a: &[f32], b: &[f32]| -> f64 {
         a.iter()
             .zip(b)
             .map(|(&x, &y)| f64::from(x - y) * f64::from(x - y))
             .sum()
     };
-    for r in 0..rows {
-        let src = &wf[r * cols..(r + 1) * cols];
-        let dst = &mut out[r * cols..(r + 1) * cols];
-        for (bs, bd) in src.chunks(group).zip(dst.chunks_mut(group)) {
-            let rotatable = bs.len().is_power_of_two() && bs.len() > 1;
-            // The rotated candidate, reconstructed back in the original basis.
-            let rotated = (rotation != RotationPolicy::Never && rotatable).then(|| {
-                buf.clear();
-                buf.extend_from_slice(bs);
-                fast_hadamard(&mut buf); // into the rotated basis
-                let q = salt_quantize_forward_itf(&buf, 1, buf.len(), t, iters);
-                buf.copy_from_slice(&q);
-                fast_hadamard(&mut buf); // H is its own inverse: back to the original basis
-                buf.clone()
-            });
-            match (rotation, rotated) {
-                (RotationPolicy::Always, Some(rot)) => bd.copy_from_slice(&rot),
-                (RotationPolicy::Auto, Some(rot)) => {
-                    let plain = salt_quantize_forward_itf(bs, 1, bs.len(), t, iters);
-                    // Keep whichever candidate actually fits this group better.
-                    if sse(&rot, bs) < sse(&plain, bs) {
-                        bd.copy_from_slice(&rot);
-                    } else {
-                        bd.copy_from_slice(&plain);
-                    }
-                }
-                _ => {
-                    let q = salt_quantize_forward_itf(bs, 1, bs.len(), t, iters);
-                    bd.copy_from_slice(&q);
-                }
+    // A ragged final block is never rotated rather than zero-padded, so no phantom weights appear.
+    let rotatable = bs.len().is_power_of_two() && bs.len() > 1;
+    let rotated = (rotation != RotationPolicy::Never && rotatable).then(|| {
+        buf.clear();
+        buf.extend_from_slice(bs);
+        fast_hadamard(buf); // into the rotated basis
+        let q = salt_quantize_forward_itf(buf, 1, buf.len(), t, iters);
+        buf.copy_from_slice(&q);
+        fast_hadamard(buf); // H is its own inverse: back to the original basis
+        buf.clone()
+    });
+    match (rotation, rotated) {
+        (RotationPolicy::Always, Some(rot)) => (rot, true),
+        (RotationPolicy::Auto, Some(rot)) => {
+            let plain = salt_quantize_forward_itf(bs, 1, bs.len(), t, iters);
+            // Keep whichever candidate actually fits this group better.
+            if sse(&rot, bs) < sse(&plain, bs) {
+                (rot, true)
+            } else {
+                (plain, false)
             }
         }
+        _ => (salt_quantize_forward_itf(bs, 1, bs.len(), t, iters), false),
     }
-    out
+}
+
+/// The per-group rotation decisions [`salt_quantize_forward_grouped`] would make, as one byte per
+/// group (`1` = rotate), in row-major group order — the layout a device kernel indexes by
+/// `row * cols.div_ceil(group) + block`.
+///
+/// A GPU trainer decides rotation **once on the host** from the initial weights rather than
+/// re-deciding every step: a flipping rotation bit would make the loss surface discontinuous, and
+/// the deployed format needs one fixed bit per group anyway.
+#[must_use]
+pub fn rotation_mask(
+    wf: &[f32],
+    rows: usize,
+    cols: usize,
+    t: usize,
+    group: usize,
+    iters: usize,
+    rotation: RotationPolicy,
+) -> Vec<u8> {
+    let group = group.max(1);
+    let mut mask = Vec::with_capacity(rows * cols.div_ceil(group));
+    let mut buf: Vec<f32> = Vec::with_capacity(group);
+    for r in 0..rows {
+        for bs in wf[r * cols..(r + 1) * cols].chunks(group) {
+            let (_, rotated) = fit_group(bs, t, iters, rotation, &mut buf);
+            mask.push(u8::from(rotated));
+        }
+    }
+    mask
 }
 
 /// Packed bits per weight for `t` ternary planes at scale-group size `group`: 2 bits per trit plus one

@@ -1319,9 +1319,39 @@ pub struct HostOffloadTrainParam {
     pub optimizer: AdamW,
 }
 
+/// The SALT fitter configuration a [`DeviceTrainer`] reconstructs with (the PTQ campaign's stack:
+/// finer scale groups + per-group Hadamard). Absent means the legacy per-row AbsMean path.
+///
+/// Measured on SmolLM2-135M PTQ, this stack is worth ~6 200× over the per-row default, so a
+/// distillation run that reconstructs the old way starts from a far worse student than it needs to.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SaltGrouping {
+    /// Weights per scale. `256` matches the deployed TQ2_0 block; `128` the PTQ convention.
+    pub group: usize,
+    /// Rotation policy. Decided **once on the host** at construction — see [`ste::rotation_mask`].
+    pub rotation: ste::RotationPolicy,
+    /// ITF alternations. **Must be `0` today**: the device kernel fits each group with greedy
+    /// AbsMean, not iterative ternary fitting, so any other value would make the host rotation mask
+    /// disagree with the fitter that actually runs — the mask would be chosen as optimal for ITF and
+    /// then applied to a greedy fit. `new_with_fitter` rejects non-zero rather than accept that.
+    ///
+    /// **Known gap.** On synthetic weights ITF cuts reconstruction SSE a further 1.4× / 2.7× / 4.4×
+    /// at T=1/2/3 *on top of* rotation, so the device path is currently strictly weaker than the
+    /// host PTQ stack that produced 1.32× fp. Implementing the LS-optimal alternation
+    /// (`s* = <r,t>/<t,t>`) in `salt_quantize_forward_grouped` is the next step before a
+    /// distillation run can claim to start from the measured PTQ quality.
+    pub iters: usize,
+}
+
 struct ResidentTrainParam {
     master: DeviceTensor,
     quantized: Option<DeviceTensor>,
+    /// One byte per scale group (`1` = rotate), fixed at construction. `None` when ungrouped.
+    ///
+    /// Deliberately *not* re-derived per step: a rotation bit that flipped as the master drifted
+    /// would make the loss surface discontinuous, and the deployed format carries one fixed bit per
+    /// group regardless.
+    rotate: Option<CudaSlice<u8>>,
     m: CudaSlice<f32>,
     v: CudaSlice<f32>,
     /// Opt-in block-wise int8 moments (Lever 5). When present, `step` routes through the int8 kernel
@@ -1377,6 +1407,8 @@ pub struct DeviceTrainer<'a> {
     master_precision: MasterPrecision,
     /// Sherry annealed fp residual mixed into each reconstruction; `0.0` = pure ternary.
     sherry_alpha: f32,
+    /// Grouped/rotated SALT fitter, or `None` for the legacy per-row AbsMean reconstruction.
+    grouping: Option<SaltGrouping>,
 }
 
 impl core::fmt::Debug for DeviceTrainer<'_> {
@@ -1426,6 +1458,46 @@ impl<'a> DeviceTrainer<'a> {
         moment_precision: MomentPrecision,
         master_precision: MasterPrecision,
     ) -> Result<Self, BackendError> {
+        Self::new_with_fitter(
+            backend,
+            params,
+            weight_storage,
+            moment_precision,
+            master_precision,
+            None,
+        )
+    }
+
+    /// As [`new_with_options`](Self::new_with_options), plus the SALT fitter the student is
+    /// reconstructed with each step. `None` keeps the legacy per-row AbsMean path bit-for-bit;
+    /// `Some` switches to grouped scales with an optional per-group Hadamard rotation.
+    ///
+    /// The rotation mask is computed **here, once, on the host** from the initial masters (see
+    /// [`SaltGrouping::rotation`]) and then only read by the device kernel.
+    pub fn new_with_fitter(
+        backend: &'a CudaBackend,
+        params: &[DeviceTrainParam<'_>],
+        weight_storage: DeviceTrainerWeightStorage,
+        moment_precision: MomentPrecision,
+        master_precision: MasterPrecision,
+        grouping: Option<SaltGrouping>,
+    ) -> Result<Self, BackendError> {
+        if let Some(g) = grouping {
+            if g.group == 0 || g.group > 256 {
+                return Err(BackendError::InvalidInput(format!(
+                    "SALT scale group must be in 1..=256, got {}",
+                    g.group
+                )));
+            }
+            if g.iters != 0 {
+                return Err(BackendError::InvalidInput(format!(
+                    "the device grouped SALT kernel fits with greedy AbsMean, not ITF, so \
+                     SaltGrouping::iters must be 0 (got {}); a non-zero value would pick the \
+                     rotation mask with a fitter the device does not run",
+                    g.iters
+                )));
+            }
+        }
         let mut leaf_lens = Vec::with_capacity(params.len());
         let mut parameter_elements = 0usize;
         let mut largest_parameter_elements = 0usize;
@@ -1452,8 +1524,25 @@ impl<'a> DeviceTrainer<'a> {
         }
         let mut resident = Vec::with_capacity(params.len());
         for param in params {
+            // Decide rotation once, on the host, from the initial weights.
+            let rotate = match grouping {
+                Some(g) if g.rotation != ste::RotationPolicy::Never => {
+                    let mask = ste::rotation_mask(
+                        param.master,
+                        param.rows,
+                        param.cols,
+                        param.salt_planes,
+                        g.group,
+                        g.iters,
+                        g.rotation,
+                    );
+                    Some(backend.dev_upload_u8(&mask)?)
+                }
+                _ => None,
+            };
             resident.push(ResidentTrainParam {
                 master: DeviceTensor::upload(backend, param.master)?,
+                rotate,
                 quantized: match weight_storage {
                     DeviceTrainerWeightStorage::DenseQuantized => Some(DeviceTensor {
                         buf: backend.dev_alloc_zeros(param.master.len())?,
@@ -1522,6 +1611,7 @@ impl<'a> DeviceTrainer<'a> {
             loading: None,
             master_precision,
             sherry_alpha: 0.0,
+            grouping,
         })
     }
 
@@ -1645,6 +1735,15 @@ impl<'a> DeviceTrainer<'a> {
     /// Reconstruct every resident master into its dense f32 SALT tensor.
     pub fn prepare_quantized(&mut self) -> Result<(), BackendError> {
         self.ensure_usable()?;
+        // The grouped kernel has no Sherry term, so silently dropping the fp mix would make a
+        // configured anneal a no-op. Refuse instead.
+        if self.grouping.is_some() && self.sherry_alpha != 0.0 {
+            return Err(BackendError::InvalidInput(
+                "Sherry's fp residual is not implemented on the grouped SALT path; set \
+                 sherry_alpha to 0 or construct the trainer without a SaltGrouping"
+                    .into(),
+            ));
+        }
         self.quantized_prepared = false;
         for param in &mut self.params {
             let quantized = param.quantized.as_mut().ok_or_else(|| {
@@ -1652,15 +1751,26 @@ impl<'a> DeviceTrainer<'a> {
                     "dense quantized storage is disabled for this resident trainer".into(),
                 )
             })?;
-            self.backend.salt_quantize_forward_sherry_dev(
-                &param.master.buf,
-                &mut self.residual,
-                &mut quantized.buf,
-                param.rows,
-                param.cols,
-                param.salt_planes,
-                self.sherry_alpha,
-            )?;
+            match self.grouping {
+                Some(g) => self.backend.salt_quantize_forward_grouped_dev(
+                    &param.master.buf,
+                    &mut quantized.buf,
+                    param.rotate.as_ref(),
+                    param.rows,
+                    param.cols,
+                    param.salt_planes,
+                    g.group,
+                )?,
+                None => self.backend.salt_quantize_forward_sherry_dev(
+                    &param.master.buf,
+                    &mut self.residual,
+                    &mut quantized.buf,
+                    param.rows,
+                    param.cols,
+                    param.salt_planes,
+                    self.sherry_alpha,
+                )?,
+            }
         }
         self.quantized_prepared = true;
         Ok(())
@@ -6433,6 +6543,140 @@ mod tests {
     /// Gate (plan 0043 P2.2): the device-resident glue kernels (silu, elementwise mul/add, grad
     /// accumulate) match their `tritium-train` CPU ops. The pure `+`/`*` ops are BIT-EXACT; silu
     /// carries `expf` (device vs host libm ~1 ULP) so it is gated device==CPU within 1e-4.
+    /// **The wiring gate.** `DeviceTrainer::new_with_fitter(.., Some(SaltGrouping))` must make
+    /// `prepare_quantized` reproduce the host fitter `ste::salt_quantize_forward_grouped(.., Auto)`
+    /// on every parameter — that is the entire point of the grouped path, and the previous parity
+    /// gate only covered the raw kernel, not the trainer that drives it.
+    ///
+    /// Also pins the two contracts that make the wiring safe: `None` keeps the legacy per-row
+    /// reconstruction bit-for-bit (so no committed result moves), and Sherry is refused rather than
+    /// silently ignored on the grouped path.
+    #[test]
+    fn device_trainer_grouped_fitter_matches_host() {
+        let Ok(backend) = CudaBackend::new(0) else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        // A ragged row (576 = 4x128 + 64) exercises the never-rotated tail block.
+        for &(rows, cols) in &[(6usize, 256usize), (4, 576)] {
+            let master: Vec<f32> = (0..rows * cols)
+                .map(|i| {
+                    let x = ((i * 2654435761) % 4096) as f32 / 4096.0 - 0.5;
+                    // Heavy tails on a few coordinates so Auto genuinely splits both ways.
+                    if i % 97 == 0 { x * 9.0 } else { x }
+                })
+                .collect();
+            for planes in 1..=3usize {
+                for group in [128usize, 256] {
+                    let grouping = SaltGrouping {
+                        group,
+                        rotation: ste::RotationPolicy::Auto,
+                        iters: 0,
+                    };
+                    let params = [DeviceTrainParam {
+                        master: &master,
+                        rows,
+                        cols,
+                        salt_planes: planes,
+                        optimizer: AdamW::new(1e-3),
+                    }];
+                    let mut trainer = DeviceTrainer::new_with_fitter(
+                        &backend,
+                        &params,
+                        DeviceTrainerWeightStorage::DenseQuantized,
+                        MomentPrecision::F32,
+                        MasterPrecision::F32,
+                        Some(grouping),
+                    )
+                    .expect("grouped trainer");
+                    trainer.prepare_quantized().expect("prepare");
+                    let mut got = vec![0.0f32; master.len()];
+                    backend
+                        .dev_download(&trainer.quantized(0).unwrap().buf, &mut got)
+                        .expect("download");
+                    let want = ste::salt_quantize_forward_grouped(
+                        &master,
+                        rows,
+                        cols,
+                        planes,
+                        group,
+                        0, // greedy: the fitter the device kernel implements (see SaltGrouping::iters)
+                        ste::RotationPolicy::Auto,
+                    );
+                    let delta = got
+                        .iter()
+                        .zip(&want)
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0.0f32, f32::max);
+                    assert!(
+                        delta < 2e-4,
+                        "grouped trainer {rows}x{cols} g{group} T{planes}: max|delta| {delta:.3e}"
+                    );
+
+                    // Sherry must be refused, not quietly dropped.
+                    trainer.set_sherry_alpha(0.25);
+                    let err = trainer.prepare_quantized().unwrap_err();
+                    assert!(
+                        matches!(&err, BackendError::InvalidInput(m) if m.contains("Sherry")),
+                        "grouped + Sherry must error, got {err:?}"
+                    );
+                }
+
+                // A fitter the device does not implement must be refused at construction, not
+                // silently downgraded to greedy with an ITF-chosen rotation mask.
+                let params = [DeviceTrainParam {
+                    master: &master,
+                    rows,
+                    cols,
+                    salt_planes: planes,
+                    optimizer: AdamW::new(1e-3),
+                }];
+                let err = DeviceTrainer::new_with_fitter(
+                    &backend,
+                    &params,
+                    DeviceTrainerWeightStorage::DenseQuantized,
+                    MomentPrecision::F32,
+                    MasterPrecision::F32,
+                    Some(SaltGrouping {
+                        group: 128,
+                        rotation: ste::RotationPolicy::Auto,
+                        iters: 5,
+                    }),
+                )
+                .expect_err("ITF is not implemented on device; must be refused");
+                assert!(
+                    matches!(&err, BackendError::InvalidInput(m) if m.contains("greedy AbsMean")),
+                    "expected the ITF-unsupported error, got {err:?}"
+                );
+
+                // `None` keeps the committed per-row reconstruction bit-for-bit.
+                let params = [DeviceTrainParam {
+                    master: &master,
+                    rows,
+                    cols,
+                    salt_planes: planes,
+                    optimizer: AdamW::new(1e-3),
+                }];
+                let mut legacy = DeviceTrainer::new(&backend, &params).expect("legacy trainer");
+                legacy.prepare_quantized().expect("prepare");
+                let mut got = vec![0.0f32; master.len()];
+                backend
+                    .dev_download(&legacy.quantized(0).unwrap().buf, &mut got)
+                    .expect("download");
+                let want = ste::salt_quantize_forward(&master, rows, cols, planes);
+                let delta = got
+                    .iter()
+                    .zip(&want)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(
+                    delta < 2e-4,
+                    "ungrouped must stay on the legacy path {rows}x{cols} T{planes}: {delta:.3e}"
+                );
+            }
+        }
+    }
+
     /// The grouped SALT kernel (finer scale groups + optional per-group Hadamard) must match the CPU
     /// oracle `ste::salt_quantize_forward_grouped`. This is the fitter that took PTQ from 10786× to
     /// 1.74× fp, so the device has to reproduce it before any distillation run can use it.
