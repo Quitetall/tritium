@@ -49,7 +49,16 @@ impl CudaDecodeModel {
     /// [`Self::tree_verify_logits`] hands the logits to the host for the
     /// speculative-sampling accept rule, with [`Self::tree_commit`] promoting
     /// the host-chosen path.
-    fn tree_forward(&mut self, tokens: &[u32], parents: &[i32]) -> Result<usize, BackendError> {
+    /// Returns `(m, on_cap)`: `on_cap` = the forward ran on the graph route
+    /// with its tail (norm/head) IN FLIGHT on `cap_stream` — consumers must
+    /// order their reads on that stream (L2, ADR 0032: the two per-verify
+    /// full syncs this fn used to carry are gone; the single ordering point
+    /// is the consumer's own readback).
+    fn tree_forward(
+        &mut self,
+        tokens: &[u32],
+        parents: &[i32],
+    ) -> Result<(usize, bool), BackendError> {
         // v1: the tree graph builders reuse the TQ2-only gb_* kernels.
         if self.layers.first().is_some_and(|l| l.qkv.tq1) {
             return Err(BackendError::UnsupportedFormat(TernaryFormat::Tq1_0));
@@ -108,6 +117,18 @@ impl CudaDecodeModel {
         } else {
             None
         };
+        if bucket.is_none() {
+            // ~600 eager launches per verify instead of 1 replay — worth one
+            // loud line per process (ctx > 12288, non-f32 KV, or m > 48).
+            static EAGER_WARN: std::sync::Once = std::sync::Once::new();
+            EAGER_WARN.call_once(|| {
+                eprintln!(
+                    "tritium-cuda: tree verify falling back to the EAGER route \
+                     (m={m}, kv_elem={}, max_ctx={}) — ~600 launches/verify",
+                    self.kv_elem, self.max_ctx
+                );
+            });
+        }
         // mb = padded node count (bucket) or the real m on the eager path;
         // every host array below is built at stride/length mb. Pad rows are
         // root-token duplicates at depth 1 — valid math whose results only
@@ -221,13 +242,21 @@ impl CudaDecodeModel {
         // into linear memory, not a buffer shape).
         let mut tok_i: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
         tok_i.resize(mb, tok_i[0]); // pads embed the root token (valid, unread)
-        s.memcpy_htod(&tok_i, &mut ts.d_tok)
+        // Graph route: uploads go straight onto `cap_stream` (the only reader
+        // is the captured graph, on that stream) — stream order replaces the
+        // old full pre-replay sync. Eager route: default stream, as before.
+        let up = if bucket.is_some() {
+            &self.cap_stream
+        } else {
+            s
+        };
+        up.memcpy_htod(&tok_i, &mut ts.d_tok)
             .map_err(|e| driver_err("tree tokens htod", &e))?;
-        s.memcpy_htod(&positions, &mut ts.d_pos)
+        up.memcpy_htod(&positions, &mut ts.d_pos)
             .map_err(|e| driver_err("tree positions htod", &e))?;
-        s.memcpy_htod(&anc, &mut ts.d_anc)
+        up.memcpy_htod(&anc, &mut ts.d_anc)
             .map_err(|e| driver_err("tree anc htod", &e))?;
-        s.memcpy_htod(&n_anc, &mut ts.d_nanc)
+        up.memcpy_htod(&n_anc, &mut ts.d_nanc)
             .map_err(|e| driver_err("tree n_anc htod", &e))?;
 
         if let Some(bucket) = bucket {
@@ -266,10 +295,8 @@ impl CudaDecodeModel {
                     .graphs
                     .insert(bucket, SendGraph(g));
             }
-            // The uploads above ran on the default stream; the graph replays
-            // on the capture stream — order them before the ctrl write.
-            s.synchronize()
-                .map_err(|e| driver_err("tree pre-replay sync", &e))?;
+            // Uploads, ctrl write, replay and tail all sit on `cap_stream` —
+            // stream order is the only ordering needed (no host sync).
             let ctrl = [prefix_len as i32, m as i32];
             let tg = self.tree_graphs.as_mut().expect("tree graphs just ensured");
             self.cap_stream
@@ -304,10 +331,10 @@ impl CudaDecodeModel {
                 m,
                 &mut ts.d_logits_all,
             )?;
-            // The verify's writes (KV appends included) must be visible to the
-            // default-stream consumers that follow (argmax/logits dtoh/promote).
-            cs.synchronize()
-                .map_err(|e| driver_err("tree post-replay sync", &e))?;
+            // No sync here (L2): consumers run their argmax/readback on
+            // `cap_stream` (see `on_cap`), and the pageable dtoh they end with
+            // drains the stream before any default-stream work (promote)
+            // touches the arena.
         } else {
             Self::bl_embed(
                 s,
@@ -613,7 +640,7 @@ impl CudaDecodeModel {
         // `tree_scratch.d_logits_all[0..m*vocab]`; provisional K/V occupy arena
         // rows [cache_len, cache_len + m). Nothing is committed yet.
         self.tree_scratch = Some(ts);
-        Ok(m)
+        Ok((m, bucket.is_some()))
     }
 
     /// Greedy tree verify (ADR 0014): forward the draft tree, device-argmax
@@ -624,8 +651,16 @@ impl CudaDecodeModel {
         tokens: &[u32],
         parents: &[i32],
     ) -> Result<Vec<u32>, BackendError> {
-        let m = self.tree_forward(tokens, parents)?;
-        let s = &self.stream;
+        let (m, on_cap) = self.tree_forward(tokens, parents)?;
+        // Consume on the stream that produced the logits (graph route:
+        // cap_stream — the trailing pageable dtoh below is the ONE ordering
+        // point and drains the whole verify before tree_promote's
+        // default-stream work).
+        let s = if on_cap {
+            &self.cap_stream
+        } else {
+            &self.stream
+        };
         let mut ts = self
             .tree_scratch
             .take()
@@ -641,7 +676,6 @@ impl CudaDecodeModel {
             &mut ts.d_amax_idx,
             &mut ts.d_ids,
         )?;
-        let tok_i: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
         let mut ids = vec![0i32; m];
         // The cached buffer may exceed this call's `m` — copy exactly m ids.
         let ids_view = ts.d_ids.slice(0..m);
@@ -658,7 +692,8 @@ impl CudaDecodeModel {
         loop {
             let cur = *path.last().expect("path non-empty");
             let want = ids[cur];
-            let next = (cur + 1..m).find(|&c| parents[c] as usize == cur && tok_i[c] == want);
+            let next =
+                (cur + 1..m).find(|&c| parents[c] as usize == cur && tokens[c] as i32 == want);
             match next {
                 Some(c) => path.push(c),
                 None => break,
@@ -680,8 +715,12 @@ impl CudaDecodeModel {
         tokens: &[u32],
         parents: &[i32],
     ) -> Result<Vec<f32>, BackendError> {
-        let m = self.tree_forward(tokens, parents)?;
-        let s = &self.stream;
+        let (m, on_cap) = self.tree_forward(tokens, parents)?;
+        let s = if on_cap {
+            &self.cap_stream
+        } else {
+            &self.stream
+        };
         let ts = self
             .tree_scratch
             .take()

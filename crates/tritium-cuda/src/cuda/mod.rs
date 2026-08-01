@@ -659,7 +659,10 @@ struct TreeScratch {
 /// `m <= TREE_BUCKET_MAX` nodes pads to the smallest bucket and replays that
 /// bucket's graph (~1 launch instead of ~420 eager launches); larger trees
 /// (the HTTP tree API allows them) use the eager path.
-const TREE_BUCKETS: [usize; 5] = [8, 16, 24, 32, 48];
+// L2 (ADR 0032): 4 and 12 added — adaptive-k drafts live at m 5..9, where
+// the old ladder padded m=9 to 16 rows (1.78x trunk FLOPs off one extra
+// draft token). Capture cost is once per bucket actually used.
+const TREE_BUCKETS: [usize; 7] = [4, 8, 12, 16, 24, 32, 48];
 const TREE_BUCKET_MAX: usize = 48;
 
 /// Captured verify-trunk graphs + their [prefix_len, real_m] ctrl buffer.
