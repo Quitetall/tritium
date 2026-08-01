@@ -321,6 +321,10 @@ fn fit_group(
 /// A GPU trainer decides rotation **once on the host** from the initial weights rather than
 /// re-deciding every step: a flipping rotation bit would make the loss surface discontinuous, and
 /// the deployed format needs one fixed bit per group anyway.
+///
+/// `iters` must match the fitter that will consume the mask. Host callers may pass any value; the
+/// `DeviceTrainer` path always passes `0`, because its kernel fits with greedy AbsMean — a mask
+/// chosen under ITF and then handed to a greedy fit is worse than either used consistently.
 #[must_use]
 pub fn rotation_mask(
     wf: &[f32],

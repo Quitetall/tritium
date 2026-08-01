@@ -1524,7 +1524,11 @@ impl<'a> DeviceTrainer<'a> {
         }
         let mut resident = Vec::with_capacity(params.len());
         for param in params {
-            // Decide rotation once, on the host, from the initial weights.
+            // Decide rotation once, on the host, from the initial weights. Ordering is
+            // load-bearing: this reads `param.master`, the caller's host slice, and must run
+            // before the upload below takes ownership of the device copy the kernel will fit.
+            // `g.iters` is 0 by the check above — the mask must be chosen with the same greedy
+            // fitter the device kernel runs.
             let rotate = match grouping {
                 Some(g) if g.rotation != ste::RotationPolicy::Never => {
                     let mask = ste::rotation_mask(
