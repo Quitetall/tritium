@@ -15,7 +15,7 @@ mod common;
 
 use std::path::PathBuf;
 
-use common::{extract, forward, logits_of, perplexity_windowed};
+use common::{Calib, calibrate, extract, fold, forward, logits_of, perplexity_windowed};
 use tritium_nn::ModelRunner;
 use tritium_train::ops::ste;
 use tritium_train::{AdamW, Optimizer, Tape};
@@ -246,6 +246,7 @@ fn salt_distillation_device_tape_recovers_heldout() {
     {
         train_ids.truncate(n);
     }
+
     let windows: Vec<&[u32]> = train_ids.chunks_exact(TRAIN_SEQ).collect();
     assert!(!windows.is_empty(), "train corpus shorter than one window");
 
@@ -332,7 +333,7 @@ fn salt_distillation_device_trainer_recovers_heldout() {
     use tritium_cuda::CudaBackend;
     use tritium_cuda::train::{
         DeviceTape, DeviceTensor, DeviceTrainParam, DeviceTrainer, DeviceTrainerWeightStorage,
-        MasterPrecision, MomentPrecision, TensorCoreGemm,
+        MasterPrecision, MomentPrecision, SaltGrouping, TensorCoreGemm,
     };
     use tritium_format::TeacherCacheHeader;
     use tritium_nn::{
@@ -378,6 +379,47 @@ fn salt_distillation_device_trainer_recovers_heldout() {
     {
         train_ids.truncate(n);
     }
+
+    // Activation-aware salience fold (TRITIUM_DISTILL_SMOOTH=<alpha>). The single largest PTQ win
+    // measured (78x at T=1; 1.74x -> 1.40x at T=3), and free at inference: every inverse lands in an
+    // fp norm gain or in a row scale the fitter already carries. Applied BEFORE the masters are
+    // uploaded, so the student trains in the folded basis and `a`'s norms carry the inverse --
+    // which also means every downstream eval must use the returned `a`, not the original.
+    //
+    // alpha MUST be calibrated per model: the optimum shifts down with size (0.75 at 135M, 0.50 at
+    // 360M) and the wrong one costs 4.2x at T=1. Deliberately no default.
+    let (a, fp) = match std::env::var("TRITIUM_DISTILL_SMOOTH")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+    {
+        None => (a, fp),
+        Some(alpha) => {
+            const CALIB_WINDOWS: usize = 8;
+            const CALIB_SEQ: usize = 512;
+            assert!(
+                train_ids.len() >= CALIB_WINDOWS * CALIB_SEQ,
+                "salience calibration needs {} train tokens, got {}",
+                CALIB_WINDOWS * CALIB_SEQ,
+                train_ids.len()
+            );
+            let mut calib = Calib::new(&a);
+            for w in 0..CALIB_WINDOWS {
+                calibrate(
+                    &fp,
+                    &a,
+                    &train_ids[w * CALIB_SEQ..(w + 1) * CALIB_SEQ],
+                    &mut calib,
+                );
+            }
+            let (folded, farch) = fold(&fp, &shapes, &a, &calib, alpha);
+            println!(
+                "salience fold applied: alpha={alpha} over {} calibration tokens (train split)",
+                calib.rows
+            );
+            (farch, folded)
+        }
+    };
+
     let windows: Vec<&[u32]> = train_ids.chunks_exact(seq_len).collect();
     assert!(!windows.is_empty(), "train corpus shorter than one window");
 
@@ -422,12 +464,56 @@ fn salt_distillation_device_trainer_recovers_heldout() {
     } else {
         MasterPrecision::F32
     };
-    let mut trainer = DeviceTrainer::new_with_options(
+    // The grouped+rotated+ITF fitter (TRITIUM_DISTILL_GROUP=<g>). Absent keeps the legacy per-row
+    // AbsMean reconstruction, which every prior distillation run used and which PTQ measured at
+    // 10786x fp -- so a real run should always set it. 128 is the PTQ convention; 256 is TQ2_0's
+    // deployed block.
+    let grouping = std::env::var("TRITIUM_DISTILL_GROUP")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|group| SaltGrouping {
+            group,
+            // Rotation defaults to Never FOR TRAINING, which is the opposite of the PTQ default,
+            // and the difference is measured rather than assumed. Held-out ppl at steps 5/10/15/20,
+            // 135M, T=2, g128 (legacy per-row control ends at 4247 / 500x):
+            //
+            //   greedy, no rotation   3.9M -> 70k -> 33.8k -> 18.1k   monotone, 117x
+            //   greedy, rotation Auto 456k -> 65k -> 79k UP -> 40.6k  OSCILLATES, 52x
+            //   ITF=5, no rotation    117k -> 6547 -> 6472 -> 3692    monotone, 575x  <- best
+            //   ITF=5, rotation Auto  5.5M -> 71k -> 1.9M UP -> 1.8M  OSCILLATES, 1x
+            //
+            // So ITF helps training (575x beats the 500x control) while rotation destabilises it,
+            // with or without ITF. The likely cause is the STE: `salt_quantize_vjp` is the identity,
+            // but under a Hadamard every coordinate of a group feeds that group's scale in BOTH
+            // directions, so the forward is far more sensitive to a master perturbation than the
+            // identity assumes -- an effectively too-large step. Rotation is the single biggest PTQ
+            // win (548x at T=3), so it stays the PTQ default; making it usable in training needs a
+            // rotation-aware backward or a lower LR, not just this switch.
+            //
+            // TRITIUM_DISTILL_ROTATE=auto|always re-enables it for that investigation.
+            rotation: match std::env::var("TRITIUM_DISTILL_ROTATE").as_deref() {
+                Ok("auto") => ste::RotationPolicy::Auto,
+                Ok("always") => ste::RotationPolicy::Always,
+                _ => ste::RotationPolicy::Never,
+            },
+            iters: std::env::var("TRITIUM_DISTILL_ITF")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(5),
+        });
+    if let Some(g) = grouping {
+        println!(
+            "SALT fitter: g{} +ITF({}) +rotation({:?})",
+            g.group, g.iters, g.rotation
+        );
+    }
+    let mut trainer = DeviceTrainer::new_with_fitter(
         &backend,
         &specs,
         DeviceTrainerWeightStorage::DenseQuantized,
         moment_precision,
         master_precision,
+        grouping,
     )
     .expect("upload resident state");
     let mut teacher_cache = std::env::var_os("TRITIUM_TEACHER_CACHE").map(|path| {

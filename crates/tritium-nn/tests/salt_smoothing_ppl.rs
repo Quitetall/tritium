@@ -35,17 +35,15 @@ mod common;
 
 use std::path::PathBuf;
 
-use common::{Arch, extract, perplexity_windowed};
+use common::{
+    Arch, Calib, calibrate, extract, fold, perplexity_windowed, quantize, quantize_split, split_bpw,
+};
 use tritium_nn::ModelRunner;
-use tritium_train::Tape;
-use tritium_train::nn::attention;
-use tritium_train::ops::ste::{self, RotationPolicy};
-use tritium_train::tape::ValueId;
+use tritium_train::ops::ste;
 
 const EVAL_WINDOW: usize = 512;
 /// Calibration windows drawn from the *training* split — never from the held-out set.
 const CALIB_WINDOWS: usize = 8;
-const ITERS: usize = 5;
 
 /// `TRITIUM_MODEL_DIR` selects the model, so the same sweep runs across a scale curve. Every SOTA
 /// ternary number is reported at 7B+, where there is far more redundancy to spend on quantization
@@ -81,202 +79,6 @@ fn corpus() -> (Vec<u32>, Vec<u32>) {
     (ids("train_ids"), ids("eval_ids"))
 }
 
-/// Per-input-channel second moments for the projections whose scale is foldable.
-struct Calib {
-    attn_in: Vec<Vec<f64>>, // [layer][n_embd] — input to q, k, v
-    ffn_in: Vec<Vec<f64>>,  // [layer][n_embd] — input to gate, up
-    down_in: Vec<Vec<f64>>, // [layer][ff]     — input to down
-    rows: usize,
-}
-
-impl Calib {
-    fn new(a: &Arch) -> Self {
-        Self {
-            attn_in: vec![vec![0.0; a.n_embd]; a.n_layers],
-            ffn_in: vec![vec![0.0; a.n_embd]; a.n_layers],
-            down_in: vec![vec![0.0; a.ff]; a.n_layers],
-            rows: 0,
-        }
-    }
-}
-
-/// Accumulate `Σ x²` per column of a `[seq, cols]` tape value.
-fn accumulate(t: &Tape, id: ValueId, seq: usize, cols: usize, acc: &mut [f64]) {
-    let v = t.value(id);
-    for r in 0..seq {
-        for (c, a) in acc.iter_mut().enumerate() {
-            let x = f64::from(v[r * cols + c]);
-            *a += x * x;
-        }
-    }
-}
-
-/// One calibration forward. Mirrors `common::forward` exactly, tapping the three foldable inputs.
-fn calibrate(weights: &[Vec<f32>], a: &Arch, tokens: &[u32], c: &mut Calib) {
-    let mut t = Tape::new();
-    let wids: Vec<ValueId> = weights.iter().map(|w| t.leaf(w.clone())).collect();
-    let seq = tokens.len();
-    let mut hidden = t.embed_gather(wids[0], tokens, a.vocab, a.n_embd);
-    for li in 0..a.n_layers {
-        let base = 1 + 7 * li;
-        let an = t.leaf(a.attn_norms[li].clone());
-        let xn = t.rmsnorm(hidden, an, seq, a.n_embd, a.eps);
-        accumulate(&t, xn, seq, a.n_embd, &mut c.attn_in[li]);
-        let attn = attention(
-            &mut t,
-            xn,
-            wids[base],
-            wids[base + 1],
-            wids[base + 2],
-            wids[base + 3],
-            seq,
-            a.n_embd,
-            a.n_head,
-            a.n_head_kv,
-            a.head_dim,
-            a.theta,
-        );
-        hidden = t.add(hidden, attn);
-        let fnw = t.leaf(a.ffn_norms[li].clone());
-        let hn = t.rmsnorm(hidden, fnw, seq, a.n_embd, a.eps);
-        accumulate(&t, hn, seq, a.n_embd, &mut c.ffn_in[li]);
-        let g = t.dense_matmul(hn, wids[base + 4], seq, a.ff, a.n_embd);
-        let u = t.dense_matmul(hn, wids[base + 5], seq, a.ff, a.n_embd);
-        let ga = t.silu(g);
-        let gated = t.mul(ga, u);
-        accumulate(&t, gated, seq, a.ff, &mut c.down_in[li]);
-        let down = t.dense_matmul(gated, wids[base + 6], seq, a.n_embd, a.ff);
-        hidden = t.add(hidden, down);
-    }
-    c.rows += seq;
-}
-
-/// AWQ's salience scale: `s_j = (rms_j / geomean(rms))^α`, normalised by the geometric mean so the
-/// fold neither inflates nor shrinks the matrix overall (α=0 ⇒ all ones ⇒ exactly today's fitter).
-fn smooth_scales(acc: &[f64], rows: usize, alpha: f64) -> Vec<f32> {
-    let rms: Vec<f64> = acc
-        .iter()
-        .map(|&s| (s / rows as f64).sqrt().max(1e-8))
-        .collect();
-    let gm = (rms.iter().map(|r| r.ln()).sum::<f64>() / rms.len() as f64).exp();
-    rms.iter().map(|&r| (r / gm).powf(alpha) as f32).collect()
-}
-
-fn scale_cols(w: &mut [f32], cols: usize, s: &[f32]) {
-    for row in w.chunks_mut(cols) {
-        for (v, &sj) in row.iter_mut().zip(s) {
-            *v *= sj;
-        }
-    }
-}
-
-fn divide_rows(w: &mut [f32], cols: usize, s: &[f32]) {
-    for (r, row) in w.chunks_mut(cols).enumerate() {
-        for v in row {
-            *v /= s[r];
-        }
-    }
-}
-
-fn clone_arch(a: &Arch) -> Arch {
-    Arch {
-        attn_norms: a.attn_norms.clone(),
-        ffn_norms: a.ffn_norms.clone(),
-        out_norm: a.out_norm.clone(),
-        n_embd: a.n_embd,
-        n_head: a.n_head,
-        n_head_kv: a.n_head_kv,
-        head_dim: a.head_dim,
-        ff: a.ff,
-        vocab: a.vocab,
-        eps: a.eps,
-        theta: a.theta,
-        n_layers: a.n_layers,
-    }
-}
-
-/// Apply the salience fold. Returns the rebalanced weights plus the `Arch` whose fp norms absorb
-/// the inverse — together an exact reparameterisation of the same function.
-fn fold(
-    fp: &[Vec<f32>],
-    shapes: &[(usize, usize)],
-    a: &Arch,
-    c: &Calib,
-    alpha: f64,
-) -> (Vec<Vec<f32>>, Arch) {
-    let mut w = fp.to_vec();
-    let mut arch = clone_arch(a);
-    for li in 0..a.n_layers {
-        let base = 1 + 7 * li;
-
-        // q, k, v — inverse into attn_norm.
-        let sa = smooth_scales(&c.attn_in[li], c.rows, alpha);
-        for k in 0..3 {
-            scale_cols(&mut w[base + k], shapes[base + k].1, &sa);
-        }
-        for (n, &s) in arch.attn_norms[li].iter_mut().zip(&sa) {
-            *n /= s;
-        }
-
-        // gate, up — inverse into ffn_norm.
-        let sf = smooth_scales(&c.ffn_in[li], c.rows, alpha);
-        for k in 4..6 {
-            scale_cols(&mut w[base + k], shapes[base + k].1, &sf);
-        }
-        for (n, &s) in arch.ffn_norms[li].iter_mut().zip(&sf) {
-            *n /= s;
-        }
-
-        // down — inverse into up's output rows (`gated = silu(gate) ⊙ up` is linear in up).
-        let sd = smooth_scales(&c.down_in[li], c.rows, alpha);
-        scale_cols(&mut w[base + 6], shapes[base + 6].1, &sd);
-        divide_rows(&mut w[base + 5], shapes[base + 5].1, &sd);
-    }
-    (w, arch)
-}
-
-fn quantize(w: &[Vec<f32>], shapes: &[(usize, usize)], t: usize, group: usize) -> Vec<Vec<f32>> {
-    w.iter()
-        .zip(shapes)
-        .map(|(v, &(n, k))| {
-            ste::salt_quantize_forward_grouped(v, n, k, t, group, ITERS, RotationPolicy::Auto)
-        })
-        .collect()
-}
-
-/// Quantize with a **separate plane count for the tied embed/head** (index 0) and for the body.
-fn quantize_split(
-    w: &[Vec<f32>],
-    shapes: &[(usize, usize)],
-    t_head: usize,
-    t_body: usize,
-    group: usize,
-) -> Vec<Vec<f32>> {
-    w.iter()
-        .zip(shapes)
-        .enumerate()
-        .map(|(i, (v, &(n, k)))| {
-            let t = if i == 0 { t_head } else { t_body };
-            ste::salt_quantize_forward_grouped(v, n, k, t, group, ITERS, RotationPolicy::Auto)
-        })
-        .collect()
-}
-
-/// Parameter-weighted bpw when the tied embed/head runs at `t_head` planes and the body at `t_body`.
-///
-/// The two costs scale differently and must not be merged: trits plus their f16 scale are charged
-/// **per plane**, but `RotationPolicy::Auto`'s choice bit is decided once per group for the whole
-/// stack of planes (see `ste::salt_quantize_forward_grouped`), so it is charged **once**.
-fn split_bpw(shapes: &[(usize, usize)], t_head: usize, t_body: usize, group: usize) -> f64 {
-    let n: Vec<usize> = shapes.iter().map(|&(a, b)| a * b).collect();
-    let total: usize = n.iter().sum();
-    let body: usize = n[1..].iter().sum();
-    let planes = t_head as f64 * n[0] as f64 + t_body as f64 * body as f64;
-    ste::ternary_bits_per_weight(1, group) * planes / total as f64 + 1.0 / group as f64
-}
-
-/// Everything a sweep needs: the fp model, its shapes, the calibration statistics, and the held-out
-/// ids. Built once and shared by both tests.
 type Fixture = (Arch, Vec<Vec<f32>>, Vec<(usize, usize)>, Calib, Vec<u32>);
 
 fn setup() -> Option<Fixture> {
