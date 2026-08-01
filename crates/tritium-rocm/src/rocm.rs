@@ -525,7 +525,7 @@ mod tests {
         };
         let vectors: Vec<_> = frozen_vectors()
             .into_iter()
-            .filter(|v| v.format == "tq2_0")
+            .filter(|v| v.format == tritium_core::TernaryFormat::Tq2_0)
             .collect();
         assert!(!vectors.is_empty(), "expected some tq2_0 frozen vectors");
 
