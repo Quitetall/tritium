@@ -435,10 +435,51 @@ fn salt_distillation_device_trainer_recovers_heldout() {
         .is_ok()
         .then(|| TensorCoreGemm::new(&backend).expect("cuBLASLt tensor-core tier"));
     let ppl_fp = perplexity_windowed(&fp, &a, &eval_ids, EVAL_WINDOW);
+
+    // The SALT fitter the student is actually trained through (see `grouping` below). Deciding it
+    // here so the PTQ baseline, every curve point, and the final score all quantize the SAME way
+    // the trainer does.
+    //
+    // This used to be `ste::salt_quantize_forward` unconditionally -- the legacy per-row AbsMean
+    // fitter -- while training ran the grouped+ITF+rotation one. Every checkpoint was then scored by
+    // a quantizer the student had never optimised against, which measures how far the master drifted
+    // out of the per-row basin rather than how well it trained. Rotation was penalised hardest,
+    // because rotation is precisely what lets a master specialise into a basis a single per-row
+    // scale cannot represent.
+    let group_cfg: Option<usize> = std::env::var("TRITIUM_DISTILL_GROUP")
+        .ok()
+        .and_then(|v| v.parse().ok());
+    let itf_cfg: usize = std::env::var("TRITIUM_DISTILL_ITF")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5);
+    let rot_cfg = match std::env::var("TRITIUM_DISTILL_ROTATE").as_deref() {
+        Ok("auto") => ste::RotationPolicy::Auto,
+        Ok("always") => ste::RotationPolicy::Always,
+        _ => ste::RotationPolicy::Never,
+    };
+    // Frozen at the INITIAL weights, exactly as `DeviceTrainer::new_with_fitter` freezes it, so the
+    // evaluator can never re-decide on a master training has moved.
+    let rot_masks: Option<Vec<Vec<u8>>> = group_cfg.map(|g| {
+        fp.iter()
+            .zip(&shapes)
+            .map(|(wf, &(n, k))| ste::rotation_mask(wf, n, k, planes, g, itf_cfg, rot_cfg))
+            .collect()
+    });
+    let deploy_quantize = |w: &[f32], n: usize, k: usize, i: usize| -> Vec<f32> {
+        match (group_cfg, &rot_masks) {
+            (Some(g), Some(masks)) => {
+                ste::salt_quantize_forward_grouped_masked(w, n, k, planes, g, itf_cfg, &masks[i])
+            }
+            _ => ste::salt_quantize_forward(w, n, k, planes),
+        }
+    };
+
     let ptq: Vec<Vec<f32>> = fp
         .iter()
         .zip(&shapes)
-        .map(|(wf, &(n, k))| ste::salt_quantize_forward(wf, n, k, planes))
+        .enumerate()
+        .map(|(i, (wf, &(n, k)))| deploy_quantize(wf, n, k, i))
         .collect();
     let ppl_ptq = perplexity_windowed(&ptq, &a, &eval_ids, EVAL_WINDOW);
 
@@ -472,39 +513,36 @@ fn salt_distillation_device_trainer_recovers_heldout() {
     // AbsMean reconstruction, which every prior distillation run used and which PTQ measured at
     // 10786x fp -- so a real run should always set it. 128 is the PTQ convention; 256 is TQ2_0's
     // deployed block.
-    let grouping = std::env::var("TRITIUM_DISTILL_GROUP")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .map(|group| SaltGrouping {
-            group,
-            // Rotation defaults to Never FOR TRAINING, which is the opposite of the PTQ default,
-            // and the difference is measured rather than assumed. Held-out ppl at steps 5/10/15/20,
-            // 135M, T=2, g128 (legacy per-row control ends at 4247 / 500x):
-            //
-            //   greedy, no rotation   3.9M -> 70k -> 33.8k -> 18.1k   monotone, 117x
-            //   greedy, rotation Auto 456k -> 65k -> 79k UP -> 40.6k  OSCILLATES, 52x
-            //   ITF=5, no rotation    117k -> 6547 -> 6472 -> 3692    monotone, 575x  <- best
-            //   ITF=5, rotation Auto  5.5M -> 71k -> 1.9M UP -> 1.8M  OSCILLATES, 1x
-            //
-            // So ITF helps training (575x beats the 500x control) while rotation destabilises it,
-            // with or without ITF. The likely cause is the STE: `salt_quantize_vjp` is the identity,
-            // but under a Hadamard every coordinate of a group feeds that group's scale in BOTH
-            // directions, so the forward is far more sensitive to a master perturbation than the
-            // identity assumes -- an effectively too-large step. Rotation is the single biggest PTQ
-            // win (548x at T=3), so it stays the PTQ default; making it usable in training needs a
-            // rotation-aware backward or a lower LR, not just this switch.
-            //
-            // TRITIUM_DISTILL_ROTATE=auto|always re-enables it for that investigation.
-            rotation: match std::env::var("TRITIUM_DISTILL_ROTATE").as_deref() {
-                Ok("auto") => ste::RotationPolicy::Auto,
-                Ok("always") => ste::RotationPolicy::Always,
-                _ => ste::RotationPolicy::Never,
-            },
-            iters: std::env::var("TRITIUM_DISTILL_ITF")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(5),
-        });
+    let grouping = group_cfg.map(|group| SaltGrouping {
+        group,
+        // Rotation defaults to Never FOR TRAINING, which is the opposite of the PTQ default,
+        // and the difference is measured rather than assumed. Held-out ppl at steps 5/10/15/20,
+        // 135M, T=2, g128 (legacy per-row control ends at 4247 / 500x):
+        //
+        //   greedy, no rotation   3.9M -> 70k -> 33.8k -> 18.1k   monotone, 117x
+        //   greedy, rotation Auto 456k -> 65k -> 79k UP -> 40.6k  OSCILLATES, 52x
+        //   ITF=5, no rotation    117k -> 6547 -> 6472 -> 3692    monotone, 575x  <- best
+        //   ITF=5, rotation Auto  5.5M -> 71k -> 1.9M UP -> 1.8M  OSCILLATES, 1x
+        //
+        // So ITF helps training (575x beats the 500x control) while rotation destabilises it,
+        // with or without ITF. The likely cause is the STE: `salt_quantize_vjp` is the identity,
+        // but under a Hadamard every coordinate of a group feeds that group's scale in BOTH
+        // directions, so the forward is far more sensitive to a master perturbation than the
+        // identity assumes -- an effectively too-large step. Rotation is the single biggest PTQ
+        // win (548x at T=3), so it stays the PTQ default; making it usable in training needs a
+        // rotation-aware backward or a lower LR, not just this switch.
+        //
+        // TRITIUM_DISTILL_ROTATE=auto|always re-enables it for that investigation.
+        rotation: match std::env::var("TRITIUM_DISTILL_ROTATE").as_deref() {
+            Ok("auto") => ste::RotationPolicy::Auto,
+            Ok("always") => ste::RotationPolicy::Always,
+            _ => ste::RotationPolicy::Never,
+        },
+        iters: std::env::var("TRITIUM_DISTILL_ITF")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5),
+    });
     if let Some(g) = grouping {
         println!(
             "SALT fitter: g{} +ITF({}) +rotation({:?})",
@@ -639,7 +677,8 @@ fn salt_distillation_device_trainer_recovers_heldout() {
             let ckpt: Vec<Vec<f32>> = (0..fp.len())
                 .map(|i| trainer.download_master(i).unwrap())
                 .zip(&shapes)
-                .map(|(wf, &(n, kk))| ste::salt_quantize_forward(&wf, n, kk, planes))
+                .enumerate()
+                .map(|(i, (wf, &(n, kk)))| deploy_quantize(&wf, n, kk, i))
                 .collect();
             let ppl = perplexity_windowed(&ckpt, &a, &eval_ids, EVAL_WINDOW);
             let tokens = step as usize * seq_len;
@@ -657,7 +696,8 @@ fn salt_distillation_device_trainer_recovers_heldout() {
     let distilled: Vec<Vec<f32>> = lat
         .iter()
         .zip(&shapes)
-        .map(|(wf, &(n, k))| ste::salt_quantize_forward(wf, n, k, planes))
+        .enumerate()
+        .map(|(i, (wf, &(n, k)))| deploy_quantize(wf, n, k, i))
         .collect();
     let ppl_distilled = perplexity_windowed(&distilled, &a, &eval_ids, EVAL_WINDOW);
     let recovery = ppl_ptq / ppl_distilled;

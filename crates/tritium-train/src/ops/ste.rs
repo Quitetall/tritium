@@ -269,6 +269,54 @@ pub fn salt_quantize_forward_grouped(
     out
 }
 
+/// [`salt_quantize_forward_grouped`] with the rotation decisions supplied as a **fixed mask** rather
+/// than re-decided per call.
+///
+/// This is what a *trainer* needs, and what evaluating a trained model needs.
+/// [`RotationPolicy::Auto`] picks per group by comparing both fits, so it re-decides every time it
+/// is called: run it on a master that training has moved and it can choose differently than the
+/// trainer did, quantizing the checkpoint in a basis the student never optimised for. A frozen mask
+/// removes that degree of freedom — the same reason `DeviceTrainer` freezes its mask at construction.
+///
+/// `mask` is one byte per group (`1` = rotate) in row-major group order,
+/// `row * cols.div_ceil(group) + block` — exactly [`rotation_mask`]'s layout. Groups whose length is
+/// not a power of two are never rotated regardless of their bit, matching the unmasked path.
+#[must_use]
+pub fn salt_quantize_forward_grouped_masked(
+    wf: &[f32],
+    rows: usize,
+    cols: usize,
+    t: usize,
+    group: usize,
+    iters: usize,
+    mask: &[u8],
+) -> Vec<f32> {
+    let group = group.max(1);
+    let per_row = cols.div_ceil(group);
+    assert_eq!(
+        mask.len(),
+        rows * per_row,
+        "rotation mask must carry one byte per group"
+    );
+    let mut out = vec![0.0f32; wf.len()];
+    let mut buf: Vec<f32> = Vec::with_capacity(group);
+    for r in 0..rows {
+        let src = &wf[r * cols..(r + 1) * cols];
+        let dst = &mut out[r * cols..(r + 1) * cols];
+        for (b, (bs, bd)) in src.chunks(group).zip(dst.chunks_mut(group)).enumerate() {
+            // Always/Never rather than Auto: the bit already IS the decision.
+            let policy = if mask[r * per_row + b] == 1 {
+                RotationPolicy::Always
+            } else {
+                RotationPolicy::Never
+            };
+            let (fit, _) = fit_group(bs, t, iters, policy, &mut buf);
+            bd.copy_from_slice(&fit);
+        }
+    }
+    out
+}
+
 /// Fit one scale group, returning `(reconstruction, was_rotated)`.
 ///
 /// This is the **single** place the rotation decision is made. Both

@@ -231,3 +231,104 @@ fn rotation_mask_matches_the_decisions_the_fitter_made() {
         }
     }
 }
+
+/// The masked fitter must be *the same fitter*, just with the decision supplied instead of made.
+/// Feed it `rotation_mask`'s own output and it has to reproduce `salt_quantize_forward_grouped`
+/// byte-for-byte.
+///
+/// This is the gate that makes trustworthy evaluation possible. Training freezes a rotation mask at
+/// construction; scoring the resulting checkpoint with `Auto` would let the evaluator re-decide on a
+/// master that training has moved, quantizing it in a basis the student never optimised for — which
+/// looks like the student got worse when only the measurement changed.
+#[test]
+fn masked_fitter_reproduces_the_policy_it_was_derived_from() {
+    for &(rows, cols, group) in &[(4usize, 128usize, 128usize), (3, 512, 256), (5, 576, 128)] {
+        // Heavy tails on alternating rows so Auto genuinely splits both ways.
+        let mut w = seeded(0x3A5C ^ cols as u64, rows * cols, -1.0, 1.0);
+        for r in (0..rows).step_by(2) {
+            for k in [5usize, 61, 110] {
+                if r * cols + k < w.len() {
+                    w[r * cols + k] *= 7.0;
+                }
+            }
+        }
+        for t in 1..=3 {
+            for policy in [
+                RotationPolicy::Never,
+                RotationPolicy::Always,
+                RotationPolicy::Auto,
+            ] {
+                let want = ste::salt_quantize_forward_grouped(&w, rows, cols, t, group, 5, policy);
+                let mask = ste::rotation_mask(&w, rows, cols, t, group, 5, policy);
+                let got =
+                    ste::salt_quantize_forward_grouped_masked(&w, rows, cols, t, group, 5, &mask);
+                assert_eq!(
+                    want, got,
+                    "masked fitter must match {policy:?} exactly ({rows}x{cols} g{group} T{t})"
+                );
+            }
+        }
+    }
+}
+
+/// A mask evaluated against DRIFTED weights must still honour the frozen decision — that is the
+/// whole point of passing a mask. Pins that the masked path never re-decides.
+#[test]
+fn masked_fitter_honours_a_frozen_decision_on_drifted_weights() {
+    let (rows, cols, group) = (4usize, 128usize, 128usize);
+    let w0 = seeded(0xD817, rows * cols, -1.0, 1.0);
+    let mask = ste::rotation_mask(&w0, rows, cols, 2, group, 5, RotationPolicy::Auto);
+
+    // Move the weights enough that Auto would plausibly choose differently.
+    let drifted: Vec<f32> = w0
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| if i % 7 == 0 { v * 6.0 } else { v * 0.6 })
+        .collect();
+
+    let frozen =
+        ste::salt_quantize_forward_grouped_masked(&drifted, rows, cols, 2, group, 5, &mask);
+    let redecided =
+        ste::salt_quantize_forward_grouped(&drifted, rows, cols, 2, group, 5, RotationPolicy::Auto);
+    let redecided_mask =
+        ste::rotation_mask(&drifted, rows, cols, 2, group, 5, RotationPolicy::Auto);
+
+    let flips = mask
+        .iter()
+        .zip(&redecided_mask)
+        .filter(|(a, b)| a != b)
+        .count();
+    println!("drift flipped {flips}/{} group decisions", mask.len());
+
+    // Rebuild from the frozen mask by hand and demand equality with the masked path.
+    let per_row = cols.div_ceil(group);
+    let mut expect = vec![0.0f32; drifted.len()];
+    for r in 0..rows {
+        let src = &drifted[r * cols..(r + 1) * cols];
+        let dst = &mut expect[r * cols..(r + 1) * cols];
+        for (b, (bs, bd)) in src.chunks(group).zip(dst.chunks_mut(group)).enumerate() {
+            let policy = if mask[r * per_row + b] == 1 {
+                RotationPolicy::Always
+            } else {
+                RotationPolicy::Never
+            };
+            bd.copy_from_slice(&ste::salt_quantize_forward_grouped(
+                bs,
+                1,
+                bs.len(),
+                2,
+                group,
+                5,
+                policy,
+            ));
+        }
+    }
+    assert_eq!(frozen, expect, "masked path must honour the frozen mask");
+    if flips > 0 {
+        assert_ne!(
+            frozen, redecided,
+            "with {flips} flipped decisions the frozen and re-decided fits must differ — \
+             that difference is exactly the eval bug this API exists to prevent"
+        );
+    }
+}
