@@ -47,7 +47,15 @@ const EVAL_WINDOW: usize = 512;
 const CALIB_WINDOWS: usize = 8;
 const ITERS: usize = 5;
 
+/// `TRITIUM_MODEL_DIR` selects the model, so the same sweep runs across a scale curve. Every SOTA
+/// ternary number is reported at 7B+, where there is far more redundancy to spend on quantization
+/// error; SmolLM2-135M is the hardest case anyone benchmarks. The SmolLM2 family shares one
+/// tokenizer (vocab 49152) and ties its head at every size, so 135M/360M/1.7B are directly
+/// comparable on the same corpus token ids with no harness change.
 fn model_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("TRITIUM_MODEL_DIR") {
+        return PathBuf::from(dir);
+    }
     let home = std::env::var("HOME").unwrap_or_default();
     PathBuf::from(home).join(".cache/tritium-models/smollm2-135m")
 }
@@ -379,10 +387,19 @@ fn activation_aware_fitting_closes_the_gap() {
 /// would break multiply-freeness on the single largest decode matmul; giving it extra ternary planes
 /// keeps every row multiply-free and still lands under int4 overall.
 ///
-/// `TRITIUM_SMOOTH_ALPHA` selects the fold strength. The default 0.75 is the measured T=1 optimum:
-/// the sweep above is monotone to 0.75 (127261× → 1619×) and then turns back over at α=1.00
-/// (7092×), because full salience weighting inflates the weight matrix's own dynamic range faster
-/// than it buys resolution where the activations are.
+/// `TRITIUM_SMOOTH_ALPHA` selects the fold strength, and **it must be calibrated per model** — the
+/// optimum shifts down as the model grows, so inheriting another model's value is a real error, not
+/// a rounding one:
+///
+/// | model | α* | penalty at 135M's α=0.75 |
+/// |---|---|---|
+/// | SmolLM2-135M | 0.75 | — |
+/// | SmolLM2-360M | 0.50 | 4.2× worse at T=1 (2915× → 12296×) |
+///
+/// Both curves are U-shaped for the same reason — past the optimum, salience weighting inflates the
+/// weight matrix's own dynamic range faster than it buys resolution where the activations are — but
+/// the turning point is a property of the model, not a constant. The 0.75 default below is correct
+/// **only for the default 135M**; set the variable when pairing this with `TRITIUM_MODEL_DIR`.
 #[test]
 #[ignore = "slow head-allocation sweep; needs SmolLM2-135M; run explicitly"]
 fn planes_where_they_matter_rescue_the_head() {
