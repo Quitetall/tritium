@@ -515,24 +515,30 @@ fn salt_distillation_device_trainer_recovers_heldout() {
     // deployed block.
     let grouping = group_cfg.map(|group| SaltGrouping {
         group,
-        // Rotation defaults to Never FOR TRAINING, which is the opposite of the PTQ default,
-        // and the difference is measured rather than assumed. Held-out ppl at steps 5/10/15/20,
-        // 135M, T=2, g128 (legacy per-row control ends at 4247 / 500x):
+        // Rotation. An earlier revision defaulted this to Never on the strength of a four-row table
+        // measured through the WRONG eval quantizer; 9682a72 fixed that and the result REVERSES.
+        // Rotation is the largest effect here. Held-out gap-to-fp, 135M T=2 g128, steps 5/10/15/20:
         //
-        //   greedy, no rotation   3.9M -> 70k -> 33.8k -> 18.1k   monotone, 117x
-        //   greedy, rotation Auto 456k -> 65k -> 79k UP -> 40.6k  OSCILLATES, 52x
-        //   ITF=5, no rotation    117k -> 6547 -> 6472 -> 3692    monotone, 575x  <- best
-        //   ITF=5, rotation Auto  5.5M -> 71k -> 1.9M UP -> 1.8M  OSCILLATES, 1x
+        //   arm                PTQ start       5      10      15      20
+        //   legacy per-row      107713x    46583    1889     839     215
+        //   g128 greedy          72127x   121241    3309    1489     760
+        //   g128 greedy +rot        808x      311     105     135      83
+        //   g128 ITF             67565x     4518     192     300     133
+        //   g128 ITF   +rot        5.25x      109    17.6    22.4     258
         //
-        // So ITF helps training (575x beats the 500x control) while rotation destabilises it,
-        // with or without ITF. The likely cause is the STE: `salt_quantize_vjp` is the identity,
-        // but under a Hadamard every coordinate of a group feeds that group's scale in BOTH
-        // directions, so the forward is far more sensitive to a master perturbation than the
-        // identity assumes -- an effectively too-large step. Rotation is the single biggest PTQ
-        // win (548x at T=3), so it stays the PTQ default; making it usable in training needs a
-        // rotation-aware backward or a lower LR, not just this switch.
+        // Rotation improves the PTQ START by ~13000x (67565x -> 5.25x) at 4.26 bpw with no salience
+        // fold and no training at all.
         //
-        // TRITIUM_DISTILL_ROTATE=auto|always re-enables it for that investigation.
+        // The remaining problem is the OPPOSITE of the one first reported: the rotated arm starts
+        // near-optimal and training DEGRADES it (5.25x -> 109x by step 5). That is an LR tuned for
+        // an init beginning at ~70000x applied to one beginning at 5x -- an initialisation-quality
+        // mismatch, not an estimator bug. It is specifically NOT a property of rotation's Jacobian:
+        // tr(J), ||J||_F, ||J||_2 and the entire spectrum are unitarily invariant, so no per-group
+        // scalar differs between the rotated and plain bases. The fix is warmup / a lower LR for
+        // well-initialised starts, not a rotation-aware backward.
+        //
+        // Default stays Never only because the LR schedule has not yet been retuned for a good
+        // init; TRITIUM_DISTILL_ROTATE=auto|always is the better fitter once it has been.
         rotation: match std::env::var("TRITIUM_DISTILL_ROTATE").as_deref() {
             Ok("auto") => ste::RotationPolicy::Auto,
             Ok("always") => ste::RotationPolicy::Always,
