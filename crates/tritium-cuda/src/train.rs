@@ -1330,16 +1330,17 @@ pub struct SaltGrouping {
     pub group: usize,
     /// Rotation policy. Decided **once on the host** at construction — see [`ste::rotation_mask`].
     pub rotation: ste::RotationPolicy,
-    /// ITF alternations. **Must be `0` today**: the device kernel fits each group with greedy
-    /// AbsMean, not iterative ternary fitting, so any other value would make the host rotation mask
-    /// disagree with the fitter that actually runs — the mask would be chosen as optimal for ITF and
-    /// then applied to a greedy fit. `new_with_fitter` rejects non-zero rather than accept that.
+    /// Iterative-ternary-fitting alternations per plane (`0` = the greedy AbsMean fit, bit-for-bit).
+    /// Each alternation moves the scale to its least-squares optimum `s* = <r,t>/<t,t>` and
+    /// re-rounds, keeping a candidate only on a **strict** SSE improvement — so more iterations can
+    /// never be worse than fewer. They converge in a handful; `5` is what the PTQ sweeps used.
     ///
-    /// **Known gap.** On synthetic weights ITF cuts reconstruction SSE a further 1.4× / 2.7× / 4.4×
-    /// at T=1/2/3 *on top of* rotation, so the device path is currently strictly weaker than the
-    /// host PTQ stack that produced 1.32× fp. Implementing the LS-optimal alternation
-    /// (`s* = <r,t>/<t,t>`) in `salt_quantize_forward_grouped` is the next step before a
-    /// distillation run can claim to start from the measured PTQ quality.
+    /// Worth 1.4× / 2.7× / 4.4× lower reconstruction SSE at T=1/2/3 *on top of* rotation, so this is
+    /// what lets a distillation run start from the PTQ quality the host stack measured.
+    ///
+    /// The value is used for both the device fit and the host rotation-mask decision, which must
+    /// agree: a mask chosen under one fitter and applied to another is worse than either used
+    /// consistently.
     pub iters: usize,
 }
 
@@ -1489,11 +1490,9 @@ impl<'a> DeviceTrainer<'a> {
                     g.group
                 )));
             }
-            if g.iters != 0 {
+            if g.iters > 16 {
                 return Err(BackendError::InvalidInput(format!(
-                    "the device grouped SALT kernel fits with greedy AbsMean, not ITF, so \
-                     SaltGrouping::iters must be 0 (got {}); a non-zero value would pick the \
-                     rotation mask with a fitter the device does not run",
+                    "SALT ITF iterations must be <= 16 (they converge in a handful), got {}",
                     g.iters
                 )));
             }
@@ -1527,8 +1526,8 @@ impl<'a> DeviceTrainer<'a> {
             // Decide rotation once, on the host, from the initial weights. Ordering is
             // load-bearing: this reads `param.master`, the caller's host slice, and must run
             // before the upload below takes ownership of the device copy the kernel will fit.
-            // `g.iters` is 0 by the check above — the mask must be chosen with the same greedy
-            // fitter the device kernel runs.
+            // The mask must be chosen with the SAME fitter the device kernel runs, so `g.iters`
+            // feeds both this decision and the kernel launch.
             let rotate = match grouping {
                 Some(g) if g.rotation != ste::RotationPolicy::Never => {
                     let mask = ste::rotation_mask(
@@ -1764,6 +1763,7 @@ impl<'a> DeviceTrainer<'a> {
                     param.cols,
                     param.salt_planes,
                     g.group,
+                    g.iters,
                 )?,
                 None => self.backend.salt_quantize_forward_sherry_dev(
                     &param.master.buf,
@@ -6572,86 +6572,83 @@ mod tests {
                 .collect();
             for planes in 1..=3usize {
                 for group in [128usize, 256] {
-                    let grouping = SaltGrouping {
-                        group,
-                        rotation: ste::RotationPolicy::Auto,
-                        iters: 0,
-                    };
-                    let params = [DeviceTrainParam {
-                        master: &master,
-                        rows,
-                        cols,
-                        salt_planes: planes,
-                        optimizer: AdamW::new(1e-3),
-                    }];
-                    let mut trainer = DeviceTrainer::new_with_fitter(
-                        &backend,
-                        &params,
-                        DeviceTrainerWeightStorage::DenseQuantized,
-                        MomentPrecision::F32,
-                        MasterPrecision::F32,
-                        Some(grouping),
-                    )
-                    .expect("grouped trainer");
-                    trainer.prepare_quantized().expect("prepare");
-                    let mut got = vec![0.0f32; master.len()];
-                    backend
-                        .dev_download(&trainer.quantized(0).unwrap().buf, &mut got)
-                        .expect("download");
-                    let want = ste::salt_quantize_forward_grouped(
-                        &master,
-                        rows,
-                        cols,
-                        planes,
-                        group,
-                        0, // greedy: the fitter the device kernel implements (see SaltGrouping::iters)
-                        ste::RotationPolicy::Auto,
-                    );
-                    let delta = got
-                        .iter()
-                        .zip(&want)
-                        .map(|(a, b)| (a - b).abs())
-                        .fold(0.0f32, f32::max);
-                    assert!(
-                        delta < 2e-4,
-                        "grouped trainer {rows}x{cols} g{group} T{planes}: max|delta| {delta:.3e}"
-                    );
+                    for iters in [0usize, 1, 5] {
+                        let grouping = SaltGrouping {
+                            group,
+                            rotation: ste::RotationPolicy::Auto,
+                            iters,
+                        };
+                        let params = [DeviceTrainParam {
+                            master: &master,
+                            rows,
+                            cols,
+                            salt_planes: planes,
+                            optimizer: AdamW::new(1e-3),
+                        }];
+                        let mut trainer = DeviceTrainer::new_with_fitter(
+                            &backend,
+                            &params,
+                            DeviceTrainerWeightStorage::DenseQuantized,
+                            MomentPrecision::F32,
+                            MasterPrecision::F32,
+                            Some(grouping),
+                        )
+                        .expect("grouped trainer");
+                        trainer.prepare_quantized().expect("prepare");
+                        let mut got = vec![0.0f32; master.len()];
+                        backend
+                            .dev_download(&trainer.quantized(0).unwrap().buf, &mut got)
+                            .expect("download");
+                        let want = ste::salt_quantize_forward_grouped(
+                            &master,
+                            rows,
+                            cols,
+                            planes,
+                            group,
+                            iters,
+                            ste::RotationPolicy::Auto,
+                        );
+                        let delta = got
+                            .iter()
+                            .zip(&want)
+                            .map(|(a, b)| (a - b).abs())
+                            .fold(0.0f32, f32::max);
+                        assert!(
+                            delta < 2e-4,
+                            "grouped trainer {rows}x{cols} g{group} T{planes} itf{iters}: max|delta| {delta:.3e}"
+                        );
+                        // Vacuity guard: with ITF on, the fit must actually MOVE off the greedy
+                        // one, otherwise this comparison could pass with the iterations never firing.
+                        if iters > 0 {
+                            let greedy = ste::salt_quantize_forward_grouped(
+                                &master,
+                                rows,
+                                cols,
+                                planes,
+                                group,
+                                0,
+                                ste::RotationPolicy::Auto,
+                            );
+                            let moved = got
+                                .iter()
+                                .zip(&greedy)
+                                .map(|(a, b)| (a - b).abs())
+                                .fold(0.0f32, f32::max);
+                            assert!(
+                                moved > 1e-6,
+                                "ITF never fired: itf{iters} equals greedy ({rows}x{cols} g{group} T{planes})"
+                            );
+                        }
 
-                    // Sherry must be refused, not quietly dropped.
-                    trainer.set_sherry_alpha(0.25);
-                    let err = trainer.prepare_quantized().unwrap_err();
-                    assert!(
-                        matches!(&err, BackendError::InvalidInput(m) if m.contains("Sherry")),
-                        "grouped + Sherry must error, got {err:?}"
-                    );
+                        // Sherry must be refused, not quietly dropped.
+                        trainer.set_sherry_alpha(0.25);
+                        let err = trainer.prepare_quantized().unwrap_err();
+                        assert!(
+                            matches!(&err, BackendError::InvalidInput(m) if m.contains("Sherry")),
+                            "grouped + Sherry must error, got {err:?}"
+                        );
+                    }
                 }
-
-                // A fitter the device does not implement must be refused at construction, not
-                // silently downgraded to greedy with an ITF-chosen rotation mask.
-                let params = [DeviceTrainParam {
-                    master: &master,
-                    rows,
-                    cols,
-                    salt_planes: planes,
-                    optimizer: AdamW::new(1e-3),
-                }];
-                let err = DeviceTrainer::new_with_fitter(
-                    &backend,
-                    &params,
-                    DeviceTrainerWeightStorage::DenseQuantized,
-                    MomentPrecision::F32,
-                    MasterPrecision::F32,
-                    Some(SaltGrouping {
-                        group: 128,
-                        rotation: ste::RotationPolicy::Auto,
-                        iters: 5,
-                    }),
-                )
-                .expect_err("ITF is not implemented on device; must be refused");
-                assert!(
-                    matches!(&err, BackendError::InvalidInput(m) if m.contains("greedy AbsMean")),
-                    "expected the ITF-unsupported error, got {err:?}"
-                );
 
                 // `None` keeps the committed per-row reconstruction bit-for-bit.
                 let params = [DeviceTrainParam {
@@ -6710,7 +6707,7 @@ mod tests {
                     // (a) no rotation
                     backend
                         .salt_quantize_forward_grouped_dev(
-                            &d_master, &mut d_out, None, rows, cols, planes, group,
+                            &d_master, &mut d_out, None, rows, cols, planes, group, 0,
                         )
                         .unwrap();
                     let mut got = vec![0.0f32; rows * cols];
@@ -6742,6 +6739,7 @@ mod tests {
                             cols,
                             planes,
                             group,
+                            0,
                         )
                         .unwrap();
                     backend.dev_download(&d_out, &mut got).unwrap();

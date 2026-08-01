@@ -3023,6 +3023,7 @@ impl CudaBackend {
         cols: usize,
         planes: usize,
         group: usize,
+        iters: usize,
     ) -> Result<(), BackendError> {
         if !(1..=3).contains(&planes) {
             return Err(BackendError::InvalidInput(format!(
@@ -3061,6 +3062,8 @@ impl CudaBackend {
             .map_err(|_| BackendError::InvalidInput("SALT cols exceed i32::MAX".into()))?;
         let planes_i = planes as i32;
         let group_i = group as i32;
+        let iters_i = i32::try_from(iters)
+            .map_err(|_| BackendError::InvalidInput("SALT ITF iters exceed i32::MAX".into()))?;
 
         // 128 threads: a power of two for the tree reduction, and <= 8 owned elements per thread at
         // the 256 group cap (the kernel's per-thread accumulator bound).
@@ -3090,7 +3093,8 @@ impl CudaBackend {
             .arg(&rows_i)
             .arg(&cols_i)
             .arg(&planes_i)
-            .arg(&group_i);
+            .arg(&group_i)
+            .arg(&iters_i);
         // SAFETY: one block per group with 128 threads and the declared shared bytes; every buffer
         // length is validated above and the scalars match the kernel ABI.
         #[allow(unsafe_code)]

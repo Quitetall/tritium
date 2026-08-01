@@ -499,7 +499,7 @@ extern "C" __global__ void salt_quantize_forward_grouped(
     const float* __restrict__ master,        // [rows, cols]
     float* __restrict__ quantized,           // [rows, cols]
     const unsigned char* __restrict__ rotate_mask, // [total_groups] 0/1, may be null
-    int rows, int cols, int planes, int group)
+    int rows, int cols, int planes, int group, int iters)
 {
     extern __shared__ float sh[];            // group floats, then blockDim.x for the reduction
     const int groups_per_row = (cols + group - 1) / group;
@@ -540,28 +540,98 @@ extern "C" __global__ void salt_quantize_forward_grouped(
     int owned = 0;
     for (int i = threadIdx.x; i < n; i += blockDim.x) { acc[owned] = 0.0f; owned++; }
 
+    // Every reduction below is block-wide, so `red[0]` is identical in all threads and every
+    // `break` driven by it is taken uniformly — which is what keeps the __syncthreads() inside the
+    // ITF loop legal.
+#define SALT_BLOCK_SUM(expr_partial)                                                  \
+    do {                                                                              \
+        red[threadIdx.x] = (expr_partial);                                            \
+        __syncthreads();                                                              \
+        for (int _s = blockDim.x >> 1; _s > 0; _s >>= 1) {                            \
+            if (threadIdx.x < _s) red[threadIdx.x] += red[threadIdx.x + _s];          \
+            __syncthreads();                                                          \
+        }                                                                             \
+    } while (0)
+
+    float trit[8];
+    float cand_trit[8];
     for (int p = 0; p < planes; ++p) {
+        // Plane 0 of the fit is always AbsMean, so iters == 0 reproduces the greedy expansion
+        // bit-for-bit and the ITF path is a pure refinement on top (mirrors host fit_plane_itf).
         float partial = 0.0f;
         for (int i = threadIdx.x; i < n; i += blockDim.x) partial += fabsf(sh[i]);
-        red[threadIdx.x] = partial;
-        __syncthreads();
-        for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
-            if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
-            __syncthreads();
-        }
+        SALT_BLOCK_SUM(partial);
         float scale = red[0] / (float)n;
-        if (scale > 0.0f) {
-            int k = 0;
-            for (int i = threadIdx.x; i < n; i += blockDim.x) {
-                float trit = fminf(1.0f, fmaxf(-1.0f, roundf(sh[i] / scale)));
-                float contrib = scale * trit;
-                acc[k] += contrib;
-                sh[i] -= contrib;
-                k++;
-            }
+        __syncthreads();
+        if (!(scale > 0.0f) || !isfinite(scale)) {
+            // Dead group: the host returns (0, zeros), i.e. this plane contributes nothing.
+            __syncthreads();
+            continue;
         }
+
+        { int k = 0;
+          for (int i = threadIdx.x; i < n; i += blockDim.x) {
+              trit[k] = fminf(1.0f, fmaxf(-1.0f, roundf(sh[i] / scale))); k++; } }
+        __syncthreads();
+
+        // best_sse = SUM (r - scale*t)^2
+        partial = 0.0f;
+        { int k = 0;
+          for (int i = threadIdx.x; i < n; i += blockDim.x) {
+              float d = sh[i] - scale * trit[k]; partial += d * d; k++; } }
+        SALT_BLOCK_SUM(partial);
+        float best_sse = red[0];
+        __syncthreads();
+
+        for (int it = 0; it < iters; ++it) {
+            // s* = <r,t> / <t,t>, the least-squares optimal scale for the current trits.
+            partial = 0.0f;
+            { int k = 0;
+              for (int i = threadIdx.x; i < n; i += blockDim.x) { partial += sh[i] * trit[k]; k++; } }
+            SALT_BLOCK_SUM(partial);
+            float num = red[0];
+            __syncthreads();
+
+            partial = 0.0f;
+            { int k = 0;
+              for (int i = threadIdx.x; i < n; i += blockDim.x) { partial += trit[k] * trit[k]; k++; } }
+            SALT_BLOCK_SUM(partial);
+            float den = red[0];
+            __syncthreads();
+
+            if (!(den > 0.0f)) break;              // host: ls_optimal_scale -> None
+            float cand = num / den;
+            if (!(cand > 0.0f) || !isfinite(cand)) break;
+
+            { int k = 0;
+              for (int i = threadIdx.x; i < n; i += blockDim.x) {
+                  cand_trit[k] = fminf(1.0f, fmaxf(-1.0f, roundf(sh[i] / cand))); k++; } }
+            __syncthreads();
+
+            partial = 0.0f;
+            { int k = 0;
+              for (int i = threadIdx.x; i < n; i += blockDim.x) {
+                  float d = sh[i] - cand * cand_trit[k]; partial += d * d; k++; } }
+            SALT_BLOCK_SUM(partial);
+            float cand_sse = red[0];
+            __syncthreads();
+
+            // Accept only on a strict improvement, so the result is never worse than AbsMean.
+            if (cand_sse >= best_sse) break;
+            scale = cand;
+            best_sse = cand_sse;
+            for (int k = 0; k < owned; ++k) trit[k] = cand_trit[k];
+        }
+
+        { int k = 0;
+          for (int i = threadIdx.x; i < n; i += blockDim.x) {
+              float contrib = scale * trit[k];
+              acc[k] += contrib;
+              sh[i] -= contrib;
+              k++; } }
         __syncthreads();
     }
+#undef SALT_BLOCK_SUM
 
     // Put the reconstruction back into shared, un-rotate, and store.
     { int k = 0;
