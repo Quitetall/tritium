@@ -15,7 +15,11 @@ mod common;
 
 use std::path::PathBuf;
 
-use common::{Calib, calibrate, extract, fold, forward, logits_of, perplexity_windowed};
+use common::{extract, forward, logits_of, perplexity_windowed};
+// `Calib`, `calibrate` and `fold` are used only by the cuda-gated
+// `salt_distillation_device_trainer_recovers_heldout` test below.
+#[cfg(feature = "cuda")]
+use common::{Calib, calibrate, fold};
 use tritium_nn::ModelRunner;
 use tritium_train::ops::ste;
 use tritium_train::{AdamW, Optimizer, Tape};
