@@ -483,7 +483,20 @@ fn salt_distillation_device_trainer_recovers_heldout() {
         .collect();
     let ppl_ptq = perplexity_windowed(&ptq, &a, &eval_ids, EVAL_WINDOW);
 
-    let opt = AdamW::new(LR);
+    // TRITIUM_DISTILL_LR shadows the file const so the schedule can be retuned per START QUALITY.
+    // The committed 2e-3 was chosen against a PTQ start of ~1e5x fp; the grouped+rotated fitter
+    // starts at ~5x, where the same LR moves the weights far too aggressively and training loses
+    // ground it should never have given up. Default is the const, so the committed gate is unchanged.
+    let lr: f32 = std::env::var("TRITIUM_DISTILL_LR")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(LR);
+    println!(
+        "lr {lr:e} | PTQ start {:.2}x fp  (a start this good needs a gentler schedule)",
+        ppl_ptq / ppl_fp
+    );
+
+    let opt = AdamW::new(lr);
     let specs: Vec<_> = fp
         .iter()
         .zip(&shapes)
@@ -597,11 +610,11 @@ fn salt_distillation_device_trainer_recovers_heldout() {
     let lr_sched = std::env::var("TRITIUM_DISTILL_WARMUP")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
-        .map(|warmup| LrSchedule::new(LR, LR * 0.05, warmup.min(steps), steps.max(1)));
+        .map(|warmup| LrSchedule::new(lr, lr * 0.05, warmup.min(steps), steps.max(1)));
     if lr_sched.is_some() {
         println!(
-            "lr schedule: warmup+cosine, peak {LR:e} → min {:e}",
-            LR * 0.05
+            "lr schedule: warmup+cosine, peak {lr:e} → min {:e}",
+            lr * 0.05
         );
     }
 
