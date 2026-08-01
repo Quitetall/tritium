@@ -64,7 +64,7 @@ jobs:
       # register implies wgpu; hosted runners compile it fine (no adapter needed).
       - run: cargo clippy -p tritium-wgpu --features register --all-targets -- -D warnings
       # Downstream cuda-gated consumers (tritium-cli/nccl implies its cuda).
-      - run: cargo clippy -p tritium-nn -p tritium-cli -p tritium-py -p tritium-benches --features tritium-nn/cuda,tritium-cli/nccl,tritium-py/cuda,tritium-benches/cuda --all-targets -- -D warnings
+      - run: cargo clippy -p tritium-nn -p tritium-cli -p tritium-py -p tritium-salt -p tritium-benches --features tritium-nn/cuda,tritium-cli/nccl,tritium-py/cuda,tritium-salt/cuda,tritium-benches/cuda --all-targets -- -D warnings
       - run: cargo clippy -p tritium-serve --features cuda,e2e,device-loss-qualification --all-targets -- -D warnings
 
   # Release compatibility claims are generated from a strict manifest. A cell
