@@ -54,9 +54,32 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
+    println!("cargo:rerun-if-env-changed=TRITIUM_CHECK_ONLY");
 
     if std::env::var_os("CARGO_FEATURE_CUDA").is_none() {
         // Default (cpu-only) build: nothing to compile, no toolkit required.
+        return;
+    }
+
+    // TRITIUM_CHECK_ONLY=1: type-check/lint the cuda-gated Rust without a CUDA
+    // toolkit. The `include_str!`s resolve against empty placeholder PTX, so the
+    // crate compiles but any attempt to *load* a kernel from such a build fails
+    // at runtime. This is what lets a hosted CI runner clippy the cuda feature
+    // (see the gpu-feature-check lane) — never ship artifacts from this mode.
+    if check_only() {
+        let out_dir = PathBuf::from(
+            std::env::var_os("OUT_DIR").expect("OUT_DIR is always set by cargo for build scripts"),
+        );
+        for ptx in [
+            "tq2_0_add.ptx",
+            "tq2_0_imma.ptx",
+            "decode.ptx",
+            "train_grad.ptx",
+            "salt_v2.ptx",
+        ] {
+            std::fs::write(out_dir.join(ptx), "")
+                .expect("tritium-cuda: failed to write check-only placeholder PTX");
+        }
         return;
     }
 
@@ -172,6 +195,12 @@ fn compile_ptx(nvcc: &Path, src: &Path, ptx_path: &Path, arch: &str, extra: &[&s
         "tritium-cuda: nvcc reported success but {} was not produced",
         ptx_path.display()
     );
+}
+
+/// Whether this build is a toolkit-free compile check (`TRITIUM_CHECK_ONLY=1`).
+/// Any value other than unset/`0` enables it.
+fn check_only() -> bool {
+    std::env::var_os("TRITIUM_CHECK_ONLY").is_some_and(|v| v != "0")
 }
 
 /// Locate the `nvcc` binary: prefer the toolkit pointed at by `CUDA_PATH` /

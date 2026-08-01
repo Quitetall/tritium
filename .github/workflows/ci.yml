@@ -37,6 +37,36 @@ jobs:
       # on the hosted macOS/Windows runners.
       - run: cargo test --workspace --exclude tritium-py # unit, integration, and doc tests
 
+  # Guards the class of break from issue #1: Rust code behind GPU-toolkit
+  # features (cuda / nccl / rocm / wgpu) that only the manual self-hosted lanes
+  # compile, so type errors and lint breaks bitrot invisibly until someone with
+  # the hardware hits them (e.g. the rocm conformance test's TernaryFormat
+  # mismatch, or the cuda-gated imports that broke the cpu clippy gate).
+  # TRITIUM_CHECK_ONLY=1 makes the tritium-cuda / tritium-rocm build scripts
+  # emit empty placeholder kernel artifacts instead of invoking nvcc / hipcc,
+  # so a plain hosted runner can type-check + lint every gated target. Nothing
+  # built here is ever run; the self-hosted lanes remain the execution gates.
+  gpu-feature-check:
+    name: clippy · gpu-feature code (no toolkit)
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: "-D warnings"
+      TRITIUM_CHECK_ONLY: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      # nccl + device-loss-qualification both imply cuda; together they cover
+      # every cuda-gated cfg in the backend crate.
+      - run: cargo clippy -p tritium-cuda --features nccl,device-loss-qualification --all-targets -- -D warnings
+      - run: cargo clippy -p tritium-rocm --features rocm --all-targets -- -D warnings
+      # register implies wgpu; hosted runners compile it fine (no adapter needed).
+      - run: cargo clippy -p tritium-wgpu --features register --all-targets -- -D warnings
+      # Downstream cuda-gated consumers (tritium-cli/nccl implies its cuda).
+      - run: cargo clippy -p tritium-nn -p tritium-cli -p tritium-py -p tritium-benches --features tritium-nn/cuda,tritium-cli/nccl,tritium-py/cuda,tritium-benches/cuda --all-targets -- -D warnings
+      - run: cargo clippy -p tritium-serve --features cuda,e2e,device-loss-qualification --all-targets -- -D warnings
+
   # Release compatibility claims are generated from a strict manifest. A cell
   # cannot become supported without a digest-bound, revision-bound pass receipt.
   compatibility-matrix:

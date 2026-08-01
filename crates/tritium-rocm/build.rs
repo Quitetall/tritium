@@ -38,9 +38,26 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=ROCM_PATH");
     println!("cargo:rerun-if-env-changed=HIP_PATH");
+    println!("cargo:rerun-if-env-changed=TRITIUM_CHECK_ONLY");
 
     if std::env::var_os("CARGO_FEATURE_ROCM").is_none() {
         // Default (cpu-only) build: nothing to compile, no toolkit required.
+        return;
+    }
+
+    // TRITIUM_CHECK_ONLY=1: type-check/lint the rocm-gated Rust without a ROCm
+    // toolkit. The `include_bytes!` resolves against an empty placeholder code
+    // object, so the crate compiles but nothing from this mode can ever load on
+    // a device. This is what lets a hosted CI runner clippy the rocm feature
+    // (see the gpu-feature-check lane) — the exact lane that would have caught
+    // the `TernaryFormat` test bitrot fixed in PR #2. Link directives are also
+    // skipped: check builds never link.
+    if std::env::var_os("TRITIUM_CHECK_ONLY").is_some_and(|v| v != "0") {
+        let out_dir = PathBuf::from(
+            std::env::var_os("OUT_DIR").expect("OUT_DIR is always set by cargo for build scripts"),
+        );
+        std::fs::write(out_dir.join("tq2_0_add.co"), b"")
+            .expect("tritium-rocm: failed to write check-only placeholder code object");
         return;
     }
 

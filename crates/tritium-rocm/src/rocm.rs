@@ -78,6 +78,8 @@ struct DeviceAlloc {
 // pointer is only ever used through the HIP runtime, which is internally
 // thread-safe for these calls. So the handle is safe to send/share across threads.
 unsafe impl Send for DeviceAlloc {}
+// SAFETY: same reasoning as `Send` above — shared references only ever reach the
+// internally thread-safe HIP runtime.
 unsafe impl Sync for DeviceAlloc {}
 
 impl DeviceAlloc {
@@ -212,6 +214,8 @@ pub struct RocmBackend {
 // construction. So the backend is safe to send/share across threads (the spec trait
 // requires `Send + Sync`).
 unsafe impl Send for RocmBackend {}
+// SAFETY: same reasoning as `Send` above — the handles are immutable after
+// construction and every use goes through the thread-safe HIP runtime.
 unsafe impl Sync for RocmBackend {}
 
 impl RocmBackend {

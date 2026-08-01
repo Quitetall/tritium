@@ -4199,6 +4199,7 @@ fn validate_report_timing_coverage(
 }
 
 #[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
 fn validate_cuda_memory_segments(
     path: &Path,
     report: &CampaignReport,

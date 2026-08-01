@@ -36,6 +36,20 @@ every skipped optional dependency or hardware lane, and every remaining blocker.
 GPU, browser, model, package, and deployment claims require receipts from the
 declared physical target; a skipped test is not a pass.
 
+Code behind the GPU-toolkit features (`cuda`, `nccl`, `rocm`, `wgpu`) can be
+type-checked and linted **without any GPU toolkit installed**: set
+`TRITIUM_CHECK_ONLY=1` and the kernel build scripts emit placeholder artifacts
+instead of invoking `nvcc`/`hipcc`. For example:
+
+```sh
+TRITIUM_CHECK_ONLY=1 cargo clippy -p tritium-rocm --features rocm --all-targets -- -D warnings
+```
+
+CI runs this for every gated crate (the `gpu-feature-check` lane), so a change
+that breaks a feature combination you cannot build locally is caught at review
+time, not on someone's hardware later. Check-only builds can never load a
+kernel — they are for compilation evidence only, never for runtime claims.
+
 ## Pull requests
 
 A pull request should contain one coherent change and explain:

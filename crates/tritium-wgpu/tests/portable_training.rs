@@ -63,14 +63,31 @@ fn wgpu_executes_every_vector_for_its_advertised_operations() {
             "lifecycle.reload"
         ]
     );
-    assert!(
-        report
-            .passed
-            .iter()
-            .filter_map(|case| case.receipt.as_ref())
-            .all(|receipt| receipt
-                .physical_device
-                .as_deref()
-                .is_some_and(|id| id.contains("NVIDIA")))
-    );
+    // Every receipt must name the physical adapter that executed the cases, and
+    // it must be real silicon: a software rasterizer (llvmpipe / lavapipe /
+    // SwiftShader) passes conformance while proving nothing about GPU execution.
+    // Any hardware vendor is acceptable — this crate's point is portability, and
+    // AMD RADV receipts from RDNA4 are as load-bearing as NVIDIA ones (the
+    // previous NVIDIA-substring assert failed on every non-NVIDIA adapter by
+    // construction; issue #1 finding 2).
+    let mut receipts = 0usize;
+    for receipt in report
+        .passed
+        .iter()
+        .filter_map(|case| case.receipt.as_ref())
+    {
+        receipts += 1;
+        let device = receipt
+            .physical_device
+            .as_deref()
+            .expect("conformance receipt must record the physical device");
+        let lower = device.to_lowercase();
+        assert!(
+            !["llvmpipe", "lavapipe", "swiftshader"]
+                .iter()
+                .any(|soft| lower.contains(soft)),
+            "conformance receipt names a software rasterizer, not a GPU: {device}"
+        );
+    }
+    assert!(receipts > 0, "no passed case carried a device receipt");
 }
