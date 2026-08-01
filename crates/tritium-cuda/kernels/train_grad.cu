@@ -543,16 +543,23 @@ extern "C" __global__ void salt_quantize_forward_grouped(
     // Every reduction below is block-wide, so `red[0]` is identical in all threads and every
     // `break` driven by it is taken uniformly — which is what keeps the __syncthreads() inside the
     // ITF loop legal.
+    //
+    // NOTE: the __syncthreads() after each read of `red[0]` is NOT redundant with the one the macro
+    // ends on. That trailing barrier makes `red[0]` readable; this one keeps a fast thread from
+    // starting the NEXT reduction (which writes `red[threadIdx.x]`) while a slower thread is still
+    // reading `red[0]`. Dropping them is a read/write race on shared memory.
 #define SALT_BLOCK_SUM(expr_partial)                                                  \
     do {                                                                              \
         red[threadIdx.x] = (expr_partial);                                            \
         __syncthreads();                                                              \
-        for (int _s = blockDim.x >> 1; _s > 0; _s >>= 1) {                            \
-            if (threadIdx.x < _s) red[threadIdx.x] += red[threadIdx.x + _s];          \
+        for (int half = blockDim.x >> 1; half > 0; half >>= 1) {                      \
+            if (threadIdx.x < half) red[threadIdx.x] += red[threadIdx.x + half];      \
             __syncthreads();                                                          \
         }                                                                             \
     } while (0)
 
+    // Bound: SALT_GROUP_MAX / 128 threads = 2 owned elements per thread; 8 leaves headroom if the
+    // launch's block size is ever lowered. Kept equal to `acc` above so the three stay in step.
     float trit[8];
     float cand_trit[8];
     for (int p = 0; p < planes; ++p) {
