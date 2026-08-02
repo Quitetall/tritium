@@ -221,6 +221,8 @@ pub(super) const KERNEL_NAME_EXTERNAL_FORWARD_F16: &str = "tq2_projected_linear_
 /// Tiled f32 forward for the framework-external path: stages the activation row in shared
 /// memory and reuses it across every warp, removing the untiled kernel's O(M) weight re-reads.
 pub(super) const KERNEL_NAME_EXTERNAL_FORWARD_TILED: &str = "tq2_0_add_mpgemm_tiled_f32_bias";
+/// fp16 twin: autocast (including a bf16 autocast, which casts to fp16) never reaches the f32 path.
+pub(super) const KERNEL_NAME_EXTERNAL_FORWARD_TILED_F16: &str = "tq2_0_add_mpgemm_tiled_f16_bias";
 pub(super) const KERNEL_NAME_EXTERNAL_GRAD_MASTER: &str = "linear_grad_master_ste";
 pub(super) const KERNEL_NAME_EXTERNAL_GRAD_MASTER_F16: &str = "linear_grad_master_ste_f16";
 pub(super) const KERNEL_NAME_EXTERNAL_GRAD_MASTER_AUTOCAST: &str =

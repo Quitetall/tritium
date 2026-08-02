@@ -4938,6 +4938,119 @@ fn external_linear_tiled_matches_the_untiled_kernel_across_m() {
     }
 }
 
+/// The fp16 tiled kernel must match the fp16 untiled one it replaces.
+///
+/// This is the path that actually matters for training: PyTorch autocast hands `ternary_linear`
+/// fp16 activations, and a **bf16** autocast is cast to fp16 too by
+/// `_ternary_linear_cuda_autocast`, so an f32-only fast path never runs in a mixed-precision loop.
+#[test]
+fn external_linear_tiled_f16_matches_the_untiled_f16_kernel() {
+    let Ok(backend) = CudaBackend::new(0) else {
+        eprintln!("skipping: no CUDA device");
+        return;
+    };
+    let kernels = backend
+        .external_kernels_for_test()
+        .expect("external kernels");
+    let stream = backend.stream();
+    let (n, k) = (96usize, 512usize);
+    let row_bytes = k.div_ceil(256) * 66;
+    let mut packed = vec![0u8; n * row_bytes];
+    let mut st = 0x2C9Fu64;
+    for b in packed.iter_mut() {
+        let mut byte = 0u8;
+        for slot in 0..4 {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            byte |= ((st % 3) as u8) << (2 * slot);
+        }
+        *b = byte;
+    }
+    let scales: Vec<f32> = (0..n).map(|i| 0.02 + (i % 5) as f32 * 0.004).collect();
+    let d_packed = backend.dev_upload_u8(&packed).unwrap();
+    let d_scales = backend.dev_upload(&scales).unwrap();
+
+    for m in [1usize, 4, 33, 128] {
+        // fp16 bit patterns built on the host, uploaded as raw u8.
+        let act_f32: Vec<f32> = (0..m * k)
+            .map(|i| ((i * 40503) % 512) as f32 / 512.0 - 0.5)
+            .collect();
+        let act_h: Vec<u8> = act_f32
+            .iter()
+            .flat_map(|&v| half::f16::from_f32(v).to_le_bytes())
+            .collect();
+        let bias_h: Vec<u8> = (0..n)
+            .flat_map(|i| half::f16::from_f32((i % 3) as f32 * 0.05).to_le_bytes())
+            .collect();
+        let d_act = backend.dev_upload_u8(&act_h).unwrap();
+        let d_bias = backend.dev_upload_u8(&bias_h).unwrap();
+        let d_tiled = backend.dev_upload_u8(&vec![0u8; m * n * 2]).unwrap();
+        let d_plain = backend.dev_upload_u8(&vec![0u8; m * n * 2]).unwrap();
+        let (mi, ni, ki, rb) = (m as i32, n as i32, k as i32, row_bytes as i32);
+
+        for tiled in [true, false] {
+            let out = if tiled { &d_tiled } else { &d_plain };
+            let (a_p, _ga) = d_act.device_ptr(stream);
+            let (w_p, _gw) = d_packed.device_ptr(stream);
+            let (s_p, _gs) = d_scales.device_ptr(stream);
+            let (b_p, _gb) = d_bias.device_ptr(stream);
+            let (o_p, _go) = out.device_ptr(stream);
+            let mut params = [
+                pp(&a_p),
+                pp(&w_p),
+                pp(&s_p),
+                pp(&b_p),
+                pp(&o_p),
+                pp(&mi),
+                pp(&ni),
+                pp(&ki),
+                pp(&rb),
+            ];
+            let (func, grid, block, shared) = if tiled {
+                const WPB: u32 = 8;
+                (
+                    kernels.forward_tiled_f16_for_test(),
+                    ((n as u32).div_ceil(WPB), m as u32, 1),
+                    (WPB * 32, 1, 1),
+                    (k * 4) as u32,
+                )
+            } else {
+                (
+                    kernels.forward_f16_for_test(),
+                    (((m * n) as u32).div_ceil(256), 1, 1),
+                    (256, 1, 1),
+                    0,
+                )
+            };
+            raw_launch(func, grid, block, shared, stream.cu_stream(), &mut params).expect("launch");
+        }
+
+        let mut got_b = vec![0u8; m * n * 2];
+        let mut want_b = vec![0u8; m * n * 2];
+        backend.dev_download_u8(&d_tiled, &mut got_b).unwrap();
+        backend.dev_download_u8(&d_plain, &mut want_b).unwrap();
+        let to_f32 = |b: &[u8]| -> Vec<f32> {
+            b.chunks_exact(2)
+                .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+                .collect()
+        };
+        let (got, want) = (to_f32(&got_b), to_f32(&want_b));
+        let worst = got
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        // Tolerance is one fp16 ULP at this magnitude: the tiled kernel converts each activation
+        // ONCE while staging, the untiled one re-converts per output column, so the two can differ
+        // in the last bit. That difference favours the tiled kernel.
+        assert!(
+            worst < 8e-3,
+            "M={m}: fp16 tiled must match fp16 untiled, max|delta| {worst:.3e}"
+        );
+    }
+}
+
 /// The point of the swap, measured: cost must stop scaling linearly in M.
 ///
 /// Reports both kernels at the reporter's shape (2048x2048) across their M sweep. This is a

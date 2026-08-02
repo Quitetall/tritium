@@ -77,6 +77,7 @@ pub(super) struct ExternalCudaKernels {
     forward: sys::CUfunction,
     forward_f16: sys::CUfunction,
     forward_tiled: sys::CUfunction,
+    forward_tiled_f16: sys::CUfunction,
     grad_input: sys::CUfunction,
     grad_input_f16: sys::CUfunction,
     grad_master: sys::CUfunction,
@@ -91,8 +92,14 @@ impl ExternalCudaKernels {
     pub(super) fn forward_for_test(&self) -> sys::CUfunction {
         self.forward
     }
+    pub(super) fn forward_f16_for_test(&self) -> sys::CUfunction {
+        self.forward_f16
+    }
     pub(super) fn forward_tiled_for_test(&self) -> sys::CUfunction {
         self.forward_tiled
+    }
+    pub(super) fn forward_tiled_f16_for_test(&self) -> sys::CUfunction {
+        self.forward_tiled_f16
     }
 }
 
@@ -134,6 +141,7 @@ impl ExternalCudaKernels {
                 forward: get(KERNEL_NAME_EXTERNAL_FORWARD)?,
                 forward_f16: get(KERNEL_NAME_EXTERNAL_FORWARD_F16)?,
                 forward_tiled: get(KERNEL_NAME_EXTERNAL_FORWARD_TILED)?,
+                forward_tiled_f16: get(KERNEL_NAME_EXTERNAL_FORWARD_TILED_F16)?,
                 grad_input: get(KERNEL_NAME_PROJECTED_GRAD_A)?,
                 grad_input_f16: get(KERNEL_NAME_PROJECTED_GRAD_A_F16)?,
                 grad_master: get(KERNEL_NAME_EXTERNAL_GRAD_MASTER)?,
@@ -524,8 +532,11 @@ impl CudaBackend {
             .checked_mul(size_of::<f32>())
             .ok_or_else(|| BackendError::InvalidInput("shared-memory size overflows".into()))?;
         const MAX_DYNAMIC_SHARED: usize = 48 * 1024;
-        let mut tiled =
-            request.scalar == ExternalLinearScalar::F32 && shared_bytes <= MAX_DYNAMIC_SHARED;
+        // Both scalars tile now. fp16 matters most in practice: PyTorch autocast hands this op
+        // fp16 activations, and a bf16 autocast is ALSO cast to fp16 by
+        // `_ternary_linear_cuda_autocast`, so an f32-only fast path is unreachable from any
+        // mixed-precision training loop -- exactly the case that needs M > 1.
+        let mut tiled = shared_bytes <= MAX_DYNAMIC_SHARED;
         // Test-only: force the legacy untiled kernel so the parity gate can run BOTH paths on
         // byte-identical inputs. Without this the old path becomes unreachable for f32 and the
         // kernel this one replaces could rot silently.
@@ -540,7 +551,9 @@ impl CudaBackend {
             let grid_m = u32::try_from(geometry.m)
                 .map_err(|_| BackendError::InvalidInput("M does not fit u32".into()))?;
             return raw_launch(
-                kernels.forward_tiled,
+                request
+                    .scalar
+                    .select(kernels.forward_tiled, kernels.forward_tiled_f16),
                 (grid_n, grid_m, 1),
                 (WARPS_PER_BLOCK * 32, 1, 1),
                 u32::try_from(shared_bytes).map_err(|_| {

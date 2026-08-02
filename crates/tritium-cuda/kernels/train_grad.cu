@@ -302,6 +302,99 @@ extern "C" __global__ void tq2_0_add_mpgemm_tiled_f32_bias(
     }
 }
 
+// fp16 twin of `tq2_0_add_mpgemm_tiled_f32_bias`.
+//
+// Needed because PyTorch autocast hands ternary_linear fp16 activations -- and, under a bf16
+// autocast, `_ternary_linear_cuda_autocast` casts to fp16 as well -- so the f32-only tiled path was
+// unreachable from any autocast training loop. Without this, every mixed-precision user keeps the
+// untiled kernel's O(M) weight re-reads.
+//
+// Activations are converted ONCE while staging into shared memory and the accumulation is fp32, so
+// this is not merely as accurate as the fp16 untiled kernel, it is strictly better: the untiled one
+// re-reads and re-converts each activation per output column.
+extern "C" __global__ void tq2_0_add_mpgemm_tiled_f16_bias(
+    const __half* __restrict__ act,
+    const unsigned char* __restrict__ weights,
+    const float* __restrict__ scales,
+    const __half* __restrict__ bias,   // [N] or null
+    __half* __restrict__ out,
+    const int m,
+    const int n,
+    const int k,
+    const int row_bytes) {
+    extern __shared__ float s_act[];
+    __shared__ int s_row_nonfinite;
+
+    const int warps_per_block = blockDim.x / 32;
+    const int warp_id = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int mi = blockIdx.y;
+    if (mi >= m) {
+        return;
+    }
+    if (threadIdx.x == 0) {
+        s_row_nonfinite = 0;
+    }
+    __syncthreads();
+
+    const __half* arow = act + (long long)mi * k;
+    for (int i = threadIdx.x; i < k; i += blockDim.x) {
+        const float v = __half2float(arow[i]);
+        if (!isfinite(v)) {
+            s_row_nonfinite = 1;
+        }
+        s_act[i] = v;
+    }
+    __syncthreads();
+
+    const int ni = blockIdx.x * warps_per_block + warp_id;
+    if (ni >= n) {
+        return;
+    }
+    const float scale = scales[ni];
+    if (s_row_nonfinite != 0 || !isfinite(scale)) {
+        if (lane == 0) {
+            out[(long long)mi * n + ni] = __float2half(NAN);
+        }
+        return;
+    }
+
+    const unsigned char* wrow = weights + (long long)ni * row_bytes;
+    float acc = 0.0f;
+    const int full = k & ~127;
+    int base = 0;
+    for (; base < full; base += 128) {
+        const int block = base >> 8;
+        const int c = (base >> 7) & 1;
+        const unsigned int byte = wrow[block * PROJECTED_VJP_TQ2_BLOCK_BYTES + c * 32 + lane];
+        const float* sa = s_act + base + lane;
+        acc += sa[0] * (float)((int)(byte & 3u) - 1);
+        acc += sa[32] * (float)((int)((byte >> 2) & 3u) - 1);
+        acc += sa[64] * (float)((int)((byte >> 4) & 3u) - 1);
+        acc += sa[96] * (float)((int)((byte >> 6) & 3u) - 1);
+    }
+    for (int ki = base + lane; ki < k; ki += 32) {
+        const int block = ki / PROJECTED_VJP_QK;
+        const int e = ki - block * PROJECTED_VJP_QK;
+        const int c = e >> 7;
+        const int mm = e & 31;
+        const int l = (e & 127) >> 5;
+        const int byte_off = block * PROJECTED_VJP_TQ2_BLOCK_BYTES + c * 32 + mm;
+        const unsigned int code = ((unsigned int)wrow[byte_off] >> (2 * l)) & 3u;
+        acc += s_act[ki] * (float)((int)code - 1);
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+        acc += __shfl_down_sync(0xffffffffu, acc, off);
+    }
+    if (lane == 0) {
+        float y = acc * scale;
+        if (bias != nullptr) {
+            y += __half2float(bias[ni]);
+        }
+        out[(long long)mi * n + ni] = __float2half(y);
+    }
+}
+
 extern "C" __global__ void tq2_projected_linear_forward_f16(
     const __half* __restrict__ a,              // [M, K]
     const unsigned char* __restrict__ weights, // [N, row_bytes]
