@@ -105,6 +105,37 @@ impl TernaryLinear {
         })
     }
 
+    /// Like [`new`](Self::new), but with a PER-ROW weight scale (ADR 0032
+    /// T2a: a per-row-scaled ternary drafter head — per-row absmean restores
+    /// the magnitude/prior axis a single tensor scale erases). The GEMM
+    /// contract is already per-row (`weight_scale[n]`); `new` merely
+    /// replicates one scalar. `scales.len()` must equal `n_out`.
+    pub fn with_row_scales(
+        backend: &dyn TernaryBackend,
+        trits: &[Trit],
+        n_out: usize,
+        k_in: usize,
+        scales: Vec<f32>,
+    ) -> Result<Self, NnError> {
+        if scales.len() != n_out {
+            return Err(NnError::Shape {
+                expected: n_out,
+                got: scales.len(),
+            });
+        }
+        let format = weights_format()?;
+        let packed = Self::pack_rows(trits, n_out, k_in, format)?;
+        let shape = GemmShape::new(0, n_out, k_in);
+        let weights = backend.upload_weights(&packed, shape, format)?;
+        Ok(Self {
+            n_out,
+            k_in,
+            scales,
+            weights,
+            format,
+        })
+    }
+
     /// Re-pack `[n_out, k_in]` ternary `trits` to `format` (TQ2_0 or TQ1_0; one `1.0`
     /// f16 block scale per 256-trit block, so the unpacked values are the raw trits)
     /// and validate the shape.
