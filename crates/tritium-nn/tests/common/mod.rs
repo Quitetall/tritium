@@ -385,6 +385,129 @@ pub fn accumulate(t: &Tape, id: ValueId, seq: usize, cols: usize, acc: &mut [f64
     }
 }
 
+/// Full input **Gram** `Σ x xᵀ` for one tap point — the curvature GPTQ actually needs.
+///
+/// [`Calib`] keeps only the diagonal (`Σ x²` per channel), which is all the AWQ-style salience fold
+/// requires. Sequential error compensation needs the OFF-DIAGONAL terms too: when column `j` is
+/// rounded, the error it induces is pushed onto the not-yet-quantized columns through `H⁻¹`, and
+/// `H = Σ x xᵀ` is what says how those columns covary.
+///
+/// Stored as a dense lower-triangle-symmetric `k×k` in f64. At `k = 1536` that is 18.9 MB per tap
+/// point, which is why this is a separate opt-in structure rather than something [`Calib`] always
+/// carries.
+pub struct Gram {
+    pub k: usize,
+    /// Row-major `k×k`, symmetric.
+    pub h: Vec<f64>,
+    pub rows: usize,
+}
+
+impl Gram {
+    pub fn new(k: usize) -> Self {
+        Self {
+            k,
+            h: vec![0.0; k * k],
+            rows: 0,
+        }
+    }
+
+    /// Accumulate every row of a `[seq, k]` activation block.
+    pub fn accumulate(&mut self, t: &Tape, id: ValueId, seq: usize) {
+        let v = t.value(id);
+        for r in 0..seq {
+            let x = &v[r * self.k..(r + 1) * self.k];
+            // Upper triangle only, mirrored at the end — halves the work on a hot O(seq·k²) loop.
+            for i in 0..self.k {
+                let xi = f64::from(x[i]);
+                if xi == 0.0 {
+                    continue;
+                }
+                let row = &mut self.h[i * self.k..(i + 1) * self.k];
+                for (j, hij) in row.iter_mut().enumerate().skip(i) {
+                    *hij += xi * f64::from(x[j]);
+                }
+            }
+        }
+        self.rows += seq;
+    }
+
+    /// Mirror the upper triangle into the lower and divide by the sample count, giving `E[x xᵀ]`.
+    pub fn finish(mut self) -> Vec<f64> {
+        for i in 0..self.k {
+            for j in 0..i {
+                self.h[i * self.k + j] = self.h[j * self.k + i];
+            }
+        }
+        let n = self.rows.max(1) as f64;
+        for v in &mut self.h {
+            *v /= n;
+        }
+        self.h
+    }
+
+    /// The diagonal, which must agree with [`Calib`]'s cheap collector — the cross-check that says
+    /// this tap sees the same activations the fold does.
+    pub fn diagonal(&self) -> Vec<f64> {
+        (0..self.k).map(|i| self.h[i * self.k + i]).collect()
+    }
+}
+
+/// Collect the input Gram at ONE tap point, named by layer and role.
+///
+/// Roles map to the four distinct projection inputs per block (q/k/v share one, gate/up share one):
+/// `"attn"` = the attn-norm output, `"ffn"` = the ffn-norm output, `"down"` = `silu(gate)⊙up`,
+/// `"o"` = the attention concat.
+pub fn calibrate_gram(
+    weights: &[Vec<f32>],
+    a: &Arch,
+    tokens: &[u32],
+    layer: usize,
+    role: &str,
+    g: &mut Gram,
+) {
+    let mut t = Tape::new();
+    let wids: Vec<ValueId> = weights.iter().map(|w| t.leaf(w.clone())).collect();
+    let seq = tokens.len();
+    let mut hidden = t.embed_gather(wids[0], tokens, a.vocab, a.n_embd);
+    for li in 0..a.n_layers {
+        let base = 1 + 7 * li;
+        let an = t.leaf(a.attn_norms[li].clone());
+        let xn = t.rmsnorm(hidden, an, seq, a.n_embd, a.eps);
+        if li == layer && role == "attn" {
+            g.accumulate(&t, xn, seq);
+        }
+        let attn = attention(
+            &mut t,
+            xn,
+            wids[base],
+            wids[base + 1],
+            wids[base + 2],
+            wids[base + 3],
+            seq,
+            a.n_embd,
+            a.n_head,
+            a.n_head_kv,
+            a.head_dim,
+            a.theta,
+        );
+        hidden = t.add(hidden, attn);
+        let fnw = t.leaf(a.ffn_norms[li].clone());
+        let hn = t.rmsnorm(hidden, fnw, seq, a.n_embd, a.eps);
+        if li == layer && role == "ffn" {
+            g.accumulate(&t, hn, seq);
+        }
+        let gate = t.dense_matmul(hn, wids[base + 4], seq, a.ff, a.n_embd);
+        let up = t.dense_matmul(hn, wids[base + 5], seq, a.ff, a.n_embd);
+        let ga = t.silu(gate);
+        let gated = t.mul(ga, up);
+        if li == layer && role == "down" {
+            g.accumulate(&t, gated, seq);
+        }
+        let down = t.dense_matmul(gated, wids[base + 6], seq, a.n_embd, a.ff);
+        hidden = t.add(hidden, down);
+    }
+}
+
 /// One calibration forward. Mirrors `common::forward` exactly, tapping the three foldable inputs.
 pub fn calibrate(weights: &[Vec<f32>], a: &Arch, tokens: &[u32], c: &mut Calib) {
     let mut t = Tape::new();
