@@ -202,6 +202,106 @@ extern "C" __global__ void tq2_projected_linear_forward(
 
 // Native CUDA autocast forward. Products accumulate in fp32; framework-visible
 // input, bias, and output remain fp16.
+// Bias-aware tiled variant for the FRAMEWORK-EXTERNAL linear path (torch etc.).
+//
+// The external path previously used `tq2_projected_linear_forward`, which assigns ONE THREAD PER
+// OUTPUT ELEMENT and loops k inside it. That has two defects that only appear once M > 1:
+//   * no weight reuse -- each of the M rows re-reads the whole weight matrix from global memory, so
+//     weight traffic is O(M*N*K) instead of O(N*K);
+//   * uncoalesced weight loads -- adjacent threads differ in `ni`, so they touch addresses
+//     `row_bytes` apart (528 B at k=2048), turning one warp load into 32 transactions.
+// Measured externally on a 4090 at 2048x2048: 5.4x slower than torch fp16 at M=1, but 830x at
+// M=2048, growing linearly in M. That is the cliff this kernel removes: activations are staged once
+// in shared memory and reused by every warp, and lane `l` owns byte `c*32 + l` so weight reads
+// coalesce.
+//
+// Semantics are kept identical to the projected kernel it replaces, because the torch dispatch layer
+// depends on them: a non-finite scale yields NaN for that output column, and a row containing any
+// non-finite activation yields NaN across that row. The row check is done once during the shared
+// staging loop rather than per-element, using the `__syncthreads()` the stage already needs.
+extern "C" __global__ void tq2_0_add_mpgemm_tiled_f32_bias(
+    const float* __restrict__ act,
+    const unsigned char* __restrict__ weights,
+    const float* __restrict__ scales,
+    const float* __restrict__ bias,   // [N] or null
+    float* __restrict__ out,
+    const int m,
+    const int n,
+    const int k,
+    const int row_bytes) {
+    extern __shared__ float s_act[];
+    __shared__ int s_row_nonfinite;
+
+    const int warps_per_block = blockDim.x / 32;
+    const int warp_id = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int mi = blockIdx.y;
+    if (mi >= m) {
+        return;
+    }
+    if (threadIdx.x == 0) {
+        s_row_nonfinite = 0;
+    }
+    __syncthreads();
+
+    const float* arow = act + (long long)mi * k;
+    for (int i = threadIdx.x; i < k; i += blockDim.x) {
+        const float v = arow[i];
+        if (!isfinite(v)) {
+            s_row_nonfinite = 1;
+        }
+        s_act[i] = v;
+    }
+    __syncthreads();
+
+    const int ni = blockIdx.x * warps_per_block + warp_id;
+    if (ni >= n) {
+        return;
+    }
+    const float scale = scales[ni];
+    if (s_row_nonfinite != 0 || !isfinite(scale)) {
+        if (lane == 0) {
+            out[(long long)mi * n + ni] = NAN;
+        }
+        return;
+    }
+
+    const unsigned char* wrow = weights + (long long)ni * row_bytes;
+    float acc = 0.0f;
+    const int full = k & ~127;
+    int base = 0;
+    for (; base < full; base += 128) {
+        const int block = base >> 8;
+        const int c = (base >> 7) & 1;
+        const unsigned int byte = wrow[block * PROJECTED_VJP_TQ2_BLOCK_BYTES + c * 32 + lane];
+        const float* sa = s_act + base + lane;
+        acc += sa[0] * (float)((int)(byte & 3u) - 1);
+        acc += sa[32] * (float)((int)((byte >> 2) & 3u) - 1);
+        acc += sa[64] * (float)((int)((byte >> 4) & 3u) - 1);
+        acc += sa[96] * (float)((int)((byte >> 6) & 3u) - 1);
+    }
+    for (int ki = base + lane; ki < k; ki += 32) {
+        const int block = ki / PROJECTED_VJP_QK;
+        const int e = ki - block * PROJECTED_VJP_QK;
+        const int c = e >> 7;
+        const int mm = e & 31;
+        const int l = (e & 127) >> 5;
+        const int byte_off = block * PROJECTED_VJP_TQ2_BLOCK_BYTES + c * 32 + mm;
+        const unsigned int code = ((unsigned int)wrow[byte_off] >> (2 * l)) & 3u;
+        acc += s_act[ki] * (float)((int)code - 1);
+    }
+    for (int off = 32 / 2; off > 0; off >>= 1) {
+        acc += __shfl_down_sync(0xffffffffu, acc, off);
+    }
+    if (lane == 0) {
+        float y = acc * scale;
+        if (bias != nullptr) {
+            y += bias[ni];
+        }
+        out[(long long)mi * n + ni] = y;
+    }
+}
+
 extern "C" __global__ void tq2_projected_linear_forward_f16(
     const __half* __restrict__ a,              // [M, K]
     const unsigned char* __restrict__ weights, // [N, row_bytes]

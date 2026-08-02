@@ -76,6 +76,7 @@ pub(super) struct ExternalCudaKernels {
     pack_f16: sys::CUfunction,
     forward: sys::CUfunction,
     forward_f16: sys::CUfunction,
+    forward_tiled: sys::CUfunction,
     grad_input: sys::CUfunction,
     grad_input_f16: sys::CUfunction,
     grad_master: sys::CUfunction,
@@ -83,6 +84,16 @@ pub(super) struct ExternalCudaKernels {
     grad_master_autocast: sys::CUfunction,
     grad_bias: sys::CUfunction,
     grad_bias_f16: sys::CUfunction,
+}
+
+#[cfg(test)]
+impl ExternalCudaKernels {
+    pub(super) fn forward_for_test(&self) -> sys::CUfunction {
+        self.forward
+    }
+    pub(super) fn forward_tiled_for_test(&self) -> sys::CUfunction {
+        self.forward_tiled
+    }
 }
 
 // SAFETY: handles are immutable process-valid driver handles. CUDA Driver API
@@ -122,6 +133,7 @@ impl ExternalCudaKernels {
                 pack_f16: get(KERNEL_NAME_EXTERNAL_PACK_F16)?,
                 forward: get(KERNEL_NAME_EXTERNAL_FORWARD)?,
                 forward_f16: get(KERNEL_NAME_EXTERNAL_FORWARD_F16)?,
+                forward_tiled: get(KERNEL_NAME_EXTERNAL_FORWARD_TILED)?,
                 grad_input: get(KERNEL_NAME_PROJECTED_GRAD_A)?,
                 grad_input_f16: get(KERNEL_NAME_PROJECTED_GRAD_A_F16)?,
                 grad_master: get(KERNEL_NAME_EXTERNAL_GRAD_MASTER)?,
@@ -266,6 +278,14 @@ fn grid(elements: usize) -> Result<(u32, u32, u32), BackendError> {
 impl CudaBackend {
     fn bind_external_context(&self) -> Result<CurrentContextRestore, BackendError> {
         CurrentContextRestore::bind(self.stream.context())
+    }
+
+    /// Test-only accessors so the in-crate parity gate can launch BOTH forward kernels on
+    /// byte-identical inputs. `external_linear_forward` itself validates that pointers belong to the
+    /// FRAMEWORK's context, so it cannot be driven from backend-owned buffers.
+    #[cfg(test)]
+    pub(super) fn external_kernels_for_test(&self) -> Result<&ExternalCudaKernels, BackendError> {
+        self.external_kernels()
     }
 
     fn external_kernels(&self) -> Result<&ExternalCudaKernels, BackendError> {
@@ -486,6 +506,51 @@ impl CudaBackend {
             pp(&k),
             pp(&row_bytes),
         ];
+
+        // Prefer the TILED kernel. The untiled `tq2_projected_linear_forward` assigns one thread per
+        // output element and loops `k` inside it, so every one of the M rows re-reads the whole
+        // weight matrix and adjacent threads read addresses `row_bytes` apart. Both defects are
+        // invisible at M=1 and dominate past ~16: measured externally on a 4090 at 2048x2048, 5.4x
+        // slower than torch fp16 at M=1 but 830x at M=2048, growing linearly in M.
+        //
+        // The tiled kernel stages the activation row in shared memory once per block and gives each
+        // warp one output column, so weight bytes coalesce and the row is reused N times.
+        //
+        // Two conditions gate it, and both fall back rather than fail:
+        //   * f32 only -- there is no f16 tiled variant yet, so half precision keeps the old path;
+        //   * `k * 4` bytes of dynamic shared memory must fit the 48 KiB default block limit.
+        let shared_bytes = geometry
+            .k
+            .checked_mul(size_of::<f32>())
+            .ok_or_else(|| BackendError::InvalidInput("shared-memory size overflows".into()))?;
+        const MAX_DYNAMIC_SHARED: usize = 48 * 1024;
+        let mut tiled =
+            request.scalar == ExternalLinearScalar::F32 && shared_bytes <= MAX_DYNAMIC_SHARED;
+        // Test-only: force the legacy untiled kernel so the parity gate can run BOTH paths on
+        // byte-identical inputs. Without this the old path becomes unreachable for f32 and the
+        // kernel this one replaces could rot silently.
+        if cfg!(test) && std::env::var_os("TRITIUM_EXTERNAL_FORCE_UNTILED").is_some() {
+            tiled = false;
+        }
+        if tiled {
+            const WARPS_PER_BLOCK: u32 = 8;
+            let grid_n = u32::try_from(geometry.n)
+                .map_err(|_| BackendError::InvalidInput("N does not fit u32".into()))?
+                .div_ceil(WARPS_PER_BLOCK);
+            let grid_m = u32::try_from(geometry.m)
+                .map_err(|_| BackendError::InvalidInput("M does not fit u32".into()))?;
+            return raw_launch(
+                kernels.forward_tiled,
+                (grid_n, grid_m, 1),
+                (WARPS_PER_BLOCK * 32, 1, 1),
+                u32::try_from(shared_bytes).map_err(|_| {
+                    BackendError::InvalidInput("shared bytes do not fit u32".into())
+                })?,
+                stream,
+                &mut params,
+            );
+        }
+
         raw_launch(
             request.scalar.select(kernels.forward, kernels.forward_f16),
             grid(mn)?,

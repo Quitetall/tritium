@@ -218,6 +218,9 @@ pub(super) const KERNEL_NAME_EXTERNAL_PACK: &str = "tq2_pack_from_master_scale";
 pub(super) const KERNEL_NAME_EXTERNAL_PACK_F16: &str = "tq2_pack_from_master_scale_f16";
 pub(super) const KERNEL_NAME_EXTERNAL_FORWARD: &str = "tq2_projected_linear_forward";
 pub(super) const KERNEL_NAME_EXTERNAL_FORWARD_F16: &str = "tq2_projected_linear_forward_f16";
+/// Tiled f32 forward for the framework-external path: stages the activation row in shared
+/// memory and reuses it across every warp, removing the untiled kernel's O(M) weight re-reads.
+pub(super) const KERNEL_NAME_EXTERNAL_FORWARD_TILED: &str = "tq2_0_add_mpgemm_tiled_f32_bias";
 pub(super) const KERNEL_NAME_EXTERNAL_GRAD_MASTER: &str = "linear_grad_master_ste";
 pub(super) const KERNEL_NAME_EXTERNAL_GRAD_MASTER_F16: &str = "linear_grad_master_ste_f16";
 pub(super) const KERNEL_NAME_EXTERNAL_GRAD_MASTER_AUTOCAST: &str =

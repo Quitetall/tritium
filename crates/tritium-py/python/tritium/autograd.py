@@ -1,5 +1,15 @@
 """PyTorch autograd wrappers for Tritium's ternary Conv1d + FSQ ops (ADR 0030).
 
+.. warning::
+   **This module is a correctness reference, not a performance path. Do not benchmark it.**
+   Tensors cross to Rust as flat ``f32`` **Python lists**, so every call pays list
+   materialisation in both directions — the cost is dominated by marshalling, not arithmetic,
+   and a measurement here says nothing about Tritium's kernels.
+
+   For anything performance-related use :mod:`tritium.torch` instead, which dispatches to the
+   native backends. The two module names are easy to confuse; this note exists because they
+   have been.
+
 Each Rust op's ``forward``/``vjp`` is wrapped in a :class:`torch.autograd.Function`, and
 :class:`TernaryConv1d` / :class:`FSQ` are drop-in :class:`torch.nn.Module` s. The ternary path
 matches the transformer linears: latent fp32 weights, per-output-channel AbsMean scale, STE round in

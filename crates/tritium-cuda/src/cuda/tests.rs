@@ -4824,3 +4824,216 @@ fn tb1_tq1_tq2_gateup_bench() {
     bench("TQ1 (1.69 b/w)", 1);
     bench("TB1 (1.58 b/w)", 2);
 }
+
+/// **The framework-external linear path must not fall off a cliff for M > 1.**
+///
+/// Reported externally on a 4090 (2048x2048 vs torch fp16): 5.4x slower at M=1 but **830x at
+/// M=2048**, growing linearly in M. Root cause in `tq2_projected_linear_forward`: one thread per
+/// output element looping `k`, so (a) each of the M rows re-reads the whole weight matrix -- weight
+/// traffic O(M*N*K) instead of O(N*K) -- and (b) adjacent threads differ in `ni` and touch addresses
+/// `row_bytes` apart, so one warp load becomes 32 transactions. Both are invisible at M=1, which is
+/// why decode benchmarks never caught it.
+///
+/// `tq2_0_add_mpgemm_tiled_f32_bias` stages the activation row in shared memory and gives each warp
+/// one output column. This gate launches BOTH kernels on byte-identical inputs and demands they
+/// agree across the M range where they diverge, plus the NaN contract the torch layer relies on.
+#[test]
+fn external_linear_tiled_matches_the_untiled_kernel_across_m() {
+    let Ok(backend) = CudaBackend::new(0) else {
+        eprintln!("skipping: no CUDA device");
+        return;
+    };
+    let kernels = backend
+        .external_kernels_for_test()
+        .expect("external kernels");
+    let stream = backend.stream();
+    let (n, k) = (96usize, 512usize);
+    let row_bytes = k.div_ceil(256) * 66;
+
+    // Each byte holds four 2-bit codes and TQ2_0 only ever emits {0,1,2} (trit = code - 1). Code 3
+    // is unreachable from any packer, and the two kernels deliberately disagree on it: the untiled
+    // one falls through to zero, the tiled one computes `code - 1 = 2`. Feeding random bytes would
+    // therefore fail this gate on malformed input that no producer can generate.
+    let mut packed = vec![0u8; n * row_bytes];
+    let mut st = 0x51D3u64;
+    for b in packed.iter_mut() {
+        let mut byte = 0u8;
+        for slot in 0..4 {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            byte |= ((st % 3) as u8) << (2 * slot);
+        }
+        *b = byte;
+    }
+    let scales: Vec<f32> = (0..n).map(|i| 0.01 + (i % 7) as f32 * 0.003).collect();
+    let bias: Vec<f32> = (0..n).map(|i| (i % 5) as f32 * 0.1 - 0.2).collect();
+    let d_packed = backend.dev_upload_u8(&packed).unwrap();
+    let d_scales = backend.dev_upload(&scales).unwrap();
+    let d_bias = backend.dev_upload(&bias).unwrap();
+
+    for m in [1usize, 2, 4, 16, 64, 129] {
+        let act: Vec<f32> = (0..m * k)
+            .map(|i| ((i * 2654435761) % 2048) as f32 / 1024.0 - 1.0)
+            .collect();
+        let d_act = backend.dev_upload(&act).unwrap();
+        let mut d_tiled = backend.dev_alloc_zeros(m * n).unwrap();
+        let mut d_plain = backend.dev_alloc_zeros(m * n).unwrap();
+        let (mi, ni, ki, rb) = (m as i32, n as i32, k as i32, row_bytes as i32);
+
+        for tiled in [true, false] {
+            let out = if tiled { &mut d_tiled } else { &mut d_plain };
+            let (a_p, _ga) = d_act.device_ptr(stream);
+            let (w_p, _gw) = d_packed.device_ptr(stream);
+            let (s_p, _gs) = d_scales.device_ptr(stream);
+            let (b_p, _gb) = d_bias.device_ptr(stream);
+            let (o_p, _go) = out.device_ptr(stream);
+            let mut params = [
+                pp(&a_p),
+                pp(&w_p),
+                pp(&s_p),
+                pp(&b_p),
+                pp(&o_p),
+                pp(&mi),
+                pp(&ni),
+                pp(&ki),
+                pp(&rb),
+            ];
+            let (func, grid, block, shared) = if tiled {
+                const WPB: u32 = 8;
+                (
+                    kernels.forward_tiled_for_test(),
+                    ((n as u32).div_ceil(WPB), m as u32, 1),
+                    (WPB * 32, 1, 1),
+                    (k * 4) as u32,
+                )
+            } else {
+                (
+                    kernels.forward_for_test(),
+                    (((m * n) as u32).div_ceil(256), 1, 1),
+                    (256, 1, 1),
+                    0,
+                )
+            };
+            raw_launch(func, grid, block, shared, stream.cu_stream(), &mut params).expect("launch");
+        }
+
+        let mut got = vec![0.0f32; m * n];
+        let mut want = vec![0.0f32; m * n];
+        backend.dev_download(&d_tiled, &mut got).unwrap();
+        backend.dev_download(&d_plain, &mut want).unwrap();
+        let worst = got
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            worst < 2e-4,
+            "M={m}: tiled must match the untiled kernel it replaces, max|delta| {worst:.3e}"
+        );
+        assert!(
+            got.iter().all(|v| v.is_finite()),
+            "M={m}: finite in, finite out"
+        );
+    }
+}
+
+/// The point of the swap, measured: cost must stop scaling linearly in M.
+///
+/// Reports both kernels at the reporter's shape (2048x2048) across their M sweep. This is a
+/// SPEEDUP RATIO gate, not an absolute-latency one -- absolute numbers depend on the card and on
+/// whatever else shares it, but the untiled kernel's O(M) weight re-reads have to show up as a
+/// widening gap no matter the box.
+#[test]
+#[ignore = "benchmark; run explicitly with --ignored --nocapture"]
+fn external_linear_tiled_removes_the_m_cliff() {
+    let Ok(backend) = CudaBackend::new(0) else {
+        eprintln!("skipping: no CUDA device");
+        return;
+    };
+    let kernels = backend
+        .external_kernels_for_test()
+        .expect("external kernels");
+    let stream = backend.stream();
+    let (n, k) = (2048usize, 2048usize);
+    let row_bytes = k.div_ceil(256) * 66;
+    let mut packed = vec![0u8; n * row_bytes];
+    let mut st = 0xA71Fu64;
+    for b in packed.iter_mut() {
+        let mut byte = 0u8;
+        for slot in 0..4 {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            byte |= ((st % 3) as u8) << (2 * slot);
+        }
+        *b = byte;
+    }
+    let scales = vec![0.02f32; n];
+    let d_packed = backend.dev_upload_u8(&packed).unwrap();
+    let d_scales = backend.dev_upload(&scales).unwrap();
+
+    println!(
+        "{:>7} {:>12} {:>12} {:>10}",
+        "M", "untiled ms", "tiled ms", "speedup"
+    );
+    for m in [1usize, 4, 16, 64, 256, 2048] {
+        let act = vec![0.05f32; m * k];
+        let d_act = backend.dev_upload(&act).unwrap();
+        let d_out = backend.dev_alloc_zeros(m * n).unwrap();
+        let (mi, ni, ki, rb) = (m as i32, n as i32, k as i32, row_bytes as i32);
+        let mut ms = [0.0f64; 2];
+        for (slot, tiled) in [false, true].into_iter().enumerate() {
+            for iter in 0..12 {
+                let t0 = std::time::Instant::now();
+                {
+                    let (a_p, _ga) = d_act.device_ptr(stream);
+                    let (w_p, _gw) = d_packed.device_ptr(stream);
+                    let (s_p, _gs) = d_scales.device_ptr(stream);
+                    let nullb = 0u64;
+                    let (o_p, _go) = d_out.device_ptr(stream);
+                    let mut params = [
+                        pp(&a_p),
+                        pp(&w_p),
+                        pp(&s_p),
+                        pp(&nullb),
+                        pp(&o_p),
+                        pp(&mi),
+                        pp(&ni),
+                        pp(&ki),
+                        pp(&rb),
+                    ];
+                    let (func, grid, block, shared) = if tiled {
+                        const WPB: u32 = 8;
+                        (
+                            kernels.forward_tiled_for_test(),
+                            ((n as u32).div_ceil(WPB), m as u32, 1),
+                            (WPB * 32, 1, 1),
+                            (k * 4) as u32,
+                        )
+                    } else {
+                        (
+                            kernels.forward_for_test(),
+                            (((m * n) as u32).div_ceil(256), 1, 1),
+                            (256, 1, 1),
+                            0,
+                        )
+                    };
+                    raw_launch(func, grid, block, shared, stream.cu_stream(), &mut params)
+                        .expect("launch");
+                }
+                backend.dev_synchronize().expect("sync");
+                if iter >= 2 {
+                    ms[slot] += t0.elapsed().as_secs_f64() * 1e3;
+                }
+            }
+            ms[slot] /= 10.0;
+        }
+        println!(
+            "{m:>7} {:>12.3} {:>12.3} {:>9.1}x",
+            ms[0],
+            ms[1],
+            ms[0] / ms[1]
+        );
+    }
+}
