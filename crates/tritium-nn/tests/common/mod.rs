@@ -508,6 +508,133 @@ pub fn calibrate_gram(
     }
 }
 
+/// Every layer's input Gram, collected in ONE forward.
+///
+/// [`calibrate_gram`] runs a whole forward per tap point, which is fine for a spot check and
+/// hopeless for a model: 30 layers x 3 roles = 90 forwards. This collects all of them at once.
+///
+/// The three roles are the distinct projection inputs — `attn` feeds q/k/v, `ffn` feeds gate/up,
+/// `down` feeds down_proj — so six of the seven projections per block are covered. `o_proj` is not:
+/// its input is the attention concat, which under GQA has query heads sharing kv dims, exactly the
+/// case the salience fold also skips.
+///
+/// Memory is the reason this is opt-in: `2*n_embd² + ff²` f64 per layer, ~24 MB/layer at 135M
+/// dimensions, ~726 MB for the whole model.
+pub struct GramSet {
+    pub attn: Vec<Gram>,
+    pub ffn: Vec<Gram>,
+    pub down: Vec<Gram>,
+}
+
+impl GramSet {
+    pub fn new(a: &Arch) -> Self {
+        Self {
+            attn: (0..a.n_layers).map(|_| Gram::new(a.n_embd)).collect(),
+            ffn: (0..a.n_layers).map(|_| Gram::new(a.n_embd)).collect(),
+            down: (0..a.n_layers).map(|_| Gram::new(a.ff)).collect(),
+        }
+    }
+
+    /// One forward, taps every layer.
+    pub fn accumulate_forward(&mut self, weights: &[Vec<f32>], a: &Arch, tokens: &[u32]) {
+        let mut t = Tape::new();
+        let wids: Vec<ValueId> = weights.iter().map(|w| t.leaf(w.clone())).collect();
+        let seq = tokens.len();
+        let mut hidden = t.embed_gather(wids[0], tokens, a.vocab, a.n_embd);
+        for li in 0..a.n_layers {
+            let base = 1 + 7 * li;
+            let an = t.leaf(a.attn_norms[li].clone());
+            let xn = t.rmsnorm(hidden, an, seq, a.n_embd, a.eps);
+            self.attn[li].accumulate(&t, xn, seq);
+            let attn = attention(
+                &mut t,
+                xn,
+                wids[base],
+                wids[base + 1],
+                wids[base + 2],
+                wids[base + 3],
+                seq,
+                a.n_embd,
+                a.n_head,
+                a.n_head_kv,
+                a.head_dim,
+                a.theta,
+            );
+            hidden = t.add(hidden, attn);
+            let fnw = t.leaf(a.ffn_norms[li].clone());
+            let hn = t.rmsnorm(hidden, fnw, seq, a.n_embd, a.eps);
+            self.ffn[li].accumulate(&t, hn, seq);
+            let gate = t.dense_matmul(hn, wids[base + 4], seq, a.ff, a.n_embd);
+            let up = t.dense_matmul(hn, wids[base + 5], seq, a.ff, a.n_embd);
+            let ga = t.silu(gate);
+            let gated = t.mul(ga, up);
+            self.down[li].accumulate(&t, gated, seq);
+            let down = t.dense_matmul(gated, wids[base + 6], seq, a.n_embd, a.ff);
+            hidden = t.add(hidden, down);
+        }
+    }
+}
+
+/// Damped inverse of a symmetric PSD matrix, via Cholesky.
+///
+/// GPTQ needs `H⁻¹`, and a calibration Gram is routinely singular — dead channels contribute an
+/// exactly-zero row. Damping with `λ = damp · mean(diag H)` is the standard remedy and is what makes
+/// the factorisation succeed; without it the first zero pivot ends the run.
+///
+/// Returns `None` if the matrix is still not positive definite after damping, so a caller can fall
+/// back to the plain fitter rather than propagate garbage.
+#[must_use]
+pub fn damped_inverse(h: &[f64], k: usize, damp: f64) -> Option<Vec<f64>> {
+    let mean_diag: f64 = (0..k).map(|i| h[i * k + i]).sum::<f64>() / k as f64;
+    let lambda = damp * mean_diag.max(1e-12);
+    let mut a = h.to_vec();
+    for i in 0..k {
+        a[i * k + i] += lambda;
+    }
+    // Cholesky: A = L Lᵀ, lower triangle in place.
+    let mut l = vec![0.0f64; k * k];
+    for i in 0..k {
+        for j in 0..=i {
+            let mut sum = a[i * k + j];
+            for p in 0..j {
+                sum -= l[i * k + p] * l[j * k + p];
+            }
+            if i == j {
+                if sum <= 0.0 {
+                    return None;
+                }
+                l[i * k + i] = sum.sqrt();
+            } else {
+                l[i * k + j] = sum / l[j * k + j];
+            }
+        }
+    }
+    // Invert L (lower triangular), then H⁻¹ = L⁻ᵀ L⁻¹.
+    let mut inv_l = vec![0.0f64; k * k];
+    for i in 0..k {
+        inv_l[i * k + i] = 1.0 / l[i * k + i];
+        for j in 0..i {
+            let mut sum = 0.0;
+            for p in j..i {
+                sum += l[i * k + p] * inv_l[p * k + j];
+            }
+            inv_l[i * k + j] = -sum / l[i * k + i];
+        }
+    }
+    let mut out = vec![0.0f64; k * k];
+    for i in 0..k {
+        for j in 0..=i {
+            let mut sum = 0.0;
+            for p in i.max(j)..k {
+                sum += inv_l[p * k + i] * inv_l[p * k + j];
+            }
+            out[i * k + j] = sum;
+            out[j * k + i] = sum;
+        }
+    }
+    Some(out)
+}
+
 /// One calibration forward. Mirrors `common::forward` exactly, tapping the three foldable inputs.
 pub fn calibrate(weights: &[Vec<f32>], a: &Arch, tokens: &[u32], c: &mut Calib) {
     let mut t = Tape::new();
