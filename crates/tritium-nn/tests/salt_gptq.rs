@@ -22,7 +22,7 @@ mod common;
 
 use std::path::PathBuf;
 
-use common::{GramSet, damped_inverse, extract, perplexity_windowed};
+use common::{Calib, GramSet, calibrate, damped_inverse, extract, fold, perplexity_windowed};
 use tritium_nn::ModelRunner;
 use tritium_quantize::{ColumnGroup, FeedbackMetric, FeedbackProblem, fit_with_feedback};
 use tritium_train::ops::ste::{self, RotationPolicy};
@@ -119,6 +119,39 @@ fn gptq_feedback_against_real_curvature() {
     let (arch, fp, shapes) = extract(&runner);
     let (train, eval) = corpus();
     let ppl_fp = perplexity_windowed(&fp, &arch, &eval, EVAL_WINDOW);
+
+    // TRITIUM_GPTQ_SMOOTH=<alpha> composes the salience fold with GPTQ. The two address DISJOINT
+    // parts of the curvature -- the fold rescales columns by E[x_j²] (the diagonal), GPTQ propagates
+    // rounding residuals through H⁻¹ (the off-diagonal) -- so whether they add is a real question.
+    //
+    // Order matters: fold FIRST, then collect the Gram, because folding divides attn_norm/ffn_norm
+    // by s and therefore changes the very activations H is a covariance of. Collecting H on the
+    // unfolded model and applying it to folded weights would be measuring the wrong curvature.
+    let (arch, fp) = match std::env::var("TRITIUM_GPTQ_SMOOTH")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+    {
+        None => (arch, fp),
+        Some(alpha) => {
+            let mut calib = Calib::new(&arch);
+            for w in 0..CALIB_WINDOWS {
+                calibrate(
+                    &fp,
+                    &arch,
+                    &train[w * CALIB_SEQ..(w + 1) * CALIB_SEQ],
+                    &mut calib,
+                );
+            }
+            let (folded, farch) = fold(&fp, &shapes, &arch, &calib, alpha);
+            println!("salience fold applied first: alpha={alpha}");
+            (farch, folded)
+        }
+    };
+    let ppl_fp_check = perplexity_windowed(&fp, &arch, &eval, EVAL_WINDOW);
+    assert!(
+        (ppl_fp_check - ppl_fp).abs() < 1e-3 * ppl_fp,
+        "the fold must be function-preserving: {ppl_fp_check} vs {ppl_fp}"
+    );
 
     // One pass per calibration window taps every layer.
     let mut grams = GramSet::new(&arch);
