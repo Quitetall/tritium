@@ -430,7 +430,7 @@ mod tests {
         // Two blocks in ONE row with different scales.
         let scales = vec![f16::from_f32(1.0), f16::from_f32(2.0)];
         pack_tq2_0_row(&trits, &scales, &mut data).expect("pack row");
-        let mut blob = gguf_with_tq2("output.weight", 1, 512, &[1.0]);
+        let mut blob = gguf_with_tq2("output.weight", n_out, k_in, &[1.0]);
         let dlen = data.len();
         let start = blob.len() - dlen;
         blob[start..].copy_from_slice(&data);
