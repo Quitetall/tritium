@@ -173,10 +173,6 @@ impl CudaDecodeModel {
     }
 
     fn build_batch(&self, n: usize, pool_pages: Option<usize>) -> Result<BatchKv, BackendError> {
-        // v1: the batched graph builders (gb_*) are TQ2-only.
-        if self.layers.first().is_some_and(|l| l.qkv.tq1) {
-            return Err(BackendError::UnsupportedFormat(TernaryFormat::Tq1_0));
-        }
         let s = &self.stream;
         let alloc =
             |k: usize, what: &str| s.alloc_zeros::<f32>(k).map_err(|e| driver_err(what, &e));
@@ -1368,18 +1364,14 @@ impl CudaDecodeModel {
         d_out: sys::CUdeviceptr,
         n: usize,
     ) -> Result<(), BackendError> {
-        // The batched builders are TQ2-only; new_batch rejects TQ1 models at
-        // layer 0 — this asserts the whole-model invariant those checks rely on.
-        debug_assert!(
-            !lin.tq1,
-            "gb_matmul: TQ1 linear reached the TQ2-only batch builder"
-        );
         let cs = self.cap_stream.cu_stream();
         let (m_i, n_out_i, k_i, rb_i) = (n as i32, lin.n as i32, lin.k as i32, lin.rb as i32);
         // v1.x: one fused i8 dp4a launch — the `_scaled` epilogue folds the per-row
         // act_scale, replacing the former tiled + scale_mul_batch pair. The multiply
         // order is unchanged ((acc·weight_scale)·act_scale) and the int32 contraction
         // is exact, so the batch-graph argmax lockstep gate is unaffected.
+        // T5: the TQ1-native twin shares the dense 9-arg signature and the exact
+        // integer accumulator, so a TQ1 row dispatches here bit-identically.
         let grid = ((lin.n as u32).div_ceil(WARPS_PER_BLOCK), n as u32, 1);
         let mut params = [
             pp(&d_qact),
@@ -1393,7 +1385,11 @@ impl CudaDecodeModel {
             pp(&rb_i),
         ];
         raw_launch(
-            self.batch_raw().tiled_scaled,
+            if lin.tq1 {
+                self.batch_raw().tq1_tiled_scaled
+            } else {
+                self.batch_raw().tiled_scaled
+            },
             grid,
             (WARPS_PER_BLOCK * 32, 1, 1),
             0,

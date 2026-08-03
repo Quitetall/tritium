@@ -286,6 +286,11 @@ pub(super) struct BatchRawKernels {
     /// i8 dp4a fused-scaled GEMM (v1.x): replaces the former `tiled` + separate
     /// `scale_mul_batch` pair — the epilogue folds the per-row act_scale.
     pub(super) tiled_scaled: sys::CUfunction,
+    /// T5: TQ1_0-native twin of `tiled_scaled` (same dense 9-arg signature,
+    /// `grid.y = m`) — bit-identical to the TQ2 kernel on the same trits
+    /// (integer accumulation; the `tq1_matches_tq2_tiled_scaled_bit_exact`
+    /// gate), so a TQ1-packed model batches/trees in the same numerics domain.
+    pub(super) tq1_tiled_scaled: sys::CUfunction,
     pub(super) lm_head_tiled: sys::CUfunction,
     pub(super) argmax: sys::CUfunction,
     /// Ctrl-driven tree-verify trunk kernels (graph-capturable twins — read
@@ -359,6 +364,7 @@ impl BatchRawKernels {
             residual: get(dm, KERNEL_NAME_RESIDUAL)?,
             relu2: get(dm, KERNEL_NAME_RELU2_GATE)?,
             tiled_scaled: get(am, KERNEL_NAME_TILED_I8_SCALED)?,
+            tq1_tiled_scaled: get(am, KERNEL_NAME_TQ1_TILED_I8_SCALED)?,
             lm_head_tiled: get(dm, KERNEL_NAME_LM_HEAD_TILED_F16)?,
             argmax: get(dm, KERNEL_NAME_ARGMAX_ROWS)?,
             kv_append_tree: get(dm, KERNEL_NAME_KV_APPEND_TREE)?,

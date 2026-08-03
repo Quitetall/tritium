@@ -53,7 +53,8 @@ pub struct TernaryLinear {
 
 /// Weight packing selected by `TRITIUM_WEIGHTS` (A2): `tq2` (default — the
 /// GPU-native 2-bit layout) or `tq1` (entropy-dense 1.6875 b/w stored, read
-/// natively by the TQ1 decode kernels; batch/tree paths reject it in v1).
+/// natively by the TQ1 decode kernels; T5 extends this to the batch/tree
+/// builders, so `--batch-slots`/`--draft-model`/tree sessions serve it too).
 /// Any other value is rejected loudly at first pack (a typo silently running
 /// tq2 would invalidate whatever comparison the user intended).
 fn weights_format() -> Result<TernaryFormat, NnError> {

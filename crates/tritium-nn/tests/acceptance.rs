@@ -2753,3 +2753,203 @@ fn cuda_tree_verify_slots_matches_sequential() {
          under-reservation) atomic across listed slots; graph==eager"
     );
 }
+
+/// RAII guard for `TRITIUM_WEIGHTS`: sets the packing for a model load and
+/// restores the previous value on drop (panic-safe), so a failing T5 gate
+/// cannot leak `tq1` into the rest of the suite's loads.
+#[cfg(feature = "cuda")]
+struct WeightsEnv(Option<String>);
+
+#[cfg(feature = "cuda")]
+impl WeightsEnv {
+    fn set(v: &str) -> Self {
+        let prev = std::env::var("TRITIUM_WEIGHTS").ok();
+        // SAFETY: mutation happens inside the GPU_LOCK critical section and the
+        // GPU suite runs `--test-threads=1`; the only reader is TernaryLinear's
+        // pack-format lookup during the model loads this guard scopes.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::set_var("TRITIUM_WEIGHTS", v)
+        };
+        Self(prev)
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for WeightsEnv {
+    fn drop(&mut self) {
+        // SAFETY: same single-threaded critical section as `set`.
+        #[allow(unsafe_code)]
+        unsafe {
+            match &self.0 {
+                Some(v) => std::env::set_var("TRITIUM_WEIGHTS", v),
+                None => std::env::remove_var("TRITIUM_WEIGHTS"),
+            }
+        }
+    }
+}
+
+/// T5 gate (re-pointing the A2 bit-identity gate at M>1): a batched decode —
+/// 3 slots with DIFFERENT histories through the batched capture/replay graph —
+/// under `TRITIUM_WEIGHTS=tq1` must be **bit-identical** (full logit vectors,
+/// `to_bits`) to the same batched decode under `tq2`. This holds at logit
+/// level, not just tokens, because the TQ1 GEMM twin runs the same exact i32
+/// dp4a accumulator and the same epilogue multiply order on the same trits
+/// (kernel gate `tq1_matches_tq2_tiled_scaled_bit_exact`), and every non-GEMM
+/// kernel in the batched pipeline is weight-format-independent.
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_tq1_batch_decode_bit_identical_to_tq2() {
+    let _gpu = gpu_serial();
+    let Some((_reference, bytes)) = maybe_load() else {
+        return;
+    };
+    // 3 rows, DIFFERENT histories (distinct in-range token streams).
+    const STEPS: usize = 6;
+    let rows: [[u32; STEPS]; 3] = [
+        [128000, 791, 6864, 315, 279, 502],
+        [128000, 3923, 374, 279, 6864, 30],
+        [128000, 9906, 1917, 11, 1268, 527],
+    ];
+    let run = |fmt: &str| -> Option<Vec<Vec<Vec<f32>>>> {
+        let _env = WeightsEnv::set(fmt);
+        let mut runner = load_on("cuda", &bytes)?;
+        let model = runner.resident_cuda().ok()??;
+        let mut batch = model.new_batch(3).expect("new_batch");
+        let mut steps = Vec::with_capacity(STEPS);
+        for i in 0..STEPS {
+            let toks: Vec<u32> = rows.iter().map(|r| r[i]).collect();
+            steps.push(
+                model
+                    .decode_batch_graph(&mut batch, &toks)
+                    .expect("decode_batch_graph"),
+            );
+        }
+        Some(steps)
+    };
+    let Some(want) = run("tq2") else {
+        return; // no device — the tq2 leg already printed why
+    };
+    let got = run("tq1").expect("tq1 load must succeed where tq2 did");
+    for (i, (ws, gs)) in want.iter().zip(&got).enumerate() {
+        assert_eq!(ws.len(), gs.len(), "row count at step {i}");
+        for (r, (wr, gr)) in ws.iter().zip(gs).enumerate() {
+            assert_eq!(wr.len(), gr.len(), "vocab width at step {i} row {r}");
+            for (v, (a, b)) in wr.iter().zip(gr).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "tq1 != tq2 batched logits at step {i} row {r} vocab {v}: \
+                     tq2={a} tq1={b}"
+                );
+            }
+            // Redundant given bit-identity, but states the decode-meaningful
+            // invariant in the pass output.
+            assert_eq!(
+                tritium_nn::sample_greedy(wr),
+                tritium_nn::sample_greedy(gr),
+                "greedy token diverged at step {i} row {r}"
+            );
+        }
+    }
+    println!(
+        "T5 batch gate: tq1 batched decode (3 slots, different histories, \
+         graph route) BIT-identical to tq2 over {STEPS} steps (full logit \
+         vectors, to_bits)"
+    );
+}
+
+/// T5 tree gate: single-seq tree verify under `TRITIUM_WEIGHTS=tq1` must
+/// commit the SAME token stream as under `tq2`, and the transformer state
+/// after the promotes must be bit-identical — asserted by comparing the next
+/// `step_graph` logits `to_bits` (the M=1 graph route reads the promoted KV,
+/// so any tree-trunk divergence or promote corruption shows up here at bit
+/// level). Draft shapes rotate perfect-chain / branch / wrong-tail so accepts
+/// AND rejects are exercised.
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_tq1_tree_verify_matches_tq2() {
+    let _gpu = gpu_serial();
+    let Some((reference, bytes)) = maybe_load() else {
+        return;
+    };
+    let prompt = reference.token_ids.clone();
+    let greedy = reference.greedy_ids.clone();
+    let k_total = 12usize;
+    let run = |fmt: &str| -> Option<(Vec<u32>, Vec<f32>)> {
+        let _env = WeightsEnv::set(fmt);
+        let mut runner = load_on("cuda", &bytes)?;
+        let positions: Vec<usize> = (0..prompt.len()).collect();
+        let prefill = runner.forward(&prompt, &positions).expect("prefill");
+        let first = argmax(&prefill) as u32;
+        assert_eq!(
+            first, greedy[0],
+            "{fmt}: prefill argmax must match the committed reference"
+        );
+        let rm = runner
+            .resident_cuda()
+            .expect("resident")
+            .expect("cuda resident");
+        let mut committed: Vec<u32> = vec![first];
+        let mut phase = 0usize;
+        while committed.len() < k_total {
+            let c = committed.len();
+            let root = *committed.last().expect("non-empty");
+            let remaining = k_total - c;
+            let (tokens, parents): (Vec<u32>, Vec<i32>) = match phase % 3 {
+                0 => {
+                    // Perfect chain of up to 3 drafts.
+                    let n = remaining.min(3);
+                    let mut t = vec![root];
+                    t.extend(greedy[c..c + n].iter().copied());
+                    let p: Vec<i32> = (0..t.len() as i32).map(|i| i - 1).collect();
+                    (t, p)
+                }
+                1 => {
+                    // Branch: wrong sibling first, right child second.
+                    let right = greedy[c];
+                    let wrong = (right + 1) % 128_256;
+                    (vec![root, wrong, right], vec![-1, 0, 0])
+                }
+                _ => {
+                    // Chain that goes wrong after one correct draft.
+                    let right = greedy[c];
+                    let wrong = (right + 7) % 128_256;
+                    (vec![root, right, wrong], vec![-1, 0, 1])
+                }
+            };
+            let out = rm
+                .tree_verify_greedy(&tokens, &parents)
+                .expect("tree_verify_greedy");
+            assert!(!out.is_empty(), "tree verify must commit >= 1 token");
+            committed.extend(&out);
+            phase += 1;
+        }
+        // One M=1 graph step off the promoted state: bit-level state probe.
+        let pos0 = prompt.len() + committed.len() - 1;
+        let pending = *committed.last().expect("non-empty");
+        let logits = rm.step_graph(pending, pos0).expect("post-tree graph step");
+        Some((committed, logits))
+    };
+    let Some((want_tokens, want_logits)) = run("tq2") else {
+        return;
+    };
+    let (got_tokens, got_logits) = run("tq1").expect("tq1 load must succeed where tq2 did");
+    assert_eq!(
+        want_tokens, got_tokens,
+        "tq1 tree verify committed a different stream than tq2"
+    );
+    for (v, (a, b)) in want_logits.iter().zip(&got_logits).enumerate() {
+        assert_eq!(
+            a.to_bits(),
+            b.to_bits(),
+            "post-tree step_graph logits diverged at vocab {v}: tq2={a} tq1={b} \
+             (tree trunk or KV promote differs between formats)"
+        );
+    }
+    println!(
+        "T5 tree gate: tq1 tree verify == tq2 ({} committed tokens, accepts + \
+         rejects) and the post-tree M=1 graph logits are BIT-identical",
+        want_tokens.len()
+    );
+}
