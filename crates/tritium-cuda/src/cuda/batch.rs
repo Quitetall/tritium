@@ -972,6 +972,139 @@ impl CudaDecodeModel {
         Ok(ids.into_iter().map(|t| t as u32).collect())
     }
 
+    /// **I1 batched greedy drafting** (L3 batch-slot spec decode): for each
+    /// LIVE slot, draft up to `k` greedy tokens by running `k` lockstep steps
+    /// of [`decode_batch_graph_argmax`](Self::decode_batch_graph_argmax) with
+    /// the host feeding each step's argmax back as the next step's token —
+    /// the batched sibling of [`draft_chain`](Self::draft_chain).
+    /// Correctness-first: the per-step host round-trip (one sync + `n`×4 B
+    /// readback) is the pre-L1' shape; a device-side chained variant (the
+    /// M=N analogue of `draft_chain_advance`) is a later, *measured*
+    /// optimization.
+    ///
+    /// Per-row semantics match `draft_chain` exactly:
+    /// - `out[r]` is truncated at the first EOS **inclusive**: the EOS is
+    ///   drafted (returned) but never fed. A row that drafts EOS at step `i`
+    ///   is temporarily marked dead (`live[r] = false`) for steps `i+1..k`,
+    ///   so the remaining lockstep steps touch NONE of its state — the C2
+    ///   dead-row contract (device position sentinel `-1`: rope/kv-append
+    ///   skip the row, ZERO arena bytes written, host position frozen by
+    ///   `advance_live`; see [`BatchKv::set_live`] and the
+    ///   `cuda_batch_dead_row_touches_nothing` gate) is exactly the halted
+    ///   behavior required, and the same gate pins that dead rows leave the
+    ///   other rows' outputs bit-identical to an all-live batch. The
+    ///   entry-time liveness is restored before returning (on success AND on
+    ///   error), which is safe because a dead row's stored position is
+    ///   untouched while dead.
+    /// - Rows DEAD at entry draft nothing (`out[r]` empty, their
+    ///   `last_tokens` entry is ignored) and stay dead.
+    /// - KV/position contract per live row `r` (same as `draft_chain`): with
+    ///   `m = out[r].len()`, the slot's KV gained rows for exactly the `m`
+    ///   FED tokens `[last_tokens[r], out[r][0], .., out[r][m-2]]` and
+    ///   `positions[r]` advanced by `m` — the last drafted id (EOS or the
+    ///   k-th token) is never fed. The caller reconciles after verify the
+    ///   same way the single-seq spec loop does (`draft_greedy_tokens`'s
+    ///   `draft_fed`/`draft_pos` bookkeeping in tritium-serve: feeds matching
+    ///   the committed history advance the watermark; a rejected feed forces
+    ///   reset + re-prefill).
+    ///
+    /// On a mid-loop step error, liveness is restored and the error is
+    /// returned; positions/KV reflect the steps that completed (the same
+    /// contract as calling `decode_batch_graph_argmax` directly).
+    ///
+    /// # Errors
+    /// [`BackendError`] on a length guard, `k` out of range, a per-row
+    /// capacity/page-reservation guard, a token guard, or a device failure.
+    pub fn draft_batch(
+        &mut self,
+        batch: &mut BatchKv,
+        last_tokens: &[u32],
+        k: usize,
+        eos: u32,
+    ) -> Result<Vec<Vec<u32>>, BackendError> {
+        let n = batch.n;
+        if last_tokens.len() != n {
+            return Err(BackendError::InvalidInput(format!(
+                "draft_batch expects {n} tokens, got {}",
+                last_tokens.len()
+            )));
+        }
+        if k == 0 || k > DRAFT_CHAIN_MAX {
+            return Err(BackendError::InvalidInput(format!(
+                "draft_batch k={k} out of range (1..={DRAFT_CHAIN_MAX})"
+            )));
+        }
+        // Full-room guards up front (draft_chain's shape): no live row may
+        // overflow its arena or outrun its page reservation mid-draft, so a
+        // failed guard can never leave the batch partially advanced.
+        for (r, (&p, &l)) in batch.positions.iter().zip(&batch.live).enumerate() {
+            if !l {
+                continue;
+            }
+            if p + k > batch.max_ctx {
+                return Err(BackendError::InvalidInput(format!(
+                    "draft_batch overflow: row {r} position {p} + k={k} > max_ctx {}",
+                    batch.max_ctx
+                )));
+            }
+            // Reservation is prefix-contiguous, so the last position's page
+            // implies every earlier one (dense batches are always mapped).
+            if !batch.page_mapped(r, p + k - 1) {
+                return Err(BackendError::InvalidInput(format!(
+                    "draft_batch: row {r} positions {p}..{} not page-reserved \
+                     (call reserve_pages before drafting)",
+                    p + k
+                )));
+            }
+        }
+
+        let entry_live = batch.live.clone();
+        let mut out: Vec<Vec<u32>> = vec![Vec::new(); n];
+        // Step-0 feeds. Dead rows' tokens are ignored but still embed-gathered
+        // on device (the unconditional vocab guard in
+        // decode_batch_graph_argmax), so pin them to a safe in-range id.
+        let mut feed: Vec<u32> = last_tokens
+            .iter()
+            .zip(&batch.live)
+            .map(|(&t, &l)| if l { t } else { 0 })
+            .collect();
+
+        let mut result = Ok(());
+        for _ in 0..k {
+            if batch.live.iter().all(|&l| !l) {
+                break; // every row dead or halted: the draft is complete
+            }
+            let ids = match self.decode_batch_graph_argmax(batch, &feed) {
+                Ok(ids) => ids,
+                Err(e) => {
+                    result = Err(e);
+                    break;
+                }
+            };
+            for r in 0..n {
+                // Dead at entry, or halted by EOS in an earlier step: its
+                // ids[r] is masked junk (zero-attention logits) — discard.
+                if !batch.live[r] {
+                    continue;
+                }
+                out[r].push(ids[r]);
+                if ids[r] == eos {
+                    // Halt: the EOS is drafted, never fed. Dead-marking
+                    // freezes the row (sentinel -1, zero KV bytes, frozen
+                    // position) for the remaining steps; restored below.
+                    batch.live[r] = false;
+                    feed[r] = 0;
+                } else {
+                    feed[r] = ids[r];
+                }
+            }
+        }
+        // Restore entry liveness: rows dead at entry stay dead; halted rows
+        // come back live with their frozen (= post-last-feed) position.
+        batch.live = entry_live;
+        result.map(|()| out)
+    }
+
     /// Extract every batch + weight buffer's stable device pointer (guards dropped here,
     /// outside capture), then capture the full M=N forward via raw launches on
     /// `cap_stream`. Mirrors [`record_graph`](Self::record_graph) for the batched path,

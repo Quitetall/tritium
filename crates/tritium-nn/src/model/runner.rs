@@ -387,6 +387,31 @@ impl ModelRunner {
             .map_err(ResidentOpError::Op)
     }
 
+    /// (cuda) I1 batched greedy drafting (L3 batch-slot spec decode): for each
+    /// LIVE batch slot, draft up to `k` tokens — truncated at the first EOS
+    /// **inclusive**, the EOS drafted but never fed — via `k` lockstep batched
+    /// argmax steps. Dead slots draft nothing (empty vec). Per-row semantics
+    /// and the KV/position contract match
+    /// [`decode_greedy_chain`](Self::decode_greedy_chain): with `m =
+    /// out[r].len()`, slot `r`'s KV gained rows for the `m` fed tokens
+    /// `[last_tokens[r], out[r][..m-1]]` and its position advanced by `m`.
+    ///
+    /// # Errors
+    /// [`ResidentOpError`] — `Unavailable` on a non-CUDA backend, `Op` with
+    /// the device/validation error otherwise.
+    #[cfg(feature = "cuda")]
+    pub fn draft_batch(
+        &mut self,
+        batch: &mut tritium_cuda::BatchKv,
+        last_tokens: &[u32],
+        k: usize,
+        eos: u32,
+    ) -> Result<Vec<Vec<u32>>, ResidentOpError> {
+        self.resident_for_op()?
+            .draft_batch(batch, last_tokens, k, eos)
+            .map_err(ResidentOpError::Op)
+    }
+
     /// Convenience: load from a GGUF byte buffer using the runtime registry's
     /// `"cpu"` backend.
     ///

@@ -1334,3 +1334,182 @@ fn cuda_draft_chain_matches_per_step() {
         "watermark after an eos-truncated chain must be consistent"
     );
 }
+
+/// The small ADR 0021 drafter GGUF for the I1 batched-draft gate: the batched
+/// drafter is the consumer, and it fits alongside a training run's VRAM
+/// footprint where the 2B4T target would not. Skips cleanly when absent.
+#[cfg(feature = "cuda")]
+static DRAFTER_PATH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        "{}/blut/data/drafter-8L768-s3.gguf",
+        std::env::var("HOME").unwrap_or_default()
+    )
+});
+
+/// I1 gate (L3 batch-slot spec decode): `draft_batch` must produce, per LIVE
+/// row, token-for-token what the single-sequence `decode_greedy_chain`
+/// produces over the same history, for k ∈ {1, 4, 7, 16} — including (a) a
+/// row that hits EOS mid-draft (synthesized, like the draft_chain gate, by
+/// passing a known first-drafted id as `eos`) while the other rows keep
+/// drafting, (b) a dead row mixed in (drafts nothing, position frozen), and
+/// (c) rows of unequal positions (three different-length histories). The
+/// KV/position state after each call must equal the single-seq equivalent:
+/// checked by position bookkeeping plus CONTINUING the lockstep across all
+/// six chained calls — a wrong or missing KV row would derail every
+/// subsequent chain's tokens.
+///
+/// Loads ONLY the drafter GGUF (never the 2B4T target); reference runners
+/// are loaded one at a time and dropped, keeping peak VRAM at ~one drafter
+/// model + one 4-slot batch.
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_draft_batch_matches_draft_chain() {
+    let _gpu = gpu_serial();
+    if !Path::new(&*DRAFTER_PATH).exists() {
+        eprintln!("skipping: {} absent (gated drafter test)", *DRAFTER_PATH);
+        return;
+    }
+    let bytes = std::fs::read(&*DRAFTER_PATH).expect("read drafter GGUF");
+
+    // Three DIFFERENT histories (content + length) => unequal row positions.
+    let base: [u32; 7] = [128000, 791, 6864, 315, 279, 1917, 574];
+    let prompts: Vec<Vec<u32>> = (0..3usize)
+        .map(|i| base.iter().copied().cycle().skip(i).take(6 + 5 * i).collect())
+        .collect();
+    let never = u32::MAX;
+
+    // Pre-pass: replay row 1 single-seq through the k∈{1,4,7,16} ladder to
+    // learn the id it would draft FIRST in the k=8 chain — that id becomes
+    // the shared `eos` so row 1 halts mid-draft while rows 0/2 keep going
+    // (the draft_chain gate's synthesis trick, batched).
+    let eos_b = {
+        let Some(mut r) = load_on("cuda", &bytes) else {
+            return;
+        };
+        let positions: Vec<usize> = (0..prompts[1].len()).collect();
+        let l0 = r.forward(&prompts[1], &positions).expect("pre prefill");
+        let mut tok = argmax(&l0) as u32;
+        let mut pos = prompts[1].len();
+        for &k in &[1usize, 4, 7, 16] {
+            let out = r
+                .decode_greedy_chain(tok, pos, k, never)
+                .expect("pre chain")
+                .expect("resident");
+            pos += out.len();
+            tok = *out.last().expect("k >= 1");
+        }
+        r.decode_greedy_step(tok, pos)
+            .expect("pre step")
+            .expect("resident")
+    };
+
+    // The six-call schedule every row runs in lockstep: the no-EOS ladder,
+    // the EOS-mid-draft chain, then a post-EOS continuation (the watermark
+    // consistency probe).
+    let schedule: [(usize, u32); 6] = [
+        (1, never),
+        (4, never),
+        (7, never),
+        (16, never),
+        (8, eos_b),
+        (2, never),
+    ];
+
+    // Reference pass: one single-seq runner per row (sequential, dropped
+    // after use), recording the prefill argmax + every chain's tokens.
+    let mut first_tok = [0u32; 3];
+    let mut expected: Vec<Vec<Vec<u32>>> = Vec::with_capacity(3);
+    for (r, prompt) in prompts.iter().enumerate() {
+        let Some(mut runner) = load_on("cuda", &bytes) else {
+            return;
+        };
+        let positions: Vec<usize> = (0..prompt.len()).collect();
+        let l0 = runner.forward(prompt, &positions).expect("ref prefill");
+        let mut tok = argmax(&l0) as u32;
+        first_tok[r] = tok;
+        let mut pos = prompt.len();
+        let mut chains = Vec::with_capacity(schedule.len());
+        for &(k, eos) in &schedule {
+            let out = runner
+                .decode_greedy_chain(tok, pos, k, eos)
+                .expect("ref chain")
+                .expect("resident");
+            assert!(!out.is_empty(), "ref chain drafted nothing (row {r})");
+            pos += out.len();
+            tok = *out.last().expect("non-empty");
+            chains.push(out);
+        }
+        expected.push(chains);
+    }
+    // The synthesized EOS must actually trigger mid-draft on row 1 AND leave
+    // at least one other row drafting past the halt point.
+    assert_eq!(
+        expected[1][4],
+        vec![eos_b],
+        "row 1's eos chain must halt at [eos] (the draft_chain gate shape)"
+    );
+    assert!(
+        expected[0][4].len() > 1 || expected[2][4].len() > 1,
+        "rows 0/2 must draft past row 1's halt for the gate to have teeth"
+    );
+
+    // Batch pass: one runner, a 4-slot batch — rows 0..3 live with the three
+    // histories (prefilled single-seq, adopted, positioned), row 3 DEAD.
+    let Some(mut rb) = load_on("cuda", &bytes) else {
+        return;
+    };
+    let mut batch = rb.new_batch(4).expect("new_batch");
+    for (r, prompt) in prompts.iter().enumerate() {
+        rb.reset();
+        let positions: Vec<usize> = (0..prompt.len()).collect();
+        let l0 = rb.forward(prompt, &positions).expect("batch prefill");
+        assert_eq!(
+            argmax(&l0) as u32,
+            first_tok[r],
+            "batch runner prefill diverged from the reference prefill (row {r})"
+        );
+        rb.adopt_into_batch_row(&mut batch, r, prompt.len())
+            .expect("adopt");
+        batch.set_position(r, prompt.len()).expect("set_position");
+    }
+    batch.set_live(3, false).expect("set_live");
+
+    let mut pos: Vec<usize> = prompts.iter().map(Vec::len).collect();
+    let mut last = first_tok.to_vec();
+    for (ci, &(k, eos)) in schedule.iter().enumerate() {
+        let feeds = [last[0], last[1], last[2], 0];
+        let outs = rb
+            .draft_batch(&mut batch, &feeds, k, eos)
+            .expect("draft_batch");
+        assert_eq!(outs.len(), 4);
+        assert!(
+            outs[3].is_empty(),
+            "dead row drafted tokens at call {ci}: {:?}",
+            outs[3]
+        );
+        assert_eq!(
+            batch.positions()[3],
+            0,
+            "dead row's position moved at call {ci}"
+        );
+        for r in 0..3 {
+            assert_eq!(
+                outs[r], expected[r][ci],
+                "draft_batch row {r} diverged from decode_greedy_chain at call {ci} (k={k})"
+            );
+            pos[r] += outs[r].len();
+            assert_eq!(
+                batch.positions()[r],
+                pos[r],
+                "row {r} position after call {ci} != single-seq watermark"
+            );
+            last[r] = *outs[r].last().expect("non-empty per the ref assert");
+        }
+    }
+    drop(batch);
+    println!(
+        "draft_batch parity: 3 live rows == draft_chain over {} chained calls \
+         (k=1/4/7/16 + eos-mid-draft + post-eos continuation), dead row inert",
+        schedule.len()
+    );
+}
