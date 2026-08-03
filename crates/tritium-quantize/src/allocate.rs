@@ -288,33 +288,72 @@ pub fn allocate_with_curves(
     let mut t = vec![cfg.t_min; n];
     let mut spent = base_bits;
 
+    // Gain of group `g`'s NEXT plane, per bit — `None` when the group is capped or the step buys
+    // nothing. Affordability is deliberately NOT checked here: it depends on `spent`, which moves.
+    let next_gain = |g: usize, t_g: usize| -> Option<f64> {
+        if t_g >= cfg.t_max {
+            return None;
+        }
+        let drop = curve_at(curves[g], t_g) - curve_at(curves[g], t_g + 1);
+        if drop <= 0.0 {
+            return None; // residual exhausted — adding a plane wastes bits
+        }
+        // An empty group has a flat (zero) curve → drop == 0 → returned above, so any group
+        // reaching here has size > 0, hence cost > 0.
+        debug_assert!(bits_per_plane[g] > 0.0);
+        Some(groups[g].sensitivity * drop / bits_per_plane[g])
+    };
+
+    // A max-heap over `(gain, group)`. The linear scan this replaces was O(additions × groups),
+    // which is ~2.6e12 operations on a 135M model's 1.14M groups — it does not finish. Each pop
+    // here re-pushes only the popped group's next step, so it is O(additions · log groups).
+    //
+    // `Ord` must reproduce the scan's tie-break EXACTLY or this is a different allocator: highest
+    // gain wins, and equal gains go to the LOWEST group index (the scan took strictly-greater while
+    // walking g ascending). Hence gain compared normally, index compared REVERSED, since
+    // `BinaryHeap` pops the maximum. `total_cmp` gives floats the total order `Ord` requires.
+    #[derive(PartialEq)]
+    struct Candidate {
+        gain: f64,
+        group: usize,
+    }
+    impl Eq for Candidate {}
+    impl Ord for Candidate {
+        fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+            self.gain
+                .total_cmp(&other.gain)
+                .then_with(|| other.group.cmp(&self.group))
+        }
+    }
+    impl PartialOrd for Candidate {
+        fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+
+    let mut heap: std::collections::BinaryHeap<Candidate> = (0..n)
+        .filter_map(|g| next_gain(g, t[g]).map(|gain| Candidate { gain, group: g }))
+        .collect();
+
     loop {
-        // Best (highest loss-drop-per-bit) affordable, beneficial plane to add.
-        let mut best: Option<(f64, usize)> = None;
-        for g in 0..n {
-            if t[g] >= cfg.t_max {
+        let best = loop {
+            let Some(c) = heap.pop() else {
+                break None;
+            };
+            // An unaffordable group can never become affordable — `spent` only grows — so drop it
+            // rather than re-pushing. This is what the scan's `continue` amounted to.
+            if spent + bits_per_plane[c.group] > cfg.budget_bits {
                 continue;
             }
-            let cost = bits_per_plane[g];
-            if spent + cost > cfg.budget_bits {
-                continue; // can't afford another plane on this group
-            }
-            let drop = curve_at(curves[g], t[g]) - curve_at(curves[g], t[g] + 1);
-            if drop <= 0.0 {
-                continue; // residual exhausted — adding a plane wastes bits
-            }
-            // An empty group has a flat (zero) curve → drop == 0 → skipped above,
-            // so any group reaching here has size > 0, hence cost > 0.
-            debug_assert!(cost > 0.0);
-            let gain_per_bit = groups[g].sensitivity * drop / cost;
-            if best.is_none_or(|(b, _)| gain_per_bit > b) {
-                best = Some((gain_per_bit, g));
-            }
-        }
+            break Some(c.group);
+        };
         match best {
-            Some((_, g)) => {
+            Some(g) => {
                 t[g] += 1;
                 spent += bits_per_plane[g];
+                if let Some(gain) = next_gain(g, t[g]) {
+                    heap.push(Candidate { gain, group: g });
+                }
             }
             None => break,
         }
@@ -663,5 +702,141 @@ mod curve_tests {
         )
         .expect("allocate");
         assert_eq!(got.plane_counts, vec![1, 3]);
+    }
+}
+
+#[cfg(test)]
+mod scale_tests {
+    use super::*;
+
+    /// The linear-scan water-filling this module shipped before the heap, kept as the reference the
+    /// fast path is gated against. Semantics that must be preserved exactly: skip groups at `t_max`,
+    /// skip groups that cannot afford another plane, skip zero-gain steps, and break ties toward the
+    /// LOWER group index.
+    fn allocate_reference(groups: &[GroupCurve], cfg: &AllocConfig) -> Allocation {
+        let n = groups.len();
+        let bits: Vec<f64> = groups
+            .iter()
+            .map(|g| g.weights as f64 * TRIT_BITS)
+            .collect();
+        let mut t = vec![cfg.t_min; n];
+        let mut spent: f64 = bits.iter().sum::<f64>() * cfg.t_min as f64;
+        loop {
+            let mut best: Option<(f64, usize)> = None;
+            for g in 0..n {
+                if t[g] >= cfg.t_max || spent + bits[g] > cfg.budget_bits {
+                    continue;
+                }
+                let drop = curve_at(groups[g].curve, t[g]) - curve_at(groups[g].curve, t[g] + 1);
+                if drop <= 0.0 {
+                    continue;
+                }
+                let gain = groups[g].sensitivity * drop / bits[g];
+                if best.is_none_or(|(b, _)| gain > b) {
+                    best = Some((gain, g));
+                }
+            }
+            match best {
+                Some((_, g)) => {
+                    t[g] += 1;
+                    spent += bits[g];
+                }
+                None => break,
+            }
+        }
+        Allocation { plane_counts: t }
+    }
+
+    fn seeded(seed: u64, n: usize) -> Vec<f64> {
+        let mut s = seed | 1;
+        (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                (s % 10_000) as f64 / 10_000.0
+            })
+            .collect()
+    }
+
+    /// The heap must reproduce the linear scan EXACTLY — including its tie-breaking — across shapes
+    /// that exercise ties, zero-gain steps, mixed group sizes and a binding budget. Anything less
+    /// and the fast path is a different allocator wearing the same name.
+    #[test]
+    fn heap_water_filling_matches_the_linear_reference() {
+        for seed in 0..24u64 {
+            let n = 3 + (seed as usize * 7) % 40;
+            let t_max = 1 + (seed as usize) % 5;
+            let raw = seeded(seed * 31 + 1, n * (t_max + 1));
+            let sens = seeded(seed * 17 + 3, n);
+            // Monotone non-increasing curves, with deliberate flat runs (equal consecutive values)
+            // so the zero-gain skip is exercised, and deliberate duplicates across groups so ties are.
+            let curves: Vec<Vec<f64>> = (0..n)
+                .map(|g| {
+                    let mut c = vec![100.0f64];
+                    for k in 1..=t_max {
+                        let step = if (g + k) % 3 == 0 {
+                            0.0 // flat run
+                        } else {
+                            raw[g * (t_max + 1) + k] * 20.0
+                        };
+                        c.push((c[k - 1] - step).max(0.0));
+                    }
+                    c
+                })
+                .collect();
+            let sizes: Vec<usize> = (0..n).map(|g| if g % 4 == 0 { 64 } else { 128 }).collect();
+            let groups: Vec<GroupCurve<'_>> = (0..n)
+                .map(|g| GroupCurve {
+                    curve: &curves[g],
+                    weights: sizes[g],
+                    // Quantised so ties genuinely occur rather than being broken by float noise.
+                    sensitivity: (sens[g] * 4.0).round().max(1.0),
+                })
+                .collect();
+
+            let total: usize = sizes.iter().sum();
+            for bpw_mult in [1.0f64, 1.7, 2.5, 100.0] {
+                let cfg = AllocConfig::from_bpw(TRIT_BITS * bpw_mult, total, 1, t_max);
+                let want = allocate_reference(&groups, &cfg);
+                let got = allocate_with_curves(&groups, &cfg).expect("allocate");
+                assert_eq!(
+                    got.plane_counts, want.plane_counts,
+                    "seed {seed} bpw_mult {bpw_mult}: heap diverged from the linear reference"
+                );
+            }
+        }
+    }
+
+    /// Model scale. SmolLM2-135M is 1,144,320 groups at g128, and the linear scan is
+    /// O(additions x groups) = ~2.6e12 operations there — it does not finish. The heap is
+    /// O(additions x log groups). This gate is the reason the fast path exists, and it fails loudly
+    /// if anyone reintroduces a full scan per plane.
+    #[test]
+    fn allocates_over_a_million_groups_quickly() {
+        let n = 1_000_000usize;
+        let curve = [100.0f64, 40.0, 18.0, 9.0];
+        let groups: Vec<GroupCurve<'_>> = (0..n)
+            .map(|g| GroupCurve {
+                curve: &curve,
+                weights: 128,
+                // Vary sensitivity so the heap actually reorders rather than running in index order.
+                sensitivity: 1.0 + (g % 97) as f64,
+            })
+            .collect();
+        let cfg = AllocConfig::from_bpw(TRIT_BITS * 3.0, n * 128, 1, 3);
+
+        let t0 = std::time::Instant::now();
+        let alloc = allocate_with_curves(&groups, &cfg).expect("allocate");
+        let secs = t0.elapsed().as_secs_f64();
+
+        assert_eq!(alloc.plane_counts.len(), n);
+        let mean: f64 = alloc.plane_counts.iter().sum::<usize>() as f64 / n as f64;
+        assert!(
+            (2.5..=3.0).contains(&mean),
+            "a T=3 budget should be nearly exhausted, got mean T {mean:.3}"
+        );
+        // Generous: the linear scan would need hours here.
+        assert!(secs < 30.0, "1M-group allocation took {secs:.1}s");
     }
 }
