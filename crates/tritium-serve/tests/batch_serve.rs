@@ -1065,6 +1065,8 @@ async fn cuda_batched_spec_multi_matches_single_worker() {
     // Phase A — three concurrent greedy streams, all exact.
     let spec_before =
         tritium_serve::generator::SPEC_COMMITTED.load(std::sync::atomic::Ordering::Relaxed);
+    let verifies_before =
+        tritium_serve::generator::SPEC_VERIFIES.load(std::sync::atomic::Ordering::Relaxed);
     let handles: Vec<_> = (0..3)
         .map(|i| {
             let router = router.clone();
@@ -1089,6 +1091,22 @@ async fn cuda_batched_spec_multi_matches_single_worker() {
         "phase A teeth: only {spec_delta} of {} tokens were committed by spec \
          verifies — the pool silently fell back to lockstep",
         3 * horizon
+    );
+    // Acceptance teeth: streams stay EXACT even with a corrupted drafter KV
+    // (spec is lossless — bad drafts just reject wholesale), so pin the
+    // tok/verify ratio too. The fixture achieves 2.80 tok/verify
+    // (2026-08-03 run: 140 committed / 50 verifies); the floor is
+    // max(half of that, 1.5) = 1.5 — a collapse toward ~1 means the
+    // drafter rows are junk.
+    let verify_delta = tritium_serve::generator::SPEC_VERIFIES
+        .load(std::sync::atomic::Ordering::Relaxed)
+        - verifies_before;
+    let tok_per_verify = spec_delta as f64 / verify_delta.max(1) as f64;
+    assert!(
+        tok_per_verify >= 1.5,
+        "phase A teeth: tok/verify collapsed to {tok_per_verify:.2} \
+         ({spec_delta} committed / {verify_delta} verifies) — drafter-KV \
+         state is likely corrupt (drafts rejecting wholesale)"
     );
 
     // Phase B — staggered admission: A+B mid-flight, C arrives.
@@ -1187,8 +1205,10 @@ async fn cuda_batched_spec_multi_matches_single_worker() {
     }
     println!(
         "multi-spec: 3 concurrent == single worker ({horizon} tokens each, \
-         {spec_delta} spec-committed); staggered admission exact; EOS mid-round \
-         truncated stream 0 at {} tokens while the others ran to {horizon}",
+         {spec_delta} spec-committed over {verify_delta} verifies = \
+         {tok_per_verify:.2} tok/verify); staggered admission exact; EOS \
+         mid-round truncated stream 0 at {} tokens while the others ran to \
+         {horizon}",
         expects[0].len(),
     );
 }

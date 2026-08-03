@@ -580,6 +580,17 @@ struct SpecSlot {
     policy: DraftPolicy,
 }
 
+/// Once-per-worker markers for the QUIET capacity fallbacks: each class
+/// recurs every round while its condition holds (pool too wide, a slot's
+/// history at the drafter's context edge), and without a marker the only
+/// symptom would be a flat spec counter.
+#[derive(Default)]
+struct MultiFallbackLog {
+    cap: bool,
+    ctx: bool,
+    k0: bool,
+}
+
 /// What one multi-slot spec round attempt did.
 enum MultiOutcome {
     /// The round ran: drafts verified, committed tokens emitted.
@@ -606,6 +617,7 @@ enum MultiOutcome {
 /// I4 pins batched == sequential slots, I1 pins batched drafts == chained
 /// drafts — and draft content never changes the committed stream).
 #[allow(clippy::too_many_lines)] // one round, straight-line; splitting hides the state flow
+#[allow(clippy::too_many_arguments)] // the round's full wiring, one call site
 fn multi_spec_round(
     runner: &mut tritium_nn::ModelRunner,
     draft: &mut tritium_nn::ModelRunner,
@@ -614,15 +626,53 @@ fn multi_spec_round(
     pool: &mut [Option<Active>],
     eos: u32,
     n_ctx: usize,
+    log: &mut MultiFallbackLog,
 ) -> MultiOutcome {
     let slots = pool.len();
     let rows: Vec<usize> = (0..slots).filter(|&r| pool[r].is_some()).collect();
     let n_live = rows.len();
+    if n_live == 0 {
+        return MultiOutcome::Fallback;
+    }
     // Even k=1 chains cost 2 nodes per slot; past the cap the one-bucket
     // verify cannot hold everyone. (Realistic pools are far smaller; a
     // grouped-rounds variant is the measured follow-up if ever needed.)
-    if n_live == 0 || 2 * n_live > TREE_NODE_CAP {
+    if 2 * n_live > TREE_NODE_CAP {
+        if !log.cap {
+            log.cap = true;
+            eprintln!(
+                "tritium-serve: multi-slot spec idle — {n_live} live slots need \
+                 {} tree nodes > the {TREE_NODE_CAP}-node verify bucket; \
+                 lockstep until the pool shrinks (logged once)",
+                2 * n_live
+            );
+        }
         return MultiOutcome::Fallback;
+    }
+    // Host-only feasibility BEFORE any drafter work, so a doomed round costs
+    // nothing (no pool alloc, no enrollment prefills — without this hoist a
+    // slot at the drafter's context edge made every round pay full
+    // enrollment for the OTHER rows and then fall back). Every live row
+    // needs drafter room for its history, the pending feed, and >= 1 draft:
+    // p + 2 < draft_ctx, which also bounds the shared k below to >= 2 per
+    // row before the policy min.
+    let draft_ctx = draft.config.n_ctx as usize;
+    let mut k = TREE_NODE_CAP / n_live - 1; // >= 1 by the cap check above
+    for &r in &rows {
+        let p = pool[r].as_ref().expect("live row").history.len() - 1;
+        if p + 2 >= draft_ctx {
+            if !log.ctx {
+                log.ctx = true;
+                eprintln!(
+                    "tritium-serve: multi-slot spec idle — a slot's history \
+                     ({} tokens) is at the drafter's context edge ({draft_ctx}); \
+                     lockstep until it retires (logged once)",
+                    p + 1
+                );
+            }
+            return MultiOutcome::Fallback;
+        }
+        k = k.min(draft_ctx - p - 1);
     }
 
     // Build the drafter pool lazily (first eligible round, or re-entry after
@@ -645,14 +695,12 @@ fn multi_spec_round(
         }
     }
     let mp = multi.as_mut().expect("built above");
-    let draft_ctx = draft.config.n_ctx as usize;
 
     // Enroll rows the drafter does not hold (fresh admissions, reused rows,
     // re-entry after a fallback): prefill the slot's committed history
     // (minus the pending token) through the drafter's single-sequence KV and
-    // adopt it into the row. v1 all-or-nothing: a row that cannot enroll
-    // (drafter context too small for its history) flips the whole pool back
-    // to lockstep — quiet, it is a capacity condition, not an error.
+    // adopt it into the row. Drafter room was established by the hoisted
+    // feasibility check above.
     for &r in &rows {
         let a = pool[r].as_ref().expect("row in rows is live");
         if mp.slots[r].as_ref().is_some_and(|s| s.owner == a.id) {
@@ -667,9 +715,6 @@ fn multi_spec_round(
             }
         };
         let p = a.history.len() - 1;
-        if p + 2 >= draft_ctx {
-            return MultiOutcome::Fallback;
-        }
         draft.reset();
         let positions: Vec<usize> = (0..p).collect();
         let enrolled = draft
@@ -697,7 +742,10 @@ fn multi_spec_round(
     // one masked k=1 draft_batch step (the batched analogue of the solo
     // path's gap `forward`). Gaps are <= 1 by the reconcile below, so this
     // loop runs at most twice; a gap that will not close is a logic error —
-    // fall back rather than wedge.
+    // fall back rather than wedge. (Future optimization, deliberately not
+    // built: the drafted token this step DISCARDS is the drafter's guess at
+    // the next pending — when it matches, it could seed the next chain and
+    // save one lockstep drafter step per fully-accepted round.)
     for guard in 0.. {
         let mut feeds = vec![0u32; slots];
         let mut any_gap = false;
@@ -731,23 +779,24 @@ fn multi_spec_round(
     }
 
     // Shared draft length (the v1 policy, module docs): min over the live
-    // slots' policy lengths, clamped by every enrolled row's drafter-context
-    // room (draft_batch's own guard) and by the I4 one-bucket cap
-    // (`N·(1+k) <= 48` — one verify group always suffices). Per-slot
-    // budget/target-room clamps are applied by TRUNCATING chains below (the
-    // overfed drafter rows roll back), so one slot near its end never drags
-    // the whole pool to k=0.
-    let mut k = TREE_NODE_CAP / n_live - 1;
+    // slots' policy lengths, on top of the hoisted clamps (every enrolled
+    // row's drafter-context room — draft_batch's own guard — and the I4
+    // one-bucket cap `N·(1+k) <= 48`, so one verify group always suffices).
+    // Per-slot budget/target-room clamps are applied by TRUNCATING chains
+    // below (the overfed drafter rows roll back), so one slot near its end
+    // never drags the whole pool to k=0.
     for &r in &rows {
-        let a = pool[r].as_ref().expect("live");
         let slot = mp.slots[r].as_ref().expect("enrolled above");
-        let p = a.history.len() - 1;
-        k = k
-            .min(slot.policy.len())
-            .min(draft_ctx.saturating_sub(p).saturating_sub(1));
+        k = k.min(slot.policy.len());
     }
     if k == 0 {
-        return MultiOutcome::Fallback; // drafter room exhausted: plain steps carry on
+        // Unreachable — the hoisted clamps keep every term >= 1 — but a
+        // future clamp must fall back loudly-once, not spin silently.
+        if !log.k0 {
+            log.k0 = true;
+            eprintln!("tritium-serve: multi-slot spec idle — draft length clamped to 0");
+        }
+        return MultiOutcome::Fallback;
     }
     // Per-slot chain caps: committed (<= drafts + 1) must fit the emission
     // budget, and the verify needs pos + 1 + d <= n_ctx (the solo
@@ -851,24 +900,66 @@ fn multi_spec_round(
             .collect();
         let outs = match runner.tree_verify_greedy_slots(batch, &group_rows, &group_trees) {
             Ok(o) => o,
+            // An InvalidInput refusal is ATOMIC — every target and tree is
+            // host-validated before any device work, so no listed slot
+            // changed and the lockstep fallback is seamless and lossless.
+            Err(tritium_nn::ResidentOpError::Op(
+                tritium_spec::BackendError::InvalidInput(m),
+            )) => {
+                eprintln!("tritium-serve: multi-slot tree verify refused: {m}");
+                return MultiOutcome::Fallback;
+            }
+            // Any OTHER error is NOT atomic: the engine promotes the
+            // group's slots SEQUENTIALLY after the forward, so the error
+            // may have landed after some slots' KV/positions already
+            // advanced — their committed tokens are lost with the error,
+            // and a silent fallback would resume lockstep from a stale
+            // pending token (dropped tokens + divergence). We cannot know
+            // which slots promoted: error every listed stream loudly (the
+            // lockstep device-error classification) and retire them.
+            // Slots in OTHER groups are safe — earlier groups fully
+            // reconciled, later ones never reached the device.
             Err(e) => {
-                // Refusals are atomic (no listed slot changed) and device
-                // errors never touch other rows' committed KV: lockstep
-                // resumes from the last committed tokens either way.
                 eprintln!("tritium-serve: multi-slot tree verify: {e}");
+                for &(r, ..) in group {
+                    if let Some(a) = pool[r].take() {
+                        let _ = a.tx.try_send(GenEvent::Error(format!(
+                            "speculative verify failed mid-commit: {e}"
+                        )));
+                        release_slot(batch, r);
+                    }
+                    mp.slots[r] = None;
+                }
                 return MultiOutcome::Fallback;
             }
         };
 
         // Per-slot reconcile: policy fold, drafter rollback to the accepted
         // prefix, then emit every committed token (EOS/budget truncate +
-        // retire exactly like the lockstep emit path).
+        // retire exactly like the lockstep emit path). The group's promotes
+        // have ALREADY advanced the slots' KV/positions, so from here NO
+        // exit may strand a promoted-but-unemitted slot: drafter-side
+        // bookkeeping errors only cost the pool state (fallback AFTER the
+        // loop), never a committed token.
+        let mut drafter_broken = false;
         for (&(r, ref tokens, _), committed) in group.iter().zip(outs) {
             let offered = tokens.len() - 1;
             let l = committed.len();
             if l == 0 {
+                // Contract violation (the accept walk always commits >= 1):
+                // this slot's promote advanced by an unknown amount with
+                // nothing to emit — error THIS stream loudly and retire it
+                // (the mid-commit rule); the other slots' commits proceed.
                 eprintln!("tritium-serve: multi-slot verify returned an empty commit");
-                return MultiOutcome::Fallback;
+                if let Some(a) = pool[r].take() {
+                    let _ = a.tx.try_send(GenEvent::Error(
+                        "speculative verify returned an empty commit".into(),
+                    ));
+                    release_slot(batch, r);
+                }
+                mp.slots[r] = None;
+                drafter_broken = true;
+                continue;
             }
             SPEC_VERIFIES.fetch_add(1, Ordering::Relaxed);
             SPEC_COMMITTED.fetch_add(l as u64, Ordering::Relaxed);
@@ -884,7 +975,17 @@ fn multi_spec_round(
                 // round.
                 let matched = 1 + (l - 1).min(fed[r] - 1);
                 if mp.dbatch.set_position(r, p + matched).is_err() {
-                    return MultiOutcome::Fallback;
+                    // Bad row/pos = corrupted bookkeeping: drop the
+                    // enrollment (pool falls back after the loop) but KEEP
+                    // emitting — the target side already committed.
+                    mp.slots[r] = None;
+                    drafter_broken = true;
+                } else {
+                    debug_assert_eq!(
+                        mp.dbatch.positions()[r],
+                        p + 1 + (l - 1).min(fed[r] - 1),
+                        "drafter watermark mismatch after rollback (row {r})"
+                    );
                 }
             }
             let mut retire = false;
@@ -904,6 +1005,9 @@ fn multi_spec_round(
                 mp.slots[r] = None;
                 release_slot(batch, r);
             }
+        }
+        if drafter_broken {
+            return MultiOutcome::Fallback; // commits all emitted; only drafter state is lost
         }
         start = end;
     }
@@ -996,6 +1100,7 @@ pub(crate) fn run_batched(
     // never serve a row's next tenant.
     let mut multi: Option<SpecPool> = None;
     let mut multi_disabled = false;
+    let mut multi_log = MultiFallbackLog::default();
     // Monotonic Active ids (enrollment ownership).
     let mut next_active_id: u64 = 0;
 
@@ -1545,7 +1650,16 @@ pub(crate) fn run_batched(
                 .all(|a| matches!(a.sampling, Sampling::Greedy) && a.logprobs.is_none());
         if multi_eligible {
             let d = draft.as_mut().expect("eligibility requires a drafter");
-            match multi_spec_round(&mut runner, d, &mut batch, &mut multi, &mut pool, eos, n_ctx) {
+            match multi_spec_round(
+                &mut runner,
+                d,
+                &mut batch,
+                &mut multi,
+                &mut pool,
+                eos,
+                n_ctx,
+                &mut multi_log,
+            ) {
                 MultiOutcome::Ran => continue,
                 MultiOutcome::Fallback => multi = None,
                 MultiOutcome::Disable => {
