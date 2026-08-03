@@ -17,12 +17,31 @@ generates bit-identically to any other encoding of the same trits.
 `tritium repack --input a.gguf --output b.gguf --to tq1|tq2` converts
 losslessly between them (BitNet 2B4T: 1.188 GB → 1.106 GB as TQ1_0, ~10 s).
 
-**Ship TQ1_0, run TQ2_0.** TQ1_0 is a *storage* format only: its base-243
-decode costs ~4× the per-trit ALU of TQ2_0, and the decode GEMMs have no
-DRAM headroom to buy it back (measured 1.19–1.37× slower even with a
-shared-LUT + `__byte_perm` unpack — see OPTIMIZATION-LOG round 10b). The
-loader erases the difference: a TQ1_0 file runs at full TQ2_0 speed because
-backends never see TQ1_0 bytes.
+**Ship TQ1_0, run TQ2_0 — unless VRAM is the constraint.** By default the
+loader unpacks TQ1_0 to trits and the CUDA backend packs TQ2_0, so a TQ1_0
+file runs at full TQ2_0 speed. `TRITIUM_WEIGHTS=tq1` (A2) opts into serving
+TQ1_0 bytes *natively* instead: a **capacity-only** rung — −18% weight VRAM
+(2B4T: ~−160 MB) at decode parity-to-−5%, because the base-243 decode costs
+~24 ALU ops per dp4a word vs TQ2_0's ~3 and M=1 GEMMs have limited DRAM
+headroom to buy that back (OPTIMIZATION-LOG rounds 10b/16; the uncontended
+e2e re-bench is still owed). v1 scope: the single-sequence path only —
+`--batch-slots > 1`, tree/spec sessions, and `--draft-model` refuse TQ1
+loudly (the `gb_*` batched/tree graph builders are TQ2-only;
+`build_batch`/`tree_forward` guards).
+
+## TB1 bitmap+signs: measured, refuted, kept
+
+A 1.578-bpw bitmap+signs layout (one zero/nonzero bit per element + a packed
+sign stream) exists in-tree as **TB1**, with bit-exact kernels and gates. It
+is **refuted as a decode format at BitNet's density** (round 16): on the real
+gateup shape (M=1, N=13824, K=2560) it measured 33.77 µs/launch vs TQ2_0's
+13.11 — 2.58× slower for a 19% byte saving, because the per-block warp
+prefix scan for sign addressing serializes exactly where M=1 GEMMs are
+ALU-bound, not DRAM-bound. Bytes don't convert to time here. The kernel,
+format, and bench harness stay in-tree; the niche survives on paper only for
+high-sparsity students (p ≥ ~0.6, where the sign stream shrinks and
+block-skip composes) — any redesign must beat TB1's 33.77 µs on the gateup
+microbench *before* integration is considered.
 
 ## The f16 scale gap
 
@@ -35,11 +54,14 @@ checkpoints' scales are **not f16-representable** (e.g. `blk.0.attn_q` =
 Foreign loaders (llama.cpp et al.) fall back to the f16 block scales —
 ~1e-4 relative on the scale, the TQ formats' native precision.
 
-Per-block scales must be uniform across a tensor's nonzero blocks (pure
-ternary tensors always are: every block's absmax is either the tensor scale
-or zero). All-zero blocks (scale 0) have their trits forced to the zero trit
-— exact at any tensor scale. Genuinely non-uniform block scales are rejected
-loudly rather than silently mis-scaled through the per-tensor path.
+Per-block scales must be uniform within each **row** of a tensor. Two cases
+load: all rows sharing one scale takes the exact per-tensor path (with the
+`i2s_scale` metadata check), and row-uniform scales that *differ across
+rows* load as a per-row-scale ternary linear — the GEMM contract is per-row
+`weight_scale[n]`, so this is exact, and it is what a per-row-α trained LM
+head (ADR 0032 T2a) exports as TQ2_0. All-zero blocks (scale 0) have their
+trits forced to the zero trit — exact at any scale. Scales that vary *within*
+a row are rejected loudly rather than silently mis-scaled.
 
 ## TL1 / TL2: a non-goal, deliberately
 
