@@ -31,6 +31,12 @@ tritium-nn = { workspace = true }
 # pulls in no `cudarc` and runs no `nvcc`. The crate-level `cuda` feature below turns
 # it on so the backend self-registers as `"cuda"` into the runtime `BACKENDS` slice.
 tritium-cuda = { workspace = true }
+# The non-NVIDIA backends, linked on the same terms as tritium-cuda above: present
+# as dev-dependencies (cargo has no optional dev-dependencies) but inert stubs until
+# the crate features below turn on their own `register` / `rocm` gates. Without this
+# linkage no AMD or Vulkan box can produce a GPU bench number at all (issue #4).
+tritium-wgpu = { workspace = true }
+tritium-rocm = { workspace = true }
 # Parse the committed `tools/reference/bitnet_accept.json` (token IDs + reference
 # perplexity) the end-to-end bench couples its tokens/sec to.
 serde = { workspace = true }
@@ -46,6 +52,13 @@ serde_json = { workspace = true }
 [features]
 default = []
 cuda = ["tritium-cuda/cuda", "tritium-nn/cuda"]
+# Non-NVIDIA GPU lanes, mirroring `cuda`. Each turns on its crate's registration
+# feature so the backend self-registers into `BACKENDS` and the GPU bench bodies can
+# resolve it by name. Independent of `cuda` and of each other; `gpu_mpgemm` runs the
+# add-only family across every backend enabled here. `rocm` needs a ROCm toolkit at
+# build time (its build.rs shells `hipcc`), which is why nothing implies it.
+wgpu = ["tritium-wgpu/register"]
+rocm = ["tritium-rocm/rocm"]
 
 # WF-E benches. `mpgemm` (CPU, always-on) is the v0.30 skeleton baseline. The GPU
 # mpGEMM microbenches + the end-to-end tokens/sec bench have `cuda`-gated bodies, so

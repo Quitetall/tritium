@@ -28,8 +28,24 @@
 //! JSON to exist (else it prints why and skips) and a working CUDA device (else
 //! backend init returns `Err` and it skips). So cpu-only lanes, GPU-less boxes, and
 //! model-less boxes all skip cleanly instead of failing.
+//!
+//! ## Why this one stays CUDA-only
+//!
+//! `gpu_mpgemm` was generalised across every compiled-in GPU backend (issue #4), but
+//! this bench deliberately was not. Its decode body is a **regression gate**, not a
+//! portable throughput harness: it `assert!`s against `TRITIUM_2B4T_DECODE_4090`, a
+//! figure measured on one specific NVIDIA box. Pointed at wgpu or ROCm it would read
+//! a legitimately different rate as a `PERF REGRESSION` and fail the bench — a false
+//! alarm, not a measurement. A portable version needs a per-backend recorded baseline,
+//! and no such number exists for any non-NVIDIA device yet. Until one does, the
+//! supported way to get an end-to-end decode figure off NVIDIA is the ledger command
+//! (`tritium report compare --backend wgpu|rocm`, docs/BENCHMARKS.md), which reports
+//! rather than gates.
 
-#![cfg_attr(not(feature = "cuda"), allow(unused_crate_dependencies))]
+#![cfg_attr(
+    not(all(feature = "cuda", feature = "wgpu", feature = "rocm")),
+    allow(unused_crate_dependencies)
+)]
 
 fn main() {
     divan::main();

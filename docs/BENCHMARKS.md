@@ -21,6 +21,23 @@ Emits: decode tok/s ×3 (median), prefill tok/s + ttft p50/p95 over a 512-token 
 environment capture (GPU, driver, VRAM, co-resident compute processes, date, git commit). The
 JSON is the artifact; the tables below are transcriptions of it.
 
+**`--backend` resolves against backends linked into the binary**, so build the one you intend to
+measure — the flag cannot reach a backend the binary does not contain:
+
+| hardware | build | `--backend` |
+|---|---|---|
+| NVIDIA | `cargo build --release -p tritium-cli --features cuda` | `cuda` |
+| AMD / Intel / any Vulkan GPU | `cargo build --release -p tritium-cli --features wgpu` | `wgpu` |
+| AMD with a ROCm toolkit | `cargo build --release -p tritium-cli --features rocm` | `rocm` |
+
+`wgpu` needs only a Vulkan driver (no vendor toolkit) and is the portable lane; `rocm` needs
+`hipcc` present at build time. Off NVIDIA there is no `nvidia-smi`, so the environment capture
+falls back to the backend's own adapter name and the `gpu` field reads e.g.
+`"AMD Radeon RX 9070 XT (RADV GFX1201) [wgpu]"`; `driver` / `vram_*` stay `"unavailable"` —
+disclose that rather than filling it in. Note `roofline_4090_pct` and `baseline_4090_drop_pct`
+are computed against fixed RTX-4090 reference constants by definition (hence the names); off that
+box they are a distance from a named reference point, **not** a claim about the local device.
+
 ### Methodology and honest caveats
 
 - **Decode** = single-stream greedy steps after prefill+warmup, M=1, the memory-bound regime.

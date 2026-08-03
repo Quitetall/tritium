@@ -4346,8 +4346,10 @@ dependencies = [
  "tritium-cuda",
  "tritium-format",
  "tritium-nn",
+ "tritium-rocm",
  "tritium-runtime",
  "tritium-spec",
+ "tritium-wgpu",
 ]
 
 [[package]]
@@ -4400,10 +4402,12 @@ dependencies = [
  "tritium-format",
  "tritium-nn",
  "tritium-quantize",
+ "tritium-rocm",
  "tritium-runtime",
  "tritium-salt",
  "tritium-spec",
  "tritium-train",
+ "tritium-wgpu",
  "ureq",
 ]
 

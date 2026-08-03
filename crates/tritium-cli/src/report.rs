@@ -13,6 +13,7 @@ use serde::Serialize;
 use tritium_format::{SafeTensors, dequant_salt_row};
 use tritium_nn::{ModelRunner, sample_greedy};
 use tritium_quantize::{BaseScaleScope, QuantConfig, ReconAccum, Sensitivity, quantize_tensor};
+use tritium_spec::DeviceCaps;
 
 use crate::quantize::ScaleGroupArg;
 use crate::{ReportFormat, SaltSensitivityArg};
@@ -254,6 +255,32 @@ fn smi(args: &[&str]) -> String {
         .unwrap_or_else(|| "unavailable".to_owned())
 }
 
+/// Resolve the ledger's `gpu` field from the two sources that can know it.
+///
+/// `nvidia-smi` wins whenever it answers: every historical BENCHMARKS.md row was
+/// recorded with its string, and changing the basis under them would silently
+/// invalidate the ledger. Off NVIDIA it reports nothing, so fall back to the
+/// adapter name the initialised backend already carries in its [`DeviceCaps`] —
+/// otherwise an AMD/Vulkan `report compare` emits a JSON that identifies no GPU at
+/// all, which is not a receipt (issue #4). The `[backend]` suffix marks which
+/// source answered so the two are never confused when read back.
+fn resolve_gpu(smi_gpu: &str, caps: Option<&DeviceCaps>) -> String {
+    if !smi_gpu.is_empty() && smi_gpu != "unavailable" {
+        return smi_gpu.to_owned();
+    }
+    match caps {
+        Some(c) if !c.device_name.is_empty() => {
+            format!("{} [{}]", c.device_name, c.backend)
+        }
+        _ => "unavailable".to_owned(),
+    }
+}
+
+/// Capture the box state for the ledger. Called BEFORE the model is loaded, so
+/// `co_resident` and `vram_used_mib` describe the contention we are measuring
+/// *against* rather than including our own allocation. The `gpu` field may come
+/// back "unavailable" off NVIDIA; [`resolve_gpu`] backfills it from the backend
+/// once one has initialised.
 fn env_capture() -> EnvCapture {
     let co_resident = smi(&[
         "--query-compute-apps=process_name,used_memory",
@@ -313,8 +340,13 @@ pub(crate) fn compare(
     } else {
         tokens.iter().copied().cycle().take(prompt_len).collect()
     };
-    let environment = env_capture();
-    let mut runner = load_runner(model_path, backend)?;
+    // Snapshot the box BEFORE loading, so co-resident processes and used VRAM
+    // describe the contention this run competes with, not our own model.
+    let mut environment = env_capture();
+    let (mut runner, caps) = load_runner_with_caps(model_path, backend)?;
+    // Backfill only the GPU *identity* from the backend — off NVIDIA it is the sole
+    // source, and without it the emitted JSON names no device (issue #4).
+    environment.gpu = resolve_gpu(&environment.gpu, caps.as_ref());
 
     let mut decode_runs = Vec::with_capacity(reps);
     for _ in 0..reps {
@@ -831,11 +863,23 @@ fn salt_model_table(r: &SaltModelReport) -> String {
 }
 
 fn load_runner(model_path: &Path, backend: &str) -> anyhow::Result<ModelRunner> {
+    load_runner_with_caps(model_path, backend).map(|(runner, _)| runner)
+}
+
+/// As [`load_runner`], but also returns the backend's [`DeviceCaps`] — read off the
+/// live object before it is moved into the runner, which is the only point it is
+/// still reachable. `None` for the CPU path (`load_cpu` owns its backend privately,
+/// and a CPU run has no GPU to identify anyway).
+fn load_runner_with_caps(
+    model_path: &Path,
+    backend: &str,
+) -> anyhow::Result<(ModelRunner, Option<DeviceCaps>)> {
     let bytes = std::fs::read(model_path)
         .with_context(|| format!("failed to read model `{}`", model_path.display()))?;
     if backend == "cpu" {
-        return ModelRunner::load_cpu(&bytes)
-            .with_context(|| format!("failed to load model `{}` on cpu", model_path.display()));
+        let runner = ModelRunner::load_cpu(&bytes)
+            .with_context(|| format!("failed to load model `{}` on cpu", model_path.display()))?;
+        return Ok((runner, None));
     }
 
     let init = tritium_runtime::BACKENDS
@@ -844,14 +888,16 @@ fn load_runner(model_path: &Path, backend: &str) -> anyhow::Result<ModelRunner> 
         .map(|entry| entry.init)
         .with_context(|| format!("backend `{backend}` is not registered"))?;
     let backend_obj = init().with_context(|| format!("backend `{backend}` failed to init"))?;
+    let caps = backend_obj.capabilities();
     let file = tritium_format::read_gguf(&bytes)
         .with_context(|| format!("failed to parse model `{}`", model_path.display()))?;
-    ModelRunner::load(&file, &bytes, backend_obj).with_context(|| {
+    let runner = ModelRunner::load(&file, &bytes, backend_obj).with_context(|| {
         format!(
             "failed to load model `{}` on {backend}",
             model_path.display()
         )
-    })
+    })?;
+    Ok((runner, Some(caps)))
 }
 
 fn dequantized_rows(rows: &[tritium_format::SaltRow]) -> anyhow::Result<Vec<f32>> {
@@ -1222,6 +1268,35 @@ mod tests {
         let got = parse_budgets("1.585, 2.0").expect("parse budgets");
         assert_eq!(got.len(), 2);
         assert!((got[1] - 2.0).abs() < f64::EPSILON);
+    }
+
+    /// On an NVIDIA box `nvidia-smi` answers and its string is what the existing
+    /// ledger entries were recorded with — the backend's own name must NOT displace
+    /// it, or every historical row silently changes basis.
+    #[test]
+    fn gpu_field_prefers_the_vendor_tool_when_it_answers() {
+        let caps = DeviceCaps::new("wgpu", "NVIDIA GeForce RTX 4090 (DiscreteGpu)");
+        let got = resolve_gpu("NVIDIA GeForce RTX 4090", Some(&caps));
+        assert_eq!(got, "NVIDIA GeForce RTX 4090");
+    }
+
+    /// The issue-#4 case: on an AMD/Vulkan box `nvidia-smi` is absent, so every env
+    /// field reads "unavailable" and the emitted JSON identifies no GPU at all — not
+    /// a receipt. The backend already knows its adapter name; use it.
+    #[test]
+    fn gpu_field_falls_back_to_the_backend_adapter_name_off_nvidia() {
+        let caps = DeviceCaps::new("wgpu", "AMD Radeon RX 9070 XT (RADV GFX1201)");
+        let got = resolve_gpu("unavailable", Some(&caps));
+        assert_eq!(got, "AMD Radeon RX 9070 XT (RADV GFX1201) [wgpu]");
+    }
+
+    /// No vendor tool and no device-backed run (e.g. `--backend cpu`) must stay
+    /// "unavailable" rather than inventing a name.
+    #[test]
+    fn gpu_field_stays_unavailable_with_neither_source() {
+        assert_eq!(resolve_gpu("unavailable", None), "unavailable");
+        // An empty `nvidia-smi` line is also "no answer", not a valid GPU name.
+        assert_eq!(resolve_gpu("", None), "unavailable");
     }
 
     #[test]

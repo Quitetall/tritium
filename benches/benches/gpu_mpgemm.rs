@@ -1,55 +1,104 @@
-//! GPU mpGEMM microbenchmarks (v0.30 WF-E, ADR 0005) — divan, `cuda`-gated.
+//! GPU mpGEMM microbenchmarks (v0.30 WF-E, ADR 0005) — divan, GPU-feature-gated.
 //!
 //! Two kernel families over the BitNet 2B4T linear-layer shapes
 //! ([`tritium_benches::BITNET_SHAPES`]: `M ∈ {1,8,32,256,512}`, `(N,K)` ∈
 //! {2560, 6912}²):
 //!
-//! 1. **Add-only** ([`gpu_add_only`]) — the TQ2_0 CUDA-core kernel via
-//!    [`TernaryBackend::mpgemm`], which auto-selects by shape: the **tiled** decode
-//!    kernel for `M ≤ 64` (so `M ∈ {1,8,32}` here) and the **simple**
-//!    one-thread-per-output kernel for larger `M` (`{256,512}`). One bench per shape
+//! 1. **Add-only** ([`gpu_add_only`]) — the TQ2_0 kernel via
+//!    [`TernaryBackend::mpgemm`], run once per (backend, shape) pair across every
+//!    GPU backend compiled in. On CUDA `mpgemm` auto-selects by shape: the **tiled**
+//!    decode kernel for `M ≤ 64` (so `M ∈ {1,8,32}` here) and the **simple**
+//!    one-thread-per-output kernel for larger `M` (`{256,512}`); one bench per shape
 //!    covers both kernels across the crossover.
 //! 2. **IMMA int8** ([`gpu_imma`]) — the `mma.m16n8k32` tensor-core fused-A8 kernel
 //!    via [`TernaryBackend::mpgemm_with_act_quant`] on an [`TernaryFormat::I2sInt8`]
-//!    buffer: on-device per-token int8 quant → int8 contraction → scale fold.
+//!    buffer: on-device per-token int8 quant → int8 contraction → scale fold. This
+//!    one is **CUDA-only by construction** — it is a PTX tensor-core path with no
+//!    wgpu or HIP equivalent — so it stays gated on `cuda` rather than pretending to
+//!    generalise and printing a skip line per shape on other backends.
 //!
 //! Each bench reports an `ItemsCount` of `M·N·K` MACs so divan prints throughput.
-//! Bodies are `#[cfg(feature = "cuda")]`; without the feature this file is an empty
-//! `divan::main()` so it still compiles + links on cpu-only lanes. With the feature
-//! but no GPU, the harness self-skips (constructing the backend returns `Err`, so the
-//! bench function early-returns before timing anything).
+//! Bodies are gated on the GPU features; with none of them this file is an empty
+//! `divan::main()` so it still compiles + links on cpu-only lanes. With a feature but
+//! no matching device, the harness self-skips (constructing the backend returns
+//! `Err`, so the bench function early-returns before timing anything).
 
-#![cfg_attr(not(feature = "cuda"), allow(unused_crate_dependencies))]
+#![cfg_attr(
+    not(all(feature = "cuda", feature = "wgpu", feature = "rocm")),
+    allow(unused_crate_dependencies)
+)]
 
 fn main() {
     divan::main();
 }
 
-#[cfg(feature = "cuda")]
-mod cuda_benches {
+#[cfg(any(feature = "cuda", feature = "wgpu", feature = "rocm"))]
+mod gpu_benches {
     use divan::{Bencher, counter::ItemsCount};
-    use tritium_benches::{
-        BITNET_SHAPES, gemm_macs, packed_i2s_int8_weights, packed_tq2_0_weights,
-    };
+    use tritium_benches::{BITNET_SHAPES, gemm_macs, packed_tq2_0_weights};
     use tritium_core::{GemmShape, TernaryFormat};
     use tritium_spec::{DeviceBuffer, MpGemm, TernaryBackend};
 
-    // Linked so the CUDA backend's `#[distributed_slice]` registration is included in
-    // the bench binary (the same edge `tests/acceptance.rs` relies on).
+    // Linked so each backend's `#[distributed_slice]` registration is included in the
+    // bench binary (the same edge `tests/acceptance.rs` relies on). Registration is
+    // what `backend_named` below resolves against — without the link the name is
+    // simply absent from `BACKENDS`.
+    #[cfg(feature = "cuda")]
     use tritium_cuda as _;
+    #[cfg(feature = "rocm")]
+    use tritium_rocm as _;
+    #[cfg(feature = "wgpu")]
+    use tritium_wgpu as _;
 
-    /// Construct an owned `"cuda"` backend through the runtime registry, or `None`
-    /// (with a printed reason) if no CUDA device initialises — the GPU-less skip path,
-    /// mirroring `tests/acceptance.rs::load_on`.
-    fn cuda_backend() -> Option<Box<dyn TernaryBackend>> {
+    /// Every GPU backend compiled into this binary, in registry-name form. Built from
+    /// the enabled features rather than probed at runtime, so a box with two usable
+    /// backends benches both and the divan output names which one produced each row.
+    const GPU_BACKENDS: &[&str] = &[
+        #[cfg(feature = "cuda")]
+        "cuda",
+        #[cfg(feature = "wgpu")]
+        "wgpu",
+        #[cfg(feature = "rocm")]
+        "rocm",
+    ];
+
+    /// One benchmark case: which backend runs it, and at what shape. `Debug` is what
+    /// divan renders as the case label, so each row reads `cuda 1x2560x2560`.
+    #[derive(Clone, Copy)]
+    struct GpuCase {
+        backend: &'static str,
+        m: usize,
+        n: usize,
+        k: usize,
+    }
+
+    impl std::fmt::Debug for GpuCase {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{} {}x{}x{}", self.backend, self.m, self.n, self.k)
+        }
+    }
+
+    /// The (backend × shape) cross product — the full add-only sweep.
+    fn gpu_cases() -> impl Iterator<Item = GpuCase> {
+        GPU_BACKENDS.iter().flat_map(|&backend| {
+            BITNET_SHAPES
+                .iter()
+                .map(move |&(m, n, k)| GpuCase { backend, m, n, k })
+        })
+    }
+
+    /// Construct an owned backend by registry name, or `None` (with a printed reason)
+    /// if it is unregistered or its device does not initialise — the GPU-less skip
+    /// path, mirroring `tests/acceptance.rs::load_on`.
+    fn backend_named(name: &str) -> Option<Box<dyn TernaryBackend>> {
         let init = tritium_runtime::BACKENDS
             .iter()
-            .find(|e| e.name == "cuda")
+            .find(|e| e.name == name)
             .map(|e| e.init)?;
         match init() {
             Ok(b) => Some(b),
             Err(e) => {
-                eprintln!("skipping gpu mpgemm bench: cuda backend init failed ({e}); no device?");
+                eprintln!("skipping gpu mpgemm bench: {name} backend init failed ({e}); no device?");
                 None
             }
         }
@@ -72,14 +121,14 @@ mod cuda_benches {
         }
     }
 
-    /// Add-only TQ2_0 mpGEMM across every BitNet shape. `mpgemm` auto-selects the
-    /// tiled (decode, `M ≤ 64`) or simple (prefill) kernel, so the one bench exercises
-    /// both across the crossover. Reports `M·N·K` MACs/iter.
-    #[divan::bench(args = BITNET_SHAPES)]
-    fn gpu_add_only(bencher: Bencher, shape: &(usize, usize, usize)) {
-        let &(m, n, k) = shape;
+    /// Add-only TQ2_0 mpGEMM across every (GPU backend, BitNet shape) pair. TQ2_0 is
+    /// the one format all three backends implement, which is what makes the numbers
+    /// comparable across vendors. Reports `M·N·K` MACs/iter.
+    #[divan::bench(args = gpu_cases())]
+    fn gpu_add_only(bencher: Bencher, case: &GpuCase) {
+        let &GpuCase { backend: name, m, n, k } = case;
         let shape = GemmShape { m, n, k };
-        let Some(backend) = cuda_backend() else {
+        let Some(backend) = backend_named(name) else {
             return;
         };
         let packed = packed_tq2_0_weights(n, k);
@@ -109,13 +158,17 @@ mod cuda_benches {
 
     /// IMMA int8 fused-A8 mpGEMM across every BitNet shape, via
     /// `mpgemm_with_act_quant` on an `I2sInt8` buffer (on-device quant + tensor-core
-    /// contraction). Reports `M·N·K` MACs/iter. Skips a shape whose `I2sInt8` upload
-    /// the backend rejects (it never should for these shapes).
+    /// contraction). CUDA-only — see the module docs. Reports `M·N·K` MACs/iter.
+    /// Skips a shape whose `I2sInt8` upload the backend rejects (it never should for
+    /// these shapes).
+    #[cfg(feature = "cuda")]
     #[divan::bench(args = BITNET_SHAPES)]
     fn gpu_imma(bencher: Bencher, shape: &(usize, usize, usize)) {
+        use tritium_benches::packed_i2s_int8_weights;
+
         let &(m, n, k) = shape;
         let shape = GemmShape { m, n, k };
-        let Some(backend) = cuda_backend() else {
+        let Some(backend) = backend_named("cuda") else {
             return;
         };
         let packed = packed_i2s_int8_weights(n, k);

@@ -65,6 +65,13 @@ jobs:
       - run: cargo clippy -p tritium-wgpu --features register --all-targets -- -D warnings
       # Downstream cuda-gated consumers (tritium-cli/nccl implies its cuda).
       - run: cargo clippy -p tritium-nn -p tritium-cli -p tritium-py -p tritium-salt -p tritium-benches --features tritium-nn/cuda,tritium-cli/nccl,tritium-py/cuda,tritium-salt/cuda,tritium-benches/cuda --all-targets -- -D warnings
+      # Downstream NON-NVIDIA consumers (issue #4). These link the wgpu/rocm backend
+      # crates so their registrations reach the shipped `tritium` binary and the bench
+      # harness. Checked as a separate invocation from the cuda line above precisely
+      # because they must build WITHOUT cuda — that is the AMD-box configuration, and
+      # a cfg that only compiles alongside `cuda` would pass the line above and still
+      # be broken on the hardware this exists for.
+      - run: cargo clippy -p tritium-cli -p tritium-benches --features tritium-cli/wgpu,tritium-cli/rocm,tritium-benches/wgpu,tritium-benches/rocm --all-targets -- -D warnings
       - run: cargo clippy -p tritium-serve --features cuda,e2e,device-loss-qualification --all-targets -- -D warnings
 
   # Release compatibility claims are generated from a strict manifest. A cell

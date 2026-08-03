@@ -16,6 +16,15 @@
 use tritium_cpu as _;
 #[cfg(feature = "cuda")]
 use tritium_cuda as _;
+// Same force-link for the non-NVIDIA backends: `list-backends` and
+// `report --backend {wgpu,rocm}` resolve names out of the linkme-populated runtime
+// registry, and an entry only exists if the backend crate is linked into this
+// binary. Without these two lines an AMD box reports only `cpu` however the GPU
+// crates were built (issue #4).
+#[cfg(feature = "wgpu")]
+use tritium_wgpu as _;
+#[cfg(feature = "rocm")]
+use tritium_rocm as _;
 
 use std::path::PathBuf;
 

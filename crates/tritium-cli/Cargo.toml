@@ -28,6 +28,12 @@ tritium-nn = { workspace = true }
 tritium-train = { workspace = true, optional = true }
 # Optional CUDA backend linkage for `report --backend cuda` / parity reports.
 tritium-cuda = { workspace = true, optional = true }
+# Optional non-NVIDIA backend linkage. Same role as `tritium-cuda` above: purely to
+# pull each crate's `linkme` self-registration into the `tritium` binary so
+# `list-backends` and `report --backend {wgpu,rocm}` can resolve them. Neither is
+# named in the CLI source — `main.rs` imports them `as _`.
+tritium-wgpu = { workspace = true, optional = true }
+tritium-rocm = { workspace = true, optional = true }
 tritium-quantize = { workspace = true }
 tritium-salt = { workspace = true }
 # `repack` converts ternary tensors at the trits level.
@@ -67,6 +73,14 @@ tritium-format = { workspace = true }
 default = []
 cuda = ["dep:tritium-cuda", "dep:tritium-train", "tritium-nn/cuda"]
 nccl = ["cuda", "tritium-cuda/nccl", "dep:libc"]
+# Non-NVIDIA GPU backends, mirroring `cuda`: each links its crate with the feature
+# that turns on that crate's `linkme` registration (`register` for wgpu, `rocm` for
+# rocm). They are independent of `cuda` and of each other — an AMD box builds
+# `--features wgpu` alone and gets a real `list-backends` entry plus a `report
+# compare` ledger row. `rocm` additionally requires a ROCm toolkit at build time
+# (its build.rs shells `hipcc`), which is why it is not implied by anything.
+wgpu = ["dep:tritium-wgpu", "tritium-wgpu/register"]
+rocm = ["dep:tritium-rocm", "tritium-rocm/rocm"]
 
 [lints]
 workspace = true
