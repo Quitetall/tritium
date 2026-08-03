@@ -441,6 +441,260 @@ pub fn ternary_bits_per_weight_codec(
     t as f64 * (bits_per_trit + 16.0 / group as f64)
 }
 
+/// Packed bits per weight for the **balanced-ternary ladder**, which stores one `s₀` per group for
+/// the whole plane stack instead of one f16 scale per plane per group.
+///
+/// The trit payload is identical to [`ternary_bits_per_weight_codec`] — same `T` planes, same codec —
+/// so the entire difference is `(T-1)·16/group` bits of scale that the ladder does not need. At
+/// `T=3`, `group=128`, B3 that is 5.25 → **5.00 bpw**, before any quality change. (B3 over a
+/// 128-trit run costs `ceil(128/5) = 26` bytes = 1.625 bits/trit, not the asymptotic 1.6.)
+#[must_use]
+pub fn ternary_bits_per_weight_geometric(
+    t: usize,
+    group: usize,
+    codec: SaltV2Codec,
+    run: usize,
+) -> f64 {
+    let group = group.max(1);
+    ternary_bits_per_weight_codec(t, group, codec, run)
+        - (t.max(1) - 1) as f64 * 16.0 / group as f64
+}
+
+// ── The balanced-ternary scale ladder ────────────────────────────────────────────────────────────
+// The greedy expansion below picks `s_p` from the residual plane `p-1` left behind. Measured on real
+// weight groups, the resulting ratios `s_{p+1}/s_p` run ≈0.41, 0.42, 0.58, 0.70 and eventually exceed
+// 1.0 — a later plane taking a LARGER scale than its predecessor (`fit_plane_itf`'s accept guard will
+// take that trade whenever chasing a few outliers lowers SSE). Each added plane then buys ~1 dB of
+// reconstruction against the 9.54 dB (= 1.585 bits × 6.02) the rate allows.
+//
+// Note what is NOT the problem: the reachable levels do not collide. Enumerating `Σ ε_p s_p` for the
+// greedy ladder yields 27/27, 81/81, 729/729, 6561/6561 DISTINCT values on Gaussian/Laplace/t₃ groups.
+// The levels are distinct but badly spaced — new planes land beside existing levels instead of
+// subdividing the gaps.
+//
+// Pinning the ratio to exactly 1/3 is balanced ternary. Then
+//
+//     Σ_p ε_p s_p = Δ · k,   Δ = s₀·3^-(T-1),   k = Σ_p ε_p 3^(T-p)
+//
+// and `k` ranges over EVERY integer in ±(3^T-1)/2, bijectively. So the levels are a uniform grid, the
+// exact minimum-SSE assignment is one `round` followed by base-3 digit extraction, and:
+//
+//   * the fit is O(T) per weight instead of 3^T enumeration — cheap enough to run every training step;
+//   * everything after the single `round` is integer, so a device mirror can be bit-exact rather than
+//     tolerance-checked (ADR 0018);
+//   * one scale is stored per group instead of T.
+//
+// This is a forward reconstruction rule only. `salt_quantize_vjp` is untouched — still identity STE.
+//
+// SAME PROXY-GAP CAVEAT as ITF above: this is guaranteed to improve weight-space MSE, and that does
+// not automatically mean better perplexity. It ships on held-out ppl or not at all.
+
+/// `3^n` for `n ≤ 8`, exact in `f32` (3^8 = 6561 ≪ 2^24).
+fn pow3(n: usize) -> f32 {
+    let mut v = 1.0f32;
+    for _ in 0..n {
+        v *= 3.0;
+    }
+    v
+}
+
+/// Largest representable multiple of `Δ` at `t` planes: `(3^t − 1)/2`.
+fn ladder_kmax(t: usize) -> i32 {
+    (3_i32.saturating_pow(t.min(9) as u32) - 1) / 2
+}
+
+/// Assign one group to the ladder with step `delta`, returning plane-major trits.
+///
+/// `k = clamp(round(w/Δ))` is the nearest lattice point — and because the ladder is a uniform grid,
+/// nearest-lattice-point IS the minimum-SSE ternary assignment, exactly. No search, no iteration.
+fn ladder_digits(bs: &[f32], t: usize, delta: f32) -> Vec<Vec<i8>> {
+    let kmax = ladder_kmax(t);
+    let mut planes = vec![vec![0i8; bs.len()]; t];
+    for (i, &w) in bs.iter().enumerate() {
+        let mut k = if delta > 0.0 && delta.is_finite() {
+            (w / delta).round().clamp(-(kmax as f32), kmax as f32) as i32
+        } else {
+            0
+        };
+        // Balanced-ternary digits, most significant plane first: plane 0 carries 3^(t-1).
+        for p in (0..t).rev() {
+            let d = (k + 1).rem_euclid(3) - 1;
+            planes[p][i] = d as i8;
+            k = (k - d) / 3;
+        }
+    }
+    planes
+}
+
+/// Sum of squared error of the ladder reconstruction at step `delta`, ascending order (ADR 0018).
+fn ladder_sse(bs: &[f32], t: usize, delta: f32) -> f32 {
+    let kmax = ladder_kmax(t) as f32;
+    let mut e = 0.0f32;
+    for &w in bs {
+        let k = if delta > 0.0 && delta.is_finite() {
+            (w / delta).round().clamp(-kmax, kmax)
+        } else {
+            0.0
+        };
+        let d = w - k * delta;
+        e += d * d;
+    }
+    e
+}
+
+/// Fit one group to the ladder, returning `(s₀, plane-major trits)`.
+///
+/// The only free parameter is the step `Δ`, searched over a **deterministic** log grid:
+/// `Δ_j = Δ₀·2^(-j/4)` for `j ∈ 0..grid`, where `Δ₀ = max|w| / kmax` is the exactly clipping-free
+/// step. Increasing `j` trades range for resolution monotonically. Fixed candidate set, argmin SSE,
+/// lowest `j` wins ties — so there is no data-dependent early exit to mirror on a device, unlike
+/// [`fit_plane_itf`]'s accept guard.
+///
+/// `grid = 0` (or 1) uses `j = 0` alone: the clipping-free ladder, the cheapest useful configuration.
+fn fit_group_geometric(bs: &[f32], t: usize, grid: usize) -> (f32, Vec<Vec<i8>>) {
+    let t = t.max(1);
+    let kmax = ladder_kmax(t) as f32;
+    let peak = bs.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+    if peak <= 0.0 || !peak.is_finite() {
+        // Dead group: zero scale, zero trits — mirrors the greedy path's dead-row early-out.
+        return (0.0, vec![vec![0i8; bs.len()]; t]);
+    }
+    let delta0 = peak / kmax;
+
+    let mut best_delta = delta0;
+    let mut best_sse = ladder_sse(bs, t, delta0);
+    for j in 1..grid {
+        let delta = delta0 * (-(j as f32) / 4.0).exp2();
+        let sse = ladder_sse(bs, t, delta);
+        if sse < best_sse {
+            best_sse = sse;
+            best_delta = delta;
+        }
+    }
+    // s₀ is plane 0's scale; the stored anchor. Δ = s₀·3^-(T-1).
+    (best_delta * pow3(t - 1), ladder_digits(bs, t, best_delta))
+}
+
+/// Reconstruct a group from `(s₀, trits)` — `Σ_p s₀·3^-p · trit_p`, ascending plane order.
+fn ladder_reconstruct(s0: f32, planes: &[Vec<i8>], n: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; n];
+    for (p, plane) in planes.iter().enumerate() {
+        let s = s0 / pow3(p);
+        for (o, &trit) in out.iter_mut().zip(plane) {
+            *o += s * f32::from(trit);
+        }
+    }
+    out
+}
+
+/// Fit one group with the ladder under `rotation`, returning `(reconstruction, s₀, trits)`.
+///
+/// Mirrors [`fit_group`]'s rotation handling exactly — including that a ragged (non-power-of-two)
+/// group is never rotated rather than zero-padded, so no phantom weights are introduced. The trits
+/// returned for a rotated group are the ones fitted **in the rotated basis**; that is what a packer
+/// stores, and the reconstruction is rotated back.
+fn fit_group_geometric_rotated(
+    bs: &[f32],
+    t: usize,
+    grid: usize,
+    rotation: RotationPolicy,
+    buf: &mut Vec<f32>,
+) -> (Vec<f32>, f32, Vec<Vec<i8>>) {
+    let sse = |a: &[f32], b: &[f32]| -> f64 {
+        a.iter()
+            .zip(b)
+            .map(|(&x, &y)| f64::from(x - y) * f64::from(x - y))
+            .sum()
+    };
+    let rotatable = bs.len().is_power_of_two() && bs.len() > 1;
+    let plain = || {
+        let (s0, planes) = fit_group_geometric(bs, t, grid);
+        let recon = ladder_reconstruct(s0, &planes, bs.len());
+        (recon, s0, planes)
+    };
+    if rotation == RotationPolicy::Never || !rotatable {
+        return plain();
+    }
+
+    buf.clear();
+    buf.extend_from_slice(bs);
+    fast_hadamard(buf);
+    let (s0, planes) = fit_group_geometric(buf, t, grid);
+    let mut back = ladder_reconstruct(s0, &planes, buf.len());
+    fast_hadamard(&mut back); // H is its own inverse at normalized scale
+
+    match rotation {
+        RotationPolicy::Always => (back, s0, planes),
+        _ => {
+            let (p_recon, p_s0, p_planes) = plain();
+            if sse(&back, bs) < sse(&p_recon, bs) {
+                (back, s0, planes)
+            } else {
+                (p_recon, p_s0, p_planes)
+            }
+        }
+    }
+}
+
+/// [`salt_quantize_forward_grouped`] on the **balanced-ternary ladder** — same shape, same output
+/// layout, same rotation semantics; only the scale rule differs.
+///
+/// `grid` is the number of deterministic `Δ` candidates (see [`fit_group_geometric`]); `0` or `1`
+/// means the single clipping-free step. `16` spans a 16× range and is the usual choice — the search
+/// is load-bearing on heavy-tailed groups, where a clipping-free ladder wastes resolution on outliers.
+#[must_use]
+pub fn salt_quantize_forward_grouped_geometric(
+    wf: &[f32],
+    rows: usize,
+    cols: usize,
+    t: usize,
+    group: usize,
+    grid: usize,
+    rotation: RotationPolicy,
+) -> Vec<f32> {
+    let group = group.max(1);
+    let mut out = vec![0.0f32; wf.len()];
+    let mut buf: Vec<f32> = Vec::with_capacity(group);
+    for r in 0..rows {
+        let src = &wf[r * cols..(r + 1) * cols];
+        let dst = &mut out[r * cols..(r + 1) * cols];
+        for (bs, bd) in src.chunks(group).zip(dst.chunks_mut(group)) {
+            let (fit, _, _) = fit_group_geometric_rotated(bs, t, grid, rotation, &mut buf);
+            bd.copy_from_slice(&fit);
+        }
+    }
+    out
+}
+
+/// The `(s₀, plane-major trits)` [`salt_quantize_forward_grouped_geometric`] produces, per group, in
+/// row-major group order (`row * cols.div_ceil(group) + block`) — the layout a packer and the
+/// diagnostics index by.
+///
+/// Goes through the same [`fit_group_geometric_rotated`] as the dense forward, so the symbols a
+/// packer writes cannot drift from the reconstruction training optimised against.
+#[must_use]
+pub fn geometric_ladder_fit(
+    wf: &[f32],
+    rows: usize,
+    cols: usize,
+    t: usize,
+    group: usize,
+    grid: usize,
+    rotation: RotationPolicy,
+) -> Vec<(f32, Vec<Vec<i8>>)> {
+    let group = group.max(1);
+    let mut out = Vec::with_capacity(rows * cols.div_ceil(group));
+    let mut buf: Vec<f32> = Vec::with_capacity(group);
+    for r in 0..rows {
+        let src = &wf[r * cols..(r + 1) * cols];
+        for bs in src.chunks(group) {
+            let (_, s0, planes) = fit_group_geometric_rotated(bs, t, grid, rotation, &mut buf);
+            out.push((s0, planes));
+        }
+    }
+    out
+}
+
 // ── ITF: iterative ternary fitting ───────────────────────────────────────────────────────────────
 // [`salt_quantize_forward`] fits each plane in ONE greedy pass: take `s = AbsMean(residual)`, then
 // `t = clamp(round(residual/s))`. AbsMean is a heuristic (the flat BitNet b1.58 contract) — it is *not*
