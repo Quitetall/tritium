@@ -3666,6 +3666,409 @@ __global__ void gqa_attention_tree_reduce_ctrl_paged_g(
 #undef TREE_MAX_DIMS_PER_THREAD
 }
 
+// ─── Batched-slots tree-verify twins (I4, L3 batch-slot spec decode) ───────
+// One tree forward whose rows are the CONCATENATION of SEVERAL slots' draft
+// trees (m_total rows, padded to one bucket), so the lm_head table read —
+// 44.5% of the spec-loop GPU (ADR 0032) — is paid once for N slots instead of
+// once per slot. The 3-word ctrl becomes PER-ROW: `row_ctrl` is i32[m·3],
+// row-major, and row g reads
+//   row_ctrl[g·3+0] = its slot's prefix_len (committed rows [0, prefix));
+//   row_ctrl[g·3+1] = its LOCAL node index within its slot's tree, or -1
+//                     for a pad row (pads exit attention AND write no KV —
+//                     unlike the single-slot pads they belong to no slot, so
+//                     there is no region to park junk in);
+//   row_ctrl[g·3+2] = its slot's word 2 — dense: the KV row base
+//                     (r · max_ctx); paged twins: the slot's page-table
+//                     offset (r · tstride).
+// The `anc` table stays region-LOGICAL per row's OWN slot (prefix + local
+// node index) and each row's context is ITS prefix + n_anc[row], so no
+// kernel loops over slots — every row is self-describing. Real rows' math is
+// row-independent and identical fold-for-fold to the single-slot ctrl twins
+// (same dot chains, same softmax orders), so a slot verified in a batch is
+// bit-identical to the same slot verified alone (gated by
+// cuda_tree_verify_slots_matches_sequential). The single-slot ctrl kernels
+// above are RETAINED unchanged — the I2/I3 paths never re-bless.
+
+// kv_append_tree_slots_g — append each REAL row's provisional K/V at its
+// slot's arena row `word2 + prefix + local`. Pad rows write nothing.
+__global__ void kv_append_tree_slots_g(const float* __restrict__ src,
+                                       float* __restrict__ kv_base,
+                                       const int* __restrict__ row_ctrl, const int kv_width,
+                                       const int m) {
+  const long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  const long long total = (long long)m * kv_width;
+  if (idx >= total) return;
+  const int row = (int)(idx / kv_width);
+  const int col = (int)(idx - (long long)row * kv_width);
+  const int local = row_ctrl[row * 3 + 1];
+  if (local < 0) return;  // pad row: no slot, no write
+  const int prefix_len = row_ctrl[row * 3 + 0];
+  const int row_base = row_ctrl[row * 3 + 2];
+  kv_base[((long long)row_base + prefix_len + local) * kv_width + col] = src[idx];
+}
+
+// kv_append_tree_slots_paged_g — the ADR 0025 paged sibling: word 2 is the
+// slot's table offset and the write row is translated logical → physical.
+// The host reservation guard pins every REAL row's logical index
+// [0, prefix + m_slot) to a mapped page; pads never write.
+__global__ void kv_append_tree_slots_paged_g(const float* __restrict__ src,
+                                             float* __restrict__ kv_base,
+                                             const int* __restrict__ row_ctrl,
+                                             const int* __restrict__ table, const int kv_width,
+                                             const int m) {
+  const long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  const long long total = (long long)m * kv_width;
+  if (idx >= total) return;
+  const int row = (int)(idx / kv_width);
+  const int col = (int)(idx - (long long)row * kv_width);
+  const int local = row_ctrl[row * 3 + 1];
+  if (local < 0) return;  // pad row: no slot, no write
+  const int prefix_len = row_ctrl[row * 3 + 0];
+  const int toff = row_ctrl[row * 3 + 2];
+  const int logical = prefix_len + local;
+  const long long phys =
+      (long long)table[toff + (logical >> KV_PAGE_SHIFT)] * KV_PAGE_TOKENS +
+      (logical & KV_PAGE_MASK);
+  kv_base[phys * kv_width + col] = src[idx];
+}
+
+// gqa_attention_tree_scores_slots_g — gqa_attention_tree_scores_ctrl_g with
+// the 3 ctrl words read per ROW instead of per launch. Dot order (float4
+// d-chains) is untouched; the pad early-exit is uniform per block.
+__global__ void gqa_attention_tree_scores_slots_g(
+    const float* __restrict__ q, const float* __restrict__ k, float* __restrict__ scores,
+    const int* __restrict__ anc, const int* __restrict__ n_anc,
+    const int* __restrict__ row_ctrl, const int score_stride, const int n_head,
+    const int n_head_kv, const int head_dim, const float scale, const int max_anc,
+    const int m) {
+  const int rowhead = blockIdx.x;
+  const int row = rowhead / n_head;
+  const int h = rowhead - row * n_head;
+  if (row_ctrl[row * 3 + 1] < 0) return;  // pad row (uniform per block)
+  const int prefix_len = row_ctrl[row * 3 + 0];
+  const int row_base = row_ctrl[row * 3 + 2];
+  const int ctx = prefix_len + n_anc[row];
+  const int chunk = blockIdx.y * TREE_SCORE_CHUNK;
+  if (chunk >= ctx) return;
+  const int lane = threadIdx.x & 31;
+  const int n_rep = n_head / n_head_kv;
+  const int kv = h / n_rep;
+  const float4* qv = (const float4*)(q + ((long long)row * n_head + h) * head_dim);
+  const int hd4 = head_dim >> 2;
+  const int* arow = anc + (long long)row * max_anc;
+  float* sc = scores + ((long long)row * n_head + h) * score_stride;
+
+  const int j0 = chunk + lane;
+#pragma unroll
+  for (int t = 0; t < 4; ++t) {
+    const int j = j0 + 32 * t;
+    if (j >= ctx) break;
+    const int slot = row_base + ((j < prefix_len) ? j : arow[j - prefix_len]);
+    const float4* kr = (const float4*)(k + ((long long)slot * n_head_kv + kv) * head_dim);
+    float dot = 0.0f;
+#pragma unroll 8
+    for (int d = 0; d < hd4; ++d) {
+      const float4 qq = qv[d];
+      const float4 a = kr[d];
+      dot = __fadd_rn(dot, __fmul_rn(qq.x, a.x));
+      dot = __fadd_rn(dot, __fmul_rn(qq.y, a.y));
+      dot = __fadd_rn(dot, __fmul_rn(qq.z, a.z));
+      dot = __fadd_rn(dot, __fmul_rn(qq.w, a.w));
+    }
+    sc[j] = __fmul_rn(dot, scale);
+  }
+}
+
+// gqa_attention_tree_scores_slots_paged_g — the paged sibling (page-table
+// lookup in place of the row-base add).
+__global__ void gqa_attention_tree_scores_slots_paged_g(
+    const float* __restrict__ q, const float* __restrict__ k, float* __restrict__ scores,
+    const int* __restrict__ anc, const int* __restrict__ n_anc,
+    const int* __restrict__ row_ctrl, const int* __restrict__ table, const int score_stride,
+    const int n_head, const int n_head_kv, const int head_dim, const float scale,
+    const int max_anc, const int m) {
+  const int rowhead = blockIdx.x;
+  const int row = rowhead / n_head;
+  const int h = rowhead - row * n_head;
+  if (row_ctrl[row * 3 + 1] < 0) return;  // pad row (uniform per block)
+  const int prefix_len = row_ctrl[row * 3 + 0];
+  const int toff = row_ctrl[row * 3 + 2];
+  const int ctx = prefix_len + n_anc[row];
+  const int chunk = blockIdx.y * TREE_SCORE_CHUNK;
+  if (chunk >= ctx) return;
+  const int lane = threadIdx.x & 31;
+  const int n_rep = n_head / n_head_kv;
+  const int kv = h / n_rep;
+  const float4* qv = (const float4*)(q + ((long long)row * n_head + h) * head_dim);
+  const int hd4 = head_dim >> 2;
+  const int* arow = anc + (long long)row * max_anc;
+  float* sc = scores + ((long long)row * n_head + h) * score_stride;
+
+  const int j0 = chunk + lane;
+#pragma unroll
+  for (int t = 0; t < 4; ++t) {
+    const int j = j0 + 32 * t;
+    if (j >= ctx) break;
+    const int logical = (j < prefix_len) ? j : arow[j - prefix_len];
+    const long long slot =
+        (long long)table[toff + (logical >> KV_PAGE_SHIFT)] * KV_PAGE_TOKENS +
+        (logical & KV_PAGE_MASK);
+    const float4* kr = (const float4*)(k + (slot * n_head_kv + kv) * head_dim);
+    float dot = 0.0f;
+#pragma unroll 8
+    for (int d = 0; d < hd4; ++d) {
+      const float4 qq = qv[d];
+      const float4 a = kr[d];
+      dot = __fadd_rn(dot, __fmul_rn(qq.x, a.x));
+      dot = __fadd_rn(dot, __fmul_rn(qq.y, a.y));
+      dot = __fadd_rn(dot, __fmul_rn(qq.z, a.z));
+      dot = __fadd_rn(dot, __fmul_rn(qq.w, a.w));
+    }
+    sc[j] = __fmul_rn(dot, scale);
+  }
+}
+
+// gqa_attention_tree_reduce_slots_g — gqa_attention_tree_reduce_ctrl_g with
+// per-row ctrl. REQUIRES blockDim.x == 128 (fold levels hardcode 64/32);
+// every f32 fold keeps the single-slot twin's canonical order.
+__global__ void gqa_attention_tree_reduce_slots_g(
+    const float* __restrict__ v, const float* __restrict__ scores, float* __restrict__ out,
+    const int* __restrict__ anc, const int* __restrict__ n_anc,
+    const int* __restrict__ row_ctrl, const int score_stride, const int n_head,
+    const int n_head_kv, const int head_dim, const int max_anc, const int m) {
+  extern __shared__ float sc[];
+  __shared__ float s_red[256];
+  __shared__ float s_inv;
+  const int rowhead = blockIdx.x;
+  const int row = rowhead / n_head;
+  const int h = rowhead - row * n_head;
+  if (row_ctrl[row * 3 + 1] < 0) return;  // pad row (uniform per block)
+  const int prefix_len = row_ctrl[row * 3 + 0];
+  const int row_base = row_ctrl[row * 3 + 2];
+  const int ctx = prefix_len + n_anc[row];
+  const int tid = threadIdx.x;
+  const int n_rep = n_head / n_head_kv;
+  const int kv = h / n_rep;
+  const int* arow = anc + (long long)row * max_anc;
+
+  const float* gsc = scores + ((long long)row * n_head + h) * score_stride;
+  for (int j = tid; j < ctx; j += blockDim.x) {
+    sc[j] = gsc[j];
+  }
+  __syncthreads();
+
+  float mx = -INFINITY;
+  for (int j = tid; j < ctx; j += blockDim.x) {
+    mx = fmaxf(mx, sc[j]);
+  }
+  s_red[tid] = mx;
+  __syncthreads();
+  if (tid < 64) {
+    s_red[tid] = fmaxf(s_red[tid], s_red[tid + 64]);
+  }
+  __syncthreads();
+  if (tid < 32) {
+    float vv = fmaxf(s_red[tid], s_red[tid + 32]);
+    for (int off = 16; off > 0; off >>= 1) {
+      vv = fmaxf(vv, __shfl_down_sync(0xffffffffu, vv, off));
+    }
+    if (tid == 0) {
+      s_red[0] = vv;
+    }
+  }
+  __syncthreads();
+  mx = s_red[0];
+
+  for (int j = tid; j < ctx; j += blockDim.x) {
+    sc[j] = exp_f32(__fsub_rn(sc[j], mx));
+  }
+  __syncthreads();
+  if (tid == 0) {
+    float sum = 0.0f;
+    for (int j = 0; j < ctx; ++j) {
+      sum = __fadd_rn(sum, sc[j]);
+    }
+    s_inv = __fdiv_rn(1.0f, sum);
+  }
+  __syncthreads();
+  const float inv = s_inv;
+  for (int j = tid; j < ctx; j += blockDim.x) {
+    sc[j] = __fmul_rn(sc[j], inv);
+  }
+  __syncthreads();
+
+  float* o_row = out + ((long long)row * n_head + h) * head_dim;
+  const int ndims = (head_dim > tid) ? (head_dim - tid + (int)blockDim.x - 1) / (int)blockDim.x : 0;
+#define TREE_MAX_DIMS_PER_THREAD 8
+  if (ndims <= TREE_MAX_DIMS_PER_THREAD) {
+    float acc[TREE_MAX_DIMS_PER_THREAD];
+    for (int t = 0; t < ndims; ++t) {
+      acc[t] = 0.0f;
+    }
+#pragma unroll 4
+    for (int j = 0; j < ctx; ++j) {
+      const float w = sc[j];
+      const int slot = row_base + ((j < prefix_len) ? j : arow[j - prefix_len]);
+      const float* v_row = v + ((long long)slot * n_head_kv + kv) * head_dim;
+      float vals[TREE_MAX_DIMS_PER_THREAD];
+#pragma unroll
+      for (int t = 0; t < TREE_MAX_DIMS_PER_THREAD; ++t) {
+        if (t < ndims) {
+          vals[t] = v_row[tid + (int)blockDim.x * t];
+        }
+      }
+      if (w != 0.0f) {
+#pragma unroll
+        for (int t = 0; t < TREE_MAX_DIMS_PER_THREAD; ++t) {
+          if (t < ndims) {
+            acc[t] = __fadd_rn(acc[t], __fmul_rn(w, vals[t]));
+          }
+        }
+      }
+    }
+    for (int t = 0; t < ndims; ++t) {
+      o_row[tid + (int)blockDim.x * t] = acc[t];
+    }
+  } else {
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+      float acc = 0.0f;
+      for (int j = 0; j < ctx; ++j) {
+        const float w = sc[j];
+        if (w == 0.0f) continue;
+        const int slot = row_base + ((j < prefix_len) ? j : arow[j - prefix_len]);
+        const float* v_row = v + ((long long)slot * n_head_kv + kv) * head_dim;
+        acc = __fadd_rn(acc, __fmul_rn(w, v_row[d]));
+      }
+      o_row[d] = acc;
+    }
+  }
+#undef TREE_MAX_DIMS_PER_THREAD
+}
+
+// gqa_attention_tree_reduce_slots_paged_g — the paged sibling. REQUIRES
+// blockDim.x == 128; folds keep the canonical order (paging changes
+// addresses, never arithmetic).
+__global__ void gqa_attention_tree_reduce_slots_paged_g(
+    const float* __restrict__ v, const float* __restrict__ scores, float* __restrict__ out,
+    const int* __restrict__ anc, const int* __restrict__ n_anc,
+    const int* __restrict__ row_ctrl, const int* __restrict__ table, const int score_stride,
+    const int n_head, const int n_head_kv, const int head_dim, const int max_anc,
+    const int m) {
+  extern __shared__ float sc[];
+  __shared__ float s_red[256];
+  __shared__ float s_inv;
+  const int rowhead = blockIdx.x;
+  const int row = rowhead / n_head;
+  const int h = rowhead - row * n_head;
+  if (row_ctrl[row * 3 + 1] < 0) return;  // pad row (uniform per block)
+  const int prefix_len = row_ctrl[row * 3 + 0];
+  const int toff = row_ctrl[row * 3 + 2];
+  const int ctx = prefix_len + n_anc[row];
+  const int tid = threadIdx.x;
+  const int n_rep = n_head / n_head_kv;
+  const int kv = h / n_rep;
+  const int* arow = anc + (long long)row * max_anc;
+
+  const float* gsc = scores + ((long long)row * n_head + h) * score_stride;
+  for (int j = tid; j < ctx; j += blockDim.x) {
+    sc[j] = gsc[j];
+  }
+  __syncthreads();
+
+  float mx = -INFINITY;
+  for (int j = tid; j < ctx; j += blockDim.x) {
+    mx = fmaxf(mx, sc[j]);
+  }
+  s_red[tid] = mx;
+  __syncthreads();
+  if (tid < 64) {
+    s_red[tid] = fmaxf(s_red[tid], s_red[tid + 64]);
+  }
+  __syncthreads();
+  if (tid < 32) {
+    float vv = fmaxf(s_red[tid], s_red[tid + 32]);
+    for (int off = 16; off > 0; off >>= 1) {
+      vv = fmaxf(vv, __shfl_down_sync(0xffffffffu, vv, off));
+    }
+    if (tid == 0) {
+      s_red[0] = vv;
+    }
+  }
+  __syncthreads();
+  mx = s_red[0];
+
+  for (int j = tid; j < ctx; j += blockDim.x) {
+    sc[j] = exp_f32(__fsub_rn(sc[j], mx));
+  }
+  __syncthreads();
+  if (tid == 0) {
+    float sum = 0.0f;
+    for (int j = 0; j < ctx; ++j) {
+      sum = __fadd_rn(sum, sc[j]);
+    }
+    s_inv = __fdiv_rn(1.0f, sum);
+  }
+  __syncthreads();
+  const float inv = s_inv;
+  for (int j = tid; j < ctx; j += blockDim.x) {
+    sc[j] = __fmul_rn(sc[j], inv);
+  }
+  __syncthreads();
+
+  float* o_row = out + ((long long)row * n_head + h) * head_dim;
+  const int ndims = (head_dim > tid) ? (head_dim - tid + (int)blockDim.x - 1) / (int)blockDim.x : 0;
+#define TREE_MAX_DIMS_PER_THREAD 8
+  if (ndims <= TREE_MAX_DIMS_PER_THREAD) {
+    float acc[TREE_MAX_DIMS_PER_THREAD];
+    for (int t = 0; t < ndims; ++t) {
+      acc[t] = 0.0f;
+    }
+#pragma unroll 4
+    for (int j = 0; j < ctx; ++j) {
+      const float w = sc[j];
+      const int logical = (j < prefix_len) ? j : arow[j - prefix_len];
+      const long long slot =
+          (long long)table[toff + (logical >> KV_PAGE_SHIFT)] * KV_PAGE_TOKENS +
+          (logical & KV_PAGE_MASK);
+      const float* v_row = v + (slot * n_head_kv + kv) * head_dim;
+      float vals[TREE_MAX_DIMS_PER_THREAD];
+#pragma unroll
+      for (int t = 0; t < TREE_MAX_DIMS_PER_THREAD; ++t) {
+        if (t < ndims) {
+          vals[t] = v_row[tid + (int)blockDim.x * t];
+        }
+      }
+      if (w != 0.0f) {
+#pragma unroll
+        for (int t = 0; t < TREE_MAX_DIMS_PER_THREAD; ++t) {
+          if (t < ndims) {
+            acc[t] = __fadd_rn(acc[t], __fmul_rn(w, vals[t]));
+          }
+        }
+      }
+    }
+    for (int t = 0; t < ndims; ++t) {
+      o_row[tid + (int)blockDim.x * t] = acc[t];
+    }
+  } else {
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+      float acc = 0.0f;
+      for (int j = 0; j < ctx; ++j) {
+        const float w = sc[j];
+        if (w == 0.0f) continue;
+        const int logical = (j < prefix_len) ? j : arow[j - prefix_len];
+        const long long slot =
+            (long long)table[toff + (logical >> KV_PAGE_SHIFT)] * KV_PAGE_TOKENS +
+            (logical & KV_PAGE_MASK);
+        const float* v_row = v + (slot * n_head_kv + kv) * head_dim;
+        acc = __fadd_rn(acc, __fmul_rn(w, v_row[d]));
+      }
+      o_row[d] = acc;
+    }
+  }
+#undef TREE_MAX_DIMS_PER_THREAD
+}
+
 
 // ===========================================================================
 // v0.3.8 (Track-2): on-device sampling for the batched M=N decode graph — fold the

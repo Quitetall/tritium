@@ -757,6 +757,16 @@ pub struct CudaDecodeModel {
     f_kv_append_tree_paged: CudaFunction,
     f_attn_tree_scores_ctrl_paged: CudaFunction,
     f_attn_tree_reduce_ctrl_paged: CudaFunction,
+    /// I4 batched-slots tree-verify twins (safe handles for the EAGER slots
+    /// route; the graph route uses the raw `BatchRawKernels` handles). The
+    /// 3-word ctrl is PER-ROW (`row_ctrl[m·3]`), so one launch set covers the
+    /// concatenation of several slots' trees — dense and paged variants.
+    f_kv_append_tree_slots: CudaFunction,
+    f_attn_tree_scores_slots: CudaFunction,
+    f_attn_tree_reduce_slots: CudaFunction,
+    f_kv_append_tree_slots_paged: CudaFunction,
+    f_attn_tree_scores_slots_paged: CudaFunction,
+    f_attn_tree_reduce_slots_paged: CudaFunction,
     f_argmax_partial: CudaFunction,
     f_argmax_combine: CudaFunction,
     /// Lazy m=1 argmax scratch for `step_graph_argmax`:

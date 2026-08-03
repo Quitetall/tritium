@@ -252,6 +252,7 @@ impl CudaDecodeModel {
             graph_argmax: None,
             tree_scratch: None,
             tree_graphs: None,
+            tree_slots_graphs: None,
             raw_keepalive: None,
         })
     }

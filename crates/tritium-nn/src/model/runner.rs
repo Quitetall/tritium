@@ -317,6 +317,54 @@ impl ModelRunner {
             .map_err(ResidentOpError::Op)
     }
 
+    /// (cuda) I4 batched-slots tree-verify (L3 batch-slot spec decode): the
+    /// same greedy verify as
+    /// [`tree_verify_greedy_slot`](Self::tree_verify_greedy_slot), run for
+    /// SEVERAL slots in ONE tree forward — `trees[k]` is slot `rows[k]`'s
+    /// `(tokens, parents)` draft tree, and `out[k]` its accepted tokens
+    /// (bit-identical to verifying the slots sequentially). The LM head +
+    /// argmax run once over the concatenated rows, amortizing the dominant
+    /// per-verify cost (ADR 0032) across the batch. Requires the f32 KV
+    /// rung, `head_dim % 4 == 0`, live non-duplicate rows and
+    /// `Σ tokensₖ.len() <= 48`; paged slots need reservations covering each
+    /// slot's `positions[r] + tokens.len()` tokens
+    /// ([`tree_reservation_rows`](Self::tree_reservation_rows) is a safe
+    /// upper bound). A refusal is atomic: no listed slot changes.
+    ///
+    /// # Errors
+    /// [`ResidentOpError`] — `Unavailable` on a non-CUDA backend, `Op` with
+    /// the device/validation error otherwise.
+    #[cfg(feature = "cuda")]
+    pub fn tree_verify_greedy_slots(
+        &mut self,
+        batch: &mut tritium_cuda::BatchKv,
+        rows: &[usize],
+        trees: &[(&[u32], &[i32])],
+    ) -> Result<Vec<Vec<u32>>, ResidentOpError> {
+        self.resident_for_op()?
+            .tree_verify_greedy_slots(batch, rows, trees)
+            .map_err(ResidentOpError::Op)
+    }
+
+    /// (cuda) Padded KV-row demand of a single-slot tree verify of `m` nodes
+    /// at committed prefix `prefix_len` (the graph route's pad rows write
+    /// real bytes, so paged callers must reserve through the PADDED tree).
+    /// Also a safe upper bound for the batched
+    /// [`tree_verify_greedy_slots`](Self::tree_verify_greedy_slots) (whose
+    /// exact demand is `prefix_len + m` per slot). See
+    /// `CudaDecodeModel::tree_reservation_rows`.
+    ///
+    /// # Errors
+    /// [`ResidentOpError::Unavailable`] on a non-CUDA backend.
+    #[cfg(feature = "cuda")]
+    pub fn tree_reservation_rows(
+        &mut self,
+        prefix_len: usize,
+        m: usize,
+    ) -> Result<usize, ResidentOpError> {
+        Ok(self.resident_for_op()?.tree_reservation_rows(prefix_len, m))
+    }
+
     /// (cuda) BASTION tree-verify, logits form: forward the token tree and
     /// return the flat `[tokens.len() × vocab]` logits for a host-side accept
     /// rule (sampling). Pair with [`tree_commit`](Self::tree_commit).

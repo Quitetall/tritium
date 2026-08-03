@@ -299,6 +299,15 @@ pub(super) struct BatchRawKernels {
     pub(super) kv_append_tree_paged: sys::CUfunction,
     pub(super) attn_tree_scores_ctrl_paged: sys::CUfunction,
     pub(super) attn_tree_reduce_ctrl_paged: sys::CUfunction,
+    /// I4 batched-slots twins of the six above: the 3-word ctrl becomes
+    /// PER-ROW (`row_ctrl[m·3]` = `[prefix_len, local_node_or_-1, word2]`),
+    /// so ONE forward verifies the concatenation of several slots' trees.
+    pub(super) kv_append_tree_slots: sys::CUfunction,
+    pub(super) attn_tree_scores_slots: sys::CUfunction,
+    pub(super) attn_tree_reduce_slots: sys::CUfunction,
+    pub(super) kv_append_tree_slots_paged: sys::CUfunction,
+    pub(super) attn_tree_scores_slots_paged: sys::CUfunction,
+    pub(super) attn_tree_reduce_slots_paged: sys::CUfunction,
 }
 
 // SAFETY: same contract as `RawGraphKernels` — the raw handles are process-valid device
@@ -358,6 +367,12 @@ impl BatchRawKernels {
             kv_append_tree_paged: get(dm, KERNEL_NAME_KV_APPEND_TREE_PAGED)?,
             attn_tree_scores_ctrl_paged: get(dm, KERNEL_NAME_ATTN_TREE_SCORES_CTRL_PAGED)?,
             attn_tree_reduce_ctrl_paged: get(dm, KERNEL_NAME_ATTN_TREE_REDUCE_CTRL_PAGED)?,
+            kv_append_tree_slots: get(dm, KERNEL_NAME_KV_APPEND_TREE_SLOTS)?,
+            attn_tree_scores_slots: get(dm, KERNEL_NAME_ATTN_TREE_SCORES_SLOTS)?,
+            attn_tree_reduce_slots: get(dm, KERNEL_NAME_ATTN_TREE_REDUCE_SLOTS)?,
+            kv_append_tree_slots_paged: get(dm, KERNEL_NAME_KV_APPEND_TREE_SLOTS_PAGED)?,
+            attn_tree_scores_slots_paged: get(dm, KERNEL_NAME_ATTN_TREE_SCORES_SLOTS_PAGED)?,
+            attn_tree_reduce_slots_paged: get(dm, KERNEL_NAME_ATTN_TREE_REDUCE_SLOTS_PAGED)?,
             modules: vec![dm, am],
         })
     }
@@ -528,6 +543,14 @@ pub struct BatchKv {
     /// own `raw_keepalive` (the `TreeGraphs` field), so module lifetime is
     /// self-contained.
     pub(super) tree_graphs: Option<TreeGraphs>,
+    /// I4: the BATCHED-slots verify's own graphs + per-ROW ctrl buffer
+    /// (`d_ctrl` here is `[3 · TREE_BUCKET_MAX]` i32 — row g reads
+    /// `[prefix_len, local_node_or_-1, word2]` at `g·3`). Kept SEPARATE from
+    /// `tree_graphs`: same bucket keys, different kernels (the slots twins)
+    /// and a different ctrl shape, and both bake this batch's `tree_scratch`
+    /// pointers — a scratch re-grow must drop BOTH. The eager slots route
+    /// reuses this struct's `d_ctrl` with an empty graph map (the I3 shape).
+    pub(super) tree_slots_graphs: Option<TreeGraphs>,
     /// A clone of the model's [`batch_raw`](CudaDecodeModel::batch_raw) `Arc`, taken when
     /// either graph is captured. Keeps the `CUfunction` modules the graphs reference loaded
     /// for as long as this batch lives, regardless of whether the producing model is dropped

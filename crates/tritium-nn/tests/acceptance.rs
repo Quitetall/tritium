@@ -2296,3 +2296,459 @@ fn cuda_tree_verify_paged_slot_matches_dense() {
          slots inert, graph==eager"
     );
 }
+
+/// I4 gate (L3 batch-slot spec decode, the payoff rung):
+/// `tree_verify_greedy_slots` — ONE tree forward over the CONCATENATION of 3
+/// slots' trees — must be bit-identical, per slot, to running
+/// `tree_verify_greedy_slot` SEQUENTIALLY on a twin batch over the same
+/// histories: accepted tokens, positions, and KV bytes (layers 0 + 7, read
+/// back THROUGH the page translation on the paged leg). Covered:
+///
+/// - per-slot chains of different lengths (phase 1: m = 3/5/2; phase 2:
+///   m = 2/4/6, an exact bucket) including branchy trees, and a slot whose
+///   drafts all reject (the EOS-ish early stop: it commits only the bonus
+///   token while the other slots keep accepting);
+/// - dense AND paged batches (interleaved reservations scramble the physical
+///   page order; asserted non-identity so the gate can't go vacuous);
+/// - both routes (captured slots graphs, then `TRITIUM_TREE_EAGER=1`),
+///   accepted tokens compared across routes;
+/// - continued decode after the verifies (`draft_batch`, 3 tokens/slot)
+///   equal between the batched and sequential twins — a functional pin on
+///   the per-slot promotes beyond the byte compares;
+/// - guard atomicity: a dead row, a duplicate row, an out-of-range row, an
+///   over-cap `m_total` (> 48) and a paged under-reservation each refuse
+///   loudly with ZERO state change on ALL listed slots (positions, KV
+///   bytes, free pages) — the fully-reserved slot is listed FIRST in the
+///   under-reservation call to prove the guard phase precedes any device
+///   work;
+/// - `tree_reservation_rows` returns the padded single-slot demand
+///   (bucketed) that serve-side reservations key off.
+///
+/// Drafter-only: the 2B4T target never loads.
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_tree_verify_slots_matches_sequential() {
+    let _gpu = gpu_serial();
+    if !Path::new(&*DRAFTER_PATH).exists() {
+        eprintln!("skipping: {} absent (gated drafter test)", *DRAFTER_PATH);
+        return;
+    }
+    let bytes = std::fs::read(&*DRAFTER_PATH).expect("read drafter GGUF");
+
+    let base: [u32; 7] = [128000, 791, 6864, 315, 279, 1917, 574];
+    let prompts: Vec<Vec<u32>> = vec![
+        base.iter().copied().cycle().take(9).collect(),
+        base.iter().copied().cycle().skip(2).take(14).collect(),
+        base.iter().copied().cycle().skip(4).take(12).collect(),
+    ];
+    let never = u32::MAX;
+    const POST: usize = 3;
+    const KV_LAYERS: [usize; 2] = [0, 7];
+    const V: u32 = 128_256;
+
+    // Reference greedy streams (one per slot) for building draft trees whose
+    // acceptance is deterministic. `generate` resets + prefills, so one
+    // loaded runner serves all three, then drops before the batches build.
+    let wants: Vec<Vec<u32>> = {
+        let Some(mut r) = load_on("cuda", &bytes) else {
+            return;
+        };
+        prompts
+            .iter()
+            .map(|p| r.generate(p, 16, never).expect("ref stream"))
+            .collect()
+    };
+    for w in &wants {
+        assert_eq!(w.len(), 16, "reference stream shorter than expected");
+    }
+
+    // Per (slot, phase) draft tree. Phase 1 mixes lengths (m_total = 10,
+    // pads to bucket 12): slot 0 a right chain m=3, slot 1 a branchy m=5
+    // (wrong sibling first at two levels), slot 2 an all-wrong m=2 (accept
+    // stops at the root — L=1 — while the others continue). Phase 2 swaps
+    // shapes (m_total = 12, an exact bucket): chain m=2, chain m=4, branchy
+    // m=6 with a wrong tail.
+    let make_tree = |slot: usize, phase: usize, c: usize, root: u32| -> (Vec<u32>, Vec<i32>) {
+        let want = &wants[slot];
+        match (phase, slot) {
+            (0, 0) => (vec![root, want[c], want[c + 1]], vec![-1, 0, 1]),
+            (0, 1) => (
+                vec![
+                    root,
+                    (want[c] + 1) % V,
+                    want[c],
+                    (want[c + 1] + 7) % V,
+                    want[c + 1],
+                ],
+                vec![-1, 0, 0, 2, 2],
+            ),
+            (0, 2) => (vec![root, (want[c] + 5) % V], vec![-1, 0]),
+            (1, 0) => (vec![root, want[c]], vec![-1, 0]),
+            (1, 1) => (
+                vec![root, want[c], want[c + 1], want[c + 2]],
+                vec![-1, 0, 1, 2],
+            ),
+            _ => (
+                vec![
+                    root,
+                    (want[c] + 1) % V,
+                    want[c],
+                    (want[c + 1] + 7) % V,
+                    want[c + 1],
+                    (want[c + 2] + 3) % V,
+                ],
+                vec![-1, 0, 0, 2, 2, 4],
+            ),
+        }
+    };
+
+    // Per route: (accepted per phase per slot, post-draft outs).
+    type RouteTokens = (Vec<Vec<Vec<u32>>>, Vec<Vec<u32>>);
+    let mut route_tokens: Vec<RouteTokens> = Vec::new();
+
+    for eager in [false, true] {
+        let _guard = TreeEagerGuard;
+        if eager {
+            // SAFETY: single-threaded test process (see TreeEagerGuard).
+            #[allow(unsafe_code)]
+            unsafe {
+                std::env::set_var("TRITIUM_TREE_EAGER", "1");
+            }
+        }
+
+        let Some(mut rb) = load_on("cuda", &bytes) else {
+            return;
+        };
+
+        for paged in [false, true] {
+            // The BATCHED batch and its SEQUENTIAL twin, same kind.
+            let (mut bat, mut seq) = if paged {
+                let mk = |rb: &mut ModelRunner| {
+                    let mut b = rb.new_batch_paged(3, 3).expect("new_batch_paged");
+                    // Interleaved reservation order (1, 0, 2) scrambles the
+                    // physical page assignment (one page per slot).
+                    for r in [1usize, 0, 2] {
+                        b.reserve_pages(r, prompts[r].len() + 24)
+                            .expect("reserve slot");
+                    }
+                    assert_eq!(b.free_pages(), 0, "pool sizing drifted");
+                    assert!(
+                        (0..3).any(|r| {
+                            b.debug_page_table_row(r)
+                                .expect("paged batch has a table")
+                                .iter()
+                                .enumerate()
+                                .any(|(i, &p)| p >= 0 && p as usize != i)
+                        }),
+                        "vacuous gate: every slot's pages are identity-mapped"
+                    );
+                    b
+                };
+                (mk(&mut rb), mk(&mut rb))
+            } else {
+                (
+                    rb.new_batch(3).expect("new_batch"),
+                    rb.new_batch(3).expect("new_batch twin"),
+                )
+            };
+
+            // Prefill each prompt once; adopt the SAME single-seq cache into
+            // the batched slot and its sequential twin.
+            let mut first_toks = [0u32; 3];
+            for (r, prompt) in prompts.iter().enumerate() {
+                rb.reset();
+                let positions: Vec<usize> = (0..prompt.len()).collect();
+                let l0 = rb.forward(prompt, &positions).expect("batch prefill");
+                first_toks[r] = argmax(&l0) as u32;
+                assert_eq!(first_toks[r], wants[r][0], "prefill vs reference (r={r})");
+                for b in [&mut bat, &mut seq] {
+                    rb.adopt_into_batch_row(b, r, prompt.len()).expect("adopt");
+                    b.set_position(r, prompt.len()).expect("set_position");
+                }
+            }
+
+            // Two verify phases: batched (one call, rows [0, 1, 2]) vs
+            // sequential (three single-slot calls) on the twin.
+            let mut committed: Vec<Vec<u32>> = (0..3).map(|r| vec![first_toks[r]]).collect();
+            let mut accepted: Vec<Vec<Vec<u32>>> = Vec::new();
+            for phase in 0..2 {
+                let trees: Vec<(Vec<u32>, Vec<i32>)> = (0..3)
+                    .map(|r| {
+                        make_tree(
+                            r,
+                            phase,
+                            committed[r].len(),
+                            *committed[r].last().expect("non-empty"),
+                        )
+                    })
+                    .collect();
+                let trees_ref: Vec<(&[u32], &[i32])> = trees
+                    .iter()
+                    .map(|(t, p)| (t.as_slice(), p.as_slice()))
+                    .collect();
+                let outs = rb
+                    .tree_verify_greedy_slots(&mut bat, &[0, 1, 2], &trees_ref)
+                    .expect("batched slots verify");
+                for r in 0..3 {
+                    let out_seq = rb
+                        .tree_verify_greedy_slot(&mut seq, r, &trees[r].0, &trees[r].1)
+                        .expect("sequential slot verify");
+                    assert_eq!(
+                        outs[r], out_seq,
+                        "batched accepted tokens != sequential (phase {phase}, r={r}, \
+                         paged {paged}, eager {eager})"
+                    );
+                    committed[r].extend(&outs[r]);
+                    assert_eq!(
+                        bat.positions()[r],
+                        seq.positions()[r],
+                        "batched position != sequential (phase {phase}, r={r})"
+                    );
+                    assert_eq!(
+                        bat.positions()[r],
+                        prompts[r].len() + committed[r].len() - 1,
+                        "slot position after phase {phase} (r={r})"
+                    );
+                }
+                // Phase-1 shape pins: mixed accept lengths, incl. the
+                // all-reject slot committing exactly the one bonus token.
+                if phase == 0 {
+                    assert_eq!(outs[0].len(), 3, "slot 0 chain must accept fully");
+                    assert_eq!(outs[1].len(), 3, "slot 1 branchy accept drifted");
+                    assert_eq!(outs[2].len(), 1, "slot 2 all-wrong drafts must L=1");
+                }
+                accepted.push(outs);
+            }
+            for r in 0..3 {
+                assert_eq!(
+                    &committed[r][..],
+                    &wants[r][..committed[r].len()],
+                    "slot {r} verify stream must stay lossless"
+                );
+            }
+
+            // Post-commit KV of every slot's whole committed region:
+            // bit-identical to the sequential twin (through the page
+            // translation on the paged leg).
+            {
+                let rm = rb.resident_cuda().expect("resident").expect("cuda");
+                for r in 0..3 {
+                    let rows = prompts[r].len() + committed[r].len() - 1;
+                    for li in KV_LAYERS {
+                        for row in 0..rows {
+                            for v in [false, true] {
+                                let got_b = rm
+                                    .debug_batch_kv_row(&bat, li, r, row, v)
+                                    .expect("batched kv row");
+                                let got_s = rm
+                                    .debug_batch_kv_row(&seq, li, r, row, v)
+                                    .expect("sequential kv row");
+                                assert_eq!(
+                                    got_b, got_s,
+                                    "KV byte mismatch (r={r}, layer {li}, row {row}, \
+                                     v={v}, paged {paged}, eager {eager})"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Continue every slot on both batches — a functional pin on the
+            // promotes (a wrong promoted row derails the continuation).
+            let feeds: Vec<u32> = (0..3)
+                .map(|r| *committed[r].last().expect("non-empty"))
+                .collect();
+            let post_b = rb
+                .draft_batch(&mut bat, &feeds, POST, never)
+                .expect("batched post draft");
+            let post_s = rb
+                .draft_batch(&mut seq, &feeds, POST, never)
+                .expect("sequential post draft");
+            assert_eq!(
+                post_b, post_s,
+                "post-verify drafts diverged (paged {paged}, eager {eager})"
+            );
+
+            // ── Refusal atomicity (graph leg only; the guards are host-side
+            // and route-independent). Every refusal must leave ALL listed
+            // slots untouched. ──
+            if !eager {
+                let rm_probe = |rb: &mut ModelRunner, b: &tritium_cuda::BatchKv| -> Vec<Vec<u8>> {
+                    let rm = rb.resident_cuda().expect("resident").expect("cuda");
+                    (0..3)
+                        .map(|r| {
+                            rm.debug_batch_kv_row(b, 0, r, prompts[r].len() - 1, false)
+                                .expect("probe kv row")
+                        })
+                        .collect()
+                };
+                let pos_before = bat.positions().to_vec();
+                let kv_before = rm_probe(&mut rb, &bat);
+                let tree: (Vec<u32>, Vec<i32>) = (vec![first_toks[0], 1], vec![-1, 0]);
+
+                // Dead row listed.
+                bat.set_live(1, false).expect("set_live dead");
+                let err = rb
+                    .tree_verify_greedy_slots(
+                        &mut bat,
+                        &[0, 1],
+                        &[(&tree.0, &tree.1), (&tree.0, &tree.1)],
+                    )
+                    .expect_err("dead row must refuse");
+                assert!(format!("{err}").contains("dead"), "unexpected: {err}");
+                bat.set_live(1, true).expect("set_live revive");
+
+                // Duplicate row.
+                let err = rb
+                    .tree_verify_greedy_slots(
+                        &mut bat,
+                        &[0, 0],
+                        &[(&tree.0, &tree.1), (&tree.0, &tree.1)],
+                    )
+                    .expect_err("duplicate row must refuse");
+                assert!(format!("{err}").contains("twice"), "unexpected: {err}");
+
+                // Out-of-range row.
+                let err = rb
+                    .tree_verify_greedy_slots(&mut bat, &[7], &[(&tree.0, &tree.1)])
+                    .expect_err("out-of-range row must refuse");
+                assert!(format!("{err}").contains(">= batch"), "unexpected: {err}");
+
+                // Over the one-bucket cap (m_total = 49 > 48).
+                let big_t: Vec<u32> = (0..49u32).map(|i| (first_toks[0] + i) % V).collect();
+                let big_p: Vec<i32> = (0..49i32).map(|i| i - 1).collect();
+                let err = rb
+                    .tree_verify_greedy_slots(&mut bat, &[0], &[(&big_t, &big_p)])
+                    .expect_err("over-cap m_total must refuse");
+                assert!(format!("{err}").contains("cap"), "unexpected: {err}");
+
+                assert_eq!(
+                    bat.positions().to_vec(),
+                    pos_before,
+                    "a refused batched verify must not advance any slot"
+                );
+                assert_eq!(
+                    rm_probe(&mut rb, &bat),
+                    kv_before,
+                    "a refused batched verify must write no KV"
+                );
+            }
+            drop(bat);
+            drop(seq);
+            if paged {
+                route_tokens.push((accepted, post_b));
+            }
+        }
+
+        // Paged under-reservation atomicity (graph leg only): slot 0's
+        // prompt ends 2 tokens before the page boundary, reserved EXACTLY —
+        // an m=4 tree crosses into the unreserved page. Slot 1 is fully
+        // reserved and listed FIRST: the refusal must leave BOTH untouched
+        // (guard phase precedes all device work).
+        if !eager {
+            let plen_s = tritium_cuda::KV_PAGE_TOKENS - 2;
+            let prompt0: Vec<u32> = base.iter().copied().cycle().take(plen_s).collect();
+            let prompt1: Vec<u32> = base.iter().copied().cycle().skip(1).take(10).collect();
+            let mut small = rb.new_batch_paged(2, 3).expect("small paged batch");
+            small.reserve_pages(0, plen_s).expect("reserve slot 0 short");
+            small.reserve_pages(1, 10 + 16).expect("reserve slot 1 full");
+            let mut roots = [0u32; 2];
+            for (r, prompt) in [&prompt0, &prompt1].into_iter().enumerate() {
+                rb.reset();
+                let positions: Vec<usize> = (0..prompt.len()).collect();
+                let l0 = rb.forward(prompt, &positions).expect("small prefill");
+                roots[r] = argmax(&l0) as u32;
+                rb.adopt_into_batch_row(&mut small, r, prompt.len())
+                    .expect("adopt");
+                small.set_position(r, prompt.len()).expect("set_position");
+            }
+            let t0: Vec<u32> = (0..4u32).map(|i| (roots[0] + i) % V).collect();
+            let t1: Vec<u32> = (0..4u32).map(|i| (roots[1] + i) % V).collect();
+            let p: Vec<i32> = (0..4i32).map(|i| i - 1).collect();
+            let free_before = small.free_pages();
+            let pos_before = small.positions().to_vec();
+            let kv_before = {
+                let rm = rb.resident_cuda().expect("resident").expect("cuda");
+                rm.debug_batch_kv_row(&small, 0, 1, prompt1.len() - 1, false)
+                    .expect("kv before")
+            };
+            let err = rb
+                .tree_verify_greedy_slots(
+                    &mut small,
+                    &[1, 0],
+                    &[(&t1, &p), (&t0, &p)],
+                )
+                .expect_err("under-reserved slot must refuse the whole batch");
+            assert!(
+                format!("{err}").contains("page-reserved"),
+                "unexpected refusal message: {err}"
+            );
+            assert_eq!(
+                small.positions().to_vec(),
+                pos_before,
+                "a refused batched verify must not advance any listed slot"
+            );
+            assert_eq!(
+                small.free_pages(),
+                free_before,
+                "a refused batched verify must draw no pages"
+            );
+            let kv_after = {
+                let rm = rb.resident_cuda().expect("resident").expect("cuda");
+                rm.debug_batch_kv_row(&small, 0, 1, prompt1.len() - 1, false)
+                    .expect("kv after")
+            };
+            assert_eq!(
+                kv_after, kv_before,
+                "a refused batched verify must write no KV (fully-reserved slot \
+                 listed first)"
+            );
+            small
+                .reserve_pages(0, plen_s + 16)
+                .expect("extend reservation");
+            let outs = rb
+                .tree_verify_greedy_slots(&mut small, &[1, 0], &[(&t1, &p), (&t0, &p)])
+                .expect("verify after extending the reservation");
+            assert!(
+                !outs[0].is_empty() && !outs[1].is_empty(),
+                "recovered verify must commit >= 1 token per slot"
+            );
+            assert_eq!(
+                small.positions().to_vec(),
+                vec![plen_s + outs[1].len(), prompt1.len() + outs[0].len()],
+                "positions after the recovered verify (slot-indexed; rows were \
+                 listed [1, 0], so outs[1] is slot 0's)"
+            );
+
+            // Reservation-demand helper: padded (bucketed) single-slot
+            // demand — the serve-side reservation key.
+            assert_eq!(
+                rb.tree_reservation_rows(100, 8).expect("resident"),
+                108,
+                "m=8 is a bucket boundary"
+            );
+            assert_eq!(
+                rb.tree_reservation_rows(100, 6).expect("resident"),
+                108,
+                "m=6 pads to bucket 8"
+            );
+            assert_eq!(
+                rb.tree_reservation_rows(100, 2).expect("resident"),
+                104,
+                "m=2 pads to bucket 4"
+            );
+        }
+    }
+
+    let (g, e) = (&route_tokens[0], &route_tokens[1]);
+    assert_eq!(g.0, e.0, "graph vs eager accepted tokens (slots gate)");
+    assert_eq!(g.1, e.1, "graph vs eager post drafts (slots gate)");
+    println!(
+        "I4 slots: one forward over 3 slots' concatenated trees (m=3/5/2 then \
+         2/4/6, branchy + an all-reject early stop) bit-equal to sequential \
+         single-slot verifies (tokens, positions, KV layers {KV_LAYERS:?}) on \
+         dense AND scrambled-paged batches; refusals (dead/dup/range/cap/\
+         under-reservation) atomic across listed slots; graph==eager"
+    );
+}

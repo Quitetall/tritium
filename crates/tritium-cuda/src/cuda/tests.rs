@@ -4353,7 +4353,7 @@ fn adr_0022_twin_family_table_matches_decode_cu() {
     }
     assert_eq!(
         names.len(),
-        74,
+        80,
         "decode.cu kernel count drifted from ADR 0022 — update the ADR \
          (65 → 64: gqa_attention_mdecode_f32 retired; 64 → 66: paged KV \
          twins added, ADR 0025 step 2; rmsnorm_quant_i8_fast was added and \
@@ -4365,7 +4365,12 @@ fn adr_0022_twin_family_table_matches_decode_cu() {
          71 → 74: paged tree-verify ctrl twins — kv_append_tree_paged_g + \
          gqa_attention_tree_{{scores,reduce}}_ctrl_paged_g, L3-I3 tree verify \
          against paged BatchKv slots, bit-identical to a dense slot by the \
-         cuda_tree_verify_paged_slot_matches_dense gate)"
+         cuda_tree_verify_paged_slot_matches_dense gate; 74 → 80: L3-I4 \
+         batched-slots twins — kv_append_tree_slots[_paged]_g + \
+         gqa_attention_tree_{{scores,reduce}}_slots[_paged]_g, per-ROW ctrl \
+         so ONE forward verifies many slots' trees; the single-slot ctrl \
+         kernels are retained unchanged, batched == sequential by the \
+         cuda_tree_verify_slots_matches_sequential gate)"
     );
 }
 

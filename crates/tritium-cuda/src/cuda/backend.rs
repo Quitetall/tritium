@@ -6411,6 +6411,27 @@ impl CudaBackend {
                 bytes,
             )
         })?;
+        // I4 batched-slots twins (eager slots route; per-ROW ctrl). Both
+        // reduce variants stage up-to-max_ctx scores in dynamic shared —
+        // same opt-in as their single-slot siblings.
+        let f_kv_append_tree_slots = f(dm, KERNEL_NAME_KV_APPEND_TREE_SLOTS)?;
+        let f_attn_tree_scores_slots = f(dm, KERNEL_NAME_ATTN_TREE_SCORES_SLOTS)?;
+        let f_attn_tree_reduce_slots = f(dm, KERNEL_NAME_ATTN_TREE_REDUCE_SLOTS)?;
+        let f_kv_append_tree_slots_paged = f(dm, KERNEL_NAME_KV_APPEND_TREE_SLOTS_PAGED)?;
+        let f_attn_tree_scores_slots_paged = f(dm, KERNEL_NAME_ATTN_TREE_SCORES_SLOTS_PAGED)?;
+        let f_attn_tree_reduce_slots_paged = f(dm, KERNEL_NAME_ATTN_TREE_REDUCE_SLOTS_PAGED)?;
+        attn_shared_opt_in(max_ctx, |bytes| {
+            f_attn_tree_reduce_slots.set_attribute(
+                sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                bytes,
+            )
+        })?;
+        attn_shared_opt_in(max_ctx, |bytes| {
+            f_attn_tree_reduce_slots_paged.set_attribute(
+                sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                bytes,
+            )
+        })?;
 
         // ADR 0026 Track P: dispatch threshold (default 32 = the tuned
         // dp4a/IMMA crossover). Loud-reject selector.
@@ -6602,6 +6623,12 @@ impl CudaBackend {
             f_kv_append_tree_paged,
             f_attn_tree_scores_ctrl_paged,
             f_attn_tree_reduce_ctrl_paged,
+            f_kv_append_tree_slots,
+            f_attn_tree_scores_slots,
+            f_attn_tree_reduce_slots,
+            f_kv_append_tree_slots_paged,
+            f_attn_tree_scores_slots_paged,
+            f_attn_tree_reduce_slots_paged,
             f_argmax_partial: f(dm, KERNEL_NAME_ARGMAX_PARTIAL)?,
             f_argmax_combine: f(dm, KERNEL_NAME_ARGMAX_COMBINE)?,
             am_scratch: None,

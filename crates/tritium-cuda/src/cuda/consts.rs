@@ -152,6 +152,17 @@ pub(super) const KERNEL_NAME_ATTN_TREE_SCORES_CTRL_PAGED: &str =
     "gqa_attention_tree_scores_ctrl_paged_g";
 pub(super) const KERNEL_NAME_ATTN_TREE_REDUCE_CTRL_PAGED: &str =
     "gqa_attention_tree_reduce_ctrl_paged_g";
+/// I4 batched-slots tree-verify twins: per-ROW i32[3] ctrl
+/// `[prefix_len, local_node_or_-1, word2]` — one forward verifies MANY slots'
+/// concatenated trees, amortizing the lm_head table read N-wide (ADR 0032).
+pub(super) const KERNEL_NAME_KV_APPEND_TREE_SLOTS: &str = "kv_append_tree_slots_g";
+pub(super) const KERNEL_NAME_ATTN_TREE_SCORES_SLOTS: &str = "gqa_attention_tree_scores_slots_g";
+pub(super) const KERNEL_NAME_ATTN_TREE_REDUCE_SLOTS: &str = "gqa_attention_tree_reduce_slots_g";
+pub(super) const KERNEL_NAME_KV_APPEND_TREE_SLOTS_PAGED: &str = "kv_append_tree_slots_paged_g";
+pub(super) const KERNEL_NAME_ATTN_TREE_SCORES_SLOTS_PAGED: &str =
+    "gqa_attention_tree_scores_slots_paged_g";
+pub(super) const KERNEL_NAME_ATTN_TREE_REDUCE_SLOTS_PAGED: &str =
+    "gqa_attention_tree_reduce_slots_paged_g";
 pub(super) const KERNEL_NAME_ATTN_TREE_REDUCE: &str = "gqa_attention_tree_reduce_g";
 /// Keys per scores-block — keep in sync with `SCORE_CHUNK` in decode.cu.
 pub(super) const ATTN_SCORE_CHUNK: usize = 128;
