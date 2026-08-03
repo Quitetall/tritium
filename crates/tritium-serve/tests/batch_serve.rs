@@ -891,6 +891,17 @@ async fn cuda_batched_spec_solo_matches_single_worker() {
     }
     // B triggers the migration: A's continuation prefills FIRST (FIFO with
     // no re-emits), then B admits into another slot; both decode lockstep.
+    // Teeth: A must still have a healthy tail of its stream left when B is
+    // fired, or this phase silently degrades to "B after A finished" and
+    // exercises zero migration code. ≥8 remaining tokens is >25ms of decode
+    // on any GPU this suite runs on — the local HTTP round-trip wins that
+    // race; a violation means the gate went vacuous, not that serving broke.
+    let a_before_b = a_text.lock().expect("lock").split_whitespace().count();
+    assert!(
+        a_before_b + 8 <= horizon,
+        "I0 phase 2 lost the migration race before it started: A had \
+         {a_before_b}/{horizon} tokens when B was sent — gate is vacuous"
+    );
     let b_ids = base
         .iter()
         .cycle()

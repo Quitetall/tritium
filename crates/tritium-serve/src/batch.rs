@@ -710,8 +710,14 @@ pub(crate) fn run_batched(
                     // preserved, no stream re-emits a token. A spec-active
                     // worker never parks jobs elsewhere (spec requires an
                     // empty pool with free pages), so the park seat is free.
+                    // A dead client must not evict the live spec sequence:
+                    // migration costs the survivor a full-history re-prefill
+                    // plus lockstep decode for its remaining tokens.
+                    if spec.is_some() && tx.is_closed() {
+                        continue;
+                    }
                     if let Some(s) = spec.take() {
-                        debug_assert!(parked.is_none(), "parked job during solo spec");
+                        assert!(parked.is_none(), "parked job during solo spec");
                         pending = migrate_spec(s, &mut runner, &mut batch, draft.as_mut(), &pool);
                         if pending.is_some() {
                             parked = Some(Job::Generate { req, tx });
@@ -830,9 +836,14 @@ pub(crate) fn run_batched(
                     // admission-type job (it claims the single-sequence KV),
                     // so it displaces the solo spec sequence the same way a
                     // chat admission does — migrate first, park the open,
-                    // retry it right after the continuation prefill.
+                    // retry it right after the continuation prefill. Same
+                    // dead-client guard as the chat arm: an abandoned open
+                    // must not evict the live spec sequence.
+                    if spec.is_some() && resp.is_closed() {
+                        continue;
+                    }
                     if let Some(s) = spec.take() {
-                        debug_assert!(parked.is_none(), "parked job during solo spec");
+                        assert!(parked.is_none(), "parked job during solo spec");
                         pending = migrate_spec(s, &mut runner, &mut batch, draft.as_mut(), &pool);
                         if pending.is_some() {
                             parked = Some(Job::OpenTreeSession { prompt, resp });
