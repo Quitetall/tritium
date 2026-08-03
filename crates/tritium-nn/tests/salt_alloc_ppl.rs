@@ -109,7 +109,12 @@ fn env_usize(key: &str, default: usize) -> usize {
 /// (o_proj's input is the attention output, and the head's is the final hidden state). Flat is the
 /// honest default — it says "we do not know", not "this does not matter".
 fn column_curvature(a: &Arch, c: &Calib, shapes: &[(usize, usize)], alpha: f64) -> Vec<Vec<f64>> {
-    let mut out: Vec<Vec<f64>> = shapes.iter().map(|&(_, k)| vec![1.0f64; k]).collect();
+    // `d_j/s_j²` expands to `d_j^(1−α)·gm^(2α)`, so it carries a per-tensor scale (`gm`, the typical
+    // activation magnitude into that tensor) as well as a per-column shape. That makes the
+    // uncalibrated tensors dangerous: a hardcoded `1.0` is not "neutral", it is 1.0 in units the
+    // calibrated tensors do not share, and whichever way it lands the allocator either starves those
+    // tensors or lets them hoover up every plane. Filling them with the MEAN of the calibrated values
+    // says "average sensitivity, we don't know better" in the right units.
     let eff = |acc: &[f64], rows: usize| -> Vec<f64> {
         let s = smooth_scales(acc, rows, alpha);
         acc.iter()
@@ -120,6 +125,7 @@ fn column_curvature(a: &Arch, c: &Calib, shapes: &[(usize, usize)], alpha: f64) 
             })
             .collect()
     };
+    let mut out: Vec<Vec<f64>> = shapes.iter().map(|_| Vec::new()).collect();
     for li in 0..a.n_layers {
         let base = 1 + 7 * li;
         let attn = eff(&c.attn_in[li], c.rows);
@@ -131,6 +137,16 @@ fn column_curvature(a: &Arch, c: &Calib, shapes: &[(usize, usize)], alpha: f64) 
         out[base + 4].clone_from(&ffn);
         out[base + 5].clone_from(&ffn);
         out[base + 6].clone_from(&down);
+    }
+    let (sum, cnt) = out
+        .iter()
+        .flatten()
+        .fold((0.0f64, 0usize), |(s, n), &v| (s + v, n + 1));
+    let mean = if cnt > 0 { sum / cnt as f64 } else { 1.0 };
+    for (o, &(_, k)) in out.iter_mut().zip(shapes) {
+        if o.is_empty() {
+            *o = vec![mean; k]; // tied embed/head and o_proj: no calibration collected
+        }
     }
     out
 }
@@ -248,6 +264,19 @@ fn curvature_allocation_beats_uniform_planes_at_matched_bits() {
     }
     let flat_sizes: Vec<usize> = all_sizes.iter().flatten().copied().collect();
     let total_weights: usize = flat_sizes.iter().sum();
+    let flat_curves: Vec<&Vec<f64>> = all_curves.iter().flatten().collect();
+
+    // Total weight-space error the arm's plane counts actually realise. This is the column that
+    // makes the table interpretable rather than merely negative: the water-filling MINIMISES this
+    // subject to the budget, so if an allocated arm posts lower error and worse perplexity, the
+    // objective itself is wrong — that is the proxy gap, not an allocator bug.
+    let total_sse = |counts: &[u8]| -> f64 {
+        counts
+            .iter()
+            .zip(&flat_curves)
+            .map(|(&t, c)| c[usize::from(t).min(c.len() - 1)])
+            .sum()
+    };
 
     println!(
         "SmolLM2-135M | fp {ppl_fp:.3} | fold α={FOLD_ALPHA} | g{GROUP} | ladder (always rot)\n\
@@ -255,10 +284,10 @@ fn curvature_allocation_beats_uniform_planes_at_matched_bits() {
          bpw includes the {plane_bits:.0}-bit per-group plane-count field the decoder needs.\n"
     );
     println!(
-        "{:<34} {:>8} {:>9} {:>11} {:>9}",
-        "arm", "mean T", "bpw", "ppl", "× fp"
+        "{:<34} {:>8} {:>9} {:>12} {:>11} {:>9}",
+        "arm", "mean T", "bpw", "recon SSE", "ppl", "× fp"
     );
-    println!("{}", "-".repeat(76));
+    println!("{}", "-".repeat(88));
 
     // ── Arm 1: uniform ────────────────────────────────────────────────────────────────────────
     let uniform: Vec<Vec<f32>> = fp
@@ -278,8 +307,9 @@ fn curvature_allocation_beats_uniform_planes_at_matched_bits() {
         .collect();
     let counts_uniform: Vec<u8> = vec![t_ref as u8; flat_sizes.len()];
     let ppl_u = perplexity_windowed(&uniform, &arch, &eval, EVAL_WINDOW);
+    let sse_u = total_sse(&counts_uniform);
     println!(
-        "{:<34} {:>8.3} {:>9.3} {ppl_u:>11.3} {:>8.3}×",
+        "{:<34} {:>8.3} {:>9.3} {sse_u:>12.5e} {ppl_u:>11.3} {:>8.3}×",
         format!("uniform T={t_ref}"),
         t_ref as f64,
         alloc_bpw(&counts_uniform, &flat_sizes, plane_bits),
@@ -348,10 +378,12 @@ fn curvature_allocation_beats_uniform_planes_at_matched_bits() {
             .sum::<f64>()
             / total_weights as f64;
         let ppl = perplexity_windowed(&q, &arch, &eval, EVAL_WINDOW);
+        let sse = total_sse(&counts);
         println!(
-            "{label:<34} {mean_t:>8.3} {:>9.3} {ppl:>11.3} {:>8.3}×",
+            "{label:<34} {mean_t:>8.3} {:>9.3} {sse:>12.5e} {ppl:>11.3} {:>8.3}×   (SSE {:+.1}% vs uniform)",
             alloc_bpw(&counts, &flat_sizes, plane_bits),
             ppl / ppl_fp,
+            100.0 * (sse - sse_u) / sse_u,
         );
 
         let mut hist = vec![0usize; t_max + 1];
@@ -366,6 +398,9 @@ fn curvature_allocation_beats_uniform_planes_at_matched_bits() {
          (error curves differ across groups) and the calibration data is not doing any work; only the\n\
          gap between it and the curvature arm is attributable to H_g. Both are judged on held-out\n\
          perplexity — the point of curvature weighting is precisely that weight-space error is the\n\
-         wrong objective, so it would be incoherent to score it on weight-space error."
+         wrong objective, so it would be incoherent to score it on weight-space error.\n\n\
+         Read the SSE column against the ppl column. The water-filling MINIMISES weighted SSE under\n\
+         the budget, so an allocated arm that posts lower SSE and worse perplexity is not a broken\n\
+         allocator — it is a demonstration that the objective is wrong."
     );
 }
