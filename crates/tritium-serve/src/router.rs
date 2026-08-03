@@ -401,14 +401,43 @@ pub fn build_router_batched_with_limits(
     limits: RequestLimits,
 ) -> std::io::Result<(Router, Arc<AtomicBool>)> {
     let admission = Arc::new(Admission::legacy(cfg.auth_token.as_deref()));
-    build_router_batched_inner(runner, eos, slots, tok, cfg, limits, admission)
+    build_router_batched_inner(runner, None, eos, slots, tok, cfg, limits, admission)
+}
+
+/// Build the continuous-batching router with an attached ADR 0021 draft
+/// model: solo greedy requests decode speculatively and migrate into a batch
+/// slot on the next admission ("spec-when-solo, migrate-on-admission",
+/// ADR 0032 L3 I0 — see `batch.rs`).
+#[cfg(feature = "cuda")]
+pub fn build_router_batched_with_draft(
+    runner: tritium_nn::ModelRunner,
+    draft: tritium_nn::ModelRunner,
+    eos: u32,
+    slots: usize,
+    tok: Arc<dyn Tokenizer + Send + Sync>,
+    cfg: ServeConfig,
+) -> std::io::Result<(Router, Arc<AtomicBool>)> {
+    let admission = Arc::new(Admission::legacy(cfg.auth_token.as_deref()));
+    build_router_batched_inner(
+        runner,
+        Some(draft),
+        eos,
+        slots,
+        tok,
+        cfg,
+        RequestLimits::default(),
+        admission,
+    )
 }
 
 /// Build the continuous-batching router with rotating bearer keys and
-/// fixed-cardinality per-principal admission control.
+/// fixed-cardinality per-principal admission control. `draft` optionally
+/// attaches the ADR 0021 drafter for the I0 solo-spec path.
 #[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)] // the governed worker's full wiring
 pub fn build_router_batched_governed(
     runner: tritium_nn::ModelRunner,
+    draft: Option<tritium_nn::ModelRunner>,
     eos: u32,
     slots: usize,
     tok: Arc<dyn Tokenizer + Send + Sync>,
@@ -417,12 +446,14 @@ pub fn build_router_batched_governed(
     policy: AdmissionPolicy,
 ) -> std::io::Result<(Router, Arc<AtomicBool>)> {
     let admission = Arc::new(Admission::new(cfg.auth_token.as_deref(), policy)?);
-    build_router_batched_inner(runner, eos, slots, tok, cfg, limits, admission)
+    build_router_batched_inner(runner, draft, eos, slots, tok, cfg, limits, admission)
 }
 
 #[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)] // the batched worker's full wiring
 fn build_router_batched_inner(
     runner: tritium_nn::ModelRunner,
+    draft: Option<tritium_nn::ModelRunner>,
     eos: u32,
     slots: usize,
     tok: Arc<dyn Tokenizer + Send + Sync>,
@@ -461,6 +492,7 @@ fn build_router_batched_inner(
             let _guard = Guard(alive);
             crate::batch::run_batched(
                 runner,
+                draft,
                 eos,
                 slots,
                 pool_tokens,

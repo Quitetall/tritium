@@ -57,7 +57,8 @@ pub use router::{
 };
 #[cfg(feature = "cuda")]
 pub use router::{
-    build_router_batched, build_router_batched_governed, build_router_batched_with_limits,
+    build_router_batched, build_router_batched_governed, build_router_batched_with_draft,
+    build_router_batched_with_limits,
 };
 #[cfg(feature = "serve")]
 pub use startup::{

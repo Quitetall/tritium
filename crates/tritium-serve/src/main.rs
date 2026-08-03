@@ -426,17 +426,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let result = if batch_slots > 1 {
                 // Continuous batching: a dedicated worker owns the runner + a fixed
                 // slot pool; requests stream through the same job queue + SSE plumbing.
-                if spec_lookup || draft_runner.is_some() {
+                if spec_lookup {
                     return Err(
-                        "--spec lookup / --draft-model and --batch-slots > 1 are mutually \
-                 exclusive (the IN-PROCESS spec loop drives a single sequence; \
-                 batched spec decoding is served to EXTERNAL drafters via the \
-                 /v1/tree endpoints, which DO work with --batch-slots — C4)"
+                        "--spec lookup and --batch-slots > 1 are mutually exclusive \
+                 (the IN-PROCESS lookup loop drives a single sequence; batched \
+                 spec decoding is served to EXTERNAL drafters via the /v1/tree \
+                 endpoints, which DO work with --batch-slots — C4)"
                             .into(),
                     );
                 }
+                // I0 (ADR 0032 L3): --draft-model coexists with --batch-slots
+                // under the "spec-when-solo, migrate-on-admission" contract —
+                // a solo greedy request decodes speculatively on the
+                // single-sequence KV; any admission migrates it into a batch
+                // slot and everyone proceeds under the lockstep contract.
                 tritium_serve::build_router_batched_governed(
                     *runner,
+                    draft_runner,
                     eos,
                     batch_slots,
                     tok,

@@ -406,9 +406,10 @@ impl RunnerGenerator {
 /// `TRITIUM_DRAFT_CHAIN=0` disables the L1' chained device-side draft
 /// (per-step ladder instead) — the A/B baseline + kill switch, the
 /// TRITIUM_DRAFT_K pattern. Loud-reject on anything else.
-// Consumed only by the cuda-gated spec-decode generators.
+// Consumed by the cuda-gated spec-decode generators and the batched
+// worker's I0 solo-spec path (ADR 0032 L3 I0).
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-fn draft_chain_from_env() -> Result<bool, GenError> {
+pub(crate) fn draft_chain_from_env() -> Result<bool, GenError> {
     match std::env::var("TRITIUM_DRAFT_CHAIN") {
         Err(std::env::VarError::NotPresent) => Ok(true),
         Ok(v) if v == "1" => Ok(true),
@@ -438,7 +439,7 @@ fn draft_chain_from_env() -> Result<bool, GenError> {
 /// recomputes the argmax chain; sampled: the residual-distribution rule) —
 /// so this is purely a cost policy with no numerics gate.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-enum DraftPolicy {
+pub(crate) enum DraftPolicy {
     /// Acceptance-adaptive (the default; see the doc above).
     Adaptive {
         /// EWMA of per-token acceptance outcomes in [0, 1].
@@ -470,7 +471,7 @@ impl DraftPolicy {
     /// Optimistic start: strong content ramps immediately; weak content
     /// converges down within a couple of cycles. `TRITIUM_DRAFT_K=legacy`
     /// selects the old fixed rule (loud-reject on anything else).
-    fn from_env() -> Result<Self, GenError> {
+    pub(crate) fn from_env() -> Result<Self, GenError> {
         match std::env::var("TRITIUM_DRAFT_K") {
             Err(std::env::VarError::NotPresent) => Ok(Self::Adaptive { acc: 0.75 }),
             Err(std::env::VarError::NotUnicode(v)) => Err(GenError::Backend(format!(
@@ -490,7 +491,7 @@ impl DraftPolicy {
     /// survived the walk (accepted < offered means the walk died at draft
     /// accepted+1 — one observed failure; accepted == offered is truncation,
     /// not a failure).
-    fn update(&mut self, offered: usize, accepted: usize) {
+    pub(crate) fn update(&mut self, offered: usize, accepted: usize) {
         match self {
             Self::Adaptive { acc } => {
                 for _ in 0..accepted {
@@ -511,7 +512,7 @@ impl DraftPolicy {
     }
 
     /// Draft length for the next cycle.
-    fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         match self {
             Self::Adaptive { acc } => {
                 let a = acc.clamp(0.05, 0.98);
@@ -520,6 +521,133 @@ impl DraftPolicy {
             Self::Legacy { len } => *len,
         }
     }
+}
+
+/// Draft up to `max_draft` tokens with `draft` (greedy), starting after
+/// `history` (whose last element is the pending token). Syncs the draft's KV
+/// to `history` first by re-feeding the gap — see `draft_pos`/`draft_fed` on
+/// [`RunnerGenerator`] for why that is always correct. Stops early at the
+/// draft's own EOS. Returns `[]` on any draft error (caller falls back to a
+/// plain step; drafting must never break generation).
+///
+/// Free function (not a method) so the batched worker's I0 solo-spec path
+/// (ADR 0032 L3 I0, `batch.rs`) can share the exact reconcile + chain logic
+/// with [`RunnerGenerator::model_draft`] — this is the single source of truth.
+#[cfg(feature = "cuda")]
+pub(crate) fn draft_greedy_tokens(
+    draft: &mut tritium_nn::ModelRunner,
+    draft_fed: &mut Vec<u32>,
+    draft_pos: &mut usize,
+    eos: u32,
+    history: &[u32],
+    max_draft: usize,
+    chain: bool,
+) -> Vec<u32> {
+    if max_draft == 0 || history.is_empty() {
+        return Vec::new();
+    }
+    let p = history.len() - 1; // pending's position
+    let draft_ctx = draft.config.n_ctx as usize;
+    if p + max_draft + 1 >= draft_ctx {
+        return Vec::new(); // draft context exhausted; plain steps carry on
+    }
+    // Reconcile last call's speculatively-fed tokens against the now-
+    // committed history: matches ADVANCE the watermark (those KV rows are
+    // proven correct); the first mismatch means a rejected draft sits in
+    // the KV — the resident runner rejects position rewinds, so recover
+    // with a reset + full re-prefill (rare for a good drafter).
+    let mut clean = true;
+    for (i, &fed) in draft_fed.iter().enumerate() {
+        if history.get(*draft_pos + i) != Some(&fed) {
+            clean = false;
+            break;
+        }
+    }
+    if clean {
+        *draft_pos = (*draft_pos + draft_fed.len()).min(p);
+    } else {
+        draft.reset();
+        *draft_pos = 0;
+    }
+    draft_fed.clear();
+    // Forward-contiguous sync: feed the history the draft hasn't seen,
+    // EXCLUDING pending (fed by the loop below).
+    if *draft_pos < p {
+        let gap: Vec<u32> = history[*draft_pos..p].to_vec();
+        let positions: Vec<usize> = (*draft_pos..p).collect();
+        if draft.forward(&gap, &positions).is_err() {
+            draft.reset();
+            *draft_pos = 0; // full resync next time
+            return Vec::new();
+        }
+        *draft_pos = p;
+    }
+    let mut out = Vec::with_capacity(max_draft);
+    let mut tok = history[p];
+    // L1' fastest path (ADR 0032): the whole k-token draft as ONE chained
+    // device-side loop — a single host round-trip instead of one per
+    // token (the measured ~1.2 ms/token host cost that held spec decode
+    // at parity). Drafts are bit-identical to the per-step path (gated by
+    // cuda_draft_chain_matches_per_step). Ok(None) = no resident decoder;
+    // Err = state untouched (cache_len only advances on success) — both
+    // fall through to the per-step ladder below.
+    let chained = if chain {
+        draft.decode_greedy_chain(tok, p, max_draft, eos)
+    } else {
+        Ok(None) // TRITIUM_DRAFT_CHAIN=0: per-step ladder (A/B + kill switch)
+    };
+    if let Ok(Some(ids)) = chained
+        && !ids.is_empty()
+    {
+        // (Empty ids — only reachable from poisoned all-NaN logits —
+        // falls through to the ladder without recording a feed.)
+        // The chain fed [tok, ids[0..len-1]] (the last id — possibly
+        // EOS — was drafted, never fed); record exactly those feeds.
+        draft_fed.push(tok);
+        for (i, &id) in ids.iter().enumerate() {
+            out.push(id);
+            if i + 1 < ids.len() {
+                draft_fed.push(id);
+            }
+        }
+        return out;
+    }
+    // Ok(None) (no resident decoder) or Err (state untouched): fall
+    // through to the per-step ladder.
+    for i in 0..max_draft {
+        // Fast path: graph replay + device argmax, 4 bytes back per step
+        // (the logits download + host scan dominated the drafter's cost).
+        // `Ok(None)` = no resident decoder -> eager logits + host argmax
+        // (same token by the pinned tie rule).
+        let next = match draft.decode_greedy_step(tok, p + i) {
+            Ok(Some(id)) => id,
+            Ok(None) => {
+                let Ok(logits) = draft.forward(&[tok], &[p + i]) else {
+                    break;
+                };
+                // The forward advanced the drafter's KV — record the fed
+                // token BEFORE any bail (the reconcile logic needs it).
+                draft_fed.push(tok);
+                let Some(next) = tritium_nn::sample_greedy(&logits) else {
+                    break;
+                };
+                out.push(next);
+                if next == eos {
+                    break;
+                }
+                tok = next;
+                continue;
+            }
+            Err(_) => break,
+        };
+        draft_fed.push(tok);
+        out.push(next);
+        if next == eos {
+            break; // the draft believes the turn ends here
+        }
+        tok = next;
+    }
+    out
 }
 
 impl RunnerGenerator {
@@ -565,121 +693,22 @@ impl RunnerGenerator {
     }
 
     #[cfg(feature = "cuda")]
-    /// Draft up to `max_draft` tokens with the attached draft model (greedy),
-    /// starting after `history` (whose last element is the pending token).
-    /// Syncs the draft's KV to `history` first by re-feeding the gap — see
-    /// `draft_pos` for why that is always correct. Stops early at the draft's
-    /// own EOS. Returns `[]` on any draft error (caller falls back to a plain
-    /// step; drafting must never break generation).
+    /// Draft up to `max_draft` tokens with the attached draft model (greedy).
+    /// Thin wrapper over [`draft_greedy_tokens`] — the shared reconcile +
+    /// chain logic (also used by the batched worker's I0 solo-spec path).
     fn model_draft(&mut self, history: &[u32], max_draft: usize, chain: bool) -> Vec<u32> {
         let Some(draft) = self.draft.as_mut() else {
             return Vec::new();
         };
-        if max_draft == 0 || history.is_empty() {
-            return Vec::new();
-        }
-        let p = history.len() - 1; // pending's position
-        let draft_ctx = draft.config.n_ctx as usize;
-        if p + max_draft + 1 >= draft_ctx {
-            return Vec::new(); // draft context exhausted; plain steps carry on
-        }
-        // Reconcile last call's speculatively-fed tokens against the now-
-        // committed history: matches ADVANCE the watermark (those KV rows are
-        // proven correct); the first mismatch means a rejected draft sits in
-        // the KV — the resident runner rejects position rewinds, so recover
-        // with a reset + full re-prefill (rare for a good drafter).
-        let mut clean = true;
-        for (i, &fed) in self.draft_fed.iter().enumerate() {
-            if history.get(self.draft_pos + i) != Some(&fed) {
-                clean = false;
-                break;
-            }
-        }
-        if clean {
-            self.draft_pos = (self.draft_pos + self.draft_fed.len()).min(p);
-        } else {
-            draft.reset();
-            self.draft_pos = 0;
-        }
-        self.draft_fed.clear();
-        // Forward-contiguous sync: feed the history the draft hasn't seen,
-        // EXCLUDING pending (fed by the loop below).
-        if self.draft_pos < p {
-            let gap: Vec<u32> = history[self.draft_pos..p].to_vec();
-            let positions: Vec<usize> = (self.draft_pos..p).collect();
-            if draft.forward(&gap, &positions).is_err() {
-                draft.reset();
-                self.draft_pos = 0; // full resync next time
-                return Vec::new();
-            }
-            self.draft_pos = p;
-        }
-        let mut out = Vec::with_capacity(max_draft);
-        let mut tok = history[p];
-        // L1' fastest path (ADR 0032): the whole k-token draft as ONE chained
-        // device-side loop — a single host round-trip instead of one per
-        // token (the measured ~1.2 ms/token host cost that held spec decode
-        // at parity). Drafts are bit-identical to the per-step path (gated by
-        // cuda_draft_chain_matches_per_step). Ok(None) = no resident decoder;
-        // Err = state untouched (cache_len only advances on success) — both
-        // fall through to the per-step ladder below.
-        let chained = if chain {
-            draft.decode_greedy_chain(tok, p, max_draft, self.eos)
-        } else {
-            Ok(None) // TRITIUM_DRAFT_CHAIN=0: per-step ladder (A/B + kill switch)
-        };
-        if let Ok(Some(ids)) = chained
-            && !ids.is_empty()
-        {
-            // (Empty ids — only reachable from poisoned all-NaN logits —
-            // falls through to the ladder without recording a feed.)
-            // The chain fed [tok, ids[0..len-1]] (the last id — possibly
-            // EOS — was drafted, never fed); record exactly those feeds.
-            self.draft_fed.push(tok);
-            for (i, &id) in ids.iter().enumerate() {
-                out.push(id);
-                if i + 1 < ids.len() {
-                    self.draft_fed.push(id);
-                }
-            }
-            return out;
-        }
-        // Ok(None) (no resident decoder) or Err (state untouched): fall
-        // through to the per-step ladder.
-        for i in 0..max_draft {
-            // Fast path: graph replay + device argmax, 4 bytes back per step
-            // (the logits download + host scan dominated the drafter's cost).
-            // `Ok(None)` = no resident decoder -> eager logits + host argmax
-            // (same token by the pinned tie rule).
-            let next = match draft.decode_greedy_step(tok, p + i) {
-                Ok(Some(id)) => id,
-                Ok(None) => {
-                    let Ok(logits) = draft.forward(&[tok], &[p + i]) else {
-                        break;
-                    };
-                    // The forward advanced the drafter's KV — record the fed
-                    // token BEFORE any bail (the reconcile logic needs it).
-                    self.draft_fed.push(tok);
-                    let Some(next) = tritium_nn::sample_greedy(&logits) else {
-                        break;
-                    };
-                    out.push(next);
-                    if next == self.eos {
-                        break;
-                    }
-                    tok = next;
-                    continue;
-                }
-                Err(_) => break,
-            };
-            self.draft_fed.push(tok);
-            out.push(next);
-            if next == self.eos {
-                break; // the draft believes the turn ends here
-            }
-            tok = next;
-        }
-        out
+        draft_greedy_tokens(
+            draft,
+            &mut self.draft_fed,
+            &mut self.draft_pos,
+            self.eos,
+            history,
+            max_draft,
+            chain,
+        )
     }
 
     /// The greedy speculative loop: pending token → draft a chain (model

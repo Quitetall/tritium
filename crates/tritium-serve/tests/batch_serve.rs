@@ -24,7 +24,7 @@ use tower::ServiceExt;
 
 use tritium_serve::{
     GenRequest, Generator, IdPassthroughTokenizer, RunnerGenerator, Sampling, ServeConfig,
-    build_router_batched,
+    build_router_batched, build_router_batched_with_draft,
 };
 
 use tritium_cpu as _;
@@ -44,6 +44,16 @@ const REF_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tools/reference/bitnet_accept.json"
 );
+
+/// ADR 0021 drafter for the I0 spec-coexistence gate; the test skips cleanly
+/// when absent (or when its vocab does not match the target's — the same
+/// startup check `--draft-model` enforces).
+static DRAFT_PATH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        "{}/blut/data/drafter-8L768-s3.gguf",
+        std::env::var("HOME").unwrap_or_default()
+    )
+});
 
 fn load_runner(bytes: &[u8]) -> Option<tritium_nn::ModelRunner> {
     let init = tritium_runtime::BACKENDS
@@ -706,6 +716,214 @@ async fn cuda_batched_admission_interleaves_live_slot() {
 
     a_handle.abort(); // measurement done; disconnecting A also exercises retire-on-close
     let _ = b_handle.await;
+}
+
+/// Spawn a streaming chat request, accumulating every SSE delta's content
+/// into the returned shared String (whitespace-separated token ids under the
+/// passthrough tokenizer — parse with `split_whitespace`). Same SSE
+/// reassembly as [`spawn_stream`], collecting text instead of arrival times.
+fn spawn_token_stream(
+    router: &Router,
+    ids: &str,
+    max_tokens: usize,
+) -> (tokio::task::JoinHandle<()>, Arc<std::sync::Mutex<String>>) {
+    let body = serde_json::json!({
+        "model": "tritium",
+        "max_tokens": max_tokens,
+        "stream": true,
+        "messages": [{"role": "user", "content": ids}],
+    });
+    let req = Request::post("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .expect("request");
+    let router = router.clone();
+    let text = Arc::new(std::sync::Mutex::new(String::new()));
+    let sink = text.clone();
+    let handle = tokio::spawn(async move {
+        let resp = router.oneshot(req).await.expect("send");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let mut body = resp.into_body();
+        let mut buf = String::new();
+        while let Some(frame) = body.frame().await {
+            let Ok(frame) = frame else { break };
+            let Some(data) = frame.data_ref() else {
+                continue;
+            };
+            buf.push_str(&String::from_utf8_lossy(data));
+            while let Some(pos) = buf.find("\n\n") {
+                let event: String = buf.drain(..pos + 2).collect();
+                let Some(json_str) = event.trim().strip_prefix("data: ") else {
+                    continue;
+                };
+                if json_str.trim() == "[DONE]" {
+                    continue;
+                }
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) else {
+                    continue;
+                };
+                if let Some(s) = v["choices"][0]["delta"]["content"].as_str() {
+                    sink.lock().expect("text lock").push_str(s);
+                }
+            }
+        }
+    });
+    (handle, text)
+}
+
+/// I0 gate (ADR 0032 L3) — speculative decoding coexists with batch slots
+/// under the "spec-when-solo, migrate-on-admission" contract.
+///
+/// Phase 1 (solo losslessness): one greedy request on a 4-slot batched server
+/// WITH a drafter must stream tokens IDENTICAL to the single-worker spec
+/// server on the same model + drafter. Both run the same single-sequence
+/// prefill + `tree_verify_greedy` ops — this is NOT the batch-decode ulp
+/// domain, so exact equality is the contract (spec is lossless: only target
+/// argmaxes are committed).
+///
+/// Phase 2 (migration): start a spec request, then admit a second request
+/// mid-stream. The spec sequence must migrate into a batch slot (continuation
+/// admission = its full history — the boundary token is bit-guaranteed by the
+/// single-sequence prefill), both requests must complete, and the first
+/// stream must STILL equal the single-worker reference.
+#[tokio::test(flavor = "multi_thread")]
+async fn cuda_batched_spec_solo_matches_single_worker() {
+    if !Path::new(&*GGUF_PATH).exists() {
+        eprintln!("skipping: {} absent (gated real-model test)", *GGUF_PATH);
+        return;
+    }
+    if !Path::new(&*DRAFT_PATH).exists() {
+        eprintln!("skipping: {} absent (gated drafter test)", *DRAFT_PATH);
+        return;
+    }
+    let reference: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(REF_PATH).expect("read reference"))
+            .expect("parse reference");
+    let base: Vec<u32> = reference["token_ids"]
+        .as_array()
+        .expect("token_ids")
+        .iter()
+        .map(|v| v.as_u64().expect("id") as u32)
+        .collect();
+    let bytes = std::fs::read(&*GGUF_PATH).expect("read gguf");
+    let dbytes = std::fs::read(&*DRAFT_PATH).expect("read draft gguf");
+
+    let Some(target) = load_runner(&bytes) else {
+        return;
+    };
+    let draft = load_runner(&dbytes).expect("draft runner");
+    if draft.weights.vocab != target.weights.vocab {
+        eprintln!(
+            "skipping: drafter vocab {} != target vocab {} (--draft-model requires a \
+             shared tokenizer; this drafter is for another target)",
+            draft.weights.vocab, target.weights.vocab
+        );
+        return;
+    }
+
+    let prompt: Vec<u32> = base.iter().cycle().take(16).copied().collect();
+    let horizon = 64usize;
+    let ids = prompt
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    // Single-worker spec reference: the exact loop the batched I0 path
+    // mirrors (generator.rs generate_spec_lookup), driven directly.
+    let mut single = RunnerGenerator::new(target, u32::MAX).with_draft_model(draft);
+    let req = GenRequest {
+        prompt_tokens: prompt.clone(),
+        max_new: horizon,
+        sampling: Sampling::Greedy,
+        stop_eos: false,
+        logprobs: None,
+    };
+    let mut want: Vec<u32> = Vec::new();
+    single
+        .generate(&req, &mut |step| {
+            want.push(step.token);
+            true
+        })
+        .expect("single-worker spec generate");
+    assert_eq!(want.len(), horizon, "reference stream wrong length");
+    drop(single);
+
+    // Batched server (4 slots) WITH the drafter attached.
+    let runner = load_runner(&bytes).expect("runner");
+    let draft = load_runner(&dbytes).expect("draft runner");
+    let tok = Arc::new(IdPassthroughTokenizer::new(128_000, u32::MAX));
+    let cfg = ServeConfig {
+        model_id: "tritium".into(),
+        queue_cap: 32,
+        max_new_default: horizon,
+        ..ServeConfig::default()
+    };
+    let (router, _draining) = build_router_batched_with_draft(runner, draft, u32::MAX, 4, tok, cfg)
+        .expect("batched router");
+
+    // Phase 1 — solo spec on the batched server == single-worker spec,
+    // token for token.
+    let text = chat(&router, &ids, horizon).await;
+    let got: Vec<u32> = text
+        .split_whitespace()
+        .map(|t| t.parse().expect("token id"))
+        .collect();
+    assert_eq!(
+        got, want,
+        "I0 phase 1: solo batched spec stream != single-worker spec stream \
+         (spec must be lossless in batched mode)"
+    );
+
+    // Phase 2 — start a spec request, admit a second request mid-stream.
+    let (a_handle, a_text) = spawn_token_stream(&router, &ids, horizon);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let n = a_text.lock().expect("lock").split_whitespace().count();
+        if n >= 2 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "spec stream never started"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+    // B triggers the migration: A's continuation prefills FIRST (FIFO with
+    // no re-emits), then B admits into another slot; both decode lockstep.
+    let b_ids = base
+        .iter()
+        .cycle()
+        .skip(3)
+        .take(12)
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let b_text = chat(&router, &b_ids, 8).await;
+    let b: Vec<u32> = b_text
+        .split_whitespace()
+        .map(|t| t.parse().expect("token id"))
+        .collect();
+    assert_eq!(b.len(), 8, "I0 phase 2: admitted request must complete");
+    a_handle.await.expect("join spec stream");
+    let a: Vec<u32> = a_text
+        .lock()
+        .expect("lock")
+        .split_whitespace()
+        .map(|t| t.parse().expect("token id"))
+        .collect();
+    let migrated_at = a.iter().zip(&want).take_while(|(x, y)| x == y).count();
+    assert_eq!(a.len(), horizon, "I0 phase 2: spec stream wrong length");
+    assert_eq!(
+        a, want,
+        "I0 phase 2: migration must preserve exact greedy (agreed for \
+         {migrated_at}/{horizon} tokens)"
+    );
+    println!(
+        "I0: solo spec == single worker ({horizon} tokens); migration mid-stream \
+         preserved the stream exactly (B admitted and completed, {} tokens)",
+        b.len()
+    );
 }
 
 /// Throughput bench (run explicitly): aggregate tok/s of N concurrent
