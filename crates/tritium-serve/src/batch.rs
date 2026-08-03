@@ -62,6 +62,41 @@
 //! (both own the single-sequence KV — the C4 serialized-ownership contract:
 //! admissions clobber the prefill staging area).
 //!
+//! **Multi-slot speculative decoding (ADR 0032 L3, the serve wiring of the
+//! I1–I4 engine rungs)**: with `--draft-model`, whenever EVERY live sequence
+//! is greedy + logprob-free and no tree session is open (the v1 all-or-nothing
+//! pool), the worker replaces the lockstep step with a batched spec ROUND:
+//! [`draft_batch`](tritium_nn::ModelRunner::draft_batch) drafts all live slots
+//! in `k` lockstep drafter steps (the I1 host-fed path — `TRITIUM_DRAFT_CHAIN`
+//! is single-sequence-only and does not apply here; `TRITIUM_DRAFT_K` selects
+//! the per-slot policy at enrollment), each slot's chain becomes a chain tree
+//! rooted at its last committed token (exactly the solo `spec_cycle` shape),
+//! and ONE [`tree_verify_greedy_slots`](tritium_nn::ModelRunner::tree_verify_greedy_slots)
+//! forward verifies them all (I4 — the f16 LM-head read amortized N-wide).
+//! Committed tokens are per-slot target argmaxes — lossless, exactly the solo
+//! stream. The DRAFTER carries its own `BatchKv` (one row per target slot,
+//! dense — the drafter is small): a slot is *enrolled* by prefilling its
+//! committed history through the drafter's single-sequence KV and adopting it
+//! into the row; after each verify the drafter row rolls BACK to its accepted
+//! prefix (`set_position`) and any 1-token feed gap (a fully-accepted chain's
+//! last draft is drafted-never-fed) is closed by a masked k=1 `draft_batch`
+//! step. **Per-slot k policy (v1)**: shared `k` = the minimum of the live
+//! slots' `DraftPolicy` lengths, clamped so `Σ mᵣ = N·(1+k) <= 48` (the I4
+//! one-bucket cap) — one verify group always suffices; per-slot budget/ctx
+//! clamps then truncate individual chains (the overfed drafter rows are
+//! rolled back). **Fallback discipline**: any draft/verify device error, page
+//! exhaustion, or capacity edge quietly falls back to a lockstep step for the
+//! round and drops the drafter pool state (target rows only ever hold
+//! COMMITTED tokens between rounds, so lockstep resumes seamlessly); a
+//! non-eligible admission (sampled/logprobs request, tree open) does the same
+//! for as long as it lives — v1 has no mixed pool. Re-entry re-enrolls from
+//! the per-slot histories. Spec rounds coexist with a chunked admission
+//! prefill (they never touch the single-sequence KV), so a request admitted
+//! mid-flight joins the spec pool on adoption. Exactly-solo ADMISSIONS still
+//! take the I0 `SpecSeq` path above (empty-pool contract unchanged); a pool
+//! that drains down to one live slot keeps running multi rounds with N=1
+//! (same committed stream — the I2 gate pins slot-verify == single-seq).
+//!
 //! Remaining phase-2 cost: free slots still burn their dense GEMM rows.
 
 use std::sync::Arc;
@@ -194,6 +229,10 @@ impl Pending {
 /// One live request occupying a slot.
 struct Active {
     tx: mpsc::Sender<GenEvent>,
+    /// Unique per-admission id (multi-slot spec enrollment validity: a
+    /// drafter row enrolled for a RETIRED occupant must never serve the
+    /// row's next tenant — see [`SpecSlot::owner`]).
+    id: u64,
     sampling: Sampling,
     /// Top-k logprobs per token, when the request asked.
     logprobs: Option<usize>,
@@ -202,6 +241,11 @@ struct Active {
     remaining: usize,
     /// The last sampled token — fed to the model on the next step.
     last_token: u32,
+    /// Prompt + every sampled token (the last element is `last_token`, the
+    /// emitted-but-not-yet-fed pending token — the `SpecSeq` invariant).
+    /// Maintained in BOTH modes so a slot can (re-)enroll into the
+    /// multi-slot spec pool at any point (the drafter re-prefills from it).
+    history: Vec<u32>,
     /// Per-request draw counter (salts the deterministic sampler stream).
     /// NOTE: the batched sampler stream (splitmix64 over (seed, salt)) is
     /// distribution-equal but NOT stream-equal to the single-request path's
@@ -503,6 +547,369 @@ fn migrate_spec(
     })
 }
 
+/// The I4 batched-slots verify's one-bucket node cap — mirrors tritium-cuda's
+/// private `TREE_BUCKET_MAX`. Kept local on purpose: if the engine cap ever
+/// changes downward, the verify refuses loudly and the round falls back to
+/// lockstep (slow, never wrong).
+const TREE_NODE_CAP: usize = 48;
+
+/// Drafter-side state of the multi-slot spec pool (module docs, "Multi-slot
+/// speculative decoding"). Exists only across CONSECUTIVE spec rounds: any
+/// lockstep round, fallback, drain, or fully-emptied pool drops it, and
+/// re-entry re-enrolls from the slots' histories.
+struct SpecPool {
+    /// The DRAFT runner's batch KV — one row per target slot, dense (the
+    /// drafter is small; `slots × draft_ctx` KV is cheap).
+    dbatch: tritium_cuda::BatchKv,
+    /// Per-row enrollment; `None` = the drafter holds nothing valid for the
+    /// row. Length = target slot count.
+    slots: Vec<Option<SpecSlot>>,
+}
+
+/// One enrolled drafter row. The row's valid-KV watermark is
+/// `dbatch.positions()[row]` (KV rows `[0, watermark)` hold the owner's
+/// `history[..watermark]`); the per-round reconcile keeps
+/// `watermark <= history.len() - 1` with a gap of at most one token.
+struct SpecSlot {
+    /// The [`Active::id`] this enrollment is valid for — a row reused by a
+    /// new admission re-enrolls instead of trusting a dead tenant's KV.
+    owner: u64,
+    /// Per-slot adaptive draft-length policy (`TRITIUM_DRAFT_K`), seeded
+    /// fresh at enrollment. Draft length never affects the stream
+    /// (losslessness), so policy state is purely a cost knob.
+    policy: DraftPolicy,
+}
+
+/// What one multi-slot spec round attempt did.
+enum MultiOutcome {
+    /// The round ran: drafts verified, committed tokens emitted.
+    Ran,
+    /// Machinery unavailable this round (capacity edge, page exhaustion, or
+    /// a device error — logged when it is an error): the caller drops the
+    /// pool state and falls through to a lockstep step. Streams unaffected —
+    /// target rows only ever hold committed tokens between rounds.
+    Fallback,
+    /// A condition that will not heal (no drafter resident decoder, bad
+    /// `TRITIUM_DRAFT_K` env): disable multi-slot spec for the worker's
+    /// lifetime instead of retry-spamming the log.
+    Disable,
+}
+
+/// One multi-slot spec round (module docs, "Multi-slot speculative
+/// decoding"): enroll → close drafter feed gaps → batched draft (I1) →
+/// grouped multi-slot verify (I4) → per-slot commit/emit + drafter rollback.
+/// The caller has already established eligibility (every live slot greedy +
+/// logprob-free, no tree session) and `PHASE_DECODE`.
+///
+/// Lossless by construction: every emitted token is the target's own greedy
+/// argmax on the slot path (I2 pins slot-verify == single-sequence verify,
+/// I4 pins batched == sequential slots, I1 pins batched drafts == chained
+/// drafts — and draft content never changes the committed stream).
+#[allow(clippy::too_many_lines)] // one round, straight-line; splitting hides the state flow
+fn multi_spec_round(
+    runner: &mut tritium_nn::ModelRunner,
+    draft: &mut tritium_nn::ModelRunner,
+    batch: &mut tritium_cuda::BatchKv,
+    multi: &mut Option<SpecPool>,
+    pool: &mut [Option<Active>],
+    eos: u32,
+    n_ctx: usize,
+) -> MultiOutcome {
+    let slots = pool.len();
+    let rows: Vec<usize> = (0..slots).filter(|&r| pool[r].is_some()).collect();
+    let n_live = rows.len();
+    // Even k=1 chains cost 2 nodes per slot; past the cap the one-bucket
+    // verify cannot hold everyone. (Realistic pools are far smaller; a
+    // grouped-rounds variant is the measured follow-up if ever needed.)
+    if n_live == 0 || 2 * n_live > TREE_NODE_CAP {
+        return MultiOutcome::Fallback;
+    }
+
+    // Build the drafter pool lazily (first eligible round, or re-entry after
+    // a fallback). A drafter without the resident decoder can never draft
+    // batched — disable rather than rebuild-spam.
+    if multi.is_none() {
+        match draft.new_batch(slots) {
+            Ok(dbatch) => {
+                *multi = Some(SpecPool {
+                    dbatch,
+                    slots: (0..slots).map(|_| None).collect(),
+                });
+            }
+            Err(e) => {
+                eprintln!(
+                    "tritium-serve: multi-slot spec disabled — drafter batch pool: {e}"
+                );
+                return MultiOutcome::Disable;
+            }
+        }
+    }
+    let mp = multi.as_mut().expect("built above");
+    let draft_ctx = draft.config.n_ctx as usize;
+
+    // Enroll rows the drafter does not hold (fresh admissions, reused rows,
+    // re-entry after a fallback): prefill the slot's committed history
+    // (minus the pending token) through the drafter's single-sequence KV and
+    // adopt it into the row. v1 all-or-nothing: a row that cannot enroll
+    // (drafter context too small for its history) flips the whole pool back
+    // to lockstep — quiet, it is a capacity condition, not an error.
+    for &r in &rows {
+        let a = pool[r].as_ref().expect("row in rows is live");
+        if mp.slots[r].as_ref().is_some_and(|s| s.owner == a.id) {
+            continue;
+        }
+        mp.slots[r] = None;
+        let policy = match DraftPolicy::from_env() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("tritium-serve: multi-slot spec disabled — {e}");
+                return MultiOutcome::Disable;
+            }
+        };
+        let p = a.history.len() - 1;
+        if p + 2 >= draft_ctx {
+            return MultiOutcome::Fallback;
+        }
+        draft.reset();
+        let positions: Vec<usize> = (0..p).collect();
+        let enrolled = draft
+            .forward(&a.history[..p], &positions)
+            .map_err(|e| e.to_string())
+            .and_then(|_| {
+                draft
+                    .adopt_into_batch_row(&mut mp.dbatch, r, p)
+                    .map_err(|e| e.to_string())
+            })
+            .and_then(|()| mp.dbatch.set_position(r, p).map_err(|e| e.to_string()));
+        if let Err(e) = enrolled {
+            eprintln!("tritium-serve: multi-slot spec enrollment (row {r}): {e}");
+            return MultiOutcome::Fallback;
+        }
+        mp.slots[r] = Some(SpecSlot {
+            owner: a.id,
+            policy,
+        });
+    }
+
+    // Close per-row drafter feed gaps: after a fully-accepted round the
+    // chain's last draft was drafted-never-fed (the draft_batch KV
+    // contract), leaving `watermark = p - 1`; feed `history[watermark]` via
+    // one masked k=1 draft_batch step (the batched analogue of the solo
+    // path's gap `forward`). Gaps are <= 1 by the reconcile below, so this
+    // loop runs at most twice; a gap that will not close is a logic error —
+    // fall back rather than wedge.
+    for guard in 0.. {
+        let mut feeds = vec![0u32; slots];
+        let mut any_gap = false;
+        for r in 0..slots {
+            let gap_feed = pool[r].as_ref().and_then(|a| {
+                mp.slots[r].as_ref()?;
+                let dpos = mp.dbatch.positions()[r];
+                let p = a.history.len() - 1;
+                debug_assert!(dpos <= p, "drafter watermark past pending");
+                (dpos < p).then(|| a.history[dpos])
+            });
+            if mp.dbatch.set_live(r, gap_feed.is_some()).is_err() {
+                return MultiOutcome::Fallback;
+            }
+            if let Some(t) = gap_feed {
+                feeds[r] = t;
+                any_gap = true;
+            }
+        }
+        if !any_gap {
+            break;
+        }
+        if guard >= 3 {
+            eprintln!("tritium-serve: multi-slot spec gap did not close; lockstep round");
+            return MultiOutcome::Fallback;
+        }
+        if let Err(e) = draft.draft_batch(&mut mp.dbatch, &feeds, 1, eos) {
+            eprintln!("tritium-serve: multi-slot spec gap feed: {e}");
+            return MultiOutcome::Fallback;
+        }
+    }
+
+    // Shared draft length (the v1 policy, module docs): min over the live
+    // slots' policy lengths, clamped by every enrolled row's drafter-context
+    // room (draft_batch's own guard) and by the I4 one-bucket cap
+    // (`N·(1+k) <= 48` — one verify group always suffices). Per-slot
+    // budget/target-room clamps are applied by TRUNCATING chains below (the
+    // overfed drafter rows roll back), so one slot near its end never drags
+    // the whole pool to k=0.
+    let mut k = TREE_NODE_CAP / n_live - 1;
+    for &r in &rows {
+        let a = pool[r].as_ref().expect("live");
+        let slot = mp.slots[r].as_ref().expect("enrolled above");
+        let p = a.history.len() - 1;
+        k = k
+            .min(slot.policy.len())
+            .min(draft_ctx.saturating_sub(p).saturating_sub(1));
+    }
+    if k == 0 {
+        return MultiOutcome::Fallback; // drafter room exhausted: plain steps carry on
+    }
+    // Per-slot chain caps: committed (<= drafts + 1) must fit the emission
+    // budget, and the verify needs pos + 1 + d <= n_ctx (the solo
+    // spec_cycle's clamps, per slot).
+    let d_max: Vec<usize> = (0..slots)
+        .map(|r| {
+            pool[r].as_ref().map_or(0, |a| {
+                // The verify needs pos + 1 + d <= n_ctx (pos = p), i.e.
+                // d <= n_ctx - history.len() — the solo spec_cycle's kv_room.
+                let p = a.history.len() - 1;
+                k.min(a.remaining.saturating_sub(1))
+                    .min(n_ctx.saturating_sub(p + 1))
+            })
+        })
+        .collect();
+
+    // Batched draft (I1): rows with a zero chain cap are masked dead (their
+    // tree is the 1-node root — a plain step through the shared verify).
+    let mut feeds = vec![0u32; slots];
+    let mut any_draft = false;
+    for r in 0..slots {
+        let drafting = pool[r].is_some() && d_max[r] > 0;
+        if mp.dbatch.set_live(r, drafting).is_err() {
+            return MultiOutcome::Fallback;
+        }
+        if drafting {
+            feeds[r] = *pool[r]
+                .as_ref()
+                .expect("drafting row is live")
+                .history
+                .last()
+                .expect("history holds the prompt");
+            any_draft = true;
+        }
+    }
+    let chains: Vec<Vec<u32>> = if any_draft {
+        match draft.draft_batch(&mut mp.dbatch, &feeds, k, eos) {
+            Ok(c) => c,
+            Err(e) => {
+                // Mid-draft device errors leave the drafter unreconcilable
+                // (fed tokens the host never saw); dropping the pool forces
+                // re-enrollment — the documented recovery.
+                eprintln!("tritium-serve: multi-slot draft_batch: {e}");
+                return MultiOutcome::Fallback;
+            }
+        }
+    } else {
+        vec![Vec::new(); slots]
+    };
+
+    // Build each slot's chain tree (the solo spec_cycle shape: root = the
+    // pending token, then the chain, parents i-1). `fed[r]` = tokens
+    // draft_batch fed (= the FULL chain length — the last drafted id is
+    // never fed); the tree may be shorter (budget/ctx truncation).
+    let mut trees: Vec<(usize, Vec<u32>, Vec<i32>)> = Vec::with_capacity(n_live);
+    let mut fed = vec![0usize; slots];
+    for &r in &rows {
+        let a = pool[r].as_ref().expect("live");
+        fed[r] = chains[r].len();
+        let take = d_max[r].min(chains[r].len());
+        let mut tokens = Vec::with_capacity(1 + take);
+        tokens.push(*a.history.last().expect("history holds the prompt"));
+        tokens.extend(&chains[r][..take]);
+        let parents: Vec<i32> = (0..tokens.len() as i32).map(|i| i - 1).collect();
+        trees.push((r, tokens, parents));
+    }
+
+    // Verify in groups of Σ m <= 48 and reconcile each group before the
+    // next. With the equal-split k clamp ONE group always suffices; the loop
+    // is defensive (and ready for a future per-slot k).
+    let mut start = 0usize;
+    while start < trees.len() {
+        let mut end = start;
+        let mut m_sum = 0usize;
+        while end < trees.len() && m_sum + trees[end].1.len() <= TREE_NODE_CAP {
+            m_sum += trees[end].1.len();
+            end += 1;
+        }
+        debug_assert!(end > start, "k clamp guarantees every chain fits a bucket");
+        let group = &trees[start..end];
+        for &(r, ref tokens, _) in group {
+            if batch.set_live(r, true).is_err() {
+                return MultiOutcome::Fallback;
+            }
+            if batch.paged() {
+                // Exact batched-slots demand is prefix + m (I4 pads write
+                // nothing), which the admission's prompt+max_new reservation
+                // already covers — this reserve is a defensive no-op that
+                // turns a bookkeeping bug into a slow round, not a wedge.
+                let need = batch.positions()[r] + tokens.len();
+                if batch.reserve_pages(r, need).is_err() {
+                    eprintln!("tritium-serve: multi-slot verify page reserve (row {r})");
+                    return MultiOutcome::Fallback;
+                }
+            }
+        }
+        let group_rows: Vec<usize> = group.iter().map(|&(r, ..)| r).collect();
+        let group_trees: Vec<(&[u32], &[i32])> = group
+            .iter()
+            .map(|(_, t, p)| (t.as_slice(), p.as_slice()))
+            .collect();
+        let outs = match runner.tree_verify_greedy_slots(batch, &group_rows, &group_trees) {
+            Ok(o) => o,
+            Err(e) => {
+                // Refusals are atomic (no listed slot changed) and device
+                // errors never touch other rows' committed KV: lockstep
+                // resumes from the last committed tokens either way.
+                eprintln!("tritium-serve: multi-slot tree verify: {e}");
+                return MultiOutcome::Fallback;
+            }
+        };
+
+        // Per-slot reconcile: policy fold, drafter rollback to the accepted
+        // prefix, then emit every committed token (EOS/budget truncate +
+        // retire exactly like the lockstep emit path).
+        for (&(r, ref tokens, _), committed) in group.iter().zip(outs) {
+            let offered = tokens.len() - 1;
+            let l = committed.len();
+            if l == 0 {
+                eprintln!("tritium-serve: multi-slot verify returned an empty commit");
+                return MultiOutcome::Fallback;
+            }
+            SPEC_VERIFIES.fetch_add(1, Ordering::Relaxed);
+            SPEC_COMMITTED.fetch_add(l as u64, Ordering::Relaxed);
+            let slot = mp.slots[r].as_mut().expect("enrolled above");
+            slot.policy.update(offered, l - 1);
+            let a = pool[r].as_mut().expect("live");
+            let p = a.history.len() - 1; // PRE-commit pending position
+            if fed[r] > 0 {
+                // draft_batch fed [pending, chain[..fed-1]]; feeds matching
+                // the now-committed history are `1 + min(l-1, fed-1)` (the
+                // accepted prefix). Rolling back to exactly that leaves a
+                // gap of at most one token (l <= fed + 1), closed next
+                // round.
+                let matched = 1 + (l - 1).min(fed[r] - 1);
+                if mp.dbatch.set_position(r, p + matched).is_err() {
+                    return MultiOutcome::Fallback;
+                }
+            }
+            let mut retire = false;
+            for &c in &committed {
+                a.history.push(c);
+                a.last_token = c;
+                if !emit(a, c, eos, &[]) {
+                    // Finished (EOS/budget) or client gone: retire the slot
+                    // and its enrollment; later committed tokens (past an
+                    // accepted EOS) are dropped with it.
+                    retire = true;
+                    break;
+                }
+            }
+            if retire {
+                pool[r] = None;
+                mp.slots[r] = None;
+                release_slot(batch, r);
+            }
+        }
+        start = end;
+    }
+    MultiOutcome::Ran
+}
+
 /// The batched worker loop: owns the runner and the job queue receiver.
 /// Runs on a dedicated OS thread (the model is `Send`, not `Sync`).
 ///
@@ -582,6 +989,15 @@ pub(crate) fn run_batched(
     // `tree_open` (both own the single-sequence KV) and — by the migration
     // rule — with any occupied pool slot or in-flight `pending`.
     let mut spec: Option<SpecSeq> = None;
+    // Multi-slot spec pool state (module docs). Valid only across
+    // CONSECUTIVE spec rounds — any lockstep round, drain, or emptied pool
+    // drops it (re-entry re-enrolls from the slots' histories); enrollment
+    // ownership is additionally pinned per Active id, so a stale pool can
+    // never serve a row's next tenant.
+    let mut multi: Option<SpecPool> = None;
+    let mut multi_disabled = false;
+    // Monotonic Active ids (enrollment ownership).
+    let mut next_active_id: u64 = 0;
 
     loop {
         // Graceful drain (mirrors the single worker): cancel in-flight
@@ -605,6 +1021,7 @@ pub(crate) fn run_batched(
             if let Some(s) = spec.take() {
                 let _ = s.tx.try_send(GenEvent::Error("server draining".into()));
             }
+            multi = None; // drained slots take their enrollments with them
             tree_open = false;
             match parked.take() {
                 None => {}
@@ -951,14 +1368,17 @@ pub(crate) fn run_batched(
                                         let _ = tx.try_send(GenEvent::Error(e));
                                         release_slot(&mut batch, row);
                                     } else {
+                                        next_active_id += 1;
                                         let mut active = Active {
                                             tx,
+                                            id: next_active_id,
                                             logprobs: req.logprobs,
                                             stop_eos: req.stop_eos,
                                             remaining: max_new,
                                             last_token: 0,
                                             salt: 0,
                                             sampling: req.sampling,
+                                            history: req.prompt_tokens,
                                         };
                                         active.salt += 1;
                                         let mut adopted = false;
@@ -968,6 +1388,7 @@ pub(crate) fn run_batched(
                                             (req_seed(&active.sampling), active.salt),
                                         ) {
                                             active.last_token = first;
+                                            active.history.push(first);
                                             if emit(&mut active, first, eos, &logits) {
                                                 pool[row] = Some(active);
                                                 adopted = true;
@@ -1100,8 +1521,40 @@ pub(crate) fn run_batched(
         }
 
         if !pool.iter().any(Option::is_some) {
+            multi = None; // an emptied pool takes its enrollments with it
             continue; // nothing live (a pending admission loops straight back
             // to its next chunk; a fully idle pool back to the blocking recv)
+        }
+
+        // Multi-slot spec round (module docs): eligible when a drafter is
+        // attached, no tree session is open, and EVERY live request is
+        // greedy + logprob-free (v1 all-or-nothing pool — one non-eligible
+        // admission puts everyone on lockstep until it retires). A pending
+        // chunked prefill does NOT block rounds: spec rounds never touch the
+        // single-sequence KV, so admissions interleave exactly as with
+        // lockstep (C1). Any fallback runs a lockstep step this round —
+        // target rows only ever hold committed tokens between rounds, so
+        // the switch is seamless and lossless.
+        phase.store(PHASE_DECODE, Ordering::Release);
+        let multi_eligible = !multi_disabled
+            && draft.is_some()
+            && !tree_open
+            && pool
+                .iter()
+                .flatten()
+                .all(|a| matches!(a.sampling, Sampling::Greedy) && a.logprobs.is_none());
+        if multi_eligible {
+            let d = draft.as_mut().expect("eligibility requires a drafter");
+            match multi_spec_round(&mut runner, d, &mut batch, &mut multi, &mut pool, eos, n_ctx) {
+                MultiOutcome::Ran => continue,
+                MultiOutcome::Fallback => multi = None,
+                MultiOutcome::Disable => {
+                    multi = None;
+                    multi_disabled = true;
+                }
+            }
+        } else {
+            multi = None;
         }
 
         // One lockstep decode step. Free slots are marked dead (C2): the
@@ -1109,7 +1562,6 @@ pub(crate) fn run_batched(
         // their pad-token outputs are ignored. Liveness is re-derived from
         // the pool every step (self-healing; adoption/retirement need no
         // separate bookkeeping).
-        phase.store(PHASE_DECODE, Ordering::Release);
         let tokens: Vec<u32> = pool
             .iter()
             .map(|s| s.as_ref().map_or(0, |a| a.last_token))
@@ -1147,6 +1599,7 @@ pub(crate) fn run_batched(
                 continue;
             };
             active.last_token = tok;
+            active.history.push(tok);
             if !emit(active, tok, eos, &all_logits[row]) {
                 *slot = None;
                 release_slot(&mut batch, row);

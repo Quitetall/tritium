@@ -937,6 +937,262 @@ async fn cuda_batched_spec_solo_matches_single_worker() {
     );
 }
 
+/// Multi-slot spec gate (ADR 0032 L3 serve wiring of I1+I4) — N concurrent
+/// greedy requests on a `--batch-slots 3 --draft-model` worker decode via
+/// batched draft → grouped multi-slot tree verify → per-slot commit rounds,
+/// and EVERY stream is token-identical to the single-worker spec path run
+/// sequentially (the I0 gate's comparison pattern, extended to N=3). This is
+/// NOT the batch-decode ulp domain: adoption copies the single-sequence
+/// prefill bit-exactly, slot tree-verifies are engine-gated identical to the
+/// single-sequence verify (I2/I4), and drafts never affect committed tokens
+/// (losslessness) — so exact equality is the contract.
+///
+/// Phase A (concurrent): three different prompts submitted together — the
+/// first admission takes the I0 solo path, the second triggers migration,
+/// and the pool then runs multi-slot rounds; all three streams must equal
+/// their references exactly. Teeth against a silent lockstep fallback: the
+/// lockstep path never bumps the spec counters, so most of the 3×horizon
+/// tokens must have been committed by spec verifies.
+///
+/// Phase B (staggered admission): A+B mid-flight in multi-spec, C arrives —
+/// C admits into the spec pool through the chunked prefill (spec rounds
+/// coexist with admissions) and all three streams stay exact.
+///
+/// Phase C (EOS mid-round): a server whose eos is a token known to appear
+/// mid-stream in reference 0. Spec is lossless, so the greedy stream is
+/// eos-independent and `stop_eos` only truncates it — the affected stream
+/// must stop exactly at the first eos occurrence (emitted, then retired
+/// mid-round) while the survivors run to their full horizon.
+#[tokio::test(flavor = "multi_thread")]
+async fn cuda_batched_spec_multi_matches_single_worker() {
+    if !Path::new(&*GGUF_PATH).exists() {
+        eprintln!("skipping: {} absent (gated real-model test)", *GGUF_PATH);
+        return;
+    }
+    if !Path::new(&*DRAFT_PATH).exists() {
+        eprintln!("skipping: {} absent (gated drafter test)", *DRAFT_PATH);
+        return;
+    }
+    let reference: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(REF_PATH).expect("read reference"))
+            .expect("parse reference");
+    let base: Vec<u32> = reference["token_ids"]
+        .as_array()
+        .expect("token_ids")
+        .iter()
+        .map(|v| v.as_u64().expect("id") as u32)
+        .collect();
+    let bytes = std::fs::read(&*GGUF_PATH).expect("read gguf");
+    let dbytes = std::fs::read(&*DRAFT_PATH).expect("read draft gguf");
+
+    let Some(target) = load_runner(&bytes) else {
+        return;
+    };
+    let draft = load_runner(&dbytes).expect("draft runner");
+    if draft.weights.vocab != target.weights.vocab {
+        eprintln!(
+            "skipping: drafter vocab {} != target vocab {} (--draft-model requires a \
+             shared tokenizer; this drafter is for another target)",
+            draft.weights.vocab, target.weights.vocab
+        );
+        return;
+    }
+
+    let horizon = 48usize;
+    // Three DIFFERENT prompts (lengths 16/19/22, distinct rotations).
+    let prompts: Vec<Vec<u32>> = (0..3usize)
+        .map(|i| {
+            base.iter()
+                .cycle()
+                .skip(2 * i)
+                .take(16 + 3 * i)
+                .copied()
+                .collect()
+        })
+        .collect();
+    let ids: Vec<String> = prompts
+        .iter()
+        .map(|p| p.iter().map(u32::to_string).collect::<Vec<_>>().join(" "))
+        .collect();
+
+    // Single-worker spec references, run SEQUENTIALLY on one generator (the
+    // production single-worker pattern — generate resets per request).
+    let mut single = RunnerGenerator::new(target, u32::MAX).with_draft_model(draft);
+    let mut want: Vec<Vec<u32>> = Vec::new();
+    for p in &prompts {
+        let req = GenRequest {
+            prompt_tokens: p.clone(),
+            max_new: horizon,
+            sampling: Sampling::Greedy,
+            stop_eos: false,
+            logprobs: None,
+        };
+        let mut out = Vec::new();
+        single
+            .generate(&req, &mut |step| {
+                out.push(step.token);
+                true
+            })
+            .expect("single-worker spec generate");
+        assert_eq!(out.len(), horizon, "reference stream wrong length");
+        want.push(out);
+    }
+    drop(single);
+
+    let parse = |text: &str| -> Vec<u32> {
+        text.split_whitespace()
+            .map(|t| t.parse().expect("token id"))
+            .collect()
+    };
+
+    // Batched server: 3 slots WITH the drafter.
+    let runner = load_runner(&bytes).expect("runner");
+    let draft = load_runner(&dbytes).expect("draft runner");
+    let tok = Arc::new(IdPassthroughTokenizer::new(128_000, u32::MAX));
+    let cfg = ServeConfig {
+        model_id: "tritium".into(),
+        queue_cap: 32,
+        max_new_default: horizon,
+        ..ServeConfig::default()
+    };
+    let (router, _draining) =
+        build_router_batched_with_draft(runner, draft, u32::MAX, 3, tok.clone(), cfg.clone())
+            .expect("batched router");
+
+    // Warm graph captures off the clock.
+    let _ = chat(&router, "128000 791", 2).await;
+
+    // Phase A — three concurrent greedy streams, all exact.
+    let spec_before =
+        tritium_serve::generator::SPEC_COMMITTED.load(std::sync::atomic::Ordering::Relaxed);
+    let handles: Vec<_> = (0..3)
+        .map(|i| {
+            let router = router.clone();
+            let ids = ids[i].clone();
+            tokio::spawn(async move { (i, chat(&router, &ids, horizon).await) })
+        })
+        .collect();
+    for h in handles {
+        let (i, text) = h.await.expect("join");
+        assert_eq!(
+            parse(&text),
+            want[i],
+            "phase A: concurrent stream {i} != single-worker spec stream \
+             (multi-slot spec must be lossless)"
+        );
+    }
+    let spec_delta = tritium_serve::generator::SPEC_COMMITTED
+        .load(std::sync::atomic::Ordering::Relaxed)
+        - spec_before;
+    assert!(
+        spec_delta >= (3 * horizon as u64) / 2,
+        "phase A teeth: only {spec_delta} of {} tokens were committed by spec \
+         verifies — the pool silently fell back to lockstep",
+        3 * horizon
+    );
+
+    // Phase B — staggered admission: A+B mid-flight, C arrives.
+    let (a_handle, a_text) = spawn_token_stream(&router, &ids[0], horizon);
+    let (b_handle, b_text) = spawn_token_stream(&router, &ids[1], horizon);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let na = a_text.lock().expect("lock").split_whitespace().count();
+        let nb = b_text.lock().expect("lock").split_whitespace().count();
+        if na >= 4 && nb >= 4 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "phase B: streams never started"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+    // Teeth (the I0 vacuousness guard): both streams must still have a
+    // healthy tail left when C is fired, or this phase degrades to
+    // "C after A/B finished" and exercises no mid-flight admission.
+    let na = a_text.lock().expect("lock").split_whitespace().count();
+    let nb = b_text.lock().expect("lock").split_whitespace().count();
+    assert!(
+        na + 8 <= horizon && nb + 8 <= horizon,
+        "phase B lost the admission race before it started (A {na}/{horizon}, \
+         B {nb}/{horizon} when C was sent) — gate is vacuous"
+    );
+    let c_text = chat(&router, &ids[2], horizon).await;
+    assert_eq!(
+        parse(&c_text),
+        want[2],
+        "phase B: stream C (admitted mid-multi-spec) != single-worker spec stream"
+    );
+    a_handle.await.expect("join A");
+    b_handle.await.expect("join B");
+    assert_eq!(
+        parse(&a_text.lock().expect("lock")),
+        want[0],
+        "phase B: stream A changed across C's admission"
+    );
+    assert_eq!(
+        parse(&b_text.lock().expect("lock")),
+        want[1],
+        "phase B: stream B changed across C's admission"
+    );
+    drop(router);
+
+    // Phase C — EOS mid-round: eos = a token whose FIRST occurrence in
+    // reference 0 is mid-stream (a token repeated from position 0 would
+    // truncate at the adoption first-token and exercise no mid-round
+    // retirement). Spec losslessness makes the greedy stream eos-independent;
+    // stop_eos truncates it at the first occurrence (which IS emitted — the
+    // tokenizer eos stays u32::MAX so the detok surfaces it).
+    let eos_tok = (8..horizon - 8)
+        .rev()
+        .map(|j| want[0][j])
+        .find(|t| {
+            let first = want[0].iter().position(|x| x == t).expect("t is in want");
+            (8..horizon - 8).contains(&first)
+        })
+        .expect("reference stream has no token first-appearing mid-stream");
+    let expects: Vec<Vec<u32>> = want
+        .iter()
+        .map(|w| {
+            w.iter()
+                .position(|&t| t == eos_tok)
+                .map_or_else(|| w.clone(), |j| w[..=j].to_vec())
+        })
+        .collect();
+    assert!(
+        expects[0].len() >= 8 && expects[0].len() < horizon,
+        "phase C teeth: the EOS must fire mid-stream (fires at {})",
+        expects[0].len()
+    );
+    let runner = load_runner(&bytes).expect("runner");
+    let draft = load_runner(&dbytes).expect("draft runner");
+    let (router, _draining) =
+        build_router_batched_with_draft(runner, draft, eos_tok, 3, tok, cfg)
+            .expect("batched router (eos)");
+    let handles: Vec<_> = (0..3)
+        .map(|i| {
+            let router = router.clone();
+            let ids = ids[i].clone();
+            tokio::spawn(async move { (i, chat(&router, &ids, horizon).await) })
+        })
+        .collect();
+    for h in handles {
+        let (i, text) = h.await.expect("join");
+        assert_eq!(
+            parse(&text),
+            expects[i],
+            "phase C: stream {i} must truncate exactly at the first eos \
+             occurrence (EOS-mid-round retirement)"
+        );
+    }
+    println!(
+        "multi-spec: 3 concurrent == single worker ({horizon} tokens each, \
+         {spec_delta} spec-committed); staggered admission exact; EOS mid-round \
+         truncated stream 0 at {} tokens while the others ran to {horizon}",
+        expects[0].len(),
+    );
+}
+
 /// Throughput bench (run explicitly): aggregate tok/s of N concurrent
 /// requests through an N-slot pool vs the same requests sequentially
 /// through the single-request worker — the number continuous batching exists
