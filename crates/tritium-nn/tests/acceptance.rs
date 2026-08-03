@@ -1513,3 +1513,95 @@ fn cuda_draft_batch_matches_draft_chain() {
         schedule.len()
     );
 }
+
+/// I1 paged leg (review follow-up on 503b520): the `page_mapped(r, p+k-1)`
+/// full-room guard must (a) refuse a draft whose tail outruns the row's page
+/// reservation WITHOUT any partial advance, and (b) once the reservation
+/// covers the draft, produce tokens identical to the single-seq chain even
+/// when the drafted KV crosses a page boundary.
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_draft_batch_paged_guard_and_boundary() {
+    use tritium_cuda::KV_PAGE_TOKENS;
+
+    let _gpu = gpu_serial();
+    if !Path::new(&*DRAFTER_PATH).exists() {
+        eprintln!("skipping: {} absent (gated drafter test)", *DRAFTER_PATH);
+        return;
+    }
+    let bytes = std::fs::read(&*DRAFTER_PATH).expect("read drafter GGUF");
+
+    // A prompt ending 6 tokens shy of the first page boundary, so k=16
+    // crosses into page 2.
+    let base: [u32; 7] = [128000, 791, 6864, 315, 279, 1917, 574];
+    let plen = KV_PAGE_TOKENS - 6;
+    let prompt: Vec<u32> = base.iter().copied().cycle().take(plen).collect();
+    let positions: Vec<usize> = (0..plen).collect();
+    let (k, never) = (16usize, u32::MAX);
+
+    // Reference: single-seq chain over the same history.
+    let (first_tok, expect) = {
+        let Some(mut r) = load_on("cuda", &bytes) else {
+            return;
+        };
+        let l0 = r.forward(&prompt, &positions).expect("ref prefill");
+        let tok = argmax(&l0) as u32;
+        let out = r
+            .decode_greedy_chain(tok, plen, k, never)
+            .expect("ref chain")
+            .expect("resident");
+        (tok, out)
+    };
+    assert_eq!(expect.len(), k, "reference chain must draft k tokens");
+
+    let Some(mut rb) = load_on("cuda", &bytes) else {
+        return;
+    };
+
+    // (a) Pool of exactly ONE page: the prompt fits, the draft tail does
+    // not. The guard must reject up front, leaving position untouched.
+    {
+        let mut batch = rb.new_batch_paged(1, 1).expect("new_batch_paged");
+        batch.reserve_pages(0, plen).expect("reserve prompt");
+        let l0 = rb.forward(&prompt, &positions).expect("prefill");
+        assert_eq!(argmax(&l0) as u32, first_tok, "prefill diverged");
+        rb.adopt_into_batch_row(&mut batch, 0, plen).expect("adopt");
+        batch.set_position(0, plen).expect("set_position");
+        let err = rb
+            .draft_batch(&mut batch, &[first_tok], k, never)
+            .expect_err("draft past the reservation must refuse");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("page-reserved") || msg.contains("page"),
+            "unexpected error: {msg}"
+        );
+        assert_eq!(
+            batch.positions()[0],
+            plen,
+            "a refused draft must not advance the row at all"
+        );
+    }
+
+    // (b) Two pages + an explicit reservation for the draft tail: the k
+    // tokens cross the page boundary and must equal the single-seq chain.
+    rb.reset();
+    let mut batch = rb.new_batch_paged(1, 2).expect("new_batch_paged");
+    batch.reserve_pages(0, plen + k).expect("reserve prompt+draft");
+    let l0 = rb.forward(&prompt, &positions).expect("prefill");
+    assert_eq!(argmax(&l0) as u32, first_tok, "prefill diverged");
+    rb.adopt_into_batch_row(&mut batch, 0, plen).expect("adopt");
+    batch.set_position(0, plen).expect("set_position");
+    let out = rb
+        .draft_batch(&mut batch, &[first_tok], k, never)
+        .expect("paged draft");
+    assert_eq!(
+        out[0], expect,
+        "paged draft across the page boundary diverged from the single-seq chain"
+    );
+    assert_eq!(batch.positions()[0], plen + k, "watermark after paged draft");
+    println!(
+        "draft_batch paged: reservation guard refuses cleanly (no partial \
+         advance); {k}-token draft across the {KV_PAGE_TOKENS}-token page \
+         boundary == single-seq chain"
+    );
+}

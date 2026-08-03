@@ -1009,8 +1009,11 @@ impl CudaDecodeModel {
     ///   reset + re-prefill).
     ///
     /// On a mid-loop step error, liveness is restored and the error is
-    /// returned; positions/KV reflect the steps that completed (the same
-    /// contract as calling `decode_batch_graph_argmax` directly).
+    /// returned; positions/KV reflect the steps that completed, but the
+    /// tokens fed at those steps were internal argmax results the caller
+    /// never saw — the state is NOT reconcilable via `draft_fed`
+    /// bookkeeping, and the only recovery is `reset()` + re-prefill of every
+    /// live row (a device error usually poisons the context anyway).
     ///
     /// # Errors
     /// [`BackendError`] on a length guard, `k` out of range, a per-row
