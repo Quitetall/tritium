@@ -48,7 +48,8 @@ It checks the commit being pushed, not your working tree, so uncommitted work
 never affects the verdict. `TRITIUM_PREPUSH_FMT_ONLY=1 git push` runs just the
 format check; `git push --no-verify` bypasses the hook entirely (CI still runs
 the same gates). The first run compiles the workspace into a dedicated cache
-under `~/.cache/tritium-prepush` and is slow; later runs are incremental.
+under `$XDG_CACHE_HOME/tritium-prepush` (default `~/.cache/tritium-prepush`)
+and is slow; later runs are incremental.
 
 Code behind the GPU-toolkit features (`cuda`, `nccl`, `rocm`, `wgpu`) can be
 type-checked and linted **without any GPU toolkit installed**: set
