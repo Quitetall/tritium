@@ -668,8 +668,12 @@ const TREE_BUCKET_MAX: usize = 48;
 /// Captured verify-trunk graphs + their `[prefix_len, real_m, kv_row_base]`
 /// ctrl buffer (i32[3]; the row base is 0 for the single-seq cache, or
 /// `r · max_ctx` when the graphs were captured against a `BatchKv` arena and
-/// replay targets slot `r` — I2). Graphs bake the owning TreeScratch's buffer
-/// pointers — invalidated (dropped) if that scratch ever re-grows.
+/// replay targets slot `r` — I2). PAGED batches (I3) repurpose ctrl word 2 as
+/// the slot's page-table offset (`r · tstride`) — a paged slot's rows are
+/// page-scattered, so a row base is meaningless and the paged ctrl twins
+/// translate every KV row through the baked `d_table` instead. Graphs bake
+/// the owning TreeScratch's buffer pointers — invalidated (dropped) if that
+/// scratch ever re-grows.
 struct TreeGraphs {
     d_ctrl: CudaSlice<i32>,
     graphs: HashMap<usize, SendGraph>,
@@ -744,6 +748,15 @@ pub struct CudaDecodeModel {
     /// and was the dominant per-verify cost (~150µs/layer at verify context).
     f_attn_tree_scores: CudaFunction,
     f_attn_tree_reduce: CudaFunction,
+    /// I3 paged tree-verify twins (safe handles for the EAGER paged slot
+    /// route; the graph route uses the raw `BatchRawKernels` handles). The
+    /// dense eager route keeps its region-view kernels — a paged slot's rows
+    /// are page-scattered, so the eager paged route launches these ctrl-driven
+    /// kernels with the batch's `d_ctrl` + `d_table` instead (mirroring the
+    /// decode split's per-batch `f_*_paged` handle selection).
+    f_kv_append_tree_paged: CudaFunction,
+    f_attn_tree_scores_ctrl_paged: CudaFunction,
+    f_attn_tree_reduce_ctrl_paged: CudaFunction,
     f_argmax_partial: CudaFunction,
     f_argmax_combine: CudaFunction,
     /// Lazy m=1 argmax scratch for `step_graph_argmax`:

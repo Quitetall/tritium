@@ -145,6 +145,13 @@ pub(super) const DRAFT_CHAIN_MAX: usize = 64;
 pub(super) const ARGMAX_CHUNKS: usize = 16;
 pub(super) const KERNEL_NAME_ATTN_TREE_SCORES_CTRL: &str = "gqa_attention_tree_scores_ctrl_g";
 pub(super) const KERNEL_NAME_ATTN_TREE_REDUCE_CTRL: &str = "gqa_attention_tree_reduce_ctrl_g";
+/// I3 paged tree-verify twins (ADR 0025 page table; ctrl word 2 = the slot's
+/// table offset `row · tstride` instead of a KV row base).
+pub(super) const KERNEL_NAME_KV_APPEND_TREE_PAGED: &str = "kv_append_tree_paged_g";
+pub(super) const KERNEL_NAME_ATTN_TREE_SCORES_CTRL_PAGED: &str =
+    "gqa_attention_tree_scores_ctrl_paged_g";
+pub(super) const KERNEL_NAME_ATTN_TREE_REDUCE_CTRL_PAGED: &str =
+    "gqa_attention_tree_reduce_ctrl_paged_g";
 pub(super) const KERNEL_NAME_ATTN_TREE_REDUCE: &str = "gqa_attention_tree_reduce_g";
 /// Keys per scores-block — keep in sync with `SCORE_CHUNK` in decode.cu.
 pub(super) const ATTN_SCORE_CHUNK: usize = 128;

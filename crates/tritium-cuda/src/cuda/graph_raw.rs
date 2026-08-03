@@ -293,6 +293,12 @@ pub(super) struct BatchRawKernels {
     pub(super) kv_append_tree: sys::CUfunction,
     pub(super) attn_tree_scores_ctrl: sys::CUfunction,
     pub(super) attn_tree_reduce_ctrl: sys::CUfunction,
+    /// I3 paged twins of the three above (ADR 0025): every KV row index is
+    /// translated through the page table; ctrl word 2 carries the slot's
+    /// table offset (`row · tstride`) instead of a KV row base.
+    pub(super) kv_append_tree_paged: sys::CUfunction,
+    pub(super) attn_tree_scores_ctrl_paged: sys::CUfunction,
+    pub(super) attn_tree_reduce_ctrl_paged: sys::CUfunction,
 }
 
 // SAFETY: same contract as `RawGraphKernels` — the raw handles are process-valid device
@@ -349,6 +355,9 @@ impl BatchRawKernels {
             kv_append_tree: get(dm, KERNEL_NAME_KV_APPEND_TREE)?,
             attn_tree_scores_ctrl: get(dm, KERNEL_NAME_ATTN_TREE_SCORES_CTRL)?,
             attn_tree_reduce_ctrl: get(dm, KERNEL_NAME_ATTN_TREE_REDUCE_CTRL)?,
+            kv_append_tree_paged: get(dm, KERNEL_NAME_KV_APPEND_TREE_PAGED)?,
+            attn_tree_scores_ctrl_paged: get(dm, KERNEL_NAME_ATTN_TREE_SCORES_CTRL_PAGED)?,
+            attn_tree_reduce_ctrl_paged: get(dm, KERNEL_NAME_ATTN_TREE_REDUCE_CTRL_PAGED)?,
             modules: vec![dm, am],
         })
     }
@@ -508,11 +517,16 @@ pub struct BatchKv {
     /// verify targets can't invalidate each other's captures.
     pub(super) tree_scratch: Option<TreeScratch>,
     /// I2: per-bucket tree-verify trunk graphs captured against THIS batch's
-    /// dense KV arenas + `tree_scratch`, keyed by bucket like the model's
+    /// KV arenas + `tree_scratch`, keyed by bucket like the model's
     /// single-seq `tree_graphs`. One set serves every slot: the slot's KV row
     /// base rides in the ctrl buffer (`[prefix_len, real_m, kv_row_base]`),
-    /// not in the baked pointers. Holds its own `raw_keepalive` (the
-    /// `TreeGraphs` field), so module lifetime is self-contained.
+    /// not in the baked pointers. Paged batches (I3) capture the PAGED ctrl
+    /// twins instead, with the `d_table` pointer baked (its CONTENT uploaded
+    /// per replay) and ctrl word 2 carrying the slot's table offset
+    /// (`row · tstride`) in place of the row base. The eager paged route
+    /// reuses this struct's `d_ctrl` too (with an empty graph map). Holds its
+    /// own `raw_keepalive` (the `TreeGraphs` field), so module lifetime is
+    /// self-contained.
     pub(super) tree_graphs: Option<TreeGraphs>,
     /// A clone of the model's [`batch_raw`](CudaDecodeModel::batch_raw) `Arc`, taken when
     /// either graph is captured. Keeps the `CUfunction` modules the graphs reference loaded
@@ -625,6 +639,19 @@ impl BatchKv {
     #[must_use]
     pub fn free_pages(&self) -> usize {
         self.pages.as_ref().map_or(0, |p| p.free.len())
+    }
+
+    /// Debug/test access: `row`'s page-table row (logical page index →
+    /// physical page id, `-1` = unmapped); `None` for a dense batch. Lets
+    /// gates assert a mapping is genuinely non-identity (a scrambled-pool
+    /// test that accidentally produced identity pages would be vacuous).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn debug_page_table_row(&self, row: usize) -> Option<Vec<i32>> {
+        self.pages
+            .as_ref()
+            .filter(|_| row < self.n)
+            .map(|pg| pg.table[row * pg.tstride..(row + 1) * pg.tstride].to_vec())
     }
 
     /// Reserve enough pages for `row` to hold `tokens` logical tokens

@@ -290,13 +290,16 @@ impl ModelRunner {
             .map_err(ResidentOpError::Op)
     }
 
-    /// (cuda) I2 batch-slot tree-verify (L3 batch-slot spec decode): the same
-    /// greedy tree verify as [`tree_verify_greedy`](Self::tree_verify_greedy),
-    /// run against dense batch slot `row` of a [`tritium_cuda::BatchKv`] — the
-    /// tree attends the slot's committed rows, the accepted path is promoted
-    /// into the slot's region, and the slot's position advances by the
-    /// accepted length. Other slots' KV is untouched. Requires a dense
-    /// (non-paged) batch, the f32 KV rung, and a live row.
+    /// (cuda) I2/I3 batch-slot tree-verify (L3 batch-slot spec decode): the
+    /// same greedy tree verify as
+    /// [`tree_verify_greedy`](Self::tree_verify_greedy), run against batch
+    /// slot `row` of a [`tritium_cuda::BatchKv`] — the tree attends the
+    /// slot's committed rows, the accepted path is promoted into the slot's
+    /// region, and the slot's position advances by the accepted length.
+    /// Other slots' KV is untouched. Dense and PAGED batches are both
+    /// supported (paged: reserve pages for the prefix + the padded tree
+    /// first, and `head_dim % 4 == 0` is required). Requires the f32 KV rung
+    /// and a live row.
     ///
     /// # Errors
     /// [`ResidentOpError`] — `Unavailable` on a non-CUDA backend, `Op` with

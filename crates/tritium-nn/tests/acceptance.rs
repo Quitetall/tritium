@@ -1969,3 +1969,330 @@ fn cuda_tree_verify_slot_matches_single_seq() {
         );
     }
 }
+
+/// I3 gate (L3 batch-slot spec decode): `tree_verify_greedy_slot` against a
+/// PAGED batch slot must be bit-identical to the SAME verify against a dense
+/// batch slot over the same history — accepted tokens, positions, and KV
+/// bytes read back THROUGH the page translation — under:
+///
+/// - genuinely NON-IDENTITY pages (interleaved reservations scramble the
+///   physical page order; asserted via the table, so the gate can't go
+///   vacuous);
+/// - trees m=2/4/6/8 with the m=8 verify's provisional rows STRADDLING the
+///   first `KV_PAGE_TOKENS` boundary (prompt length tuned so phase 3 lands
+///   at prefix 252: rows 252..260 cross page 0 → 1);
+/// - a reservation-too-short verify that must refuse loudly with ZERO state
+///   change (position, KV bytes, free pages), then succeed after the
+///   reservation is extended;
+/// - other live slots inert (their pre/post drafts equal the dense leg's);
+/// - both the graph route and the eager route (`TRITIUM_TREE_EAGER=1`),
+///   tokens compared across routes too.
+///
+/// Drafter-only: the 2B4T target never loads.
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_tree_verify_paged_slot_matches_dense() {
+    use tritium_cuda::KV_PAGE_TOKENS;
+
+    let _gpu = gpu_serial();
+    if !Path::new(&*DRAFTER_PATH).exists() {
+        eprintln!("skipping: {} absent (gated drafter test)", *DRAFTER_PATH);
+        return;
+    }
+    let bytes = std::fs::read(&*DRAFTER_PATH).expect("read drafter GGUF");
+
+    let base: [u32; 7] = [128000, 791, 6864, 315, 279, 1917, 574];
+    const TARGET: usize = 1;
+    // Tuned so phase 3 (m=8) starts at prefix plen_t + 9 = KV_PAGE_TOKENS - 4
+    // (perfect chains accept fully, the branchy m=6 accepts 3 — asserted
+    // below): provisional rows then straddle the first page boundary.
+    let plen_t = KV_PAGE_TOKENS - 13;
+    let prompts: Vec<Vec<u32>> = vec![
+        base.iter().copied().cycle().take(9).collect(),
+        base.iter().copied().cycle().take(plen_t).collect(),
+        base.iter().copied().cycle().skip(3).take(12).collect(),
+    ];
+    let never = u32::MAX;
+    const PRE: usize = 2;
+    const POST: usize = 4;
+    const KV_LAYERS: [usize; 2] = [0, 7];
+
+    // Reference greedy stream for building the target slot's draft trees
+    // (chains drafted from the true continuation accept deterministically).
+    let want = {
+        let Some(mut r) = load_on("cuda", &bytes) else {
+            return;
+        };
+        r.generate(&prompts[TARGET], 24, never).expect("ref stream")
+    };
+    assert_eq!(want.len(), 24, "reference stream shorter than expected");
+
+    let make_tree = |phase: usize, c: usize, root: u32| -> (Vec<u32>, Vec<i32>) {
+        match phase {
+            0 => (vec![root, want[c]], vec![-1, 0]),
+            1 => (
+                vec![root, want[c], want[c + 1], want[c + 2]],
+                vec![-1, 0, 1, 2],
+            ),
+            2 => {
+                let (r1, r2) = (want[c], want[c + 1]);
+                (
+                    vec![
+                        root,
+                        (r1 + 1) % 128_256,
+                        r1,
+                        (r2 + 7) % 128_256,
+                        r2,
+                        (want[c + 2] + 3) % 128_256,
+                    ],
+                    vec![-1, 0, 0, 2, 2, 4],
+                )
+            }
+            _ => {
+                let mut t = vec![root];
+                t.extend(want[c..c + 6].iter().copied());
+                t.push((want[c + 6] + 5) % 128_256);
+                (t, (0..8i32).map(|i| i - 1).collect())
+            }
+        }
+    };
+
+    // Per route: (accepted per phase, post-draft outs for all rows).
+    type RouteTokens = (Vec<Vec<u32>>, Vec<Vec<u32>>);
+    let mut route_tokens: Vec<RouteTokens> = Vec::new();
+
+    for eager in [false, true] {
+        let _guard = TreeEagerGuard;
+        if eager {
+            // SAFETY: single-threaded test process (see TreeEagerGuard).
+            #[allow(unsafe_code)]
+            unsafe {
+                std::env::set_var("TRITIUM_TREE_EAGER", "1");
+            }
+        }
+
+        let Some(mut rb) = load_on("cuda", &bytes) else {
+            return;
+        };
+        let mut dense = rb.new_batch(3).expect("new_batch");
+        // Pool sized EXACTLY: 1 (target head) + 1 (slot 0) + 1 (slot 2) + 1
+        // (target tail) — asserted drained below.
+        let mut paged = rb.new_batch_paged(3, 4).expect("new_batch_paged");
+
+        // Interleaved reservations scramble the physical pages: the target's
+        // logical page 0 takes physical 0, but its logical page 1 is handed
+        // out only AFTER slots 0/2 take physicals 1/2 — non-identity AND
+        // non-contiguous.
+        paged.reserve_pages(TARGET, 1).expect("reserve target head");
+        paged.reserve_pages(0, 32).expect("reserve slot 0");
+        paged.reserve_pages(2, 32).expect("reserve slot 2");
+        paged
+            .reserve_pages(TARGET, plen_t + 24)
+            .expect("reserve target tail");
+        assert_eq!(paged.free_pages(), 0, "pool sizing drifted");
+        let trow = paged
+            .debug_page_table_row(TARGET)
+            .expect("paged batch has a table");
+        assert!(
+            trow.iter()
+                .enumerate()
+                .any(|(i, &p)| p >= 0 && p as usize != i),
+            "vacuous gate: target slot's pages are identity-mapped ({trow:?})"
+        );
+
+        // Prefill each prompt once; adopt the SAME single-seq cache into the
+        // dense slot and (through the page spans) the paged slot.
+        let mut first_toks = [0u32; 3];
+        for (r, prompt) in prompts.iter().enumerate() {
+            rb.reset();
+            let positions: Vec<usize> = (0..prompt.len()).collect();
+            let l0 = rb.forward(prompt, &positions).expect("batch prefill");
+            first_toks[r] = argmax(&l0) as u32;
+            for b in [&mut dense, &mut paged] {
+                rb.adopt_into_batch_row(b, r, prompt.len()).expect("adopt");
+                b.set_position(r, prompt.len()).expect("set_position");
+            }
+        }
+        assert_eq!(first_toks[TARGET], want[0], "target prefill vs reference");
+
+        // Pre-verify drafting on the OTHER rows (target dead: frozen
+        // position, zero KV bytes — identical schedule on both batches).
+        let mut pre_feeds = first_toks;
+        pre_feeds[TARGET] = 0;
+        for b in [&mut dense, &mut paged] {
+            b.set_live(TARGET, false).expect("set_live dead");
+        }
+        let pre_d = rb
+            .draft_batch(&mut dense, &pre_feeds, PRE, never)
+            .expect("dense pre draft");
+        let pre_p = rb
+            .draft_batch(&mut paged, &pre_feeds, PRE, never)
+            .expect("paged pre draft");
+        assert_eq!(pre_d, pre_p, "paged pre-draft != dense pre-draft");
+        for b in [&mut dense, &mut paged] {
+            b.set_live(TARGET, true).expect("set_live revive");
+        }
+
+        // The 4 verifies, dense slot then paged slot, phase by phase.
+        let mut committed: Vec<u32> = vec![first_toks[TARGET]];
+        let mut accepted: Vec<Vec<u32>> = Vec::new();
+        for phase in 0..4 {
+            if phase == 3 {
+                let p3 = paged.positions()[TARGET];
+                assert!(
+                    p3 < KV_PAGE_TOKENS && p3 + 8 > KV_PAGE_TOKENS,
+                    "phase-3 provisional rows must straddle the page boundary \
+                     (prefix {p3}, page {KV_PAGE_TOKENS}) — retune plen_t"
+                );
+            }
+            let (t, p) = make_tree(
+                phase,
+                committed.len(),
+                *committed.last().expect("non-empty"),
+            );
+            let out_d = rb
+                .tree_verify_greedy_slot(&mut dense, TARGET, &t, &p)
+                .expect("dense slot verify");
+            let out_p = rb
+                .tree_verify_greedy_slot(&mut paged, TARGET, &t, &p)
+                .expect("paged slot verify");
+            assert_eq!(
+                out_p, out_d,
+                "paged accepted tokens != dense (phase {phase}, eager {eager})"
+            );
+            committed.extend(&out_d);
+            assert_eq!(
+                paged.positions()[TARGET],
+                dense.positions()[TARGET],
+                "paged position != dense after phase {phase}"
+            );
+            assert_eq!(
+                paged.positions()[TARGET],
+                prompts[TARGET].len() + committed.len() - 1,
+                "slot position after phase {phase}"
+            );
+            accepted.push(out_d);
+        }
+        assert_eq!(
+            &committed[..],
+            &want[..committed.len()],
+            "slot tree-verify stream must stay lossless"
+        );
+
+        // Post-commit KV of the whole committed region, byte-compared THROUGH
+        // the page translation.
+        {
+            let rows = prompts[TARGET].len() + committed.len() - 1;
+            let rm = rb.resident_cuda().expect("resident").expect("cuda");
+            for li in KV_LAYERS {
+                for row in 0..rows {
+                    for v in [false, true] {
+                        let got_d = rm
+                            .debug_batch_kv_row(&dense, li, TARGET, row, v)
+                            .expect("dense kv row");
+                        let got_p = rm
+                            .debug_batch_kv_row(&paged, li, TARGET, row, v)
+                            .expect("paged kv row");
+                        assert_eq!(
+                            got_p, got_d,
+                            "paged KV byte mismatch (layer {li}, row {row}, v={v}, \
+                             eager {eager})"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Continue EVERY row on both batches: the target pins the promote,
+        // the other rows pin slot inertness (verifies touched nothing).
+        let mut feeds = [0u32; 3];
+        for r in 0..3 {
+            feeds[r] = if r == TARGET {
+                *committed.last().expect("non-empty")
+            } else {
+                *pre_d[r].last().expect("PRE >= 1")
+            };
+        }
+        let post_d = rb
+            .draft_batch(&mut dense, &feeds, POST, never)
+            .expect("dense post draft");
+        let post_p = rb
+            .draft_batch(&mut paged, &feeds, POST, never)
+            .expect("paged post draft");
+        assert_eq!(
+            post_p, post_d,
+            "post-verify drafts diverged (target promote or slot leak, eager {eager})"
+        );
+
+        // Reservation-too-short (once; the guard is host-side and
+        // route-independent): a 1-slot pool where the prompt fits page 0 but
+        // prefix + the padded m=8 tree does not — loud refusal, zero state
+        // change, then success after extending the reservation.
+        if !eager {
+            let plen_s = KV_PAGE_TOKENS - 6;
+            let prompt: Vec<u32> = base.iter().copied().cycle().take(plen_s).collect();
+            let positions: Vec<usize> = (0..plen_s).collect();
+            let mut small = rb.new_batch_paged(1, 2).expect("small paged batch");
+            small.reserve_pages(0, plen_s).expect("reserve prompt");
+            rb.reset();
+            let l0 = rb.forward(&prompt, &positions).expect("small prefill");
+            let root = argmax(&l0) as u32;
+            rb.adopt_into_batch_row(&mut small, 0, plen_s).expect("adopt");
+            small.set_position(0, plen_s).expect("set_position");
+
+            let t: Vec<u32> = (0..8).map(|i| (root + i) % 128_256).collect();
+            let p: Vec<i32> = (0..8i32).map(|i| i - 1).collect();
+            let rm = rb.resident_cuda().expect("resident").expect("cuda");
+            let kv_before = rm
+                .debug_batch_kv_row(&small, 0, 0, plen_s - 1, false)
+                .expect("kv before");
+            let err = rb
+                .tree_verify_greedy_slot(&mut small, 0, &t, &p)
+                .expect_err("verify past the reservation must refuse");
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("page-reserved"),
+                "unexpected refusal message: {msg}"
+            );
+            assert_eq!(
+                small.positions()[0],
+                plen_s,
+                "a refused verify must not advance the slot"
+            );
+            assert_eq!(small.free_pages(), 1, "a refused verify must draw no pages");
+            let rm = rb.resident_cuda().expect("resident").expect("cuda");
+            let kv_after = rm
+                .debug_batch_kv_row(&small, 0, 0, plen_s - 1, false)
+                .expect("kv after");
+            assert_eq!(kv_after, kv_before, "a refused verify must write no KV");
+
+            small
+                .reserve_pages(0, plen_s + 16)
+                .expect("extend reservation");
+            let out = rb
+                .tree_verify_greedy_slot(&mut small, 0, &t, &p)
+                .expect("verify after extending the reservation");
+            assert!(!out.is_empty(), "verify must commit >= 1 token");
+            assert_eq!(
+                small.positions()[0],
+                plen_s + out.len(),
+                "position after the recovered verify"
+            );
+        }
+
+        drop(dense);
+        drop(paged);
+        route_tokens.push((accepted, post_d));
+    }
+
+    let (g, e) = (&route_tokens[0], &route_tokens[1]);
+    assert_eq!(g.0, e.0, "graph vs eager accepted tokens (paged gate)");
+    assert_eq!(g.1, e.1, "graph vs eager post drafts (paged gate)");
+    println!(
+        "I3 paged slot: 4 trees (m=2/4/6/8, phase-3 straddling the \
+         {KV_PAGE_TOKENS}-token boundary) bit-equal to the dense slot \
+         (tokens, positions, KV layers {KV_LAYERS:?} through the scrambled \
+         non-identity table), short-reservation refusal is state-free, other \
+         slots inert, graph==eager"
+    );
+}

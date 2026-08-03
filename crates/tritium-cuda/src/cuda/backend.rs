@@ -6399,6 +6399,18 @@ impl CudaBackend {
                 bytes,
             )
         })?;
+        // I3 paged tree-verify twins (eager paged slot route). The paged
+        // reduce stages the same up-to-max_ctx scores in dynamic shared, so
+        // it needs the identical opt-in on its own handle.
+        let f_kv_append_tree_paged = f(dm, KERNEL_NAME_KV_APPEND_TREE_PAGED)?;
+        let f_attn_tree_scores_ctrl_paged = f(dm, KERNEL_NAME_ATTN_TREE_SCORES_CTRL_PAGED)?;
+        let f_attn_tree_reduce_ctrl_paged = f(dm, KERNEL_NAME_ATTN_TREE_REDUCE_CTRL_PAGED)?;
+        attn_shared_opt_in(max_ctx, |bytes| {
+            f_attn_tree_reduce_ctrl_paged.set_attribute(
+                sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                bytes,
+            )
+        })?;
 
         // ADR 0026 Track P: dispatch threshold (default 32 = the tuned
         // dp4a/IMMA crossover). Loud-reject selector.
@@ -6587,6 +6599,9 @@ impl CudaBackend {
             f_attn_tree: f(dm, KERNEL_NAME_ATTN_TREE)?,
             f_attn_tree_scores,
             f_attn_tree_reduce,
+            f_kv_append_tree_paged,
+            f_attn_tree_scores_ctrl_paged,
+            f_attn_tree_reduce_ctrl_paged,
             f_argmax_partial: f(dm, KERNEL_NAME_ARGMAX_PARTIAL)?,
             f_argmax_combine: f(dm, KERNEL_NAME_ARGMAX_COMBINE)?,
             am_scratch: None,

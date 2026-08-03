@@ -64,8 +64,16 @@ impl CudaDecodeModel {
     /// `cache_len` scalar). `slot = None` is the pre-I2 single-seq path,
     /// bit-identical (base 0). The scratch + captured graphs live on the
     /// TARGET (`self.tree_scratch`/`tree_graphs` vs the batch's own fields),
-    /// so the two never invalidate each other. Callers guarantee for `slot`:
-    /// dense (non-paged) batch, f32 KV rung, valid live row.
+    /// so the two never invalidate each other.
+    ///
+    /// I3: a PAGED `BatchKv` slot runs the same forward through the `_paged`
+    /// ctrl twins — `ctrl[2]` carries the slot's page-table offset
+    /// (`r · tstride`) instead of a row base, every KV row is translated
+    /// logical → physical through the shared `d_table` (pointer baked at
+    /// capture, content uploaded per verify), and an up-front reservation
+    /// guard pins `[0, prefix + padded m)` to mapped pages. Callers
+    /// guarantee for `slot`: f32 KV rung, valid live row, and (paged only)
+    /// `head_dim % 4 == 0`.
     fn tree_forward(
         &mut self,
         tokens: &[u32],
@@ -83,9 +91,22 @@ impl CudaDecodeModel {
             self.pending_tree = None;
         }
         // Region geometry: watermark, capacity and KV row base of the target.
-        let (prefix_len, region_ctx, row_base) = match &slot {
-            Some((b, r)) => (b.positions[*r], b.max_ctx, *r * b.max_ctx),
-            None => (self.cache_len, self.max_ctx, 0),
+        // A PAGED slot (I3) has no row base — its rows are page-scattered, so
+        // `table_off` (the slot's page-table row offset, `r · tstride`) rides
+        // in ctrl word 2 instead and the paged twins translate every KV row
+        // through the shared `d_table`. Exactly one of `row_base`/`table_off`
+        // is meaningful; the dense/single-seq paths keep base semantics.
+        let (prefix_len, region_ctx) = match &slot {
+            Some((b, r)) => (b.positions[*r], b.max_ctx),
+            None => (self.cache_len, self.max_ctx),
+        };
+        let table_off: Option<usize> = match &slot {
+            Some((b, r)) => b.pages.as_ref().map(|pg| *r * pg.tstride),
+            None => None,
+        };
+        let row_base = match (&slot, table_off) {
+            (Some((b, r)), None) => *r * b.max_ctx,
+            _ => 0,
         };
         let m = tokens.len();
         if m == 0 || parents.len() != m {
@@ -159,6 +180,24 @@ impl CudaDecodeModel {
         // root-token duplicates at depth 1 — valid math whose results only
         // the pads themselves ever see.
         let mb = bucket.unwrap_or(m);
+
+        // I3 paged guard: every row the trunk touches — the committed prefix
+        // plus the PADDED provisional rows [prefix_len, prefix_len + mb) (the
+        // graph route's pads write real bytes) — must sit on a reserved page
+        // BEFORE any device work. An unmapped (-1) table entry inside a
+        // kernel is UB, so this is a loud host error with zero state change
+        // (draft_batch's up-front guard shape; reservation is prefix-
+        // contiguous, so the last row's page implies every earlier one).
+        if let Some((b, r)) = &slot
+            && b.pages.is_some()
+            && !b.page_mapped(*r, prefix_len + mb - 1)
+        {
+            return Err(BackendError::InvalidInput(format!(
+                "tree_verify: slot {r} rows {prefix_len}..{} not page-reserved \
+                 (reserve_pages for the prefix + the padded tree before verifying)",
+                prefix_len + mb
+            )));
+        }
 
         // Depths, RoPE positions, and per-node ancestor slot lists (root-first,
         // including self). Ancestors are REGION-LOCAL arena slots
@@ -318,47 +357,62 @@ impl CudaDecodeModel {
                     eprintln!("tree-graph: capturing bucket {bucket}");
                 }
                 // Bake the TARGET's ctrl + KV arena pointers into the capture
-                // (the row base rides in ctrl at replay, so one batch capture
-                // serves every slot).
+                // (the row base / table offset rides in ctrl at replay, so
+                // one batch capture serves every slot). Paged batch (I3): the
+                // arenas are the page POOLS and the page-table POINTER is
+                // baked too — its CONTENT is per-replay data, uploaded below
+                // exactly like `decode_batch_graph`'s.
                 let cs = &self.cap_stream;
-                let (d_ctrl, kv): (sys::CUdeviceptr, Vec<(sys::CUdeviceptr, sys::CUdeviceptr)>) =
+                type KvPtrs = Vec<(sys::CUdeviceptr, sys::CUdeviceptr)>;
+                let (d_ctrl, kv, d_table): (sys::CUdeviceptr, KvPtrs, Option<sys::CUdeviceptr>) =
                     match &slot {
                         Some((b, _)) => (
                             dptr(&b.tree_graphs.as_ref().expect("just ensured").d_ctrl, cs),
                             (0..self.layers.len())
                                 .map(|li| (dptr(&b.kv_k[li], cs), dptr(&b.kv_v[li], cs)))
                                 .collect(),
+                            b.pages.as_ref().map(|pg| dptr(&pg.d_table, cs)),
                         ),
                         None => (
                             dptr(&self.tree_graphs.as_ref().expect("just ensured").d_ctrl, cs),
                             (0..self.layers.len())
                                 .map(|li| (dptr(&self.kv_k[li], cs), dptr(&self.kv_v[li], cs)))
                                 .collect(),
+                            None,
                         ),
                     };
-                let g = self.record_graph_tree(&ts, bucket, d_ctrl, &kv)?;
-                match slot.as_mut() {
-                    Some((b, _)) => b
-                        .tree_graphs
-                        .as_mut()
-                        .expect("tree graphs just ensured")
-                        .graphs
-                        .insert(bucket, SendGraph(g)),
-                    None => self
-                        .tree_graphs
-                        .as_mut()
-                        .expect("tree graphs just ensured")
-                        .graphs
-                        .insert(bucket, SendGraph(g)),
-                };
+                let g = self.record_graph_tree(&ts, bucket, d_ctrl, &kv, d_table)?;
+                let tg = match slot.as_mut() {
+                    Some((b, _)) => b.tree_graphs.as_mut(),
+                    None => self.tree_graphs.as_mut(),
+                }
+                .expect("tree graphs just ensured");
+                tg.graphs.insert(bucket, SendGraph(g));
+                // The eager paged route may have created this TreeGraphs
+                // before `batch_raw` existed — (re)pin the modules the
+                // freshly captured graph references.
+                tg.raw_keepalive = self.batch_raw.clone();
             }
             // Uploads, ctrl write, replay and tail all sit on `cap_stream` —
             // stream order is the only ordering needed (no host sync).
-            // row_base is a TOKEN-ROW offset; i32 truncation would need a
-            // >2^31-row arena (multi-TB f32 alloc fails long before).
-            debug_assert!(row_base <= i32::MAX as usize, "kv_row_base overflows i32");
-            let ctrl = [prefix_len as i32, m as i32, row_base as i32];
+            // Word 2: dense = the slot's TOKEN-ROW base; paged = the slot's
+            // page-TABLE offset (`r · tstride`). Either is a token/table
+            // index; i32 truncation would need a >2^31-entry arena/table
+            // (multi-TB allocs fail long before).
+            let ctrl2 = table_off.unwrap_or(row_base);
+            debug_assert!(ctrl2 <= i32::MAX as usize, "tree ctrl word 2 overflows i32");
+            let ctrl = [prefix_len as i32, m as i32, ctrl2 as i32];
             {
+                // Paged: refresh the baked table's CONTENT for this replay
+                // (`decode_batch_graph`'s shape — pointer at capture, data
+                // per step).
+                if let Some((b, _)) = slot.as_mut()
+                    && let Some(pg) = b.pages.as_mut()
+                {
+                    self.cap_stream
+                        .memcpy_htod(&pg.table, &mut pg.d_table)
+                        .map_err(|e| driver_err("tree table htod", &e))?;
+                }
                 let tg = match slot.as_mut() {
                     Some((b, _)) => b.tree_graphs.as_mut(),
                     None => self.tree_graphs.as_mut(),
@@ -399,6 +453,37 @@ impl CudaDecodeModel {
             // drains the stream before any default-stream work (promote)
             // touches the arena.
         } else {
+            // I3 eager PAGED slot: region-offset views can't address page-
+            // scattered rows, so the eager route launches the SAME ctrl-driven
+            // paged twins the graph route captures (the decode split's shape:
+            // per-batch paged handles), reading ctrl + table from device.
+            // Upload both once per verify on the default stream (all eager
+            // work is stream-ordered there, promote dtods included). The
+            // batch's `TreeGraphs` is ensured just for its `d_ctrl` — its
+            // graph map stays empty on this route.
+            if let Some(toff) = table_off {
+                let (b, _) = slot.as_mut().expect("table_off implies a slot");
+                if b.tree_graphs.is_none() {
+                    let d_ctrl = s
+                        .alloc_zeros::<i32>(3)
+                        .map_err(|e| driver_err("tree ctrl alloc (eager paged)", &e))?;
+                    b.tree_graphs = Some(TreeGraphs {
+                        d_ctrl,
+                        graphs: HashMap::new(),
+                        raw_keepalive: self.batch_raw.clone(),
+                    });
+                }
+                debug_assert!(toff <= i32::MAX as usize, "tree ctrl word 2 overflows i32");
+                let ctrl = [prefix_len as i32, m as i32, toff as i32];
+                s.memcpy_htod(
+                    &ctrl,
+                    &mut b.tree_graphs.as_mut().expect("just ensured").d_ctrl,
+                )
+                .map_err(|e| driver_err("tree ctrl htod (eager paged)", &e))?;
+                let pg = b.pages.as_mut().expect("table_off implies pages");
+                s.memcpy_htod(&pg.table, &mut pg.d_table)
+                    .map_err(|e| driver_err("tree table htod (eager paged)", &e))?;
+            }
             Self::bl_embed(
                 s,
                 &self.f_embed_batch,
@@ -569,6 +654,60 @@ impl CudaDecodeModel {
                                 m,
                             )?;
                         }
+                    }
+                    Some((b, _)) if b.pages.is_some() => {
+                        // I3 paged slot: absolute pool addressing through the
+                        // page table — the ctrl-driven paged twins, fed by the
+                        // ctrl/table uploaded before the loop. score stride is
+                        // self.max_ctx (the scratch's row pitch); grid/smem
+                        // are bounded by the REAL context like the dense
+                        // eager launches.
+                        let tg = b.tree_graphs.as_ref().expect("ensured before the loop");
+                        let pg = b.pages.as_ref().expect("paged arm");
+                        Self::bl_kv_append_tree_paged(
+                            s,
+                            &self.f_kv_append_tree_paged,
+                            &ts.d_k,
+                            &mut b.kv_k[li],
+                            &tg.d_ctrl,
+                            &pg.d_table,
+                            kv_width,
+                            m,
+                        )?;
+                        Self::bl_kv_append_tree_paged(
+                            s,
+                            &self.f_kv_append_tree_paged,
+                            &ts.d_v,
+                            &mut b.kv_v[li],
+                            &tg.d_ctrl,
+                            &pg.d_table,
+                            kv_width,
+                            m,
+                        )?;
+                        // head_dim % 4 == 0 is guaranteed (the slot wrapper
+                        // refuses paged verifies otherwise — the paged twins
+                        // are float4 kernels).
+                        Self::bl_attn_tree_split_paged(
+                            s,
+                            &self.f_attn_tree_scores_ctrl_paged,
+                            &self.f_attn_tree_reduce_ctrl_paged,
+                            &ts.d_q,
+                            &b.kv_k[li],
+                            &b.kv_v[li],
+                            &tg.d_ctrl,
+                            &pg.d_table,
+                            &mut ts.d_attn,
+                            &mut ts.d_scores,
+                            &ts.d_anc,
+                            &ts.d_nanc,
+                            self.max_ctx,
+                            ctx_max,
+                            n_head,
+                            n_head_kv,
+                            head_dim,
+                            self.attn_scale,
+                            m,
+                        )?;
                     }
                     Some((b, _)) => {
                         // Batch arenas are f32 (no scale planes); the slot
@@ -850,25 +989,34 @@ impl CudaDecodeModel {
         self.tree_verify_greedy_in(tokens, parents, None)
     }
 
-    /// **I2 batch-slot greedy tree verify** (L3 batch-slot spec decode): the
-    /// SAME verify as [`Self::tree_verify_greedy`], run against dense batch
+    /// **I2/I3 batch-slot greedy tree verify** (L3 batch-slot spec decode):
+    /// the SAME verify as [`Self::tree_verify_greedy`], run against batch
     /// slot `row` of a [`BatchKv`] instead of the single-sequence cache — the
     /// tree attends the slot's committed rows `[0, positions[row])`, the
     /// accepted path is promoted into the slot's region, and
     /// `batch.positions[row]` advances by the accepted length. Other slots'
-    /// KV is untouched (every KV read/write is offset into slot `row`'s dense
-    /// region), so a per-slot spec loop can verify each slot in turn (I3/I4
-    /// build on this).
+    /// KV is untouched, so a per-slot spec loop can verify each slot in turn
+    /// (I4 builds on this).
     ///
-    /// Requirements: a DENSE batch (paged trees are the I3 rung), the f32 KV
-    /// rung (batch arenas are f32 — the same constraint as
-    /// [`Self::copy_kv_into_batch_row`]), and a live row. The tree-shape
-    /// contract (root at node 0 = the slot's last committed token, topological
-    /// parents) is identical to the single-seq verify.
+    /// Dense batches (I2) address the slot's rows via a KV row base
+    /// (`row · max_ctx`). PAGED batches (I3, ADR 0025) translate every KV row
+    /// through the slot's page table instead; the caller must have
+    /// [`BatchKv::reserve_pages`] covering `positions[row]` PLUS the padded
+    /// tree (`prefix + bucket` tokens — the graph route's pad rows write real
+    /// bytes) before verifying, or the verify refuses loudly with zero state
+    /// change. Paged verifies additionally require `head_dim % 4 == 0` (the
+    /// paged ctrl twins are float4 kernels; the non-split tree kernel has no
+    /// paged twin).
+    ///
+    /// Common requirements: the f32 KV rung (batch arenas are f32 — the same
+    /// constraint as [`Self::copy_kv_into_batch_row`]) and a live row. The
+    /// tree-shape contract (root at node 0 = the slot's last committed token,
+    /// topological parents) is identical to the single-seq verify.
     ///
     /// # Errors
-    /// [`BackendError::InvalidInput`] on a bad/dead/paged target, a malformed
-    /// tree, or region overflow; device errors otherwise.
+    /// [`BackendError::InvalidInput`] on a bad/dead target, a malformed
+    /// tree, region overflow, or a short page reservation; device errors
+    /// otherwise.
     pub fn tree_verify_greedy_slot(
         &mut self,
         batch: &mut BatchKv,
@@ -882,12 +1030,12 @@ impl CudaDecodeModel {
                 batch.n
             )));
         }
-        if batch.pages.is_some() {
-            return Err(BackendError::InvalidInput(
-                "tree_verify_greedy_slot: paged batch (dense-region trees only; \
-                 the paged tree is the I3 rung)"
-                    .into(),
-            ));
+        if batch.pages.is_some() && !self.head_dim.is_multiple_of(4) {
+            return Err(BackendError::InvalidInput(format!(
+                "tree_verify_greedy_slot: paged tree verify requires \
+                 head_dim % 4 == 0 (float4 paged ctrl twins), got head_dim {}",
+                self.head_dim
+            )));
         }
         if self.kv_elem != 4 {
             return Err(BackendError::InvalidInput(
@@ -1052,13 +1200,16 @@ impl CudaDecodeModel {
         self.tree_promote(path)
     }
 
-    /// Region dispatcher for the accepted-path promotion (I2): `None` = the
-    /// single-seq cache ([`Self::tree_promote`]); `Some((batch, r))` compacts
-    /// the SAME strictly-increasing path inside batch slot `r`'s dense region
-    /// (row `positions[r] + path[k]` → `positions[r] + k`, both offset by
-    /// `r · max_ctx`) and advances `positions[r]` by the path length. Batch
-    /// arenas are f32 with no scale planes, so the slot arm is the plain
-    /// row-copy loop.
+    /// Region dispatcher for the accepted-path promotion (I2/I3): `None` =
+    /// the single-seq cache ([`Self::tree_promote`]); `Some((batch, r))`
+    /// compacts the SAME strictly-increasing path inside batch slot `r`
+    /// (slot-logical row `positions[r] + path[k]` → `positions[r] + k`) and
+    /// advances `positions[r]` by the path length. Dense slots offset both
+    /// rows by `r · max_ctx`; PAGED slots translate each row through the HOST
+    /// page-table copy (the promote is host-issued dtods — no kernel, so no
+    /// device table read; every row lives inside ONE page, so a per-row
+    /// lookup suffices). Batch arenas are f32 with no scale planes, so the
+    /// slot arm is the plain row-copy loop.
     fn tree_promote_in(
         &mut self,
         path: &[usize],
@@ -1071,21 +1222,38 @@ impl CudaDecodeModel {
         let prefix = batch.positions[row];
         let row_base = row * batch.max_ctx;
         let row_bytes = self.kv_width * 4; // batch arenas are f32
+        // Physical token row of a slot-logical row. Paged: the forward's
+        // reservation guard already pinned every row in
+        // [0, prefix + padded m) to a mapped page, and nothing between the
+        // forward and this promote can unmap one (same &mut borrow).
+        let phys_row = |logical: usize| -> usize {
+            match batch.pages.as_ref() {
+                None => row_base + logical,
+                Some(pg) => {
+                    let e = pg.table[row * pg.tstride + logical / KV_PAGE_TOKENS];
+                    debug_assert!(e >= 0, "tree promote row unmapped (guarded in tree_forward)");
+                    e as usize * KV_PAGE_TOKENS + logical % KV_PAGE_TOKENS
+                }
+            }
+        };
         for (k, &node) in path.iter().enumerate() {
             if node == k {
                 continue; // already in place (chain prefix)
             }
             debug_assert!(node > k, "tree_promote: path must be strictly increasing");
-            let src = (row_base + prefix + node) * row_bytes;
-            let dst = (row_base + prefix + k) * row_bytes;
+            let src = phys_row(prefix + node) * row_bytes;
+            let dst = phys_row(prefix + k) * row_bytes;
             for li in 0..self.layers.len() {
                 for arena in [&mut batch.kv_k[li], &mut batch.kv_v[li]] {
                     let (base, guard) = arena.device_ptr(s);
                     // SAFETY: one dtod within the live batch arena; src/dst
-                    // are row-aligned, equal-length, disjoint (node > k) byte
-                    // ranges inside slot `row`'s dense region (the forward's
-                    // overflow guard bounds prefix + node by max_ctx), so
-                    // they stay inside the allocation; ordered on this stream.
+                    // are row-aligned, equal-length, DISJOINT byte ranges —
+                    // node > k gives distinct logical rows, and dense base-add
+                    // / the paged table (distinct pages from the free list ⇒
+                    // injective) both map distinct logical rows to distinct
+                    // physical rows inside the allocation (the forward's
+                    // overflow + reservation guards bound them); ordered on
+                    // this stream.
                     #[allow(unsafe_code)]
                     unsafe {
                         result::memcpy_dtod_async(
@@ -1193,12 +1361,19 @@ impl CudaDecodeModel {
     /// TARGET's (I2): the model's single-seq cache, or a `BatchKv`'s dense
     /// arenas + own ctrl — whichever owns the capture. The slot row base is
     /// per-replay ctrl data, so one batch capture serves every slot.
+    ///
+    /// `paged_table` (I3): `Some(d_table)` marks a PAGED BatchKv owner — the
+    /// three ctrl twins become their `_paged` siblings, `kv` holds the page
+    /// POOL base pointers, the table POINTER is baked here (its content is
+    /// per-replay data) and ctrl word 2 is read as the slot's table offset
+    /// (`r · tstride`) instead of a KV row base.
     fn record_graph_tree(
         &self,
         ts: &TreeScratch,
         bucket: usize,
         d_ctrl: sys::CUdeviceptr,
         kv: &[(sys::CUdeviceptr, sys::CUdeviceptr)],
+        paged_table: Option<sys::CUdeviceptr>,
     ) -> Result<CudaGraph, BackendError> {
         let s = &self.cap_stream;
         let mb = bucket;
@@ -1206,11 +1381,21 @@ impl CudaDecodeModel {
             (self.n_embd, self.q_width, self.kv_width, self.n_ff);
         let (n_head, n_head_kv, head_dim) = (self.n_head, self.n_head_kv, self.head_dim);
         let raw = self.batch_raw();
-        let (f_kv, f_sc, f_rd) = (
-            raw.kv_append_tree,
-            raw.attn_tree_scores_ctrl,
-            raw.attn_tree_reduce_ctrl,
-        );
+        let paged = paged_table.is_some();
+        let d_table: sys::CUdeviceptr = paged_table.unwrap_or(0);
+        let (f_kv, f_sc, f_rd) = if paged {
+            (
+                raw.kv_append_tree_paged,
+                raw.attn_tree_scores_ctrl_paged,
+                raw.attn_tree_reduce_ctrl_paged,
+            )
+        } else {
+            (
+                raw.kv_append_tree,
+                raw.attn_tree_scores_ctrl,
+                raw.attn_tree_reduce_ctrl,
+            )
+        };
 
         let lin = |l: &ResidentLinear| LinPtrs {
             w: dptr(l.device.as_ref(), s),
@@ -1305,8 +1490,20 @@ impl CudaDecodeModel {
         let scale = self.attn_scale;
         let kv_append = |src: sys::CUdeviceptr, base: sys::CUdeviceptr| {
             let grid = (((mb * kv_width) as u32).div_ceil(256), 1, 1);
-            let mut params = [pp(&src), pp(&base), pp(&d_ctrl), pp(&kw_i), pp(&mb_i)];
-            raw_launch(f_kv, grid, (256, 1, 1), 0, cs, &mut params)
+            if paged {
+                let mut params = [
+                    pp(&src),
+                    pp(&base),
+                    pp(&d_ctrl),
+                    pp(&d_table),
+                    pp(&kw_i),
+                    pp(&mb_i),
+                ];
+                raw_launch(f_kv, grid, (256, 1, 1), 0, cs, &mut params)
+            } else {
+                let mut params = [pp(&src), pp(&base), pp(&d_ctrl), pp(&kw_i), pp(&mb_i)];
+                raw_launch(f_kv, grid, (256, 1, 1), 0, cs, &mut params)
+            }
         };
         let attn = |kv_k: sys::CUdeviceptr, kv_v: sys::CUdeviceptr| {
             const TREE_SCORE_CHUNK: usize = 128; // keep in sync with decode.cu
@@ -1315,39 +1512,78 @@ impl CudaDecodeModel {
                 (self.max_ctx.div_ceil(TREE_SCORE_CHUNK)) as u32,
                 1,
             );
-            let mut params = [
-                pp(&d_q),
-                pp(&kv_k),
-                pp(&d_scores),
-                pp(&d_anc),
-                pp(&d_nanc),
-                pp(&d_ctrl),
-                pp(&stride_i),
-                pp(&nh_i),
-                pp(&nhkv_i),
-                pp(&hd_i),
-                pp(&scale),
-                pp(&ma_i),
-                pp(&mb_i),
-            ];
-            raw_launch(f_sc, grid, (32, 1, 1), 0, cs, &mut params)?;
+            if paged {
+                let mut params = [
+                    pp(&d_q),
+                    pp(&kv_k),
+                    pp(&d_scores),
+                    pp(&d_anc),
+                    pp(&d_nanc),
+                    pp(&d_ctrl),
+                    pp(&d_table),
+                    pp(&stride_i),
+                    pp(&nh_i),
+                    pp(&nhkv_i),
+                    pp(&hd_i),
+                    pp(&scale),
+                    pp(&ma_i),
+                    pp(&mb_i),
+                ];
+                raw_launch(f_sc, grid, (32, 1, 1), 0, cs, &mut params)?;
+            } else {
+                let mut params = [
+                    pp(&d_q),
+                    pp(&kv_k),
+                    pp(&d_scores),
+                    pp(&d_anc),
+                    pp(&d_nanc),
+                    pp(&d_ctrl),
+                    pp(&stride_i),
+                    pp(&nh_i),
+                    pp(&nhkv_i),
+                    pp(&hd_i),
+                    pp(&scale),
+                    pp(&ma_i),
+                    pp(&mb_i),
+                ];
+                raw_launch(f_sc, grid, (32, 1, 1), 0, cs, &mut params)?;
+            }
             let grid = ((mb * n_head) as u32, 1, 1);
             let smem = (self.max_ctx * 4) as u32;
-            let mut params = [
-                pp(&kv_v),
-                pp(&d_scores),
-                pp(&d_attn),
-                pp(&d_anc),
-                pp(&d_nanc),
-                pp(&d_ctrl),
-                pp(&stride_i),
-                pp(&nh_i),
-                pp(&nhkv_i),
-                pp(&hd_i),
-                pp(&ma_i),
-                pp(&mb_i),
-            ];
-            raw_launch(f_rd, grid, (128, 1, 1), smem, cs, &mut params)
+            if paged {
+                let mut params = [
+                    pp(&kv_v),
+                    pp(&d_scores),
+                    pp(&d_attn),
+                    pp(&d_anc),
+                    pp(&d_nanc),
+                    pp(&d_ctrl),
+                    pp(&d_table),
+                    pp(&stride_i),
+                    pp(&nh_i),
+                    pp(&nhkv_i),
+                    pp(&hd_i),
+                    pp(&ma_i),
+                    pp(&mb_i),
+                ];
+                raw_launch(f_rd, grid, (128, 1, 1), smem, cs, &mut params)
+            } else {
+                let mut params = [
+                    pp(&kv_v),
+                    pp(&d_scores),
+                    pp(&d_attn),
+                    pp(&d_anc),
+                    pp(&d_nanc),
+                    pp(&d_ctrl),
+                    pp(&stride_i),
+                    pp(&nh_i),
+                    pp(&nhkv_i),
+                    pp(&hd_i),
+                    pp(&ma_i),
+                    pp(&mb_i),
+                ];
+                raw_launch(f_rd, grid, (128, 1, 1), smem, cs, &mut params)
+            }
         };
 
         // Drain the device_ptr events so the capture carries no pre-capture deps.
@@ -1408,5 +1644,147 @@ impl CudaDecodeModel {
             .map_err(|e| driver_err("tree end_capture", &e))?
             .ok_or_else(|| BackendError::Backend("tree graph capture produced no graph".into()))?;
         Ok(graph)
+    }
+
+    /// I3 eager-paged launch: `kv_append_tree_paged_g` — append `m`
+    /// provisional K/V rows at slot-logical rows `[ctrl[0], ctrl[0] + m)`,
+    /// each translated through the page table (`ctrl[2]` = the slot's table
+    /// offset, `row · tstride`). `kv_base` is the page POOL.
+    #[allow(clippy::too_many_arguments)]
+    fn bl_kv_append_tree_paged(
+        s: &Arc<CudaStream>,
+        f: &CudaFunction,
+        src: &CudaSlice<f32>,
+        kv_base: &mut CudaSlice<f32>,
+        ctrl: &CudaSlice<i32>,
+        table: &CudaSlice<i32>,
+        kv_width: usize,
+        m: usize,
+    ) -> Result<(), BackendError> {
+        let (kw_i, m_i) = (kv_width as i32, m as i32);
+        let cfg = LaunchConfig {
+            grid_dim: (((m * kv_width) as u32).div_ceil(256), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut l = s.launch_builder(f);
+        l.arg(src)
+            .arg(kv_base)
+            .arg(ctrl)
+            .arg(table)
+            .arg(&kw_i)
+            .arg(&m_i);
+        // SAFETY: matches `kv_append_tree_paged_g(src, pool, tree_ctrl, table,
+        // kv_width, m)`; only `kv_base` mutable; the host reservation guard in
+        // `tree_forward` pins every written row to a mapped page.
+        #[allow(unsafe_code)]
+        unsafe {
+            l.launch(cfg)
+                .map_err(|e| driver_err("launch tree kv_append paged", &e))?;
+        }
+        Ok(())
+    }
+
+    /// I3 eager-paged split tree attention: the ctrl-driven PAGED twins
+    /// (scores fan-out + per-(node, head) 128-thread softmax/reduce), every
+    /// f32 fold in the dense pair's order — paging changes addresses, never
+    /// arithmetic. `k`/`v` are the page POOLS (absolute addressing through
+    /// the table; no region views). `score_stride` is the scores scratch row
+    /// pitch (`self.max_ctx`, what the graph route bakes); `ctx_bound` =
+    /// `prefix_len + m` bounds the grid and shared staging (the kernels
+    /// guard per row, mirroring the dense eager launches).
+    #[allow(clippy::too_many_arguments)]
+    fn bl_attn_tree_split_paged(
+        s: &Arc<CudaStream>,
+        f_scores: &CudaFunction,
+        f_reduce: &CudaFunction,
+        q: &CudaSlice<f32>,
+        k: &CudaSlice<f32>,
+        v: &CudaSlice<f32>,
+        ctrl: &CudaSlice<i32>,
+        table: &CudaSlice<i32>,
+        out: &mut CudaSlice<f32>,
+        scores: &mut CudaSlice<f32>,
+        anc: &CudaSlice<i32>,
+        n_anc: &CudaSlice<i32>,
+        score_stride: usize,
+        ctx_bound: usize,
+        n_head: usize,
+        n_head_kv: usize,
+        head_dim: usize,
+        scale: f32,
+        m: usize,
+    ) -> Result<(), BackendError> {
+        // Keep in sync with `#define TREE_SCORE_CHUNK` in decode.cu.
+        const TREE_SCORE_CHUNK: usize = 128;
+        let (ss_i, nh_i, nhkv_i, hd_i) = (
+            score_stride as i32,
+            n_head as i32,
+            n_head_kv as i32,
+            head_dim as i32,
+        );
+        let (ma_i, m_i) = (m as i32, m as i32);
+        let cfg = LaunchConfig {
+            grid_dim: (
+                (m * n_head) as u32,
+                (ctx_bound.div_ceil(TREE_SCORE_CHUNK)) as u32,
+                1,
+            ),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut l = s.launch_builder(f_scores);
+        l.arg(q)
+            .arg(k)
+            .arg(&mut *scores)
+            .arg(anc)
+            .arg(n_anc)
+            .arg(ctrl)
+            .arg(table)
+            .arg(&ss_i)
+            .arg(&nh_i)
+            .arg(&nhkv_i)
+            .arg(&hd_i)
+            .arg(&scale)
+            .arg(&ma_i)
+            .arg(&m_i);
+        // SAFETY: matches `gqa_attention_tree_scores_ctrl_paged_g(q, k, scores,
+        // anc, n_anc, tree_ctrl, table, score_stride, n_head, n_head_kv,
+        // head_dim, scale, max_anc, m)`; max_anc == m (the eager ancestor
+        // table is [m, m]); only `scores` mutable.
+        #[allow(unsafe_code)]
+        unsafe {
+            l.launch(cfg)
+                .map_err(|e| driver_err("launch tree attention scores paged", &e))?;
+        }
+        let cfg = LaunchConfig {
+            grid_dim: ((m * n_head) as u32, 1, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: (ctx_bound * 4) as u32,
+        };
+        let mut l = s.launch_builder(f_reduce);
+        l.arg(v)
+            .arg(&*scores)
+            .arg(out)
+            .arg(anc)
+            .arg(n_anc)
+            .arg(ctrl)
+            .arg(table)
+            .arg(&ss_i)
+            .arg(&nh_i)
+            .arg(&nhkv_i)
+            .arg(&hd_i)
+            .arg(&ma_i)
+            .arg(&m_i);
+        // SAFETY: matches `gqa_attention_tree_reduce_ctrl_paged_g(v, scores,
+        // out, anc, n_anc, tree_ctrl, table, score_stride, n_head, n_head_kv,
+        // head_dim, max_anc, m)` with ctx_bound·4 B of dynamic shared (the
+        // handle's opt-in at load covers up to max_ctx·4).
+        #[allow(unsafe_code)]
+        unsafe {
+            l.launch(cfg)
+                .map_err(|e| driver_err("launch tree attention reduce paged", &e))?;
+        }
+        Ok(())
     }
 }
