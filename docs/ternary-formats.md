@@ -1,10 +1,11 @@
 # Ternary formats: what Tritium reads, writes, and refuses
 
 Ternary weights are trits × scales in any container. Tritium's policy is
-**one compute format, many interchange formats**: the loader unpacks every
-supported container to trits at load, and each backend packs its own native
-layout — so the container never touches kernel code, and any supported file
-generates bit-identically to any other encoding of the same trits.
+**compute formats decoupled from interchange formats**: the loader unpacks
+every supported container to trits at load, and each backend packs its own
+native layout (TQ2_0 by default; TQ1_0 under the opt-in capacity rung below)
+— so file bytes never touch kernel code, and any supported file generates
+bit-identically to any other encoding of the same trits.
 
 ## Supported containers
 
@@ -20,13 +21,15 @@ losslessly between them (BitNet 2B4T: 1.188 GB → 1.106 GB as TQ1_0, ~10 s).
 **Ship TQ1_0, run TQ2_0 — unless VRAM is the constraint.** By default the
 loader unpacks TQ1_0 to trits and the CUDA backend packs TQ2_0, so a TQ1_0
 file runs at full TQ2_0 speed. `TRITIUM_WEIGHTS=tq1` (A2) opts into serving
-TQ1_0 bytes *natively* instead: a **capacity-only** rung — −18% weight VRAM
-(2B4T: ~−160 MB) at decode parity-to-−5%, because the base-243 decode costs
-~24 ALU ops per dp4a word vs TQ2_0's ~3 and M=1 GEMMs have limited DRAM
-headroom to buy that back (OPTIMIZATION-LOG rounds 10b/16; the uncontended
-e2e re-bench is still owed). v1 scope: the single-sequence path only —
+a native TQ1-packed layout instead: a **capacity** rung — −18% weight VRAM
+(2B4T: ~−160 MB) at measured e2e decode parity (uncontended interleaved ×3:
+median +2.3%, "parity, possibly a hair better" — OPTIMIZATION-LOG "Round
+15/16 caveat CLOSED"). The kernel-level 1.51× gateup penalty (base-243
+decode costs ~24 ALU ops per dp4a word vs TQ2_0's ~3, round 16) does not
+materialize end-to-end: decode is latency-bound outside the GEMMs and the
+−20% gateup DRAM traffic offsets. v1 scope: the single-sequence path only —
 `--batch-slots > 1`, tree/spec sessions, and `--draft-model` refuse TQ1
-loudly (the `gb_*` batched/tree graph builders are TQ2-only;
+loudly per-request (the `gb_*` batched/tree graph builders are TQ2-only;
 `build_batch`/`tree_forward` guards).
 
 ## TB1 bitmap+signs: measured, refuted, kept
@@ -34,14 +37,17 @@ loudly (the `gb_*` batched/tree graph builders are TQ2-only;
 A 1.578-bpw bitmap+signs layout (one zero/nonzero bit per element + a packed
 sign stream) exists in-tree as **TB1**, with bit-exact kernels and gates. It
 is **refuted as a decode format at BitNet's density** (round 16): on the real
-gateup shape (M=1, N=13824, K=2560) it measured 33.77 µs/launch vs TQ2_0's
-13.11 — 2.58× slower for a 19% byte saving, because the per-block warp
-prefix scan for sign addressing serializes exactly where M=1 GEMMs are
-ALU-bound, not DRAM-bound. Bytes don't convert to time here. The kernel,
-format, and bench harness stay in-tree; the niche survives on paper only for
-high-sparsity students (p ≥ ~0.6, where the sign stream shrinks and
-block-skip composes) — any redesign must beat TB1's 33.77 µs on the gateup
-microbench *before* integration is considered.
+gateup shape (M=1, N=13824, K=2560) it measured 2.58× slower than TQ2_0
+(33.77 vs 13.11 µs/launch on a contended box — absolutes inflated, the
+*ordering* is the ALU-vs-bytes signal) for a 19% byte saving, because the
+per-block warp prefix scan for sign addressing serializes exactly where M=1
+GEMMs are not DRAM-bound *enough* (44–68% DRAM) to hide it. Bytes don't
+convert to time here. The kernel, format, and bench harness stay in-tree;
+the niche survives on paper only for high-sparsity students (p ≥ ~0.6,
+where the sign stream shrinks and block-skip composes) — any redesign must
+close most of the 2.58× gap to TQ2_0 on the gateup microbench (same-session
+interleaved, not just beat TB1's stale absolute) *before* integration is
+considered.
 
 ## The f16 scale gap
 
