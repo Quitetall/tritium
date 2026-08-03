@@ -27,13 +27,24 @@
 //!
 //! The honest caveats, stated up front because they decide whether any of this ships:
 //!
-//! 1. `entropy` is a lower bound on a real codec's rate, not a rate. Arithmetic coding approaches
-//!    it; a practical GPU-decodable format will not reach it.
-//! 2. **Bandwidth saved is not time saved.** The open question already on record for B3
+//! 1. **`gr-alpha` does NOT charge for the per-group alphabet table and is therefore optimistic —
+//!    do not quote it as a rate.** A decoder that reads `log2(|alphabet_g|)`-bit symbols has to be
+//!    told *which* states are in group `g`'s alphabet, and that side information is unpriced here.
+//!    At `T=8` a group using 40 of 6561 states would need `40·log2(6561) ≈ 508` bits of table for
+//!    128 weights — about 4 bpw, which would eat the entire saving. Only **`dense`** and
+//!    **`gl-alpha`** (one table for the whole model, amortised to nothing) are chargeable as-is.
+//! 2. `entropy` is a lower bound on a real codec's rate, not a rate. Arithmetic coding approaches
+//!    it; a practical GPU-decodable format will not reach it, and an adaptive coder that avoids
+//!    transmitting the distribution is inherently sequential.
+//! 3. **Bandwidth saved is not time saved.** The open question already on record for B3
 //!    (`research-ternary-sota-mid2026.md:160`) applies with more force here: a variable-length or
 //!    table-driven decode costs more per weight than a shift-and-mask. This test cannot answer it.
-//! 3. Symbol statistics are measured on one 135M model's weights after the salience fold. Whether
+//! 4. Symbol statistics are measured on one 135M model's weights after the salience fold. Whether
 //!    the collapse survives other architectures and scales is unmeasured.
+//!
+//! So the result to take from this is **how much information the symbols actually carry**, which
+//! bounds what any codec could achieve. Turning that bound into a shippable rate is a codec-design
+//! problem this test does not solve.
 //!
 //! Run:
 //! ```text
@@ -46,15 +57,31 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use common::{Calib, calibrate, extract, fold};
+use tritium_format::salt_v2::SaltV2Codec;
 use tritium_nn::ModelRunner;
 use tritium_quantize::{JointFitConfig, JointFitMetric, fit_joint_ternary};
-use tritium_train::ops::ste;
+use tritium_train::ops::ste::{self, RotationPolicy};
 
 const GROUP: usize = 128;
 const CALIB_WINDOWS: usize = 8;
 const CALIB_SEQ: usize = 512;
-/// B3 packs 5 trits per byte = 1.6 bits/trit, the densest codec we ship.
-const B3_BITS_PER_TRIT: f64 = 1.6;
+/// Δ candidates per group for the ladder fitter.
+const GRID: usize = 16;
+
+/// Which fitter's symbols to price.
+///
+/// `ladder` is the default and the one that matters. The joint fitter enumerates `3^T` states per
+/// weight with EM restarts — measuring it over 134M weights took 90 minutes for `T=1` alone and
+/// timed out before `T=2`. The ladder is O(T), so the same sweep runs to `T=8` in seconds. It is
+/// also the more interesting subject: a *uniform* grid on a peaked weight distribution should put
+/// far more mass on the near-zero symbols than a free-scale fitter, which adapts its levels to the
+/// data and thereby flattens its own symbol distribution. If entropy coding pays anywhere, it pays
+/// on the ladder.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Fitter {
+    Ladder,
+    Joint,
+}
 
 fn model_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_default();
@@ -203,8 +230,45 @@ fn group_symbols(bs: &[f32], cfg: JointFitConfig) -> Option<Vec<u32>> {
     }
 }
 
+/// Base-3 encode one group's plane-major trits into one symbol per weight.
+fn encode_trits(trits: &[Vec<i8>]) -> Vec<u32> {
+    let n = trits[0].len();
+    (0..n)
+        .map(|i| {
+            let mut sym = 0u32;
+            let mut radix = 1u32;
+            for plane in trits {
+                sym += u32::try_from(plane[i] + 1).expect("trit in {-1,0,1}") * radix;
+                radix *= 3;
+            }
+            sym
+        })
+        .collect()
+}
+
+fn fitter() -> Fitter {
+    match std::env::var("TRITIUM_ENTROPY_FITTER").as_deref() {
+        Ok("joint") => Fitter::Joint,
+        _ => Fitter::Ladder,
+    }
+}
+
+fn plane_counts(f: Fitter) -> Vec<usize> {
+    let default = if f == Fitter::Joint {
+        "1,2,3"
+    } else {
+        "1,2,3,4,6,8"
+    };
+    std::env::var("TRITIUM_ENTROPY_T")
+        .unwrap_or_else(|_| default.to_string())
+        .split(',')
+        .filter_map(|s| s.trim().parse::<usize>().ok())
+        .filter(|t| (1..=8).contains(t))
+        .collect()
+}
+
 #[test]
-#[ignore = "slow joint fit over every tensor; needs SmolLM2-135M; run explicitly"]
+#[ignore = "sweeps every tensor; needs SmolLM2-135M; run explicitly"]
 fn joint_symbols_cost_less_than_dense_planes_charge() {
     let dir = model_dir();
     if !dir.join("model.safetensors").exists() {
@@ -229,11 +293,17 @@ fn joint_symbols_cost_less_than_dense_planes_charge() {
     }
     let (fp, _arch) = fold(&fp, &shapes, &arch, &calib, 0.75);
 
+    let fitter = fitter();
     println!(
-        "SmolLM2-135M, salience fold alpha=0.75, joint {}-group fit, Auto rotation.\n\
+        "SmolLM2-135M, salience fold alpha=0.75, {}-group fit, {} fitter.\n\
          Reconstruction (and therefore perplexity) is IDENTICAL across all rate columns —\n\
          entropy coding is lossless. Only the price changes.\n",
-        GROUP
+        GROUP,
+        if fitter == Fitter::Joint {
+            "joint 3^T (Auto rotation)"
+        } else {
+            "balanced-ternary ladder (Always rotation)"
+        }
     );
     println!(
         "{:<4} {:>7} {:>9} {:>10} {:>10} {:>10} {:>9}",
@@ -241,30 +311,63 @@ fn joint_symbols_cost_less_than_dense_planes_charge() {
     );
     println!("{}", "-".repeat(66));
 
-    for t in 1..=3usize {
+    for t in plane_counts(fitter) {
         let cfg = JointFitConfig {
-            planes: t,
+            planes: t.min(3),
             ..JointFitConfig::default()
         };
         let mut stats = SymbolStats::default();
         let mut failed_groups = 0u64;
 
         for (w, &(rows, cols)) in fp.iter().zip(&shapes) {
-            for r in 0..rows {
-                let row = &w[r * cols..(r + 1) * cols];
-                for bs in row.chunks(GROUP) {
-                    match group_symbols(bs, cfg) {
-                        Some(syms) => stats.observe_group(&syms),
-                        None => failed_groups += 1,
+            match fitter {
+                // O(T) per weight: one whole-tensor call, no per-group enumeration.
+                Fitter::Ladder => {
+                    for (_, planes) in ste::geometric_ladder_fit(
+                        w,
+                        rows,
+                        cols,
+                        t,
+                        GROUP,
+                        GRID,
+                        RotationPolicy::Always,
+                    ) {
+                        stats.observe_group(&encode_trits(&planes));
+                    }
+                }
+                Fitter::Joint => {
+                    for r in 0..rows {
+                        let row = &w[r * cols..(r + 1) * cols];
+                        for bs in row.chunks(GROUP) {
+                            match group_symbols(bs, cfg) {
+                                Some(syms) => stats.observe_group(&syms),
+                                None => failed_groups += 1,
+                            }
+                        }
                     }
                 }
             }
         }
 
-        // What we charge today: T dense B3 planes + one f16 scale per plane per group + the
-        // one-bit rotation flag per group. Same accounting as `ternary_bits_per_weight_codec`.
-        let scale_overhead = (t as f64 * 16.0 + 1.0) / GROUP as f64;
-        let dense = t as f64 * B3_BITS_PER_TRIT + scale_overhead;
+        // What the artifact costs today, from the packer's own ledger — the ladder stores ONE f16
+        // anchor per group where the free-scale path stores T, so the two have different baselines
+        // and must not be charged the same.
+        let rot_bit = 1.0 / GROUP as f64;
+        let dense = rot_bit
+            + match fitter {
+                Fitter::Ladder => {
+                    ste::ternary_bits_per_weight_geometric(t, GROUP, SaltV2Codec::B3, GROUP)
+                }
+                Fitter::Joint => {
+                    ste::ternary_bits_per_weight_codec(t, GROUP, SaltV2Codec::B3, GROUP)
+                }
+            };
+        // Symbol columns replace only the TRIT payload; scales and the rotation bit still cost.
+        let scale_overhead = rot_bit
+            + match fitter {
+                Fitter::Ladder => 16.0 / GROUP as f64,
+                Fitter::Joint => t as f64 * 16.0 / GROUP as f64,
+            };
         let gl_alpha = stats.global_alphabet_bits_per_weight() + scale_overhead;
         let gr_alpha = stats.group_alphabet_bits_per_weight() + scale_overhead;
         let entropy = stats.entropy_bits_per_weight() + scale_overhead;
@@ -294,7 +397,8 @@ fn joint_symbols_cost_less_than_dense_planes_charge() {
     println!(
         "\ndense    = what every bpw figure in this repo charges (T x B3 + scales)\n\
          gl-alpha = one fixed-width code over the whole model's observed state set\n\
-         gr-alpha = fixed-width code per group, over that group's own states\n\
+         gr-alpha = fixed-width code per group — OPTIMISTIC, the per-group alphabet table\n\
+                    is NOT charged for; not quotable as a rate (see caveat 1)\n\
          entropy  = ideal per-group entropy coder: a LOWER BOUND, not an achievable rate.\n\
          None of these are a speed claim. GPU decode cost of a table-driven symbol is\n\
          unmeasured and could exceed the bandwidth saved."
