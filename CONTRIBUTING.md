@@ -36,6 +36,20 @@ every skipped optional dependency or hardware lane, and every remaining blocker.
 GPU, browser, model, package, and deployment claims require receipts from the
 declared physical target; a skipped test is not a pass.
 
+A pre-push hook that runs the fast gates (fmt, workspace clippy, and — when
+the push touches them — the GPU-feature clippy legs) against the **pushed
+commit's tree** is versioned in `.githooks/`. Enable it once per clone:
+
+```sh
+git config core.hooksPath .githooks
+```
+
+It checks the commit being pushed, not your working tree, so uncommitted work
+never affects the verdict. `TRITIUM_PREPUSH_FMT_ONLY=1 git push` runs just the
+format check; `git push --no-verify` bypasses the hook entirely (CI still runs
+the same gates). The first run compiles the workspace into a dedicated cache
+under `~/.cache/tritium-prepush` and is slow; later runs are incremental.
+
 Code behind the GPU-toolkit features (`cuda`, `nccl`, `rocm`, `wgpu`) can be
 type-checked and linted **without any GPU toolkit installed**: set
 `TRITIUM_CHECK_ONLY=1` and the kernel build scripts emit placeholder artifacts

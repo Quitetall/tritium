@@ -1,0 +1,121 @@
+#!/usr/bin/env sh
+# Pre-push gate: catch the breaks that have actually taken CI red before the
+# paid runners see them. Per pushed ref TIP (CI only ever judges the tip):
+#
+#   1. cargo fmt --all --check          — seconds; the most frequent breaker
+#   2. cargo clippy --workspace         — the cuda-gated-imports class
+#   3. gpu-feature-check clippy legs    — the rocm-test-bitrot class; only when
+#      the push touches GPU-feature crates or the CI workflow (path filter)
+#
+# Everything runs against the PUSHED COMMIT's tree in a persistent scratch
+# worktree, never against the working tree: this repo's working tree routinely
+# carries another session's uncommitted WIP, and the worktree's formatting says
+# nothing about what the push publishes. The scratch worktree + target dir live
+# under ~/.cache and are reused, so warm runs are incremental (a stable path
+# matters: cargo fingerprints include source paths, so a fresh mktemp worktree
+# per push would rebuild the world every time).
+#
+# Deliberately NOT here: tests (minutes; CI's job), cargo-deny (advisories go
+# red independently of local changes), semver / python / npm gates (slow or
+# rarely touched). A hook that takes minutes gets --no-verify'd out of habit
+# and protects nothing.
+#
+# Enable:  git config core.hooksPath .githooks
+# Skip:    fmt+clippy only: TRITIUM_PREPUSH_FMT_ONLY=1 git push
+#          everything:      git push --no-verify
+
+set -u
+
+CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/tritium-prepush"
+WT="$CACHE/worktree"
+LOCK="$CACHE/lock"
+export CARGO_TARGET_DIR="$CACHE/target"
+export RUSTFLAGS="-D warnings" # match CI so the cache fingerprints line up
+
+mkdir -p "$CACHE"
+
+# One pre-push at a time: two sessions share this repo and would race the
+# scratch worktree. mkdir is the portable atomic lock.
+if ! mkdir "$LOCK" 2>/dev/null; then
+    echo "pre-push: another pre-push run holds $LOCK — wait for it, or if it" >&2
+    echo "pre-push: crashed, rmdir it. Bypass once with: git push --no-verify" >&2
+    exit 1
+fi
+trap 'rmdir "$LOCK" 2>/dev/null' EXIT INT TERM
+
+checkout_tip() {
+    # Reuse the registered scratch worktree; (re)create it if missing/broken.
+    if ! git -C "$WT" checkout --quiet --detach "$1" 2>/dev/null; then
+        git worktree remove --force "$WT" >/dev/null 2>&1
+        rm -rf "$WT"
+        git worktree prune >/dev/null 2>&1
+        git worktree add --detach "$WT" "$1" >/dev/null || return 1
+    fi
+    # Detached checkouts leave stale untracked files behind when files vanish
+    # between tips; a clean tree keeps `cargo fmt --all` honest.
+    git -C "$WT" clean -qfd
+}
+
+fail=0
+while read -r local_ref local_sha remote_ref remote_sha; do
+    # Branch deletions push no commit.
+    [ "$local_sha" = "0000000000000000000000000000000000000000" ] && continue
+
+    if ! checkout_tip "$local_sha"; then
+        echo "pre-push: could not check out $local_sha in scratch worktree $WT" >&2
+        fail=1
+        break
+    fi
+
+    if ! (cd "$WT" && cargo fmt --all --check); then
+        echo "pre-push: cargo fmt --all --check FAILED for $local_sha ($local_ref)." >&2
+        echo "pre-push: the COMMIT is unformatted (the working tree is irrelevant);" >&2
+        echo "pre-push: fix with a fresh formatting commit — never --amend in this repo." >&2
+        fail=1
+        break
+    fi
+
+    if [ "${TRITIUM_PREPUSH_FMT_ONLY:-0}" != "0" ]; then
+        continue
+    fi
+
+    if ! (cd "$WT" && cargo clippy --workspace --all-targets -- -D warnings); then
+        echo "pre-push: workspace clippy FAILED for $local_sha ($local_ref)." >&2
+        fail=1
+        break
+    fi
+
+    # GPU-feature legs (mirrors the gpu-feature-check CI lane) only when the
+    # push can affect them. Unknown remote tip (new branch) => no diff base =>
+    # run them.
+    run_gpu=1
+    if [ "$remote_sha" != "0000000000000000000000000000000000000000" ] &&
+        git cat-file -e "$remote_sha" 2>/dev/null; then
+        if git diff --name-only "$remote_sha" "$local_sha" -- \
+            .github/workflows/ci.yml \
+            crates/tritium-cuda crates/tritium-rocm crates/tritium-wgpu \
+            crates/tritium-nn crates/tritium-cli crates/tritium-py \
+            crates/tritium-salt crates/tritium-benches crates/tritium-serve \
+            | grep -q .; then :; else run_gpu=0; fi
+    fi
+
+    # Keep this block in sync with the gpu-feature-check lane in
+    # .github/workflows/ci.yml — it is that lane, run early.
+    if [ "$run_gpu" -eq 1 ]; then
+        if ! (
+            cd "$WT" && export TRITIUM_CHECK_ONLY=1 &&
+                cargo clippy -p tritium-cuda --features nccl,device-loss-qualification --all-targets -- -D warnings &&
+                cargo clippy -p tritium-rocm --features rocm --all-targets -- -D warnings &&
+                cargo clippy -p tritium-wgpu --features register --all-targets -- -D warnings &&
+                cargo clippy -p tritium-nn -p tritium-cli -p tritium-py -p tritium-salt -p tritium-benches --features tritium-nn/cuda,tritium-cli/nccl,tritium-py/cuda,tritium-salt/cuda,tritium-benches/cuda --all-targets -- -D warnings &&
+                cargo clippy -p tritium-cli -p tritium-benches --features tritium-cli/wgpu,tritium-cli/rocm,tritium-benches/wgpu,tritium-benches/rocm --all-targets -- -D warnings &&
+                cargo clippy -p tritium-serve --features cuda,e2e,device-loss-qualification --all-targets -- -D warnings
+        ); then
+            echo "pre-push: gpu-feature clippy FAILED for $local_sha ($local_ref)." >&2
+            fail=1
+            break
+        fi
+    fi
+done
+
+exit "$fail"
