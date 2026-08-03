@@ -52,7 +52,10 @@ mod salt_v2_model;
 mod salt_v2_output;
 mod training_export;
 
-pub use allocate::{AllocConfig, AllocError, Allocation, GroupInput, TRIT_BITS, allocate};
+pub use allocate::{
+    AllocConfig, AllocError, Allocation, GroupCurve, GroupInput, TRIT_BITS, allocate,
+    allocate_with_curves,
+};
 pub use architecture::{
     AdapterError, ArchitectureAdapter, ArchitectureFeature, ArchitectureRequirements,
     CapabilityGap, CapabilitySet, TensorDescriptor, TensorDisposition, TensorRole,

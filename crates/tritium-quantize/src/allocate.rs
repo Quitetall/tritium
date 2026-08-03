@@ -39,6 +39,26 @@ pub struct GroupInput<'a> {
     pub sensitivity: f64,
 }
 
+/// One group presented with a **precomputed** error curve, for callers whose fitter is not the
+/// greedy residual expansion [`GroupInput`] assumes.
+///
+/// This exists because the allocation rule and the fitter are independent choices, and hardwiring
+/// [`error_curve`] to [`residual_expand`] conflated them. The balanced-ternary ladder, for one,
+/// produces a materially different `err(T)` — measured at ~9.5 dB per plane against the greedy
+/// expansion's ~2.8 — so allocating from greedy curves would spend the budget as if planes bought
+/// far less than they do.
+#[derive(Clone, Copy, Debug)]
+pub struct GroupCurve<'a> {
+    /// `err(0..=T)`: reconstruction error after each plane count, index `0` meaning no planes.
+    /// Must be non-empty; values are used as given (monotonicity is the caller's contract, and a
+    /// non-decreasing step simply reads as "no gain" and is skipped).
+    pub curve: &'a [f64],
+    /// Number of weights in the group — sets the bit cost of one plane.
+    pub weights: usize,
+    /// Loss sensitivity `H_g`, as in [`GroupInput`].
+    pub sensitivity: f64,
+}
+
 /// Allocation knobs.
 #[derive(Clone, Copy, Debug)]
 pub struct AllocConfig {
@@ -201,13 +221,56 @@ pub fn allocate(groups: &[GroupInput], cfg: &AllocConfig) -> Result<Allocation, 
             });
         }
     }
-    let n = groups.len();
-    let sizes: Vec<usize> = groups.iter().map(|g| g.weights.len()).collect();
-    let bits_per_plane: Vec<f64> = sizes.iter().map(|&s| s as f64 * TRIT_BITS).collect();
     let curves: Vec<Vec<f64>> = groups
         .iter()
         .map(|g| error_curve(g.weights, cfg.t_max))
         .collect();
+    let curved: Vec<GroupCurve<'_>> = groups
+        .iter()
+        .zip(&curves)
+        .map(|(g, c)| GroupCurve {
+            curve: c,
+            weights: g.weights.len(),
+            sensitivity: g.sensitivity,
+        })
+        .collect();
+    allocate_with_curves(&curved, cfg)
+}
+
+/// [`allocate`], driven by precomputed error curves instead of the greedy residual expansion.
+///
+/// This is the actual water-filling; [`allocate`] builds greedy curves and delegates here, so both
+/// entry points share one rule and cannot drift. See [`GroupCurve`] for why a caller would want to
+/// supply its own curves.
+///
+/// # Errors
+/// [`AllocError::BadRange`] if `t_min > t_max`; [`AllocError::InvalidSensitivity`] for a negative or
+/// non-finite sensitivity; [`AllocError::BudgetTooSmall`] if the budget cannot cover `t_min`
+/// everywhere.
+pub fn allocate_with_curves(
+    groups: &[GroupCurve],
+    cfg: &AllocConfig,
+) -> Result<Allocation, AllocError> {
+    if cfg.t_min > cfg.t_max {
+        return Err(AllocError::BadRange {
+            t_min: cfg.t_min,
+            t_max: cfg.t_max,
+        });
+    }
+    for (g, grp) in groups.iter().enumerate() {
+        if !(grp.sensitivity.is_finite() && grp.sensitivity >= 0.0) {
+            return Err(AllocError::InvalidSensitivity {
+                group: g,
+                value: grp.sensitivity,
+            });
+        }
+    }
+    let n = groups.len();
+    let bits_per_plane: Vec<f64> = groups
+        .iter()
+        .map(|g| g.weights as f64 * TRIT_BITS)
+        .collect();
+    let curves: Vec<&[f64]> = groups.iter().map(|g| g.curve).collect();
 
     let base_bits: f64 = bits_per_plane.iter().sum::<f64>() * cfg.t_min as f64;
     // The exact floor (budget == base) must stay feasible: `base` sums per group
@@ -236,7 +299,7 @@ pub fn allocate(groups: &[GroupInput], cfg: &AllocConfig) -> Result<Allocation, 
             if spent + cost > cfg.budget_bits {
                 continue; // can't afford another plane on this group
             }
-            let drop = curve_at(&curves[g], t[g]) - curve_at(&curves[g], t[g] + 1);
+            let drop = curve_at(curves[g], t[g]) - curve_at(curves[g], t[g] + 1);
             if drop <= 0.0 {
                 continue; // residual exhausted — adding a plane wastes bits
             }
@@ -480,5 +543,125 @@ mod tests {
             let b = allocate(&groups, &cfg).unwrap();
             prop_assert_eq!(a, b);
         }
+    }
+}
+
+#[cfg(test)]
+mod curve_tests {
+    use super::*;
+    use crate::{PlaneStack, recon_error, residual_expand};
+
+    /// The same greedy-residual curve `allocate` builds internally, rebuilt here so the equivalence
+    /// gate below compares the two entry points on identical inputs rather than on a re-derivation.
+    fn greedy_curve(w: &[f32], t_max: usize) -> Vec<f64> {
+        let stack = residual_expand(w, t_max);
+        (0..=stack.plane_count())
+            .map(|t| {
+                recon_error(
+                    w,
+                    &PlaneStack {
+                        planes: stack.planes[..t].to_vec(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// `allocate_with_curves` must reproduce `allocate` exactly when handed the curves `allocate`
+    /// would have built. This is what makes the refactor safe: one water-filling rule, two ways in,
+    /// and no chance of the ladder path silently drifting from the shipped behaviour.
+    #[test]
+    fn curve_entry_point_reproduces_the_weights_entry_point() {
+        let a = [1.0f32, -0.5, 0.25, 2.0, 0.75, -3.0, 0.1, 0.9];
+        let b = [3.0f32, 0.1, -1.5, 0.05, 2.2, -0.3];
+        let groups = [
+            GroupInput {
+                weights: &a,
+                sensitivity: 5.0,
+            },
+            GroupInput {
+                weights: &b,
+                sensitivity: 1.0,
+            },
+        ];
+        let cfg = AllocConfig::from_bpw(3.2, a.len() + b.len(), 1, 3);
+        let want = allocate(&groups, &cfg).expect("allocate");
+
+        let ca = greedy_curve(&a, cfg.t_max);
+        let cb = greedy_curve(&b, cfg.t_max);
+        let curved = [
+            GroupCurve {
+                curve: &ca,
+                weights: a.len(),
+                sensitivity: 5.0,
+            },
+            GroupCurve {
+                curve: &cb,
+                weights: b.len(),
+                sensitivity: 1.0,
+            },
+        ];
+        let got = allocate_with_curves(&curved, &cfg).expect("allocate_with_curves");
+        assert_eq!(got.plane_counts, want.plane_counts);
+    }
+
+    /// The whole point of the sensitivity term: at a budget that cannot buy every group a plane,
+    /// the loss-critical group must win it. With identical curves, sensitivity is the only
+    /// tiebreaker, so this isolates it from the error-curve shape.
+    #[test]
+    fn sensitivity_decides_which_group_gets_the_scarce_plane() {
+        // Identical curves ⇒ identical Δerr and identical cost; only `sensitivity` differs.
+        let curve = [100.0f64, 40.0, 20.0, 10.0];
+        let mk = |s: f64| GroupCurve {
+            curve: &curve,
+            weights: 128,
+            sensitivity: s,
+        };
+        // Base (T=1 everywhere) plus exactly one more plane's worth of bits.
+        let base = 2.0 * 128.0 * TRIT_BITS;
+        let cfg = AllocConfig {
+            t_min: 1,
+            t_max: 3,
+            budget_bits: base + 128.0 * TRIT_BITS,
+        };
+        let got = allocate_with_curves(&[mk(1.0), mk(9.0)], &cfg).expect("allocate");
+        assert_eq!(
+            got.plane_counts,
+            vec![1, 2],
+            "the scarce plane must go to the more sensitive group"
+        );
+        // ... and it must flip when the sensitivity does, so this is not a group-order artifact.
+        let flipped = allocate_with_curves(&[mk(9.0), mk(1.0)], &cfg).expect("allocate");
+        assert_eq!(flipped.plane_counts, vec![2, 1]);
+    }
+
+    /// A group whose curve is already flat gains nothing from another plane, so the allocator must
+    /// spend the budget elsewhere rather than burning it on a zero-Δerr group.
+    #[test]
+    fn flat_curves_never_take_a_plane() {
+        let flat = [50.0f64, 50.0, 50.0, 50.0];
+        let useful = [50.0f64, 10.0, 5.0, 1.0];
+        let cfg = AllocConfig {
+            t_min: 1,
+            t_max: 3,
+            budget_bits: f64::INFINITY,
+        };
+        let got = allocate_with_curves(
+            &[
+                GroupCurve {
+                    curve: &flat,
+                    weights: 64,
+                    sensitivity: 1.0,
+                },
+                GroupCurve {
+                    curve: &useful,
+                    weights: 64,
+                    sensitivity: 1.0,
+                },
+            ],
+            &cfg,
+        )
+        .expect("allocate");
+        assert_eq!(got.plane_counts, vec![1, 3]);
     }
 }

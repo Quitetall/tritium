@@ -307,3 +307,89 @@ fn all_zero_group_fits_to_zero_without_nan() {
         }
     }
 }
+
+/// Per-group plane counts must reduce to the uniform path exactly when every group asks for the
+/// same `T`. Without this the allocated arm and the uniform baseline are not comparable, and any
+/// measured "win" could be a reconstruction difference rather than an allocation one.
+#[test]
+fn uniform_allocation_reproduces_the_uniform_fitter_bit_for_bit() {
+    let (rows, cols, group) = (5usize, 200usize, 128usize); // 200 ⇒ a ragged tail per row
+    let w = gaussian(0x5A17, rows * cols);
+    let per_row = cols.div_ceil(group);
+    for t in 1..=4u8 {
+        for &rot in &[
+            RotationPolicy::Never,
+            RotationPolicy::Always,
+            RotationPolicy::Auto,
+        ] {
+            let counts = vec![t; rows * per_row];
+            let alloc = ste::salt_quantize_forward_grouped_geometric_alloc(
+                &w, rows, cols, &counts, group, 8, rot,
+            );
+            let uniform = ste::salt_quantize_forward_grouped_geometric(
+                &w,
+                rows,
+                cols,
+                usize::from(t),
+                group,
+                8,
+                rot,
+            );
+            assert_eq!(
+                alloc.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                uniform.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "T={t} rot={rot:?}: uniform allocation must be bit-identical to the uniform fitter"
+            );
+        }
+    }
+}
+
+/// Spending planes where they are asked for must actually move error: a group given more planes
+/// fits better than the same group given fewer. This is what makes an allocator's decision mean
+/// something, and it guards against the plane count being silently ignored.
+#[test]
+fn a_group_given_more_planes_fits_better() {
+    let (rows, cols, group) = (1usize, 256usize, 128usize);
+    let w = gaussian(0x9E77, rows * cols);
+    let sse_of = |q: &[f32], lo: usize, hi: usize| -> f64 {
+        q[lo..hi]
+            .iter()
+            .zip(&w[lo..hi])
+            .map(|(&a, &b)| f64::from(a - b) * f64::from(a - b))
+            .sum()
+    };
+    // Group 0 rich, group 1 poor.
+    let q = ste::salt_quantize_forward_grouped_geometric_alloc(
+        &w,
+        rows,
+        cols,
+        &[4, 1],
+        group,
+        16,
+        RotationPolicy::Never,
+    );
+    let rich = sse_of(&q, 0, group);
+    let poor = sse_of(&q, group, 2 * group);
+
+    // ... and the same groups with the allocation swapped, so this cannot be a property of the data.
+    let swapped = ste::salt_quantize_forward_grouped_geometric_alloc(
+        &w,
+        rows,
+        cols,
+        &[1, 4],
+        group,
+        16,
+        RotationPolicy::Never,
+    );
+    let now_poor = sse_of(&swapped, 0, group);
+    let now_rich = sse_of(&swapped, group, 2 * group);
+
+    assert!(
+        rich < now_poor,
+        "group 0 at T=4 ({rich:.4e}) must beat itself at T=1 ({now_poor:.4e})"
+    );
+    assert!(
+        now_rich < poor,
+        "group 1 at T=4 ({now_rich:.4e}) must beat itself at T=1 ({poor:.4e})"
+    );
+}

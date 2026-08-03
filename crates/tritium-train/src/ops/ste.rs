@@ -666,6 +666,57 @@ pub fn salt_quantize_forward_grouped_geometric(
     out
 }
 
+/// [`salt_quantize_forward_grouped_geometric`] with a **per-group plane count**.
+///
+/// The uniform-`T` fitter spends the same bits on every group regardless of how much the loss cares
+/// about it. Rate-distortion allocation (`tritium_quantize::allocate_with_curves`) instead hands
+/// each group a `T_g` by loss-drop-per-bit, so sensitive groups get resolution and inert ones do
+/// not. This is the fitter side of that: the allocator decides `T_g`, this reconstructs it.
+///
+/// `planes` is one count per group in row-major group order — `row * cols.div_ceil(group) + block`,
+/// the same layout as [`rotation_mask`]. A count of `0` reconstructs the group as all-zero (the
+/// allocator is permitted to prune a tile to nothing); counts are otherwise unbounded here, with
+/// the ladder's own `T ≤ 9` limit applying.
+///
+/// Passing a uniform count reproduces [`salt_quantize_forward_grouped_geometric`] bit-for-bit,
+/// which is what makes an allocated arm comparable to a uniform baseline.
+///
+/// # Panics
+/// If `planes.len()` is not `rows * cols.div_ceil(group)`.
+#[must_use]
+pub fn salt_quantize_forward_grouped_geometric_alloc(
+    wf: &[f32],
+    rows: usize,
+    cols: usize,
+    planes: &[u8],
+    group: usize,
+    grid: usize,
+    rotation: RotationPolicy,
+) -> Vec<f32> {
+    let group = group.max(1);
+    let per_row = cols.div_ceil(group);
+    assert_eq!(
+        planes.len(),
+        rows * per_row,
+        "geometric allocation must carry one plane count per group"
+    );
+    let mut out = vec![0.0f32; wf.len()];
+    let mut buf: Vec<f32> = Vec::with_capacity(group);
+    for r in 0..rows {
+        let src = &wf[r * cols..(r + 1) * cols];
+        let dst = &mut out[r * cols..(r + 1) * cols];
+        for (b, (bs, bd)) in src.chunks(group).zip(dst.chunks_mut(group)).enumerate() {
+            let t = usize::from(planes[r * per_row + b]);
+            if t == 0 {
+                continue; // pruned tile: already zero
+            }
+            let (fit, _, _) = fit_group_geometric_rotated(bs, t, grid, rotation, &mut buf);
+            bd.copy_from_slice(&fit);
+        }
+    }
+    out
+}
+
 /// The `(s₀, plane-major trits)` [`salt_quantize_forward_grouped_geometric`] produces, per group, in
 /// row-major group order (`row * cols.div_ceil(group) + block`) — the layout a packer and the
 /// diagnostics index by.
