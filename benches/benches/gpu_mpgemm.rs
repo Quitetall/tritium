@@ -98,7 +98,9 @@ mod gpu_benches {
         match init() {
             Ok(b) => Some(b),
             Err(e) => {
-                eprintln!("skipping gpu mpgemm bench: {name} backend init failed ({e}); no device?");
+                eprintln!(
+                    "skipping gpu mpgemm bench: {name} backend init failed ({e}); no device?"
+                );
                 None
             }
         }
@@ -126,7 +128,12 @@ mod gpu_benches {
     /// comparable across vendors. Reports `M·N·K` MACs/iter.
     #[divan::bench(args = gpu_cases())]
     fn gpu_add_only(bencher: Bencher, case: &GpuCase) {
-        let &GpuCase { backend: name, m, n, k } = case;
+        let &GpuCase {
+            backend: name,
+            m,
+            n,
+            k,
+        } = case;
         let shape = GemmShape { m, n, k };
         let Some(backend) = backend_named(name) else {
             return;

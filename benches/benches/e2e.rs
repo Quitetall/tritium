@@ -42,12 +42,21 @@
 //! (`tritium report compare --backend wgpu|rocm`, docs/BENCHMARKS.md), which reports
 //! rather than gates.
 
-#![cfg_attr(
-    not(all(feature = "cuda", feature = "wgpu", feature = "rocm")),
-    allow(unused_crate_dependencies)
-)]
+// Only `tritium-cuda` is ever used by this file, so the gate stays keyed on `cuda`
+// alone. (The `wgpu` / `rocm` dev-dependencies the bench crate now carries are
+// deliberately unused here — see "Why this one stays CUDA-only" above.)
+#![cfg_attr(not(feature = "cuda"), allow(unused_crate_dependencies))]
 
 fn main() {
+    // Without `cuda` this binary has no bench bodies at all. Say so: a silent empty
+    // run reads as "measured and fine", and someone who built `--features wgpu`
+    // specifically to get a number off NVIDIA deserves to be told where to get one.
+    #[cfg(not(feature = "cuda"))]
+    eprintln!(
+        "e2e bench: no bodies compiled (needs `--features cuda`). This bench is a \
+         CUDA regression gate, not a portable harness; for an end-to-end decode \
+         figure on another backend use `tritium report compare --backend <name>`."
+    );
     divan::main();
 }
 

@@ -21,10 +21,10 @@ use tritium_cuda as _;
 // registry, and an entry only exists if the backend crate is linked into this
 // binary. Without these two lines an AMD box reports only `cpu` however the GPU
 // crates were built (issue #4).
-#[cfg(feature = "wgpu")]
-use tritium_wgpu as _;
 #[cfg(feature = "rocm")]
 use tritium_rocm as _;
+#[cfg(feature = "wgpu")]
+use tritium_wgpu as _;
 
 use std::path::PathBuf;
 

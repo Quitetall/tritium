@@ -30,6 +30,7 @@ with the listed stable diagnostic instead of silently falling back.
 | Target | Status | Evidence / failure |
 |---|---|---|
 | Linux CUDA wheels | **pending** | Driver, runtime, PyTorch and GPU-architecture receipts are not yet archived. |
+| Non-NVIDIA GPU execution backend (wgpu/Vulkan, ROCm) | **pending** | The tritium-cli and tritium-benches wgpu/rocm lanes now exist (issue #4), but no `tritium report compare` ledger JSON from a physical non-NVIDIA GPU has been archived. Compile-only and Vulkan-on-NVIDIA runs do not qualify this row. |
 | ROCm wheel | **unsupported** | `TRITIUM_UNSUPPORTED_ROCM_WHEEL_V1_1` |
 | Metal-specific wheel | **unsupported** | `TRITIUM_UNSUPPORTED_METAL_WHEEL_V1_1` |
 

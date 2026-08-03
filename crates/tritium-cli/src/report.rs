@@ -257,21 +257,29 @@ fn smi(args: &[&str]) -> String {
 
 /// Resolve the ledger's `gpu` field from the two sources that can know it.
 ///
-/// `nvidia-smi` wins whenever it answers: every historical BENCHMARKS.md row was
-/// recorded with its string, and changing the basis under them would silently
-/// invalidate the ledger. Off NVIDIA it reports nothing, so fall back to the
-/// adapter name the initialised backend already carries in its [`DeviceCaps`] —
-/// otherwise an AMD/Vulkan `report compare` emits a JSON that identifies no GPU at
-/// all, which is not a receipt (issue #4). The `[backend]` suffix marks which
-/// source answered so the two are never confused when read back.
+/// **The backend that actually ran wins**, because it is the only source that knows
+/// *which* device executed the work. `nvidia-smi` describes the NVIDIA card in the
+/// box whether or not that card was used — and a box can expose several adapters
+/// (this repo's build box offers both an RTX 4090 and an Intel iGPU to Vulkan), so
+/// trusting it on a `--backend wgpu` run can record a GPU the run never touched.
+/// That false receipt is worse than the missing one this fallback was added to fix.
+///
+/// `nvidia-smi` is therefore consulted only where it is authoritative: a `cuda` run
+/// (whose string is what every historical BENCHMARKS.md row was recorded with, so
+/// the basis under them does not move), or a run with no device backend at all
+/// (`--backend cpu`), where it is still a fair description of the box.
 fn resolve_gpu(smi_gpu: &str, caps: Option<&DeviceCaps>) -> String {
-    if !smi_gpu.is_empty() && smi_gpu != "unavailable" {
+    let smi_is_authoritative = caps.is_none_or(|c| c.backend == "cuda");
+    if smi_is_authoritative && !smi_gpu.is_empty() && smi_gpu != "unavailable" {
         return smi_gpu.to_owned();
     }
     match caps {
         Some(c) if !c.device_name.is_empty() => {
             format!("{} [{}]", c.device_name, c.backend)
         }
+        // No backend name to fall back on: report the vendor tool's answer if it
+        // gave one, else say so plainly rather than inventing a device.
+        _ if !smi_gpu.is_empty() && smi_gpu != "unavailable" => smi_gpu.to_owned(),
         _ => "unavailable".to_owned(),
     }
 }
@@ -1270,24 +1278,37 @@ mod tests {
         assert!((got[1] - 2.0).abs() < f64::EPSILON);
     }
 
-    /// On an NVIDIA box `nvidia-smi` answers and its string is what the existing
-    /// ledger entries were recorded with — the backend's own name must NOT displace
-    /// it, or every historical row silently changes basis.
+    /// On a CUDA run `nvidia-smi` answers and its string is what the existing ledger
+    /// entries were recorded with — the backend's own name must NOT displace it, or
+    /// every historical row silently changes basis.
     #[test]
-    fn gpu_field_prefers_the_vendor_tool_when_it_answers() {
-        let caps = DeviceCaps::new("wgpu", "NVIDIA GeForce RTX 4090 (DiscreteGpu)");
+    fn gpu_field_prefers_the_vendor_tool_on_a_cuda_run() {
+        let caps = DeviceCaps::new("cuda", "NVIDIA GeForce RTX 4090");
         let got = resolve_gpu("NVIDIA GeForce RTX 4090", Some(&caps));
         assert_eq!(got, "NVIDIA GeForce RTX 4090");
     }
 
-    /// The issue-#4 case: on an AMD/Vulkan box `nvidia-smi` is absent, so every env
-    /// field reads "unavailable" and the emitted JSON identifies no GPU at all — not
-    /// a receipt. The backend already knows its adapter name; use it.
+    /// A box can hold more than one adapter — this very repo's build box exposes an
+    /// RTX 4090 *and* an Intel iGPU to Vulkan. `nvidia-smi` describes the NVIDIA card
+    /// whether or not that is the device the run used, so on a non-CUDA backend it
+    /// must NOT win: recording "RTX 4090" for a run executed on the Intel adapter is
+    /// exactly the false receipt this fallback exists to prevent.
     #[test]
-    fn gpu_field_falls_back_to_the_backend_adapter_name_off_nvidia() {
-        let caps = DeviceCaps::new("wgpu", "AMD Radeon RX 9070 XT (RADV GFX1201)");
+    fn gpu_field_ignores_nvidia_smi_when_another_backend_ran() {
+        let caps = DeviceCaps::new("wgpu", "Intel(R) Graphics (RPL-S) (IntegratedGpu)");
+        let got = resolve_gpu("NVIDIA GeForce RTX 4090", Some(&caps));
+        assert_eq!(got, "Intel(R) Graphics (RPL-S) (IntegratedGpu) [wgpu]");
+    }
+
+    /// The issue-#4 case: with no `nvidia-smi` on the box every env field reads
+    /// "unavailable" and the emitted JSON identifies no GPU at all — not a receipt.
+    /// The backend already knows its adapter name; use it. (The name here is a
+    /// synthetic fixture, not a measurement from any device.)
+    #[test]
+    fn gpu_field_falls_back_to_the_backend_adapter_name_with_no_vendor_tool() {
+        let caps = DeviceCaps::new("wgpu", "test-adapter");
         let got = resolve_gpu("unavailable", Some(&caps));
-        assert_eq!(got, "AMD Radeon RX 9070 XT (RADV GFX1201) [wgpu]");
+        assert_eq!(got, "test-adapter [wgpu]");
     }
 
     /// No vendor tool and no device-backed run (e.g. `--backend cpu`) must stay

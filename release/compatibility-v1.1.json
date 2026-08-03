@@ -13,6 +13,7 @@
     ],
     "accelerator": [
       {"id": "cuda-wheel-matrix", "target": "Linux CUDA wheels", "status": "pending", "blocker": "Driver, runtime, PyTorch and GPU-architecture receipts are not yet archived."},
+      {"id": "non-nvidia-gpu-backend", "target": "Non-NVIDIA GPU execution backend (wgpu/Vulkan, ROCm)", "status": "pending", "blocker": "The tritium-cli and tritium-benches wgpu/rocm lanes now exist (issue #4), but no `tritium report compare` ledger JSON from a physical non-NVIDIA GPU has been archived. Compile-only and Vulkan-on-NVIDIA runs do not qualify this row."},
       {"id": "rocm-wheel", "target": "ROCm wheel", "status": "unsupported", "diagnostic": "TRITIUM_UNSUPPORTED_ROCM_WHEEL_V1_1"},
       {"id": "metal-wheel", "target": "Metal-specific wheel", "status": "unsupported", "diagnostic": "TRITIUM_UNSUPPORTED_METAL_WHEEL_V1_1"}
     ],
