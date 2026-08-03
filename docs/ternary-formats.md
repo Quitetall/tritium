@@ -27,10 +27,15 @@ median +2.3%, "parity, possibly a hair better" — OPTIMIZATION-LOG "Round
 15/16 caveat CLOSED"). The kernel-level 1.51× gateup penalty (base-243
 decode costs ~24 ALU ops per dp4a word vs TQ2_0's ~3, round 16) does not
 materialize end-to-end: decode is latency-bound outside the GEMMs and the
-−20% gateup DRAM traffic offsets. v1 scope: the single-sequence path only —
-`--batch-slots > 1`, tree/spec sessions, and `--draft-model` refuse TQ1
-loudly per-request (the `gb_*` batched/tree graph builders are TQ2-only;
-`build_batch`/`tree_forward` guards).
+−20% gateup DRAM traffic offsets. As of T5 (c61c76d) the rung serves
+EVERYWHERE: `--batch-slots > 1`, tree/spec sessions, `--draft-model`, and
+multi-slot spec decode all run TQ1 (the `gb_matmul` dispatch gained the tq1
+arm; batched decode and tree verify are gated bit-identical to tq2 — exact
+i32 accumulation + identical epilogue make this structural, not shape-luck).
+Two caveats: host-CPU mpgemm has no TQ1 kernel (backend loads refuse), and
+TQ1 skips the IMMA prefill shadows — a measured batched-spec serve saved
+674 MiB total (payload −18% PLUS the dropped ~0.25 B/w IMMA shadows), at
+the cost of dp4a-only prefill. Pick tq1 for VRAM, tq2 for prefill speed.
 
 ## TB1 bitmap+signs: measured, refuted, kept
 
