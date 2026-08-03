@@ -54,17 +54,39 @@ impl CudaDecodeModel {
     /// order their reads on that stream (L2, ADR 0032: the two per-verify
     /// full syncs this fn used to carry are gone; the single ordering point
     /// is the consumer's own readback).
+    ///
+    /// I2 (L3 batch-slot spec decode): `slot = Some((batch, r))` runs the SAME
+    /// forward against dense batch slot `r` of a `BatchKv` instead of the
+    /// single-seq cache — the prefix is the slot's rows `[0, positions[r])`,
+    /// provisional K/V land at region rows `[positions[r], positions[r]+m)`,
+    /// and every KV row index is offset by `r · max_ctx` (graph route: via
+    /// `ctrl[2]`; eager route: via a region-offset arena view / a shifted
+    /// `cache_len` scalar). `slot = None` is the pre-I2 single-seq path,
+    /// bit-identical (base 0). The scratch + captured graphs live on the
+    /// TARGET (`self.tree_scratch`/`tree_graphs` vs the batch's own fields),
+    /// so the two never invalidate each other. Callers guarantee for `slot`:
+    /// dense (non-paged) batch, f32 KV rung, valid live row.
     fn tree_forward(
         &mut self,
         tokens: &[u32],
         parents: &[i32],
+        mut slot: Option<(&mut BatchKv, usize)>,
     ) -> Result<(usize, bool), BackendError> {
         // v1: the tree graph builders reuse the TQ2-only gb_* kernels.
         if self.layers.first().is_some_and(|l| l.qkv.tq1) {
             return Err(BackendError::UnsupportedFormat(TernaryFormat::Tq1_0));
         }
-        // A new forward invalidates any uncommitted previous tree.
-        self.pending_tree = None;
+        // A new single-seq forward invalidates any uncommitted previous tree.
+        // A batch-slot forward touches neither the single-seq arenas nor the
+        // single-seq scratch, so a pending single-seq tree stays committable.
+        if slot.is_none() {
+            self.pending_tree = None;
+        }
+        // Region geometry: watermark, capacity and KV row base of the target.
+        let (prefix_len, region_ctx, row_base) = match &slot {
+            Some((b, r)) => (b.positions[*r], b.max_ctx, *r * b.max_ctx),
+            None => (self.cache_len, self.max_ctx, 0),
+        };
         let m = tokens.len();
         if m == 0 || parents.len() != m {
             return Err(BackendError::InvalidInput(
@@ -90,10 +112,9 @@ impl CudaDecodeModel {
                 )));
             }
         }
-        if self.cache_len + m > self.max_ctx {
+        if prefix_len + m > region_ctx {
             return Err(BackendError::InvalidInput(format!(
-                "tree_verify overflow: cache_len={} + {m} nodes > max_ctx={}",
-                self.cache_len, self.max_ctx
+                "tree_verify overflow: prefix_len={prefix_len} + {m} nodes > region max_ctx={region_ctx}"
             )));
         }
 
@@ -104,6 +125,10 @@ impl CudaDecodeModel {
         // score staging fits the default shared-memory limit (the raw-handle
         // capture path doesn't carry the opt-in attribute the safe handles
         // get at load).
+        // (Batch slots share every condition: the slot-route wrapper requires
+        // the f32 KV rung, batch arenas are f32, and `batch.max_ctx` equals
+        // `self.max_ctx` by construction — the score stride and reduce smem
+        // stay `self.max_ctx` for both targets.)
         let bucket = if self.head_dim.is_multiple_of(4)
             && m <= TREE_BUCKET_MAX
             && self.max_ctx * 4 <= 48 * 1024
@@ -113,7 +138,7 @@ impl CudaDecodeModel {
             TREE_BUCKETS
                 .iter()
                 .copied()
-                .find(|&b| b >= m && self.cache_len + b <= self.max_ctx)
+                .find(|&b| b >= m && prefix_len + b <= region_ctx)
         } else {
             None
         };
@@ -136,7 +161,9 @@ impl CudaDecodeModel {
         let mb = bucket.unwrap_or(m);
 
         // Depths, RoPE positions, and per-node ancestor slot lists (root-first,
-        // including self). Ancestors are arena slots (cache_len + node index).
+        // including self). Ancestors are REGION-LOCAL arena slots
+        // (prefix_len + node index): the kernels add the KV row base, so the
+        // same table shape serves the single-seq cache and any batch slot.
         let mut depth = vec![0usize; m];
         let mut anc: Vec<i32> = vec![0; mb * mb]; // [mb, max_anc=mb], row-major
         let mut n_anc = vec![0i32; mb];
@@ -148,28 +175,27 @@ impl CudaDecodeModel {
                 let np = n_anc[p] as usize;
                 // anc[i] = anc[parent] ++ [slot(i)] (rows are disjoint: p < i).
                 anc.copy_within(src_off..src_off + np, dst_off);
-                anc[dst_off + np] = (self.cache_len + i) as i32;
+                anc[dst_off + np] = (prefix_len + i) as i32;
                 n_anc[i] = n_anc[p] + 1;
             } else {
-                anc[i * mb] = (self.cache_len + i) as i32;
+                anc[i * mb] = (prefix_len + i) as i32;
                 n_anc[i] = 1;
             }
         }
         for i in m..mb {
             // Pad: a root child (its ancestor list is the root's slot + its own).
-            anc[i * mb] = self.cache_len as i32;
-            anc[i * mb + 1] = (self.cache_len + i) as i32;
+            anc[i * mb] = prefix_len as i32;
+            anc[i * mb + 1] = (prefix_len + i) as i32;
             n_anc[i] = 2;
         }
-        let mut positions: Vec<i32> = depth.iter().map(|&d| (self.cache_len + d) as i32).collect();
-        positions.resize(mb, (self.cache_len + 1) as i32);
+        let mut positions: Vec<i32> = depth.iter().map(|&d| (prefix_len + d) as i32).collect();
+        positions.resize(mb, (prefix_len + 1) as i32);
 
         let s = &self.stream;
         let (n_embd, q_width, kv_width, n_ff) =
             (self.n_embd, self.q_width, self.kv_width, self.n_ff);
         let (n_head, n_head_kv, head_dim) = (self.n_head, self.n_head_kv, self.head_dim);
-        let prefix_len = self.cache_len;
-        let ctx_max = self.cache_len + m;
+        let ctx_max = prefix_len + m;
 
         // Reusable M=N scratch: allocated on first use (or re-grown for a larger
         // tree), then cached on the model — per-call alloc/free measurably ate
@@ -179,63 +205,38 @@ impl CudaDecodeModel {
         // graphs' baked pointers stay valid; an oversized eager tree (> the
         // bucket max) re-grows the scratch and must drop every graph.
         let m_cap_want = mb.max(TREE_BUCKET_MAX);
-        if self
-            .tree_scratch
-            .as_ref()
-            .is_none_or(|t| t.m_cap < m_cap_want)
-        {
-            // Unconditional: an error-path `?` between take and put-back drops
-            // the scratch while captured graphs keep its baked pointers — on
-            // the next call the scratch is None but stale graphs would replay
-            // into freed memory if this drop were guarded on `is_some()`.
-            self.tree_graphs = None;
-            let m = m_cap_want;
-            let alloc =
-                |n: usize, what: &str| s.alloc_zeros::<f32>(n).map_err(|e| driver_err(what, &e));
-            self.tree_scratch = Some(TreeScratch {
-                m_cap: m,
-                d_x: alloc(m * n_embd, "tree d_x")?,
-                d_normed: alloc(m * n_embd, "tree d_normed")?,
-                d_q: alloc(m * q_width, "tree d_q")?,
-                d_k: alloc(m * kv_width, "tree d_k")?,
-                d_v: alloc(m * kv_width, "tree d_v")?,
-                d_attn: alloc(m * q_width, "tree d_attn")?,
-                d_attn_sn: alloc(m * q_width, "tree d_attn_sn")?,
-                d_proj: alloc(m * n_embd, "tree d_proj")?,
-                d_gate: alloc(m * n_ff, "tree d_gate")?,
-                d_up: alloc(m * n_ff, "tree d_up")?,
-                d_gate_sn: alloc(m * n_ff, "tree d_gate_sn")?,
-                d_qact: s
-                    .alloc_zeros::<i8>(m * n_ff)
-                    .map_err(|e| driver_err("tree d_qact", &e))?,
-                d_act_scale: alloc(m, "tree d_act_scale")?,
-                d_scores: alloc(m * n_head * self.max_ctx, "tree d_scores")?,
-                d_logits_all: alloc(m * self.vocab, "tree d_logits")?,
-                d_norm_all: alloc(m * n_embd, "tree d_norm_all")?,
-                d_ids: s
-                    .alloc_zeros::<i32>(m)
-                    .map_err(|e| driver_err("tree d_ids", &e))?,
-                d_tok: s
-                    .alloc_zeros::<i32>(m)
-                    .map_err(|e| driver_err("tree d_tok", &e))?,
-                d_pos: s
-                    .alloc_zeros::<i32>(m)
-                    .map_err(|e| driver_err("tree d_pos", &e))?,
-                d_anc: s
-                    .alloc_zeros::<i32>(m * m)
-                    .map_err(|e| driver_err("tree d_anc", &e))?,
-                d_nanc: s
-                    .alloc_zeros::<i32>(m)
-                    .map_err(|e| driver_err("tree d_nanc", &e))?,
-                d_amax_val: alloc(m * ARGMAX_CHUNKS, "tree d_amax_val")?,
-                d_amax_idx: s
-                    .alloc_zeros::<i32>(m * ARGMAX_CHUNKS)
-                    .map_err(|e| driver_err("tree d_amax_idx", &e))?,
-            });
+        let scratch_stale = match &slot {
+            Some((b, _)) => b.tree_scratch.as_ref().is_none_or(|t| t.m_cap < m_cap_want),
+            None => self
+                .tree_scratch
+                .as_ref()
+                .is_none_or(|t| t.m_cap < m_cap_want),
+        };
+        if scratch_stale {
+            // Drop the owner's graphs FIRST, unconditionally: an error-path
+            // `?` on a previous call may have dropped the scratch while
+            // captured graphs kept its baked pointers — stale graphs must be
+            // gone before anything could ever replay them (and before the
+            // alloc below, so an alloc failure can't resurrect the hazard).
+            match slot.as_mut() {
+                Some((b, _)) => b.tree_graphs = None,
+                None => self.tree_graphs = None,
+            }
+            let ts_new = self.alloc_tree_scratch(m_cap_want)?;
+            match slot.as_mut() {
+                Some((b, _)) => b.tree_scratch = Some(ts_new),
+                None => self.tree_scratch = Some(ts_new),
+            }
         }
-        // Move the scratch out for disjoint borrows vs `self.kv_*` below; put
-        // it back once the device work completes.
-        let mut ts = self.tree_scratch.take().expect("tree scratch just ensured");
+        // Move the scratch out for disjoint borrows vs the KV arenas below;
+        // put it back on the same owner once the device work completes. (An
+        // early `?` drops it instead; the `scratch_stale` check above then
+        // re-allocates AND drops the owner's stale graphs on the next call.)
+        let mut ts = match slot.as_mut() {
+            Some((b, _)) => b.tree_scratch.take(),
+            None => self.tree_scratch.take(),
+        }
+        .expect("tree scratch just ensured");
 
         // Uploads go into the cached buffers too (oversized is fine — kernels
         // read exactly the first m / m·m entries; `max_anc == m` is a stride
@@ -263,53 +264,112 @@ impl CudaDecodeModel {
             // ── Graph route: replay the captured trunk (1 launch), then the
             // eager tail at the REAL node count (a padded LM head would read
             // the 656 MB f16 table once per extra 8-row tile).
+            //
+            // Drain any pending default-stream work before the replay (on
+            // `cap_stream`) touches the KV arena — the same edge `step_graph`
+            // and `decode_batch_graph` order. Without it, back-to-back
+            // verifies race: the PREVIOUS verify's `tree_promote` dtods run
+            // on the default stream, and this replay's kv_append overwrites
+            // their SOURCE rows (found as a wrong promoted row in the I2
+            // bitwise KV gate; the eager route shares the default stream and
+            // never races).
+            self.stream
+                .synchronize()
+                .map_err(|e| driver_err("tree pre-replay default sync", &e))?;
             if self.batch_raw.is_none() {
                 let ctx = self.cap_stream.context().clone();
                 self.batch_raw = Some(Arc::new(BatchRawKernels::load(&ctx)?));
             }
-            if self.tree_graphs.is_none() {
+            let owner_missing = match &slot {
+                Some((b, _)) => b.tree_graphs.is_none(),
+                None => self.tree_graphs.is_none(),
+            };
+            if owner_missing {
                 let d_ctrl = self
                     .cap_stream
-                    .alloc_zeros::<i32>(2)
+                    .alloc_zeros::<i32>(3)
                     .map_err(|e| driver_err("tree ctrl alloc", &e))?;
-                self.tree_graphs = Some(TreeGraphs {
+                let tg = TreeGraphs {
                     d_ctrl,
                     graphs: HashMap::new(),
                     raw_keepalive: self.batch_raw.clone(),
-                });
+                };
+                match slot.as_mut() {
+                    Some((b, _)) => b.tree_graphs = Some(tg),
+                    None => self.tree_graphs = Some(tg),
+                }
             }
-            let have = self
-                .tree_graphs
-                .as_ref()
-                .expect("tree graphs just ensured")
-                .graphs
-                .contains_key(&bucket);
+            let have = match &slot {
+                Some((b, _)) => b
+                    .tree_graphs
+                    .as_ref()
+                    .expect("tree graphs just ensured")
+                    .graphs
+                    .contains_key(&bucket),
+                None => self
+                    .tree_graphs
+                    .as_ref()
+                    .expect("tree graphs just ensured")
+                    .graphs
+                    .contains_key(&bucket),
+            };
             if !have {
                 if std::env::var_os("TRITIUM_TREE_DEBUG").is_some() {
                     eprintln!("tree-graph: capturing bucket {bucket}");
                 }
-                let g = self.record_graph_tree(&ts, bucket)?;
-                self.tree_graphs
-                    .as_mut()
-                    .expect("tree graphs just ensured")
-                    .graphs
-                    .insert(bucket, SendGraph(g));
+                // Bake the TARGET's ctrl + KV arena pointers into the capture
+                // (the row base rides in ctrl at replay, so one batch capture
+                // serves every slot).
+                let cs = &self.cap_stream;
+                let (d_ctrl, kv): (sys::CUdeviceptr, Vec<(sys::CUdeviceptr, sys::CUdeviceptr)>) =
+                    match &slot {
+                        Some((b, _)) => (
+                            dptr(&b.tree_graphs.as_ref().expect("just ensured").d_ctrl, cs),
+                            (0..self.layers.len())
+                                .map(|li| (dptr(&b.kv_k[li], cs), dptr(&b.kv_v[li], cs)))
+                                .collect(),
+                        ),
+                        None => (
+                            dptr(&self.tree_graphs.as_ref().expect("just ensured").d_ctrl, cs),
+                            (0..self.layers.len())
+                                .map(|li| (dptr(&self.kv_k[li], cs), dptr(&self.kv_v[li], cs)))
+                                .collect(),
+                        ),
+                    };
+                let g = self.record_graph_tree(&ts, bucket, d_ctrl, &kv)?;
+                match slot.as_mut() {
+                    Some((b, _)) => b
+                        .tree_graphs
+                        .as_mut()
+                        .expect("tree graphs just ensured")
+                        .graphs
+                        .insert(bucket, SendGraph(g)),
+                    None => self
+                        .tree_graphs
+                        .as_mut()
+                        .expect("tree graphs just ensured")
+                        .graphs
+                        .insert(bucket, SendGraph(g)),
+                };
             }
             // Uploads, ctrl write, replay and tail all sit on `cap_stream` —
             // stream order is the only ordering needed (no host sync).
-            let ctrl = [prefix_len as i32, m as i32];
-            let tg = self.tree_graphs.as_mut().expect("tree graphs just ensured");
-            self.cap_stream
-                .memcpy_htod(&ctrl, &mut tg.d_ctrl)
-                .map_err(|e| driver_err("tree ctrl htod", &e))?;
-            self.tree_graphs
-                .as_ref()
-                .expect("tree graphs just ensured")
-                .graphs
-                .get(&bucket)
-                .expect("tree graph just inserted")
-                .launch()
-                .map_err(|e| driver_err("tree graph launch", &e))?;
+            let ctrl = [prefix_len as i32, m as i32, row_base as i32];
+            {
+                let tg = match slot.as_mut() {
+                    Some((b, _)) => b.tree_graphs.as_mut(),
+                    None => self.tree_graphs.as_mut(),
+                }
+                .expect("tree graphs just ensured");
+                self.cap_stream
+                    .memcpy_htod(&ctrl, &mut tg.d_ctrl)
+                    .map_err(|e| driver_err("tree ctrl htod", &e))?;
+                tg.graphs
+                    .get(&bucket)
+                    .expect("tree graph just inserted")
+                    .launch()
+                    .map_err(|e| driver_err("tree graph launch", &e))?;
+            }
             let cs = &self.cap_stream;
             Self::bl_rmsnorm(
                 cs,
@@ -418,86 +478,164 @@ impl CudaDecodeModel {
                     head_dim,
                     m,
                 )?;
-                // Provisional K/V at arena rows [cache_len, cache_len + m) — node i's
-                // row is cache_len + i regardless of its depth (attention resolves
-                // rows through the ancestor table, not contiguity).
-                Self::bl_kv_append(
-                    s,
-                    &self.f_kv_append_batch,
-                    &ts.d_k,
-                    &mut self.kv_k[li],
-                    prefix_len,
-                    kv_width,
-                    m,
-                    if self.kv_dtype.has_scales() {
-                        Some(&mut self.kv_k_scales[li])
-                    } else {
-                        None
-                    },
-                )?;
-                Self::bl_kv_append(
-                    s,
-                    &self.f_kv_append_batch,
-                    &ts.d_v,
-                    &mut self.kv_v[li],
-                    prefix_len,
-                    kv_width,
-                    m,
-                    if self.kv_dtype.has_scales() {
-                        Some(&mut self.kv_v_scales[li])
-                    } else {
-                        None
-                    },
-                )?;
-                if head_dim.is_multiple_of(4) {
-                    Self::bl_attn_tree_split(
-                        s,
-                        &self.f_attn_tree_scores,
-                        &self.f_attn_tree_reduce,
-                        &ts.d_q,
-                        &self.kv_k[li],
-                        &self.kv_v[li],
-                        if self.kv_dtype.has_scales() {
-                            Some(&self.kv_k_scales[li])
+                // Provisional K/V at region rows [prefix_len, prefix_len + m) —
+                // node i's row is prefix_len + i regardless of its depth
+                // (attention resolves rows through the ancestor table, not
+                // contiguity). Single-seq: the model arenas at base 0. Batch
+                // slot: the batch's f32 arena, with the row base folded into
+                // the kv_append `cache_len` scalar and the attention views'
+                // pointer offset (region-relative indexing either way).
+                match slot.as_mut() {
+                    None => {
+                        Self::bl_kv_append(
+                            s,
+                            &self.f_kv_append_batch,
+                            &ts.d_k,
+                            &mut self.kv_k[li],
+                            prefix_len,
+                            kv_width,
+                            m,
+                            if self.kv_dtype.has_scales() {
+                                Some(&mut self.kv_k_scales[li])
+                            } else {
+                                None
+                            },
+                        )?;
+                        Self::bl_kv_append(
+                            s,
+                            &self.f_kv_append_batch,
+                            &ts.d_v,
+                            &mut self.kv_v[li],
+                            prefix_len,
+                            kv_width,
+                            m,
+                            if self.kv_dtype.has_scales() {
+                                Some(&mut self.kv_v_scales[li])
+                            } else {
+                                None
+                            },
+                        )?;
+                        let (kview, vview) = (self.kv_k[li].as_view(), self.kv_v[li].as_view());
+                        if head_dim.is_multiple_of(4) {
+                            Self::bl_attn_tree_split(
+                                s,
+                                &self.f_attn_tree_scores,
+                                &self.f_attn_tree_reduce,
+                                &ts.d_q,
+                                &kview,
+                                &vview,
+                                if self.kv_dtype.has_scales() {
+                                    Some(&self.kv_k_scales[li])
+                                } else {
+                                    None
+                                },
+                                if self.kv_dtype.has_scales() {
+                                    Some(&self.kv_v_scales[li])
+                                } else {
+                                    None
+                                },
+                                &mut ts.d_attn,
+                                &mut ts.d_scores,
+                                &ts.d_anc,
+                                &ts.d_nanc,
+                                ctx_max,
+                                n_head,
+                                n_head_kv,
+                                head_dim,
+                                self.attn_scale,
+                                prefix_len,
+                                m,
+                            )?;
                         } else {
-                            None
-                        },
-                        if self.kv_dtype.has_scales() {
-                            Some(&self.kv_v_scales[li])
+                            Self::bl_attn_tree(
+                                s,
+                                &self.f_attn_tree,
+                                &ts.d_q,
+                                &kview,
+                                &vview,
+                                &mut ts.d_attn,
+                                &mut ts.d_scores,
+                                &ts.d_anc,
+                                &ts.d_nanc,
+                                ctx_max,
+                                n_head,
+                                n_head_kv,
+                                head_dim,
+                                self.attn_scale,
+                                prefix_len,
+                                m,
+                            )?;
+                        }
+                    }
+                    Some((b, _)) => {
+                        // Batch arenas are f32 (no scale planes); the slot
+                        // wrapper guarantees kv_elem == 4, so the dtype-
+                        // selected handles below are the f32 kernels.
+                        Self::bl_kv_append(
+                            s,
+                            &self.f_kv_append_batch,
+                            &ts.d_k,
+                            &mut b.kv_k[li],
+                            row_base + prefix_len,
+                            kv_width,
+                            m,
+                            None,
+                        )?;
+                        Self::bl_kv_append(
+                            s,
+                            &self.f_kv_append_batch,
+                            &ts.d_v,
+                            &mut b.kv_v[li],
+                            row_base + prefix_len,
+                            kv_width,
+                            m,
+                            None,
+                        )?;
+                        let (lo, hi) = (row_base * kv_width, (row_base + region_ctx) * kv_width);
+                        let (kview, vview) = (b.kv_k[li].slice(lo..hi), b.kv_v[li].slice(lo..hi));
+                        if head_dim.is_multiple_of(4) {
+                            Self::bl_attn_tree_split(
+                                s,
+                                &self.f_attn_tree_scores,
+                                &self.f_attn_tree_reduce,
+                                &ts.d_q,
+                                &kview,
+                                &vview,
+                                None,
+                                None,
+                                &mut ts.d_attn,
+                                &mut ts.d_scores,
+                                &ts.d_anc,
+                                &ts.d_nanc,
+                                ctx_max,
+                                n_head,
+                                n_head_kv,
+                                head_dim,
+                                self.attn_scale,
+                                prefix_len,
+                                m,
+                            )?;
                         } else {
-                            None
-                        },
-                        &mut ts.d_attn,
-                        &mut ts.d_scores,
-                        &ts.d_anc,
-                        &ts.d_nanc,
-                        ctx_max,
-                        n_head,
-                        n_head_kv,
-                        head_dim,
-                        self.attn_scale,
-                        prefix_len,
-                        m,
-                    )?;
-                } else {
-                    Self::bl_attn_tree(
-                        s,
-                        &self.f_attn_tree,
-                        &ts.d_q,
-                        &self.kv_k[li],
-                        &self.kv_v[li],
-                        &mut ts.d_attn,
-                        &mut ts.d_scores,
-                        &ts.d_anc,
-                        &ts.d_nanc,
-                        ctx_max,
-                        n_head,
-                        n_head_kv,
-                        head_dim,
-                        self.attn_scale,
-                        prefix_len,
-                        m,
-                    )?;
+                            Self::bl_attn_tree(
+                                s,
+                                &self.f_attn_tree,
+                                &ts.d_q,
+                                &kview,
+                                &vview,
+                                &mut ts.d_attn,
+                                &mut ts.d_scores,
+                                &ts.d_anc,
+                                &ts.d_nanc,
+                                ctx_max,
+                                n_head,
+                                n_head_kv,
+                                head_dim,
+                                self.attn_scale,
+                                prefix_len,
+                                m,
+                            )?;
+                        }
+                    }
                 }
                 let attn_in: &CudaSlice<f32> =
                     if let Some(sn) = self.layers[li].attn_sub_norm.as_ref() {
@@ -636,11 +774,66 @@ impl CudaDecodeModel {
                 &mut ts.d_logits_all,
             )?;
         }
-        // Forward complete: logits for every tree node sit in
-        // `tree_scratch.d_logits_all[0..m*vocab]`; provisional K/V occupy arena
-        // rows [cache_len, cache_len + m). Nothing is committed yet.
-        self.tree_scratch = Some(ts);
+        // Forward complete: logits for every tree node sit in the target's
+        // `tree_scratch.d_logits_all[0..m*vocab]`; provisional K/V occupy
+        // region rows [prefix_len, prefix_len + m). Nothing is committed yet.
+        match slot.as_mut() {
+            Some((b, _)) => b.tree_scratch = Some(ts),
+            None => self.tree_scratch = Some(ts),
+        }
         Ok((m, bucket.is_some()))
+    }
+
+    /// Allocate a [`TreeScratch`] sized for `m_cap` tree nodes (shared by the
+    /// single-seq target and each `BatchKv`'s own scratch — the buffers are
+    /// tree-shaped, not target-shaped).
+    fn alloc_tree_scratch(&self, m_cap: usize) -> Result<TreeScratch, BackendError> {
+        let s = &self.stream;
+        let (n_embd, q_width, kv_width, n_ff) =
+            (self.n_embd, self.q_width, self.kv_width, self.n_ff);
+        let m = m_cap;
+        let alloc =
+            |n: usize, what: &str| s.alloc_zeros::<f32>(n).map_err(|e| driver_err(what, &e));
+        Ok(TreeScratch {
+            m_cap: m,
+            d_x: alloc(m * n_embd, "tree d_x")?,
+            d_normed: alloc(m * n_embd, "tree d_normed")?,
+            d_q: alloc(m * q_width, "tree d_q")?,
+            d_k: alloc(m * kv_width, "tree d_k")?,
+            d_v: alloc(m * kv_width, "tree d_v")?,
+            d_attn: alloc(m * q_width, "tree d_attn")?,
+            d_attn_sn: alloc(m * q_width, "tree d_attn_sn")?,
+            d_proj: alloc(m * n_embd, "tree d_proj")?,
+            d_gate: alloc(m * n_ff, "tree d_gate")?,
+            d_up: alloc(m * n_ff, "tree d_up")?,
+            d_gate_sn: alloc(m * n_ff, "tree d_gate_sn")?,
+            d_qact: s
+                .alloc_zeros::<i8>(m * n_ff)
+                .map_err(|e| driver_err("tree d_qact", &e))?,
+            d_act_scale: alloc(m, "tree d_act_scale")?,
+            d_scores: alloc(m * self.n_head * self.max_ctx, "tree d_scores")?,
+            d_logits_all: alloc(m * self.vocab, "tree d_logits")?,
+            d_norm_all: alloc(m * n_embd, "tree d_norm_all")?,
+            d_ids: s
+                .alloc_zeros::<i32>(m)
+                .map_err(|e| driver_err("tree d_ids", &e))?,
+            d_tok: s
+                .alloc_zeros::<i32>(m)
+                .map_err(|e| driver_err("tree d_tok", &e))?,
+            d_pos: s
+                .alloc_zeros::<i32>(m)
+                .map_err(|e| driver_err("tree d_pos", &e))?,
+            d_anc: s
+                .alloc_zeros::<i32>(m * m)
+                .map_err(|e| driver_err("tree d_anc", &e))?,
+            d_nanc: s
+                .alloc_zeros::<i32>(m)
+                .map_err(|e| driver_err("tree d_nanc", &e))?,
+            d_amax_val: alloc(m * ARGMAX_CHUNKS, "tree d_amax_val")?,
+            d_amax_idx: s
+                .alloc_zeros::<i32>(m * ARGMAX_CHUNKS)
+                .map_err(|e| driver_err("tree d_amax_idx", &e))?,
+        })
     }
 
     /// Greedy tree verify (ADR 0014): forward the draft tree, device-argmax
@@ -651,7 +844,73 @@ impl CudaDecodeModel {
         tokens: &[u32],
         parents: &[i32],
     ) -> Result<Vec<u32>, BackendError> {
-        let (m, on_cap) = self.tree_forward(tokens, parents)?;
+        self.tree_verify_greedy_in(tokens, parents, None)
+    }
+
+    /// **I2 batch-slot greedy tree verify** (L3 batch-slot spec decode): the
+    /// SAME verify as [`Self::tree_verify_greedy`], run against dense batch
+    /// slot `row` of a [`BatchKv`] instead of the single-sequence cache — the
+    /// tree attends the slot's committed rows `[0, positions[row])`, the
+    /// accepted path is promoted into the slot's region, and
+    /// `batch.positions[row]` advances by the accepted length. Other slots'
+    /// KV is untouched (every KV read/write is offset into slot `row`'s dense
+    /// region), so a per-slot spec loop can verify each slot in turn (I3/I4
+    /// build on this).
+    ///
+    /// Requirements: a DENSE batch (paged trees are the I3 rung), the f32 KV
+    /// rung (batch arenas are f32 — the same constraint as
+    /// [`Self::copy_kv_into_batch_row`]), and a live row. The tree-shape
+    /// contract (root at node 0 = the slot's last committed token, topological
+    /// parents) is identical to the single-seq verify.
+    ///
+    /// # Errors
+    /// [`BackendError::InvalidInput`] on a bad/dead/paged target, a malformed
+    /// tree, or region overflow; device errors otherwise.
+    pub fn tree_verify_greedy_slot(
+        &mut self,
+        batch: &mut BatchKv,
+        row: usize,
+        tokens: &[u32],
+        parents: &[i32],
+    ) -> Result<Vec<u32>, BackendError> {
+        if row >= batch.n {
+            return Err(BackendError::InvalidInput(format!(
+                "tree_verify_greedy_slot: row {row} >= batch n {}",
+                batch.n
+            )));
+        }
+        if batch.pages.is_some() {
+            return Err(BackendError::InvalidInput(
+                "tree_verify_greedy_slot: paged batch (dense-region trees only; \
+                 the paged tree is the I3 rung)"
+                    .into(),
+            ));
+        }
+        if self.kv_elem != 4 {
+            return Err(BackendError::InvalidInput(
+                "tree_verify_greedy_slot requires the f32 KV rung (batch arenas \
+                 are f32); unset TRITIUM_KV"
+                    .into(),
+            ));
+        }
+        if !batch.live[row] {
+            return Err(BackendError::InvalidInput(format!(
+                "tree_verify_greedy_slot: row {row} is dead"
+            )));
+        }
+        self.tree_verify_greedy_in(tokens, parents, Some((batch, row)))
+    }
+
+    /// Shared greedy-verify body — `slot` selects the target region (see
+    /// [`Self::tree_forward`]).
+    fn tree_verify_greedy_in(
+        &mut self,
+        tokens: &[u32],
+        parents: &[i32],
+        mut slot: Option<(&mut BatchKv, usize)>,
+    ) -> Result<Vec<u32>, BackendError> {
+        let (m, on_cap) =
+            self.tree_forward(tokens, parents, slot.as_mut().map(|(b, r)| (&mut **b, *r)))?;
         // Consume on the stream that produced the logits (graph route:
         // cap_stream — the trailing pageable dtoh below is the ONE ordering
         // point and drains the whole verify before tree_promote's
@@ -661,10 +920,11 @@ impl CudaDecodeModel {
         } else {
             &self.stream
         };
-        let mut ts = self
-            .tree_scratch
-            .take()
-            .expect("tree scratch after forward");
+        let mut ts = match slot.as_mut() {
+            Some((b, _)) => b.tree_scratch.take(),
+            None => self.tree_scratch.take(),
+        }
+        .expect("tree scratch after forward");
         Self::bl_argmax_rows_chunked(
             s,
             &self.f_argmax_partial,
@@ -682,9 +942,12 @@ impl CudaDecodeModel {
         s.memcpy_dtoh(&ids_view, &mut ids)
             .map_err(|e| driver_err("tree ids dtoh", &e))?;
 
-        // Device work is done — return the scratch to the cache. (An early `?`
+        // Device work is done — return the scratch to its owner. (An early `?`
         // above drops it instead; the next call simply re-allocates.)
-        self.tree_scratch = Some(ts);
+        match slot.as_mut() {
+            Some((b, _)) => b.tree_scratch = Some(ts),
+            None => self.tree_scratch = Some(ts),
+        }
 
         // Greedy accept walk: from the root, descend into the (first) child whose
         // draft token equals the target argmax at the current node.
@@ -699,7 +962,7 @@ impl CudaDecodeModel {
                 None => break,
             }
         }
-        self.tree_promote(&path)?;
+        self.tree_promote_in(&path, slot)?;
 
         Ok(path.iter().map(|&n| ids[n] as u32).collect())
     }
@@ -715,7 +978,7 @@ impl CudaDecodeModel {
         tokens: &[u32],
         parents: &[i32],
     ) -> Result<Vec<f32>, BackendError> {
-        let (m, on_cap) = self.tree_forward(tokens, parents)?;
+        let (m, on_cap) = self.tree_forward(tokens, parents, None)?;
         let s = if on_cap {
             &self.cap_stream
         } else {
@@ -768,6 +1031,58 @@ impl CudaDecodeModel {
             }
         }
         self.tree_promote(path)
+    }
+
+    /// Region dispatcher for the accepted-path promotion (I2): `None` = the
+    /// single-seq cache ([`Self::tree_promote`]); `Some((batch, r))` compacts
+    /// the SAME strictly-increasing path inside batch slot `r`'s dense region
+    /// (row `positions[r] + path[k]` → `positions[r] + k`, both offset by
+    /// `r · max_ctx`) and advances `positions[r]` by the path length. Batch
+    /// arenas are f32 with no scale planes, so the slot arm is the plain
+    /// row-copy loop.
+    fn tree_promote_in(
+        &mut self,
+        path: &[usize],
+        slot: Option<(&mut BatchKv, usize)>,
+    ) -> Result<(), BackendError> {
+        let Some((batch, row)) = slot else {
+            return self.tree_promote(path);
+        };
+        let s = &self.stream;
+        let prefix = batch.positions[row];
+        let row_base = row * batch.max_ctx;
+        let row_bytes = self.kv_width * 4; // batch arenas are f32
+        for (k, &node) in path.iter().enumerate() {
+            if node == k {
+                continue; // already in place (chain prefix)
+            }
+            debug_assert!(node > k, "tree_promote: path must be strictly increasing");
+            let src = (row_base + prefix + node) * row_bytes;
+            let dst = (row_base + prefix + k) * row_bytes;
+            for li in 0..self.layers.len() {
+                for arena in [&mut batch.kv_k[li], &mut batch.kv_v[li]] {
+                    let (base, guard) = arena.device_ptr(s);
+                    // SAFETY: one dtod within the live batch arena; src/dst
+                    // are row-aligned, equal-length, disjoint (node > k) byte
+                    // ranges inside slot `row`'s dense region (the forward's
+                    // overflow guard bounds prefix + node by max_ctx), so
+                    // they stay inside the allocation; ordered on this stream.
+                    #[allow(unsafe_code)]
+                    unsafe {
+                        result::memcpy_dtod_async(
+                            base + dst as sys::CUdeviceptr,
+                            base + src as sys::CUdeviceptr,
+                            row_bytes,
+                            s.cu_stream(),
+                        )
+                    }
+                    .map_err(|e| driver_err("tree promote slot row", &e))?;
+                    drop(guard);
+                }
+            }
+        }
+        batch.positions[row] += path.len();
+        Ok(())
     }
 
     /// Promote the accepted path: node path[k] (arena slot cache_len + path[k])
@@ -850,13 +1165,21 @@ impl CudaDecodeModel {
     /// `tree_verify_greedy` trunk OP-FOR-OP: every kernel is the same function
     /// with the same geometry, except the three ctrl-driven twins
     /// (`kv_append_tree_g`, `gqa_attention_tree_{scores,reduce}_ctrl_g`) that
-    /// read [prefix_len, real_m] from `TreeGraphs::d_ctrl` at replay. Real
-    /// rows' math is row-independent, so their results are bit-identical to
-    /// the eager path (gated by `cuda_tree_verify_greedy_lossless`).
+    /// read `[prefix_len, real_m, kv_row_base]` from the owning
+    /// `TreeGraphs::d_ctrl` at replay. Real rows' math is row-independent, so
+    /// their results are bit-identical to the eager path (gated by
+    /// `cuda_tree_verify_greedy_lossless`).
+    ///
+    /// `d_ctrl` and the per-layer `kv` (K, V) arena base pointers are the
+    /// TARGET's (I2): the model's single-seq cache, or a `BatchKv`'s dense
+    /// arenas + own ctrl — whichever owns the capture. The slot row base is
+    /// per-replay ctrl data, so one batch capture serves every slot.
     fn record_graph_tree(
         &self,
         ts: &TreeScratch,
         bucket: usize,
+        d_ctrl: sys::CUdeviceptr,
+        kv: &[(sys::CUdeviceptr, sys::CUdeviceptr)],
     ) -> Result<CudaGraph, BackendError> {
         let s = &self.cap_stream;
         let mb = bucket;
@@ -914,15 +1237,10 @@ impl CudaDecodeModel {
                 gate: lin(&l.gate),
                 up: lin(&l.up),
                 down: lin(&l.down),
-                kv_k: dptr(&self.kv_k[li], s),
-                kv_v: dptr(&self.kv_v[li], s),
+                kv_k: kv[li].0,
+                kv_v: kv[li].1,
             })
             .collect();
-        let tg = self
-            .tree_graphs
-            .as_ref()
-            .expect("TreeGraphs created before record");
-        let d_ctrl = dptr(&tg.d_ctrl, s);
         let (d_tok, d_pos, d_anc, d_nanc) = (
             dptr(&ts.d_tok, s),
             dptr(&ts.d_pos, s),

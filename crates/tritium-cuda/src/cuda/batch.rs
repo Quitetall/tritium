@@ -250,6 +250,8 @@ impl CudaDecodeModel {
                 .map_err(|e| driver_err("batch d_argmax", &e))?,
             graph: None,
             graph_argmax: None,
+            tree_scratch: None,
+            tree_graphs: None,
             raw_keepalive: None,
         })
     }

@@ -290,6 +290,30 @@ impl ModelRunner {
             .map_err(ResidentOpError::Op)
     }
 
+    /// (cuda) I2 batch-slot tree-verify (L3 batch-slot spec decode): the same
+    /// greedy tree verify as [`tree_verify_greedy`](Self::tree_verify_greedy),
+    /// run against dense batch slot `row` of a [`tritium_cuda::BatchKv`] — the
+    /// tree attends the slot's committed rows, the accepted path is promoted
+    /// into the slot's region, and the slot's position advances by the
+    /// accepted length. Other slots' KV is untouched. Requires a dense
+    /// (non-paged) batch, the f32 KV rung, and a live row.
+    ///
+    /// # Errors
+    /// [`ResidentOpError`] — `Unavailable` on a non-CUDA backend, `Op` with
+    /// the device/validation error otherwise.
+    #[cfg(feature = "cuda")]
+    pub fn tree_verify_greedy_slot(
+        &mut self,
+        batch: &mut tritium_cuda::BatchKv,
+        row: usize,
+        tokens: &[u32],
+        parents: &[i32],
+    ) -> Result<Vec<u32>, ResidentOpError> {
+        self.resident_for_op()?
+            .tree_verify_greedy_slot(batch, row, tokens, parents)
+            .map_err(ResidentOpError::Op)
+    }
+
     /// (cuda) BASTION tree-verify, logits form: forward the token tree and
     /// return the flat `[tokens.len() × vocab]` logits for a host-side accept
     /// rule (sampling). Pair with [`tree_commit`](Self::tree_commit).

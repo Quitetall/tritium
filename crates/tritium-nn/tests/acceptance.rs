@@ -1374,7 +1374,14 @@ fn cuda_draft_batch_matches_draft_chain() {
     // Three DIFFERENT histories (content + length) => unequal row positions.
     let base: [u32; 7] = [128000, 791, 6864, 315, 279, 1917, 574];
     let prompts: Vec<Vec<u32>> = (0..3usize)
-        .map(|i| base.iter().copied().cycle().skip(i).take(6 + 5 * i).collect())
+        .map(|i| {
+            base.iter()
+                .copied()
+                .cycle()
+                .skip(i)
+                .take(6 + 5 * i)
+                .collect()
+        })
         .collect();
     let never = u32::MAX;
 
@@ -1586,7 +1593,9 @@ fn cuda_draft_batch_paged_guard_and_boundary() {
     // tokens cross the page boundary and must equal the single-seq chain.
     rb.reset();
     let mut batch = rb.new_batch_paged(1, 2).expect("new_batch_paged");
-    batch.reserve_pages(0, plen + k).expect("reserve prompt+draft");
+    batch
+        .reserve_pages(0, plen + k)
+        .expect("reserve prompt+draft");
     let l0 = rb.forward(&prompt, &positions).expect("prefill");
     assert_eq!(argmax(&l0) as u32, first_tok, "prefill diverged");
     rb.adopt_into_batch_row(&mut batch, 0, plen).expect("adopt");
@@ -1598,10 +1607,361 @@ fn cuda_draft_batch_paged_guard_and_boundary() {
         out[0], expect,
         "paged draft across the page boundary diverged from the single-seq chain"
     );
-    assert_eq!(batch.positions()[0], plen + k, "watermark after paged draft");
+    assert_eq!(
+        batch.positions()[0],
+        plen + k,
+        "watermark after paged draft"
+    );
     println!(
         "draft_batch paged: reservation guard refuses cleanly (no partial \
          advance); {k}-token draft across the {KV_PAGE_TOKENS}-token page \
          boundary == single-seq chain"
     );
+}
+
+/// Removes `TRITIUM_TREE_EAGER` on drop so a failing eager pass can't leak
+/// the env override into later tests in the same process.
+#[cfg(feature = "cuda")]
+struct TreeEagerGuard;
+#[cfg(feature = "cuda")]
+impl Drop for TreeEagerGuard {
+    fn drop(&mut self) {
+        // SAFETY: the GPU tests run single-threaded (`gpu_serial` +
+        // `--test-threads=1`); no other thread touches the environment.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::remove_var("TRITIUM_TREE_EAGER");
+        }
+    }
+}
+
+/// I2 gate (L3 batch-slot spec decode): `tree_verify_greedy_slot` against
+/// dense slot `r` of a 3-slot `BatchKv` must behave EXACTLY like the
+/// single-sequence `tree_verify_greedy` over the same history:
+///
+/// - same accepted tokens for the same draft trees (a chain m=2, a chain m=4
+///   and m=8 — both `TREE_BUCKETS` boundaries — and a branchy m=6 with wrong
+///   siblings/tails), for slot r = 0 AND r = 2 (a nonzero KV row base is the
+///   whole point);
+/// - bit-identical post-commit KV (layer 0 and layer 7 K+V rows of the whole
+///   committed region, byte-compared) and matching positions;
+/// - identical continued decode (4 more tokens both ways);
+/// - OTHER live slots untouched: rows != r keep drafting exactly what a
+///   no-tree-interleaved single-seq control drafts;
+/// - graph and eager routes agree: the whole schedule runs twice (captured
+///   tree graphs, then `TRITIUM_TREE_EAGER=1`) and every accepted token and
+///   KV byte must match across routes.
+///
+/// Drafter-only (the 2B4T target never loads); reference runners are loaded
+/// one at a time and dropped, keeping peak VRAM at ~one drafter + one 3-slot
+/// batch.
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_tree_verify_slot_matches_single_seq() {
+    let _gpu = gpu_serial();
+    if !Path::new(&*DRAFTER_PATH).exists() {
+        eprintln!("skipping: {} absent (gated drafter test)", *DRAFTER_PATH);
+        return;
+    }
+    let bytes = std::fs::read(&*DRAFTER_PATH).expect("read drafter GGUF");
+
+    let base: [u32; 7] = [128000, 791, 6864, 315, 279, 1917, 574];
+    let prompts: Vec<Vec<u32>> = (0..3usize)
+        .map(|i| {
+            base.iter()
+                .copied()
+                .cycle()
+                .skip(i)
+                .take(6 + 5 * i)
+                .collect()
+        })
+        .collect();
+    let never = u32::MAX;
+    const PRE: usize = 3; // pre-verify chain length (every row)
+    const POST: usize = 4; // post-verify chain length (every row)
+    // The drafter GGUF is 8L768 — layer 0's K/V precedes any attention, layer
+    // 7's K/V has flowed through 7 tree-attention blocks (the kernels under
+    // test). A different drafter panics the debug row reads loudly.
+    const KV_LAYERS: [usize; 2] = [0, 7];
+
+    for &target in &[0usize, 2] {
+        let plen = prompts[target].len();
+
+        // Reference greedy stream for building the target row's draft trees.
+        let want = {
+            let Some(mut r) = load_on("cuda", &bytes) else {
+                return;
+            };
+            r.generate(&prompts[target], 28, never).expect("ref stream")
+        };
+        assert_eq!(want.len(), 28, "reference stream shorter than expected");
+
+        // Draft-tree schedule: m ∈ {2, 4, 6, 8} (4 and 8 are TREE_BUCKETS
+        // boundaries; 2 pads to 4, 6 pads to 8). `c` = committed length, so
+        // `want[c..]` is the true greedy continuation (losslessness keeps the
+        // committed stream on `want` in every leg).
+        let make_tree = |phase: usize, c: usize, root: u32| -> (Vec<u32>, Vec<i32>) {
+            match phase {
+                // m=2 perfect chain.
+                0 => (vec![root, want[c]], vec![-1, 0]),
+                // m=4 perfect chain (exact bucket 4).
+                1 => (
+                    vec![root, want[c], want[c + 1], want[c + 2]],
+                    vec![-1, 0, 1, 2],
+                ),
+                // m=6 branchy: wrong sibling first at two levels + wrong leaf.
+                2 => {
+                    let (r1, r2) = (want[c], want[c + 1]);
+                    (
+                        vec![
+                            root,
+                            (r1 + 1) % 128_256,
+                            r1,
+                            (r2 + 7) % 128_256,
+                            r2,
+                            (want[c + 2] + 3) % 128_256,
+                        ],
+                        vec![-1, 0, 0, 2, 2, 4],
+                    )
+                }
+                // m=8 chain (exact bucket 8): 6 right drafts + a wrong tail.
+                _ => {
+                    let mut t = vec![root];
+                    t.extend(want[c..c + 6].iter().copied());
+                    t.push((want[c + 6] + 5) % 128_256);
+                    (t, (0..8i32).map(|i| i - 1).collect())
+                }
+            }
+        };
+
+        // Per route: (accepted-tokens per phase, continuation, KV bytes).
+        type RouteResult = (Vec<Vec<u32>>, Vec<u32>, Vec<Vec<u8>>);
+        let mut route_results: Vec<RouteResult> = Vec::new();
+
+        for eager in [false, true] {
+            let _guard = TreeEagerGuard;
+            if eager {
+                // SAFETY: single-threaded test process (see TreeEagerGuard).
+                #[allow(unsafe_code)]
+                unsafe {
+                    std::env::set_var("TRITIUM_TREE_EAGER", "1");
+                }
+            }
+
+            // ── Single-seq leg on the target prompt ──
+            // NO decode steps between prefill and the verifies: the M=1 chain
+            // and the M=N draft paths are token-equal but only ULP-close in
+            // KV, so a chain here would poison the bitwise KV compare below.
+            // The batch leg mirrors this by keeping the target row DEAD during
+            // the other rows' pre-verify draft.
+            let (first_tok, single_outs, single_cont, single_kv) = {
+                let Some(mut rs) = load_on("cuda", &bytes) else {
+                    return;
+                };
+                let positions: Vec<usize> = (0..plen).collect();
+                let l0 = rs
+                    .forward(&prompts[target], &positions)
+                    .expect("ss prefill");
+                let first = argmax(&l0) as u32;
+                assert_eq!(first, want[0], "prefill argmax vs reference stream");
+                let mut committed: Vec<u32> = vec![first];
+                let mut outs = Vec::new();
+                for phase in 0..4 {
+                    let (t, p) = make_tree(
+                        phase,
+                        committed.len(),
+                        *committed.last().expect("non-empty"),
+                    );
+                    let rm = rs.resident_cuda().expect("resident").expect("cuda");
+                    let out = rm.tree_verify_greedy(&t, &p).expect("ss tree verify");
+                    assert!(!out.is_empty(), "verify must commit >= 1 token");
+                    committed.extend(&out);
+                    outs.push(out);
+                }
+                assert_eq!(
+                    &committed[..],
+                    &want[..committed.len()],
+                    "single-seq tree-verify stream must stay lossless"
+                );
+                let rows = plen + committed.len() - 1; // == cache_len
+                let cont = rs
+                    .decode_greedy_chain(*committed.last().expect("non-empty"), rows, POST, never)
+                    .expect("ss post chain")
+                    .expect("resident");
+                let rm = rs.resident_cuda().expect("resident").expect("cuda");
+                let mut kv = Vec::new();
+                for li in KV_LAYERS {
+                    for row in 0..rows {
+                        kv.push(rm.debug_kv_row(li, row, false).expect("ss kv k row"));
+                        kv.push(rm.debug_kv_row(li, row, true).expect("ss kv v row"));
+                    }
+                }
+                (first, outs, cont, kv)
+            };
+
+            // ── No-tree-interleaved controls for the other rows ──
+            let mut ctrl_first = [0u32; 3];
+            let mut ctrl_pre: Vec<Vec<u32>> = vec![Vec::new(); 3];
+            let mut ctrl_post: Vec<Vec<u32>> = vec![Vec::new(); 3];
+            for r in 0..3 {
+                if r == target {
+                    continue;
+                }
+                let Some(mut rc) = load_on("cuda", &bytes) else {
+                    return;
+                };
+                let positions: Vec<usize> = (0..prompts[r].len()).collect();
+                let l0 = rc.forward(&prompts[r], &positions).expect("ctrl prefill");
+                ctrl_first[r] = argmax(&l0) as u32;
+                ctrl_pre[r] = rc
+                    .decode_greedy_chain(ctrl_first[r], prompts[r].len(), PRE, never)
+                    .expect("ctrl pre chain")
+                    .expect("resident");
+                ctrl_post[r] = rc
+                    .decode_greedy_chain(
+                        *ctrl_pre[r].last().expect("PRE >= 1"),
+                        prompts[r].len() + PRE,
+                        POST,
+                        never,
+                    )
+                    .expect("ctrl post chain")
+                    .expect("resident");
+            }
+
+            // ── Batch leg: 3 live slots, trees run ONLY against `target` ──
+            let Some(mut rb) = load_on("cuda", &bytes) else {
+                return;
+            };
+            let mut batch = rb.new_batch(3).expect("new_batch");
+            let mut first_toks = [0u32; 3];
+            for (r, prompt) in prompts.iter().enumerate() {
+                rb.reset();
+                let positions: Vec<usize> = (0..prompt.len()).collect();
+                let l0 = rb.forward(prompt, &positions).expect("batch prefill");
+                first_toks[r] = argmax(&l0) as u32;
+                rb.adopt_into_batch_row(&mut batch, r, prompt.len())
+                    .expect("adopt");
+                batch.set_position(r, prompt.len()).expect("set_position");
+            }
+            assert_eq!(first_toks[target], first_tok, "target prefill mismatch");
+
+            // Pre-verify activity for the OTHER rows only: the target row sits
+            // dead (frozen position, zero KV bytes — the C2 contract) so its
+            // history stays prefill-only, matching the single-seq leg bitwise.
+            batch.set_live(target, false).expect("set_live dead");
+            let mut pre_feeds = first_toks;
+            pre_feeds[target] = 0; // dead row's feed is ignored (in-range id)
+            let pre_outs = rb
+                .draft_batch(&mut batch, &pre_feeds, PRE, never)
+                .expect("batch pre draft");
+            assert!(
+                pre_outs[target].is_empty(),
+                "dead target row must draft nothing"
+            );
+            assert_eq!(
+                batch.positions()[target],
+                plen,
+                "dead target row's position moved during the pre-draft"
+            );
+            batch.set_live(target, true).expect("set_live revive");
+            let mut committed: Vec<u32> = vec![first_toks[target]];
+
+            for (phase, single_out) in single_outs.iter().enumerate() {
+                let (t, p) = make_tree(
+                    phase,
+                    committed.len(),
+                    *committed.last().expect("non-empty"),
+                );
+                let out = rb
+                    .tree_verify_greedy_slot(&mut batch, target, &t, &p)
+                    .expect("slot tree verify");
+                assert_eq!(
+                    &out, single_out,
+                    "slot verify accepted tokens != single-seq (phase {phase}, r={target})"
+                );
+                committed.extend(&out);
+                assert_eq!(
+                    batch.positions()[target],
+                    plen + committed.len() - 1,
+                    "slot position after phase {phase}"
+                );
+            }
+
+            // Post-commit KV of the whole committed region: bit-identical to
+            // the single-seq cache.
+            {
+                let rows = plen + committed.len() - 1;
+                let rm = rb.resident_cuda().expect("resident").expect("cuda");
+                let mut idx = 0usize;
+                for li in KV_LAYERS {
+                    for row in 0..rows {
+                        for v in [false, true] {
+                            let got = rm
+                                .debug_batch_kv_row(&batch, li, target, row, v)
+                                .expect("slot kv row");
+                            assert_eq!(
+                                got, single_kv[idx],
+                                "slot KV byte mismatch (layer {li}, row {row}, v={v}, r={target})"
+                            );
+                            idx += 1;
+                        }
+                    }
+                }
+            }
+
+            // Continue every row: target must equal the single-seq
+            // continuation; the other rows must equal their NO-TREE controls
+            // (their KV/positions were never touched by the slot verifies).
+            let mut feeds = [0u32; 3];
+            for r in 0..3 {
+                feeds[r] = if r == target {
+                    *committed.last().expect("non-empty")
+                } else {
+                    assert_eq!(
+                        pre_outs[r], ctrl_pre[r],
+                        "row {r} pre-draft != its single-seq control"
+                    );
+                    *pre_outs[r].last().expect("PRE >= 1")
+                };
+            }
+            let post_outs = rb
+                .draft_batch(&mut batch, &feeds, POST, never)
+                .expect("batch post draft");
+            assert_eq!(
+                post_outs[target], single_cont,
+                "target continuation diverged — promote corrupted slot KV (r={target})"
+            );
+            for r in 0..3 {
+                if r == target {
+                    continue;
+                }
+                assert_eq!(
+                    post_outs[r], ctrl_post[r],
+                    "row {r} diverged after trees on slot {target} — verify leaked across slots"
+                );
+            }
+            drop(batch);
+            route_results.push((single_outs, single_cont, single_kv));
+        }
+
+        // Graph route vs eager route: bitwise agreement (tokens AND KV bytes).
+        let (g, e) = (&route_results[0], &route_results[1]);
+        assert_eq!(g.0, e.0, "graph vs eager accepted tokens (r={target})");
+        assert_eq!(g.1, e.1, "graph vs eager continuation (r={target})");
+        assert_eq!(g.2.len(), e.2.len(), "graph vs eager KV row count");
+        let rows = g.2.len() / (2 * KV_LAYERS.len());
+        for (i, (a, b)) in g.2.iter().zip(&e.2).enumerate() {
+            let (li, row, v) = (KV_LAYERS[i / (2 * rows)], (i / 2) % rows, i % 2 == 1);
+            assert_eq!(
+                a, b,
+                "graph vs eager KV bytes differ (r={target}, layer {li}, row {row}, \
+                 v={v}) — ctrl twins drifted"
+            );
+        }
+        println!(
+            "I2 slot r={target}: 4 trees (m=2/4/6/8) bit-equal to single-seq \
+             (tokens, positions, KV layers {KV_LAYERS:?}), other slots inert, \
+             graph==eager"
+        );
+    }
 }

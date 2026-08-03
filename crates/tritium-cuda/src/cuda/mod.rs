@@ -48,7 +48,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaGraph, CudaModule, CudaSlice, CudaStream, CudaView, DevicePtr,
-    DriverError, LaunchConfig, PushKernelArg, result, sys,
+    DeviceRepr, DriverError, LaunchConfig, PushKernelArg, result, sys,
 };
 use cudarc::nvrtc::Ptx;
 use std::ffi::{CString, c_void};
@@ -665,9 +665,11 @@ struct TreeScratch {
 const TREE_BUCKETS: [usize; 7] = [4, 8, 12, 16, 24, 32, 48];
 const TREE_BUCKET_MAX: usize = 48;
 
-/// Captured verify-trunk graphs + their [prefix_len, real_m] ctrl buffer.
-/// Graphs bake the TreeScratch buffer pointers — invalidated (dropped) if the
-/// scratch ever re-grows.
+/// Captured verify-trunk graphs + their `[prefix_len, real_m, kv_row_base]`
+/// ctrl buffer (i32[3]; the row base is 0 for the single-seq cache, or
+/// `r · max_ctx` when the graphs were captured against a `BatchKv` arena and
+/// replay targets slot `r` — I2). Graphs bake the owning TreeScratch's buffer
+/// pointers — invalidated (dropped) if that scratch ever re-grows.
 struct TreeGraphs {
     d_ctrl: CudaSlice<i32>,
     graphs: HashMap<usize, SendGraph>,
@@ -2389,13 +2391,18 @@ impl CudaDecodeModel {
     }
 
     /// Tree-verify attention launch (ADR 0014): one warp per (node, head).
+    ///
+    /// `k`/`v` are VIEWS so the caller picks the KV region: the full
+    /// single-seq arena (`as_view`, pointer-identical to the pre-I2 slice
+    /// args) or a batch slot's dense sub-range (`slice(r·max_ctx·kv_width..)`,
+    /// I2) — the kernel's slot indexing is region-relative either way.
     #[allow(clippy::too_many_arguments)]
-    fn bl_attn_tree(
+    fn bl_attn_tree<T: DeviceRepr>(
         s: &Arc<CudaStream>,
         f: &CudaFunction,
         q: &CudaSlice<f32>,
-        k: &CudaSlice<u8>,
-        v: &CudaSlice<u8>,
+        k: &CudaView<'_, T>,
+        v: &CudaView<'_, T>,
         out: &mut CudaSlice<f32>,
         scores: &mut CudaSlice<f32>,
         anc: &CudaSlice<i32>,
@@ -2454,14 +2461,15 @@ impl CudaDecodeModel {
     /// reduce. Bit-identical to `bl_attn_tree` — every rounded f32 fold keeps
     /// its order (per-key dots in d-order, the softmax sum in j-order on one
     /// thread, per-dim weighted chains in j-order).
+    /// `k`/`v` are region views — see [`Self::bl_attn_tree`].
     #[allow(clippy::too_many_arguments)]
-    fn bl_attn_tree_split(
+    fn bl_attn_tree_split<T: DeviceRepr>(
         s: &Arc<CudaStream>,
         f_scores: &CudaFunction,
         f_reduce: &CudaFunction,
         q: &CudaSlice<f32>,
-        k: &CudaSlice<u8>,
-        v: &CudaSlice<u8>,
+        k: &CudaView<'_, T>,
+        v: &CudaView<'_, T>,
         k_scales: Option<&CudaSlice<f32>>,
         v_scales: Option<&CudaSlice<f32>>,
         out: &mut CudaSlice<f32>,
@@ -2874,11 +2882,15 @@ impl CudaDecodeModel {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn bl_kv_append(
+    /// Generic over the arena element type: `u8` for the model's byte-typed
+    /// single-seq arenas (the dtype-selected kernel reinterprets), `f32` for
+    /// a `BatchKv`'s f32 arenas (I2 batch-slot trees, where `cache_len` is
+    /// `kv_row_base + prefix_len` — the kernel only ever adds it to the row).
+    fn bl_kv_append<T: DeviceRepr>(
         s: &Arc<CudaStream>,
         f: &CudaFunction,
         src: &CudaSlice<f32>,
-        kv_base: &mut CudaSlice<u8>,
+        kv_base: &mut CudaSlice<T>,
         cache_len: usize,
         kv_width: usize,
         m: usize,

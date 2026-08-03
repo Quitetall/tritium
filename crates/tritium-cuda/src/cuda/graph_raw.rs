@@ -501,6 +501,19 @@ pub struct BatchKv {
     /// [`CudaDecodeModel::decode_batch_graph_argmax`]): the same forward plus the batched LM
     /// head + greedy argmax, ending at `d_argmax`. Also declared before `raw_keepalive`.
     pub(super) graph_argmax: Option<CudaGraph>,
+    /// I2 (L3 batch-slot spec decode): this batch's OWN tree-verify scratch,
+    /// lazily allocated on the first [`CudaDecodeModel::tree_verify_greedy_slot`]
+    /// against this batch — the batch's captured tree graphs bake THESE buffer
+    /// pointers (never the model's single-seq `tree_scratch`), so the two
+    /// verify targets can't invalidate each other's captures.
+    pub(super) tree_scratch: Option<TreeScratch>,
+    /// I2: per-bucket tree-verify trunk graphs captured against THIS batch's
+    /// dense KV arenas + `tree_scratch`, keyed by bucket like the model's
+    /// single-seq `tree_graphs`. One set serves every slot: the slot's KV row
+    /// base rides in the ctrl buffer (`[prefix_len, real_m, kv_row_base]`),
+    /// not in the baked pointers. Holds its own `raw_keepalive` (the
+    /// `TreeGraphs` field), so module lifetime is self-contained.
+    pub(super) tree_graphs: Option<TreeGraphs>,
     /// A clone of the model's [`batch_raw`](CudaDecodeModel::batch_raw) `Arc`, taken when
     /// either graph is captured. Keeps the `CUfunction` modules the graphs reference loaded
     /// for as long as this batch lives, regardless of whether the producing model is dropped

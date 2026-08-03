@@ -2052,17 +2052,26 @@ __global__ void gqa_attention_tree_reduce_g(
 // ─── Ctrl-driven tree-verify kernels (v1.x) — graph-capturable twins of the
 // tree trunk's shape-varying launches. A CUDA graph bakes every scalar arg and
 // grid at capture, but a spec-decode loop calls verify with a growing prefix
-// and a varying node count; these variants read the two per-call values from
-// `tree_ctrl` = [prefix_len, real_m] (device i32[2], uploaded before replay)
-// so ONE graph per padded tree size (bucket) serves every verify. Pad rows
-// (real_m <= row < m) are early-exited in attention (the expensive per-row
-// cost) and left to compute harmless junk elsewhere — pads are root-token
-// duplicates, and every trunk op is row-independent, so real rows are
-// bit-identical to the eager path.
+// and a varying node count; these variants read the per-call values from
+// `tree_ctrl` = [prefix_len, real_m, kv_row_base] (device i32[3], uploaded
+// before replay) so ONE graph per padded tree size (bucket) serves every
+// verify. Pad rows (real_m <= row < m) are early-exited in attention (the
+// expensive per-row cost) and left to compute harmless junk elsewhere — pads
+// are root-token duplicates, and every trunk op is row-independent, so real
+// rows are bit-identical to the eager path.
+//
+// `kv_row_base` (I2, L3 batch-slot spec decode): a TOKEN-ROW offset added to
+// every KV arena row index. 0 = the single-sequence cache (bit-identical to
+// the pre-I2 two-word ctrl); r·max_ctx targets dense batch slot r of a
+// BatchKv arena, so one captured graph serves EVERY slot (pointers are baked
+// at capture; the base is per-replay data). The `anc` table stays REGION-
+// LOCAL (slots cache_len+i); the kernels add the base at the KV access.
 
 // kv_append_tree_g — append m provisional K/V rows at arena rows
-// [ctrl[0], ctrl[0] + m). Pad rows write junk into dead arena space (rows at
-// or above the post-accept cache_len are never read and get overwritten).
+// [ctrl[2] + ctrl[0], ctrl[2] + ctrl[0] + m). Pad rows write junk into dead
+// region space (rows at or above the post-accept watermark are never read and
+// get overwritten); the bucket guard keeps ctrl[0] + m inside the region, so
+// pads can never spill into a neighbouring batch slot.
 __global__ void kv_append_tree_g(const float* __restrict__ src, float* __restrict__ kv_base,
                                  const int* __restrict__ tree_ctrl, const int kv_width,
                                  const int m) {
@@ -2070,9 +2079,10 @@ __global__ void kv_append_tree_g(const float* __restrict__ src, float* __restric
   const long long total = (long long)m * kv_width;
   if (idx >= total) return;
   const int prefix_len = tree_ctrl[0];
+  const int row_base = tree_ctrl[2];
   const int row = (int)(idx / kv_width);
   const int col = (int)(idx - (long long)row * kv_width);
-  kv_base[((long long)prefix_len + row) * kv_width + col] = src[idx];
+  kv_base[((long long)row_base + prefix_len + row) * kv_width + col] = src[idx];
 }
 
 // gqa_attention_tree_scores_ctrl_g — the scores fan-out with prefix_len from
@@ -2091,6 +2101,7 @@ __global__ void gqa_attention_tree_scores_ctrl_g(
   const int h = rowhead - row * n_head;
   if (row >= tree_ctrl[1]) return;  // pad row (uniform per block)
   const int prefix_len = tree_ctrl[0];
+  const int row_base = tree_ctrl[2];
   const int ctx = prefix_len + n_anc[row];
   const int chunk = blockIdx.y * TREE_SCORE_CHUNK;
   if (chunk >= ctx) return;
@@ -2107,7 +2118,7 @@ __global__ void gqa_attention_tree_scores_ctrl_g(
   for (int t = 0; t < 4; ++t) {
     const int j = j0 + 32 * t;
     if (j >= ctx) break;
-    const int slot = (j < prefix_len) ? j : arow[j - prefix_len];
+    const int slot = row_base + ((j < prefix_len) ? j : arow[j - prefix_len]);
     const float4* kr = (const float4*)(k + ((long long)slot * n_head_kv + kv) * head_dim);
     float dot = 0.0f;
 #pragma unroll 8
@@ -2141,6 +2152,7 @@ __global__ void gqa_attention_tree_reduce_ctrl_g(
   const int h = rowhead - row * n_head;
   if (row >= tree_ctrl[1]) return;  // pad row (uniform per block)
   const int prefix_len = tree_ctrl[0];
+  const int row_base = tree_ctrl[2];
   const int ctx = prefix_len + n_anc[row];
   const int tid = threadIdx.x;
   const int n_rep = n_head / n_head_kv;
@@ -2204,7 +2216,7 @@ __global__ void gqa_attention_tree_reduce_ctrl_g(
 #pragma unroll 4
     for (int j = 0; j < ctx; ++j) {
       const float w = sc[j];
-      const int slot = (j < prefix_len) ? j : arow[j - prefix_len];
+      const int slot = row_base + ((j < prefix_len) ? j : arow[j - prefix_len]);
       const float* v_row = v + ((long long)slot * n_head_kv + kv) * head_dim;
       float vals[TREE_MAX_DIMS_PER_THREAD];
 #pragma unroll
@@ -2231,7 +2243,7 @@ __global__ void gqa_attention_tree_reduce_ctrl_g(
       for (int j = 0; j < ctx; ++j) {
         const float w = sc[j];
         if (w == 0.0f) continue;
-        const int slot = (j < prefix_len) ? j : arow[j - prefix_len];
+        const int slot = row_base + ((j < prefix_len) ? j : arow[j - prefix_len]);
         const float* v_row = v + ((long long)slot * n_head_kv + kv) * head_dim;
         acc = __fadd_rn(acc, __fmul_rn(w, v_row[d]));
       }
