@@ -1184,9 +1184,8 @@ async fn cuda_batched_spec_multi_matches_single_worker() {
     );
     let runner = load_runner(&bytes).expect("runner");
     let draft = load_runner(&dbytes).expect("draft runner");
-    let (router, _draining) =
-        build_router_batched_with_draft(runner, draft, eos_tok, 3, tok, cfg)
-            .expect("batched router (eos)");
+    let (router, _draining) = build_router_batched_with_draft(runner, draft, eos_tok, 3, tok, cfg)
+        .expect("batched router (eos)");
     let handles: Vec<_> = (0..3)
         .map(|i| {
             let router = router.clone();

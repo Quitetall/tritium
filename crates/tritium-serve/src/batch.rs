@@ -687,9 +687,7 @@ fn multi_spec_round(
                 });
             }
             Err(e) => {
-                eprintln!(
-                    "tritium-serve: multi-slot spec disabled — drafter batch pool: {e}"
-                );
+                eprintln!("tritium-serve: multi-slot spec disabled — drafter batch pool: {e}");
                 return MultiOutcome::Disable;
             }
         }
@@ -903,9 +901,7 @@ fn multi_spec_round(
             // An InvalidInput refusal is ATOMIC — every target and tree is
             // host-validated before any device work, so no listed slot
             // changed and the lockstep fallback is seamless and lossless.
-            Err(tritium_nn::ResidentOpError::Op(
-                tritium_spec::BackendError::InvalidInput(m),
-            )) => {
+            Err(tritium_nn::ResidentOpError::Op(tritium_spec::BackendError::InvalidInput(m))) => {
                 eprintln!("tritium-serve: multi-slot tree verify refused: {m}");
                 return MultiOutcome::Fallback;
             }

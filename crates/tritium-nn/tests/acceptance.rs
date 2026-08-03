@@ -2237,7 +2237,8 @@ fn cuda_tree_verify_paged_slot_matches_dense() {
             rb.reset();
             let l0 = rb.forward(&prompt, &positions).expect("small prefill");
             let root = argmax(&l0) as u32;
-            rb.adopt_into_batch_row(&mut small, 0, plen_s).expect("adopt");
+            rb.adopt_into_batch_row(&mut small, 0, plen_s)
+                .expect("adopt");
             small.set_position(0, plen_s).expect("set_position");
 
             let t: Vec<u32> = (0..8).map(|i| (root + i) % 128_256).collect();
@@ -2651,8 +2652,12 @@ fn cuda_tree_verify_slots_matches_sequential() {
             let prompt0: Vec<u32> = base.iter().copied().cycle().take(plen_s).collect();
             let prompt1: Vec<u32> = base.iter().copied().cycle().skip(1).take(10).collect();
             let mut small = rb.new_batch_paged(2, 3).expect("small paged batch");
-            small.reserve_pages(0, plen_s).expect("reserve slot 0 short");
-            small.reserve_pages(1, 10 + 16).expect("reserve slot 1 full");
+            small
+                .reserve_pages(0, plen_s)
+                .expect("reserve slot 0 short");
+            small
+                .reserve_pages(1, 10 + 16)
+                .expect("reserve slot 1 full");
             let mut roots = [0u32; 2];
             for (r, prompt) in [&prompt0, &prompt1].into_iter().enumerate() {
                 rb.reset();
@@ -2674,11 +2679,7 @@ fn cuda_tree_verify_slots_matches_sequential() {
                     .expect("kv before")
             };
             let err = rb
-                .tree_verify_greedy_slots(
-                    &mut small,
-                    &[1, 0],
-                    &[(&t1, &p), (&t0, &p)],
-                )
+                .tree_verify_greedy_slots(&mut small, &[1, 0], &[(&t1, &p), (&t0, &p)])
                 .expect_err("under-reserved slot must refuse the whole batch");
             assert!(
                 format!("{err}").contains("page-reserved"),

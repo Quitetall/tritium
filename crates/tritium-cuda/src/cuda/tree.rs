@@ -1237,7 +1237,10 @@ impl CudaDecodeModel {
                 None => row_base + logical,
                 Some(pg) => {
                     let e = pg.table[row * pg.tstride + logical / KV_PAGE_TOKENS];
-                    debug_assert!(e >= 0, "tree promote row unmapped (guarded in tree_forward)");
+                    debug_assert!(
+                        e >= 0,
+                        "tree promote row unmapped (guarded in tree_forward)"
+                    );
                     e as usize * KV_PAGE_TOKENS + logical % KV_PAGE_TOKENS
                 }
             }
@@ -2083,13 +2086,12 @@ impl CudaDecodeModel {
         // the remaining conditions mirror `tree_forward` (a bucket always
         // exists — m_total <= TREE_BUCKET_MAX — and pads write nothing, so
         // there is no region-fit condition on the padded size).
-        let bucket = if self.max_ctx * 4 <= 48 * 1024
-            && std::env::var_os("TRITIUM_TREE_EAGER").is_none()
-        {
-            TREE_BUCKETS.iter().copied().find(|&b| b >= m_total)
-        } else {
-            None
-        };
+        let bucket =
+            if self.max_ctx * 4 <= 48 * 1024 && std::env::var_os("TRITIUM_TREE_EAGER").is_none() {
+                TREE_BUCKETS.iter().copied().find(|&b| b >= m_total)
+            } else {
+                None
+            };
         if bucket.is_none() {
             static EAGER_WARN: std::sync::Once = std::sync::Once::new();
             EAGER_WARN.call_once(|| {
@@ -2120,7 +2122,10 @@ impl CudaDecodeModel {
                 Some(pg) => r * pg.tstride,
                 None => r * batch.max_ctx,
             };
-            debug_assert!(word2 <= i32::MAX as usize, "slots ctrl word 2 overflows i32");
+            debug_assert!(
+                word2 <= i32::MAX as usize,
+                "slots ctrl word 2 overflows i32"
+            );
             let m_i = tokens.len();
             let mut depth = vec![0usize; m_i];
             for i in 0..m_i {
@@ -2694,7 +2699,12 @@ impl CudaDecodeModel {
             shared_mem_bytes: 0,
         };
         let mut l = s.launch_builder(f_scores);
-        l.arg(q).arg(k).arg(&mut *scores).arg(anc).arg(n_anc).arg(row_ctrl);
+        l.arg(q)
+            .arg(k)
+            .arg(&mut *scores)
+            .arg(anc)
+            .arg(n_anc)
+            .arg(row_ctrl);
         if let Some(t) = table {
             l.arg(t);
         }
@@ -2720,7 +2730,12 @@ impl CudaDecodeModel {
             shared_mem_bytes: (ctx_bound * 4) as u32,
         };
         let mut l = s.launch_builder(f_reduce);
-        l.arg(v).arg(&*scores).arg(out).arg(anc).arg(n_anc).arg(row_ctrl);
+        l.arg(v)
+            .arg(&*scores)
+            .arg(out)
+            .arg(anc)
+            .arg(n_anc)
+            .arg(row_ctrl);
         if let Some(t) = table {
             l.arg(t);
         }
