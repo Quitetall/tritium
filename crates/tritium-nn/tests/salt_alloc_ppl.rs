@@ -163,6 +163,10 @@ fn ladder_curves(
             sens[g] = curvature[c0..c1].iter().sum::<f64>() / (c1 - c0) as f64;
         }
     }
+    // `t` indexes each group's own curve (`curves[g][t]`), not `curves` — clippy reads the double
+    // subscript as a range loop over `curves` and its `enumerate()` suggestion inverts the meaning.
+    // The outer loop must be over `t` because one quantize pass yields the whole model at that T.
+    #[allow(clippy::needless_range_loop)]
     for t in 1..=t_max {
         let q = ste::salt_quantize_forward_grouped_geometric(
             w,
