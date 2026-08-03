@@ -1944,7 +1944,11 @@ fn cuda_tree_verify_slot_matches_single_seq() {
             route_results.push((single_outs, single_cont, single_kv));
         }
 
-        // Graph route vs eager route: bitwise agreement (tokens AND KV bytes).
+        // Graph route vs eager route: bitwise agreement (tokens AND KV
+        // bytes). NB route_results holds the SINGLE-SEQ leg of each route, so
+        // this block directly pins the single-seq ctrl twins; the SLOT-route
+        // graph==eager property then holds transitively through the per-route
+        // slot == single-seq asserts above (slotᵍ=ssᵍ ∧ slotᵉ=ssᵉ ∧ ssᵍ=ssᵉ).
         let (g, e) = (&route_results[0], &route_results[1]);
         assert_eq!(g.0, e.0, "graph vs eager accepted tokens (r={target})");
         assert_eq!(g.1, e.1, "graph vs eager continuation (r={target})");

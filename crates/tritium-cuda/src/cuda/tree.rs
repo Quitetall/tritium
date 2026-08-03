@@ -354,6 +354,9 @@ impl CudaDecodeModel {
             }
             // Uploads, ctrl write, replay and tail all sit on `cap_stream` —
             // stream order is the only ordering needed (no host sync).
+            // row_base is a TOKEN-ROW offset; i32 truncation would need a
+            // >2^31-row arena (multi-TB f32 alloc fails long before).
+            debug_assert!(row_base <= i32::MAX as usize, "kv_row_base overflows i32");
             let ctrl = [prefix_len as i32, m as i32, row_base as i32];
             {
                 let tg = match slot.as_mut() {
@@ -896,6 +899,22 @@ impl CudaDecodeModel {
         if !batch.live[row] {
             return Err(BackendError::InvalidInput(format!(
                 "tree_verify_greedy_slot: row {row} is dead"
+            )));
+        }
+        // Geometry check (review 69649e8): the slot route sizes smem/scores
+        // off self.max_ctx and indexes b.kv_k[li] per layer — a batch built
+        // by a different-geometry model would corrupt device memory. (The
+        // same exposure predates I2 in decode_batch/draft_batch; this entry
+        // is the newly load-bearing one for scratch sizing.)
+        if batch.max_ctx != self.max_ctx || batch.kv_k.len() != self.layers.len() {
+            return Err(BackendError::InvalidInput(format!(
+                "tree_verify_greedy_slot: batch geometry (max_ctx {}, {} layers) \
+                 does not match this model (max_ctx {}, {} layers) — the BatchKv \
+                 must come from this model's new_batch",
+                batch.max_ctx,
+                batch.kv_k.len(),
+                self.max_ctx,
+                self.layers.len()
             )));
         }
         self.tree_verify_greedy_in(tokens, parents, Some((batch, row)))
