@@ -295,6 +295,62 @@ fn group_symbols(bs: &[f32], cfg: JointFitConfig) -> Option<Vec<u32>> {
     }
 }
 
+/// Canonical-Huffman code lengths for a symbol histogram. Returns `symbol -> length in bits`.
+///
+/// Entropy is a bound, not a rate. A real decoder needs an actual code, and the cheapest
+/// GPU-plausible one is a **global** prefix code: one table for the whole model, no per-group side
+/// information — which the Miller-Madow analysis showed there is no point paying for anyway, since
+/// debiased per-group entropy lands on the global figure. Huffman is within one bit of entropy per
+/// symbol by construction and far closer on a skewed alphabet, so this measures how much of the
+/// bound survives INTEGER code lengths.
+fn huffman_code_lengths(hist: &HashMap<u32, u64>) -> HashMap<u32, u32> {
+    let mut lengths = HashMap::new();
+    if hist.len() <= 1 {
+        for &k in hist.keys() {
+            lengths.insert(k, 1); // a one-symbol alphabet still costs a bit to signal
+        }
+        return lengths;
+    }
+    #[derive(PartialEq, Eq)]
+    struct Node(u64, usize);
+    impl Ord for Node {
+        fn cmp(&self, o: &Self) -> std::cmp::Ordering {
+            o.0.cmp(&self.0).then_with(|| o.1.cmp(&self.1)) // min-heap on weight, then id
+        }
+    }
+    impl PartialOrd for Node {
+        fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
+            Some(self.cmp(o))
+        }
+    }
+    let mut syms: Vec<u32> = hist.keys().copied().collect();
+    syms.sort_unstable(); // deterministic tree ⇒ reproducible table
+    let mut children: Vec<(usize, usize)> = vec![(usize::MAX, usize::MAX); syms.len()];
+    let mut heap: std::collections::BinaryHeap<Node> = syms
+        .iter()
+        .enumerate()
+        .map(|(i, k)| Node(hist[k], i))
+        .collect();
+    while heap.len() > 1 {
+        let a = heap.pop().expect("two nodes");
+        let b = heap.pop().expect("two nodes");
+        children.push((a.1, b.1));
+        heap.push(Node(a.0 + b.0, children.len() - 1));
+    }
+    let root = heap.pop().expect("root").1;
+    let mut stack = vec![(root, 0u32)];
+    while let Some((node, depth)) = stack.pop() {
+        if node < syms.len() {
+            lengths.insert(syms[node], depth.max(1));
+        } else {
+            let (l, r) = children[node];
+            stack.push((l, depth + 1));
+            stack.push((r, depth + 1));
+        }
+    }
+    lengths
+}
+
 /// Base-3 encode one group's plane-major trits into one symbol per weight.
 fn encode_trits(trits: &[Vec<i8>]) -> Vec<u32> {
     let n = trits[0].len();
@@ -459,6 +515,16 @@ fn joint_symbols_cost_less_than_dense_planes_charge() {
         let gr_alpha = stats.bucketed_entropy_bits_per_weight() + scale_overhead + selector_bits;
         let entropy = stats.entropy_bits_per_weight() + scale_overhead;
 
+        // What an actual global prefix code costs, including the byte-offset table a GPU kernel
+        // needs to start decoding a block without walking the whole row.
+        let code = huffman_code_lengths(&stats.global);
+        let total_sym: u64 = stats.global.values().sum();
+        let huff_bits: f64 = stats
+            .global
+            .iter()
+            .map(|(k, &c)| c as f64 * f64::from(code[k]))
+            .sum::<f64>()
+            / total_sym as f64;
         let debiased = stats.debiased_group_entropy_bits_per_weight() + scale_overhead;
         let ceil_frac = stats.entropy_ceiling_fraction();
         println!(
@@ -484,6 +550,22 @@ fn joint_symbols_cost_less_than_dense_planes_charge() {
                 ceil_frac * 100.0
             );
         }
+        // A variable-length code needs a seek point per block or a GPU lane cannot address the
+        // middle of a row. 32-bit offsets, amortised over the block.
+        print!(
+            "     global Huffman {huff_bits:.3} b/sym (entropy {:.3}, +{:.1}% for integer lengths)  |  with 32-bit block offsets:",
+            stats.global_entropy_bits_per_weight(),
+            100.0 * (huff_bits - stats.global_entropy_bits_per_weight())
+                / stats.global_entropy_bits_per_weight()
+        );
+        for block in [128usize, 512, 2048] {
+            let total = huff_bits + scale_overhead + 32.0 / block as f64;
+            print!(
+                "  b{block} {total:.3} bpw ({:+.1}%)",
+                100.0 * (total - dense) / dense
+            );
+        }
+        println!();
         if failed_groups > 0 {
             println!("     (note: {failed_groups} groups failed to fit and are EXCLUDED)");
         }
