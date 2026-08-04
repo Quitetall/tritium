@@ -396,7 +396,10 @@ pub(crate) struct CacheKey {
 /// bit-identity contract; outputs shift at ULP level vs rev 2.
 /// rev 4 = cp.async staging pipeline + packed-B shared + contiguous warp-grid
 /// ownership + full unrolls (outputs bit-identical to rev 3; perf only).
-pub(crate) const CODEGEN_REV: u32 = 4;
+/// rev 5 = XOR-swizzled A-tile shared layout (bank-conflict-free fragment
+/// loads; store and load share the mapping, so it is a pure byte relayout —
+/// outputs bit-identical to rev 4; perf only).
+pub(crate) const CODEGEN_REV: u32 = 5;
 
 impl CacheKey {
     /// Stable filesystem-safe string form, e.g.
@@ -661,7 +664,7 @@ mod tests {
         // driver bump invalidates the on-disk entry.
         assert_eq!(
             sample_key().to_key_string(),
-            "sm_89-i2sint8-m5-n2560-k2560-cuda13030-r4"
+            "sm_89-i2sint8-m5-n2560-k2560-cuda13030-r5"
         );
     }
 

@@ -1802,9 +1802,17 @@ static __device__ __forceinline__ void gqa_attention_batch_v2_body(
 // => BIT-IDENTICAL per (row, head) to gqa_attention_batch_{f32,h} (and so
 // to v2). Gate: to_bits equality, both dtypes, staircase/tail/deep-ctx
 // regimes. Host contract: head_dim <= ATTN_V2_HDMAX only (no ctx bound).
-#define ATTN_V3_THREADS 128
+// Track T4 round-3 tune: 256 threads (8 warps — one query row per warp in
+// phases 1/2, and double the staging bandwidth) beat 128 by 1.12x at pp512
+// shapes in the offline BQ/KCH/THREADS sweep; BQ=8 / KCH=32 stayed optimal
+// (BQ 4/16/32, KCH 16/64 and a split phase-3 fold all measured slower).
+// ATTN_V3_BQ * 32 must be divisible by ATTN_V3_THREADS (ATTN_V3_RPW >= 1).
+#define ATTN_V3_THREADS 256
 #define ATTN_V3_BQ 8
 #define ATTN_V3_KCH 32
+#define ATTN_V3_WARPS (ATTN_V3_THREADS / 32)
+// Query rows owned per warp in phases 1 and 2 (warp w owns rows w, w+WARPS, ...).
+#define ATTN_V3_RPW (ATTN_V3_BQ / ATTN_V3_WARPS)
 
 template <class C>
 static __device__ __forceinline__ void gqa_attention_batch_v3_body(
@@ -1840,8 +1848,8 @@ static __device__ __forceinline__ void gqa_attention_batch_v3_body(
   const int kstride = head_dim + 1;
 
   // Phase 1: scaled dots. Each staged KCH-key chunk feeds all BQ rows:
-  // thread t owns key t&31 for rows t>>5 and (t>>5)+4 (4 threads share a
-  // key row -> broadcast shared reads; 32 threads share a query row ->
+  // thread t owns key t&31 for rows (t>>5) + rr*WARPS (lanes sharing a key
+  // broadcast the shared K row; the 32 lanes of a warp share a query row ->
   // broadcast s_q reads). Keys past a row's causal limit write nothing.
   for (int c0 = 0; c0 < ctx_top; c0 += ATTN_V3_KCH) {
     const int nk = min(ATTN_V3_KCH, ctx_top - c0);
@@ -1857,8 +1865,8 @@ static __device__ __forceinline__ void gqa_attention_batch_v3_body(
       const float* kr = &s_kv[key * kstride];
       const int jglob = c0 + key;
 #pragma unroll
-      for (int rr = 0; rr < 2; ++rr) {
-        const int r = (tid >> 5) + rr * 4;
+      for (int rr = 0; rr < ATTN_V3_RPW; ++rr) {
+        const int r = (tid >> 5) + rr * ATTN_V3_WARPS;
         if (r < nrows && jglob <= causal_offset + row0 + r) {
           const float* qr = &s_q[r * ATTN_V2_HDMAX];
           float dot = 0.0f;
@@ -1873,14 +1881,14 @@ static __device__ __forceinline__ void gqa_attention_batch_v3_body(
     __syncthreads();
   }
 
-  // Phase 2: per-row softmax; warp w owns rows w and w+4. Butterfly fmaxf
+  // Phase 2: per-row softmax; warp w owns rows w, w+WARPS, ... Butterfly fmaxf
   // (exact any order), elementwise exp, ORDER-PINNED sequential sum on
   // lane 0, elementwise inv scale.
   const int warp = tid >> 5;
   const int lane = tid & 31;
 #pragma unroll
-  for (int rr = 0; rr < 2; ++rr) {
-    const int r = warp + rr * 4;
+  for (int rr = 0; rr < ATTN_V3_RPW; ++rr) {
+    const int r = warp + rr * ATTN_V3_WARPS;
     if (r < nrows) {
       float* sc = scores + ((long long)(row0 + r) * n_head + h) * ctx_max;
       const int ctx = causal_offset + row0 + r + 1;

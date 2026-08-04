@@ -204,8 +204,10 @@ pub(super) const KERNEL_NAME_ATTN_BATCH_V3: &str = "gqa_attention_batch_v3_f32";
 pub(super) const KERNEL_NAME_ATTN_BATCH_V3_H: &str = "gqa_attention_batch_v3_h";
 /// Query rows per v3 attention block.
 pub(super) const ATTN_V3_BQ: usize = 8;
-/// Threads per v3 attention block.
-pub(super) const ATTN_V3_THREADS: u32 = 128;
+/// Threads per v3 attention block (Track T4 round-3 tune: 256 — one query
+/// row per warp in phases 1/2 + doubled staging bandwidth — beat 128 by
+/// 1.12x at pp512 shapes; per-row pinned orders untouched).
+pub(super) const ATTN_V3_THREADS: u32 = 256;
 /// v0.3.7 batched M=N decode (N concurrent sequences, per-sequence KV).
 /// The direct M=N attention (`gqa_attention_mdecode_f32`) was retired in ADR
 /// 0025 step 2 — the split partial+combine pair is the only batch attention

@@ -3106,9 +3106,16 @@ fn gqa_attention_batch_v3_matches_rev1_bitwise() {
             block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         };
+        // v3 geometry comes from the pinned consts (they mirror the decode.cu
+        // defines by test) — a hardcoded block_dim here silently under-runs
+        // the kernel's compile-time thread-count strides if the tune changes.
         let cfg3 = LaunchConfig {
-            grid_dim: (n_head as u32, (m as u32).div_ceil(8), 1),
-            block_dim: (128, 1, 1),
+            grid_dim: (
+                n_head as u32,
+                (m as u32).div_ceil(consts::ATTN_V3_BQ as u32),
+                1,
+            ),
+            block_dim: (consts::ATTN_V3_THREADS, 1, 1),
             shared_mem_bytes: 0,
         };
 
