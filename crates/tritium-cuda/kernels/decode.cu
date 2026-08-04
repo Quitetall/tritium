@@ -1813,6 +1813,11 @@ static __device__ __forceinline__ void gqa_attention_batch_v2_body(
 #define ATTN_V3_WARPS (ATTN_V3_THREADS / 32)
 // Query rows owned per warp in phases 1 and 2 (warp w owns rows w, w+WARPS, ...).
 #define ATTN_V3_RPW (ATTN_V3_BQ / ATTN_V3_WARPS)
+// RPW = 0 (more warps than BQ rows) compiles phases 1/2 to nothing — every
+// output garbage; a bitwise gate only catches it on a GPU machine, this
+// catches it in every build.
+static_assert(ATTN_V3_BQ % ATTN_V3_WARPS == 0 && ATTN_V3_RPW >= 1,
+              "ATTN_V3_BQ must be a positive multiple of ATTN_V3_WARPS");
 
 template <class C>
 static __device__ __forceinline__ void gqa_attention_batch_v3_body(

@@ -99,6 +99,12 @@ impl TileConfig {
             && self.tile_n.is_multiple_of(8)
             && self.tile_k != 0
             && self.tile_k.is_multiple_of(32)
+            // rev-5 A-tile XOR swizzle: CH = tile_k/16 must be a power of
+            // two or the (chunk ^ masked-row) mapping is non-bijective —
+            // stores collide and the last row writes past A_STAGE. The
+            // shipped candidate list only emits 32/64/128, but load_cached
+            // accepts any on-disk entry that passes this predicate.
+            && (self.tile_k / 16).is_power_of_two()
             && self.warps >= 1
             && self.stages >= 2
     }
@@ -403,7 +409,7 @@ pub(crate) const CODEGEN_REV: u32 = 5;
 
 impl CacheKey {
     /// Stable filesystem-safe string form, e.g.
-    /// `sm_89-i2sint8-m5-n2560-k2560-cuda13030-r4`. The CUDA version and codegen
+    /// `sm_89-i2sint8-m5-n2560-k2560-cuda13030-r5`. The CUDA version and codegen
     /// revision suffixes mean a driver bump or a codegen change keys a *different*
     /// file, transparently invalidating stale entries.
     pub(crate) fn to_key_string(&self) -> String {
