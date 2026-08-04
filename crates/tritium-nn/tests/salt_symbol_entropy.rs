@@ -351,6 +351,51 @@ fn huffman_code_lengths(hist: &HashMap<u32, u64>) -> HashMap<u32, u32> {
     lengths
 }
 
+/// Best achievable **Golomb–Rice** rate over the same symbols, in bits/symbol.
+///
+/// GR is the obvious "no table" alternative to Huffman: encode `q = v >> m` in unary and the low `m`
+/// bits raw. Its decoder is tiny and table-free, which matters for CPU and MCU paths. But it is
+/// optimal only for a **two-sided geometric** source, and ours is a discretized *Gaussian* — the
+/// ladder's `k = round(w/Δ)` after a Hadamard that exists precisely to Gaussianise the group. So the
+/// question is how much that mismatch costs, and it is cheaper to measure than to argue about.
+///
+/// Symbols are mapped back to the ladder index `k` (the base-3 digits are a bijection onto
+/// `±(3^T−1)/2` — that is the whole point of the representation), then zigzagged to a non-negative
+/// integer so the sign costs one bit rather than a separate code. `m` is swept and the best kept, so
+/// this is GR at its most favourable.
+fn golomb_rice_bits(hist: &HashMap<u32, u64>, planes: usize) -> (f64, u32) {
+    let total: u64 = hist.values().sum();
+    if total == 0 {
+        return (0.0, 0);
+    }
+    // symbol -> k: digit `p` of the base-3 code is plane `p`, which carries weight 3^(T-1-p).
+    let to_k = |mut sym: u32| -> i64 {
+        let mut k = 0i64;
+        for p in 0..planes {
+            let digit = (sym % 3) as i64 - 1;
+            sym /= 3;
+            k += digit * 3i64.pow((planes - 1 - p) as u32);
+        }
+        k
+    };
+    let mut best = (f64::INFINITY, 0u32);
+    for m in 0..16u32 {
+        let mut bits = 0f64;
+        for (&sym, &count) in hist {
+            let k = to_k(sym);
+            let v = if k >= 0 { 2 * k } else { -2 * k - 1 } as u64; // zigzag
+            let q = v >> m;
+            // unary(q) = q+1 bits, plus m raw bits.
+            bits += count as f64 * ((q + 1) as f64 + f64::from(m));
+        }
+        let rate = bits / total as f64;
+        if rate < best.0 {
+            best = (rate, m);
+        }
+    }
+    best
+}
+
 /// Base-3 encode one group's plane-major trits into one symbol per weight.
 fn encode_trits(trits: &[Vec<i8>]) -> Vec<u32> {
     let n = trits[0].len();
@@ -525,6 +570,7 @@ fn joint_symbols_cost_less_than_dense_planes_charge() {
             .map(|(k, &c)| c as f64 * f64::from(code[k]))
             .sum::<f64>()
             / total_sym as f64;
+        let (gr_bits, gr_m) = golomb_rice_bits(&stats.global, t);
         let debiased = stats.debiased_group_entropy_bits_per_weight() + scale_overhead;
         let ceil_frac = stats.entropy_ceiling_fraction();
         println!(
@@ -566,6 +612,12 @@ fn joint_symbols_cost_less_than_dense_planes_charge() {
             );
         }
         println!();
+        println!(
+            "     Golomb-Rice (best m={gr_m}) {gr_bits:.3} b/sym — {:+.1}% vs Huffman, {:+.1}% vs entropy",
+            100.0 * (gr_bits - huff_bits) / huff_bits,
+            100.0 * (gr_bits - stats.global_entropy_bits_per_weight())
+                / stats.global_entropy_bits_per_weight(),
+        );
         if failed_groups > 0 {
             println!("     (note: {failed_groups} groups failed to fit and are EXCLUDED)");
         }
