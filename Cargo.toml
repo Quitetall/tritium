@@ -70,6 +70,7 @@ tritium-cuda = { path = "crates/tritium-cuda", version = "1.1.0-rc.0" }
 # `report compare` ledger entry (issue #4).
 tritium-wgpu = { path = "crates/tritium-wgpu", version = "1.1.0-rc.0" }
 tritium-rocm = { path = "crates/tritium-rocm", version = "1.1.0-rc.0" }
+tritium-metal = { path = "crates/tritium-metal", version = "1.1.0-rc.0" }
 tritium-quantize = { path = "crates/tritium-quantize", version = "1.1.0-rc.0" }
 tritium-salt = { path = "crates/tritium-salt", version = "1.1.0-rc.0" }
 tritium-nn = { path = "crates/tritium-nn", version = "1.1.0-rc.0" }
@@ -88,7 +89,11 @@ cc = "1"
 # ffi (C ABI): cbindgen regenerates include/tritium.h in a dev-only drift test
 cbindgen = "0.29"
 # wgpu backend (WGSL mpGEMM over Vulkan); exact pin keeps cargo-deny wildcards=deny meaningful
-wgpu = { version = "=23.0.1", default-features = false, features = ["wgsl"] }
+# `metal` is what makes the "cross-platform" claim true: wgpu 23 gates its Metal hal
+# behind a DEFAULT feature, which `default-features = false` turns off, so a
+# Vulkan-only mask yields zero adapters on every Mac. The feature is a no-op on
+# non-Apple targets (wgpu-hal cfgs the backend out), so it costs Linux nothing.
+wgpu = { version = "=23.0.1", default-features = false, features = ["wgsl", "metal"] }
 pollster = "0.4"
 # metal backend (MSL mpGEMM over Apple Metal, tritium-metal). metal-rs is declared under
 # tritium-metal's [target.'cfg(target_os = "macos")'] table, so it is NEVER resolved on a

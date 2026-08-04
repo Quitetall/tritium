@@ -10,7 +10,16 @@ fn wgpu_executes_every_vector_for_its_advertised_operations() {
         "../../../spec/training/v2/vectors/v2.json"
     ))
     .expect("parse canonical training vectors");
-    let backend = WgpuTrainBackendV1::new().expect("open native wgpu adapter");
+    // Self-skip when the box has no adapter this backend can open, matching the unit tests'
+    // contract. A bare `.expect()` here made the whole crate's test run RED on any machine
+    // without one — every Mac, before Metal joined the adapter mask (issue #6 finding 6).
+    let backend = match WgpuTrainBackendV1::new() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping wgpu portable-training: no adapter ({e})");
+            return;
+        }
+    };
     backend
         .validate_dispatch_catalog()
         .expect("compile every shared WebGPU dispatch stage");

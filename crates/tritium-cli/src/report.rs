@@ -304,12 +304,19 @@ fn env_capture() -> EnvCapture {
         } else {
             co_resident.lines().map(str::to_owned).collect()
         },
+        // `-Is` is GNU coreutils only — BSD `date` (every macOS box) rejects it and exits 1.
+        // The old call also never checked the exit status, so the failure was silent and EVERY
+        // macOS receipt carried `date_utc: ""` with nothing saying so (issue #6 finding 5).
+        // `+%Y-%m-%dT%H:%M:%S+00:00` is accepted by both, and the status is now checked, so a
+        // future breakage reads as "unavailable" rather than as a blank that looks intentional.
         date_utc: std::process::Command::new("date")
-            .args(["-u", "-Is"])
+            .args(["-u", "+%Y-%m-%dT%H:%M:%S+00:00"])
             .output()
             .ok()
+            .filter(|o| o.status.success())
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
-            .unwrap_or_default(),
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "unavailable".to_owned()),
         git_commit: std::process::Command::new("git")
             .args(["rev-parse", "--short", "HEAD"])
             .output()

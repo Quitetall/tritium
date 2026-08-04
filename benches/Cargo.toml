@@ -37,6 +37,7 @@ tritium-cuda = { workspace = true }
 # linkage no AMD or Vulkan box can produce a GPU bench number at all (issue #4).
 tritium-wgpu = { workspace = true }
 tritium-rocm = { workspace = true }
+tritium-metal = { workspace = true }
 # Parse the committed `tools/reference/bitnet_accept.json` (token IDs + reference
 # perplexity) the end-to-end bench couples its tokens/sec to.
 serde = { workspace = true }
@@ -59,6 +60,9 @@ cuda = ["tritium-cuda/cuda", "tritium-nn/cuda"]
 # build time (its build.rs shells `hipcc`), which is why nothing implies it.
 wgpu = ["tritium-wgpu/register"]
 rocm = ["tritium-rocm/rocm"]
+# Apple Silicon. Inert off macOS: every device path in tritium-metal is additionally
+# `cfg(target_os = "macos")`.
+metal = ["tritium-metal/register"]
 
 # WF-E benches. `mpgemm` (CPU, always-on) is the v0.30 skeleton baseline. The GPU
 # mpGEMM microbenches + the end-to-end tokens/sec bench have `cuda`-gated bodies, so

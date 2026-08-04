@@ -34,6 +34,7 @@ tritium-cuda = { workspace = true, optional = true }
 # named in the CLI source — `main.rs` imports them `as _`.
 tritium-wgpu = { workspace = true, optional = true }
 tritium-rocm = { workspace = true, optional = true }
+tritium-metal = { workspace = true, optional = true }
 tritium-quantize = { workspace = true }
 tritium-salt = { workspace = true }
 # `repack` converts ternary tensors at the trits level.
@@ -81,6 +82,11 @@ nccl = ["cuda", "tritium-cuda/nccl", "dep:libc"]
 # (its build.rs shells `hipcc`), which is why it is not implied by anything.
 wgpu = ["dep:tritium-wgpu", "tritium-wgpu/register"]
 rocm = ["dep:tritium-rocm", "tritium-rocm/rocm"]
+# Apple Silicon. `register` implies the crate's own `metal` gate. Harmless off macOS:
+# every device path in tritium-metal is additionally `cfg(target_os = "macos")`, and the
+# metal-rs binding lives under a macOS-only target table, so a Linux build with this
+# feature on links an inert stub.
+metal = ["dep:tritium-metal", "tritium-metal/register"]
 
 [lints]
 workspace = true

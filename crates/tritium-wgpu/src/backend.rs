@@ -371,6 +371,7 @@ pub struct WgpuBackend {
     attention_pipeline: wgpu::ComputePipeline,
     attention_bind_group_layout: wgpu::BindGroupLayout,
     device_name: String,
+    adapter_backend: String,
 }
 
 /// Packed bytes per block for a format this backend supports.
@@ -382,16 +383,25 @@ fn block_bytes(format: TernaryFormat) -> Result<usize, BackendError> {
     }
 }
 
-/// Select a Vulkan adapter, preferring the discrete NVIDIA GPU.
+/// The adapter families this backend will open.
+///
+/// Vulkan is the Linux/Windows path; **Metal is required for Apple Silicon**, where Vulkan yields
+/// zero adapters — MoltenVK would need wgpu's `vulkan-portability` feature, which the pin does not
+/// admit. A Vulkan-only mask made the "cross-platform GPU backend" in this crate's own description
+/// false on every Mac, and turned `tests/portable_training.rs` red there (reported from an M1 Max,
+/// issue #6 finding 6).
+const PORTABLE_BACKENDS: wgpu::Backends = wgpu::Backends::VULKAN.union(wgpu::Backends::METAL);
+
+/// Select an adapter, preferring the discrete NVIDIA GPU.
 ///
 /// `PowerPreference` alone is unreliable on Linux/Mesa, so we enumerate and pick
 /// explicitly: honor `TRITIUM_WGPU_ADAPTER` (substring of the adapter name), then
 /// prefer NVIDIA discrete (vendor `0x10DE`), then any discrete GPU, then the first.
 fn pick_adapter(instance: &wgpu::Instance) -> Result<wgpu::Adapter, BackendError> {
     // `wgpu::Adapter` is not `Clone`, so select an index then move it out.
-    let mut adapters = instance.enumerate_adapters(wgpu::Backends::VULKAN);
+    let mut adapters = instance.enumerate_adapters(PORTABLE_BACKENDS);
     if adapters.is_empty() {
-        return Err(BackendError::Backend("no Vulkan adapter".into()));
+        return Err(BackendError::Backend("no Vulkan or Metal adapter".into()));
     }
     for a in &adapters {
         let i = a.get_info();
@@ -430,12 +440,15 @@ impl WgpuBackend {
     pub fn new() -> Result<Self, BackendError> {
         async fn init() -> Result<WgpuBackend, BackendError> {
             let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-                backends: wgpu::Backends::VULKAN,
+                backends: PORTABLE_BACKENDS,
                 ..Default::default()
             });
             let adapter = pick_adapter(&instance)?;
             let info = adapter.get_info();
             let device_name = format!("{} ({:?})", info.name, info.device_type);
+            // Which family actually opened — reported through `capabilities()`, since a
+            // hard-coded "vulkan" is a lie the moment the mask admits Metal.
+            let adapter_backend = format!("{:?}", info.backend).to_lowercase();
 
             // Request the adapter's real limits (not the conservative 128 MiB /
             // 65535-workgroup defaults), so production-scale GEMMs are not capped
@@ -998,6 +1011,7 @@ impl WgpuBackend {
                 attention_pipeline,
                 attention_bind_group_layout,
                 device_name,
+                adapter_backend,
             })
         }
         init().block_on()
@@ -3155,7 +3169,11 @@ impl TernaryBackend for WgpuBackend {
 
     fn capabilities(&self) -> DeviceCaps {
         // No fp8/IMMA; the fused W1.58A8 path degrades via the trait default.
-        DeviceCaps::new("wgpu", self.device_name.clone()).with_features(vec!["vulkan".to_owned()])
+        // Report the adapter we ACTUALLY opened. Hard-coding "vulkan" was wrong the
+        // moment the mask admitted Metal, and a capability string that lies is worse
+        // than no capability string.
+        DeviceCaps::new("wgpu", self.device_name.clone())
+            .with_features(vec![self.adapter_backend.to_owned()])
     }
 
     fn upload_weights(

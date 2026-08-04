@@ -71,7 +71,7 @@ jobs:
       # because they must build WITHOUT cuda — that is the AMD-box configuration, and
       # a cfg that only compiles alongside `cuda` would pass the line above and still
       # be broken on the hardware this exists for.
-      - run: cargo clippy -p tritium-cli -p tritium-benches --features tritium-cli/wgpu,tritium-cli/rocm,tritium-benches/wgpu,tritium-benches/rocm --all-targets -- -D warnings
+      - run: cargo clippy -p tritium-cli -p tritium-benches --features tritium-cli/wgpu,tritium-cli/rocm,tritium-cli/metal,tritium-benches/wgpu,tritium-benches/rocm,tritium-benches/metal --all-targets -- -D warnings
       - run: cargo clippy -p tritium-serve --features cuda,e2e,device-loss-qualification --all-targets -- -D warnings
 
   # Release compatibility claims are generated from a strict manifest. A cell

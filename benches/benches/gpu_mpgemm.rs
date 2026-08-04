@@ -24,7 +24,12 @@
 //! `Err`, so the bench function early-returns before timing anything).
 
 #![cfg_attr(
-    not(all(feature = "cuda", feature = "wgpu", feature = "rocm")),
+    not(all(
+        feature = "cuda",
+        feature = "wgpu",
+        feature = "rocm",
+        feature = "metal"
+    )),
     allow(unused_crate_dependencies)
 )]
 
@@ -32,7 +37,12 @@ fn main() {
     divan::main();
 }
 
-#[cfg(any(feature = "cuda", feature = "wgpu", feature = "rocm"))]
+#[cfg(any(
+    feature = "cuda",
+    feature = "wgpu",
+    feature = "rocm",
+    feature = "metal"
+))]
 mod gpu_benches {
     use divan::{Bencher, counter::ItemsCount};
     use tritium_benches::{BITNET_SHAPES, gemm_macs, packed_tq2_0_weights};
@@ -45,6 +55,8 @@ mod gpu_benches {
     // simply absent from `BACKENDS`.
     #[cfg(feature = "cuda")]
     use tritium_cuda as _;
+    #[cfg(feature = "metal")]
+    use tritium_metal as _;
     #[cfg(feature = "rocm")]
     use tritium_rocm as _;
     #[cfg(feature = "wgpu")]
@@ -60,6 +72,8 @@ mod gpu_benches {
         "wgpu",
         #[cfg(feature = "rocm")]
         "rocm",
+        #[cfg(feature = "metal")]
+        "metal",
     ];
 
     /// One benchmark case: which backend runs it, and at what shape. `Debug` is what
