@@ -115,6 +115,20 @@ struct SymbolStats {
     weighted_group_entropy_bits: f64,
     /// Sum over groups of `n_g * log2(|alphabet_g|)` — a per-group fixed-width code.
     weighted_group_alphabet_bits: f64,
+    /// Symbol histogram pooled within each Δ-grid bucket, and the weight count per bucket. This is
+    /// the SHIPPABLE rate: a small family of static code tables, chosen per group by a few stored
+    /// bits, rather than a per-group table nobody can afford to transmit.
+    bucket_hist: Vec<HashMap<u32, u64>>,
+    bucket_weights: Vec<u64>,
+    /// Sum over groups of the Miller–Madow bias term `(K_g − 1)/(2·ln2)`, where `K_g` is the number
+    /// of DISTINCT symbols the group used. A plug-in entropy estimate from `n` samples is biased LOW
+    /// by about `(K−1)/(2n·ln2)` bits, and with `n = 128` against `3^T` states that bias is the
+    /// whole apparent per-group "win". Tracking it is what stops this table lying.
+    group_miller_madow_bits: f64,
+    /// Sum over groups of `n_g · log2(n_g)` — the hard ceiling on a plug-in estimate, since `n`
+    /// samples can show at most `n` distinct symbols. A per-group entropy near this ceiling is
+    /// measuring the sample size, not the source.
+    group_entropy_ceiling_bits: f64,
     weights: u64,
     groups: u64,
 }
@@ -122,10 +136,18 @@ struct SymbolStats {
 impl SymbolStats {
     /// Fold one group's joint symbols in. `symbols` is one `u32` per weight in the group,
     /// packing plane `p`'s trit into base-3 digit `p`.
-    fn observe_group(&mut self, symbols: &[u32]) {
+    fn observe_group(&mut self, symbols: &[u32], bucket: usize) {
         if symbols.is_empty() {
             return;
         }
+        if self.bucket_hist.len() <= bucket {
+            self.bucket_hist.resize_with(bucket + 1, HashMap::new);
+            self.bucket_weights.resize(bucket + 1, 0);
+        }
+        for &s in symbols {
+            *self.bucket_hist[bucket].entry(s).or_default() += 1;
+        }
+        self.bucket_weights[bucket] += symbols.len() as u64;
         let mut local: HashMap<u32, u64> = HashMap::new();
         for &s in symbols {
             *local.entry(s).or_default() += 1;
@@ -141,6 +163,8 @@ impl SymbolStats {
             .sum();
         self.weighted_group_entropy_bits += n * h;
         self.weighted_group_alphabet_bits += n * (local.len() as f64).log2();
+        self.group_miller_madow_bits += (local.len() as f64 - 1.0) / (2.0 * std::f64::consts::LN_2);
+        self.group_entropy_ceiling_bits += n * n.log2();
         self.weights += symbols.len() as u64;
         self.groups += 1;
     }
@@ -155,9 +179,50 @@ impl SymbolStats {
         self.weighted_group_alphabet_bits / self.weights as f64
     }
 
-    /// One fixed-width code shared by the whole model, bits per weight.
+    /// One fixed-width code shared by the whole model, bits per weight. Superseded by the global
+    /// ENTROPY figure (a fixed-width code over the same alphabet is strictly worse), kept because it
+    /// is the cheapest possible non-statistical decoder and therefore a useful floor to quote.
+    #[allow(dead_code)]
     fn global_alphabet_bits_per_weight(&self) -> f64 {
         (self.global.len() as f64).log2()
+    }
+
+    /// Rate of a **static table family**: pool each Δ-grid bucket's histogram, entropy-code within
+    /// it, and charge the bucket selector separately. This is what a real decoder can do — the
+    /// tables are global (amortised to nothing) and the per-group side information is a few bits.
+    fn bucketed_entropy_bits_per_weight(&self) -> f64 {
+        let mut acc = 0.0f64;
+        for (hist, &n) in self.bucket_hist.iter().zip(&self.bucket_weights) {
+            if n == 0 {
+                continue;
+            }
+            let h: f64 = hist
+                .values()
+                .map(|&c| {
+                    let p = c as f64 / n as f64;
+                    -p * p.log2()
+                })
+                .sum();
+            acc += n as f64 * h;
+        }
+        acc / self.weights as f64
+    }
+
+    /// Per-group entropy with the Miller–Madow bias added back. If this lands on the global figure,
+    /// the groups are statistically identical and there is NO per-group structure to code against.
+    fn debiased_group_entropy_bits_per_weight(&self) -> f64 {
+        (self.weighted_group_entropy_bits + self.group_miller_madow_bits) / self.weights as f64
+    }
+
+    /// How close the raw per-group estimate sits to its `log2(n_g)` ceiling. Above ~0.9 the column
+    /// is reporting the group size and nothing else.
+    fn entropy_ceiling_fraction(&self) -> f64 {
+        self.weighted_group_entropy_bits / self.group_entropy_ceiling_bits
+    }
+
+    /// Number of buckets that actually carried weights — the size of the table family.
+    fn live_buckets(&self) -> usize {
+        self.bucket_weights.iter().filter(|&&n| n > 0).count()
     }
 
     /// Entropy of the pooled distribution — reported only to show how much of the win is
@@ -306,8 +371,8 @@ fn joint_symbols_cost_less_than_dense_planes_charge() {
         }
     );
     println!(
-        "{:<4} {:>7} {:>9} {:>10} {:>10} {:>10} {:>9}",
-        "T", "states", "dense", "gl-alpha", "gr-alpha", "entropy", "vs dense"
+        "{:<4} {:>7} {:>9} {:>11} {:>10} {:>10} {:>11} {:>9}",
+        "T", "states", "dense", "ACHIEVABLE", "bucketed", "gr-naive", "gr-debiased", "vs dense"
     );
     println!("{}", "-".repeat(66));
 
@@ -323,7 +388,13 @@ fn joint_symbols_cost_less_than_dense_planes_charge() {
             match fitter {
                 // O(T) per weight: one whole-tensor call, no per-group enumeration.
                 Fitter::Ladder => {
-                    for (_, planes) in ste::geometric_ladder_fit(
+                    // Bucket each group by its Δ-grid index `j` — the one knob the fitter chose, and
+                    // something a decoder can be told in `ceil(log2 GRID)` = 4 bits. Recovered as
+                    // `j = 4·log2(Δ₀/Δ)` with `Δ₀ = max|w|/kmax` the clipping-free step, mirroring
+                    // `fit_group_geometric`'s `Δ_j = Δ₀·2^(-j/4)`.
+                    let kmax = ((3f64.powi(t as i32) - 1.0) / 2.0) as f32;
+                    let per_row = cols.div_ceil(GROUP);
+                    let fits = ste::geometric_ladder_fit(
                         w,
                         rows,
                         cols,
@@ -331,8 +402,22 @@ fn joint_symbols_cost_less_than_dense_planes_charge() {
                         GROUP,
                         GRID,
                         RotationPolicy::Always,
-                    ) {
-                        stats.observe_group(&encode_trits(&planes));
+                    );
+                    for (g, (s0, planes)) in fits.iter().enumerate() {
+                        let (r, b) = (g / per_row, g % per_row);
+                        let lo = r * cols + b * GROUP;
+                        let hi = (lo + GROUP).min((r + 1) * cols);
+                        let peak = w[lo..hi].iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+                        let delta = s0 / 3.0f32.powi(t as i32 - 1);
+                        let j = if peak > 0.0 && delta > 0.0 {
+                            let d0 = peak / kmax;
+                            (4.0 * (f64::from(d0) / f64::from(delta)).log2())
+                                .round()
+                                .clamp(0.0, (GRID - 1) as f64) as usize
+                        } else {
+                            0
+                        };
+                        stats.observe_group(&encode_trits(planes), j);
                     }
                 }
                 Fitter::Joint => {
@@ -340,7 +425,7 @@ fn joint_symbols_cost_less_than_dense_planes_charge() {
                         let row = &w[r * cols..(r + 1) * cols];
                         for bs in row.chunks(GROUP) {
                             match group_symbols(bs, cfg) {
-                                Some(syms) => stats.observe_group(&syms),
+                                Some(syms) => stats.observe_group(&syms, 0),
                                 None => failed_groups += 1,
                             }
                         }
@@ -368,12 +453,16 @@ fn joint_symbols_cost_less_than_dense_planes_charge() {
                 Fitter::Ladder => 16.0 / GROUP as f64,
                 Fitter::Joint => t as f64 * 16.0 / GROUP as f64,
             };
-        let gl_alpha = stats.global_alphabet_bits_per_weight() + scale_overhead;
-        let gr_alpha = stats.group_alphabet_bits_per_weight() + scale_overhead;
+        // The bucket selector is real side information and is charged here.
+        let selector_bits = (GRID as f64).log2().ceil() / GROUP as f64;
+        let gl_alpha = stats.global_entropy_bits_per_weight() + scale_overhead;
+        let gr_alpha = stats.bucketed_entropy_bits_per_weight() + scale_overhead + selector_bits;
         let entropy = stats.entropy_bits_per_weight() + scale_overhead;
 
+        let debiased = stats.debiased_group_entropy_bits_per_weight() + scale_overhead;
+        let ceil_frac = stats.entropy_ceiling_fraction();
         println!(
-            "{:<4} {:>3}/{:<3} {:>9.3} {:>10.3} {:>10.3} {:>10.3} {:>8.1}%",
+            "{:<4} {:>3}/{:<3} {:>9.3} {:>11.3} {:>10.3} {:>10.3} {:>11} {:>8.1}%",
             t,
             stats.global.len(),
             3usize.pow(t as u32),
@@ -381,16 +470,30 @@ fn joint_symbols_cost_less_than_dense_planes_charge() {
             gl_alpha,
             gr_alpha,
             entropy,
-            100.0 * (entropy - dense) / dense,
+            if ceil_frac > 0.9 {
+                "  (invalid)".to_string()
+            } else {
+                format!("{debiased:.3}")
+            },
+            100.0 * (gl_alpha - dense) / dense,
         );
+        if ceil_frac > 0.9 {
+            println!(
+                "     !! gr-naive is {:.0}% of its log2(group) ceiling — it is measuring the SAMPLE SIZE, \
+                 not the source. Ignore it at this T.",
+                ceil_frac * 100.0
+            );
+        }
         if failed_groups > 0 {
             println!("     (note: {failed_groups} groups failed to fit and are EXCLUDED)");
         }
         println!(
-            "     pooled-entropy cross-check {:.3} bpw ({} groups, {} weights)",
-            stats.global_entropy_bits_per_weight() + scale_overhead,
+            "     {} live Δ-buckets, +{:.4} bpw selector | {} groups, {} weights | per-group alphabet {:.3} bpw (NOT chargeable)",
+            stats.live_buckets(),
+            selector_bits,
             stats.groups,
             stats.weights,
+            stats.group_alphabet_bits_per_weight() + scale_overhead,
         );
     }
 
