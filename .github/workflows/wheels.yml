@@ -323,7 +323,7 @@ jobs:
             tensorboard==2.21.0 wandb==0.28.1 \
             opentelemetry-api==1.44.0 opentelemetry-sdk==1.44.0
           python -m pip install --isolated --disable-pip-version-check \
-            --no-index --no-deps --only-binary=:all: dist/*.whl
+            --no-index --no-deps --only-binary=:all: --no-compile dist/*.whl
       - name: execute and validate source-free installed tutorial
         shell: bash
         run: |

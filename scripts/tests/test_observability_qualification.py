@@ -27,6 +27,11 @@ class ObservabilityQualificationTests(unittest.TestCase):
             "opentelemetry-sdk==1.44.0",
         ):
             self.assertIn(package, job)
+        self.assertRegex(
+            job,
+            r"python -m pip install --isolated[^\n]*\\\n"
+            r"\s+--no-index --no-deps --only-binary=:all: --no-compile dist/\*\.whl",
+        )
         self.assertIn("--check-receipt evidence/observability-clean/receipt.json", job)
         self.assertIn("evidence/observability-clean/**", job)
         self.assertNotIn("actions/checkout", job)
