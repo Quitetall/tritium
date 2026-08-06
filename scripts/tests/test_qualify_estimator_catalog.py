@@ -71,7 +71,7 @@ def fixture(root: Path):
 
 
 class QualifyEstimatorCatalogTests(unittest.TestCase):
-    def test_accepts_venv_style_python_symlink(self):
+    def test_preserves_venv_style_python_entrypoint(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             target = root / "python-real"
@@ -79,7 +79,7 @@ class QualifyEstimatorCatalogTests(unittest.TestCase):
             target.chmod(0o755)
             link = root / "python"
             link.symlink_to(target)
-            self.assertEqual(MODULE["executable"](link, "Python"), target)
+            self.assertEqual(MODULE["executable"](link, "Python"), link.absolute())
 
     def test_seals_trace_and_self_validates(self):
         with tempfile.TemporaryDirectory() as raw:

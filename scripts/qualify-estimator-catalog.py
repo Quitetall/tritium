@@ -68,13 +68,18 @@ def ordinary(path: Path, label: str, *, max_bytes: int | None = None) -> Path:
 
 
 def executable(path: Path, label: str) -> Path:
+    entrypoint = path.absolute()
     try:
-        path = path.resolve(strict=True)
+        target = entrypoint.resolve(strict=True)
     except FileNotFoundError as error:
         raise QualificationError(f"{label} does not exist") from error
-    if not path.is_file() or path.stat().st_size <= 0 or not os.access(path, os.X_OK):
+    if (
+        not target.is_file()
+        or target.stat().st_size <= 0
+        or not os.access(entrypoint, os.X_OK)
+    ):
         raise QualificationError(f"{label} must be executable")
-    return path
+    return entrypoint
 
 
 def anchor(candidate: Path, wheel: Path) -> dict[str, Any]:
