@@ -30,7 +30,7 @@ def junit(names: tuple[str, ...]) -> str:
     cases = "".join(f"<testcase name='{name}'/>" for name in names)
     count = len(names)
     return (
-        f"<testsuites tests='{count}' failures='0' errors='0' skipped='0'>"
+        "<testsuites name='pytest tests'>"
         f"<testsuite tests='{count}' failures='0' errors='0' skipped='0'>"
         f"{cases}</testsuite></testsuites>"
     )
@@ -101,13 +101,21 @@ def fixture(root: Path) -> tuple[Path, Path, dict[str, object]]:
     return receipt, wheel, value
 
 
+def validate_fixture(receipt: Path, wheel: Path, value: dict[str, object]):
+    return validate(
+        receipt,
+        "a" * 40,
+        "1.1.0-rc.0",
+        wheel,
+        value["source"]["git_blob"],
+    )
+
+
 class VerifyTorchDispatchCudaReceiptTests(unittest.TestCase):
     def test_accepts_exact_physical_cuda_receipt(self):
         with tempfile.TemporaryDirectory() as raw:
             receipt, wheel, expected = fixture(Path(raw))
-            self.assertEqual(
-                validate(receipt, "a" * 40, "1.1.0-rc.0", wheel), expected
-            )
+            self.assertEqual(validate_fixture(receipt, wheel, expected), expected)
 
     def test_rejects_identity_and_result_drift(self):
         mutations = (
@@ -121,7 +129,7 @@ class VerifyTorchDispatchCudaReceiptTests(unittest.TestCase):
                 value[field] = replacement
                 receipt.write_bytes(canonical(value) + b"\n")
                 with self.assertRaises(ReceiptError):
-                    validate(receipt, "a" * 40, "1.1.0-rc.0", wheel)
+                    validate_fixture(receipt, wheel, value)
 
     def test_rejects_installed_distribution_version_drift(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -131,7 +139,13 @@ class VerifyTorchDispatchCudaReceiptTests(unittest.TestCase):
             value["receipt_id"] = "sha256:" + hashlib.sha256(canonical(unsigned)).hexdigest()
             receipt.write_bytes(canonical(value) + b"\n")
             with self.assertRaises(ReceiptError):
-                validate(receipt, "a" * 40, "1.1.0-rc.0", wheel)
+                validate_fixture(receipt, wheel, value)
+
+    def test_rejects_retained_source_not_in_candidate_revision(self):
+        with tempfile.TemporaryDirectory() as raw:
+            receipt, wheel, _ = fixture(Path(raw))
+            with self.assertRaises(ReceiptError):
+                validate(receipt, "a" * 40, "1.1.0-rc.0", wheel, "c" * 40)
 
     def test_rejects_test_set_and_sanitizer_claim_drift(self):
         mutations = (
@@ -148,16 +162,16 @@ class VerifyTorchDispatchCudaReceiptTests(unittest.TestCase):
                 value["receipt_id"] = "sha256:" + hashlib.sha256(canonical(unsigned)).hexdigest()
                 receipt.write_bytes(canonical(value) + b"\n")
                 with self.assertRaises(ReceiptError):
-                    validate(receipt, "a" * 40, "1.1.0-rc.0", wheel)
+                    validate_fixture(receipt, wheel, value)
 
     def test_rejects_retained_file_and_wheel_drift(self):
         for target in ("suite-junit.xml", "compute-sanitizer.log", "wheel"):
             with self.subTest(target=target), tempfile.TemporaryDirectory() as raw:
-                receipt, wheel, _ = fixture(Path(raw))
+                receipt, wheel, value = fixture(Path(raw))
                 path = wheel if target == "wheel" else Path(raw) / target
                 path.write_bytes(path.read_bytes() + b"drift")
                 with self.assertRaises(ReceiptError):
-                    validate(receipt, "a" * 40, "1.1.0-rc.0", wheel)
+                    validate_fixture(receipt, wheel, value)
 
     def test_rejects_unknown_fields_and_symlinked_receipt(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -168,13 +182,13 @@ class VerifyTorchDispatchCudaReceiptTests(unittest.TestCase):
             value["receipt_id"] = "sha256:" + hashlib.sha256(canonical(unsigned)).hexdigest()
             receipt.write_bytes(canonical(value) + b"\n")
             with self.assertRaises(ReceiptError):
-                validate(receipt, "a" * 40, "1.1.0-rc.0", wheel)
+                validate_fixture(receipt, wheel, value)
 
-            receipt, wheel, _ = fixture(root)
+            receipt, wheel, value = fixture(root)
             link = root / "link.json"
             link.symlink_to(receipt)
             with self.assertRaises(ReceiptError):
-                validate(link, "a" * 40, "1.1.0-rc.0", wheel)
+                validate_fixture(link, wheel, value)
 
 
 if __name__ == "__main__":

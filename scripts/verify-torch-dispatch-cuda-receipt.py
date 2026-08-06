@@ -9,6 +9,7 @@ import json
 import math
 from pathlib import Path
 import re
+import subprocess
 import sys
 from typing import Any
 import xml.etree.ElementTree as ET
@@ -136,11 +137,14 @@ def _junit(path: Path, expected: tuple[str, ...], label: str) -> None:
         raise ReceiptError(f"{label} must contain XML") from error
     if root.tag not in {"testsuite", "testsuites"}:
         raise ReceiptError(f"{label} root must be testsuite or testsuites")
+    suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+    if not suites:
+        raise ReceiptError(f"{label} contains no test suite")
     for field, expected_value in (
         ("tests", len(expected)), ("failures", 0), ("errors", 0), ("skipped", 0)
     ):
         try:
-            observed = int(root.attrib.get(field, ""))
+            observed = sum(int(suite.attrib.get(field, "")) for suite in suites)
         except ValueError as error:
             raise ReceiptError(f"{label}.{field} is invalid") from error
         if observed != expected_value:
@@ -160,8 +164,26 @@ def _git_blob(path: Path) -> str:
     return hashlib.sha1(f"blob {len(content)}\0".encode() + content).hexdigest()
 
 
+def git_blob_at(repo: Path, revision: str) -> str:
+    result = subprocess.run(
+        ["git", "rev-parse", f"{revision}:{SOURCE_PATH}"],
+        cwd=repo,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    blob = result.stdout.strip()
+    if result.returncode != 0 or re.fullmatch(r"[0-9a-f]{40}", blob) is None:
+        raise ReceiptError("candidate revision lacks frozen dispatcher test source")
+    return blob
+
+
 def validate(
-    path: Path, expected_revision: str, expected_release: str, expected_wheel: Path
+    path: Path,
+    expected_revision: str,
+    expected_release: str,
+    expected_wheel: Path,
+    expected_source_blob: str,
 ) -> dict[str, Any]:
     path = _ordinary(path, "receipt", MAX_RECEIPT_BYTES)
     expected_wheel = _ordinary(expected_wheel, "qualified wheel", 2 * 1024**3)
@@ -207,8 +229,11 @@ def validate(
         {field: source[field] for field in FILE_FIELDS},
         "source",
     )
-    if _digest(source["git_blob"], 40, "source.git_blob") != _git_blob(source_path):
+    source_blob = _digest(source["git_blob"], 40, "source.git_blob")
+    if source_blob != _git_blob(source_path):
         raise ReceiptError("source.git_blob differs from retained test source")
+    if source_blob != _digest(expected_source_blob, 40, "expected source blob"):
+        raise ReceiptError("retained test source is not candidate revision source")
 
     suite = _object(receipt["suite"], SUITE_FIELDS, "suite")
     if suite["selector"] != "native_cuda" or suite["tests"] != list(CUDA_TESTS):
@@ -247,9 +272,17 @@ def main() -> int:
     parser.add_argument("--source-revision", required=True)
     parser.add_argument("--release", required=True)
     parser.add_argument("--wheel", type=Path, required=True)
+    parser.add_argument("--repo", type=Path, default=Path.cwd())
     args = parser.parse_args()
     try:
-        receipt = validate(args.receipt, args.source_revision, args.release, args.wheel)
+        source_blob = git_blob_at(args.repo.resolve(strict=True), args.source_revision)
+        receipt = validate(
+            args.receipt,
+            args.source_revision,
+            args.release,
+            args.wheel,
+            source_blob,
+        )
     except (OSError, ReceiptError) as error:
         print(f"verify-torch-dispatch-cuda-receipt: FAIL: {error}", file=sys.stderr)
         return 1

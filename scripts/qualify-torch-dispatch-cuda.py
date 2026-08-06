@@ -289,7 +289,9 @@ def assemble(
     unsigned = {key: value for key, value in receipt.items() if key != "receipt_id"}
     receipt["receipt_id"] = "sha256:" + hashlib.sha256(canonical(unsigned)).hexdigest()
     (stage / "receipt.json").write_bytes(canonical(receipt) + b"\n")
-    validate_receipt(stage / "receipt.json", source_revision, release, wheel)
+    validate_receipt(
+        stage / "receipt.json", source_revision, release, wheel, source_blob
+    )
     return receipt
 
 
@@ -372,7 +374,10 @@ def qualify(
             sanitizer_version=version,
         )
         publish_directory_noreplace(stage, output)
-        if validate_receipt(output / "receipt.json", source_revision, release, wheel) != receipt:
+        expected_blob = git_output(repo, "rev-parse", f"{source_revision}:{SOURCE_PATH}")
+        if validate_receipt(
+            output / "receipt.json", source_revision, release, wheel, expected_blob
+        ) != receipt:
             raise QualificationError("published receipt differs after no-clobber publication")
         return receipt
     finally:

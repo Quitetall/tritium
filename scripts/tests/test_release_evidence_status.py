@@ -927,16 +927,31 @@ class ReleaseEvidenceStatusTests(unittest.TestCase):
                 [entry(receipt_path, receipt, kind="torch-dispatch-cuda")],
             )
             loader = mock.Mock(return_value=receipt)
+            source_blob = mock.Mock(return_value="b" * 40)
             with mock.patch.dict(
                 evaluate.__globals__,
-                {"validate_torch_dispatch_cuda": loader},
+                {
+                    "validate_torch_dispatch_cuda": loader,
+                    "torch_dispatch_git_blob_at": source_blob,
+                },
             ):
                 report = evaluate(registry_path, candidate, document)
             frontend = next(row for row in report["rows"] if row["id"] == "pytorch-hf")
             self.assertEqual(frontend["satisfied_kinds"], ["torch-dispatch-cuda"])
             loader.assert_called_once_with(
-                receipt_path.resolve(), "a" * 40, "1.1.0-rc.0", artifact
+                receipt_path.resolve(), "a" * 40, "1.1.0-rc.0", artifact, "b" * 40
             )
+            source_blob.assert_called_once_with(ROOT, "a" * 40)
+
+            document["artifacts"][0]["identity"]["bytes"] = 999
+            with mock.patch.dict(
+                evaluate.__globals__,
+                {
+                    "validate_torch_dispatch_cuda": mock.Mock(return_value=receipt),
+                    "torch_dispatch_git_blob_at": mock.Mock(return_value="b" * 40),
+                },
+            ), self.assertRaisesRegex(EvidenceError, "candidate wheel bytes"):
+                evaluate(registry_path, candidate, document)
 
     def test_hf_lifecycle_binds_candidate_wheel_and_advances_frontend_gate(self):
         with tempfile.TemporaryDirectory() as raw:

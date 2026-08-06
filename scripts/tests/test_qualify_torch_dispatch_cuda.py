@@ -22,7 +22,7 @@ def junit(names: tuple[str, ...]) -> str:
     cases = "".join(f"<testcase name='{name}'/>" for name in names)
     count = len(names)
     return (
-        f"<testsuites tests='{count}' failures='0' errors='0' skipped='0'>"
+        "<testsuites name='pytest tests'>"
         f"<testsuite tests='{count}' failures='0' errors='0' skipped='0'>"
         f"{cases}</testsuite></testsuites>"
     )
@@ -73,7 +73,13 @@ class QualifyTorchDispatchCudaTests(unittest.TestCase):
                 sanitizer_version="2026.2.1.0",
             )
             self.assertEqual(
-                validate(stage / "receipt.json", "a" * 40, "1.1.0-rc.0", wheel),
+                validate(
+                    stage / "receipt.json",
+                    "a" * 40,
+                    "1.1.0-rc.0",
+                    wheel,
+                    receipt["source"]["git_blob"],
+                ),
                 receipt,
             )
 

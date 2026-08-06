@@ -9,6 +9,44 @@ from tritium.nn import TernaryLinear  # noqa: E402
 from tritium import _tritium as _native  # noqa: E402
 
 
+def assert_no_device_wide_cuda_synchronization(profile, region_name):
+    events = profile.events()
+    assert any(event.name == region_name for event in events)
+
+    def belongs_to_region(event):
+        parent = event.cpu_parent
+        while parent is not None:
+            if parent.name == region_name:
+                return True
+            parent = parent.cpu_parent
+        return False
+
+    synchronizations = [
+        event
+        for event in events
+        if event.name.replace(" ", "").lower() == "cudadevicesynchronize"
+    ]
+    assert not any(belongs_to_region(event) for event in synchronizations)
+
+
+def test_device_wide_cuda_synchronization_guard_rejects_profiler_event():
+    class Event:
+        def __init__(self, name, parent=None):
+            self.name = name
+            self.cpu_parent = parent
+
+    class Profile:
+        def events(self):
+            region = Event("warm")
+            return [
+                region,
+                Event("cudaDeviceSynchronize", region),
+            ]
+
+    with pytest.raises(AssertionError):
+        assert_no_device_wide_cuda_synchronization(Profile(), "warm")
+
+
 def test_ternary_linear_op_matches_literal_forward_and_masked_backward():
     _native._ternary_linear_cache_clear()
     weight = torch.tensor(
@@ -403,7 +441,9 @@ def test_native_cuda_warm_forward_backward_avoids_composite_tensor_ops():
         activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
         acc_events=True,
     ) as profile:
-        with torch.cuda.stream(stream):
+        with torch.cuda.stream(stream), torch.profiler.record_function(
+            "tritium_native_cuda_warm"
+        ):
             ternary_linear(x, weight, bias).backward(grad_output)
             torch.cuda._sleep(1)
         stream.synchronize()
@@ -412,6 +452,9 @@ def test_native_cuda_warm_forward_backward_avoids_composite_tensor_ops():
     assert torch.allclose(weight.grad, expected_weight.grad, atol=2e-5, rtol=2e-5)
     assert torch.allclose(bias.grad, expected_bias.grad, atol=2e-5, rtol=2e-5)
     event_names = {event.key.lower() for event in profile.key_averages()}
+    assert_no_device_wide_cuda_synchronization(
+        profile, "tritium_native_cuda_warm"
+    )
     forbidden = {
         "aten::abs",
         "aten::clamp",
@@ -482,9 +525,10 @@ def test_native_cuda_autocast_warm_forward_backward_uses_fp16_kernels():
             ],
             acc_events=True,
         ) as profile:
-            output = ternary_linear(x, weight, bias)
-            output.backward(grad_output)
-            torch.cuda._sleep(1)
+            with torch.profiler.record_function("tritium_native_cuda_fp16_warm"):
+                output = ternary_linear(x, weight, bias)
+                output.backward(grad_output)
+                torch.cuda._sleep(1)
         stream.synchronize()
 
     assert output.dtype == torch.float16
@@ -498,6 +542,9 @@ def test_native_cuda_autocast_warm_forward_backward_uses_fp16_kernels():
     )
 
     event_names = {event.key.lower() for event in profile.key_averages()}
+    assert_no_device_wide_cuda_synchronization(
+        profile, "tritium_native_cuda_fp16_warm"
+    )
     forbidden = {
         "aten::abs",
         "aten::clamp",

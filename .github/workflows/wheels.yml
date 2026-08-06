@@ -467,6 +467,7 @@ jobs:
             --output-dir evidence/torch-dispatch-cuda
           python scripts/verify-torch-dispatch-cuda-receipt.py \
             evidence/torch-dispatch-cuda/receipt.json \
+            --repo "$PWD" \
             --source-revision "${{ github.sha }}" \
             --release 1.1.0-rc.0 \
             --wheel "${wheels[0]}"
