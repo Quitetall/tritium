@@ -114,6 +114,14 @@ the registry. Empty and partial registries therefore enumerate `MISSING` gates;
 one valid CUDA receipt cannot green the broader native-backend gate, and one
 functional wheel or compatibility matrix cannot replace complete local-archive
 evidence.
+
+PyTorch dispatcher evidence is intentionally split. `torch-dispatch-overhead`
+binds exact installed-wheel CPU forward/backward overhead distributions to the
+five-percent policy. `torch-dispatch-cuda` binds the exact CUDA wheel, committed
+dispatcher test source, physical GPU identity, all seven native CUDA cases, and
+compute-sanitizer JUnit/log bytes with one zero-error summary. Both kinds are
+required; CUDA training evidence cannot substitute for dispatcher residency,
+tail, cache-lifetime, stream-ordering, or memcheck coverage.
 Public activation is always `EXTERNAL_AUTH_REQUIRED` and is not inferred from
 local evidence.
 

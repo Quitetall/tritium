@@ -108,6 +108,11 @@ TORCH_DISPATCH_RECEIPT = runpy.run_path(
 )
 validate_torch_dispatch_overhead = TORCH_DISPATCH_RECEIPT["validate"]
 DispatchOverheadError = TORCH_DISPATCH_RECEIPT["DispatchOverheadError"]
+TORCH_DISPATCH_CUDA_RECEIPT = runpy.run_path(
+    Path(__file__).with_name("verify-torch-dispatch-cuda-receipt.py")
+)
+validate_torch_dispatch_cuda = TORCH_DISPATCH_CUDA_RECEIPT["validate"]
+DispatchCudaReceiptError = TORCH_DISPATCH_CUDA_RECEIPT["ReceiptError"]
 ESTIMATOR_REFINEMENT_RECEIPT = runpy.run_path(
     Path(__file__).with_name("verify-estimator-refinement-receipt.py")
 )
@@ -148,6 +153,7 @@ KNOWN_KINDS = frozenset(
         "backend-manifest",
         "performance",
         "torch-dispatch-overhead",
+        "torch-dispatch-cuda",
         "estimator-validation",
         "refinement",
         "baseline-ablation",
@@ -168,7 +174,7 @@ GATES = (
         (
             "installed-qat-tutorial", "frontend-lifecycle",
             "distributed-training", "export-reload",
-            "observability", "torch-dispatch-overhead",
+            "observability", "torch-dispatch-overhead", "torch-dispatch-cuda",
         ),
     ),
     ("native-backends", ("backend-manifest", "cuda-training", "performance")),
@@ -505,6 +511,10 @@ def evaluate(
                     expected_release=release,
                     expected_wheel=artifact_path,
                 )
+            elif kind == "torch-dispatch-cuda":
+                receipt = validate_torch_dispatch_cuda(
+                    receipt_path, revision, release, artifact_path
+                )
             elif kind == "estimator-validation":
                 receipt = validate_estimators(
                     receipt_path, revision, release, candidate
@@ -596,6 +606,7 @@ def evaluate(
             TrainingBackendReceiptError,
             TrainingPerformanceError,
             DispatchOverheadError,
+            DispatchCudaReceiptError,
             EstimatorRefinementError,
             ValueError,
         ) as error:

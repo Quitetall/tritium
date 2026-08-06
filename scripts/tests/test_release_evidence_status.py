@@ -900,6 +900,44 @@ class ReleaseEvidenceStatusTests(unittest.TestCase):
                 expected_wheel=artifact,
             )
 
+    def test_torch_dispatch_cuda_binds_wheel_and_advances_frontend_gate(self):
+        with tempfile.TemporaryDirectory() as raw:
+            candidate, document, artifact, evidence_root = release_fixture(Path(raw))
+            document["artifacts"][0]["identity"] = {
+                "sha256": sha256(artifact),
+                "bytes": artifact.stat().st_size,
+            }
+            candidate.write_bytes(canonical(document) + b"\n")
+            receipt_path = evidence_root / "torch-dispatch-cuda.json"
+            receipt_path.write_bytes(b"{}\n")
+            receipt = {
+                "receipt_id": "sha256:" + "6" * 64,
+                "run_id": "dispatch-cuda-physical-1",
+                "artifact": {
+                    "kind": "python-wheel",
+                    "name": artifact.name,
+                    "bytes": artifact.stat().st_size,
+                    "sha256": sha256(artifact),
+                },
+            }
+            registry_path = evidence_root / "registry.json"
+            registry(
+                registry_path,
+                candidate,
+                [entry(receipt_path, receipt, kind="torch-dispatch-cuda")],
+            )
+            loader = mock.Mock(return_value=receipt)
+            with mock.patch.dict(
+                evaluate.__globals__,
+                {"validate_torch_dispatch_cuda": loader},
+            ):
+                report = evaluate(registry_path, candidate, document)
+            frontend = next(row for row in report["rows"] if row["id"] == "pytorch-hf")
+            self.assertEqual(frontend["satisfied_kinds"], ["torch-dispatch-cuda"])
+            loader.assert_called_once_with(
+                receipt_path.resolve(), "a" * 40, "1.1.0-rc.0", artifact
+            )
+
     def test_hf_lifecycle_binds_candidate_wheel_and_advances_frontend_gate(self):
         with tempfile.TemporaryDirectory() as raw:
             candidate, document, artifact, evidence_root = release_fixture(Path(raw))

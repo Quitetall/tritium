@@ -415,8 +415,11 @@ jobs:
         run: |
           set -euo pipefail
           NVCC="$(command -v nvcc)"
+          COMPUTE_SANITIZER="$(command -v compute-sanitizer)"
           test -x "$NVCC"
+          test -x "$COMPUTE_SANITIZER"
           "$NVCC" --version | grep -E 'release 13\.'
+          "$COMPUTE_SANITIZER" --version
           nvidia-smi --query-gpu=name,compute_cap,driver_version --format=csv
       - name: test CUDA manylinux build contract
         run: >-
@@ -443,9 +446,30 @@ jobs:
           python -m pip install --disable-pip-version-check --only-binary=:all: \
             torch==2.11.0 --index-url https://download.pytorch.org/whl/cu130
           python -m pip install --disable-pip-version-check --only-binary=:all: \
-            transformers==5.5.3 safetensors==0.8.0 accelerate==1.10.0
+            transformers==5.5.3 safetensors==0.8.0 accelerate==1.10.0 \
+            pytest==9.0.2
           python -m pip install --isolated --disable-pip-version-check \
             --no-index --no-deps --only-binary=:all: --force-reinstall dist-cuda/*.whl
+      - name: qualify exact-wheel CUDA dispatcher and memcheck
+        shell: bash
+        run: |
+          set -euo pipefail
+          wheels=(dist-cuda/*.whl)
+          test "${#wheels[@]}" -eq 1
+          python scripts/qualify-torch-dispatch-cuda.py \
+            --repo "$PWD" \
+            --python "$(command -v python)" \
+            --wheel "${wheels[0]}" \
+            --compute-sanitizer "$(command -v compute-sanitizer)" \
+            --source-revision "${{ github.sha }}" \
+            --release 1.1.0-rc.0 \
+            --run-id github-${{ github.run_id }}-${{ github.run_attempt }}-dispatch-cuda \
+            --output-dir evidence/torch-dispatch-cuda
+          python scripts/verify-torch-dispatch-cuda-receipt.py \
+            evidence/torch-dispatch-cuda/receipt.json \
+            --source-revision "${{ github.sha }}" \
+            --release 1.1.0-rc.0 \
+            --wheel "${wheels[0]}"
       - name: execute installed-wheel CUDA kernel and lifecycle
         shell: bash
         run: >-
