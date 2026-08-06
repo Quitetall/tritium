@@ -389,33 +389,62 @@ impl Qwen36PtqEvidenceCaptureSession {
             return Ok(self.tasks.get(self.cursor).cloned());
         }
         while let Some(task) = self.tasks.get(self.cursor) {
-            match fs::symlink_metadata(self.evidence.record_path(task.tensor_index)) {
-                Ok(_) => {
-                    let record = self.evidence.reopen(task.tensor_index)?;
-                    validate_capture_task(task, self.source_model_id, &record)?;
-                    self.reused = self
-                        .reused
-                        .checked_add(1)
-                        .ok_or(Qwen36PtqDriverError::AllocationFailed)?;
-                    self.cursor = self
-                        .cursor
-                        .checked_add(1)
-                        .ok_or(Qwen36PtqDriverError::AllocationFailed)?;
-                }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    self.pending = true;
-                    return Ok(Some(task.clone()));
-                }
-                Err(error) => {
-                    return Err(Qwen36PtqDriverError::Io {
-                        operation: "inspect evidence record",
-                        tensor_index: Some(task.tensor_index),
-                        kind: error.kind(),
-                    });
-                }
+            if !self.validate_present_record(task)? {
+                self.pending = true;
+                return Ok(Some(task.clone()));
             }
+            self.reused = self
+                .reused
+                .checked_add(1)
+                .ok_or(Qwen36PtqDriverError::AllocationFailed)?;
+            self.cursor = self
+                .cursor
+                .checked_add(1)
+                .ok_or(Qwen36PtqDriverError::AllocationFailed)?;
         }
         Ok(None)
+    }
+
+    /// Return up to `max_tasks` missing tasks without advancing acceptance.
+    ///
+    /// The currently pending task is always first. Later existing records are
+    /// freshly validated and omitted, but are not counted as reused until
+    /// ordinary traversal reaches them. This bounded look-ahead lets one
+    /// runtime replay feed several projection writers while preserving the
+    /// same ordered, record-at-a-time durable acceptance contract.
+    ///
+    /// # Errors
+    /// Rejects namespace drift or any later present record that no longer
+    /// matches its canonical catalog slot and provenance.
+    pub fn next_requests(
+        &mut self,
+        max_tasks: usize,
+    ) -> Result<Vec<Qwen36PtqEvidenceCaptureTask>, Qwen36PtqDriverError> {
+        if max_tasks == 0 || self.receipt.is_some() {
+            return Ok(Vec::new());
+        }
+        if self.next_request()?.is_none() {
+            return Ok(Vec::new());
+        }
+        let capacity = max_tasks.min(self.tasks.len().saturating_sub(self.cursor));
+        let mut requests = Vec::new();
+        requests
+            .try_reserve_exact(capacity)
+            .map_err(|_| Qwen36PtqDriverError::AllocationFailed)?;
+        let current = self
+            .tasks
+            .get(self.cursor)
+            .ok_or(Qwen36PtqDriverError::AllocationFailed)?;
+        requests.push(current.clone());
+        for task in self.tasks.iter().skip(self.cursor.saturating_add(1)) {
+            if requests.len() == max_tasks {
+                break;
+            }
+            if !self.validate_present_record(task)? {
+                requests.push(task.clone());
+            }
+        }
+        Ok(requests)
     }
 
     /// Validate and accept the durable record for the currently pending task.
@@ -433,19 +462,9 @@ impl Qwen36PtqEvidenceCaptureSession {
             .tasks
             .get(self.cursor)
             .ok_or(Qwen36PtqDriverError::AllocationFailed)?;
-        match fs::symlink_metadata(self.evidence.record_path(task.tensor_index)) {
-            Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => {
-                return Err(Qwen36PtqDriverError::Io {
-                    operation: "inspect evidence record",
-                    tensor_index: Some(task.tensor_index),
-                    kind: error.kind(),
-                });
-            }
+        if !self.validate_present_record(task)? {
+            return Ok(false);
         }
-        let record = self.evidence.reopen(task.tensor_index)?;
-        validate_capture_task(task, self.source_model_id, &record)?;
         self.produced = self
             .produced
             .checked_add(1)
@@ -492,6 +511,25 @@ impl Qwen36PtqEvidenceCaptureSession {
         )?;
         self.receipt = Some(receipt.clone());
         Ok(Some(receipt))
+    }
+
+    fn validate_present_record(
+        &self,
+        task: &Qwen36PtqEvidenceCaptureTask,
+    ) -> Result<bool, Qwen36PtqDriverError> {
+        match fs::symlink_metadata(self.evidence.record_path(task.tensor_index)) {
+            Ok(_) => {
+                let record = self.evidence.reopen(task.tensor_index)?;
+                validate_capture_task(task, self.source_model_id, &record)?;
+                Ok(true)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(Qwen36PtqDriverError::Io {
+                operation: "inspect evidence record",
+                tensor_index: Some(task.tensor_index),
+                kind: error.kind(),
+            }),
+        }
     }
 
     fn create_current_builder(
@@ -950,6 +988,12 @@ mod tests {
         assert_eq!(first.tensor_index(), 0);
         assert_eq!(first.tensor_name(), "a.weight");
         assert_eq!((first.rows(), first.columns()), (2, 128));
+        let prefetched = session.next_requests(2).unwrap();
+        assert_eq!(prefetched.len(), 2);
+        assert_eq!(prefetched[0], first);
+        assert_eq!(prefetched[1].tensor_index(), 1);
+        assert_eq!(prefetched[1].tensor_name(), "b.weight");
+        assert_eq!(session.counts(), (2, 0, 0));
         assert_eq!(session.next_request().unwrap().unwrap(), first);
         assert!(!session.accept_current().unwrap());
         let mut builder = session_directory
@@ -1017,6 +1061,69 @@ mod tests {
 
         fs::remove_dir_all(session_root).unwrap();
         fs::remove_dir_all(reference_root).unwrap();
+    }
+
+    #[test]
+    fn capture_session_prefetch_skips_valid_later_records_without_advancing_counts() {
+        let root = temp_root("session-prefetch-existing");
+        let directory = Qwen36PtqEvidenceDirectory::create(&root).unwrap();
+        let slots = [slot("a.weight"), slot("b.weight"), slot("c.weight")];
+        let source_model_id = ModelId::from_digest([1; 32]);
+        let mut probe = Qwen36PtqEvidenceCaptureSession::open_slots(
+            &slots,
+            source_model_id,
+            directory.clone(),
+            SaltV2Curvature::GuidedFisher,
+            [2; 32],
+            [3; 32],
+            0.25,
+        )
+        .unwrap();
+        let tasks = probe.next_requests(3).unwrap();
+        drop(probe);
+
+        let later = &tasks[1];
+        let mut builder = directory
+            .create_builder(later.spec(directory.max_record_bytes()).unwrap())
+            .unwrap();
+        builder
+            .accumulate_batch(&vec![2.0; 128], Some(&[1.0, 2.0]), 1, None, None)
+            .unwrap();
+        directory.install_builder(builder).unwrap();
+
+        let mut session = Qwen36PtqEvidenceCaptureSession::open_slots(
+            &slots,
+            source_model_id,
+            directory.clone(),
+            SaltV2Curvature::GuidedFisher,
+            [2; 32],
+            [3; 32],
+            0.25,
+        )
+        .unwrap();
+        let first = session.next_request().unwrap().unwrap();
+        let prefetched = session.next_requests(2).unwrap();
+        assert_eq!(
+            prefetched
+                .iter()
+                .map(Qwen36PtqEvidenceCaptureTask::tensor_index)
+                .collect::<Vec<_>>(),
+            [0, 2]
+        );
+        assert_eq!(session.counts(), (3, 0, 0));
+
+        let mut builder = directory
+            .create_builder(first.spec(directory.max_record_bytes()).unwrap())
+            .unwrap();
+        builder
+            .accumulate_batch(&vec![1.0; 128], Some(&[1.0, 2.0]), 1, None, None)
+            .unwrap();
+        directory.install_builder(builder).unwrap();
+        assert!(session.accept_current().unwrap());
+        assert_eq!(session.next_request().unwrap().unwrap().tensor_index(), 2);
+        assert_eq!(session.counts(), (3, 1, 1));
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

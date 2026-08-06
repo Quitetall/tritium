@@ -371,6 +371,20 @@ impl Qwen36KroneckerCaptureSession {
             .map_err(directory_error)
     }
 
+    /// Return a bounded missing-task window without advancing acceptance.
+    fn next_requests(
+        &mut self,
+        py: Python<'_>,
+        max_tasks: usize,
+    ) -> PyResult<Vec<Qwen36KroneckerCaptureTask>> {
+        if max_tasks == 0 {
+            return Err(contract_error("max_tasks must be positive"));
+        }
+        py.detach(|| self.session.next_requests(max_tasks))
+            .map(|tasks| tasks.into_iter().map(Into::into).collect())
+            .map_err(directory_error)
+    }
+
     /// Advance only after the current exact record strictly reopens.
     fn accept_current(&mut self, py: Python<'_>) -> PyResult<bool> {
         py.detach(|| self.session.accept_current())

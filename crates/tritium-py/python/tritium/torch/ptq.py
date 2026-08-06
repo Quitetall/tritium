@@ -815,15 +815,17 @@ def capture_qwen36_kronecker_evidence(
     max_batch_bytes: int = 256 * 1024 * 1024,
     max_capture_bytes: Optional[int] = None,
     max_objective_bytes: int = 256 * 1024 * 1024,
+    max_shared_modules: int = 8,
     _session_factory=None,
 ):
     """Resume and complete the canonical pinned-Qwen grouped-evidence catalog.
 
     ``data_factory(task)`` must return a fresh replayable calibration iterable
-    for each missing tensor. Existing records are reused by the native session.
-    Linear projections and the output head use dense factors; token embeddings
-    use sparse indexed factors. The source checkpoint is admitted before any
-    task is exposed.
+    for each missing task window. Dense projections on the same model are
+    captured in groups of at most ``max_shared_modules`` from one replay;
+    ``task`` is the first canonical task in that window. Existing records are
+    reused by the native session. Token embeddings remain sparse one-task
+    captures. The source checkpoint is admitted before any task is exposed.
     """
 
     if not isinstance(language_model, nn.Module):
@@ -832,6 +834,8 @@ def capture_qwen36_kronecker_evidence(
         raise TypeError("mtp_model must be a torch.nn.Module")
     if not callable(data_factory):
         raise TypeError("data_factory must be callable")
+    if type(max_shared_modules) is not int or max_shared_modules <= 0:
+        raise ValueError("max_shared_modules must be a positive integer")
     if curvature == "guided-fisher":
         if guided_loss_reduction not in {
             "sum",
@@ -867,13 +871,8 @@ def capture_qwen36_kronecker_evidence(
         damping,
         max_evidence_bytes=max_evidence_bytes,
     )
-    while True:
-        task = session.next_request()
-        if task is None:
-            receipt = session.finish()
-            if receipt is None:
-                raise RuntimeError("Qwen evidence session did not seal a complete catalog")
-            return receipt
+
+    def validate_task(task: Any) -> None:
         if (
             task.curvature != curvature
             or task.activation_cache_digest != bound_cache_digest
@@ -881,11 +880,9 @@ def capture_qwen36_kronecker_evidence(
             or task.damping != damping
         ):
             raise RuntimeError("native Qwen capture task drifted from the session contract")
-        target, module_path, selected = _resolve_qwen36_capture_module(
-            task, language_model, mtp_model
-        )
-        indexed_output = isinstance(selected, nn.Embedding)
-        writer = KroneckerCalibrationWriter(
+
+    def writer_for(task: Any, *, indexed_output: bool) -> KroneckerCalibrationWriter:
+        return KroneckerCalibrationWriter(
             evidence_dir,
             tensor_index=task.tensor_index,
             tensor_name=task.tensor_name,
@@ -901,6 +898,78 @@ def capture_qwen36_kronecker_evidence(
             max_evidence_bytes=max_evidence_bytes,
             max_batch_bytes=max_batch_bytes,
         )
+
+    def accept(task: Any) -> None:
+        current = session.next_request()
+        if (
+            current is None
+            or current.tensor_index != task.tensor_index
+            or current.tensor_name != task.tensor_name
+        ):
+            raise RuntimeError("native Qwen capture acceptance order drifted")
+        if not session.accept_current():
+            raise RuntimeError("Qwen evidence session refused the published record")
+
+    while True:
+        task = session.next_request()
+        if task is None:
+            receipt = session.finish()
+            if receipt is None:
+                raise RuntimeError("Qwen evidence session did not seal a complete catalog")
+            return receipt
+        validate_task(task)
+        tasks = (task,)
+        prefetch = getattr(session, "next_requests", None)
+        if max_shared_modules > 1 and callable(prefetch):
+            tasks = tuple(prefetch(max_shared_modules))
+            if (
+                not tasks
+                or tasks[0].tensor_index != task.tensor_index
+                or tasks[0].tensor_name != task.tensor_name
+            ):
+                raise RuntimeError("native Qwen capture prefetch order drifted")
+        target, module_path, selected = _resolve_qwen36_capture_module(
+            task, language_model, mtp_model
+        )
+        indexed_output = isinstance(selected, nn.Embedding)
+        if not indexed_output:
+            grouped = [(task, module_path, selected)]
+            selected_ids = {id(selected)}
+            for candidate in tasks[1:]:
+                if candidate.scope != task.scope:
+                    break
+                validate_task(candidate)
+                candidate_target, candidate_path, candidate_module = (
+                    _resolve_qwen36_capture_module(
+                        candidate, language_model, mtp_model
+                    )
+                )
+                if (
+                    candidate_target is not target
+                    or isinstance(candidate_module, nn.Embedding)
+                    or id(candidate_module) in selected_ids
+                ):
+                    break
+                selected_ids.add(id(candidate_module))
+                grouped.append((candidate, candidate_path, candidate_module))
+            if len(grouped) > 1:
+                writers = [writer_for(item, indexed_output=False) for item, _, _ in grouped]
+                results = capture_kronecker_module_group(
+                    target,
+                    data_factory(grouped[0][0]),
+                    modules=[path for _, path, _ in grouped],
+                    writers=writers,
+                    curvature=curvature,
+                    guided_loss_reduction=guided_loss_reduction,
+                    max_capture_bytes=max_capture_bytes,
+                    max_objective_bytes=max_objective_bytes,
+                )
+                for (expected, _, _), result in zip(grouped, results):
+                    if result.record.tensor_index != expected.tensor_index:
+                        raise RuntimeError("Qwen capture published the wrong tensor ordinal")
+                    accept(expected)
+                continue
+        writer = writer_for(task, indexed_output=indexed_output)
         capture = capture_kronecker_embedding if indexed_output else capture_kronecker_module
         result = capture(
             target,
@@ -914,8 +983,7 @@ def capture_qwen36_kronecker_evidence(
         )
         if result.record.tensor_index != task.tensor_index:
             raise RuntimeError("Qwen capture published the wrong tensor ordinal")
-        if not session.accept_current():
-            raise RuntimeError("Qwen evidence session refused the published record")
+        accept(task)
 
 
 def capture_kronecker_module(

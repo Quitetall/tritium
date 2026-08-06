@@ -250,7 +250,8 @@ def test_qwen_capture_session_dispatches_embedding_and_output_head(tmp_path):
             self.accepted = 0
 
         def next_request(self):
-            self.current = next(self.tasks, None)
+            if self.current is None:
+                self.current = next(self.tasks, None)
             return self.current
 
         def accept_current(self):
@@ -285,6 +286,110 @@ def test_qwen_capture_session_dispatches_embedding_and_output_head(tmp_path):
     )
 
     assert receipt.records == 2
+    assert (tmp_path / "evidence" / "000000.s2kf").is_file()
+    assert (tmp_path / "evidence" / "000001.s2kf").is_file()
+
+
+def test_qwen_capture_groups_dense_tasks_into_one_calibration_replay(tmp_path):
+    class TinyQwen(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj1 = torch.nn.Linear(128, 128, bias=False)
+            self.proj2 = torch.nn.Linear(128, 4, bias=False)
+            self.forward_calls = 0
+
+        def forward(self, values, attention_mask=None):
+            self.forward_calls += 1
+            hidden = torch.nn.functional.silu(self.proj1(values))
+            logits = self.proj2(hidden)
+            return SimpleNamespace(logits=logits, loss=logits.square().mean())
+
+    class FakeSession:
+        def __init__(
+            self,
+            model_dir,
+            revision,
+            work_dir,
+            evidence_dir,
+            curvature,
+            activation_cache_digest,
+            token_stream_digest,
+            damping,
+            **kwargs,
+        ):
+            common = dict(
+                columns=128,
+                scope="language",
+                role="projection",
+                source_model_digest="01" * 32,
+                activation_cache_digest=activation_cache_digest,
+                token_stream_digest=token_stream_digest,
+                curvature=curvature,
+                damping=damping,
+            )
+            self.tasks = [
+                SimpleNamespace(
+                    tensor_index=0,
+                    tensor_name="model.language_model.proj1.weight",
+                    rows=128,
+                    **common,
+                ),
+                SimpleNamespace(
+                    tensor_index=1,
+                    tensor_name="model.language_model.proj2.weight",
+                    rows=4,
+                    **common,
+                ),
+            ]
+            self.cursor = 0
+
+        def next_request(self):
+            return self.tasks[self.cursor] if self.cursor < len(self.tasks) else None
+
+        def next_requests(self, maximum):
+            return self.tasks[self.cursor : self.cursor + maximum]
+
+        def accept_current(self):
+            assert self.cursor < len(self.tasks)
+            self.cursor += 1
+            return True
+
+        def finish(self):
+            assert self.cursor == len(self.tasks)
+            return SimpleNamespace(records=2, produced=2, reused=0)
+
+    model = TinyQwen()
+    factory_calls = 0
+
+    def data_factory(task):
+        nonlocal factory_calls
+        factory_calls += 1
+        assert task.tensor_index == 0
+        return [
+            {
+                "values": torch.ones(1, 2, 128),
+                "attention_mask": torch.ones(1, 2, dtype=torch.int64),
+            }
+        ]
+
+    receipt = capture_qwen36_kronecker_evidence(
+        model,
+        data_factory,
+        model_dir=tmp_path / "model",
+        declared_revision="test-revision",
+        work_dir=tmp_path / "work",
+        evidence_dir=tmp_path / "evidence",
+        curvature="forward-kl-kronecker",
+        activation_cache_digest="02" * 32,
+        token_stream_digest="03" * 32,
+        damping=0.01,
+        max_shared_modules=2,
+        _session_factory=FakeSession,
+    )
+
+    assert receipt.records == 2
+    assert factory_calls == 1
+    assert model.forward_calls == 1
     assert (tmp_path / "evidence" / "000000.s2kf").is_file()
     assert (tmp_path / "evidence" / "000001.s2kf").is_file()
 
