@@ -611,8 +611,8 @@ def validate_export_receipt(
     weights = manifest.get("weights") if isinstance(manifest, dict) else None
     if (
         not isinstance(manifest, dict)
-        or manifest.get("schema_version") != 1
-        or manifest.get("artifact_kind") != "tritium.module-qat-hard-v1"
+        or manifest.get("schema_version") != 2
+        or manifest.get("artifact_kind") != "tritium.module-qat-hard-v2"
         or not isinstance(state, dict)
         or not isinstance(config, dict)
         or not isinstance(weights, list)

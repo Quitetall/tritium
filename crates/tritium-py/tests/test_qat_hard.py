@@ -5,6 +5,8 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from tritium.nn import (  # noqa: E402
+    AdditiveTernaryConv1d,
+    AdditiveTernaryConv2d,
     AdditiveTernaryEmbedding,
     AdditiveTernaryLinear,
     TernaryEmbedding,
@@ -22,6 +24,54 @@ class _TiedLanguageModel(torch.nn.Module):
 
     def forward(self, tokens):
         return self.head(self.embed(tokens))
+
+
+class _ConvolutionModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.temporal = torch.nn.Conv1d(
+            4,
+            6,
+            kernel_size=3,
+            padding=1,
+            groups=2,
+            padding_mode="reflect",
+        )
+        self.spatial = torch.nn.Conv2d(
+            4,
+            6,
+            kernel_size=(3, 1),
+            padding=(1, 0),
+            groups=2,
+            bias=False,
+        )
+
+    def forward(self, temporal, spatial):
+        return self.temporal(temporal), self.spatial(spatial)
+
+
+class _TiedConvolutionModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.first = torch.nn.Conv1d(2, 3, kernel_size=3, padding=1)
+        self.second = torch.nn.Conv1d(2, 3, kernel_size=3, padding=1)
+        self.second.weight = self.first.weight
+        self.second.bias = self.first.bias
+
+    def forward(self, inputs):
+        return self.first(inputs) + self.second(inputs)
+
+
+class _CrossBoundaryTiedBiasModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv = torch.nn.Conv1d(2, 3, kernel_size=3, padding=1)
+        self.norm = torch.nn.LayerNorm(3)
+        self.norm.bias = self.conv.bias
+
+    def forward(self, inputs):
+        hidden = self.conv(inputs).transpose(1, 2)
+        return self.norm(hidden).transpose(1, 2)
 
 
 def test_convert_qat_freezes_tied_masters_without_ptq_relabeling():
@@ -116,3 +166,96 @@ def test_qat_hard_hashes_and_replays_bfloat16_state():
     result = convert(prepared)
     assert result.source_checkpoint_digest.startswith("sha256:")
     torch.testing.assert_close(result.model(sample), expected, rtol=0, atol=0)
+
+
+def test_convert_qat_hard_lowers_convolutions_without_dense_masters():
+    torch.manual_seed(89)
+    source = _ConvolutionModel().eval()
+    prepared = prepare(
+        source,
+        TernaryConfig.qat(
+            estimator="salt-ste",
+            target_modules=("Conv1d", "Conv2d"),
+            planes=2,
+        ),
+        inplace=False,
+    )
+    temporal = torch.randn(2, 4, 11)
+    spatial = torch.randn(2, 4, 7, 5)
+    expected = prepared.model(temporal, spatial)
+
+    result = convert(prepared)
+
+    assert isinstance(result.model.temporal, AdditiveTernaryConv1d)
+    assert isinstance(result.model.spatial, AdditiveTernaryConv2d)
+    assert [weight.consumer_kinds for weight in result.weights] == [
+        ("conv1d",),
+        ("conv2d",),
+    ]
+    assert [weight.shape for weight in result.weights] == [(6, 6), (6, 6)]
+    assert not any(name.endswith(".weight") for name in result.model.state_dict())
+    actual = result.model(temporal, spatial)
+    torch.testing.assert_close(actual[0], expected[0], rtol=0, atol=0)
+    torch.testing.assert_close(actual[1], expected[1], rtol=0, atol=0)
+
+
+def test_convert_qat_hard_preserves_root_convolution_string_padding():
+    torch.manual_seed(101)
+    prepared = prepare(
+        torch.nn.Conv1d(2, 3, kernel_size=3, padding="same", bias=False).eval(),
+        TernaryConfig.qat(
+            estimator="salt-ste",
+            target_modules=("Conv1d",),
+        ),
+        inplace=True,
+    )
+    sample = torch.randn(2, 2, 13)
+    expected = prepared.model(sample)
+
+    hard = convert(prepared)
+
+    assert isinstance(hard.model, AdditiveTernaryConv1d)
+    assert hard.model.padding == "same"
+    torch.testing.assert_close(hard.model(sample), expected, rtol=0, atol=0)
+
+
+def test_convert_qat_hard_preserves_distinct_consumers_tied_bias():
+    torch.manual_seed(107)
+    prepared = prepare(
+        _TiedConvolutionModel().eval(),
+        TernaryConfig.qat(
+            estimator="salt-ste",
+            target_modules=("Conv1d",),
+        ),
+        inplace=True,
+    )
+    sample = torch.randn(2, 2, 9)
+    expected = prepared.model(sample)
+
+    hard = convert(prepared)
+
+    assert hard.model.first is not hard.model.second
+    assert hard.model.first.packed_weight is hard.model.second.packed_weight
+    assert hard.model.first.bias is hard.model.second.bias
+    torch.testing.assert_close(hard.model(sample), expected, rtol=0, atol=0)
+
+
+def test_convert_qat_hard_preserves_target_to_preserved_bias_tie():
+    torch.manual_seed(113)
+    prepared = prepare(
+        _CrossBoundaryTiedBiasModel().eval(),
+        TernaryConfig.qat(
+            estimator="salt-ste",
+            target_modules=("Conv1d",),
+        ),
+        inplace=True,
+    )
+    sample = torch.randn(2, 2, 9)
+    expected = prepared.model(sample)
+
+    hard = convert(prepared)
+
+    assert hard.model.conv.bias is hard.model.norm.bias
+    torch.testing.assert_close(hard.model(sample), expected, rtol=0, atol=0)
+    hard.model.to(dtype=torch.float64)
+    assert hard.model.conv.bias is hard.model.norm.bias

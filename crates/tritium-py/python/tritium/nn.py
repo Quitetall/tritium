@@ -445,6 +445,155 @@ class AdditiveTernaryEmbedding(_AdditiveTernaryConsumer):
         )
 
 
+class _AdditiveTernaryConvNd(_AdditiveTernaryConsumer):
+    """Shared inference-only convolution state over flattened packed kernels."""
+
+    def _initialize_from_module(
+        self,
+        module: nn.Module,
+        packed_weight: AdditiveTernaryWeight,
+        *,
+        bias: Optional[torch.Tensor],
+        owner: bool,
+    ) -> None:
+        weight_shape = tuple(int(dimension) for dimension in module.weight.shape)
+        flattened_columns = int(module.weight[0].numel())
+        if (
+            packed_weight.out_features != module.out_channels
+            or packed_weight.in_features != flattened_columns
+        ):
+            raise ValueError("additive ternary convolution shell geometry differs")
+        self.in_channels = int(module.in_channels)
+        self.out_channels = int(module.out_channels)
+        self.kernel_size = tuple(module.kernel_size)
+        self.stride = tuple(module.stride)
+        self.padding = (
+            module.padding if isinstance(module.padding, str) else tuple(module.padding)
+        )
+        self.dilation = tuple(module.dilation)
+        self.transposed = bool(module.transposed)
+        self.output_padding = tuple(module.output_padding)
+        self.groups = int(module.groups)
+        self.padding_mode = module.padding_mode
+        self._reversed_padding_repeated_twice = tuple(
+            module._reversed_padding_repeated_twice
+        )
+        self.weight_shape = weight_shape
+        self.weight_elements = packed_weight.weight_elements
+        self.plane_count = packed_weight.plane_count
+        self._bind_packed_weight(packed_weight, owner=owner)
+        if bias is not None:
+            if bias.ndim != 1 or bias.shape[0] != self.out_channels:
+                raise ValueError("additive ternary convolution bias geometry differs")
+            self.register_buffer("bias", bias.detach().clone())
+        else:
+            self.register_buffer("bias", None)
+        self.training = False
+
+    @classmethod
+    def from_packed_weight(
+        cls,
+        module: nn.Module,
+        packed_weight: AdditiveTernaryWeight,
+        *,
+        owner: bool = False,
+    ):
+        converted = cls.__new__(cls)
+        nn.Module.__init__(converted)
+        converted._initialize_from_module(
+            module,
+            packed_weight,
+            bias=module.bias,
+            owner=owner,
+        )
+        return converted
+
+    @classmethod
+    def empty(
+        cls,
+        module: nn.Module,
+        planes: int,
+        *,
+        packed_weight: AdditiveTernaryWeight | None = None,
+        owner: bool = True,
+    ):
+        flattened_columns = int(module.weight[0].numel())
+        if packed_weight is None:
+            packed_weight = AdditiveTernaryWeight.empty(
+                flattened_columns,
+                module.out_channels,
+                planes,
+                device=module.weight.device,
+            )
+        converted = cls.__new__(cls)
+        nn.Module.__init__(converted)
+        bias = (
+            torch.empty_like(module.bias, memory_format=torch.contiguous_format)
+            if module.bias is not None
+            else None
+        )
+        converted._initialize_from_module(
+            module,
+            packed_weight,
+            bias=bias,
+            owner=owner,
+        )
+        return converted
+
+    def _padded_input(self, input: torch.Tensor):
+        if self.padding_mode == "zeros":
+            return input, self.padding
+        return (
+            F.pad(input, self._reversed_padding_repeated_twice, mode=self.padding_mode),
+            0,
+        )
+
+    def _dense_weight(self, input: torch.Tensor) -> torch.Tensor:
+        if not input.dtype.is_floating_point:
+            raise TypeError("additive ternary convolution input must be floating point")
+        return self.packed_weight.dense(dtype=input.dtype).reshape(self.weight_shape)
+
+    def extra_repr(self) -> str:
+        return (
+            f"in_channels={self.in_channels}, out_channels={self.out_channels}, "
+            f"kernel_size={self.kernel_size}, stride={self.stride}, "
+            f"padding={self.padding}, groups={self.groups}, "
+            f"planes={self.plane_count}, bias={self.bias is not None}"
+        )
+
+
+class AdditiveTernaryConv1d(_AdditiveTernaryConvNd):
+    """Inference-only Conv1d backed by additive packed ternary kernels."""
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        input, padding = self._padded_input(input)
+        return F.conv1d(
+            input,
+            self._dense_weight(input),
+            self.bias.to(dtype=input.dtype) if self.bias is not None else None,
+            self.stride,
+            padding,
+            self.dilation,
+            self.groups,
+        )
+
+
+class AdditiveTernaryConv2d(_AdditiveTernaryConvNd):
+    """Inference-only Conv2d backed by additive packed ternary kernels."""
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        input, padding = self._padded_input(input)
+        return F.conv2d(
+            input,
+            self._dense_weight(input),
+            self.bias.to(dtype=input.dtype) if self.bias is not None else None,
+            self.stride,
+            padding,
+            self.dilation,
+            self.groups,
+        )
+
+
 class TernaryLinear(nn.Module):
     """Linear layer with latent floating weights and a hard ternary forward."""
 

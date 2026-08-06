@@ -1014,8 +1014,8 @@ class ReleaseEvidenceStatusTests(unittest.TestCase):
             state = hard / "model.safetensors"
             state.write_bytes(b"hard state")
             manifest = {
-                "schema_version": 1,
-                "artifact_kind": "tritium.module-qat-hard-v1",
+                "schema_version": 2,
+                "artifact_kind": "tritium.module-qat-hard-v2",
                 "artifact_id": "sha256:" + "1" * 64,
                 "conversion_artifact_id": "sha256:" + "2" * 64,
                 "source_checkpoint_digest": "sha256:" + "3" * 64,

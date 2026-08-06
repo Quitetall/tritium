@@ -5,12 +5,15 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
+from types import MethodType
 from typing import Any, Dict, Tuple
 
 import torch
 from torch import nn
 
 from ..nn import (
+    AdditiveTernaryConv1d,
+    AdditiveTernaryConv2d,
     AdditiveTernaryEmbedding,
     AdditiveTernaryLinear,
     AdditiveTernaryWeight,
@@ -27,22 +30,46 @@ from .projection import ProjectionContext, validate_projection
 
 
 @dataclass(frozen=True)
+class QatHardConsumer:
+    """One module consumer bound to a packed QAT-hard weight."""
+
+    alias: str
+    kind: str
+    contract_id: str
+    module_group: int
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "alias": self.alias,
+            "kind": self.kind,
+            "contract_id": self.contract_id,
+            "module_group": self.module_group,
+        }
+
+
+@dataclass(frozen=True)
 class QatHardWeight:
     """Identity of one unique latent master frozen into compact planes."""
 
     path: str
-    aliases: Tuple[str, ...]
-    consumer_kinds: Tuple[str, ...]
+    consumers: Tuple[QatHardConsumer, ...]
     storage_path: str
     shape: Tuple[int, int]
     algorithm_id: str
     planes: int
 
+    @property
+    def aliases(self) -> Tuple[str, ...]:
+        return tuple(consumer.alias for consumer in self.consumers)
+
+    @property
+    def consumer_kinds(self) -> Tuple[str, ...]:
+        return tuple(consumer.kind for consumer in self.consumers)
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "path": self.path,
-            "aliases": list(self.aliases),
-            "consumer_kinds": list(self.consumer_kinds),
+            "consumers": [consumer.to_dict() for consumer in self.consumers],
             "storage_path": self.storage_path,
             "shape": list(self.shape),
             "algorithm_id": self.algorithm_id,
@@ -63,7 +90,7 @@ class QatHardResult:
     source_coverage: CoverageReport
     weights: Tuple[QatHardWeight, ...]
     mode: str = "qat-hard"
-    schema_version: int = 1
+    schema_version: int = 2
 
     def export(self, output_dir):
         """Atomically publish this hard result as a strict state bundle."""
@@ -103,7 +130,7 @@ def _qat_hard_ids(
     weights: Tuple[QatHardWeight, ...],
 ) -> Tuple[str, str]:
     recipe_value = {
-        "schema_version": 1,
+        "schema_version": 2,
         "mode": "qat-hard",
         "source_checkpoint_digest": source_checkpoint_digest,
         "config": config.to_dict(),
@@ -138,22 +165,13 @@ def _groups(prepared: PreparedModel) -> Tuple[_WeightGroup, ...]:
             code="invalid_phase",
             stage="convert_qat_hard",
         )
-    unsupported = [
-        path
-        for path, module in model.named_modules(remove_duplicate=False)
-        if isinstance(module, (TernaryConv1d, TernaryConv2d))
-    ]
-    if unsupported:
-        raise TritiumError(
-            "QAT hard conversion does not yet support ternary convolutions",
-            code="unsupported_module",
-            stage="convert_qat_hard",
-            details={"modules": unsupported},
-        )
     by_weight: Dict[int, list[_Consumer]] = {}
     modules_by_weight: Dict[int, nn.Module] = {}
     for path, module in model.named_modules(remove_duplicate=False):
-        if not isinstance(module, (TernaryLinear, TernaryEmbedding)):
+        if not isinstance(
+            module,
+            (TernaryLinear, TernaryEmbedding, TernaryConv1d, TernaryConv2d),
+        ):
             continue
         if isinstance(module, TernaryEmbedding) and module.max_norm is not None:
             raise TritiumError(
@@ -198,11 +216,17 @@ def _groups(prepared: PreparedModel) -> Tuple[_WeightGroup, ...]:
                 stage="convert_qat_hard",
                 module=entry.path,
             )
+        consumers_by_alias = {
+            f"{consumer.path}.weight" if consumer.path else "weight": consumer
+            for consumer in consumers
+        }
         groups.append(
             _WeightGroup(
                 path=entry.path,
                 aliases=entry.aliases,
-                consumers=tuple(consumers),
+                consumers=tuple(
+                    consumers_by_alias[alias] for alias in entry.aliases
+                ),
             )
         )
     return tuple(groups)
@@ -232,7 +256,184 @@ def _replacement(
             dtype=module.weight.dtype,
             owner=owner,
         )
-    raise TypeError("QAT hard replacement requires a ternary Linear or Embedding")
+    if isinstance(module, TernaryConv1d):
+        return AdditiveTernaryConv1d.from_packed_weight(
+            module,
+            packed_weight,
+            owner=owner,
+        )
+    if isinstance(module, TernaryConv2d):
+        return AdditiveTernaryConv2d.from_packed_weight(
+            module,
+            packed_weight,
+            owner=owner,
+        )
+    raise TypeError("QAT hard replacement requires a supported ternary module")
+
+
+def _matrix_weight(module: nn.Module) -> torch.Tensor:
+    weight = module.weight
+    if isinstance(module, (TernaryConv1d, TernaryConv2d)):
+        return weight.flatten(start_dim=1)
+    return weight
+
+
+def _consumer_kind(module: nn.Module) -> str:
+    if isinstance(module, (nn.Linear, TernaryLinear)):
+        return "linear"
+    if isinstance(module, (nn.Embedding, TernaryEmbedding)):
+        return "embedding"
+    if isinstance(module, (nn.Conv1d, TernaryConv1d)):
+        return "conv1d"
+    if isinstance(module, (nn.Conv2d, TernaryConv2d)):
+        return "conv2d"
+    raise TypeError("unsupported QAT hard consumer")
+
+
+def _consumer_contract_id(module: nn.Module) -> str:
+    kind = _consumer_kind(module)
+    contract: Dict[str, Any] = {
+        "schema_version": 1,
+        "kind": kind,
+        "weight_dtype": str(module.weight.dtype),
+        "weight_shape": list(module.weight.shape),
+    }
+    if kind == "linear":
+        contract.update(
+            in_features=module.in_features,
+            out_features=module.out_features,
+            bias=module.bias is not None,
+        )
+    elif kind == "embedding":
+        contract.update(
+            num_embeddings=module.num_embeddings,
+            embedding_dim=module.embedding_dim,
+            padding_idx=module.padding_idx,
+            max_norm=module.max_norm,
+            norm_type=module.norm_type,
+            scale_grad_by_freq=module.scale_grad_by_freq,
+            sparse=module.sparse,
+        )
+    else:
+        contract.update(
+            in_channels=module.in_channels,
+            out_channels=module.out_channels,
+            kernel_size=list(module.kernel_size),
+            stride=list(module.stride),
+            padding=(
+                module.padding
+                if isinstance(module.padding, str)
+                else list(module.padding)
+            ),
+            dilation=list(module.dilation),
+            transposed=module.transposed,
+            output_padding=list(module.output_padding),
+            groups=module.groups,
+            padding_mode=module.padding_mode,
+            bias=module.bias is not None,
+        )
+    return _digest(contract)
+
+
+def _state_tensor_identity(tensor: torch.Tensor):
+    storage = tensor.untyped_storage()
+    return (
+        str(tensor.device),
+        storage._cdata,
+        tensor.storage_offset(),
+        tuple(tensor.shape),
+        tuple(tensor.stride()),
+        str(tensor.dtype),
+    )
+
+
+def _state_slot(model: nn.Module, name: str):
+    parts = name.split(".")
+    module = model
+    for part in parts[:-1]:
+        child = module._modules.get(part)
+        if child is None:
+            raise ValueError("QAT-hard state differs from model shell")
+        module = child
+    leaf = parts[-1]
+    parameter = module._parameters.get(leaf)
+    buffer = module._buffers.get(leaf)
+    if parameter is not None and buffer is None:
+        return module, "parameter", leaf, parameter
+    if buffer is not None and parameter is None:
+        return module, "buffer", leaf, buffer
+    raise ValueError("QAT-hard state differs from model shell")
+
+
+def _tied_state_apply(model: nn.Module, fn, recurse: bool = True):
+    base_apply = object.__getattribute__(model, "_tritium_base_apply")
+    result = base_apply(model, fn, recurse)
+    aliases = object.__getattribute__(model, "_tritium_tied_state_aliases")
+    for group in aliases:
+        slots = [_state_slot(model, name) for name in group]
+        parameter_slots = [slot for slot in slots if slot[1] == "parameter"]
+        value = (parameter_slots or slots)[0][3]
+        for module, kind, leaf, _ in slots:
+            if kind == "parameter":
+                module._parameters[leaf] = value
+            else:
+                module._buffers[leaf] = value
+    return result
+
+
+def _install_tie_aware_apply(model: nn.Module) -> None:
+    groups = {}
+    for name, tensor in model.state_dict(keep_vars=True).items():
+        groups.setdefault(_state_tensor_identity(tensor), []).append(name)
+    aliases = tuple(
+        tuple(sorted(names))
+        for names in groups.values()
+        if len(names) > 1
+    )
+    if not aliases:
+        return
+    object.__setattr__(model, "_tritium_tied_state_aliases", aliases)
+    object.__setattr__(model, "_tritium_base_apply", type(model)._apply)
+    object.__setattr__(model, "_apply", MethodType(_tied_state_apply, model))
+
+
+def _canonical_hard_state_items(
+    model: nn.Module,
+) -> Tuple[Tuple[str, torch.Tensor], ...]:
+    """Select lexicographically canonical names for exact shared tensors."""
+
+    return tuple(
+        (name, tensor)
+        for name, tensor, _ in _canonical_hard_state_groups(model)
+    )
+
+
+def _canonical_hard_state_groups(model: nn.Module):
+    """Select canonical tensors plus every exact state alias."""
+
+    canonical = {}
+    for name, tensor in sorted(model.state_dict().items()):
+        entry = canonical.setdefault(
+            _state_tensor_identity(tensor),
+            [name, tensor, []],
+        )
+        entry[2].append(name)
+    return tuple(
+        (name, tensor, tuple(aliases))
+        for name, tensor, aliases in sorted(canonical.values())
+    )
+
+
+def _hard_state_digest(model: nn.Module) -> str:
+    """Hash hard state once per exact shared tensor under its canonical alias."""
+
+    from .ptq import _hash_tensor
+
+    digest = hashlib.sha256()
+    for name, tensor, aliases in _canonical_hard_state_groups(model):
+        digest.update(_canonical({"aliases": aliases}))
+        _hash_tensor(digest, f"state.{name}", tensor)
+    return f"sha256:{digest.hexdigest()}"
 
 
 def convert_qat_hard(prepared: PreparedModel) -> QatHardResult:
@@ -255,13 +456,14 @@ def convert_qat_hard(prepared: PreparedModel) -> QatHardResult:
     with torch.no_grad():
         for group in groups:
             first = group.consumers[0].module
+            matrix_weight = _matrix_weight(first)
             projection = first.estimator.project(
-                first.weight,
+                matrix_weight,
                 context=ProjectionContext(training=False, role="weight"),
             )
             validate_projection(
                 projection,
-                first.weight,
+                matrix_weight,
                 algorithm_id=first.estimator.algorithm_id,
                 schema_version=first.estimator.schema_version,
             )
@@ -274,8 +476,8 @@ def convert_qat_hard(prepared: PreparedModel) -> QatHardResult:
                 )
             if any(
                 plane.scales.dtype != torch.float16
-                or tuple(plane.scales.shape) != (first.weight.shape[0], 1)
-                or plane.group_size != first.weight.shape[1]
+                or tuple(plane.scales.shape) != (matrix_weight.shape[0], 1)
+                or plane.group_size != matrix_weight.shape[1]
                 or plane.structure != "dense"
                 for plane in projection.planes
             ):
@@ -287,18 +489,24 @@ def convert_qat_hard(prepared: PreparedModel) -> QatHardResult:
                 )
             packed = AdditiveTernaryWeight(projection.planes).to(first.weight.device)
             compact_weights[id(first.weight)] = packed
+            module_groups: Dict[int, int] = {}
+            hard_consumers = []
+            for alias, consumer in zip(group.aliases, group.consumers):
+                module_group = module_groups.setdefault(
+                    id(consumer.module), len(module_groups)
+                )
+                hard_consumers.append(
+                    QatHardConsumer(
+                        alias=alias,
+                        kind=_consumer_kind(consumer.module),
+                        contract_id=_consumer_contract_id(consumer.module),
+                        module_group=module_group,
+                    )
+                )
             receipts.append(
                 QatHardWeight(
                     path=group.path,
-                    aliases=group.aliases,
-                    consumer_kinds=tuple(
-                        (
-                            "linear"
-                            if isinstance(consumer.module, TernaryLinear)
-                            else "embedding"
-                        )
-                        for consumer in group.consumers
-                    ),
+                    consumers=tuple(hard_consumers),
                     storage_path=(
                         f"{group.consumers[0].path}._packed_weight"
                         if group.consumers[0].path
@@ -312,6 +520,7 @@ def convert_qat_hard(prepared: PreparedModel) -> QatHardResult:
 
     replacements = []
     root_replacement = None
+    shared_biases: Dict[int, torch.Tensor] = {}
     for group in groups:
         packed = compact_weights[id(group.consumers[0].module.weight)]
         replacement_by_module = {}
@@ -324,6 +533,13 @@ def convert_qat_hard(prepared: PreparedModel) -> QatHardResult:
                     packed,
                     owner=owns_weight,
                 )
+                source_bias = getattr(consumer.module, "bias", None)
+                if source_bias is not None:
+                    bias = shared_biases.setdefault(
+                        id(source_bias),
+                        source_bias,
+                    )
+                    replacement._buffers["bias"] = bias
                 owns_weight = False
                 replacement_by_module[id(consumer.module)] = replacement
             if consumer.path:
@@ -350,7 +566,8 @@ def convert_qat_hard(prepared: PreparedModel) -> QatHardResult:
 
     model = root_replacement if root_replacement is not None else prepared.model
     model.eval()
-    hard_digest = _source_model_digest(model)
+    _install_tie_aware_apply(model)
+    hard_digest = _hard_state_digest(model)
     recipe_id, artifact_id = _qat_hard_ids(
         source_checkpoint_digest=source_digest,
         hard_state_digest=hard_digest,
@@ -375,4 +592,9 @@ def convert_qat_hard(prepared: PreparedModel) -> QatHardResult:
     )
 
 
-__all__ = ["QatHardResult", "QatHardWeight", "convert_qat_hard"]
+__all__ = [
+    "QatHardConsumer",
+    "QatHardResult",
+    "QatHardWeight",
+    "convert_qat_hard",
+]

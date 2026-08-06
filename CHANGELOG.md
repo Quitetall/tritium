@@ -26,6 +26,17 @@ see `docs/v1.0-api-freeze-audit.md` for the tier policy.
 
 ### Added
 
+- **QAT-hard convolution artifacts:** `TernaryConv1d` and `TernaryConv2d`
+  now hard-convert into inference-only composite reference modules backed by
+  additive packed storage, preserve shared/grouped convolution and padding
+  semantics, and export/reload through QAT-hard artifact schema v2. Typed
+  per-consumer contracts bind complete module geometry and reject same-size
+  shell substitutions. Complete tensor-alias ledgers include persistent
+  buffers; transactional reload cannot mutate a supplied shell on failure;
+  shared state remains tied across whole-model dtype/device moves. Native
+  no-dense-shadow packed convolution dispatch remains a separate
+  optimized-runtime gate.
+
 - **SALT reconstruction-fidelity report** (`tritium report salt-model`): loads an fp
   (bf16/f16/f32) safetensors **master**, SALT-quantizes every 2D weight at a sweep of
   bits-per-weight budgets, and reports whole-model (and optional `--per-tensor`)

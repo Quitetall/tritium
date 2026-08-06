@@ -175,6 +175,13 @@ exporters publish to a new directory and refuse an existing destination.
 | Refinement result | `load_refinement(path)` | `export_refinement(result, new_path)` |
 | Typed hard ONNX bundle | `load_onnx(path)` | `export_onnx(typed_result, new_path, ...)` |
 
+QAT-hard artifacts use `tritium.module-qat-hard-v2`. Development-only v1
+bundles did not bind complete per-consumer module semantics and are rejected;
+re-run hard conversion from the retained latent checkpoint and export a new v2
+directory. V2 also binds every canonical state tensor and all exact aliases,
+including persistent buffers. Relabeling or rehashing a v1 manifest is not
+migration.
+
 For example, republish a strictly admitted current Qwen PTQ bundle without
 mutating its source:
 

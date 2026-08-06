@@ -18,16 +18,32 @@ from torch import nn
 
 from .. import _tritium
 from ..nn import (
+    AdditiveTernaryConv1d,
+    AdditiveTernaryConv2d,
     AdditiveTernaryEmbedding,
     AdditiveTernaryLinear,
     AdditiveTernaryWeight,
+    TernaryConv1d,
+    TernaryConv2d,
     TernaryEmbedding,
     TernaryLinear,
 )
 from .config import TernaryConfig
 from .coverage import CoverageReport
 from .errors import TritiumError
-from .qat import QatHardResult, QatHardWeight, _canonical, _qat_hard_ids
+from .qat import (
+    QatHardConsumer,
+    QatHardResult,
+    QatHardWeight,
+    _canonical,
+    _canonical_hard_state_items,
+    _consumer_contract_id,
+    _hard_state_digest,
+    _install_tie_aware_apply,
+    _qat_hard_ids,
+    _state_slot,
+    _state_tensor_identity,
+)
 
 Pathish = Union[str, os.PathLike[str]]
 _MANIFEST = "tritium-qat-hard.json"
@@ -47,15 +63,15 @@ _TOP_FIELDS = {
 }
 _WEIGHT_FIELDS = {
     "path",
-    "aliases",
-    "consumer_kinds",
+    "consumers",
     "storage_path",
     "shape",
     "algorithm_id",
     "planes",
 }
+_CONSUMER_FIELDS = {"alias", "kind", "contract_id", "module_group"}
 _STATE_FIELDS = {"file", "sha256", "bytes", "tensors"}
-_TENSOR_FIELDS = {"name", "dtype", "shape"}
+_TENSOR_FIELDS = {"name", "dtype", "shape", "aliases"}
 _SAFE_TO_TORCH_DTYPE = {
     "BOOL": "torch.bool",
     "U8": "torch.uint8",
@@ -94,9 +110,11 @@ class QatHardArtifact:
     state_digest: str
     state_bytes: int
     state_tensors: int
-    state_ledger: Tuple[Tuple[str, str, Tuple[int, ...]], ...]
+    state_ledger: Tuple[
+        Tuple[str, str, Tuple[int, ...], Tuple[str, ...]], ...
+    ]
     mode: str = "qat-hard"
-    schema_version: int = 1
+    schema_version: int = 2
 
 
 def _dependencies():
@@ -164,19 +182,13 @@ def _digest_file(path: Path, maximum: int) -> Tuple[str, int]:
 def _weight_from_dict(value: Any) -> QatHardWeight:
     if not isinstance(value, dict) or set(value) != _WEIGHT_FIELDS:
         raise ValueError("QAT-hard weight fields differ from schema")
-    aliases = value["aliases"]
-    consumer_kinds = value["consumer_kinds"]
+    raw_consumers = value["consumers"]
     shape = value["shape"]
     if (
         not isinstance(value["path"], str)
         or not value["path"]
-        or not isinstance(aliases, list)
-        or not aliases
-        or len(set(aliases)) != len(aliases)
-        or any(not isinstance(alias, str) or not alias for alias in aliases)
-        or not isinstance(consumer_kinds, list)
-        or len(consumer_kinds) != len(aliases)
-        or any(kind not in {"linear", "embedding"} for kind in consumer_kinds)
+        or not isinstance(raw_consumers, list)
+        or not raw_consumers
         or not isinstance(value["storage_path"], str)
         or not value["storage_path"]
         or not isinstance(shape, list)
@@ -188,18 +200,50 @@ def _weight_from_dict(value: Any) -> QatHardWeight:
         or not 1 <= value["planes"] <= 3
     ):
         raise ValueError("QAT-hard weight identity is invalid")
+    consumers = []
+    aliases = set()
+    module_groups = set()
+    for item in raw_consumers:
+        if (
+            not isinstance(item, dict)
+            or set(item) != _CONSUMER_FIELDS
+            or not isinstance(item["alias"], str)
+            or not item["alias"]
+            or item["alias"] in aliases
+            or item["kind"] not in {"linear", "embedding", "conv1d", "conv2d"}
+            or type(item["module_group"]) is not int
+            or item["module_group"] < 0
+        ):
+            raise ValueError("QAT-hard consumer identity is invalid")
+        if (
+            item["module_group"] not in module_groups
+            and item["module_group"] != len(module_groups)
+        ):
+            raise ValueError("QAT-hard consumer module groups are noncanonical")
+        aliases.add(item["alias"])
+        module_groups.add(item["module_group"])
+        consumers.append(
+            QatHardConsumer(
+                alias=item["alias"],
+                kind=item["kind"],
+                contract_id=_validate_digest(
+                    item["contract_id"], "consumer contract"
+                ),
+                module_group=item["module_group"],
+            )
+        )
+    first_alias = consumers[0].alias
     first_module = (
-        "" if aliases[0] == "weight" else aliases[0].removesuffix(".weight")
+        "" if first_alias == "weight" else first_alias.removesuffix(".weight")
     )
     expected_storage = (
         f"{first_module}._packed_weight" if first_module else "_packed_weight"
     )
-    if value["path"] != aliases[0] or value["storage_path"] != expected_storage:
+    if value["path"] != first_alias or value["storage_path"] != expected_storage:
         raise ValueError("QAT-hard weight storage identity is noncanonical")
     return QatHardWeight(
         path=value["path"],
-        aliases=tuple(aliases),
-        consumer_kinds=tuple(consumer_kinds),
+        consumers=tuple(consumers),
         storage_path=value["storage_path"],
         shape=(shape[0], shape[1]),
         algorithm_id=value["algorithm_id"],
@@ -320,6 +364,62 @@ def _read_manifest(directory: Path) -> Tuple[dict, bytes]:
     return value, payload
 
 
+def _state_file_alias_groups(keys, metadata):
+    keys = set(keys)
+    if (
+        not isinstance(metadata, dict)
+        or metadata.get("format") != "pt"
+        or metadata.get("tritium_mode") != "qat-hard"
+    ):
+        raise ValueError("QAT-hard state metadata differs from schema")
+    groups = {name: {name} for name in keys}
+    for alias, canonical in metadata.items():
+        if alias in {"format", "tritium_mode"}:
+            continue
+        if not alias or alias in keys or canonical not in keys:
+            raise ValueError("QAT-hard state alias metadata is invalid")
+        groups[canonical].add(alias)
+    return {frozenset(names) for names in groups.values()}
+
+
+def _artifact_state_alias_groups(tensor_ledger):
+    return {frozenset(aliases) for _, _, _, aliases in tensor_ledger}
+
+
+def _known_state_alias_groups(
+    weights: Tuple[QatHardWeight, ...], coverage: CoverageReport
+):
+    groups = set()
+    for weight in weights:
+        owner_group = weight.consumers[0].module_group
+        owner_modules = {
+            (
+                ""
+                if consumer.alias == "weight"
+                else consumer.alias.removesuffix(".weight")
+            )
+            for consumer in weight.consumers
+            if consumer.module_group == owner_group
+        }
+        for index in range(weight.planes):
+            for field in (f"packed_trits_{index}", f"scales_{index}"):
+                groups.add(
+                    frozenset(
+                        f"{module}._packed_weight.{field}"
+                        if module
+                        else f"_packed_weight.{field}"
+                        for module in owner_modules
+                    )
+                )
+    groups.update(
+        frozenset(entry.aliases)
+        for entry in coverage.entries
+        if entry.disposition == "preserved"
+        and entry.reason != "estimator_state"
+    )
+    return groups
+
+
 def _inspect_state(
     path: Path,
     weights: Tuple[QatHardWeight, ...],
@@ -332,7 +432,20 @@ def _inspect_state(
         expected_keys = tuple(item[0] for item in tensor_ledger)
         if set(keys) != set(expected_keys) or len(keys) != len(expected_keys):
             raise ValueError("QAT-hard state tensor ledger differs")
-        for name, dtype, shape in tensor_ledger:
+        state_groups = _state_file_alias_groups(keys, state.metadata())
+        if state_groups != _artifact_state_alias_groups(tensor_ledger):
+            raise ValueError("QAT-hard state tie topology differs from manifest")
+        matched_groups = set()
+        for expected_group in _known_state_alias_groups(weights, coverage):
+            matches = [
+                group for group in state_groups if expected_group.issubset(group)
+            ]
+            if len(matches) != 1 or matches[0] in matched_groups:
+                raise ValueError(
+                    "QAT-hard state tie topology differs from source coverage"
+                )
+            matched_groups.add(matches[0])
+        for name, dtype, shape, _ in tensor_ledger:
             tensor_slice = state.get_slice(name)
             if (
                 _SAFE_TO_TORCH_DTYPE.get(tensor_slice.get_dtype()) != dtype
@@ -340,7 +453,8 @@ def _inspect_state(
             ):
                 raise ValueError("QAT-hard state tensor ledger differs")
         targeted = {alias for weight in weights for alias in weight.aliases}
-        if targeted & set(keys):
+        state_aliases = set().union(*state_groups)
+        if targeted & state_aliases:
             raise ValueError("QAT-hard state contains a targeted floating master")
         estimator_state = {
             alias
@@ -348,7 +462,7 @@ def _inspect_state(
             if entry.reason == "estimator_state"
             for alias in entry.aliases
         }
-        if estimator_state & set(keys):
+        if estimator_state & state_aliases:
             raise ValueError("QAT-hard state contains estimator state")
         for weight in weights:
             rows, columns = weight.shape
@@ -381,7 +495,8 @@ def _inspect_state(
         from .ptq import _hash_tensor
 
         digest = hashlib.sha256()
-        for name, _, _ in tensor_ledger:
+        for name, _, _, aliases in tensor_ledger:
+            digest.update(_canonical({"aliases": aliases}))
             _hash_tensor(
                 digest,
                 f"state.{name}",
@@ -397,7 +512,9 @@ def _tensor_ledger(
         raise ValueError("QAT-hard tensor ledger is invalid")
     ledger = []
     names = set()
+    aliases_seen = set()
     for item in value:
+        aliases = item.get("aliases") if isinstance(item, dict) else None
         if (
             not isinstance(item, dict)
             or set(item) != _TENSOR_FIELDS
@@ -410,11 +527,106 @@ def _tensor_ledger(
                 type(dimension) is not int or dimension < 0
                 for dimension in item["shape"]
             )
+            or not isinstance(aliases, list)
+            or not aliases
+            or aliases != sorted(aliases)
+            or len(set(aliases)) != len(aliases)
+            or item["name"] != aliases[0]
+            or any(
+                not isinstance(alias, str)
+                or not alias
+                or alias in aliases_seen
+                for alias in aliases
+            )
         ):
             raise ValueError("QAT-hard tensor ledger is invalid")
         names.add(item["name"])
-        ledger.append((item["name"], item["dtype"], tuple(item["shape"])))
+        aliases_seen.update(aliases)
+        ledger.append(
+            (
+                item["name"],
+                item["dtype"],
+                tuple(item["shape"]),
+                tuple(aliases),
+            )
+        )
     return tuple(ledger)
+
+
+def _clone_module_shell(model: nn.Module) -> nn.Module:
+    """Clone graph structure without cloning persistent tensor storage."""
+
+    memo = {}
+    for module in model.modules():
+        for parameter in module._parameters.values():
+            if parameter is not None:
+                memo[id(parameter)] = parameter
+        for name, buffer in module._buffers.items():
+            if (
+                buffer is not None
+                and name not in module._non_persistent_buffers_set
+            ):
+                memo[id(buffer)] = buffer
+    return copy.deepcopy(model, memo)
+
+
+def _state_alias_groups(model: nn.Module):
+    groups = {}
+    for name, tensor in model.state_dict(keep_vars=True).items():
+        groups.setdefault(_state_tensor_identity(tensor), []).append(name)
+    return tuple(frozenset(names) for names in groups.values())
+
+
+def _load_state_into_shell(model: nn.Module, state_path: Path) -> None:
+    """Assign verified state into an isolated shell without in-place copies."""
+
+    safe_open, _, _ = _dependencies()
+    expected_groups = set(_state_alias_groups(model))
+    with safe_open(state_path, framework="pt", device="cpu") as state:
+        keys = set(state.keys())
+        observed_groups = _state_file_alias_groups(keys, state.metadata())
+        if observed_groups != expected_groups:
+            raise ValueError("QAT-hard state tie topology differs from model shell")
+
+        file_groups = {name: {name} for name in keys}
+        for group in observed_groups:
+            canonical = next(name for name in group if name in keys)
+            file_groups[canonical] = set(group)
+
+        for canonical in sorted(file_groups):
+            aliases = sorted(file_groups[canonical])
+            slots = [_state_slot(model, alias) for alias in aliases]
+            expected = [slot[3] for slot in slots]
+            if any(tensor.layout != torch.strided for tensor in expected):
+                raise ValueError("QAT-hard model shell state must be strided")
+            shapes = {tuple(tensor.shape) for tensor in expected}
+            dtypes = {tensor.dtype for tensor in expected}
+            devices = {tensor.device for tensor in expected}
+            if len(shapes) != 1 or len(dtypes) != 1 or len(devices) != 1:
+                raise ValueError("QAT-hard tied state geometry differs")
+            device = next(iter(devices))
+            if device.type == "meta":
+                raise ValueError("QAT-hard state cannot load onto a meta shell")
+            tensor = state.get_tensor(canonical)
+            if tuple(tensor.shape) not in shapes or tensor.dtype not in dtypes:
+                raise ValueError("QAT-hard state differs from model shell")
+            materialized = tensor.to(device=device)
+            parameter_slots = [slot for slot in slots if slot[1] == "parameter"]
+            if parameter_slots:
+                requires_grad = {slot[3].requires_grad for slot in parameter_slots}
+                if len(requires_grad) != 1:
+                    raise ValueError("QAT-hard tied parameter state differs")
+                value = nn.Parameter(
+                    materialized,
+                    requires_grad=next(iter(requires_grad)),
+                )
+            else:
+                value = materialized
+            for module, kind, leaf, _ in slots:
+                if kind == "parameter":
+                    module._parameters[leaf] = value
+                else:
+                    module._buffers[leaf] = value
 
 
 def load_qat_hard(
@@ -437,8 +649,8 @@ def load_qat_hard(
     value, _ = _read_manifest(directory)
     if (
         type(value["schema_version"]) is not int
-        or value["schema_version"] != 1
-        or value["artifact_kind"] != "tritium.module-qat-hard-v1"
+        or value["schema_version"] != 2
+        or value["artifact_kind"] != "tritium.module-qat-hard-v2"
     ):
         raise ValueError("unsupported QAT-hard artifact")
     for field in (
@@ -519,22 +731,22 @@ def load_qat_hard(
     if not isinstance(model, nn.Module) or type(inplace) is not bool:
         raise TypeError("QAT-hard model load requires nn.Module and explicit inplace")
     _preflight_shell_state(model, artifact)
-    target = model if inplace else copy.deepcopy(model)
-    target = _prepare_shell(target, artifact)
-    _, load_model, _ = _dependencies()
-    missing, unexpected = load_model(target, directory / _STATE, strict=True)
-    if missing or unexpected:
-        raise ValueError("QAT-hard state differs from model shell")
+    staged = _clone_module_shell(model)
+    target, _ = _prepare_shell(staged, artifact)
+    _load_state_into_shell(target, directory / _STATE)
     for module in target.modules():
         if isinstance(module, AdditiveTernaryWeight):
             module.validate_buffers()
-    from .ptq import _source_model_digest
-
-    if _source_model_digest(target) != artifact.hard_state_digest:
+    if _hard_state_digest(target) != artifact.hard_state_digest:
         raise ValueError("QAT-hard loaded state identity mismatch")
     target.eval()
     target._tritium_qat_hard_artifact_id = artifact.conversion_artifact_id
     target._tritium_qat_checkpoint_digest = artifact.source_checkpoint_digest
+    if inplace and target is staged:
+        object.__setattr__(model, "__dict__", staged.__dict__)
+        _install_tie_aware_apply(model)
+        return model
+    _install_tie_aware_apply(target)
     return target
 
 
@@ -559,44 +771,78 @@ def _preflight_shell_state(model: nn.Module, artifact: QatHardArtifact) -> None:
     }
     expected = {
         name: (dtype, shape)
-        for name, dtype, shape in artifact.state_ledger
+        for name, dtype, shape, _ in artifact.state_ledger
         if name not in compact
     }
     observed = {
         name: (str(tensor.dtype), tuple(tensor.shape))
-        for name, tensor in model.state_dict().items()
+        for name, tensor in _canonical_hard_state_items(model)
         if name not in targeted and name not in estimator_state
     }
     if observed != expected:
         raise ValueError("QAT-hard preserved model shell state differs")
 
 
-def _prepare_shell(model: nn.Module, artifact: QatHardArtifact) -> nn.Module:
+def _prepare_shell(
+    model: nn.Module, artifact: QatHardArtifact
+) -> Tuple[nn.Module, Tuple[Tuple[nn.Module, str, nn.Module], ...]]:
     modules = dict(model.named_modules(remove_duplicate=False))
     replacements = []
     root = None
     seen_source_weights = set()
+    shared_biases = {}
     for weight in artifact.weights:
         by_module = {}
+        modules_by_group = {}
+        groups_by_module = {}
         owner = True
         packed = None
         source_weight_id = None
-        for alias, consumer_kind in zip(weight.aliases, weight.consumer_kinds):
+        for consumer in weight.consumers:
+            alias = consumer.alias
+            consumer_kind = consumer.kind
             module_path = "" if alias == "weight" else alias.removesuffix(".weight")
             if alias != "weight" and not alias.endswith(".weight"):
                 raise ValueError("QAT-hard weight alias is not canonical")
             module = modules.get(module_path)
-            if type(module) not in {nn.Linear, nn.Embedding, TernaryLinear, TernaryEmbedding}:
+            if type(module) not in {
+                nn.Linear,
+                nn.Embedding,
+                nn.Conv1d,
+                nn.Conv2d,
+                TernaryLinear,
+                TernaryEmbedding,
+                TernaryConv1d,
+                TernaryConv2d,
+            }:
                 raise ValueError("QAT-hard target is not a supported module shell")
-            actual_kind = (
-                "linear"
-                if isinstance(module, (nn.Linear, TernaryLinear))
-                else "embedding"
-            )
+            if isinstance(module, (nn.Linear, TernaryLinear)):
+                actual_kind = "linear"
+                matrix_shape = tuple(module.weight.shape)
+            elif isinstance(module, (nn.Embedding, TernaryEmbedding)):
+                actual_kind = "embedding"
+                matrix_shape = tuple(module.weight.shape)
+            elif isinstance(module, (nn.Conv1d, TernaryConv1d)):
+                actual_kind = "conv1d"
+                matrix_shape = (module.out_channels, int(module.weight[0].numel()))
+            else:
+                actual_kind = "conv2d"
+                matrix_shape = (module.out_channels, int(module.weight[0].numel()))
             if actual_kind != consumer_kind:
                 raise ValueError("QAT-hard model shell consumer kind differs")
-            if tuple(module.weight.shape) != weight.shape:
+            if matrix_shape != weight.shape:
                 raise ValueError("QAT-hard model shell geometry differs")
+            if _consumer_contract_id(module) != consumer.contract_id:
+                raise ValueError("QAT-hard model shell consumer contract differs")
+            module_id = id(module)
+            prior_module = modules_by_group.setdefault(
+                consumer.module_group, module_id
+            )
+            prior_group = groups_by_module.setdefault(
+                module_id, consumer.module_group
+            )
+            if prior_module != module_id or prior_group != consumer.module_group:
+                raise ValueError("QAT-hard model shell module topology differs")
             if source_weight_id is None:
                 source_weight_id = id(module.weight)
                 if source_weight_id in seen_source_weights:
@@ -624,7 +870,7 @@ def _prepare_shell(model: nn.Module, artifact: QatHardArtifact) -> nn.Module:
                         packed_weight=packed,
                         owner=owner,
                     )
-                else:
+                elif isinstance(module, (nn.Embedding, TernaryEmbedding)):
                     if module.max_norm is not None:
                         raise ValueError("QAT-hard model shell has mutating max_norm")
                     replacement = AdditiveTernaryEmbedding.empty(
@@ -641,6 +887,26 @@ def _prepare_shell(model: nn.Module, artifact: QatHardArtifact) -> nn.Module:
                         packed_weight=packed,
                         owner=owner,
                     )
+                elif isinstance(module, (nn.Conv1d, TernaryConv1d)):
+                    replacement = AdditiveTernaryConv1d.empty(
+                        module,
+                        weight.planes,
+                        packed_weight=packed,
+                        owner=owner,
+                    )
+                else:
+                    replacement = AdditiveTernaryConv2d.empty(
+                        module,
+                        weight.planes,
+                        packed_weight=packed,
+                        owner=owner,
+                    )
+                source_bias = getattr(module, "bias", None)
+                if source_bias is not None:
+                    shared_bias = shared_biases.setdefault(
+                        id(source_bias), source_bias
+                    )
+                    replacement._buffers["bias"] = shared_bias
                 owner = False
                 by_module[id(module)] = replacement
             if module_path:
@@ -650,14 +916,17 @@ def _prepare_shell(model: nn.Module, artifact: QatHardArtifact) -> nn.Module:
     if root is not None and replacements:
         raise ValueError("QAT-hard root target cannot coexist with nested targets")
     if root is not None:
-        return root
+        return root, ()
+    applied = []
     for path, replacement in replacements:
         parts = path.split(".")
         parent = model
         for part in parts[:-1]:
             parent = parent._modules[part]
+        original = parent._modules[parts[-1]]
         parent._modules[parts[-1]] = replacement
-    return model
+        applied.append((parent, parts[-1], original))
+    return model, tuple(applied)
 
 
 def export_qat_hard(result: QatHardResult, output_dir: Pathish) -> QatHardArtifact:
@@ -665,9 +934,7 @@ def export_qat_hard(result: QatHardResult, output_dir: Pathish) -> QatHardArtifa
 
     if not isinstance(result, QatHardResult):
         raise TypeError("export_qat_hard requires a QatHardResult")
-    from .ptq import _source_model_digest
-
-    if _source_model_digest(result.model) != result.hard_state_digest:
+    if _hard_state_digest(result.model) != result.hard_state_digest:
         raise TritiumError(
             "QAT-hard result model changed after conversion",
             code="state_changed",
@@ -686,7 +953,7 @@ def export_qat_hard(result: QatHardResult, output_dir: Pathish) -> QatHardArtifa
             code="artifact_mismatch",
             stage="export_qat_hard",
         )
-    _, _, save_model = _dependencies()
+    safe_open, _, save_model = _dependencies()
     target = Path(output_dir).absolute()
     parent = target.parent.resolve(strict=True)
     if target.exists() or target.is_symlink():
@@ -701,20 +968,33 @@ def export_qat_hard(result: QatHardResult, output_dir: Pathish) -> QatHardArtifa
             metadata={"format": "pt", "tritium_mode": "qat-hard"},
             force_contiguous=True,
         )
-        tensor_ledger = [
-            {
-                "name": name,
-                "dtype": str(tensor.dtype),
-                "shape": list(tensor.shape),
+        with safe_open(state_path, framework="pt", device="cpu") as state:
+            keys = tuple(state.keys())
+            groups = _state_file_alias_groups(keys, state.metadata())
+            aliases_by_name = {
+                next(alias for alias in group if alias in keys): sorted(group)
+                for group in groups
             }
-            for name, tensor in result.model.state_dict().items()
-        ]
+            tensor_ledger = []
+            for name in sorted(keys):
+                tensor_slice = state.get_slice(name)
+                dtype = _SAFE_TO_TORCH_DTYPE.get(tensor_slice.get_dtype())
+                if dtype is None:
+                    raise ValueError("QAT-hard state contains unsupported dtype")
+                tensor_ledger.append(
+                    {
+                        "name": name,
+                        "dtype": dtype,
+                        "shape": list(tensor_slice.get_shape()),
+                        "aliases": aliases_by_name[name],
+                    }
+                )
         with state_path.open("rb") as stream:
             os.fsync(stream.fileno())
         state_digest, state_bytes = _digest_file(state_path, 128 * 1024**3)
         manifest = {
-            "schema_version": 1,
-            "artifact_kind": "tritium.module-qat-hard-v1",
+            "schema_version": 2,
+            "artifact_kind": "tritium.module-qat-hard-v2",
             "conversion_artifact_id": result.artifact_id,
             "source_checkpoint_digest": result.source_checkpoint_digest,
             "hard_state_digest": result.hard_state_digest,

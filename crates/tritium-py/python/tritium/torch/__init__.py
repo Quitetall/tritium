@@ -64,7 +64,7 @@ from .onnx import (
     export_onnx,
     load_onnx,
 )
-from .qat import QatHardResult, QatHardWeight, convert_qat_hard
+from .qat import QatHardConsumer, QatHardResult, QatHardWeight, convert_qat_hard
 from .qat_artifacts import QatHardArtifact, export_qat_hard, load_qat_hard
 from .ptq import (
     ActivationCalibrationReceipt,
@@ -134,6 +134,7 @@ __all__ = [
     "ProjectionContext",
     "PreparedModel",
     "QatHardArtifact",
+    "QatHardConsumer",
     "QatHardResult",
     "QatHardWeight",
     "QuantizationResult",
