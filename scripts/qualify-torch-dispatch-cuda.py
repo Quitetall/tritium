@@ -47,6 +47,13 @@ def require_same_file_identity(candidate: Path, snapshot: Path) -> None:
         raise QualificationError("qualified wheel changed during qualification")
 
 
+def python_launcher(path: Path) -> Path:
+    launcher = path.absolute()
+    if not launcher.is_file() or not os.access(launcher, os.X_OK):
+        raise QualificationError("Python launcher must be an executable file")
+    return launcher
+
+
 def git_output(repo: Path, *args: str) -> str:
     result = subprocess.run(
         ["git", *args], cwd=repo, text=True, capture_output=True, check=False
@@ -327,7 +334,9 @@ def qualify(
     source = require_clean_revision(repo, source_revision)
     if wheel.is_symlink() or not wheel.is_file():
         raise QualificationError("qualified wheel must be an ordinary file")
-    python = python.resolve(strict=True)
+    # venv bin/python is normally a symlink. Resolving it discards venv prefix
+    # discovery and can silently probe a global same-version distribution.
+    python = python_launcher(python)
     wheel = wheel.resolve(strict=True)
     sanitizer = sanitizer.resolve(strict=True)
     smoke_script = repo.resolve(strict=True) / "scripts" / "wheel-functional-smoke.py"

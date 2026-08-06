@@ -113,6 +113,16 @@ class QualifyTorchDispatchCudaTests(unittest.TestCase):
             with self.assertRaises(QualificationError):
                 QUALIFY["require_same_file_identity"](candidate, snapshot)
 
+    def test_preserves_virtual_environment_python_launcher_symlink(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            interpreter = root / "python-real"
+            interpreter.write_text("#!/bin/sh\n", encoding="utf-8")
+            interpreter.chmod(0o755)
+            launcher = root / "python"
+            launcher.symlink_to(interpreter)
+            self.assertEqual(QUALIFY["python_launcher"](launcher), launcher.absolute())
+
 
 if __name__ == "__main__":
     unittest.main()
