@@ -26,6 +26,22 @@ see `docs/v1.0-api-freeze-audit.md` for the tier policy.
 
 ### Added
 
+- **Governed Stage-7 recipe freeze:**
+  `scripts/qualify-stage7-recipe-freeze.py` validates the immutable
+  SmolLM2-1.7B campaign inventory, disjoint calibration/evaluation provenance,
+  successive-halving promotions, matched-byte output-aware curvature win,
+  R3 gap closure, task retention, physical/native prerequisite receipts, and
+  scale-only/short-PV token caps. It derives exact rank-2 matrix inventory from
+  pinned safetensors, strictly reopens every SALT V2 package through the native
+  parser, binds four disjoint revision/seed/tokenizer/token-stream partitions,
+  complete relay/window policy, source-complete S2KF sensitivity lineage, and
+  HESTIA gradcheck plus portable-v3 CPU/CUDA conformance. It records soft-method
+  wins, ties, losses, or tradeoffs, binds each reported refinement metric to its
+  exact evaluated hard-checkpoint artifact, and emits either a content-bound
+  recipe/checkpoint freeze or terminal negative result for valid missing-rate,
+  physical, native, or quality-gate failures. Malformed, contradictory,
+  cherry-picked, or hash-consistent non-package traces fail closed.
+
 - **QAT-hard convolution artifacts:** `TernaryConv1d` and `TernaryConv2d`
   now hard-convert into inference-only composite reference modules backed by
   additive packed storage, preserve shared/grouped convolution and padding
