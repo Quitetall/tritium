@@ -95,6 +95,18 @@ class QualifyTorchDispatchCudaTests(unittest.TestCase):
             with self.subTest(malformed=malformed), self.assertRaises(QualificationError):
                 parse_sanitizer_version(malformed)
 
+    def test_rejects_candidate_drift_from_private_snapshot(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            candidate = root / "candidate.whl"
+            snapshot = root / "snapshot.whl"
+            candidate.write_bytes(b"wheel")
+            snapshot.write_bytes(b"wheel")
+            QUALIFY["require_same_file_identity"](candidate, snapshot)
+            candidate.write_bytes(b"drift")
+            with self.assertRaises(QualificationError):
+                QUALIFY["require_same_file_identity"](candidate, snapshot)
+
 
 if __name__ == "__main__":
     unittest.main()

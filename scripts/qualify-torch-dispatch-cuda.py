@@ -39,6 +39,14 @@ def file_record(path: Path) -> dict[str, object]:
     return {"name": path.name, "bytes": path.stat().st_size, "sha256": sha256(path)}
 
 
+def require_same_file_identity(candidate: Path, snapshot: Path) -> None:
+    if (
+        candidate.stat().st_size != snapshot.stat().st_size
+        or sha256(candidate) != sha256(snapshot)
+    ):
+        raise QualificationError("qualified wheel changed during qualification")
+
+
 def git_output(repo: Path, *args: str) -> str:
     result = subprocess.run(
         ["git", *args], cwd=repo, text=True, capture_output=True, check=False
@@ -330,14 +338,10 @@ def qualify(
     try:
         wheel_snapshot = work / wheel.name
         shutil.copyfile(wheel, wheel_snapshot)
-        if (
-            wheel_snapshot.stat().st_size != wheel.stat().st_size
-            or sha256(wheel_snapshot) != sha256(wheel)
-        ):
-            raise QualificationError("qualified wheel changed while snapshotting")
-        probe = probe_environment(
-            python, wheel_snapshot, smoke_script, work, environment
-        )
+        require_same_file_identity(wheel, wheel_snapshot)
+        # direct_url.json binds installation to original candidate path. Probe
+        # that path, while receipt assembly reads private immutable snapshot.
+        probe = probe_environment(python, wheel, smoke_script, work, environment)
         version_result = _run(
             [str(sanitizer), "--version"], cwd=work, environment=environment
         )
@@ -353,6 +357,7 @@ def qualify(
         )
         if require_clean_revision(repo, source_revision) != source:
             raise QualificationError("dispatcher source path changed during qualification")
+        require_same_file_identity(wheel, wheel_snapshot)
         receipt = assemble(
             stage,
             wheel=wheel_snapshot,
