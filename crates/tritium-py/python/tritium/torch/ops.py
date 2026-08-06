@@ -13,6 +13,10 @@ from tritium import _tritium as _native
 
 _CUDA_PACKED_CACHE_CAPACITY = 4096
 _CUDA_PACKED_CACHE = OrderedDict()
+_NATIVE_CPU_FORWARD = getattr(_native, "_ternary_linear_cpu_dlpack", None)
+_NATIVE_CPU_BACKWARD = getattr(
+    _native, "_ternary_linear_backward_cpu_dlpack", None
+)
 
 
 class _CudaPackedLinear:
@@ -254,10 +258,13 @@ def reference_ternary_linear(
 def _native_cpu_supported(
     input: torch.Tensor, master: torch.Tensor, bias: Optional[torch.Tensor]
 ) -> bool:
-    native = getattr(_native, "_ternary_linear_cpu_dlpack", None)
     return (
-        native is not None
+        _NATIVE_CPU_FORWARD is not None
+        and input.ndim >= 1
+        and master.ndim == 2
+        and input.shape[-1] == master.shape[1]
         and input.device.type == "cpu"
+        and master.device.type == "cpu"
         and input.dtype == torch.float32
         and master.dtype == torch.float32
         and input.is_contiguous()
@@ -268,7 +275,9 @@ def _native_cpu_supported(
         and (
             bias is None
             or (
-                bias.dtype == torch.float32
+                bias.ndim == 1
+                and bias.shape[0] == master.shape[0]
+                and bias.dtype == torch.float32
                 and bias.device.type == "cpu"
                 and bias.is_contiguous()
             )
@@ -280,7 +289,7 @@ def _native_cpu_backward_supported(
     grad_output: torch.Tensor, input: torch.Tensor, master: torch.Tensor
 ) -> bool:
     return (
-        getattr(_native, "_ternary_linear_backward_cpu_dlpack", None) is not None
+        _NATIVE_CPU_BACKWARD is not None
         and not torch.is_grad_enabled()
         and grad_output.device.type == "cpu"
         and grad_output.dtype == torch.float32
@@ -298,6 +307,34 @@ def ternary_linear(
 ) -> torch.Tensor:
     """Hard ternary Linear over tensors resident on the current CPU/CUDA device."""
 
+    if _native_cpu_supported(input, master, bias):
+        detached_input = input.detach()
+        detached_master = master.detach()
+        detached_bias = bias.detach() if bias is not None else None
+        version = int(master._version)
+        storage_identity = int(master.untyped_storage()._cdata)
+        capsule = _NATIVE_CPU_FORWARD(
+            detached_input,
+            detached_master,
+            detached_bias,
+            None,
+            master,
+            version,
+            storage_identity,
+        )
+        if capsule is None:
+            scales = detached_master.abs().mean(dim=1)
+            capsule = _NATIVE_CPU_FORWARD(
+                detached_input,
+                detached_master,
+                detached_bias,
+                scales,
+                master,
+                version,
+                storage_identity,
+            )
+        if capsule is not None:
+            return torch.from_dlpack(capsule)
     _validate_linear_inputs(input, master, bias)
     if _native_cuda_supported(input, master, bias):
         detached_input = input.detach()
@@ -323,30 +360,6 @@ def ternary_linear(
             packed.device,
         )
         return output
-    if _native_cpu_supported(input, master, bias):
-        detached_input = input.detach()
-        detached_master = master.detach()
-        detached_bias = bias.detach() if bias is not None else None
-        version = int(master._version)
-        storage_identity = int(master.untyped_storage()._cdata)
-
-        def call_native(scales: Optional[torch.Tensor]):
-            return _native._ternary_linear_cpu_dlpack(
-                detached_input,
-                detached_master,
-                detached_bias,
-                scales,
-                master,
-                version,
-                storage_identity,
-            )
-
-        capsule = call_native(None)
-        if capsule is None:
-            scales = detached_master.abs().mean(dim=1)
-            capsule = call_native(scales)
-        if capsule is not None:
-            return torch.from_dlpack(capsule)
     projected, _mask = _projection_components(master)
     if input.dtype != master.dtype:
         output = F.linear(
@@ -360,10 +373,14 @@ def ternary_linear(
 def _ternary_linear_fake(
     input: torch.Tensor, master: torch.Tensor, bias: Optional[torch.Tensor] = None
 ) -> torch.Tensor:
+    if input.device != master.device:
+        raise ValueError("ternary_linear input and master weight must share a device")
     torch._check(input.dim() >= 1)
     torch._check(master.dim() == 2)
     torch._check(input.shape[-1] == master.shape[1])
     if bias is not None:
+        if bias.device != input.device:
+            raise TypeError("ternary_linear bias must match input dtype and device")
         torch._check(bias.dim() == 1)
         torch._check(bias.shape[0] == master.shape[0])
     return input.new_empty((*input.shape[:-1], master.shape[0]))
@@ -418,9 +435,19 @@ def _ternary_linear_backward(ctx, grad_output: torch.Tensor):
         detached_master = master.detach()
         version = int(master._version)
         storage_identity = int(master.untyped_storage()._cdata)
-
-        def call_native(scales: Optional[torch.Tensor]):
-            return _native._ternary_linear_backward_cpu_dlpack(
+        capsules = _NATIVE_CPU_BACKWARD(
+            detached_grad,
+            detached_input,
+            detached_master,
+            None,
+            master,
+            version,
+            storage_identity,
+            ctx.has_bias,
+        )
+        if capsules is None:
+            scales = detached_master.abs().mean(dim=1)
+            capsules = _NATIVE_CPU_BACKWARD(
                 detached_grad,
                 detached_input,
                 detached_master,
@@ -430,11 +457,6 @@ def _ternary_linear_backward(ctx, grad_output: torch.Tensor):
                 storage_identity,
                 ctx.has_bias,
             )
-
-        capsules = call_native(None)
-        if capsules is None:
-            scales = detached_master.abs().mean(dim=1)
-            capsules = call_native(scales)
         if capsules is not None:
             grad_input, grad_master, grad_bias = capsules
             return (

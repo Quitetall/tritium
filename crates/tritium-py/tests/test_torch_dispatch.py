@@ -134,6 +134,16 @@ def test_native_cpu_forward_keeps_composite_fallback_for_unsupported_layout_and_
     }
 
 
+def test_native_cpu_fast_path_preserves_public_validation_errors():
+    x = torch.ones(1, 4)
+    with pytest.raises(ValueError, match="ternary_linear input width"):
+        ternary_linear(x, torch.ones(2, 3))
+    with pytest.raises(ValueError, match="ternary_linear bias shape"):
+        ternary_linear(x, torch.ones(2, 4), torch.ones(3))
+    with pytest.raises(ValueError, match="share a device"):
+        ternary_linear(x, torch.empty(2, 4, device="meta"))
+
+
 def test_native_cpu_cache_does_not_retain_dead_parameters():
     import gc
 
