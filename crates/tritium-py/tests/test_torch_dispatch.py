@@ -11,36 +11,44 @@ from tritium import _tritium as _native  # noqa: E402
 
 def assert_no_device_wide_cuda_synchronization(profile, region_name):
     events = profile.events()
-    assert any(event.name == region_name for event in events)
-
-    def belongs_to_region(event):
-        parent = event.cpu_parent
-        while parent is not None:
-            if parent.name == region_name:
-                return True
-            parent = parent.cpu_parent
-        return False
-
-    synchronizations = [
-        event
+    regions = [
+        event.time_range
         for event in events
-        if event.name.replace(" ", "").lower() == "cudadevicesynchronize"
+        if event.name == region_name and str(event.device_type) == "DeviceType.CPU"
     ]
-    assert not any(belongs_to_region(event) for event in synchronizations)
+    assert len(regions) == 1
+    synchronization_names = {
+        "cudadevicesynchronize",
+        "cudastreamsynchronize",
+        "cudaeventsynchronize",
+        "cuctxsynchronize",
+        "custreamsynchronize",
+        "cueventsynchronize",
+    }
+    synchronizations = [
+        event.time_range
+        for event in events
+        if event.name.replace(" ", "").lower() in synchronization_names
+    ]
+    region = regions[0]
+    assert not any(
+        region.start <= synchronization.start < region.end
+        for synchronization in synchronizations
+    )
 
 
 def test_device_wide_cuda_synchronization_guard_rejects_profiler_event():
     class Event:
-        def __init__(self, name, parent=None):
+        def __init__(self, name, start, end):
             self.name = name
-            self.cpu_parent = parent
+            self.device_type = "DeviceType.CPU"
+            self.time_range = type("Range", (), {"start": start, "end": end})()
 
     class Profile:
         def events(self):
-            region = Event("warm")
             return [
-                region,
-                Event("cudaDeviceSynchronize", region),
+                Event("warm", 1, 4),
+                Event("cuCtxSynchronize", 2, 3),
             ]
 
     with pytest.raises(AssertionError):
@@ -387,7 +395,7 @@ def test_ternary_linear_cuda_stays_resident_and_autocasts():
 
     with torch.profiler.profile(
         activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
-        acc_events=True,
+        acc_events=False,
     ) as profile:
         output = ternary_linear(x, weight, bias)
         output.square().mean().backward()
@@ -523,7 +531,7 @@ def test_native_cuda_autocast_warm_forward_backward_uses_fp16_kernels():
                 torch.profiler.ProfilerActivity.CPU,
                 torch.profiler.ProfilerActivity.CUDA,
             ],
-            acc_events=True,
+            acc_events=False,
         ) as profile:
             with torch.profiler.record_function("tritium_native_cuda_fp16_warm"):
                 output = ternary_linear(x, weight, bias)
