@@ -63,6 +63,32 @@ extra residual planes on the most sensitive tiles (up to `~4.75` bpw at `T = 3`)
 You can preview the bpw/error tradeoff on a raw fp32 matrix without committing to
 a full quantize via `tritium report salt`.
 
+## Stage-7 token evidence
+
+Build the frozen SmolLM recipe-selection token pack from a content-bound
+`tritium.stage7-sampled-rows.v1` manifest:
+
+```sh
+tritium salt build-stage7-evidence-pack \
+  --model-dir ~/.cache/huggingface/hub/models--HuggingFaceTB--SmolLM2-135M/snapshots/93efa2f097d58c2a74874c7e644dbc9b0cee75a2 \
+  --sampled-rows ./stage7-sampled-rows.json \
+  --output-dir ./stage7-token-evidence
+```
+
+The input contains four ordered partitions and three dataset lanes per
+partition. Every lane binds its exact Hub commit, config, optional `data_dir`,
+split, source-row index, text-field name, raw-text digest, and file identity.
+For StarCoderData, config `default`, `data_dir="python"`, and source field
+`content` are distinct provenance values; the sampled JSONL still transports
+that verified content under its normalized `text` key. The builder uses the
+snapshot tokenizer, writes exactly 512 unique 2,048-token sequences per
+partition, and publishes `stage7.u32le` before its canonical `manifest.json`.
+The qualifier rejects any payload other than the fixed 16 MiB geometry before
+opening it and rechecks bounded bytes through one descriptor. The builder
+consumes already selected rows; it does not silently download or resample
+datasets. StarCoderData remains gated and requires authorized Hub access during
+the separate row-collection step.
+
 ## SALT V2 Qwen master campaigns
 
 The legacy `tritium quantize` command above is not the Qwen3.6-27B SALT V2

@@ -48,6 +48,7 @@ mod release;
 mod repack;
 mod report;
 mod salt;
+mod stage7_evidence;
 
 /// BitNet 2B4T uses the LLaMA-3 tokenizer, whose end-of-text token is `128001`.
 /// Used as the default stop token for `generate` when `--eos` is not given.

@@ -24,7 +24,7 @@ tritium-spec = { workspace = true }
 # `generate` (which loads a model on the CPU backend via the runtime registry).
 tritium-cpu = { workspace = true }
 # The `generate` subcommand loads a model and decodes tokens through `ModelRunner`.
-tritium-nn = { workspace = true }
+tritium-nn = { workspace = true, features = ["tokenizer"] }
 tritium-train = { workspace = true, optional = true }
 # Optional CUDA backend linkage for `report --backend cuda` / parity reports.
 tritium-cuda = { workspace = true, optional = true }
@@ -69,6 +69,7 @@ tritium-train = { workspace = true }
 # `fisher_quantize_cli` reads back the emitted SALT bundle to assert the Fisher sidecar drove
 # plane allocation (plan 0039 step 4).
 tritium-format = { workspace = true }
+tokenizers = { workspace = true }
 
 [features]
 default = []

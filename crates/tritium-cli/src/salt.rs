@@ -32,6 +32,18 @@ pub(crate) enum SaltCommand {
         #[arg(long)]
         output: PathBuf,
     },
+    /// Build exact Stage-7 token evidence from pinned, preselected source rows.
+    BuildStage7EvidencePack {
+        /// SmolLM Hugging Face snapshot containing exact tokenizer assets.
+        #[arg(long)]
+        model_dir: PathBuf,
+        /// Content-bound `tritium.stage7-sampled-rows.v1` input manifest.
+        #[arg(long)]
+        sampled_rows: PathBuf,
+        /// New directory receiving `manifest.json` and `stage7.u32le`.
+        #[arg(long)]
+        output_dir: PathBuf,
+    },
 }
 
 pub(crate) fn run(command: SaltCommand) -> anyhow::Result<()> {
@@ -41,6 +53,11 @@ pub(crate) fn run(command: SaltCommand) -> anyhow::Result<()> {
             work_root,
             output,
         } => qwen36_preflight(&model_dir, &work_root, &output),
+        SaltCommand::BuildStage7EvidencePack {
+            model_dir,
+            sampled_rows,
+            output_dir,
+        } => crate::stage7_evidence::build(&model_dir, &sampled_rows, &output_dir),
     }
 }
 

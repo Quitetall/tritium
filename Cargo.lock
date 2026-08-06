@@ -4397,6 +4397,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tokenizers",
  "tritium-core",
  "tritium-cpu",
  "tritium-cuda",

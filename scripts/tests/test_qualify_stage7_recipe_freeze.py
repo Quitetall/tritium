@@ -62,25 +62,29 @@ def member_digests(label, count):
     ]
 
 
-def partition_provenance(label, seed):
+def partition_provenance(label, seed, tokenizer_digest):
     members = member_digests(label, 512)
     partition = {
         "members": members,
         "datasets": [
-            {"repo_id": "allenai/c4", "revision": "b" * 40, "fraction_ppm": 500_000},
+            {
+                "repo_id": "allenai/c4",
+                "revision": "1588ec454efa1a09f29cd18ddd04fe05fc8653a2",
+                "fraction_ppm": 500_000,
+            },
             {
                 "repo_id": "open-web-math/open-web-math",
-                "revision": "c" * 40,
+                "revision": "fde8ef8de2300f5e778f56261843dab89f230815",
                 "fraction_ppm": 250_000,
             },
             {
                 "repo_id": "bigcode/starcoderdata",
-                "revision": "d" * 40,
+                "revision": "9fc30b578cedaec69e47302df72cf00feed7c8c4",
                 "fraction_ppm": 250_000,
             },
         ],
         "sampling_seed": seed,
-        "tokenizer_digest": "sha256:" + "e" * 64,
+        "tokenizer_digest": tokenizer_digest,
         "ordered_token_digest": digest(members),
         "sequence_count": 512,
         "tokens_per_sequence": 2_048,
@@ -152,7 +156,7 @@ def model_file_records(root: Path, weights: bytes):
     payloads = {
         ".gitattributes": b"lfs\n",
         "README.md": b"model\n",
-        "config.json": b"{}\n",
+        "config.json": b'{"vocab_size":4096}\n',
         "generation_config.json": b"{}\n",
         "merges.txt": b"#version\n",
         "model.safetensors": weights,
@@ -162,6 +166,96 @@ def model_file_records(root: Path, weights: bytes):
         "vocab.json": b"{}\n",
     }
     return [file_record(root, name, payloads[name]) for name in sorted(payloads)]
+
+
+def tokenizer_identity(records):
+    tokenizer_files = {
+        "merges.txt",
+        "special_tokens_map.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "vocab.json",
+    }
+    selected = [record for record in records if record["path"] in tokenizer_files]
+    return digest(selected)
+
+
+def write_token_evidence_pack(root: Path, provenance, tokenizer_digest):
+    tokens = bytearray()
+    partitions = {}
+    global_ordinal = 0
+    dataset_contracts = {
+        "allenai/c4": ("en", None, "text"),
+        "open-web-math/open-web-math": ("default", None, "text"),
+        "bigcode/starcoderdata": ("default", "python", "content"),
+    }
+    for partition_ordinal, (name, campaign_partition) in enumerate(
+        provenance.items()
+    ):
+        sequences = []
+        for ordinal in range(512):
+            dataset_ordinal = 0 if ordinal < 256 else 1 if ordinal < 384 else 2
+            dataset = campaign_partition["datasets"][dataset_ordinal]
+            dataset_config, dataset_data_dir, text_field = dataset_contracts[
+                dataset["repo_id"]
+            ]
+            row_index = partition_ordinal * 10_000 + ordinal
+            sequence_tokens = (
+                global_ordinal.to_bytes(4, "little") + bytes((2_048 - 1) * 4)
+            )
+            token_sha = hashlib.sha256(sequence_tokens).hexdigest()
+            sequence = {
+                "dataset_repo_id": dataset["repo_id"],
+                "dataset_revision": dataset["revision"],
+                "dataset_config": dataset_config,
+                "dataset_data_dir": dataset_data_dir,
+                "dataset_split": "train",
+                "source_rows": [
+                    {
+                        "row_index": row_index,
+                        "text_field": text_field,
+                        "content_sha256": hashlib.sha256(
+                            f"{name}:{dataset['repo_id']}:{row_index}".encode()
+                        ).hexdigest(),
+                    }
+                ],
+                "token_offset": global_ordinal * 2_048,
+                "token_count": 2_048,
+                "token_sha256": "sha256:" + token_sha,
+            }
+            sequence["id"] = digest(sequence)
+            sequences.append(sequence)
+            tokens.extend(sequence_tokens)
+            global_ordinal += 1
+        campaign_partition["members"] = [sequence["id"] for sequence in sequences]
+        campaign_partition["ordered_token_digest"] = digest(
+            campaign_partition["members"]
+        )
+        campaign_partition["id"] = digest(
+            {
+                key: value
+                for key, value in campaign_partition.items()
+                if key != "id"
+            }
+        )
+        partitions[name] = {
+            "sampling_seed": campaign_partition["sampling_seed"],
+            "sequences": sequences,
+        }
+    token_record = file_record(root, "tokens/stage7.u32le", bytes(tokens))
+    token_record["path"] = "stage7.u32le"
+    manifest = {
+        "schema": "tritium.stage7-token-evidence-pack.v1",
+        "tokenizer_digest": tokenizer_digest,
+        "tokenizer_vocab_size": 4_096,
+        "token_encoding": "u32le",
+        "tokens": token_record,
+        "partitions": partitions,
+    }
+    manifest["pack_id"] = digest(manifest)
+    manifest_path = root / "tokens/manifest.json"
+    write_json(manifest_path, manifest)
+    return file_record(root, "tokens/manifest.json", manifest_path.read_bytes())
 
 
 def matched_control(candidate_id, grid):
@@ -319,12 +413,17 @@ def fixture(root: Path):
     }
     smoke_model_id = digest(smoke_model)
     QUALIFIER_GLOBALS["SMOLLM2_135M_MODEL_ID"] = smoke_model_id
+    tokenizer_digest = tokenizer_identity(model_files)
+    assert tokenizer_digest == tokenizer_identity(smoke_model["files"])
     provenance = {
-        "calibration": partition_provenance("calibration", 11),
-        "refinement": partition_provenance("refinement", 12),
-        "validation": partition_provenance("validation", 13),
-        "evaluation": partition_provenance("evaluation", 14),
+        "calibration": partition_provenance("calibration", 11, tokenizer_digest),
+        "refinement": partition_provenance("refinement", 12, tokenizer_digest),
+        "validation": partition_provenance("validation", 13, tokenizer_digest),
+        "evaluation": partition_provenance("evaluation", 14, tokenizer_digest),
     }
+    token_evidence_pack = write_token_evidence_pack(
+        root, provenance, tokenizer_digest
+    )
     calibration_id = provenance["calibration"]["id"]
     refinement_corpus_id = provenance["refinement"]["id"]
     validation_id = provenance["validation"]["id"]
@@ -471,9 +570,9 @@ def fixture(root: Path):
             "evaluation_members": smoke_evaluation_members,
             "calibration_id": calibration_id,
             "dataset_repo_id": "allenai/c4",
-            "dataset_revision": "b" * 40,
+            "dataset_revision": "1588ec454efa1a09f29cd18ddd04fe05fc8653a2",
             "sampling_seed": 11,
-            "tokenizer_digest": "sha256:" + "e" * 64,
+            "tokenizer_digest": tokenizer_digest,
             "ordered_token_digest": smoke_evaluation_id,
             "sequence_count": 128,
             "tokens_per_sequence": 2_048,
@@ -489,6 +588,7 @@ def fixture(root: Path):
         },
         "recipe_count": 1404,
         "recipe_grid_id": digest(sorted(grid)),
+        "token_evidence_pack": token_evidence_pack,
         "evidence": [
             {"kind": "smoke", **file_record(root, smoke_path.name, smoke_path.read_bytes())},
             {
@@ -822,6 +922,190 @@ def fixture(root: Path):
 
 
 class Stage7RecipeFreezeTests(unittest.TestCase):
+    def test_rejects_campaign_without_token_evidence_pack(self):
+        with tempfile.TemporaryDirectory() as raw:
+            state = fixture(Path(raw))
+            del state["campaign"]["token_evidence_pack"]
+            write_json(state["campaign_path"], state["campaign"])
+            with self.assertRaisesRegex(Stage7Error, "token evidence pack"):
+                qualify(
+                    state["campaign_path"],
+                    state["trace_path"],
+                    model_root=state["model_root"],
+                    smoke_model_root=state["smoke_model_root"],
+                    source_root=state["source"],
+                )
+
+    def test_rejects_resealed_pack_with_changed_sequence_tokens(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            state = fixture(root)
+            manifest_path = root / state["campaign"]["token_evidence_pack"]["path"]
+            manifest = json.loads(manifest_path.read_bytes())
+            tokens_path = manifest_path.parent / manifest["tokens"]["path"]
+            tokens = bytearray(tokens_path.read_bytes())
+            tokens[0] ^= 1
+            tokens_path.write_bytes(tokens)
+            manifest["tokens"] = file_record(
+                manifest_path.parent,
+                manifest["tokens"]["path"],
+                tokens_path.read_bytes(),
+            )
+            manifest["pack_id"] = digest(
+                {key: value for key, value in manifest.items() if key != "pack_id"}
+            )
+            write_json(manifest_path, manifest)
+            state["campaign"]["token_evidence_pack"] = file_record(
+                root,
+                state["campaign"]["token_evidence_pack"]["path"],
+                manifest_path.read_bytes(),
+            )
+            write_json(state["campaign_path"], state["campaign"])
+            state["trace"]["campaign_sha256"] = hashlib.sha256(
+                state["campaign_path"].read_bytes()
+            ).hexdigest()
+            write_json(state["trace_path"], state["trace"])
+            with self.assertRaisesRegex(Stage7Error, "token payload digest"):
+                qualify(
+                    state["campaign_path"],
+                    state["trace_path"],
+                    model_root=state["model_root"],
+                    smoke_model_root=state["smoke_model_root"],
+                    source_root=state["source"],
+                )
+
+    def test_rejects_oversized_token_payload_before_record_open(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            state = fixture(root)
+            manifest_path = root / state["campaign"]["token_evidence_pack"]["path"]
+            manifest = json.loads(manifest_path.read_bytes())
+            tokens_path = manifest_path.parent / manifest["tokens"]["path"]
+            tokens_path.write_bytes(tokens_path.read_bytes() + b"\x00\x00\x00\x00")
+            manifest["tokens"] = file_record(
+                manifest_path.parent,
+                manifest["tokens"]["path"],
+                tokens_path.read_bytes(),
+            )
+            manifest["pack_id"] = digest(
+                {key: value for key, value in manifest.items() if key != "pack_id"}
+            )
+            write_json(manifest_path, manifest)
+            state["campaign"]["token_evidence_pack"] = file_record(
+                root,
+                state["campaign"]["token_evidence_pack"]["path"],
+                manifest_path.read_bytes(),
+            )
+            write_json(state["campaign_path"], state["campaign"])
+            state["trace"]["campaign_sha256"] = hashlib.sha256(
+                state["campaign_path"].read_bytes()
+            ).hexdigest()
+            write_json(state["trace_path"], state["trace"])
+            with self.assertRaisesRegex(
+                Stage7Error, "token evidence payload byte geometry differs"
+            ):
+                qualify(
+                    state["campaign_path"],
+                    state["trace_path"],
+                    model_root=state["model_root"],
+                    smoke_model_root=state["smoke_model_root"],
+                    source_root=state["source"],
+                )
+
+    def test_rejects_duplicate_token_payload_under_distinct_source_rows(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            state = fixture(root)
+            manifest_path = root / state["campaign"]["token_evidence_pack"]["path"]
+            manifest = json.loads(manifest_path.read_bytes())
+            sequences = manifest["partitions"]["calibration"]["sequences"]
+            tokens_path = manifest_path.parent / manifest["tokens"]["path"]
+            tokens = bytearray(tokens_path.read_bytes())
+            width = 2_048 * 4
+            tokens[width:2 * width] = tokens[:width]
+            tokens_path.write_bytes(tokens)
+            sequences[1]["token_sha256"] = sequences[0]["token_sha256"]
+            sequences[1]["id"] = digest(
+                {key: value for key, value in sequences[1].items() if key != "id"}
+            )
+            manifest["tokens"] = file_record(
+                manifest_path.parent,
+                manifest["tokens"]["path"],
+                tokens_path.read_bytes(),
+            )
+            manifest["pack_id"] = digest(
+                {key: value for key, value in manifest.items() if key != "pack_id"}
+            )
+            write_json(manifest_path, manifest)
+            calibration = state["campaign"]["provenance"]["calibration"]
+            calibration["members"][1] = sequences[1]["id"]
+            calibration["ordered_token_digest"] = digest(calibration["members"])
+            calibration["id"] = digest(
+                {key: value for key, value in calibration.items() if key != "id"}
+            )
+            smoke = state["campaign"]["smoke_provenance"]
+            smoke["evaluation_members"] = calibration["members"][:128]
+            smoke["evaluation_id"] = digest(smoke["evaluation_members"])
+            smoke["ordered_token_digest"] = smoke["evaluation_id"]
+            smoke["calibration_id"] = calibration["id"]
+            state["campaign"]["token_evidence_pack"] = file_record(
+                root,
+                state["campaign"]["token_evidence_pack"]["path"],
+                manifest_path.read_bytes(),
+            )
+            write_json(state["campaign_path"], state["campaign"])
+            with self.assertRaisesRegex(Stage7Error, "duplicate token sequences"):
+                qualify(
+                    state["campaign_path"],
+                    state["trace_path"],
+                    model_root=state["model_root"],
+                    smoke_model_root=state["smoke_model_root"],
+                    source_root=state["source"],
+                )
+
+    def test_rejects_duplicate_source_content_under_distinct_row_indices(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            state = fixture(root)
+            manifest_path = root / state["campaign"]["token_evidence_pack"]["path"]
+            manifest = json.loads(manifest_path.read_bytes())
+            sequences = manifest["partitions"]["calibration"]["sequences"]
+            sequences[1]["source_rows"][0]["content_sha256"] = sequences[0][
+                "source_rows"
+            ][0]["content_sha256"]
+            sequences[1]["id"] = digest(
+                {key: value for key, value in sequences[1].items() if key != "id"}
+            )
+            manifest["pack_id"] = digest(
+                {key: value for key, value in manifest.items() if key != "pack_id"}
+            )
+            write_json(manifest_path, manifest)
+            calibration = state["campaign"]["provenance"]["calibration"]
+            calibration["members"][1] = sequences[1]["id"]
+            calibration["ordered_token_digest"] = digest(calibration["members"])
+            calibration["id"] = digest(
+                {key: value for key, value in calibration.items() if key != "id"}
+            )
+            smoke = state["campaign"]["smoke_provenance"]
+            smoke["evaluation_members"] = calibration["members"][:128]
+            smoke["evaluation_id"] = digest(smoke["evaluation_members"])
+            smoke["ordered_token_digest"] = smoke["evaluation_id"]
+            smoke["calibration_id"] = calibration["id"]
+            state["campaign"]["token_evidence_pack"] = file_record(
+                root,
+                state["campaign"]["token_evidence_pack"]["path"],
+                manifest_path.read_bytes(),
+            )
+            write_json(state["campaign_path"], state["campaign"])
+            with self.assertRaisesRegex(Stage7Error, "reuses source content"):
+                qualify(
+                    state["campaign_path"],
+                    state["trace_path"],
+                    model_root=state["model_root"],
+                    smoke_model_root=state["smoke_model_root"],
+                    source_root=state["source"],
+                )
+
     def test_grid_is_complete_and_r4_is_control_only(self):
         grid = recipe_grid(
             source_model_id="sha256:" + "1" * 64,
@@ -1059,6 +1343,22 @@ class Stage7RecipeFreezeTests(unittest.TestCase):
             with self.assertRaisesRegex(Stage7Error, "dataset revision"):
                 qualify(
                     state["campaign_path"], state["trace_path"],
+                    model_root=state["model_root"],
+                    smoke_model_root=state["smoke_model_root"],
+                    source_root=state["source"],
+                )
+
+    def test_rejects_other_commit_under_frozen_dataset_name(self):
+        with tempfile.TemporaryDirectory() as raw:
+            state = fixture(Path(raw))
+            state["campaign"]["provenance"]["calibration"]["datasets"][0][
+                "revision"
+            ] = "f" * 40
+            write_json(state["campaign_path"], state["campaign"])
+            with self.assertRaisesRegex(Stage7Error, "frozen dataset revision"):
+                qualify(
+                    state["campaign_path"],
+                    state["trace_path"],
                     model_root=state["model_root"],
                     smoke_model_root=state["smoke_model_root"],
                     source_root=state["source"],

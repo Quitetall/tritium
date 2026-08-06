@@ -41,6 +41,14 @@ see `docs/v1.0-api-freeze-audit.md` for the tier policy.
   recipe/checkpoint freeze or terminal negative result for valid missing-rate,
   physical, native, or quality-gate failures. Malformed, contradictory,
   cherry-picked, or hash-consistent non-package traces fail closed.
+  Stage-7 data admission now reopens a canonical 16 MiB `u32le` token payload,
+  verifies all 2,048 per-sequence spans against exact source-row provenance and
+  the shared SmolLM tokenizer identity, rejects duplicate samples, and freezes
+  the official C4/OpenWebMath/StarCoderData revisions. The new
+  `tritium salt build-stage7-evidence-pack` command converts content-bound,
+  preselected source rows into that cross-language manifest transactionally.
+  StarCoder provenance distinguishes config `default`, `data_dir=python`, and
+  source field `content`; fixed token geometry is rejected before bounded read.
 
 - **QAT-hard convolution artifacts:** `TernaryConv1d` and `TernaryConv2d`
   now hard-convert into inference-only composite reference modules backed by

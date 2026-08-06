@@ -11,6 +11,8 @@ import math
 import os
 from pathlib import Path, PurePosixPath
 import re
+import stat
+import struct
 import subprocess
 import tempfile
 from typing import Any, Iterable
@@ -21,11 +23,13 @@ TRACE_SCHEMA = "tritium.stage7-execution.v1"
 QUALIFICATION_SCHEMA = "tritium.stage7-qualification.v1"
 SMOKE_SCHEMA = "tritium.stage7-smoke.v1"
 SMOKE_EXECUTION_SCHEMA = "tritium.stage7-smoke-execution.v1"
+TOKEN_EVIDENCE_SCHEMA = "tritium.stage7-token-evidence-pack.v1"
 NATIVE_SCHEMA = "tritium.stage7-native-kernels.v1"
 PHYSICAL_SCHEMA = "tritium.stage7-physical-report.v1"
 HESTIA_GATE_SCHEMA = "tritium.stage7-hestia-gate-c.v1"
 MAX_JSON_BYTES = 32 * 1024 * 1024
 MAX_SAFETENSORS_HEADER_BYTES = 128 * 1024 * 1024
+TOKEN_PAYLOAD_BYTES = 4 * 512 * 2_048 * 4
 RATES = ("R2", "R3", "R4")
 PUBLISHABLE_RATES = ("R2", "R3")
 RATE_BPW = {"R2": 2.25, "R3": 3.50, "R4": 4.25}
@@ -56,13 +60,38 @@ MODEL_FILES = {
     "merges.txt", "model.safetensors", "special_tokens_map.json", "tokenizer.json",
     "tokenizer_config.json", "vocab.json",
 }
+TOKENIZER_FILES = {
+    "merges.txt", "special_tokens_map.json", "tokenizer.json",
+    "tokenizer_config.json", "vocab.json",
+}
+TOKEN_DATASET_LAYOUT = (
+    ("allenai/c4", "en", None, "train", "text", 256),
+    ("open-web-math/open-web-math", "default", None, "train", "text", 128),
+    ("bigcode/starcoderdata", "default", "python", "train", "content", 128),
+)
+FROZEN_DATASET_REVISIONS = {
+    "allenai/c4": "1588ec454efa1a09f29cd18ddd04fe05fc8653a2",
+    "open-web-math/open-web-math": "fde8ef8de2300f5e778f56261843dab89f230815",
+    "bigcode/starcoderdata": "9fc30b578cedaec69e47302df72cf00feed7c8c4",
+}
 FILE_FIELDS = {"path", "bytes", "sha256"}
 CAMPAIGN_FIELDS = {
     "schema", "release", "source_revision", "run_id", "model", "smoke_model",
     "smoke_provenance", "provenance", "thresholds", "recipe_count",
-    "recipe_grid_id", "evidence",
+    "recipe_grid_id", "token_evidence_pack", "evidence",
 }
 MODEL_FIELDS = {"repo_id", "revision", "files"}
+TOKEN_EVIDENCE_FIELDS = {
+    "schema", "pack_id", "tokenizer_digest", "tokenizer_vocab_size",
+    "token_encoding", "tokens", "partitions",
+}
+TOKEN_PARTITION_FIELDS = {"sampling_seed", "sequences"}
+TOKEN_SEQUENCE_FIELDS = {
+    "id", "dataset_repo_id", "dataset_revision", "dataset_config",
+    "dataset_data_dir", "dataset_split", "source_rows", "token_offset",
+    "token_count", "token_sha256",
+}
+TOKEN_SOURCE_ROW_FIELDS = {"row_index", "text_field", "content_sha256"}
 PROVENANCE_FIELDS = {"calibration", "refinement", "validation", "evaluation"}
 PARTITION_PROVENANCE_FIELDS = {
     "id", "members", "datasets", "sampling_seed", "tokenizer_digest",
@@ -264,10 +293,20 @@ def _load(path: Path, label: str) -> tuple[dict[str, Any], bytes]:
     return value, raw
 
 
-def _hash_file(path: Path) -> str:
+def _hash_file(path: Path, *, max_bytes: int | None = None) -> str:
     digest = hashlib.sha256()
+    total = 0
     with path.open("rb") as stream:
-        while chunk := stream.read(1024 * 1024):
+        while True:
+            read_size = 1024 * 1024
+            if max_bytes is not None:
+                read_size = min(read_size, max_bytes - total + 1)
+            chunk = stream.read(read_size)
+            if not chunk:
+                break
+            total += len(chunk)
+            if max_bytes is not None and total > max_bytes:
+                raise Stage7Error(f"{path} exceeds bounded size")
             digest.update(chunk)
     return digest.hexdigest()
 
@@ -288,11 +327,32 @@ def _logical_path(value: Any, label: str) -> PurePosixPath:
 def _verify_file(path: Path, record: dict[str, Any], label: str) -> Path:
     if not path.is_file() or path.is_symlink():
         raise Stage7Error(f"{label}.path must resolve to an ordinary file")
-    if path.stat().st_size != _integer(record["bytes"], f"{label}.bytes", 1):
+    declared_bytes = _integer(record["bytes"], f"{label}.bytes", 1)
+    if path.stat().st_size != declared_bytes:
         raise Stage7Error(f"{label}.bytes differs from opened file")
-    if _hash_file(path) != _sha256(record["sha256"], f"{label}.sha256"):
+    if _hash_file(path, max_bytes=declared_bytes) != _sha256(
+        record["sha256"], f"{label}.sha256"
+    ):
         raise Stage7Error(f"{label}.sha256 differs from opened file")
     return path
+
+
+def _read_exact_file(path: Path, expected_bytes: int, expected_sha256: str, label: str) -> bytes:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise Stage7Error(f"{label} could not be reopened safely") from error
+    with os.fdopen(descriptor, "rb") as stream:
+        opened = os.fstat(stream.fileno())
+        if not stat.S_ISREG(opened.st_mode) or opened.st_size != expected_bytes:
+            raise Stage7Error(f"{label} byte geometry changed after verification")
+        payload = stream.read(expected_bytes + 1)
+    if len(payload) != expected_bytes:
+        raise Stage7Error(f"{label} byte geometry changed after verification")
+    if hashlib.sha256(payload).hexdigest() != expected_sha256:
+        raise Stage7Error(f"{label} identity changed after verification")
+    return payload
 
 
 def _open_record(
@@ -463,7 +523,7 @@ def _model_identity(
     expected_repo: str,
     expected_revision: str,
     expected_model_id: str,
-) -> tuple[str, int, int, tuple[str, ...]]:
+) -> tuple[str, int, int, tuple[str, ...], int, str]:
     if model["repo_id"] != expected_repo:
         raise Stage7Error("Stage-7 model id differs from frozen rung")
     revision = _revision(model["revision"], "model revision")
@@ -488,6 +548,18 @@ def _model_identity(
         raise Stage7Error("model file inventory contains duplicates")
     if set(logical_paths) != MODEL_FILES:
         raise Stage7Error("model file inventory differs from frozen Hub revision")
+    opened_by_name = dict(zip(logical_paths, opened))
+    config, _ = _load(opened_by_name["config.json"], "model config")
+    vocab_size = _integer(config.get("vocab_size"), "model vocab size", 1)
+    tokenizer_records = sorted(
+        (record for record in files if record["path"] in TOKENIZER_FILES),
+        key=lambda record: record["path"],
+    )
+    if {record["path"] for record in tokenizer_records} != TOKENIZER_FILES:
+        raise Stage7Error("model tokenizer inventory differs")
+    tokenizer_digest = "sha256:" + hashlib.sha256(
+        canonical(tokenizer_records)
+    ).hexdigest()
     weight_files = [
         path for path, logical in zip(opened, logical_paths) if logical.endswith(".safetensors")
     ]
@@ -510,7 +582,187 @@ def _model_identity(
     model_id = "sha256:" + hashlib.sha256(canonical(scope)).hexdigest()
     if model_id != expected_model_id:
         raise Stage7Error("model file identities differ from frozen Hub revision")
-    return model_id, quantized, preserved, tuple(sorted(quantized_tensors))
+    return (
+        model_id,
+        quantized,
+        preserved,
+        tuple(sorted(quantized_tensors)),
+        vocab_size,
+        tokenizer_digest,
+    )
+
+
+def _validate_token_evidence_pack(
+    path: Path,
+    campaign: dict[str, Any],
+    *,
+    tokenizer_digest: str,
+    tokenizer_vocab_size: int,
+) -> None:
+    manifest, _ = _load(path, "Stage-7 token evidence pack")
+    _object(manifest, TOKEN_EVIDENCE_FIELDS, "Stage-7 token evidence pack")
+    if manifest["schema"] != TOKEN_EVIDENCE_SCHEMA:
+        raise Stage7Error("token evidence pack schema differs")
+    expected_pack_id = "sha256:" + hashlib.sha256(canonical({
+        field: manifest[field] for field in TOKEN_EVIDENCE_FIELDS - {"pack_id"}
+    })).hexdigest()
+    if manifest["pack_id"] != expected_pack_id:
+        raise Stage7Error("token evidence pack id differs")
+    if (
+        manifest["tokenizer_digest"] != tokenizer_digest
+        or manifest["tokenizer_vocab_size"] != tokenizer_vocab_size
+        or manifest["token_encoding"] != "u32le"
+    ):
+        raise Stage7Error("token evidence pack tokenizer identity differs")
+    token_record = _object(manifest["tokens"], FILE_FIELDS, "token evidence payload")
+    if _integer(token_record["bytes"], "token evidence payload.bytes", 1) != TOKEN_PAYLOAD_BYTES:
+        raise Stage7Error("token evidence payload byte geometry differs")
+    tokens_path = _open_record(path.parent, token_record, "token evidence payload")
+    payload = _read_exact_file(
+        tokens_path,
+        TOKEN_PAYLOAD_BYTES,
+        _sha256(token_record["sha256"], "token evidence payload.sha256"),
+        "token evidence payload",
+    )
+    partitions = _object(
+        manifest["partitions"], PROVENANCE_FIELDS, "token evidence partitions"
+    )
+    expected_offset = 0
+    source_rows: set[tuple[Any, ...]] = set()
+    source_content_digests: set[str] = set()
+    sequence_ids: set[str] = set()
+    token_digests: set[str] = set()
+    for partition_name in ("calibration", "refinement", "validation", "evaluation"):
+        evidence_partition = _object(
+            partitions[partition_name],
+            TOKEN_PARTITION_FIELDS,
+            f"token evidence {partition_name}",
+        )
+        campaign_partition = campaign["provenance"][partition_name]
+        if (
+            evidence_partition["sampling_seed"]
+            != campaign_partition["sampling_seed"]
+            or campaign_partition["tokenizer_digest"] != tokenizer_digest
+        ):
+            raise Stage7Error(
+                f"token evidence {partition_name} provenance differs"
+            )
+        sequences = evidence_partition["sequences"]
+        if not isinstance(sequences, list) or len(sequences) != 512:
+            raise Stage7Error(
+                f"token evidence {partition_name} sequence inventory differs"
+            )
+        dataset_counts = {
+            repo_id: 0 for repo_id, _, _, _, _, _ in TOKEN_DATASET_LAYOUT
+        }
+        campaign_datasets = {
+            dataset["repo_id"]: dataset for dataset in campaign_partition["datasets"]
+        }
+        observed_members = []
+        for ordinal, raw_sequence in enumerate(sequences):
+            label = f"token evidence {partition_name}.sequences[{ordinal}]"
+            sequence = _object(raw_sequence, TOKEN_SEQUENCE_FIELDS, label)
+            repo_id = _string(sequence["dataset_repo_id"], f"{label}.dataset")
+            layout = next(
+                (item for item in TOKEN_DATASET_LAYOUT if item[0] == repo_id), None
+            )
+            if layout is None:
+                raise Stage7Error(f"{label} dataset is outside frozen composition")
+            (
+                _, expected_config, expected_data_dir, expected_split,
+                expected_text_field, _,
+            ) = layout
+            dataset = campaign_datasets[repo_id]
+            if (
+                sequence["dataset_revision"] != dataset["revision"]
+                or sequence["dataset_config"] != expected_config
+                or sequence["dataset_data_dir"] != expected_data_dir
+                or sequence["dataset_split"] != expected_split
+            ):
+                raise Stage7Error(f"{label} dataset provenance differs")
+            dataset_counts[repo_id] += 1
+            raw_rows = sequence["source_rows"]
+            if not isinstance(raw_rows, list) or not raw_rows:
+                raise Stage7Error(f"{label} source rows must be nonempty")
+            for row_ordinal, raw_row in enumerate(raw_rows):
+                row_label = f"{label}.source_rows[{row_ordinal}]"
+                row = _object(raw_row, TOKEN_SOURCE_ROW_FIELDS, row_label)
+                row_index = _integer(row["row_index"], f"{row_label}.row_index")
+                text_field = _string(row["text_field"], f"{row_label}.text_field")
+                if text_field != expected_text_field:
+                    raise Stage7Error(f"{row_label}.text_field differs")
+                content_digest = _sha256(
+                    row["content_sha256"], f"{row_label}.content_sha256"
+                )
+                locator = (
+                    repo_id,
+                    sequence["dataset_revision"],
+                    sequence["dataset_config"],
+                    sequence["dataset_data_dir"],
+                    sequence["dataset_split"],
+                    row_index,
+                    text_field,
+                )
+                if locator in source_rows:
+                    raise Stage7Error("token evidence reuses a source row")
+                source_rows.add(locator)
+                if content_digest in source_content_digests:
+                    raise Stage7Error("token evidence reuses source content")
+                source_content_digests.add(content_digest)
+            offset = _integer(sequence["token_offset"], f"{label}.token_offset")
+            count = _integer(sequence["token_count"], f"{label}.token_count", 1)
+            if offset != expected_offset or count != 2_048:
+                raise Stage7Error(f"{label} token span differs")
+            start = offset * 4
+            end = start + count * 4
+            if end > len(payload):
+                raise Stage7Error(f"{label} token span exceeds payload")
+            sequence_payload = payload[start:end]
+            observed_token_digest = "sha256:" + hashlib.sha256(
+                sequence_payload
+            ).hexdigest()
+            if sequence["token_sha256"] != observed_token_digest:
+                raise Stage7Error(f"{label} token payload digest differs")
+            if observed_token_digest in token_digests:
+                raise Stage7Error("token evidence contains duplicate token sequences")
+            token_digests.add(observed_token_digest)
+            if any(
+                token[0] >= tokenizer_vocab_size
+                for token in struct.iter_unpack("<I", sequence_payload)
+            ):
+                raise Stage7Error(f"{label} token id exceeds tokenizer vocabulary")
+            sequence_scope = {
+                field: sequence[field] for field in TOKEN_SEQUENCE_FIELDS - {"id"}
+            }
+            expected_sequence_id = "sha256:" + hashlib.sha256(
+                canonical(sequence_scope)
+            ).hexdigest()
+            if sequence["id"] != expected_sequence_id:
+                raise Stage7Error(f"{label} id differs")
+            if sequence["id"] in sequence_ids:
+                raise Stage7Error("token evidence sequence ids are not disjoint")
+            sequence_ids.add(sequence["id"])
+            observed_members.append(sequence["id"])
+            expected_offset += count
+        expected_counts = {
+            repo_id: count for repo_id, _, _, _, _, count in TOKEN_DATASET_LAYOUT
+        }
+        if dataset_counts != expected_counts:
+            raise Stage7Error(
+                f"token evidence {partition_name} dataset composition differs"
+            )
+        if observed_members != campaign_partition["members"]:
+            raise Stage7Error(
+                f"token evidence {partition_name} members differ from campaign"
+            )
+    if expected_offset * 4 != len(payload):
+        raise Stage7Error("token evidence payload has trailing or missing bytes")
+    calibration = partitions["calibration"]["sequences"]
+    if any(
+        sequence["dataset_repo_id"] != "allenai/c4"
+        for sequence in calibration[:128]
+    ):
+        raise Stage7Error("smoke token prefix is not the frozen C4 prefix")
 
 
 def _solver(variant: str) -> dict[str, Any]:
@@ -836,7 +1088,9 @@ def _validate_partition_provenance(
         )
         if dataset["repo_id"] != repo_id or dataset["fraction_ppm"] != fraction:
             raise Stage7Error(f"{label} dataset composition differs")
-        _revision(dataset["revision"], f"{label} dataset revision")
+        revision = _revision(dataset["revision"], f"{label} dataset revision")
+        if revision != FROZEN_DATASET_REVISIONS[repo_id]:
+            raise Stage7Error(f"{label} frozen dataset revision differs")
     scope = {
         field: partition[field]
         for field in PARTITION_PROVENANCE_FIELDS - {"id"}
@@ -854,6 +1108,8 @@ def _validate_campaign(
     tuple[str, ...], list[str],
 ]:
     campaign, raw = _load(path, "Stage-7 campaign")
+    if "token_evidence_pack" not in campaign:
+        raise Stage7Error("campaign token evidence pack is missing")
     _object(campaign, CAMPAIGN_FIELDS, "Stage-7 campaign")
     if campaign["schema"] != CAMPAIGN_SCHEMA:
         raise Stage7Error("Stage-7 campaign schema differs")
@@ -863,7 +1119,10 @@ def _validate_campaign(
         raise Stage7Error("campaign source revision differs from clean repository HEAD")
     _string(campaign["run_id"], "campaign run id")
     model = _object(campaign["model"], MODEL_FIELDS, "campaign model")
-    model_id, quantized, preserved, quantized_tensor_names = _model_identity(
+    (
+        model_id, quantized, preserved, quantized_tensor_names,
+        tokenizer_vocab_size, tokenizer_digest,
+    ) = _model_identity(
         model,
         model_root,
         expected_repo="HuggingFaceTB/SmolLM2-1.7B",
@@ -873,13 +1132,21 @@ def _validate_campaign(
     smoke_model = _object(
         campaign["smoke_model"], MODEL_FIELDS, "campaign smoke model"
     )
-    smoke_model_id, _, _, smoke_quantized_tensor_names = _model_identity(
+    (
+        smoke_model_id, _, _, smoke_quantized_tensor_names,
+        smoke_tokenizer_vocab_size, smoke_tokenizer_digest,
+    ) = _model_identity(
         smoke_model,
         smoke_model_root,
         expected_repo="HuggingFaceTB/SmolLM2-135M",
         expected_revision=SMOLLM2_135M_REVISION,
         expected_model_id=SMOLLM2_135M_MODEL_ID,
     )
+    if (
+        smoke_tokenizer_vocab_size != tokenizer_vocab_size
+        or smoke_tokenizer_digest != tokenizer_digest
+    ):
+        raise Stage7Error("Stage-7 SmolLM tokenizer identities differ")
 
     smoke_provenance = _object(
         campaign["smoke_provenance"],
@@ -945,6 +1212,17 @@ def _validate_campaign(
         or smoke_provenance["tokenizer_digest"] != calibration["tokenizer_digest"]
     ):
         raise Stage7Error("smoke metadata differs from parent calibration provenance")
+    token_evidence_path = _open_record(
+        path.parent,
+        campaign["token_evidence_pack"],
+        "campaign token evidence pack",
+    )
+    _validate_token_evidence_pack(
+        token_evidence_path,
+        campaign,
+        tokenizer_digest=tokenizer_digest,
+        tokenizer_vocab_size=tokenizer_vocab_size,
+    )
 
     thresholds = _object(campaign["thresholds"], THRESHOLD_FIELDS, "thresholds")
     if thresholds != {
