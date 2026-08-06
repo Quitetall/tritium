@@ -9,12 +9,13 @@ from tritium.nn import TernaryLinear  # noqa: E402
 from tritium import _tritium as _native  # noqa: E402
 
 
-def assert_no_device_wide_cuda_synchronization(profile, region_name):
+def assert_no_cuda_synchronization_in_region(profile, region_name):
     events = profile.events()
     regions = [
-        event.time_range
+        event
         for event in events
-        if event.name == region_name and str(event.device_type) == "DeviceType.CPU"
+        if event.name == region_name
+        and event.device_type == torch.autograd.DeviceType.CPU
     ]
     assert len(regions) == 1
     synchronization_names = {
@@ -26,33 +27,70 @@ def assert_no_device_wide_cuda_synchronization(profile, region_name):
         "cueventsynchronize",
     }
     synchronizations = [
-        event.time_range
+        event
         for event in events
         if event.name.replace(" ", "").lower() in synchronization_names
     ]
     region = regions[0]
     assert not any(
-        region.start <= synchronization.start < region.end
+        synchronization.thread == region.thread
+        and region.time_range.start
+        <= synchronization.time_range.start
+        < region.time_range.end
         for synchronization in synchronizations
     )
 
 
-def test_device_wide_cuda_synchronization_guard_rejects_profiler_event():
+@pytest.mark.parametrize(
+    "synchronization_name",
+    [
+        "cudaDeviceSynchronize",
+        "cudaStreamSynchronize",
+        "cudaEventSynchronize",
+        "cuCtxSynchronize",
+        "cuStreamSynchronize",
+        "cuEventSynchronize",
+    ],
+)
+def test_cuda_synchronization_guard_rejects_same_thread_profiler_event(
+    synchronization_name,
+):
     class Event:
-        def __init__(self, name, start, end):
+        def __init__(self, name, start, end, thread=7):
             self.name = name
-            self.device_type = "DeviceType.CPU"
+            self.device_type = torch.autograd.DeviceType.CPU
             self.time_range = type("Range", (), {"start": start, "end": end})()
+            self.thread = thread
 
     class Profile:
         def events(self):
             return [
                 Event("warm", 1, 4),
-                Event("cuCtxSynchronize", 2, 3),
+                Event(synchronization_name, 2, 3),
             ]
 
     with pytest.raises(AssertionError):
-        assert_no_device_wide_cuda_synchronization(Profile(), "warm")
+        assert_no_cuda_synchronization_in_region(Profile(), "warm")
+
+
+def test_cuda_synchronization_guard_ignores_other_thread_and_outside_region():
+    class Event:
+        def __init__(self, name, start, end, thread=7):
+            self.name = name
+            self.device_type = torch.autograd.DeviceType.CPU
+            self.time_range = type("Range", (), {"start": start, "end": end})()
+            self.thread = thread
+
+    class Profile:
+        def events(self):
+            return [
+                Event("warm", 2, 5),
+                Event("cudaDeviceSynchronize", 1, 2),
+                Event("cuCtxSynchronize", 3, 4, thread=8),
+                Event("cudaStreamSynchronize", 5, 6),
+            ]
+
+    assert_no_cuda_synchronization_in_region(Profile(), "warm")
 
 
 def test_ternary_linear_op_matches_literal_forward_and_masked_backward():
@@ -460,7 +498,7 @@ def test_native_cuda_warm_forward_backward_avoids_composite_tensor_ops():
     assert torch.allclose(weight.grad, expected_weight.grad, atol=2e-5, rtol=2e-5)
     assert torch.allclose(bias.grad, expected_bias.grad, atol=2e-5, rtol=2e-5)
     event_names = {event.key.lower() for event in profile.key_averages()}
-    assert_no_device_wide_cuda_synchronization(
+    assert_no_cuda_synchronization_in_region(
         profile, "tritium_native_cuda_warm"
     )
     forbidden = {
@@ -550,7 +588,7 @@ def test_native_cuda_autocast_warm_forward_backward_uses_fp16_kernels():
     )
 
     event_names = {event.key.lower() for event in profile.key_averages()}
-    assert_no_device_wide_cuda_synchronization(
+    assert_no_cuda_synchronization_in_region(
         profile, "tritium_native_cuda_fp16_warm"
     )
     forbidden = {
