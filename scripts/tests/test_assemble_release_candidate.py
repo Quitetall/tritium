@@ -6,7 +6,11 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from scripts.tests.test_release_status import bundle_fixture, helm_fixture
+from scripts.tests.test_release_status import (
+    bundle_fixture,
+    helm_fixture,
+    oci_candidate_fixture,
+)
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -151,7 +155,48 @@ def missing_helm_fixture(base: Path) -> tuple[Path, Path, Path]:
     return candidate, inputs, tool
 
 
+def missing_oci_fixture(base: Path) -> tuple[Path, Path, Path]:
+    candidate_manifest, tool, document = oci_candidate_fixture(base)
+    candidate = candidate_manifest.parent
+    candidate_manifest.unlink()
+    (candidate / "oci.cdx.json").unlink()
+    (candidate / "oci.provenance.json").unlink()
+    inputs = base / "inputs.json"
+    write_json(
+        inputs,
+        {
+            "schema": "tritium.release-inputs.v1",
+            "release": document["release"],
+            "source_revision": document["source_revision"],
+            "builder": {
+                "id": "test-builder",
+                "build_type": "test-build",
+                "invocation_id": "test-run",
+            },
+            "artifacts": [
+                {
+                    "id": "tritium-serve-cpu",
+                    "kind": "oci-image",
+                    "path": "image.oci.tar",
+                    "sbom": "oci.cdx.json",
+                }
+            ],
+        },
+    )
+    return candidate, inputs, tool
+
+
 class AssembleReleaseCandidateTests(unittest.TestCase):
+    def test_assembly_generates_missing_canonical_oci_sbom(self):
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            candidate, inputs, tool = missing_oci_fixture(base)
+            output = candidate / "manifest.json"
+            manifest = assemble(inputs, output, str(tool))
+            sbom = json.loads((candidate / "oci.cdx.json").read_text())
+            self.assertEqual(len(sbom["components"]), 7)
+            self.assertEqual(candidate_validate(output, str(tool)), manifest)
+
     def test_assembly_generates_missing_canonical_helm_sbom(self):
         with tempfile.TemporaryDirectory() as raw:
             base = Path(raw)

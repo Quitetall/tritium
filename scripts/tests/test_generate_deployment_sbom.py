@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest import mock
 
 from scripts.tests.helm_fixtures import RELEASE, chart_source
+from scripts.tests.test_verify_oci_archive import BUILDER_ID, fixture as oci_fixture
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -72,6 +73,63 @@ def tar_entry(name: str, payload: bytes, *, kind: bytes = tarfile.REGTYPE) -> ta
 
 
 class DeploymentSbomTests(unittest.TestCase):
+    def test_oci_archive_has_complete_closed_attested_inventory(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            archive, _, _ = oci_fixture(root)
+            document = generate(
+                archive,
+                "tritium-serve-cpu",
+                "oci-image",
+                RELEASE,
+                REVISION,
+                str(fake_tool(root)),
+            )
+            self.assertEqual(len(document["components"]), 7)
+            properties = {
+                item["name"]: item["value"]
+                for item in document["metadata"]["component"]["properties"]
+            }
+            self.assertEqual(properties["tritium:deployment:archive-format"], "oci-tar")
+            self.assertEqual(properties["tritium:oci:platform"], "linux/amd64")
+            self.assertEqual(properties["tritium:oci:builder-id"], BUILDER_ID)
+            self.assertEqual(
+                properties["tritium:oci:invocation-id"], "buildkit-invocation-123"
+            )
+            self.assertEqual(
+                document["metadata"]["component"]["hashes"][0]["content"],
+                hashlib.sha256(archive.read_bytes()).hexdigest(),
+            )
+
+            with archive.open("ab") as stream:
+                stream.write(b"trailing")
+            with self.assertRaisesRegex(DeploymentSbomError, "trailing|block aligned"):
+                generate(
+                    archive,
+                    "tritium-serve-cpu",
+                    "oci-image",
+                    RELEASE,
+                    REVISION,
+                    str(fake_tool(root)),
+                )
+
+        for option, message in (
+            ({"wrong_subject": True}, "subject"),
+            ({"extra_blob": True}, "unreferenced"),
+        ):
+            with self.subTest(option=option), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw)
+                archive, _, _ = oci_fixture(root, **option)
+                with self.assertRaisesRegex(DeploymentSbomError, message):
+                    generate(
+                        archive,
+                        "tritium-serve-cpu",
+                        "oci-image",
+                        RELEASE,
+                        REVISION,
+                        str(fake_tool(root)),
+                    )
+
     def test_packager_and_generator_are_deterministic_complete_and_exact(self):
         archives = []
         documents = []

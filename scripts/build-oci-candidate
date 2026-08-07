@@ -21,6 +21,23 @@ root="$(git rev-parse --show-toplevel)"
 [[ -f "$candidate" && ! -L "$candidate" ]] || { echo "candidate manifest must be an ordinary file" >&2; exit 1; }
 candidate="$(cd "$(dirname "$candidate")" && pwd -P)/$(basename "$candidate")"
 digest_tool="${TRITIUM_BIN:-$root/target/release/tritium}"
+builder_id="${TRITIUM_OCI_BUILDER_ID:-}"
+python3 - "$builder_id" <<'PY'
+import sys
+from urllib.parse import urlsplit
+
+value = sys.argv[1]
+parsed = urlsplit(value)
+if (
+    parsed.scheme != "https"
+    or not parsed.netloc
+    or parsed.username is not None
+    or parsed.password is not None
+    or not value.isascii()
+    or any(character.isspace() or character in ',"\\' for character in value)
+):
+    raise SystemExit("TRITIUM_OCI_BUILDER_ID must be a safe HTTPS identity URI")
+PY
 candidate_sha256="$(sha256sum "$candidate" | cut -d ' ' -f 1)"
 "$root/scripts/release-status" --candidate "$candidate" --digest-tool "$digest_tool"
 [[ "$(sha256sum "$candidate" | cut -d ' ' -f 1)" == "$candidate_sha256" ]] || {
@@ -42,15 +59,18 @@ epoch="$(git -C "$root" show -s --format=%ct HEAD)"
 created="$(date -u -d "@$epoch" '+%Y-%m-%dT%H:%M:%SZ')"
 
 mkdir -p "$output"
-output="$(cd "$output" && pwd -P)"
-[[ -z "$(find "$output" -mindepth 1 -maxdepth 1 -print -quit)" ]] || {
-  echo "output directory must be empty: $output" >&2
+final_output="$(cd "$output" && pwd -P)"
+[[ -z "$(find "$final_output" -mindepth 1 -maxdepth 1 -print -quit)" ]] || {
+  echo "output directory must be empty: $final_output" >&2
   exit 1
 }
+output_parent="$(dirname "$final_output")"
+output_name="$(basename "$final_output")"
+staging="$(mktemp -d "$output_parent/.${output_name}.staging.XXXXXX")"
 
 context="$(mktemp -d)"
-trap 'rm -rf "$context"' EXIT
-source_archive="$output/tritium-${release}-source-${revision}.tar"
+trap 'rm -rf "$context" "${staging:-}"' EXIT
+source_archive="$staging/tritium-${release}-source-${revision}.tar"
 git -C "$root" archive --format=tar --prefix="tritium-${release}/" --output="$source_archive" "$revision"
 tar -xf "$source_archive" --strip-components=1 -C "$context"
 (
@@ -58,7 +78,7 @@ tar -xf "$source_archive" --strip-components=1 -C "$context"
   cargo vendor --locked --versioned-dirs vendor >> .cargo/config.toml
 )
 
-archive="$output/tritium-serve-${flavor}-${revision}.oci.tar"
+archive="$staging/tritium-serve-${flavor}-${revision}.oci.tar"
 docker buildx build \
   --platform linux/amd64 \
   --network none \
@@ -68,7 +88,7 @@ docker buildx build \
   --build-arg "SOURCE_DATE_EPOCH=$epoch" \
   --build-arg CARGO_NET_OFFLINE=true \
   --attest type=sbom \
-  --attest type=provenance,mode=max \
+  --attest "type=provenance,mode=max,version=v1,builder-id=$builder_id" \
   --output "type=oci,dest=$archive,rewrite-timestamp=true" \
   "$context"
 
@@ -85,10 +105,31 @@ source_bytes="$(stat -c %s "$source_archive")"
 }
 printf '%s  %s\n' "$archive_sha256" "$archive_name" > "$archive.sha256"
 printf '%s  %s\n' "$source_sha256" "$source_name" > "$source_archive.sha256"
-printf '{"schema":"tritium.oci-build.v1","release":"%s","flavor":"%s","candidate_manifest_sha256":"%s","source_revision":"%s","source_created":"%s","source_date_epoch":%s,"source_archive":"%s","source_archive_bytes":%s,"source_archive_sha256":"%s","platform":"linux/amd64","archive":"%s","archive_bytes":%s,"archive_sha256":"%s"}\n' \
-  "$release" "$flavor" "$candidate_sha256" "$revision" "$created" "$epoch" "$source_name" "$source_bytes" "$source_sha256" "$archive_name" "$archive_bytes" "$archive_sha256" > "$output/build-receipt.json"
+printf '{"schema":"tritium.oci-build.v1","release":"%s","flavor":"%s","candidate_manifest_sha256":"%s","source_revision":"%s","source_created":"%s","source_date_epoch":%s,"source_archive":"%s","source_archive_bytes":%s,"source_archive_sha256":"%s","platform":"linux/amd64","archive":"%s","archive_bytes":%s,"archive_sha256":"%s","builder_id":"%s"}\n' \
+  "$release" "$flavor" "$candidate_sha256" "$revision" "$created" "$epoch" "$source_name" "$source_bytes" "$source_sha256" "$archive_name" "$archive_bytes" "$archive_sha256" "$builder_id" > "$staging/build-receipt.json"
 python3 "$root/scripts/verify-oci-archive.py" \
   --archive "$archive" \
-  --build-receipt "$output/build-receipt.json" \
+  --build-receipt "$staging/build-receipt.json" \
   --package-candidate "$candidate"
-echo "$archive"
+python3 "$root/scripts/generate-deployment-sbom.py" \
+  --artifact "$archive" \
+  --artifact-id "tritium-serve-$flavor" \
+  --kind oci-image \
+  --release "$release" \
+  --source-revision "$revision" \
+  --digest-tool "$digest_tool" \
+  --output "$archive.cdx.json"
+rmdir "$final_output"
+mv -T "$staging" "$final_output"
+staging=""
+python3 - "$output_parent" <<'PY'
+import os
+import sys
+
+descriptor = os.open(sys.argv[1], os.O_RDONLY)
+try:
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+PY
+echo "$final_output/$archive_name"

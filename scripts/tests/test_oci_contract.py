@@ -53,14 +53,24 @@ class OciContractTests(unittest.TestCase):
             "--build-arg CARGO_NET_OFFLINE=true",
             'SOURCE_DATE_EPOCH=$epoch',
             "--attest type=sbom",
-            "--attest type=provenance,mode=max",
+            "TRITIUM_OCI_BUILDER_ID",
+            "type=provenance,mode=max,version=v1,builder-id=$builder_id",
+            "mktemp -d",
+            'mv -T "$staging" "$final_output"',
             "rewrite-timestamp=true",
             'archive_sha256="$(sha256sum',
             '"archive_bytes":%s',
             'scripts/verify-oci-archive.py',
             '--package-candidate "$candidate"',
+            'scripts/generate-deployment-sbom.py',
+            '--kind oci-image',
+            '--artifact-id "tritium-serve-$flavor"',
         ):
             self.assertIn(token, script)
+        self.assertLess(
+            script.index('scripts/generate-deployment-sbom.py'),
+            script.index('mv -T "$staging" "$final_output"'),
+        )
         for flavor in ("cpu", "cuda"):
             self.assertIn("cargo build --frozen --profile dist", self.dockerfile(flavor))
 

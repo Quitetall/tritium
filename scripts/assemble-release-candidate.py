@@ -221,23 +221,39 @@ def assemble(inputs: Path, output: Path, digest_tool: str) -> dict[str, Any]:
             sbom_path = contained_file(root, artifact["sbom"], f"{artifact['id']}.sbom")
             sbom = json_file(sbom_path, f"{artifact['id']}.sbom")
             identity = file_identity(artifact_path, digest_tool)
-            if not generated_here:
-                validate_sbom(
-                    sbom,
-                    artifact["id"],
-                    sbom_path.name,
-                    binding=ArtifactBinding(
-                        filename=artifact_path.name,
-                        bytes=identity["bytes"],
-                        sha256=identity["sha256"],
-                        kind=artifact["kind"],
-                        path=artifact_path,
-                        source_revision=revision,
-                        release=release,
-                        digest_tool=digest_tool,
-                    ),
-                )
+            sbom_properties = validate_sbom(
+                sbom,
+                artifact["id"],
+                sbom_path.name,
+                binding=ArtifactBinding(
+                    filename=artifact_path.name,
+                    bytes=identity["bytes"],
+                    sha256=identity["sha256"],
+                    kind=artifact["kind"],
+                    path=artifact_path,
+                    source_revision=revision,
+                    release=release,
+                    digest_tool=digest_tool,
+                ),
+            )
             provenance_relative = f"provenance/{artifact['id']}.intoto.json"
+            external_parameters = {
+                "artifact_id": artifact["id"],
+                "artifact_kind": artifact["kind"],
+                "release": release,
+                "source_revision": revision,
+            }
+            if artifact["kind"] == "oci-image":
+                external_parameters.update(
+                    {
+                        "oci_builder_id": sbom_properties.get(
+                            "tritium:oci:builder-id"
+                        ),
+                        "oci_invocation_id": sbom_properties.get(
+                            "tritium:oci:invocation-id"
+                        ),
+                    }
+                )
             provenance = {
                 "_type": "https://in-toto.io/Statement/v1",
                 "predicateType": "https://slsa.dev/provenance/v1",
@@ -250,18 +266,13 @@ def assemble(inputs: Path, output: Path, digest_tool: str) -> dict[str, Any]:
                 "predicate": {
                     "buildDefinition": {
                         "buildType": builder["build_type"],
-                        "externalParameters": {
-                            "artifact_id": artifact["id"],
-                            "artifact_kind": artifact["kind"],
-                            "release": release,
-                            "source_revision": revision,
-                        },
+                        "externalParameters": external_parameters,
                         "internalParameters": {},
                         "resolvedDependencies": [],
                     },
                     "runDetails": {
                         "builder": {"id": builder["id"]},
-                        "metadata": {"invocationId": builder["invocation_id"]},
+                        "metadata": {"invocationID": builder["invocation_id"]},
                     },
                 },
             }

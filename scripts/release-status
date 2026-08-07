@@ -175,7 +175,8 @@ def _validate_sbom(
     label: str,
     *,
     binding: ArtifactBinding | None = None,
-) -> None:
+) -> dict[str, str]:
+    observed: dict[str, str] = {}
     if value.get("bomFormat") == "CycloneDX" and isinstance(
         value.get("specVersion"), str
     ):
@@ -191,7 +192,6 @@ def _validate_sbom(
             properties = component.get("properties")
             if not isinstance(properties, list):
                 raise ReleaseError(f"{label} root properties are absent")
-            observed: dict[str, str] = {}
             for ordinal, raw in enumerate(properties):
                 item = _object(raw, f"{label}.component.properties[{ordinal}]")
                 if set(item) != {"name", "value"}:
@@ -269,11 +269,12 @@ def _validate_sbom(
             raise ReleaseError(f"{label} deployment inventory is invalid: {error}") from error
         if value != expected:
             raise ReleaseError(f"{label} is not the canonical deployment inventory")
+    return observed
 
 
 def _validate_provenance(
     value: dict[str, Any], artifact_path: str, sha256: str, revision: str, label: str
-) -> None:
+) -> tuple[dict[str, Any], str, str]:
     if value.get("_type") != "https://in-toto.io/Statement/v1":
         raise ReleaseError(f"{label} must be an in-toto Statement v1")
     if value.get("predicateType") != "https://slsa.dev/provenance/v1":
@@ -296,7 +297,12 @@ def _validate_provenance(
         raise ReleaseError(f"{label} does not bind the candidate source revision")
     details = _object(predicate.get("runDetails"), f"{label}.runDetails")
     builder = _object(details.get("builder"), f"{label}.builder")
-    _string(builder.get("id"), f"{label}.builder.id")
+    builder_id = _string(builder.get("id"), f"{label}.builder.id")
+    metadata = _object(details.get("metadata"), f"{label}.metadata")
+    invocation_id = _string(
+        metadata.get("invocationID"), f"{label}.metadata.invocationID"
+    )
+    return parameters, builder_id, invocation_id
 
 
 def validate(candidate: Path, digest_tool: str) -> dict[str, Any]:
@@ -343,7 +349,7 @@ def validate(candidate: Path, digest_tool: str) -> dict[str, Any]:
             raise ReleaseError(f"{label}.identity does not match {artifact_path}")
         sbom_path, sbom = _reference(artifact["sbom"], root, f"{label}.sbom")
         admitted_files.add(sbom_path.relative_to(root).as_posix())
-        _validate_sbom(
+        sbom_properties = _validate_sbom(
             sbom,
             artifact_id,
             sbom_path.name,
@@ -362,13 +368,22 @@ def validate(candidate: Path, digest_tool: str) -> dict[str, Any]:
             artifact["provenance"], root, f"{label}.provenance"
         )
         admitted_files.add(provenance_path.relative_to(root).as_posix())
-        _validate_provenance(
+        provenance_parameters, _, _ = _validate_provenance(
             provenance,
             artifact_path,
             expected["sha256"],
             revision,
             provenance_path.name,
         )
+        if artifact_kind == "oci-image" and (
+            sbom_properties.get("tritium:oci:builder-id")
+            != provenance_parameters.get("oci_builder_id")
+            or sbom_properties.get("tritium:oci:invocation-id")
+            != provenance_parameters.get("oci_invocation_id")
+        ):
+            raise ReleaseError(
+                f"{label} OCI builder/invocation differs from candidate provenance"
+            )
     actual_files: set[str] = set()
     actual_directories: set[str] = set()
     for path in root.rglob("*"):

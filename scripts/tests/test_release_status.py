@@ -8,6 +8,10 @@ import unittest
 from pathlib import Path
 
 from scripts.tests.helm_fixtures import chart_source
+from scripts.tests.test_verify_oci_archive import (
+    BUILDER_ID,
+    fixture as oci_archive_fixture,
+)
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -87,7 +91,10 @@ def fixture(root: Path) -> tuple[Path, Path, dict]:
                 "buildDefinition": {
                     "externalParameters": {"source_revision": revision}
                 },
-                "runDetails": {"builder": {"id": "test-builder"}},
+                "runDetails": {
+                    "builder": {"id": "test-builder"},
+                    "metadata": {"invocationID": "test-run"},
+                },
             },
         },
     )
@@ -183,7 +190,10 @@ def bundle_fixture(root: Path) -> tuple[Path, Path, dict]:
                 "buildDefinition": {
                     "externalParameters": {"source_revision": revision}
                 },
-                "runDetails": {"builder": {"id": "test-builder"}},
+                "runDetails": {
+                    "builder": {"id": "test-builder"},
+                    "metadata": {"invocationID": "test-run"},
+                },
             },
         },
     )
@@ -247,7 +257,10 @@ def helm_fixture(root: Path) -> tuple[Path, Path, dict]:
                 "buildDefinition": {
                     "externalParameters": {"source_revision": revision}
                 },
-                "runDetails": {"builder": {"id": "test-builder"}},
+                "runDetails": {
+                    "builder": {"id": "test-builder"},
+                    "metadata": {"invocationID": "test-run"},
+                },
             },
         },
     )
@@ -279,6 +292,79 @@ def helm_fixture(root: Path) -> tuple[Path, Path, dict]:
     return candidate, tool, document
 
 
+def oci_candidate_fixture(root: Path) -> tuple[Path, Path, dict]:
+    _, tool, _ = fixture(root)
+    candidate_root = root / "candidate"
+    for path in candidate_root.iterdir():
+        path.unlink()
+    oci_root = root / "oci-source"
+    oci_root.mkdir()
+    source_archive, _, _ = oci_archive_fixture(oci_root)
+    artifact = candidate_root / "image.oci.tar"
+    artifact.write_bytes(source_archive.read_bytes())
+    artifact_id = "tritium-serve-cpu"
+    release = "1.1.0-rc.0"
+    revision = "a" * 40
+    sbom = DEPLOYMENT_SBOM["generate"](
+        artifact,
+        artifact_id,
+        "oci-image",
+        release,
+        revision,
+        str(tool),
+    )
+    sbom_sha = write_json(candidate_root / "oci.cdx.json", sbom)
+    payload = artifact.read_bytes()
+    sha256 = hashlib.sha256(payload).hexdigest()
+    provenance_sha = write_json(
+        candidate_root / "oci.provenance.json",
+        {
+            "_type": "https://in-toto.io/Statement/v1",
+            "subject": [{"name": artifact.name, "digest": {"sha256": sha256}}],
+            "predicateType": "https://slsa.dev/provenance/v1",
+            "predicate": {
+                "buildDefinition": {
+                    "externalParameters": {
+                        "source_revision": revision,
+                        "oci_builder_id": BUILDER_ID,
+                        "oci_invocation_id": "buildkit-invocation-123",
+                    }
+                },
+                "runDetails": {
+                    "builder": {"id": "test-builder"},
+                    "metadata": {"invocationID": "test-run"},
+                },
+            },
+        },
+    )
+    document = {
+        "schema": "tritium.release-candidate.v1",
+        "release": release,
+        "source_revision": revision,
+        "artifacts": [
+            {
+                "id": artifact_id,
+                "kind": "oci-image",
+                "path": artifact.name,
+                "identity": {
+                    "schema": "tritium.file-identity.v1",
+                    "bytes": len(payload),
+                    "sha256": sha256,
+                    "blake3": fake_blake3(payload),
+                },
+                "sbom": {"path": "oci.cdx.json", "sha256": sbom_sha},
+                "provenance": {
+                    "path": "oci.provenance.json",
+                    "sha256": provenance_sha,
+                },
+            }
+        ],
+    }
+    candidate = candidate_root / "manifest.json"
+    write_json(candidate, document)
+    return candidate, tool, document
+
+
 class ReleaseStatusTests(unittest.TestCase):
     def test_json_report_publish_is_atomic_and_rejects_symlink(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -298,6 +384,25 @@ class ReleaseStatusTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             candidate, tool, document = fixture(Path(raw))
             self.assertEqual(validate(candidate, str(tool)), document)
+
+    def test_oci_candidate_binds_inner_buildkit_identity_in_outer_provenance(self):
+        for field, replacement in (
+            ("builder", "https://github.com/Quitetall/tritium/actions/runs/999"),
+            ("invocation", "other-buildkit-invocation"),
+        ):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as raw:
+                candidate, tool, document = oci_candidate_fixture(Path(raw))
+                reference = document["artifacts"][0]["provenance"]
+                path = candidate.parent / reference["path"]
+                provenance = json.loads(path.read_text())
+                key = "oci_builder_id" if field == "builder" else "oci_invocation_id"
+                provenance["predicate"]["buildDefinition"]["externalParameters"][
+                    key
+                ] = replacement
+                reference["sha256"] = write_json(path, provenance)
+                write_json(candidate, document)
+                with self.assertRaisesRegex(ReleaseError, "builder|invocation"):
+                    validate(candidate, str(tool))
 
     def test_candidate_rejects_identity_and_lineage_drift(self):
         for mutation in ("artifact", "sbom", "provenance", "revision"):
@@ -346,6 +451,19 @@ class ReleaseStatusTests(unittest.TestCase):
             candidate, tool, document = helm_fixture(Path(raw))
             self.assertEqual(validate(candidate, str(tool)), document)
             sbom_path = candidate.parent / "helm.cdx.json"
+            sbom = json.loads(sbom_path.read_text())
+            sbom["components"] = []
+            sbom["dependencies"][0]["dependsOn"] = []
+            document["artifacts"][0]["sbom"]["sha256"] = write_json(sbom_path, sbom)
+            write_json(candidate, document)
+            with self.assertRaisesRegex(ReleaseError, "canonical deployment inventory"):
+                validate(candidate, str(tool))
+
+    def test_oci_candidate_requires_canonical_complete_member_inventory(self):
+        with tempfile.TemporaryDirectory() as raw:
+            candidate, tool, document = oci_candidate_fixture(Path(raw))
+            self.assertEqual(validate(candidate, str(tool)), document)
+            sbom_path = candidate.parent / "oci.cdx.json"
             sbom = json.loads(sbom_path.read_text())
             sbom["components"] = []
             sbom["dependencies"][0]["dependsOn"] = []

@@ -59,7 +59,9 @@ requires the token; the server refuses to start without it.
 
 Release candidates use `scripts/build-oci-candidate`, which additionally
 requires a clean tree, vendors the locked dependency graph, disables build
-network access, and emits an attested OCI archive. See `deploy/oci/README.md`.
+network access, requires an HTTPS `TRITIUM_OCI_BUILDER_ID`, and emits a semantic
+SPDX/SLSA-v1-attested OCI archive plus exact CycloneDX transport inventory. See
+`deploy/oci/README.md`.
 
 ## Building from source
 

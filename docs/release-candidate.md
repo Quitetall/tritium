@@ -122,9 +122,32 @@ python scripts/generate-deployment-sbom.py \
 Helm CycloneDX inventory binds exact compressed bytes and every chart member's
 SHA-256, raw BLAKE3, transport package ID, and byte count. Candidate admission
 regenerates whole document independently. Embedded or root-only chart metadata
-cannot substitute for complete archive inventory. OCI archive SBOM remains a
-separate open lane: image-bound BuildKit SPDX/SLSA attestations do not bind exact
-OCI transport-tar bytes.
+cannot substitute for complete archive inventory.
+
+`scripts/build-oci-candidate` emits `<archive>.cdx.json` after its independent
+OCI verifier passes. The same deployment generator accepts `--kind oci-image`.
+It binds exact transport-tar SHA-256/bytes and inventories every layout, index,
+manifest, config, layer, and attestation blob through SHA-256, raw BLAKE3,
+transport package ID, and byte count. Admission requires a closed descriptor
+graph with no unreferenced blobs, one Linux/amd64 image, hardened runtime labels
+and identity, and image-manifest-bound semantic SPDX plus SLSA v1 statements.
+OCI builds require `TRITIUM_OCI_BUILDER_ID` as a safe HTTPS identity. Admission
+checks BuildKit `mode=max` structure, exact source-revision build argument,
+resolved dependencies, LLB definition, builder/invocation identity and a
+non-empty SPDX package inventory; predicate URLs or empty objects cannot satisfy
+those gates. Candidate admission carries embedded BuildKit builder identity
+through archive, build receipt, SBOM and outer SLSA external parameters, and
+carries embedded BuildKit invocation identity through archive, SBOM and those
+external parameters. Outer SLSA run details retain the distinct release-packaging
+workflow identity. Hidden
+PAX/GNU tar extension records are rejected rather than omitted from transport
+inventory. Build output is staged, verified and atomically published. Compressed,
+unsafe, linked, duplicate, corrupt, unaligned, trailing, unbound, or mutated
+archives fail closed. Candidate assembly generates a missing OCI SBOM and
+candidate admission regenerates the whole document; embedded BuildKit
+attestations alone cannot substitute for exact transport inventory. This closes
+SBOM infrastructure, not physical image/runtime/security qualification or
+publication.
 
 ## Aggregate evidence status
 
