@@ -33,6 +33,9 @@ const expectedFiles = Object.freeze([
   "dist/portable-schedule-types.d.ts",
   "dist/portable-state-types.d.ts",
   "dist/portable.d.ts",
+  "dist/qualification.d.ts",
+  "dist/qualification.js",
+  "dist/qualification.js.map",
   "dist/tritium_wasm_bg.wasm",
   "package.json",
 ]);
@@ -141,24 +144,32 @@ async function verifyArchive(temporary, startedAtUtc, started) {
   const installedRoot = await realpath(resolve(consumer, "node_modules"));
   const installedRootUrl = pathToFileURL(`${installedRoot}${sep}`).href;
   const installedPackage = resolve(installedRoot, "@tritium-ai/web");
-  const sourceMap = JSON.parse(
-    await readFile(resolve(installedPackage, "dist/index.js.map"), "utf8"),
-  );
-  if (!Array.isArray(sourceMap.sources) ||
-      sourceMap.sources.some((source) => typeof source !== "string" ||
-        source.startsWith("/") || /^[A-Za-z]:[\\/]/.test(source)) ||
-      (Array.isArray(sourceMap.sourcesContent) &&
-        sourceMap.sourcesContent.some((content) => content !== null))) {
-    fail("installed source map leaks source contents or absolute paths");
+  for (const sourceMapName of ["index.js.map", "qualification.js.map"]) {
+    const sourceMap = JSON.parse(
+      await readFile(resolve(installedPackage, "dist", sourceMapName), "utf8"),
+    );
+    if (!Array.isArray(sourceMap.sources) ||
+        sourceMap.sources.some((source) => typeof source !== "string" ||
+          source.startsWith("/") || /^[A-Za-z]:[\\/]/.test(source)) ||
+        (Array.isArray(sourceMap.sourcesContent) &&
+          sourceMap.sourcesContent.some((content) => content !== null))) {
+      fail(`${sourceMapName} leaks source contents or absolute paths`);
+    }
   }
   await writeFile(resolve(consumer, "smoke.mjs"), `
 import assert from "node:assert/strict";
 import { runPortableWasmConformance } from "@tritium-ai/web";
+import { webGpuVectorConformanceInventoryV1 } from "@tritium-ai/web/qualification";
 const resolved = import.meta.resolve("@tritium-ai/web");
+const qualificationResolved = import.meta.resolve("@tritium-ai/web/qualification");
 assert.ok(resolved.startsWith(${JSON.stringify(installedRootUrl)}));
+assert.ok(qualificationResolved.startsWith(${JSON.stringify(installedRootUrl)}));
 const receipt = await runPortableWasmConformance();
 assert.equal(receipt.operationCount, 36);
 assert.equal(receipt.caseCount, 117);
+assert.deepEqual(webGpuVectorConformanceInventoryV1().caseCounts, {
+  valid: 72, invalid: 45, compute: 68, lifecycle: 4, total: 117,
+});
 process.stdout.write(JSON.stringify(receipt));
 `);
   const smoke = await run(process.execPath, [resolve(consumer, "smoke.mjs")], {
@@ -185,11 +196,18 @@ import {
   type WebGpuDevicePortV1,
   type WebTrainingAdapterV1,
 } from "@tritium-ai/web";
+import {
+  runWebGpuVectorConformanceV1,
+  type WebGpuVectorConformanceTraceV1,
+} from "@tritium-ai/web/qualification";
 const digest: string = TRAINING_MANIFEST_DIGEST_V1;
 declare const device: WebGpuDevicePortV1;
 const adapter: WebTrainingAdapterV1 = createWebGpuTrainingAdapter(device);
+const qualification: Promise<WebGpuVectorConformanceTraceV1> =
+  runWebGpuVectorConformanceV1(device);
 void digest;
 void adapter;
+void qualification;
 `);
   await writeFile(resolve(consumer, "tsconfig.json"), JSON.stringify({
     compilerOptions: {

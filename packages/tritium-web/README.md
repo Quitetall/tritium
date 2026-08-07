@@ -99,6 +99,19 @@ fails closed when acquisition fails; `backend: "auto"` may use deterministic
 WASM only when `allowWasmFallback` is true. The explicit factory remains the
 seam for applications that own device selection or permission UX.
 
+Release qualification lives on the separate
+`@tritium-ai/web/qualification` subpath. Its source-free
+`runWebGpuVectorConformanceV1(device)` deep module executes all 68 successful
+non-lifecycle vectors through resident WebGPU, grades explicit output
+readbacks against frozen tolerances, and executes four canonical lifecycle
+codecs plus all 45 expected-invalid admissions through Rust/WASM validation.
+The retained trace labels those codec and validation calls and fixes successful
+WASM tensor dispatches at zero; they cannot be mistaken for WebGPU execution.
+The runner takes exclusive device ownership. Physical browser lane identity,
+full session fault injection, and browser trace capture remain release gates;
+this packaged runner makes those lanes possible but is not itself a lane
+receipt.
+
 This package is private while the local v1.1 release candidate is under
 construction. Registry publication requires explicit release authorization.
 Building the archive from source requires the pinned
@@ -106,7 +119,7 @@ Building the archive from source requires the pinned
 fails on tool drift and verifies the guest's 192 MiB maximum-memory declaration.
 Archive consumers need neither Rust nor wasm-bindgen.
 
-`npm run check` finishes by packing the exact 13-file archive, verifying its
+`npm run check` finishes by packing the exact 16-file archive, verifying its
 npm integrity metadata and source-free map, installing it offline with
 lifecycle scripts disabled into a new project, running the bundled 117-case
 WASM corpus from `node_modules`, and compiling the installed declarations under
