@@ -503,6 +503,27 @@ fn ladder_kmax(t: usize) -> i32 {
     (3_i32.saturating_pow(t.min(9) as u32) - 1) / 2
 }
 
+/// `2^(-j/4)`, the grid's step factor, built so a device mirror reproduces it **exactly**.
+///
+/// The obvious `(-(j as f32) / 4.0).exp2()` is not usable across host and device: CUDA's `exp2f` and
+/// Rust's `f32::exp2` are each accurate to a couple of ULP but not to the same couple, and a 1-ULP
+/// difference in `Δ` changes which grid candidate wins, which changes the whole fit. So the factor is
+/// assembled from four exact quarter-octave constants and repeated exact halving — no transcendental
+/// on either side, and every operation correctly rounded.
+fn ladder_grid_factor(j: usize) -> f32 {
+    /// `2^(-r/4)` for `r ∈ 0..4`, as f32.
+    // These four f32 values must stay BIT-IDENTICAL to `QUARTER_OCTAVE` in
+    // `crates/tritium-cuda/kernels/train_grad.cu`, or the device fitter picks a different grid
+    // candidate than the host and the parity gate fails. `2^-1/2` is spelled as the std constant
+    // because clippy recognises the literal; it is the same f32 (0x3f3504f3) either way.
+    const QUARTER: [f32; 4] = [1.0, 0.8408964, core::f32::consts::FRAC_1_SQRT_2, 0.59460356];
+    let mut f = QUARTER[j % 4];
+    for _ in 0..(j / 4) {
+        f *= 0.5; // exact: halving only decrements the exponent
+    }
+    f
+}
+
 /// Assign one group to the ladder with step `delta`, returning plane-major trits.
 ///
 /// `k = clamp(round(w/Δ))` is the nearest lattice point — and because the ladder is a uniform grid,
@@ -564,7 +585,7 @@ fn fit_group_geometric(bs: &[f32], t: usize, grid: usize) -> (f32, Vec<Vec<i8>>)
     let mut best_delta = delta0;
     let mut best_sse = ladder_sse(bs, t, delta0);
     for j in 1..grid {
-        let delta = delta0 * (-(j as f32) / 4.0).exp2();
+        let delta = delta0 * ladder_grid_factor(j);
         let sse = ladder_sse(bs, t, delta);
         if sse < best_sse {
             best_sse = sse;

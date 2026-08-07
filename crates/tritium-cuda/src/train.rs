@@ -6765,6 +6765,103 @@ mod tests {
         );
     }
 
+    /// The **balanced-ternary ladder** kernel against its CPU oracle, asserted BIT-EXACT.
+    ///
+    /// The ITF gate above has to allow `1e-4`, because its fit runs a least-squares scale solve and
+    /// an accept guard whose block reduction cannot reproduce the host's sequential summation order.
+    /// The ladder has neither: one `roundf` per weight, then base-3 digit extraction and a sum of
+    /// `T` scaled trits. Everything after that round is integer, so there is no float slop left to
+    /// tolerate and a tolerance would only hide a real divergence.
+    ///
+    /// The one float decision is which `Δ` grid candidate wins, and both sides sweep the same fixed
+    /// candidate set taking strictly-less. Candidates are `2^(1/4)` apart — far outside reduction
+    /// noise — so the argmin agrees; this assertion is what would make a flip visible rather than
+    /// silently changing the fit under training.
+    #[test]
+    fn salt_quantize_geometric_matches_cpu_oracle_bit_exact() {
+        use tritium_train::ops::ste::{self, RotationPolicy};
+        let backend = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping geometric ladder parity: no CUDA device ({e})");
+                return;
+            }
+        };
+        let bits = |v: &[f32]| -> Vec<u32> { v.iter().map(|x| x.to_bits()).collect() };
+        let mut checked = 0usize;
+        let mut moved_vs_itf = 0usize;
+
+        // 576 = 4*128 + 64 gives a ragged tail that must stay unrotated on both sides.
+        for &(rows, cols) in &[(4usize, 256usize), (3, 128), (5, 576)] {
+            let master = seeded_uniform(0x1AD_DE12 ^ cols as u64, rows * cols, -2.0, 2.0);
+            let d_master = backend.dev_upload(&master).unwrap();
+            let mut d_out = backend.dev_alloc_zeros(rows * cols).unwrap();
+
+            for group in [128usize, 256] {
+                let groups = rows * cols.div_ceil(group);
+                let ones = vec![1u8; groups];
+                let d_mask = backend.stream().clone_htod(&ones).unwrap();
+                // Planes to 8: the ladder is O(T), so the 1..=3 cap the 3^T enumeration forces on
+                // the joint fitter does not apply here, and T>3 is exactly what this unlocks.
+                for planes in 1..=8usize {
+                    for grid in [0usize, 4, 16] {
+                        for rotate in [false, true] {
+                            let mask = rotate.then_some(&d_mask);
+                            backend
+                                .salt_quantize_forward_grouped_geometric_dev(
+                                    &d_master, &mut d_out, mask, rows, cols, planes, group, grid,
+                                )
+                                .unwrap();
+                            let mut got = vec![0.0f32; rows * cols];
+                            backend.dev_download(&d_out, &mut got).unwrap();
+                            let policy = if rotate {
+                                RotationPolicy::Always
+                            } else {
+                                RotationPolicy::Never
+                            };
+                            let want = ste::salt_quantize_forward_grouped_geometric(
+                                &master, rows, cols, planes, group, grid, policy,
+                            );
+                            assert_eq!(
+                                bits(&got),
+                                bits(&want),
+                                "ladder {rows}x{cols} g{group} T{planes} grid{grid} rot={rotate}: \
+                                 device diverged from the host oracle"
+                            );
+                            checked += 1;
+
+                            // Vacuity guard: a stubbed kernel that echoed the ITF fit would pass a
+                            // loose gate. Assert the ladder actually produces a DIFFERENT fit.
+                            if !rotate && planes <= 3 {
+                                let itf = ste::salt_quantize_forward_grouped(
+                                    &master,
+                                    rows,
+                                    cols,
+                                    planes,
+                                    group,
+                                    5,
+                                    RotationPolicy::Never,
+                                );
+                                if max_abs_diff(&want, &itf) > 1e-6 {
+                                    moved_vs_itf += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked >= 200, "sweep should cover the grid, got {checked}");
+        assert!(
+            moved_vs_itf > 0,
+            "the ladder never differed from the ITF fit — the gate would pass on a stub"
+        );
+        eprintln!(
+            "geometric ladder: {checked} configurations bit-exact vs the CPU oracle \
+             ({moved_vs_itf} confirmed distinct from the ITF fit)"
+        );
+    }
+
     #[test]
     fn resident_glue_ops_match_cpu() {
         use tritium_train::ops::{act, elementwise};

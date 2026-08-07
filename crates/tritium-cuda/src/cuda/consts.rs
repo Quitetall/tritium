@@ -253,6 +253,10 @@ pub(super) const KERNEL_NAME_SALT_QUANTIZE_FWD: &str = "salt_quantize_forward";
 pub(super) const KERNEL_NAME_ADAMW_STEP: &str = "adamw_step";
 /// Grouped SALT with optional per-group Hadamard rotation (the fixed fitter: 10786x -> 1.74x fp).
 pub(super) const KERNEL_NAME_SALT_QUANTIZE_GROUPED: &str = "salt_quantize_forward_grouped";
+/// The balanced-ternary ladder fitter — `s_p = s0*3^-p`, one anchor per group instead of T
+/// scales, and O(T) per weight instead of a per-plane residual pass.
+pub(super) const KERNEL_NAME_SALT_QUANTIZE_GROUPED_GEOMETRIC: &str =
+    "salt_quantize_forward_grouped_geometric";
 /// Lever 5: block-wise int8 AdamW (signed-int8 m, sqrt-space uint8 v) — mirrors `Int8AdamW`.
 pub(super) const KERNEL_NAME_ADAMW_STEP_8BIT: &str = "adamw_step_8bit";
 /// Lever 5: AdamW on a bf16 master with stochastic rounding — mirrors `tritium_train::bf16`.

@@ -881,6 +881,183 @@ extern "C" __global__ void salt_quantize_forward_bounded(
     }
 }
 
+// ── Balanced-ternary ladder (the geometric fitter) ───────────────────────────────────────────────
+// Mirror of `ste::salt_quantize_forward_grouped_geometric`. The greedy+ITF kernel above fits each
+// plane to the residual the previous one left; this one fixes the scale ladder to `s_p = s0*3^-p`,
+// which makes the reachable levels a UNIFORM grid over every integer in +-(3^T-1)/2 and turns the
+// whole fit into `k = round(w/delta)` followed by base-3 digit extraction.
+//
+// Three consequences for this kernel specifically:
+//   * O(T) per weight instead of a per-plane residual pass, and no `<r,t>/<t,t>` solve.
+//   * NO DATA-DEPENDENT BREAK. The ITF kernel's accept guard forced the careful argument about
+//     `red[0]` being block-uniform so every `break` is taken uniformly; here the only control flow
+//     is a fixed grid sweep, so that whole class of hazard is absent.
+//   * Everything after the single `roundf` is integer, so the reconstruction is exactly
+//     `k * delta` summed over powers of three — reproducible bit-for-bit against the host given the
+//     same `delta`.
+//
+// The one float decision is which grid candidate wins. Both sides sweep the same fixed candidate
+// set and take strictly-less, so the argmin agrees unless two candidates tie to within reduction
+// noise; the candidates are 2^(1/4) apart, so that is far outside float slop. The parity gate
+// asserts BIT-EXACT equality rather than a tolerance precisely so a flip would be visible.
+/// `2^(-r/4)` for `r` in `0..4`. Must stay bit-identical to `ste::ladder_grid_factor`.
+__device__ __constant__ float QUARTER_OCTAVE[4] = {1.0f, 0.8408964f, 0.70710678f, 0.59460356f};
+
+extern "C" __global__ void salt_quantize_forward_grouped_geometric(
+    const float* __restrict__ master,               // [rows, cols]
+    float* __restrict__ quantized,                  // [rows, cols]
+    const unsigned char* __restrict__ rotate_mask,  // [total_groups] 0/1, may be null
+    int rows, int cols, int planes, int group, int grid)
+{
+    extern __shared__ float shg[];                  // group floats, then blockDim.x for reductions
+    const int groups_per_row = (cols + group - 1) / group;
+    const int gid = blockIdx.x;
+    if (gid >= rows * groups_per_row) return;
+    const int row = gid / groups_per_row;
+    const int gcol = (gid % groups_per_row) * group;
+    const int n = min(group, cols - gcol);
+    const long base = (long)row * cols + gcol;
+    float* redg = shg + SALT_GROUP_MAX;
+
+    const bool pow2 = (n > 1) && ((n & (n - 1)) == 0);
+    const bool rot = pow2 && rotate_mask != nullptr && rotate_mask[gid] != 0;
+
+    for (int i = threadIdx.x; i < n; i += blockDim.x) shg[i] = master[base + i];
+    __syncthreads();
+
+    // Forward Hadamard (normalized), identical to the ITF kernel's.
+    if (rot) {
+        for (int len = 1; len < n; len <<= 1) {
+            for (int idx = threadIdx.x; idx < (n >> 1); idx += blockDim.x) {
+                int blk = idx / len, off = idx % len;
+                int i = blk * (len << 1) + off;
+                float a = shg[i], b = shg[i + len];
+                shg[i] = a + b; shg[i + len] = a - b;
+            }
+            __syncthreads();
+        }
+        // `1.0f/sqrtf(n)` and NOT `rsqrtf`: the host computes `1.0 / (n as f32).sqrt()`, and
+        // `rsqrtf` is a fast approximate intrinsic (~2 ULP) whose result differs. With
+        // `--fmad=false` and nvcc's default `-prec-div/-prec-sqrt`, both operations here are
+        // IEEE correctly-rounded, so this reproduces the host bit-for-bit. The ITF kernel above
+        // still uses `rsqrtf`; its gate is a 1e-4 tolerance, which hides exactly this.
+        float s = 1.0f / sqrtf((float)n);
+        for (int i = threadIdx.x; i < n; i += blockDim.x) shg[i] *= s;
+        __syncthreads();
+    }
+
+    // kmax = (3^planes - 1) / 2, in float for the clamp and int for the digits.
+    int pow3t = 1;
+    for (int p = 0; p < planes; ++p) pow3t *= 3;
+    const int kmax_i = (pow3t - 1) / 2;
+    const float kmax_f = (float)kmax_i;
+
+    // peak = max |w| over the group. Max is exact and order-independent, so no ordering contract is
+    // needed here (unlike a sum).
+    float local_peak = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) local_peak = fmaxf(local_peak, fabsf(shg[i]));
+    redg[threadIdx.x] = local_peak;
+    __syncthreads();
+    for (int half = blockDim.x >> 1; half > 0; half >>= 1) {
+        if (threadIdx.x < half) redg[threadIdx.x] = fmaxf(redg[threadIdx.x], redg[threadIdx.x + half]);
+        __syncthreads();
+    }
+    const float peak = redg[0];
+    __syncthreads();
+
+    if (!(peak > 0.0f) || !isfinite(peak)) {
+        // Dead group: host returns (0, zeros) and contributes nothing.
+        for (int i = threadIdx.x; i < n; i += blockDim.x) quantized[base + i] = 0.0f;
+        return;
+    }
+
+    const float delta0 = peak / kmax_f;
+    float best_delta = delta0;
+    float best_sse = 0.0f;
+    const int sweep = (grid < 1) ? 1 : grid;
+
+    for (int j = 0; j < sweep; ++j) {
+        // Mirrors `ste::ladder_grid_factor`: four exact quarter-octave constants plus exact
+        // halving, NOT `exp2f`. CUDA's `exp2f` and Rust's `f32::exp2` are each a couple of ULP off
+        // but not identically so, and a 1-ULP difference in `delta` flips which candidate wins.
+        float factor = QUARTER_OCTAVE[j & 3];
+        for (int h = 0; h < (j >> 2); ++h) factor *= 0.5f;
+        const float delta = (j == 0) ? delta0 : delta0 * factor;
+        float partial = 0.0f;
+        for (int i = threadIdx.x; i < n; i += blockDim.x) {
+            const float w = shg[i];
+            const float k = (delta > 0.0f && isfinite(delta))
+                ? fminf(kmax_f, fmaxf(-kmax_f, roundf(w / delta)))
+                : 0.0f;
+            const float d = w - k * delta;
+            partial += d * d;
+        }
+        redg[threadIdx.x] = partial;
+        __syncthreads();
+        for (int half = blockDim.x >> 1; half > 0; half >>= 1) {
+            if (threadIdx.x < half) redg[threadIdx.x] += redg[threadIdx.x + half];
+            __syncthreads();
+        }
+        const float sse = redg[0];
+        // Strictly-less keeps the LOWEST j on a tie, matching the host's `if sse < best_sse`.
+        if (j == 0 || sse < best_sse) { best_sse = sse; best_delta = delta; }
+        __syncthreads();   // before the next iteration overwrites redg[threadIdx.x]
+    }
+
+    // Digits + reconstruction. Integer from here: `k` is an int, and the reconstruction is the same
+    // `sum_p (s0 * 3^-p) * trit_p` the host evaluates, in the same plane order.
+    // `best_delta * 3^(T-1)` as ONE multiply by an exact power of three, mirroring the host's
+    // `best_delta * pow3(t - 1)`. Repeated `s0 *= 3.0f` is a different value: `(x*3)*3 != x*9` in
+    // f32, which is why T<=2 agreed and T=3 did not.
+    float pow3_t1 = 1.0f;
+    for (int p = 0; p + 1 < planes; ++p) pow3_t1 *= 3.0f;
+    const float s0 = best_delta * pow3_t1;
+
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        int k = (int)fminf(kmax_f, fmaxf(-kmax_f, roundf(shg[i] / best_delta)));
+        int trits[9];                                   // planes <= 9 (3^9 fits an i32)
+        for (int p = planes - 1; p >= 0; --p) {
+            int d = ((k + 1) % 3 + 3) % 3 - 1;          // rem_euclid, matching the host
+            trits[p] = d;
+            k = (k - d) / 3;
+        }
+        // `s0 / 3^p` as ONE division by an exactly-representable power of three, mirroring the
+        // host's `s0 / pow3(p)`. Dividing by 3 repeatedly is NOT the same: `(s0/3)/3 != s0/9` in
+        // f32, which is precisely what made T=3 diverge while T<=2 agreed. Powers of three through
+        // 3^8 = 6561 are exact in f32, so building `p3` by multiplication is itself lossless.
+        float acc = 0.0f;
+        float p3 = 1.0f;
+        for (int p = 0; p < planes; ++p) {
+            acc += (s0 / p3) * (float)trits[p];
+            p3 *= 3.0f;
+        }
+        shg[i] = acc;
+    }
+    __syncthreads();
+
+    // Inverse Hadamard (its own inverse at normalized scale), then store.
+    if (rot) {
+        for (int len = 1; len < n; len <<= 1) {
+            for (int idx = threadIdx.x; idx < (n >> 1); idx += blockDim.x) {
+                int blk = idx / len, off = idx % len;
+                int i = blk * (len << 1) + off;
+                float a = shg[i], b = shg[i + len];
+                shg[i] = a + b; shg[i + len] = a - b;
+            }
+            __syncthreads();
+        }
+        // `1.0f/sqrtf(n)` and NOT `rsqrtf`: the host computes `1.0 / (n as f32).sqrt()`, and
+        // `rsqrtf` is a fast approximate intrinsic (~2 ULP) whose result differs. With
+        // `--fmad=false` and nvcc's default `-prec-div/-prec-sqrt`, both operations here are
+        // IEEE correctly-rounded, so this reproduces the host bit-for-bit. The ITF kernel above
+        // still uses `rsqrtf`; its gate is a 1e-4 tolerance, which hides exactly this.
+        float s = 1.0f / sqrtf((float)n);
+        for (int i = threadIdx.x; i < n; i += blockDim.x) shg[i] *= s;
+        __syncthreads();
+    }
+    for (int i = threadIdx.x; i < n; i += blockDim.x) quantized[base + i] = shg[i];
+}
+
 // ADR 0027 Track D: compact training-only SALT representation. Each plane keeps
 // the canonical TQ2 2-bit address mapping but omits the inference format's f16
 // block scale. Track A has one f32 AbsMean per (plane,row), so storing those

@@ -610,6 +610,7 @@ pub struct CudaBackend {
     /// Grouped SALT quantize with optional per-group Hadamard rotation.
     #[allow(dead_code)] // consumed by the grouped-fitter parity gate and DeviceTrainer
     pub(super) func_salt_quantize_grouped: CudaFunction,
+    pub(super) func_salt_quantize_grouped_geometric: CudaFunction,
     /// Lever 5: block-wise int8 AdamW update (int8 moments + per-block scales).
     #[allow(dead_code)] // consumed by the int8-Adam gate and DeviceTrainer int8 path
     pub(super) func_adamw_step_8bit: CudaFunction,
@@ -843,6 +844,9 @@ impl CudaBackend {
         let func_adamw_step = grad_module
             .load_function(KERNEL_NAME_ADAMW_STEP)
             .map_err(|e| driver_err("resolve adamw_step kernel", &e))?;
+        let func_salt_quantize_grouped_geometric = grad_module
+            .load_function(KERNEL_NAME_SALT_QUANTIZE_GROUPED_GEOMETRIC)
+            .map_err(|e| driver_err("load salt_quantize_forward_grouped_geometric", &e))?;
         let func_salt_quantize_grouped = grad_module
             .load_function(KERNEL_NAME_SALT_QUANTIZE_GROUPED)
             .map_err(|e| driver_err("resolve salt_quantize_forward_grouped kernel", &e))?;
@@ -1111,6 +1115,7 @@ impl CudaBackend {
             func_salt_quantize_fwd,
             func_adamw_step,
             func_salt_quantize_grouped,
+            func_salt_quantize_grouped_geometric,
             func_adamw_step_8bit,
             func_adamw_step_bf16_master,
             func_sr_round_to_bf16grid,
@@ -3103,6 +3108,112 @@ impl CudaBackend {
             launch
                 .launch(cfg)
                 .map_err(|e| driver_err("launch salt_quantize_forward_grouped_dev", &e))?;
+        }
+        Ok(())
+    }
+
+    /// Quantize `d_master` into `d_quantized` with the **balanced-ternary ladder**, the device
+    /// mirror of [`tritium_train::ops::ste::salt_quantize_forward_grouped_geometric`].
+    ///
+    /// Differs from [`Self::salt_quantize_forward_grouped_dev`] in three ways that matter here:
+    /// planes go up to 9 rather than 3 (the ladder is O(T), so a deep stack is affordable and the
+    /// `3^T` enumeration cap does not apply); `grid` replaces `iters` as the fitter's knob; and the
+    /// result is reproducible bit-for-bit against the host oracle, because everything after the
+    /// single `round` is integer arithmetic.
+    ///
+    /// # Errors
+    /// [`BackendError`] on a plane count outside `1..=9`, a group outside `1..=256`, a buffer
+    /// shorter than `rows * cols`, a short rotation mask, or a launch failure.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn salt_quantize_forward_grouped_geometric_dev(
+        &self,
+        d_master: &CudaSlice<f32>,
+        d_quantized: &mut CudaSlice<f32>,
+        d_rotate: Option<&CudaSlice<u8>>,
+        rows: usize,
+        cols: usize,
+        planes: usize,
+        group: usize,
+        grid: usize,
+    ) -> Result<(), BackendError> {
+        // 3^9 = 19683 still fits an i32 index and the kernel's `trits[9]`; beyond that the digit
+        // extraction would overflow its fixed array.
+        if !(1..=9).contains(&planes) {
+            return Err(BackendError::InvalidInput(format!(
+                "geometric ladder plane count must be in 1..=9, got {planes}"
+            )));
+        }
+        if group == 0 || group > 256 {
+            return Err(BackendError::InvalidInput(format!(
+                "SALT group must be in 1..=256 (shared-memory bound), got {group}"
+            )));
+        }
+        let len = rows
+            .checked_mul(cols)
+            .ok_or_else(|| BackendError::InvalidInput("SALT shape overflows usize".into()))?;
+        if d_master.len() < len || d_quantized.len() < len {
+            return Err(BackendError::ShapeMismatch {
+                expected: len,
+                got: d_master.len().min(d_quantized.len()),
+            });
+        }
+        if len == 0 {
+            return Ok(());
+        }
+        let groups = rows * cols.div_ceil(group);
+        if let Some(mask) = d_rotate
+            && mask.len() < groups
+        {
+            return Err(BackendError::ShapeMismatch {
+                expected: groups,
+                got: mask.len(),
+            });
+        }
+        let rows_i = i32::try_from(rows)
+            .map_err(|_| BackendError::InvalidInput("SALT rows exceed i32::MAX".into()))?;
+        let cols_i = i32::try_from(cols)
+            .map_err(|_| BackendError::InvalidInput("SALT cols exceed i32::MAX".into()))?;
+        let planes_i = planes as i32;
+        let group_i = group as i32;
+        let grid_i = i32::try_from(grid)
+            .map_err(|_| BackendError::InvalidInput("ladder grid exceeds i32::MAX".into()))?;
+
+        const THREADS: u32 = 128;
+        let cfg = LaunchConfig {
+            grid_dim: (u32::try_from(groups).unwrap_or(u32::MAX), 1, 1),
+            block_dim: (THREADS, 1, 1),
+            shared_mem_bytes: (256 + THREADS as usize) as u32 * 4,
+        };
+        // Same full-length stand-in contract as the ITF path: the kernel indexes `rotate_mask[gid]`
+        // for every group, so a 1-byte dummy would read out of bounds.
+        let zeros = match d_rotate {
+            Some(_) => None,
+            None => Some(
+                self.stream
+                    .alloc_zeros::<u8>(groups)
+                    .map_err(|e| driver_err("alloc rotation mask", &e))?,
+            ),
+        };
+        let mask = d_rotate.or(zeros.as_ref()).expect("one of the two is Some");
+        let mut launch = self
+            .stream
+            .launch_builder(&self.func_salt_quantize_grouped_geometric);
+        launch
+            .arg(d_master)
+            .arg(d_quantized)
+            .arg(mask)
+            .arg(&rows_i)
+            .arg(&cols_i)
+            .arg(&planes_i)
+            .arg(&group_i)
+            .arg(&grid_i);
+        // SAFETY: one block per group with 128 threads and the declared shared bytes; every buffer
+        // length is validated above and the scalars match the kernel ABI.
+        #[allow(unsafe_code)]
+        unsafe {
+            launch.launch(cfg).map_err(|e| {
+                driver_err("launch salt_quantize_forward_grouped_geometric_dev", &e)
+            })?;
         }
         Ok(())
     }
