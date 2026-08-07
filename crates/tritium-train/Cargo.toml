@@ -13,6 +13,7 @@ categories.workspace = true
 
 [dependencies]
 blake3 = { workspace = true }
+half = { workspace = true }
 tritium-core = { workspace = true }
 tritium-format = { workspace = true }
 tritium-spec = { workspace = true }
@@ -23,7 +24,6 @@ tritium-testkit = { workspace = true }
 rayon = { workspace = true }
 
 [dev-dependencies]
-half = { workspace = true }
 # Property-based gates for LoRA (frozen-base zero-grad, merge correctness, rank edges) —
 # ADR 0007. Workspace-pinned; already used by tritium-core/-cpu/-nn/-format/-quantize.
 proptest = { workspace = true }

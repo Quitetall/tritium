@@ -27,6 +27,7 @@ pub mod nn;
 pub mod ops;
 pub mod optim;
 pub mod portable;
+pub mod pv_tuning;
 pub mod salt_v2_recovery;
 pub mod tape;
 pub mod temp;
@@ -47,6 +48,10 @@ pub use optim::{
     Optimizer, Sgd, SgdState, newton_schulz,
 };
 pub use portable::CpuTrainBackendV1;
+pub use pv_tuning::{
+    PvStepReceipt, PvTernaryPlane, PvTernaryStructure, PvTernaryWeight, PvTuningConfig,
+    PvTuningConfigBuilder, PvTuningError, PvTuningSession,
+};
 pub use salt_v2_recovery::{
     BypassSchedule, BypassUsageFlag, EarlyStopDecision, EarlyStopGate, EarlyStopPoint,
     FinalRecoveryMetrics, HiddenCosineTerm, LossMode, PlateauConfig, PromotionCheckpoint,
