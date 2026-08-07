@@ -30,6 +30,11 @@ BUNDLE_KINDS = BUNDLE_SBOM["KINDS"]
 BundleSbomError = BUNDLE_SBOM["BundleSbomError"]
 generate_bundle_sbom = BUNDLE_SBOM["generate"]
 write_bundle_sbom = BUNDLE_SBOM["write_sbom"]
+DEPLOYMENT_SBOM = runpy.run_path(Path(__file__).with_name("generate-deployment-sbom.py"))
+DEPLOYMENT_KINDS = DEPLOYMENT_SBOM["KINDS"]
+DeploymentSbomError = DEPLOYMENT_SBOM["DeploymentSbomError"]
+generate_deployment_sbom = DEPLOYMENT_SBOM["generate"]
+write_deployment_sbom = DEPLOYMENT_SBOM["write_sbom"]
 
 INPUT_SCHEMA = "tritium.release-inputs.v1"
 ENTRY_SCHEMA = "tritium.release-candidate.v1"
@@ -175,7 +180,7 @@ def assemble(inputs: Path, output: Path, digest_tool: str) -> dict[str, Any]:
             requested_sbom = root / PurePosixPath(artifact["sbom"])
             generated_here = False
             if (
-                artifact["kind"] in BUNDLE_KINDS
+                artifact["kind"] in BUNDLE_KINDS | DEPLOYMENT_KINDS
                 and not requested_sbom.exists()
                 and not requested_sbom.is_symlink()
             ):
@@ -183,17 +188,33 @@ def assemble(inputs: Path, output: Path, digest_tool: str) -> dict[str, Any]:
                     root, artifact["sbom"], f"{artifact['id']}.sbom"
                 )
                 try:
-                    generated = generate_bundle_sbom(
-                        artifact_path,
-                        artifact["id"],
-                        artifact["kind"],
-                        revision,
-                        digest_tool,
-                    )
-                    write_bundle_sbom(generated, sbom_output)
-                except (OSError, BundleSbomError, subprocess.SubprocessError) as error:
+                    if artifact["kind"] in BUNDLE_KINDS:
+                        generated = generate_bundle_sbom(
+                            artifact_path,
+                            artifact["id"],
+                            artifact["kind"],
+                            revision,
+                            digest_tool,
+                        )
+                        write_bundle_sbom(generated, sbom_output)
+                    else:
+                        generated = generate_deployment_sbom(
+                            artifact_path,
+                            artifact["id"],
+                            artifact["kind"],
+                            release,
+                            revision,
+                            digest_tool,
+                        )
+                        write_deployment_sbom(generated, sbom_output)
+                except (
+                    OSError,
+                    BundleSbomError,
+                    DeploymentSbomError,
+                    subprocess.SubprocessError,
+                ) as error:
                     raise ReleaseError(
-                        f"cannot generate {artifact['id']} bundle SBOM: {error}"
+                        f"cannot generate {artifact['id']} canonical SBOM: {error}"
                     ) from error
                 generated_sboms.append(sbom_output)
                 generated_here = True
@@ -212,6 +233,7 @@ def assemble(inputs: Path, output: Path, digest_tool: str) -> dict[str, Any]:
                         kind=artifact["kind"],
                         path=artifact_path,
                         source_revision=revision,
+                        release=release,
                         digest_tool=digest_tool,
                     ),
                 )

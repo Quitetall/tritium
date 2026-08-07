@@ -7,6 +7,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from scripts.tests.helm_fixtures import chart_source
+
 
 ROOT = Path(__file__).resolve().parents[2]
 MODULE = runpy.run_path(ROOT / "scripts" / "release-status")
@@ -15,6 +17,8 @@ validate = MODULE["validate"]
 write_report = MODULE["_write_report"]
 BUNDLE_MODULE = runpy.run_path(ROOT / "scripts" / "generate-bundle-sbom.py")
 generate_bundle_sbom = BUNDLE_MODULE["generate"]
+HELM_PACKAGER = runpy.run_path(ROOT / "scripts" / "package-helm-chart.py")
+DEPLOYMENT_SBOM = runpy.run_path(ROOT / "scripts" / "generate-deployment-sbom.py")
 
 
 def fake_blake3(payload: bytes) -> str:
@@ -211,6 +215,70 @@ def bundle_fixture(root: Path) -> tuple[Path, Path, dict]:
     return candidate, tool, document
 
 
+def helm_fixture(root: Path) -> tuple[Path, Path, dict]:
+    _, tool, _ = fixture(root)
+    candidate_root = root / "candidate"
+    for path in candidate_root.iterdir():
+        path.unlink()
+    source = chart_source(root)
+    release = "1.1.0-rc.0"
+    artifact = candidate_root / f"tritium-{release}.tgz"
+    HELM_PACKAGER["package"](source, artifact, release)
+    artifact_id = "tritium-helm"
+    revision = "1" * 40
+    sbom = DEPLOYMENT_SBOM["generate"](
+        artifact,
+        artifact_id,
+        "helm-chart",
+        release,
+        revision,
+        str(tool),
+    )
+    sbom_sha = write_json(candidate_root / "helm.cdx.json", sbom)
+    payload = artifact.read_bytes()
+    sha256 = hashlib.sha256(payload).hexdigest()
+    provenance_sha = write_json(
+        candidate_root / "helm.provenance.json",
+        {
+            "_type": "https://in-toto.io/Statement/v1",
+            "subject": [{"name": artifact.name, "digest": {"sha256": sha256}}],
+            "predicateType": "https://slsa.dev/provenance/v1",
+            "predicate": {
+                "buildDefinition": {
+                    "externalParameters": {"source_revision": revision}
+                },
+                "runDetails": {"builder": {"id": "test-builder"}},
+            },
+        },
+    )
+    document = {
+        "schema": "tritium.release-candidate.v1",
+        "release": release,
+        "source_revision": revision,
+        "artifacts": [
+            {
+                "id": artifact_id,
+                "kind": "helm-chart",
+                "path": artifact.name,
+                "identity": {
+                    "schema": "tritium.file-identity.v1",
+                    "bytes": len(payload),
+                    "sha256": sha256,
+                    "blake3": fake_blake3(payload),
+                },
+                "sbom": {"path": "helm.cdx.json", "sha256": sbom_sha},
+                "provenance": {
+                    "path": "helm.provenance.json",
+                    "sha256": provenance_sha,
+                },
+            }
+        ],
+    }
+    candidate = candidate_root / "manifest.json"
+    write_json(candidate, document)
+    return candidate, tool, document
+
+
 class ReleaseStatusTests(unittest.TestCase):
     def test_json_report_publish_is_atomic_and_rejects_symlink(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -271,6 +339,19 @@ class ReleaseStatusTests(unittest.TestCase):
             document["artifacts"][0]["sbom"]["sha256"] = write_json(sbom_path, sbom)
             write_json(candidate, document)
             with self.assertRaisesRegex(ReleaseError, "canonical bundle inventory"):
+                validate(candidate, str(tool))
+
+    def test_helm_candidate_requires_canonical_complete_member_inventory(self):
+        with tempfile.TemporaryDirectory() as raw:
+            candidate, tool, document = helm_fixture(Path(raw))
+            self.assertEqual(validate(candidate, str(tool)), document)
+            sbom_path = candidate.parent / "helm.cdx.json"
+            sbom = json.loads(sbom_path.read_text())
+            sbom["components"] = []
+            sbom["dependencies"][0]["dependsOn"] = []
+            document["artifacts"][0]["sbom"]["sha256"] = write_json(sbom_path, sbom)
+            write_json(candidate, document)
+            with self.assertRaisesRegex(ReleaseError, "canonical deployment inventory"):
                 validate(candidate, str(tool))
 
     def test_spdx_candidate_requires_exact_described_package(self):

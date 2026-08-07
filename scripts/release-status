@@ -30,6 +30,10 @@ BUNDLE_SBOM = runpy.run_path(Path(__file__).with_name("generate-bundle-sbom.py")
 BUNDLE_KINDS = BUNDLE_SBOM["KINDS"]
 BundleSbomError = BUNDLE_SBOM["BundleSbomError"]
 generate_bundle_sbom = BUNDLE_SBOM["generate"]
+DEPLOYMENT_SBOM = runpy.run_path(Path(__file__).with_name("generate-deployment-sbom.py"))
+DEPLOYMENT_KINDS = DEPLOYMENT_SBOM["KINDS"]
+DeploymentSbomError = DEPLOYMENT_SBOM["DeploymentSbomError"]
+generate_deployment_sbom = DEPLOYMENT_SBOM["generate"]
 
 
 class ReleaseError(ValueError):
@@ -44,6 +48,7 @@ class ArtifactBinding:
     kind: str
     path: Path
     source_revision: str
+    release: str
     digest_tool: str
 
 
@@ -250,6 +255,20 @@ def _validate_sbom(
             raise ReleaseError(f"{label} bundle inventory is invalid: {error}") from error
         if value != expected:
             raise ReleaseError(f"{label} is not the canonical bundle inventory")
+    if binding is not None and binding.kind in DEPLOYMENT_KINDS:
+        try:
+            expected = generate_deployment_sbom(
+                binding.path,
+                artifact_id,
+                binding.kind,
+                binding.release,
+                binding.source_revision,
+                binding.digest_tool,
+            )
+        except (OSError, DeploymentSbomError, subprocess.SubprocessError) as error:
+            raise ReleaseError(f"{label} deployment inventory is invalid: {error}") from error
+        if value != expected:
+            raise ReleaseError(f"{label} is not the canonical deployment inventory")
 
 
 def _validate_provenance(
@@ -335,6 +354,7 @@ def validate(candidate: Path, digest_tool: str) -> dict[str, Any]:
                 kind=artifact_kind,
                 path=path,
                 source_revision=revision,
+                release=release,
                 digest_tool=digest_tool,
             ),
         )

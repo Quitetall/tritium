@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from scripts.tests.test_release_status import bundle_fixture
+from scripts.tests.test_release_status import bundle_fixture, helm_fixture
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -120,7 +120,48 @@ def missing_bundle_fixture(base: Path) -> tuple[Path, Path, Path]:
     return candidate, inputs, tool
 
 
+def missing_helm_fixture(base: Path) -> tuple[Path, Path, Path]:
+    candidate_manifest, tool, document = helm_fixture(base)
+    candidate = candidate_manifest.parent
+    candidate_manifest.unlink()
+    (candidate / "helm.cdx.json").unlink()
+    (candidate / "helm.provenance.json").unlink()
+    inputs = base / "inputs.json"
+    write_json(
+        inputs,
+        {
+            "schema": "tritium.release-inputs.v1",
+            "release": document["release"],
+            "source_revision": document["source_revision"],
+            "builder": {
+                "id": "test-builder",
+                "build_type": "test-build",
+                "invocation_id": "test-run",
+            },
+            "artifacts": [
+                {
+                    "id": "tritium-helm",
+                    "kind": "helm-chart",
+                    "path": f"tritium-{document['release']}.tgz",
+                    "sbom": "helm.cdx.json",
+                }
+            ],
+        },
+    )
+    return candidate, inputs, tool
+
+
 class AssembleReleaseCandidateTests(unittest.TestCase):
+    def test_assembly_generates_missing_canonical_helm_sbom(self):
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            candidate, inputs, tool = missing_helm_fixture(base)
+            output = candidate / "manifest.json"
+            manifest = assemble(inputs, output, str(tool))
+            sbom = json.loads((candidate / "helm.cdx.json").read_text())
+            self.assertEqual(len(sbom["components"]), 3)
+            self.assertEqual(candidate_validate(output, str(tool)), manifest)
+
     def test_assembly_generates_missing_canonical_bundle_sbom(self):
         with tempfile.TemporaryDirectory() as raw:
             base = Path(raw)

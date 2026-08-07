@@ -56,10 +56,10 @@ scripts/release-status \
 Assembly sorts artifacts by ID, streams SHA-256/BLAKE3 through shipped CLI,
 writes canonical in-toto/SLSA v1 statements, fsyncs data and directories, then
 strictly reloads generated candidate. It never overwrites existing manifest or
-provenance. For `model-bundle` and `onnx-bundle` inputs, a missing named SBOM is
-generated before provenance publication; a supplied SBOM must reproduce the
-same canonical inventory exactly. Failure removes every SBOM and metadata file
-created by that assembly attempt.
+provenance. For `model-bundle`, `onnx-bundle`, and `helm-chart` inputs, a missing
+named SBOM is generated before provenance publication; a supplied SBOM must
+reproduce the same canonical inventory exactly. Failure removes every SBOM and
+metadata file created by that assembly attempt.
 
 Verification requires:
 
@@ -94,6 +94,37 @@ python scripts/generate-bundle-sbom.py \
   --digest-tool target/release/tritium \
   --output release/v1.1/qwen-onnx.cdx.json
 ```
+
+Helm candidates use Tritium's source-closed packager, not ambient `helm package`
+defaults. It emits one deterministic gzip stream containing a sorted POSIX
+ustar `tritium/` tree with canonical modes, owners, timestamps, padding, and no
+directory or link members. `Chart.yaml` must bind exact candidate release
+through both `version` and `appVersion` and retain frozen chart API, Kubernetes
+floor, and receipt-schema annotations. Source symlinks, duplicate portable
+paths, mutation, oversized input, output overwrite, noncanonical gzip, trailing
+streams, unsafe tar paths, links, and metadata drift fail closed.
+
+```bash
+python scripts/package-helm-chart.py \
+  --source deploy/helm/tritium \
+  --release 1.1.0-rc.0 \
+  --output release/v1.1/tritium-1.1.0-rc.0.tgz
+python scripts/generate-deployment-sbom.py \
+  --artifact release/v1.1/tritium-1.1.0-rc.0.tgz \
+  --artifact-id tritium-helm \
+  --kind helm-chart \
+  --release 1.1.0-rc.0 \
+  --source-revision "$(git rev-parse HEAD)" \
+  --digest-tool target/release/tritium \
+  --output release/v1.1/tritium-helm.cdx.json
+```
+
+Helm CycloneDX inventory binds exact compressed bytes and every chart member's
+SHA-256, raw BLAKE3, transport package ID, and byte count. Candidate admission
+regenerates whole document independently. Embedded or root-only chart metadata
+cannot substitute for complete archive inventory. OCI archive SBOM remains a
+separate open lane: image-bound BuildKit SPDX/SLSA attestations do not bind exact
+OCI transport-tar bytes.
 
 ## Aggregate evidence status
 
