@@ -382,6 +382,64 @@ test("candidate commits reject duplicate and chained physical destinations", asy
   runtime.dispose();
 });
 
+test("signalled commits reject ordered dependencies and exclude concurrent mutations", async () => {
+  const device = new FakeDevice();
+  const runtime = await WebGpuResidentRuntimeV1.prepare(
+    device,
+    plan(),
+    [{ bufferId: "left", bytes: Uint8Array.of(1, 2, 3, 4) }],
+    {
+      maxBytes: 4,
+      resources: [{ id: "candidate", byteLength: 4, initialBytes: null }],
+    },
+  );
+  const stage = Object.freeze({
+    commands: Object.freeze([command]),
+    copies: Object.freeze([{
+      source: "left", sourceOffset: 0,
+      destination: "candidate", destinationOffset: 0, byteLength: 4,
+    }]),
+    commitCopies: Object.freeze([{
+      source: "candidate", sourceOffset: 0,
+      destination: "right", destinationOffset: 0, byteLength: 4,
+    }]),
+  });
+  assert.throws(
+    () => runtime.dispatchTransactions([
+      stage,
+      { commands: [command], copies: [], commitCopies: [] },
+    ], [], new AbortController().signal),
+    (error) => error instanceof WebTrainingError && error.code === "invalid_schema",
+  );
+
+  let releaseWork;
+  const work = new Promise((resolve) => { releaseWork = resolve; });
+  let barriers = 0;
+  device.queue.onSubmittedWorkDone = () => {
+    barriers += 1;
+    return work;
+  };
+  const cancellation = new AbortController();
+  const submitted = runtime.dispatchTransactions([stage], [], cancellation.signal);
+  assert.equal(barriers, 1, "completion barrier must bind the submitted compute synchronously");
+  assert.throws(
+    () => runtime.write("left", Uint8Array.of(9, 9, 9, 9)),
+    (error) => error instanceof WebTrainingError && error.code === "busy",
+  );
+  assert.throws(
+    () => runtime.dispatch([command]),
+    (error) => error instanceof WebTrainingError && error.code === "busy",
+  );
+  cancellation.abort();
+  releaseWork();
+  await assert.rejects(
+    submitted,
+    (error) => error instanceof WebTrainingError && error.code === "cancelled",
+  );
+  runtime.write("left", Uint8Array.of(9, 9, 9, 9));
+  runtime.dispose();
+});
+
 test("auxiliary getters are captured exactly once before preparation awaits", async () => {
   const reads = new Map();
   const once = (name, value) => ({
@@ -874,6 +932,157 @@ test("resident WebGPU adapter executes one command buffer per training phase", a
   );
   assert.equal(session.state, "terminal");
   assert.equal(device.destroyed, true);
+});
+
+test("resident WebGPU step cancellation after compute submission preserves committed owners", async () => {
+  const device = new FakeDevice();
+  const { model, config } = adapterOptimizerFixture("adamw");
+  const session = await prepareTraining(
+    model,
+    config,
+    createWebGpuTrainingAdapter(device, {
+      buildId: "test-webgpu-step-cancellation",
+      physicalDevice: "fake-gpu",
+      maxResidentBytes: 1 << 20,
+    }),
+  );
+  const result = await session.forward({
+    inputs: { x: new Float32Array([3]), target: new Float32Array([0]) },
+  });
+  await session.backward(result);
+
+  const committedOwners = ["weight", "moment1", "moment2"].map((id) => {
+    const owner = device.buffers.get(`tritium:resident:${id}`);
+    return [owner, Uint8Array.from(owner.bytes)];
+  });
+  let releaseWork;
+  const work = new Promise((resolve) => { releaseWork = resolve; });
+  device.queue.onSubmittedWorkDone = () => work;
+  const cancellation = new AbortController();
+  const submitted = device.submits;
+  const stepping = session.step({ signal: cancellation.signal });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(device.submits, submitted + 1, "optimizer compute must reach the GPU");
+  cancellation.abort();
+  releaseWork();
+  await assert.rejects(
+    stepping,
+    (error) => error instanceof WebTrainingError && error.code === "cancelled",
+  );
+  assert.equal(session.state, "backward-complete");
+  for (const [owner, committed] of committedOwners) {
+    assert.deepEqual(owner.bytes, committed, "cancelled compute cannot commit candidate owners");
+  }
+
+  device.queue.onSubmittedWorkDone = async () => {};
+  const retrySubmits = device.submits;
+  const retryCancellation = new AbortController();
+  const retried = await session.step({ signal: retryCancellation.signal });
+  assert.equal(retried.completedSteps, 1);
+  assert.equal(session.state, "prepared");
+  assert.equal(device.submits, retrySubmits + 2, "signalled success separates compute and commit");
+
+  const controlDevice = new FakeDevice();
+  const controlFixture = adapterOptimizerFixture("adamw");
+  const control = await prepareTraining(
+    controlFixture.model,
+    controlFixture.config,
+    createWebGpuTrainingAdapter(controlDevice, {
+      buildId: "test-webgpu-step-cancellation",
+      physicalDevice: "fake-gpu",
+      maxResidentBytes: 1 << 20,
+    }),
+  );
+  const controlResult = await control.forward({
+    inputs: { x: new Float32Array([3]), target: new Float32Array([0]) },
+  });
+  await control.backward(controlResult);
+  await control.step();
+  assert.deepEqual(
+    (await session.checkpoint()).bytes,
+    (await control.checkpoint()).bytes,
+    "cancelled candidate compute followed by retry must match a clean stateful step",
+  );
+  await control.dispose();
+  await session.dispose();
+});
+
+test("resident WebGPU compute and loss-read cancellation leave forward and backward reusable", async () => {
+  const device = new FakeDevice();
+  const { model, config } = adapterTrainingFixture();
+  const session = await prepareTraining(
+    model,
+    config,
+    createWebGpuTrainingAdapter(device, {
+      buildId: "test-webgpu-phase-cancellation",
+      physicalDevice: "fake-gpu",
+      maxResidentBytes: 1 << 20,
+    }),
+  );
+
+  let releaseMap;
+  device.mapGate = new Promise((resolve) => { releaseMap = resolve; });
+  const forwardCancellation = new AbortController();
+  const cancelledForward = session.forward(
+    { inputs: { x: new Float32Array([3]), target: new Float32Array([0]) } },
+    { signal: forwardCancellation.signal },
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+  forwardCancellation.abort();
+  releaseMap();
+  await assert.rejects(
+    cancelledForward,
+    (error) => error instanceof WebTrainingError && error.code === "cancelled",
+  );
+  assert.equal(session.state, "prepared");
+  device.mapGate = null;
+  const result = await session.forward({
+    inputs: { x: new Float32Array([3]), target: new Float32Array([0]) },
+  });
+
+  let releaseWork;
+  const work = new Promise((resolve) => { releaseWork = resolve; });
+  device.queue.onSubmittedWorkDone = () => work;
+  const backwardCancellation = new AbortController();
+  const cancelledBackward = session.backward(result, { signal: backwardCancellation.signal });
+  await new Promise((resolve) => setImmediate(resolve));
+  backwardCancellation.abort();
+  releaseWork();
+  await assert.rejects(
+    cancelledBackward,
+    (error) => error instanceof WebTrainingError && error.code === "cancelled",
+  );
+  assert.equal(session.state, "forward-complete");
+  device.queue.onSubmittedWorkDone = async () => {};
+  const backward = await session.backward(result);
+  assert.equal(backward.completedSteps, 0);
+  assert.equal(session.state, "backward-complete");
+
+  await session.step();
+  const actual = await session.checkpoint();
+  const controlDevice = new FakeDevice();
+  const controlFixture = adapterTrainingFixture();
+  const control = await prepareTraining(
+    controlFixture.model,
+    controlFixture.config,
+    createWebGpuTrainingAdapter(controlDevice, {
+      buildId: "test-webgpu-phase-cancellation",
+      physicalDevice: "fake-gpu",
+      maxResidentBytes: 1 << 20,
+    }),
+  );
+  const controlResult = await control.forward({
+    inputs: { x: new Float32Array([3]), target: new Float32Array([0]) },
+  });
+  await control.backward(controlResult);
+  await control.step();
+  assert.deepEqual(
+    actual.bytes,
+    (await control.checkpoint()).bytes,
+    "forward/backward cancellation followed by retry must match a clean training cycle",
+  );
+  await control.dispose();
+  await session.dispose();
 });
 
 test("resident WebGPU checkpoint resumes exact optimizer state through public session", async () => {

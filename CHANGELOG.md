@@ -13,6 +13,13 @@ see `docs/v1.0-api-freeze-audit.md` for the tier policy.
 
 ### Changed
 
+- **Transactional WebGPU cancellation:** resident training now carries each
+  operation's `AbortSignal` through GPU submission. Optimizer kernels retain
+  their existing candidate owners, but signalled execution defers explicit
+  root-owner commit copies until submitted compute finishes uncancelled.
+  Cancellation after compute submission therefore returns a recoverable
+  failure without changing parameters or optimizer state; retry remains valid.
+  Calls without a signal keep the one-command-buffer fast path.
 - **Compiled autocast parity:** `tritium.torch.ternary_linear` now makes its
   selective CPU/CUDA autocast casts visible to `torch.compile`. Compiled CUDA
   graphs preserve the fp32 master weight for resident native kernels while

@@ -229,10 +229,13 @@ export interface WebBinaryResultV1 {
  * `validate` must be allocation-free, and neither `validate` nor `prepare` may
  * mutate or retain their arguments. Validation completes operation-specific
  * geometry and attribute checks before `prepare` allocates persistent state.
- * A recoverable typed rejection must happen before mutation. A cancelled
- * operation must reject with `WebTrainingError("cancelled", ...)`
- * only after rolling back every partial write. Device loss must reject with
- * `WebTrainingError("device_lost", ...)`; the session makes that state terminal.
+ * A recoverable typed rejection must happen before committed-state mutation.
+ * Cancellation after phase submission must preserve parameter and optimizer
+ * owners and permit exact retry from the last public state. Transient batch,
+ * activation, result, and gradient owners may be discarded only when retry
+ * deterministically reconstructs them before observation. Device loss must
+ * reject with `WebTrainingError("device_lost", ...)`; the session makes that
+ * state terminal.
  */
 export interface WebTrainingAdapterV1 {
   readonly capabilities: WebTrainingCapabilitiesV1;

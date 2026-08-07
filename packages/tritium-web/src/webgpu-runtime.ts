@@ -148,7 +148,7 @@ type PreparedStage = Readonly<{
   hasUniform: boolean;
 }>;
 
-function fail(code: "adapter_unavailable" | "adapter_failure" | "cancelled" | "capability_mismatch" | "device_lost" | "invalid_schema" | "memory_limit", message: string): never {
+function fail(code: "adapter_unavailable" | "adapter_failure" | "busy" | "cancelled" | "capability_mismatch" | "device_lost" | "invalid_schema" | "memory_limit", message: string): never {
   throw new WebTrainingError(code, message);
 }
 
@@ -239,6 +239,8 @@ export class WebGpuResidentRuntimeV1 {
   readonly #buffers: ReadonlyMap<string, ResidentBuffer>;
   readonly #stages: ReadonlyMap<string, PreparedStage>;
   readonly #bindGroups = new Map<string, unknown>();
+  #replacementPending = false;
+  #signalledSubmission = false;
   #lost = false;
   #disposed = false;
 
@@ -586,15 +588,23 @@ export class WebGpuResidentRuntimeV1 {
   dispatchTransactions(
     transactions: readonly WebGpuResidentSubmissionV1[],
     clearBufferIds: readonly string[] = [],
+    signal?: AbortSignal | null,
   ): Promise<void> {
-    return this.#submitTransactions(transactions, clearBufferIds);
+    return this.#submitTransactions(transactions, clearBufferIds, signal);
   }
 
   #submitTransactions(
     transactions: readonly WebGpuResidentSubmissionV1[],
     clearBufferIds: readonly string[],
+    signal?: AbortSignal | null,
   ): Promise<void> {
     this.#ready();
+    if (this.#signalledSubmission || this.#replacementPending) {
+      fail("busy", "WebGPU runtime has an exclusive mutation in flight");
+    }
+    if (signal?.aborted === true) {
+      fail("cancelled", "WebGPU transaction was cancelled before submission");
+    }
     if (!denseArray(transactions) || !denseArray(clearBufferIds)) {
       fail("invalid_schema", "WebGPU transaction inputs must be dense arrays");
     }
@@ -756,6 +766,44 @@ export class WebGpuResidentRuntimeV1 {
         commitCopies: Object.freeze(capturedCommitCopies),
       });
     });
+    if (signal !== null && signal !== undefined) {
+      const priorCommitOwners = new Set<string>();
+      const ownerOf = (bufferId: string): string => {
+        const buffer = this.#buffers.get(bufferId);
+        if (buffer === undefined) {
+          fail("invalid_schema", `unknown WebGPU storage binding ${bufferId}`);
+        }
+        return buffer.ownerId;
+      };
+      for (const transaction of capturedTransactions) {
+        const referencedOwners = new Set<string>();
+        for (const copy of transaction.copies) {
+          referencedOwners.add(ownerOf(copy.source));
+          referencedOwners.add(ownerOf(copy.destination));
+        }
+        for (const command of transaction.commands) {
+          for (const bufferId of Object.values(command.storageBindings)) {
+            referencedOwners.add(ownerOf(bufferId));
+          }
+        }
+        for (const copy of transaction.commitCopies) {
+          referencedOwners.add(ownerOf(copy.source));
+        }
+        if ([...referencedOwners].some((owner) => priorCommitOwners.has(owner))) {
+          fail(
+            "invalid_schema",
+            "signalled WebGPU transactions require commit-independent compute",
+          );
+        }
+        for (const copy of transaction.commitCopies) {
+          const owner = ownerOf(copy.destination);
+          if (priorCommitOwners.has(owner)) {
+            fail("invalid_schema", "signalled WebGPU commits require unique owners");
+          }
+          priorCommitOwners.add(owner);
+        }
+      }
+    }
     const encoder = this.#device.createCommandEncoder({ label: "tritium:transaction" });
     for (const clear of capturedClears) {
       encoder.clearBuffer(this.#physicalBuffer(clear.id), 0, clear.byteLength);
@@ -834,8 +882,57 @@ export class WebGpuResidentRuntimeV1 {
         }
         pass.end();
       }
-      for (const copy of transaction.commitCopies) {
-        encoder.copyBufferToBuffer(
+      if (signal === null || signal === undefined) {
+        for (const copy of transaction.commitCopies) {
+          encoder.copyBufferToBuffer(
+            this.#physicalBuffer(copy.source),
+            copy.sourceOffset,
+            this.#physicalBuffer(copy.destination),
+            copy.destinationOffset,
+            copy.byteLength,
+          );
+        }
+      }
+    }
+    let aborted = false;
+    const abort = () => { aborted = true; };
+    const signalled = signal !== null && signal !== undefined;
+    if (signalled) this.#signalledSubmission = true;
+    try {
+      signal?.addEventListener("abort", abort, { once: true });
+      this.#device.queue.submit([encoder.finish()]);
+    } catch (error) {
+      signal?.removeEventListener("abort", abort);
+      if (signalled) this.#signalledSubmission = false;
+      throw error;
+    }
+    const submittedWork = () => {
+      let queueDone: Promise<void>;
+      try {
+        queueDone = this.#device.queue.onSubmittedWorkDone();
+      } catch (error) {
+        queueDone = Promise.reject(error);
+      }
+      return Promise.race([
+        queueDone.catch(() =>
+          fail("device_lost", "WebGPU queue rejected submitted work")
+        ),
+        this.#device.lost.then(() =>
+          fail("device_lost", "WebGPU device was lost during submitted work")
+        ),
+      ]).then(() => undefined);
+    };
+    return submittedWork().then(async () => {
+      if (signal === null || signal === undefined) return;
+      if (aborted || signal.aborted) {
+        fail("cancelled", "WebGPU transaction was cancelled after compute submission");
+      }
+      signal.removeEventListener("abort", abort);
+      const commits = capturedTransactions.flatMap((transaction) => transaction.commitCopies);
+      if (commits.length === 0) return;
+      const commitEncoder = this.#device.createCommandEncoder({ label: "tritium:commit" });
+      for (const copy of commits) {
+        commitEncoder.copyBufferToBuffer(
           this.#physicalBuffer(copy.source),
           copy.sourceOffset,
           this.#physicalBuffer(copy.destination),
@@ -843,20 +940,19 @@ export class WebGpuResidentRuntimeV1 {
           copy.byteLength,
         );
       }
-    }
-    this.#device.queue.submit([encoder.finish()]);
-    return Promise.race([
-      this.#device.queue.onSubmittedWorkDone().catch(() =>
-        fail("device_lost", "WebGPU queue rejected submitted work")
-      ),
-      this.#device.lost.then(() =>
-        fail("device_lost", "WebGPU device was lost during submitted work")
-      ),
-    ]).then(() => undefined);
+      this.#device.queue.submit([commitEncoder.finish()]);
+      await submittedWork();
+    }).finally(() => {
+      signal?.removeEventListener("abort", abort);
+      if (signalled) this.#signalledSubmission = false;
+    });
   }
 
   write(bufferId: string, bytes: Uint8Array): void {
     this.#ready();
+    if (this.#signalledSubmission || this.#replacementPending) {
+      fail("busy", "WebGPU runtime has an exclusive mutation in flight");
+    }
     const buffer = this.#buffers.get(bufferId);
     if (buffer === undefined || buffer.ownerId !== buffer.id ||
         !(bytes instanceof Uint8Array) || bytes.byteLength !== buffer.byteLength) {
@@ -874,6 +970,9 @@ export class WebGpuResidentRuntimeV1 {
     signal?: AbortSignal | null,
   ): Promise<void> {
     this.#ready();
+    if (this.#signalledSubmission || this.#replacementPending) {
+      fail("busy", "WebGPU runtime has an exclusive mutation in flight");
+    }
     if (!denseArray(tensors)) {
       fail("invalid_schema", "WebGPU replacement tensors must be a dense array");
     }
@@ -919,6 +1018,7 @@ export class WebGpuResidentRuntimeV1 {
     }
     const candidates = new Map<string, WebGpuBufferPortV1>();
     let abort: (() => void) | null = null;
+    this.#replacementPending = true;
     try {
       for (const tensor of captured) {
         const allocated = this.#device.createBuffer({
@@ -955,6 +1055,7 @@ export class WebGpuResidentRuntimeV1 {
       fail("adapter_failure", `WebGPU replacement upload failed: ${String(error)}`);
     } finally {
       if (abort !== null) signal?.removeEventListener("abort", abort);
+      this.#replacementPending = false;
     }
     const replaced: WebGpuBufferPortV1[] = [];
     for (const [bufferId, candidate] of candidates) {

@@ -281,6 +281,7 @@ class ResidentWebGpuTrainingAdapter implements WebTrainingAdapterV1 {
     operationIds: readonly string[],
     optimizerStep?: number,
     clears: readonly string[] = [],
+    signal?: AbortSignal | null,
   ): Promise<void> {
     const { runtime, schedule } = this.#ready();
     const transactions: WebGpuResidentSubmissionV1[] = [];
@@ -292,7 +293,7 @@ class ResidentWebGpuTrainingAdapter implements WebTrainingAdapterV1 {
       transactions.push(transaction);
       firstUniformSlot += transaction.commands.length;
     }
-    await runtime.dispatchTransactions(transactions, clears);
+    await runtime.dispatchTransactions(transactions, clears, signal);
   }
 
   async forward(
@@ -309,13 +310,18 @@ class ResidentWebGpuTrainingAdapter implements WebTrainingAdapterV1 {
       plan.operations
         .filter((operation) => !operation.operation.startsWith("optimizer."))
         .map((operation) => operation.id),
+      undefined,
+      [],
+      signal,
     );
     const lossOperation = [...plan.operations].reverse().find((operation) =>
       operation.operation.startsWith("loss."),
     );
     const lossId = lossOperation?.outputs[0];
     if (lossId === undefined) fail("invalid_schema", "compiled plan has no loss output");
-    const lossBytes = await runtime.read(lossId);
+    const lossBytes = await cancellable(
+      () => runtime.read(lossId), signal, "forward loss read",
+    );
     if (lossBytes.byteLength !== 4) fail("invalid_schema", "loss output is not scalar f32");
     const loss = new DataView(
       lossBytes.buffer, lossBytes.byteOffset, lossBytes.byteLength,
@@ -341,6 +347,7 @@ class ResidentWebGpuTrainingAdapter implements WebTrainingAdapterV1 {
       .map((buffer) => buffer.id);
     await this.#dispatch(
       "backward", plan.backwardOperations.map((operation) => operation.id), undefined, clears,
+      signal,
     );
     return receipt(
       this.capabilities, "session.backward", this.#completedSteps, schedule.peakBytes(),
@@ -357,6 +364,8 @@ class ResidentWebGpuTrainingAdapter implements WebTrainingAdapterV1 {
         .filter((operation) => operation.operation.startsWith("optimizer."))
         .map((operation) => operation.id),
       nextStep,
+      [],
+      signal,
     );
     this.#completedSteps = nextStep;
     return receipt(this.capabilities, "session.step", nextStep, schedule.peakBytes());

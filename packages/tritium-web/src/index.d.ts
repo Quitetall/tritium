@@ -405,9 +405,12 @@ export interface WebBinaryResultV1 {
 
 /** Low-level generated adapter. `validate` is allocation-free; neither
  * `validate` nor `prepare` may mutate or retain their arguments. Recoverable
- * typed rejections happen before mutation. Cancellation
- * must roll back partial writes before rejecting with `cancelled`; device loss
- * rejects with `device_lost` and is terminal.
+ * typed rejections happen before committed-state mutation. Cancellation after
+ * phase submission must preserve parameter and optimizer owners and permit an
+ * exact retry from the last public state. Transient batch, activation, result,
+ * and gradient owners may be discarded only when retry deterministically
+ * reconstructs them before observation. Device loss rejects with `device_lost`
+ * and is terminal.
  */
 export interface WebTrainingAdapterV1 {
   readonly capabilities: WebTrainingCapabilitiesV1;
@@ -664,6 +667,8 @@ export declare class WebGpuResidentRuntimeV1 {
   dispatchTransactions(
     transactions: readonly WebGpuResidentSubmissionV1[],
     clearBufferIds?: readonly string[],
+    /** Defers explicit commit copies until submitted compute completes uncancelled. */
+    signal?: AbortSignal | null,
   ): Promise<void>;
   write(bufferId: string, bytes: Uint8Array): void;
   read(bufferId: string): Promise<Uint8Array>;
