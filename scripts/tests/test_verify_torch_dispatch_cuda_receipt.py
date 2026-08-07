@@ -112,6 +112,12 @@ def validate_fixture(receipt: Path, wheel: Path, value: dict[str, object]):
 
 
 class VerifyTorchDispatchCudaReceiptTests(unittest.TestCase):
+    def test_contract_includes_compiled_autocast_backward_gate(self):
+        self.assertIn(
+            "test_native_cuda_compiled_autocast_preserves_master_cache_and_backward",
+            CUDA_TESTS,
+        )
+
     def test_accepts_exact_physical_cuda_receipt(self):
         with tempfile.TemporaryDirectory() as raw:
             receipt, wheel, expected = fixture(Path(raw))

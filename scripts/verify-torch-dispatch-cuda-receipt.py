@@ -18,6 +18,7 @@ import xml.etree.ElementTree as ET
 SCHEMA = "tritium.torch-dispatch-cuda-qualification.v1"
 SOURCE_PATH = "crates/tritium-py/tests/test_torch_dispatch.py"
 CUDA_TESTS = (
+    "test_native_cuda_compiled_autocast_preserves_master_cache_and_backward",
     "test_native_cuda_warm_forward_backward_avoids_composite_tensor_ops",
     "test_native_cuda_autocast_warm_forward_backward_uses_fp16_kernels",
     "test_native_cuda_fp16_tail_paths_for_memcheck",
