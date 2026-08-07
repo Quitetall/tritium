@@ -10,19 +10,26 @@ import os
 import re
 import runpy
 import shutil
+import subprocess
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 
 RELEASE_STATUS = runpy.run_path(Path(__file__).with_name("release-status"))
 ReleaseError = RELEASE_STATUS["ReleaseError"]
+ArtifactBinding = RELEASE_STATUS["ArtifactBinding"]
 candidate_validate = RELEASE_STATUS["validate"]
 file_identity = RELEASE_STATUS["_identity"]
 contained_file = RELEASE_STATUS["_file"]
 sha256_file = RELEASE_STATUS["_sha256"]
 validate_sbom = RELEASE_STATUS["_validate_sbom"]
 json_file = RELEASE_STATUS["_json_file"]
+BUNDLE_SBOM = runpy.run_path(Path(__file__).with_name("generate-bundle-sbom.py"))
+BUNDLE_KINDS = BUNDLE_SBOM["KINDS"]
+BundleSbomError = BUNDLE_SBOM["BundleSbomError"]
+generate_bundle_sbom = BUNDLE_SBOM["generate"]
+write_bundle_sbom = BUNDLE_SBOM["write_sbom"]
 
 INPUT_SCHEMA = "tritium.release-inputs.v1"
 ENTRY_SCHEMA = "tritium.release-candidate.v1"
@@ -56,10 +63,37 @@ def _canonical(value: Any) -> bytes:
 
 
 def _write_fsynced(path: Path, payload: bytes) -> None:
-    with path.open("xb") as stream:
-        stream.write(payload)
-        stream.flush()
-        os.fsync(stream.fileno())
+    created = False
+    try:
+        with path.open("xb") as stream:
+            created = True
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except BaseException:
+        if created:
+            path.unlink(missing_ok=True)
+        raise
+
+
+def _new_contained_file(root: Path, value: str, label: str) -> Path:
+    logical = PurePosixPath(value)
+    if (
+        logical.is_absolute()
+        or not logical.parts
+        or ".." in logical.parts
+        or "\\" in value
+    ):
+        raise ReleaseError(f"{label} must be a contained POSIX path")
+    cursor = root
+    for part in logical.parts[:-1]:
+        cursor /= part
+        if cursor.is_symlink() or not cursor.is_dir():
+            raise ReleaseError(f"{label} parent must be an ordinary directory")
+    output = cursor / logical.parts[-1]
+    if output.exists() or output.is_symlink():
+        raise ReleaseError(f"{label} output already exists")
+    return output
 
 
 def _fsync_directory(path: Path) -> None:
@@ -134,58 +168,105 @@ def assemble(inputs: Path, output: Path, digest_tool: str) -> dict[str, Any]:
 
     manifest_artifacts = []
     provenance_payloads: list[tuple[str, bytes]] = []
-    for artifact in artifacts:
-        artifact_path = contained_file(root, artifact["path"], f"{artifact['id']}.path")
-        sbom_path = contained_file(root, artifact["sbom"], f"{artifact['id']}.sbom")
-        sbom = json_file(sbom_path, f"{artifact['id']}.sbom")
-        validate_sbom(sbom, artifact["id"], sbom_path.name)
-        identity = file_identity(artifact_path, digest_tool)
-        provenance_relative = f"provenance/{artifact['id']}.intoto.json"
-        provenance = {
-            "_type": "https://in-toto.io/Statement/v1",
-            "predicateType": "https://slsa.dev/provenance/v1",
-            "subject": [
-                {
-                    "digest": {"sha256": identity["sha256"]},
-                    "name": artifact["path"],
-                }
-            ],
-            "predicate": {
-                "buildDefinition": {
-                    "buildType": builder["build_type"],
-                    "externalParameters": {
-                        "artifact_id": artifact["id"],
-                        "artifact_kind": artifact["kind"],
-                        "release": release,
-                        "source_revision": revision,
+    generated_sboms: list[Path] = []
+    try:
+        for artifact in artifacts:
+            artifact_path = contained_file(root, artifact["path"], f"{artifact['id']}.path")
+            requested_sbom = root / PurePosixPath(artifact["sbom"])
+            generated_here = False
+            if (
+                artifact["kind"] in BUNDLE_KINDS
+                and not requested_sbom.exists()
+                and not requested_sbom.is_symlink()
+            ):
+                sbom_output = _new_contained_file(
+                    root, artifact["sbom"], f"{artifact['id']}.sbom"
+                )
+                try:
+                    generated = generate_bundle_sbom(
+                        artifact_path,
+                        artifact["id"],
+                        artifact["kind"],
+                        revision,
+                        digest_tool,
+                    )
+                    write_bundle_sbom(generated, sbom_output)
+                except (OSError, BundleSbomError, subprocess.SubprocessError) as error:
+                    raise ReleaseError(
+                        f"cannot generate {artifact['id']} bundle SBOM: {error}"
+                    ) from error
+                generated_sboms.append(sbom_output)
+                generated_here = True
+            sbom_path = contained_file(root, artifact["sbom"], f"{artifact['id']}.sbom")
+            sbom = json_file(sbom_path, f"{artifact['id']}.sbom")
+            identity = file_identity(artifact_path, digest_tool)
+            if not generated_here:
+                validate_sbom(
+                    sbom,
+                    artifact["id"],
+                    sbom_path.name,
+                    binding=ArtifactBinding(
+                        filename=artifact_path.name,
+                        bytes=identity["bytes"],
+                        sha256=identity["sha256"],
+                        kind=artifact["kind"],
+                        path=artifact_path,
+                        source_revision=revision,
+                        digest_tool=digest_tool,
+                    ),
+                )
+            provenance_relative = f"provenance/{artifact['id']}.intoto.json"
+            provenance = {
+                "_type": "https://in-toto.io/Statement/v1",
+                "predicateType": "https://slsa.dev/provenance/v1",
+                "subject": [
+                    {
+                        "digest": {"sha256": identity["sha256"]},
+                        "name": artifact["path"],
+                    }
+                ],
+                "predicate": {
+                    "buildDefinition": {
+                        "buildType": builder["build_type"],
+                        "externalParameters": {
+                            "artifact_id": artifact["id"],
+                            "artifact_kind": artifact["kind"],
+                            "release": release,
+                            "source_revision": revision,
+                        },
+                        "internalParameters": {},
+                        "resolvedDependencies": [],
                     },
-                    "internalParameters": {},
-                    "resolvedDependencies": [],
-                },
-                "runDetails": {
-                    "builder": {"id": builder["id"]},
-                    "metadata": {"invocationId": builder["invocation_id"]},
-                },
-            },
-        }
-        provenance_payload = _canonical(provenance)
-        provenance_payloads.append((f"{artifact['id']}.intoto.json", provenance_payload))
-        manifest_artifacts.append(
-            {
-                "id": artifact["id"],
-                "kind": artifact["kind"],
-                "path": artifact["path"],
-                "identity": identity,
-                "sbom": {
-                    "path": sbom_path.relative_to(root).as_posix(),
-                    "sha256": sha256_file(sbom_path),
-                },
-                "provenance": {
-                    "path": provenance_relative,
-                    "sha256": hashlib.sha256(provenance_payload).hexdigest(),
+                    "runDetails": {
+                        "builder": {"id": builder["id"]},
+                        "metadata": {"invocationId": builder["invocation_id"]},
+                    },
                 },
             }
-        )
+            provenance_payload = _canonical(provenance)
+            provenance_payloads.append(
+                (f"{artifact['id']}.intoto.json", provenance_payload)
+            )
+            manifest_artifacts.append(
+                {
+                    "id": artifact["id"],
+                    "kind": artifact["kind"],
+                    "path": artifact["path"],
+                    "identity": identity,
+                    "sbom": {
+                        "path": sbom_path.relative_to(root).as_posix(),
+                        "sha256": sha256_file(sbom_path),
+                    },
+                    "provenance": {
+                        "path": provenance_relative,
+                        "sha256": hashlib.sha256(provenance_payload).hexdigest(),
+                    },
+                }
+            )
+    except Exception:
+        for path in generated_sboms:
+            path.unlink(missing_ok=True)
+        raise
 
     manifest = {
         "schema": ENTRY_SCHEMA,
@@ -212,6 +293,8 @@ def assemble(inputs: Path, output: Path, digest_tool: str) -> dict[str, Any]:
             output.unlink(missing_ok=True)
         if published_provenance:
             shutil.rmtree(provenance_target, ignore_errors=True)
+        for path in generated_sboms:
+            path.unlink(missing_ok=True)
         _fsync_directory(root)
         raise
 

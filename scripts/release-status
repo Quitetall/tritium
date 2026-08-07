@@ -12,6 +12,7 @@ import runpy
 import subprocess
 import sys
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -25,10 +26,25 @@ REFERENCE_FIELDS = {"path", "sha256"}
 HEX = frozenset("0123456789abcdef")
 MAX_METADATA_BYTES = 32 * 1024 * 1024
 RC_PATTERN = re.compile(r"1\.1\.0-rc\.(0|[1-9][0-9]*)")
+BUNDLE_SBOM = runpy.run_path(Path(__file__).with_name("generate-bundle-sbom.py"))
+BUNDLE_KINDS = BUNDLE_SBOM["KINDS"]
+BundleSbomError = BUNDLE_SBOM["BundleSbomError"]
+generate_bundle_sbom = BUNDLE_SBOM["generate"]
 
 
 class ReleaseError(ValueError):
     """Candidate evidence is incomplete, mutable, or contradictory."""
+
+
+@dataclass(frozen=True)
+class ArtifactBinding:
+    filename: str
+    bytes: int
+    sha256: str
+    kind: str
+    path: Path
+    source_revision: str
+    digest_tool: str
 
 
 def _object(value: Any, label: str) -> dict[str, Any]:
@@ -148,22 +164,92 @@ def _reference(value: Any, root: Path, label: str) -> tuple[Path, dict[str, Any]
     return path, _json_file(path, label)
 
 
-def _validate_sbom(value: dict[str, Any], artifact_id: str, label: str) -> None:
+def _validate_sbom(
+    value: dict[str, Any],
+    artifact_id: str,
+    label: str,
+    *,
+    binding: ArtifactBinding | None = None,
+) -> None:
     if value.get("bomFormat") == "CycloneDX" and isinstance(
         value.get("specVersion"), str
     ):
         metadata = _object(value.get("metadata"), f"{label}.metadata")
         component = _object(metadata.get("component"), f"{label}.component")
         bound_id = component.get("bom-ref")
+        if binding is not None:
+            hashes = component.get("hashes")
+            if not isinstance(hashes, list) or hashes != [
+                {"alg": "SHA-256", "content": binding.sha256}
+            ]:
+                raise ReleaseError(f"{label} does not bind exact artifact SHA-256")
+            properties = component.get("properties")
+            if not isinstance(properties, list):
+                raise ReleaseError(f"{label} root properties are absent")
+            observed: dict[str, str] = {}
+            for ordinal, raw in enumerate(properties):
+                item = _object(raw, f"{label}.component.properties[{ordinal}]")
+                if set(item) != {"name", "value"}:
+                    raise ReleaseError(f"{label} root property fields are not canonical")
+                name = _string(item.get("name"), f"{label} root property name")
+                value_text = _string(item.get("value"), f"{label} root property value")
+                if name in observed:
+                    raise ReleaseError(f"{label} has duplicate root property {name!r}")
+                observed[name] = value_text
+            if observed.get("tritium:artifact:file") != binding.filename:
+                raise ReleaseError(f"{label} does not bind exact artifact filename")
+            if observed.get("tritium:artifact:bytes") != str(binding.bytes):
+                raise ReleaseError(f"{label} does not bind exact artifact byte count")
     elif (
         isinstance(value.get("spdxVersion"), str)
         and value.get("SPDXID") == "SPDXRef-DOCUMENT"
     ):
         bound_id = value.get("name")
+        if binding is not None:
+            packages = value.get("packages")
+            described = value.get("documentDescribes")
+            if (
+                not isinstance(packages, list)
+                or len(packages) != 1
+                or not isinstance(described, list)
+                or len(described) != 1
+            ):
+                raise ReleaseError(f"{label} SPDX package binding is absent")
+            matching = []
+            for ordinal, raw in enumerate(packages):
+                package = _object(raw, f"{label}.packages[{ordinal}]")
+                checksums = package.get("checksums")
+                if (
+                    package.get("SPDXID") in described
+                    and package.get("packageFileName") == binding.filename
+                    and checksums
+                    == [
+                        {
+                            "algorithm": "SHA256",
+                            "checksumValue": binding.sha256,
+                        }
+                    ]
+                ):
+                    matching.append(package)
+            if len(matching) != 1:
+                raise ReleaseError(f"{label} does not bind one exact SPDX artifact package")
     else:
         raise ReleaseError(f"{label} is neither a CycloneDX nor SPDX document")
     if bound_id != artifact_id:
         raise ReleaseError(f"{label} does not bind artifact id {artifact_id!r}")
+    if binding is not None and binding.kind in BUNDLE_KINDS:
+        try:
+            expected = generate_bundle_sbom(
+                binding.path,
+                artifact_id,
+                binding.kind,
+                binding.source_revision,
+                binding.digest_tool,
+            )
+        except (OSError, BundleSbomError, subprocess.SubprocessError) as error:
+            raise ReleaseError(f"{label} bundle inventory is invalid: {error}") from error
+        if value != expected:
+            raise ReleaseError(f"{label} is not the canonical bundle inventory")
 
 
 def _validate_provenance(
@@ -217,7 +303,7 @@ def validate(candidate: Path, digest_tool: str) -> dict[str, Any]:
         artifact = _object(raw, label)
         _exact(artifact, ARTIFACT_FIELDS, label)
         artifact_id = _string(artifact["id"], f"{label}.id")
-        _string(artifact["kind"], f"{label}.kind")
+        artifact_kind = _string(artifact["kind"], f"{label}.kind")
         artifact_path = _string(artifact["path"], f"{label}.path")
         if artifact_id in ids or artifact_path in paths:
             raise ReleaseError("candidate artifact ids and paths must be unique")
@@ -238,7 +324,20 @@ def validate(candidate: Path, digest_tool: str) -> dict[str, Any]:
             raise ReleaseError(f"{label}.identity does not match {artifact_path}")
         sbom_path, sbom = _reference(artifact["sbom"], root, f"{label}.sbom")
         admitted_files.add(sbom_path.relative_to(root).as_posix())
-        _validate_sbom(sbom, artifact_id, sbom_path.name)
+        _validate_sbom(
+            sbom,
+            artifact_id,
+            sbom_path.name,
+            binding=ArtifactBinding(
+                filename=path.name,
+                bytes=expected["bytes"],
+                sha256=expected["sha256"],
+                kind=artifact_kind,
+                path=path,
+                source_revision=revision,
+                digest_tool=digest_tool,
+            ),
+        )
         provenance_path, provenance = _reference(
             artifact["provenance"], root, f"{label}.provenance"
         )

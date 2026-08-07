@@ -4,6 +4,9 @@ import runpy
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
+
+from scripts.tests.test_release_status import bundle_fixture
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -46,7 +49,21 @@ def candidate_fixture(base: Path, *, corrupt_sbom: bool = False) -> tuple[Path, 
         sbom = {
             "bomFormat": "CycloneDX",
             "specVersion": "1.6",
-            "metadata": {"component": {"bom-ref": artifact_id}},
+            "metadata": {
+                "component": {
+                    "bom-ref": artifact_id,
+                    "hashes": [
+                        {
+                            "alg": "SHA-256",
+                            "content": hashlib.sha256(payload).hexdigest(),
+                        }
+                    ],
+                    "properties": [
+                        {"name": "tritium:artifact:file", "value": filename},
+                        {"name": "tritium:artifact:bytes", "value": str(len(payload))},
+                    ],
+                }
+            },
         }
         if corrupt_sbom and artifact_id == "cpu-wheel":
             sbom["metadata"]["component"]["bom-ref"] = "wrong"
@@ -72,7 +89,66 @@ def candidate_fixture(base: Path, *, corrupt_sbom: bool = False) -> tuple[Path, 
     return candidate, descriptor, fake_tool(base)
 
 
+def missing_bundle_fixture(base: Path) -> tuple[Path, Path, Path]:
+    candidate_manifest, tool, document = bundle_fixture(base)
+    candidate = candidate_manifest.parent
+    candidate_manifest.unlink()
+    (candidate / "onnx.cdx.json").unlink()
+    (candidate / "onnx.provenance.json").unlink()
+    inputs = base / "inputs.json"
+    write_json(
+        inputs,
+        {
+            "schema": "tritium.release-inputs.v1",
+            "release": document["release"],
+            "source_revision": document["source_revision"],
+            "builder": {
+                "id": "test-builder",
+                "build_type": "test-build",
+                "invocation_id": "test-run",
+            },
+            "artifacts": [
+                {
+                    "id": "qwen-onnx",
+                    "kind": "onnx-bundle",
+                    "path": "onnx.tar",
+                    "sbom": "onnx.cdx.json",
+                }
+            ],
+        },
+    )
+    return candidate, inputs, tool
+
+
 class AssembleReleaseCandidateTests(unittest.TestCase):
+    def test_assembly_generates_missing_canonical_bundle_sbom(self):
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            candidate, inputs, tool = missing_bundle_fixture(base)
+            output = candidate / "manifest.json"
+            manifest = assemble(inputs, output, str(tool))
+            sbom = json.loads((candidate / "onnx.cdx.json").read_text())
+            self.assertEqual(len(sbom["components"]), 4)
+            self.assertEqual(candidate_validate(output, str(tool)), manifest)
+
+    def test_failed_assembly_removes_generated_bundle_sbom(self):
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            candidate, inputs, tool = missing_bundle_fixture(base)
+            source = tool.read_text()
+            tool.write_text(
+                source.replace(
+                    "else:\n p=pathlib.Path(sys.argv[3]); b=p.read_bytes()",
+                    "else:\n raise SystemExit(9)",
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ReleaseError, "digest tool failed"):
+                assemble(inputs, candidate / "manifest.json", str(tool))
+            self.assertFalse((candidate / "onnx.cdx.json").exists())
+            self.assertFalse((candidate / "manifest.json").exists())
+            self.assertFalse((candidate / "provenance").exists())
+
     def test_assembly_is_sorted_deterministic_and_strictly_reloadable(self):
         manifests = []
         for ordinal in range(2):
@@ -126,6 +202,26 @@ class AssembleReleaseCandidateTests(unittest.TestCase):
             tool.chmod(0o755)
             with self.assertRaisesRegex(ReleaseError, "identity does not match"):
                 assemble(inputs, candidate / "manifest.json", str(tool))
+            self.assertFalse((candidate / "manifest.json").exists())
+            self.assertFalse((candidate / "provenance").exists())
+
+    def test_manifest_fsync_failure_leaves_no_partial_manifest(self):
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            candidate, inputs, tool = candidate_fixture(base)
+            calls = 0
+            original_fsync = MODULE["os"].fsync
+
+            def fail_manifest_fsync(descriptor):
+                nonlocal calls
+                calls += 1
+                if calls == 5:
+                    raise OSError("manifest sync failed")
+                return original_fsync(descriptor)
+
+            with mock.patch.object(MODULE["os"], "fsync", fail_manifest_fsync):
+                with self.assertRaisesRegex(OSError, "manifest sync failed"):
+                    assemble(inputs, candidate / "manifest.json", str(tool))
             self.assertFalse((candidate / "manifest.json").exists())
             self.assertFalse((candidate / "provenance").exists())
 

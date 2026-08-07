@@ -11,9 +11,13 @@ second-machine gates remain separate.
 
 Place exact unpublished payloads and their generated SBOMs below the ignored
 `release/v1.1/` directory. Every CycloneDX SBOM must set
-`metadata.component.bom-ref` to the artifact ID used below. SPDX documents use
-their document `name` as the artifact ID. Inputs live outside the candidate
-directory because candidate admission rejects every unmanifested file.
+`metadata.component.bom-ref` to the artifact ID used below. Its root component
+must also bind the exact artifact filename, byte count and SHA-256 through
+`tritium:artifact:file`, `tritium:artifact:bytes` and `hashes`. SPDX documents
+use their document `name` as the artifact ID and must describe exactly one
+package whose `packageFileName` and SHA256 checksum bind the artifact. Inputs
+live outside the candidate directory because candidate admission rejects every
+unmanifested file.
 
 ```json
 {
@@ -52,7 +56,10 @@ scripts/release-status \
 Assembly sorts artifacts by ID, streams SHA-256/BLAKE3 through shipped CLI,
 writes canonical in-toto/SLSA v1 statements, fsyncs data and directories, then
 strictly reloads generated candidate. It never overwrites existing manifest or
-provenance. Failure removes newly published metadata.
+provenance. For `model-bundle` and `onnx-bundle` inputs, a missing named SBOM is
+generated before provenance publication; a supplied SBOM must reproduce the
+same canonical inventory exactly. Failure removes every SBOM and metadata file
+created by that assembly attempt.
 
 Verification requires:
 
@@ -64,6 +71,29 @@ Verification requires:
 - digest-bound CycloneDX/SPDX SBOM tied to exact artifact ID;
 - digest-bound in-toto/SLSA v1 provenance tied to artifact SHA-256, source
   revision and builder identity.
+
+Canonical flat `model-bundle` and `onnx-bundle` tar archives get complete member
+inventories through `scripts/generate-bundle-sbom.py`. Canonical input uses
+POSIX ustar as `.tar` or one zstd-compressed `.tar.zst`/`.tzst`; auto-detected
+or mislabeled compression is rejected. The generator rejects
+links, symlinked or replaced parent paths, directories, path traversal,
+duplicate portable names, unexpected files, nonzero trailing payload,
+manifest byte-ledger/digest drift and source mutation. Each member is streamed
+through `tritium release digest-stream`; ONNX BLAKE3 values and model profile,
+preserved-tensor and Hugging Face package IDs must match exact archived bytes.
+Lineage authority comes from the separate ONNX inference qualification receipt;
+the SBOM generator does not promote self-described lineage strings to evidence.
+`.tar.zst` requires the `zstd` decoder. Example:
+
+```bash
+python scripts/generate-bundle-sbom.py \
+  --artifact release/v1.1/qwen-onnx.tar.zst \
+  --artifact-id qwen-onnx \
+  --kind onnx-bundle \
+  --source-revision "$(git rev-parse HEAD)" \
+  --digest-tool target/release/tritium \
+  --output release/v1.1/qwen-onnx.cdx.json
+```
 
 ## Aggregate evidence status
 
