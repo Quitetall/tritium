@@ -450,6 +450,12 @@ impl TrainingSaltLinear {
         self.planes
     }
 
+    /// Plane-major scale storage. The first `rows()` entries are the current
+    /// first-plane AbsMean scales produced from the latent master.
+    pub(crate) fn scales(&self) -> &CudaSlice<f32> {
+        &self.scales
+    }
+
     /// Compact 2-bit code payload bytes, excluding external scales.
     pub(crate) fn packed_bytes(&self) -> usize {
         self.codes.len()

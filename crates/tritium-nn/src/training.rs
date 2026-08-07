@@ -1044,6 +1044,169 @@ pub struct ResidentTrainingForward {
     pub master_leaves: Vec<usize>,
 }
 
+/// Outputs from one dense HESTIA device forward graph.
+#[cfg(feature = "cuda")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HestiaTrainingForward {
+    /// DeviceTape value id for `[sequence, vocabulary]` logits.
+    pub logits: usize,
+    /// Borrowed latent-master leaf ids in canonical parameter order.
+    pub master_leaves: Vec<usize>,
+}
+
+#[cfg(feature = "cuda")]
+fn dense_device_forward_with<'backend, 'leaf, F>(
+    tape: &mut tritium_cuda::train::DeviceTape<'backend, 'leaf>,
+    model: &TiedSwiGluTrainingModel,
+    tokens: &[i32],
+    mut weight: F,
+) -> Result<usize, TrainingAdapterError>
+where
+    F: FnMut(
+        &mut tritium_cuda::train::DeviceTape<'backend, 'leaf>,
+        usize,
+    ) -> Result<usize, TrainingAdapterError>,
+{
+    let arch = &model.arch;
+    let sequence = tokens.len();
+    let embedding = weight(tape, 0)?;
+    let mut hidden = tape.embed(embedding, tokens, sequence, arch.n_embd, arch.vocab)?;
+    for layer_index in 0..arch.n_layers {
+        let base = 1 + 7 * layer_index;
+        let constants = &arch.attention_constants[layer_index];
+        let attn_norm = tape.leaf(&arch.attn_norms[layer_index])?;
+        let normalized = tape.rmsnorm(hidden, attn_norm, sequence, arch.n_embd, arch.rms_eps)?;
+        let q = weight(tape, base)?;
+        let k = weight(tape, base + 1)?;
+        let v = weight(tape, base + 2)?;
+        let o = weight(tape, base + 3)?;
+        let attention = tape.attention_with_fixed(
+            normalized,
+            q,
+            k,
+            v,
+            o,
+            sequence,
+            arch.n_embd,
+            arch.n_head,
+            arch.n_head_kv,
+            arch.head_dim,
+            arch.rope_theta,
+            tritium_cuda::train::FixedAttentionParameters {
+                q_bias: &constants.q_bias,
+                k_bias: &constants.k_bias,
+                v_bias: &constants.v_bias,
+                q_norm: &constants.q_norm,
+                k_norm: &constants.k_norm,
+                rms_eps: arch.rms_eps,
+            },
+        )?;
+        hidden = tape.add(hidden, attention)?;
+
+        let ffn_norm = tape.leaf(&arch.ffn_norms[layer_index])?;
+        let normalized = tape.rmsnorm(hidden, ffn_norm, sequence, arch.n_embd, arch.rms_eps)?;
+        let gate_weight = weight(tape, base + 4)?;
+        let up_weight = weight(tape, base + 5)?;
+        let down_weight = weight(tape, base + 6)?;
+        let gate = tape.matmul(normalized, gate_weight, sequence, arch.n_ff, arch.n_embd)?;
+        let up = tape.matmul(normalized, up_weight, sequence, arch.n_ff, arch.n_embd)?;
+        let activated_gate = tape.silu(gate)?;
+        let gated = tape.mul(activated_gate, up)?;
+        let down = tape.matmul(gated, down_weight, sequence, arch.n_embd, arch.n_ff)?;
+        hidden = tape.add(hidden, down)?;
+        tape.checkpoint_keep(&[hidden])?;
+    }
+
+    let output_norm = tape.leaf(&arch.output_norm)?;
+    let normalized = tape.rmsnorm(hidden, output_norm, sequence, arch.n_embd, arch.rms_eps)?;
+    let head = model.lm_head_parameter_index();
+    let head_weight = weight(tape, head)?;
+    tape.matmul(normalized, head_weight, sequence, arch.vocab, arch.n_embd)
+        .map_err(TrainingAdapterError::from)
+}
+
+/// Build a differentiable HESTIA SwiGLU forward from resident latent masters.
+///
+/// Each master is relaxed with its packed SALT handle's current first-plane
+/// AbsMean scale, then consumed by dense training ops. Projections are created
+/// inside their checkpoint segment; a tied output head reprojects the same
+/// master so gradients still accumulate into one leaf without retaining a
+/// vocabulary-sized dense activation. All inputs are validated before the tape
+/// changes.
+///
+/// # Errors
+/// Returns [`TrainingAdapterError::InvalidInput`] for token, temperature, or
+/// packed-model disagreement, [`TrainingAdapterError::TensorShape`] for resident
+/// parameter disagreement, and [`TrainingAdapterError::Backend`] for device errors.
+#[cfg(feature = "cuda")]
+pub fn hestia_device_forward<'backend, 'leaf>(
+    tape: &mut tritium_cuda::train::DeviceTape<'backend, 'leaf>,
+    model: &TiedSwiGluTrainingModel,
+    masters: &[&'leaf tritium_cuda::train::DeviceTensor],
+    packed: &'leaf [tritium_cuda::train::DevicePackedSaltWeight],
+    temperatures: &[f32],
+    tokens: &[i32],
+) -> Result<HestiaTrainingForward, TrainingAdapterError> {
+    let arch = &model.arch;
+    validate_training_tokens(arch, tokens)?;
+    validate_runtime_architecture(arch)?;
+    let expected = model.parameters.len();
+    for (name, got) in [
+        ("resident HESTIA parameter count", masters.len()),
+        ("packed HESTIA parameter count", packed.len()),
+        ("HESTIA temperature count", temperatures.len()),
+    ] {
+        if got != expected {
+            return Err(tensor_mismatch(name, expected, got));
+        }
+    }
+    for (index, parameter) in model.parameters.iter().enumerate() {
+        let master = masters[index];
+        let weight = &packed[index];
+        tape.validate_device_tensor(master)?;
+        if master.len() != parameter.elements() {
+            return Err(tensor_mismatch(
+                &format!("resident HESTIA {}", parameter.name),
+                parameter.elements(),
+                master.len(),
+            ));
+        }
+        if weight.rows() != parameter.rows || weight.cols() != parameter.cols {
+            return Err(invalid_input(&format!(
+                "packed HESTIA {} is [{}, {}], expected [{}, {}]",
+                parameter.name,
+                weight.rows(),
+                weight.cols(),
+                parameter.rows,
+                parameter.cols
+            )));
+        }
+        weight.validate_current_master(master)?;
+        let tau = temperatures[index];
+        if !tau.is_finite() || tau < tritium_train::ops::hestia::MIN_DIFFERENTIABLE_TAU {
+            return Err(invalid_input(&format!(
+                "HESTIA temperature for {} must be finite and at least {}",
+                parameter.name,
+                tritium_train::ops::hestia::MIN_DIFFERENTIABLE_TAU
+            )));
+        }
+    }
+
+    let master_leaves = masters
+        .iter()
+        .map(|master| tape.leaf_device(master).map_err(TrainingAdapterError::from))
+        .collect::<Result<Vec<_>, _>>()?;
+    let logits = dense_device_forward_with(tape, model, tokens, |tape, index| {
+        let tau = tape.leaf(&[temperatures[index]])?;
+        tape.hestia_relax_packed(master_leaves[index], masters[index], &packed[index], tau)
+            .map_err(TrainingAdapterError::from)
+    })?;
+    Ok(HestiaTrainingForward {
+        logits,
+        master_leaves,
+    })
+}
+
 /// Build the SwiGLU packed-SALT forward on a CUDA
 /// [`DeviceTape`](tritium_cuda::train::DeviceTape).
 ///
@@ -1199,64 +1362,7 @@ pub fn resident_device_forward<'backend, 'leaf>(
         .iter()
         .map(|weight| tape.leaf_device(weight).map_err(TrainingAdapterError::from))
         .collect::<Result<Vec<_>, _>>()?;
-    let sequence = tokens.len();
-    let mut hidden = tape.embed(masters[0], tokens, sequence, arch.n_embd, arch.vocab)?;
-
-    for layer_index in 0..arch.n_layers {
-        let base = 1 + 7 * layer_index;
-        let constants = &arch.attention_constants[layer_index];
-        let attn_norm = tape.leaf(&arch.attn_norms[layer_index])?;
-        let normalized = tape.rmsnorm(hidden, attn_norm, sequence, arch.n_embd, arch.rms_eps)?;
-        let attention = tape.attention_with_fixed(
-            normalized,
-            masters[base],
-            masters[base + 1],
-            masters[base + 2],
-            masters[base + 3],
-            sequence,
-            arch.n_embd,
-            arch.n_head,
-            arch.n_head_kv,
-            arch.head_dim,
-            arch.rope_theta,
-            tritium_cuda::train::FixedAttentionParameters {
-                q_bias: &constants.q_bias,
-                k_bias: &constants.k_bias,
-                v_bias: &constants.v_bias,
-                q_norm: &constants.q_norm,
-                k_norm: &constants.k_norm,
-                rms_eps: arch.rms_eps,
-            },
-        )?;
-        hidden = tape.add(hidden, attention)?;
-
-        let ffn_norm = tape.leaf(&arch.ffn_norms[layer_index])?;
-        let normalized = tape.rmsnorm(hidden, ffn_norm, sequence, arch.n_embd, arch.rms_eps)?;
-        let gate = tape.matmul(
-            normalized,
-            masters[base + 4],
-            sequence,
-            arch.n_ff,
-            arch.n_embd,
-        )?;
-        let up = tape.matmul(
-            normalized,
-            masters[base + 5],
-            sequence,
-            arch.n_ff,
-            arch.n_embd,
-        )?;
-        let activated_gate = tape.silu(gate)?;
-        let gated = tape.mul(activated_gate, up)?;
-        let down = tape.matmul(gated, masters[base + 6], sequence, arch.n_embd, arch.n_ff)?;
-        hidden = tape.add(hidden, down)?;
-        tape.checkpoint_keep(&[hidden])?;
-    }
-
-    let output_norm = tape.leaf(&arch.output_norm)?;
-    let normalized = tape.rmsnorm(hidden, output_norm, sequence, arch.n_embd, arch.rms_eps)?;
-    let head = model.lm_head_parameter_index();
-    let logits = tape.matmul(normalized, masters[head], sequence, arch.vocab, arch.n_embd)?;
+    let logits = dense_device_forward_with(tape, model, tokens, |_tape, index| Ok(masters[index]))?;
     Ok(ResidentTrainingForward {
         logits,
         master_leaves: masters,

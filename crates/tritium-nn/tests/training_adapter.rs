@@ -1000,6 +1000,294 @@ fn upload_packed_parameters(
 }
 
 #[cfg(feature = "cuda")]
+fn hestia_test_fixture() -> (ModelConfig, TiedSwiGluTrainingModel) {
+    let mut config = config();
+    config.n_layers = 1;
+    let mut source = weights();
+    source.layers.truncate(1);
+    source.token_embd = TokenEmbedding::from_dense(
+        (0..source.vocab * source.n_embd)
+            .map(|index| (((index * 5 + 3) % 17) as f32 - 8.0) / 16.0)
+            .collect(),
+        source.vocab,
+        source.n_embd,
+    )
+    .unwrap();
+    source.output_norm = vec![0.875, 1.125, 0.75, 1.25];
+    let layer = &mut source.layers[0];
+    layer.attn_norm = vec![1.0, 0.75, 1.25, 0.875];
+    layer.ffn_norm = vec![0.875, 1.125, 1.0, 0.75];
+    layer.q_proj = patterned_dense(4, 4, 1);
+    layer.k_proj = patterned_dense(2, 4, 2);
+    layer.v_proj = patterned_dense(2, 4, 3);
+    layer.o_proj = patterned_dense(4, 4, 4);
+    let Mlp::SwiGlu(mlp) = &mut layer.mlp else {
+        unreachable!("test fixture is SwiGLU")
+    };
+    mlp.gate = patterned_dense(6, 4, 5);
+    mlp.up = patterned_dense(6, 4, 6);
+    mlp.down = patterned_dense(4, 6, 7);
+    let model = TiedSwiGluTrainingModel::extract(&config, &spec(), &source).unwrap();
+    (config, model)
+}
+
+#[cfg(feature = "cuda")]
+fn cpu_hestia_logits(
+    config: &ModelConfig,
+    model: &TiedSwiGluTrainingModel,
+    masters: &[Vec<f32>],
+    scales: &[Vec<f32>],
+    temperatures: &[f32],
+    tokens: &[u32],
+) -> Vec<f32> {
+    use tritium_train::ops::hestia::hestia_forward;
+
+    let arch = model.architecture();
+    let relaxed: Vec<Vec<f32>> = model
+        .parameters()
+        .iter()
+        .zip(masters)
+        .zip(scales)
+        .zip(temperatures)
+        .map(|(((parameter, master), scale), &tau)| {
+            hestia_forward(master, scale, &[tau], parameter.rows, parameter.cols)
+        })
+        .collect();
+    let dense = |index: usize| {
+        let parameter = &model.parameters()[index];
+        Projection::Dense(
+            DenseLinear::new_exact(relaxed[index].clone(), parameter.rows, parameter.cols).unwrap(),
+        )
+    };
+    let build_weights = || {
+        let mut layers = Vec::with_capacity(arch.n_layers);
+        for layer_index in 0..arch.n_layers {
+            let base = 1 + 7 * layer_index;
+            layers.push(TransformerBlock {
+                attn_norm: arch.attn_norms[layer_index].clone(),
+                q_proj: dense(base),
+                k_proj: dense(base + 1),
+                v_proj: dense(base + 2),
+                o_proj: dense(base + 3),
+                attn_sub_norm: Vec::new(),
+                q_bias: Vec::new(),
+                k_bias: Vec::new(),
+                v_bias: Vec::new(),
+                q_norm: Vec::new(),
+                k_norm: Vec::new(),
+                ffn_norm: arch.ffn_norms[layer_index].clone(),
+                mlp: Mlp::SwiGlu(SwiGluMlp {
+                    gate: dense(base + 4),
+                    up: dense(base + 5),
+                    down: dense(base + 6),
+                }),
+            });
+        }
+        ModelWeights {
+            token_embd: TokenEmbedding::from_dense(relaxed[0].clone(), arch.vocab, arch.n_embd)
+                .unwrap(),
+            vocab: arch.vocab,
+            n_embd: arch.n_embd,
+            layers,
+            output_norm: arch.output_norm.clone(),
+            lm_head: None,
+        }
+    };
+    let mut logits = Vec::with_capacity(tokens.len() * arch.vocab);
+    for end in 1..=tokens.len() {
+        let mut runner = ModelRunner::from_weights(
+            config.clone(),
+            build_weights(),
+            Box::new(tritium_cpu::CpuBackend::new()),
+        );
+        let positions: Vec<_> = (0..end).collect();
+        logits.extend(runner.forward(&tokens[..end], &positions).unwrap());
+    }
+    logits
+}
+
+#[cfg(feature = "cuda")]
+fn mean_cross_entropy(logits: &[f32], target: &[f32], rows: usize, cols: usize) -> f32 {
+    logits
+        .chunks_exact(cols)
+        .zip(target.chunks_exact(cols))
+        .map(|(row, target_row)| {
+            let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let log_sum_exp = max
+                + row
+                    .iter()
+                    .map(|value| (*value - max).exp())
+                    .sum::<f32>()
+                    .ln();
+            target_row
+                .iter()
+                .zip(row)
+                .map(|(&probability, &logit)| probability * (log_sum_exp - logit))
+                .sum::<f32>()
+        })
+        .sum::<f32>()
+        / rows as f32
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn hestia_device_forward_matches_cpu_oracle_and_master_gradients() {
+    use tritium_cuda::train::{
+        CheckpointPolicy, DeviceTape, DeviceTensor, DeviceTrainParam, DeviceTrainer,
+        DeviceTrainerWeightStorage,
+    };
+    use tritium_nn::hestia_device_forward;
+    use tritium_train::{AdamW, ops::ste::absmean_scale_per_row};
+
+    let Some(backend) =
+        cuda_backend_or_skip("hestia_device_forward_matches_cpu_oracle_and_master_gradients")
+    else {
+        return;
+    };
+    let (config, model) = hestia_test_fixture();
+    let parameter_specs: Vec<_> = model
+        .parameters()
+        .iter()
+        .map(|parameter| DeviceTrainParam {
+            master: &parameter.master,
+            rows: parameter.rows,
+            cols: parameter.cols,
+            salt_planes: 2,
+            optimizer: AdamW::new(1e-3),
+        })
+        .collect();
+    let mut trainer = DeviceTrainer::new_with_weight_storage(
+        &backend,
+        &parameter_specs,
+        DeviceTrainerWeightStorage::Packed,
+    )
+    .unwrap();
+    let mut packed: Vec<_> = (0..model.parameters().len())
+        .map(|index| trainer.packed_weight(index).unwrap())
+        .collect();
+    let masters: Vec<_> = (0..model.parameters().len())
+        .map(|index| trainer.master_tensor(index).unwrap())
+        .collect();
+    let host_masters: Vec<_> = model
+        .parameters()
+        .iter()
+        .map(|parameter| parameter.master.clone())
+        .collect();
+    let scales: Vec<_> = model
+        .parameters()
+        .iter()
+        .map(|parameter| absmean_scale_per_row(&parameter.master, parameter.rows, parameter.cols))
+        .collect();
+    let temperatures: Vec<_> = model
+        .parameters()
+        .iter()
+        .enumerate()
+        .map(|(index, _)| 0.55 + index as f32 * 0.025)
+        .collect();
+    let tokens = [0_i32, 3];
+    let token_ids = [0_u32, 3];
+    let arch = model.architecture();
+
+    let foreign_master = DeviceTensor::upload(&backend, &host_masters[0]).unwrap();
+    let foreign_packed = tritium_cuda::train::DevicePackedSaltWeight::from_device_master(
+        &backend,
+        &foreign_master,
+        model.parameters()[0].rows,
+        model.parameters()[0].cols,
+        2,
+    )
+    .unwrap();
+    let original_packed = core::mem::replace(&mut packed[0], foreign_packed);
+    let mut rejected_tape = DeviceTape::new(&backend, arch.vocab.max(arch.n_ff)).unwrap();
+    let error = hestia_device_forward(
+        &mut rejected_tape,
+        &model,
+        &masters,
+        &packed,
+        &temperatures,
+        &tokens,
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("different resident master"),
+        "{error}"
+    );
+    packed[0] = original_packed;
+
+    let mut tape = DeviceTape::new_with_checkpoint_policy(
+        &backend,
+        arch.vocab.max(arch.n_ff),
+        CheckpointPolicy::SqrtDepth(arch.n_layers),
+    )
+    .unwrap();
+    let forward =
+        hestia_device_forward(&mut tape, &model, &masters, &packed, &temperatures, &tokens)
+            .unwrap();
+    let actual_logits = tape.value(forward.logits).unwrap();
+    let expected_logits = cpu_hestia_logits(
+        &config,
+        &model,
+        &host_masters,
+        &scales,
+        &temperatures,
+        &token_ids,
+    );
+    let forward_error = actual_logits
+        .iter()
+        .zip(&expected_logits)
+        .map(|(&actual, &expected)| (actual - expected).abs())
+        .fold(0.0_f32, f32::max);
+    assert!(
+        forward_error <= 2e-4,
+        "HESTIA forward error {forward_error:e}"
+    );
+
+    let mut target = vec![0.0; tokens.len() * arch.vocab];
+    target[1] = 1.0;
+    target[arch.vocab + 4] = 1.0;
+    let device_target = DeviceTensor::upload(&backend, &target).unwrap();
+    let gradients = tape
+        .xent_backward_device(
+            forward.logits,
+            &device_target,
+            tokens.len(),
+            arch.vocab,
+            &forward.master_leaves,
+        )
+        .unwrap();
+
+    let epsilon = 2e-3_f32;
+    let mut max_gradient_error = 0.0_f32;
+    for (parameter_index, parameter) in model.parameters().iter().enumerate() {
+        let actual = gradients.download(&backend, parameter_index).unwrap();
+        for element_index in 0..parameter.elements() {
+            let mut plus = host_masters.clone();
+            plus[parameter_index][element_index] += epsilon;
+            let plus_loss = mean_cross_entropy(
+                &cpu_hestia_logits(&config, &model, &plus, &scales, &temperatures, &token_ids),
+                &target,
+                tokens.len(),
+                arch.vocab,
+            );
+            let mut minus = host_masters.clone();
+            minus[parameter_index][element_index] -= epsilon;
+            let minus_loss = mean_cross_entropy(
+                &cpu_hestia_logits(&config, &model, &minus, &scales, &temperatures, &token_ids),
+                &target,
+                tokens.len(),
+                arch.vocab,
+            );
+            let expected = (plus_loss - minus_loss) / (2.0 * epsilon);
+            max_gradient_error = max_gradient_error.max((actual[element_index] - expected).abs());
+        }
+    }
+    assert!(
+        max_gradient_error <= 3e-3,
+        "HESTIA master-gradient error {max_gradient_error:e}"
+    );
+}
+
+#[cfg(feature = "cuda")]
 #[test]
 fn resident_qwen_attention_constants_match_cpu_and_packed_path_runs() {
     use tritium_cuda::train::{DeviceTape, DeviceTensor};

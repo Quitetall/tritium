@@ -26,7 +26,10 @@
 //! resident training engine.
 
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 use cudarc::cublaslt::{CudaBlasLT, Matmul, MatmulConfig};
 use cudarc::driver::{CudaSlice, CudaStream, PinnedHostSlice};
@@ -845,6 +848,11 @@ struct CheckpointSegment {
 /// contexts or mutate a tensor while a tape borrows it.
 pub struct DeviceTensor {
     buf: CudaSlice<f32>,
+    version: Arc<DeviceTensorVersion>,
+}
+
+struct DeviceTensorVersion {
+    generation: AtomicU64,
 }
 
 impl core::fmt::Debug for DeviceTensor {
@@ -861,6 +869,9 @@ impl DeviceTensor {
     pub fn upload(backend: &CudaBackend, host: &[f32]) -> Result<Self, BackendError> {
         Ok(Self {
             buf: backend.dev_upload(host)?,
+            version: Arc::new(DeviceTensorVersion {
+                generation: AtomicU64::new(0),
+            }),
         })
     }
 
@@ -903,6 +914,12 @@ impl DeviceTensor {
 pub struct DevicePackedSaltWeight {
     inner: TrainingSaltLinear,
     prepared: bool,
+    source: Option<PackedMasterBinding>,
+}
+
+struct PackedMasterBinding {
+    version: Arc<DeviceTensorVersion>,
+    packed_generation: u64,
 }
 
 impl core::fmt::Debug for DevicePackedSaltWeight {
@@ -913,6 +930,7 @@ impl core::fmt::Debug for DevicePackedSaltWeight {
             .field("planes", &self.planes())
             .field("resident_bytes", &self.resident_bytes())
             .field("prepared", &self.prepared)
+            .field("source_bound", &self.source.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -941,6 +959,41 @@ impl DevicePackedSaltWeight {
         Ok(Self {
             inner,
             prepared: true,
+            source: None,
+        })
+    }
+
+    /// Pack an immutable resident tensor and bind the handle to that exact allocation.
+    pub fn from_device_master(
+        backend: &CudaBackend,
+        master: &DeviceTensor,
+        rows: usize,
+        cols: usize,
+        planes: usize,
+    ) -> Result<Self, BackendError> {
+        if !backend.same_context(&master.buf) {
+            return Err(BackendError::InvalidInput(
+                "device master belongs to a different CUDA context".into(),
+            ));
+        }
+        let expected = rows.checked_mul(cols).ok_or_else(|| {
+            BackendError::InvalidInput("packed SALT shape overflows usize".into())
+        })?;
+        if master.len() != expected {
+            return Err(BackendError::ShapeMismatch {
+                expected,
+                got: master.len(),
+            });
+        }
+        let mut scratch = backend.dev_alloc_zeros(expected)?;
+        let inner = backend.pack_training_salt(&master.buf, &mut scratch, rows, cols, planes)?;
+        Ok(Self {
+            inner,
+            prepared: true,
+            source: Some(PackedMasterBinding {
+                version: Arc::clone(&master.version),
+                packed_generation: master.version.generation.load(Ordering::Acquire),
+            }),
         })
     }
 
@@ -966,6 +1019,7 @@ impl DevicePackedSaltWeight {
         let mut scratch = backend.dev_alloc_zeros(expected)?;
         backend.repack_training_salt(&d_master, &mut scratch, &mut self.inner)?;
         self.prepared = true;
+        self.source = None;
         Ok(())
     }
 
@@ -977,7 +1031,12 @@ impl DevicePackedSaltWeight {
     /// Whether the handle may be inserted into a new device tape.
     #[must_use]
     pub fn is_prepared(&self) -> bool {
-        self.prepared
+        self.ensure_prepared().is_ok()
+    }
+
+    /// Validate that this prepared handle was packed from `master`'s current generation.
+    pub fn validate_current_master(&self, master: &DeviceTensor) -> Result<(), BackendError> {
+        self.ensure_bound_to(master)
     }
 
     /// Output rows (`N`, or vocabulary size for a tied embedding).
@@ -1017,13 +1076,35 @@ impl DevicePackedSaltWeight {
     }
 
     fn ensure_prepared(&self) -> Result<(), BackendError> {
-        if self.prepared {
-            Ok(())
-        } else {
-            Err(BackendError::InvalidInput(
+        if !self.prepared {
+            return Err(BackendError::InvalidInput(
                 "packed SALT weight is stale; repack from the updated master".into(),
-            ))
+            ));
         }
+        if let Some(source) = &self.source
+            && source.version.generation.load(Ordering::Acquire) != source.packed_generation
+        {
+            return Err(BackendError::InvalidInput(
+                "packed SALT weight predates the current resident master generation; repack it"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn ensure_bound_to(&self, master: &DeviceTensor) -> Result<(), BackendError> {
+        self.ensure_prepared()?;
+        let source = self.source.as_ref().ok_or_else(|| {
+            BackendError::InvalidInput(
+                "packed SALT weight is not identity-bound to a resident master".into(),
+            )
+        })?;
+        if !Arc::ptr_eq(&source.version, &master.version) {
+            return Err(BackendError::InvalidInput(
+                "packed SALT weight is bound to a different resident master".into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -1623,6 +1704,9 @@ impl<'a> DeviceTrainer<'a> {
                 quantized: match weight_storage {
                     DeviceTrainerWeightStorage::DenseQuantized => Some(DeviceTensor {
                         buf: backend.dev_alloc_zeros(param.master.len())?,
+                        version: Arc::new(DeviceTensorVersion {
+                            generation: AtomicU64::new(0),
+                        }),
                     }),
                     DeviceTrainerWeightStorage::Packed => None,
                 },
@@ -1759,6 +1843,10 @@ impl<'a> DeviceTrainer<'a> {
         Ok(DevicePackedSaltWeight {
             inner,
             prepared: true,
+            source: Some(PackedMasterBinding {
+                version: Arc::clone(&param.master.version),
+                packed_generation: param.master.version.generation.load(Ordering::Acquire),
+            }),
         })
     }
 
@@ -1788,8 +1876,36 @@ impl<'a> DeviceTrainer<'a> {
             &mut self.residual,
             &mut weight.inner,
         )?;
+        weight.source = Some(PackedMasterBinding {
+            version: Arc::clone(&param.master.version),
+            packed_generation: param.master.version.generation.load(Ordering::Acquire),
+        });
         weight.prepared = true;
         Ok(())
+    }
+
+    fn invalidate_packed_weights(&self) {
+        for parameter in &self.params {
+            parameter
+                .master
+                .version
+                .generation
+                .fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    /// Borrow one resident latent master without allocation or device transfer.
+    ///
+    /// The returned tensor remains owned by this trainer. A tape borrowing it
+    /// prevents a mutable optimizer step until that tape is dropped.
+    pub fn master_tensor(&self, index: usize) -> Result<&DeviceTensor, BackendError> {
+        self.ensure_usable()?;
+        self.params
+            .get(index)
+            .map(|parameter| &parameter.master)
+            .ok_or_else(|| {
+                BackendError::InvalidInput(format!("parameter index {index} is out of range"))
+            })
     }
 
     fn ensure_usable(&self) -> Result<(), BackendError> {
@@ -1931,6 +2047,7 @@ impl<'a> DeviceTrainer<'a> {
                 });
             }
         }
+        self.invalidate_packed_weights();
         self.quantized_prepared = false;
         self.poisoned = true;
         let master_precision = self.master_precision;
@@ -2143,7 +2260,7 @@ impl GradientOptimizerSink for DeviceTrainer<'_> {
         gradient: &CudaSlice<f32>,
         step: u64,
     ) -> Result<(), BackendError> {
-        let parameter = self.params.get_mut(parameter_index).ok_or_else(|| {
+        let parameter = self.params.get(parameter_index).ok_or_else(|| {
             BackendError::InvalidInput(format!(
                 "streamed parameter index {parameter_index} is out of range"
             ))
@@ -2159,8 +2276,12 @@ impl GradientOptimizerSink for DeviceTrainer<'_> {
                 got: gradient.len(),
             });
         }
+        if !self.poisoned {
+            self.invalidate_packed_weights();
+        }
         self.quantized_prepared = false;
         self.poisoned = true;
+        let parameter = &mut self.params[parameter_index];
         self.backend.adamw_step_dev(
             &mut parameter.master.buf,
             gradient,
@@ -2258,6 +2379,7 @@ impl tritium_train::dcp::StateSink for DeviceTrainer<'_> {
     ) -> Result<(), DcpError> {
         // A load may overwrite part of device state before it fails. Poisoning
         // makes that partial generation unavailable until a complete fresh load.
+        self.invalidate_packed_weights();
         self.poisoned = true;
         self.quantized_prepared = false;
         self.loading = None;
@@ -3857,14 +3979,44 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
     /// Borrow an existing resident tensor as a leaf without allocating or
     /// copying it. The tensor must belong to this tape's CUDA context.
     pub fn leaf_device(&mut self, tensor: &'leaf DeviceTensor) -> Result<usize, BackendError> {
+        self.validate_device_tensor(tensor)?;
+        let id = self.vals.len();
+        self.vals.push(Some(DeviceValue::Borrowed(&tensor.buf)));
+        self.lens.push(tensor.buf.len());
+        self.leaves.push(true);
+        Ok(id)
+    }
+
+    /// Validate a resident tensor against this tape without changing the graph.
+    pub fn validate_device_tensor(&self, tensor: &DeviceTensor) -> Result<(), BackendError> {
         if !self.b.same_context(&tensor.buf) {
             return Err(BackendError::InvalidInput(
                 "device tensor belongs to a different CUDA context".into(),
             ));
         }
+        Ok(())
+    }
+
+    fn leaf_borrowed_prefix(
+        &mut self,
+        buffer: &'leaf CudaSlice<f32>,
+        len: usize,
+        name: &str,
+    ) -> Result<usize, BackendError> {
+        if !self.b.same_context(buffer) {
+            return Err(BackendError::InvalidInput(format!(
+                "{name} belongs to a different CUDA context"
+            )));
+        }
+        if len == 0 || buffer.len() < len {
+            return Err(BackendError::ShapeMismatch {
+                expected: len.max(1),
+                got: buffer.len(),
+            });
+        }
         let id = self.vals.len();
-        self.vals.push(Some(DeviceValue::Borrowed(&tensor.buf)));
-        self.lens.push(tensor.buf.len());
+        self.vals.push(Some(DeviceValue::Borrowed(buffer)));
+        self.lens.push(len);
         self.leaves.push(true);
         Ok(id)
     }
@@ -4142,6 +4294,49 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
             out: id,
         });
         Ok(id)
+    }
+
+    /// Project one resident master through HESTIA using the packed handle's
+    /// current first-plane AbsMean scales.
+    ///
+    /// SALT packing refreshes these scales from the same master after every
+    /// optimizer step. The scale prefix is borrowed directly; no host transfer,
+    /// device copy, or dense quantized shadow is created.
+    pub fn hestia_relax_packed(
+        &mut self,
+        weight: usize,
+        master: &DeviceTensor,
+        packed: &'leaf DevicePackedSaltWeight,
+        tau: usize,
+    ) -> Result<usize, BackendError> {
+        packed.ensure_bound_to(master)?;
+        let elements = packed.rows().checked_mul(packed.cols()).ok_or_else(|| {
+            BackendError::InvalidInput("HESTIA packed geometry overflows usize".into())
+        })?;
+        let value = self.vals.get(weight).ok_or_else(|| {
+            BackendError::InvalidInput(format!("device tape value id {weight} is out of range"))
+        })?;
+        if !matches!(
+            value,
+            Some(DeviceValue::Borrowed(buffer)) if std::ptr::eq(*buffer, &master.buf)
+        ) {
+            return Err(BackendError::InvalidInput(
+                "HESTIA weight id is not the bound resident-master leaf".into(),
+            ));
+        }
+        let got = self.lens[weight];
+        if got != elements {
+            return Err(BackendError::ShapeMismatch {
+                expected: elements,
+                got,
+            });
+        }
+        let scale = self.leaf_borrowed_prefix(
+            packed.inner.scales(),
+            packed.rows(),
+            "packed HESTIA scales",
+        )?;
+        self.hestia_relax(weight, scale, tau, packed.rows(), packed.cols())
     }
 
     pub fn matmul(
@@ -8187,6 +8382,14 @@ mod tests {
                 if message.contains("dense quantized storage is disabled")
         ));
         let mut packed = trainer.packed_weight(0).unwrap();
+        let direct_packed = DevicePackedSaltWeight::from_device_master(
+            &backend,
+            trainer.master_tensor(0).unwrap(),
+            rows,
+            cols,
+            planes,
+        )
+        .unwrap();
         let input = seeded_uniform(0xD2A1, 2 * cols, -0.5, 0.5);
         let packed_output = |packed: &DevicePackedSaltWeight| {
             let mut tape = DeviceTape::new(&backend, rows).unwrap();
@@ -8204,6 +8407,12 @@ mod tests {
         trainer
             .step(upload_test_gradients(&backend, &gradients), 1)
             .unwrap();
+        assert!(!packed.is_prepared());
+        assert!(!direct_packed.is_prepared());
+        assert!(matches!(
+            packed.validate_current_master(trainer.master_tensor(0).unwrap()),
+            Err(BackendError::InvalidInput(message)) if message.contains("predates")
+        ));
         trainer.repack_packed_weight(0, &mut packed).unwrap();
         let updated_master = trainer.download_master(0).unwrap();
         let updated_host =
