@@ -13,6 +13,8 @@ from tritium import _tritium as _native
 
 _CUDA_PACKED_CACHE_CAPACITY = 4096
 _CUDA_PACKED_CACHE = OrderedDict()
+_CPU_AUTOCAST_DTYPE = torch.bfloat16
+_CUDA_AUTOCAST_DTYPE = torch.float16
 _NATIVE_CPU_FORWARD = getattr(_native, "_ternary_linear_cpu_dlpack", None)
 _NATIVE_CPU_BACKWARD = getattr(
     _native, "_ternary_linear_backward_cpu_dlpack", None
@@ -302,7 +304,7 @@ def _native_cpu_backward_supported(
     mutates_args=(),
     device_types=("cpu", "cuda"),
 )
-def ternary_linear(
+def _ternary_linear_dispatch(
     input: torch.Tensor, master: torch.Tensor, bias: Optional[torch.Tensor] = None
 ) -> torch.Tensor:
     """Hard ternary Linear over tensors resident on the current CPU/CUDA device."""
@@ -369,7 +371,7 @@ def ternary_linear(
     return F.linear(input, projected, bias)
 
 
-@ternary_linear.register_fake
+@_ternary_linear_dispatch.register_fake
 def _ternary_linear_fake(
     input: torch.Tensor, master: torch.Tensor, bias: Optional[torch.Tensor] = None
 ) -> torch.Tensor:
@@ -393,8 +395,12 @@ def _setup_ternary_linear_context(ctx, inputs, output) -> None:
     ctx.has_bias = bias is not None
 
 
-def _ternary_linear_backward(ctx, grad_output: torch.Tensor):
-    input, master = ctx.saved_tensors
+def _ternary_linear_backward_impl(
+    grad_output: torch.Tensor,
+    input: torch.Tensor,
+    master: torch.Tensor,
+    has_bias: bool,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if _native_cuda_backward_supported(grad_output, input, master):
         detached_grad = grad_output.detach()
         detached_input = input.detach()
@@ -406,7 +412,7 @@ def _ternary_linear_backward(ctx, grad_output: torch.Tensor):
             torch.empty(
                 master.shape[0], dtype=input.dtype, device=master.device
             )
-            if ctx.has_bias
+            if has_bias
             else None
         )
         m = input.numel() // input.shape[-1]
@@ -428,7 +434,11 @@ def _ternary_linear_backward(ctx, grad_output: torch.Tensor):
             _cuda_stream(input),
             packed.device,
         )
-        return grad_input, grad_master, grad_bias
+        return (
+            grad_input,
+            grad_master,
+            grad_bias if grad_bias is not None else input.new_empty((0,)),
+        )
     if _native_cpu_backward_supported(grad_output, input, master):
         detached_grad = grad_output.detach().contiguous()
         detached_input = input.detach()
@@ -443,7 +453,7 @@ def _ternary_linear_backward(ctx, grad_output: torch.Tensor):
             master,
             version,
             storage_identity,
-            ctx.has_bias,
+            has_bias,
         )
         if capsules is None:
             scales = detached_master.abs().mean(dim=1)
@@ -455,14 +465,16 @@ def _ternary_linear_backward(ctx, grad_output: torch.Tensor):
                 master,
                 version,
                 storage_identity,
-                ctx.has_bias,
+                has_bias,
             )
         if capsules is not None:
             grad_input, grad_master, grad_bias = capsules
             return (
                 torch.from_dlpack(grad_input),
                 torch.from_dlpack(grad_master),
-                torch.from_dlpack(grad_bias) if grad_bias is not None else None,
+                torch.from_dlpack(grad_bias)
+                if grad_bias is not None
+                else input.new_empty((0,)),
             )
 
     projected, mask = _projection_components(master)
@@ -475,21 +487,64 @@ def _ternary_linear_backward(ctx, grad_output: torch.Tensor):
             grad_2d_master.transpose(0, 1) @ input_2d.float()
         ) * mask
         grad_bias = (
-            grad_2d_master.sum(dim=0).to(input.dtype) if ctx.has_bias else None
+            grad_2d_master.sum(dim=0).to(input.dtype)
+            if has_bias
+            else input.new_empty((0,))
         )
         return grad_input, grad_master, grad_bias
     grad_input = (grad_2d @ projected).reshape(input.shape)
     grad_master = (grad_2d.transpose(0, 1) @ input_2d) * mask
-    grad_bias = grad_2d.sum(dim=0) if ctx.has_bias else None
+    grad_bias = grad_2d.sum(dim=0) if has_bias else input.new_empty((0,))
     return grad_input, grad_master, grad_bias
 
 
+@torch.library.custom_op(
+    "tritium::_ternary_linear_backward",
+    mutates_args=(),
+    device_types=("cpu", "cuda"),
+)
+def _ternary_linear_backward_dispatch(
+    grad_output: torch.Tensor,
+    input: torch.Tensor,
+    master: torch.Tensor,
+    has_bias: bool,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Opaque first-order VJP boundary for compiled native/cache execution."""
+
+    return _ternary_linear_backward_impl(grad_output, input, master, has_bias)
+
+
+@_ternary_linear_backward_dispatch.register_fake
+def _ternary_linear_backward_fake(
+    grad_output: torch.Tensor,
+    input: torch.Tensor,
+    master: torch.Tensor,
+    has_bias: bool,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    del grad_output
+    grad_bias = input.new_empty((master.shape[0],) if has_bias else (0,))
+    return input.new_empty(input.shape), master.new_empty(master.shape), grad_bias
+
+
+def _ternary_linear_backward(ctx, grad_output: torch.Tensor):
+    input, master = ctx.saved_tensors
+    if torch.is_grad_enabled():
+        grad_input, grad_master, grad_bias = _ternary_linear_backward_impl(
+            grad_output, input, master, ctx.has_bias
+        )
+    else:
+        grad_input, grad_master, grad_bias = _ternary_linear_backward_dispatch(
+            grad_output, input, master, ctx.has_bias
+        )
+    return grad_input, grad_master, grad_bias if ctx.has_bias else None
+
+
 torch.library.register_autograd(
-    ternary_linear,
+    _ternary_linear_dispatch,
     _ternary_linear_backward,
     setup_context=_setup_ternary_linear_context,
 )
-torch.library.register_autocast(ternary_linear, "cpu", torch.bfloat16)
+torch.library.register_autocast(_ternary_linear_dispatch, "cpu", _CPU_AUTOCAST_DTYPE)
 
 
 def _ternary_linear_cuda_autocast(
@@ -498,19 +553,36 @@ def _ternary_linear_cuda_autocast(
     # Preserve fp32 master/optimizer state. Only activation-facing tensors use
     # fp16; disabling autocast around redispatch prevents recursion.
     with torch.autocast("cuda", enabled=False):
-        cast_input = input.to(torch.float16)
-        cast_bias = bias.to(torch.float16) if bias is not None else None
+        cast_input = input.to(_CUDA_AUTOCAST_DTYPE)
+        cast_bias = bias.to(_CUDA_AUTOCAST_DTYPE) if bias is not None else None
         native_mixed = (
             getattr(_native, "_ternary_linear_cuda_pack", None) is not None
             and getattr(_native, "_ternary_linear_cuda_forward", None) is not None
             and getattr(_native, "_ternary_linear_cuda_backward", None) is not None
             and master.dtype == torch.float32
         )
-        cast_master = master if native_mixed else master.to(torch.float16)
-        return ternary_linear(cast_input, cast_master, cast_bias)
+        cast_master = master if native_mixed else master.to(_CUDA_AUTOCAST_DTYPE)
+        return _ternary_linear_dispatch(cast_input, cast_master, cast_bias)
 
 
 _CUDA_AUTOCAST_LIBRARY = torch.library.Library("tritium", "FRAGMENT")
 _CUDA_AUTOCAST_LIBRARY.impl(
     "ternary_linear", _ternary_linear_cuda_autocast, "AutocastCUDA"
 )
+
+
+def ternary_linear(
+    input: torch.Tensor, master: torch.Tensor, bias: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    """Hard ternary Linear with graph-visible CPU/CUDA autocast semantics."""
+
+    if input.device.type == "cuda" and torch.is_autocast_enabled("cuda"):
+        return _ternary_linear_cuda_autocast(input, master, bias)
+    if input.device.type == "cpu" and torch.is_autocast_enabled("cpu"):
+        with torch.autocast("cpu", enabled=False):
+            return _ternary_linear_dispatch(
+                input.to(_CPU_AUTOCAST_DTYPE),
+                master.to(_CPU_AUTOCAST_DTYPE),
+                bias.to(_CPU_AUTOCAST_DTYPE) if bias is not None else None,
+            )
+    return _ternary_linear_dispatch(input, master, bias)

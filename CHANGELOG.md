@@ -13,6 +13,13 @@ see `docs/v1.0-api-freeze-audit.md` for the tier policy.
 
 ### Changed
 
+- **Compiled autocast parity:** `tritium.torch.ternary_linear` now makes its
+  selective CPU/CUDA autocast casts visible to `torch.compile`. Compiled CUDA
+  graphs preserve the fp32 master weight for resident native kernels while
+  casting only activation-facing tensors to fp16, matching eager execution
+  instead of silently falling back to fp32 composite projection. Compiled
+  first-order backward uses an opaque dispatcher VJP boundary so native packed
+  caches remain available without tracing storage pointers through fake tensors.
 - **Python distribution rename:** install release candidates with
   `pip install tritium-torch`; the import namespace remains `import tritium`.
   This aligns packaging with ADR 0033 and avoids claiming the generic `tritium`

@@ -5,6 +5,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from tritium.torch import reference_ternary_linear, ternary_linear  # noqa: E402
+from tritium.torch import ops as torch_ops  # noqa: E402
 from tritium.nn import TernaryLinear  # noqa: E402
 from tritium import _tritium as _native  # noqa: E402
 
@@ -396,7 +397,7 @@ def test_ternary_linear_opcheck_and_fullgraph_compile():
     bias = torch.randn(5, dtype=torch.double, requires_grad=True)
 
     checks = torch.library.opcheck(
-        ternary_linear,
+        torch.ops.tritium.ternary_linear.default,
         (x, weight, bias),
         atol=1e-8,
         rtol=1e-8,
@@ -420,13 +421,35 @@ def test_ternary_linear_supports_leading_dims_no_bias_and_cpu_autocast():
     output.square().mean().backward()
     assert x.grad is not None and weight.grad is not None
 
+    x.grad = None
+    weight.grad = None
     with torch.autocast("cpu", dtype=torch.bfloat16):
-        autocast_output = ternary_linear(x.detach(), weight.detach())
+        autocast_output = ternary_linear(x, weight)
+        dispatcher_output = torch.ops.tritium.ternary_linear.default(
+            x.detach(), weight.detach()
+        )
     assert autocast_output.dtype == torch.bfloat16
+    assert torch.equal(dispatcher_output, autocast_output)
+    autocast_output.float().sum().backward()
+    eager_x_grad = x.grad.detach().clone()
+    eager_weight_grad = weight.grad.detach().clone()
+    x.grad = None
+    weight.grad = None
+
+    compiled = torch.compile(
+        lambda a, w: ternary_linear(a, w), fullgraph=True
+    )
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        compiled_output = compiled(x, weight)
+    assert torch.equal(compiled_output, autocast_output)
+    compiled_output.float().sum().backward()
+    torch.testing.assert_close(x.grad, eager_x_grad)
+    torch.testing.assert_close(weight.grad, eager_weight_grad)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
 def test_ternary_linear_cuda_stays_resident_and_autocasts():
+    torch.manual_seed(0)
     x = torch.randn(8, 16, device="cuda", requires_grad=True)
     weight = torch.randn(12, 16, device="cuda", requires_grad=True)
     bias = torch.randn(12, device="cuda", requires_grad=True)
@@ -448,7 +471,11 @@ def test_ternary_linear_cuda_stays_resident_and_autocasts():
 
     with torch.autocast("cuda", dtype=torch.float16):
         autocast_output = ternary_linear(x.detach(), weight.detach(), bias.detach())
+        dispatcher_output = torch.ops.tritium.ternary_linear.default(
+            x.detach(), weight.detach(), bias.detach()
+        )
     assert autocast_output.dtype == torch.float16
+    assert torch.equal(dispatcher_output, autocast_output)
 
     compiled = torch.compile(
         lambda a, w, b: ternary_linear(a, w, b), fullgraph=True
@@ -456,6 +483,84 @@ def test_ternary_linear_cuda_stays_resident_and_autocasts():
     with torch.autocast("cuda", dtype=torch.float16):
         compiled_output = compiled(x.detach(), weight.detach(), bias.detach())
     assert torch.equal(compiled_output, autocast_output)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or "cuda" not in _native.compiled_backends(),
+    reason="CUDA-enabled Tritium extension unavailable",
+)
+def test_native_cuda_compiled_autocast_preserves_master_cache_and_backward():
+    torch.manual_seed(37)
+    eager_x = torch.randn(8, 16, device="cuda", requires_grad=True)
+    eager_weight = torch.randn(12, 16, device="cuda", requires_grad=True)
+    eager_bias = torch.randn(12, device="cuda", requires_grad=True)
+    compiled_x = eager_x.detach().clone().requires_grad_()
+    compiled_weight = eager_weight.detach().clone().requires_grad_()
+    compiled_bias = eager_bias.detach().clone().requires_grad_()
+    grad_output = torch.randn(8, 12, device="cuda", dtype=torch.float16)
+
+    with torch.autocast("cuda", dtype=torch.float16):
+        eager_output = ternary_linear(eager_x, eager_weight, eager_bias)
+    eager_output.backward(grad_output)
+
+    compiled = torch.compile(
+        lambda a, w, b: ternary_linear(a, w, b), fullgraph=True
+    )
+    torch_ops._CUDA_PACKED_CACHE.clear()
+    with torch.autocast("cuda", dtype=torch.float16):
+        warm_output = compiled(compiled_x, compiled_weight, compiled_bias)
+    warm_output.backward(grad_output)
+    compiled_x.grad = None
+    compiled_weight.grad = None
+    compiled_bias.grad = None
+
+    cache_entries = list(torch_ops._CUDA_PACKED_CACHE.values())
+    assert len(cache_entries) == 1
+    warm_entry = cache_entries[0]
+    warm_packed_storage = int(warm_entry.packed.untyped_storage()._cdata)
+    assert warm_entry.owner() is compiled_weight
+    assert warm_entry.dtype == torch.float32
+
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+        acc_events=False,
+    ) as profile:
+        with torch.autocast("cuda", dtype=torch.float16):
+            compiled_output = compiled(compiled_x, compiled_weight, compiled_bias)
+        compiled_output.backward(grad_output)
+        torch.cuda._sleep(1)
+    torch.cuda.synchronize()
+
+    assert torch.equal(compiled_output, eager_output)
+    torch.testing.assert_close(compiled_x.grad, eager_x.grad)
+    torch.testing.assert_close(compiled_weight.grad, eager_weight.grad)
+    torch.testing.assert_close(compiled_bias.grad, eager_bias.grad)
+    cache_entries = list(torch_ops._CUDA_PACKED_CACHE.values())
+    assert len(cache_entries) == 1
+    assert cache_entries[0] is warm_entry
+    assert int(cache_entries[0].packed.untyped_storage()._cdata) == warm_packed_storage
+    native_events = {
+        event.name
+        for event in profile.events()
+        if event.device_type == torch.autograd.DeviceType.CUDA
+    }
+    assert {
+        "tq2_0_add_mpgemm_tiled_f16_bias",
+        "tq2_projected_grad_a_f16",
+        "linear_grad_master_ste_autocast",
+        "bias_backward_f16",
+    }.issubset(native_events)
+    event_names = {event.key.lower() for event in profile.key_averages()}
+    assert event_names.isdisjoint(
+        {
+            "aten::abs",
+            "aten::clamp",
+            "aten::matmul",
+            "aten::mean",
+            "aten::mm",
+            "aten::round",
+        }
+    )
 
 
 @pytest.mark.skipif(
