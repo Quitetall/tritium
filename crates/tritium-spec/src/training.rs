@@ -8,6 +8,7 @@ const SCHEMA_ID: &str = "tritium.training_op_manifest";
 const DTYPE: &str = "f32";
 const CANONICAL_JSON_V1: &[u8] = include_bytes!("../data/training/v1/manifest.json");
 const CANONICAL_JSON_V2: &[u8] = include_bytes!("../data/training/v2/manifest.json");
+const CANONICAL_JSON_V3: &[u8] = include_bytes!("../data/training/v3/manifest.json");
 
 /// Semantic category for one portable training operation.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -184,6 +185,46 @@ static OPERATIONS_V2: &[TrainingOpDescriptorV1] = &[
     lifecycle("lifecycle.resume", true),
     lifecycle("lifecycle.export", false),
     lifecycle("lifecycle.reload", true),
+];
+
+static OPERATIONS_V3: &[TrainingOpDescriptorV1] = &[
+    graph("graph.ste_surrogate"),
+    graph("graph.salt_ste"),
+    graph("graph.lsq_ste"),
+    graph("graph.fsq"),
+    graph("graph.dense_matmul"),
+    graph("graph.ternary_matmul"),
+    graph("graph.transpose"),
+    graph("graph.embedding_gather"),
+    graph("graph.slice_cols"),
+    graph("graph.concat_cols"),
+    graph("graph.detach"),
+    graph("graph.scale_const"),
+    graph("graph.bias"),
+    graph("graph.add"),
+    graph("graph.mul"),
+    graph("graph.conv1d"),
+    graph("graph.conv2d"),
+    graph("graph.relu2"),
+    graph("graph.silu"),
+    graph("graph.rmsnorm"),
+    graph("graph.softmax"),
+    graph("graph.causal_mask"),
+    graph("graph.rope"),
+    graph("graph.attention"),
+    loss("loss.mse"),
+    loss("loss.softmax_cross_entropy"),
+    loss("loss.topk_knowledge_distillation"),
+    optimizer("optimizer.sgd", PARAMETER),
+    optimizer("optimizer.adamw", ADAM_PLANES),
+    optimizer("optimizer.cautious_adamw", ADAM_PLANES),
+    optimizer("optimizer.int8_adamw", INT8_ADAM_PLANES),
+    optimizer("optimizer.muon", MUON_PLANES),
+    lifecycle("lifecycle.checkpoint", false),
+    lifecycle("lifecycle.resume", true),
+    lifecycle("lifecycle.export", false),
+    lifecycle("lifecycle.reload", true),
+    graph("graph.hestia_relax"),
 ];
 
 #[derive(Debug, Deserialize)]
@@ -384,6 +425,45 @@ impl TrainingOpManifestV2 {
     /// dtype, count, order, identifier, capability or state-plane mismatch.
     pub fn parse_json(bytes: &[u8]) -> Result<Self, TrainingManifestError> {
         validate_manifest(bytes, Self::SCHEMA_VERSION, OPERATIONS_V2)?;
+        Ok(Self)
+    }
+}
+
+/// Frozen language-neutral v3 portable-training registry.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TrainingOpManifestV3;
+
+impl TrainingOpManifestV3 {
+    /// Permanent schema identifier.
+    pub const SCHEMA_ID: &'static str = SCHEMA_ID;
+    /// Frozen schema version.
+    pub const SCHEMA_VERSION: u32 = 3;
+
+    /// Canonically ordered operation registry.
+    #[must_use]
+    pub const fn operations() -> &'static [TrainingOpDescriptorV1] {
+        OPERATIONS_V3
+    }
+
+    /// Exact canonical JSON bytes, including one terminal newline.
+    #[must_use]
+    pub const fn canonical_json() -> &'static [u8] {
+        CANONICAL_JSON_V3
+    }
+
+    /// BLAKE3 digest of exact canonical JSON bytes.
+    #[must_use]
+    pub fn digest() -> [u8; 32] {
+        *blake3::hash(CANONICAL_JSON_V3).as_bytes()
+    }
+
+    /// Parse and validate a manifest against complete frozen v3 registry.
+    ///
+    /// # Errors
+    /// Returns [`TrainingManifestError`] for malformed JSON or any schema,
+    /// dtype, count, order, identifier, capability or state-plane mismatch.
+    pub fn parse_json(bytes: &[u8]) -> Result<Self, TrainingManifestError> {
+        validate_manifest(bytes, Self::SCHEMA_VERSION, OPERATIONS_V3)?;
         Ok(Self)
     }
 }

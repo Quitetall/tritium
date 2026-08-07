@@ -618,6 +618,14 @@ fn seeded_uniform(seed: u64, n: usize, lo: f32, hi: f32) -> Vec<f32> {
 // DeviceTape on a real model (plan 0043 P2.5b onward).
 #[allow(dead_code)]
 enum DevOp<'leaf> {
+    HestiaRelax {
+        weight: usize,
+        scale: usize,
+        tau: usize,
+        rows: usize,
+        cols: usize,
+        out: usize,
+    },
     Matmul {
         x: usize,
         w: usize,
@@ -731,7 +739,8 @@ enum DevOp<'leaf> {
 impl DevOp<'_> {
     fn output(&self) -> usize {
         match self {
-            Self::Matmul { out, .. }
+            Self::HestiaRelax { out, .. }
+            | Self::Matmul { out, .. }
             | Self::SaltMatmul { out, .. }
             | Self::Rmsnorm { out, .. }
             | Self::Silu { out, .. }
@@ -751,6 +760,9 @@ impl DevOp<'_> {
 
     fn gradient_inputs(&self) -> Vec<usize> {
         match self {
+            Self::HestiaRelax {
+                weight, scale, tau, ..
+            } => vec![*weight, *scale, *tau],
             Self::Matmul { x, w, .. } => vec![*x, *w],
             Self::SaltMatmul { x, master, .. } => vec![*x, *master],
             Self::Rmsnorm { x, w, .. } => vec![*x, *w],
@@ -4082,6 +4094,56 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
         }
     }
 
+    /// Smooth HESTIA ternary expectation retained as a dense training weight.
+    ///
+    /// Compose returned value with [`Self::matmul`]. Packed SALT contractions are
+    /// intentionally unavailable until hard export because soft expectations are dense.
+    /// Temperatures below `MIN_DIFFERENTIABLE_TAU` fail closed to zero in device kernels.
+    pub fn hestia_relax(
+        &mut self,
+        weight: usize,
+        scale: usize,
+        tau: usize,
+        rows: usize,
+        cols: usize,
+    ) -> Result<usize, BackendError> {
+        let elements = rows.checked_mul(cols).ok_or_else(|| {
+            BackendError::InvalidInput("HESTIA matrix shape overflows usize".into())
+        })?;
+        if rows == 0 || cols == 0 {
+            return Err(BackendError::InvalidInput(
+                "HESTIA rows and cols must be non-zero".into(),
+            ));
+        }
+        for (id, expected) in [(weight, elements), (scale, rows), (tau, 1)] {
+            let got = *self.lens.get(id).ok_or_else(|| {
+                BackendError::InvalidInput(format!("device tape value id {id} is out of range"))
+            })?;
+            if got != expected {
+                return Err(BackendError::ShapeMismatch { expected, got });
+            }
+        }
+        let mut out = self.b.dev_alloc_zeros(elements)?;
+        self.b.hestia_relax_forward_dev(
+            self.value_slice(weight)?,
+            self.value_slice(scale)?,
+            self.value_slice(tau)?,
+            &mut out,
+            rows,
+            cols,
+        )?;
+        let id = self.push_activation(out, elements);
+        self.ops.push(DevOp::HestiaRelax {
+            weight,
+            scale,
+            tau,
+            rows,
+            cols,
+            out: id,
+        });
+        Ok(id)
+    }
+
     pub fn matmul(
         &mut self,
         x: usize,
@@ -4773,6 +4835,25 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
         }
 
         let output = match *op {
+            DevOp::HestiaRelax {
+                weight,
+                scale,
+                tau,
+                rows,
+                cols,
+                out: _,
+            } => {
+                let mut output = self.b.dev_alloc_zeros(rows * cols)?;
+                self.b.hestia_relax_forward_dev(
+                    self.value_slice(weight)?,
+                    self.value_slice(scale)?,
+                    self.value_slice(tau)?,
+                    &mut output,
+                    rows,
+                    cols,
+                )?;
+                output
+            }
             DevOp::Matmul {
                 x,
                 w,
@@ -5281,6 +5362,52 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
                     continue;
                 };
                 match *op {
+                    DevOp::HestiaRelax {
+                        weight,
+                        scale,
+                        tau,
+                        rows,
+                        cols,
+                        out: _,
+                    } => {
+                        let mut grad_weight = self.b.dev_alloc_zeros(rows * cols)?;
+                        let mut grad_tau = self.b.dev_alloc_zeros(1)?;
+                        self.b.hestia_relax_backward_dev(
+                            self.value_slice(weight)?,
+                            self.value_slice(scale)?,
+                            self.value_slice(tau)?,
+                            &grad_out,
+                            &mut grad_weight,
+                            &mut grad_tau,
+                            rows,
+                            cols,
+                        )?;
+                        self.accumulate_grad_slot(
+                            &mut grads,
+                            &retain,
+                            weight,
+                            &grad_weight,
+                            &mut live_elements,
+                            &mut peak_persistent_grad_elements,
+                        )?;
+                        let grad_scale = self.b.dev_alloc_zeros(rows)?;
+                        self.accumulate_grad_slot(
+                            &mut grads,
+                            &retain,
+                            scale,
+                            &grad_scale,
+                            &mut live_elements,
+                            &mut peak_persistent_grad_elements,
+                        )?;
+                        self.accumulate_grad_slot(
+                            &mut grads,
+                            &retain,
+                            tau,
+                            &grad_tau,
+                            &mut live_elements,
+                            &mut peak_persistent_grad_elements,
+                        )?;
+                    }
                     DevOp::Matmul {
                         x,
                         w,
@@ -6176,6 +6303,140 @@ mod tests {
             "lazy gradient slots must beat one persistent gradient per value: {:?}",
             result.stats
         );
+    }
+
+    #[test]
+    fn device_tape_hestia_relax_uses_dense_matmul_and_multistage_tau_vjp() {
+        use tritium_train::ops::{dense, hestia};
+
+        let backend = match CudaBackend::new(0) {
+            Ok(backend) => backend,
+            Err(error) => {
+                eprintln!("skipping DeviceTape HESTIA test: no CUDA device ({error})");
+                return;
+            }
+        };
+        let (m, rows, cols) = (2usize, 3usize, 769usize);
+        let x = seeded_uniform(0xC301, m * cols, -0.75, 0.75);
+        let weight = seeded_uniform(0xC302, rows * cols, -1.25, 1.25);
+        let scale = [0.8f32, 1.0, 0.6];
+        let tau = [0.7f32];
+        let seed = seeded_uniform(0xC303, m * rows, -0.5, 0.5);
+
+        let soft = hestia::hestia_forward(&weight, &scale, &tau, rows, cols);
+        let expected_output = dense::forward(&x, &soft, m, rows, cols);
+        let dense_grad = dense::vjp(&x, &soft, m, rows, cols, &seed);
+        let hestia_grad = hestia::hestia_vjp(&weight, &scale, &tau, rows, cols, &dense_grad[1]);
+
+        let mut tape = DeviceTape::new_with_checkpoint_policy(
+            &backend,
+            rows,
+            CheckpointPolicy::EveryBlocks(1),
+        )
+        .unwrap();
+        let x_id = tape.leaf(&x).unwrap();
+        let weight_id = tape.leaf(&weight).unwrap();
+        let scale_id = tape.leaf(&scale).unwrap();
+        let tau_id = tape.leaf(&tau).unwrap();
+        let soft_id = tape
+            .hestia_relax(weight_id, scale_id, tau_id, rows, cols)
+            .unwrap();
+        let output_id = tape.matmul(x_id, soft_id, m, rows, cols).unwrap();
+        let output_diff = max_abs_diff(&tape.value(output_id).unwrap(), &expected_output);
+        assert!(
+            output_diff < 1e-5,
+            "HESTIA dense matmul forward max abs diff {output_diff}"
+        );
+        tape.checkpoint_keep(&[output_id]).unwrap();
+        let device_seed = backend.dev_upload(&seed).unwrap();
+        let result = tape
+            .backward_retain(
+                output_id,
+                &device_seed,
+                &[x_id, weight_id, scale_id, tau_id],
+            )
+            .unwrap();
+        let download = |id: usize| {
+            let mut host = vec![0.0f32; result.grads[id].as_ref().unwrap().len()];
+            backend
+                .dev_download(result.grads[id].as_ref().unwrap(), &mut host)
+                .unwrap();
+            host
+        };
+        assert!(max_abs_diff(&download(x_id), &dense_grad[0]) < 1e-5);
+        assert!(max_abs_diff(&download(weight_id), &hestia_grad[0]) < 1e-5);
+        assert_eq!(download(scale_id), hestia_grad[1]);
+        assert!(max_abs_diff(&download(tau_id), &hestia_grad[2]) < 1e-4);
+        assert!(result.stats.recomputed_ops >= 2);
+    }
+
+    #[test]
+    fn device_tape_hestia_unrepresentable_tau_fails_closed() {
+        use tritium_train::ops::hestia;
+
+        let backend = match CudaBackend::new(0) {
+            Ok(backend) => backend,
+            Err(error) => {
+                eprintln!("skipping DeviceTape HESTIA test: no CUDA device ({error})");
+                return;
+            }
+        };
+        let weight = [0.25f32, -0.75, 1.0, -1.5];
+        let scale = [0.5f32, 1.25];
+        let tau = [hestia::MIN_DIFFERENTIABLE_TAU * 0.5];
+        let seed = [1.0f32; 4];
+
+        let mut tape = DeviceTape::new(&backend, 2).unwrap();
+        let weight_id = tape.leaf(&weight).unwrap();
+        let scale_id = tape.leaf(&scale).unwrap();
+        let tau_id = tape.leaf(&tau).unwrap();
+        let output_id = tape
+            .hestia_relax(weight_id, scale_id, tau_id, 2, 2)
+            .unwrap();
+        assert_eq!(tape.value(output_id).unwrap(), vec![0.0; 4]);
+
+        let device_seed = backend.dev_upload(&seed).unwrap();
+        let result = tape
+            .backward_retain(output_id, &device_seed, &[weight_id, scale_id, tau_id])
+            .unwrap();
+        for id in [weight_id, scale_id, tau_id] {
+            let gradient = result.grads[id].as_ref().unwrap();
+            let mut host = vec![f32::NAN; gradient.len()];
+            backend.dev_download(gradient, &mut host).unwrap();
+            assert!(host.iter().all(|value| *value == 0.0));
+        }
+    }
+
+    #[test]
+    fn device_tape_hestia_exact_temperature_floor_has_finite_vjp() {
+        use tritium_train::ops::hestia;
+
+        let backend = match CudaBackend::new(0) {
+            Ok(backend) => backend,
+            Err(error) => {
+                eprintln!("skipping DeviceTape HESTIA test: no CUDA device ({error})");
+                return;
+            }
+        };
+        let mut tape = DeviceTape::new(&backend, 1).unwrap();
+        let weight_id = tape.leaf(&[1.0]).unwrap();
+        let scale_id = tape.leaf(&[1.0]).unwrap();
+        let tau_id = tape.leaf(&[hestia::MIN_DIFFERENTIABLE_TAU]).unwrap();
+        let output_id = tape
+            .hestia_relax(weight_id, scale_id, tau_id, 1, 1)
+            .unwrap();
+        assert_eq!(tape.value(output_id).unwrap(), vec![1.0]);
+
+        let device_seed = backend.dev_upload(&[1.0]).unwrap();
+        let result = tape
+            .backward_retain(output_id, &device_seed, &[weight_id, scale_id, tau_id])
+            .unwrap();
+        for id in [weight_id, scale_id, tau_id] {
+            let gradient = result.grads[id].as_ref().unwrap();
+            let mut host = vec![f32::NAN; gradient.len()];
+            backend.dev_download(gradient, &mut host).unwrap();
+            assert_eq!(host, vec![0.0; gradient.len()]);
+        }
     }
 
     #[test]

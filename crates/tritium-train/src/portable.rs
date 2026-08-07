@@ -8,7 +8,7 @@ use tritium_format::salt_v2_package::SaltV2PackageReader;
 use tritium_spec::{
     TrainAttributeValueV1, TrainBackendError, TrainBackendV1, TrainBufferDataMutV1,
     TrainBufferDataRefV1, TrainCapabilitiesV1, TrainDTypeV1, TrainExecutionV1, TrainLimitsV1,
-    TrainOperationErrorV1, TrainOutputV1, TrainReceiptV1, TrainRequestV1, TrainingOpManifestV2,
+    TrainOperationErrorV1, TrainOutputV1, TrainReceiptV1, TrainRequestV1, TrainingOpManifestV3,
     train_output_digest_v1, train_request_digest_v1,
 };
 
@@ -16,7 +16,7 @@ use crate::{
     AdamState, AdamW, CautiousAdamW, INT8_ADAM_BLOCK, Int8AdamState, Int8AdamW, Muon, MuonState,
     Optimizer, Sgd, SgdState,
     checkpoint::{Checkpoint, CheckpointError, LeafCheckpoint, read_checkpoint, write_checkpoint},
-    ops::{attention, conv1d, conv2d},
+    ops::{attention, conv1d, conv2d, hestia},
 };
 
 const BACKEND_ID: &str = "cpu.reference.v1";
@@ -73,6 +73,7 @@ enum CpuOperation {
     Resume,
     Export,
     Reload,
+    HestiaRelax,
 }
 
 #[derive(Clone, Copy)]
@@ -226,6 +227,10 @@ const CPU_OPERATIONS: &[CpuOperationEntry] = &[
         id: "lifecycle.reload",
         operation: CpuOperation::Reload,
     },
+    CpuOperationEntry {
+        id: "graph.hestia_relax",
+        operation: CpuOperation::HestiaRelax,
+    },
 ];
 
 struct OperationSchema {
@@ -263,6 +268,16 @@ const LSQ_VJP: OperationSchema = OperationSchema {
     inputs: &["weight", "alpha", "grad_output"],
     attributes: &["rows", "cols"],
     outputs: &["grad_weight", "grad_alpha"],
+};
+const HESTIA_FORWARD: OperationSchema = OperationSchema {
+    inputs: &["weight", "scale", "tau"],
+    attributes: &["rows", "cols"],
+    outputs: &["result"],
+};
+const HESTIA_VJP: OperationSchema = OperationSchema {
+    inputs: &["weight", "scale", "tau", "grad_output"],
+    attributes: &["rows", "cols"],
+    outputs: &["grad_weight", "grad_scale", "grad_tau"],
 };
 const FSQ_FORWARD: OperationSchema = OperationSchema {
     inputs: &["x"],
@@ -556,7 +571,7 @@ const RELOAD: OperationSchema = OperationSchema {
     outputs: &["package"],
 };
 
-/// Complete CPU semantic-reference adapter for `TrainBackendV1` manifest v1.
+/// Complete CPU semantic-reference adapter for latest `TrainBackendV1` manifest.
 ///
 /// Every advertised forward/VJP, optimizer and lifecycle operation passes the
 /// canonical corpus through this exact seam. Accelerator residency and physical
@@ -576,7 +591,7 @@ impl TrainBackendV1 for CpuTrainBackendV1 {
     fn capabilities(&self) -> TrainCapabilitiesV1 {
         TrainCapabilitiesV1 {
             backend_id: BACKEND_ID.to_owned(),
-            manifest_digest: TrainingOpManifestV2::digest(),
+            manifest_digest: TrainingOpManifestV3::digest(),
             supported_operations: CPU_OPERATIONS
                 .iter()
                 .map(|operation| operation.id.to_owned())
@@ -675,6 +690,12 @@ impl TrainBackendV1 for CpuTrainBackendV1 {
             }
             (CpuOperation::LsqSte, TrainExecutionV1::Vjp) => {
                 lsq_ste_vjp(&request, output)?;
+            }
+            (CpuOperation::HestiaRelax, TrainExecutionV1::Forward) => {
+                hestia_relax_forward(&request, output)?;
+            }
+            (CpuOperation::HestiaRelax, TrainExecutionV1::Vjp) => {
+                hestia_relax_vjp(&request, output)?;
             }
             (CpuOperation::Fsq, TrainExecutionV1::Forward) => fsq_forward(&request, output)?,
             (CpuOperation::Fsq, TrainExecutionV1::Vjp) => fsq_vjp(&request, output)?,
@@ -808,7 +829,7 @@ impl TrainBackendV1 for CpuTrainBackendV1 {
             backend_id: BACKEND_ID.to_owned(),
             backend_build: backend_build_identity(),
             physical_device: Some(cpu_physical_device().to_owned()),
-            manifest_digest: TrainingOpManifestV2::digest(),
+            manifest_digest: TrainingOpManifestV3::digest(),
             vector_digest: request.vector_digest,
             operation: request.operation.to_owned(),
             execution: request.execution,
@@ -1054,6 +1075,82 @@ fn lsq_ste_vjp(
         }
         grad_alpha[row] = gradient * gradient_scale;
     }
+    Ok(())
+}
+
+fn hestia_relax_forward(
+    request: &TrainRequestV1<'_>,
+    output: &mut TrainOutputV1<'_>,
+) -> Result<(), TrainBackendError> {
+    require_contract(request, output, &HESTIA_FORWARD)?;
+    let (weight_shape, weight) = input_f32(request, "weight")?;
+    let (scale_shape, scale) = input_f32(request, "scale")?;
+    let (tau_shape, tau) = input_f32(request, "tau")?;
+    let (rows, cols, rows_usize, cols_usize) = matrix_attributes(request)?;
+    if rows_usize == 0 {
+        return Err(attribute_value("rows", "positive"));
+    }
+    if cols_usize == 0 {
+        return Err(attribute_value("cols", "positive"));
+    }
+    if weight_shape != [rows, cols] || scale_shape != [rows] || !tau_shape.is_empty() {
+        return Err(shape_error());
+    }
+    reject_nonfinite("weight", weight)?;
+    reject_nonfinite("scale", scale)?;
+    reject_nonfinite("tau", tau)?;
+    if tau[0] <= 0.0 {
+        return Err(attribute_value("tau", "positive"));
+    }
+    if tau[0] < hestia::MIN_DIFFERENTIABLE_TAU {
+        return Err(attribute_value("tau", "min_differentiable"));
+    }
+    require_f32_output(output, "result", weight_shape)?;
+    let result = hestia::hestia_forward(weight, scale, tau, rows_usize, cols_usize);
+    output_f32(output, "result")?.copy_from_slice(&result);
+    Ok(())
+}
+
+fn hestia_relax_vjp(
+    request: &TrainRequestV1<'_>,
+    output: &mut TrainOutputV1<'_>,
+) -> Result<(), TrainBackendError> {
+    require_contract(request, output, &HESTIA_VJP)?;
+    let (weight_shape, weight) = input_f32(request, "weight")?;
+    let (scale_shape, scale) = input_f32(request, "scale")?;
+    let (tau_shape, tau) = input_f32(request, "tau")?;
+    let (gradient_shape, grad_output) = input_f32(request, "grad_output")?;
+    let (rows, cols, rows_usize, cols_usize) = matrix_attributes(request)?;
+    if rows_usize == 0 {
+        return Err(attribute_value("rows", "positive"));
+    }
+    if cols_usize == 0 {
+        return Err(attribute_value("cols", "positive"));
+    }
+    if weight_shape != [rows, cols]
+        || scale_shape != [rows]
+        || !tau_shape.is_empty()
+        || gradient_shape != weight_shape
+    {
+        return Err(shape_error());
+    }
+    reject_nonfinite("weight", weight)?;
+    reject_nonfinite("scale", scale)?;
+    reject_nonfinite("tau", tau)?;
+    reject_nonfinite("grad_output", grad_output)?;
+    if tau[0] <= 0.0 {
+        return Err(attribute_value("tau", "positive"));
+    }
+    if tau[0] < hestia::MIN_DIFFERENTIABLE_TAU {
+        return Err(attribute_value("tau", "min_differentiable"));
+    }
+    require_f32_output(output, "grad_weight", weight_shape)?;
+    require_f32_output(output, "grad_scale", scale_shape)?;
+    require_f32_output(output, "grad_tau", tau_shape)?;
+    let gradients = hestia::hestia_vjp(weight, scale, tau, rows_usize, cols_usize, grad_output);
+    output_f32(output, "grad_weight")?.copy_from_slice(&gradients[0]);
+    output_f32(output, "grad_scale")?.copy_from_slice(&gradients[1]);
+    output_f32(output, "grad_tau")?.copy_from_slice(&gradients[2]);
     Ok(())
 }
 

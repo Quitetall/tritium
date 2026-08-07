@@ -6,11 +6,12 @@ use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 use tritium_spec::{
     TrainBackendV1, TrainCapabilitiesV1, TrainDTypeV1, TrainExecutionV1, TrainLimitsV1,
-    TrainReceiptV1, TrainingOpManifestV2, TrainingVectorBufferDataV1, TrainingVectorBufferV1,
-    TrainingVectorExpectedV1, TrainingVectorSetV2,
+    TrainReceiptV1, TrainingVectorBufferDataV1, TrainingVectorBufferV1, TrainingVectorExpectedV1,
 };
 
-use crate::{portable_training::canonical_case_input_digest, run_training_conformance};
+use crate::{
+    TrainingVectorCorpus, portable_training::canonical_case_input_digest, run_training_conformance,
+};
 
 const SCHEMA_ID: &str = "tritium.training_receipts";
 const SCHEMA_VERSION: u32 = 1;
@@ -246,7 +247,7 @@ struct ReceiptWire {
 /// devices, fallback residency, or inconsistent receipts.
 pub fn seal_training_receipts(
     backend: &dyn TrainBackendV1,
-    vectors: &TrainingVectorSetV2,
+    vectors: &impl TrainingVectorCorpus,
 ) -> Result<SealedTrainingReceiptBundleV1, TrainingReceiptBundleError> {
     let report = run_training_conformance(backend, vectors);
     if !report.failed.is_empty() {
@@ -342,7 +343,7 @@ pub fn seal_training_receipts(
 /// malformed digests, anonymous devices, or nonresident/fallback receipts.
 pub fn admit_training_receipts(
     bytes: &[u8],
-    vectors: &TrainingVectorSetV2,
+    vectors: &impl TrainingVectorCorpus,
     expected_bundle_digest: [u8; 32],
     source_policy: TrainingReceiptSourcePolicyV1,
 ) -> Result<AdmittedTrainingReceiptBundleV1, TrainingReceiptBundleError> {
@@ -447,7 +448,7 @@ fn render_training_capability_rows(
 
 fn validate_capabilities(
     capabilities: &TrainCapabilitiesV1,
-    vectors: &TrainingVectorSetV2,
+    vectors: &impl TrainingVectorCorpus,
 ) -> Result<(), TrainingReceiptBundleError> {
     if capabilities.backend_id.trim().is_empty() {
         return Err(TrainingReceiptBundleError::Capabilities(
@@ -459,7 +460,8 @@ fn validate_capabilities(
             "manifest_digest".to_owned(),
         ));
     }
-    let expected: Vec<_> = TrainingOpManifestV2::operations()
+    let expected: Vec<_> = vectors
+        .operations()
         .iter()
         .map(|operation| operation.id.to_owned())
         .collect();
@@ -485,7 +487,7 @@ fn validate_capabilities(
 fn validate_receipt(
     receipt: &TrainReceiptV1,
     capabilities: &TrainCapabilitiesV1,
-    vectors: &TrainingVectorSetV2,
+    vectors: &impl TrainingVectorCorpus,
     physical_device: &str,
     backend_build: &str,
     case_id: &str,
@@ -526,7 +528,7 @@ fn validate_receipt(
 
 fn validate_wire(
     wire: &BundleWire,
-    vectors: &TrainingVectorSetV2,
+    vectors: &impl TrainingVectorCorpus,
     source_policy: TrainingReceiptSourcePolicyV1,
 ) -> Result<(), TrainingReceiptBundleError> {
     if wire.backend_id.trim().is_empty()
@@ -545,7 +547,8 @@ fn validate_wire(
             "manifest/vector_digest".to_owned(),
         ));
     }
-    let expected_operations: Vec<_> = TrainingOpManifestV2::operations()
+    let expected_operations: Vec<_> = vectors
+        .operations()
         .iter()
         .map(|operation| operation.id.to_owned())
         .collect();

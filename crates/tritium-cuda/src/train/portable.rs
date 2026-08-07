@@ -7,7 +7,7 @@ use tritium_spec::{
     BackendError, TernaryBackend, TrainAttributeValueV1, TrainBackendError, TrainBackendV1,
     TrainBufferDataMutV1, TrainBufferDataRefV1, TrainCapabilitiesV1, TrainDTypeV1,
     TrainExecutionV1, TrainLimitsV1, TrainOperationErrorV1, TrainOutputV1, TrainReceiptV1,
-    TrainRequestV1, TrainingOpManifestV2, train_output_digest_v1, train_request_digest_v1,
+    TrainRequestV1, TrainingOpManifestV3, train_output_digest_v1, train_request_digest_v1,
 };
 
 use super::DeviceTape;
@@ -55,6 +55,7 @@ const OPERATIONS: &[&str] = &[
     "lifecycle.resume",
     "lifecycle.export",
     "lifecycle.reload",
+    "graph.hestia_relax",
 ];
 const LIMITS: TrainLimitsV1 = TrainLimitsV1 {
     max_rank: 4,
@@ -419,6 +420,103 @@ impl CudaTrainBackendV1 {
             let grad_alpha = download_device(&self.backend, &device_grad_alpha, rows)?;
             output_f32(output, "grad_weight", &shape, elements)?.copy_from_slice(&grad_weight);
             output_f32(output, "grad_alpha", &[rows as u64], rows)?.copy_from_slice(&grad_alpha);
+        }
+        Ok(())
+    }
+
+    fn execute_hestia_relax(
+        &self,
+        request: &TrainRequestV1<'_>,
+        output: &mut TrainOutputV1<'_>,
+    ) -> Result<(), TrainBackendError> {
+        let expected_inputs: &[&str] = match request.execution {
+            TrainExecutionV1::Forward => &["weight", "scale", "tau"],
+            TrainExecutionV1::Vjp => &["weight", "scale", "tau", "grad_output"],
+            _ => return Err(invariant("hestia_relax received an illegal phase")),
+        };
+        require_names(
+            request.inputs.iter().map(|buffer| buffer.name),
+            expected_inputs,
+            "inputs",
+        )?;
+        require_names(
+            request.attributes.iter().map(|attribute| attribute.name),
+            &["rows", "cols"],
+            "attributes",
+        )?;
+        let expected_outputs: &[&str] = match request.execution {
+            TrainExecutionV1::Forward => &["result"],
+            TrainExecutionV1::Vjp => &["grad_weight", "grad_scale", "grad_tau"],
+            _ => unreachable!(),
+        };
+        require_names(
+            output.buffers.iter().map(|buffer| buffer.name),
+            expected_outputs,
+            "outputs",
+        )?;
+        let rows = attribute_usize(request, "rows")?;
+        let cols = attribute_usize(request, "cols")?;
+        if rows == 0 {
+            return Err(attribute_value("rows", "positive"));
+        }
+        if cols == 0 {
+            return Err(attribute_value("cols", "positive"));
+        }
+        let elements = rows.checked_mul(cols).ok_or_else(shape_error)?;
+        let shape = [rows as u64, cols as u64];
+        let weight = input_f32(request, "weight", &shape)?;
+        let scale = input_f32(request, "scale", &[rows as u64])?;
+        let tau = input_f32(request, "tau", &[])?;
+        require_finite("weight", weight)?;
+        require_finite("scale", scale)?;
+        require_finite("tau", tau)?;
+        if tau[0] <= 0.0 {
+            return Err(attribute_value("tau", "positive"));
+        }
+        if tau[0] < tritium_train::ops::hestia::MIN_DIFFERENTIABLE_TAU {
+            return Err(attribute_value("tau", "min_differentiable"));
+        }
+        let device_weight = self.backend.dev_upload(weight).map_err(cuda_error)?;
+        let device_scale = self.backend.dev_upload(scale).map_err(cuda_error)?;
+        let device_tau = self.backend.dev_upload(tau).map_err(cuda_error)?;
+        if request.execution == TrainExecutionV1::Forward {
+            let mut device_result = self.backend.dev_alloc_zeros(elements).map_err(cuda_error)?;
+            self.backend
+                .hestia_relax_forward_dev(
+                    &device_weight,
+                    &device_scale,
+                    &device_tau,
+                    &mut device_result,
+                    rows,
+                    cols,
+                )
+                .map_err(cuda_error)?;
+            let result = download_device(&self.backend, &device_result, elements)?;
+            output_f32(output, "result", &shape, elements)?.copy_from_slice(&result);
+        } else {
+            let upstream = input_f32(request, "grad_output", &shape)?;
+            require_finite("grad_output", upstream)?;
+            let device_upstream = self.backend.dev_upload(upstream).map_err(cuda_error)?;
+            let mut device_grad_weight =
+                self.backend.dev_alloc_zeros(elements).map_err(cuda_error)?;
+            let mut device_grad_tau = self.backend.dev_alloc_zeros(1).map_err(cuda_error)?;
+            self.backend
+                .hestia_relax_backward_dev(
+                    &device_weight,
+                    &device_scale,
+                    &device_tau,
+                    &device_upstream,
+                    &mut device_grad_weight,
+                    &mut device_grad_tau,
+                    rows,
+                    cols,
+                )
+                .map_err(cuda_error)?;
+            let grad_weight = download_device(&self.backend, &device_grad_weight, elements)?;
+            let grad_tau = download_device(&self.backend, &device_grad_tau, 1)?;
+            output_f32(output, "grad_weight", &shape, elements)?.copy_from_slice(&grad_weight);
+            output_f32(output, "grad_scale", &[rows as u64], rows)?.fill(0.0);
+            output_f32(output, "grad_tau", &[], 1)?.copy_from_slice(&grad_tau);
         }
         Ok(())
     }
@@ -2571,7 +2669,7 @@ impl TrainBackendV1 for CudaTrainBackendV1 {
     fn capabilities(&self) -> TrainCapabilitiesV1 {
         TrainCapabilitiesV1 {
             backend_id: self.backend_id.clone(),
-            manifest_digest: TrainingOpManifestV2::digest(),
+            manifest_digest: TrainingOpManifestV3::digest(),
             supported_operations: OPERATIONS
                 .iter()
                 .map(|operation| (*operation).to_owned())
@@ -2593,6 +2691,7 @@ impl TrainBackendV1 for CudaTrainBackendV1 {
             "graph.ste_surrogate" => self.execute_ste_surrogate(&request, output)?,
             "graph.salt_ste" => self.execute_salt_ste(&request, output)?,
             "graph.lsq_ste" => self.execute_lsq(&request, output)?,
+            "graph.hestia_relax" => self.execute_hestia_relax(&request, output)?,
             "graph.fsq" => self.execute_fsq(&request, output)?,
             "graph.dense_matmul" => self.execute_dense_matmul(&request, output)?,
             "graph.ternary_matmul" => self.execute_ternary_matmul(&request, output)?,
@@ -2638,6 +2737,12 @@ impl TrainBackendV1 for CudaTrainBackendV1 {
             ("graph.salt_ste", TrainExecutionV1::Forward) => attribute_u64(&request, "cols")?
                 .checked_mul(size_of::<f32>() as u64)
                 .ok_or_else(shape_error)?,
+            ("graph.hestia_relax", TrainExecutionV1::Vjp) => {
+                let rows = attribute_usize(&request, "rows")?;
+                let cols = attribute_usize(&request, "cols")?;
+                let elements = rows.checked_mul(cols).ok_or_else(shape_error)?;
+                CudaBackend::hestia_tau_scratch_bytes(elements).map_err(cuda_error)?
+            }
             ("optimizer.cautious_adamw", TrainExecutionV1::Step) => {
                 let (_, parameter) = input_f32_any_shape(&request, "parameter")?;
                 (parameter.len() as u64)
@@ -2697,7 +2802,7 @@ impl TrainBackendV1 for CudaTrainBackendV1 {
             backend_id: self.backend_id.clone(),
             backend_build: backend_build_identity(),
             physical_device: Some(self.physical_device.clone()),
-            manifest_digest: TrainingOpManifestV2::digest(),
+            manifest_digest: TrainingOpManifestV3::digest(),
             vector_digest: request.vector_digest,
             operation: request.operation.to_owned(),
             execution: request.execution,

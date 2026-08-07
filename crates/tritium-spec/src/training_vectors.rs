@@ -7,12 +7,13 @@ use serde::Deserialize;
 
 use crate::{
     TrainExecutionV1, TrainingOpCategoryV1, TrainingOpDescriptorV1, TrainingOpManifestV1,
-    TrainingOpManifestV2, TrainingVjpV1,
+    TrainingOpManifestV2, TrainingOpManifestV3, TrainingVjpV1,
 };
 
 const SCHEMA_ID: &str = "tritium.training_vectors";
 const CANONICAL_JSON_V1: &[u8] = include_bytes!("../data/training/v1/vectors/v1.json");
 const CANONICAL_JSON_V2: &[u8] = include_bytes!("../data/training/v2/vectors/v2.json");
+const CANONICAL_JSON_V3: &[u8] = include_bytes!("../data/training/v3/vectors/v3.json");
 
 /// Exact or bounded comparison policy for one semantic vector.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -239,6 +240,70 @@ impl TrainingVectorSetV2 {
             Self::SCHEMA_VERSION,
             TrainingOpManifestV2::digest(),
             TrainingOpManifestV2::operations(),
+        )?;
+        Ok(Self {
+            manifest_digest: parsed.manifest_digest,
+            source_digest: parsed.source_digest,
+            cases: parsed.cases,
+        })
+    }
+
+    /// Exact manifest digest declared by this corpus.
+    #[must_use]
+    pub const fn manifest_digest(&self) -> [u8; 32] {
+        self.manifest_digest
+    }
+
+    /// BLAKE3 digest of exact source bytes accepted by parser.
+    #[must_use]
+    pub const fn source_digest(&self) -> [u8; 32] {
+        self.source_digest
+    }
+
+    /// Canonically ordered cases as parsed from corpus.
+    #[must_use]
+    pub fn cases(&self) -> &[TrainingVectorCaseV1] {
+        &self.cases
+    }
+}
+
+/// Parsed v3 semantic-vector corpus bound to exact v3 manifest.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TrainingVectorSetV3 {
+    manifest_digest: [u8; 32],
+    source_digest: [u8; 32],
+    cases: Vec<TrainingVectorCaseV1>,
+}
+
+impl TrainingVectorSetV3 {
+    /// Permanent schema identifier.
+    pub const SCHEMA_ID: &'static str = SCHEMA_ID;
+    /// Frozen schema version.
+    pub const SCHEMA_VERSION: u32 = 3;
+
+    /// Exact canonical corpus bytes, including one terminal newline.
+    #[must_use]
+    pub const fn canonical_json() -> &'static [u8] {
+        CANONICAL_JSON_V3
+    }
+
+    /// BLAKE3 digest of exact canonical corpus bytes.
+    #[must_use]
+    pub fn digest() -> [u8; 32] {
+        *blake3::hash(CANONICAL_JSON_V3).as_bytes()
+    }
+
+    /// Parse and validate a v3 vector corpus.
+    ///
+    /// # Errors
+    /// Returns [`TrainingVectorError`] for malformed JSON, schema/manifest
+    /// drift, duplicate identifiers, illegal phases or invalid payloads.
+    pub fn parse_json(bytes: &[u8]) -> Result<Self, TrainingVectorError> {
+        let parsed = parse_vector_set(
+            bytes,
+            Self::SCHEMA_VERSION,
+            TrainingOpManifestV3::digest(),
+            TrainingOpManifestV3::operations(),
         )?;
         Ok(Self {
             manifest_digest: parsed.manifest_digest,

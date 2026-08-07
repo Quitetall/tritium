@@ -3,6 +3,7 @@
 use tritium_spec::{
     BackendError, TrainBackendError, TrainBackendV1, TrainBufferDataMutV1, TrainBufferDataRefV1,
     TrainCapabilitiesV1, TrainLimitsV1, TrainOutputV1, TrainReceiptV1, TrainRequestV1,
+    TrainingOpManifestV2,
 };
 use tritium_train::CpuTrainBackendV1;
 
@@ -63,6 +64,11 @@ impl TrainBackendV1 for WasmTrainBackendV1 {
     fn capabilities(&self) -> TrainCapabilitiesV1 {
         let mut capabilities = self.reference.capabilities();
         capabilities.backend_id = BACKEND_ID.to_owned();
+        capabilities.manifest_digest = TrainingOpManifestV2::digest();
+        capabilities.supported_operations = TrainingOpManifestV2::operations()
+            .iter()
+            .map(|operation| operation.id.to_owned())
+            .collect();
         capabilities.limits = LIMITS;
         capabilities.device_resident = true;
         capabilities
@@ -73,6 +79,14 @@ impl TrainBackendV1 for WasmTrainBackendV1 {
         request: TrainRequestV1<'_>,
         output: &mut TrainOutputV1<'_>,
     ) -> Result<TrainReceiptV1, TrainBackendError> {
+        if !TrainingOpManifestV2::operations()
+            .iter()
+            .any(|operation| operation.id == request.operation)
+        {
+            return Err(TrainBackendError::UnsupportedOperation(
+                request.operation.to_owned(),
+            ));
+        }
         request.validate_with_limits(output, LIMITS)?;
         let caller_bytes = caller_bytes(&request, output)?;
         if caller_bytes > MAX_CALLER_BYTES {
@@ -88,6 +102,7 @@ impl TrainBackendV1 for WasmTrainBackendV1 {
         receipt.backend_id = BACKEND_ID.to_owned();
         receipt.backend_build = backend_build_identity();
         receipt.physical_device = Some(self.physical_device.clone());
+        receipt.manifest_digest = TrainingOpManifestV2::digest();
         receipt.limits = LIMITS;
         receipt.host_transfers = 0;
         receipt.device_resident = true;

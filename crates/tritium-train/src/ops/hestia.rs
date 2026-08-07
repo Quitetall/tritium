@@ -17,9 +17,16 @@
 //! all-zero `g_sq`. `τ` (shared, `[1]`) IS trainable: it receives the exact temperature
 //! gradient so the anneal can be learned rather than imposed.
 //!
-//! Caller contract: `τ > 0`. A degenerate `τ <= 0` yields an all-zero output with zero
-//! gradients, and `s[r] == 0` zeroes that row the same way — the LSQ convention for
-//! invalid `α` ([`lsq_forward`](super::ste::lsq_forward)).
+//! Caller contract: `τ >= MIN_DIFFERENTIABLE_TAU`. Smaller temperatures cannot square in
+//! binary32 without underflow and therefore cannot represent the exact temperature VJP. An
+//! out-of-contract temperature yields an all-zero output with zero gradients, and `s[r] == 0`
+//! zeroes that row the same way — the LSQ convention for invalid `α`
+//! ([`lsq_forward`](super::ste::lsq_forward)).
+
+/// Smallest binary32 temperature whose square remains normal and supports finite VJP algebra.
+///
+/// This is exactly `sqrt(f32::MIN_POSITIVE) == 2^-63`, matching Python HESTIA admission.
+pub const MIN_DIFFERENTIABLE_TAU: f32 = f32::from_bits(0x2000_0000);
 
 /// Softmax over the ternary grid at normalized weight `z`: `[π₋₁, π₀, π₊₁]`.
 /// Max-subtracted (small `τ` makes the logits large-magnitude negatives). The partition
@@ -42,7 +49,7 @@ fn trit_softmax(z: f32, tau: f32) -> [f32; 3] {
 pub fn hestia_forward(wf: &[f32], s: &[f32], tau: &[f32], rows: usize, cols: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; rows * cols];
     let t = tau[0];
-    if t <= 0.0 {
+    if t < MIN_DIFFERENTIABLE_TAU {
         return out;
     }
     for r in 0..rows {
@@ -61,10 +68,10 @@ pub fn hestia_forward(wf: &[f32], s: &[f32], tau: &[f32], rows: usize, cols: usi
 
 /// Exact vjp of [`hestia_forward`] → `[gWf, gS, gTau]`.
 ///
-/// With `ā = Σ_k π_k·a'_k` and `a'_q = da_q/dz = -2(z-q)/τ`:
-/// `dE/dz = Σ_q q·π_q·(a'_q - ā)`, and `d out/d Wf = s·(dE/dz)·(1/s) = dE/dz` — the scale
-/// cancels, so `gWf[i] = g[i]·dE/dz`. With `b_q = da_q/dτ = (z-q)²/τ²` and `b̄ = Σ_k π_k·b_k`:
-/// `dE/dτ = Σ_q q·π_q·(b_q - b̄)`, so `gTau[0] = Σ_i g[i]·s[r(i)]·dE_i/dτ`. `gS` is all-zero
+/// `dE/dz` and `dE/dτ` use the pairwise covariance identity. This evaluates the
+/// temperature numerator before its single division by `τ²`, avoiding the undefined
+/// `0·∞` produced by separately materializing `(z-q)²/τ²` at the admitted floor.
+/// `d out/d Wf = s·(dE/dz)·(1/s) = dE/dz`, so the scale cancels. `gS` is all-zero
 /// (stop-gradient on the scale, see module docs). Degenerate rows/`τ` contribute nothing.
 #[must_use]
 #[allow(clippy::needless_range_loop)]
@@ -80,7 +87,7 @@ pub fn hestia_vjp(
     let g_s = vec![0.0f32; rows];
     let mut g_tau = 0.0f32;
     let t = tau[0];
-    if t > 0.0 {
+    if t >= MIN_DIFFERENTIABLE_TAU {
         for r in 0..rows {
             let sr = s[r];
             if sr == 0.0 {
@@ -89,18 +96,32 @@ pub fn hestia_vjp(
             for c in 0..cols {
                 let i = r * cols + c;
                 let z = wf[i] / sr;
-                let d = [z + 1.0, z, z - 1.0];
                 let pi = trit_softmax(z, t);
-                let ap = [-2.0 * d[0] / t, -2.0 * d[1] / t, -2.0 * d[2] / t];
-                let abar = pi[0] * ap[0] + pi[1] * ap[1] + pi[2] * ap[2];
-                g_wf[i] = grad_out[i] * (pi[2] * (ap[2] - abar) - pi[0] * (ap[0] - abar));
-                let b = [
-                    d[0] * d[0] / (t * t),
-                    d[1] * d[1] / (t * t),
-                    d[2] * d[2] / (t * t),
-                ];
-                let bbar = pi[0] * b[0] + pi[1] * b[1] + pi[2] * b[2];
-                g_tau += grad_out[i] * sr * (pi[2] * (b[2] - bbar) - pi[0] * (b[0] - bbar));
+                let edge_mass = pi[0] * pi[1] + pi[1] * pi[2];
+                let span_mass = pi[0] * pi[2];
+                let d_e_d_z = (2.0 / t) * (edge_mass + 4.0 * span_mass);
+                g_wf[i] = grad_out[i] * d_e_d_z;
+
+                let minus_zero_mass = pi[0] * pi[1];
+                let zero_plus_mass = pi[1] * pi[2];
+                let minus_plus_mass = pi[0] * pi[2];
+                let minus_zero = if minus_zero_mass == 0.0 {
+                    0.0
+                } else {
+                    -minus_zero_mass * (2.0 * z + 1.0)
+                };
+                let zero_plus = if zero_plus_mass == 0.0 {
+                    0.0
+                } else {
+                    -zero_plus_mass * (2.0 * z - 1.0)
+                };
+                let minus_plus = if minus_plus_mass == 0.0 {
+                    0.0
+                } else {
+                    -8.0 * minus_plus_mass * z
+                };
+                let d_e_d_tau = ((minus_zero + zero_plus) + minus_plus) / (t * t);
+                g_tau += grad_out[i] * sr * d_e_d_tau;
             }
         }
     }

@@ -118,6 +118,35 @@ fn zero_scale_row_outputs_and_grads_zero() {
 }
 
 #[test]
+fn unrepresentable_temperature_fails_closed_without_nan() {
+    let weight = [0.25f32, -0.75, 1.0, -1.5];
+    let scale = [0.5f32, 1.25];
+    let tau = [hestia::MIN_DIFFERENTIABLE_TAU * 0.5];
+    let grad_output = [1.0f32; 4];
+    assert_eq!(
+        hestia::hestia_forward(&weight, &scale, &tau, 2, 2),
+        [0.0; 4]
+    );
+    assert_eq!(
+        hestia::hestia_vjp(&weight, &scale, &tau, 2, 2, &grad_output),
+        [vec![0.0; 4], vec![0.0; 2], vec![0.0]]
+    );
+}
+
+#[test]
+fn exact_temperature_floor_has_finite_exact_vjp() {
+    let weight = [1.0f32];
+    let scale = [1.0f32];
+    let tau = [hestia::MIN_DIFFERENTIABLE_TAU];
+    let grad_output = [1.0f32];
+    assert_eq!(hestia::hestia_forward(&weight, &scale, &tau, 1, 1), [1.0]);
+    assert_eq!(
+        hestia::hestia_vjp(&weight, &scale, &tau, 1, 1, &grad_output),
+        [vec![0.0], vec![0.0], vec![0.0]]
+    );
+}
+
+#[test]
 fn tape_hestia_relax_smoke() {
     // Record → backward through MSE: grads carry the input shapes, the scale grad is all-zero
     // (stop-gradient), and both Wf and τ receive nonzero gradients.

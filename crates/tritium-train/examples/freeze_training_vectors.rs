@@ -14,14 +14,14 @@ use tritium_format::salt_v2::SaltV2Codec;
 use tritium_format::salt_v2_package::{
     SaltV2Package, SaltV2Plane, SaltV2Tensor, SaltV2Tile, write_salt_v2_package,
 };
-use tritium_spec::{TrainingOpManifestV2, TrainingVectorSetV2};
+use tritium_spec::{TrainingOpManifestV3, TrainingVectorSetV3};
 use tritium_train::{
     AdamState, AdamW, CautiousAdamW, Int8AdamW, Muon, Optimizer, Sgd,
     checkpoint::{Checkpoint, LeafCheckpoint, write_checkpoint},
     ops::{
         act, attention, bias, conv1d, conv2d, dense, elementwise, embed,
         fsq::{self, FsqBound, FsqCfg, FsqSte},
-        loss, matmul, norm, rope, shape, softmax, ste,
+        hestia, loss, matmul, norm, rope, shape, softmax, ste,
     },
 };
 
@@ -199,6 +199,16 @@ fn main() {
     let learned_scale = [0.75_f32, 1.25];
     let lsq_result = ste::lsq_forward(&quant_weight, &learned_scale, 2, 3);
     let lsq_grads = ste::lsq_vjp(&quant_weight, &learned_scale, 2, 3, &quant_grad_output);
+    let hestia_tau = [0.7_f32];
+    let hestia_result = hestia::hestia_forward(&quant_weight, &quant_scale, &hestia_tau, 2, 3);
+    let hestia_grads = hestia::hestia_vjp(
+        &quant_weight,
+        &quant_scale,
+        &hestia_tau,
+        2,
+        3,
+        &quant_grad_output,
+    );
 
     let fsq_input = [-1.2_f32, -0.25, 0.6, 0.9, 0.1, -0.9];
     let fsq_cfg = FsqCfg {
@@ -663,9 +673,9 @@ fn main() {
     corrupt_artifact[0] ^= u8::MAX;
 
     let corpus = Corpus {
-        schema_id: TrainingVectorSetV2::SCHEMA_ID,
-        schema_version: TrainingVectorSetV2::SCHEMA_VERSION,
-        manifest_digest: hex(&TrainingOpManifestV2::digest()),
+        schema_id: TrainingVectorSetV3::SCHEMA_ID,
+        schema_version: TrainingVectorSetV3::SCHEMA_VERSION,
+        manifest_digest: hex(&TrainingOpManifestV3::digest()),
         cases: vec![
             Case {
                 case_id: "graph.add.forward.basic",
@@ -3391,21 +3401,172 @@ fn main() {
                     outputs: vec![f32_buffer("result", &[], &[123.0])],
                 },
             },
+            Case {
+                case_id: "graph.hestia_relax.forward.basic",
+                operation: "graph.hestia_relax",
+                execution: "forward",
+                tolerance: Tolerance::BitExact,
+                inputs: vec![
+                    f32_buffer("weight", &[2, 3], &quant_weight),
+                    f32_buffer("scale", &[2], &quant_scale),
+                    f32_buffer("tau", &[], &hestia_tau),
+                ],
+                attributes: vec![
+                    Attribute::U64 {
+                        name: "rows",
+                        value: 2,
+                    },
+                    Attribute::U64 {
+                        name: "cols",
+                        value: 3,
+                    },
+                ],
+                expected: Expected::Success {
+                    outputs: vec![f32_buffer("result", &[2, 3], &hestia_result)],
+                    scratch_bytes_max: 0,
+                },
+            },
+            Case {
+                case_id: "graph.hestia_relax.vjp.basic",
+                operation: "graph.hestia_relax",
+                execution: "vjp",
+                tolerance: Tolerance::BitExact,
+                inputs: vec![
+                    f32_buffer("weight", &[2, 3], &quant_weight),
+                    f32_buffer("scale", &[2], &quant_scale),
+                    f32_buffer("tau", &[], &hestia_tau),
+                    f32_buffer("grad_output", &[2, 3], &quant_grad_output),
+                ],
+                attributes: vec![
+                    Attribute::U64 {
+                        name: "rows",
+                        value: 2,
+                    },
+                    Attribute::U64 {
+                        name: "cols",
+                        value: 3,
+                    },
+                ],
+                expected: Expected::Success {
+                    outputs: vec![
+                        f32_buffer("grad_weight", &[2, 3], &hestia_grads[0]),
+                        f32_buffer("grad_scale", &[2], &hestia_grads[1]),
+                        f32_buffer("grad_tau", &[], &hestia_grads[2]),
+                    ],
+                    scratch_bytes_max: 0,
+                },
+            },
+            Case {
+                case_id: "graph.hestia_relax.forward.invalid_tau",
+                operation: "graph.hestia_relax",
+                execution: "forward",
+                tolerance: Tolerance::BitExact,
+                inputs: vec![
+                    f32_buffer("weight", &[2, 3], &quant_weight),
+                    f32_buffer("scale", &[2], &quant_scale),
+                    f32_buffer("tau", &[], &[0.0]),
+                ],
+                attributes: vec![
+                    Attribute::U64 {
+                        name: "rows",
+                        value: 2,
+                    },
+                    Attribute::U64 {
+                        name: "cols",
+                        value: 3,
+                    },
+                ],
+                expected: Expected::Error {
+                    category: "invalid_operation",
+                    code: "attribute_value.tau.positive",
+                    outputs: vec![f32_buffer("result", &[2, 3], &[123.0; 6])],
+                },
+            },
+            Case {
+                case_id: "graph.hestia_relax.vjp.unrepresentable_tau",
+                operation: "graph.hestia_relax",
+                execution: "vjp",
+                tolerance: Tolerance::BitExact,
+                inputs: vec![
+                    f32_buffer("weight", &[2, 3], &quant_weight),
+                    f32_buffer("scale", &[2], &quant_scale),
+                    f32_buffer("tau", &[], &[hestia::MIN_DIFFERENTIABLE_TAU * 0.5]),
+                    f32_buffer("grad_output", &[2, 3], &quant_grad_output),
+                ],
+                attributes: vec![
+                    Attribute::U64 {
+                        name: "rows",
+                        value: 2,
+                    },
+                    Attribute::U64 {
+                        name: "cols",
+                        value: 3,
+                    },
+                ],
+                expected: Expected::Error {
+                    category: "invalid_operation",
+                    code: "attribute_value.tau.min_differentiable",
+                    outputs: vec![
+                        f32_buffer("grad_weight", &[2, 3], &[123.0; 6]),
+                        f32_buffer("grad_scale", &[2], &[123.0; 2]),
+                        f32_buffer("grad_tau", &[], &[123.0]),
+                    ],
+                },
+            },
+            Case {
+                case_id: "graph.hestia_relax.vjp.invalid_shape",
+                operation: "graph.hestia_relax",
+                execution: "vjp",
+                tolerance: Tolerance::BitExact,
+                inputs: vec![
+                    f32_buffer("weight", &[6], &quant_weight),
+                    f32_buffer("scale", &[2], &quant_scale),
+                    f32_buffer("tau", &[], &hestia_tau),
+                    f32_buffer("grad_output", &[2, 3], &quant_grad_output),
+                ],
+                attributes: vec![
+                    Attribute::U64 {
+                        name: "rows",
+                        value: 2,
+                    },
+                    Attribute::U64 {
+                        name: "cols",
+                        value: 3,
+                    },
+                ],
+                expected: Expected::Error {
+                    category: "invalid_operation",
+                    code: "shape",
+                    outputs: vec![
+                        f32_buffer("grad_weight", &[2, 3], &[123.0; 6]),
+                        f32_buffer("grad_scale", &[2], &[123.0; 2]),
+                        f32_buffer("grad_tau", &[], &[123.0]),
+                    ],
+                },
+            },
         ],
     };
 
     let mut bytes = serde_json::to_vec_pretty(&corpus).expect("serialize tracer corpus");
     bytes.push(b'\n');
-    TrainingVectorSetV2::parse_json(&bytes).expect("generated corpus must validate");
+    TrainingVectorSetV3::parse_json(&bytes).expect("generated corpus must validate");
 
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../spec/training/v2/vectors/v2.json");
-    let temporary = path.with_extension("json.tmp");
-    std::fs::write(&temporary, &bytes).expect("write temporary vector corpus");
-    std::fs::rename(&temporary, &path).expect("atomically replace vector corpus");
+    let paths = [
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../spec/training/v3/vectors/v3.json"),
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../tritium-spec/data/training/v3/vectors/v3.json"),
+    ];
+    for path in &paths {
+        std::fs::create_dir_all(path.parent().expect("vector parent"))
+            .expect("create vector directory");
+        let temporary = path.with_extension("json.tmp");
+        std::fs::write(&temporary, &bytes).expect("write temporary vector corpus");
+        std::fs::rename(&temporary, path).expect("atomically replace vector corpus");
+    }
     eprintln!(
         "froze {} cases -> {} ({})",
         corpus.cases.len(),
-        path.display(),
+        paths[0].display(),
         hex(blake3::hash(&bytes).as_bytes())
     );
 }

@@ -3,11 +3,49 @@
 use tritium_spec::{
     TrainAttributeV1, TrainAttributeValueV1, TrainBackendError, TrainBackendV1, TrainExecutionV1,
     TrainOperationErrorV1, TrainOutputV1, TrainOwnedBufferDataV1, TrainOwnedBufferV1,
-    TrainReceiptV1, TrainRequestError, TrainRequestV1, TrainingToleranceV1,
+    TrainReceiptV1, TrainRequestError, TrainRequestV1, TrainingOpDescriptorV1, TrainingToleranceV1,
     TrainingVectorAttributeV1, TrainingVectorAttributeValueV1, TrainingVectorBufferDataV1,
     TrainingVectorBufferV1, TrainingVectorCaseV1, TrainingVectorErrorCategoryV1,
-    TrainingVectorExpectedV1, TrainingVectorSetV2, train_output_digest_v1, train_request_digest_v1,
+    TrainingVectorExpectedV1, TrainingVectorSetV2, TrainingVectorSetV3, train_output_digest_v1,
+    train_request_digest_v1,
 };
+
+/// Common read-only view over append-only portable-training vector corpora.
+pub trait TrainingVectorCorpus {
+    /// Exact manifest digest declared by this corpus.
+    fn manifest_digest(&self) -> [u8; 32];
+    /// BLAKE3 digest of exact corpus bytes accepted by its parser.
+    fn source_digest(&self) -> [u8; 32];
+    /// Canonically ordered semantic cases.
+    fn cases(&self) -> &[TrainingVectorCaseV1];
+    /// Exact append-only operation registry bound to this corpus.
+    fn operations(&self) -> &[TrainingOpDescriptorV1];
+}
+
+macro_rules! impl_training_vector_corpus {
+    ($corpus:ty, $manifest:ty) => {
+        impl TrainingVectorCorpus for $corpus {
+            fn manifest_digest(&self) -> [u8; 32] {
+                self.manifest_digest()
+            }
+
+            fn source_digest(&self) -> [u8; 32] {
+                self.source_digest()
+            }
+
+            fn cases(&self) -> &[TrainingVectorCaseV1] {
+                self.cases()
+            }
+
+            fn operations(&self) -> &[TrainingOpDescriptorV1] {
+                <$manifest>::operations()
+            }
+        }
+    };
+}
+
+impl_training_vector_corpus!(TrainingVectorSetV2, tritium_spec::TrainingOpManifestV2);
+impl_training_vector_corpus!(TrainingVectorSetV3, tritium_spec::TrainingOpManifestV3);
 
 /// One portable-training vector that matched its frozen result.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -95,7 +133,7 @@ impl TrainingConformanceReport {
 #[must_use]
 pub fn run_training_conformance(
     backend: &dyn TrainBackendV1,
-    vectors: &TrainingVectorSetV2,
+    vectors: &impl TrainingVectorCorpus,
 ) -> TrainingConformanceReport {
     run_training_conformance_matching(backend, vectors, |_| true)
 }
@@ -108,7 +146,7 @@ pub fn run_training_conformance(
 #[must_use]
 pub fn run_supported_training_conformance(
     backend: &dyn TrainBackendV1,
-    vectors: &TrainingVectorSetV2,
+    vectors: &impl TrainingVectorCorpus,
 ) -> TrainingConformanceReport {
     let supported = backend.capabilities().supported_operations;
     run_training_conformance_matching(backend, vectors, |operation| {
@@ -118,7 +156,7 @@ pub fn run_supported_training_conformance(
 
 fn run_training_conformance_matching(
     backend: &dyn TrainBackendV1,
-    vectors: &TrainingVectorSetV2,
+    vectors: &impl TrainingVectorCorpus,
     include: impl Fn(&str) -> bool,
 ) -> TrainingConformanceReport {
     let mut report = TrainingConformanceReport::default();
@@ -143,7 +181,7 @@ fn run_training_conformance_matching(
 
 fn run_case(
     backend: &dyn TrainBackendV1,
-    vectors: &TrainingVectorSetV2,
+    vectors: &impl TrainingVectorCorpus,
     case: &TrainingVectorCaseV1,
 ) -> Result<Option<TrainReceiptV1>, TrainingVectorFailureReason> {
     match &case.expected {
@@ -161,7 +199,7 @@ fn run_case(
 
 fn run_success_case(
     backend: &dyn TrainBackendV1,
-    vectors: &TrainingVectorSetV2,
+    vectors: &impl TrainingVectorCorpus,
     case: &TrainingVectorCaseV1,
     expected_outputs: &[TrainingVectorBufferV1],
     scratch_bytes_max: u64,
@@ -206,7 +244,7 @@ fn run_success_case(
 
 fn run_error_case(
     backend: &dyn TrainBackendV1,
-    vectors: &TrainingVectorSetV2,
+    vectors: &impl TrainingVectorCorpus,
     case: &TrainingVectorCaseV1,
     expected_category: TrainingVectorErrorCategoryV1,
     expected_code: &str,
@@ -244,7 +282,7 @@ fn run_error_case(
 
 fn vector_request<'a>(
     case: &'a TrainingVectorCaseV1,
-    vectors: &TrainingVectorSetV2,
+    vectors: &impl TrainingVectorCorpus,
     inputs: &'a [tritium_spec::TrainNamedBufferRefV1<'a>],
     attributes: &'a [TrainAttributeV1<'a>],
 ) -> TrainRequestV1<'a> {
@@ -254,7 +292,7 @@ fn vector_request<'a>(
 
 pub(crate) fn canonical_case_input_digest(
     case: &TrainingVectorCaseV1,
-    vectors: &TrainingVectorSetV2,
+    vectors: &impl TrainingVectorCorpus,
 ) -> [u8; 32] {
     let inputs: Vec<_> = case.inputs.iter().map(materialize_buffer).collect();
     let input_views: Vec<_> = inputs.iter().map(TrainOwnedBufferV1::as_ref).collect();
@@ -381,7 +419,7 @@ fn accepts(tolerance: TrainingToleranceV1, actual: f32, expected: f32) -> bool {
 fn grade_receipt(
     backend: &dyn TrainBackendV1,
     receipt: &TrainReceiptV1,
-    vectors: &TrainingVectorSetV2,
+    vectors: &impl TrainingVectorCorpus,
     operation: &str,
     execution: TrainExecutionV1,
     expected_input_digest: [u8; 32],

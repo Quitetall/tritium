@@ -2302,6 +2302,159 @@ extern "C" __global__ void lsq_backward_alpha(
     grad_alpha[row] = gradient;
 }
 
+#define HESTIA_MIN_DIFFERENTIABLE_TAU 0x1p-63f
+
+__device__ __forceinline__ void hestia_trit_softmax(
+    float z, float tau, float* pm, float* pz, float* pp)
+{
+    float dm = z + 1.0f;
+    float dz = z;
+    float dp = z - 1.0f;
+    float am = -(dm * dm) / tau;
+    float az = -(dz * dz) / tau;
+    float ap = -(dp * dp) / tau;
+    float maximum = fmaxf(fmaxf(am, az), ap);
+    float em = expf(am - maximum);
+    float ez = expf(az - maximum);
+    float ep = expf(ap - maximum);
+    float sum = (em + ep) + ez;
+    *pm = em / sum;
+    *pz = ez / sum;
+    *pp = ep / sum;
+}
+
+extern "C" __global__ void hestia_relax_forward(
+    const float* __restrict__ weight, const float* __restrict__ scale,
+    const float* __restrict__ tau, float* __restrict__ result,
+    int rows, int cols)
+{
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (long)rows * cols) return;
+    float t = tau[0];
+    if (!(t >= HESTIA_MIN_DIFFERENTIABLE_TAU)) {
+        result[i] = 0.0f;
+        return;
+    }
+    float s = scale[i / cols];
+    if (s == 0.0f) {
+        result[i] = 0.0f;
+        return;
+    }
+    float pm, pz, pp;
+    hestia_trit_softmax(weight[i] / s, t, &pm, &pz, &pp);
+    result[i] = s * (pp - pm);
+}
+
+extern "C" __global__ void hestia_relax_backward_w(
+    const float* __restrict__ weight, const float* __restrict__ scale,
+    const float* __restrict__ tau, const float* __restrict__ upstream,
+    float* __restrict__ grad_weight, int rows, int cols)
+{
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (long)rows * cols) return;
+    float t = tau[0];
+    if (!(t >= HESTIA_MIN_DIFFERENTIABLE_TAU)) {
+        grad_weight[i] = 0.0f;
+        return;
+    }
+    float s = scale[i / cols];
+    if (s == 0.0f) {
+        grad_weight[i] = 0.0f;
+        return;
+    }
+    float z = weight[i] / s;
+    float pm, pz, pp;
+    hestia_trit_softmax(z, t, &pm, &pz, &pp);
+    float edge_mass = pm * pz + pz * pp;
+    float span_mass = pm * pp;
+    float d_e_d_z = (2.0f / t) * (edge_mass + 4.0f * span_mass);
+    grad_weight[i] = upstream[i] * d_e_d_z;
+}
+
+__device__ __forceinline__ float hestia_tau_contribution(
+    const float* __restrict__ weight, const float* __restrict__ scale,
+    const float* __restrict__ tau, const float* __restrict__ upstream,
+    long i, int cols)
+{
+    float t = tau[0];
+    if (!(t >= HESTIA_MIN_DIFFERENTIABLE_TAU)) return 0.0f;
+    float s = scale[i / cols];
+    if (s == 0.0f) return 0.0f;
+    float z = weight[i] / s;
+    float pm, pz, pp;
+    hestia_trit_softmax(z, t, &pm, &pz, &pp);
+    float minus_zero_mass = pm * pz;
+    float zero_plus_mass = pz * pp;
+    float minus_plus_mass = pm * pp;
+    float minus_zero = minus_zero_mass == 0.0f
+        ? 0.0f : -minus_zero_mass * (2.0f * z + 1.0f);
+    float zero_plus = zero_plus_mass == 0.0f
+        ? 0.0f : -zero_plus_mass * (2.0f * z - 1.0f);
+    float minus_plus = minus_plus_mass == 0.0f
+        ? 0.0f : -8.0f * minus_plus_mass * z;
+    float d_e_d_tau = ((minus_zero + zero_plus) + minus_plus) / (t * t);
+    return upstream[i] * s * d_e_d_tau;
+}
+
+extern "C" __global__ void hestia_relax_backward_tau(
+    const float* __restrict__ weight, const float* __restrict__ scale,
+    const float* __restrict__ tau, const float* __restrict__ upstream,
+    float* __restrict__ grad_tau, int rows, int cols)
+{
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    long elements = (long)rows * cols;
+    float gradient = 0.0f;
+    for (long i = 0; i < elements; ++i) {
+        gradient += hestia_tau_contribution(weight, scale, tau, upstream, i, cols);
+    }
+    grad_tau[0] = gradient;
+}
+
+#define HESTIA_TAU_REDUCTION_THREADS 256
+#define HESTIA_TAU_ITEMS_PER_THREAD 8
+
+extern "C" __global__ void hestia_relax_backward_tau_partial(
+    const float* __restrict__ weight, const float* __restrict__ scale,
+    const float* __restrict__ tau, const float* __restrict__ upstream,
+    float* __restrict__ partials, int rows, int cols)
+{
+    __shared__ float sums[HESTIA_TAU_REDUCTION_THREADS];
+    long elements = (long)rows * cols;
+    long start = (long)blockIdx.x * HESTIA_TAU_REDUCTION_THREADS * HESTIA_TAU_ITEMS_PER_THREAD;
+    float local = 0.0f;
+    #pragma unroll
+    for (int item = 0; item < HESTIA_TAU_ITEMS_PER_THREAD; ++item) {
+        long i = start + threadIdx.x + (long)item * HESTIA_TAU_REDUCTION_THREADS;
+        if (i < elements) {
+            local += hestia_tau_contribution(weight, scale, tau, upstream, i, cols);
+        }
+    }
+    sums[threadIdx.x] = local;
+    __syncthreads();
+    for (int stride = HESTIA_TAU_REDUCTION_THREADS / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) sums[threadIdx.x] += sums[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) partials[blockIdx.x] = sums[0];
+}
+
+extern "C" __global__ void hestia_relax_backward_tau_finalize(
+    const float* __restrict__ partials, float* __restrict__ grad_tau, int count)
+{
+    __shared__ float sums[HESTIA_TAU_REDUCTION_THREADS];
+    float local = 0.0f;
+    for (int i = threadIdx.x; i < count; i += HESTIA_TAU_REDUCTION_THREADS) {
+        local += partials[i];
+    }
+    sums[threadIdx.x] = local;
+    __syncthreads();
+    for (int stride = HESTIA_TAU_REDUCTION_THREADS / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) sums[threadIdx.x] += sums[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) grad_tau[0] = sums[0];
+}
+
 __device__ __forceinline__ float fsq_bound_value(float value, int bound)
 {
     return bound == 0 ? fminf(1.0f, fmaxf(-1.0f, value)) : tanhf(value);

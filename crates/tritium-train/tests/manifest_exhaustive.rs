@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use tritium_spec::TrainingOpManifestV2;
+use tritium_spec::TrainingOpManifestV3;
 
 const TAPE_METHODS: &[(&str, &str)] = &[
     ("ste_surrogate", "graph.ste_surrogate"),
@@ -31,6 +31,7 @@ const TAPE_METHODS: &[(&str, &str)] = &[
     ("mse", "loss.mse"),
     ("softmax_xent", "loss.softmax_cross_entropy"),
     ("topk_kd", "loss.topk_knowledge_distillation"),
+    ("hestia_relax", "graph.hestia_relax"),
 ];
 
 const OPTIMIZERS: &[(&str, &str)] = &[
@@ -74,10 +75,6 @@ fn every_public_tape_operation_has_one_frozen_manifest_id() {
         "value",
         "backward",
         "try_conv2d",
-        // Semantic op awaiting its frozen id in manifest V3 (ADR 0035 WS-C3 /
-        // plan 0054): V2 is digest-frozen, so registration lands with the V3
-        // vectors. WS-C3 MUST move this to TAPE_METHODS and delete this entry.
-        "hestia_relax",
     ];
     let semantic: BTreeSet<_> = actual
         .into_iter()
@@ -89,7 +86,7 @@ fn every_public_tape_operation_has_one_frozen_manifest_id() {
         "public Tape surface changed; amend manifest mapping"
     );
 
-    let manifest: BTreeSet<_> = TrainingOpManifestV2::operations()
+    let manifest: BTreeSet<_> = TrainingOpManifestV3::operations()
         .iter()
         .map(|operation| operation.id)
         .collect();
@@ -111,7 +108,7 @@ fn every_optimizer_implementation_has_one_frozen_manifest_id() {
         "Optimizer implementation set changed; amend manifest mapping"
     );
 
-    let manifest: BTreeSet<_> = TrainingOpManifestV2::operations()
+    let manifest: BTreeSet<_> = TrainingOpManifestV3::operations()
         .iter()
         .map(|operation| operation.id)
         .collect();
@@ -125,7 +122,7 @@ fn every_optimizer_implementation_has_one_frozen_manifest_id() {
 
 #[test]
 fn lifecycle_registry_is_complete() {
-    let manifest: BTreeSet<_> = TrainingOpManifestV2::operations()
+    let manifest: BTreeSet<_> = TrainingOpManifestV3::operations()
         .iter()
         .map(|operation| operation.id)
         .collect();

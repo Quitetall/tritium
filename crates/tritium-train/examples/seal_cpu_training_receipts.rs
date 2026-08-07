@@ -1,13 +1,13 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 
-use tritium_spec::TrainingVectorSetV2;
+use tritium_spec::TrainingVectorSetV3;
 use tritium_testkit::seal_training_receipts;
 use tritium_train::CpuTrainBackendV1;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let vectors = TrainingVectorSetV2::parse_json(include_bytes!(
-        "../../../spec/training/v2/vectors/v2.json"
+    let vectors = TrainingVectorSetV3::parse_json(include_bytes!(
+        "../../../spec/training/v3/vectors/v3.json"
     ))?;
     let output_dir = std::env::args_os()
         .nth(1)

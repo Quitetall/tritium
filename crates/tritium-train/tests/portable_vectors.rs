@@ -2,20 +2,34 @@
 
 use tritium_spec::{
     TrainBackendError, TrainBackendV1, TrainCapabilitiesV1, TrainDTypeV1, TrainOutputV1,
-    TrainReceiptV1, TrainRequestV1, TrainingVectorSetV2, train_output_digest_v1,
-    train_request_digest_v1,
+    TrainReceiptV1, TrainRequestV1, TrainingOpManifestV3, TrainingVectorSetV3,
+    train_output_digest_v1, train_request_digest_v1,
 };
 use tritium_testkit::{TrainingVectorFailureReason, run_training_conformance};
 use tritium_train::CpuTrainBackendV1;
 
 #[test]
+fn canonical_v3_vectors_cover_hestia_on_cpu() {
+    let vectors = TrainingVectorSetV3::parse_json(TrainingVectorSetV3::canonical_json()).unwrap();
+    let report = run_training_conformance(&CpuTrainBackendV1::new(), &vectors);
+    assert!(report.is_ok(), "{:#?}", report.failed);
+    assert_eq!(report.passed.len(), 122);
+    let capabilities = CpuTrainBackendV1::new().capabilities();
+    assert_eq!(capabilities.manifest_digest, TrainingOpManifestV3::digest());
+    assert_eq!(
+        capabilities.supported_operations.last().map(String::as_str),
+        Some("graph.hestia_relax")
+    );
+}
+
+#[test]
 fn canonical_tracer_vectors_pass_with_corpus_bound_receipts() {
-    let vectors = TrainingVectorSetV2::parse_json(TrainingVectorSetV2::canonical_json()).unwrap();
+    let vectors = TrainingVectorSetV3::parse_json(TrainingVectorSetV3::canonical_json()).unwrap();
     let report =
         std::panic::catch_unwind(|| run_training_conformance(&CpuTrainBackendV1::new(), &vectors))
             .expect("canonical valid/error corpus must never panic the CPU request path");
     assert!(report.is_ok(), "{:#?}", report.failed);
-    assert_eq!(report.passed.len(), 117);
+    assert_eq!(report.passed.len(), 122);
     let mut receipt_count = 0;
     let mut checked_conv2d_scratch = false;
     let mut checked_attention_forward_scratch = false;
@@ -75,7 +89,7 @@ fn canonical_tracer_vectors_pass_with_corpus_bound_receipts() {
             }
         }
     }
-    assert_eq!(receipt_count, 72);
+    assert_eq!(receipt_count, 74);
     assert!(checked_conv2d_scratch);
     assert!(checked_attention_forward_scratch);
     assert!(checked_attention_vjp_scratch);
@@ -130,6 +144,7 @@ fn canonical_tracer_vectors_pass_with_corpus_bound_receipts() {
             "lifecycle.resume",
             "lifecycle.export",
             "lifecycle.reload",
+            "graph.hestia_relax",
         ]
     );
 }
@@ -154,7 +169,7 @@ impl TrainBackendV1 for CorruptReceiptBackend {
 
 #[test]
 fn harness_rejects_fabricated_receipt_content_digests() {
-    let vectors = TrainingVectorSetV2::parse_json(TrainingVectorSetV2::canonical_json()).unwrap();
+    let vectors = TrainingVectorSetV3::parse_json(TrainingVectorSetV3::canonical_json()).unwrap();
     let report =
         run_training_conformance(&CorruptReceiptBackend(CpuTrainBackendV1::new()), &vectors);
     assert!(report.failed.iter().any(|failure| {
@@ -198,7 +213,7 @@ impl TrainBackendV1 for NoWriteBackend {
 
 #[test]
 fn harness_poisons_success_outputs_so_unwritten_zeroes_fail() {
-    let vectors = TrainingVectorSetV2::parse_json(TrainingVectorSetV2::canonical_json()).unwrap();
+    let vectors = TrainingVectorSetV3::parse_json(TrainingVectorSetV3::canonical_json()).unwrap();
     let report = run_training_conformance(&NoWriteBackend, &vectors);
     assert!(report.failed.iter().any(|failure| {
         failure.case_id == "graph.add.forward.zero"

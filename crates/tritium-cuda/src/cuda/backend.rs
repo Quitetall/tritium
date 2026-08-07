@@ -72,6 +72,8 @@ const TRAINING_SALT_TILE_M: u32 = 4;
 const TRAINING_SALT_EXACT_TILE_M: u32 = 16;
 const KERNEL_NAME_SALT_TRAINING_FORWARD_TILED: &str = "salt_training_forward_tiled";
 const KERNEL_NAME_SALT_TRAINING_GRAD_A_TILED: &str = "salt_training_grad_a_tiled";
+const HESTIA_TAU_ITEMS_PER_THREAD: usize = 8;
+const HESTIA_TAU_REDUCTION_CHUNK: usize = THREADS_PER_BLOCK as usize * HESTIA_TAU_ITEMS_PER_THREAD;
 
 fn conv1d_kernel_geometry(
     config: &tritium_train::ops::conv1d::Conv1dCfg,
@@ -682,6 +684,11 @@ pub struct CudaBackend {
     pub(super) func_lsq_fwd: CudaFunction,
     pub(super) func_lsq_bwd_weight: CudaFunction,
     pub(super) func_lsq_bwd_alpha: CudaFunction,
+    pub(super) func_hestia_fwd: CudaFunction,
+    pub(super) func_hestia_bwd_weight: CudaFunction,
+    pub(super) func_hestia_bwd_tau: CudaFunction,
+    pub(super) func_hestia_bwd_tau_partial: CudaFunction,
+    pub(super) func_hestia_bwd_tau_finalize: CudaFunction,
     pub(super) func_fsq_fwd: CudaFunction,
     pub(super) func_fsq_bwd: CudaFunction,
     pub(super) func_salt_bounded_fwd: CudaFunction,
@@ -1002,6 +1009,21 @@ impl CudaBackend {
         let func_lsq_bwd_alpha = grad_module
             .load_function(KERNEL_NAME_LSQ_BWD_ALPHA)
             .map_err(|e| driver_err("resolve lsq_backward_alpha kernel", &e))?;
+        let func_hestia_fwd = grad_module
+            .load_function(KERNEL_NAME_HESTIA_FWD)
+            .map_err(|e| driver_err("resolve hestia_relax_forward kernel", &e))?;
+        let func_hestia_bwd_weight = grad_module
+            .load_function(KERNEL_NAME_HESTIA_BWD_WEIGHT)
+            .map_err(|e| driver_err("resolve hestia_relax_backward_w kernel", &e))?;
+        let func_hestia_bwd_tau = grad_module
+            .load_function(KERNEL_NAME_HESTIA_BWD_TAU)
+            .map_err(|e| driver_err("resolve hestia_relax_backward_tau kernel", &e))?;
+        let func_hestia_bwd_tau_partial = grad_module
+            .load_function(KERNEL_NAME_HESTIA_BWD_TAU_PARTIAL)
+            .map_err(|e| driver_err("resolve hestia_relax_backward_tau_partial kernel", &e))?;
+        let func_hestia_bwd_tau_finalize = grad_module
+            .load_function(KERNEL_NAME_HESTIA_BWD_TAU_FINALIZE)
+            .map_err(|e| driver_err("resolve hestia_relax_backward_tau_finalize kernel", &e))?;
         let func_fsq_fwd = grad_module
             .load_function(KERNEL_NAME_FSQ_FWD)
             .map_err(|e| driver_err("resolve fsq_forward kernel", &e))?;
@@ -1166,6 +1188,11 @@ impl CudaBackend {
             func_lsq_fwd,
             func_lsq_bwd_weight,
             func_lsq_bwd_alpha,
+            func_hestia_fwd,
+            func_hestia_bwd_weight,
+            func_hestia_bwd_tau,
+            func_hestia_bwd_tau_partial,
+            func_hestia_bwd_tau_finalize,
             func_fsq_fwd,
             func_fsq_bwd,
             func_salt_bounded_fwd,
@@ -4523,6 +4550,179 @@ impl CudaBackend {
             alpha_launch
                 .launch(Self::elementwise_cfg(rows))
                 .map_err(|e| driver_err("launch lsq_backward_alpha_dev", &e))?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn hestia_relax_forward_dev(
+        &self,
+        weight: &CudaSlice<f32>,
+        scale: &CudaSlice<f32>,
+        tau: &CudaSlice<f32>,
+        result: &mut CudaSlice<f32>,
+        rows: usize,
+        cols: usize,
+    ) -> Result<(), BackendError> {
+        let n = rows
+            .checked_mul(cols)
+            .ok_or_else(|| BackendError::InvalidInput("HESTIA geometry overflows usize".into()))?;
+        if weight.len() < n || scale.len() < rows || tau.is_empty() || result.len() < n {
+            return Err(BackendError::ShapeMismatch {
+                expected: n,
+                got: result.len(),
+            });
+        }
+        if n == 0 {
+            return Ok(());
+        }
+        let rows = i32::try_from(rows)
+            .map_err(|_| BackendError::InvalidInput("HESTIA rows exceed i32".into()))?;
+        let cols = i32::try_from(cols)
+            .map_err(|_| BackendError::InvalidInput("HESTIA cols exceed i32".into()))?;
+        let mut launch = self.stream.launch_builder(&self.func_hestia_fwd);
+        launch
+            .arg(weight)
+            .arg(scale)
+            .arg(tau)
+            .arg(result)
+            .arg(&rows)
+            .arg(&cols);
+        #[allow(unsafe_code)]
+        // SAFETY: validated spans; one thread writes each output element.
+        unsafe {
+            launch
+                .launch(Self::elementwise_cfg(n))
+                .map_err(|e| driver_err("launch hestia_relax_forward_dev", &e))?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn hestia_tau_scratch_bytes(elements: usize) -> Result<u64, BackendError> {
+        if elements <= HESTIA_TAU_REDUCTION_CHUNK {
+            return Ok(0);
+        }
+        let partials = elements.div_ceil(HESTIA_TAU_REDUCTION_CHUNK);
+        (partials as u64)
+            .checked_mul(core::mem::size_of::<f32>() as u64)
+            .ok_or_else(|| BackendError::InvalidInput("HESTIA tau scratch overflows u64".into()))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn hestia_relax_backward_dev(
+        &self,
+        weight: &CudaSlice<f32>,
+        scale: &CudaSlice<f32>,
+        tau: &CudaSlice<f32>,
+        upstream: &CudaSlice<f32>,
+        grad_weight: &mut CudaSlice<f32>,
+        grad_tau: &mut CudaSlice<f32>,
+        rows: usize,
+        cols: usize,
+    ) -> Result<(), BackendError> {
+        let n = rows
+            .checked_mul(cols)
+            .ok_or_else(|| BackendError::InvalidInput("HESTIA geometry overflows usize".into()))?;
+        if weight.len() < n
+            || scale.len() < rows
+            || tau.is_empty()
+            || upstream.len() < n
+            || grad_weight.len() < n
+            || grad_tau.is_empty()
+        {
+            return Err(BackendError::ShapeMismatch {
+                expected: n,
+                got: grad_weight.len(),
+            });
+        }
+        if n == 0 {
+            return Ok(());
+        }
+        let rows = i32::try_from(rows)
+            .map_err(|_| BackendError::InvalidInput("HESTIA rows exceed i32".into()))?;
+        let cols = i32::try_from(cols)
+            .map_err(|_| BackendError::InvalidInput("HESTIA cols exceed i32".into()))?;
+        let mut weight_launch = self.stream.launch_builder(&self.func_hestia_bwd_weight);
+        weight_launch
+            .arg(weight)
+            .arg(scale)
+            .arg(tau)
+            .arg(upstream)
+            .arg(grad_weight)
+            .arg(&rows)
+            .arg(&cols);
+        #[allow(unsafe_code)]
+        // SAFETY: validated spans; one thread writes each weight gradient.
+        unsafe {
+            weight_launch
+                .launch(Self::elementwise_cfg(n))
+                .map_err(|e| driver_err("launch hestia_relax_backward_w_dev", &e))?;
+        }
+        if n <= HESTIA_TAU_REDUCTION_CHUNK {
+            let mut tau_launch = self.stream.launch_builder(&self.func_hestia_bwd_tau);
+            tau_launch
+                .arg(weight)
+                .arg(scale)
+                .arg(tau)
+                .arg(upstream)
+                .arg(grad_tau)
+                .arg(&rows)
+                .arg(&cols);
+            #[allow(unsafe_code)]
+            // SAFETY: validated spans; exact serial reduction is bounded to one small chunk.
+            unsafe {
+                tau_launch
+                    .launch(Self::elementwise_cfg(1))
+                    .map_err(|e| driver_err("launch hestia_relax_backward_tau_dev", &e))?;
+            }
+        } else {
+            let partial_count = n.div_ceil(HESTIA_TAU_REDUCTION_CHUNK);
+            let partial_count_i32 = i32::try_from(partial_count).map_err(|_| {
+                BackendError::InvalidInput("HESTIA tau partial count exceeds i32".into())
+            })?;
+            let mut partials = self.dev_alloc_zeros(partial_count)?;
+            let mut partial_launch = self
+                .stream
+                .launch_builder(&self.func_hestia_bwd_tau_partial);
+            partial_launch
+                .arg(weight)
+                .arg(scale)
+                .arg(tau)
+                .arg(upstream)
+                .arg(&mut partials)
+                .arg(&rows)
+                .arg(&cols);
+            let partial_cfg = LaunchConfig {
+                grid_dim: (partial_count as u32, 1, 1),
+                block_dim: (THREADS_PER_BLOCK, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            #[allow(unsafe_code)]
+            // SAFETY: fixed-grid partials own disjoint slots.
+            unsafe {
+                partial_launch
+                    .launch(partial_cfg)
+                    .map_err(|e| driver_err("launch hestia_relax_backward_tau_partial", &e))?;
+            }
+            drop(partial_launch);
+            let mut finalize_launch = self
+                .stream
+                .launch_builder(&self.func_hestia_bwd_tau_finalize);
+            finalize_launch
+                .arg(&partials)
+                .arg(grad_tau)
+                .arg(&partial_count_i32);
+            let finalize_cfg = LaunchConfig {
+                grid_dim: (1, 1, 1),
+                block_dim: (THREADS_PER_BLOCK, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            #[allow(unsafe_code)]
+            // SAFETY: one fixed tree reads every initialized partial and writes one scalar.
+            unsafe {
+                finalize_launch
+                    .launch(finalize_cfg)
+                    .map_err(|e| driver_err("launch hestia_relax_backward_tau_finalize", &e))?;
+            }
         }
         Ok(())
     }

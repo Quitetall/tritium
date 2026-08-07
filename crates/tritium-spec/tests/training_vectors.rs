@@ -1,10 +1,72 @@
 //! Public schema tests for plan-0049 portable training vectors.
 
 use tritium_spec::{
-    TrainExecutionV1, TrainingOpManifestV1, TrainingOpManifestV2, TrainingToleranceV1,
-    TrainingVectorBufferDataV1, TrainingVectorErrorCategoryV1, TrainingVectorExpectedV1,
-    TrainingVectorSetV1, TrainingVectorSetV2,
+    TrainExecutionV1, TrainingOpManifestV1, TrainingOpManifestV2, TrainingOpManifestV3,
+    TrainingToleranceV1, TrainingVectorBufferDataV1, TrainingVectorErrorCategoryV1,
+    TrainingVectorExpectedV1, TrainingVectorSetV1, TrainingVectorSetV2, TrainingVectorSetV3,
 };
+
+#[test]
+fn manifest_v3_adds_only_hestia_relax_to_v2() {
+    let v2 = TrainingOpManifestV2::operations();
+    let v3 = TrainingOpManifestV3::operations();
+    assert_eq!(&v3[..v2.len()], v2);
+    assert_eq!(v3.len(), v2.len() + 1);
+    let hestia = v3.last().unwrap();
+    assert_eq!(hestia.id, "graph.hestia_relax");
+    assert!(hestia.forward);
+    assert_eq!(hestia.vjp, tritium_spec::TrainingVjpV1::FirstOrder);
+    assert!(!hestia.mutates);
+    assert!(hestia.checkpoint_planes.is_empty());
+    assert_eq!(
+        TrainingOpManifestV3::parse_json(TrainingOpManifestV3::canonical_json()),
+        Ok(TrainingOpManifestV3)
+    );
+}
+
+#[test]
+fn vector_v3_extends_v2_with_hestia_forward_vjp_and_errors() {
+    let v2 = TrainingVectorSetV2::parse_json(TrainingVectorSetV2::canonical_json()).unwrap();
+    let v3 = TrainingVectorSetV3::parse_json(TrainingVectorSetV3::canonical_json()).unwrap();
+    assert_eq!(v3.manifest_digest(), TrainingOpManifestV3::digest());
+    assert_eq!(v3.source_digest(), TrainingVectorSetV3::digest());
+    assert_eq!(v3.cases().len(), v2.cases().len() + 5);
+    assert_eq!(
+        v3.cases()[..v2.cases().len()]
+            .iter()
+            .map(|case| case.case_id.as_str())
+            .collect::<Vec<_>>(),
+        v2.cases()
+            .iter()
+            .map(|case| case.case_id.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        v3.cases()[v2.cases().len()..]
+            .iter()
+            .map(|case| (case.case_id.as_str(), case.execution))
+            .collect::<Vec<_>>(),
+        [
+            (
+                "graph.hestia_relax.forward.basic",
+                TrainExecutionV1::Forward,
+            ),
+            ("graph.hestia_relax.vjp.basic", TrainExecutionV1::Vjp),
+            (
+                "graph.hestia_relax.forward.invalid_tau",
+                TrainExecutionV1::Forward,
+            ),
+            (
+                "graph.hestia_relax.vjp.unrepresentable_tau",
+                TrainExecutionV1::Vjp,
+            ),
+            (
+                "graph.hestia_relax.vjp.invalid_shape",
+                TrainExecutionV1::Vjp,
+            ),
+        ]
+    );
+}
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
