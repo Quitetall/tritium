@@ -11,12 +11,20 @@ const run = promisify(execFile);
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const repository = resolve(root, "../..");
 const generated = resolve(root, ".generated");
-const guest = resolve(
-  repository,
-  "target/wasm32-unknown-unknown/release/tritium_wasm.wasm",
-);
 const wasmBindgenVersion = "wasm-bindgen 0.2.126";
 const maximumLinearMemoryPages = (192 * 1024 * 1024) / 65536;
+
+export function resolveCargoTargetDirectory(
+  environment = process.env,
+  repositoryRoot = repository,
+) {
+  const configured = environment.CARGO_TARGET_DIR;
+  if (configured === undefined) return resolve(repositoryRoot, "target");
+  if (typeof configured !== "string" || configured.length === 0 || configured.includes("\0")) {
+    throw new Error("CARGO_TARGET_DIR must be a non-empty filesystem path");
+  }
+  return resolve(repositoryRoot, configured);
+}
 
 function readU32Leb(bytes, cursor) {
   let result = 0;
@@ -66,6 +74,10 @@ function assertLinearMemoryMaximum(bytes) {
 }
 
 export async function buildPortableWasm(output) {
+  const guest = resolve(
+    resolveCargoTargetDirectory(),
+    "wasm32-unknown-unknown/release/tritium_wasm.wasm",
+  );
   await mkdir(generated, { recursive: true });
   await run(
     "cargo",
