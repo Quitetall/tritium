@@ -21,6 +21,7 @@ mod pipeline;
 mod qwen36_preflight;
 mod qwen36_source_admission;
 mod qwen36_tensor_work;
+mod stage7_evidence;
 mod tensor_work_store;
 
 pub use pipeline::{
@@ -63,6 +64,13 @@ pub use qwen36_tensor_work::{
     Qwen36PackageProfileReceipt, Qwen36PackageRuntimeLedger, Qwen36PackageScaleOnlyCampaignStore,
     Qwen36PackageVisitError, Qwen36PtqPackageError, Qwen36PtqPackagesReceipt,
     reconcile_qwen36_ptq_packages,
+};
+pub use stage7_evidence::{
+    STAGE7_DATASETS, STAGE7_PARTITION_SEQUENCE_COUNT, STAGE7_SAMPLED_ROWS_SCHEMA,
+    STAGE7_TOKEN_ENCODING, STAGE7_TOKEN_EVIDENCE_SCHEMA, STAGE7_TOKEN_PAYLOAD_BYTES,
+    STAGE7_TOKEN_PAYLOAD_FILE, STAGE7_TOKENS_PER_SEQUENCE, Stage7DatasetContract,
+    Stage7EvidenceError, Stage7Partition, Stage7TokenBatch, Stage7TokenEvidencePack,
+    Stage7TokenEvidenceReceipt, stage7_prefixed_json_sha256,
 };
 pub use tensor_work_store::{
     TensorPayloadValidator, TensorPayloadWriter, TensorPutError, TensorRecordInfo,

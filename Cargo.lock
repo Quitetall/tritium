@@ -4602,8 +4602,10 @@ version = "1.1.0-rc.0"
 dependencies = [
  "blake3",
  "half",
+ "libc",
  "serde",
  "serde_json",
+ "sha2",
  "tritium-cpu",
  "tritium-cuda",
  "tritium-format",

@@ -47,6 +47,10 @@ see `docs/v1.0-api-freeze-audit.md` for the tier policy.
   the official C4/OpenWebMath/StarCoderData revisions. The new
   `tritium salt build-stage7-evidence-pack` command converts content-bound,
   preselected source rows into that cross-language manifest transactionally.
+  `tritium salt inspect-stage7-evidence-pack` then binds that pack to the
+  campaign-frozen pack ID and exact model tokenizer, validates all manifest and
+  payload semantics through a retained seek-backed handle, reads one bounded
+  partition window, and emits its ordered token digest for model execution.
   StarCoder provenance distinguishes config `default`, `data_dir=python`, and
   source field `content`; fixed token geometry is rejected before bounded read.
 

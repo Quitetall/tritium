@@ -89,6 +89,26 @@ consumes already selected rows; it does not silently download or resample
 datasets. StarCoderData remains gated and requires authorized Hub access during
 the separate row-collection step.
 
+Before calibration or evaluation, reopen a bounded sequence window against both
+the model tokenizer and the pack identity frozen by campaign provenance:
+
+```sh
+tritium salt inspect-stage7-evidence-pack \
+  --model-dir ~/.cache/huggingface/hub/models--HuggingFaceTB--SmolLM2-135M/snapshots/93efa2f097d58c2a74874c7e644dbc9b0cee75a2 \
+  --manifest ./stage7-token-evidence/manifest.json \
+  --expected-pack-id sha256:<campaign-frozen-pack-id> \
+  --partition calibration \
+  --start-sequence 0 \
+  --sequence-count 128
+```
+
+This command uses the reusable `tritium-salt` seek-backed reader. Admission
+recomputes the manifest and every sequence identity, verifies frozen dataset
+geometry and source-row disjointness, rejects out-of-vocabulary tokens, checks
+the complete payload digest, then rechecks the retained file handle after the
+selected read. Its JSON receipt identifies the exact ordered token window; it
+does not claim model execution or quality.
+
 ## SALT V2 Qwen master campaigns
 
 The legacy `tritium quantize` command above is not the Qwen3.6-27B SALT V2

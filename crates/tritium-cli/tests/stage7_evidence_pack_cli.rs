@@ -1,5 +1,6 @@
 use std::{
-    fs,
+    fs::{self, OpenOptions},
+    io::{Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::Command,
 };
@@ -287,6 +288,111 @@ fn builds_content_bound_stage7_token_pack_from_sampled_rows() {
         cross_check.status.success(),
         "{}",
         String::from_utf8_lossy(&cross_check.stderr)
+    );
+
+    let inspected = Command::new(env!("CARGO_BIN_EXE_tritium"))
+        .args(["salt", "inspect-stage7-evidence-pack", "--model-dir"])
+        .arg(&model)
+        .arg("--manifest")
+        .arg(output.join("manifest.json"))
+        .arg("--expected-pack-id")
+        .arg(manifest["pack_id"].as_str().unwrap())
+        .args([
+            "--partition",
+            "calibration",
+            "--start-sequence",
+            "0",
+            "--sequence-count",
+            "128",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        inspected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&inspected.stderr)
+    );
+    let receipt: Value = serde_json::from_slice(&inspected.stdout).unwrap();
+    assert_eq!(receipt["schema"], "tritium.stage7-token-evidence-read.v1");
+    assert_eq!(receipt["pack_id"], manifest["pack_id"]);
+    assert_eq!(receipt["partition"], "calibration");
+    assert_eq!(receipt["sampling_seed"], 11);
+    assert_eq!(receipt["start_sequence"], 0);
+    assert_eq!(receipt["sequence_count"], 128);
+    assert_eq!(receipt["tokens_per_sequence"], 2_048);
+    assert_eq!(receipt["token_count"], 128 * 2_048);
+    let expected_prefix_ids = manifest["partitions"]["calibration"]["sequences"]
+        .as_array()
+        .unwrap()[..128]
+        .iter()
+        .map(|sequence| sequence["id"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        receipt["sequence_ids"].as_array().unwrap(),
+        &expected_prefix_ids
+    );
+    let payload_prefix = &fs::read(output.join("stage7.u32le")).unwrap()[..128 * 2_048 * 4];
+    assert_eq!(
+        receipt["ordered_token_sha256"],
+        format!("sha256:{}", hex(&Sha256::digest(payload_prefix)))
+    );
+    assert_eq!(receipt["terminal_validated"], true);
+
+    let wrong_campaign = Command::new(env!("CARGO_BIN_EXE_tritium"))
+        .args(["salt", "inspect-stage7-evidence-pack", "--model-dir"])
+        .arg(&model)
+        .arg("--manifest")
+        .arg(output.join("manifest.json"))
+        .arg("--expected-pack-id")
+        .arg(format!("sha256:{}", "0".repeat(64)))
+        .args([
+            "--partition",
+            "calibration",
+            "--start-sequence",
+            "0",
+            "--sequence-count",
+            "128",
+        ])
+        .output()
+        .unwrap();
+    assert!(!wrong_campaign.status.success());
+    assert!(
+        String::from_utf8_lossy(&wrong_campaign.stderr)
+            .contains("token evidence pack differs from expected campaign"),
+        "{}",
+        String::from_utf8_lossy(&wrong_campaign.stderr)
+    );
+
+    let mut payload = OpenOptions::new()
+        .write(true)
+        .open(output.join("stage7.u32le"))
+        .unwrap();
+    payload.seek(SeekFrom::Start(9_000_000)).unwrap();
+    payload.write_all(&[0xff]).unwrap();
+    payload.sync_all().unwrap();
+    drop(payload);
+    let rejected = Command::new(env!("CARGO_BIN_EXE_tritium"))
+        .args(["salt", "inspect-stage7-evidence-pack", "--model-dir"])
+        .arg(&model)
+        .arg("--manifest")
+        .arg(output.join("manifest.json"))
+        .arg("--expected-pack-id")
+        .arg(manifest["pack_id"].as_str().unwrap())
+        .args([
+            "--partition",
+            "calibration",
+            "--start-sequence",
+            "0",
+            "--sequence-count",
+            "128",
+        ])
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("token payload identity differs"),
+        "{}",
+        String::from_utf8_lossy(&rejected.stderr)
     );
     fs::remove_dir_all(root).unwrap();
 }

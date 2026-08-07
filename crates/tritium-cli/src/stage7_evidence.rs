@@ -14,55 +14,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tritium_nn::{HfJsonTokenizer, Tokenizer};
+use tritium_salt::{
+    STAGE7_DATASETS, STAGE7_PARTITION_SEQUENCE_COUNT, STAGE7_SAMPLED_ROWS_SCHEMA,
+    STAGE7_TOKEN_ENCODING, STAGE7_TOKEN_EVIDENCE_SCHEMA, STAGE7_TOKEN_PAYLOAD_FILE,
+    STAGE7_TOKENS_PER_SEQUENCE, Stage7DatasetContract, Stage7Partition,
+    stage7_prefixed_json_sha256,
+};
 
-const SOURCE_SCHEMA: &str = "tritium.stage7-sampled-rows.v1";
-const PACK_SCHEMA: &str = "tritium.stage7-token-evidence-pack.v1";
-const TOKENS_PER_SEQUENCE: usize = 2_048;
 const MAX_JSON_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_ROWS_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_ROW_BYTES: usize = 16 * 1024 * 1024;
-const PARTITIONS: [&str; 4] = ["calibration", "refinement", "validation", "evaluation"];
-
-#[derive(Clone, Copy, Debug)]
-struct DatasetContract {
-    repo_id: &'static str,
-    revision: &'static str,
-    config: &'static str,
-    data_dir: Option<&'static str>,
-    split: &'static str,
-    text_field: &'static str,
-    sequence_count: usize,
-}
-
-const DATASETS: [DatasetContract; 3] = [
-    DatasetContract {
-        repo_id: "allenai/c4",
-        revision: "1588ec454efa1a09f29cd18ddd04fe05fc8653a2",
-        config: "en",
-        data_dir: None,
-        split: "train",
-        text_field: "text",
-        sequence_count: 256,
-    },
-    DatasetContract {
-        repo_id: "open-web-math/open-web-math",
-        revision: "fde8ef8de2300f5e778f56261843dab89f230815",
-        config: "default",
-        data_dir: None,
-        split: "train",
-        text_field: "text",
-        sequence_count: 128,
-    },
-    DatasetContract {
-        repo_id: "bigcode/starcoderdata",
-        revision: "9fc30b578cedaec69e47302df72cf00feed7c8c4",
-        config: "default",
-        data_dir: Some("python"),
-        split: "train",
-        text_field: "content",
-        sequence_count: 128,
-    },
-];
 const TOKENIZER_FILES: [&str; 5] = [
     "merges.txt",
     "special_tokens_map.json",
@@ -189,28 +150,21 @@ struct PackManifest {
 
 pub(crate) fn build(model: &Path, sampled: &Path, output: &Path) -> anyhow::Result<()> {
     validate_output(model, sampled, output)?;
-    let config_path = open_model_file(model, "config.json")?;
+    let (tokenizer_digest, vocab_size) = model_tokenizer_identity(model)?;
     let tokenizer_path = open_model_file(model, "tokenizer.json")?;
     let tokenizer_config_path = open_model_file(model, "tokenizer_config.json")?;
-    let config: Value = read_json(&config_path, MAX_JSON_BYTES, "model config")?;
-    let vocab_size = config
-        .get("vocab_size")
-        .and_then(Value::as_u64)
-        .filter(|value| *value > 0)
-        .context("model config requires positive vocab_size")?;
-    let tokenizer_digest = tokenizer_digest(model)?;
     let tokenizer = HfJsonTokenizer::from_files(&tokenizer_path, &tokenizer_config_path)?;
     ensure!(
-        u64::from(tokenizer.eos()) < vocab_size,
+        tokenizer.eos() < vocab_size,
         "EOS token exceeds model vocabulary"
     );
     let source: SourceManifest = read_json(sampled, MAX_JSON_BYTES, "sampled-row manifest")?;
     ensure!(
-        source.schema == SOURCE_SCHEMA,
+        source.schema == STAGE7_SAMPLED_ROWS_SCHEMA,
         "sampled-row manifest schema differs"
     );
     ensure!(
-        source.partitions.len() == PARTITIONS.len(),
+        source.partitions.len() == Stage7Partition::ALL.len(),
         "sampled-row partition inventory differs"
     );
     let source_root = sampled.parent().unwrap_or_else(|| Path::new("."));
@@ -218,39 +172,46 @@ pub(crate) fn build(model: &Path, sampled: &Path, output: &Path) -> anyhow::Resu
     let mut content_digests = BTreeSet::new();
     let mut drafts = BTreeMap::new();
     let mut seeds = BTreeMap::new();
-    for partition_name in PARTITIONS {
+    for partition_kind in Stage7Partition::ALL {
+        let partition_name = partition_kind.as_str();
         let partition = source
             .partitions
             .get(partition_name)
             .with_context(|| format!("sampled-row partition {partition_name} is missing"))?;
         ensure!(
-            partition.datasets.len() == DATASETS.len(),
+            partition.datasets.len() == STAGE7_DATASETS.len(),
             "{partition_name} dataset inventory differs"
         );
-        let mut partition_drafts = Vec::with_capacity(512);
-        for (ordinal, expected) in DATASETS.iter().enumerate() {
+        let mut partition_drafts = Vec::with_capacity(STAGE7_PARTITION_SEQUENCE_COUNT);
+        for (ordinal, expected) in STAGE7_DATASETS.into_iter().enumerate() {
             let dataset = &partition.datasets[ordinal];
             validate_dataset(dataset, expected, partition_name)?;
             let rows = open_record(source_root, &dataset.rows, MAX_ROWS_BYTES, "sampled rows")?;
             partition_drafts.extend(build_lane(
                 rows,
                 dataset,
-                expected.sequence_count,
+                expected.sequence_count(),
                 &tokenizer,
-                vocab_size,
+                u64::from(vocab_size),
                 &mut locators,
                 &mut content_digests,
             )?);
         }
         ensure!(
-            partition_drafts.len() == 512,
+            partition_drafts.len() == STAGE7_PARTITION_SEQUENCE_COUNT,
             "{partition_name} sequence inventory differs"
         );
         seeds.insert(partition_name.to_owned(), partition.sampling_seed);
         drafts.insert(partition_name.to_owned(), partition_drafts);
     }
     let staging = create_staging(output)?;
-    let result = write_pack(&staging, drafts, seeds, tokenizer_digest, vocab_size);
+    let result = write_pack(
+        &staging,
+        drafts,
+        seeds,
+        tokenizer_digest,
+        u64::from(vocab_size),
+    );
     let manifest = match result {
         Ok(manifest) => manifest,
         Err(error) => {
@@ -269,6 +230,23 @@ pub(crate) fn build(model: &Path, sampled: &Path, output: &Path) -> anyhow::Resu
         String::from_utf8(rendered).expect("manifest JSON is UTF-8")
     );
     Ok(())
+}
+
+pub(crate) fn model_tokenizer_identity(model: &Path) -> anyhow::Result<(String, u32)> {
+    let metadata = fs::symlink_metadata(model)
+        .with_context(|| format!("inspect model directory {}", model.display()))?;
+    ensure!(
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "model path must be an ordinary directory"
+    );
+    let config_path = open_model_file(model, "config.json")?;
+    let config: Value = read_json(&config_path, MAX_JSON_BYTES, "model config")?;
+    let vocab_size = config
+        .get("vocab_size")
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0 && *value <= u64::from(u32::MAX))
+        .context("model config requires u32-representable positive vocab_size")?;
+    Ok((tokenizer_digest(model)?, vocab_size as u32))
 }
 
 fn validate_output(model: &Path, sampled: &Path, output: &Path) -> anyhow::Result<()> {
@@ -311,18 +289,18 @@ fn validate_output(model: &Path, sampled: &Path, output: &Path) -> anyhow::Resul
 
 fn validate_dataset(
     dataset: &SourceDataset,
-    expected: &DatasetContract,
+    expected: Stage7DatasetContract,
     partition: &str,
 ) -> anyhow::Result<()> {
     ensure!(
-        dataset.repo_id == expected.repo_id
-            && dataset.revision == expected.revision
-            && dataset.config == expected.config
-            && dataset.data_dir.as_deref() == expected.data_dir
-            && dataset.split == expected.split
-            && dataset.text_field == expected.text_field,
+        dataset.repo_id == expected.repo_id()
+            && dataset.revision == expected.revision()
+            && dataset.config == expected.config()
+            && dataset.data_dir.as_deref() == expected.data_dir()
+            && dataset.split == expected.split()
+            && dataset.text_field == expected.text_field(),
         "{partition} dataset {} provenance differs",
-        expected.repo_id,
+        expected.repo_id(),
     );
     Ok(())
 }
@@ -338,7 +316,7 @@ fn build_lane(
 ) -> anyhow::Result<Vec<SequenceDraft>> {
     let mut reader = BufReader::new(rows_file);
     let mut result = Vec::with_capacity(wanted);
-    let mut tokens = Vec::with_capacity(TOKENS_PER_SEQUENCE);
+    let mut tokens = Vec::with_capacity(STAGE7_TOKENS_PER_SEQUENCE);
     let mut rows = Vec::new();
     let mut line_ordinal = 0_usize;
     loop {
@@ -406,11 +384,11 @@ fn build_lane(
             text_field: dataset.text_field.clone(),
             content_sha256: row.content_sha256,
         });
-        if tokens.len() < TOKENS_PER_SEQUENCE {
+        if tokens.len() < STAGE7_TOKENS_PER_SEQUENCE {
             tokens.push(tokenizer.eos());
         }
-        if tokens.len() >= TOKENS_PER_SEQUENCE {
-            tokens.truncate(TOKENS_PER_SEQUENCE);
+        if tokens.len() >= STAGE7_TOKENS_PER_SEQUENCE {
+            tokens.truncate(STAGE7_TOKENS_PER_SEQUENCE);
             result.push(SequenceDraft {
                 dataset_repo_id: dataset.repo_id.clone(),
                 dataset_revision: dataset.revision.clone(),
@@ -420,7 +398,7 @@ fn build_lane(
                 source_rows: std::mem::take(&mut rows),
                 tokens: std::mem::take(&mut tokens),
             });
-            tokens = Vec::with_capacity(TOKENS_PER_SEQUENCE);
+            tokens = Vec::with_capacity(STAGE7_TOKENS_PER_SEQUENCE);
             if result.len() == wanted {
                 break;
             }
@@ -440,7 +418,7 @@ fn write_pack(
     tokenizer_digest: String,
     vocab_size: u64,
 ) -> anyhow::Result<PackManifest> {
-    let token_path = root.join("stage7.u32le");
+    let token_path = root.join(STAGE7_TOKEN_PAYLOAD_FILE);
     let mut token_file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -449,13 +427,14 @@ fn write_pack(
     let mut offset = 0_u64;
     let mut partitions = BTreeMap::new();
     let mut token_digests = BTreeSet::new();
-    for partition_name in PARTITIONS {
-        let mut receipts = Vec::with_capacity(512);
+    for partition_kind in Stage7Partition::ALL {
+        let partition_name = partition_kind.as_str();
+        let mut receipts = Vec::with_capacity(STAGE7_PARTITION_SEQUENCE_COUNT);
         for draft in drafts
             .remove(partition_name)
             .context("missing built partition")?
         {
-            let mut bytes = Vec::with_capacity(TOKENS_PER_SEQUENCE * 4);
+            let mut bytes = Vec::with_capacity(STAGE7_TOKENS_PER_SEQUENCE * 4);
             for token in &draft.tokens {
                 bytes.extend_from_slice(&token.to_le_bytes());
             }
@@ -474,12 +453,12 @@ fn write_pack(
                 dataset_split: draft.dataset_split,
                 source_rows: draft.source_rows,
                 token_offset: offset,
-                token_count: TOKENS_PER_SEQUENCE as u64,
+                token_count: STAGE7_TOKENS_PER_SEQUENCE as u64,
                 token_sha256,
             };
-            let id = prefixed_id(&serde_json::to_value(&scope)?)?;
+            let id = stage7_prefixed_json_sha256(&serde_json::to_value(&scope)?)?;
             receipts.push(SequenceReceipt { id, scope });
-            offset += TOKENS_PER_SEQUENCE as u64;
+            offset += STAGE7_TOKENS_PER_SEQUENCE as u64;
         }
         partitions.insert(
             partition_name.to_owned(),
@@ -491,19 +470,19 @@ fn write_pack(
     }
     token_file.sync_all()?;
     let tokens = FileRecord {
-        path: "stage7.u32le".to_owned(),
+        path: STAGE7_TOKEN_PAYLOAD_FILE.to_owned(),
         bytes: offset * 4,
         sha256: hex_digest(&token_hasher.finalize()),
     };
     let scope = PackScope {
-        schema: PACK_SCHEMA,
+        schema: STAGE7_TOKEN_EVIDENCE_SCHEMA,
         tokenizer_digest,
         tokenizer_vocab_size: vocab_size,
-        token_encoding: "u32le",
+        token_encoding: STAGE7_TOKEN_ENCODING,
         tokens,
         partitions,
     };
-    let pack_id = prefixed_id(&serde_json::to_value(&scope)?)?;
+    let pack_id = stage7_prefixed_json_sha256(&serde_json::to_value(&scope)?)?;
     let manifest = PackManifest { pack_id, scope };
     let mut bytes = serde_json::to_vec_pretty(&manifest)?;
     bytes.push(b'\n');
@@ -521,7 +500,9 @@ fn tokenizer_digest(model: &Path) -> anyhow::Result<String> {
     for name in TOKENIZER_FILES {
         records.push(file_record(&open_model_file(model, name)?, name)?);
     }
-    prefixed_id(&serde_json::to_value(records)?)
+    Ok(stage7_prefixed_json_sha256(&serde_json::to_value(
+        records,
+    )?)?)
 }
 
 fn open_model_file(model: &Path, name: &str) -> anyhow::Result<PathBuf> {
@@ -685,8 +666,11 @@ fn sync_parent(path: &Path) -> anyhow::Result<()> {
 fn publish_directory(staging: &Path, output: &Path) -> anyhow::Result<()> {
     fs::create_dir(output).context("reserve Stage-7 evidence output directory")?;
     let result = (|| {
-        fs::hard_link(staging.join("stage7.u32le"), output.join("stage7.u32le"))
-            .context("publish Stage-7 token payload")?;
+        fs::hard_link(
+            staging.join(STAGE7_TOKEN_PAYLOAD_FILE),
+            output.join(STAGE7_TOKEN_PAYLOAD_FILE),
+        )
+        .context("publish Stage-7 token payload")?;
         fs::hard_link(staging.join("manifest.json"), output.join("manifest.json"))
             .context("publish Stage-7 manifest")?;
         #[cfg(unix)]
@@ -699,52 +683,6 @@ fn publish_directory(staging: &Path, output: &Path) -> anyhow::Result<()> {
     result?;
     fs::remove_dir_all(staging).context("remove Stage-7 evidence staging directory")?;
     Ok(())
-}
-
-fn prefixed_id(value: &Value) -> anyhow::Result<String> {
-    Ok(format!(
-        "sha256:{}",
-        hex_digest(&Sha256::digest(canonical(value)?))
-    ))
-}
-
-fn canonical(value: &Value) -> anyhow::Result<Vec<u8>> {
-    fn write(value: &Value, output: &mut Vec<u8>) -> anyhow::Result<()> {
-        match value {
-            Value::Null => output.extend_from_slice(b"null"),
-            Value::Bool(value) => output.extend_from_slice(if *value { b"true" } else { b"false" }),
-            Value::Number(value) => output.extend_from_slice(value.to_string().as_bytes()),
-            Value::String(value) => serde_json::to_writer(output, value)?,
-            Value::Array(values) => {
-                output.push(b'[');
-                for (ordinal, value) in values.iter().enumerate() {
-                    if ordinal != 0 {
-                        output.push(b',');
-                    }
-                    write(value, output)?;
-                }
-                output.push(b']');
-            }
-            Value::Object(values) => {
-                output.push(b'{');
-                let mut fields: Vec<_> = values.iter().collect();
-                fields.sort_by_key(|(key, _)| *key);
-                for (ordinal, (key, value)) in fields.into_iter().enumerate() {
-                    if ordinal != 0 {
-                        output.push(b',');
-                    }
-                    serde_json::to_writer(&mut *output, key)?;
-                    output.push(b':');
-                    write(value, output)?;
-                }
-                output.push(b'}');
-            }
-        }
-        Ok(())
-    }
-    let mut output = Vec::new();
-    write(value, &mut output)?;
-    Ok(output)
 }
 
 fn valid_hex(value: &str) -> bool {

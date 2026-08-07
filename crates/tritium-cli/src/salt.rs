@@ -12,7 +12,10 @@ use anyhow::{Context, bail};
 use clap::Subcommand;
 use serde::Serialize;
 use tritium_quantize::{Qwen35CoverageSummary, Qwen35CoverageTotals};
-use tritium_salt::{Qwen36AdmittedSource, Qwen36LanguageCoverage};
+use tritium_salt::{
+    Qwen36AdmittedSource, Qwen36LanguageCoverage, STAGE7_TOKENS_PER_SEQUENCE, Stage7Partition,
+    Stage7TokenEvidencePack,
+};
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -44,6 +47,27 @@ pub(crate) enum SaltCommand {
         #[arg(long)]
         output_dir: PathBuf,
     },
+    /// Strictly reopen Stage-7 evidence and read one bounded token window.
+    InspectStage7EvidencePack {
+        /// Model snapshot whose tokenizer identity must match the pack.
+        #[arg(long)]
+        model_dir: PathBuf,
+        /// Exact `tritium.stage7-token-evidence-pack.v1` manifest.
+        #[arg(long)]
+        manifest: PathBuf,
+        /// Pack identity frozen by campaign/recipe provenance.
+        #[arg(long)]
+        expected_pack_id: String,
+        /// Frozen evidence partition to read.
+        #[arg(long)]
+        partition: Stage7Partition,
+        /// First sequence ordinal in the selected partition.
+        #[arg(long)]
+        start_sequence: usize,
+        /// Number of complete 2,048-token sequences to read.
+        #[arg(long)]
+        sequence_count: usize,
+    },
 }
 
 pub(crate) fn run(command: SaltCommand) -> anyhow::Result<()> {
@@ -58,7 +82,83 @@ pub(crate) fn run(command: SaltCommand) -> anyhow::Result<()> {
             sampled_rows,
             output_dir,
         } => crate::stage7_evidence::build(&model_dir, &sampled_rows, &output_dir),
+        SaltCommand::InspectStage7EvidencePack {
+            model_dir,
+            manifest,
+            expected_pack_id,
+            partition,
+            start_sequence,
+            sequence_count,
+        } => inspect_stage7_evidence_pack(
+            &model_dir,
+            &manifest,
+            &expected_pack_id,
+            partition,
+            start_sequence,
+            sequence_count,
+        ),
     }
+}
+
+fn inspect_stage7_evidence_pack(
+    model_dir: &Path,
+    manifest: &Path,
+    expected_pack_id: &str,
+    partition: Stage7Partition,
+    start_sequence: usize,
+    sequence_count: usize,
+) -> anyhow::Result<()> {
+    let (tokenizer_digest, tokenizer_vocab_size) =
+        crate::stage7_evidence::model_tokenizer_identity(model_dir)?;
+    let mut evidence = Stage7TokenEvidencePack::open(
+        manifest,
+        expected_pack_id,
+        &tokenizer_digest,
+        tokenizer_vocab_size,
+    )?;
+    let batch = evidence.read_sequences(partition, start_sequence, sequence_count)?;
+    let receipt = evidence.finish()?;
+    let report = Stage7EvidenceReadReport {
+        schema: "tritium.stage7-token-evidence-read.v1",
+        pack_id: receipt.pack_id(),
+        tokenizer_digest: receipt.tokenizer_digest(),
+        tokenizer_vocab_size: receipt.tokenizer_vocab_size(),
+        token_payload_sha256: receipt.token_payload_sha256(),
+        partition: batch.partition(),
+        sampling_seed: batch.sampling_seed(),
+        start_sequence: batch.start_sequence(),
+        sequence_count: batch.sequence_count(),
+        tokens_per_sequence: STAGE7_TOKENS_PER_SEQUENCE,
+        token_count: batch.tokens().len(),
+        sequence_ids: batch.sequence_ids(),
+        ordered_token_sha256: batch.ordered_token_sha256(),
+        terminal_validated: true,
+    };
+    let mut rendered = serde_json::to_vec_pretty(&report)?;
+    rendered.push(b'\n');
+    print!(
+        "{}",
+        String::from_utf8(rendered).expect("report JSON is UTF-8")
+    );
+    Ok(())
+}
+
+#[derive(Debug, Serialize)]
+struct Stage7EvidenceReadReport<'a> {
+    schema: &'static str,
+    pack_id: &'a str,
+    tokenizer_digest: &'a str,
+    tokenizer_vocab_size: u32,
+    token_payload_sha256: &'a str,
+    partition: Stage7Partition,
+    sampling_seed: u64,
+    start_sequence: usize,
+    sequence_count: usize,
+    tokens_per_sequence: usize,
+    token_count: usize,
+    sequence_ids: &'a [String],
+    ordered_token_sha256: &'a str,
+    terminal_validated: bool,
 }
 
 fn qwen36_preflight(model_dir: &Path, work_root: &Path, output: &Path) -> anyhow::Result<()> {

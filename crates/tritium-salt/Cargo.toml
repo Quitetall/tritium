@@ -15,11 +15,15 @@ categories.workspace = true
 blake3 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 tritium-format = { workspace = true }
 tritium-nn = { workspace = true }
 tritium-cpu = { workspace = true }
 tritium-cuda = { workspace = true, optional = true }
 tritium-quantize = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 half = { workspace = true }
