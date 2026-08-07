@@ -112,6 +112,57 @@ full session fault injection, and browser trace capture remain release gates;
 this packaged runner makes those lanes possible but is not itself a lane
 receipt.
 
+`runPhysicalBrowserTrainingLaneV1()` is the fail-closed physical-lane module.
+It acquires high-performance WebGPU devices, rejects missing or software
+adapter identity, runs the complete vector core, executes a frozen SALT-STE /
+SGD forward-backward-step-checkpoint-resume-export scenario, strict-reloads the
+artifact, compares it byte-for-byte with a candidate-bound native CPU reference,
+and injects device loss, allocation failure, malformed checkpoint, malformed
+SALT, cancellation and out-of-order calls. Buffer mapping is instrumented from
+device allocation so its trace reports observed explicit readbacks and refuses
+any hidden mapping. WebDriver host identity and atomic lane publication remain
+outside the package and cannot be replaced by this browser-side trace.
+
+Keep qualification outputs outside checkout so strict source admission sees
+every nonignored untracked path. First produce npm archive and native CPU
+reference on clean exact revision. Native producer executes
+same one-step scenario through `CpuTrainBackendV1`, exports and native-reloads
+canonical SALT V2 bytes, rejects host transfers or dirty build identity, and
+atomically seals both lifecycle receipts:
+
+```bash
+export TRITIUM_EVIDENCE_ROOT="${TMPDIR:-/tmp}/tritium-v11-$(git rev-parse HEAD)"
+TRITIUM_NPM_EVIDENCE_DIR="$TRITIUM_EVIDENCE_ROOT/npm" \
+  npm --prefix packages/tritium-web run check
+python scripts/produce-browser-native-reference.py \
+  --source-revision "$(git rev-parse HEAD)" \
+  --output-dir "$TRITIUM_EVIDENCE_ROOT/native"
+```
+
+Then produce one physical lane from already-running W3C WebDriver endpoint:
+
+```bash
+node scripts/run-browser-training-lane.mjs \
+  --artifact "$TRITIUM_EVIDENCE_ROOT/npm/tritium-ai-web-1.1.0-rc.0.tgz" \
+  --npm-receipt "$TRITIUM_EVIDENCE_ROOT/npm/npm-archive-receipt.json" \
+  --native-artifact "$TRITIUM_EVIDENCE_ROOT/native/native.salt" \
+  --native-reference-receipt "$TRITIUM_EVIDENCE_ROOT/native/receipt.json" \
+  --webdriver-url http://127.0.0.1:9515 \
+  --engine chrome --expected-browser-version 140.0.1 \
+  --source-revision "$(git rev-parse HEAD)" \
+  --run-id chrome-physical-1 \
+  --output-dir "$TRITIUM_EVIDENCE_ROOT/chrome"
+```
+
+The producer installs exact archive bytes offline, serves only installed files
+from loopback, accepts only a loopback-local WebDriver endpoint so host OS
+identity describes the browser machine, creates a non-headless browser session, runs browser qualification,
+derives host OS identity from running machine, binds browser capabilities plus
+native CPU and npm receipts, then atomically
+publishes `lane.json` and canonical `trace.json`. It requires a clean revision
+and a clean-source npm receipt. Run separate current-stable endpoints for
+Chrome, Firefox and Safari; Safari lane additionally requires physical macOS.
+
 This package is private while the local v1.1 release candidate is under
 construction. Registry publication requires explicit release authorization.
 Building the archive from source requires the pinned

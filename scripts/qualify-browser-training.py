@@ -45,9 +45,9 @@ def git_output(repo: Path, *args: str) -> str:
 def require_clean_revision(repo: Path, revision: str) -> None:
     if git_output(repo, "rev-parse", "HEAD") != revision:
         raise QualificationError("browser qualification source revision is not HEAD")
-    status = git_output(repo, "status", "--short", "--untracked-files=no")
+    status = git_output(repo, "status", "--short", "--untracked-files=all")
     if status:
-        raise QualificationError("browser qualification requires clean tracked source")
+        raise QualificationError("browser qualification requires clean exact source")
 
 
 def ordinary(path: Path, label: str, maximum: int) -> Path:
@@ -61,7 +61,13 @@ def ordinary(path: Path, label: str, maximum: int) -> Path:
     return path.resolve(strict=True)
 
 
-def load_lane(path: Path, ordinal: int) -> tuple[dict[str, Any], Path]:
+def load_lane(
+    path: Path,
+    ordinal: int,
+    source_revision: str,
+    release: str,
+    archive: Path,
+) -> tuple[dict[str, Any], Path]:
     path = ordinary(path, f"{ENGINES[ordinal]} lane fragment", MAX_RECEIPT_BYTES)
     try:
         value = json.loads(path.read_bytes())
@@ -69,7 +75,14 @@ def load_lane(path: Path, ordinal: int) -> tuple[dict[str, Any], Path]:
         raise QualificationError(
             "browser lane fragment must contain UTF-8 JSON"
         ) from error
-    lane = validate_lane(value, ordinal, path.parent.resolve(strict=True))
+    lane = validate_lane(
+        value,
+        ordinal,
+        path.parent.resolve(strict=True),
+        source_revision,
+        release,
+        archive,
+    )
     trace = (path.parent / lane["trace"]["file"]).resolve(strict=True)
     return lane, trace
 
@@ -112,7 +125,9 @@ def assemble(
     traces.mkdir()
     lanes = []
     for ordinal, path in enumerate(lane_paths):
-        lane, source_trace = load_lane(path, ordinal)
+        lane, source_trace = load_lane(
+            path, ordinal, source_revision, release, archive
+        )
         lane = json.loads(json.dumps(lane))
         destination = traces / f"{ENGINES[ordinal]}.trace.json"
         shutil.copyfile(source_trace, destination)

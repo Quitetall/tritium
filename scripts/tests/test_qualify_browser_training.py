@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 import runpy
 import shutil
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -16,6 +17,7 @@ assemble = MODULE["assemble"]
 qualify = MODULE["qualify"]
 validate = MODULE["validate_receipt"]
 QualificationError = MODULE["QualificationError"]
+require_clean_revision = MODULE["require_clean_revision"]
 
 
 def lane_fragments(root: Path):
@@ -35,6 +37,35 @@ def lane_fragments(root: Path):
 
 
 class BrowserTrainingQualificationTests(unittest.TestCase):
+    def test_clean_revision_rejects_nonignored_untracked_source(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            subprocess.run(
+                ["git", "config", "user.email", "test@tritium.invalid"],
+                cwd=root,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "Tritium Test"],
+                cwd=root,
+                check=True,
+            )
+            (root / "tracked.txt").write_text("tracked\n")
+            subprocess.run(["git", "add", "tracked.txt"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-qm", "fixture"], cwd=root, check=True)
+            revision = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            require_clean_revision(root, revision)
+            (root / "untracked.txt").write_text("source injection\n")
+            with self.assertRaisesRegex(QualificationError, "clean exact"):
+                require_clean_revision(root, revision)
+
     def test_assembles_revalidated_distinct_traces_and_strict_receipt(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)

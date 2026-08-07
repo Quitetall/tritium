@@ -1,0 +1,593 @@
+{
+  "schema": "tritium.browser-vector-inventory.v1",
+  "manifestDigest": "9093a1a7f9a3422c399943782aadf4df6b11833cf2253db0db56ff2d9dedb098",
+  "vectorDigest": "38b17f4c76c1d2f85cb35c713652a3d77627d02ba47933d2c8f31a88e0c594a7",
+  "sourceSha256": "eae8fab4778ad00f32a5ee0984ae6620960751029118dd9d7b97ffd36a502d0d",
+  "cases": [
+    {
+      "caseId": "graph.add.forward.basic",
+      "implementation": "webgpu",
+      "scratchBytesMax": 0
+    },
+    {
+      "caseId": "graph.add.forward.zero",
+      "implementation": "webgpu",
+      "scratchBytesMax": 0
+    },
+    {
+      "caseId": "graph.add.vjp.basic",
+      "implementation": "webgpu",
+      "scratchBytesMax": 0
+    },
+    {
+      "caseId": "graph.ste_surrogate.forward.basic",
+      "implementation": "webgpu",
+      "scratchBytesMax": 0
+    },
+    {
+      "caseId": "graph.ste_surrogate.vjp.basic",
+      "implementation": "webgpu",
+      "scratchBytesMax": 0
+    },
+    {
+      "caseId": "graph.salt_ste.forward.two_planes",
+      "implementation": "webgpu",
+      "scratchBytesMax": 12
+    },
+    {
+      "caseId": "graph.salt_ste.vjp.identity",
+      "implementation": "webgpu",
+      "scratchBytesMax": 0
+    },
+    {
+      "caseId": "graph.lsq_ste.forward.basic",
+      "implementation": "webgpu",
+      "scratchBytesMax": 0
+    },
+    {
+      "caseId": "graph.lsq_ste.vjp.basic",
+      "implementation": "webgpu",
+      "scratchBytesMax": 0
+    },
+    {
+      "caseId": "graph.fsq.forward.soft_round",
+      "implementation": "webgpu",
+      "scratchBytesMax": 0
+    },
+    {
+      "caseId": "graph.fsq.vjp.soft_round",
+      "implementation": "webgpu",
+      "scratchBytesMax": 0
+    },
+    {
+      "caseId": "graph.fsq.forward.hard_half_ties",
+      "implementation": "webgpu",
+      "scratchBytesMax": 0
+    },
+    {
+      "caseId": "graph.fsq.vjp.hard_tanh",
+      "implementation": "webgpu",
+      "scratchBytesMax": 0
+    },
+    {
+      "caseId": "graph.fsq.forward.stochastic_seed_7",
+      "implementation": "webgpu",
+      "scratchBytesMax": 0
+    },
+    {
+      "caseId": "graph.fsq.forward.stochastic_seed_8",
+      "implementation": "webgpu",
+      "scratchBytesMax": 0
+    },
+    {
+      "caseId": "graph.dense_matmul.forward.basic",
+      "implementation": "webgpu",
+      "scratchBytesMax": 0
+    },
+    {
+      "caseId": "graph.dense_matmul.vjp.basic",
+      "implementation": "webgpu",
+      "scratchBytesMax": 0
+    },
+    {
+      "caseId": "graph.ternary_matmul.forward.basic",
+      "implementation": "webgpu",
+      "scratchBytesMax": 0
+    },
+    {
+      "caseId": "graph.ternary_matmul.vjp.basic",
+      "implementation": "webgpu",
+      "scratchBytesMax": 0
+    },
+    {
+      "caseId": "graph.transpose.forward.basic",
+      "implementation": "webgpu",
+      "scratchBytesMax": 0
+    },
+    {
+      "caseId": "graph.transpose.vjp.basic",
+      "implementation": "webgpu",
+      "scratchBytesMax": 0
+    },
+    {
+      "caseId": "graph.embedding_gather.forward.repeated",
+      "implementation": "webgpu",
+      "scratchBytesMax": 0
+    },
+    {
+      "caseId": "graph.embedding_gather.vjp.repeated",
+      "implementation": "webgpu",
+      "scratchBytesMax": 0
+    },
+    {
+      "caseId": "graph.slice_cols.forward.basic",
+      "implementation": "webgpu",
+      "scratchBytesMax": 0
+    },
+    {
+      "caseId": "graph.slice_cols.vjp.basic",
+      "implementation": "webgpu",
+      "scratchBytesMax": 0
+    },
+    {
+      "caseId": "graph.concat_cols.forward.basic",
+      "implementation": "webgpu",
+      "scratchBytesMax": 0
+    },
+    {
+      "caseId": "graph.concat_cols.vjp.basic",
+      "implementation": "webgpu",
+      "scratchBytesMax": 0
+    },
+    {
+      "caseId": "graph.mul.forward.basic",
+      "implementation": "webgpu",
+      "scratchBytesMax": 0
+    },
+    {
+      "caseId": "graph.mul.vjp.basic",
+      "implementation": "webgpu",
+      "scratchBytesMax": 0
+    },
+    {
+      "caseId": "graph.conv1d.forward.depthwise_asymmetric",
+      "implementation": "webgpu",
+      "scratchBytesMax": 80
+    },
+    {
+      "caseId": "graph.conv1d.vjp.depthwise_asymmetric",
+      "implementation": "webgpu",
+      "scratchBytesMax": 148
+    },
+    {
+      "caseId": "graph.conv2d.forward.depthwise_asymmetric",
+      "implementation": "webgpu",
+      "scratchBytesMax": 168
+    },
+    {
+      "caseId": "graph.conv2d.vjp.depthwise_asymmetric",
+      "implementation": "webgpu",
+      "scratchBytesMax": 372
+    },
+    {
+      "caseId": "graph.detach.forward.basic",
+      "implementation": "webgpu",
+      "scratchBytesMax": 0
+    },
+    {
+      "caseId": "graph.detach.vjp.zero",
+      "implementation": "webgpu",
+      "scratchBytesMax": 0
+    },
+    {
+      "caseId": "graph.scale_const.forward.basic",
+      "implementation": "webgpu",
+      "scratchBytesMax": 0
+    },
+    {
+      "caseId": "graph.scale_const.vjp.basic",
+      "implementation": "webgpu",
+      "scratchBytesMax": 0
+    },
+    {
+      "caseId": "graph.bias.forward.basic",
+      "implementation": "webgpu",
+      "scratchBytesMax": 0
+    },
+    {
+      "caseId": "graph.bias.vjp.basic",
+      "implementation": "webgpu",
+      "scratchBytesMax": 0
+    },
+    {
+      "caseId": "graph.relu2.forward.basic",
+      "implementation": "webgpu",
+      "scratchBytesMax": 0
+    },
+    {
+      "caseId": "graph.relu2.vjp.basic",
+      "implementation": "webgpu",
+      "scratchBytesMax": 0
+    },
+    {
+      "caseId": "graph.silu.forward.basic",
+      "implementation": "webgpu",
+      "scratchBytesMax": 0
+    },
+    {
+      "caseId": "graph.silu.vjp.basic",
+      "implementation": "webgpu",
+      "scratchBytesMax": 0
+    },
+    {
+      "caseId": "graph.rmsnorm.forward.basic",
+      "implementation": "webgpu",
+      "scratchBytesMax": 0
+    },
+    {
+      "caseId": "graph.rmsnorm.vjp.basic",
+      "implementation": "webgpu",
+      "scratchBytesMax": 0
+    },
+    {
+      "caseId": "graph.softmax.forward.basic",
+      "implementation": "webgpu",
+      "scratchBytesMax": 0
+    },
+    {
+      "caseId": "graph.softmax.vjp.basic",
+      "implementation": "webgpu",
+      "scratchBytesMax": 0
+    },
+    {
+      "caseId": "graph.causal_mask.forward.basic",
+      "implementation": "webgpu",
+      "scratchBytesMax": 0
+    },
+    {
+      "caseId": "graph.causal_mask.vjp.basic",
+      "implementation": "webgpu",
+      "scratchBytesMax": 0
+    },
+    {
+      "caseId": "graph.rope.forward.basic",
+      "implementation": "webgpu",
+      "scratchBytesMax": 0
+    },
+    {
+      "caseId": "graph.rope.vjp.basic",
+      "implementation": "webgpu",
+      "scratchBytesMax": 0
+    },
+    {
+      "caseId": "graph.attention.forward.causal_gqa",
+      "implementation": "webgpu",
+      "scratchBytesMax": 84
+    },
+    {
+      "caseId": "graph.attention.forward.noncausal_gqa",
+      "implementation": "webgpu",
+      "scratchBytesMax": 84
+    },
+    {
+      "caseId": "graph.attention.vjp.causal_gqa",
+      "implementation": "webgpu",
+      "scratchBytesMax": 168
+    },
+    {
+      "caseId": "graph.attention.vjp.noncausal_mqa",
+      "implementation": "webgpu",
+      "scratchBytesMax": 168
+    },
+    {
+      "caseId": "graph.attention.forward.multigroup_gqa",
+      "implementation": "webgpu",
+      "scratchBytesMax": 48
+    },
+    {
+      "caseId": "graph.attention.vjp.multigroup_gqa",
+      "implementation": "webgpu",
+      "scratchBytesMax": 96
+    },
+    {
+      "caseId": "loss.mse.forward.basic",
+      "implementation": "webgpu",
+      "scratchBytesMax": 0
+    },
+    {
+      "caseId": "loss.mse.vjp.basic",
+      "implementation": "webgpu",
+      "scratchBytesMax": 0
+    },
+    {
+      "caseId": "loss.softmax_cross_entropy.forward.basic",
+      "implementation": "webgpu",
+      "scratchBytesMax": 0
+    },
+    {
+      "caseId": "loss.softmax_cross_entropy.vjp.basic",
+      "implementation": "webgpu",
+      "scratchBytesMax": 0
+    },
+    {
+      "caseId": "loss.topk_knowledge_distillation.forward.duplicate_indices",
+      "implementation": "webgpu",
+      "scratchBytesMax": 0
+    },
+    {
+      "caseId": "loss.topk_knowledge_distillation.vjp.duplicate_indices",
+      "implementation": "webgpu",
+      "scratchBytesMax": 0
+    },
+    {
+      "caseId": "optimizer.sgd.step.basic",
+      "implementation": "webgpu",
+      "scratchBytesMax": 0
+    },
+    {
+      "caseId": "optimizer.adamw.step.resumed_state",
+      "implementation": "webgpu",
+      "scratchBytesMax": 32
+    },
+    {
+      "caseId": "optimizer.cautious_adamw.step.masked_state",
+      "implementation": "webgpu",
+      "scratchBytesMax": 48
+    },
+    {
+      "caseId": "optimizer.int8_adamw.step.quiet_spike_blocks",
+      "implementation": "webgpu",
+      "scratchBytesMax": 2584
+    },
+    {
+      "caseId": "optimizer.muon.step.resumed_rectangular",
+      "implementation": "webgpu",
+      "scratchBytesMax": 144
+    },
+    {
+      "caseId": "lifecycle.checkpoint.adamw_multileaf",
+      "implementation": "wasm-codec",
+      "scratchBytesMax": 153
+    },
+    {
+      "caseId": "lifecycle.resume.adamw_multileaf",
+      "implementation": "wasm-codec",
+      "scratchBytesMax": 60
+    },
+    {
+      "caseId": "lifecycle.export.salt_v2_package",
+      "implementation": "wasm-codec",
+      "scratchBytesMax": 132032
+    },
+    {
+      "caseId": "lifecycle.reload.salt_v2_package",
+      "implementation": "wasm-codec",
+      "scratchBytesMax": 132032
+    },
+    {
+      "caseId": "graph.add.forward.nonfinite",
+      "implementation": "wasm-validation",
+      "scratchBytesMax": null
+    },
+    {
+      "caseId": "graph.add.forward.duplicate_input",
+      "implementation": "wasm-validation",
+      "scratchBytesMax": null
+    },
+    {
+      "caseId": "graph.transpose.forward.shape_error",
+      "implementation": "wasm-validation",
+      "scratchBytesMax": null
+    },
+    {
+      "caseId": "graph.embedding_gather.forward.token_oob",
+      "implementation": "wasm-validation",
+      "scratchBytesMax": null
+    },
+    {
+      "caseId": "graph.slice_cols.forward.bounds_error",
+      "implementation": "wasm-validation",
+      "scratchBytesMax": null
+    },
+    {
+      "caseId": "graph.concat_cols.forward.shape_error",
+      "implementation": "wasm-validation",
+      "scratchBytesMax": null
+    },
+    {
+      "caseId": "graph.dense_matmul.forward.shape_error",
+      "implementation": "wasm-validation",
+      "scratchBytesMax": null
+    },
+    {
+      "caseId": "graph.ternary_matmul.forward.nonfinite_scale",
+      "implementation": "wasm-validation",
+      "scratchBytesMax": null
+    },
+    {
+      "caseId": "graph.rmsnorm.forward.shape_error",
+      "implementation": "wasm-validation",
+      "scratchBytesMax": null
+    },
+    {
+      "caseId": "graph.softmax.forward.shape_error",
+      "implementation": "wasm-validation",
+      "scratchBytesMax": null
+    },
+    {
+      "caseId": "graph.causal_mask.forward.shape_error",
+      "implementation": "wasm-validation",
+      "scratchBytesMax": null
+    },
+    {
+      "caseId": "loss.softmax_cross_entropy.forward.shape_error",
+      "implementation": "wasm-validation",
+      "scratchBytesMax": null
+    },
+    {
+      "caseId": "loss.topk_knowledge_distillation.forward.index_out_of_range",
+      "implementation": "wasm-validation",
+      "scratchBytesMax": null
+    },
+    {
+      "caseId": "graph.rope.forward.odd_head_dim",
+      "implementation": "wasm-validation",
+      "scratchBytesMax": null
+    },
+    {
+      "caseId": "loss.softmax_cross_entropy.forward.zero_rows",
+      "implementation": "wasm-validation",
+      "scratchBytesMax": null
+    },
+    {
+      "caseId": "loss.softmax_cross_entropy.forward.zero_cols",
+      "implementation": "wasm-validation",
+      "scratchBytesMax": null
+    },
+    {
+      "caseId": "graph.rope.forward.position_overflow",
+      "implementation": "wasm-validation",
+      "scratchBytesMax": null
+    },
+    {
+      "caseId": "graph.ste_surrogate.forward.shape_error",
+      "implementation": "wasm-validation",
+      "scratchBytesMax": null
+    },
+    {
+      "caseId": "graph.salt_ste.forward.zero_planes",
+      "implementation": "wasm-validation",
+      "scratchBytesMax": null
+    },
+    {
+      "caseId": "graph.lsq_ste.forward.shape_error",
+      "implementation": "wasm-validation",
+      "scratchBytesMax": null
+    },
+    {
+      "caseId": "graph.fsq.forward.invalid_levels",
+      "implementation": "wasm-validation",
+      "scratchBytesMax": null
+    },
+    {
+      "caseId": "graph.salt_ste.forward.zero_rows_huge_cols",
+      "implementation": "wasm-validation",
+      "scratchBytesMax": null
+    },
+    {
+      "caseId": "graph.salt_ste.forward.too_many_planes",
+      "implementation": "wasm-validation",
+      "scratchBytesMax": null
+    },
+    {
+      "caseId": "graph.salt_ste.forward.reordered_attributes",
+      "implementation": "wasm-validation",
+      "scratchBytesMax": null
+    },
+    {
+      "caseId": "graph.lsq_ste.vjp.zero_cols",
+      "implementation": "wasm-validation",
+      "scratchBytesMax": null
+    },
+    {
+      "caseId": "graph.fsq.forward.zero_len",
+      "implementation": "wasm-validation",
+      "scratchBytesMax": null
+    },
+    {
+      "caseId": "graph.fsq.forward.invalid_alpha",
+      "implementation": "wasm-validation",
+      "scratchBytesMax": null
+    },
+    {
+      "caseId": "graph.fsq.forward.unknown_ste",
+      "implementation": "wasm-validation",
+      "scratchBytesMax": null
+    },
+    {
+      "caseId": "graph.conv1d.forward.zero_groups",
+      "implementation": "wasm-validation",
+      "scratchBytesMax": null
+    },
+    {
+      "caseId": "graph.conv1d.forward.ragged_groups",
+      "implementation": "wasm-validation",
+      "scratchBytesMax": null
+    },
+    {
+      "caseId": "graph.conv1d.forward.axis_u32_overflow",
+      "implementation": "wasm-validation",
+      "scratchBytesMax": null
+    },
+    {
+      "caseId": "graph.conv1d.forward.scratch_limit",
+      "implementation": "wasm-validation",
+      "scratchBytesMax": null
+    },
+    {
+      "caseId": "graph.conv2d.forward.zero_groups",
+      "implementation": "wasm-validation",
+      "scratchBytesMax": null
+    },
+    {
+      "caseId": "graph.conv2d.forward.oversized_kernel",
+      "implementation": "wasm-validation",
+      "scratchBytesMax": null
+    },
+    {
+      "caseId": "optimizer.adamw.step.zero_step",
+      "implementation": "wasm-validation",
+      "scratchBytesMax": null
+    },
+    {
+      "caseId": "optimizer.cautious_adamw.step.invalid_beta1",
+      "implementation": "wasm-validation",
+      "scratchBytesMax": null
+    },
+    {
+      "caseId": "optimizer.int8_adamw.step.scale_shape",
+      "implementation": "wasm-validation",
+      "scratchBytesMax": null
+    },
+    {
+      "caseId": "optimizer.muon.step.zero_ns_steps",
+      "implementation": "wasm-validation",
+      "scratchBytesMax": null
+    },
+    {
+      "caseId": "lifecycle.checkpoint.negative_second_moment",
+      "implementation": "wasm-validation",
+      "scratchBytesMax": null
+    },
+    {
+      "caseId": "lifecycle.resume.bad_magic",
+      "implementation": "wasm-validation",
+      "scratchBytesMax": null
+    },
+    {
+      "caseId": "lifecycle.resume.negative_second_moment",
+      "implementation": "wasm-validation",
+      "scratchBytesMax": null
+    },
+    {
+      "caseId": "lifecycle.export.unknown_format",
+      "implementation": "wasm-validation",
+      "scratchBytesMax": null
+    },
+    {
+      "caseId": "lifecycle.reload.bad_magic",
+      "implementation": "wasm-validation",
+      "scratchBytesMax": null
+    },
+    {
+      "caseId": "graph.attention.forward.ragged_gqa",
+      "implementation": "wasm-validation",
+      "scratchBytesMax": null
+    },
+    {
+      "caseId": "graph.attention.forward.product_limit",
+      "implementation": "wasm-validation",
+      "scratchBytesMax": null
+    }
+  ]
+}

@@ -1,24 +1,15 @@
-import { cp, mkdir, readFile, rm } from "node:fs/promises";
+import { cp, mkdir, rm } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { blake3 } from "@noble/hashes/blake3.js";
-import { bytesToHex } from "@noble/hashes/utils.js";
 import { build } from "esbuild";
 
 import { buildPortableWasm } from "./build-wasm.mjs";
+import { canonicalBrowserVectorMetadataV1 } from "./canonical-browser-vector-metadata.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const output = resolve(root, "dist");
-const canonicalVectors = await readFile(resolve(
-  root,
-  "../../crates/tritium-spec/data/training/v2/vectors/v2.json",
-));
-const canonicalVectorDigest =
-  "38b17f4c76c1d2f85cb35c713652a3d77627d02ba47933d2c8f31a88e0c594a7";
-if (bytesToHex(blake3(canonicalVectors)) !== canonicalVectorDigest) {
-  throw new Error("canonical training vector bytes differ from the frozen V2 digest");
-}
+const { sourceBytes: canonicalVectors } = await canonicalBrowserVectorMetadataV1();
 
 await rm(output, { force: true, recursive: true });
 await mkdir(output, { recursive: true });
@@ -27,7 +18,7 @@ await build({
   bundle: true,
   entryPoints: {
     index: resolve(root, "src/index.ts"),
-    qualification: resolve(root, "src/webgpu-conformance.ts"),
+    qualification: resolve(root, "src/qualification.ts"),
   },
   format: "esm",
   legalComments: "none",

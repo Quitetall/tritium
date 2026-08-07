@@ -836,6 +836,17 @@ function outputDigest(outputs: readonly PortableBufferV1[]): string {
   return bytesToHex(sha256(UTF8.encode(JSON.stringify(outputs))));
 }
 
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value !== null && typeof value === "object") {
+    const recordValue = value as Readonly<Record<string, unknown>>;
+    return `{${Object.keys(recordValue).sort().map((key) =>
+      `${JSON.stringify(key)}:${canonicalJson(recordValue[key])}`
+    ).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
 function samePortableOutputs(
   actual: readonly PortableBufferV1[],
   expected: readonly VectorBuffer[],
@@ -981,7 +992,7 @@ export async function runWebGpuVectorConformanceV1(
       if (trace === undefined) fail(`${item.case_id} has no execution trace`);
       return trace;
     }));
-    const executionDigest = bytesToHex(sha256(UTF8.encode(JSON.stringify(ordered))));
+    const executionDigest = bytesToHex(sha256(UTF8.encode(canonicalJson(ordered))));
     return Object.freeze({
       schemaId: "tritium.webgpu_vector_conformance_trace",
       schemaVersion: 1,

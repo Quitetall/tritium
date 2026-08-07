@@ -1628,7 +1628,7 @@ class ReleaseEvidenceStatusTests(unittest.TestCase):
                     ).decode("ascii"),
                 },
                 "evidence": {
-                    "source_dirty": False, "entry_count": 13,
+                    "source_dirty": False, "entry_count": 16,
                     "source_free": True, "installed_offline": True,
                     "strict_typescript": True,
                     "wasm_build_id": "tritium-wasm@1.1.0-rc.0+source-git:" + "a" * 40,

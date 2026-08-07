@@ -28,8 +28,8 @@ EVIDENCE_FIELDS = {
 HEX = frozenset("0123456789abcdef")
 MAX_RECEIPT_BYTES = 1024 * 1024
 MAX_ARCHIVE_BYTES = 512 * 1024 * 1024
-# verify-pack.mjs freezes the exact public tarball inventory to 13 files.
-EXPECTED_ENTRY_COUNT = 13
+# verify-pack.mjs freezes the exact public tarball inventory to 16 files.
+EXPECTED_ENTRY_COUNT = 16
 
 
 class NpmReceiptError(ValueError):
@@ -76,6 +76,16 @@ def validate_receipt(
 ) -> dict[str, Any]:
     if path.is_symlink() or not path.is_file() or path.stat().st_size > MAX_RECEIPT_BYTES:
         raise NpmReceiptError("npm receipt must be a bounded ordinary file")
+    try:
+        value = json.loads(path.read_bytes())
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise NpmReceiptError("npm receipt must contain UTF-8 JSON") from error
+    return validate_receipt_value(value, archive, revision, release)
+
+
+def validate_receipt_value(
+    value: Any, archive: Path, revision: str, release: str,
+) -> dict[str, Any]:
     if (
         archive.is_symlink()
         or not archive.is_file()
@@ -83,10 +93,7 @@ def validate_receipt(
         or archive.stat().st_size > MAX_ARCHIVE_BYTES
     ):
         raise NpmReceiptError("npm archive must be a bounded ordinary file")
-    try:
-        value = _object(json.loads(path.read_bytes()), TOP_FIELDS, "receipt")
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise NpmReceiptError("npm receipt must contain UTF-8 JSON") from error
+    value = _object(value, TOP_FIELDS, "receipt")
     if value["schema"] != SCHEMA or value["result"] != "pass":
         raise NpmReceiptError("npm receipt schema or result mismatch")
     if value["release"] != release or value["source_revision"] != revision:

@@ -47,7 +47,7 @@ def receipt_for(archive: Path, *, dirty: bool = False) -> dict:
         },
         "evidence": {
             "source_dirty": dirty,
-            "entry_count": 13,
+            "entry_count": 16,
             "source_free": True,
             "installed_offline": True,
             "strict_typescript": True,
