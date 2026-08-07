@@ -91,6 +91,7 @@ from .tutorial import (
     SMOLLM2_REVISION,
     run_smollm2_release_demo,
 )
+from .stage7 import Stage7CausalData, Stage7CausalDataReceipt
 from .projection import (
     ProjectionContext,
     TernaryPlane,
@@ -146,6 +147,8 @@ __all__ = [
     "SparseTernaryEstimator",
     "SMOLLM2_MODEL_ID",
     "SMOLLM2_REVISION",
+    "Stage7CausalData",
+    "Stage7CausalDataReceipt",
     "TernaryConfig",
     "TernaryDiagnostics",
     "TernaryPlane",

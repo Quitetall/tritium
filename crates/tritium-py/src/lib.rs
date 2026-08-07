@@ -41,6 +41,7 @@ mod onnx;
 mod ops;
 mod qwen;
 mod salt;
+mod stage7;
 mod torch_native;
 
 use std::sync::Mutex;
@@ -337,6 +338,10 @@ fn _tritium(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<kronecker::Qwen36KroneckerCaptureReceipt>()?;
     m.add_class::<kronecker::Qwen36KroneckerCaptureSession>()?;
     kronecker::register_exceptions(m)?;
+    m.add_class::<stage7::Stage7TokenEvidenceReceipt>()?;
+    m.add_class::<stage7::Stage7TokenBatch>()?;
+    m.add_class::<stage7::Stage7TokenEvidencePack>()?;
+    stage7::register_exceptions(m)?;
     m.add_function(wrap_pyfunction!(source_identity, m)?)?;
     m.add_function(wrap_pyfunction!(ternary_matmul, m)?)?;
     m.add_function(wrap_pyfunction!(compiled_backends, m)?)?;

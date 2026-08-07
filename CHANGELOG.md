@@ -26,6 +26,15 @@ see `docs/v1.0-api-freeze-audit.md` for the tier policy.
 
 ### Added
 
+- **Source-bound Stage-7 PyTorch data:** `Stage7TokenEvidencePack` now exposes
+  strict, same-handle token-pack admission to the `tritium-torch` wheel without
+  expanding token payloads into Python scalar lists. `Stage7CausalData.open`
+  selects a bounded partition window, terminally rehashes the retained payload
+  handle, records both ordered-member and raw-token identities, and yields
+  replayable causal-LM batches. This is the production input boundary for the
+  SmolLM2-135M smoke and 1.7B recipe driver; it does not claim capture, fitting,
+  package, quality, or Stage-7 completion by itself.
+
 - **Governed Stage-7 recipe freeze:**
   `scripts/qualify-stage7-recipe-freeze.py` validates the immutable
   SmolLM2-1.7B campaign inventory, disjoint calibration/evaluation provenance,
