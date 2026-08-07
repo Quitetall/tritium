@@ -1319,6 +1319,49 @@ pub struct HostOffloadTrainParam {
     pub optimizer: AdamW,
 }
 
+/// How the plane scales are chosen.
+///
+/// Two genuinely different fitters, not a tuning knob:
+///
+/// * [`Itf`](Self::Itf) — greedy residual expansion, each plane's scale fitted to what the previous
+///   left, then refined toward its least-squares optimum. The scales are free, and measured on real
+///   weights they drift *upward* (0.41, 0.42, 0.58, 0.70, eventually past 1.0), so each added plane
+///   buys about 1 dB against the 9.54 dB the rate allows.
+/// * [`Geometric`](Self::Geometric) — the scales are pinned to `s_p = s0·3^-p`, i.e. balanced
+///   ternary, which makes the reachable levels a uniform grid over every integer in `±(3^T-1)/2`.
+///   Measured 9.55–9.58 dB per plane, reaching fp parity at T=4; O(T) per weight instead of a
+///   per-plane residual pass; and one stored anchor per group instead of `T` scales.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SaltLadder {
+    /// Greedy residual expansion with `iters` ITF alternations per plane (`0` = plain AbsMean).
+    Itf {
+        /// Alternations per plane. Each moves the scale to `s* = <r,t>/<t,t>` and re-rounds,
+        /// accepting only on a strict SSE improvement, so more is never worse. `5` is what the PTQ
+        /// sweeps used. Also drives the host rotation-mask decision, which must agree with the
+        /// device fit.
+        iters: usize,
+    },
+    /// Balanced-ternary ladder. `grid` is the number of deterministic `Δ` candidates swept per
+    /// group (`0`/`1` = the single clipping-free step; `16` spans a 16× range and is the usual
+    /// choice — the search is load-bearing on heavy-tailed groups).
+    Geometric {
+        /// Number of `Δ` candidates.
+        grid: usize,
+    },
+}
+
+impl SaltLadder {
+    /// Plane counts this fitter admits. The ITF path is capped at 3 by the SALT V2 format and the
+    /// `3^T` joint enumeration; the ladder is O(T) and runs to 9.
+    #[must_use]
+    pub fn plane_range(self) -> core::ops::RangeInclusive<usize> {
+        match self {
+            SaltLadder::Itf { .. } => 1..=3,
+            SaltLadder::Geometric { .. } => 1..=9,
+        }
+    }
+}
+
 /// The SALT fitter configuration a [`DeviceTrainer`] reconstructs with (the PTQ campaign's stack:
 /// finer scale groups + per-group Hadamard). Absent means the legacy per-row AbsMean path.
 ///
@@ -1326,22 +1369,12 @@ pub struct HostOffloadTrainParam {
 /// distillation run that reconstructs the old way starts from a far worse student than it needs to.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SaltGrouping {
+    /// Which scale rule the fitter uses. See [`SaltLadder`].
+    pub ladder: SaltLadder,
     /// Weights per scale. `256` matches the deployed TQ2_0 block; `128` the PTQ convention.
     pub group: usize,
     /// Rotation policy. Decided **once on the host** at construction — see [`ste::rotation_mask`].
     pub rotation: ste::RotationPolicy,
-    /// Iterative-ternary-fitting alternations per plane (`0` = the greedy AbsMean fit, bit-for-bit).
-    /// Each alternation moves the scale to its least-squares optimum `s* = <r,t>/<t,t>` and
-    /// re-rounds, keeping a candidate only on a **strict** SSE improvement — so more iterations can
-    /// never be worse than fewer. They converge in a handful; `5` is what the PTQ sweeps used.
-    ///
-    /// Worth 1.4× / 2.7× / 4.4× lower reconstruction SSE at T=1/2/3 *on top of* rotation, so this is
-    /// what lets a distillation run start from the PTQ quality the host stack measured.
-    ///
-    /// The value is used for both the device fit and the host rotation-mask decision, which must
-    /// agree: a mask chosen under one fitter and applied to another is worse than either used
-    /// consistently.
-    pub iters: usize,
 }
 
 struct ResidentTrainParam {
@@ -1490,11 +1523,20 @@ impl<'a> DeviceTrainer<'a> {
                     g.group
                 )));
             }
-            if g.iters > 16 {
-                return Err(BackendError::InvalidInput(format!(
-                    "SALT ITF iterations must be <= 16 (they converge in a handful), got {}",
-                    g.iters
-                )));
+            match g.ladder {
+                SaltLadder::Itf { iters } if iters > 16 => {
+                    return Err(BackendError::InvalidInput(format!(
+                        "SALT ITF iterations must be <= 16 (they converge in a handful), got {iters}"
+                    )));
+                }
+                // The ladder's grid is a fixed candidate set, and beyond ~16 the steps are finer
+                // than the fit can use; keeping a bound stops a caller burning a per-step sweep.
+                SaltLadder::Geometric { grid } if grid > 32 => {
+                    return Err(BackendError::InvalidInput(format!(
+                        "geometric Δ grid must be <= 32, got {grid}"
+                    )));
+                }
+                _ => {}
             }
         }
         let mut leaf_lens = Vec::with_capacity(params.len());
@@ -1510,9 +1552,15 @@ impl<'a> DeviceTrainer<'a> {
                     got: param.master.len(),
                 });
             }
-            if !(1..=3).contains(&param.salt_planes) {
+            // The cap is the FITTER's, not a global constant: the ITF path is bounded at 3 by the
+            // SALT V2 format and the 3^T joint enumeration, while the ladder is O(T) and runs to 9.
+            // T>3 is exactly what the ladder unlocks (it reaches fp parity at T=4).
+            let planes_ok = grouping.map_or(1..=3, |g: SaltGrouping| g.ladder.plane_range());
+            if !planes_ok.contains(&param.salt_planes) {
                 return Err(BackendError::InvalidInput(format!(
-                    "parameter {index} SALT planes must be in 1..=3"
+                    "parameter {index} SALT planes must be in {:?}..={:?}",
+                    planes_ok.start(),
+                    planes_ok.end()
                 )));
             }
             parameter_elements = parameter_elements.checked_add(len).ok_or_else(|| {
@@ -1530,15 +1578,29 @@ impl<'a> DeviceTrainer<'a> {
             // feeds both this decision and the kernel launch.
             let rotate = match grouping {
                 Some(g) if g.rotation != ste::RotationPolicy::Never => {
-                    let mask = ste::rotation_mask(
-                        param.master,
-                        param.rows,
-                        param.cols,
-                        param.salt_planes,
-                        g.group,
-                        g.iters,
-                        g.rotation,
-                    );
+                    // Same fitter for the mask as for the fit. Deriving the mask from one fitter and
+                    // applying it to another is the train/eval quantizer mismatch that invalidated a
+                    // published conclusion once already (task #76).
+                    let mask = match g.ladder {
+                        SaltLadder::Itf { iters } => ste::rotation_mask(
+                            param.master,
+                            param.rows,
+                            param.cols,
+                            param.salt_planes,
+                            g.group,
+                            iters,
+                            g.rotation,
+                        ),
+                        SaltLadder::Geometric { grid } => ste::geometric_rotation_mask(
+                            param.master,
+                            param.rows,
+                            param.cols,
+                            param.salt_planes,
+                            g.group,
+                            grid,
+                            g.rotation,
+                        ),
+                    };
                     Some(backend.dev_upload_u8(&mask)?)
                 }
                 _ => None,
@@ -1755,16 +1817,30 @@ impl<'a> DeviceTrainer<'a> {
                 )
             })?;
             match self.grouping {
-                Some(g) => self.backend.salt_quantize_forward_grouped_dev(
-                    &param.master.buf,
-                    &mut quantized.buf,
-                    param.rotate.as_ref(),
-                    param.rows,
-                    param.cols,
-                    param.salt_planes,
-                    g.group,
-                    g.iters,
-                )?,
+                Some(g) => match g.ladder {
+                    SaltLadder::Itf { iters } => self.backend.salt_quantize_forward_grouped_dev(
+                        &param.master.buf,
+                        &mut quantized.buf,
+                        param.rotate.as_ref(),
+                        param.rows,
+                        param.cols,
+                        param.salt_planes,
+                        g.group,
+                        iters,
+                    )?,
+                    SaltLadder::Geometric { grid } => {
+                        self.backend.salt_quantize_forward_grouped_geometric_dev(
+                            &param.master.buf,
+                            &mut quantized.buf,
+                            param.rotate.as_ref(),
+                            param.rows,
+                            param.cols,
+                            param.salt_planes,
+                            g.group,
+                            grid,
+                        )?
+                    }
+                },
                 None => self.backend.salt_quantize_forward_sherry_dev(
                     &param.master.buf,
                     &mut self.residual,
@@ -6574,9 +6650,9 @@ mod tests {
                 for group in [128usize, 256] {
                     for iters in [0usize, 1, 5] {
                         let grouping = SaltGrouping {
+                            ladder: SaltLadder::Itf { iters },
                             group,
                             rotation: ste::RotationPolicy::Auto,
-                            iters,
                         };
                         let params = [DeviceTrainParam {
                             master: &master,
@@ -6763,6 +6839,126 @@ mod tests {
         eprintln!(
             "grouped SALT kernel matches the CPU oracle (rotated and not, incl. ragged tails)"
         );
+    }
+
+    /// The trainer driving the ladder end to end: `prepare_quantized` must reproduce the host
+    /// fitter bit-for-bit, at plane counts the ITF path cannot reach.
+    ///
+    /// The kernel gate below proves the kernel; this proves the WIRING — that `SaltGrouping`
+    /// dispatches to it, that the rotation mask is built with the ladder's own fitter rather than
+    /// the ITF one (deriving it from the wrong fitter is the train/eval mismatch of task #76), and
+    /// that the `1..=3` cap is lifted only for the fitter that can honour it.
+    #[test]
+    fn device_trainer_geometric_ladder_matches_host_and_lifts_the_plane_cap() {
+        use tritium_train::ops::ste::{self, RotationPolicy};
+        let backend = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping trainer ladder wiring: no CUDA device ({e})");
+                return;
+            }
+        };
+        let (rows, cols) = (4usize, 256usize);
+        let master = seeded_uniform(0x1AD_7A11, rows * cols, -2.0, 2.0);
+        let bits = |v: &[f32]| -> Vec<u32> { v.iter().map(|x| x.to_bits()).collect() };
+
+        // 6 is past the ITF path's hard cap of 3 — the point of the ladder on device.
+        for planes in [1usize, 3, 6] {
+            let grouping = SaltGrouping {
+                ladder: SaltLadder::Geometric { grid: 16 },
+                group: 128,
+                rotation: RotationPolicy::Auto,
+            };
+            let params = [DeviceTrainParam {
+                master: &master,
+                rows,
+                cols,
+                salt_planes: planes,
+                optimizer: AdamW::new(1e-3),
+            }];
+            let mut trainer = DeviceTrainer::new_with_fitter(
+                &backend,
+                &params,
+                DeviceTrainerWeightStorage::DenseQuantized,
+                MomentPrecision::F32,
+                MasterPrecision::F32,
+                Some(grouping),
+            )
+            .expect("trainer with the geometric ladder");
+            trainer.prepare_quantized().expect("prepare");
+            let mut got = vec![0.0f32; rows * cols];
+            backend
+                .dev_download(&trainer.quantized(0).expect("quantized").buf, &mut got)
+                .unwrap();
+
+            // The host oracle must use the SAME frozen mask the trainer built, not a fresh `Auto`
+            // decision — `Auto` re-decides per call and would introduce a second mismatch.
+            let mask = ste::geometric_rotation_mask(
+                &master,
+                rows,
+                cols,
+                planes,
+                128,
+                16,
+                RotationPolicy::Auto,
+            );
+            let mut want = vec![0.0f32; rows * cols];
+            let per_row = cols.div_ceil(128);
+            for r in 0..rows {
+                for b in 0..per_row {
+                    let lo = r * cols + b * 128;
+                    let hi = (lo + 128).min((r + 1) * cols);
+                    let policy = if mask[r * per_row + b] == 1 {
+                        RotationPolicy::Always
+                    } else {
+                        RotationPolicy::Never
+                    };
+                    let fit = ste::salt_quantize_forward_grouped_geometric(
+                        &master[lo..hi],
+                        1,
+                        hi - lo,
+                        planes,
+                        128,
+                        16,
+                        policy,
+                    );
+                    want[lo..hi].copy_from_slice(&fit);
+                }
+            }
+            assert_eq!(
+                bits(&got),
+                bits(&want),
+                "trainer ladder T{planes}: device diverged from the host fitter"
+            );
+        }
+
+        // And the cap is per-fitter, not global: the ITF path must still refuse T=6.
+        let itf = SaltGrouping {
+            ladder: SaltLadder::Itf { iters: 5 },
+            group: 128,
+            rotation: RotationPolicy::Auto,
+        };
+        let params = [DeviceTrainParam {
+            master: &master,
+            rows,
+            cols,
+            salt_planes: 6,
+            optimizer: AdamW::new(1e-3),
+        }];
+        assert!(
+            DeviceTrainer::new_with_fitter(
+                &backend,
+                &params,
+                DeviceTrainerWeightStorage::DenseQuantized,
+                MomentPrecision::F32,
+                MasterPrecision::F32,
+                Some(itf),
+            )
+            .is_err(),
+            "the ITF path must still reject T=6 — its cap is a format/enumeration limit, not a \
+             global one, and silently accepting it would produce a fit the packer cannot store"
+        );
+        eprintln!("trainer ladder wiring bit-exact at T=1/3/6; ITF cap still enforced");
     }
 
     /// The **balanced-ternary ladder** kernel against its CPU oracle, asserted BIT-EXACT.

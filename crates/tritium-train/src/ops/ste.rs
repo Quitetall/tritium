@@ -620,7 +620,7 @@ fn fit_group_geometric_rotated(
     grid: usize,
     rotation: RotationPolicy,
     buf: &mut Vec<f32>,
-) -> (Vec<f32>, f32, Vec<Vec<i8>>) {
+) -> (Vec<f32>, f32, Vec<Vec<i8>>, bool) {
     let sse = |a: &[f32], b: &[f32]| -> f64 {
         a.iter()
             .zip(b)
@@ -631,7 +631,7 @@ fn fit_group_geometric_rotated(
     let plain = || {
         let (s0, planes) = fit_group_geometric(bs, t, grid);
         let recon = ladder_reconstruct(s0, &planes, bs.len());
-        (recon, s0, planes)
+        (recon, s0, planes, false)
     };
     if rotation == RotationPolicy::Never || !rotatable {
         return plain();
@@ -645,13 +645,13 @@ fn fit_group_geometric_rotated(
     fast_hadamard(&mut back); // H is its own inverse at normalized scale
 
     match rotation {
-        RotationPolicy::Always => (back, s0, planes),
+        RotationPolicy::Always => (back, s0, planes, true),
         _ => {
-            let (p_recon, p_s0, p_planes) = plain();
+            let (p_recon, p_s0, p_planes, _) = plain();
             if sse(&back, bs) < sse(&p_recon, bs) {
-                (back, s0, planes)
+                (back, s0, planes, true)
             } else {
-                (p_recon, p_s0, p_planes)
+                (p_recon, p_s0, p_planes, false)
             }
         }
     }
@@ -680,8 +680,39 @@ pub fn salt_quantize_forward_grouped_geometric(
         let src = &wf[r * cols..(r + 1) * cols];
         let dst = &mut out[r * cols..(r + 1) * cols];
         for (bs, bd) in src.chunks(group).zip(dst.chunks_mut(group)) {
-            let (fit, _, _) = fit_group_geometric_rotated(bs, t, grid, rotation, &mut buf);
+            let (fit, _, _, _) = fit_group_geometric_rotated(bs, t, grid, rotation, &mut buf);
             bd.copy_from_slice(&fit);
+        }
+    }
+    out
+}
+
+/// The per-group rotation decisions [`salt_quantize_forward_grouped_geometric`] would make, as one
+/// byte per group (`1` = rotate), in the layout a device kernel indexes by
+/// `row * cols.div_ceil(group) + block` — the ladder's counterpart to [`rotation_mask`].
+///
+/// A trainer must freeze the mask with the SAME fitter the kernel runs. Deriving it from the ITF
+/// fitter and applying it to a ladder fit is the train/eval quantizer mismatch that invalidated a
+/// published conclusion once already; the two fitters make genuinely different rotation choices
+/// because they have different error curves.
+#[must_use]
+pub fn geometric_rotation_mask(
+    wf: &[f32],
+    rows: usize,
+    cols: usize,
+    t: usize,
+    group: usize,
+    grid: usize,
+    rotation: RotationPolicy,
+) -> Vec<u8> {
+    let group = group.max(1);
+    let mut out = Vec::with_capacity(rows * cols.div_ceil(group));
+    let mut buf: Vec<f32> = Vec::with_capacity(group);
+    for r in 0..rows {
+        let src = &wf[r * cols..(r + 1) * cols];
+        for bs in src.chunks(group) {
+            let (_, _, _, rotated) = fit_group_geometric_rotated(bs, t, grid, rotation, &mut buf);
+            out.push(u8::from(rotated));
         }
     }
     out
@@ -731,7 +762,7 @@ pub fn salt_quantize_forward_grouped_geometric_alloc(
             if t == 0 {
                 continue; // pruned tile: already zero
             }
-            let (fit, _, _) = fit_group_geometric_rotated(bs, t, grid, rotation, &mut buf);
+            let (fit, _, _, _) = fit_group_geometric_rotated(bs, t, grid, rotation, &mut buf);
             bd.copy_from_slice(&fit);
         }
     }
@@ -760,7 +791,7 @@ pub fn geometric_ladder_fit(
     for r in 0..rows {
         let src = &wf[r * cols..(r + 1) * cols];
         for bs in src.chunks(group) {
-            let (_, s0, planes) = fit_group_geometric_rotated(bs, t, grid, rotation, &mut buf);
+            let (_, s0, planes, _) = fit_group_geometric_rotated(bs, t, grid, rotation, &mut buf);
             out.push((s0, planes));
         }
     }

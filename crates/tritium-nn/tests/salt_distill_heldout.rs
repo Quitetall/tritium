@@ -337,7 +337,7 @@ fn salt_distillation_device_trainer_recovers_heldout() {
     use tritium_cuda::CudaBackend;
     use tritium_cuda::train::{
         DeviceTape, DeviceTensor, DeviceTrainParam, DeviceTrainer, DeviceTrainerWeightStorage,
-        MasterPrecision, MomentPrecision, SaltGrouping, TensorCoreGemm,
+        MasterPrecision, MomentPrecision, SaltGrouping, SaltLadder, TensorCoreGemm,
     };
     use tritium_format::TeacherCacheHeader;
     use tritium_nn::{
@@ -557,15 +557,28 @@ fn salt_distillation_device_trainer_recovers_heldout() {
             Ok("always") => ste::RotationPolicy::Always,
             _ => ste::RotationPolicy::Never,
         },
-        iters: std::env::var("TRITIUM_DISTILL_ITF")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(5),
+        // `TRITIUM_DISTILL_LADDER=geometric` selects the balanced-ternary ladder — the fitter that
+        // reaches fp parity at T=4 in PTQ, and the reason the plane cap here can exceed 3. Default
+        // stays ITF so every committed distillation number remains reproducible from a bare run.
+        ladder: match std::env::var("TRITIUM_DISTILL_LADDER").as_deref() {
+            Ok("geometric") => SaltLadder::Geometric {
+                grid: std::env::var("TRITIUM_DISTILL_GRID")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(16),
+            },
+            _ => SaltLadder::Itf {
+                iters: std::env::var("TRITIUM_DISTILL_ITF")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(5),
+            },
+        },
     });
     if let Some(g) = grouping {
         println!(
-            "SALT fitter: g{} +ITF({}) +rotation({:?})",
-            g.group, g.iters, g.rotation
+            "SALT fitter: g{} +{:?} +rotation({:?})",
+            g.group, g.ladder, g.rotation
         );
     }
     let mut trainer = DeviceTrainer::new_with_fitter(
