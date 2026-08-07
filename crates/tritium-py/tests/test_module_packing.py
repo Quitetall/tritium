@@ -63,7 +63,7 @@ def test_module_conversion_streams_strict_native_salt_package(tmp_path):
         load_packed_module(packed.artifact_dir)
 
 
-def test_module_conversion_native_pack_rejects_unaligned_g128_weights(tmp_path):
+def test_module_conversion_native_pack_rejects_unaligned_g64_weights(tmp_path):
     prepared = prepare(
         torch.nn.Linear(3, 1, bias=False),
         TernaryConfig.ptq(profile="compact-v1", target_modules=("Linear",)),
@@ -75,7 +75,7 @@ def test_module_conversion_native_pack_rejects_unaligned_g128_weights(tmp_path):
         evidence_dir=tmp_path / "evidence",
     )
     converted = convert(prepared, calibration, work_dir=tmp_path / "work")
-    with pytest.raises(ValueError, match="G128 alignment"):
+    with pytest.raises(ValueError, match="G64 alignment"):
         converted.pack_native(tmp_path / "packed")
 
 

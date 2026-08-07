@@ -4,8 +4,7 @@ use core::fmt;
 
 use tritium_format::salt_v2::SaltV2Codec;
 use tritium_format::salt_v2_package::{
-    SALT_V2_ALLOCATION_TILE_SIZE, SALT_V2_SCALE_GROUP_SIZE, SaltV2Package, SaltV2Tensor,
-    SaltV2Transform,
+    SALT_V2_ALLOCATION_TILE_SIZE, SaltV2Package, SaltV2Tensor, SaltV2Transform,
 };
 
 /// The scalar operation order used by the SALT V2 CPU reference.
@@ -277,7 +276,7 @@ impl std::error::Error for SaltV2CpuError {}
 /// Reconstruct one row-major SALT V2 coefficient without materializing a tensor.
 ///
 /// Present additive planes are reduced in ascending plane order. Each hard trit
-/// is multiplied by its zero-point-free f16 group128 scale in `f32`.
+/// is multiplied by its zero-point-free f16 tensor-declared group scale in `f32`.
 ///
 /// # Errors
 /// Returns [`SaltV2CpuError::CoefficientIndexOutOfBounds`] for an invalid index.
@@ -339,6 +338,7 @@ pub fn salt_v2_matvec_into(
     }
 
     let receipt = work_receipt(package.codec(), tensor, rows, columns)?;
+    let scale_group_size = tensor.scale_group_size();
     for (row, output_value) in output.iter_mut().enumerate() {
         let row_base = row
             .checked_mul(columns)
@@ -358,10 +358,10 @@ pub fn salt_v2_matvec_into(
                 .tiles()
                 .get(tile_index)
                 .ok_or(SaltV2CpuError::SemanticLayoutMismatch { coefficient })?;
-            let group_index = local_start / SALT_V2_SCALE_GROUP_SIZE;
+            let group_index = local_start / scale_group_size;
             let group_end = group_index
                 .checked_add(1)
-                .and_then(|value| value.checked_mul(SALT_V2_SCALE_GROUP_SIZE))
+                .and_then(|value| value.checked_mul(scale_group_size))
                 .ok_or(SaltV2CpuError::DimensionProductOverflow)?
                 .min(tile.logical_len());
             let segment_len = (group_end - local_start).min(row_end - coefficient);
@@ -536,7 +536,7 @@ fn reconstruct_coefficient(
                 })?;
         let scale = plane
             .scales()
-            .get(local_index / SALT_V2_SCALE_GROUP_SIZE)
+            .get(local_index / tensor.scale_group_size())
             .ok_or(SaltV2CpuError::SemanticLayoutMismatch {
                 coefficient: linear_index,
             })?;
@@ -684,7 +684,7 @@ mod tests {
     use tritium_format::salt_v2::SaltV2Codec;
     use tritium_format::salt_v2_package::{
         SALT_V2_ALLOCATION_TILE_SIZE, SALT_V2_SCALE_GROUP_SIZE, SaltV2Package, SaltV2Plane,
-        SaltV2Tensor, SaltV2Tile, read_salt_v2_package, write_salt_v2_package,
+        SaltV2Tensor, SaltV2Tile, SaltV2Transform, read_salt_v2_package, write_salt_v2_package,
     };
 
     use super::*;
@@ -730,6 +730,36 @@ mod tests {
         )
         .expect("valid ragged matrix");
         SaltV2Package::new(codec, vec![tensor]).expect("valid package")
+    }
+
+    fn g64_matrix_package(codec: SaltV2Codec) -> SaltV2Package {
+        let tiles = (0..9)
+            .map(|tile_index| {
+                let trits = (0..256)
+                    .map(|index| match (index + tile_index) % 4 {
+                        0 => 0,
+                        1 | 2 => 1,
+                        _ => -1,
+                    })
+                    .collect();
+                let scales = (0..4)
+                    .map(|group| f16::from_f32(0.125 + (tile_index * 4 + group) as f32 / 64.0))
+                    .collect();
+                SaltV2Tile::new(vec![
+                    SaltV2Plane::new_with_scale_group_size(trits, scales, 64).unwrap(),
+                ])
+                .unwrap()
+            })
+            .collect();
+        let tensor = SaltV2Tensor::new_with_layout(
+            "g64-projection",
+            vec![4, 576],
+            SaltV2Transform::None,
+            64,
+            tiles,
+        )
+        .unwrap();
+        SaltV2Package::new(codec, vec![tensor]).unwrap()
     }
 
     fn independent_dense_reconstruction(tensor: &SaltV2Tensor) -> Vec<f32> {
@@ -803,6 +833,33 @@ mod tests {
                 actual.receipt.reduction_order(),
                 SaltV2ReductionOrder::RowMajorGroupThenPlaneThenColumn
             );
+        }
+    }
+
+    #[test]
+    fn g64_runtime_matches_independent_dense_matvec() {
+        let activation = (0..576)
+            .map(|index| (index as f32 - 283.0) / 71.0)
+            .collect::<Vec<_>>();
+        for codec in [SaltV2Codec::D2, SaltV2Codec::B3, SaltV2Codec::S34] {
+            let package = g64_matrix_package(codec);
+            let encoded = write_salt_v2_package(&package).unwrap();
+            let decoded = read_salt_v2_package(&encoded.bytes).unwrap();
+            let tensor = &decoded.package.tensors()[0];
+            let dense = (0..tensor.logical_coefficients())
+                .map(|coefficient| {
+                    let tile = &tensor.tiles()[coefficient / SALT_V2_ALLOCATION_TILE_SIZE];
+                    let local = coefficient % SALT_V2_ALLOCATION_TILE_SIZE;
+                    tile.planes()[0].trits()[local].to_f32()
+                        * tile.planes()[0].scales()[local / 64].to_f32()
+                })
+                .collect::<Vec<_>>();
+            let expected = independent_dense_matvec(&dense, 4, 576, &activation);
+            let actual = salt_v2_matvec(&decoded.package, 0, &activation).unwrap();
+            for (got, expected) in actual.output.iter().zip(expected) {
+                let tolerance = 2.0e-5 * expected.abs().max(1.0);
+                assert!((got - expected).abs() <= tolerance);
+            }
         }
     }
 

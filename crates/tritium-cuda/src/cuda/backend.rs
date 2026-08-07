@@ -213,7 +213,7 @@ impl SaltV2ResidentAllocationReceipt {
         self.runtime.payload_bytes()
     }
 
-    /// Group128 f16 scale bytes resident on the device.
+    /// Tensor-declared f16 scale bytes resident on the device.
     #[must_use]
     pub fn scale_bytes(self) -> u64 {
         self.runtime.scale_bytes()
@@ -274,6 +274,7 @@ pub struct SaltV2ResidentTensor {
     tile_count: usize,
     plane_count: usize,
     codec_tag: u32,
+    scale_group_size: u32,
     allocation_map_bytes: u32,
     rank_prefix_count: u32,
     terminal_map_value: u32,
@@ -6998,7 +6999,7 @@ impl CudaBackend {
     /// Upload one validated rank-2 SALT V2 tensor without materializing dense weights.
     ///
     /// The selected codec is applied independently to every present tile plane.
-    /// Device memory retains the exact encoded payload, group128 f16 scales,
+    /// Device memory retains exact encoded payload and tensor-declared f16 scales,
     /// complete two-bit allocation-map bytes, and one coarse u32 plane-rank
     /// prefix per 256-tile block after the first. Terminal map bits ride in the
     /// mandatory launch scalar. Missing planes consume no payload or scale bytes.
@@ -7063,6 +7064,7 @@ impl CudaBackend {
         to_u32(rows, "row count")?;
         to_u32(columns, "column count")?;
         to_u32(tensor.tiles().len(), "tile count")?;
+        let scale_group_size = to_u32(tensor.scale_group_size(), "scale-group size")?;
 
         let plane_count = tensor.tiles().iter().try_fold(0usize, |total, tile| {
             total.checked_add(tile.planes().len()).ok_or_else(|| {
@@ -7188,6 +7190,7 @@ impl CudaBackend {
             tile_count: tensor.tiles().len(),
             plane_count,
             codec_tag,
+            scale_group_size,
             allocation_map_bytes: to_u32(map_bytes, "allocation map bytes")?,
             rank_prefix_count: to_u32(rank_prefixes.len(), "rank prefix count")?,
             terminal_map_value,
@@ -7197,7 +7200,7 @@ impl CudaBackend {
 
     /// Execute the deterministic scalar SALT V2 kernel.
     ///
-    /// The result streams resident trits through group128/plane add-sub-skip
+    /// The result streams resident trits through declared-group/plane add-sub-skip
     /// activation accumulators, applies each f16 scale once, then accumulates the
     /// output exactly like the CPU semantic oracle. No dense weight allocation is
     /// made.

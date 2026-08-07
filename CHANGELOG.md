@@ -35,6 +35,20 @@ see `docs/v1.0-api-freeze-audit.md` for the tier policy.
   SmolLM2-135M smoke and 1.7B recipe driver; it does not claim capture, fitting,
   package, quality, or Stage-7 completion by itself.
 
+- **Executable Stage-7 135M smoke:** `run_stage7_smoke_model` now performs and
+  strictly resumes capture, additive PTQ fitting, explicit allocation, native
+  SALT V2 packaging, and causal evaluation from terminally validated token
+  evidence. `run_stage7_smollm2_smoke` additionally binds the exact frozen
+  SmolLM2-135M source, tokenizer, 128-sequence C4 prefix, complete rank-2 tensor
+  inventory, and qualifier-compatible execution/artifact receipts. SALT V2
+  packages remain byte-identical version 1 for G128-only tensors; tensors whose
+  row geometry requires G64 use canonical version 2 with an explicit scale
+  geometry byte. Eager and seek-backed readers, streamed writing, CPU, compact
+  host, physical CUDA exact/gather, and packed ONNX kernels have G64 parity
+  coverage. This engineering path does not claim recipe quality, Stage-7
+  qualification, or G64 campaign promotion; those still require frozen physical
+  evidence and matched-quality gates.
+
 - **Governed Stage-7 recipe freeze:**
   `scripts/qualify-stage7-recipe-freeze.py` validates the immutable
   SmolLM2-1.7B campaign inventory, disjoint calibration/evaluation provenance,

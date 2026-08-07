@@ -140,7 +140,7 @@ impl<'a> PackedSaltV2PlaneRef<'a> {
         self.packed
     }
 
-    /// Zero-point-free f16 scales, one per logical group128.
+    /// Zero-point-free f16 scales, one per tensor-declared logical group.
     #[must_use]
     pub const fn scales(self) -> &'a [f16] {
         self.scales
@@ -153,6 +153,7 @@ pub struct SaltV2TensorInfo {
     dims: Vec<u64>,
     logical_coefficients: usize,
     transform: SaltV2Transform,
+    scale_group_size: usize,
     tile_count: usize,
     present_planes: usize,
     encoded_payload_bytes: u64,
@@ -178,6 +179,12 @@ impl SaltV2TensorInfo {
     #[must_use]
     pub const fn transform(&self) -> SaltV2Transform {
         self.transform
+    }
+
+    /// Number of coefficients sharing each zero-point-free scale.
+    #[must_use]
+    pub const fn scale_group_size(&self) -> usize {
+        self.scale_group_size
     }
 
     /// Number of 256-coefficient allocation tiles.
@@ -332,7 +339,10 @@ impl<R: Read + Seek> SaltV2PackageReader<R> {
             return Err(SaltV2PackageError::BadMagic.into());
         }
         let version = header_cursor.u16()?;
-        if version != SALT_V2_PACKAGE_VERSION {
+        if !matches!(
+            version,
+            SALT_V2_PACKAGE_VERSION | SALT_V2_PACKAGE_VERSION_SCALE_GEOMETRY
+        ) {
             return Err(SaltV2PackageError::UnsupportedVersion(version).into());
         }
         let codec = codec_from_tag(header_cursor.u8()?)?;
@@ -410,7 +420,8 @@ impl<R: Read + Seek> SaltV2PackageReader<R> {
             let declared_scales = source.u64("read scale length")?;
             let transform_bytes =
                 source.array::<SALT_V2_TRANSFORM_METADATA_BYTES>("read transform metadata")?;
-            let transform = read_transform(&mut Cursor::new(&transform_bytes))?;
+            let (transform, scale_group_size) =
+                read_layout(&mut Cursor::new(&transform_bytes), version)?;
 
             let name_len_usize = usize::try_from(name_len)
                 .map_err(|_| limit_error("tensor name bytes", name_len, usize::MAX as u64))?;
@@ -455,7 +466,7 @@ impl<R: Read + Seek> SaltV2PackageReader<R> {
                         .ok_or(SaltV2PackageError::LengthOverflow)?;
                     Some(map_value_plane_count(ragged_map_value, tile_count - 1)?)
                 };
-            let minimum = minimum_tensor_physical(codec, logical_coefficients)?;
+            let minimum = minimum_tensor_physical(codec, logical_coefficients, scale_group_size)?;
             require_at_least("payload bytes", declared_payload, minimum.payload_bytes)?;
             require_at_least("scale bytes", declared_scales, minimum.scales_bytes)?;
 
@@ -510,6 +521,7 @@ impl<R: Read + Seek> SaltV2PackageReader<R> {
                     dims,
                     logical_coefficients,
                     transform,
+                    scale_group_size,
                     tile_count,
                     present_planes: 0,
                     encoded_payload_bytes: declared_payload,
@@ -532,6 +544,17 @@ impl<R: Read + Seek> SaltV2PackageReader<R> {
                     scales: scale_digest,
                 },
             });
+        }
+
+        let expected_version = package_version_for_scale_groups(
+            tensors.iter().map(|tensor| tensor.info.scale_group_size),
+        );
+        if version != expected_version {
+            return Err(SaltV2PackageError::NonCanonicalVersion {
+                declared: version,
+                expected: expected_version,
+            }
+            .into());
         }
 
         let map_offset = source.position();
@@ -598,6 +621,7 @@ impl<R: Read + Seek> SaltV2PackageReader<R> {
                 codec,
                 tensor.info.logical_coefficients,
                 TensorPlaneCounts::new(&map, tensor),
+                tensor.info.scale_group_size(),
             )?;
             require_declared(
                 "payload bytes",
@@ -630,6 +654,7 @@ impl<R: Read + Seek> SaltV2PackageReader<R> {
                 &tensor.info.dims,
                 tensor.info.logical_coefficients,
                 tensor.info.transform,
+                tensor.info.scale_group_size,
                 tensor.info.tile_count,
             );
             let section_digest = scan_tensor(
@@ -1018,7 +1043,7 @@ fn scan_tensor<R: Read + Seek>(
                 break;
             }
             let scale_len = logical_len
-                .div_ceil(SALT_V2_SCALE_GROUP_SIZE)
+                .div_ceil(tensor.info.scale_group_size())
                 .checked_mul(2)
                 .ok_or(SaltV2PackageError::LengthOverflow)?;
             descriptors.push(PlaneDescriptor {
@@ -1072,12 +1097,16 @@ fn scan_tensor<R: Read + Seek>(
                 .checked_add(descriptor.scale_len)
                 .ok_or(SaltV2PackageError::LengthOverflow)?;
             let scale_bytes = &scales[descriptor.scale_start..scale_end];
-            let mut decoded_scales = [f16::ZERO; 2];
+            let mut decoded_scales = [f16::ZERO; 4];
             for (index, bytes) in scale_bytes.chunks_exact(2).enumerate() {
                 decoded_scales[index] = f16::from_bits(u16::from_le_bytes([bytes[0], bytes[1]]));
             }
             let scale_count = scale_bytes.len() / 2;
-            validate_scales(&trits, &decoded_scales[..scale_count])?;
+            validate_scales(
+                &trits,
+                &decoded_scales[..scale_count],
+                tensor.info.scale_group_size(),
+            )?;
             if let Some(hasher) = &mut semantic_hasher {
                 if descriptor.plane_index == 0 {
                     hasher.update_tile(
@@ -1133,8 +1162,12 @@ fn scan_tensor<R: Read + Seek>(
     })
 }
 
-fn validate_scales(trits: &[Trit], scales: &[f16]) -> Result<(), SaltV2PackageError> {
-    let expected = trits.len().div_ceil(SALT_V2_SCALE_GROUP_SIZE);
+fn validate_scales(
+    trits: &[Trit],
+    scales: &[f16],
+    scale_group_size: usize,
+) -> Result<(), SaltV2PackageError> {
+    let expected = trits.len().div_ceil(scale_group_size);
     if scales.len() != expected {
         return Err(SaltV2PackageError::WrongScaleCount {
             expected,
@@ -1155,8 +1188,8 @@ fn validate_scales(trits: &[Trit], scales: &[f16]) -> Result<(), SaltV2PackageEr
                 bits: scale.to_bits(),
             });
         }
-        let start = group_index * SALT_V2_SCALE_GROUP_SIZE;
-        let end = (start + SALT_V2_SCALE_GROUP_SIZE).min(trits.len());
+        let start = group_index * scale_group_size;
+        let end = (start + scale_group_size).min(trits.len());
         if scale == f16::ZERO && trits[start..end].iter().any(|trit| !trit.is_zero()) {
             return Err(SaltV2PackageError::ZeroScaleForNonzeroGroup { group_index });
         }

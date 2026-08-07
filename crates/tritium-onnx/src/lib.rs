@@ -36,7 +36,8 @@ use tritium_format::{
     salt_v2::{S34_TRITS_PER_GROUP, SaltV2Codec},
     salt_v2_package::{
         SALT_V2_ALLOCATION_TILE_SIZE, SALT_V2_INDEXED_RUNTIME_RANK_STRIDE_TILES,
-        SALT_V2_MAX_PLANES, SALT_V2_SCALE_GROUP_SIZE, unpack_salt_v2_plane_into,
+        SALT_V2_MAX_PLANES, SALT_V2_SCALE_GROUP_SIZE, SALT_V2_SCALE_GROUP_SIZE_64,
+        unpack_salt_v2_plane_into,
     },
     unpack_tq1_0_row, unpack_tq2_0_row,
 };
@@ -73,6 +74,9 @@ pub const ATTR_ROWS: &str = "rows";
 
 /// Additive SALT V2 codec attribute (`0` = D2, `1` = B3, `2` = S34).
 pub const ATTR_CODEC: &str = "codec";
+
+/// Additive SALT V2 zero-point-free scale-group width (`64` or `128`).
+pub const ATTR_SCALE_GROUP_SIZE: &str = "scale_group_size";
 
 /// Additive SALT V2 terminal partial allocation-map bits.
 pub const ATTR_TERMINAL_MAP_VALUE: &str = "terminal_map_value";
@@ -651,7 +655,7 @@ pub fn ternary_mpgemm_kernel(
 
 /// One descriptor-free indexed SALT V2 matrix operand.
 ///
-/// The arenas are the production runtime layout: codec payloads, f16 group-128
+/// The arenas are the production runtime layout: codec payloads, f16 group
 /// scales, a two-bit plane-count map, and one u32 rank prefix per 256 tiles.
 /// The terminal partial map byte is carried by `terminal_map_value` and is not
 /// duplicated in `allocation_map`.
@@ -663,6 +667,8 @@ pub struct SaltV2PackedMatrix<'a> {
     pub columns: usize,
     /// Physical plane codec.
     pub codec: SaltV2Codec,
+    /// Number of coefficients sharing each zero-point-free scale.
+    pub scale_group_size: usize,
     /// Concatenated canonical plane payloads.
     pub payload: &'a [u8],
     /// Concatenated nonnegative finite f16 group scales.
@@ -759,8 +765,8 @@ impl<'a> SaltV2PackedMatrix<'a> {
         let rank = self.plane_rank_before(tile)?;
         let payload_stride = self.payload_bytes(logical_len)?;
         let full_payload_stride = self.payload_bytes(SALT_V2_ALLOCATION_TILE_SIZE)?;
-        let scale_stride = logical_len.div_ceil(SALT_V2_SCALE_GROUP_SIZE);
-        let full_scale_stride = SALT_V2_ALLOCATION_TILE_SIZE.div_ceil(SALT_V2_SCALE_GROUP_SIZE);
+        let scale_stride = logical_len.div_ceil(self.scale_group_size);
+        let full_scale_stride = SALT_V2_ALLOCATION_TILE_SIZE.div_ceil(self.scale_group_size);
         let payload_start = rank
             .checked_mul(full_payload_stride)
             .and_then(|offset| offset.checked_add(plane.checked_mul(payload_stride)?))
@@ -781,6 +787,15 @@ impl<'a> SaltV2PackedMatrix<'a> {
     }
 
     fn validate_structure(self) -> Result<(), OnnxTernaryError> {
+        if !matches!(
+            self.scale_group_size,
+            SALT_V2_SCALE_GROUP_SIZE_64 | SALT_V2_SCALE_GROUP_SIZE
+        ) {
+            return Err(OnnxTernaryError::InvalidSaltV2(format!(
+                "unsupported scale-group size {}",
+                self.scale_group_size
+            )));
+        }
         let logical = self.logical_coefficients()?;
         let tiles = self.tile_count()?;
         let expected_map = tiles.checked_mul(2).ok_or(OnnxTernaryError::ShapeOverflow(
@@ -831,7 +846,7 @@ impl<'a> SaltV2PackedMatrix<'a> {
                 .ok_or(OnnxTernaryError::ShapeOverflow("SALT V2 payload bytes"))?;
             scale_count = scale_count
                 .checked_add(
-                    len.div_ceil(SALT_V2_SCALE_GROUP_SIZE)
+                    len.div_ceil(self.scale_group_size)
                         .checked_mul(planes)
                         .ok_or(OnnxTernaryError::ShapeOverflow("SALT V2 tile scales"))?,
                 )
@@ -883,8 +898,8 @@ impl<'a> SaltV2PackedMatrix<'a> {
                     if scale.to_bits() != 0 {
                         continue;
                     }
-                    let group_start = group * SALT_V2_SCALE_GROUP_SIZE;
-                    let group_end = (group_start + SALT_V2_SCALE_GROUP_SIZE).min(logical_len);
+                    let group_start = group * self.scale_group_size;
+                    let group_end = (group_start + self.scale_group_size).min(logical_len);
                     if decoded[group_start..group_end]
                         .iter()
                         .any(|&trit| trit != Trit::ZERO)
@@ -902,7 +917,7 @@ impl<'a> SaltV2PackedMatrix<'a> {
 
 /// Execute additive SALT V2 matrix multiplication without a dense weight shadow.
 ///
-/// Reduction order is row, group-128, plane, then column, matching Tritium's
+/// Reduction order is row, declared scale group, plane, then column, matching Tritium's
 /// host and CUDA SALT V2 execution contract.
 ///
 /// # Errors
@@ -955,8 +970,8 @@ pub fn salt_v2_mpgemm_kernel(
                 let local_start = coefficient - tile_start;
                 let logical_len =
                     (matrix.logical_coefficients()? - tile_start).min(SALT_V2_ALLOCATION_TILE_SIZE);
-                let group = local_start / SALT_V2_SCALE_GROUP_SIZE;
-                let group_end = ((group + 1) * SALT_V2_SCALE_GROUP_SIZE).min(logical_len);
+                let group = local_start / matrix.scale_group_size;
+                let group_end = ((group + 1) * matrix.scale_group_size).min(logical_len);
                 let segment_len = (group_end - local_start).min(row_end - coefficient);
                 let segment_end = coefficient + segment_len;
                 let planes = matrix.tile_plane_count(tile)?;
@@ -1061,7 +1076,7 @@ pub(crate) fn salt_v2_embedding_kernel_admitted(
                     .map_err(|error| OnnxTernaryError::InvalidSaltV2(error.to_string()))?;
                 for local in local_start..local_start + segment_len {
                     destination[coefficient - row_start + local - local_start] +=
-                        decoded[local].to_f32() * scales[local / SALT_V2_SCALE_GROUP_SIZE].to_f32();
+                        decoded[local].to_f32() * scales[local / matrix.scale_group_size].to_f32();
                 }
             }
             coefficient += segment_len;
@@ -1374,6 +1389,15 @@ mod tests {
     }
 
     fn salt_fixture(codec: SaltV2Codec, rows: usize, columns: usize) -> SaltFixture {
+        salt_fixture_with_group(codec, rows, columns, SALT_V2_SCALE_GROUP_SIZE)
+    }
+
+    fn salt_fixture_with_group(
+        codec: SaltV2Codec,
+        rows: usize,
+        columns: usize,
+        scale_group_size: usize,
+    ) -> SaltFixture {
         let logical = rows * columns;
         let mut payload = Vec::new();
         let mut scales = Vec::new();
@@ -1418,12 +1442,12 @@ mod tests {
                     })
                     .collect();
                 payload.extend(pack_salt_v2_plane(codec, &trits).unwrap());
-                let group_count = len.div_ceil(SALT_V2_SCALE_GROUP_SIZE);
+                let group_count = len.div_ceil(scale_group_size);
                 for group in 0..group_count {
                     let scale = f16::from_f32(0.125 * (1 + plane_index + group) as f32);
                     scales.push(scale);
-                    let begin = group * SALT_V2_SCALE_GROUP_SIZE;
-                    let end = (begin + SALT_V2_SCALE_GROUP_SIZE).min(len);
+                    let begin = group * scale_group_size;
+                    let end = (begin + scale_group_size).min(len);
                     for local in begin..end {
                         dense[start + local] += trits[local].to_f32() * scale.to_f32();
                     }
@@ -1480,6 +1504,7 @@ mod tests {
                 rows,
                 columns,
                 codec,
+                scale_group_size: SALT_V2_SCALE_GROUP_SIZE,
                 payload: &fixture.payload,
                 scales: &fixture.scales,
                 allocation_map: &fixture.allocation_map,
@@ -1506,12 +1531,47 @@ mod tests {
     }
 
     #[test]
+    fn salt_v2_g64_kernel_matches_independent_additive_oracle() {
+        let (rows, columns) = (4, 576);
+        let fixture = salt_fixture_with_group(SaltV2Codec::B3, rows, columns, 64);
+        let matrix = SaltV2PackedMatrix {
+            rows,
+            columns,
+            codec: SaltV2Codec::B3,
+            scale_group_size: 64,
+            payload: &fixture.payload,
+            scales: &fixture.scales,
+            allocation_map: &fixture.allocation_map,
+            rank_prefixes: &fixture.rank_prefixes,
+            terminal_map_value: fixture.terminal_map_value,
+        };
+        let activation = (0..columns)
+            .map(|index| (index as f32 - 283.0) / 71.0)
+            .collect::<Vec<_>>();
+        let expected = fixture
+            .dense
+            .chunks_exact(columns)
+            .map(|row| {
+                row.iter()
+                    .zip(&activation)
+                    .fold(0.0f32, |sum, (weight, input)| sum + weight * input)
+            })
+            .collect::<Vec<_>>();
+        let actual = salt_v2_mpgemm_kernel(&activation, 1, matrix).unwrap();
+        for (got, expected) in actual.iter().zip(expected) {
+            let tolerance = 2.0e-5 * expected.abs().max(1.0);
+            assert!((got - expected).abs() <= tolerance);
+        }
+    }
+
+    #[test]
     fn salt_v2_kernel_rejects_noncanonical_or_incomplete_arenas() {
         let fixture = salt_fixture(SaltV2Codec::B3, 2, 300);
         let valid = SaltV2PackedMatrix {
             rows: 2,
             columns: 300,
             codec: SaltV2Codec::B3,
+            scale_group_size: SALT_V2_SCALE_GROUP_SIZE,
             payload: &fixture.payload,
             scales: &fixture.scales,
             allocation_map: &fixture.allocation_map,
@@ -1586,6 +1646,7 @@ mod tests {
             rows: 1,
             columns,
             codec: SaltV2Codec::D2,
+            scale_group_size: SALT_V2_SCALE_GROUP_SIZE,
             payload: &fixture.payload,
             scales: &fixture.scales,
             allocation_map: &fixture.allocation_map,
@@ -1615,6 +1676,7 @@ mod tests {
                 rows,
                 columns,
                 codec,
+                scale_group_size: SALT_V2_SCALE_GROUP_SIZE,
                 payload: &fixture.payload,
                 scales: &fixture.scales,
                 allocation_map: &fixture.allocation_map,
@@ -1641,6 +1703,7 @@ mod tests {
             rows: 2,
             columns: 8,
             codec: SaltV2Codec::B3,
+            scale_group_size: SALT_V2_SCALE_GROUP_SIZE,
             payload: &fixture.payload,
             scales: &fixture.scales,
             allocation_map: &fixture.allocation_map,

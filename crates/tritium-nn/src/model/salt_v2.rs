@@ -162,7 +162,7 @@ impl SaltV2ModelAllocationReceipt {
         self.payload_bytes
     }
 
-    /// Exact resident group128 fp16-scale bytes.
+    /// Exact resident tensor-declared fp16-scale bytes.
     #[must_use]
     pub const fn scale_bytes(&self) -> u64 {
         self.scale_bytes

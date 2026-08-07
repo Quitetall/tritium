@@ -13,7 +13,6 @@
 namespace {
 
 constexpr uint32_t kAllocationTile = 256;
-constexpr uint32_t kScaleGroup = 128;
 constexpr uint32_t kRankStrideTiles = 256;
 
 __device__ __forceinline__ int decode_trit(
@@ -122,6 +121,7 @@ extern "C" __global__ void salt_v2_forward_exact(
     uint32_t n,
     uint32_t k,
     uint32_t codec,
+    uint32_t scale_group_size,
     uint32_t tile_count,
     uint32_t plane_count,
     uint64_t payload_bytes,
@@ -168,9 +168,9 @@ extern "C" __global__ void salt_v2_forward_exact(
     if (tile_base >= total_coefficients) break;
     const uint32_t logical_len = static_cast<uint32_t>(
         min(static_cast<uint64_t>(kAllocationTile), total_coefficients - tile_base));
-    const uint32_t group = local_start / kScaleGroup;
+    const uint32_t group = local_start / scale_group_size;
     const uint32_t group_end =
-        min((group + 1U) * kScaleGroup, logical_len);
+        min((group + 1U) * scale_group_size, logical_len);
     if (local_start >= group_end) break;
     const uint64_t segment_len =
         min(static_cast<uint64_t>(group_end - local_start),
@@ -178,13 +178,16 @@ extern "C" __global__ void salt_v2_forward_exact(
 
     const uint32_t full_payload_bytes = plane_payload_bytes(codec, kAllocationTile);
     const uint32_t current_payload_bytes = plane_payload_bytes(codec, logical_len);
-    const uint32_t current_scale_count = (logical_len + kScaleGroup - 1U) / kScaleGroup;
+    const uint32_t full_scale_count =
+        (kAllocationTile + scale_group_size - 1U) / scale_group_size;
+    const uint32_t current_scale_count =
+        (logical_len + scale_group_size - 1U) / scale_group_size;
     for (uint32_t plane = begin; plane < end; ++plane) {
       const uint32_t local_plane = plane - begin;
       const uint64_t payload_base =
           static_cast<uint64_t>(begin) * full_payload_bytes +
           static_cast<uint64_t>(local_plane) * current_payload_bytes;
-      const uint64_t scale_base = static_cast<uint64_t>(begin) * 2U +
+      const uint64_t scale_base = static_cast<uint64_t>(begin) * full_scale_count +
                                   static_cast<uint64_t>(local_plane) * current_scale_count;
       const uint64_t scale_index = scale_base + group;
       if (scale_index >= scale_count) continue;
@@ -225,6 +228,7 @@ extern "C" __global__ void salt_v2_gather_rows(
     uint32_t n,
     uint32_t k,
     uint32_t codec,
+    uint32_t scale_group_size,
     uint32_t tile_count,
     uint32_t plane_count,
     uint64_t payload_bytes,
@@ -269,11 +273,13 @@ extern "C" __global__ void salt_v2_gather_rows(
   const uint32_t logical_len = static_cast<uint32_t>(
       min(static_cast<uint64_t>(kAllocationTile), total_coefficients - tile_base));
   if (local >= logical_len) return;
-  const uint32_t group = local / kScaleGroup;
+  const uint32_t group = local / scale_group_size;
   const uint32_t full_payload_bytes = plane_payload_bytes(codec, kAllocationTile);
   const uint32_t current_payload_bytes = plane_payload_bytes(codec, logical_len);
+  const uint32_t full_scale_count =
+      (kAllocationTile + scale_group_size - 1U) / scale_group_size;
   const uint32_t current_scale_count =
-      (logical_len + kScaleGroup - 1U) / kScaleGroup;
+      (logical_len + scale_group_size - 1U) / scale_group_size;
 
   float accumulator = 0.0f;
   for (uint32_t plane = begin; plane < end; ++plane) {
@@ -281,7 +287,7 @@ extern "C" __global__ void salt_v2_gather_rows(
     const uint64_t payload_base =
         static_cast<uint64_t>(begin) * full_payload_bytes +
         static_cast<uint64_t>(local_plane) * current_payload_bytes;
-    const uint64_t scale_base = static_cast<uint64_t>(begin) * 2U +
+    const uint64_t scale_base = static_cast<uint64_t>(begin) * full_scale_count +
                                 static_cast<uint64_t>(local_plane) * current_scale_count;
     const uint64_t scale_index = scale_base + group;
     if (scale_index >= scale_count) continue;

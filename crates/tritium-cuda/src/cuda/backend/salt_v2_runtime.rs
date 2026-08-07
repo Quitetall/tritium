@@ -339,6 +339,7 @@ impl CudaBackend {
             .arg(&n_u32)
             .arg(&k_u32)
             .arg(&tensor.codec_tag)
+            .arg(&tensor.scale_group_size)
             .arg(&tile_count)
             .arg(&plane_count)
             .arg(&payload_bytes)
@@ -382,7 +383,7 @@ impl CudaBackend {
     /// Reconstruct selected semantic rows into caller-owned host memory.
     ///
     /// `rows` is ordered and may contain duplicates, matching token-embedding
-    /// gather semantics. The kernel reads D2/B3/S34 payloads and group128 scales
+    /// gather semantics. The kernel reads D2/B3/S34 payloads and declared-group scales
     /// directly. It never creates or retains the full dense table. Private host
     /// staging makes publication transactional: `output` is unchanged on error.
     ///
@@ -479,6 +480,7 @@ impl CudaBackend {
             .arg(&n_u32)
             .arg(&k_u32)
             .arg(&tensor.codec_tag)
+            .arg(&tensor.scale_group_size)
             .arg(&tile_count)
             .arg(&plane_count)
             .arg(&payload_bytes)

@@ -1,8 +1,9 @@
 //! Canonical SALT V2 tensor/package encoding.
 //!
 //! The package is deliberately semantic: a tensor is split into 256-coefficient
-//! allocation macrotiles, every plane has one zero-point-free f16 scale per 128
-//! coefficients, and the two optional planes are described by one package-global
+//! allocation macrotiles, every plane has one zero-point-free f16 scale per 64
+//! or 128 coefficients as bound by its tensor layout tag, and the two optional
+//! planes are described by one package-global
 //! two-bit stream for full allocation tiles. Complete map bytes are serialized
 //! once; its terminal 0/2/4/6 bits use unused high bits of the mandatory package
 //! tensor-count word. A ragged tensor's final two map bits use unused high bits of
@@ -36,6 +37,9 @@ pub use stream_writer::{
 /// Number of coefficients sharing one SALT V2 scale.
 pub const SALT_V2_SCALE_GROUP_SIZE: usize = 128;
 
+/// Smaller scale group admitted for model widths such as SmolLM2's K=576.
+pub const SALT_V2_SCALE_GROUP_SIZE_64: usize = 64;
+
 /// Number of coefficients in one variable-plane allocation macrotile.
 pub const SALT_V2_ALLOCATION_TILE_SIZE: usize = 256;
 
@@ -57,8 +61,14 @@ pub const SALT_V2_TILE_COUNT_BITS: u32 = 62;
 /// Canonical package magic for the SALT V2 semantic container.
 pub const SALT_V2_PACKAGE_MAGIC: [u8; 8] = *b"TSLT2PKG";
 
-/// Current SALT V2 semantic package version.
+/// Canonical SALT V2 semantic package version for G128-only tensors.
 pub const SALT_V2_PACKAGE_VERSION: u16 = 1;
+
+/// SALT V2 version carrying explicit per-tensor scale geometry.
+///
+/// G128-only packages remain canonical version 1. Version 2 assigns one
+/// formerly reserved tensor-layout byte to G64/G128 geometry.
+pub const SALT_V2_PACKAGE_VERSION_SCALE_GEOMETRY: u16 = 2;
 
 /// Bytes in the fixed package header.
 pub const SALT_V2_PACKAGE_HEADER_BYTES: usize = 24;
@@ -66,7 +76,7 @@ pub const SALT_V2_PACKAGE_HEADER_BYTES: usize = 24;
 /// Bytes in each fixed tensor header, excluding its name and dimensions.
 pub const SALT_V2_TENSOR_HEADER_BYTES: usize = 64;
 
-/// Bytes used by the fixed transform tag, reserved bytes, seed, and domain.
+/// Bytes used by fixed transform, scale-geometry, seed, and domain metadata.
 pub const SALT_V2_TRANSFORM_METADATA_BYTES: usize = 24;
 
 /// Allocation tiles covered by one indexed-runtime plane-rank prefix.
@@ -81,11 +91,25 @@ pub const SALT_V2_PACKAGE_ALIGNMENT: usize = 8;
 /// Domain and encoding version for codec-independent SALT V2 tensor semantics.
 const SALT_V2_SEMANTIC_TENSOR_DOMAIN: &[u8] = b"tritium.salt-v2.semantic-tensor.v1\0";
 
+fn validate_scale_group_size(scale_group_size: usize) -> Result<(), SaltV2PackageError> {
+    if matches!(
+        scale_group_size,
+        SALT_V2_SCALE_GROUP_SIZE_64 | SALT_V2_SCALE_GROUP_SIZE
+    ) {
+        Ok(())
+    } else {
+        Err(SaltV2PackageError::UnsupportedScaleGroupSize(
+            scale_group_size,
+        ))
+    }
+}
+
 /// A validated, zero-point-free additive ternary plane for one allocation tile.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SaltV2Plane {
     trits: Vec<Trit>,
     scales: Vec<f16>,
+    scale_group_size: usize,
 }
 
 impl SaltV2Plane {
@@ -96,6 +120,19 @@ impl SaltV2Plane {
     /// inconsistent scale count, a non-finite or negative scale, and a zero
     /// scale whose group contains a nonzero trit.
     pub fn new(raw_trits: Vec<i8>, scales: Vec<f16>) -> Result<Self, SaltV2PackageError> {
+        Self::new_with_scale_group_size(raw_trits, scales, SALT_V2_SCALE_GROUP_SIZE)
+    }
+
+    /// Construct a plane with an explicit canonical scale-group width.
+    ///
+    /// G64 is encoded by a distinct tensor layout tag. G128 remains byte-identical
+    /// to SALT V2 v1 packages.
+    pub fn new_with_scale_group_size(
+        raw_trits: Vec<i8>,
+        scales: Vec<f16>,
+        scale_group_size: usize,
+    ) -> Result<Self, SaltV2PackageError> {
+        validate_scale_group_size(scale_group_size)?;
         if raw_trits.is_empty() || raw_trits.len() > SALT_V2_ALLOCATION_TILE_SIZE {
             return Err(SaltV2PackageError::InvalidPlaneLength {
                 got: raw_trits.len(),
@@ -113,7 +150,7 @@ impl SaltV2Plane {
             );
         }
 
-        let expected_scales = trits.len().div_ceil(SALT_V2_SCALE_GROUP_SIZE);
+        let expected_scales = trits.len().div_ceil(scale_group_size);
         if scales.len() != expected_scales {
             return Err(SaltV2PackageError::WrongScaleCount {
                 expected: expected_scales,
@@ -135,14 +172,18 @@ impl SaltV2Plane {
                     bits: scale.to_bits(),
                 });
             }
-            let start = group_index * SALT_V2_SCALE_GROUP_SIZE;
-            let end = (start + SALT_V2_SCALE_GROUP_SIZE).min(trits.len());
+            let start = group_index * scale_group_size;
+            let end = (start + scale_group_size).min(trits.len());
             if scale == f16::ZERO && trits[start..end].iter().any(|trit| !trit.is_zero()) {
                 return Err(SaltV2PackageError::ZeroScaleForNonzeroGroup { group_index });
             }
         }
 
-        Ok(Self { trits, scales })
+        Ok(Self {
+            trits,
+            scales,
+            scale_group_size,
+        })
     }
 
     /// Logical ternary coefficients in this plane.
@@ -155,6 +196,12 @@ impl SaltV2Plane {
     #[must_use]
     pub fn scales(&self) -> &[f16] {
         &self.scales
+    }
+
+    /// Number of coefficients sharing each zero-point-free scale.
+    #[must_use]
+    pub const fn scale_group_size(&self) -> usize {
+        self.scale_group_size
     }
 }
 
@@ -177,6 +224,7 @@ impl SaltV2Tile {
             return Err(SaltV2PackageError::InvalidPlaneCount { got: planes.len() });
         }
         let expected = planes[0].trits.len();
+        let expected_scale_group_size = planes[0].scale_group_size;
         if let Some((plane_index, plane)) = planes
             .iter()
             .enumerate()
@@ -186,6 +234,17 @@ impl SaltV2Tile {
                 plane_index,
                 expected,
                 got: plane.trits.len(),
+            });
+        }
+        if let Some((plane_index, plane)) = planes
+            .iter()
+            .enumerate()
+            .find(|(_, plane)| plane.scale_group_size != expected_scale_group_size)
+        {
+            return Err(SaltV2PackageError::InconsistentScaleGroupSize {
+                plane_index,
+                expected: expected_scale_group_size,
+                got: plane.scale_group_size,
             });
         }
         Ok(Self { planes })
@@ -245,6 +304,7 @@ impl SaltV2SemanticTensorHasher {
         dims: &[u64],
         logical_coefficients: usize,
         transform: SaltV2Transform,
+        scale_group_size: usize,
         tile_count: usize,
     ) -> Self {
         Self::with_inner(
@@ -252,6 +312,7 @@ impl SaltV2SemanticTensorHasher {
             dims,
             logical_coefficients,
             transform,
+            scale_group_size,
             tile_count,
         )
     }
@@ -260,6 +321,7 @@ impl SaltV2SemanticTensorHasher {
         dims: &[u64],
         logical_coefficients: usize,
         transform: SaltV2Transform,
+        scale_group_size: usize,
         tile_count: usize,
     ) -> Self {
         Self::with_inner(
@@ -267,6 +329,7 @@ impl SaltV2SemanticTensorHasher {
             dims,
             logical_coefficients,
             transform,
+            scale_group_size,
             tile_count,
         )
     }
@@ -276,6 +339,7 @@ impl SaltV2SemanticTensorHasher {
         dims: &[u64],
         logical_coefficients: usize,
         transform: SaltV2Transform,
+        scale_group_size: usize,
         tile_count: usize,
     ) -> Self {
         inner.update(SALT_V2_SEMANTIC_TENSOR_DOMAIN);
@@ -286,6 +350,10 @@ impl SaltV2SemanticTensorHasher {
                 inner.update(&seed.to_le_bytes());
                 inner.update(&domain.to_le_bytes());
             }
+        }
+        if scale_group_size != SALT_V2_SCALE_GROUP_SIZE {
+            inner.update(&[2]);
+            inner.update(&(scale_group_size as u64).to_le_bytes());
         }
         inner.update(&(dims.len() as u64).to_le_bytes());
         for &dimension in dims {
@@ -340,6 +408,7 @@ pub struct SaltV2SemanticTensorStream {
     logical_coefficients: usize,
     expected_tiles: usize,
     next_tile: usize,
+    scale_group_size: usize,
 }
 
 impl SaltV2SemanticTensorStream {
@@ -353,6 +422,20 @@ impl SaltV2SemanticTensorStream {
         dims: Vec<u64>,
         transform: SaltV2Transform,
     ) -> Result<Self, SaltV2PackageError> {
+        Self::new_with_layout(name, dims, transform, SALT_V2_SCALE_GROUP_SIZE)
+    }
+
+    /// Start a checked semantic stream with explicit scale geometry.
+    ///
+    /// # Errors
+    /// Rejects an invalid name, shape, transform, or scale-group width.
+    pub fn new_with_layout(
+        name: impl Into<String>,
+        dims: Vec<u64>,
+        transform: SaltV2Transform,
+        scale_group_size: usize,
+    ) -> Result<Self, SaltV2PackageError> {
+        validate_scale_group_size(scale_group_size)?;
         let name = name.into();
         if name.is_empty() {
             return Err(SaltV2PackageError::EmptyTensorName);
@@ -376,6 +459,7 @@ impl SaltV2SemanticTensorStream {
             &dims,
             logical_coefficients,
             transform,
+            scale_group_size,
             expected_tiles,
         );
         Ok(Self {
@@ -383,6 +467,7 @@ impl SaltV2SemanticTensorStream {
             logical_coefficients,
             expected_tiles,
             next_tile: 0,
+            scale_group_size,
         })
     }
 
@@ -416,6 +501,11 @@ impl SaltV2SemanticTensorStream {
                     expected: expected_len,
                     got: plane.trits.len(),
                 });
+            }
+            if plane.scale_group_size != self.scale_group_size {
+                return Err(SaltV2PackageError::UnsupportedScaleGroupSize(
+                    plane.scale_group_size,
+                ));
             }
         }
 
@@ -451,6 +541,7 @@ pub struct SaltV2Tensor {
     dims: Vec<u64>,
     logical_coefficients: usize,
     transform: SaltV2Transform,
+    scale_group_size: usize,
     tiles: Vec<SaltV2Tile>,
 }
 
@@ -481,6 +572,21 @@ impl SaltV2Tensor {
         transform: SaltV2Transform,
         tiles: Vec<SaltV2Tile>,
     ) -> Result<Self, SaltV2PackageError> {
+        Self::new_with_layout(name, dims, transform, SALT_V2_SCALE_GROUP_SIZE, tiles)
+    }
+
+    /// Construct a semantic tensor with explicit transform and scale geometry.
+    ///
+    /// # Errors
+    /// Rejects an invalid name, shape, tile sequence, or scale-group width.
+    pub fn new_with_layout(
+        name: impl Into<String>,
+        dims: Vec<u64>,
+        transform: SaltV2Transform,
+        scale_group_size: usize,
+        tiles: Vec<SaltV2Tile>,
+    ) -> Result<Self, SaltV2PackageError> {
+        validate_scale_group_size(scale_group_size)?;
         let name = name.into();
         if name.is_empty() {
             return Err(SaltV2PackageError::EmptyTensorName);
@@ -517,6 +623,11 @@ impl SaltV2Tensor {
                     got: tile.logical_len(),
                 });
             }
+            if tile.planes[0].scale_group_size != scale_group_size {
+                return Err(SaltV2PackageError::UnsupportedScaleGroupSize(
+                    tile.planes[0].scale_group_size,
+                ));
+            }
         }
 
         Ok(Self {
@@ -524,6 +635,7 @@ impl SaltV2Tensor {
             dims,
             logical_coefficients,
             transform,
+            scale_group_size,
             tiles,
         })
     }
@@ -552,6 +664,12 @@ impl SaltV2Tensor {
         self.transform
     }
 
+    /// Number of coefficients sharing each zero-point-free scale.
+    #[must_use]
+    pub const fn scale_group_size(&self) -> usize {
+        self.scale_group_size
+    }
+
     /// Deterministic 256-coefficient allocation tiles.
     #[must_use]
     pub fn tiles(&self) -> &[SaltV2Tile] {
@@ -570,6 +688,7 @@ impl SaltV2Tensor {
             &self.dims,
             self.logical_coefficients,
             self.transform,
+            self.scale_group_size,
             self.tiles.len(),
         );
         for (tile_index, tile) in self.tiles.iter().enumerate() {
@@ -681,10 +800,11 @@ impl SaltV2Package {
                 }
                 prefix_tiles.push(SaltV2Tile::new(tile.planes[..plane_count].to_vec())?);
             }
-            prefix_tensors.push(SaltV2Tensor::new_with_transform(
+            prefix_tensors.push(SaltV2Tensor::new_with_layout(
                 tensor.name.clone(),
                 tensor.dims.clone(),
                 tensor.transform,
+                tensor.scale_group_size,
                 prefix_tiles,
             )?);
         }
@@ -695,9 +815,9 @@ impl SaltV2Package {
 /// Exact physical component accounting for a SALT V2 package.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SaltV2PackageLedger {
-    /// Package/tensor framing, names, and dimensions, excluding transform metadata.
+    /// Package/tensor framing, names, and dimensions, excluding layout metadata.
     pub headers_bytes: u64,
-    /// Fixed transform tag, reserved, seed, and domain bytes.
+    /// Fixed transform, scale-geometry, seed, and domain bytes.
     pub transform_bytes: u64,
     /// Complete serialized bytes in the package-global allocation map.
     pub maps_bytes: u64,
@@ -719,7 +839,7 @@ pub struct SaltV2PackageLedger {
     pub allocation_capacity_coefficients: u64,
     /// Encoded ternary payload bytes for planes that are actually present.
     pub payload_bytes: u64,
-    /// Zero-point-free f16 group128 scale bytes for present planes.
+    /// Zero-point-free f16 scale bytes for present planes.
     pub scales_bytes: u64,
     /// Canonical zero bytes used to align the whole package.
     pub padding_bytes: u64,
@@ -977,13 +1097,15 @@ pub enum SaltV2PackageError {
         /// Supplied logical coefficient count.
         got: usize,
     },
-    /// A plane did not contain exactly one scale per logical group128.
+    /// A plane did not contain exactly one scale per logical scale group.
     WrongScaleCount {
         /// Canonical scale count.
         expected: usize,
         /// Supplied scale count.
         got: usize,
     },
+    /// A tensor requested a scale-group width outside the canonical catalog.
+    UnsupportedScaleGroupSize(usize),
     /// A scale was NaN or infinite.
     NonFiniteScale {
         /// Scale-group index.
@@ -1015,6 +1137,15 @@ pub enum SaltV2PackageError {
         /// Base-plane logical length.
         expected: usize,
         /// Offending logical length.
+        got: usize,
+    },
+    /// Planes in one tile used different scale-group widths.
+    InconsistentScaleGroupSize {
+        /// Offending plane index.
+        plane_index: usize,
+        /// Base-plane group width.
+        expected: usize,
+        /// Offending group width.
         got: usize,
     },
     /// A tensor name was empty.
@@ -1102,10 +1233,19 @@ pub enum SaltV2PackageError {
     BadMagic,
     /// Package version is not supported.
     UnsupportedVersion(u16),
+    /// Supported package version was not minimal for encoded scale geometry.
+    NonCanonicalVersion {
+        /// Version encoded in package header.
+        declared: u16,
+        /// Minimal canonical version for tensor layouts.
+        expected: u16,
+    },
     /// Package codec tag is not supported.
     UnsupportedCodec(u8),
     /// Tensor transform tag is not supported.
     UnsupportedTransformTag(u8),
+    /// Version-2 tensor scale-geometry tag is not supported.
+    UnsupportedScaleGeometryTag(u8),
     /// Reserved transform bytes or identity-only seed/domain fields were nonzero.
     NonCanonicalTransformMetadata,
     /// Reserved package flags were nonzero.
@@ -1190,10 +1330,10 @@ impl fmt::Display for SaltV2PackageError {
                 "plane length must be in 1..={SALT_V2_ALLOCATION_TILE_SIZE}, got {got}"
             ),
             Self::WrongScaleCount { expected, got } => {
-                write!(
-                    f,
-                    "wrong group128 scale count: expected {expected}, got {got}"
-                )
+                write!(f, "wrong scale count: expected {expected}, got {got}")
+            }
+            Self::UnsupportedScaleGroupSize(size) => {
+                write!(f, "unsupported SALT V2 scale-group size {size}")
             }
             Self::NonFiniteScale { group_index, bits } => {
                 write!(f, "non-finite f16 scale {bits:#06x} in group {group_index}")
@@ -1214,6 +1354,14 @@ impl fmt::Display for SaltV2PackageError {
             } => write!(
                 f,
                 "plane {plane_index} length {got} differs from base length {expected}"
+            ),
+            Self::InconsistentScaleGroupSize {
+                plane_index,
+                expected,
+                got,
+            } => write!(
+                f,
+                "plane {plane_index} scale-group size {got} differs from base size {expected}"
             ),
             Self::EmptyTensorName => write!(f, "tensor name is empty"),
             Self::TensorNameTooLong { got } => {
@@ -1268,9 +1416,16 @@ impl fmt::Display for SaltV2PackageError {
             Self::UnsupportedVersion(version) => {
                 write!(f, "unsupported SALT V2 package version {version}")
             }
+            Self::NonCanonicalVersion { declared, expected } => write!(
+                f,
+                "SALT V2 package version {declared} is noncanonical; expected {expected}"
+            ),
             Self::UnsupportedCodec(codec) => write!(f, "unsupported SALT V2 codec tag {codec}"),
             Self::UnsupportedTransformTag(tag) => {
                 write!(f, "unsupported SALT V2 transform tag {tag}")
+            }
+            Self::UnsupportedScaleGeometryTag(tag) => {
+                write!(f, "unsupported SALT V2 scale-geometry tag {tag}")
             }
             Self::NonCanonicalTransformMetadata => {
                 write!(f, "SALT V2 transform metadata is not canonical")
@@ -1342,6 +1497,7 @@ struct EncodedTensor {
     logical_coefficients: u64,
     packed_tile_count: u64,
     transform: SaltV2Transform,
+    scale_group_size: usize,
     payload: Vec<u8>,
     scales: Vec<u8>,
     codec_padding_trits: u64,
@@ -1355,6 +1511,7 @@ struct RawTensor<'a> {
     full_tile_count: usize,
     ragged_plane_count: Option<usize>,
     transform: SaltV2Transform,
+    scale_group_size: usize,
     declared_payload: u64,
     declared_scales: u64,
     payload: &'a [u8],
@@ -1369,6 +1526,9 @@ struct RawTensor<'a> {
 pub fn write_salt_v2_package(
     package: &SaltV2Package,
 ) -> Result<EncodedSaltV2Package, SaltV2PackageError> {
+    let version = package_version_for_scale_groups(
+        package.tensors.iter().map(SaltV2Tensor::scale_group_size),
+    );
     let mut tensors = Vec::new();
     tensors
         .try_reserve_exact(package.tensors.len())
@@ -1462,7 +1622,7 @@ pub fn write_salt_v2_package(
         .try_reserve_exact(total_len)
         .map_err(|_| SaltV2PackageError::AllocationFailed)?;
     bytes.extend_from_slice(&SALT_V2_PACKAGE_MAGIC);
-    push_u16(&mut bytes, SALT_V2_PACKAGE_VERSION);
+    push_u16(&mut bytes, version);
     bytes.push(codec_tag(package.codec));
     bytes.push(0);
     push_u32(&mut bytes, allocation_map.packed_tensor_count);
@@ -1487,7 +1647,12 @@ pub fn write_salt_v2_package(
             &mut bytes,
             u64::try_from(tensor.scales.len()).map_err(|_| SaltV2PackageError::LengthOverflow)?,
         );
-        push_transform(&mut bytes, tensor.transform);
+        push_layout(
+            &mut bytes,
+            version,
+            tensor.transform,
+            tensor.scale_group_size,
+        );
         bytes.extend_from_slice(tensor.name.as_bytes());
         for dim in tensor.dims {
             push_u64(&mut bytes, dim);
@@ -1517,7 +1682,10 @@ pub fn read_salt_v2_package(bytes: &[u8]) -> Result<DecodedSaltV2Package, SaltV2
         return Err(SaltV2PackageError::BadMagic);
     }
     let version = cursor.u16()?;
-    if version != SALT_V2_PACKAGE_VERSION {
+    if !matches!(
+        version,
+        SALT_V2_PACKAGE_VERSION | SALT_V2_PACKAGE_VERSION_SCALE_GEOMETRY
+    ) {
         return Err(SaltV2PackageError::UnsupportedVersion(version));
     }
     let codec = codec_from_tag(cursor.u8()?)?;
@@ -1568,7 +1736,7 @@ pub fn read_salt_v2_package(bytes: &[u8]) -> Result<DecodedSaltV2Package, SaltV2
         let packed_declared_tiles = cursor.u64()?;
         let declared_payload = cursor.u64()?;
         let declared_scales = cursor.u64()?;
-        let transform = read_transform(&mut cursor)?;
+        let (transform, scale_group_size) = read_layout(&mut cursor, version)?;
 
         let name_bytes = cursor.take(name_len)?;
         let name = core::str::from_utf8(name_bytes)
@@ -1634,7 +1802,7 @@ pub fn read_salt_v2_package(bytes: &[u8]) -> Result<DecodedSaltV2Package, SaltV2
                 remaining: cursor.remaining(),
             });
         }
-        let minimum = minimum_tensor_physical(codec, logical_coefficients)?;
+        let minimum = minimum_tensor_physical(codec, logical_coefficients, scale_group_size)?;
         require_at_least("payload bytes", declared_payload, minimum.payload_bytes)?;
         require_at_least("scale bytes", declared_scales, minimum.scales_bytes)?;
         total_tiles = total_tiles
@@ -1662,10 +1830,20 @@ pub fn read_salt_v2_package(bytes: &[u8]) -> Result<DecodedSaltV2Package, SaltV2
             full_tile_count,
             ragged_plane_count,
             transform,
+            scale_group_size,
             declared_payload,
             declared_scales,
             payload,
             scales,
+        });
+    }
+
+    let expected_version =
+        package_version_for_scale_groups(raw_tensors.iter().map(|tensor| tensor.scale_group_size));
+    if version != expected_version {
+        return Err(SaltV2PackageError::NonCanonicalVersion {
+            declared: version,
+            expected: expected_version,
         });
     }
 
@@ -1734,7 +1912,12 @@ pub fn read_salt_v2_package(bytes: &[u8]) -> Result<DecodedSaltV2Package, SaltV2
         let plane_counts =
             || full_plane_counts.counts(plane_start..plane_end, raw.ragged_plane_count);
         plane_offset = plane_end;
-        let physical = expected_tensor_physical(codec, raw.logical_coefficients, plane_counts())?;
+        let physical = expected_tensor_physical(
+            codec,
+            raw.logical_coefficients,
+            plane_counts(),
+            raw.scale_group_size,
+        )?;
         require_declared(
             "payload bytes",
             raw.declared_payload,
@@ -1747,8 +1930,15 @@ pub fn read_salt_v2_package(bytes: &[u8]) -> Result<DecodedSaltV2Package, SaltV2
             plane_counts(),
             raw.payload,
             raw.scales,
+            raw.scale_group_size,
         )?;
-        let tensor = SaltV2Tensor::new_with_transform(raw.name, raw.dims, raw.transform, tiles)?;
+        let tensor = SaltV2Tensor::new_with_layout(
+            raw.name,
+            raw.dims,
+            raw.transform,
+            raw.scale_group_size,
+            tiles,
+        )?;
         checked_ledger_add(&mut ledger.payload_bytes, raw.payload.len())?;
         checked_ledger_add(&mut ledger.scales_bytes, raw.scales.len())?;
         ledger.codec_padding_trits = ledger
@@ -1817,6 +2007,7 @@ fn encode_tensor(
         codec,
         tensor.logical_coefficients,
         tensor.tiles.iter().map(|tile| tile.planes.len()),
+        tensor.scale_group_size(),
     )?;
     let payload_len =
         usize::try_from(expected.payload_bytes).map_err(|_| SaltV2PackageError::LengthOverflow)?;
@@ -1866,6 +2057,7 @@ fn encode_tensor(
             .map_err(|_| SaltV2PackageError::LengthOverflow)?,
         packed_tile_count,
         transform: tensor.transform,
+        scale_group_size: tensor.scale_group_size,
         payload,
         scales,
         codec_padding_trits,
@@ -1890,11 +2082,13 @@ struct TensorPhysical {
 fn minimum_tensor_physical(
     codec: SaltV2Codec,
     logical_coefficients: usize,
+    scale_group_size: usize,
 ) -> Result<TensorPhysical, SaltV2PackageError> {
     fn checked_repeated_plane(
         codec: SaltV2Codec,
         logical_len: usize,
         repetitions: usize,
+        scale_group_size: usize,
     ) -> Result<TensorPhysical, SaltV2PackageError> {
         if repetitions == 0 {
             return Ok(TensorPhysical::default());
@@ -1911,7 +2105,7 @@ fn minimum_tensor_physical(
                 .ok_or(SaltV2PackageError::LengthOverflow)
         };
         let scale_bytes = logical_len
-            .div_ceil(SALT_V2_SCALE_GROUP_SIZE)
+            .div_ceil(scale_group_size)
             .checked_mul(2)
             .ok_or(SaltV2PackageError::LengthOverflow)?;
         let padding_trits = stored_trits
@@ -1931,8 +2125,13 @@ fn minimum_tensor_physical(
 
     let full_tiles = logical_coefficients / SALT_V2_ALLOCATION_TILE_SIZE;
     let tail = logical_coefficients % SALT_V2_ALLOCATION_TILE_SIZE;
-    let full = checked_repeated_plane(codec, SALT_V2_ALLOCATION_TILE_SIZE, full_tiles)?;
-    let tail = checked_repeated_plane(codec, tail, usize::from(tail != 0))?;
+    let full = checked_repeated_plane(
+        codec,
+        SALT_V2_ALLOCATION_TILE_SIZE,
+        full_tiles,
+        scale_group_size,
+    )?;
+    let tail = checked_repeated_plane(codec, tail, usize::from(tail != 0), scale_group_size)?;
 
     Ok(TensorPhysical {
         payload_bytes: full
@@ -1958,6 +2157,7 @@ fn expected_tensor_physical(
     codec: SaltV2Codec,
     logical_coefficients: usize,
     plane_counts: impl ExactSizeIterator<Item = usize>,
+    scale_group_size: usize,
 ) -> Result<TensorPhysical, SaltV2PackageError> {
     let expected_tiles = logical_coefficients.div_ceil(SALT_V2_ALLOCATION_TILE_SIZE);
     let got = plane_counts.len();
@@ -1989,7 +2189,7 @@ fn expected_tensor_physical(
                     .ok_or(SaltV2PackageError::LengthOverflow)?,
             )
             .ok_or(SaltV2PackageError::LengthOverflow)?;
-        let scale_count = logical_len.div_ceil(SALT_V2_SCALE_GROUP_SIZE);
+        let scale_count = logical_len.div_ceil(scale_group_size);
         physical.scales_bytes = physical
             .scales_bytes
             .checked_add(
@@ -2028,6 +2228,7 @@ fn decode_tensor_tiles(
     plane_counts: impl ExactSizeIterator<Item = usize>,
     payload: &[u8],
     scales: &[u8],
+    scale_group_size: usize,
 ) -> Result<Vec<SaltV2Tile>, SaltV2PackageError> {
     let mut payload_cursor = Cursor::new(payload);
     let mut scale_cursor = Cursor::new(scales);
@@ -2044,7 +2245,7 @@ fn decode_tensor_tiles(
         let logical_len = (logical_coefficients - consumed).min(SALT_V2_ALLOCATION_TILE_SIZE);
         let stored_trits = stored_trit_count(codec, logical_len)?;
         let packed_len = codec.ledger(stored_trits)?.physical_bytes;
-        let scale_count = logical_len.div_ceil(SALT_V2_SCALE_GROUP_SIZE);
+        let scale_count = logical_len.div_ceil(scale_group_size);
         let mut planes = Vec::new();
         planes
             .try_reserve_exact(plane_count)
@@ -2062,7 +2263,11 @@ fn decode_tensor_tiles(
                 .map(|bytes| f16::from_bits(u16::from_le_bytes([bytes[0], bytes[1]])))
                 .collect::<Vec<_>>();
             let raw_trits = trits.into_iter().map(Trit::get).collect();
-            planes.push(SaltV2Plane::new(raw_trits, decoded_scales)?);
+            planes.push(SaltV2Plane::new_with_scale_group_size(
+                raw_trits,
+                decoded_scales,
+                scale_group_size,
+            )?);
         }
         tiles.push(SaltV2Tile::new(planes)?);
     }
@@ -2556,6 +2761,17 @@ fn codec_from_tag(tag: u8) -> Result<SaltV2Codec, SaltV2PackageError> {
     }
 }
 
+fn package_version_for_scale_groups(scale_groups: impl IntoIterator<Item = usize>) -> u16 {
+    if scale_groups
+        .into_iter()
+        .any(|size| size != SALT_V2_SCALE_GROUP_SIZE)
+    {
+        SALT_V2_PACKAGE_VERSION_SCALE_GEOMETRY
+    } else {
+        SALT_V2_PACKAGE_VERSION
+    }
+}
+
 fn checked_ledger_add(target: &mut u64, amount: usize) -> Result<(), SaltV2PackageError> {
     *target = target
         .checked_add(u64::try_from(amount).map_err(|_| SaltV2PackageError::LengthOverflow)?)
@@ -2609,18 +2825,31 @@ fn push_u64(bytes: &mut Vec<u8>, value: u64) {
     bytes.extend_from_slice(&value.to_le_bytes());
 }
 
-fn push_transform(bytes: &mut Vec<u8>, transform: SaltV2Transform) {
+fn push_layout(
+    bytes: &mut Vec<u8>,
+    version: u16,
+    transform: SaltV2Transform,
+    scale_group_size: usize,
+) {
     let start = bytes.len();
+    let scale_geometry = match (version, scale_group_size) {
+        (SALT_V2_PACKAGE_VERSION, SALT_V2_SCALE_GROUP_SIZE) => 0,
+        (SALT_V2_PACKAGE_VERSION_SCALE_GEOMETRY, SALT_V2_SCALE_GROUP_SIZE) => 0,
+        (SALT_V2_PACKAGE_VERSION_SCALE_GEOMETRY, SALT_V2_SCALE_GROUP_SIZE_64) => 1,
+        _ => unreachable!("validated package version and scale geometry"),
+    };
     match transform {
         SaltV2Transform::None => {
             bytes.push(0);
-            bytes.extend_from_slice(&[0; 7]);
+            bytes.push(scale_geometry);
+            bytes.extend_from_slice(&[0; 6]);
             push_u64(bytes, 0);
             push_u64(bytes, 0);
         }
         SaltV2Transform::SignedRht { seed, domain } => {
             bytes.push(1);
-            bytes.extend_from_slice(&[0; 7]);
+            bytes.push(scale_geometry);
+            bytes.extend_from_slice(&[0; 6]);
             push_u64(bytes, seed);
             push_u64(bytes, domain);
         }
@@ -2628,20 +2857,45 @@ fn push_transform(bytes: &mut Vec<u8>, transform: SaltV2Transform) {
     debug_assert_eq!(bytes.len() - start, SALT_V2_TRANSFORM_METADATA_BYTES);
 }
 
-fn read_transform(cursor: &mut Cursor<'_>) -> Result<SaltV2Transform, SaltV2PackageError> {
+#[cfg(test)]
+fn push_transform(bytes: &mut Vec<u8>, transform: SaltV2Transform) {
+    push_layout(
+        bytes,
+        SALT_V2_PACKAGE_VERSION,
+        transform,
+        SALT_V2_SCALE_GROUP_SIZE,
+    );
+}
+
+fn read_layout(
+    cursor: &mut Cursor<'_>,
+    version: u16,
+) -> Result<(SaltV2Transform, usize), SaltV2PackageError> {
     let tag = cursor.u8()?;
-    let reserved = cursor.take(7)?;
+    let scale_geometry = cursor.u8()?;
+    let reserved = cursor.take(6)?;
     let seed = cursor.u64()?;
     let domain = cursor.u64()?;
     if reserved.iter().any(|byte| *byte != 0) {
         return Err(SaltV2PackageError::NonCanonicalTransformMetadata);
     }
-    match tag {
-        0 if seed == 0 && domain == 0 => Ok(SaltV2Transform::None),
-        0 => Err(SaltV2PackageError::NonCanonicalTransformMetadata),
-        1 => Ok(SaltV2Transform::SignedRht { seed, domain }),
-        other => Err(SaltV2PackageError::UnsupportedTransformTag(other)),
-    }
+    let scale_group_size = match (version, scale_geometry) {
+        (SALT_V2_PACKAGE_VERSION, 0) | (SALT_V2_PACKAGE_VERSION_SCALE_GEOMETRY, 0) => {
+            SALT_V2_SCALE_GROUP_SIZE
+        }
+        (SALT_V2_PACKAGE_VERSION_SCALE_GEOMETRY, 1) => SALT_V2_SCALE_GROUP_SIZE_64,
+        (SALT_V2_PACKAGE_VERSION, _) => {
+            return Err(SaltV2PackageError::NonCanonicalTransformMetadata);
+        }
+        (_, other) => return Err(SaltV2PackageError::UnsupportedScaleGeometryTag(other)),
+    };
+    let transform = match tag {
+        0 if seed == 0 && domain == 0 => SaltV2Transform::None,
+        0 => return Err(SaltV2PackageError::NonCanonicalTransformMetadata),
+        1 => SaltV2Transform::SignedRht { seed, domain },
+        other => return Err(SaltV2PackageError::UnsupportedTransformTag(other)),
+    };
+    Ok((transform, scale_group_size))
 }
 
 struct Cursor<'a> {
@@ -3571,6 +3825,49 @@ mod tests {
         assert_eq!(
             read_salt_v2_package(&encoded.bytes)
                 .expect("decode compact prefix")
+                .package,
+            compact
+        );
+    }
+
+    #[test]
+    fn compact_prefix_preserves_g64_scale_geometry() {
+        let planes = (0..2)
+            .map(|phase| {
+                SaltV2Plane::new_with_scale_group_size(
+                    structured_values(128, phase),
+                    vec![f16::from_f32(0.5), f16::from_f32(0.75)],
+                    SALT_V2_SCALE_GROUP_SIZE_64,
+                )
+                .expect("valid G64 plane")
+            })
+            .collect();
+        let tensor = SaltV2Tensor::new_with_layout(
+            "g64",
+            vec![128],
+            SaltV2Transform::None,
+            SALT_V2_SCALE_GROUP_SIZE_64,
+            vec![SaltV2Tile::new(planes).expect("valid G64 tile")],
+        )
+        .expect("valid G64 tensor");
+        let near = SaltV2Package::new(SaltV2Codec::B3, vec![tensor]).expect("valid G64 package");
+
+        let compact = near
+            .derive_prefix(&[vec![1]])
+            .expect("derive G64 semantic compact prefix");
+
+        assert_eq!(
+            compact.tensors()[0].scale_group_size(),
+            SALT_V2_SCALE_GROUP_SIZE_64
+        );
+        assert_eq!(
+            compact.tensors()[0].tiles()[0].planes(),
+            &near.tensors()[0].tiles()[0].planes()[..1]
+        );
+        let encoded = write_salt_v2_package(&compact).expect("encode G64 compact prefix");
+        assert_eq!(
+            read_salt_v2_package(&encoded.bytes)
+                .expect("decode G64 compact prefix")
                 .package,
             compact
         );

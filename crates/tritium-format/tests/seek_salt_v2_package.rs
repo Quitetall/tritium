@@ -7,9 +7,10 @@ use tritium_format::PackageId;
 use tritium_format::salt_v2::SaltV2Codec;
 use tritium_format::salt_v2_package::{
     PackedSaltV2PlaneRef, SALT_V2_ALLOCATION_TILE_SIZE, SALT_V2_PACKAGE_MAGIC,
-    SALT_V2_PACKAGE_VERSION, SaltV2IndexedRuntimeLedger, SaltV2Package, SaltV2PackageError,
-    SaltV2PackageReadError, SaltV2PackageReader, SaltV2Plane, SaltV2Tensor, SaltV2Tile,
-    pack_salt_v2_plane, read_salt_v2_package, unpack_salt_v2_plane, write_salt_v2_package,
+    SALT_V2_PACKAGE_VERSION, SALT_V2_PACKAGE_VERSION_SCALE_GEOMETRY, SaltV2IndexedRuntimeLedger,
+    SaltV2Package, SaltV2PackageError, SaltV2PackageReadError, SaltV2PackageReader, SaltV2Plane,
+    SaltV2Tensor, SaltV2Tile, SaltV2Transform, pack_salt_v2_plane, read_salt_v2_package,
+    unpack_salt_v2_plane, write_salt_v2_package,
 };
 
 fn plane(len: usize, seed: usize) -> SaltV2Plane {
@@ -51,6 +52,37 @@ fn package_with_codec(codec: SaltV2Codec) -> SaltV2Package {
         vec![
             tensor("z", &[(256, 1), (256, 3), (87, 2)], 1),
             tensor("a", &[(256, 2)], 17),
+        ],
+    )
+    .unwrap()
+}
+
+fn g64_package() -> SaltV2Package {
+    let tiles = (0..9)
+        .map(|tile_index| {
+            let trits = (0..256)
+                .map(|index| ((index + tile_index) % 3) as i8 - 1)
+                .collect();
+            let scales = (0..4)
+                .map(|group| f16::from_f32(0.25 + (tile_index * 4 + group) as f32 / 64.0))
+                .collect();
+            SaltV2Tile::new(vec![
+                SaltV2Plane::new_with_scale_group_size(trits, scales, 64).unwrap(),
+            ])
+            .unwrap()
+        })
+        .collect();
+    SaltV2Package::new(
+        SaltV2Codec::B3,
+        vec![
+            SaltV2Tensor::new_with_layout(
+                "smollm.weight",
+                vec![4, 576],
+                SaltV2Transform::None,
+                64,
+                tiles,
+            )
+            .unwrap(),
         ],
     )
     .unwrap()
@@ -225,6 +257,70 @@ fn strict_seek_reader_visits_canonical_planes_in_arbitrary_tensor_order() {
         "largest Read request was {} bytes",
         max_request.get()
     );
+}
+
+#[test]
+fn g64_smollm_geometry_round_trips_eager_and_seek_backed() {
+    let package = g64_package();
+    let encoded = write_salt_v2_package(&package).unwrap();
+    let version_offset = SALT_V2_PACKAGE_MAGIC.len();
+    assert_eq!(
+        u16::from_le_bytes(
+            encoded.bytes[version_offset..version_offset + 2]
+                .try_into()
+                .unwrap()
+        ),
+        SALT_V2_PACKAGE_VERSION_SCALE_GEOMETRY
+    );
+    let eager = read_salt_v2_package(&encoded.bytes).unwrap();
+    assert_eq!(eager.package, package);
+
+    let mut reader = SaltV2PackageReader::new_strict(Cursor::new(encoded.bytes)).unwrap();
+    let info = reader.tensor_info("smollm.weight").unwrap();
+    assert_eq!(info.dims(), [4, 576]);
+    assert_eq!(info.transform(), SaltV2Transform::None);
+    assert_eq!(info.scale_group_size(), 64);
+    let mut planes = 0;
+    reader
+        .visit_packed_tensor("smollm.weight", |plane| {
+            assert_eq!(plane.scales().len(), 4);
+            planes += 1;
+        })
+        .unwrap();
+    assert_eq!(planes, 9);
+}
+
+#[test]
+fn version_two_without_g64_geometry_is_noncanonical() {
+    let encoded = write_salt_v2_package(&package()).unwrap();
+    let version_offset = SALT_V2_PACKAGE_MAGIC.len();
+    assert_eq!(
+        u16::from_le_bytes(
+            encoded.bytes[version_offset..version_offset + 2]
+                .try_into()
+                .unwrap()
+        ),
+        SALT_V2_PACKAGE_VERSION
+    );
+    let mut noncanonical = encoded.bytes;
+    noncanonical[version_offset..version_offset + 2]
+        .copy_from_slice(&SALT_V2_PACKAGE_VERSION_SCALE_GEOMETRY.to_le_bytes());
+    assert!(matches!(
+        read_salt_v2_package(&noncanonical),
+        Err(SaltV2PackageError::NonCanonicalVersion {
+            declared: SALT_V2_PACKAGE_VERSION_SCALE_GEOMETRY,
+            expected: SALT_V2_PACKAGE_VERSION,
+        })
+    ));
+    assert!(matches!(
+        SaltV2PackageReader::new_strict(Cursor::new(noncanonical)),
+        Err(SaltV2PackageReadError::Format(
+            SaltV2PackageError::NonCanonicalVersion {
+                declared: SALT_V2_PACKAGE_VERSION_SCALE_GEOMETRY,
+                expected: SALT_V2_PACKAGE_VERSION,
+            }
+        ))
+    ));
 }
 
 #[test]

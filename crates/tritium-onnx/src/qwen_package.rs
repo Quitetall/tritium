@@ -254,6 +254,7 @@ impl<'a> Qwen35PackedTensorProvider<'a, SaltV2PackedMatrix<'a>> for Qwen35SaltV2
             rows: matrix.rows(),
             columns: matrix.columns(),
             codec: matrix.codec(),
+            scale_group_size: matrix.scale_group_size(),
             payload: matrix.payload(),
             scales: matrix.scales(),
             allocation_map: matrix.allocation_map(),

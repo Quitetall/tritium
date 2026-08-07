@@ -92,6 +92,15 @@ from .tutorial import (
     run_smollm2_release_demo,
 )
 from .stage7 import Stage7CausalData, Stage7CausalDataReceipt
+from .stage7_smoke import (
+    SMOLLM2_135M_MODEL_ID,
+    SMOLLM2_135M_REPO_ID,
+    SMOLLM2_135M_REVISION,
+    Stage7SmokeModelResult,
+    Stage7SmolLM2SmokeResult,
+    run_stage7_smoke_model,
+    run_stage7_smollm2_smoke,
+)
 from .projection import (
     ProjectionContext,
     TernaryPlane,
@@ -149,6 +158,11 @@ __all__ = [
     "SMOLLM2_REVISION",
     "Stage7CausalData",
     "Stage7CausalDataReceipt",
+    "SMOLLM2_135M_MODEL_ID",
+    "SMOLLM2_135M_REPO_ID",
+    "SMOLLM2_135M_REVISION",
+    "Stage7SmokeModelResult",
+    "Stage7SmolLM2SmokeResult",
     "TernaryConfig",
     "TernaryDiagnostics",
     "TernaryPlane",
@@ -195,6 +209,8 @@ __all__ = [
     "register_huggingface",
     "registered_estimators",
     "run_smollm2_release_demo",
+    "run_stage7_smoke_model",
+    "run_stage7_smollm2_smoke",
     "ternary_linear",
     "TensorDiagnostics",
     "validate_projection",

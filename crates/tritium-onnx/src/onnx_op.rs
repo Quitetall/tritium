@@ -44,8 +44,8 @@ use tritium_core::TernaryFormat;
 use crate::{
     ATTR_CODEC, ATTR_CONV_KERNEL_DIM, ATTR_FORMAT, ATTR_HEAD_DIM, ATTR_K, ATTR_KEY_HEAD_DIM,
     ATTR_N_HEAD, ATTR_N_KV_HEAD, ATTR_NUM_KEY_HEADS, ATTR_NUM_VALUE_HEADS, ATTR_PAST_TOKENS,
-    ATTR_ROWS, ATTR_TERMINAL_MAP_VALUE, ATTR_VALUE_HEAD_DIM, ONNX_DOMAIN, ONNX_EMBEDDING_OP_NAME,
-    ONNX_KV_ATTENTION_OP_NAME, ONNX_OP_NAME, ONNX_QWEN_DELTANET_OP_NAME,
+    ATTR_ROWS, ATTR_SCALE_GROUP_SIZE, ATTR_TERMINAL_MAP_VALUE, ATTR_VALUE_HEAD_DIM, ONNX_DOMAIN,
+    ONNX_EMBEDDING_OP_NAME, ONNX_KV_ATTENTION_OP_NAME, ONNX_OP_NAME, ONNX_QWEN_DELTANET_OP_NAME,
     ONNX_SALT_V2_EMBEDDING_OP_NAME, ONNX_SALT_V2_OP_NAME, QwenDeltaNetGeometry, QwenDeltaNetInput,
     QwenDeltaNetOutputSlot, SaltV2PackedMatrix, kv_attention_kernel, salt_v2_embedding_kernel,
     salt_v2_embedding_kernel_admitted, salt_v2_mpgemm_kernel, ternary_embedding_kernel,
@@ -235,7 +235,13 @@ pub struct TritiumSaltV2MpGemmOp;
 
 fn salt_v2_kernel_config(
     attributes: &KernelAttributes,
-) -> ort::Result<(usize, usize, tritium_format::salt_v2::SaltV2Codec, u32)> {
+) -> ort::Result<(
+    usize,
+    usize,
+    tritium_format::salt_v2::SaltV2Codec,
+    usize,
+    u32,
+)> {
     let columns = usize_attribute(attributes, ATTR_K, false)?;
     let rows = usize_attribute(attributes, ATTR_ROWS, false)?;
     let codec: i64 = attributes
@@ -251,12 +257,24 @@ fn salt_v2_kernel_config(
             )));
         }
     };
+    let scale_group_size: i64 = attributes
+        .get(ATTR_SCALE_GROUP_SIZE)
+        .unwrap_or(tritium_format::salt_v2_package::SALT_V2_SCALE_GROUP_SIZE as i64);
+    let scale_group_size = match scale_group_size {
+        64 => tritium_format::salt_v2_package::SALT_V2_SCALE_GROUP_SIZE_64,
+        128 => tritium_format::salt_v2_package::SALT_V2_SCALE_GROUP_SIZE,
+        value => {
+            return Err(OrtError::new(format!(
+                "tritium-onnx: unsupported SALT V2 scale_group_size {value}"
+            )));
+        }
+    };
     let terminal: i64 = attributes
         .get(ATTR_TERMINAL_MAP_VALUE)
         .ok_or_else(|| OrtError::new("tritium-onnx: missing i64 attribute `terminal_map_value`"))?;
     let terminal_map_value = u32::try_from(terminal)
         .map_err(|_| OrtError::new("tritium-onnx: terminal_map_value must fit unsigned 32 bits"))?;
-    Ok((rows, columns, codec, terminal_map_value))
+    Ok((rows, columns, codec, scale_group_size, terminal_map_value))
 }
 
 impl Operator for TritiumSaltV2MpGemmOp {
@@ -287,11 +305,13 @@ impl Operator for TritiumSaltV2MpGemmOp {
     }
 
     fn create_kernel(&self, attributes: &KernelAttributes) -> ort::Result<Box<dyn Kernel>> {
-        let (rows, columns, codec, terminal_map_value) = salt_v2_kernel_config(attributes)?;
+        let (rows, columns, codec, scale_group_size, terminal_map_value) =
+            salt_v2_kernel_config(attributes)?;
         Ok(Box::new(TritiumSaltV2MpGemmKernel {
             rows,
             columns,
             codec,
+            scale_group_size,
             terminal_map_value,
         }))
     }
@@ -303,6 +323,7 @@ pub struct TritiumSaltV2MpGemmKernel {
     rows: usize,
     columns: usize,
     codec: tritium_format::salt_v2::SaltV2Codec,
+    scale_group_size: usize,
     terminal_map_value: u32,
 }
 
@@ -336,6 +357,7 @@ impl TritiumSaltV2MpGemmKernel {
                 rows: self.rows,
                 columns: self.columns,
                 codec: self.codec,
+                scale_group_size: self.scale_group_size,
                 payload,
                 scales,
                 allocation_map,
@@ -419,11 +441,13 @@ impl Operator for TritiumSaltV2EmbeddingOp {
     }
 
     fn create_kernel(&self, attributes: &KernelAttributes) -> ort::Result<Box<dyn Kernel>> {
-        let (rows, columns, codec, terminal_map_value) = salt_v2_kernel_config(attributes)?;
+        let (rows, columns, codec, scale_group_size, terminal_map_value) =
+            salt_v2_kernel_config(attributes)?;
         Ok(Box::new(TritiumSaltV2EmbeddingKernel {
             rows,
             columns,
             codec,
+            scale_group_size,
             terminal_map_value,
             validated: false,
         }))
@@ -436,6 +460,7 @@ pub struct TritiumSaltV2EmbeddingKernel {
     rows: usize,
     columns: usize,
     codec: tritium_format::salt_v2::SaltV2Codec,
+    scale_group_size: usize,
     terminal_map_value: u32,
     validated: bool,
 }
@@ -492,6 +517,7 @@ impl TritiumSaltV2EmbeddingKernel {
             rows: self.rows,
             columns: self.columns,
             codec: self.codec,
+            scale_group_size: self.scale_group_size,
             payload,
             scales,
             allocation_map,
@@ -538,6 +564,7 @@ impl Kernel for TritiumSaltV2EmbeddingKernel {
                 rows: self.rows,
                 columns: self.columns,
                 codec: self.codec,
+                scale_group_size: self.scale_group_size,
                 payload,
                 scales,
                 allocation_map,
@@ -1631,6 +1658,7 @@ mod tests {
             rows,
             columns,
             codec: SaltV2Codec::B3,
+            scale_group_size: tritium_format::salt_v2_package::SALT_V2_SCALE_GROUP_SIZE,
             payload: &payload,
             scales: &scales,
             allocation_map: &[],
@@ -1669,6 +1697,61 @@ mod tests {
         let (_, actual) = outputs[0].try_extract_tensor::<f32>().unwrap();
         assert_eq!(actual, expected_two);
         assert_eq!(counters.snapshot().salt_v2_mpgemm, 2);
+
+        let legacy = crate::model::encode_legacy_g128_salt_v2_mpgemm_test_graph(matrix);
+        assert!(
+            crate::diagnose_unsupported_graph(&legacy)
+                .unwrap()
+                .is_empty()
+        );
+        let mut legacy_session = ort::session::Session::builder()
+            .unwrap()
+            .with_operators(tritium_operator_domain().unwrap())
+            .unwrap()
+            .commit_from_memory(&legacy)
+            .unwrap();
+        let act = Tensor::from_array(([1, columns], activation)).unwrap();
+        let outputs = legacy_session.run(ort::inputs![&act]).unwrap();
+        let (_, actual) = outputs[0].try_extract_tensor::<f32>().unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn salt_v2_g64_custom_op_executes_declared_scale_geometry_in_real_ort() {
+        use ort::value::Tensor;
+
+        let columns = 128;
+        let trits = vec![Trit::POS; columns];
+        let payload = pack_salt_v2_plane(SaltV2Codec::B3, &trits).unwrap();
+        let scales = [f16::from_f32(0.5), f16::from_f32(1.5)];
+        let activation = vec![1.0_f32; columns];
+        let matrix = crate::SaltV2PackedMatrix {
+            rows: 1,
+            columns,
+            codec: SaltV2Codec::B3,
+            scale_group_size: tritium_format::salt_v2_package::SALT_V2_SCALE_GROUP_SIZE_64,
+            payload: &payload,
+            scales: &scales,
+            allocation_map: &[],
+            rank_prefixes: &[],
+            terminal_map_value: 0,
+        };
+        let expected = crate::salt_v2_mpgemm_kernel(&activation, 1, matrix).unwrap();
+        assert_eq!(expected, vec![128.0]);
+
+        let encoded = crate::model::encode_salt_v2_mpgemm_test_graph(matrix);
+        let diagnostics = crate::diagnose_unsupported_graph(&encoded).unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        let mut session = ort::session::Session::builder()
+            .unwrap()
+            .with_operators(tritium_operator_domain().unwrap())
+            .unwrap()
+            .commit_from_memory(&encoded)
+            .unwrap();
+        let act = Tensor::from_array(([1, columns], activation)).unwrap();
+        let outputs = session.run(ort::inputs![&act]).unwrap();
+        let (_, actual) = outputs[0].try_extract_tensor::<f32>().unwrap();
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -1690,6 +1773,7 @@ mod tests {
             rows,
             columns,
             codec: SaltV2Codec::B3,
+            scale_group_size: tritium_format::salt_v2_package::SALT_V2_SCALE_GROUP_SIZE,
             payload: &payload,
             scales: &scales,
             allocation_map: &[],
@@ -1711,6 +1795,50 @@ mod tests {
         let outputs = session.run(ort::inputs![&tokens]).unwrap();
         let (shape, actual) = outputs[0].try_extract_tensor::<f32>().unwrap();
         assert_eq!(shape.as_ref(), &[1, 3, columns as i64]);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn salt_v2_g64_embedding_custom_op_uses_declared_scale_geometry_in_real_ort() {
+        use ort::value::Tensor;
+
+        let rows = 2;
+        let columns = 128;
+        let trits = vec![Trit::POS; rows * columns];
+        let payload = pack_salt_v2_plane(SaltV2Codec::B3, &trits).unwrap();
+        let scales = [
+            f16::from_f32(0.25),
+            f16::from_f32(0.5),
+            f16::from_f32(0.75),
+            f16::from_f32(1.0),
+        ];
+        let matrix = crate::SaltV2PackedMatrix {
+            rows,
+            columns,
+            codec: SaltV2Codec::B3,
+            scale_group_size: tritium_format::salt_v2_package::SALT_V2_SCALE_GROUP_SIZE_64,
+            payload: &payload,
+            scales: &scales,
+            allocation_map: &[],
+            rank_prefixes: &[],
+            terminal_map_value: 0,
+        };
+        let tokens = [1_i64, 0];
+        let expected = crate::salt_v2_embedding_kernel(&tokens, &[2], matrix).unwrap();
+
+        let encoded = crate::model::encode_salt_v2_embedding_test_graph(matrix, &[2]);
+        let diagnostics = crate::diagnose_unsupported_graph(&encoded).unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        let mut session = ort::session::Session::builder()
+            .unwrap()
+            .with_operators(tritium_operator_domain().unwrap())
+            .unwrap()
+            .commit_from_memory(&encoded)
+            .unwrap();
+        let tokens = Tensor::from_array(([2], tokens.to_vec())).unwrap();
+        let outputs = session.run(ort::inputs![&tokens]).unwrap();
+        let (shape, actual) = outputs[0].try_extract_tensor::<f32>().unwrap();
+        assert_eq!(shape.as_ref(), &[2, columns as i64]);
         assert_eq!(actual, expected);
     }
 
@@ -2538,6 +2666,7 @@ mod tests {
                     rows: self.rows,
                     columns: self.columns,
                     codec: SaltV2Codec::B3,
+                    scale_group_size: tritium_format::salt_v2_package::SALT_V2_SCALE_GROUP_SIZE,
                     payload: &self.payload,
                     scales: &self.scales,
                     allocation_map: &self.allocation_map,

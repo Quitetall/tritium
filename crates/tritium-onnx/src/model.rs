@@ -2258,6 +2258,14 @@ pub fn diagnose_unsupported_graph(
                     subject,
                     reason: format!("unsupported SALT V2 codec code {}", attribute.value),
                 });
+            } else if attribute.name == crate::ATTR_SCALE_GROUP_SIZE
+                && !matches!(attribute.value, 64 | 128)
+            {
+                diagnostics.push(UnsupportedGraphDiagnostic {
+                    kind: UnsupportedGraphItemKind::Attribute,
+                    subject,
+                    reason: format!("unsupported SALT V2 scale-group size {}", attribute.value),
+                });
             } else if attribute.name == crate::ATTR_TERMINAL_MAP_VALUE
                 && u32::try_from(attribute.value).is_err()
             {
@@ -2397,6 +2405,11 @@ pub fn diagnose_unsupported_graph(
                     required
                 );
                 match count {
+                    0 if required == crate::ATTR_SCALE_GROUP_SIZE => {
+                        // Pre-G64 opset-2 nodes implied canonical G128 geometry.
+                        // Keep those graphs diagnosable and executable while all
+                        // newly exported nodes carry the explicit attribute.
+                    }
                     0 => diagnostics.push(UnsupportedGraphDiagnostic {
                         kind: UnsupportedGraphItemKind::Attribute,
                         subject,
@@ -2647,12 +2660,14 @@ fn supported_attributes(node: &NodeProto) -> &'static [&'static str] {
             ATTR_K,
             crate::ATTR_ROWS,
             crate::ATTR_CODEC,
+            crate::ATTR_SCALE_GROUP_SIZE,
             crate::ATTR_TERMINAL_MAP_VALUE,
         ],
         (ONNX_DOMAIN, crate::ONNX_SALT_V2_EMBEDDING_OP_NAME) => &[
             ATTR_K,
             crate::ATTR_ROWS,
             crate::ATTR_CODEC,
+            crate::ATTR_SCALE_GROUP_SIZE,
             crate::ATTR_TERMINAL_MAP_VALUE,
         ],
         (ONNX_DOMAIN, ONNX_KV_ATTENTION_OP_NAME) => {
@@ -6334,6 +6349,10 @@ impl CausalGraphBuilder {
                         ),
                         int_attribute(crate::ATTR_CODEC, codec),
                         int_attribute(
+                            crate::ATTR_SCALE_GROUP_SIZE,
+                            as_i64(matrix.scale_group_size, "SALT V2 matrix scale-group size")?,
+                        ),
+                        int_attribute(
                             crate::ATTR_TERMINAL_MAP_VALUE,
                             i64::from(matrix.terminal_map_value),
                         ),
@@ -9063,6 +9082,10 @@ fn salt_v2_test_parts(
             int_attribute(crate::ATTR_ROWS, rows),
             int_attribute(crate::ATTR_CODEC, codec),
             int_attribute(
+                crate::ATTR_SCALE_GROUP_SIZE,
+                i64::try_from(matrix.scale_group_size).unwrap(),
+            ),
+            int_attribute(
                 crate::ATTR_TERMINAL_MAP_VALUE,
                 i64::from(matrix.terminal_map_value),
             ),
@@ -9136,6 +9159,22 @@ pub(crate) fn encode_salt_v2_mpgemm_test_graph(matrix: crate::SaltV2PackedMatrix
         metadata_props: Vec::new(),
     }
     .encode_to_vec()
+}
+
+#[cfg(all(test, feature = "onnx"))]
+pub(crate) fn encode_legacy_g128_salt_v2_mpgemm_test_graph(
+    matrix: crate::SaltV2PackedMatrix<'_>,
+) -> Vec<u8> {
+    assert_eq!(
+        matrix.scale_group_size,
+        tritium_format::salt_v2_package::SALT_V2_SCALE_GROUP_SIZE
+    );
+    let mut model =
+        ModelProto::decode(encode_salt_v2_mpgemm_test_graph(matrix).as_slice()).unwrap();
+    model.graph.as_mut().unwrap().node[0]
+        .attribute
+        .retain(|attribute| attribute.name != crate::ATTR_SCALE_GROUP_SIZE);
+    model.encode_to_vec()
 }
 
 #[cfg(all(test, feature = "onnx"))]
@@ -10929,6 +10968,7 @@ mod tests {
             rows: 1,
             columns: 1,
             codec: tritium_format::salt_v2::SaltV2Codec::B3,
+            scale_group_size: tritium_format::salt_v2_package::SALT_V2_SCALE_GROUP_SIZE,
             payload: &payload,
             scales: &scales,
             allocation_map: &[],
@@ -10937,6 +10977,17 @@ mod tests {
         };
         let encoded = encode_salt_v2_mpgemm_test_graph(matrix);
         assert!(diagnose_unsupported_graph(&encoded).unwrap().is_empty());
+
+        let mut legacy_g128 = ModelProto::decode(encoded.as_slice()).unwrap();
+        legacy_g128.graph.as_mut().unwrap().node[0]
+            .attribute
+            .retain(|attribute| attribute.name != crate::ATTR_SCALE_GROUP_SIZE);
+        assert!(
+            diagnose_unsupported_graph(&legacy_g128.encode_to_vec())
+                .unwrap()
+                .is_empty(),
+            "pre-G64 opset-2 nodes retain their implicit G128 contract"
+        );
 
         let mut missing = ModelProto::decode(encoded.as_slice()).unwrap();
         missing.graph.as_mut().unwrap().node[0].input.pop();

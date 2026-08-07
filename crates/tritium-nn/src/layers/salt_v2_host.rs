@@ -9,8 +9,8 @@ use tritium_format::{
     salt_v2::{S34_TRITS_PER_GROUP, SaltV2Codec},
     salt_v2_package::{
         PackedSaltV2PlaneRef, SALT_V2_ALLOCATION_TILE_SIZE,
-        SALT_V2_INDEXED_RUNTIME_RANK_STRIDE_TILES, SALT_V2_MAX_PLANES, SALT_V2_SCALE_GROUP_SIZE,
-        SaltV2PackageReader, SaltV2TensorInfo, SaltV2Transform, unpack_salt_v2_plane_into,
+        SALT_V2_INDEXED_RUNTIME_RANK_STRIDE_TILES, SALT_V2_MAX_PLANES, SaltV2PackageReader,
+        SaltV2TensorInfo, SaltV2Transform, unpack_salt_v2_plane_into,
     },
 };
 
@@ -27,6 +27,7 @@ pub struct HostSaltV2Linear {
     codec: SaltV2Codec,
     rows: usize,
     columns: usize,
+    scale_group_size: usize,
     logical_coefficients: usize,
     tile_count: usize,
     plane_count: usize,
@@ -137,6 +138,7 @@ impl HostSaltV2Linear {
             codec,
             rows,
             columns,
+            scale_group_size: info.scale_group_size(),
             logical_coefficients: info.logical_coefficients(),
             tile_count: info.tile_count(),
             plane_count: expected_planes,
@@ -158,6 +160,12 @@ impl HostSaltV2Linear {
     #[must_use]
     pub const fn columns(&self) -> usize {
         self.columns
+    }
+
+    /// Number of coefficients sharing each zero-point-free scale.
+    #[must_use]
+    pub const fn scale_group_size(&self) -> usize {
+        self.scale_group_size
     }
 
     /// Number of physically present additive planes.
@@ -217,7 +225,7 @@ impl HostSaltV2Linear {
 
     /// Portable fp32 activation contraction without a dense weight shadow.
     ///
-    /// Every output follows the canonical row, group128, plane, then column
+    /// Every output follows canonical row, declared scale group, plane, then column
     /// reduction order. One reusable 256-trit buffer is the only heap scratch.
     ///
     /// # Errors
@@ -304,8 +312,8 @@ impl HostSaltV2Linear {
             let tile_base = tile_index * SALT_V2_ALLOCATION_TILE_SIZE;
             let local_start = coefficient - tile_base;
             let logical_len = self.tile_logical_len(tile_index)?;
-            let group_index = local_start / SALT_V2_SCALE_GROUP_SIZE;
-            let group_end = ((group_index + 1) * SALT_V2_SCALE_GROUP_SIZE).min(logical_len);
+            let group_index = local_start / self.scale_group_size;
+            let group_end = ((group_index + 1) * self.scale_group_size).min(logical_len);
             let segment_len = (group_end - local_start).min(row_end - coefficient);
             let segment_end = coefficient + segment_len;
             let terminal_column = segment_end - row_base - 1;
@@ -368,7 +376,7 @@ impl HostSaltV2Linear {
                 unpack_salt_v2_plane_into(self.codec, packed, logical_len, decoded)
                     .map_err(|error| internal(&format!("decode indexed plane: {error}")))?;
                 for local in local_start..local_start + segment_len {
-                    let scale = scales[local / SALT_V2_SCALE_GROUP_SIZE].to_f32();
+                    let scale = scales[local / self.scale_group_size].to_f32();
                     output[coefficient - row_base + local - local_start] +=
                         decoded[local].to_f32() * scale;
                 }
@@ -391,9 +399,9 @@ impl HostSaltV2Linear {
             .checked_mul(full_payload_bytes)
             .and_then(|offset| offset.checked_add(plane_index.checked_mul(payload_bytes)?))
             .ok_or_else(|| internal("payload offset overflows host usize"))?;
-        let scale_count = logical_len.div_ceil(SALT_V2_SCALE_GROUP_SIZE);
+        let scale_count = logical_len.div_ceil(self.scale_group_size);
         let scale_start = rank
-            .checked_mul(SALT_V2_ALLOCATION_TILE_SIZE / SALT_V2_SCALE_GROUP_SIZE)
+            .checked_mul(SALT_V2_ALLOCATION_TILE_SIZE / self.scale_group_size)
             .and_then(|offset| offset.checked_add(plane_index.checked_mul(scale_count)?))
             .ok_or_else(|| internal("scale offset overflows host usize"))?;
         let packed = self
@@ -664,6 +672,19 @@ mod tests {
         (package, linear)
     }
 
+    fn g64_plane(seed: usize) -> SaltV2Plane {
+        SaltV2Plane::new_with_scale_group_size(
+            (0..256)
+                .map(|index| ((index + seed) % 3) as i8 - 1)
+                .collect(),
+            (0..4)
+                .map(|group| f16::from_f32(0.25 + (seed * 4 + group) as f32 / 64.0))
+                .collect(),
+            64,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn compact_host_projection_is_bit_exact_across_rows_groups_and_tile_boundary() {
         let tensor = SaltV2Tensor::new(
@@ -705,6 +726,40 @@ mod tests {
             }
             assert_eq!(linear.plane_count(), 4);
             assert!(linear.resident_bytes() < tensor.logical_coefficients() * size_of::<f32>());
+        }
+    }
+
+    #[test]
+    fn g64_host_projection_and_gather_match_semantic_runtime() {
+        let tensor = SaltV2Tensor::new_with_layout(
+            "g64-weight",
+            vec![4, 576],
+            SaltV2Transform::None,
+            64,
+            (0..9)
+                .map(|tile| SaltV2Tile::new(vec![g64_plane(tile)]).unwrap())
+                .collect(),
+        )
+        .unwrap();
+        let activation = (0..576)
+            .map(|index| (index as f32 - 283.0) / 71.0)
+            .collect::<Vec<_>>();
+        let (package, linear) = resident(SaltV2Codec::B3, &tensor);
+        let mut expected = [0.0; 4];
+        salt_v2_matvec_into(&package, 0, &activation, &mut expected).unwrap();
+        let mut actual = [0.0; 4];
+        linear.forward(&activation, 1, &mut actual).unwrap();
+        assert_eq!(actual, expected);
+
+        let mut gathered = vec![0.0; 2 * 576];
+        linear.gather_rows(&[3, 1], &mut gathered).unwrap();
+        for (destination, row) in [3_usize, 1].into_iter().enumerate() {
+            for column in 0..576 {
+                assert_eq!(
+                    gathered[destination * 576 + column],
+                    salt_v2_coefficient(&tensor, row * 576 + column).unwrap()
+                );
+            }
         }
     }
 

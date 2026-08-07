@@ -11,7 +11,11 @@ from tritium import (  # noqa: E402
     Stage7EvidenceStateError,
     Stage7TokenEvidencePack,
 )
-from tritium.torch import Stage7CausalData  # noqa: E402
+from tritium.torch import (  # noqa: E402
+    Stage7CausalData,
+    run_stage7_smoke_model,
+    run_stage7_smollm2_smoke,
+)
 
 
 DATASETS = (
@@ -204,3 +208,118 @@ def test_stage7_causal_data_rejects_nonmaterializing_device_before_pack_open(tmp
             batch_sequences=1,
             device="meta",
         )
+
+
+class TinyCausalLM(torch.nn.Module):
+    def __init__(self, hidden_size=128):
+        super().__init__()
+        self.embed_tokens = torch.nn.Embedding(4_096, hidden_size)
+        self.proj = torch.nn.Linear(hidden_size, hidden_size)
+        self.lm_head = torch.nn.Linear(hidden_size, 4_096, bias=False)
+        self.lm_head.weight = self.embed_tokens.weight
+
+    def forward(self, input_ids, attention_mask=None, labels=None, use_cache=False):
+        del attention_mask, use_cache
+        hidden = torch.tanh(self.proj(self.embed_tokens(input_ids)))
+        logits = self.lm_head(hidden)
+        loss = None
+        if labels is not None:
+            loss = torch.nn.functional.cross_entropy(
+                logits[..., :-1, :].reshape(-1, logits.shape[-1]),
+                labels[..., 1:].reshape(-1),
+            )
+        return {"logits": logits, "loss": loss}
+
+
+@pytest.mark.parametrize("hidden_size", [128, 64])
+def test_stage7_smoke_model_executes_real_pipeline_and_resumes(tmp_path, hidden_size):
+    torch.manual_seed(7)
+    manifest_path, manifest = write_pack(tmp_path / "pack")
+    data = Stage7CausalData.open(
+        manifest_path,
+        expected_pack_id=manifest["pack_id"],
+        expected_tokenizer_digest=manifest["tokenizer_digest"],
+        expected_tokenizer_vocab_size=4_096,
+        partition="calibration",
+        start_sequence=0,
+        sequence_count=2,
+        batch_sequences=1,
+    )
+    model = TinyCausalLM(hidden_size).eval()
+
+    first = run_stage7_smoke_model(
+        model,
+        data,
+        tmp_path / "smoke",
+        packing="b3",
+        max_working_bytes=16 * 1024 * 1024,
+    )
+
+    assert first.schema == "tritium.stage7-smoke-model.v1"
+    assert first.result == "pass"
+    assert first.package_id.startswith("trp1_")
+    assert first.packing == "b3"
+    assert first.tensor_count == 2
+    assert first.evaluated_tokens == 2 * (2_048 - 1)
+    assert first.mean_loss > 0
+    assert first.terminal_validated is True
+    assert first.stage_names == (
+        "capture",
+        "fit",
+        "allocate",
+        "package",
+        "evaluate",
+    )
+    assert first.artifact_path.is_file()
+    package_version = int.from_bytes(first.artifact_path.read_bytes()[8:10], "little")
+    assert package_version == (1 if hidden_size == 128 else 2)
+    allocation = json.loads((tmp_path / "smoke" / "allocation.json").read_text())
+    assert {tensor["scale_group_size"] for tensor in allocation["tensors"]} == {
+        hidden_size
+    }
+
+    resumed = run_stage7_smoke_model(
+        model,
+        data,
+        tmp_path / "smoke",
+        packing="b3",
+        max_working_bytes=16 * 1024 * 1024,
+    )
+    assert resumed == first
+
+
+def test_stage7_smollm2_smoke_rejects_noncanonical_model_before_output(tmp_path):
+    campaign = {
+        "schema": "tritium.stage7-campaign.v1",
+        "release": "1.1.0-rc.0",
+        "source_revision": "12" * 20,
+        "run_id": "stage7-test",
+        "model": {},
+        "smoke_model": {
+            "repo_id": "HuggingFaceTB/SmolLM2-135M",
+            "revision": "93efa2f097d58c2a74874c7e644dbc9b0cee75a2",
+            "files": [],
+        },
+        "smoke_provenance": {},
+        "provenance": {},
+        "thresholds": {},
+        "recipe_count": 1_404,
+        "recipe_grid_id": "sha256:" + "34" * 32,
+        "token_evidence_pack": {},
+        "evidence": [],
+    }
+    campaign_path = tmp_path / "campaign.json"
+    campaign_path.write_bytes(canonical(campaign) + b"\n")
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    output = tmp_path / "smoke"
+
+    with pytest.raises(ValueError, match="model file inventory"):
+        run_stage7_smollm2_smoke(
+            campaign_path,
+            model_dir,
+            output,
+            device="cpu",
+        )
+
+    assert not output.exists()

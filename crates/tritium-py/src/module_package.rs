@@ -15,9 +15,9 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tritium_format::salt_v2::SaltV2Codec;
 use tritium_format::salt_v2_package::{
-    SALT_V2_ALLOCATION_TILE_SIZE, SALT_V2_SCALE_GROUP_SIZE, SaltV2PackageReader,
-    SaltV2PackageStreamPlan, SaltV2PackageStreamWriter, SaltV2Plane, SaltV2StreamTensorSpec,
-    SaltV2Transform, unpack_salt_v2_plane,
+    SALT_V2_ALLOCATION_TILE_SIZE, SALT_V2_SCALE_GROUP_SIZE, SALT_V2_SCALE_GROUP_SIZE_64,
+    SaltV2PackageReader, SaltV2PackageStreamPlan, SaltV2PackageStreamWriter, SaltV2Plane,
+    SaltV2StreamTensorSpec, SaltV2Transform, unpack_salt_v2_plane,
 };
 
 #[cfg(unix)]
@@ -114,6 +114,7 @@ struct AdmittedWeight {
     aliases: Vec<String>,
     rows: usize,
     columns: usize,
+    scale_group_size: usize,
     planes: Vec<AdmittedPlane>,
 }
 
@@ -278,10 +279,11 @@ fn pack(
     let specs = weights
         .iter()
         .map(|weight| {
-            SaltV2StreamTensorSpec::new(
+            SaltV2StreamTensorSpec::new_with_layout(
                 weight.name.clone(),
                 vec![weight.rows as u64, weight.columns as u64],
                 SaltV2Transform::None,
+                weight.scale_group_size,
             )
             .map_err(|error| error.to_string())
         })
@@ -384,12 +386,16 @@ fn admit_weight(
         .map_err(|_| "conversion row count exceeds platform".to_owned())?;
     let columns = usize::try_from(receipt.shape[1])
         .map_err(|_| "conversion column count exceeds platform".to_owned())?;
-    if !columns.is_multiple_of(SALT_V2_SCALE_GROUP_SIZE) {
+    let scale_group_size = if columns.is_multiple_of(SALT_V2_SCALE_GROUP_SIZE) {
+        SALT_V2_SCALE_GROUP_SIZE
+    } else if columns.is_multiple_of(SALT_V2_SCALE_GROUP_SIZE_64) {
+        SALT_V2_SCALE_GROUP_SIZE_64
+    } else {
         return Err(format!(
-            "conversion weight `{}` has {} columns; SALT V2 export requires G128 alignment",
+            "conversion weight `{}` has {} columns; SALT V2 export requires G64 alignment",
             receipt.path, columns
         ));
-    }
+    };
     let elements = rows
         .checked_mul(columns)
         .ok_or_else(|| "conversion weight geometry overflowed".to_owned())?;
@@ -439,6 +445,7 @@ fn admit_weight(
             aliases: receipt.aliases,
             rows,
             columns,
+            scale_group_size,
             planes,
         },
         files,
@@ -648,10 +655,10 @@ fn read_source_plane(
         .read_exact(&mut trits)
         .map_err(|error| format!("read conversion trits failed: {:?}", error.kind()))?;
     let trits = trits.into_iter().map(|value| value as i8).collect();
-    let groups = logical_len.div_ceil(SALT_V2_SCALE_GROUP_SIZE);
+    let groups = logical_len.div_ceil(weight.scale_group_size);
     let mut scales = Vec::with_capacity(groups);
     for group in 0..groups {
-        let coefficient = start + group * SALT_V2_SCALE_GROUP_SIZE;
+        let coefficient = start + group * weight.scale_group_size;
         let row = coefficient / weight.columns;
         plane
             .scales
@@ -664,7 +671,8 @@ fn read_source_plane(
             .map_err(|error| format!("read conversion scales failed: {:?}", error.kind()))?;
         scales.push(f16::from_bits(u16::from_le_bytes(bits)));
     }
-    SaltV2Plane::new(trits, scales).map_err(|error| error.to_string())
+    SaltV2Plane::new_with_scale_group_size(trits, scales, weight.scale_group_size)
+        .map_err(|error| error.to_string())
 }
 
 fn verify_opened_weight(weight: &AdmittedWeight, opened: &mut [OpenedPlane]) -> Result<(), String> {

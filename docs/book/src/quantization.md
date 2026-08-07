@@ -109,6 +109,36 @@ the complete payload digest, then rechecks the retained file handle after the
 selected read. Its JSON receipt identifies the exact ordered token window; it
 does not claim model execution or quality.
 
+Run the frozen 135M execution seam from the installed wheel:
+
+```python
+from pathlib import Path
+
+from tritium.torch import run_stage7_smollm2_smoke
+
+snapshot = (
+    Path.home()
+    / ".cache/huggingface/hub/models--HuggingFaceTB--SmolLM2-135M/snapshots"
+    / "93efa2f097d58c2a74874c7e644dbc9b0cee75a2"
+)
+
+result = run_stage7_smollm2_smoke(
+    "./stage7-campaign.json",
+    snapshot,
+    "./stage7-smoke",
+    device="cuda",
+)
+print(result.model.package_id, result.model.mean_loss)
+```
+
+The driver strictly resumes capture, additive PTQ fitting, allocation, native
+SALT V2 packaging, and causal evaluation. It admits only the campaign-frozen
+model/token prefix and emits qualifier-compatible receipts. A completed smoke
+proves workflow integrity and physical package production, not 1.7B recipe
+quality or Stage-7 qualification. SmolLM matrices requiring G64 use explicit
+SALT V2 package-version 2 scale geometry; G128-only packages remain canonical
+version 1.
+
 ## SALT V2 Qwen master campaigns
 
 The legacy `tritium quantize` command above is not the Qwen3.6-27B SALT V2

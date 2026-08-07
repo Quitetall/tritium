@@ -243,6 +243,7 @@ impl CudaBackend {
             tile_count: info.tile_count(),
             plane_count: expected_planes,
             codec_tag: geometry.codec_tag,
+            scale_group_size: geometry.scale_group_size,
             allocation_map_bytes: to_u32(map_bytes, "allocation map bytes")?,
             rank_prefix_count: to_u32(rank_prefix_count, "rank prefix count")?,
             terminal_map_value,
@@ -256,6 +257,7 @@ struct UploadGeometry {
     rows: usize,
     columns: usize,
     codec_tag: u32,
+    scale_group_size: u32,
 }
 
 fn validate_geometry(
@@ -308,10 +310,12 @@ fn validate_geometry(
     to_u32(rows, "row count")?;
     to_u32(columns, "column count")?;
     to_u32(info.tile_count(), "tile count")?;
+    let scale_group_size = to_u32(info.scale_group_size(), "scale-group size")?;
     Ok(UploadGeometry {
         rows,
         columns,
         codec_tag,
+        scale_group_size,
     })
 }
 
