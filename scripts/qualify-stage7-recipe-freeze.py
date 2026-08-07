@@ -1021,6 +1021,32 @@ def _canonical_hestia_vector_identity(source_root: Path) -> tuple[str, int]:
     return f"sha256:{digest}", hestia_cases
 
 
+def _cpu_physical_device(value: Any, label: str) -> str:
+    device = _string(value, label)
+    if not device.startswith("cpu:"):
+        raise Stage7Error(f"{label} differs")
+    os_name, os_separator, remainder = device[4:].partition(":")
+    arch, arch_separator, remainder = remainder.partition(":")
+    model, count_separator, logical = remainder.rpartition(":")
+    if (
+        not os_separator
+        or not arch_separator
+        or not count_separator
+        or any(not part or part.strip() != part for part in (os_name, arch, model))
+        or re.fullmatch(r"[1-9][0-9]*-logical", logical) is None
+    ):
+        raise Stage7Error(f"{label} differs")
+    return device
+
+
+def _cuda_physical_device(value: Any, label: str) -> str:
+    device = _string(value, label)
+    match = re.fullmatch(r"cuda:(0|[1-9][0-9]*):(.+)", device)
+    if match is None or match.group(2).strip() != match.group(2):
+        raise Stage7Error(f"{label} differs")
+    return device
+
+
 def _validate_hestia_gate(
     path: Path, campaign: dict[str, Any], source_root: Path
 ) -> None:
@@ -1072,14 +1098,19 @@ def _validate_hestia_gate(
             or portable["operation"] != "graph.hestia_relax"
         ):
             raise Stage7Error(f"HESTIA portable {backend} conformance differs")
-        device = _string(
-            portable["physical_device"], f"HESTIA portable {backend} physical device"
+        device_label = f"HESTIA portable {backend} physical device"
+        device = _string(portable["physical_device"], device_label)
+        driver = _string(
+            portable["driver"], f"HESTIA portable {backend} driver"
         )
-        _string(portable["driver"], f"HESTIA portable {backend} driver")
-        if (backend == "cpu" and device != "cpu") or (
-            backend == "cuda" and not device.startswith("cuda:")
-        ):
-            raise Stage7Error(f"HESTIA portable {backend} device differs")
+        if backend == "cpu":
+            _cpu_physical_device(device, device_label)
+            if driver != "rust-reference":
+                raise Stage7Error("HESTIA portable CPU driver differs")
+        else:
+            _cuda_physical_device(device, device_label)
+            if re.fullmatch(r"cuda-driver-api:[1-9][0-9]*", driver) is None:
+                raise Stage7Error("HESTIA portable CUDA driver differs")
         if digest != expected_vector_digest:
             raise Stage7Error(
                 "HESTIA portable backends used different vectors or did not use "

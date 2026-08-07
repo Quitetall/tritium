@@ -554,7 +554,7 @@ def fixture(root: Path):
             "operation": "graph.hestia_relax",
             "vector_digest": hestia_vector_digest,
             "case_count": 5,
-            "physical_device": "cpu",
+            "physical_device": "cpu:linux:x86_64:test-cpu:1-logical",
             "driver": "rust-reference",
         },
         "portable_cuda": {
@@ -565,7 +565,7 @@ def fixture(root: Path):
             "vector_digest": hestia_vector_digest,
             "case_count": 5,
             "physical_device": "cuda:0:GPU-1",
-            "driver": "999.1",
+            "driver": "cuda-driver-api:9991",
         },
     }
     hestia_gate_path = root / "hestia-gate-c.json"
@@ -935,6 +935,30 @@ def fixture(root: Path):
 
 
 class Stage7RecipeFreezeTests(unittest.TestCase):
+    def _assert_hestia_gate_mutation_rejected(
+        self, root, *, backend, field, value, message
+    ):
+        state = fixture(root)
+        gate_path = root / "hestia-gate-c.json"
+        gate = json.loads(gate_path.read_bytes())
+        gate[backend][field] = value
+        write_json(gate_path, gate)
+        state["campaign"]["evidence"][2].update(
+            file_record(root, gate_path.name, gate_path.read_bytes())
+        )
+        write_json(state["campaign_path"], state["campaign"])
+        state["trace"]["campaign_sha256"] = hashlib.sha256(
+            state["campaign_path"].read_bytes()
+        ).hexdigest()
+        write_json(state["trace_path"], state["trace"])
+        with self.assertRaisesRegex(Stage7Error, message):
+            qualify(
+                state["campaign_path"], state["trace_path"],
+                model_root=state["model_root"],
+                smoke_model_root=state["smoke_model_root"],
+                source_root=state["source"],
+            )
+
     def test_rejects_campaign_without_token_evidence_pack(self):
         with tempfile.TemporaryDirectory() as raw:
             state = fixture(Path(raw))
@@ -1517,6 +1541,34 @@ class Stage7RecipeFreezeTests(unittest.TestCase):
                     smoke_model_root=state["smoke_model_root"],
                     source_root=state["source"],
                 )
+
+    def test_rejects_hestia_gate_c_truncated_cpu_identity(self):
+        with tempfile.TemporaryDirectory() as raw:
+            self._assert_hestia_gate_mutation_rejected(
+                Path(raw), backend="portable_cpu", field="physical_device",
+                value="cpu:", message="physical device",
+            )
+
+    def test_rejects_hestia_gate_c_truncated_cuda_identity(self):
+        with tempfile.TemporaryDirectory() as raw:
+            self._assert_hestia_gate_mutation_rejected(
+                Path(raw), backend="portable_cuda", field="physical_device",
+                value="cuda:", message="physical device",
+            )
+
+    def test_rejects_hestia_gate_c_fabricated_cuda_driver(self):
+        with tempfile.TemporaryDirectory() as raw:
+            self._assert_hestia_gate_mutation_rejected(
+                Path(raw), backend="portable_cuda", field="driver",
+                value="fabricated-driver", message="CUDA driver",
+            )
+
+    def test_rejects_hestia_gate_c_fabricated_cpu_driver(self):
+        with tempfile.TemporaryDirectory() as raw:
+            self._assert_hestia_gate_mutation_rejected(
+                Path(raw), backend="portable_cpu", field="driver",
+                value="fabricated-driver", message="CPU driver",
+            )
 
     def test_rejects_cherry_picked_promotion(self):
         with tempfile.TemporaryDirectory() as raw:
