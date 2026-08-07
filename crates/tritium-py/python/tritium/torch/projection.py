@@ -32,12 +32,13 @@ class TernaryPlane:
 
 @dataclass(frozen=True)
 class TernaryProjection:
-    """One-to-three hard planes plus their differentiable summed decode."""
+    """One-to-three hard planes plus a differentiable training value."""
 
     dense: torch.Tensor
     planes: Tuple[TernaryPlane, ...]
     algorithm_id: str
     schema_version: int
+    exportable: bool = True
 
     @property
     def trits(self) -> torch.Tensor:
@@ -192,6 +193,11 @@ def validate_projection(
                 details={"plane": index},
             ) from error
     _require_tensor_contract(
-        torch.all(projection.dense.detach() == decoded),
-        "projection forward value is not its canonical ternary decode",
+        torch.isfinite(projection.dense).all(),
+        "projection forward value must be finite",
     )
+    if projection.exportable:
+        _require_tensor_contract(
+            torch.all(projection.dense.detach() == decoded),
+            "projection forward value is not its canonical ternary decode",
+        )

@@ -25,6 +25,12 @@ class Estimator(nn.Module, ABC):
     schema_version: int = 1
     physical_planes: int = 1
 
+    @property
+    def projection_step(self) -> int:
+        """Schedule position product paths must place in projection context."""
+
+        return 0
+
     @abstractmethod
     def project(
         self, master: torch.Tensor, *, context: ProjectionContext
@@ -109,6 +115,152 @@ def _projection(
     return _multi_projection(master, ((trits, scales),), surrogate, estimator)
 
 
+def _soft_projection(
+    master: torch.Tensor,
+    trits: torch.Tensor,
+    scales: torch.Tensor,
+    soft: torch.Tensor,
+    estimator: Estimator,
+    *,
+    exportable: bool,
+) -> TernaryProjection:
+    """Build HESTIA's soft forward without weakening hard-plane validation."""
+
+    stored_scales = scales.to(torch.float16)
+    decoded = trits.to(master.dtype) * stored_scales.to(master.dtype)
+    dense = decoded.detach() + (soft - soft.detach()) if exportable else soft
+    return TernaryProjection(
+        dense=dense,
+        planes=(
+            TernaryPlane(
+                trits=trits.detach().to(torch.int8),
+                scales=stored_scales,
+                group_size=master.shape[1],
+            ),
+        ),
+        algorithm_id=estimator.algorithm_id,
+        schema_version=estimator.schema_version,
+        exportable=exportable,
+    )
+
+
+def hestia_soft_expectation(
+    master: torch.Tensor,
+    scales: torch.Tensor,
+    temperature: torch.Tensor,
+) -> torch.Tensor:
+    """Evaluate HESTIA's differentiable ternary expectation oracle."""
+
+    _rank2(master, "hestia_soft_expectation")
+    if scales.shape not in {(master.shape[0],), (master.shape[0], 1)}:
+        raise ValueError("HESTIA scales must contain one value per row")
+    if temperature.numel() != 1 or not temperature.dtype.is_floating_point:
+        raise ValueError("HESTIA temperature must be one floating scalar")
+    valid_temperature = torch.isfinite(temperature).all() & (temperature > 0).all()
+    valid_scales = torch.isfinite(scales).all() & (scales >= 0).all()
+    valid_master = torch.isfinite(master).all()
+    if torch.compiler.is_compiling():
+        torch._assert_async(
+            valid_temperature,
+            "HESTIA temperature must be finite and positive",
+        )
+        torch._assert_async(valid_scales, "HESTIA scales must be finite and nonnegative")
+        torch._assert_async(valid_master, "HESTIA master must be finite")
+    elif not bool(valid_temperature):
+        raise ValueError("HESTIA temperature must be finite and positive")
+    elif not bool(valid_scales):
+        raise ValueError("HESTIA scales must be finite and nonnegative")
+    elif not bool(valid_master):
+        raise ValueError("HESTIA master must be finite")
+
+    accumulation_dtype = (
+        torch.float32 if master.dtype in {torch.float16, torch.bfloat16} else master.dtype
+    )
+    work = master.to(accumulation_dtype)
+    scale = scales.detach().reshape(master.shape[0], 1).to(accumulation_dtype)
+    tau = temperature.reshape(()).to(device=master.device, dtype=accumulation_dtype)
+    min_differentiable_tau = math.sqrt(torch.finfo(accumulation_dtype).tiny)
+    representable = (
+        torch.isfinite(scale).all()
+        & torch.isfinite(tau)
+        & (tau >= min_differentiable_tau)
+    )
+    if torch.compiler.is_compiling():
+        torch._assert_async(
+            representable,
+            "HESTIA inputs are not representable in accumulation dtype",
+        )
+    elif not bool(representable):
+        raise ValueError("HESTIA inputs are not representable in accumulation dtype")
+    live_rows = scale > 0
+    divisor = torch.where(live_rows, scale, torch.ones_like(scale))
+    raw_normalized = torch.where(live_rows, work.div(divisor), torch.zeros_like(work))
+    finite_normalized = torch.isfinite(raw_normalized).all()
+    if torch.compiler.is_compiling():
+        torch._assert_async(
+            finite_normalized,
+            "HESTIA normalized weights are not representable",
+        )
+    elif not bool(finite_normalized):
+        raise ValueError("HESTIA normalized weights are not representable")
+    grid = work.new_tensor((-1.0, 0.0, 1.0))
+    sqrt_max = math.sqrt(torch.finfo(accumulation_dtype).max)
+    direct_magnitude = raw_normalized.abs() + 1
+    direct_usable = (direct_magnitude <= sqrt_max) & (
+        direct_magnitude / sqrt_max <= torch.sqrt(tau.detach())
+    )
+    direct_normalized = torch.where(
+        direct_usable, raw_normalized, torch.zeros_like(raw_normalized)
+    ).unsqueeze(-1)
+    direct_distance = (direct_normalized - grid).square()
+    direct_logits = -direct_distance / tau
+
+    max_logit = -math.log(torch.finfo(accumulation_dtype).tiny)
+    if accumulation_dtype == torch.float64:
+        fallback_representable = direct_usable.all()
+        if torch.compiler.is_compiling():
+            torch._assert_async(
+                fallback_representable,
+                "HESTIA float64 fallback is not representable",
+            )
+        elif not bool(fallback_representable):
+            raise ValueError("HESTIA float64 fallback is not representable")
+        stable_logits = torch.zeros_like(direct_logits)
+    else:
+        # f64 provides ample headroom for every finite f16/bf16/f32 input once
+        # tau passed the differentiable floor. Clamp dimensionless logits after
+        # division; never multiply tau by a saturation threshold.
+        fallback_normalized = raw_normalized.to(torch.float64).unsqueeze(-1)
+        fallback_grid = grid.to(torch.float64)
+        reference = torch.where(
+            fallback_normalized < -0.5,
+            fallback_normalized.new_tensor(-1.0),
+            torch.where(
+                fallback_normalized > 0.5,
+                fallback_normalized.new_tensor(1.0),
+                fallback_normalized.new_tensor(0.0),
+            ),
+        )
+        difference = reference - fallback_grid
+        relative_distance = difference * (fallback_normalized - fallback_grid)
+        relative_distance = relative_distance + difference * (
+            fallback_normalized - reference
+        )
+        scaled_relative = relative_distance / tau.to(torch.float64)
+        stable_logits = -scaled_relative.clamp(min=0, max=max_logit).to(
+            accumulation_dtype
+        )
+    logits = torch.where(direct_usable.unsqueeze(-1), direct_logits, stable_logits)
+    expected = (torch.softmax(logits, dim=-1) * grid).sum(dim=-1)
+    output = (scale * expected).to(master.dtype)
+    finite_output = torch.isfinite(output).all()
+    if torch.compiler.is_compiling():
+        torch._assert_async(finite_output, "HESTIA expectation must be finite")
+    elif not bool(finite_output):
+        raise ValueError("HESTIA expectation must be finite")
+    return output
+
+
 def _multi_projection(
     master: torch.Tensor,
     values: Tuple[Tuple[torch.Tensor, torch.Tensor], ...],
@@ -169,6 +321,7 @@ class AdditiveEstimator(Estimator):
         residual = master
         dense = torch.zeros_like(master)
         planes = []
+        exportable = True
         for estimator in self.estimators:
             projection = estimator.project(residual, context=context)
             validate_projection(
@@ -186,12 +339,39 @@ class AdditiveEstimator(Estimator):
             planes.append(projection.planes[0])
             dense = dense + projection.dense
             residual = master - dense
+            exportable = exportable and projection.exportable
         return TernaryProjection(
             dense=dense,
             planes=tuple(planes),
             algorithm_id=self.algorithm_id,
             schema_version=self.schema_version,
+            exportable=exportable,
         )
+
+    def set_step(self, step: int) -> "AdditiveEstimator":
+        """Advance every child schedule as one additive projection."""
+
+        setters = [getattr(estimator, "set_step", None) for estimator in self.estimators]
+        if any(setter is None for setter in setters):
+            raise TritiumError(
+                "additive estimator children do not expose a shared schedule",
+                code="unsupported_recipe",
+                stage="schedule",
+            )
+        for setter in setters:
+            setter(step)
+        return self
+
+    @property
+    def projection_step(self) -> int:
+        steps = {estimator.projection_step for estimator in self.estimators}
+        if len(steps) != 1:
+            raise TritiumError(
+                "additive estimator child schedules differ",
+                code="estimator_contract",
+                stage="schedule",
+            )
+        return steps.pop()
 
 
 class AnnealedSTE(Estimator):
@@ -234,6 +414,110 @@ class AnnealedSTE(Estimator):
         denominator = math.tanh(temperature)
         surrogate = scales * torch.tanh(normalized * temperature) / denominator
         return _projection(master, trits, scales, surrogate, self)
+
+
+class HestiaEstimator(Estimator):
+    """Soft ternary expectation with exponential temperature decay."""
+
+    algorithm_id = "tritium.hestia"
+    schema_version = 1
+
+    def __init__(
+        self,
+        initial_temperature: float = 1.0,
+        temperature_floor: float = 0.01,
+        total_steps: int = 100,
+    ) -> None:
+        super().__init__()
+        if (
+            not math.isfinite(initial_temperature)
+            or not math.isfinite(temperature_floor)
+            or initial_temperature <= 0
+            or temperature_floor <= 0
+            or initial_temperature < temperature_floor
+            or isinstance(total_steps, bool)
+            or not isinstance(total_steps, int)
+            or total_steps <= 0
+        ):
+            raise ValueError("invalid HESTIA temperature schedule")
+        self.initial_temperature = float(initial_temperature)
+        self.temperature_floor = float(temperature_floor)
+        self.total_steps = total_steps
+        self.register_buffer("_schedule_step", torch.tensor(0, dtype=torch.int64))
+        self._schedule_step_value = 0
+
+    @property
+    def schedule_step(self) -> int:
+        """Current explicit schedule position used by module forwards and export."""
+
+        return self._schedule_step_value
+
+    @property
+    def projection_step(self) -> int:
+        return self.schedule_step
+
+    def set_step(self, step: int) -> "HestiaEstimator":
+        """Set schedule position; training loops call this before each forward."""
+
+        if isinstance(step, bool) or not isinstance(step, int) or step < 0:
+            raise ValueError("HESTIA schedule step must be a nonnegative integer")
+        self._schedule_step.fill_(step)
+        self._schedule_step_value = step
+        return self
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ) -> None:
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+        self._schedule_step_value = int(self._schedule_step.item())
+
+    def temperature(self, step: int) -> float:
+        """Return schedule temperature, clamped to exact endpoint values."""
+
+        if step <= 0:
+            return self.initial_temperature
+        if step >= self.total_steps:
+            return self.temperature_floor
+        progress = step / self.total_steps
+        log_tau = math.log(self.initial_temperature) + progress * (
+            math.log(self.temperature_floor) - math.log(self.initial_temperature)
+        )
+        return max(self.temperature_floor, math.exp(log_tau))
+
+    def project(
+        self, master: torch.Tensor, *, context: ProjectionContext
+    ) -> TernaryProjection:
+        _rank2(master, "HestiaEstimator")
+        tau = self.temperature(context.step)
+        scales = _absmean_scale(master)
+        safe = scales.clamp_min(torch.finfo(master.dtype).tiny)
+        normalized = master / safe
+        soft = hestia_soft_expectation(master, scales, master.new_tensor(tau))
+        trits = normalized.detach().round().clamp(-1, 1).to(torch.int8)
+        exportable = tau <= self.temperature_floor
+        return _soft_projection(
+            master,
+            trits,
+            scales,
+            soft,
+            self,
+            exportable=exportable,
+        )
 
 
 class LSQEstimator(Estimator):
@@ -378,6 +662,7 @@ _ESTIMATORS: Dict[str, EstimatorFactory] = {
     "absmean-ste": AbsMeanSTE,
     "salt-ste": SaltSTE,
     "annealed-ste": AnnealedSTE,
+    "hestia": HestiaEstimator,
     "lsq": LSQEstimator,
     "twn": TWNEstimator,
     "ttq": TTQEstimator,

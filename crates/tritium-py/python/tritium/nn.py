@@ -66,7 +66,11 @@ def _project(
 ) -> torch.Tensor:
     projection = estimator.project(
         weight,
-        context=ProjectionContext(training=training, role="weight"),
+        context=ProjectionContext(
+            step=estimator.projection_step,
+            training=training,
+            role="weight",
+        ),
     )
     validate_projection(
         projection,

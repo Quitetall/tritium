@@ -14,6 +14,7 @@ from .estimators import (
     AbsMeanSTE,
     AdditiveEstimator,
     AnnealedSTE,
+    HestiaEstimator,
     LSQEstimator,
     SaltSTE,
     SparseTernaryEstimator,
@@ -408,6 +409,7 @@ def _gradient(weight: torch.Tensor) -> Tuple[Optional[float], Optional[bool]]:
 _BUILTIN_ESTIMATOR_TYPES = {
     AbsMeanSTE,
     AnnealedSTE,
+    HestiaEstimator,
     LSQEstimator,
     SaltSTE,
     SparseTernaryEstimator,

@@ -459,7 +459,11 @@ def convert_qat_hard(prepared: PreparedModel) -> QatHardResult:
             matrix_weight = _matrix_weight(first)
             projection = first.estimator.project(
                 matrix_weight,
-                context=ProjectionContext(training=False, role="weight"),
+                context=ProjectionContext(
+                    step=first.estimator.projection_step,
+                    training=False,
+                    role="weight",
+                ),
             )
             validate_projection(
                 projection,
@@ -467,6 +471,14 @@ def convert_qat_hard(prepared: PreparedModel) -> QatHardResult:
                 algorithm_id=first.estimator.algorithm_id,
                 schema_version=first.estimator.schema_version,
             )
+            if not projection.exportable:
+                raise TritiumError(
+                    "QAT hard conversion requires an exportable projection; "
+                    "HESTIA must reach its temperature floor",
+                    code="invalid_phase",
+                    stage="convert_qat_hard",
+                    module=group.path,
+                )
             if len(projection.planes) != prepared.config.planes:
                 raise TritiumError(
                     "QAT hard projection plane count differs from recipe",
