@@ -1076,17 +1076,22 @@ impl DevicePackedSaltWeight {
     }
 
     fn ensure_prepared(&self) -> Result<(), BackendError> {
-        if !self.prepared {
-            return Err(BackendError::InvalidInput(
-                "packed SALT weight is stale; repack from the updated master".into(),
-            ));
-        }
+        self.ensure_snapshot_prepared()?;
         if let Some(source) = &self.source
             && source.version.generation.load(Ordering::Acquire) != source.packed_generation
         {
             return Err(BackendError::InvalidInput(
                 "packed SALT weight predates the current resident master generation; repack it"
                     .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn ensure_snapshot_prepared(&self) -> Result<(), BackendError> {
+        if !self.prepared {
+            return Err(BackendError::InvalidInput(
+                "packed SALT weight is stale; repack from the updated master".into(),
             ));
         }
         Ok(())
@@ -5075,7 +5080,11 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
                 k: _,
                 out: _,
             } => {
-                weight.ensure_prepared()?;
+                // Graph admission already bound this immutable packed snapshot
+                // to the then-current master generation. Streamed reverse may
+                // advance the resident master before replay reaches earlier
+                // ops; replay must still use the forward snapshot.
+                weight.ensure_snapshot_prepared()?;
                 let mut output = self.b.dev_alloc_zeros(m * n)?;
                 match self.packed_compute_policy {
                     PackedSaltComputePolicy::Exact => self.b.training_salt_forward(
@@ -5167,7 +5176,7 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
                 vocab: _,
                 out: _,
             } => {
-                weight.ensure_prepared()?;
+                weight.ensure_snapshot_prepared()?;
                 let mut output = self.b.dev_alloc_zeros(seq * dim)?;
                 self.b
                     .training_salt_embed_forward(&weight.inner, tokens, seq, &mut output)?;
@@ -5642,7 +5651,10 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
                         k,
                         out: _,
                     } => {
-                        weight.ensure_prepared()?;
+                        // Same admitted forward snapshot as replay above. New
+                        // tapes still reject stale generations in
+                        // `validate_packed_master`.
+                        weight.ensure_snapshot_prepared()?;
                         let shape = GemmShape { m, n, k };
                         let mut gx = self.b.dev_alloc_zeros(m * k)?;
                         match self.packed_compute_policy {

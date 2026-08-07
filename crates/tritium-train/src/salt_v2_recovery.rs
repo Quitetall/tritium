@@ -304,6 +304,30 @@ impl TemperatureSchedule {
     pub fn sensitivity_scores(&self) -> &[f64] {
         self.sensitivity.scores()
     }
+
+    /// Recovery schedule whose soft boundary this temperature policy follows.
+    #[must_use]
+    pub const fn recovery_schedule(&self) -> RecoverySchedule {
+        self.recovery
+    }
+
+    /// Base temperature before applying per-tensor sensitivity scaling.
+    #[must_use]
+    pub const fn tau_initial(&self) -> f64 {
+        self.base.tau_initial()
+    }
+
+    /// Common temperature floor reached at the hard boundary.
+    #[must_use]
+    pub const fn tau_floor(&self) -> f64 {
+        self.tau_floor
+    }
+
+    /// Exponential coefficient applied to standardized tensor sensitivity.
+    #[must_use]
+    pub const fn sensitivity_alpha(&self) -> f64 {
+        self.sensitivity_alpha
+    }
 }
 
 /// Active token-level recovery objective.

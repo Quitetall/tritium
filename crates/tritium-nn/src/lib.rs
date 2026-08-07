@@ -21,6 +21,8 @@ mod layers;
 mod model;
 mod ops;
 mod qwen35_config;
+#[cfg(feature = "cuda")]
+mod recovery;
 mod salt_v2_growth;
 mod teacher_cache;
 mod tensor;
@@ -77,6 +79,11 @@ pub use qwen35_config::{
     Qwen35Dtype, Qwen35FullAttentionConfig, Qwen35LayerType, Qwen35MtpConfig,
     Qwen35NormWeightSemantics, Qwen35OutputGate, Qwen35RopeConfig, Qwen35RopeType,
     Qwen35TextConfig, Qwen35VisionScope,
+};
+#[cfg(feature = "cuda")]
+pub use recovery::{
+    DeviceRecoveryConfig, DeviceRecoveryError, DeviceRecoveryEstimator, DeviceRecoveryPhase,
+    DeviceRecoverySession, DeviceRecoveryStepReceipt,
 };
 pub use salt_v2_growth::{
     AppliedIntermediateGrowthReceipt, DENSE_GROWTH_ORACLE_ALGORITHM_V1,

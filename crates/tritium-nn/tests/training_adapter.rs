@@ -1032,6 +1032,37 @@ fn hestia_test_fixture() -> (ModelConfig, TiedSwiGluTrainingModel) {
 }
 
 #[cfg(feature = "cuda")]
+fn recovery_session_fixture(
+    backend: &tritium_cuda::CudaBackend,
+) -> (
+    TiedSwiGluTrainingModel,
+    tritium_train::RecoverySchedule,
+    tritium_nn::DeviceRecoveryConfig,
+    [i32; 2],
+    tritium_cuda::train::DeviceTensor,
+) {
+    use tritium_train::{AdamW, HestiaSensitivityProfile, RecoverySchedule, TemperatureSchedule};
+
+    let (_, model) = hestia_test_fixture();
+    let schedule = RecoverySchedule::new(5).unwrap();
+    let traces: Vec<_> = (0..model.parameters().len())
+        .map(|index| 1.0 + index as f64)
+        .collect();
+    let sensitivity = HestiaSensitivityProfile::standardized_sigmoid(&traces, 1.0, 1e-12).unwrap();
+    let temperature = TemperatureSchedule::new(schedule, 1.0, 0.01, 0.5, sensitivity).unwrap();
+    let config =
+        tritium_nn::DeviceRecoveryConfig::hestia(schedule, temperature, 2, AdamW::new(2e-3))
+            .unwrap();
+    let tokens = [0_i32, 3];
+    let target = tritium_cuda::train::DeviceTensor::upload(
+        backend,
+        &vec![1.0 / model.architecture().vocab as f32; tokens.len() * model.architecture().vocab],
+    )
+    .unwrap();
+    (model, schedule, config, tokens, target)
+}
+
+#[cfg(feature = "cuda")]
 fn cpu_hestia_logits(
     config: &ModelConfig,
     model: &TiedSwiGluTrainingModel,
@@ -1285,6 +1316,137 @@ fn hestia_device_forward_matches_cpu_oracle_and_master_gradients() {
         max_gradient_error <= 3e-3,
         "HESTIA master-gradient error {max_gradient_error:e}"
     );
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn recovery_session_resumes_hestia_soft_to_packed_hard_bit_identically() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use tritium_nn::{DeviceRecoveryEstimator, DeviceRecoveryPhase, DeviceRecoverySession};
+
+    let Some(backend) =
+        cuda_backend_or_skip("recovery_session_resumes_hestia_soft_to_packed_hard_bit_identically")
+    else {
+        return;
+    };
+    let (model, _, config, tokens, target) = recovery_session_fixture(&backend);
+
+    let mut uninterrupted = DeviceRecoverySession::new(&backend, &model, config.clone()).unwrap();
+    let uninterrupted_receipts: Vec<_> = (0..5)
+        .map(|step| {
+            uninterrupted
+                .step(&tokens, &target)
+                .unwrap_or_else(|error| panic!("uninterrupted step {step}: {error}"))
+        })
+        .collect();
+
+    let mut interrupted = DeviceRecoverySession::new(&backend, &model, config.clone()).unwrap();
+    interrupted.step(&tokens, &target).unwrap();
+    interrupted.step(&tokens, &target).unwrap();
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let checkpoint = std::env::temp_dir().join(format!(
+        "tritium-recovery-resume-{}-{unique}",
+        std::process::id()
+    ));
+    interrupted.save_checkpoint(&checkpoint, 2).unwrap();
+    drop(interrupted);
+
+    let mut resumed = DeviceRecoverySession::new(&backend, &model, config).unwrap();
+    resumed.resume_checkpoint(&checkpoint).unwrap();
+    assert_eq!(resumed.completed_step(), 2);
+    let resumed_receipts: Vec<_> = (2..5)
+        .map(|_| resumed.step(&tokens, &target).unwrap())
+        .collect();
+
+    assert_eq!(resumed_receipts, uninterrupted_receipts[2..]);
+    assert_eq!(
+        uninterrupted_receipts
+            .iter()
+            .map(|receipt| receipt.phase())
+            .collect::<Vec<_>>(),
+        [
+            DeviceRecoveryPhase::Soft,
+            DeviceRecoveryPhase::Soft,
+            DeviceRecoveryPhase::Soft,
+            DeviceRecoveryPhase::Soft,
+            DeviceRecoveryPhase::Hard,
+        ]
+    );
+    assert!(uninterrupted_receipts[..4].iter().all(|receipt| {
+        receipt.estimator() == DeviceRecoveryEstimator::Hestia
+            && receipt.temperature_digest().is_some()
+    }));
+    assert_eq!(
+        uninterrupted_receipts[4].estimator(),
+        DeviceRecoveryEstimator::PackedSte
+    );
+    assert!(uninterrupted_receipts[4].temperature_digest().is_none());
+    assert!(
+        uninterrupted_receipts[4].peak_live_gradient_elements()
+            < uninterrupted_receipts[4].materialized_gradient_elements()
+    );
+    for index in 0..model.parameters().len() {
+        assert_eq!(
+            uninterrupted.download_master(index).unwrap(),
+            resumed.download_master(index).unwrap(),
+            "resumed master {index} differs"
+        );
+    }
+    std::fs::remove_dir_all(checkpoint).unwrap();
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn recovery_session_rejects_missing_or_mismatched_plan_before_loading_checkpoint_state() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use tritium_nn::{DeviceRecoveryConfig, DeviceRecoveryError, DeviceRecoverySession};
+    use tritium_train::AdamW;
+
+    let Some(backend) = cuda_backend_or_skip(
+        "recovery_session_rejects_missing_or_mismatched_plan_before_loading_checkpoint_state",
+    ) else {
+        return;
+    };
+    let (model, schedule, hestia, tokens, target) = recovery_session_fixture(&backend);
+
+    let mut source = DeviceRecoverySession::new(&backend, &model, hestia.clone()).unwrap();
+    source.step(&tokens, &target).unwrap();
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let checkpoint = std::env::temp_dir().join(format!(
+        "tritium-recovery-plan-mismatch-{}-{unique}",
+        std::process::id()
+    ));
+    source.save_checkpoint(&checkpoint, 2).unwrap();
+
+    let packed = DeviceRecoveryConfig::packed_ste(schedule, 2, AdamW::new(2e-3)).unwrap();
+    let mut candidate = DeviceRecoverySession::new(&backend, &model, packed).unwrap();
+    let before: Vec<_> = (0..model.parameters().len())
+        .map(|index| candidate.download_master(index).unwrap())
+        .collect();
+    let error = candidate.resume_checkpoint(&checkpoint).unwrap_err();
+    assert!(matches!(error, DeviceRecoveryError::Plan(_)), "{error}");
+    assert_eq!(candidate.completed_step(), 0);
+    for (index, expected) in before.iter().enumerate() {
+        assert_eq!(candidate.download_master(index).unwrap(), *expected);
+    }
+
+    let plan = checkpoint.join("recovery-plan.json");
+    std::fs::remove_file(&plan).unwrap();
+    let mut missing = DeviceRecoverySession::new(&backend, &model, hestia).unwrap();
+    let error = missing.resume_checkpoint(&checkpoint).unwrap_err();
+    assert!(matches!(error, DeviceRecoveryError::Plan(_)), "{error}");
+    assert_eq!(missing.completed_step(), 0);
+    assert!(!plan.exists(), "resume must not recreate a missing plan");
+
+    std::fs::remove_dir_all(checkpoint).unwrap();
 }
 
 #[cfg(feature = "cuda")]
