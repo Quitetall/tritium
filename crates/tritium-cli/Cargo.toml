@@ -20,6 +20,7 @@ tritium-format = { workspace = true }
 tritium-runtime = { workspace = true }
 # Used directly to render `DeviceCaps` in `list-backends`.
 tritium-spec = { workspace = true }
+tritium-testkit = { workspace = true, optional = true }
 # Linked so its backend self-registration is visible to `list-backends` and used by
 # `generate` (which loads a model on the CPU backend via the runtime registry).
 tritium-cpu = { workspace = true }
@@ -73,7 +74,12 @@ tokenizers = { workspace = true }
 
 [features]
 default = []
-cuda = ["dep:tritium-cuda", "dep:tritium-train", "tritium-nn/cuda"]
+cuda = [
+    "dep:tritium-cuda",
+    "dep:tritium-testkit",
+    "dep:tritium-train",
+    "tritium-nn/cuda",
+]
 nccl = ["cuda", "tritium-cuda/nccl", "dep:libc"]
 # Non-NVIDIA GPU backends, mirroring `cuda`: each links its crate with the feature
 # that turns on that crate's `linkme` registration (`register` for wgpu, `rocm` for

@@ -27,6 +27,11 @@ TOKEN_EVIDENCE_SCHEMA = "tritium.stage7-token-evidence-pack.v1"
 NATIVE_SCHEMA = "tritium.stage7-native-kernels.v1"
 PHYSICAL_SCHEMA = "tritium.stage7-physical-report.v1"
 HESTIA_GATE_SCHEMA = "tritium.stage7-hestia-gate-c.v1"
+HESTIA_V3_VECTOR_PATH = Path("crates/tritium-spec/data/training/v3/vectors/v3.json")
+HESTIA_V3_VECTOR_SHA256 = (
+    "9ab8b18c122e2a3721663894744b766fa213057193c9dcc5ac64f1b362acf20a"
+)
+HESTIA_V3_CASE_COUNT = 5
 MAX_JSON_BYTES = 32 * 1024 * 1024
 MAX_SAFETENSORS_HEADER_BYTES = 128 * 1024 * 1024
 TOKEN_PAYLOAD_BYTES = 4 * 512 * 2_048 * 4
@@ -996,7 +1001,29 @@ def _validate_native(path: Path, campaign: dict[str, Any]) -> bool:
     return not gate_failed
 
 
-def _validate_hestia_gate(path: Path, campaign: dict[str, Any]) -> None:
+def _canonical_hestia_vector_identity(source_root: Path) -> tuple[str, int]:
+    vectors, raw = _load(
+        source_root / HESTIA_V3_VECTOR_PATH,
+        "canonical portable V3 vectors",
+    )
+    digest = hashlib.sha256(raw).hexdigest()
+    if digest != HESTIA_V3_VECTOR_SHA256:
+        raise Stage7Error("canonical portable V3 vector corpus digest differs")
+    cases = vectors.get("cases")
+    if not isinstance(cases, list):
+        raise Stage7Error("canonical portable V3 vectors must contain a case list")
+    hestia_cases = sum(
+        isinstance(case, dict) and case.get("operation") == "graph.hestia_relax"
+        for case in cases
+    )
+    if hestia_cases != HESTIA_V3_CASE_COUNT:
+        raise Stage7Error("canonical V3 corpus must contain exactly five HESTIA cases")
+    return f"sha256:{digest}", hestia_cases
+
+
+def _validate_hestia_gate(
+    path: Path, campaign: dict[str, Any], source_root: Path
+) -> None:
     receipt, _ = _load(path, "HESTIA Gate-C receipt")
     _object(receipt, HESTIA_GATE_FIELDS, "HESTIA Gate-C receipt")
     expected = {
@@ -1023,8 +1050,9 @@ def _validate_hestia_gate(path: Path, campaign: dict[str, Any]) -> None:
     ):
         raise Stage7Error("HESTIA gradcheck receipt differs or fails")
 
-    vector_digest = None
-    vector_case_count = None
+    expected_vector_digest, expected_case_count = _canonical_hestia_vector_identity(
+        source_root
+    )
     for field, backend in (("portable_cpu", "cpu"), ("portable_cuda", "cuda")):
         portable = _object(
             receipt[field], HESTIA_PORTABLE_FIELDS, f"HESTIA portable {backend}"
@@ -1035,7 +1063,7 @@ def _validate_hestia_gate(path: Path, campaign: dict[str, Any]) -> None:
             prefixed=True,
         )
         case_count = _integer(
-            portable["case_count"], f"HESTIA portable {backend} case count", 5
+            portable["case_count"], f"HESTIA portable {backend} case count", 1
         )
         if (
             portable["backend"] != backend
@@ -1052,12 +1080,13 @@ def _validate_hestia_gate(path: Path, campaign: dict[str, Any]) -> None:
             backend == "cuda" and not device.startswith("cuda:")
         ):
             raise Stage7Error(f"HESTIA portable {backend} device differs")
-        if vector_digest is not None and digest != vector_digest:
-            raise Stage7Error("HESTIA portable backends used different vectors")
-        if vector_case_count is not None and case_count != vector_case_count:
-            raise Stage7Error("HESTIA portable backends used different vector counts")
-        vector_digest = digest
-        vector_case_count = case_count
+        if digest != expected_vector_digest:
+            raise Stage7Error(
+                "HESTIA portable backends used different vectors or did not use "
+                "canonical V3 vectors"
+            )
+        if case_count != expected_case_count:
+            raise Stage7Error("HESTIA Gate-C must cover exactly five HESTIA cases")
 
 
 def _validate_partition_provenance(
@@ -1270,7 +1299,7 @@ def _validate_campaign(
             if not _validate_native(receipt_path, campaign):
                 prerequisite_reasons.append("native-kernel-gate-failed")
         else:
-            _validate_hestia_gate(receipt_path, campaign)
+            _validate_hestia_gate(receipt_path, campaign, source_root)
     return (
         campaign, raw, grid, model_id, quantized, preserved,
         len(quantized_tensor_names), quantized_tensor_names, prerequisite_reasons,

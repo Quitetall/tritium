@@ -87,6 +87,18 @@ impl CudaTrainBackendV1 {
         })
     }
 
+    /// CUDA Driver API version bound to physical conformance evidence.
+    #[must_use]
+    pub fn cuda_driver_version(&self) -> u32 {
+        self.backend.cuda_driver_version()
+    }
+
+    /// Compile-time source identity carried by every CUDA training receipt.
+    #[must_use]
+    pub const fn source_identity() -> &'static str {
+        env!("TRITIUM_SOURCE_ID")
+    }
+
     fn execute_dense_matmul(
         &self,
         request: &TrainRequestV1<'_>,

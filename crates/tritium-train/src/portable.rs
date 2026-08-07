@@ -585,6 +585,12 @@ impl CpuTrainBackendV1 {
     pub const fn new() -> Self {
         Self
     }
+
+    /// Compile-time source identity carried by every CPU training receipt.
+    #[must_use]
+    pub const fn source_identity() -> &'static str {
+        env!("TRITIUM_SOURCE_ID")
+    }
 }
 
 impl TrainBackendV1 for CpuTrainBackendV1 {

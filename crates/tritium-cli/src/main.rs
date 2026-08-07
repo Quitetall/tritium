@@ -39,6 +39,8 @@ mod campaign_artifact;
 #[cfg(feature = "nccl")]
 mod campaign_world;
 mod generate;
+#[cfg(feature = "cuda")]
+mod hestia_gate;
 mod inspect;
 #[cfg(feature = "cuda")]
 mod nvml_probe;

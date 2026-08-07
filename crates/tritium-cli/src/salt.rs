@@ -68,6 +68,22 @@ pub(crate) enum SaltCommand {
         #[arg(long)]
         sequence_count: usize,
     },
+    /// Seal source-bound HESTIA analytic and portable CPU/CUDA Gate-C evidence.
+    #[cfg(feature = "cuda")]
+    SealHestiaGateC {
+        /// Release identifier bound by the Stage-7 campaign.
+        #[arg(long)]
+        release: String,
+        /// Exact clean 40-character Git revision compiled into both backends.
+        #[arg(long)]
+        source_revision: String,
+        /// Immutable JSON receipt destination.
+        #[arg(long)]
+        output: PathBuf,
+        /// CUDA device ordinal used for physical conformance.
+        #[arg(long, default_value_t = 0)]
+        cuda_device: usize,
+    },
 }
 
 pub(crate) fn run(command: SaltCommand) -> anyhow::Result<()> {
@@ -97,6 +113,13 @@ pub(crate) fn run(command: SaltCommand) -> anyhow::Result<()> {
             start_sequence,
             sequence_count,
         ),
+        #[cfg(feature = "cuda")]
+        SaltCommand::SealHestiaGateC {
+            release,
+            source_revision,
+            output,
+            cuda_device,
+        } => crate::hestia_gate::seal(&release, &source_revision, &output, cuda_device),
     }
 }
 
@@ -390,29 +413,29 @@ fn path_identity(path: &Path) -> anyhow::Result<PathBuf> {
     Ok(identity)
 }
 
-fn publish_immutable(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+pub(crate) fn publish_immutable(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     match fs::read(path) {
         Ok(existing) => {
             if existing == bytes {
                 return Ok(());
             }
             bail!(
-                "refusing to replace different immutable preflight output {}",
+                "refusing to replace different immutable output {}",
                 path.display()
             );
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error).context("read existing preflight output"),
+        Err(error) => return Err(error).context("read existing immutable output"),
     }
     let parent = path
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
     fs::create_dir_all(parent)
-        .with_context(|| format!("create preflight output directory {}", parent.display()))?;
+        .with_context(|| format!("create immutable output directory {}", parent.display()))?;
     let file_name = path
         .file_name()
-        .context("preflight output has no file name")?;
+        .context("immutable output has no file name")?;
     let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let mut temporary_name = OsString::from(file_name);
     temporary_name.push(format!(".tmp-{}-{sequence}", std::process::id()));
@@ -421,32 +444,32 @@ fn publish_immutable(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
         .write(true)
         .create_new(true)
         .open(&temporary)
-        .with_context(|| format!("create temporary preflight output {}", temporary.display()))?;
+        .with_context(|| format!("create temporary immutable output {}", temporary.display()))?;
     if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
         let _ = fs::remove_file(&temporary);
-        return Err(error).context("write temporary preflight output");
+        return Err(error).context("write temporary immutable output");
     }
     drop(file);
     match fs::hard_link(&temporary, path) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             let existing =
-                fs::read(path).context("read concurrently published preflight output")?;
+                fs::read(path).context("read concurrently published immutable output")?;
             if existing != bytes {
                 let _ = fs::remove_file(&temporary);
-                bail!("concurrent preflight output differs from this admission");
+                bail!("concurrent immutable output differs from this admission");
             }
         }
         Err(error) => {
             let _ = fs::remove_file(&temporary);
-            return Err(error).context("publish immutable preflight output");
+            return Err(error).context("publish immutable output");
         }
     }
-    fs::remove_file(&temporary).context("remove temporary preflight output")?;
+    fs::remove_file(&temporary).context("remove temporary immutable output")?;
     #[cfg(unix)]
     fs::File::open(parent)
         .and_then(|directory| directory.sync_all())
-        .with_context(|| format!("sync preflight output directory {}", parent.display()))?;
+        .with_context(|| format!("sync immutable output directory {}", parent.display()))?;
     Ok(())
 }
 

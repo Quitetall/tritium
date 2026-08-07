@@ -121,7 +121,17 @@ def source_repo(root: Path):
         if "__file__" in MODULE
         else (Path(__file__).resolve().parents[1] / "qualify-stage7-recipe-freeze.py").read_bytes()
     )
-    subprocess.run(["git", "-C", str(repo), "add", "README", "scripts"], check=True)
+    source_vectors = (
+        Path(__file__).resolve().parents[2]
+        / "crates/tritium-spec/data/training/v3/vectors/v3.json"
+    )
+    vectors = repo / "crates/tritium-spec/data/training/v3/vectors/v3.json"
+    vectors.parent.mkdir(parents=True)
+    vectors.write_bytes(source_vectors.read_bytes())
+    subprocess.run(
+        ["git", "-C", str(repo), "add", "README", "scripts", "crates"],
+        check=True,
+    )
     subprocess.run(
         [
             "git", "-C", str(repo), "-c", "user.name=Test",
@@ -521,7 +531,10 @@ def fixture(root: Path):
     native_path = root / "native-receipt.json"
     write_json(native_path, native)
 
-    hestia_vector_digest = "sha256:" + "a" * 64
+    hestia_vector_digest = (
+        "sha256:9ab8b18c122e2a3721663894744b766f"
+        "a213057193c9dcc5ac64f1b362acf20a"
+    )
     hestia_gate = {
         "schema": "tritium.stage7-hestia-gate-c.v1",
         "result": "pass",
@@ -540,7 +553,7 @@ def fixture(root: Path):
             "manifest_version": 3,
             "operation": "graph.hestia_relax",
             "vector_digest": hestia_vector_digest,
-            "case_count": 8,
+            "case_count": 5,
             "physical_device": "cpu",
             "driver": "rust-reference",
         },
@@ -550,7 +563,7 @@ def fixture(root: Path):
             "manifest_version": 3,
             "operation": "graph.hestia_relax",
             "vector_digest": hestia_vector_digest,
-            "case_count": 8,
+            "case_count": 5,
             "physical_device": "cuda:0:GPU-1",
             "driver": "999.1",
         },
@@ -1451,6 +1464,55 @@ class Stage7RecipeFreezeTests(unittest.TestCase):
                 qualify(
                     state["campaign_path"],
                     state["trace_path"],
+                    model_root=state["model_root"],
+                    smoke_model_root=state["smoke_model_root"],
+                    source_root=state["source"],
+                )
+
+    def test_rejects_hestia_gate_c_noncanonical_v3_vectors(self):
+        with tempfile.TemporaryDirectory() as raw:
+            state = fixture(Path(raw))
+            gate_path = Path(raw) / "hestia-gate-c.json"
+            gate = json.loads(gate_path.read_bytes())
+            fabricated = "sha256:" + "a" * 64
+            gate["portable_cpu"]["vector_digest"] = fabricated
+            gate["portable_cuda"]["vector_digest"] = fabricated
+            write_json(gate_path, gate)
+            state["campaign"]["evidence"][2].update(
+                file_record(Path(raw), gate_path.name, gate_path.read_bytes())
+            )
+            write_json(state["campaign_path"], state["campaign"])
+            state["trace"]["campaign_sha256"] = hashlib.sha256(
+                state["campaign_path"].read_bytes()
+            ).hexdigest()
+            write_json(state["trace_path"], state["trace"])
+            with self.assertRaisesRegex(Stage7Error, "canonical V3 vectors"):
+                qualify(
+                    state["campaign_path"], state["trace_path"],
+                    model_root=state["model_root"],
+                    smoke_model_root=state["smoke_model_root"],
+                    source_root=state["source"],
+                )
+
+    def test_rejects_hestia_gate_c_noncanonical_case_count(self):
+        with tempfile.TemporaryDirectory() as raw:
+            state = fixture(Path(raw))
+            gate_path = Path(raw) / "hestia-gate-c.json"
+            gate = json.loads(gate_path.read_bytes())
+            gate["portable_cpu"]["case_count"] = 8
+            gate["portable_cuda"]["case_count"] = 8
+            write_json(gate_path, gate)
+            state["campaign"]["evidence"][2].update(
+                file_record(Path(raw), gate_path.name, gate_path.read_bytes())
+            )
+            write_json(state["campaign_path"], state["campaign"])
+            state["trace"]["campaign_sha256"] = hashlib.sha256(
+                state["campaign_path"].read_bytes()
+            ).hexdigest()
+            write_json(state["trace_path"], state["trace"])
+            with self.assertRaisesRegex(Stage7Error, "exactly five HESTIA cases"):
+                qualify(
+                    state["campaign_path"], state["trace_path"],
                     model_root=state["model_root"],
                     smoke_model_root=state["smoke_model_root"],
                     source_root=state["source"],

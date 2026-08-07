@@ -20,6 +20,17 @@ pub struct GradCheckFail {
     pub numeric: f32,
 }
 
+/// Measured error envelope for one successful finite-difference check.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GradCheckReport {
+    /// Input ordinals checked, in caller-supplied order.
+    pub checked_inputs: Vec<usize>,
+    /// Total scalar partial derivatives compared.
+    pub checked_elements: usize,
+    /// Largest `|analytic-numeric| / max(1, |numeric|)` observed.
+    pub max_relative_error: f32,
+}
+
 /// Gradient-check configuration.
 #[derive(Clone, Copy, Debug)]
 pub struct GradCheckCfg {
@@ -79,6 +90,24 @@ where
     F: Fn(&[&[f32]]) -> Vec<f32>,
     V: Fn(&[&[f32]], &[f32]) -> Vec<Vec<f32>>,
 {
+    check_op_report(forward, vjp, inputs, wrt, cfg).map(|_| ())
+}
+
+/// Compare an op's analytic VJP and return its measured passing envelope.
+///
+/// This executes the same check as [`check_op`] while retaining the maximum
+/// normalized error needed by source-bound release receipts.
+pub fn check_op_report<F, V>(
+    forward: F,
+    vjp: V,
+    inputs: &[Vec<f32>],
+    wrt: &[usize],
+    cfg: GradCheckCfg,
+) -> Result<GradCheckReport, GradCheckFail>
+where
+    F: Fn(&[&[f32]]) -> Vec<f32>,
+    V: Fn(&[&[f32]], &[f32]) -> Vec<Vec<f32>>,
+{
     let refs: Vec<&[f32]> = inputs.iter().map(Vec::as_slice).collect();
     let out_len = forward(&refs).len();
     let r = cotangent(cfg.seed, out_len);
@@ -87,6 +116,8 @@ where
         |ins: &[&[f32]]| -> f32 { forward(ins).iter().zip(&r).map(|(&y, &ri)| y * ri).sum() };
 
     let analytic = vjp(&refs, &r);
+    let mut checked_elements = 0usize;
+    let mut max_relative_error = 0.0f32;
 
     for &wi in wrt {
         let n = inputs[wi].len();
@@ -99,7 +130,7 @@ where
             let mr: Vec<&[f32]> = minus.iter().map(Vec::as_slice).collect();
             let numeric = (scalar(&pr) - scalar(&mr)) / (2.0 * cfg.h);
             let a = analytic[wi][i];
-            if !cfg.tol.accepts(a, numeric) {
+            if !a.is_finite() || !numeric.is_finite() || !cfg.tol.accepts(a, numeric) {
                 return Err(GradCheckFail {
                     input: wi,
                     index: i,
@@ -107,7 +138,47 @@ where
                     numeric,
                 });
             }
+            max_relative_error =
+                max_relative_error.max((a - numeric).abs() / numeric.abs().max(1.0));
+            checked_elements += 1;
         }
     }
-    Ok(())
+    Ok(GradCheckReport {
+        checked_inputs: wrt.to_vec(),
+        checked_elements,
+        max_relative_error,
+    })
+}
+
+/// Execute ADR-0035's canonical HESTIA Gate-C fixture.
+///
+/// Gate C checks every weight derivative plus the scalar temperature
+/// derivative. Per-row scale remains stop-gradient by contract.
+pub fn hestia_gate_c_report() -> Result<GradCheckReport, GradCheckFail> {
+    const ROWS: usize = 3;
+    const COLS: usize = 5;
+    let inputs = vec![
+        seeded(21, ROWS * COLS, -2.0, 2.0),
+        seeded(22, ROWS, 0.5, 1.5),
+        vec![0.7],
+    ];
+    check_op_report(
+        |ins| crate::ops::hestia::hestia_forward(ins[0], ins[1], ins[2], ROWS, COLS),
+        |ins, grad| crate::ops::hestia::hestia_vjp(ins[0], ins[1], ins[2], ROWS, COLS, grad),
+        &inputs,
+        &[0, 2],
+        GradCheckCfg::default(),
+    )
+}
+
+fn seeded(seed: u64, count: usize, low: f32, high: f32) -> Vec<f32> {
+    let mut state = seed | 1;
+    (0..count)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            low + (state % 1000) as f32 / 1000.0 * (high - low)
+        })
+        .collect()
 }

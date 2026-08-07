@@ -6,7 +6,7 @@
 //! records. The τ-limits, odd symmetry, and the zero-scale/stop-gradient conventions are pinned
 //! alongside.
 
-use tritium_train::gradcheck::{GradCheckCfg, check_op};
+use tritium_train::gradcheck::hestia_gate_c_report;
 use tritium_train::ops::{hestia, ste};
 use tritium_train::tape::Tape;
 
@@ -27,20 +27,17 @@ const COLS: usize = 5;
 
 #[test]
 fn hestia_grads_match_finite_difference() {
-    // Random inputs anywhere on the line are valid — no kink placement (contrast gradcheck_lsq).
-    // wrt = [Wf, τ]; the scale (input 1) is stop-gradient by design, pinned separately below.
-    let wf = seeded(21, ROWS * COLS, -2.0, 2.0);
-    let s = seeded(22, ROWS, 0.5, 1.5);
-    let tau = vec![0.7f32];
-    let inputs = vec![wf, s, tau];
-    check_op(
-        |ins| hestia::hestia_forward(ins[0], ins[1], ins[2], ROWS, COLS),
-        |ins, g| hestia::hestia_vjp(ins[0], ins[1], ins[2], ROWS, COLS, g),
-        &inputs,
-        &[0, 2],
-        GradCheckCfg::default(),
-    )
-    .expect("HESTIA vjp must equal the forward's central finite difference");
+    hestia_gate_c_report().expect("HESTIA vjp must equal the forward's central finite difference");
+}
+
+#[test]
+fn hestia_gradcheck_reports_both_inputs_and_measured_error() {
+    let report = hestia_gate_c_report().expect("HESTIA report must retain the analytic check");
+
+    assert_eq!(report.checked_inputs, vec![0, 2]);
+    assert_eq!(report.checked_elements, ROWS * COLS + 1);
+    assert!(report.max_relative_error.is_finite());
+    assert!(report.max_relative_error <= 2e-3);
 }
 
 #[test]
