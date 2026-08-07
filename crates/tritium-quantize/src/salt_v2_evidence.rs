@@ -1118,6 +1118,47 @@ impl SaltV2KroneckerEvidence {
         self.record_digest
     }
 
+    /// Derive HESTIA's tensor sensitivity proxy from this S2KF record.
+    ///
+    /// The frozen proxy is `input-Gram trace * output-Fisher mean`. Damping is
+    /// excluded: it stabilizes fitting but is not observed curvature. Input-only
+    /// Hessian evidence cannot supply the required output-Fisher signal.
+    ///
+    /// # Errors
+    /// Rejects input-only evidence or non-positive/non-finite derived arithmetic.
+    pub fn hestia_trace_proxy(&self) -> Result<f64, SaltV2KroneckerEvidenceError> {
+        if !matches!(
+            self.kind,
+            SaltV2Curvature::GuidedFisher | SaltV2Curvature::ForwardKlKronecker
+        ) {
+            return Err(SaltV2KroneckerEvidenceError::Malformed(
+                "HESTIA sensitivity requires output-Fisher evidence",
+            ));
+        }
+        let mut input_trace = 0.0_f64;
+        for group in &self.input_groups {
+            let dimension = group.dimension();
+            for index in 0..dimension {
+                input_trace += group.as_slice()[index * dimension + index];
+            }
+        }
+        let output_mean =
+            self.output_weights.iter().sum::<f64>() / self.output_weights.len() as f64;
+        let proxy = input_trace * output_mean;
+        if !input_trace.is_finite()
+            || !output_mean.is_finite()
+            || !proxy.is_finite()
+            || input_trace <= 0.0
+            || output_mean <= 0.0
+            || proxy <= 0.0
+        {
+            return Err(SaltV2KroneckerEvidenceError::Malformed(
+                "HESTIA sensitivity proxy",
+            ));
+        }
+        Ok(proxy)
+    }
+
     /// Exact canonical identity and encoded length without materializing bytes.
     ///
     /// # Errors

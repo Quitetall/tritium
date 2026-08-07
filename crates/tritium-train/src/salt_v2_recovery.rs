@@ -5,6 +5,8 @@
 //! those mechanics outside the policy makes the training receipt replayable and
 //! lets callers reject invalid schedules before allocating accelerator time.
 
+use crate::temp::{HestiaSensitivityProfile, TempSchedule, TemperatureError};
+
 /// The two fixed SALT V2 recovery phases.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecoveryPhase {
@@ -213,6 +215,94 @@ impl BypassSchedule {
         }
         let remaining = self.zero_at_step - step;
         Ok(self.initial_fraction * remaining as f64 / self.zero_at_step as f64)
+    }
+}
+
+/// Sensitivity-aware HESTIA temperature policy for the soft recovery phase.
+///
+/// The frozen formula is `tau_i(t) = tau_bar(t) * exp(alpha * score_i)`.
+/// The base schedule retains its frozen initial value and floor. At the exact
+/// 80% boundary, recovery enters the untouched hard phase, returns the floor,
+/// and no longer executes the relaxation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TemperatureSchedule {
+    recovery: RecoverySchedule,
+    base: TempSchedule,
+    tau_floor: f64,
+    sensitivity_alpha: f64,
+    sensitivity: HestiaSensitivityProfile,
+}
+
+impl TemperatureSchedule {
+    /// Build the frozen exponential HESTIA schedule over one recovery run.
+    ///
+    /// # Errors
+    /// Rejects invalid temperatures, alpha, sensitivity profiles, exponential
+    /// overflow, or a base schedule that cannot reach the common floor by the
+    /// hard boundary.
+    pub fn new(
+        recovery: RecoverySchedule,
+        tau_initial: f64,
+        tau_floor: f64,
+        sensitivity_alpha: f64,
+        sensitivity: HestiaSensitivityProfile,
+    ) -> Result<Self, TemperatureError> {
+        if sensitivity.scores().is_empty() {
+            return Err(TemperatureError::InvalidConfiguration(
+                "temperature sensitivity profile cannot be empty",
+            ));
+        }
+        if !sensitivity_alpha.is_finite() || sensitivity_alpha < 0.0 {
+            return Err(TemperatureError::InvalidConfiguration(
+                "temperature sensitivity alpha must be finite and non-negative",
+            ));
+        }
+        let maximum_scale = sensitivity_alpha.exp();
+        if !maximum_scale.is_finite() {
+            return Err(TemperatureError::InvalidConfiguration(
+                "temperature sensitivity scale overflows",
+            ));
+        }
+        let base = TempSchedule::new(tau_initial, tau_floor, recovery.hard_start_step())?;
+        Ok(Self {
+            recovery,
+            base,
+            tau_floor,
+            sensitivity_alpha,
+            sensitivity,
+        })
+    }
+
+    /// Effective temperature for one tensor and optimizer step.
+    ///
+    /// # Errors
+    /// Rejects a tensor ordinal outside the bound sensitivity inventory or a
+    /// step outside the recovery schedule.
+    pub fn tau_at(&self, tensor: usize, step: u64) -> Result<f64, TemperatureError> {
+        let score = self.sensitivity.score(tensor)?;
+        let phase = self
+            .recovery
+            .phase_at(step)
+            .map_err(|_| TemperatureError::StepOutOfRange {
+                step,
+                total_steps: self.recovery.total_steps(),
+            })?;
+        if phase == RecoveryPhase::Hard {
+            return Ok(self.tau_floor);
+        }
+        let scaled = self.base.tau(step) * (self.sensitivity_alpha * score).exp();
+        if !scaled.is_finite() {
+            return Err(TemperatureError::InvalidConfiguration(
+                "effective tensor temperature is not finite",
+            ));
+        }
+        Ok(scaled.max(self.tau_floor))
+    }
+
+    /// Ordered standardized sensitivity scores bound to this schedule.
+    #[must_use]
+    pub fn sensitivity_scores(&self) -> &[f64] {
+        self.sensitivity.scores()
     }
 }
 

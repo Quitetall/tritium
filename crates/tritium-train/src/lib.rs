@@ -29,6 +29,7 @@ pub mod optim;
 pub mod portable;
 pub mod salt_v2_recovery;
 pub mod tape;
+pub mod temp;
 pub mod value;
 
 pub use checkpoint::{Checkpoint, CheckpointError, LeafCheckpoint};
@@ -56,7 +57,8 @@ pub use salt_v2_recovery::{
     RecoveryPredecessorEvidence, RecoveryPromotionEvidence, RecoveryPromotionGate,
     RecoveryPromotionOutcome, RecoveryReceipt, RecoveryRun, RecoverySchedule,
     RecoverySelectedCheckpoint, RecoverySourceModel, RecoverySourceModelId, RecoveryTrack,
-    StepObservation,
+    StepObservation, TemperatureSchedule,
 };
 pub use tape::{Tape, ValueId};
+pub use temp::{HestiaSensitivityProfile, TempSchedule, TemperatureError};
 pub use value::Shape;
