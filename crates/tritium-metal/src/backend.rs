@@ -245,12 +245,16 @@ impl MetalBackend {
         let f_attn_v3 = attn_library
             .get_function("gqa_attention_batch_v3_f32", None)
             .map_err(|e| {
-                BackendError::Backend(format!("missing `gqa_attention_batch_v3_f32` function: {e}"))
+                BackendError::Backend(format!(
+                    "missing `gqa_attention_batch_v3_f32` function: {e}"
+                ))
             })?;
         let pipeline_attn_v3 = device
             .new_compute_pipeline_state_with_function(&f_attn_v3)
             .map_err(|e| {
-                BackendError::Backend(format!("pipeline state for `gqa_attention_batch_v3_f32`: {e}"))
+                BackendError::Backend(format!(
+                    "pipeline state for `gqa_attention_batch_v3_f32`: {e}"
+                ))
             })?;
 
         Ok(MetalBackend {
@@ -853,8 +857,12 @@ mod tests {
             (s as f32 / u64::MAX as f32) * 2.0 - 1.0
         };
         let q: Vec<f32> = (0..m * n_head * head_dim).map(|_| next()).collect();
-        let k: Vec<f32> = (0..ctx_top * n_head_kv * head_dim).map(|_| next()).collect();
-        let v: Vec<f32> = (0..ctx_top * n_head_kv * head_dim).map(|_| next()).collect();
+        let k: Vec<f32> = (0..ctx_top * n_head_kv * head_dim)
+            .map(|_| next())
+            .collect();
+        let v: Vec<f32> = (0..ctx_top * n_head_kv * head_dim)
+            .map(|_| next())
+            .collect();
         (q, k, v)
     }
 

@@ -126,7 +126,9 @@ pub fn validate_v3_launch(
         ));
     }
     if !n_head.is_multiple_of(n_head_kv) {
-        return Err(format!("n_head {n_head} not a multiple of n_head_kv {n_head_kv}"));
+        return Err(format!(
+            "n_head {n_head} not a multiple of n_head_kv {n_head_kv}"
+        ));
     }
     let ctx_top = causal_offset
         .checked_add(m)
@@ -144,17 +146,23 @@ pub fn validate_v3_launch(
         return Err(format!("q len {q_len} != m*n_head*head_dim = {q_expect}"));
     }
     if out_len != q_expect {
-        return Err(format!("out len {out_len} != m*n_head*head_dim = {q_expect}"));
+        return Err(format!(
+            "out len {out_len} != m*n_head*head_dim = {q_expect}"
+        ));
     }
     let kv_min = ctx_top
         .checked_mul(n_head_kv)
         .and_then(|x| x.checked_mul(head_dim))
         .ok_or_else(|| "kv arena length ctx_top*n_head_kv*head_dim overflows".to_owned())?;
     if k_len < kv_min {
-        return Err(format!("k len {k_len} < ctx_top*n_head_kv*head_dim = {kv_min}"));
+        return Err(format!(
+            "k len {k_len} < ctx_top*n_head_kv*head_dim = {kv_min}"
+        ));
     }
     if v_len < kv_min {
-        return Err(format!("v len {v_len} < ctx_top*n_head_kv*head_dim = {kv_min}"));
+        return Err(format!(
+            "v len {v_len} < ctx_top*n_head_kv*head_dim = {kv_min}"
+        ));
     }
     // The kernel takes its scalars as u32 (`AttnV3Params`) and widens per-row
     // bases to 64 bits in-kernel (the v0.6.9 discipline); reject anything that
@@ -230,7 +238,8 @@ pub fn gqa_attention_prefill_ref(
             weights.clear();
             weights.reserve(ctx);
             for j in 0..ctx {
-                let k_row = &k[(j * n_head_kv + kv) * head_dim..(j * n_head_kv + kv) * head_dim + head_dim];
+                let k_row =
+                    &k[(j * n_head_kv + kv) * head_dim..(j * n_head_kv + kv) * head_dim + head_dim];
                 let mut dot = 0.0f32;
                 for d in 0..head_dim {
                     let prod = q_row[d] * k_row[d];
@@ -338,18 +347,85 @@ mod tests {
         );
         assert_eq!(ok, Ok(()));
         // n_head not a multiple of n_head_kv.
-        assert!(validate_v3_launch(5 * 7 * 64, 5 * 2 * 64, 5 * 2 * 64, 5 * 7 * 64, 5, 7, 2, 64, 0, 5).is_err());
+        assert!(
+            validate_v3_launch(
+                5 * 7 * 64,
+                5 * 2 * 64,
+                5 * 2 * 64,
+                5 * 7 * 64,
+                5,
+                7,
+                2,
+                64,
+                0,
+                5
+            )
+            .is_err()
+        );
         // ctx_top exceeds ctx_max.
-        assert!(validate_v3_launch(5 * 8 * 64, 5 * 2 * 64, 5 * 2 * 64, 5 * 8 * 64, 4, 8, 2, 64, 0, 5).is_err());
+        assert!(
+            validate_v3_launch(
+                5 * 8 * 64,
+                5 * 2 * 64,
+                5 * 2 * 64,
+                5 * 8 * 64,
+                4,
+                8,
+                2,
+                64,
+                0,
+                5
+            )
+            .is_err()
+        );
         // Short K arena.
-        assert!(validate_v3_launch(5 * 8 * 64, 4 * 2 * 64, 5 * 2 * 64, 5 * 8 * 64, 5, 8, 2, 64, 0, 5).is_err());
+        assert!(
+            validate_v3_launch(
+                5 * 8 * 64,
+                4 * 2 * 64,
+                5 * 2 * 64,
+                5 * 8 * 64,
+                5,
+                8,
+                2,
+                64,
+                0,
+                5
+            )
+            .is_err()
+        );
         // Wrong q length.
-        assert!(validate_v3_launch(5 * 8 * 64 - 1, 5 * 2 * 64, 5 * 2 * 64, 5 * 8 * 64, 5, 8, 2, 64, 0, 5).is_err());
+        assert!(
+            validate_v3_launch(
+                5 * 8 * 64 - 1,
+                5 * 2 * 64,
+                5 * 2 * 64,
+                5 * 8 * 64,
+                5,
+                8,
+                2,
+                64,
+                0,
+                5
+            )
+            .is_err()
+        );
         // m = 0.
         assert!(validate_v3_launch(0, 0, 0, 0, 5, 8, 2, 64, 0, 0).is_err());
         // Oversized arenas are allowed (KV arenas may be over-allocated).
         assert_eq!(
-            validate_v3_launch(5 * 8 * 64, 9 * 2 * 64, 9 * 2 * 64, 5 * 8 * 64, 9, 8, 2, 64, 0, 5),
+            validate_v3_launch(
+                5 * 8 * 64,
+                9 * 2 * 64,
+                9 * 2 * 64,
+                5 * 8 * 64,
+                9,
+                8,
+                2,
+                64,
+                0,
+                5
+            ),
             Ok(())
         );
     }
@@ -377,8 +453,12 @@ mod tests {
             (s as f32 / u64::MAX as f32) * 2.0 - 1.0
         };
         let q: Vec<f32> = (0..m * n_head * head_dim).map(|_| next()).collect();
-        let k: Vec<f32> = (0..ctx_top * n_head_kv * head_dim).map(|_| next()).collect();
-        let v: Vec<f32> = (0..ctx_top * n_head_kv * head_dim).map(|_| next()).collect();
+        let k: Vec<f32> = (0..ctx_top * n_head_kv * head_dim)
+            .map(|_| next())
+            .collect();
+        let v: Vec<f32> = (0..ctx_top * n_head_kv * head_dim)
+            .map(|_| next())
+            .collect();
         (q, k, v)
     }
 
@@ -444,10 +524,28 @@ mod tests {
             let mut got = vec![0.0f32; m * n_head * head_dim];
             let mut want = vec![0.0f32; m * n_head * head_dim];
             gqa_attention_prefill_ref(
-                &q, &k, &v, &mut got, n_head, n_head_kv, head_dim, scale, causal_offset, m,
+                &q,
+                &k,
+                &v,
+                &mut got,
+                n_head,
+                n_head_kv,
+                head_dim,
+                scale,
+                causal_offset,
+                m,
             );
             oracle_f64(
-                &q, &k, &v, &mut want, n_head, n_head_kv, head_dim, scale, causal_offset, m,
+                &q,
+                &k,
+                &v,
+                &mut want,
+                n_head,
+                n_head_kv,
+                head_dim,
+                scale,
+                causal_offset,
+                m,
             );
             for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
                 let denom = w.abs().max(1.0);
@@ -470,7 +568,16 @@ mod tests {
         let scale = 1.0 / (head_dim as f32).sqrt();
         let mut batch = vec![0.0f32; m * n_head * head_dim];
         gqa_attention_prefill_ref(
-            &q, &k, &v, &mut batch, n_head, n_head_kv, head_dim, scale, causal_offset, m,
+            &q,
+            &k,
+            &v,
+            &mut batch,
+            n_head,
+            n_head_kv,
+            head_dim,
+            scale,
+            causal_offset,
+            m,
         );
         for r in 0..m {
             let q_row = &q[r * n_head * head_dim..(r + 1) * n_head * head_dim];
