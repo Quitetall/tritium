@@ -88,9 +88,21 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      # nbformat: the only third-party dependency in scripts/tests (colab
-      # notebook generator); everything else is stdlib.
+      # nbformat: the colab notebook generator's dependency. The Stage-7
+      # qualifier's semantic verification additionally imports the BUILT
+      # tritium-py native module (897f2f4: `from tritium import _tritium` in
+      # _verify_salt_v2_package) — the tests construct real packages that only
+      # the native verifier can check, so CI builds the real wheel (default
+      # features, no cuda; the wheels workflow's exact maturin invocation)
+      # instead of stubbing the verifier and losing the format-drift teeth.
       - run: python -m pip install nbformat
+      - uses: dtolnay/rust-toolchain@stable
+      - name: build tritium-py wheel (Stage-7 semantic verifier)
+        uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release --manifest-path crates/tritium-py/Cargo.toml --out dist
+      - run: python -m pip install dist/*.whl
       - run: python -m unittest discover -s scripts/tests -p 'test_*.py' -v
       - run: python scripts/check-release-version.py
       - run: python scripts/generate-compatibility.py --check
