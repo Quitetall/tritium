@@ -1,6 +1,6 @@
 # RFC 0001 — The relaxed decode numerics tier (`TRITIUM_KERNEL_TIER=fast`, second attempt)
 
-Status: **ACCEPTED** (2026-08-08, Brian) — L3b and the L8 flash-prefill rewrite are unblocked under this contract.
+Status: **ACCEPTED** (2026-08-08, Brian); **Amendment 1 ACCEPTED** (2026-08-08, Brian) — the drift bar re-scoped to the kernel output + quality triplet after L3b's structural finding (see the amended decision below). L3b is ADOPTED under the amended contract.
 Authorized by [ADR 0036](../adr/0036-decode-endgame.md) § "The numerics RFC";
 per that ADR, **accepted or rejected both close the item**, and L3b (online-softmax
 fused decode attention) plus the L8 flash-prefill rewrite stay blocked until this
@@ -88,22 +88,34 @@ Eligible kernel classes (each still needs its own measured adoption, below):
 | level | bar | source of the number |
 |---|---|---|
 | kernel vs exact twin | max rel err ≤ **1e-4** on the kernel's outputs, asserted in the kernel's gate | the shipped split_partial/combine pair's bar (T3b wired "the shipped 1e-4 pair"); the f16 head precedent sits at ~1e-5 rel (decode.cu:3072-3079) |
-| e2e logit drift vs host exact oracle | rel err ≤ **2e-3** on final logits over the parity corpus | the `cpu_cuda_parity` bar T3b failed at 2.29e-2 — see the decision below |
+| drift at the fast kernel's OUTPUT vs the exact twin, in situ | max rel err ≤ **1e-4** at the swapped kernel's output inside a real forward | Amendment 1 (2026-08-08) — see the decision below; the original final-logits 2e-3 leg is retired for activation-quantized trunks |
 | e2e perplexity | ppl(fast)/ppl(exact) ≤ **1.001** on the 5100-position teacher-forced WT-103 harness | the ADR 0036 L2 gate bar, already exercised (i8 head passed at 1.000609) |
 | greedy tokens | fast tier == exact tier token-for-token over the **256-token** acceptance horizon; vs transformers, the ≥96-token exact-prefix gate unchanged | ADR 0023's gate (rmsnorm_fast passed 256/256); ADR 0018 re-baseline note |
 | spec quality | τ measured; adoption requires τ unchanged within noise **for any spec-default claim** | round 26 addendum 3 (−4.1% τ deterministic sank a +7.75% kernel win) |
 
-**Decision on the 2e-3 bar (the T3b question).** The bar applies to the **tier**,
-not just to T3b. `cpu_cuda_parity`'s bit-equality leg cannot apply (the CPU host
-has no fast twin, and building one per fast kernel is exactly the cross-backend
-sprawl ADR 0018 exists to avoid), but its 2e-3 numeric envelope is the drift
-metric every downstream gate implicitly trusts, and T3b's 2.29e-2 was a symptom
-of real accumulated error (63 identity partials), not a gate technicality. So:
-the fast tier does **not** run the bit-parity leg; it **must** hold rel err
-≤ 2e-3 on final logits vs the host exact oracle, asserted by a tier-specific
-gate over the same parity corpus. A fast kernel that is 1e-4-clean in isolation
-but composes past 2e-3 e2e is rejected — that is precisely the failure T3b
-demonstrated.
+**Decision on the 2e-3 bar — AMENDED (Amendment 1, 2026-08-08, owner
+decision).** The RFC as proposed bounded final-logit drift at 2e-3 (the
+`cpu_cuda_parity` envelope) and diagnosed T3b's 2.29e-2 as accumulated error
+from 63 identity partials. The first consumer's measurement refuted both
+premises (L3b, 917b037, `cuda_l3b_drift_diagnostic`): the trunk re-quantizes
+activations to i8 four times per layer, so ANY sub-lattice perturbation — the
+fused kernel's measured 1.9e-5 included — re-rounds a fraction of the 2560
+dims per quant, and 30 layers of ~1/127-scale re-rounding accumulate to a
+~1e-2 relative final-logit floor INDEPENDENT of kernel accuracy (the
+exact-vs-exact control drifts 0.0; the drift is broad, on every node, with
+argmax preserved everywhere). T3b's 2.29e-2 was this same floor, not its
+partials. A final-logits bar under this floor is unreachable for every kernel
+this RFC exists to enable.
+
+Amended contract: the drift bound moves to where it is meaningful — the
+swapped kernel's OWN output measured in situ (≤ 1e-4 max rel vs the exact
+twin inside a real forward, not just the isolated-kernel gate) — and the e2e
+leg becomes the quality triplet this campaign's evidence shows is operative:
+ppl ratio ≤ 1.001, greedy 256-token identity vs the exact tier, and τ
+unchanged for any spec claim. A fast kernel that is 1e-4-clean at its output
+but breaks any triplet member is rejected. The retired final-logits number is
+still REPORTED (not gated) in every adoption record so the floor stays
+visible.
 
 ### The spec-path interaction clause (mandatory)
 
