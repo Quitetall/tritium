@@ -4130,6 +4130,140 @@ fn rmsnorm_quant_bit_matches_host() {
     );
 }
 
+/// ADR 0036 L5 gate: the fused `rmsnorm_quant_batch_i8` must be BIT-identical
+/// to the split `rmsnorm_batch_f32` → `act_quant_batch_i8` pair it replaces at
+/// every norm→quant seam of the batch/tree trunk — i8 activations byte-equal,
+/// per-row scales equal by `to_bits`. Shapes cover the 2B4T trunk widths
+/// (n_embd 2560, n_ff 6912-ish via 1536) at verify-scale m, plus m=1 and an
+/// all-zero row (the gamma==0 branch).
+#[test]
+fn rmsnorm_quant_batch_matches_split_pair_bitwise() {
+    use cudarc::driver::{CudaContext, LaunchConfig, PushKernelArg};
+    use cudarc::nvrtc::Ptx;
+
+    let ctx = match CudaContext::new(0) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("skipping rmsnorm_quant_batch gate: no device ({e})");
+            return;
+        }
+    };
+    let stream = ctx.default_stream();
+    let dm = ctx
+        .load_module(Ptx::from_src(DECODE_PTX))
+        .expect("load decode module");
+    let f_rmsnorm = dm.load_function("rmsnorm_batch_f32").expect("rmsnorm fn");
+    let f_quant = dm.load_function("act_quant_batch_i8").expect("quant fn");
+    let f_fused = dm
+        .load_function("rmsnorm_quant_batch_i8")
+        .expect("fused fn");
+
+    let mut s = 0x0036_51AB_C0DE_F00Du64;
+    let mut next = move || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        ((s >> 11) as f32 / (1u64 << 53) as f32) * 4.0 - 2.0
+    };
+    let eps = 1e-5f32;
+    for (n, m) in [(2560usize, 48usize), (1536, 13), (2560, 1), (256, 3)] {
+        let mut x: Vec<f32> = (0..m * n).map(|_| next()).collect();
+        // Row 0 all-zero when m > 1: exercises the gamma==0 branch in batch.
+        if m > 1 {
+            x[..n].fill(0.0);
+        }
+        let w: Vec<f32> = (0..n).map(|_| next()).collect();
+        let d_x = stream.clone_htod(&x).expect("x htod");
+        let d_w = stream.clone_htod(&w).expect("w htod");
+        let mut d_normed = stream.alloc_zeros::<f32>(m * n).expect("normed");
+        let mut d_q_split = stream.alloc_zeros::<i8>(m * n).expect("q split");
+        let mut d_sc_split = stream.alloc_zeros::<f32>(m).expect("sc split");
+        let mut d_q_fused = stream.alloc_zeros::<i8>(m * n).expect("q fused");
+        let mut d_sc_fused = stream.alloc_zeros::<f32>(m).expect("sc fused");
+        let (n_i, m_i) = (n as i32, m as i32);
+
+        // Split pair: rmsnorm_batch_f32 → act_quant_batch_i8.
+        let norm_cfg = LaunchConfig {
+            grid_dim: (m as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: (n * 4) as u32,
+        };
+        let mut l = stream.launch_builder(&f_rmsnorm);
+        l.arg(&d_x)
+            .arg(&d_w)
+            .arg(&eps)
+            .arg(&n_i)
+            .arg(&m_i)
+            .arg(&mut d_normed);
+        // SAFETY: `rmsnorm_batch_f32(x, w, eps, n, m, out)`.
+        #[allow(unsafe_code)]
+        unsafe { l.launch(norm_cfg) }.expect("launch rmsnorm_batch");
+        let quant_cfg = LaunchConfig {
+            grid_dim: (m as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut l = stream.launch_builder(&f_quant);
+        l.arg(&d_normed)
+            .arg(&n_i)
+            .arg(&m_i)
+            .arg(&mut d_q_split)
+            .arg(&mut d_sc_split);
+        // SAFETY: `act_quant_batch_i8(act, k, m, q_out, act_scale)`.
+        #[allow(unsafe_code)]
+        unsafe { l.launch(quant_cfg) }.expect("launch act_quant_batch");
+
+        // Fused twin.
+        let mut l = stream.launch_builder(&f_fused);
+        l.arg(&d_x)
+            .arg(&d_w)
+            .arg(&eps)
+            .arg(&n_i)
+            .arg(&m_i)
+            .arg(&mut d_q_fused)
+            .arg(&mut d_sc_fused);
+        // SAFETY: `rmsnorm_quant_batch_i8(x, w, eps, n, m, q_out, act_scale)`.
+        #[allow(unsafe_code)]
+        unsafe { l.launch(norm_cfg) }.expect("launch rmsnorm_quant_batch");
+
+        let mut q_split = vec![0i8; m * n];
+        let mut q_fused = vec![0i8; m * n];
+        let mut sc_split = vec![0.0f32; m];
+        let mut sc_fused = vec![0.0f32; m];
+        stream.memcpy_dtoh(&d_q_split, &mut q_split).expect("dtoh");
+        stream.memcpy_dtoh(&d_q_fused, &mut q_fused).expect("dtoh");
+        stream
+            .memcpy_dtoh(&d_sc_split, &mut sc_split)
+            .expect("dtoh");
+        stream
+            .memcpy_dtoh(&d_sc_fused, &mut sc_fused)
+            .expect("dtoh");
+        stream.synchronize().expect("sync");
+
+        for r in 0..m {
+            assert_eq!(
+                sc_split[r].to_bits(),
+                sc_fused[r].to_bits(),
+                "act_scale drift n={n} m={m} row {r}: split {} fused {}",
+                sc_split[r],
+                sc_fused[r]
+            );
+        }
+        assert_eq!(
+            q_split, q_fused,
+            "fused rmsnorm_quant_batch_i8 must be bit-identical to the split \
+             pair (n={n} m={m})"
+        );
+        if m > 1 {
+            assert_eq!(sc_split[0], 0.0, "zero row must give zero scale");
+            assert!(
+                q_fused[..n].iter().all(|&v| v == 0),
+                "zero row must quantize to zeros"
+            );
+        }
+    }
+}
+
 /// The device GEMM chain (`mpgemm_device`: on-device quant → tiled f64 GEMM →
 /// scale fold) must reproduce the host path (`quantize_activation_int8` → tiled
 /// `mpgemm` → `out *= act_scale`) **bit-for-bit** — same quant, same kernel, same
@@ -4690,7 +4824,7 @@ fn adr_0022_twin_family_table_matches_decode_cu() {
     }
     assert_eq!(
         names.len(),
-        85,
+        86,
         "decode.cu kernel count drifted from ADR 0022 — update the ADR \
          (65 → 64: gqa_attention_mdecode_f32 retired; 64 → 66: paged KV \
          twins added, ADR 0025 step 2; rmsnorm_quant_i8_fast was added and \
@@ -4719,7 +4853,12 @@ fn adr_0022_twin_family_table_matches_decode_cu() {
          lm_head_warp_i8 + lm_head_tiled_i8 — ADR 0036 L2 opt-in int8 head \
          rung (TRITIUM_LM_HEAD=i8), 64-group absmax table + f32 scales, \
          ppl/τ-gated NOT bit-identical; pinned to a host oracle + \
-         warp==tiled by lm_head_i8_warp_and_tiled_match_host_oracle_bitwise)"
+         warp==tiled by lm_head_i8_warp_and_tiled_match_host_oracle_bitwise; \
+         85 → 86: rmsnorm_quant_batch_i8 — ADR 0036 L5 fused batch \
+         rmsnorm+quant, bit-identical to the rmsnorm_batch_f32 → \
+         act_quant_batch_i8 pair by the \
+         rmsnorm_quant_batch_matches_split_pair_bitwise gate; the split \
+         kernels stay for the final output norm and quant-only sites)"
     );
 }
 

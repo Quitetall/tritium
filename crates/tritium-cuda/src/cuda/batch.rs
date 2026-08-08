@@ -225,11 +225,9 @@ impl CudaDecodeModel {
             d_k: alloc(n * self.kv_width, "batch d_k")?,
             d_v: alloc(n * self.kv_width, "batch d_v")?,
             d_attn: alloc(n * self.q_width, "batch d_attn")?,
-            d_attn_sn: alloc(n * self.q_width, "batch d_attn_sn")?,
             d_proj: alloc(n * self.n_embd, "batch d_proj")?,
             d_gate: alloc(n * self.n_ff, "batch d_gate")?,
             d_up: alloc(n * self.n_ff, "batch d_up")?,
-            d_gate_sn: alloc(n * self.n_ff, "batch d_gate_sn")?,
             d_qact: s
                 .alloc_zeros::<i8>(n * self.n_ff)
                 .map_err(|e| driver_err("batch d_qact", &e))?,
@@ -329,20 +327,13 @@ impl CudaDecodeModel {
         )?;
 
         for li in 0..self.layers.len() {
-            Self::bl_rmsnorm(
+            // q/k/v share one fused rmsnorm+quant of d_x (ADR 0036 L5).
+            Self::bl_rmsnorm_quant(
                 s,
-                &self.f_rmsnorm_batch,
+                &self.f_rmsnorm_quant_batch,
                 &batch.d_x,
                 &self.layers[li].attn_norm,
                 self.rms_eps,
-                n_embd,
-                n,
-                &mut batch.d_normed,
-            )?;
-            Self::bl_quant(
-                s,
-                &self.f_quant_batch,
-                &batch.d_normed,
                 n_embd,
                 n,
                 &mut batch.d_qact,
@@ -450,31 +441,30 @@ impl CudaDecodeModel {
                 self.attn_scale,
                 n,
             )?;
-            let attn_in: &CudaSlice<f32> = if let Some(sn) = self.layers[li].attn_sub_norm.as_ref()
-            {
-                Self::bl_rmsnorm(
+            if let Some(sn) = self.layers[li].attn_sub_norm.as_ref() {
+                // Fused sub-norm + quant (ADR 0036 L5): skips d_attn_sn.
+                Self::bl_rmsnorm_quant(
                     s,
-                    &self.f_rmsnorm_batch,
+                    &self.f_rmsnorm_quant_batch,
                     &batch.d_attn,
                     sn,
                     self.rms_eps,
                     q_width,
                     n,
-                    &mut batch.d_attn_sn,
+                    &mut batch.d_qact,
+                    &mut batch.d_act_scale,
                 )?;
-                &batch.d_attn_sn
             } else {
-                &batch.d_attn
-            };
-            Self::bl_quant(
-                s,
-                &self.f_quant_batch,
-                attn_in,
-                q_width,
-                n,
-                &mut batch.d_qact,
-                &mut batch.d_act_scale,
-            )?;
+                Self::bl_quant(
+                    s,
+                    &self.f_quant_batch,
+                    &batch.d_attn,
+                    q_width,
+                    n,
+                    &mut batch.d_qact,
+                    &mut batch.d_act_scale,
+                )?;
+            }
             Self::bl_matmul(
                 s,
                 &self.f_tiled_scaled,
@@ -493,20 +483,13 @@ impl CudaDecodeModel {
                 n * n_embd,
             )?;
 
-            Self::bl_rmsnorm(
+            // Fused rmsnorm+quant (ADR 0036 L5).
+            Self::bl_rmsnorm_quant(
                 s,
-                &self.f_rmsnorm_batch,
+                &self.f_rmsnorm_quant_batch,
                 &batch.d_x,
                 &self.layers[li].ffn_norm,
                 self.rms_eps,
-                n_embd,
-                n,
-                &mut batch.d_normed,
-            )?;
-            Self::bl_quant(
-                s,
-                &self.f_quant_batch,
-                &batch.d_normed,
                 n_embd,
                 n,
                 &mut batch.d_qact,
@@ -533,30 +516,30 @@ impl CudaDecodeModel {
                 &mut batch.d_up,
             )?;
             Self::bl_relu2(s, &self.f_relu2, &mut batch.d_gate, &batch.d_up, n * n_ff)?;
-            let down_in: &CudaSlice<f32> = if let Some(sn) = self.layers[li].ffn_sub_norm.as_ref() {
-                Self::bl_rmsnorm(
+            if let Some(sn) = self.layers[li].ffn_sub_norm.as_ref() {
+                // Fused sub-norm + quant (ADR 0036 L5): skips d_gate_sn.
+                Self::bl_rmsnorm_quant(
                     s,
-                    &self.f_rmsnorm_batch,
+                    &self.f_rmsnorm_quant_batch,
                     &batch.d_gate,
                     sn,
                     self.rms_eps,
                     n_ff,
                     n,
-                    &mut batch.d_gate_sn,
+                    &mut batch.d_qact,
+                    &mut batch.d_act_scale,
                 )?;
-                &batch.d_gate_sn
             } else {
-                &batch.d_gate
-            };
-            Self::bl_quant(
-                s,
-                &self.f_quant_batch,
-                down_in,
-                n_ff,
-                n,
-                &mut batch.d_qact,
-                &mut batch.d_act_scale,
-            )?;
+                Self::bl_quant(
+                    s,
+                    &self.f_quant_batch,
+                    &batch.d_gate,
+                    n_ff,
+                    n,
+                    &mut batch.d_qact,
+                    &mut batch.d_act_scale,
+                )?;
+            }
             Self::bl_matmul(
                 s,
                 &self.f_tiled_scaled,
@@ -1153,11 +1136,9 @@ impl CudaDecodeModel {
             d_k: dptr(&batch.d_k, s),
             d_v: dptr(&batch.d_v, s),
             d_attn: dptr(&batch.d_attn, s),
-            d_attn_sn: dptr(&batch.d_attn_sn, s),
             d_proj: dptr(&batch.d_proj, s),
             d_gate: dptr(&batch.d_gate, s),
             d_up: dptr(&batch.d_up, s),
-            d_gate_sn: dptr(&batch.d_gate_sn, s),
             d_qact: dptr(&batch.d_qact, s),
             d_act_scale: dptr(&batch.d_act_scale, s),
             d_attn_partials: dptr(&batch.d_attn_partials, s),
@@ -1230,9 +1211,10 @@ impl CudaDecodeModel {
             (self.n_embd, self.q_width, self.kv_width, self.n_ff);
         let (n_head, n_head_kv, head_dim) = (self.n_head, self.n_head_kv, self.head_dim);
 
-        // pre-norm attention. q/k/v share ONE quant of d_normed, then three unfused GEMMs.
-        self.gb_rmsnorm(p.d_x, l.attn_norm, n_embd, p.d_normed, n)?;
-        self.gb_quant(p.d_normed, n_embd, p.d_qact, p.d_act_scale, n)?;
+        // pre-norm attention. q/k/v share ONE fused rmsnorm+quant of d_x
+        // (ADR 0036 L5: the normed rows never round-trip through d_normed),
+        // then three unfused GEMMs.
+        self.gb_rmsnorm_quant(p.d_x, l.attn_norm, n_embd, p.d_qact, p.d_act_scale, n)?;
         self.gb_matmul(&l.q, p.d_qact, p.d_act_scale, p.d_q, n)?;
         self.gb_matmul(&l.k, p.d_qact, p.d_act_scale, p.d_k, n)?;
         self.gb_matmul(&l.v, p.d_qact, p.d_act_scale, p.d_v, n)?;
@@ -1258,29 +1240,27 @@ impl CudaDecodeModel {
             p.paged,
             n,
         )?;
-        let attn_in = if let Some(sn) = l.attn_sub_norm {
-            self.gb_rmsnorm(p.d_attn, sn, q_width, p.d_attn_sn, n)?;
-            p.d_attn_sn
+        if let Some(sn) = l.attn_sub_norm {
+            // Fused sub-norm + quant (ADR 0036 L5): skips d_attn_sn.
+            self.gb_rmsnorm_quant(p.d_attn, sn, q_width, p.d_qact, p.d_act_scale, n)?;
         } else {
-            p.d_attn
-        };
-        self.gb_quant(attn_in, q_width, p.d_qact, p.d_act_scale, n)?;
+            self.gb_quant(p.d_attn, q_width, p.d_qact, p.d_act_scale, n)?;
+        }
         self.gb_matmul(&l.o, p.d_qact, p.d_act_scale, p.d_proj, n)?;
         self.gb_residual(p.d_x, p.d_proj, n * n_embd)?;
 
         // pre-norm ReLU² MLP. gate/up unfused; relu2 writes gate = relu(gate)² ⊙ up.
-        self.gb_rmsnorm(p.d_x, l.ffn_norm, n_embd, p.d_normed, n)?;
-        self.gb_quant(p.d_normed, n_embd, p.d_qact, p.d_act_scale, n)?;
+        // Fused rmsnorm+quant (ADR 0036 L5).
+        self.gb_rmsnorm_quant(p.d_x, l.ffn_norm, n_embd, p.d_qact, p.d_act_scale, n)?;
         self.gb_matmul(&l.gate, p.d_qact, p.d_act_scale, p.d_gate, n)?;
         self.gb_matmul(&l.up, p.d_qact, p.d_act_scale, p.d_up, n)?;
         self.gb_relu2(p.d_gate, p.d_up, n * n_ff)?;
-        let down_in = if let Some(sn) = l.ffn_sub_norm {
-            self.gb_rmsnorm(p.d_gate, sn, n_ff, p.d_gate_sn, n)?;
-            p.d_gate_sn
+        if let Some(sn) = l.ffn_sub_norm {
+            // Fused sub-norm + quant (ADR 0036 L5): skips d_gate_sn.
+            self.gb_rmsnorm_quant(p.d_gate, sn, n_ff, p.d_qact, p.d_act_scale, n)?;
         } else {
-            p.d_gate
-        };
-        self.gb_quant(down_in, n_ff, p.d_qact, p.d_act_scale, n)?;
+            self.gb_quant(p.d_gate, n_ff, p.d_qact, p.d_act_scale, n)?;
+        }
         self.gb_matmul(&l.down, p.d_qact, p.d_act_scale, p.d_proj, n)?;
         self.gb_residual(p.d_x, p.d_proj, n * n_embd)?;
         Ok(())
@@ -1348,6 +1328,39 @@ impl CudaDecodeModel {
             (n as u32, 1, 1),
             (256, 1, 1),
             0,
+            self.cap_stream.cu_stream(),
+            &mut params,
+        )
+    }
+
+    /// ADR 0036 L5: fused rmsnorm+quant capture node — one node replacing the
+    /// `gb_rmsnorm` → `gb_quant` pair, bit-identical to it.
+    pub(super) fn gb_rmsnorm_quant(
+        &self,
+        x: sys::CUdeviceptr,
+        w: sys::CUdeviceptr,
+        dim: usize,
+        d_qact: sys::CUdeviceptr,
+        d_act_scale: sys::CUdeviceptr,
+        n: usize,
+    ) -> Result<(), BackendError> {
+        let eps = self.rms_eps;
+        let (dim_i, n_i) = (dim as i32, n as i32);
+        let smem = (dim * 4) as u32;
+        let mut params = [
+            pp(&x),
+            pp(&w),
+            pp(&eps),
+            pp(&dim_i),
+            pp(&n_i),
+            pp(&d_qact),
+            pp(&d_act_scale),
+        ];
+        raw_launch(
+            self.batch_raw().rmsnorm_quant,
+            (n as u32, 1, 1),
+            (256, 1, 1),
+            smem,
             self.cap_stream.cu_stream(),
             &mut params,
         )

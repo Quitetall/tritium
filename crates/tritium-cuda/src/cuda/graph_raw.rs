@@ -282,6 +282,9 @@ pub(super) struct BatchRawKernels {
     pub(super) embed: sys::CUfunction,
     pub(super) rmsnorm: sys::CUfunction,
     pub(super) quant: sys::CUfunction,
+    /// ADR 0036 L5: fused rmsnorm+quant — bit-identical to `rmsnorm` then
+    /// `quant` at every norm→quant seam of the batch/tree trunk.
+    pub(super) rmsnorm_quant: sys::CUfunction,
     pub(super) rope: sys::CUfunction,
     pub(super) kv_append: sys::CUfunction,
     pub(super) attn_split_partial: sys::CUfunction,
@@ -373,6 +376,7 @@ impl BatchRawKernels {
             embed: get(dm, KERNEL_NAME_EMBED_BATCH)?,
             rmsnorm: get(dm, KERNEL_NAME_RMSNORM_BATCH)?,
             quant: get(dm, KERNEL_NAME_ACT_QUANT_BATCH_I8)?,
+            rmsnorm_quant: get(dm, KERNEL_NAME_RMSNORM_QUANT_BATCH_I8)?,
             rope: get(dm, KERNEL_NAME_ROPE_BATCH)?,
             kv_append: get(dm, KERNEL_NAME_KV_APPEND_MDECODE)?,
             attn_split_partial: get(dm, KERNEL_NAME_ATTN_SPLIT_PARTIAL)?,
@@ -469,11 +473,11 @@ pub(super) struct BatchPtrs {
     pub(super) d_k: sys::CUdeviceptr,
     pub(super) d_v: sys::CUdeviceptr,
     pub(super) d_attn: sys::CUdeviceptr,
-    pub(super) d_attn_sn: sys::CUdeviceptr,
+    // (d_attn_sn / d_gate_sn retired by the ADR 0036 L5 fused rmsnorm+quant;
+    // d_normed stays for the final output norm.)
     pub(super) d_proj: sys::CUdeviceptr,
     pub(super) d_gate: sys::CUdeviceptr,
     pub(super) d_up: sys::CUdeviceptr,
-    pub(super) d_gate_sn: sys::CUdeviceptr,
     pub(super) d_qact: sys::CUdeviceptr,
     pub(super) d_act_scale: sys::CUdeviceptr,
     pub(super) d_attn_partials: sys::CUdeviceptr,
@@ -544,11 +548,11 @@ pub struct BatchKv {
     pub(super) d_k: CudaSlice<f32>,
     pub(super) d_v: CudaSlice<f32>,
     pub(super) d_attn: CudaSlice<f32>,
-    pub(super) d_attn_sn: CudaSlice<f32>,
+    // (d_attn_sn / d_gate_sn scratch retired by the ADR 0036 L5 fused
+    // rmsnorm+quant; d_normed stays for the final output norm.)
     pub(super) d_proj: CudaSlice<f32>,
     pub(super) d_gate: CudaSlice<f32>,
     pub(super) d_up: CudaSlice<f32>,
-    pub(super) d_gate_sn: CudaSlice<f32>,
     pub(super) d_qact: CudaSlice<i8>,
     pub(super) d_act_scale: CudaSlice<f32>,
     /// Split-KV attention partials `[n · n_head · S · (head_dim+2)]`, `S = ceil(max_ctx/ATTN_SPLIT_CHUNK)`.

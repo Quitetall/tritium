@@ -3195,6 +3195,112 @@ __global__ void rmsnorm_batch_f32(const float* __restrict__ x, const float* __re
   }
 }
 
+// rmsnorm_quant_batch_i8 — fused rmsnorm_batch_f32 + act_quant_batch_i8
+// (ADR 0036 L5): block `mi` norms row `mi` in shared, then quantizes it in
+// place — the normed row never round-trips through global memory and one
+// launch per norm site (4/layer in the batch/tree trunk) disappears.
+//
+// Bit-match contract (vs the split pair): the normed value y[i] is produced
+// by exactly rmsnorm_batch_f32's chain — same canonical tree sum (ADR 0018),
+// same `__fmul_rn(__fmul_rn(x, inv), w)` pair; a global store/load of an f32
+// is bit-preserving, so quantizing y from shared instead of global reads the
+// identical bits. The absmax reduction has act_quant_batch_i8's exact shape
+// (max is exact under any order regardless); the quant epilogue is its exact
+// rintf + clamp chain. Requires blockDim.x == 256 (all launches comply).
+// Dynamic shared = n * 4 bytes (the launch must set it).
+__global__ void rmsnorm_quant_batch_i8(const float* __restrict__ x,
+                                       const float* __restrict__ w, const float eps,
+                                       const int n, const int m,
+                                       signed char* __restrict__ q_out,
+                                       float* __restrict__ act_scale) {
+  const int mi = blockIdx.x;
+  if (mi >= m) return;
+  extern __shared__ float s_x[];
+  __shared__ float s_inv;
+  __shared__ float s_gamma;
+  __shared__ float s_red[256];
+  const float* xr = x + (long long)mi * n;
+  signed char* qr = q_out + (long long)mi * n;
+  for (int i = threadIdx.x; i < n; i += blockDim.x) s_x[i] = xr[i];
+  __syncthreads();
+  // Canonical tree sum (ADR 0018) — byte-for-byte rmsnorm_batch_f32's.
+  {
+    float part = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+      const float xi = s_x[i];
+      part = __fadd_rn(part, __fmul_rn(xi, xi));
+    }
+    s_red[threadIdx.x] = part;
+    __syncthreads();
+    for (int off = 128; off >= 64; off >>= 1) {
+      if (threadIdx.x < off) {
+        s_red[threadIdx.x] = __fadd_rn(s_red[threadIdx.x], s_red[threadIdx.x + off]);
+      }
+      __syncthreads();
+    }
+    if (threadIdx.x < 32) {
+      float v = __fadd_rn(s_red[threadIdx.x], s_red[threadIdx.x + 32]);  // level 32
+      for (int off = 16; off > 0; off >>= 1) {
+        v = __fadd_rn(v, __shfl_down_sync(0xffffffffu, v, off));
+      }
+      if (threadIdx.x == 0) {
+        const float mean_sq = __fdiv_rn(v, (float)n);
+        const float denom = sqrtf(__fadd_rn(mean_sq, eps));
+        s_inv = __fdiv_rn(1.0f, denom);
+      }
+    }
+  }
+  __syncthreads();
+  // Normed row into shared (rmsnorm_batch_f32's exact value chain), tracking
+  // the per-thread absmax act_quant_batch_i8 would have computed over it.
+  const float inv = s_inv;
+  float local_max = 0.0f;
+  for (int i = threadIdx.x; i < n; i += blockDim.x) {
+    const float yi = __fmul_rn(__fmul_rn(s_x[i], inv), w[i]);
+    s_x[i] = yi;
+    const float a = fabsf(yi);
+    if (a > local_max) local_max = a;
+  }
+  __syncthreads();
+  // act_quant_batch_i8's absmax reduction: shared levels 128/64, warp-0
+  // shuffle tail. Reduce in s_red, NOT s_x — s_x holds the normed row the
+  // quant step below consumes.
+  s_red[threadIdx.x] = local_max;
+  __syncthreads();
+  for (int off = 128; off >= 64; off >>= 1) {
+    if (threadIdx.x < off) {
+      const float o = s_red[threadIdx.x + off];
+      if (o > s_red[threadIdx.x]) s_red[threadIdx.x] = o;
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x < 32) {
+    float v = fmaxf(s_red[threadIdx.x], s_red[threadIdx.x + 32]);
+    for (int off = 16; off > 0; off >>= 1) {
+      v = fmaxf(v, __shfl_down_sync(0xffffffffu, v, off));
+    }
+    if (threadIdx.x == 0) {
+      s_red[0] = v;
+    }
+  }
+  if (threadIdx.x == 0) {
+    const float gamma = s_red[0];
+    s_gamma = gamma;
+    act_scale[mi] = (gamma == 0.0f) ? 0.0f : __fdiv_rn(gamma, 127.0f);
+  }
+  __syncthreads();
+  const float gamma = s_gamma;
+  if (gamma == 0.0f) {
+    for (int i = threadIdx.x; i < n; i += blockDim.x) qr[i] = 0;
+    return;
+  }
+  const float s = __fdiv_rn(127.0f, gamma);
+  for (int i = threadIdx.x; i < n; i += blockDim.x) {
+    const float scaled = rintf(__fmul_rn(s_x[i], s));
+    qr[i] = (signed char)fminf(fmaxf(scaled, -128.0f), 127.0f);
+  }
+}
+
 // embedding_gather_batch_f32 — out[r] = table[tokens[r]] for r in 0..m. `tokens` is a
 // device int array (the prompt ids). One thread per (row, element).
 __global__ void embedding_gather_batch_f32(const float* __restrict__ table,

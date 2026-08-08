@@ -77,6 +77,12 @@ pub(super) const KERNEL_NAME_RMSNORM_QUANT: &str = "rmsnorm_quant_f32";
 pub(super) const KERNEL_NAME_ACT_QUANT_TILED_I8: &str = "act_quant_tiled_i8";
 pub(super) const KERNEL_NAME_RMSNORM_QUANT_I8: &str = "rmsnorm_quant_i8";
 pub(super) const KERNEL_NAME_ACT_QUANT_BATCH_I8: &str = "act_quant_batch_i8";
+/// Fused batch rmsnorm + i8 quant (ADR 0036 L5): the norm→quant seam of the
+/// batch/tree trunk collapsed into one kernel, bit-identical to the
+/// `rmsnorm_batch_f32` → `act_quant_batch_i8` pair it replaces at every
+/// norm-then-quant site. The split kernels stay for the final output norm
+/// (no quant) and the sub-norm-absent quant-only sites.
+pub(super) const KERNEL_NAME_RMSNORM_QUANT_BATCH_I8: &str = "rmsnorm_quant_batch_i8";
 /// Threads for the `rmsnorm_quant_i8` launches. The kernel pins its canonical
 /// fold to 256 slots explicitly, so extra threads (ncu: the kernel is
 /// single-block latency-bound at ~1% of every throughput ceiling with 256)

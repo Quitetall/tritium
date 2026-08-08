@@ -6959,6 +6959,7 @@ impl CudaBackend {
             f_embed_batch: f(dm, KERNEL_NAME_EMBED_BATCH)?,
             f_rope_batch: f(dm, KERNEL_NAME_ROPE_BATCH)?,
             f_quant_batch: f(dm, KERNEL_NAME_ACT_QUANT_BATCH_I8)?,
+            f_rmsnorm_quant_batch: f(dm, KERNEL_NAME_RMSNORM_QUANT_BATCH_I8)?,
             f_scale_batch: f(dm, KERNEL_NAME_SCALE_BATCH)?,
             f_kv_append_batch: f(
                 dm,

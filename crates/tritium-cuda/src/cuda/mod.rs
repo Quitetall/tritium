@@ -631,16 +631,15 @@ struct ResidentLayer {
 struct TreeScratch {
     m_cap: usize,
     d_x: CudaSlice<f32>,
-    d_normed: CudaSlice<f32>,
+    // (d_normed / d_attn_sn / d_gate_sn retired by the ADR 0036 L5 fused
+    // rmsnorm+quant — the normed rows never leave shared memory.)
     d_q: CudaSlice<f32>,
     d_k: CudaSlice<f32>,
     d_v: CudaSlice<f32>,
     d_attn: CudaSlice<f32>,
-    d_attn_sn: CudaSlice<f32>,
     d_proj: CudaSlice<f32>,
     d_gate: CudaSlice<f32>,
     d_up: CudaSlice<f32>,
-    d_gate_sn: CudaSlice<f32>,
     d_qact: CudaSlice<i8>,
     d_act_scale: CudaSlice<f32>,
     d_scores: CudaSlice<f32>,
@@ -729,6 +728,9 @@ pub struct CudaDecodeModel {
     f_embed_batch: CudaFunction,
     f_rope_batch: CudaFunction,
     f_quant_batch: CudaFunction,
+    /// ADR 0036 L5: fused batch rmsnorm+quant — bit-identical to the
+    /// `f_rmsnorm_batch` → `f_quant_batch` pair at every norm→quant seam.
+    f_rmsnorm_quant_batch: CudaFunction,
     #[allow(dead_code)]
     f_scale_batch: CudaFunction,
     f_kv_append_batch: CudaFunction,
@@ -2062,17 +2064,16 @@ impl CudaDecodeModel {
         // M=P scratch (allocated for this prefill; freed on return).
         let alloc =
             |n: usize, what: &str| s.alloc_zeros::<f32>(n).map_err(|e| driver_err(what, &e));
+        // (d_normed / d_attn_sn / d_gate_sn scratch retired by the ADR 0036 L5
+        // fused rmsnorm+quant — the normed rows never leave shared memory.)
         let mut d_x = alloc(m * n_embd, "prefill d_x")?;
-        let mut d_normed = alloc(m * n_embd, "prefill d_normed")?;
         let mut d_q = alloc(m * q_width, "prefill d_q")?;
         let mut d_k = alloc(m * kv_width, "prefill d_k")?;
         let mut d_v = alloc(m * kv_width, "prefill d_v")?;
         let mut d_attn = alloc(m * q_width, "prefill d_attn")?;
-        let mut d_attn_sn = alloc(m * q_width, "prefill d_attn_sn")?;
         let mut d_proj = alloc(m * n_embd, "prefill d_proj")?;
         let mut d_gate = alloc(m * n_ff, "prefill d_gate")?;
         let mut d_up = alloc(m * n_ff, "prefill d_up")?;
-        let mut d_gate_sn = alloc(m * n_ff, "prefill d_gate_sn")?;
         let mut d_qact = s
             .alloc_zeros::<i8>(m * n_ff)
             .map_err(|e| driver_err("prefill d_qact", &e))?;
@@ -2113,21 +2114,13 @@ impl CudaDecodeModel {
 
         for li in 0..self.layers.len() {
             // --- attention ---
-            Self::bl_rmsnorm(
+            // q/k/v share one fused rmsnorm+quant of d_x (ADR 0036 L5).
+            Self::bl_rmsnorm_quant(
                 s,
-                &self.f_rmsnorm_batch,
+                &self.f_rmsnorm_quant_batch,
                 &d_x,
                 &self.layers[li].attn_norm,
                 self.rms_eps,
-                n_embd,
-                m,
-                &mut d_normed,
-            )?;
-            // q/k/v share one quant of d_normed.
-            Self::bl_quant(
-                s,
-                &self.f_quant_batch,
-                &d_normed,
                 n_embd,
                 m,
                 &mut d_qact,
@@ -2249,49 +2242,41 @@ impl CudaDecodeModel {
                     m,
                 )?;
             }
-            let attn_in: &CudaSlice<f32> = if let Some(sn) = self.layers[li].attn_sub_norm.as_ref()
-            {
-                Self::bl_rmsnorm(
+            if let Some(sn) = self.layers[li].attn_sub_norm.as_ref() {
+                // Fused sub-norm + quant (ADR 0036 L5): skips d_attn_sn.
+                Self::bl_rmsnorm_quant(
                     s,
-                    &self.f_rmsnorm_batch,
+                    &self.f_rmsnorm_quant_batch,
                     &d_attn,
                     sn,
                     self.rms_eps,
                     q_width,
                     m,
-                    &mut d_attn_sn,
+                    &mut d_qact,
+                    &mut d_act_scale,
                 )?;
-                &d_attn_sn
             } else {
-                &d_attn
-            };
-            Self::bl_quant(
-                s,
-                &self.f_quant_batch,
-                attn_in,
-                q_width,
-                m,
-                &mut d_qact,
-                &mut d_act_scale,
-            )?;
+                Self::bl_quant(
+                    s,
+                    &self.f_quant_batch,
+                    &d_attn,
+                    q_width,
+                    m,
+                    &mut d_qact,
+                    &mut d_act_scale,
+                )?;
+            }
             self.matmul_m(s, &d_qact, &self.layers[li].o, &d_act_scale, m, &mut d_proj)?;
             Self::bl_residual(s, &self.f_residual, &mut d_x, &d_proj, m * n_embd)?;
 
             // --- ReLU² MLP ---
-            Self::bl_rmsnorm(
+            // Fused rmsnorm+quant (ADR 0036 L5).
+            Self::bl_rmsnorm_quant(
                 s,
-                &self.f_rmsnorm_batch,
+                &self.f_rmsnorm_quant_batch,
                 &d_x,
                 &self.layers[li].ffn_norm,
                 self.rms_eps,
-                n_embd,
-                m,
-                &mut d_normed,
-            )?;
-            Self::bl_quant(
-                s,
-                &self.f_quant_batch,
-                &d_normed,
                 n_embd,
                 m,
                 &mut d_qact,
@@ -2307,30 +2292,30 @@ impl CudaDecodeModel {
             )?;
             self.matmul_m(s, &d_qact, &self.layers[li].up, &d_act_scale, m, &mut d_up)?;
             Self::bl_relu2(s, &self.f_relu2, &mut d_gate, &d_up, m * n_ff)?;
-            let down_in: &CudaSlice<f32> = if let Some(sn) = self.layers[li].ffn_sub_norm.as_ref() {
-                Self::bl_rmsnorm(
+            if let Some(sn) = self.layers[li].ffn_sub_norm.as_ref() {
+                // Fused sub-norm + quant (ADR 0036 L5): skips d_gate_sn.
+                Self::bl_rmsnorm_quant(
                     s,
-                    &self.f_rmsnorm_batch,
+                    &self.f_rmsnorm_quant_batch,
                     &d_gate,
                     sn,
                     self.rms_eps,
                     n_ff,
                     m,
-                    &mut d_gate_sn,
+                    &mut d_qact,
+                    &mut d_act_scale,
                 )?;
-                &d_gate_sn
             } else {
-                &d_gate
-            };
-            Self::bl_quant(
-                s,
-                &self.f_quant_batch,
-                down_in,
-                n_ff,
-                m,
-                &mut d_qact,
-                &mut d_act_scale,
-            )?;
+                Self::bl_quant(
+                    s,
+                    &self.f_quant_batch,
+                    &d_gate,
+                    n_ff,
+                    m,
+                    &mut d_qact,
+                    &mut d_act_scale,
+                )?;
+            }
             self.matmul_m(
                 s,
                 &d_qact,
@@ -2949,6 +2934,45 @@ impl CudaDecodeModel {
         unsafe {
             l.launch(cfg)
                 .map_err(|e| driver_err("launch prefill quant", &e))?;
+        }
+        Ok(())
+    }
+
+    /// ADR 0036 L5: fused batch rmsnorm+quant — one launch replacing the
+    /// `bl_rmsnorm` → `bl_quant` pair, bit-identical to it (the normed row
+    /// stays in shared instead of round-tripping through `d_normed`).
+    #[allow(clippy::too_many_arguments)]
+    fn bl_rmsnorm_quant(
+        s: &Arc<CudaStream>,
+        f: &CudaFunction,
+        x: &CudaSlice<f32>,
+        w: &CudaSlice<f32>,
+        eps: f32,
+        n: usize,
+        m: usize,
+        qact: &mut CudaSlice<i8>,
+        scale: &mut CudaSlice<f32>,
+    ) -> Result<(), BackendError> {
+        let (n_i, m_i) = (n as i32, m as i32);
+        let cfg = LaunchConfig {
+            grid_dim: (m as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: (n * 4) as u32,
+        };
+        let mut l = s.launch_builder(f);
+        l.arg(x)
+            .arg(w)
+            .arg(&eps)
+            .arg(&n_i)
+            .arg(&m_i)
+            .arg(qact)
+            .arg(scale);
+        // SAFETY: `rmsnorm_quant_batch_i8(const float* x, const float* w, float eps,
+        // int n, int m, signed char* q_out, float* act_scale)`.
+        #[allow(unsafe_code)]
+        unsafe {
+            l.launch(cfg)
+                .map_err(|e| driver_err("launch batch rmsnorm_quant", &e))?;
         }
         Ok(())
     }
