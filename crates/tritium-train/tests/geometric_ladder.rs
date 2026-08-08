@@ -403,7 +403,7 @@ fn a_group_given_more_planes_fits_better() {
 #[test]
 fn masked_ladder_reproduces_the_policy_its_mask_came_from() {
     let (rows, cols, group) = (4usize, 200usize, 128usize); // ragged tail included
-    let w = gaussian(0x5A5F_11, rows * cols);
+    let w = gaussian(0x005A_5F11, rows * cols);
     for t in 1..=4usize {
         for &policy in &[
             RotationPolicy::Never,
@@ -431,7 +431,7 @@ fn masked_ladder_reproduces_the_policy_its_mask_came_from() {
 #[test]
 fn masked_ladder_honours_a_frozen_decision_on_drifted_weights() {
     let (rows, cols, group) = (2usize, 256usize, 128usize);
-    let w0 = gaussian(0xD21F7, rows * cols);
+    let w0 = gaussian(0x000D_21F7, rows * cols);
     let mask = ste::geometric_rotation_mask(&w0, rows, cols, 3, group, 16, RotationPolicy::Auto);
 
     // Perturb hard enough that `Auto` would re-decide for at least one group.
