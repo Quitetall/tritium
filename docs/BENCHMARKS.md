@@ -55,6 +55,113 @@ box they are a distance from a named reference point, **not** a claim about the 
 
 ## Ledger
 
+### 2026-08-08 — T8 publishing sweep @ dde0c61: decode/pp512, lossless spec decode, batched multi-slot, TQ1 capacity
+
+**Box state (disclosed up front): NOT quiet.** A parallel session's
+`salt_distill_heldout` test (Tritium repo, PID 2609694) ran on-GPU for the whole sweep,
+growing 388 MiB → 4.3 GiB and pulling 27–100% GPU util between my runs; desktop stack
+~1.05 GiB (kwin/Xwayland/plasmashell/firefox/ghostty). RTX 4090, driver 610.57.04,
+CUDA 13.3. Every number below carries that contention; relative pairs were measured
+same-session order-alternated (ABBA) so both sides share it. **Quiet-box rerun of the
+absolutes is owed.** Binary provenance: the shared working tree held uncommitted
+parallel-session changes (including `tritium-cli/src/report.rs`), so all Tritium
+binaries were built from a clean `git archive dde0c61` export
+(`cargo build --release -p tritium-cli -p tritium-serve --features
+tritium-cli/cuda,tritium-serve/cuda`), not the dirty tree.
+
+#### 1. Plain decode + pp512 (the ledger command)
+
+Command: `tritium report compare --model ggml-model-i2_s.gguf --tokens prompt512.json
+--backend cuda --prompt-len 512 --decode-steps 256 --warmup 16 --reps 3 --runs 5
+--format json` @ dde0c61 (clean-HEAD build). Tokens: first 512 ids of a wt103 doc
+(BOS 128000). Run twice per protocol; both bundles recorded because the co-resident
+distill was RAMPING between them (run 1 caught the lighter window).
+
+| bundle | decode tok/s (3 reps) | median | pp512 tok/s | ttft p50 / p95 ms |
+|---|---|---:|---:|---|
+| run 1 (07:28 UTC, distill just starting) | 216.1 / 211.8 / 215.0 | **215.0** | **22,298.6** | 22.96 / 23.88 |
+| run 2 (07:29 UTC, distill ramping) | 191.7 / 191.2 / 191.1 | 191.2 | 19,603.8 | 26.05 / 26.74 |
+
+pp512 at HEAD is **19.6–22.3k tok/s even contended** — up from the 2026-07-18 ledger
+line of 12,275 (v3-attention era) and above the same-day llama.cpp Q4_K_M reference
+(12,608, below). Decode 191–215 sits inside the documented contention band around the
+221–222 quiet-class entries; treat the decode absolutes as contended, not a regression.
+JSON artifacts: session scratchpad `compare-head-run{1,2}.json` (receipts dir pattern
+`docs/receipts-ws-*` is gitignored; artifacts live outside the repo).
+
+#### 2. Solo speculative decode — lossless, tau, e2e
+
+Harness: `~/blut/scripts/measure_tau.py` (12 wt103 prose prefixes, 256 greedy tokens
+each) against two clean-HEAD `tritium-serve` instances: spec on 8124
+(`--draft-model ~/blut/data/drafter-8L768-s3.gguf`), plain on 8125; both
+`--model ggml-model-i2_s.gguf --backend cuda --raw-tokens --eos 4294967295
+--max-completion-tokens 4096`. Cold pass discarded (prompt 0 paid ~22 s of JIT on both
+servers); the warm pass is the record:
+
+| metric | value |
+|---|---:|
+| losslessness | **12/12 prompts token-identical** (spec == plain greedy), both passes |
+| tok/verify (tau) | **3.575** (3,057 committed / 855 verifies) |
+| e2e wall | spec 10.02 s vs plain 11.08 s → **1.105×** |
+
+Per-prompt spread was contention-noisy (spec 0.47–1.39 s per 256 tok); the lossless
+count and tau are contention-immune, the 1.105× e2e is same-session relative.
+
+#### 3. Batched multi-slot spec decode (with the 9930062 bucket snap)
+
+Harness: measure_multi.py class (session scratchpad copy pointed at the clean-HEAD
+`tritium-serve`), Round-25 protocol: server at `--batch-slots 4`, shared draft k
+(`TRITIUM_MULTI_K=shared`, the shipped default; per-slot k was refuted at 9930062),
+N concurrent 192-token wt103 streams, drafted-vs-undrafted ABBA×2 at the
+server-launch level, 5 samples/visit → n=20 per config, p50.
+
+| N streams | drafted p50 agg tok/s | undrafted p50 agg tok/s | speedup | tok/verify p50 |
+|---|---:|---:|---:|---:|
+| 2 | 189.8 (min 149.5, max 408.7) | 102.9 | **1.84×** | 2.09 |
+| 4 | 276.2 (min 244.0, max 506.3) | 217.8 | **1.27×** | 2.01 |
+
+Honest reading: the Round-25 headline (2.44×/1.52×, tok/verify 2.63) was measured on a
+lighter box (5 GB idle squatter, no active compute); this session's absolutes are
+~half Round-25's and the sample spread (149–506 tok/s at fixed config) shows the
+distill co-resident dominating variance. These rows re-confirm drafted > undrafted at
+HEAD under load; they do NOT cleanly re-measure the bucket-snap +6.6% (same-session
+relative claim in 9930062) and are not comparable to Round-25's absolutes.
+Quiet-box recapture owed for the headline table.
+
+#### 4. TQ1 capacity rung (batched-spec serve)
+
+Harness: same batched-spec server (`--batch-slots 4` + drafter), `TRITIUM_WEIGHTS=tq2`
+vs `tq1`, ABBA at launch level (tq2/tq1/tq1/tq2); peak per-process VRAM sampled from
+`nvidia-smi --query-compute-apps` at 0.5 s during a warm+measured 4-stream sample,
+then a single-stream 256-token greedy parity completion per visit.
+
+| weights | peak serve VRAM (2 visits) | parity (256-tok greedy) |
+|---|---:|---|
+| tq2 (default) | 7,648 / 7,636 MiB | reference |
+| tq1 | **6,976 / 6,976 MiB (−672 MiB)** | **token-identical to tq2, all visits** |
+
+Two new facts at HEAD: the batched-spec path now ACCEPTS `TRITIUM_WEIGHTS=tq1`
+(round 15's "batch/tree reject loudly in v1" is lifted), and the capacity win holds
+end-to-end in the serve process (−672 MiB ≈ the −18%-of-ternary-bytes rung from
+round 15). No speed claim: the contended 4-stream aggregates spanned 259–431 tok/s
+*within the tq2 pair alone*, so tq1-vs-tq2 throughput stays an open quiet-box item
+(round 16's "re-bench uncontended" note stands).
+
+#### 5. Competitor line (documented invocation, re-run same-day)
+
+`llama-bench -m /home/brianklam/models/qwen3.5-4b-gguf/Qwen3.5-4B-Q4_K_M.gguf -p 512
+-n 128 -ngl 99`, fork build 41a666dac (8943) — the same binary as the 2026-07-11
+reference line. Ran in the lightest window of the session (desktop ~1.4 GiB, distill
+at 388 MiB just starting):
+
+| engine | model | pp512 tok/s | tg128 tok/s |
+|---|---|---:|---:|
+| llama.cpp CUDA | Qwen3.5-4B Q4_K_M (2.54 GiB) | 12,607.84 ± 1,173.85 | 199.79 ± 3.65 |
+
+Stable vs the 07-11 reference (12,281 ± 828 / 200.1 ± 6.5). **Still owed:** the
+upstream-master Q2_0 quiet-box rerun from the 2026-07-30 entry — the upstream build
+(1212) and the Q2_0 gguf are not present on this box; not improvised.
+
 ### 2026-07-30 — llama.cpp Q2_0 CUDA merged upstream (PR #25707, merged TODAY) — first same-box head-to-head
 
 The mainstream-ternary-CUDA gap closed this morning. Same box (RTX 4090, ~5.3 GB
