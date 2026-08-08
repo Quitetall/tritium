@@ -145,6 +145,11 @@ pub(super) const DRAFT_CHAIN_MAX: usize = 64;
 pub(super) const ARGMAX_CHUNKS: usize = 16;
 pub(super) const KERNEL_NAME_ATTN_TREE_SCORES_CTRL: &str = "gqa_attention_tree_scores_ctrl_g";
 pub(super) const KERNEL_NAME_ATTN_TREE_REDUCE_CTRL: &str = "gqa_attention_tree_reduce_ctrl_g";
+/// f16-KV ctrl tree-verify twins (ADR 0036 L6): the single-seq tree graph
+/// route on the accepted f16 rung — same ctrl contract, __half KV element.
+pub(super) const KERNEL_NAME_KV_APPEND_TREE_H: &str = "kv_append_tree_h";
+pub(super) const KERNEL_NAME_ATTN_TREE_SCORES_CTRL_H: &str = "gqa_attention_tree_scores_ctrl_h";
+pub(super) const KERNEL_NAME_ATTN_TREE_REDUCE_CTRL_H: &str = "gqa_attention_tree_reduce_ctrl_h";
 /// I3 paged tree-verify twins (ADR 0025 page table; ctrl word 2 = the slot's
 /// table offset `row · tstride` instead of a KV row base).
 pub(super) const KERNEL_NAME_KV_APPEND_TREE_PAGED: &str = "kv_append_tree_paged_g";

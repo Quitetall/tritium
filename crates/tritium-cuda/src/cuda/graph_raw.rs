@@ -295,6 +295,10 @@ pub(super) struct BatchRawKernels {
     pub(super) argmax: sys::CUfunction,
     /// Ctrl-driven tree-verify trunk kernels (graph-capturable twins — read
     /// [prefix_len, real_m] from a device buffer instead of baked scalars).
+    /// Dtype-selected at `load` for the SINGLE-SEQ dense route (ADR 0036 L6):
+    /// f32 → `_g`, f16 → `_h`. The scale rungs (i8/t2) keep the f32 handles —
+    /// unreachable, `tree_forward`'s bucket gate routes them eager. The paged
+    /// and slots twins below stay f32-only (batch arenas are the f32 rung).
     pub(super) kv_append_tree: sys::CUfunction,
     pub(super) attn_tree_scores_ctrl: sys::CUfunction,
     pub(super) attn_tree_reduce_ctrl: sys::CUfunction,
@@ -330,7 +334,11 @@ unsafe impl Send for BatchRawKernels {}
 unsafe impl Sync for BatchRawKernels {}
 
 impl BatchRawKernels {
-    pub(super) fn load(ctx: &Arc<CudaContext>) -> Result<Self, BackendError> {
+    pub(super) fn load(ctx: &Arc<CudaContext>, kv_dtype: KvDtype) -> Result<Self, BackendError> {
+        // Single-seq dense tree-ctrl triple by KV rung (ADR 0036 L6). Only
+        // f16 selects twins; the scale rungs fall back to the f32 names
+        // (handles never launched — the tree graph gate excludes them).
+        let f16 = kv_dtype == KvDtype::F16;
         ctx.bind_to_thread()
             .map_err(|e| driver_err("batch raw kernels bind", &e))?;
         let load_mod = |ptx: &str| -> Result<sys::CUmodule, BackendError> {
@@ -367,9 +375,30 @@ impl BatchRawKernels {
             tq1_tiled_scaled: get(am, KERNEL_NAME_TQ1_TILED_I8_SCALED)?,
             lm_head_tiled: get(dm, KERNEL_NAME_LM_HEAD_TILED_F16)?,
             argmax: get(dm, KERNEL_NAME_ARGMAX_ROWS)?,
-            kv_append_tree: get(dm, KERNEL_NAME_KV_APPEND_TREE)?,
-            attn_tree_scores_ctrl: get(dm, KERNEL_NAME_ATTN_TREE_SCORES_CTRL)?,
-            attn_tree_reduce_ctrl: get(dm, KERNEL_NAME_ATTN_TREE_REDUCE_CTRL)?,
+            kv_append_tree: get(
+                dm,
+                if f16 {
+                    KERNEL_NAME_KV_APPEND_TREE_H
+                } else {
+                    KERNEL_NAME_KV_APPEND_TREE
+                },
+            )?,
+            attn_tree_scores_ctrl: get(
+                dm,
+                if f16 {
+                    KERNEL_NAME_ATTN_TREE_SCORES_CTRL_H
+                } else {
+                    KERNEL_NAME_ATTN_TREE_SCORES_CTRL
+                },
+            )?,
+            attn_tree_reduce_ctrl: get(
+                dm,
+                if f16 {
+                    KERNEL_NAME_ATTN_TREE_REDUCE_CTRL_H
+                } else {
+                    KERNEL_NAME_ATTN_TREE_REDUCE_CTRL
+                },
+            )?,
             kv_append_tree_paged: get(dm, KERNEL_NAME_KV_APPEND_TREE_PAGED)?,
             attn_tree_scores_ctrl_paged: get(dm, KERNEL_NAME_ATTN_TREE_SCORES_CTRL_PAGED)?,
             attn_tree_reduce_ctrl_paged: get(dm, KERNEL_NAME_ATTN_TREE_REDUCE_CTRL_PAGED)?,

@@ -799,7 +799,7 @@ impl CudaDecodeModel {
         // Lazily load the raw batch kernels, then capture this batch's graph (per-N).
         if self.batch_raw.is_none() {
             let ctx = self.cap_stream.context().clone();
-            self.batch_raw = Some(Arc::new(BatchRawKernels::load(&ctx)?));
+            self.batch_raw = Some(Arc::new(BatchRawKernels::load(&ctx, self.kv_dtype)?));
         }
         if batch.graph.is_none() {
             let g = self.record_graph_batch(batch, false)?;
@@ -927,7 +927,7 @@ impl CudaDecodeModel {
 
         if self.batch_raw.is_none() {
             let ctx = self.cap_stream.context().clone();
-            self.batch_raw = Some(Arc::new(BatchRawKernels::load(&ctx)?));
+            self.batch_raw = Some(Arc::new(BatchRawKernels::load(&ctx, self.kv_dtype)?));
         }
         if batch.graph_argmax.is_none() {
             let g = self.record_graph_batch(batch, true)?;

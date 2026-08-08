@@ -1125,6 +1125,202 @@ fn cuda_tree_verify_greedy_lossless() {
     }
 }
 
+/// Restores `TRITIUM_KV` to its pre-test value on drop so a failing f16 leg
+/// can't leak the rung override into later tests in the same process.
+#[cfg(feature = "cuda")]
+struct KvEnvGuard(Option<std::ffi::OsString>);
+#[cfg(feature = "cuda")]
+impl KvEnvGuard {
+    fn set(rung: &str) -> Self {
+        let prev = std::env::var_os("TRITIUM_KV");
+        // SAFETY: the GPU tests run single-threaded (`gpu_serial` +
+        // `--test-threads=1`); no other thread touches the environment.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::set_var("TRITIUM_KV", rung);
+        }
+        Self(prev)
+    }
+}
+#[cfg(feature = "cuda")]
+impl Drop for KvEnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: single-threaded test process (see `KvEnvGuard::set`).
+        #[allow(unsafe_code)]
+        unsafe {
+            match self.0.take() {
+                Some(v) => std::env::set_var("TRITIUM_KV", v),
+                None => std::env::remove_var("TRITIUM_KV"),
+            }
+        }
+    }
+}
+
+/// ADR 0036 L6 stage-1 gate: the SINGLE-SEQ tree-verify GRAPH route on the
+/// accepted f16 KV rung (ADR 0020 rung 1). Three teeth:
+///
+/// 1. **Route taken**: under `TRITIUM_KV=f16` the verify must run the
+///    captured-graph route (`tree_graph_bucket_count() >= 1`), not the old
+///    eager fallback the `kv_elem == 4` gate forced.
+/// 2. **Losslessness within the rung** (the ADR 0014 contract, unweakened):
+///    the tree-verify committed stream under f16 must equal plain greedy
+///    decode under the same f16 rung, token for token.
+/// 3. **Graph == eager within the rung** (the f32 pair's equivalence,
+///    mirrored): the same draft schedule with `TRITIUM_TREE_EAGER=1` (the
+///    accepted eager-f16 tree path, `_h` non-ctrl twins) must commit the
+///    identical stream — the ctrl `_h` twins do the same arithmetic in the
+///    same order.
+///
+/// f16-vs-f32 token identity is NOT asserted — the f16 tier is perplexity-
+/// gated vs f32 (each written K/V rounds once, ADR 0020), so the cross-rung
+/// stream comparison is reported for the record, not gated.
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_tree_verify_f16_graph_route_lossless_and_matches_eager() {
+    let _gpu = gpu_serial();
+    let Some((reference, bytes)) = maybe_load() else {
+        return;
+    };
+    let _kv = KvEnvGuard::set("f16");
+    let prompt = reference.token_ids.clone();
+    let k_total = 24usize;
+
+    // Plain greedy reference stream ON THE F16 RUNG (the within-rung anchor).
+    let Some(mut runner) = load_on("cuda", &bytes) else {
+        return;
+    };
+    let want_f16 = runner
+        .generate(&prompt, k_total + 8, u32::MAX)
+        .expect("plain f16 greedy generate");
+
+    // The same 4-shape draft rotation as `cuda_tree_verify_greedy_lossless`,
+    // seeded from the f16 stream (perfect chain / branch / partial / reject).
+    let make_tree = |phase: usize, c: usize, root: u32| -> (Vec<u32>, Vec<i32>) {
+        let remaining = k_total.saturating_sub(c).max(1);
+        match phase % 4 {
+            0 => {
+                let n = remaining.min(3);
+                let mut t = vec![root];
+                t.extend(want_f16[c..c + n].iter().copied());
+                let p: Vec<i32> = (0..t.len() as i32).map(|i| i - 1).collect();
+                (t, p)
+            }
+            1 => {
+                let right = want_f16[c];
+                let wrong = (right + 1) % 128_256;
+                let mut t = vec![root, wrong, right];
+                let mut p = vec![-1, 0, 0];
+                if remaining >= 2 {
+                    t.push(want_f16[c + 1]);
+                    p.push(2);
+                }
+                (t, p)
+            }
+            2 => {
+                let right = want_f16[c];
+                let wrong = (right + 7) % 128_256;
+                (vec![root, right, wrong], vec![-1, 0, 1])
+            }
+            _ => {
+                let wrong = (want_f16[c] + 3) % 128_256;
+                (vec![root, wrong], vec![-1, 0])
+            }
+        }
+    };
+
+    // Two legs over the identical schedule: graph route, then forced eager.
+    let mut streams: Vec<Vec<u32>> = Vec::new();
+    for eager in [false, true] {
+        let _eager_guard = TreeEagerGuard;
+        if eager {
+            // SAFETY: single-threaded test process (see TreeEagerGuard).
+            #[allow(unsafe_code)]
+            unsafe {
+                std::env::set_var("TRITIUM_TREE_EAGER", "1");
+            }
+        }
+        let Some(mut r) = load_on("cuda", &bytes) else {
+            return;
+        };
+        let positions: Vec<usize> = (0..prompt.len()).collect();
+        let prefill_logits = r.forward(&prompt, &positions).expect("f16 prefill");
+        assert_eq!(
+            argmax(&prefill_logits) as u32,
+            want_f16[0],
+            "f16 prefill argmax must match the f16 reference's first token"
+        );
+        let rm = r
+            .resident_cuda()
+            .expect("resident model")
+            .expect("cuda resident model present");
+        let mut committed: Vec<u32> = vec![want_f16[0]];
+        let mut phase = 0usize;
+        while committed.len() < k_total {
+            let (t, p) = make_tree(
+                phase,
+                committed.len(),
+                *committed.last().expect("non-empty"),
+            );
+            let out = rm.tree_verify_greedy(&t, &p).expect("f16 tree verify");
+            assert!(!out.is_empty(), "verify must always commit >= 1 token");
+            committed.extend(&out);
+            phase += 1;
+        }
+        let buckets = rm.tree_graph_bucket_count();
+        if eager {
+            assert_eq!(
+                buckets, 0,
+                "TRITIUM_TREE_EAGER leg must not capture tree graphs"
+            );
+        } else {
+            assert!(
+                buckets >= 1,
+                "f16 tree verify fell back to the eager route — the L6 gate \
+                 requires the GRAPH route under TRITIUM_KV=f16 (buckets = 0)"
+            );
+        }
+
+        // Tooth 2 (per leg): committed == plain f16 greedy, token for token.
+        let c_full = committed.len();
+        assert!(
+            c_full <= want_f16.len(),
+            "committed stream overran the f16 reference window"
+        );
+        assert_eq!(
+            &committed[..],
+            &want_f16[..c_full],
+            "f16 tree-verify committed stream must equal plain f16 greedy \
+             (lossless within the rung; eager={eager})"
+        );
+        streams.push(committed);
+    }
+
+    // Tooth 3: graph and eager legs commit the identical stream.
+    assert_eq!(
+        streams[0], streams[1],
+        "f16 tree verify: graph route and eager route diverged"
+    );
+
+    // For the record only (the f16 tier is ppl-gated, not token-gated vs f32):
+    // where does the f16 stream first leave the f32 stream?
+    drop(_kv);
+    if let Some(mut r32) = load_on("cuda", &bytes) {
+        let want_f32 = r32
+            .generate(&prompt, k_total, u32::MAX)
+            .expect("plain f32 greedy generate");
+        let div = want_f16
+            .iter()
+            .zip(&want_f32)
+            .position(|(a, b)| a != b)
+            .map_or("none within window".to_string(), |i| format!("step {i}"));
+        println!(
+            "f16 tree-verify gate: graph==eager over {} committed tokens, \
+             lossless vs plain f16; f16-vs-f32 first token divergence: {div}",
+            streams[0].len()
+        );
+    }
+}
+
 /// Batch↔graph single-token bit-parity: after the same prompt prefill,
 /// forwarding ONE token via the batch path (`prefill(&[t], _)`) and via the
 /// M=1 graph path (`step_graph(t, _)`) must give BIT-IDENTICAL logits — the

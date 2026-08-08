@@ -149,7 +149,10 @@ impl CudaDecodeModel {
         let bucket = if self.head_dim.is_multiple_of(4)
             && m <= TREE_BUCKET_MAX
             && self.max_ctx * 4 <= 48 * 1024
-            && self.kv_elem == 4 // non-f32 KV: eager tree (no ctrl twins; graph measured ≈ no win)
+            // f32 everywhere; f16 single-seq only (ADR 0036 L6: the ctrl `_h`
+            // twins serve the dense single-seq capture — batch arenas stay
+            // f32, and the scale rungs (i8/t2) have no ctrl twins → eager).
+            && (self.kv_elem == 4 || (self.kv_dtype == KvDtype::F16 && slot.is_none()))
             && std::env::var_os("TRITIUM_TREE_EAGER").is_none()
         {
             TREE_BUCKETS
@@ -318,7 +321,7 @@ impl CudaDecodeModel {
                 .map_err(|e| driver_err("tree pre-replay default sync", &e))?;
             if self.batch_raw.is_none() {
                 let ctx = self.cap_stream.context().clone();
-                self.batch_raw = Some(Arc::new(BatchRawKernels::load(&ctx)?));
+                self.batch_raw = Some(Arc::new(BatchRawKernels::load(&ctx, self.kv_dtype)?));
             }
             let owner_missing = match &slot {
                 Some((b, _)) => b.tree_graphs.is_none(),
@@ -988,6 +991,13 @@ impl CudaDecodeModel {
         parents: &[i32],
     ) -> Result<Vec<u32>, BackendError> {
         self.tree_verify_greedy_in(tokens, parents, None)
+    }
+
+    /// Captured tree-graph bucket count on the SINGLE-SEQ target — gate
+    /// observability (ADR 0036 L6): 0 after a verify means the graph route
+    /// was not taken (eager fallback); ≥1 proves the ctrl-twin capture ran.
+    pub fn tree_graph_bucket_count(&self) -> usize {
+        self.tree_graphs.as_ref().map_or(0, |tg| tg.graphs.len())
     }
 
     /// **I2/I3 batch-slot greedy tree verify** (L3 batch-slot spec decode):
@@ -2206,7 +2216,7 @@ impl CudaDecodeModel {
                 .map_err(|e| driver_err("tree slots pre-replay default sync", &e))?;
             if self.batch_raw.is_none() {
                 let ctx = self.cap_stream.context().clone();
-                self.batch_raw = Some(Arc::new(BatchRawKernels::load(&ctx)?));
+                self.batch_raw = Some(Arc::new(BatchRawKernels::load(&ctx, self.kv_dtype)?));
             }
             if batch.tree_slots_graphs.is_none() {
                 let d_ctrl = self

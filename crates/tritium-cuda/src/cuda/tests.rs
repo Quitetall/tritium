@@ -4371,7 +4371,7 @@ fn adr_0022_twin_family_table_matches_decode_cu() {
     }
     assert_eq!(
         names.len(),
-        80,
+        83,
         "decode.cu kernel count drifted from ADR 0022 — update the ADR \
          (65 → 64: gqa_attention_mdecode_f32 retired; 64 → 66: paged KV \
          twins added, ADR 0025 step 2; rmsnorm_quant_i8_fast was added and \
@@ -4392,7 +4392,11 @@ fn adr_0022_twin_family_table_matches_decode_cu() {
          draft_batch_chain_advance was added and REVERTED by measurement — \
          Track B 2026-08-08, bit-identical + fully gated but -2.4%..+1.6% \
          at N=4 < the 3% bar: post-bucket-snap k~2-3 leaves only 1-2 \
-         per-step round-trips to amortize)"
+         per-step round-trips to amortize; 80 → 83: f16-KV ctrl tree-verify \
+         twins — kv_append_tree_h + gqa_attention_tree_{{scores,reduce}}_ctrl_h, \
+         ADR 0036 L6: the SINGLE-SEQ tree graph route on the accepted f16 \
+         rung (batch arenas stay f32); graph == eager-f16 by the \
+         cuda_tree_verify_f16_graph gate in tritium-nn acceptance)"
     );
 }
 
