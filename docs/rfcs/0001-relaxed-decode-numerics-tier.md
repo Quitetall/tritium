@@ -1,6 +1,6 @@
 # RFC 0001 — The relaxed decode numerics tier (`TRITIUM_KERNEL_TIER=fast`, second attempt)
 
-Status: **PROPOSED** (2026-08-08) — decision requested from the repo owner (Brian).
+Status: **ACCEPTED** (2026-08-08, Brian) — L3b and the L8 flash-prefill rewrite are unblocked under this contract.
 Authorized by [ADR 0036](../adr/0036-decode-endgame.md) § "The numerics RFC";
 per that ADR, **accepted or rejected both close the item**, and L3b (online-softmax
 fused decode attention) plus the L8 flash-prefill rewrite stay blocked until this
