@@ -2702,17 +2702,32 @@ impl CudaDecodeModel {
         logits: &mut CudaSlice<f32>,
     ) -> Result<(), BackendError> {
         match (&self.d_token_embd_i8, &self.d_lm_head_scales) {
-            (Some(embd_i8), Some(scales)) => Self::bl_lm_head_tiled_i8(
-                s,
-                &self.f_lm_head_tiled_i8,
-                h,
-                embd_i8,
-                scales,
-                self.n_embd,
-                self.vocab,
-                m,
-                logits,
-            ),
+            (Some(embd_i8), Some(scales)) => {
+                // The tiled head runs (essentially) only from the tree-verify
+                // sites: an i8 head under spec decode is a measured footgun
+                // (tau 3.575->3.427, spec e2e -3.1% — ADR 0036 L2, adopted
+                // plain-only). One-shot warn, mirroring the tree.rs
+                // eager-fallback precedent.
+                static I8_SPEC_WARN: std::sync::Once = std::sync::Once::new();
+                I8_SPEC_WARN.call_once(|| {
+                    eprintln!(
+                        "tritium-cuda: TRITIUM_LM_HEAD=i8 reached the tree-verify head — \
+                         the i8 rung is adopted for UNDRAFTED decode only (spec tau drops \
+                         ~4%, net -3.1% e2e); prefer f16 under --draft-model"
+                    );
+                });
+                Self::bl_lm_head_tiled_i8(
+                    s,
+                    &self.f_lm_head_tiled_i8,
+                    h,
+                    embd_i8,
+                    scales,
+                    self.n_embd,
+                    self.vocab,
+                    m,
+                    logits,
+                )
+            }
             _ => Self::bl_lm_head_tiled(
                 s,
                 &self.f_lm_head_tiled,
