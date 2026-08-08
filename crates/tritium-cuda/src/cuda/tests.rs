@@ -3599,19 +3599,20 @@ fn lm_head_i8_warp_and_tiled_match_host_oracle_bitwise() {
             .arg(&v_i)
             .arg(&mut d_logits);
         #[allow(unsafe_code)]
+        // SAFETY: kernel launch with matching arity/types; buffers sized
+        // above outlive the launch and the following sync.
         unsafe {
             l.launch(cfg_warp).expect("launch warp i8");
         }
     }
     let mut got_warp = vec![0.0f32; vocab];
     stream.memcpy_dtoh(&d_logits, &mut got_warp).expect("dtoh");
-    for v in 0..vocab {
+    for (v, got) in got_warp.iter().enumerate() {
         let want = oracle_row(&h[..n_embd], v);
         assert_eq!(
-            got_warp[v].to_bits(),
+            got.to_bits(),
             want.to_bits(),
-            "lm_head_warp_i8 diverges from host oracle at [{v}]: got {} want {want}",
-            got_warp[v]
+            "lm_head_warp_i8 diverges from host oracle at [{v}]: got {got} want {want}"
         );
     }
 
@@ -3638,6 +3639,8 @@ fn lm_head_i8_warp_and_tiled_match_host_oracle_bitwise() {
             .arg(&m_i)
             .arg(&mut d_logits_all);
         #[allow(unsafe_code)]
+        // SAFETY: kernel launch with matching arity/types; buffers sized
+        // above outlive the launch and the following sync.
         unsafe {
             l.launch(cfg_tiled).expect("launch tiled i8");
         }
@@ -3750,6 +3753,7 @@ fn lm_head_i8_vs_f16_m1_abba_bench() {
                         .arg(&ne_i)
                         .arg(&v_i)
                         .arg(&mut d_logits);
+                    // SAFETY: same launch contract as the gated call above.
                     unsafe { l.launch(cfg).expect("warmup f16") }
                 }
                 _ => {
@@ -3760,6 +3764,7 @@ fn lm_head_i8_vs_f16_m1_abba_bench() {
                         .arg(&ne_i)
                         .arg(&v_i)
                         .arg(&mut d_logits);
+                    // SAFETY: same launch contract as the gated call above.
                     unsafe { l.launch(cfg).expect("warmup i8") }
                 }
             };
@@ -3776,6 +3781,7 @@ fn lm_head_i8_vs_f16_m1_abba_bench() {
                         .arg(&ne_i)
                         .arg(&v_i)
                         .arg(&mut d_logits);
+                    // SAFETY: same launch contract as the gated call above.
                     unsafe { l.launch(cfg).expect("run f16") }
                 }
                 _ => {
@@ -3786,6 +3792,7 @@ fn lm_head_i8_vs_f16_m1_abba_bench() {
                         .arg(&ne_i)
                         .arg(&v_i)
                         .arg(&mut d_logits);
+                    // SAFETY: same launch contract as the gated call above.
                     unsafe { l.launch(cfg).expect("run i8") }
                 }
             };
