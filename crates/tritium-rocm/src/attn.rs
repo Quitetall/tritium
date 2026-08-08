@@ -65,7 +65,9 @@
 //! # 1. from the Tritium checkout root — build kernels via hipcc and run
 //! #    BOTH device gates in one pass (tq2_0 conformance + the E2 attention
 //! #    gate). Needs ROCM_PATH or /opt/rocm; build.rs finds hipcc itself.
-//! cargo test -p tritium-rocm --features rocm --release -- --nocapture
+//! #    REQUIRE_DEVICE turns a load-time .co rejection into a hard failure
+//! #    instead of a self-skip — mandatory on the paid session.
+//! TRITIUM_ROCM_REQUIRE_DEVICE=1 cargo test -p tritium-rocm --features rocm --release -- --nocapture
 //!
 //! # 2. if (and only if) the gate's BIT-EQUALITY tier fails while the
 //! #    tolerance tier passes (an exp-ULP finding, not a bug): re-run with

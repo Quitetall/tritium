@@ -737,7 +737,14 @@ impl RocmBackend {
         let d_v = DeviceAlloc::new(core::mem::size_of_val(v), v.len() * 4)?;
         d_v.copy_from_host(v)?;
         let d_out = DeviceAlloc::new(core::mem::size_of_val(out), out.len() * 4)?;
-        let d_scores = DeviceAlloc::new(scores_len * 4, scores_len * 4)?;
+        // checked *4: v3_scores_len checked the ELEMENT product, but an
+        // element count in (2^62, 2^64) would wrap the byte conversion toward
+        // 0 and DeviceAlloc::new(0, _) returns a null alloc the kernel would
+        // write through (review 5593fda F1; unreachable at real shapes).
+        let scores_bytes = scores_len
+            .checked_mul(4)
+            .ok_or_else(|| BackendError::Backend("attn v3 scores byte size overflows".into()))?;
+        let d_scores = DeviceAlloc::new(scores_bytes, scores_bytes)?;
 
         // Kernel scalar args, in locals so their addresses are stable for the
         // duration of the launch (validate_v3_launch capped each at i32::MAX).
@@ -943,6 +950,14 @@ mod tests {
         let backend = match RocmBackend::new(0) {
             Ok(b) => b,
             Err(e) => {
+                // A load-time .co rejection (missing gfx slice, bad module)
+                // arrives here identically to "no device" — on the one
+                // budgeted MI300X session that must NOT read as a skip:
+                // TRITIUM_ROCM_REQUIRE_DEVICE=1 turns it into a hard failure
+                // (review 5593fda F2; the runbook exports it).
+                if std::env::var_os("TRITIUM_ROCM_REQUIRE_DEVICE").is_some_and(|v| v == "1") {
+                    panic!("TRITIUM_ROCM_REQUIRE_DEVICE=1 but backend init failed: {e}");
+                }
                 eprintln!("skipping rocm attn v3 gate: no device ({e})");
                 return;
             }

@@ -651,7 +651,14 @@ impl MetalBackend {
         let v_buf = shared_buffer(dev, v);
         let out_bytes = core::mem::size_of_val(out) as u64;
         let out_buf = dev.new_buffer(out_bytes, MTLResourceOptions::StorageModeShared);
-        let scores_bytes = (scores_len * core::mem::size_of::<f32>()) as u64;
+        // checked: an element count in (2^62, 2^64) would wrap the byte
+        // conversion (shared nit with the rocm twin, review 5593fda F1;
+        // unreachable at real shapes — a zero-byte buffer here would be
+        // written through by the kernel).
+        let scores_bytes = scores_len
+            .checked_mul(core::mem::size_of::<f32>())
+            .ok_or_else(|| BackendError::Backend("attn v3 scores byte size overflows".into()))?
+            as u64;
         let scores_buf = dev.new_buffer(scores_bytes, MTLResourceOptions::StorageModeShared);
 
         let params = AttnV3Params {

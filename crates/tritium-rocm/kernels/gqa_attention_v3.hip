@@ -132,7 +132,11 @@ static_assert(ATTN_V3_BQ % ATTN_V3_WARPS == 0 && ATTN_V3_RPW >= 1,
               "ATTN_V3_BQ must be a positive multiple of ATTN_V3_WARPS");
 // Phase 1 maps `key = tid & 31`, so a chunk can stage at most 32 keys (the
 // CUDA/Metal sources share this assumption implicitly; pin it here).
-static_assert(ATTN_V3_KCH <= 32, "phase-1 key ownership is tid & 31");
+// == not <=: the phase-2a "scores written by THIS thread" comment reasons
+// from jglob % 32 == lane, which needs KCH exactly 32 (review 5593fda F3;
+// a KCH retune must revisit that reasoning even though the phase-1 trailing
+// __syncthreads already orders the writes either way).
+static_assert(ATTN_V3_KCH == 32, "phase-1 key ownership is tid & 31");
 // LDS budget: CDNA/GCN workgroups have 64 KiB of LDS (Apple's bound on the
 // Metal twin is 32 KiB; the staging fits both).
 static_assert((ATTN_V3_KCH * (ATTN_V3_HDMAX + 1) + ATTN_V3_BQ * ATTN_V3_HDMAX +
