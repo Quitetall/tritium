@@ -652,9 +652,23 @@ fn salt_distillation_device_trainer_recovers_heldout() {
         .ok()
         .and_then(|s| s.parse().ok())
         .filter(|&k| k > 0);
+    // A curve point costs a FULL held-out evaluation. On WikiText-2's 32,768-token set that is 64
+    // windowed forwards, which dominates wall clock and ran a finished 3000-step job out of its time
+    // budget. `TRITIUM_DISTILL_CURVE_EVAL=<n>` scores the first `n` held-out tokens at intermediate
+    // points instead; the FINAL number always uses the whole set, so the reported result is never
+    // the subsample. Intermediate points are for shape, not for quoting.
+    let curve_eval_tokens: usize = std::env::var("TRITIUM_DISTILL_CURVE_EVAL")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .map_or(eval_ids.len(), |n: usize| {
+            n.clamp(EVAL_WINDOW, eval_ids.len())
+        });
     if curve_every.is_some() {
         println!(
-            "curve: step,tokens,distilled_ppl,recovery_vs_ptq,gap_to_fp (fp {ppl_fp:.3}, ptq {ppl_ptq:.3e})"
+            "curve: step,tokens,distilled_ppl,recovery_vs_ptq,gap_to_fp (fp {ppl_fp:.3}, ptq {ppl_ptq:.3e}) \
+             [intermediate points scored on {curve_eval_tokens} of {} held-out tokens; the final \
+             number uses all of them]",
+            eval_ids.len()
         );
     }
 
@@ -754,7 +768,7 @@ fn salt_distillation_device_trainer_recovers_heldout() {
                 .enumerate()
                 .map(|(i, (wf, &(n, kk)))| deploy_quantize(&wf, n, kk, i))
                 .collect();
-            let ppl = perplexity_windowed(&ckpt, &a, &eval_ids, EVAL_WINDOW);
+            let ppl = perplexity_windowed(&ckpt, &a, &eval_ids[..curve_eval_tokens], EVAL_WINDOW);
             let tokens = step as usize * seq_len;
             println!(
                 "curve: {step},{tokens},{ppl:.3},{:.1},{:.3}",
