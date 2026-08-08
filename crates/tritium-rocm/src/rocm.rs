@@ -32,6 +32,15 @@ use crate::ffi;
 /// Kernel entry point — must match the `extern "C"` symbol in the `.hip` file.
 const KERNEL_NAME: &str = "tq2_0_add_mpgemm";
 
+/// v3 prefill-attention kernel entry point — must match the `extern "C"`
+/// symbol in `kernels/gqa_attention_v3.hip` (Track E2).
+const ATTN_KERNEL_NAME: &str = "gqa_attention_batch_v3_f32";
+
+/// Wavefront-width probe entry point (same code object as the attention
+/// kernel): writes the device `warpSize` so the host can gate the v3 dispatch
+/// on a wave width the kernel's analysis covers (32 or 64).
+const WAVE_PROBE_NAME: &str = "attn_v3_wave_probe";
+
 /// HIP threads per block for the 1-D launch grid (one thread per output element).
 /// 256 is a safe, occupancy-friendly default on every supported AMD arch.
 const THREADS_PER_BLOCK: u32 = 256;
@@ -40,6 +49,10 @@ const THREADS_PER_BLOCK: u32 = 256;
 /// time so the backend needs no `.co` file on disk at runtime — the analogue of
 /// tritium-cuda's `include_str!` of the PTX.
 const TQ2_0_ADD_CO: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tq2_0_add.co"));
+
+/// The v3 prefill-attention code object (plus the wave probe), emitted by
+/// `build.rs` alongside the mpGEMM one and embedded the same way.
+const GQA_ATTENTION_V3_CO: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gqa_attention_v3.co"));
 
 /// Wrap a HIP error code into a [`BackendError::Backend`] with context, unless it is
 /// success. Returns `Ok(())` on `hipSuccess`.
@@ -202,6 +215,16 @@ pub struct RocmBackend {
     module: ffi::hipModule_t,
     /// The resolved `tq2_0_add_mpgemm` kernel handle (one thread per output).
     func: ffi::hipFunction_t,
+    /// Loaded attention code-object module (kept alive so `attn_func` stays
+    /// valid; unloaded on drop).
+    attn_module: ffi::hipModule_t,
+    /// The resolved `gqa_attention_batch_v3_f32` kernel handle (Track E2).
+    attn_func: ffi::hipFunction_t,
+    /// Physical wavefront width reported by the `attn_v3_wave_probe` kernel at
+    /// init (64 on CDNA, 32 on RDNA). The v3 attention dispatch refuses the
+    /// device rung unless it is 32 or 64 — the analogue of tritium-metal's
+    /// `thread_execution_width == 32` check.
+    wave_size: i32,
     /// Backend identifier, e.g. `"rocm:0"`.
     device_id: String,
     /// Human-readable device name reported by the driver, e.g. `"AMD Instinct MI300X"`.
@@ -255,33 +278,43 @@ impl RocmBackend {
 
         let device_name = query_device_name(dev);
 
-        // Load the embedded code object and resolve the kernel symbol.
-        let mut module: ffi::hipModule_t = core::ptr::null_mut();
-        // SAFETY: `TQ2_0_ADD_CO` is a valid, NUL-free code-object image embedded at
-        // build time; `&mut module` is a valid out-pointer. HIP copies the image, so
-        // the borrow need not outlive the call.
-        let code =
-            unsafe { ffi::hipModuleLoadData(&mut module, TQ2_0_ADD_CO.as_ptr() as *const c_void) };
-        hip_check("hipModuleLoadData", code)?;
-
-        let name = CString::new(KERNEL_NAME).expect("kernel name has no interior NUL");
-        let mut func: ffi::hipFunction_t = core::ptr::null_mut();
-        // SAFETY: `module` was just loaded successfully; `name` is a valid NUL-
-        // terminated C string; `&mut func` is a valid out-pointer.
-        let code =
-            unsafe { ffi::hipModuleGetFunction(&mut func, module, name.as_ptr() as *const c_char) };
-        if let Err(e) = hip_check("hipModuleGetFunction", code) {
-            // SAFETY: `module` is a live module from the successful load above; we
-            // unload it on the error path so we do not leak it. Ignore the code.
-            unsafe {
-                let _ = ffi::hipModuleUnload(module);
+        // Load the embedded code objects and resolve the kernel symbols. Each
+        // error path unloads whatever was already loaded so `new` never leaks
+        // a module.
+        let module = load_module(TQ2_0_ADD_CO)?;
+        let func = match get_function(module, KERNEL_NAME) {
+            Ok(f) => f,
+            Err(e) => {
+                unload_module(module);
+                return Err(e);
             }
-            return Err(e);
-        }
+        };
+
+        let attn_module = match load_module(GQA_ATTENTION_V3_CO) {
+            Ok(m) => m,
+            Err(e) => {
+                unload_module(module);
+                return Err(e);
+            }
+        };
+        let attn_resolved = get_function(attn_module, ATTN_KERNEL_NAME)
+            .and_then(|attn_func| Ok((attn_func, get_function(attn_module, WAVE_PROBE_NAME)?)))
+            .and_then(|(attn_func, probe)| Ok((attn_func, probe_wave_size(probe)?)));
+        let (attn_func, wave_size) = match attn_resolved {
+            Ok(v) => v,
+            Err(e) => {
+                unload_module(attn_module);
+                unload_module(module);
+                return Err(e);
+            }
+        };
 
         Ok(Self {
             module,
             func,
+            attn_module,
+            attn_func,
+            wave_size,
             device_id: format!("rocm:{ordinal}"),
             device_name,
         })
@@ -295,15 +328,87 @@ impl RocmBackend {
 
 impl Drop for RocmBackend {
     fn drop(&mut self) {
-        if !self.module.is_null() {
-            // SAFETY: `self.module` came from a successful `hipModuleLoadData` and is
-            // unloaded exactly once (here). The resolved `func` belongs to the module
-            // and is invalidated by the unload; nothing uses it after drop.
-            unsafe {
-                let _ = ffi::hipModuleUnload(self.module);
-            }
+        // Both modules came from successful `hipModuleLoadData` calls and are
+        // unloaded exactly once (here). The resolved functions belong to their
+        // modules and are invalidated by the unload; nothing uses them after
+        // drop.
+        unload_module(self.module);
+        unload_module(self.attn_module);
+    }
+}
+
+/// Load an embedded code-object image into a HIP module.
+fn load_module(image: &[u8]) -> Result<ffi::hipModule_t, BackendError> {
+    let mut module: ffi::hipModule_t = core::ptr::null_mut();
+    // SAFETY: `image` is a valid code-object image embedded at build time;
+    // `&mut module` is a valid out-pointer. HIP copies the image, so the
+    // borrow need not outlive the call.
+    let code = unsafe { ffi::hipModuleLoadData(&mut module, image.as_ptr() as *const c_void) };
+    hip_check("hipModuleLoadData", code)?;
+    Ok(module)
+}
+
+/// Unload a module if non-null, ignoring the return code (used on error paths
+/// and in `Drop`, where there is nothing actionable to do with a failure).
+fn unload_module(module: ffi::hipModule_t) {
+    if !module.is_null() {
+        // SAFETY: `module` came from a successful `hipModuleLoadData` and each
+        // call site unloads it exactly once.
+        unsafe {
+            let _ = ffi::hipModuleUnload(module);
         }
     }
+}
+
+/// Resolve kernel symbol `name` in `module`.
+fn get_function(module: ffi::hipModule_t, name: &str) -> Result<ffi::hipFunction_t, BackendError> {
+    let cname = CString::new(name).expect("kernel name has no interior NUL");
+    let mut func: ffi::hipFunction_t = core::ptr::null_mut();
+    // SAFETY: `module` is a live module; `cname` is a valid NUL-terminated C
+    // string; `&mut func` is a valid out-pointer.
+    let code =
+        unsafe { ffi::hipModuleGetFunction(&mut func, module, cname.as_ptr() as *const c_char) };
+    hip_check(&format!("hipModuleGetFunction({name})"), code)?;
+    Ok(func)
+}
+
+/// Run the 1-thread `attn_v3_wave_probe` kernel and return the device's
+/// physical wavefront width. A probe kernel is used instead of
+/// `hipDeviceGetAttribute` / `hipGetDeviceProperties` because the attribute
+/// enum values and the props struct layout have both changed across ROCm
+/// major releases, while module launch + memcpy is ABI this crate already
+/// depends on (see the kernel banner).
+fn probe_wave_size(probe: ffi::hipFunction_t) -> Result<i32, BackendError> {
+    let d_out = DeviceAlloc::new(core::mem::size_of::<i32>(), core::mem::size_of::<i32>())?;
+    let out_ptr = d_out.ptr;
+    let mut params: [*mut c_void; 1] = [(&out_ptr as *const ffi::hipDeviceptr_t as *mut c_void)];
+    // SAFETY: `probe` is the resolved `attn_v3_wave_probe` kernel, whose only
+    // argument is an `int*` sized for one value (allocated just above). One
+    // 1×1×1 block of one thread; shared memory 0; default stream; `extra`
+    // null. The argument local outlives the launch (the synchronize below
+    // joins before it drops).
+    let code = unsafe {
+        ffi::hipModuleLaunchKernel(
+            probe,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            0,
+            core::ptr::null_mut(),
+            params.as_mut_ptr(),
+            core::ptr::null_mut(),
+        )
+    };
+    hip_check("hipModuleLaunchKernel(wave probe)", code)?;
+    // SAFETY: null stream is the default stream; blocks until the probe done.
+    let code = unsafe { ffi::hipStreamSynchronize(core::ptr::null_mut()) };
+    hip_check("hipStreamSynchronize(wave probe)", code)?;
+    let mut out = [0i32; 1];
+    d_out.copy_to_host(&mut out)?;
+    Ok(out[0])
 }
 
 /// Read the device name via `hipDeviceGetName`, defaulting to a placeholder if the
@@ -500,6 +605,207 @@ impl TernaryBackend for RocmBackend {
     }
 }
 
+impl RocmBackend {
+    /// v3 Q-blocked prefill GQA attention (Track E2: the HIP port of
+    /// tritium-cuda's `gqa_attention_batch_v3_f32`) — `M >= 1` query rows
+    /// against an f32 KV arena, causal, GQA.
+    ///
+    /// STATUS: the device kernel is compile/lint-verified only until the
+    /// budgeted MI300X session runs `rocm::tests::
+    /// attn_v3_matches_pinned_host_reference_or_skip` (runbook: the
+    /// [`crate::attn`] module docs).
+    ///
+    /// Layouts (row-major): `q`/`out` `[m, n_head, head_dim]`; `k`/`v` KV
+    /// arenas `[>= causal_offset + m, n_head_kv, head_dim]`. `ctx_max` is the
+    /// scores-scratch stride (`>= causal_offset + m`; the arena capacity, in
+    /// the CUDA runner's terms).
+    ///
+    /// Dispatch priority — CUDA runs v3 → v2 → rev-1; this backend has no v2
+    /// or rev-1 device kernel, so the ladder is v3 (device) → the pinned-order
+    /// HOST reference [`crate::attn::gqa_attention_prefill_ref`] (same
+    /// summation orders — and, with HIP's f64 `exp_f32`, expected bit-equal;
+    /// see the `attn` module docs). The host rung serves when:
+    /// * `TRITIUM_ATTN_V3=0` (kill switch; the tritium-cuda env contract —
+    ///   any value other than `0`/`1` is a loud reject);
+    /// * `head_dim > ATTN_V3_HDMAX` (the kernel's LDS staging bound);
+    /// * the probed device `warpSize` is neither 32 nor 64 (the kernel's
+    ///   width-32 logical-lane mapping is only argued for those — the
+    ///   analogue of Metal's `thread_execution_width` refusal);
+    /// * the row-block count exceeds the conservative 65535 grid-dimension
+    ///   ceiling (the bound the Metal twin also uses).
+    ///
+    /// # Errors
+    /// [`BackendError::InvalidInput`] on shape/length violations or a
+    /// malformed `TRITIUM_ATTN_V3`; [`BackendError::Backend`] on HIP
+    /// dispatch failures.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gqa_attention_prefill(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        out: &mut [f32],
+        ctx_max: usize,
+        n_head: usize,
+        n_head_kv: usize,
+        head_dim: usize,
+        scale: f32,
+        causal_offset: usize,
+        m: usize,
+    ) -> Result<(), BackendError> {
+        crate::attn::validate_v3_launch(
+            q.len(),
+            k.len(),
+            v.len(),
+            out.len(),
+            ctx_max,
+            n_head,
+            n_head_kv,
+            head_dim,
+            causal_offset,
+            m,
+        )
+        .map_err(BackendError::InvalidInput)?;
+
+        let v3_enabled =
+            crate::attn::parse_attn_v3(std::env::var("TRITIUM_ATTN_V3").ok().as_deref())
+                .map_err(BackendError::InvalidInput)?;
+        let (grid_x, grid_y) = crate::attn::v3_grid(m, n_head);
+        let use_device = v3_enabled
+            && head_dim <= crate::attn::ATTN_V3_HDMAX
+            && (self.wave_size == 32 || self.wave_size == 64)
+            && grid_x <= 65535
+            && grid_y <= 65535;
+        if !use_device {
+            crate::attn::gqa_attention_prefill_ref(
+                q,
+                k,
+                v,
+                out,
+                n_head,
+                n_head_kv,
+                head_dim,
+                scale,
+                causal_offset,
+                m,
+            );
+            return Ok(());
+        }
+        self.gqa_attention_prefill_v3_device(
+            q,
+            k,
+            v,
+            out,
+            ctx_max,
+            n_head,
+            n_head_kv,
+            head_dim,
+            scale,
+            causal_offset,
+            m,
+            (grid_x, grid_y),
+        )
+    }
+
+    /// Launch the v3 kernel: grid `(n_head, ceil(m/ATTN_V3_BQ))` blocks of
+    /// `ATTN_V3_THREADS`, plus the global `[m, n_head, ctx_max]` scores
+    /// scratch (device-allocated per call, like the CUDA prefill's per-call
+    /// `d_scores`). Caller has validated shapes and the dispatch bounds.
+    #[allow(clippy::too_many_arguments)]
+    fn gqa_attention_prefill_v3_device(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        out: &mut [f32],
+        ctx_max: usize,
+        n_head: usize,
+        n_head_kv: usize,
+        head_dim: usize,
+        scale: f32,
+        causal_offset: usize,
+        m: usize,
+        (grid_x, grid_y): (u32, u32),
+    ) -> Result<(), BackendError> {
+        let scores_len = crate::attn::v3_scores_len(m, n_head, ctx_max)
+            .ok_or_else(|| BackendError::InvalidInput("scores scratch overflows".to_owned()))?;
+
+        let d_q = DeviceAlloc::new(core::mem::size_of_val(q), q.len() * 4)?;
+        d_q.copy_from_host(q)?;
+        let d_k = DeviceAlloc::new(core::mem::size_of_val(k), k.len() * 4)?;
+        d_k.copy_from_host(k)?;
+        let d_v = DeviceAlloc::new(core::mem::size_of_val(v), v.len() * 4)?;
+        d_v.copy_from_host(v)?;
+        let d_out = DeviceAlloc::new(core::mem::size_of_val(out), out.len() * 4)?;
+        let d_scores = DeviceAlloc::new(scores_len * 4, scores_len * 4)?;
+
+        // Kernel scalar args, in locals so their addresses are stable for the
+        // duration of the launch (validate_v3_launch capped each at i32::MAX).
+        let ctx_max_i = ctx_max as i32;
+        let n_head_i = n_head as i32;
+        let n_head_kv_i = n_head_kv as i32;
+        let head_dim_i = head_dim as i32;
+        let causal_offset_i = causal_offset as i32;
+        let m_i = m as i32;
+
+        let q_ptr = d_q.ptr;
+        let k_ptr = d_k.ptr;
+        let v_ptr = d_v.ptr;
+        let out_ptr = d_out.ptr;
+        let scores_ptr = d_scores.ptr;
+        let mut params: [*mut c_void; 12] = [
+            (&q_ptr as *const ffi::hipDeviceptr_t as *mut c_void),
+            (&k_ptr as *const ffi::hipDeviceptr_t as *mut c_void),
+            (&v_ptr as *const ffi::hipDeviceptr_t as *mut c_void),
+            (&out_ptr as *const ffi::hipDeviceptr_t as *mut c_void),
+            (&scores_ptr as *const ffi::hipDeviceptr_t as *mut c_void),
+            (&ctx_max_i as *const i32 as *mut c_void),
+            (&n_head_i as *const i32 as *mut c_void),
+            (&n_head_kv_i as *const i32 as *mut c_void),
+            (&head_dim_i as *const i32 as *mut c_void),
+            (&scale as *const f32 as *mut c_void),
+            (&causal_offset_i as *const i32 as *mut c_void),
+            (&m_i as *const i32 as *mut c_void),
+        ];
+
+        // SAFETY: `self.attn_func` is the resolved `gqa_attention_batch_v3_f32`
+        // kernel, whose signature is (const float*, const float*, const
+        // float*, float*, float*, int, int, int, int, float, int, int) —
+        // matched here by `params` in that exact order (five device-pointer-
+        // by-value entries then the scalars). The device allocations are sized
+        // against the validated shapes above; the grid is
+        // (n_head, ceil(m/BQ)) blocks of ATTN_V3_THREADS, the CUDA launch
+        // geometry the kernel is written for, and the kernel bounds-checks its
+        // row block (`nrows <= 0` early-out). Shared memory is 0 (static LDS
+        // only), stream is the default (null). All argument locals outlive the
+        // launch (the synchronize below joins before they drop). `extra` null.
+        let code = unsafe {
+            ffi::hipModuleLaunchKernel(
+                self.attn_func,
+                grid_x,
+                grid_y,
+                1,
+                crate::attn::ATTN_V3_THREADS,
+                1,
+                1,
+                0,
+                core::ptr::null_mut(),
+                params.as_mut_ptr(),
+                core::ptr::null_mut(),
+            )
+        };
+        hip_check("hipModuleLaunchKernel(attn v3)", code)?;
+
+        // Join the default stream before reading back (the launch is async).
+        // SAFETY: null stream is the default stream; blocks until done.
+        let code = unsafe { ffi::hipStreamSynchronize(core::ptr::null_mut()) };
+        hip_check("hipStreamSynchronize(attn v3)", code)?;
+
+        d_out.copy_to_host(out)?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! GPU conformance test. Runs only with `--features rocm` AND a working AMD/HIP
@@ -541,5 +847,261 @@ mod tests {
             report.failed
         );
         assert_eq!(report.passed, vectors.len(), "all tq2_0 vectors must pass");
+    }
+
+    // ---- v3 prefill attention (Track E2) — MI300X-lane conformance gate ----
+
+    use crate::attn;
+
+    /// RAII guard for `TRITIUM_ATTN_V3` (the tritium-metal / tritium-nn env
+    /// pattern): sets the value and restores the previous one on drop
+    /// (panic-safe), so the wrapper smoke below cannot inherit a CI-exported
+    /// `TRITIUM_ATTN_V3=0` and silently compare ref-vs-ref.
+    struct AttnV3Env(Option<String>);
+
+    impl AttnV3Env {
+        fn set(v: &str) -> Self {
+            let prev = std::env::var("TRITIUM_ATTN_V3").ok();
+            // SAFETY: the only reader of this env var in this test binary is
+            // `gqa_attention_prefill`'s kill-switch lookup, which runs on this
+            // thread inside the guard's scope; no other test in the crate
+            // reads or writes the environment concurrently.
+            unsafe {
+                std::env::set_var("TRITIUM_ATTN_V3", v);
+            }
+            Self(prev)
+        }
+    }
+
+    impl Drop for AttnV3Env {
+        fn drop(&mut self) {
+            // SAFETY: same no-concurrent-env-access argument as `set`.
+            unsafe {
+                match &self.0 {
+                    Some(v) => std::env::set_var("TRITIUM_ATTN_V3", v),
+                    None => std::env::remove_var("TRITIUM_ATTN_V3"),
+                }
+            }
+        }
+    }
+
+    /// Deterministic q/k/v for an attention shape (xorshift64, the same
+    /// generator the Metal twin's gate uses — no external rng).
+    fn attn_case(
+        m: usize,
+        n_head: usize,
+        n_head_kv: usize,
+        head_dim: usize,
+        causal_offset: usize,
+    ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        let ctx_top = causal_offset + m;
+        let mut s: u64 = 0xA076_1D64_78BD_642F
+            ^ ((m as u64) << 3)
+            ^ ((n_head as u64) << 21)
+            ^ ((head_dim as u64) << 37)
+            ^ (causal_offset as u64);
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s as f32 / u64::MAX as f32) * 2.0 - 1.0
+        };
+        let q: Vec<f32> = (0..m * n_head * head_dim).map(|_| next()).collect();
+        let k: Vec<f32> = (0..ctx_top * n_head_kv * head_dim)
+            .map(|_| next())
+            .collect();
+        let v: Vec<f32> = (0..ctx_top * n_head_kv * head_dim)
+            .map(|_| next())
+            .collect();
+        (q, k, v)
+    }
+
+    /// The v3 device kernel vs the pinned-order host reference, across the
+    /// CUDA gate's regimes: staircase (m spanning multiple BQ row-blocks with
+    /// a tail), pure tail (m < BQ), deep ctx (causal_offset > 0), GQA + MHA
+    /// head groupings, head_dim at/below the HDMAX cap and not a multiple of
+    /// 32, and a ctx_max wider than ctx_top (scores-stride vs arena split).
+    ///
+    /// TWO-TIER assertion (see the `attn` module docs):
+    /// * Tier 1 (hard, always): per-element agreement at rel 1e-5 / abs 1e-6.
+    ///   Every summation ORDER is pinned identically on both sides, so any
+    ///   drift past this exp-only band is a REAL order/mapping bug.
+    /// * Tier 2 (hard by default): `to_bits` equality — HIP's `exp_f32`
+    ///   keeps CUDA's f64-round-once spelling, so bit-parity with the host's
+    ///   glibc `expf` is expected. If ONLY this tier fires, the deviation is
+    ///   exp-attributable (ocml f64 exp ULP): set
+    ///   `TRITIUM_ROCM_ATTN_STRICT_BITS=0` to demote it to a printed report,
+    ///   record the count, and file the follow-up (the Metal twin's
+    ///   documented-tolerance precedent) — do not loosen Tier 1.
+    ///
+    /// Calls the device path directly (not the dispatch wrapper), so a
+    /// wave-size fallback cannot turn this gate into a vacuous ref-vs-ref
+    /// pass; skips (loudly) when no AMD device exists and on a wave width
+    /// the kernel's analysis does not cover.
+    #[test]
+    fn attn_v3_matches_pinned_host_reference_or_skip() {
+        let backend = match RocmBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping rocm attn v3 gate: no device ({e})");
+                return;
+            }
+        };
+        if backend.wave_size != 32 && backend.wave_size != 64 {
+            eprintln!(
+                "skipping rocm attn v3 gate: probed warpSize {} is neither 32 nor 64",
+                backend.wave_size
+            );
+            return;
+        }
+        let strict_bits = std::env::var("TRITIUM_ROCM_ATTN_STRICT_BITS").map_or(true, |v| v != "0");
+
+        // (m, n_head, n_head_kv, head_dim, causal_offset, ctx_slack)
+        for &(m, n_head, n_head_kv, head_dim, causal_offset, ctx_slack) in &[
+            (1usize, 4usize, 4usize, 64usize, 0usize, 0usize), // single row, MHA
+            (5, 8, 2, 64, 0, 0),                               // tail-only block
+            (20, 8, 2, 128, 0, 0),                             // staircase + tail, HDMAX
+            (11, 8, 2, 80, 37, 0),                             // deep ctx, hd % 32 != 0
+            (16, 4, 1, 64, 3, 5),                              // ctx_max > ctx_top
+            (67, 8, 4, 64, 129, 0),                            // multi-chunk deep ctx
+        ] {
+            let ctx_max = causal_offset + m + ctx_slack;
+            let (q, k, v) = attn_case(m, n_head, n_head_kv, head_dim, causal_offset);
+            let scale = 1.0 / (head_dim as f32).sqrt();
+            let mut got = vec![0.0f32; m * n_head * head_dim];
+            let mut want = vec![0.0f32; m * n_head * head_dim];
+
+            attn::validate_v3_launch(
+                q.len(),
+                k.len(),
+                v.len(),
+                got.len(),
+                ctx_max,
+                n_head,
+                n_head_kv,
+                head_dim,
+                causal_offset,
+                m,
+            )
+            .expect("gate shape must satisfy the launch contract");
+            backend
+                .gqa_attention_prefill_v3_device(
+                    &q,
+                    &k,
+                    &v,
+                    &mut got,
+                    ctx_max,
+                    n_head,
+                    n_head_kv,
+                    head_dim,
+                    scale,
+                    causal_offset,
+                    m,
+                    attn::v3_grid(m, n_head),
+                )
+                .expect("v3 device launch");
+            attn::gqa_attention_prefill_ref(
+                &q,
+                &k,
+                &v,
+                &mut want,
+                n_head,
+                n_head_kv,
+                head_dim,
+                scale,
+                causal_offset,
+                m,
+            );
+
+            let mut bit_mismatches = 0usize;
+            for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
+                // Tier 1: any drift past the exp-only band is a real bug.
+                let diff = (g - w).abs();
+                let ok = diff <= 1e-6 || diff <= 1e-5 * w.abs();
+                assert!(
+                    ok,
+                    "[{i}] device {g} vs host {w} (m={m} n_head={n_head} kv={n_head_kv} \
+                     hd={head_dim} co={causal_offset} ctx_max={ctx_max}) — beyond the \
+                     exp-only tolerance: a pinned-order or thread-mapping bug"
+                );
+                if g.to_bits() != w.to_bits() {
+                    bit_mismatches += 1;
+                    if bit_mismatches <= 5 {
+                        eprintln!(
+                            "attn v3 bit mismatch [{i}]: device {g} ({:#010x}) vs host {w} \
+                             ({:#010x}) (m={m} n_head={n_head} kv={n_head_kv} hd={head_dim} \
+                             co={causal_offset})",
+                            g.to_bits(),
+                            w.to_bits()
+                        );
+                    }
+                }
+            }
+            // Tier 2: bit parity (expected via the f64-round-once exp).
+            if strict_bits {
+                assert_eq!(
+                    bit_mismatches,
+                    0,
+                    "attn v3: {bit_mismatches}/{} elements differ in bits while ALL pass \
+                     the exp-only tolerance (m={m} n_head={n_head} kv={n_head_kv} \
+                     hd={head_dim} co={causal_offset}). This is an ocml-exp ULP finding, \
+                     not an order bug — re-run with TRITIUM_ROCM_ATTN_STRICT_BITS=0, \
+                     record the counts, and file the documented-tolerance follow-up.",
+                    got.len()
+                );
+            } else if bit_mismatches > 0 {
+                eprintln!(
+                    "attn v3 REPORT (strict bits off): {bit_mismatches}/{} bit mismatches \
+                     at m={m} n_head={n_head} kv={n_head_kv} hd={head_dim} co={causal_offset}",
+                    got.len()
+                );
+            }
+        }
+
+        // Smoke the public dispatch wrapper once (env parsing + priority +
+        // validation glue; the loop above pinned the device kernel itself).
+        // Pin the kill switch ON for this leg: a CI-exported TRITIUM_ATTN_V3=0
+        // would otherwise route the wrapper to the host reference and turn the
+        // comparison below into a vacuous ref-vs-ref pass.
+        let _attn_env = AttnV3Env::set("1");
+        let (m, n_head, n_head_kv, head_dim, causal_offset) = (5, 8, 2, 64, 0);
+        let (q, k, v) = attn_case(m, n_head, n_head_kv, head_dim, causal_offset);
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let mut got = vec![0.0f32; m * n_head * head_dim];
+        let mut want = vec![0.0f32; m * n_head * head_dim];
+        backend
+            .gqa_attention_prefill(
+                &q,
+                &k,
+                &v,
+                &mut got,
+                causal_offset + m,
+                n_head,
+                n_head_kv,
+                head_dim,
+                scale,
+                causal_offset,
+                m,
+            )
+            .expect("dispatch wrapper");
+        attn::gqa_attention_prefill_ref(
+            &q,
+            &k,
+            &v,
+            &mut want,
+            n_head,
+            n_head_kv,
+            head_dim,
+            scale,
+            causal_offset,
+            m,
+        );
+        for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
+            let diff = (g - w).abs();
+            assert!(
+                diff <= 1e-6 || diff <= 1e-5 * w.abs(),
+                "wrapper [{i}] device {g} vs host {w}"
+            );
+        }
     }
 }

@@ -35,6 +35,7 @@ fn main() {
     // Rebuild triggers regardless of feature state: cheap, and correct when the
     // feature is later toggled on. Mirrors tritium-cuda.
     println!("cargo:rerun-if-changed=kernels/tq2_0_add.hip");
+    println!("cargo:rerun-if-changed=kernels/gqa_attention_v3.hip");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=ROCM_PATH");
     println!("cargo:rerun-if-env-changed=HIP_PATH");
@@ -56,8 +57,10 @@ fn main() {
         let out_dir = PathBuf::from(
             std::env::var_os("OUT_DIR").expect("OUT_DIR is always set by cargo for build scripts"),
         );
-        std::fs::write(out_dir.join("tq2_0_add.co"), b"")
-            .expect("tritium-rocm: failed to write check-only placeholder code object");
+        for co in ["tq2_0_add.co", "gqa_attention_v3.co"] {
+            std::fs::write(out_dir.join(co), b"")
+                .expect("tritium-rocm: failed to write check-only placeholder code object");
+        }
         return;
     }
 
@@ -77,6 +80,20 @@ fn main() {
         &hipcc,
         Path::new("kernels/tq2_0_add.hip"),
         &out_dir.join("tq2_0_add.co"),
+        &[],
+    );
+
+    // The v3 prefill-attention kernel (Track E2). `-ffp-contract=off` is
+    // LOAD-BEARING: hipcc's default HIP contract mode may fuse a separate
+    // mul + add into an FMA across statements, which would change the
+    // rounding of every pinned summation chain the ADR 0022 twin contract
+    // freezes. The kernel source carries a file-scope
+    // `#pragma clang fp contract(off)` as a second, independent guard.
+    compile_code_object(
+        &hipcc,
+        Path::new("kernels/gqa_attention_v3.hip"),
+        &out_dir.join("gqa_attention_v3.co"),
+        &["-ffp-contract=off"],
     );
 
     // Point the linker at the HIP runtime so the `#[link(name = "amdhip64")]` in
@@ -90,14 +107,16 @@ fn main() {
 }
 
 /// Compile a single `.hip` source to a relocatable AMD GPU code object covering
-/// every arch in [`SUPPORTED_GFX_ARCHS`], emitting it at `co_path`. Panics with an
-/// actionable message if hipcc is missing the source, fails, or silently produces
-/// nothing. Mirrors tritium-cuda's `compile_ptx`.
-fn compile_code_object(hipcc: &Path, src: &Path, co_path: &Path) {
+/// every arch in [`SUPPORTED_GFX_ARCHS`], emitting it at `co_path`, with any
+/// per-kernel `extra_args` (e.g. the attention kernel's `-ffp-contract=off`).
+/// Panics with an actionable message if hipcc is missing the source, fails, or
+/// silently produces nothing. Mirrors tritium-cuda's `compile_ptx`.
+fn compile_code_object(hipcc: &Path, src: &Path, co_path: &Path, extra_args: &[&str]) {
     let mut cmd = Command::new(hipcc);
     // `--genco` emits a relocatable code object (the HIP analogue of `nvcc -ptx`'s
     // standalone artifact) that `hipModuleLoadData` consumes at runtime.
     cmd.arg("--genco").arg(src).arg("-o").arg(co_path);
+    cmd.args(extra_args);
     // One `--offload-arch` per supported target; hipcc bundles them into one fat
     // object and the loader picks the slice matching the device.
     for arch in SUPPORTED_GFX_ARCHS {

@@ -62,6 +62,15 @@
 // which contains the narrowly scoped `unsafe` HIP FFI (the launch + the raw runtime
 // calls), so the crate does not blanket-`deny(unsafe_code)` like the pure-Rust
 // crates do; the FFI module documents every `unsafe` block instead.
+// Host-side structure for the v3 prefill-attention port (Track E2): launch
+// constants (pinned to kernels/gqa_attention_v3.hip by test), dispatch
+// geometry, the TRITIUM_ATTN_V3 kill-switch parser, the pinned-order CPU
+// reference the device kernel is gated against on the MI300X lane, the MFMA
+// int8 design memo, and the cloud-session runbook. Plain Rust, no HIP
+// dependency — compiled and unit-tested on every platform (the
+// CPU-verifiable half of the port), exactly like tritium-metal's `attn`.
+pub mod attn;
+
 #[cfg(feature = "rocm")]
 mod ffi;
 #[cfg(feature = "rocm")]
