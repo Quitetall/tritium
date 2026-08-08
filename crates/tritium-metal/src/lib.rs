@@ -33,9 +33,9 @@
 //! `MTLCommandQueue`, and `MTLComputePipelineState` as thread-safe for concurrent
 //! use, so the backend wraps its handles in a newtype with a narrowly-scoped,
 //! documented `unsafe impl Send + Sync`. That is the only hand-written `unsafe`
-//! in the crate (plus the `linkme` registration static, same as every backend);
-//! the crate `deny`s — not `forbid`s — unsafe so those two sites are allowed
-//! explicitly.
+//! in shipped code (plus the `linkme` registration static, same as every
+//! backend, and a test-only env-var RAII guard); the crate `deny`s — not
+//! `forbid`s — unsafe so those sites are allowed explicitly.
 #![cfg_attr(not(target_os = "macos"), forbid(unsafe_code))]
 #![cfg_attr(target_os = "macos", deny(unsafe_code))]
 #![deny(missing_docs)]

@@ -9,7 +9,8 @@
 use core::any::Any;
 
 use metal::{
-    Buffer, CommandQueue, CompileOptions, ComputePipelineState, Device, MTLResourceOptions, MTLSize,
+    Buffer, CommandQueue, CompileOptions, ComputePipelineState, Device, MTLCommandBufferStatus,
+    MTLResourceOptions, MTLSize,
 };
 
 use tritium_core::{GemmShape, TernaryFormat, Trit};
@@ -534,6 +535,9 @@ impl MetalBackend {
     /// * `head_dim > ATTN_V3_HDMAX` (the kernel's threadgroup staging bound);
     /// * the compiled pipeline's `thread_execution_width != 32` (the kernel's
     ///   warp→simdgroup mapping assumes 32-lane simdgroups);
+    /// * the compiled pipeline's `max_total_threads_per_threadgroup` is below
+    ///   the kernel's fixed 256-thread launch (register pressure can lower it
+    ///   on some devices; dispatching past it is an invalid dispatch);
     /// * the row-block count exceeds Metal's guaranteed 65535 threadgroups
     ///   per grid dimension.
     ///
@@ -580,6 +584,11 @@ impl MetalBackend {
             && head_dim <= crate::attn::ATTN_V3_HDMAX
             && self.handles.pipeline_attn_v3.thread_execution_width()
                 == crate::attn::ATTN_V3_SIMD_WIDTH as u64
+            // Register pressure can push the pipeline's threadgroup ceiling
+            // below the kernel's fixed 256-thread launch on some devices;
+            // dispatching past it is invalid, so fall back to the host rung.
+            && self.handles.pipeline_attn_v3.max_total_threads_per_threadgroup()
+                >= u64::from(crate::attn::ATTN_V3_THREADS)
             && tg_x <= 65535
             && tg_y <= 65535;
         if !use_device {
@@ -675,6 +684,18 @@ impl MetalBackend {
 
         cmd.commit();
         cmd.wait_until_completed();
+        // Metal reports invalid dispatches (bad grid, exceeded threadgroup
+        // ceiling, page fault, ...) as a command-buffer error, NOT a Rust-level
+        // failure — without this check the readback below would silently
+        // return zeros. metal-rs 0.33 exposes `status()` but no NSError
+        // accessor, so the status enum is the whole diagnostic.
+        let status = cmd.status();
+        if status != MTLCommandBufferStatus::Completed {
+            return Err(BackendError::Backend(format!(
+                "attention v3 command buffer finished with status {status:?} \
+                 (expected Completed) — the dispatch failed on-device"
+            )));
+        }
 
         read_f32(&out_buf, out);
         Ok(())
@@ -695,8 +716,17 @@ mod tests {
     fn conformance_and_fused_fallback_or_skip() {
         let backend = match MetalBackend::new() {
             Ok(b) => b,
+            // Skip ONLY the genuinely-no-device case (the attn-gate discipline):
+            // an MSL compile/pipeline failure — including one in attention.metal,
+            // which `new()` also compiles — must FAIL here, not masquerade as a
+            // skip of the mpgemm conformance.
             Err(e) => {
-                eprintln!("skipping metal conformance: no Metal device ({e})");
+                let msg = format!("{e}");
+                assert!(
+                    msg.contains("no Metal device"),
+                    "metal conformance: backend init failed (not a missing device): {msg}"
+                );
+                eprintln!("skipping metal conformance: no Metal device ({msg})");
                 return;
             }
         };
@@ -835,6 +865,40 @@ mod tests {
 
     use crate::attn;
 
+    /// RAII guard for `TRITIUM_ATTN_V3` (the tritium-nn `WeightsEnv` pattern):
+    /// sets the value and restores the previous one on drop (panic-safe), so
+    /// the wrapper smoke below cannot inherit a CI-exported `TRITIUM_ATTN_V3=0`
+    /// and silently compare ref-vs-ref.
+    struct AttnV3Env(Option<String>);
+
+    impl AttnV3Env {
+        fn set(v: &str) -> Self {
+            let prev = std::env::var("TRITIUM_ATTN_V3").ok();
+            // SAFETY: the only reader of any env var in this test binary is
+            // `gqa_attention_prefill`'s kill-switch lookup, which runs on this
+            // thread inside the guard's scope; no other test in the crate
+            // reads or writes the environment concurrently.
+            #[allow(unsafe_code)]
+            unsafe {
+                std::env::set_var("TRITIUM_ATTN_V3", v);
+            }
+            Self(prev)
+        }
+    }
+
+    impl Drop for AttnV3Env {
+        fn drop(&mut self) {
+            // SAFETY: same no-concurrent-env-access argument as `set`.
+            #[allow(unsafe_code)]
+            unsafe {
+                match &self.0 {
+                    Some(v) => std::env::set_var("TRITIUM_ATTN_V3", v),
+                    None => std::env::remove_var("TRITIUM_ATTN_V3"),
+                }
+            }
+        }
+    }
+
     /// Deterministic q/k/v for an attention shape (xorshift64, like
     /// `random_case` above — no external rng).
     fn attn_case(
@@ -902,6 +966,18 @@ mod tests {
         let width = backend.handles.pipeline_attn_v3.thread_execution_width();
         if width != attn::ATTN_V3_SIMD_WIDTH as u64 {
             eprintln!("skipping metal attn v3 gate: thread_execution_width {width} != 32");
+            return;
+        }
+        let max_total = backend
+            .handles
+            .pipeline_attn_v3
+            .max_total_threads_per_threadgroup();
+        if max_total < u64::from(attn::ATTN_V3_THREADS) {
+            // The dispatch ladder refuses the device rung here too; dispatching
+            // 256 threads against a smaller ceiling is an invalid dispatch.
+            eprintln!(
+                "skipping metal attn v3 gate: max_total_threads_per_threadgroup {max_total} < 256"
+            );
             return;
         }
 
@@ -976,6 +1052,10 @@ mod tests {
 
         // Smoke the public dispatch wrapper once (env parsing + priority +
         // validation glue; the loop above pinned the device kernel itself).
+        // Pin the kill switch ON for this leg: a CI-exported TRITIUM_ATTN_V3=0
+        // would otherwise route the wrapper to the host reference and turn the
+        // comparison below into a vacuous ref-vs-ref pass.
+        let _attn_env = AttnV3Env::set("1");
         let (m, n_head, n_head_kv, head_dim, causal_offset) = (5, 8, 2, 64, 0);
         let (q, k, v) = attn_case(m, n_head, n_head_kv, head_dim, causal_offset);
         let scale = 1.0 / (head_dim as f32).sqrt();

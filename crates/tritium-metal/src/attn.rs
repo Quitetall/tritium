@@ -99,8 +99,9 @@ pub fn v3_scores_len(m: usize, n_head: usize, ctx_max: usize) -> Option<usize> {
 ///
 /// Checks shape coherence (`n_head % n_head_kv`, `causal_offset + m <=
 /// ctx_max`), buffer lengths (`q`/`out` exactly `m·n_head·head_dim`; `k`/`v`
-/// arenas at least `ctx_top·n_head_kv·head_dim` rows), the kernel's `u32`
-/// scalar range, and scores-scratch overflow. It does NOT enforce
+/// arenas at least `ctx_top·n_head_kv·head_dim` rows), the kernel's `i32`
+/// scalar range (the MSL kernel casts its `u32` params to `int`), and
+/// scores-scratch overflow. It does NOT enforce
 /// `head_dim <= ATTN_V3_HDMAX` — that is a *dispatch* bound (too-large heads
 /// fall back to the host reference, mirroring CUDA's v3 → baseline priority),
 /// not an input error.
@@ -164,9 +165,12 @@ pub fn validate_v3_launch(
             "v len {v_len} < ctx_top*n_head_kv*head_dim = {kv_min}"
         ));
     }
-    // The kernel takes its scalars as u32 (`AttnV3Params`) and widens per-row
-    // bases to 64 bits in-kernel (the v0.6.9 discipline); reject anything that
-    // would truncate the u32 params rather than dispatching a wrapped value.
+    // The kernel takes its scalars as u32 (`AttnV3Params`) but immediately
+    // casts every one to `int` (and widens per-row bases to 64 bits in-kernel,
+    // the v0.6.9 discipline) — so the truncation bound is i32::MAX, not
+    // u32::MAX; reject anything that would go negative in the cast rather than
+    // dispatching a wrapped value. (`ctx_top <= ctx_max` above keeps the
+    // kernel's `causal_offset + row0 + nrows` int sum in range too.)
     for (name, val) in [
         ("ctx_max", ctx_max),
         ("n_head", n_head),
@@ -175,8 +179,11 @@ pub fn validate_v3_launch(
         ("causal_offset", causal_offset),
         ("m", m),
     ] {
-        if val > u32::MAX as usize {
-            return Err(format!("{name} {val} exceeds the kernel's u32 param range"));
+        if val > i32::MAX as usize {
+            return Err(format!(
+                "{name} {val} exceeds the kernel's i32 param range (the MSL \
+                 kernel casts its u32 params to int)"
+            ));
         }
     }
     if v3_scores_len(m, n_head, ctx_max).is_none() {
@@ -412,6 +419,24 @@ mod tests {
         );
         // m = 0.
         assert!(validate_v3_launch(0, 0, 0, 0, 5, 8, 2, 64, 0, 0).is_err());
+        // ctx_max past i32::MAX: the kernel casts its u32 params to int, so a
+        // value that fits u32 but not i32 must still be rejected (arena
+        // lengths only need to cover ctx_top, so this reaches the range check).
+        assert!(
+            validate_v3_launch(
+                5 * 8 * 64,
+                5 * 2 * 64,
+                5 * 2 * 64,
+                5 * 8 * 64,
+                i32::MAX as usize + 1,
+                8,
+                2,
+                64,
+                0,
+                5
+            )
+            .is_err()
+        );
         // Oversized arenas are allowed (KV arenas may be over-allocated).
         assert_eq!(
             validate_v3_launch(
