@@ -1835,9 +1835,14 @@ impl CudaDecodeModel {
     /// serve-side callers can use this one helper for both entry points.
     #[must_use]
     pub fn tree_reservation_rows(&self, prefix_len: usize, m: usize) -> usize {
-        // Mirrors `tree_forward`'s bucket predicate exactly (batch slots
-        // share every condition; region_ctx == self.max_ctx by the geometry
-        // guard).
+        // Mirrors `tree_forward`'s bucket predicate for the SLOT routes,
+        // which are the only consumers whose reservation math matters (paged
+        // BatchKv is f32-only, so the kv_elem == 4 arm here is exact for
+        // them). NB the SINGLE-SEQ gate additionally admits the f16 rung
+        // (L6, c572f75) — this helper conservatively omits that arm, which
+        // is safe: single-seq has no page reservations, and the bucket
+        // finder's prefix_len + b <= max_ctx bound prevents overflow there
+        // independently (review c572f75 F2).
         let bucket = if self.head_dim.is_multiple_of(4)
             && m <= TREE_BUCKET_MAX
             && self.max_ctx * 4 <= 48 * 1024
