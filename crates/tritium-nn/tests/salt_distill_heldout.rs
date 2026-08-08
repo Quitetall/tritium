@@ -392,10 +392,10 @@ fn salt_distillation_device_trainer_recovers_heldout() {
     //
     // alpha MUST be calibrated per model: the optimum shifts down with size (0.75 at 135M, 0.50 at
     // 360M) and the wrong one costs 4.2x at T=1. Deliberately no default.
-    let (a, fp) = match std::env::var("TRITIUM_DISTILL_SMOOTH")
+    let smooth_alpha: Option<f64> = std::env::var("TRITIUM_DISTILL_SMOOTH")
         .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-    {
+        .and_then(|v| v.parse::<f64>().ok());
+    let (a, fp) = match smooth_alpha {
         None => (a, fp),
         Some(alpha) => {
             const CALIB_WINDOWS: usize = 8;
@@ -449,6 +449,24 @@ fn salt_distillation_device_trainer_recovers_heldout() {
     let group_cfg: Option<usize> = std::env::var("TRITIUM_DISTILL_GROUP")
         .ok()
         .and_then(|v| v.parse().ok());
+    // Every fitter knob below lives on the GROUPED path; without `TRITIUM_DISTILL_GROUP` the run
+    // silently falls back to legacy per-row AbsMean and ignores all of them. That failure is
+    // invisible in the output — it just reports a plausible number for a configuration nobody asked
+    // for — so refuse it rather than produce a result that means something else. (Cost me a
+    // 124-second run reported as a ladder measurement when the ladder was never engaged.)
+    for knob in [
+        "TRITIUM_DISTILL_LADDER",
+        "TRITIUM_DISTILL_GRID",
+        "TRITIUM_DISTILL_ROTATE",
+        "TRITIUM_DISTILL_ITF",
+    ] {
+        assert!(
+            !(std::env::var_os(knob).is_some() && group_cfg.is_none()),
+            "{knob} is set but TRITIUM_DISTILL_GROUP is not. Every fitter knob lives on the grouped \
+             path; without a group this run would quietly use legacy per-row AbsMean and report a \
+             number for a different configuration than the one requested."
+        );
+    }
     let itf_cfg: usize = std::env::var("TRITIUM_DISTILL_ITF")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -575,12 +593,22 @@ fn salt_distillation_device_trainer_recovers_heldout() {
             },
         },
     });
-    if let Some(g) = grouping {
-        println!(
-            "SALT fitter: g{} +{:?} +rotation({:?})",
-            g.group, g.ladder, g.rotation
-        );
-    }
+    // Print the WHOLE fitter configuration, including the knobs that are off. A distillation number
+    // is only interpretable against the configuration that produced it, and an unset knob is
+    // invisible in the output unless it is named — which is how two runs in a row got reported
+    // against a configuration nobody had selected.
+    println!(
+        "SALT fitter: {} | salience fold: {} | planes: {planes}",
+        match grouping {
+            Some(g) => format!("g{} +{:?} +rotation({:?})", g.group, g.ladder, g.rotation),
+            None => "NONE (legacy per-row AbsMean — set TRITIUM_DISTILL_GROUP)".to_string(),
+        },
+        match smooth_alpha {
+            Some(a) => format!("alpha={a}"),
+            None =>
+                "OFF (set TRITIUM_DISTILL_SMOOTH; it is the largest single PTQ win)".to_string(),
+        },
+    );
     let mut trainer = DeviceTrainer::new_with_fitter(
         &backend,
         &specs,
@@ -752,10 +780,38 @@ fn salt_distillation_device_trainer_recovers_heldout() {
     );
 
     assert!(ppl_ptq > ppl_fp, "PTQ must degrade held-out ppl");
-    assert!(
-        recovery >= 950.0,
-        "resident trainer recovered only {recovery:.0}x vs PTQ (expected about 960x)"
-    );
+
+    // The success criterion depends on the FITTER, because `recovery = ppl_ptq / ppl_distilled` is
+    // only meaningful when PTQ is bad. The 950x gate was calibrated against the per-row AbsMean
+    // start, whose PTQ perplexity was ~1e5x fp — there was that much to recover. The balanced-
+    // ternary ladder starts at 1.09x fp at T=3, so its "recovery" is near 1 BY CONSTRUCTION and a
+    // 950x threshold would fail a strictly better run. Asserting the same number on both would not
+    // be a stronger gate, it would be an incoherent one.
+    //
+    // So: the committed path keeps its exact threshold, and the ladder path gets the criterion that
+    // actually applies to it — distillation must not make a good start WORSE. The real target
+    // (<=1% of fp) is a campaign goal tracked through the `curve:` lines, not a unit-test bound.
+    let gap_to_fp = ppl_distilled / ppl_fp;
+    match grouping.map(|g| g.ladder) {
+        Some(SaltLadder::Geometric { .. }) => {
+            println!(
+                "ladder arm: PTQ {:.3}x fp -> distilled {gap_to_fp:.3}x fp \
+                 ({:+.1}% vs the PTQ start)",
+                ppl_ptq / ppl_fp,
+                100.0 * (ppl_distilled / ppl_ptq - 1.0),
+            );
+            assert!(
+                ppl_distilled <= ppl_ptq,
+                "distillation made a good start WORSE: PTQ {ppl_ptq:.3} -> {ppl_distilled:.3}. \
+                 The LR schedule is the first suspect — 2e-3 was tuned for a ~1e5x init and \
+                 destroyed a 5.25x one (2e94a99), and the ladder's init is better still."
+            );
+        }
+        _ => assert!(
+            recovery >= 950.0,
+            "resident trainer recovered only {recovery:.0}x vs PTQ (expected about 960x)"
+        ),
+    }
     assert!(
         mean_ms < TRACK0_STEP_MS,
         "resident mean step {mean_ms:.0}ms did not beat Track-0 {TRACK0_STEP_MS:.0}ms"
