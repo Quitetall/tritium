@@ -103,6 +103,10 @@ pub(super) struct GraphPtrs {
     pub(super) d_sin: sys::CUdeviceptr,
     pub(super) d_token_embd: sys::CUdeviceptr,
     pub(super) d_token_embd_f16: sys::CUdeviceptr,
+    /// ADR 0036 L2 i8 head rung table + scales; 0 (never dereferenced) on the
+    /// default f16 head.
+    pub(super) d_token_embd_i8: sys::CUdeviceptr,
+    pub(super) d_lm_head_scales: sys::CUdeviceptr,
     pub(super) d_output_norm: sys::CUdeviceptr,
 }
 
@@ -128,6 +132,9 @@ pub(super) struct RawGraphKernels {
     pub(super) residual: sys::CUfunction,
     pub(super) relu2: sys::CUfunction,
     pub(super) lm_head: sys::CUfunction,
+    /// ADR 0036 L2 opt-in i8 head (captured only when the model was built
+    /// under `TRITIUM_LM_HEAD=i8`; resolved unconditionally — same module).
+    pub(super) lm_head_i8: sys::CUfunction,
     pub(super) act_quant: sys::CUfunction,
     pub(super) scale: sys::CUfunction,
     pub(super) tiled: sys::CUfunction,
@@ -227,6 +234,7 @@ impl RawGraphKernels {
             // Coalesced warp-per-row LM head reading the f16 token_embd (bit-identical to
             // the f32 warp head — f16 is the GGUF's native precision — at half the read).
             lm_head: get(dm, KERNEL_NAME_LM_HEAD_WARP_F16)?,
+            lm_head_i8: get(dm, KERNEL_NAME_LM_HEAD_WARP_I8)?,
             // f32-accumulate GEMM (the f64 one is 1/64-rate on consumer GPUs).
             tiled: get(am, KERNEL_NAME_TILED_F32)?,
             // DP4A fused-scaled variant: packed-int8 activations, act_scale folded
@@ -292,6 +300,8 @@ pub(super) struct BatchRawKernels {
     /// gate), so a TQ1-packed model batches/trees in the same numerics domain.
     pub(super) tq1_tiled_scaled: sys::CUfunction,
     pub(super) lm_head_tiled: sys::CUfunction,
+    /// ADR 0036 L2 opt-in i8 tiled head (batched-graph verify/decode head).
+    pub(super) lm_head_tiled_i8: sys::CUfunction,
     pub(super) argmax: sys::CUfunction,
     /// Ctrl-driven tree-verify trunk kernels (graph-capturable twins — read
     /// [prefix_len, real_m] from a device buffer instead of baked scalars).
@@ -374,6 +384,7 @@ impl BatchRawKernels {
             tiled_scaled: get(am, KERNEL_NAME_TILED_I8_SCALED)?,
             tq1_tiled_scaled: get(am, KERNEL_NAME_TQ1_TILED_I8_SCALED)?,
             lm_head_tiled: get(dm, KERNEL_NAME_LM_HEAD_TILED_F16)?,
+            lm_head_tiled_i8: get(dm, KERNEL_NAME_LM_HEAD_TILED_I8)?,
             argmax: get(dm, KERNEL_NAME_ARGMAX_ROWS)?,
             kv_append_tree: get(
                 dm,
@@ -472,6 +483,10 @@ pub(super) struct BatchPtrs {
     pub(super) d_output_norm: sys::CUdeviceptr,
     // On-device-sampling head (only used when the argmax graph is captured).
     pub(super) d_token_embd_f16: sys::CUdeviceptr,
+    /// ADR 0036 L2 i8 head rung table + scales; 0 (never dereferenced) on the
+    /// default f16 head.
+    pub(super) d_token_embd_i8: sys::CUdeviceptr,
+    pub(super) d_lm_head_scales: sys::CUdeviceptr,
     pub(super) d_logits_batch: sys::CUdeviceptr,
     pub(super) d_argmax: sys::CUdeviceptr,
     /// Paged KV (ADR 0025): `(d_table, tstride)`; `None` = dense. The table

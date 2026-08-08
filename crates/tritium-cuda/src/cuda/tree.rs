@@ -442,16 +442,7 @@ impl CudaDecodeModel {
                 m,
                 &mut ts.d_norm_all,
             )?;
-            Self::bl_lm_head_tiled(
-                cs,
-                &self.f_lm_head_tiled,
-                &ts.d_norm_all,
-                &self.d_token_embd_f16,
-                n_embd,
-                self.vocab,
-                m,
-                &mut ts.d_logits_all,
-            )?;
+            self.launch_head_tiled(cs, &ts.d_norm_all, m, &mut ts.d_logits_all)?;
             // No sync here (L2): consumers run their argmax/readback on
             // `cap_stream` (see `on_cap`), and the pageable dtoh they end with
             // drains the stream before any default-stream work (promote)
@@ -909,16 +900,7 @@ impl CudaDecodeModel {
                 m,
                 &mut ts.d_norm_all,
             )?;
-            Self::bl_lm_head_tiled(
-                s,
-                &self.f_lm_head_tiled,
-                &ts.d_norm_all,
-                &self.d_token_embd_f16,
-                n_embd,
-                self.vocab,
-                m,
-                &mut ts.d_logits_all,
-            )?;
+            self.launch_head_tiled(s, &ts.d_norm_all, m, &mut ts.d_logits_all)?;
         }
         // Forward complete: logits for every tree node sit in the target's
         // `tree_scratch.d_logits_all[0..m*vocab]`; provisional K/V occupy
@@ -2298,16 +2280,7 @@ impl CudaDecodeModel {
                 m_total,
                 &mut ts.d_norm_all,
             )?;
-            Self::bl_lm_head_tiled(
-                cs,
-                &self.f_lm_head_tiled,
-                &ts.d_norm_all,
-                &self.d_token_embd_f16,
-                n_embd,
-                self.vocab,
-                m_total,
-                &mut ts.d_logits_all,
-            )?;
+            self.launch_head_tiled(cs, &ts.d_norm_all, m_total, &mut ts.d_logits_all)?;
         } else {
             // ── Eager route: the SAME slots kernels launched per layer on
             // the default stream (the I3 eager-paged shape — no region views
@@ -2605,16 +2578,7 @@ impl CudaDecodeModel {
                 m,
                 &mut ts.d_norm_all,
             )?;
-            Self::bl_lm_head_tiled(
-                s,
-                &self.f_lm_head_tiled,
-                &ts.d_norm_all,
-                &self.d_token_embd_f16,
-                n_embd,
-                self.vocab,
-                m,
-                &mut ts.d_logits_all,
-            )?;
+            self.launch_head_tiled(s, &ts.d_norm_all, m, &mut ts.d_logits_all)?;
         }
         batch.tree_scratch = Some(ts);
         Ok((m_total, bucket.is_some()))

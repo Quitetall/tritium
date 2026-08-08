@@ -57,6 +57,39 @@ impl KvDtype {
 /// Keep in sync with `KV_QGROUP` in decode.cu (i8 rung group size).
 pub(super) const KV_QGROUP: usize = 64;
 
+/// LM-head table dtype (ADR 0036 L2). Selected by `TRITIUM_LM_HEAD=f16|i8`,
+/// parsed ONCE at model build. `F16` (default) is the sanctioned bit-exactness
+/// exception (ADR 0013); `I8` is the opt-in rung — 64-wide absmax groups along
+/// the embedding dim, f32 scales `[vocab, n_embd/64]`, half the table read.
+/// The i8 head is NOT token-identical to f16 — it is ppl (≤1.001×) + τ-gated
+/// per the L2 gate; the f16 table stays resident either way (embedding gather
+/// + prefill head keep reading it).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum LmHeadDtype {
+    F16,
+    I8,
+}
+
+/// LM-head i8 rung group width along the embedding dim. Keep in sync with
+/// `LMHEAD_QGROUP` in decode.cu.
+pub(super) const LM_HEAD_QGROUP: usize = 64;
+
+pub(super) fn lm_head_dtype_from_env() -> Result<LmHeadDtype, BackendError> {
+    match std::env::var("TRITIUM_LM_HEAD") {
+        Err(std::env::VarError::NotPresent) => Ok(LmHeadDtype::F16),
+        Ok(v) => match v.as_str() {
+            "f16" | "" => Ok(LmHeadDtype::F16),
+            "i8" => Ok(LmHeadDtype::I8),
+            // Reject loudly: a typo silently running f16 would invalidate
+            // whatever A/B the user thought they were running.
+            other => Err(BackendError::InvalidInput(format!(
+                "TRITIUM_LM_HEAD={other:?} — use f16 (default) or i8"
+            ))),
+        },
+        Err(e) => Err(BackendError::InvalidInput(format!("TRITIUM_LM_HEAD: {e}"))),
+    }
+}
+
 pub(super) fn kv_dtype_from_env() -> Result<KvDtype, BackendError> {
     // Legacy alias first (still honored; the new var wins if both are set).
     let legacy = match std::env::var("TRITIUM_KV_F16") {

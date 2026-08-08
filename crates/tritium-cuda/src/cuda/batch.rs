@@ -594,15 +594,7 @@ impl CudaDecodeModel {
                 s.memcpy_dtod(&row, &mut batch.d_h)
                     .map_err(|e| driver_err("batch row copy", &e))?;
             }
-            Self::bl_lm_head_f16(
-                s,
-                &self.f_lm_head_f16,
-                &batch.d_h,
-                &self.d_token_embd_f16,
-                n_embd,
-                self.vocab,
-                &mut batch.d_logits,
-            )?;
+            self.launch_head_warp(s, &batch.d_h, &mut batch.d_logits)?;
             let mut logits = vec![0.0f32; self.vocab];
             s.memcpy_dtoh(&batch.d_logits, &mut logits)
                 .map_err(|e| driver_err("batch logits dtoh", &e))?;
@@ -856,15 +848,7 @@ impl CudaDecodeModel {
                 s.memcpy_dtod(&row, &mut batch.d_h)
                     .map_err(|e| driver_err("batch graph row copy", &e))?;
             }
-            Self::bl_lm_head_f16(
-                s,
-                &self.f_lm_head_f16,
-                &batch.d_h,
-                &self.d_token_embd_f16,
-                n_embd,
-                self.vocab,
-                &mut batch.d_logits,
-            )?;
+            self.launch_head_warp(s, &batch.d_h, &mut batch.d_logits)?;
             let mut logits = vec![0.0f32; self.vocab];
             s.memcpy_dtoh(&batch.d_logits, &mut logits)
                 .map_err(|e| driver_err("batch graph logits dtoh", &e))?;
@@ -1182,6 +1166,8 @@ impl CudaDecodeModel {
             d_token_embd: dptr(&self.d_token_embd, s),
             d_output_norm: dptr(&self.d_output_norm, s),
             d_token_embd_f16: dptr(&self.d_token_embd_f16, s),
+            d_token_embd_i8: self.d_token_embd_i8.as_ref().map_or(0, |b| dptr(b, s)),
+            d_lm_head_scales: self.d_lm_head_scales.as_ref().map_or(0, |b| dptr(b, s)),
             d_logits_batch: dptr(&batch.d_logits_batch, s),
             d_argmax: dptr(&batch.d_argmax, s),
             paged: batch
@@ -1210,7 +1196,14 @@ impl CudaDecodeModel {
             if with_head {
                 // Batched LM head over all n rows → d_logits_batch, then per-row greedy argmax →
                 // d_argmax. Both raw-launched into the capture; only d_argmax is read back.
-                self.gb_lm_head_batch(p.d_normed, p.d_token_embd_f16, p.d_logits_batch, n)?;
+                self.gb_lm_head_batch(
+                    p.d_normed,
+                    p.d_token_embd_f16,
+                    p.d_token_embd_i8,
+                    p.d_lm_head_scales,
+                    p.d_logits_batch,
+                    n,
+                )?;
                 self.gb_argmax(p.d_logits_batch, p.d_argmax, n)?;
             }
             Ok(())
@@ -1626,14 +1619,17 @@ impl CudaDecodeModel {
         )
     }
 
-    /// Batched LM head over all `n` rows: `d_normed[n, n_embd] · token_embd_f16 → d_logits[n, vocab]`.
+    /// Batched LM head over all `n` rows: `d_normed[n, n_embd] · token_embd → d_logits[n, vocab]`.
     /// One warp per vocab row, computing `LMHEAD_ROW_TILE` output rows per launch so the embd
     /// table is read once per row-tile (not once per row); `grid.y = ceil(n / TILE)`.
-    /// Bit-identical per row to the single-row head.
+    /// Bit-identical per row to the single-row head of the SAME dtype: f16 tiled by
+    /// default; the ADR 0036 L2 opt-in rung captures the i8 tiled twin (table + scales).
     pub(super) fn gb_lm_head_batch(
         &self,
         h: sys::CUdeviceptr,
-        embd: sys::CUdeviceptr,
+        embd_f16: sys::CUdeviceptr,
+        embd_i8: sys::CUdeviceptr,
+        scales: sys::CUdeviceptr,
         d_logits: sys::CUdeviceptr,
         n: usize,
     ) -> Result<(), BackendError> {
@@ -1643,22 +1639,45 @@ impl CudaDecodeModel {
             (n as u32).div_ceil(LMHEAD_ROW_TILE),
             1,
         );
-        let mut params = [
-            pp(&h),
-            pp(&embd),
-            pp(&ne_i),
-            pp(&v_i),
-            pp(&n_i),
-            pp(&d_logits),
-        ];
-        raw_launch(
-            self.batch_raw().lm_head_tiled,
-            grid,
-            (256, 1, 1),
-            0,
-            self.cap_stream.cu_stream(),
-            &mut params,
-        )
+        match self.head_dtype {
+            LmHeadDtype::F16 => {
+                let mut params = [
+                    pp(&h),
+                    pp(&embd_f16),
+                    pp(&ne_i),
+                    pp(&v_i),
+                    pp(&n_i),
+                    pp(&d_logits),
+                ];
+                raw_launch(
+                    self.batch_raw().lm_head_tiled,
+                    grid,
+                    (256, 1, 1),
+                    0,
+                    self.cap_stream.cu_stream(),
+                    &mut params,
+                )
+            }
+            LmHeadDtype::I8 => {
+                let mut params = [
+                    pp(&h),
+                    pp(&embd_i8),
+                    pp(&scales),
+                    pp(&ne_i),
+                    pp(&v_i),
+                    pp(&n_i),
+                    pp(&d_logits),
+                ];
+                raw_launch(
+                    self.batch_raw().lm_head_tiled_i8,
+                    grid,
+                    (256, 1, 1),
+                    0,
+                    self.cap_stream.cu_stream(),
+                    &mut params,
+                )
+            }
+        }
     }
 
     /// Per-row greedy argmax `d_logits[n, vocab] → d_out[n]` (i32). One block per row.

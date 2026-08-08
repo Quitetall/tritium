@@ -3093,6 +3093,42 @@ __global__ void lm_head_warp_f16(const float* __restrict__ h, const __half* __re
   lm_head_warp_body<KvLoadF16>(h, embd, n_embd, vocab, logits);
 }
 
+// LM-head int8 rung group width (ADR 0036 L2). 64 embedding dims share one
+// absmax/127 f32 scale — [vocab, n_embd/64] scales beside the i8 table. Keep in
+// sync with `LM_HEAD_QGROUP` in kv.rs.
+#define LMHEAD_QGROUP 64
+
+// lm_head_warp_i8 — ADR 0036 L2 **opt-in** head rung (`TRITIUM_LM_HEAD=i8`): the tied
+// head over an int8 copy of `token_embd` (64-wide absmax groups along the embedding dim,
+// f32 scales `[vocab, n_embd/64]`) at HALF the f16 read (656 → 328 MB/token + ~20 MB
+// scales). **NOT bit-identical to the f16 head**: logits carry group-quantization error —
+// the rung is ppl/τ-gated (OPTIMIZATION-LOG round-25 addendum; default stays f16).
+// Per-lane fold order is PINNED for the host oracle and the tiled twin: k = lane + 32·t
+// ascending, per element one __fmul_rn(scale, __fmul_rn(h, q)) then __fadd_rn — trip t's
+// k-range [32t, 32t+32) sits wholly in group t/2, so the scale load is lane-uniform.
+// The inner loop is unroll-8 fixed-trip: a naive per-group loop was LATENCY-bound at
+// 0.65× (trap recorded, round-25 addendum); unrolling restores the memory-bound 2× win.
+__global__ void lm_head_warp_i8(const float* __restrict__ h,
+                                const signed char* __restrict__ embd,
+                                const float* __restrict__ scales, const int n_embd,
+                                const int vocab, float* __restrict__ logits) {
+  const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+  const int lane = threadIdx.x & 31;
+  if (warp >= vocab) return;
+  const signed char* row = embd + (long long)warp * n_embd;
+  const float* srow = scales + (long long)warp * (n_embd / LMHEAD_QGROUP);
+  float acc = 0.0f;
+  const int trips = n_embd >> 5;  // 32 consecutive bytes per warp per trip (coalesced)
+#pragma unroll 8
+  for (int t = 0; t < trips; ++t) {
+    const int k = lane + (t << 5);
+    const float s = srow[t >> 1];  // lane-uniform: [32t, 32t+32) ⊂ group t/2
+    acc = __fadd_rn(acc, __fmul_rn(s, __fmul_rn(h[k], (float)row[k])));
+  }
+  for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffff, acc, off);
+  if (lane == 0) logits[warp] = acc;
+}
+
 // ===========================================================================
 // v0.3.6: M>1 (batched) kernels for the **prefill** forward — process all P prompt
 // tokens in ONE device-resident forward instead of P sequential M=1 decode steps
@@ -4187,6 +4223,49 @@ __global__ void lm_head_tiled_f16(const float* __restrict__ h, const __half* __r
     for (int r = 0; r < LMHEAD_ROW_TILE; ++r) {
       const int mi = row0 + r;
       if (mi < m) acc[r] = __fadd_rn(acc[r], __fmul_rn(h[(long long)mi * n_embd + k], e));
+    }
+  }
+#pragma unroll
+  for (int r = 0; r < LMHEAD_ROW_TILE; ++r) {
+    float a = acc[r];
+    for (int off = 16; off > 0; off >>= 1) a += __shfl_down_sync(0xffffffff, a, off);
+    const int mi = row0 + r;
+    if (lane == 0 && mi < m) logits[(long long)mi * vocab + warp] = a;
+  }
+}
+
+// lm_head_tiled_i8 — batched twin of `lm_head_warp_i8` (ADR 0036 L2, opt-in): row-tiled
+// like `lm_head_tiled_f16` so the i8 table streams once per LMHEAD_ROW_TILE output rows —
+// this is the TREE-VERIFY head (44.5% of spec-loop GPU, ADR 0032) at half the table read.
+// BIT-IDENTICAL per row to `lm_head_warp_i8`: same k = lane + 32·t order, same
+// __fmul_rn(s, __fmul_rn(h, q)) / __fadd_rn per element (s and q are NOT pre-folded —
+// folding would reorder the two multiplies vs the warp twin), same warp tree-reduce.
+// Arithmetic stays under the roofline knee: 8 rows × 3 ops per i8 byte = 24 ops/byte.
+__global__ void lm_head_tiled_i8(const float* __restrict__ h,
+                                 const signed char* __restrict__ embd,
+                                 const float* __restrict__ scales, const int n_embd,
+                                 const int vocab, const int m, float* __restrict__ logits) {
+  const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+  const int lane = threadIdx.x & 31;
+  if (warp >= vocab) return;
+  const int row0 = blockIdx.y * LMHEAD_ROW_TILE;
+  const signed char* erow = embd + (long long)warp * n_embd;
+  const float* srow = scales + (long long)warp * (n_embd / LMHEAD_QGROUP);
+  float acc[LMHEAD_ROW_TILE];
+#pragma unroll
+  for (int r = 0; r < LMHEAD_ROW_TILE; ++r) acc[r] = 0.0f;
+  const int trips = n_embd >> 5;
+#pragma unroll 8
+  for (int t = 0; t < trips; ++t) {
+    const int k = lane + (t << 5);
+    const float s = srow[t >> 1];
+    const float q = (float)erow[k];
+#pragma unroll
+    for (int r = 0; r < LMHEAD_ROW_TILE; ++r) {
+      const int mi = row0 + r;
+      if (mi < m) {
+        acc[r] = __fadd_rn(acc[r], __fmul_rn(s, __fmul_rn(h[(long long)mi * n_embd + k], q)));
+      }
     }
   }
 #pragma unroll

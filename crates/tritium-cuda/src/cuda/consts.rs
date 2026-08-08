@@ -179,6 +179,12 @@ pub(super) const KERNEL_NAME_RMSNORM_SHARED: &str = "rmsnorm_shared_f32";
 /// f16-`token_embd` warp LM head for the graph (v0.3.4 perf) — bit-identical to the f32
 /// warp head (f16 is the GGUF's native precision), halves the 1.3 GB/token table read.
 pub(super) const KERNEL_NAME_LM_HEAD_WARP_F16: &str = "lm_head_warp_f16";
+/// ADR 0036 L2 opt-in int8 head rung (`TRITIUM_LM_HEAD=i8`): i8 table +
+/// per-64-group f32 scales at half the f16 read. NOT bit-identical to the f16
+/// head — ppl/τ-gated (OPTIMIZATION-LOG round-25 addendum).
+pub(super) const KERNEL_NAME_LM_HEAD_WARP_I8: &str = "lm_head_warp_i8";
+/// Batched (row-tiled) twin of the i8 head — the tree-verify / batched-graph head.
+pub(super) const KERNEL_NAME_LM_HEAD_TILED_I8: &str = "lm_head_tiled_i8";
 /// v0.3.6 batched (M>1) prefill kernels — process the whole prompt in one forward.
 pub(super) const KERNEL_NAME_RMSNORM_BATCH: &str = "rmsnorm_batch_f32";
 pub(super) const KERNEL_NAME_EMBED_BATCH: &str = "embedding_gather_batch_f32";

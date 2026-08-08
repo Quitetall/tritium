@@ -3496,6 +3496,317 @@ fn residual_embed_lmhead_bit_match_host() {
     }
 }
 
+/// ADR 0036 L2 i8 head rung drift gate: `lm_head_warp_i8` must reproduce a host
+/// oracle that emulates the kernel's PINNED fold order exactly (per lane
+/// k = lane + 32·t ascending, per element `fadd(acc, fmul(scale, fmul(h, q)))`,
+/// then the 16/8/4/2/1 shuffle tree), and `lm_head_tiled_i8` must match the warp
+/// twin bit-for-bit per row (same per-element order by construction — scale and
+/// q deliberately NOT pre-folded). The quantizer here mirrors
+/// `build_decode_model`'s: per-64-group absmax/127, round half-away, clamp ±127.
+#[test]
+fn lm_head_i8_warp_and_tiled_match_host_oracle_bitwise() {
+    use cudarc::driver::{CudaContext, LaunchConfig, PushKernelArg};
+    use cudarc::nvrtc::Ptx;
+
+    let ctx = match CudaContext::new(0) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("skipping lm_head i8 gate: no device ({e})");
+            return;
+        }
+    };
+    let stream = ctx.default_stream();
+    let dm = ctx
+        .load_module(Ptx::from_src(DECODE_PTX))
+        .expect("load decode module");
+    let f_warp = dm.load_function("lm_head_warp_i8").expect("warp i8 fn");
+    let f_tiled = dm.load_function("lm_head_tiled_i8").expect("tiled i8 fn");
+
+    // Odd vocab exercises the tail warp; n_embd = 2560 is the 2B4T shape
+    // (40 groups); m = 13 exercises a partial row tile.
+    let (vocab, n_embd, m) = (257usize, 2560usize, 13usize);
+    const G: usize = 64;
+    let n_groups = n_embd / G;
+
+    let mut s = 0x51AB_77E1_0F3C_2D19u64;
+    let mut next = move || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        ((s >> 11) as f32 / (1u64 << 53) as f32) * 4.0 - 2.0
+    };
+    let table: Vec<f32> = (0..vocab * n_embd).map(|_| next()).collect();
+    let h: Vec<f32> = (0..m * n_embd).map(|_| next()).collect();
+
+    // Host quantizer — MUST mirror build_decode_model's exactly.
+    let mut q = vec![0i8; vocab * n_embd];
+    let mut sc = vec![0.0f32; vocab * n_groups];
+    for v in 0..vocab {
+        let row = &table[v * n_embd..(v + 1) * n_embd];
+        for g in 0..n_groups {
+            let grp = &row[g * G..(g + 1) * G];
+            let absmax = grp.iter().fold(0.0f32, |a, &x| a.max(x.abs()));
+            let scale = absmax / 127.0;
+            sc[v * n_groups + g] = scale;
+            if scale > 0.0 {
+                for (j, &x) in grp.iter().enumerate() {
+                    q[v * n_embd + g * G + j] = (x / scale).round().clamp(-127.0, 127.0) as i8;
+                }
+            }
+        }
+    }
+
+    // Host oracle in the kernel's exact fp order (Rust f32 * / + are the same
+    // correctly-rounded ops as __fmul_rn/__fadd_rn).
+    let oracle_row = |hrow: &[f32], v: usize| -> f32 {
+        let qrow = &q[v * n_embd..(v + 1) * n_embd];
+        let srow = &sc[v * n_groups..(v + 1) * n_groups];
+        let mut lanes = [0.0f32; 32];
+        let trips = n_embd / 32;
+        for (lane, acc) in lanes.iter_mut().enumerate() {
+            for t in 0..trips {
+                let k = lane + 32 * t;
+                *acc += srow[t / 2] * (hrow[k] * f32::from(qrow[k]));
+            }
+        }
+        for off in [16usize, 8, 4, 2, 1] {
+            for l in 0..off {
+                lanes[l] += lanes[l + off];
+            }
+        }
+        lanes[0]
+    };
+
+    let d_q = stream.clone_htod(&q).expect("q htod");
+    let d_sc = stream.clone_htod(&sc).expect("scales htod");
+    let d_h = stream.clone_htod(&h).expect("h htod");
+    let (ne_i, v_i, m_i) = (n_embd as i32, vocab as i32, m as i32);
+
+    // Warp head over row 0's hidden state.
+    let d_h0 = stream.clone_htod(&h[..n_embd]).expect("h0 htod");
+    let mut d_logits: cudarc::driver::CudaSlice<f32> = stream.alloc_zeros(vocab).expect("logits");
+    let cfg_warp = LaunchConfig {
+        grid_dim: ((vocab as u32).div_ceil(8), 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    {
+        let mut l = stream.launch_builder(&f_warp);
+        l.arg(&d_h0)
+            .arg(&d_q)
+            .arg(&d_sc)
+            .arg(&ne_i)
+            .arg(&v_i)
+            .arg(&mut d_logits);
+        #[allow(unsafe_code)]
+        unsafe {
+            l.launch(cfg_warp).expect("launch warp i8");
+        }
+    }
+    let mut got_warp = vec![0.0f32; vocab];
+    stream.memcpy_dtoh(&d_logits, &mut got_warp).expect("dtoh");
+    for v in 0..vocab {
+        let want = oracle_row(&h[..n_embd], v);
+        assert_eq!(
+            got_warp[v].to_bits(),
+            want.to_bits(),
+            "lm_head_warp_i8 diverges from host oracle at [{v}]: got {} want {want}",
+            got_warp[v]
+        );
+    }
+
+    // Tiled head over all m rows — every row must equal the oracle (and hence
+    // the warp twin) bit-for-bit.
+    let mut d_logits_all: cudarc::driver::CudaSlice<f32> =
+        stream.alloc_zeros(m * vocab).expect("logits all");
+    let cfg_tiled = LaunchConfig {
+        grid_dim: (
+            ((vocab * 32) as u32).div_ceil(256),
+            (m as u32).div_ceil(8), // LMHEAD_ROW_TILE
+            1,
+        ),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    {
+        let mut l = stream.launch_builder(&f_tiled);
+        l.arg(&d_h)
+            .arg(&d_q)
+            .arg(&d_sc)
+            .arg(&ne_i)
+            .arg(&v_i)
+            .arg(&m_i)
+            .arg(&mut d_logits_all);
+        #[allow(unsafe_code)]
+        unsafe {
+            l.launch(cfg_tiled).expect("launch tiled i8");
+        }
+    }
+    let mut got_tiled = vec![0.0f32; m * vocab];
+    stream
+        .memcpy_dtoh(&d_logits_all, &mut got_tiled)
+        .expect("dtoh tiled");
+    for mi in 0..m {
+        let hrow = &h[mi * n_embd..(mi + 1) * n_embd];
+        for v in 0..vocab {
+            let want = oracle_row(hrow, v);
+            assert_eq!(
+                got_tiled[mi * vocab + v].to_bits(),
+                want.to_bits(),
+                "lm_head_tiled_i8 diverges from host oracle at [{mi},{v}]"
+            );
+        }
+    }
+    eprintln!(
+        "lm_head i8 drift gate: warp {vocab} rows + tiled {m}x{vocab} rows all bit-exact vs host oracle"
+    );
+}
+
+/// ADR 0036 L2 head-format kernel A/B at equal M=1 shapes (the ≥1.6× gate):
+/// `lm_head_warp_i8` vs `lm_head_warp_f16` on the 2B4T head shape
+/// (vocab 128256 × n_embd 2560 — 656 MB f16 / 328 MB i8 + 20.5 MB scales, both
+/// far beyond L2, so the timing is naturally L2-defeated). Same-session ABBA
+/// (f16, i8, i8, f16), 40 timed launches per leg after warmup.
+#[test]
+#[ignore = "perf bench: needs a quiet GPU box; run explicitly"]
+fn lm_head_i8_vs_f16_m1_abba_bench() {
+    use cudarc::driver::{CudaContext, LaunchConfig, PushKernelArg};
+    use cudarc::nvrtc::Ptx;
+    use std::time::Instant;
+
+    let ctx = match CudaContext::new(0) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("skipping lm_head i8 bench: no device ({e})");
+            return;
+        }
+    };
+    let stream = ctx.default_stream();
+    let dm = ctx
+        .load_module(Ptx::from_src(DECODE_PTX))
+        .expect("load decode module");
+    let f_f16 = dm.load_function("lm_head_warp_f16").expect("f16 fn");
+    let f_i8 = dm.load_function("lm_head_warp_i8").expect("i8 fn");
+
+    let (vocab, n_embd) = (128_256usize, 2560usize);
+    const G: usize = 64;
+    let n_groups = n_embd / G;
+
+    let mut s = 0xBEE5_1234u64;
+    let mut next = move || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        ((s >> 11) as f32 / (1u64 << 53) as f32) * 2.0 - 1.0
+    };
+    // Table filled row-block-wise to keep host memory modest.
+    let mut table_f16 = vec![0u16; vocab * n_embd];
+    let mut q = vec![0i8; vocab * n_embd];
+    let mut sc = vec![0.0f32; vocab * n_groups];
+    for v in 0..vocab {
+        let mut row = vec![0.0f32; n_embd];
+        for x in row.iter_mut() {
+            *x = next();
+        }
+        for g in 0..n_groups {
+            let grp = &row[g * G..(g + 1) * G];
+            let absmax = grp.iter().fold(0.0f32, |a, &x| a.max(x.abs()));
+            let scale = absmax / 127.0;
+            sc[v * n_groups + g] = scale;
+            if scale > 0.0 {
+                for (j, &x) in grp.iter().enumerate() {
+                    q[v * n_embd + g * G + j] = (x / scale).round().clamp(-127.0, 127.0) as i8;
+                }
+            }
+        }
+        for (k, &x) in row.iter().enumerate() {
+            table_f16[v * n_embd + k] = half::f16::from_f32(x).to_bits();
+        }
+    }
+    let h: Vec<f32> = (0..n_embd).map(|_| next()).collect();
+
+    let d_f16 = stream.clone_htod(&table_f16).expect("f16 htod");
+    let d_q = stream.clone_htod(&q).expect("i8 htod");
+    let d_sc = stream.clone_htod(&sc).expect("scales htod");
+    let d_h = stream.clone_htod(&h).expect("h htod");
+    let mut d_logits: cudarc::driver::CudaSlice<f32> = stream.alloc_zeros(vocab).expect("logits");
+    let (ne_i, v_i) = (n_embd as i32, vocab as i32);
+    let cfg = LaunchConfig {
+        grid_dim: ((vocab as u32).div_ceil(8), 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let mut time_leg = |which: &str| -> f64 {
+        const WARMUP: usize = 8;
+        const RUNS: usize = 40;
+        for _ in 0..WARMUP {
+            #[allow(unsafe_code)]
+            match which {
+                "f16" => {
+                    let mut l = stream.launch_builder(&f_f16);
+                    l.arg(&d_h)
+                        .arg(&d_f16)
+                        .arg(&ne_i)
+                        .arg(&v_i)
+                        .arg(&mut d_logits);
+                    unsafe { l.launch(cfg).expect("warmup f16") }
+                }
+                _ => {
+                    let mut l = stream.launch_builder(&f_i8);
+                    l.arg(&d_h)
+                        .arg(&d_q)
+                        .arg(&d_sc)
+                        .arg(&ne_i)
+                        .arg(&v_i)
+                        .arg(&mut d_logits);
+                    unsafe { l.launch(cfg).expect("warmup i8") }
+                }
+            };
+        }
+        stream.synchronize().expect("warmup sync");
+        let t0 = Instant::now();
+        for _ in 0..RUNS {
+            #[allow(unsafe_code)]
+            match which {
+                "f16" => {
+                    let mut l = stream.launch_builder(&f_f16);
+                    l.arg(&d_h)
+                        .arg(&d_f16)
+                        .arg(&ne_i)
+                        .arg(&v_i)
+                        .arg(&mut d_logits);
+                    unsafe { l.launch(cfg).expect("run f16") }
+                }
+                _ => {
+                    let mut l = stream.launch_builder(&f_i8);
+                    l.arg(&d_h)
+                        .arg(&d_q)
+                        .arg(&d_sc)
+                        .arg(&ne_i)
+                        .arg(&v_i)
+                        .arg(&mut d_logits);
+                    unsafe { l.launch(cfg).expect("run i8") }
+                }
+            };
+        }
+        stream.synchronize().expect("leg sync");
+        t0.elapsed().as_secs_f64() / RUNS as f64 * 1e6
+    };
+
+    // Same-session ABBA: f16, i8, i8, f16.
+    let a1 = time_leg("f16");
+    let b1 = time_leg("i8");
+    let b2 = time_leg("i8");
+    let a2 = time_leg("f16");
+    let f16_us = (a1 + a2) / 2.0;
+    let i8_us = (b1 + b2) / 2.0;
+    eprintln!(
+        "lm_head M=1 ABBA (us/launch): f16 [{a1:.1}, {a2:.1}] avg {f16_us:.1} | i8 [{b1:.1}, {b2:.1}] avg {i8_us:.1} | speedup {:.2}x (gate >= 1.6x)",
+        f16_us / i8_us
+    );
+}
+
 /// `relu2_gate` must reproduce the host BitNet squared-ReLU FFN gate `r =
 /// g.max(0); g = r*r*u` **bit-for-bit**. The input deliberately straddles zero so
 /// the `max(.,0)` clamp (and the gate's hard zero on negatives) is exercised.
@@ -4342,7 +4653,8 @@ fn adr_0022_twin_family_table_matches_decode_cu() {
                 // exact family match: prefix, then either end or a variant
                 // suffix — avoids kv_append counting kv_append_batch.
                 n.strip_prefix(prefix).is_some_and(|rest| {
-                    rest.is_empty() || matches!(rest, "_g" | "_h" | "_q8" | "_t2" | "_f32" | "_f16")
+                    rest.is_empty()
+                        || matches!(rest, "_g" | "_h" | "_q8" | "_t2" | "_f32" | "_f16" | "_i8")
                 })
             })
             .count()
@@ -4359,7 +4671,7 @@ fn adr_0022_twin_family_table_matches_decode_cu() {
         ("gqa_attention_batch_v3", 2),
         ("gqa_attention_tree_scores", 3),
         ("gqa_attention_tree_reduce", 3),
-        ("lm_head_warp", 2),
+        ("lm_head_warp", 3),
     ];
     for (family, want) in table {
         assert_eq!(
@@ -4371,7 +4683,7 @@ fn adr_0022_twin_family_table_matches_decode_cu() {
     }
     assert_eq!(
         names.len(),
-        83,
+        85,
         "decode.cu kernel count drifted from ADR 0022 — update the ADR \
          (65 → 64: gqa_attention_mdecode_f32 retired; 64 → 66: paged KV \
          twins added, ADR 0025 step 2; rmsnorm_quant_i8_fast was added and \
@@ -4396,7 +4708,11 @@ fn adr_0022_twin_family_table_matches_decode_cu() {
          twins — kv_append_tree_h + gqa_attention_tree_{{scores,reduce}}_ctrl_h, \
          ADR 0036 L6: the SINGLE-SEQ tree graph route on the accepted f16 \
          rung (batch arenas stay f32); graph == eager-f16 by the \
-         cuda_tree_verify_f16_graph gate in tritium-nn acceptance)"
+         cuda_tree_verify_f16_graph gate in tritium-nn acceptance; 83 → 85: \
+         lm_head_warp_i8 + lm_head_tiled_i8 — ADR 0036 L2 opt-in int8 head \
+         rung (TRITIUM_LM_HEAD=i8), 64-group absmax table + f32 scales, \
+         ppl/τ-gated NOT bit-identical; pinned to a host oracle + \
+         warp==tiled by lm_head_i8_warp_and_tiled_match_host_oracle_bitwise)"
     );
 }
 

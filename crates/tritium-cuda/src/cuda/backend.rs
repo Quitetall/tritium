@@ -6449,6 +6449,14 @@ impl CudaBackend {
         // shaped (half4 loads), so the same geometry gate as the split
         // attention applies.
         let kv_dtype = kv_dtype_from_env()?;
+        // ADR 0036 L2: opt-in int8 LM-head rung (TRITIUM_LM_HEAD=i8, parsed once,
+        // loud-reject on typos). Default f16 stays byte-for-byte the shipped path.
+        let head_dtype = lm_head_dtype_from_env()?;
+        if head_dtype == LmHeadDtype::I8 && !n_embd.is_multiple_of(LM_HEAD_QGROUP) {
+            return Err(BackendError::InvalidInput(format!(
+                "TRITIUM_LM_HEAD=i8 requires n_embd % {LM_HEAD_QGROUP} == 0 (got {n_embd})"
+            )));
+        }
         // ADR 0026 Track P: build I2sInt8 IMMA shadows for the prefill
         // tensor-core path (~0.25 B/weight beside the TQ2 rows). Kill switch:
         // TRITIUM_IMMA_PREFILL=0 skips the shadows AND the dispatch; the tune
@@ -6581,6 +6589,41 @@ impl CudaBackend {
         let d_token_embd_f16 = s
             .clone_htod(&embd_f16)
             .map_err(|e| driver_err("decode token_embd f16 htod", &e))?;
+        // ADR 0036 L2 opt-in: int8 head table + per-64-group absmax/127 f32 scales,
+        // built ONLY under TRITIUM_LM_HEAD=i8 (the f16 table above stays resident
+        // regardless — embedding gather and the prefill head keep reading it).
+        // Quantized host-side from the same f32 (= exactly-f16) values the f16 table
+        // holds: q = round(x/scale) half-away-from-zero, clamped to ±127 — the host
+        // oracle in tests reproduces this exactly.
+        let (d_token_embd_i8, d_lm_head_scales) = if head_dtype == LmHeadDtype::I8 {
+            let n_groups = n_embd / LM_HEAD_QGROUP;
+            let mut q = vec![0i8; vocab * n_embd];
+            let mut sc = vec![0.0f32; vocab * n_groups];
+            for v in 0..vocab {
+                let row = &spec.token_embd[v * n_embd..(v + 1) * n_embd];
+                for g in 0..n_groups {
+                    let grp = &row[g * LM_HEAD_QGROUP..(g + 1) * LM_HEAD_QGROUP];
+                    let absmax = grp.iter().fold(0.0f32, |a, &x| a.max(x.abs()));
+                    let scale = absmax / 127.0;
+                    sc[v * n_groups + g] = scale;
+                    if scale > 0.0 {
+                        for (j, &x) in grp.iter().enumerate() {
+                            q[v * n_embd + g * LM_HEAD_QGROUP + j] =
+                                (x / scale).round().clamp(-127.0, 127.0) as i8;
+                        }
+                    }
+                }
+            }
+            let d_q = s
+                .clone_htod(&q)
+                .map_err(|e| driver_err("decode token_embd i8 htod", &e))?;
+            let d_sc = s
+                .clone_htod(&sc)
+                .map_err(|e| driver_err("decode lm_head scales htod", &e))?;
+            (Some(d_q), Some(d_sc))
+        } else {
+            (None, None)
+        };
         let d_output_norm = upload(spec.output_norm, "decode output_norm htod")?;
         let d_cos = upload(&cos_t, "decode rope cos htod")?;
         let d_sin = upload(&sin_t, "decode rope sin htod")?;
@@ -6958,6 +7001,9 @@ impl CudaBackend {
             chain_scratch: None,
             f_lm_head_tiled: f(dm, KERNEL_NAME_LM_HEAD_TILED_F16)?,
             f_lm_head_f16: f(dm, KERNEL_NAME_LM_HEAD_WARP_F16)?,
+            f_lm_head_i8: f(dm, KERNEL_NAME_LM_HEAD_WARP_I8)?,
+            f_lm_head_tiled_i8: f(dm, KERNEL_NAME_LM_HEAD_TILED_I8)?,
+            head_dtype,
             f_kv_append_mdecode: f(dm, KERNEL_NAME_KV_APPEND_MDECODE)?,
             f_kv_append_mdecode_paged: f(dm, KERNEL_NAME_KV_APPEND_MDECODE_PAGED)?,
             f_attn_split_partial: f(dm, KERNEL_NAME_ATTN_SPLIT_PARTIAL)?,
@@ -6965,6 +7011,8 @@ impl CudaBackend {
             f_attn_combine: f(dm, KERNEL_NAME_ATTN_COMBINE)?,
             d_token_embd,
             d_token_embd_f16,
+            d_token_embd_i8,
+            d_lm_head_scales,
             d_output_norm,
             d_cos,
             d_sin,

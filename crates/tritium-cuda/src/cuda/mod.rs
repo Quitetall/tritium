@@ -783,6 +783,14 @@ pub struct CudaDecodeModel {
     chain_scratch: Option<(CudaSlice<i32>, CudaSlice<i32>)>,
     f_lm_head_tiled: CudaFunction,
     f_lm_head_f16: CudaFunction,
+    /// ADR 0036 L2 opt-in int8 head twins (`TRITIUM_LM_HEAD=i8`); resolved
+    /// unconditionally (same module), dispatched only when `head_dtype` is I8.
+    f_lm_head_i8: CudaFunction,
+    f_lm_head_tiled_i8: CudaFunction,
+    /// LM-head table dtype (parse-once from `TRITIUM_LM_HEAD`; default F16).
+    /// Drives the decode/verify head dispatch ONLY — the prefill head and
+    /// embedding gather always read the f16/f32 tables.
+    head_dtype: LmHeadDtype,
     f_kv_append_mdecode: CudaFunction,
     f_kv_append_mdecode_paged: CudaFunction,
     f_attn_split_partial: CudaFunction,
@@ -793,6 +801,11 @@ pub struct CudaDecodeModel {
     /// f16 copy of `token_embd` (the GGUF's native precision) for the graph LM head — it
     /// reads the whole table per token, so f16 halves that 1.3 GB read bit-identically.
     d_token_embd_f16: CudaSlice<u16>,
+    /// ADR 0036 L2 i8 head rung: int8 table + per-64-group f32 scales
+    /// `[vocab, n_embd/64]`, built at model build only under
+    /// `TRITIUM_LM_HEAD=i8`; `None` on the default f16 head.
+    d_token_embd_i8: Option<CudaSlice<i8>>,
+    d_lm_head_scales: Option<CudaSlice<f32>>,
     d_output_norm: CudaSlice<f32>,
     d_cos: CudaSlice<f32>,
     d_sin: CudaSlice<f32>,
@@ -2631,6 +2644,133 @@ impl CudaDecodeModel {
         Ok(())
     }
 
+    /// Batched tied LM head over `m` rows — i8 rung twin of
+    /// [`bl_lm_head_tiled`](Self::bl_lm_head_tiled) (ADR 0036 L2): int8 table +
+    /// per-64-group f32 scales at half the table read. Bit-identical per row to
+    /// the warp i8 head, NOT to the f16 pair (ppl/τ-gated rung).
+    #[allow(clippy::too_many_arguments)]
+    fn bl_lm_head_tiled_i8(
+        s: &Arc<CudaStream>,
+        f: &CudaFunction,
+        h: &CudaSlice<f32>,
+        embd_i8: &CudaSlice<i8>,
+        scales: &CudaSlice<f32>,
+        n_embd: usize,
+        vocab: usize,
+        m: usize,
+        logits: &mut CudaSlice<f32>,
+    ) -> Result<(), BackendError> {
+        let (ne_i, v_i, m_i) = (n_embd as i32, vocab as i32, m as i32);
+        let warps = vocab as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (
+                (warps * 32).div_ceil(256),
+                (m as u32).div_ceil(LMHEAD_ROW_TILE),
+                1,
+            ),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut l = s.launch_builder(f);
+        l.arg(h)
+            .arg(embd_i8)
+            .arg(scales)
+            .arg(&ne_i)
+            .arg(&v_i)
+            .arg(&m_i)
+            .arg(logits);
+        // SAFETY: `lm_head_tiled_i8(const float* h, const signed char* embd,
+        // const float* scales, int n_embd, int vocab, int m, float* logits)` —
+        // one warp per vocab row, grid.y tiles rows.
+        #[allow(unsafe_code)]
+        unsafe {
+            l.launch(cfg)
+                .map_err(|e| driver_err("launch tree lm_head i8", &e))?;
+        }
+        Ok(())
+    }
+
+    /// THE tiled-head dispatch point (ADR 0022 guardrail: selection logic lives
+    /// here exactly once): tree-verify / batched heads route through this and
+    /// get the f16 tiled head unless the model was built under
+    /// `TRITIUM_LM_HEAD=i8`.
+    fn launch_head_tiled(
+        &self,
+        s: &Arc<CudaStream>,
+        h: &CudaSlice<f32>,
+        m: usize,
+        logits: &mut CudaSlice<f32>,
+    ) -> Result<(), BackendError> {
+        match (&self.d_token_embd_i8, &self.d_lm_head_scales) {
+            (Some(embd_i8), Some(scales)) => Self::bl_lm_head_tiled_i8(
+                s,
+                &self.f_lm_head_tiled_i8,
+                h,
+                embd_i8,
+                scales,
+                self.n_embd,
+                self.vocab,
+                m,
+                logits,
+            ),
+            _ => Self::bl_lm_head_tiled(
+                s,
+                &self.f_lm_head_tiled,
+                h,
+                &self.d_token_embd_f16,
+                self.n_embd,
+                self.vocab,
+                m,
+                logits,
+            ),
+        }
+    }
+
+    /// Warp (M=1-row) head dispatch twin of
+    /// [`launch_head_tiled`](Self::launch_head_tiled) — the eager batched
+    /// tails' per-row head.
+    fn launch_head_warp(
+        &self,
+        s: &Arc<CudaStream>,
+        h: &CudaSlice<f32>,
+        logits: &mut CudaSlice<f32>,
+    ) -> Result<(), BackendError> {
+        match (&self.d_token_embd_i8, &self.d_lm_head_scales) {
+            (Some(embd_i8), Some(scales)) => {
+                let (ne_i, v_i) = (self.n_embd as i32, self.vocab as i32);
+                let cfg = LaunchConfig {
+                    grid_dim: ((self.vocab as u32).div_ceil(8), 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let mut l = s.launch_builder(&self.f_lm_head_i8);
+                l.arg(h)
+                    .arg(embd_i8)
+                    .arg(scales)
+                    .arg(&ne_i)
+                    .arg(&v_i)
+                    .arg(logits);
+                // SAFETY: `lm_head_warp_i8(const float* h, const signed char* embd,
+                // const float* scales, int n_embd, int vocab, float* logits)`.
+                #[allow(unsafe_code)]
+                unsafe {
+                    l.launch(cfg)
+                        .map_err(|e| driver_err("launch lm_head i8", &e))?;
+                }
+                Ok(())
+            }
+            _ => Self::bl_lm_head_f16(
+                s,
+                &self.f_lm_head_f16,
+                h,
+                &self.d_token_embd_f16,
+                self.n_embd,
+                self.vocab,
+                logits,
+            ),
+        }
+    }
+
     /// Chunked per-row argmax: the single-kernel `argmax_rows_f32` spawns only
     /// `m` blocks (129µs measured at m=13); the partial/combine pair fans each
     /// row over `ARGMAX_CHUNKS` blocks with the identical tie rule, so the
@@ -3312,6 +3452,8 @@ impl CudaDecodeModel {
             d_sin: dptr(&self.d_sin, s),
             d_token_embd: dptr(&self.d_token_embd, s),
             d_token_embd_f16: dptr(&self.d_token_embd_f16, s),
+            d_token_embd_i8: self.d_token_embd_i8.as_ref().map_or(0, |b| dptr(b, s)),
+            d_lm_head_scales: self.d_lm_head_scales.as_ref().map_or(0, |b| dptr(b, s)),
             d_output_norm: dptr(&self.d_output_norm, s),
         };
         // Drain the events the device_ptr extraction recorded, so the capture (which
@@ -3332,7 +3474,21 @@ impl CudaDecodeModel {
                 self.g_layer(&p, lp)?;
             }
             self.g_rmsnorm(p.d_x, p.d_output_norm, self.n_embd, p.d_normed)?;
-            self.g_lm_head(p.d_normed, p.d_token_embd_f16, p.d_logits)?;
+            // Head dispatch (ADR 0036 L2): f16 warp head by default; the opt-in
+            // i8 rung captures `lm_head_warp_i8` with the i8 table + scales.
+            match self.head_dtype {
+                LmHeadDtype::F16 => {
+                    self.g_lm_head(p.d_normed, p.d_token_embd_f16, p.d_logits)?;
+                }
+                LmHeadDtype::I8 => {
+                    self.g_lm_head_i8(
+                        p.d_normed,
+                        p.d_token_embd_i8,
+                        p.d_lm_head_scales,
+                        p.d_logits,
+                    )?;
+                }
+            }
             Ok(())
         })?;
 
@@ -3868,6 +4024,35 @@ impl CudaDecodeModel {
         let mut params = [pp(&h), pp(&embd), pp(&ne_i), pp(&v_i), pp(&logits)];
         raw_launch(
             self.raw().lm_head,
+            grid,
+            (256, 1, 1),
+            0,
+            self.cap_stream.cu_stream(),
+            &mut params,
+        )
+    }
+
+    /// i8 head rung twin of [`g_lm_head`](Self::g_lm_head) (ADR 0036 L2):
+    /// captures `lm_head_warp_i8` over the i8 table + per-64-group scales.
+    fn g_lm_head_i8(
+        &self,
+        h: sys::CUdeviceptr,
+        embd_i8: sys::CUdeviceptr,
+        scales: sys::CUdeviceptr,
+        logits: sys::CUdeviceptr,
+    ) -> Result<(), BackendError> {
+        let (ne_i, v_i) = (self.n_embd as i32, self.vocab as i32);
+        let grid = ((self.vocab as u32).div_ceil(8), 1, 1);
+        let mut params = [
+            pp(&h),
+            pp(&embd_i8),
+            pp(&scales),
+            pp(&ne_i),
+            pp(&v_i),
+            pp(&logits),
+        ];
+        raw_launch(
+            self.raw().lm_head_i8,
             grid,
             (256, 1, 1),
             0,
