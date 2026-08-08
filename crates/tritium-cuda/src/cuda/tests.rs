@@ -3497,10 +3497,14 @@ fn tree_ctrl_f16w_wide_and_fallback_match_nonctrl_h_bitwise() {
 ///
 /// Equivalence construction: slots rows carry per-row ctrl `[prefix, i, w2]`
 /// (the concatenation of one slot's tree = the single-slot launch); paged
-/// twins run a NON-IDENTITY page table (`table[toff] = 3` at `toff = 2`, so
-/// physical rows sit at `768 + logical`) over a pool whose mapped page holds
-/// the anchor's contiguous rows — pinning the table translation, the toff
-/// offset and the wide/fallback bodies in one comparison.
+/// twins run a NON-IDENTITY, NON-CONTIGUOUS two-page table at `toff = 2`
+/// (`table[2..4] = [3, 1]`: logical page 0 → physical page 3, logical page 1
+/// → physical page 1) over a pool whose mapped pages hold the anchor's
+/// contiguous rows. The prefix is 258 (> KV_PAGE_TOKENS = 256), so BOTH the
+/// prefix walk and the ancestor rows straddle the page boundary — every
+/// `logical >> KV_PAGE_SHIFT` branch (0 and 1) runs — pinning the table
+/// translation, the toff offset and the wide/fallback bodies in one
+/// comparison.
 #[test]
 fn tree_addr_h_wide_and_fallback_match_ctrl_h_bitwise() {
     use cudarc::driver::{CudaContext, LaunchConfig, PushKernelArg};
@@ -3527,16 +3531,17 @@ fn tree_addr_h_wide_and_fallback_match_ctrl_h_bitwise() {
     let f_scores_slots_paged = f("gqa_attention_tree_scores_slots_paged_h");
     let f_reduce_slots_paged = f("gqa_attention_tree_reduce_slots_paged_h");
 
-    // Geometry mirrors the stage-1 f16w gate: 3 real rows, prefix 5,
-    // ctx_max 16 (= score stride everywhere).
+    // Geometry: 3 real rows; prefix 258 > KV_PAGE_TOKENS (256) so logical
+    // rows straddle the 256-token page boundary; kv_rows 264 spans logical
+    // pages 0 AND 1; ctx_max 264 (= score stride everywhere).
     let (n_head, n_head_kv, m, prefix_len, max_anc, ctx_max, kv_rows) =
-        (4usize, 2usize, 3usize, 5usize, 4usize, 16usize, 16usize);
+        (4usize, 2usize, 3usize, 258usize, 4usize, 264usize, 264usize);
     let n_anc: Vec<i32> = vec![2, 4, 3];
     #[rustfmt::skip]
     let anc: Vec<i32> = vec![
-        5, 7, 0, 0,    // row 0: 2 ancestors
-        6, 8, 11, 14,  // row 1: 4
-        5, 9, 13, 0,   // row 2: 3
+        255, 258, 0, 0,      // row 0: 2 ancestors (page 0 + page 1)
+        254, 257, 259, 263,  // row 1: 4 (both pages)
+        250, 256, 262, 0,    // row 2: 3 (page 0 + the boundary row 256)
     ];
     // Anchor ctrl (dense single-slot, row base 0); slots rows are the same
     // tree expressed per row; paged word 2 = the slot's TABLE offset.
@@ -3549,10 +3554,12 @@ fn tree_addr_h_wide_and_fallback_match_ctrl_h_bitwise() {
         row_ctrl_dense.extend([prefix_len as i32, i as i32, 0]);
         row_ctrl_paged.extend([prefix_len as i32, i as i32, toff as i32]);
     }
-    // Non-identity single-page table at offset `toff`: logical row j lives at
-    // physical pool row 3·256 + j.
-    let table: Vec<i32> = vec![-1, -1, 3];
-    let pool_rows = 3 * 256 + kv_rows;
+    // Non-identity, non-contiguous TWO-page table at offset `toff`: logical
+    // page 0 (rows 0..256) lives on physical page 3 (pool rows 768..1024),
+    // logical page 1 (rows 256..264) on physical page 1 (pool rows 256..).
+    let table: Vec<i32> = vec![-1, -1, 3, 1];
+    let pool_rows = 4 * 256;
+    let tail_rows = kv_rows - 256; // logical rows on page 1
 
     let mut seed = 0x0036_0006_0002u64;
     let mut nextf = move || {
@@ -3599,13 +3606,18 @@ fn tree_addr_h_wide_and_fallback_match_ctrl_h_bitwise() {
         let vh: Vec<u16> = (0..kv_len)
             .map(|_| f16::from_f32(nextf()).to_bits())
             .collect();
-        // Paged pool: the mapped page (rows 768..768+kv_rows) holds the
-        // anchor's contiguous rows; everything else stays zero.
+        // Paged pool: physical page 3 (rows 768..1024) holds logical rows
+        // 0..256; physical page 1 (rows 256..256+tail) holds logical rows
+        // 256..kv_rows; everything else stays zero.
         let row_elems = n_head_kv * head_dim;
         let mut kh_pool: Vec<u16> = vec![0; pool_rows * row_elems];
         let mut vh_pool: Vec<u16> = vec![0; pool_rows * row_elems];
-        kh_pool[768 * row_elems..(768 + kv_rows) * row_elems].copy_from_slice(&kh);
-        vh_pool[768 * row_elems..(768 + kv_rows) * row_elems].copy_from_slice(&vh);
+        kh_pool[768 * row_elems..1024 * row_elems].copy_from_slice(&kh[..256 * row_elems]);
+        vh_pool[768 * row_elems..1024 * row_elems].copy_from_slice(&vh[..256 * row_elems]);
+        kh_pool[256 * row_elems..(256 + tail_rows) * row_elems]
+            .copy_from_slice(&kh[256 * row_elems..]);
+        vh_pool[256 * row_elems..(256 + tail_rows) * row_elems]
+            .copy_from_slice(&vh[256 * row_elems..]);
         let d_q = stream.clone_htod(&q).expect("q");
         let d_k = stream.clone_htod(&kh).expect("k16");
         let d_v = stream.clone_htod(&vh).expect("v16");
@@ -3756,7 +3768,9 @@ fn tree_addr_h_wide_and_fallback_match_ctrl_h_bitwise() {
             .collect();
         let row_elems = n_head_kv * head_dim;
         let mut vh_pool: Vec<u16> = vec![0; pool_rows * row_elems];
-        vh_pool[768 * row_elems..(768 + kv_rows) * row_elems].copy_from_slice(&vh);
+        vh_pool[768 * row_elems..1024 * row_elems].copy_from_slice(&vh[..256 * row_elems]);
+        vh_pool[256 * row_elems..(256 + tail_rows) * row_elems]
+            .copy_from_slice(&vh[256 * row_elems..]);
         let sc_host: Vec<f32> = (0..scores_len).map(|_| nextf()).collect();
         let d_v = stream.clone_htod(&vh).expect("v16 odd");
         let d_v_pool = stream.clone_htod(&vh_pool).expect("v pool odd");

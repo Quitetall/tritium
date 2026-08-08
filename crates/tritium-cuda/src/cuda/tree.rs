@@ -1299,8 +1299,9 @@ impl CudaDecodeModel {
     /// rows by `r · max_ctx`; PAGED slots translate each row through the HOST
     /// page-table copy (the promote is host-issued dtods — no kernel, so no
     /// device table read; every row lives inside ONE page, so a per-row
-    /// lookup suffices). Batch arenas are f32 with no scale planes, so the
-    /// slot arm is the plain row-copy loop.
+    /// lookup suffices). Batch arenas carry no scale planes (f32/f16 rungs
+    /// only — scale rungs are rejected at build), so the slot arm is the
+    /// plain row-copy loop, byte-scaled by `batch.kv_elem`.
     fn tree_promote_in(
         &mut self,
         path: &[usize],
@@ -2164,7 +2165,8 @@ impl CudaDecodeModel {
         }
 
         // Route: pad m_total to the smallest bucket and replay ONE captured
-        // slots graph. head_dim % 4 and kv_elem == 4 are guaranteed above;
+        // slots graph. head_dim % 4 is guaranteed above; kv_elem is 4 (f32)
+        // or 2 (f16) — all row/byte math below is kv_elem-scaled;
         // the remaining conditions mirror `tree_forward` (a bucket always
         // exists — m_total <= TREE_BUCKET_MAX — and pads write nothing, so
         // there is no region-fit condition on the padded size).
