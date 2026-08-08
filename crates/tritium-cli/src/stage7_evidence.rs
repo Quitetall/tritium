@@ -660,6 +660,11 @@ fn create_staging(output: &Path) -> anyhow::Result<PathBuf> {
 fn sync_parent(path: &Path) -> anyhow::Result<()> {
     #[cfg(unix)]
     File::open(path.parent().unwrap_or(Path::new(".")))?.sync_all()?;
+    // Directory sync is best-effort durability (see pipeline.rs): windows cannot
+    // open a directory handle via File::open, so the rename/link publish above is
+    // the strongest portable guarantee there.
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 
