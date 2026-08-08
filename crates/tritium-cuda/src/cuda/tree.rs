@@ -5,6 +5,72 @@
 
 use super::*;
 
+/// Env-gated (`TRITIUM_TREE_TRACE=1`) host-wall phase tracer for the verify
+/// path (ADR 0036 L1b): accumulates per-phase nanos across verifies and
+/// prints a cumulative average line every 64 verifies. Zero cost when off
+/// (one cached env check per verify). Phases cover the single-seq greedy
+/// verify — the solo-spec path the L1b residue lives on.
+mod ttrace {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Instant;
+
+    pub(super) const PHASES: [&str; 10] = [
+        "prep",    // validation + depth/anc/pos/tok host build
+        "upload",  // tok/pos/anc/nanc htod
+        "presync", // pre-replay default-stream drain
+        "replay",  // graph ensure + ctrl htod + graph launch (host issue)
+        "tail",    // final norm + LM-head launches (host issue)
+        "argmax",  // argmax kernel launches (host issue)
+        "dtoh",    // ids readback — contains the wait for ALL queued GPU work
+        "promote", // greedy walk + accepted-path KV promotion
+        "total",   // whole tree_verify_greedy_in
+        "gpu",     // event-timed span: verify start -> argmax done (graph route)
+    ];
+    static SUMS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    static ON: OnceLock<bool> = OnceLock::new();
+
+    pub(super) fn on() -> bool {
+        *ON.get_or_init(|| std::env::var_os("TRITIUM_TREE_TRACE").is_some())
+    }
+
+    /// Phase stopwatch: `lap(i)` adds the time since the previous lap (or
+    /// construction) to phase `i`. Inert when the tracer is off.
+    pub(super) struct Lap(Option<Instant>);
+    impl Lap {
+        pub(super) fn start() -> Self {
+            Lap(on().then(Instant::now))
+        }
+        pub(super) fn lap(&mut self, phase: usize) {
+            if let Some(t) = self.0.as_mut() {
+                let now = Instant::now();
+                SUMS[phase].fetch_add((now - *t).as_nanos() as u64, Ordering::Relaxed);
+                *t = now;
+            }
+        }
+    }
+
+    /// Accumulate an event-timed GPU span (µs) for the "gpu" phase.
+    pub(super) fn add_gpu_us(us: u64) {
+        SUMS[9].fetch_add(us * 1_000, Ordering::Relaxed);
+    }
+
+    /// Record one whole-verify duration + maybe print the running averages.
+    pub(super) fn finish(total: Instant) {
+        SUMS[8].fetch_add(total.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        let n = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        if n.is_multiple_of(64) {
+            let mut line = format!("tree-trace: n={n} avg-us");
+            for (i, name) in PHASES.iter().enumerate() {
+                let avg = SUMS[i].load(Ordering::Relaxed) / n / 1_000;
+                line.push_str(&format!(" {name}={avg}"));
+            }
+            eprintln!("{line}");
+        }
+    }
+}
+
 impl CudaDecodeModel {
     /// **BASTION greedy tree-verify** (ADR 0014) — verify a draft token tree in ONE
     /// batched forward and commit the longest greedy-accepted path.
@@ -80,6 +146,7 @@ impl CudaDecodeModel {
         parents: &[i32],
         mut slot: Option<(&mut BatchKv, usize)>,
     ) -> Result<(usize, bool), BackendError> {
+        let mut tt = ttrace::Lap::start();
         // A new single-seq forward invalidates any uncommitted previous tree.
         // A batch-slot forward touches neither the single-seq arenas nor the
         // single-seq scratch, so a pending single-seq tree stays committable.
@@ -294,6 +361,7 @@ impl CudaDecodeModel {
         } else {
             s
         };
+        tt.lap(0); // prep
         up.memcpy_htod(&tok_i, &mut ts.d_tok)
             .map_err(|e| driver_err("tree tokens htod", &e))?;
         up.memcpy_htod(&positions, &mut ts.d_pos)
@@ -302,6 +370,7 @@ impl CudaDecodeModel {
             .map_err(|e| driver_err("tree anc htod", &e))?;
         up.memcpy_htod(&n_anc, &mut ts.d_nanc)
             .map_err(|e| driver_err("tree n_anc htod", &e))?;
+        tt.lap(1); // upload
 
         if let Some(bucket) = bucket {
             // ── Graph route: replay the captured trunk (1 launch), then the
@@ -319,6 +388,7 @@ impl CudaDecodeModel {
             self.stream
                 .synchronize()
                 .map_err(|e| driver_err("tree pre-replay default sync", &e))?;
+            tt.lap(2); // presync
             if self.batch_raw.is_none() {
                 let ctx = self.cap_stream.context().clone();
                 self.batch_raw = Some(Arc::new(BatchRawKernels::load(&ctx, self.kv_dtype)?));
@@ -431,6 +501,7 @@ impl CudaDecodeModel {
                     .launch()
                     .map_err(|e| driver_err("tree graph launch", &e))?;
             }
+            tt.lap(3); // replay (host issue)
             let cs = &self.cap_stream;
             Self::bl_rmsnorm(
                 cs,
@@ -443,10 +514,11 @@ impl CudaDecodeModel {
                 &mut ts.d_norm_all,
             )?;
             self.launch_head_tiled(cs, &ts.d_norm_all, m, &mut ts.d_logits_all)?;
-            // No sync here (L2): consumers run their argmax/readback on
-            // `cap_stream` (see `on_cap`), and the pageable dtoh they end with
-            // drains the stream before any default-stream work (promote)
-            // touches the arena.
+            tt.lap(4); // tail (host issue)
+        // No sync here (L2): consumers run their argmax/readback on
+        // `cap_stream` (see `on_cap`), and the pageable dtoh they end with
+        // drains the stream before any default-stream work (promote)
+        // touches the arena.
         } else {
             // I3 eager PAGED slot: region-offset views can't address page-
             // scattered rows, so the eager route launches the SAME ctrl-driven
@@ -1070,8 +1142,28 @@ impl CudaDecodeModel {
         parents: &[i32],
         mut slot: Option<(&mut BatchKv, usize)>,
     ) -> Result<Vec<u32>, BackendError> {
+        let t_total = std::time::Instant::now();
+        // Trace-only GPU span events: cap_stream is idle at verify entry (the
+        // previous verify's trailing dtoh drained it), so a start event
+        // recorded here completes ~immediately and (start → post-argmax end)
+        // is the verify's GPU execution span on the graph route.
+        let ev = if ttrace::on() {
+            let ctx = self.stream.context();
+            // NB `None` means DISABLE_TIMING in cudarc — timing needs DEFAULT.
+            let fl = Some(sys::CUevent_flags::CU_EVENT_DEFAULT);
+            match (ctx.new_event(fl), ctx.new_event(fl)) {
+                (Ok(a), Ok(b)) => {
+                    a.record(&self.cap_stream).ok();
+                    Some((a, b))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
         let (m, on_cap) =
             self.tree_forward(tokens, parents, slot.as_mut().map(|(b, r)| (&mut **b, *r)))?;
+        let mut tt = ttrace::Lap::start();
         // Consume on the stream that produced the logits (graph route:
         // cap_stream — the trailing pageable dtoh below is the ONE ordering
         // point and drains the whole verify before tree_promote's
@@ -1097,11 +1189,22 @@ impl CudaDecodeModel {
             &mut ts.d_amax_idx,
             &mut ts.d_ids,
         )?;
+        tt.lap(5); // argmax (host issue)
+        if let Some((_, b)) = &ev {
+            b.record(s).ok();
+        }
         let mut ids = vec![0i32; m];
         // The cached buffer may exceed this call's `m` — copy exactly m ids.
         let ids_view = ts.d_ids.slice(0..m);
         s.memcpy_dtoh(&ids_view, &mut ids)
             .map_err(|e| driver_err("tree ids dtoh", &e))?;
+        tt.lap(6); // dtoh (contains the wait for all queued GPU work)
+        if on_cap
+            && let Some((a, b)) = &ev
+            && let Ok(ms) = a.elapsed_ms(b)
+        {
+            ttrace::add_gpu_us((ms * 1000.0) as u64);
+        }
 
         // Device work is done — return the scratch to its owner. (An early `?`
         // above drops it instead; the next call simply re-allocates.)
@@ -1124,6 +1227,10 @@ impl CudaDecodeModel {
             }
         }
         self.tree_promote_in(&path, slot)?;
+        tt.lap(7); // promote (walk + accepted-path KV moves)
+        if ttrace::on() {
+            ttrace::finish(t_total);
+        }
 
         Ok(path.iter().map(|&n| ids[n] as u32).collect())
     }
