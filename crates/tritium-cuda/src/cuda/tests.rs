@@ -3493,6 +3493,7 @@ fn tree_ctrl_f16w_wide_and_fallback_match_nonctrl_h_bitwise() {
 ///     context (prefix 1000, all 8 warps streaming multiple tiles);
 ///   * hd=64 (nq=16: half the lanes idle in loads — the lane-map guard path)
 ///     at a mid context.
+///
 /// The exact pair is the conformance reference (ADR 0022: exact twins are
 /// never deleted); this gate is the fast twin's admission bar, NOT a
 /// bit-equality pin — the fused kernel reorders the softmax folds by design.

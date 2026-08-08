@@ -398,7 +398,7 @@ fn verify_path_ppl(
         let seed = runner.forward(&[w[0]], &[0]).expect("seed");
         let vocab = seed.len();
         let mut fed = 1usize; // cache holds w[..fed]
-        while fed + CHAIN + 1 <= SEQ_LEN {
+        while fed + CHAIN < SEQ_LEN {
             let tree: Vec<u32> = w[fed..fed + CHAIN].to_vec();
             let logits = runner
                 .tree_verify_logits(&tree, &parents)
