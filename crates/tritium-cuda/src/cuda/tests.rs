@@ -4388,7 +4388,11 @@ fn adr_0022_twin_family_table_matches_decode_cu() {
          gqa_attention_tree_{{scores,reduce}}_slots[_paged]_g, per-ROW ctrl \
          so ONE forward verifies many slots' trees; the single-slot ctrl \
          kernels are retained unchanged, batched == sequential by the \
-         cuda_tree_verify_slots_matches_sequential gate)"
+         cuda_tree_verify_slots_matches_sequential gate; \
+         draft_batch_chain_advance was added and REVERTED by measurement — \
+         Track B 2026-08-08, bit-identical + fully gated but -2.4%..+1.6% \
+         at N=4 < the 3% bar: post-bucket-snap k~2-3 leaves only 1-2 \
+         per-step round-trips to amortize)"
     );
 }
 

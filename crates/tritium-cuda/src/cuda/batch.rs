@@ -978,8 +978,12 @@ impl CudaDecodeModel {
     /// the batched sibling of [`draft_chain`](Self::draft_chain).
     /// Correctness-first: the per-step host round-trip (one sync + `n`×4 B
     /// readback) is the pre-L1' shape; a device-side chained variant (the
-    /// M=N analogue of `draft_chain_advance`) is a later, *measured*
-    /// optimization.
+    /// M=N analogue of `draft_chain_advance`) was built + MEASURED on
+    /// 2026-08-08 (Track B) and REVERTED: bit-identical and fully gated, but
+    /// -2.4%..+1.6% at N=4 across three interleaved ABBA sessions — after
+    /// the Track A bucket snap the shared k is ~2-3, so a round has only
+    /// 1-2 per-step round-trips left to amortize and the gap-close k=1 call
+    /// saves none; the theoretical ceiling (~1-4%) sits under the 3% bar.
     ///
     /// Per-row semantics match `draft_chain` exactly:
     /// - `out[r]` is truncated at the first EOS **inclusive**: the EOS is
