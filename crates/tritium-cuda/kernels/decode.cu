@@ -2198,9 +2198,16 @@ static __device__ __forceinline__ void gqa_attention_tree_reduce_ctrl_body(
 // its whole win at M=1 long-ctx decode — buys nothing here, while its extra
 // load + convert instructions cost directly. These bodies keep every
 // conversion and every __fmul_rn/__fadd_rn in the IDENTICAL element order as
-// gqa_attention_tree_{scores,reduce}_ctrl_body<KvLoadF16> (outputs are
-// bit-identical; verified by memcmp in the stage-2 microbench), and only
-// widen the loads:
+// gqa_attention_tree_{scores,reduce}_ctrl_body<KvLoadF16>, so outputs are
+// bit-identical. Committed evidence: the
+// cuda_tree_verify_f16_graph_route_lossless_and_matches_eager acceptance
+// gate (tritium-nn) pins the graph-route ctrl `_h` kernels (these bodies,
+// hd=128 wide path) against the eager non-ctrl `_h` generic bodies on
+// identical committed streams, and the
+// tree_ctrl_f16w_wide_and_fallback_match_nonctrl_h_bitwise lib test
+// (tritium-cuda) pins both the wide paths at a non-128 shape and the
+// guarded fallbacks below against the non-ctrl `_h` twins to_bits-exactly.
+// The only change vs the generic bodies is that these widen the loads:
 //   * scores: one 16B LDG covers 8 halves (two quads), folded x,y,z,w then
 //     x,y,z,w — the same order the d-loop produced quad-by-quad. Requires
 //     head_dim % 8 == 0 (16B row alignment + even quad count); guarded by a

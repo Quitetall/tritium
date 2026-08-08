@@ -3210,6 +3210,280 @@ fn gqa_attention_batch_v3_matches_rev1_bitwise() {
     }
 }
 
+/// Review-66d8f58 F1 gate: the f16 ctrl tree-verify pair
+/// (`gqa_attention_tree_{scores,reduce}_ctrl_h`) dispatches to the `_f16w`
+/// wide-load bodies, which carry launch-uniform fallbacks to the generic
+/// `<KvLoadF16>` ctrl bodies for shapes outside the wide contract
+/// (scores: head_dim % 8 != 0; reduce: head_dim odd or > pair budget).
+/// Every acceptance gate runs hd=128, so neither fallback nor the wide
+/// paths at a non-128 shape had a test execution. Anchor: the EAGER
+/// non-ctrl `_h` twins (`gqa_attention_tree_{scores,reduce}_h`) — a
+/// different entry point through the generic template bodies, with
+/// scalar (prefix_len, m) args and score stride = ctx_max; the ctrl pair
+/// gets an equivalent device ctrl `[prefix_len, m, 0]` and score_stride =
+/// ctx_max, so bit-equality pins ctrl==non-ctrl AND wide==generic:
+///   * hd=100 (%4==0, %8!=0): scores takes the FALLBACK, reduce the wide
+///     pair path.
+///   * hd=104 (%8==0): both take the WIDE path at a non-128 shape.
+///   * hd=101 (odd, reduce-only on host-synthesized scores — the scores
+///     bodies require head_dim % 4 == 0): reduce takes the FALLBACK.
+#[test]
+fn tree_ctrl_f16w_wide_and_fallback_match_nonctrl_h_bitwise() {
+    use cudarc::driver::{CudaContext, LaunchConfig, PushKernelArg};
+    use cudarc::nvrtc::Ptx;
+
+    let ctx = match CudaContext::new(0) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("skipping tree ctrl f16w gate: no device ({e})");
+            return;
+        }
+    };
+    let stream = ctx.default_stream();
+    let dm = ctx
+        .load_module(Ptx::from_src(DECODE_PTX))
+        .expect("load decode module");
+    let f_scores_ctrl = dm
+        .load_function("gqa_attention_tree_scores_ctrl_h")
+        .expect("ctrl scores fn");
+    let f_reduce_ctrl = dm
+        .load_function("gqa_attention_tree_reduce_ctrl_h")
+        .expect("ctrl reduce fn");
+    let f_scores = dm
+        .load_function("gqa_attention_tree_scores_h")
+        .expect("scores fn");
+    let f_reduce = dm
+        .load_function("gqa_attention_tree_reduce_h")
+        .expect("reduce fn");
+
+    // Small tree: 3 real rows with varying ancestor counts over a 16-row
+    // KV arena; prefix 5, ctx_max 16 (also the score stride for BOTH paths).
+    let (n_head, n_head_kv, m, prefix_len, max_anc, ctx_max, kv_rows) =
+        (4usize, 2usize, 3usize, 5usize, 4usize, 16usize, 16usize);
+    let n_anc: Vec<i32> = vec![2, 4, 3];
+    #[rustfmt::skip]
+    let anc: Vec<i32> = vec![
+        5, 7, 0, 0,    // row 0: 2 ancestors
+        6, 8, 11, 14,  // row 1: 4
+        5, 9, 13, 0,   // row 2: 3
+    ];
+    let tree_ctrl: Vec<i32> = vec![prefix_len as i32, m as i32, 0];
+
+    let mut seed = 0x66d8f58u64;
+    let mut nextf = move || {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (((seed >> 33) as i32 % 1000) as f32) * 1e-3 - 0.5
+    };
+
+    let d_anc = stream.clone_htod(&anc).expect("anc");
+    let d_n_anc = stream.clone_htod(&n_anc).expect("n_anc");
+    let d_ctrl = stream.clone_htod(&tree_ctrl).expect("tree_ctrl");
+    let (cm_i, ss_i, nh_i, nhkv_i, pl_i, ma_i, m_i) = (
+        ctx_max as i32,
+        ctx_max as i32, // ctrl score_stride == the non-ctrl path's ctx_max
+        n_head as i32,
+        n_head_kv as i32,
+        prefix_len as i32,
+        max_anc as i32,
+        m as i32,
+    );
+    let scores_cfg = LaunchConfig {
+        grid_dim: ((m * n_head) as u32, ctx_max.div_ceil(128) as u32, 1),
+        block_dim: (32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let reduce_cfg = LaunchConfig {
+        grid_dim: ((m * n_head) as u32, 1, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: (ctx_max * 4) as u32,
+    };
+    let scores_len = m * n_head * ctx_max;
+
+    // Part 1: full scores→reduce chain at hd=100 (scores FALLBACK + wide
+    // reduce) and hd=104 (wide scores + wide reduce, non-128).
+    for head_dim in [100usize, 104usize] {
+        let hd_i = head_dim as i32;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let q: Vec<f32> = (0..m * n_head * head_dim).map(|_| nextf()).collect();
+        let kv_len = kv_rows * n_head_kv * head_dim;
+        let kh: Vec<u16> = (0..kv_len)
+            .map(|_| f16::from_f32(nextf()).to_bits())
+            .collect();
+        let vh: Vec<u16> = (0..kv_len)
+            .map(|_| f16::from_f32(nextf()).to_bits())
+            .collect();
+        let d_q = stream.clone_htod(&q).expect("q");
+        let d_k = stream.clone_htod(&kh).expect("k16");
+        let d_v = stream.clone_htod(&vh).expect("v16");
+
+        let out_len = m * n_head * head_dim;
+        // alloc_zeros: entries past each row's live ctx stay 0 on both
+        // paths, so full-buffer comparison is well-defined.
+        let mut d_sc_ctrl: cudarc::driver::CudaSlice<f32> =
+            stream.alloc_zeros(scores_len).expect("sc ctrl");
+        let mut d_sc_ref: cudarc::driver::CudaSlice<f32> =
+            stream.alloc_zeros(scores_len).expect("sc ref");
+        let mut d_out_ctrl: cudarc::driver::CudaSlice<f32> =
+            stream.alloc_zeros(out_len).expect("out ctrl");
+        let mut d_out_ref: cudarc::driver::CudaSlice<f32> =
+            stream.alloc_zeros(out_len).expect("out ref");
+
+        #[allow(unsafe_code)]
+        {
+            let mut l = stream.launch_builder(&f_scores_ctrl);
+            l.arg(&d_q)
+                .arg(&d_k)
+                .arg(&mut d_sc_ctrl)
+                .arg(&d_anc)
+                .arg(&d_n_anc)
+                .arg(&d_ctrl)
+                .arg(&ss_i)
+                .arg(&nh_i)
+                .arg(&nhkv_i)
+                .arg(&hd_i)
+                .arg(&scale)
+                .arg(&ma_i)
+                .arg(&m_i);
+            // SAFETY: ctrl scores signature; one-warp blocks per contract.
+            unsafe { l.launch(scores_cfg).expect("ctrl scores") };
+            let mut l = stream.launch_builder(&f_scores);
+            l.arg(&d_q)
+                .arg(&d_k)
+                .arg(&mut d_sc_ref)
+                .arg(&d_anc)
+                .arg(&d_n_anc)
+                .arg(&cm_i)
+                .arg(&nh_i)
+                .arg(&nhkv_i)
+                .arg(&hd_i)
+                .arg(&scale)
+                .arg(&pl_i)
+                .arg(&ma_i)
+                .arg(&m_i);
+            // SAFETY: non-ctrl scores signature (scalar prefix_len).
+            unsafe { l.launch(scores_cfg).expect("ref scores") };
+            let mut l = stream.launch_builder(&f_reduce_ctrl);
+            l.arg(&d_v)
+                .arg(&d_sc_ctrl)
+                .arg(&mut d_out_ctrl)
+                .arg(&d_anc)
+                .arg(&d_n_anc)
+                .arg(&d_ctrl)
+                .arg(&ss_i)
+                .arg(&nh_i)
+                .arg(&nhkv_i)
+                .arg(&hd_i)
+                .arg(&ma_i)
+                .arg(&m_i);
+            // SAFETY: ctrl reduce signature; blockDim.x == 128 per contract.
+            unsafe { l.launch(reduce_cfg).expect("ctrl reduce") };
+            let mut l = stream.launch_builder(&f_reduce);
+            l.arg(&d_v)
+                .arg(&d_sc_ref)
+                .arg(&mut d_out_ref)
+                .arg(&d_anc)
+                .arg(&d_n_anc)
+                .arg(&cm_i)
+                .arg(&nh_i)
+                .arg(&nhkv_i)
+                .arg(&hd_i)
+                .arg(&pl_i)
+                .arg(&ma_i)
+                .arg(&m_i);
+            // SAFETY: non-ctrl reduce signature; blockDim.x == 128 per contract.
+            unsafe { l.launch(reduce_cfg).expect("ref reduce") };
+        }
+
+        let sc_c = stream.clone_dtoh(&d_sc_ctrl).expect("dtoh sc ctrl");
+        let sc_r = stream.clone_dtoh(&d_sc_ref).expect("dtoh sc ref");
+        for (i, (&a, &b)) in sc_c.iter().zip(&sc_r).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "ctrl_h scores diverge from non-ctrl _h (hd={head_dim}) at [{i}]: \
+                 ctrl={a} ref={b}"
+            );
+        }
+        let o_c = stream.clone_dtoh(&d_out_ctrl).expect("dtoh out ctrl");
+        let o_r = stream.clone_dtoh(&d_out_ref).expect("dtoh out ref");
+        for (i, (&a, &b)) in o_c.iter().zip(&o_r).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "ctrl_h reduce diverges from non-ctrl _h (hd={head_dim}) at [{i}]: \
+                 ctrl={a} ref={b}"
+            );
+        }
+    }
+
+    // Part 2: reduce FALLBACK guard (head_dim odd) on host-synthesized
+    // scores — both kernels read the same buffer, so this pins the guarded
+    // generic ctrl body against the non-ctrl generic body.
+    {
+        let head_dim = 101usize;
+        let hd_i = head_dim as i32;
+        let kv_len = kv_rows * n_head_kv * head_dim;
+        let vh: Vec<u16> = (0..kv_len)
+            .map(|_| f16::from_f32(nextf()).to_bits())
+            .collect();
+        let sc_host: Vec<f32> = (0..scores_len).map(|_| nextf()).collect();
+        let d_v = stream.clone_htod(&vh).expect("v16 odd");
+        let d_sc = stream.clone_htod(&sc_host).expect("sc odd");
+        let out_len = m * n_head * head_dim;
+        let mut d_out_ctrl: cudarc::driver::CudaSlice<f32> =
+            stream.alloc_zeros(out_len).expect("out ctrl odd");
+        let mut d_out_ref: cudarc::driver::CudaSlice<f32> =
+            stream.alloc_zeros(out_len).expect("out ref odd");
+
+        #[allow(unsafe_code)]
+        {
+            let mut l = stream.launch_builder(&f_reduce_ctrl);
+            l.arg(&d_v)
+                .arg(&d_sc)
+                .arg(&mut d_out_ctrl)
+                .arg(&d_anc)
+                .arg(&d_n_anc)
+                .arg(&d_ctrl)
+                .arg(&ss_i)
+                .arg(&nh_i)
+                .arg(&nhkv_i)
+                .arg(&hd_i)
+                .arg(&ma_i)
+                .arg(&m_i);
+            // SAFETY: ctrl reduce signature; blockDim.x == 128 per contract.
+            unsafe { l.launch(reduce_cfg).expect("ctrl reduce odd") };
+            let mut l = stream.launch_builder(&f_reduce);
+            l.arg(&d_v)
+                .arg(&d_sc)
+                .arg(&mut d_out_ref)
+                .arg(&d_anc)
+                .arg(&d_n_anc)
+                .arg(&cm_i)
+                .arg(&nh_i)
+                .arg(&nhkv_i)
+                .arg(&hd_i)
+                .arg(&pl_i)
+                .arg(&ma_i)
+                .arg(&m_i);
+            // SAFETY: non-ctrl reduce signature; blockDim.x == 128 per contract.
+            unsafe { l.launch(reduce_cfg).expect("ref reduce odd") };
+        }
+
+        let o_c = stream.clone_dtoh(&d_out_ctrl).expect("dtoh out ctrl odd");
+        let o_r = stream.clone_dtoh(&d_out_ref).expect("dtoh out ref odd");
+        for (i, (&a, &b)) in o_c.iter().zip(&o_r).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "ctrl_h reduce fallback diverges from non-ctrl _h (hd=101, odd) \
+                 at [{i}]: ctrl={a} ref={b}"
+            );
+        }
+    }
+}
+
 /// v0.3.1 de-risk: the device `rmsnorm_f32` decode kernel must reproduce the host
 /// `tritium_nn::ops::rmsnorm` **bit-for-bit** (`to_bits` equal), so the fully
 /// device-resident forward keeps greedy 256/256. This is the proof that a
