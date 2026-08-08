@@ -40,9 +40,17 @@
 #![cfg_attr(target_os = "macos", deny(unsafe_code))]
 #![deny(missing_docs)]
 
+// Host-side structure for the v3 prefill-attention port: launch constants
+// (pinned to attention.metal by test), dispatch geometry, the TRITIUM_ATTN_V3
+// kill-switch parser, and the pinned-order CPU reference the device kernel is
+// gated against on the Mac lane. Plain Rust, no Metal dependency — compiled
+// and unit-tested on every platform (the CPU-verifiable half of the port).
+pub mod attn;
+
 // All device code lives in the `backend` module, gated on BOTH the `metal`
 // feature and macOS. On Linux (or any non-macOS target) the module — and the
-// metal-rs dep it uses — is compiled out entirely, leaving an empty lib.
+// metal-rs dep it uses — is compiled out entirely, leaving only the pure-Rust
+// `attn` module above.
 #[cfg(all(feature = "metal", target_os = "macos"))]
 mod backend;
 #[cfg(all(feature = "metal", target_os = "macos"))]

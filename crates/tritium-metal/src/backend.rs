@@ -49,6 +49,33 @@ const _: () = assert!(core::mem::offset_of!(Dims, k) == 8);
 const _: () = assert!(core::mem::offset_of!(Dims, lane_stride) == 12);
 const _: () = assert!(core::mem::offset_of!(Dims, row_bytes) == 16);
 
+/// Scalar params for the v3 prefill attention (`attention.metal`), passed by
+/// value via `set_bytes` at buffer index 5. `repr(C)` so the field
+/// order/offsets match the MSL `struct AttnV3Params` exactly.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct AttnV3Params {
+    ctx_max: u32,
+    n_head: u32,
+    n_head_kv: u32,
+    head_dim: u32,
+    scale: f32,
+    causal_offset: u32,
+    m: u32,
+}
+
+// Pin size + offsets against the MSL struct (7×4-byte fields, natural
+// alignment) — the Dims discipline above, so a reorder cannot land `m` where
+// the kernel reads `ctx_max`.
+const _: () = assert!(core::mem::size_of::<AttnV3Params>() == 28);
+const _: () = assert!(core::mem::offset_of!(AttnV3Params, ctx_max) == 0);
+const _: () = assert!(core::mem::offset_of!(AttnV3Params, n_head) == 4);
+const _: () = assert!(core::mem::offset_of!(AttnV3Params, n_head_kv) == 8);
+const _: () = assert!(core::mem::offset_of!(AttnV3Params, head_dim) == 12);
+const _: () = assert!(core::mem::offset_of!(AttnV3Params, scale) == 16);
+const _: () = assert!(core::mem::offset_of!(AttnV3Params, causal_offset) == 20);
+const _: () = assert!(core::mem::offset_of!(AttnV3Params, m) == 24);
+
 /// Send+Sync wrapper around the non-`Send` metal-rs handles.
 ///
 /// metal-rs types are `foreign-types` pointer wrappers and are neither `Send` nor
@@ -62,6 +89,11 @@ struct Handles {
     pipeline: ComputePipelineState,
     /// `mpgemm_tq2_0` — packed in-kernel-decode path (TQ2_0).
     pipeline_tq2: ComputePipelineState,
+    /// `gqa_attention_batch_v3_f32` — v3 Q-blocked prefill attention
+    /// (attention.metal, compiled as its OWN library with fast math disabled
+    /// so the pinned f32 orders stay IEEE round-to-nearest; mpgemm keeps its
+    /// validated default-options compile untouched).
+    pipeline_attn_v3: ComputePipelineState,
 }
 
 // SAFETY: the wrapped handles are `MTLDevice` / `MTLCommandQueue` /
@@ -201,12 +233,33 @@ impl MetalBackend {
                 BackendError::Backend(format!("pipeline state for `mpgemm_tq2_0`: {e}"))
             })?;
 
+        // v3 prefill attention: a SEPARATE library so it can compile with fast
+        // math disabled (IEEE round-to-nearest +,*,/ — the MSL meaning of
+        // CUDA's __fadd_rn/__fmul_rn discipline) without perturbing the
+        // validated mpgemm codegen above.
+        let attn_options = CompileOptions::new();
+        attn_options.set_fast_math_enabled(false);
+        let attn_library = device
+            .new_library_with_source(include_str!("attention.metal"), &attn_options)
+            .map_err(|e| BackendError::Backend(format!("attention MSL compile: {e}")))?;
+        let f_attn_v3 = attn_library
+            .get_function("gqa_attention_batch_v3_f32", None)
+            .map_err(|e| {
+                BackendError::Backend(format!("missing `gqa_attention_batch_v3_f32` function: {e}"))
+            })?;
+        let pipeline_attn_v3 = device
+            .new_compute_pipeline_state_with_function(&f_attn_v3)
+            .map_err(|e| {
+                BackendError::Backend(format!("pipeline state for `gqa_attention_batch_v3_f32`: {e}"))
+            })?;
+
         Ok(MetalBackend {
             handles: Handles {
                 device,
                 queue,
                 pipeline,
                 pipeline_tq2,
+                pipeline_attn_v3,
             },
             device_name,
         })
@@ -453,6 +506,177 @@ impl TernaryBackend for MetalBackend {
     }
 }
 
+impl MetalBackend {
+    /// v3 Q-blocked prefill GQA attention (Track E1: the MSL port of
+    /// tritium-cuda's `gqa_attention_batch_v3_f32`) — `M >= 1` query rows
+    /// against an f32 KV arena, causal, GQA.
+    ///
+    /// STATUS: the device kernel is compile-verified only until the
+    /// self-hosted Apple-Silicon lane runs `backend::tests::
+    /// attn_v3_matches_pinned_host_reference_or_skip`.
+    ///
+    /// Layouts (row-major): `q`/`out` `[m, n_head, head_dim]`; `k`/`v` KV
+    /// arenas `[>= causal_offset + m, n_head_kv, head_dim]`. `ctx_max` is the
+    /// scores-scratch stride (`>= causal_offset + m`; the arena capacity, in
+    /// the CUDA runner's terms).
+    ///
+    /// Dispatch priority — CUDA runs v3 → v2 → rev-1; this backend has no v2
+    /// or rev-1 device kernel, so the ladder is v3 (device) → the pinned-order
+    /// HOST reference [`crate::attn::gqa_attention_prefill_ref`] (same
+    /// summation orders, so the two rungs agree to within the documented
+    /// `precise::exp` deviation). The host rung serves when:
+    /// * `TRITIUM_ATTN_V3=0` (kill switch; the tritium-cuda env contract —
+    ///   any value other than `0`/`1` is a loud reject);
+    /// * `head_dim > ATTN_V3_HDMAX` (the kernel's threadgroup staging bound);
+    /// * the compiled pipeline's `thread_execution_width != 32` (the kernel's
+    ///   warp→simdgroup mapping assumes 32-lane simdgroups);
+    /// * the row-block count exceeds Metal's guaranteed 65535 threadgroups
+    ///   per grid dimension.
+    ///
+    /// # Errors
+    /// [`BackendError::InvalidInput`] on shape/length violations or a
+    /// malformed `TRITIUM_ATTN_V3`; [`BackendError::Backend`] on Metal
+    /// dispatch failures.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gqa_attention_prefill(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        out: &mut [f32],
+        ctx_max: usize,
+        n_head: usize,
+        n_head_kv: usize,
+        head_dim: usize,
+        scale: f32,
+        causal_offset: usize,
+        m: usize,
+    ) -> Result<(), BackendError> {
+        crate::attn::validate_v3_launch(
+            q.len(),
+            k.len(),
+            v.len(),
+            out.len(),
+            ctx_max,
+            n_head,
+            n_head_kv,
+            head_dim,
+            causal_offset,
+            m,
+        )
+        .map_err(BackendError::InvalidInput)?;
+
+        let v3_enabled =
+            crate::attn::parse_attn_v3(std::env::var("TRITIUM_ATTN_V3").ok().as_deref())
+                .map_err(BackendError::InvalidInput)?;
+        let (tg_x, tg_y) = crate::attn::v3_threadgroups(m, n_head);
+        // Metal guarantees at least 65535 threadgroups per grid dimension
+        // (same conservative ceiling the mpgemm dispatch uses).
+        let use_device = v3_enabled
+            && head_dim <= crate::attn::ATTN_V3_HDMAX
+            && self.handles.pipeline_attn_v3.thread_execution_width()
+                == crate::attn::ATTN_V3_SIMD_WIDTH as u64
+            && tg_x <= 65535
+            && tg_y <= 65535;
+        if !use_device {
+            crate::attn::gqa_attention_prefill_ref(
+                q,
+                k,
+                v,
+                out,
+                n_head,
+                n_head_kv,
+                head_dim,
+                scale,
+                causal_offset,
+                m,
+            );
+            return Ok(());
+        }
+        self.gqa_attention_prefill_v3_device(
+            q,
+            k,
+            v,
+            out,
+            ctx_max,
+            n_head,
+            n_head_kv,
+            head_dim,
+            scale,
+            causal_offset,
+            m,
+            (tg_x, tg_y),
+        )
+    }
+
+    /// Launch the v3 kernel: grid `(n_head, ceil(m/ATTN_V3_BQ))` threadgroups
+    /// of `ATTN_V3_THREADS`, plus the global `[m, n_head, ctx_max]` scores
+    /// scratch (device-allocated per call, like the CUDA prefill's per-call
+    /// `d_scores`). Caller has validated shapes and the dispatch bounds.
+    #[allow(clippy::too_many_arguments)]
+    fn gqa_attention_prefill_v3_device(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        out: &mut [f32],
+        ctx_max: usize,
+        n_head: usize,
+        n_head_kv: usize,
+        head_dim: usize,
+        scale: f32,
+        causal_offset: usize,
+        m: usize,
+        (tg_x, tg_y): (u64, u64),
+    ) -> Result<(), BackendError> {
+        let scores_len = crate::attn::v3_scores_len(m, n_head, ctx_max)
+            .ok_or_else(|| BackendError::InvalidInput("scores scratch overflows".to_owned()))?;
+
+        let dev = &self.handles.device;
+        let q_buf = shared_buffer(dev, q);
+        let k_buf = shared_buffer(dev, k);
+        let v_buf = shared_buffer(dev, v);
+        let out_bytes = core::mem::size_of_val(out) as u64;
+        let out_buf = dev.new_buffer(out_bytes, MTLResourceOptions::StorageModeShared);
+        let scores_bytes = (scores_len * core::mem::size_of::<f32>()) as u64;
+        let scores_buf = dev.new_buffer(scores_bytes, MTLResourceOptions::StorageModeShared);
+
+        let params = AttnV3Params {
+            ctx_max: ctx_max as u32,
+            n_head: n_head as u32,
+            n_head_kv: n_head_kv as u32,
+            head_dim: head_dim as u32,
+            scale,
+            causal_offset: causal_offset as u32,
+            m: m as u32,
+        };
+
+        let cmd = self.handles.queue.new_command_buffer();
+        let encoder = cmd.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&self.handles.pipeline_attn_v3);
+        encoder.set_buffer(0, Some(&q_buf), 0);
+        encoder.set_buffer(1, Some(&k_buf), 0);
+        encoder.set_buffer(2, Some(&v_buf), 0);
+        encoder.set_buffer(3, Some(&out_buf), 0);
+        encoder.set_buffer(4, Some(&scores_buf), 0);
+        encoder.set_bytes(
+            5,
+            core::mem::size_of::<AttnV3Params>() as u64,
+            core::ptr::from_ref(&params).cast(),
+        );
+        let threadgroups = MTLSize::new(tg_x, tg_y, 1);
+        let threads_per_group = MTLSize::new(u64::from(crate::attn::ATTN_V3_THREADS), 1, 1);
+        encoder.dispatch_thread_groups(threadgroups, threads_per_group);
+        encoder.end_encoding();
+
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        read_f32(&out_buf, out);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::MetalBackend;
@@ -601,5 +825,187 @@ mod tests {
         };
         run_shape(&backend, 0, 4, 256); // M=0 → empty output
         run_shape(&backend, 2, 3, 0); // K=0 → all-zeros (each out = scale·empty-sum)
+    }
+
+    // ---- v3 prefill attention (Track E1) — Mac-lane conformance gate --------
+
+    use crate::attn;
+
+    /// Deterministic q/k/v for an attention shape (xorshift64, like
+    /// `random_case` above — no external rng).
+    fn attn_case(
+        m: usize,
+        n_head: usize,
+        n_head_kv: usize,
+        head_dim: usize,
+        causal_offset: usize,
+    ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        let ctx_top = causal_offset + m;
+        let mut s: u64 = 0xA076_1D64_78BD_642F
+            ^ ((m as u64) << 3)
+            ^ ((n_head as u64) << 21)
+            ^ ((head_dim as u64) << 37)
+            ^ (causal_offset as u64);
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s as f32 / u64::MAX as f32) * 2.0 - 1.0
+        };
+        let q: Vec<f32> = (0..m * n_head * head_dim).map(|_| next()).collect();
+        let k: Vec<f32> = (0..ctx_top * n_head_kv * head_dim).map(|_| next()).collect();
+        let v: Vec<f32> = (0..ctx_top * n_head_kv * head_dim).map(|_| next()).collect();
+        (q, k, v)
+    }
+
+    /// The v3 device kernel vs the pinned-order host reference, across the
+    /// CUDA gate's regimes: staircase (m spanning multiple BQ row-blocks with
+    /// a tail), pure tail (m < BQ), deep ctx (causal_offset > 0), GQA + MHA
+    /// head groupings, head_dim at/below the HDMAX cap and not a multiple of
+    /// 32, and a ctx_max wider than ctx_top (scores-stride vs arena split).
+    ///
+    /// TOLERANCE, not to_bits: every summation ORDER is pinned identically on
+    /// both sides, but the kernel's exponential is `precise::exp` (Metal has
+    /// no f64 to reproduce CUDA's exp_f32) vs the host's glibc-correctly-
+    /// rounded `f32::exp` — a few ULP per weight, so per-element agreement is
+    /// asserted at rel 1e-5 / abs 1e-6. A drift beyond that means a REAL
+    /// order/mapping bug, not exp noise. Calls the device path directly (not
+    /// the dispatch wrapper), so an exec-width fallback cannot turn this gate
+    /// into a vacuous ref-vs-ref pass; skips (loudly) off-32-lane hardware
+    /// and when no Metal device exists.
+    #[test]
+    fn attn_v3_matches_pinned_host_reference_or_skip() {
+        let backend = match MetalBackend::new() {
+            Ok(b) => b,
+            // Skip ONLY the genuinely-no-device case; an MSL compile error in
+            // attention.metal must FAIL here, not masquerade as a skip (this
+            // is the first place the kernel source ever meets a Metal
+            // compiler — it is authored on Linux).
+            Err(e) => {
+                let msg = format!("{e}");
+                assert!(
+                    msg.contains("no Metal device"),
+                    "metal attn v3 gate: backend init failed (not a missing device): {msg}"
+                );
+                eprintln!("skipping metal attn v3 gate: no Metal device ({msg})");
+                return;
+            }
+        };
+        let width = backend.handles.pipeline_attn_v3.thread_execution_width();
+        if width != attn::ATTN_V3_SIMD_WIDTH as u64 {
+            eprintln!("skipping metal attn v3 gate: thread_execution_width {width} != 32");
+            return;
+        }
+
+        // (m, n_head, n_head_kv, head_dim, causal_offset, ctx_slack)
+        for &(m, n_head, n_head_kv, head_dim, causal_offset, ctx_slack) in &[
+            (1usize, 4usize, 4usize, 64usize, 0usize, 0usize), // single row, MHA
+            (5, 8, 2, 64, 0, 0),                               // tail-only block
+            (20, 8, 2, 128, 0, 0),                             // staircase + tail, HDMAX
+            (11, 8, 2, 80, 37, 0),                             // deep ctx, hd % 32 != 0
+            (16, 4, 1, 64, 3, 5),                              // ctx_max > ctx_top
+            (67, 8, 4, 64, 129, 0),                            // multi-chunk deep ctx
+        ] {
+            let ctx_max = causal_offset + m + ctx_slack;
+            let (q, k, v) = attn_case(m, n_head, n_head_kv, head_dim, causal_offset);
+            let scale = 1.0 / (head_dim as f32).sqrt();
+            let mut got = vec![0.0f32; m * n_head * head_dim];
+            let mut want = vec![0.0f32; m * n_head * head_dim];
+
+            attn::validate_v3_launch(
+                q.len(),
+                k.len(),
+                v.len(),
+                got.len(),
+                ctx_max,
+                n_head,
+                n_head_kv,
+                head_dim,
+                causal_offset,
+                m,
+            )
+            .expect("gate shape must satisfy the launch contract");
+            backend
+                .gqa_attention_prefill_v3_device(
+                    &q,
+                    &k,
+                    &v,
+                    &mut got,
+                    ctx_max,
+                    n_head,
+                    n_head_kv,
+                    head_dim,
+                    scale,
+                    causal_offset,
+                    m,
+                    attn::v3_threadgroups(m, n_head),
+                )
+                .expect("v3 device launch");
+            attn::gqa_attention_prefill_ref(
+                &q,
+                &k,
+                &v,
+                &mut want,
+                n_head,
+                n_head_kv,
+                head_dim,
+                scale,
+                causal_offset,
+                m,
+            );
+
+            for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
+                let diff = (g - w).abs();
+                let ok = diff <= 1e-6 || diff <= 1e-5 * w.abs();
+                assert!(
+                    ok,
+                    "[{i}] device {g} vs host {w} (m={m} n_head={n_head} kv={n_head_kv} \
+                     hd={head_dim} co={causal_offset} ctx_max={ctx_max}) — beyond the \
+                     exp-only tolerance: a pinned-order or thread-mapping bug"
+                );
+            }
+        }
+
+        // Smoke the public dispatch wrapper once (env parsing + priority +
+        // validation glue; the loop above pinned the device kernel itself).
+        let (m, n_head, n_head_kv, head_dim, causal_offset) = (5, 8, 2, 64, 0);
+        let (q, k, v) = attn_case(m, n_head, n_head_kv, head_dim, causal_offset);
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let mut got = vec![0.0f32; m * n_head * head_dim];
+        let mut want = vec![0.0f32; m * n_head * head_dim];
+        backend
+            .gqa_attention_prefill(
+                &q,
+                &k,
+                &v,
+                &mut got,
+                causal_offset + m,
+                n_head,
+                n_head_kv,
+                head_dim,
+                scale,
+                causal_offset,
+                m,
+            )
+            .expect("dispatch wrapper");
+        attn::gqa_attention_prefill_ref(
+            &q,
+            &k,
+            &v,
+            &mut want,
+            n_head,
+            n_head_kv,
+            head_dim,
+            scale,
+            causal_offset,
+            m,
+        );
+        for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
+            let diff = (g - w).abs();
+            assert!(
+                diff <= 1e-6 || diff <= 1e-5 * w.abs(),
+                "wrapper [{i}] {g} vs {w}"
+            );
+        }
     }
 }
