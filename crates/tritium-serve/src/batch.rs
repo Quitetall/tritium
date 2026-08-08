@@ -796,6 +796,31 @@ fn multi_spec_round(
         }
         return MultiOutcome::Fallback;
     }
+    // Bucket snap (Track A fallback, measured 2026-08-08): the batched
+    // verify trunk runs at the PADDED bucket size (tritium_cuda's
+    // TREE_BUCKETS ladder) and only the norm+lm_head tail at real Σm, so a
+    // group strictly between buckets pays the next bucket's whole trunk for
+    // rows that are pure padding. Reduce the shared k (floor 1) until
+    // N·(1+k) fits the largest bucket <= the policy Σm — trading at most a
+    // couple of drafts per slot for a trunk bucket of FLOPs. Unreachable
+    // snaps (Σm already on a bucket, below the smallest bucket, or the fit
+    // would need k=0) keep k unchanged. Kept (no switch) on the 2026-08-08
+    // ABBA A/B: +6.6% aggregate tok/s at N=4, +40% at N=2 (noisy session,
+    // direction consistent) vs the unsnapped shared k. Draft length never
+    // affects the committed stream, so this is a pure cost knob.
+    let m_total = n_live * (1 + k);
+    if !tritium_cuda::TREE_BUCKETS.contains(&m_total)
+        && let Some(b) = tritium_cuda::TREE_BUCKETS
+            .iter()
+            .copied()
+            .filter(|&b| b <= TREE_NODE_CAP && b < m_total)
+            .max()
+    {
+        let k_snap = (b / n_live).saturating_sub(1);
+        if k_snap >= 1 {
+            k = k.min(k_snap);
+        }
+    }
     // Per-slot chain caps: committed (<= drafts + 1) must fit the emission
     // budget, and the verify needs pos + 1 + d <= n_ctx (the solo
     // spec_cycle's clamps, per slot).

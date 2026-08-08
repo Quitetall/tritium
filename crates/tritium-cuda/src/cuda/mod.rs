@@ -662,7 +662,12 @@ struct TreeScratch {
 // L2 (ADR 0032): 4 and 12 added — adaptive-k drafts live at m 5..9, where
 // the old ladder padded m=9 to 16 rows (1.78x trunk FLOPs off one extra
 // draft token). Capture cost is once per bucket actually used.
-const TREE_BUCKETS: [usize; 7] = [4, 8, 12, 16, 24, 32, 48];
+// `pub`: tritium-serve's multi-slot spec round snaps its shared draft
+// length so the verify group's Σm lands ON a bucket boundary (the trunk
+// runs at the padded bucket size, so padding up wastes trunk FLOPs while
+// trimming a marginal draft is cheap) — exporting the ladder keeps serve
+// from hardcoding a second copy that could drift.
+pub const TREE_BUCKETS: [usize; 7] = [4, 8, 12, 16, 24, 32, 48];
 const TREE_BUCKET_MAX: usize = 48;
 
 /// Captured verify-trunk graphs + their `[prefix_len, real_m, kv_row_base]`

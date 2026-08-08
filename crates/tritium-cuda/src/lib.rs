@@ -59,6 +59,12 @@ pub use cuda::{
     BatchKv, CudaDecodeModel, DecodeLayerSpec, DecodeLinearSpec, DecodeModelSpec, KV_PAGE_TOKENS,
 };
 
+// ADR 0032 Track A: the tree-verify padding ladder, exported so tritium-serve's
+// shared draft-length selection can snap a verify group's Σm onto a bucket
+// boundary instead of hardcoding a drift-prone copy (see `cuda::TREE_BUCKETS`).
+#[cfg(feature = "cuda")]
+pub use cuda::TREE_BUCKETS;
+
 // v0.4.0: the resident SALT projection primitive — upload multi-plane TQ2_0 weights
 // plane-major once, then run the `salt_mpgemm_tiled_f32` kernel against them. The
 // building block a SALT decode forward composes per projection.
