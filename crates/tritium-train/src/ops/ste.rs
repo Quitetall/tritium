@@ -687,6 +687,58 @@ pub fn salt_quantize_forward_grouped_geometric(
     out
 }
 
+/// [`salt_quantize_forward_grouped_geometric`] with the rotation decisions supplied as a **fixed
+/// mask** rather than re-decided per call — the ladder's counterpart to
+/// [`salt_quantize_forward_grouped_masked`], and what an evaluator must use.
+///
+/// [`RotationPolicy::Auto`] re-decides every time it is called, so running it on a master that
+/// training has moved can score the checkpoint in a basis the student never optimised for. A
+/// trainer freezes the decision at construction; anything scoring that trainer's output has to
+/// apply the same frozen bits or it is measuring a different quantizer than the one that was
+/// trained. That mismatch invalidated a published conclusion in this repo once already.
+///
+/// `mask` is one byte per group (`1` = rotate) in row-major group order,
+/// `row * cols.div_ceil(group) + block` — [`geometric_rotation_mask`]'s layout. Groups whose length
+/// is not a power of two are never rotated regardless of their bit, matching the unmasked path.
+///
+/// # Panics
+/// If `mask.len()` is not `rows * cols.div_ceil(group)`.
+#[must_use]
+pub fn salt_quantize_forward_grouped_geometric_masked(
+    wf: &[f32],
+    rows: usize,
+    cols: usize,
+    t: usize,
+    group: usize,
+    grid: usize,
+    mask: &[u8],
+) -> Vec<f32> {
+    let group = group.max(1);
+    let per_row = cols.div_ceil(group);
+    assert_eq!(
+        mask.len(),
+        rows * per_row,
+        "geometric rotation mask must carry one byte per group"
+    );
+    let mut out = vec![0.0f32; wf.len()];
+    let mut buf: Vec<f32> = Vec::with_capacity(group);
+    for r in 0..rows {
+        let src = &wf[r * cols..(r + 1) * cols];
+        let dst = &mut out[r * cols..(r + 1) * cols];
+        for (b, (bs, bd)) in src.chunks(group).zip(dst.chunks_mut(group)).enumerate() {
+            // Always/Never rather than Auto: the bit already IS the decision.
+            let policy = if mask[r * per_row + b] == 1 {
+                RotationPolicy::Always
+            } else {
+                RotationPolicy::Never
+            };
+            let (fit, _, _, _) = fit_group_geometric_rotated(bs, t, grid, policy, &mut buf);
+            bd.copy_from_slice(&fit);
+        }
+    }
+    out
+}
+
 /// The per-group rotation decisions [`salt_quantize_forward_grouped_geometric`] would make, as one
 /// byte per group (`1` = rotate), in the layout a device kernel indexes by
 /// `row * cols.div_ceil(group) + block` — the ladder's counterpart to [`rotation_mask`].

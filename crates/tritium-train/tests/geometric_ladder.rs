@@ -393,3 +393,75 @@ fn a_group_given_more_planes_fits_better() {
         "group 1 at T=4 ({now_rich:.4e}) must beat itself at T=1 ({poor:.4e})"
     );
 }
+
+/// The masked ladder must reproduce the policy its mask was derived from.
+///
+/// A trainer freezes the rotation decision at construction and the kernel applies it; an evaluator
+/// must apply the SAME frozen decision, because `Auto` re-decides per call and would score a
+/// checkpoint in a basis the student never optimised for. That mismatch is not hypothetical — it
+/// invalidated a published conclusion in this repo once already.
+#[test]
+fn masked_ladder_reproduces_the_policy_its_mask_came_from() {
+    let (rows, cols, group) = (4usize, 200usize, 128usize); // ragged tail included
+    let w = gaussian(0x5A5F_11, rows * cols);
+    for t in 1..=4usize {
+        for &policy in &[
+            RotationPolicy::Never,
+            RotationPolicy::Always,
+            RotationPolicy::Auto,
+        ] {
+            let mask = ste::geometric_rotation_mask(&w, rows, cols, t, group, 16, policy);
+            let masked = ste::salt_quantize_forward_grouped_geometric_masked(
+                &w, rows, cols, t, group, 16, &mask,
+            );
+            let direct =
+                ste::salt_quantize_forward_grouped_geometric(&w, rows, cols, t, group, 16, policy);
+            assert_eq!(
+                masked.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                direct.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "T={t} {policy:?}: masked fitter diverged from the policy its mask encodes"
+            );
+        }
+    }
+}
+
+/// A frozen mask must stay frozen: applied to a master that has MOVED, the masked fitter honours
+/// the recorded decision rather than re-deciding. This is the property that makes it usable as an
+/// evaluator at all — and it is what distinguishes it from passing `Auto` again.
+#[test]
+fn masked_ladder_honours_a_frozen_decision_on_drifted_weights() {
+    let (rows, cols, group) = (2usize, 256usize, 128usize);
+    let w0 = gaussian(0xD21F7, rows * cols);
+    let mask = ste::geometric_rotation_mask(&w0, rows, cols, 3, group, 16, RotationPolicy::Auto);
+
+    // Perturb hard enough that `Auto` would re-decide for at least one group.
+    let drifted: Vec<f32> = w0
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| if i % 7 == 0 { v * 9.0 } else { v * 0.5 })
+        .collect();
+    let fresh =
+        ste::geometric_rotation_mask(&drifted, rows, cols, 3, group, 16, RotationPolicy::Auto);
+    assert_ne!(
+        mask, fresh,
+        "fixture too tame: the drift must change at least one Auto decision or this proves nothing"
+    );
+
+    let frozen = ste::salt_quantize_forward_grouped_geometric_masked(
+        &drifted, rows, cols, 3, group, 16, &mask,
+    );
+    let refit = ste::salt_quantize_forward_grouped_geometric(
+        &drifted,
+        rows,
+        cols,
+        3,
+        group,
+        16,
+        RotationPolicy::Auto,
+    );
+    assert_ne!(
+        frozen.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        refit.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        "the frozen mask must NOT track a re-decided Auto — that is the whole point of freezing it"
+    );
+}

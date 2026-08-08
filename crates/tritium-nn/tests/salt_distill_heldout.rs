@@ -478,17 +478,40 @@ fn salt_distillation_device_trainer_recovers_heldout() {
     };
     // Frozen at the INITIAL weights, exactly as `DeviceTrainer::new_with_fitter` freezes it, so the
     // evaluator can never re-decide on a master training has moved.
+    //
+    // BOTH the mask and the evaluator must use the SAME fitter the trainer runs. Deriving them from
+    // ITF while the device forward runs the ladder is the train/eval quantizer mismatch of task #76
+    // — and it recurred here: `SaltLadder` was wired into `DeviceTrainer` (f3f587c) while this path
+    // still called the ITF fitter unconditionally, so the ladder arm was trained through one
+    // quantizer and scored through another. Every number from that arm before this fix is void.
+    let ladder_cfg = match std::env::var("TRITIUM_DISTILL_LADDER").as_deref() {
+        Ok("geometric") => Some(
+            std::env::var("TRITIUM_DISTILL_GRID")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(16),
+        ),
+        _ => None,
+    };
     let rot_masks: Option<Vec<Vec<u8>>> = group_cfg.map(|g| {
         fp.iter()
             .zip(&shapes)
-            .map(|(wf, &(n, k))| ste::rotation_mask(wf, n, k, planes, g, itf_cfg, rot_cfg))
+            .map(|(wf, &(n, k))| match ladder_cfg {
+                Some(grid) => ste::geometric_rotation_mask(wf, n, k, planes, g, grid, rot_cfg),
+                None => ste::rotation_mask(wf, n, k, planes, g, itf_cfg, rot_cfg),
+            })
             .collect()
     });
     let deploy_quantize = |w: &[f32], n: usize, k: usize, i: usize| -> Vec<f32> {
         match (group_cfg, &rot_masks) {
-            (Some(g), Some(masks)) => {
-                ste::salt_quantize_forward_grouped_masked(w, n, k, planes, g, itf_cfg, &masks[i])
-            }
+            (Some(g), Some(masks)) => match ladder_cfg {
+                Some(grid) => ste::salt_quantize_forward_grouped_geometric_masked(
+                    w, n, k, planes, g, grid, &masks[i],
+                ),
+                None => ste::salt_quantize_forward_grouped_masked(
+                    w, n, k, planes, g, itf_cfg, &masks[i],
+                ),
+            },
             _ => ste::salt_quantize_forward(w, n, k, planes),
         }
     };
@@ -578,19 +601,10 @@ fn salt_distillation_device_trainer_recovers_heldout() {
         // `TRITIUM_DISTILL_LADDER=geometric` selects the balanced-ternary ladder — the fitter that
         // reaches fp parity at T=4 in PTQ, and the reason the plane cap here can exceed 3. Default
         // stays ITF so every committed distillation number remains reproducible from a bare run.
-        ladder: match std::env::var("TRITIUM_DISTILL_LADDER").as_deref() {
-            Ok("geometric") => SaltLadder::Geometric {
-                grid: std::env::var("TRITIUM_DISTILL_GRID")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(16),
-            },
-            _ => SaltLadder::Itf {
-                iters: std::env::var("TRITIUM_DISTILL_ITF")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(5),
-            },
+        // Derived from the SAME `ladder_cfg` the mask and evaluator use, so the three cannot drift.
+        ladder: match ladder_cfg {
+            Some(grid) => SaltLadder::Geometric { grid },
+            None => SaltLadder::Itf { iters: itf_cfg },
         },
     });
     // Print the WHOLE fitter configuration, including the knobs that are off. A distillation number
