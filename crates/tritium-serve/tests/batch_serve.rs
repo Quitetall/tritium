@@ -1212,6 +1212,179 @@ async fn cuda_batched_spec_multi_matches_single_worker() {
     );
 }
 
+/// Restores `TRITIUM_KV` on drop (the acceptance suite's KvEnvGuard pattern),
+/// so a failing f16 leg can't leak the rung into later tests.
+struct KvEnvGuard(Option<std::ffi::OsString>);
+impl KvEnvGuard {
+    fn set(rung: &str) -> Self {
+        let prev = std::env::var_os("TRITIUM_KV");
+        // SAFETY: the suite runs --test-threads=1 and the var is set before
+        // any model build or request; the tokio workers hold no work yet.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::set_var("TRITIUM_KV", rung);
+        }
+        Self(prev)
+    }
+}
+impl Drop for KvEnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: as in `set`.
+        #[allow(unsafe_code)]
+        unsafe {
+            match self.0.take() {
+                Some(v) => std::env::set_var("TRITIUM_KV", v),
+                None => std::env::remove_var("TRITIUM_KV"),
+            }
+        }
+    }
+}
+
+/// ADR 0036 L6 stage 2: the multi-slot spec pool under `TRITIUM_KV=f16` —
+/// the `cuda_batched_spec_multi_matches_single_worker` phase-A contract ON
+/// THE RUNG: 3 concurrent greedy streams through a `--batch-slots 3
+/// --draft-model` worker must be token-identical to the single-worker spec
+/// path run sequentially under the same f16 rung (adoption copies the f16
+/// prefill bytes exactly; slot verifies are engine-gated identical; drafts
+/// never affect committed tokens), with the same anti-lockstep and
+/// tok/verify teeth. The serve layer itself is expected to need ZERO f16
+/// changes — the engine guards were the only blockers — so this gate is
+/// pure verification.
+#[tokio::test(flavor = "multi_thread")]
+async fn cuda_batched_spec_multi_f16_matches_single_worker() {
+    if !Path::new(&*GGUF_PATH).exists() {
+        eprintln!("skipping: {} absent (gated real-model test)", *GGUF_PATH);
+        return;
+    }
+    if !Path::new(&*DRAFT_PATH).exists() {
+        eprintln!("skipping: {} absent (gated drafter test)", *DRAFT_PATH);
+        return;
+    }
+    let _kv = KvEnvGuard::set("f16");
+    let reference: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(REF_PATH).expect("read reference"))
+            .expect("parse reference");
+    let base: Vec<u32> = reference["token_ids"]
+        .as_array()
+        .expect("token_ids")
+        .iter()
+        .map(|v| v.as_u64().expect("id") as u32)
+        .collect();
+    let bytes = std::fs::read(&*GGUF_PATH).expect("read gguf");
+    let dbytes = std::fs::read(&*DRAFT_PATH).expect("read draft gguf");
+
+    let Some(target) = load_runner(&bytes) else {
+        return;
+    };
+    let draft = load_runner(&dbytes).expect("draft runner");
+    if draft.weights.vocab != target.weights.vocab {
+        eprintln!("skipping: drafter vocab mismatch");
+        return;
+    }
+
+    let horizon = 48usize;
+    let prompts: Vec<Vec<u32>> = (0..3usize)
+        .map(|i| {
+            base.iter()
+                .cycle()
+                .skip(2 * i)
+                .take(16 + 3 * i)
+                .copied()
+                .collect()
+        })
+        .collect();
+    let ids: Vec<String> = prompts
+        .iter()
+        .map(|p| p.iter().map(u32::to_string).collect::<Vec<_>>().join(" "))
+        .collect();
+
+    // Single-worker spec references under f16, run sequentially.
+    let mut single = RunnerGenerator::new(target, u32::MAX).with_draft_model(draft);
+    let mut want: Vec<Vec<u32>> = Vec::new();
+    for p in &prompts {
+        let req = GenRequest {
+            prompt_tokens: p.clone(),
+            max_new: horizon,
+            sampling: Sampling::Greedy,
+            stop_eos: false,
+            logprobs: None,
+        };
+        let mut out = Vec::new();
+        single
+            .generate(&req, &mut |step| {
+                out.push(step.token);
+                true
+            })
+            .expect("single-worker f16 spec generate");
+        assert_eq!(out.len(), horizon, "f16 reference stream wrong length");
+        want.push(out);
+    }
+    drop(single);
+
+    let parse = |text: &str| -> Vec<u32> {
+        text.split_whitespace()
+            .map(|t| t.parse().expect("token id"))
+            .collect()
+    };
+
+    // Batched server: 3 slots WITH the drafter, still under f16.
+    let runner = load_runner(&bytes).expect("runner");
+    let draft = load_runner(&dbytes).expect("draft runner");
+    let tok = Arc::new(IdPassthroughTokenizer::new(128_000, u32::MAX));
+    let cfg = ServeConfig {
+        model_id: "tritium".into(),
+        queue_cap: 32,
+        max_new_default: horizon,
+        ..ServeConfig::default()
+    };
+    let (router, _draining) = build_router_batched_with_draft(runner, draft, u32::MAX, 3, tok, cfg)
+        .expect("batched router");
+    let _ = chat(&router, "128000 791", 2).await; // warm captures
+
+    let spec_before =
+        tritium_serve::generator::SPEC_COMMITTED.load(std::sync::atomic::Ordering::Relaxed);
+    let verifies_before =
+        tritium_serve::generator::SPEC_VERIFIES.load(std::sync::atomic::Ordering::Relaxed);
+    let handles: Vec<_> = (0..3)
+        .map(|i| {
+            let router = router.clone();
+            let ids = ids[i].clone();
+            tokio::spawn(async move { (i, chat(&router, &ids, horizon).await) })
+        })
+        .collect();
+    for h in handles {
+        let (i, text) = h.await.expect("join");
+        assert_eq!(
+            parse(&text),
+            want[i],
+            "f16 multi-slot spec: concurrent stream {i} != single-worker f16 \
+             spec stream (losslessness on the rung)"
+        );
+    }
+    let spec_delta = tritium_serve::generator::SPEC_COMMITTED
+        .load(std::sync::atomic::Ordering::Relaxed)
+        - spec_before;
+    assert!(
+        spec_delta >= (3 * horizon as u64) / 2,
+        "f16 multi-slot spec teeth: only {spec_delta} of {} tokens were \
+         spec-committed — the pool silently fell back to lockstep",
+        3 * horizon
+    );
+    let verify_delta = tritium_serve::generator::SPEC_VERIFIES
+        .load(std::sync::atomic::Ordering::Relaxed)
+        - verifies_before;
+    let tok_per_verify = spec_delta as f64 / verify_delta.max(1) as f64;
+    assert!(
+        tok_per_verify >= 1.5,
+        "f16 multi-slot spec teeth: tok/verify collapsed to {tok_per_verify:.2}"
+    );
+    println!(
+        "f16 multi-spec gate: 3 concurrent == single worker ({horizon} tokens \
+         each, {spec_delta} spec-committed / {verify_delta} verifies = \
+         {tok_per_verify:.2} tok/verify) — zero serve-side changes needed"
+    );
+}
+
 /// Throughput bench (run explicitly): aggregate tok/s of N concurrent
 /// requests through an N-slot pool vs the same requests sequentially
 /// through the single-request worker — the number continuous batching exists

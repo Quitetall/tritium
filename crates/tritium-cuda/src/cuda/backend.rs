@@ -6720,6 +6720,10 @@ impl CudaBackend {
         // v1.x split attention: the reduce kernel stages the same max_ctx scores in
         // dynamic shared, so it needs the identical opt-in on its own handle.
         let sel = |a, b, c| kv_dtype.pick(a, b, c);
+        // ADR 0036 L6 stage 2: the batch/paged/slots families have f32 + f16
+        // twins only — the scale rungs keep the f32 names (their batch
+        // arenas stay f32 and every f16-twin-reachable entry rejects i8/t2).
+        let fh = |a, b| if kv_dtype == KvDtype::F16 { b } else { a };
         let f_attn_scores = f(
             dm,
             sel(
@@ -6767,9 +6771,27 @@ impl CudaBackend {
         // I3 paged tree-verify twins (eager paged slot route). The paged
         // reduce stages the same up-to-max_ctx scores in dynamic shared, so
         // it needs the identical opt-in on its own handle.
-        let f_kv_append_tree_paged = f(dm, KERNEL_NAME_KV_APPEND_TREE_PAGED)?;
-        let f_attn_tree_scores_ctrl_paged = f(dm, KERNEL_NAME_ATTN_TREE_SCORES_CTRL_PAGED)?;
-        let f_attn_tree_reduce_ctrl_paged = f(dm, KERNEL_NAME_ATTN_TREE_REDUCE_CTRL_PAGED)?;
+        let f_kv_append_tree_paged = f(
+            dm,
+            fh(
+                KERNEL_NAME_KV_APPEND_TREE_PAGED,
+                KERNEL_NAME_KV_APPEND_TREE_PAGED_H,
+            ),
+        )?;
+        let f_attn_tree_scores_ctrl_paged = f(
+            dm,
+            fh(
+                KERNEL_NAME_ATTN_TREE_SCORES_CTRL_PAGED,
+                KERNEL_NAME_ATTN_TREE_SCORES_CTRL_PAGED_H,
+            ),
+        )?;
+        let f_attn_tree_reduce_ctrl_paged = f(
+            dm,
+            fh(
+                KERNEL_NAME_ATTN_TREE_REDUCE_CTRL_PAGED,
+                KERNEL_NAME_ATTN_TREE_REDUCE_CTRL_PAGED_H,
+            ),
+        )?;
         attn_shared_opt_in(max_ctx, |bytes| {
             f_attn_tree_reduce_ctrl_paged.set_attribute(
                 sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
@@ -6779,12 +6801,48 @@ impl CudaBackend {
         // I4 batched-slots twins (eager slots route; per-ROW ctrl). Both
         // reduce variants stage up-to-max_ctx scores in dynamic shared —
         // same opt-in as their single-slot siblings.
-        let f_kv_append_tree_slots = f(dm, KERNEL_NAME_KV_APPEND_TREE_SLOTS)?;
-        let f_attn_tree_scores_slots = f(dm, KERNEL_NAME_ATTN_TREE_SCORES_SLOTS)?;
-        let f_attn_tree_reduce_slots = f(dm, KERNEL_NAME_ATTN_TREE_REDUCE_SLOTS)?;
-        let f_kv_append_tree_slots_paged = f(dm, KERNEL_NAME_KV_APPEND_TREE_SLOTS_PAGED)?;
-        let f_attn_tree_scores_slots_paged = f(dm, KERNEL_NAME_ATTN_TREE_SCORES_SLOTS_PAGED)?;
-        let f_attn_tree_reduce_slots_paged = f(dm, KERNEL_NAME_ATTN_TREE_REDUCE_SLOTS_PAGED)?;
+        let f_kv_append_tree_slots = f(
+            dm,
+            fh(
+                KERNEL_NAME_KV_APPEND_TREE_SLOTS,
+                KERNEL_NAME_KV_APPEND_TREE_SLOTS_H,
+            ),
+        )?;
+        let f_attn_tree_scores_slots = f(
+            dm,
+            fh(
+                KERNEL_NAME_ATTN_TREE_SCORES_SLOTS,
+                KERNEL_NAME_ATTN_TREE_SCORES_SLOTS_H,
+            ),
+        )?;
+        let f_attn_tree_reduce_slots = f(
+            dm,
+            fh(
+                KERNEL_NAME_ATTN_TREE_REDUCE_SLOTS,
+                KERNEL_NAME_ATTN_TREE_REDUCE_SLOTS_H,
+            ),
+        )?;
+        let f_kv_append_tree_slots_paged = f(
+            dm,
+            fh(
+                KERNEL_NAME_KV_APPEND_TREE_SLOTS_PAGED,
+                KERNEL_NAME_KV_APPEND_TREE_SLOTS_PAGED_H,
+            ),
+        )?;
+        let f_attn_tree_scores_slots_paged = f(
+            dm,
+            fh(
+                KERNEL_NAME_ATTN_TREE_SCORES_SLOTS_PAGED,
+                KERNEL_NAME_ATTN_TREE_SCORES_SLOTS_PAGED_H,
+            ),
+        )?;
+        let f_attn_tree_reduce_slots_paged = f(
+            dm,
+            fh(
+                KERNEL_NAME_ATTN_TREE_REDUCE_SLOTS_PAGED,
+                KERNEL_NAME_ATTN_TREE_REDUCE_SLOTS_PAGED_H,
+            ),
+        )?;
         attn_shared_opt_in(max_ctx, |bytes| {
             f_attn_tree_reduce_slots.set_attribute(
                 sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
@@ -7005,10 +7063,34 @@ impl CudaBackend {
             f_lm_head_i8: f(dm, KERNEL_NAME_LM_HEAD_WARP_I8)?,
             f_lm_head_tiled_i8: f(dm, KERNEL_NAME_LM_HEAD_TILED_I8)?,
             head_dtype,
-            f_kv_append_mdecode: f(dm, KERNEL_NAME_KV_APPEND_MDECODE)?,
-            f_kv_append_mdecode_paged: f(dm, KERNEL_NAME_KV_APPEND_MDECODE_PAGED)?,
-            f_attn_split_partial: f(dm, KERNEL_NAME_ATTN_SPLIT_PARTIAL)?,
-            f_attn_split_partial_paged: f(dm, KERNEL_NAME_ATTN_SPLIT_PARTIAL_PAGED)?,
+            f_kv_append_mdecode: f(
+                dm,
+                fh(
+                    KERNEL_NAME_KV_APPEND_MDECODE,
+                    KERNEL_NAME_KV_APPEND_MDECODE_H,
+                ),
+            )?,
+            f_kv_append_mdecode_paged: f(
+                dm,
+                fh(
+                    KERNEL_NAME_KV_APPEND_MDECODE_PAGED,
+                    KERNEL_NAME_KV_APPEND_MDECODE_PAGED_H,
+                ),
+            )?,
+            f_attn_split_partial: f(
+                dm,
+                fh(
+                    KERNEL_NAME_ATTN_SPLIT_PARTIAL,
+                    KERNEL_NAME_ATTN_SPLIT_PARTIAL_H,
+                ),
+            )?,
+            f_attn_split_partial_paged: f(
+                dm,
+                fh(
+                    KERNEL_NAME_ATTN_SPLIT_PARTIAL_PAGED,
+                    KERNEL_NAME_ATTN_SPLIT_PARTIAL_PAGED_H,
+                ),
+            )?,
             f_attn_combine: f(dm, KERNEL_NAME_ATTN_COMBINE)?,
             d_token_embd,
             d_token_embd_f16,

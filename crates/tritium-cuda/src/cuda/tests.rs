@@ -3484,6 +3484,358 @@ fn tree_ctrl_f16w_wide_and_fallback_match_nonctrl_h_bitwise() {
     }
 }
 
+/// ADR 0036 L6 stage 2 gate: the SIX new addressing-policy `_h` tree kernels
+/// (`gqa_attention_tree_{scores,reduce}_{ctrl_paged,slots,slots_paged}_h`)
+/// must be bit-identical to the ALREADY-GATED dense single-slot ctrl `_h`
+/// pair on equivalent inputs, across the wide AND fallback shapes:
+///   * hd=104 (%8==0): scores WIDE (one 16 B LDG / 8 halves), reduce pair
+///     path — a non-128 wide shape;
+///   * hd=100 (%4==0, %8!=0): scores takes the kvh_load4 FALLBACK, reduce
+///     stays on the pair path;
+///   * hd=101 (odd, reduce-only over host-synthesized scores): reduce takes
+///     the scalar FALLBACK.
+///
+/// Equivalence construction: slots rows carry per-row ctrl `[prefix, i, w2]`
+/// (the concatenation of one slot's tree = the single-slot launch); paged
+/// twins run a NON-IDENTITY page table (`table[toff] = 3` at `toff = 2`, so
+/// physical rows sit at `768 + logical`) over a pool whose mapped page holds
+/// the anchor's contiguous rows — pinning the table translation, the toff
+/// offset and the wide/fallback bodies in one comparison.
+#[test]
+fn tree_addr_h_wide_and_fallback_match_ctrl_h_bitwise() {
+    use cudarc::driver::{CudaContext, LaunchConfig, PushKernelArg};
+    use cudarc::nvrtc::Ptx;
+
+    let ctx = match CudaContext::new(0) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("skipping tree addr _h gate: no device ({e})");
+            return;
+        }
+    };
+    let stream = ctx.default_stream();
+    let dm = ctx
+        .load_module(Ptx::from_src(DECODE_PTX))
+        .expect("load decode module");
+    let f = |n: &str| dm.load_function(n).unwrap_or_else(|e| panic!("{n}: {e}"));
+    let f_scores_anchor = f("gqa_attention_tree_scores_ctrl_h");
+    let f_reduce_anchor = f("gqa_attention_tree_reduce_ctrl_h");
+    let f_scores_paged = f("gqa_attention_tree_scores_ctrl_paged_h");
+    let f_reduce_paged = f("gqa_attention_tree_reduce_ctrl_paged_h");
+    let f_scores_slots = f("gqa_attention_tree_scores_slots_h");
+    let f_reduce_slots = f("gqa_attention_tree_reduce_slots_h");
+    let f_scores_slots_paged = f("gqa_attention_tree_scores_slots_paged_h");
+    let f_reduce_slots_paged = f("gqa_attention_tree_reduce_slots_paged_h");
+
+    // Geometry mirrors the stage-1 f16w gate: 3 real rows, prefix 5,
+    // ctx_max 16 (= score stride everywhere).
+    let (n_head, n_head_kv, m, prefix_len, max_anc, ctx_max, kv_rows) =
+        (4usize, 2usize, 3usize, 5usize, 4usize, 16usize, 16usize);
+    let n_anc: Vec<i32> = vec![2, 4, 3];
+    #[rustfmt::skip]
+    let anc: Vec<i32> = vec![
+        5, 7, 0, 0,    // row 0: 2 ancestors
+        6, 8, 11, 14,  // row 1: 4
+        5, 9, 13, 0,   // row 2: 3
+    ];
+    // Anchor ctrl (dense single-slot, row base 0); slots rows are the same
+    // tree expressed per row; paged word 2 = the slot's TABLE offset.
+    let toff = 2usize;
+    let ctrl_anchor: Vec<i32> = vec![prefix_len as i32, m as i32, 0];
+    let ctrl_paged: Vec<i32> = vec![prefix_len as i32, m as i32, toff as i32];
+    let mut row_ctrl_dense: Vec<i32> = Vec::new();
+    let mut row_ctrl_paged: Vec<i32> = Vec::new();
+    for i in 0..m {
+        row_ctrl_dense.extend([prefix_len as i32, i as i32, 0]);
+        row_ctrl_paged.extend([prefix_len as i32, i as i32, toff as i32]);
+    }
+    // Non-identity single-page table at offset `toff`: logical row j lives at
+    // physical pool row 3·256 + j.
+    let table: Vec<i32> = vec![-1, -1, 3];
+    let pool_rows = 3 * 256 + kv_rows;
+
+    let mut seed = 0x0036_0006_0002u64;
+    let mut nextf = move || {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (((seed >> 33) as i32 % 1000) as f32) * 1e-3 - 0.5
+    };
+
+    let d_anc = stream.clone_htod(&anc).expect("anc");
+    let d_n_anc = stream.clone_htod(&n_anc).expect("n_anc");
+    let d_ctrl_anchor = stream.clone_htod(&ctrl_anchor).expect("ctrl anchor");
+    let d_ctrl_paged = stream.clone_htod(&ctrl_paged).expect("ctrl paged");
+    let d_row_ctrl_dense = stream.clone_htod(&row_ctrl_dense).expect("row ctrl");
+    let d_row_ctrl_paged = stream.clone_htod(&row_ctrl_paged).expect("row ctrl paged");
+    let d_table = stream.clone_htod(&table).expect("table");
+    let (ss_i, nh_i, nhkv_i, ma_i, m_i) = (
+        ctx_max as i32, // score stride, all paths
+        n_head as i32,
+        n_head_kv as i32,
+        max_anc as i32,
+        m as i32,
+    );
+    let scores_cfg = LaunchConfig {
+        grid_dim: ((m * n_head) as u32, ctx_max.div_ceil(128) as u32, 1),
+        block_dim: (32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let reduce_cfg = LaunchConfig {
+        grid_dim: ((m * n_head) as u32, 1, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: (ctx_max * 4) as u32,
+    };
+    let scores_len = m * n_head * ctx_max;
+
+    for head_dim in [100usize, 104usize] {
+        let hd_i = head_dim as i32;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let q: Vec<f32> = (0..m * n_head * head_dim).map(|_| nextf()).collect();
+        let kv_len = kv_rows * n_head_kv * head_dim;
+        let kh: Vec<u16> = (0..kv_len)
+            .map(|_| f16::from_f32(nextf()).to_bits())
+            .collect();
+        let vh: Vec<u16> = (0..kv_len)
+            .map(|_| f16::from_f32(nextf()).to_bits())
+            .collect();
+        // Paged pool: the mapped page (rows 768..768+kv_rows) holds the
+        // anchor's contiguous rows; everything else stays zero.
+        let row_elems = n_head_kv * head_dim;
+        let mut kh_pool: Vec<u16> = vec![0; pool_rows * row_elems];
+        let mut vh_pool: Vec<u16> = vec![0; pool_rows * row_elems];
+        kh_pool[768 * row_elems..(768 + kv_rows) * row_elems].copy_from_slice(&kh);
+        vh_pool[768 * row_elems..(768 + kv_rows) * row_elems].copy_from_slice(&vh);
+        let d_q = stream.clone_htod(&q).expect("q");
+        let d_k = stream.clone_htod(&kh).expect("k16");
+        let d_v = stream.clone_htod(&vh).expect("v16");
+        let d_k_pool = stream.clone_htod(&kh_pool).expect("k pool");
+        let d_v_pool = stream.clone_htod(&vh_pool).expect("v pool");
+
+        let out_len = m * n_head * head_dim;
+        let alloc_f = |what: &str, n: usize| -> cudarc::driver::CudaSlice<f32> {
+            stream
+                .alloc_zeros(n)
+                .unwrap_or_else(|e| panic!("{what}: {e}"))
+        };
+        let mut d_sc_anchor = alloc_f("sc anchor", scores_len);
+        let mut d_out_anchor = alloc_f("out anchor", out_len);
+
+        // Anchor: the gated dense ctrl _h pair.
+        #[allow(unsafe_code)]
+        {
+            let mut l = stream.launch_builder(&f_scores_anchor);
+            l.arg(&d_q)
+                .arg(&d_k)
+                .arg(&mut d_sc_anchor)
+                .arg(&d_anc)
+                .arg(&d_n_anc)
+                .arg(&d_ctrl_anchor)
+                .arg(&ss_i)
+                .arg(&nh_i)
+                .arg(&nhkv_i)
+                .arg(&hd_i)
+                .arg(&scale)
+                .arg(&ma_i)
+                .arg(&m_i);
+            // SAFETY: ctrl scores signature; one-warp blocks per contract.
+            unsafe { l.launch(scores_cfg).expect("anchor scores") };
+            let mut l = stream.launch_builder(&f_reduce_anchor);
+            l.arg(&d_v)
+                .arg(&d_sc_anchor)
+                .arg(&mut d_out_anchor)
+                .arg(&d_anc)
+                .arg(&d_n_anc)
+                .arg(&d_ctrl_anchor)
+                .arg(&ss_i)
+                .arg(&nh_i)
+                .arg(&nhkv_i)
+                .arg(&hd_i)
+                .arg(&ma_i)
+                .arg(&m_i);
+            // SAFETY: ctrl reduce signature; blockDim.x == 128 per contract.
+            unsafe { l.launch(reduce_cfg).expect("anchor reduce") };
+        }
+        let sc_a = stream.clone_dtoh(&d_sc_anchor).expect("dtoh sc anchor");
+        let out_a = stream.clone_dtoh(&d_out_anchor).expect("dtoh out anchor");
+
+        // The three new pairs, each on its own scratch.
+        for (name, paged, per_row) in [
+            ("ctrl_paged_h", true, false),
+            ("slots_h", false, true),
+            ("slots_paged_h", true, true),
+        ] {
+            let (f_sc, f_rd) = match (paged, per_row) {
+                (true, false) => (&f_scores_paged, &f_reduce_paged),
+                (false, true) => (&f_scores_slots, &f_reduce_slots),
+                (true, true) => (&f_scores_slots_paged, &f_reduce_slots_paged),
+                _ => unreachable!(),
+            };
+            let d_c = match (paged, per_row) {
+                (true, false) => &d_ctrl_paged,
+                (false, true) => &d_row_ctrl_dense,
+                _ => &d_row_ctrl_paged,
+            };
+            let (dk, dv) = if paged {
+                (&d_k_pool, &d_v_pool)
+            } else {
+                (&d_k, &d_v)
+            };
+            let mut d_sc = alloc_f("sc", scores_len);
+            let mut d_out = alloc_f("out", out_len);
+            #[allow(unsafe_code)]
+            {
+                let mut l = stream.launch_builder(f_sc);
+                l.arg(&d_q)
+                    .arg(dk)
+                    .arg(&mut d_sc)
+                    .arg(&d_anc)
+                    .arg(&d_n_anc)
+                    .arg(d_c);
+                if paged {
+                    l.arg(&d_table);
+                }
+                l.arg(&ss_i)
+                    .arg(&nh_i)
+                    .arg(&nhkv_i)
+                    .arg(&hd_i)
+                    .arg(&scale)
+                    .arg(&ma_i)
+                    .arg(&m_i);
+                // SAFETY: the addressed scores signature (paged twins carry
+                // the extra table arg); one-warp blocks per contract.
+                unsafe { l.launch(scores_cfg).expect("addr scores") };
+                let mut l = stream.launch_builder(f_rd);
+                l.arg(dv)
+                    .arg(&d_sc)
+                    .arg(&mut d_out)
+                    .arg(&d_anc)
+                    .arg(&d_n_anc)
+                    .arg(d_c);
+                if paged {
+                    l.arg(&d_table);
+                }
+                l.arg(&ss_i)
+                    .arg(&nh_i)
+                    .arg(&nhkv_i)
+                    .arg(&hd_i)
+                    .arg(&ma_i)
+                    .arg(&m_i);
+                // SAFETY: the addressed reduce signature; blockDim.x == 128.
+                unsafe { l.launch(reduce_cfg).expect("addr reduce") };
+            }
+            let sc = stream.clone_dtoh(&d_sc).expect("dtoh sc");
+            let out = stream.clone_dtoh(&d_out).expect("dtoh out");
+            for (i, (&a, &b)) in sc.iter().zip(&sc_a).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "{name} scores diverge from dense ctrl _h (hd={head_dim}) \
+                     at [{i}]: got={a} anchor={b}"
+                );
+            }
+            for (i, (&a, &b)) in out.iter().zip(&out_a).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "{name} reduce diverges from dense ctrl _h (hd={head_dim}) \
+                     at [{i}]: got={a} anchor={b}"
+                );
+            }
+        }
+    }
+
+    // Reduce FALLBACK (hd=101, odd) over host-synthesized scores: all three
+    // new reduce kernels vs the anchor on the same scores buffer.
+    {
+        let head_dim = 101usize;
+        let hd_i = head_dim as i32;
+        let kv_len = kv_rows * n_head_kv * head_dim;
+        let vh: Vec<u16> = (0..kv_len)
+            .map(|_| f16::from_f32(nextf()).to_bits())
+            .collect();
+        let row_elems = n_head_kv * head_dim;
+        let mut vh_pool: Vec<u16> = vec![0; pool_rows * row_elems];
+        vh_pool[768 * row_elems..(768 + kv_rows) * row_elems].copy_from_slice(&vh);
+        let sc_host: Vec<f32> = (0..scores_len).map(|_| nextf()).collect();
+        let d_v = stream.clone_htod(&vh).expect("v16 odd");
+        let d_v_pool = stream.clone_htod(&vh_pool).expect("v pool odd");
+        let d_sc = stream.clone_htod(&sc_host).expect("sc odd");
+        let out_len = m * n_head * head_dim;
+        let mut d_out_anchor: cudarc::driver::CudaSlice<f32> =
+            stream.alloc_zeros(out_len).expect("out anchor odd");
+        #[allow(unsafe_code)]
+        {
+            let mut l = stream.launch_builder(&f_reduce_anchor);
+            l.arg(&d_v)
+                .arg(&d_sc)
+                .arg(&mut d_out_anchor)
+                .arg(&d_anc)
+                .arg(&d_n_anc)
+                .arg(&d_ctrl_anchor)
+                .arg(&ss_i)
+                .arg(&nh_i)
+                .arg(&nhkv_i)
+                .arg(&hd_i)
+                .arg(&ma_i)
+                .arg(&m_i);
+            // SAFETY: ctrl reduce signature; blockDim.x == 128 per contract.
+            unsafe { l.launch(reduce_cfg).expect("anchor reduce odd") };
+        }
+        let out_a = stream.clone_dtoh(&d_out_anchor).expect("dtoh anchor odd");
+        for (name, paged, per_row) in [
+            ("ctrl_paged_h", true, false),
+            ("slots_h", false, true),
+            ("slots_paged_h", true, true),
+        ] {
+            let f_rd = match (paged, per_row) {
+                (true, false) => &f_reduce_paged,
+                (false, true) => &f_reduce_slots,
+                (true, true) => &f_reduce_slots_paged,
+                _ => unreachable!(),
+            };
+            let d_c = match (paged, per_row) {
+                (true, false) => &d_ctrl_paged,
+                (false, true) => &d_row_ctrl_dense,
+                _ => &d_row_ctrl_paged,
+            };
+            let dv = if paged { &d_v_pool } else { &d_v };
+            let mut d_out: cudarc::driver::CudaSlice<f32> =
+                stream.alloc_zeros(out_len).expect("out odd");
+            #[allow(unsafe_code)]
+            {
+                let mut l = stream.launch_builder(f_rd);
+                l.arg(dv)
+                    .arg(&d_sc)
+                    .arg(&mut d_out)
+                    .arg(&d_anc)
+                    .arg(&d_n_anc)
+                    .arg(d_c);
+                if paged {
+                    l.arg(&d_table);
+                }
+                l.arg(&ss_i)
+                    .arg(&nh_i)
+                    .arg(&nhkv_i)
+                    .arg(&hd_i)
+                    .arg(&ma_i)
+                    .arg(&m_i);
+                // SAFETY: the addressed reduce signature; blockDim.x == 128.
+                unsafe { l.launch(reduce_cfg).expect("addr reduce odd") };
+            }
+            let out = stream.clone_dtoh(&d_out).expect("dtoh out odd");
+            for (i, (&a, &b)) in out.iter().zip(&out_a).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "{name} reduce FALLBACK diverges from dense ctrl _h (hd=101) \
+                     at [{i}]: got={a} anchor={b}"
+                );
+            }
+        }
+    }
+}
+
 /// v0.3.1 de-risk: the device `rmsnorm_f32` decode kernel must reproduce the host
 /// `tritium_nn::ops::rmsnorm` **bit-for-bit** (`to_bits` equal), so the fully
 /// device-resident forward keeps greedy 256/256. This is the proof that a
@@ -5098,7 +5450,7 @@ fn adr_0022_twin_family_table_matches_decode_cu() {
     }
     assert_eq!(
         names.len(),
-        86,
+        99,
         "decode.cu kernel count drifted from ADR 0022 — update the ADR \
          (65 → 64: gqa_attention_mdecode_f32 retired; 64 → 66: paged KV \
          twins added, ADR 0025 step 2; rmsnorm_quant_i8_fast was added and \
@@ -5132,7 +5484,18 @@ fn adr_0022_twin_family_table_matches_decode_cu() {
          rmsnorm+quant, bit-identical to the rmsnorm_batch_f32 → \
          act_quant_batch_i8 pair by the \
          rmsnorm_quant_batch_matches_split_pair_bitwise gate; the split \
-         kernels stay for the final output norm and quant-only sites)"
+         kernels stay for the final output norm and quant-only sites; \
+         86 → 99: ADR 0036 L6 stage 2 — f16 twins for the BATCHED arenas: \
+         kv_append_mdecode[_paged]_h + gqa_attention_split_partial[_paged]_h \
+         (store/load-codec instantiations of the mdecode bodies; f32 SASS \
+         pinned identical via tools/sass_diff.sh) and the nine \
+         addressing-policy tree twins kv_append_tree_{{paged,slots,\
+         slots_paged}}_h + gqa_attention_tree_{{scores,reduce}}_{{ctrl_paged,\
+         slots,slots_paged}}_h (wide-load bodies per 66d8f58; the f32 \
+         paged/slots kernels are RETAINED verbatim), pinned bitwise against \
+         the gated dense ctrl _h pair by \
+         tree_addr_h_wide_and_fallback_match_ctrl_h_bitwise and end-to-end \
+         by the f16 batch/paged/slots acceptance gates in tritium-nn)"
     );
 }
 

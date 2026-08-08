@@ -138,7 +138,8 @@ impl CudaDecodeModel {
     /// logical → physical through the shared `d_table` (pointer baked at
     /// capture, content uploaded per verify), and an up-front reservation
     /// guard pins `[0, prefix + padded m)` to mapped pages. Callers
-    /// guarantee for `slot`: f32 KV rung, valid live row, and (paged only)
+    /// guarantee for `slot`: the f32 or f16 KV rung (stage 2: the ctrl
+    /// twins are dtype-selected), valid live row, and (paged only)
     /// `head_dim % 4 == 0`.
     fn tree_forward(
         &mut self,
@@ -210,16 +211,17 @@ impl CudaDecodeModel {
         // capture path doesn't carry the opt-in attribute the safe handles
         // get at load).
         // (Batch slots share every condition: the slot-route wrapper requires
-        // the f32 KV rung, batch arenas are f32, and `batch.max_ctx` equals
+        // an f32/f16 KV rung, batch arenas follow it, and `batch.max_ctx` equals
         // `self.max_ctx` by construction — the score stride and reduce smem
         // stay `self.max_ctx` for both targets.)
         let bucket = if self.head_dim.is_multiple_of(4)
             && m <= TREE_BUCKET_MAX
             && self.max_ctx * 4 <= 48 * 1024
-            // f32 everywhere; f16 single-seq only (ADR 0036 L6: the ctrl `_h`
-            // twins serve the dense single-seq capture — batch arenas stay
-            // f32, and the scale rungs (i8/t2) have no ctrl twins → eager).
-            && (self.kv_elem == 4 || (self.kv_dtype == KvDtype::F16 && slot.is_none()))
+            // f32 and f16 rungs everywhere (ADR 0036 L6 stage 2: the ctrl
+            // `_h` twins now cover single-seq, dense-slot, paged and slots
+            // captures — batch arenas follow the rung); the scale rungs
+            // (i8/t2) have no ctrl twins → eager.
+            && (self.kv_elem == 4 || self.kv_dtype == KvDtype::F16)
             && std::env::var_os("TRITIUM_TREE_EAGER").is_none()
         {
             TREE_BUCKETS
@@ -770,9 +772,10 @@ impl CudaDecodeModel {
                         )?;
                     }
                     Some((b, _)) => {
-                        // Batch arenas are f32 (no scale planes); the slot
-                        // wrapper guarantees kv_elem == 4, so the dtype-
-                        // selected handles below are the f32 kernels.
+                        // Batch arenas follow the rung (no scale planes); the
+                        // slot wrapper rejects i8/t2, so the dtype-selected
+                        // handles below are the f32 or f16 kernels — matching
+                        // the byte arenas.
                         Self::bl_kv_append(
                             s,
                             &self.f_kv_append_batch,
@@ -793,7 +796,12 @@ impl CudaDecodeModel {
                             m,
                             None,
                         )?;
-                        let (lo, hi) = (row_base * kv_width, (row_base + region_ctx) * kv_width);
+                        // Byte-offset views of the slot's dense sub-range
+                        // (arenas are byte-typed; elements are kv_elem wide).
+                        let (lo, hi) = (
+                            row_base * kv_width * b.kv_elem,
+                            (row_base + region_ctx) * kv_width * b.kv_elem,
+                        );
                         let (kview, vview) = (b.kv_k[li].slice(lo..hi), b.kv_v[li].slice(lo..hi));
                         if head_dim.is_multiple_of(4) {
                             Self::bl_attn_tree_split(
@@ -1055,7 +1063,8 @@ impl CudaDecodeModel {
     /// paged ctrl twins are float4 kernels; the non-split tree kernel has no
     /// paged twin).
     ///
-    /// Common requirements: the f32 KV rung (batch arenas are f32 — the same
+    /// Common requirements: the f32 or f16 KV rung (batch arenas follow the
+    /// rung; the i8/t2 scale arenas have no batch twin — the same
     /// constraint as [`Self::copy_kv_into_batch_row`]) and a live row. The
     /// tree-shape contract (root at node 0 = the slot's last committed token,
     /// topological parents) is identical to the single-seq verify.
@@ -1084,10 +1093,10 @@ impl CudaDecodeModel {
                 self.head_dim
             )));
         }
-        if self.kv_elem != 4 {
+        if self.kv_dtype.has_scales() {
             return Err(BackendError::InvalidInput(
-                "tree_verify_greedy_slot requires the f32 KV rung (batch arenas \
-                 are f32); unset TRITIUM_KV"
+                "tree_verify_greedy_slot requires the f32 or f16 KV rung (the \
+                 i8/t2 scale arenas have no batch twin); set TRITIUM_KV=f32|f16"
                     .into(),
             ));
         }
@@ -1303,7 +1312,9 @@ impl CudaDecodeModel {
         let s = &self.stream;
         let prefix = batch.positions[row];
         let row_base = row * batch.max_ctx;
-        let row_bytes = self.kv_width * 4; // batch arenas are f32
+        // batch arenas follow the rung (f32 or f16) — a row copy is
+        // dtype-agnostic bytes, like the single-seq promote's.
+        let row_bytes = self.kv_width * batch.kv_elem;
         // Physical token row of a slot-logical row. Paged: the forward's
         // reservation guard already pinned every row in
         // [0, prefix + padded m) to a mapped page, and nothing between the
@@ -1754,7 +1765,7 @@ impl CudaDecodeModel {
         s: &Arc<CudaStream>,
         f: &CudaFunction,
         src: &CudaSlice<f32>,
-        kv_base: &mut CudaSlice<f32>,
+        kv_base: &mut CudaSlice<u8>,
         ctrl: &CudaSlice<i32>,
         table: &CudaSlice<i32>,
         kv_width: usize,
@@ -1798,8 +1809,8 @@ impl CudaDecodeModel {
         f_scores: &CudaFunction,
         f_reduce: &CudaFunction,
         q: &CudaSlice<f32>,
-        k: &CudaSlice<f32>,
-        v: &CudaSlice<f32>,
+        k: &CudaSlice<u8>,
+        v: &CudaSlice<u8>,
         ctrl: &CudaSlice<i32>,
         table: &CudaSlice<i32>,
         out: &mut CudaSlice<f32>,
@@ -1903,17 +1914,14 @@ impl CudaDecodeModel {
     #[must_use]
     pub fn tree_reservation_rows(&self, prefix_len: usize, m: usize) -> usize {
         // Mirrors `tree_forward`'s bucket predicate for the SLOT routes,
-        // which are the only consumers whose reservation math matters (paged
-        // BatchKv is f32-only, so the kv_elem == 4 arm here is exact for
-        // them). NB the SINGLE-SEQ gate additionally admits the f16 rung
-        // (L6, c572f75) — this helper conservatively omits that arm, which
-        // is safe: single-seq has no page reservations, and the bucket
-        // finder's prefix_len + b <= max_ctx bound prevents overflow there
-        // independently (review c572f75 F2).
+        // which are the only consumers whose reservation math matters. Stage
+        // 2: paged BatchKv slots run the graph route on the f16 rung too, so
+        // the f16 arm is load-bearing here — a conservative f32-only arm
+        // would under-reserve an f16 slot's PADDED tree rows.
         let bucket = if self.head_dim.is_multiple_of(4)
             && m <= TREE_BUCKET_MAX
             && self.max_ctx * 4 <= 48 * 1024
-            && self.kv_elem == 4
+            && (self.kv_elem == 4 || self.kv_dtype == KvDtype::F16)
             && std::env::var_os("TRITIUM_TREE_EAGER").is_none()
         {
             TREE_BUCKETS
@@ -1946,7 +1954,7 @@ impl CudaDecodeModel {
     /// and branchy trees mix freely; an early accept stop in one slot (e.g.
     /// its drafts reject at the root) never affects the others.
     ///
-    /// Requirements: the f32 KV rung, `head_dim % 4 == 0` (the slots twins
+    /// Requirements: the f32 or f16 KV rung, `head_dim % 4 == 0` (the slots twins
     /// are float4 kernels — dense AND paged), a batch from this model's
     /// `new_batch`/`new_batch_paged`, live non-duplicate rows, and
     /// `m_total <= 48` (`TREE_BUCKET_MAX` — the batched forward pads to ONE
@@ -2054,10 +2062,10 @@ impl CudaDecodeModel {
                 trees.len()
             )));
         }
-        if self.kv_elem != 4 {
+        if self.kv_dtype.has_scales() {
             return Err(BackendError::InvalidInput(
-                "tree_verify_slots requires the f32 KV rung (batch arenas are \
-                 f32); unset TRITIUM_KV"
+                "tree_verify_slots requires the f32 or f16 KV rung (the i8/t2 \
+                 scale arenas have no batch twin); set TRITIUM_KV=f32|f16"
                     .into(),
             ));
         }
@@ -2662,7 +2670,7 @@ impl CudaDecodeModel {
         s: &Arc<CudaStream>,
         f: &CudaFunction,
         src: &CudaSlice<f32>,
-        kv_base: &mut CudaSlice<f32>,
+        kv_base: &mut CudaSlice<u8>,
         row_ctrl: &CudaSlice<i32>,
         table: Option<&CudaSlice<i32>>,
         kv_width: usize,
@@ -2704,8 +2712,8 @@ impl CudaDecodeModel {
         f_scores: &CudaFunction,
         f_reduce: &CudaFunction,
         q: &CudaSlice<f32>,
-        k: &CudaSlice<f32>,
-        v: &CudaSlice<f32>,
+        k: &CudaSlice<u8>,
+        v: &CudaSlice<u8>,
         row_ctrl: &CudaSlice<i32>,
         table: Option<&CudaSlice<i32>>,
         out: &mut CudaSlice<f32>,

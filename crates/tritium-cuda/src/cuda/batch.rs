@@ -6,7 +6,8 @@
 use super::*;
 
 impl CudaDecodeModel {
-    /// Debug/test access: dtoh one K row of a batch slot (f32 bytes).
+    /// Debug/test access: dtoh one K row of a batch slot (raw element bytes —
+    /// f32 or, on the f16 rung, __half).
     #[doc(hidden)]
     pub fn debug_batch_kv_row(
         &self,
@@ -16,9 +17,9 @@ impl CudaDecodeModel {
         row: usize,
         v: bool,
     ) -> Result<Vec<u8>, BackendError> {
-        let kw = self.kv_width;
+        let rb = self.kv_width * batch.kv_elem;
         let off = match batch.pages.as_ref() {
-            None => (row_slot * batch.max_ctx + row) * kw,
+            None => (row_slot * batch.max_ctx + row) * rb,
             Some(pg) => {
                 let page = pg.table[row_slot * pg.tstride + row / KV_PAGE_TOKENS];
                 if page < 0 {
@@ -26,16 +27,16 @@ impl CudaDecodeModel {
                         "debug_batch_kv_row: slot {row_slot} token {row} unmapped"
                     )));
                 }
-                (page as usize * KV_PAGE_TOKENS + row % KV_PAGE_TOKENS) * kw
+                (page as usize * KV_PAGE_TOKENS + row % KV_PAGE_TOKENS) * rb
             }
         };
         let arena = if v { &batch.kv_v[li] } else { &batch.kv_k[li] };
-        let view = arena.slice(off..off + kw);
-        let mut out = vec![0f32; kw];
+        let view = arena.slice(off..off + rb);
+        let mut out = vec![0u8; rb];
         self.stream
             .memcpy_dtoh(&view, &mut out)
             .map_err(|e| driver_err("debug batch kv row dtoh", &e))?;
-        Ok(out.iter().flat_map(|v| v.to_le_bytes()).collect())
+        Ok(out)
     }
 
     /// Continuous-batching admission: copy this model's single-sequence KV
@@ -44,21 +45,23 @@ impl CudaDecodeModel {
     /// optimized prefill), then adopts the cache into the slot and
     /// [`BatchKv::set_position`]s it — zero new kernels.
     ///
-    /// Phase-1 constraint: batch arenas are f32, so this requires the f32 KV
-    /// rung (`kv_elem == 4`); other rungs are rejected loudly.
+    /// Batch arenas follow the model's KV rung on f32 and (ADR 0036 L6
+    /// stage 2) f16, so the copy is a raw byte move either way; the scale
+    /// rungs (i8/t2 — a side scale arena the batch has no twin of) are
+    /// rejected loudly.
     ///
     /// # Errors
-    /// [`BackendError::InvalidInput`] on a bad row/len or a non-f32 KV rung.
+    /// [`BackendError::InvalidInput`] on a bad row/len or a scale KV rung.
     pub fn copy_kv_into_batch_row(
         &self,
         batch: &mut BatchKv,
         row: usize,
         len: usize,
     ) -> Result<(), BackendError> {
-        if self.kv_elem != 4 {
+        if self.kv_dtype.has_scales() {
             return Err(BackendError::InvalidInput(
-                "continuous batching requires the f32 KV rung (batch arenas are f32); \
-                 unset TRITIUM_KV"
+                "continuous batching requires the f32 or f16 KV rung (the i8/t2 \
+                 scale arenas have no batch twin); set TRITIUM_KV=f32|f16"
                     .into(),
             ));
         }
@@ -82,8 +85,9 @@ impl CudaDecodeModel {
             )));
         }
         // Destination spans: ONE contiguous copy for the dense arena, or one
-        // copy per page for paged mode (ADR 0025) — (dst f32 offset, src f32
-        // offset, f32 count) triples, identical bytes either way.
+        // copy per page for paged mode (ADR 0025) — (dst element offset, src
+        // element offset, element count) triples, identical bytes either way
+        // (elements are kv_elem bytes; the copy is dtype-agnostic).
         let spans: Vec<(usize, usize, usize)> = match batch.pages.as_ref() {
             None => vec![(row * batch.max_ctx * self.kv_width, 0, len * self.kv_width)],
             Some(pg) => {
@@ -117,17 +121,23 @@ impl CudaDecodeModel {
                 let (src_base, sg) = src.device_ptr(s);
                 let (dst_base, dg) = dst.device_ptr(s);
                 for &(dst_off, src_off, count) in &spans {
-                    // f32 elements → byte pointer offset ×4.
-                    let dst_ptr = dst_base + (dst_off * 4) as sys::CUdeviceptr;
-                    let src_ptr = src_base + (src_off * 4) as sys::CUdeviceptr;
+                    // element offsets → byte pointer offsets ×kv_elem.
+                    let dst_ptr = dst_base + (dst_off * self.kv_elem) as sys::CUdeviceptr;
+                    let src_ptr = src_base + (src_off * self.kv_elem) as sys::CUdeviceptr;
                     // SAFETY: raw byte copy between live device allocations on
                     // this model's stream: src holds the single-seq arena's
                     // rows [src_off, src_off+count) and dst the slot's mapped
                     // span (dense row or a reserved page); sizes checked above
-                    // and by the span construction.
+                    // and by the span construction; both arenas share this
+                    // model's kv_elem.
                     #[allow(unsafe_code)]
                     unsafe {
-                        result::memcpy_dtod_async(dst_ptr, src_ptr, count * 4, s.cu_stream())
+                        result::memcpy_dtod_async(
+                            dst_ptr,
+                            src_ptr,
+                            count * self.kv_elem,
+                            s.cu_stream(),
+                        )
                     }
                     .map_err(|e| driver_err("batch row adopt dtod", &e))?;
                 }
@@ -176,15 +186,27 @@ impl CudaDecodeModel {
         let s = &self.stream;
         let alloc =
             |k: usize, what: &str| s.alloc_zeros::<f32>(k).map_err(|e| driver_err(what, &e));
-        let kv_len = match pool_pages {
-            Some(p) => p * KV_PAGE_TOKENS * self.kv_width,
-            None => n * self.max_ctx * self.kv_width,
+        // Batch arenas follow the model's rung on f32/f16 (ADR 0036 L6
+        // stage 2: the mdecode/split/tree kernels have `_h` twins); the scale
+        // rungs keep the historical f32-arena batch behavior (their batch
+        // entries either reject — adoption, slot verify — or run the f32
+        // batch kernels over these f32 arenas exactly as before stage 2).
+        let kv_elem = if self.kv_dtype == KvDtype::F16 { 2 } else { 4 };
+        let kv_bytes = match pool_pages {
+            Some(p) => p * KV_PAGE_TOKENS * self.kv_width * kv_elem,
+            None => n * self.max_ctx * self.kv_width * kv_elem,
         };
         let mut kv_k = Vec::with_capacity(self.layers.len());
         let mut kv_v = Vec::with_capacity(self.layers.len());
         for _ in 0..self.layers.len() {
-            kv_k.push(alloc(kv_len, "batch kv_k")?);
-            kv_v.push(alloc(kv_len, "batch kv_v")?);
+            kv_k.push(
+                s.alloc_zeros::<u8>(kv_bytes)
+                    .map_err(|e| driver_err("batch kv_k", &e))?,
+            );
+            kv_v.push(
+                s.alloc_zeros::<u8>(kv_bytes)
+                    .map_err(|e| driver_err("batch kv_v", &e))?,
+            );
         }
         let pages = match pool_pages {
             None => None,
@@ -210,6 +232,7 @@ impl CudaDecodeModel {
             max_ctx: self.max_ctx,
             kv_k,
             kv_v,
+            kv_elem,
             positions: vec![0; n],
             live: vec![true; n],
             pages,
@@ -594,7 +617,7 @@ impl CudaDecodeModel {
         s: &Arc<CudaStream>,
         f: &CudaFunction,
         src: &CudaSlice<f32>,
-        kv_base: &mut CudaSlice<f32>,
+        kv_base: &mut CudaSlice<u8>,
         positions: &CudaSlice<i32>,
         paged: Option<(&CudaSlice<i32>, i32)>,
         max_ctx: usize,
@@ -619,7 +642,9 @@ impl CudaDecodeModel {
         l.arg(&kw_i).arg(&n_i);
         // SAFETY: matches `kv_append_mdecode_f32(src, kv_base, pos, max_ctx, kv_width, n)`
         // or `kv_append_mdecode_paged_f32(src, pool, pos, table, tstride, kv_width, n)` —
-        // the caller pairs `f` with the matching `paged` argument.
+        // the caller pairs `f` with the matching `paged` argument; the `_h`
+        // twins share both signatures (kv_base is a byte arena the selected
+        // kernel interprets).
         #[allow(unsafe_code)]
         unsafe {
             l.launch(cfg)
@@ -636,8 +661,8 @@ impl CudaDecodeModel {
         f_partial: &CudaFunction,
         f_combine: &CudaFunction,
         q: &CudaSlice<f32>,
-        k: &CudaSlice<f32>,
-        v: &CudaSlice<f32>,
+        k: &CudaSlice<u8>,
+        v: &CudaSlice<u8>,
         out: &mut CudaSlice<f32>,
         partials: &mut CudaSlice<f32>,
         positions: &CudaSlice<i32>,

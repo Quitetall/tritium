@@ -2528,8 +2528,9 @@ __global__ void gqa_attention_tree_reduce_ctrl_g(
 // __half2float, and every f32 fold keeps its order. The f32 originals are
 // untouched (the default path stays bit-exact); an f16 model instance loads
 // the `_h` names into the same function handles, so launch sites don't
-// change. Verify trees route to the EAGER path under f16 (the ctrl twins are
-// deliberately not duplicated — the graph measured ≈ no wall-clock win).
+// change. Verify trees run the GRAPH route under f16 too: the ctrl `_h`
+// twins below (ADR 0036 L6 stage 1) and the paged/slots/mdecode `_h` twins
+// further down (stage 2) cover every batched arena on the rung.
 
 // 8-byte load of 4 halves → float4 (the f16 twin of a float4 KV read).
 
@@ -3774,9 +3775,13 @@ __global__ void gqa_attention_tree_f32(const float* __restrict__ q, const float*
 #define SPLIT_MAX_HD_PER_LANE 8
 
 // kv_append_mdecode_body — append `n` new k/v rows, row r → seq r's KV at positions[r].
-template <bool PAGED>
+// ADR 0036 L6 stage 2: store-codec templated (`S` = KvStoreF32/KvStoreF16) so
+// the batch arenas ride the f16 rung; the f32 shims instantiate KvStoreF32
+// (`*p = v` inlined — SASS byte-identity proven via tools/sass_diff.sh, the
+// stage-1 obligation).
+template <bool PAGED, class S>
 static __device__ __forceinline__ void kv_append_mdecode_body(
-    const float* __restrict__ src, float* __restrict__ kv_base,
+    const float* __restrict__ src, typename S::T* __restrict__ kv_base,
     const int* __restrict__ positions, const int* __restrict__ table, const int tstride,
     const int max_ctx, const int kv_width, const int n) {
   const long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -3797,15 +3802,26 @@ static __device__ __forceinline__ void kv_append_mdecode_body(
     tok = (long long)row * max_ctx + positions[row];
   }
   const long long off = tok * kv_width + e;
-  kv_base[off] = src[(long long)row * kv_width + e];
+  S::store(&kv_base[off], src[(long long)row * kv_width + e]);
 }
 
 // gqa_attention_split_partial_body — warp per (row, head, split); see the
 // dense shim's doc below. Only the KV addressing is PAGED-conditional;
 // everything else is the retired kernel verbatim.
-template <bool PAGED>
+// ADR 0036 L6 stage 2: KV-load-codec templated (`C` = KvLoadF32/KvLoadF16).
+// The access pattern here is one SCALAR element per lane per step (d += 32):
+// a warp's 32 lanes read 32 CONTIGUOUS elements, so the f16 twin's per-lane
+// U16 loads coalesce to one 64 B line (2 sectors/warp vs f32's 4) — the
+// stage-1 "narrow codec" pathology (per-lane float4 emulated as two unmerged
+// __half2 loads) cannot occur in a scalar-per-lane pattern, and any per-lane
+// widening (__half2 = two dims/lane) would reassign dims to lanes and change
+// the warp tree-reduce chains — NOT bit-identical. So the scalar codec IS
+// the wide-load-correct instantiation for this family. The f32 shims
+// instantiate KvLoadF32 (`*p` inlined; SASS byte-identity via sass_diff.sh).
+template <bool PAGED, class C>
 static __device__ __forceinline__ void gqa_attention_split_partial_body(
-    const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
+    const float* __restrict__ q, const typename C::T* __restrict__ k,
+    const typename C::T* __restrict__ v,
     float* __restrict__ partials, const int* __restrict__ positions,
     const int* __restrict__ table, const int tstride, const int max_ctx,
     const int n_head, const int n_head_kv, const int head_dim, const float scale, const int n,
@@ -3835,8 +3851,8 @@ static __device__ __forceinline__ void gqa_attention_split_partial_body(
   const int n_rep = n_head / n_head_kv;
   const int kv = h / n_rep;
   const long long kv_seq = PAGED ? 0 : (long long)row * max_ctx * n_head_kv * head_dim;
-  const float* k_seq = k + kv_seq;
-  const float* v_seq = v + kv_seq;
+  const typename C::T* k_seq = k + kv_seq;
+  const typename C::T* v_seq = v + kv_seq;
   const int* trow = PAGED ? table + (long long)row * tstride : nullptr;
   const float* q_row = q + rh * (long long)head_dim;
 
@@ -3852,10 +3868,11 @@ static __device__ __forceinline__ void gqa_attention_split_partial_body(
     } else {
       jt = j;
     }
-    const float* k_row = k_seq + (jt * n_head_kv + kv) * head_dim;
+    const typename C::T* k_row = k_seq + (jt * n_head_kv + kv) * head_dim;
     // Lane-strided partial dot, then a warp tree-reduce to the full q·k.
     float pd = 0.0f;
-    for (int d = lane; d < head_dim; d += 32) pd = __fadd_rn(pd, __fmul_rn(q_row[d], k_row[d]));
+    for (int d = lane; d < head_dim; d += 32)
+      pd = __fadd_rn(pd, __fmul_rn(q_row[d], C::load(&k_row[d])));
     for (int off = 16; off > 0; off >>= 1) pd += __shfl_down_sync(0xffffffff, pd, off);
     float sj = __shfl_sync(0xffffffff, pd, 0);  // broadcast the reduced dot to all lanes
     sj = __fmul_rn(sj, scale);
@@ -3863,9 +3880,9 @@ static __device__ __forceinline__ void gqa_attention_split_partial_body(
     const float corr = exp_f32(__fsub_rn(m, m_new));  // 0 on the first key (m = -inf)
     const float p = exp_f32(__fsub_rn(sj, m_new));
     l = __fadd_rn(__fmul_rn(l, corr), p);
-    const float* v_row = v_seq + (jt * n_head_kv + kv) * head_dim;
+    const typename C::T* v_row = v_seq + (jt * n_head_kv + kv) * head_dim;
     for (int i = 0, d = lane; d < head_dim; d += 32, ++i)
-      acc[i] = __fadd_rn(__fmul_rn(acc[i], corr), __fmul_rn(p, v_row[d]));
+      acc[i] = __fadd_rn(__fmul_rn(acc[i], corr), __fmul_rn(p, C::load(&v_row[d])));
     m = m_new;
   }
   for (int i = 0, d = lane; d < head_dim; d += 32, ++i) part[d] = acc[i];
@@ -3881,7 +3898,8 @@ extern "C" {
 __global__ void kv_append_mdecode_f32(const float* __restrict__ src, float* __restrict__ kv_base,
                                       const int* __restrict__ positions, const int max_ctx,
                                       const int kv_width, const int n) {
-  kv_append_mdecode_body<false>(src, kv_base, positions, nullptr, 0, max_ctx, kv_width, n);
+  kv_append_mdecode_body<false, KvStoreF32>(src, kv_base, positions, nullptr, 0, max_ctx,
+                                            kv_width, n);
 }
 
 // kv_append_mdecode_paged_f32 — the paged twin: `kv_base` is the page POOL
@@ -3892,7 +3910,27 @@ __global__ void kv_append_mdecode_paged_f32(const float* __restrict__ src,
                                             const int* __restrict__ positions,
                                             const int* __restrict__ table, const int tstride,
                                             const int kv_width, const int n) {
-  kv_append_mdecode_body<true>(src, kv_base, positions, table, tstride, 0, kv_width, n);
+  kv_append_mdecode_body<true, KvStoreF32>(src, kv_base, positions, table, tstride, 0, kv_width,
+                                           n);
+}
+
+// ── f16 mdecode twins (ADR 0036 L6 stage 2) — the batch-arena append on the
+// f16 rung: stores round once via __float2half_rn; addressing and the
+// dead-row contract are the f32 bodies' verbatim (shared template).
+__global__ void kv_append_mdecode_h(const float* __restrict__ src, __half* __restrict__ kv_base,
+                                    const int* __restrict__ positions, const int max_ctx,
+                                    const int kv_width, const int n) {
+  kv_append_mdecode_body<false, KvStoreF16>(src, kv_base, positions, nullptr, 0, max_ctx,
+                                            kv_width, n);
+}
+
+__global__ void kv_append_mdecode_paged_h(const float* __restrict__ src,
+                                          __half* __restrict__ kv_base,
+                                          const int* __restrict__ positions,
+                                          const int* __restrict__ table, const int tstride,
+                                          const int kv_width, const int n) {
+  kv_append_mdecode_body<true, KvStoreF16>(src, kv_base, positions, table, tstride, 0, kv_width,
+                                           n);
 }
 
 // ─── Paged tree-verify ctrl twins (I3, L3 batch-slot spec decode) ───────────
@@ -4517,6 +4555,471 @@ __global__ void gqa_attention_tree_reduce_slots_paged_g(
 #undef TREE_MAX_DIMS_PER_THREAD
 }
 
+}  // extern "C" — f16 tree-ctrl addressing templates (ADR 0036 L6 stage 2).
+
+// ── f16 twins of the paged/slots tree-ctrl kernels (ADR 0036 L6 stage 2) ────
+// The f32 paged/slots kernels above are RETAINED verbatim (byte-identity pin:
+// zero refactor risk); the `_h` family instead shares ONE policy-templated
+// body per phase. `TreeCtrlAddr<PER_ROW, PAGED>` folds the two axes the four
+// f32 variants hand-duplicate:
+//   * PER_ROW — the I4 slots ctrl plane (`row_ctrl[m·3]`, pad = word1 < 0)
+//     vs the per-launch 3-word ctrl (pad = row >= ctrl[1]);
+//   * PAGED — page-table translation (word 2 = the slot's table offset) vs
+//     the dense row-base add (word 2 = the KV row base).
+// Every body instantiates from the WIDE-LOAD pattern (66d8f58): scores read
+// 8 halves per 16 B LDG in the f16w fold order (head_dim % 8, launch-uniform
+// fallback to a kvh_load4 generic path); reduce takes two adjacent dims per
+// thread via one __half2 load (head_dim even + pair-count cap, same
+// fallback). Real rows' folds are element-order-identical to the f32
+// siblings', so paged==dense and slots==sequential hold ON the f16 rung
+// exactly as the f32 gates pin them.
+
+template <bool PER_ROW, bool PAGED>
+struct TreeCtrlAddr {
+  static __device__ __forceinline__ bool pad(const int* __restrict__ ctrl, const int row) {
+    if constexpr (PER_ROW) {
+      return ctrl[row * 3 + 1] < 0;
+    } else {
+      return row >= ctrl[1];
+    }
+  }
+  static __device__ __forceinline__ int prefix(const int* __restrict__ ctrl, const int row) {
+    if constexpr (PER_ROW) {
+      return ctrl[row * 3 + 0];
+    } else {
+      return ctrl[0];
+    }
+  }
+  static __device__ __forceinline__ int word2(const int* __restrict__ ctrl, const int row) {
+    if constexpr (PER_ROW) {
+      return ctrl[row * 3 + 2];
+    } else {
+      return ctrl[2];
+    }
+  }
+  /// Region-logical token row → physical KV token row.
+  static __device__ __forceinline__ long long slot(const int* __restrict__ table, const int w2,
+                                                   const int logical) {
+    if constexpr (PAGED) {
+      return (long long)table[w2 + (logical >> KV_PAGE_SHIFT)] * KV_PAGE_TOKENS +
+             (logical & KV_PAGE_MASK);
+    } else {
+      return (long long)w2 + logical;
+    }
+  }
+  /// kv_append's per-row region-local node index: slots rows carry it in ctrl
+  /// word 1 (−1 = pad, no write); single-slot launches append row i at
+  /// prefix + i (pads write junk past the watermark, the `_g` contract).
+  static __device__ __forceinline__ int append_local(const int* __restrict__ ctrl,
+                                                     const int row) {
+    if constexpr (PER_ROW) {
+      return ctrl[row * 3 + 1];
+    } else {
+      return row;
+    }
+  }
+};
+
+// Append: one store per (row, col), addressing via the policy — mirrors
+// kv_append_tree_paged_g / kv_append_tree_slots[_paged]_g with an f16 store.
+template <class A>
+static __device__ __forceinline__ void kv_append_tree_addr_h_body(
+    const float* __restrict__ src, __half* __restrict__ kv_base,
+    const int* __restrict__ ctrl, const int* __restrict__ table, const int kv_width,
+    const int m) {
+  const long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  const long long total = (long long)m * kv_width;
+  if (idx >= total) return;
+  const int row = (int)(idx / kv_width);
+  const int col = (int)(idx - (long long)row * kv_width);
+  const int local = A::append_local(ctrl, row);
+  if (local < 0) return;  // slots pad row: no slot, no write
+  const int prefix_len = A::prefix(ctrl, row);
+  const int w2 = A::word2(ctrl, row);
+  const long long phys = A::slot(table, w2, prefix_len + local);
+  kv_base[phys * kv_width + col] = __float2half_rn(src[idx]);
+}
+
+// Narrow (kvh_load4 8 B quads) scores fallback for head_dim % 8 != 0 shapes —
+// the generic-ctrl-<KvLoadF16> body with policy addressing.
+template <class A>
+static __device__ __forceinline__ void tree_scores_addr_h_narrow_body(
+    const float* __restrict__ q, const __half* __restrict__ k, float* __restrict__ scores,
+    const int* __restrict__ anc, const int* __restrict__ n_anc, const int* __restrict__ ctrl,
+    const int* __restrict__ table, const int score_stride, const int n_head,
+    const int n_head_kv, const int head_dim, const float scale, const int max_anc,
+    const int m) {
+  const int rowhead = blockIdx.x;
+  const int row = rowhead / n_head;
+  const int h = rowhead - row * n_head;
+  if (A::pad(ctrl, row)) return;  // pad row (uniform per block)
+  const int prefix_len = A::prefix(ctrl, row);
+  const int w2 = A::word2(ctrl, row);
+  const int ctx = prefix_len + n_anc[row];
+  const int chunk = blockIdx.y * TREE_SCORE_CHUNK;
+  if (chunk >= ctx) return;
+  const int lane = threadIdx.x & 31;
+  const int n_rep = n_head / n_head_kv;
+  const int kv = h / n_rep;
+  const float4* qv = (const float4*)(q + ((long long)row * n_head + h) * head_dim);
+  const int hd4 = head_dim >> 2;
+  const int* arow = anc + (long long)row * max_anc;
+  float* sc = scores + ((long long)row * n_head + h) * score_stride;
+
+  const int j0 = chunk + lane;
+#pragma unroll
+  for (int t = 0; t < 4; ++t) {
+    const int j = j0 + 32 * t;
+    if (j >= ctx) break;
+    const int logical = (j < prefix_len) ? j : arow[j - prefix_len];
+    const long long slot = A::slot(table, w2, logical);
+    const __half* kr = k + (slot * n_head_kv + kv) * head_dim;
+    float dot = 0.0f;
+#pragma unroll 8
+    for (int d = 0; d < hd4; ++d) {
+      const float4 qq = qv[d];
+      const float4 a = kvh_load4(kr + 4 * d);
+      dot = __fadd_rn(dot, __fmul_rn(qq.x, a.x));
+      dot = __fadd_rn(dot, __fmul_rn(qq.y, a.y));
+      dot = __fadd_rn(dot, __fmul_rn(qq.z, a.z));
+      dot = __fadd_rn(dot, __fmul_rn(qq.w, a.w));
+    }
+    sc[j] = __fmul_rn(dot, scale);
+  }
+}
+
+// Wide scores body (one 16 B LDG = 8 halves, f16w fold order); launch-uniform
+// fallback to the narrow body above.
+template <class A>
+static __device__ __forceinline__ void tree_scores_addr_h_body(
+    const float* __restrict__ q, const __half* __restrict__ k, float* __restrict__ scores,
+    const int* __restrict__ anc, const int* __restrict__ n_anc, const int* __restrict__ ctrl,
+    const int* __restrict__ table, const int score_stride, const int n_head,
+    const int n_head_kv, const int head_dim, const float scale, const int max_anc,
+    const int m) {
+  if ((head_dim & 7) != 0) {
+    tree_scores_addr_h_narrow_body<A>(q, k, scores, anc, n_anc, ctrl, table, score_stride,
+                                      n_head, n_head_kv, head_dim, scale, max_anc, m);
+    return;
+  }
+  const int rowhead = blockIdx.x;
+  const int row = rowhead / n_head;
+  const int h = rowhead - row * n_head;
+  if (A::pad(ctrl, row)) return;  // pad row (uniform per block)
+  const int prefix_len = A::prefix(ctrl, row);
+  const int w2 = A::word2(ctrl, row);
+  const int ctx = prefix_len + n_anc[row];
+  const int chunk = blockIdx.y * TREE_SCORE_CHUNK;
+  if (chunk >= ctx) return;
+  const int lane = threadIdx.x & 31;
+  const int n_rep = n_head / n_head_kv;
+  const int kv = h / n_rep;
+  const float4* qv = (const float4*)(q + ((long long)row * n_head + h) * head_dim);
+  const int hd8 = head_dim >> 3;
+  const int* arow = anc + (long long)row * max_anc;
+  float* sc = scores + ((long long)row * n_head + h) * score_stride;
+
+  const int j0 = chunk + lane;
+#pragma unroll
+  for (int t = 0; t < 4; ++t) {
+    const int j = j0 + 32 * t;
+    if (j >= ctx) break;
+    const int logical = (j < prefix_len) ? j : arow[j - prefix_len];
+    const long long slot = A::slot(table, w2, logical);
+    const uint4* kr = (const uint4*)(k + (slot * n_head_kv + kv) * head_dim);
+    float dot = 0.0f;
+#pragma unroll 4
+    for (int d = 0; d < hd8; ++d) {
+      const float4 q0 = qv[2 * d];
+      const float4 q1 = qv[2 * d + 1];
+      const uint4 u = kr[d];  // 8 halves, one LDG.E.128
+      const float2 a01 = __half22float2(*reinterpret_cast<const __half2*>(&u.x));
+      const float2 a23 = __half22float2(*reinterpret_cast<const __half2*>(&u.y));
+      const float2 a45 = __half22float2(*reinterpret_cast<const __half2*>(&u.z));
+      const float2 a67 = __half22float2(*reinterpret_cast<const __half2*>(&u.w));
+      dot = __fadd_rn(dot, __fmul_rn(q0.x, a01.x));
+      dot = __fadd_rn(dot, __fmul_rn(q0.y, a01.y));
+      dot = __fadd_rn(dot, __fmul_rn(q0.z, a23.x));
+      dot = __fadd_rn(dot, __fmul_rn(q0.w, a23.y));
+      dot = __fadd_rn(dot, __fmul_rn(q1.x, a45.x));
+      dot = __fadd_rn(dot, __fmul_rn(q1.y, a45.y));
+      dot = __fadd_rn(dot, __fmul_rn(q1.z, a67.x));
+      dot = __fadd_rn(dot, __fmul_rn(q1.w, a67.y));
+    }
+    sc[j] = __fmul_rn(dot, scale);
+  }
+}
+
+// Reduce: softmax scaffold (staging, tree max, exp, thread-0 j-order sum,
+// normalize) verbatim from the f32 siblings, then the f16w weighted sum —
+// two adjacent dims per thread via one __half2 load; each dim's j-order
+// __fadd_rn chain unchanged (the thread→dim map is contract-free). Narrow
+// scalar-load fallback for odd head_dim / pair overflow shapes.
+// REQUIRES blockDim.x == 128 (fold levels hardcode 64/32).
+template <class A>
+static __device__ __forceinline__ void tree_reduce_addr_h_body(
+    const __half* __restrict__ v, const float* __restrict__ scores, float* __restrict__ out,
+    const int* __restrict__ anc, const int* __restrict__ n_anc, const int* __restrict__ ctrl,
+    const int* __restrict__ table, const int score_stride, const int n_head,
+    const int n_head_kv, const int head_dim, const int max_anc, const int m) {
+#define TREE_MAX_PAIRS 4
+#define TREE_MAX_DIMS_PER_THREAD 8
+  const bool wide =
+      (head_dim & 1) == 0 && (head_dim >> 1) <= TREE_MAX_PAIRS * (int)blockDim.x;
+  extern __shared__ float sc[];
+  __shared__ float s_red[256];
+  __shared__ float s_inv;
+  const int rowhead = blockIdx.x;
+  const int row = rowhead / n_head;
+  const int h = rowhead - row * n_head;
+  if (A::pad(ctrl, row)) return;  // pad row (uniform per block)
+  const int prefix_len = A::prefix(ctrl, row);
+  const int w2 = A::word2(ctrl, row);
+  const int ctx = prefix_len + n_anc[row];
+  const int tid = threadIdx.x;
+  const int n_rep = n_head / n_head_kv;
+  const int kv = h / n_rep;
+  const int* arow = anc + (long long)row * max_anc;
+
+  const float* gsc = scores + ((long long)row * n_head + h) * score_stride;
+  for (int j = tid; j < ctx; j += blockDim.x) {
+    sc[j] = gsc[j];
+  }
+  __syncthreads();
+
+  float mx = -INFINITY;
+  for (int j = tid; j < ctx; j += blockDim.x) {
+    mx = fmaxf(mx, sc[j]);
+  }
+  s_red[tid] = mx;
+  __syncthreads();
+  if (tid < 64) {
+    s_red[tid] = fmaxf(s_red[tid], s_red[tid + 64]);
+  }
+  __syncthreads();
+  if (tid < 32) {
+    float vv = fmaxf(s_red[tid], s_red[tid + 32]);
+    for (int off = 16; off > 0; off >>= 1) {
+      vv = fmaxf(vv, __shfl_down_sync(0xffffffffu, vv, off));
+    }
+    if (tid == 0) {
+      s_red[0] = vv;
+    }
+  }
+  __syncthreads();
+  mx = s_red[0];
+
+  for (int j = tid; j < ctx; j += blockDim.x) {
+    sc[j] = exp_f32(__fsub_rn(sc[j], mx));
+  }
+  __syncthreads();
+  if (tid == 0) {
+    float sum = 0.0f;
+    for (int j = 0; j < ctx; ++j) {
+      sum = __fadd_rn(sum, sc[j]);
+    }
+    s_inv = __fdiv_rn(1.0f, sum);
+  }
+  __syncthreads();
+  const float inv = s_inv;
+  for (int j = tid; j < ctx; j += blockDim.x) {
+    sc[j] = __fmul_rn(sc[j], inv);
+  }
+  __syncthreads();
+
+  float* o_row = out + ((long long)row * n_head + h) * head_dim;
+  if (wide) {
+    // f16w pair path: one __half2 load feeds dims 2d and 2d+1.
+    const int hd2 = head_dim >> 1;
+    const int pairs =
+        (hd2 > tid) ? (hd2 - tid + (int)blockDim.x - 1) / (int)blockDim.x : 0;
+    float acc0[TREE_MAX_PAIRS];
+    float acc1[TREE_MAX_PAIRS];
+    for (int t = 0; t < pairs; ++t) {
+      acc0[t] = 0.0f;
+      acc1[t] = 0.0f;
+    }
+#pragma unroll 4
+    for (int j = 0; j < ctx; ++j) {
+      const float w = sc[j];
+      const int logical = (j < prefix_len) ? j : arow[j - prefix_len];
+      const long long slot = A::slot(table, w2, logical);
+      const __half2* v_row = (const __half2*)(v + (slot * n_head_kv + kv) * head_dim);
+      float2 vals[TREE_MAX_PAIRS];
+#pragma unroll
+      for (int t = 0; t < TREE_MAX_PAIRS; ++t) {
+        if (t < pairs) {
+          vals[t] = __half22float2(v_row[tid + (int)blockDim.x * t]);
+        }
+      }
+      if (w != 0.0f) {
+#pragma unroll
+        for (int t = 0; t < TREE_MAX_PAIRS; ++t) {
+          if (t < pairs) {
+            acc0[t] = __fadd_rn(acc0[t], __fmul_rn(w, vals[t].x));
+            acc1[t] = __fadd_rn(acc1[t], __fmul_rn(w, vals[t].y));
+          }
+        }
+      }
+    }
+    for (int t = 0; t < pairs; ++t) {
+      o_row[2 * (tid + (int)blockDim.x * t)] = acc0[t];
+      o_row[2 * (tid + (int)blockDim.x * t) + 1] = acc1[t];
+    }
+  } else {
+    // Narrow fallback: scalar __half loads, one dim per thread stride — the
+    // generic-<KvLoadF16> reduce shape with policy addressing.
+    const int ndims =
+        (head_dim > tid) ? (head_dim - tid + (int)blockDim.x - 1) / (int)blockDim.x : 0;
+    if (ndims <= TREE_MAX_DIMS_PER_THREAD) {
+      float acc[TREE_MAX_DIMS_PER_THREAD];
+      for (int t = 0; t < ndims; ++t) {
+        acc[t] = 0.0f;
+      }
+#pragma unroll 4
+      for (int j = 0; j < ctx; ++j) {
+        const float w = sc[j];
+        const int logical = (j < prefix_len) ? j : arow[j - prefix_len];
+        const long long slot = A::slot(table, w2, logical);
+        const __half* v_row = v + (slot * n_head_kv + kv) * head_dim;
+        float vals[TREE_MAX_DIMS_PER_THREAD];
+#pragma unroll
+        for (int t = 0; t < TREE_MAX_DIMS_PER_THREAD; ++t) {
+          if (t < ndims) {
+            vals[t] = __half2float(v_row[tid + (int)blockDim.x * t]);
+          }
+        }
+        if (w != 0.0f) {
+#pragma unroll
+          for (int t = 0; t < TREE_MAX_DIMS_PER_THREAD; ++t) {
+            if (t < ndims) {
+              acc[t] = __fadd_rn(acc[t], __fmul_rn(w, vals[t]));
+            }
+          }
+        }
+      }
+      for (int t = 0; t < ndims; ++t) {
+        o_row[tid + (int)blockDim.x * t] = acc[t];
+      }
+    } else {
+      for (int d = tid; d < head_dim; d += blockDim.x) {
+        float acc = 0.0f;
+        for (int j = 0; j < ctx; ++j) {
+          const float w = sc[j];
+          if (w == 0.0f) continue;
+          const int logical = (j < prefix_len) ? j : arow[j - prefix_len];
+          const long long slot = A::slot(table, w2, logical);
+          const __half* v_row = v + (slot * n_head_kv + kv) * head_dim;
+          acc = __fadd_rn(acc, __fmul_rn(w, __half2float(v_row[d])));
+        }
+        o_row[d] = acc;
+      }
+    }
+  }
+#undef TREE_MAX_DIMS_PER_THREAD
+#undef TREE_MAX_PAIRS
+}
+
+extern "C" {
+
+// The nine `_h` shims. Signatures mirror the f32 `_g` twins word for word
+// (paged variants carry the extra `table` arg); the dense-slots pair passes
+// a null table the dense policy never dereferences.
+
+__global__ void kv_append_tree_paged_h(const float* __restrict__ src,
+                                       __half* __restrict__ kv_base,
+                                       const int* __restrict__ tree_ctrl,
+                                       const int* __restrict__ table, const int kv_width,
+                                       const int m) {
+  kv_append_tree_addr_h_body<TreeCtrlAddr<false, true>>(src, kv_base, tree_ctrl, table,
+                                                        kv_width, m);
+}
+
+__global__ void kv_append_tree_slots_h(const float* __restrict__ src,
+                                       __half* __restrict__ kv_base,
+                                       const int* __restrict__ row_ctrl, const int kv_width,
+                                       const int m) {
+  kv_append_tree_addr_h_body<TreeCtrlAddr<true, false>>(src, kv_base, row_ctrl, nullptr,
+                                                        kv_width, m);
+}
+
+__global__ void kv_append_tree_slots_paged_h(const float* __restrict__ src,
+                                             __half* __restrict__ kv_base,
+                                             const int* __restrict__ row_ctrl,
+                                             const int* __restrict__ table, const int kv_width,
+                                             const int m) {
+  kv_append_tree_addr_h_body<TreeCtrlAddr<true, true>>(src, kv_base, row_ctrl, table, kv_width,
+                                                       m);
+}
+
+__global__ void gqa_attention_tree_scores_ctrl_paged_h(
+    const float* __restrict__ q, const __half* __restrict__ k, float* __restrict__ scores,
+    const int* __restrict__ anc, const int* __restrict__ n_anc,
+    const int* __restrict__ tree_ctrl, const int* __restrict__ table, const int score_stride,
+    const int n_head, const int n_head_kv, const int head_dim, const float scale,
+    const int max_anc, const int m) {
+  tree_scores_addr_h_body<TreeCtrlAddr<false, true>>(q, k, scores, anc, n_anc, tree_ctrl, table,
+                                                     score_stride, n_head, n_head_kv, head_dim,
+                                                     scale, max_anc, m);
+}
+
+// REQUIRES blockDim.x == 128 (same contract as the `_g` twin).
+__global__ void gqa_attention_tree_reduce_ctrl_paged_h(
+    const __half* __restrict__ v, const float* __restrict__ scores, float* __restrict__ out,
+    const int* __restrict__ anc, const int* __restrict__ n_anc,
+    const int* __restrict__ tree_ctrl, const int* __restrict__ table, const int score_stride,
+    const int n_head, const int n_head_kv, const int head_dim, const int max_anc,
+    const int m) {
+  tree_reduce_addr_h_body<TreeCtrlAddr<false, true>>(v, scores, out, anc, n_anc, tree_ctrl,
+                                                     table, score_stride, n_head, n_head_kv,
+                                                     head_dim, max_anc, m);
+}
+
+__global__ void gqa_attention_tree_scores_slots_h(
+    const float* __restrict__ q, const __half* __restrict__ k, float* __restrict__ scores,
+    const int* __restrict__ anc, const int* __restrict__ n_anc,
+    const int* __restrict__ row_ctrl, const int score_stride, const int n_head,
+    const int n_head_kv, const int head_dim, const float scale, const int max_anc,
+    const int m) {
+  tree_scores_addr_h_body<TreeCtrlAddr<true, false>>(q, k, scores, anc, n_anc, row_ctrl,
+                                                     nullptr, score_stride, n_head, n_head_kv,
+                                                     head_dim, scale, max_anc, m);
+}
+
+// REQUIRES blockDim.x == 128 (same contract as the `_g` twin).
+__global__ void gqa_attention_tree_reduce_slots_h(
+    const __half* __restrict__ v, const float* __restrict__ scores, float* __restrict__ out,
+    const int* __restrict__ anc, const int* __restrict__ n_anc,
+    const int* __restrict__ row_ctrl, const int score_stride, const int n_head,
+    const int n_head_kv, const int head_dim, const int max_anc, const int m) {
+  tree_reduce_addr_h_body<TreeCtrlAddr<true, false>>(v, scores, out, anc, n_anc, row_ctrl,
+                                                     nullptr, score_stride, n_head, n_head_kv,
+                                                     head_dim, max_anc, m);
+}
+
+__global__ void gqa_attention_tree_scores_slots_paged_h(
+    const float* __restrict__ q, const __half* __restrict__ k, float* __restrict__ scores,
+    const int* __restrict__ anc, const int* __restrict__ n_anc,
+    const int* __restrict__ row_ctrl, const int* __restrict__ table, const int score_stride,
+    const int n_head, const int n_head_kv, const int head_dim, const float scale,
+    const int max_anc, const int m) {
+  tree_scores_addr_h_body<TreeCtrlAddr<true, true>>(q, k, scores, anc, n_anc, row_ctrl, table,
+                                                    score_stride, n_head, n_head_kv, head_dim,
+                                                    scale, max_anc, m);
+}
+
+// REQUIRES blockDim.x == 128 (same contract as the `_g` twin).
+__global__ void gqa_attention_tree_reduce_slots_paged_h(
+    const __half* __restrict__ v, const float* __restrict__ scores, float* __restrict__ out,
+    const int* __restrict__ anc, const int* __restrict__ n_anc,
+    const int* __restrict__ row_ctrl, const int* __restrict__ table, const int score_stride,
+    const int n_head, const int n_head_kv, const int head_dim, const int max_anc,
+    const int m) {
+  tree_reduce_addr_h_body<TreeCtrlAddr<true, true>>(v, scores, out, anc, n_anc, row_ctrl, table,
+                                                    score_stride, n_head, n_head_kv, head_dim,
+                                                    max_anc, m);
+}
+
 
 // ===========================================================================
 // v0.3.8 (Track-2): on-device sampling for the batched M=N decode graph — fold the
@@ -4733,9 +5236,9 @@ __global__ void gqa_attention_split_partial_f32(
     float* __restrict__ partials, const int* __restrict__ positions, const int max_ctx,
     const int n_head, const int n_head_kv, const int head_dim, const float scale, const int n,
     const int n_split, const int chunk) {
-  gqa_attention_split_partial_body<false>(q, k, v, partials, positions, nullptr, 0, max_ctx,
-                                               n_head, n_head_kv, head_dim, scale, n, n_split,
-                                               chunk);
+  gqa_attention_split_partial_body<false, KvLoadF32>(q, k, v, partials, positions, nullptr, 0,
+                                                     max_ctx, n_head, n_head_kv, head_dim, scale,
+                                                     n, n_split, chunk);
 }
 
 // gqa_attention_split_partial_paged_f32 — the paged twin: `k`/`v` are the page
@@ -4747,9 +5250,35 @@ __global__ void gqa_attention_split_partial_paged_f32(
     const int* __restrict__ table, const int tstride,
     const int n_head, const int n_head_kv, const int head_dim, const float scale, const int n,
     const int n_split, const int chunk) {
-  gqa_attention_split_partial_body<true>(q, k, v, partials, positions, table, tstride, 0,
-                                               n_head, n_head_kv, head_dim, scale, n, n_split,
-                                               chunk);
+  gqa_attention_split_partial_body<true, KvLoadF32>(q, k, v, partials, positions, table, tstride,
+                                                    0, n_head, n_head_kv, head_dim, scale, n,
+                                                    n_split, chunk);
+}
+
+// ── f16 split-attention twins (ADR 0036 L6 stage 2) — the batch-decode
+// attention on the f16 rung. Scalar-per-lane loads (warp-contiguous → the
+// U16 loads coalesce; see the body doc for why NOT widening per lane is the
+// bit-identity-correct choice here); every online-softmax fold keeps the f32
+// order.
+__global__ void gqa_attention_split_partial_h(
+    const float* __restrict__ q, const __half* __restrict__ k, const __half* __restrict__ v,
+    float* __restrict__ partials, const int* __restrict__ positions, const int max_ctx,
+    const int n_head, const int n_head_kv, const int head_dim, const float scale, const int n,
+    const int n_split, const int chunk) {
+  gqa_attention_split_partial_body<false, KvLoadF16>(q, k, v, partials, positions, nullptr, 0,
+                                                     max_ctx, n_head, n_head_kv, head_dim, scale,
+                                                     n, n_split, chunk);
+}
+
+__global__ void gqa_attention_split_partial_paged_h(
+    const float* __restrict__ q, const __half* __restrict__ k, const __half* __restrict__ v,
+    float* __restrict__ partials, const int* __restrict__ positions,
+    const int* __restrict__ table, const int tstride,
+    const int n_head, const int n_head_kv, const int head_dim, const float scale, const int n,
+    const int n_split, const int chunk) {
+  gqa_attention_split_partial_body<true, KvLoadF16>(q, k, v, partials, positions, table, tstride,
+                                                    0, n_head, n_head_kv, head_dim, scale, n,
+                                                    n_split, chunk);
 }
 
 // gqa_attention_combine_f32 — warp per (row, head). Flash-merge the `n_split` partials

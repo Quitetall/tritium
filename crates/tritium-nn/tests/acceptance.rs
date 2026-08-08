@@ -1321,6 +1321,369 @@ fn cuda_tree_verify_f16_graph_route_lossless_and_matches_eager() {
     }
 }
 
+/// ADR 0036 L6 **stage 2** gate: the BATCHED arenas on the f16 KV rung.
+/// Under `TRITIUM_KV=f16` the batch arenas are __half and the mdecode/split
+/// kernels are the `_h` twins; the f32 gates' invariants must hold WITHIN
+/// the rung:
+///
+/// 1. **Graph == eager** (`decode_batch_graph` vs `decode_batch`): bitwise
+///    logits, every step and row — the stage-2 mirror of
+///    `cuda_batch_decode_graph_matches_eager`.
+/// 2. **Within-rung anchor**: batch rows' greedy tokens equal the M=1 f16
+///    `step_graph` greedy tokens (the `cuda_batch_decode_matches_single`
+///    argmax-level contract, on the rung).
+/// 3. **Paged == dense**: adoption (the kv_elem=2 byte-span copy), lockstep
+///    graph + eager + argmax steps, and the raw adopted KV rows (dense vs
+///    paged, byte for byte) — the stage-2 mirror of
+///    `cuda_batch_paged_matches_dense_bit_exact`.
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_batch_decode_f16_graph_matches_eager_and_paged_matches_dense() {
+    let _gpu = gpu_serial();
+    let Some((reference, bytes)) = maybe_load() else {
+        return;
+    };
+    let _kv = KvEnvGuard::set("f16");
+    let Some(mut runner) = load_on("cuda", &bytes) else {
+        return;
+    };
+    const N: usize = 2;
+    let toks: [u32; 4] = [128000, 791, 6864, 315];
+
+    // Teeth 1+2: graph == eager (bitwise) and batch greedy == single greedy.
+    {
+        let model = match runner.resident_cuda() {
+            Ok(Some(m)) => m,
+            _ => {
+                eprintln!("skipping f16 batch gate: no cuda resident");
+                return;
+            }
+        };
+        model.reset();
+        let mut single: Vec<Vec<f32>> = Vec::with_capacity(toks.len());
+        for (i, &t) in toks.iter().enumerate() {
+            single.push(model.step_graph(t, i).expect("f16 single step_graph"));
+        }
+        let mut eager = model.new_batch(N).expect("new_batch eager");
+        let mut graph = model.new_batch(N).expect("new_batch graph");
+        for (i, &t) in toks.iter().enumerate() {
+            let row_tokens = vec![t; N];
+            let want = model
+                .decode_batch(&mut eager, &row_tokens)
+                .expect("f16 decode_batch eager");
+            let got = model
+                .decode_batch_graph(&mut graph, &row_tokens)
+                .expect("f16 decode_batch_graph");
+            for r in 0..N {
+                for v in 0..want[r].len() {
+                    assert_eq!(
+                        got[r][v].to_bits(),
+                        want[r][v].to_bits(),
+                        "f16 batch graph != eager at step {i} row {r} vocab {v}"
+                    );
+                }
+            }
+            let batch_tok = tritium_nn::sample_greedy(&want[0]).expect("non-empty logits");
+            let single_tok = tritium_nn::sample_greedy(&single[i]).expect("non-empty logits");
+            assert_eq!(
+                batch_tok, single_tok,
+                "f16 batch greedy != f16 single greedy at step {i}"
+            );
+        }
+        drop(eager);
+        drop(graph);
+        model.reset();
+    }
+
+    // Tooth 3: paged == dense on f16, through adoption + all three dispatch
+    // paths (graph, eager, argmax graph).
+    let prompt = reference.token_ids.clone();
+    assert!(
+        prompt.len() + toks.len() + 2 <= 256,
+        "fixture grew past one KV page — retune the pool arithmetic"
+    );
+    let positions: Vec<usize> = (0..prompt.len()).collect();
+    runner.forward(&prompt, &positions).expect("f16 prefill");
+    let mut dense = runner.new_batch(N).expect("new_batch dense");
+    let mut paged = runner.new_batch_paged(N, 2).expect("new_batch_paged");
+    paged
+        .reserve_pages(0, prompt.len() + toks.len() + 2)
+        .expect("reserve row0");
+    paged
+        .reserve_pages(1, toks.len() + 2)
+        .expect("reserve row1");
+    runner
+        .adopt_into_batch_row(&mut dense, 0, prompt.len())
+        .expect("adopt dense");
+    runner
+        .adopt_into_batch_row(&mut paged, 0, prompt.len())
+        .expect("adopt paged");
+    for b in [&mut dense, &mut paged] {
+        b.set_position(0, prompt.len()).expect("pos row0");
+    }
+    // Adopted f16 KV rows: dense == paged byte-for-byte, and non-zero.
+    {
+        let model = runner
+            .resident_cuda()
+            .expect("resident")
+            .expect("cuda resident");
+        for v in [false, true] {
+            for row in [0usize, prompt.len() - 1] {
+                let d = model
+                    .debug_batch_kv_row(&dense, 0, 0, row, v)
+                    .expect("dense adopted row");
+                let p = model
+                    .debug_batch_kv_row(&paged, 0, 0, row, v)
+                    .expect("paged adopted row");
+                assert_eq!(d, p, "adopted f16 KV row diverged (v={v}, row={row})");
+                assert!(
+                    d.iter().any(|&b| b != 0),
+                    "adopted f16 KV row all-zero (v={v}, row={row}) — vacuous"
+                );
+            }
+        }
+    }
+    for (i, &t) in toks.iter().enumerate() {
+        let want = runner
+            .decode_batch_graph(&mut dense, &[t, t])
+            .expect("f16 dense step");
+        let got = runner
+            .decode_batch_graph(&mut paged, &[t, t])
+            .expect("f16 paged step");
+        for r in 0..N {
+            for v in 0..want[r].len() {
+                assert_eq!(
+                    got[r][v].to_bits(),
+                    want[r][v].to_bits(),
+                    "f16 paged != dense at step {i} row {r} vocab {v}"
+                );
+            }
+        }
+    }
+    {
+        let model = runner
+            .resident_cuda()
+            .expect("resident")
+            .expect("cuda resident");
+        let want = model
+            .decode_batch(&mut dense, &[toks[0], toks[0]])
+            .expect("f16 dense eager");
+        let got = model
+            .decode_batch(&mut paged, &[toks[0], toks[0]])
+            .expect("f16 paged eager");
+        for r in 0..N {
+            for v in 0..want[r].len() {
+                assert_eq!(
+                    got[r][v].to_bits(),
+                    want[r][v].to_bits(),
+                    "f16 paged != dense at eager step row {r} vocab {v}"
+                );
+            }
+        }
+        let want_ids = model
+            .decode_batch_graph_argmax(&mut dense, &[toks[1], toks[1]])
+            .expect("f16 dense argmax");
+        let got_ids = model
+            .decode_batch_graph_argmax(&mut paged, &[toks[1], toks[1]])
+            .expect("f16 paged argmax");
+        assert_eq!(
+            want_ids, got_ids,
+            "f16 argmax graph diverged paged vs dense"
+        );
+    }
+    drop(dense);
+    drop(paged);
+    println!(
+        "f16 batch gate: graph==eager bitwise + single-greedy anchor over {} \
+         steps; paged==dense bitwise through adoption, {} graph + eager + \
+         argmax steps",
+        toks.len(),
+        toks.len()
+    );
+}
+
+/// ADR 0036 L6 stage 2, I4 on the rung: batched-slots tree verify under
+/// `TRITIUM_KV=f16` — `tree_verify_greedy_slots` must commit EXACTLY what
+/// per-slot `tree_verify_greedy_slot` verifies sequentially (the
+/// `cuda_tree_verify_slots_matches_sequential` contract, dense AND paged),
+/// and both must be lossless vs plain f16 greedy per slot. Also pins the
+/// batched vs sequential slot KV bytes (the promoted rows) at the first and
+/// last layers.
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_tree_verify_slots_f16_matches_sequential() {
+    let _gpu = gpu_serial();
+    if !Path::new(&*DRAFTER_PATH).exists() {
+        eprintln!("skipping: {} absent (gated drafter test)", *DRAFTER_PATH);
+        return;
+    }
+    let bytes = std::fs::read(&*DRAFTER_PATH).expect("read drafter GGUF");
+    let _kv = KvEnvGuard::set("f16");
+
+    let base: [u32; 7] = [128000, 791, 6864, 315, 279, 1917, 574];
+    let prompts: Vec<Vec<u32>> = vec![
+        base.iter().copied().cycle().take(9).collect(),
+        base.iter().copied().cycle().skip(2).take(14).collect(),
+        base.iter().copied().cycle().skip(4).take(12).collect(),
+    ];
+    let never = u32::MAX;
+    const V: u32 = 128_256;
+
+    // f16 reference greedy streams (within-rung anchors).
+    let wants: Vec<Vec<u32>> = {
+        let Some(mut r) = load_on("cuda", &bytes) else {
+            return;
+        };
+        prompts
+            .iter()
+            .map(|p| r.generate(p, 16, never).expect("f16 ref stream"))
+            .collect()
+    };
+
+    // Two phases per slot: chain / branchy-with-wrong-siblings / all-wrong,
+    // then shapes rotated — the f32 slots gate's mix, trimmed.
+    let make_tree = |slot: usize, phase: usize, c: usize, root: u32| -> (Vec<u32>, Vec<i32>) {
+        let want = &wants[slot];
+        match (phase, slot) {
+            (0, 0) => (vec![root, want[c], want[c + 1]], vec![-1, 0, 1]),
+            (0, 1) => (
+                vec![
+                    root,
+                    (want[c] + 1) % V,
+                    want[c],
+                    (want[c + 1] + 7) % V,
+                    want[c + 1],
+                ],
+                vec![-1, 0, 0, 2, 2],
+            ),
+            (0, 2) => (vec![root, (want[c] + 5) % V], vec![-1, 0]),
+            (1, 0) => (vec![root, want[c]], vec![-1, 0]),
+            (1, 1) => (
+                vec![root, want[c], want[c + 1], want[c + 2]],
+                vec![-1, 0, 1, 2],
+            ),
+            _ => (vec![root, (want[c] + 1) % V, want[c]], vec![-1, 0, 0]),
+        }
+    };
+
+    for paged in [false, true] {
+        // Two independently-loaded legs: batched (one grouped verify per
+        // phase) vs sequential (per-slot verifies). Each returns per slot
+        // (committed tokens, promoted KV row bytes at first+last layer).
+        type Leg = Vec<(Vec<u32>, Vec<u8>)>;
+        let legs: Vec<Leg> = (0..2)
+            .map(|leg| -> Leg {
+                let Some(mut rb) = load_on("cuda", &bytes) else {
+                    return Vec::new();
+                };
+                let n_layers = rb.config.n_layers as usize;
+                let mut bat = if paged {
+                    let mut b = rb.new_batch_paged(3, 3).expect("new_batch_paged");
+                    for (r, p) in prompts.iter().enumerate() {
+                        b.reserve_pages(r, p.len() + 24).expect("reserve slot");
+                    }
+                    b
+                } else {
+                    rb.new_batch(3).expect("new_batch")
+                };
+                let mut committed: Vec<Vec<u32>> = Vec::new();
+                for (r, prompt) in prompts.iter().enumerate() {
+                    let positions: Vec<usize> = (0..prompt.len()).collect();
+                    rb.reset();
+                    let logits = rb.forward(prompt, &positions).expect("f16 slot prefill");
+                    rb.adopt_into_batch_row(&mut bat, r, prompt.len())
+                        .expect("adopt");
+                    bat.set_position(r, prompt.len()).expect("pos");
+                    committed.push(vec![argmax(&logits) as u32]);
+                }
+                let model = rb
+                    .resident_cuda()
+                    .expect("resident")
+                    .expect("cuda resident");
+                for phase in 0..2 {
+                    let trees: Vec<(Vec<u32>, Vec<i32>)> = (0..3)
+                        .map(|r| {
+                            make_tree(
+                                r,
+                                phase,
+                                committed[r].len(),
+                                *committed[r].last().expect("non-empty"),
+                            )
+                        })
+                        .collect();
+                    if leg == 0 {
+                        let refs: Vec<(&[u32], &[i32])> = trees
+                            .iter()
+                            .map(|(t, p)| (t.as_slice(), p.as_slice()))
+                            .collect();
+                        let outs = model
+                            .tree_verify_greedy_slots(&mut bat, &[0, 1, 2], &refs)
+                            .expect("f16 slots verify");
+                        for (r, out) in outs.into_iter().enumerate() {
+                            assert!(!out.is_empty(), "slots verify committed nothing");
+                            committed[r].extend(out);
+                        }
+                    } else {
+                        for r in 0..3 {
+                            let (t, p) = &trees[r];
+                            let out = model
+                                .tree_verify_greedy_slot(&mut bat, r, t, p)
+                                .expect("f16 slot verify");
+                            assert!(!out.is_empty(), "slot verify committed nothing");
+                            committed[r].extend(out);
+                        }
+                    }
+                }
+                // Promoted KV rows of every slot, first + last layer, K + V.
+                // The last committed token's row is not yet appended (it is
+                // the next feed), hence the -1 span bound.
+                let out: Leg = (0..3)
+                    .map(|r| {
+                        let mut kv = Vec::new();
+                        for li in [0usize, n_layers - 1] {
+                            for v in [false, true] {
+                                for row in
+                                    prompts[r].len()..prompts[r].len() + committed[r].len() - 1
+                                {
+                                    kv.extend(
+                                        model
+                                            .debug_batch_kv_row(&bat, li, r, row, v)
+                                            .expect("slot kv row"),
+                                    );
+                                }
+                            }
+                        }
+                        (committed[r].clone(), kv)
+                    })
+                    .collect();
+                drop(bat);
+                out
+            })
+            .collect();
+        if legs[0].is_empty() || legs[1].is_empty() {
+            return; // no device
+        }
+        for r in 0..3 {
+            assert_eq!(
+                legs[0][r].0, legs[1][r].0,
+                "f16 slots (paged={paged}) batched != sequential committed tokens at slot {r}"
+            );
+            assert_eq!(
+                legs[0][r].1, legs[1][r].1,
+                "f16 slots (paged={paged}) batched != sequential promoted KV bytes at slot {r}"
+            );
+            // Losslessness within the rung: committed == plain f16 greedy.
+            let n_tok = legs[0][r].0.len().min(wants[r].len());
+            assert_eq!(
+                &legs[0][r].0[..n_tok],
+                &wants[r][..n_tok],
+                "f16 slots (paged={paged}) slot {r}: committed stream != plain f16 greedy"
+            );
+        }
+    }
+    println!("f16 slots gate: batched == sequential (dense + paged), lossless per slot");
+}
+
 /// Batch↔graph single-token bit-parity: after the same prompt prefill,
 /// forwarding ONE token via the batch path (`prefill(&[t], _)`) and via the
 /// M=1 graph path (`step_graph(t, _)`) must give BIT-IDENTICAL logits — the

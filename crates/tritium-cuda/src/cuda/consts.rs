@@ -174,6 +174,21 @@ pub(super) const KERNEL_NAME_ATTN_TREE_SCORES_SLOTS_PAGED: &str =
     "gqa_attention_tree_scores_slots_paged_g";
 pub(super) const KERNEL_NAME_ATTN_TREE_REDUCE_SLOTS_PAGED: &str =
     "gqa_attention_tree_reduce_slots_paged_g";
+/// ADR 0036 L6 stage 2: f16 twins of the paged/slots tree-ctrl kernels —
+/// batch/paged/slots verify on the f16 rung (wide-load bodies, 66d8f58).
+pub(super) const KERNEL_NAME_KV_APPEND_TREE_PAGED_H: &str = "kv_append_tree_paged_h";
+pub(super) const KERNEL_NAME_ATTN_TREE_SCORES_CTRL_PAGED_H: &str =
+    "gqa_attention_tree_scores_ctrl_paged_h";
+pub(super) const KERNEL_NAME_ATTN_TREE_REDUCE_CTRL_PAGED_H: &str =
+    "gqa_attention_tree_reduce_ctrl_paged_h";
+pub(super) const KERNEL_NAME_KV_APPEND_TREE_SLOTS_H: &str = "kv_append_tree_slots_h";
+pub(super) const KERNEL_NAME_ATTN_TREE_SCORES_SLOTS_H: &str = "gqa_attention_tree_scores_slots_h";
+pub(super) const KERNEL_NAME_ATTN_TREE_REDUCE_SLOTS_H: &str = "gqa_attention_tree_reduce_slots_h";
+pub(super) const KERNEL_NAME_KV_APPEND_TREE_SLOTS_PAGED_H: &str = "kv_append_tree_slots_paged_h";
+pub(super) const KERNEL_NAME_ATTN_TREE_SCORES_SLOTS_PAGED_H: &str =
+    "gqa_attention_tree_scores_slots_paged_h";
+pub(super) const KERNEL_NAME_ATTN_TREE_REDUCE_SLOTS_PAGED_H: &str =
+    "gqa_attention_tree_reduce_slots_paged_h";
 pub(super) const KERNEL_NAME_ATTN_TREE_REDUCE: &str = "gqa_attention_tree_reduce_g";
 /// Keys per scores-block — keep in sync with `SCORE_CHUNK` in decode.cu.
 pub(super) const ATTN_SCORE_CHUNK: usize = 128;
@@ -236,6 +251,14 @@ pub(super) const KERNEL_NAME_KV_APPEND_MDECODE: &str = "kv_append_mdecode_f32";
 pub(super) const KERNEL_NAME_KV_APPEND_MDECODE_PAGED: &str = "kv_append_mdecode_paged_f32";
 pub(super) const KERNEL_NAME_ATTN_SPLIT_PARTIAL_PAGED: &str =
     "gqa_attention_split_partial_paged_f32";
+/// ADR 0036 L6 stage 2: f16 twins of the batched M=N decode's KV kernels
+/// (byte batch arenas on the f16 rung; scalar-per-lane loads coalesce, see
+/// the decode.cu body doc).
+pub(super) const KERNEL_NAME_KV_APPEND_MDECODE_H: &str = "kv_append_mdecode_h";
+pub(super) const KERNEL_NAME_KV_APPEND_MDECODE_PAGED_H: &str = "kv_append_mdecode_paged_h";
+pub(super) const KERNEL_NAME_ATTN_SPLIT_PARTIAL_H: &str = "gqa_attention_split_partial_h";
+pub(super) const KERNEL_NAME_ATTN_SPLIT_PARTIAL_PAGED_H: &str =
+    "gqa_attention_split_partial_paged_h";
 /// Tokens per KV page (ADR 0025). MUST equal decode.cu's KV_PAGE_TOKENS —
 /// the paged==dense bit-equality gate breaks instantly on a mismatch.
 pub const KV_PAGE_TOKENS: usize = 256;

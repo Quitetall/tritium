@@ -308,10 +308,12 @@ pub(super) struct BatchRawKernels {
     pub(super) argmax: sys::CUfunction,
     /// Ctrl-driven tree-verify trunk kernels (graph-capturable twins — read
     /// [prefix_len, real_m] from a device buffer instead of baked scalars).
-    /// Dtype-selected at `load` for the SINGLE-SEQ dense route (ADR 0036 L6):
-    /// f32 → `_g`, f16 → `_h`. The scale rungs (i8/t2) keep the f32 handles —
-    /// unreachable, `tree_forward`'s bucket gate routes them eager. The paged
-    /// and slots twins below stay f32-only (batch arenas are the f32 rung).
+    /// Dtype-selected at `load` (ADR 0036 L6): f32 → `_g`, f16 → `_h`. The
+    /// scale rungs (i8/t2) keep the f32 handles — unreachable,
+    /// `tree_forward`'s bucket gate routes them eager. Stage 2: the paged and
+    /// slots twins below (and the mdecode append/split-partial pair above)
+    /// are dtype-selected the same way — batch arenas follow the model's KV
+    /// rung (f32 or f16; the scale rungs are rejected at every batch entry).
     pub(super) kv_append_tree: sys::CUfunction,
     pub(super) attn_tree_scores_ctrl: sys::CUfunction,
     pub(super) attn_tree_reduce_ctrl: sys::CUfunction,
@@ -378,10 +380,38 @@ impl BatchRawKernels {
             quant: get(dm, KERNEL_NAME_ACT_QUANT_BATCH_I8)?,
             rmsnorm_quant: get(dm, KERNEL_NAME_RMSNORM_QUANT_BATCH_I8)?,
             rope: get(dm, KERNEL_NAME_ROPE_BATCH)?,
-            kv_append: get(dm, KERNEL_NAME_KV_APPEND_MDECODE)?,
-            attn_split_partial: get(dm, KERNEL_NAME_ATTN_SPLIT_PARTIAL)?,
-            kv_append_paged: get(dm, KERNEL_NAME_KV_APPEND_MDECODE_PAGED)?,
-            attn_split_partial_paged: get(dm, KERNEL_NAME_ATTN_SPLIT_PARTIAL_PAGED)?,
+            kv_append: get(
+                dm,
+                if f16 {
+                    KERNEL_NAME_KV_APPEND_MDECODE_H
+                } else {
+                    KERNEL_NAME_KV_APPEND_MDECODE
+                },
+            )?,
+            attn_split_partial: get(
+                dm,
+                if f16 {
+                    KERNEL_NAME_ATTN_SPLIT_PARTIAL_H
+                } else {
+                    KERNEL_NAME_ATTN_SPLIT_PARTIAL
+                },
+            )?,
+            kv_append_paged: get(
+                dm,
+                if f16 {
+                    KERNEL_NAME_KV_APPEND_MDECODE_PAGED_H
+                } else {
+                    KERNEL_NAME_KV_APPEND_MDECODE_PAGED
+                },
+            )?,
+            attn_split_partial_paged: get(
+                dm,
+                if f16 {
+                    KERNEL_NAME_ATTN_SPLIT_PARTIAL_PAGED_H
+                } else {
+                    KERNEL_NAME_ATTN_SPLIT_PARTIAL_PAGED
+                },
+            )?,
             attn_combine: get(dm, KERNEL_NAME_ATTN_COMBINE)?,
             residual: get(dm, KERNEL_NAME_RESIDUAL)?,
             relu2: get(dm, KERNEL_NAME_RELU2_GATE)?,
@@ -414,15 +444,78 @@ impl BatchRawKernels {
                     KERNEL_NAME_ATTN_TREE_REDUCE_CTRL
                 },
             )?,
-            kv_append_tree_paged: get(dm, KERNEL_NAME_KV_APPEND_TREE_PAGED)?,
-            attn_tree_scores_ctrl_paged: get(dm, KERNEL_NAME_ATTN_TREE_SCORES_CTRL_PAGED)?,
-            attn_tree_reduce_ctrl_paged: get(dm, KERNEL_NAME_ATTN_TREE_REDUCE_CTRL_PAGED)?,
-            kv_append_tree_slots: get(dm, KERNEL_NAME_KV_APPEND_TREE_SLOTS)?,
-            attn_tree_scores_slots: get(dm, KERNEL_NAME_ATTN_TREE_SCORES_SLOTS)?,
-            attn_tree_reduce_slots: get(dm, KERNEL_NAME_ATTN_TREE_REDUCE_SLOTS)?,
-            kv_append_tree_slots_paged: get(dm, KERNEL_NAME_KV_APPEND_TREE_SLOTS_PAGED)?,
-            attn_tree_scores_slots_paged: get(dm, KERNEL_NAME_ATTN_TREE_SCORES_SLOTS_PAGED)?,
-            attn_tree_reduce_slots_paged: get(dm, KERNEL_NAME_ATTN_TREE_REDUCE_SLOTS_PAGED)?,
+            kv_append_tree_paged: get(
+                dm,
+                if f16 {
+                    KERNEL_NAME_KV_APPEND_TREE_PAGED_H
+                } else {
+                    KERNEL_NAME_KV_APPEND_TREE_PAGED
+                },
+            )?,
+            attn_tree_scores_ctrl_paged: get(
+                dm,
+                if f16 {
+                    KERNEL_NAME_ATTN_TREE_SCORES_CTRL_PAGED_H
+                } else {
+                    KERNEL_NAME_ATTN_TREE_SCORES_CTRL_PAGED
+                },
+            )?,
+            attn_tree_reduce_ctrl_paged: get(
+                dm,
+                if f16 {
+                    KERNEL_NAME_ATTN_TREE_REDUCE_CTRL_PAGED_H
+                } else {
+                    KERNEL_NAME_ATTN_TREE_REDUCE_CTRL_PAGED
+                },
+            )?,
+            kv_append_tree_slots: get(
+                dm,
+                if f16 {
+                    KERNEL_NAME_KV_APPEND_TREE_SLOTS_H
+                } else {
+                    KERNEL_NAME_KV_APPEND_TREE_SLOTS
+                },
+            )?,
+            attn_tree_scores_slots: get(
+                dm,
+                if f16 {
+                    KERNEL_NAME_ATTN_TREE_SCORES_SLOTS_H
+                } else {
+                    KERNEL_NAME_ATTN_TREE_SCORES_SLOTS
+                },
+            )?,
+            attn_tree_reduce_slots: get(
+                dm,
+                if f16 {
+                    KERNEL_NAME_ATTN_TREE_REDUCE_SLOTS_H
+                } else {
+                    KERNEL_NAME_ATTN_TREE_REDUCE_SLOTS
+                },
+            )?,
+            kv_append_tree_slots_paged: get(
+                dm,
+                if f16 {
+                    KERNEL_NAME_KV_APPEND_TREE_SLOTS_PAGED_H
+                } else {
+                    KERNEL_NAME_KV_APPEND_TREE_SLOTS_PAGED
+                },
+            )?,
+            attn_tree_scores_slots_paged: get(
+                dm,
+                if f16 {
+                    KERNEL_NAME_ATTN_TREE_SCORES_SLOTS_PAGED_H
+                } else {
+                    KERNEL_NAME_ATTN_TREE_SCORES_SLOTS_PAGED
+                },
+            )?,
+            attn_tree_reduce_slots_paged: get(
+                dm,
+                if f16 {
+                    KERNEL_NAME_ATTN_TREE_REDUCE_SLOTS_PAGED_H
+                } else {
+                    KERNEL_NAME_ATTN_TREE_REDUCE_SLOTS_PAGED
+                },
+            )?,
             modules: vec![dm, am],
         })
     }
@@ -529,8 +622,16 @@ pub struct BatchKv {
     pub(super) n: usize,
     /// Per-sequence KV capacity (the arena stride, in tokens).
     pub(super) max_ctx: usize,
-    pub(super) kv_k: Vec<CudaSlice<f32>>,
-    pub(super) kv_v: Vec<CudaSlice<f32>>,
+    /// Per-layer K/V arenas, stored as BYTES (`n · max_ctx · kv_width ·
+    /// kv_elem`, or the paged pools' equivalent) exactly like the model's
+    /// single-seq arenas: elements are f32 or, under the ADR 0036 L6 stage-2
+    /// f16 rung, __half — the dtype-selected kernels interpret them; host
+    /// code only ever slices by byte offsets.
+    pub(super) kv_k: Vec<CudaSlice<u8>>,
+    pub(super) kv_v: Vec<CudaSlice<u8>>,
+    /// KV element size in bytes (4 = f32, 2 = f16), copied from the building
+    /// model so byte math never guesses.
+    pub(super) kv_elem: usize,
     /// Per-sequence current position (next KV write slot); length `n`.
     pub(super) positions: Vec<usize>,
     /// Per-sequence liveness (batching P2 C2). A dead row is uploaded as
