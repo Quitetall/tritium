@@ -5177,3 +5177,395 @@ fn external_linear_tiled_removes_the_m_cliff() {
         );
     }
 }
+
+// ── Sparsity crossover sweep (WS-4 A2) ───────────────────────────────────────────────────────────
+// At what zero density, and with what STRUCTURE, does skipping actually pay?
+//
+// The repo's recorded answer is "it never does" — round 10b measured base-243 entropy packing
+// 1.19-1.37x slower than TQ2_0 dp4a, and round 16 measured TB1 at 2.58x slower, concluding "byte
+// savings of 18-27% bought 77-196% more time". Both stand as ALU-cost measurements. Neither is a
+// byte-cost measurement, because in both harnesses the weights never left L2:
+// `tb1_tq1_tq2_gateup_bench` uploads ONE 9.12 MB weight buffer (10 blocks x 66 B x 13824 rows) and
+// launches against it 2000 times, on a device with 72 MB of L2. After the first iteration every
+// byte is served at L2 bandwidth, so an 18% byte saving had nothing to save. The log's own warning
+// (OPTIMIZATION-LOG.md, "in-model the 30 layers' ~530 MB defeat L2") was never applied to the
+// harness that produced the verdict.
+//
+// So L2 defeat is this sweep's PRIMARY CONTROL, not a caveat: every point is measured twice, once
+// resident and once against enough rotating weight replicas to overflow L2. The gap between the two
+// is the kernel's byte-sensitivity, and it is the quantity that decides whether a byte-saving format
+// can ever win. If the ordering inverts, round 16 gets an amendment.
+//
+// Three further things this sweep does that a density-only sweep cannot:
+//
+//   * **Structure, not just density.** `mixed_trits` is uniform-1/3 unstructured — simultaneously the
+//     worst case for block-skip (which needs CONTIGUOUS all-zero 256-blocks) and the best case for
+//     TB1 (which wants element sparsity). Element density `p` and block-clustering `q` are
+//     independent axes and the block-skip kernel responds only to `q`.
+//   * **Batch.** Every recorded negative is M=1, the latency-bound regime. The skip is per
+//     (row, block), so one skipped block is skipped for every one of the M rows: the win scales with
+//     M, and that axis has never been measured.
+//   * **A real control.** The sparse kernel at `q = 0` has the bitmap machinery fully active with
+//     nothing to skip. If that is not within a couple of percent of the dense kernel, the harness is
+//     measuring codegen luck and every crossover it reports is noise.
+//
+// S34 is deliberately absent: its density is fixed at exactly 0.25 (a point, not an axis, and BELOW
+// BitNet's natural 42.2%), and its only GPU path is the one-thread-per-output `--fmad=false`
+// conformance kernel. It is a bits play, not a speed play.
+
+/// How the zeros are arranged, which matters far more than how many there are.
+#[derive(Clone, Copy, Debug)]
+enum SparsityStructure {
+    /// Bernoulli(`p`) zeros, independent per element. Block-skip's worst case.
+    Unstructured { p: f64 },
+    /// Fraction `q` of aligned 256-trit blocks forced entirely zero; the rest carry whatever
+    /// residual density brings the total to `p`. The only structure block-skip can exploit.
+    BlockClustered { p: f64, q: f64 },
+    /// Fraction `f` of output rows entirely zero — the realistic pattern (round 15 found one BitNet
+    /// gate/up tensor with 43.6% dead neurons). Every block of a dead row is skippable.
+    RowDead { p: f64, f: f64 },
+    /// Exactly `m - keep` zeros per aligned `m`-group: 6:8, 2:4, and S34's one-in-four in one
+    /// generator. What ADR 0024 targets.
+    NPerM { keep: usize, m: usize },
+}
+
+impl SparsityStructure {
+    fn label(self) -> String {
+        match self {
+            Self::Unstructured { p } => format!("unstruct p={p:.2}"),
+            Self::BlockClustered { p, q } => format!("blockclust p={p:.2} q={q:.2}"),
+            Self::RowDead { p, f } => format!("rowdead p={p:.2} f={f:.2}"),
+            Self::NPerM { keep, m } => format!("{keep}:{m}"),
+        }
+    }
+}
+
+/// Build `[n, k]` trits with the requested zero structure. Deterministic in `seed`.
+fn trits_structured(
+    n: usize,
+    k: usize,
+    spec: SparsityStructure,
+    seed: u64,
+) -> Vec<tritium_core::Trit> {
+    let mut s = seed | 1;
+    let mut next = move || {
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (s >> 33) as f64 / (1u64 << 31) as f64
+    };
+    let sign = |u: f64| {
+        if u < 0.5 {
+            tritium_core::Trit::from_i8(-1).unwrap()
+        } else {
+            tritium_core::Trit::from_i8(1).unwrap()
+        }
+    };
+    let zero = tritium_core::Trit::from_i8(0).unwrap();
+    let mut out = vec![zero; n * k];
+    let nb = k.div_ceil(QK_K);
+
+    match spec {
+        SparsityStructure::Unstructured { p } => {
+            for v in out.iter_mut() {
+                *v = if next() < p { zero } else { sign(next()) };
+            }
+        }
+        SparsityStructure::BlockClustered { p, q } => {
+            // Dead blocks contribute q of the total zeros; the survivors carry the remainder, so the
+            // element density still lands on p.
+            let residual = if q >= 1.0 {
+                0.0
+            } else {
+                ((p - q) / (1.0 - q)).clamp(0.0, 1.0)
+            };
+            for row in 0..n {
+                for b in 0..nb {
+                    let dead = next() < q;
+                    let lo = row * k + b * QK_K;
+                    let hi = (lo + QK_K).min(row * k + k);
+                    for v in out[lo..hi].iter_mut() {
+                        *v = if dead || next() < residual {
+                            zero
+                        } else {
+                            sign(next())
+                        };
+                    }
+                }
+            }
+        }
+        SparsityStructure::RowDead { p, f } => {
+            let residual = if f >= 1.0 {
+                0.0
+            } else {
+                ((p - f) / (1.0 - f)).clamp(0.0, 1.0)
+            };
+            for row in 0..n {
+                let dead = next() < f;
+                for v in out[row * k..(row + 1) * k].iter_mut() {
+                    *v = if dead || next() < residual {
+                        zero
+                    } else {
+                        sign(next())
+                    };
+                }
+            }
+        }
+        SparsityStructure::NPerM { keep, m } => {
+            for row in 0..n {
+                for g in (0..k).step_by(m) {
+                    let hi = (g + m).min(k);
+                    // Keep the first `keep` slots of a randomly rotated window — an arbitrary but
+                    // uniform placement, which is what an N:M kernel's index metadata assumes.
+                    let rot = (next() * m as f64) as usize;
+                    for (j, idx) in (g..hi).enumerate() {
+                        let slot = (j + rot) % m;
+                        out[row * k + idx] = if slot < keep { sign(next()) } else { zero };
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Measured element-zero fraction and all-zero-256-block fraction of a trit buffer — reported so a
+/// requested `(p, q)` can never be confused with an achieved one.
+fn zero_census(trits: &[tritium_core::Trit], n: usize, k: usize) -> (f64, f64) {
+    let zeros = trits
+        .iter()
+        .filter(|t| **t == tritium_core::Trit::ZERO)
+        .count();
+    let nb = k.div_ceil(QK_K);
+    let mut dead_blocks = 0usize;
+    for row in 0..n {
+        for b in 0..nb {
+            let lo = row * k + b * QK_K;
+            let hi = (lo + QK_K).min(row * k + k);
+            if trits[lo..hi].iter().all(|t| *t == tritium_core::Trit::ZERO) {
+                dead_blocks += 1;
+            }
+        }
+    }
+    (
+        zeros as f64 / (n * k) as f64,
+        dead_blocks as f64 / (n * nb) as f64,
+    )
+}
+
+/// **The crossover sweep.** For each (kernel, structure, M), report µs/launch both L2-resident and
+/// L2-defeated, so the byte-saving and ALU-cost components are separable.
+///
+/// Not a correctness test — `tb1_matches_tq2_tiled_scaled_bit_exact` and the sparse kernel's
+/// NULL-bitmap identity own that. This one only times kernels those gates already proved equal.
+#[test]
+#[ignore = "perf sweep: needs a quiet GPU box; run explicitly"]
+fn sparsity_crossover_sweep() {
+    use cudarc::driver::{CudaContext, LaunchConfig, PushKernelArg};
+    use cudarc::nvrtc::Ptx;
+
+    let ctx = match CudaContext::new(0) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("skipping sweep: no device ({e})");
+            return;
+        }
+    };
+    let stream = ctx.default_stream();
+    let module = ctx.load_module(Ptx::from_src(TQ2_0_ADD_PTX)).unwrap();
+
+    // Query L2 rather than hardcoding 72 MB — there is a wgpu/ROCm lane now, and a wrong constant
+    // here silently turns the primary control back into the artifact it exists to remove.
+    let l2_bytes = ctx
+        .attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE)
+        .map(|v| v.max(0) as usize)
+        .unwrap_or(72 << 20);
+
+    let (n, k) = (13824usize, 2560usize); // round 16's BitNet fused gateup, for continuity
+    let nb = num_blocks(k);
+    let rb = nb * TQ2_0_BLOCK_BYTES;
+    let words_per_row = nb.div_ceil(32);
+    let weight_bytes = n * rb;
+    // 4x L2 of distinct weight bytes, so a launch cannot be served from cache.
+    let replicas = (4 * l2_bytes).div_ceil(weight_bytes).max(2);
+
+    println!(
+        "L2 {} MiB | weight buffer {:.2} MiB | {replicas} replicas = {:.0} MiB to defeat L2\n\
+         shape N={n} K={k}; every point reported L2-resident AND L2-defeated.\n",
+        l2_bytes >> 20,
+        weight_bytes as f64 / (1 << 20) as f64,
+        (replicas * weight_bytes) as f64 / (1 << 20) as f64,
+    );
+
+    let structures = [
+        SparsityStructure::Unstructured { p: 0.42 },
+        SparsityStructure::BlockClustered { p: 0.42, q: 0.0 },
+        SparsityStructure::BlockClustered { p: 0.50, q: 0.05 },
+        SparsityStructure::BlockClustered { p: 0.60, q: 0.20 },
+        SparsityStructure::BlockClustered { p: 0.80, q: 0.40 },
+        SparsityStructure::RowDead { p: 0.50, f: 0.10 },
+        SparsityStructure::NPerM { keep: 6, m: 8 },
+    ];
+    let batches = [1usize, 8, 32, 256];
+
+    let unit = vec![f16::ONE; nb];
+    let scales = seeded_f32(1, n, 0.5, 2.0);
+    let d_sc = stream.clone_htod(&scales).unwrap();
+
+    println!(
+        "{:<26} {:>4} {:>7} {:>7} {:>10} {:>10} {:>8} {:>9}",
+        "structure / kernel",
+        "M",
+        "zero%",
+        "dead%",
+        "L2res µs",
+        "L2def µs",
+        "vs dense",
+        "byte-sens"
+    );
+    println!("{}", "-".repeat(94));
+
+    for spec in structures {
+        let trits = trits_structured(n, k, spec, 0xBE11);
+        let (zero_frac, dead_frac) = zero_census(&trits, n, k);
+
+        let mut packed = vec![0u8; n * rb];
+        for ni in 0..n {
+            tritium_format::pack_tq2_0_row(
+                &trits[ni * k..(ni + 1) * k],
+                &unit,
+                &mut packed[ni * rb..(ni + 1) * rb],
+            )
+            .unwrap();
+        }
+        let bitmap = tritium_format::compute_zero_bitmaps(&packed, n, k, rb).unwrap();
+
+        // Rotating replicas: identical contents, distinct addresses, so nothing is L2-resident.
+        let d_w: Vec<_> = (0..replicas)
+            .map(|_| stream.clone_htod(&packed).unwrap())
+            .collect();
+        let d_bm: Vec<_> = (0..replicas)
+            .map(|_| stream.clone_htod(&bitmap).unwrap())
+            .collect();
+
+        for m in batches {
+            let qact: Vec<i8> = (0..m * k).map(|i| ((i * 37) % 253) as i8).collect();
+            let act_scale = seeded_f32(2, m, 0.5, 1.5);
+            let d_qact = stream.clone_htod(&qact).unwrap();
+            let d_as = stream.clone_htod(&act_scale).unwrap();
+            let mut d_out = stream.alloc_zeros::<f32>(m * n).unwrap();
+            let (m_i, n_i, k_i, rb_i, wpr_i) = (
+                m as i32,
+                n as i32,
+                k as i32,
+                rb as i32,
+                words_per_row as i32,
+            );
+            let cfg = LaunchConfig {
+                grid_dim: ((n as u32).div_ceil(8), m as u32, 1),
+                block_dim: (8 * 32, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            // Fewer iterations at large M: the kernel itself is ~M times the work.
+            let iters = (2000 / m.max(1)).max(50) as u32;
+
+            // Time one kernel. `defeat` rotates the weight replica per launch; otherwise every
+            // launch reuses replica 0 and runs out of L2, which is what round 16 measured.
+            let mut bench = |sparse: bool, defeat: bool| -> (f64, f64) {
+                let f = module
+                    .load_function(if sparse {
+                        "tq2_0_add_mpgemm_tiled_i8_scaled_sparse"
+                    } else {
+                        "tq2_0_add_mpgemm_tiled_i8_scaled"
+                    })
+                    .unwrap();
+                let mut launch = |i: usize| {
+                    let idx = if defeat { i % replicas } else { 0 };
+                    let mut l = stream.launch_builder(&f);
+                    if sparse {
+                        l.arg(&d_qact)
+                            .arg(&d_w[idx])
+                            .arg(&d_sc)
+                            .arg(&d_as)
+                            .arg(&d_bm[idx])
+                            .arg(&mut d_out)
+                            .arg(&m_i)
+                            .arg(&n_i)
+                            .arg(&k_i)
+                            .arg(&rb_i)
+                            .arg(&wpr_i);
+                    } else {
+                        l.arg(&d_qact)
+                            .arg(&d_w[idx])
+                            .arg(&d_sc)
+                            .arg(&d_as)
+                            .arg(&mut d_out)
+                            .arg(&m_i)
+                            .arg(&n_i)
+                            .arg(&k_i)
+                            .arg(&rb_i);
+                    }
+                    // SAFETY: both signatures are exercised by the bit-exactness gates above.
+                    #[allow(unsafe_code)]
+                    unsafe {
+                        l.launch(cfg).unwrap()
+                    };
+                };
+                for i in 0..50 {
+                    launch(i);
+                }
+                stream.synchronize().unwrap();
+                // Min-of-N across reps: contention only ever inflates, so the minimum is the
+                // cleanest estimator (a median already crowned a wrong winner on this box once).
+                // σ across reps is reported so a within-noise "win" cannot be mistaken for one.
+                let mut samples = Vec::new();
+                for _ in 0..5 {
+                    let t0 = std::time::Instant::now();
+                    for i in 0..iters as usize {
+                        launch(i);
+                    }
+                    stream.synchronize().unwrap();
+                    samples.push(t0.elapsed().as_secs_f64() * 1e6 / f64::from(iters));
+                }
+                let best = samples.iter().copied().fold(f64::INFINITY, f64::min);
+                let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+                let var =
+                    samples.iter().map(|s| (s - mean).powi(2)).sum::<f64>() / samples.len() as f64;
+                (best, var.sqrt())
+            };
+
+            let (dense_res, _) = bench(false, false);
+            let (dense_def, dense_sigma) = bench(false, true);
+            let (sparse_res, _) = bench(true, false);
+            let (sparse_def, sparse_sigma) = bench(true, true);
+
+            for (name, res, def, sigma, base) in [
+                ("dense tq2 i8", dense_res, dense_def, dense_sigma, dense_def),
+                (
+                    "sparse blockskip",
+                    sparse_res,
+                    sparse_def,
+                    sparse_sigma,
+                    dense_def,
+                ),
+            ] {
+                println!(
+                    "{:<26} {m:>4} {:>6.1}% {:>6.1}% {res:>10.2} {def:>10.2} {:>7.3}x {:>8.2}x  (σ {sigma:.2})",
+                    format!("{} / {name}", spec.label()),
+                    zero_frac * 100.0,
+                    dead_frac * 100.0,
+                    base / def,
+                    def / res,
+                );
+            }
+        }
+        println!();
+    }
+
+    println!(
+        "byte-sens = L2-defeated / L2-resident. A kernel whose time barely moves when its weights \
+         stop fitting in cache is ALU-bound, and no byte saving can help it; one that slows a lot \
+         is byte-bound, and a denser or sparser format has room to pay. Round 16 measured only the \
+         L2-resident column."
+    );
+}
