@@ -1219,10 +1219,19 @@ __global__ void gqa_attention_decode_warp_g(const float* __restrict__ q,
 // loop carries a per-(token, head, group) scale stream (a structurally
 // different contraction, tuning-sensitive per ADR 0020) — the _q8 kernels
 // stay hand-written, justified in ADR 0022.
+// ONE 8-byte load (LDG.E.64), then the exact same two __half2->float2
+// conversions as the original pair-of-__half2 form — bit-identical results.
+// The __half2* form compiled to TWO 32-bit LDGs (ptxas cannot merge them:
+// __half2 only asserts 4B alignment), which doubled the L1 wavefront count
+// per quad; at the tree-verify shape (KV L2-resident, kernels issue-bound)
+// that halved the f16 rung's speed (ADR 0036 L6 stage-1 deficit). Alignment:
+// every load4 call site addresses `row + 4*d` where the row offset is a
+// multiple of head_dim (resp. n_embd) — the same head_dim%4==0 contract the
+// f32 float4 path already requires — so 8B alignment holds by construction.
 __device__ __forceinline__ float4 kvh_load4(const __half* p) {
-  const __half2* h2 = (const __half2*)p;
-  const float2 lo = __half22float2(h2[0]);
-  const float2 hi = __half22float2(h2[1]);
+  const uint2 u = *reinterpret_cast<const uint2*>(p);
+  const float2 lo = __half22float2(*reinterpret_cast<const __half2*>(&u.x));
+  const float2 hi = __half22float2(*reinterpret_cast<const __half2*>(&u.y));
   return make_float4(lo.x, lo.y, hi.x, hi.y);
 }
 
@@ -2181,6 +2190,207 @@ static __device__ __forceinline__ void gqa_attention_tree_reduce_ctrl_body(
 #undef TREE_MAX_DIMS_PER_THREAD
 }
 
+// ── f16 wide-load tree-ctrl bodies (ADR 0036 L6 stage-1 deficit fix) ────────
+//
+// WHY: at the m×n_head tree-verify shape the per-layer KV working set is
+// L2-resident (m-fold reuse; ~91% L2 hit measured) and both ctrl kernels are
+// issue/latency-bound (IPC 0.05–0.17), so the f16 rung's DRAM-byte halving —
+// its whole win at M=1 long-ctx decode — buys nothing here, while its extra
+// load + convert instructions cost directly. These bodies keep every
+// conversion and every __fmul_rn/__fadd_rn in the IDENTICAL element order as
+// gqa_attention_tree_{scores,reduce}_ctrl_body<KvLoadF16> (outputs are
+// bit-identical; verified by memcmp in the stage-2 microbench), and only
+// widen the loads:
+//   * scores: one 16B LDG covers 8 halves (two quads), folded x,y,z,w then
+//     x,y,z,w — the same order the d-loop produced quad-by-quad. Requires
+//     head_dim % 8 == 0 (16B row alignment + even quad count); guarded by a
+//     launch-uniform fallback to the generic body.
+//   * reduce: two adjacent output dims per thread via one __half2 load —
+//     each dim's j-order accumulation chain is unchanged (the contract
+//     leaves the thread→dim map free); halves the per-element load+convert
+//     count. Requires head_dim even; same launch-uniform fallback.
+// Measured (4090, m=8, n_head 20/kv 5, hd 128, standalone ABBA): scores
+// 138→51 us at prefix 3968 (f32 _g: 97); reduce 833→679 (f32 _g: 763) —
+// the pair flips from +13% slower than f32 to ~15% faster.
+static __device__ __forceinline__ void gqa_attention_tree_scores_ctrl_f16w_body(
+    const float* __restrict__ q, const __half* __restrict__ k,
+    float* __restrict__ scores, const int* __restrict__ anc,
+    const int* __restrict__ n_anc, const int* __restrict__ tree_ctrl,
+    const int score_stride, const int n_head, const int n_head_kv,
+    const int head_dim, const float scale, const int max_anc, const int m) {
+  if ((head_dim & 7) != 0) {
+    gqa_attention_tree_scores_ctrl_body<KvLoadF16>(
+        q, k, scores, anc, n_anc, tree_ctrl, score_stride, n_head, n_head_kv,
+        head_dim, scale, max_anc, m);
+    return;
+  }
+  const int rowhead = blockIdx.x;
+  const int row = rowhead / n_head;
+  const int h = rowhead - row * n_head;
+  if (row >= tree_ctrl[1]) return;  // pad row (uniform per block)
+  const int prefix_len = tree_ctrl[0];
+  const int row_base = tree_ctrl[2];
+  const int ctx = prefix_len + n_anc[row];
+  const int chunk = blockIdx.y * TREE_SCORE_CHUNK;
+  if (chunk >= ctx) return;
+  const int lane = threadIdx.x & 31;
+  const int n_rep = n_head / n_head_kv;
+  const int kv = h / n_rep;
+  const float4* qv = (const float4*)(q + ((long long)row * n_head + h) * head_dim);
+  const int hd8 = head_dim >> 3;
+  const int* arow = anc + (long long)row * max_anc;
+  float* sc = scores + ((long long)row * n_head + h) * score_stride;
+
+  const int j0 = chunk + lane;
+#pragma unroll
+  for (int t = 0; t < 4; ++t) {
+    const int j = j0 + 32 * t;
+    if (j >= ctx) break;
+    const int slot = row_base + ((j < prefix_len) ? j : arow[j - prefix_len]);
+    const uint4* kr =
+        (const uint4*)(k + ((long long)slot * n_head_kv + kv) * head_dim);
+    float dot = 0.0f;
+#pragma unroll 4
+    for (int d = 0; d < hd8; ++d) {
+      const float4 q0 = qv[2 * d];
+      const float4 q1 = qv[2 * d + 1];
+      const uint4 u = kr[d];  // 8 halves, one LDG.E.128
+      const float2 a01 = __half22float2(*reinterpret_cast<const __half2*>(&u.x));
+      const float2 a23 = __half22float2(*reinterpret_cast<const __half2*>(&u.y));
+      const float2 a45 = __half22float2(*reinterpret_cast<const __half2*>(&u.z));
+      const float2 a67 = __half22float2(*reinterpret_cast<const __half2*>(&u.w));
+      dot = __fadd_rn(dot, __fmul_rn(q0.x, a01.x));
+      dot = __fadd_rn(dot, __fmul_rn(q0.y, a01.y));
+      dot = __fadd_rn(dot, __fmul_rn(q0.z, a23.x));
+      dot = __fadd_rn(dot, __fmul_rn(q0.w, a23.y));
+      dot = __fadd_rn(dot, __fmul_rn(q1.x, a45.x));
+      dot = __fadd_rn(dot, __fmul_rn(q1.y, a45.y));
+      dot = __fadd_rn(dot, __fmul_rn(q1.z, a67.x));
+      dot = __fadd_rn(dot, __fmul_rn(q1.w, a67.y));
+    }
+    sc[j] = __fmul_rn(dot, scale);
+  }
+}
+
+// REQUIRES blockDim.x == 128 (same contract as the generic ctrl reduce body).
+static __device__ __forceinline__ void gqa_attention_tree_reduce_ctrl_f16w_body(
+    const __half* __restrict__ v, const float* __restrict__ scores,
+    float* __restrict__ out, const int* __restrict__ anc,
+    const int* __restrict__ n_anc, const int* __restrict__ tree_ctrl,
+    const int score_stride, const int n_head, const int n_head_kv,
+    const int head_dim, const int max_anc, const int m) {
+  // Pair path needs head_dim even AND <= 2·TREE_MAX_PAIRS·blockDim dims.
+#define TREE_MAX_PAIRS 4
+  if ((head_dim & 1) != 0 || (head_dim >> 1) > TREE_MAX_PAIRS * (int)blockDim.x) {
+    gqa_attention_tree_reduce_ctrl_body<KvLoadF16>(
+        v, scores, out, anc, n_anc, tree_ctrl, score_stride, n_head, n_head_kv,
+        head_dim, max_anc, m);
+    return;
+  }
+  extern __shared__ float sc[];
+  __shared__ float s_red[256];
+  __shared__ float s_inv;
+  const int rowhead = blockIdx.x;
+  const int row = rowhead / n_head;
+  const int h = rowhead - row * n_head;
+  if (row >= tree_ctrl[1]) return;  // pad row (uniform per block)
+  const int prefix_len = tree_ctrl[0];
+  const int row_base = tree_ctrl[2];
+  const int ctx = prefix_len + n_anc[row];
+  const int tid = threadIdx.x;
+  const int n_rep = n_head / n_head_kv;
+  const int kv = h / n_rep;
+  const int* arow = anc + (long long)row * max_anc;
+
+  const float* gsc = scores + ((long long)row * n_head + h) * score_stride;
+  for (int j = tid; j < ctx; j += blockDim.x) {
+    sc[j] = gsc[j];
+  }
+  __syncthreads();
+
+  float mx = -INFINITY;
+  for (int j = tid; j < ctx; j += blockDim.x) {
+    mx = fmaxf(mx, sc[j]);
+  }
+  s_red[tid] = mx;
+  __syncthreads();
+  if (tid < 64) {
+    s_red[tid] = fmaxf(s_red[tid], s_red[tid + 64]);
+  }
+  __syncthreads();
+  if (tid < 32) {
+    float vv = fmaxf(s_red[tid], s_red[tid + 32]);
+    for (int off = 16; off > 0; off >>= 1) {
+      vv = fmaxf(vv, __shfl_down_sync(0xffffffffu, vv, off));
+    }
+    if (tid == 0) {
+      s_red[0] = vv;
+    }
+  }
+  __syncthreads();
+  mx = s_red[0];
+
+  for (int j = tid; j < ctx; j += blockDim.x) {
+    sc[j] = exp_f32(__fsub_rn(sc[j], mx));
+  }
+  __syncthreads();
+  if (tid == 0) {
+    float sum = 0.0f;
+    for (int j = 0; j < ctx; ++j) {
+      sum = __fadd_rn(sum, sc[j]);
+    }
+    s_inv = __fdiv_rn(1.0f, sum);
+  }
+  __syncthreads();
+  const float inv = s_inv;
+  for (int j = tid; j < ctx; j += blockDim.x) {
+    sc[j] = __fmul_rn(sc[j], inv);
+  }
+  __syncthreads();
+
+  // Weighted sum: two adjacent dims per thread via one __half2 load. Each
+  // dim's j-order __fadd_rn chain is identical to the generic body's; the
+  // load is hoisted out of the w==0 skip exactly as there.
+  float* o_row = out + ((long long)row * n_head + h) * head_dim;
+  const int hd2 = head_dim >> 1;
+  const int pairs =
+      (hd2 > tid) ? (hd2 - tid + (int)blockDim.x - 1) / (int)blockDim.x : 0;
+  float acc0[TREE_MAX_PAIRS];
+  float acc1[TREE_MAX_PAIRS];
+  for (int t = 0; t < pairs; ++t) {
+    acc0[t] = 0.0f;
+    acc1[t] = 0.0f;
+  }
+#pragma unroll 4
+  for (int j = 0; j < ctx; ++j) {
+    const float w = sc[j];
+    const int slot = row_base + ((j < prefix_len) ? j : arow[j - prefix_len]);
+    const __half2* v_row =
+        (const __half2*)(v + ((long long)slot * n_head_kv + kv) * head_dim);
+    float2 vals[TREE_MAX_PAIRS];
+#pragma unroll
+    for (int t = 0; t < TREE_MAX_PAIRS; ++t) {
+      if (t < pairs) {
+        vals[t] = __half22float2(v_row[tid + (int)blockDim.x * t]);
+      }
+    }
+    if (w != 0.0f) {
+#pragma unroll
+      for (int t = 0; t < TREE_MAX_PAIRS; ++t) {
+        if (t < pairs) {
+          acc0[t] = __fadd_rn(acc0[t], __fmul_rn(w, vals[t].x));
+          acc1[t] = __fadd_rn(acc1[t], __fmul_rn(w, vals[t].y));
+        }
+      }
+    }
+  }
+  for (int t = 0; t < pairs; ++t) {
+    o_row[2 * (tid + (int)blockDim.x * t)] = acc0[t];
+    o_row[2 * (tid + (int)blockDim.x * t) + 1] = acc1[t];
+  }
+#undef TREE_MAX_PAIRS
+}
+
 extern "C" {
 
 __global__ void gqa_attention_scores_g(const float* __restrict__ q,
@@ -2418,10 +2628,13 @@ __global__ void gqa_attention_tree_reduce_h(
 // ── f16 ctrl-driven tree-verify twins (ADR 0036 L6) — the graph-capturable
 // tree trunk on the accepted f16 rung: same ctrl contract as the `_g`
 // originals ([prefix_len, real_m, kv_row_base]); the ONLY change is the KV
-// element type (stores round once via __float2half_rn, loads widen via
-// kvh_load4/__half2float; every f32 fold keeps its order — so the graph
-// route is bit-identical to the eager f16 tree path, mirroring the f32
-// pair's graph==eager equivalence).
+// element type (stores round once via __float2half_rn, loads widen to f32;
+// every f32 fold keeps its order — so the graph route is bit-identical to
+// the eager f16 tree path, mirroring the f32 pair's graph==eager
+// equivalence). The attention pair dispatches to the `_f16w_body` wide-load
+// bodies above (same values, same fold order, wider LDGs — the stage-1
+// deficit fix); the generic <KvLoadF16> template bodies remain the guarded
+// fallback for shapes outside the wide contract.
 
 __global__ void kv_append_tree_h(const float* __restrict__ src, __half* __restrict__ kv_base,
                                  const int* __restrict__ tree_ctrl, const int kv_width,
@@ -2435,7 +2648,7 @@ __global__ void gqa_attention_tree_scores_ctrl_h(
     const int* __restrict__ tree_ctrl, const int score_stride, const int n_head,
     const int n_head_kv, const int head_dim, const float scale, const int max_anc,
     const int m) {
-  gqa_attention_tree_scores_ctrl_body<KvLoadF16>(q, k, scores, anc, n_anc, tree_ctrl,
+  gqa_attention_tree_scores_ctrl_f16w_body(q, k, scores, anc, n_anc, tree_ctrl,
       score_stride, n_head, n_head_kv, head_dim, scale, max_anc, m);
 }
 
@@ -2445,7 +2658,7 @@ __global__ void gqa_attention_tree_reduce_ctrl_h(
     const int* __restrict__ anc, const int* __restrict__ n_anc,
     const int* __restrict__ tree_ctrl, const int score_stride, const int n_head,
     const int n_head_kv, const int head_dim, const int max_anc, const int m) {
-  gqa_attention_tree_reduce_ctrl_body<KvLoadF16>(v, scores, out, anc, n_anc, tree_ctrl,
+  gqa_attention_tree_reduce_ctrl_f16w_body(v, scores, out, anc, n_anc, tree_ctrl,
       score_stride, n_head, n_head_kv, head_dim, max_anc, m);
 }
 
