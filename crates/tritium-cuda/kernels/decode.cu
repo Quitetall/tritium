@@ -2398,6 +2398,178 @@ static __device__ __forceinline__ void gqa_attention_tree_reduce_ctrl_f16w_body(
 #undef TREE_MAX_PAIRS
 }
 
+// ── RFC 0001 FAST-TIER tree attention (ADR 0036 L3b) — one-pass online-softmax
+// fusion of the gqa_attention_tree_{scores,reduce}_ctrl pair. NOT bit-exact:
+// this is the first member of the relaxed `TRITIUM_KERNEL_TIER=fast` tier and
+// deviates from the ADR 0018 canonical order under RFC 0001's bounds (kernel
+// <=1e-4 max-rel vs the exact pair; e2e logit drift <=2e-3; tree-verify
+// ACCEPTANCE arithmetic untouched — only this softmax/weighted-sum reorders).
+// The exact ctrl pair above is RETAINED verbatim as the conformance reference
+// and CI default; capture-time selection in tree.rs picks this kernel only
+// when the model was built under the fast tier (dense single-slot route).
+//
+// Shape: one TREE_FUSED_THREADS-thread block per (tree row, q-head) —
+// grid ((m·n_head), 1). Each of the 8 warps streams a strided set of 32-key
+// tiles (warp w takes tiles w, w+8, ...): per tile, lane j computes the full
+// q·k dot for key (32·tile + j) — the exact scores kernel's lane-per-key
+// float4 pattern, per-key d-order kept but folded with fmaf (RFC-permitted) —
+// then the warp does an ONLINE max/sum/V-fold update: tile max via butterfly
+// shuffles, running (m_w, s_w) rescaled by exp_f32(m_old - m_new), and the
+// per-lane V quad accumulators rescaled + fmaf-folded key-by-key in tile
+// order. Warps then combine in shared (the flash-decoding merge: global max,
+// exp-weighted sums and accumulators). All accumulation is f32; the
+// exponential stays exp_f32 (the f64-routed twin of the exact path — one
+// warp-instruction per 32 keys plus one per rescale, so the f64 rate is not
+// on the critical path). What the exact pair serialized — the thread-0
+// j-order softmax sum and the per-thread j-order V chains over the FULL
+// context — is here parallel across 8 warps with tile-local chains, which is
+// the entire speedup (round 26 addendum 4: the reduce's pinned folds are 30%
+// of verify GPU time).
+//
+// Contract (host-guarded in tree.rs): blockDim.x == TREE_FUSED_THREADS,
+// head_dim % 4 == 0, head_dim <= 128 (= 4·32: lane l owns the contiguous dim
+// quad [4l, 4l+4)); shapes outside it keep the exact pair. Pad rows
+// (row >= tree_ctrl[1]) exit before any barrier-free divergence, matching the
+// ctrl pair. No dynamic shared: the merge scratch is static.
+#define TREE_FUSED_THREADS 256
+#define TREE_FUSED_WARPS (TREE_FUSED_THREADS / 32)
+
+template <class C>
+static __device__ __forceinline__ void gqa_attention_tree_fused_ctrl_body(
+    const float* __restrict__ q, const typename C::T* __restrict__ k,
+    const typename C::T* __restrict__ v, float* __restrict__ out,
+    const int* __restrict__ anc, const int* __restrict__ n_anc,
+    const int* __restrict__ tree_ctrl, const int n_head, const int n_head_kv,
+    const int head_dim, const float scale, const int max_anc, const int m) {
+  __shared__ float s_m[TREE_FUSED_WARPS];
+  __shared__ float s_s[TREE_FUSED_WARPS];
+  __shared__ float4 s_acc[TREE_FUSED_WARPS][32];
+  const int rowhead = blockIdx.x;
+  const int row = rowhead / n_head;
+  const int h = rowhead - row * n_head;
+  if (row >= tree_ctrl[1]) return;  // pad row (uniform per block)
+  const int prefix_len = tree_ctrl[0];
+  const int row_base = tree_ctrl[2];
+  const int ctx = prefix_len + n_anc[row];
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const int n_rep = n_head / n_head_kv;
+  const int kv = h / n_rep;
+  const int* arow = anc + (long long)row * max_anc;
+  const int nq = head_dim >> 2;  // quads per row; lane l owns quad l (l < nq)
+  const bool live = lane < nq;
+
+  // Hoisted q row pointer (each lane re-reads the whole row per key — the
+  // exact scores kernel's shape; the row is L1-resident and lane-uniform).
+  const float4* qv = (const float4*)(q + ((long long)row * n_head + h) * head_dim);
+
+  float m_w = -INFINITY;  // running warp max (replicated across lanes)
+  float s_w = 0.0f;       // running warp exp-sum (replicated)
+  float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);  // lane's V quad accumulator
+
+  const int n_tiles = (ctx + 31) >> 5;
+  for (int t = warp; t < n_tiles; t += TREE_FUSED_WARPS) {
+    const int j = (t << 5) + lane;
+    // Lane-per-key dot (the exact scores kernel's pattern; fmaf per RFC).
+    float sc_l = -INFINITY;
+    if (j < ctx) {
+      const int slot = row_base + ((j < prefix_len) ? j : arow[j - prefix_len]);
+      const typename C::Row kr =
+          C::row(k, ((long long)slot * n_head_kv + kv) * head_dim);
+      float dot = 0.0f;
+#pragma unroll 8
+      for (int d = 0; d < nq; ++d) {
+        const float4 qd = qv[d];
+        const float4 a = C::load4(kr, d);
+        dot = fmaf(qd.x, a.x, dot);
+        dot = fmaf(qd.y, a.y, dot);
+        dot = fmaf(qd.z, a.z, dot);
+        dot = fmaf(qd.w, a.w, dot);
+      }
+      sc_l = dot * scale;
+    }
+    // Tile max (butterfly: every lane ends with the tile max).
+    float tmax = sc_l;
+    for (int off = 16; off > 0; off >>= 1) {
+      tmax = fmaxf(tmax, __shfl_xor_sync(0xffffffffu, tmax, off));
+    }
+    const float new_m = fmaxf(m_w, tmax);
+    if (new_m != m_w) {
+      // Rescale the running state onto the new max (c = 0 on the first tile:
+      // m_w = -inf and exp_f32(-inf) = 0, so the dead state clears exactly).
+      const float c = exp_f32(m_w - new_m);
+      s_w *= c;
+      acc.x *= c;
+      acc.y *= c;
+      acc.z *= c;
+      acc.w *= c;
+      m_w = new_m;
+    }
+    // Per-key weight; one warp-wide exp_f32 covers the whole tile.
+    const float p_l = (j < ctx) ? exp_f32(sc_l - m_w) : 0.0f;
+    float psum = p_l;
+    for (int off = 16; off > 0; off >>= 1) {
+      psum += __shfl_xor_sync(0xffffffffu, psum, off);
+    }
+    s_w += psum;
+    // V fold: key-by-key in tile order; all lanes load quad `lane` of the
+    // key's V row (coalesced full-row reads), weight broadcast by shuffle.
+    const int jbase = t << 5;
+    const int tn = min(32, ctx - jbase);
+    for (int jj = 0; jj < tn; ++jj) {
+      const float w = __shfl_sync(0xffffffffu, p_l, jj);
+      const int kj = jbase + jj;
+      const int slot =
+          row_base + ((kj < prefix_len) ? kj : arow[kj - prefix_len]);
+      if (live) {
+        const typename C::Row vr =
+            C::row(v, ((long long)slot * n_head_kv + kv) * head_dim);
+        const float4 vv = C::load4(vr, lane);
+        acc.x = fmaf(w, vv.x, acc.x);
+        acc.y = fmaf(w, vv.y, acc.y);
+        acc.z = fmaf(w, vv.z, acc.z);
+        acc.w = fmaf(w, vv.w, acc.w);
+      }
+    }
+  }
+
+  // Cross-warp merge (flash combine): stage per-warp (m, s, acc) and fold
+  // under the global max. Warp counts are tiny (8), so warp 0's lanes redo
+  // the scalar part redundantly.
+  if (lane == 0) {
+    s_m[warp] = m_w;
+    s_s[warp] = s_w;
+  }
+  s_acc[warp][lane] = acc;
+  __syncthreads();
+  if (warp == 0) {
+    float gm = -INFINITY;
+#pragma unroll
+    for (int w = 0; w < TREE_FUSED_WARPS; ++w) {
+      gm = fmaxf(gm, s_m[w]);
+    }
+    float gs = 0.0f;
+    float4 oq = make_float4(0.f, 0.f, 0.f, 0.f);
+#pragma unroll
+    for (int w = 0; w < TREE_FUSED_WARPS; ++w) {
+      const float c = exp_f32(s_m[w] - gm);  // 0 for empty warps (m = -inf)
+      gs = fmaf(c, s_s[w], gs);
+      const float4 aw = s_acc[w][lane];
+      oq.x = fmaf(c, aw.x, oq.x);
+      oq.y = fmaf(c, aw.y, oq.y);
+      oq.z = fmaf(c, aw.z, oq.z);
+      oq.w = fmaf(c, aw.w, oq.w);
+    }
+    const float inv = 1.0f / gs;
+    if (live) {
+      float4* o_row =
+          (float4*)(out + ((long long)row * n_head + h) * head_dim);
+      o_row[lane] =
+          make_float4(oq.x * inv, oq.y * inv, oq.z * inv, oq.w * inv);
+    }
+  }
+}
+
 extern "C" {
 
 __global__ void gqa_attention_scores_g(const float* __restrict__ q,
@@ -2520,6 +2692,20 @@ __global__ void gqa_attention_tree_reduce_ctrl_g(
     const int n_head_kv, const int head_dim, const int max_anc, const int m) {
   gqa_attention_tree_reduce_ctrl_body<KvLoadF32>(v, scores, out, anc, n_anc, tree_ctrl,
       score_stride, n_head, n_head_kv, head_dim, max_anc, m);
+}
+
+// gqa_attention_tree_fused_ctrl_g — RFC 0001 fast-tier one-pass online-softmax
+// fusion of the ctrl pair above (see the body's contract comment). NOT
+// bit-exact; selected only under TRITIUM_KERNEL_TIER=fast at graph capture.
+// REQUIRES blockDim.x == TREE_FUSED_THREADS, head_dim % 4 == 0, head_dim <= 128.
+__global__ void gqa_attention_tree_fused_ctrl_g(
+    const float* __restrict__ q, const float* __restrict__ k,
+    const float* __restrict__ v, float* __restrict__ out,
+    const int* __restrict__ anc, const int* __restrict__ n_anc,
+    const int* __restrict__ tree_ctrl, const int n_head, const int n_head_kv,
+    const int head_dim, const float scale, const int max_anc, const int m) {
+  gqa_attention_tree_fused_ctrl_body<KvLoadF32>(q, k, v, out, anc, n_anc,
+      tree_ctrl, n_head, n_head_kv, head_dim, scale, max_anc, m);
 }
 
 // ─── f16 KV-cache twins (ADR 0020, rung 1) — every kernel that touches the
@@ -2668,6 +2854,21 @@ __global__ void gqa_attention_tree_reduce_ctrl_h(
     const int n_head_kv, const int head_dim, const int max_anc, const int m) {
   gqa_attention_tree_reduce_ctrl_f16w_body(v, scores, out, anc, n_anc, tree_ctrl,
       score_stride, n_head, n_head_kv, head_dim, max_anc, m);
+}
+
+// gqa_attention_tree_fused_ctrl_h — the fast-tier fused kernel on the f16 KV
+// rung (RFC 0001 checklist item 4: the long-ctx regime is owned by f16-KV, so
+// the fast twin instantiates there too). KvLoadF16::load4 rides the 8B uint2
+// wide-load path (66d8f58): lane l's quad is one 8-byte load, 256 B/warp
+// contiguous per K/V row. Same contract as the `_g` twin.
+__global__ void gqa_attention_tree_fused_ctrl_h(
+    const float* __restrict__ q, const __half* __restrict__ k,
+    const __half* __restrict__ v, float* __restrict__ out,
+    const int* __restrict__ anc, const int* __restrict__ n_anc,
+    const int* __restrict__ tree_ctrl, const int n_head, const int n_head_kv,
+    const int head_dim, const float scale, const int max_anc, const int m) {
+  gqa_attention_tree_fused_ctrl_body<KvLoadF16>(q, k, v, out, anc, n_anc,
+      tree_ctrl, n_head, n_head_kv, head_dim, scale, max_anc, m);
 }
 
 // ─── i8 KV-cache twins (ADR 0020, rung 2) — per-(token, kv-head, KV_QGROUP-

@@ -822,6 +822,12 @@ pub struct CudaDecodeModel {
     kv_elem: usize,
     /// The selected KV dtype (drives kernel-handle selection and gates).
     kv_dtype: KvDtype,
+    /// RFC 0001 kernel numerics tier (`TRITIUM_KERNEL_TIER`, parsed once at
+    /// build). `Fast` swaps in the RFC-bounded relaxed twins at capture-time
+    /// dispatch points (first member: the L3b fused tree attention on the
+    /// dense single-slot graph route); `Exact` (default) is the ADR 0018
+    /// bit-exact contract everywhere.
+    kernel_tier: KernelTier,
     /// i8-rung per-group scales, `[max_ctx, n_head_kv, head_dim/KV_QGROUP]`
     /// f32 per layer per direction; empty vecs on other rungs.
     kv_k_scales: Vec<CudaSlice<f32>>,

@@ -90,6 +90,40 @@ pub(super) fn lm_head_dtype_from_env() -> Result<LmHeadDtype, BackendError> {
     }
 }
 
+/// Kernel numerics tier (RFC 0001). Selected by `TRITIUM_KERNEL_TIER=exact|fast`,
+/// parsed ONCE at model build (capture-time constant: CUDA graphs bake the
+/// picked symbols; a process serves exactly one tier). `Exact` (default) is
+/// the ADR 0018 bit-exact contract and the CI identity. `Fast` opts into the
+/// RFC-bounded relaxed twins (first member: the L3b fused tree attention —
+/// kernel ≤1e-4 max-rel vs the exact twin, e2e logit drift ≤2e-3, ppl ≤1.001,
+/// tree-verify ACCEPTANCE arithmetic untouched). The exact twins are retained
+/// and remain the conformance reference on every path the fast tier does not
+/// claim (shape guards fall back to exact — numerically a superset of the
+/// fast contract, disclosed in the model's tier report).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum KernelTier {
+    Exact,
+    Fast,
+}
+
+pub(super) fn kernel_tier_from_env() -> Result<KernelTier, BackendError> {
+    match std::env::var("TRITIUM_KERNEL_TIER") {
+        Err(std::env::VarError::NotPresent) => Ok(KernelTier::Exact),
+        Ok(v) => match v.as_str() {
+            "exact" | "" => Ok(KernelTier::Exact),
+            "fast" => Ok(KernelTier::Fast),
+            // Reject loudly (the TRITIUM_KV pattern): a typo silently running
+            // exact would invalidate whatever A/B the user thought they ran.
+            other => Err(BackendError::InvalidInput(format!(
+                "TRITIUM_KERNEL_TIER={other:?} — use exact (default) or fast"
+            ))),
+        },
+        Err(e) => Err(BackendError::InvalidInput(format!(
+            "TRITIUM_KERNEL_TIER: {e}"
+        ))),
+    }
+}
+
 pub(super) fn kv_dtype_from_env() -> Result<KvDtype, BackendError> {
     // Legacy alias first (still honored; the new var wins if both are set).
     let legacy = match std::env::var("TRITIUM_KV_F16") {

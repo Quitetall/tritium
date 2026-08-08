@@ -156,6 +156,17 @@ pub(super) const KERNEL_NAME_ATTN_TREE_REDUCE_CTRL: &str = "gqa_attention_tree_r
 pub(super) const KERNEL_NAME_KV_APPEND_TREE_H: &str = "kv_append_tree_h";
 pub(super) const KERNEL_NAME_ATTN_TREE_SCORES_CTRL_H: &str = "gqa_attention_tree_scores_ctrl_h";
 pub(super) const KERNEL_NAME_ATTN_TREE_REDUCE_CTRL_H: &str = "gqa_attention_tree_reduce_ctrl_h";
+/// RFC 0001 fast-tier fused tree attention (ADR 0036 L3b): one-pass
+/// online-softmax replacement for the ctrl scores+reduce pair, selected at
+/// graph capture only under `TRITIUM_KERNEL_TIER=fast` (dense single-slot
+/// route). NOT bit-exact — RFC-bounded (kernel ≤1e-4 vs the exact pair).
+pub(super) const KERNEL_NAME_ATTN_TREE_FUSED_CTRL: &str = "gqa_attention_tree_fused_ctrl_g";
+pub(super) const KERNEL_NAME_ATTN_TREE_FUSED_CTRL_H: &str = "gqa_attention_tree_fused_ctrl_h";
+/// Threads per fused-tree-attention block — keep in sync with
+/// `TREE_FUSED_THREADS` in decode.cu.
+pub(super) const TREE_FUSED_THREADS: u32 = 256;
+/// The fused kernel's lane→quad map caps head_dim at 4·32 (host guard).
+pub(super) const TREE_FUSED_HDMAX: usize = 128;
 /// I3 paged tree-verify twins (ADR 0025 page table; ctrl word 2 = the slot's
 /// table offset `row · tstride` instead of a KV row base).
 pub(super) const KERNEL_NAME_KV_APPEND_TREE_PAGED: &str = "kv_append_tree_paged_g";

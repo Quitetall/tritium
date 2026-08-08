@@ -6452,6 +6452,10 @@ impl CudaBackend {
         // ADR 0036 L2: opt-in int8 LM-head rung (TRITIUM_LM_HEAD=i8, parsed once,
         // loud-reject on typos). Default f16 stays byte-for-byte the shipped path.
         let head_dtype = lm_head_dtype_from_env()?;
+        // RFC 0001: kernel numerics tier (TRITIUM_KERNEL_TIER=exact|fast),
+        // parsed once at model build — graphs bake the picked symbols at
+        // capture, so this is the tier the whole process serves.
+        let kernel_tier = kernel_tier_from_env()?;
         if head_dtype == LmHeadDtype::I8 && !n_embd.is_multiple_of(LM_HEAD_QGROUP) {
             return Err(BackendError::InvalidInput(format!(
                 "TRITIUM_LM_HEAD=i8 requires n_embd % {LM_HEAD_QGROUP} == 0 (got {n_embd})"
@@ -6992,6 +6996,7 @@ impl CudaBackend {
             pending_tree: None,
             kv_elem,
             kv_dtype,
+            kernel_tier,
             kv_k_scales,
             kv_v_scales,
             f_rmsnorm: f(dm, KERNEL_NAME_RMSNORM)?,

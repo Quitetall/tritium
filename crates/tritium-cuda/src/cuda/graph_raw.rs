@@ -317,6 +317,12 @@ pub(super) struct BatchRawKernels {
     pub(super) kv_append_tree: sys::CUfunction,
     pub(super) attn_tree_scores_ctrl: sys::CUfunction,
     pub(super) attn_tree_reduce_ctrl: sys::CUfunction,
+    /// RFC 0001 fast-tier fused twin of the ctrl pair above (ADR 0036 L3b):
+    /// one-pass online-softmax scores+reduce. Resolved unconditionally (same
+    /// module, the `lm_head_i8` precedent), dtype-selected `_g`/`_h` like the
+    /// pair; captured ONLY when the model was built under
+    /// `TRITIUM_KERNEL_TIER=fast` (dense single-slot route, tree.rs guard).
+    pub(super) attn_tree_fused_ctrl: sys::CUfunction,
     /// I3 paged twins of the three above (ADR 0025): every KV row index is
     /// translated through the page table; ctrl word 2 carries the slot's
     /// table offset (`row · tstride`) instead of a KV row base.
@@ -442,6 +448,14 @@ impl BatchRawKernels {
                     KERNEL_NAME_ATTN_TREE_REDUCE_CTRL_H
                 } else {
                     KERNEL_NAME_ATTN_TREE_REDUCE_CTRL
+                },
+            )?,
+            attn_tree_fused_ctrl: get(
+                dm,
+                if f16 {
+                    KERNEL_NAME_ATTN_TREE_FUSED_CTRL_H
+                } else {
+                    KERNEL_NAME_ATTN_TREE_FUSED_CTRL
                 },
             )?,
             kv_append_tree_paged: get(

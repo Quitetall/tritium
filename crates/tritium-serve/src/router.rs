@@ -1276,6 +1276,23 @@ async fn health(State(st): State<AppState>) -> Response {
         "worker_alive": true,
         "draining": st.runtime.draining.load(Ordering::Relaxed),
         "queue_depth": queue_depth,
+        // RFC 0001: disclose the numerics domain this process serves. The
+        // tier/rungs are parsed once at model build from these env vars
+        // (loud-reject on typos, so an echoed value here is the active one).
+        "kernel_tier": std::env::var("TRITIUM_KERNEL_TIER")
+            .unwrap_or_else(|_| "exact".into()),
+        "kv_dtype": std::env::var("TRITIUM_KV")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| {
+                // Legacy alias honored by kv_dtype_from_env.
+                if std::env::var("TRITIUM_KV_F16").is_ok_and(|v| v == "1") {
+                    "f16".into()
+                } else {
+                    "f32".into()
+                }
+            }),
+        "lm_head": std::env::var("TRITIUM_LM_HEAD").unwrap_or_else(|_| "f16".into()),
     }))
     .into_response()
 }

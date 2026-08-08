@@ -242,6 +242,21 @@ impl CudaDecodeModel {
                     self.kv_elem, self.max_ctx
                 );
             });
+            if self.kernel_tier == KernelTier::Fast {
+                // RFC 0001 disclosure: the fast tier's fused tree attention
+                // lives on the graph route only; an eager verify runs the
+                // exact pair (numerically a superset of the fast bounds, but
+                // the perf the tier was opted into is NOT delivered here).
+                static TIER_WARN: std::sync::Once = std::sync::Once::new();
+                TIER_WARN.call_once(|| {
+                    eprintln!(
+                        "tritium-cuda: TRITIUM_KERNEL_TIER=fast but the verify \
+                         is on the eager route — the fused fast-tier attention \
+                         only rides the graph route; this process serves exact \
+                         numerics (and exact-tier speed) for eager verifies"
+                    );
+                });
+            }
         }
         // mb = padded node count (bucket) or the real m on the eager path;
         // every host array below is built at stride/length mb. Pad rows are
@@ -1618,7 +1633,44 @@ impl CudaDecodeModel {
                 raw_launch(f_kv, grid, (256, 1, 1), 0, cs, &mut params)
             }
         };
+        // RFC 0001 capture-time tier selection (ADR 0036 L3b): under
+        // TRITIUM_KERNEL_TIER=fast the dense single-slot route captures the
+        // fused one-pass online-softmax kernel in place of the exact
+        // scores+reduce pair. Scope guards: the paged/slots routes and shapes
+        // outside the fused contract (head_dim % 4 != 0 or > TREE_FUSED_HDMAX)
+        // keep the exact pair — numerically a superset of the fast bounds.
+        // The graph bakes whichever symbol is picked here (a process serves
+        // one tier; no per-replay switching).
+        let fused: Option<sys::CUfunction> = (!slots
+            && !paged
+            && self.kernel_tier == KernelTier::Fast
+            && head_dim.is_multiple_of(4)
+            && head_dim <= TREE_FUSED_HDMAX)
+            .then_some(raw.attn_tree_fused_ctrl);
         let attn = |kv_k: sys::CUdeviceptr, kv_v: sys::CUdeviceptr| {
+            if let Some(ff) = fused {
+                // SAFETY: matches `gqa_attention_tree_fused_ctrl_{g,h}(q, k, v,
+                // out, anc, n_anc, tree_ctrl, n_head, n_head_kv, head_dim,
+                // scale, max_anc, m)`; block = TREE_FUSED_THREADS per the
+                // kernel contract, one block per (row, head), no dynamic smem.
+                let grid = ((mb * n_head) as u32, 1, 1);
+                let mut params = [
+                    pp(&d_q),
+                    pp(&kv_k),
+                    pp(&kv_v),
+                    pp(&d_attn),
+                    pp(&d_anc),
+                    pp(&d_nanc),
+                    pp(&d_ctrl),
+                    pp(&nh_i),
+                    pp(&nhkv_i),
+                    pp(&hd_i),
+                    pp(&scale),
+                    pp(&ma_i),
+                    pp(&mb_i),
+                ];
+                return raw_launch(ff, grid, (TREE_FUSED_THREADS, 1, 1), 0, cs, &mut params);
+            }
             const TREE_SCORE_CHUNK: usize = 128; // keep in sync with decode.cu
             let grid = (
                 (mb * n_head) as u32,
