@@ -440,7 +440,7 @@ jobs:
           python scripts/qualify-crate-archives.py
           --archives target/package
           --source-revision ${{ github.sha }}
-          --release 1.1.0-rc.0
+          --release 1.1.0-rc.1
           --run-id github-${{ github.run_id }}-${{ github.run_attempt }}-crate-archives
           --output crate-evidence/crate-archive-qualification.json
       - uses: actions/upload-artifact@v4
