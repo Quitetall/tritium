@@ -607,9 +607,15 @@ impl SpecGovernor {
     /// Consecutive low-τ verifies before suppression engages — one noisy
     /// cycle (or the optimistic-start decay) must not kill a healthy drafter.
     const ENTRY_STREAK: u32 = 4;
-    /// Committed plain tokens between probe verifies while suppressed. At
-    /// ~1 verify + 1 short draft per 64 plain steps the probe overhead is
-    /// well under 2% of plain, so suppressed ≈ plain by construction.
+    /// Committed plain tokens between probe verifies while suppressed. The
+    /// verify + 4-token draft is <2% of plain — but the probe's DOMINANT cost
+    /// at long ctx is the drafter re-sync: 64 plain tokens stale the drafter
+    /// KV past the gap the reconcile tolerates, so essentially every probe
+    /// pays a full drafter re-prefill (~ctx-linear). The measured long-ctx
+    /// wins (2.42x exact / 1.22x fast+f16, probes included) already carry
+    /// that cost at ctx~4K; shrinking PROBE_PERIOD or growing ctx changes
+    /// the economics — re-measure before touching either (review 4190673
+    /// F2).
     const PROBE_PERIOD: usize = 64;
     /// Probe draft length: long enough that a fully-accepted probe moves the
     /// EWMA materially (two consecutive full-accept probes at k=4 lift

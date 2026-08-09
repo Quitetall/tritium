@@ -689,6 +689,12 @@ fn multi_spec_round(
             multi
                 .as_ref()
                 .and_then(|mp| mp.slots[r].as_ref())
+                // Owner check (review 4190673 F1): a slot retired during a
+                // Lockstep round keeps its stale SpecSlot until re-enrollment
+                // — without this filter a FRESH admission into that row read
+                // the dead owner's suppressed governor and decoded plain for
+                // up to a probe period. Mirror the enrollment loop's check.
+                .filter(|s| pool[r].as_ref().is_some_and(|a| s.owner == a.id))
                 .and_then(|s| s.governor.draft_cap())
         })
         .collect();
