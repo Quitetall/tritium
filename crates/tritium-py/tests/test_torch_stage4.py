@@ -168,11 +168,29 @@ def test_tequila_tau_anneal_changes_soft_code_only():
 
 # ---------------------------------------------------------------- KD cache
 @needs_lamu
-def test_kd_cache_module_identity():
-    ours = Path(q.__file__).parent / "kd_cache.py"
+def test_cookbook_kd_cache_is_a_shim():
     theirs_src = (LAMU_PY / "kd_cache.py").read_text()
-    assert "tritium.torch.kd_cache" in theirs_src  # cookbook is the shim now
+    assert "tritium.torch.kd_cache" in theirs_src  # cookbook delegates here
     from tritium.torch.kd_cache import TopkCache, stream_key  # noqa: F401
+
+
+def test_registry_side_effect_on_package_import(monkeypatch):
+    # A fresh interpreter importing ONLY tritium.torch must see the ids.
+    import subprocess
+    import sys as _sys
+
+    code = (
+        "import tritium.torch;"
+        "from tritium.torch.estimators import registered_estimators;"
+        "names = registered_estimators();"
+        "assert 'tequila-lsq' in names and 'pareto-seq' in names, names;"
+        "print('REGISTERED')"
+    )
+    out = subprocess.run(
+        [_sys.executable, "-c", code], capture_output=True, text=True,
+        env={"PYTHONPATH": str(Path(__file__).resolve().parents[1] / "python"), "PATH": "/usr/bin:/bin"},
+    )
+    assert out.returncode == 0 and "REGISTERED" in out.stdout, out.stdout + out.stderr
 
 
 # ---------------------------------------------------------------- autocast
@@ -186,3 +204,26 @@ def test_cuda_autocast_dtype_resolver(monkeypatch):
     monkeypatch.setenv("TRITIUM_CUDA_AUTOCAST", "int8")
     with pytest.raises(ValueError):
         ops._resolve_cuda_autocast_dtype()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_bf16_autocast_path_with_native_kernels_present(monkeypatch):
+    """Regression for the review blocker: with the native CUDA kernels
+    PRESENT and bf16 selected, the autocast wrapper must cast the master
+    down with the input (the fp16-only native mixed path must not engage),
+    or the dispatch validator rejects bf16-input/fp32-master."""
+    from tritium.torch import ops
+
+    sentinel = object()
+    for attr in (
+        "_ternary_linear_cuda_pack",
+        "_ternary_linear_cuda_forward",
+        "_ternary_linear_cuda_backward",
+    ):
+        if getattr(ops._native, attr, None) is None:
+            monkeypatch.setattr(ops._native, attr, sentinel, raising=False)
+    monkeypatch.setattr(ops, "_CUDA_AUTOCAST_DTYPE", torch.bfloat16)
+    x = torch.randn(2, 8, device="cuda")
+    master = torch.randn(4, 8, device="cuda")  # fp32 master
+    out = ops._ternary_linear_cuda_autocast(x, master)
+    assert out.dtype == torch.bfloat16

@@ -226,8 +226,13 @@ def main() -> int:
     ap.add_argument("--out", required=True, type=Path)
     args = ap.parse_args()
 
-    sys.path.insert(0, str(Path(__file__).parent))
-    from bitnet_student import BitNetStudent, StudentConfig
+    try:
+        from bitnet_student import BitNetStudent, StudentConfig
+    except ImportError as e:
+        raise ImportError(
+            "gguf_i2s needs the cookbook's model definition: put the blut-lamu "
+            "python/lamu dir on PYTHONPATH (its stages inject it automatically)"
+        ) from e
 
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     cfg = StudentConfig(**ckpt["config"])

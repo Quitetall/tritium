@@ -579,6 +579,10 @@ def _ternary_linear_cuda_autocast(
             and getattr(_native, "_ternary_linear_cuda_forward", None) is not None
             and getattr(_native, "_ternary_linear_cuda_backward", None) is not None
             and master.dtype == torch.float32
+            # The native mixed kernel is fp16-activation-only: under bf16
+            # autocast the master must be cast down with the input, or the
+            # dispatch validator rejects the bf16-input/fp32-master pair.
+            and _CUDA_AUTOCAST_DTYPE == torch.float16
         )
         cast_master = master if native_mixed else master.to(_CUDA_AUTOCAST_DTYPE)
         return _ternary_linear_dispatch(cast_input, cast_master, cast_bias)

@@ -19,6 +19,7 @@ import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F  # noqa: N812 — used by _wht_smooth
 
 class _LSQTernaryFunction(torch.autograd.Function):
     """Ternary quantization with LSQ gradient scaling + Tequila deadzone fix.
@@ -434,9 +435,19 @@ class TequilaLSQEstimator(Estimator):
     def set_tau(self, tau: float) -> None:
         self._tau.fill_(float(tau))
 
+    def materialize(self, master: torch.Tensor) -> None:
+        """Create the per-row alpha now. Call BEFORE building the optimizer
+        and BEFORE load_state_dict — alpha is lazily created on the first
+        project(), so an optimizer built earlier silently never trains it,
+        and a strict load into a fresh estimator rejects the unexpected
+        key."""
+        self._ensure_alpha(master)
+
     def _ensure_alpha(self, master: torch.Tensor) -> nn.Parameter:
         if self._alpha is None:
-            # LamQuant's TernaryConv1d init: alpha0 = (2/3)·mean|W| per row.
+            # (2/3)·mean|W| per-row init, after LamQuant's TernaryConv1d
+            # (which additionally clamps at 1e-3 and uses fan-in grad
+            # scaling — those stay conv-specific).
             init = (master.detach().abs().mean(dim=1, keepdim=True) * (2.0 / 3.0)).clamp(min=1e-8)
             self._alpha = nn.Parameter(init)
         return self._alpha
@@ -465,8 +476,9 @@ class ParetoSEQEstimator(Estimator):
     """ParetoQ Stretched Elastic Quantization for ternary (BSD-3 upstream —
     see `_SEQTernaryFunction`). The stretched grid ({-2/3, 0, +2/3}·alpha)
     exists only in the training-time soft code; `project()` reports plain
-    trits with the effective per-row scale (2/3)·alpha so the exported
-    tensor equals the soft lattice exactly."""
+    trits with the effective per-row scale alpha/1.5, so the export decodes
+    to the same lattice up to the registry-wide fp16 plane-scale storage
+    (~4e-4 rel, the same convention as every built-in estimator)."""
 
     algorithm_id = "tritium.pareto-seq"
     schema_version = 1
@@ -474,6 +486,10 @@ class ParetoSEQEstimator(Estimator):
     def __init__(self) -> None:
         super().__init__()
         self._alpha: nn.Parameter | None = None
+
+    def materialize(self, master: torch.Tensor) -> None:
+        """See TequilaLSQEstimator.materialize — same lazy-alpha caveats."""
+        self._ensure_alpha(master)
 
     def _ensure_alpha(self, master: torch.Tensor) -> nn.Parameter:
         if self._alpha is None:

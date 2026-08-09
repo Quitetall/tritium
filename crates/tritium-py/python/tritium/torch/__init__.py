@@ -219,3 +219,9 @@ __all__ = [
     "TensorDiagnostics",
     "validate_projection",
 ]
+
+# ADR 0037 Stage 4: importing the consolidated quantizers registers the
+# "tequila-lsq" / "pareto-seq" estimator ids as a side effect — without this,
+# create_estimator("tequila-lsq") only works if a caller happened to import
+# the module first.
+from . import quantizers as _quantizers  # noqa: E402,F401  (registry side effect)
