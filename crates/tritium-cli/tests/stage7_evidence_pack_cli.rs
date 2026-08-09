@@ -55,13 +55,19 @@ fn record(root: &Path, path: &str) -> Value {
 }
 
 fn root() -> PathBuf {
+    // pid + nanos alone collide on macOS (coarser clock: two concurrent
+    // tests can draw the same timestamp, and the second create_dir panics
+    // with AlreadyExists — seen on the macos-latest CI lane); the atomic
+    // counter makes the name unique within the process unconditionally.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     std::env::temp_dir().join(format!(
-        "tritium-stage7-evidence-{}-{}",
+        "tritium-stage7-evidence-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
     ))
 }
 
