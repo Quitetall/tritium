@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import os
+import weakref
 from collections import OrderedDict
 from typing import Optional, Tuple
-import weakref
 
 import torch
 import torch.nn.functional as F
@@ -14,7 +15,25 @@ from tritium import _tritium as _native
 _CUDA_PACKED_CACHE_CAPACITY = 4096
 _CUDA_PACKED_CACHE = OrderedDict()
 _CPU_AUTOCAST_DTYPE = torch.bfloat16
-_CUDA_AUTOCAST_DTYPE = torch.float16
+
+
+def _resolve_cuda_autocast_dtype() -> torch.dtype:
+    """CUDA autocast dtype for the ternary ops. Default fp16 (fastest packed
+    path); `TRITIUM_CUDA_AUTOCAST=bf16` preserves bf16 through the dispatch —
+    required by bf16-with-fp32-escapes training loops (LamQuant's codec
+    trainer, ADR 0037 Stage 4) where an fp16 downcast changes numerics.
+    Resolved once at import, like the registration it feeds."""
+    choice = os.environ.get("TRITIUM_CUDA_AUTOCAST", "fp16").strip().lower()
+    if choice in ("fp16", "float16", ""):
+        return torch.float16
+    if choice in ("bf16", "bfloat16"):
+        return torch.bfloat16
+    raise ValueError(
+        f"TRITIUM_CUDA_AUTOCAST must be fp16 or bf16, got {choice!r}"
+    )
+
+
+_CUDA_AUTOCAST_DTYPE = _resolve_cuda_autocast_dtype()
 _NATIVE_CPU_FORWARD = getattr(_native, "_ternary_linear_cpu_dlpack", None)
 _NATIVE_CPU_BACKWARD = getattr(
     _native, "_ternary_linear_backward_cpu_dlpack", None
