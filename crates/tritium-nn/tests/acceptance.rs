@@ -2508,6 +2508,17 @@ fn cuda_tree_verify_slot_matches_single_seq() {
         // this block directly pins the single-seq ctrl twins; the SLOT-route
         // graph==eager property then holds transitively through the per-route
         // slot == single-seq asserts above (slotᵍ=ssᵍ ∧ slotᵉ=ssᵉ ∧ ssᵍ=ssᵉ).
+        // Exact tier only: under TRITIUM_KERNEL_TIER=fast the graph route
+        // runs the FUSED attention while eager runs the exact pair by
+        // design (RFC 0001) — layer>0 KV carries earlier layers' attention
+        // outputs, so the bitwise pins hold only when both routes run the
+        // same kernels (review 3d99d55 nit a; pre-existing since dense
+        // L3b).
+        let fast_tier = std::env::var("TRITIUM_KERNEL_TIER").is_ok_and(|v| v == "fast");
+        if fast_tier {
+            eprintln!("skipping graph-vs-eager bitwise pins: fast tier (exact-tier semantics)");
+            return;
+        }
         let (g, e) = (&route_results[0], &route_results[1]);
         assert_eq!(g.0, e.0, "graph vs eager accepted tokens (r={target})");
         assert_eq!(g.1, e.1, "graph vs eager continuation (r={target})");

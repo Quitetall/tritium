@@ -2356,8 +2356,15 @@ impl CudaDecodeModel {
                 eprintln!(
                     "tritium-cuda: batched-slots tree verify falling back to the \
                      EAGER route (m_total={m_total}, max_ctx={}) — ~600 \
-                     launches/verify",
-                    self.max_ctx
+                     launches/verify{}",
+                    self.max_ctx,
+                    if self.kernel_tier == KernelTier::Fast {
+                        "; NB the eager route runs the EXACT pair — the fast \
+                         tier's fused kernels live on the graph route only \
+                         (review 3d99d55 nit b)"
+                    } else {
+                        ""
+                    }
                 );
             });
         }
