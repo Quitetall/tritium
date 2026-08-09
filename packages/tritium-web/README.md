@@ -143,7 +143,7 @@ Then produce one physical lane from already-running W3C WebDriver endpoint:
 
 ```bash
 node scripts/run-browser-training-lane.mjs \
-  --artifact "$TRITIUM_EVIDENCE_ROOT/npm/tritium-ai-web-1.1.0-rc.0.tgz" \
+  --artifact "$TRITIUM_EVIDENCE_ROOT/npm/tritium-ai-web-1.1.0-rc.1.tgz" \
   --npm-receipt "$TRITIUM_EVIDENCE_ROOT/npm/npm-archive-receipt.json" \
   --native-artifact "$TRITIUM_EVIDENCE_ROOT/native/native.salt" \
   --native-reference-receipt "$TRITIUM_EVIDENCE_ROOT/native/receipt.json" \

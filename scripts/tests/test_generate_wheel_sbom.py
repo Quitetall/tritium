@@ -18,13 +18,13 @@ class GenerateWheelSbomTests(unittest.TestCase):
     def test_sbom_binds_wheel_files_and_declared_dependencies(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
-            wheel = root / "tritium_torch-1.1.0rc0-cp39-abi3-linux_x86_64.whl"
+            wheel = root / "tritium_torch-1.1.0rc1-cp39-abi3-linux_x86_64.whl"
             build_wheel(
                 wheel,
                 extra={
-                    "tritium_torch-1.1.0rc0.dist-info/METADATA": (
+                    "tritium_torch-1.1.0rc1.dist-info/METADATA": (
                         b"Metadata-Version: 2.3\nName: tritium-torch\n"
-                        b"Version: 1.1.0rc0\nRequires-Dist: torch>=2.11\n"
+                        b"Version: 1.1.0rc1\nRequires-Dist: torch>=2.11\n"
                     )
                 },
             )
@@ -60,7 +60,7 @@ class GenerateWheelSbomTests(unittest.TestCase):
     def test_invalid_artifact_id_and_corrupt_wheel_fail_closed(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
-            wheel = root / "tritium_torch-1.1.0rc0-cp39-abi3-linux_x86_64.whl"
+            wheel = root / "tritium_torch-1.1.0rc1-cp39-abi3-linux_x86_64.whl"
             build_wheel(wheel, corrupt_record=True)
             with self.assertRaisesRegex(SbomError, "lowercase"):
                 generate(wheel, "Uppercase")

@@ -5,15 +5,15 @@ import { generateNpmSbom } from "../scripts/generate-npm-sbom.mjs";
 
 const packageJson = {
   name: "@tritium-ai/web",
-  version: "1.1.0-rc.0",
+  version: "1.1.0-rc.1",
   dependencies: { runtime: "1.2.3" },
 };
 const packageLock = {
   name: "@tritium-ai/web",
-  version: "1.1.0-rc.0",
+  version: "1.1.0-rc.1",
   lockfileVersion: 3,
   packages: {
-    "": { name: "@tritium-ai/web", version: "1.1.0-rc.0" },
+    "": { name: "@tritium-ai/web", version: "1.1.0-rc.1" },
     "node_modules/runtime": {
       version: "1.2.3",
       integrity: `sha512-${Buffer.alloc(64, 1).toString("base64")}`,
@@ -30,7 +30,7 @@ const packageLock = {
 const receipt = {
   source_revision: "b".repeat(40),
   artifact: {
-    package: "@tritium-ai/web@1.1.0-rc.0",
+    package: "@tritium-ai/web@1.1.0-rc.1",
     sha256: "a".repeat(64),
     bytes: 123,
   },

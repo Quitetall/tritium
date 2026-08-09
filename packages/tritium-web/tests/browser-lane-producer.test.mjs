@@ -55,13 +55,13 @@ function canonicalVectorCases() {
 
 function npmArchiveReceipt(archiveBytes, revision = "a".repeat(40)) {
   const archive = {
-    name: "tritium-ai-web-1.1.0-rc.0.tgz",
+    name: "tritium-ai-web-1.1.0-rc.1.tgz",
     bytes: archiveBytes.byteLength,
     sha256: sha256(archiveBytes),
   };
   const unsigned = {
     schema: "tritium.npm-archive-qualification.v1",
-    release: "1.1.0-rc.0",
+    release: "1.1.0-rc.1",
     source_revision: revision,
     run_id: "npm-physical-1",
     started_at_utc: "2026-08-07T12:00:00Z",
@@ -75,7 +75,7 @@ function npmArchiveReceipt(archiveBytes, revision = "a".repeat(40)) {
     artifact: {
       kind: "npm-archive",
       name: archive.name,
-      package: "@tritium-ai/web@1.1.0-rc.0",
+      package: "@tritium-ai/web@1.1.0-rc.1",
       bytes: archive.bytes,
       sha256: archive.sha256,
       integrity: `sha512-${createHash("sha512").update(archiveBytes).digest("base64")}`,
@@ -86,7 +86,7 @@ function npmArchiveReceipt(archiveBytes, revision = "a".repeat(40)) {
       source_free: true,
       installed_offline: true,
       strict_typescript: true,
-      wasm_build_id: `tritium-wasm@1.1.0-rc.0+source-git:${revision}`,
+      wasm_build_id: `tritium-wasm@1.1.0-rc.1+source-git:${revision}`,
       wasm_guest_digest: "2".repeat(64),
     },
     result: "pass",
@@ -131,7 +131,7 @@ function nativeReference(artifact, revision = "a".repeat(40)) {
     source_revision: revision,
     backend: "cpu",
     backend_id: "cpu.reference.v1",
-    backend_build: `tritium-train@1.1.0-rc.0+source-git:${revision}`,
+    backend_build: `tritium-train@1.1.0-rc.1+source-git:${revision}`,
     physical_device: "cpu:linux:x86_64:test",
     manifest_digest: "9093a1a7f9a3422c399943782aadf4df6b11833cf2253db0db56ff2d9dedb098",
     vector_digest: "38b17f4c76c1d2f85cb35c713652a3d77627d02ba47933d2c8f31a88e0c594a7",
@@ -331,7 +331,7 @@ test("native CPU reference is revision, artifact, and receipt bound", () => {
 test("lane assembly derives every pass claim from browser trace", () => {
   const artifact = Buffer.from("native artifact");
   const archive = {
-    name: "tritium-ai-web-1.1.0-rc.0.tgz",
+    name: "tritium-ai-web-1.1.0-rc.1.tgz",
     bytes: 123,
     sha256: "3".repeat(64),
   };
@@ -392,7 +392,7 @@ test("lane assembly rejects a rehashed non-canonical vector inventory", () => {
       runId: "chrome-physical-1",
       sourceRevision: "a".repeat(40),
       archive: {
-        name: "tritium-ai-web-1.1.0-rc.0.tgz",
+        name: "tritium-ai-web-1.1.0-rc.1.tgz",
         bytes: 123,
         sha256: "3".repeat(64),
       },
@@ -428,7 +428,7 @@ test("lane assembly rejects unobserved submitted cancellation and allocation inj
         runId: "chrome-physical-1",
         sourceRevision: "a".repeat(40),
         archive: {
-          name: "tritium-ai-web-1.1.0-rc.0.tgz",
+          name: "tritium-ai-web-1.1.0-rc.1.tgz",
           bytes: 123,
           sha256: "3".repeat(64),
         },

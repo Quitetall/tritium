@@ -18,7 +18,7 @@ source_admission = MODULE["source_admission"]
 def metadata():
     result = {
         "backend_id": "cpu.reference.v1",
-        "backend_build": "tritium-train@1.1.0-rc.0+source-git:" + "a" * 40,
+        "backend_build": "tritium-train@1.1.0-rc.1+source-git:" + "a" * 40,
         "physical_device": "cpu:linux:x86_64:test",
         "manifest_digest": MODULE["MANIFEST_DIGEST"],
     }

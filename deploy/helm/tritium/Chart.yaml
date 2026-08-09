@@ -2,8 +2,8 @@ apiVersion: v2
 name: tritium
 description: Hardened, digest-pinned Tritium inference deployment
 type: application
-version: 1.1.0-rc.0
-appVersion: 1.1.0-rc.0
+version: 1.1.0-rc.1
+appVersion: 1.1.0-rc.1
 kubeVersion: ">=1.29.0-0"
 annotations:
   tritium.ai/artifact-schema: "3"
