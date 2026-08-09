@@ -105,7 +105,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use tokio::sync::mpsc;
 
 use crate::generator::{
-    DraftPolicy, FinishReason, GenRequest, SPEC_COMMITTED, SPEC_VERIFIES, Sampling,
+    DraftPolicy, FinishReason, GenRequest, SPEC_COMMITTED, SPEC_VERIFIES, Sampling, SpecGovernor,
     draft_chain_from_env, draft_greedy_tokens,
 };
 use crate::worker::{GenEvent, Job, PHASE_DECODE, PHASE_IDLE, PHASE_PREFILL};
@@ -171,6 +171,8 @@ enum PendingGoal {
         max_new: usize,
         /// Adaptive draft-length policy (from `TRITIUM_DRAFT_K`).
         policy: DraftPolicy,
+        /// Adaptive spec on/off governor (from `TRITIUM_SPEC_ADAPTIVE`).
+        governor: SpecGovernor,
         /// Chained device-side drafting (from `TRITIUM_DRAFT_CHAIN`).
         chain: bool,
     },
@@ -345,6 +347,8 @@ struct SpecSeq {
     req: GenRequest,
     /// Adaptive draft-length policy (mirrors the single worker's).
     policy: DraftPolicy,
+    /// Adaptive spec on/off governor (mirrors the single worker's).
+    governor: SpecGovernor,
     /// Chained device-side drafting (`TRITIUM_DRAFT_CHAIN`).
     chain: bool,
     /// Drafter reconcile state — same contract as
@@ -434,16 +438,26 @@ fn spec_cycle(
     // committed tokens (<= drafts + 1) must fit the emission budget.
     let kv_room = n_ctx.saturating_sub(s.history.len());
     let budget = s.max_new - s.emitted; // >= 1 by the SpecSeq invariant
-    let max_draft = s.policy.len().min(kv_room).min(budget.saturating_sub(1));
-    let drafts = draft_greedy_tokens(
-        draft,
-        &mut s.draft_fed,
-        &mut s.draft_pos,
-        eos,
-        &s.history,
-        max_draft,
-        s.chain,
-    );
+    // Governor cap on top of the policy length (the single worker's rule):
+    // Some(0) = suppressed plain step, Some(k) = probe, None = normal.
+    let want = match s.governor.draft_cap() {
+        Some(k) => k,
+        None => s.policy.len(),
+    };
+    let max_draft = want.min(kv_room).min(budget.saturating_sub(1));
+    let drafts = if max_draft == 0 {
+        Vec::new() // suppressed (or clamped): no drafter work at all
+    } else {
+        draft_greedy_tokens(
+            draft,
+            &mut s.draft_fed,
+            &mut s.draft_pos,
+            eos,
+            &s.history,
+            max_draft,
+            s.chain,
+        )
+    };
 
     if drafts.is_empty() {
         // Plain M=1 graph step (faster than a 1-node tree).
@@ -454,6 +468,7 @@ fn spec_cycle(
             .map_err(|e| e.to_string())?;
         s.n_plain += 1;
         s.t_plain += t0.elapsed();
+        s.governor.on_plain_commit(1); // no-op unless suppressed
         let next = tritium_nn::sample_greedy(&logits).ok_or_else(|| "empty logits".to_owned())?;
         return Ok(emit_spec(s, next, eos));
     }
@@ -475,6 +490,8 @@ fn spec_cycle(
     // committed.len() - 1 (saturating mirrors the single worker's guard).
     s.policy
         .update(drafts.len(), committed.len().saturating_sub(1));
+    s.governor
+        .on_verify(&s.policy, SpecGovernor::TAU_FLOOR_SOLO);
     if committed.is_empty() {
         return Err("tree verify returned an empty commit".into());
     }
@@ -578,6 +595,12 @@ struct SpecSlot {
     /// fresh at enrollment. Draft length never affects the stream
     /// (losslessness), so policy state is purely a cost knob.
     policy: DraftPolicy,
+    /// Per-slot adaptive spec on/off governor (`TRITIUM_SPEC_ADAPTIVE`): a
+    /// slot whose acceptance collapsed stops drafting — its tree is the
+    /// 1-node root, which through the shared verify IS the batch-friendly
+    /// plain step — and probes periodically. Purely a cost knob (the 1-node
+    /// bonus commit is the target's own argmax).
+    governor: SpecGovernor,
 }
 
 /// Once-per-worker markers for the QUIET capacity fallbacks: each class
@@ -604,6 +627,13 @@ enum MultiOutcome {
     /// `TRITIUM_DRAFT_K` env): disable multi-slot spec for the worker's
     /// lifetime instead of retry-spamming the log.
     Disable,
+    /// Every live slot's governor has drafting suppressed and none is due a
+    /// probe: the caller runs a lockstep step (the M=N graph step — cheaper
+    /// than an all-1-node verify round) but KEEPS the pool state, so probe
+    /// rounds re-enter without rebuilding it. Suppressed rows' drafter
+    /// watermarks go stale on purpose; a probe re-syncs via the enrollment
+    /// prefill.
+    Lockstep,
 }
 
 /// One multi-slot spec round (module docs, "Multi-slot speculative
@@ -649,18 +679,56 @@ fn multi_spec_round(
         }
         return MultiOutcome::Fallback;
     }
+    // Per-row governor plans (None = draft normally, Some(0) = suppressed
+    // plain step, Some(k) = probe chain). Un-enrolled rows plan a normal
+    // draft (a fresh governor is never suppressed). Computed once up front —
+    // probe clocks only advance at commit time, so plans are stable within
+    // the round.
+    let mut caps: Vec<Option<usize>> = (0..slots)
+        .map(|r| {
+            multi
+                .as_ref()
+                .and_then(|mp| mp.slots[r].as_ref())
+                .and_then(|s| s.governor.draft_cap())
+        })
+        .collect();
+    if rows.iter().all(|&r| caps[r] == Some(0)) {
+        // Whole pool suppressed, nobody due a probe: the lockstep graph step
+        // is the cheapest plain step (beats an all-1-node verify round) and
+        // the drafter does no work at all. Advance each governor's probe
+        // clock by the one token that step commits; the pool state survives
+        // (see MultiOutcome::Lockstep).
+        let mp = multi.as_mut().expect("suppressed slots are enrolled");
+        for &r in &rows {
+            if let Some(slot) = mp.slots[r].as_mut() {
+                slot.governor.on_plain_commit(1);
+            }
+        }
+        return MultiOutcome::Lockstep;
+    }
+
     // Host-only feasibility BEFORE any drafter work, so a doomed round costs
     // nothing (no pool alloc, no enrollment prefills — without this hoist a
     // slot at the drafter's context edge made every round pay full
-    // enrollment for the OTHER rows and then fall back). Every live row
+    // enrollment for the OTHER rows and then fall back). Every DRAFTING row
     // needs drafter room for its history, the pending feed, and >= 1 draft:
     // p + 2 < draft_ctx, which also bounds the shared k below to >= 2 per
-    // row before the policy min.
+    // row before the policy min. Suppressed rows never draft, so they are
+    // exempt — a collapsed long-ctx slot must not idle the whole pool.
     let draft_ctx = draft.config.n_ctx as usize;
     let mut k = TREE_NODE_CAP / n_live - 1; // >= 1 by the cap check above
     for &r in &rows {
+        if caps[r] == Some(0) {
+            continue; // suppressed: no drafter work this round
+        }
         let p = pool[r].as_ref().expect("live row").history.len() - 1;
         if p + 2 >= draft_ctx {
+            if caps[r].is_some() {
+                // A probe blocked at the drafter's context edge: plain step
+                // this round; the (cheap) probe attempt recurs next round.
+                caps[r] = Some(0);
+                continue;
+            }
             if !log.ctx {
                 log.ctx = true;
                 eprintln!(
@@ -701,18 +769,21 @@ fn multi_spec_round(
     // feasibility check above.
     for &r in &rows {
         let a = pool[r].as_ref().expect("row in rows is live");
-        if mp.slots[r].as_ref().is_some_and(|s| s.owner == a.id) {
-            continue;
-        }
-        mp.slots[r] = None;
-        let policy = match DraftPolicy::from_env() {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("tritium-serve: multi-slot spec disabled — {e}");
-                return MultiOutcome::Disable;
-            }
-        };
         let p = a.history.len() - 1;
+        let keep = mp.slots[r].as_ref().is_some_and(|s| s.owner == a.id);
+        if keep {
+            // Suppressed rows are masked out of the gap-close below, so
+            // their drafter watermark goes stale ON PURPOSE (no drafter
+            // cost while plain). A kept row about to draft again (probe or
+            // recovery) whose watermark fell more than the gap-close's
+            // one-token contract behind re-syncs through this same
+            // prefill+adopt path, KEEPING its policy/governor state.
+            if caps[r] == Some(0) || p.saturating_sub(mp.dbatch.positions()[r]) <= 1 {
+                continue;
+            }
+        } else {
+            mp.slots[r] = None;
+        }
         draft.reset();
         let positions: Vec<usize> = (0..p).collect();
         let enrolled = draft
@@ -728,10 +799,20 @@ fn multi_spec_round(
             eprintln!("tritium-serve: multi-slot spec enrollment (row {r}): {e}");
             return MultiOutcome::Fallback;
         }
-        mp.slots[r] = Some(SpecSlot {
-            owner: a.id,
-            policy,
-        });
+        if !keep {
+            let (policy, governor) = match (DraftPolicy::from_env(), SpecGovernor::from_env()) {
+                (Ok(p), Ok(g)) => (p, g),
+                (Err(e), _) | (_, Err(e)) => {
+                    eprintln!("tritium-serve: multi-slot spec disabled — {e}");
+                    return MultiOutcome::Disable;
+                }
+            };
+            mp.slots[r] = Some(SpecSlot {
+                owner: a.id,
+                policy,
+                governor,
+            });
+        }
     }
 
     // Close per-row drafter feed gaps: after a fully-accepted round the
@@ -750,6 +831,9 @@ fn multi_spec_round(
         for r in 0..slots {
             let gap_feed = pool[r].as_ref().and_then(|a| {
                 mp.slots[r].as_ref()?;
+                if caps[r] == Some(0) {
+                    return None; // suppressed: watermark stale on purpose
+                }
                 let dpos = mp.dbatch.positions()[r];
                 let p = a.history.len() - 1;
                 debug_assert!(dpos <= p, "drafter watermark past pending");
@@ -784,8 +868,18 @@ fn multi_spec_round(
     // below (the overfed drafter rows roll back), so one slot near its end
     // never drags the whole pool to k=0.
     for &r in &rows {
-        let slot = mp.slots[r].as_ref().expect("enrolled above");
-        k = k.min(slot.policy.len());
+        match caps[r] {
+            // Suppressed: a 1-node plain step — must NOT drag the shared k
+            // (a collapsed slot's policy length sits at its floor of 1).
+            Some(0) => {}
+            // Probe: a fixed short chain, independent of the collapsed
+            // policy length (see SpecGovernor::PROBE_K).
+            Some(pk) => k = k.min(pk),
+            None => {
+                let slot = mp.slots[r].as_ref().expect("enrolled above");
+                k = k.min(slot.policy.len());
+            }
+        }
     }
     if k == 0 {
         // Unreachable — the hoisted clamps keep every term >= 1 — but a
@@ -808,15 +902,18 @@ fn multi_spec_round(
     // ABBA A/B: +6.6% aggregate tok/s at N=4, +40% at N=2 (noisy session,
     // direction consistent) vs the unsnapped shared k. Draft length never
     // affects the committed stream, so this is a pure cost knob.
-    let m_total = n_live * (1 + k);
-    if !tritium_cuda::TREE_BUCKETS.contains(&m_total)
+    // Suppressed rows contribute their 1-node root only, not 1 + k.
+    let n_draft = rows.iter().filter(|&&r| caps[r] != Some(0)).count();
+    let m_total = n_live + n_draft * k;
+    if n_draft > 0
+        && !tritium_cuda::TREE_BUCKETS.contains(&m_total)
         && let Some(b) = tritium_cuda::TREE_BUCKETS
             .iter()
             .copied()
             .filter(|&b| b <= TREE_NODE_CAP && b < m_total)
             .max()
     {
-        let k_snap = (b / n_live).saturating_sub(1);
+        let k_snap = b.saturating_sub(n_live) / n_draft;
         if k_snap >= 1 {
             k = k.min(k_snap);
         }
@@ -827,10 +924,17 @@ fn multi_spec_round(
     let d_max: Vec<usize> = (0..slots)
         .map(|r| {
             pool[r].as_ref().map_or(0, |a| {
+                // Suppressed slot: 1-node root (the batch-friendly plain
+                // step); probe slot: at most its fixed probe chain.
+                let kr = match caps[r] {
+                    Some(0) => return 0,
+                    Some(pk) => k.min(pk),
+                    None => k,
+                };
                 // The verify needs pos + 1 + d <= n_ctx (pos = p), i.e.
                 // d <= n_ctx - history.len() — the solo spec_cycle's kv_room.
                 let p = a.history.len() - 1;
-                k.min(a.remaining.saturating_sub(1))
+                kr.min(a.remaining.saturating_sub(1))
                     .min(n_ctx.saturating_sub(p + 1))
             })
         })
@@ -982,10 +1086,20 @@ fn multi_spec_round(
                 drafter_broken = true;
                 continue;
             }
-            SPEC_VERIFIES.fetch_add(1, Ordering::Relaxed);
-            SPEC_COMMITTED.fetch_add(l as u64, Ordering::Relaxed);
             let slot = mp.slots[r].as_mut().expect("enrolled above");
-            slot.policy.update(offered, l - 1);
+            if offered > 0 {
+                SPEC_VERIFIES.fetch_add(1, Ordering::Relaxed);
+                SPEC_COMMITTED.fetch_add(l as u64, Ordering::Relaxed);
+                slot.policy.update(offered, l - 1);
+                slot.governor
+                    .on_verify(&slot.policy, SpecGovernor::TAU_FLOOR_BATCHED);
+            } else {
+                // A suppressed slot's 1-node tree is its plain step: no
+                // acceptance signal to fold (and no spec-counter bump —
+                // these commits are plain decode); advance its probe clock
+                // and the suppression counter instead.
+                slot.governor.on_plain_commit(l);
+            }
             let a = pool[r].as_mut().expect("live");
             let p = a.history.len() - 1; // PRE-commit pending position
             if fed[r] > 0 {
@@ -1285,8 +1399,12 @@ pub(crate) fn run_batched(
                         && (!batch.paged() || prompt_len + max_new <= pool_cap_tokens)
                         && !tx.is_closed()
                     {
-                        match (DraftPolicy::from_env(), draft_chain_from_env()) {
-                            (Ok(policy), Ok(chain)) => {
+                        match (
+                            DraftPolicy::from_env(),
+                            draft_chain_from_env(),
+                            SpecGovernor::from_env(),
+                        ) {
+                            (Ok(policy), Ok(chain), Ok(governor)) => {
                                 // The admission reset (C4 serialized-ownership
                                 // contract): the single-sequence KV is the
                                 // prefill staging area, so taking it closes
@@ -1304,11 +1422,12 @@ pub(crate) fn run_batched(
                                         req,
                                         max_new,
                                         policy,
+                                        governor,
                                         chain,
                                     },
                                 });
                             }
-                            (Err(e), _) | (_, Err(e)) => {
+                            (Err(e), ..) | (_, Err(e), _) | (.., Err(e)) => {
                                 let _ = tx.try_send(GenEvent::Error(e.to_string()));
                             }
                         }
@@ -1560,6 +1679,7 @@ pub(crate) fn run_batched(
                                     req,
                                     max_new,
                                     policy,
+                                    governor,
                                     chain,
                                 } => match tritium_nn::sample_greedy(&logits) {
                                     None => {
@@ -1592,6 +1712,7 @@ pub(crate) fn run_batched(
                                                 max_new,
                                                 req,
                                                 policy,
+                                                governor,
                                                 chain,
                                                 draft_fed: Vec::new(),
                                                 draft_pos: 0,
@@ -1687,6 +1808,11 @@ pub(crate) fn run_batched(
                     multi = None;
                     multi_disabled = true;
                 }
+                // Whole pool suppressed (adaptive spec off): fall through to
+                // the lockstep step below, KEEPING the pool + enrollments so
+                // probe rounds re-enter cheaply (stale drafter watermarks
+                // re-sync through the enrollment prefill at probe time).
+                MultiOutcome::Lockstep => {}
             }
         } else {
             multi = None;

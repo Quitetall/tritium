@@ -1467,3 +1467,279 @@ async fn cuda_batched_throughput_vs_sequential() {
         seq.as_secs_f64() / conc.as_secs_f64(),
     );
 }
+
+// ───────────── adaptive spec on/off governor (TRITIUM_SPEC_ADAPTIVE) ─────────────
+
+/// Env guard for `TRITIUM_SPEC_ADAPTIVE`; restores the prior value on drop.
+struct AdaptiveEnv(Option<std::ffi::OsString>);
+impl AdaptiveEnv {
+    fn set(v: &str) -> Self {
+        let prev = std::env::var_os("TRITIUM_SPEC_ADAPTIVE");
+        // SAFETY: these gated tests run single-threaded (--test-threads=1 —
+        // the release-suite house rule); no other thread touches the
+        // environment.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::set_var("TRITIUM_SPEC_ADAPTIVE", v);
+        }
+        Self(prev)
+    }
+}
+impl Drop for AdaptiveEnv {
+    fn drop(&mut self) {
+        // SAFETY: single-threaded test (see `AdaptiveEnv::set`).
+        #[allow(unsafe_code)]
+        unsafe {
+            match self.0.take() {
+                Some(v) => std::env::set_var("TRITIUM_SPEC_ADAPTIVE", v),
+                None => std::env::remove_var("TRITIUM_SPEC_ADAPTIVE"),
+            }
+        }
+    }
+}
+
+/// Adaptive-governor forced-collapse gate for the BATCHED worker (solo
+/// `spec_cycle` + `multi_spec_round` per-slot suppression + the
+/// whole-pool-suppressed Lockstep outcome + the probe re-sync path):
+/// `TRITIUM_SPEC_ADAPTIVE=force` classifies every verify as collapsed, so
+/// each slot's governor enters suppression after its entry streak and the
+/// pool degrades to plain decode with periodic probes. The horizon (96)
+/// exceeds the probe period (64), so probe rounds — including the stale-
+/// watermark re-sync enrollment — are exercised. Losslessness teeth: every
+/// stream must be token-identical to the PLAIN single-worker greedy stream
+/// (suppression changes when spec runs, never what is committed), and the
+/// suppressed-plain counter must move (observability).
+#[tokio::test(flavor = "multi_thread")]
+async fn cuda_batched_spec_adaptive_forced_collapse_stays_lossless() {
+    if !Path::new(&*GGUF_PATH).exists() {
+        eprintln!("skipping: {} absent (gated real-model test)", *GGUF_PATH);
+        return;
+    }
+    if !Path::new(&*DRAFT_PATH).exists() {
+        eprintln!("skipping: {} absent (gated drafter test)", *DRAFT_PATH);
+        return;
+    }
+    let reference: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(REF_PATH).expect("read reference"))
+            .expect("parse reference");
+    let base: Vec<u32> = reference["token_ids"]
+        .as_array()
+        .expect("token_ids")
+        .iter()
+        .map(|v| v.as_u64().expect("id") as u32)
+        .collect();
+    let bytes = std::fs::read(&*GGUF_PATH).expect("read gguf");
+    let dbytes = std::fs::read(&*DRAFT_PATH).expect("read draft gguf");
+
+    let Some(target) = load_runner(&bytes) else {
+        return;
+    };
+    {
+        let draft = load_runner(&dbytes).expect("draft runner");
+        if draft.weights.vocab != target.weights.vocab {
+            eprintln!("skipping: drafter/target vocab mismatch");
+            return;
+        }
+    }
+
+    let horizon = 96usize; // > the 64-token probe period: probes exercised
+    let prompts: Vec<Vec<u32>> = (0..3usize)
+        .map(|i| {
+            base.iter()
+                .cycle()
+                .skip(2 * i)
+                .take(16 + 3 * i)
+                .copied()
+                .collect()
+        })
+        .collect();
+    let ids: Vec<String> = prompts
+        .iter()
+        .map(|p| p.iter().map(u32::to_string).collect::<Vec<_>>().join(" "))
+        .collect();
+
+    // PLAIN single-worker greedy references (no drafter): with force, the
+    // batched streams must still be exactly these.
+    let mut plain = RunnerGenerator::new(target, u32::MAX);
+    let mut want: Vec<Vec<u32>> = Vec::new();
+    for p in &prompts {
+        let req = GenRequest {
+            prompt_tokens: p.clone(),
+            max_new: horizon,
+            sampling: Sampling::Greedy,
+            stop_eos: false,
+            logprobs: None,
+        };
+        let mut out = Vec::new();
+        plain
+            .generate(&req, &mut |step| {
+                out.push(step.token);
+                true
+            })
+            .expect("plain reference generate");
+        assert_eq!(out.len(), horizon, "reference stream wrong length");
+        want.push(out);
+    }
+    drop(plain);
+
+    let _env = AdaptiveEnv::set("force");
+    let runner = load_runner(&bytes).expect("runner");
+    let draft = load_runner(&dbytes).expect("draft runner");
+    let tok = Arc::new(IdPassthroughTokenizer::new(128_000, u32::MAX));
+    let cfg = ServeConfig {
+        model_id: "tritium".into(),
+        queue_cap: 32,
+        max_new_default: horizon,
+        ..ServeConfig::default()
+    };
+    let (router, _draining) =
+        build_router_batched_with_draft(runner, draft, u32::MAX, 3, tok.clone(), cfg.clone())
+            .expect("batched router");
+
+    // Warm graph captures off the clock (also consumes some entry streak on
+    // the solo path — harmless, force keeps every verify collapsed).
+    let _ = chat(&router, "128000 791", 2).await;
+
+    let suppressed = || {
+        tritium_serve::generator::SPEC_SUPPRESSED_PLAIN.load(std::sync::atomic::Ordering::Relaxed)
+    };
+    let s0 = suppressed();
+
+    // Solo leg (spec_cycle suppression): one request alone on the worker.
+    let solo = chat(&router, &ids[0], horizon).await;
+    let parse = |text: &str| -> Vec<u32> {
+        text.split_whitespace()
+            .map(|t| t.parse().expect("token id"))
+            .collect()
+    };
+    assert_eq!(
+        parse(&solo),
+        want[0],
+        "forced-collapse solo batched stream != plain greedy (lossless)"
+    );
+    let s_solo = suppressed() - s0;
+    assert!(
+        s_solo > 0,
+        "forced collapse never engaged suppression on the solo spec path"
+    );
+
+    // Multi leg: three concurrent streams — per-slot suppression, the
+    // all-suppressed Lockstep round, and probe re-sync all fire here.
+    let s1 = suppressed();
+    let handles: Vec<_> = (0..3)
+        .map(|i| {
+            let router = router.clone();
+            let ids = ids[i].clone();
+            tokio::spawn(async move { (i, chat(&router, &ids, horizon).await) })
+        })
+        .collect();
+    for h in handles {
+        let (i, text) = h.await.expect("join");
+        assert_eq!(
+            parse(&text),
+            want[i],
+            "forced-collapse concurrent stream {i} != plain greedy (lossless)"
+        );
+    }
+    let s_multi = suppressed() - s1;
+    println!(
+        "adaptive forced-collapse (batched): solo {s_solo} suppressed-plain \
+         tokens, multi {s_multi} over 3x{horizon}"
+    );
+    assert!(
+        s_multi > 0,
+        "forced collapse never engaged suppression in the multi-slot pool"
+    );
+}
+
+/// ABBA bench for the adaptive lever at N=4 standard shape (ignored; run
+/// explicitly, serially, with --nocapture): four concurrent short-prompt
+/// greedy streams on a 4-slot drafter-attached worker, aggregate tok/s,
+/// adaptive on vs off. Short healthy prompts — the lever must stay dormant,
+/// so on/off must sit within noise.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "adaptive multi bench: run with --ignored --nocapture --test-threads=1"]
+async fn cuda_batched_spec_adaptive_multi_bench() {
+    if !Path::new(&*GGUF_PATH).exists() {
+        eprintln!("skipping: {} absent (gated real-model test)", *GGUF_PATH);
+        return;
+    }
+    if !Path::new(&*DRAFT_PATH).exists() {
+        eprintln!("skipping: {} absent (gated drafter test)", *DRAFT_PATH);
+        return;
+    }
+    let reference: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(REF_PATH).expect("read reference"))
+            .expect("parse reference");
+    let base: Vec<u32> = reference["token_ids"]
+        .as_array()
+        .expect("token_ids")
+        .iter()
+        .map(|v| v.as_u64().expect("id") as u32)
+        .collect();
+    let bytes = std::fs::read(&*GGUF_PATH).expect("read gguf");
+    let dbytes = std::fs::read(&*DRAFT_PATH).expect("read draft gguf");
+    let runner = load_runner(&bytes).expect("runner");
+    let draft = load_runner(&dbytes).expect("draft runner");
+    if draft.weights.vocab != runner.weights.vocab {
+        eprintln!("skipping: drafter/target vocab mismatch");
+        return;
+    }
+
+    let horizon = 128usize;
+    let n = 4usize;
+    let ids: Vec<String> = (0..n)
+        .map(|i| {
+            base.iter()
+                .cycle()
+                .skip(2 * i)
+                .take(16 + 3 * i)
+                .map(|t| t.to_string())
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect();
+    let tok = Arc::new(IdPassthroughTokenizer::new(128_000, u32::MAX));
+    let cfg = ServeConfig {
+        model_id: "tritium".into(),
+        queue_cap: 32,
+        max_new_default: horizon,
+        ..ServeConfig::default()
+    };
+    let (router, _draining) = build_router_batched_with_draft(runner, draft, u32::MAX, n, tok, cfg)
+        .expect("batched router");
+
+    async fn leg(router: &Router, ids: &[String], horizon: usize, env: &str) -> f64 {
+        let _e = AdaptiveEnv::set(env);
+        let t0 = std::time::Instant::now();
+        let handles: Vec<_> = ids
+            .iter()
+            .map(|p| {
+                let router = router.clone();
+                let p = p.clone();
+                tokio::spawn(async move { chat(&router, &p, horizon).await })
+            })
+            .collect();
+        let mut total = 0usize;
+        for h in handles {
+            total += h.await.expect("join").split_whitespace().count();
+        }
+        total as f64 / t0.elapsed().as_secs_f64()
+    }
+
+    // Warm both arms off the clock (graph captures + JIT on first full runs).
+    let _ = leg(&router, &ids, horizon, "1").await;
+    let _ = leg(&router, &ids, horizon, "0").await;
+    // ABBA: on, off, off, on.
+    let a1 = leg(&router, &ids, horizon, "1").await;
+    let b1 = leg(&router, &ids, horizon, "0").await;
+    let b2 = leg(&router, &ids, horizon, "0").await;
+    let a2 = leg(&router, &ids, horizon, "1").await;
+    let (on, off) = ((a1 + a2) / 2.0, (b1 + b2) / 2.0);
+    println!(
+        "adaptive-multi-bench N={n} horizon={horizon}: on {a1:.1}/{a2:.1} \
+         (mean {on:.1}) | off {b1:.1}/{b2:.1} (mean {off:.1}) agg tok/s | \
+         on/off {:.3}x",
+        on / off
+    );
+}

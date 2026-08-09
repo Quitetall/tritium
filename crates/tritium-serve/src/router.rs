@@ -1388,7 +1388,10 @@ async fn metrics(State(st): State<AppState>) -> Response {
          tritium_spec_verifies_total {}\n\
          # HELP tritium_spec_committed_total Tokens committed by spec verifies.\n\
          # TYPE tritium_spec_committed_total counter\n\
-         tritium_spec_committed_total {}\n",
+         tritium_spec_committed_total {}\n\
+         # HELP tritium_spec_suppressed_plain_total Plain-decode tokens committed while adaptive spec suppression was engaged (TRITIUM_SPEC_ADAPTIVE).\n\
+         # TYPE tritium_spec_suppressed_plain_total counter\n\
+         tritium_spec_suppressed_plain_total {}\n",
         st.metrics.chat_requests.load(Ordering::Relaxed),
         st.metrics.queue_rejections.load(Ordering::Relaxed),
         st.metrics.rate_rejections.load(Ordering::Relaxed),
@@ -1404,6 +1407,7 @@ async fn metrics(State(st): State<AppState>) -> Response {
         u8::from(phase == PHASE_DECODE),
         crate::generator::SPEC_VERIFIES.load(Ordering::Relaxed),
         crate::generator::SPEC_COMMITTED.load(Ordering::Relaxed),
+        crate::generator::SPEC_SUPPRESSED_PLAIN.load(Ordering::Relaxed),
     );
     ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body).into_response()
 }

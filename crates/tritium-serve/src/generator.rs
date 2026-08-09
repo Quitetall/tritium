@@ -14,6 +14,10 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 pub static SPEC_VERIFIES: AtomicU64 = AtomicU64::new(0);
 /// Tokens committed by spec verifies (tok/verify = committed / verifies).
 pub static SPEC_COMMITTED: AtomicU64 = AtomicU64::new(0);
+/// Plain-decode tokens committed while the adaptive spec governor had
+/// drafting SUPPRESSED (the long-ctx tau-collapse lever, [`SpecGovernor`]).
+/// A nonzero value is the observable "spec is off right now" signal.
+pub static SPEC_SUPPRESSED_PLAIN: AtomicU64 = AtomicU64::new(0);
 
 /// One generation request: a tokenized prompt + decode controls.
 #[derive(Debug, Clone)]
@@ -521,6 +525,204 @@ impl DraftPolicy {
             Self::Legacy { len } => *len,
         }
     }
+
+    /// Expected committed tokens per verify (τ) at the CURRENT policy state,
+    /// under the geometric accept model the EWMA tracks: `1` bonus token plus
+    /// `a·(1−a^k)/(1−a)` accepted drafts at `k = len()`. `None` for the
+    /// legacy policy — it carries no acceptance estimate, so the adaptive
+    /// governor stays inert on the `TRITIUM_DRAFT_K=legacy` A/B baseline.
+    pub(crate) fn tau_estimate(&self) -> Option<f64> {
+        match self {
+            Self::Adaptive { acc } => {
+                let a = acc.clamp(0.05, 0.98);
+                let k = self.len() as i32;
+                Some(1.0 + a * (1.0 - a.powi(k)) / (1.0 - a))
+            }
+            Self::Legacy { .. } => None,
+        }
+    }
+}
+
+/// Adaptive spec on/off governor (the long-ctx τ-collapse lever, 2026-08-08
+/// final sweep): at long context the drafter's acceptance collapses
+/// (τ ≈ 1.2–1.35 at ctx ≈ 3776), where a verify cycle commits so few tokens
+/// that speculative decoding is a NET slowdown in every kernel tier (0.37×
+/// plain on the exact tier). The `DraftPolicy` EWMA already measures this —
+/// the governor turns it into a decision: when the policy's τ estimate sits
+/// below a conservative breakeven floor for a sustained window, STOP
+/// drafting/verifying and run plain steps, while still probing with one
+/// short spec cycle every [`Self::PROBE_PERIOD`] committed tokens so
+/// drafting resumes if acceptance returns (context shifts as generation
+/// proceeds).
+///
+/// The floor is deliberately tier-agnostic, conservative, and CALLER-scoped
+/// (passed to [`Self::on_verify`]): in the solo loops one request pays the
+/// whole drafter step + verify, and τ < 1.5 is below every measured tier's
+/// solo breakeven (the fast+f16 tier — spec's best case — still lost at
+/// τ ≈ 1.2–1.4 in the sweep); in the multi-slot pool ride-along drafting is
+/// nearly free, so only a true collapse (τ < 1.1) drops a slot out. A
+/// cost-model-driven, per-tier threshold is the measured follow-up.
+///
+/// Purely a cost policy: suppression changes WHEN the target runs a verify,
+/// never what is committed — plain steps emit the target's own argmax, which
+/// is exactly what the lossless verify would have committed.
+///
+/// `TRITIUM_SPEC_ADAPTIVE`: `1`/unset = on (default), `0` = off (kill
+/// switch), `force` = classify every verify as collapsed (deterministic
+/// forced-collapse gates; not a production setting).
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SpecGovernor {
+    /// Kill switch (`TRITIUM_SPEC_ADAPTIVE=0`): never suppress.
+    Off,
+    /// The adaptive lever.
+    On {
+        /// `TRITIUM_SPEC_ADAPTIVE=force`: every verify counts as collapsed.
+        force: bool,
+        /// Drafting currently suppressed (plain steps + periodic probes).
+        suppressed: bool,
+        /// Consecutive verifies whose τ estimate sat below the floor.
+        low_streak: u32,
+        /// Committed plain tokens since the last verify while suppressed.
+        since_probe: usize,
+    },
+}
+
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+impl SpecGovernor {
+    /// SOLO breakeven floor: suppress while the policy's expected
+    /// committed-per-verify sits below this. In the solo loops one request
+    /// pays the whole drafter step + verify, and τ < 1.5 is below every
+    /// measured tier's solo breakeven (see the type docs).
+    pub(crate) const TAU_FLOOR_SOLO: f64 = 1.5;
+    /// BATCHED (multi-slot) floor: ride-along drafting is nearly free there
+    /// — the batched drafter step and the shared verify run for the pool
+    /// anyway, so a slot at τ ≈ 1.4 still nets more tokens per round than a
+    /// 1-node plain step (measured 2026-08-09: a 1.5 floor at N=4 cost 32%
+    /// aggregate tok/s on the healthy fixture). A slot only drops out on
+    /// TRUE collapse (drafting buys ~nothing); the real batched win is the
+    /// whole-pool-suppressed Lockstep state, which skips the drafter and
+    /// verify entirely. A cost-model floor is the measured follow-up.
+    pub(crate) const TAU_FLOOR_BATCHED: f64 = 1.1;
+    /// Consecutive low-τ verifies before suppression engages — one noisy
+    /// cycle (or the optimistic-start decay) must not kill a healthy drafter.
+    const ENTRY_STREAK: u32 = 4;
+    /// Committed plain tokens between probe verifies while suppressed. At
+    /// ~1 verify + 1 short draft per 64 plain steps the probe overhead is
+    /// well under 2% of plain, so suppressed ≈ plain by construction.
+    const PROBE_PERIOD: usize = 64;
+    /// Probe draft length: long enough that a fully-accepted probe moves the
+    /// EWMA materially (two consecutive full-accept probes at k=4 lift
+    /// acc ≈ 0.30 → ≈ 0.54, clearing the floor), short enough to stay cheap.
+    const PROBE_K: usize = 4;
+
+    /// Fresh governor in the ON state (the default; also the unit-test seam).
+    pub(crate) const fn new_on(force: bool) -> Self {
+        Self::On {
+            force,
+            suppressed: false,
+            low_streak: 0,
+            since_probe: 0,
+        }
+    }
+
+    /// `TRITIUM_SPEC_ADAPTIVE`: unset/`1` = on, `0` = off, `force` = forced
+    /// collapse (gates). Loud-reject on anything else (the TRITIUM_DRAFT_K
+    /// pattern).
+    pub(crate) fn from_env() -> Result<Self, GenError> {
+        match std::env::var("TRITIUM_SPEC_ADAPTIVE") {
+            Err(std::env::VarError::NotPresent) => Ok(Self::new_on(false)),
+            Ok(v) if v == "1" => Ok(Self::new_on(false)),
+            Ok(v) if v == "0" => Ok(Self::Off),
+            Ok(v) if v == "force" => Ok(Self::new_on(true)),
+            Ok(v) => Err(GenError::Backend(format!(
+                "TRITIUM_SPEC_ADAPTIVE={v:?} — use 1 (default), 0, or force"
+            ))),
+            Err(e) => Err(GenError::Backend(format!("TRITIUM_SPEC_ADAPTIVE: {e}"))),
+        }
+    }
+
+    /// Draft-length cap for the next cycle: `None` = draft normally (the
+    /// policy's length), `Some(0)` = take a plain step, `Some(k)` = probe
+    /// with a k-token chain.
+    pub(crate) fn draft_cap(&self) -> Option<usize> {
+        match self {
+            Self::Off
+            | Self::On {
+                suppressed: false, ..
+            } => None,
+            Self::On { since_probe, .. } if *since_probe >= Self::PROBE_PERIOD => {
+                Some(Self::PROBE_K)
+            }
+            Self::On { .. } => Some(0),
+        }
+    }
+
+    /// Fold `n` committed tokens from suppressed plain steps: advances the
+    /// probe clock and the observability counter. No-op unless suppressed
+    /// (call it from every plain branch unconditionally).
+    pub(crate) fn on_plain_commit(&mut self, n: usize) {
+        if let Self::On {
+            suppressed: true,
+            since_probe,
+            ..
+        } = self
+        {
+            *since_probe += n;
+            SPEC_SUPPRESSED_PLAIN.fetch_add(n as u64, Ordering::Relaxed);
+        }
+    }
+
+    /// Fold one verify cycle's outcome, AFTER `policy.update`. `floor` is
+    /// the caller's breakeven ([`Self::TAU_FLOOR_SOLO`] in the solo loops,
+    /// [`Self::TAU_FLOOR_BATCHED`] per slot in the multi-slot pool). Entry
+    /// needs [`Self::ENTRY_STREAK`] consecutive collapsed verifies; a probe
+    /// verify that clears the floor lifts suppression immediately
+    /// (re-suppression costs another streak — that asymmetry is the
+    /// hysteresis).
+    pub(crate) fn on_verify(&mut self, policy: &DraftPolicy, floor: f64) {
+        let Self::On {
+            force,
+            suppressed,
+            low_streak,
+            since_probe,
+        } = self
+        else {
+            return;
+        };
+        let Some(tau) = policy.tau_estimate() else {
+            return; // legacy policy: governor inert (A/B baseline)
+        };
+        let low = *force || tau < floor;
+        if *suppressed {
+            if low {
+                *since_probe = 0; // failed probe: restart the probe clock
+            } else {
+                *suppressed = false;
+                *low_streak = 0;
+            }
+        } else if low {
+            *low_streak += 1;
+            if *low_streak >= Self::ENTRY_STREAK {
+                *suppressed = true;
+                *since_probe = 0;
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    eprintln!(
+                        "tritium-serve: adaptive spec suppression engaged — drafter \
+                         acceptance collapsed below breakeven (τ < {floor}); plain decode \
+                         with a {}-token probe every {} tokens \
+                         (TRITIUM_SPEC_ADAPTIVE=0 disables; logged once, see \
+                         tritium_spec_suppressed_plain_total)",
+                        Self::PROBE_K,
+                        Self::PROBE_PERIOD,
+                    );
+                });
+            }
+        } else {
+            *low_streak = 0;
+        }
+    }
 }
 
 /// Draft up to `max_draft` tokens with `draft` (greedy), starting after
@@ -738,6 +940,9 @@ impl RunnerGenerator {
         let stats = std::env::var("TRITIUM_SPEC_STATS").as_deref() == Ok("1");
         // Acceptance-adaptive draft length (see DraftPolicy).
         let mut policy = DraftPolicy::from_env()?;
+        // Adaptive spec on/off (see SpecGovernor — the long-ctx τ-collapse
+        // lever). Greedy-path v1; the sampled twin is the measured follow-up.
+        let mut governor = SpecGovernor::from_env()?;
         let chain = draft_chain_from_env()?;
         let (mut n_verify, mut n_committed, mut n_plain, mut t_verify, mut t_plain) = (
             0usize,
@@ -785,8 +990,16 @@ impl RunnerGenerator {
             // committed tokens (<= drafts + 1) must fit the emission budget.
             let kv_room = n_ctx.saturating_sub(history.len());
             let budget = max_new - emitted;
-            let max_draft = policy.len().min(kv_room).min(budget.saturating_sub(1));
-            let drafts = if self.draft.is_some() {
+            // Governor cap on top of the policy length: Some(0) = suppressed
+            // plain step, Some(k) = probe chain, None = draft normally.
+            let want = match governor.draft_cap() {
+                Some(k) => k,
+                None => policy.len(),
+            };
+            let max_draft = want.min(kv_room).min(budget.saturating_sub(1));
+            let drafts = if max_draft == 0 {
+                Vec::new() // suppressed (or clamped): no drafter work at all
+            } else if self.draft.is_some() {
                 self.model_draft(&history, max_draft, chain)
             } else {
                 Self::lookup_draft(&history, max_draft)
@@ -802,6 +1015,7 @@ impl RunnerGenerator {
                     .map_err(|e| GenError::Backend(e.to_string()))?;
                 n_plain += 1;
                 t_plain += t0.elapsed();
+                governor.on_plain_commit(1); // no-op unless suppressed
                 pending = tritium_nn::sample_greedy(&logits)
                     .ok_or_else(|| GenError::Backend("sampler produced no token".into()))?;
                 continue;
@@ -826,6 +1040,7 @@ impl RunnerGenerator {
             // violates tree_verify_greedy's contract and is caught below, but
             // a wrapped usize here would spin the EWMA fold first).
             policy.update(drafts.len(), committed.len().saturating_sub(1));
+            governor.on_verify(&policy, SpecGovernor::TAU_FLOOR_SOLO);
             // committed[..L-1] extend history as fully-processed tokens; the
             // last committed becomes the new pending (top of the next loop
             // emits it and pushes it into history).
@@ -1334,6 +1549,118 @@ mod tests {
         assert!(mk(0.95) >= 13);
         assert_eq!(mk(0.01), 1); // clamped floor
         assert_eq!(mk(1.5), super::DraftPolicy::MAX); // clamped ceiling
+    }
+
+    #[test]
+    fn tau_estimate_tracks_acceptance() {
+        let tau = |a: f64| {
+            super::DraftPolicy::Adaptive { acc: a }
+                .tau_estimate()
+                .expect("adaptive has a tau")
+        };
+        // Healthy drafter: well above the governor floor.
+        assert!(tau(0.8) > 2.5, "tau(0.8) = {}", tau(0.8));
+        // The sweep's collapsed band (τ ≈ 1.2–1.35): below the floor.
+        assert!(tau(0.30) < super::SpecGovernor::TAU_FLOOR_SOLO);
+        assert!(tau(0.20) < super::SpecGovernor::TAU_FLOOR_SOLO);
+        // Optimistic start (acc = 0.75): must NOT read as collapsed.
+        assert!(tau(0.75) > super::SpecGovernor::TAU_FLOOR_SOLO);
+        // Mid-health band (the N=4 fixture, acc ≈ 0.45): below the solo
+        // floor but ABOVE the batched floor — a ride-along slot keeps
+        // drafting (suppressing it cost 32% aggregate, 2026-08-09 bench).
+        assert!(tau(0.45) < super::SpecGovernor::TAU_FLOOR_SOLO);
+        assert!(tau(0.45) > super::SpecGovernor::TAU_FLOOR_BATCHED);
+        // True collapse: below both floors.
+        assert!(tau(0.05) < super::SpecGovernor::TAU_FLOOR_BATCHED);
+        // Legacy policy carries no estimate — governor inert.
+        assert!(
+            super::DraftPolicy::Legacy { len: 6 }
+                .tau_estimate()
+                .is_none(),
+            "legacy must be None"
+        );
+    }
+
+    #[test]
+    fn governor_enters_after_streak_and_stays_dormant_when_healthy() {
+        let collapsed = super::DraftPolicy::Adaptive { acc: 0.25 };
+        let healthy = super::DraftPolicy::Adaptive { acc: 0.85 };
+        let mut g = super::SpecGovernor::new_on(false);
+        // Healthy verifies never suppress.
+        for _ in 0..100 {
+            g.on_verify(&healthy, super::SpecGovernor::TAU_FLOOR_SOLO);
+            assert_eq!(g.draft_cap(), None);
+        }
+        // One low verify resets on the next healthy one (streak, not latch).
+        g.on_verify(&collapsed, super::SpecGovernor::TAU_FLOOR_SOLO);
+        g.on_verify(&healthy, super::SpecGovernor::TAU_FLOOR_SOLO);
+        for _ in 0..super::SpecGovernor::ENTRY_STREAK - 1 {
+            g.on_verify(&collapsed, super::SpecGovernor::TAU_FLOOR_SOLO);
+            assert_eq!(g.draft_cap(), None, "must not fire before the streak");
+        }
+        g.on_verify(&collapsed, super::SpecGovernor::TAU_FLOOR_SOLO);
+        assert_eq!(g.draft_cap(), Some(0), "streak complete: suppressed");
+    }
+
+    #[test]
+    fn governor_probe_cadence_and_recovery() {
+        let collapsed = super::DraftPolicy::Adaptive { acc: 0.25 };
+        let healthy = super::DraftPolicy::Adaptive { acc: 0.85 };
+        let mut g = super::SpecGovernor::new_on(false);
+        for _ in 0..super::SpecGovernor::ENTRY_STREAK {
+            g.on_verify(&collapsed, super::SpecGovernor::TAU_FLOOR_SOLO);
+        }
+        assert_eq!(g.draft_cap(), Some(0));
+        // Plain commits advance the probe clock; the probe fires at PERIOD.
+        g.on_plain_commit(super::SpecGovernor::PROBE_PERIOD - 1);
+        assert_eq!(g.draft_cap(), Some(0));
+        g.on_plain_commit(1);
+        assert_eq!(g.draft_cap(), Some(super::SpecGovernor::PROBE_K));
+        // Failed probe: back to plain, clock restarted.
+        g.on_verify(&collapsed, super::SpecGovernor::TAU_FLOOR_SOLO);
+        assert_eq!(g.draft_cap(), Some(0));
+        g.on_plain_commit(super::SpecGovernor::PROBE_PERIOD);
+        assert_eq!(g.draft_cap(), Some(super::SpecGovernor::PROBE_K));
+        // Recovered probe: suppression lifts immediately.
+        g.on_verify(&healthy, super::SpecGovernor::TAU_FLOOR_SOLO);
+        assert_eq!(g.draft_cap(), None);
+        // Re-suppression needs a fresh full streak (hysteresis).
+        g.on_verify(&collapsed, super::SpecGovernor::TAU_FLOOR_SOLO);
+        assert_eq!(g.draft_cap(), None);
+    }
+
+    #[test]
+    fn governor_off_and_legacy_are_inert() {
+        let collapsed = super::DraftPolicy::Adaptive { acc: 0.10 };
+        let mut off = super::SpecGovernor::Off;
+        for _ in 0..20 {
+            off.on_verify(&collapsed, super::SpecGovernor::TAU_FLOOR_SOLO);
+            off.on_plain_commit(1);
+            assert_eq!(off.draft_cap(), None);
+        }
+        // Legacy policy: no tau estimate, ON governor never moves.
+        let mut g = super::SpecGovernor::new_on(true); // even forced
+        for _ in 0..20 {
+            g.on_verify(
+                &super::DraftPolicy::Legacy { len: 6 },
+                super::SpecGovernor::TAU_FLOOR_SOLO,
+            );
+            assert_eq!(g.draft_cap(), None);
+        }
+    }
+
+    #[test]
+    fn governor_force_suppresses_despite_healthy_acceptance() {
+        let healthy = super::DraftPolicy::Adaptive { acc: 0.9 };
+        let mut g = super::SpecGovernor::new_on(true);
+        for _ in 0..super::SpecGovernor::ENTRY_STREAK {
+            g.on_verify(&healthy, super::SpecGovernor::TAU_FLOOR_SOLO);
+        }
+        assert_eq!(g.draft_cap(), Some(0), "force: collapsed regardless of acc");
+        g.on_plain_commit(super::SpecGovernor::PROBE_PERIOD);
+        assert_eq!(g.draft_cap(), Some(super::SpecGovernor::PROBE_K));
+        g.on_verify(&healthy, super::SpecGovernor::TAU_FLOOR_SOLO); // probe verifies stay classified collapsed
+        assert_eq!(g.draft_cap(), Some(0));
     }
 
     /// Monte-Carlo gate for the deterministic-drafter accept rule: over many
