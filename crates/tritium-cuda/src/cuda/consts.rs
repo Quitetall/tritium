@@ -158,10 +158,22 @@ pub(super) const KERNEL_NAME_ATTN_TREE_SCORES_CTRL_H: &str = "gqa_attention_tree
 pub(super) const KERNEL_NAME_ATTN_TREE_REDUCE_CTRL_H: &str = "gqa_attention_tree_reduce_ctrl_h";
 /// RFC 0001 fast-tier fused tree attention (ADR 0036 L3b): one-pass
 /// online-softmax replacement for the ctrl scores+reduce pair, selected at
-/// graph capture only under `TRITIUM_KERNEL_TIER=fast` (dense single-slot
-/// route). NOT bit-exact — RFC-bounded (kernel ≤1e-4 vs the exact pair).
+/// graph capture only under `TRITIUM_KERNEL_TIER=fast`. NOT bit-exact —
+/// RFC-bounded (kernel ≤1e-4 vs the exact pair). Lever 6 extends the family
+/// over the paged/slots routes (one templated body over `TreeCtrlAddr`;
+/// the `_paged`/`_slots[_paged]` names below).
 pub(super) const KERNEL_NAME_ATTN_TREE_FUSED_CTRL: &str = "gqa_attention_tree_fused_ctrl_g";
 pub(super) const KERNEL_NAME_ATTN_TREE_FUSED_CTRL_H: &str = "gqa_attention_tree_fused_ctrl_h";
+pub(super) const KERNEL_NAME_ATTN_TREE_FUSED_CTRL_PAGED: &str =
+    "gqa_attention_tree_fused_ctrl_paged_g";
+pub(super) const KERNEL_NAME_ATTN_TREE_FUSED_CTRL_PAGED_H: &str =
+    "gqa_attention_tree_fused_ctrl_paged_h";
+pub(super) const KERNEL_NAME_ATTN_TREE_FUSED_SLOTS: &str = "gqa_attention_tree_fused_slots_g";
+pub(super) const KERNEL_NAME_ATTN_TREE_FUSED_SLOTS_H: &str = "gqa_attention_tree_fused_slots_h";
+pub(super) const KERNEL_NAME_ATTN_TREE_FUSED_SLOTS_PAGED: &str =
+    "gqa_attention_tree_fused_slots_paged_g";
+pub(super) const KERNEL_NAME_ATTN_TREE_FUSED_SLOTS_PAGED_H: &str =
+    "gqa_attention_tree_fused_slots_paged_h";
 /// Threads per fused-tree-attention block — keep in sync with
 /// `TREE_FUSED_THREADS` in decode.cu.
 pub(super) const TREE_FUSED_THREADS: u32 = 256;

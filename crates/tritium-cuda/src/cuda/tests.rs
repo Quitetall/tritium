@@ -3688,6 +3688,315 @@ fn tree_fused_ctrl_fast_tier_within_1e4_of_exact_pair() {
     }
 }
 
+/// Lever 6 kernel gate: the fast-tier fused twins over the PAGED and SLOTS
+/// tree routes (`gqa_attention_tree_fused_{ctrl_paged,slots,slots_paged}_{g,h}`)
+/// must stay within the RFC 0001 1e-4 max-rel bound against the exact
+/// scores→reduce pair OF THE SAME ROUTE at identical inputs, per
+/// instantiation. Route shapes exercise the policy axes' edges:
+///   * ctrl_paged — per-launch ctrl, NON-IDENTITY multi-page table at a
+///     non-zero table offset (prefix 300 spans two pages, scrambled mapping);
+///   * slots — per-row ctrl, two slots with UNEQUAL prefix, unequal per-slot
+///     node counts, disjoint row bases, plus a pad row (word1 = -1);
+///   * slots_paged — per-row ctrl + per-slot table offsets into one shared
+///     non-identity table (slot A spans two pages).
+///
+/// The exact pairs are the conformance references (ADR 0022); this is the
+/// fused twins' admission bar, NOT a bit-equality pin.
+#[test]
+fn tree_fused_addr_fast_tier_within_1e4_of_exact_pair() {
+    use cudarc::driver::{CudaContext, LaunchConfig, PushKernelArg};
+    use cudarc::nvrtc::Ptx;
+
+    let ctx = match CudaContext::new(0) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("skipping tree fused addr fast-tier gate: no device ({e})");
+            return;
+        }
+    };
+    let stream = ctx.default_stream();
+    let dm = ctx
+        .load_module(Ptx::from_src(DECODE_PTX))
+        .expect("load decode module");
+
+    let mut seed = 0x6b17u64;
+    let mut nextf = move || {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (((seed >> 33) as i32 % 1000) as f32) * 1e-3 - 0.5
+    };
+
+    let (n_head, n_head_kv, head_dim, max_anc) = (4usize, 2usize, 128usize, 4usize);
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+
+    struct Route {
+        name: &'static str,
+        /// Per row: (prefix_len, word2, n_anc, pad).
+        rows: Vec<(i32, i32, i32, bool)>,
+        /// None = per-launch 3-word ctrl (built from rows[0] + real_m).
+        per_row: bool,
+        /// Page table content (None = dense addressing).
+        table: Option<Vec<i32>>,
+        /// Physical KV token rows to allocate.
+        kv_rows: usize,
+        /// Exact pair's score stride (>= max per-row ctx).
+        score_stride: usize,
+    }
+    let routes = [
+        Route {
+            name: "ctrl_paged",
+            // Per-launch ctrl [300, 3, 2]: prefix 300 spans pages 0..2 of the
+            // region at table offset 2; mapping {0→3, 1→1} is non-identity.
+            rows: vec![(300, 2, 2, false), (300, 2, 4, false), (300, 2, 3, false)],
+            per_row: false,
+            table: Some(vec![0, 0, 3, 1]),
+            kv_rows: 5 * 256,
+            score_stride: 304,
+        },
+        Route {
+            name: "slots",
+            // Slot A: 2 nodes at prefix 7, base 0; slot B: 3 nodes at prefix
+            // 100, base 512 (unequal m_i AND prefix); row 5 = pad.
+            rows: vec![
+                (7, 0, 1, false),
+                (7, 0, 2, false),
+                (100, 512, 4, false),
+                (100, 512, 3, false),
+                (100, 512, 1, false),
+                (0, 0, 1, true),
+            ],
+            per_row: true,
+            table: None,
+            kv_rows: 640,
+            score_stride: 104,
+        },
+        Route {
+            name: "slots_paged",
+            // Slot A: table offset 0, prefix 260 (two pages, mapping
+            // {0→2, 1→0}); slot B: offset 2, prefix 30 (page {0→4}).
+            rows: vec![
+                (260, 0, 2, false),
+                (260, 0, 4, false),
+                (30, 2, 3, false),
+                (30, 2, 1, false),
+            ],
+            per_row: true,
+            table: Some(vec![2, 0, 4]),
+            kv_rows: 6 * 256,
+            score_stride: 264,
+        },
+    ];
+
+    for route in &routes {
+        let m = route.rows.len();
+        let real_m = route.rows.iter().filter(|r| !r.3).count();
+        // Ancestor tables: region-local logical rows prefix + a (self-first,
+        // then earlier provisional locals — ragged like the dense gate).
+        let mut anc = vec![0i32; m * max_anc];
+        let mut n_anc = vec![0i32; m];
+        for (r, &(prefix, _, na, pad)) in route.rows.iter().enumerate() {
+            n_anc[r] = na;
+            if pad {
+                continue;
+            }
+            for a in 0..na as usize {
+                anc[r * max_anc + a] = prefix + a as i32;
+            }
+        }
+        let ctrl: Vec<i32> = if route.per_row {
+            route
+                .rows
+                .iter()
+                .enumerate()
+                .flat_map(|(r, &(prefix, w2, _, pad))| {
+                    [prefix, if pad { -1 } else { r as i32 }, w2]
+                })
+                .collect()
+        } else {
+            vec![route.rows[0].0, real_m as i32, route.rows[0].1]
+        };
+
+        let d_anc = stream.clone_htod(&anc).expect("anc");
+        let d_n_anc = stream.clone_htod(&n_anc).expect("n_anc");
+        let d_ctrl = stream.clone_htod(&ctrl).expect("ctrl");
+        let d_table = route
+            .table
+            .as_ref()
+            .map(|t| stream.clone_htod(t).expect("table"));
+        let (ss_i, nh_i, nhkv_i, hd_i, ma_i, m_i) = (
+            route.score_stride as i32,
+            n_head as i32,
+            n_head_kv as i32,
+            head_dim as i32,
+            max_anc as i32,
+            m as i32,
+        );
+        let q: Vec<f32> = (0..m * n_head * head_dim).map(|_| nextf()).collect();
+        let kv_len = route.kv_rows * n_head_kv * head_dim;
+        let kf: Vec<f32> = (0..kv_len).map(|_| nextf()).collect();
+        let vf: Vec<f32> = (0..kv_len).map(|_| nextf()).collect();
+        let kh: Vec<u16> = kf.iter().map(|&x| f16::from_f32(x).to_bits()).collect();
+        let vh: Vec<u16> = vf.iter().map(|&x| f16::from_f32(x).to_bits()).collect();
+        let d_q = stream.clone_htod(&q).expect("q");
+
+        let scores_cfg = LaunchConfig {
+            grid_dim: (
+                (m * n_head) as u32,
+                route.score_stride.div_ceil(128) as u32,
+                1,
+            ),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let reduce_cfg = LaunchConfig {
+            grid_dim: ((m * n_head) as u32, 1, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: (route.score_stride * 4) as u32,
+        };
+        let fused_cfg = LaunchConfig {
+            grid_dim: ((m * n_head) as u32, 1, 1),
+            block_dim: (consts::TREE_FUSED_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let scores_len = m * n_head * route.score_stride;
+        let out_len = m * n_head * head_dim;
+        let suffix = match route.name {
+            "ctrl_paged" => "ctrl_paged",
+            "slots" => "slots",
+            _ => "slots_paged",
+        };
+
+        for dtype in ["g", "h"] {
+            let f_scores = dm
+                .load_function(&format!("gqa_attention_tree_scores_{suffix}_{dtype}"))
+                .expect("exact scores fn");
+            let f_reduce = dm
+                .load_function(&format!("gqa_attention_tree_reduce_{suffix}_{dtype}"))
+                .expect("exact reduce fn");
+            let f_fused = dm
+                .load_function(&format!("gqa_attention_tree_fused_{suffix}_{dtype}"))
+                .expect("fused fn");
+            let mut d_sc: cudarc::driver::CudaSlice<f32> =
+                stream.alloc_zeros(scores_len).expect("sc");
+            let mut d_out_ref: cudarc::driver::CudaSlice<f32> =
+                stream.alloc_zeros(out_len).expect("out ref");
+            let mut d_out_fast: cudarc::driver::CudaSlice<f32> =
+                stream.alloc_zeros(out_len).expect("out fast");
+
+            macro_rules! launch_all {
+                ($dk:expr, $dv:expr) => {{
+                    #[allow(unsafe_code)]
+                    {
+                        let mut l = stream.launch_builder(&f_scores);
+                        l.arg(&d_q)
+                            .arg($dk)
+                            .arg(&mut d_sc)
+                            .arg(&d_anc)
+                            .arg(&d_n_anc)
+                            .arg(&d_ctrl);
+                        if let Some(dt) = d_table.as_ref() {
+                            l.arg(dt);
+                        }
+                        l.arg(&ss_i)
+                            .arg(&nh_i)
+                            .arg(&nhkv_i)
+                            .arg(&hd_i)
+                            .arg(&scale)
+                            .arg(&ma_i)
+                            .arg(&m_i);
+                        // SAFETY: route-matched exact scores signature (the
+                        // paged variants carry `table` after ctrl).
+                        unsafe { l.launch(scores_cfg).expect("exact scores") };
+                        let mut l = stream.launch_builder(&f_reduce);
+                        l.arg($dv)
+                            .arg(&d_sc)
+                            .arg(&mut d_out_ref)
+                            .arg(&d_anc)
+                            .arg(&d_n_anc)
+                            .arg(&d_ctrl);
+                        if let Some(dt) = d_table.as_ref() {
+                            l.arg(dt);
+                        }
+                        l.arg(&ss_i)
+                            .arg(&nh_i)
+                            .arg(&nhkv_i)
+                            .arg(&hd_i)
+                            .arg(&ma_i)
+                            .arg(&m_i);
+                        // SAFETY: route-matched exact reduce signature;
+                        // blockDim.x == 128 per contract.
+                        unsafe { l.launch(reduce_cfg).expect("exact reduce") };
+                        let mut l = stream.launch_builder(&f_fused);
+                        l.arg(&d_q)
+                            .arg($dk)
+                            .arg($dv)
+                            .arg(&mut d_out_fast)
+                            .arg(&d_anc)
+                            .arg(&d_n_anc)
+                            .arg(&d_ctrl);
+                        if let Some(dt) = d_table.as_ref() {
+                            l.arg(dt);
+                        }
+                        l.arg(&nh_i)
+                            .arg(&nhkv_i)
+                            .arg(&hd_i)
+                            .arg(&scale)
+                            .arg(&ma_i)
+                            .arg(&m_i);
+                        // SAFETY: fused family signature (table after ctrl on
+                        // the paged variants); blockDim.x == TREE_FUSED_THREADS.
+                        unsafe { l.launch(fused_cfg).expect("fused") };
+                    }
+                }};
+            }
+            if dtype == "g" {
+                let d_k = stream.clone_htod(&kf).expect("k32");
+                let d_v = stream.clone_htod(&vf).expect("v32");
+                launch_all!(&d_k, &d_v);
+            } else {
+                let d_k = stream.clone_htod(&kh).expect("k16");
+                let d_v = stream.clone_htod(&vh).expect("v16");
+                launch_all!(&d_k, &d_v);
+            }
+
+            let o_ref = stream.clone_dtoh(&d_out_ref).expect("dtoh ref");
+            let o_fast = stream.clone_dtoh(&d_out_fast).expect("dtoh fast");
+            let mut worst = 0.0f32;
+            for (i, (&a, &b)) in o_fast.iter().zip(&o_ref).enumerate() {
+                let row = i / (n_head * head_dim);
+                if route.rows[row].3 {
+                    // Pad row: both kernels early-exit, leaving the zero fill.
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "pad row {row} was written ({}, {dtype}) at [{i}]: \
+                         fast={a} exact={b}",
+                        route.name
+                    );
+                    continue;
+                }
+                assert!(
+                    a.is_finite(),
+                    "fused output not finite ({}, {dtype}) at [{i}]: {a}",
+                    route.name
+                );
+                let rel = (a - b).abs() / a.abs().max(b.abs()).max(1e-3);
+                if rel > worst {
+                    worst = rel;
+                }
+                assert!(
+                    rel <= 1e-4,
+                    "fused fast tier out of the RFC 0001 1e-4 bound \
+                     ({}, {dtype}) at [{i}]: fast={a} exact={b} rel={rel:.3e}",
+                    route.name
+                );
+            }
+            println!("tree fused {} {dtype}: worst rel = {worst:.3e}", route.name);
+        }
+    }
+}
+
 /// RFC 0001 L3b kernel-level ABBA bench (ignored; run explicitly): fused
 /// fast-tier kernel vs the exact ctrl scores+reduce pair at the BitNet 2B4T
 /// verify shape (m=8, n_head=20, n_head_kv=5, hd=128), short and long
@@ -3897,6 +4206,256 @@ fn tree_fused_vs_exact_pair_kernel_abba_bench() {
                 f / p,
                 (f / p - 1.0) * 100.0
             );
+        }
+    }
+}
+
+/// Lever 6 kernel-level ABBA bench (ignored; run explicitly): the fused
+/// fast-tier twins vs the exact pair on the PAGED and SLOTS routes at the
+/// BitNet 2B4T verify shape (n_head=20, n_head_kv=5, hd=128), short and long
+/// prefix, f32 and f16. Routes: `ctrl_paged` (m=8, scrambled page table) and
+/// `slots` (2 slots x 4 rows, per-row ctrl, disjoint bases — the N=2
+/// multi-slot verify shape). ABBA: pair, fused, fused, pair; 200-launch
+/// batches.
+#[test]
+#[ignore = "kernel ABBA bench: run explicitly with --ignored --nocapture --test-threads=1"]
+fn tree_fused_addr_vs_exact_pair_kernel_abba_bench() {
+    use cudarc::driver::{CudaContext, LaunchConfig, PushKernelArg};
+    use cudarc::nvrtc::Ptx;
+    use std::time::Instant;
+
+    let ctx = match CudaContext::new(0) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("skipping fused addr kernel bench: no device ({e})");
+            return;
+        }
+    };
+    let stream = ctx.default_stream();
+    let dm = ctx
+        .load_module(Ptx::from_src(DECODE_PTX))
+        .expect("load decode module");
+
+    let (n_head, n_head_kv, head_dim, max_anc) = (20usize, 5usize, 128usize, 8usize);
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+    let mut seed = 0x6abbau64;
+    let mut nextf = move || {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (((seed >> 33) as i32 % 1000) as f32) * 1e-3 - 0.5
+    };
+
+    for prefix_len in [512usize, 3968usize] {
+        for suffix in ["ctrl_paged", "slots"] {
+            // ctrl_paged: one slot, m=8 chain (the dense-bench tree) through
+            // a reversed page table. slots: 2 slots x 4-row chains at the
+            // same prefix, disjoint dense bases.
+            let per_row = suffix == "slots";
+            let m = 8usize;
+            let mut anc = vec![0i32; m * max_anc];
+            let mut n_anc = vec![0i32; m];
+            if per_row {
+                for s in 0..2usize {
+                    for i in 0..4usize {
+                        let r = s * 4 + i;
+                        n_anc[r] = (i + 1) as i32;
+                        for a in 0..=i {
+                            anc[r * max_anc + a] = (prefix_len + a) as i32;
+                        }
+                    }
+                }
+            } else {
+                for i in 0..m {
+                    n_anc[i] = (i + 1) as i32;
+                    for a in 0..=i {
+                        anc[i * max_anc + a] = (prefix_len + a) as i32;
+                    }
+                }
+            }
+            let region_rows = prefix_len + m;
+            let ctx_max = prefix_len + max_anc;
+            let (ctrl, table, kv_rows): (Vec<i32>, Option<Vec<i32>>, usize) = if per_row {
+                let base_b = region_rows as i32; // slot B right after slot A
+                let mut c = Vec::with_capacity(3 * m);
+                for s in 0..2usize {
+                    for i in 0..4usize {
+                        c.extend([prefix_len as i32, i as i32, s as i32 * base_b]);
+                    }
+                }
+                (c, None, 2 * region_rows)
+            } else {
+                let pages = region_rows.div_ceil(256);
+                // Reversed (non-identity) mapping at table offset 0.
+                let t: Vec<i32> = (0..pages).rev().map(|p| p as i32).collect();
+                (vec![prefix_len as i32, m as i32, 0], Some(t), pages * 256)
+            };
+            let d_anc = stream.clone_htod(&anc).expect("anc");
+            let d_n_anc = stream.clone_htod(&n_anc).expect("n_anc");
+            let d_ctrl = stream.clone_htod(&ctrl).expect("ctrl");
+            let d_table = table.map(|t| stream.clone_htod(&t).expect("table"));
+            let (ss_i, nh_i, nhkv_i, hd_i, ma_i, m_i) = (
+                ctx_max as i32,
+                n_head as i32,
+                n_head_kv as i32,
+                head_dim as i32,
+                max_anc as i32,
+                m as i32,
+            );
+            let q: Vec<f32> = (0..m * n_head * head_dim).map(|_| nextf()).collect();
+            let kv_len = kv_rows * n_head_kv * head_dim;
+            let kf: Vec<f32> = (0..kv_len).map(|_| nextf()).collect();
+            let vf: Vec<f32> = (0..kv_len).map(|_| nextf()).collect();
+            let kh: Vec<u16> = kf.iter().map(|&x| f16::from_f32(x).to_bits()).collect();
+            let vh: Vec<u16> = vf.iter().map(|&x| f16::from_f32(x).to_bits()).collect();
+            let d_q = stream.clone_htod(&q).expect("q");
+            let scores_cfg = LaunchConfig {
+                grid_dim: ((m * n_head) as u32, ctx_max.div_ceil(128) as u32, 1),
+                block_dim: (32, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let reduce_cfg = LaunchConfig {
+                grid_dim: ((m * n_head) as u32, 1, 1),
+                block_dim: (128, 1, 1),
+                shared_mem_bytes: (ctx_max * 4) as u32,
+            };
+            let fused_cfg = LaunchConfig {
+                grid_dim: ((m * n_head) as u32, 1, 1),
+                block_dim: (consts::TREE_FUSED_THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let scores_len = m * n_head * ctx_max;
+            let out_len = m * n_head * head_dim;
+
+            for dtype in ["g", "h"] {
+                let f_scores = dm
+                    .load_function(&format!("gqa_attention_tree_scores_{suffix}_{dtype}"))
+                    .expect("scores fn");
+                let f_reduce = dm
+                    .load_function(&format!("gqa_attention_tree_reduce_{suffix}_{dtype}"))
+                    .expect("reduce fn");
+                let f_fused = dm
+                    .load_function(&format!("gqa_attention_tree_fused_{suffix}_{dtype}"))
+                    .expect("fused fn");
+                let mut d_sc: cudarc::driver::CudaSlice<f32> =
+                    stream.alloc_zeros(scores_len).expect("sc");
+                let mut d_out_p: cudarc::driver::CudaSlice<f32> =
+                    stream.alloc_zeros(out_len).expect("out p");
+                let mut d_out_f: cudarc::driver::CudaSlice<f32> =
+                    stream.alloc_zeros(out_len).expect("out f");
+                let d_k32 = stream.clone_htod(&kf).expect("k32");
+                let d_v32 = stream.clone_htod(&vf).expect("v32");
+                let d_k16 = stream.clone_htod(&kh).expect("k16");
+                let d_v16 = stream.clone_htod(&vh).expect("v16");
+
+                const ITERS: usize = 200;
+                #[allow(unsafe_code)]
+                let mut run_pair = |timed: bool| -> f64 {
+                    let t0 = Instant::now();
+                    for _ in 0..ITERS {
+                        let mut l = stream.launch_builder(&f_scores);
+                        l.arg(&d_q);
+                        if dtype == "g" {
+                            l.arg(&d_k32);
+                        } else {
+                            l.arg(&d_k16);
+                        }
+                        l.arg(&mut d_sc).arg(&d_anc).arg(&d_n_anc).arg(&d_ctrl);
+                        if let Some(dt) = d_table.as_ref() {
+                            l.arg(dt);
+                        }
+                        l.arg(&ss_i)
+                            .arg(&nh_i)
+                            .arg(&nhkv_i)
+                            .arg(&hd_i)
+                            .arg(&scale)
+                            .arg(&ma_i)
+                            .arg(&m_i);
+                        // SAFETY: route-matched exact scores signature.
+                        unsafe { l.launch(scores_cfg).expect("scores") };
+                        let mut l = stream.launch_builder(&f_reduce);
+                        if dtype == "g" {
+                            l.arg(&d_v32);
+                        } else {
+                            l.arg(&d_v16);
+                        }
+                        l.arg(&d_sc)
+                            .arg(&mut d_out_p)
+                            .arg(&d_anc)
+                            .arg(&d_n_anc)
+                            .arg(&d_ctrl);
+                        if let Some(dt) = d_table.as_ref() {
+                            l.arg(dt);
+                        }
+                        l.arg(&ss_i)
+                            .arg(&nh_i)
+                            .arg(&nhkv_i)
+                            .arg(&hd_i)
+                            .arg(&ma_i)
+                            .arg(&m_i);
+                        // SAFETY: route-matched exact reduce signature; blockDim.x == 128.
+                        unsafe { l.launch(reduce_cfg).expect("reduce") };
+                    }
+                    stream.synchronize().expect("sync");
+                    if timed {
+                        t0.elapsed().as_secs_f64() / ITERS as f64
+                    } else {
+                        0.0
+                    }
+                };
+                #[allow(unsafe_code)]
+                let mut run_fused = |timed: bool| -> f64 {
+                    let t0 = Instant::now();
+                    for _ in 0..ITERS {
+                        let mut l = stream.launch_builder(&f_fused);
+                        l.arg(&d_q);
+                        if dtype == "g" {
+                            l.arg(&d_k32).arg(&d_v32);
+                        } else {
+                            l.arg(&d_k16).arg(&d_v16);
+                        }
+                        l.arg(&mut d_out_f).arg(&d_anc).arg(&d_n_anc).arg(&d_ctrl);
+                        if let Some(dt) = d_table.as_ref() {
+                            l.arg(dt);
+                        }
+                        l.arg(&nh_i)
+                            .arg(&nhkv_i)
+                            .arg(&hd_i)
+                            .arg(&scale)
+                            .arg(&ma_i)
+                            .arg(&m_i);
+                        // SAFETY: fused family signature; blockDim.x == TREE_FUSED_THREADS.
+                        unsafe { l.launch(fused_cfg).expect("fused") };
+                    }
+                    stream.synchronize().expect("sync");
+                    if timed {
+                        t0.elapsed().as_secs_f64() / ITERS as f64
+                    } else {
+                        0.0
+                    }
+                };
+
+                run_pair(false);
+                run_fused(false);
+                let p1 = run_pair(true);
+                let f1 = run_fused(true);
+                let f2 = run_fused(true);
+                let p2 = run_pair(true);
+                let (p, f) = ((p1 + p2) / 2.0, (f1 + f2) / 2.0);
+                println!(
+                    "[{suffix} {dtype} prefix={prefix_len}] exact pair {:.1}us \
+                     (A {:.1} B {:.1}) | fused {:.1}us (A {:.1} B {:.1}) | \
+                     fused/pair = {:.3} ({:+.1}%)",
+                    p * 1e6,
+                    p1 * 1e6,
+                    p2 * 1e6,
+                    f * 1e6,
+                    f1 * 1e6,
+                    f2 * 1e6,
+                    f / p,
+                    (f / p - 1.0) * 100.0
+                );
+            }
         }
     }
 }
@@ -5870,6 +6429,9 @@ fn adr_0022_twin_family_table_matches_decode_cu() {
         ("gqa_attention_tree_scores", 3),
         ("gqa_attention_tree_reduce", 3),
         ("gqa_attention_tree_fused_ctrl", 2),
+        ("gqa_attention_tree_fused_ctrl_paged", 2),
+        ("gqa_attention_tree_fused_slots", 2),
+        ("gqa_attention_tree_fused_slots_paged", 2),
         ("lm_head_warp", 3),
     ];
     for (family, want) in table {
@@ -5882,7 +6444,7 @@ fn adr_0022_twin_family_table_matches_decode_cu() {
     }
     assert_eq!(
         names.len(),
-        101,
+        107,
         "decode.cu kernel count drifted from ADR 0022 — update the ADR \
          (65 → 64: gqa_attention_mdecode_f32 retired; 64 → 66: paged KV \
          twins added, ADR 0025 step 2; rmsnorm_quant_i8_fast was added and \
@@ -5933,7 +6495,14 @@ fn adr_0022_twin_family_table_matches_decode_cu() {
          ctrl scores+reduce pair, ADR 0036 L3b; NOT bit-exact — RFC-bounded \
          (kernel ≤1e-4 vs the exact pair by \
          tree_fused_ctrl_fast_tier_within_1e4_of_exact_pair); the exact ctrl \
-         pair is retained verbatim as the conformance reference + CI default)"
+         pair is retained verbatim as the conformance reference + CI default; \
+         101 → 107: gqa_attention_tree_fused_{{ctrl_paged,slots,\
+         slots_paged}}_{{g,h}} — lever 6 extends the fast-tier fused family \
+         over the paged/slots tree routes: ONE templated online-softmax body \
+         instantiated per TreeCtrlAddr policy axis (the L6-s2 pattern), \
+         RFC-bounded vs the exact pair of the SAME route by \
+         tree_fused_addr_fast_tier_within_1e4_of_exact_pair; the exact \
+         paged/slots pairs are retained verbatim)"
     );
 }
 

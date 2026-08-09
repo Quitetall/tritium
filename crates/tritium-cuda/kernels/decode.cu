@@ -2410,8 +2410,9 @@ static __device__ __forceinline__ void gqa_attention_tree_reduce_ctrl_f16w_body(
 // structural floor on it regardless of kernel accuracy. Tree-verify
 // ACCEPTANCE arithmetic untouched — only this softmax/weighted-sum reorders.
 // The exact ctrl pair above is RETAINED verbatim as the conformance reference
-// and CI default; capture-time selection in tree.rs picks this kernel only
-// when the model was built under the fast tier (dense single-slot route).
+// and CI default; capture-time selection in tree.rs picks the fused family
+// only when the model was built under the fast tier (all four tree routes
+// since lever 6 — the paged/slots twins share this body via TreeCtrlAddr).
 //
 // Shape: one TREE_FUSED_THREADS-thread block per (tree row, q-head) —
 // grid ((m·n_head), 1). Each of the 8 warps streams a strided set of 32-key
@@ -2445,22 +2446,95 @@ static __device__ __forceinline__ void gqa_attention_tree_reduce_ctrl_f16w_body(
 #define TREE_FUSED_THREADS 256
 #define TREE_FUSED_WARPS (TREE_FUSED_THREADS / 32)
 
-template <class C>
+// ── Tree-ctrl addressing policy (shared with the L6-s2 `_h` pair family
+// below) ─────────────────────────────────────────────────────────────────────
+// `TreeCtrlAddr<PER_ROW, PAGED>` folds the two ctrl/addressing axes the
+// hand-written f32 pair variants duplicate:
+//   * PER_ROW — the I4 slots ctrl plane (`row_ctrl[m·3]` =
+//     `[prefix_len, local_node_or_-1, word2]`, pad = word1 < 0) vs the
+//     per-launch 3-word ctrl (`[prefix_len, real_m, word2]`, pad =
+//     row >= ctrl[1]);
+//   * PAGED — page-table translation (word 2 = the slot's table offset) vs
+//     the dense row-base add (word 2 = the KV row base).
+// `<false, false>` IS the dense single-slot ctrl contract — the fused body
+// below instantiates it for the original `_ctrl_{g,h}` shims (same
+// arithmetic, `if constexpr`-pruned addressing). The KV_PAGE_* geometry is
+// hoisted here from the M=N paged-KV section (ADR 0025) that also uses it.
+#define KV_PAGE_TOKENS 256
+#define KV_PAGE_SHIFT 8
+#define KV_PAGE_MASK 255
+
+template <bool PER_ROW, bool PAGED>
+struct TreeCtrlAddr {
+  static __device__ __forceinline__ bool pad(const int* __restrict__ ctrl, const int row) {
+    if constexpr (PER_ROW) {
+      return ctrl[row * 3 + 1] < 0;
+    } else {
+      return row >= ctrl[1];
+    }
+  }
+  static __device__ __forceinline__ int prefix(const int* __restrict__ ctrl, const int row) {
+    if constexpr (PER_ROW) {
+      return ctrl[row * 3 + 0];
+    } else {
+      return ctrl[0];
+    }
+  }
+  static __device__ __forceinline__ int word2(const int* __restrict__ ctrl, const int row) {
+    if constexpr (PER_ROW) {
+      return ctrl[row * 3 + 2];
+    } else {
+      return ctrl[2];
+    }
+  }
+  /// Region-logical token row → physical KV token row.
+  static __device__ __forceinline__ long long slot(const int* __restrict__ table, const int w2,
+                                                   const int logical) {
+    if constexpr (PAGED) {
+      return (long long)table[w2 + (logical >> KV_PAGE_SHIFT)] * KV_PAGE_TOKENS +
+             (logical & KV_PAGE_MASK);
+    } else {
+      return (long long)w2 + logical;
+    }
+  }
+  /// kv_append's per-row region-local node index: slots rows carry it in ctrl
+  /// word 1 (−1 = pad, no write); single-slot launches append row i at
+  /// prefix + i (pads write junk past the watermark, the `_g` contract).
+  static __device__ __forceinline__ int append_local(const int* __restrict__ ctrl,
+                                                     const int row) {
+    if constexpr (PER_ROW) {
+      return ctrl[row * 3 + 1];
+    } else {
+      return row;
+    }
+  }
+};
+
+// ONE fused body across all four (ctrl, addressing) routes (lever 6): `A` is
+// a `TreeCtrlAddr` instantiation; `table` is dereferenced only by the PAGED
+// policies (dense shims pass nullptr). The dense `<false, false>` route is
+// arithmetically IDENTICAL to the pre-policy body (same fold order, the
+// addressing add merely widens to long long), so the dense L3b gates pin
+// this refactor. The ctx >= 1 host guarantee extends per ROUTE: every tree
+// builder (dense, batch-slot, slots) includes self in each node's ancestor
+// list, and slots pad rows exit at `A::pad` before ctx is formed.
+template <class C, class A>
 static __device__ __forceinline__ void gqa_attention_tree_fused_ctrl_body(
     const float* __restrict__ q, const typename C::T* __restrict__ k,
     const typename C::T* __restrict__ v, float* __restrict__ out,
     const int* __restrict__ anc, const int* __restrict__ n_anc,
-    const int* __restrict__ tree_ctrl, const int n_head, const int n_head_kv,
-    const int head_dim, const float scale, const int max_anc, const int m) {
+    const int* __restrict__ tree_ctrl, const int* __restrict__ table,
+    const int n_head, const int n_head_kv, const int head_dim,
+    const float scale, const int max_anc, const int m) {
   __shared__ float s_m[TREE_FUSED_WARPS];
   __shared__ float s_s[TREE_FUSED_WARPS];
   __shared__ float4 s_acc[TREE_FUSED_WARPS][32];
   const int rowhead = blockIdx.x;
   const int row = rowhead / n_head;
   const int h = rowhead - row * n_head;
-  if (row >= tree_ctrl[1]) return;  // pad row (uniform per block)
-  const int prefix_len = tree_ctrl[0];
-  const int row_base = tree_ctrl[2];
+  if (A::pad(tree_ctrl, row)) return;  // pad row (uniform per block)
+  const int prefix_len = A::prefix(tree_ctrl, row);
+  const int w2 = A::word2(tree_ctrl, row);
   const int ctx = prefix_len + n_anc[row];
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
@@ -2484,9 +2558,9 @@ static __device__ __forceinline__ void gqa_attention_tree_fused_ctrl_body(
     // Lane-per-key dot (the exact scores kernel's pattern; fmaf per RFC).
     float sc_l = -INFINITY;
     if (j < ctx) {
-      const int slot = row_base + ((j < prefix_len) ? j : arow[j - prefix_len]);
-      const typename C::Row kr =
-          C::row(k, ((long long)slot * n_head_kv + kv) * head_dim);
+      const long long slot =
+          A::slot(table, w2, (j < prefix_len) ? j : arow[j - prefix_len]);
+      const typename C::Row kr = C::row(k, (slot * n_head_kv + kv) * head_dim);
       float dot = 0.0f;
 #pragma unroll 8
       for (int d = 0; d < nq; ++d) {
@@ -2530,11 +2604,10 @@ static __device__ __forceinline__ void gqa_attention_tree_fused_ctrl_body(
     for (int jj = 0; jj < tn; ++jj) {
       const float w = __shfl_sync(0xffffffffu, p_l, jj);
       const int kj = jbase + jj;
-      const int slot =
-          row_base + ((kj < prefix_len) ? kj : arow[kj - prefix_len]);
+      const long long slot =
+          A::slot(table, w2, (kj < prefix_len) ? kj : arow[kj - prefix_len]);
       if (live) {
-        const typename C::Row vr =
-            C::row(v, ((long long)slot * n_head_kv + kv) * head_dim);
+        const typename C::Row vr = C::row(v, (slot * n_head_kv + kv) * head_dim);
         const float4 vv = C::load4(vr, lane);
         acc.x = fmaf(w, vv.x, acc.x);
         acc.y = fmaf(w, vv.y, acc.y);
@@ -2715,8 +2788,9 @@ __global__ void gqa_attention_tree_fused_ctrl_g(
     const int* __restrict__ anc, const int* __restrict__ n_anc,
     const int* __restrict__ tree_ctrl, const int n_head, const int n_head_kv,
     const int head_dim, const float scale, const int max_anc, const int m) {
-  gqa_attention_tree_fused_ctrl_body<KvLoadF32>(q, k, v, out, anc, n_anc,
-      tree_ctrl, n_head, n_head_kv, head_dim, scale, max_anc, m);
+  gqa_attention_tree_fused_ctrl_body<KvLoadF32, TreeCtrlAddr<false, false>>(
+      q, k, v, out, anc, n_anc, tree_ctrl, nullptr, n_head, n_head_kv,
+      head_dim, scale, max_anc, m);
 }
 
 // ─── f16 KV-cache twins (ADR 0020, rung 1) — every kernel that touches the
@@ -2878,8 +2952,9 @@ __global__ void gqa_attention_tree_fused_ctrl_h(
     const int* __restrict__ anc, const int* __restrict__ n_anc,
     const int* __restrict__ tree_ctrl, const int n_head, const int n_head_kv,
     const int head_dim, const float scale, const int max_anc, const int m) {
-  gqa_attention_tree_fused_ctrl_body<KvLoadF16>(q, k, v, out, anc, n_anc,
-      tree_ctrl, n_head, n_head_kv, head_dim, scale, max_anc, m);
+  gqa_attention_tree_fused_ctrl_body<KvLoadF16, TreeCtrlAddr<false, false>>(
+      q, k, v, out, anc, n_anc, tree_ctrl, nullptr, n_head, n_head_kv,
+      head_dim, scale, max_anc, m);
 }
 
 // ─── i8 KV-cache twins (ADR 0020, rung 2) — per-(token, kv-head, KV_QGROUP-
@@ -3976,10 +4051,9 @@ __global__ void gqa_attention_tree_f32(const float* __restrict__ q, const float*
 // physical token = table_row[j >> KV_PAGE_SHIFT] · KV_PAGE_TOKENS +
 // (j & KV_PAGE_MASK); pools are `[pool_pages, KV_PAGE_TOKENS, kv_width]`.
 // An unmapped (-1) table entry is a host-allocator bug, not a fallback — the
-// kernels do not guard it.
-#define KV_PAGE_TOKENS 256
-#define KV_PAGE_SHIFT 8
-#define KV_PAGE_MASK 255
+// kernels do not guard it. (The KV_PAGE_* geometry macros are defined
+// earlier, above the fused tree body — the fused twins' `TreeCtrlAddr`
+// policy translates through the same table mapping.)
 
 // Per-lane register budget for one warp's accumulator: head_dim / 32, capped
 // at 8 (head_dim ≤ 256; the Rust launch asserts it). Hoisted above the
@@ -4785,52 +4859,10 @@ __global__ void gqa_attention_tree_reduce_slots_paged_g(
 // fallback). Real rows' folds are element-order-identical to the f32
 // siblings', so paged==dense and slots==sequential hold ON the f16 rung
 // exactly as the f32 gates pin them.
-
-template <bool PER_ROW, bool PAGED>
-struct TreeCtrlAddr {
-  static __device__ __forceinline__ bool pad(const int* __restrict__ ctrl, const int row) {
-    if constexpr (PER_ROW) {
-      return ctrl[row * 3 + 1] < 0;
-    } else {
-      return row >= ctrl[1];
-    }
-  }
-  static __device__ __forceinline__ int prefix(const int* __restrict__ ctrl, const int row) {
-    if constexpr (PER_ROW) {
-      return ctrl[row * 3 + 0];
-    } else {
-      return ctrl[0];
-    }
-  }
-  static __device__ __forceinline__ int word2(const int* __restrict__ ctrl, const int row) {
-    if constexpr (PER_ROW) {
-      return ctrl[row * 3 + 2];
-    } else {
-      return ctrl[2];
-    }
-  }
-  /// Region-logical token row → physical KV token row.
-  static __device__ __forceinline__ long long slot(const int* __restrict__ table, const int w2,
-                                                   const int logical) {
-    if constexpr (PAGED) {
-      return (long long)table[w2 + (logical >> KV_PAGE_SHIFT)] * KV_PAGE_TOKENS +
-             (logical & KV_PAGE_MASK);
-    } else {
-      return (long long)w2 + logical;
-    }
-  }
-  /// kv_append's per-row region-local node index: slots rows carry it in ctrl
-  /// word 1 (−1 = pad, no write); single-slot launches append row i at
-  /// prefix + i (pads write junk past the watermark, the `_g` contract).
-  static __device__ __forceinline__ int append_local(const int* __restrict__ ctrl,
-                                                     const int row) {
-    if constexpr (PER_ROW) {
-      return ctrl[row * 3 + 1];
-    } else {
-      return row;
-    }
-  }
-};
+//
+// `TreeCtrlAddr<PER_ROW, PAGED>` itself is defined ABOVE the fused tree body
+// (lever 6 hoisted it: the fast-tier fused kernel instantiates the same
+// policy axes for all four routes).
 
 // Append: one store per (row, col), addressing via the policy — mirrors
 // kv_append_tree_paged_g / kv_append_tree_slots[_paged]_g with an f16 store.
@@ -5230,6 +5262,90 @@ __global__ void gqa_attention_tree_reduce_slots_paged_h(
   tree_reduce_addr_h_body<TreeCtrlAddr<true, true>>(v, scores, out, anc, n_anc, row_ctrl, table,
                                                     score_stride, n_head, n_head_kv, head_dim,
                                                     max_anc, m);
+}
+
+// ── RFC 0001 fast-tier fused twins over the paged/slots routes (ADR 0036
+// L3b, lever 6) ─────────────────────────────────────────────────────────────
+// The SAME online-softmax body as `gqa_attention_tree_fused_ctrl_{g,h}`
+// (defined above the dense shims), instantiated over the remaining
+// `TreeCtrlAddr` policy axes × KV codec — six shims, ONE templated body.
+// Same contract as the dense fused twins (blockDim.x == TREE_FUSED_THREADS,
+// head_dim % 4 == 0 and <= 128, ctx >= 1 host-guaranteed per route); NOT
+// bit-exact — RFC-bounded (<=1e-4 max rel vs the exact pair of the SAME
+// route, `tree_fused_addr_fast_tier_within_1e4_of_exact_pair`), captured
+// only under TRITIUM_KERNEL_TIER=fast (tree.rs, one selection point). The
+// exact paged/slots pairs above are RETAINED verbatim as the conformance
+// references and CI default. kv_append and the acceptance walk are
+// UNTOUCHED (ADR 0014: only this softmax/weighted-sum reorders).
+
+__global__ void gqa_attention_tree_fused_ctrl_paged_g(
+    const float* __restrict__ q, const float* __restrict__ k,
+    const float* __restrict__ v, float* __restrict__ out,
+    const int* __restrict__ anc, const int* __restrict__ n_anc,
+    const int* __restrict__ tree_ctrl, const int* __restrict__ table,
+    const int n_head, const int n_head_kv, const int head_dim,
+    const float scale, const int max_anc, const int m) {
+  gqa_attention_tree_fused_ctrl_body<KvLoadF32, TreeCtrlAddr<false, true>>(
+      q, k, v, out, anc, n_anc, tree_ctrl, table, n_head, n_head_kv, head_dim,
+      scale, max_anc, m);
+}
+
+__global__ void gqa_attention_tree_fused_ctrl_paged_h(
+    const float* __restrict__ q, const __half* __restrict__ k,
+    const __half* __restrict__ v, float* __restrict__ out,
+    const int* __restrict__ anc, const int* __restrict__ n_anc,
+    const int* __restrict__ tree_ctrl, const int* __restrict__ table,
+    const int n_head, const int n_head_kv, const int head_dim,
+    const float scale, const int max_anc, const int m) {
+  gqa_attention_tree_fused_ctrl_body<KvLoadF16, TreeCtrlAddr<false, true>>(
+      q, k, v, out, anc, n_anc, tree_ctrl, table, n_head, n_head_kv, head_dim,
+      scale, max_anc, m);
+}
+
+__global__ void gqa_attention_tree_fused_slots_g(
+    const float* __restrict__ q, const float* __restrict__ k,
+    const float* __restrict__ v, float* __restrict__ out,
+    const int* __restrict__ anc, const int* __restrict__ n_anc,
+    const int* __restrict__ row_ctrl, const int n_head, const int n_head_kv,
+    const int head_dim, const float scale, const int max_anc, const int m) {
+  gqa_attention_tree_fused_ctrl_body<KvLoadF32, TreeCtrlAddr<true, false>>(
+      q, k, v, out, anc, n_anc, row_ctrl, nullptr, n_head, n_head_kv,
+      head_dim, scale, max_anc, m);
+}
+
+__global__ void gqa_attention_tree_fused_slots_h(
+    const float* __restrict__ q, const __half* __restrict__ k,
+    const __half* __restrict__ v, float* __restrict__ out,
+    const int* __restrict__ anc, const int* __restrict__ n_anc,
+    const int* __restrict__ row_ctrl, const int n_head, const int n_head_kv,
+    const int head_dim, const float scale, const int max_anc, const int m) {
+  gqa_attention_tree_fused_ctrl_body<KvLoadF16, TreeCtrlAddr<true, false>>(
+      q, k, v, out, anc, n_anc, row_ctrl, nullptr, n_head, n_head_kv,
+      head_dim, scale, max_anc, m);
+}
+
+__global__ void gqa_attention_tree_fused_slots_paged_g(
+    const float* __restrict__ q, const float* __restrict__ k,
+    const float* __restrict__ v, float* __restrict__ out,
+    const int* __restrict__ anc, const int* __restrict__ n_anc,
+    const int* __restrict__ row_ctrl, const int* __restrict__ table,
+    const int n_head, const int n_head_kv, const int head_dim,
+    const float scale, const int max_anc, const int m) {
+  gqa_attention_tree_fused_ctrl_body<KvLoadF32, TreeCtrlAddr<true, true>>(
+      q, k, v, out, anc, n_anc, row_ctrl, table, n_head, n_head_kv, head_dim,
+      scale, max_anc, m);
+}
+
+__global__ void gqa_attention_tree_fused_slots_paged_h(
+    const float* __restrict__ q, const __half* __restrict__ k,
+    const __half* __restrict__ v, float* __restrict__ out,
+    const int* __restrict__ anc, const int* __restrict__ n_anc,
+    const int* __restrict__ row_ctrl, const int* __restrict__ table,
+    const int n_head, const int n_head_kv, const int head_dim,
+    const float scale, const int max_anc, const int m) {
+  gqa_attention_tree_fused_ctrl_body<KvLoadF16, TreeCtrlAddr<true, true>>(
+      q, k, v, out, anc, n_anc, row_ctrl, table, n_head, n_head_kv, head_dim,
+      scale, max_anc, m);
 }
 
 

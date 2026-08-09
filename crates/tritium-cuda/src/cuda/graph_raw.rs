@@ -338,6 +338,14 @@ pub(super) struct BatchRawKernels {
     pub(super) kv_append_tree_slots_paged: sys::CUfunction,
     pub(super) attn_tree_scores_slots_paged: sys::CUfunction,
     pub(super) attn_tree_reduce_slots_paged: sys::CUfunction,
+    /// RFC 0001 fast-tier fused twins over the paged/slots routes (lever 6):
+    /// the same one-pass online-softmax body as `attn_tree_fused_ctrl`,
+    /// instantiated per `TreeCtrlAddr` axis. Resolved unconditionally,
+    /// dtype-selected `_g`/`_h`; captured only under
+    /// `TRITIUM_KERNEL_TIER=fast` (tree.rs, the one selection point).
+    pub(super) attn_tree_fused_ctrl_paged: sys::CUfunction,
+    pub(super) attn_tree_fused_slots: sys::CUfunction,
+    pub(super) attn_tree_fused_slots_paged: sys::CUfunction,
 }
 
 // SAFETY: same contract as `RawGraphKernels` — the raw handles are process-valid device
@@ -528,6 +536,30 @@ impl BatchRawKernels {
                     KERNEL_NAME_ATTN_TREE_REDUCE_SLOTS_PAGED_H
                 } else {
                     KERNEL_NAME_ATTN_TREE_REDUCE_SLOTS_PAGED
+                },
+            )?,
+            attn_tree_fused_ctrl_paged: get(
+                dm,
+                if f16 {
+                    KERNEL_NAME_ATTN_TREE_FUSED_CTRL_PAGED_H
+                } else {
+                    KERNEL_NAME_ATTN_TREE_FUSED_CTRL_PAGED
+                },
+            )?,
+            attn_tree_fused_slots: get(
+                dm,
+                if f16 {
+                    KERNEL_NAME_ATTN_TREE_FUSED_SLOTS_H
+                } else {
+                    KERNEL_NAME_ATTN_TREE_FUSED_SLOTS
+                },
+            )?,
+            attn_tree_fused_slots_paged: get(
+                dm,
+                if f16 {
+                    KERNEL_NAME_ATTN_TREE_FUSED_SLOTS_PAGED_H
+                } else {
+                    KERNEL_NAME_ATTN_TREE_FUSED_SLOTS_PAGED
                 },
             )?,
             modules: vec![dm, am],

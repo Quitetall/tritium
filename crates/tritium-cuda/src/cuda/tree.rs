@@ -1102,6 +1102,34 @@ impl CudaDecodeModel {
         Ok(Some((host, stride, self.q_width)))
     }
 
+    /// [`Self::tree_attn_dump`] for the BATCH routes (lever 6): the paged and
+    /// slots tree verifies run on the [`BatchKv`]'s OWN `TreeScratch` (same
+    /// env-gated `d_attn_dump` allocation, same captured per-layer dtod
+    /// nodes), so the Amendment 1 in-situ drift bar can be asserted on those
+    /// routes too. Same contract as the single-seq accessor: graph route
+    /// only, `None` unless the batch's scratch was allocated under
+    /// `TRITIUM_TREE_ATTN_DUMP=1`.
+    pub fn tree_attn_dump_batch(
+        &self,
+        batch: &BatchKv,
+    ) -> Result<Option<(Vec<f32>, usize, usize)>, BackendError> {
+        let Some(ts) = batch.tree_scratch.as_ref() else {
+            return Ok(None);
+        };
+        let Some(dump) = ts.d_attn_dump.as_ref() else {
+            return Ok(None);
+        };
+        self.cap_stream
+            .synchronize()
+            .map_err(|e| driver_err("tree attn dump (batch) cap sync", &e))?;
+        let stride = ts.m_cap * self.q_width;
+        let mut host = vec![0.0f32; self.layers.len() * stride];
+        self.stream
+            .memcpy_dtoh(dump, &mut host)
+            .map_err(|e| driver_err("tree attn dump (batch) dtoh", &e))?;
+        Ok(Some((host, stride, self.q_width)))
+    }
+
     /// **I2/I3 batch-slot greedy tree verify** (L3 batch-slot spec decode):
     /// the SAME verify as [`Self::tree_verify_greedy`], run against batch
     /// slot `row` of a [`BatchKv`] instead of the single-sequence cache — the
@@ -1677,20 +1705,24 @@ impl CudaDecodeModel {
                 raw_launch(f_kv, grid, (256, 1, 1), 0, cs, &mut params)
             }
         };
-        // RFC 0001 capture-time tier selection (ADR 0036 L3b): under
-        // TRITIUM_KERNEL_TIER=fast the dense single-slot route captures the
-        // fused one-pass online-softmax kernel in place of the exact
-        // scores+reduce pair. Scope guards: the paged/slots routes and shapes
-        // outside the fused contract (head_dim % 4 != 0 or > TREE_FUSED_HDMAX)
-        // keep the exact pair — numerically a superset of the fast bounds.
-        // The graph bakes whichever symbol is picked here (a process serves
-        // one tier; no per-replay switching).
-        let fused: Option<sys::CUfunction> = (!slots
-            && !paged
-            && self.kernel_tier == KernelTier::Fast
+        // RFC 0001 capture-time tier selection (ADR 0036 L3b; lever 6 extends
+        // it to every tree route): under TRITIUM_KERNEL_TIER=fast the capture
+        // takes the fused one-pass online-softmax kernel — the route-matched
+        // TreeCtrlAddr instantiation of ONE body — in place of the exact
+        // scores+reduce pair. Scope guard: shapes outside the fused contract
+        // (head_dim % 4 != 0 or > TREE_FUSED_HDMAX) keep the exact pair —
+        // numerically a superset of the fast bounds. The graph bakes
+        // whichever symbol is picked here (a process serves one tier; no
+        // per-replay switching).
+        let fused: Option<sys::CUfunction> = (self.kernel_tier == KernelTier::Fast
             && head_dim.is_multiple_of(4)
             && head_dim <= TREE_FUSED_HDMAX)
-            .then_some(raw.attn_tree_fused_ctrl);
+            .then_some(match (slots, paged) {
+                (false, false) => raw.attn_tree_fused_ctrl,
+                (false, true) => raw.attn_tree_fused_ctrl_paged,
+                (true, false) => raw.attn_tree_fused_slots,
+                (true, true) => raw.attn_tree_fused_slots_paged,
+            });
         // RFC 0001 Amendment 1 seam (TRITIUM_TREE_ATTN_DUMP, baked at scratch
         // alloc): snapshot d_attn per layer so the in-situ kernel-output
         // drift gate can compare the fast tier's fused attention against the
@@ -1701,11 +1733,32 @@ impl CudaDecodeModel {
         let dump_stride = ts.m_cap * q_width;
         let attn = |kv_k: sys::CUdeviceptr, kv_v: sys::CUdeviceptr| {
             if let Some(ff) = fused {
-                // SAFETY: matches `gqa_attention_tree_fused_ctrl_{g,h}(q, k, v,
-                // out, anc, n_anc, tree_ctrl, n_head, n_head_kv, head_dim,
-                // scale, max_anc, m)`; block = TREE_FUSED_THREADS per the
-                // kernel contract, one block per (row, head), no dynamic smem.
+                // SAFETY: matches the fused family's signature — dense/slots
+                // `(q, k, v, out, anc, n_anc, ctrl, n_head, n_head_kv,
+                // head_dim, scale, max_anc, m)`, paged variants carry `table`
+                // right after `ctrl` (the pair kernels' convention); block =
+                // TREE_FUSED_THREADS per the kernel contract, one block per
+                // (row, head), no dynamic smem.
                 let grid = ((mb * n_head) as u32, 1, 1);
+                if paged {
+                    let mut params = [
+                        pp(&d_q),
+                        pp(&kv_k),
+                        pp(&kv_v),
+                        pp(&d_attn),
+                        pp(&d_anc),
+                        pp(&d_nanc),
+                        pp(&d_ctrl),
+                        pp(&d_table),
+                        pp(&nh_i),
+                        pp(&nhkv_i),
+                        pp(&hd_i),
+                        pp(&scale),
+                        pp(&ma_i),
+                        pp(&mb_i),
+                    ];
+                    return raw_launch(ff, grid, (TREE_FUSED_THREADS, 1, 1), 0, cs, &mut params);
+                }
                 let mut params = [
                     pp(&d_q),
                     pp(&kv_k),
