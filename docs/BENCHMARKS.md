@@ -55,7 +55,189 @@ box they are a distance from a named reference point, **not** a claim about the 
 
 ## Ledger
 
-### 2026-08-08 — T8 publishing sweep @ dde0c61: decode/pp512, lossless spec decode, batched multi-slot, TQ1 capacity
+### 2026-08-08 final sweep @ 07b9d6a — the quiet-box ledger: absolutes + the adopted opt-in tiers
+
+**Box state: QUIET.** RTX 4090, driver 610.57.04, CUDA 13.3. Co-resident the whole
+sweep: desktop graphics only, 1.5–1.75 GiB total (kwin ~161–184 MiB, Xwayland,
+plasmashell, firefox ~317 MiB, ghostty, krunner, one codex-desktop electron
+gpu-process 192 MiB) — **zero compute jobs**, re-verified per section
+(`nvidia-smi --query-compute-apps`). Binary provenance: all Tritium binaries built
+from a clean `git archive 07b9d6a` export (`cargo build --release -p tritium-cli
+-p tritium-serve --features tritium-cli/cuda,tritium-serve/cuda`); the compare-JSON
+`git_commit` field is empty because the export has no `.git` — the sha is pinned
+here. JSON/log artifacts: session scratchpad `final-*.{json,log,txt}` (outside the
+repo; receipts dirs are gitignored).
+
+**Engine state — the adopted opt-in levers (each measured below, scope stated):**
+
+| lever | default | opt-in | measured win (this sweep) | scope |
+|---|---|---|---|---|
+| kernel tier (RFC 0001 + Amdt 1, L3b) | `exact` | `TRITIUM_KERNEL_TIER=fast` | spec verify wall −18% @ short ctx, **−61% (2.57×) @ ctx≈3.5–4k**; NOT token-identical to exact greedy | solo spec verify only; paged/slots stay exact; exact stays default+CI |
+| KV dtype | `f32` | `TRITIUM_KV=f16` | plain decode **+46.7% @ ctx≈3.8–4k**; batched N=4 spec **+16.2%** | decode KV read path; lossless claim per L6 gates |
+| LM head (ADR 0036 L2) | `f16` | `TRITIUM_LM_HEAD=i8` | plain decode +3–6% (noisy; see §2a) | UNDRAFTED decode only (spec path refuted in round 26) |
+| weights packing | `tq2` | `TRITIUM_WEIGHTS=tq1` | **−628…−640 MiB** serve peak, token-parity; costs ~24% batched-spec throughput | capacity rung, not a speed rung |
+
+#### 1. Plain decode + pp512 + ttft (the ledger command, all defaults)
+
+Command: `tritium report compare --model ggml-model-i2_s.gguf --tokens prompt512.json
+--backend cuda --prompt-len 512 --decode-steps 256 --warmup 16 --reps 3 --runs 5
+--format json` @ 07b9d6a clean build. Tier `exact`, head `f16`, KV `f32` (all
+defaults). Three back-to-back bundles:
+
+| bundle | decode tok/s (3 reps) | median | pp512 tok/s | ttft p50 / p95 ms |
+|---|---|---:|---:|---|
+| run 1 | 206.6 / 211.0 / 211.8 | **211.0** | **22,714.7** | 22.55 / 23.55 |
+| run 2 | 194.9 / 195.5 / 172.0 | 194.9 | 20,264.4 | 24.50 / 28.22 |
+| run 3 | 176.0 / 172.0 / 177.6 | 176.0 | 19,885.3 | 25.38 / 26.61 |
+
+The monotone decline across bundles on an idle 34 °C box is the documented
+sustained-clock settle (07-18 entry), not contention; the four baseline visits
+inside §2a's ABBA pairs landed 189–214. **Honest quiet-box absolutes @ HEAD:
+decode 176–214 tok/s (bundle medians), pp512 19.9–23.0k tok/s, ttft p50
+22.6–25.4 ms.** pp512 is 1.6–1.8× the same-session llama.cpp Q4_K_M line (§5).
+
+#### 2a. `TRITIUM_LM_HEAD=i8` — plain decode, ABBA×2
+
+Same ledger command ± the env var, order A B B A / B A A B (8 bundles):
+
+| config | bundle medians tok/s | mean |
+|---|---|---:|
+| baseline f16 head | 189.1 / 211.0 / 213.8 / 207.0 | 205.2 |
+| `TRITIUM_LM_HEAD=i8` | 219.2 / 230.4 / 212.3 / 203.9 | 216.4 |
+
+**+5.5% mean / +3.2% median-of-medians**; pairwise spread −1.5%…+15.9%. Direction
+confirms round 26's same-session +7.75%, but at this effect size the box's clock
+variance dominates a 4-pair ABBA — recorded as +3–6%, not a sharper number.
+pp512 unchanged within noise (i8 19.8–23.5k vs base 22.1–23.0k).
+
+#### 2b. `TRITIUM_KV=f16` — plain decode at long ctx, ABBA
+
+Ledger command with a real 3,900-token wt103 prompt file, `--prompt-len 3776`
+(prompt 3776 + 16 warmup + 256 steps = ctx 4048, the 4096 cap; 3900 overflowed —
+disclosed), order A B B A:
+
+| config | decode medians tok/s (2 visits) | pp3776 tok/s | gain |
+|---|---|---:|---:|
+| KV f32 (default) | 75.6 / 70.8 | 7,453 / 7,068 | — |
+| `TRITIUM_KV=f16` | **108.3 / 106.5** | 7,135 / 7,110 | **+46.7%** |
+
+The L6 +47% long-ctx claim reproduces exactly on the quiet box. Reps within each
+visit were tight (±1.5%); prefill unchanged within noise.
+
+#### 2c. `TRITIUM_KERNEL_TIER=fast` — solo spec decode (short ctx)
+
+Harness: measure_tau.py (12 wt103 96-token prefixes, 256 greedy each) against two
+clean-HEAD `tritium-serve` instances (spec 8124 w/ `--draft-model
+drafter-8L768-s3.gguf`, plain 8125; both `--backend cuda --raw-tokens --eos
+4294967295`); per leg the cold pass is discarded, warm recorded; leg order
+E F C C F E (E=exact spec, F=fast spec, C=fast+f16 spec; the plain reference
+server is always default/exact). ctx spans 96→352 per prompt — note this is a
+SHORTER shape than round 27's ctx≈512 point.
+
+| spec config (verify tier / KV) | identical to exact greedy | tok/verify (tau) | spec wall (2 legs) | e2e vs plain (exact) |
+|---|---|---:|---|---:|
+| exact / f32 | **12/12 + 12/12 (lossless)** | 3.575 | 10.29 s / 9.56 s | 1.151× / 1.203× |
+| fast / f32 | 3/12 + 3/12 | 4.183 | 7.74 s / 8.56 s | **1.511× / 1.446×** |
+| fast / f16 | 4/12 + 4/12 | 3.726 | 7.69 s / 7.80 s | 1.488× / 1.465× |
+
+Fast-vs-exact spec wall at this shape: **+21.8%** (19.85 s vs 16.30 s summed) —
+well under round 27's +57–60% at ctx≈512; shape and box differ, the ctx≈3.5k
+point below is where L3b's claim lands. **Losslessness, honestly: the exact tier
+is spec-lossless (24/24 prompts token-identical to plain greedy, deterministic
+across legs). The fast tier is NOT token-identical to exact greedy (3/12,
+deterministic) — RFC 0001 drift-tier semantics: ~1e-6 kernel drift flips argmax
+at near-ties over 256-token horizons.** Fast tau 4.183 vs exact 3.575 is measured
+on the divergent continuations, not a like-for-like acceptance gain. Single-stream
+throughput at this shape: plain ~260–270 tok/s (96-tok prompts — shorter-ctx than
+§1's 512), exact spec ~299–321, **fast+f16 spec ~394–399 tok/s**.
+
+#### 2c-long / 4. Best-composed single-user config at long ctx
+
+Same leg protocol, 6 wt103 prefixes of 3,520 tokens (denser doc walk `i%191==7`;
+the standard walk has only 3 long-enough docs), 256 greedy each → ctx 3520→3776.
+Order E C C E:
+
+| spec config | identical | tau | spec wall | e2e vs plain (exact/f32) |
+|---|---|---:|---|---:|
+| exact / f32 | 6/6 + 6/6 | 1.228 | 56.73 s / 59.43 s | **0.373× / 0.369×** |
+| fast / f16 | 0/6 + 0/6 | 1.354 | 23.65 s / 21.59 s | 0.979× / 0.974× |
+
+Two honest findings. (1) **The fast tier's long-ctx verify win is real: the fast
+spec wall is 2.57× faster than exact (45.24 s vs 116.16 s summed, −61%)** — the
+round-27 +188–240% e2e claim direction confirmed at its ctx point (fast-vs-exact
+e2e here +157–175%). (2) **Solo spec is NOT a long-ctx win with this drafter:
+tau collapses to 1.23–1.35, exact spec is a 2.7× slowdown vs plain, fast+f16
+only recovers to parity (0.97×).** The best single-user long-ctx config today is
+therefore **plain decode + `TRITIUM_KV=f16` (+ i8 head): 106–108 tok/s vs the
+70–76 plain-f32 baseline** — not spec. At short/standard ctx the best config IS
+fast+f16 solo spec (≈1.47–1.51× plain, §2c).
+
+#### 3. Batched multi-slot spec decode — the quiet-box headline recapture
+
+Harness: measure_multi.py (Round-25 protocol: server `--batch-slots 4`, shared
+draft k — the shipped default incl. the 9930062 bucket snap — N concurrent
+192-token wt103 streams, drafted-vs-undrafted ABBA×2 at server-launch level,
+5 samples/visit → n=20/config, p50). Clean-HEAD serve, tier exact, KV f32:
+
+| N streams | drafted p50 agg tok/s | undrafted p50 agg tok/s | speedup | tok/verify p50 |
+|---|---:|---:|---:|---:|
+| 2 | **309.7** (min 254.9, max 433.4) | 164.3 | **1.88×** | 2.08 |
+| 4 | **496.4** (min 428.5, max 526.6) | 307.5 | **1.61×** | 2.01 |
+
+These are the quiet-box numbers owed since Round 25. Sample spread is ~7× tighter
+than the contended T8 rows (min/max within ±15% vs 149–506). Vs Round 25's
+lighter-box 2.44×/1.52×: N=2 lands lower (the undrafted baseline is much faster
+on a quiet box), N=4 lands higher — the drafted-vs-undrafted ordering is stable
+and the N=4 aggregate ~496 tok/s is the serve headline.
+
+N=4 + `TRITIUM_KV=f16` (same harness, drafted-only ABBA×2 f32-vs-f16, n=20):
+**544.7 vs 468.8 p50 → +16.2%** — the L6-stage-2 +12–14% claim holds (slightly
+exceeded) on the quiet box.
+
+#### 5. Competitor line (documented invocation, same session)
+
+`llama-bench -m /home/brianklam/models/qwen3.5-4b-gguf/Qwen3.5-4B-Q4_K_M.gguf
+-p 512 -n 128 -ngl 99`, fork build 41a666dac (8943) — same binary as the 07-11
+reference:
+
+| engine | model | pp512 tok/s | tg128 tok/s |
+|---|---|---:|---:|
+| llama.cpp CUDA | Qwen3.5-4B Q4_K_M (2.54 GiB) | 12,765.52 ± 1,290.62 | 204.19 ± 3.23 |
+
+Stable vs 07-11 (12,281 ± 828 / 200.1) and the T8 rerun (12,608 / 199.8).
+Different models (2.4B ternary vs 4.2B Q4) — bandwidth normalization is the
+comparison basis. **Still owed:** the upstream-master Q2_0 quiet-box rerun from
+2026-07-30 — the upstream build (1212) and the Q2_0 gguf remain absent on this
+box; not improvised.
+
+#### 6. TQ1 capacity rung (batched-spec serve VRAM) — quick quiet-box recapture
+
+Harness: measure_tq1.py (batched-spec serve `--batch-slots 4` + drafter,
+`TRITIUM_WEIGHTS=tq2/tq1/tq1/tq2` ABBA at launch, peak per-process VRAM at 0.5 s
+during a warm 4-stream sample, then a 256-token single-stream greedy parity
+completion per visit):
+
+| weights | peak serve VRAM (2 visits) | 4-stream agg tok/s | parity |
+|---|---:|---:|---|
+| tq2 (default) | 7,592 / 7,610 MiB | 504.0 / 501.2 | reference |
+| tq1 | **6,964 / 6,970 MiB (−628…−640 MiB)** | 378.9 / 396.4 | **token-identical, all visits** |
+
+The capacity rung reproduces quiet (T8's −672 was contended-peak). NEW fact the
+quiet box finally settles (round 16's open item): **tq1 costs ~24% batched-spec
+throughput** — it is a capacity/VRAM rung, not a free lever.
+
+#### Caveats
+
+- Decode absolutes move ~±10% with the box's sustained-clock state even quiet;
+  every relative claim above is same-session ABBA.
+- §2c/§2c-long single-stream tok/s are 96-tok- and 3,520-tok-prompt shapes, not
+  the §1 512-prompt ledger shape — don't cross-compare the absolutes.
+- The fast tier's non-identity to exact greedy (3/12 short, 0/6 long) is the
+  documented RFC 0001 trade; exact remains the default and the lossless tier.
+- Long-ctx spec numbers are drafter-limited (tau ≈ 1.3); a long-ctx-competent
+  drafter would move §2c-long, not the kernels.
+
+
 
 **Box state (disclosed up front): NOT quiet.** A parallel session's
 `salt_distill_heldout` test (Tritium repo, PID 2609694) ran on-GPU for the whole sweep,
