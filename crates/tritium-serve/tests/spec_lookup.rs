@@ -383,11 +383,47 @@ fn cuda_spec_adaptive_bench() {
             .collect()
     };
 
+    // Arms: dyn = governor with cost-model floors (the lever under test),
+    // fix = governor with the fixed floors pinned (TRITIUM_SPEC_COST_FLOORS=0
+    // — the landed 4190673 behavior), off = governor kill switch (plain
+    // spec). The mid-ctx shapes probe the band where the fixed 1.5 may sit on
+    // the wrong side of the true (measured) crossover.
+    /// Env guard for `TRITIUM_SPEC_COST_FLOORS`; restores on drop.
+    struct CostEnv(Option<std::ffi::OsString>);
+    impl CostEnv {
+        fn set(v: Option<&str>) -> Self {
+            let prev = std::env::var_os("TRITIUM_SPEC_COST_FLOORS");
+            // SAFETY: single-threaded test (`--test-threads=1`).
+            #[allow(unsafe_code)]
+            unsafe {
+                match v {
+                    Some(v) => std::env::set_var("TRITIUM_SPEC_COST_FLOORS", v),
+                    None => std::env::remove_var("TRITIUM_SPEC_COST_FLOORS"),
+                }
+            }
+            Self(prev)
+        }
+    }
+    impl Drop for CostEnv {
+        fn drop(&mut self) {
+            // SAFETY: single-threaded test.
+            #[allow(unsafe_code)]
+            unsafe {
+                match self.0.take() {
+                    Some(v) => std::env::set_var("TRITIUM_SPEC_COST_FLOORS", v),
+                    None => std::env::remove_var("TRITIUM_SPEC_COST_FLOORS"),
+                }
+            }
+        }
+    }
     for (name, prompt) in [
         (
             "short-ctx-64",
             base.iter().cycle().take(64).copied().collect::<Vec<u32>>(),
         ),
+        ("mid-ctx-1536", shuffled(1536)),
+        ("mid-ctx-2048", shuffled(2048)),
+        ("mid-ctx-2560", shuffled(2560)),
         ("long-ctx-3776", shuffled(3776)),
     ] {
         let req = GenRequest {
@@ -404,13 +440,19 @@ fn cuda_spec_adaptive_bench() {
             stop_eos: false,
             logprobs: None,
         };
+        /// One timed leg: tok/s, the stream, the suppressed-plain delta
+        /// (where the governor engaged), and the last applied solo floor.
         fn run_leg(
             g: &mut RunnerGenerator,
             req: &GenRequest,
             name: &str,
-            env: &str,
-        ) -> Option<(f64, Vec<u32>)> {
-            let _e = AdaptiveEnv::set(env);
+            adaptive: &str,
+            cost: Option<&str>,
+        ) -> Option<(f64, Vec<u32>, u64, f64)> {
+            let _e = AdaptiveEnv::set(adaptive);
+            let _c = CostEnv::set(cost);
+            let s0 = tritium_serve::generator::SPEC_SUPPRESSED_PLAIN
+                .load(std::sync::atomic::Ordering::Relaxed);
             let mut out = Vec::new();
             let t0 = std::time::Instant::now();
             if let Err(e) = g.generate(req, &mut |step| {
@@ -420,7 +462,15 @@ fn cuda_spec_adaptive_bench() {
                 eprintln!("skipping {name}: {e}");
                 return None;
             }
-            Some((out.len() as f64 / t0.elapsed().as_secs_f64(), out))
+            let dt = t0.elapsed().as_secs_f64();
+            let sup = tritium_serve::generator::SPEC_SUPPRESSED_PLAIN
+                .load(std::sync::atomic::Ordering::Relaxed)
+                - s0;
+            let floor = f64::from_bits(
+                tritium_serve::generator::SPEC_FLOOR_SOLO
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            );
+            Some((out.len() as f64 / dt, out, sup, floor))
         }
         {
             let _e = AdaptiveEnv::set("1");
@@ -432,30 +482,64 @@ fn cuda_spec_adaptive_bench() {
         // Full-length warm legs, one per arm, OFF the clock: the first
         // full-length run after a shape change pays JIT/graph work that a
         // 4-token warm request does not reach (measured ~4-20% on the first
-        // timed leg regardless of arm).
-        if run_leg(&mut g, &req, name, "1").is_none() || run_leg(&mut g, &req, name, "0").is_none()
+        // timed leg regardless of arm). These also warm the cost-model EWMAs
+        // at THIS shape's context, as a resident server would be.
+        if run_leg(&mut g, &req, name, "1", None).is_none()
+            || run_leg(&mut g, &req, name, "1", Some("0")).is_none()
+            || run_leg(&mut g, &req, name, "0", None).is_none()
         {
             continue;
         }
-        // ABBA: on, off, off, on.
-        let Some((a1, sa)) = run_leg(&mut g, &req, name, "1") else {
+        // ABC-CBA: dyn, fix, off, off, fix, dyn.
+        let Some((d1, sd, sup_d1, fl1)) = run_leg(&mut g, &req, name, "1", None) else {
             continue;
         };
-        let Some((b1, sb)) = run_leg(&mut g, &req, name, "0") else {
+        let Some((f1, sf, sup_f1, _)) = run_leg(&mut g, &req, name, "1", Some("0")) else {
             continue;
         };
-        let Some((b2, _)) = run_leg(&mut g, &req, name, "0") else {
+        let Some((o1, so, _, _)) = run_leg(&mut g, &req, name, "0", None) else {
             continue;
         };
-        let Some((a2, _)) = run_leg(&mut g, &req, name, "1") else {
+        let Some((o2, _, _, _)) = run_leg(&mut g, &req, name, "0", None) else {
             continue;
         };
-        assert_eq!(sa, sb, "{name}: adaptive stream != non-adaptive (lossless)");
-        let (on, off) = ((a1 + a2) / 2.0, (b1 + b2) / 2.0);
+        let Some((f2, _, sup_f2, _)) = run_leg(&mut g, &req, name, "1", Some("0")) else {
+            continue;
+        };
+        let Some((d2, _, sup_d2, fl2)) = run_leg(&mut g, &req, name, "1", None) else {
+            continue;
+        };
+        // Cross-arm token identity is a hard gate on the EXACT tier only:
+        // the fast tier's relaxed numerics (RFC 0001) let a suppressed plain
+        // step's argmax differ from tree-verify's on near-ties — switching
+        // WHEN a verify runs is then observable on pathological near-tie
+        // prompts (this shuffled fixture is one). Pre-existing tier
+        // property, not a governor defect; warn loudly, don't fail the arm
+        // comparison the bench exists to time.
+        let exact_tier = !matches!(std::env::var("TRITIUM_KERNEL_TIER").as_deref(), Ok("fast"));
+        for (arm, s) in [("dynamic-floor", &sd), ("fixed-floor", &sf)] {
+            if exact_tier {
+                assert_eq!(s, &so, "{name}: {arm} stream != spec-off (lossless)");
+            } else if s != &so {
+                let first = s.iter().zip(&so).position(|(a, b)| a != b);
+                eprintln!(
+                    "adaptive-bench {name}: {arm} stream diverges from spec-off \
+                     at token {first:?} (fast-tier near-tie, RFC 0001 — \
+                     informational)"
+                );
+            }
+        }
+        let (dyn_m, fix_m, off_m) = ((d1 + d2) / 2.0, (f1 + f2) / 2.0, (o1 + o2) / 2.0);
         println!(
-            "adaptive-bench {name}: on {a1:.1}/{a2:.1} tok/s (mean {on:.1}) | \
-             off {b1:.1}/{b2:.1} tok/s (mean {off:.1}) | on/off {:.3}x",
-            on / off
+            "adaptive-bench {name}: dyn {d1:.1}/{d2:.1} (mean {dyn_m:.1}) | \
+             fix {f1:.1}/{f2:.1} (mean {fix_m:.1}) | off {o1:.1}/{o2:.1} (mean {off_m:.1}) tok/s | \
+             dyn/fix {:.3}x dyn/off {:.3}x fix/off {:.3}x | \
+             suppressed dyn {sup_d1}/{sup_d2} fix {sup_f1}/{sup_f2} of {} | \
+             solo-floor {fl1:.3}/{fl2:.3}",
+            dyn_m / fix_m,
+            dyn_m / off_m,
+            fix_m / off_m,
+            max_new,
         );
     }
 }

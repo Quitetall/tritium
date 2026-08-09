@@ -1391,7 +1391,18 @@ async fn metrics(State(st): State<AppState>) -> Response {
          tritium_spec_committed_total {}\n\
          # HELP tritium_spec_suppressed_plain_total Plain-decode tokens committed while adaptive spec suppression was engaged (TRITIUM_SPEC_ADAPTIVE).\n\
          # TYPE tritium_spec_suppressed_plain_total counter\n\
-         tritium_spec_suppressed_plain_total {}\n",
+         tritium_spec_suppressed_plain_total {}\n\
+         # HELP tritium_spec_floor Adaptive-spec breakeven floor last applied by the governor (the fixed fallback until the cost model warms).\n\
+         # TYPE tritium_spec_floor gauge\n\
+         tritium_spec_floor{{path=\"solo\"}} {}\n\
+         tritium_spec_floor{{path=\"batched\"}} {}\n\
+         # HELP tritium_spec_cost_us Measured spec-decode phase wall-cost EWMA in microseconds (0 until the first sample).\n\
+         # TYPE tritium_spec_cost_us gauge\n\
+         tritium_spec_cost_us{{phase=\"verify\"}} {}\n\
+         tritium_spec_cost_us{{phase=\"plain\"}} {}\n\
+         tritium_spec_cost_us{{phase=\"draft_token\"}} {}\n\
+         tritium_spec_cost_us{{phase=\"verify_round\"}} {}\n\
+         tritium_spec_cost_us{{phase=\"lockstep\"}} {}\n",
         st.metrics.chat_requests.load(Ordering::Relaxed),
         st.metrics.queue_rejections.load(Ordering::Relaxed),
         st.metrics.rate_rejections.load(Ordering::Relaxed),
@@ -1408,6 +1419,22 @@ async fn metrics(State(st): State<AppState>) -> Response {
         crate::generator::SPEC_VERIFIES.load(Ordering::Relaxed),
         crate::generator::SPEC_COMMITTED.load(Ordering::Relaxed),
         crate::generator::SPEC_SUPPRESSED_PLAIN.load(Ordering::Relaxed),
+        f64::from_bits(crate::generator::SPEC_FLOOR_SOLO.load(Ordering::Relaxed)),
+        f64::from_bits(crate::generator::SPEC_FLOOR_BATCHED.load(Ordering::Relaxed)),
+        crate::generator::SPEC_COST.verify.mean_us().unwrap_or(0.0),
+        crate::generator::SPEC_COST.plain.mean_us().unwrap_or(0.0),
+        crate::generator::SPEC_COST
+            .draft_tok
+            .mean_us()
+            .unwrap_or(0.0),
+        crate::generator::SPEC_COST
+            .verify_round
+            .mean_us()
+            .unwrap_or(0.0),
+        crate::generator::SPEC_COST
+            .lockstep
+            .mean_us()
+            .unwrap_or(0.0),
     );
     ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body).into_response()
 }

@@ -19,6 +19,189 @@ pub static SPEC_COMMITTED: AtomicU64 = AtomicU64::new(0);
 /// A nonzero value is the observable "spec is off right now" signal.
 pub static SPEC_SUPPRESSED_PLAIN: AtomicU64 = AtomicU64::new(0);
 
+/// Process-wide EWMA of one spec-decode phase's wall-clock cost in
+/// microseconds. Single-writer (the one decode worker thread) with `Relaxed`
+/// atomics — `/metrics` reads racily, and a torn mean/count pair only
+/// mis-reports a gauge by one sample. The timers are ~free: two
+/// `Instant::now()` around calls that already synchronize on the device
+/// (WALL time, no added syncs).
+#[derive(Debug)]
+pub struct Ewma {
+    /// Current mean as `f64` bits; meaningless until `n > 0`.
+    mean_bits: AtomicU64,
+    /// Samples folded so far (saturates the warmup check, never resets).
+    n: AtomicU64,
+}
+
+impl Ewma {
+    /// Decay: ~ the last dozen samples dominate — fast enough to track a
+    /// request's context growing (V and the drafter re-sync cost are
+    /// ctx-dependent), slow enough to ride out scheduler noise.
+    const ALPHA: f64 = 0.2;
+
+    const fn new() -> Self {
+        Self {
+            mean_bits: AtomicU64::new(0),
+            n: AtomicU64::new(0),
+        }
+    }
+
+    /// Fold one wall-clock sample (microseconds). Non-finite or negative
+    /// samples are dropped (defensive; `Instant` cannot produce them).
+    pub fn record(&self, us: f64) {
+        if !us.is_finite() || us < 0.0 {
+            return;
+        }
+        let n = self.n.load(Ordering::Relaxed);
+        let mean = if n == 0 {
+            us
+        } else {
+            Self::ALPHA * us
+                + (1.0 - Self::ALPHA) * f64::from_bits(self.mean_bits.load(Ordering::Relaxed))
+        };
+        self.mean_bits.store(mean.to_bits(), Ordering::Relaxed);
+        self.n.store(n.saturating_add(1), Ordering::Relaxed);
+    }
+
+    /// Current mean in microseconds; `None` until the first sample.
+    pub fn mean_us(&self) -> Option<f64> {
+        (self.n.load(Ordering::Relaxed) > 0)
+            .then(|| f64::from_bits(self.mean_bits.load(Ordering::Relaxed)))
+    }
+
+    /// Samples folded so far.
+    pub fn samples(&self) -> u64 {
+        self.n.load(Ordering::Relaxed)
+    }
+}
+
+impl Default for Ewma {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Measured ADR 0032 cost model for the adaptive spec governor: spec wins
+/// per committed token when `(V + k·d)/τ < P`, so the breakeven is
+/// `τ_floor = (V + k·d)/P` at the CURRENT draft length `k`. The governor
+/// derives its floors from these runtime EWMAs instead of the fixed
+/// constants once each required timer has [`Self::WARMUP`] samples —
+/// tier/rung awareness comes FREE via measurement (the fast tier's cheaper
+/// verify lowers V, and with it the floor, automatically; no per-tier
+/// tables).
+#[derive(Debug)]
+pub struct SpecCostModel {
+    /// V (solo): wall of one `tree_verify_greedy` call, µs.
+    pub verify: Ewma,
+    /// P (solo): wall of one plain M=1 step, µs.
+    pub plain: Ewma,
+    /// d (solo): drafter wall per DRAFTED token, µs — includes the
+    /// reconcile/re-sync share, which is the honest cost of drafting (a
+    /// long-ctx probe's drafter re-prefill lands here and correctly raises
+    /// the floor while re-syncs are expensive).
+    pub draft_tok: Ewma,
+    /// V_round (batched): wall of one grouped multi-slot verify, µs.
+    pub verify_round: Ewma,
+    /// P_lockstep (batched): wall of one lockstep `decode_batch_graph`
+    /// step, µs.
+    pub lockstep: Ewma,
+}
+
+impl SpecCostModel {
+    /// Samples required of EACH timer a floor depends on before the derived
+    /// floor replaces the fixed fallback — one noisy first sample must not
+    /// steer suppression.
+    pub const WARMUP: u64 = 8;
+    /// Derived-floor clamp (solo): never below 1.05 (spec must still beat
+    /// plain by SOMETHING — τ estimates carry model error) and never above
+    /// 3.0 (a floor that suppresses a τ≈3 drafter is a cost-model outlier,
+    /// not a decision we trust unmeasured).
+    pub const SOLO_CLAMP: (f64, f64) = (1.05, 3.0);
+    /// Derived-floor clamp (batched): the lower bound KEEPS the measured
+    /// 1.1 ride-along floor (suppressing τ≈1.4 slots cost 32% aggregate,
+    /// 2026-08-09) — the model can only RAISE the batched floor when round
+    /// verifies are measurably expensive relative to lockstep.
+    pub const BATCHED_CLAMP: (f64, f64) = (1.1, 3.0);
+
+    const fn new() -> Self {
+        Self {
+            verify: Ewma::new(),
+            plain: Ewma::new(),
+            draft_tok: Ewma::new(),
+            verify_round: Ewma::new(),
+            lockstep: Ewma::new(),
+        }
+    }
+
+    /// SOLO derived floor at draft length `k`: `(V + k·d)/P`, clamped to
+    /// [`Self::SOLO_CLAMP`]. `None` until V, P, and d each have
+    /// [`Self::WARMUP`] samples (callers fall back to the fixed
+    /// [`SpecGovernor::TAU_FLOOR_SOLO`]).
+    pub fn solo_floor(&self, k: usize) -> Option<f64> {
+        if self.verify.samples() < Self::WARMUP
+            || self.plain.samples() < Self::WARMUP
+            || self.draft_tok.samples() < Self::WARMUP
+        {
+            return None;
+        }
+        let (v, p, d) = (
+            self.verify.mean_us()?,
+            self.plain.mean_us()?,
+            self.draft_tok.mean_us()?,
+        );
+        if p <= 0.0 {
+            return None; // degenerate mean (all-zero wall samples): stay fixed
+        }
+        let (lo, hi) = Self::SOLO_CLAMP;
+        Some(((v + k as f64 * d) / p).clamp(lo, hi))
+    }
+
+    /// BATCHED derived floor for a pool of `n_live` slots — the v1 MARGINAL
+    /// approximation, deliberately simple and conservative:
+    ///
+    /// A spec round replaces one lockstep step (cost P_lockstep, commits 1
+    /// token per live slot), so the pool's marginal premium for running the
+    /// round is `V_round − P_lockstep` (the drafter step is shared and
+    /// ride-along cheap — excluded, which only makes the floor LOWER /
+    /// spec-friendlier; the trunk runs at the padded bucket size, so a
+    /// single slot's true marginal share is smaller still). Splitting that
+    /// premium evenly, a slot must beat its 1-token lockstep commit by its
+    /// share of the premium measured in plain steps:
+    ///
+    /// `floor = 1 + max(0, V_round − P_lockstep) / (n_live · P_lockstep)`
+    ///
+    /// clamped to [`Self::BATCHED_CLAMP`] — i.e. the fixed 1.1 floor holds
+    /// unless round verifies measurably exceed a lockstep step. `None`
+    /// until V_round and P_lockstep each have [`Self::WARMUP`] samples.
+    pub fn batched_floor(&self, n_live: usize) -> Option<f64> {
+        if self.verify_round.samples() < Self::WARMUP
+            || self.lockstep.samples() < Self::WARMUP
+            || n_live == 0
+        {
+            return None;
+        }
+        let (vr, p) = (self.verify_round.mean_us()?, self.lockstep.mean_us()?);
+        if p <= 0.0 {
+            return None;
+        }
+        let (lo, hi) = Self::BATCHED_CLAMP;
+        Some((1.0 + (vr - p).max(0.0) / (n_live as f64 * p)).clamp(lo, hi))
+    }
+}
+
+/// The process-wide cost model (the generator is runtime-free, so statics
+/// rather than plumbing — the [`SPEC_VERIFIES`] pattern). Read by
+/// `/metrics` (`tritium_spec_cost_us`, `tritium_spec_floor`).
+pub static SPEC_COST: SpecCostModel = SpecCostModel::new();
+
+/// Last floor the solo governor actually applied (f64 bits; gauge
+/// `tritium_spec_floor{path="solo"}`). Starts at the fixed fallback.
+pub static SPEC_FLOOR_SOLO: AtomicU64 = AtomicU64::new(SpecGovernor::TAU_FLOOR_SOLO.to_bits());
+/// Last floor the batched governor actually applied (f64 bits; gauge
+/// `tritium_spec_floor{path="batched"}`). Starts at the fixed fallback.
+pub static SPEC_FLOOR_BATCHED: AtomicU64 =
+    AtomicU64::new(SpecGovernor::TAU_FLOOR_BATCHED.to_bits());
+
 /// One generation request: a tokenized prompt + decode controls.
 #[derive(Debug, Clone)]
 pub struct GenRequest {
@@ -555,13 +738,15 @@ impl DraftPolicy {
 /// drafting resumes if acceptance returns (context shifts as generation
 /// proceeds).
 ///
-/// The floor is deliberately tier-agnostic, conservative, and CALLER-scoped
-/// (passed to [`Self::on_verify`]): in the solo loops one request pays the
-/// whole drafter step + verify, and τ < 1.5 is below every measured tier's
-/// solo breakeven (the fast+f16 tier — spec's best case — still lost at
-/// τ ≈ 1.2–1.4 in the sweep); in the multi-slot pool ride-along drafting is
-/// nearly free, so only a true collapse (τ < 1.1) drops a slot out. A
-/// cost-model-driven, per-tier threshold is the measured follow-up.
+/// The floor is CALLER-scoped (passed to [`Self::on_verify`]) and, since the
+/// cost-model lever, MEASURED: the governor derives it from the runtime's
+/// own phase timers ([`SpecCostModel`] — `τ_floor = (V + k·d)/P` at the
+/// current draft length in the solo loops; the marginal-round approximation
+/// in the multi-slot pool) via [`Self::floor_solo`]/[`Self::floor_batched`].
+/// The fixed constants remain as the warmup fallback (until every required
+/// timer has [`SpecCostModel::WARMUP`] samples), the clamp anchors, and the
+/// `force` pin. Tier/rung awareness comes free via measurement — the fast
+/// tier's cheaper verify lowers V and with it the floor automatically.
 ///
 /// Purely a cost policy: suppression changes WHEN the target runs a verify,
 /// never what is committed — plain steps emit the target's own argmax, which
@@ -570,6 +755,10 @@ impl DraftPolicy {
 /// `TRITIUM_SPEC_ADAPTIVE`: `1`/unset = on (default), `0` = off (kill
 /// switch), `force` = classify every verify as collapsed (deterministic
 /// forced-collapse gates; not a production setting).
+///
+/// `TRITIUM_SPEC_COST_FLOORS`: `1`/unset = derive the floors from the
+/// measured cost model once warm (default), `0` = pin the fixed floors
+/// (the cost-model kill switch and the fixed-vs-dynamic A/B arm).
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SpecGovernor {
@@ -590,10 +779,10 @@ pub(crate) enum SpecGovernor {
 
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 impl SpecGovernor {
-    /// SOLO breakeven floor: suppress while the policy's expected
-    /// committed-per-verify sits below this. In the solo loops one request
-    /// pays the whole drafter step + verify, and τ < 1.5 is below every
-    /// measured tier's solo breakeven (see the type docs).
+    /// SOLO fixed floor — the warmup fallback and the `force` pin (see
+    /// [`Self::floor_solo`]). τ < 1.5 was below every measured tier's solo
+    /// breakeven in the 2026-08-08 sweep; once [`SPEC_COST`] is warm the
+    /// measured `(V + k·d)/P` replaces it.
     pub(crate) const TAU_FLOOR_SOLO: f64 = 1.5;
     /// BATCHED (multi-slot) floor: ride-along drafting is nearly free there
     /// — the batched drafter step and the shared verify run for the pool
@@ -602,7 +791,8 @@ impl SpecGovernor {
     /// aggregate tok/s on the healthy fixture). A slot only drops out on
     /// TRUE collapse (drafting buys ~nothing); the real batched win is the
     /// whole-pool-suppressed Lockstep state, which skips the drafter and
-    /// verify entirely. A cost-model floor is the measured follow-up.
+    /// verify entirely. Once [`SPEC_COST`] is warm, [`Self::floor_batched`]
+    /// can only RAISE this (1.1 is the derived floor's lower clamp).
     pub(crate) const TAU_FLOOR_BATCHED: f64 = 1.1;
     /// Consecutive low-τ verifies before suppression engages — one noisy
     /// cycle (or the optimistic-start decay) must not kill a healthy drafter.
@@ -634,8 +824,22 @@ impl SpecGovernor {
 
     /// `TRITIUM_SPEC_ADAPTIVE`: unset/`1` = on, `0` = off, `force` = forced
     /// collapse (gates). Loud-reject on anything else (the TRITIUM_DRAFT_K
-    /// pattern).
+    /// pattern). Also validates `TRITIUM_SPEC_COST_FLOORS` (unset/`1` =
+    /// derived floors, `0` = pin the fixed floors) up front so a typo fails
+    /// the request loudly instead of silently steering the floors.
     pub(crate) fn from_env() -> Result<Self, GenError> {
+        match std::env::var("TRITIUM_SPEC_COST_FLOORS") {
+            Err(std::env::VarError::NotPresent) => {}
+            Ok(v) if v == "1" || v == "0" => {}
+            Ok(v) => {
+                return Err(GenError::Backend(format!(
+                    "TRITIUM_SPEC_COST_FLOORS={v:?} — use 1 (default) or 0"
+                )));
+            }
+            Err(e) => {
+                return Err(GenError::Backend(format!("TRITIUM_SPEC_COST_FLOORS: {e}")));
+            }
+        }
         match std::env::var("TRITIUM_SPEC_ADAPTIVE") {
             Err(std::env::VarError::NotPresent) => Ok(Self::new_on(false)),
             Ok(v) if v == "1" => Ok(Self::new_on(false)),
@@ -662,6 +866,50 @@ impl SpecGovernor {
             }
             Self::On { .. } => Some(0),
         }
+    }
+
+    /// The SOLO breakeven for the next [`Self::on_verify`], at the current
+    /// draft length `k` (the policy's `len()` — the k the next cycle would
+    /// actually pay for): the measured `(V + k·d)/P` from [`SPEC_COST`] once
+    /// warm, else the fixed [`Self::TAU_FLOOR_SOLO`]. `force` PINS the fixed
+    /// floor — the forced-collapse gates must stay deterministic, never a
+    /// function of this box's wall clock. Publishes the applied floor to
+    /// [`SPEC_FLOOR_SOLO`] (`tritium_spec_floor{path="solo"}`).
+    /// `TRITIUM_SPEC_COST_FLOORS=0` (validated by [`Self::from_env`]) pins
+    /// the fixed floors — the cost-model kill switch and the fixed-vs-dynamic
+    /// bench arm. Read per verify: sub-µs against a ms-scale verify.
+    fn cost_floors_enabled() -> bool {
+        std::env::var("TRITIUM_SPEC_COST_FLOORS").as_deref() != Ok("0")
+    }
+
+    pub(crate) fn floor_solo(&self, k: usize) -> f64 {
+        let dynamic = !matches!(self, Self::On { force: true, .. }) && Self::cost_floors_enabled();
+        let floor = if dynamic {
+            SPEC_COST.solo_floor(k).unwrap_or(Self::TAU_FLOOR_SOLO)
+        } else {
+            Self::TAU_FLOOR_SOLO
+        };
+        SPEC_FLOOR_SOLO.store(floor.to_bits(), Ordering::Relaxed);
+        floor
+    }
+
+    /// The BATCHED per-slot breakeven for the next [`Self::on_verify`]:
+    /// the measured marginal-round floor from [`SPEC_COST`] once warm (see
+    /// [`SpecCostModel::batched_floor`] — it can only RAISE the fixed 1.1),
+    /// else the fixed [`Self::TAU_FLOOR_BATCHED`]. `force` pins the fixed
+    /// floor (deterministic gates). Publishes the applied floor to
+    /// [`SPEC_FLOOR_BATCHED`] (`tritium_spec_floor{path="batched"}`).
+    pub(crate) fn floor_batched(&self, n_live: usize) -> f64 {
+        let dynamic = !matches!(self, Self::On { force: true, .. }) && Self::cost_floors_enabled();
+        let floor = if dynamic {
+            SPEC_COST
+                .batched_floor(n_live)
+                .unwrap_or(Self::TAU_FLOOR_BATCHED)
+        } else {
+            Self::TAU_FLOOR_BATCHED
+        };
+        SPEC_FLOOR_BATCHED.store(floor.to_bits(), Ordering::Relaxed);
+        floor
     }
 
     /// Fold `n` committed tokens from suppressed plain steps: advances the
@@ -1003,6 +1251,7 @@ impl RunnerGenerator {
                 None => policy.len(),
             };
             let max_draft = want.min(kv_room).min(budget.saturating_sub(1));
+            let t_d = std::time::Instant::now();
             let drafts = if max_draft == 0 {
                 Vec::new() // suppressed (or clamped): no drafter work at all
             } else if self.draft.is_some() {
@@ -1010,6 +1259,13 @@ impl RunnerGenerator {
             } else {
                 Self::lookup_draft(&history, max_draft)
             };
+            // Cost-model d: drafter wall per drafted token (empty results —
+            // bails, no match — carry no per-token denominator; skipped).
+            if !drafts.is_empty() {
+                SPEC_COST
+                    .draft_tok
+                    .record(t_d.elapsed().as_secs_f64() * 1e6 / drafts.len() as f64);
+            }
 
             if drafts.is_empty() {
                 // Plain M=1 graph step (faster than a 1-node tree).
@@ -1020,7 +1276,9 @@ impl RunnerGenerator {
                     .forward(&[pending], &[pos])
                     .map_err(|e| GenError::Backend(e.to_string()))?;
                 n_plain += 1;
-                t_plain += t0.elapsed();
+                let el = t0.elapsed();
+                t_plain += el;
+                SPEC_COST.plain.record(el.as_secs_f64() * 1e6); // cost-model P
                 governor.on_plain_commit(1); // no-op unless suppressed
                 pending = tritium_nn::sample_greedy(&logits)
                     .ok_or_else(|| GenError::Backend("sampler produced no token".into()))?;
@@ -1040,13 +1298,16 @@ impl RunnerGenerator {
             n_committed += committed.len();
             SPEC_VERIFIES.fetch_add(1, Ordering::Relaxed);
             SPEC_COMMITTED.fetch_add(committed.len() as u64, Ordering::Relaxed);
-            t_verify += t0.elapsed();
+            let el = t0.elapsed();
+            t_verify += el;
+            SPEC_COST.verify.record(el.as_secs_f64() * 1e6); // cost-model V
             // committed = accepted drafts + the final token, so accepted
             // drafts = committed.len() - 1 (saturating: an empty `committed`
             // violates tree_verify_greedy's contract and is caught below, but
             // a wrapped usize here would spin the EWMA fold first).
             policy.update(drafts.len(), committed.len().saturating_sub(1));
-            governor.on_verify(&policy, SpecGovernor::TAU_FLOOR_SOLO);
+            let floor = governor.floor_solo(policy.len());
+            governor.on_verify(&policy, floor);
             // committed[..L-1] extend history as fully-processed tokens; the
             // last committed becomes the new pending (top of the next loop
             // emits it and pushes it into history).
@@ -1667,6 +1928,124 @@ mod tests {
         assert_eq!(g.draft_cap(), Some(super::SpecGovernor::PROBE_K));
         g.on_verify(&healthy, super::SpecGovernor::TAU_FLOOR_SOLO); // probe verifies stay classified collapsed
         assert_eq!(g.draft_cap(), Some(0));
+    }
+
+    // ───────────── cost-model floors (SpecCostModel + Ewma) ─────────────
+
+    /// First sample seeds the mean; later samples fold with ALPHA and the
+    /// count rises monotonically toward the new level.
+    #[test]
+    fn ewma_first_sample_then_converges() {
+        let e = super::Ewma::new();
+        assert_eq!(e.mean_us(), None);
+        assert_eq!(e.samples(), 0);
+        e.record(100.0);
+        assert_eq!(e.mean_us(), Some(100.0));
+        assert_eq!(e.samples(), 1);
+        let mut prev = 100.0;
+        for _ in 0..20 {
+            e.record(200.0);
+            let m = e.mean_us().expect("recorded");
+            assert!(m > prev && m <= 200.0, "EWMA must move toward 200: {m}");
+            prev = m;
+        }
+        assert!(
+            prev > 190.0,
+            "20 folds at ALPHA=0.2 converge near 200: {prev}"
+        );
+        assert_eq!(e.samples(), 21);
+        // Defensive drops: non-finite/negative samples change nothing.
+        e.record(f64::NAN);
+        e.record(-1.0);
+        assert_eq!(e.samples(), 21);
+    }
+
+    /// Warm each Ewma of a LOCAL model with `n` identical samples.
+    fn warm(e: &super::Ewma, us: f64, n: u64) {
+        for _ in 0..n {
+            e.record(us);
+        }
+    }
+
+    /// The solo derivation `(V + k·d)/P` and its [1.05, 3.0] clamp.
+    #[test]
+    fn cost_model_solo_floor_math_and_clamps() {
+        let m = super::SpecCostModel::new();
+        warm(&m.verify, 4000.0, super::SpecCostModel::WARMUP);
+        warm(&m.plain, 4000.0, super::SpecCostModel::WARMUP);
+        warm(&m.draft_tok, 750.0, super::SpecCostModel::WARMUP);
+        // (4000 + 4·750)/4000 = 1.75 — the ADR 0032 numbers.
+        let f = m.solo_floor(4).expect("warm");
+        assert!((f - 1.75).abs() < 1e-12, "solo floor {f}");
+        // k dependence: a longer draft raises the breakeven.
+        assert!(m.solo_floor(8).expect("warm") > f);
+        // Upper clamp: an expensive verify cannot push the floor past 3.0.
+        let hi = super::SpecCostModel::new();
+        warm(&hi.verify, 100_000.0, super::SpecCostModel::WARMUP);
+        warm(&hi.plain, 1000.0, super::SpecCostModel::WARMUP);
+        warm(&hi.draft_tok, 10.0, super::SpecCostModel::WARMUP);
+        assert_eq!(hi.solo_floor(4), Some(3.0));
+        // Lower clamp: a nearly-free verify still demands τ > 1.05.
+        let lo = super::SpecCostModel::new();
+        warm(&lo.verify, 10.0, super::SpecCostModel::WARMUP);
+        warm(&lo.plain, 4000.0, super::SpecCostModel::WARMUP);
+        warm(&lo.draft_tok, 1.0, super::SpecCostModel::WARMUP);
+        assert_eq!(lo.solo_floor(1), Some(1.05));
+    }
+
+    /// The batched marginal derivation `1 + max(0, Vr−P)/(n·P)` and its
+    /// [1.1, 3.0] clamp — the model can only RAISE the 1.1 floor.
+    #[test]
+    fn cost_model_batched_floor_marginal() {
+        let m = super::SpecCostModel::new();
+        warm(&m.verify_round, 2600.0, super::SpecCostModel::WARMUP);
+        warm(&m.lockstep, 1000.0, super::SpecCostModel::WARMUP);
+        // 1 + 1600/(4·1000) = 1.4.
+        let f = m.batched_floor(4).expect("warm");
+        assert!((f - 1.4).abs() < 1e-12, "batched floor {f}");
+        // More live slots dilute the premium.
+        assert!(m.batched_floor(8).expect("warm") < f);
+        // A round no dearer than lockstep clamps to the fixed 1.1 —
+        // ride-along slots keep drafting exactly as before.
+        let cheap = super::SpecCostModel::new();
+        warm(&cheap.verify_round, 900.0, super::SpecCostModel::WARMUP);
+        warm(&cheap.lockstep, 1000.0, super::SpecCostModel::WARMUP);
+        assert_eq!(cheap.batched_floor(4), Some(1.1));
+        // Upper clamp.
+        let hi = super::SpecCostModel::new();
+        warm(&hi.verify_round, 1_000_000.0, super::SpecCostModel::WARMUP);
+        warm(&hi.lockstep, 1000.0, super::SpecCostModel::WARMUP);
+        assert_eq!(hi.batched_floor(1), Some(3.0));
+        // No live slots: no derivation.
+        assert_eq!(m.batched_floor(0), None);
+    }
+
+    /// Until EVERY required timer has WARMUP samples the derived floor is
+    /// None — callers fall back to the fixed constants.
+    #[test]
+    fn cost_model_warmup_falls_back() {
+        let m = super::SpecCostModel::new();
+        warm(&m.verify, 4000.0, super::SpecCostModel::WARMUP);
+        warm(&m.plain, 4000.0, super::SpecCostModel::WARMUP);
+        warm(&m.draft_tok, 750.0, super::SpecCostModel::WARMUP - 1);
+        assert_eq!(m.solo_floor(4), None, "one cold timer keeps the fallback");
+        m.draft_tok.record(750.0); // the WARMUP-th sample
+        assert!(m.solo_floor(4).is_some());
+        let b = super::SpecCostModel::new();
+        warm(&b.verify_round, 2000.0, super::SpecCostModel::WARMUP - 1);
+        warm(&b.lockstep, 1000.0, super::SpecCostModel::WARMUP);
+        assert_eq!(b.batched_floor(4), None);
+        b.verify_round.record(2000.0);
+        assert!(b.batched_floor(4).is_some());
+    }
+
+    /// `force` pins the FIXED floors regardless of the process-wide cost
+    /// model — the forced-collapse e2e gates stay deterministic on any box.
+    #[test]
+    fn governor_force_pins_fixed_floors() {
+        let g = super::SpecGovernor::new_on(true);
+        assert_eq!(g.floor_solo(40), super::SpecGovernor::TAU_FLOOR_SOLO);
+        assert_eq!(g.floor_batched(4), super::SpecGovernor::TAU_FLOOR_BATCHED);
     }
 
     /// Monte-Carlo gate for the deterministic-drafter accept rule: over many

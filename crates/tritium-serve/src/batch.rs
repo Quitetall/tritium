@@ -105,8 +105,8 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use tokio::sync::mpsc;
 
 use crate::generator::{
-    DraftPolicy, FinishReason, GenRequest, SPEC_COMMITTED, SPEC_VERIFIES, Sampling, SpecGovernor,
-    draft_chain_from_env, draft_greedy_tokens,
+    DraftPolicy, FinishReason, GenRequest, SPEC_COMMITTED, SPEC_COST, SPEC_VERIFIES, Sampling,
+    SpecGovernor, draft_chain_from_env, draft_greedy_tokens,
 };
 use crate::worker::{GenEvent, Job, PHASE_DECODE, PHASE_IDLE, PHASE_PREFILL};
 
@@ -445,6 +445,7 @@ fn spec_cycle(
         None => s.policy.len(),
     };
     let max_draft = want.min(kv_room).min(budget.saturating_sub(1));
+    let t_d = std::time::Instant::now();
     let drafts = if max_draft == 0 {
         Vec::new() // suppressed (or clamped): no drafter work at all
     } else {
@@ -458,6 +459,13 @@ fn spec_cycle(
             s.chain,
         )
     };
+    // Cost-model d: drafter wall per drafted token (empty results — bails —
+    // carry no per-token denominator; skipped).
+    if !drafts.is_empty() {
+        SPEC_COST
+            .draft_tok
+            .record(t_d.elapsed().as_secs_f64() * 1e6 / drafts.len() as f64);
+    }
 
     if drafts.is_empty() {
         // Plain M=1 graph step (faster than a 1-node tree).
@@ -467,7 +475,9 @@ fn spec_cycle(
             .forward(&[pending], &[pos])
             .map_err(|e| e.to_string())?;
         s.n_plain += 1;
-        s.t_plain += t0.elapsed();
+        let el = t0.elapsed();
+        s.t_plain += el;
+        SPEC_COST.plain.record(el.as_secs_f64() * 1e6); // cost-model P
         s.governor.on_plain_commit(1); // no-op unless suppressed
         let next = tritium_nn::sample_greedy(&logits).ok_or_else(|| "empty logits".to_owned())?;
         return Ok(emit_spec(s, next, eos));
@@ -485,13 +495,15 @@ fn spec_cycle(
     s.n_committed += committed.len();
     SPEC_VERIFIES.fetch_add(1, Ordering::Relaxed);
     SPEC_COMMITTED.fetch_add(committed.len() as u64, Ordering::Relaxed);
-    s.t_verify += t0.elapsed();
+    let el = t0.elapsed();
+    s.t_verify += el;
+    SPEC_COST.verify.record(el.as_secs_f64() * 1e6); // cost-model V
     // committed = accepted drafts + the final token, so accepted drafts =
     // committed.len() - 1 (saturating mirrors the single worker's guard).
     s.policy
         .update(drafts.len(), committed.len().saturating_sub(1));
-    s.governor
-        .on_verify(&s.policy, SpecGovernor::TAU_FLOOR_SOLO);
+    let floor = s.governor.floor_solo(s.policy.len());
+    s.governor.on_verify(&s.policy, floor);
     if committed.is_empty() {
         return Err("tree verify returned an empty commit".into());
     }
@@ -1031,8 +1043,16 @@ fn multi_spec_round(
             .iter()
             .map(|(_, t, p)| (t.as_slice(), p.as_slice()))
             .collect();
+        let t_v = std::time::Instant::now();
         let outs = match runner.tree_verify_greedy_slots(batch, &group_rows, &group_trees) {
-            Ok(o) => o,
+            Ok(o) => {
+                // Cost-model V_round: one grouped verify's wall (with the
+                // equal-split k clamp there is one group per round).
+                SPEC_COST
+                    .verify_round
+                    .record(t_v.elapsed().as_secs_f64() * 1e6);
+                o
+            }
             // An InvalidInput refusal is ATOMIC — every target and tree is
             // host-validated before any device work, so no listed slot
             // changed and the lockstep fallback is seamless and lossless.
@@ -1097,8 +1117,8 @@ fn multi_spec_round(
                 SPEC_VERIFIES.fetch_add(1, Ordering::Relaxed);
                 SPEC_COMMITTED.fetch_add(l as u64, Ordering::Relaxed);
                 slot.policy.update(offered, l - 1);
-                slot.governor
-                    .on_verify(&slot.policy, SpecGovernor::TAU_FLOOR_BATCHED);
+                let floor = slot.governor.floor_batched(n_live);
+                slot.governor.on_verify(&slot.policy, floor);
             } else {
                 // A suppressed slot's 1-node tree is its plain step: no
                 // acceptance signal to fold (and no spec-counter bump —
@@ -1836,9 +1856,15 @@ pub(crate) fn run_batched(
         for (row, slot) in pool.iter().enumerate() {
             let _ = batch.set_live(row, slot.is_some());
         }
+        let t_p = std::time::Instant::now();
         let step = runner.decode_batch_graph(&mut batch, &tokens);
         let all_logits = match step {
-            Ok(l) => l,
+            Ok(l) => {
+                // Cost-model P_lockstep: one lockstep step's wall (the
+                // batched floor's plain-step denominator).
+                SPEC_COST.lockstep.record(t_p.elapsed().as_secs_f64() * 1e6);
+                l
+            }
             Err(e) => {
                 for (row, slot) in pool.iter_mut().enumerate() {
                     if let Some(a) = slot.take() {
