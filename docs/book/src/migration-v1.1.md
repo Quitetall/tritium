@@ -1,7 +1,7 @@
 # Migrating from v1.0 to v1.1
 
 Tritium v1.1 is a platform expansion over the frozen v1.0 infrastructure
-milestone. The repository currently carries candidate version `1.1.0-rc.0`; it
+milestone. The repository currently carries candidate version `1.1.0-rc.1`; it
 is not yet an authorized or receipt-qualified public release. Use locally built
 candidate artifacts until the [compatibility matrix](../../compatibility.md)
 marks your exact target `qualified`.

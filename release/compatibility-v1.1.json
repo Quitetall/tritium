@@ -1,35 +1,120 @@
 {
   "schema": "tritium.compatibility.v1",
-  "release": "1.1.0-rc.0",
+  "release": "1.1.0-rc.1",
   "dimensions": {
     "platform": [
-      {"id": "linux-x86_64-cpu", "target": "Linux x86_64 CPU wheel", "status": "pending", "blocker": "Fresh no-compiler wheel receipt is not yet archived."},
-      {"id": "macos-arm64-cpu", "target": "macOS arm64 CPU wheel", "status": "pending", "blocker": "Fresh no-compiler wheel receipt is not yet archived."},
-      {"id": "windows-x86_64-cpu", "target": "Windows x86_64 CPU wheel", "status": "pending", "blocker": "Fresh no-compiler wheel receipt is not yet archived."}
+      {
+        "id": "linux-x86_64-cpu",
+        "target": "Linux x86_64 CPU wheel",
+        "status": "pending",
+        "blocker": "Fresh no-compiler wheel receipt is not yet archived."
+      },
+      {
+        "id": "macos-arm64-cpu",
+        "target": "macOS arm64 CPU wheel",
+        "status": "pending",
+        "blocker": "Fresh no-compiler wheel receipt is not yet archived."
+      },
+      {
+        "id": "windows-x86_64-cpu",
+        "target": "Windows x86_64 CPU wheel",
+        "status": "pending",
+        "blocker": "Fresh no-compiler wheel receipt is not yet archived."
+      }
     ],
     "python-torch": [
-      {"id": "python-abi3-39-plus", "target": "CPython 3.9+ abi3 import", "status": "pending", "blocker": "Per-version clean-wheel receipts are not yet archived."},
-      {"id": "pytorch-version-matrix", "target": "Supported PyTorch versions", "status": "pending", "blocker": "Torch ABI and operator conformance matrix is not yet qualified."}
+      {
+        "id": "python-abi3-39-plus",
+        "target": "CPython 3.9+ abi3 import",
+        "status": "pending",
+        "blocker": "Per-version clean-wheel receipts are not yet archived."
+      },
+      {
+        "id": "pytorch-version-matrix",
+        "target": "Supported PyTorch versions",
+        "status": "pending",
+        "blocker": "Torch ABI and operator conformance matrix is not yet qualified."
+      }
     ],
     "accelerator": [
-      {"id": "cuda-wheel-matrix", "target": "Linux CUDA wheels", "status": "pending", "blocker": "Driver, runtime, PyTorch and GPU-architecture receipts are not yet archived."},
-      {"id": "non-nvidia-gpu-backend", "target": "Non-NVIDIA GPU execution backend (wgpu/Vulkan, ROCm)", "status": "pending", "blocker": "The tritium-cli and tritium-benches wgpu/rocm lanes now exist (issue #4), but no `tritium report compare` ledger JSON from a physical non-NVIDIA GPU has been archived. Compile-only and Vulkan-on-NVIDIA runs do not qualify this row."},
-      {"id": "rocm-wheel", "target": "ROCm wheel", "status": "unsupported", "diagnostic": "TRITIUM_UNSUPPORTED_ROCM_WHEEL_V1_1"},
-      {"id": "metal-wheel", "target": "Metal-specific wheel", "status": "unsupported", "diagnostic": "TRITIUM_UNSUPPORTED_METAL_WHEEL_V1_1"}
+      {
+        "id": "cuda-wheel-matrix",
+        "target": "Linux CUDA wheels",
+        "status": "pending",
+        "blocker": "Driver, runtime, PyTorch and GPU-architecture receipts are not yet archived."
+      },
+      {
+        "id": "non-nvidia-gpu-backend",
+        "target": "Non-NVIDIA GPU execution backend (wgpu/Vulkan, ROCm)",
+        "status": "pending",
+        "blocker": "The tritium-cli and tritium-benches wgpu/rocm lanes now exist (issue #4), but no `tritium report compare` ledger JSON from a physical non-NVIDIA GPU has been archived. Compile-only and Vulkan-on-NVIDIA runs do not qualify this row."
+      },
+      {
+        "id": "rocm-wheel",
+        "target": "ROCm wheel",
+        "status": "unsupported",
+        "diagnostic": "TRITIUM_UNSUPPORTED_ROCM_WHEEL_V1_1"
+      },
+      {
+        "id": "metal-wheel",
+        "target": "Metal-specific wheel",
+        "status": "unsupported",
+        "diagnostic": "TRITIUM_UNSUPPORTED_METAL_WHEEL_V1_1"
+      }
     ],
     "onnx-runtime": [
-      {"id": "ort-cpu", "target": "ONNX Runtime CPU session and opset", "status": "pending", "blocker": "Clean-wheel whole-model generation receipt is not yet archived."},
-      {"id": "ort-training", "target": "Trainable whole-model ONNX import", "status": "unsupported", "diagnostic": "TRITIUM_UNSUPPORTED_TRAINABLE_ONNX_REQUIRES_V1_3"}
+      {
+        "id": "ort-cpu",
+        "target": "ONNX Runtime CPU session and opset",
+        "status": "pending",
+        "blocker": "Clean-wheel whole-model generation receipt is not yet archived."
+      },
+      {
+        "id": "ort-training",
+        "target": "Trainable whole-model ONNX import",
+        "status": "unsupported",
+        "diagnostic": "TRITIUM_UNSUPPORTED_TRAINABLE_ONNX_REQUIRES_V1_3"
+      }
     ],
     "web": [
-      {"id": "node-22", "target": "Node.js 22+ strict-TypeScript archive", "status": "pending", "blocker": "Clean npm-pack install receipt is not yet archived."},
-      {"id": "chrome-webgpu", "target": "Chrome WebGPU training", "status": "pending", "blocker": "Actual-browser WebGPU receipt is not yet archived."},
-      {"id": "firefox-webgpu", "target": "Firefox WebGPU training", "status": "pending", "blocker": "Actual-browser WebGPU receipt is not yet archived."},
-      {"id": "safari-webgpu", "target": "Safari WebGPU training", "status": "pending", "blocker": "Actual-browser WebGPU receipt is not yet archived."}
+      {
+        "id": "node-22",
+        "target": "Node.js 22+ strict-TypeScript archive",
+        "status": "pending",
+        "blocker": "Clean npm-pack install receipt is not yet archived."
+      },
+      {
+        "id": "chrome-webgpu",
+        "target": "Chrome WebGPU training",
+        "status": "pending",
+        "blocker": "Actual-browser WebGPU receipt is not yet archived."
+      },
+      {
+        "id": "firefox-webgpu",
+        "target": "Firefox WebGPU training",
+        "status": "pending",
+        "blocker": "Actual-browser WebGPU receipt is not yet archived."
+      },
+      {
+        "id": "safari-webgpu",
+        "target": "Safari WebGPU training",
+        "status": "pending",
+        "blocker": "Actual-browser WebGPU receipt is not yet archived."
+      }
     ],
     "artifact-schema": [
-      {"id": "salt-schema-v3-write", "target": "SALT schema v3 current writes", "status": "pending", "blocker": "Backward-read and current-write matrix receipt is not yet archived."},
-      {"id": "onnx-manifest-v2", "target": "Tritium ONNX manifest v2 writes with v1 backward reads", "status": "pending", "blocker": "Export, reload, corruption and rollback receipt is not yet archived."}
+      {
+        "id": "salt-schema-v3-write",
+        "target": "SALT schema v3 current writes",
+        "status": "pending",
+        "blocker": "Backward-read and current-write matrix receipt is not yet archived."
+      },
+      {
+        "id": "onnx-manifest-v2",
+        "target": "Tritium ONNX manifest v2 writes with v1 backward reads",
+        "status": "pending",
+        "blocker": "Export, reload, corruption and rollback receipt is not yet archived."
+      }
     ]
   }
 }
