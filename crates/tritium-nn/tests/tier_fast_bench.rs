@@ -7,17 +7,26 @@
 //! cargo test -p tritium-nn --features cuda --release --test tier_fast_bench -- --ignored --nocapture --test-threads=1
 //! ```
 //!
-//! Two ignored tests:
-//!   * `cuda_l3b_tier_drift_and_identity` — RFC checklist items 2 and 3 on
-//!     the path the fast tier claims: per (rung, ctx-regime), the fast
-//!     tier's tree-verify LOGITS stay within 2e-3 rel of the exact tier's
-//!     (the tier drift gate, measured where the fast kernel is actually in
-//!     the forward), and the fast tier's spec-committed stream is
-//!     token-identical to the exact tier's over a >=256-token horizon (the
-//!     greedy-identity gate; committed == plain-greedy losslessness is also
-//!     asserted inside every leg, which pins the ADR 0014 acceptance walk).
-//!     Deterministic drafts and greedy identity together imply tau is
-//!     EXACTLY unchanged: same trees in, same accepted paths out.
+//! The gates (RFC 0001 as amended by Amendment 1, b9fb8d5):
+//!   * `cuda_l3b_in_situ_kernel_drift` — Amendment 1's BINDING drift bar:
+//!     ≤1e-4 max rel at the swapped kernel's OUTPUT inside a real forward.
+//!     Via the `TRITIUM_TREE_ATTN_DUMP` seam, the layer-0 tree-attention
+//!     output (fast vs exact at bit-identical inputs — prefill and the
+//!     pre-attention trunk are tier-invariant) is asserted; deeper layers'
+//!     drift and the final verify-logits drift are REPORTED (their inputs
+//!     diverge through the i8 activation lattice — the amendment's ~1e-2
+//!     structural floor, which measures composition, not the kernel).
+//!   * `cuda_l3b_tier_drift_and_identity` — the quality-triplet identity leg
+//!     plus the Amendment 1 reporting duty: per (rung, ctx-regime), the fast
+//!     tier's spec-committed stream is token-identical to the exact tier's
+//!     over a >=256-token horizon (committed == plain-greedy losslessness is
+//!     also asserted inside every leg, which pins the ADR 0014 acceptance
+//!     walk), and the final verify-logits drift is measured and PRINTED —
+//!     not gated: Amendment 1 retired the 2e-3 final-logits bar (the i8
+//!     re-round floor; see `cuda_l3b_drift_diagnostic`) but requires the
+//!     number stay reported in adoption records. Deterministic drafts and
+//!     greedy identity together imply tau is EXACTLY unchanged: same trees
+//!     in, same accepted paths out.
 //!   * `cuda_l3b_spec_abba` — RFC checklist items 4 and 5: ABBA
 //!     (fast, exact, exact, fast) spec e2e + ms/verify per (rung, ctx),
 //!     mock-draft engine (fixed acceptance profile, drafting cost excluded —
@@ -305,9 +314,6 @@ fn cuda_l3b_tier_drift_and_identity() {
         return;
     };
     // n_ctx is asserted inside run_leg; 4096 is the 2B4T window.
-    // Drift failures are COLLECTED so every (ctx, rung) leg runs and the
-    // full table prints; the RFC bar is asserted at the end.
-    let mut drift_failures: Vec<String> = Vec::new();
     for &target in &ctx_targets(4096) {
         for rung in ["f32", "f16"] {
             let Some(exact) = run_leg("exact", rung, target, &bytes, &base) else {
@@ -321,8 +327,15 @@ fn cuda_l3b_tier_drift_and_identity() {
                 "[fast/{rung}] verify ran eager — the fast tier lives on the graph \
                  tree route; nothing was measured"
             );
-            // RFC item 2 — tier drift on the claimed path: full verify logits
-            // (8 nodes × vocab) at identical state, fast vs exact, ≤ 2e-3.
+            // Final verify-logits drift (8 nodes × vocab at identical state,
+            // fast vs exact) — REPORTED, NOT GATED: RFC 0001 Amendment 1
+            // retired the 2e-3 final-logits bar (the i8 activation lattice
+            // re-rounds under ANY sub-lattice perturbation — a ~1e-2
+            // structural floor independent of kernel accuracy; see
+            // `cuda_l3b_drift_diagnostic`) but requires the number stay
+            // reported in every adoption record. The BINDING drift bar is
+            // `cuda_l3b_in_situ_kernel_drift`; the binding e2e legs are the
+            // quality triplet (ppl ratio, the identity asserts below, τ).
             assert_eq!(exact.probe_logits.len(), fast.probe_logits.len());
             let row = exact.probe_logits.len() / 8; // 8 tree nodes x vocab
             let drift = max_rel_err_rows(&fast.probe_logits, &exact.probe_logits, row);
@@ -338,27 +351,156 @@ fn cuda_l3b_tier_drift_and_identity() {
                 "[{rung} ctx≈{target}] verify count changed — τ moved"
             );
             println!(
-                "[{rung} ctx≈{target}] drift(verify logits, {} vals) = {drift:.3e} \
-                 (bar 2e-3) | committed identity {}/{} tokens | verifies {}",
+                "[{rung} ctx≈{target}] final-logits drift(verify logits, {} vals) = \
+                 {drift:.3e} (REPORTED — bar retired by RFC 0001 Amendment 1; \
+                 expected ~the 1e-2 i8 re-round floor) | committed identity {}/{} \
+                 tokens | verifies {}",
                 fast.probe_logits.len(),
                 fast.committed.len(),
                 exact.committed.len(),
                 fast.verifies,
             );
-            if drift > 2e-3 {
-                drift_failures.push(format!(
-                    "[{rung} ctx≈{target}] verify-logit drift {drift:.3e} > 2e-3"
-                ));
-            }
         }
     }
+}
+
+/// Scoped `TRITIUM_TREE_ATTN_DUMP=1` (the in-situ drift seam is baked at
+/// model build, so it must be set before every leg's load); restores on drop
+/// so later legs/tests don't pay the dump buffer + copy nodes.
+struct DumpEnvGuard;
+impl DumpEnvGuard {
+    fn set() -> Self {
+        // SAFETY: single-threaded bench (see `EnvGuard::set`).
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::set_var("TRITIUM_TREE_ATTN_DUMP", "1");
+        }
+        DumpEnvGuard
+    }
+}
+impl Drop for DumpEnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: single-threaded bench (see `EnvGuard::set`).
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::remove_var("TRITIUM_TREE_ATTN_DUMP");
+        }
+    }
+}
+
+/// One in-situ probe leg: fresh model under (tier, rung) with the attention
+/// dump enabled, prefill to `target`, one fixed 8-node chain verify (tokens
+/// drawn deterministically from the reference stream — tier-invariant by
+/// construction), then read back the per-layer attention outputs + the
+/// verify logits. Returns `(dump, layer_stride, q_width, logits)`.
+fn run_dump_leg(
+    tier: &'static str,
+    rung: &'static str,
+    target: usize,
+    bytes: &[u8],
+    base: &[u32],
+) -> Option<(Vec<f32>, usize, usize, Vec<f32>)> {
+    let _env = EnvGuard::set(tier, rung);
+    let init = tritium_runtime::BACKENDS
+        .iter()
+        .find(|e| e.name == "cuda")?
+        .init;
+    let backend = match init() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: cuda backend failed to init ({e})");
+            return None;
+        }
+    };
+    let file = tritium_format::read_gguf(bytes).expect("parse gguf");
+    let mut runner = tritium_nn::ModelRunner::load(&file, bytes, backend).expect("load model");
+    let n_ctx = runner.config.n_ctx as usize;
     assert!(
-        drift_failures.is_empty(),
-        "RFC 0001 tier drift gate failed:\n{}\n(see cuda_l3b_drift_diagnostic: the \
-         i8 activation lattice re-rounds under ANY sub-lattice perturbation, so \
-         this bar binds structurally, not per-kernel)",
-        drift_failures.join("\n")
+        target + 16 <= n_ctx,
+        "probe target {target} + tree > n_ctx {n_ctx}"
     );
+    let prompt: Vec<u32> = base.iter().cycle().take(target).copied().collect();
+    let positions: Vec<usize> = (0..prompt.len()).collect();
+    runner.forward(&prompt, &positions).expect("probe prefill");
+    let tree: Vec<u32> = base.iter().cycle().skip(target).take(8).copied().collect();
+    let parents: Vec<i32> = (0..8i32).map(|i| i - 1).collect();
+    let logits = runner
+        .tree_verify_logits(&tree, &parents)
+        .expect("probe verify logits");
+    let rm = runner
+        .resident_cuda()
+        .expect("resident model")
+        .expect("cuda resident model present");
+    assert!(
+        rm.tree_graph_bucket_count() >= 1,
+        "[{tier}/{rung}] probe verify ran eager — the dump seam (and the fast \
+         tier's fused kernel) live on the graph route; nothing was measured"
+    );
+    let (dump, stride, q_width) = rm
+        .tree_attn_dump()
+        .expect("attn dump read")
+        .expect("TRITIUM_TREE_ATTN_DUMP was set at build — dump must exist");
+    Some((dump, stride, q_width, logits))
+}
+
+/// RFC 0001 Amendment 1's BINDING drift bar: ≤1e-4 max rel at the swapped
+/// kernel's OUTPUT inside a real forward. Both tiers run the identical
+/// (prompt, tree) verify on the graph route with the per-layer attention
+/// dump enabled; layer 0 is the assertion point because its kernel inputs
+/// are bit-identical across tiers (prefill and the pre-attention trunk —
+/// embed, rmsnorm+quant, q/k/v matmuls, RoPE, kv-append — are tier-invariant
+/// and deterministic), so the layer-0 diff is purely the fused kernel in
+/// situ. Deeper layers are REPORTED, not gated: their inputs diverge through
+/// the i8 activation lattice (the amendment's ~1e-2 structural floor), so a
+/// cross-tier diff there measures composition, not the kernel. The final
+/// verify-logits drift is also printed (the amendment's reporting duty).
+#[test]
+#[ignore = "L3b Amendment 1 in-situ gate: run explicitly with --ignored --nocapture --test-threads=1"]
+fn cuda_l3b_in_situ_kernel_drift() {
+    let Some((bytes, base)) = load_inputs() else {
+        return;
+    };
+    let _dump_env = DumpEnvGuard::set();
+    const M: usize = 8; // probe tree nodes (chain)
+    for &target in &ctx_targets(4096) {
+        for rung in ["f32", "f16"] {
+            let Some((ed, es, eq, el)) = run_dump_leg("exact", rung, target, &bytes, &base) else {
+                return;
+            };
+            let Some((fd, fs, fq, fl)) = run_dump_leg("fast", rung, target, &bytes, &base) else {
+                return;
+            };
+            assert_eq!((es, eq, ed.len()), (fs, fq, fd.len()));
+            let n_layers = ed.len() / es;
+            let layer = |d: &[f32], li: usize| d[li * es..li * es + M * eq].to_vec();
+            let mut in_situ = 0.0f32;
+            let mut deep_worst = (0usize, 0.0f32);
+            for li in 0..n_layers {
+                let d = max_rel_err_rows(&layer(&fd, li), &layer(&ed, li), eq);
+                if li == 0 {
+                    in_situ = d;
+                } else if d > deep_worst.1 {
+                    deep_worst = (li, d);
+                }
+            }
+            let row = el.len() / M;
+            let logit_drift = max_rel_err_rows(&fl, &el, row);
+            println!(
+                "[{rung} ctx≈{target}] IN-SITU kernel-output drift (layer 0, \
+                 fast vs exact at identical inputs) = {in_situ:.3e} (bar 1e-4) | \
+                 deeper layers reported: worst {:.3e} at layer {} (i8-floor \
+                 composition, not the kernel) | final-logits drift {logit_drift:.3e} \
+                 (reported)",
+                deep_worst.1, deep_worst.0,
+            );
+            assert!(
+                in_situ <= 1e-4,
+                "[{rung} ctx≈{target}] RFC 0001 Amendment 1 in-situ drift gate \
+                 failed: {in_situ:.3e} > 1e-4 at the fused kernel's output (layer 0, \
+                 bit-identical inputs)"
+            );
+        }
+    }
 }
 
 /// Teacher-forced perplexity THROUGH THE TREE-VERIFY FORWARD (the path the

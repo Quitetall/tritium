@@ -1278,9 +1278,16 @@ async fn health(State(st): State<AppState>) -> Response {
         "queue_depth": queue_depth,
         // RFC 0001: disclose the numerics domain this process serves. The
         // tier/rungs are parsed once at model build from these env vars
-        // (loud-reject on typos, so an echoed value here is the active one).
-        "kernel_tier": std::env::var("TRITIUM_KERNEL_TIER")
-            .unwrap_or_else(|_| "exact".into()),
+        // (loud-reject on typos — a process with an invalid value never gets
+        // this far). `kernel_tier` is the RESOLVED tier, mirroring
+        // `kernel_tier_from_env` (unset and "" both parse to exact), not a
+        // raw env echo. NOTE: `fast` is a per-route claim — verifies outside
+        // the fused contract (head_dim > 128, paged/slots arenas, eager
+        // fallback) still run exact numerics in a fast-tier process.
+        "kernel_tier": match std::env::var("TRITIUM_KERNEL_TIER").as_deref() {
+            Ok("fast") => "fast",
+            _ => "exact",
+        },
         "kv_dtype": std::env::var("TRITIUM_KV")
             .ok()
             .filter(|v| !v.is_empty())

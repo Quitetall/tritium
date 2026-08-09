@@ -2401,9 +2401,14 @@ static __device__ __forceinline__ void gqa_attention_tree_reduce_ctrl_f16w_body(
 // ── RFC 0001 FAST-TIER tree attention (ADR 0036 L3b) — one-pass online-softmax
 // fusion of the gqa_attention_tree_{scores,reduce}_ctrl pair. NOT bit-exact:
 // this is the first member of the relaxed `TRITIUM_KERNEL_TIER=fast` tier and
-// deviates from the ADR 0018 canonical order under RFC 0001's bounds (kernel
-// <=1e-4 max-rel vs the exact pair; e2e logit drift <=2e-3; tree-verify
-// ACCEPTANCE arithmetic untouched — only this softmax/weighted-sum reorders).
+// deviates from the ADR 0018 canonical order under RFC 0001's bounds as
+// amended (Amendment 1, 2026-08-08): <=1e-4 max-rel at THIS kernel's output
+// vs the exact pair — in isolation and in situ inside a real forward — plus
+// the e2e quality triplet (ppl ratio <=1.001, greedy 256-token identity vs
+// the exact tier, tau unchanged for spec claims). Final-logits drift is
+// reported, not gated: the trunk's i8 activation re-rounding puts a ~1e-2
+// structural floor on it regardless of kernel accuracy. Tree-verify
+// ACCEPTANCE arithmetic untouched — only this softmax/weighted-sum reorders.
 // The exact ctrl pair above is RETAINED verbatim as the conformance reference
 // and CI default; capture-time selection in tree.rs picks this kernel only
 // when the model was built under the fast tier (dense single-slot route).
@@ -2430,7 +2435,13 @@ static __device__ __forceinline__ void gqa_attention_tree_reduce_ctrl_f16w_body(
 // head_dim % 4 == 0, head_dim <= 128 (= 4·32: lane l owns the contiguous dim
 // quad [4l, 4l+4)); shapes outside it keep the exact pair. Pad rows
 // (row >= tree_ctrl[1]) exit before any barrier-free divergence, matching the
-// ctrl pair. No dynamic shared: the merge scratch is static.
+// ctrl pair. No dynamic shared: the merge scratch is static. ctx >= 1 is a
+// HOST-GUARANTEED precondition: the dense-route tree builder always includes
+// self in every node's ancestor list (n_anc[row] >= 1), so
+// ctx = prefix_len + n_anc[row] >= 1 even at prefix_len == 0. A ctx == 0 row
+// would leave the merge with gs == 0 (inv = inf, 0·inf = NaN) where the
+// exact pair writes 0 — do not relax the host guarantee without adding a
+// gs == 0 guard here.
 #define TREE_FUSED_THREADS 256
 #define TREE_FUSED_WARPS (TREE_FUSED_THREADS / 32)
 

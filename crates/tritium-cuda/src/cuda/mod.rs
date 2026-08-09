@@ -652,6 +652,13 @@ struct TreeScratch {
     d_nanc: CudaSlice<i32>,
     d_amax_val: CudaSlice<f32>,
     d_amax_idx: CudaSlice<i32>,
+    /// RFC 0001 Amendment 1 observability seam (`TRITIUM_TREE_ATTN_DUMP=1`,
+    /// the TRITIUM_TREE_TRACE precedent): `[n_layers, m_cap, q_width]` f32
+    /// snapshot of `d_attn` (the tree-attention output, pre sub-norm/o-proj)
+    /// per layer. `None` unless the env var was set when this scratch was
+    /// allocated; when present, graph capture bakes one dtod node per layer
+    /// (graph route only — see [`CudaDecodeModel::tree_attn_dump`]).
+    d_attn_dump: Option<CudaSlice<f32>>,
 }
 
 /// Padded tree sizes with a captured verify-trunk graph. A verify with

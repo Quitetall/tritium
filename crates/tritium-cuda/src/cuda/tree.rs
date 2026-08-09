@@ -1037,6 +1037,14 @@ impl CudaDecodeModel {
             d_amax_idx: s
                 .alloc_zeros::<i32>(m * ARGMAX_CHUNKS)
                 .map_err(|e| driver_err("tree d_amax_idx", &e))?,
+            // RFC 0001 Amendment 1 seam: env-gated per-layer attention-output
+            // dump (see `tree_attn_dump`). Zero cost when unset (no buffer,
+            // no captured copy nodes).
+            d_attn_dump: if std::env::var_os("TRITIUM_TREE_ATTN_DUMP").is_some() {
+                Some(alloc(self.layers.len() * m * q_width, "tree d_attn_dump")?)
+            } else {
+                None
+            },
         })
     }
 
@@ -1056,6 +1064,42 @@ impl CudaDecodeModel {
     /// was not taken (eager fallback); ≥1 proves the ctrl-twin capture ran.
     pub fn tree_graph_bucket_count(&self) -> usize {
         self.tree_graphs.as_ref().map_or(0, |tg| tg.graphs.len())
+    }
+
+    /// RFC 0001 Amendment 1 observability seam: the per-layer attention
+    /// outputs (`d_attn` — the tree-attention result BEFORE sub-norm/o-proj)
+    /// of the LAST graph-route tree verify on the single-seq target,
+    /// host-copied. `Some((data, layer_stride, q_width))`: layer `li`'s rows
+    /// live at `data[li·layer_stride .. li·layer_stride + m·q_width]` where
+    /// `m` is that verify's real node count (rows past it are pad/stale).
+    ///
+    /// `None` unless the model's tree scratch was allocated under
+    /// `TRITIUM_TREE_ATTN_DUMP=1` (the TRITIUM_TREE_TRACE env-gate precedent:
+    /// the buffer and the captured per-layer dtod nodes are baked at scratch
+    /// alloc / graph capture — zero cost otherwise). GRAPH ROUTE ONLY: eager
+    /// verifies write no snapshot, so callers pair this with a
+    /// [`Self::tree_graph_bucket_count`]` >= 1` check. This is the smallest
+    /// seam that lets the amendment's binding bar — ≤1e-4 max rel at the
+    /// swapped kernel's output inside a real forward — be asserted by
+    /// `tier_fast_bench` without exposing the scratch itself.
+    pub fn tree_attn_dump(&self) -> Result<Option<(Vec<f32>, usize, usize)>, BackendError> {
+        let Some(ts) = self.tree_scratch.as_ref() else {
+            return Ok(None);
+        };
+        let Some(dump) = ts.d_attn_dump.as_ref() else {
+            return Ok(None);
+        };
+        // Drain the verify tail: the graph trunk (and its dump copies) ride
+        // cap_stream; the dtoh below rides the default stream.
+        self.cap_stream
+            .synchronize()
+            .map_err(|e| driver_err("tree attn dump cap sync", &e))?;
+        let stride = ts.m_cap * self.q_width;
+        let mut host = vec![0.0f32; self.layers.len() * stride];
+        self.stream
+            .memcpy_dtoh(dump, &mut host)
+            .map_err(|e| driver_err("tree attn dump dtoh", &e))?;
+        Ok(Some((host, stride, self.q_width)))
     }
 
     /// **I2/I3 batch-slot greedy tree verify** (L3 batch-slot spec decode):
@@ -1647,6 +1691,14 @@ impl CudaDecodeModel {
             && head_dim.is_multiple_of(4)
             && head_dim <= TREE_FUSED_HDMAX)
             .then_some(raw.attn_tree_fused_ctrl);
+        // RFC 0001 Amendment 1 seam (TRITIUM_TREE_ATTN_DUMP, baked at scratch
+        // alloc): snapshot d_attn per layer so the in-situ kernel-output
+        // drift gate can compare the fast tier's fused attention against the
+        // exact pair AT THE SWAPPED KERNEL'S OWN OUTPUT inside a real
+        // forward. One dtod memcpy node per layer, captured into the graph;
+        // absent entirely when the env is unset.
+        let dump_ptr: Option<sys::CUdeviceptr> = ts.d_attn_dump.as_ref().map(|d| dptr(d, s));
+        let dump_stride = ts.m_cap * q_width;
         let attn = |kv_k: sys::CUdeviceptr, kv_v: sys::CUdeviceptr| {
             if let Some(ff) = fused {
                 // SAFETY: matches `gqa_attention_tree_fused_ctrl_{g,h}(q, k, v,
@@ -1763,7 +1815,7 @@ impl CudaDecodeModel {
 
         capture_body(s, || {
             self.gb_embed(d_token_embd, d_tok, d_x, mb)?;
-            for lp in &layers {
+            for (li, lp) in layers.iter().enumerate() {
                 // q/k/v share one fused rmsnorm+quant of d_x (ADR 0036 L5).
                 self.gb_rmsnorm_quant(d_x, lp.attn_norm, n_embd, d_qact, d_act_scale, mb)?;
                 self.gb_matmul(&lp.q, d_qact, d_act_scale, d_q, mb)?;
@@ -1774,6 +1826,23 @@ impl CudaDecodeModel {
                 kv_append(d_k, lp.kv_k)?;
                 kv_append(d_v, lp.kv_v)?;
                 attn(lp.kv_k, lp.kv_v)?;
+                if let Some(dp) = dump_ptr {
+                    // SAFETY: dtod within live allocations — d_attn holds
+                    // mb·q_width valid f32s after attn(); layer li's dump
+                    // slice starts at li·dump_stride and holds m_cap·q_width
+                    // ≥ mb·q_width elements (disjoint per layer); ordered on
+                    // the capture stream (recorded as a graph memcpy node).
+                    #[allow(unsafe_code)]
+                    unsafe {
+                        result::memcpy_dtod_async(
+                            dp + (li * dump_stride * 4) as sys::CUdeviceptr,
+                            d_attn,
+                            mb * q_width * 4,
+                            cs,
+                        )
+                    }
+                    .map_err(|e| driver_err("tree attn dump dtod", &e))?;
+                }
                 if let Some(sn) = lp.attn_sub_norm {
                     // Fused sub-norm + quant (ADR 0036 L5): skips d_attn_sn.
                     self.gb_rmsnorm_quant(d_attn, sn, q_width, d_qact, d_act_scale, mb)?;

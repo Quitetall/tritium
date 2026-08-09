@@ -94,12 +94,17 @@ pub(super) fn lm_head_dtype_from_env() -> Result<LmHeadDtype, BackendError> {
 /// parsed ONCE at model build (capture-time constant: CUDA graphs bake the
 /// picked symbols; a process serves exactly one tier). `Exact` (default) is
 /// the ADR 0018 bit-exact contract and the CI identity. `Fast` opts into the
-/// RFC-bounded relaxed twins (first member: the L3b fused tree attention —
-/// kernel ≤1e-4 max-rel vs the exact twin, e2e logit drift ≤2e-3, ppl ≤1.001,
-/// tree-verify ACCEPTANCE arithmetic untouched). The exact twins are retained
-/// and remain the conformance reference on every path the fast tier does not
-/// claim (shape guards fall back to exact — numerically a superset of the
-/// fast contract, disclosed in the model's tier report).
+/// RFC-bounded relaxed twins (first member: the L3b fused tree attention)
+/// under the Amendment 1 contract: ≤1e-4 max-rel at the swapped kernel's
+/// output — in isolation AND in situ inside a real forward — plus the e2e
+/// quality triplet (ppl ratio ≤1.001, greedy 256-token identity vs exact, τ
+/// unchanged for spec claims); final-logits drift is REPORTED, not gated
+/// (the i8 activation re-round floor ~1e-2 binds structurally, independent
+/// of kernel accuracy). Tree-verify ACCEPTANCE arithmetic is untouched. The
+/// exact twins are retained and remain the conformance reference on every
+/// path the fast tier does not claim (shape guards fall back to exact —
+/// numerically a superset of the fast contract, disclosed in the model's
+/// tier report).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum KernelTier {
     Exact,
