@@ -89,17 +89,41 @@ impl Default for Ewma {
 /// tier/rung awareness comes FREE via measurement (the fast tier's cheaper
 /// verify lowers V, and with it the floor, automatically; no per-tier
 /// tables).
+///
+/// SHARING: these EWMAs are process-wide statics, so they carry across
+/// SEQUENTIAL requests — a fresh request's first cycles are governed by the
+/// previous request's warm floors until its own samples decay them in (~a
+/// dozen at ALPHA 0.2; intentional — the phase costs are properties of the
+/// model+box+ctx band, not of a request, and a warm start beats the fixed
+/// fallback) — and across every server instance in one process (concurrent
+/// writers interleave into one mixture; the `Relaxed` mean/count pairs can
+/// tear, mis-reporting a gauge by one sample — benign, see [`Ewma`]).
 #[derive(Debug)]
 pub struct SpecCostModel {
     /// V (solo): wall of one `tree_verify_greedy` call, µs.
     pub verify: Ewma,
     /// P (solo): wall of one plain M=1 step, µs.
     pub plain: Ewma,
-    /// d (solo): drafter wall per DRAFTED token, µs — includes the
-    /// reconcile/re-sync share, which is the honest cost of drafting (a
-    /// long-ctx probe's drafter re-prefill lands here and correctly raises
-    /// the floor while re-syncs are expensive).
+    /// d (solo): drafter wall per DRAFTED token in STEADY-STATE drafting
+    /// (unsuppressed cycles), µs — the small per-cycle reconcile share
+    /// included. Probe-time drafter walls go to [`Self::draft_resync`]
+    /// instead, NEVER here: the floor's d must price what a recovered
+    /// drafter would pay per cycle, not the one-off cost of finding out
+    /// (see [`Self::record_draft`]).
     pub draft_tok: Ewma,
+    /// Probe-time drafter wall per drafted token, µs — dominated by the
+    /// ~ctx-linear re-prefill after [`SpecGovernor::PROBE_PERIOD`] stale
+    /// plain tokens. TELEMETRY ONLY (`/metrics` phase="draft_resync"),
+    /// deliberately excluded from the floors: the re-sync is an
+    /// entry-transition cost of LEAVING suppression, not steady-state spec
+    /// economics. Pricing it into d latched suppression — probes were the
+    /// only d samples while suppressed, so the EWMA converged to
+    /// resync-dominated values, the floor clamped high, and a genuinely
+    /// recovered drafter (τ 2.4–2.9 measured on the fast tier, honest
+    /// floor ≈ 2.15) could never clear it. The ENTRY decision is
+    /// unaffected by the exclusion: entry happens while unsuppressed,
+    /// where every draft is steady-state anyway.
+    pub draft_resync: Ewma,
     /// V_round (batched): wall of one grouped multi-slot verify, µs.
     pub verify_round: Ewma,
     /// P_lockstep (batched): wall of one lockstep `decode_batch_graph`
@@ -128,15 +152,34 @@ impl SpecCostModel {
             verify: Ewma::new(),
             plain: Ewma::new(),
             draft_tok: Ewma::new(),
+            draft_resync: Ewma::new(),
             verify_round: Ewma::new(),
             lockstep: Ewma::new(),
+        }
+    }
+
+    /// Route one drafter wall sample (µs per DRAFTED token): steady-state
+    /// cycles feed [`Self::draft_tok`] (the floor's d), probe cycles feed
+    /// [`Self::draft_resync`] (telemetry only — the field docs carry the
+    /// design note on why the floor excludes re-sync). The one seam both
+    /// spec loops record through, so the split cannot drift between them.
+    pub fn record_draft(&self, us_per_tok: f64, is_probe: bool) {
+        if is_probe {
+            self.draft_resync.record(us_per_tok);
+        } else {
+            self.draft_tok.record(us_per_tok);
         }
     }
 
     /// SOLO derived floor at draft length `k`: `(V + k·d)/P`, clamped to
     /// [`Self::SOLO_CLAMP`]. `None` until V, P, and d each have
     /// [`Self::WARMUP`] samples (callers fall back to the fixed
-    /// [`SpecGovernor::TAU_FLOOR_SOLO`]).
+    /// [`SpecGovernor::TAU_FLOOR_SOLO`]). d is STEADY-STATE drafting cost
+    /// by construction — probe-time re-sync walls are recorded to
+    /// [`Self::draft_resync`] and intentionally excluded (an
+    /// entry-transition cost, not steady-state economics; see the field
+    /// docs), so the floor prices the regime the drafter would run in
+    /// AFTER suppression lifts.
     pub fn solo_floor(&self, k: usize) -> Option<f64> {
         if self.verify.samples() < Self::WARMUP
             || self.plain.samples() < Self::WARMUP
@@ -173,6 +216,12 @@ impl SpecCostModel {
     /// clamped to [`Self::BATCHED_CLAMP`] — i.e. the fixed 1.1 floor holds
     /// unless round verifies measurably exceed a lockstep step. `None`
     /// until V_round and P_lockstep each have [`Self::WARMUP`] samples.
+    ///
+    /// V_round is an EWMA of raw group walls recorded at whatever group
+    /// size was live THEN; dividing by the CURRENT `n_live` at application
+    /// mis-prices the floor transiently after a pool resize (until the
+    /// EWMA re-converges, ~a dozen rounds at ALPHA 0.2) — a known v1
+    /// approximation the [1.1, 3.0] clamps bound.
     pub fn batched_floor(&self, n_live: usize) -> Option<f64> {
         if self.verify_round.samples() < Self::WARMUP
             || self.lockstep.samples() < Self::WARMUP
@@ -807,9 +856,31 @@ impl SpecGovernor {
     /// the economics — re-measure before touching either (review 4190673
     /// F2).
     const PROBE_PERIOD: usize = 64;
-    /// Probe draft length: long enough that a fully-accepted probe moves the
-    /// EWMA materially (two consecutive full-accept probes at k=4 lift
-    /// acc ≈ 0.30 → ≈ 0.54, clearing the floor), short enough to stay cheap.
+    /// Probe draft length: long enough that a fully-accepted probe moves
+    /// the acceptance EWMA materially, short enough to stay cheap.
+    ///
+    /// Recovery arithmetic (DraftPolicy LAMBDA 0.95: after n consecutive
+    /// full-accept k=4 probes from acc₀ = 0.30, acc_n = 1 − 0.95⁴ⁿ·0.70,
+    /// τ from `tau_estimate` at the policy's own k):
+    /// - 2 probes → acc ≈ 0.54, k=2, τ ≈ 1.82 — clears the FIXED 1.5
+    ///   fallback, but NOT a warm measured floor (fast tier ≈ 2.15–2.95
+    ///   at ctx 1536, exact tier at the 3.0 clamp).
+    /// - 4 probes → acc ≈ 0.69, k=3, τ ≈ 2.50 — clears the warm fast-tier
+    ///   floor.
+    /// - 5 probes → acc ≈ 0.75, k=4, τ ≈ 3.05 — clears even the 3.0 clamp,
+    ///   so recovery is reachable on the exact tier too; that it takes a
+    ///   ~5-probe (~320 committed tokens) streak of full accepts there
+    ///   matches the exact tier's honest economics — its measured verify
+    ///   really is that dear, and a floor pinned at the clamp demands a
+    ///   drafter that earns it.
+    ///
+    /// A partial accept decays acc by ONE LAMBDA factor per failed walk,
+    /// so mixed probes ratchet slower, not never. The floor itself also
+    /// drifts while suppressed: V keeps folding the cheap k≤4 probe
+    /// verifies and P every plain step (d is FROZEN at its steady-state
+    /// value — probe walls go to `draft_resync`, review aec4c78 F1), so a
+    /// warm floor decays toward the small-tree breakeven between probes,
+    /// and post-recovery cheap verifies keep refreshing V downward.
     const PROBE_K: usize = 4;
 
     /// Fresh governor in the ON state (the default; also the unit-test seam).
@@ -1246,7 +1317,12 @@ impl RunnerGenerator {
             let budget = max_new - emitted;
             // Governor cap on top of the policy length: Some(0) = suppressed
             // plain step, Some(k) = probe chain, None = draft normally.
-            let want = match governor.draft_cap() {
+            let cap = governor.draft_cap();
+            // A probe cycle's drafter wall is dominated by the ~ctx-linear
+            // re-prefill (PROBE_PERIOD stale plain tokens force a reset) —
+            // routed to the resync EWMA below, never the floor's d.
+            let is_probe = matches!(cap, Some(k) if k > 0);
+            let want = match cap {
                 Some(k) => k,
                 None => policy.len(),
             };
@@ -1261,10 +1337,13 @@ impl RunnerGenerator {
             };
             // Cost-model d: drafter wall per drafted token (empty results —
             // bails, no match — carry no per-token denominator; skipped).
+            // Probe cycles feed draft_resync (telemetry), steady-state
+            // cycles feed the floor's draft_tok — see record_draft.
             if !drafts.is_empty() {
-                SPEC_COST
-                    .draft_tok
-                    .record(t_d.elapsed().as_secs_f64() * 1e6 / drafts.len() as f64);
+                SPEC_COST.record_draft(
+                    t_d.elapsed().as_secs_f64() * 1e6 / drafts.len() as f64,
+                    is_probe,
+                );
             }
 
             if drafts.is_empty() {
@@ -2037,6 +2116,90 @@ mod tests {
         assert_eq!(b.batched_floor(4), None);
         b.verify_round.record(2000.0);
         assert!(b.batched_floor(4).is_some());
+    }
+
+    /// F1 (review aec4c78): probe-time drafter walls must NOT feed the
+    /// floor's d — they land in the resync EWMA (telemetry). Otherwise the
+    /// only d samples while suppressed are ~ctx-linear re-prefills, the
+    /// floor clamps high, and a recovered drafter can never lift
+    /// suppression.
+    #[test]
+    fn probe_draft_walls_feed_resync_not_the_floors_d() {
+        let m = super::SpecCostModel::new();
+        warm(&m.verify, 4000.0, super::SpecCostModel::WARMUP);
+        warm(&m.plain, 4000.0, super::SpecCostModel::WARMUP);
+        // Steady-state drafting measured d = 500 µs/tok before collapse.
+        warm(&m.draft_tok, 500.0, super::SpecCostModel::WARMUP);
+        let d0 = m.draft_tok.mean_us().expect("warm");
+        let floor0 = m.solo_floor(2).expect("warm");
+        // Suppressed phase: every probe pays a ctx-linear re-prefill.
+        // Routed as probes, the walls move ONLY the resync EWMA.
+        for _ in 0..32 {
+            m.record_draft(20_000.0, true);
+        }
+        assert_eq!(
+            m.draft_tok.mean_us(),
+            Some(d0),
+            "probe walls must not move the floor's d"
+        );
+        assert_eq!(m.solo_floor(2), Some(floor0), "floor unmoved by probes");
+        assert_eq!(m.draft_resync.samples(), 32, "resync EWMA takes them");
+        assert!(m.draft_resync.mean_us().expect("recorded") > 10_000.0);
+        // Steady-state samples still feed d.
+        m.record_draft(500.0, false);
+        assert_eq!(m.draft_tok.samples(), super::SpecCostModel::WARMUP + 1);
+        assert_eq!(m.draft_resync.samples(), 32);
+    }
+
+    /// The recovery scenario the F1 split exists for: with steady-state d
+    /// the warm floor sits where a recovered drafter's τ clears it and a
+    /// suppressed governor lifts; with the pre-fix accounting (probe
+    /// re-prefills folded into d) the derived floor clamps to 3.0 and the
+    /// SAME drafter latches suppressed forever.
+    #[test]
+    fn recovered_drafter_clears_steady_floor_not_resync_polluted_floor() {
+        // Fast-tier-shaped costs: V 8.6 ms, P 4 ms, steady d 0.3 ms.
+        let m = super::SpecCostModel::new();
+        warm(&m.verify, 8600.0, super::SpecCostModel::WARMUP);
+        warm(&m.plain, 4000.0, super::SpecCostModel::WARMUP);
+        warm(&m.draft_tok, 300.0, super::SpecCostModel::WARMUP);
+        // Probe re-prefills during suppression: resync only.
+        for _ in 0..32 {
+            m.record_draft(30_000.0, true);
+        }
+        // Recovered drafter: acc after ~4 consecutive full-accept k=4
+        // probes from 0.30 (see PROBE_K's recovery arithmetic).
+        let recovered = super::DraftPolicy::Adaptive { acc: 0.69 };
+        let tau = recovered.tau_estimate().expect("adaptive");
+        let k = recovered.len();
+        let floor = m.solo_floor(k).expect("warm");
+        assert!(
+            floor > super::SpecGovernor::TAU_FLOOR_SOLO,
+            "a warm fast-tier floor sits above the fixed fallback: {floor}"
+        );
+        assert!(
+            tau >= floor,
+            "recovered τ {tau} must clear the steady-state floor {floor}"
+        );
+        // A suppressed governor lifts on that probe verify.
+        let collapsed = super::DraftPolicy::Adaptive { acc: 0.25 };
+        let mut g = super::SpecGovernor::new_on(false);
+        for _ in 0..super::SpecGovernor::ENTRY_STREAK {
+            g.on_verify(&collapsed, floor);
+        }
+        g.on_plain_commit(super::SpecGovernor::PROBE_PERIOD);
+        assert_eq!(g.draft_cap(), Some(super::SpecGovernor::PROBE_K));
+        g.on_verify(&recovered, floor);
+        assert_eq!(g.draft_cap(), None, "suppression lifts");
+        // Counterfactual pre-fix accounting: resync-dominated d clamps the
+        // floor to 3.0 — the same recovered drafter can never clear it.
+        let polluted = super::SpecCostModel::new();
+        warm(&polluted.verify, 8600.0, super::SpecCostModel::WARMUP);
+        warm(&polluted.plain, 4000.0, super::SpecCostModel::WARMUP);
+        warm(&polluted.draft_tok, 30_000.0, super::SpecCostModel::WARMUP);
+        let bad = polluted.solo_floor(k).expect("warm");
+        assert_eq!(bad, super::SpecCostModel::SOLO_CLAMP.1, "clamped high");
+        assert!(tau < bad, "resync-polluted d latches suppression: τ {tau}");
     }
 
     /// `force` pins the FIXED floors regardless of the process-wide cost

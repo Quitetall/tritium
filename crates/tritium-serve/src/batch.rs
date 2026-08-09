@@ -440,7 +440,11 @@ fn spec_cycle(
     let budget = s.max_new - s.emitted; // >= 1 by the SpecSeq invariant
     // Governor cap on top of the policy length (the single worker's rule):
     // Some(0) = suppressed plain step, Some(k) = probe, None = normal.
-    let want = match s.governor.draft_cap() {
+    let cap = s.governor.draft_cap();
+    // Probe cycles pay the ~ctx-linear drafter re-prefill — routed to the
+    // resync EWMA below, never the floor's d (the single worker's rule).
+    let is_probe = matches!(cap, Some(k) if k > 0);
+    let want = match cap {
         Some(k) => k,
         None => s.policy.len(),
     };
@@ -460,11 +464,13 @@ fn spec_cycle(
         )
     };
     // Cost-model d: drafter wall per drafted token (empty results — bails —
-    // carry no per-token denominator; skipped).
+    // carry no per-token denominator; skipped). Probe cycles feed
+    // draft_resync (telemetry), steady-state cycles the floor's draft_tok.
     if !drafts.is_empty() {
-        SPEC_COST
-            .draft_tok
-            .record(t_d.elapsed().as_secs_f64() * 1e6 / drafts.len() as f64);
+        SPEC_COST.record_draft(
+            t_d.elapsed().as_secs_f64() * 1e6 / drafts.len() as f64,
+            is_probe,
+        );
     }
 
     if drafts.is_empty() {
@@ -1047,7 +1053,12 @@ fn multi_spec_round(
         let outs = match runner.tree_verify_greedy_slots(batch, &group_rows, &group_trees) {
             Ok(o) => {
                 // Cost-model V_round: one grouped verify's wall (with the
-                // equal-split k clamp there is one group per round).
+                // equal-split k clamp there is one group per round). The
+                // RAW group wall is recorded at whatever group size is live
+                // now; `floor_batched` divides the EWMA by the n_live at
+                // APPLICATION time, so a pool resize mis-prices the floor
+                // transiently until the EWMA re-converges (~a dozen rounds
+                // at ALPHA 0.2) — the [1.1, 3.0] clamps bound the error.
                 SPEC_COST
                     .verify_round
                     .record(t_v.elapsed().as_secs_f64() * 1e6);

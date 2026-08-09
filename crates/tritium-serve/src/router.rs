@@ -1401,6 +1401,7 @@ async fn metrics(State(st): State<AppState>) -> Response {
          tritium_spec_cost_us{{phase=\"verify\"}} {}\n\
          tritium_spec_cost_us{{phase=\"plain\"}} {}\n\
          tritium_spec_cost_us{{phase=\"draft_token\"}} {}\n\
+         tritium_spec_cost_us{{phase=\"draft_resync\"}} {}\n\
          tritium_spec_cost_us{{phase=\"verify_round\"}} {}\n\
          tritium_spec_cost_us{{phase=\"lockstep\"}} {}\n",
         st.metrics.chat_requests.load(Ordering::Relaxed),
@@ -1425,6 +1426,12 @@ async fn metrics(State(st): State<AppState>) -> Response {
         crate::generator::SPEC_COST.plain.mean_us().unwrap_or(0.0),
         crate::generator::SPEC_COST
             .draft_tok
+            .mean_us()
+            .unwrap_or(0.0),
+        // Probe-time drafter re-sync (telemetry only — never in the floors;
+        // see SpecCostModel::draft_resync).
+        crate::generator::SPEC_COST
+            .draft_resync
             .mean_us()
             .unwrap_or(0.0),
         crate::generator::SPEC_COST

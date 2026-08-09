@@ -215,6 +215,35 @@ impl Drop for AdaptiveEnv {
     }
 }
 
+/// Env guard for `TRITIUM_SPEC_COST_FLOORS`; restores the prior value on
+/// drop. Deterministic gates pin the FIXED floors — the derived floors are
+/// a function of this box's wall clock (and its co-resident load), so a
+/// dormancy assertion against them is a bet on the room, not the code.
+struct FloorsEnv(Option<std::ffi::OsString>);
+impl FloorsEnv {
+    fn pin_fixed() -> Self {
+        let prev = std::env::var_os("TRITIUM_SPEC_COST_FLOORS");
+        // SAFETY: single-threaded test (see `AdaptiveEnv::set`).
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::set_var("TRITIUM_SPEC_COST_FLOORS", "0");
+        }
+        Self(prev)
+    }
+}
+impl Drop for FloorsEnv {
+    fn drop(&mut self) {
+        // SAFETY: single-threaded test (see `AdaptiveEnv::set`).
+        #[allow(unsafe_code)]
+        unsafe {
+            match self.0.take() {
+                Some(v) => std::env::set_var("TRITIUM_SPEC_COST_FLOORS", v),
+                None => std::env::remove_var("TRITIUM_SPEC_COST_FLOORS"),
+            }
+        }
+    }
+}
+
 fn ref_prompt() -> Vec<u32> {
     let reference: serde_json::Value =
         serde_json::from_slice(&std::fs::read(REF_PATH).expect("read reference"))
@@ -276,9 +305,15 @@ fn cuda_spec_adaptive_forced_collapse_matches_plain_greedy() {
     let verifies =
         || tritium_serve::generator::SPEC_VERIFIES.load(std::sync::atomic::Ordering::Relaxed);
 
-    // Leg 1 — default ON, healthy acceptance: dormant.
+    // Leg 1 — default ON, healthy acceptance: dormant. Fixed floors pinned
+    // (FloorsEnv): the dormancy assertion is only deterministic against the
+    // fixed 1.5 — on a contended box the DERIVED floor can rise past the
+    // fixture drafter's τ (measured ~1.86 under a co-resident training run,
+    // 2026-08-09) and suppressing there is the cost model doing its job,
+    // not a governor bug.
     {
         let _env = AdaptiveEnv::set("1");
+        let _floors = FloorsEnv::pin_fixed();
         let Some(runner) = load_runner(&bytes) else {
             return;
         };
@@ -295,6 +330,7 @@ fn cuda_spec_adaptive_forced_collapse_matches_plain_greedy() {
     }
 
     // Leg 2 — forced collapse: suppression engages, stream stays exact.
+    // (`force` already pins the fixed floors; no FloorsEnv needed.)
     {
         let _env = AdaptiveEnv::set("force");
         let Some(runner) = load_runner(&bytes) else {
