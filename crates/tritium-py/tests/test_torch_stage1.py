@@ -71,7 +71,9 @@ def test_soap_reduces_loss():
 
 def test_esoap_routed_groups_and_descent():
     model = _quadratic_model()
-    groups = optim.route_param_groups(model.named_parameters(), "esoap", weight_decay=0.01)
+    groups = optim.route_param_groups(
+        model.named_parameters(), "esoap", weight_decay=0.01, suffixes=(".weight",)
+    )
     assert [g["method"] for g in groups] == ["esoap", "adamw"]
     assert all(p.ndim == 2 for p in groups[0]["params"])
     assert len(groups[0]["params"]) == 2  # the two Linear weights
@@ -81,7 +83,9 @@ def test_esoap_routed_groups_and_descent():
 
 def test_sinksoaph_descent():
     model = _quadratic_model()
-    groups = optim.route_param_groups(model.named_parameters(), "sinksoaph")
+    groups = optim.route_param_groups(
+        model.named_parameters(), "sinksoaph", suffixes=(".weight",)
+    )
     hist = _train_steps(model, optim.SinkSOAPH(groups, lr=5e-3), steps=20)
     assert hist[-1] < hist[0]
 
@@ -95,6 +99,23 @@ def test_cautious_wd_never_fights_the_step():
     assert p[0] == pytest.approx(float(p0[0] - (0.5 + 0.1 * 0.5 * p0[0])))
     assert p[1] == pytest.approx(float(p0[1] - 0.5))
     assert p[2] == pytest.approx(float(p0[2] + 0.5))
+
+
+def test_default_suffixes_are_lamquant_verbatim():
+    assert optim.LINEAR_SUFFIXES == (
+        "in_proj.weight",
+        "x_proj.weight",
+        "out_proj.weight",
+        "spatial_mix.weight",
+    )
+    named = [
+        ("blocks.0.attn.in_proj.weight", torch.nn.Parameter(torch.zeros(4, 4))),
+        ("embed.weight", torch.nn.Parameter(torch.zeros(10, 4))),
+        ("norm.weight", torch.nn.Parameter(torch.zeros(4))),
+    ]
+    groups = optim.route_param_groups(named, "esoap")
+    assert len(groups[0]["params"]) == 1  # only the in_proj weight
+    assert len(groups[1]["params"]) == 2  # embedding + 1-D norm stay adamw
 
 
 def test_create_optimizer_unknown_name():
@@ -238,7 +259,7 @@ def test_envelope_alias_reads(tmp_path):
         path,
     )
     payload = ckpt.load_envelope(path)
-    assert payload["model"] == {"w": payload["model"]["w"]}
+    assert torch.equal(payload["model"]["w"], torch.zeros(1))
     assert payload["config"] == "abc123"
     assert payload["rng"]["torch"] is not None
     assert payload["epoch"] == 3  # extras preserved
@@ -361,9 +382,12 @@ def _run_pair(make_ours, make_orig, steps=8, seed=3):
 @needs_lamquant
 def test_soap_parity_with_lamquant():
     SoapOrig, _, _ = _import_originals()
+    # steps=25 crosses the precondition_frequency=10 QR eigenbasis refresh
+    # (twice), so the parity covers get_orthogonal_matrix_QR, not just init.
     ours, orig = _run_pair(
         lambda m: optim.SOAP(m.parameters(), lr=3e-3),
         lambda m: SoapOrig(m.parameters(), lr=3e-3),
+        steps=25,
     )
     assert torch.equal(ours, orig)
 
@@ -373,7 +397,9 @@ def test_esoap_parity_with_lamquant():
     _, EsoapOrig, _ = _import_originals()
 
     def groups_for(m):
-        return optim.route_param_groups(m.named_parameters(), "esoap", weight_decay=0.01)
+        return optim.route_param_groups(
+            m.named_parameters(), "esoap", weight_decay=0.01, suffixes=(".weight",)
+        )
 
     ours, orig = _run_pair(
         lambda m: optim.ESOAP(groups_for(m), lr=1e-2),
@@ -387,7 +413,9 @@ def test_sinksoaph_parity_with_lamquant():
     _, _, SinkOrig = _import_originals()
 
     def groups_for(m):
-        return optim.route_param_groups(m.named_parameters(), "sinksoaph")
+        return optim.route_param_groups(
+            m.named_parameters(), "sinksoaph", suffixes=(".weight",)
+        )
 
     ours, orig = _run_pair(
         lambda m: optim.SinkSOAPH(groups_for(m), lr=5e-3),

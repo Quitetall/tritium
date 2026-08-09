@@ -31,14 +31,17 @@ __all__ = [
     "LINEAR_SUFFIXES",
 ]
 
-# 2-D weight name-suffixes routed to the preconditioned (SOAP-family) group.
-# Verbatim from LamQuant's ingredient specs — covers Linear/Conv projections
-# in both the codec and transformer naming conventions.
+# 2-D weight name-suffixes routed to the preconditioned (SOAP-family) group —
+# VERBATIM from LamQuant's `_route_by_suffix` (`_LINEAR_SUFFIXES`), so a
+# migrated trainer gets byte-identical group assignments. Deliberately narrow:
+# a `.weight` catch-all would sweep embeddings and every other 2-D weight into
+# the Muon/Newton-Schulz tail, which the modded-nanogpt lineage avoids. Pass
+# `suffixes=` to widen for a different model family.
 LINEAR_SUFFIXES: tuple[str, ...] = (
-    ".weight",
-    "_proj.weight",
-    ".in_proj_weight",
-    ".out_proj.weight",
+    "in_proj.weight",
+    "x_proj.weight",
+    "out_proj.weight",
+    "spatial_mix.weight",
 )
 
 
@@ -50,11 +53,12 @@ def route_param_groups(
     suffixes: tuple[str, ...] = LINEAR_SUFFIXES,
 ) -> list[dict]:
     """Split parameters into a `method`-tagged preconditioned group (2-D
-    weights whose name ends in a linear suffix) and an `adamw` remainder group
-    (1-D params, embeddings-by-name, anything else). This is LamQuant's
-    `_route_by_suffix` contract: one optimizer object, per-group `method`
-    tags, one `.step()`/`.zero_grad()`, and an LR schedule that scales every
-    group.
+    weights whose name ends in one of `suffixes`) and an `adamw` remainder
+    group (everything else: 1-D params and any 2-D weight not matching —
+    embeddings are excluded only insofar as their names don't match, exactly
+    as in LamQuant). This is LamQuant's `_route_by_suffix` contract: one
+    optimizer object, per-group `method` tags, one `.step()`/`.zero_grad()`,
+    and an LR schedule that scales every group.
     """
     routed, rest = [], []
     for nm, q in named_params:
@@ -134,8 +138,9 @@ def clip_grad_norm_(
     parameters, max_norm: float, *, norm_type: float = 2.0
 ) -> torch.Tensor:
     """Global-norm gradient clipping. Thin, name-stable wrapper over
-    `torch.nn.utils.clip_grad_norm_` so cookbooks depend on one surface (and
-    the Rust tape's future clipping op can mirror this exact semantic:
-    scale all grads by `max_norm / max(total_norm, max_norm)`).
+    `torch.nn.utils.clip_grad_norm_` so cookbooks depend on one surface. A
+    Rust-tape mirror must reproduce torch's exact rule — scale by
+    `min(1, max_norm / (total_norm + 1e-6))` — not an idealized clamp, or the
+    two paths diverge bitwise near the threshold.
     """
     return torch.nn.utils.clip_grad_norm_(parameters, max_norm, norm_type=norm_type)

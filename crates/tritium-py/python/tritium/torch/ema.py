@@ -17,10 +17,13 @@ __all__ = ["Ema"]
 class Ema:
     """Weight EMA wrapper.
 
-    - ``update(model)`` after each optimizer step.
-    - ``sync_buffers(model, names)`` hand-syncs non-parameter buffers the
-      average does not track (LamQuant's CDF-breakpoint pattern: fitted state
-      refit mid-training must be copied into the EMA twin explicitly).
+    - ``update(model)`` after each optimizer step. Note torch's
+      ``AveragedModel`` (``use_buffers=False``) already copies ALL buffers
+      from the live model on every update — buffers are mirrored, not
+      averaged, and cannot be held frozen in the twin.
+    - ``sync_buffers(model, names)`` refreshes named buffers explicitly
+      BETWEEN updates (LamQuant's CDF-breakpoint pattern: fitted state refit
+      after the last ``update()`` must reach the twin before export).
     - ``state_dict()`` / ``load_state_dict()`` round-trip for the envelope's
       ``ema`` key; ``averaged_state_dict()`` is what ships when the EMA
       weights are the promoted artifact.

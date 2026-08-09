@@ -1,6 +1,34 @@
-# Ported verbatim from LamQuant (ingredients/optimizers/sinksoaph.py) into
+# Ported verbatim from LamQuant (lamquant/ingredients/optimizers/sinksoaph.py) into
 # tritium.torch by the LamQuant copyright holder; relicensed to this
-# repository's Apache-2.0 terms. Method provenance notes retained below.
+# repository's Apache-2.0 terms. Original header retained below.
+#
+# SinkSOAPH — Gram-Sinkhorn direction + hyperball post-step, for PyTorch.
+#
+# Method provenance (both OSI-approved, GPL-3.0-compatible):
+#   * SinkSOAP direction — KellerJordan/modded-nanogpt PR #298 (MIT):
+#       Gram-eigenbasis rotation of the momentum, then a Sinkhorn-Knopp
+#       row/column energy balance of the rotated update (no second-order
+#       moment), rotated back.
+#   * Hyperball post-step — marin-community/marin experiments/grug/moe
+#       (Apache-2.0), `adamh.py::_scale_invariant_2d`: a scale-invariant,
+#       norm-preserving sphere step. The applied delta has magnitude
+#       ``lr * ||p||`` in the (unit) update direction, after which the
+#       parameter is re-projected back onto the sphere of radius ``||p||``.
+#
+# "SinkSOAPH" = SinkSOAP direction with the hyperball post-step substituted
+# for SinkSOAP's Muon-Frobenius scaling + NorMuon post-conditioner. Because
+# the hyperball is the scale controller, neither the Muon-Frobenius rescale
+# nor the NorMuon branch is used here.
+#
+# This is a single ``torch.optim.Optimizer`` that routes each param group by
+# a ``method`` tag so the LamQuant SNN trainer can keep its single-optimizer
+# contract (one ``.step()`` / ``.zero_grad()``; the WSDScheduler scales every
+# group's ``lr``):
+#   * ``method="sinksoaph"`` — Gram-Sinkhorn + hyperball. 2-D params only.
+#   * ``method="adamw"``     — decoupled-weight-decay AdamW. Any shape.
+#
+# Single-GPU / single-process only — no torch.distributed sharding (the SNN
+# is 57 K params; the upstream all_gather param-shard loop is unnecessary).
 
 from __future__ import annotations
 

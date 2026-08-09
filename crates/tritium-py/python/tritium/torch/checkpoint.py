@@ -63,9 +63,12 @@ def restore_rng(state: dict[str, Any]) -> None:
         except ImportError:
             pass
     if "cuda" in state and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all(
-            [torch.as_tensor(s, dtype=torch.uint8) for s in state["cuda"]]
-        )
+        states = [torch.as_tensor(s, dtype=torch.uint8) for s in state["cuda"]]
+        # Restore what applies: a checkpoint from a bigger GPU fleet restores
+        # the first N states rather than raising on the count mismatch.
+        n = min(len(states), torch.cuda.device_count())
+        for i in range(n):
+            torch.cuda.set_rng_state(states[i], device=i)
 
 
 def save_envelope(
@@ -117,10 +120,29 @@ def save_envelope(
         f.flush()
         os.fsync(f.fileno())
     if path.exists():
+        # Hardlink (not rename) the current checkpoint to .prev so `path`
+        # exists at EVERY instant of the rotation — a crash between the two
+        # steps can never leave a resume with no checkpoint at `path`.
         prev = path.with_suffix(path.suffix + ".prev")
-        os.replace(path, prev)
+        prev.unlink(missing_ok=True)
+        try:
+            os.link(path, prev)
+        except OSError:
+            # Filesystem without hardlinks: fall back to copy-by-rename with
+            # the (now documented) brief no-file-at-path window.
+            os.replace(path, prev)
     os.replace(tmp, path)
+    # Directory fsync: the renames themselves must be durable before we claim
+    # the previous checkpoint may be dropped (CONTRACT.md §4 "until the new
+    # one is durable").
+    dir_fd = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
 
+    # weights_only=False is required (the rng key stores python/numpy state
+    # tuples) and safe here: we are re-reading bytes this process just wrote.
     reloaded = torch.load(path, map_location="cpu", weights_only=False)
     if smoke_check is not None:
         smoke_check(reloaded)
@@ -134,7 +156,8 @@ def save_envelope(
 def load_envelope(path: str | os.PathLike, map_location: str = "cpu") -> dict[str, Any]:
     """Load an envelope, normalizing v1 aliases to canonical keys (aliases are
     kept alongside so alias-era callers keep working). Raises if any canonical
-    key is unsatisfiable."""
+    key is unsatisfiable. Uses ``weights_only=False`` (rng state tuples) —
+    only load checkpoints you trust."""
     payload = torch.load(Path(path), map_location=map_location, weights_only=False)
     for canonical, aliases in ENVELOPE_ALIASES.items():
         if canonical not in payload:

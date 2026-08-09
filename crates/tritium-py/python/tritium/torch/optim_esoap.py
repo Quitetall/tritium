@@ -1,6 +1,36 @@
-# Ported verbatim from LamQuant (ingredients/optimizers/esoap.py) into
+# Ported verbatim from LamQuant (lamquant/ingredients/optimizers/esoap.py) into
 # tritium.torch by the LamQuant copyright holder; relicensed to this
-# repository's Apache-2.0 terms. Method provenance notes retained below.
+# repository's Apache-2.0 terms. Original header retained below.
+#
+# ESOAP — Eigen-Split adaptive optimizer: SOAP/Adam preconditioning on the
+# LEADING eigensubspace + Muon orthogonalization on the TAIL eigensubspace.
+#
+# CLEAN-ROOM reimplementation of the *principle* described in the COSMOS paper
+# (arXiv:2502.17410): "apply SOAP to the leading eigensubspace, which captures
+# the primary optimization dynamics, and Muon to the remaining eigensubspace."
+# Implemented from the paper's stated principle ONLY — no code from the
+# unlicensed upstream repo (github.com/lliu606/COSMOS) was read or copied; that
+# repo stays REFERENCE-ONLY in reference/REGISTRY.yaml and the trainer's
+# `--optimizer cosmos` remains hard-gated. This is our own design and may differ
+# from COSMOS in side-handling, rank split, and scaling.
+#
+# Method components (both OSI-permissive lineage):
+#   - SOAP eigenbasis idea (Gram eigvecs) — public; our own implementation.
+#   - Muon Newton-Schulz orthogonalizer — modded-nanogpt (MIT), standard NS5.
+#
+# Per 2-D weight W[m,n] with raw grad G and Nesterov momentum M:
+#   1. EMA right-Gram  C = β·C + (1-β)·GᵀG   (n×n)
+#   2. eigvecs V of C, descending eigenvalue
+#   3. rotate momentum into the column eigenbasis: A = M·V   (m×n)
+#   4. SPLIT columns by eigenvalue rank: lead = A[:, :r], tail = A[:, r:]
+#   5. LEAD → Adam: v ← β₂v + (1-β₂)lead²;  upd_lead = lead / (√v + ε)
+#   6. TAIL → Muon: upd_tail = NewtonSchulz5(tail)   (orthogonalize)
+#   7. recombine + rotate back: U = [upd_lead | upd_tail]·Vᵀ
+#   8. RMS-normalize U, apply  p ← p − lr·U   (decoupled wd optional)
+#
+# Single torch.optim.Optimizer with method-tagged groups (same contract as
+# sinksoaph.py): method="esoap" on 2-D matrices, method="adamw" on the rest.
+# Single-GPU / single-process.
 
 from __future__ import annotations
 

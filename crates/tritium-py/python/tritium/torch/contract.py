@@ -114,13 +114,27 @@ def write_heartbeat_file(state_json: str | os.PathLike, state: dict | None = Non
 
 
 def _canonical_json(obj: Any) -> str:
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    """The PINNED canonical-JSON dialect (CONTRACT.md §5): sorted keys,
+    ``,``/``:`` separators, ASCII-escaped non-ASCII (``\\uXXXX``), floats via
+    Python ``repr`` shortest round-trip, NaN/Inf rejected. Any other
+    implementation (the Rust engine included) must byte-match THIS output —
+    note ``1`` and ``1.0`` canonicalize differently by design; configs are
+    single-sourced so type-stable."""
+    return json.dumps(
+        obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False
+    )
 
 
 def resume_key(config: dict, data_digest: str) -> str:
-    """CONTRACT.md §5: BLAKE3(canonical_config_hash ‖ data_digest ‖ version),
-    hex. Requires the ``blake3`` package — the contract pins the algorithm, so
-    there is deliberately no silent fallback to another hash."""
+    """CONTRACT.md §5, pinned composition::
+
+        config_hash = blake3(canonical_json(config)).hex
+        key         = blake3(config_hash + "\\x1f" + data_digest
+                             + "\\x1f" + CONTRACT_VERSION).hex
+
+    (0x1f unit separators; all pieces UTF-8.) Requires the ``blake3`` package —
+    the contract pins the algorithm, so there is deliberately no silent
+    fallback to another hash."""
     try:
         from blake3 import blake3
     except ImportError as e:  # pragma: no cover - environment dependent
