@@ -437,7 +437,10 @@ fn salt_fp_vs_gguf_stage_dump() {
     let absmean = |w: &[f32]| w.iter().map(|x| f64::from(x.abs())).sum::<f64>() / w.len() as f64;
     let hf_w = |p: &Projection| match p {
         Projection::Dense(d) => d.weights.clone(),
-        Projection::Salt(_) | Projection::HostSaltV2(_) | Projection::Ternary(_) => {
+        Projection::Salt(_)
+        | Projection::HostSaltV2(_)
+        | Projection::Ternary(_)
+        | Projection::Q2(_) => {
             unreachable!("hf is dense")
         }
         #[cfg(feature = "cuda")]

@@ -25,7 +25,10 @@ fn model_dir() -> PathBuf {
 fn dense(p: &Projection) -> (&[f32], usize, usize) {
     match p {
         Projection::Dense(d) => (&d.weights, d.n_out, d.k_in),
-        Projection::Salt(_) | Projection::HostSaltV2(_) | Projection::Ternary(_) => {
+        Projection::Salt(_)
+        | Projection::HostSaltV2(_)
+        | Projection::Ternary(_)
+        | Projection::Q2(_) => {
             panic!("from_hf builds Dense projections")
         }
         #[cfg(feature = "cuda")]

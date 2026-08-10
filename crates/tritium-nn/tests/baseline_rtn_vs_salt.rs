@@ -168,20 +168,20 @@ fn salt_vs_rtn_quality_per_byte() {
     let g = group();
     let alpha = fold_alpha();
 
+    // Peak host memory is the binding constraint on a shared workstation, and it is knowable up
+    // front. The arms below are ordered so at most TWO f32 copies of the model are live at once
+    // (a source and the arm being scored) rather than three — see the `drop(fp)` below. Reported
+    // so a run that would evict a co-tenant is visible before it starts rather than after the
+    // kernel picks a victim.
+    let params: usize = shapes.iter().map(|&(n, k)| n * k).sum();
+    let copy_gib = params as f64 * 4.0 / (1024.0 * 1024.0 * 1024.0);
+    eprintln!(
+        "peak host weights ≈ {:.1} GiB ({params} params × f32 × 2 live copies)",
+        copy_gib * 2.0
+    );
+
     // The fp reference is scored on the ORIGINAL weights, before the fold reparameterizes them.
     let ppl_fp = ev.ppl(&fp, &arch, &eval, EVAL_WINDOW);
-
-    // Calibrate once; the folded pair feeds every folded arm so the fold is identical across them.
-    let mut calib = Calib::new(&arch);
-    for w in 0..CALIB_WINDOWS {
-        calibrate(
-            &fp,
-            &arch,
-            &train[w * CALIB_SEQ..(w + 1) * CALIB_SEQ],
-            &mut calib,
-        );
-    }
-    let (fp_folded, arch_folded) = fold(&fp, &shapes, &arch, &calib, alpha);
 
     println!(
         "{} | fp {ppl_fp:.3} ppl | {} held-out tokens | g{g} | B3 bpw | fold α={alpha} | eval={}\n\
@@ -222,6 +222,24 @@ fn salt_vs_rtn_quality_per_byte() {
         let ppl = ev.ppl(&q, &arch, &eval, EVAL_WINDOW);
         score(format!("RTN int{bits} g{g}"), rtn_bpw(bits), ppl, false);
     }
+
+    // Calibration and the fold happen HERE, after the unfolded arms are done, so that `fp` can be
+    // released the moment the folded copy exists. Folding up front (the obvious order) keeps `fp`,
+    // `fp_folded` and the arm under test all live — three full f32 copies, 20.5 GiB at 1.7B — and
+    // on a shared box that is the difference between finishing and being OOM-killed.
+    let mut calib = Calib::new(&arch);
+    for w in 0..CALIB_WINDOWS {
+        calibrate(
+            &fp,
+            &arch,
+            &train[w * CALIB_SEQ..(w + 1) * CALIB_SEQ],
+            &mut calib,
+        );
+    }
+    let (fp_folded, arch_folded) = fold(&fp, &shapes, &arch, &calib, alpha);
+    drop(fp);
+    drop(calib);
+
     for bits in [2u32, 3, 4, 5, 6, 8] {
         let q: Vec<Vec<f32>> = fp_folded
             .iter()
