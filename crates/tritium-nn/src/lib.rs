@@ -20,6 +20,8 @@ mod kv_cache;
 mod layers;
 mod model;
 mod ops;
+#[cfg(feature = "cuda")]
+mod pv_recovery;
 mod qwen35_config;
 #[cfg(feature = "cuda")]
 mod recovery;
@@ -73,6 +75,12 @@ pub use ops::{
     QB, gqa_attention, quantize_activation_int8, rmsnorm, rmsnorm_zero_centered, rope_apply,
     rope_apply_partial_neox, sample_categorical, sample_greedy, sample_top_k, sample_top_p,
     softmax_rows, truncated_top_k, truncated_top_p,
+};
+#[cfg(feature = "cuda")]
+pub use pv_recovery::{
+    DEFAULT_PV_HOST_GRADIENT_BLOCK_ELEMENTS, DevicePvRecoveryCheckpointArtifact,
+    DevicePvRecoveryError, DevicePvRecoveryParentContext, DevicePvRecoverySession,
+    DevicePvRecoveryStepReceipt, DevicePvRecoveryWeightVisitError,
 };
 pub use qwen35_config::{
     QWEN36_27B_REPOSITORY, QWEN36_27B_REVISION, Qwen35CheckpointConfig, Qwen35DeltaNetConfig,
