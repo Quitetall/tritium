@@ -50,6 +50,11 @@ cuda_device_loss_env_contract = MODULE["cuda_device_loss_env_contract"]
 restore_cuda_device_loss_env = MODULE["restore_cuda_device_loss_env"]
 validate_cuda_device_loss = MODULE["validate_cuda_device_loss"]
 qualified_generation_sha256 = MODULE["qualified_generation_sha256"]
+artifact_startup_fault_command = MODULE["artifact_startup_fault_command"]
+artifact_startup_contract = MODULE["artifact_startup_contract"]
+artifact_startup_fault_script = MODULE["artifact_startup_fault_script"]
+restore_artifact_startup_script = MODULE["restore_artifact_startup_script"]
+artifact_startup_error_line = MODULE["artifact_startup_error_line"]
 auth_secret_contract = MODULE["auth_secret_contract"]
 missing_secret_failure = MODULE["missing_secret_failure"]
 restore_missing_secret_refs = MODULE["restore_missing_secret_refs"]
@@ -184,7 +189,96 @@ def startup_argument_receipt(scenario: str, flavor: str,
     }
 
 
-def cuda_device_loss_receipt(startup_receipt: dict) -> dict:
+def artifact_startup_receipt(scenario: str, flavor: str, startup_receipt: dict,
+                             baseline: dict, index: int) -> dict:
+    versions = (str(60 + index * 10), str(61 + index * 10), str(62 + index * 10))
+    started = 10_000.0 + index * 7_000.0
+    script = "sha256sum -c -; chmod -R a-w /staged/bundle"
+    deployment = {
+        "metadata": {"uid": "deployment-uid", "resourceVersion": versions[0]},
+        "spec": {"template": {"spec": {"initContainers": [{
+            "name": "stage-verified-artifact", "args": [script],
+        }]}}},
+    }
+    binding = artifact_startup_contract(deployment, profile="compact-v1")
+    fault_script, fault_command = artifact_startup_fault_script(
+        binding, scenario=scenario, profile="compact-v1",
+    )
+    fault_patch = [
+        {"op": "test", "path": "/metadata/uid", "value": "deployment-uid"},
+        {"op": "test", "path": "/metadata/resourceVersion", "value": versions[0]},
+        {"op": "test", "path": binding["script_path"], "value": script},
+        {"op": "replace", "path": binding["script_path"], "value": fault_script},
+    ]
+    restore_patch = [
+        {"op": "test", "path": "/metadata/uid", "value": "deployment-uid"},
+        {"op": "test", "path": binding["script_path"], "value": fault_script},
+        {"op": "replace", "path": binding["script_path"], "value": script},
+    ]
+    error_lines = {
+        "malformed_manifest": (
+            'Error: InvalidArtifact("parse strict schema-v3 manifest: EOF while '
+            'parsing an object at line 1 column 1")'
+        ),
+        "truncated_profile": (
+            'Error: InvalidArtifact("open SALT V2 profile: package header is truncated")'
+        ),
+        "wrong_identity": (
+            'Error: Provenance("HF asset `config.json` differs from manifest")'
+        ),
+    }
+    recovered = {"pods": [{
+        "name": f"pod-{scenario}-recovered", "uid": f"{scenario}-recovered-uid",
+        "node": "node-1", "restarts": 0,
+    }]}
+    return {
+        "scenario": scenario, "deployment_uid": "deployment-uid",
+        "baseline_resource_version": versions[0],
+        "fault_resource_version": versions[1],
+        "restored_resource_version": versions[2],
+        "binding": binding, "fault_script": fault_script,
+        "fault_command": fault_command,
+        "fault_patch_sha256": hashlib.sha256(
+            canonical(fault_patch).decode().strip().encode()
+        ).hexdigest(),
+        "restore_patch_sha256": hashlib.sha256(
+            canonical(restore_patch).decode().strip().encode()
+        ).hexdigest(),
+        "observation_budget_ms": 120000, "duration_ms": 5000.0,
+        "started_elapsed_ms": started, "completed_elapsed_ms": started + 6000.0,
+        "baseline": copy.deepcopy(baseline),
+        "failure": {
+            "pod_name": f"pod-{scenario}", "pod_uid": f"{scenario}-pod-uid",
+            "container": "tritium", "exit_code": 1, "reason": "Error",
+            "restart_count": 1, "termination_source": "last_state",
+            "replica_set_name": f"qualification-tritium-{scenario}",
+            "replica_set_uid": f"{scenario}-rs-uid",
+            "replica_set_owner": {
+                "kind": "Deployment", "name": "qualification-tritium",
+                "uid": "deployment-uid",
+            },
+            "error_line": error_lines[scenario], "normalized_log_sha256": "d" * 64,
+        },
+        "recovered": recovered, "startup_receipt": dict(startup_receipt),
+        "generation_response_sha256": "e" * 64,
+        "request": request_evidence("tritium", "Hello", temperature=0, max_tokens=1),
+        "metrics": {"sha256": "f" * 64, "values": {
+            "tritium_chat_requests_total": 1.0,
+            "tritium_tokens_out_total": 1.0,
+            "tritium_worker_alive": 1.0,
+            "tritium_backend_faults_total": 0.0,
+            "tritium_backend_faulted": 0.0,
+        }},
+        "cleanup": {"status": "restored"},
+        "transitions": [
+            {"state": state, "elapsed_ms": float(position * 1000),
+             "observed_at_utc": f"2026-07-21T12:01:0{position}+00:00"}
+            for position, state in enumerate(MODULE["ARTIFACT_STARTUP_TRANSITIONS"])
+        ],
+    }
+
+
+def cuda_device_loss_receipt(startup_receipt: dict, baseline: dict) -> dict:
     env_path = "/spec/template/spec/containers/0/env"
     gate = {
         "name": MODULE["CUDA_DEVICE_LOSS_ENV"], "value": "1",
@@ -244,11 +338,8 @@ def cuda_device_loss_receipt(startup_receipt: dict) -> dict:
             MODULE["CUDA_DEVICE_LOSS_SIGNAL_COMMAND"].encode()
         ).hexdigest(),
         "observation_budget_ms": MODULE["CUDA_DEVICE_LOSS_BUDGET_MS"],
-        "started_elapsed_ms": 20_000.0, "duration_ms": 60_000.0,
-        "baseline": {"pods": [{
-            "name": "pod-cuda-baseline", "uid": "cuda-baseline-uid",
-            "node": "node-1", "restarts": 0,
-        }]},
+        "started_elapsed_ms": 32_000.0, "duration_ms": 60_000.0,
+        "baseline": copy.deepcopy(baseline),
         "fault_baseline": {"pods": [{
             "name": "pod-cuda-fault", "uid": "cuda-fault-uid",
             "node": "node-1", "restarts": 0,
@@ -327,6 +418,26 @@ def cuda_device_loss_receipt(startup_receipt: dict) -> dict:
 def receipt(chart: Path, image_archive: Path, candidate: Path,
             flavor: str = "cpu") -> dict:
     startup_receipt = startup(flavor)
+    invalid_config_startup = startup_argument_receipt(
+        "invalid_config", flavor, startup_receipt
+    )
+    unavailable_backend_startup = startup_argument_receipt(
+        "unavailable_backend", flavor, startup_receipt
+    )
+    artifact_startup_failures = {}
+    artifact_baseline = unavailable_backend_startup["recovered"]
+    for artifact_index, artifact_scenario in enumerate((
+        "malformed_manifest", "truncated_profile", "wrong_identity",
+    )):
+        artifact_evidence = artifact_startup_receipt(
+            artifact_scenario, flavor, startup_receipt,
+            artifact_baseline, artifact_index,
+        )
+        artifact_startup_failures[artifact_scenario] = artifact_evidence
+        artifact_baseline = artifact_evidence["recovered"]
+    watchdog_pod_uid = (
+        "cuda-recovered-uid" if flavor == "cuda" else "wrong_identity-recovered-uid"
+    )
     recovered_name = "pod-artifact-recovered" if flavor == "cuda" else "pod-new"
 
     def resource_sample(name: str | None, timestamp: str, seed: str) -> dict:
@@ -393,7 +504,7 @@ def receipt(chart: Path, image_archive: Path, candidate: Path,
                                     "node": "node-1", "restarts": 0}]},
             "startup_receipt": startup_receipt,
             "watchdog_replacement": {
-                "pod_uid": "pod-old-uid",
+                "pod_uid": watchdog_pod_uid,
                 "container_id_before": "containerd://old",
                 "container_id_after": "containerd://new",
                 "restart_count_before": 0,
@@ -646,14 +757,11 @@ def receipt(chart: Path, image_archive: Path, candidate: Path,
                     for index, state in enumerate(MODULE["MISSING_SECRET_TRANSITIONS"])
                 ],
             },
-            "invalid_config_startup": startup_argument_receipt(
-                "invalid_config", flavor, startup_receipt
-            ),
-            "unavailable_backend_startup": startup_argument_receipt(
-                "unavailable_backend", flavor, startup_receipt
-            ),
+            "invalid_config_startup": invalid_config_startup,
+            "unavailable_backend_startup": unavailable_backend_startup,
+            "artifact_startup_failures": artifact_startup_failures,
             "cuda_device_loss": (
-                cuda_device_loss_receipt(startup_receipt)
+                cuda_device_loss_receipt(startup_receipt, artifact_baseline)
                 if flavor == "cuda" else None
             ),
             "restart_startup_receipt": dict(startup_receipt),
@@ -896,6 +1004,140 @@ def validate(value: dict, chart: Path, image: Path, manifest: Path,
 
 
 class QualifyKubernetesDeploymentTests(unittest.TestCase):
+    def test_artifact_startup_contract_builds_exact_staged_copy_faults(self):
+        script = (
+            "umask 077; cp -R /source/. /staged/bundle/; "
+            "printf '%s  %s\\n' \"${EXPECTED_MANIFEST_SHA256}\" "
+            "/staged/bundle/tritium.json | sha256sum -c -; "
+            "chmod -R a-w /staged/bundle"
+        )
+        deployment = {
+            "metadata": {"uid": "deployment-uid", "resourceVersion": "50"},
+            "spec": {"template": {"spec": {"initContainers": [{
+                "name": "stage-verified-artifact", "args": [script],
+            }]}}},
+        }
+        contract = artifact_startup_contract(deployment, profile="compact-v1")
+        self.assertEqual(contract["container_index"], 0)
+        self.assertEqual(contract["script_sha256"], hashlib.sha256(script.encode()).hexdigest())
+        expected = {
+            "malformed_manifest": "printf '{' > /staged/bundle/tritium.json",
+            "truncated_profile": "printf '\\000' > /staged/bundle/compact.tsalt2",
+            "wrong_identity": "printf '\\n' >> /staged/bundle/config.json",
+        }
+        for scenario, command in expected.items():
+            with self.subTest(scenario=scenario):
+                faulted, observed = artifact_startup_fault_script(
+                    contract, scenario=scenario, profile="compact-v1",
+                )
+                self.assertEqual(observed, command)
+                self.assertEqual(faulted.count(command), 1)
+                self.assertLess(faulted.index(command), faulted.index(contract["marker"]))
+
+        contaminated = copy.deepcopy(deployment)
+        contaminated["spec"]["template"]["spec"]["initContainers"][0]["args"][0] = (
+            script.replace(contract["marker"], expected["malformed_manifest"] + "; "
+                           + contract["marker"])
+        )
+        with self.assertRaisesRegex(DeploymentError, "baseline script"):
+            artifact_startup_contract(contaminated, profile="compact-v1")
+
+    def test_artifact_startup_cleanup_tracks_reordered_init_container(self):
+        script = "sha256sum -c -; chmod -R a-w /staged/bundle"
+        deployment = {
+            "metadata": {"uid": "deployment-uid", "resourceVersion": "50"},
+            "spec": {"template": {"spec": {"initContainers": [{
+                "name": "stage-verified-artifact", "args": [script],
+            }]}}},
+        }
+        contract = artifact_startup_contract(deployment, profile="compact-v1")
+        fault_script, command = artifact_startup_fault_script(
+            contract, scenario="malformed_manifest", profile="compact-v1",
+        )
+        extra = {"name": "foreign-init", "args": ["true"]}
+        faulted = copy.deepcopy(deployment)
+        faulted["metadata"]["resourceVersion"] = "51"
+        faulted["spec"]["template"]["spec"]["initContainers"] = [
+            extra, {"name": "stage-verified-artifact", "args": [fault_script]},
+        ]
+        cleaned = copy.deepcopy(faulted)
+        cleaned["metadata"]["resourceVersion"] = "52"
+        cleaned["spec"]["template"]["spec"]["initContainers"][1]["args"] = [script]
+        run_mock = mock.Mock(return_value="")
+        with mock.patch.dict(restore_artifact_startup_script.__globals__, {
+            "run": run_mock,
+            "run_json": mock.Mock(side_effect=[faulted, cleaned]),
+        }):
+            restored, restore_sha = restore_artifact_startup_script(
+                ["kubectl"], service="qualification-tritium", contract=contract,
+                fault_command=command, timeout=10,
+            )
+        self.assertEqual(restored, cleaned)
+        payload = run_mock.call_args.args[0][-1].removeprefix("--patch=")
+        self.assertIn("/spec/template/spec/initContainers/1/args/0", payload)
+        self.assertEqual(restore_sha, hashlib.sha256(payload.encode()).hexdigest())
+
+        replacement = copy.deepcopy(deployment)
+        replacement["metadata"]["uid"] = "replacement-uid"
+        with mock.patch.dict(restore_artifact_startup_script.__globals__, {
+            "run_json": mock.Mock(return_value=replacement),
+        }), self.assertRaisesRegex(DeploymentError, "Deployment identity"):
+            restore_artifact_startup_script(
+                ["kubectl"], service="qualification-tritium", contract=contract,
+                fault_command=command, timeout=10,
+            )
+
+        drifted = copy.deepcopy(deployment)
+        drifted["metadata"]["resourceVersion"] = "53"
+        drifted_script = fault_script.replace(contract["marker"], (
+            "echo foreign-controller; " + contract["marker"]
+        ))
+        drifted["spec"]["template"]["spec"]["initContainers"][0]["args"] = [
+            drifted_script
+        ]
+        safely_cleaned = copy.deepcopy(drifted)
+        safely_cleaned["metadata"]["resourceVersion"] = "54"
+        safely_cleaned["spec"]["template"]["spec"]["initContainers"][0]["args"] = [
+            script.replace(contract["marker"], (
+                "echo foreign-controller; " + contract["marker"]
+            ))
+        ]
+        run_mock = mock.Mock(return_value="")
+        with mock.patch.dict(restore_artifact_startup_script.__globals__, {
+            "run": run_mock,
+            "run_json": mock.Mock(side_effect=[drifted, safely_cleaned]),
+        }), self.assertRaisesRegex(DeploymentError, "foreign drift"):
+            restore_artifact_startup_script(
+                ["kubectl"], service="qualification-tritium", contract=contract,
+                fault_command=command, timeout=10,
+            )
+        cleanup_patch = __import__("json").loads(
+            run_mock.call_args.args[0][-1].removeprefix("--patch=")
+        )
+        self.assertNotIn(command, cleanup_patch[-1]["value"])
+
+    def test_artifact_startup_error_grammar_is_scenario_specific(self):
+        lines = {
+            "malformed_manifest": (
+                'Error: InvalidArtifact("parse strict schema-v3 manifest: EOF while '
+                'parsing an object at line 1 column 1")'
+            ),
+            "truncated_profile": (
+                'Error: InvalidArtifact("open SALT V2 profile: package header is truncated")'
+            ),
+            "wrong_identity": (
+                'Error: Provenance("HF asset `config.json` differs from manifest")'
+            ),
+        }
+        for scenario, line in lines.items():
+            with self.subTest(scenario=scenario):
+                self.assertEqual(
+                    artifact_startup_error_line(f"loader context\n{line}\n", scenario=scenario),
+                    line,
+                )
+                with self.assertRaisesRegex(DeploymentError, "error line differs"):
+                    artifact_startup_error_line("Error: unrelated", scenario=scenario)
+
     def test_qualified_generation_requires_one_choice(self):
         response = {
             "id": "chatcmpl-test", "object": "chat.completion", "created": 1,
@@ -2395,6 +2637,47 @@ class QualifyKubernetesDeploymentTests(unittest.TestCase):
                     ):
                         validate(value, chart, image, manifest, build, candidate)
 
+    def test_receipt_validator_binds_artifact_startup_failures(self):
+        cases = (
+            ("malformed_manifest", "patch"),
+            ("truncated_profile", "error"),
+            ("wrong_identity", "command"),
+            ("truncated_profile", "baseline"),
+            ("wrong_identity", "transition"),
+            ("truncated_profile", "timing"),
+        )
+        for scenario, target in cases:
+            with (self.subTest(scenario=scenario, target=target),
+                  tempfile.TemporaryDirectory() as raw):
+                chart, image, manifest, build, candidate = candidate_inputs(raw)
+                value = receipt(chart, image, candidate)
+                evidence = value["workload"]["artifact_startup_failures"][scenario]
+                if target == "patch":
+                    evidence["fault_patch_sha256"] = "0" * 64
+                elif target == "error":
+                    evidence["failure"]["error_line"] = "Error: unrelated"
+                elif target == "command":
+                    evidence["fault_command"] = "true"
+                elif target == "baseline":
+                    evidence["baseline"]["pods"][0]["uid"] = "foreign-baseline"
+                elif target == "transition":
+                    evidence["transitions"][1], evidence["transitions"][2] = (
+                        evidence["transitions"][2], evidence["transitions"][1]
+                    )
+                else:
+                    evidence["started_elapsed_ms"] = 1.0
+                del value["receipt_id"]
+                value["receipt_id"] = "sha256:" + hashlib.sha256(
+                    canonical(value)
+                ).hexdigest()
+                with self.assertRaisesRegex(
+                    DeploymentError,
+                    "artifact patch evidence|artifact startup error line|"
+                    "artifact mutation|artifact baseline|transition sequence|"
+                    "artifact identity or bounds",
+                ):
+                    validate(value, chart, image, manifest, build, candidate)
+
     def test_receipt_validator_requires_clean_post_restart_recovery(self):
         with tempfile.TemporaryDirectory() as raw:
             chart, image, manifest, build, candidate = candidate_inputs(raw)
@@ -2712,7 +2995,10 @@ class QualifyKubernetesDeploymentTests(unittest.TestCase):
             chart, image, manifest, build, candidate = candidate_inputs(raw)
             value = receipt(chart, image, candidate)
             value["workload"]["cuda_device_loss"] = cuda_device_loss_receipt(
-                value["workload"]["startup_receipt"]
+                value["workload"]["startup_receipt"],
+                value["workload"]["artifact_startup_failures"][
+                    "wrong_identity"
+                ]["recovered"],
             )
             del value["receipt_id"]
             value["receipt_id"] = "sha256:" + hashlib.sha256(canonical(value)).hexdigest()
