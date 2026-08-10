@@ -1,22 +1,29 @@
 # Ternary formats: what Tritium reads, writes, and refuses
 
 Ternary weights are trits × scales in any container. Tritium's policy is
-**compute formats decoupled from interchange formats**: the loader unpacks
-every supported container to trits at load, and each backend packs its own
-native layout (TQ2_0 by default; TQ1_0 under the opt-in capacity rung below)
-— so file bytes never touch kernel code, and any supported file generates
-bit-identically to any other encoding of the same trits.
+**compute formats decoupled from interchange formats**. I2_S/TQ1_0/TQ2_0
+normalize into each backend's selected layout. Standard Q2_0 keeps its exact
+group-64 packed bytes in a portable A8 projection until native backend kernels
+land. Equivalent artifacts must bind canonical semantic trits and scales;
+zero-scale stored codes are ignored. Token identity is measured, not inferred
+from format names.
 
 ## Supported containers
 
 | format | bpw | scale | role |
 |---|---|---|---|
 | **I2_S** (ggml type 36) | 2.00 | per-tensor f32 | bitnet.cpp's baseline; what BitNet checkpoints ship as |
+| **Q2_0** (ggml type 42) | 2.25 | per-64 f16 | standard llama.cpp interchange; packed portable execution |
 | **TQ2_0** (ggml type 35) | 2.06 | per-block f16 | the GPU compute layout (base-4 codes → 2-bit shifts → dp4a) |
 | **TQ1_0** (ggml type 34) | 1.69 | per-block f16 | storage/interchange — base-243 (5 trits/byte), ~18% smaller ternary payload |
 
-`tritium repack --input a.gguf --output b.gguf --to tq1|tq2` converts
-losslessly between them (BitNet 2B4T: 1.188 GB → 1.106 GB as TQ1_0, ~10 s).
+`tritium repack --input a.gguf --output b.gguf --to q2|tq1|tq2` preserves
+dequantized ternary weight values while copying dense tensors and rebinding
+exporter-owned scale metadata. Q2_0 uses G64 scales. Conversion to a G256 TQ
+format fails closed if four nonzero G64 scales differ; conversion never averages
+them. Zero-scale groups are semantic zeros and their stored codes may be
+canonicalized. Publication uses a verified sibling temporary plus atomic rename,
+including in-place conversion. BitNet 2B4T: 1.188 GB → 1.106 GB as TQ1_0.
 
 **Ship TQ1_0, run TQ2_0 — unless VRAM is the constraint.** By default the
 loader unpacks TQ1_0 to trits and the CUDA backend packs TQ2_0, so a TQ1_0
@@ -65,14 +72,17 @@ checkpoints' scales are **not f16-representable** (e.g. `blk.0.attn_q` =
 Foreign loaders (llama.cpp et al.) fall back to the f16 block scales —
 ~1e-4 relative on the scale, the TQ formats' native precision.
 
-Per-block scales must be uniform within each **row** of a tensor. Two cases
+TQ1_0/TQ2_0 scales must be uniform within each **row** of a tensor. Two cases
 load: all rows sharing one scale takes the exact per-tensor path (with the
 `i2s_scale` metadata check), and row-uniform scales that *differ across
 rows* load as a per-row-scale ternary linear — the GEMM contract is per-row
 `weight_scale[n]`, so this is exact, and it is what a per-row-α trained LM
 head (ADR 0032 T2a) exports as TQ2_0. All-zero blocks (scale 0) have their
-trits forced to the zero trit — exact at any scale. Scales that vary *within*
-a row are rejected loudly rather than silently mis-scaled.
+trits forced to the zero trit — exact at any scale. TQ scales that vary *within*
+a row are rejected loudly rather than silently mis-scaled. Standard Q2_0 is
+different: its G64 scales may vary within a row and remain packed in `Q2Linear`;
+code 3 (`+2`) and non-finite scales fail before the projection is published.
+`tritium report sparsity` applies the same scale semantics before counting zeros.
 
 ## TL1 / TL2: a non-goal, deliberately
 

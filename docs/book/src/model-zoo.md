@@ -29,25 +29,27 @@ evidence receipts; absent evidence remains `MISSING`.
 ## What the loader accepts
 
 `ModelRunner::load` (and the convenience `ModelRunner::load_cpu`) read a parsed
-GGUF container and map ggml tensor type-ids to internal storage. Only three
-type-ids are consumed today (`crates/tritium-nn/src/model/weights.rs`):
+GGUF container and map ggml tensor type-ids to internal storage. Six
+type-ids are consumed by the BitNet loader (`crates/tritium-nn/src/model/weights.rs`):
 
 | ggml type-id | name | role | how it is stored |
 |--------------|------|------|------------------|
 | `36` | `I2_S` | the ternary linear weights (`attn_q/k/v/output`, `ffn_gate/up/down`) | unpacked to `{-1, 0, +1}` trits + a per-tensor f32 scale, then **re-packed as `TQ2_0`** and uploaded to the backend |
+| `34` | `TQ1_0` | group-256 ternary linear weights | decoded, checked for row-compatible scales, then packed into the selected backend layout |
+| `35` | `TQ2_0` | group-256 ternary linear weights | decoded, checked for row-compatible scales, then packed into the selected backend layout |
+| `42` | standard `Q2_0` | group-64 ternary linear weights | retained packed by `Q2Linear`; varying finite G64 scales execute exactly through the portable A8 path without a dense weight shadow |
 | `0` | `F32` | norms (`attn_norm`, `ffn_norm`, the sub-norms, `output_norm`) | kept host-side as fp32 |
 | `1` | `F16` | the token embedding (`token_embd.weight`) | widened to fp32 |
 
-A ternary tensor that is **not** `I2_S` (`ggml_type != 36`) makes the loader
-return `NnError::UnsupportedTensorType`. So although Tritium's *packing layer*
-(`tritium-format`) is built around `TQ1_0`/`TQ2_0` — and the
-[Conformance](./conformance.md) vectors and every backend's `mpgemm` are graded
-on those packings — the **model loader** ingests the BitNet checkpoint via the
-`I2_S` path and converts to `TQ2_0` internally. `TQ1_0`/`TQ2_0` are how trits are
-*packed for a kernel*, not (today) a GGUF tensor type the runner reads directly.
+The loader dispatches on explicit GGUF type IDs; it does not sniff bytes.
+`I2_S`/`TQ1_0`/`TQ2_0` normalize into the backend's selected compute layout.
+Standard Q2_0 retains its group-64 scales and packed payload through a portable
+projection because collapsing four G64 scales into one G256 scale would be lossy.
+This path is correctness/interchange coverage, not yet a backend-native Q2_0
+performance claim.
 
-> The `tritium inspect` tool labels `F32`, `F16`, `TQ1_0` (id `34`), and `TQ2_0`
-> (id `35`) by name and prints any other id as `type N` — so an `I2_S` tensor
+> The `tritium inspect` tool labels `F32`, `F16`, `TQ1_0` (id `34`), `TQ2_0`
+> (id `35`), and standard `Q2_0` (id `42`) by name; other ids print as `type N`, so an `I2_S` tensor
 > shows up as `type 36`. Inspect is a container dump; it does **not** imply the
 > runner can load every type it can name.
 
@@ -88,7 +90,8 @@ with `--eos <ID>` on `generate` and `report parity`.
 | **BitNet b1.58 2B4T**, `I2_S` GGUF, **CUDA** backend | **Verified-compatible (GPU lane)** | `acceptance.rs` (`cuda_greedy_matches_transformers` — full 256-token greedy match; perplexity within 1% of the `transformers` reference; CPU↔CUDA logit parity). Runs only with `--features cuda` on a real CUDA device + the model present; **self-skips** otherwise. |
 | Any other `I2_S` GGUF with the BitNet 2B4T layer layout | **Expected-compatible** | The loader path is type-driven, not file-specific, so an `I2_S` checkpoint with the same tensor names and the supported `F32`/`F16` companions should load — but no committed test pins a *different* artifact, so it is not claimed as verified. |
 | A SALT-quantized GGUF written by `tritium quantize ... --format gguf` | **Expected-compatible (SALT path)** | `tritium-format` can write a SALT bundle into a GGUF (`crates/tritium-format/src/salt_gguf.rs`); see [Quantization](./quantization.md). This is the producer side; loading such an artifact back through `ModelRunner` is not part of the committed acceptance gates. |
-| A GGUF whose ternary tensors are native `TQ1_0`/`TQ2_0` (not `I2_S`) | **Not loaded today** | `load_ternary` accepts only `I2_S` for the linear weights; a native `TQ*_0` tensor returns `UnsupportedTensorType`. `inspect` can still *name* those tensors. |
+| BitNet b1.58 2B4T repacked as native `TQ1_0`/`TQ2_0` | **Verified-compatible** | `repack::tests::repacked_tq1_model_loads_bit_identical` proves exact logits; the real Q2_0/TQ2_0 interop harness also loads the TQ2_0 sibling. |
+| BitNet b1.58 2B4T repacked as standard group-64 `Q2_0` | **Verified loader + gated token interop** | `q2_0_interop.rs` binds Q2_0/TQ2_0 artifact and prompt digests, decodes every paired ternary tensor to prove exact scale-compatible weight equivalence, requires byte-identical non-ternary payloads, and compares greedy tokens. Its v2 receipt labels truncated runs `smoke`; only the frozen three-distinct-prompt × 16-token profile is qualifying. |
 
 > **No bundled weights.** The repo ships **no** model file — the 2B4T GGUF is an
 > external download (it lives at

@@ -65,13 +65,47 @@ a full quantize via `tritium report salt`.
 
 ## Stage-7 token evidence
 
+Collect the frozen source rows at the three immutable Hub revisions before
+building the token pack:
+
+```sh
+python scripts/collect-stage7-sampled-rows.py \
+  --output-dir ./stage7-sampled-rows
+```
+
+Install its frozen producer dependencies first:
+
+```sh
+python -m pip install --requirement scripts/requirements-stage7-collection.txt
+```
+
+The collector preflights access to
+all three datasets before downloading any payload, verifies every downloaded
+LFS SHA-256 and size through one retained descriptor, terminally rehashes that
+descriptor, and uses each frozen partition seed to rank source locators into
+four disjoint lanes. It requires at least one source row per eventual sequence
+as well as a conservative UTF-8 byte floor, then atomically publishes
+`sampled-rows.json`, its JSONL lanes, and a separate
+`tritium.stage7-row-acquisition.v1` receipt. The download ceiling is
+campaign-wide. Duplicate content is excluded
+deterministically and disclosed in the receipt; insufficient unique content,
+existing output, incomplete sources, changed shard identities, and unauthorised
+StarCoderData access fail closed. No public or synthetic dataset may silently
+replace the gated lane. Authenticate with `hf auth login` only after Hugging
+Face grants access to `bigcode/starcoderdata`.
+
+The row collector is acquisition evidence, not proof that every raw-text lane
+contains enough tokenizer output. `build-stage7-evidence-pack` remains the
+authority: it tokenizes the published rows with the pinned model tokenizer and
+fails unless all four exact 512x2048 partitions can be emitted.
+
 Build the frozen SmolLM recipe-selection token pack from a content-bound
 `tritium.stage7-sampled-rows.v1` manifest:
 
 ```sh
 tritium salt build-stage7-evidence-pack \
   --model-dir ~/.cache/huggingface/hub/models--HuggingFaceTB--SmolLM2-135M/snapshots/93efa2f097d58c2a74874c7e644dbc9b0cee75a2 \
-  --sampled-rows ./stage7-sampled-rows.json \
+  --sampled-rows ./stage7-sampled-rows/sampled-rows.json \
   --output-dir ./stage7-token-evidence
 ```
 
