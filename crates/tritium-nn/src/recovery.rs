@@ -763,7 +763,7 @@ impl<'backend, 'model> DeviceRecoverySession<'backend, 'model> {
     }
 }
 
-fn recovery_model_digest(model: &TiedSwiGluTrainingModel) -> String {
+pub(crate) fn recovery_model_digest(model: &TiedSwiGluTrainingModel) -> String {
     let mut hash = blake3::Hasher::new();
     hash.update(b"tritium-device-recovery-model-v1");
     let arch = model.architecture();

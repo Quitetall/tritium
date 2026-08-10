@@ -41,6 +41,18 @@ fn checkpoint_resume_is_bit_identical_and_identity_bound() {
 
     let mut uninterrupted = PvTuningSession::new(parent.clone(), config).unwrap();
     let first = uninterrupted.step(&gradients[0], 1).unwrap();
+    let receipt_bytes = first.checkpoint_bytes();
+    assert_eq!(
+        tritium_train::PvStepReceipt::resume(&receipt_bytes).unwrap(),
+        first
+    );
+    let mut corrupt_receipt = receipt_bytes.clone();
+    let corrupt_index = corrupt_receipt.len() / 2;
+    corrupt_receipt[corrupt_index] ^= 1;
+    assert!(tritium_train::PvStepReceipt::resume(&corrupt_receipt).is_err());
+    let mut trailing_receipt = receipt_bytes;
+    trailing_receipt.push(0);
+    assert!(tritium_train::PvStepReceipt::resume(&trailing_receipt).is_err());
     let checkpoint = uninterrupted.checkpoint_bytes().unwrap();
     let second = uninterrupted.step(&gradients[1], 2).unwrap();
 
@@ -79,6 +91,55 @@ fn checkpoint_resume_is_bit_identical_and_identity_bound() {
         PvTuningSession::resume(other_parent, config, &checkpoint),
         Err(PvTuningError::Checkpoint(_))
     ));
+}
+
+#[test]
+fn blockwise_campaign_checkpoint_resumes_inside_a_tensor_bit_identically() {
+    let parent = parent();
+    let config = recipe(0.5, Some(0.75));
+    let gradient = [0.75, -0.5, 0.25, -0.125];
+    let mut uninterrupted = PvTuningSession::new(parent.clone(), config).unwrap();
+    let expected = uninterrupted.step(&gradient, 1).unwrap();
+
+    let mut partial = PvTuningSession::new(parent.clone(), config).unwrap();
+    let source_state_digest = partial.state_digest();
+    partial.begin_blockwise_step(1, 3).unwrap();
+    partial.apply_gradient_block(0, &gradient[..3]).unwrap();
+    assert_ne!(partial.state_digest(), source_state_digest);
+    let checkpoint = partial.blockwise_checkpoint_bytes().unwrap();
+    let ledger = partial.size_ledger().unwrap();
+    assert_eq!(ledger.host_representation_bytes(), 6);
+    assert_eq!(ledger.host_optimizer_bytes(), 40);
+    assert_eq!(ledger.host_campaign_bytes(), 8);
+    assert_eq!(ledger.serialized_checkpoint_bytes(), checkpoint.len());
+
+    let mut resumed =
+        PvTuningSession::resume_blockwise(parent.clone(), config, &checkpoint).unwrap();
+    assert_eq!(resumed.completed_step(), 0);
+    assert_eq!(resumed.blockwise_cursor().unwrap().next_offset(), 3);
+    assert_eq!(resumed.state_digest(), partial.state_digest());
+    resumed.apply_gradient_block(3, &gradient[3..]).unwrap();
+    assert_eq!(resumed.finish_blockwise_step().unwrap(), expected);
+    assert_eq!(resumed.weight(), uninterrupted.weight());
+    assert_eq!(resumed.state_digest(), uninterrupted.state_digest());
+    assert_eq!(
+        resumed.checkpoint_bytes().unwrap(),
+        uninterrupted.checkpoint_bytes().unwrap()
+    );
+    let ledger = resumed.size_ledger().unwrap();
+    assert_eq!(ledger.host_campaign_bytes(), 0);
+    assert_eq!(
+        ledger.serialized_checkpoint_bytes(),
+        resumed.checkpoint_bytes().unwrap().len()
+    );
+
+    let mut corrupt = checkpoint.clone();
+    let corrupt_index = corrupt.len() / 2;
+    corrupt[corrupt_index] ^= 1;
+    assert!(PvTuningSession::resume_blockwise(parent.clone(), config, &corrupt).is_err());
+    let mut trailing = checkpoint;
+    trailing.push(0);
+    assert!(PvTuningSession::resume_blockwise(parent, config, &trailing).is_err());
 }
 
 fn resign(mut checkpoint: Vec<u8>) -> Vec<u8> {

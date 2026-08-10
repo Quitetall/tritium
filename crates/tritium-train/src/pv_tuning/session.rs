@@ -1,6 +1,7 @@
 use crate::optim::Optimizer;
 
-use super::selection::{selected_units, unit_surrogate};
+use super::projection::project_units;
+use super::selection::selected_units;
 use super::{PvStepReceipt, PvTernaryWeight, PvTuningConfig, PvTuningError, PvTuningSession};
 
 impl PvTuningSession {
@@ -22,6 +23,7 @@ impl PvTuningSession {
             scale_state,
             code_state,
             completed_step: 0,
+            blockwise: None,
         })
     }
 
@@ -41,8 +43,9 @@ impl PvTuningSession {
     ///
     /// P differentiates actual group scales. V uses dequantized-weight gradient to
     /// form Adam proposal, selects largest bounded proposal units, then projects them
-    /// onto deployed code space. This reference clones compact session state before
-    /// mutation; device/block adapters use scoped journals at model scale.
+    /// onto deployed code space. This reference clones deployed representation and
+    /// optimizer state before mutation; device/block adapters use scoped journals at
+    /// model scale.
     ///
     /// # Errors
     /// Invalid input or update fails without mutating representation or optimizer state.
@@ -62,6 +65,11 @@ impl PvTuningSession {
         gradient: &[f32],
         optimizer_step: u64,
     ) -> Result<PvStepReceipt, PvTuningError> {
+        if self.blockwise.is_some() {
+            return Err(PvTuningError::step(
+                "cannot run a whole-gradient step while a blockwise step is active",
+            ));
+        }
         let expected_step = self
             .completed_step
             .checked_add(1)
@@ -99,11 +107,13 @@ impl PvTuningSession {
             &proposal,
             self.config.max_code_change_fraction,
         );
-        let v_surrogate_before = unit_surrogate(self.weight.structure, &units, &decoded, &proposal);
-        let projection = self.v_step(&units, &decoded, &proposal);
+        let (projection, v_surrogate_before, v_surrogate_after) = project_units(
+            &mut self.weight,
+            self.config.max_relative_code_change,
+            &units,
+            |index, _decoded| proposal[index],
+        );
         self.weight.validate()?;
-        let refined = self.weight.decode();
-        let v_surrogate_after = unit_surrogate(self.weight.structure, &units, &refined, &proposal);
         if v_surrogate_after > v_surrogate_before {
             return Err(PvTuningError::step(
                 "V projection increased its discrete surrogate",

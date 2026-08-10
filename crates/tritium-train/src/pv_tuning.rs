@@ -9,21 +9,26 @@
 //! use exact enumeration across all planes. Structured 3:4 units use deterministic
 //! conditional exact search, one plane at a time, preserving each plane's invariant.
 
+mod blockwise;
 mod checkpoint;
 mod config;
 mod continuous;
 mod error;
+mod identity;
 mod projection;
 mod receipt;
 mod representation;
 mod selection;
 mod session;
+mod size;
 mod wire;
 
+pub use blockwise::PvBlockwiseCursor;
 pub use config::{PvTuningConfig, PvTuningConfigBuilder};
 pub use error::PvTuningError;
 pub use receipt::PvStepReceipt;
 pub use representation::{PvTernaryPlane, PvTernaryStructure, PvTernaryWeight};
+pub use size::PvTuningSizeLedger;
 
 use crate::optim::AdamState;
 
@@ -39,4 +44,13 @@ pub struct PvTuningSession {
     scale_state: AdamState,
     code_state: AdamState,
     completed_step: u64,
+    blockwise: Option<PvBlockwiseState>,
+}
+
+#[derive(Clone, Debug)]
+struct PvBlockwiseState {
+    optimizer_step: u64,
+    max_block_elements: usize,
+    next_offset: usize,
+    scale_gradient: Vec<f64>,
 }

@@ -1,11 +1,18 @@
 //! Exact SALT V2 package admission over a durable nested allocation.
 
 mod execution;
+#[cfg(feature = "cuda")]
+mod pv;
 
 pub use execution::{
     Qwen36AdmittedExecutionReceipt, Qwen36AdmittedExecutionSession, Qwen36ExecutionBackend,
     Qwen36ExecutionReplayError, Qwen36ExecutionSessionOpenError, Qwen36ExecutionVisitError,
     Qwen36FinalLogitsOutputBindingError, Qwen36FinalLogitsOutputBindingReceipt,
+};
+#[cfg(feature = "cuda")]
+pub use pv::{
+    Qwen36PvPackageAdmissionError, Qwen36PvPackageAdmissionReceipt,
+    Qwen36PvPackageAdmittedCampaignStore, Qwen36PvPackageVisitError,
 };
 
 use core::fmt;
@@ -50,6 +57,7 @@ const PACKAGE_SCHEMA: &[u8] = b"tritium qwen3.6 exact selected SALT V2 package r
 const PACKAGE_METADATA_MAGIC: [u8; 8] = *b"TSQ36PR\0";
 const PACKAGE_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_ADMISSION_BYTES: u64 = 512 * 1024;
+const PV_PARENT_CONTEXT: &str = "tritium qwen3.6 package-admitted PV parent context v1";
 
 /// Failure while staging or admitting exact selected SALT V2 packages.
 #[derive(Debug)]
@@ -267,6 +275,25 @@ pub struct Qwen36PackageAdmissionReceipt {
     near_lossless: Qwen36PackageProfileReceipt,
 }
 
+/// Exact Qwen package lineage authorized to initialize one hard-PV session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Qwen36PvParentContext([u8; 32]);
+
+impl Qwen36PvParentContext {
+    /// Domain-separated completion/admission/package lineage digest.
+    pub const fn as_bytes(self) -> [u8; 32] {
+        self.0
+    }
+
+    /// Convert into device-PV plan authority when CUDA recovery is enabled.
+    #[cfg(feature = "cuda")]
+    pub fn device_context(
+        self,
+    ) -> Result<tritium_nn::DevicePvRecoveryParentContext, tritium_nn::DevicePvRecoveryError> {
+        tritium_nn::DevicePvRecoveryParentContext::new(self.0)
+    }
+}
+
 impl Qwen36PackageAdmissionReceipt {
     /// Identity of the complete canonical admission receipt.
     pub const fn admission_id(&self) -> ContentId {
@@ -462,6 +489,38 @@ impl Qwen36PackageAdmittedCampaignStore<'_, '_, '_, '_> {
     /// Durable exact package-admission receipt carried by this capability.
     pub const fn receipt(&self) -> &Qwen36PackageAdmissionReceipt {
         &self.receipt
+    }
+
+    /// Derive exact parent authority for a package-bound hard-PV session.
+    ///
+    /// Both selected packages are bound because PV may refine every profile's
+    /// shared Pmax representation. Derivation strictly revalidates durable
+    /// admission state before and after hashing.
+    pub fn pv_parent_context(&self) -> Result<Qwen36PvParentContext, Qwen36PackageAdmissionError> {
+        self.verify_current()?;
+        let completion = &self.allocated.parent_completion;
+        let mut hasher = blake3::Hasher::new_derive_key(PV_PARENT_CONTEXT);
+        for digest in [
+            *completion.completion_id().as_bytes(),
+            *completion.base_workspace_id().as_bytes(),
+            *completion.campaign_id().as_bytes(),
+            *completion.source_model_id().as_bytes(),
+            completion.master_set_id(),
+            *self.receipt.admission_id().as_bytes(),
+            *self.receipt.selection_id().as_bytes(),
+            *self.receipt.compact().package_id().as_bytes(),
+            *self.receipt.near_lossless().package_id().as_bytes(),
+        ] {
+            hasher.update(&digest);
+        }
+        let context = *hasher.finalize().as_bytes();
+        if context == [0; 32] {
+            return Err(
+                Qwen36TensorWorkError::WorkspaceMalformed("PV package-parent context").into(),
+            );
+        }
+        self.verify_current()?;
+        Ok(Qwen36PvParentContext(context))
     }
 
     /// Strictly revalidate selection lineage, package CAS records, semantics, and budgets.

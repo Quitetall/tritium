@@ -50,7 +50,7 @@ pub use optim::{
 pub use portable::CpuTrainBackendV1;
 pub use pv_tuning::{
     PvStepReceipt, PvTernaryPlane, PvTernaryStructure, PvTernaryWeight, PvTuningConfig,
-    PvTuningConfigBuilder, PvTuningError, PvTuningSession,
+    PvTuningConfigBuilder, PvTuningError, PvTuningSession, PvTuningSizeLedger,
 };
 pub use salt_v2_recovery::{
     BypassSchedule, BypassUsageFlag, EarlyStopDecision, EarlyStopGate, EarlyStopPoint,

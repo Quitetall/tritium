@@ -861,6 +861,8 @@ pub enum RecoveryModelRung {
     Qwen8B,
     /// The frozen Qwen3-32B confirmation rung.
     Qwen32B,
+    /// The frozen Qwen3.6-27B language-plus-MTP flagship rung.
+    Qwen27B,
 }
 
 impl RecoveryModelRung {
@@ -878,6 +880,8 @@ impl RecoveryModelRung {
             (Self::Qwen8B, RecoveryTrack::Pv) => Some(256_000_000),
             (Self::Qwen32B, RecoveryTrack::ScaleOnly) => Some(64_000_000),
             (Self::Qwen32B, RecoveryTrack::Pv) => Some(512_000_000),
+            (Self::Qwen27B, RecoveryTrack::ScaleOnly) => Some(64_000_000),
+            (Self::Qwen27B, RecoveryTrack::Pv) => Some(512_000_000),
         }
     }
 }
@@ -967,6 +971,8 @@ pub enum RecoverySourceModel {
     Qwen3EightBillion,
     /// Frozen Qwen3-32B confirmation rung.
     Qwen3ThirtyTwoBillion,
+    /// Frozen Qwen3.6-27B language-plus-MTP flagship checkpoint.
+    Qwen36TwentySevenBillion,
 }
 
 impl RecoverySourceModel {
@@ -979,6 +985,7 @@ impl RecoverySourceModel {
             }
             Self::Qwen3EightBillion => RecoveryModelRung::Qwen8B,
             Self::Qwen3ThirtyTwoBillion => RecoveryModelRung::Qwen32B,
+            Self::Qwen36TwentySevenBillion => RecoveryModelRung::Qwen27B,
         }
     }
 }
@@ -1940,6 +1947,7 @@ const fn encode_source_model(value: RecoverySourceModel) -> u8 {
         RecoverySourceModel::SmolLm2OnePointSevenBillion => 1,
         RecoverySourceModel::Qwen3EightBillion => 2,
         RecoverySourceModel::Qwen3ThirtyTwoBillion => 3,
+        RecoverySourceModel::Qwen36TwentySevenBillion => 4,
     }
 }
 
@@ -1948,6 +1956,7 @@ const fn encode_model_rung(value: RecoveryModelRung) -> u8 {
         RecoveryModelRung::Pilot => 0,
         RecoveryModelRung::Qwen8B => 1,
         RecoveryModelRung::Qwen32B => 2,
+        RecoveryModelRung::Qwen27B => 3,
     }
 }
 
@@ -1999,6 +2008,7 @@ fn decode_source_model(value: u8) -> Result<RecoverySourceModel, RecoveryError> 
         1 => Ok(RecoverySourceModel::SmolLm2OnePointSevenBillion),
         2 => Ok(RecoverySourceModel::Qwen3EightBillion),
         3 => Ok(RecoverySourceModel::Qwen3ThirtyTwoBillion),
+        4 => Ok(RecoverySourceModel::Qwen36TwentySevenBillion),
         _ => Err(RecoveryError::InvalidCampaignReceipt(
             "invalid source-model tag",
         )),
@@ -2010,6 +2020,7 @@ fn decode_model_rung(value: u8) -> Result<RecoveryModelRung, RecoveryError> {
         0 => Ok(RecoveryModelRung::Pilot),
         1 => Ok(RecoveryModelRung::Qwen8B),
         2 => Ok(RecoveryModelRung::Qwen32B),
+        3 => Ok(RecoveryModelRung::Qwen27B),
         _ => Err(RecoveryError::InvalidCampaignReceipt(
             "invalid model-rung tag",
         )),
@@ -2182,7 +2193,62 @@ impl<'a> RecoveryReceiptCursor<'a> {
     }
 }
 
+struct RecoveryCampaignRunCursor<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> RecoveryCampaignRunCursor<'a> {
+    const fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn read_exact<const N: usize>(&mut self) -> Result<[u8; N], RecoveryError> {
+        let end = self
+            .offset
+            .checked_add(N)
+            .ok_or(RecoveryError::InvalidCampaignRunCheckpoint(
+                "checkpoint length overflow",
+            ))?;
+        let slice =
+            self.bytes
+                .get(self.offset..end)
+                .ok_or(RecoveryError::InvalidCampaignRunCheckpoint(
+                    "truncated checkpoint",
+                ))?;
+        self.offset = end;
+        Ok(slice
+            .try_into()
+            .expect("fixed-size campaign checkpoint slice"))
+    }
+
+    fn read_u8(&mut self) -> Result<u8, RecoveryError> {
+        Ok(self.read_exact::<1>()?[0])
+    }
+
+    fn read_u64(&mut self) -> Result<u64, RecoveryError> {
+        Ok(u64::from_le_bytes(self.read_exact::<8>()?))
+    }
+
+    const fn is_empty(&self) -> bool {
+        self.offset == self.bytes.len()
+    }
+}
+
 /// Stateful authorization and evaluation control for one frozen campaign track.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum RecoveryCampaignObservation {
+    Ptq {
+        validation_quality: f64,
+        artifact_digest: RecoveryEvidenceDigest,
+    },
+    Evaluation {
+        cumulative_tokens: u64,
+        validation_quality: f64,
+        artifact_digest: RecoveryEvidenceDigest,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct RecoveryCampaignRun {
     source_model: RecoverySourceModel,
@@ -2199,9 +2265,258 @@ pub struct RecoveryCampaignRun {
     best: Option<RecoveryCampaignBest>,
     termination: Option<RecoveryCampaignTermination>,
     promotion_gate: RecoveryPromotionGate,
+    observations: Vec<RecoveryCampaignObservation>,
 }
 
+const RECOVERY_CAMPAIGN_CONTEXT_HASH_CONTEXT: &str = "tritium recovery campaign context v1";
+const RECOVERY_CAMPAIGN_RUN_MAGIC: [u8; 8] = *b"TRCRUN\0\0";
+const RECOVERY_CAMPAIGN_RUN_VERSION: u16 = 1;
+const RECOVERY_CAMPAIGN_RUN_FIXED_BODY_BYTES: usize = 8 + 2 + 32 + 1;
+const RECOVERY_CAMPAIGN_RUN_OBSERVATION_BYTES: usize = 1 + 8 + 8 + 32;
+const RECOVERY_CAMPAIGN_RUN_CHECKSUM_BYTES: usize = 32;
+const RECOVERY_CAMPAIGN_RUN_MAX_OBSERVATIONS: usize = RecoveryEvaluationCheckpoint::ALL.len();
+
 impl RecoveryCampaignRun {
+    /// Immutable track kind for typed artifact producers.
+    #[must_use]
+    pub const fn track(&self) -> RecoveryTrack {
+        self.track
+    }
+
+    /// Stable identity of every immutable campaign authorization field.
+    ///
+    /// Mutable progress, measurements, and selection state are excluded so one
+    /// artifact can be recorded after construction without changing identity.
+    #[must_use]
+    pub fn evidence_context_digest(&self) -> RecoveryEvidenceDigest {
+        let mut hasher = blake3::Hasher::new_derive_key(RECOVERY_CAMPAIGN_CONTEXT_HASH_CONTEXT);
+        hasher.update(&[
+            encode_source_model(self.source_model),
+            encode_model_rung(self.model_rung),
+            encode_activation_rung(self.activation_rung),
+            encode_track(self.track),
+        ]);
+        hasher.update(&self.source_model_id.as_bytes());
+        hasher.update(&self.campaign_digest.as_bytes());
+        match self.predecessor_receipt_digest {
+            Some(digest) => {
+                hasher.update(&[1]);
+                hasher.update(&digest.as_bytes());
+            }
+            None => {
+                hasher.update(&[0]);
+                hasher.update(&[0; 32]);
+            }
+        }
+        match self.token_cap {
+            Some(token_cap) => {
+                hasher.update(&[1]);
+                hasher.update(&token_cap.to_le_bytes());
+            }
+            None => {
+                hasher.update(&[0]);
+                hasher.update(&0_u64.to_le_bytes());
+            }
+        }
+        hasher.update(
+            &canonical_f64_bits(self.promotion_gate.minimum_validation_quality).to_le_bytes(),
+        );
+        hasher.update(&self.promotion_gate.gate_digest.as_bytes());
+        RecoveryEvidenceDigest(*hasher.finalize().as_bytes())
+    }
+
+    /// Serialize bounded active progress for exact process-restart replay.
+    ///
+    /// This checkpoint records only accepted observations. Reopen reconstructs
+    /// authorization from the supplied plan and predecessor, then replays every
+    /// transition through the public state machine. It is resumable state, not
+    /// promotion evidence or a release receipt.
+    pub fn checkpoint_bytes(&self) -> Result<Vec<u8>, RecoveryError> {
+        if self.observations.len() > RECOVERY_CAMPAIGN_RUN_MAX_OBSERVATIONS {
+            return Err(RecoveryError::InvalidCampaignRunCheckpoint(
+                "too many observations",
+            ));
+        }
+        let observation_count = u8::try_from(self.observations.len())
+            .map_err(|_| RecoveryError::ArithmeticOverflow("campaign observations"))?;
+        let body_len = self
+            .observations
+            .len()
+            .checked_mul(RECOVERY_CAMPAIGN_RUN_OBSERVATION_BYTES)
+            .and_then(|bytes| bytes.checked_add(RECOVERY_CAMPAIGN_RUN_FIXED_BODY_BYTES))
+            .ok_or(RecoveryError::ArithmeticOverflow(
+                "campaign checkpoint bytes",
+            ))?;
+        let capacity = body_len
+            .checked_add(RECOVERY_CAMPAIGN_RUN_CHECKSUM_BYTES)
+            .ok_or(RecoveryError::ArithmeticOverflow(
+                "campaign checkpoint bytes",
+            ))?;
+        let mut out = Vec::new();
+        out.try_reserve_exact(capacity)
+            .map_err(|_| RecoveryError::AllocationFailed("campaign checkpoint encoding"))?;
+        out.extend_from_slice(&RECOVERY_CAMPAIGN_RUN_MAGIC);
+        out.extend_from_slice(&RECOVERY_CAMPAIGN_RUN_VERSION.to_le_bytes());
+        out.extend_from_slice(&self.evidence_context_digest().as_bytes());
+        out.push(observation_count);
+        for observation in &self.observations {
+            match *observation {
+                RecoveryCampaignObservation::Ptq {
+                    validation_quality,
+                    artifact_digest,
+                } => {
+                    out.push(0);
+                    out.extend_from_slice(&0_u64.to_le_bytes());
+                    out.extend_from_slice(&canonical_f64_bits(validation_quality).to_le_bytes());
+                    out.extend_from_slice(&artifact_digest.as_bytes());
+                }
+                RecoveryCampaignObservation::Evaluation {
+                    cumulative_tokens,
+                    validation_quality,
+                    artifact_digest,
+                } => {
+                    out.push(1);
+                    out.extend_from_slice(&cumulative_tokens.to_le_bytes());
+                    out.extend_from_slice(&canonical_f64_bits(validation_quality).to_le_bytes());
+                    out.extend_from_slice(&artifact_digest.as_bytes());
+                }
+            }
+        }
+        debug_assert_eq!(out.len(), body_len);
+        let checksum = blake3::hash(&out);
+        out.extend_from_slice(checksum.as_bytes());
+        debug_assert_eq!(out.len(), capacity);
+        Ok(out)
+    }
+
+    /// Reopen active campaign progress under its exact plan and predecessor.
+    ///
+    /// Every retained observation is replayed through [`Self::record_ptq`] or
+    /// [`Self::record_evaluation`]. Corrupt, non-canonical, out-of-order,
+    /// cross-plan, or trailing bytes fail closed.
+    pub fn reopen_checkpoint(
+        plan: RecoveryCampaignPlan,
+        predecessor: Option<RecoveryPredecessorEvidence>,
+        bytes: &[u8],
+    ) -> Result<Self, RecoveryError> {
+        let minimum = RECOVERY_CAMPAIGN_RUN_FIXED_BODY_BYTES
+            .checked_add(RECOVERY_CAMPAIGN_RUN_CHECKSUM_BYTES)
+            .ok_or(RecoveryError::ArithmeticOverflow(
+                "campaign checkpoint bytes",
+            ))?;
+        if bytes.len() < minimum {
+            return Err(RecoveryError::InvalidCampaignRunCheckpoint(
+                "truncated checkpoint",
+            ));
+        }
+        if bytes[..RECOVERY_CAMPAIGN_RUN_MAGIC.len()] != RECOVERY_CAMPAIGN_RUN_MAGIC {
+            return Err(RecoveryError::InvalidCampaignRunCheckpoint("invalid magic"));
+        }
+        let version = u16::from_le_bytes(
+            bytes[RECOVERY_CAMPAIGN_RUN_MAGIC.len()..RECOVERY_CAMPAIGN_RUN_MAGIC.len() + 2]
+                .try_into()
+                .expect("fixed campaign-run version slice"),
+        );
+        if version != RECOVERY_CAMPAIGN_RUN_VERSION {
+            return Err(RecoveryError::UnsupportedCampaignRunCheckpointVersion(
+                version,
+            ));
+        }
+        let count_offset = RECOVERY_CAMPAIGN_RUN_MAGIC.len() + 2 + 32;
+        let observation_count = usize::from(bytes[count_offset]);
+        if observation_count > RECOVERY_CAMPAIGN_RUN_MAX_OBSERVATIONS {
+            return Err(RecoveryError::InvalidCampaignRunCheckpoint(
+                "too many observations",
+            ));
+        }
+        let body_len = observation_count
+            .checked_mul(RECOVERY_CAMPAIGN_RUN_OBSERVATION_BYTES)
+            .and_then(|value| value.checked_add(RECOVERY_CAMPAIGN_RUN_FIXED_BODY_BYTES))
+            .ok_or(RecoveryError::ArithmeticOverflow(
+                "campaign checkpoint bytes",
+            ))?;
+        let expected_len = body_len
+            .checked_add(RECOVERY_CAMPAIGN_RUN_CHECKSUM_BYTES)
+            .ok_or(RecoveryError::ArithmeticOverflow(
+                "campaign checkpoint bytes",
+            ))?;
+        if bytes.len() != expected_len {
+            return Err(RecoveryError::InvalidCampaignRunCheckpoint(
+                "checkpoint length mismatch",
+            ));
+        }
+        let (body, checksum) = bytes.split_at(body_len);
+        if blake3::hash(body).as_bytes() != checksum {
+            return Err(RecoveryError::InvalidCampaignRunCheckpoint(
+                "checksum mismatch",
+            ));
+        }
+
+        let mut cursor = RecoveryCampaignRunCursor::new(body);
+        cursor.read_exact::<8>()?;
+        cursor.read_exact::<2>()?;
+        let expected_context = RecoveryEvidenceDigest::new(cursor.read_exact::<32>()?)?;
+        let encoded_count = usize::from(cursor.read_u8()?);
+        if encoded_count != observation_count {
+            return Err(RecoveryError::InvalidCampaignRunCheckpoint(
+                "observation count mismatch",
+            ));
+        }
+        let mut run = Self::start(plan, predecessor)?;
+        if expected_context != run.evidence_context_digest() {
+            return Err(RecoveryError::InvalidCampaignRunCheckpoint(
+                "campaign context mismatch",
+            ));
+        }
+        for _ in 0..observation_count {
+            let kind = cursor.read_u8()?;
+            let cumulative_tokens = cursor.read_u64()?;
+            let quality_bits = cursor.read_u64()?;
+            let validation_quality = f64::from_bits(quality_bits);
+            if quality_bits != canonical_f64_bits(validation_quality) {
+                return Err(RecoveryError::InvalidCampaignRunCheckpoint(
+                    "non-canonical validation quality",
+                ));
+            }
+            let artifact_digest = RecoveryEvidenceDigest::new(cursor.read_exact::<32>()?)?;
+            let replay = match kind {
+                0 if cumulative_tokens == 0 => run.record_ptq(validation_quality, artifact_digest),
+                1 => run.record_evaluation(cumulative_tokens, validation_quality, artifact_digest),
+                0 => Err(RecoveryError::InvalidCampaignRunCheckpoint(
+                    "PTQ observation has token progress",
+                )),
+                _ => Err(RecoveryError::InvalidCampaignRunCheckpoint(
+                    "invalid observation tag",
+                )),
+            };
+            replay.map_err(|_| {
+                RecoveryError::InvalidCampaignRunCheckpoint("invalid observation history")
+            })?;
+        }
+        if !cursor.is_empty() {
+            return Err(RecoveryError::InvalidCampaignRunCheckpoint(
+                "trailing checkpoint body",
+            ));
+        }
+        if run.checkpoint_bytes()?.as_slice() != bytes {
+            return Err(RecoveryError::InvalidCampaignRunCheckpoint(
+                "non-canonical checkpoint encoding",
+            ));
+        }
+        Ok(run)
+    }
+
+    fn reserve_observation(&mut self) -> Result<(), RecoveryError> {
+        if self.observations.len() >= RECOVERY_CAMPAIGN_RUN_MAX_OBSERVATIONS {
+            return Err(RecoveryError::InvalidCampaignRunCheckpoint(
+                "too many observations",
+            ));
+        }
+        self.observations
+            .try_reserve_exact(1)
+            .map_err(|_| RecoveryError::AllocationFailed("campaign progress observation"))
+    }
+
     /// Start a track only when its exact predecessor has been reopened.
     ///
     /// The chain is A16/PTQ -> A16/ScaleOnly -> A16/PV -> A8/PTQ and repeats
@@ -2268,6 +2583,10 @@ impl RecoveryCampaignRun {
                 artifact_digest: predecessor.best.artifact_digest,
             })
         };
+        let mut observations = Vec::new();
+        observations
+            .try_reserve_exact(RECOVERY_CAMPAIGN_RUN_MAX_OBSERVATIONS)
+            .map_err(|_| RecoveryError::AllocationFailed("campaign progress observations"))?;
         Ok(Self {
             source_model: plan.source_model,
             source_model_id: plan.source_model_id,
@@ -2283,6 +2602,7 @@ impl RecoveryCampaignRun {
             best,
             termination: None,
             promotion_gate: plan.promotion_gate,
+            observations,
         })
     }
 
@@ -2309,13 +2629,19 @@ impl RecoveryCampaignRun {
                 "campaign validation quality",
             ));
         }
+        self.reserve_observation()?;
+        let validation_quality = canonical_f64(validation_quality);
         let termination = RecoveryCampaignTermination::PtqComplete;
         self.best = Some(RecoveryCampaignBest {
             checkpoint: RecoverySelectedCheckpoint::Ptq,
-            validation_quality: canonical_f64(validation_quality),
+            validation_quality,
             artifact_digest,
         });
         self.termination = Some(termination);
+        self.observations.push(RecoveryCampaignObservation::Ptq {
+            validation_quality,
+            artifact_digest,
+        });
         Ok(RecoveryCampaignDecision::Complete(termination))
     }
 
@@ -2362,6 +2688,7 @@ impl RecoveryCampaignRun {
                 actual_tokens: cumulative_tokens,
             });
         }
+        self.reserve_observation()?;
 
         let prior_best = self
             .best
@@ -2388,6 +2715,12 @@ impl RecoveryCampaignRun {
             None
         };
         self.termination = termination;
+        self.observations
+            .push(RecoveryCampaignObservation::Evaluation {
+                cumulative_tokens,
+                validation_quality,
+                artifact_digest,
+            });
         Ok(
             termination.map_or(RecoveryCampaignDecision::Continue, |reason| {
                 RecoveryCampaignDecision::Complete(reason)
@@ -2841,6 +3174,10 @@ pub enum RecoveryError {
     InvalidCampaignReceipt(&'static str),
     /// A durable campaign receipt uses an unknown encoding version.
     UnsupportedCampaignReceiptVersion(u16),
+    /// Active recovery-campaign progress is malformed or non-canonical.
+    InvalidCampaignRunCheckpoint(&'static str),
+    /// Active recovery-campaign progress uses an unknown encoding version.
+    UnsupportedCampaignRunCheckpointVersion(u16),
     /// Durable promotion evidence is malformed or non-canonical.
     InvalidPromotionEvidence(&'static str),
     /// Durable promotion evidence uses an unknown encoding version.
@@ -2979,6 +3316,15 @@ impl core::fmt::Display for RecoveryError {
             }
             Self::UnsupportedCampaignReceiptVersion(version) => {
                 write!(f, "unsupported recovery campaign receipt version {version}")
+            }
+            Self::InvalidCampaignRunCheckpoint(reason) => {
+                write!(f, "invalid recovery campaign checkpoint: {reason}")
+            }
+            Self::UnsupportedCampaignRunCheckpointVersion(version) => {
+                write!(
+                    f,
+                    "unsupported recovery campaign checkpoint version {version}"
+                )
             }
             Self::InvalidPromotionEvidence(reason) => {
                 write!(f, "invalid recovery promotion evidence: {reason}")
@@ -3305,6 +3651,7 @@ mod tests {
             (RecoveryModelRung::Pilot, 8_000_000, 32_000_000),
             (RecoveryModelRung::Qwen8B, 32_000_000, 256_000_000),
             (RecoveryModelRung::Qwen32B, 64_000_000, 512_000_000),
+            (RecoveryModelRung::Qwen27B, 64_000_000, 512_000_000),
         ] {
             assert_eq!(rung.token_cap(RecoveryTrack::Ptq), None);
             assert_eq!(rung.token_cap(RecoveryTrack::ScaleOnly), Some(scale_cap));
@@ -3325,6 +3672,7 @@ mod tests {
             RecoveryModelRung::Pilot => RecoverySourceModel::SmolLm2OneThirtyFiveMillion,
             RecoveryModelRung::Qwen8B => RecoverySourceModel::Qwen3EightBillion,
             RecoveryModelRung::Qwen32B => RecoverySourceModel::Qwen3ThirtyTwoBillion,
+            RecoveryModelRung::Qwen27B => RecoverySourceModel::Qwen36TwentySevenBillion,
         }
     }
 
@@ -3333,6 +3681,7 @@ mod tests {
             RecoveryModelRung::Pilot => 201,
             RecoveryModelRung::Qwen8B => 202,
             RecoveryModelRung::Qwen32B => 203,
+            RecoveryModelRung::Qwen27B => 204,
         };
         RecoverySourceModelId::new([seed; 32]).expect("source identity")
     }

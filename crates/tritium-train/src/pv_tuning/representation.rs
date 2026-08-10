@@ -1,31 +1,24 @@
 use half::f16;
+pub use tritium_format::TernaryStructure as PvTernaryStructure;
 
 use super::PvTuningError;
 
 const MAX_PLANES: usize = 3;
 
-/// Code constraint applied independently to every additive ternary plane.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PvTernaryStructure {
-    /// Every scalar code is independently chosen from `{-1, 0, 1}`.
-    Dense,
-    /// Every contiguous four-code row block has exactly one zero and three signs.
-    S34,
+pub(super) const fn unit_width(structure: PvTernaryStructure) -> usize {
+    match structure {
+        PvTernaryStructure::Dense => 1,
+        PvTernaryStructure::S34 => 4,
+    }
 }
 
-impl PvTernaryStructure {
-    pub(super) const fn tag(self) -> u8 {
-        match self {
-            Self::Dense => 0,
-            Self::S34 => 1,
-        }
-    }
-
-    pub(super) fn from_tag(tag: u8) -> Result<Self, PvTuningError> {
-        match tag {
-            0 => Ok(Self::Dense),
-            1 => Ok(Self::S34),
-            _ => Err(PvTuningError::checkpoint("unknown structure tag")),
+pub(super) fn unit_start(weight: &PvTernaryWeight, unit: usize) -> usize {
+    match weight.structure {
+        PvTernaryStructure::Dense => unit,
+        PvTernaryStructure::S34 => {
+            let blocks_per_row = weight.cols / unit_width(weight.structure);
+            (unit / blocks_per_row) * weight.cols
+                + (unit % blocks_per_row) * unit_width(weight.structure)
         }
     }
 }
@@ -146,7 +139,7 @@ impl PvTernaryWeight {
         hasher.update(&(self.rows as u64).to_le_bytes());
         hasher.update(&(self.cols as u64).to_le_bytes());
         hasher.update(&(self.group_size as u64).to_le_bytes());
-        hasher.update(&[self.structure.tag(), self.planes.len() as u8]);
+        hasher.update(&[self.structure.wire_tag(), self.planes.len() as u8]);
         for plane in &self.planes {
             for &trit in &plane.trits {
                 hasher.update(&trit.to_le_bytes());
@@ -172,6 +165,17 @@ impl PvTernaryWeight {
 
     pub(super) fn total_scale_count(&self) -> usize {
         self.scale_count_per_plane() * self.planes.len()
+    }
+
+    pub(super) fn decode_element(&self, index: usize) -> f32 {
+        let row = index / self.cols;
+        let col = index % self.cols;
+        let scale_index = row * self.groups_per_row() + col / self.group_size;
+        let mut decoded = 0.0;
+        for plane in &self.planes {
+            decoded += f32::from(plane.scales[scale_index]) * f32::from(plane.trits[index]);
+        }
+        decoded
     }
 
     pub(super) fn validate(&self) -> Result<(), PvTuningError> {

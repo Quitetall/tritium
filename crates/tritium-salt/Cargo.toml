@@ -18,6 +18,7 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 tritium-format = { workspace = true }
 tritium-nn = { workspace = true }
+tritium-train = { workspace = true }
 tritium-cpu = { workspace = true }
 tritium-cuda = { workspace = true, optional = true }
 tritium-quantize = { workspace = true }

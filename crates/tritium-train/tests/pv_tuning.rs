@@ -61,6 +61,31 @@ fn pv_step_runs_real_continuous_p_then_bounded_discrete_v() {
 }
 
 #[test]
+fn blockwise_pv_step_matches_whole_gradient_bit_identically() {
+    let parent = parent();
+    let config = pv_config(adam(0.1), adam(0.6), 0.5, None).unwrap();
+    let gradient = [1.0, -1.0, 0.25, -0.5];
+    let mut whole = PvTuningSession::new(parent.clone(), config).unwrap();
+    let mut blockwise = PvTuningSession::new(parent, config).unwrap();
+
+    let expected_receipt = whole.step(&gradient, 1).unwrap();
+    blockwise.begin_blockwise_step(1, 3).unwrap();
+    assert_eq!(blockwise.blockwise_cursor().unwrap().next_offset(), 0);
+    blockwise.apply_gradient_block(0, &gradient[..3]).unwrap();
+    assert_eq!(blockwise.blockwise_cursor().unwrap().next_offset(), 3);
+    blockwise.apply_gradient_block(3, &gradient[3..]).unwrap();
+    let got_receipt = blockwise.finish_blockwise_step().unwrap();
+
+    assert_eq!(got_receipt, expected_receipt);
+    assert_eq!(blockwise.weight(), whole.weight());
+    assert_eq!(
+        blockwise.checkpoint_bytes().unwrap(),
+        whole.checkpoint_bytes().unwrap()
+    );
+    assert!(blockwise.blockwise_cursor().is_none());
+}
+
+#[test]
 fn s34_v_step_moves_zero_without_breaking_per_plane_structure() {
     let parent = PvTernaryWeight::new(
         1,

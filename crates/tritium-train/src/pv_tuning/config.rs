@@ -55,7 +55,9 @@ impl PvTuningConfig {
         })
     }
 
-    pub(super) fn digest(self) -> [u8; 32] {
+    /// Stable recipe identity used by model-level plans and checkpoints.
+    #[must_use]
+    pub fn recipe_digest(self) -> [u8; 32] {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"tritium.pv-tuning-plan.v1\0");
         hash_adam(&mut hasher, self.continuous_optimizer);
@@ -71,6 +73,10 @@ impl PvTuningConfig {
             }
         }
         *hasher.finalize().as_bytes()
+    }
+
+    pub(super) fn digest(self) -> [u8; 32] {
+        self.recipe_digest()
     }
 }
 

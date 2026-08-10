@@ -4612,6 +4612,7 @@ dependencies = [
  "tritium-format",
  "tritium-nn",
  "tritium-quantize",
+ "tritium-train",
 ]
 
 [[package]]

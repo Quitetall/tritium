@@ -65,6 +65,10 @@ impl<'a> Reader<'a> {
         Ok(bytes)
     }
 
+    pub(super) fn bytes(&mut self, count: usize) -> Result<&'a [u8], PvTuningError> {
+        self.take(count)
+    }
+
     pub(super) fn array<const N: usize>(&mut self) -> Result<[u8; N], PvTuningError> {
         self.take(N)?
             .try_into()
@@ -85,6 +89,10 @@ impl<'a> Reader<'a> {
 
     pub(super) fn u64(&mut self) -> Result<u64, PvTuningError> {
         Ok(u64::from_le_bytes(self.array()?))
+    }
+
+    pub(super) fn f64(&mut self) -> Result<f64, PvTuningError> {
+        Ok(f64::from_bits(self.u64()?))
     }
 
     pub(super) fn usize(&mut self) -> Result<usize, PvTuningError> {
