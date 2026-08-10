@@ -22,7 +22,7 @@ unmanifested file.
 ```json
 {
   "schema": "tritium.release-inputs.v1",
-  "release": "1.1.0-rc.0",
+  "release": "1.1.0-rc.1",
   "source_revision": "FULL_40_CHARACTER_GIT_REVISION",
   "builder": {
     "id": "https://github.com/OWNER/REPOSITORY/actions/workflows/release.yml",
@@ -107,13 +107,13 @@ streams, unsafe tar paths, links, and metadata drift fail closed.
 ```bash
 python scripts/package-helm-chart.py \
   --source deploy/helm/tritium \
-  --release 1.1.0-rc.0 \
-  --output release/v1.1/tritium-1.1.0-rc.0.tgz
+  --release 1.1.0-rc.1 \
+  --output release/v1.1/tritium-1.1.0-rc.1.tgz
 python scripts/generate-deployment-sbom.py \
-  --artifact release/v1.1/tritium-1.1.0-rc.0.tgz \
+  --artifact release/v1.1/tritium-1.1.0-rc.1.tgz \
   --artifact-id tritium-helm \
   --kind helm-chart \
-  --release 1.1.0-rc.0 \
+  --release 1.1.0-rc.1 \
   --source-revision "$(git rev-parse HEAD)" \
   --digest-tool target/release/tritium \
   --output release/v1.1/tritium-helm.cdx.json

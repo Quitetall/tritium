@@ -31,7 +31,7 @@ see `docs/v1.0-api-freeze-audit.md` for the tier policy.
   `pip install tritium-torch`; the import namespace remains `import tritium`.
   This aligns packaging with ADR 0033 and avoids claiming the generic `tritium`
   distribution name. The Rust workspace and wheel now share the
-  `1.1.0-rc.0` candidate version (rendered as PEP 440 `1.1.0rc0` in wheel
+  `1.1.0-rc.1` candidate version (rendered as PEP 440 `1.1.0rc1` in wheel
   metadata).
 - **Stable API baseline:** `scripts/check-semver.sh` now compares the seven
   frozen Rust crates with the latest reachable stable SemVer tag (`v1.0.0` for
