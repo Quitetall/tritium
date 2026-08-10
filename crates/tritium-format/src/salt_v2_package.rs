@@ -22,11 +22,17 @@ use crate::salt_v2::{
 };
 use crate::{SemanticTensor, SemanticTensorHasher};
 
+mod q2_0_gguf;
 mod reader;
 mod stream_writer;
 
+pub use q2_0_gguf::{
+    COMPACT_Q2_EXPORT_PROFILE_KEY, COMPACT_Q2_SOURCE_PACKAGE_ID_KEY, CompactQ2GgufExportError,
+    write_compact_q2_0_gguf,
+};
 pub use reader::{
-    PackedSaltV2PlaneRef, SaltV2PackageReadError, SaltV2PackageReader, SaltV2TensorInfo,
+    CompactQ2ExportError, PackedSaltV2PlaneRef, SaltV2PackageReadError, SaltV2PackageReader,
+    SaltV2TensorInfo, export_compact_q2_0_tensor,
 };
 pub use stream_writer::{
     SaltV2PackageStreamError, SaltV2PackageStreamPlan, SaltV2PackageStreamPlanError,

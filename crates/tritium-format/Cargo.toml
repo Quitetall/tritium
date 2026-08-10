@@ -14,6 +14,7 @@ categories.workspace = true
 # Pack/unpack is a faithful port of ggml's TQ1_0/TQ2_0 reference (MIT, see NOTICE).
 [dependencies]
 tritium-core = { workspace = true }
+bytemuck = { workspace = true }
 blake3 = { workspace = true }
 half = { workspace = true }
 # safetensors header is JSON; serde_json parses it (the fp source reader for SALT).

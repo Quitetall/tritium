@@ -1572,7 +1572,7 @@ fn extract_dense(
 ) -> Result<TrainingParameter, TrainingAdapterError> {
     let dense = match projection {
         Projection::Dense(dense) => dense,
-        Projection::Salt(_) | Projection::Ternary(_) => {
+        Projection::Salt(_) | Projection::Ternary(_) | Projection::Q2(_) => {
             return Err(unsupported(&format!(
                 "{name} is already ternary; a latent fp32 master is required"
             )));

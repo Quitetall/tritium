@@ -157,7 +157,7 @@ enum TrainingSaltDispatch {
     // it directly; cfg(test) would remove a variant needed by production code.
     #[allow(dead_code)]
     ScalarExact,
-    #[cfg(test)]
+    #[allow(dead_code)]
     ScalarFast,
 }
 
@@ -434,6 +434,18 @@ pub(crate) struct TrainingSaltLinear {
     k: usize,
     row_bytes: usize,
     planes: usize,
+    group_size: usize,
+    groups_per_row: usize,
+}
+
+struct TrainingSaltKernelDims {
+    batch: i32,
+    rows: i32,
+    cols: i32,
+    planes: i32,
+    row_bytes: i32,
+    group_size: i32,
+    groups_per_row: i32,
 }
 
 #[allow(dead_code)] // accounting is load-bearing in the Track D GPU gate before tape wiring
@@ -450,8 +462,15 @@ impl TrainingSaltLinear {
         self.planes
     }
 
-    /// Plane-major scale storage. The first `rows()` entries are the current
-    /// first-plane AbsMean scales produced from the latent master.
+    pub(crate) fn group_size(&self) -> usize {
+        self.group_size
+    }
+
+    pub(crate) fn groups_per_row(&self) -> usize {
+        self.groups_per_row
+    }
+
+    /// Plane-major, then row-major group-scale storage.
     pub(crate) fn scales(&self) -> &CudaSlice<f32> {
         &self.scales
     }
@@ -471,18 +490,20 @@ impl TrainingSaltLinear {
         self.packed_bytes() + self.scale_bytes()
     }
 
-    fn kernel_dims(&self, m: usize) -> Result<(i32, i32, i32, i32, i32), BackendError> {
+    fn kernel_dims(&self, m: usize) -> Result<TrainingSaltKernelDims, BackendError> {
         let convert = |name: &str, value: usize| {
             i32::try_from(value)
                 .map_err(|_| BackendError::InvalidInput(format!("SALT {name} exceeds i32::MAX")))
         };
-        Ok((
-            convert("batch", m)?,
-            convert("rows", self.n)?,
-            convert("cols", self.k)?,
-            convert("planes", self.planes)?,
-            convert("row bytes", self.row_bytes)?,
-        ))
+        Ok(TrainingSaltKernelDims {
+            batch: convert("batch", m)?,
+            rows: convert("rows", self.n)?,
+            cols: convert("cols", self.k)?,
+            planes: convert("planes", self.planes)?,
+            row_bytes: convert("row bytes", self.row_bytes)?,
+            group_size: convert("group size", self.group_size)?,
+            groups_per_row: convert("groups per row", self.groups_per_row)?,
+        })
     }
 }
 
@@ -1951,8 +1972,11 @@ impl CudaBackend {
             .checked_mul(n)
             .and_then(|v| v.checked_mul(row_bytes))
             .ok_or_else(|| BackendError::InvalidInput("SALT packed bytes overflow usize".into()))?;
+        let group_size = k;
+        let groups_per_row = 1;
         let scale_len = planes
             .checked_mul(n)
+            .and_then(|value| value.checked_mul(groups_per_row))
             .ok_or_else(|| BackendError::InvalidInput("SALT scale count overflows usize".into()))?;
         let codes = self
             .stream
@@ -1969,8 +1993,84 @@ impl CudaBackend {
             k,
             row_bytes,
             planes,
+            group_size,
+            groups_per_row,
         };
         self.repack_training_salt(d_master, d_residual, &mut weight)?;
+        Ok(weight)
+    }
+
+    /// Upload an already-projected compact SALT snapshot without a dense master.
+    pub(crate) fn upload_training_salt_snapshot(
+        &self,
+        codes: &[u8],
+        scales: &[f32],
+        n: usize,
+        k: usize,
+        planes: usize,
+        group_size: usize,
+    ) -> Result<TrainingSaltLinear, BackendError> {
+        if !(1..=3).contains(&planes) || n == 0 || k == 0 || group_size == 0 {
+            return Err(BackendError::InvalidInput(
+                "compact SALT geometry requires nonzero dimensions/group size and 1..=3 planes"
+                    .into(),
+            ));
+        }
+        Self::check_grad_launch_bounds(1, n, k)?;
+        let row_bytes = k
+            .div_ceil(TRAINING_SALT_QK)
+            .checked_mul(TRAINING_SALT_QS_BYTES)
+            .ok_or_else(|| BackendError::InvalidInput("SALT row bytes overflow usize".into()))?;
+        let groups_per_row = k.div_ceil(group_size);
+        let expected_codes = planes
+            .checked_mul(n)
+            .and_then(|value| value.checked_mul(row_bytes))
+            .ok_or_else(|| BackendError::InvalidInput("SALT packed bytes overflow usize".into()))?;
+        let expected_scales = planes
+            .checked_mul(n)
+            .and_then(|value| value.checked_mul(groups_per_row))
+            .ok_or_else(|| BackendError::InvalidInput("SALT scale count overflows usize".into()))?;
+        if codes.len() != expected_codes {
+            return Err(BackendError::ShapeMismatch {
+                expected: expected_codes,
+                got: codes.len(),
+            });
+        }
+        if scales.len() != expected_scales {
+            return Err(BackendError::ShapeMismatch {
+                expected: expected_scales,
+                got: scales.len(),
+            });
+        }
+        if scales
+            .iter()
+            .any(|value| !value.is_finite() || *value < 0.0)
+        {
+            return Err(BackendError::InvalidInput(
+                "compact SALT scales must be finite and nonnegative".into(),
+            ));
+        }
+        let codes = self.stream.clone_htod(codes).map_err(|error| {
+            alloc_or_backend("upload compact SALT codes", &error, expected_codes)
+        })?;
+        let scale_bytes = expected_scales
+            .checked_mul(core::mem::size_of::<f32>())
+            .ok_or_else(|| BackendError::InvalidInput("SALT scale bytes overflow usize".into()))?;
+        let scales = self
+            .stream
+            .clone_htod(scales)
+            .map_err(|error| alloc_or_backend("upload compact SALT scales", &error, scale_bytes))?;
+        let weight = TrainingSaltLinear {
+            codes,
+            scales,
+            n,
+            k,
+            row_bytes,
+            planes,
+            group_size,
+            groups_per_row,
+        };
+        self.validate_training_salt(&weight)?;
         Ok(weight)
     }
 
@@ -2003,17 +2103,19 @@ impl CudaBackend {
         if dense_len == 0 {
             return Ok(());
         }
-        let (_, ni, ki, pi, rbi) = weight.kernel_dims(1)?;
+        let dims = weight.kernel_dims(1)?;
         let mut launch = self.stream.launch_builder(&self.func_salt_pack_training);
         launch
             .arg(d_master)
             .arg(d_residual)
             .arg(&mut weight.codes)
             .arg(&mut weight.scales)
-            .arg(&ni)
-            .arg(&ki)
-            .arg(&pi)
-            .arg(&rbi);
+            .arg(&dims.rows)
+            .arg(&dims.cols)
+            .arg(&dims.planes)
+            .arg(&dims.row_bytes)
+            .arg(&dims.group_size)
+            .arg(&dims.groups_per_row);
         // SAFETY: one thread owns each row; all flat products and scalar
         // dimensions were checked, and every buffer covers the full shape.
         #[allow(unsafe_code)]
@@ -2127,7 +2229,16 @@ impl CudaBackend {
         if out_len == 0 {
             return Ok(());
         }
-        let (mi, ni, ki, pi, rbi) = weight.kernel_dims(m)?;
+        if matches!(
+            dispatch,
+            TrainingSaltDispatch::Fast | TrainingSaltDispatch::ScalarFast
+        ) && weight.groups_per_row != 1
+        {
+            return Err(BackendError::InvalidInput(
+                "fast packed SALT kernels require one scale group per row".into(),
+            ));
+        }
+        let dims = weight.kernel_dims(m)?;
         let use_exact = matches!(
             dispatch,
             TrainingSaltDispatch::Exact | TrainingSaltDispatch::ScalarExact
@@ -2169,11 +2280,13 @@ impl CudaBackend {
             .arg(&weight.codes)
             .arg(&weight.scales)
             .arg(d_y)
-            .arg(&mi)
-            .arg(&ni)
-            .arg(&ki)
-            .arg(&pi)
-            .arg(&rbi);
+            .arg(&dims.batch)
+            .arg(&dims.rows)
+            .arg(&dims.cols)
+            .arg(&dims.planes)
+            .arg(&dims.row_bytes)
+            .arg(&dims.group_size)
+            .arg(&dims.groups_per_row);
         // SAFETY: validated handle/input/output buffers cover MxK, packed
         // TxNxrow_bytes, TxN and MxN; flat indices fit the kernel ABI.
         #[allow(unsafe_code)]
@@ -2290,7 +2403,16 @@ impl CudaBackend {
         if ga_len == 0 {
             return Ok(());
         }
-        let (mi, ni, ki, pi, rbi) = weight.kernel_dims(m)?;
+        if matches!(
+            dispatch,
+            TrainingSaltDispatch::Fast | TrainingSaltDispatch::ScalarFast
+        ) && weight.groups_per_row != 1
+        {
+            return Err(BackendError::InvalidInput(
+                "fast packed SALT kernels require one scale group per row".into(),
+            ));
+        }
+        let dims = weight.kernel_dims(m)?;
         let use_exact = matches!(
             dispatch,
             TrainingSaltDispatch::Exact | TrainingSaltDispatch::ScalarExact
@@ -2332,11 +2454,13 @@ impl CudaBackend {
             .arg(&weight.codes)
             .arg(&weight.scales)
             .arg(d_ga)
-            .arg(&mi)
-            .arg(&ni)
-            .arg(&ki)
-            .arg(&pi)
-            .arg(&rbi);
+            .arg(&dims.batch)
+            .arg(&dims.rows)
+            .arg(&dims.cols)
+            .arg(&dims.planes)
+            .arg(&dims.row_bytes)
+            .arg(&dims.group_size)
+            .arg(&dims.groups_per_row);
         // SAFETY: validated buffers cover MxN, packed TxNxrow_bytes, TxN and
         // MxK; one thread writes each activation-gradient element.
         #[allow(unsafe_code)]
@@ -2395,18 +2519,20 @@ impl CudaBackend {
         if out_len == 0 {
             return Ok(());
         }
-        let (seq_i, vocab_i, dim_i, planes_i, row_bytes_i) = weight.kernel_dims(seq)?;
+        let dims = weight.kernel_dims(seq)?;
         let mut launch = self.stream.launch_builder(&self.func_salt_training_embed);
         launch
             .arg(&weight.codes)
             .arg(&weight.scales)
             .arg(d_tokens)
             .arg(d_out)
-            .arg(&seq_i)
-            .arg(&vocab_i)
-            .arg(&dim_i)
-            .arg(&planes_i)
-            .arg(&row_bytes_i);
+            .arg(&dims.batch)
+            .arg(&dims.rows)
+            .arg(&dims.cols)
+            .arg(&dims.planes)
+            .arg(&dims.row_bytes)
+            .arg(&dims.group_size)
+            .arg(&dims.groups_per_row);
         // SAFETY: validated buffers cover the packed handle, seq token ids and
         // seq*dim outputs; the kernel guards each token before row addressing.
         #[allow(unsafe_code)]
@@ -2434,11 +2560,19 @@ impl CudaBackend {
             .checked_mul(weight.n)
             .and_then(|v| v.checked_mul(expected_row_bytes))
             .ok_or_else(|| BackendError::InvalidInput("SALT packed bytes overflow usize".into()))?;
+        let expected_groups = if weight.group_size == 0 {
+            0
+        } else {
+            weight.k.div_ceil(weight.group_size)
+        };
         let expected_scales = weight
             .planes
             .checked_mul(weight.n)
+            .and_then(|value| value.checked_mul(expected_groups))
             .ok_or_else(|| BackendError::InvalidInput("SALT scale count overflows usize".into()))?;
         if !(1..=3).contains(&weight.planes)
+            || weight.group_size == 0
+            || weight.groups_per_row != expected_groups
             || weight.row_bytes != expected_row_bytes
             || weight.codes.len() != expected_codes
             || weight.scales.len() != expected_scales

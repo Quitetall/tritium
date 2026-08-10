@@ -966,7 +966,10 @@ mod tests {
                 assert_eq!((linear.n_out(), linear.k_in()), (qw, n_embd));
                 assert!(linear.packed_bytes() > 0);
             }
-            Projection::Dense(_) | Projection::Ternary(_) | Projection::HostSaltV2(_) => {
+            Projection::Dense(_)
+            | Projection::Ternary(_)
+            | Projection::Q2(_)
+            | Projection::HostSaltV2(_) => {
                 panic!("SALT loader must retain packed additive planes")
             }
             #[cfg(feature = "cuda")]

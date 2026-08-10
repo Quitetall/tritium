@@ -1,28 +1,34 @@
-//! `tritium repack` — lossless ternary format conversion between GGUF files.
+//! `tritium repack` — weight-value-preserving ternary GGUF conversion.
 //!
 //! Ternary weights are trits × scales regardless of container: I2_S (2 bpw,
-//! per-tensor scale), TQ2_0 (2.06 bpw, per-block scale, the GPU compute
-//! format) and TQ1_0 (1.69 bpw base-243, per-block scale, ~18% smaller — the
-//! interchange/storage format) all encode the same information. This command
+//! per-tensor scale), standard Q2_0 (2.25 bpw, group-64), TQ2_0 (2.06 bpw,
+//! group-256, GPU compute) and TQ1_0 (1.69 bpw base-243, group-256, storage)
+//! encode the same dequantized weights when scale geometry is compatible. This command
 //! rewrites every 2-D ternary tensor into the target format and copies
-//! everything else (metadata, norms, embeddings) verbatim, so
-//! `repack(repack(x)) == x` at the trits level.
+//! everything else (metadata, norms, embeddings) verbatim. Zero-scale groups are
+//! semantic zeros; conversion to G256 canonicalizes their stored codes to zero.
 //!
-//! Ship TQ1_0, run TQ2_0: the model loader unpacks any of the three to trits
-//! at load and each backend packs its own native layout, so a repacked file
-//! generates bit-identically to its source.
+//! I2_S/TQ1_0/TQ2_0 normalize into backend-native layouts at load. Standard Q2_0
+//! remains packed with its exact G64 scales in the portable Q2 projection.
 
-use std::path::Path;
+use std::ffi::OsString;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, bail};
 use clap::ValueEnum;
 use half::f16;
 use tritium_core::Trit;
 use tritium_format::{
-    GGML_TYPE_I2_S, GGML_TYPE_TQ1_0, GGML_TYPE_TQ2_0, GgufFile, QK_K, TQ1_0_BLOCK_BYTES,
-    TQ2_0_BLOCK_BYTES, TensorOut, pack_tq1_0_row, pack_tq2_0_row, read_gguf, unpack_i2s_tensor,
+    GGML_TYPE_I2_S, GGML_TYPE_Q2_0, GGML_TYPE_TQ1_0, GGML_TYPE_TQ2_0, GgufFile, I2S_SCALE_BYTES,
+    Q2_0_BLOCK_BYTES, Q2_0_GROUP_SIZE, QK_K, TQ1_0_BLOCK_BYTES, TQ2_0_BLOCK_BYTES, TensorOut,
+    pack_q2_0_row, pack_tq1_0_row, pack_tq2_0_row, read_gguf, unpack_i2s_tensor, unpack_q2_0_row,
     unpack_tq1_0_row, unpack_tq2_0_row, write_gguf,
 };
+
+static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Target ternary format for `tritium repack`.
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -31,6 +37,8 @@ pub(crate) enum RepackTarget {
     Tq1,
     /// TQ2_0 — base-4, 2.06 bpw (the GPU compute format).
     Tq2,
+    /// Standard llama.cpp Q2_0 — base-4, 2.25 bpw, one f16 scale per 64 values.
+    Q2,
 }
 
 impl RepackTarget {
@@ -38,18 +46,27 @@ impl RepackTarget {
         match self {
             RepackTarget::Tq1 => GGML_TYPE_TQ1_0,
             RepackTarget::Tq2 => GGML_TYPE_TQ2_0,
+            RepackTarget::Q2 => GGML_TYPE_Q2_0,
         }
     }
     fn block_bytes(self) -> usize {
         match self {
             RepackTarget::Tq1 => TQ1_0_BLOCK_BYTES,
             RepackTarget::Tq2 => TQ2_0_BLOCK_BYTES,
+            RepackTarget::Q2 => Q2_0_BLOCK_BYTES,
+        }
+    }
+
+    fn group_size(self) -> usize {
+        match self {
+            RepackTarget::Tq1 | RepackTarget::Tq2 => QK_K,
+            RepackTarget::Q2 => Q2_0_GROUP_SIZE,
         }
     }
 }
 
 /// A tensor's payload span, honoring the I2_S sizing quirk (`n_bytes == 0`
-/// from the reader; the payload is `n_elements/4 + 32`).
+/// from the reader; the payload is `n_elements/4 + I2S_SCALE_BYTES`).
 fn payload<'a>(
     file: &GgufFile,
     bytes: &'a [u8],
@@ -57,14 +74,24 @@ fn payload<'a>(
     n_elements: usize,
 ) -> anyhow::Result<&'a [u8]> {
     let info = &file.tensors[idx];
-    let start = (file.tensor_data_offset + info.offset) as usize;
+    let start = file
+        .tensor_data_offset
+        .checked_add(info.offset)
+        .context("tensor payload offset overflow")?;
+    let start = usize::try_from(start).context("tensor payload offset exceeds usize")?;
     let len = if info.ggml_type == GGML_TYPE_I2_S {
-        n_elements / 4 + 32
+        n_elements
+            .checked_div(4)
+            .and_then(|packed| packed.checked_add(I2S_SCALE_BYTES))
+            .context("I2_S payload length overflow")?
     } else {
-        info.n_bytes as usize
+        usize::try_from(info.n_bytes).context("tensor payload length exceeds usize")?
     };
+    let end = start
+        .checked_add(len)
+        .context("tensor payload end overflow")?;
     bytes
-        .get(start..start + len)
+        .get(start..end)
         .with_context(|| format!("{}: payload out of bounds", info.name))
 }
 
@@ -82,48 +109,93 @@ pub(crate) fn run(input: &Path, output: &Path, to: RepackTarget) -> anyhow::Resu
     // scale rides in metadata so Tritium's loader reproduces the source model
     // BIT-EXACTLY; foreign loaders fall back to the f16 block scales (~1e-4
     // relative, the formats' native precision).
-    let mut scale_meta: Vec<(String, f32)> = Vec::new();
+    // Every converted tensor owns this exporter namespace. Record `None` when
+    // the target's f16 blocks are exact so stale input metadata is removed.
+    let mut scale_meta: Vec<(String, Option<f32>)> = Vec::new();
 
     for (idx, info) in file.tensors.iter().enumerate() {
         let ternary = matches!(
             info.ggml_type,
-            GGML_TYPE_I2_S | GGML_TYPE_TQ1_0 | GGML_TYPE_TQ2_0
+            GGML_TYPE_I2_S | GGML_TYPE_Q2_0 | GGML_TYPE_TQ1_0 | GGML_TYPE_TQ2_0
         ) && info.dims.len() == 2;
         if !ternary {
             passthrough += 1;
             continue;
         }
-        let k_in = info.dims[0] as usize;
-        let n_out = info.dims[1] as usize;
-        if !k_in.is_multiple_of(QK_K) {
+        let k_in = usize::try_from(info.dims[0])
+            .with_context(|| format!("{}: K exceeds usize", info.name))?;
+        let n_out = usize::try_from(info.dims[1])
+            .with_context(|| format!("{}: N exceeds usize", info.name))?;
+        if !k_in.is_multiple_of(to.group_size()) {
             // repack writes per-row-padded blocks but the GGUF reader sizes TQ
             // tensors flat (ceil(k*n/256)) — a ragged k would produce a file
             // whose n_bytes under-counts its payload. ggml itself requires
             // ne0 % 256 == 0 for TQ types; refuse rather than emit it.
             bail!(
-                "{}: k={k_in} is not a multiple of {QK_K} — TQ formats require it",
-                info.name
+                "{}: k={k_in} is not a multiple of target {:?} group {}",
+                info.name,
+                to,
+                to.group_size()
             );
         }
-        let n_elements = k_in * n_out;
+        let n_elements = k_in
+            .checked_mul(n_out)
+            .with_context(|| format!("{}: element count overflow", info.name))?;
         let p = payload(&file, &bytes, idx, n_elements)?;
 
-        // Unpack to trits + per-block scales (I2_S: replicate the per-tensor
-        // scale into every block — all-zero blocks decode to 0 at any scale,
-        // so this is exact).
-        let nb = k_in.div_ceil(QK_K);
-        let mut trits = vec![Trit::ZERO; n_elements];
-        let mut scales = vec![vec![f16::ZERO; nb]; n_out];
+        // Normalize scale geometry to G64. I2_S replicates its tensor scale;
+        // TQ1/TQ2 replicate each G256 scale four times; Q2 is already G64.
+        // This makes Q2 output exact and lets coarser targets fail closed when
+        // four source groups cannot share one scale.
+        let groups64 = k_in.div_ceil(Q2_0_GROUP_SIZE);
+        let mut trits = zeroed_vec(n_elements, Trit::ZERO, &format!("{} trits", info.name))?;
+        let mut scales64 = Vec::new();
+        scales64
+            .try_reserve_exact(n_out)
+            .with_context(|| format!("{}: allocate {n_out} scale rows", info.name))?;
+        for _ in 0..n_out {
+            scales64.push(zeroed_vec(
+                groups64,
+                f16::ZERO,
+                &format!("{} G64 scales", info.name),
+            )?);
+        }
         match info.ggml_type {
             GGML_TYPE_I2_S => {
                 let s = unpack_i2s_tensor(p, n_elements, &mut trits)
                     .map_err(|e| anyhow::anyhow!("{}: {e}", info.name))?;
                 let s16 = f16::from_f32(s);
-                if f32::from(s16) != s {
-                    scale_meta.push((format!("tritium.i2s_scale.{}", info.name), s));
+                if !s.is_finite() {
+                    bail!("{}: I2_S scale is non-finite ({s})", info.name);
                 }
-                for row in &mut scales {
+                if !s16.is_finite() {
+                    bail!("{}: I2_S scale {s} overflows finite f16", info.name);
+                }
+                if s != 0.0 && s16 == f16::ZERO {
+                    bail!(
+                        "{}: nonzero I2_S scale {s} underflows to f16 zero",
+                        info.name
+                    );
+                }
+                scale_meta.push((
+                    format!("tritium.i2s_scale.{}", info.name),
+                    (f32::from(s16) != s).then_some(s),
+                ));
+                for row in &mut scales64 {
                     row.fill(s16);
+                }
+            }
+            GGML_TYPE_Q2_0 => {
+                let row_bytes = groups64
+                    .checked_mul(Q2_0_BLOCK_BYTES)
+                    .with_context(|| format!("{}: Q2_0 row length overflow", info.name))?;
+                for r in 0..n_out {
+                    unpack_q2_0_row(
+                        &p[r * row_bytes..(r + 1) * row_bytes],
+                        &mut trits[r * k_in..(r + 1) * k_in],
+                        &mut scales64[r],
+                    )
+                    .map_err(|e| anyhow::anyhow!("{}: {e}", info.name))?;
                 }
             }
             t @ (GGML_TYPE_TQ1_0 | GGML_TYPE_TQ2_0) => {
@@ -132,30 +204,107 @@ pub(crate) fn run(input: &Path, output: &Path, to: RepackTarget) -> anyhow::Resu
                 } else {
                     TQ2_0_BLOCK_BYTES
                 };
-                let row_bytes = nb * bb;
+                let groups256 = k_in.div_ceil(QK_K);
+                let row_bytes = groups256
+                    .checked_mul(bb)
+                    .with_context(|| format!("{}: TQ row length overflow", info.name))?;
+                let mut scales256 =
+                    zeroed_vec(groups256, f16::ZERO, &format!("{} G256 scales", info.name))?;
                 for r in 0..n_out {
                     let row = &p[r * row_bytes..(r + 1) * row_bytes];
                     let out = &mut trits[r * k_in..(r + 1) * k_in];
                     if t == GGML_TYPE_TQ1_0 {
-                        unpack_tq1_0_row(row, out, &mut scales[r])
+                        unpack_tq1_0_row(row, out, &mut scales256)
                     } else {
-                        unpack_tq2_0_row(row, out, &mut scales[r])
+                        unpack_tq2_0_row(row, out, &mut scales256)
                     }
                     .map_err(|e| anyhow::anyhow!("{}: {e}", info.name))?;
+                    for (group, &scale) in scales256.iter().enumerate() {
+                        scales64[r][group * 4..group * 4 + 4].fill(scale);
+                    }
                 }
             }
             _ => unreachable!("ternary match guarded above"),
         }
+        for (row, scales) in scales64.iter().enumerate() {
+            for (group, scale) in scales.iter().enumerate() {
+                if !scale.is_finite() {
+                    bail!(
+                        "{}: row {row} G64 group {group} has non-finite f16 scale bits 0x{:04x}",
+                        info.name,
+                        scale.to_bits()
+                    );
+                }
+            }
+        }
+        if info.ggml_type != GGML_TYPE_I2_S {
+            let key = format!("tritium.i2s_scale.{}", info.name);
+            let rebound = match file.metadata.get(&key) {
+                Some(value) => {
+                    let exact = value.as_f32().with_context(|| {
+                        format!("{}: stale scale metadata {key} is not f32", info.name)
+                    })?;
+                    if !exact.is_finite() {
+                        bail!(
+                            "{}: stale scale metadata {key} is non-finite ({exact})",
+                            info.name
+                        );
+                    }
+                    let rounded = f16::from_f32(exact);
+                    if !rounded.is_finite() || (exact != 0.0 && rounded == f16::ZERO) {
+                        bail!(
+                            "{}: stale scale metadata {key} value {exact} is not representable as finite nonzero f16",
+                            info.name
+                        );
+                    }
+                    let mut saw_nonzero = false;
+                    for (row, scales) in scales64.iter().enumerate() {
+                        for (group, scale) in scales.iter().enumerate() {
+                            if *scale == f16::ZERO {
+                                continue;
+                            }
+                            saw_nonzero = true;
+                            if scale.to_bits() != rounded.to_bits() {
+                                bail!(
+                                    "{}: stale scale metadata {key} rounds to 0x{:04x}, but row {row} G64 group {group} stores 0x{:04x}",
+                                    info.name,
+                                    rounded.to_bits(),
+                                    scale.to_bits()
+                                );
+                            }
+                        }
+                    }
+                    saw_nonzero.then_some(exact)
+                }
+                None => None,
+            };
+            scale_meta.push((key, rebound));
+        }
 
-        // Pack every row into the target format, preserving block scales.
-        let row_bytes = nb * to.block_bytes();
-        let mut out = vec![0u8; n_out * row_bytes];
+        // Pack every row into target geometry. G256 targets require each four
+        // G64 groups to carry one common nonzero scale; zero-scale groups are
+        // semantically zero and are canonicalized to zero trits before collapse.
+        let target_groups = k_in.div_ceil(to.group_size());
+        let row_bytes = target_groups
+            .checked_mul(to.block_bytes())
+            .with_context(|| format!("{}: target row length overflow", info.name))?;
+        let out_len = n_out
+            .checked_mul(row_bytes)
+            .with_context(|| format!("{}: target payload length overflow", info.name))?;
+        let mut out = zeroed_vec(out_len, 0u8, &format!("{} target payload", info.name))?;
         for r in 0..n_out {
-            let row_trits = &trits[r * k_in..(r + 1) * k_in];
+            let row_trits = &mut trits[r * k_in..(r + 1) * k_in];
             let dst = &mut out[r * row_bytes..(r + 1) * row_bytes];
             match to {
-                RepackTarget::Tq1 => pack_tq1_0_row(row_trits, &scales[r], dst),
-                RepackTarget::Tq2 => pack_tq2_0_row(row_trits, &scales[r], dst),
+                RepackTarget::Q2 => pack_q2_0_row(row_trits, &scales64[r], dst),
+                RepackTarget::Tq1 | RepackTarget::Tq2 => {
+                    let scales256 = collapse_g64_scales(&info.name, row_trits, &scales64[r], k_in)?;
+                    if to == RepackTarget::Tq1 {
+                        pack_tq1_0_row(row_trits, &scales256, dst)
+                    } else {
+                        pack_tq2_0_row(row_trits, &scales256, dst)
+                    }
+                }
             }
             .map_err(|e| anyhow::anyhow!("{}: {e}", info.name))?;
         }
@@ -164,7 +313,7 @@ pub(crate) fn run(input: &Path, output: &Path, to: RepackTarget) -> anyhow::Resu
     }
 
     if converted == 0 {
-        bail!("no 2-D ternary tensors (I2_S / TQ1_0 / TQ2_0) found — nothing to repack");
+        bail!("no 2-D ternary tensors (I2_S / Q2_0 / TQ1_0 / TQ2_0) found — nothing to repack");
     }
 
     // Assemble the output tensor table in file order.
@@ -182,7 +331,13 @@ pub(crate) fn run(input: &Path, output: &Path, to: RepackTarget) -> anyhow::Resu
             });
             arena_it.next();
         } else {
-            let n_elements = info.dims.iter().product::<u64>() as usize;
+            let n_elements = info
+                .dims
+                .iter()
+                .try_fold(1u64, |total, &dimension| total.checked_mul(dimension))
+                .context("passthrough tensor element count overflow")?;
+            let n_elements =
+                usize::try_from(n_elements).context("passthrough element count exceeds usize")?;
             let p = payload(&file, &bytes, idx, n_elements)?;
             tensors.push(TensorOut {
                 name: info.name.clone(),
@@ -194,11 +349,14 @@ pub(crate) fn run(input: &Path, output: &Path, to: RepackTarget) -> anyhow::Resu
     }
 
     let mut metadata = file.metadata.clone();
-    for (k, v) in scale_meta {
-        metadata.insert(k, tritium_format::GgufValue::F32(v));
+    for (key, value) in scale_meta {
+        metadata.remove(&key);
+        if let Some(value) = value {
+            metadata.insert(key, tritium_format::GgufValue::F32(value));
+        }
     }
     let out_bytes = write_gguf(file.version, &metadata, &tensors).context("serialize GGUF")?;
-    std::fs::write(output, &out_bytes).with_context(|| format!("write {}", output.display()))?;
+    publish_atomic_verified(output, &out_bytes)?;
     println!(
         "repacked {} of {} tensors to {:?}: {} -> {} bytes ({:+.1}%)",
         converted,
@@ -209,6 +367,133 @@ pub(crate) fn run(input: &Path, output: &Path, to: RepackTarget) -> anyhow::Resu
         (out_bytes.len() as f64 / bytes.len() as f64 - 1.0) * 100.0,
     );
     Ok(())
+}
+
+struct TemporaryOutput {
+    path: PathBuf,
+    committed: bool,
+}
+
+impl Drop for TemporaryOutput {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn publish_atomic_verified(output: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    let parent = match output.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("create output directory {}", parent.display()))?;
+    let file_name = output
+        .file_name()
+        .context("repack output path has no file name")?;
+    let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let mut temporary_name = OsString::from(".");
+    temporary_name.push(file_name);
+    temporary_name.push(format!(".repack-{}-{sequence}.tmp", std::process::id()));
+    let mut temporary = TemporaryOutput {
+        path: parent.join(temporary_name),
+        committed: false,
+    };
+
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary.path)
+        .with_context(|| format!("create temporary output {}", temporary.path.display()))?;
+    file.write_all(bytes)
+        .with_context(|| format!("write temporary output {}", temporary.path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("fsync temporary output {}", temporary.path.display()))?;
+    drop(file);
+
+    let expected = blake3::hash(bytes);
+    let mut actual = blake3::Hasher::new();
+    let mut reopened = File::open(&temporary.path)
+        .with_context(|| format!("reopen temporary output {}", temporary.path.display()))?;
+    let mut buffer = [0u8; 64 * 1024];
+    let mut verified_bytes = 0usize;
+    loop {
+        let count = reopened
+            .read(&mut buffer)
+            .with_context(|| format!("verify temporary output {}", temporary.path.display()))?;
+        if count == 0 {
+            break;
+        }
+        verified_bytes = verified_bytes
+            .checked_add(count)
+            .context("verified repack output length overflow")?;
+        actual.update(&buffer[..count]);
+    }
+    if verified_bytes != bytes.len() || actual.finalize() != expected {
+        bail!(
+            "temporary output {} failed byte-for-byte verification",
+            temporary.path.display()
+        );
+    }
+
+    std::fs::rename(&temporary.path, output).with_context(|| {
+        format!(
+            "atomically publish {} as {}",
+            temporary.path.display(),
+            output.display()
+        )
+    })?;
+    temporary.committed = true;
+    #[cfg(unix)]
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .with_context(|| format!("fsync output directory {}", parent.display()))?;
+    Ok(())
+}
+
+fn zeroed_vec<T: Clone>(len: usize, value: T, label: &str) -> anyhow::Result<Vec<T>> {
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(len)
+        .with_context(|| format!("allocate {len} values for {label}"))?;
+    output.resize(len, value);
+    Ok(output)
+}
+
+fn collapse_g64_scales(
+    name: &str,
+    row_trits: &mut [Trit],
+    scales64: &[f16],
+    k_in: usize,
+) -> anyhow::Result<Vec<f16>> {
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(k_in / QK_K)
+        .with_context(|| format!("{name}: allocate collapsed G256 scales"))?;
+    for (group256, chunk) in scales64.chunks_exact(4).enumerate() {
+        let mut selected = None;
+        for (within, &scale) in chunk.iter().enumerate() {
+            if scale == f16::ZERO {
+                let start = group256 * QK_K + within * Q2_0_GROUP_SIZE;
+                row_trits[start..start + Q2_0_GROUP_SIZE].fill(Trit::ZERO);
+                continue;
+            }
+            match selected {
+                None => selected = Some(scale),
+                Some(expected) if expected.to_bits() == scale.to_bits() => {}
+                Some(expected) => {
+                    bail!(
+                        "{name}: Q2_0 G64 scales 0x{:04x} and 0x{:04x} differ inside G256 group {group256}; refusing lossy TQ repack",
+                        expected.to_bits(),
+                        scale.to_bits()
+                    );
+                }
+            }
+        }
+        output.push(selected.unwrap_or(f16::ZERO));
+    }
+    Ok(output)
 }
 
 #[cfg(test)]
@@ -239,10 +524,10 @@ mod tests {
 
     /// Pack an I2_S payload: per 32-byte block, byte `gp` holds elements
     /// `[gp, 32+gp, 64+gp, 96+gp]` at bit-pairs `[7:6]..[1:0]` (code =
-    /// trit + 1), followed by the f32 scale padded to 32 trailer bytes.
+    /// trit + 1), followed by the little-endian f32 scale trailer.
     fn pack_i2s_tensor(t: &[Trit], scale: f32) -> Vec<u8> {
         assert_eq!(t.len() % 128, 0);
-        let mut out = vec![0u8; t.len() / 4 + 32];
+        let mut out = vec![0u8; t.len() / 4 + I2S_SCALE_BYTES];
         for (b, blk) in t.chunks_exact(128).enumerate() {
             for gp in 0..32 {
                 let mut byte = 0u8;
@@ -429,5 +714,78 @@ mod tests {
                 .collect();
             assert_eq!(got_dense, dense);
         }
+    }
+
+    #[test]
+    fn repack_i2s_to_standard_q2_preserves_model_payloads() {
+        let (src, want_trits, scale, dense) = synthetic_gguf();
+        let dir = std::env::temp_dir().join("tritium-repack-q2-test");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let input = dir.join("input.gguf");
+        let output = dir.join("q2.gguf");
+        std::fs::write(&input, src).expect("write source");
+
+        run(&input, &output, RepackTarget::Q2).expect("repack to standard Q2_0");
+        let bytes = std::fs::read(output).expect("read Q2_0 output");
+        let file = read_gguf(&bytes).expect("parse Q2_0 output");
+        let info = file.tensor("blk.0.w").expect("Q2_0 tensor");
+        assert_eq!(info.ggml_type, tritium_format::GGML_TYPE_Q2_0);
+        let (k_in, n_out) = (info.dims[0] as usize, info.dims[1] as usize);
+        let blocks = tritium_format::q2_0_num_blocks(k_in);
+        let row_bytes = blocks * tritium_format::Q2_0_BLOCK_BYTES;
+        let payload_start = (file.tensor_data_offset + info.offset) as usize;
+        let payload = &bytes[payload_start..payload_start + n_out * row_bytes];
+        let mut got = vec![Trit::ZERO; n_out * k_in];
+        let mut scales = vec![f16::ZERO; blocks];
+        for row in 0..n_out {
+            tritium_format::unpack_q2_0_row(
+                &payload[row * row_bytes..(row + 1) * row_bytes],
+                &mut got[row * k_in..(row + 1) * k_in],
+                &mut scales,
+            )
+            .expect("unpack Q2_0 row");
+            assert!(scales.iter().all(|value| f32::from(*value) == scale));
+        }
+        assert_eq!(got, want_trits);
+
+        let dense_info = file.tensor("norm").expect("dense passthrough");
+        let start = (file.tensor_data_offset + dense_info.offset) as usize;
+        let got_dense: Vec<f32> = bytes[start..start + dense_info.n_bytes as usize]
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("f32 bytes")))
+            .collect();
+        assert_eq!(got_dense, dense);
+    }
+
+    #[test]
+    fn repack_q2_to_tq_refuses_incompatible_g64_scales() {
+        let (src, _, _, _) = synthetic_gguf();
+        let dir = std::env::temp_dir().join("tritium-repack-q2-collapse-test");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let input = dir.join("input.gguf");
+        let q2_path = dir.join("q2.gguf");
+        let incompatible = dir.join("q2-incompatible.gguf");
+        let output = dir.join("tq2.gguf");
+        if output.exists() {
+            std::fs::remove_file(&output).expect("remove stale output");
+        }
+        std::fs::write(&input, src).expect("write source");
+        run(&input, &q2_path, RepackTarget::Q2).expect("make Q2_0 source");
+
+        let mut bytes = std::fs::read(q2_path).expect("read Q2_0 source");
+        let file = read_gguf(&bytes).expect("parse Q2_0 source");
+        let info = file.tensor("blk.0.w").expect("Q2_0 tensor");
+        let start = (file.tensor_data_offset + info.offset) as usize;
+        bytes[start + Q2_0_BLOCK_BYTES..start + Q2_0_BLOCK_BYTES + 2]
+            .copy_from_slice(&f16::from_f32(0.25).to_bits().to_le_bytes());
+        std::fs::write(&incompatible, bytes).expect("write incompatible Q2_0");
+
+        let error = run(&incompatible, &output, RepackTarget::Tq2)
+            .expect_err("incompatible G64 scales must refuse");
+        assert!(
+            error.to_string().contains("refusing lossy TQ repack"),
+            "unexpected error: {error}"
+        );
+        assert!(!output.exists(), "failed repack must not publish output");
     }
 }

@@ -4472,6 +4472,7 @@ name = "tritium-format"
 version = "1.1.0-rc.1"
 dependencies = [
  "blake3",
+ "bytemuck",
  "half",
  "proptest",
  "serde",

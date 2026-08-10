@@ -4,6 +4,7 @@ use core::fmt;
 use std::io::{self, Write};
 
 use half::f16;
+use tritium_core::Trit;
 
 use crate::{
     ModelId,
@@ -22,6 +23,8 @@ const METADATA_VERSION: u16 = 1;
 const METADATA_CHECKSUM_BYTES: usize = 32;
 const METADATA_CHECKSUM_CONTEXT: &str = "tritium salt v2 tensor master metadata v1";
 const TENSOR_MASTER_ID_CONTEXT: &str = "tritium salt v2 tensor master identity v1";
+const PARENT_TENSOR_LINEAGE_CONTEXT: &str = "tritium salt v2 parent tensor lineage v1";
+const PARENT_CATALOG_LINEAGE_CONTEXT: &str = "tritium salt v2 parent catalog lineage v1";
 const MAX_NAME_BYTES: usize = 64 * 1024;
 const MAX_RANK: usize = 32;
 const MAX_METADATA_BYTES: usize = 128 * 1024;
@@ -451,10 +454,274 @@ impl SaltV2MasterTile {
     }
 }
 
+/// Bounded streaming identity over exact ordered Pmax trits and scale bits.
+///
+/// Unlike [`SaltV2MasterTensorReceipt::tensor_master_id`], this identity omits
+/// fitting losses and source evidence. Device refinement can recompute it from
+/// decoded parents and prove semantic ancestry.
+#[derive(Debug)]
+pub struct SaltV2ParentTensorLineageHasher {
+    hasher: blake3::Hasher,
+    logical_coefficients: usize,
+    expected_tiles: usize,
+    group_size: usize,
+    plane_count: u8,
+    next_tile: usize,
+    failed: bool,
+}
+
+impl SaltV2ParentTensorLineageHasher {
+    /// Start one canonical tile-major parent identity.
+    ///
+    /// # Errors
+    /// Rejects empty/overflowing geometry, unsupported plane counts, or scale
+    /// groups incompatible with canonical 256-coefficient allocation tiles.
+    pub fn new(
+        shape: &[u64],
+        group_size: usize,
+        constraint: SaltV2FitConstraint,
+        plane_count: u8,
+    ) -> Result<Self, SaltV2MasterError> {
+        if shape.is_empty() || shape.contains(&0) || group_size == 0 {
+            return Err(SaltV2MasterError::InvalidShape);
+        }
+        if !(1..=3).contains(&plane_count) {
+            return Err(SaltV2MasterError::InvalidPlaneCount { got: plane_count });
+        }
+        if group_size > SALT_V2_ALLOCATION_TILE_SIZE
+            || !SALT_V2_ALLOCATION_TILE_SIZE.is_multiple_of(group_size)
+        {
+            return Err(SaltV2MasterError::Package(
+                SaltV2PackageError::UnsupportedScaleGroupSize(group_size),
+            ));
+        }
+        let logical_coefficients = shape
+            .iter()
+            .try_fold(1_u64, |product, dimension| product.checked_mul(*dimension))
+            .ok_or(SaltV2MasterError::LengthOverflow)
+            .and_then(|count| {
+                usize::try_from(count).map_err(|_| SaltV2MasterError::LengthOverflow)
+            })?;
+        let expected_tiles = logical_coefficients.div_ceil(SALT_V2_ALLOCATION_TILE_SIZE);
+        let mut hasher = blake3::Hasher::new_derive_key(PARENT_TENSOR_LINEAGE_CONTEXT);
+        hasher.update(&(shape.len() as u64).to_le_bytes());
+        for dimension in shape {
+            hasher.update(&dimension.to_le_bytes());
+        }
+        hasher.update(&(group_size as u64).to_le_bytes());
+        hasher.update(&[constraint_tag(constraint), plane_count]);
+        Ok(Self {
+            hasher,
+            logical_coefficients,
+            expected_tiles,
+            group_size,
+            plane_count,
+            next_tile: 0,
+            failed: false,
+        })
+    }
+
+    /// Hash one exact row-major allocation tile without tensor-sized allocation.
+    ///
+    /// # Errors
+    /// Rejects reuse after failure, extra tiles, or wrong code/scale/plane counts.
+    pub fn push_tile<'a>(
+        &mut self,
+        planes: impl IntoIterator<Item = (&'a [Trit], &'a [f16])>,
+    ) -> Result<(), SaltV2MasterError> {
+        self.push_tile_with(planes, |hasher, trits| {
+            let mut encoded = [0_u8; SALT_V2_ALLOCATION_TILE_SIZE];
+            for (output, trit) in encoded.iter_mut().zip(trits) {
+                *output = trit.get().to_le_bytes()[0];
+            }
+            hasher.update(&encoded[..trits.len()]);
+        })
+    }
+
+    /// Hash one tile from already validated raw `{-1, 0, 1}` codes.
+    ///
+    /// # Errors
+    /// Rejects reuse after failure, extra tiles, or wrong code/scale/plane counts.
+    pub fn push_raw_tile<'a>(
+        &mut self,
+        planes: impl IntoIterator<Item = (&'a [i8], &'a [f16])>,
+    ) -> Result<(), SaltV2MasterError> {
+        self.push_tile_with(planes, |hasher, trits| {
+            hasher.update(bytemuck::cast_slice(trits));
+        })
+    }
+
+    fn push_tile_with<'a, T: 'a>(
+        &mut self,
+        planes: impl IntoIterator<Item = (&'a [T], &'a [f16])>,
+        hash_trits: impl FnMut(&mut blake3::Hasher, &[T]),
+    ) -> Result<(), SaltV2MasterError> {
+        if self.failed {
+            return Err(SaltV2MasterError::Poisoned);
+        }
+        let result = self.push_tile_inner(planes, hash_trits);
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+
+    fn push_tile_inner<'a, T: 'a>(
+        &mut self,
+        planes: impl IntoIterator<Item = (&'a [T], &'a [f16])>,
+        mut hash_trits: impl FnMut(&mut blake3::Hasher, &[T]),
+    ) -> Result<(), SaltV2MasterError> {
+        if self.next_tile >= self.expected_tiles {
+            return Err(SaltV2MasterError::TooManyTiles);
+        }
+        let start = self
+            .next_tile
+            .checked_mul(SALT_V2_ALLOCATION_TILE_SIZE)
+            .ok_or(SaltV2MasterError::LengthOverflow)?;
+        let logical_len = (self.logical_coefficients - start).min(SALT_V2_ALLOCATION_TILE_SIZE);
+        let expected_scales = logical_len.div_ceil(self.group_size);
+        self.hasher.update(&(self.next_tile as u64).to_le_bytes());
+        self.hasher.update(&(logical_len as u64).to_le_bytes());
+        let mut seen = 0_u8;
+        for (trits, scales) in planes {
+            if trits.len() != logical_len {
+                return Err(SaltV2MasterError::WrongTileLength {
+                    tile_index: self.next_tile,
+                    expected: logical_len,
+                    got: trits.len(),
+                });
+            }
+            if scales.len() != expected_scales {
+                return Err(SaltV2MasterError::Package(
+                    SaltV2PackageError::WrongScaleCount {
+                        expected: expected_scales,
+                        got: scales.len(),
+                    },
+                ));
+            }
+            hash_trits(&mut self.hasher, trits);
+            for scale in scales {
+                self.hasher.update(&scale.to_bits().to_le_bytes());
+            }
+            seen = seen
+                .checked_add(1)
+                .ok_or(SaltV2MasterError::LengthOverflow)?;
+        }
+        if seen != self.plane_count {
+            return Err(SaltV2MasterError::WrongPlaneCount {
+                expected: self.plane_count,
+                got: seen,
+            });
+        }
+        self.next_tile += 1;
+        Ok(())
+    }
+
+    /// Finish only after exact shape-derived tile coverage.
+    ///
+    /// # Errors
+    /// Rejects poisoned or incomplete streams.
+    pub fn finish(self) -> Result<[u8; 32], SaltV2MasterError> {
+        if self.failed {
+            return Err(SaltV2MasterError::Poisoned);
+        }
+        if self.next_tile != self.expected_tiles {
+            return Err(SaltV2MasterError::PayloadLengthMismatch {
+                expected: self.expected_tiles as u64,
+                actual: self.next_tile as u64,
+            });
+        }
+        Ok(*self.hasher.finalize().as_bytes())
+    }
+}
+
+/// Ordered model identity over named parent-tensor lineage digests.
+#[derive(Debug)]
+pub struct SaltV2ParentCatalogLineageHasher {
+    hasher: blake3::Hasher,
+    previous_name: Option<String>,
+    count: u64,
+    failed: bool,
+}
+
+impl SaltV2ParentCatalogLineageHasher {
+    /// Start an empty lexical parent catalog.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            hasher: blake3::Hasher::new_derive_key(PARENT_CATALOG_LINEAGE_CONTEXT),
+            previous_name: None,
+            count: 0,
+            failed: false,
+        }
+    }
+
+    /// Add one strictly increasing canonical tensor name and semantic digest.
+    ///
+    /// # Errors
+    /// Rejects empty, duplicate, out-of-order, overlong, or post-failure entries.
+    pub fn push(
+        &mut self,
+        name: &str,
+        tensor_lineage_digest: [u8; 32],
+    ) -> Result<(), SaltV2MasterError> {
+        if self.failed {
+            return Err(SaltV2MasterError::Poisoned);
+        }
+        if name.is_empty() || name.len() > MAX_NAME_BYTES {
+            self.failed = true;
+            return Err(SaltV2MasterError::InvalidName);
+        }
+        if self
+            .previous_name
+            .as_deref()
+            .is_some_and(|previous| previous >= name)
+        {
+            self.failed = true;
+            return Err(SaltV2MasterError::MalformedMetadata("parent catalog order"));
+        }
+        let name_len = u64::try_from(name.len()).map_err(|_| {
+            self.failed = true;
+            SaltV2MasterError::LengthOverflow
+        })?;
+        self.hasher.update(&name_len.to_le_bytes());
+        self.hasher.update(name.as_bytes());
+        self.hasher.update(&tensor_lineage_digest);
+        self.previous_name = Some(name.to_owned());
+        self.count = self.count.checked_add(1).ok_or_else(|| {
+            self.failed = true;
+            SaltV2MasterError::LengthOverflow
+        })?;
+        Ok(())
+    }
+
+    /// Seal a nonempty catalog identity.
+    ///
+    /// # Errors
+    /// Rejects empty or poisoned catalogs.
+    pub fn finish(mut self) -> Result<[u8; 32], SaltV2MasterError> {
+        if self.failed {
+            return Err(SaltV2MasterError::Poisoned);
+        }
+        if self.count == 0 {
+            return Err(SaltV2MasterError::InvalidShape);
+        }
+        self.hasher.update(&self.count.to_le_bytes());
+        Ok(*self.hasher.finalize().as_bytes())
+    }
+}
+
+impl Default for SaltV2ParentCatalogLineageHasher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Content receipt for one complete canonical tensor-master stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SaltV2MasterTensorReceipt {
     tensor_master_id: [u8; 32],
+    parent_lineage_digest: [u8; 32],
     payload_bytes: u64,
     tile_count: u64,
 }
@@ -464,6 +731,12 @@ impl SaltV2MasterTensorReceipt {
     #[must_use]
     pub const fn tensor_master_id(self) -> [u8; 32] {
         self.tensor_master_id
+    }
+
+    /// Exact Pmax trit/scale identity, excluding fitting losses and evidence.
+    #[must_use]
+    pub const fn parent_lineage_digest(self) -> [u8; 32] {
+        self.parent_lineage_digest
     }
 
     /// Exact canonical payload length.
@@ -485,6 +758,7 @@ pub struct SaltV2MasterTensorEncoder<'a, W> {
     spec: &'a SaltV2MasterTensorSpec,
     sink: W,
     hasher: blake3::Hasher,
+    parent_lineage: SaltV2ParentTensorLineageHasher,
     tile_index: usize,
     written: u64,
     failed: bool,
@@ -505,6 +779,12 @@ impl<'a, W: Write> SaltV2MasterTensorEncoder<'a, W> {
             spec,
             sink,
             hasher,
+            parent_lineage: SaltV2ParentTensorLineageHasher::new(
+                spec.shape(),
+                SALT_V2_SCALE_GROUP_SIZE,
+                spec.geometry.constraint,
+                spec.geometry.max_planes,
+            )?,
             tile_index: 0,
             written: 0,
             failed: false,
@@ -555,6 +835,8 @@ impl<'a, W: Write> SaltV2MasterTensorEncoder<'a, W> {
             });
         }
         validate_prefix_curve(losses, admissible_planes)?;
+        self.parent_lineage
+            .push_tile(planes.iter().map(|plane| (plane.trits(), plane.scales())))?;
         let expected = self.spec.tile_frame_bytes(self.tile_index)?;
         let mut frame = Vec::new();
         frame
@@ -613,6 +895,7 @@ impl<'a, W: Write> SaltV2MasterTensorEncoder<'a, W> {
         }
         Ok(SaltV2MasterTensorReceipt {
             tensor_master_id: *self.hasher.finalize().as_bytes(),
+            parent_lineage_digest: self.parent_lineage.finish()?,
             payload_bytes: self.written,
             tile_count: self.tile_index as u64,
         })
@@ -624,6 +907,7 @@ impl<'a, W: Write> SaltV2MasterTensorEncoder<'a, W> {
 pub struct SaltV2MasterTensorDecoder<'a> {
     spec: &'a SaltV2MasterTensorSpec,
     hasher: blake3::Hasher,
+    parent_lineage: SaltV2ParentTensorLineageHasher,
     tile_index: usize,
     buffer: Vec<u8>,
     received: u64,
@@ -649,6 +933,12 @@ impl<'a> SaltV2MasterTensorDecoder<'a> {
         Ok(Self {
             spec,
             hasher,
+            parent_lineage: SaltV2ParentTensorLineageHasher::new(
+                spec.shape(),
+                SALT_V2_SCALE_GROUP_SIZE,
+                spec.geometry.constraint,
+                spec.geometry.max_planes,
+            )?,
             tile_index: 0,
             buffer,
             received: 0,
@@ -710,6 +1000,13 @@ impl<'a> SaltV2MasterTensorDecoder<'a> {
             if self.buffer.len() == frame_bytes {
                 let tile = decode_tile(self.spec, self.tile_index, &self.buffer)
                     .map_err(SaltV2MasterVisitError::Master)?;
+                self.parent_lineage
+                    .push_tile(
+                        tile.planes()
+                            .iter()
+                            .map(|plane| (plane.trits(), plane.scales())),
+                    )
+                    .map_err(SaltV2MasterVisitError::Master)?;
                 visit(tile).map_err(SaltV2MasterVisitError::Visitor)?;
                 self.buffer.clear();
                 self.tile_index += 1;
@@ -737,6 +1034,7 @@ impl<'a> SaltV2MasterTensorDecoder<'a> {
         }
         Ok(SaltV2MasterTensorReceipt {
             tensor_master_id: *self.hasher.finalize().as_bytes(),
+            parent_lineage_digest: self.parent_lineage.finish()?,
             payload_bytes: self.received,
             tile_count: self.tile_index as u64,
         })

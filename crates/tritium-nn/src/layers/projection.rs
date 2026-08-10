@@ -14,7 +14,7 @@ use std::sync::Arc;
 use tritium_spec::TernaryBackend;
 
 use crate::error::NnError;
-use crate::layers::{DenseLinear, HostSaltV2Linear, SaltLinear, TernaryLinear};
+use crate::layers::{DenseLinear, HostSaltV2Linear, Q2Linear, SaltLinear, TernaryLinear};
 
 /// Activation arithmetic performed before a projection's weight contraction.
 ///
@@ -33,6 +33,8 @@ pub enum ProjectionActivationMode {
 pub enum Projection {
     /// The deployed ternary weight (TQ2_0 on device + per-channel scales).
     Ternary(TernaryLinear),
+    /// Standard GGUF Q2_0 retained packed with one scale per 64 coefficients.
+    Q2(Q2Linear),
     /// Packed additive SALT planes, executed without a retained fp32 matrix.
     Salt(SaltLinear),
     /// Compact SALT V2 codec payload executed on portable host arithmetic.
@@ -49,7 +51,9 @@ impl Projection {
     #[must_use]
     pub fn activation_mode(&self) -> ProjectionActivationMode {
         match self {
-            Projection::Ternary(_) | Projection::Salt(_) => ProjectionActivationMode::A8,
+            Projection::Ternary(_) | Projection::Q2(_) | Projection::Salt(_) => {
+                ProjectionActivationMode::A8
+            }
             Projection::HostSaltV2(_) => ProjectionActivationMode::F32,
             #[cfg(feature = "cuda")]
             Projection::SaltV2(_) => ProjectionActivationMode::F32,
@@ -67,6 +71,7 @@ impl Projection {
     pub(crate) fn validate_retained_geometry(&self) -> Result<(), NnError> {
         match self {
             Projection::Ternary(linear) => linear.validate_retained_geometry(),
+            Projection::Q2(linear) => linear.validate_retained_geometry(),
             Projection::Dense(linear) => linear.validate_retained_geometry(),
             Projection::Salt(_) | Projection::HostSaltV2(_) => Ok(()),
             #[cfg(feature = "cuda")]
@@ -89,6 +94,9 @@ impl Projection {
                         "ternary projection scales contain a non-finite value".to_owned(),
                     ));
                 }
+            }
+            Projection::Q2(_) => {
+                // Constructor validates every packed code and scale.
             }
             Projection::Dense(linear) => {
                 if linear.weights.iter().any(|value| !value.is_finite()) {
@@ -126,6 +134,7 @@ impl Projection {
     ) -> Result<(), NnError> {
         match self {
             Projection::Ternary(l) => l.forward(backend, act, m, out),
+            Projection::Q2(l) => l.forward(act, m, out),
             Projection::Salt(l) => l.forward(act, m, out),
             Projection::HostSaltV2(l) => l.forward(act, m, out),
             #[cfg(feature = "cuda")]
@@ -138,6 +147,7 @@ impl Projection {
     pub fn n_out(&self) -> usize {
         match self {
             Projection::Ternary(l) => l.n_out,
+            Projection::Q2(l) => l.n_out(),
             Projection::Salt(l) => l.n_out(),
             Projection::HostSaltV2(l) => l.rows(),
             #[cfg(feature = "cuda")]
@@ -150,6 +160,7 @@ impl Projection {
     pub fn k_in(&self) -> usize {
         match self {
             Projection::Ternary(l) => l.k_in,
+            Projection::Q2(l) => l.k_in(),
             Projection::Salt(l) => l.k_in(),
             Projection::HostSaltV2(l) => l.columns(),
             #[cfg(feature = "cuda")]
@@ -163,7 +174,10 @@ impl Projection {
     pub fn as_ternary(&self) -> Option<&TernaryLinear> {
         match self {
             Projection::Ternary(l) => Some(l),
-            Projection::Salt(_) | Projection::HostSaltV2(_) | Projection::Dense(_) => None,
+            Projection::Q2(_)
+            | Projection::Salt(_)
+            | Projection::HostSaltV2(_)
+            | Projection::Dense(_) => None,
             #[cfg(feature = "cuda")]
             Projection::SaltV2(_) => None,
         }
@@ -174,7 +188,10 @@ impl Projection {
     pub fn as_ternary_mut(&mut self) -> Option<&mut TernaryLinear> {
         match self {
             Projection::Ternary(l) => Some(l),
-            Projection::Salt(_) | Projection::HostSaltV2(_) | Projection::Dense(_) => None,
+            Projection::Q2(_)
+            | Projection::Salt(_)
+            | Projection::HostSaltV2(_)
+            | Projection::Dense(_) => None,
             #[cfg(feature = "cuda")]
             Projection::SaltV2(_) => None,
         }

@@ -1094,13 +1094,16 @@ __device__ __forceinline__ unsigned int train_salt_code(
 __device__ __forceinline__ float train_salt_reconstruct_weight(
     const unsigned char* __restrict__ codes,
     const float* __restrict__ scales,
-    int row, int col, int rows, int planes, int row_bytes)
+    int row, int col, int rows, int planes, int row_bytes,
+    int group_size, int groups_per_row)
 {
     float weight = 0.0f;
     for (int plane = 0; plane < planes; ++plane) {
         unsigned int code = train_salt_code(
             codes, plane, row, col, rows, row_bytes);
-        float scale = scales[(long)plane * rows + row];
+        long scale_index = ((long)plane * rows + row) * groups_per_row
+            + col / group_size;
+        float scale = scales[scale_index];
         if (code == 2u) {
             weight += scale;
         } else if (code == 0u) {
@@ -1116,8 +1119,9 @@ extern "C" __global__ void salt_pack_training(
     const float* __restrict__ master,       // [rows, cols]
     float* __restrict__ residual,           // [rows, cols] scratch
     unsigned char* __restrict__ codes,      // [planes, rows, row_bytes]
-    float* __restrict__ scales,             // [planes, rows]
-    int rows, int cols, int planes, int row_bytes)
+    float* __restrict__ scales,             // [planes, rows, groups_per_row]
+    int rows, int cols, int planes, int row_bytes,
+    int group_size, int groups_per_row)
 {
     int row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= rows) return;
@@ -1135,30 +1139,35 @@ extern "C" __global__ void salt_pack_training(
             codes[plane_row + byte] = 0x55u;
         }
 
-        float sum = 0.0f;
-        for (int col = 0; col < cols; ++col) {
-            sum += fabsf(residual[base + col]);
-        }
-        float scale = sum / (float)cols;
-        scales[(long)plane * rows + row] = scale;
-        if (scale == 0.0f) continue;
+        for (int group = 0; group < groups_per_row; ++group) {
+            int start = group * group_size;
+            int end = start + group_size;
+            if (end > cols) end = cols;
+            float sum = 0.0f;
+            for (int col = start; col < end; ++col) {
+                sum += fabsf(residual[base + col]);
+            }
+            float scale = sum / (float)(end - start);
+            scales[((long)plane * rows + row) * groups_per_row + group] = scale;
+            if (scale == 0.0f) continue;
 
-        for (int col = 0; col < cols; ++col) {
-            long idx = base + col;
-            float trit = roundf(residual[idx] / scale);
-            trit = fminf(1.0f, fmaxf(-1.0f, trit));
-            float contribution = scale * trit;
-            residual[idx] -= contribution;
+            for (int col = start; col < end; ++col) {
+                long idx = base + col;
+                float trit = roundf(residual[idx] / scale);
+                trit = fminf(1.0f, fmaxf(-1.0f, trit));
+                float contribution = scale * trit;
+                residual[idx] -= contribution;
 
-            int e = col & (TRAIN_SALT_QK - 1);
-            int l = (e & 127) >> 5;
-            long off = train_salt_code_offset(
-                plane, row, col, rows, row_bytes);
-            unsigned int shift = 2u * (unsigned int)l;
-            unsigned int code = (unsigned int)((int)trit + 1);
-            unsigned int old = codes[off];
-            codes[off] = (unsigned char)(
-                (old & ~(3u << shift)) | (code << shift));
+                int e = col & (TRAIN_SALT_QK - 1);
+                int l = (e & 127) >> 5;
+                long off = train_salt_code_offset(
+                    plane, row, col, rows, row_bytes);
+                unsigned int shift = 2u * (unsigned int)l;
+                unsigned int code = (unsigned int)((int)trit + 1);
+                unsigned int old = codes[off];
+                codes[off] = (unsigned char)(
+                    (old & ~(3u << shift)) | (code << shift));
+            }
         }
     }
 }
@@ -1170,7 +1179,8 @@ extern "C" __global__ void salt_training_forward(
     const unsigned char* __restrict__ codes, // [planes, N, row_bytes]
     const float* __restrict__ scales,        // [planes, N]
     float* __restrict__ y,                   // [M, N]
-    int m, int n, int k, int planes, int row_bytes)
+    int m, int n, int k, int planes, int row_bytes,
+    int group_size, int groups_per_row)
 {
     long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= (long)m * n) return;
@@ -1203,7 +1213,8 @@ extern "C" __global__ void salt_training_grad_a(
     const unsigned char* __restrict__ codes, // [planes, N, row_bytes]
     const float* __restrict__ scales,        // [planes, N]
     float* __restrict__ ga,                  // [M, K]
-    int m, int n, int k, int planes, int row_bytes)
+    int m, int n, int k, int planes, int row_bytes,
+    int group_size, int groups_per_row)
 {
     long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= (long)m * k) return;
@@ -1236,7 +1247,8 @@ extern "C" __global__ void salt_training_forward_exact(
     const unsigned char* __restrict__ codes, // [planes, N, row_bytes]
     const float* __restrict__ scales,        // [planes, N]
     float* __restrict__ y,                   // [M, N]
-    int m, int n, int k, int planes, int row_bytes)
+    int m, int n, int k, int planes, int row_bytes,
+    int group_size, int groups_per_row)
 {
     long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= (long)m * n) return;
@@ -1247,7 +1259,8 @@ extern "C" __global__ void salt_training_forward_exact(
 
     for (int ki = 0; ki < k; ++ki) {
         float weight = train_salt_reconstruct_weight(
-            codes, scales, ni, ki, n, planes, row_bytes);
+            codes, scales, ni, ki, n, planes, row_bytes,
+            group_size, groups_per_row);
         acc += arow[ki] * weight;
     }
     y[idx] = acc;
@@ -1261,7 +1274,8 @@ extern "C" __global__ void salt_training_grad_a_exact(
     const unsigned char* __restrict__ codes, // [planes, N, row_bytes]
     const float* __restrict__ scales,        // [planes, N]
     float* __restrict__ ga,                  // [M, K]
-    int m, int n, int k, int planes, int row_bytes)
+    int m, int n, int k, int planes, int row_bytes,
+    int group_size, int groups_per_row)
 {
     long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= (long)m * k) return;
@@ -1271,7 +1285,8 @@ extern "C" __global__ void salt_training_grad_a_exact(
 
     for (int ni = 0; ni < n; ++ni) {
         float weight = train_salt_reconstruct_weight(
-            codes, scales, ni, ki, n, planes, row_bytes);
+            codes, scales, ni, ki, n, planes, row_bytes,
+            group_size, groups_per_row);
         acc += gy[(long)mi * n + ni] * weight;
     }
     ga[idx] = acc;
@@ -1293,7 +1308,8 @@ extern "C" __global__ void salt_training_forward_exact_tiled(
     const unsigned char* __restrict__ codes, // [planes, N, row_bytes]
     const float* __restrict__ scales,        // [planes, N]
     float* __restrict__ y,                   // [M, N]
-    int m, int n, int k, int planes, int row_bytes)
+    int m, int n, int k, int planes, int row_bytes,
+    int group_size, int groups_per_row)
 {
     // [K,N+1] lets neighboring output columns read neighboring banks while
     // the padding avoids a 32-way alias between successive K rows.
@@ -1332,7 +1348,8 @@ extern "C" __global__ void salt_training_forward_exact_tiled(
             float weight = 0.0f;
             if (global_n < n && global_k < k) {
                 weight = train_salt_reconstruct_weight(
-                    codes, scales, global_n, global_k, n, planes, row_bytes);
+                    codes, scales, global_n, global_k, n, planes, row_bytes,
+                    group_size, groups_per_row);
             }
             weight_tile[tile_k][tile_n] = weight;
         }
@@ -1361,7 +1378,8 @@ extern "C" __global__ void salt_training_grad_a_exact_tiled(
     const unsigned char* __restrict__ codes, // [planes, N, row_bytes]
     const float* __restrict__ scales,        // [planes, N]
     float* __restrict__ ga,                  // [M, K]
-    int m, int n, int k, int planes, int row_bytes)
+    int m, int n, int k, int planes, int row_bytes,
+    int group_size, int groups_per_row)
 {
     // [N,K+1] gives each warp a conflict-free row when neighboring K output
     // columns consume the same reconstructed N row.
@@ -1400,7 +1418,8 @@ extern "C" __global__ void salt_training_grad_a_exact_tiled(
             float weight = 0.0f;
             if (global_n < n && global_k < k) {
                 weight = train_salt_reconstruct_weight(
-                    codes, scales, global_n, global_k, n, planes, row_bytes);
+                    codes, scales, global_n, global_k, n, planes, row_bytes,
+                    group_size, groups_per_row);
             }
             weight_tile[tile_n][tile_k] = weight;
         }
@@ -1441,7 +1460,8 @@ extern "C" __global__ void salt_training_forward_tiled(
     const unsigned char* __restrict__ codes, // [planes, N, row_bytes]
     const float* __restrict__ scales,        // [planes, N]
     float* __restrict__ y,                   // [M, N]
-    int m, int n, int k, int planes, int row_bytes)
+    int m, int n, int k, int planes, int row_bytes,
+    int group_size, int groups_per_row)
 {
     __shared__ float activation_tile
         [TRAIN_SALT_TILE_M][TRAIN_SALT_FORWARD_K_TILE];
@@ -1526,7 +1546,8 @@ extern "C" __global__ void salt_training_grad_a_tiled(
     const unsigned char* __restrict__ codes, // [planes, N, row_bytes]
     const float* __restrict__ scales,        // [planes, N]
     float* __restrict__ ga,                  // [M, K]
-    int m, int n, int k, int planes, int row_bytes)
+    int m, int n, int k, int planes, int row_bytes,
+    int group_size, int groups_per_row)
 {
     __shared__ float scaled_gy_tile
         [3][TRAIN_SALT_TILE_M][TRAIN_SALT_GRAD_N_TILE];
@@ -1591,7 +1612,8 @@ extern "C" __global__ void salt_training_embed_gather(
     const float* __restrict__ scales,        // [planes, vocab]
     const int* __restrict__ tokens,          // [seq]
     float* __restrict__ out,                 // [seq, dim]
-    int seq, int vocab, int dim, int planes, int row_bytes)
+    int seq, int vocab, int dim, int planes, int row_bytes,
+    int group_size, int groups_per_row)
 {
     long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= (long)seq * dim) return;
@@ -1609,7 +1631,8 @@ extern "C" __global__ void salt_training_embed_gather(
     for (int plane = 0; plane < planes; ++plane) {
         unsigned int code = train_salt_code(
             codes, plane, row, col, vocab, row_bytes);
-        float scale = scales[(long)plane * vocab + row];
+        float scale = scales[((long)plane * vocab + row) * groups_per_row
+            + col / group_size];
         if (code == 2u) {
             value += scale;
         } else if (code == 0u) {

@@ -34,6 +34,7 @@ use std::sync::{
 use cudarc::cublaslt::{CudaBlasLT, Matmul, MatmulConfig};
 use cudarc::driver::{CudaSlice, CudaStream, PinnedHostSlice};
 use tritium_core::GemmShape;
+use tritium_format::{PackedTrainingSaltSnapshot, TernaryStructure};
 use tritium_spec::BackendError;
 use tritium_train::dcp::{DcpError, StatePlane};
 use tritium_train::ops::{act, loss, matmul, ste};
@@ -907,19 +908,23 @@ impl DeviceTensor {
 
 /// Opaque device-resident SALT weight for training-time packed execution.
 ///
-/// The handle owns compact TQ2-addressed plane codes plus external f32 per-row
-/// scales. It never owns a dense quantized reconstruction. Latent masters and
-/// optimizer state remain separate; callers explicitly repack after updating a
-/// host-resident master.
+/// The handle owns compact TQ2-addressed plane codes plus external f32 group
+/// scales. It never owns a dense quantized reconstruction.
 pub struct DevicePackedSaltWeight {
     inner: TrainingSaltLinear,
     prepared: bool,
-    source: Option<PackedMasterBinding>,
+    origin: PackedSaltOrigin,
 }
 
 struct PackedMasterBinding {
     version: Arc<DeviceTensorVersion>,
     packed_generation: u64,
+}
+
+enum PackedSaltOrigin {
+    HostDense,
+    Resident(PackedMasterBinding),
+    HardSnapshot(TernaryStructure),
 }
 
 impl core::fmt::Debug for DevicePackedSaltWeight {
@@ -928,9 +933,14 @@ impl core::fmt::Debug for DevicePackedSaltWeight {
             .field("rows", &self.rows())
             .field("cols", &self.cols())
             .field("planes", &self.planes())
+            .field("group_size", &self.group_size())
+            .field("structure", &self.structure())
             .field("resident_bytes", &self.resident_bytes())
             .field("prepared", &self.prepared)
-            .field("source_bound", &self.source.is_some())
+            .field(
+                "source_bound",
+                &matches!(&self.origin, PackedSaltOrigin::Resident(_)),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -959,7 +969,7 @@ impl DevicePackedSaltWeight {
         Ok(Self {
             inner,
             prepared: true,
-            source: None,
+            origin: PackedSaltOrigin::HostDense,
         })
     }
 
@@ -990,11 +1000,64 @@ impl DevicePackedSaltWeight {
         Ok(Self {
             inner,
             prepared: true,
-            source: Some(PackedMasterBinding {
+            origin: PackedSaltOrigin::Resident(PackedMasterBinding {
                 version: Arc::clone(&master.version),
                 packed_generation: master.version.generation.load(Ordering::Acquire),
             }),
         })
+    }
+
+    /// Upload one format-validated hard snapshot without creating a dense master.
+    pub fn from_snapshot(
+        backend: &CudaBackend,
+        snapshot: &PackedTrainingSaltSnapshot,
+    ) -> Result<Self, BackendError> {
+        let inner = backend.upload_training_salt_snapshot(
+            snapshot.codes(),
+            snapshot.scales(),
+            snapshot.rows(),
+            snapshot.cols(),
+            snapshot.planes(),
+            snapshot.group_size(),
+        )?;
+        Ok(Self {
+            inner,
+            prepared: true,
+            origin: PackedSaltOrigin::HardSnapshot(snapshot.structure()),
+        })
+    }
+
+    /// Transactionally replace this handle from the next validated hard snapshot.
+    pub fn update_from_snapshot(
+        &mut self,
+        backend: &CudaBackend,
+        snapshot: &PackedTrainingSaltSnapshot,
+    ) -> Result<(), BackendError> {
+        if !matches!(&self.origin, PackedSaltOrigin::HardSnapshot(_)) {
+            return Err(BackendError::InvalidInput(
+                "only a detached hard snapshot accepts snapshot replacement".into(),
+            ));
+        }
+        if (
+            self.rows(),
+            self.cols(),
+            self.planes(),
+            self.group_size(),
+            self.structure(),
+        ) != (
+            snapshot.rows(),
+            snapshot.cols(),
+            snapshot.planes(),
+            snapshot.group_size(),
+            snapshot.structure(),
+        ) {
+            return Err(BackendError::InvalidInput(
+                "hard snapshot update changes packed representation geometry or structure".into(),
+            ));
+        }
+        let replacement = Self::from_snapshot(backend, snapshot)?;
+        *self = replacement;
+        Ok(())
     }
 
     /// Replace all packed codes/scales from a new host master with the same
@@ -1005,6 +1068,7 @@ impl DevicePackedSaltWeight {
         backend: &CudaBackend,
         master: &[f32],
     ) -> Result<(), BackendError> {
+        self.ensure_dense_repack_allowed()?;
         self.prepared = false;
         let expected = self.rows().checked_mul(self.cols()).ok_or_else(|| {
             BackendError::InvalidInput("packed SALT shape overflows usize".into())
@@ -1019,7 +1083,7 @@ impl DevicePackedSaltWeight {
         let mut scratch = backend.dev_alloc_zeros(expected)?;
         backend.repack_training_salt(&d_master, &mut scratch, &mut self.inner)?;
         self.prepared = true;
-        self.source = None;
+        self.origin = PackedSaltOrigin::HostDense;
         Ok(())
     }
 
@@ -1057,6 +1121,21 @@ impl DevicePackedSaltWeight {
         self.inner.planes()
     }
 
+    /// Columns sharing one scale in every row and plane.
+    #[must_use]
+    pub fn group_size(&self) -> usize {
+        self.inner.group_size()
+    }
+
+    /// Hard code constraint carried by this compact representation.
+    #[must_use]
+    pub fn structure(&self) -> TernaryStructure {
+        match &self.origin {
+            PackedSaltOrigin::HardSnapshot(structure) => *structure,
+            PackedSaltOrigin::HostDense | PackedSaltOrigin::Resident(_) => TernaryStructure::Dense,
+        }
+    }
+
     /// Compact 2-bit code bytes, excluding f32 scales.
     #[must_use]
     pub fn packed_bytes(&self) -> usize {
@@ -1077,7 +1156,7 @@ impl DevicePackedSaltWeight {
 
     fn ensure_prepared(&self) -> Result<(), BackendError> {
         self.ensure_snapshot_prepared()?;
-        if let Some(source) = &self.source
+        if let PackedSaltOrigin::Resident(source) = &self.origin
             && source.version.generation.load(Ordering::Acquire) != source.packed_generation
         {
             return Err(BackendError::InvalidInput(
@@ -1086,6 +1165,16 @@ impl DevicePackedSaltWeight {
             ));
         }
         Ok(())
+    }
+
+    fn ensure_dense_repack_allowed(&self) -> Result<(), BackendError> {
+        if matches!(&self.origin, PackedSaltOrigin::HardSnapshot(_)) {
+            Err(BackendError::InvalidInput(
+                "detached hard snapshot cannot be repacked from a dense master".into(),
+            ))
+        } else {
+            Ok(())
+        }
     }
 
     fn ensure_snapshot_prepared(&self) -> Result<(), BackendError> {
@@ -1099,11 +1188,11 @@ impl DevicePackedSaltWeight {
 
     fn ensure_bound_to(&self, master: &DeviceTensor) -> Result<(), BackendError> {
         self.ensure_prepared()?;
-        let source = self.source.as_ref().ok_or_else(|| {
-            BackendError::InvalidInput(
+        let PackedSaltOrigin::Resident(source) = &self.origin else {
+            return Err(BackendError::InvalidInput(
                 "packed SALT weight is not identity-bound to a resident master".into(),
-            )
-        })?;
+            ));
+        };
         if !Arc::ptr_eq(&source.version, &master.version) {
             return Err(BackendError::InvalidInput(
                 "packed SALT weight is bound to a different resident master".into(),
@@ -1290,12 +1379,87 @@ pub(crate) trait GradientOptimizerSink {
     ) -> Result<(), BackendError>;
 }
 
+struct HostGradientBlockVisitorSink<'backend, 'shape, F> {
+    backend: &'backend CudaBackend,
+    parameter_lengths: &'shape [usize],
+    max_block_elements: usize,
+    scratch: Vec<f32>,
+    visitor: F,
+}
+
+impl<F> GradientOptimizerSink for HostGradientBlockVisitorSink<'_, '_, F>
+where
+    F: FnMut(usize, usize, usize, &[f32]) -> Result<(), BackendError>,
+{
+    fn backend(&self) -> &CudaBackend {
+        self.backend
+    }
+
+    fn parameter_count(&self) -> usize {
+        self.parameter_lengths.len()
+    }
+
+    fn parameter_len(&self, index: usize) -> Result<usize, BackendError> {
+        self.parameter_lengths.get(index).copied().ok_or_else(|| {
+            BackendError::InvalidInput(format!("parameter index {index} is out of range"))
+        })
+    }
+
+    fn validate_stream_step(&self, step: u64) -> Result<(), BackendError> {
+        if step == 0 {
+            return Err(BackendError::InvalidInput(
+                "gradient visitor step must be non-zero".into(),
+            ));
+        }
+        if self.max_block_elements == 0 {
+            return Err(BackendError::InvalidInput(
+                "host gradient block size must be non-zero".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn apply_finalized_gradient(
+        &mut self,
+        parameter_index: usize,
+        gradient: &CudaSlice<f32>,
+        _step: u64,
+    ) -> Result<(), BackendError> {
+        let total = gradient.len();
+        let block_elements = self.max_block_elements.min(total);
+        self.scratch.resize(block_elements, 0.0);
+        for offset in (0..total).step_by(self.max_block_elements) {
+            let count = self.max_block_elements.min(total - offset);
+            self.backend.resident_state_download_range(
+                gradient,
+                offset,
+                &mut self.scratch[..count],
+            )?;
+            (self.visitor)(parameter_index, offset, total, &self.scratch[..count])?;
+        }
+        Ok(())
+    }
+
+    fn abort_gradient_stream(&mut self) {}
+
+    fn finish_gradient_stream(
+        &mut self,
+        _step: u64,
+        _materialized_gradient_elements: usize,
+    ) -> Result<(), BackendError> {
+        Ok(())
+    }
+}
+
 /// Result of a streamed backward-and-offload step.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GradientStreamReport {
     pub emissions: Vec<GradientEmission>,
     pub materialized_collection_elements: usize,
     pub peak_live_requested_gradient_elements: usize,
+    /// Maximum f32 elements simultaneously staged in host memory by a host-gradient visitor.
+    /// Optimizer sinks that never stage a host gradient report zero.
+    pub peak_host_gradient_elements: usize,
     pub backward_stats: DeviceBackwardStats,
 }
 
@@ -1848,7 +2012,7 @@ impl<'a> DeviceTrainer<'a> {
         Ok(DevicePackedSaltWeight {
             inner,
             prepared: true,
-            source: Some(PackedMasterBinding {
+            origin: PackedSaltOrigin::Resident(PackedMasterBinding {
                 version: Arc::clone(&param.master.version),
                 packed_generation: param.master.version.generation.load(Ordering::Acquire),
             }),
@@ -1865,6 +2029,7 @@ impl<'a> DeviceTrainer<'a> {
         weight: &mut DevicePackedSaltWeight,
     ) -> Result<(), BackendError> {
         self.ensure_usable()?;
+        weight.ensure_dense_repack_allowed()?;
         weight.prepared = false;
         let param = self.params.get(index).ok_or_else(|| {
             BackendError::InvalidInput(format!("parameter index {index} is out of range"))
@@ -1881,7 +2046,7 @@ impl<'a> DeviceTrainer<'a> {
             &mut self.residual,
             &mut weight.inner,
         )?;
-        weight.source = Some(PackedMasterBinding {
+        weight.origin = PackedSaltOrigin::Resident(PackedMasterBinding {
             version: Arc::clone(&param.master.version),
             packed_generation: param.master.version.generation.load(Ordering::Acquire),
         });
@@ -4165,6 +4330,31 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
         Ok(h)
     }
 
+    /// Evaluate mean-row softmax cross-entropy with one scalar device-to-host readback.
+    ///
+    /// Dense teacher probabilities are accepted as `target`, so this is teacher
+    /// cross-entropy and differs from teacher KL only by fixed teacher entropy.
+    pub fn softmax_xent_value(
+        &self,
+        logits: usize,
+        target: &DeviceTensor,
+        rows: usize,
+        cols: usize,
+    ) -> Result<f32, BackendError> {
+        self.validate_xent_stream_inputs(logits, target, rows, cols)?;
+        let mut loss = self.b.dev_alloc_zeros(1)?;
+        self.b.softmax_xent_forward_dev(
+            self.value_slice(logits)?,
+            &target.buf,
+            &mut loss,
+            rows,
+            cols,
+        )?;
+        let mut host = [0.0_f32];
+        self.b.dev_download(&loss, &mut host)?;
+        Ok(host[0])
+    }
+
     /// `g_logits` of `L = mean_row softmax-xent(logits, target)` — the reverse seed when the loss is
     /// distillation cross-entropy (`grad_out = 1`, so `gscale = 1/rows`).
     pub(crate) fn softmax_xent_grad(
@@ -4315,6 +4505,11 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
         tau: usize,
     ) -> Result<usize, BackendError> {
         packed.ensure_bound_to(master)?;
+        if packed.inner.groups_per_row() != 1 {
+            return Err(BackendError::InvalidInput(
+                "HESTIA packed relaxation requires one scale group per row".into(),
+            ));
+        }
         let elements = packed.rows().checked_mul(packed.cols()).ok_or_else(|| {
             BackendError::InvalidInput("HESTIA packed geometry overflows usize".into())
         })?;
@@ -6152,6 +6347,49 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
         )
     }
 
+    /// Stream each finalized requested gradient through one bounded reusable host block.
+    ///
+    /// Blocks are contiguous, ordered, and cover each parameter exactly once. The callback
+    /// receives `(parameter_index, offset, total_elements, block)`. No host allocation grows
+    /// beyond `max_block_elements`, including for a multi-billion-element embedding tensor.
+    #[allow(clippy::too_many_arguments)]
+    pub fn xent_backward_visit_host_gradient_blocks<F>(
+        self,
+        logits: usize,
+        target: &DeviceTensor,
+        rows: usize,
+        cols: usize,
+        bindings: &[GradientLeafBinding],
+        parameter_lengths: &[usize],
+        max_block_elements: usize,
+        step: u64,
+        visitor: F,
+    ) -> Result<GradientStreamReport, BackendError>
+    where
+        F: FnMut(usize, usize, usize, &[f32]) -> Result<(), BackendError>,
+    {
+        let mut sink = HostGradientBlockVisitorSink {
+            backend: self.b,
+            parameter_lengths,
+            max_block_elements,
+            scratch: Vec::new(),
+            visitor,
+        };
+        let mut transform = IdentityGradientTransform;
+        let mut report = self.xent_backward_into_with_transform(
+            logits,
+            target,
+            rows,
+            cols,
+            bindings,
+            &mut sink,
+            step,
+            &mut transform,
+        )?;
+        report.peak_host_gradient_elements = sink.scratch.len();
+        Ok(report)
+    }
+
     /// Compute the exact finalized-gradient emission sequence without running
     /// backward or mutating optimizer state.
     ///
@@ -6290,6 +6528,7 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
             emissions: stream.emissions,
             materialized_collection_elements: stream.plan.materialized_collection_elements,
             peak_live_requested_gradient_elements: stream.peak_live_requested_gradient_elements,
+            peak_host_gradient_elements: 0,
             backward_stats: result.stats,
         })
     }

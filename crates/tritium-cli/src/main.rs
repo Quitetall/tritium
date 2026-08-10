@@ -135,10 +135,9 @@ enum Command {
         #[command(subcommand)]
         release: release::ReleaseCommand,
     },
-    /// Losslessly repack ternary GGUF tensors between formats (I2_S/TQ1_0/TQ2_0 in;
-    /// TQ1_0 for ~18% smaller storage or TQ2_0 for the GPU compute layout out).
+    /// Repack ternary GGUF tensors while preserving dequantized weight values.
     Repack {
-        /// Path to the source `.gguf` (ternary tensors in I2_S, TQ1_0 or TQ2_0).
+        /// Path to source `.gguf` (I2_S, standard Q2_0, TQ1_0 or TQ2_0 tensors).
         #[arg(long)]
         input: PathBuf,
         /// Path to write the repacked `.gguf`.
@@ -187,7 +186,7 @@ enum ReportCommand {
     /// entropy bits/weight and projected traffic savings per tensor (Track A
     /// ground truth — run per model, per checkpoint).
     Sparsity {
-        /// Path to the `.gguf` model file (I2_S / TQ1_0 / TQ2_0 tensors).
+        /// Path to the `.gguf` model file (I2_S / Q2_0 / TQ1_0 / TQ2_0 tensors).
         #[arg(long)]
         model: PathBuf,
     },

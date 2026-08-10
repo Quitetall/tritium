@@ -1017,7 +1017,10 @@ mod tests {
                     .expect("q dense")
                     .as_slice()
             ),
-            Projection::Salt(_) | Projection::Ternary(_) | Projection::HostSaltV2(_) => {
+            Projection::Salt(_)
+            | Projection::Ternary(_)
+            | Projection::Q2(_)
+            | Projection::HostSaltV2(_) => {
                 panic!("reference loader must dequantize to exact dense")
             }
             #[cfg(feature = "cuda")]
@@ -1182,7 +1185,10 @@ mod tests {
                     .expect("head dense")
                     .as_slice()
             ),
-            Projection::Salt(_) | Projection::Ternary(_) | Projection::HostSaltV2(_) => {
+            Projection::Salt(_)
+            | Projection::Ternary(_)
+            | Projection::Q2(_)
+            | Projection::HostSaltV2(_) => {
                 panic!("reference loader must dequantize the head to exact dense")
             }
             #[cfg(feature = "cuda")]

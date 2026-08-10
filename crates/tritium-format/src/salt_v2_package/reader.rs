@@ -1,10 +1,14 @@
 //! Strict seek-backed access to canonical SALT V2 packages.
 
 use core::fmt;
+use core::ops::ControlFlow;
 use std::io::{ErrorKind, Read, Seek, SeekFrom};
 
 use super::*;
-use crate::{PackageHasher, PackageId};
+use crate::{
+    FormatError, PackageHasher, PackageId, Q2_0_BLOCK_BYTES, Q2_0_GROUP_SIZE, pack_q2_0_row,
+    q2_0_num_blocks,
+};
 
 const MAX_TENSORS: u64 = 1_000_000;
 const MAX_TOTAL_NAME_BYTES: u64 = 100_000_000;
@@ -91,6 +95,97 @@ impl std::error::Error for SaltV2PackageReadError {
 
 impl From<SaltV2PackageError> for SaltV2PackageReadError {
     fn from(error: SaltV2PackageError) -> Self {
+        Self::Format(error)
+    }
+}
+
+/// Errors from exact CompactV1 one-plane SALT V2 to Q2_0 export.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CompactQ2ExportError {
+    /// Strict SALT V2 package access or integrity verification failed.
+    Read(SaltV2PackageReadError),
+    /// Compact Q2_0 export requires one additive plane in every allocation tile.
+    IncompatiblePlaneCount {
+        /// Offending allocation-tile index.
+        tile_index: usize,
+        /// Number of planes present in that tile.
+        got: usize,
+    },
+    /// Compact Q2_0 export requires source scales grouped by 128 coefficients.
+    IncompatibleScaleGroupSize {
+        /// Source tensor scale-group width.
+        got: usize,
+    },
+    /// Bare Q2_0 bytes cannot preserve SALT V2 transform metadata.
+    IncompatibleTransform {
+        /// Source tensor transform identity.
+        got: SaltV2Transform,
+    },
+    /// Q2_0 blocks cannot cross row boundaries in a shaped tensor.
+    IncompatibleRowWidth {
+        /// Source tensor innermost dimension.
+        got: usize,
+    },
+    /// Output length arithmetic overflowed.
+    LengthOverflow,
+    /// Final output storage could not be reserved.
+    AllocationFailed {
+        /// Exact Q2_0 tensor bytes requested.
+        requested_bytes: usize,
+    },
+    /// Q2_0 packing rejected internally derived geometry or coefficients.
+    Format(FormatError),
+}
+
+impl fmt::Display for CompactQ2ExportError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Read(error) => write!(f, "Compact Q2_0 export: {error}"),
+            Self::IncompatiblePlaneCount { tile_index, got } => write!(
+                f,
+                "Compact Q2_0 export requires one plane per tile; tile {tile_index} has {got}"
+            ),
+            Self::IncompatibleScaleGroupSize { got } => write!(
+                f,
+                "Compact Q2_0 export requires SALT V2 G128 scales, got G{got}"
+            ),
+            Self::IncompatibleTransform { got } => write!(
+                f,
+                "Compact Q2_0 export cannot preserve SALT V2 transform {got:?}"
+            ),
+            Self::IncompatibleRowWidth { got } => write!(
+                f,
+                "Compact Q2_0 export requires row width divisible by {Q2_0_GROUP_SIZE}, got {got}"
+            ),
+            Self::LengthOverflow => f.write_str("Compact Q2_0 output length overflowed"),
+            Self::AllocationFailed { requested_bytes } => write!(
+                f,
+                "Compact Q2_0 output allocation of {requested_bytes} bytes failed"
+            ),
+            Self::Format(error) => write!(f, "Compact Q2_0 packing: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for CompactQ2ExportError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Read(error) => Some(error),
+            Self::Format(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<SaltV2PackageReadError> for CompactQ2ExportError {
+    fn from(error: SaltV2PackageReadError) -> Self {
+        Self::Read(error)
+    }
+}
+
+impl From<FormatError> for CompactQ2ExportError {
+    fn from(error: FormatError) -> Self {
         Self::Format(error)
     }
 }
@@ -663,8 +758,9 @@ impl<R: Read + Seek> SaltV2PackageReader<R> {
                 &map,
                 tensor,
                 Some(&mut semantic_hasher),
-                |_| {},
-            )?;
+                |_| ControlFlow::Continue(()),
+            )?
+            .expect("construction-time semantic visitor is infallible");
             if section_digest != tensor.section_digest {
                 return Err(SaltV2PackageReadError::SourceChanged(tensor.name.clone()));
             }
@@ -841,8 +937,21 @@ impl<R: Read + Seek> SaltV2PackageReader<R> {
     pub fn visit_packed_tensor(
         &mut self,
         name: &str,
-        visitor: impl FnMut(PackedSaltV2PlaneRef<'_>),
+        mut visitor: impl FnMut(PackedSaltV2PlaneRef<'_>),
     ) -> Result<(), SaltV2PackageReadError> {
+        let outcome = self.visit_packed_tensor_control(name, |plane| {
+            visitor(plane);
+            ControlFlow::Continue(())
+        })?;
+        debug_assert_eq!(outcome, PackedTensorVisitOutcome::Complete);
+        Ok(())
+    }
+
+    pub(super) fn visit_packed_tensor_control(
+        &mut self,
+        name: &str,
+        visitor: impl FnMut(PackedSaltV2PlaneRef<'_>) -> ControlFlow<()>,
+    ) -> Result<PackedTensorVisitOutcome, SaltV2PackageReadError> {
         let tensor = self
             .find_tensor(name)
             .cloned()
@@ -876,7 +985,7 @@ impl<R: Read + Seek> SaltV2PackageReader<R> {
         // so canonical decode and scale checks prevent malformed mutated bytes
         // from ever reaching a callback while the final digest catches valid
         // same-length mutations.
-        let digest = match scan_tensor(
+        let Some(digest) = (match scan_tensor(
             &mut self.source,
             self.codec,
             &self.map,
@@ -889,11 +998,13 @@ impl<R: Read + Seek> SaltV2PackageReader<R> {
                 return Err(SaltV2PackageReadError::SourceChanged(name.to_owned()));
             }
             Err(error) => return Err(error),
+        }) else {
+            return Ok(PackedTensorVisitOutcome::Aborted);
         };
         if digest != tensor.section_digest {
             return Err(SaltV2PackageReadError::SourceChanged(name.to_owned()));
         }
-        Ok(())
+        Ok(PackedTensorVisitOutcome::Complete)
     }
 
     /// Recompute and verify the exact package identity through this reader handle.
@@ -947,6 +1058,179 @@ impl<R: Read + Seek> SaltV2PackageReader<R> {
             .ok()
             .map(|index| &self.tensors[index])
     }
+}
+
+/// Export one compatible uniform P=1, G128 SALT V2 tensor as llama.cpp Q2_0 g64 bytes.
+///
+/// Trits remain unchanged. Each complete G128 source scale is copied into its
+/// two corresponding G64 Q2_0 blocks; a ragged final G128 group emits only the
+/// blocks needed by its logical coefficients. Identity transform and row widths
+/// divisible by 64 are required because bare Q2_0 bytes cannot carry SALT V2
+/// transform metadata and Q2_0 blocks cannot cross tensor row boundaries. Package
+/// and tensor integrity are reverified before the returned bytes publish.
+///
+/// # Errors
+/// Fails closed when the tensor is absent, any allocation tile has other than one
+/// plane, source scale geometry is not G128, transform identity is not `None`, row
+/// width is not divisible by 64, source bytes changed, output storage cannot be
+/// reserved, length arithmetic overflows, or Q2_0 packing fails.
+pub fn export_compact_q2_0_tensor<R: Read + Seek>(
+    reader: &mut SaltV2PackageReader<R>,
+    name: &str,
+) -> Result<Vec<u8>, CompactQ2ExportError> {
+    let output_len = validate_compact_q2_0_tensor(reader, name)?;
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(output_len)
+        .map_err(|_| CompactQ2ExportError::AllocationFailed {
+            requested_bytes: output_len,
+        })?;
+    match visit_compact_q2_0_tensor_without_package_verification(reader, name, |chunk| {
+        output.extend_from_slice(chunk);
+        Ok::<(), core::convert::Infallible>(())
+    }) {
+        Ok(()) => {}
+        Err(CompactQ2VisitError::Export(error)) => return Err(error),
+        Err(CompactQ2VisitError::Sink(never)) => match never {},
+    }
+    reader.verify_unchanged()?;
+    Ok(output)
+}
+
+pub(super) fn validate_compact_q2_0_tensor<R: Read + Seek>(
+    reader: &SaltV2PackageReader<R>,
+    name: &str,
+) -> Result<usize, CompactQ2ExportError> {
+    let (logical_coefficients, scale_group_size, transform, row_width) = reader
+        .tensor_info(name)
+        .map(|info| {
+            (
+                info.logical_coefficients(),
+                info.scale_group_size(),
+                info.transform(),
+                info.dims().last().copied(),
+            )
+        })
+        .ok_or_else(|| {
+            CompactQ2ExportError::Read(SaltV2PackageReadError::TensorNotFound(name.to_owned()))
+        })?;
+    if scale_group_size != SALT_V2_SCALE_GROUP_SIZE {
+        return Err(CompactQ2ExportError::IncompatibleScaleGroupSize {
+            got: scale_group_size,
+        });
+    }
+    if transform != SaltV2Transform::None {
+        return Err(CompactQ2ExportError::IncompatibleTransform { got: transform });
+    }
+    let row_width = usize::try_from(row_width.ok_or(CompactQ2ExportError::LengthOverflow)?)
+        .map_err(|_| CompactQ2ExportError::LengthOverflow)?;
+    if !row_width.is_multiple_of(Q2_0_GROUP_SIZE) {
+        return Err(CompactQ2ExportError::IncompatibleRowWidth { got: row_width });
+    }
+    for (tile_index, plane_count) in reader.tensor_plane_counts(name)?.enumerate() {
+        if plane_count != 1 {
+            return Err(CompactQ2ExportError::IncompatiblePlaneCount {
+                tile_index,
+                got: plane_count,
+            });
+        }
+    }
+    q2_0_num_blocks(logical_coefficients)
+        .checked_mul(Q2_0_BLOCK_BYTES)
+        .ok_or(CompactQ2ExportError::LengthOverflow)
+}
+
+pub(super) enum CompactQ2VisitError<E> {
+    Export(CompactQ2ExportError),
+    Sink(E),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PackedTensorVisitOutcome {
+    Complete,
+    Aborted,
+}
+
+pub(super) fn visit_compact_q2_0_tensor_without_package_verification<R: Read + Seek, E>(
+    reader: &mut SaltV2PackageReader<R>,
+    name: &str,
+    mut sink: impl FnMut(&[u8]) -> Result<(), E>,
+) -> Result<(), CompactQ2VisitError<E>> {
+    let output_len =
+        validate_compact_q2_0_tensor(reader, name).map_err(CompactQ2VisitError::Export)?;
+    let codec = reader.codec();
+    let mut decoded = Vec::new();
+    let mut callback_error = None;
+    let mut output_bytes = 0usize;
+    let mut packed = [0u8; Q2_0_BLOCK_BYTES * SALT_V2_ALLOCATION_TILE_SIZE / Q2_0_GROUP_SIZE];
+
+    let visit_outcome = reader
+        .visit_packed_tensor_control(name, |plane| {
+            if callback_error.is_some() {
+                return ControlFlow::Break(());
+            }
+            if let Err(error) = unpack_salt_v2_plane_into(
+                codec,
+                plane.packed_bytes(),
+                plane.logical_len(),
+                &mut decoded,
+            ) {
+                callback_error = Some(CompactQ2VisitError::Export(CompactQ2ExportError::Read(
+                    error.into(),
+                )));
+                return ControlFlow::Break(());
+            }
+            let q2_blocks = q2_0_num_blocks(decoded.len());
+            let mut q2_scales = [f16::ZERO; SALT_V2_ALLOCATION_TILE_SIZE / Q2_0_GROUP_SIZE];
+            for (q2_index, scale) in q2_scales[..q2_blocks].iter_mut().enumerate() {
+                *scale = plane.scales()[q2_index / 2];
+            }
+            let tile_bytes = match q2_blocks.checked_mul(Q2_0_BLOCK_BYTES) {
+                Some(value) => value,
+                None => {
+                    callback_error = Some(CompactQ2VisitError::Export(
+                        CompactQ2ExportError::LengthOverflow,
+                    ));
+                    return ControlFlow::Break(());
+                }
+            };
+            let end = match output_bytes.checked_add(tile_bytes) {
+                Some(value) if value <= output_len => value,
+                _ => {
+                    callback_error = Some(CompactQ2VisitError::Export(
+                        CompactQ2ExportError::LengthOverflow,
+                    ));
+                    return ControlFlow::Break(());
+                }
+            };
+            if let Err(error) =
+                pack_q2_0_row(&decoded, &q2_scales[..q2_blocks], &mut packed[..tile_bytes])
+            {
+                callback_error = Some(CompactQ2VisitError::Export(error.into()));
+                return ControlFlow::Break(());
+            }
+            if let Err(error) = sink(&packed[..tile_bytes]) {
+                callback_error = Some(CompactQ2VisitError::Sink(error));
+                return ControlFlow::Break(());
+            }
+            output_bytes = end;
+            ControlFlow::Continue(())
+        })
+        .map_err(|error| CompactQ2VisitError::Export(error.into()))?;
+    if let Some(error) = callback_error {
+        return Err(error);
+    }
+    if visit_outcome != PackedTensorVisitOutcome::Complete {
+        return Err(CompactQ2VisitError::Export(
+            CompactQ2ExportError::LengthOverflow,
+        ));
+    }
+    if output_bytes != output_len {
+        return Err(CompactQ2VisitError::Export(
+            CompactQ2ExportError::LengthOverflow,
+        ));
+    }
+    Ok(())
 }
 
 struct TensorPlaneCounts<'a> {
@@ -1003,8 +1287,8 @@ fn scan_tensor<R: Read + Seek>(
     map: &OwnedPresenceMap,
     tensor: &IndexedTensor,
     mut semantic_hasher: Option<&mut SaltV2SemanticTensorHasher>,
-    mut visitor: impl FnMut(PackedSaltV2PlaneRef<'_>),
-) -> Result<TensorSectionDigest, SaltV2PackageReadError> {
+    mut visitor: impl FnMut(PackedSaltV2PlaneRef<'_>) -> ControlFlow<()>,
+) -> Result<Option<TensorSectionDigest>, SaltV2PackageReadError> {
     let mut descriptors = Vec::new();
     try_reserve_exact::<PlaneDescriptor>(&mut descriptors, MAX_PLANES_PER_BATCH)?;
     let mut payload = Vec::new();
@@ -1121,14 +1405,18 @@ fn scan_tensor<R: Read + Seek>(
                     &decoded_scales[..scale_count],
                 );
             }
-            visitor(PackedSaltV2PlaneRef {
+            if visitor(PackedSaltV2PlaneRef {
                 tile_index: descriptor.tile_index,
                 plane_index: descriptor.plane_index,
                 plane_count: descriptor.plane_count,
                 logical_len: descriptor.logical_len,
                 packed,
                 scales: &decoded_scales[..scale_count],
-            });
+            })
+            .is_break()
+            {
+                return Ok(None);
+            }
         }
     }
 
@@ -1156,10 +1444,10 @@ fn scan_tensor<R: Read + Seek>(
         }
         .into());
     }
-    Ok(TensorSectionDigest {
+    Ok(Some(TensorSectionDigest {
         payload: *payload_hasher.finalize().as_bytes(),
         scales: *scale_hasher.finalize().as_bytes(),
-    })
+    }))
 }
 
 fn validate_scales(

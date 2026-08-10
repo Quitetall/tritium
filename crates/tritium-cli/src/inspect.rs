@@ -20,6 +20,7 @@ fn ggml_type_name(ggml_type: u32) -> String {
     match ggml_type {
         0 => "F32".to_owned(),
         1 => "F16".to_owned(),
+        tritium_format::GGML_TYPE_Q2_0 => "Q2_0".to_owned(),
         tritium_format::GGML_TYPE_TQ1_0 => "TQ1_0".to_owned(),
         tritium_format::GGML_TYPE_TQ2_0 => "TQ2_0".to_owned(),
         other => format!("type {other}"),
@@ -175,6 +176,7 @@ mod tests {
         assert_eq!(ggml_type_name(1), "F16");
         assert_eq!(ggml_type_name(34), "TQ1_0");
         assert_eq!(ggml_type_name(35), "TQ2_0");
+        assert_eq!(ggml_type_name(42), "Q2_0");
         assert_eq!(ggml_type_name(99), "type 99");
     }
 

@@ -1112,12 +1112,14 @@ fn percentile_sorted(samples: &[f64], p: f64) -> f64 {
 pub(crate) fn sparsity(model: &Path) -> anyhow::Result<()> {
     use tritium_core::Trit;
     use tritium_format::{
-        GGML_TYPE_I2_S, GGML_TYPE_TQ1_0, GGML_TYPE_TQ2_0, TQ1_0_BLOCK_BYTES, TQ2_0_BLOCK_BYTES,
-        unpack_i2s_tensor, unpack_tq1_0_row, unpack_tq2_0_row,
+        GGML_TYPE_I2_S, GGML_TYPE_Q2_0, GGML_TYPE_TQ1_0, GGML_TYPE_TQ2_0, Q2_0_BLOCK_BYTES,
+        Q2_0_GROUP_SIZE, TQ1_0_BLOCK_BYTES, TQ2_0_BLOCK_BYTES, unpack_i2s_tensor, unpack_q2_0_row,
+        unpack_tq1_0_row, unpack_tq2_0_row,
     };
     let bytes = std::fs::read(model).with_context(|| format!("read {}", model.display()))?;
     let file = tritium_format::read_gguf(&bytes).context("parse gguf")?;
-    let data0 = file.tensor_data_offset as usize;
+    let data0 = usize::try_from(file.tensor_data_offset)
+        .context("GGUF tensor data offset exceeds usize")?;
 
     struct Row {
         name: String,
@@ -1132,13 +1134,13 @@ pub(crate) fn sparsity(model: &Path) -> anyhow::Result<()> {
         .filter(|t| {
             matches!(
                 t.ggml_type,
-                GGML_TYPE_I2_S | GGML_TYPE_TQ1_0 | GGML_TYPE_TQ2_0
+                GGML_TYPE_I2_S | GGML_TYPE_Q2_0 | GGML_TYPE_TQ1_0 | GGML_TYPE_TQ2_0
             )
         })
         .collect();
     if ternary.is_empty() {
         bail!(
-            "no ternary tensors (I2_S/TQ1_0/TQ2_0) in {}",
+            "no ternary tensors (I2_S/Q2_0/TQ1_0/TQ2_0) in {}",
             model.display()
         );
     }
@@ -1146,37 +1148,111 @@ pub(crate) fn sparsity(model: &Path) -> anyhow::Result<()> {
     let rows: Vec<Row> = ternary
         .par_iter()
         .map(|info| -> anyhow::Result<Row> {
-            let k = info.dims.first().copied().unwrap_or(0) as usize;
-            let n_el: usize = info.dims.iter().product::<u64>() as usize;
-            let n_rows = n_el.checked_div(k).unwrap_or(0);
-            let start = data0 + info.offset as usize;
+            let k = usize::try_from(info.dims.first().copied().unwrap_or(0))
+                .context("ternary K exceeds usize")?;
+            if k == 0 {
+                anyhow::bail!("{}: zero-width ternary tensor", info.name);
+            }
+            let n_el = info
+                .dims
+                .iter()
+                .try_fold(1u64, |total, &dimension| total.checked_mul(dimension))
+                .context("ternary element count overflow")?;
+            let n_el = usize::try_from(n_el).context("ternary element count exceeds usize")?;
+            let n_rows = n_el / k;
+            let offset = usize::try_from(info.offset).context("tensor offset exceeds usize")?;
+            let start = data0
+                .checked_add(offset)
+                .context("tensor payload offset overflow")?;
             // I2_S is a bitnet.cpp extension the generic reader sizes as 0 —
             // compute its payload length (packed 2-bit body + f32 scale) the
             // way the model loader does; TQ1/TQ2 are known types.
             let len = if info.ggml_type == GGML_TYPE_I2_S {
-                n_el / 4 + tritium_format::I2S_SCALE_BYTES
+                n_el.checked_div(4)
+                    .and_then(|packed| packed.checked_add(tritium_format::I2S_SCALE_BYTES))
+                    .context("I2_S payload length overflow")?
             } else {
-                info.n_bytes as usize
+                usize::try_from(info.n_bytes).context("tensor payload length exceeds usize")?
             };
+            let end = start
+                .checked_add(len)
+                .context("tensor payload end overflow")?;
             let payload = bytes
-                .get(start..start + len)
+                .get(start..end)
                 .context("tensor payload out of bounds")?;
-            let mut trits = vec![Trit::ZERO; n_el];
+            let mut trits = Vec::new();
+            trits
+                .try_reserve_exact(n_el)
+                .with_context(|| format!("{}: allocate {n_el} decoded trits", info.name))?;
+            trits.resize(n_el, Trit::ZERO);
             match info.ggml_type {
                 GGML_TYPE_I2_S => {
-                    unpack_i2s_tensor(payload, n_el, &mut trits)
+                    let scale = unpack_i2s_tensor(payload, n_el, &mut trits)
                         .map_err(|e| anyhow::anyhow!("{}: {e}", info.name))?;
+                    if !scale.is_finite() {
+                        anyhow::bail!("{}: non-finite I2_S scale {scale}", info.name);
+                    }
+                    if scale == 0.0 {
+                        trits.fill(Trit::ZERO);
+                    }
+                }
+                GGML_TYPE_Q2_0 => {
+                    let nb = k.div_ceil(Q2_0_GROUP_SIZE);
+                    let row_bytes = nb
+                        .checked_mul(Q2_0_BLOCK_BYTES)
+                        .context("Q2_0 row length overflow")?;
+                    let mut scales = Vec::new();
+                    scales
+                        .try_reserve_exact(nb)
+                        .with_context(|| format!("{}: allocate {nb} Q2_0 scales", info.name))?;
+                    scales.resize(nb, half::f16::ZERO);
+                    let required = n_rows
+                        .checked_mul(row_bytes)
+                        .context("Q2_0 payload length overflow")?;
+                    if required > payload.len() {
+                        anyhow::bail!(
+                            "{}: payload {} B < {} rows x {} B (k % 64 != 0?)",
+                            info.name,
+                            payload.len(),
+                            n_rows,
+                            row_bytes
+                        );
+                    }
+                    for r in 0..n_rows {
+                        unpack_q2_0_row(
+                            &payload[r * row_bytes..(r + 1) * row_bytes],
+                            &mut trits[r * k..(r + 1) * k],
+                            &mut scales,
+                        )
+                        .map_err(|e| anyhow::anyhow!("{}: {e}", info.name))?;
+                        apply_scale_semantics(
+                            &info.name,
+                            r,
+                            &mut trits[r * k..(r + 1) * k],
+                            &scales,
+                            Q2_0_GROUP_SIZE,
+                        )?;
+                    }
                 }
                 t @ (GGML_TYPE_TQ1_0 | GGML_TYPE_TQ2_0) => {
                     let nb = k.div_ceil(256);
+                    let block_bytes = if t == GGML_TYPE_TQ1_0 {
+                        TQ1_0_BLOCK_BYTES
+                    } else {
+                        TQ2_0_BLOCK_BYTES
+                    };
                     let row_bytes = nb
-                        * if t == GGML_TYPE_TQ1_0 {
-                            TQ1_0_BLOCK_BYTES
-                        } else {
-                            TQ2_0_BLOCK_BYTES
-                        };
-                    let mut scales = vec![half::f16::ZERO; nb];
-                    if n_rows * row_bytes > payload.len() {
+                        .checked_mul(block_bytes)
+                        .context("TQ row length overflow")?;
+                    let mut scales = Vec::new();
+                    scales
+                        .try_reserve_exact(nb)
+                        .with_context(|| format!("{}: allocate {nb} TQ scales", info.name))?;
+                    scales.resize(nb, half::f16::ZERO);
+                    let required = n_rows
+                        .checked_mul(row_bytes)
+                        .context("TQ payload length overflow")?;
+                    if required > payload.len() {
                         anyhow::bail!(
                             "{}: payload {} B < {} rows x {} B (k % 256 != 0?)",
                             info.name,
@@ -1194,6 +1270,7 @@ pub(crate) fn sparsity(model: &Path) -> anyhow::Result<()> {
                             unpack_tq2_0_row(row, out, &mut scales)
                         }
                         .map_err(|e| anyhow::anyhow!("{}: {e}", info.name))?;
+                        apply_scale_semantics(&info.name, r, out, &scales, 256)?;
                     }
                 }
                 _ => unreachable!(),
@@ -1271,6 +1348,34 @@ pub(crate) fn sparsity(model: &Path) -> anyhow::Result<()> {
         "  block-skip savings   {:.3}%  (all-zero-block fraction — what the _sparse kernels skip)",
         tot_zb as f64 / tot_b.max(1) as f64 * 100.0
     );
+    Ok(())
+}
+
+fn apply_scale_semantics(
+    tensor_name: &str,
+    row: usize,
+    trits: &mut [tritium_core::Trit],
+    scales: &[half::f16],
+    group_size: usize,
+) -> anyhow::Result<()> {
+    for (group, scale) in scales.iter().enumerate() {
+        if !scale.is_finite() {
+            bail!(
+                "{tensor_name}: row {row} group {group} has non-finite scale bits 0x{:04x}",
+                scale.to_bits()
+            );
+        }
+        if *scale == half::f16::ZERO {
+            let start = group
+                .checked_mul(group_size)
+                .context("scale group offset overflow")?;
+            let end = start.saturating_add(group_size).min(trits.len());
+            trits
+                .get_mut(start..end)
+                .context("scale group lies outside decoded row")?
+                .fill(tritium_core::Trit::ZERO);
+        }
+    }
     Ok(())
 }
 

@@ -38,7 +38,7 @@ pub use evaluation::{TeacherForcedPerplexity, teacher_forced_perplexity_windows}
 pub use kv_cache::KvCache;
 pub use layers::{
     BlockDump, BlockScratch, DenseLinear, HostSaltV2Linear, Mlp, Projection,
-    ProjectionActivationMode, Qwen35DeltaNet, Qwen35DeltaNetCache, Qwen35DeltaNetWeights,
+    ProjectionActivationMode, Q2Linear, Qwen35DeltaNet, Qwen35DeltaNetCache, Qwen35DeltaNetWeights,
     Qwen35FullAttention, Qwen35FullAttentionCache, Qwen35FullAttentionWeights, Relu2Mlp,
     SaltLinear, SwiGluMlp, TernaryLinear, TokenEmbedding, TransformerBlock,
 };

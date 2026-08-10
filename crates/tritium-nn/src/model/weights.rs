@@ -24,14 +24,14 @@
 use half::f16;
 use tritium_core::Trit;
 use tritium_format::{
-    GGML_TYPE_TQ1_0, GGML_TYPE_TQ2_0, GgufFile, QK_K, TQ1_0_BLOCK_BYTES, TQ2_0_BLOCK_BYTES,
-    TensorInfo, unpack_i2s_tensor, unpack_tq1_0_row, unpack_tq2_0_row,
+    GGML_TYPE_Q2_0, GGML_TYPE_TQ1_0, GGML_TYPE_TQ2_0, GgufFile, QK_K, TQ1_0_BLOCK_BYTES,
+    TQ2_0_BLOCK_BYTES, TensorInfo, unpack_i2s_tensor, unpack_tq1_0_row, unpack_tq2_0_row,
 };
 use tritium_spec::TernaryBackend;
 
 use crate::config::{ArchSpec, ModelConfig};
 use crate::error::NnError;
-use crate::layers::{Projection, TernaryLinear, TokenEmbedding, TransformerBlock};
+use crate::layers::{Projection, Q2Linear, TernaryLinear, TokenEmbedding, TransformerBlock};
 use crate::tensor::f16_bytes_to_f32;
 
 /// The weights for one decoder layer, ready to run.
@@ -128,11 +128,7 @@ impl ModelWeights {
             // file's own dims (pre-existing behavior). TODO(non-BitNet GGUF):
             // check them against the config-derived n_out/k_in so a
             // config/file head_dim disagreement fails at load, not runtime.
-            |name, _n_out, _k_in| {
-                Ok(Projection::Ternary(load_ternary(
-                    file, bytes, backend, name,
-                )?))
-            },
+            |name, _n_out, _k_in| load_projection(file, bytes, backend, name),
         )
     }
 }
@@ -176,20 +172,59 @@ fn load_dense(file: &GgufFile, bytes: &[u8], name: &str) -> Result<Vec<f32>, NnE
     }
 }
 
-/// Load a ternary tensor (I2_S, TQ1_0 or TQ2_0) into a [`TernaryLinear`].
+/// Load an explicit GGUF ternary projection without byte sniffing.
+fn load_projection(
+    file: &GgufFile,
+    bytes: &[u8],
+    backend: &dyn TernaryBackend,
+    name: &str,
+) -> Result<Projection, NnError> {
+    let info = require(file, name)?;
+    if info.ggml_type != GGML_TYPE_Q2_0 {
+        return Ok(Projection::Ternary(load_ternary(
+            file, bytes, backend, name,
+        )?));
+    }
+    if info.dims.len() != 2 {
+        return Err(NnError::Shape {
+            expected: 2,
+            got: info.dims.len(),
+        });
+    }
+    let k_in = usize::try_from(info.dims[0])
+        .map_err(|_| NnError::Backend(format!("{name}: Q2_0 K exceeds usize")))?;
+    let n_out = usize::try_from(info.dims[1])
+        .map_err(|_| NnError::Backend(format!("{name}: Q2_0 N exceeds usize")))?;
+    let source = payload(file, bytes, info)?;
+    let mut packed = Vec::new();
+    packed.try_reserve_exact(source.len()).map_err(|error| {
+        NnError::Backend(format!(
+            "allocate Q2_0 payload for {} bytes: {error}",
+            source.len()
+        ))
+    })?;
+    packed.extend_from_slice(source);
+    let exact_scale = file
+        .metadata
+        .get(&format!("tritium.i2s_scale.{name}"))
+        .and_then(tritium_format::GgufValue::as_f32);
+    Ok(Projection::Q2(Q2Linear::new_with_uniform_scale_override(
+        packed,
+        n_out,
+        k_in,
+        exact_scale,
+    )?))
+}
+
+/// Load an I2_S, TQ1_0 or TQ2_0 tensor into a [`TernaryLinear`].
 ///
 /// ggml dims are `[K_in, N_out]` (fastest-first); the decoded trits are `[N, K]`
 /// row-major and the per-tensor f32 scale becomes the linear's weight scale.
 ///
-/// TQ1_0 / TQ2_0 carry a scale PER 256-BLOCK while the ternary stack is
-/// per-tensor-scaled: pure ternary tensors round-trip exactly because every
-/// block scale is either the tensor scale (block has a nonzero trit) or zero
-/// (all-zero block — its trits decode to 0 regardless, and are forced to the
-/// zero trit here so `trit × tensor_scale` reproduces it). Genuinely
-/// non-uniform block scales are rejected loudly rather than silently
-/// mis-scaled. This makes TQ1_0 files (18% smaller ternary payloads) a
-/// first-class interchange format: every backend sees the identical trits +
-/// scale it would have seen from the equivalent I2_S/TQ2_0 file.
+/// TQ1_0 / TQ2_0 carry one scale per 256-element block. The device ternary
+/// stack is per-output-row-scaled: every nonzero block in a row must therefore
+/// share one scale, while zero-scale blocks are forced to zero trits. Standard
+/// Q2_0 uses [`Q2Linear`] instead so its per-64-group scales remain exact.
 fn load_ternary(
     file: &GgufFile,
     bytes: &[u8],
@@ -216,10 +251,10 @@ fn load_ternary(
             (trits, scale)
         }
         t @ (GGML_TYPE_TQ1_0 | GGML_TYPE_TQ2_0) => {
-            let block_bytes = if t == GGML_TYPE_TQ1_0 {
-                TQ1_0_BLOCK_BYTES
-            } else {
-                TQ2_0_BLOCK_BYTES
+            let block_bytes = match t {
+                GGML_TYPE_TQ1_0 => TQ1_0_BLOCK_BYTES,
+                GGML_TYPE_TQ2_0 => TQ2_0_BLOCK_BYTES,
+                _ => unreachable!("match arm admits only TQ1_0/TQ2_0"),
             };
             let nb = k_in.div_ceil(QK_K);
             let row_bytes = nb * block_bytes;
@@ -245,10 +280,10 @@ fn load_ternary(
             for r in 0..n_out {
                 let row = &p[r * row_bytes..(r + 1) * row_bytes];
                 let out = &mut trits[r * k_in..(r + 1) * k_in];
-                if t == GGML_TYPE_TQ1_0 {
-                    unpack_tq1_0_row(row, out, &mut scales)
-                } else {
-                    unpack_tq2_0_row(row, out, &mut scales)
+                match t {
+                    GGML_TYPE_TQ1_0 => unpack_tq1_0_row(row, out, &mut scales),
+                    GGML_TYPE_TQ2_0 => unpack_tq2_0_row(row, out, &mut scales),
+                    _ => unreachable!("match arm admits only TQ1_0/TQ2_0"),
                 }
                 .map_err(|e| NnError::Backend(e.to_string()))?;
                 let mut row_scale: Option<f32> = None;
@@ -381,6 +416,48 @@ mod tests {
         b
     }
 
+    /// Minimal single-tensor GGUF v3 blob carrying standard llama.cpp Q2_0.
+    fn gguf_with_q2(name: &str, n_out: usize, k_in: usize, row_scales: &[f32]) -> Vec<u8> {
+        use tritium_format::{GGML_TYPE_Q2_0, Q2_0_BLOCK_BYTES, Q2_0_GROUP_SIZE, pack_q2_0_row};
+        assert_eq!(k_in % Q2_0_GROUP_SIZE, 0, "test rows are whole Q2_0 blocks");
+        assert_eq!(row_scales.len(), n_out);
+        let nb = k_in / Q2_0_GROUP_SIZE;
+        let row_bytes = nb * Q2_0_BLOCK_BYTES;
+        let mut data = vec![0u8; n_out * row_bytes];
+        for (r, &scale) in row_scales.iter().enumerate() {
+            let trits: Vec<Trit> = (0..k_in)
+                .map(|i| Trit::from_i8((((i + r) % 3) as i8) - 1).unwrap())
+                .collect();
+            let scales = vec![f16::from_f32(scale); nb];
+            pack_q2_0_row(
+                &trits,
+                &scales,
+                &mut data[r * row_bytes..(r + 1) * row_bytes],
+            )
+            .expect("pack Q2_0 row");
+        }
+        let mut b = Vec::new();
+        let s = |b: &mut Vec<u8>, t: &str| {
+            b.extend((t.len() as u64).to_le_bytes());
+            b.extend(t.as_bytes());
+        };
+        b.extend(0x46554747u32.to_le_bytes());
+        b.extend(3u32.to_le_bytes());
+        b.extend(1u64.to_le_bytes());
+        b.extend(0u64.to_le_bytes());
+        s(&mut b, name);
+        b.extend(2u32.to_le_bytes());
+        b.extend((k_in as u64).to_le_bytes());
+        b.extend((n_out as u64).to_le_bytes());
+        b.extend(GGML_TYPE_Q2_0.to_le_bytes());
+        b.extend(0u64.to_le_bytes());
+        while b.len() % 32 != 0 {
+            b.push(0);
+        }
+        b.extend(&data);
+        b
+    }
+
     fn load(name: &str, blob: &[u8]) -> TernaryLinear {
         let file = tritium_format::read_gguf(blob).expect("parse gguf");
         let backend = tritium_cpu::CpuBackend::new();
@@ -438,5 +515,75 @@ mod tests {
         let backend = tritium_cpu::CpuBackend::new();
         let err = load_ternary(&file, &blob, &backend, "output.weight");
         assert!(err.is_err(), "within-row non-uniform scales must refuse");
+    }
+
+    #[test]
+    fn q2_row_scales_load_and_forward_matches_tq2_sibling() {
+        let backend = tritium_cpu::CpuBackend::new();
+        let row_scales = [1.0f32, 2.0, 0.5];
+        let q2_blob = gguf_with_q2("output.weight", 3, 256, &row_scales);
+        let tq2_blob = gguf_with_tq2("output.weight", 3, 256, &row_scales);
+        let q2_file = tritium_format::read_gguf(&q2_blob).expect("parse Q2_0 GGUF");
+        let tq2_file = tritium_format::read_gguf(&tq2_blob).expect("parse TQ2_0 GGUF");
+        let q2 = load_projection(&q2_file, &q2_blob, &backend, "output.weight")
+            .expect("load Q2_0 projection");
+        let tq2 = load_projection(&tq2_file, &tq2_blob, &backend, "output.weight")
+            .expect("load TQ2_0 projection");
+
+        assert!(matches!(q2, Projection::Q2(_)));
+        assert!(matches!(tq2, Projection::Ternary(_)));
+        let act: Vec<f32> = (0..2 * 256)
+            .map(|i| ((i % 29) as f32 - 14.0) / 7.0)
+            .collect();
+        let mut q2_out = vec![0.0f32; 2 * 3];
+        let mut tq2_out = vec![0.0f32; 2 * 3];
+        q2.forward(&backend, &act, 2, &mut q2_out)
+            .expect("Q2_0 forward");
+        tq2.forward(&backend, &act, 2, &mut tq2_out)
+            .expect("TQ2_0 forward");
+        assert_eq!(q2_out, tq2_out, "normalized siblings must be bit-identical");
+    }
+
+    #[test]
+    fn q2_within_row_scales_remain_exact_without_dense_shadow() {
+        use tritium_format::{Q2_0_BLOCK_BYTES, Q2_0_GROUP_SIZE, pack_q2_0_row};
+
+        let (n_out, k_in) = (1usize, 256usize);
+        let nb = k_in / Q2_0_GROUP_SIZE;
+        let row_bytes = nb * Q2_0_BLOCK_BYTES;
+        let trits: Vec<Trit> = (0..k_in)
+            .map(|i| Trit::from_i8(((i % 3) as i8) - 1).unwrap())
+            .collect();
+        let scales = [1.0f32, 1.0, 2.0, 1.0].map(f16::from_f32);
+        let mut data = vec![0u8; row_bytes];
+        pack_q2_0_row(&trits, &scales, &mut data).expect("pack nonuniform Q2_0 row");
+        let mut blob = gguf_with_q2("output.weight", n_out, k_in, &[1.0]);
+        let start = blob.len() - data.len();
+        blob[start..].copy_from_slice(&data);
+        let file = tritium_format::read_gguf(&blob).expect("parse Q2_0 GGUF");
+        let backend = tritium_cpu::CpuBackend::new();
+        let projection = load_projection(&file, &blob, &backend, "output.weight")
+            .expect("load nonuniform Q2_0 projection");
+        let Projection::Q2(q2) = &projection else {
+            panic!("standard Q2_0 must stay packed");
+        };
+        assert_eq!(q2.packed_bytes(), row_bytes);
+
+        let act: Vec<f32> = (0..k_in).map(|i| ((i % 17) as f32 - 8.0) / 4.0).collect();
+        let mut got = [0.0f32; 1];
+        projection
+            .forward(&backend, &act, 1, &mut got)
+            .expect("Q2_0 forward");
+        let weights: Vec<f32> = trits
+            .iter()
+            .enumerate()
+            .map(|(index, trit)| f32::from(scales[index / Q2_0_GROUP_SIZE]) * f32::from(trit.get()))
+            .collect();
+        let dense = crate::layers::DenseLinear::new(weights, 1, k_in).expect("dense oracle");
+        let mut want = [0.0f32; 1];
+        dense
+            .forward(&act, 1, &mut want)
+            .expect("dense Q2_0 oracle");
+        assert_eq!(got, want, "per-group Q2_0 scales must remain exact");
     }
 }

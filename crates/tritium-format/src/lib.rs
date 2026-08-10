@@ -67,6 +67,7 @@ mod tq1;
 mod tq2;
 mod tqbin;
 mod tqidx;
+mod training_salt;
 
 pub use artifact::{
     ArtifactError, ModelId, PackageHasher, PackageId, SemanticModelManifest, SemanticTensor,
@@ -139,6 +140,7 @@ pub use tq1::{pack_tq1_0_block, unpack_tq1_0_block};
 pub use tq2::{compute_zero_bitmap, compute_zero_bitmaps, pack_tq2_0_block, unpack_tq2_0_block};
 pub use tqbin::{TQBIN_HEADER_BYTES, TQBIN_MAGIC, TQBIN_VERSION, read_tqbin, write_tqbin};
 pub use tqidx::{ShardEntry, TQIDX_MAGIC, TQIDX_VERSION, TqIndex, read_tqidx, write_tqidx};
+pub use training_salt::{PackedTrainingSaltSnapshot, TernaryStructure, TrainingSaltPlane};
 
 /// Weights per quantization block (ggml `QK_K`).
 pub const QK_K: usize = 256;
@@ -224,6 +226,9 @@ pub enum FormatError {
     UnsupportedTeacherCacheVersion(u8),
     /// A teacher cache declared a zero or overflowing shape.
     TeacherCacheInvalidShape,
+    /// A training-time packed SALT snapshot violated geometry, code, scale, or
+    /// structured-sparsity invariants.
+    InvalidTrainingSalt(&'static str),
 }
 
 impl From<GgufError> for FormatError {
@@ -331,6 +336,9 @@ impl fmt::Display for FormatError {
             }
             FormatError::TeacherCacheInvalidShape => {
                 write!(f, "teacher cache: invalid or overflowing shape")
+            }
+            FormatError::InvalidTrainingSalt(reason) => {
+                write!(f, "training SALT snapshot: {reason}")
             }
         }
     }
