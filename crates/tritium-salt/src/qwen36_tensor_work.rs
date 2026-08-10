@@ -21,7 +21,12 @@ pub use additive_master::{
     Qwen36FinalLogitsOutputBindingError, Qwen36FinalLogitsOutputBindingReceipt,
     Qwen36PackageAdmissionError, Qwen36PackageAdmissionReceipt, Qwen36PackageAdmittedCampaignStore,
     Qwen36PackageProfileReceipt, Qwen36PackageRuntimeLedger, Qwen36PackageScaleOnlyCampaignStore,
-    Qwen36PackageVisitError,
+    Qwen36PackageVisitError, Qwen36PvParentContext,
+};
+#[cfg(all(unix, feature = "cuda"))]
+pub use additive_master::{
+    Qwen36PvPackageAdmissionError, Qwen36PvPackageAdmissionReceipt,
+    Qwen36PvPackageAdmittedCampaignStore, Qwen36PvPackageVisitError,
 };
 pub use ptq_driver::{
     Qwen36PtqDriverError, Qwen36PtqEvidenceCaptureError, Qwen36PtqEvidenceCaptureReceipt,

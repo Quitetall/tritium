@@ -10,11 +10,16 @@ pub use selected_allocation::{
     Qwen36FinalLogitsOutputBindingError, Qwen36FinalLogitsOutputBindingReceipt,
     Qwen36PackageAdmissionError, Qwen36PackageAdmissionReceipt, Qwen36PackageAdmittedCampaignStore,
     Qwen36PackageProfileReceipt, Qwen36PackageRuntimeLedger, Qwen36PackageScaleOnlyCampaignStore,
-    Qwen36PackageVisitError,
+    Qwen36PackageVisitError, Qwen36PvParentContext,
 };
 pub use selected_allocation::{
     Qwen36AllocatedCampaignStore, Qwen36PhysicalAllocationError, Qwen36SelectedAllocationBindError,
     Qwen36SelectedAllocationReceipt, Qwen36SelectedAllocationSpec, Qwen36SelectedProfileReceipt,
+};
+#[cfg(all(unix, feature = "cuda"))]
+pub use selected_allocation::{
+    Qwen36PvPackageAdmissionError, Qwen36PvPackageAdmissionReceipt,
+    Qwen36PvPackageAdmittedCampaignStore, Qwen36PvPackageVisitError,
 };
 
 use core::fmt;
@@ -1124,6 +1129,24 @@ impl<'store, 'source> Qwen36AdditiveCampaignStore<'store, 'source> {
         ),
         Qwen36TensorWorkError,
     > {
+        self.require_complete_verified_visit(fixed_mode, |_, _| Ok(()))
+    }
+
+    fn require_complete_verified_visit(
+        &self,
+        fixed_mode: FixedCampaignMode<'_>,
+        mut visit: impl FnMut(
+            &SaltV2MasterTensorSpec,
+            VerifiedMaster,
+        ) -> Result<(), Qwen36TensorWorkError>,
+    ) -> Result<
+        (
+            Qwen36CompleteWorkspaceReceipt,
+            CompleteManifest,
+            Vec<[u8; 32]>,
+        ),
+        Qwen36TensorWorkError,
+    > {
         fixed_mode.validate_count(self.spec.expected_masters.len())?;
         self.ensure_current()?;
         match fs::symlink_metadata(self.completion_path()) {
@@ -1183,6 +1206,7 @@ impl<'store, 'source> Qwen36AdditiveCampaignStore<'store, 'source> {
                     "completion master receipt",
                 ));
             }
+            visit(expected, verified)?;
             reopened.push(current);
             if let Some(fixed_id) = verified.fixed_id {
                 fixed_ids.push(fixed_id);
@@ -2486,6 +2510,8 @@ mod tests {
     };
 
     use half::f16;
+    #[cfg(feature = "cuda")]
+    use tritium_cuda::{CudaBackend, train::DeviceTensor};
     use tritium_format::{
         PackageId, SemanticTensorHasher,
         salt_v2::SaltV2Codec,
@@ -2498,6 +2524,11 @@ mod tests {
             SaltV2Transform, SaltV2UniformRateModel, write_salt_v2_package,
         },
     };
+    #[cfg(feature = "cuda")]
+    use tritium_nn::{
+        ArchSpec, DenseLinear, DevicePvRecoverySession, Mlp, MlpKind, ModelConfig, ModelWeights,
+        Projection, SwiGluMlp, TiedSwiGluTrainingModel, TokenEmbedding, TransformerBlock,
+    };
     use tritium_nn::{
         NnError, QWEN36_27B_REVISION, Qwen35CheckpointConfig, Qwen35TensorSchemaRole,
         Qwen35TensorStreamError, qwen35_language_mtp_tensor_schema,
@@ -2507,6 +2538,13 @@ mod tests {
         OutputReconstructionSchedule, OutputReconstructionScope, OutputReconstructionSpec,
         PhysicalBytes, ProfileBudget, Qwen35SourceDtype, Qwen35TensorRole, Qwen35TensorScope,
         SaltV2Profile, select_output_reconstruction,
+    };
+    #[cfg(feature = "cuda")]
+    use tritium_train::{
+        AdamW, PvTernaryPlane, PvTernaryStructure, PvTernaryWeight, PvTuningConfig,
+        RecoveryActivationRung, RecoveryCampaignPlan, RecoveryCampaignReceipt, RecoveryCampaignRun,
+        RecoveryEvidenceDigest, RecoveryPredecessorEvidence, RecoveryPromotionGate,
+        RecoverySourceModel, RecoverySourceModelId, RecoveryTrack,
     };
 
     use super::super::{
@@ -2583,6 +2621,301 @@ mod tests {
             ],
             preserved: Vec::new(),
         }
+    }
+
+    #[cfg(feature = "cuda")]
+    fn pv_dense(rows: usize, cols: usize, seed: usize) -> Projection {
+        let values = (0..rows * cols)
+            .map(|index| (((index + seed) % 7) as f32 - 3.0) / 8.0)
+            .collect();
+        Projection::Dense(DenseLinear::new_exact(values, rows, cols).unwrap())
+    }
+
+    #[cfg(feature = "cuda")]
+    fn pv_model() -> TiedSwiGluTrainingModel {
+        let config = ModelConfig {
+            arch: "llama".into(),
+            n_layers: 1,
+            n_embd: 128,
+            n_head: 2,
+            n_head_kv: 1,
+            head_dim: 64,
+            n_ff: 128,
+            n_ctx: 4,
+            rope_theta: 10_000.0,
+            rms_eps: 1e-5,
+        };
+        let spec = ArchSpec {
+            mlp: MlpKind::SwiGlu,
+            attn_sub_norm: false,
+            ffn_sub_norm: false,
+            qk_norm: false,
+            qkv_bias: false,
+            tied_embeddings: true,
+        };
+        let weights = ModelWeights {
+            token_embd: TokenEmbedding::from_dense(vec![0.0; 128 * 128], 128, 128).unwrap(),
+            vocab: 128,
+            n_embd: 128,
+            layers: vec![TransformerBlock {
+                attn_norm: vec![1.0; 128],
+                q_proj: pv_dense(128, 128, 1),
+                k_proj: pv_dense(64, 128, 2),
+                v_proj: pv_dense(64, 128, 3),
+                o_proj: pv_dense(128, 128, 4),
+                attn_sub_norm: Vec::new(),
+                q_bias: Vec::new(),
+                k_bias: Vec::new(),
+                v_bias: Vec::new(),
+                q_norm: Vec::new(),
+                k_norm: Vec::new(),
+                ffn_norm: vec![1.0; 128],
+                mlp: Mlp::SwiGlu(SwiGluMlp {
+                    gate: pv_dense(128, 128, 5),
+                    up: pv_dense(128, 128, 6),
+                    down: pv_dense(128, 128, 7),
+                }),
+            }],
+            output_norm: vec![1.0; 128],
+            lm_head: None,
+        };
+        TiedSwiGluTrainingModel::extract(&config, &spec, &weights).unwrap()
+    }
+
+    #[cfg(feature = "cuda")]
+    fn pv_parent(rows: usize, cols: usize) -> PvTernaryWeight {
+        pv_parent_with_scale(rows, cols, 0.125)
+    }
+
+    #[cfg(feature = "cuda")]
+    fn pv_parent_with_scale(rows: usize, cols: usize, scale: f32) -> PvTernaryWeight {
+        assert!(cols.is_multiple_of(128));
+        let plane = PvTernaryPlane::new(
+            [1, -1, 1, 0].repeat(rows * cols / 4),
+            vec![f16::from_f32(scale); rows * cols / 128],
+        );
+        PvTernaryWeight::new(
+            rows,
+            cols,
+            128,
+            PvTernaryStructure::S34,
+            vec![plane.clone(), plane],
+        )
+        .unwrap()
+    }
+
+    #[cfg(feature = "cuda")]
+    fn pv_workspace_plan(model: &TiedSwiGluTrainingModel) -> WorkspacePlan {
+        let mut parameters = model.parameters().iter().collect::<Vec<_>>();
+        parameters.sort_by(|left, right| left.name.cmp(&right.name));
+        let additive = parameters
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, parameter)| Qwen36AdditiveWorkSlot {
+                name: parameter.name.clone(),
+                dtype: Qwen35SourceDtype::Bfloat16,
+                shape: vec![parameter.rows as u64, parameter.cols as u64],
+                coefficients: (parameter.rows * parameter.cols) as u64,
+                scope: Qwen35TensorScope::Language,
+                role: Qwen35TensorRole::MlpProjection,
+                source_tensor_digest: [u8::try_from(ordinal + 1).unwrap(); 32],
+                state: Qwen36AdditiveSlotState::MissingCanonicalMaster,
+            })
+            .collect::<Vec<_>>();
+        let coefficients = additive.iter().map(|slot| slot.coefficients).sum();
+        WorkspacePlan {
+            proof_id: ContentId::of_bytes(b"device-PV package proof"),
+            manifest_content_id: ContentId::of_bytes(b"device-PV package manifest"),
+            source_model_id: ModelId::from_digest([11; 32]),
+            coverage_policy_digest: [12; 32],
+            identity_status: Qwen36SourceIdentityStatus::MeasuredAwaitingOfficialRegistration,
+            summary: Qwen36TensorWorkSummary {
+                active_tensors: additive.len() as u64,
+                additive_required: additive.len() as u64,
+                additive_present: 0,
+                preserved_tensors: 0,
+                deferred_vision_tensors: 0,
+                active_coefficients: coefficients,
+                preserved_coefficients: 0,
+                preserved_payload_bytes: 0,
+            },
+            additive,
+            preserved: Vec::new(),
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    fn pv_campaign_spec(model: &TiedSwiGluTrainingModel) -> Qwen36AdditiveCampaignSpec {
+        let mut parameters = model.parameters().iter().collect::<Vec<_>>();
+        parameters.sort_by(|left, right| left.name.cmp(&right.name));
+        Qwen36AdditiveCampaignSpec::new(
+            parameters
+                .into_iter()
+                .enumerate()
+                .map(|(ordinal, parameter)| {
+                    SaltV2MasterTensorSpec::new(
+                        &parameter.name,
+                        vec![parameter.rows as u64, parameter.cols as u64],
+                        ModelId::from_digest([11; 32]),
+                        [u8::try_from(ordinal + 1).unwrap(); 32],
+                        [u8::try_from(ordinal + 101).unwrap(); 32],
+                        ordinal as u64,
+                        SaltV2MasterEvidence {
+                            recipe_id: [31; 32],
+                            solver_id: [32; 32],
+                            activation_digest: [33; 32],
+                            curvature_digest: [u8::try_from(ordinal + 41).unwrap(); 32],
+                            feedback_digest: None,
+                            track: SaltV2MasterTrack::Ptq,
+                            parent_master_id: None,
+                        },
+                        SaltV2MasterGeometry {
+                            constraint: SaltV2FitConstraint::S34,
+                            max_planes: 2,
+                        },
+                    )
+                    .unwrap()
+                })
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    #[cfg(feature = "cuda")]
+    fn write_pv_parent_master(
+        spec: &SaltV2MasterTensorSpec,
+        writer: &mut TensorPayloadWriter<'_>,
+    ) -> Result<(), SaltV2MasterError> {
+        let rows = usize::try_from(spec.shape()[0]).unwrap();
+        let cols = usize::try_from(spec.shape()[1]).unwrap();
+        let weight = pv_parent(rows, cols);
+        let loss = [
+            SaltV2PrefixLoss::new(2.0, 2.0)?,
+            SaltV2PrefixLoss::new(1.0, 1.0)?,
+        ];
+        let mut encoder = SaltV2MasterTensorEncoder::new(spec, writer)?;
+        for tile_index in 0..spec.tile_count() {
+            let start = tile_index * 256;
+            let end = (start + 256).min(rows * cols);
+            let plane = SaltV2Plane::new(
+                weight.planes()[0].trits()[start..end].to_vec(),
+                weight.planes()[0].scales()[start / 128..end.div_ceil(128)].to_vec(),
+            )?;
+            encoder.write_tile(2, &loss, &[plane.clone(), plane])?;
+        }
+        encoder.finish()?;
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    fn pv_selection_spec(campaign: &Qwen36AdditiveCampaignSpec) -> Qwen36SelectedAllocationSpec {
+        let specs = campaign
+            .expected_masters()
+            .iter()
+            .map(|master| {
+                SaltV2StreamTensorSpec::new(
+                    master.name(),
+                    master.shape().to_vec(),
+                    SaltV2Transform::None,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let rate = SaltV2UniformRateModel::new(SaltV2Codec::S34, &specs).unwrap();
+        let physical = rate.physical_bytes(rate.tile_count()).unwrap();
+        Qwen36SelectedAllocationSpec::for_uniform_full_tiles(
+            SaltV2Codec::S34,
+            [91; 32],
+            [92; 32],
+            campaign.expected_masters(),
+            PhysicalBytes {
+                serialized: physical.serialized,
+                resident: physical.resident,
+            },
+            PhysicalBytes {
+                serialized: physical.serialized,
+                resident: physical.resident,
+            },
+        )
+        .unwrap()
+    }
+
+    #[cfg(feature = "cuda")]
+    fn pv_tuning_config() -> PvTuningConfig {
+        let optimizer = AdamW {
+            lr: 0.001,
+            beta1: 0.0,
+            beta2: 0.0,
+            eps: 1e-8,
+            weight_decay: 0.0,
+        };
+        PvTuningConfig::builder(optimizer, optimizer)
+            .max_code_change_fraction(0.25)
+            .build()
+            .unwrap()
+    }
+
+    #[cfg(feature = "cuda")]
+    fn pv_evidence(byte: u8) -> RecoveryEvidenceDigest {
+        RecoveryEvidenceDigest::new([byte; 32]).unwrap()
+    }
+
+    #[cfg(feature = "cuda")]
+    fn pv_recovery_plan(
+        track: RecoveryTrack,
+        campaign: RecoveryEvidenceDigest,
+    ) -> RecoveryCampaignPlan {
+        RecoveryCampaignPlan::new(
+            RecoverySourceModel::SmolLm2OneThirtyFiveMillion,
+            RecoverySourceModelId::new([200; 32]).unwrap(),
+            RecoveryActivationRung::A16,
+            track,
+            campaign,
+            RecoveryPromotionGate::new(-100.0, pv_evidence(201)).unwrap(),
+        )
+    }
+
+    #[cfg(feature = "cuda")]
+    fn finish_pv_recovery_campaign(run: RecoveryCampaignRun) -> (RecoveryCampaignReceipt, Vec<u8>) {
+        let promotion = run.prepare_promotion_evidence().unwrap();
+        let bytes = promotion.to_bytes().unwrap();
+        (run.finish(&bytes).unwrap(), bytes)
+    }
+
+    #[cfg(feature = "cuda")]
+    fn pv_predecessor(
+        receipt: &RecoveryCampaignReceipt,
+        promotion: &[u8],
+    ) -> RecoveryPredecessorEvidence {
+        RecoveryPredecessorEvidence::new(&receipt.to_bytes().unwrap(), promotion).unwrap()
+    }
+
+    #[cfg(feature = "cuda")]
+    fn authorized_pv_recovery(campaign: RecoveryEvidenceDigest) -> RecoveryCampaignRun {
+        let mut ptq =
+            RecoveryCampaignRun::start(pv_recovery_plan(RecoveryTrack::Ptq, campaign), None)
+                .unwrap();
+        ptq.record_ptq(-2.0, pv_evidence(202)).unwrap();
+        let (ptq, ptq_promotion) = finish_pv_recovery_campaign(ptq);
+        let mut scale = RecoveryCampaignRun::start(
+            pv_recovery_plan(RecoveryTrack::ScaleOnly, campaign),
+            Some(pv_predecessor(&ptq, &ptq_promotion)),
+        )
+        .unwrap();
+        for (tokens, quality, digest) in [
+            (1_000_000, -1.9, pv_evidence(203)),
+            (2_000_000, -1.8, pv_evidence(204)),
+            (4_000_000, -1.7, pv_evidence(205)),
+            (8_000_000, -1.6, pv_evidence(206)),
+        ] {
+            scale.record_evaluation(tokens, quality, digest).unwrap();
+        }
+        let (scale, promotion) = finish_pv_recovery_campaign(scale);
+        RecoveryCampaignRun::start(
+            pv_recovery_plan(RecoveryTrack::Pv, campaign),
+            Some(pv_predecessor(&scale, &promotion)),
+        )
+        .unwrap()
     }
 
     #[derive(Debug)]
@@ -4464,6 +4797,10 @@ mod tests {
                 .present_planes(),
             3
         );
+        let pv_parent_context = admitted
+            .pv_parent_context()
+            .expect("derive exact PV package-parent context");
+        assert_ne!(pv_parent_context.as_bytes(), [0; 32]);
         let child_specs = vec![
             fixture_scale_only_master(&parent_masters[0], "language.weight", [21; 32], 0, [51; 32]),
             fixture_scale_only_master(&parent_masters[1], "mtp.weight", [22; 32], 1, [52; 32]),
@@ -4489,6 +4826,12 @@ mod tests {
             .reopen_package_admission()
             .expect("reopen exact package admission");
         assert_eq!(admitted.receipt(), &admission_receipt);
+        assert_eq!(
+            admitted
+                .pv_parent_context()
+                .expect("rederive PV package-parent context"),
+            pv_parent_context
+        );
 
         let selection_store = TensorWorkStore::open(&parent.root().join("selected-allocation"))
             .expect("open selected allocation CAS");
@@ -4498,6 +4841,7 @@ mod tests {
         )
         .expect("tamper admitted package record");
         assert!(admitted.verify_current().is_err());
+        assert!(admitted.pv_parent_context().is_err());
 
         drop(admitted);
         drop(allocated);
@@ -4592,6 +4936,172 @@ mod tests {
             0
         );
 
+        drop(admitted);
+        drop(allocated);
+        drop(parent);
+        drop(base);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn admitted_parent_packages_materialize_exact_current_pv_artifact() {
+        let root = fixture_root("hard-pv-package-admission");
+        let _ = fs::remove_dir_all(&root);
+        let source = EmptySource;
+        let mut model = pv_model();
+        let plan = pv_workspace_plan(&model);
+        let base = Qwen36TensorWorkStore::open_from_parts(&source, root.clone(), plan)
+            .expect("open hard-PV package workspace");
+        base.reconcile_preserved().expect("seal empty base");
+        let campaign_spec = pv_campaign_spec(&model);
+        let parent = base
+            .open_master_campaign(campaign_spec.clone())
+            .expect("open PTQ parent campaign");
+        for expected in campaign_spec.expected_masters() {
+            parent
+                .install_master(expected, |writer| write_pv_parent_master(expected, writer))
+                .expect("install exact PTQ parent master");
+        }
+        parent.seal_complete().expect("seal PTQ parent");
+        let allocated = parent
+            .allocate_selected_allocation(pv_selection_spec(&campaign_spec))
+            .expect("allocate exact selected packages");
+        let admitted = allocated
+            .materialize_and_admit_packages()
+            .expect("admit exact PTQ parent packages");
+        let package_parent_context = admitted
+            .pv_parent_context()
+            .expect("derive parent package authority");
+
+        let parents = model
+            .parameters()
+            .iter()
+            .map(|parameter| pv_parent(parameter.rows, parameter.cols))
+            .collect::<Vec<_>>();
+        drop(model.take_parameter_masters());
+        let backend = CudaBackend::new(0).expect("CUDA feature lane requires device 0");
+        let recovery_campaign = authorized_pv_recovery(pv_evidence(215));
+        let mut session = DevicePvRecoverySession::new_for_recovery_campaign_with_parent_context(
+            &backend,
+            &model,
+            parents,
+            pv_tuning_config(),
+            &recovery_campaign,
+            package_parent_context.device_context().unwrap(),
+        )
+        .expect("open package-bound hard-PV session");
+        let mut target = vec![0.0; 128];
+        target[0] = 1.0;
+        let target = DeviceTensor::upload(&backend, &target).unwrap();
+        let step = session
+            .step(&[0], &target)
+            .expect("complete one hard-PV step");
+        let artifact = session
+            .checkpoint_artifact(&step, &recovery_campaign)
+            .expect("seal exact TPVM2/TPVA1 artifact");
+
+        let pv = admitted
+            .materialize_and_admit_pv_packages(&session, &artifact)
+            .expect("materialize exact current hard-PV packages");
+        assert_eq!(
+            pv.receipt().parent_admission_id(),
+            admitted.receipt().admission_id()
+        );
+        assert_eq!(
+            pv.receipt().selection_id(),
+            admitted.receipt().selection_id()
+        );
+        assert_eq!(
+            pv.receipt().parent_context(),
+            package_parent_context.as_bytes()
+        );
+        assert_eq!(
+            pv.receipt().artifact_digest(),
+            artifact.artifact_digest().as_bytes()
+        );
+        assert_eq!(pv.receipt().optimizer_step(), step.optimizer_step());
+        assert_eq!(
+            pv.receipt().representation_digest(),
+            step.representation_digest()
+        );
+        assert_eq!(
+            pv.receipt().compact().runtime_ledger().present_planes(),
+            allocated.receipt().compact().selected_planes()
+        );
+        assert_eq!(
+            pv.receipt()
+                .near_lossless()
+                .runtime_ledger()
+                .present_planes(),
+            allocated.receipt().near_lossless().selected_planes()
+        );
+        let mut compact_bytes = Vec::new();
+        let compact_len = pv
+            .try_visit_package(SaltV2Profile::CompactV1, 97, |chunk| {
+                compact_bytes.extend_from_slice(chunk);
+                Ok::<_, Infallible>(())
+            })
+            .expect("visit exact refined compact package");
+        assert_eq!(compact_len, compact_bytes.len() as u64);
+        assert!(!compact_bytes.is_empty());
+        pv.verify_current().expect("reverify refined packages");
+        let receipt = pv.receipt().clone();
+        drop(pv);
+
+        let reopened = admitted
+            .reopen_pv_package_admission(&session, &artifact)
+            .expect("reopen exact refined package admission");
+        assert_eq!(reopened.receipt(), &receipt);
+        drop(reopened);
+
+        let mut unrelated_parents = model
+            .parameters()
+            .iter()
+            .map(|parameter| pv_parent(parameter.rows, parameter.cols))
+            .collect::<Vec<_>>();
+        let first = &model.parameters()[0];
+        unrelated_parents[0] = pv_parent_with_scale(first.rows, first.cols, 0.25);
+        let mut unrelated_session =
+            DevicePvRecoverySession::new_for_recovery_campaign_with_parent_context(
+                &backend,
+                &model,
+                unrelated_parents,
+                pv_tuning_config(),
+                &recovery_campaign,
+                package_parent_context.device_context().unwrap(),
+            )
+            .expect("open context-labeled but semantically unrelated hard-PV session");
+        let unrelated_step = unrelated_session
+            .step(&[0], &target)
+            .expect("complete unrelated hard-PV step");
+        let unrelated_artifact = unrelated_session
+            .checkpoint_artifact(&unrelated_step, &recovery_campaign)
+            .expect("seal unrelated hard-PV artifact");
+        let unrelated_error = admitted
+            .materialize_and_admit_pv_packages(&unrelated_session, &unrelated_artifact)
+            .expect_err("parent context cannot relabel unrelated parent weights");
+        assert!(
+            matches!(
+                unrelated_error,
+                Qwen36PvPackageAdmissionError::Package(Qwen36PackageAdmissionError::Campaign(
+                    Qwen36TensorWorkError::WorkspaceMismatch("hard-PV session parent catalog")
+                ))
+            ),
+            "unexpected unrelated-parent error: {unrelated_error:?}"
+        );
+        drop(unrelated_session);
+
+        session
+            .step(&[0], &target)
+            .expect("advance session beyond selected artifact");
+        assert!(
+            admitted
+                .reopen_pv_package_admission(&session, &artifact)
+                .is_err()
+        );
+
+        drop(session);
         drop(admitted);
         drop(allocated);
         drop(parent);

@@ -12,7 +12,12 @@ pub use package_admission::{
     Qwen36FinalLogitsOutputBindingError, Qwen36FinalLogitsOutputBindingReceipt,
     Qwen36PackageAdmissionError, Qwen36PackageAdmissionReceipt, Qwen36PackageAdmittedCampaignStore,
     Qwen36PackageProfileReceipt, Qwen36PackageRuntimeLedger, Qwen36PackageScaleOnlyCampaignStore,
-    Qwen36PackageVisitError,
+    Qwen36PackageVisitError, Qwen36PvParentContext,
+};
+#[cfg(all(unix, feature = "cuda"))]
+pub use package_admission::{
+    Qwen36PvPackageAdmissionError, Qwen36PvPackageAdmissionReceipt,
+    Qwen36PvPackageAdmittedCampaignStore, Qwen36PvPackageVisitError,
 };
 
 use std::{

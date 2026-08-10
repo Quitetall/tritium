@@ -63,7 +63,12 @@ pub use qwen36_tensor_work::{
     Qwen36PackageAdmissionError, Qwen36PackageAdmissionReceipt, Qwen36PackageAdmittedCampaignStore,
     Qwen36PackageProfileReceipt, Qwen36PackageRuntimeLedger, Qwen36PackageScaleOnlyCampaignStore,
     Qwen36PackageVisitError, Qwen36PtqPackageError, Qwen36PtqPackagesReceipt,
-    reconcile_qwen36_ptq_packages,
+    Qwen36PvParentContext, reconcile_qwen36_ptq_packages,
+};
+#[cfg(all(unix, feature = "cuda"))]
+pub use qwen36_tensor_work::{
+    Qwen36PvPackageAdmissionError, Qwen36PvPackageAdmissionReceipt,
+    Qwen36PvPackageAdmittedCampaignStore, Qwen36PvPackageVisitError,
 };
 pub use stage7_evidence::{
     STAGE7_DATASETS, STAGE7_PARTITION_SEQUENCE_COUNT, STAGE7_SAMPLED_ROWS_SCHEMA,
