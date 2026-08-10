@@ -31,20 +31,41 @@ mod common;
 
 use std::path::PathBuf;
 
-use common::{Calib, calibrate, extract, fold, perplexity_windowed};
+use common::{Calib, Evaluator, calibrate, extract, fold};
 use tritium_format::salt_v2::SaltV2Codec;
 use tritium_nn::ModelRunner;
 use tritium_train::ops::ste::{self, RotationPolicy};
 
 const EVAL_WINDOW: usize = 512;
-/// Group size for both RTN scales and SALT groups — 128 is the standard GPTQ/AWQ reporting width.
-const GROUP: usize = 128;
+/// Default group size for both RTN scales and SALT groups — 128 is the standard GPTQ/AWQ
+/// reporting width. Override with `TRITIUM_GROUP`; unset reproduces every published number.
+const GROUP_DEFAULT: usize = 128;
 /// ITF alternations for the legacy free-scale control.
 const ITERS: usize = 5;
 /// Δ candidates per group for the ladder.
 const GRID: usize = 16;
-/// Salience-fold strength — the value every published SALT number was measured under.
-const FOLD_ALPHA: f64 = 0.75;
+/// Default salience-fold strength — the value every published SALT number was measured under.
+/// Override with `TRITIUM_FOLD_ALPHA`. The optimum is known to shift DOWN with model size
+/// (0.75 -> 0.50 observed), so a fixed value is very likely wrong away from 135M.
+const FOLD_ALPHA_DEFAULT: f64 = 0.75;
+
+/// Group size for this run. Both the RTN scales and the SALT groups use it, so a sweep moves the
+/// two baselines together and the comparison stays like-for-like.
+fn group() -> usize {
+    std::env::var("TRITIUM_GROUP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&g: &usize| g >= 8)
+        .unwrap_or(GROUP_DEFAULT)
+}
+
+/// Salience-fold alpha for this run.
+fn fold_alpha() -> f64 {
+    std::env::var("TRITIUM_FOLD_ALPHA")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(FOLD_ALPHA_DEFAULT)
+}
 const CALIB_WINDOWS: usize = 8;
 const CALIB_SEQ: usize = 512;
 
@@ -77,7 +98,7 @@ fn corpus() -> (Vec<u32>, Vec<u32>) {
 }
 
 /// Group-wise **asymmetric** round-to-nearest integer quantization — the ordinary `int-b` weight
-/// quantizer. Each contiguous run of `GROUP` weights within a row gets its own `(scale, zero)`, the
+/// quantizer. Each contiguous run of `group()` weights within a row gets its own `(scale, zero)`, the
 /// weight is mapped to `[0, 2^b - 1]`, and the returned buffer is the dequantized reconstruction.
 fn rtn_quantize(w: &[f32], rows: usize, cols: usize, bits: u32) -> Vec<f32> {
     let levels = ((1u32 << bits) - 1) as f32;
@@ -85,7 +106,7 @@ fn rtn_quantize(w: &[f32], rows: usize, cols: usize, bits: u32) -> Vec<f32> {
     for r in 0..rows {
         let row = &w[r * cols..(r + 1) * cols];
         let dst = &mut out[r * cols..(r + 1) * cols];
-        for (g_src, g_dst) in row.chunks(GROUP).zip(dst.chunks_mut(GROUP)) {
+        for (g_src, g_dst) in row.chunks(group()).zip(dst.chunks_mut(group())) {
             let lo = g_src.iter().copied().fold(f32::INFINITY, f32::min);
             let hi = g_src.iter().copied().fold(f32::NEG_INFINITY, f32::max);
             let scale = (hi - lo) / levels;
@@ -106,17 +127,18 @@ fn rtn_quantize(w: &[f32], rows: usize, cols: usize, bits: u32) -> Vec<f32> {
 
 /// bpw for group-wise int-`b`: the codes plus one f16 scale and one f16 zero per group.
 fn rtn_bpw(bits: u32) -> f64 {
-    f64::from(bits) + 32.0 / GROUP as f64
+    f64::from(bits) + 32.0 / group() as f64
 }
 
 /// bpw for `T` ladder planes: B3-packed trits, one f16 anchor per group, plus the rotation bit.
 fn ladder_bpw(t: usize) -> f64 {
-    ste::ternary_bits_per_weight_geometric(t, GROUP, SaltV2Codec::B3, GROUP) + 1.0 / GROUP as f64
+    ste::ternary_bits_per_weight_geometric(t, group(), SaltV2Codec::B3, group())
+        + 1.0 / group() as f64
 }
 
 /// bpw for `T` free-scale (ITF) planes: B3-packed trits, one f16 scale **per plane** per group.
 fn itf_bpw(t: usize) -> f64 {
-    ste::ternary_bits_per_weight_codec(t, GROUP, SaltV2Codec::B3, GROUP) + 1.0 / GROUP as f64
+    ste::ternary_bits_per_weight_codec(t, group(), SaltV2Codec::B3, group()) + 1.0 / group() as f64
 }
 
 /// One scored configuration.
@@ -142,8 +164,12 @@ fn salt_vs_rtn_quality_per_byte() {
     let (arch, fp, shapes) = extract(&runner);
     let (train, eval) = corpus();
 
+    let ev = Evaluator::from_env();
+    let g = group();
+    let alpha = fold_alpha();
+
     // The fp reference is scored on the ORIGINAL weights, before the fold reparameterizes them.
-    let ppl_fp = perplexity_windowed(&fp, &arch, &eval, EVAL_WINDOW);
+    let ppl_fp = ev.ppl(&fp, &arch, &eval, EVAL_WINDOW);
 
     // Calibrate once; the folded pair feeds every folded arm so the fold is identical across them.
     let mut calib = Calib::new(&arch);
@@ -155,14 +181,15 @@ fn salt_vs_rtn_quality_per_byte() {
             &mut calib,
         );
     }
-    let (fp_folded, arch_folded) = fold(&fp, &shapes, &arch, &calib, FOLD_ALPHA);
+    let (fp_folded, arch_folded) = fold(&fp, &shapes, &arch, &calib, alpha);
 
     println!(
-        "{} | fp {ppl_fp:.3} ppl | {} held-out tokens | g{GROUP} | B3 bpw | fold α={FOLD_ALPHA}\n\
+        "{} | fp {ppl_fp:.3} ppl | {} held-out tokens | g{g} | B3 bpw | fold α={alpha} | eval={}\n\
          RTN is scored BOTH unfolded and folded; folded-vs-folded is the honest comparison, and \
          the unfolded row shows what the fold itself is worth.\n",
         dir.file_name().unwrap_or_default().to_string_lossy(),
         eval.len(),
+        ev.label(),
     );
     println!(
         "{:<30} {:>7}  {:>11}  {:>9}",
@@ -192,8 +219,8 @@ fn salt_vs_rtn_quality_per_byte() {
             .zip(&shapes)
             .map(|(w, &(n, k))| rtn_quantize(w, n, k, bits))
             .collect();
-        let ppl = perplexity_windowed(&q, &arch, &eval, EVAL_WINDOW);
-        score(format!("RTN int{bits} g{GROUP}"), rtn_bpw(bits), ppl, false);
+        let ppl = ev.ppl(&q, &arch, &eval, EVAL_WINDOW);
+        score(format!("RTN int{bits} g{g}"), rtn_bpw(bits), ppl, false);
     }
     for bits in [2u32, 3, 4, 5, 6, 8] {
         let q: Vec<Vec<f32>> = fp_folded
@@ -201,9 +228,9 @@ fn salt_vs_rtn_quality_per_byte() {
             .zip(&shapes)
             .map(|(w, &(n, k))| rtn_quantize(w, n, k, bits))
             .collect();
-        let ppl = perplexity_windowed(&q, &arch_folded, &eval, EVAL_WINDOW);
+        let ppl = ev.ppl(&q, &arch_folded, &eval, EVAL_WINDOW);
         score(
-            format!("RTN int{bits} g{GROUP} +fold"),
+            format!("RTN int{bits} g{g} +fold"),
             rtn_bpw(bits),
             ppl,
             false,
@@ -221,13 +248,13 @@ fn salt_vs_rtn_quality_per_byte() {
                     n,
                     k,
                     t,
-                    GROUP,
+                    group(),
                     GRID,
                     RotationPolicy::Always,
                 )
             })
             .collect();
-        let ppl = perplexity_windowed(&q, &arch_folded, &eval, EVAL_WINDOW);
+        let ppl = ev.ppl(&q, &arch_folded, &eval, EVAL_WINDOW);
         score(format!("SALT ladder T={t} +fold"), ladder_bpw(t), ppl, true);
     }
     for t in 1..=3 {
@@ -235,10 +262,10 @@ fn salt_vs_rtn_quality_per_byte() {
             .iter()
             .zip(&shapes)
             .map(|(w, &(n, k))| {
-                ste::salt_quantize_forward_grouped(w, n, k, t, GROUP, ITERS, RotationPolicy::Auto)
+                ste::salt_quantize_forward_grouped(w, n, k, t, group(), ITERS, RotationPolicy::Auto)
             })
             .collect();
-        let ppl = perplexity_windowed(&q, &arch_folded, &eval, EVAL_WINDOW);
+        let ppl = ev.ppl(&q, &arch_folded, &eval, EVAL_WINDOW);
         score(format!("SALT ITF T={t} +fold"), itf_bpw(t), ppl, true);
     }
 

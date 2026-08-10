@@ -28,7 +28,10 @@ pub struct Arch {
 pub fn dense(p: &Projection) -> (Vec<f32>, usize, usize) {
     match p {
         Projection::Dense(d) => (d.weights.clone(), d.n_out, d.k_in),
-        Projection::Salt(_) | Projection::HostSaltV2(_) | Projection::Ternary(_) => {
+        Projection::Salt(_)
+        | Projection::HostSaltV2(_)
+        | Projection::Ternary(_)
+        | Projection::Q2(_) => {
             panic!("from_hf builds Dense projections")
         }
         #[cfg(feature = "cuda")]
@@ -330,17 +333,141 @@ pub fn perplexity_windowed(weights: &[Vec<f32>], a: &Arch, eval_ids: &[u32], win
         }
         // Build, score, and drop one window's tape before the next allocates.
         let logits = logits_of(weights, a, chunk);
-        for tpos in 0..chunk.len() - 1 {
-            let row = &logits[tpos * a.vocab..tpos * a.vocab + a.vocab];
-            let m = row.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
-            let lse = m + row
-                .iter()
-                .map(|&x| (f64::from(x) - m).exp())
-                .sum::<f64>()
-                .ln();
-            nll += lse - f64::from(row[chunk[tpos + 1] as usize]);
+        score_window(&logits, chunk, a.vocab, &mut nll, &mut scored);
+    }
+    assert!(scored > 0, "held-out set scored no positions");
+    (nll / scored as f64).exp()
+}
+
+/// Which forward path a sweep scores perplexity with.
+///
+/// Selected by `TRITIUM_EVAL_DEVICE=cuda|host`, **defaulting to `host`**. Measured on SmolLM2-135M
+/// over 4,096 tokens the two agree to `8.8e-8` relative while the device path is **20.7× faster**
+/// (`device_eval_parity.rs`), so `cuda` is safe for sweeps — but the default stays `host` because
+/// every published number in this repo is host-computed and a silent basis change is the specific
+/// failure this campaign has come closest to shipping. Harnesses print [`label`](Self::label) beside
+/// their results: a number whose basis is not stated is not quotable.
+pub enum Evaluator {
+    /// The CPU tape — authoritative for anything quoted.
+    Host,
+    /// The device tape — for sweeps and exploration.
+    #[cfg(feature = "cuda")]
+    Cuda(Box<tritium_cuda::CudaBackend>),
+}
+
+impl Evaluator {
+    /// Build from `TRITIUM_EVAL_DEVICE`; unset or unrecognised yields [`Evaluator::Host`].
+    ///
+    /// # Panics
+    /// If `cuda` is requested but the device cannot be opened — failing loudly beats silently
+    /// scoring a sweep on a different basis than the one the operator asked for.
+    #[must_use]
+    pub fn from_env() -> Self {
+        match std::env::var("TRITIUM_EVAL_DEVICE").as_deref() {
+            Ok("cuda") => {
+                #[cfg(feature = "cuda")]
+                {
+                    Self::Cuda(Box::new(
+                        tritium_cuda::CudaBackend::new(0).expect("TRITIUM_EVAL_DEVICE=cuda"),
+                    ))
+                }
+                #[cfg(not(feature = "cuda"))]
+                panic!(
+                    "TRITIUM_EVAL_DEVICE=cuda but this binary was built without --features cuda"
+                );
+            }
+            _ => Self::Host,
         }
-        scored += chunk.len() - 1;
+    }
+
+    /// Short name for the results header.
+    #[must_use]
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Host => "host",
+            #[cfg(feature = "cuda")]
+            Self::Cuda(_) => "cuda",
+        }
+    }
+
+    /// Windowed perplexity through the selected path.
+    #[must_use]
+    pub fn ppl(&self, weights: &[Vec<f32>], a: &Arch, eval_ids: &[u32], window: usize) -> f64 {
+        match self {
+            Self::Host => perplexity_windowed(weights, a, eval_ids, window),
+            #[cfg(feature = "cuda")]
+            Self::Cuda(b) => perplexity_windowed_device(b, weights, a, eval_ids, window),
+        }
+    }
+}
+
+/// Accumulate one window's next-token NLL in f64.
+///
+/// Factored out so the host and device perplexity paths share **one** scoring implementation: the
+/// only thing that may differ between them is the logits, never the arithmetic that turns logits
+/// into a number. A second copy of this loop would make a host↔device delta ambiguous between "the
+/// forward differs" and "the scoring differs", which is exactly what the parity gate exists to
+/// distinguish.
+fn score_window(logits: &[f32], chunk: &[u32], vocab: usize, nll: &mut f64, scored: &mut usize) {
+    for tpos in 0..chunk.len() - 1 {
+        let row = &logits[tpos * vocab..tpos * vocab + vocab];
+        let m = row.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+        let lse = m + row
+            .iter()
+            .map(|&x| (f64::from(x) - m).exp())
+            .sum::<f64>()
+            .ln();
+        *nll += lse - f64::from(row[chunk[tpos + 1] as usize]);
+    }
+    *scored += chunk.len() - 1;
+}
+
+/// The GPU mirror of [`perplexity_windowed`] — same windowing, same f64 scoring, logits from the
+/// device tape instead of the host tape.
+///
+/// **Weights are uploaded once**, before the window loop, and each window borrows them through
+/// [`device_forward_resident`]. The obvious port — calling [`device_forward`], which does
+/// `dt.leaf(&weights[i])` per call — re-uploads the entire model for every window: at SmolLM2-1.7B
+/// that is ~6.8 GB × 64 windows ≈ 435 GB of PCIe traffic per evaluation, which would eat the whole
+/// speedup this function exists to deliver.
+///
+/// **This path is NOT bit-identical to the host.** The device tape reproduces the host op sequence
+/// within ~1e-4 (transcendentals differ), so perplexities differ in the last digits. Every published
+/// number in this repo is host-computed; use this for sweeps and exploration, and keep the host path
+/// authoritative for anything quoted. `device_eval_matches_host_ppl` measures and prints the actual
+/// delta rather than leaving it assumed.
+#[cfg(feature = "cuda")]
+pub fn perplexity_windowed_device(
+    backend: &tritium_cuda::CudaBackend,
+    weights: &[Vec<f32>],
+    a: &Arch,
+    eval_ids: &[u32],
+    window: usize,
+) -> f64 {
+    use tritium_cuda::train::{DeviceTape, DeviceTensor};
+
+    assert!(window >= 2, "a window must score at least one next-token");
+
+    // Upload once; borrow per window.
+    let resident: Vec<DeviceTensor> = weights
+        .iter()
+        .map(|w| DeviceTensor::upload(backend, w).expect("upload weight to device"))
+        .collect();
+    let refs: Vec<&DeviceTensor> = resident.iter().collect();
+
+    let mut nll = 0.0f64;
+    let mut scored = 0usize;
+    for chunk in eval_ids.chunks(window) {
+        if chunk.len() < 2 {
+            continue;
+        }
+        let tokens_i32: Vec<i32> = chunk.iter().map(|&t| t as i32).collect();
+        // A fresh tape per window, dropped before the next allocates — the same peak-memory
+        // discipline the host path documents.
+        let mut dt = DeviceTape::new(backend, a.vocab).expect("device tape");
+        let (logits_id, _) = device_forward_resident(&mut dt, a, &refs, &tokens_i32, chunk.len());
+        let logits = dt.value(logits_id).expect("download logits");
+        score_window(&logits, chunk, a.vocab, &mut nll, &mut scored);
     }
     assert!(scored > 0, "held-out set scored no positions");
     (nll / scored as f64).exp()
