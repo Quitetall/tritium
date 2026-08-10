@@ -30,12 +30,16 @@
 
 mod common;
 
-use std::path::PathBuf;
+use std::fs::File;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::Instant;
 
 use common::{extract, perplexity_windowed, perplexity_windowed_device};
 use tritium_cuda::CudaBackend;
 use tritium_nn::ModelRunner;
+use tritium_spec::TernaryBackend;
 
 const EVAL_WINDOW: usize = 512;
 /// Relative perplexity agreement required between the host and device paths.
@@ -55,13 +59,7 @@ fn model_dir() -> PathBuf {
 }
 
 fn eval_ids() -> Vec<u32> {
-    let path = std::env::var("TRITIUM_CORPUS").unwrap_or_else(|_| {
-        concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../tools/reference/heldout_corpus.json"
-        )
-        .to_string()
-    });
+    let path = corpus_path();
     let j: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&path).expect("corpus json")).expect("parse");
     j["eval_ids"]
@@ -72,27 +70,132 @@ fn eval_ids() -> Vec<u32> {
         .collect()
 }
 
+fn corpus_path() -> PathBuf {
+    std::env::var("TRITIUM_CORPUS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            PathBuf::from(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tools/reference/heldout_corpus.json"
+            ))
+        })
+}
+
+fn hash_file(path: &Path) -> String {
+    let mut file =
+        File::open(path).unwrap_or_else(|error| panic!("open {}: {error}", path.display()));
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = vec![0u8; 1024 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .unwrap_or_else(|error| panic!("hash {}: {error}", path.display()));
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+fn model_manifest_digest(dir: &Path) -> String {
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
+        .unwrap_or_else(|error| panic!("read model directory {}: {error}", dir.display()))
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && (path.extension().is_some_and(|ext| ext == "safetensors")
+                    || matches!(
+                        path.file_name().and_then(|name| name.to_str()),
+                        Some(
+                            "config.json"
+                                | "tokenizer.json"
+                                | "tokenizer_config.json"
+                                | "model.safetensors.index.json"
+                        )
+                    ))
+        })
+        .collect();
+    paths.sort();
+    assert!(
+        !paths.is_empty(),
+        "model directory has no identity-bearing files"
+    );
+    let mut hasher = blake3::Hasher::new();
+    for path in paths {
+        hasher.update(
+            path.file_name()
+                .expect("model file name")
+                .to_string_lossy()
+                .as_bytes(),
+        );
+        hasher.update(hash_file(path.as_path()).as_bytes());
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+fn optional_file_digest(path: &Path) -> String {
+    if path.is_file() {
+        hash_file(path)
+    } else {
+        "absent".to_owned()
+    }
+}
+
+fn git_head() -> String {
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("repo root");
+    let output = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo)
+        .output()
+        .expect("git rev-parse");
+    assert!(output.status.success(), "git rev-parse failed");
+    String::from_utf8(output.stdout)
+        .expect("git output")
+        .trim()
+        .to_owned()
+}
+
 #[test]
 #[ignore = "needs a CUDA device + the cached model; run explicitly"]
 fn device_eval_matches_host_ppl() {
     let dir = model_dir();
-    if !dir.join("model.safetensors").exists() && !dir.join("model.safetensors.index.json").exists()
-    {
-        eprintln!("skipping: {} absent", dir.display());
-        return;
-    }
+    assert!(
+        dir.join("model.safetensors").exists() || dir.join("model.safetensors.index.json").exists(),
+        "model absent at {}; explicit parity run requires TRITIUM_MODEL_DIR",
+        dir.display()
+    );
     let runner =
         ModelRunner::from_hf(&dir, Box::new(tritium_cpu::CpuBackend::new())).expect("from_hf");
     let (arch, fp, _shapes) = extract(&runner);
 
     let all = eval_ids();
     let eval = &all[..GATE_TOKENS.min(all.len())];
+    let corpus = corpus_path();
+    println!(
+        "PROVENANCE git={} model_dir={} model_manifest_blake3={} tokenizer_blake3={} corpus={} corpus_blake3={} recipe=device_eval_window:{EVAL_WINDOW},tokens:{GATE_TOKENS},bound:{MAX_REL_DELTA:.0e}",
+        git_head(),
+        dir.display(),
+        model_manifest_digest(&dir),
+        optional_file_digest(&dir.join("tokenizer.json")),
+        corpus.display(),
+        hash_file(&corpus),
+    );
 
     let t0 = Instant::now();
     let host = perplexity_windowed(&fp, &arch, eval, EVAL_WINDOW);
     let host_secs = t0.elapsed().as_secs_f64();
 
     let backend = CudaBackend::new(0).expect("open CUDA device");
+    println!(
+        "DEVICE physical_name={} capabilities={:?}",
+        backend.capabilities().device_name,
+        backend.capabilities()
+    );
     let t1 = Instant::now();
     let device = perplexity_windowed_device(&backend, &fp, &arch, eval, EVAL_WINDOW);
     let device_secs = t1.elapsed().as_secs_f64();

@@ -33,7 +33,7 @@ unmanifested file.
     {
       "id": "tritium-torch-linux-cpu",
       "kind": "python-wheel",
-      "path": "tritium_torch-1.1.0rc0-cp39-abi3-manylinux_2_28_x86_64.whl",
+      "path": "tritium_torch-1.1.0rc1-cp39-abi3-manylinux_2_28_x86_64.whl",
       "sbom": "tritium-torch-linux-cpu.cdx.json"
     }
   ]

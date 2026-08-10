@@ -35,3 +35,21 @@ jobs:
       # gracefully (skips only the safetensors->.tslb sub-step) if it is absent.
       - name: run CPU capstone smoke
         run: ./scripts/capstone.sh
+
+  # Stable branch-protection target for this separate workflow. `ci-required`
+  # cannot aggregate jobs across workflow files.
+  capstone-required:
+    name: capstone-required
+    if: ${{ always() }}
+    needs: [capstone-cpu]
+    runs-on: ubuntu-latest
+    steps:
+      - name: fail closed on capstone result
+        env:
+          RESULT: ${{ needs.capstone-cpu.result }}
+        run: |
+          if [ "$RESULT" != success ]; then
+            echo "capstone dependency not green: $RESULT"
+            exit 1
+          fi
+          echo "capstone dependency passed"

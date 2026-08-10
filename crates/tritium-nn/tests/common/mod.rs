@@ -341,12 +341,12 @@ pub fn perplexity_windowed(weights: &[Vec<f32>], a: &Arch, eval_ids: &[u32], win
 
 /// Which forward path a sweep scores perplexity with.
 ///
-/// Selected by `TRITIUM_EVAL_DEVICE=cuda|host`, **defaulting to `host`**. Measured on SmolLM2-135M
-/// over 4,096 tokens the two agree to `8.8e-8` relative while the device path is **20.7× faster**
-/// (`device_eval_parity.rs`), so `cuda` is safe for sweeps — but the default stays `host` because
-/// every published number in this repo is host-computed and a silent basis change is the specific
-/// failure this campaign has come closest to shipping. Harnesses print [`label`](Self::label) beside
-/// their results: a number whose basis is not stated is not quotable.
+/// Selected by `TRITIUM_EVAL_DEVICE=cuda|host`, **defaulting to `host`**. The ignored
+/// `device_eval_parity.rs` gate measures host/device agreement on a real model and GPU, but no
+/// physical receipt is committed here; its result is therefore not a release claim. The default
+/// stays `host` because every published number in this repo is host-computed and a silent basis
+/// change is the specific failure this campaign has come closest to shipping. Harnesses print
+/// [`label`](Self::label) beside their results: a number whose basis is not stated is not quotable.
 pub enum Evaluator {
     /// The CPU tape — authoritative for anything quoted.
     Host,
@@ -356,27 +356,29 @@ pub enum Evaluator {
 }
 
 impl Evaluator {
-    /// Build from `TRITIUM_EVAL_DEVICE`; unset or unrecognised yields [`Evaluator::Host`].
-    ///
-    /// # Panics
-    /// If `cuda` is requested but the device cannot be opened — failing loudly beats silently
-    /// scoring a sweep on a different basis than the one the operator asked for.
-    #[must_use]
-    pub fn from_env() -> Self {
+    /// Build from `TRITIUM_EVAL_DEVICE`; unset yields [`Evaluator::Host`].
+    /// Unsupported values return an error rather than silently changing the measurement basis.
+    #[must_use = "the selected evaluator or its configuration error must be handled"]
+    pub fn from_env() -> Result<Self, String> {
         match std::env::var("TRITIUM_EVAL_DEVICE").as_deref() {
+            Ok("host") | Err(std::env::VarError::NotPresent) => Ok(Self::Host),
             Ok("cuda") => {
                 #[cfg(feature = "cuda")]
                 {
-                    Self::Cuda(Box::new(
-                        tritium_cuda::CudaBackend::new(0).expect("TRITIUM_EVAL_DEVICE=cuda"),
-                    ))
+                    tritium_cuda::CudaBackend::new(0)
+                        .map(|backend| Self::Cuda(Box::new(backend)))
+                        .map_err(|error| format!("TRITIUM_EVAL_DEVICE=cuda: {error}"))
                 }
                 #[cfg(not(feature = "cuda"))]
-                panic!(
+                Err(
                     "TRITIUM_EVAL_DEVICE=cuda but this binary was built without --features cuda"
-                );
+                        .to_owned(),
+                )
             }
-            _ => Self::Host,
+            Ok(value) => Err(format!(
+                "unsupported TRITIUM_EVAL_DEVICE={value:?}; expected host or cuda"
+            )),
+            Err(error) => Err(format!("TRITIUM_EVAL_DEVICE is not valid UTF-8: {error:?}")),
         }
     }
 

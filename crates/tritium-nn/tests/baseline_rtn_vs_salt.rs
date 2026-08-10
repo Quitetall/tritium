@@ -6,7 +6,8 @@
 //! quantization, because that is what a deployed model is actually stored as.
 //!
 //! - **RTN** (round-to-nearest, group-wise asymmetric int-`b`): the standard baseline GPTQ/AWQ
-//!   improve upon. `bpw = b + 32/group` (f16 scale + f16 zero per group).
+//!   improve upon. `bpw = b + 32/group` (f16 scale + f16 zero per group), with
+//!   ragged final groups charged at their actual count.
 //! - **SALT ladder** `T` planes: balanced-ternary geometric ladder, one f16 anchor per group plus a
 //!   rotation bit, packed B3 (5 trits/byte) — `1.625` bpw per plane.
 //! - **SALT ITF** `T` planes: the previous free-scale fitter, kept as the "old fitter" control.
@@ -29,7 +30,10 @@
 
 mod common;
 
-use std::path::PathBuf;
+use std::fs::File;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use common::{Calib, Evaluator, calibrate, extract, fold};
 use tritium_format::salt_v2::SaltV2Codec;
@@ -52,19 +56,33 @@ const FOLD_ALPHA_DEFAULT: f64 = 0.75;
 /// Group size for this run. Both the RTN scales and the SALT groups use it, so a sweep moves the
 /// two baselines together and the comparison stays like-for-like.
 fn group() -> usize {
-    std::env::var("TRITIUM_GROUP")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|&g: &usize| g >= 8)
-        .unwrap_or(GROUP_DEFAULT)
+    match std::env::var("TRITIUM_GROUP") {
+        Ok(value) => {
+            let parsed = value
+                .parse::<usize>()
+                .unwrap_or_else(|_| panic!("TRITIUM_GROUP must be an integer >= 8, got {value:?}"));
+            assert!(parsed >= 8, "TRITIUM_GROUP must be >= 8, got {parsed}");
+            parsed
+        }
+        Err(std::env::VarError::NotPresent) => GROUP_DEFAULT,
+        Err(error) => panic!("TRITIUM_GROUP is not valid UTF-8: {error}"),
+    }
 }
 
 /// Salience-fold alpha for this run.
 fn fold_alpha() -> f64 {
-    std::env::var("TRITIUM_FOLD_ALPHA")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(FOLD_ALPHA_DEFAULT)
+    let alpha = match std::env::var("TRITIUM_FOLD_ALPHA") {
+        Ok(value) => value.parse::<f64>().unwrap_or_else(|_| {
+            panic!("TRITIUM_FOLD_ALPHA must be finite in [0, 1], got {value:?}")
+        }),
+        Err(std::env::VarError::NotPresent) => FOLD_ALPHA_DEFAULT,
+        Err(error) => panic!("TRITIUM_FOLD_ALPHA is not valid UTF-8: {error}"),
+    };
+    assert!(
+        alpha.is_finite() && (0.0..=1.0).contains(&alpha),
+        "TRITIUM_FOLD_ALPHA must be finite in [0, 1], got {alpha}"
+    );
+    alpha
 }
 const CALIB_WINDOWS: usize = 8;
 const CALIB_SEQ: usize = 512;
@@ -76,15 +94,103 @@ fn model_dir() -> PathBuf {
     PathBuf::from(dir)
 }
 
+fn corpus_path() -> PathBuf {
+    std::env::var("TRITIUM_CORPUS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            PathBuf::from(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tools/reference/heldout_corpus.json"
+            ))
+        })
+}
+
+fn hash_file(path: &Path) -> [u8; 32] {
+    let mut file =
+        File::open(path).unwrap_or_else(|error| panic!("open {}: {error}", path.display()));
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = vec![0u8; 1024 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .unwrap_or_else(|error| panic!("hash {}: {error}", path.display()));
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    *hasher.finalize().as_bytes()
+}
+
+fn hex_digest(digest: [u8; 32]) -> String {
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn git_head() -> String {
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("repo root");
+    let output = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo)
+        .output()
+        .expect("git rev-parse");
+    assert!(output.status.success(), "git rev-parse failed");
+    String::from_utf8(output.stdout)
+        .expect("git output")
+        .trim()
+        .to_owned()
+}
+
+fn model_manifest_digest(dir: &Path) -> String {
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
+        .unwrap_or_else(|error| panic!("read model directory {}: {error}", dir.display()))
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && (path.extension().is_some_and(|ext| ext == "safetensors")
+                    || matches!(
+                        path.file_name().and_then(|name| name.to_str()),
+                        Some(
+                            "config.json"
+                                | "tokenizer.json"
+                                | "tokenizer_config.json"
+                                | "model.safetensors.index.json"
+                        )
+                    ))
+        })
+        .collect();
+    paths.sort();
+    assert!(
+        !paths.is_empty(),
+        "model directory has no identity-bearing files"
+    );
+    let mut hasher = blake3::Hasher::new();
+    for path in paths {
+        hasher.update(
+            path.file_name()
+                .expect("model file name")
+                .to_string_lossy()
+                .as_bytes(),
+        );
+        hasher.update(&hash_file(&path));
+    }
+    hex_digest(*hasher.finalize().as_bytes())
+}
+
+fn optional_file_digest(path: &Path) -> String {
+    if path.is_file() {
+        hex_digest(hash_file(path))
+    } else {
+        "absent".to_owned()
+    }
+}
+
 /// `(train_ids, eval_ids)` — training ids feed calibration, eval ids score perplexity.
 fn corpus() -> (Vec<u32>, Vec<u32>) {
-    let path = std::env::var("TRITIUM_CORPUS").unwrap_or_else(|_| {
-        concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../tools/reference/heldout_corpus.json"
-        )
-        .to_string()
-    });
+    let path = corpus_path();
     let j: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&path).expect("corpus json")).expect("parse");
     let ids = |k: &str| -> Vec<u32> {
@@ -125,20 +231,58 @@ fn rtn_quantize(w: &[f32], rows: usize, cols: usize, bits: u32) -> Vec<f32> {
     out
 }
 
-/// bpw for group-wise int-`b`: the codes plus one f16 scale and one f16 zero per group.
-fn rtn_bpw(bits: u32) -> f64 {
-    f64::from(bits) + 32.0 / group() as f64
+fn parameter_count(shapes: &[(usize, usize)]) -> usize {
+    shapes.iter().map(|&(rows, cols)| rows * cols).sum()
 }
 
-/// bpw for `T` ladder planes: B3-packed trits, one f16 anchor per group, plus the rotation bit.
-fn ladder_bpw(t: usize) -> f64 {
-    ste::ternary_bits_per_weight_geometric(t, group(), SaltV2Codec::B3, group())
-        + 1.0 / group() as f64
+fn group_count(shapes: &[(usize, usize)]) -> usize {
+    shapes
+        .iter()
+        .map(|&(rows, cols)| rows * cols.div_ceil(group()))
+        .sum()
 }
 
-/// bpw for `T` free-scale (ITF) planes: B3-packed trits, one f16 scale **per plane** per group.
-fn itf_bpw(t: usize) -> f64 {
-    ste::ternary_bits_per_weight_codec(t, group(), SaltV2Codec::B3, group()) + 1.0 / group() as f64
+/// Physical B3 payload bits for one ternary plane, including each ragged tail.
+fn b3_payload_bits(shapes: &[(usize, usize)]) -> usize {
+    shapes
+        .iter()
+        .map(|&(rows, cols)| {
+            (0..rows)
+                .map(|_| {
+                    (0..cols)
+                        .step_by(group())
+                        .map(|start| {
+                            SaltV2Codec::B3
+                                .ledger((cols - start).min(group()))
+                                .expect("B3 ledger")
+                                .physical_bytes
+                                * 8
+                        })
+                        .sum::<usize>()
+                })
+                .sum::<usize>()
+        })
+        .sum()
+}
+
+/// bpw for group-wise int-`b`: codes plus one f16 scale and one f16 zero per
+/// actual group, including ragged final groups.
+fn rtn_bpw(bits: u32, shapes: &[(usize, usize)]) -> f64 {
+    f64::from(bits) + 32.0 * group_count(shapes) as f64 / parameter_count(shapes) as f64
+}
+
+/// bpw for `T` ladder planes: B3 payload, one f16 anchor per group, plus the
+/// rotation bit. Every term uses physical tail-aware counts.
+fn ladder_bpw(t: usize, shapes: &[(usize, usize)]) -> f64 {
+    (t * b3_payload_bits(shapes) + 16 * group_count(shapes) + group_count(shapes)) as f64
+        / parameter_count(shapes) as f64
+}
+
+/// bpw for `T` free-scale (ITF) planes: B3 payload plus one f16 scale per
+/// plane per actual group.
+fn itf_bpw(t: usize, shapes: &[(usize, usize)]) -> f64 {
+    (t * (b3_payload_bits(shapes) + 16 * group_count(shapes))) as f64
+        / parameter_count(shapes) as f64
 }
 
 /// One scored configuration.
@@ -164,16 +308,27 @@ fn salt_vs_rtn_quality_per_byte() {
     let (arch, fp, shapes) = extract(&runner);
     let (train, eval) = corpus();
 
-    let ev = Evaluator::from_env();
+    let ev = Evaluator::from_env().expect("valid TRITIUM_EVAL_DEVICE");
     let g = group();
     let alpha = fold_alpha();
+    let corpus = corpus_path();
+    println!(
+        "PROVENANCE git={} model_dir={} model_manifest_blake3={} tokenizer_blake3={} corpus={} corpus_blake3={} evaluator={} recipe=group:{g},fold_alpha:{alpha},window:{EVAL_WINDOW},calib_windows:{CALIB_WINDOWS},calib_seq:{CALIB_SEQ},grid:{GRID},iters:{ITERS},rotation:always",
+        git_head(),
+        dir.display(),
+        model_manifest_digest(&dir),
+        optional_file_digest(&dir.join("tokenizer.json")),
+        corpus.display(),
+        hex_digest(hash_file(&corpus)),
+        ev.label(),
+    );
 
     // Peak host memory is the binding constraint on a shared workstation, and it is knowable up
     // front. The arms below are ordered so at most TWO f32 copies of the model are live at once
     // (a source and the arm being scored) rather than three — see the `drop(fp)` below. Reported
     // so a run that would evict a co-tenant is visible before it starts rather than after the
     // kernel picks a victim.
-    let params: usize = shapes.iter().map(|&(n, k)| n * k).sum();
+    let params = parameter_count(&shapes);
     let copy_gib = params as f64 * 4.0 / (1024.0 * 1024.0 * 1024.0);
     eprintln!(
         "peak host weights ≈ {:.1} GiB ({params} params × f32 × 2 live copies)",
@@ -220,7 +375,12 @@ fn salt_vs_rtn_quality_per_byte() {
             .map(|(w, &(n, k))| rtn_quantize(w, n, k, bits))
             .collect();
         let ppl = ev.ppl(&q, &arch, &eval, EVAL_WINDOW);
-        score(format!("RTN int{bits} g{g}"), rtn_bpw(bits), ppl, false);
+        score(
+            format!("RTN int{bits} g{g}"),
+            rtn_bpw(bits, &shapes),
+            ppl,
+            false,
+        );
     }
 
     // Calibration and the fold happen HERE, after the unfolded arms are done, so that `fp` can be
@@ -249,7 +409,7 @@ fn salt_vs_rtn_quality_per_byte() {
         let ppl = ev.ppl(&q, &arch_folded, &eval, EVAL_WINDOW);
         score(
             format!("RTN int{bits} g{g} +fold"),
-            rtn_bpw(bits),
+            rtn_bpw(bits, &shapes),
             ppl,
             false,
         );
@@ -273,7 +433,12 @@ fn salt_vs_rtn_quality_per_byte() {
             })
             .collect();
         let ppl = ev.ppl(&q, &arch_folded, &eval, EVAL_WINDOW);
-        score(format!("SALT ladder T={t} +fold"), ladder_bpw(t), ppl, true);
+        score(
+            format!("SALT ladder T={t} +fold"),
+            ladder_bpw(t, &shapes),
+            ppl,
+            true,
+        );
     }
     for t in 1..=3 {
         let q: Vec<Vec<f32>> = fp_folded
@@ -284,7 +449,12 @@ fn salt_vs_rtn_quality_per_byte() {
             })
             .collect();
         let ppl = ev.ppl(&q, &arch_folded, &eval, EVAL_WINDOW);
-        score(format!("SALT ITF T={t} +fold"), itf_bpw(t), ppl, true);
+        score(
+            format!("SALT ITF T={t} +fold"),
+            itf_bpw(t, &shapes),
+            ppl,
+            true,
+        );
     }
 
     // ── Verdict: at matched-or-fewer bits, does ternary beat integer? ────────────────────────────

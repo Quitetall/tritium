@@ -612,11 +612,13 @@ mod tests {
     /// backend (identical trits + scale make every downstream op identical by
     /// construction; this catches any packing/eq drift).
     #[test]
+    #[ignore = "requires the external BitNet 2B4T GGUF; run explicitly for qualification"]
     fn repacked_tq1_model_loads_bit_identical() {
-        if !Path::new(&*GGUF).exists() {
-            eprintln!("skipping: {} absent (gated real-model test)", *GGUF);
-            return;
-        }
+        assert!(
+            Path::new(&*GGUF).exists(),
+            "real-model gate requires TRITIUM_MODEL_DIR/bitnet-b1.58-2B-4T.gguf at {}",
+            *GGUF
+        );
         let dir = std::env::temp_dir().join("tritium-repack-model-test");
         std::fs::create_dir_all(&dir).expect("mkdir");
         let tq1 = dir.join("bitnet-tq1.gguf");

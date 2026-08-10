@@ -204,16 +204,27 @@ fn load_projection(
         ))
     })?;
     packed.extend_from_slice(source);
-    let exact_scale = file
-        .metadata
-        .get(&format!("tritium.i2s_scale.{name}"))
-        .and_then(tritium_format::GgufValue::as_f32);
+    let exact_scale = exact_scale_metadata(file, name)?;
     Ok(Projection::Q2(Q2Linear::new_with_uniform_scale_override(
         packed,
         n_out,
         k_in,
         exact_scale,
     )?))
+}
+
+/// Read exporter-owned exact-scale metadata without silently accepting a
+/// malformed value as if the key were absent. A present key with the wrong
+/// GGUF type can only mean stale or corrupt provenance, so loading fails closed.
+fn exact_scale_metadata(file: &GgufFile, name: &str) -> Result<Option<f32>, NnError> {
+    let key = format!("tritium.i2s_scale.{name}");
+    match file.metadata.get(&key) {
+        None => Ok(None),
+        Some(value) => value
+            .as_f32()
+            .map(Some)
+            .ok_or_else(|| NnError::Backend(format!("{key} must be an F32 GGUF metadata value"))),
+    }
 }
 
 /// Load an I2_S, TQ1_0 or TQ2_0 tensor into a [`TernaryLinear`].
@@ -339,11 +350,7 @@ fn load_ternary(
                 }
                 return TernaryLinear::with_row_scales(backend, &trits, n_out, k_in, row_scales);
             }
-            let scale = match file
-                .metadata
-                .get(&format!("tritium.i2s_scale.{}", info.name))
-                .and_then(tritium_format::GgufValue::as_f32)
-            {
+            let scale = match exact_scale_metadata(file, &info.name)? {
                 Some(exact) => {
                     if let Some(sv) = tensor_scale {
                         let expect = f32::from(f16::from_f32(exact));
@@ -585,5 +592,21 @@ mod tests {
             .forward(&act, 1, &mut want)
             .expect("dense Q2_0 oracle");
         assert_eq!(got, want, "per-group Q2_0 scales must remain exact");
+    }
+
+    #[test]
+    fn malformed_exact_scale_metadata_refuses_load() {
+        let backend = tritium_cpu::CpuBackend::new();
+        let blob = gguf_with_q2("output.weight", 1, 256, &[1.0]);
+        let mut file = tritium_format::read_gguf(&blob).expect("parse Q2_0 GGUF");
+        file.metadata.insert(
+            "tritium.i2s_scale.output.weight".to_owned(),
+            tritium_format::GgufValue::String("stale".to_owned()),
+        );
+        let error = match load_projection(&file, &blob, &backend, "output.weight") {
+            Ok(_) => panic!("malformed exporter metadata must fail closed"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("must be an F32"));
     }
 }

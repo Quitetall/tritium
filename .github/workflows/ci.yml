@@ -469,9 +469,9 @@ jobs:
           path: "**/*.cdx.json"
           if-no-files-found: error
 
-  # Stable branch-protection target. This job remains unconditional and fails
-  # closed when any mandatory dependency fails, is cancelled, or is skipped.
-  # Configure `CI / ci-required` as required status check on main.
+  # Stable branch-protection target for jobs in this workflow. GitHub Actions
+  # cannot express `needs` across workflow files; require `docs-required` and
+  # `capstone-required` from their own workflows alongside this check.
   ci-required:
     name: ci-required
     if: ${{ always() }}

@@ -35,3 +35,22 @@ jobs:
           name: tritium-book
           path: docs/book/book/html
           if-no-files-found: error
+
+  # Cross-workflow jobs cannot be listed in ci.yml's `needs`; expose a stable
+  # always-reporting check so branch protection can require `docs-required`
+  # independently of the implementation job.
+  docs-required:
+    name: docs-required
+    if: ${{ always() }}
+    needs: [mdbook]
+    runs-on: ubuntu-latest
+    steps:
+      - name: fail closed on documentation result
+        env:
+          RESULT: ${{ needs.mdbook.result }}
+        run: |
+          if [ "$RESULT" != success ]; then
+            echo "documentation dependency not green: $RESULT"
+            exit 1
+          fi
+          echo "documentation dependency passed"

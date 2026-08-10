@@ -19,7 +19,7 @@ python -m pip install --disable-pip-version-check --only-binary=:all: \
   torch==2.11.0 --index-url https://download.pytorch.org/whl/cpu
 python -m pip install --disable-pip-version-check --only-binary=:all: \
   safetensors==0.8.0
-TRITIUM_WHEEL=./dist/tritium_torch-1.1.0rc0-cp39-abi3-PLATFORM.whl
+TRITIUM_WHEEL=./dist/tritium_torch-1.1.0rc1-cp39-abi3-PLATFORM.whl
 TRITIUM_SOURCE_REVISION=0000000000000000000000000000000000000000 # replace
 python -m pip install --isolated --disable-pip-version-check \
   --no-index --no-deps --only-binary=:all: "$TRITIUM_WHEEL"

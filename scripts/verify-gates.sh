@@ -15,6 +15,13 @@ run() {
     "$@"
 }
 
+require_command() {
+    command -v "$1" >/dev/null 2>&1 || {
+        echo "required command missing: $1" >&2
+        exit 1
+    }
+}
+
 repo=$(git rev-parse --show-toplevel)
 cd "$repo"
 
@@ -44,12 +51,15 @@ case "$tier" in
     ci)
         run cargo fmt --all --check
         run cargo clippy --workspace --all-targets -- -D warnings
-        run cargo test --workspace --exclude tritium-py --no-fail-fast
+        run cargo test --workspace --no-fail-fast
         ;;
     release)
         run cargo fmt --all --check
-        run cargo clippy --workspace --all-targets -- -D warnings
-        run cargo test --workspace --exclude tritium-py --no-fail-fast
+        # Type-check every feature-gated surface without requiring GPU toolkits.
+        run env TRITIUM_CHECK_ONLY=1 cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run cargo test --workspace --no-fail-fast
+        require_command cargo-deny
+        run cargo deny check
         run python scripts/check-release-version.py
         run ./scripts/check-semver.sh
         ;;
