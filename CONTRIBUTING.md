@@ -44,6 +44,11 @@ commit's tree** is versioned in `.githooks/`. Enable it once per clone:
 git config core.hooksPath .githooks
 ```
 
+The pre-commit hook runs `./scripts/verify-gates.sh precommit` against the
+staged tree. It checks staged whitespace and formatting without touching files
+or inspecting unrelated working-tree WIP. For explicit local tiers, run
+`./scripts/verify-gates.sh prepush`, `ci`, or `release`.
+
 It checks the commit being pushed, not your working tree, so uncommitted work
 never affects the verdict. `TRITIUM_PREPUSH_FMT_ONLY=1 git push` runs just the
 format check; `git push --no-verify` bypasses the hook entirely (CI still runs

@@ -1,0 +1,15 @@
+# Repository controls require maintainer review. Keep this file itself owned.
+/.github/                 @Quitetall
+/.githooks/               @Quitetall
+/Cargo.toml               @Quitetall
+/Cargo.lock               @Quitetall
+/rust-toolchain.toml      @Quitetall
+/deny.toml                @Quitetall
+/crates/tritium-format/   @Quitetall
+/crates/tritium-cuda/     @Quitetall
+/crates/tritium-rocm/     @Quitetall
+/crates/tritium-wgpu/     @Quitetall
+/crates/tritium-salt/     @Quitetall
+/crates/tritium-train/    @Quitetall
+/scripts/release*         @Quitetall
+/release/                 @Quitetall

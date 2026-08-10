@@ -94,8 +94,8 @@ jobs:
       matrix:
         crate: [tritium-cpu, tritium-ffi, tritium-format]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb
         with:
           components: rust-src
       - name: cargo test (ASan)
@@ -128,8 +128,8 @@ jobs:
       matrix:
         crate: [tritium-cpu, tritium-ffi]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb
         with:
           components: rust-src
       - name: cargo test (MSan)
@@ -159,8 +159,8 @@ jobs:
       matrix:
         crate: [tritium-cpu, tritium-ffi]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb
         with:
           components: rust-src
       - name: cargo test (TSan)
@@ -223,8 +223,8 @@ jobs:
       # wrong: proptest touches the FS even on success.)
       MIRIFLAGS: "-Zmiri-disable-isolation"
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb
         with:
           components: miri, rust-src
       # core: every test (it is tiny + pure).

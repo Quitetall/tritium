@@ -1,0 +1,5 @@
+#!/usr/bin/env sh
+# Fast staged-tree gate. Full tests remain CI/pre-push responsibilities.
+set -eu
+repo=$(git rev-parse --show-toplevel)
+exec "$repo/scripts/verify-gates.sh" precommit
