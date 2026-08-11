@@ -12,11 +12,29 @@ use core::cmp::Ordering;
 /// Returns `None` for empty logits.
 #[must_use]
 pub fn sample_greedy(logits: &[f32]) -> Option<u32> {
-    logits
-        .iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(Ordering::Less))
-        .map(|(i, _)| i as u32)
+    argmax_index(logits).map(|index| index as u32)
+}
+
+/// Return highest-index maximum while treating NaNs as losing values.
+///
+/// The explicit scan keeps tie and NaN behavior stable across Rust standard
+/// library versions; `Iterator::max_by` has changed its incomparable-value
+/// behavior over time. If every value is NaN, retain historical non-empty
+/// behavior by returning the first index.
+fn argmax_index(logits: &[f32]) -> Option<usize> {
+    if logits.is_empty() {
+        return None;
+    }
+    let mut best: Option<(usize, f32)> = None;
+    for (index, &value) in logits.iter().enumerate() {
+        if value.is_nan() {
+            continue;
+        }
+        if best.is_none_or(|(_, current)| value >= current) {
+            best = Some((index, value));
+        }
+    }
+    Some(best.map_or(0, |(index, _)| index))
 }
 
 /// `splitmix64`: a tiny, fast, well-distributed PRNG seeded by a single `u64`.
@@ -45,11 +63,8 @@ fn next_unit(state: &mut u64) -> f32 {
 /// non-empty slice, so the `expect` is unreachable in practice.
 #[inline]
 fn argmax(logits: &[f32]) -> u32 {
-    logits
-        .iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(Ordering::Less))
-        .map(|(i, _)| i as u32)
+    argmax_index(logits)
+        .map(|index| index as u32)
         .expect("argmax called on non-empty slice")
 }
 
@@ -242,7 +257,10 @@ mod tests {
     fn greedy_picks_argmax() {
         assert_eq!(sample_greedy(&[0.1, 0.9, 0.3, 0.2]), Some(1));
         assert_eq!(sample_greedy(&[]), None);
+        // Exact ties choose the highest index, matching device argmax.
+        assert_eq!(sample_greedy(&[0.5, 0.5]), Some(1));
         // NaN must not win.
         assert_eq!(sample_greedy(&[f32::NAN, 0.5]), Some(1));
+        assert_eq!(sample_greedy(&[f32::NAN, f32::NAN]), Some(0));
     }
 }

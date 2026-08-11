@@ -1,6 +1,6 @@
 [toolchain]
-# Build with current stable. MSRV (1.89 — AVX-512 intrinsics floor) is declared
-# per-crate via `rust-version` and enforced in CI, not pinned here.
-channel = "stable"
+# Pin release and CI builds to MSRV. This prevents compiler drift from changing
+# generated code or silently widening the accepted toolchain surface.
+channel = "1.89.0"
 components = ["rustfmt", "clippy"]
 # GPU/edge targets added per-backend; wasm + aarch64 land with those crates.

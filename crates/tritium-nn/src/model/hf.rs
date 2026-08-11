@@ -62,19 +62,14 @@ impl ModelWeights {
             }
         };
         // Every requested tensor is seek-read from its shard and widened exactly to fp32.
-        let weights = build_standard_model(
-            &config,
-            &spec,
-            NameSchema::Hf,
-            |name, request| get(name, request),
-            |name, n_out, k_in| {
+        let weights =
+            build_standard_model(&config, &spec, NameSchema::Hf, get, |name, n_out, k_in| {
                 Ok(Projection::Dense(DenseLinear::new_exact(
                     shards.tensor_f32_exact(name, &[n_out, k_in])?,
                     n_out,
                     k_in,
                 )?))
-            },
-        )?;
+            })?;
         Ok((config, spec, weights))
     }
 
@@ -175,7 +170,7 @@ impl ModelWeights {
             &spec,
             NameSchema::Hf,
             token_embd,
-            |name, request| provider(name, request),
+            provider,
             |name, n_out, k_in| {
                 Ok(Projection::Salt(SaltLinear::from_packed_matrix(
                     source.matrix(name, Some(n_out), k_in)?,
