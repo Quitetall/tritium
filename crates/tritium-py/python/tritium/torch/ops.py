@@ -291,6 +291,56 @@ def reference_ternary_linear(
     return F.linear(input, differentiable, bias)
 
 
+def _reference_ternary_linear_batched(
+    input: torch.Tensor, master: torch.Tensor, bias: Optional[torch.Tensor]
+) -> torch.Tensor:
+    """Batched reference path used only by the custom-op vmap rule."""
+
+    if input.ndim < 2 or master.ndim != 3:
+        raise ValueError("batched ternary_linear operands have invalid ranks")
+    if input.shape[0] != master.shape[0] or input.shape[-1] != master.shape[-1]:
+        raise ValueError("batched ternary_linear dimensions do not match")
+    if input.device != master.device or input.dtype != master.dtype:
+        raise ValueError("batched ternary_linear operands must share device and dtype")
+    if bias is not None and (
+        bias.ndim != 2
+        or bias.shape[0] != master.shape[0]
+        or bias.shape[1] != master.shape[1]
+        or bias.device != input.device
+        or bias.dtype != input.dtype
+    ):
+        raise ValueError("batched ternary_linear bias does not match operands")
+
+    accumulation_dtype = (
+        torch.float32 if master.dtype in {torch.float16, torch.bfloat16} else master.dtype
+    )
+    scales = (
+        master.detach()
+        .to(accumulation_dtype)
+        .abs()
+        .mean(dim=-1, keepdim=True)
+        .to(master.dtype)
+    )
+    safe_scales = scales.clamp_min(torch.finfo(master.dtype).tiny)
+    normalized = master / safe_scales
+    projected = normalized.round().clamp(-1.0, 1.0) * scales
+    if input.dtype != master.dtype:
+        output = torch.matmul(
+            input.float(), projected.float().transpose(-1, -2)
+        )
+        if bias is not None:
+            output = output + bias.float().view(
+                bias.shape[0], *([1] * (input.ndim - 2)), bias.shape[1]
+            )
+        return output.to(input.dtype)
+    output = torch.matmul(input, projected.transpose(-1, -2))
+    if bias is not None:
+        output = output + bias.view(
+            bias.shape[0], *([1] * (input.ndim - 2)), bias.shape[1]
+        )
+    return output
+
+
 def _native_cpu_supported(
     input: torch.Tensor, master: torch.Tensor, bias: Optional[torch.Tensor]
 ) -> bool:
@@ -435,6 +485,38 @@ def _ternary_linear_fake(
         torch._check(bias.dim() == 1)
         torch._check(bias.shape[0] == master.shape[0])
     return input.new_empty((*input.shape[:-1], master.shape[0]))
+
+
+def _ternary_linear_vmap(
+    info, in_dims, input: torch.Tensor, master: torch.Tensor, bias: Optional[torch.Tensor] = None
+):
+    """Batch the first-class op without falling through Python's generic vmap path."""
+
+    input_dim, master_dim, bias_dim = in_dims
+    batch_size = info.batch_size
+
+    def batched(value: torch.Tensor, dim: Optional[int], label: str) -> torch.Tensor:
+        if dim is None:
+            return value.unsqueeze(0).expand(batch_size, *value.shape)
+        moved = value.movedim(dim, 0)
+        if moved.shape[0] != batch_size:
+            raise ValueError(f"ternary_linear {label} batch dimension differs from vmap")
+        return moved
+
+    batched_input = batched(input, input_dim, "input")
+    batched_master = batched(master, master_dim, "master")
+    batched_bias = (
+        None if bias is None else batched(bias, bias_dim, "bias")
+    )
+    output = _reference_ternary_linear_batched(
+        batched_input, batched_master, batched_bias
+    )
+    return output, 0
+
+
+_register_vmap = getattr(torch.library, "register_vmap", None)
+if _register_vmap is not None:
+    _register_vmap(_ternary_linear_dispatch, _ternary_linear_vmap)
 
 
 def _setup_ternary_linear_context(ctx, inputs, output) -> None:

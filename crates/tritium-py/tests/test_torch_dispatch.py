@@ -434,6 +434,23 @@ def test_ternary_linear_supports_functorch_grad_and_vmap():
     )(samples)
     torch.testing.assert_close(actual, expected)
 
+    # The dispatcher itself is a public first-class op too. Its explicit rule
+    # must cover batched weights and bias, not only the common batched-input
+    # wrapper path.
+    batched_weight = torch.randn(5, 3, 4)
+    batched_bias = torch.randn(5, 3)
+    direct = torch.func.vmap(
+        lambda sample, master, bias: torch.ops.tritium.ternary_linear.default(
+            sample, master, bias
+        )
+    )(samples, batched_weight, batched_bias)
+    direct_expected = torch.stack(
+        [reference_ternary_linear(x_i, w_i, b_i) for x_i, w_i, b_i in zip(
+            samples, batched_weight, batched_bias
+        )]
+    )
+    torch.testing.assert_close(direct, direct_expected)
+
 
 def test_ternary_linear_supports_leading_dims_no_bias_and_cpu_autocast():
     x = torch.randn(2, 3, 4, requires_grad=True)
