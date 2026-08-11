@@ -412,6 +412,29 @@ def test_ternary_linear_opcheck_and_fullgraph_compile():
     assert torch.equal(compiled(x, weight, bias), ternary_linear(x, weight, bias))
 
 
+@pytest.mark.skipif(not hasattr(torch, "func"), reason="torch.func unavailable")
+def test_ternary_linear_supports_functorch_grad_and_vmap():
+    torch.manual_seed(17)
+    x = torch.randn(2, 4)
+    weight = torch.randn(3, 4)
+
+    def objective(master):
+        return ternary_linear(x, master).square().mean()
+
+    actual_grad = torch.func.grad(objective)(weight)
+    expected_grad = torch.func.grad(
+        lambda master: reference_ternary_linear(x, master).square().mean()
+    )(weight)
+    torch.testing.assert_close(actual_grad, expected_grad)
+
+    samples = torch.randn(5, 2, 4)
+    actual = torch.func.vmap(lambda sample: ternary_linear(sample, weight))(samples)
+    expected = torch.func.vmap(
+        lambda sample: reference_ternary_linear(sample, weight)
+    )(samples)
+    torch.testing.assert_close(actual, expected)
+
+
 def test_ternary_linear_supports_leading_dims_no_bias_and_cpu_autocast():
     x = torch.randn(2, 3, 4, requires_grad=True)
     weight = torch.randn(5, 4, requires_grad=True)

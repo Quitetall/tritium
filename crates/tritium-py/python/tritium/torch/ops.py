@@ -40,6 +40,21 @@ _NATIVE_CPU_BACKWARD = getattr(
 )
 
 
+def _functorch_transforms_active() -> bool:
+    """Return whether public execution is inside a ``torch.func`` transform.
+
+    PyTorch's generated autograd wrapper for ``torch.library.custom_op`` is not
+    itself transformable on every supported Torch release. The public helper
+    therefore uses the literal Torch reference while ``grad``/``vmap``/friends
+    are active; eager and ``torch.compile`` execution still use the native
+    dispatcher below. Keep this probe isolated so older Torch versions that do
+    not expose the private predicate retain the native path.
+    """
+
+    probe = getattr(torch._C, "_are_functorch_transforms_active", None)
+    return bool(probe()) if probe is not None else False
+
+
 class _CudaPackedLinear:
     __slots__ = (
         "owner",
@@ -623,6 +638,8 @@ def ternary_linear(
 ) -> torch.Tensor:
     """Hard ternary Linear with graph-visible CPU/CUDA autocast semantics."""
 
+    if _functorch_transforms_active():
+        return reference_ternary_linear(input, master, bias)
     if input.device.type == "cpu" and not torch.is_grad_enabled():
         native = _ternary_linear_cpu_native(input, master, bias)
         if native is not None:
