@@ -20,16 +20,18 @@
 //! - **Ownership.** [`tritium_model_load_file`] returns an owned handle the caller
 //!   must release with [`tritium_model_free`] (null-safe). Token IDs are copied
 //!   into a caller-owned buffer; Tritium frees nothing the caller passes in.
-//! - **Threading.** A `TritiumModel*` is `Send` (move it between threads) but **not
-//!   `Sync`**: do not call [`tritium_generate`] on the *same* handle from two
-//!   threads at once (it mutates the model's KV cache). Distinct handles are fully
-//!   independent and may run concurrently.
+//! - **Threading.** A `TritiumModel*` may be shared between threads. Generation
+//!   uses a nonblocking mutex: one call runs, while an overlapping call returns
+//!   [`TritiumStatus::Busy`] without touching the model's KV cache. Distinct
+//!   handles are fully independent and may run concurrently. Do not free a
+//!   handle while another call is using it.
 #![deny(missing_docs)]
 
 use std::cell::RefCell;
 use std::ffi::{CStr, CString, c_char};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
+use std::sync::{Mutex, TryLockError};
 
 // Force-link the CPU backend so its `linkme` registration is present for
 // `ModelRunner::load_cpu`.
@@ -97,12 +99,14 @@ pub enum TritiumStatus {
     /// crate is built with `panic = "unwind"`; under `panic = "abort"` (the
     /// default release/dist profile) a panic aborts the process instead.
     Panic = 5,
+    /// Another generation is already using this model handle.
+    Busy = 6,
 }
 
 /// Opaque handle to a loaded model (a `ModelRunner`). Created by
 /// [`tritium_model_load_file`], released by [`tritium_model_free`].
 pub struct TritiumModel {
-    runner: ModelRunner,
+    runner: Mutex<ModelRunner>,
 }
 
 impl std::fmt::Debug for TritiumModel {
@@ -162,7 +166,9 @@ pub unsafe extern "C" fn tritium_model_load_file(
             set_last_error(&format!("load model: {e}"));
             TritiumStatus::Load
         })?;
-        Ok(Box::into_raw(Box::new(TritiumModel { runner })))
+        Ok(Box::into_raw(Box::new(TritiumModel {
+            runner: Mutex::new(runner),
+        })))
     }));
     match outcome {
         Ok(Ok(handle)) => {
@@ -220,7 +226,9 @@ pub unsafe extern "C" fn tritium_model_load_bytes(
             set_last_error(&format!("load model: {e}"));
             TritiumStatus::Load
         })?;
-        Ok(Box::into_raw(Box::new(TritiumModel { runner })))
+        Ok(Box::into_raw(Box::new(TritiumModel {
+            runner: Mutex::new(runner),
+        })))
     }));
     match outcome {
         Ok(Ok(handle)) => {
@@ -286,8 +294,9 @@ pub struct TritiumGenerateOptions {
 /// point to `prompt_len` `u32`s (or be null iff `prompt_len == 0`); `out` must
 /// point to `out_cap` writable `u32`s (or be null iff `out_cap == 0`); `out_len`
 /// must be a valid writable `usize*`; `opts` must be null or point to a valid
-/// [`TritiumGenerateOptions`] of at least `opts->struct_size` bytes. Do not call
-/// concurrently on one `model`.
+/// [`TritiumGenerateOptions`] of at least `opts->struct_size` bytes. Concurrent
+/// calls on one `model` are safe; one succeeds while overlapping calls return
+/// [`TritiumStatus::Busy`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tritium_generate(
     model: *mut TritiumModel,
@@ -327,15 +336,28 @@ pub unsafe extern "C" fn tritium_generate(
             set_last_error("a required pointer argument was null");
             return TritiumStatus::NullArg;
         }
-        // SAFETY: non-null per the check; caller guarantees a live, exclusively-held handle.
-        let model = unsafe { &mut *model };
+        // SAFETY: non-null per the check; caller guarantees a live handle. The
+        // mutex provides interior mutability and prevents concurrent mutable
+        // access to the runner/KV cache.
+        let model = unsafe { &*model };
+        let mut runner = match model.runner.try_lock() {
+            Ok(runner) => runner,
+            Err(TryLockError::WouldBlock) => {
+                set_last_error("model is already generating");
+                return TritiumStatus::Busy;
+            }
+            Err(TryLockError::Poisoned(_)) => {
+                set_last_error("model generation mutex is poisoned");
+                return TritiumStatus::Generate;
+            }
+        };
         let prompt_slice = if prompt_len == 0 {
             &[][..]
         } else {
             // SAFETY: non-null + len checked; caller guarantees `prompt_len` valid u32s.
             unsafe { std::slice::from_raw_parts(prompt, prompt_len) }
         };
-        let tokens = match model.runner.generate(prompt_slice, max_new as usize, eos) {
+        let tokens = match runner.generate(prompt_slice, max_new as usize, eos) {
             Ok(t) => t,
             Err(e) => {
                 set_last_error(&format!("generate: {e}"));

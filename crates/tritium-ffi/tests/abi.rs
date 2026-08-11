@@ -25,6 +25,13 @@ fn abi_version_matches_constant() {
 }
 
 #[test]
+fn model_handle_is_shareable_and_busy_status_is_stable() {
+    fn assert_sync<T: Sync>() {}
+    assert_sync::<TritiumModel>();
+    assert_eq!(TritiumStatus::Busy as i32, 6);
+}
+
+#[test]
 fn version_is_nonnull_and_matches_crate() {
     let p = tritium_version();
     assert!(!p.is_null());

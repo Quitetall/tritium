@@ -40,6 +40,8 @@ enum TritiumStatus
     // crate is built with `panic = "unwind"`; under `panic = "abort"` (the
     // default release/dist profile) a panic aborts the process instead.
     TritiumStatus_Panic = 5,
+    // Another generation is already using this model handle.
+    TritiumStatus_Busy = 6,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
@@ -141,8 +143,9 @@ struct TritiumModel *tritium_model_load_bytes(const uint8_t *data,
 // point to `prompt_len` `u32`s (or be null iff `prompt_len == 0`); `out` must
 // point to `out_cap` writable `u32`s (or be null iff `out_cap == 0`); `out_len`
 // must be a valid writable `usize*`; `opts` must be null or point to a valid
-// [`TritiumGenerateOptions`] of at least `opts->struct_size` bytes. Do not call
-// concurrently on one `model`.
+// [`TritiumGenerateOptions`] of at least `opts->struct_size` bytes. Concurrent
+// calls on one `model` are safe; one succeeds while overlapping calls return
+// [`TritiumStatus::Busy`].
 TritiumStatus tritium_generate(struct TritiumModel *model,
                                const uint32_t *prompt,
                                size_t prompt_len,
