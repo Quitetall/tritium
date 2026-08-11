@@ -498,7 +498,16 @@ def _ternary_linear_vmap(
 ):
     """Batch the first-class op without falling through Python's generic vmap path."""
 
-    input_dim, master_dim, bias_dim = in_dims
+    # Dispatcher vmap metadata omits trailing optional arguments that were not
+    # supplied at the call site. Normalize both ``(input, master)`` and
+    # ``(input, master, bias)`` forms before applying batch dimensions.
+    if len(in_dims) == 2:
+        input_dim, master_dim = in_dims
+        bias_dim = None
+    elif len(in_dims) == 3:
+        input_dim, master_dim, bias_dim = in_dims
+    else:  # pragma: no cover - dispatcher owns this contract
+        raise ValueError("ternary_linear vmap metadata has invalid arity")
     batch_size = info.batch_size
 
     def batched(value: torch.Tensor, dim: Optional[int], label: str) -> torch.Tensor:

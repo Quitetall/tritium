@@ -464,6 +464,18 @@ def test_ternary_linear_supports_functorch_grad_and_vmap():
     )
     torch.testing.assert_close(vector_direct, vector_expected)
 
+    direct_no_bias = torch.func.vmap(
+        lambda sample, master: torch.ops.tritium.ternary_linear.default(
+            sample, master
+        )
+    )(vector_samples, batched_weight)
+    no_bias_expected = torch.stack(
+        [reference_ternary_linear(x_i, w_i) for x_i, w_i in zip(
+            vector_samples, batched_weight
+        )]
+    )
+    torch.testing.assert_close(direct_no_bias, no_bias_expected)
+
 
 def test_ternary_linear_supports_leading_dims_no_bias_and_cpu_autocast():
     x = torch.randn(2, 3, 4, requires_grad=True)
