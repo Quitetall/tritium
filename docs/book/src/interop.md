@@ -31,6 +31,14 @@ backpressure, shutdown — is proven **model-free** through `MockGenerator`, so 
 runs on CPU in CI with no model. The real-model end-to-end path is a manual lane
 gated on a GGUF being present.
 
+Every authenticated request receives bounded `x-request-id` and W3C
+`traceparent` response headers. A valid incoming `traceparent` keeps its trace ID
+and receives a new server span; malformed context is discarded. The server emits
+one structured JSON `http_request` event per request with fixed route/method
+classes, status, stable `error_code`, request/trace/span IDs, and duration. It
+never logs prompts, completions, bearer tokens, paths, or model text. Request IDs
+and trace IDs are correlation handles only; they are not metric labels.
+
 ```sh
 cargo test -p tritium-serve --features serve     # the model-free contract suite
 ```

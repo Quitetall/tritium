@@ -935,6 +935,19 @@ fn status_class(status: StatusCode) -> &'static str {
     }
 }
 
+fn error_code(status: StatusCode) -> &'static str {
+    match status {
+        StatusCode::UNAUTHORIZED => "invalid_authentication",
+        StatusCode::BAD_REQUEST => "invalid_request",
+        StatusCode::REQUEST_TIMEOUT => "request_timeout",
+        StatusCode::TOO_MANY_REQUESTS => "rate_limit_exceeded",
+        StatusCode::SERVICE_UNAVAILABLE => "service_unavailable",
+        status if status.is_success() => "none",
+        status if status.is_client_error() => "client_error",
+        _ => "server_error",
+    }
+}
+
 fn finish_request(
     mut response: Response,
     identity: &RequestIdentity,
@@ -952,14 +965,16 @@ fn finish_request(
         HeaderValue::from_str(&identity.traceparent()).expect("traceparent is valid header value"),
     );
     eprintln!(
-        "{{\"event\":\"http_request\",\"request_id\":\"{}\",\"trace_id\":\"{}\",\"route\":\"{}\",\"method\":\"{}\",\"status\":{},\"duration_us\":{},\"status_class\":\"{}\"}}",
+        "{{\"event\":\"http_request\",\"request_id\":\"{}\",\"trace_id\":\"{}\",\"span_id\":\"{}\",\"route\":\"{}\",\"method\":\"{}\",\"status\":{},\"duration_us\":{},\"status_class\":\"{}\",\"error_code\":\"{}\"}}",
         identity.request_id,
         identity.trace_id,
+        identity.span_id,
         route,
         method,
         status.as_u16(),
         started.elapsed().as_micros(),
         status_class(status),
+        error_code(status),
     );
     response
 }
