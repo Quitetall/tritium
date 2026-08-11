@@ -87,6 +87,10 @@ jobs:
         run: python -m unittest scripts.tests.test_verify_wheel -v
       - name: build abi3 wheel
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b
+        env:
+          # Build metadata must remain authenticated even when maturin's
+          # manylinux container does not receive the checkout's .git directory.
+          TRITIUM_SOURCE_ID: source-git:${{ github.sha }}
         with:
           # The crate lives in the workspace; point maturin at its manifest.
           # --release for distributable artifacts; the abi3 feature comes from
