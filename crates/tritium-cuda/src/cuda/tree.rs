@@ -1430,6 +1430,7 @@ impl CudaDecodeModel {
             for li in 0..self.layers.len() {
                 for arena in [&mut batch.kv_k[li], &mut batch.kv_v[li]] {
                     let (base, guard) = arena.device_ptr(s);
+                    #[allow(unsafe_code)]
                     // SAFETY: one dtod within the live batch arena; src/dst
                     // are row-aligned, equal-length, DISJOINT byte ranges —
                     // node > k gives distinct logical rows, and dense base-add
@@ -1438,7 +1439,6 @@ impl CudaDecodeModel {
                     // physical rows inside the allocation (the forward's
                     // overflow + reservation guards bound them); ordered on
                     // this stream.
-                    #[allow(unsafe_code)]
                     unsafe {
                         result::memcpy_dtod_async(
                             base + dst as sys::CUdeviceptr,
@@ -1487,10 +1487,10 @@ impl CudaDecodeModel {
             for li in 0..self.layers.len() {
                 for arena in [&mut self.kv_k[li], &mut self.kv_v[li]] {
                     let (base, guard) = arena.device_ptr(s);
+                    #[allow(unsafe_code)]
                     // SAFETY: one dtod within a live arena; src/dst are
                     // row-aligned, equal-length, disjoint (node > k) byte
                     // ranges inside the allocation; ordered on this stream.
-                    #[allow(unsafe_code)]
                     unsafe {
                         result::memcpy_dtod_async(
                             base + dst as sys::CUdeviceptr,
@@ -1507,9 +1507,9 @@ impl CudaDecodeModel {
                     let s_dst = (self.cache_len + k) * sc_row * 4;
                     for arena in [&mut self.kv_k_scales[li], &mut self.kv_v_scales[li]] {
                         let (base, guard) = arena.device_ptr(s);
+                        #[allow(unsafe_code)]
                         // SAFETY: as above — f32 arena addressed in bytes
                         // (offsets ×4), disjoint row-aligned ranges.
-                        #[allow(unsafe_code)]
                         unsafe {
                             result::memcpy_dtod_async(
                                 base + s_dst as sys::CUdeviceptr,
@@ -1880,12 +1880,12 @@ impl CudaDecodeModel {
                 kv_append(d_v, lp.kv_v)?;
                 attn(lp.kv_k, lp.kv_v)?;
                 if let Some(dp) = dump_ptr {
+                    #[allow(unsafe_code)]
                     // SAFETY: dtod within live allocations — d_attn holds
                     // mb·q_width valid f32s after attn(); layer li's dump
                     // slice starts at li·dump_stride and holds m_cap·q_width
                     // ≥ mb·q_width elements (disjoint per layer); ordered on
                     // the capture stream (recorded as a graph memcpy node).
-                    #[allow(unsafe_code)]
                     unsafe {
                         result::memcpy_dtod_async(
                             dp + (li * dump_stride * 4) as sys::CUdeviceptr,

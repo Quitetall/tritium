@@ -3161,8 +3161,8 @@ fn gqa_attention_batch_v3_matches_rev1_bitwise() {
                         .arg(&scale)
                         .arg(&co_i)
                         .arg(&m_i);
-                    // SAFETY: rev-1 batch signature, ctx_max == ctx_end stride.
                     #[allow(unsafe_code)]
+                    // SAFETY: rev-1 batch signature, ctx_max == ctx_end stride.
                     unsafe {
                         l1.launch(cfg1).expect("rev1")
                     };
@@ -3179,8 +3179,8 @@ fn gqa_attention_batch_v3_matches_rev1_bitwise() {
                         .arg(&scale)
                         .arg(&co_i)
                         .arg(&m_i);
-                    // SAFETY: v3 signature (same as rev-1's).
                     #[allow(unsafe_code)]
+                    // SAFETY: v3 signature (same as rev-1's).
                     unsafe {
                         l3.launch(cfg3).expect("v3")
                     };

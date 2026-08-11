@@ -1291,7 +1291,8 @@ fn hestia_device_forward_matches_cpu_oracle_and_master_gradients() {
     let mut max_gradient_error = 0.0_f32;
     for (parameter_index, parameter) in model.parameters().iter().enumerate() {
         let actual = gradients.download(&backend, parameter_index).unwrap();
-        for element_index in 0..parameter.elements() {
+        debug_assert_eq!(actual.len(), parameter.elements());
+        for (element_index, _) in actual.iter().enumerate().take(parameter.elements()) {
             let mut plus = host_masters.clone();
             plus[parameter_index][element_index] += epsilon;
             let plus_loss = mean_cross_entropy(

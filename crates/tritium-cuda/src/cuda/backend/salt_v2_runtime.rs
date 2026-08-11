@@ -139,10 +139,10 @@ impl CudaBackend {
             shared_mem_bytes: 0,
         };
         let mut launch = self.stream.launch_builder(&self.func_qualification_poison);
+        #[allow(unsafe_code)]
         // SAFETY: qualification kernel has no parameters and exactly one thread.
         // Its intentional `trap` is destructive to this CUDA context, not host
         // memory. Caller must replace the serving process after this returns.
-        #[allow(unsafe_code)]
         unsafe { launch.launch(cfg) }.map_err(|error| {
             BackendError::Backend(format!(
                 "destructive CUDA context-loss qualification trap did not launch: {error}"

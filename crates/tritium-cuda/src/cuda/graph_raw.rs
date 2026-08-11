@@ -145,11 +145,11 @@ pub(super) struct RawGraphKernels {
     pub(super) tq1_tiled_scaled_residual: sys::CUfunction,
 }
 
+#[allow(unsafe_code)]
 // SAFETY: the raw `CUmodule`/`CUfunction` are process-valid device handles, used only on
 // the owning `CudaDecodeModel`'s single capture stream (never concurrently across
 // threads — `CudaGraph` is itself documented not-thread-safe, so the whole graph path is
 // single-threaded by construction).
-#[allow(unsafe_code)]
 unsafe impl Send for RawGraphKernels {}
 
 impl RawGraphKernels {
@@ -348,6 +348,7 @@ pub(super) struct BatchRawKernels {
     pub(super) attn_tree_fused_slots_paged: sys::CUfunction,
 }
 
+#[allow(unsafe_code)]
 // SAFETY: same contract as `RawGraphKernels` — the raw handles are process-valid device
 // handles used only on the owning model's single capture stream, never concurrently across
 // threads (the graph path is single-threaded by construction). `Sync` (which `RawGraphKernels`
@@ -355,11 +356,10 @@ pub(super) struct BatchRawKernels {
 // these behind an `Arc` (shared with each `BatchKv`), and `Arc<T>: Send` needs `T: Send + Sync`;
 // it is sound for the same reason — the handles are immutable after `load` and never touched
 // off the single capture stream.
-#[allow(unsafe_code)]
 unsafe impl Send for BatchRawKernels {}
+#[allow(unsafe_code)]
 // SAFETY: as above — the handles are immutable after `load` and only ever used on the single
 // capture stream, so concurrent shared (`&`) access across threads observes nothing mutable.
-#[allow(unsafe_code)]
 unsafe impl Sync for BatchRawKernels {}
 
 impl BatchRawKernels {

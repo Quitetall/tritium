@@ -124,13 +124,13 @@ impl CudaDecodeModel {
                     // element offsets → byte pointer offsets ×kv_elem.
                     let dst_ptr = dst_base + (dst_off * self.kv_elem) as sys::CUdeviceptr;
                     let src_ptr = src_base + (src_off * self.kv_elem) as sys::CUdeviceptr;
+                    #[allow(unsafe_code)]
                     // SAFETY: raw byte copy between live device allocations on
                     // this model's stream: src holds the single-seq arena's
                     // rows [src_off, src_off+count) and dst the slot's mapped
                     // span (dense row or a reserved page); sizes checked above
                     // and by the span construction; both arenas share this
                     // model's kv_elem.
-                    #[allow(unsafe_code)]
                     unsafe {
                         result::memcpy_dtod_async(
                             dst_ptr,

@@ -42,7 +42,7 @@ pub use burn_op::{BurnTernaryError, ternary_mpgemm};
 mod burn_op {
     use core::fmt;
 
-    use burn_tensor::{DType, Tensor, TensorData, backend::Backend};
+    use burn_tensor::{Tensor, TensorData, backend::Backend};
     use half::f16;
     use tritium_core::{GemmShape, TernaryFormat, Trit, reference_mpgemm};
     use tritium_format::{
@@ -207,11 +207,11 @@ mod burn_op {
         reference_mpgemm(&acts, &trits, scales, GemmShape { m, n, k }, &mut out)
             .map_err(|e| BurnTernaryError::Kernel(format!("{e}")))?;
 
-        // Pin the result to f32 (via the (&device, DType) creation options) so it
-        // is not silently downcast on a backend whose default float dtype is half.
+        // TensorData constructed from Vec<f32> preserves f32 output on Burn 0.20's
+        // backend-neutral constructor; do not rely on backend default float dtype.
         Ok(Tensor::<B, 2>::from_data(
             TensorData::new(out, [m, n]),
-            (&device, DType::F32),
+            &device,
         ))
     }
 

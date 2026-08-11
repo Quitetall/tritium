@@ -103,13 +103,13 @@ impl ExternalCudaKernels {
     }
 }
 
+#[allow(unsafe_code)]
 // SAFETY: handles are immutable process-valid driver handles. CUDA Driver API
 // permits launches from multiple host threads; each call supplies and validates
 // its own stream. Module unload happens only after owning backend is dropped.
-#[allow(unsafe_code)]
 unsafe impl Send for ExternalCudaKernels {}
-// SAFETY: same invariant; shared access mutates no Rust memory.
 #[allow(unsafe_code)]
+// SAFETY: same invariant; shared access mutates no Rust memory.
 unsafe impl Sync for ExternalCudaKernels {}
 
 impl ExternalCudaKernels {
@@ -317,9 +317,9 @@ impl CudaBackend {
             return Ok(raw);
         }
         let mut stream_ctx = std::ptr::null_mut();
+        #[allow(unsafe_code)]
         // SAFETY: `raw` is not dereferenced by Rust; driver validates handle and
         // writes one CUcontext into live storage.
-        #[allow(unsafe_code)]
         unsafe { sys::cuStreamGetCtx(raw, &mut stream_ctx).result() }
             .map_err(|error| driver_err("external stream context query", &error))?;
         if stream_ctx != ctx.cu_ctx() {
@@ -346,9 +346,9 @@ impl CudaBackend {
         let mut pointer_ctx = std::ptr::null_mut();
         let mut range_start: sys::CUdeviceptr = 0;
         let mut range_size = 0usize;
+        #[allow(unsafe_code)]
         // SAFETY: output variables have attribute-matching types and remain
         // live. Driver validates `ptr`; no pointed-to tensor memory is read.
-        #[allow(unsafe_code)]
         unsafe {
             sys::cuPointerGetAttribute(
                 (&mut pointer_ctx as *mut sys::CUcontext).cast(),

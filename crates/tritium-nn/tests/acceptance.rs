@@ -1663,7 +1663,7 @@ fn cuda_tree_verify_slots_f16_matches_sequential() {
         if legs[0].is_empty() || legs[1].is_empty() {
             return; // no device
         }
-        for r in 0..3 {
+        for (r, want) in wants.iter().enumerate().take(3) {
             assert_eq!(
                 legs[0][r].0, legs[1][r].0,
                 "f16 slots (paged={paged}) batched != sequential committed tokens at slot {r}"
@@ -1673,10 +1673,10 @@ fn cuda_tree_verify_slots_f16_matches_sequential() {
                 "f16 slots (paged={paged}) batched != sequential promoted KV bytes at slot {r}"
             );
             // Losslessness within the rung: committed == plain f16 greedy.
-            let n_tok = legs[0][r].0.len().min(wants[r].len());
+            let n_tok = legs[0][r].0.len().min(want.len());
             assert_eq!(
                 &legs[0][r].0[..n_tok],
-                &wants[r][..n_tok],
+                &want[..n_tok],
                 "f16 slots (paged={paged}) slot {r}: committed stream != plain f16 greedy"
             );
         }
