@@ -17,9 +17,17 @@
 //! Every published ladder number is measured under the AWQ-style salience fold (α = 0.75). Scoring
 //! a folded ladder against *unfolded* RTN would compare our best configuration against the
 //! baseline's weakest, and the fold — not ternary — could be doing the work. So RTN is run **both
-//! ways**: unfolded (plain RTN) and folded (activation-aware, i.e. AWQ-like). The headline
-//! comparison is folded-vs-folded; the unfolded RTN row is kept so the fold's own contribution is
-//! visible rather than hidden inside our column.
+//! ways**: unfolded (plain RTN) and folded (activation-aware, i.e. AWQ-like).
+//!
+//! **The verdict scores against `min(folded, unfolded)` — the best RTN can do at each width — not
+//! against folded by default.** Folded-vs-folded looks like the fair choice and at `g128` it is
+//! conservative, because the fold HELPS RTN there (int4 23.225 → 21.980). But the fold is not a
+//! universal gain: at `g256` it HURTS (int4 26.029 → 28.887, int5 16.737 → 17.236), since it widens
+//! within-group dynamic range that RTN's min/max scaling already struggles to cover at that width.
+//! Measuring against a handicapped baseline would manufacture a domination out of the baseline's
+//! bad configuration. Taking the min can only weaken our own claims, which is the direction an
+//! honest verdict errs in. Both rows stay in the table so the fold's contribution is visible on
+//! each side rather than hidden inside one column.
 //!
 //! `#[ignore]`d; run:
 //! ```text
@@ -229,6 +237,32 @@ fn rtn_quantize(w: &[f32], rows: usize, cols: usize, bits: u32) -> Vec<f32> {
         }
     }
     out
+}
+
+/// The best RTN configuration at each bit width — folded or unfolded, whichever scores lower.
+///
+/// The two share a bpw (the fold is a reparameterization, not a rate change), so "best" is simply
+/// the lower perplexity. This is the baseline a real deployment would pick, and therefore the only
+/// honest thing for a ternary arm to be measured against.
+fn best_rtn(rows: &[Row]) -> Vec<Row> {
+    let mut best: Vec<Row> = Vec::new();
+    for r in rows.iter().filter(|r| !r.ternary) {
+        // Rows at equal bpw are the same integer width; keep the better-scoring one.
+        match best.iter_mut().find(|b| (b.bpw - r.bpw).abs() < 1e-9) {
+            Some(b) if r.ppl < b.ppl => {
+                b.name = r.name.clone();
+                b.ppl = r.ppl;
+            }
+            Some(_) => {}
+            None => best.push(Row {
+                name: r.name.clone(),
+                bpw: r.bpw,
+                ppl: r.ppl,
+                ternary: false,
+            }),
+        }
+    }
+    best
 }
 
 fn parameter_count(shapes: &[(usize, usize)]) -> usize {
@@ -458,11 +492,21 @@ fn salt_vs_rtn_quality_per_byte() {
     }
 
     // ── Verdict: at matched-or-fewer bits, does ternary beat integer? ────────────────────────────
-    println!("\n--- quality-per-byte verdict (vs FOLDED RTN — like against like) ---");
-    let rivals: Vec<&Row> = rows
-        .iter()
-        .filter(|r| r.name.starts_with("RTN") && r.name.ends_with("+fold"))
-        .collect();
+    //
+    // The rival is the BEST RTN configuration at each bit width — folded or unfolded, whichever
+    // scores lower — not "folded" by default.
+    //
+    // Scoring against folded-only looked like the fair choice (our arms are folded, so folded-vs-
+    // folded is like against like) and at g128 it is conservative: the fold HELPS RTN there
+    // (int4 23.225 -> 21.980), so folded is already the baseline's better face. But the fold is not
+    // a universal gain. At g256 it HURTS — int4 26.029 -> 28.887, int5 16.737 -> 17.236 — because
+    // the fold widens within-group dynamic range that RTN's min/max scaling is already struggling
+    // to cover at that width. Comparing against a handicapped baseline would manufacture a
+    // domination out of the baseline's bad configuration, precisely where we most want the claim
+    // to be trustworthy. Taking the min can only ever weaken our result, which is the direction an
+    // honest verdict should err in.
+    println!("\n--- quality-per-byte verdict (vs the BEST RTN config: min(folded, unfolded)) ---");
+    let rivals: Vec<Row> = best_rtn(&rows);
     let mut ternary_wins = 0usize;
     let mut ternary_total = 0usize;
     for r in rows.iter().filter(|r| r.ternary) {
@@ -497,10 +541,7 @@ fn salt_vs_rtn_quality_per_byte() {
     // scrutiny: no cheaper-or-equal point is also better-or-equal. Report both directions, because
     // an arm being dominated is the result that would sink the thesis.
     println!("\n--- strict Pareto check (dominate = no worse on BOTH bpw and ppl) ---");
-    let folded_rtn: Vec<&Row> = rows
-        .iter()
-        .filter(|r| r.name.starts_with("RTN") && r.name.ends_with("+fold"))
-        .collect();
+    let folded_rtn: Vec<&Row> = rivals.iter().collect();
     let eps = 1e-9;
     for r in rows.iter().filter(|r| r.ternary) {
         let dominated_by: Vec<&str> = folded_rtn
