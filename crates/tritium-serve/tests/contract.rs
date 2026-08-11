@@ -1461,6 +1461,30 @@ async fn metrics_exposition() {
         text.contains("tritium_time_to_first_token_seconds_count 2\n"),
         "{text}"
     );
+    assert!(
+        text.contains("# TYPE tritium_queue_wait_seconds histogram"),
+        "{text}"
+    );
+    assert!(
+        text.contains("tritium_queue_wait_seconds_count 2\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("# TYPE tritium_prefill_duration_seconds histogram"),
+        "{text}"
+    );
+    assert!(
+        text.contains("tritium_prefill_duration_seconds_count 2\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("# TYPE tritium_decode_duration_seconds histogram"),
+        "{text}"
+    );
+    assert!(
+        text.contains("tritium_decode_duration_seconds_count 2\n"),
+        "{text}"
+    );
     // The scrape itself is inside middleware, so one request is in flight.
     assert!(text.contains("tritium_requests_inflight 1\n"), "{text}");
     assert!(text.contains("tritium_generations_active 0\n"), "{text}");

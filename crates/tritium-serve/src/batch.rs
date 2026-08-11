@@ -101,6 +101,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::time::Instant;
 
 use tokio::sync::mpsc;
 
@@ -108,7 +109,7 @@ use crate::generator::{
     DraftPolicy, FinishReason, GenRequest, SPEC_COMMITTED, SPEC_COST, SPEC_VERIFIES, Sampling,
     SpecGovernor, draft_chain_from_env, draft_greedy_tokens,
 };
-use crate::worker::{GenEvent, Job, PHASE_DECODE, PHASE_IDLE, PHASE_PREFILL};
+use crate::worker::{GenEvent, Job, PHASE_DECODE, PHASE_IDLE, PHASE_PREFILL, WorkerTelemetry};
 
 /// Default prompt tokens per prefill chunk during admission (C1). 128 bounds a
 /// live slot's inter-token gap to one ~128-token prefill + one decode step.
@@ -136,6 +137,8 @@ fn prefill_chunk() -> Result<usize, String> {
 struct Pending {
     /// Prompt tokens already prefilled.
     done: usize,
+    /// Monotonic start used for bounded prefill timing.
+    started_at: Instant,
     goal: PendingGoal,
 }
 
@@ -573,6 +576,7 @@ fn migrate_spec(
     req.max_new = remaining;
     Some(Pending {
         done: 0,
+        started_at: Instant::now(),
         goal: PendingGoal::Admit {
             tx: s.tx,
             req,
@@ -1202,6 +1206,7 @@ pub(crate) fn run_batched(
     mut job_rx: mpsc::Receiver<Job>,
     draining: Arc<AtomicBool>,
     phase: Arc<AtomicU8>,
+    telemetry: Arc<WorkerTelemetry>,
 ) {
     struct PhaseGuard(Arc<AtomicU8>);
     impl Drop for PhaseGuard {
@@ -1386,7 +1391,14 @@ pub(crate) fn run_batched(
                 continue;
             }
             match job {
-                Job::Generate { req, tx } => {
+                Job::Generate {
+                    req,
+                    mut accepted_at,
+                    tx,
+                } => {
+                    if let Some(accepted_at) = accepted_at.take() {
+                        telemetry.observe_queue_wait(accepted_at.elapsed());
+                    }
                     let prompt_len = req.prompt_tokens.len();
                     if prompt_len == 0 || prompt_len + 1 >= n_ctx {
                         let _ = tx.try_send(GenEvent::Error("prompt does not fit".into()));
@@ -1414,7 +1426,11 @@ pub(crate) fn run_batched(
                         assert!(parked.is_none(), "parked job during solo spec");
                         pending = migrate_spec(s, &mut runner, &mut batch, draft.as_mut(), &pool);
                         if pending.is_some() {
-                            parked = Some(Job::Generate { req, tx });
+                            parked = Some(Job::Generate {
+                                req,
+                                accepted_at,
+                                tx,
+                            });
                             continue; // pending set: the continuation prefills first
                         }
                         // Defensive migration failure (stream already
@@ -1454,6 +1470,7 @@ pub(crate) fn run_batched(
                                 }
                                 pending = Some(Pending {
                                     done: 0,
+                                    started_at: Instant::now(),
                                     goal: PendingGoal::SpecAdmit {
                                         tx,
                                         req,
@@ -1474,7 +1491,11 @@ pub(crate) fn run_batched(
                     // is pulled past a parked job; it is retried as soon as a
                     // retirement frees a slot).
                     let Some(row) = pool.iter().position(Option::is_none) else {
-                        parked = Some(Job::Generate { req, tx });
+                        parked = Some(Job::Generate {
+                            req,
+                            accepted_at,
+                            tx,
+                        });
                         break;
                     };
                     // Paged KV (C3): reserve the request's whole footprint up
@@ -1500,7 +1521,11 @@ pub(crate) fn run_batched(
                         // reserve_pages ever grows another error kind, match
                         // on it — a permanent error would park-loop.
                         if batch.reserve_pages(row, needed).is_err() {
-                            parked = Some(Job::Generate { req, tx });
+                            parked = Some(Job::Generate {
+                                req,
+                                accepted_at,
+                                tx,
+                            });
                             break;
                         }
                     }
@@ -1512,6 +1537,7 @@ pub(crate) fn run_batched(
                     tree_open = false;
                     pending = Some(Pending {
                         done: 0,
+                        started_at: Instant::now(),
                         goal: PendingGoal::Admit {
                             tx,
                             req,
@@ -1553,6 +1579,7 @@ pub(crate) fn run_batched(
                     tree_open = false;
                     pending = Some(Pending {
                         done: 0,
+                        started_at: Instant::now(),
                         goal: PendingGoal::TreeOpen { prompt, resp },
                     });
                 }
@@ -1626,7 +1653,9 @@ pub(crate) fn run_batched(
                     Ok(logits) => {
                         p.done = end;
                         if p.done == len {
+                            let prefill_elapsed = p.started_at.elapsed();
                             let p = pending.take().expect("pending checked above");
+                            telemetry.observe_prefill(prefill_elapsed);
                             match p.goal {
                                 // Prompt complete: adopt the KV rows into the
                                 // reserved slot and activate. `logits` is the
@@ -1794,6 +1823,7 @@ pub(crate) fn run_batched(
             }
             phase.store(PHASE_DECODE, Ordering::Release);
             let d = draft.as_mut().expect("spec admission requires a drafter");
+            let decode_started = Instant::now();
             match spec_cycle(&mut runner, d, &mut s, eos, n_ctx) {
                 Ok(SpecOutcome::Continue) => spec = Some(s),
                 Ok(SpecOutcome::Done | SpecOutcome::Cancelled) => s.print_stats(),
@@ -1801,6 +1831,7 @@ pub(crate) fn run_batched(
                     let _ = s.tx.try_send(GenEvent::Error(msg));
                 }
             }
+            telemetry.observe_decode(decode_started.elapsed());
             continue;
         }
 
@@ -1829,7 +1860,8 @@ pub(crate) fn run_batched(
                 .all(|a| matches!(a.sampling, Sampling::Greedy) && a.logprobs.is_none());
         if multi_eligible {
             let d = draft.as_mut().expect("eligibility requires a drafter");
-            match multi_spec_round(
+            let decode_started = Instant::now();
+            let outcome = multi_spec_round(
                 &mut runner,
                 d,
                 &mut batch,
@@ -1838,7 +1870,9 @@ pub(crate) fn run_batched(
                 eos,
                 n_ctx,
                 &mut multi_log,
-            ) {
+            );
+            telemetry.observe_decode(decode_started.elapsed());
+            match outcome {
                 MultiOutcome::Ran => continue,
                 MultiOutcome::Fallback => multi = None,
                 MultiOutcome::Disable => {
@@ -1868,7 +1902,9 @@ pub(crate) fn run_batched(
             let _ = batch.set_live(row, slot.is_some());
         }
         let t_p = std::time::Instant::now();
+        let decode_started = Instant::now();
         let step = runner.decode_batch_graph(&mut batch, &tokens);
+        telemetry.observe_decode(decode_started.elapsed());
         let all_logits = match step {
             Ok(l) => {
                 // Cost-model P_lockstep: one lockstep step's wall (the

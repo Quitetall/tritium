@@ -24,6 +24,7 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 
@@ -32,6 +33,70 @@ use crate::generator::{FinishReason, GenError, GenRequest, Generator, TreeOpErro
 pub(crate) const PHASE_IDLE: u8 = 0;
 pub(crate) const PHASE_PREFILL: u8 = 1;
 pub(crate) const PHASE_DECODE: u8 = 2;
+
+const PHASE_DURATION_BUCKET_US: [u64; 8] = [
+    1_000, 5_000, 10_000, 50_000, 100_000, 500_000, 1_000_000, 5_000_000,
+];
+
+/// Worker-owned phase timing. Each router gets one instance, so parallel
+/// servers do not contaminate each other's receipts or `/metrics` output.
+#[derive(Debug, Default)]
+pub(crate) struct WorkerTelemetry {
+    pub(crate) queue_wait_buckets: [AtomicU64; PHASE_DURATION_BUCKET_US.len()],
+    pub(crate) queue_wait_sum_us: AtomicU64,
+    pub(crate) queue_wait_count: AtomicU64,
+    pub(crate) prefill_buckets: [AtomicU64; PHASE_DURATION_BUCKET_US.len()],
+    pub(crate) prefill_sum_us: AtomicU64,
+    pub(crate) prefill_count: AtomicU64,
+    pub(crate) decode_buckets: [AtomicU64; PHASE_DURATION_BUCKET_US.len()],
+    pub(crate) decode_sum_us: AtomicU64,
+    pub(crate) decode_count: AtomicU64,
+}
+
+impl WorkerTelemetry {
+    pub(crate) fn observe_queue_wait(&self, elapsed: Duration) {
+        observe_histogram(
+            elapsed,
+            &self.queue_wait_buckets,
+            &self.queue_wait_sum_us,
+            &self.queue_wait_count,
+        );
+    }
+
+    pub(crate) fn observe_prefill(&self, elapsed: Duration) {
+        observe_histogram(
+            elapsed,
+            &self.prefill_buckets,
+            &self.prefill_sum_us,
+            &self.prefill_count,
+        );
+    }
+
+    pub(crate) fn observe_decode(&self, elapsed: Duration) {
+        observe_histogram(
+            elapsed,
+            &self.decode_buckets,
+            &self.decode_sum_us,
+            &self.decode_count,
+        );
+    }
+}
+
+fn observe_histogram(
+    elapsed: Duration,
+    buckets: &[AtomicU64; PHASE_DURATION_BUCKET_US.len()],
+    sum_us: &AtomicU64,
+    count: &AtomicU64,
+) {
+    let micros = elapsed.as_micros().min(u128::from(u64::MAX)) as u64;
+    sum_us.fetch_add(micros, Ordering::Relaxed);
+    count.fetch_add(1, Ordering::Relaxed);
+    for (bucket, ceiling) in buckets.iter().zip(PHASE_DURATION_BUCKET_US) {
+        if micros <= ceiling {
+            bucket.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
 
 fn record_backend_fault(faulted: &AtomicBool, faults: &AtomicU64, latch: bool) {
     faults.fetch_add(1, Ordering::Relaxed);
@@ -46,6 +111,7 @@ pub(crate) struct WorkerSignals {
     pub(crate) phase: Arc<AtomicU8>,
     pub(crate) backend_faulted: Arc<AtomicBool>,
     pub(crate) backend_faults: Arc<AtomicU64>,
+    pub(crate) telemetry: Arc<WorkerTelemetry>,
     pub(crate) latch_backend_faults: bool,
 }
 
@@ -68,6 +134,8 @@ pub(crate) enum Job {
     Generate {
         /// The generation request.
         req: GenRequest,
+        /// Monotonic admission timestamp used for queue-wait accounting.
+        accepted_at: Option<Instant>,
         /// Per-request event channel (dropped by the handler on client
         /// disconnect, which the worker observes as a send failure and treats
         /// as cancellation).
@@ -110,6 +178,7 @@ pub(crate) fn spawn_worker(
         phase,
         backend_faulted,
         backend_faults,
+        telemetry,
         latch_backend_faults,
     } = signals;
     let (job_tx, mut job_rx) = mpsc::channel::<Job>(queue_cap.max(1));
@@ -145,13 +214,22 @@ pub(crate) fn spawn_worker(
                     continue;
                 }
                 match job {
-                    Job::Generate { req, tx } => {
+                    Job::Generate {
+                        req,
+                        accepted_at,
+                        tx,
+                    } => {
                         if draining.load(Ordering::Acquire) {
                             let _ = tx.try_send(GenEvent::Error("server draining".to_owned()));
                             continue;
                         }
+                        if let Some(accepted_at) = accepted_at {
+                            telemetry.observe_queue_wait(accepted_at.elapsed());
+                        }
                         phase.store(PHASE_PREFILL, Ordering::Release);
                         let _phase = PhaseGuard(phase.clone());
+                        let generation_started = Instant::now();
+                        let mut first_decode_at = None;
                         // Run the (panic-prone) generation under catch_unwind so one
                         // bad job can't kill the worker. `final_reason` lives inside
                         // the closure so its &mut borrow can't cross the unwind
@@ -159,6 +237,10 @@ pub(crate) fn spawn_worker(
                         let outcome = catch_unwind(AssertUnwindSafe(|| {
                             let mut final_reason = FinishReason::Stop;
                             let res = generator.generate(&req, &mut |step| {
+                                if first_decode_at.is_none() {
+                                    telemetry.observe_prefill(generation_started.elapsed());
+                                    first_decode_at = Some(Instant::now());
+                                }
                                 phase.store(PHASE_DECODE, Ordering::Release);
                                 if let Some(fr) = step.finish_reason {
                                     final_reason = fr;
@@ -173,6 +255,11 @@ pub(crate) fn spawn_worker(
                             });
                             (res, final_reason)
                         }));
+                        if let Some(first_decode_at) = first_decode_at {
+                            telemetry.observe_decode(first_decode_at.elapsed());
+                        } else {
+                            telemetry.observe_prefill(generation_started.elapsed());
+                        }
                         match outcome {
                             Ok((Ok(()), final_reason)) => {
                                 let _ = tx.try_send(GenEvent::Done(final_reason));
@@ -334,6 +421,7 @@ mod tests {
         let phase = Arc::new(AtomicU8::new(PHASE_IDLE));
         let faulted = Arc::new(AtomicBool::new(false));
         let faults = Arc::new(AtomicU64::new(0));
+        let telemetry = Arc::new(WorkerTelemetry::default());
         let jobs = spawn_worker(
             generator,
             WorkerSignals {
@@ -342,6 +430,7 @@ mod tests {
                 phase,
                 backend_faulted: faulted.clone(),
                 backend_faults: faults.clone(),
+                telemetry: telemetry.clone(),
                 latch_backend_faults: latch,
             },
             1,
@@ -355,6 +444,7 @@ mod tests {
                 sampling: Sampling::Greedy,
                 stop_eos: true,
             },
+            accepted_at: Some(Instant::now()),
             tx: events,
         })
         .unwrap();
@@ -376,6 +466,7 @@ mod tests {
     fn production_latch_rejects_already_queued_work_without_backend_reentry() {
         let calls = Arc::new(AtomicU64::new(0));
         let faulted = Arc::new(AtomicBool::new(false));
+        let telemetry = Arc::new(WorkerTelemetry::default());
         let jobs = spawn_worker(
             Box::new(CountThenFail(calls.clone())),
             WorkerSignals {
@@ -384,6 +475,7 @@ mod tests {
                 phase: Arc::new(AtomicU8::new(PHASE_IDLE)),
                 backend_faulted: faulted.clone(),
                 backend_faults: Arc::new(AtomicU64::new(0)),
+                telemetry: telemetry.clone(),
                 latch_backend_faults: true,
             },
             2,
@@ -399,11 +491,13 @@ mod tests {
         };
         jobs.try_send(Job::Generate {
             req: request.clone(),
+            accepted_at: Some(Instant::now()),
             tx: first_tx,
         })
         .unwrap();
         jobs.try_send(Job::Generate {
             req: request,
+            accepted_at: Some(Instant::now()),
             tx: second_tx,
         })
         .unwrap();

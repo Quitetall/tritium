@@ -28,7 +28,8 @@ use crate::sse::{
 };
 use crate::startup::{AdmittedGeneratorV1, ProductionReadiness, prepare_production_generator};
 use crate::worker::{
-    GenEvent, Job, PHASE_DECODE, PHASE_IDLE, PHASE_PREFILL, WorkerSignals, spawn_worker,
+    GenEvent, Job, PHASE_DECODE, PHASE_IDLE, PHASE_PREFILL, WorkerSignals, WorkerTelemetry,
+    spawn_worker,
 };
 
 /// How `/v1/chat/completions` renders `messages` into the prompt string
@@ -268,6 +269,31 @@ fn observe_histogram(
     }
 }
 
+const HISTOGRAM_BUCKET_LABELS: [&str; 8] =
+    ["0.001", "0.005", "0.01", "0.05", "0.1", "0.5", "1", "5"];
+
+fn render_histogram(
+    name: &str,
+    help: &str,
+    buckets: &[AtomicU64; 8],
+    sum_us: &AtomicU64,
+    count: &AtomicU64,
+) -> String {
+    let mut text = format!("# HELP {name} {help}\n# TYPE {name} histogram\n");
+    for (label, bucket) in HISTOGRAM_BUCKET_LABELS.iter().zip(buckets) {
+        text.push_str(&format!(
+            "{name}_bucket{{le=\"{label}\"}} {}\n",
+            bucket.load(Ordering::Relaxed)
+        ));
+    }
+    let total = count.load(Ordering::Relaxed);
+    text.push_str(&format!(
+        "{name}_bucket{{le=\"+Inf\"}} {total}\n{name}_sum {}\n{name}_count {total}\n",
+        sum_us.load(Ordering::Relaxed) as f64 / 1_000_000.0
+    ));
+    text
+}
+
 struct RequestMetricsGuard {
     metrics: Arc<Metrics>,
     started: Instant,
@@ -364,6 +390,7 @@ struct RuntimeState {
     phase: Arc<AtomicU8>,
     backend_faulted: Arc<AtomicBool>,
     backend_faults: Arc<AtomicU64>,
+    telemetry: Arc<WorkerTelemetry>,
     production: Option<ProductionReadiness>,
 }
 
@@ -390,6 +417,7 @@ pub fn build_router_with_limits(
     let phase = Arc::new(AtomicU8::new(PHASE_IDLE));
     let backend_faulted = Arc::new(AtomicBool::new(false));
     let backend_faults = Arc::new(AtomicU64::new(0));
+    let telemetry = Arc::new(WorkerTelemetry::default());
     let jobs = spawn_worker(
         generator,
         WorkerSignals {
@@ -398,6 +426,7 @@ pub fn build_router_with_limits(
             phase: phase.clone(),
             backend_faulted: backend_faulted.clone(),
             backend_faults: backend_faults.clone(),
+            telemetry: telemetry.clone(),
             latch_backend_faults: false,
         },
         cfg.queue_cap,
@@ -415,6 +444,7 @@ pub fn build_router_with_limits(
             phase,
             backend_faulted,
             backend_faults,
+            telemetry,
             production: None,
         },
     )
@@ -438,6 +468,7 @@ pub fn build_router_governed(
     let phase = Arc::new(AtomicU8::new(PHASE_IDLE));
     let backend_faulted = Arc::new(AtomicBool::new(false));
     let backend_faults = Arc::new(AtomicU64::new(0));
+    let telemetry = Arc::new(WorkerTelemetry::default());
     let jobs = spawn_worker(
         generator,
         WorkerSignals {
@@ -446,6 +477,7 @@ pub fn build_router_governed(
             phase: phase.clone(),
             backend_faulted: backend_faulted.clone(),
             backend_faults: backend_faults.clone(),
+            telemetry: telemetry.clone(),
             latch_backend_faults: false,
         },
         cfg.queue_cap,
@@ -462,6 +494,7 @@ pub fn build_router_governed(
             phase,
             backend_faulted,
             backend_faults,
+            telemetry,
             production: None,
         },
     ))
@@ -485,6 +518,7 @@ pub fn build_router_production(
     let phase = Arc::new(AtomicU8::new(PHASE_IDLE));
     let backend_faulted = Arc::new(AtomicBool::new(false));
     let backend_faults = Arc::new(AtomicU64::new(0));
+    let telemetry = Arc::new(WorkerTelemetry::default());
     let jobs = spawn_worker(
         generator,
         WorkerSignals {
@@ -493,6 +527,7 @@ pub fn build_router_production(
             phase: phase.clone(),
             backend_faulted: backend_faulted.clone(),
             backend_faults: backend_faults.clone(),
+            telemetry: telemetry.clone(),
             latch_backend_faults: true,
         },
         cfg.queue_cap,
@@ -509,6 +544,7 @@ pub fn build_router_production(
             phase,
             backend_faulted,
             backend_faults,
+            telemetry,
             production: Some(production.clone()),
         },
     );
@@ -614,9 +650,11 @@ fn build_router_batched_inner(
     let phase = Arc::new(AtomicU8::new(PHASE_IDLE));
     let backend_faulted = Arc::new(AtomicBool::new(false));
     let backend_faults = Arc::new(AtomicU64::new(0));
+    let telemetry = Arc::new(WorkerTelemetry::default());
     let alive = worker_alive.clone();
     let drain_flag = draining.clone();
     let worker_phase = phase.clone();
+    let worker_telemetry = telemetry.clone();
     let pool_tokens = cfg.kv_pool_tokens;
     std::thread::Builder::new()
         .name("tritium-serve-batch".into())
@@ -639,6 +677,7 @@ fn build_router_batched_inner(
                 jobs_rx,
                 drain_flag,
                 worker_phase,
+                worker_telemetry,
             );
         })?;
     Ok(build_router_inner(
@@ -653,6 +692,7 @@ fn build_router_batched_inner(
             phase,
             backend_faulted,
             backend_faults,
+            telemetry,
             production: None,
         },
     ))
@@ -1070,7 +1110,11 @@ async fn chat_completions(
     // Start latency accounting before queue admission so generation duration
     // includes bounded queue wait, not only response-body consumption.
     let generation_started = Instant::now();
-    match st.jobs.try_send(Job::Generate { req: gen_req, tx }) {
+    match st.jobs.try_send(Job::Generate {
+        req: gen_req,
+        accepted_at: Some(generation_started),
+        tx,
+    }) {
         Ok(()) => {
             st.metrics.chat_requests.fetch_add(1, Ordering::Relaxed);
             st.metrics
@@ -1524,6 +1568,28 @@ async fn metrics(State(st): State<AppState>) -> Response {
         .iter()
         .map(|bucket| bucket.load(Ordering::Relaxed))
         .collect();
+    let worker = &st.runtime.telemetry;
+    let queue_wait_histogram = render_histogram(
+        "tritium_queue_wait_seconds",
+        "Time from accepted request to decode-worker admission.",
+        &worker.queue_wait_buckets,
+        &worker.queue_wait_sum_us,
+        &worker.queue_wait_count,
+    );
+    let prefill_histogram = render_histogram(
+        "tritium_prefill_duration_seconds",
+        "Decode-worker model prefill duration.",
+        &worker.prefill_buckets,
+        &worker.prefill_sum_us,
+        &worker.prefill_count,
+    );
+    let decode_histogram = render_histogram(
+        "tritium_decode_duration_seconds",
+        "Decode-worker token-generation duration after first token callback.",
+        &worker.decode_buckets,
+        &worker.decode_sum_us,
+        &worker.decode_count,
+    );
     let body = format!(
         "# HELP tritium_chat_requests_total Chat completions accepted into the queue.\n\
          # TYPE tritium_chat_requests_total counter\n\
@@ -1591,6 +1657,7 @@ async fn metrics(State(st): State<AppState>) -> Response {
          tritium_time_to_first_token_seconds_bucket{{le=\"+Inf\"}} {}\n\
          tritium_time_to_first_token_seconds_sum {}\n\
          tritium_time_to_first_token_seconds_count {}\n\
+         {}{}{}\n\
          # HELP tritium_queue_depth Jobs waiting in the decode queue.\n\
          # TYPE tritium_queue_depth gauge\n\
          tritium_queue_depth {}\n\
@@ -1674,6 +1741,9 @@ async fn metrics(State(st): State<AppState>) -> Response {
         st.metrics.ttft_count.load(Ordering::Relaxed),
         st.metrics.ttft_sum_us.load(Ordering::Relaxed) as f64 / 1_000_000.0,
         st.metrics.ttft_count.load(Ordering::Relaxed),
+        queue_wait_histogram,
+        prefill_histogram,
+        decode_histogram,
         queue_depth,
         u8::from(st.runtime.worker_alive.load(Ordering::Relaxed)),
         st.runtime.backend_faults.load(Ordering::Relaxed),
@@ -1898,6 +1968,7 @@ mod tests {
         let phase = Arc::new(AtomicU8::new(PHASE_IDLE));
         let backend_faulted = Arc::new(AtomicBool::new(false));
         let backend_faults = Arc::new(AtomicU64::new(0));
+        let telemetry = Arc::new(WorkerTelemetry::default());
         let jobs = spawn_worker(
             Box::new(BackendFail),
             WorkerSignals {
@@ -1906,6 +1977,7 @@ mod tests {
                 phase: phase.clone(),
                 backend_faulted: backend_faulted.clone(),
                 backend_faults: backend_faults.clone(),
+                telemetry: telemetry.clone(),
                 latch_backend_faults: true,
             },
             cfg.queue_cap,
@@ -1922,6 +1994,7 @@ mod tests {
                 phase,
                 backend_faulted,
                 backend_faults,
+                telemetry,
                 production: None,
             },
         )
