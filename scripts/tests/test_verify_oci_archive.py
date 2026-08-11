@@ -15,6 +15,7 @@ MODULE = runpy.run_path(ROOT / "scripts" / "verify-oci-archive.py")
 validate = MODULE["validate"]
 OciError = MODULE["OciError"]
 MANIFEST = "application/vnd.oci.image.manifest.v1+json"
+INDEX = "application/vnd.oci.image.index.v1+json"
 BUILDER_ID = "https://github.com/Quitetall/tritium/actions/runs/123"
 BUILDKIT_BUILD_TYPE = (
     "https://github.com/moby/buildkit/blob/master/"
@@ -51,6 +52,7 @@ def fixture(
     invalid_dependency_digest: bool = False,
     reversed_slsa_timestamps: bool = False,
     pax_metadata: bool = False,
+    nested_index: bool = False,
 ):
     revision = "a" * 40
     release = "1.1.0-rc.0"
@@ -177,7 +179,13 @@ def fixture(
     if extra_blob:
         orphan = b"unreferenced OCI payload"
         blobs[hashlib.sha256(orphan).hexdigest()] = orphan
-    index = encoded({"schemaVersion": 2, "manifests": [image_desc, attestation_desc]})
+    nested = encoded({"schemaVersion": 2, "manifests": [image_desc, attestation_desc]})
+    if nested_index:
+        nested_desc = descriptor(nested, INDEX)
+        blobs[nested_desc["digest"][7:]] = nested
+        index = encoded({"schemaVersion": 2, "manifests": [nested_desc]})
+    else:
+        index = nested
     archive = root / "image.oci.tar"
     with tarfile.open(archive, "w") as tar:
         files = {"oci-layout": encoded({"imageLayoutVersion": "1.0.0"}), "index.json": index}
@@ -210,6 +218,12 @@ class VerifyOciArchiveTests(unittest.TestCase):
             self.assertEqual(len(result["predicates"]), 2)
             self.assertEqual(result["builder_id"], BUILDER_ID)
             self.assertEqual(result["invocation_id"], "buildkit-invocation-123")
+
+    def test_accepts_buildkit_nested_attested_index(self):
+        with tempfile.TemporaryDirectory() as raw:
+            archive, receipt, candidate = fixture(Path(raw), nested_index=True)
+            result = validate(archive, receipt, candidate)
+            self.assertEqual(len(result["predicates"]), 2)
 
     def test_rejects_empty_predicate_documents(self):
         with tempfile.TemporaryDirectory() as raw:

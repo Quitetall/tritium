@@ -14,6 +14,7 @@ from typing import Any, BinaryIO, Callable
 from urllib.parse import urlsplit
 
 
+INDEX = "application/vnd.oci.image.index.v1+json"
 MANIFEST = "application/vnd.oci.image.manifest.v1+json"
 ATTESTATION = "application/vnd.in-toto+json"
 SPDX_PREDICATE = "https://spdx.dev/Document"
@@ -418,7 +419,24 @@ def inspect(
         _, payload = descriptor_blob(descriptor, label)
         return _json(payload, label)
 
-    descriptors = index["manifests"]
+    top_descriptors = index["manifests"]
+    # BuildKit's OCI exporter can wrap its attested image index in a
+    # single top-level index descriptor. Keep direct OCI indexes supported,
+    # but resolve only this canonical one-descriptor wrapper so hidden
+    # manifests cannot bypass image/attestation checks.
+    if (
+        len(top_descriptors) == 1
+        and isinstance(top_descriptors[0], dict)
+        and top_descriptors[0].get("mediaType") == INDEX
+    ):
+        nested_index = json_blob(top_descriptors[0], "nested OCI index")
+        if nested_index.get("schemaVersion") != 2 or not isinstance(
+            nested_index.get("manifests"), list
+        ):
+            raise OciArchiveError("nested OCI index schema or manifests are invalid")
+        descriptors = nested_index["manifests"]
+    else:
+        descriptors = top_descriptors
     images = [
         item
         for item in descriptors
