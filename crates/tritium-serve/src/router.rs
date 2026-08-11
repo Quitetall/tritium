@@ -191,6 +191,8 @@ pub(crate) struct Metrics {
     pub(crate) stream_disconnects: AtomicU64,
     /// HTTP requests currently inside authenticated router middleware.
     pub(crate) requests_inflight: AtomicU64,
+    /// Accepted chat generations awaiting or receiving model events.
+    pub(crate) generations_active: AtomicU64,
     /// Fixed-cardinality request-duration histogram buckets.
     pub(crate) request_duration_buckets: [AtomicU64; REQUEST_DURATION_BUCKET_US.len()],
     /// Sum of observed request durations in microseconds.
@@ -238,6 +240,25 @@ impl Drop for RequestMetricsGuard {
             .requests_inflight
             .fetch_sub(1, Ordering::Relaxed);
         self.metrics.observe_request(self.started.elapsed());
+    }
+}
+
+struct GenerationMetricsGuard {
+    metrics: Arc<Metrics>,
+}
+
+impl GenerationMetricsGuard {
+    fn new(metrics: Arc<Metrics>) -> Self {
+        metrics.generations_active.fetch_add(1, Ordering::Relaxed);
+        Self { metrics }
+    }
+}
+
+impl Drop for GenerationMetricsGuard {
+    fn drop(&mut self) {
+        self.metrics
+            .generations_active
+            .fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -1044,6 +1065,7 @@ async fn nonstream_response(
     stops: Vec<String>,
     metrics: Arc<Metrics>,
 ) -> Response {
+    let _generation_metrics = GenerationMetricsGuard::new(metrics.clone());
     let eos = tok.eos();
     let detok_ref = tok.clone();
     // Mirror the streaming loop: incremental detok + stop-matcher, BREAK on a
@@ -1171,7 +1193,9 @@ fn stream_response(
         // an overflowing lifetime into an unbounded stream.
         now.checked_add(budget).unwrap_or(now)
     });
+    let generation_metrics = GenerationMetricsGuard::new(metrics.clone());
     let stream = async_stream::stream! {
+        let _generation_metrics = generation_metrics;
         let mut disconnect = StreamDisconnectGuard {
             metrics: metrics.clone(),
             completed: false,
@@ -1438,6 +1462,9 @@ async fn metrics(State(st): State<AppState>) -> Response {
          # HELP tritium_requests_inflight HTTP requests inside router middleware.\n\
          # TYPE tritium_requests_inflight gauge\n\
          tritium_requests_inflight {}\n\
+         # HELP tritium_generations_active Accepted chat generations awaiting or receiving model events.\n\
+         # TYPE tritium_generations_active gauge\n\
+         tritium_generations_active {}\n\
          # HELP tritium_request_duration_seconds HTTP request duration, fixed buckets.\n\
          # TYPE tritium_request_duration_seconds histogram\n\
          tritium_request_duration_seconds_bucket{{le=\"0.001\"}} {}\n\
@@ -1497,6 +1524,7 @@ async fn metrics(State(st): State<AppState>) -> Response {
         st.metrics.stream_timeouts.load(Ordering::Relaxed),
         st.metrics.stream_disconnects.load(Ordering::Relaxed),
         st.metrics.requests_inflight.load(Ordering::Relaxed),
+        st.metrics.generations_active.load(Ordering::Relaxed),
         request_buckets[0],
         request_buckets[1],
         request_buckets[2],
