@@ -87,6 +87,9 @@ mod manylinux_glibc_compat {
         end: *mut *mut c_char,
         base: c_int,
     ) -> c_long {
+        // SAFETY: This compatibility symbol preserves the libc parser ABI;
+        // callers provide the same valid pointers and base contract as
+        // `strtol`.
         unsafe { strtol(value, end, base) }
     }
 
@@ -96,6 +99,9 @@ mod manylinux_glibc_compat {
         end: *mut *mut c_char,
         base: c_int,
     ) -> c_longlong {
+        // SAFETY: This compatibility symbol preserves the libc parser ABI;
+        // callers provide the same valid pointers and base contract as
+        // `strtoll`.
         unsafe { strtoll(value, end, base) }
     }
 
@@ -105,6 +111,9 @@ mod manylinux_glibc_compat {
         end: *mut *mut c_char,
         base: c_int,
     ) -> c_ulonglong {
+        // SAFETY: This compatibility symbol preserves the libc parser ABI;
+        // callers provide the same valid pointers and base contract as
+        // `strtoull`.
         unsafe { strtoull(value, end, base) }
     }
 }
