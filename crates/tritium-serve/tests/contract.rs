@@ -197,6 +197,76 @@ async fn send(router: &Router, req: Request<Body>) -> (StatusCode, Vec<u8>) {
     (status, body)
 }
 
+fn assert_bounded_metric_exposition(text: &str) {
+    const MAX_SERIES: usize = 128;
+    let mut series = 0usize;
+    for line in text
+        .lines()
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+    {
+        series += 1;
+        assert!(
+            !line.contains("model=")
+                && !line.contains("request_id=")
+                && !line.contains("trace_id=")
+        );
+        let Some(open) = line.find('{') else {
+            continue;
+        };
+        let close = line.rfind('}').expect("metric label set must close");
+        for label in line[open + 1..close].split(',') {
+            let (name, value) = label
+                .split_once('=')
+                .expect("metric label must be key=value");
+            assert!(
+                matches!(name, "le" | "phase" | "path" | "version"),
+                "unexpected metric label {name:?} in {line:?}"
+            );
+            assert!(!value.is_empty(), "metric label value must not be empty");
+            match name {
+                "le" => assert!(matches!(
+                    value,
+                    "\"0.001\""
+                        | "\"0.005\""
+                        | "\"0.01\""
+                        | "\"0.05\""
+                        | "\"0.1\""
+                        | "\"0.5\""
+                        | "\"1\""
+                        | "\"5\""
+                        | "\"+Inf\""
+                )),
+                "phase" => assert!(matches!(
+                    value,
+                    "\"idle\""
+                        | "\"prefill\""
+                        | "\"decode\""
+                        | "\"verify\""
+                        | "\"plain\""
+                        | "\"draft_token\""
+                        | "\"draft_resync\""
+                        | "\"verify_round\""
+                        | "\"lockstep\""
+                )),
+                "path" => {
+                    assert!(matches!(value, "\"solo\"" | "\"batched\""));
+                    assert!(line.starts_with("tritium_spec_floor{"));
+                }
+                "version" => assert_eq!(value, "\"1\""),
+                _ => unreachable!("label allowlist checked above"),
+            }
+        }
+    }
+    assert!(
+        series <= MAX_SERIES,
+        "metric series cardinality exceeded: {series}"
+    );
+    assert!(
+        text.contains("tritium_metrics_schema_info{version=\"1\"} 1\n"),
+        "metrics schema marker missing"
+    );
+}
+
 #[tokio::test]
 async fn request_identity_headers_propagate_without_unbounded_cardinality() {
     let (router, _) = mock_router(vec![1], FinishReason::Stop);
@@ -1461,6 +1531,7 @@ async fn metrics_exposition() {
     let (status, body) = send(&router, req).await;
     assert_eq!(status, StatusCode::OK);
     let text = String::from_utf8(body).unwrap();
+    assert_bounded_metric_exposition(&text);
     assert!(text.contains("tritium_chat_requests_total 2\n"), "{text}");
     assert!(text.contains("tritium_tokens_out_total 6\n"), "{text}");
     assert!(text.contains("tritium_tokens_in_total 2\n"), "{text}");

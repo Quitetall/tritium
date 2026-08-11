@@ -271,6 +271,7 @@ fn observe_histogram(
 
 const HISTOGRAM_BUCKET_LABELS: [&str; 8] =
     ["0.001", "0.005", "0.01", "0.05", "0.1", "0.5", "1", "5"];
+const METRICS_SCHEMA_VERSION: &str = "1";
 
 fn render_histogram(
     name: &str,
@@ -1737,7 +1738,10 @@ async fn metrics(State(st): State<AppState>) -> Response {
         &worker.decode_count,
     );
     let body = format!(
-        "# HELP tritium_chat_requests_total Chat completions accepted into the queue.\n\
+        "# HELP tritium_metrics_schema_info Exposition schema version (fixed).\n\
+         # TYPE tritium_metrics_schema_info gauge\n\
+         tritium_metrics_schema_info{{version=\"{METRICS_SCHEMA_VERSION}\"}} 1\n\
+         # HELP tritium_chat_requests_total Chat completions accepted into the queue.\n\
          # TYPE tritium_chat_requests_total counter\n\
          tritium_chat_requests_total {}\n\
          # HELP tritium_queue_rejections_total Requests 429'd because the job queue was full.\n\
