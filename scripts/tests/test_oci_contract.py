@@ -72,7 +72,9 @@ class OciContractTests(unittest.TestCase):
             script.index('mv -T "$staging" "$final_output"'),
         )
         for flavor in ("cpu", "cuda"):
-            self.assertIn("cargo build --frozen --profile dist", self.dockerfile(flavor))
+            text = self.dockerfile(flavor)
+            self.assertIn("cargo build --frozen --profile dist", text)
+            self.assertIn("RUSTUP_TOOLCHAIN=1.89.0", text)
 
     def test_image_metadata_matches_source_contracts(self):
         cargo = (ROOT / "Cargo.toml").read_text(encoding="utf-8")

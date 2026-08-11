@@ -15,6 +15,7 @@ ENV PATH=/usr/local/cargo/bin:${PATH} \
     RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
     CARGO_NET_OFFLINE=${CARGO_NET_OFFLINE} \
+    RUSTUP_TOOLCHAIN=1.89.0 \
     TRITIUM_SOURCE_ID=source-git:${SOURCE_REVISION}
 WORKDIR /src
 COPY . .
