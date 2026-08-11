@@ -532,11 +532,6 @@ def _ternary_linear_backward_impl(
     return grad_input, grad_master, grad_bias
 
 
-@torch.library.custom_op(
-    "tritium::_ternary_linear_backward",
-    mutates_args=(),
-    device_types=("cpu", "cuda"),
-)
 def _ternary_linear_backward_dispatch(
     grad_output: torch.Tensor,
     input: torch.Tensor,
@@ -545,10 +540,24 @@ def _ternary_linear_backward_dispatch(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Opaque first-order VJP boundary for compiled native/cache execution."""
 
-    return _ternary_linear_backward_impl(grad_output, input, master, has_bias)
+    return torch.ops.tritium._ternary_linear_backward.default(
+        grad_output, input, master, has_bias
+    )
 
 
-@_ternary_linear_backward_dispatch.register_fake
+_BACKWARD_LIBRARY = torch.library.Library("tritium", "FRAGMENT")
+_BACKWARD_LIBRARY.define(
+    "_ternary_linear_backward(Tensor grad_output, Tensor input, Tensor master, bool has_bias) -> (Tensor, Tensor, Tensor)"
+)
+_BACKWARD_LIBRARY.impl(
+    "_ternary_linear_backward", _ternary_linear_backward_impl, "CPU"
+)
+_BACKWARD_LIBRARY.impl(
+    "_ternary_linear_backward", _ternary_linear_backward_impl, "CUDA"
+)
+
+
+@torch.library.register_fake("tritium::_ternary_linear_backward")
 def _ternary_linear_backward_fake(
     grad_output: torch.Tensor,
     input: torch.Tensor,
