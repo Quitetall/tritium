@@ -61,7 +61,10 @@ already_published() {
 if [[ "${1:-}" != "--yes-publish" ]]; then
   echo "DRY RUN preflight: packaging every crate in publish order (no upload)."
   echo "To actually publish: $0 --yes-publish"
-  cargo package --workspace --exclude tritium-py --exclude tritium-benches --frozen --no-verify
+  # Reuse local prerelease patching and version/spec checks from the CI gate.
+  # Raw `cargo package --workspace` resolves rewritten internal deps from
+  # crates.io, where this unpublished release does not exist yet.
+  ./scripts/check-publish.sh
   echo "PREFLIGHT OK: all ${#ORDER[@]} crates package cleanly. Re-run with --yes-publish."
   exit 0
 fi
