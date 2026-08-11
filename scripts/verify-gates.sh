@@ -56,6 +56,7 @@ case "$tier" in
         # by the native wheel/pytest path below, matching CI's maturin lane.
         run cargo test --workspace --exclude tritium-py --no-fail-fast
         run python -m unittest discover -s scripts/tests -p 'test_*.py'
+        run python scripts/check-community-contract.py --json
         ;;
     release)
         run cargo fmt --all --check
@@ -63,6 +64,7 @@ case "$tier" in
         run env TRITIUM_CHECK_ONLY=1 cargo clippy --workspace --all-targets --all-features -- -D warnings
         run cargo test --workspace --exclude tritium-py --no-fail-fast
         run python -m unittest discover -s scripts/tests -p 'test_*.py'
+        run python scripts/check-community-contract.py --json
         require_command cargo-deny
         run cargo deny check
         run python scripts/check-release-version.py

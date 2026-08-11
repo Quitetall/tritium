@@ -108,6 +108,7 @@ jobs:
       - run: python -m unittest discover -s scripts/tests -p 'test_*.py' -v
       - run: python scripts/check-release-version.py
       - run: python scripts/generate-compatibility.py --check
+      - run: python scripts/check-community-contract.py --json
 
   # Exact browser-package lane. The local RC stays private, but the candidate
   # tarball and its digest-bound clean-install receipt are retained as CI

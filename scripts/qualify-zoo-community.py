@@ -35,6 +35,10 @@ CLAIM_GENERATOR = runpy.run_path(
     Path(__file__).with_name("generate-release-claims.py")
 )
 check_claim_documents = CLAIM_GENERATOR["check"]
+COMMUNITY_CHECKER = runpy.run_path(
+    Path(__file__).with_name("check-community-contract.py")
+)
+check_community_contract = COMMUNITY_CHECKER["check"]
 
 SOURCE_SCHEMA = "tritium.model-zoo-source.v1"
 REVIEW_SCHEMA = "tritium.governance-review-attestation.v1"
@@ -439,6 +443,7 @@ def qualify(
         raise QualificationError(f"output directory already exists: {output_dir}")
     repo = repo.resolve(strict=True)
     require_clean_revision(repo, source_revision)
+    check_community_contract(repo)
     output_dir.parent.mkdir(parents=True, exist_ok=True)
     stage = Path(tempfile.mkdtemp(prefix=f".{output_dir.name}.", dir=output_dir.parent))
     stage.rmdir()
