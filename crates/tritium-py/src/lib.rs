@@ -53,6 +53,62 @@ use tritium_core::{GemmShape, TernaryFormat, Trit};
 use tritium_nn::{ModelRunner, TernaryLinear};
 use tritium_spec::TernaryBackend;
 
+// Rust's glibc threading fast path references `__libc_single_threaded`, which
+// only exists in glibc 2.32+. manylinux_2_28 wheels must still load on older
+// hosts. Export a conservative zero-valued fallback from the extension so the
+// runtime takes the fully thread-safe path when libc lacks that symbol. Zero
+// is also glibc's post-thread-creation value, so this never enables an unsafe
+// single-thread optimization.
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+mod manylinux_glibc_compat {
+    use std::ffi::{c_char, c_int, c_long, c_longlong, c_ulonglong};
+
+    unsafe extern "C" {
+        fn strtol(value: *const c_char, end: *mut *mut c_char, base: c_int) -> c_long;
+        fn strtoll(value: *const c_char, end: *mut *mut c_char, base: c_int) -> c_longlong;
+        fn strtoull(value: *const c_char, end: *mut *mut c_char, base: c_int) -> c_ulonglong;
+    }
+
+    // Rust's glibc threading fast path references this variable, which only
+    // exists in glibc 2.32+. Zero selects the conservative thread-safe path.
+    #[allow(non_upper_case_globals)]
+    #[unsafe(no_mangle)]
+    #[used]
+    #[doc(hidden)]
+    pub static __libc_single_threaded: u8 = 0;
+
+    // The bundled ONNX Runtime static archive is built against glibc headers
+    // that expose C23 parser names. Forward those calls to their stable
+    // pre-C23 ABI so manylinux_2_28 hosts can load the wheel.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn __isoc23_strtol(
+        value: *const c_char,
+        end: *mut *mut c_char,
+        base: c_int,
+    ) -> c_long {
+        unsafe { strtol(value, end, base) }
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn __isoc23_strtoll(
+        value: *const c_char,
+        end: *mut *mut c_char,
+        base: c_int,
+    ) -> c_longlong {
+        unsafe { strtoll(value, end, base) }
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn __isoc23_strtoull(
+        value: *const c_char,
+        end: *mut *mut c_char,
+        base: c_int,
+    ) -> c_ulonglong {
+        unsafe { strtoull(value, end, base) }
+    }
+}
+
 // Linked so its `linkme` backend self-registration into `tritium_runtime::BACKENDS`
 // is present in the extension module — the registry that `Model::load` and
 // `ternary_matmul` consult would otherwise find no `cpu` backend.
