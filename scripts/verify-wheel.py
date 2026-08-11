@@ -222,6 +222,14 @@ def qualify_target(target_id: str, platform_tag: str) -> dict[str, str]:
             host_os.startswith("linux") and host_arch in {"amd64", "x86_64"},
             re.fullmatch(r"(?:manylinux|musllinux).*_x86_64", platform_tag) is not None,
         ),
+        # CUDA wheels intentionally retain the same manylinux ABI tag as CPU
+        # wheels.  Target identity therefore carries the backend contract;
+        # clean_install_smoke additionally proves compiled_backends() contains
+        # CUDA before a receipt can be emitted.
+        "linux-x86_64-cuda13-sm89": (
+            host_os.startswith("linux") and host_arch in {"amd64", "x86_64"},
+            re.fullmatch(r"(?:manylinux|musllinux).*_x86_64", platform_tag) is not None,
+        ),
         "macos-arm64-cpu": (
             host_os == "darwin" and host_arch in {"aarch64", "arm64"},
             platform_tag.endswith(("_arm64", "_universal2")),
@@ -266,7 +274,9 @@ def runtime_cell_id(
     return f"{target_id}-cp{major}.{minor}"
 
 
-def clean_install_smoke(path: Path, forbidden_root: Path) -> None:
+def clean_install_smoke(
+    path: Path, forbidden_root: Path, *, required_backend: str | None = None
+) -> None:
     with tempfile.TemporaryDirectory(prefix="tritium-wheel-smoke-") as raw:
         root = Path(raw)
         environment = root / "venv"
@@ -301,6 +311,11 @@ assert native_name == '_tritium.pyd' or native_name.startswith('_tritium.abi3.')
 out = tritium.ternary_matmul([[1.0, 2.0]], [[1, -1]], 1.0)
 assert len(out) == 1 and len(out[0]) == 1 and out[0][0] < 0.0, out
 """
+        if required_backend is not None:
+            smoke += (
+                "\ncompiled = tritium._tritium.compiled_backends()\n"
+                f"assert {required_backend!r} in compiled, (compiled, {required_backend!r})\n"
+            )
         smoke_path = root / "smoke.py"
         smoke_path.write_text(smoke, encoding="utf-8")
         environment_vars = os.environ.copy()
@@ -345,7 +360,12 @@ def main() -> int:
                 f"{args.require_platform_tag!r}"
             )
         if args.install_smoke:
-            clean_install_smoke(wheel, args.workspace)
+            required_backend = (
+                "cuda" if args.target_id == "linux-x86_64-cuda13-sm89" else None
+            )
+            clean_install_smoke(
+                wheel, args.workspace, required_backend=required_backend
+            )
         if args.receipt:
             if not args.install_smoke:
                 raise WheelError("compatibility receipts require --install-smoke")
