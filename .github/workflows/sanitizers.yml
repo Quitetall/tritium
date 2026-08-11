@@ -100,7 +100,7 @@ jobs:
           components: rust-src
       - name: cargo test (ASan)
         run: |
-          cargo +nightly test -Zbuild-std \
+          cargo +nightly test --locked -Zbuild-std \
             --target "$TARGET" \
             -p ${{ matrix.crate }} --lib --tests
 
@@ -134,7 +134,7 @@ jobs:
           components: rust-src
       - name: cargo test (MSan)
         run: |
-          cargo +nightly test -Zbuild-std \
+          cargo +nightly test --locked -Zbuild-std \
             --target "$TARGET" \
             -p ${{ matrix.crate }} --lib --tests
 
@@ -165,7 +165,7 @@ jobs:
           components: rust-src
       - name: cargo test (TSan)
         run: |
-          cargo +nightly test -Zbuild-std \
+          cargo +nightly test --locked -Zbuild-std \
             --target "$TARGET" \
             -p ${{ matrix.crate }} --lib --tests
 
@@ -228,7 +228,7 @@ jobs:
         with:
           components: miri, rust-src
       # core: every test (it is tiny + pure).
-      - run: cargo +nightly miri test -p tritium-core
+      - run: cargo +nightly miri test --locked -p tritium-core
       # format: the parser unit tests + the parser-fuzz integration test only
       # (see the comment above for why the real-GGUF round-trips are excluded).
-      - run: cargo +nightly miri test -p tritium-format --lib --test tqidx_fuzz
+      - run: cargo +nightly miri test --locked -p tritium-format --lib --test tqidx_fuzz

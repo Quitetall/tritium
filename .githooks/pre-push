@@ -94,7 +94,7 @@ while read -r local_ref local_sha remote_ref remote_sha; do
         continue
     fi
 
-    if ! (cd "$WT" && cargo clippy --workspace --all-targets -- -D warnings); then
+    if ! (cd "$WT" && cargo clippy --locked --workspace --all-targets -- -D warnings); then
         echo "pre-push: workspace clippy FAILED for $local_sha ($local_ref)." >&2
         fail=1
         break
@@ -124,12 +124,12 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     if [ "$run_gpu" -eq 1 ]; then
         if ! (
             cd "$WT" && export TRITIUM_CHECK_ONLY=1 &&
-                cargo clippy -p tritium-cuda --features nccl,device-loss-qualification --all-targets -- -D warnings &&
-                cargo clippy -p tritium-rocm --features rocm --all-targets -- -D warnings &&
-                cargo clippy -p tritium-wgpu --features register --all-targets -- -D warnings &&
-                cargo clippy -p tritium-nn -p tritium-cli -p tritium-py -p tritium-salt -p tritium-benches --features tritium-nn/cuda,tritium-cli/nccl,tritium-py/cuda,tritium-salt/cuda,tritium-benches/cuda --all-targets -- -D warnings &&
-                cargo clippy -p tritium-cli -p tritium-benches --features tritium-cli/wgpu,tritium-cli/rocm,tritium-benches/wgpu,tritium-benches/rocm --all-targets -- -D warnings &&
-                cargo clippy -p tritium-serve --features cuda,e2e,device-loss-qualification --all-targets -- -D warnings
+                cargo clippy --locked -p tritium-cuda --features nccl,device-loss-qualification --all-targets -- -D warnings &&
+                cargo clippy --locked -p tritium-rocm --features rocm --all-targets -- -D warnings &&
+                cargo clippy --locked -p tritium-wgpu --features register --all-targets -- -D warnings &&
+                cargo clippy --locked -p tritium-nn -p tritium-cli -p tritium-py -p tritium-salt -p tritium-benches --features tritium-nn/cuda,tritium-cli/nccl,tritium-py/cuda,tritium-salt/cuda,tritium-benches/cuda --all-targets -- -D warnings &&
+                cargo clippy --locked -p tritium-cli -p tritium-benches --features tritium-cli/wgpu,tritium-cli/rocm,tritium-benches/wgpu,tritium-benches/rocm --all-targets -- -D warnings &&
+                cargo clippy --locked -p tritium-serve --features cuda,e2e,device-loss-qualification --all-targets -- -D warnings
         ); then
             echo "pre-push: gpu-feature clippy FAILED for $local_sha ($local_ref)." >&2
             fail=1

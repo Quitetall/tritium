@@ -32,12 +32,12 @@ jobs:
         with:
           components: rustfmt, clippy
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       # tritium-py is a PyO3 extension module (cdylib) with no cargo tests — it is
       # exercised via maturin + pytest, not `cargo test`. Excluded here so its
       # cdylib doesn't link libpython into a cargo-test binary, which fails to link
       # on the hosted macOS/Windows runners.
-      - run: cargo test --workspace --exclude tritium-py # unit, integration, and doc tests
+      - run: cargo test --locked --workspace --exclude tritium-py # unit, integration, and doc tests
 
   # Guards the class of break from issue #1: Rust code behind GPU-toolkit
   # features (cuda / nccl / rocm / wgpu) that only the manual self-hosted lanes
@@ -61,20 +61,20 @@ jobs:
           components: clippy
       # nccl + device-loss-qualification both imply cuda; together they cover
       # every cuda-gated cfg in the backend crate.
-      - run: cargo clippy -p tritium-cuda --features nccl,device-loss-qualification --all-targets -- -D warnings
-      - run: cargo clippy -p tritium-rocm --features rocm --all-targets -- -D warnings
+      - run: cargo clippy --locked -p tritium-cuda --features nccl,device-loss-qualification --all-targets -- -D warnings
+      - run: cargo clippy --locked -p tritium-rocm --features rocm --all-targets -- -D warnings
       # register implies wgpu; hosted runners compile it fine (no adapter needed).
-      - run: cargo clippy -p tritium-wgpu --features register --all-targets -- -D warnings
+      - run: cargo clippy --locked -p tritium-wgpu --features register --all-targets -- -D warnings
       # Downstream cuda-gated consumers (tritium-cli/nccl implies its cuda).
-      - run: cargo clippy -p tritium-nn -p tritium-cli -p tritium-py -p tritium-salt -p tritium-benches --features tritium-nn/cuda,tritium-cli/nccl,tritium-py/cuda,tritium-salt/cuda,tritium-benches/cuda --all-targets -- -D warnings
+      - run: cargo clippy --locked -p tritium-nn -p tritium-cli -p tritium-py -p tritium-salt -p tritium-benches --features tritium-nn/cuda,tritium-cli/nccl,tritium-py/cuda,tritium-salt/cuda,tritium-benches/cuda --all-targets -- -D warnings
       # Downstream NON-NVIDIA consumers (issue #4). These link the wgpu/rocm backend
       # crates so their registrations reach the shipped `tritium` binary and the bench
       # harness. Checked as a separate invocation from the cuda line above precisely
       # because they must build WITHOUT cuda — that is the AMD-box configuration, and
       # a cfg that only compiles alongside `cuda` would pass the line above and still
       # be broken on the hardware this exists for.
-      - run: cargo clippy -p tritium-cli -p tritium-benches --features tritium-cli/wgpu,tritium-cli/rocm,tritium-cli/metal,tritium-benches/wgpu,tritium-benches/rocm,tritium-benches/metal --all-targets -- -D warnings
-      - run: cargo clippy -p tritium-serve --features cuda,e2e,device-loss-qualification --all-targets -- -D warnings
+      - run: cargo clippy --locked -p tritium-cli -p tritium-benches --features tritium-cli/wgpu,tritium-cli/rocm,tritium-cli/metal,tritium-benches/wgpu,tritium-benches/rocm,tritium-benches/metal --all-targets -- -D warnings
+      - run: cargo clippy --locked -p tritium-serve --features cuda,e2e,device-loss-qualification --all-targets -- -D warnings
 
   # Release compatibility claims are generated from a strict manifest. A cell
   # cannot become supported without a digest-bound, revision-bound pass receipt.
@@ -208,8 +208,8 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
-      - run: cargo test -p tritium-cuda --features cuda
-      - run: compute-sanitizer --tool memcheck cargo test -p tritium-cuda --features cuda
+      - run: cargo test --locked -p tritium-cuda --features cuda
+      - run: compute-sanitizer --tool memcheck cargo test --locked -p tritium-cuda --features cuda
 
   # metal lane (Apple-Silicon backend breadth). Self-hosted, manual — runs only on
   # an Apple-Silicon runner with a Metal device. Mirrors the disabled `wgpu`/`gpu`
@@ -229,8 +229,8 @@ jobs:
           components: clippy
       # Lint the macOS-only backend here — the Linux clippy lane cannot compile the
       # `cfg(target_os = "macos")` device code, so this is the only clippy coverage.
-      - run: cargo clippy -p tritium-metal --features register --all-targets -- -D warnings
-      - run: cargo test -p tritium-metal --features register
+      - run: cargo clippy --locked -p tritium-metal --features register --all-targets -- -D warnings
+      - run: cargo test --locked -p tritium-metal --features register
 
   # ROCm lane (AMD HIP conformance). Self-hosted, manual — mirrors the `gpu` (CUDA)
   # lane: runs only where a ROCm toolkit (hipcc) + an AMD GPU are present. The
@@ -248,8 +248,8 @@ jobs:
           components: clippy
       # Lint the rocm-feature-gated backend here — the Linux clippy lane cannot
       # compile it (no hipcc / HIP runtime), so this is the only clippy coverage.
-      - run: cargo clippy -p tritium-rocm --features rocm --all-targets -- -D warnings
-      - run: cargo test -p tritium-rocm --features rocm
+      - run: cargo clippy --locked -p tritium-rocm --features rocm --all-targets -- -D warnings
+      - run: cargo test --locked -p tritium-rocm --features rocm
 
   # Perf-regression lane (ADR 0005 WF-E / Pe). Scheduled on the pinned GPU box: runs
   # the end-to-end tokens/sec bench (which couples each perf number to an
@@ -267,14 +267,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
       # The bench fixtures + baseline/regression logic are unit-tested on every lane;
       # this asserts they hold under -D warnings on the GPU toolchain too.
-      - run: cargo test -p tritium-benches --features cuda
+      - run: cargo test --locked -p tritium-benches --features cuda
       # Compile the GPU + e2e benches (nvcc PTX build) and run the e2e tok/s bench.
       # The bench asserts perplexity-within-1% before timing (panics on drift), then
       # asserts the decode-only tok/s is not >5% below the recorded competitor baseline
       # — both `assert!`s fail the bench process and thus this job. The published
       # baseline is a conservative floor; tighten it to a `BuiltOnBox` number to make
       # the gate bite on real kernel regressions.
-      - run: cargo bench -p tritium-benches --features cuda --bench e2e
+      - run: cargo bench --locked -p tritium-benches --features cuda --bench e2e
 
   # CPU bench smoke (v0.90 hardening). Hosted ubuntu, every push: compiles ALL
   # benches (catches bench bit-rot, incl. the cuda-gated gpu_mpgemm/e2e shells)
@@ -290,8 +290,8 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
-      - run: cargo build -p tritium-benches --benches
-      - run: cargo bench -p tritium-benches --bench mpgemm
+      - run: cargo build --locked -p tritium-benches --benches
+      - run: cargo bench --locked -p tritium-benches --bench mpgemm
 
   # wasm lane (v0.70 backend breadth). Hosted ubuntu, no GPU, no sudo: adds the
   # wasm32-wasip1 target, installs the wasmtime CLI (Cranelift), and runs the
@@ -311,7 +311,7 @@ jobs:
       - uses: taiki-e/install-action@7f4eb899022d8fe70b20c4f3de697aa85c309026
         with:
           tool: wasmtime
-      - run: cargo test --target wasm32-wasip1 -p tritium-wasm
+      - run: cargo test --locked --target wasm32-wasip1 -p tritium-wasm
 
   # wgpu lane (v0.70 backend breadth). Self-hosted, manual — runs only where a
   # Vulkan adapter + driver are present (the 4090 box). Mirrors the disabled `gpu`
@@ -328,7 +328,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
       - name: vulkan runtime
         run: sudo apt-get update && sudo apt-get install -y libvulkan1 vulkan-tools
-      - run: cargo test -p tritium-wgpu --features register
+      - run: cargo test --locked -p tritium-wgpu --features register
 
   # serve contract lane (v0.80 interop). Hosted ubuntu, every push: the OpenAI
   # wire contract (schema, SSE framing, stream==buffered, finish_reason, stop
@@ -344,8 +344,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
           components: clippy
-      - run: cargo clippy -p tritium-serve --features serve --all-targets -- -D warnings
-      - run: cargo test -p tritium-serve --features serve
+      - run: cargo clippy --locked -p tritium-serve --features serve --all-targets -- -D warnings
+      - run: cargo test --locked -p tritium-serve --features serve
 
   # serve real-model e2e (v0.80). Manual — needs a GGUF + the e2e feature.
   serve-e2e:
@@ -355,7 +355,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
-      - run: cargo test -p tritium-serve --features e2e -- --ignored serve_e2e_token_id_roundtrip
+      - run: cargo test --locked -p tritium-serve --features e2e -- --ignored serve_e2e_token_id_roundtrip
 
   # candle interop lane (v0.80). Hosted ubuntu, every push: the candle `CustomOp1`
   # conformance gate proves the op reproduces the frozen vector set at the candle
@@ -373,8 +373,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
           components: clippy
-      - run: cargo clippy -p tritium-candle --features candle --all-targets -- -D warnings
-      - run: cargo test -p tritium-candle --features candle
+      - run: cargo clippy --locked -p tritium-candle --features candle --all-targets -- -D warnings
+      - run: cargo test --locked -p tritium-candle --features candle
 
   # burn interop lane (v0.80). Hosted ubuntu, every push: the burn host-round-trip
   # op conformance gate proves the op reproduces the frozen vector set at the burn
@@ -392,8 +392,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
           components: clippy
-      - run: cargo clippy -p tritium-burn --features burn --all-targets -- -D warnings
-      - run: cargo test -p tritium-burn --features burn
+      - run: cargo clippy --locked -p tritium-burn --features burn --all-targets -- -D warnings
+      - run: cargo test --locked -p tritium-burn --features burn
 
   # onnx custom-op lane (v0.80). Hosted ubuntu, every push: builds + tests the `ort`
   # 2.x custom operator (Layer 2). The always-on Layer-1 kernel conformance gate
@@ -413,8 +413,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
           components: clippy
-      - run: cargo clippy -p tritium-onnx --features onnx --all-targets -- -D warnings
-      - run: cargo test -p tritium-onnx --features onnx
+      - run: cargo clippy --locked -p tritium-onnx --features onnx --all-targets -- -D warnings
+      - run: cargo test --locked -p tritium-onnx --features onnx
 
   # Publish-readiness gate (ADR 0011 / v0.90): every workspace crate packages into a
   # valid .crate (manifest + files + version-pinned internal deps). See

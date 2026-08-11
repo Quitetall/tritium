@@ -46,23 +46,23 @@ case "$tier" in
         ;;
     prepush)
         run cargo fmt --all --check
-        run cargo clippy --workspace --all-targets -- -D warnings
+        run cargo clippy --locked --workspace --all-targets -- -D warnings
         ;;
     ci)
         run cargo fmt --all --check
-        run cargo clippy --workspace --all-targets -- -D warnings
+        run cargo clippy --locked --workspace --all-targets -- -D warnings
         # tritium-py is a PyO3 cdylib; standalone cargo-test binaries cannot
         # link Python without a development lib. Its shipped surface is gated
         # by the native wheel/pytest path below, matching CI's maturin lane.
-        run cargo test --workspace --exclude tritium-py --no-fail-fast
+        run cargo test --locked --workspace --exclude tritium-py --no-fail-fast
         run python -m unittest discover -s scripts/tests -p 'test_*.py'
         run python scripts/check-community-contract.py --json
         ;;
     release)
         run cargo fmt --all --check
         # Type-check every feature-gated surface without requiring GPU toolkits.
-        run env TRITIUM_CHECK_ONLY=1 cargo clippy --workspace --all-targets --all-features -- -D warnings
-        run cargo test --workspace --exclude tritium-py --no-fail-fast
+        run env TRITIUM_CHECK_ONLY=1 cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+        run cargo test --locked --workspace --exclude tritium-py --no-fail-fast
         run python -m unittest discover -s scripts/tests -p 'test_*.py'
         run python scripts/check-community-contract.py --json
         require_command cargo-deny
