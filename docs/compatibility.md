@@ -14,7 +14,7 @@ with the listed stable diagnostic instead of silently falling back.
 
 | Target | Status | Evidence / failure |
 |---|---|---|
-| Linux x86_64 CPU wheel | **qualified** | [`compatibility-v1.1/linux-x86_64-cpu.json`](../release/compatibility-v1.1/linux-x86_64-cpu.json) SHA-256 `bd0d82170df8f7d2e5b64bf7c8368080f7fa680f037713e0937681868bb99426`; revision `1df9d80ebcf52aeabcd2e14d357f58284c2d229b` |
+| Linux x86_64 CPU wheel | **qualified** | [`compatibility-v1.1/linux-x86_64-cpu.json`](../release/compatibility-v1.1/linux-x86_64-cpu.json) SHA-256 `942047ae75771b02ce071c8e8e7bd1c97f10ee4be886bb987754c79e8a1f149d`; revision `f1a0a65b215104e1699c898134f4299c7cb61504` |
 | macOS arm64 CPU wheel | **pending** | Fresh no-compiler wheel receipt is not yet archived. |
 | Windows x86_64 CPU wheel | **pending** | Fresh no-compiler wheel receipt is not yet archived. |
 
@@ -22,7 +22,7 @@ with the listed stable diagnostic instead of silently falling back.
 
 | Target | Status | Evidence / failure |
 |---|---|---|
-| CPython 3.9+ abi3 import | **qualified** | [`compatibility-v1.1/python-abi3-39-plus.json`](../release/compatibility-v1.1/python-abi3-39-plus.json) SHA-256 `c6bb865c13a114fc7f1e2347195cffaeef453088678d48f13443f3b710e37858`; revision `1df9d80ebcf52aeabcd2e14d357f58284c2d229b` |
+| CPython 3.9+ abi3 import | **pending** | Fresh cross-interpreter abi3 wheel receipt is not yet archived for current candidate. |
 | Supported PyTorch versions | **pending** | Torch ABI and operator conformance matrix is not yet qualified. |
 
 ## Accelerator
@@ -45,7 +45,7 @@ with the listed stable diagnostic instead of silently falling back.
 
 | Target | Status | Evidence / failure |
 |---|---|---|
-| Node.js 22+ strict-TypeScript archive | **qualified** | [`compatibility-v1.1/node-22.json`](../release/compatibility-v1.1/node-22.json) SHA-256 `90c142f5c10970ea7b616cff1c5b5d90b974bc059d2a423645de37ff8c673123`; revision `1df9d80ebcf52aeabcd2e14d357f58284c2d229b` |
+| Node.js 22+ strict-TypeScript archive | **qualified** | [`compatibility-v1.1/node-22.json`](../release/compatibility-v1.1/node-22.json) SHA-256 `12c3df0057fface0298624990e4029c3e528d3319bd2601333aa05058ecf7530`; revision `f1a0a65b215104e1699c898134f4299c7cb61504` |
 | Chrome WebGPU training | **pending** | Actual-browser WebGPU receipt is not yet archived. |
 | Firefox WebGPU training | **pending** | Actual-browser WebGPU receipt is not yet archived. |
 | Safari WebGPU training | **pending** | Actual-browser WebGPU receipt is not yet archived. |
