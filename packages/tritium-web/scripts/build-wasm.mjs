@@ -26,6 +26,27 @@ export function resolveCargoTargetDirectory(
   return resolve(repositoryRoot, configured);
 }
 
+export function canonicalSourceIdentity(head, status) {
+  const revision = typeof head === "string" ? head.trim() : "";
+  if (!/^[0-9a-f]{40}$/.test(revision)) {
+    throw new Error("Git HEAD must be a full lowercase object ID");
+  }
+  if (typeof status !== "string" || status.trim() !== "") {
+    throw new Error("WASM release builds require a clean Git worktree");
+  }
+  return `source-git:${revision}`;
+}
+
+async function resolveSourceIdentity(repositoryRoot = repository) {
+  const [{ stdout: head }, { stdout: status }] = await Promise.all([
+    run("git", ["rev-parse", "HEAD"], { cwd: repositoryRoot }),
+    run("git", ["status", "--porcelain=v1", "--untracked-files=all"], {
+      cwd: repositoryRoot,
+    }),
+  ]);
+  return canonicalSourceIdentity(head, status);
+}
+
 function readU32Leb(bytes, cursor) {
   let result = 0;
   let shift = 0;
@@ -79,6 +100,7 @@ export async function buildPortableWasm(output) {
     "wasm32-unknown-unknown/release/tritium_wasm.wasm",
   );
   await mkdir(generated, { recursive: true });
+  const sourceIdentity = await resolveSourceIdentity();
   await run(
     "cargo",
     [
@@ -90,7 +112,10 @@ export async function buildPortableWasm(output) {
       "--target",
       "wasm32-unknown-unknown",
     ],
-    { cwd: repository },
+    {
+      cwd: repository,
+      env: { ...process.env, TRITIUM_SOURCE_ID: sourceIdentity },
+    },
   );
   const { stdout: actualWasmBindgenVersion } = await run("wasm-bindgen", [
     "--version",
