@@ -84,8 +84,12 @@
       {
         "id": "node-22",
         "target": "Node.js 22+ strict-TypeScript archive",
-        "status": "pending",
-        "blocker": "Clean npm-pack install receipt is not yet archived."
+        "status": "qualified",
+        "receipt": {
+          "path": "compatibility-v1.1/node-22.json",
+          "sha256": "f88bc18f87bca33dfb96a88f9d976a6e4bd30a45fa010ebfb04137cec07bf3dc",
+          "source_revision": "a08bd09a7b7e3c80669244c042089473fbd2a22b"
+        }
       },
       {
         "id": "chrome-webgpu",
