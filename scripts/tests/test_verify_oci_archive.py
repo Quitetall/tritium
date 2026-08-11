@@ -53,6 +53,8 @@ def fixture(
     reversed_slsa_timestamps: bool = False,
     pax_metadata: bool = False,
     nested_index: bool = False,
+    empty_subject: bool = False,
+    invocation_id_key: str = "invocationID",
 ):
     revision = "a" * 40
     release = "1.1.0-rc.0"
@@ -133,7 +135,7 @@ def fixture(
         "runDetails": {
             "builder": {"id": builder_id},
             "metadata": {
-                "invocationID": "buildkit-invocation-123",
+                invocation_id_key: "buildkit-invocation-123",
                 "startedOn": "2026-07-21T00:00:00Z",
                 "finishedOn": "2026-07-21T00:01:00Z",
             },
@@ -156,14 +158,15 @@ def fixture(
             predicate = "https://evil.invalid/spdx-and-slsa"
         subject = "f" * 64 if wrong_subject else image_digest[7:]
         body = spdx if predicate == "https://spdx.dev/Document" else slsa
-        payload = encoded(
-            {
-                "_type": "https://in-toto.io/Statement/v1",
-                "predicateType": predicate,
-                "subject": [{"name": "image", "digest": {"sha256": subject}}],
-                "predicate": {} if empty_predicates else body,
-            }
-        )
+        statement = {
+            "_type": "https://in-toto.io/Statement/v1",
+            "predicateType": predicate,
+            "subject": []
+            if empty_subject
+            else [{"name": "image", "digest": {"sha256": subject}}],
+            "predicate": {} if empty_predicates else body,
+        }
+        payload = encoded(statement)
         item = descriptor(payload, "application/vnd.in-toto+json")
         item["annotations"] = {"in-toto.io/predicate-type": predicate}
         blobs[item["digest"][7:]] = payload
@@ -222,6 +225,15 @@ class VerifyOciArchiveTests(unittest.TestCase):
     def test_accepts_buildkit_nested_attested_index(self):
         with tempfile.TemporaryDirectory() as raw:
             archive, receipt, candidate = fixture(Path(raw), nested_index=True)
+            result = validate(archive, receipt, candidate)
+            self.assertEqual(len(result["predicates"]), 2)
+
+    def test_accepts_buildkit_empty_attestation_subject(self):
+        with tempfile.TemporaryDirectory() as raw:
+            archive, receipt, candidate = fixture(
+                Path(raw), nested_index=True, empty_subject=True,
+                invocation_id_key="invocationId",
+            )
             result = validate(archive, receipt, candidate)
             self.assertEqual(len(result["predicates"]), 2)
 

@@ -258,7 +258,18 @@ def _validate_slsa_v1(
     builder = _object(details.get("builder"), "SLSA builder")
     builder_id = _https_url(builder.get("id"), "SLSA builder identity")
     metadata = _object(details.get("metadata"), "SLSA run metadata")
-    invocation_id = _string(metadata.get("invocationID"), "SLSA invocation identity")
+    invocation_id_upper = metadata.get("invocationID")
+    invocation_id_lower = metadata.get("invocationId")
+    if (
+        invocation_id_upper is not None
+        and invocation_id_lower is not None
+        and invocation_id_upper != invocation_id_lower
+    ):
+        raise OciArchiveError("SLSA invocation identities differ")
+    invocation_id = _string(
+        invocation_id_upper if invocation_id_upper is not None else invocation_id_lower,
+        "SLSA invocation identity",
+    )
     started = _timestamp(metadata.get("startedOn"), "SLSA build start timestamp")
     finished = _timestamp(metadata.get("finishedOn"), "SLSA build finish timestamp")
     if finished < started:
@@ -521,7 +532,14 @@ def inspect(
             ):
                 raise OciArchiveError("attestation statement type or predicate differs")
             subjects = payload.get("subject")
-            if not isinstance(subjects, list) or not any(
+            if not isinstance(subjects, list):
+                raise OciArchiveError("attestation subject does not bind image manifest")
+            # BuildKit's OCI exporter emits semantic SPDX/SLSA statements with
+            # an empty in-toto subject, while the enclosing attestation
+            # descriptor binds that statement to image_digest. Reject any
+            # non-empty subject that fails its own image binding; accept the
+            # exporter form only after descriptor-level binding above.
+            if subjects and not any(
                 isinstance(subject, dict)
                 and isinstance(subject.get("digest"), dict)
                 and subject["digest"].get("sha256") == image_digest[7:]
