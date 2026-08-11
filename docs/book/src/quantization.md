@@ -196,8 +196,10 @@ exact 506-record evidence namespace and one campaign-wide token stream, widens
 only one matrix at a time, resumes valid content-addressed masters, and seals a
 canonical structural receipt. It does **not** return a deployable model: profile
 allocation, package assembly, evaluation, and export remain governed later
-stages. The high-level raw-calibration `tritium.torch.quantize(...)` facade is
-still under implementation in plan 0047.
+stages. The high-level `tritium.torch.quantize(...)` facade now composes
+`prepare` → `calibrate` → `convert` for this Qwen source path. Live
+`torch.nn.Module` PTQ uses activation calibration and returns a module-scoped
+conversion result; it does not silently substitute Qwen S2KF evidence.
 
 ## Hardware constraints (load-bearing)
 
