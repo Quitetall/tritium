@@ -14,6 +14,9 @@
 # Usage:  ./scripts/check-semver.sh [baseline-rev]
 #         ./scripts/check-semver.sh --print-baseline
 # Needs:  cargo-semver-checks (cargo install cargo-semver-checks --locked).
+# The checker can require a newer compiler than this workspace's declared MSRV;
+# run it with the newest installed stable toolchain by default, while retaining
+# an override for hermetic CI images (`TRITIUM_SEMVER_TOOLCHAIN=1.95`).
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
@@ -44,7 +47,9 @@ main() {
   local baseline="${1:-$(latest_stable_baseline)}"
   echo "[check-semver] baseline rev: $baseline"
 
-  exec cargo semver-checks --baseline-rev "$baseline" \
+  local toolchain="${TRITIUM_SEMVER_TOOLCHAIN:-stable}"
+  echo "[check-semver] toolchain: $toolchain"
+  exec cargo "+$toolchain" semver-checks --baseline-rev "$baseline" \
     -p tritium-core \
     -p tritium-spec \
     -p tritium-format \
