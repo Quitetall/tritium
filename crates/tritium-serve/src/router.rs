@@ -172,6 +172,12 @@ impl Default for RequestLimits {
 const REQUEST_DURATION_BUCKET_US: [u64; 8] = [
     1_000, 5_000, 10_000, 50_000, 100_000, 500_000, 1_000_000, 5_000_000,
 ];
+const GENERATION_DURATION_BUCKET_US: [u64; 8] = [
+    1_000, 5_000, 10_000, 50_000, 100_000, 500_000, 1_000_000, 5_000_000,
+];
+const TTFT_BUCKET_US: [u64; 8] = [
+    1_000, 5_000, 10_000, 50_000, 100_000, 500_000, 1_000_000, 5_000_000,
+];
 
 #[derive(Debug, Default)]
 pub(crate) struct Metrics {
@@ -199,22 +205,65 @@ pub(crate) struct Metrics {
     pub(crate) request_duration_sum_us: AtomicU64,
     /// Count of observed request durations.
     pub(crate) request_duration_count: AtomicU64,
+    /// Fixed-cardinality end-to-end generation-duration histogram buckets.
+    pub(crate) generation_duration_buckets: [AtomicU64; GENERATION_DURATION_BUCKET_US.len()],
+    /// Sum of observed generation durations in microseconds.
+    pub(crate) generation_duration_sum_us: AtomicU64,
+    /// Count of observed generation durations.
+    pub(crate) generation_duration_count: AtomicU64,
+    /// Fixed-cardinality time-to-first-token histogram buckets.
+    pub(crate) ttft_buckets: [AtomicU64; TTFT_BUCKET_US.len()],
+    /// Sum of observed time-to-first-token durations in microseconds.
+    pub(crate) ttft_sum_us: AtomicU64,
+    /// Count of observed time-to-first-token observations.
+    pub(crate) ttft_count: AtomicU64,
 }
 
 impl Metrics {
     fn observe_request(&self, elapsed: Duration) {
-        let micros = elapsed.as_micros().min(u128::from(u64::MAX)) as u64;
-        self.request_duration_sum_us
-            .fetch_add(micros, Ordering::Relaxed);
-        self.request_duration_count.fetch_add(1, Ordering::Relaxed);
-        for (bucket, ceiling) in self
-            .request_duration_buckets
-            .iter()
-            .zip(REQUEST_DURATION_BUCKET_US)
-        {
-            if micros <= ceiling {
-                bucket.fetch_add(1, Ordering::Relaxed);
-            }
+        observe_histogram(
+            elapsed,
+            &self.request_duration_buckets,
+            &self.request_duration_sum_us,
+            &self.request_duration_count,
+            REQUEST_DURATION_BUCKET_US,
+        );
+    }
+
+    fn observe_generation(&self, elapsed: Duration) {
+        observe_histogram(
+            elapsed,
+            &self.generation_duration_buckets,
+            &self.generation_duration_sum_us,
+            &self.generation_duration_count,
+            GENERATION_DURATION_BUCKET_US,
+        );
+    }
+
+    fn observe_ttft(&self, elapsed: Duration) {
+        observe_histogram(
+            elapsed,
+            &self.ttft_buckets,
+            &self.ttft_sum_us,
+            &self.ttft_count,
+            TTFT_BUCKET_US,
+        );
+    }
+}
+
+fn observe_histogram(
+    elapsed: Duration,
+    buckets: &[AtomicU64; 8],
+    sum_us: &AtomicU64,
+    count: &AtomicU64,
+    ceilings_us: [u64; 8],
+) {
+    let micros = elapsed.as_micros().min(u128::from(u64::MAX)) as u64;
+    sum_us.fetch_add(micros, Ordering::Relaxed);
+    count.fetch_add(1, Ordering::Relaxed);
+    for (bucket, ceiling) in buckets.iter().zip(ceilings_us) {
+        if micros <= ceiling {
+            bucket.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -245,12 +294,25 @@ impl Drop for RequestMetricsGuard {
 
 struct GenerationMetricsGuard {
     metrics: Arc<Metrics>,
+    started: Instant,
+    first_token_seen: bool,
 }
 
 impl GenerationMetricsGuard {
-    fn new(metrics: Arc<Metrics>) -> Self {
+    fn with_start(metrics: Arc<Metrics>, started: Instant) -> Self {
         metrics.generations_active.fetch_add(1, Ordering::Relaxed);
-        Self { metrics }
+        Self {
+            metrics,
+            started,
+            first_token_seen: false,
+        }
+    }
+
+    fn observe_first_token(&mut self) {
+        if !self.first_token_seen {
+            self.first_token_seen = true;
+            self.metrics.observe_ttft(self.started.elapsed());
+        }
     }
 }
 
@@ -259,6 +321,7 @@ impl Drop for GenerationMetricsGuard {
         self.metrics
             .generations_active
             .fetch_sub(1, Ordering::Relaxed);
+        self.metrics.observe_generation(self.started.elapsed());
     }
 }
 
@@ -1004,6 +1067,9 @@ async fn chat_completions(
     };
 
     let (tx, rx) = mpsc::channel::<GenEvent>(64);
+    // Start latency accounting before queue admission so generation duration
+    // includes bounded queue wait, not only response-body consumption.
+    let generation_started = Instant::now();
     match st.jobs.try_send(Job::Generate { req: gen_req, tx }) {
         Ok(()) => {
             st.metrics.chat_requests.fetch_add(1, Ordering::Relaxed);
@@ -1041,6 +1107,7 @@ async fn chat_completions(
             req.model,
             stops,
             st.metrics.clone(),
+            generation_started,
             include_usage.then_some(prompt_len),
             st.request_timeout,
         )
@@ -1052,6 +1119,7 @@ async fn chat_completions(
             prompt_len,
             stops,
             st.metrics.clone(),
+            generation_started,
         )
         .await
     }
@@ -1064,8 +1132,10 @@ async fn nonstream_response(
     prompt_len: usize,
     stops: Vec<String>,
     metrics: Arc<Metrics>,
+    generation_started: Instant,
 ) -> Response {
-    let _generation_metrics = GenerationMetricsGuard::new(metrics.clone());
+    let mut generation_metrics =
+        GenerationMetricsGuard::with_start(metrics.clone(), generation_started);
     let eos = tok.eos();
     let detok_ref = tok.clone();
     // Mirror the streaming loop: incremental detok + stop-matcher, BREAK on a
@@ -1082,6 +1152,7 @@ async fn nonstream_response(
         match ev {
             GenEvent::Token(t, lp) => {
                 if t != eos {
+                    generation_metrics.observe_first_token();
                     completion_tokens += 1;
                     metrics.tokens_out.fetch_add(1, Ordering::Relaxed);
                     if let Some(lp) = lp {
@@ -1170,12 +1241,14 @@ fn sse_data(chunk: &ChatChunk) -> Event {
     Event::default().data(serde_json::to_string(chunk).unwrap_or_default())
 }
 
+#[allow(clippy::too_many_arguments)] // wire contract keeps stream controls explicit
 fn stream_response(
     mut rx: mpsc::Receiver<GenEvent>,
     tok: Arc<dyn Tokenizer + Send + Sync>,
     model: String,
     stops: Vec<String>,
     metrics: Arc<Metrics>,
+    generation_started: Instant,
     // `Some(prompt_tokens)` when the client asked for
     // `stream_options.include_usage`: emit the final usage chunk.
     usage_prompt_len: Option<usize>,
@@ -1193,9 +1266,10 @@ fn stream_response(
         // an overflowing lifetime into an unbounded stream.
         now.checked_add(budget).unwrap_or(now)
     });
-    let generation_metrics = GenerationMetricsGuard::new(metrics.clone());
+    let generation_metrics =
+        GenerationMetricsGuard::with_start(metrics.clone(), generation_started);
     let stream = async_stream::stream! {
-        let _generation_metrics = generation_metrics;
+        let mut generation_metrics = generation_metrics;
         let mut disconnect = StreamDisconnectGuard {
             metrics: metrics.clone(),
             completed: false,
@@ -1230,6 +1304,7 @@ fn stream_response(
                     // Count like the non-stream path: eos terminates, it is
                     // not an emitted completion token.
                     if t != detok_eos {
+                        generation_metrics.observe_first_token();
                         metrics.tokens_out.fetch_add(1, Ordering::Relaxed);
                         completion_tokens += 1;
                         // Buffer the row: text may be held back (StopMatcher
@@ -1437,6 +1512,18 @@ async fn metrics(State(st): State<AppState>) -> Response {
         .iter()
         .map(|bucket| bucket.load(Ordering::Relaxed));
     let request_buckets: Vec<u64> = request_buckets.collect();
+    let generation_buckets: Vec<u64> = st
+        .metrics
+        .generation_duration_buckets
+        .iter()
+        .map(|bucket| bucket.load(Ordering::Relaxed))
+        .collect();
+    let ttft_buckets: Vec<u64> = st
+        .metrics
+        .ttft_buckets
+        .iter()
+        .map(|bucket| bucket.load(Ordering::Relaxed))
+        .collect();
     let body = format!(
         "# HELP tritium_chat_requests_total Chat completions accepted into the queue.\n\
          # TYPE tritium_chat_requests_total counter\n\
@@ -1478,6 +1565,32 @@ async fn metrics(State(st): State<AppState>) -> Response {
          tritium_request_duration_seconds_bucket{{le=\"+Inf\"}} {}\n\
          tritium_request_duration_seconds_sum {}\n\
          tritium_request_duration_seconds_count {}\n\
+         # HELP tritium_generation_duration_seconds End-to-end accepted generation duration, including queue wait.\n\
+         # TYPE tritium_generation_duration_seconds histogram\n\
+         tritium_generation_duration_seconds_bucket{{le=\"0.001\"}} {}\n\
+         tritium_generation_duration_seconds_bucket{{le=\"0.005\"}} {}\n\
+         tritium_generation_duration_seconds_bucket{{le=\"0.01\"}} {}\n\
+         tritium_generation_duration_seconds_bucket{{le=\"0.05\"}} {}\n\
+         tritium_generation_duration_seconds_bucket{{le=\"0.1\"}} {}\n\
+         tritium_generation_duration_seconds_bucket{{le=\"0.5\"}} {}\n\
+         tritium_generation_duration_seconds_bucket{{le=\"1\"}} {}\n\
+         tritium_generation_duration_seconds_bucket{{le=\"5\"}} {}\n\
+         tritium_generation_duration_seconds_bucket{{le=\"+Inf\"}} {}\n\
+         tritium_generation_duration_seconds_sum {}\n\
+         tritium_generation_duration_seconds_count {}\n\
+         # HELP tritium_time_to_first_token_seconds Time from generation admission to first emitted token.\n\
+         # TYPE tritium_time_to_first_token_seconds histogram\n\
+         tritium_time_to_first_token_seconds_bucket{{le=\"0.001\"}} {}\n\
+         tritium_time_to_first_token_seconds_bucket{{le=\"0.005\"}} {}\n\
+         tritium_time_to_first_token_seconds_bucket{{le=\"0.01\"}} {}\n\
+         tritium_time_to_first_token_seconds_bucket{{le=\"0.05\"}} {}\n\
+         tritium_time_to_first_token_seconds_bucket{{le=\"0.1\"}} {}\n\
+         tritium_time_to_first_token_seconds_bucket{{le=\"0.5\"}} {}\n\
+         tritium_time_to_first_token_seconds_bucket{{le=\"1\"}} {}\n\
+         tritium_time_to_first_token_seconds_bucket{{le=\"5\"}} {}\n\
+         tritium_time_to_first_token_seconds_bucket{{le=\"+Inf\"}} {}\n\
+         tritium_time_to_first_token_seconds_sum {}\n\
+         tritium_time_to_first_token_seconds_count {}\n\
          # HELP tritium_queue_depth Jobs waiting in the decode queue.\n\
          # TYPE tritium_queue_depth gauge\n\
          tritium_queue_depth {}\n\
@@ -1536,6 +1649,31 @@ async fn metrics(State(st): State<AppState>) -> Response {
         st.metrics.request_duration_count.load(Ordering::Relaxed),
         st.metrics.request_duration_sum_us.load(Ordering::Relaxed) as f64 / 1_000_000.0,
         st.metrics.request_duration_count.load(Ordering::Relaxed),
+        generation_buckets[0],
+        generation_buckets[1],
+        generation_buckets[2],
+        generation_buckets[3],
+        generation_buckets[4],
+        generation_buckets[5],
+        generation_buckets[6],
+        generation_buckets[7],
+        st.metrics.generation_duration_count.load(Ordering::Relaxed),
+        st.metrics
+            .generation_duration_sum_us
+            .load(Ordering::Relaxed) as f64
+            / 1_000_000.0,
+        st.metrics.generation_duration_count.load(Ordering::Relaxed),
+        ttft_buckets[0],
+        ttft_buckets[1],
+        ttft_buckets[2],
+        ttft_buckets[3],
+        ttft_buckets[4],
+        ttft_buckets[5],
+        ttft_buckets[6],
+        ttft_buckets[7],
+        st.metrics.ttft_count.load(Ordering::Relaxed),
+        st.metrics.ttft_sum_us.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+        st.metrics.ttft_count.load(Ordering::Relaxed),
         queue_depth,
         u8::from(st.runtime.worker_alive.load(Ordering::Relaxed)),
         st.runtime.backend_faults.load(Ordering::Relaxed),
