@@ -1422,6 +1422,7 @@ async fn metrics_exposition() {
     let text = String::from_utf8(body).unwrap();
     assert!(text.contains("tritium_chat_requests_total 2\n"), "{text}");
     assert!(text.contains("tritium_tokens_out_total 6\n"), "{text}");
+    assert!(text.contains("tritium_tokens_in_total 2\n"), "{text}");
     assert!(
         text.contains("tritium_queue_rejections_total 0\n"),
         "{text}"

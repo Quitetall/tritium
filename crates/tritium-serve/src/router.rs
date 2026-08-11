@@ -183,6 +183,8 @@ pub(crate) struct Metrics {
     pub(crate) rate_rejections: AtomicU64,
     /// Completion tokens emitted to clients across all requests.
     pub(crate) tokens_out: AtomicU64,
+    /// Prompt tokens accepted into the generation queue.
+    pub(crate) tokens_in: AtomicU64,
     /// Streaming generations cancelled after exceeding their lifetime budget.
     pub(crate) stream_timeouts: AtomicU64,
     /// SSE bodies dropped before a terminal event, causing cooperative cancellation.
@@ -984,6 +986,9 @@ async fn chat_completions(
     match st.jobs.try_send(Job::Generate { req: gen_req, tx }) {
         Ok(()) => {
             st.metrics.chat_requests.fetch_add(1, Ordering::Relaxed);
+            st.metrics
+                .tokens_in
+                .fetch_add(prompt_len as u64, Ordering::Relaxed);
         }
         Err(mpsc::error::TrySendError::Full(_)) => {
             st.metrics.queue_rejections.fetch_add(1, Ordering::Relaxed);
@@ -1421,6 +1426,9 @@ async fn metrics(State(st): State<AppState>) -> Response {
          # HELP tritium_tokens_out_total Completion tokens emitted to clients.\n\
          # TYPE tritium_tokens_out_total counter\n\
          tritium_tokens_out_total {}\n\
+         # HELP tritium_tokens_in_total Prompt tokens accepted into the generation queue.\n\
+         # TYPE tritium_tokens_in_total counter\n\
+         tritium_tokens_in_total {}\n\
          # HELP tritium_stream_timeouts_total Streaming generations cancelled at their lifetime deadline.\n\
          # TYPE tritium_stream_timeouts_total counter\n\
          tritium_stream_timeouts_total {}\n\
@@ -1485,6 +1493,7 @@ async fn metrics(State(st): State<AppState>) -> Response {
         st.metrics.queue_rejections.load(Ordering::Relaxed),
         st.metrics.rate_rejections.load(Ordering::Relaxed),
         st.metrics.tokens_out.load(Ordering::Relaxed),
+        st.metrics.tokens_in.load(Ordering::Relaxed),
         st.metrics.stream_timeouts.load(Ordering::Relaxed),
         st.metrics.stream_disconnects.load(Ordering::Relaxed),
         st.metrics.requests_inflight.load(Ordering::Relaxed),
