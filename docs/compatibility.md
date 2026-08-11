@@ -14,7 +14,7 @@ with the listed stable diagnostic instead of silently falling back.
 
 | Target | Status | Evidence / failure |
 |---|---|---|
-| Linux x86_64 CPU wheel | **qualified** | [`compatibility-v1.1/linux-x86_64-cpu.json`](../release/compatibility-v1.1/linux-x86_64-cpu.json) SHA-256 `558a8078504d7d70330161759d05020541f21fb40fe30ade91e06d2ed869b00d`; revision `c31dcf0b43bb3eba1da4499fa786e82b2336467e` |
+| Linux x86_64 CPU wheel | **qualified** | [`compatibility-v1.1/linux-x86_64-cpu.json`](../release/compatibility-v1.1/linux-x86_64-cpu.json) SHA-256 `bd0d82170df8f7d2e5b64bf7c8368080f7fa680f037713e0937681868bb99426`; revision `1df9d80ebcf52aeabcd2e14d357f58284c2d229b` |
 | macOS arm64 CPU wheel | **pending** | Fresh no-compiler wheel receipt is not yet archived. |
 | Windows x86_64 CPU wheel | **pending** | Fresh no-compiler wheel receipt is not yet archived. |
 
@@ -22,7 +22,7 @@ with the listed stable diagnostic instead of silently falling back.
 
 | Target | Status | Evidence / failure |
 |---|---|---|
-| CPython 3.9+ abi3 import | **qualified** | [`compatibility-v1.1/python-abi3-39-plus.json`](../release/compatibility-v1.1/python-abi3-39-plus.json) SHA-256 `3feae298c762a709db9fe4781fa14ca6c3178f89b52733d31821e86f02d0385a`; revision `26394023d6c311b1c2b23cb06382155f5811b8ca` |
+| CPython 3.9+ abi3 import | **qualified** | [`compatibility-v1.1/python-abi3-39-plus.json`](../release/compatibility-v1.1/python-abi3-39-plus.json) SHA-256 `c6bb865c13a114fc7f1e2347195cffaeef453088678d48f13443f3b710e37858`; revision `1df9d80ebcf52aeabcd2e14d357f58284c2d229b` |
 | Supported PyTorch versions | **pending** | Torch ABI and operator conformance matrix is not yet qualified. |
 
 ## Accelerator
@@ -45,7 +45,7 @@ with the listed stable diagnostic instead of silently falling back.
 
 | Target | Status | Evidence / failure |
 |---|---|---|
-| Node.js 22+ strict-TypeScript archive | **qualified** | [`compatibility-v1.1/node-22.json`](../release/compatibility-v1.1/node-22.json) SHA-256 `f88bc18f87bca33dfb96a88f9d976a6e4bd30a45fa010ebfb04137cec07bf3dc`; revision `a08bd09a7b7e3c80669244c042089473fbd2a22b` |
+| Node.js 22+ strict-TypeScript archive | **qualified** | [`compatibility-v1.1/node-22.json`](../release/compatibility-v1.1/node-22.json) SHA-256 `90c142f5c10970ea7b616cff1c5b5d90b974bc059d2a423645de37ff8c673123`; revision `1df9d80ebcf52aeabcd2e14d357f58284c2d229b` |
 | Chrome WebGPU training | **pending** | Actual-browser WebGPU receipt is not yet archived. |
 | Firefox WebGPU training | **pending** | Actual-browser WebGPU receipt is not yet archived. |
 | Safari WebGPU training | **pending** | Actual-browser WebGPU receipt is not yet archived. |
