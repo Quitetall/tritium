@@ -72,6 +72,24 @@ Verification requires:
 - digest-bound in-toto/SLSA v1 provenance tied to artifact SHA-256, source
   revision and builder identity.
 
+For the browser package, build the exact npm archive first, then generate its
+closed CycloneDX inventory from archive bytes. The generator rejects path
+traversal, links, duplicate members, package identity drift and unsafe archive
+topology; every regular member is hashed and linked from the root component:
+
+```bash
+npm pack ./packages/tritium-web --pack-destination release/v1.1
+python scripts/generate-npm-sbom.py \
+  --archive release/v1.1/tritium-ai-web-1.1.0-rc.1.tgz \
+  --artifact-id tritium-web-node22 \
+  --source-revision "$(git rev-parse HEAD)" \
+  --output release/v1.1/tritium-web-node22.cdx.json
+```
+
+Npm archive qualification remains separate: an SBOM proves package bytes and
+topology, while browser training and offline-install receipts prove runtime
+behavior.
+
 Canonical flat `model-bundle` and `onnx-bundle` tar archives get complete member
 inventories through `scripts/generate-bundle-sbom.py`. Canonical input uses
 POSIX ustar as `.tar` or one zstd-compressed `.tar.zst`/`.tzst`; auto-detected
