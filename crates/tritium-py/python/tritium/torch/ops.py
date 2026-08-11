@@ -318,6 +318,46 @@ def _native_cpu_backward_supported(
     )
 
 
+def _ternary_linear_cpu_native(
+    input: torch.Tensor, master: torch.Tensor, bias: Optional[torch.Tensor]
+) -> Optional[torch.Tensor]:
+    """Run native CPU forward without entering the dispatcher shim.
+
+    Inference callers do not need a graph-visible custom-op boundary. Keeping
+    this fast path separate preserves autograd semantics while avoiding a
+    measurable Python custom-op trampoline for decode-sized batches.
+    """
+
+    if not _native_cpu_supported(input, master, bias):
+        return None
+    detached_input = input.detach()
+    detached_master = master.detach()
+    detached_bias = bias.detach() if bias is not None else None
+    version = int(master._version)
+    storage_identity = int(master.untyped_storage()._cdata)
+    capsule = _NATIVE_CPU_FORWARD(
+        detached_input,
+        detached_master,
+        detached_bias,
+        None,
+        master,
+        version,
+        storage_identity,
+    )
+    if capsule is None:
+        scales = detached_master.abs().mean(dim=1)
+        capsule = _NATIVE_CPU_FORWARD(
+            detached_input,
+            detached_master,
+            detached_bias,
+            scales,
+            master,
+            version,
+            storage_identity,
+        )
+    return torch.from_dlpack(capsule) if capsule is not None else None
+
+
 @torch.library.custom_op(
     "tritium::ternary_linear",
     mutates_args=(),
@@ -328,34 +368,9 @@ def _ternary_linear_dispatch(
 ) -> torch.Tensor:
     """Hard ternary Linear over tensors resident on the current CPU/CUDA device."""
 
-    if _native_cpu_supported(input, master, bias):
-        detached_input = input.detach()
-        detached_master = master.detach()
-        detached_bias = bias.detach() if bias is not None else None
-        version = int(master._version)
-        storage_identity = int(master.untyped_storage()._cdata)
-        capsule = _NATIVE_CPU_FORWARD(
-            detached_input,
-            detached_master,
-            detached_bias,
-            None,
-            master,
-            version,
-            storage_identity,
-        )
-        if capsule is None:
-            scales = detached_master.abs().mean(dim=1)
-            capsule = _NATIVE_CPU_FORWARD(
-                detached_input,
-                detached_master,
-                detached_bias,
-                scales,
-                master,
-                version,
-                storage_identity,
-            )
-        if capsule is not None:
-            return torch.from_dlpack(capsule)
+    native = _ternary_linear_cpu_native(input, master, bias)
+    if native is not None:
+        return native
     _validate_linear_inputs(input, master, bias)
     if _native_cuda_supported(input, master, bias):
         detached_input = input.detach()
@@ -599,6 +614,10 @@ def ternary_linear(
 ) -> torch.Tensor:
     """Hard ternary Linear with graph-visible CPU/CUDA autocast semantics."""
 
+    if input.device.type == "cpu" and not torch.is_grad_enabled():
+        native = _ternary_linear_cpu_native(input, master, bias)
+        if native is not None:
+            return native
     if input.device.type == "cuda" and torch.is_autocast_enabled("cuda"):
         return _ternary_linear_cuda_autocast(input, master, bias)
     if input.device.type == "cpu" and torch.is_autocast_enabled("cpu"):
