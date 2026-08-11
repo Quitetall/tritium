@@ -67,7 +67,10 @@ def package_inventory_sha256(candidate_document: dict[str, Any]) -> str:
     for ordinal, artifact in enumerate(artifacts):
         if not isinstance(artifact, dict):
             raise OciError(f"candidate artifact {ordinal} must be an object")
-        if artifact.get("kind") in PACKAGE_ARTIFACT_KINDS:
+        for field in ("id", "kind", "path"):
+            if not isinstance(artifact.get(field), str) or not artifact[field]:
+                raise OciError(f"candidate artifact {ordinal} {field} is malformed")
+        if artifact["kind"] in PACKAGE_ARTIFACT_KINDS:
             continue
         identity = artifact.get("identity")
         if not isinstance(identity, dict):

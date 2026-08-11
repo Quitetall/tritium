@@ -301,6 +301,17 @@ class VerifyOciArchiveTests(unittest.TestCase):
             with self.assertRaisesRegex(OciError, "package inventory"):
                 validate(archive, receipt, final_candidate)
 
+    def test_package_inventory_rejects_malformed_package_fields(self):
+        with self.assertRaisesRegex(OciError, "candidate artifact 0 id"):
+            package_inventory_sha256({
+                "artifacts": [{
+                    "id": None,
+                    "kind": "rust-crate",
+                    "path": "package.crate",
+                    "identity": {},
+                }],
+            })
+
     def test_accepts_buildkit_nested_attested_index(self):
         with tempfile.TemporaryDirectory() as raw:
             archive, receipt, candidate = fixture(Path(raw), nested_index=True)
