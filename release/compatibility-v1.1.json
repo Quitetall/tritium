@@ -30,8 +30,12 @@
       {
         "id": "python-abi3-39-plus",
         "target": "CPython 3.9+ abi3 import",
-        "status": "pending",
-        "blocker": "Per-version clean-wheel receipts are not yet archived."
+        "status": "qualified",
+        "receipt": {
+          "path": "compatibility-v1.1/python-abi3-39-plus.json",
+          "sha256": "3feae298c762a709db9fe4781fa14ca6c3178f89b52733d31821e86f02d0385a",
+          "source_revision": "26394023d6c311b1c2b23cb06382155f5811b8ca"
+        }
       },
       {
         "id": "pytorch-version-matrix",

@@ -22,7 +22,7 @@ with the listed stable diagnostic instead of silently falling back.
 
 | Target | Status | Evidence / failure |
 |---|---|---|
-| CPython 3.9+ abi3 import | **pending** | Per-version clean-wheel receipts are not yet archived. |
+| CPython 3.9+ abi3 import | **qualified** | [`compatibility-v1.1/python-abi3-39-plus.json`](../release/compatibility-v1.1/python-abi3-39-plus.json) SHA-256 `3feae298c762a709db9fe4781fa14ca6c3178f89b52733d31821e86f02d0385a`; revision `26394023d6c311b1c2b23cb06382155f5811b8ca` |
 | Supported PyTorch versions | **pending** | Torch ABI and operator conformance matrix is not yet qualified. |
 
 ## Accelerator

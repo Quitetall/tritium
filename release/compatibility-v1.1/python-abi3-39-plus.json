@@ -1,0 +1,22 @@
+{
+  "schema": "tritium.compatibility-receipt.v1",
+  "target_id": "python-abi3-39-plus",
+  "source_revision": "26394023d6c311b1c2b23cb06382155f5811b8ca",
+  "passed": true,
+  "install_smoke": true,
+  "host_os": "linux",
+  "host_arch": "x86_64",
+  "manylinux_image": "quay.io/pypa/manylinux_2_28_x86_64:latest",
+  "wheel": "tritium_torch-1.1.0rc1-cp39-abi3-manylinux_2_28_x86_64.whl",
+  "wheel_sha256": "7df7289cbe2577fa694afe450f67ca400fe46147fcbd8926d6ba0f9693eb9904",
+  "wheel_bytes": 10126509,
+  "tested_interpreters": [
+    "CPython 3.9.25",
+    "CPython 3.10.20",
+    "CPython 3.11.15",
+    "CPython 3.12.13",
+    "CPython 3.13.14",
+    "CPython 3.14.6"
+  ],
+  "all_install_smokes_passed": true
+}
