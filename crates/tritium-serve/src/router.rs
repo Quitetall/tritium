@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::State;
 use axum::extract::rejection::JsonRejection;
@@ -169,6 +169,10 @@ impl Default for RequestLimits {
 
 /// Serve-level counters for `/metrics` (Prometheus text format, no deps).
 /// Counters are monotone; gauges are computed at scrape time.
+const REQUEST_DURATION_BUCKET_US: [u64; 8] = [
+    1_000, 5_000, 10_000, 50_000, 100_000, 500_000, 1_000_000, 5_000_000,
+];
+
 #[derive(Debug, Default)]
 pub(crate) struct Metrics {
     /// Chat completions accepted into the queue (streaming + non-streaming).
@@ -183,6 +187,56 @@ pub(crate) struct Metrics {
     pub(crate) stream_timeouts: AtomicU64,
     /// SSE bodies dropped before a terminal event, causing cooperative cancellation.
     pub(crate) stream_disconnects: AtomicU64,
+    /// HTTP requests currently inside authenticated router middleware.
+    pub(crate) requests_inflight: AtomicU64,
+    /// Fixed-cardinality request-duration histogram buckets.
+    pub(crate) request_duration_buckets: [AtomicU64; REQUEST_DURATION_BUCKET_US.len()],
+    /// Sum of observed request durations in microseconds.
+    pub(crate) request_duration_sum_us: AtomicU64,
+    /// Count of observed request durations.
+    pub(crate) request_duration_count: AtomicU64,
+}
+
+impl Metrics {
+    fn observe_request(&self, elapsed: Duration) {
+        let micros = elapsed.as_micros().min(u128::from(u64::MAX)) as u64;
+        self.request_duration_sum_us
+            .fetch_add(micros, Ordering::Relaxed);
+        self.request_duration_count.fetch_add(1, Ordering::Relaxed);
+        for (bucket, ceiling) in self
+            .request_duration_buckets
+            .iter()
+            .zip(REQUEST_DURATION_BUCKET_US)
+        {
+            if micros <= ceiling {
+                bucket.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+struct RequestMetricsGuard {
+    metrics: Arc<Metrics>,
+    started: Instant,
+}
+
+impl RequestMetricsGuard {
+    fn new(metrics: Arc<Metrics>) -> Self {
+        metrics.requests_inflight.fetch_add(1, Ordering::Relaxed);
+        Self {
+            metrics,
+            started: Instant::now(),
+        }
+    }
+}
+
+impl Drop for RequestMetricsGuard {
+    fn drop(&mut self) {
+        self.metrics
+            .requests_inflight
+            .fetch_sub(1, Ordering::Relaxed);
+        self.metrics.observe_request(self.started.elapsed());
+    }
 }
 
 struct StreamDisconnectGuard {
@@ -589,6 +643,7 @@ fn build_router_inner(
             let admission = admission.clone();
             let metrics = metrics_state.clone();
             async move {
+                let _request_metrics = RequestMetricsGuard::new(metrics.clone());
                 let presented = req
                     .headers()
                     .get(axum::http::header::AUTHORIZATION)
@@ -1347,6 +1402,12 @@ async fn readiness(State(st): State<AppState>) -> Response {
 async fn metrics(State(st): State<AppState>) -> Response {
     let queue_depth = st.jobs.max_capacity() - st.jobs.capacity();
     let phase = st.runtime.phase.load(Ordering::Acquire);
+    let request_buckets = st
+        .metrics
+        .request_duration_buckets
+        .iter()
+        .map(|bucket| bucket.load(Ordering::Relaxed));
+    let request_buckets: Vec<u64> = request_buckets.collect();
     let body = format!(
         "# HELP tritium_chat_requests_total Chat completions accepted into the queue.\n\
          # TYPE tritium_chat_requests_total counter\n\
@@ -1366,6 +1427,22 @@ async fn metrics(State(st): State<AppState>) -> Response {
          # HELP tritium_stream_disconnects_total SSE bodies dropped before terminal completion.\n\
          # TYPE tritium_stream_disconnects_total counter\n\
          tritium_stream_disconnects_total {}\n\
+         # HELP tritium_requests_inflight HTTP requests inside router middleware.\n\
+         # TYPE tritium_requests_inflight gauge\n\
+         tritium_requests_inflight {}\n\
+         # HELP tritium_request_duration_seconds HTTP request duration, fixed buckets.\n\
+         # TYPE tritium_request_duration_seconds histogram\n\
+         tritium_request_duration_seconds_bucket{{le=\"0.001\"}} {}\n\
+         tritium_request_duration_seconds_bucket{{le=\"0.005\"}} {}\n\
+         tritium_request_duration_seconds_bucket{{le=\"0.01\"}} {}\n\
+         tritium_request_duration_seconds_bucket{{le=\"0.05\"}} {}\n\
+         tritium_request_duration_seconds_bucket{{le=\"0.1\"}} {}\n\
+         tritium_request_duration_seconds_bucket{{le=\"0.5\"}} {}\n\
+         tritium_request_duration_seconds_bucket{{le=\"1\"}} {}\n\
+         tritium_request_duration_seconds_bucket{{le=\"5\"}} {}\n\
+         tritium_request_duration_seconds_bucket{{le=\"+Inf\"}} {}\n\
+         tritium_request_duration_seconds_sum {}\n\
+         tritium_request_duration_seconds_count {}\n\
          # HELP tritium_queue_depth Jobs waiting in the decode queue.\n\
          # TYPE tritium_queue_depth gauge\n\
          tritium_queue_depth {}\n\
@@ -1410,6 +1487,18 @@ async fn metrics(State(st): State<AppState>) -> Response {
         st.metrics.tokens_out.load(Ordering::Relaxed),
         st.metrics.stream_timeouts.load(Ordering::Relaxed),
         st.metrics.stream_disconnects.load(Ordering::Relaxed),
+        st.metrics.requests_inflight.load(Ordering::Relaxed),
+        request_buckets[0],
+        request_buckets[1],
+        request_buckets[2],
+        request_buckets[3],
+        request_buckets[4],
+        request_buckets[5],
+        request_buckets[6],
+        request_buckets[7],
+        st.metrics.request_duration_count.load(Ordering::Relaxed),
+        st.metrics.request_duration_sum_us.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+        st.metrics.request_duration_count.load(Ordering::Relaxed),
         queue_depth,
         u8::from(st.runtime.worker_alive.load(Ordering::Relaxed)),
         st.runtime.backend_faults.load(Ordering::Relaxed),
