@@ -300,8 +300,15 @@ def _reference_ternary_linear_batched(
         raise ValueError("batched ternary_linear operands have invalid ranks")
     if input.shape[0] != master.shape[0] or input.shape[-1] != master.shape[-1]:
         raise ValueError("batched ternary_linear dimensions do not match")
-    if input.device != master.device or input.dtype != master.dtype:
-        raise ValueError("batched ternary_linear operands must share device and dtype")
+    if input.device != master.device:
+        raise ValueError("batched ternary_linear operands must share a device")
+    mixed_cuda = (
+        input.device.type == "cuda"
+        and input.dtype == torch.float16
+        and master.dtype == torch.float32
+    )
+    if input.dtype != master.dtype and not mixed_cuda:
+        raise ValueError("batched ternary_linear operands have incompatible dtypes")
     if bias is not None and (
         bias.ndim != 2
         or bias.shape[0] != master.shape[0]
@@ -324,21 +331,20 @@ def _reference_ternary_linear_batched(
     safe_scales = scales.clamp_min(torch.finfo(master.dtype).tiny)
     normalized = master / safe_scales
     projected = normalized.round().clamp(-1.0, 1.0) * scales
+    flat_input = input.reshape(input.shape[0], -1, input.shape[-1])
+    bias_shape = (bias.shape[0], 1, bias.shape[1]) if bias is not None else None
     if input.dtype != master.dtype:
-        output = torch.matmul(
-            input.float(), projected.float().transpose(-1, -2)
+        output = torch.bmm(
+            flat_input.float(), projected.float().transpose(-1, -2)
         )
         if bias is not None:
-            output = output + bias.float().view(
-                bias.shape[0], *([1] * (input.ndim - 2)), bias.shape[1]
-            )
-        return output.to(input.dtype)
-    output = torch.matmul(input, projected.transpose(-1, -2))
-    if bias is not None:
-        output = output + bias.view(
-            bias.shape[0], *([1] * (input.ndim - 2)), bias.shape[1]
-        )
-    return output
+            output = output + bias.float().view(bias_shape)
+        output = output.to(input.dtype)
+    else:
+        output = torch.bmm(flat_input, projected.transpose(-1, -2))
+        if bias is not None:
+            output = output + bias.view(bias_shape)
+    return output.reshape(*input.shape[:-1], master.shape[1])
 
 
 def _native_cpu_supported(
