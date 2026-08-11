@@ -13,6 +13,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 MODULE = runpy.run_path(ROOT / "scripts" / "verify-oci-archive.py")
 validate = MODULE["validate"]
+package_inventory_sha256 = MODULE["package_inventory_sha256"]
 OciError = MODULE["OciError"]
 MANIFEST = "application/vnd.oci.image.manifest.v1+json"
 INDEX = "application/vnd.oci.image.index.v1+json"
@@ -221,6 +222,84 @@ class VerifyOciArchiveTests(unittest.TestCase):
             self.assertEqual(len(result["predicates"]), 2)
             self.assertEqual(result["builder_id"], BUILDER_ID)
             self.assertEqual(result["invocation_id"], "buildkit-invocation-123")
+
+    def test_v2_receipt_survives_final_deployment_artifacts(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            archive, receipt, package_candidate = fixture(root)
+            package_payload = b"package artifact"
+            package_path = root / "package.crate"
+            package_path.write_bytes(package_payload)
+            final_candidate = root / "final-manifest.json"
+            package_identity = {
+                "bytes": len(package_payload),
+                "sha256": hashlib.sha256(package_payload).hexdigest(),
+                "blake3": "0" * 64,
+            }
+            final_candidate.write_bytes(encoded({
+                "release": "1.1.0-rc.0",
+                "source_revision": "a" * 40,
+                "artifacts": [
+                    {
+                        "id": "crate-example",
+                        "kind": "rust-crate",
+                        "path": package_path.name,
+                        "identity": package_identity,
+                    },
+                    {
+                        "id": "tritium-serve-cpu",
+                        "kind": "oci-image",
+                        "path": archive.name,
+                        "identity": {
+                            "bytes": archive.stat().st_size,
+                            "sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
+                            "blake3": "1" * 64,
+                        },
+                    },
+                ],
+            }))
+            document = json.loads(receipt.read_bytes())
+            document["schema"] = "tritium.oci-build.v2"
+            document["package_inventory_sha256"] = package_inventory_sha256(
+                json.loads(final_candidate.read_bytes())
+            )
+            receipt.write_bytes(encoded(document))
+            result = validate(archive, receipt, final_candidate)
+            self.assertFalse(result["manifest_matches"])
+            self.assertEqual(
+                result["package_inventory_sha256"],
+                document["package_inventory_sha256"],
+            )
+
+    def test_v2_receipt_rejects_package_inventory_drift(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            archive, receipt, package_candidate = fixture(root)
+            package_payload = b"package artifact"
+            package_path = root / "package.crate"
+            package_path.write_bytes(package_payload)
+            final_candidate = root / "final-manifest.json"
+            final_document = {
+                "release": "1.1.0-rc.0",
+                "source_revision": "a" * 40,
+                "artifacts": [{
+                    "id": "crate-example",
+                    "kind": "rust-crate",
+                    "path": package_path.name,
+                    "identity": {
+                        "bytes": len(package_payload),
+                        "sha256": hashlib.sha256(package_payload).hexdigest(),
+                        "blake3": "0" * 64,
+                    },
+                }],
+            }
+            final_candidate.write_bytes(encoded(final_document))
+            document = json.loads(receipt.read_bytes())
+            document["schema"] = "tritium.oci-build.v2"
+            document["package_inventory_sha256"] = "f" * 64
+            receipt.write_bytes(encoded(document))
+            with self.assertRaisesRegex(OciError, "package inventory"):
+                validate(archive, receipt, final_candidate)
 
     def test_accepts_buildkit_nested_attested_index(self):
         with tempfile.TemporaryDirectory() as raw:

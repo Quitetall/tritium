@@ -167,6 +167,14 @@ attestations alone cannot substitute for exact transport inventory. This closes
 SBOM infrastructure, not physical image/runtime/security qualification or
 publication.
 
+OCI build receipts use `tritium.oci-build.v2` when deployment artifacts are
+added after the package set is frozen. The receipt retains the exact manifest
+hash used to build the image and binds a canonical `package_inventory_sha256`
+over every non-deployment artifact. Final candidates can therefore add their
+OCI image and Helm chart without creating a circular manifest hash, while any
+package, path or byte drift still fails closed. `tritium.oci-build.v1` remains
+readable only when its exact manifest hash still matches.
+
 ## Aggregate evidence status
 
 An evidence registry lives outside the candidate directory, whose closed file
