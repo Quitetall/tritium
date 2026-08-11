@@ -129,6 +129,7 @@ def validate_matrix(document: Any, matrix_path: Path) -> dict[str, Any]:
         raise MatrixError("matrix.dimensions: " + "; ".join(details))
 
     seen: set[str] = set()
+    qualified_revisions: set[str] = set()
     for dimension, raw_rows in dimensions.items():
         if not isinstance(raw_rows, list) or not raw_rows:
             raise MatrixError(f"matrix.dimensions.{dimension} must be a non-empty array")
@@ -158,6 +159,7 @@ def validate_matrix(document: Any, matrix_path: Path) -> dict[str, Any]:
                 _validate_receipt(
                     row["receipt"], matrix_path.parent, row_id, f"{label}.receipt"
                 )
+                qualified_revisions.add(row["receipt"]["source_revision"])
             elif status == "pending":
                 _string(row["blocker"], f"{label}.blocker")
             else:
@@ -166,6 +168,10 @@ def validate_matrix(document: Any, matrix_path: Path) -> dict[str, Any]:
                     raise MatrixError(
                         f"{label}.diagnostic must be a TRITIUM_UNSUPPORTED_* code"
                     )
+    if len(qualified_revisions) > 1:
+        raise MatrixError(
+            "qualified receipts must share one source_revision within a candidate"
+        )
     return matrix
 
 

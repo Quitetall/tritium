@@ -85,6 +85,44 @@ class CompatibilityMatrixTests(unittest.TestCase):
             with self.assertRaisesRegex(MODULE.MatrixError, "contained POSIX path"):
                 MODULE.validate_matrix(matrix(row), Path(raw) / "matrix.json")
 
+    def test_qualified_rows_require_one_source_revision(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            rows = []
+            for index, revision in enumerate(("ab" * 20, "cd" * 20)):
+                path = root / f"receipt-{index}.json"
+                path.write_text(
+                    json.dumps(
+                        {
+                            "schema": MODULE.RECEIPT_SCHEMA,
+                            "target_id": ("platform-row", "artifact-schema-row")[index],
+                            "source_revision": revision,
+                            "passed": True,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                rows.append(
+                    {
+                        "target": f"target-{index}",
+                        "status": "qualified",
+                        "receipt": {
+                            "path": path.name,
+                            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                            "source_revision": revision,
+                        },
+                    }
+                )
+            document = matrix(
+                {"target": "pending", "status": "pending", "blocker": "missing"}
+            )
+            document["dimensions"]["platform"] = [dict(rows[0], id="platform-row")]
+            document["dimensions"]["artifact-schema"] = [
+                dict(rows[1], id="artifact-schema-row")
+            ]
+            with self.assertRaisesRegex(MODULE.MatrixError, "share one source_revision"):
+                MODULE.validate_matrix(document, root / "matrix.json")
+
     def test_status_has_exactly_one_evidence_field(self):
         row = {
             "target": "CUDA",
