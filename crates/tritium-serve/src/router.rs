@@ -8,7 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::State;
 use axum::extract::rejection::JsonRejection;
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -769,48 +769,58 @@ fn build_router_inner(
             let admission = admission.clone();
             let metrics = metrics_state.clone();
             async move {
+                let started = Instant::now();
+                let identity = RequestIdentity::from_headers(req.headers());
+                let method = method_class(req.method());
+                let route = route_class(req.method(), req.uri().path());
                 let _request_metrics = RequestMetricsGuard::new(metrics.clone());
                 let presented = req
                     .headers()
                     .get(axum::http::header::AUTHORIZATION)
                     .and_then(|value| value.to_str().ok())
                     .and_then(|value| value.strip_prefix("Bearer "));
-                let Some(principal) = admission.authenticate(presented) else {
-                    let mut response = api_error(
-                        StatusCode::UNAUTHORIZED,
-                        "invalid_request_error",
-                        "missing or invalid bearer token",
-                        None,
-                    );
-                    response.headers_mut().insert(
-                        axum::http::header::WWW_AUTHENTICATE,
-                        axum::http::HeaderValue::from_static("Bearer"),
-                    );
-                    return response;
-                };
-
-                let governed = req.method() == axum::http::Method::POST
-                    && matches!(
-                        req.uri().path(),
-                        "/v1/chat/completions" | "/v1/tree/session" | "/v1/tree/verify"
-                    );
-                if governed
-                    && let AdmissionDecision::Reject { retry_after_secs } =
-                        admission.admit(principal)
-                {
-                    metrics.rate_rejections.fetch_add(1, Ordering::Relaxed);
-                    let mut response = api_error(
-                        StatusCode::TOO_MANY_REQUESTS,
-                        "rate_limit_exceeded",
-                        "principal request rate exceeded; retry later",
-                        None,
-                    );
-                    if let Ok(value) = HeaderValue::from_str(&retry_after_secs.to_string()) {
-                        response.headers_mut().insert(header::RETRY_AFTER, value);
+                let response = match admission.authenticate(presented) {
+                    None => {
+                        let mut response = api_error(
+                            StatusCode::UNAUTHORIZED,
+                            "invalid_request_error",
+                            "missing or invalid bearer token",
+                            None,
+                        );
+                        response.headers_mut().insert(
+                            axum::http::header::WWW_AUTHENTICATE,
+                            axum::http::HeaderValue::from_static("Bearer"),
+                        );
+                        response
                     }
-                    return response;
-                }
-                next.run(req).await
+                    Some(principal) => {
+                        let governed = req.method() == axum::http::Method::POST
+                            && matches!(
+                                req.uri().path(),
+                                "/v1/chat/completions" | "/v1/tree/session" | "/v1/tree/verify"
+                            );
+                        if governed
+                            && let AdmissionDecision::Reject { retry_after_secs } =
+                                admission.admit(principal)
+                        {
+                            metrics.rate_rejections.fetch_add(1, Ordering::Relaxed);
+                            let mut response = api_error(
+                                StatusCode::TOO_MANY_REQUESTS,
+                                "rate_limit_exceeded",
+                                "principal request rate exceeded; retry later",
+                                None,
+                            );
+                            if let Ok(value) = HeaderValue::from_str(&retry_after_secs.to_string())
+                            {
+                                response.headers_mut().insert(header::RETRY_AFTER, value);
+                            }
+                            response
+                        } else {
+                            next.run(req).await
+                        }
+                    }
+                };
+                finish_request(response, &identity, method, route, started)
             }
         },
     ));
@@ -825,12 +835,133 @@ fn now_secs() -> u64 {
 }
 
 static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+static REQUEST_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn make_id() -> String {
     format!(
         "chatcmpl-{:016x}",
         ID_COUNTER.fetch_add(1, Ordering::Relaxed)
     )
+}
+
+struct RequestIdentity {
+    request_id: String,
+    trace_id: String,
+    span_id: String,
+}
+
+impl RequestIdentity {
+    fn from_headers(headers: &axum::http::HeaderMap) -> Self {
+        let sequence = REQUEST_ID_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
+        let request_id = format!("tritium-req-{sequence:016x}");
+        let trace_id = headers
+            .get("traceparent")
+            .and_then(parse_traceparent_trace_id)
+            .unwrap_or_else(|| format!("{sequence:016x}{:016x}", !sequence));
+        let mut span_id = sequence.rotate_left(17) ^ 0x9e37_79b9_7f4a_7c15;
+        if span_id == 0 {
+            span_id = 1;
+        }
+        Self {
+            request_id,
+            trace_id,
+            span_id: format!("{span_id:016x}"),
+        }
+    }
+
+    fn traceparent(&self) -> String {
+        format!("00-{}-{}-01", self.trace_id, self.span_id)
+    }
+}
+
+fn parse_traceparent_trace_id(value: &HeaderValue) -> Option<String> {
+    let value = value.to_str().ok()?;
+    if !value.is_ascii() || value.len() != 55 {
+        return None;
+    }
+    let bytes = value.as_bytes();
+    if bytes[2] != b'-' || bytes[35] != b'-' || bytes[52] != b'-' {
+        return None;
+    }
+    if bytes[0] == b'f' || bytes[0] == b'F' {
+        return None;
+    }
+    let trace_id = &value[3..35];
+    let parent_id = &value[36..52];
+    let flags = &value[53..55];
+    if !is_hex(trace_id) || !is_hex(parent_id) || !is_hex(flags) {
+        return None;
+    }
+    if trace_id.bytes().all(|byte| byte == b'0') || parent_id.bytes().all(|byte| byte == b'0') {
+        return None;
+    }
+    Some(trace_id.to_ascii_lowercase())
+}
+
+fn is_hex(value: &str) -> bool {
+    value.bytes().all(|byte| {
+        byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte) || (b'A'..=b'F').contains(&byte)
+    })
+}
+
+fn method_class(method: &Method) -> &'static str {
+    match *method {
+        Method::GET => "GET",
+        Method::POST => "POST",
+        _ => "OTHER",
+    }
+}
+
+fn route_class(method: &Method, path: &str) -> &'static str {
+    match (method, path) {
+        (&Method::POST, "/v1/chat/completions") => "chat_completions",
+        (&Method::GET, "/v1/models") => "models",
+        (&Method::GET, "/healthz") => "healthz",
+        (&Method::GET, "/readyz") => "readyz",
+        (&Method::GET, "/metrics") => "metrics",
+        (&Method::POST, "/v1/tree/session") => "tree_session",
+        (&Method::POST, "/v1/tree/verify") => "tree_verify",
+        _ => "other",
+    }
+}
+
+fn status_class(status: StatusCode) -> &'static str {
+    if status.is_success() {
+        "ok"
+    } else if status.is_client_error() {
+        "client_error"
+    } else {
+        "server_error"
+    }
+}
+
+fn finish_request(
+    mut response: Response,
+    identity: &RequestIdentity,
+    method: &'static str,
+    route: &'static str,
+    started: Instant,
+) -> Response {
+    let status = response.status();
+    response.headers_mut().insert(
+        "x-request-id",
+        HeaderValue::from_str(&identity.request_id).expect("request id is valid header value"),
+    );
+    response.headers_mut().insert(
+        "traceparent",
+        HeaderValue::from_str(&identity.traceparent()).expect("traceparent is valid header value"),
+    );
+    eprintln!(
+        "{{\"event\":\"http_request\",\"request_id\":\"{}\",\"trace_id\":\"{}\",\"route\":\"{}\",\"method\":\"{}\",\"status\":{},\"duration_us\":{},\"status_class\":\"{}\"}}",
+        identity.request_id,
+        identity.trace_id,
+        route,
+        method,
+        status.as_u16(),
+        started.elapsed().as_micros(),
+        status_class(status),
+    );
+    response
 }
 
 fn api_error(

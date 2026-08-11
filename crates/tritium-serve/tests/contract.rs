@@ -197,6 +197,47 @@ async fn send(router: &Router, req: Request<Body>) -> (StatusCode, Vec<u8>) {
     (status, body)
 }
 
+#[tokio::test]
+async fn request_identity_headers_propagate_without_unbounded_cardinality() {
+    let (router, _) = mock_router(vec![1], FinishReason::Stop);
+    let req = Request::get("/healthz")
+        .header(
+            "traceparent",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        )
+        .body(Body::empty())
+        .unwrap();
+    let response = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let request_id = response
+        .headers()
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap();
+    assert!(request_id.starts_with("tritium-req-"));
+    let traceparent = response
+        .headers()
+        .get("traceparent")
+        .and_then(|value| value.to_str().ok())
+        .unwrap();
+    assert_eq!(traceparent.len(), 55);
+    assert_eq!(&traceparent[3..35], "4bf92f3577b34da6a3ce929d0e0e4736");
+    assert_ne!(&traceparent[36..52], "00f067aa0ba902b7");
+
+    let invalid = Request::get("/healthz")
+        .header("traceparent", "not-a-trace-context")
+        .body(Body::empty())
+        .unwrap();
+    let response = router.oneshot(invalid).await.unwrap();
+    let traceparent = response
+        .headers()
+        .get("traceparent")
+        .and_then(|value| value.to_str().ok())
+        .unwrap();
+    assert_eq!(traceparent.len(), 55);
+    assert_ne!(&traceparent[3..35], "00000000000000000000000000000000");
+}
+
 /// Split an SSE body into its `data:` payloads (keep-alive comment lines skipped).
 fn parse_sse(bytes: &[u8]) -> Vec<String> {
     let text = String::from_utf8_lossy(bytes);
