@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import runpy
 import subprocess
 import sys
 from typing import Any
@@ -15,6 +16,10 @@ from typing import Any
 
 SCHEMA = "tritium.local-rc-signoff.v1"
 REPORT_SCHEMA = "tritium.release-gate-report.v1"
+CANDIDATE_SCHEMA = "tritium.release-candidate.v1"
+RELEASE_STATUS = runpy.run_path(Path(__file__).with_name("release-status"))
+validate_candidate = RELEASE_STATUS["validate"]
+CandidateReleaseError = RELEASE_STATUS["ReleaseError"]
 FIELDS = {
     "schema", "release", "source_revision", "candidate_manifest_sha256",
     "evidence_registry_sha256", "evidence_report_sha256", "signer_principal",
@@ -58,7 +63,7 @@ def json_file(path: Path, label: str) -> dict[str, Any]:
 
 
 def statement(report_path: Path, registry: Path, candidate: Path,
-              principal: str) -> dict[str, str]:
+              principal: str, digest_tool: str) -> dict[str, str]:
     report = json_file(report_path, "evidence report")
     if report.get("schema") != REPORT_SCHEMA or report.get("ready") is not True:
         raise SignoffError("evidence report is not a complete passing report")
@@ -81,6 +86,16 @@ def statement(report_path: Path, registry: Path, candidate: Path,
         raise SignoffError("evidence report identities must be lowercase hexadecimal")
     if candidate_digest != actual_candidate_digest:
         raise SignoffError("evidence report does not bind the exact candidate manifest")
+    try:
+        candidate_document = validate_candidate(candidate, digest_tool)
+    except (OSError, CandidateReleaseError, subprocess.SubprocessError, ValueError) as error:
+        raise SignoffError(f"candidate validation failed: {error}") from error
+    if candidate_document.get("schema") != CANDIDATE_SCHEMA:
+        raise SignoffError("candidate manifest has the wrong schema")
+    if candidate_document.get("release") != release:
+        raise SignoffError("candidate release differs from evidence report")
+    if candidate_document.get("source_revision") != revision:
+        raise SignoffError("candidate source revision differs from evidence report")
     return {
         "schema": SCHEMA,
         "release": release,
@@ -113,8 +128,8 @@ def atomic_create(path: Path, payload: bytes) -> None:
 
 
 def seal(report: Path, registry: Path, candidate: Path, principal: str,
-         key: Path, output: Path) -> None:
-    value = statement(report, registry, candidate, principal)
+         key: Path, output: Path, digest_tool: str) -> None:
+    value = statement(report, registry, candidate, principal, digest_tool)
     signature = Path(str(output) + ".sig")
     if signature.exists() or signature.is_symlink():
         raise SignoffError(f"refusing to overwrite {signature}")
@@ -134,11 +149,12 @@ def seal(report: Path, registry: Path, candidate: Path, principal: str,
 
 
 def verify(statement_path: Path, signature: Path, report: Path, registry: Path,
-           candidate: Path, principal: str, allowed_signers: Path) -> dict[str, str]:
+           candidate: Path, principal: str, allowed_signers: Path,
+           digest_tool: str) -> dict[str, str]:
     actual = json_file(statement_path, "sign-off statement")
     if set(actual) != FIELDS or actual.get("schema") != SCHEMA:
         raise SignoffError("sign-off statement fields do not match the frozen schema")
-    expected = statement(report, registry, candidate, principal)
+    expected = statement(report, registry, candidate, principal, digest_tool)
     if actual != expected:
         raise SignoffError("sign-off statement does not match current evidence")
     try:
@@ -165,6 +181,9 @@ def main() -> int:
         item.add_argument("--registry", type=Path, required=True)
         item.add_argument("--candidate", type=Path, required=True)
         item.add_argument("--principal", required=True)
+        item.add_argument(
+            "--digest-tool", default=os.environ.get("TRITIUM_BIN", "tritium")
+        )
     seal_parser.add_argument("--key", type=Path, required=True)
     seal_parser.add_argument("--output", type=Path, required=True)
     verify_parser.add_argument("--statement", type=Path, required=True)
@@ -174,11 +193,14 @@ def main() -> int:
     try:
         if args.command == "seal":
             seal(args.report, args.registry, args.candidate, args.principal,
-                 args.key, args.output)
+                 args.key, args.output, args.digest_tool)
             print(f"local-rc-signoff: SEALED: {args.output}")
         else:
-            value = verify(args.statement, args.signature, args.report, args.registry,
-                           args.candidate, args.principal, args.allowed_signers)
+            value = verify(
+                args.statement, args.signature, args.report, args.registry,
+                args.candidate, args.principal, args.allowed_signers,
+                args.digest_tool,
+            )
             print(f"local-rc-signoff: LOCAL_RC_READY: {value['release']}")
     except (OSError, SignoffError) as error:
         print(f"local-rc-signoff: BLOCKED: {error}", file=sys.stderr)

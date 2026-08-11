@@ -240,19 +240,24 @@ local evidence.
 Evidence readiness and maintainer sign-off are separate layers. A complete
 registry produces `LOCAL_RC_EVIDENCE_READY_UNSIGNED` with exit status 2; it does
 not produce `LOCAL_RC_READY`. Seal that exact canonical report with an SSH
-signing key, then verify it against a reviewed `allowed_signers` file:
+signing key. Sign-off re-runs canonical candidate admission, including every
+artifact identity, SBOM, provenance and closed-directory check, through the
+same digest tool used for release status. Then verify it against a reviewed
+`allowed_signers` file:
 
 ```bash
 python scripts/local-rc-signoff.py seal \
   --report release/v1.1-evidence/status.json \
   --registry release/v1.1-evidence/registry.json \
   --candidate release/v1.1/manifest.json \
+  --digest-tool target/release/tritium \
   --principal release-maintainer --key /secure/release-key \
   --output release/v1.1-evidence/signoff.json
 python scripts/local-rc-signoff.py verify \
   --report release/v1.1-evidence/status.json \
   --registry release/v1.1-evidence/registry.json \
   --candidate release/v1.1/manifest.json \
+  --digest-tool target/release/tritium \
   --principal release-maintainer \
   --statement release/v1.1-evidence/signoff.json \
   --signature release/v1.1-evidence/signoff.json.sig \
