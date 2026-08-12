@@ -200,8 +200,8 @@ runner cannot satisfy Stage-7.
 
 Before candidate work, each runner must answer a capability preflight request
 (`tritium.stage7-capabilities-request.v1`) with a
-`tritium.stage7-capabilities.v1` declaration bound to the campaign source
-revision. The measurement runner must advertise all three stages, D2/B3/S34,
+`tritium.stage7-capabilities.v1` declaration bound to the exact request ID and
+campaign source revision. The measurement runner must advertise all three stages, D2/B3/S34,
 G64/G128/G256, two/three planes, both rotations, all three curvature modes, all
 six solver variants, full artifacts, and physical reports. The auxiliary runner
 advertises only baseline/refinement features. Missing or stale capability

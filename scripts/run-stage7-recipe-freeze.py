@@ -36,8 +36,8 @@ CAPABILITY_FEATURE_FIELDS = {
     "full_artifacts", "physical_reports", "baselines", "refinements",
 }
 CAPABILITY_FIELDS = {
-    "schema", "source_revision", "stages", "codecs", "groups", "planes",
-    "rotations", "curvatures", "solvers", "features",
+    "schema", "request_id", "source_revision", "stages", "codecs", "groups",
+    "planes", "rotations", "curvatures", "solvers", "features",
 }
 STAGE_NAMES = ("one-layer", "four-layer", "full-model")
 RECIPE_CODECS = ("D2", "B3", "S34")
@@ -93,6 +93,7 @@ def _validate_capabilities(
     value: dict[str, Any],
     *,
     kind: str,
+    request_id: str,
     source_revision: str,
 ) -> dict[str, Any]:
     """Validate runner declaration before any candidate work is started."""
@@ -103,6 +104,8 @@ def _validate_capabilities(
         raise Stage7RunError("runner capability fields differ")
     if value["schema"] != CAPABILITY_SCHEMA:
         raise Stage7RunError("runner capability schema differs")
+    if value["request_id"] != request_id:
+        raise Stage7RunError("runner capability request identity differs")
     if value["source_revision"] != source_revision:
         raise Stage7RunError("runner capability source revision differs")
 
@@ -487,6 +490,7 @@ def run(
             timeout_seconds=timeout_seconds,
         ),
         kind="measurement",
+        request_id=measurement_capability_request["request_id"],
         source_revision=campaign["source_revision"],
     )
     auxiliary_capability_request = _capability_request(
@@ -499,6 +503,7 @@ def run(
             timeout_seconds=timeout_seconds,
         ),
         kind="auxiliary",
+        request_id=auxiliary_capability_request["request_id"],
         source_revision=campaign["source_revision"],
     )
     previous = sorted(grid)

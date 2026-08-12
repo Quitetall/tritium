@@ -46,6 +46,7 @@ def test_capability_preflight_requires_complete_measurement_surface() -> None:
     source_revision = "a" * 40
     valid = {
         "schema": runner.CAPABILITY_SCHEMA,
+        "request_id": "sha256:" + "c" * 64,
         "source_revision": source_revision,
         "stages": list(runner.STAGE_NAMES),
         "codecs": list(runner.RECIPE_CODECS),
@@ -62,18 +63,32 @@ def test_capability_preflight_requires_complete_measurement_surface() -> None:
         },
     }
     assert runner._validate_capabilities(
-        valid, kind="measurement", source_revision=source_revision
+        valid,
+        kind="measurement",
+        request_id=valid["request_id"],
+        source_revision=source_revision,
     ) is valid
+    with pytest.raises(runner.Stage7RunError, match="request identity"):
+        runner._validate_capabilities(
+            valid,
+            kind="measurement",
+            request_id="sha256:" + "e" * 64,
+            source_revision=source_revision,
+        )
     valid["solvers"] = valid["solvers"][:-1]
     with pytest.raises(runner.Stage7RunError, match="solvers"):
         runner._validate_capabilities(
-            valid, kind="measurement", source_revision=source_revision
+            valid,
+            kind="measurement",
+            request_id=valid["request_id"],
+            source_revision=source_revision,
         )
 
 
 def test_auxiliary_capability_preflight_requires_baselines_and_refinements() -> None:
     value = {
         "schema": runner.CAPABILITY_SCHEMA,
+        "request_id": "sha256:" + "d" * 64,
         "source_revision": "b" * 40,
         "stages": [],
         "codecs": [],
@@ -90,12 +105,18 @@ def test_auxiliary_capability_preflight_requires_baselines_and_refinements() -> 
         },
     }
     assert runner._validate_capabilities(
-        value, kind="auxiliary", source_revision="b" * 40
+        value,
+        kind="auxiliary",
+        request_id=value["request_id"],
+        source_revision="b" * 40,
     ) is value
     value["features"]["refinements"] = False
     with pytest.raises(runner.Stage7RunError, match="required"):
         runner._validate_capabilities(
-            value, kind="auxiliary", source_revision="b" * 40
+            value,
+            kind="auxiliary",
+            request_id=value["request_id"],
+            source_revision="b" * 40,
         )
 
 
