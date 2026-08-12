@@ -1174,96 +1174,119 @@ def refine(
         )
         for reference in conversion.weights
     )
-    modules = dict(teacher.named_modules(remove_duplicate=False))
     final_planes = _snapshot(stores)
-    weight_losses = {}
-    for reference in conversion.weights:
-        alias = reference.aliases[0]
-        path = "" if alias == "weight" else alias.removesuffix(".weight")
-        weight_losses[reference.path] = _weight_mse(
-            modules[path].weight,
-            final_planes[reference.path],
-            metrics[reference.path],
-        )
+    # Keep only immutable CPU planes for artifact sealing. Retaining the full
+    # differentiable student while computing diagnostics causes allocator and
+    # swap pressure on 24-GiB hosts.
+    del student, stores, optimizer, parameters
+    if compute_dtype != torch.float32 and torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
-    def fit_weight(record: _Record, writer: WeightCheckpointWriter) -> float:
-        planes = final_planes[record.path]
-        for start in range(0, record.outputs, writer.fit_chunk_rows):
-            end = min(record.outputs, start + writer.fit_chunk_rows)
-            writer.append(
-                tuple(
-                    TernaryPlane(
-                        trits=plane.trits[start:end],
-                        scales=plane.scales[start:end],
-                        group_size=plane.group_size,
-                        structure=plane.structure,
-                    )
-                    for plane in planes
-                )
-            )
-        return weight_losses[record.path]
-
-    max_working_bytes = 64 * 1024 * 1024
-
-    def fit_chunk_rows(record: _Record) -> int:
-        bytes_per_row = max(1, record.features * 3 + 6)
-        return max(1, min(record.outputs, max_working_bytes // bytes_per_row))
-
-    child = seal_module_conversion(
-        directory / _CONVERSION_DIRECTORY,
-        source_model_digest=conversion.source_model_digest,
-        evidence_id=evidence_id,
-        algorithm_id=algorithm_id,
-        recipe_id=recipe_id,
-        config=conversion.config,
-        coverage=conversion.coverage,
-        records=records,
-        fit_weight=fit_weight,
-        fit_chunk_rows=fit_chunk_rows,
-        max_working_bytes=max_working_bytes,
-    )
-    packable = all(reference.shape[1] % 128 == 0 for reference in child.weights)
-    packing = ("s34" if config.structure == "s34" else "b3") if packable else None
-    packed_path = directory / _PACKED_DIRECTORY
-    if packing is None:
-        if packed_path.exists() or packed_path.is_symlink():
-            raise ValueError("unaligned refinement has an unexpected packed package")
-        packed = None
-    elif packed_path.exists() or packed_path.is_symlink():
-        packed = load_packed_module(packed_path)
-        if (
-            packed.packing != packing
-            or packed.conversion_artifact_id != child.artifact_id
-            or packed.source_model_digest != child.source_model_digest
-            or packed.evidence_id != child.evidence_id
-            or packed.algorithm_id != child.algorithm_id
-            or packed.recipe_id != child.recipe_id
-        ):
-            raise ValueError("resumed packed package differs from refinement child")
-    else:
-        packed = child.pack_native(packed_path, packing=packing)
-    identity = {
-        "schema_version": 2,
-        "artifact_kind": f"tritium.module-{config.kind}-refinement-v2",
-        "parent_artifact_id": parent_id,
-        "ancestry": list(ancestry),
-        "source_model_digest": conversion.source_model_digest,
-        "teacher_digest": teacher_digest,
-        "training_digest": training_digest,
-        "training_batches": list(training_members),
-        "validation_digest": validation_digest,
-        "validation_batches": list(validation_members),
-        "config": config.to_dict(),
-        "child_conversion_artifact_id": child.artifact_id,
-        "packed_artifact_id": None if packed is None else packed.artifact_id,
-        "packing": packing,
-        "validation_loss_before": before,
-        "validation_loss_after": after,
-        "accepted_steps": accepted_steps,
+    parameter_devices = {
+        tensor.device
+        for tensor in (*teacher.parameters(), *teacher.buffers())
     }
-    identity["artifact_id"] = _digest(identity)
-    _write_manifest_atomic(directory, identity)
-    return load_refinement(directory)
+    seal_device = (
+        next(iter(parameter_devices))
+        if len(parameter_devices) == 1
+        and next(iter(parameter_devices)).type == "cuda"
+        else None
+    )
+    if seal_device is not None:
+        teacher.to(device="cpu")
+    try:
+        modules = dict(teacher.named_modules(remove_duplicate=False))
+        weight_losses = {}
+        for reference in conversion.weights:
+            alias = reference.aliases[0]
+            path = "" if alias == "weight" else alias.removesuffix(".weight")
+            weight_losses[reference.path] = _weight_mse(
+                modules[path].weight,
+                final_planes[reference.path],
+                metrics[reference.path],
+            )
+
+        def fit_weight(record: _Record, writer: WeightCheckpointWriter) -> float:
+            planes = final_planes[record.path]
+            for start in range(0, record.outputs, writer.fit_chunk_rows):
+                end = min(record.outputs, start + writer.fit_chunk_rows)
+                writer.append(
+                    tuple(
+                        TernaryPlane(
+                            trits=plane.trits[start:end],
+                            scales=plane.scales[start:end],
+                            group_size=plane.group_size,
+                            structure=plane.structure,
+                        )
+                        for plane in planes
+                    )
+                )
+            return weight_losses[record.path]
+
+        max_working_bytes = 64 * 1024 * 1024
+
+        def fit_chunk_rows(record: _Record) -> int:
+            bytes_per_row = max(1, record.features * 3 + 6)
+            return max(1, min(record.outputs, max_working_bytes // bytes_per_row))
+
+        child = seal_module_conversion(
+            directory / _CONVERSION_DIRECTORY,
+            source_model_digest=conversion.source_model_digest,
+            evidence_id=evidence_id,
+            algorithm_id=algorithm_id,
+            recipe_id=recipe_id,
+            config=conversion.config,
+            coverage=conversion.coverage,
+            records=records,
+            fit_weight=fit_weight,
+            fit_chunk_rows=fit_chunk_rows,
+            max_working_bytes=max_working_bytes,
+        )
+        packable = all(reference.shape[1] % 128 == 0 for reference in child.weights)
+        packing = ("s34" if config.structure == "s34" else "b3") if packable else None
+        packed_path = directory / _PACKED_DIRECTORY
+        if packing is None:
+            if packed_path.exists() or packed_path.is_symlink():
+                raise ValueError("unaligned refinement has an unexpected packed package")
+            packed = None
+        elif packed_path.exists() or packed_path.is_symlink():
+            packed = load_packed_module(packed_path)
+            if (
+                packed.packing != packing
+                or packed.conversion_artifact_id != child.artifact_id
+                or packed.source_model_digest != child.source_model_digest
+                or packed.evidence_id != child.evidence_id
+                or packed.algorithm_id != child.algorithm_id
+                or packed.recipe_id != child.recipe_id
+            ):
+                raise ValueError("resumed packed package differs from refinement child")
+        else:
+            packed = child.pack_native(packed_path, packing=packing)
+        identity = {
+            "schema_version": 2,
+            "artifact_kind": f"tritium.module-{config.kind}-refinement-v2",
+            "parent_artifact_id": parent_id,
+            "ancestry": list(ancestry),
+            "source_model_digest": conversion.source_model_digest,
+            "teacher_digest": teacher_digest,
+            "training_digest": training_digest,
+            "training_batches": list(training_members),
+            "validation_digest": validation_digest,
+            "validation_batches": list(validation_members),
+            "config": config.to_dict(),
+            "child_conversion_artifact_id": child.artifact_id,
+            "packed_artifact_id": None if packed is None else packed.artifact_id,
+            "packing": packing,
+            "validation_loss_before": before,
+            "validation_loss_after": after,
+            "accepted_steps": accepted_steps,
+        }
+        identity["artifact_id"] = _digest(identity)
+        _write_manifest_atomic(directory, identity)
+        return load_refinement(directory)
+    finally:
+        if seal_device is not None:
+            teacher.to(device=seal_device)
 
 
 def export_refinement(
