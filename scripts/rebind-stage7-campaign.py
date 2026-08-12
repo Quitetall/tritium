@@ -8,9 +8,10 @@ not copy, invent, or qualify measurements. Existing output is never replaced.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import subprocess
 import tempfile
@@ -26,6 +27,7 @@ CAMPAIGN_FIELDS = {
 MAX_JSON_BYTES = 32 * 1024 * 1024
 HEX = frozenset("0123456789abcdef")
 RUN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+FILE_FIELDS = {"path", "bytes", "sha256"}
 
 
 class RebindError(ValueError):
@@ -102,6 +104,63 @@ def _count(value: Any, needle: str) -> int:
     return int(value == needle)
 
 
+def _open_record(root: Path, record: Any, label: str) -> Path:
+    if not isinstance(record, dict) or set(record) != FILE_FIELDS:
+        raise RebindError(f"{label} file record fields differ")
+    logical_text = record["path"]
+    if not isinstance(logical_text, str) or not logical_text:
+        raise RebindError(f"{label}.path must be a nonempty string")
+    logical = PurePosixPath(logical_text)
+    if (
+        logical.is_absolute()
+        or ".." in logical.parts
+        or "\\" in logical_text
+        or logical.as_posix() != logical_text
+    ):
+        raise RebindError(f"{label}.path must be a contained POSIX path")
+    if (
+        type(record["bytes"]) is not int
+        or record["bytes"] <= 0
+        or not isinstance(record["sha256"], str)
+        or len(record["sha256"]) != 64
+        or any(character not in HEX for character in record["sha256"])
+    ):
+        raise RebindError(f"{label} byte or digest record is invalid")
+    path = root.joinpath(*logical.parts)
+    cursor = root
+    for part in logical.parts:
+        cursor /= part
+        if cursor.is_symlink():
+            raise RebindError(f"{label}.path traverses a symlink")
+    if not path.is_file() or path.is_symlink():
+        raise RebindError(f"{label}.path must name an ordinary file")
+    if path.stat().st_size != record["bytes"]:
+        raise RebindError(f"{label}.bytes differs from file")
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    if digest != record["sha256"]:
+        raise RebindError(f"{label}.sha256 differs from file")
+    return path
+
+
+def _validate_prerequisites(value: dict[str, Any], root: Path) -> None:
+    _open_record(root, value["token_evidence_pack"], "campaign token evidence pack")
+    evidence = value["evidence"]
+    if not isinstance(evidence, list) or len(evidence) != 3:
+        raise RebindError("campaign prerequisite evidence inventory is incomplete")
+    expected = ("smoke", "native-kernels", "hestia-gate-c")
+    for ordinal, kind in enumerate(expected):
+        record = evidence[ordinal]
+        if not isinstance(record, dict) or set(record) != FILE_FIELDS | {"kind"}:
+            raise RebindError(f"evidence[{ordinal}] fields differ")
+        if record["kind"] != kind:
+            raise RebindError("campaign prerequisite evidence order differs")
+        _open_record(
+            root,
+            {field: record[field] for field in FILE_FIELDS},
+            f"evidence[{ordinal}]",
+        )
+
+
 def _write_new(path: Path, value: dict[str, Any]) -> None:
     if path.exists() or path.is_symlink():
         raise RebindError(f"refusing to replace existing output: {path}")
@@ -157,6 +216,7 @@ def rebind(
         raise RebindError("campaign is already bound to current HEAD")
     if _count(value, old_revision) != 1:
         raise RebindError("old source revision appears outside top-level campaign identity")
+    _validate_prerequisites(value, template.resolve(strict=True).parent)
     if run_id == value["run_id"]:
         raise RebindError("new run_id must differ from template run_id")
     rebound = dict(value)
