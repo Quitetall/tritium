@@ -51,6 +51,7 @@ mod repack;
 mod report;
 mod salt;
 mod stage7_evidence;
+mod transport;
 
 /// BitNet 2B4T uses the LLaMA-3 tokenizer, whose end-of-text token is `128001`.
 /// Used as the default stop token for `generate` when `--eos` is not given.
@@ -146,6 +147,12 @@ enum Command {
         /// Target ternary format.
         #[arg(long, value_enum)]
         to: repack::RepackTarget,
+    },
+    /// Pack or restore a seekable outer transport without changing resident-byte accounting.
+    Transport {
+        /// Transport operation.
+        #[command(subcommand)]
+        transport: transport::TransportCommand,
     },
     /// SALT-quantize an fp safetensors model to a SALT bundle.
     Quantize {
@@ -373,6 +380,7 @@ fn main() -> anyhow::Result<()> {
             generate::run(&model, &ids, max_new, greedy, eos)?;
         }
         Command::Repack { input, output, to } => repack::run(&input, &output, to)?,
+        Command::Transport { transport: command } => transport::run(command)?,
         Command::Release { release: command } => release::run(command)?,
         Command::Report { report: command } => match command {
             ReportCommand::Sparsity { model } => report::sparsity(&model)?,
