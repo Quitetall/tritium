@@ -6,8 +6,12 @@
       {
         "id": "linux-x86_64-cpu",
         "target": "Linux x86_64 CPU wheel",
-        "status": "pending",
-        "blocker": "Current-HEAD manylinux CPU wheel receipt is not yet archived after release metadata changed."
+        "status": "qualified",
+        "receipt": {
+          "path": "compatibility-v1.1/linux-x86_64-cpu.json",
+          "sha256": "ed4cc9c7a11cc203187b181aa0245649a106948fe4e77ebc3ff7e0b02eef2867",
+          "source_revision": "867115f39456e96127b7746122bdfb80b4d395cc"
+        }
       },
       {
         "id": "macos-arm64-cpu",
@@ -83,8 +87,8 @@
         "status": "qualified",
         "receipt": {
           "path": "compatibility-v1.1/node-22.json",
-          "sha256": "5bfa8f9656235566b45144d2846af729fc814ac36c90597774fca540e15af5ff",
-          "source_revision": "568be03cd88d7816d43b7b6420aff998d9baef38"
+          "sha256": "08ec98ba1d5fdad8e51349ae80f6a829993bfdb3c119e1e0be43cb89430bc75b",
+          "source_revision": "867115f39456e96127b7746122bdfb80b4d395cc"
         }
       },
       {
