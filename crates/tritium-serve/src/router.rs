@@ -2211,6 +2211,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn admission_outcomes_use_fixed_status_classes() {
+        let metrics = Metrics::default();
+        for status in [
+            StatusCode::OK,
+            StatusCode::UNAUTHORIZED,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::BAD_REQUEST,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            metrics.observe_admission(status);
+        }
+        let observed: Vec<u64> = metrics
+            .admission_outcomes
+            .iter()
+            .map(|value| value.load(Ordering::Relaxed))
+            .collect();
+        assert_eq!(observed, vec![1; ADMISSION_OUTCOME_LABELS.len()]);
+    }
+
     #[tokio::test]
     async fn production_backend_latch_fails_health_readiness_and_new_work() {
         let router = latching_router();
