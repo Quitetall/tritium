@@ -344,6 +344,7 @@ def capture_qwen36_components(
     activation_cache_digest: str,
     token_stream_digest: str,
     damping: float,
+    execution_model: Optional[nn.Module] = None,
     guided_loss_reduction: Optional[str] = None,
     max_evidence_bytes: int = 64 * 1024 * 1024,
     max_batch_bytes: int = 256 * 1024 * 1024,
@@ -356,6 +357,8 @@ def capture_qwen36_components(
     Component resolution happens before native session creation or evidence
     mutation.  The existing model-aware capture loop remains the sole producer
     of canonical records and retains its resumability/provenance guarantees.
+    Pass ``execution_model`` when a containing language-plus-MTP oracle must
+    exercise modules that are not reached by ``model.language_model`` alone.
     """
 
     components = resolve_qwen36_components(model, require_mtp=True)
@@ -373,6 +376,7 @@ def capture_qwen36_components(
         token_stream_digest=token_stream_digest,
         damping=damping,
         mtp_model=components.mtp_model,
+        execution_model=execution_model,
         guided_loss_reduction=guided_loss_reduction,
         max_evidence_bytes=max_evidence_bytes,
         max_batch_bytes=max_batch_bytes,

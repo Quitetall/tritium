@@ -128,6 +128,32 @@ def test_model_aware_capture_publishes_all_estimators(tmp_path, curvature):
     assert all(parameter.grad is None for parameter in model.parameters())
 
 
+def test_capture_can_execute_containing_oracle_model(tmp_path):
+    selected = _TinyObjectiveModel().train()
+
+    class Oracle(torch.nn.Module):
+        def __init__(self, child):
+            super().__init__()
+            self.child = child
+
+        def forward(self, values, labels=None, attention_mask=None):
+            return self.child(values, labels=labels, attention_mask=attention_mask)
+
+    oracle = Oracle(selected).train()
+    receipt = capture_kronecker_module(
+        selected,
+        _batches(),
+        module="proj",
+        writer=_writer(tmp_path, "input-hessian"),
+        curvature="input-hessian",
+        execution_model=oracle,
+    )
+
+    assert receipt.samples == 5
+    assert selected.training is True
+    assert oracle.training is True
+
+
 @pytest.mark.parametrize("curvature", ["guided-fisher", "forward-kl-kronecker"])
 def test_embedding_capture_streams_sparse_vocabulary_factors(tmp_path, curvature):
     class TinyEmbeddingModel(torch.nn.Module):

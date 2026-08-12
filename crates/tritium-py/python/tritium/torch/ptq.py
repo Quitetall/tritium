@@ -530,11 +530,16 @@ def capture_kronecker_embedding(
     module: str,
     writer: KroneckerCalibrationWriter,
     curvature: str,
+    execution_model: Optional[nn.Module] = None,
     guided_loss_reduction: Optional[str] = None,
     max_capture_bytes: Optional[int] = None,
     max_objective_bytes: int = 256 * 1024 * 1024,
 ) -> KroneckerModuleCaptureReceipt:
     """Capture embedding-table Fisher/KL factors without dense vocabulary rows.
+
+    ``execution_model`` can be a containing/oracle module when the selected
+    embedding is not the module that owns the calibration forward. Hooks stay
+    attached to ``model``; batches execute through ``execution_model``.
 
     The gradient with respect to each embedding output supplies the input-side
     hidden-state factor. Its token id supplies a sparse one-hot output row.
@@ -544,6 +549,8 @@ def capture_kronecker_embedding(
 
     if not isinstance(model, nn.Module):
         raise TypeError("model must be a torch.nn.Module")
+    if execution_model is not None and not isinstance(execution_model, nn.Module):
+        raise TypeError("execution_model must be a torch.nn.Module")
     if not isinstance(writer, KroneckerCalibrationWriter):
         raise TypeError("writer must be a KroneckerCalibrationWriter")
     if curvature == "input-hessian":
@@ -634,7 +641,8 @@ def capture_kronecker_embedding(
 
     pre_handle = selected.register_forward_pre_hook(preflight_input)
     handle = selected.register_forward_hook(capture)
-    training_flags = tuple((component, component.training) for component in model.modules())
+    runner = model if execution_model is None else execution_model
+    training_flags = tuple((component, component.training) for component in runner.modules())
     batches = 0
     module_calls = 0
     samples = 0
@@ -644,7 +652,7 @@ def capture_kronecker_embedding(
     finalizing = False
     objective_sample_start = 0
     try:
-        model.eval()
+        runner.eval()
         for batch in data:
             pending.clear()
             raw_mask = batch.get("attention_mask") if isinstance(batch, Mapping) else None
@@ -673,7 +681,7 @@ def capture_kronecker_embedding(
             )
             pending_index_bytes = snapshot_bytes
             with torch.enable_grad():
-                output = _invoke_model(model, batch)
+                output = _invoke_model(runner, batch)
                 if not pending:
                     raise ValueError("selected embedding was not exercised by a calibration batch")
                 if curvature == "guided-fisher":
@@ -816,6 +824,7 @@ def capture_qwen36_kronecker_evidence(
     token_stream_digest: str,
     damping: float,
     mtp_model: Optional[nn.Module] = None,
+    execution_model: Optional[nn.Module] = None,
     guided_loss_reduction: Optional[str] = None,
     max_evidence_bytes: int = 64 * 1024 * 1024,
     max_batch_bytes: int = 256 * 1024 * 1024,
@@ -831,13 +840,18 @@ def capture_qwen36_kronecker_evidence(
     captured in groups of at most ``max_shared_modules`` from one replay;
     ``task`` is the first canonical task in that window. Existing records are
     reused by the native session. Token embeddings remain sparse one-task
-    captures. The source checkpoint is admitted before any task is exposed.
+    captures. ``execution_model`` may be a full language-plus-MTP oracle that
+    exercises selected modules nested under ``language_model`` or ``mtp_model``;
+    this is required when those modules are not reached by ``language_model``'s
+    own forward. The source checkpoint is admitted before any task is exposed.
     """
 
     if not isinstance(language_model, nn.Module):
         raise TypeError("language_model must be a torch.nn.Module")
     if mtp_model is not None and not isinstance(mtp_model, nn.Module):
         raise TypeError("mtp_model must be a torch.nn.Module")
+    if execution_model is not None and not isinstance(execution_model, nn.Module):
+        raise TypeError("execution_model must be a torch.nn.Module")
     if not callable(data_factory):
         raise TypeError("data_factory must be callable")
     if type(max_shared_modules) is not int or max_shared_modules <= 0:
@@ -966,6 +980,7 @@ def capture_qwen36_kronecker_evidence(
                     modules=[path for _, path, _ in grouped],
                     writers=writers,
                     curvature=curvature,
+                    execution_model=execution_model,
                     guided_loss_reduction=guided_loss_reduction,
                     max_capture_bytes=max_capture_bytes,
                     max_objective_bytes=max_objective_bytes,
@@ -983,6 +998,7 @@ def capture_qwen36_kronecker_evidence(
             module=module_path,
             writer=writer,
             curvature=curvature,
+            execution_model=execution_model,
             guided_loss_reduction=guided_loss_reduction,
             max_capture_bytes=max_capture_bytes,
             max_objective_bytes=max_objective_bytes,
@@ -999,11 +1015,16 @@ def capture_kronecker_module(
     module: str,
     writer: KroneckerCalibrationWriter,
     curvature: str,
+    execution_model: Optional[nn.Module] = None,
     guided_loss_reduction: Optional[str] = None,
     max_capture_bytes: Optional[int] = None,
     max_objective_bytes: int = 256 * 1024 * 1024,
 ) -> KroneckerModuleCaptureReceipt:
     """Capture one projection through a bounded model-aware PyTorch pass.
+
+    ``execution_model`` can be a containing/oracle module when the selected
+    projection is not the module that owns the calibration forward. Hooks stay
+    attached to ``model``; batches execute through ``execution_model``.
 
     ``input-hessian`` accumulates input Gram factors without autograd.
     ``guided-fisher`` differentiates the model's exact scalar ``loss`` output.
@@ -1014,6 +1035,8 @@ def capture_kronecker_module(
 
     if not isinstance(model, nn.Module):
         raise TypeError("model must be a torch.nn.Module")
+    if execution_model is not None and not isinstance(execution_model, nn.Module):
+        raise TypeError("execution_model must be a torch.nn.Module")
     if not isinstance(writer, KroneckerCalibrationWriter):
         raise TypeError("writer must be a KroneckerCalibrationWriter")
     if curvature not in {
@@ -1107,7 +1130,8 @@ def capture_kronecker_module(
 
     pre_handle = selected.register_forward_pre_hook(preflight_input)
     handle = selected.register_forward_hook(capture)
-    training_flags = tuple((component, component.training) for component in model.modules())
+    runner = model if execution_model is None else execution_model
+    training_flags = tuple((component, component.training) for component in runner.modules())
     batches = 0
     module_calls = 0
     samples = 0
@@ -1117,7 +1141,7 @@ def capture_kronecker_module(
     finalizing = False
     objective_sample_start = 0
     try:
-        model.eval()
+        runner.eval()
         for batch in data:
             pending.clear()
             raw_mask = batch.get("attention_mask") if isinstance(batch, Mapping) else None
@@ -1152,7 +1176,7 @@ def capture_kronecker_module(
             pending_activation_bytes = snapshot_bytes
             context = torch.no_grad() if curvature == "input-hessian" else torch.enable_grad()
             with context:
-                output = _invoke_model(model, batch)
+                output = _invoke_model(runner, batch)
                 if not pending:
                     raise ValueError("selected module was not exercised by a calibration batch")
                 if curvature == "guided-fisher":
@@ -1251,11 +1275,15 @@ def capture_kronecker_module_group(
     modules: Sequence[str],
     writers: Sequence[KroneckerCalibrationWriter],
     curvature: str,
+    execution_model: Optional[nn.Module] = None,
     guided_loss_reduction: Optional[str] = None,
     max_capture_bytes: Optional[int] = None,
     max_objective_bytes: int = 256 * 1024 * 1024,
 ) -> Tuple[KroneckerModuleCaptureReceipt, ...]:
     """Capture several projections through one shared bounded PyTorch pass.
+
+    ``execution_model`` has the same containing/oracle semantics as the
+    single-module capture path.
 
     One forward pass per calibration batch feeds every target module's writer,
     replacing one full-calibration replay per tensor. Guided-Fisher and
@@ -1269,6 +1297,8 @@ def capture_kronecker_module_group(
 
     if not isinstance(model, nn.Module):
         raise TypeError("model must be a torch.nn.Module")
+    if execution_model is not None and not isinstance(execution_model, nn.Module):
+        raise TypeError("execution_model must be a torch.nn.Module")
     if isinstance(modules, str) or not isinstance(modules, Sequence):
         raise TypeError("modules must be a sequence of module paths")
     if not isinstance(writers, Sequence):
@@ -1413,7 +1443,8 @@ def capture_kronecker_module_group(
     for index, selected in enumerate(selected_modules):
         handles.append(selected.register_forward_pre_hook(preflight_for(index)))
         handles.append(selected.register_forward_hook(capture_for(index)))
-    training_flags = tuple((component, component.training) for component in model.modules())
+    runner = model if execution_model is None else execution_model
+    training_flags = tuple((component, component.training) for component in runner.modules())
     batches = 0
     module_calls = [0] * len(modules)
     samples = [0] * len(modules)
@@ -1423,7 +1454,7 @@ def capture_kronecker_module_group(
     objective_sample_start = 0
     records = []
     try:
-        model.eval()
+        runner.eval()
         for batch in data:
             for slot in pending:
                 slot.clear()
@@ -1459,7 +1490,7 @@ def capture_kronecker_module_group(
             pending_activation_bytes = snapshot_bytes
             context = torch.no_grad() if curvature == "input-hessian" else torch.enable_grad()
             with context:
-                output = _invoke_model(model, batch)
+                output = _invoke_model(runner, batch)
                 if any(not slot for slot in pending):
                     raise ValueError("selected module was not exercised by a calibration batch")
                 flat_outputs = tuple(item[1] for slot in pending for item in slot)
