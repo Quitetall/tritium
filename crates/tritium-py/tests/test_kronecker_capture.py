@@ -316,6 +316,93 @@ def test_qwen_capture_session_dispatches_embedding_and_output_head(tmp_path):
     assert (tmp_path / "evidence" / "000001.s2kf").is_file()
 
 
+def test_qwen_mtp_task_executes_through_containing_oracle(tmp_path):
+    class Language(torch.nn.Module):
+        pass
+
+    class Mtp(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = torch.nn.Linear(128, 4, bias=False)
+
+        def forward(self, values, labels=None, attention_mask=None):
+            logits = self.proj(values)
+            return SimpleNamespace(logits=logits, loss=logits.square().mean())
+
+    class Oracle(torch.nn.Module):
+        def __init__(self, mtp):
+            super().__init__()
+            self.mtp = mtp
+
+        def forward(self, values, labels=None, attention_mask=None):
+            return self.mtp(values, labels=labels, attention_mask=attention_mask)
+
+    class FakeSession:
+        def __init__(
+            self,
+            model_dir,
+            revision,
+            work_dir,
+            evidence_dir,
+            curvature,
+            activation_cache_digest,
+            token_stream_digest,
+            damping,
+            **kwargs,
+        ):
+            self.task = SimpleNamespace(
+                tensor_index=0,
+                tensor_name="mtp.proj.weight",
+                rows=4,
+                columns=128,
+                scope="mtp-drafter",
+                role="projection",
+                source_model_digest="01" * 32,
+                activation_cache_digest=activation_cache_digest,
+                token_stream_digest=token_stream_digest,
+                curvature=curvature,
+                damping=damping,
+            )
+            self.accepted = False
+
+        def next_request(self):
+            return None if self.accepted else self.task
+
+        def accept_current(self):
+            self.accepted = True
+            return True
+
+        def finish(self):
+            assert self.accepted
+            return SimpleNamespace(records=1, produced=1, reused=0)
+
+    mtp = Mtp()
+    receipt = capture_qwen36_kronecker_evidence(
+        Language(),
+        lambda task: [
+            {
+                "values": torch.ones(1, 2, 128),
+                "attention_mask": torch.ones(1, 2, dtype=torch.int64),
+            }
+        ],
+        model_dir=tmp_path / "model",
+        declared_revision="test-revision",
+        work_dir=tmp_path / "work",
+        evidence_dir=tmp_path / "evidence",
+        curvature="guided-fisher",
+        activation_cache_digest="02" * 32,
+        token_stream_digest="03" * 32,
+        damping=0.01,
+        mtp_model=mtp,
+        execution_model=Oracle(mtp),
+        guided_loss_reduction="mean-attention-mask",
+        _session_factory=FakeSession,
+    )
+
+    assert receipt.records == 1
+    assert (tmp_path / "evidence" / "000000.s2kf").is_file()
+
+
 def test_qwen_capture_groups_dense_tasks_into_one_calibration_replay(tmp_path):
     class TinyQwen(torch.nn.Module):
         def __init__(self):
