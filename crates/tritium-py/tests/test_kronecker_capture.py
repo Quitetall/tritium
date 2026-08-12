@@ -128,6 +128,22 @@ def test_model_aware_capture_publishes_all_estimators(tmp_path, curvature):
     assert all(parameter.grad is None for parameter in model.parameters())
 
 
+def test_output_curvature_capture_restores_parameter_grad_flags(tmp_path):
+    model = _TinyObjectiveModel().train()
+    model.proj.weight.requires_grad_(False)
+    before = tuple(parameter.requires_grad for parameter in model.parameters())
+
+    capture_kronecker_module(
+        model,
+        _batches(),
+        module="proj",
+        writer=_writer(tmp_path, "forward-kl-kronecker"),
+        curvature="forward-kl-kronecker",
+    )
+
+    assert tuple(parameter.requires_grad for parameter in model.parameters()) == before
+
+
 @pytest.mark.parametrize("curvature", ["input-hessian", "forward-kl-kronecker"])
 def test_model_aware_capture_rejects_nonfinite_calibration_values(tmp_path, curvature):
     model = _TinyObjectiveModel()

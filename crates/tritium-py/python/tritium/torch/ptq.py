@@ -456,6 +456,39 @@ def _require_finite_tensor(value: torch.Tensor, label: str) -> None:
         raise ValueError(f"{label} must contain only finite values")
 
 
+def _freeze_capture_parameters(
+    runner: nn.Module, *, curvature: str
+) -> Tuple[Tuple[nn.Parameter, bool], ...]:
+    """Freeze runner parameters while capturing output-side curvature.
+
+    Capture requests gradients with respect to selected module outputs, not
+    model parameters. Leaving checkpoint parameters trainable makes autograd
+    retain parameter paths (and can allocate optimizer-sized graph state) for
+    large models. Preserve and restore each flag so capture remains a
+    non-mutating observation of caller training state.
+    """
+
+    if curvature == "input-hessian":
+        return ()
+    states = []
+    seen: set[int] = set()
+    for parameter in runner.parameters():
+        identity = id(parameter)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        states.append((parameter, parameter.requires_grad))
+        parameter.requires_grad_(False)
+    return tuple(states)
+
+
+def _restore_capture_parameters(
+    states: Tuple[Tuple[nn.Parameter, bool], ...]
+) -> None:
+    for parameter, requires_grad in states:
+        parameter.requires_grad_(requires_grad)
+
+
 def _capture_token_mask(
     mask: Optional[torch.Tensor], sample_shape: Tuple[int, ...]
 ) -> Optional[torch.Tensor]:
@@ -662,6 +695,7 @@ def capture_kronecker_embedding(
     handle = selected.register_forward_hook(capture)
     runner = model if execution_model is None else execution_model
     training_flags = tuple((component, component.training) for component in runner.modules())
+    parameter_flags = _freeze_capture_parameters(runner, curvature=curvature)
     batches = 0
     module_calls = 0
     samples = 0
@@ -775,6 +809,7 @@ def capture_kronecker_embedding(
         handle.remove()
         for component, training in training_flags:
             component.training = training
+        _restore_capture_parameters(parameter_flags)
         pending.clear()
     return KroneckerModuleCaptureReceipt(
         module=module,
@@ -1151,6 +1186,7 @@ def capture_kronecker_module(
     handle = selected.register_forward_hook(capture)
     runner = model if execution_model is None else execution_model
     training_flags = tuple((component, component.training) for component in runner.modules())
+    parameter_flags = _freeze_capture_parameters(runner, curvature=curvature)
     batches = 0
     module_calls = 0
     samples = 0
@@ -1272,6 +1308,7 @@ def capture_kronecker_module(
         handle.remove()
         for component, training in training_flags:
             component.training = training
+        _restore_capture_parameters(parameter_flags)
         pending.clear()
     return KroneckerModuleCaptureReceipt(
         module=module,
@@ -1464,6 +1501,7 @@ def capture_kronecker_module_group(
         handles.append(selected.register_forward_hook(capture_for(index)))
     runner = model if execution_model is None else execution_model
     training_flags = tuple((component, component.training) for component in runner.modules())
+    parameter_flags = _freeze_capture_parameters(runner, curvature=curvature)
     batches = 0
     module_calls = [0] * len(modules)
     samples = [0] * len(modules)
@@ -1593,6 +1631,7 @@ def capture_kronecker_module_group(
             handle.remove()
         for component, training in training_flags:
             component.training = training
+        _restore_capture_parameters(parameter_flags)
         for slot in pending:
             slot.clear()
     return tuple(
