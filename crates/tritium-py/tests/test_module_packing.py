@@ -66,6 +66,62 @@ def test_module_conversion_streams_strict_native_salt_package(tmp_path):
         load_packed_module(packed.artifact_dir)
 
 
+def test_native_package_preserves_legacy_g64_scales_on_g128_width(tmp_path):
+    model = torch.nn.Linear(256, 2, bias=False)
+    prepared = prepare(
+        model,
+        TernaryConfig.ptq(profile="compact-v1", target_modules=("Linear",)),
+        inplace=False,
+    )
+    calibration = calibrate(
+        prepared,
+        [torch.ones(1, 256)],
+        evidence_dir=tmp_path / "evidence",
+    )
+    converted = convert(prepared, calibration, work_dir=tmp_path / "work")
+    work = converted.artifact_dir
+
+    # Reopen a valid conversion after widening its canonical G128 scales into
+    # distinct legacy G64 values. Package admission must retain both values,
+    # not silently coarsen them back to one G128 scale.
+    receipt_path = work / "weight-00000.json"
+    receipt = json.loads(receipt_path.read_text())
+    for plane in receipt["planes"]:
+        scales_path = work / plane["scales_file"]
+        scales = torch.frombuffer(
+            bytearray(scales_path.read_bytes()), dtype=torch.float16
+        ).reshape(2, 2)
+        payload = scales.repeat_interleave(2, dim=1).contiguous().numpy().tobytes()
+        scales_path.write_bytes(payload)
+        plane["scales_bytes"] = len(payload)
+        plane["scales_digest"] = "sha256:" + hashlib.sha256(payload).hexdigest()
+        plane["scales_shape"] = [2, 4]
+        plane["group_size"] = 64
+    receipt_payload = json.dumps(
+        receipt, sort_keys=True, separators=(",", ":")
+    ).encode()
+    receipt_path.write_bytes(receipt_payload)
+    manifest_path = work / "conversion.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["weight_receipts"][0] = {
+        "file": "weight-00000.json",
+        "digest": "sha256:" + hashlib.sha256(receipt_payload).hexdigest(),
+        "bytes": len(receipt_payload),
+    }
+    identity = dict(manifest)
+    identity.pop("artifact_id")
+    manifest["artifact_id"] = "sha256:" + hashlib.sha256(
+        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    manifest_path.write_text(json.dumps(manifest))
+
+    widened = load_module_conversion(work)
+    packed = widened.pack_native(tmp_path / "packed", packing="b3")
+    assert packed.tensors == 1
+    assert packed.serialized_bytes == 472
+    assert load_packed_module(packed.artifact_dir) == packed
+
+
 def test_module_conversion_native_pack_rejects_unaligned_g64_weights(tmp_path):
     prepared = prepare(
         torch.nn.Linear(3, 1, bias=False),

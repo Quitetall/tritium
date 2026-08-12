@@ -387,16 +387,6 @@ fn admit_weight(
         .map_err(|_| "conversion row count exceeds platform".to_owned())?;
     let columns = usize::try_from(receipt.shape[1])
         .map_err(|_| "conversion column count exceeds platform".to_owned())?;
-    let package_scale_group_size = if columns.is_multiple_of(SALT_V2_SCALE_GROUP_SIZE) {
-        SALT_V2_SCALE_GROUP_SIZE
-    } else if columns.is_multiple_of(SALT_V2_SCALE_GROUP_SIZE_64) {
-        SALT_V2_SCALE_GROUP_SIZE_64
-    } else {
-        return Err(format!(
-            "conversion weight `{}` has {} columns; SALT V2 export requires G64 alignment",
-            receipt.path, columns
-        ));
-    };
     let source_scale_group_size = receipt
         .planes
         .first()
@@ -413,6 +403,22 @@ fn admit_weight(
     if !columns.is_multiple_of(source_scale_group_size) {
         return Err("conversion scale group size is not aligned".to_owned());
     }
+    // Never coarsen source scales during package conversion. A legacy/source
+    // G64 tensor may have columns divisible by 128, but collapsing adjacent
+    // G64 values into one G128 value changes decoded weights. Row-scale
+    // sources can safely expand to canonical package geometry.
+    let package_scale_group_size = if source_scale_group_size == SALT_V2_SCALE_GROUP_SIZE_64 {
+        SALT_V2_SCALE_GROUP_SIZE_64
+    } else if columns.is_multiple_of(SALT_V2_SCALE_GROUP_SIZE) {
+        SALT_V2_SCALE_GROUP_SIZE
+    } else if columns.is_multiple_of(SALT_V2_SCALE_GROUP_SIZE_64) {
+        SALT_V2_SCALE_GROUP_SIZE_64
+    } else {
+        return Err(format!(
+            "conversion weight `{}` has {} columns; SALT V2 export requires G64 alignment",
+            receipt.path, columns
+        ));
+    };
     let source_scale_groups = columns / source_scale_group_size;
     let elements = rows
         .checked_mul(columns)
