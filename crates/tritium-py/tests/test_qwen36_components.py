@@ -14,6 +14,7 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5TextRotaryEmbedd
 
 from tritium.torch import (
     Qwen36ComponentError,
+    Qwen36LanguageMtpOracle,
     Qwen36MtpAdapter,
     attach_qwen36_mtp,
     capture_qwen36_components,
@@ -170,3 +171,48 @@ def test_qwen36_mtp_adapter_forward_is_finite() -> None:
     )
     assert output.shape == (1, 3, config.hidden_size)
     assert torch.isfinite(output).all()
+
+
+def test_qwen36_oracle_avoids_hidden_state_capture_path() -> None:
+    class Norm(nn.Module):
+        def forward(self, values):
+            return values
+
+    class Language(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = nn.Embedding(8, 4)
+            self.norm = Norm()
+
+        def forward(self, input_ids):
+            return self.norm(self.embed(input_ids))
+
+    class Mtp(nn.Module):
+        def forward(self, *, input_ids, hidden_states, **_kwargs):
+            return hidden_states + 1
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = nn.Module()
+            self.model.language_model = Language()
+            self.mtp = Mtp()
+            self.lm_head = nn.Linear(4, 8, bias=False)
+            self.seen_output_hidden_states = []
+
+        def forward(self, input_ids, output_hidden_states=False, **_kwargs):
+            self.seen_output_hidden_states.append(output_hidden_states)
+            hidden = self.model.language_model(input_ids)
+            return SimpleNamespace(logits=self.lm_head(hidden), loss=None)
+
+    model = Model()
+    oracle = Qwen36LanguageMtpOracle(model)
+    output = oracle(
+        input_ids=torch.tensor([[1, 2]]),
+        attention_mask=torch.ones(1, 2, dtype=torch.int64),
+        output_hidden_states=True,
+    )
+    assert model.seen_output_hidden_states == [False]
+    assert output.mtp_hidden_states.shape == (1, 2, 4)
+    assert torch.equal(output.mtp_logits, model.lm_head(output.mtp_hidden_states))
+    assert output.logits.shape == (1, 2, 8)

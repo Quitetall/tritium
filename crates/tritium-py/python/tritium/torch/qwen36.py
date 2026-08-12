@@ -284,6 +284,123 @@ class Qwen36Components:
     lm_head_path: str
 
 
+@dataclass(frozen=True)
+class Qwen36LanguageMtpOutput:
+    """Output from :class:`Qwen36LanguageMtpOracle`.
+
+    ``base_output`` remains available for model-specific fields.  ``logits``
+    and ``loss`` delegate to it so existing Tritium capture objectives can use
+    this output without a model-specific branch.
+    """
+
+    base_output: Any
+    mtp_hidden_states: torch.Tensor
+    mtp_logits: torch.Tensor
+
+    @property
+    def logits(self) -> Optional[torch.Tensor]:
+        return getattr(self.base_output, "logits", None)
+
+    @property
+    def loss(self) -> Optional[torch.Tensor]:
+        return getattr(self.base_output, "loss", None)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.base_output, name)
+
+
+class Qwen36LanguageMtpOracle(nn.Module):
+    """Execute Qwen language and MTP paths without hidden-state offload hooks.
+
+    Transformers' ``output_hidden_states=True`` path can corrupt the final
+    hidden state when Accelerate disk offload is active.  This oracle captures
+    the already-normalized language output through a local hook while keeping
+    the base forward on its ordinary path, then executes the attached MTP
+    graph.  It is intended for calibration, parity, and MTP evidence; it does
+    not replace the source model's generation implementation.
+    """
+
+    def __init__(self, model: nn.Module) -> None:
+        super().__init__()
+        if not isinstance(model, nn.Module):
+            raise TypeError("model must be a torch.nn.Module")
+        components = resolve_qwen36_components(model, require_mtp=True)
+        if components.mtp_model is None:
+            raise Qwen36ComponentError("Qwen3.6 MTP drafter is required for oracle execution")
+        self._model = model
+        object.__setattr__(self, "_language_model", components.language_model)
+        object.__setattr__(self, "_mtp_model", components.mtp_model)
+        object.__setattr__(self, "_lm_head", components.lm_head)
+
+    def forward(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        past_key_values: Any = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        **kwargs: Any,
+    ) -> Qwen36LanguageMtpOutput:
+        hidden: list[torch.Tensor] = []
+
+        def capture(_module: nn.Module, _args: tuple[Any, ...], output: Any) -> None:
+            if not isinstance(output, torch.Tensor):
+                raise Qwen36ComponentError(
+                    "Qwen3.6 language norm must return one hidden-state tensor"
+                )
+            hidden.append(output)
+
+        handle = self._language_model.norm.register_forward_hook(capture)
+        base_kwargs = dict(kwargs)
+        # Avoid Transformers output-capturing hooks under disk offload.  The
+        # local norm hook above is the authoritative hidden-state capture.
+        base_kwargs["output_hidden_states"] = False
+        try:
+            base_output = self._model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                **base_kwargs,
+            )
+        finally:
+            handle.remove()
+        if len(hidden) != 1:
+            raise Qwen36ComponentError(
+                f"Qwen3.6 language norm executed {len(hidden)} times; expected exactly once"
+            )
+        if input_ids is None and inputs_embeds is None:
+            raise Qwen36ComponentError(
+                "Qwen3.6 oracle requires input_ids or inputs_embeds for MTP"
+            )
+        if position_ids is not None and position_ids.ndim != 2:
+            raise Qwen36ComponentError(
+                "Qwen3.6 oracle requires two-dimensional position_ids for MTP"
+            )
+        mtp_mask = attention_mask
+        if mtp_mask is not None and mtp_mask.dtype != torch.bool and not (
+            mtp_mask.is_floating_point() or mtp_mask.is_complex()
+        ):
+            mtp_mask = mtp_mask.bool()
+        mtp_hidden = self._mtp_model(
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            hidden_states=hidden[0],
+            attention_mask=mtp_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+        )
+        if not isinstance(mtp_hidden, torch.Tensor):
+            raise Qwen36ComponentError("Qwen3.6 MTP graph must return one hidden-state tensor")
+        mtp_logits = self._lm_head(mtp_hidden)
+        return Qwen36LanguageMtpOutput(
+            base_output=base_output,
+            mtp_hidden_states=mtp_hidden,
+            mtp_logits=mtp_logits,
+        )
+
+
 def _module(root: nn.Module, path: str, label: str) -> nn.Module:
     current: Any = root
     for part in path.split("."):

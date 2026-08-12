@@ -92,6 +92,8 @@ from .ptq import (
 from .qwen36 import (
     Qwen36ComponentError,
     Qwen36Components,
+    Qwen36LanguageMtpOracle,
+    Qwen36LanguageMtpOutput,
     Qwen36MtpAdapter,
     Qwen36MtpLoadError,
     attach_qwen36_mtp,
@@ -165,6 +167,8 @@ __all__ = [
     "QwenOnnxCausalLM",
     "Qwen36ComponentError",
     "Qwen36Components",
+    "Qwen36LanguageMtpOracle",
+    "Qwen36LanguageMtpOutput",
     "Qwen36MtpAdapter",
     "Qwen36MtpLoadError",
     "attach_qwen36_mtp",
