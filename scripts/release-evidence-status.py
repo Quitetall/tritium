@@ -88,6 +88,10 @@ FLAGSHIP_RUNTIME_RECEIPT = runpy.run_path(
 validate_flagship_runtime = FLAGSHIP_RUNTIME_RECEIPT["validate_runtime"]
 validate_flagship_physical = FLAGSHIP_RUNTIME_RECEIPT["validate_physical"]
 FlagshipRuntimeError = FLAGSHIP_RUNTIME_RECEIPT["FlagshipRuntimeError"]
+STAGE7_RECEIPT = runpy.run_path(
+    Path(__file__).with_name("verify-stage7-qualification-receipt.py")
+)
+validate_stage7_freeze = STAGE7_RECEIPT["validate"]
 ONNX_RECEIPT = runpy.run_path(
     Path(__file__).with_name("verify-onnx-inference-receipt.py")
 )
@@ -150,6 +154,7 @@ KNOWN_KINDS = frozenset(
         "task-retention",
         "runtime",
         "physical-bytes",
+        "stage7-recipe-freeze",
         "onnx-inference",
         "backend-manifest",
         "performance",
@@ -170,6 +175,7 @@ GATES = (
         "flagship-qwen",
         ("conversion-refinement", "quality", "task-retention", "runtime", "physical-bytes"),
     ),
+    ("stage7-freeze", ("stage7-recipe-freeze",)),
     (
         "pytorch-hf",
         (
@@ -380,7 +386,7 @@ def evaluate(
             )
             else "model-bundle" if kind in {
                 "conversion-refinement", "quality", "task-retention", "runtime",
-                "physical-bytes",
+                "physical-bytes", "stage7-recipe-freeze",
             }
             else "onnx-bundle" if kind == "onnx-inference"
             else "training-receipt-bundle" if kind in {"backend-manifest", "performance"}
@@ -490,6 +496,10 @@ def evaluate(
                 )
             elif kind == "physical-bytes":
                 receipt = validate_flagship_physical(
+                    receipt_path, revision, release, candidate
+                )
+            elif kind == "stage7-recipe-freeze":
+                receipt = validate_stage7_freeze(
                     receipt_path, revision, release, candidate
                 )
             elif kind == "onnx-inference":
@@ -881,6 +891,20 @@ def evaluate(
             if actual != declared or actual != qualified:
                 raise EvidenceError(
                     "deployment receipt does not bind candidate image bytes"
+                )
+        elif kind == "stage7-recipe-freeze":
+            identity = artifact.get("identity", {})
+            actual = (
+                artifact.get("id"), artifact.get("kind"), artifact_path.name,
+                artifact_path.stat().st_size, _sha256(artifact_path),
+            )
+            declared = (
+                artifact.get("id"), artifact.get("kind"), artifact_path.name,
+                identity.get("bytes"), identity.get("sha256"),
+            )
+            if actual != declared:
+                raise EvidenceError(
+                    "stage7 recipe-freeze candidate artifact bytes differ"
                 )
         elif receipt["artifact"]["kind"] != "python-wheel":
             raise EvidenceError(f"{kind} receipt does not identify a Python wheel")

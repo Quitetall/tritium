@@ -2205,6 +2205,7 @@ def qualify(
     model_root: Path,
     smoke_model_root: Path,
     source_root: Path,
+    candidate: Path | None = None,
     output: Path | None = None,
 ) -> dict[str, Any]:
     """Validate raw Stage-7 evidence and emit pass or terminal-negative receipt."""
@@ -2214,6 +2215,20 @@ def qualify(
         raise Stage7Error("campaign and trace must share one evidence directory")
     if output is not None and output.parent.resolve(strict=True) != campaign_path.parent:
         raise Stage7Error("qualification output must share campaign evidence directory")
+    candidate_manifest_sha256 = None
+    if candidate is not None:
+        if candidate.is_symlink() or not candidate.is_file():
+            raise Stage7Error("candidate manifest must be an ordinary file")
+        cursor = candidate.parent
+        while True:
+            if cursor.is_symlink():
+                raise Stage7Error("candidate manifest parent must not be a symlink")
+            parent = cursor.parent
+            if parent == cursor:
+                break
+            cursor = parent
+        candidate = candidate.resolve(strict=True)
+        candidate_manifest_sha256 = hashlib.sha256(candidate.read_bytes()).hexdigest()
     (
         campaign, campaign_raw, grid, model_id, quantized, preserved,
         quantized_tensors, quantized_tensor_names, prerequisite_reasons,
@@ -2243,6 +2258,7 @@ def qualify(
         "run_id": campaign["run_id"],
         "model_id": model_id,
         "model_revision": campaign["model"]["revision"],
+        "candidate_manifest_sha256": candidate_manifest_sha256,
         "campaign": _record(campaign_path, campaign_raw),
         "trace": _record(trace_path, trace_raw),
         "freeze_authorized": authorized,
@@ -2273,6 +2289,7 @@ def main() -> int:
     parser.add_argument("--model-root", required=True, type=Path)
     parser.add_argument("--smoke-model-root", required=True, type=Path)
     parser.add_argument("--source-root", required=True, type=Path)
+    parser.add_argument("--candidate", type=Path)
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
     try:
@@ -2282,6 +2299,7 @@ def main() -> int:
             model_root=args.model_root,
             smoke_model_root=args.smoke_model_root,
             source_root=args.source_root,
+            candidate=args.candidate,
             output=args.output,
         )
     except (OSError, Stage7Error) as error:
