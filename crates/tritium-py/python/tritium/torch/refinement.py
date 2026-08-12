@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import gc
 import hashlib
 import json
 import math
@@ -1132,6 +1133,12 @@ def refine(
             config.temperature,
             input_dtype=compute_dtype,
         )
+        # Plane dictionaries hold full CPU copies of every parent/accepted
+        # candidate. Drop them before taking the final snapshot; otherwise
+        # sealing a 1.7B model retains multiple multi-gigabyte copies and
+        # thrashes hosts whose swap is already occupied.
+        del initial_planes, best_planes
+        gc.collect()
     finally:
         teacher.train(teacher_was_training)
         if compute_dtype != torch.float32:
