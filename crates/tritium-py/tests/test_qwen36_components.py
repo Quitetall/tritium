@@ -191,6 +191,33 @@ def test_qwen36_mtp_adapter_matches_checkpoint_namespace(tmp_path) -> None:
     assert resolve_qwen36_components(graph).mtp_model is adapter
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA device split")
+def test_qwen36_mtp_default_device_follows_language_embedding(tmp_path) -> None:
+    config = _tiny_text_config()
+    graph = MtpGraph(config)
+    # Multimodal checkpoints may register a CUDA vision module before their
+    # CPU/offloaded language embedding.  MTP must follow embedding placement.
+    graph.vision = nn.Linear(2, 2, device="cuda")
+    template = Qwen36MtpAdapter(
+        config,
+        graph.model.language_model.embed_tokens,
+        graph.model.language_model.rotary_emb,
+    )
+    expected = {
+        f"mtp.{name}": torch.randn_like(value)
+        for name, value in template.state_dict().items()
+    }
+    shard = tmp_path / "model-00001-of-00001.safetensors"
+    save_file(expected, str(shard))
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {name: shard.name for name in expected}}),
+        encoding="utf-8",
+    )
+
+    adapter = attach_qwen36_mtp(graph, tmp_path)
+    assert next(adapter.parameters()).device.type == "cpu"
+
+
 def test_qwen36_mtp_adapter_forward_is_finite() -> None:
     config = _tiny_text_config()
     embeddings = nn.Embedding(config.vocab_size, config.hidden_size)

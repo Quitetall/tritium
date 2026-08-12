@@ -213,10 +213,18 @@ def attach_qwen36_mtp(
     if dtype is not None:
         adapter = adapter.to(dtype=dtype)
     if device is None:
-        try:
-            inferred = next(model.parameters()).device
-        except StopIteration:
-            inferred = torch.device("cpu")
+        # Qwen3.6 multimodal graphs can register vision parameters before the
+        # language graph.  Under Accelerate/offload those parameters may live
+        # on a different device (or on ``meta``) than the shared embedding
+        # that supplies MTP inputs.  Bind adapter placement to that embedding
+        # first; only fall back to the model-wide parameter probe for unusual
+        # graphs without a materialized embedding weight.
+        inferred = getattr(getattr(shared_embeddings, "weight", None), "device", None)
+        if inferred is None or inferred.type == "meta":
+            try:
+                inferred = next(model.parameters()).device
+            except StopIteration:
+                inferred = torch.device("cpu")
         device = torch.device("cpu") if inferred.type == "meta" else inferred
     adapter = adapter.to(device=device)
     try:
