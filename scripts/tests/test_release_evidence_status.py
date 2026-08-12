@@ -15,6 +15,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[2]
 MODULE = runpy.run_path(ROOT / "scripts" / "release-evidence-status.py")
 EvidenceError = MODULE["EvidenceError"]
+contained_file = MODULE["_contained_file"]
 evaluate = MODULE["evaluate"]
 render = MODULE["render"]
 gate_row = MODULE["_gate_row"]
@@ -282,6 +283,14 @@ def entry(
 
 
 class ReleaseEvidenceStatusTests(unittest.TestCase):
+    def test_candidate_artifact_path_must_be_contained(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            outside = root / "outside.model"
+            outside.write_bytes(b"outside")
+            with self.assertRaisesRegex(EvidenceError, "contained"):
+                contained_file(root, "../outside.model", "candidate artifact path")
+
     def test_estimator_refinement_ablation_requires_exact_lineage(self):
         with tempfile.TemporaryDirectory() as raw:
             candidate, document, old_artifact, evidence_root = release_fixture(Path(raw))

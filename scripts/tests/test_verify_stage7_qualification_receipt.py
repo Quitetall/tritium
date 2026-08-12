@@ -257,6 +257,17 @@ class Stage7QualificationTests(unittest.TestCase):
             with self.assertRaisesRegex(Stage7QualificationError, "trace"):
                 validate(receipt_path, "a" * 40, "1.1.0-rc.1", candidate)
 
+    def test_rejects_frozen_checkpoint_not_bound_to_trace(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            candidate, receipt_path, receipt = fixture(root)
+            receipt["frozen_refined_checkpoint"]["tokens"] = 123
+            unsigned = {key: value for key, value in receipt.items() if key != "receipt_id"}
+            receipt["receipt_id"] = "sha256:" + hashlib.sha256(canonical(unsigned)).hexdigest()
+            receipt_path.write_bytes(canonical(receipt) + b"\n")
+            with self.assertRaisesRegex(Stage7QualificationError, "checkpoint"):
+                validate(receipt_path, "a" * 40, "1.1.0-rc.1", candidate)
+
     def test_rejects_intermediate_symlink_escape(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
