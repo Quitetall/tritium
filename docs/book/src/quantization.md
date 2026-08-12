@@ -63,6 +63,25 @@ extra residual planes on the most sensitive tiles (up to `~4.75` bpw at `T = 3`)
 You can preview the bpw/error tradeoff on a raw fp32 matrix without committing to
 a full quantize via `tritium report salt`.
 
+PyTorch researchers can use the same native water-filling allocator with
+measured group curves:
+
+```python
+from tritium.torch import allocate_planes
+
+allocation = allocate_planes(
+    group_sizes=[128, 128],
+    sensitivities=[1.0, 8.0],
+    error_curves=[[10.0, 6.0, 4.0, 3.0], [10.0, 2.0, 0.5, 0.0]],
+    target_bpw=3.0,
+)
+print(allocation.plane_counts, allocation.achieved_bpw)
+```
+
+Curves are evidence inputs, not guessed metrics. Native deterministic
+tie-breaking returns counts within budget; malformed, nonfinite, or undersized
+curves fail before allocation.
+
 ## Stage-7 token evidence
 
 Collect the frozen source rows at the three immutable Hub revisions before
