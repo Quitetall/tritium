@@ -847,11 +847,11 @@ def load_refinement(artifact_dir: Pathish) -> RefinementResult:
     conversion = load_module_conversion(conversion_path)
     if conversion.artifact_id != value["child_conversion_artifact_id"]:
         raise ValueError("refinement child conversion identity mismatch")
-    packable = all(reference.shape[1] % 128 == 0 for reference in conversion.weights)
+    packable = all(reference.shape[1] % 64 == 0 for reference in conversion.weights)
     packed = None
     if packable:
         if value["packed_artifact_id"] is None:
-            raise ValueError("G128 refinement is missing its packed package")
+            raise ValueError("aligned refinement is missing its packed package")
         packed = load_packed_module(packed_path)
         expected_packing = "s34" if config.structure == "s34" else "b3"
         if (
@@ -1268,7 +1268,7 @@ def refine(
             fit_chunk_rows=fit_chunk_rows,
             max_working_bytes=max_working_bytes,
         )
-        packable = all(reference.shape[1] % 128 == 0 for reference in child.weights)
+        packable = all(reference.shape[1] % 64 == 0 for reference in child.weights)
         packing = ("s34" if config.structure == "s34" else "b3") if packable else None
         packed_path = directory / _PACKED_DIRECTORY
         if packing is None:
