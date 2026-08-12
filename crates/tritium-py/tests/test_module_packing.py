@@ -91,7 +91,9 @@ def test_native_package_preserves_legacy_g64_scales_on_g128_width(tmp_path):
         scales = torch.frombuffer(
             bytearray(scales_path.read_bytes()), dtype=torch.float16
         ).reshape(2, 2)
-        payload = scales.repeat_interleave(2, dim=1).contiguous().numpy().tobytes()
+        widened = scales.repeat_interleave(2, dim=1)
+        widened[:, 1::2] += 0.25
+        payload = widened.contiguous().numpy().tobytes()
         scales_path.write_bytes(payload)
         plane["scales_bytes"] = len(payload)
         plane["scales_digest"] = "sha256:" + hashlib.sha256(payload).hexdigest()
