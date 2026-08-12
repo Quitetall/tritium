@@ -10,7 +10,7 @@ from typing import Sequence, Tuple
 import torch
 
 from .config import RefinementConfig
-from .projection import TernaryPlane
+from .projection import TernaryPlane, expand_plane_scales
 
 
 @dataclass(frozen=True)
@@ -42,6 +42,8 @@ def _validate(
         raise ValueError("refinement master must be one finite floating matrix")
     if not 1 <= len(planes) <= 3:
         raise ValueError("refinement requires one to three parent planes")
+    if not isinstance(config, RefinementConfig):
+        raise TypeError("config must be RefinementConfig")
     if (
         not isinstance(metric, torch.Tensor)
         or metric.ndim != 1
@@ -52,21 +54,25 @@ def _validate(
         or not bool((metric > 0).any())
     ):
         raise ValueError("refinement metric must be finite nonnegative input curvature")
+    group_size = planes[0].group_size
+    if type(group_size) is not int or group_size <= 0 or master.shape[1] % group_size:
+        raise ValueError("refinement parent plane group size is not aligned")
+    groups = master.shape[1] // group_size
     for plane in planes:
         if (
             plane.trits.dtype != torch.int8
             or tuple(plane.trits.shape) != tuple(master.shape)
             or plane.trits.device != master.device
             or plane.scales.dtype != torch.float16
-            or tuple(plane.scales.shape) != (master.shape[0], 1)
+            or tuple(plane.scales.shape) != (master.shape[0], groups)
             or plane.scales.device != master.device
-            or plane.group_size != master.shape[1]
+            or plane.group_size != group_size
             or plane.structure not in {"dense", "s34"}
             or not bool(torch.all((plane.trits >= -1) & (plane.trits <= 1)))
             or not bool(torch.isfinite(plane.scales).all())
             or bool((plane.scales < 0).any())
         ):
-            raise ValueError("refinement parent plane is not deployable row-scale SALT")
+            raise ValueError("refinement parent plane is not deployable SALT")
         if plane.structure == "s34" and (
             master.shape[1] % 4
             or not bool(
@@ -80,8 +86,8 @@ def _validate(
             )
         ):
             raise ValueError("refinement parent S34 plane violates one-zero groups")
-    if not isinstance(config, RefinementConfig):
-        raise TypeError("config must be RefinementConfig")
+    if config.structure == "s34" and group_size != master.shape[1]:
+        raise ValueError("S34 refinement requires row-scale parent planes")
     if type(iterations) is not int or iterations <= 0:
         raise ValueError("iterations must be a positive integer")
     if type(max_working_bytes) is not int or max_working_bytes < 1024:
@@ -102,8 +108,14 @@ def _decoded(
     dtype: torch.dtype,
 ) -> torch.Tensor:
     value = torch.zeros_like(trits[0], dtype=dtype)
-    for codes, row_scales in zip(trits, scales):
-        value.add_(codes.to(dtype) * row_scales.to(dtype))
+    for codes, group_scales in zip(trits, scales):
+        expanded = expand_plane_scales(
+            group_scales,
+            rows=codes.shape[0],
+            columns=codes.shape[1],
+            group_size=codes.shape[1] // group_scales.shape[1],
+        )
+        value.add_(codes.to(dtype) * expanded.to(dtype))
     return value
 
 
@@ -122,34 +134,39 @@ def _solve_scales(
     master: torch.Tensor,
     trits: Sequence[torch.Tensor],
     metric: torch.Tensor,
+    group_size: int,
 ) -> Tuple[torch.Tensor, ...]:
     """Exact small-K nonnegative least squares, then deployment f16 rounding."""
 
     dtype = torch.float64
-    codes = torch.stack(tuple(value.to(dtype) for value in trits), dim=1)
-    curvature = metric.to(dtype)
-    target = master.to(dtype)
-    gram = torch.einsum("rpi,i,rqi->rpq", codes, curvature, codes)
-    rhs = torch.einsum("rpi,i,ri->rp", codes, curvature, target)
-    rows, plane_count = rhs.shape
-    best = torch.zeros((rows, plane_count), dtype=dtype, device=master.device)
-    best_loss = (target.square() * curvature).sum(dim=1)
+    rows, columns = master.shape
+    groups = columns // group_size
+    plane_count = len(trits)
+    codes = torch.stack(tuple(value.to(dtype) for value in trits), dim=1).reshape(
+        rows, plane_count, groups, group_size
+    )
+    curvature = metric.to(dtype).reshape(groups, group_size)
+    target = master.to(dtype).reshape(rows, groups, group_size)
+    gram = torch.einsum("rpgi,gi,rqgi->rgpq", codes, curvature, codes)
+    rhs = torch.einsum("rpgi,gi,rgi->rgp", codes, curvature, target)
+    best = torch.zeros((rows, groups, plane_count), dtype=dtype, device=master.device)
+    best_loss = (target.square() * curvature).sum(dim=2)
     for mask in range(1, 1 << plane_count):
         active = [index for index in range(plane_count) if mask & (1 << index)]
-        sub_gram = gram[:, active][:, :, active]
-        sub_rhs = rhs[:, active]
+        sub_gram = gram[:, :, active][:, :, :, active]
+        sub_rhs = rhs[:, :, active]
         solution = torch.linalg.pinv(sub_gram) @ sub_rhs.unsqueeze(-1)
         solution = solution.squeeze(-1)
-        feasible = torch.isfinite(solution).all(dim=1) & (solution >= 0).all(dim=1)
+        feasible = torch.isfinite(solution).all(dim=2) & (solution >= 0).all(dim=2)
         candidate = torch.zeros_like(best)
-        candidate[:, active] = solution
-        decoded = torch.einsum("rpi,rp->ri", codes, candidate)
-        loss = ((target - decoded).square() * curvature).sum(dim=1)
+        candidate[:, :, active] = solution
+        decoded = torch.einsum("rpgi,rgp->rgi", codes, candidate)
+        loss = ((target - decoded).square() * curvature).sum(dim=2)
         accept = feasible & (loss < best_loss)
         best[accept] = candidate[accept]
         best_loss[accept] = loss[accept]
     stored = best.to(torch.float16)
-    return tuple(stored[:, index : index + 1] for index in range(plane_count))
+    return tuple(stored[:, :, index] for index in range(plane_count))
 
 
 def _dense_sweep(
@@ -173,7 +190,12 @@ def _dense_sweep(
             if len(result) > 1
             else torch.zeros_like(master, dtype=dtype)
         )
-        row_scale = scale.to(dtype)
+        row_scale = expand_plane_scales(
+            scale,
+            rows=master.shape[0],
+            columns=master.shape[1],
+            group_size=master.shape[1] // scale.shape[1],
+        ).to(dtype)
         residual = master.to(dtype) - other
         negative = (residual + row_scale).square()
         zero = residual.square()
@@ -181,7 +203,7 @@ def _dense_sweep(
         selected = (
             torch.stack((negative, zero, positive), dim=0).argmin(dim=0) - 1
         ).to(torch.int8)
-        selected[row_scale.squeeze(1) == 0] = 0
+        selected[row_scale == 0] = 0
         result[plane_index] = selected
     return tuple(result)
 
@@ -260,6 +282,7 @@ def refine_weight_diagonal(
     output_scales = [
         torch.empty_like(plane.scales, dtype=torch.float16) for plane in planes
     ]
+    group_size = planes[0].group_size
     parent_total = 0.0
     refined_total = 0.0
     denominator = float(metric.to(torch.float64).sum()) * rows
@@ -271,7 +294,9 @@ def refine_weight_diagonal(
         parent_loss = _loss_rows(chunk_master, chunk_trits, chunk_scales, metric)
         if config.kind == "scale-only":
             candidate_trits = chunk_trits
-            candidate_scales = _solve_scales(chunk_master, candidate_trits, metric)
+            candidate_scales = _solve_scales(
+                chunk_master, candidate_trits, metric, group_size
+            )
         else:
             candidate_trits = chunk_trits
             candidate_scales = chunk_scales
@@ -284,7 +309,9 @@ def refine_weight_diagonal(
                     candidate_trits = _dense_sweep(
                         chunk_master, candidate_trits, candidate_scales
                     )
-                candidate_scales = _solve_scales(chunk_master, candidate_trits, metric)
+                candidate_scales = _solve_scales(
+                    chunk_master, candidate_trits, metric, group_size
+                )
         candidate_loss = _loss_rows(
             chunk_master, candidate_trits, candidate_scales, metric
         )
@@ -304,7 +331,7 @@ def refine_weight_diagonal(
         TernaryPlane(
             trits=trits,
             scales=scales,
-            group_size=columns,
+            group_size=group_size,
             structure=structure,
         )
         for trits, scales in zip(output_trits, output_scales)

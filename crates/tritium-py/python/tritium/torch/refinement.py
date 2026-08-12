@@ -32,7 +32,7 @@ from .module_artifacts import (
     module_recipe_id,
     seal_module_conversion,
 )
-from .projection import TernaryPlane
+from .projection import TernaryPlane, expand_plane_scales
 from .ptq import _hash_value, _invoke_model, _source_model_digest
 from .refinement_core import RefinedWeight, refine_weight_diagonal
 
@@ -135,8 +135,15 @@ class _ScaleOnlyWeight(nn.Module):
     def __init__(self, planes: Tuple[TernaryPlane, ...]) -> None:
         super().__init__()
         self.plane_count = len(planes)
+        self.group_size = planes[0].group_size
+        self.scale_groups = planes[0].scales.shape[1]
         self.structures = tuple(plane.structure for plane in planes)
         for index, plane in enumerate(planes):
+            if (
+                plane.group_size != self.group_size
+                or plane.scales.shape[1] != self.scale_groups
+            ):
+                raise ValueError("refinement planes have inconsistent scale geometry")
             self.register_buffer(f"trits_{index}", plane.trits.detach().clone())
             self.register_parameter(
                 f"scale_{index}",
@@ -154,7 +161,13 @@ class _ScaleOnlyWeight(nn.Module):
             # flow through the full-precision scale parameter.
             stored = scale.to(torch.float16).to(scale.dtype)
             quantized = scale + (stored - scale).detach()
-            plane = trits * quantized.to(dtype=dtype)
+            expanded = expand_plane_scales(
+                quantized,
+                rows=trits.shape[0],
+                columns=trits.shape[1],
+                group_size=self.group_size,
+            )
+            plane = trits * expanded.to(dtype=dtype)
             decoded = plane if decoded is None else decoded + plane
         assert decoded is not None
         return decoded
@@ -174,7 +187,7 @@ class _ScaleOnlyWeight(nn.Module):
                 TernaryPlane(
                     trits,
                     scales,
-                    trits.shape[1],
+                    self.group_size,
                     structure=self.structures[index],
                 )
             )
@@ -686,9 +699,15 @@ def _weight_mse(
         end = min(master.shape[0], start + rows_per_chunk)
         decoded = torch.zeros((end - start, master.shape[1]), dtype=torch.float32)
         for plane in planes:
+            scales = expand_plane_scales(
+                plane.scales[start:end],
+                rows=end - start,
+                columns=master.shape[1],
+                group_size=plane.group_size,
+            )
             decoded.add_(
                 plane.trits[start:end].to(torch.float32)
-                * plane.scales[start:end].to(torch.float32)
+                * scales.to(torch.float32)
             )
         residual = master_cpu[start:end] - decoded
         total += float(

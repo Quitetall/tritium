@@ -76,6 +76,34 @@ def test_dense_hard_pv_alternates_assignments_and_scales_without_regression():
     assert result.refined_weighted_mse <= result.parent_weighted_mse
 
 
+def test_grouped_scales_refine_per_group_and_preserve_geometry():
+    torch.manual_seed(229)
+    master = torch.randn(6, 32)
+    group_size = 8
+    parent = tuple(
+        TernaryPlane(
+            trits=torch.randint(-1, 2, (6, 32), dtype=torch.int8),
+            scales=torch.rand(6, 4, dtype=torch.float16),
+            group_size=group_size,
+        )
+        for _ in range(3)
+    )
+    result = refine_weight_diagonal(
+        master,
+        parent,
+        torch.rand(32).add_(0.1),
+        RefinementConfig.hard_pv(pv_iterations=2),
+        iterations=2,
+        max_working_bytes=4096,
+    )
+
+    assert result.refined_weighted_mse <= result.parent_weighted_mse
+    assert all(
+        plane.group_size == group_size and plane.scales.shape == (6, 4)
+        for plane in result.planes
+    )
+
+
 def test_s34_hard_pv_emits_exact_one_zero_per_group_and_is_deterministic():
     torch.manual_seed(227)
     master = torch.randn(5, 12)
