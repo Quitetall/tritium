@@ -393,8 +393,9 @@ def evaluate(
             )
             else "model-bundle" if kind in {
                 "conversion-refinement", "quality", "task-retention", "runtime",
-                "physical-bytes", "stage7-recipe-freeze", "source-admission",
+                "physical-bytes", "stage7-recipe-freeze",
             }
+            else "source-admission" if kind == "source-admission"
             else "onnx-bundle" if kind == "onnx-inference"
             else "training-receipt-bundle" if kind in {"backend-manifest", "performance"}
             else "model-bundle" if kind in {"refinement", "baseline-ablation"}
