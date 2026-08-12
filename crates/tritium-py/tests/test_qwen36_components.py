@@ -46,6 +46,11 @@ def test_aliasing_components_is_rejected() -> None:
     with pytest.raises(Qwen36ComponentError, match="alias unexpectedly"):
         resolve_qwen36_components(graph)
 
+    graph = Graph()
+    graph.mtp = graph.lm_head
+    with pytest.raises(Qwen36ComponentError, match="alias unexpectedly"):
+        resolve_qwen36_components(graph)
+
 
 def test_capture_resolves_components_before_delegating(monkeypatch) -> None:
     graph = Graph()

@@ -68,7 +68,9 @@ def resolve_qwen36_components(
         if require_mtp or hasattr(model, "mtp")
         else None
     )
-    if id(language) == id(lm_head) or (mtp is not None and id(language) == id(mtp)):
+    if id(language) == id(lm_head) or (
+        mtp is not None and id(language) == id(mtp)
+    ) or (mtp is not None and id(lm_head) == id(mtp)):
         raise Qwen36ComponentError("Qwen3.6 component paths alias unexpectedly")
     return Qwen36Components(
         root=model,
