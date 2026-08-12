@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import copy
 import hashlib
 import importlib.util
 import json
@@ -68,6 +67,7 @@ def test_validates_inventory_and_returns_registry_identity(tmp_path: Path):
     write(path, value)
     result = MODULE.validate(path, MODULE.PINNED_REVISION, "1.1.0-rc.1", path)
     assert result["receipt_id"] == "sha256:" + hashlib.sha256(canonical(value)).hexdigest()
+    assert result["run_id"] == "qwen36-source-admission-" + value["receipt"]["proof_id"]
 
 
 @pytest.mark.parametrize(
@@ -102,3 +102,57 @@ def test_source_admission_is_a_distinct_release_gate():
         Path(__file__).resolve().parents[1] / "release-evidence-status.py"
     )
     assert ("qwen-source-admission", ("source-admission",)) in release_module["GATES"]
+
+
+def test_release_evaluator_accepts_source_receipt_identity(tmp_path: Path):
+    release_module = runpy.run_path(
+        Path(__file__).resolve().parents[1] / "release-evidence-status.py"
+    )
+    candidate_root = tmp_path / "candidate"
+    candidate_root.mkdir()
+    artifact = candidate_root / "qwen-source.bundle"
+    artifact.write_bytes(b"source bundle")
+    candidate_document = {
+        "schema": "tritium.release-candidate.v1",
+        "release": "1.1.0-rc.1",
+        "source_revision": "a" * 40,
+        "artifacts": [{
+            "id": "qwen-source",
+            "kind": "model-bundle",
+            "path": artifact.name,
+            "identity": {},
+            "sbom": {},
+            "provenance": {"source_model_id": record()["receipt"]["source_model_id"]},
+        }],
+    }
+    candidate = candidate_root / "manifest.json"
+    write(candidate, candidate_document)
+    evidence_root = tmp_path / "evidence"
+    evidence_root.mkdir()
+    receipt = record()
+    receipt_path = evidence_root / "source.json"
+    write(receipt_path, receipt)
+    validated = MODULE.validate(
+        receipt_path, MODULE.PINNED_REVISION, "1.1.0-rc.1", candidate
+    )
+    registry = {
+        "schema": "tritium.release-evidence-registry.v1",
+        "release": candidate_document["release"],
+        "source_revision": candidate_document["source_revision"],
+        "candidate_manifest_sha256": hashlib.sha256(candidate.read_bytes()).hexdigest(),
+        "receipts": [{
+            "id": validated["receipt_id"],
+            "kind": "source-admission",
+            "path": receipt_path.name,
+            "sha256": hashlib.sha256(receipt_path.read_bytes()).hexdigest(),
+            "artifact_id": "qwen-source",
+            "parents": [],
+        }],
+    }
+    registry_path = evidence_root / "registry.json"
+    write(registry_path, registry)
+    report = release_module["evaluate"](
+        registry_path, candidate, candidate_document
+    )
+    source_gate = next(row for row in report["rows"] if row["id"] == "qwen-source-admission")
+    assert source_gate["status"] == "PASS"

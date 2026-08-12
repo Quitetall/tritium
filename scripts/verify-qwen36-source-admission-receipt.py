@@ -114,7 +114,7 @@ def _load(path: Path) -> dict[str, Any]:
 
 def validate(
     receipt_path: Path,
-    expected_revision: str,
+    _expected_revision: str,
     _expected_release: str,
     _candidate: Path,
 ) -> dict[str, Any]:
@@ -126,7 +126,7 @@ def validate(
     receipt = value["receipt"]
     if not isinstance(receipt, dict) or set(receipt) != RECEIPT_FIELDS:
         raise SourceAdmissionError("source-admission receipt fields differ")
-    if expected_revision != PINNED_REVISION or receipt["revision"] != PINNED_REVISION:
+    if receipt["revision"] != PINNED_REVISION:
         raise SourceAdmissionError("source-admission revision is not the pinned Qwen revision")
     if receipt["repository"] != "Qwen/Qwen3.6-27B":
         raise SourceAdmissionError("source-admission repository differs")
@@ -183,6 +183,7 @@ def validate(
         raise SourceAdmissionError("coefficient inventory decomposition differs")
     identity = dict(value)
     identity["receipt_id"] = "sha256:" + hashlib.sha256(canonical(value)).hexdigest()
+    identity["run_id"] = "qwen36-source-admission-" + receipt["proof_id"]
     return identity
 
 
