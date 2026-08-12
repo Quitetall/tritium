@@ -111,18 +111,19 @@ def test_release_evaluator_accepts_source_receipt_identity(tmp_path: Path):
     candidate_root = tmp_path / "candidate"
     candidate_root.mkdir()
     artifact = candidate_root / "qwen-source.json"
-    artifact.write_bytes(b"source bundle")
+    candidate_source = record()
+    artifact.write_bytes(canonical(candidate_source) + b"\n")
     candidate_document = {
         "schema": "tritium.release-candidate.v1",
         "release": "1.1.0-rc.1",
-        "source_revision": "a" * 40,
+        "source_revision": MODULE.PINNED_REVISION,
         "artifacts": [{
             "id": "qwen-source",
             "kind": "source-admission",
             "path": artifact.name,
             "identity": {},
             "sbom": {},
-            "provenance": {"source_model_id": record()["receipt"]["source_model_id"]},
+            "provenance": {},
         }],
     }
     candidate = candidate_root / "manifest.json"

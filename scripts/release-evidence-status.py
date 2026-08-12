@@ -926,13 +926,13 @@ def evaluate(
                     "stage7 recipe-freeze candidate artifact bytes differ"
                 )
         elif kind == "source-admission":
-            _contained_file(candidate.parent, artifact.get("path"), "source-admission artifact path")
-            provenance = artifact.get("provenance")
-            if (
-                not isinstance(provenance, dict)
-                or provenance.get("source_model_id")
-                != receipt["receipt"]["source_model_id"]
-            ):
+            source_artifact_path = _contained_file(
+                candidate.parent, artifact.get("path"), "source-admission artifact path"
+            )
+            source_artifact = validate_source_admission(
+                source_artifact_path, revision, release, source_artifact_path
+            )
+            if source_artifact["receipt"]["source_model_id"] != receipt["receipt"]["source_model_id"]:
                 raise EvidenceError(
                     "source-admission does not bind candidate source_model_id"
                 )
