@@ -9,6 +9,7 @@ from .artifacts import (
     load,
 )
 from .config import RefinementConfig, TernaryConfig
+from .allocation import PlaneAllocation, allocate_planes
 from .conversion import PreparedModel, inspect, prepare, prepare_qat
 from .coverage import CoverageEntry, CoverageReport
 from .errors import TritiumError
@@ -150,6 +151,7 @@ __all__ = [
     "OnnxModule",
     "OpenTelemetryDiagnostics",
     "PlaneDiagnostics",
+    "PlaneAllocation",
     "ProjectionContext",
     "PreparedModel",
     "QatHardArtifact",
@@ -187,6 +189,7 @@ __all__ = [
     "create_estimator",
     "hestia_soft_expectation",
     "calibrate",
+    "allocate_planes",
     "bind_kronecker_activation_cache_digest",
     "capture_kronecker_embedding",
     "capture_kronecker_module",

@@ -7,9 +7,86 @@
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
+use tritium_quantize::{AllocConfig, GroupCurve, allocate_with_curves};
 use tritium_train::ops::conv1d::{self, Conv1dCfg};
 use tritium_train::ops::fsq::{self, FsqBound, FsqCfg, FsqSte};
 use tritium_train::ops::ste;
+
+/// Allocate additive ternary planes from measured group error curves.
+///
+/// Curves contain `err(0..=t_max)` for each group. The native allocator owns
+/// deterministic water-filling and tie-breaking; Python only supplies bounded
+/// numeric evidence and receives plane counts plus the achieved logical bpw.
+#[pyfunction]
+pub(crate) fn allocate_planes(
+    group_sizes: Vec<usize>,
+    sensitivities: Vec<f64>,
+    error_curves: Vec<Vec<f64>>,
+    target_bpw: f64,
+    t_min: usize,
+    t_max: usize,
+) -> PyResult<(Vec<usize>, f64)> {
+    if group_sizes.is_empty() {
+        return Err(PyValueError::new_err("group_sizes must not be empty"));
+    }
+    if group_sizes.len() != sensitivities.len() || group_sizes.len() != error_curves.len() {
+        return Err(PyValueError::new_err(
+            "group_sizes, sensitivities, and error_curves must have equal lengths",
+        ));
+    }
+    if !target_bpw.is_finite() || target_bpw <= 0.0 {
+        return Err(PyValueError::new_err(
+            "target_bpw must be finite and positive",
+        ));
+    }
+    if t_min > t_max {
+        return Err(PyValueError::new_err("t_min must not exceed t_max"));
+    }
+    let mut total_weights = 0usize;
+    for (index, (size, (sensitivity, curve))) in group_sizes
+        .iter()
+        .zip(sensitivities.iter().zip(error_curves.iter()))
+        .enumerate()
+    {
+        if *size == 0 {
+            return Err(PyValueError::new_err(format!(
+                "group_sizes[{index}] must be positive"
+            )));
+        }
+        total_weights = total_weights
+            .checked_add(*size)
+            .ok_or_else(|| PyValueError::new_err("group_sizes total exceeds platform usize"))?;
+        if !sensitivity.is_finite() || *sensitivity < 0.0 {
+            return Err(PyValueError::new_err(format!(
+                "sensitivities[{index}] must be finite and nonnegative"
+            )));
+        }
+        if curve.len() <= t_max {
+            return Err(PyValueError::new_err(format!(
+                "error_curves[{index}] must contain t_max + 1 values"
+            )));
+        }
+        if curve.iter().any(|error| !error.is_finite() || *error < 0.0) {
+            return Err(PyValueError::new_err(format!(
+                "error_curves[{index}] must contain finite nonnegative values"
+            )));
+        }
+    }
+    let groups: Vec<GroupCurve<'_>> = group_sizes
+        .iter()
+        .zip(sensitivities.iter().zip(error_curves.iter()))
+        .map(|(weights, (sensitivity, curve))| GroupCurve {
+            curve,
+            weights: *weights,
+            sensitivity: *sensitivity,
+        })
+        .collect();
+    let config = AllocConfig::from_bpw(target_bpw, total_weights, t_min, t_max);
+    let allocation = allocate_with_curves(&groups, &config)
+        .map_err(|error| PyValueError::new_err(error.to_string()))?;
+    let achieved_bpw = allocation.avg_bpw(&group_sizes);
+    Ok((allocation.plane_counts, achieved_bpw))
+}
 
 #[allow(clippy::too_many_arguments)]
 fn conv_cfg(

@@ -423,6 +423,7 @@ fn _tritium(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(ops::ste_quantize_vjp, m)?)?;
     m.add_function(wrap_pyfunction!(ops::lsq_forward, m)?)?;
     m.add_function(wrap_pyfunction!(ops::lsq_vjp, m)?)?;
+    m.add_function(wrap_pyfunction!(ops::allocate_planes, m)?)?;
     m.add_function(wrap_pyfunction!(
         torch_native::_ternary_linear_cpu_dlpack,
         m
