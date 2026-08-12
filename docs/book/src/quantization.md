@@ -226,6 +226,17 @@ source = admit_qwen36_source(
 print(source.source_model_id, source.additive_tensors, source.mtp_tensors)
 ```
 
+For release evidence, the equivalent strict producer persists one canonical
+JSON receipt and the SHA-256 of the durable proof:
+
+```sh
+python scripts/admit-qwen36-source.py \
+  --model-dir /models/Qwen3.6-27B \
+  --revision 6a9e13bd6fc8f0983b9b99948120bc37f49c13e9 \
+  --work-dir ./tritium-work \
+  --output ./tritium-work/source-admission.json
+```
+
 Source admission performs no calibration, fitting, packaging, or quality
 claim. `identity_status` remains candidate-only until official payload
 authentication is independently registered. Advanced users with a fully
