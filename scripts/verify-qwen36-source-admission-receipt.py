@@ -104,7 +104,9 @@ def _load(path: Path) -> dict[str, Any]:
             ),
         )
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
-        raise SourceAdmissionError("source-admission receipt must contain strict UTF-8 JSON") from error
+        raise SourceAdmissionError(
+            "source-admission receipt must contain strict UTF-8 JSON"
+        ) from error
     if not isinstance(value, dict) or set(value) != TOP_FIELDS:
         raise SourceAdmissionError("source-admission receipt fields differ")
     return value
@@ -145,19 +147,39 @@ def validate(
     if receipt["proof_bytes"] == 0 or receipt["payload_bytes"] == 0:
         raise SourceAdmissionError("source-admission proof and payload must be nonempty")
     tensor_totals = {
-        "total_tensors": receipt["language_tensors"] + receipt["mtp_tensors"] + receipt["vision_tensors"],
-        "total_coefficients": receipt["language_coefficients"] + receipt["mtp_coefficients"] + receipt["vision_coefficients"],
+        "total_tensors": (
+            receipt["language_tensors"]
+            + receipt["mtp_tensors"]
+            + receipt["vision_tensors"]
+        ),
+        "total_coefficients": (
+            receipt["language_coefficients"]
+            + receipt["mtp_coefficients"]
+            + receipt["vision_coefficients"]
+        ),
     }
     for field, expected in tensor_totals.items():
         if receipt[field] != expected:
             raise SourceAdmissionError(f"receipt.{field} does not equal source partition totals")
-    if receipt["language_tensors"] + receipt["mtp_tensors"] != receipt["additive_tensors"] + receipt["preserved_tensors"]:
+    if receipt["language_tensors"] + receipt["mtp_tensors"] != (
+        receipt["additive_tensors"] + receipt["preserved_tensors"]
+    ):
         raise SourceAdmissionError("language/MTP tensor coverage is incomplete")
-    if receipt["language_coefficients"] + receipt["mtp_coefficients"] != receipt["additive_coefficients"] + receipt["preserved_coefficients"]:
+    if receipt["language_coefficients"] + receipt["mtp_coefficients"] != (
+        receipt["additive_coefficients"] + receipt["preserved_coefficients"]
+    ):
         raise SourceAdmissionError("language/MTP coefficient coverage is incomplete")
-    if receipt["total_tensors"] != receipt["additive_tensors"] + receipt["preserved_tensors"] + receipt["excluded_vision_tensors"]:
+    if receipt["total_tensors"] != (
+        receipt["additive_tensors"]
+        + receipt["preserved_tensors"]
+        + receipt["excluded_vision_tensors"]
+    ):
         raise SourceAdmissionError("tensor inventory decomposition differs")
-    if receipt["total_coefficients"] != receipt["additive_coefficients"] + receipt["preserved_coefficients"] + receipt["excluded_vision_coefficients"]:
+    if receipt["total_coefficients"] != (
+        receipt["additive_coefficients"]
+        + receipt["preserved_coefficients"]
+        + receipt["excluded_vision_coefficients"]
+    ):
         raise SourceAdmissionError("coefficient inventory decomposition differs")
     identity = dict(value)
     identity["receipt_id"] = "sha256:" + hashlib.sha256(canonical(value)).hexdigest()
