@@ -89,7 +89,7 @@ impl ModelWeights {
         // bounds-checked), so element_count suffices — no decode needed
         // (review: the old full F16->f32 decode here was information-free,
         // ~657MB read + ~1.3GB transient per load).
-        let n_embd = config.n_embd as usize;
+        let n_embd = checked_usize(u64::from(config.n_embd), "model hidden size")?;
         let embd_info = require(file, "token_embd.weight")?;
         let vocab = checked_usize(
             *embd_info
