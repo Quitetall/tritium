@@ -65,6 +65,16 @@ def test_runner_identity_does_not_treat_non_file_model_args_as_code() -> None:
     assert len(identity["files"]) == 1
 
 
+def test_runner_identity_does_not_hash_existing_model_payload(tmp_path: Path) -> None:
+    model = tmp_path / "model.gguf"
+    model.write_bytes(b"model payload")
+    identity = runner._runner_identity(
+        [sys.executable, "measure", "--model", str(model)]
+    )
+    assert identity["schema"] == runner.RUNNER_IDENTITY_SCHEMA
+    assert len(identity["files"]) == 1
+
+
 def test_capability_preflight_requires_complete_measurement_surface() -> None:
     source_revision = "a" * 40
     valid = {

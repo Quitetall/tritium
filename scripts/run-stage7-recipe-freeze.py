@@ -200,8 +200,6 @@ def _runner_identity(command: list[str]) -> dict[str, Any]:
             candidate = Path(executable)
         elif Path(raw).suffix in script_suffixes:
             candidate = Path(raw)
-        elif "/" in raw and Path(raw).is_file():
-            candidate = Path(raw)
         if candidate is None:
             continue
         try:
