@@ -183,7 +183,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb
-      - run: cargo install cargo-fuzz
+      - run: cargo install cargo-fuzz --locked
       # ~85 min split across EVERY tritium-format untrusted-byte parser (U5:
       # every parser introduced has a target). Looped so adding a parser is a
       # one-line change here + a new fuzz_targets/*.rs + a [[bin]] block.
