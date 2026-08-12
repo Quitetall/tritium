@@ -36,6 +36,13 @@ def materialize(root: Path, path: str, seed: int = 1) -> dict:
     return {"path": path, "bytes": 1, "sha256": sha256(target)}
 
 
+def materialize_json(root: Path, path: str, value: dict) -> dict:
+    target = root / path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(canonical(value) + b"\n")
+    return {"path": path, "bytes": target.stat().st_size, "sha256": sha256(target)}
+
+
 def fixture(root: Path):
     root.mkdir(parents=True, exist_ok=True)
     candidate = root / "manifest.json"
@@ -80,18 +87,20 @@ def fixture(root: Path):
         "provenance": provenance,
         "thresholds": {"r3_gap_closure_min": 0.25, "metadata_bpw_max": 0.01, "scale_only_token_cap": 8_000_000, "short_pv_token_cap": 32_000_000},
         "recipe_count": 1404, "recipe_grid_id": digest(5_000),
-        "token_evidence_pack": materialize(root, "token-evidence/manifest.json", 5_001),
+        "token_evidence_pack": materialize_json(root, "token-evidence/manifest.json", {
+            "schema": "tritium.stage7-token-evidence-pack.v1", "partitions": {}, "tokens": 1,
+        }),
         "evidence": [
-            {**materialize(root, "smoke/smoke-receipt.json", 5_010), "kind": "smoke"},
-            {**materialize(root, "native/native-receipt.json", 5_011), "kind": "native-kernels"},
-            {**materialize(root, "hestia-gate-c.json", 5_012), "kind": "hestia-gate-c"},
+            {**materialize_json(root, "smoke/smoke-receipt.json", {"schema": "tritium.stage7-smoke.v1", "result": "pass", "release": "1.1.0-rc.1", "source_revision": "a" * 40}), "kind": "smoke"},
+            {**materialize_json(root, "native/native-receipt.json", {"schema": "tritium.stage7-native-kernels.v1", "result": "pass", "release": "1.1.0-rc.1", "source_revision": "a" * 40}), "kind": "native-kernels"},
+            {**materialize_json(root, "hestia-gate-c.json", {"schema": "tritium.stage7-hestia-gate-c.v1", "result": "pass", "release": "1.1.0-rc.1", "source_revision": "a" * 40}), "kind": "hestia-gate-c"},
         ],
     }
     campaign.write_bytes(canonical(campaign_value) + b"\n")
     trace = root / "trace.json"
     ids = [digest(index + 10_000) for index in range(1404)]
     artifact = materialize(root, "artifacts/shared.tsalt2", 6_000)
-    physical = materialize(root, "artifacts/shared-physical.json", 6_001)
+    physical = materialize_json(root, "artifacts/shared-physical.json", {"schema": "tritium.stage7-physical-report.v1", "result": "pass", "release": "1.1.0-rc.1", "source_revision": "a" * 40})
     def measurement(candidate_id: str, full: bool) -> dict:
         return {
             "candidate_id": candidate_id, "track": "ptq", "physical_bytes": 1,

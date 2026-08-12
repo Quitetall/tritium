@@ -105,6 +105,28 @@ def _file_shape(value: Any, label: str) -> None:
     _raw_digest(record["sha256"], f"{label}.sha256")
 
 
+def _load_canonical_json(path: Path, label: str) -> dict[str, Any]:
+    try:
+        raw = path.read_bytes()
+        value = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise Stage7QualificationError(f"{label} must contain UTF-8 JSON") from error
+    if raw != canonical(value) + b"\n" or not isinstance(value, dict):
+        raise Stage7QualificationError(f"{label} must be canonical JSON object")
+    return value
+
+
+def _envelope(path: Path, label: str, schema: str, receipt: dict[str, Any]) -> None:
+    value = _load_canonical_json(path, label)
+    if (
+        value.get("schema") != schema
+        or value.get("result") != "pass"
+        or value.get("release") != receipt["release"]
+        or value.get("source_revision") != receipt["source_revision"]
+    ):
+        raise Stage7QualificationError(f"{label} envelope differs")
+
+
 def _validate_campaign_payload(
     campaign: Any, receipt: dict[str, Any], evidence_root: Path
 ) -> None:
@@ -186,7 +208,16 @@ def _validate_campaign_payload(
         raise Stage7QualificationError("campaign recipe count differs")
     _digest(campaign["recipe_grid_id"], "campaign recipe grid id")
     _file_shape(campaign["token_evidence_pack"], "campaign token evidence pack")
-    _record(evidence_root, campaign["token_evidence_pack"], "campaign token evidence pack")
+    token_pack_path = _record(
+        evidence_root, campaign["token_evidence_pack"], "campaign token evidence pack"
+    )
+    token_pack = _load_canonical_json(token_pack_path, "campaign token evidence pack")
+    if (
+        token_pack.get("schema") != "tritium.stage7-token-evidence-pack.v1"
+        or not isinstance(token_pack.get("partitions"), dict)
+        or not isinstance(token_pack.get("tokens"), int)
+    ):
+        raise Stage7QualificationError("campaign token evidence pack envelope differs")
     evidence = campaign["evidence"]
     if not isinstance(evidence, list) or len(evidence) != 3:
         raise Stage7QualificationError("campaign prerequisite evidence inventory differs")
@@ -195,10 +226,20 @@ def _validate_campaign_payload(
         if record["kind"] != kind:
             raise Stage7QualificationError("campaign prerequisite evidence order differs")
         _file_shape({field: record[field] for field in FILE_FIELDS}, f"campaign.evidence[{index}]")
-        _record(
+        evidence_path = _record(
             evidence_root,
             {field: record[field] for field in FILE_FIELDS},
             f"campaign.evidence[{index}]",
+        )
+        _envelope(
+            evidence_path,
+            f"campaign.evidence[{index}]",
+            {
+                "smoke": "tritium.stage7-smoke.v1",
+                "native-kernels": "tritium.stage7-native-kernels.v1",
+                "hestia-gate-c": "tritium.stage7-hestia-gate-c.v1",
+            }[kind],
+            receipt,
         )
 
 
@@ -246,7 +287,13 @@ def _validate_trace_payload(
                 if not isinstance(row["heldout_ppl"], (int, float)) or isinstance(row["heldout_ppl"], bool) or not isinstance(row["task_metrics"], dict) or not row["artifact"] or not row["physical_report"]:
                     raise Stage7QualificationError("full-model measurement lacks quality or physical evidence")
                 _record(evidence_root, row["artifact"], f"{name}.artifact")
-                _record(evidence_root, row["physical_report"], f"{name}.physical_report")
+                physical_path = _record(
+                    evidence_root, row["physical_report"], f"{name}.physical_report"
+                )
+                _envelope(
+                    physical_path, f"{name}.physical_report",
+                    "tritium.stage7-physical-report.v1", receipt,
+                )
             seen.add(candidate_id)
         if set(seen) != set(inputs):
             raise Stage7QualificationError(f"{name} measurement coverage is incomplete")
@@ -269,7 +316,13 @@ def _validate_trace_payload(
         if not isinstance(row, dict) or row.get("rate") not in ("R2", "R3", "R4") or not row.get("artifact") or not row.get("physical_report"):
             raise Stage7QualificationError(f"SALT baseline[{index}] is incomplete")
         _record(evidence_root, row["artifact"], f"SALT baseline[{index}].artifact")
-        _record(evidence_root, row["physical_report"], f"SALT baseline[{index}].physical_report")
+        physical_path = _record(
+            evidence_root, row["physical_report"], f"SALT baseline[{index}].physical_report"
+        )
+        _envelope(
+            physical_path, f"SALT baseline[{index}].physical_report",
+            "tritium.stage7-physical-report.v1", receipt,
+        )
     refinements = trace["refinements"]
     if not isinstance(refinements, list) or len(refinements) != 5:
         raise Stage7QualificationError("refinement inventory differs")
@@ -410,11 +463,8 @@ def validate(receipt_path: Path, revision: str, release: str, candidate: Path) -
         raise Stage7QualificationError("campaign and trace evidence are required")
     campaign_path = _record(receipt_path.parent, receipt["campaign"], "campaign")
     trace_path = _record(receipt_path.parent, receipt["trace"], "trace")
-    try:
-        campaign = json.loads(campaign_path.read_bytes())
-        trace = json.loads(trace_path.read_bytes())
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise Stage7QualificationError("campaign and trace must contain UTF-8 JSON") from error
+    campaign = _load_canonical_json(campaign_path, "campaign")
+    trace = _load_canonical_json(trace_path, "trace")
     _validate_campaign_payload(campaign, receipt, receipt_path.parent)
     trace_state = _validate_trace_payload(
         trace, receipt, campaign_path, receipt_path.parent
