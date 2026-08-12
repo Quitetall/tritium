@@ -288,6 +288,27 @@ def test_stage7_smoke_model_executes_real_pipeline_and_resumes(tmp_path, hidden_
     assert resumed == first
 
 
+def test_stage7_smoke_model_rejects_invalid_ptq_profile_options(tmp_path):
+    torch.manual_seed(8)
+    manifest_path, manifest = write_pack(tmp_path / "pack")
+    data = Stage7CausalData.open(
+        manifest_path,
+        expected_pack_id=manifest["pack_id"],
+        expected_tokenizer_digest=manifest["tokenizer_digest"],
+        expected_tokenizer_vocab_size=4_096,
+        partition="calibration",
+        start_sequence=0,
+        sequence_count=2,
+        batch_sequences=1,
+    )
+    model = TinyCausalLM(64).eval()
+
+    with pytest.raises(ValueError, match="profile must be"):
+        run_stage7_smoke_model(model, data, tmp_path / "invalid-profile", profile="bad")
+    with pytest.raises(ValueError, match="target_bpw must be"):
+        run_stage7_smoke_model(model, data, tmp_path / "invalid-bpw", target_bpw=-1)
+
+
 def test_stage7_smollm2_smoke_rejects_noncanonical_model_before_output(tmp_path):
     campaign = {
         "schema": "tritium.stage7-campaign.v1",

@@ -553,6 +553,8 @@ def run_stage7_smoke_model(
     output_dir: Pathish,
     *,
     packing: str = "b3",
+    profile: str = "compact-v1",
+    target_bpw: float | None = None,
     max_evidence_bytes: int = 64 * 1024 * 1024,
     max_working_bytes: int = 512 * 1024 * 1024,
     max_payload_bytes: int = 8 * 1024 * 1024 * 1024,
@@ -571,6 +573,15 @@ def run_stage7_smoke_model(
         raise ValueError("Stage-7 smoke data lacks terminal validation")
     if packing not in {"d2", "b3", "s34"}:
         raise ValueError("packing must be 'd2', 'b3', or 's34'")
+    if profile not in {"compact-v1", "near-lossless-v1"}:
+        raise ValueError("profile must be 'compact-v1' or 'near-lossless-v1'")
+    if target_bpw is not None and (
+        isinstance(target_bpw, bool)
+        or not isinstance(target_bpw, (int, float))
+        or not math.isfinite(float(target_bpw))
+        or target_bpw <= 0
+    ):
+        raise ValueError("target_bpw must be finite and positive when provided")
     for label, value in (
         ("max_evidence_bytes", max_evidence_bytes),
         ("max_working_bytes", max_working_bytes),
@@ -590,7 +601,9 @@ def run_stage7_smoke_model(
         raise ValueError(f"Stage-7 smoke output contains unknown entries: {sorted(unknown)}")
 
     config = TernaryConfig.ptq(
-        profile="compact-v1", target_modules=("Linear", "Embedding")
+        profile=profile,
+        target_modules=("Linear", "Embedding"),
+        target_bpw=None if target_bpw is None else float(target_bpw),
     )
     source_digest = _source_model_digest(model)
     token_stream_digest = _stream_digest(data)
