@@ -209,6 +209,21 @@ six solver variants, full artifacts, and physical reports. The auxiliary runner
 advertises only baseline/refinement features. Missing or stale capability
 declarations fail before any measurement cache is written.
 
+Campaign templates are pre-evidence plans. When source code changes before a
+run, rebind the template to clean `HEAD` with no-replace output:
+
+```sh
+python scripts/rebind-stage7-campaign.py \
+  --template /evidence/stage7/campaign-template.json \
+  --source-root . \
+  --run-id stage7-smollm2-17b-real-$(git rev-parse --short HEAD) \
+  --output /evidence/stage7/campaign.json
+```
+
+The rebinder changes only top-level `source_revision` and `run_id`; nested
+stale revisions, dirty trees, malformed templates, and existing outputs fail
+closed. It creates no measurements and does not qualify a recipe freeze.
+
 ## SALT V2 Qwen master campaigns
 
 The legacy `tritium quantize` command above is not the Qwen3.6-27B SALT V2
