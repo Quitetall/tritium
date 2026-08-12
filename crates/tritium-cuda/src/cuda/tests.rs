@@ -51,6 +51,14 @@ fn physical_device_id_matches_nvidia_uuid_spelling() {
     );
 }
 
+#[test]
+fn mpgemm_launch_bounds_reject_index_overflow() {
+    assert!(CudaBackend::check_grad_launch_bounds(i32::MAX as usize + 1, 1, 1).is_err());
+    assert!(CudaBackend::check_grad_launch_bounds(1, i32::MAX as usize + 1, 1).is_err());
+    assert!(CudaBackend::check_grad_launch_bounds(1, 1, i32::MAX as usize + 1).is_err());
+    assert!(CudaBackend::check_grad_launch_bounds(1024, 1024, 1024).is_ok());
+}
+
 /// Deterministic xorshift f32 fill in `[lo, hi)` — no `rand` dep.
 fn seeded_f32(seed: u64, len: usize, lo: f32, hi: f32) -> Vec<f32> {
     let mut s = seed | 1;

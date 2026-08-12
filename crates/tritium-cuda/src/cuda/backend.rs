@@ -1252,7 +1252,11 @@ impl CudaBackend {
     /// device's `int` index arithmetic (the kernels form `m*n`, `n*k`, `m*k` as int32),
     /// which also bounds the `u32` launch grid. A silent `as` truncation would otherwise
     /// give a wrong answer; BitNet shapes are orders of magnitude below this limit.
-    fn check_grad_launch_bounds(m: usize, n: usize, k: usize) -> Result<(), BackendError> {
+    pub(super) fn check_grad_launch_bounds(
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<(), BackendError> {
         let lim = i32::MAX as usize;
         if m.checked_mul(n).is_none_or(|v| v > lim)
             || n.checked_mul(k).is_none_or(|v| v > lim)
@@ -7334,6 +7338,10 @@ impl CudaBackend {
         };
 
         let GemmShape { m, n, k } = shape;
+        // The add kernels use i32 dimensions and a u32 flat-output launch grid.
+        // Validate before any shape products or narrowing casts; otherwise an
+        // absurd inference request can wrap into a wrong launch/OOB device access.
+        Self::check_grad_launch_bounds(m, n, k)?;
         if buf.n != n || buf.k != k {
             return Err(BackendError::ShapeMismatch {
                 expected: buf.n * buf.k,
@@ -7487,6 +7495,9 @@ impl CudaBackend {
         };
 
         let GemmShape { m, n, k } = shape;
+        // Keep sparse inference under the same checked index contract as the
+        // dense path. This runs before expected-length products and casts.
+        Self::check_grad_launch_bounds(m, n, k)?;
         if buf.n != n || buf.k != k {
             return Err(BackendError::ShapeMismatch {
                 expected: buf.n * buf.k,
