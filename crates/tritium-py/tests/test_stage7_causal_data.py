@@ -309,6 +309,47 @@ def test_stage7_smoke_model_rejects_invalid_ptq_profile_options(tmp_path):
         run_stage7_smoke_model(model, data, tmp_path / "invalid-bpw", target_bpw=-1)
 
 
+def test_stage7_smoke_model_binds_near_lossless_adaptive_recipe(tmp_path):
+    torch.manual_seed(9)
+    manifest_path, manifest = write_pack(tmp_path / "pack")
+    data = Stage7CausalData.open(
+        manifest_path,
+        expected_pack_id=manifest["pack_id"],
+        expected_tokenizer_digest=manifest["tokenizer_digest"],
+        expected_tokenizer_vocab_size=4_096,
+        partition="calibration",
+        start_sequence=0,
+        sequence_count=2,
+        batch_sequences=1,
+    )
+    model = TinyCausalLM(64).eval()
+    output = tmp_path / "near-lossless"
+
+    result = run_stage7_smoke_model(
+        model,
+        data,
+        output,
+        packing="b3",
+        profile="near-lossless-v1",
+        target_bpw=3.5,
+        max_working_bytes=16 * 1024 * 1024,
+    )
+    request = json.loads((output / "request.json").read_text())
+    assert request["config"]["profile"] == "near-lossless-v1"
+    assert request["config"]["target_bpw"] == 3.5
+    assert result.result == "pass"
+
+    with pytest.raises(ValueError, match="request differs"):
+        run_stage7_smoke_model(
+            model,
+            data,
+            output,
+            packing="b3",
+            profile="compact-v1",
+            max_working_bytes=16 * 1024 * 1024,
+        )
+
+
 def test_stage7_smollm2_smoke_rejects_noncanonical_model_before_output(tmp_path):
     campaign = {
         "schema": "tritium.stage7-campaign.v1",
