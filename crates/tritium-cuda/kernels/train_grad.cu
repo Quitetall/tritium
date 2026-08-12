@@ -1177,7 +1177,7 @@ extern "C" __global__ void salt_pack_training(
 extern "C" __global__ void salt_training_forward(
     const float* __restrict__ a,             // [M, K]
     const unsigned char* __restrict__ codes, // [planes, N, row_bytes]
-    const float* __restrict__ scales,        // [planes, N]
+    const float* __restrict__ scales,        // [planes, N, groups_per_row]
     float* __restrict__ y,                   // [M, N]
     int m, int n, int k, int planes, int row_bytes,
     int group_size, int groups_per_row)
@@ -1190,28 +1190,32 @@ extern "C" __global__ void salt_training_forward(
     float out = 0.0f;
 
     for (int plane = 0; plane < planes; ++plane) {
-        float acc = 0.0f;
-        for (int ki = 0; ki < k; ++ki) {
-            unsigned int code = train_salt_code(
-                codes, plane, ni, ki, n, row_bytes);
-            if (code == 2u) {
-                acc += arow[ki];
-            } else if (code == 0u) {
-                acc -= arow[ki];
+        for (int group = 0; group < groups_per_row; ++group) {
+            int start = group * group_size;
+            int end = start + group_size;
+            if (end > k) end = k;
+            float acc = 0.0f;
+            for (int ki = start; ki < end; ++ki) {
+                unsigned int code = train_salt_code(
+                    codes, plane, ni, ki, n, row_bytes);
+                if (code == 2u) {
+                    acc += arow[ki];
+                } else if (code == 0u) {
+                    acc -= arow[ki];
+                }
             }
+            out += acc * scales[((long)plane * n + ni) * groups_per_row + group];
         }
-        out += acc * scales[(long)plane * n + ni];
     }
     y[idx] = out;
 }
 
-// gA[M,K] = sum_n,p gy[M,N] * scale[p,n] * trit[p,n,K]. A row scale
-// is multiplied into gy once per plane/output-row, then the packed trit selects
-// add/sub/skip; no dense quantized weight is materialized.
+// gA[M,K] = sum_n,p gy[M,N] * scale[p,n,group(K)] * trit[p,n,K]. The
+// packed trit selects add/sub/skip; no dense quantized weight is materialized.
 extern "C" __global__ void salt_training_grad_a(
     const float* __restrict__ gy,            // [M, N]
     const unsigned char* __restrict__ codes, // [planes, N, row_bytes]
-    const float* __restrict__ scales,        // [planes, N]
+    const float* __restrict__ scales,        // [planes, N, groups_per_row]
     float* __restrict__ ga,                  // [M, K]
     int m, int n, int k, int planes, int row_bytes,
     int group_size, int groups_per_row)
@@ -1225,7 +1229,9 @@ extern "C" __global__ void salt_training_grad_a(
     for (int ni = 0; ni < n; ++ni) {
         float g = gy[(long)mi * n + ni];
         for (int plane = 0; plane < planes; ++plane) {
-            float scaled = g * scales[(long)plane * n + ni];
+            int group = ki / group_size;
+            float scaled = g
+                * scales[((long)plane * n + ni) * groups_per_row + group];
             unsigned int code = train_salt_code(
                 codes, plane, ni, ki, n, row_bytes);
             if (code == 2u) {
@@ -1476,6 +1482,8 @@ extern "C" __global__ void salt_training_forward_tiled(
     int lane = (int)threadIdx.y * TRAIN_SALT_TILE_X + (int)threadIdx.x;
     int threads = TRAIN_SALT_TILE_X * TRAIN_SALT_TILE_M;
     float plane_acc[3] = {0.0f, 0.0f, 0.0f};
+    float out = 0.0f;
+    int active_group = -1;
 
     for (int k_base = 0; k_base < k; k_base += TRAIN_SALT_FORWARD_K_TILE) {
         for (int load = lane;
@@ -1512,6 +1520,18 @@ extern "C" __global__ void salt_training_forward_tiled(
                 tile_k_count = TRAIN_SALT_FORWARD_K_TILE;
             }
             for (int tile_k = 0; tile_k < tile_k_count; ++tile_k) {
+                int global_k = k_base + tile_k;
+                int group = global_k / group_size;
+                if (group != active_group) {
+                    if (active_group >= 0) {
+                        for (int plane = 0; plane < planes; ++plane) {
+                            out += plane_acc[plane]
+                                * scales[((long)plane * n + ni) * groups_per_row + active_group];
+                            plane_acc[plane] = 0.0f;
+                        }
+                    }
+                    active_group = group;
+                }
                 float value = activation_tile[threadIdx.y][tile_k];
                 int c = tile_k >> 7;
                 int mm = tile_k & 31;
@@ -1533,9 +1553,11 @@ extern "C" __global__ void salt_training_forward_tiled(
     }
 
     if (mi < m && ni < n) {
-        float out = 0.0f;
-        for (int plane = 0; plane < planes; ++plane) {
-            out += plane_acc[plane] * scales[(long)plane * n + ni];
+        if (active_group >= 0) {
+            for (int plane = 0; plane < planes; ++plane) {
+                out += plane_acc[plane]
+                    * scales[((long)plane * n + ni) * groups_per_row + active_group];
+            }
         }
         y[(long)mi * n + ni] = out;
     }
@@ -1544,7 +1566,7 @@ extern "C" __global__ void salt_training_forward_tiled(
 extern "C" __global__ void salt_training_grad_a_tiled(
     const float* __restrict__ gy,            // [M, N]
     const unsigned char* __restrict__ codes, // [planes, N, row_bytes]
-    const float* __restrict__ scales,        // [planes, N]
+    const float* __restrict__ scales,        // [planes, N, groups_per_row]
     float* __restrict__ ga,                  // [M, K]
     int m, int n, int k, int planes, int row_bytes,
     int group_size, int groups_per_row)
@@ -1572,7 +1594,6 @@ extern "C" __global__ void salt_training_grad_a_tiled(
             scaled_gy_tile[plane][tile_m][tile_n] =
                 global_m < m && global_n < n
                     ? gy[(long)global_m * n + global_n]
-                        * scales[(long)plane * n + global_n]
                     : 0.0f;
         }
         __syncthreads();
@@ -1585,7 +1606,9 @@ extern "C" __global__ void salt_training_grad_a_tiled(
             for (int tile_n = 0; tile_n < tile_n_count; ++tile_n) {
                 int ni = n_base + tile_n;
                 for (int plane = 0; plane < planes; ++plane) {
-                    float scaled = scaled_gy_tile[plane][threadIdx.y][tile_n];
+                    float scaled = scaled_gy_tile[plane][threadIdx.y][tile_n]
+                        * scales[((long)plane * n + ni) * groups_per_row
+                            + ki / group_size];
                     unsigned int code = train_salt_code(
                         codes, plane, ni, ki, n, row_bytes);
                     if (code == 2u) {

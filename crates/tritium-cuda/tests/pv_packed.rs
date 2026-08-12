@@ -3,7 +3,10 @@
 use half::f16;
 use tritium_cuda::{
     CudaBackend,
-    train::{DevicePackedSaltWeight, DeviceTape, DeviceTensor, GradientLeafBinding},
+    train::{
+        CheckpointPolicy, DevicePackedSaltWeight, DeviceTape, DeviceTensor, GradientLeafBinding,
+        PackedSaltComputePolicy,
+    },
 };
 use tritium_format::{PackedTrainingSaltSnapshot, TernaryStructure, TrainingSaltPlane};
 use tritium_train::ops::{dense, embed, loss};
@@ -236,6 +239,25 @@ fn g128_packed_weight_matches_cpu_decode_across_tiled_forward_vjp_and_embedding(
     let master = tape.gradient_leaf(rows * cols).unwrap();
     let logits = tape.salt_matmul(input_id, master, &packed, batch).unwrap();
     assert_close(&tape.value(logits).unwrap(), &expected_forward, 2e-5);
+
+    // Fast path must retain per-group scales when K spans multiple groups.
+    let mut fast_tape = DeviceTape::new_with_policies(
+        &backend,
+        rows,
+        CheckpointPolicy::KeepAll,
+        PackedSaltComputePolicy::Fast,
+    )
+    .unwrap();
+    let fast_input = fast_tape.leaf(&input).unwrap();
+    let fast_master = fast_tape.gradient_leaf(rows * cols).unwrap();
+    let fast_logits = fast_tape
+        .salt_matmul(fast_input, fast_master, &packed, batch)
+        .unwrap();
+    assert_close(
+        &fast_tape.value(fast_logits).unwrap(),
+        &expected_forward,
+        2e-5,
+    );
     let target_device = DeviceTensor::upload(&backend, &target).unwrap();
     let device_loss = tape
         .softmax_xent_value(logits, &target_device, batch, rows)
@@ -249,6 +271,15 @@ fn g128_packed_weight_matches_cpu_decode_across_tiled_forward_vjp_and_embedding(
     let seed = loss::softmax_xent_vjp(&expected_forward, &target, batch, rows, &[1.0]).remove(0);
     let expected_input_gradient = dense::vjp(&input, &decoded, batch, rows, cols, &seed).remove(0);
     assert_close(&got_input_gradient, &expected_input_gradient, 2e-5);
+    let fast_target_device = DeviceTensor::upload(&backend, &target).unwrap();
+    fast_tape
+        .softmax_xent_value(fast_logits, &fast_target_device, batch, rows)
+        .unwrap();
+    let fast_input_gradient = fast_tape
+        .xent_backward(fast_logits, &target, batch, rows, &[fast_input])
+        .unwrap()
+        .remove(0);
+    assert_close(&fast_input_gradient, &expected_input_gradient, 2e-5);
 
     let tokens_i32 = [36, 0, 17, 36];
     let tokens_u32 = [36, 0, 17, 36];
@@ -260,4 +291,61 @@ fn g128_packed_weight_matches_cpu_decode_across_tiled_forward_vjp_and_embedding(
         &embed::gather_forward(&decoded, &tokens_u32, cols),
         0.0,
     );
+}
+
+#[test]
+fn g256_fast_forward_preserves_multiple_scale_groups() {
+    let backend = backend();
+    let (rows, cols, group_size, planes, batch) = (19usize, 513usize, 256usize, 3usize, 4usize);
+    let groups_per_row = cols.div_ceil(group_size);
+    let semantic = (0..planes)
+        .map(|plane| {
+            let trits = (0..rows * cols)
+                .map(|index| match (index + plane + index / cols) % 3 {
+                    0 => -1,
+                    1 => 0,
+                    _ => 1,
+                })
+                .collect();
+            let scales = (0..rows * groups_per_row)
+                .map(|index| f16::from_f32((1 + (index + plane) % 7) as f32 / 32.0))
+                .collect();
+            (trits, scales)
+        })
+        .collect::<Vec<_>>();
+    let decoded = decode(rows, cols, group_size, &semantic);
+    let snapshot = snapshot(rows, cols, group_size, TernaryStructure::Dense, &semantic);
+    let packed = DevicePackedSaltWeight::from_snapshot(&backend, &snapshot).unwrap();
+    let input = (0..batch * cols)
+        .map(|index| ((index * 13 % 31) as f32 - 15.0) / 32.0)
+        .collect::<Vec<_>>();
+    let expected = dense::forward(&input, &decoded, batch, rows, cols);
+    let mut tape = DeviceTape::new_with_policies(
+        &backend,
+        rows,
+        CheckpointPolicy::KeepAll,
+        PackedSaltComputePolicy::Fast,
+    )
+    .unwrap();
+    let input_id = tape.leaf(&input).unwrap();
+    let master = tape.gradient_leaf(rows * cols).unwrap();
+    let output = tape.salt_matmul(input_id, master, &packed, batch).unwrap();
+    assert_close(&tape.value(output).unwrap(), &expected, 2e-5);
+
+    // Batch >= 4 selects tiled fast grad-A. Keep this check coupled to the
+    // grouped-scale forward assertion so both fast kernels see same geometry.
+    let mut target = vec![0.0; batch * rows];
+    for row in 0..batch {
+        target[row * rows + (row * 7 + 3) % rows] = 1.0;
+    }
+    let target_device = DeviceTensor::upload(&backend, &target).unwrap();
+    tape.softmax_xent_value(output, &target_device, batch, rows)
+        .unwrap();
+    let got_gradient = tape
+        .xent_backward(output, &target, batch, rows, &[input_id])
+        .unwrap()
+        .remove(0);
+    let seed = loss::softmax_xent_vjp(&expected, &target, batch, rows, &[1.0]).remove(0);
+    let expected_gradient = dense::vjp(&input, &decoded, batch, rows, cols, &seed).remove(0);
+    assert_close(&got_gradient, &expected_gradient, 2e-5);
 }

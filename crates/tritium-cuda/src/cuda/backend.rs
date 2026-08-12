@@ -2233,15 +2233,6 @@ impl CudaBackend {
         if out_len == 0 {
             return Ok(());
         }
-        if matches!(
-            dispatch,
-            TrainingSaltDispatch::Fast | TrainingSaltDispatch::ScalarFast
-        ) && weight.groups_per_row != 1
-        {
-            return Err(BackendError::InvalidInput(
-                "fast packed SALT kernels require one scale group per row".into(),
-            ));
-        }
         let dims = weight.kernel_dims(m)?;
         let use_exact = matches!(
             dispatch,
@@ -2406,15 +2397,6 @@ impl CudaBackend {
         }
         if ga_len == 0 {
             return Ok(());
-        }
-        if matches!(
-            dispatch,
-            TrainingSaltDispatch::Fast | TrainingSaltDispatch::ScalarFast
-        ) && weight.groups_per_row != 1
-        {
-            return Err(BackendError::InvalidInput(
-                "fast packed SALT kernels require one scale group per row".into(),
-            ));
         }
         let dims = weight.kernel_dims(m)?;
         let use_exact = matches!(
