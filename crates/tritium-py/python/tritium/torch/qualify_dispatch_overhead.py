@@ -495,10 +495,11 @@ def _run_case(policy: dict[str, Any], seed: int) -> dict[str, Any]:
 
     def wrapper_forward():
         # Measure dispatcher work, not autograd graph construction.  The
-        # forward policy is an inference-path comparison; autograd semantics
-        # are covered by the functional and torch-dispatch test suites.
-        with torch.no_grad():
-            return ternary_linear(input_, master, bias)
+        # forward policy is an inference-path comparison; the surrounding
+        # no-grad scope keeps context-manager entry/exit out of every sample.
+        # Autograd semantics are covered by the functional and torch-dispatch
+        # test suites.
+        return ternary_linear(input_, master, bias)
 
     def direct_backward():
         capsules = _native._ternary_linear_backward_cpu_dlpack(
@@ -520,32 +521,33 @@ def _run_case(policy: dict[str, Any], seed: int) -> dict[str, Any]:
         # torch.autograd.grad here would benchmark graph traversal and Python
         # tuple construction in addition to the dispatcher itself, while the
         # direct arm is the native VJP adapter.
-        with torch.no_grad():
-            return torch.ops.tritium._ternary_linear_backward.default(
-                grad_output, input_, master, True
-            )
+        return torch.ops.tritium._ternary_linear_backward.default(
+            grad_output, input_, master, True
+        )
 
     direct = direct_forward if policy["phase"] == "forward" else direct_backward
     wrapper = wrapper_forward if policy["phase"] == "forward" else wrapper_backward
-    parity_exact = _exact_equal(direct(), wrapper())
+    with torch.no_grad():
+        parity_exact = _exact_equal(direct(), wrapper())
     if not parity_exact:
         raise RuntimeError(f"{policy['case_id']} direct/wrapper parity failed")
     repetitions = policy["repetitions"]
     was_enabled = gc.isenabled()
     gc.disable()
     try:
-        warmups = _paired_samples(
-            direct,
-            wrapper,
-            count=WARMUP_COUNT,
-            repetitions=repetitions,
-        )
-        samples = _paired_samples(
-            direct,
-            wrapper,
-            count=SAMPLE_COUNT,
-            repetitions=repetitions,
-        )
+        with torch.no_grad():
+            warmups = _paired_samples(
+                direct,
+                wrapper,
+                count=WARMUP_COUNT,
+                repetitions=repetitions,
+            )
+            samples = _paired_samples(
+                direct,
+                wrapper,
+                count=SAMPLE_COUNT,
+                repetitions=repetitions,
+            )
     finally:
         if was_enabled:
             gc.enable()
