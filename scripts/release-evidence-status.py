@@ -410,8 +410,14 @@ def evaluate(
             elif kind == "compatibility-matrix":
                 receipt = validate_matrix_receipt(receipt_path, revision, release)
             elif kind == "crate-archive":
+                crate_root = candidate.parent / "crates"
+                if not crate_root.is_dir():
+                    # Preserve legacy flat candidates while matching the
+                    # published candidate layout, which keeps crate archives
+                    # in a dedicated directory.
+                    crate_root = candidate.parent
                 receipt = validate_crate_receipt(
-                    receipt_path, candidate.parent,
+                    receipt_path, crate_root,
                     Path(__file__).resolve().parent.parent / "Cargo.lock",
                     revision, release,
                 )
