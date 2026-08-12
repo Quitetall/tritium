@@ -173,6 +173,31 @@ quality or Stage-7 qualification. SmolLM matrices requiring G64 use explicit
 SALT V2 package-version 2 scale geometry; G128-only packages remain canonical
 version 1.
 
+## Stage-7 full recipe freeze
+
+The full 1.7B successive-halving campaign is driven by the source-bound
+orchestrator:
+
+```sh
+python scripts/run-stage7-recipe-freeze.py \
+  --campaign /evidence/stage7/campaign.json \
+  --model-root /models/SmolLM2-1.7B \
+  --smoke-model-root /models/SmolLM2-135M \
+  --source-root . \
+  --runner python /path/to/measure-one-recipe.py \
+  --auxiliary-runner python /path/to/measure-baselines-and-refinements.py \
+  --output /evidence/stage7/trace.json
+```
+
+Both runners receive one canonical JSON request on stdin and must emit one
+strict JSON object on stdout. The measurement runner supplies every frozen
+recipe row; the auxiliary runner supplies BF16/SALT V1 baselines and the five
+refinement records. The orchestrator binds each request to clean `HEAD`, model,
+campaign, runner argv, and evidence paths, caches only validated immutable rows,
+resumes completed work, and invokes the existing qualifier before publishing
+the trace. It never synthesizes metrics. A structural smoke or a missing real
+runner cannot satisfy Stage-7.
+
 ## SALT V2 Qwen master campaigns
 
 The legacy `tritium quantize` command above is not the Qwen3.6-27B SALT V2
