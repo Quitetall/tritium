@@ -37,9 +37,32 @@ def test_runner_response_requires_one_strict_json_object() -> None:
     with pytest.raises(runner.Stage7RunError, match="strict UTF-8 JSON"):
         runner._runner_response(bad_json, {}, timeout_seconds=2)
 
+    duplicate = [sys.executable, "-c", "print('{\"ok\":true,\"ok\":false}')"]
+    with pytest.raises(runner.Stage7RunError, match="strict UTF-8 JSON"):
+        runner._runner_response(duplicate, {}, timeout_seconds=2)
+
     failed = [sys.executable, "-c", "import sys; sys.stderr.write('bad'); sys.exit(7)"]
     with pytest.raises(runner.Stage7RunError, match="exit 7"):
         runner._runner_response(failed, {}, timeout_seconds=2)
+
+
+def test_runner_identity_binds_executable_and_script_contents(tmp_path: Path) -> None:
+    script = tmp_path / "runner.py"
+    script.write_text("print('one')\n", encoding="utf-8")
+    first = runner._runner_identity([sys.executable, str(script)])
+    assert first["schema"] == runner.RUNNER_IDENTITY_SCHEMA
+    assert {entry["argv_index"] for entry in first["files"]} == {0, 1}
+    script.write_text("print('two')\n", encoding="utf-8")
+    second = runner._runner_identity([sys.executable, str(script)])
+    assert first["files"][1]["sha256"] != second["files"][1]["sha256"]
+
+
+def test_runner_identity_does_not_treat_non_file_model_args_as_code() -> None:
+    identity = runner._runner_identity(
+        [sys.executable, "measure", "--model-root", "/models/not-yet-mounted"]
+    )
+    assert identity["schema"] == runner.RUNNER_IDENTITY_SCHEMA
+    assert len(identity["files"]) == 1
 
 
 def test_capability_preflight_requires_complete_measurement_surface() -> None:

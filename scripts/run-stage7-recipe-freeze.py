@@ -20,6 +20,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 from typing import Any
@@ -28,10 +29,12 @@ from typing import Any
 MAX_JSON_BYTES = 64 * 1024 * 1024
 MAX_RUNNER_OUTPUT_BYTES = 16 * 1024 * 1024
 TRACE_SCHEMA = "tritium.stage7-execution.v1"
-REQUEST_SCHEMA = "tritium.stage7-measurement-request.v1"
-AUXILIARY_SCHEMA = "tritium.stage7-auxiliary-request.v1"
-CAPABILITY_REQUEST_SCHEMA = "tritium.stage7-capabilities-request.v1"
+REQUEST_SCHEMA = "tritium.stage7-measurement-request.v2"
+AUXILIARY_SCHEMA = "tritium.stage7-auxiliary-request.v2"
+CAPABILITY_REQUEST_SCHEMA = "tritium.stage7-capabilities-request.v2"
 CAPABILITY_SCHEMA = "tritium.stage7-capabilities.v1"
+RUNNER_IDENTITY_SCHEMA = "tritium.stage7-runner-identity.v1"
+MAX_RUNNER_IDENTITY_FILE_BYTES = 128 * 1024 * 1024
 CAPABILITY_FEATURE_FIELDS = {
     "full_artifacts", "physical_reports", "baselines", "refinements",
 }
@@ -71,6 +74,7 @@ def _capability_request(
     model_root: Path,
     source_root: Path,
     evidence_root: Path,
+    runner_identity: dict[str, Any],
 ) -> dict[str, Any]:
     if kind not in {"measurement", "auxiliary"}:
         raise Stage7RunError("capability request kind is invalid")
@@ -81,6 +85,7 @@ def _capability_request(
         "run_id": campaign["run_id"],
         "campaign_sha256": campaign_sha256,
         "runner": command,
+        "runner_identity": runner_identity,
         "model_root": str(model_root),
         "source_root": str(source_root),
         "evidence_root": str(evidence_root),
@@ -151,6 +156,79 @@ def canonical(value: Any) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
 
 
+def _reject_duplicate_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate JSON field {key!r}")
+        value[key] = item
+    return value
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _runner_identity(command: list[str]) -> dict[str, Any]:
+    """Return content identity for executable and source files in runner argv.
+
+    Request IDs must change when a runner implementation changes.  Hashing only
+    argv is insufficient because a stable script path can point at new code.
+    We hash the executable plus explicit script-like file arguments, while
+    avoiding model/config payloads that may also appear in argv.
+    """
+
+    if not command or any("\0" in part for part in command):
+        raise Stage7RunError("runner command must be a nonempty NUL-free argv")
+    executable = shutil.which(command[0])
+    if executable is None:
+        first = Path(command[0])
+        if first.exists():
+            executable = str(first)
+        else:
+            raise Stage7RunError("runner executable identity could not be resolved")
+    files: list[dict[str, Any]] = []
+    seen: set[Path] = set()
+    script_suffixes = {".js", ".mjs", ".py", ".rb", ".sh", ".tcl"}
+    for index, raw in enumerate(command):
+        candidate: Path | None = None
+        if index == 0:
+            candidate = Path(executable)
+        elif Path(raw).suffix in script_suffixes:
+            candidate = Path(raw)
+        elif "/" in raw and Path(raw).is_file():
+            candidate = Path(raw)
+        if candidate is None:
+            continue
+        try:
+            resolved = candidate.resolve(strict=True)
+            metadata = resolved.stat()
+        except (OSError, RuntimeError) as error:
+            raise Stage7RunError(
+                f"runner identity file cannot be resolved: {candidate}"
+            ) from error
+        if not resolved.is_file():
+            raise Stage7RunError(f"runner identity path is not a file: {candidate}")
+        if metadata.st_size > MAX_RUNNER_IDENTITY_FILE_BYTES:
+            raise Stage7RunError(
+                f"runner identity file exceeds {MAX_RUNNER_IDENTITY_FILE_BYTES} bytes: {resolved}"
+            )
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        files.append({
+            "argv_index": index,
+            "path": str(resolved),
+            "bytes": metadata.st_size,
+            "sha256": _sha256_file(resolved),
+        })
+    return {"schema": RUNNER_IDENTITY_SCHEMA, "files": files}
+
+
 def load_json(path: Path, label: str) -> dict[str, Any]:
     if path.is_symlink() or not path.is_file() or path.stat().st_size <= 0:
         raise Stage7RunError(f"{label} must be a bounded ordinary file")
@@ -159,6 +237,7 @@ def load_json(path: Path, label: str) -> dict[str, Any]:
     try:
         value = json.loads(
             path.read_bytes(),
+            object_pairs_hook=_reject_duplicate_pairs,
             parse_constant=lambda token: (_ for _ in ()).throw(
                 ValueError(f"invalid JSON constant {token}")
             ),
@@ -249,6 +328,7 @@ def _runner_response(
     try:
         value = json.loads(
             completed.stdout,
+            object_pairs_hook=_reject_duplicate_pairs,
             parse_constant=lambda token: (_ for _ in ()).throw(
                 ValueError(f"invalid JSON constant {token}")
             ),
@@ -359,6 +439,7 @@ def _run_stage(
     quantized_tensors: int,
     preserved: int,
     timeout_seconds: float,
+    runner_identity: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], list[str]]:
     rows = []
     for candidate_id in input_ids:
@@ -372,6 +453,7 @@ def _run_stage(
             "candidate_id": candidate_id,
             "recipe": recipe,
             "runner": command,
+            "runner_identity": runner_identity,
             "model_root": str(model_root),
             "source_root": str(source_root),
             "evidence_root": str(evidence_root),
@@ -473,6 +555,8 @@ def run(
             "Stage-7 prerequisites failed: " + ", ".join(prerequisite_reasons)
         )
     campaign_sha256 = digest(campaign_path)
+    runner_identity = _runner_identity(runner)
+    auxiliary_runner_identity = _runner_identity(auxiliary_runner)
     capability_context = {
         "campaign": campaign,
         "campaign_sha256": campaign_sha256,
@@ -481,7 +565,8 @@ def run(
         "evidence_root": evidence_root,
     }
     measurement_capability_request = _capability_request(
-        kind="measurement", command=runner, **capability_context
+        kind="measurement", command=runner,
+        runner_identity=runner_identity, **capability_context
     )
     _validate_capabilities(
         _runner_response(
@@ -494,7 +579,8 @@ def run(
         source_revision=campaign["source_revision"],
     )
     auxiliary_capability_request = _capability_request(
-        kind="auxiliary", command=auxiliary_runner, **capability_context
+        kind="auxiliary", command=auxiliary_runner,
+        runner_identity=auxiliary_runner_identity, **capability_context
     )
     _validate_capabilities(
         _runner_response(
@@ -525,6 +611,7 @@ def run(
             quantized_tensors=quantized_tensors,
             preserved=preserved,
             timeout_seconds=timeout_seconds,
+            runner_identity=runner_identity,
         )
         stages.append({
             "name": name,
@@ -540,6 +627,7 @@ def run(
         "run_id": campaign["run_id"],
         "campaign_sha256": campaign_sha256,
         "runner": auxiliary_runner,
+        "runner_identity": auxiliary_runner_identity,
         "model_root": str(model_root.resolve(strict=True)),
         "source_root": str(source_root),
         "evidence_root": str(evidence_root),

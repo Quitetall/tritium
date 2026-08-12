@@ -193,13 +193,15 @@ Both runners receive one canonical JSON request on stdin and must emit one
 strict JSON object on stdout. The measurement runner supplies every frozen
 recipe row; the auxiliary runner supplies BF16/SALT V1 baselines and the five
 refinement records. The orchestrator binds each request to clean `HEAD`, model,
-campaign, runner argv, and evidence paths, caches only validated immutable rows,
-resumes completed work, and invokes the existing qualifier before publishing
-the trace. It never synthesizes metrics. A structural smoke or a missing real
-runner cannot satisfy Stage-7.
+campaign, runner argv, runner executable/script digests, and evidence paths,
+caches only validated immutable rows, resumes completed work, and invokes the
+existing qualifier before publishing the trace. Request schemas are versioned
+when this identity contract changes, so caches from older runner code cannot be
+silently replayed. It never synthesizes metrics. A structural smoke or a
+missing real runner cannot satisfy Stage-7.
 
 Before candidate work, each runner must answer a capability preflight request
-(`tritium.stage7-capabilities-request.v1`) with a
+(`tritium.stage7-capabilities-request.v2`) with a
 `tritium.stage7-capabilities.v1` declaration bound to the exact request ID and
 campaign source revision. The measurement runner must advertise all three stages, D2/B3/S34,
 G64/G128/G256, two/three planes, both rotations, all three curvature modes, all
