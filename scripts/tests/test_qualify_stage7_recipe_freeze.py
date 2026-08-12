@@ -452,13 +452,15 @@ def fixture(root: Path):
     smoke_evaluation_members = provenance["calibration"]["members"][:128]
     smoke_evaluation_id = digest(smoke_evaluation_members)
     smoke_execution = {
-        "schema": "tritium.stage7-smoke-execution.v1",
+        "schema": "tritium.stage7-smoke-execution.v2",
         "result": "pass",
         "release": release,
         "source_revision": revision,
         "model_id": smoke_model_id,
         "model_revision": smoke_model["revision"],
         "evaluation_id": smoke_evaluation_id,
+        "profile": "compact-v1",
+        "target_bpw": None,
         "artifact_sha256": smoke_artifact["sha256"],
         "stages": [
             {"name": name, "result": "pass"}
@@ -473,13 +475,15 @@ def fixture(root: Path):
         smoke_execution_path.read_bytes(),
     )
     smoke = {
-        "schema": "tritium.stage7-smoke.v1",
+        "schema": "tritium.stage7-smoke.v2",
         "result": "pass",
         "release": release,
         "source_revision": revision,
         "model_id": smoke_model_id,
         "model_revision": smoke_model["revision"],
         "evaluation_id": smoke_evaluation_id,
+        "profile": "compact-v1",
+        "target_bpw": None,
         "artifact": smoke_artifact,
         "package_id": smoke_package_id,
         "codec": "b3",

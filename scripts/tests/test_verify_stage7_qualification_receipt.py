@@ -89,7 +89,7 @@ def fixture(root: Path):
         "recipe_count": 1404, "recipe_grid_id": digest(5_000),
         "token_evidence_pack": None,
         "evidence": [
-            {**materialize_json(root, "smoke/smoke-receipt.json", {"schema": "tritium.stage7-smoke.v1", "result": "pass", "release": "1.1.0-rc.1", "source_revision": "a" * 40}), "kind": "smoke"},
+            {**materialize_json(root, "smoke/smoke-receipt.json", {"schema": "tritium.stage7-smoke.v2", "result": "pass", "release": "1.1.0-rc.1", "source_revision": "a" * 40}), "kind": "smoke"},
             {**materialize_json(root, "native/native-receipt.json", {"schema": "tritium.stage7-native-kernels.v1", "result": "pass", "release": "1.1.0-rc.1", "source_revision": "a" * 40}), "kind": "native-kernels"},
             {**materialize_json(root, "hestia-gate-c.json", {"schema": "tritium.stage7-hestia-gate-c.v1", "result": "pass", "release": "1.1.0-rc.1", "source_revision": "a" * 40}), "kind": "hestia-gate-c"},
         ],

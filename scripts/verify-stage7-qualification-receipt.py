@@ -265,7 +265,7 @@ def _validate_campaign_payload(
             evidence_path,
             f"campaign.evidence[{index}]",
             {
-                "smoke": "tritium.stage7-smoke.v1",
+                "smoke": "tritium.stage7-smoke.v2",
                 "native-kernels": "tritium.stage7-native-kernels.v1",
                 "hestia-gate-c": "tritium.stage7-hestia-gate-c.v1",
             }[kind],

@@ -21,8 +21,8 @@ from typing import Any, Iterable
 CAMPAIGN_SCHEMA = "tritium.stage7-campaign.v1"
 TRACE_SCHEMA = "tritium.stage7-execution.v1"
 QUALIFICATION_SCHEMA = "tritium.stage7-qualification.v1"
-SMOKE_SCHEMA = "tritium.stage7-smoke.v1"
-SMOKE_EXECUTION_SCHEMA = "tritium.stage7-smoke-execution.v1"
+SMOKE_SCHEMA = "tritium.stage7-smoke.v2"
+SMOKE_EXECUTION_SCHEMA = "tritium.stage7-smoke-execution.v2"
 TOKEN_EVIDENCE_SCHEMA = "tritium.stage7-token-evidence-pack.v1"
 NATIVE_SCHEMA = "tritium.stage7-native-kernels.v1"
 PHYSICAL_SCHEMA = "tritium.stage7-physical-report.v1"
@@ -178,12 +178,14 @@ COMPONENT_FIELDS = {
 }
 SMOKE_FIELDS = {
     "schema", "result", "release", "source_revision", "model_id",
-    "model_revision", "evaluation_id", "artifact", "package_id", "codec",
-    "serialized_bytes", "resident_bytes", "tensor_count", "execution_log",
+    "model_revision", "evaluation_id", "profile", "target_bpw", "artifact",
+    "package_id", "codec", "serialized_bytes", "resident_bytes", "tensor_count",
+    "execution_log",
 }
 SMOKE_EXECUTION_FIELDS = {
     "schema", "result", "release", "source_revision", "model_id",
-    "model_revision", "evaluation_id", "artifact_sha256", "stages",
+    "model_revision", "evaluation_id", "profile", "target_bpw",
+    "artifact_sha256", "stages",
 }
 SMOKE_STAGE_FIELDS = {"name", "result"}
 NATIVE_FIELDS = {
@@ -879,6 +881,12 @@ def _validate_smoke(
         raise Stage7Error("smoke receipt model revision differs")
     if receipt["evaluation_id"] != campaign["smoke_provenance"]["evaluation_id"]:
         raise Stage7Error("smoke receipt evaluation provenance differs")
+    profile = _string(receipt["profile"], "smoke profile")
+    if profile not in {"compact-v1", "near-lossless-v1"}:
+        raise Stage7Error("smoke profile differs")
+    target_bpw = receipt["target_bpw"]
+    if target_bpw is not None:
+        _number(target_bpw, "smoke target bpw", 1e-12)
     artifact = _open_record(path.parent, receipt["artifact"], "smoke artifact")
     serialized = _integer(receipt["serialized_bytes"], "smoke serialized bytes", 1)
     resident = _integer(receipt["resident_bytes"], "smoke resident bytes", 1)
@@ -912,6 +920,8 @@ def _validate_smoke(
         "model_id": smoke_model_id,
         "model_revision": campaign["smoke_model"]["revision"],
         "evaluation_id": campaign["smoke_provenance"]["evaluation_id"],
+        "profile": profile,
+        "target_bpw": target_bpw,
         "artifact_sha256": _hash_file(artifact),
     }
     if any(execution[field] != value for field, value in expected_execution.items()):

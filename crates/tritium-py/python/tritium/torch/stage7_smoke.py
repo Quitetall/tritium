@@ -32,6 +32,8 @@ _SCHEMA = "tritium.stage7-smoke-model.v1"
 _REQUEST_SCHEMA = "tritium.stage7-smoke-model-request.v1"
 _ALLOCATION_SCHEMA = "tritium.stage7-smoke-allocation.v1"
 _EVALUATION_SCHEMA = "tritium.stage7-smoke-evaluation.v1"
+_SMOKE_SCHEMA = "tritium.stage7-smoke.v2"
+_SMOKE_EXECUTION_SCHEMA = "tritium.stage7-smoke-execution.v2"
 _STAGES = ("capture", "fit", "allocate", "package", "evaluate")
 _MAX_JSON_BYTES = 8 * 1024 * 1024
 _TOP_LEVEL_FILES = {
@@ -475,6 +477,18 @@ def _scale_group_size(shape: tuple[int, ...]) -> int:
     raise ValueError("Stage-7 packed weight columns must be G64-aligned")
 
 
+def _validate_ptq_options(profile: str, target_bpw: float | None) -> None:
+    if profile not in {"compact-v1", "near-lossless-v1"}:
+        raise ValueError("profile must be 'compact-v1' or 'near-lossless-v1'")
+    if target_bpw is not None and (
+        isinstance(target_bpw, bool)
+        or not isinstance(target_bpw, (int, float))
+        or not math.isfinite(float(target_bpw))
+        or target_bpw <= 0
+    ):
+        raise ValueError("target_bpw must be finite and positive when provided")
+
+
 def _model_output(output: Any, field: str) -> Any:
     return output.get(field) if isinstance(output, Mapping) else getattr(output, field, None)
 
@@ -573,15 +587,7 @@ def run_stage7_smoke_model(
         raise ValueError("Stage-7 smoke data lacks terminal validation")
     if packing not in {"d2", "b3", "s34"}:
         raise ValueError("packing must be 'd2', 'b3', or 's34'")
-    if profile not in {"compact-v1", "near-lossless-v1"}:
-        raise ValueError("profile must be 'compact-v1' or 'near-lossless-v1'")
-    if target_bpw is not None and (
-        isinstance(target_bpw, bool)
-        or not isinstance(target_bpw, (int, float))
-        or not math.isfinite(float(target_bpw))
-        or target_bpw <= 0
-    ):
-        raise ValueError("target_bpw must be finite and positive when provided")
+    _validate_ptq_options(profile, target_bpw)
     for label, value in (
         ("max_evidence_bytes", max_evidence_bytes),
         ("max_working_bytes", max_working_bytes),
@@ -807,6 +813,8 @@ def run_stage7_smollm2_smoke(
     device: str = "cuda",
     batch_sequences: int = 1,
     packing: str = "b3",
+    profile: str = "compact-v1",
+    target_bpw: float | None = None,
     max_evidence_bytes: int = 64 * 1024 * 1024,
     max_working_bytes: int = 512 * 1024 * 1024,
     max_payload_bytes: int = 8 * 1024 * 1024 * 1024,
@@ -824,6 +832,7 @@ def run_stage7_smollm2_smoke(
         raise RuntimeError("CUDA Stage-7 smoke requested but CUDA is unavailable")
     if type(batch_sequences) is not int or not 1 <= batch_sequences <= 128:
         raise ValueError("batch_sequences must be an integer between 1 and 128")
+    _validate_ptq_options(profile, target_bpw)
     requested_campaign = Path(campaign_path)
     if requested_campaign.is_symlink():
         raise ValueError("Stage-7 campaign path must not be a symlink")
@@ -887,6 +896,8 @@ def run_stage7_smollm2_smoke(
         data,
         target / "model",
         packing=packing,
+        profile=profile,
+        target_bpw=target_bpw,
         max_evidence_bytes=max_evidence_bytes,
         max_working_bytes=max_working_bytes,
         max_payload_bytes=max_payload_bytes,
@@ -897,13 +908,15 @@ def run_stage7_smollm2_smoke(
         )
     artifact_sha256 = _sha256_file(model_result.artifact_path)
     execution = {
-        "schema": "tritium.stage7-smoke-execution.v1",
+        "schema": _SMOKE_EXECUTION_SCHEMA,
         "result": "pass",
         "release": release,
         "source_revision": source_revision,
         "model_id": model_id,
         "model_revision": SMOLLM2_135M_REVISION,
         "evaluation_id": evaluation_id,
+        "profile": profile,
+        "target_bpw": target_bpw,
         "artifact_sha256": artifact_sha256,
         "stages": [
             {"name": name, "result": "pass"} for name in model_result.stage_names
@@ -924,13 +937,15 @@ def run_stage7_smollm2_smoke(
         "sha256": artifact_sha256,
     }
     smoke = {
-        "schema": "tritium.stage7-smoke.v1",
+        "schema": _SMOKE_SCHEMA,
         "result": "pass",
         "release": release,
         "source_revision": source_revision,
         "model_id": model_id,
         "model_revision": SMOLLM2_135M_REVISION,
         "evaluation_id": evaluation_id,
+        "profile": profile,
+        "target_bpw": target_bpw,
         "artifact": artifact_record,
         "package_id": model_result.package_id,
         "codec": model_result.packing,

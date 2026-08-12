@@ -309,6 +309,25 @@ def test_stage7_smoke_model_rejects_invalid_ptq_profile_options(tmp_path):
         run_stage7_smoke_model(model, data, tmp_path / "invalid-bpw", target_bpw=-1)
 
 
+def test_stage7_smollm2_smoke_validates_forwarded_ptq_options_before_io(tmp_path):
+    with pytest.raises(ValueError, match="profile must be"):
+        run_stage7_smollm2_smoke(
+            tmp_path / "missing-campaign.json",
+            tmp_path / "missing-model",
+            tmp_path / "invalid-profile",
+            device="cpu",
+            profile="unsupported",
+        )
+    with pytest.raises(ValueError, match="target_bpw must be"):
+        run_stage7_smollm2_smoke(
+            tmp_path / "missing-campaign.json",
+            tmp_path / "missing-model",
+            tmp_path / "invalid-bpw",
+            device="cpu",
+            target_bpw=0,
+        )
+
+
 def test_stage7_smoke_model_binds_near_lossless_adaptive_recipe(tmp_path):
     torch.manual_seed(9)
     manifest_path, manifest = write_pack(tmp_path / "pack")
