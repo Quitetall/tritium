@@ -669,19 +669,26 @@ def _weight_mse(
     planes: Tuple[TernaryPlane, ...],
     metric: torch.Tensor,
 ) -> float:
+    # Source weights and exported scales are at most FP16/FP32. Keep the
+    # per-element decode/residual path in FP32; only the final scalar sum is
+    # FP64. This preserves deterministic chunk order and receipt precision
+    # while avoiding a 3x FP64 bandwidth penalty on billion-parameter models.
     total = 0.0
     denominator = float(metric.sum()) * master.shape[0]
+    metric_fp32 = metric.to(torch.float32)
     rows_per_chunk = max(1, (64 * 1024 * 1024) // max(1, master.shape[1] * 24))
     for start in range(0, master.shape[0], rows_per_chunk):
         end = min(master.shape[0], start + rows_per_chunk)
-        decoded = torch.zeros((end - start, master.shape[1]), dtype=torch.float64)
+        decoded = torch.zeros((end - start, master.shape[1]), dtype=torch.float32)
         for plane in planes:
             decoded.add_(
-                plane.trits[start:end].to(torch.float64)
-                * plane.scales[start:end].to(torch.float64)
+                plane.trits[start:end].to(torch.float32)
+                * plane.scales[start:end].to(torch.float32)
             )
-        residual = master[start:end].detach().cpu().to(torch.float64) - decoded
-        total += float((residual.square() * metric).sum())
+        residual = master[start:end].detach().cpu().to(torch.float32) - decoded
+        total += float(
+            (residual.square() * metric_fp32).sum(dtype=torch.float64)
+        )
     return total / denominator
 
 
