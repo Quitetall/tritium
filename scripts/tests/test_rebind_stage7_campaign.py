@@ -43,7 +43,7 @@ def setup(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> tuple[Path, Path]:
     evidence = []
     for index, kind in enumerate(("smoke", "native-kernels", "hestia-gate-c")):
         filename = f"{kind}.json"
-        payload = kind.encode()
+        payload = MODULE.canonical({"kind": kind, "source_revision": "b" * 40})
         (tmp_path / filename).write_bytes(payload)
         evidence.append({
             "kind": kind,

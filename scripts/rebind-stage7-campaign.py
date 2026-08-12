@@ -142,7 +142,9 @@ def _open_record(root: Path, record: Any, label: str) -> Path:
     return path
 
 
-def _validate_prerequisites(value: dict[str, Any], root: Path) -> None:
+def _validate_prerequisites(
+    value: dict[str, Any], root: Path, target_revision: str
+) -> None:
     _open_record(root, value["token_evidence_pack"], "campaign token evidence pack")
     evidence = value["evidence"]
     if not isinstance(evidence, list) or len(evidence) != 3:
@@ -154,11 +156,28 @@ def _validate_prerequisites(value: dict[str, Any], root: Path) -> None:
             raise RebindError(f"evidence[{ordinal}] fields differ")
         if record["kind"] != kind:
             raise RebindError("campaign prerequisite evidence order differs")
-        _open_record(
+        receipt_path = _open_record(
             root,
             {field: record[field] for field in FILE_FIELDS},
             f"evidence[{ordinal}]",
         )
+        try:
+            receipt = json.loads(
+                receipt_path.read_bytes(),
+                object_pairs_hook=_reject_duplicate_pairs,
+                parse_constant=lambda token: (_ for _ in ()).throw(
+                    ValueError(f"invalid JSON constant {token}")
+                ),
+            )
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+            raise RebindError(f"evidence[{ordinal}] must contain strict UTF-8 JSON") from error
+        if (
+            not isinstance(receipt, dict)
+            or receipt.get("source_revision") != target_revision
+        ):
+            raise RebindError(
+                f"evidence[{ordinal}] source revision differs from target HEAD"
+            )
 
 
 def _write_new(path: Path, value: dict[str, Any]) -> None:
@@ -216,7 +235,9 @@ def rebind(
         raise RebindError("campaign is already bound to current HEAD")
     if _count(value, old_revision) != 1:
         raise RebindError("old source revision appears outside top-level campaign identity")
-    _validate_prerequisites(value, template.resolve(strict=True).parent)
+    _validate_prerequisites(
+        value, template.resolve(strict=True).parent, target_revision
+    )
     if run_id == value["run_id"]:
         raise RebindError("new run_id must differ from template run_id")
     rebound = dict(value)
