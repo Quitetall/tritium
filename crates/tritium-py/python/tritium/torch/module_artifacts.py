@@ -937,7 +937,12 @@ def pack_module_conversion(
     packing: str = "b3",
     max_payload_bytes: int = 8 * 1024 * 1024 * 1024,
 ) -> PackedModuleArtifact:
-    """Verify, stream, strict-reopen, and atomically publish fitted weights."""
+    """Verify, stream, strict-reopen, and atomically publish fitted weights.
+
+    Native packing performs strict package verification before returning.  Do
+    not scan the staged payload a second time: the post-publish reopen below
+    verifies the exact bytes that crossed the atomic publication boundary.
+    """
 
     if not isinstance(result, ModuleQuantizationResult):
         raise TypeError("pack_module_conversion requires a ModuleQuantizationResult")
@@ -992,11 +997,10 @@ def pack_module_conversion(
         }
         manifest["artifact_id"] = _digest_bytes(_canonical(manifest))
         _atomic_write(staging / _PACKED_MANIFEST, _canonical(manifest))
-        staged = load_packed_module(staging)
         _tritium.publish_directory_noreplace(str(staging), str(target))
         published = True
         reopened = load_packed_module(target)
-        if reopened.artifact_id != staged.artifact_id:
+        if reopened.artifact_id != manifest["artifact_id"]:
             raise RuntimeError("published packed module identity changed")
         return reopened
     finally:
