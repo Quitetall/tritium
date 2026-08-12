@@ -219,7 +219,7 @@ fn assert_bounded_metric_exposition(text: &str) {
                 .split_once('=')
                 .expect("metric label must be key=value");
             assert!(
-                matches!(name, "le" | "phase" | "path" | "version"),
+                matches!(name, "le" | "outcome" | "phase" | "path" | "version"),
                 "unexpected metric label {name:?} in {line:?}"
             );
             assert!(!value.is_empty(), "metric label value must not be empty");
@@ -235,6 +235,15 @@ fn assert_bounded_metric_exposition(text: &str) {
                         | "\"1\""
                         | "\"5\""
                         | "\"+Inf\""
+                )),
+                "outcome" => assert!(matches!(
+                    value,
+                    "\"accepted\""
+                        | "\"unauthenticated\""
+                        | "\"rate_limited\""
+                        | "\"invalid_request\""
+                        | "\"unavailable\""
+                        | "\"server_error\""
                 )),
                 "phase" => assert!(matches!(
                     value,
@@ -1532,6 +1541,30 @@ async fn metrics_exposition() {
     assert_eq!(status, StatusCode::OK);
     let text = String::from_utf8(body).unwrap();
     assert_bounded_metric_exposition(&text);
+    assert!(
+        text.contains("# TYPE tritium_admission_outcomes_total counter"),
+        "{text}"
+    );
+    // Metrics body is rendered before middleware records its own completion;
+    // two chat requests are visible while labels stay fixed and identity-free.
+    assert!(
+        text.contains("tritium_admission_outcomes_total{outcome=\"accepted\"} 2\n"),
+        "{text}"
+    );
+    for outcome in [
+        "unauthenticated",
+        "rate_limited",
+        "invalid_request",
+        "unavailable",
+        "server_error",
+    ] {
+        assert!(
+            text.contains(&format!(
+                "tritium_admission_outcomes_total{{outcome=\"{outcome}\"}} 0\n"
+            )),
+            "{text}"
+        );
+    }
     assert!(text.contains("tritium_chat_requests_total 2\n"), "{text}");
     assert!(text.contains("tritium_tokens_out_total 6\n"), "{text}");
     assert!(text.contains("tritium_tokens_in_total 2\n"), "{text}");

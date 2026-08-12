@@ -179,9 +179,20 @@ const GENERATION_DURATION_BUCKET_US: [u64; 8] = [
 const TTFT_BUCKET_US: [u64; 8] = [
     1_000, 5_000, 10_000, 50_000, 100_000, 500_000, 1_000_000, 5_000_000,
 ];
+const ADMISSION_OUTCOME_LABELS: [&str; 6] = [
+    "accepted",
+    "unauthenticated",
+    "rate_limited",
+    "invalid_request",
+    "unavailable",
+    "server_error",
+];
 
 #[derive(Debug, Default)]
 pub(crate) struct Metrics {
+    /// Fixed-cardinality request admission outcomes. Labels never contain
+    /// request, model, principal, or error text.
+    pub(crate) admission_outcomes: [AtomicU64; ADMISSION_OUTCOME_LABELS.len()],
     /// Chat completions accepted into the queue (streaming + non-streaming).
     pub(crate) chat_requests: AtomicU64,
     /// 429s returned because the job queue was full.
@@ -221,6 +232,18 @@ pub(crate) struct Metrics {
 }
 
 impl Metrics {
+    fn observe_admission(&self, status: StatusCode) {
+        let index = match status {
+            status if status.is_success() => 0,
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => 1,
+            StatusCode::TOO_MANY_REQUESTS => 2,
+            StatusCode::BAD_REQUEST | StatusCode::PAYLOAD_TOO_LARGE => 3,
+            StatusCode::REQUEST_TIMEOUT | StatusCode::SERVICE_UNAVAILABLE => 4,
+            _ => 5,
+        };
+        self.admission_outcomes[index].fetch_add(1, Ordering::Relaxed);
+    }
+
     fn observe_request(&self, elapsed: Duration) {
         observe_histogram(
             elapsed,
@@ -821,7 +844,7 @@ fn build_router_inner(
                         }
                     }
                 };
-                finish_request(response, &identity, method, route, started)
+                finish_request(response, &identity, method, route, started, &metrics)
             }
         },
     ));
@@ -955,8 +978,10 @@ fn finish_request(
     method: &'static str,
     route: &'static str,
     started: Instant,
+    metrics: &Metrics,
 ) -> Response {
     let status = response.status();
+    metrics.observe_admission(status);
     response.headers_mut().insert(
         "x-request-id",
         HeaderValue::from_str(&identity.request_id).expect("request id is valid header value"),
@@ -1741,6 +1766,14 @@ async fn metrics(State(st): State<AppState>) -> Response {
         "# HELP tritium_metrics_schema_info Exposition schema version (fixed).\n\
          # TYPE tritium_metrics_schema_info gauge\n\
          tritium_metrics_schema_info{{version=\"{METRICS_SCHEMA_VERSION}\"}} 1\n\
+         # HELP tritium_admission_outcomes_total Request admission outcomes by fixed result class.\n\
+         # TYPE tritium_admission_outcomes_total counter\n\
+         tritium_admission_outcomes_total{{outcome=\"accepted\"}} {}\n\
+         tritium_admission_outcomes_total{{outcome=\"unauthenticated\"}} {}\n\
+         tritium_admission_outcomes_total{{outcome=\"rate_limited\"}} {}\n\
+         tritium_admission_outcomes_total{{outcome=\"invalid_request\"}} {}\n\
+         tritium_admission_outcomes_total{{outcome=\"unavailable\"}} {}\n\
+         tritium_admission_outcomes_total{{outcome=\"server_error\"}} {}\n\
          # HELP tritium_chat_requests_total Chat completions accepted into the queue.\n\
          # TYPE tritium_chat_requests_total counter\n\
          tritium_chat_requests_total {}\n\
@@ -1846,6 +1879,12 @@ async fn metrics(State(st): State<AppState>) -> Response {
          tritium_spec_cost_us{{phase=\"draft_resync\"}} {}\n\
          tritium_spec_cost_us{{phase=\"verify_round\"}} {}\n\
          tritium_spec_cost_us{{phase=\"lockstep\"}} {}\n",
+        st.metrics.admission_outcomes[0].load(Ordering::Relaxed),
+        st.metrics.admission_outcomes[1].load(Ordering::Relaxed),
+        st.metrics.admission_outcomes[2].load(Ordering::Relaxed),
+        st.metrics.admission_outcomes[3].load(Ordering::Relaxed),
+        st.metrics.admission_outcomes[4].load(Ordering::Relaxed),
+        st.metrics.admission_outcomes[5].load(Ordering::Relaxed),
         st.metrics.chat_requests.load(Ordering::Relaxed),
         st.metrics.queue_rejections.load(Ordering::Relaxed),
         st.metrics.rate_rejections.load(Ordering::Relaxed),
