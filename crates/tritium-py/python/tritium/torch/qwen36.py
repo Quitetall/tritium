@@ -486,6 +486,11 @@ def capture_qwen36_components(
     components = resolve_qwen36_components(model, require_mtp=True)
     if components.mtp_model is None:
         raise Qwen36ComponentError("Qwen3.6 MTP drafter is required for capture")
+    if execution_model is None and hasattr(components.language_model, "norm"):
+        # The ordinary language-only forward does not reach ``model.mtp``.
+        # Use the offload-safe containing oracle by default so strict capture
+        # cannot silently publish language-only evidence.
+        execution_model = Qwen36LanguageMtpOracle(model)
     return capture_qwen36_kronecker_evidence(
         components.language_model,
         data_factory,

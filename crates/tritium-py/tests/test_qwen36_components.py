@@ -131,6 +131,40 @@ def test_capture_resolves_components_before_delegating(monkeypatch) -> None:
     assert observed["mtp_model"] is graph.mtp
 
 
+def test_capture_defaults_to_offload_safe_oracle_for_qwen_shape(monkeypatch) -> None:
+    graph = Graph()
+    graph.model.language_model.norm = nn.Identity()
+    sentinel = object()
+    observed = {}
+
+    monkeypatch.setattr(
+        "tritium.torch.qwen36.Qwen36LanguageMtpOracle",
+        lambda model: sentinel,
+    )
+
+    def fake_capture(_language_model, _data_factory, **kwargs):
+        observed["execution_model"] = kwargs["execution_model"]
+        return object()
+
+    monkeypatch.setattr(
+        "tritium.torch.qwen36.capture_qwen36_kronecker_evidence",
+        fake_capture,
+    )
+    capture_qwen36_components(
+        graph,
+        lambda _task: (),
+        model_dir="/model",
+        declared_revision="a" * 40,
+        work_dir="/work",
+        evidence_dir="/evidence",
+        curvature="input-hessian",
+        activation_cache_digest="b" * 64,
+        token_stream_digest="c" * 64,
+        damping=1e-4,
+    )
+    assert observed["execution_model"] is sentinel
+
+
 def test_qwen36_mtp_adapter_matches_checkpoint_namespace(tmp_path) -> None:
     config = _tiny_text_config()
     graph = MtpGraph(config)
