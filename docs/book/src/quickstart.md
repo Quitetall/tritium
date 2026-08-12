@@ -169,6 +169,21 @@ container. `--bpw` is the single accuracy↔size knob (`1.585` = all base ternar
 tritium quantize --input model.safetensors --output model.tslb --bpw 2.0
 ```
 
+### Optional seekable transport
+
+Compress an already-packed artifact for storage or range-friendly transfer:
+
+```bash
+tritium transport pack model.tslb model.tslb.trns
+tritium transport inspect model.tslb.trns
+tritium transport unpack model.tslb.trns model-restored.tslb
+cmp model.tslb model-restored.tslb
+```
+
+Transport compression is not runtime quantization. `inspect` keeps logical
+fixed-codec bytes as resident denominator; compressed bytes must not be used for
+VRAM, bpw, or kernel-throughput claims.
+
 > The exact subcommand surface is defined in `crates/tritium-cli/src/main.rs`; if
 > a flag here ever drifts, that file is the source of truth.
 
