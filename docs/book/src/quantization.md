@@ -237,6 +237,31 @@ stages. The high-level `tritium.torch.quantize(...)` facade now composes
 `torch.nn.Module` PTQ uses activation calibration and returns a module-scoped
 conversion result; it does not silently substitute Qwen S2KF evidence.
 
+For Transformers-backed Qwen3.6 capture, use the strict component boundary:
+
+```python
+from tritium.torch import capture_qwen36_components, resolve_qwen36_components
+
+components = resolve_qwen36_components(model)  # requires model.mtp
+receipt = capture_qwen36_components(
+    model,
+    data_factory,
+    model_dir="/models/Qwen3.6-27B",
+    declared_revision="6a9e13bd6fc8f0983b9b99948120bc37f49c13e9",
+    work_dir="./tritium-work",
+    evidence_dir="./curvature-evidence",
+    curvature="input-hessian",
+    activation_cache_digest=cache_digest,
+    token_stream_digest=token_digest,
+    damping=1e-4,
+)
+```
+
+Resolution requires canonical `model.language_model`, `lm_head`, and retained
+`mtp` modules before native evidence mutation. A Transformers graph that drops
+MTP tensors fails closed; language-only diagnostics require an explicit
+`require_mtp=False` resolution and cannot enter flagship capture.
+
 ## Hardware constraints (load-bearing)
 
 - **Regular compute.** Plane counts are quantized to `{1, 2, 3}` and allocated at

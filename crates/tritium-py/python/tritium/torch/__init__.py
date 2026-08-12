@@ -88,6 +88,12 @@ from .ptq import (
     load_quantized_module,
     quantize,
 )
+from .qwen36 import (
+    Qwen36ComponentError,
+    Qwen36Components,
+    capture_qwen36_components,
+    resolve_qwen36_components,
+)
 from .tutorial import (
     SMOLLM2_MODEL_ID,
     SMOLLM2_REVISION,
@@ -152,6 +158,8 @@ __all__ = [
     "QatHardWeight",
     "QuantizationResult",
     "QwenOnnxCausalLM",
+    "Qwen36ComponentError",
+    "Qwen36Components",
     "RefinementConfig",
     "RefinementResult",
     "SaltSTE",
@@ -184,6 +192,7 @@ __all__ = [
     "capture_kronecker_module",
     "capture_kronecker_module_group",
     "capture_qwen36_kronecker_evidence",
+    "capture_qwen36_components",
     "convert",
     "convert_qat_hard",
     "collect_diagnostics",
@@ -208,6 +217,7 @@ __all__ = [
     "prepare_qat",
     "quantize",
     "refine",
+    "resolve_qwen36_components",
     "reference_ternary_linear",
     "register_estimator",
     "register_huggingface",
