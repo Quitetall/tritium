@@ -462,9 +462,14 @@ def _exact_equal(left: Any, right: Any) -> bool:
 def _run_case(policy: dict[str, Any], seed: int) -> dict[str, Any]:
     torch.manual_seed(seed)
     m, n, k = policy["m"], policy["n"], policy["k"]
-    input_ = torch.randn(m, k, dtype=torch.float32, requires_grad=True)
-    master = torch.randn(n, k, dtype=torch.float32, requires_grad=True)
-    bias = torch.randn(n, dtype=torch.float32, requires_grad=True)
+    # Forward cases model inference/decode under the surrounding no-grad
+    # scope.  Requiring gradients there adds wrapper-only ``detach`` work and
+    # measures graph preparation rather than dispatch overhead.  Backward
+    # cases retain gradient-bearing operands for the native VJP comparison.
+    requires_grad = policy["phase"] == "backward"
+    input_ = torch.randn(m, k, dtype=torch.float32, requires_grad=requires_grad)
+    master = torch.randn(n, k, dtype=torch.float32, requires_grad=requires_grad)
+    bias = torch.randn(n, dtype=torch.float32, requires_grad=requires_grad)
     grad_output = torch.randn(m, n, dtype=torch.float32)
     detached_input = input_.detach()
     detached_master = master.detach()
