@@ -2,11 +2,20 @@
 
 from __future__ import annotations
 
+import json
+from types import SimpleNamespace
+
 import pytest
+import torch
 from torch import nn
+from safetensors.torch import save_file
+from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
+from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5TextRotaryEmbedding
 
 from tritium.torch import (
     Qwen36ComponentError,
+    Qwen36MtpAdapter,
+    attach_qwen36_mtp,
     capture_qwen36_components,
     resolve_qwen36_components,
 )
@@ -20,6 +29,42 @@ class Graph(nn.Module):
         self.lm_head = nn.Linear(4, 8, bias=False)
         if mtp:
             self.mtp = nn.Linear(4, 4)
+
+
+def _tiny_text_config() -> Qwen3_5TextConfig:
+    return Qwen3_5TextConfig(
+        vocab_size=32,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=4,
+        layer_types=["full_attention"],
+        max_position_embeddings=32,
+        rope_parameters={
+            "rope_type": "default",
+            "rope_theta": 10_000,
+            "partial_rotary_factor": 1.0,
+            "mrope_section": [1, 1, 2],
+        },
+        linear_num_key_heads=2,
+        linear_num_value_heads=2,
+        linear_key_head_dim=4,
+        linear_value_head_dim=4,
+    )
+
+
+class MtpGraph(nn.Module):
+    def __init__(self, config: Qwen3_5TextConfig) -> None:
+        super().__init__()
+        language = nn.Module()
+        language.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        language.rotary_emb = Qwen3_5TextRotaryEmbedding(config)
+        self.model = nn.Module()
+        self.model.language_model = language
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.config = SimpleNamespace(text_config=config)
 
 
 def test_resolve_requires_explicit_mtp_component() -> None:
@@ -83,3 +128,45 @@ def test_capture_resolves_components_before_delegating(monkeypatch) -> None:
     assert observed["language_model"] is graph.model.language_model
     assert observed["data_factory"] is factory
     assert observed["mtp_model"] is graph.mtp
+
+
+def test_qwen36_mtp_adapter_matches_checkpoint_namespace(tmp_path) -> None:
+    config = _tiny_text_config()
+    graph = MtpGraph(config)
+    template = Qwen36MtpAdapter(
+        config,
+        graph.model.language_model.embed_tokens,
+        graph.model.language_model.rotary_emb,
+    )
+    expected = {
+        f"mtp.{name}": torch.randn_like(value)
+        for name, value in template.state_dict().items()
+    }
+    shard = tmp_path / "model-00001-of-00001.safetensors"
+    save_file(expected, str(shard))
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {name: shard.name for name in expected}}),
+        encoding="utf-8",
+    )
+
+    adapter = attach_qwen36_mtp(graph, tmp_path, device="cpu")
+    assert set(adapter.state_dict()) == set(template.state_dict())
+    for name, value in template.state_dict().items():
+        assert torch.equal(adapter.state_dict()[name], expected[f"mtp.{name}"])
+    assert resolve_qwen36_components(graph).mtp_model is adapter
+
+
+def test_qwen36_mtp_adapter_forward_is_finite() -> None:
+    config = _tiny_text_config()
+    embeddings = nn.Embedding(config.vocab_size, config.hidden_size)
+    adapter = Qwen36MtpAdapter(
+        config,
+        embeddings,
+        Qwen3_5TextRotaryEmbedding(config),
+    ).eval()
+    output = adapter(
+        input_ids=torch.tensor([[1, 2, 3]]),
+        hidden_states=torch.randn(1, 3, config.hidden_size),
+    )
+    assert output.shape == (1, 3, config.hidden_size)
+    assert torch.isfinite(output).all()

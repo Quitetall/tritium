@@ -92,6 +92,9 @@ from .ptq import (
 from .qwen36 import (
     Qwen36ComponentError,
     Qwen36Components,
+    Qwen36MtpAdapter,
+    Qwen36MtpLoadError,
+    attach_qwen36_mtp,
     capture_qwen36_components,
     resolve_qwen36_components,
 )
@@ -162,6 +165,9 @@ __all__ = [
     "QwenOnnxCausalLM",
     "Qwen36ComponentError",
     "Qwen36Components",
+    "Qwen36MtpAdapter",
+    "Qwen36MtpLoadError",
+    "attach_qwen36_mtp",
     "RefinementConfig",
     "RefinementResult",
     "SaltSTE",
