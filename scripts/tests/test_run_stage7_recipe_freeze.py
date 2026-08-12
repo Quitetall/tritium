@@ -42,6 +42,63 @@ def test_runner_response_requires_one_strict_json_object() -> None:
         runner._runner_response(failed, {}, timeout_seconds=2)
 
 
+def test_capability_preflight_requires_complete_measurement_surface() -> None:
+    source_revision = "a" * 40
+    valid = {
+        "schema": runner.CAPABILITY_SCHEMA,
+        "source_revision": source_revision,
+        "stages": list(runner.STAGE_NAMES),
+        "codecs": list(runner.RECIPE_CODECS),
+        "groups": list(runner.RECIPE_GROUPS),
+        "planes": list(runner.RECIPE_PLANES),
+        "rotations": list(runner.RECIPE_ROTATIONS),
+        "curvatures": list(runner.RECIPE_CURVATURES),
+        "solvers": list(runner.RECIPE_SOLVERS),
+        "features": {
+            "full_artifacts": True,
+            "physical_reports": True,
+            "baselines": False,
+            "refinements": False,
+        },
+    }
+    assert runner._validate_capabilities(
+        valid, kind="measurement", source_revision=source_revision
+    ) is valid
+    valid["solvers"] = valid["solvers"][:-1]
+    with pytest.raises(runner.Stage7RunError, match="solvers"):
+        runner._validate_capabilities(
+            valid, kind="measurement", source_revision=source_revision
+        )
+
+
+def test_auxiliary_capability_preflight_requires_baselines_and_refinements() -> None:
+    value = {
+        "schema": runner.CAPABILITY_SCHEMA,
+        "source_revision": "b" * 40,
+        "stages": [],
+        "codecs": [],
+        "groups": [],
+        "planes": [],
+        "rotations": [],
+        "curvatures": [],
+        "solvers": [],
+        "features": {
+            "full_artifacts": False,
+            "physical_reports": False,
+            "baselines": True,
+            "refinements": True,
+        },
+    }
+    assert runner._validate_capabilities(
+        value, kind="auxiliary", source_revision="b" * 40
+    ) is value
+    value["features"]["refinements"] = False
+    with pytest.raises(runner.Stage7RunError, match="required"):
+        runner._validate_capabilities(
+            value, kind="auxiliary", source_revision="b" * 40
+        )
+
+
 def test_cached_measurement_binds_request_stage_and_candidate(tmp_path: Path) -> None:
     candidate = "sha256:" + "b" * 64
     value = {

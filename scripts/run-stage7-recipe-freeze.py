@@ -30,6 +30,27 @@ MAX_RUNNER_OUTPUT_BYTES = 16 * 1024 * 1024
 TRACE_SCHEMA = "tritium.stage7-execution.v1"
 REQUEST_SCHEMA = "tritium.stage7-measurement-request.v1"
 AUXILIARY_SCHEMA = "tritium.stage7-auxiliary-request.v1"
+CAPABILITY_REQUEST_SCHEMA = "tritium.stage7-capabilities-request.v1"
+CAPABILITY_SCHEMA = "tritium.stage7-capabilities.v1"
+CAPABILITY_FEATURE_FIELDS = {
+    "full_artifacts", "physical_reports", "baselines", "refinements",
+}
+CAPABILITY_FIELDS = {
+    "schema", "source_revision", "stages", "codecs", "groups", "planes",
+    "rotations", "curvatures", "solvers", "features",
+}
+STAGE_NAMES = ("one-layer", "four-layer", "full-model")
+RECIPE_CODECS = ("D2", "B3", "S34")
+RECIPE_GROUPS = (64, 128, 256)
+RECIPE_PLANES = (2, 3)
+RECIPE_ROTATIONS = ("none", "signed-rht")
+RECIPE_CURVATURES = (
+    "input-hessian", "guided-fisher", "forward-kl-kronecker",
+)
+RECIPE_SOLVERS = (
+    "greedy", "joint", "joint+feedback", "joint+feedback+output-recon",
+    "+softened-relay-basin", "+modulated-basin",
+)
 MEASUREMENT_FIELDS = {
     "candidate_id", "track", "physical_bytes", "resident_bytes", "output_loss",
     "heldout_ppl", "task_metrics", "runtime_ms", "artifact", "physical_report",
@@ -39,6 +60,88 @@ MEASUREMENT_FIELDS = {
 
 class Stage7RunError(ValueError):
     """Campaign execution failed before a qualified trace could be published."""
+
+
+def _capability_request(
+    *,
+    kind: str,
+    campaign: dict[str, Any],
+    campaign_sha256: str,
+    command: list[str],
+    model_root: Path,
+    source_root: Path,
+    evidence_root: Path,
+) -> dict[str, Any]:
+    if kind not in {"measurement", "auxiliary"}:
+        raise Stage7RunError("capability request kind is invalid")
+    request = {
+        "schema": CAPABILITY_REQUEST_SCHEMA,
+        "kind": kind,
+        "source_revision": campaign["source_revision"],
+        "run_id": campaign["run_id"],
+        "campaign_sha256": campaign_sha256,
+        "runner": command,
+        "model_root": str(model_root),
+        "source_root": str(source_root),
+        "evidence_root": str(evidence_root),
+    }
+    request["request_id"] = "sha256:" + hashlib.sha256(canonical(request)).hexdigest()
+    return request
+
+
+def _validate_capabilities(
+    value: dict[str, Any],
+    *,
+    kind: str,
+    source_revision: str,
+) -> dict[str, Any]:
+    """Validate runner declaration before any candidate work is started."""
+
+    if kind not in {"measurement", "auxiliary"}:
+        raise Stage7RunError("capability kind is invalid")
+    if set(value) != CAPABILITY_FIELDS:
+        raise Stage7RunError("runner capability fields differ")
+    if value["schema"] != CAPABILITY_SCHEMA:
+        raise Stage7RunError("runner capability schema differs")
+    if value["source_revision"] != source_revision:
+        raise Stage7RunError("runner capability source revision differs")
+
+    def exact_list(field: str, expected: tuple[Any, ...]) -> None:
+        observed = value[field]
+        if observed != list(expected):
+            raise Stage7RunError(
+                f"runner capability {field} does not cover frozen Stage-7 contract"
+            )
+
+    if kind == "measurement":
+        exact_list("stages", STAGE_NAMES)
+        exact_list("codecs", RECIPE_CODECS)
+        exact_list("groups", RECIPE_GROUPS)
+        exact_list("planes", RECIPE_PLANES)
+        exact_list("rotations", RECIPE_ROTATIONS)
+        exact_list("curvatures", RECIPE_CURVATURES)
+        exact_list("solvers", RECIPE_SOLVERS)
+    else:
+        for field in ("stages", "codecs", "groups", "planes", "rotations", "curvatures", "solvers"):
+            if value[field] != []:
+                raise Stage7RunError(
+                    f"auxiliary runner capability {field} must be empty"
+                )
+    features = value["features"]
+    if not isinstance(features, dict) or set(features) != CAPABILITY_FEATURE_FIELDS:
+        raise Stage7RunError("runner capability features differ")
+    if any(type(flag) is not bool for flag in features.values()):
+        raise Stage7RunError("runner capability features must be boolean")
+    required = (
+        {"full_artifacts", "physical_reports"}
+        if kind == "measurement"
+        else {"baselines", "refinements"}
+    )
+    if any(features[field] is not True for field in required):
+        raise Stage7RunError(
+            f"{kind} runner does not advertise required Stage-7 capabilities"
+        )
+    return value
 
 
 def canonical(value: Any) -> bytes:
@@ -367,6 +470,37 @@ def run(
             "Stage-7 prerequisites failed: " + ", ".join(prerequisite_reasons)
         )
     campaign_sha256 = digest(campaign_path)
+    capability_context = {
+        "campaign": campaign,
+        "campaign_sha256": campaign_sha256,
+        "model_root": model_root.resolve(strict=True),
+        "source_root": source_root,
+        "evidence_root": evidence_root,
+    }
+    measurement_capability_request = _capability_request(
+        kind="measurement", command=runner, **capability_context
+    )
+    _validate_capabilities(
+        _runner_response(
+            runner,
+            measurement_capability_request,
+            timeout_seconds=timeout_seconds,
+        ),
+        kind="measurement",
+        source_revision=campaign["source_revision"],
+    )
+    auxiliary_capability_request = _capability_request(
+        kind="auxiliary", command=auxiliary_runner, **capability_context
+    )
+    _validate_capabilities(
+        _runner_response(
+            auxiliary_runner,
+            auxiliary_capability_request,
+            timeout_seconds=timeout_seconds,
+        ),
+        kind="auxiliary",
+        source_revision=campaign["source_revision"],
+    )
     previous = sorted(grid)
     stages = []
     for name in ("one-layer", "four-layer", "full-model"):

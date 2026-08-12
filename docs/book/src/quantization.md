@@ -198,6 +198,15 @@ resumes completed work, and invokes the existing qualifier before publishing
 the trace. It never synthesizes metrics. A structural smoke or a missing real
 runner cannot satisfy Stage-7.
 
+Before candidate work, each runner must answer a capability preflight request
+(`tritium.stage7-capabilities-request.v1`) with a
+`tritium.stage7-capabilities.v1` declaration bound to the campaign source
+revision. The measurement runner must advertise all three stages, D2/B3/S34,
+G64/G128/G256, two/three planes, both rotations, all three curvature modes, all
+six solver variants, full artifacts, and physical reports. The auxiliary runner
+advertises only baseline/refinement features. Missing or stale capability
+declarations fail before any measurement cache is written.
+
 ## SALT V2 Qwen master campaigns
 
 The legacy `tritium quantize` command above is not the Qwen3.6-27B SALT V2
