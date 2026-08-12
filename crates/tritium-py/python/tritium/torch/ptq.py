@@ -40,7 +40,12 @@ from .module_artifacts import (
     module_recipe_id,
     seal_module_conversion,
 )
-from .projection import TernaryPlane, TernaryProjection, validate_projection
+from .projection import (
+    TernaryPlane,
+    TernaryProjection,
+    expand_plane_scales,
+    validate_projection,
+)
 
 if TYPE_CHECKING:
     from .qat import QatHardResult
@@ -2028,6 +2033,16 @@ def _collect_activations(
     )
 
 
+def _scale_group_size(columns: int) -> int:
+    """Choose SALT's canonical scale geometry for one matrix width."""
+
+    if columns % 128 == 0:
+        return 128
+    if columns % 64 == 0:
+        return 64
+    return columns
+
+
 def _diagonal_additive_projection(
     master: torch.Tensor, curvature: torch.Tensor, planes: int
 ) -> TernaryProjection:
@@ -2051,36 +2066,107 @@ def _diagonal_additive_projection(
         if float(mean) == 0.0
         else diagonal + mean * 1e-4
     )
-    residual = master_f64
-    decoded = torch.zeros_like(master_f64)
-    fitted_planes = []
+    group_size = _scale_group_size(master.shape[1])
+    groups = (master.shape[1] + group_size - 1) // group_size
+    grouped_master = master_f64.reshape(master.shape[0], groups, group_size)
+    grouped_diagonal = diagonal.reshape(groups, group_size)
+    trit_values = []
+    scale_values = []
+    residual = grouped_master
     for _ in range(planes):
-        initial_scale = (residual.abs() * diagonal).sum(dim=1, keepdim=True)
-        initial_scale = initial_scale / diagonal.sum().clamp_min(
+        initial_scale = (residual.abs() * grouped_diagonal).sum(dim=2)
+        initial_scale = initial_scale / grouped_diagonal.sum(dim=1).clamp_min(
             torch.finfo(torch.float64).tiny
         )
         nonzero_scale = initial_scale.clamp_min(torch.finfo(torch.float64).tiny)
-        trits = (residual / nonzero_scale).round().clamp(-1, 1).to(torch.int8)
+        trits = (
+            (residual / nonzero_scale.unsqueeze(-1))
+            .round()
+            .clamp(-1, 1)
+            .to(torch.int8)
+        )
         trits_f64 = trits.to(torch.float64)
-        denominator = (trits_f64.square() * diagonal).sum(dim=1, keepdim=True)
-        numerator = (residual * trits_f64 * diagonal).sum(dim=1, keepdim=True)
+        denominator = (trits_f64.square() * grouped_diagonal).sum(dim=2)
+        numerator = (residual * trits_f64 * grouped_diagonal).sum(dim=2)
         scale = torch.where(
             denominator > 0,
             numerator / denominator.clamp_min(torch.finfo(torch.float64).tiny),
             torch.zeros_like(numerator),
         ).clamp_min(0)
-        plane = TernaryPlane(
-            trits=trits,
-            scales=scale.to(torch.float16),
-            group_size=master.shape[1],
+        trit_values.append(trits)
+        stored_scale = (
+            scale.to(torch.float16).to(torch.float64)
+            if group_size == master.shape[1]
+            else scale
         )
-        fitted_planes.append(plane)
-        stored_scale_f64 = plane.scales.to(torch.float64)
-        decoded = decoded + trits_f64 * stored_scale_f64
-        residual = master_f64 - decoded
+        scale_values.append(stored_scale)
+        residual = residual - trits_f64 * stored_scale.unsqueeze(-1)
+
+    # Greedy residual fitting is deterministic and cheap, but coordinate
+    # refinement closes much of its additive-plane error without changing the
+    # export contract. Keep all updates in FP64; round to stored FP16 only at
+    # the final receipt boundary.
+    if group_size < master.shape[1]:
+        for _ in range(20):
+            for index in range(planes):
+                decoded_without = torch.zeros_like(grouped_master)
+                for other, (other_trits, other_scale) in enumerate(
+                    zip(trit_values, scale_values)
+                ):
+                    if other != index:
+                        decoded_without = (
+                            decoded_without
+                            + other_trits.to(torch.float64) * other_scale.unsqueeze(-1)
+                        )
+                residual_without = grouped_master - decoded_without
+                current_scale = scale_values[index].clamp_min(
+                    torch.finfo(torch.float64).tiny
+                )
+                trits = (
+                    (residual_without / current_scale.unsqueeze(-1))
+                    .round()
+                    .clamp(-1, 1)
+                    .to(torch.int8)
+                )
+                trits_f64 = trits.to(torch.float64)
+                denominator = (trits_f64.square() * grouped_diagonal).sum(dim=2)
+                numerator = (residual_without * trits_f64 * grouped_diagonal).sum(
+                    dim=2
+                )
+                scale = torch.where(
+                    denominator > 0,
+                    numerator
+                    / denominator.clamp_min(torch.finfo(torch.float64).tiny),
+                    torch.zeros_like(numerator),
+                ).clamp_min(0)
+                trit_values[index] = trits
+                scale_values[index] = scale
+
+    fitted_planes = [
+        TernaryPlane(
+            trits=trits.reshape_as(master),
+            scales=scale.to(torch.float16),
+            group_size=group_size,
+        )
+        for trits, scale in zip(trit_values, scale_values)
+    ]
+    decoded = torch.zeros_like(master_f64)
+    for plane in fitted_planes:
+        stored_scale_f64 = expand_plane_scales(
+            plane.scales,
+            rows=master.shape[0],
+            columns=master.shape[1],
+            group_size=group_size,
+        ).to(torch.float64)
+        decoded = decoded + plane.trits.to(torch.float64) * stored_scale_f64
     dense = torch.zeros_like(master, device="cpu")
     for plane in fitted_planes:
-        dense = dense + plane.trits.to(master.dtype) * plane.scales
+        dense = dense + plane.trits.to(master.dtype) * expand_plane_scales(
+            plane.scales,
+            rows=master.shape[0],
+            columns=master.shape[1],
+            group_size=plane.group_size,
+        ).to(master.dtype)
     projection = TernaryProjection(
         dense=dense,
         planes=tuple(fitted_planes),
@@ -2276,6 +2362,7 @@ def load_quantized_module(
     modules = dict(target.named_modules(remove_duplicate=False))
     owners = {}
     replacement_paths = {}
+    group_sizes = {}
     for reference in admitted.weights:
         fitted = admitted.weight(reference.path)
         packed_weight = None
@@ -2322,6 +2409,8 @@ def load_quantized_module(
                     packed_weight = AdditiveTernaryWeight(fitted.planes).to(
                         device=module.weight.device
                     )
+                    for alias in reference.aliases:
+                        group_sizes[alias] = packed_weight.group_size
                     owns_weight = True
                 else:
                     owns_weight = False
@@ -2377,6 +2466,7 @@ def load_quantized_module(
         root.config.tritium_ptq_artifact_id = admitted.artifact_id
         root.config.tritium_ptq_source_digest = admitted.source_model_digest
         root.config.tritium_ptq_checkpoint_digest = _source_model_digest(root)
+        root.config.tritium_ptq_group_sizes = dict(group_sizes)
     return root
 
 

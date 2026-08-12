@@ -12,6 +12,7 @@ from .torch.errors import TritiumError
 from .torch.estimators import AbsMeanSTE, Estimator, SaltSTE
 from .torch.ops import ternary_linear
 from .torch.projection import ProjectionContext, validate_projection
+from .torch.projection import expand_plane_scales
 
 _B3_MAX_VALID_BYTE = 3**5 - 1
 
@@ -95,13 +96,20 @@ class AdditiveTernaryWeight(nn.Module):
         if first.trits.ndim != 2:
             raise ValueError("additive ternary linear trits must be rank 2")
         self.out_features, self.in_features = map(int, first.trits.shape)
+        if type(first.group_size) is not int or first.group_size <= 0:
+            raise ValueError("additive ternary linear group size must be positive")
+        self.group_size = first.group_size
         self.weight_elements = self.out_features * self.in_features
         self.plane_count = len(planes)
         for index, plane in enumerate(planes):
+            expected_groups = (
+                self.in_features + self.group_size - 1
+            ) // self.group_size
             if (
                 tuple(plane.trits.shape) != (self.out_features, self.in_features)
-                or tuple(plane.scales.shape) != (self.out_features, 1)
-                or plane.group_size != self.in_features
+                or tuple(plane.scales.shape)
+                != (self.out_features, expected_groups)
+                or plane.group_size != self.group_size
             ):
                 raise ValueError("additive ternary linear plane geometry differs")
             trits = plane.trits.detach().to(dtype=torch.int8).contiguous()
@@ -128,6 +136,7 @@ class AdditiveTernaryWeight(nn.Module):
         planes: int,
         *,
         device=None,
+        group_size: int | None = None,
     ) -> "AdditiveTernaryWeight":
         """Build a metadata-only compact state shell."""
 
@@ -139,6 +148,10 @@ class AdditiveTernaryWeight(nn.Module):
         module.out_features = int(out_features)
         module.weight_elements = module.in_features * module.out_features
         module.plane_count = int(planes)
+        module.group_size = module.in_features if group_size is None else int(group_size)
+        if module.group_size <= 0 or module.in_features % module.group_size != 0:
+            raise ValueError("additive ternary linear group size is not aligned")
+        scale_groups = (module.in_features + module.group_size - 1) // module.group_size
         packed_elements = (module.weight_elements + 4) // 5
         for index in range(module.plane_count):
             module.register_buffer(
@@ -148,7 +161,9 @@ class AdditiveTernaryWeight(nn.Module):
             module.register_buffer(
                 f"scales_{index}",
                 torch.empty(
-                    (module.out_features, 1), dtype=torch.float16, device=device
+                    (module.out_features, scale_groups),
+                    dtype=torch.float16,
+                    device=device,
                 ),
             )
         module.training = False
@@ -178,7 +193,11 @@ class AdditiveTernaryWeight(nn.Module):
                 )
             if (
                 scales.dtype != torch.float16
-                or tuple(scales.shape) != (self.out_features, 1)
+                or tuple(scales.shape)
+                != (
+                    self.out_features,
+                    (self.in_features + self.group_size - 1) // self.group_size,
+                )
             ):
                 raise TritiumError(
                     "packed ternary scales have invalid geometry",
@@ -214,6 +233,12 @@ class AdditiveTernaryWeight(nn.Module):
                 self.out_features, self.in_features
             ).to(dtype=dtype)
             scales = getattr(self, f"scales_{index}").to(dtype=dtype)
+            scales = expand_plane_scales(
+                scales,
+                rows=self.out_features,
+                columns=self.in_features,
+                group_size=self.group_size,
+            )
             plane = trits * scales
             output = plane if output is None else output + plane
         return output
@@ -332,10 +357,15 @@ class AdditiveTernaryLinear(_AdditiveTernaryConsumer):
         dtype=None,
         packed_weight: AdditiveTernaryWeight | None = None,
         owner: bool = True,
+        group_size: int | None = None,
     ) -> "AdditiveTernaryLinear":
         if packed_weight is None:
             packed_weight = AdditiveTernaryWeight.empty(
-                in_features, out_features, planes, device=device
+                in_features,
+                out_features,
+                planes,
+                device=device,
+                group_size=group_size,
             )
         elif (packed_weight.in_features, packed_weight.out_features) != (
             in_features,
@@ -410,10 +440,15 @@ class AdditiveTernaryEmbedding(_AdditiveTernaryConsumer):
         dtype: torch.dtype = torch.float32,
         packed_weight: AdditiveTernaryWeight | None = None,
         owner: bool = True,
+        group_size: int | None = None,
     ) -> "AdditiveTernaryEmbedding":
         if packed_weight is None:
             packed_weight = AdditiveTernaryWeight.empty(
-                embedding_dim, num_embeddings, planes, device=device
+                embedding_dim,
+                num_embeddings,
+                planes,
+                device=device,
+                group_size=group_size,
             )
         elif (packed_weight.out_features, packed_weight.in_features) != (
             num_embeddings,

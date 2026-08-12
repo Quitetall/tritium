@@ -394,10 +394,13 @@ def _load_weight_receipt(
                 type(dimension) is not int or dimension <= 0
                 for dimension in scales_shape
             )
-            or scales_shape != [shape[0], 1]
-            or plane["scales_bytes"] != math.prod(scales_shape) * 2
             or type(plane["group_size"]) is not int
-            or plane["group_size"] != shape[1]
+            or plane["group_size"] <= 0
+            or plane["group_size"] not in {shape[1], 64, 128}
+            or shape[1] % plane["group_size"] != 0
+            or scales_shape
+            != [shape[0], (shape[1] + plane["group_size"] - 1) // plane["group_size"]]
+            or plane["scales_bytes"] != math.prod(scales_shape) * 2
         ):
             raise ValueError("conversion plane byte ledger or geometry is invalid")
         trits_digest, trits_bytes = _digest_file(
@@ -600,6 +603,14 @@ class WeightCheckpointWriter:
         self.plane_count = plane_count
         self.fit_chunk_rows = fit_chunk_rows
         self.max_working_bytes = max_working_bytes
+        self.scale_group_size = (
+            128 if self.shape[1] % 128 == 0
+            else 64 if self.shape[1] % 64 == 0
+            else self.shape[1]
+        )
+        self.scale_groups = (
+            self.shape[1] + self.scale_group_size - 1
+        ) // self.scale_group_size
         self.rows_written = 0
         self._files = []
         self._digests = []
@@ -627,8 +638,8 @@ class WeightCheckpointWriter:
         for plane_index, plane in enumerate(planes):
             if (
                 tuple(plane.trits.shape) != (chunk_rows, self.shape[1])
-                or tuple(plane.scales.shape) != (chunk_rows, 1)
-                or plane.group_size != self.shape[1]
+                or tuple(plane.scales.shape) != (chunk_rows, self.scale_groups)
+                or plane.group_size != self.scale_group_size
             ):
                 raise ValueError("fit chunk plane geometry differs from weight")
             trits = plane.trits.detach().to(torch.int8).cpu().contiguous()
@@ -670,8 +681,8 @@ class WeightCheckpointWriter:
                     scales_path=self._final_paths[scales_slot],
                     scales_digest="sha256:" + self._digests[scales_slot].hexdigest(),
                     scales_bytes=self._bytes[scales_slot],
-                    scales_shape=(self.shape[0], 1),
-                    group_size=self.shape[1],
+                    scales_shape=(self.shape[0], self.scale_groups),
+                    group_size=self.scale_group_size,
                 )
             )
         return FittedWeightRef(

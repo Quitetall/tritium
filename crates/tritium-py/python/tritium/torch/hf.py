@@ -180,11 +180,29 @@ def _prepare_ptq_inference_shell(model, recipe: TernaryConfig):
             owns_weight = packed_weight is None
             if packed_weight is None:
                 rows, columns = map(int, module.weight.shape)
+                group_sizes = getattr(model.config, "tritium_ptq_group_sizes", {})
+                if not isinstance(group_sizes, dict):
+                    raise TritiumError(
+                        "Hugging Face PTQ group-size map is malformed",
+                        code="state_geometry",
+                        stage="load",
+                    )
+                group_size = group_sizes.get(weight_key, group_sizes.get(weight_path))
+                if group_size is not None and (
+                    type(group_size) is not int or group_size <= 0 or columns % group_size
+                ):
+                    raise TritiumError(
+                        "Hugging Face PTQ group-size map is not aligned",
+                        code="state_geometry",
+                        stage="load",
+                        module=path,
+                    )
                 packed_weight = AdditiveTernaryWeight.empty(
                     columns,
                     rows,
                     recipe.planes,
                     device=module.weight.device,
+                    group_size=group_size,
                 )
                 packed_weights[weight_key] = packed_weight
             if type(module) is nn.Linear:

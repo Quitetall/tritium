@@ -10,6 +10,19 @@ import torch
 from .errors import TritiumError
 
 
+def expand_plane_scales(
+    scales: torch.Tensor, *, rows: int, columns: int, group_size: int
+) -> torch.Tensor:
+    """Expand per-group scales to coefficient geometry without a dense shadow."""
+
+    if type(group_size) is not int or group_size <= 0:
+        raise ValueError("plane group_size must be a positive integer")
+    groups = (columns + group_size - 1) // group_size
+    if tuple(scales.shape) != (rows, groups):
+        raise ValueError("plane scales shape does not match group geometry")
+    return scales.repeat_interleave(group_size, dim=1)[..., :columns]
+
+
 @dataclass(frozen=True)
 class ProjectionContext:
     """Deterministic inputs that may affect a ternary projection."""
@@ -182,10 +195,16 @@ def validate_projection(
                 details={"plane": index},
             )
         try:
-            decoded = decoded + plane.trits.to(master.dtype) * plane.scales.to(
+            expanded_scales = expand_plane_scales(
+                plane.scales,
+                rows=master.shape[0],
+                columns=master.shape[1],
+                group_size=plane.group_size,
+            )
+            decoded = decoded + plane.trits.to(master.dtype) * expanded_scales.to(
                 master.dtype
             )
-        except RuntimeError as error:
+        except (RuntimeError, ValueError) as error:
             raise TritiumError(
                 "projection scales are not broadcastable over trits",
                 code="estimator_contract",

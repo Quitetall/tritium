@@ -32,6 +32,9 @@ def test_module_conversion_streams_strict_native_salt_package(tmp_path):
         evidence_dir=tmp_path / "evidence",
     )
     converted = convert(prepared, calibration, work_dir=tmp_path / "work")
+    fitted = converted.weight("weight")
+    assert fitted.planes[0].group_size == 128
+    assert fitted.planes[0].scales.shape == (3, 3)
     packed = converted.pack_native(tmp_path / "packed", packing="b3")
 
     assert packed.conversion_artifact_id == converted.artifact_id

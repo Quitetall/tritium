@@ -114,7 +114,8 @@ struct AdmittedWeight {
     aliases: Vec<String>,
     rows: usize,
     columns: usize,
-    scale_group_size: usize,
+    source_scale_group_size: usize,
+    package_scale_group_size: usize,
     planes: Vec<AdmittedPlane>,
 }
 
@@ -283,7 +284,7 @@ fn pack(
                 weight.name.clone(),
                 vec![weight.rows as u64, weight.columns as u64],
                 SaltV2Transform::None,
-                weight.scale_group_size,
+                weight.package_scale_group_size,
             )
             .map_err(|error| error.to_string())
         })
@@ -386,7 +387,7 @@ fn admit_weight(
         .map_err(|_| "conversion row count exceeds platform".to_owned())?;
     let columns = usize::try_from(receipt.shape[1])
         .map_err(|_| "conversion column count exceeds platform".to_owned())?;
-    let scale_group_size = if columns.is_multiple_of(SALT_V2_SCALE_GROUP_SIZE) {
+    let package_scale_group_size = if columns.is_multiple_of(SALT_V2_SCALE_GROUP_SIZE) {
         SALT_V2_SCALE_GROUP_SIZE
     } else if columns.is_multiple_of(SALT_V2_SCALE_GROUP_SIZE_64) {
         SALT_V2_SCALE_GROUP_SIZE_64
@@ -396,6 +397,23 @@ fn admit_weight(
             receipt.path, columns
         ));
     };
+    let source_scale_group_size = receipt
+        .planes
+        .first()
+        .map(|plane| plane.group_size)
+        .ok_or_else(|| "conversion weight has no planes".to_owned())?;
+    let source_scale_group_size = usize::try_from(source_scale_group_size)
+        .map_err(|_| "conversion scale group size exceeds platform".to_owned())?;
+    if source_scale_group_size != columns
+        && source_scale_group_size != SALT_V2_SCALE_GROUP_SIZE
+        && source_scale_group_size != SALT_V2_SCALE_GROUP_SIZE_64
+    {
+        return Err("conversion scale group size is unsupported".to_owned());
+    }
+    if !columns.is_multiple_of(source_scale_group_size) {
+        return Err("conversion scale group size is not aligned".to_owned());
+    }
+    let source_scale_groups = columns / source_scale_group_size;
     let elements = rows
         .checked_mul(columns)
         .ok_or_else(|| "conversion weight geometry overflowed".to_owned())?;
@@ -407,9 +425,9 @@ fn admit_weight(
         if plane.trits_file != trits_name
             || plane.scales_file != scales_name
             || plane.trits_bytes != elements as u64
-            || plane.scales_bytes != rows as u64 * 2
-            || plane.scales_shape != [rows as u64, 1]
-            || plane.group_size != columns as u64
+            || plane.scales_bytes != rows as u64 * source_scale_groups as u64 * 2
+            || plane.scales_shape != [rows as u64, source_scale_groups as u64]
+            || plane.group_size != source_scale_group_size as u64
         {
             return Err("conversion plane geometry or byte ledger is invalid".to_owned());
         }
@@ -445,7 +463,8 @@ fn admit_weight(
             aliases: receipt.aliases,
             rows,
             columns,
-            scale_group_size,
+            source_scale_group_size,
+            package_scale_group_size,
             planes,
         },
         files,
@@ -655,14 +674,18 @@ fn read_source_plane(
         .read_exact(&mut trits)
         .map_err(|error| format!("read conversion trits failed: {:?}", error.kind()))?;
     let trits = trits.into_iter().map(|value| value as i8).collect();
-    let groups = logical_len.div_ceil(weight.scale_group_size);
+    let groups = logical_len.div_ceil(weight.package_scale_group_size);
     let mut scales = Vec::with_capacity(groups);
     for group in 0..groups {
-        let coefficient = start + group * weight.scale_group_size;
+        let coefficient = start + group * weight.package_scale_group_size;
         let row = coefficient / weight.columns;
+        let column = coefficient % weight.columns;
+        let source_group = column / weight.source_scale_group_size;
+        let source_groups = weight.columns / weight.source_scale_group_size;
+        let source_scale_index = row * source_groups + source_group;
         plane
             .scales
-            .seek(SeekFrom::Start((row * 2) as u64))
+            .seek(SeekFrom::Start((source_scale_index * 2) as u64))
             .map_err(|error| format!("seek conversion scales failed: {:?}", error.kind()))?;
         let mut bits = [0u8; 2];
         plane
@@ -671,7 +694,7 @@ fn read_source_plane(
             .map_err(|error| format!("read conversion scales failed: {:?}", error.kind()))?;
         scales.push(f16::from_bits(u16::from_le_bytes(bits)));
     }
-    SaltV2Plane::new_with_scale_group_size(trits, scales, weight.scale_group_size)
+    SaltV2Plane::new_with_scale_group_size(trits, scales, weight.package_scale_group_size)
         .map_err(|error| error.to_string())
 }
 
