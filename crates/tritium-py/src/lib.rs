@@ -456,6 +456,8 @@ fn _tritium(m: &Bound<'_, PyModule>) -> PyResult<()> {
     }
     m.add_class::<salt::Qwen36PtqMasterReceipt>()?;
     m.add_class::<salt::Qwen36PtqPackageReceipt>()?;
+    m.add_class::<salt::Qwen36SourceAdmissionReceipt>()?;
+    m.add_function(wrap_pyfunction!(salt::admit_qwen36_source, m)?)?;
     m.add_function(wrap_pyfunction!(salt::reconcile_qwen36_ptq_masters, m)?)?;
     #[cfg(unix)]
     m.add_function(wrap_pyfunction!(salt::reconcile_qwen36_ptq_packages, m)?)?;

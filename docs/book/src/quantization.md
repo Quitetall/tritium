@@ -212,8 +212,25 @@ declarations fail before any measurement cache is written.
 ## SALT V2 Qwen master campaigns
 
 The legacy `tritium quantize` command above is not the Qwen3.6-27B SALT V2
-campaign path. Advanced users with a fully collected canonical `S2KF` evidence
-directory can resume the rate-free master stage directly from Python:
+campaign path. Admit the pinned source first to persist its content-bound
+language/MTP/vision coverage proof:
+
+```python
+from tritium.salt import admit_qwen36_source
+
+source = admit_qwen36_source(
+    "/models/Qwen3.6-27B",
+    revision="6a9e13bd6fc8f0983b9b99948120bc37f49c13e9",
+    work_dir="./tritium-work",
+)
+print(source.source_model_id, source.additive_tensors, source.mtp_tensors)
+```
+
+Source admission performs no calibration, fitting, packaging, or quality
+claim. `identity_status` remains candidate-only until official payload
+authentication is independently registered. Advanced users with a fully
+collected canonical `S2KF` evidence directory can then resume the rate-free
+master stage directly from Python:
 
 ```python
 from tritium.salt import reconcile_qwen36_ptq_masters

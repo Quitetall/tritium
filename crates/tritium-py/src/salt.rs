@@ -32,6 +32,195 @@ const BUNDLE_MANIFEST_FILE: &str = "tritium.json";
 const MAX_SAFETENSORS_HEADER_BYTES: u64 = 1024 * 1024;
 static STAGING_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Immutable receipt for source admission before calibration evidence exists.
+///
+/// This boundary lets callers inspect the exact language/MTP/vision coverage
+/// and persist the candidate proof without pretending that PTQ evidence or an
+/// official payload authentication already exists.
+#[pyclass(frozen, module = "tritium._tritium", skip_from_py_object)]
+#[derive(Clone, Debug)]
+pub(crate) struct Qwen36SourceAdmissionReceipt {
+    proof_id: String,
+    manifest_content_id: String,
+    source_model_id: String,
+    repository: String,
+    revision: String,
+    identity_status: String,
+    official_payload_authenticated: bool,
+    proof_bytes: u64,
+    payload_bytes: u64,
+    work_dir: String,
+    proof_path: String,
+    total_tensors: u64,
+    total_coefficients: u64,
+    language_tensors: u64,
+    language_coefficients: u64,
+    mtp_tensors: u64,
+    mtp_coefficients: u64,
+    vision_tensors: u64,
+    vision_coefficients: u64,
+    additive_tensors: u64,
+    additive_coefficients: u64,
+    preserved_tensors: u64,
+    preserved_coefficients: u64,
+    excluded_vision_tensors: u64,
+    excluded_vision_coefficients: u64,
+}
+
+impl Qwen36SourceAdmissionReceipt {
+    fn from_native(admitted: &Qwen36AdmittedSource) -> Self {
+        let preflight = admitted.preflight();
+        let receipt = admitted.receipt();
+        let coverage = preflight.receipt().coverage();
+        let total = coverage.total();
+        let language = coverage.language();
+        let mtp = coverage.mtp();
+        let vision = coverage.vision();
+        let additive = coverage.additive_ternary();
+        let preserved = coverage.preserve_source();
+        let excluded_vision = coverage.excluded_future_vision();
+        let identity_status = receipt.identity_status();
+        Self {
+            proof_id: receipt.proof_id().to_string(),
+            manifest_content_id: receipt.manifest_content_id().to_string(),
+            source_model_id: hex_digest(receipt.source_model_id().as_bytes()),
+            repository: tritium_nn::QWEN36_27B_REPOSITORY.to_owned(),
+            revision: tritium_nn::QWEN36_27B_REVISION.to_owned(),
+            identity_status: identity_status.as_str().to_owned(),
+            official_payload_authenticated: identity_status.official_payload_authenticated(),
+            proof_bytes: receipt.proof_bytes(),
+            payload_bytes: preflight.receipt().payload_bytes(),
+            work_dir: admitted.work_dir().to_string_lossy().into_owned(),
+            proof_path: admitted.proof_path().to_string_lossy().into_owned(),
+            total_tensors: total.tensors(),
+            total_coefficients: total.coefficients(),
+            language_tensors: language.tensors(),
+            language_coefficients: language.coefficients(),
+            mtp_tensors: mtp.tensors(),
+            mtp_coefficients: mtp.coefficients(),
+            vision_tensors: vision.tensors(),
+            vision_coefficients: vision.coefficients(),
+            additive_tensors: additive.tensors(),
+            additive_coefficients: additive.coefficients(),
+            preserved_tensors: preserved.tensors(),
+            preserved_coefficients: preserved.coefficients(),
+            excluded_vision_tensors: excluded_vision.tensors(),
+            excluded_vision_coefficients: excluded_vision.coefficients(),
+        }
+    }
+}
+
+#[pymethods]
+impl Qwen36SourceAdmissionReceipt {
+    #[getter]
+    fn proof_id(&self) -> &str {
+        &self.proof_id
+    }
+    #[getter]
+    fn manifest_content_id(&self) -> &str {
+        &self.manifest_content_id
+    }
+    #[getter]
+    fn source_model_id(&self) -> &str {
+        &self.source_model_id
+    }
+    #[getter]
+    fn repository(&self) -> &str {
+        &self.repository
+    }
+    #[getter]
+    fn revision(&self) -> &str {
+        &self.revision
+    }
+    #[getter]
+    fn identity_status(&self) -> &str {
+        &self.identity_status
+    }
+    #[getter]
+    fn official_payload_authenticated(&self) -> bool {
+        self.official_payload_authenticated
+    }
+    #[getter]
+    fn proof_bytes(&self) -> u64 {
+        self.proof_bytes
+    }
+    #[getter]
+    fn payload_bytes(&self) -> u64 {
+        self.payload_bytes
+    }
+    #[getter]
+    fn work_dir(&self) -> &str {
+        &self.work_dir
+    }
+    #[getter]
+    fn proof_path(&self) -> &str {
+        &self.proof_path
+    }
+    #[getter]
+    fn total_tensors(&self) -> u64 {
+        self.total_tensors
+    }
+    #[getter]
+    fn total_coefficients(&self) -> u64 {
+        self.total_coefficients
+    }
+    #[getter]
+    fn language_tensors(&self) -> u64 {
+        self.language_tensors
+    }
+    #[getter]
+    fn language_coefficients(&self) -> u64 {
+        self.language_coefficients
+    }
+    #[getter]
+    fn mtp_tensors(&self) -> u64 {
+        self.mtp_tensors
+    }
+    #[getter]
+    fn mtp_coefficients(&self) -> u64 {
+        self.mtp_coefficients
+    }
+    #[getter]
+    fn vision_tensors(&self) -> u64 {
+        self.vision_tensors
+    }
+    #[getter]
+    fn vision_coefficients(&self) -> u64 {
+        self.vision_coefficients
+    }
+    #[getter]
+    fn additive_tensors(&self) -> u64 {
+        self.additive_tensors
+    }
+    #[getter]
+    fn additive_coefficients(&self) -> u64 {
+        self.additive_coefficients
+    }
+    #[getter]
+    fn preserved_tensors(&self) -> u64 {
+        self.preserved_tensors
+    }
+    #[getter]
+    fn preserved_coefficients(&self) -> u64 {
+        self.preserved_coefficients
+    }
+    #[getter]
+    fn excluded_vision_tensors(&self) -> u64 {
+        self.excluded_vision_tensors
+    }
+    #[getter]
+    fn excluded_vision_coefficients(&self) -> u64 {
+        self.excluded_vision_coefficients
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "Qwen36SourceAdmissionReceipt(source_model_id='{}', additive_tensors={}, mtp_tensors={})",
+            self.source_model_id, self.additive_tensors, self.mtp_tensors
+        )
+    }
+}
+
 /// Immutable receipt for one sealed Qwen3.6 rate-free PTQ master campaign.
 ///
 /// This is not a deployable model receipt: physical profile allocation, final
@@ -397,6 +586,45 @@ impl Qwen36PtqPackageReceipt {
             self.artifact_dir, self.admission_id
         )
     }
+}
+
+/// Admit the pinned Qwen3.6 source and persist its content-bound coverage proof.
+///
+/// This is intentionally separate from calibration and fitting. It proves the
+/// local checkpoint's semantic inventory and language/MTP conversion policy,
+/// while retaining the explicit candidate-only authentication status.
+#[pyfunction]
+#[pyo3(signature = (model_dir, declared_revision, work_dir))]
+pub(crate) fn admit_qwen36_source(
+    py: Python<'_>,
+    model_dir: &str,
+    declared_revision: &str,
+    work_dir: &str,
+) -> PyResult<Qwen36SourceAdmissionReceipt> {
+    for (field, value) in [
+        ("model_dir", model_dir),
+        ("declared_revision", declared_revision),
+        ("work_dir", work_dir),
+    ] {
+        if value.is_empty() {
+            return Err(PyValueError::new_err(format!("{field} must not be empty")));
+        }
+    }
+    if declared_revision != tritium_nn::QWEN36_27B_REVISION {
+        return Err(PyValueError::new_err(format!(
+            "declared_revision must equal the pinned Qwen3.6 revision {}",
+            tritium_nn::QWEN36_27B_REVISION
+        )));
+    }
+    let model_dir = PathBuf::from(model_dir);
+    let declared_revision = declared_revision.to_owned();
+    let work_dir = PathBuf::from(work_dir);
+    py.detach(move || {
+        Qwen36AdmittedSource::open(&model_dir, &declared_revision, &work_dir)
+            .map(|admitted| Qwen36SourceAdmissionReceipt::from_native(&admitted))
+            .map_err(|error| error.to_string())
+    })
+    .map_err(PyRuntimeError::new_err)
 }
 
 /// Reconcile the pinned Qwen3.6 checkpoint into a sealed rate-free PTQ master campaign.

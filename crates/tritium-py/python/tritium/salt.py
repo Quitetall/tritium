@@ -12,6 +12,8 @@ from typing import Union
 from ._tritium import (
     Qwen36PtqMasterReceipt,
     Qwen36PtqPackageReceipt,
+    Qwen36SourceAdmissionReceipt,
+    admit_qwen36_source as _admit_qwen36_source,
     reconcile_qwen36_ptq_masters as _reconcile_qwen36_ptq_masters,
 )
 
@@ -23,6 +25,22 @@ except ImportError:  # non-unix wheels omit the native symbol (unix-only staging
     _reconcile_qwen36_ptq_packages = None
 
 Pathish = Union[str, PathLike[str]]
+
+
+def admit_qwen36_source(
+    model_dir: Pathish,
+    *,
+    revision: str,
+    work_dir: Pathish,
+) -> Qwen36SourceAdmissionReceipt:
+    """Admit pinned Qwen3.6 source and persist language/MTP coverage proof.
+
+    This stage performs no calibration or fitting. It returns candidate-only
+    source identity until official payload authentication is independently
+    registered.
+    """
+
+    return _admit_qwen36_source(str(model_dir), revision, str(work_dir))
 
 
 def reconcile_qwen36_ptq_masters(
@@ -100,8 +118,10 @@ def reconcile_qwen36_ptq_packages(
 
 
 __all__ = [
+    "Qwen36SourceAdmissionReceipt",
     "Qwen36PtqMasterReceipt",
     "Qwen36PtqPackageReceipt",
+    "admit_qwen36_source",
     "reconcile_qwen36_ptq_masters",
     "reconcile_qwen36_ptq_packages",
 ]
