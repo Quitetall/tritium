@@ -1,7 +1,7 @@
 {
   "schema": "tritium.compatibility-receipt.v1",
   "target_id": "node-22",
-  "source_revision": "867115f39456e96127b7746122bdfb80b4d395cc",
+  "source_revision": "9195107acc25da1f97c29091c8360b660c5cfacb",
   "passed": true,
   "install_smoke": true,
   "host_os": "linux",
@@ -12,13 +12,13 @@
   },
   "package": "@tritium-ai/web@1.1.0-rc.1",
   "archive": "tritium-ai-web-1.1.0-rc.1.tgz",
-  "archive_sha256": "e5a8331419b0a9404d1d939348c044b4ff606ffd6824ed508628ca6e5febe85b",
+  "archive_sha256": "a0ef6bce33d7941218d6708474ad345843cd276d1bdfca81e707b4cd59f39a8e",
   "archive_bytes": 637039,
   "entry_count": 16,
   "source_free": true,
   "installed_offline": true,
   "strict_typescript": true,
-  "wasm_build_id": "tritium-wasm@1.1.0-rc.1+source-git:867115f39456e96127b7746122bdfb80b4d395cc",
-  "wasm_guest_digest": "353fb4a91261695b9581c896902e1fc49ce2e2a2aea0d737b2bcbc6007393fdd",
-  "upstream_receipt_id": "sha256:e4c08974f397f45047395c2bc87c4cd5f378fec5d59d6ced0cf1f3bac4866f44"
+  "wasm_build_id": "tritium-wasm@1.1.0-rc.1+source-git:9195107acc25da1f97c29091c8360b660c5cfacb",
+  "wasm_guest_digest": "6a657771d98defbca0f3aee3d308c9bbe7151ee23eaa7136bd5366bad51b2f47",
+  "upstream_receipt_id": "sha256:9ba4f641509111e4a5c47ca930c2147c58c3439ab5d39c75ff1e3c49d2799bb2"
 }
