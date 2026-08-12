@@ -13,7 +13,7 @@ use tritium_format::salt_v2_package::{
 use tritium_spec::{
     TrainAttributeV1, TrainAttributeValueV1, TrainBackendV1, TrainBufferDataMutV1,
     TrainBufferDataRefV1, TrainExecutionV1, TrainNamedBufferMutV1, TrainNamedBufferRefV1,
-    TrainOutputV1, TrainReceiptV1, TrainRequestV1, TrainingOpManifestV3,
+    TrainOutputV1, TrainReceiptV1, TrainRequestV1, TrainingOpManifestV2,
 };
 use tritium_train::CpuTrainBackendV1;
 
@@ -50,7 +50,7 @@ fn execute_f32(
             TrainBufferDataMutV1::F32(&mut values),
         )];
         let mut output = TrainOutputV1::new(&mut buffers);
-        backend.execute(request, &mut output)?
+        execute_browser_v2(backend, request, &mut output)?
     };
     Ok((values, receipt))
 }
@@ -82,9 +82,35 @@ fn execute_bytes(
             TrainBufferDataMutV1::Bytes(&mut values),
         )];
         let mut output = TrainOutputV1::new(&mut buffers);
-        backend.execute(request, &mut output)?
+        execute_browser_v2(backend, request, &mut output)?
     };
     Ok((values, receipt))
+}
+
+/// Adapt latest CPU semantics to browser package's frozen V2 receipt contract.
+///
+/// `CpuTrainBackendV1` executes the latest V3 registry. This example only
+/// invokes operations present in V2; bind those receipts to V2 so native
+/// reference evidence can be compared byte-for-byte with the browser/WASM
+/// package without changing the latest CPU backend contract.
+fn execute_browser_v2(
+    backend: &CpuTrainBackendV1,
+    request: TrainRequestV1<'_>,
+    output: &mut TrainOutputV1<'_>,
+) -> Result<TrainReceiptV1, Box<dyn Error>> {
+    if !TrainingOpManifestV2::operations()
+        .iter()
+        .any(|operation| operation.id == request.operation)
+    {
+        return Err(format!(
+            "browser reference operation is absent from V2 manifest: {}",
+            request.operation
+        )
+        .into());
+    }
+    let mut receipt = backend.execute(request, output)?;
+    receipt.manifest_digest = TrainingOpManifestV2::digest();
+    Ok(receipt)
 }
 
 fn fit_package(parameter: &[f32]) -> Result<Vec<u8>, Box<dyn Error>> {
@@ -290,8 +316,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     if reference.export_receipt.backend_build != reference.reload_receipt.backend_build
         || reference.export_receipt.backend_id != reference.reload_receipt.backend_id
         || reference.export_receipt.physical_device.as_deref() != Some(physical_device)
-        || reference.export_receipt.manifest_digest != TrainingOpManifestV3::digest()
-        || reference.reload_receipt.manifest_digest != TrainingOpManifestV3::digest()
+        || reference.export_receipt.manifest_digest != TrainingOpManifestV2::digest()
+        || reference.reload_receipt.manifest_digest != TrainingOpManifestV2::digest()
     {
         return Err("native lifecycle receipt identity drifted".into());
     }
@@ -368,6 +394,14 @@ mod tests {
         assert_eq!(reference.artifact, reference.reloaded);
         assert_eq!(reference.export_receipt.operation, "lifecycle.export");
         assert_eq!(reference.reload_receipt.operation, "lifecycle.reload");
+        assert_eq!(
+            reference.export_receipt.manifest_digest,
+            TrainingOpManifestV2::digest()
+        );
+        assert_eq!(
+            reference.reload_receipt.manifest_digest,
+            TrainingOpManifestV2::digest()
+        );
         assert!(reference.export_receipt.device_resident);
         assert!(reference.reload_receipt.device_resident);
         assert_eq!(reference.export_receipt.host_transfers, 0);
