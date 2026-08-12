@@ -128,6 +128,23 @@ def test_model_aware_capture_publishes_all_estimators(tmp_path, curvature):
     assert all(parameter.grad is None for parameter in model.parameters())
 
 
+@pytest.mark.parametrize("curvature", ["input-hessian", "forward-kl-kronecker"])
+def test_model_aware_capture_rejects_nonfinite_calibration_values(tmp_path, curvature):
+    model = _TinyObjectiveModel()
+    writer = _writer(tmp_path, curvature)
+    batch = {"values": torch.full((1, 2, 128), float("nan"))}
+    with pytest.raises(ValueError, match="finite"):
+        capture_kronecker_module(
+            model,
+            [batch],
+            module="proj",
+            writer=writer,
+            curvature=curvature,
+            guided_loss_reduction=None,
+        )
+    assert not writer.active
+
+
 def test_capture_can_execute_containing_oracle_model(tmp_path):
     selected = _TinyObjectiveModel().train()
 

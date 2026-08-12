@@ -215,6 +215,7 @@ class KroneckerCalibrationWriter:
             raise ValueError(
                 f"activations last dimension must be {self._columns}, got {activations.shape[-1]}"
             )
+        _require_finite_tensor(activations, "calibration activations")
         sample_shape = tuple(activations.shape[:-1])
         samples = activations.numel() // self._columns
         required_bytes = activations.numel() * 4
@@ -228,6 +229,7 @@ class KroneckerCalibrationWriter:
                 raise ValueError(
                     f"output_factors must have shape {sample_shape + (self._rows,)}"
                 )
+            _require_finite_tensor(output_factors, "calibration output factors")
             required_bytes += output_factors.numel() * 4
         if token_weights is not None:
             if (
@@ -235,6 +237,7 @@ class KroneckerCalibrationWriter:
                 or tuple(token_weights.shape) != sample_shape
             ):
                 raise ValueError(f"token_weights must have shape {sample_shape}")
+            _require_finite_tensor(token_weights, "calibration token weights")
             required_bytes += token_weights.numel() * 8
         if token_mask is not None:
             if (
@@ -315,11 +318,15 @@ class KroneckerCalibrationWriter:
             or tuple(output_factors.shape) != sample_shape
         ):
             raise ValueError(f"output_factors must have shape {sample_shape}")
+        if output_factors is not None:
+            _require_finite_tensor(output_factors, "calibration output factors")
         if token_weights is not None and (
             not isinstance(token_weights, torch.Tensor)
             or tuple(token_weights.shape) != sample_shape
         ):
             raise ValueError(f"token_weights must have shape {sample_shape}")
+        if token_weights is not None:
+            _require_finite_tensor(token_weights, "calibration token weights")
         if token_mask is not None and (
             not isinstance(token_mask, torch.Tensor)
             or tuple(token_mask.shape) != sample_shape
@@ -438,6 +445,17 @@ def _capture_output_tensor(output: Any, field: str) -> torch.Tensor:
     return value
 
 
+def _require_finite_tensor(value: torch.Tensor, label: str) -> None:
+    """Reject non-finite calibration values before native evidence mutation."""
+
+    if not isinstance(value, torch.Tensor):
+        raise TypeError(f"{label} must be a tensor")
+    if (value.is_floating_point() or value.is_complex()) and not bool(
+        torch.isfinite(value).all()
+    ):
+        raise ValueError(f"{label} must contain only finite values")
+
+
 def _capture_token_mask(
     mask: Optional[torch.Tensor], sample_shape: Tuple[int, ...]
 ) -> Optional[torch.Tensor]:
@@ -473,6 +491,7 @@ def _forward_kl_factors(
 ) -> torch.Tensor:
     if logits.ndim < 2 or logits.shape[-1] < 2:
         raise ValueError("forward-KL logits must have a nontrivial vocabulary dimension")
+    _require_finite_tensor(logits, "forward-KL logits")
     elements = logits.numel()
     samples = elements // logits.shape[-1]
     vocabulary = logits.shape[-1]
