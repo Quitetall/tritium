@@ -31,7 +31,7 @@ tritium-cuda = { workspace = true, optional = true }
 # Used by the low-level `ternary_matmul` helper to express problem geometry.
 tritium-core = { workspace = true }
 tritium-format = { workspace = true }
-tritium-onnx = { workspace = true, features = ["qwen-package", "onnx"] }
+tritium-onnx = { workspace = true, optional = true, features = ["qwen-package", "onnx"] }
 # The autograd tape ops (ternary Conv1d, FSQ, STE) exposed to PyTorch via `src/ops.rs` (ADR 0030).
 tritium-train = { workspace = true }
 # Production SALT V2 evidence and resumable Qwen master-campaign orchestration.
@@ -42,7 +42,7 @@ serde = { workspace = true }
 sha2 = { workspace = true }
 blake3 = { workspace = true }
 half = { workspace = true }
-ort = { workspace = true }
+ort = { workspace = true, optional = true }
 # `abi3-py39`: build one wheel that works on CPython 3.9+ (forward-compatible).
 pyo3 = { workspace = true, features = ["abi3-py39"] }
 dlpark = { workspace = true }
@@ -57,6 +57,7 @@ rustix = { version = "1", features = ["fs"] }
 [features]
 default = []
 extension-module = ["pyo3/extension-module"]
+onnx = ["dep:ort", "dep:tritium-onnx"]
 cuda = ["dep:tritium-cuda", "tritium-cuda/cuda", "tritium-nn/cuda"]
 
 [lints]

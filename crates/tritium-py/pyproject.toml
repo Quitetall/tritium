@@ -28,7 +28,7 @@ Repository = "https://github.com/Quitetall/tritium"
 manifest-path = "Cargo.toml"
 module-name = "tritium._tritium"
 python-source = "python"
-features = ["extension-module"]
+features = ["extension-module", "onnx"]
 # Mixed-layout builds copy the Python tree verbatim. Exclude interpreter caches
 # explicitly so a local test run cannot contaminate a release wheel.
 exclude = ["**/__pycache__/**", "**/*.pyc"]

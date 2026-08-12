@@ -37,6 +37,7 @@
 mod hf_assets;
 mod kronecker;
 mod module_package;
+#[cfg(feature = "onnx")]
 mod onnx;
 mod ops;
 mod qwen;
@@ -59,7 +60,7 @@ use tritium_spec::TernaryBackend;
 // runtime takes the fully thread-safe path when libc lacks that symbol. Zero
 // is also glibc's post-thread-creation value, so this never enables an unsafe
 // single-thread optimization.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "extension-module"))]
 #[allow(unsafe_code)]
 mod manylinux_glibc_compat {
     use std::ffi::{c_char, c_int, c_long, c_longlong, c_ulonglong};
@@ -390,11 +391,14 @@ fn _tritium(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<qwen::QwenModel>()?;
     m.add_class::<qwen::QwenLoadReceipt>()?;
     m.add_class::<qwen::QwenReferenceLanguageOutput>()?;
-    m.add_class::<onnx::QwenOnnxBundleReceipt>()?;
-    m.add_class::<onnx::QwenOnnxModel>()?;
-    m.add_class::<onnx::QwenOnnxOperatorCounts>()?;
-    m.add_class::<onnx::QwenOnnxLanguageOutput>()?;
-    m.add_class::<onnx::QwenOnnxMtpOutput>()?;
+    #[cfg(feature = "onnx")]
+    {
+        m.add_class::<onnx::QwenOnnxBundleReceipt>()?;
+        m.add_class::<onnx::QwenOnnxModel>()?;
+        m.add_class::<onnx::QwenOnnxOperatorCounts>()?;
+        m.add_class::<onnx::QwenOnnxLanguageOutput>()?;
+        m.add_class::<onnx::QwenOnnxMtpOutput>()?;
+    }
     m.add_class::<module_package::ModuleSaltV2Receipt>()?;
     m.add_class::<kronecker::KroneckerEvidenceBuilder>()?;
     m.add_class::<kronecker::KroneckerSharedForwardGroup>()?;
@@ -410,9 +414,12 @@ fn _tritium(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(source_identity, m)?)?;
     m.add_function(wrap_pyfunction!(ternary_matmul, m)?)?;
     m.add_function(wrap_pyfunction!(compiled_backends, m)?)?;
-    m.add_function(wrap_pyfunction!(onnx::verify_qwen35_onnx_bundle, m)?)?;
-    m.add_function(wrap_pyfunction!(onnx::stage_qwen35_onnx_bundle, m)?)?;
-    m.add_function(wrap_pyfunction!(onnx::export_qwen35_onnx_bundle, m)?)?;
+    #[cfg(feature = "onnx")]
+    {
+        m.add_function(wrap_pyfunction!(onnx::verify_qwen35_onnx_bundle, m)?)?;
+        m.add_function(wrap_pyfunction!(onnx::stage_qwen35_onnx_bundle, m)?)?;
+        m.add_function(wrap_pyfunction!(onnx::export_qwen35_onnx_bundle, m)?)?;
+    }
     // Autograd-op primitives (ADR 0030): forward/vjp for ternary Conv1d, FSQ, and STE.
     m.add_function(wrap_pyfunction!(ops::conv1d_forward, m)?)?;
     m.add_function(wrap_pyfunction!(ops::conv1d_vjp, m)?)?;
