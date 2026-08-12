@@ -257,6 +257,7 @@ def _run_stage(
             "stage": stage,
             "candidate_id": candidate_id,
             "recipe": recipe,
+            "runner": command,
             "model_root": str(model_root),
             "source_root": str(source_root),
             "evidence_root": str(evidence_root),
@@ -391,15 +392,41 @@ def run(
         "source_revision": campaign["source_revision"],
         "run_id": campaign["run_id"],
         "campaign_sha256": campaign_sha256,
+        "runner": auxiliary_runner,
         "model_root": str(model_root.resolve(strict=True)),
         "source_root": str(source_root),
         "evidence_root": str(evidence_root),
     }
-    auxiliary = _runner_response(
-        auxiliary_runner,
-        auxiliary_request,
-        timeout_seconds=timeout_seconds,
-    )
+    auxiliary_request_id = "sha256:" + hashlib.sha256(
+        canonical(auxiliary_request)
+    ).hexdigest()
+    auxiliary_cache = evidence_root / "measurements" / "auxiliary.json"
+    if auxiliary_cache.exists():
+        cached = load_json(auxiliary_cache, "cached auxiliary response")
+        if set(cached) != {"schema", "request_id", "response"}:
+            raise Stage7RunError("cached auxiliary response envelope differs")
+        if (
+            cached["schema"] != AUXILIARY_SCHEMA
+            or cached["request_id"] != auxiliary_request_id
+        ):
+            raise Stage7RunError("cached auxiliary response identity differs")
+        auxiliary = cached["response"]
+        if not isinstance(auxiliary, dict):
+            raise Stage7RunError("cached auxiliary response is not an object")
+    else:
+        auxiliary = _runner_response(
+            auxiliary_runner,
+            auxiliary_request,
+            timeout_seconds=timeout_seconds,
+        )
+        _write_new(
+            auxiliary_cache,
+            {
+                "schema": AUXILIARY_SCHEMA,
+                "request_id": auxiliary_request_id,
+                "response": auxiliary,
+            },
+        )
     if set(auxiliary) != {"schema", "baselines", "refinements"}:
         raise Stage7RunError("auxiliary runner response fields differ")
     if auxiliary["schema"] != AUXILIARY_SCHEMA:
