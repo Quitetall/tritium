@@ -68,6 +68,19 @@ def test_cached_measurement_binds_request_stage_and_candidate(tmp_path: Path) ->
         )
 
 
+def test_auxiliary_validation_precedes_cache_publication() -> None:
+    valid = {
+        "schema": runner.AUXILIARY_SCHEMA,
+        "baselines": {},
+        "refinements": [],
+    }
+    assert runner._validate_auxiliary(valid) is valid
+    with pytest.raises(runner.Stage7RunError, match="fields differ"):
+        runner._validate_auxiliary({"schema": runner.AUXILIARY_SCHEMA})
+    with pytest.raises(runner.Stage7RunError, match="schema differs"):
+        runner._validate_auxiliary({"schema": "wrong", "baselines": {}, "refinements": []})
+
+
 def test_write_new_is_immutable(tmp_path: Path) -> None:
     path = tmp_path / "record.json"
     runner._write_new(path, {"schema": "test"})

@@ -210,6 +210,14 @@ def _cached_measurement(
     return measurement
 
 
+def _validate_auxiliary(value: dict[str, Any]) -> dict[str, Any]:
+    if set(value) != {"schema", "baselines", "refinements"}:
+        raise Stage7RunError("auxiliary runner response fields differ")
+    if value["schema"] != AUXILIARY_SCHEMA:
+        raise Stage7RunError("auxiliary runner schema differs")
+    return value
+
+
 def _write_new(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists() or path.is_symlink():
@@ -419,6 +427,7 @@ def run(
             auxiliary_request,
             timeout_seconds=timeout_seconds,
         )
+        auxiliary = _validate_auxiliary(auxiliary)
         _write_new(
             auxiliary_cache,
             {
@@ -427,10 +436,7 @@ def run(
                 "response": auxiliary,
             },
         )
-    if set(auxiliary) != {"schema", "baselines", "refinements"}:
-        raise Stage7RunError("auxiliary runner response fields differ")
-    if auxiliary["schema"] != AUXILIARY_SCHEMA:
-        raise Stage7RunError("auxiliary runner schema differs")
+    auxiliary = _validate_auxiliary(auxiliary)
     trace = {
         "schema": TRACE_SCHEMA,
         "release": campaign["release"],
