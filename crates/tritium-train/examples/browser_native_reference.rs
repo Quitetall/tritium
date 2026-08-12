@@ -13,7 +13,7 @@ use tritium_format::salt_v2_package::{
 use tritium_spec::{
     TrainAttributeV1, TrainAttributeValueV1, TrainBackendV1, TrainBufferDataMutV1,
     TrainBufferDataRefV1, TrainExecutionV1, TrainNamedBufferMutV1, TrainNamedBufferRefV1,
-    TrainOutputV1, TrainReceiptV1, TrainRequestV1, TrainingOpManifestV2,
+    TrainOutputV1, TrainReceiptV1, TrainRequestV1, TrainingOpManifestV3,
 };
 use tritium_train::CpuTrainBackendV1;
 
@@ -290,8 +290,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     if reference.export_receipt.backend_build != reference.reload_receipt.backend_build
         || reference.export_receipt.backend_id != reference.reload_receipt.backend_id
         || reference.export_receipt.physical_device.as_deref() != Some(physical_device)
-        || reference.export_receipt.manifest_digest != TrainingOpManifestV2::digest()
-        || reference.reload_receipt.manifest_digest != TrainingOpManifestV2::digest()
+        || reference.export_receipt.manifest_digest != TrainingOpManifestV3::digest()
+        || reference.reload_receipt.manifest_digest != TrainingOpManifestV3::digest()
     {
         return Err("native lifecycle receipt identity drifted".into());
     }
