@@ -140,6 +140,7 @@ class RefinementConfig:
     learning_rate: float = 1e-3
     temperature: float = 1.0
     pv_iterations: int = 0
+    compute_dtype: str = "float32"
     schema_version: int = 2
 
     def __post_init__(self) -> None:
@@ -157,6 +158,10 @@ class RefinementConfig:
             raise ValueError("refinement temperature must be finite and positive")
         if type(self.pv_iterations) is not int or self.pv_iterations < 0:
             raise ValueError("refinement pv_iterations must be a nonnegative integer")
+        if self.compute_dtype not in {"float32", "float16", "bfloat16"}:
+            raise ValueError(
+                "refinement compute_dtype must be 'float32', 'float16', or 'bfloat16'"
+            )
         if self.kind == "scale-only" and self.structure != "dense":
             raise ValueError("scale-only refinement has fixed dense structure")
         if self.kind == "scale-only" and self.pv_iterations != 0:
@@ -171,6 +176,7 @@ class RefinementConfig:
         max_steps: int = 100,
         learning_rate: float = 1e-3,
         temperature: float = 1.0,
+        compute_dtype: str = "float32",
     ) -> "RefinementConfig":
         return cls(
             kind="scale-only",
@@ -179,6 +185,7 @@ class RefinementConfig:
             learning_rate=learning_rate,
             temperature=temperature,
             pv_iterations=0,
+            compute_dtype=compute_dtype,
         )
 
     @classmethod
@@ -190,6 +197,7 @@ class RefinementConfig:
         learning_rate: float = 1e-3,
         temperature: float = 1.0,
         pv_iterations: int = 4,
+        compute_dtype: str = "float32",
     ) -> "RefinementConfig":
         return cls(
             kind="hard-pv",
@@ -198,6 +206,7 @@ class RefinementConfig:
             learning_rate=learning_rate,
             temperature=temperature,
             pv_iterations=pv_iterations,
+            compute_dtype=compute_dtype,
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -209,6 +218,7 @@ class RefinementConfig:
             "learning_rate": self.learning_rate,
             "temperature": self.temperature,
             "pv_iterations": self.pv_iterations,
+            "compute_dtype": self.compute_dtype,
         }
 
     @classmethod
@@ -226,7 +236,7 @@ class RefinementConfig:
                     "create a schema-version-2 recipe"
                 )
             raise ValueError("legacy RefinementConfig kind or structure is invalid")
-        expected = {
+        legacy_expected = {
             "schema_version",
             "kind",
             "structure",
@@ -235,7 +245,8 @@ class RefinementConfig:
             "temperature",
             "pv_iterations",
         }
-        if set(value) != expected:
+        expected = legacy_expected | {"compute_dtype"}
+        if set(value) != legacy_expected and set(value) != expected:
             raise ValueError("RefinementConfig fields do not match schema version 2")
         return cls(
             schema_version=int(value["schema_version"]),
@@ -245,4 +256,9 @@ class RefinementConfig:
             learning_rate=float(value["learning_rate"]),
             temperature=float(value["temperature"]),
             pv_iterations=int(value["pv_iterations"]),
+            compute_dtype=(
+                "float32"
+                if "compute_dtype" not in value
+                else str(value["compute_dtype"])
+            ),
         )

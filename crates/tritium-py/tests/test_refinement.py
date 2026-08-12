@@ -88,6 +88,23 @@ def test_scale_only_refinement_freezes_trits_and_binds_full_ancestry(tmp_path):
     assert resumed == result
 
 
+def test_low_precision_refinement_restores_teacher_dtype(tmp_path):
+    torch.manual_seed(102)
+    teacher = torch.nn.Linear(8, 5)
+    parent = _parent(teacher, [torch.randn(4, 8)], tmp_path)
+    result = refine(
+        parent,
+        teacher=teacher,
+        training=[torch.randn(4, 8)],
+        validation=[torch.randn(3, 8)],
+        config=RefinementConfig.scale_only(max_steps=1, compute_dtype="float16"),
+        work_dir=tmp_path / "low-precision",
+    )
+    assert result.validation_loss_after <= result.validation_loss_before
+    assert teacher.weight.dtype is torch.float32
+    assert teacher.bias.dtype is torch.float32
+
+
 def test_refinement_rejects_overlap_hard_pv_and_rehashed_parent_claims(tmp_path):
     torch.manual_seed(103)
     teacher = torch.nn.Linear(4, 3)

@@ -146,7 +146,9 @@ class _ScaleOnlyWeight(nn.Module):
         decoded = None
         for index in range(self.plane_count):
             trits = getattr(self, f"trits_{index}").to(dtype=dtype)
-            scale = getattr(self, f"scale_{index}").clamp_min(0)
+            scale = getattr(self, f"scale_{index}").clamp_min(
+                torch.finfo(torch.float16).tiny
+            )
             # The forward is exactly the eventual f16 artifact while gradients
             # flow through the full-precision scale parameter.
             stored = scale.to(torch.float16).to(scale.dtype)
@@ -163,7 +165,7 @@ class _ScaleOnlyWeight(nn.Module):
             scales = (
                 getattr(self, f"scale_{index}")
                 .detach()
-                .clamp_min(0)
+                .clamp_min(torch.finfo(torch.float16).tiny)
                 .cpu()
                 .to(torch.float16)
             )
@@ -179,13 +181,24 @@ class _ScaleOnlyWeight(nn.Module):
 
 
 class _ScaleOnlyLinear(nn.Module):
-    def __init__(self, weight: _ScaleOnlyWeight, bias: torch.Tensor | None) -> None:
+    def __init__(
+        self,
+        weight: _ScaleOnlyWeight,
+        bias: torch.Tensor | None,
+        compute_dtype: torch.dtype,
+    ) -> None:
         super().__init__()
         object.__setattr__(self, "weight_store", weight)
         self.register_buffer("bias", None if bias is None else bias.detach().clone())
+        self.compute_dtype = compute_dtype
 
     def forward(self, value: torch.Tensor) -> torch.Tensor:
-        return F.linear(value, self.weight_store.decoded(value.dtype), self.bias)
+        value = value.to(dtype=self.compute_dtype)
+        return F.linear(
+            value,
+            self.weight_store.decoded(self.compute_dtype),
+            self.bias,
+        )
 
 
 class _ScaleOnlyEmbedding(nn.Module):
@@ -327,6 +340,23 @@ def _output_tensor(value: Any) -> torch.Tensor:
     )
 
 
+def _cast_batch(batch: Any, dtype: Optional[torch.dtype]) -> Any:
+    """Cast floating batch leaves for low-precision teacher execution."""
+
+    if dtype is None:
+        return batch
+    if isinstance(batch, torch.Tensor):
+        return batch.to(dtype=dtype) if batch.is_floating_point() else batch
+    if not isinstance(batch, Mapping):
+        return batch
+    return {
+        key: value.to(dtype=dtype)
+        if isinstance(value, torch.Tensor) and value.is_floating_point()
+        else value
+        for key, value in batch.items()
+    }
+
+
 def _loss(
     student: torch.Tensor, teacher: torch.Tensor, temperature: float
 ) -> torch.Tensor:
@@ -354,14 +384,19 @@ def _evaluate(
     teacher: nn.Module,
     batches: Tuple[Any, ...],
     temperature: float,
+    input_dtype: Optional[torch.dtype] = None,
 ) -> float:
     total = 0.0
     with torch.no_grad():
         for batch in batches:
             total += float(
                 _loss(
-                    _output_tensor(_invoke_model(student, batch)),
-                    _output_tensor(_invoke_model(teacher, batch)),
+                    _output_tensor(
+                        _invoke_model(student, _cast_batch(batch, input_dtype))
+                    ),
+                    _output_tensor(
+                        _invoke_model(teacher, _cast_batch(batch, input_dtype))
+                    ),
                     temperature,
                 )
             )
@@ -409,6 +444,7 @@ def _build_scale_model(
     teacher: nn.Module,
     conversion: ModuleQuantizationResult,
     plane_overrides: Optional[Dict[str, Tuple[TernaryPlane, ...]]] = None,
+    compute_dtype: torch.dtype = torch.float32,
 ) -> Tuple[nn.Module, Dict[str, _ScaleOnlyWeight]]:
     try:
         model = copy.deepcopy(teacher)
@@ -418,6 +454,8 @@ def _build_scale_model(
             code="copy_failed",
             stage="refine",
         ) from error
+    if compute_dtype is not torch.float32:
+        model.to(dtype=compute_dtype)
     model.requires_grad_(False)
     modules = dict(model.named_modules(remove_duplicate=False))
     stores: Dict[str, _ScaleOnlyWeight] = {}
@@ -450,7 +488,11 @@ def _build_scale_model(
             replacement = replacement_by_module.get(id(module))
             if replacement is None:
                 if type(module) is nn.Linear:
-                    replacement = _ScaleOnlyLinear(store, module.bias)
+                    replacement = _ScaleOnlyLinear(
+                        store,
+                        module.bias,
+                        compute_dtype,
+                    )
                 elif type(module) is nn.Embedding:
                     if module.max_norm is not None:
                         raise TritiumError(
@@ -482,6 +524,19 @@ def _build_scale_model(
     # Register each shared scale store exactly once after graph replacement.
     for index, store in enumerate(stores.values()):
         root.add_module(f"_tritium_scale_store_{index}", store)
+    if compute_dtype != torch.float32 and hasattr(
+        root, "gradient_checkpointing_enable"
+    ):
+        # Billion-parameter transformer refinement otherwise retains every
+        # activation for scale gradients. Non-FP32 recipes are explicitly the
+        # memory-saving path; checkpointing keeps 2048-token Stage-7 batches
+        # inside commodity GPU memory.
+        try:
+            root.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+        except TypeError:
+            root.gradient_checkpointing_enable()
     root.eval()
     return root, stores
 
@@ -490,6 +545,7 @@ def _input_metrics(
     teacher: nn.Module,
     conversion: ModuleQuantizationResult,
     batches: Tuple[Any, ...],
+    input_dtype: Optional[torch.dtype] = None,
 ) -> Dict[str, torch.Tensor]:
     """Collect diagonal input curvature for each unique target weight."""
 
@@ -525,7 +581,12 @@ def _input_metrics(
                     module=path,
                 )
             flat = value.detach().reshape(-1, features)
-            metrics[path].add_(flat.to(torch.float64).square().sum(dim=0).cpu())
+            # RTX-class GPUs have weak FP64 throughput. Accumulate each batch in
+            # FP32 on device, then fold into the deterministic FP64 host metric.
+            # This keeps receipt precision while avoiding a multi-minute FP64
+            # kernel for every hooked target activation.
+            partial = flat.float().square().sum(dim=0)
+            metrics[path].add_(partial.cpu().to(torch.float64))
             counts[path] += flat.shape[0]
 
         handles.extend(module.register_forward_pre_hook(collect) for module in selected)
@@ -534,7 +595,7 @@ def _input_metrics(
     try:
         with torch.no_grad():
             for batch in batches:
-                _invoke_model(teacher, batch)
+                _invoke_model(teacher, _cast_batch(batch, input_dtype))
     finally:
         for handle in handles:
             handle.remove()
@@ -919,19 +980,78 @@ def refine(
     if unknown:
         raise ValueError("unsealed refinement work_dir contains unknown state")
 
+    compute_dtype = {
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+    }[config.compute_dtype]
+    original_tensors = {
+        name: (tensor, tensor.dtype)
+        for name, tensor in (
+            *teacher.named_parameters(),
+            *teacher.named_buffers(),
+        )
+        if tensor.is_floating_point() or tensor.is_complex()
+    }
+    if compute_dtype != torch.float32:
+        # Exact source identity was admitted above. The recipe's lower-precision
+        # execution mode now applies to teacher and student alike, avoiding a
+        # resident FP32 teacher plus FP16 student duplicate on constrained GPUs.
+        teacher.to(dtype=compute_dtype)
+
     teacher_was_training = teacher.training
     teacher.eval()
     try:
-        parent_student, _ = _build_scale_model(teacher, conversion)
+        parent_student, _ = _build_scale_model(
+            teacher, conversion, compute_dtype=compute_dtype
+        )
         before = _evaluate(
-            parent_student, teacher, validation_batches, config.temperature
+            parent_student,
+            teacher,
+            validation_batches,
+            config.temperature,
+            input_dtype=compute_dtype,
         )
         del parent_student
-        metrics = _input_metrics(teacher, conversion, training_batches)
-        initial_planes, _ = _initial_refinement(teacher, conversion, metrics, config)
-        student, stores = _build_scale_model(teacher, conversion, initial_planes)
+        if config.kind == "scale-only":
+            # Scale-only refinement freezes trits by contract. Re-solving every
+            # plane before optimization is redundant and, for billion-parameter
+            # models, needlessly materializes a full FP64 CPU objective. Start
+            # from the admitted PTQ planes; hard-PV retains curvature fitting.
+            initial_planes = {
+                reference.path: conversion.weight(reference.path).planes
+                for reference in conversion.weights
+            }
+            # No activation-weighted solve is performed in this mode. Use a
+            # deterministic unit metric for the child diagnostics below.
+            metrics = {
+                reference.path: torch.ones(
+                    reference.shape[1], dtype=torch.float64
+                )
+                for reference in conversion.weights
+            }
+        else:
+            metrics = _input_metrics(
+                teacher,
+                conversion,
+                training_batches,
+                input_dtype=compute_dtype,
+            )
+            initial_planes, _ = _initial_refinement(
+                teacher, conversion, metrics, config
+            )
+        student, stores = _build_scale_model(
+            teacher,
+            conversion,
+            initial_planes,
+            compute_dtype=compute_dtype,
+        )
         initial_loss = _evaluate(
-            student, teacher, validation_batches, config.temperature
+            student,
+            teacher,
+            validation_batches,
+            config.temperature,
+            input_dtype=compute_dtype,
         )
         best_planes = _snapshot(stores) if initial_loss <= before else None
         best_loss = initial_loss if best_planes is not None else before
@@ -942,13 +1062,21 @@ def refine(
         optimizer = torch.optim.AdamW(
             parameters, lr=config.learning_rate, weight_decay=0.0
         )
+        checkpointed_training = compute_dtype != torch.float32 and hasattr(
+            student, "gradient_checkpointing_enable"
+        )
+        if checkpointed_training:
+            student.train()
         for batch in (
             item for _, item in zip(range(config.max_steps), cycle(training_batches))
         ):
             optimizer.zero_grad(set_to_none=True)
+            compute_batch = _cast_batch(batch, compute_dtype)
             with torch.no_grad():
-                teacher_output = _output_tensor(_invoke_model(teacher, batch))
-            student_output = _output_tensor(_invoke_model(student, batch))
+                teacher_output = _output_tensor(
+                    _invoke_model(teacher, compute_batch)
+                )
+            student_output = _output_tensor(_invoke_model(student, compute_batch))
             loss = _loss(student_output, teacher_output, config.temperature)
             if not bool(torch.isfinite(loss)):
                 raise TritiumError(
@@ -958,9 +1086,17 @@ def refine(
                 )
             loss.backward()
             optimizer.step()
+            if checkpointed_training:
+                student.eval()
             candidate = _evaluate(
-                student, teacher, validation_batches, config.temperature
+                student,
+                teacher,
+                validation_batches,
+                config.temperature,
+                input_dtype=compute_dtype,
             )
+            if checkpointed_training:
+                student.train()
             if candidate < best_loss and candidate <= before:
                 best_loss = candidate
                 accepted_steps += 1
@@ -977,9 +1113,22 @@ def refine(
                 for reference in conversion.weights
             }
         _install(stores, best_planes)
-        after = _evaluate(student, teacher, validation_batches, config.temperature)
+        student.eval()
+        after = _evaluate(
+            student,
+            teacher,
+            validation_batches,
+            config.temperature,
+            input_dtype=compute_dtype,
+        )
     finally:
         teacher.train(teacher_was_training)
+        if compute_dtype != torch.float32:
+            for tensor, dtype in original_tensors.values():
+                # `teacher.to` mutates tensor storage in place; restore the
+                # caller-owned module's exact floating/complex dtypes.
+                if tensor.dtype != dtype:
+                    tensor.data = tensor.data.to(dtype=dtype)
     if after > before:
         raise TritiumError(
             "held-out predecessor retention failed",

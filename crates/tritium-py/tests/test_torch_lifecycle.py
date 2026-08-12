@@ -24,6 +24,9 @@ def test_ptq_recipe_and_refinement_are_distinct_versioned_schemas():
     hard_pv = RefinementConfig.hard_pv(structure="s34")
     assert RefinementConfig.from_dict(scale_only.to_dict()) == scale_only
     assert RefinementConfig.from_dict(hard_pv.to_dict()) == hard_pv
+    low_memory = RefinementConfig.scale_only(compute_dtype="float16")
+    assert RefinementConfig.from_dict(low_memory.to_dict()) == low_memory
+    assert low_memory.compute_dtype == "float16"
     assert scale_only.kind == "scale-only"
     assert hard_pv.kind == "hard-pv"
     assert (
