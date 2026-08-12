@@ -176,11 +176,11 @@ The boundary is the developer/CI build machine. Realistic attacker = a compromis
 Honest list of gaps the audits flagged, ordered by actionability. None are critical under the documented trusted/local model; several rise under public exposure.
 
 **Cheap, recommended:**
-1. **Add `--locked` to all CI cargo invocations** (ci.yml) + a step that fails on lockfile drift. *(supply chain, medium)* — closes the silent-malicious-patch window the committed lockfile is supposed to prevent.
+1. ~~**Add `--locked` to all CI cargo invocations.**~~ **DONE** (`ac60c56`) — the scheduled fuzz lane now installs `cargo-fuzz` with lock enforcement; all workspace cargo build/test/lint/install/fetch lanes use `--locked`.
 2. ~~**Lift `check_grad_launch_bounds` into CUDA inference `mpgemm_kernel`.**~~ **DONE** (`0aecae5`) — dense and sparse add paths reject checked-product overflow before allocation, grid math, and i32/u32 casts; regression covers each dimension.
 3. ~~**Length-check discipline + fuzz target for `tq2.rs compute_zero_bitmap`/`compute_zero_bitmaps`.**~~ **DONE** — both functions total (typed errors on every absurd-size shape incl. the `row_bytes = 0` capacity-overflow class), `zero_bitmap` fuzz target in the scheduled lane (see §4.1 row).
 4. **Defensive FFI hardening (optional):** an `AtomicBool` in-use guard on `TritiumModel` to reject concurrent `tritium_generate` (medium — concurrency UB); a magic sentinel zeroed on free to fail fast on UAF/double-free (medium).
-5. **Loader hardening:** make `weights.rs` (124,134,174) reuse `info.element_count()` and checked adds instead of unchecked `+`/`*`. *(low)*
+5. ~~**Loader hardening.**~~ **DONE** (`8609e93`) — GGUF offsets, payload ranges, u64→usize conversions, tensor products, row strides and block offsets fail closed with typed errors; regression covers offset/range overflow.
 
 **Server hardening (only needed if the loopback/off-by-default assumption is ever relaxed):**
 6. ~~**No auth gate.**~~ **DONE** — non-loopback bind requires uniform bearer authentication; loopback may opt in.
