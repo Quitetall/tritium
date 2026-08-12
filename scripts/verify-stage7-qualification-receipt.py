@@ -66,6 +66,12 @@ REFINEMENT_FIELDS = {
     "soft_policy", "refinement_corpus_id", "validation_id",
     "parent_validation_ppl", "checkpoints",
 }
+TRACE_CHECKPOINT_FIELDS = {
+    "tokens", "validation_ppl", "teacher_kl", "artifact", "package_id",
+    "codec", "serialized_bytes", "resident_bytes", "tensor_count",
+    "trits_changed", "hard_reload_max_abs_error", "hard_reload_tolerance",
+    "evaluation_receipt",
+}
 BASELINE_FIELDS = {"bf16", "salt_v1"}
 
 
@@ -212,12 +218,36 @@ def _validate_campaign_payload(
         evidence_root, campaign["token_evidence_pack"], "campaign token evidence pack"
     )
     token_pack = _load_canonical_json(token_pack_path, "campaign token evidence pack")
-    if (
-        token_pack.get("schema") != "tritium.stage7-token-evidence-pack.v1"
-        or not isinstance(token_pack.get("partitions"), dict)
-        or not isinstance(token_pack.get("tokens"), int)
-    ):
+    if set(token_pack) != {
+        "schema", "pack_id", "tokenizer_digest", "tokenizer_vocab_size",
+        "token_encoding", "tokens", "partitions",
+    } or token_pack["schema"] != "tritium.stage7-token-evidence-pack.v1":
         raise Stage7QualificationError("campaign token evidence pack envelope differs")
+    _digest(token_pack["pack_id"], "campaign token evidence pack.id")
+    _digest(token_pack["tokenizer_digest"], "campaign token evidence pack.tokenizer_digest")
+    _bounded_int(
+        token_pack["tokenizer_vocab_size"],
+        "campaign token evidence pack.tokenizer_vocab_size",
+        positive=True,
+    )
+    if token_pack["token_encoding"] != "u32le":
+        raise Stage7QualificationError("campaign token evidence pack encoding differs")
+    _record(token_pack_path.parent, token_pack["tokens"], "campaign token evidence payload")
+    partitions = token_pack["partitions"]
+    if not isinstance(partitions, dict) or set(partitions) != {
+        "calibration", "refinement", "validation", "evaluation",
+    }:
+        raise Stage7QualificationError("campaign token evidence partitions differ")
+    for name, partition in partitions.items():
+        if not isinstance(partition, dict) or set(partition) != {"sampling_seed", "sequences"}:
+            raise Stage7QualificationError(
+                f"campaign token evidence {name} partition differs"
+            )
+        _bounded_int(partition["sampling_seed"], f"campaign token evidence {name}.sampling_seed")
+        if not isinstance(partition["sequences"], list) or len(partition["sequences"]) != 512:
+            raise Stage7QualificationError(
+                f"campaign token evidence {name} sequence inventory differs"
+            )
     evidence = campaign["evidence"]
     if not isinstance(evidence, list) or len(evidence) != 3:
         raise Stage7QualificationError("campaign prerequisite evidence inventory differs")
@@ -260,6 +290,7 @@ def _validate_trace_payload(
     full_promoted: set[str] = set()
     previous_promoted: set[str] | None = None
     refinement_ids: set[str] = set()
+    refinement_checkpoints: dict[str, list[Any]] = {}
     for index, (name, required_count) in enumerate((("one-layer", 1404), ("four-layer", None), ("full-model", None))):
         stage = _object(stages[index], STAGE_FIELDS, f"trace.stages[{index}]")
         if stage["name"] != name:
@@ -340,7 +371,12 @@ def _validate_trace_payload(
         if row["mode"] != expected_refinement_modes[index] or row["rate"] != expected_rates[index]:
             raise Stage7QualificationError("refinement mode or rate inventory differs")
         refinement_ids.add(refinement_id)
-    return {"full_promoted": full_promoted, "refinement_ids": refinement_ids}
+        refinement_checkpoints[refinement_id] = checkpoints
+    return {
+        "full_promoted": full_promoted,
+        "refinement_ids": refinement_ids,
+        "refinement_checkpoints": refinement_checkpoints,
+    }
 
 
 class Stage7QualificationError(ValueError):
@@ -493,8 +529,42 @@ def validate(receipt_path: Path, revision: str, release: str, candidate: Path) -
     package_id = _string(checkpoint["package_id"], "checkpoint.package_id")
     if re.fullmatch(r"trp1_[0-9a-f]{64}", package_id) is None:
         raise Stage7QualificationError("checkpoint.package_id is malformed")
-    _recipe_id(checkpoint["artifact_sha256"], "checkpoint.artifact_sha256")
-    _recipe_id(checkpoint["evaluation_sha256"], "checkpoint.evaluation_sha256")
+    _raw_digest(checkpoint["artifact_sha256"], "checkpoint.artifact_sha256")
+    _raw_digest(checkpoint["evaluation_sha256"], "checkpoint.evaluation_sha256")
+    selected_checkpoints = trace_state["refinement_checkpoints"].get(
+        receipt["frozen_refined_recipe_id"], []
+    )
+    selected_trace_checkpoint = None
+    for raw_checkpoint in selected_checkpoints:
+        if isinstance(raw_checkpoint, dict) and raw_checkpoint.get("tokens") == checkpoint["tokens"]:
+            selected_trace_checkpoint = raw_checkpoint
+            break
+    if selected_trace_checkpoint is None:
+        raise Stage7QualificationError("frozen checkpoint is absent from trace")
+    if set(selected_trace_checkpoint) != TRACE_CHECKPOINT_FIELDS:
+        raise Stage7QualificationError("trace checkpoint fields differ")
+    if selected_trace_checkpoint["package_id"] != checkpoint["package_id"]:
+        raise Stage7QualificationError("frozen checkpoint package differs from trace")
+    artifact_path = _record(receipt_path.parent, selected_trace_checkpoint["artifact"], "trace refinement artifact")
+    evaluation_path = _record(
+        receipt_path.parent,
+        selected_trace_checkpoint["evaluation_receipt"],
+        "trace refinement evaluation",
+    )
+    evaluation = _load_canonical_json(evaluation_path, "trace refinement evaluation")
+    if (
+        evaluation.get("tokens") != checkpoint["tokens"]
+        or evaluation.get("package_id") != checkpoint["package_id"]
+        or evaluation.get("artifact_sha256") != checkpoint["artifact_sha256"]
+        or evaluation.get("result") != "pass"
+    ):
+        raise Stage7QualificationError("frozen checkpoint evaluation differs from trace")
+    if _sha256(artifact_path) != checkpoint["artifact_sha256"]:
+        raise Stage7QualificationError("frozen checkpoint artifact bytes differ from trace")
+    if selected_trace_checkpoint["artifact"]["sha256"] != checkpoint["artifact_sha256"]:
+        raise Stage7QualificationError("frozen checkpoint artifact differs from trace")
+    if selected_trace_checkpoint["evaluation_receipt"]["sha256"] != checkpoint["evaluation_sha256"]:
+        raise Stage7QualificationError("frozen checkpoint evaluation digest differs from trace")
     soft = _object(receipt["soft_method_ab"], SOFT_AB_FIELDS, "soft method A/B")
     _string(soft["outcome"], "soft method outcome")
     if soft["winner"] is not None:

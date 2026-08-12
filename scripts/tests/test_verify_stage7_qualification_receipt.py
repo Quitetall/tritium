@@ -87,15 +87,34 @@ def fixture(root: Path):
         "provenance": provenance,
         "thresholds": {"r3_gap_closure_min": 0.25, "metadata_bpw_max": 0.01, "scale_only_token_cap": 8_000_000, "short_pv_token_cap": 32_000_000},
         "recipe_count": 1404, "recipe_grid_id": digest(5_000),
-        "token_evidence_pack": materialize_json(root, "token-evidence/manifest.json", {
-            "schema": "tritium.stage7-token-evidence-pack.v1", "partitions": {}, "tokens": 1,
-        }),
+        "token_evidence_pack": None,
         "evidence": [
             {**materialize_json(root, "smoke/smoke-receipt.json", {"schema": "tritium.stage7-smoke.v1", "result": "pass", "release": "1.1.0-rc.1", "source_revision": "a" * 40}), "kind": "smoke"},
             {**materialize_json(root, "native/native-receipt.json", {"schema": "tritium.stage7-native-kernels.v1", "result": "pass", "release": "1.1.0-rc.1", "source_revision": "a" * 40}), "kind": "native-kernels"},
             {**materialize_json(root, "hestia-gate-c.json", {"schema": "tritium.stage7-hestia-gate-c.v1", "result": "pass", "release": "1.1.0-rc.1", "source_revision": "a" * 40}), "kind": "hestia-gate-c"},
         ],
     }
+    campaign.write_bytes(canonical(campaign_value) + b"\n")
+    token_payload = materialize(root, "token-evidence/tokens.u32le", 120)
+    token_payload = {**token_payload, "path": "tokens.u32le"}
+    token_partitions = {
+        name: {"sampling_seed": index + 1, "sequences": [{} for _ in range(512)]}
+        for index, name in enumerate(("calibration", "refinement", "validation", "evaluation"))
+    }
+    token_pack = {
+        "schema": "tritium.stage7-token-evidence-pack.v1",
+        "pack_id": "pending",
+        "tokenizer_digest": digest(2_000),
+        "tokenizer_vocab_size": 32_000,
+        "token_encoding": "u32le",
+        "tokens": token_payload,
+        "partitions": token_partitions,
+    }
+    token_pack["pack_id"] = "sha256:" + hashlib.sha256(
+        canonical({key: value for key, value in token_pack.items() if key != "pack_id"})
+    ).hexdigest()
+    token_pack_record = materialize_json(root, "token-evidence/manifest.json", token_pack)
+    campaign_value["token_evidence_pack"] = token_pack_record
     campaign.write_bytes(canonical(campaign_value) + b"\n")
     trace = root / "trace.json"
     ids = [digest(index + 10_000) for index in range(1404)]
@@ -128,6 +147,31 @@ def fixture(root: Path):
         refinements[-1]["mode"] = mode
         refinements[-1]["soft_method"] = soft_method
         refinements[-1]["soft_policy"] = {"kind": "none"} if soft_method is None else {"kind": soft_method}
+    selected = refinements[0]["checkpoints"][-1]
+    selected["validation_ppl"] = 2.0
+    selected["teacher_kl"] = 0.3
+    selected["artifact"] = artifact
+    selected["package_id"] = "trp1_" + "3" * 64
+    selected.update({
+        "codec": "d2", "serialized_bytes": artifact["bytes"], "resident_bytes": 1,
+        "tensor_count": 1, "trits_changed": False,
+        "hard_reload_max_abs_error": 0.0, "hard_reload_tolerance": 1e-4,
+    })
+    evaluation = {
+        "schema": "tritium.stage7-refinement-evaluation.v1", "result": "pass",
+        "release": "1.1.0-rc.1", "source_revision": "a" * 40,
+        "parent_candidate_id": ids[0], "mode": "scale-only", "soft_method": None,
+        "refinement_corpus_id": refinements[0]["refinement_corpus_id"],
+        "validation_id": refinements[0]["validation_id"], "tokens": selected["tokens"],
+        "artifact_sha256": artifact["sha256"], "package_id": selected["package_id"],
+        "validation_ppl": selected["validation_ppl"], "teacher_kl": selected["teacher_kl"],
+    }
+    evaluation["evaluation_id"] = "sha256:" + hashlib.sha256(
+        canonical(evaluation)
+    ).hexdigest()
+    selected["evaluation_receipt"] = materialize_json(
+        root, "refinement/selected-evaluation.json", evaluation
+    )
     trace_value = {
         "schema": "tritium.stage7-execution.v1", "release": "1.1.0-rc.1", "source_revision": "a" * 40,
         "run_id": "stage7-run-1", "campaign_sha256": sha256(campaign), "stages": stages,
@@ -164,10 +208,10 @@ def fixture(root: Path):
         "frozen_refined_recipe_id": digest(20_000),
         "frozen_refined_checkpoint": {
             "refinement_id": digest(20_000),
-            "tokens": 8_000_000,
-            "package_id": "trp1_" + "3" * 64,
-            "artifact_sha256": "sha256:" + "4" * 64,
-            "evaluation_sha256": "sha256:" + "5" * 64,
+            "tokens": selected["tokens"],
+            "package_id": selected["package_id"],
+            "artifact_sha256": selected["artifact"]["sha256"],
+            "evaluation_sha256": selected["evaluation_receipt"]["sha256"],
         },
         "soft_method_ab": {
             "outcome": "hestia-win",

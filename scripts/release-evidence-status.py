@@ -405,7 +405,9 @@ def evaluate(
             raise EvidenceError(
                 f"{kind} evidence must bind candidate {expected_artifact_kind}"
             )
-        artifact_path = candidate.parent / _string(artifact.get("path"), "candidate artifact path")
+        artifact_path = _contained_file(
+            candidate.parent, artifact.get("path"), "candidate artifact path"
+        )
         try:
             if kind == "cuda-training":
                 receipt = validate_cuda_receipt(
