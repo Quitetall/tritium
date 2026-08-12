@@ -91,18 +91,24 @@ impl ModelWeights {
         // ~657MB read + ~1.3GB transient per load).
         let n_embd = config.n_embd as usize;
         let embd_info = require(file, "token_embd.weight")?;
-        let vocab = *embd_info
-            .dims
-            .last()
-            .ok_or_else(|| NnError::MissingTensor("token_embd.weight (no dims)".to_owned()))?
-            as usize;
+        let vocab = checked_usize(
+            *embd_info
+                .dims
+                .last()
+                .ok_or_else(|| NnError::MissingTensor("token_embd.weight (no dims)".to_owned()))?,
+            "token_embd.weight vocabulary",
+        )?;
         let embd_len = embd_info
             .element_count()
             .map_err(|e| NnError::Backend(format!("token_embd.weight dims: {e}")))?
-            as usize;
-        if embd_len != vocab * n_embd {
+            .try_into()
+            .map_err(|_| {
+                NnError::Backend("token_embd.weight element count exceeds usize".into())
+            })?;
+        let expected_embd_len = checked_product(vocab, n_embd, "token_embd.weight shape")?;
+        if embd_len != expected_embd_len {
             return Err(NnError::Shape {
-                expected: vocab * n_embd,
+                expected: expected_embd_len,
                 got: embd_len,
             });
         }
@@ -144,18 +150,40 @@ fn require<'a>(file: &'a GgufFile, name: &str) -> Result<&'a TensorInfo, NnError
 /// For I2_S (`n_bytes == 0` from the reader) the payload is sized as
 /// `n_elements/4 + 32`; otherwise `n_bytes` from the reader is authoritative.
 fn payload<'a>(file: &GgufFile, bytes: &'a [u8], info: &TensorInfo) -> Result<&'a [u8], NnError> {
-    let start = (file.tensor_data_offset + info.offset) as usize;
+    let start_u64 = file
+        .tensor_data_offset
+        .checked_add(info.offset)
+        .ok_or_else(|| NnError::Backend(format!("{}: payload offset overflows u64", info.name)))?;
+    let start = checked_usize(start_u64, "tensor payload offset")?;
     let n_elements = info
         .element_count()
-        .map_err(|e| NnError::Backend(e.to_string()))? as usize;
+        .map_err(|e| NnError::Backend(e.to_string()))
+        .and_then(|value| checked_usize(value, "tensor element count"))?;
     let len = if info.ggml_type == GGML_TYPE_I2_S {
-        n_elements / 4 + 32
+        (n_elements / 4).checked_add(32).ok_or_else(|| {
+            NnError::Backend(format!(
+                "{}: I2_S payload length overflows usize",
+                info.name
+            ))
+        })?
     } else {
-        info.n_bytes as usize
+        checked_usize(info.n_bytes, "tensor payload length")?
     };
+    let end = start
+        .checked_add(len)
+        .ok_or_else(|| NnError::Backend(format!("{}: payload range overflows usize", info.name)))?;
     bytes
-        .get(start..start + len)
+        .get(start..end)
         .ok_or_else(|| NnError::MissingTensor(format!("{} (payload out of bounds)", info.name)))
+}
+
+fn checked_usize(value: u64, label: &str) -> Result<usize, NnError> {
+    usize::try_from(value).map_err(|_| NnError::Backend(format!("{label} exceeds platform usize")))
+}
+
+fn checked_product(lhs: usize, rhs: usize, label: &str) -> Result<usize, NnError> {
+    lhs.checked_mul(rhs)
+        .ok_or_else(|| NnError::Backend(format!("{label} element count overflows usize")))
 }
 
 /// Load a dense (F32 or F16) tensor as fp32, in ggml memory order.
@@ -191,10 +219,8 @@ fn load_projection(
             got: info.dims.len(),
         });
     }
-    let k_in = usize::try_from(info.dims[0])
-        .map_err(|_| NnError::Backend(format!("{name}: Q2_0 K exceeds usize")))?;
-    let n_out = usize::try_from(info.dims[1])
-        .map_err(|_| NnError::Backend(format!("{name}: Q2_0 N exceeds usize")))?;
+    let k_in = checked_usize(info.dims[0], &format!("{name}: Q2_0 K"))?;
+    let n_out = checked_usize(info.dims[1], &format!("{name}: Q2_0 N"))?;
     let source = payload(file, bytes, info)?;
     let mut packed = Vec::new();
     packed.try_reserve_exact(source.len()).map_err(|error| {
@@ -249,9 +275,9 @@ fn load_ternary(
             got: info.dims.len(),
         });
     }
-    let k_in = info.dims[0] as usize;
-    let n_out = info.dims[1] as usize;
-    let n_elements = n_out * k_in;
+    let k_in = checked_usize(info.dims[0], &format!("{name}: K dimension"))?;
+    let n_out = checked_usize(info.dims[1], &format!("{name}: N dimension"))?;
+    let n_elements = checked_product(n_out, k_in, &format!("{name}: tensor shape"))?;
 
     let p = payload(file, bytes, info)?;
     let (trits, scale) = match info.ggml_type {
@@ -268,8 +294,10 @@ fn load_ternary(
                 _ => unreachable!("match arm admits only TQ1_0/TQ2_0"),
             };
             let nb = k_in.div_ceil(QK_K);
-            let row_bytes = nb * block_bytes;
-            if p.len() < n_out * row_bytes {
+            let row_bytes = checked_product(nb, block_bytes, &format!("{}: row bytes", info.name))?;
+            let expected_payload =
+                checked_product(n_out, row_bytes, &format!("{}: payload rows", info.name))?;
+            if p.len() < expected_payload {
                 return Err(NnError::Backend(format!(
                     "{}: payload {} B < {} rows × {row_bytes} B",
                     info.name,
@@ -289,8 +317,16 @@ fn load_ternary(
             let mut row_scales: Vec<f32> = Vec::with_capacity(n_out);
             let mut rows_uniform = true;
             for r in 0..n_out {
-                let row = &p[r * row_bytes..(r + 1) * row_bytes];
-                let out = &mut trits[r * k_in..(r + 1) * k_in];
+                let row_start = checked_product(r, row_bytes, "tensor row offset")?;
+                let row_end = row_start.checked_add(row_bytes).ok_or_else(|| {
+                    NnError::Backend(format!("{}: row range overflows usize", info.name))
+                })?;
+                let trit_start = checked_product(r, k_in, "tensor trit offset")?;
+                let trit_end = trit_start.checked_add(k_in).ok_or_else(|| {
+                    NnError::Backend(format!("{}: trit range overflows usize", info.name))
+                })?;
+                let row = &p[row_start..row_end];
+                let out = &mut trits[trit_start..trit_end];
                 match t {
                     GGML_TYPE_TQ1_0 => unpack_tq1_0_row(row, out, &mut scales),
                     GGML_TYPE_TQ2_0 => unpack_tq2_0_row(row, out, &mut scales),
@@ -304,9 +340,13 @@ fn load_ternary(
                         // All-zero block: its decoded values are 0 at any
                         // scale; force the trits so trit × scale reproduces
                         // them exactly.
-                        let start = bi * QK_K;
-                        let end = (start + QK_K).min(k_in);
-                        out[start..end].fill(Trit::ZERO);
+                        let start = bi.checked_mul(QK_K).ok_or_else(|| {
+                            NnError::Backend(format!("{}: block offset overflows usize", info.name))
+                        })?;
+                        if start < k_in {
+                            let end = start.saturating_add(QK_K).min(k_in);
+                            out[start..end].fill(Trit::ZERO);
+                        }
                     } else {
                         match row_scale {
                             None => row_scale = Some(dv),
@@ -608,5 +648,31 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("must be an F32"));
+    }
+
+    #[test]
+    fn payload_rejects_offset_and_range_overflow() {
+        let offset_info =
+            TensorInfo::new("overflow.offset".to_owned(), vec![1], GGML_TYPE_F32, 1, 4);
+        let offset_file = tritium_format::GgufFile::new(
+            3,
+            Default::default(),
+            vec![offset_info.clone()],
+            u64::MAX,
+        );
+        let offset_error = payload(&offset_file, &[], &offset_info).expect_err("offset overflow");
+        assert!(offset_error.to_string().contains("payload offset"));
+
+        let range_info = TensorInfo::new(
+            "overflow.range".to_owned(),
+            vec![1],
+            GGML_TYPE_F32,
+            0,
+            u64::MAX,
+        );
+        let range_file =
+            tritium_format::GgufFile::new(3, Default::default(), vec![range_info.clone()], 1);
+        let range_error = payload(&range_file, &[], &range_info).expect_err("range overflow");
+        assert!(range_error.to_string().contains("payload range"));
     }
 }
