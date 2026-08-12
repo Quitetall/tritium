@@ -310,9 +310,14 @@ conversion result; it does not silently substitute Qwen S2KF evidence.
 For Transformers-backed Qwen3.6 capture, use the strict component boundary:
 
 ```python
-from tritium.torch import capture_qwen36_components, resolve_qwen36_components
+from tritium.torch import (
+    Qwen36LanguageMtpOracle,
+    capture_qwen36_components,
+    resolve_qwen36_components,
+)
 
 components = resolve_qwen36_components(model)  # requires model.mtp
+oracle = Qwen36LanguageMtpOracle(model)
 receipt = capture_qwen36_components(
     model,
     data_factory,
@@ -324,8 +329,16 @@ receipt = capture_qwen36_components(
     activation_cache_digest=cache_digest,
     token_stream_digest=token_digest,
     damping=1e-4,
+    execution_model=oracle,
 )
 ```
+
+`Qwen36LanguageMtpOracle` keeps Transformers on its ordinary forward path and
+captures final language states with a local norm hook before executing the
+attached MTP graph. This avoids the `output_hidden_states=True` capture path,
+which is not safe with disk-offloaded Qwen checkpoints. Its output retains
+`logits`/`loss` plus finite `mtp_hidden_states` and `mtp_logits` fields for
+calibration and parity diagnostics.
 
 Resolution requires canonical `model.language_model`, `lm_head`, and retained
 `mtp` modules before native evidence mutation. A Transformers graph that drops

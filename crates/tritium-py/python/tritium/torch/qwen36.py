@@ -341,6 +341,10 @@ class Qwen36LanguageMtpOracle(nn.Module):
         inputs_embeds: Optional[torch.Tensor] = None,
         **kwargs: Any,
     ) -> Qwen36LanguageMtpOutput:
+        if past_key_values is not None:
+            raise Qwen36ComponentError(
+                "Qwen3.6 oracle does not share cached states between language and MTP graphs"
+            )
         hidden: list[torch.Tensor] = []
 
         def capture(_module: nn.Module, _args: tuple[Any, ...], output: Any) -> None:
@@ -355,6 +359,7 @@ class Qwen36LanguageMtpOracle(nn.Module):
         # Avoid Transformers output-capturing hooks under disk offload.  The
         # local norm hook above is the authoritative hidden-state capture.
         base_kwargs["output_hidden_states"] = False
+        base_kwargs["use_cache"] = False
         try:
             base_output = self._model(
                 input_ids=input_ids,
