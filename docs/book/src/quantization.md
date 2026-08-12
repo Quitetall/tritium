@@ -82,6 +82,14 @@ Curves are evidence inputs, not guessed metrics. Native deterministic
 tie-breaking returns counts within budget; malformed, nonfinite, or undersized
 curves fail before allocation.
 
+Generic live-module PTQ accepts same measured knob. Set
+`TernaryConfig.ptq(..., target_bpw=2.0)` and `convert(...)` will measure
+curvature-weighted error for one, two, and three additive planes per selected
+weight, then run native water-filling. Result exposes `achieved_bpw`, and its
+strict artifact records each selected weight's plane count. This first generic
+integration allocates at weight granularity; Stage-7 SALT model conversion
+retains finer allocation-tile maps.
+
 ## Stage-7 token evidence
 
 Collect the frozen source rows at the three immutable Hub revisions before

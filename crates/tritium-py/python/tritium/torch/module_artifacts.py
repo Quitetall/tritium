@@ -11,7 +11,7 @@ import stat
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, Mapping, Tuple, Union
 
 import torch
 
@@ -132,6 +132,21 @@ class ModuleQuantizationResult:
     @property
     def weight_names(self) -> Tuple[str, ...]:
         return tuple(weight.path for weight in self.weights)
+
+    @property
+    def achieved_bpw(self) -> float:
+        """Logical ternary bits per selected coefficient, from admitted planes."""
+
+        total_weights = sum(
+            weight.shape[0] * weight.shape[1] for weight in self.weights
+        )
+        if total_weights <= 0:
+            return 0.0
+        plane_weights = sum(
+            weight.shape[0] * weight.shape[1] * len(weight.planes)
+            for weight in self.weights
+        )
+        return plane_weights * math.log2(3.0) / total_weights
 
     def pack_native(
         self,
@@ -516,8 +531,27 @@ def load_module_conversion(
         coverage,
     ):
         raise ValueError("module conversion recipe identity mismatch")
-    if any(len(weight.planes) != config.planes for weight in weights):
-        raise ValueError("module conversion plane count differs from recipe")
+    if config.target_bpw is None:
+        if any(len(weight.planes) != config.planes for weight in weights):
+            raise ValueError("module conversion plane count differs from recipe")
+    else:
+        if any(not 1 <= len(weight.planes) <= config.planes for weight in weights):
+            raise ValueError("adaptive module conversion plane count differs from recipe")
+        total_weights = sum(
+            weight.shape[0] * weight.shape[1] for weight in weights
+        )
+        achieved_bpw = (
+            sum(
+                weight.shape[0]
+                * weight.shape[1]
+                * len(weight.planes)
+                for weight in weights
+            )
+            * math.log2(3.0)
+            / total_weights
+        )
+        if achieved_bpw > config.target_bpw + 1e-9:
+            raise ValueError("adaptive module conversion exceeds target_bpw")
     selected = {
         entry.path: entry
         for entry in coverage.entries
@@ -716,6 +750,7 @@ def seal_module_conversion(
     fit_weight: Callable[[Any, WeightCheckpointWriter], float],
     fit_chunk_rows: Callable[[Any], int],
     max_working_bytes: int,
+    plane_counts: Mapping[str, int] | None = None,
 ) -> ModuleQuantizationResult:
     """Resume per-weight fitting, then atomically seal one conversion manifest."""
 
@@ -745,6 +780,21 @@ def seal_module_conversion(
             raise ValueError("sealed module conversion belongs to another recipe")
         return result
     directory.mkdir(parents=True, exist_ok=True)
+    records = tuple(records)
+    if plane_counts is not None:
+        plane_counts = dict(plane_counts)
+        if config.target_bpw is None:
+            raise ValueError("plane_counts requires adaptive PTQ target_bpw")
+        expected_paths = {record.weight_aliases[0] for record in records}
+        if set(plane_counts) != expected_paths:
+            raise ValueError("adaptive plane allocation does not match calibration")
+        if any(
+            type(count) is not int or not 1 <= count <= config.planes
+            for count in plane_counts.values()
+        ):
+            raise ValueError("adaptive plane allocation is out of recipe bounds")
+    elif config.target_bpw is not None:
+        raise ValueError("adaptive PTQ requires a measured plane allocation")
     for child in directory.iterdir():
         if (
             child.name.startswith(".tmp-")
@@ -769,7 +819,12 @@ def seal_module_conversion(
                 reference.path != record.weight_aliases[0]
                 or reference.aliases != record.weight_aliases
                 or reference.shape != (record.outputs, record.features)
-                or len(reference.planes) != config.planes
+                or len(reference.planes)
+                != (
+                    plane_counts[record.weight_aliases[0]]
+                    if plane_counts is not None
+                    else config.planes
+                )
             ):
                 raise ValueError(
                     "resumed conversion weight identity differs from calibration"
@@ -785,7 +840,11 @@ def seal_module_conversion(
             record.weight_aliases[0],
             record.weight_aliases,
             (record.outputs, record.features),
-            config.planes,
+            (
+                plane_counts[record.weight_aliases[0]]
+                if plane_counts is not None
+                else config.planes
+            ),
             fit_chunk_rows(record),
             max_working_bytes,
         )

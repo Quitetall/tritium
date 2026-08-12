@@ -530,15 +530,44 @@ def test_live_module_fit_consumes_bound_curvature_and_rejects_source_drift(tmp_p
         ),
         inplace=False,
     )
-    with pytest.raises(TritiumError) as caught:
-        convert(rate_limited, receipt, work_dir=tmp_path / "rate-work")
-    assert caught.value.code == "unsupported_recipe"
+    adaptive_result = convert(
+        rate_limited, receipt, work_dir=tmp_path / "rate-work"
+    )
+    assert adaptive_result.algorithm_id == "tritium.diagonal-additive-adaptive@1"
+    assert adaptive_result.achieved_bpw <= 2.0
+    assert len(adaptive_result.weight("weight").planes) == 1
+    assert load_quantized_module(model, adaptive_result)(
+        torch.ones(1, 3)
+    ).shape == (1, 2)
 
     with torch.no_grad():
         prepared.model.weight[0, 0] += 1
     with pytest.raises(TritiumError) as caught:
         convert(prepared, receipt, work_dir=tmp_path / "drift-work")
     assert caught.value.code == "source_changed"
+
+
+def test_adaptive_module_artifact_packs_variable_weight_plane_count(tmp_path):
+    model = torch.nn.Linear(64, 2, bias=False)
+    prepared = prepare(
+        model,
+        TernaryConfig.ptq(
+            profile="compact-v1", target_modules=("Linear",), target_bpw=2.0
+        ),
+        inplace=False,
+    )
+    calibration = calibrate(
+        prepared,
+        [torch.ones(1, 64)],
+        evidence_dir=tmp_path / "adaptive-pack-evidence",
+    )
+    result = convert(
+        prepared, calibration, work_dir=tmp_path / "adaptive-pack-work"
+    )
+    assert 1 <= len(result.weight("weight").planes) <= 3
+    packed = result.pack_native(tmp_path / "adaptive-pack")
+    assert packed.tensors == 1
+    assert packed.serialized_bytes > 0
 
 
 def test_live_module_convert_fits_later_planes_against_stored_low_precision_scale(

@@ -29,6 +29,7 @@ from torch import nn
 from .. import _tritium
 from ..salt import reconcile_qwen36_ptq_packages
 from .artifacts import QuantizationResult, load
+from .allocation import allocate_planes
 from .config import TernaryConfig
 from .conversion import PreparedModel, prepare
 from .errors import TritiumError
@@ -2186,6 +2187,12 @@ def _diagonal_algorithm_id(planes: int) -> str:
     return f"tritium.diagonal-additive-{planes}@1"
 
 
+def _adaptive_diagonal_algorithm_id() -> str:
+    """Identity for measured weight-level rate-distortion allocation."""
+
+    return "tritium.diagonal-additive-adaptive@1"
+
+
 def _fit_module(
     prepared: PreparedModel,
     calibration: ActivationCalibrationReceipt,
@@ -2206,13 +2213,6 @@ def _fit_module(
         )
     if not isinstance(calibration, ActivationCalibrationReceipt):
         raise TypeError("module conversion requires an ActivationCalibrationReceipt")
-    if prepared.config.target_bpw is not None:
-        raise TritiumError(
-            "generic diagonal PTQ does not yet implement target_bpw allocation",
-            code="unsupported_recipe",
-            stage="convert",
-            details={"target_bpw": prepared.config.target_bpw},
-        )
     if type(max_working_bytes) is not int or max_working_bytes <= 0:
         raise ValueError("max_working_bytes must be a positive integer")
     if prepared.coverage is None:
@@ -2239,7 +2239,12 @@ def _fit_module(
             stage="convert",
         )
     parameters = dict(prepared.model.named_parameters(remove_duplicate=False))
-    algorithm_id = _diagonal_algorithm_id(prepared.config.planes)
+    adaptive = prepared.config.target_bpw is not None
+    algorithm_id = (
+        _adaptive_diagonal_algorithm_id()
+        if adaptive
+        else _diagonal_algorithm_id(prepared.config.planes)
+    )
     recipe_id = module_recipe_id(
         source_digest,
         calibration.evidence_id,
@@ -2264,6 +2269,71 @@ def _fit_module(
             )
         return min(record.outputs, (max_working_bytes - fixed_bytes) // per_row_bytes)
 
+    records = tuple(calibration.records)
+
+    def measured_error_curve(record: ActivationRecord) -> tuple[float, ...]:
+        """Measure weighted reconstruction error for every admissible plane count."""
+
+        try:
+            master = parameters[record.weight_aliases[0]]
+        except KeyError as error:
+            raise TritiumError(
+                "calibration refers to a missing source parameter",
+                code="evidence_geometry_mismatch",
+                stage="convert",
+                module=record.module,
+            ) from error
+        payload = (calibration.evidence_dir / record.file).read_bytes()
+        curvature = torch.frombuffer(bytearray(payload), dtype=torch.float64)
+        curvature = curvature / record.samples
+        if curvature.numel() != master.shape[1]:
+            raise TritiumError(
+                "calibration curvature does not match the selected weight",
+                code="evidence_geometry_mismatch",
+                stage="convert",
+                module=record.module,
+            )
+        objective_curvature = curvature
+        if float(objective_curvature.sum()) <= 0.0:
+            objective_curvature = torch.ones_like(objective_curvature)
+        curves = [0.0] * (prepared.config.planes + 1)
+        rows_per_chunk = chunk_rows(record)
+        for start in range(0, master.shape[0], rows_per_chunk):
+            stop = min(master.shape[0], start + rows_per_chunk)
+            master_chunk = master[start:stop]
+            dense = master_chunk.detach().cpu().to(torch.float64)
+            grouped_curvature = objective_curvature.to(torch.float64).reshape(
+                1, -1
+            )
+            curves[0] += float(
+                (dense.square() * grouped_curvature).sum()
+            )
+            for planes in range(1, prepared.config.planes + 1):
+                projection = _diagonal_additive_projection(
+                    master_chunk, objective_curvature, planes
+                )
+                error = (
+                    dense - projection.dense.to(torch.float64)
+                ).square()
+                curves[planes] += float((error * grouped_curvature).sum())
+        return tuple(curves)
+
+    plane_counts = None
+    if adaptive:
+        measured_curves = [measured_error_curve(record) for record in records]
+        allocation = allocate_planes(
+            [record.outputs * record.features for record in records],
+            [1.0 for _ in records],
+            measured_curves,
+            prepared.config.target_bpw,
+            t_min=1,
+            t_max=prepared.config.planes,
+        )
+        plane_counts = {
+            record.weight_aliases[0]: count
+            for record, count in zip(records, allocation.plane_counts)
+        }
+
     def fit_weight(
         record: ActivationRecord, writer: WeightCheckpointWriter
     ) -> float:
@@ -2285,7 +2355,7 @@ def _fit_module(
             stop = min(master.shape[0], start + rows_per_chunk)
             master_chunk = master[start:stop]
             projection = _diagonal_additive_projection(
-                master_chunk, curvature, prepared.config.planes
+                master_chunk, curvature, writer.plane_count
             )
             error = (
                 master_chunk.detach().cpu().to(torch.float64)
@@ -2304,10 +2374,11 @@ def _fit_module(
         recipe_id=recipe_id,
         config=prepared.config,
         coverage=prepared.coverage,
-        records=calibration.records,
+        records=records,
         fit_weight=fit_weight,
         fit_chunk_rows=chunk_rows,
         max_working_bytes=max_working_bytes,
+        plane_counts=plane_counts,
     )
 
 
