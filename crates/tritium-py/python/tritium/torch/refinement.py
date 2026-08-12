@@ -676,6 +676,10 @@ def _weight_mse(
     total = 0.0
     denominator = float(metric.sum()) * master.shape[0]
     metric_fp32 = metric.to(torch.float32)
+    # Teacher may remain resident on CUDA for the preceding evaluation. Pull
+    # each master weight across the bus once; slicing a CUDA tensor inside the
+    # loop turns every chunk into a synchronous transfer and dominates sealing.
+    master_cpu = master.detach().cpu().to(torch.float32)
     rows_per_chunk = max(1, (64 * 1024 * 1024) // max(1, master.shape[1] * 24))
     for start in range(0, master.shape[0], rows_per_chunk):
         end = min(master.shape[0], start + rows_per_chunk)
@@ -685,7 +689,7 @@ def _weight_mse(
                 plane.trits[start:end].to(torch.float32)
                 * plane.scales[start:end].to(torch.float32)
             )
-        residual = master[start:end].detach().cpu().to(torch.float32) - decoded
+        residual = master_cpu[start:end] - decoded
         total += float(
             (residual.square() * metric_fp32).sum(dtype=torch.float64)
         )
