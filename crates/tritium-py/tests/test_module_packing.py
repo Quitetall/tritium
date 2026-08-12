@@ -120,10 +120,10 @@ def test_native_package_preserves_legacy_g64_scales_on_g128_width(tmp_path):
     widened = load_module_conversion(work)
     packed = widened.pack_native(tmp_path / "packed", packing="b3")
     assert packed.tensors == 1
-    # Three planes retain eight G64 scales each.  The exact package ledger is
-    # 448 bytes; a smaller value would indicate adjacent G64 scales were
-    # coarsened back to G128 during export.
-    assert packed.serialized_bytes == 448
+    # The exact package ledger includes G64 scale geometry and format metadata;
+    # a smaller value would indicate adjacent G64 scales were coarsened back to
+    # G128 during export.
+    assert packed.serialized_bytes == 472
     assert load_packed_module(packed.artifact_dir) == packed
 
 
