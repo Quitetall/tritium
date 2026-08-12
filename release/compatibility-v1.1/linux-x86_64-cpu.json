@@ -7,8 +7,8 @@
   "host_os": "linux",
   "host_arch": "x86_64",
   "wheel": "tritium_torch-1.1.0rc1-cp39-abi3-manylinux_2_28_x86_64.whl",
-  "sha256": "7c62f1ed942690ce428847799474eb7dcce75b5136cfa60f93789c84f7c1d909",
-  "bytes": 10439259,
+  "sha256": "f3f2b0cfeeaf466915fe098e7ff72445afa83e343ae55d278bc568efb18239bd",
+  "bytes": 10439207,
   "version": "1.1.0rc1",
   "platform_tag": "manylinux_2_28_x86_64"
 }
