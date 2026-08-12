@@ -125,6 +125,11 @@ validate_estimators = ESTIMATOR_REFINEMENT_RECEIPT["validate_estimators"]
 validate_refinement = ESTIMATOR_REFINEMENT_RECEIPT["validate_refinement"]
 validate_baseline_ablation = ESTIMATOR_REFINEMENT_RECEIPT["validate_ablation"]
 EstimatorRefinementError = ESTIMATOR_REFINEMENT_RECEIPT["EstimatorRefinementError"]
+SOURCE_ADMISSION_RECEIPT = runpy.run_path(
+    Path(__file__).with_name("verify-qwen36-source-admission-receipt.py")
+)
+validate_source_admission = SOURCE_ADMISSION_RECEIPT["validate"]
+SourceAdmissionError = SOURCE_ADMISSION_RECEIPT["SourceAdmissionError"]
 
 SCHEMA = "tritium.release-evidence-registry.v1"
 REPORT_SCHEMA = "tritium.release-gate-report.v1"
@@ -163,6 +168,7 @@ KNOWN_KINDS = frozenset(
         "estimator-validation",
         "refinement",
         "baseline-ablation",
+        "source-admission",
     }
 )
 HEX = frozenset("0123456789abcdef")
@@ -171,6 +177,7 @@ MAX_RECEIPT_BYTES = 32 * 1024 * 1024
 # This policy is code, not registry input: a partial or adversarial registry cannot
 # remove release gates. New receipt schemas become useful only after a validator lands.
 GATES = (
+    ("qwen-source-admission", ("source-admission",)),
     (
         "flagship-qwen",
         ("conversion-refinement", "quality", "task-retention", "runtime", "physical-bytes"),
@@ -386,7 +393,7 @@ def evaluate(
             )
             else "model-bundle" if kind in {
                 "conversion-refinement", "quality", "task-retention", "runtime",
-                "physical-bytes", "stage7-recipe-freeze",
+                "physical-bytes", "stage7-recipe-freeze", "source-admission",
             }
             else "onnx-bundle" if kind == "onnx-inference"
             else "training-receipt-bundle" if kind in {"backend-manifest", "performance"}
@@ -547,6 +554,10 @@ def evaluate(
                 receipt = validate_baseline_ablation(
                     receipt_path, revision, release, candidate
                 )
+            elif kind == "source-admission":
+                receipt = validate_source_admission(
+                    receipt_path, revision, release, candidate
+                )
             elif kind in {"oci-runtime-cpu", "oci-runtime-cuda"}:
                 receipt = load_oci_runtime_receipt(
                     receipt_path, revision=revision, release=release,
@@ -628,6 +639,7 @@ def evaluate(
             DispatchOverheadError,
             DispatchCudaReceiptError,
             EstimatorRefinementError,
+            SourceAdmissionError,
             ValueError,
         ) as error:
             raise EvidenceError(f"{label} failed {kind} validation: {error}") from error
@@ -911,6 +923,17 @@ def evaluate(
             if actual != declared:
                 raise EvidenceError(
                     "stage7 recipe-freeze candidate artifact bytes differ"
+                )
+        elif kind == "source-admission":
+            _contained_file(candidate.parent, artifact.get("path"), "source-admission artifact path")
+            provenance = artifact.get("provenance")
+            if (
+                not isinstance(provenance, dict)
+                or provenance.get("source_model_id")
+                != receipt["receipt"]["source_model_id"]
+            ):
+                raise EvidenceError(
+                    "source-admission does not bind candidate source_model_id"
                 )
         elif receipt["artifact"]["kind"] != "python-wheel":
             raise EvidenceError(f"{kind} receipt does not identify a Python wheel")
