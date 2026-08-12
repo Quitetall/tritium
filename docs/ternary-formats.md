@@ -53,6 +53,10 @@ chooses raw bytes or a canonical byte-Huffman payload per chunk, and records a
 content digest plus physical offset in a fixed index. `read_range` decodes only
 chunks intersecting requested logical bytes, so package inspection, HTTP range
 fetch, and resumable transfer do not require whole-artifact materialization.
+`read_entropy_transport_seekable` accepts any `Read + Seek` source and reads
+only header/index at construction; chunk payloads are fetched with absolute
+seeks on demand. CLI `transport inspect` and `transport unpack` use this path,
+avoiding eager materialization of the full `.trns` file.
 
 This is transport/interchange compression, not a new runtime codec. Expanded
 TQ/SALT bytes remain the resident and physical-runtime denominator; no bpw,

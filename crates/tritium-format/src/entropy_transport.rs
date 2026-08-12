@@ -8,6 +8,7 @@
 use core::fmt;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
+use std::io::{Read, Seek, SeekFrom};
 
 use blake3::Hasher;
 
@@ -47,6 +48,19 @@ pub struct EntropyChunkInfo {
 #[derive(Debug)]
 pub struct EntropyTransport<'a> {
     bytes: &'a [u8],
+    logical_len: usize,
+    chunk_size: usize,
+    chunks: Vec<EntropyChunkInfo>,
+}
+
+/// File-backed parsed view over an entropy transport.
+///
+/// Construction reads only the fixed header and index. Payload bytes are fetched with an
+/// absolute seek for each requested chunk, so callers can inspect or decode large artifacts
+/// without first materializing the complete transport in memory.
+#[derive(Debug)]
+pub struct SeekableEntropyTransport<R> {
+    source: R,
     logical_len: usize,
     chunk_size: usize,
     chunks: Vec<EntropyChunkInfo>,
@@ -195,6 +209,58 @@ pub fn write_entropy_transport_with_chunk_size(
 
 /// Parse a transport without eagerly decoding all chunks.
 pub fn read_entropy_transport(bytes: &[u8]) -> Result<EntropyTransport<'_>, EntropyTransportError> {
+    let (logical_len, chunk_size, chunks) = parse_transport_metadata(
+        bytes,
+        u64::try_from(bytes.len()).map_err(|_| EntropyTransportError::LengthOverflow)?,
+    )?;
+    Ok(EntropyTransport {
+        bytes,
+        logical_len,
+        chunk_size,
+        chunks,
+    })
+}
+
+/// Parse a file-backed transport by reading only its header and fixed index.
+pub fn read_entropy_transport_seekable<R: Read + Seek>(
+    mut source: R,
+) -> Result<SeekableEntropyTransport<R>, EntropyTransportError> {
+    let source_len = source
+        .seek(SeekFrom::End(0))
+        .map_err(|_| EntropyTransportError::Truncated)?;
+    source
+        .seek(SeekFrom::Start(0))
+        .map_err(|_| EntropyTransportError::Truncated)?;
+    let mut header = [0u8; HEADER_BYTES];
+    source
+        .read_exact(&mut header)
+        .map_err(|_| EntropyTransportError::Truncated)?;
+    let index_bytes = usize::try_from(read_u64(&header, 28)?)
+        .map_err(|_| EntropyTransportError::LengthOverflow)?;
+    let index_end = HEADER_BYTES
+        .checked_add(index_bytes)
+        .ok_or(EntropyTransportError::LengthOverflow)?;
+    if u64::try_from(index_end).map_err(|_| EntropyTransportError::LengthOverflow)? > source_len {
+        return Err(EntropyTransportError::NonCanonicalIndex);
+    }
+    let mut metadata = vec![0u8; index_end];
+    metadata[..HEADER_BYTES].copy_from_slice(&header);
+    source
+        .read_exact(&mut metadata[HEADER_BYTES..])
+        .map_err(|_| EntropyTransportError::Truncated)?;
+    let (logical_len, chunk_size, chunks) = parse_transport_metadata(&metadata, source_len)?;
+    Ok(SeekableEntropyTransport {
+        source,
+        logical_len,
+        chunk_size,
+        chunks,
+    })
+}
+
+fn parse_transport_metadata(
+    bytes: &[u8],
+    source_len: u64,
+) -> Result<(usize, usize, Vec<EntropyChunkInfo>), EntropyTransportError> {
     if bytes.len() < HEADER_BYTES || bytes[..4] != ENTROPY_TRANSPORT_MAGIC {
         return Err(EntropyTransportError::BadMagic);
     }
@@ -278,7 +344,7 @@ pub fn read_entropy_transport(bytes: &[u8]) -> Result<EntropyTransport<'_>, Entr
         let payload_end = payload_offset
             .checked_add(u64::from(payload_len))
             .ok_or(EntropyTransportError::LengthOverflow)?;
-        if payload_end > u64::try_from(bytes.len()).unwrap() {
+        if payload_end > source_len {
             return Err(EntropyTransportError::Truncated);
         }
         logical_cursor = logical_cursor
@@ -294,17 +360,10 @@ pub fn read_entropy_transport(bytes: &[u8]) -> Result<EntropyTransport<'_>, Entr
             digest,
         });
     }
-    if logical_cursor != u64::try_from(logical_len).unwrap()
-        || payload_cursor != u64::try_from(bytes.len()).unwrap()
-    {
+    if logical_cursor != u64::try_from(logical_len).unwrap() || payload_cursor != source_len {
         return Err(EntropyTransportError::NonCanonicalIndex);
     }
-    Ok(EntropyTransport {
-        bytes,
-        logical_len,
-        chunk_size,
-        chunks,
-    })
+    Ok((logical_len, chunk_size, chunks))
 }
 
 impl<'a> EntropyTransport<'a> {
@@ -346,18 +405,7 @@ impl<'a> EntropyTransport<'a> {
             .bytes
             .get(start..end)
             .ok_or(EntropyTransportError::Truncated)?;
-        let decoded = if info.huffman {
-            decode_huffman(payload, info.logical_len as usize)?
-        } else {
-            if payload.len() != info.logical_len as usize {
-                return Err(EntropyTransportError::DecodedLengthMismatch);
-            }
-            payload.to_vec()
-        };
-        if digest(&decoded) != info.digest {
-            return Err(EntropyTransportError::DigestMismatch);
-        }
-        Ok(decoded)
+        decode_chunk(info, payload)
     }
 
     /// Decode and integrity-check an arbitrary logical byte range.
@@ -388,6 +436,103 @@ impl<'a> EntropyTransport<'a> {
     pub fn read_all(&self) -> Result<Vec<u8>, EntropyTransportError> {
         self.read_range(0, self.logical_len)
     }
+}
+
+impl<R: Read + Seek> SeekableEntropyTransport<R> {
+    /// Return the underlying source after releasing the parsed transport view.
+    #[must_use]
+    pub fn into_inner(self) -> R {
+        self.source
+    }
+
+    /// Number of logical bytes in the transport.
+    #[must_use]
+    pub const fn logical_len(&self) -> usize {
+        self.logical_len
+    }
+
+    /// Independently addressable chunk size.
+    #[must_use]
+    pub const fn chunk_size(&self) -> usize {
+        self.chunk_size
+    }
+
+    /// Number of chunks in the transport index.
+    #[must_use]
+    pub fn chunk_count(&self) -> usize {
+        self.chunks.len()
+    }
+
+    /// Return indexed metadata without reading any payload bytes.
+    pub fn chunk_info(&self, index: usize) -> Result<EntropyChunkInfo, EntropyTransportError> {
+        self.chunks
+            .get(index)
+            .copied()
+            .ok_or(EntropyTransportError::ChunkOutOfRange(index))
+    }
+
+    /// Seek to and decode one independently addressable chunk.
+    pub fn read_chunk(&mut self, index: usize) -> Result<Vec<u8>, EntropyTransportError> {
+        let info = self.chunk_info(index)?;
+        let payload_len =
+            usize::try_from(info.payload_len).map_err(|_| EntropyTransportError::LengthOverflow)?;
+        let mut payload = vec![0u8; payload_len];
+        self.source
+            .seek(SeekFrom::Start(info.payload_offset))
+            .map_err(|_| EntropyTransportError::Truncated)?;
+        self.source
+            .read_exact(&mut payload)
+            .map_err(|_| EntropyTransportError::Truncated)?;
+        decode_chunk(info, &payload)
+    }
+
+    /// Seek to and decode an arbitrary logical byte range.
+    pub fn read_range(
+        &mut self,
+        offset: usize,
+        len: usize,
+    ) -> Result<Vec<u8>, EntropyTransportError> {
+        let end = offset
+            .checked_add(len)
+            .ok_or(EntropyTransportError::RangeOutOfRange)?;
+        if end > self.logical_len {
+            return Err(EntropyTransportError::RangeOutOfRange);
+        }
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        let first = offset / self.chunk_size;
+        let last = (end - 1) / self.chunk_size;
+        let mut out = Vec::with_capacity(len);
+        for index in first..=last {
+            let chunk = self.read_chunk(index)?;
+            let chunk_start = index * self.chunk_size;
+            let from = offset.saturating_sub(chunk_start);
+            let to = (end - chunk_start).min(chunk.len());
+            out.extend_from_slice(&chunk[from..to]);
+        }
+        Ok(out)
+    }
+
+    /// Seek to and decode the complete logical stream.
+    pub fn read_all(&mut self) -> Result<Vec<u8>, EntropyTransportError> {
+        self.read_range(0, self.logical_len)
+    }
+}
+
+fn decode_chunk(info: EntropyChunkInfo, payload: &[u8]) -> Result<Vec<u8>, EntropyTransportError> {
+    let decoded = if info.huffman {
+        decode_huffman(payload, info.logical_len as usize)?
+    } else {
+        if payload.len() != info.logical_len as usize {
+            return Err(EntropyTransportError::DecodedLengthMismatch);
+        }
+        payload.to_vec()
+    };
+    if digest(&decoded) != info.digest {
+        return Err(EntropyTransportError::DigestMismatch);
+    }
+    Ok(decoded)
 }
 
 fn validate_chunk_size(chunk_size: usize) -> Result<(), EntropyTransportError> {
@@ -715,6 +860,27 @@ fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, EntropyTransportError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Cursor, Read, Seek, SeekFrom};
+
+    #[derive(Debug)]
+    struct CountingCursor {
+        cursor: Cursor<Vec<u8>>,
+        reads: usize,
+    }
+
+    impl Read for CountingCursor {
+        fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+            let count = self.cursor.read(bytes)?;
+            self.reads += count;
+            Ok(count)
+        }
+    }
+
+    impl Seek for CountingCursor {
+        fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+            self.cursor.seek(position)
+        }
+    }
 
     #[test]
     fn deterministic_compressible_roundtrip_and_range() {
@@ -797,6 +963,39 @@ mod tests {
         malformed[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
         assert!(matches!(
             read_entropy_transport(&malformed),
+            Err(EntropyTransportError::NonCanonicalIndex | EntropyTransportError::Truncated)
+        ));
+    }
+
+    #[test]
+    fn file_backed_reader_loads_index_then_only_selected_payloads() {
+        let source = vec![0u8; 192]
+            .into_iter()
+            .chain((0..192).map(|n| n as u8))
+            .collect::<Vec<_>>();
+        let encoded = write_entropy_transport_with_chunk_size(&source, 64).unwrap();
+        let mut reader = read_entropy_transport_seekable(CountingCursor {
+            cursor: Cursor::new(encoded.clone()),
+            reads: 0,
+        })
+        .unwrap();
+        assert_eq!(reader.chunk_count(), 6);
+        let header_and_index = HEADER_BYTES + 6 * INDEX_ENTRY_BYTES;
+        assert_eq!(reader.source.reads, header_and_index);
+        let info = reader.chunk_info(4).unwrap();
+        let before = reader.source.reads;
+        assert_eq!(reader.read_chunk(4).unwrap(), source[256..320]);
+        assert_eq!(reader.source.reads - before, info.payload_len as usize);
+        assert_eq!(reader.read_range(17, 141).unwrap(), source[17..158]);
+        assert_eq!(reader.read_all().unwrap(), source);
+    }
+
+    #[test]
+    fn file_backed_reader_rejects_truncated_source_before_payload_read() {
+        let encoded = write_entropy_transport_with_chunk_size(&[5; 128], 64).unwrap();
+        let truncated = encoded[..encoded.len() - 1].to_vec();
+        assert!(matches!(
+            read_entropy_transport_seekable(Cursor::new(truncated)),
             Err(EntropyTransportError::NonCanonicalIndex | EntropyTransportError::Truncated)
         ));
     }

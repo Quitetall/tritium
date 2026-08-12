@@ -3,7 +3,7 @@
 //! Transport bytes are delivery/storage bytes only. The command reports the logical
 //! fixed-codec size separately and never presents the transport size as resident VRAM.
 
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -11,7 +11,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{Context, bail};
 use clap::Subcommand;
 use tritium_format::{
-    EntropyTransportError, read_entropy_transport, write_entropy_transport_with_chunk_size,
+    EntropyTransportError, read_entropy_transport, read_entropy_transport_seekable,
+    write_entropy_transport_with_chunk_size,
 };
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -78,8 +79,8 @@ fn pack(input: &Path, output: &Path, chunk_size: usize) -> anyhow::Result<()> {
 }
 
 fn unpack(input: &Path, output: &Path) -> anyhow::Result<()> {
-    let encoded = fs::read(input).with_context(|| format!("read {}", input.display()))?;
-    let parsed = read_entropy_transport(&encoded)
+    let source = File::open(input).with_context(|| format!("read {}", input.display()))?;
+    let mut parsed = read_entropy_transport_seekable(source)
         .map_err(format_error)
         .context("parse TRNS transport")?;
     let logical = parsed
@@ -92,8 +93,11 @@ fn unpack(input: &Path, output: &Path) -> anyhow::Result<()> {
 }
 
 fn inspect(input: &Path) -> anyhow::Result<()> {
-    let encoded = fs::read(input).with_context(|| format!("read {}", input.display()))?;
-    let parsed = read_entropy_transport(&encoded)
+    let transport_bytes = fs::metadata(input)
+        .with_context(|| format!("stat {}", input.display()))?
+        .len();
+    let source = File::open(input).with_context(|| format!("read {}", input.display()))?;
+    let parsed = read_entropy_transport_seekable(source)
         .map_err(format_error)
         .context("parse TRNS transport")?;
     let huffman_chunks = (0..parsed.chunk_count())
@@ -104,7 +108,7 @@ fn inspect(input: &Path) -> anyhow::Result<()> {
         tritium_format::ENTROPY_TRANSPORT_VERSION
     );
     println!("logical_bytes: {}", parsed.logical_len());
-    println!("transport_bytes: {}", encoded.len());
+    println!("transport_bytes: {transport_bytes}");
     println!("chunk_size: {}", parsed.chunk_size());
     println!("chunks: {}", parsed.chunk_count());
     println!("huffman_chunks: {huffman_chunks}");
