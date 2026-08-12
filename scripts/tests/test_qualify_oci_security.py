@@ -18,7 +18,7 @@ validate_receipt = MODULE["validate_receipt"]
 def receipt(artifact: Path) -> dict:
     command = [
         "/usr/bin/trivy", "--cache-dir", "/cache", "image", "--input",
-        str(artifact.resolve()), "--format", "json", "--offline-scan",
+        "<layout>", "--format", "json", "--offline-scan",
         "--skip-db-update", "--skip-java-db-update", "--skip-check-update",
     ]
     value = {

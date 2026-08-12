@@ -9,20 +9,22 @@ import hashlib
 import json
 import math
 import os
-from pathlib import Path
 import re
 import secrets
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 
 SCHEMA = "tritium.oci-security-qualification.v1"
 HEX = frozenset("0123456789abcdef")
 MAX_REPORT_BYTES = 128 * 1024 * 1024
+MAX_LAYOUT_MEMBER_BYTES = 512 * 1024 * 1024
 RC_PATTERN = re.compile(r"1\.1\.0-rc\.(0|[1-9][0-9]*)")
 RUN_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 VERSION_PATTERN = re.compile(r"v?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?")
@@ -122,6 +124,42 @@ def report_findings(report: Any, scanner: str) -> int:
     return count
 
 
+def stage_oci_layout(archive: Path, destination: Path) -> None:
+    """Extract a tarred OCI layout into a scanner-readable directory safely."""
+    destination.mkdir()
+    seen: set[str] = set()
+    try:
+        with tarfile.open(archive, mode="r:*") as stream:
+            for member in stream.getmembers():
+                name = member.name
+                logical = PurePosixPath(name)
+                if (
+                    not name
+                    or logical.is_absolute()
+                    or ".." in logical.parts
+                    or "\\" in name
+                    or name in seen
+                ):
+                    raise SecurityScanError("OCI archive contains an unsafe or duplicate member")
+                seen.add(name)
+                target = destination.joinpath(*logical.parts)
+                if member.isdir():
+                    target.mkdir(parents=True, exist_ok=True)
+                    continue
+                if not member.isreg() or member.size < 0 or member.size > MAX_LAYOUT_MEMBER_BYTES:
+                    raise SecurityScanError("OCI archive contains a non-regular or oversized member")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                source = stream.extractfile(member)
+                if source is None:
+                    raise SecurityScanError("OCI archive member has no readable payload")
+                with source, target.open("xb") as output:
+                    shutil.copyfileobj(source, output)
+    except (OSError, tarfile.TarError) as error:
+        raise SecurityScanError(f"OCI archive extraction failed: {error}") from error
+    if not (destination / "index.json").is_file() or not (destination / "oci-layout").is_file():
+        raise SecurityScanError("OCI archive does not contain a complete layout")
+
+
 def atomic_create(path: Path, payload: bytes) -> None:
     if path.exists() or path.is_symlink():
         raise SecurityScanError("refusing to overwrite output")
@@ -181,14 +219,16 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
             or next_update < started_at
             or started_at - updated > timedelta(hours=args.max_db_age_hours)):
         raise SecurityScanError("Trivy vulnerability database is stale or future-dated")
-    common = [
-        "image", "--input", str(archive), "--format", "json", "--offline-scan",
-        "--skip-db-update", "--skip-java-db-update", "--skip-check-update",
-    ]
     with tempfile.TemporaryDirectory(prefix="tritium-oci-scan-") as raw:
         temporary = Path(raw)
+        layout = temporary / "layout"
+        stage_oci_layout(archive, layout)
         vuln_output = temporary / "vulnerability.json"
         secret_output = temporary / "secret.json"
+        common = [
+            "image", "--input", str(layout), "--format", "json", "--offline-scan",
+            "--skip-db-update", "--skip-java-db-update", "--skip-check-update",
+        ]
         vuln_command = base + common + [
             "--scanners", "vuln", "--severity", "HIGH,CRITICAL", "--output",
             str(vuln_output),
@@ -216,7 +256,10 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
                      "bytes": archive.stat().st_size, "sha256": sha256(archive)},
         "scanner": {"name": "trivy", "version": version_number,
                     "executable_sha256": sha256(executable),
-                    "commands": [vuln_command, secret_command]},
+                    "commands": [
+                        [*vuln_command[:5], "<layout>", *vuln_command[6:]],
+                        [*secret_command[:5], "<layout>", *secret_command[6:]],
+                    ]},
         "database": {"updated_at": database["UpdatedAt"],
                      "downloaded_at": database["DownloadedAt"],
                      "next_update": database["NextUpdate"],
@@ -275,7 +318,7 @@ def validate_receipt(receipt: dict[str, Any], *, artifact_path: Path,
         raise SecurityScanError("security receipt command contract differs")
     common = [
         "<executable>", "--cache-dir", "<cache>", "image", "--input",
-        str(artifact_path), "--format", "json", "--offline-scan", "--skip-db-update",
+        "<layout>", "--format", "json", "--offline-scan", "--skip-db-update",
         "--skip-java-db-update", "--skip-check-update",
     ]
     normalized = []
@@ -285,6 +328,8 @@ def validate_receipt(receipt: dict[str, Any], *, artifact_path: Path,
         item = list(command)
         item[0] = "<executable>"
         item[2] = "<cache>"
+        if item[5] != "<layout>":
+            raise SecurityScanError("security receipt command layout placeholder differs")
         item[-1] = "<output>"
         normalized.append(item)
     expected = [

@@ -219,7 +219,7 @@ def oci_runtime_receipt(path: Path, artifact: Path, *, flavor: str = "cpu") -> d
 def oci_security_receipt(path: Path, artifact: Path, *, flavor: str = "cpu") -> dict:
     common = [
         "/usr/bin/trivy", "--cache-dir", "/cache", "image", "--input",
-        str(artifact.resolve()), "--format", "json", "--offline-scan",
+        "<layout>", "--format", "json", "--offline-scan",
         "--skip-db-update", "--skip-java-db-update", "--skip-check-update",
     ]
     value = {
