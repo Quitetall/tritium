@@ -44,7 +44,7 @@ blake3 = { workspace = true }
 half = { workspace = true }
 ort = { workspace = true }
 # `abi3-py39`: build one wheel that works on CPython 3.9+ (forward-compatible).
-pyo3 = { workspace = true, features = ["extension-module", "abi3-py39"] }
+pyo3 = { workspace = true, features = ["abi3-py39"] }
 dlpark = { workspace = true }
 ndarray = { workspace = true }
 
@@ -56,6 +56,7 @@ rustix = { version = "1", features = ["fs"] }
 
 [features]
 default = []
+extension-module = ["pyo3/extension-module"]
 cuda = ["dep:tritium-cuda", "tritium-cuda/cuda", "tritium-nn/cuda"]
 
 [lints]
