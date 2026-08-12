@@ -250,3 +250,36 @@ def test_qwen36_oracle_avoids_hidden_state_capture_path() -> None:
     assert output.mtp_hidden_states.shape == (1, 2, 4)
     assert torch.equal(output.mtp_logits, model.lm_head(output.mtp_hidden_states))
     assert output.logits.shape == (1, 2, 8)
+
+
+def test_qwen36_oracle_rejects_cached_decode_state() -> None:
+    class Norm(nn.Module):
+        def forward(self, values):
+            return values
+
+    class Language(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = nn.Embedding(8, 4)
+            self.norm = Norm()
+
+        def forward(self, input_ids):
+            return self.norm(self.embed(input_ids))
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = nn.Module()
+            self.model.language_model = Language()
+            self.mtp = nn.Identity()
+            self.lm_head = nn.Linear(4, 8, bias=False)
+
+        def forward(self, input_ids, **_kwargs):
+            hidden = self.model.language_model(input_ids)
+            return SimpleNamespace(logits=self.lm_head(hidden), loss=None)
+
+    with pytest.raises(Qwen36ComponentError, match="does not share cached states"):
+        Qwen36LanguageMtpOracle(Model())(
+            input_ids=torch.tensor([[1]]),
+            past_key_values=object(),
+        )
