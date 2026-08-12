@@ -42,6 +42,7 @@ use tritium_core::TritError;
 
 mod artifact;
 mod codec_bundle;
+mod entropy_transport;
 mod gguf;
 mod gguf_write;
 mod i2s;
@@ -77,6 +78,12 @@ pub use codec_bundle::{
     CODEC_BUNDLE_MAGIC, CODEC_BUNDLE_VERSION, CdfLut, CodecBundle, CodecBundleError,
     Conv1dTensorMeta, FsqLayerMeta, LsqAlpha, MAX_CODEC_BUNDLE_BYTES, RotationMatrix,
     read_codec_bundle, write_codec_bundle,
+};
+pub use entropy_transport::{
+    ENTROPY_TRANSPORT_DEFAULT_CHUNK_BYTES, ENTROPY_TRANSPORT_MAGIC,
+    ENTROPY_TRANSPORT_MAX_CHUNK_BYTES, ENTROPY_TRANSPORT_MIN_CHUNK_BYTES,
+    ENTROPY_TRANSPORT_VERSION, EntropyChunkInfo, EntropyTransport, EntropyTransportError,
+    read_entropy_transport, write_entropy_transport, write_entropy_transport_with_chunk_size,
 };
 pub use gguf::{
     DEFAULT_ALIGNMENT, GGML_TYPE_Q2_0, GGML_TYPE_TQ1_0, GGML_TYPE_TQ2_0, GgufError, GgufFile,

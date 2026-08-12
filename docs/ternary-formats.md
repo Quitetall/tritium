@@ -44,6 +44,22 @@ TQ1 skips the IMMA prefill shadows — a measured batched-spec serve saved
 674 MiB total (payload −18% PLUS the dropped ~0.25 B/w IMMA shadows), at
 the cost of dp4a-only prefill. Pick tq1 for VRAM, tq2 for prefill speed.
 
+## Seekable entropy transport: bytes at rest only
+
+`tritium-format` exposes `write_entropy_transport` and
+`read_entropy_transport` for an outer `TRNS` container. It splits any canonical
+fixed-codec artifact into deterministic power-of-two chunks (64 KiB by default),
+chooses raw bytes or a canonical byte-Huffman payload per chunk, and records a
+content digest plus physical offset in a fixed index. `read_range` decodes only
+chunks intersecting requested logical bytes, so package inspection, HTTP range
+fetch, and resumable transfer do not require whole-artifact materialization.
+
+This is transport/interchange compression, not a new runtime codec. Expanded
+TQ/SALT bytes remain the resident and physical-runtime denominator; no bpw,
+VRAM, or kernel-throughput claim may use `TRNS` bytes. Raw fallback keeps
+incompressible chunks from growing, while per-chunk digests and canonical
+metadata make mutation and non-deterministic encoders fail closed.
+
 ## TB1 bitmap+signs: measured, refuted, kept
 
 A 1.578-bpw bitmap+signs layout (one zero/nonzero bit per element + a packed
