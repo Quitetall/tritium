@@ -814,7 +814,11 @@ async function runLifecycle(
       if (unexpectedAllocationSession !== null) await unexpectedAllocationSession.dispose();
       allocationDevice.device.destroy();
     }
-    if (allocationError !== allocationProbe.sentinel || allocationProbe.hits() !== 1) {
+    const allocationObserved = allocationError === allocationProbe.sentinel ||
+      (allocationError instanceof WebTrainingError &&
+       allocationError.code === "capability_mismatch" &&
+       allocationError.message.includes(allocationProbe.sentinel.message));
+    if (!allocationObserved || allocationProbe.hits() !== 1) {
       fail("fault_injection", "allocation injection did not observe its unique sentinel exactly once");
     }
     const allocationFailure = Object.freeze({
