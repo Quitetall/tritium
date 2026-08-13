@@ -770,7 +770,9 @@ export async function qualifyBrowserLaneV1(options) {
       nativeReference.receiptDigest,
     ]);
     if (!result || result.ok !== true || typeof result.value !== "object" || result.value === null) {
-      fail("browser", `physical browser qualification failed: ${result?.error?.code ?? "malformed result"}`);
+      const code = result?.error?.code ?? "malformed result";
+      const message = typeof result?.error?.message === "string" ? `: ${result.error.message}` : "";
+      fail("browser", `physical browser qualification failed: ${code}${message}`);
     }
     const browserVersion = nonEmpty(options.expectedBrowserVersion, "expected browser version");
     if (session.capabilities.browserVersion !== browserVersion) {
