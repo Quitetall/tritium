@@ -64,6 +64,7 @@ impl Default for JointFitConfig {
 pub struct DensePsdMetric {
     dimension: usize,
     values: Vec<f64>,
+    diagonal: Option<Vec<f64>>,
 }
 
 impl DensePsdMetric {
@@ -98,6 +99,7 @@ impl DensePsdMetric {
         }
 
         let mut canonical_values = values.to_vec();
+        let mut is_diagonal = true;
         for row in 0..dimension {
             for col in row + 1..dimension {
                 let upper = values[row * dimension + col];
@@ -111,6 +113,7 @@ impl DensePsdMetric {
                 let symmetric = upper * 0.5 + lower * 0.5;
                 canonical_values[row * dimension + col] = symmetric;
                 canonical_values[col * dimension + row] = symmetric;
+                is_diagonal &= symmetric == 0.0;
             }
             // Every PSD diagonal is non-negative. Reject an explicitly negative stored diagonal
             // at any scale; Schur-complement roundoff is handled separately below.
@@ -173,6 +176,11 @@ impl DensePsdMetric {
         Ok(Self {
             dimension,
             values: canonical_values,
+            diagonal: is_diagonal.then(|| {
+                (0..dimension)
+                    .map(|index| values[index * dimension + index])
+                    .collect()
+            }),
         })
     }
 
@@ -237,6 +245,12 @@ impl DensePsdMetric {
         any_positive.then_some(Self {
             dimension: self.dimension,
             values,
+            diagonal: self.diagonal.as_ref().map(|diagonal| {
+                diagonal
+                    .iter()
+                    .map(|value| value * scale + diagonal_shift)
+                    .collect()
+            }),
         })
     }
 
@@ -244,18 +258,8 @@ impl DensePsdMetric {
     ///
     /// This is intentionally exact: callers may replace dense quadratic scoring with the
     /// mathematically equivalent diagonal path only when no curvature information is discarded.
-    pub(crate) fn exact_diagonal(&self) -> Option<Vec<f64>> {
-        if (0..self.dimension).any(|row| {
-            (0..self.dimension)
-                .any(|column| row != column && self.values[row * self.dimension + column] != 0.0)
-        }) {
-            return None;
-        }
-        Some(
-            (0..self.dimension)
-                .map(|index| self.values[index * self.dimension + index])
-                .collect(),
-        )
+    pub(crate) fn exact_diagonal(&self) -> Option<&[f64]> {
+        self.diagonal.as_deref()
     }
 }
 

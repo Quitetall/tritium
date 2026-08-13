@@ -3817,8 +3817,8 @@ fn curvature_metric<'a>(
             let scale = factors.output_weights[output_row];
             if let Some(diagonal) = input.exact_diagonal() {
                 let values = diagonal
-                    .into_iter()
-                    .map(|value| value * scale + factors.damping)
+                    .iter()
+                    .map(|value| *value * scale + factors.damping)
                     .collect::<Vec<_>>();
                 return Ok(ResolvedCurvatureMetric::OwnedDiagonal(values));
             }
