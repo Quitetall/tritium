@@ -139,7 +139,7 @@ fn modulo_million(value: U64) -> u32 {
     return remainder;
 }
 
-fn uniform(index: u32) -> f32 {
+fn sample_uniform(index: u32) -> f32 {
     let product = multiply_index(index);
     var state = U64(params.seed_low ^ product.low, params.seed_high ^ product.high);
     state.low |= 1u;
@@ -178,7 +178,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         if (params.estimator == 2u) {
             position = clamp(position, 0.0, maximum);
             let base = floor(position);
-            code = base + select(0.0, 1.0, uniform(index) < position - base);
+            code = base + select(0.0, 1.0, sample_uniform(index) < position - base);
         } else {
             code = floor(position + 0.5);
         }
