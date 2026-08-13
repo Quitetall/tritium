@@ -182,6 +182,22 @@ function member(value: object, name: PropertyKey): unknown {
   }
 }
 
+function jsonRecord(value: unknown): Readonly<Record<PropertyKey, unknown>> | undefined {
+  let encoded: string;
+  try {
+    encoded = JSON.stringify(value);
+  } catch {
+    return undefined;
+  }
+  if (encoded.length === 0 || encoded.length > 16 * 1024) return undefined;
+  try {
+    const parsed: unknown = JSON.parse(encoded);
+    return record(parsed) ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function nonEmpty(value: unknown, label: string): string {
   if (typeof value !== "string" || value.trim().length === 0) {
     fail("device_identity", `${label} must be a non-empty string`);
@@ -365,25 +381,35 @@ async function adapterInfo(adapter: BrowserGpuAdapter): Promise<PhysicalBrowserA
     fail("device_identity", "WebGPU adapter is fallback or cannot prove physical execution");
   }
 
+  // Firefox exposes wgpu diagnostics through GPUAdapterInfo.toJSON() while
+  // leaving named property access empty. Read bounded JSON only as a fallback;
+  // direct WebGPU properties remain authoritative when present.
+  const serializedInfo = jsonRecord(info);
+  const infoValue = (name: PropertyKey): unknown => {
+    const direct = member(info as object, name);
+    if (direct !== undefined && direct !== null && direct !== "") return direct;
+    return serializedInfo === undefined ? undefined : member(serializedInfo, name);
+  };
+
   // Firefox 153 exposes its physical Vulkan identity through wgpu-prefixed
   // fields while leaving the standard GPUAdapterInfo strings empty. Accept
   // that shape only when it also proves a discrete/integrated hardware
   // adapter, preserving fail-closed behavior for anonymous or software
   // adapters.
-  const wgpuName = member(info, "wgpuName");
-  const wgpuBackend = member(info, "wgpuBackend");
-  const wgpuDeviceType = member(info, "wgpuDeviceType");
-  const wgpuDriver = member(info, "wgpuDriver");
-  const wgpuDriverInfo = member(info, "wgpuDriverInfo");
+  const wgpuName = infoValue("wgpuName");
+  const wgpuBackend = infoValue("wgpuBackend");
+  const wgpuDeviceType = infoValue("wgpuDeviceType");
+  const wgpuDriver = infoValue("wgpuDriver");
+  const wgpuDriverInfo = infoValue("wgpuDriverInfo");
   const firefoxPhysical = typeof wgpuName === "string" && wgpuName.trim().length > 0 &&
     typeof wgpuBackend === "string" && wgpuBackend.trim().length > 0 &&
     (wgpuDeviceType === "DiscreteGpu" || wgpuDeviceType === "IntegratedGpu");
   const text = (value: unknown): string | undefined =>
     typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
-  const standardVendor = text(member(info, "vendor"));
-  const standardArchitecture = text(member(info, "architecture"));
-  const standardDevice = text(member(info, "device"));
-  const standardDescription = text(member(info, "description"));
+  const standardVendor = text(infoValue("vendor"));
+  const standardArchitecture = text(infoValue("architecture"));
+  const standardDevice = text(infoValue("device"));
+  const standardDescription = text(infoValue("description"));
   const vendor = standardVendor ?? (firefoxPhysical ? text(wgpuDriver) : undefined);
   const architecture = standardArchitecture ?? (
     firefoxPhysical ? `${String(wgpuBackend).trim()}/${String(wgpuDeviceType).trim()}` : undefined

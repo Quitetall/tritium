@@ -156,11 +156,20 @@ test("Firefox wgpu identity proves hardware before vector qualification", async 
               device: "",
               description: "",
               isFallbackAdapter: false,
-              wgpuBackend: "Vulkan",
-              wgpuDeviceType: "DiscreteGpu",
-              wgpuDriver: "NVIDIA",
-              wgpuDriverInfo: "610.57.04",
-              wgpuName: "NVIDIA GeForce RTX 4090",
+              toJSON() {
+                return {
+                  vendor: "",
+                  architecture: "",
+                  device: "",
+                  description: "",
+                  isFallbackAdapter: false,
+                  wgpuBackend: "Vulkan",
+                  wgpuDeviceType: "DiscreteGpu",
+                  wgpuDriver: "NVIDIA",
+                  wgpuDriverInfo: "610.57.04",
+                  wgpuName: "NVIDIA GeForce RTX 4090",
+                };
+              },
             },
             async requestDevice() {
               const device = new FakeDevice();
