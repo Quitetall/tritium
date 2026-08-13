@@ -4,6 +4,7 @@ use core::fmt;
 use std::{collections::BTreeSet, io::Write};
 
 use half::f16;
+use rayon::prelude::*;
 use tritium_format::salt_v2::{SaltV2Codec, SaltV2CodecError};
 pub use tritium_format::salt_v2_master::SaltV2FitConstraint;
 use tritium_format::salt_v2_master::{
@@ -1660,35 +1661,48 @@ fn fit_salt_v2_tensor_master_with_spec<W: Write>(
     let tile_count = tensor.weights.len().div_ceil(SALT_V2_ALLOCATION_TILE_SIZE);
     let required_planes = usize::from(spec.geometry().max_planes);
     let mut encoder = SaltV2MasterTensorEncoder::new(&spec, sink)?;
-    for tile_index in 0..tile_count {
-        let start = tile_index
-            .checked_mul(SALT_V2_ALLOCATION_TILE_SIZE)
-            .ok_or(SaltV2Error::AccountingOverflow)?;
-        let end = (start + SALT_V2_ALLOCATION_TILE_SIZE).min(tensor.weights.len());
-        let tile = fit_tile_frontier(tensor_index, tile_index, start, end, &tensor, config)?;
-        if tile.master.planes().len() != required_planes
-            || tile.losses.len() != required_planes
-            || tile.candidates.is_empty()
-            || tile.candidates.len() > required_planes
-            || tile
-                .candidates
-                .iter()
-                .enumerate()
-                .any(|(prefix, candidate)| {
-                    candidate.planes != (prefix + 1) as u8
-                        || candidate.tile.planes() != &tile.master.planes()[..=prefix]
-                })
-        {
-            return Err(SaltV2Error::MasterPrefixMismatch {
-                tensor_index,
-                tile_index,
-            });
+    // Fit bounded tile batches in parallel, then emit each batch in canonical order. This keeps
+    // sink memory bounded while allowing large row-major matrices (Qwen lm_head/embed) to use all
+    // available CPU cores. Tile fits are independent; ordered collection preserves byte output.
+    const TILE_BATCH: usize = 4096;
+    for batch_start in (0..tile_count).step_by(TILE_BATCH) {
+        let batch_end = (batch_start + TILE_BATCH).min(tile_count);
+        let tiles = (batch_start..batch_end)
+            .into_par_iter()
+            .map(|tile_index| {
+                let start = tile_index
+                    .checked_mul(SALT_V2_ALLOCATION_TILE_SIZE)
+                    .ok_or(SaltV2Error::AccountingOverflow)?;
+                let end = (start + SALT_V2_ALLOCATION_TILE_SIZE).min(tensor.weights.len());
+                fit_tile_frontier(tensor_index, tile_index, start, end, &tensor, config)
+            })
+            .collect::<Result<Vec<_>, SaltV2Error>>()?;
+        for (offset, tile) in tiles.into_iter().enumerate() {
+            let tile_index = batch_start + offset;
+            if tile.master.planes().len() != required_planes
+                || tile.losses.len() != required_planes
+                || tile.candidates.is_empty()
+                || tile.candidates.len() > required_planes
+                || tile
+                    .candidates
+                    .iter()
+                    .enumerate()
+                    .any(|(prefix, candidate)| {
+                        candidate.planes != (prefix + 1) as u8
+                            || candidate.tile.planes() != &tile.master.planes()[..=prefix]
+                    })
+            {
+                return Err(SaltV2Error::MasterPrefixMismatch {
+                    tensor_index,
+                    tile_index,
+                });
+            }
+            encoder.write_tile(
+                u8::try_from(tile.candidates.len()).map_err(|_| SaltV2Error::AccountingOverflow)?,
+                &tile.losses,
+                tile.master.planes(),
+            )?;
         }
-        encoder.write_tile(
-            u8::try_from(tile.candidates.len()).map_err(|_| SaltV2Error::AccountingOverflow)?,
-            &tile.losses,
-            tile.master.planes(),
-        )?;
     }
     let receipt = encoder.finish()?;
     Ok(SaltV2TensorMasterFitResult { spec, receipt })
