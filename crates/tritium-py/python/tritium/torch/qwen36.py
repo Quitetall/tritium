@@ -369,6 +369,9 @@ class Qwen36LanguageMtpOracle(nn.Module):
         inputs_embeds: Optional[torch.Tensor] = None,
         **kwargs: Any,
     ) -> Qwen36LanguageMtpOutput:
+        skip_logits = kwargs.pop("_tritium_skip_logits", False)
+        if type(skip_logits) is not bool:
+            raise Qwen36ComponentError("_tritium_skip_logits must be boolean")
         if past_key_values is not None:
             raise Qwen36ComponentError(
                 "Qwen3.6 oracle does not share cached states between language and MTP graphs"
@@ -389,14 +392,24 @@ class Qwen36LanguageMtpOracle(nn.Module):
         base_kwargs["output_hidden_states"] = False
         base_kwargs["use_cache"] = False
         try:
-            base_output = self._model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                inputs_embeds=inputs_embeds,
-                **base_kwargs,
-            )
+            if skip_logits:
+                base_output = self._language_model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    inputs_embeds=inputs_embeds,
+                    **base_kwargs,
+                )
+            else:
+                base_output = self._model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    inputs_embeds=inputs_embeds,
+                    **base_kwargs,
+                )
         finally:
             handle.remove()
         if len(hidden) != 1:
@@ -439,8 +452,11 @@ class Qwen36LanguageMtpOracle(nn.Module):
         )
         if not isinstance(mtp_hidden, torch.Tensor):
             raise Qwen36ComponentError("Qwen3.6 MTP graph must return one hidden-state tensor")
-        lm_head_device = self._lm_head.weight.device
-        mtp_logits = self._lm_head(mtp_hidden.to(lm_head_device))
+        if skip_logits:
+            mtp_logits = torch.empty(0, dtype=mtp_hidden.dtype, device=mtp_hidden.device)
+        else:
+            lm_head_device = self._lm_head.weight.device
+            mtp_logits = self._lm_head(mtp_hidden.to(lm_head_device))
         return Qwen36LanguageMtpOutput(
             base_output=base_output,
             mtp_hidden_states=mtp_hidden,
