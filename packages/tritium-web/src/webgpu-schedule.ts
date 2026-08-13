@@ -1196,8 +1196,7 @@ export function compileWebGpuResidentScheduleV1(
         const candidateParameter = auxiliary("adamw-parameter-candidate", bytes, null);
         const candidateMoment1 = auxiliary("adamw-moment1-candidate", bytes, null);
         const candidateMoment2 = auxiliary("adamw-moment2-candidate", bytes, null);
-        const scratch1 = auxiliary("adamw-scratch-1", bytes, null);
-        const scratch2 = auxiliary("adamw-scratch-2", bytes, null);
+        const scratch = auxiliary("adamw-scratch", bytes * 2, null);
         let aligned: string | undefined;
         let zero: string | undefined;
         if (cautious) {
@@ -1227,29 +1226,29 @@ export function compileWebGpuResidentScheduleV1(
             indexedStage(invocation, 0, "adamw", params, {
               1: parameter, 2: gradient, 3: moment1, 4: moment2,
               5: candidateParameter, 6: candidateMoment1, 7: candidateMoment2,
-              8: scratch1, 9: scratch2,
+              8: scratch,
             }, workgroups),
             indexedStage(invocation, 1, "adamw_terms", params, {
-              2: gradient, 6: candidateMoment1, 8: scratch1, 9: scratch2,
+              2: gradient, 6: candidateMoment1, 8: scratch,
             }, workgroups),
             indexedStage(invocation, 2, "adamw_variance", params, {
-              7: candidateMoment2, 9: scratch2,
+              7: candidateMoment2, 8: scratch,
             }, workgroups),
           ];
           if (cautious) {
             commands.push(
               indexedStage(invocation, 3, "cautious_adamw_mask", params, {
                 2: gradient, 6: candidateMoment1, 7: candidateMoment2,
-                8: scratch1, 10: aligned!,
+                8: scratch, 10: aligned!,
               }, workgroups),
               indexedStage(invocation, 4, "cautious_adamw_lr", params, {
-                8: scratch1,
+                8: scratch,
               }, workgroups),
               indexedStage(invocation, 5, "cautious_adamw_rescale", params, {
-                8: scratch1, 10: aligned!,
+                8: scratch, 10: aligned!,
               }, workgroups),
               indexedStage(invocation, 6, "cautious_adamw_finish", params, {
-                5: candidateParameter, 8: scratch1,
+                5: candidateParameter, 8: scratch,
               }, workgroups),
             );
           } else {

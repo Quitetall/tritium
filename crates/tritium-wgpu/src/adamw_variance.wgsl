@@ -15,12 +15,12 @@ struct Params {
 
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(7) var<storage, read_write> updated_moment2: array<f32>;
-@group(0) @binding(9) var<storage, read_write> scratch2: array<f32>;
+@group(0) @binding(8) var<storage, read_write> scratch: array<f32>;
 
 @compute @workgroup_size(64, 1, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let index = gid.x;
     if (index < params.len) {
-        updated_moment2[index] = updated_moment2[index] + scratch2[index];
+        updated_moment2[index] = updated_moment2[index] + scratch[params.len + index];
     }
 }

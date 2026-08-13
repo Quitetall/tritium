@@ -1617,8 +1617,15 @@ impl WgpuBackend {
         let updated_parameter = output("portable-adamw-updated-parameter");
         let updated_moment1 = output("portable-adamw-updated-moment1");
         let updated_moment2 = output("portable-adamw-updated-moment2");
-        let scratch1 = output("portable-adamw-scratch1");
-        let scratch2 = output("portable-adamw-scratch2");
+        let scratch_bytes = bytes
+            .checked_mul(2)
+            .expect("portable AdamW scratch size overflow");
+        let scratch = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("portable-adamw-scratch"),
+            size: scratch_bytes,
+            usage: storage,
+            mapped_at_creation: false,
+        });
         let aligned = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1667,11 +1674,11 @@ impl WgpuBackend {
                 },
                 wgpu::BindGroupEntry {
                     binding: 8,
-                    resource: scratch1.as_entire_binding(),
+                    resource: scratch.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 9,
-                    resource: scratch2.as_entire_binding(),
+                    resource: scratch.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 10,

@@ -21,8 +21,7 @@ struct Params {
 @group(0) @binding(5) var<storage, read_write> updated_parameter: array<f32>;
 @group(0) @binding(6) var<storage, read_write> updated_moment1: array<f32>;
 @group(0) @binding(7) var<storage, read_write> updated_moment2: array<f32>;
-@group(0) @binding(8) var<storage, read_write> scratch1: array<f32>;
-@group(0) @binding(9) var<storage, read_write> scratch2: array<f32>;
+@group(0) @binding(8) var<storage, read_write> scratch: array<f32>;
 
 @compute @workgroup_size(64, 1, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -30,9 +29,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (index < params.len) {
         let g = gradient[index];
         updated_moment1[index] = params.beta1 * moment1[index];
-        scratch1[index] = (1.0 - params.beta1) * g;
+        scratch[index] = (1.0 - params.beta1) * g;
         updated_moment2[index] = params.beta2 * moment2[index];
-        scratch2[index] = (1.0 - params.beta2) * g;
+        scratch[params.len + index] = (1.0 - params.beta2) * g;
         updated_parameter[index] = parameter[index] * params.shrink;
     }
 }
