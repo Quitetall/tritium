@@ -141,9 +141,25 @@ test("no-op structural WebGPU cannot produce a physical lane", async () => {
   }
 });
 
-test("Firefox wgpu identity proves hardware before vector qualification", async () => {
+test("Firefox non-fallback adapter uses WebGL hardware identity before vector qualification", async () => {
   const devices = [];
   const priorNavigator = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+  const priorDocument = Object.getOwnPropertyDescriptor(globalThis, "document");
+  const webgl = {
+    getExtension(name) {
+      assert.equal(name, "WEBGL_debug_renderer_info");
+      return { UNMASKED_VENDOR_WEBGL: 0x9245, UNMASKED_RENDERER_WEBGL: 0x9246 };
+    },
+    getParameter(name) {
+      return name === 0x9245 ? "NVIDIA Corporation" : "NVIDIA GeForce RTX 4090";
+    },
+  };
+  const document = {
+    createElement(name) {
+      assert.equal(name, "canvas");
+      return { getContext: (kind) => kind === "webgl2" ? webgl : null };
+    },
+  };
   Object.defineProperty(globalThis, "navigator", {
     configurable: true,
     value: {
@@ -156,20 +172,6 @@ test("Firefox wgpu identity proves hardware before vector qualification", async 
               device: "",
               description: "",
               isFallbackAdapter: false,
-              toJSON() {
-                return {
-                  vendor: "",
-                  architecture: "",
-                  device: "",
-                  description: "",
-                  isFallbackAdapter: false,
-                  wgpuBackend: "Vulkan",
-                  wgpuDeviceType: "DiscreteGpu",
-                  wgpuDriver: "NVIDIA",
-                  wgpuDriverInfo: "610.57.04",
-                  wgpuName: "NVIDIA GeForce RTX 4090",
-                };
-              },
             },
             async requestDevice() {
               const device = new FakeDevice();
@@ -181,6 +183,7 @@ test("Firefox wgpu identity proves hardware before vector qualification", async 
       },
     },
   });
+  Object.defineProperty(globalThis, "document", { configurable: true, value: document });
   try {
     await rejectsCode(
       runPhysicalBrowserTrainingLaneV1({
@@ -194,5 +197,7 @@ test("Firefox wgpu identity proves hardware before vector qualification", async 
   } finally {
     if (priorNavigator === undefined) delete globalThis.navigator;
     else Object.defineProperty(globalThis, "navigator", priorNavigator);
+    if (priorDocument === undefined) delete globalThis.document;
+    else Object.defineProperty(globalThis, "document", priorDocument);
   }
 });

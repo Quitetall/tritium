@@ -182,22 +182,6 @@ function member(value: object, name: PropertyKey): unknown {
   }
 }
 
-function jsonRecord(value: unknown): Readonly<Record<PropertyKey, unknown>> | undefined {
-  let encoded: string;
-  try {
-    encoded = JSON.stringify(value);
-  } catch {
-    return undefined;
-  }
-  if (encoded.length === 0 || encoded.length > 16 * 1024) return undefined;
-  try {
-    const parsed: unknown = JSON.parse(encoded);
-    return record(parsed) ? parsed : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
 function nonEmpty(value: unknown, label: string): string {
   if (typeof value !== "string" || value.trim().length === 0) {
     fail("device_identity", `${label} must be a non-empty string`);
@@ -362,6 +346,52 @@ export function physicalBrowserTrainingScenarioV1(): PhysicalBrowserTrainingScen
   });
 }
 
+async function webglHardwareIdentity(): Promise<Readonly<{
+  vendor: string;
+  renderer: string;
+}> | undefined> {
+  const documentValue = member(globalThis, "document");
+  const createElement = record(documentValue) ? member(documentValue, "createElement") : undefined;
+  if (!record(documentValue) || typeof createElement !== "function") return undefined;
+  let canvas: unknown;
+  try {
+    canvas = Reflect.apply(createElement, documentValue, ["canvas"]);
+  } catch {
+    return undefined;
+  }
+  const getContext = record(canvas) ? member(canvas, "getContext") : undefined;
+  if (!record(canvas) || typeof getContext !== "function") return undefined;
+  let context: unknown;
+  try {
+    context = Reflect.apply(getContext, canvas, ["webgl2"]);
+  } catch {
+    return undefined;
+  }
+  if (!record(context)) return undefined;
+  const getExtension = member(context, "getExtension");
+  const getParameter = member(context, "getParameter");
+  if (typeof getExtension !== "function" || typeof getParameter !== "function") return undefined;
+  let extension: unknown;
+  try {
+    extension = Reflect.apply(getExtension, context, ["WEBGL_debug_renderer_info"]);
+  } catch {
+    return undefined;
+  }
+  if (!record(extension)) return undefined;
+  const vendorEnum = member(extension, "UNMASKED_VENDOR_WEBGL");
+  const rendererEnum = member(extension, "UNMASKED_RENDERER_WEBGL");
+  if (!Number.isSafeInteger(vendorEnum) || !Number.isSafeInteger(rendererEnum)) return undefined;
+  try {
+    const vendor = Reflect.apply(getParameter, context, [vendorEnum]);
+    const renderer = Reflect.apply(getParameter, context, [rendererEnum]);
+    if (typeof vendor !== "string" || vendor.trim().length === 0 ||
+        typeof renderer !== "string" || renderer.trim().length === 0) return undefined;
+    return Object.freeze({ vendor: vendor.trim(), renderer: renderer.trim() });
+  } catch {
+    return undefined;
+  }
+}
+
 async function adapterInfo(adapter: BrowserGpuAdapter): Promise<PhysicalBrowserAdapterIdentityV1> {
   let info = member(adapter, "info");
   const hasStandardIdentity = (candidate: unknown): candidate is Readonly<Record<PropertyKey, unknown>> =>
@@ -381,46 +411,35 @@ async function adapterInfo(adapter: BrowserGpuAdapter): Promise<PhysicalBrowserA
     fail("device_identity", "WebGPU adapter is fallback or cannot prove physical execution");
   }
 
-  // Firefox exposes wgpu diagnostics through GPUAdapterInfo.toJSON() while
-  // leaving named property access empty. Read bounded JSON only as a fallback;
-  // direct WebGPU properties remain authoritative when present.
-  const serializedInfo = jsonRecord(info);
-  const infoValue = (name: PropertyKey): unknown => {
-    const direct = member(info as object, name);
-    if (direct !== undefined && direct !== null && direct !== "") return direct;
-    return serializedInfo === undefined ? undefined : member(serializedInfo, name);
-  };
-
   // Firefox 153 exposes its physical Vulkan identity through wgpu-prefixed
-  // fields while leaving the standard GPUAdapterInfo strings empty. Accept
-  // that shape only when it also proves a discrete/integrated hardware
-  // adapter, preserving fail-closed behavior for anonymous or software
-  // adapters.
-  const wgpuName = infoValue("wgpuName");
-  const wgpuBackend = infoValue("wgpuBackend");
-  const wgpuDeviceType = infoValue("wgpuDeviceType");
-  const wgpuDriver = infoValue("wgpuDriver");
-  const wgpuDriverInfo = infoValue("wgpuDriverInfo");
+  // fields in privileged diagnostics while leaving standard GPUAdapterInfo
+  // strings empty. Named WebGPU fields remain authoritative when exposed.
+  const wgpuName = member(info, "wgpuName");
+  const wgpuBackend = member(info, "wgpuBackend");
+  const wgpuDeviceType = member(info, "wgpuDeviceType");
+  const wgpuDriver = member(info, "wgpuDriver");
+  const wgpuDriverInfo = member(info, "wgpuDriverInfo");
   const firefoxPhysical = typeof wgpuName === "string" && wgpuName.trim().length > 0 &&
     typeof wgpuBackend === "string" && wgpuBackend.trim().length > 0 &&
     (wgpuDeviceType === "DiscreteGpu" || wgpuDeviceType === "IntegratedGpu");
+  const webgl = firefoxPhysical ? undefined : await webglHardwareIdentity();
   const text = (value: unknown): string | undefined =>
     typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
-  const standardVendor = text(infoValue("vendor"));
-  const standardArchitecture = text(infoValue("architecture"));
-  const standardDevice = text(infoValue("device"));
-  const standardDescription = text(infoValue("description"));
-  const vendor = standardVendor ?? (firefoxPhysical ? text(wgpuDriver) : undefined);
+  const standardVendor = text(member(info, "vendor"));
+  const standardArchitecture = text(member(info, "architecture"));
+  const standardDevice = text(member(info, "device"));
+  const standardDescription = text(member(info, "description"));
+  const vendor = standardVendor ?? (firefoxPhysical ? text(wgpuDriver) : webgl?.vendor);
   const architecture = standardArchitecture ?? (
     firefoxPhysical ? `${String(wgpuBackend).trim()}/${String(wgpuDeviceType).trim()}` : undefined
-  );
-  const device = standardDevice ?? (firefoxPhysical ? text(wgpuName) : undefined);
+  ) ?? (webgl === undefined ? undefined : "WebGL2/WebGPU");
+  const device = standardDevice ?? (firefoxPhysical ? text(wgpuName) : webgl?.renderer);
   const description = standardDescription ?? (
     firefoxPhysical
       ? [text(wgpuName), text(wgpuBackend), text(wgpuDriver), text(wgpuDriverInfo)]
         .filter((value): value is string => value !== undefined)
         .join(" ")
-      : undefined
+      : webgl === undefined ? undefined : `${webgl.renderer} (${webgl.vendor}); WebGPU non-fallback`
   );
   const identity = Object.freeze({
     vendor: nonEmpty(vendor, "adapter.vendor"),
