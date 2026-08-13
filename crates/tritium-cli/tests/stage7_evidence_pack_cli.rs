@@ -430,3 +430,34 @@ fn rejects_empty_sampled_row_path_without_panicking() {
     assert!(!stderr.contains("panicked"), "{stderr}");
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn accepts_nested_text_config_vocab_size() {
+    let root = root();
+    fs::create_dir(&root).unwrap();
+    let model = write_model(&root);
+    fs::write(
+        model.join("config.json"),
+        r#"{"text_config":{"vocab_size":3}}"#,
+    )
+    .unwrap();
+    fs::remove_file(model.join("special_tokens_map.json")).unwrap();
+    let sampled = write_sampled_rows(&root);
+    let command = Command::new(env!("CARGO_BIN_EXE_tritium"))
+        .args(["salt", "build-stage7-evidence-pack", "--model-dir"])
+        .arg(&model)
+        .arg("--sampled-rows")
+        .arg(&sampled)
+        .arg("--output-dir")
+        .arg(root.join("pack"))
+        .output()
+        .unwrap();
+    assert!(
+        command.status.success(),
+        "{}",
+        String::from_utf8_lossy(&command.stderr)
+    );
+    let manifest: Value = serde_json::from_slice(&command.stdout).unwrap();
+    assert_eq!(manifest["tokenizer_vocab_size"], 3);
+    fs::remove_dir_all(root).unwrap();
+}

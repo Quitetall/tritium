@@ -24,13 +24,13 @@ use tritium_salt::{
 const MAX_JSON_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_ROWS_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_ROW_BYTES: usize = 16 * 1024 * 1024;
-const TOKENIZER_FILES: [&str; 5] = [
+const REQUIRED_TOKENIZER_FILES: [&str; 4] = [
     "merges.txt",
-    "special_tokens_map.json",
     "tokenizer.json",
     "tokenizer_config.json",
     "vocab.json",
 ];
+const OPTIONAL_TOKENIZER_FILES: [&str; 1] = ["special_tokens_map.json"];
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -243,6 +243,12 @@ pub(crate) fn model_tokenizer_identity(model: &Path) -> anyhow::Result<(String, 
     let config: Value = read_json(&config_path, MAX_JSON_BYTES, "model config")?;
     let vocab_size = config
         .get("vocab_size")
+        .or_else(|| {
+            config
+                .get("text_config")
+                .and_then(Value::as_object)
+                .and_then(|text| text.get("vocab_size"))
+        })
         .and_then(Value::as_u64)
         .filter(|value| *value > 0 && *value <= u64::from(u32::MAX))
         .context("model config requires u32-representable positive vocab_size")?;
@@ -497,8 +503,13 @@ fn write_pack(
 
 fn tokenizer_digest(model: &Path) -> anyhow::Result<String> {
     let mut records = Vec::new();
-    for name in TOKENIZER_FILES {
+    for name in REQUIRED_TOKENIZER_FILES {
         records.push(file_record(&open_model_file(model, name)?, name)?);
+    }
+    for name in OPTIONAL_TOKENIZER_FILES {
+        if model.join(name).exists() {
+            records.push(file_record(&open_model_file(model, name)?, name)?);
+        }
     }
     Ok(stage7_prefixed_json_sha256(&serde_json::to_value(
         records,
