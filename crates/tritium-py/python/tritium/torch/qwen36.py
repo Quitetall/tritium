@@ -102,7 +102,11 @@ class Qwen36MtpAdapter(nn.Module):
         if (input_ids is None) == (inputs_embeds is None):
             raise ValueError("provide exactly one of input_ids or inputs_embeds")
         if inputs_embeds is None:
-            inputs_embeds = self._shared_embeddings(input_ids)
+            embedding_device = self._shared_embeddings.weight.device
+            inputs_embeds = self._shared_embeddings(input_ids.to(embedding_device))
+        else:
+            inputs_embeds = inputs_embeds.to(self.fc.weight.device)
+        hidden_states = hidden_states.to(self.fc.weight.device)
         if inputs_embeds.shape[:-1] != hidden_states.shape[:-1]:
             raise ValueError("MTP embeddings and hidden_states must share batch/sequence shape")
         hidden_states = self.fc(
@@ -117,11 +121,27 @@ class Qwen36MtpAdapter(nn.Module):
         if position_embeddings is None:
             if self._rotary_embeddings is None:
                 raise ValueError("position_embeddings or rotary_embeddings is required")
-            if position_ids is None:
-                position_ids = torch.arange(
-                    hidden_states.shape[1], device=hidden_states.device
-                ).expand(hidden_states.shape[0], -1)
-            position_embeddings = self._rotary_embeddings(hidden_states, position_ids)
+                if position_ids is None:
+                    position_ids = torch.arange(
+                        hidden_states.shape[1], device=hidden_states.device
+                    ).expand(hidden_states.shape[0], -1)
+            rotary_device = getattr(
+                getattr(self._rotary_embeddings, "inv_freq", None),
+                "device",
+                hidden_states.device,
+            )
+            rotary_hidden = hidden_states.to(rotary_device)
+            rotary_ids = position_ids.to(rotary_device)
+            rotary = self._rotary_embeddings(rotary_hidden, rotary_ids)
+            position_embeddings = tuple(value.to(hidden_states.device) for value in rotary)
+        else:
+            position_embeddings = tuple(
+                value.to(hidden_states.device) for value in position_embeddings
+            )
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(hidden_states.device)
+        if position_ids is not None:
+            position_ids = position_ids.to(hidden_states.device)
         hidden_states = self.layers[0](
             hidden_states,
             position_embeddings=position_embeddings,
@@ -391,22 +411,32 @@ class Qwen36LanguageMtpOracle(nn.Module):
             raise Qwen36ComponentError(
                 "Qwen3.6 oracle requires two-dimensional position_ids for MTP"
             )
+        mtp_device = self._mtp_model.fc.weight.device
+        mtp_input_ids = input_ids.to(mtp_device) if input_ids is not None else None
+        mtp_inputs_embeds = (
+            inputs_embeds.to(mtp_device) if inputs_embeds is not None else None
+        )
+        mtp_hidden_states = hidden[0].to(mtp_device)
+        mtp_position_ids = position_ids.to(mtp_device) if position_ids is not None else None
         mtp_mask = attention_mask
         if mtp_mask is not None and mtp_mask.dtype != torch.bool and not (
             mtp_mask.is_floating_point() or mtp_mask.is_complex()
         ):
             mtp_mask = mtp_mask.bool()
+        if mtp_mask is not None:
+            mtp_mask = mtp_mask.to(mtp_device)
         mtp_hidden = self._mtp_model(
-            input_ids=input_ids,
-            inputs_embeds=inputs_embeds,
-            hidden_states=hidden[0],
+            input_ids=mtp_input_ids,
+            inputs_embeds=mtp_inputs_embeds,
+            hidden_states=mtp_hidden_states,
             attention_mask=mtp_mask,
-            position_ids=position_ids,
+            position_ids=mtp_position_ids,
             past_key_values=past_key_values,
         )
         if not isinstance(mtp_hidden, torch.Tensor):
             raise Qwen36ComponentError("Qwen3.6 MTP graph must return one hidden-state tensor")
-        mtp_logits = self._lm_head(mtp_hidden)
+        lm_head_device = self._lm_head.weight.device
+        mtp_logits = self._lm_head(mtp_hidden.to(lm_head_device))
         return Qwen36LanguageMtpOutput(
             base_output=base_output,
             mtp_hidden_states=mtp_hidden,
