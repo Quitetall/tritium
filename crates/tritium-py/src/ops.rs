@@ -7,10 +7,15 @@
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
-use tritium_quantize::{AllocConfig, GroupCurve, allocate_with_curves};
+use tritium_quantize::{
+    AllocConfig, DensePsdMetric, GroupCurve, JointFitConfig, JointFitMetric, RelayBasins,
+    ScalePrecision, allocate_with_curves, fit_joint_ternary,
+};
 use tritium_train::ops::conv1d::{self, Conv1dCfg};
 use tritium_train::ops::fsq::{self, FsqBound, FsqCfg, FsqSte};
 use tritium_train::ops::ste;
+
+type DenseJointFitResult = (Vec<f32>, Vec<Vec<i8>>, Vec<f32>, f64);
 
 /// Allocate additive ternary planes from measured group error curves.
 ///
@@ -86,6 +91,75 @@ pub(crate) fn allocate_planes(
         .map_err(|error| PyValueError::new_err(error.to_string()))?;
     let achieved_bpw = allocation.avg_bpw(&group_sizes);
     Ok((allocation.plane_counts, achieved_bpw))
+}
+
+/// Fit additive ternary planes against one dense PSD curvature group.
+///
+/// This is a bounded native primitive for output-aware/K-FAC PTQ drivers. The
+/// Python layer supplies one row's weight group and one validated row-major
+/// metric; the native solver owns deterministic restarts, alternating scale /
+/// assignment updates, and deployment-precision scale scoring. The returned
+/// tuple is `(scales, trits, reconstruction, objective)`; restart telemetry is
+/// intentionally kept in the caller's evidence receipt rather than discarded
+/// into a global side channel.
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fit_joint_ternary_dense(
+    weights: Vec<f32>,
+    metric: Vec<f64>,
+    planes: usize,
+    max_iterations: usize,
+    ridge: f64,
+    em_restarts: usize,
+    ridge_condition_limit: f64,
+    scale_precision: &str,
+    softened_relay: bool,
+    modulated_relay: bool,
+) -> PyResult<DenseJointFitResult> {
+    if weights.is_empty() {
+        return Err(PyValueError::new_err("weights must not be empty"));
+    }
+    let dimension = weights.len();
+    let expected = dimension
+        .checked_mul(dimension)
+        .ok_or_else(|| PyValueError::new_err("metric dimension overflows platform usize"))?;
+    if metric.len() != expected {
+        return Err(PyValueError::new_err(format!(
+            "metric must contain {expected} values for a {}x{} group, got {}",
+            dimension,
+            dimension,
+            metric.len()
+        )));
+    }
+    let scale_precision = match scale_precision {
+        "f32" => ScalePrecision::F32,
+        "f16" => ScalePrecision::F16,
+        _ => {
+            return Err(PyValueError::new_err(
+                "scale_precision must be 'f32' or 'f16'",
+            ));
+        }
+    };
+    let dense = DensePsdMetric::new(dimension, &metric)
+        .map_err(|error| PyValueError::new_err(error.to_string()))?;
+    let fit = fit_joint_ternary(
+        &weights,
+        JointFitMetric::Dense(&dense),
+        JointFitConfig {
+            planes,
+            max_iterations,
+            ridge,
+            em_restarts,
+            ridge_condition_limit,
+            scale_precision,
+            relay_basins: RelayBasins {
+                softened: softened_relay,
+                modulated: modulated_relay,
+            },
+        },
+    )
+    .map_err(|error| PyValueError::new_err(error.to_string()))?;
+    Ok((fit.scales, fit.trits, fit.reconstruction, fit.objective))
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -406,6 +406,7 @@ fn _tritium(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<kronecker::Qwen36KroneckerCaptureTask>()?;
     m.add_class::<kronecker::Qwen36KroneckerCaptureReceipt>()?;
     m.add_class::<kronecker::Qwen36KroneckerCaptureSession>()?;
+    m.add_function(wrap_pyfunction!(kronecker::fit_kronecker_ternary, m)?)?;
     kronecker::register_exceptions(m)?;
     m.add_class::<stage7::Stage7TokenEvidenceReceipt>()?;
     m.add_class::<stage7::Stage7TokenBatch>()?;
@@ -431,6 +432,7 @@ fn _tritium(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(ops::lsq_forward, m)?)?;
     m.add_function(wrap_pyfunction!(ops::lsq_vjp, m)?)?;
     m.add_function(wrap_pyfunction!(ops::allocate_planes, m)?)?;
+    m.add_function(wrap_pyfunction!(ops::fit_joint_ternary_dense, m)?)?;
     m.add_function(wrap_pyfunction!(
         torch_native::_ternary_linear_cpu_dlpack,
         m

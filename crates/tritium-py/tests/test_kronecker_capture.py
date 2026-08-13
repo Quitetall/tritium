@@ -11,6 +11,7 @@ from tritium import (
     KroneckerStateError,
 )
 from tritium.torch import (
+    KroneckerGroupFit,
     KroneckerCalibrationWriter,
     KroneckerModuleCaptureReceipt,
     bind_kronecker_activation_cache_digest,
@@ -18,6 +19,7 @@ from tritium.torch import (
     capture_kronecker_module,
     capture_kronecker_module_group,
     capture_qwen36_kronecker_evidence,
+    fit_kronecker_group,
 )
 from tritium.torch import ptq
 
@@ -126,6 +128,62 @@ def test_model_aware_capture_publishes_all_estimators(tmp_path, curvature):
     assert not writer.active
     assert model.training is True
     assert all(parameter.grad is None for parameter in model.parameters())
+
+
+def test_native_kronecker_fit_consumes_canonical_record(tmp_path):
+    model = _TinyObjectiveModel().eval()
+    evidence_dir = tmp_path / "fit-evidence"
+    writer = KroneckerCalibrationWriter(
+        evidence_dir,
+        tensor_index=0,
+        tensor_name="proj.weight",
+        rows=4,
+        columns=128,
+        curvature="guided-fisher",
+        source_model_digest="01" * 32,
+        activation_cache_digest="02" * 32,
+        token_stream_digest="03" * 32,
+        damping=0.01,
+        objective_id="tritium.model-loss-guided-fisher.mean-attention-mask@1",
+        max_batch_bytes=16 * 1024,
+    )
+    capture_kronecker_module(
+        model,
+        _batches(),
+        module="proj",
+        writer=writer,
+        curvature="guided-fisher",
+        guided_loss_reduction="mean-attention-mask",
+    )
+    record = next(evidence_dir.glob("*.s2kf"))
+    result = fit_kronecker_group(model.proj.weight.detach(), record, planes=2, em_restarts=2)
+    assert isinstance(result, KroneckerGroupFit)
+    assert result.projection.dense.shape == model.proj.weight.shape
+    assert len(result.record_digest) == 64
+    assert all(value in "0123456789abcdef" for value in result.record_digest)
+    assert result.objective >= 0.0
+    assert all(
+        torch.all((plane.trits >= -1) & (plane.trits <= 1))
+        for plane in result.projection.planes
+    )
+
+    partial = fit_kronecker_group(
+        model.proj.weight.detach()[1:3],
+        record,
+        planes=2,
+        em_restarts=2,
+        row_start=1,
+        row_count=2,
+    )
+    assert partial.projection.dense.shape == (2, 128)
+    assert partial.record_digest == result.record_digest
+
+    with pytest.raises(ValueError, match="exceeds max_evidence_bytes"):
+        fit_kronecker_group(
+            model.proj.weight.detach(),
+            record,
+            max_evidence_bytes=record.stat().st_size - 1,
+        )
 
 
 def test_output_curvature_capture_restores_parameter_grad_flags(tmp_path):

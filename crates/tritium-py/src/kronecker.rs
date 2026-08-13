@@ -7,15 +7,26 @@ use pyo3::{
     pybacked::PyBackedBytes,
 };
 use tritium_quantize::{
-    CurvatureError, CurvatureSourceId, Qwen35TensorRole, Qwen35TensorScope, SaltV2Curvature,
+    CurvatureError, CurvatureSourceId, DensePsdMetric, JointFitConfig, JointFitMetric,
+    Qwen35TensorRole, Qwen35TensorScope, RelayBasins, SaltV2Curvature, SaltV2KroneckerEvidence,
     SaltV2KroneckerEvidenceBuildError, SaltV2KroneckerEvidenceBuilder,
-    SaltV2KroneckerEvidenceError, SaltV2KroneckerEvidenceSpec,
+    SaltV2KroneckerEvidenceError, SaltV2KroneckerEvidenceSpec, ScalePrecision, fit_joint_ternary,
 };
 use tritium_salt::{
     Qwen36AdmissionError, Qwen36AdmittedSource, Qwen36PtqDriverError,
     Qwen36PtqEvidenceCaptureReceipt, Qwen36PtqEvidenceCaptureSession, Qwen36PtqEvidenceCaptureTask,
     Qwen36PtqEvidenceDirectory, Qwen36TensorWorkError, TensorWorkError,
 };
+
+type KroneckerJointFitResult = (
+    usize,
+    usize,
+    Vec<Vec<f32>>,
+    Vec<Vec<i8>>,
+    Vec<f32>,
+    f64,
+    String,
+);
 
 const DEFAULT_MAX_BATCH_BYTES: usize = 256 * 1024 * 1024;
 
@@ -410,6 +421,159 @@ impl Qwen36KroneckerCaptureSession {
             "Qwen36KroneckerCaptureSession(records={records}, produced={produced}, reused={reused})"
         )
     }
+}
+
+/// Fit every row/group of one canonical S2KF record with native joint ternary search.
+///
+/// This primitive consumes one already verified record and one row-major source
+/// matrix (optionally one bounded output-row window). It returns
+/// `(rows, columns, scales, trits, reconstruction, objective, record_digest)`,
+/// with scales flattened as `plane -> rows * (columns / 128)` and trits as
+/// `plane -> rows * columns`.
+/// It performs no source-model admission or package publication; callers must
+/// bind the returned record digest and solver settings into their own receipt.
+#[pyfunction]
+#[pyo3(signature = (
+    weights_f32le,
+    evidence_s2kf,
+    *,
+    planes = 3,
+    max_iterations = 16,
+    ridge = 1e-8,
+    em_restarts = 4,
+    ridge_condition_limit = 1e6,
+    scale_precision = "f16",
+    softened_relay = false,
+    modulated_relay = false,
+    row_start = 0,
+    row_count = None
+))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fit_kronecker_ternary(
+    py: Python<'_>,
+    weights_f32le: &[u8],
+    evidence_s2kf: &[u8],
+    planes: usize,
+    max_iterations: usize,
+    ridge: f64,
+    em_restarts: usize,
+    ridge_condition_limit: f64,
+    scale_precision: &str,
+    softened_relay: bool,
+    modulated_relay: bool,
+    row_start: usize,
+    row_count: Option<usize>,
+) -> PyResult<KroneckerJointFitResult> {
+    let scale_precision = match scale_precision {
+        "f32" => ScalePrecision::F32,
+        "f16" => ScalePrecision::F16,
+        _ => return Err(contract_error("scale_precision must be 'f32' or 'f16'")),
+    };
+    let weights = decode_f32le("weights", weights_f32le, weights_f32le.len() / 4)?;
+    let evidence =
+        SaltV2KroneckerEvidence::from_canonical_bytes(evidence_s2kf).map_err(contract_error)?;
+    let rows = evidence.rows();
+    let columns = evidence.columns();
+    if columns == 0 || !columns.is_multiple_of(128) {
+        return Err(contract_error(
+            "S2KF fitting requires columns divisible by native group size 128",
+        ));
+    }
+    if row_start > rows {
+        return Err(contract_error("row_start exceeds S2KF output rows"));
+    }
+    let fit_rows = row_count.unwrap_or(rows - row_start);
+    if fit_rows == 0 || fit_rows > rows - row_start {
+        return Err(contract_error(
+            "row_count must select at least one row within S2KF output rows",
+        ));
+    }
+    let expected_weights = fit_rows
+        .checked_mul(columns)
+        .ok_or_else(|| contract_error("weight geometry overflows platform usize"))?;
+    if weights.len() != expected_weights {
+        return Err(contract_error(format!(
+            "weights requires {expected_weights} f32 values, got {}",
+            weights.len()
+        )));
+    }
+    let metric_groups = evidence.input_groups().to_vec();
+    let output_weights = evidence.output_weights()[row_start..row_start + fit_rows].to_vec();
+    let damping = evidence.damping();
+    let record_digest = encode_digest(&evidence.record_digest());
+    let group_count = columns / 128;
+    let result = py
+        .detach(move || {
+            let mut all_scales = (0..planes).map(|_| Vec::new()).collect::<Vec<_>>();
+            let mut all_trits = (0..planes).map(|_| Vec::new()).collect::<Vec<_>>();
+            for values in &mut all_scales {
+                values
+                    .try_reserve_exact(fit_rows.checked_mul(group_count).ok_or_else(|| {
+                        "scale output geometry overflows platform usize".to_owned()
+                    })?)
+                    .map_err(|_| "scale output allocation failed".to_owned())?;
+            }
+            for values in &mut all_trits {
+                values
+                    .try_reserve_exact(expected_weights)
+                    .map_err(|_| "trit output allocation failed".to_owned())?;
+            }
+            let mut reconstruction = Vec::new();
+            reconstruction
+                .try_reserve_exact(expected_weights)
+                .map_err(|_| "reconstruction allocation failed".to_owned())?;
+            let mut objective = 0.0_f64;
+            for (row, output_weight) in output_weights.iter().enumerate() {
+                for (group, metric_group) in metric_groups.iter().enumerate() {
+                    let mut metric_values = Vec::with_capacity(128 * 128);
+                    for (index, value) in metric_group.as_slice().iter().enumerate() {
+                        let diagonal = if index / 128 == index % 128 {
+                            damping
+                        } else {
+                            0.0
+                        };
+                        metric_values.push(*value * output_weight + diagonal);
+                    }
+                    let metric = DensePsdMetric::new(128, &metric_values)
+                        .map_err(|error| error.to_string())?;
+                    let start = row * columns + group * 128;
+                    let fit = fit_joint_ternary(
+                        &weights[start..start + 128],
+                        JointFitMetric::Dense(&metric),
+                        JointFitConfig {
+                            planes,
+                            max_iterations,
+                            ridge,
+                            em_restarts,
+                            ridge_condition_limit,
+                            scale_precision,
+                            relay_basins: RelayBasins {
+                                softened: softened_relay,
+                                modulated: modulated_relay,
+                            },
+                        },
+                    )
+                    .map_err(|error| error.to_string())?;
+                    objective += fit.objective;
+                    reconstruction.extend_from_slice(&fit.reconstruction);
+                    for plane in 0..planes {
+                        all_scales[plane].push(fit.scales[plane]);
+                        all_trits[plane].extend_from_slice(&fit.trits[plane]);
+                    }
+                }
+            }
+            Ok::<_, String>((all_scales, all_trits, reconstruction, objective))
+        })
+        .map_err(contract_error)?;
+    Ok((
+        fit_rows,
+        columns,
+        result.0,
+        result.1,
+        result.2,
+        result.3,
+        record_digest,
+    ))
 }
 
 /// One bounded native producer for a canonical grouped-curvature record.

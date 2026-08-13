@@ -116,9 +116,13 @@ from .stage7_smoke import (
     run_stage7_smollm2_smoke,
 )
 from .projection import (
+    DenseGroupFit,
+    KroneckerGroupFit,
     ProjectionContext,
     TernaryPlane,
     TernaryProjection,
+    fit_dense_ternary_group,
+    fit_kronecker_group,
     validate_projection,
 )
 from .refinement import (
@@ -138,6 +142,8 @@ __all__ = [
     "CalibrationReceipt",
     "CoverageEntry",
     "CoverageReport",
+    "DenseGroupFit",
+    "KroneckerGroupFit",
     "Estimator",
     "ExportReceipt",
     "FittedWeight",
@@ -190,6 +196,8 @@ __all__ = [
     "TernaryDiagnostics",
     "TernaryPlane",
     "TernaryProjection",
+    "fit_dense_ternary_group",
+    "fit_kronecker_group",
     "TritiumError",
     "TritiumTrainer",
     "TritHistogram",

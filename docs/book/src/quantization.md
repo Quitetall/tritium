@@ -345,6 +345,34 @@ Resolution requires canonical `model.language_model`, `lm_head`, and retained
 MTP tensors fails closed; language-only diagnostics require an explicit
 `require_mtp=False` resolution and cannot enter flagship capture.
 
+### Native output-aware group fitting
+
+Captured S2KF records can be passed to the native joint solver without
+materializing one dense Hessian per output row:
+
+```python
+from tritium.torch import fit_kronecker_group
+
+fit = fit_kronecker_group(
+    linear.weight.detach().cpu(),
+    "./curvature-evidence/000123.s2kf",
+    planes=3,
+    scale_precision="f16",
+    # Fit bounded output-row windows when converting large matrices.
+    row_start=0,
+    row_count=None,
+)
+projection = fit.projection
+print(fit.record_digest, fit.objective)
+```
+
+The Rust solver validates S2KF checksum, PSD group geometry, output-row
+curvature, deterministic restart settings, and canonical hard decode. The
+Python boundary bounds file-backed evidence before reading it and supports
+bounded output-row windows. The helper is a fitting primitive, not release
+admission: source-model, token stream, calibration-cache, package, and quality
+receipts remain mandatory.
+
 ## Hardware constraints (load-bearing)
 
 - **Regular compute.** Plane counts are quantized to `{1, 2, 3}` and allocated at

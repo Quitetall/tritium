@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Tuple
+from pathlib import Path
+from typing import Optional, Tuple, Union
 
 import torch
 
+from .. import _tritium
 from .errors import TritiumError
 
 
@@ -88,6 +90,190 @@ class TernaryProjection:
                 stage="project",
             )
         return self.planes[0].group_size
+
+
+@dataclass(frozen=True)
+class DenseGroupFit:
+    """Native dense-curvature fit and its final weighted objective."""
+
+    projection: TernaryProjection
+    objective: float
+
+
+@dataclass(frozen=True)
+class KroneckerGroupFit:
+    """Native S2KF output-aware fit with bound record identity."""
+
+    projection: TernaryProjection
+    objective: float
+    record_digest: str
+
+
+def fit_dense_ternary_group(
+    weights: torch.Tensor,
+    metric: torch.Tensor,
+    *,
+    planes: int = 3,
+    max_iterations: int = 16,
+    ridge: float = 1e-8,
+    em_restarts: int = 4,
+    ridge_condition_limit: float = 1e6,
+    scale_precision: str = "f16",
+    softened_relay: bool = False,
+    modulated_relay: bool = False,
+) -> DenseGroupFit:
+    """Fit one dense PSD-curvature group with native SALT joint optimization.
+
+    ``weights`` and ``metric`` are one-dimensional group weights and a square
+    row-major PSD metric. This helper is the bridge for output-aware/K-FAC PTQ
+    drivers; it does not capture calibration or manufacture provenance. Callers
+    must bind returned projection metadata to their calibration receipt.
+    """
+
+    if not isinstance(weights, torch.Tensor) or weights.ndim != 1:
+        raise TypeError("weights must be a rank-1 tensor")
+    if not weights.dtype.is_floating_point:
+        raise TypeError("weights must use a floating dtype")
+    if not isinstance(metric, torch.Tensor) or metric.ndim != 2:
+        raise TypeError("metric must be a rank-2 tensor")
+    if tuple(metric.shape) != (weights.numel(), weights.numel()):
+        raise ValueError("metric must be square with one row per weight")
+    if not metric.dtype.is_floating_point:
+        raise TypeError("metric must use a floating dtype")
+    if weights.device.type != "cpu" or metric.device.type != "cpu":
+        raise ValueError("native dense fitting currently requires CPU tensors")
+    if not torch.isfinite(weights).all() or not torch.isfinite(metric).all():
+        raise ValueError("weights and metric must be finite")
+    scales, trits, reconstruction, _objective = _tritium.fit_joint_ternary_dense(
+        weights.to(torch.float32).tolist(),
+        metric.to(torch.float64).reshape(-1).tolist(),
+        planes,
+        max_iterations,
+        ridge,
+        em_restarts,
+        ridge_condition_limit,
+        scale_precision,
+        softened_relay,
+        modulated_relay,
+    )
+    scale_dtype = torch.float16 if scale_precision == "f16" else torch.float32
+    planes_out = tuple(
+        TernaryPlane(
+            trits=torch.tensor(trit_values, dtype=torch.int8).reshape(1, -1),
+            scales=torch.tensor([[scale]], dtype=scale_dtype),
+            group_size=weights.numel(),
+        )
+        for scale, trit_values in zip(scales, trits)
+    )
+    dense = torch.tensor(reconstruction, dtype=weights.dtype).reshape(1, -1)
+    projection = TernaryProjection(
+        dense=dense,
+        planes=planes_out,
+        algorithm_id="tritium.salt-v2-joint-dense@1",
+        schema_version=1,
+    )
+    validate_projection(projection, weights.reshape(1, -1))
+    return DenseGroupFit(projection=projection, objective=float(_objective))
+
+
+def fit_kronecker_group(
+    weights: torch.Tensor,
+    evidence: Union[bytes, bytearray, memoryview, str, Path],
+    *,
+    planes: int = 3,
+    max_iterations: int = 16,
+    ridge: float = 1e-8,
+    em_restarts: int = 4,
+    ridge_condition_limit: float = 1e6,
+    scale_precision: str = "f16",
+    softened_relay: bool = False,
+    modulated_relay: bool = False,
+    max_evidence_bytes: int = 64 * 1024 * 1024,
+    row_start: int = 0,
+    row_count: Optional[int] = None,
+) -> KroneckerGroupFit:
+    """Fit rank-2 weights against canonical S2KF K-FAC evidence.
+
+    Evidence is either canonical S2KF bytes or a regular file containing one
+    canonical record. Native code validates record checksum, geometry, PSD
+    factors, and source-bound record identity before fitting. This function is
+    a compute primitive: callers still own source-model and token-cache
+    admission and must persist returned ``record_digest`` in their receipt.
+    """
+
+    if not isinstance(weights, torch.Tensor) or weights.ndim != 2:
+        raise TypeError("weights must be a rank-2 tensor")
+    if not weights.dtype.is_floating_point:
+        raise TypeError("weights must use a floating dtype")
+    if weights.device.type != "cpu":
+        raise ValueError("native Kronecker fitting currently requires CPU tensors")
+    if type(row_start) is not int or row_start < 0:
+        raise ValueError("row_start must be a nonnegative integer")
+    if row_count is not None and (type(row_count) is not int or row_count <= 0):
+        raise ValueError("row_count must be a positive integer when provided")
+    if type(max_evidence_bytes) is not int or max_evidence_bytes <= 0:
+        raise ValueError("max_evidence_bytes must be a positive integer")
+    if isinstance(evidence, (str, Path)):
+        path = Path(evidence)
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("S2KF evidence must be a regular non-symlink file")
+        if path.stat().st_size > max_evidence_bytes:
+            raise ValueError("S2KF evidence exceeds max_evidence_bytes")
+        evidence_bytes = path.read_bytes()
+    else:
+        evidence_bytes = bytes(evidence)
+    if not evidence_bytes:
+        raise ValueError("S2KF evidence must not be empty")
+    if len(evidence_bytes) > max_evidence_bytes:
+        raise ValueError("S2KF evidence exceeds max_evidence_bytes")
+    weight_bytes = (
+        weights.detach()
+        .to(dtype=torch.float32, device="cpu")
+        .contiguous()
+        .numpy()
+        .tobytes()
+    )
+    rows, columns, scales, trits, reconstruction, objective, record_digest = (
+        _tritium.fit_kronecker_ternary(
+            weight_bytes,
+            evidence_bytes,
+            planes=planes,
+            max_iterations=max_iterations,
+            ridge=ridge,
+            em_restarts=em_restarts,
+            ridge_condition_limit=ridge_condition_limit,
+            scale_precision=scale_precision,
+            softened_relay=softened_relay,
+            modulated_relay=modulated_relay,
+            row_start=row_start,
+            row_count=row_count,
+        )
+    )
+    group_count = columns // 128
+    scale_dtype = torch.float16 if scale_precision == "f16" else torch.float32
+    planes_out = tuple(
+        TernaryPlane(
+            trits=torch.tensor(values, dtype=torch.int8).reshape(rows, columns),
+            scales=torch.tensor(values_scale, dtype=scale_dtype).reshape(
+                rows, group_count
+            ),
+            group_size=128,
+        )
+        for values, values_scale in zip(trits, scales)
+    )
+    dense = torch.tensor(reconstruction, dtype=weights.dtype).reshape(rows, columns)
+    projection = TernaryProjection(
+        dense=dense,
+        planes=planes_out,
+        algorithm_id="tritium.salt-v2-kfac-joint@1",
+        schema_version=1,
+    )
+    validate_projection(projection, weights)
+    return KroneckerGroupFit(
+        projection=projection,
+        objective=float(objective),
+        record_digest=record_digest,
+    )
 
 
 def _require_tensor_contract(
