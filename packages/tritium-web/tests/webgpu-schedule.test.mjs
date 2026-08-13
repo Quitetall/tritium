@@ -372,23 +372,22 @@ test("convolution VJP clears resident accumulators and packs exact 80-byte ABI",
   }
 });
 
-test("attention owns probability scratch and zeroes three VJP outputs", () => {
+test("attention packs VJP scratch under Firefox storage-buffer limits", () => {
   const item = corpus.cases.find((candidate) =>
     candidate.operation === "graph.attention" && candidate.execution === "vjp" &&
     candidate.expected.kind === "success");
   const representative = representativePlan(item);
   const schedule = compileWebGpuResidentScheduleV1(representative.plan, BUDGET);
   const resources = schedule.auxiliaryResources();
-  assert.deepEqual(resources.resources.map((resource) => resource.byteLength), [36, 48, 36]);
+  assert.deepEqual(resources.resources.map((resource) => resource.byteLength), [36, 84, 84]);
   const transaction = schedule.transaction(representative.phase, representative.operationId, 0);
   assert.deepEqual(transaction.copies.map((copy) => copy.destination), [
-    "grad_q", "grad_k", "grad_v",
+    "grad_q", resources.resources[1].id,
   ]);
   assert.deepEqual(transaction.commands[0].storageBindings, {
     1: "q", 2: "k", 3: "v", 4: "grad_output", 5: "grad_q",
-    6: "grad_k", 7: "grad_v",
-    8: resources.resources[0].id,
-    9: resources.resources[2].id,
+    6: resources.resources[1].id,
+    7: resources.resources[0].id,
   });
   assert.deepEqual([
     view(transaction.commands[0]).getUint32(0, true),

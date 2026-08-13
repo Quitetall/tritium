@@ -927,52 +927,50 @@ export function compileWebGpuResidentScheduleV1(
         const probabilities = auxiliary(
           "attention-probabilities", probabilityElements * 4, null,
         );
+        const scratchElements = sumU32(
+          "attention scratch outputs", kvElements, kvElements, probabilityElements,
+        );
+        const scratch = auxiliary("attention-scratch", scratchElements * 4, null);
         let gradOutput: string;
         let output0: string;
-        let output1: string;
-        let output2: string;
-        let gradProbabilities: string;
         const copies: WebGpuResidentCopyV1[] = [];
         if (invocation.execution === "vjp") {
           gradOutput = requiredWebGpuRoleV1(input, "grad_output");
           output0 = requiredWebGpuRoleV1(output, "grad_q");
-          output1 = requiredWebGpuRoleV1(output, "grad_k");
-          output2 = requiredWebGpuRoleV1(output, "grad_v");
+          const gradK = requiredWebGpuRoleV1(output, "grad_k");
+          const gradV = requiredWebGpuRoleV1(output, "grad_v");
           expect(buffers, gradOutput, "f32", queryShape, "attention grad_output");
           expect(buffers, output0, "f32", queryShape, "attention grad_q");
-          expect(buffers, output1, "f32", kvShape, "attention grad_k");
-          expect(buffers, output2, "f32", kvShape, "attention grad_v");
+          expect(buffers, gradK, "f32", kvShape, "attention grad_k");
+          expect(buffers, gradV, "f32", kvShape, "attention grad_v");
           requireDisjointWrites(
-            buffers, [q, k, v, gradOutput], [output0, output1, output2],
+            buffers, [q, k, v, gradOutput], [output0, gradK, gradV],
             invocation.operation,
           );
           const zero = auxiliary(
-            "attention-zero", Math.max(queryElements, kvElements) * 4, null,
+            "attention-zero", Math.max(queryElements, scratchElements) * 4, null,
           );
-          for (const [destination, byteLength] of [
-            [output0, queryElements * 4],
-            [output1, kvElements * 4],
-            [output2, kvElements * 4],
-          ] as const) {
-            copies.push(Object.freeze({
+          copies.push(
+            Object.freeze({
               source: zero,
               sourceOffset: 0,
-              destination,
+              destination: output0,
               destinationOffset: 0,
-              byteLength,
-            }));
-          }
-          gradProbabilities = auxiliary(
-            "attention-grad-probabilities", probabilityElements * 4, null,
+              byteLength: queryElements * 4,
+            }),
+            Object.freeze({
+              source: zero,
+              sourceOffset: 0,
+              destination: scratch,
+              destinationOffset: 0,
+              byteLength: scratchElements * 4,
+            }),
           );
         } else {
           gradOutput = q;
           output0 = requiredWebGpuRoleV1(output, "result");
           expect(buffers, output0, "f32", queryShape, "attention result");
           requireDisjointWrites(buffers, [q, k, v], [output0], invocation.operation);
-          output1 = auxiliary("attention-unused-output-1", 4, null);
-          output2 = auxiliary("attention-unused-output-2", 4, null);
-          gradProbabilities = auxiliary("attention-unused-grad-probabilities", 4, null);
         }
         const params = uniform(32, (view) => {
           view.setUint32(0, seq, true);
@@ -989,7 +987,7 @@ export function compileWebGpuResidentScheduleV1(
             params,
             {
               1: q, 2: k, 3: v, 4: gradOutput, 5: output0,
-              6: output1, 7: output2, 8: probabilities, 9: gradProbabilities,
+              6: scratch, 7: probabilities,
             },
             [1, 1, 1],
           )]),
