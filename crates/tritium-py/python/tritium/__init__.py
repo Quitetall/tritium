@@ -83,8 +83,11 @@ __all__ = [
 # and the raw op primitives work without torch.
 try:  # pragma: no cover - trivial import guard
     from . import autograd  # noqa: F401
-    from . import nn  # noqa: F401
     from . import torch  # noqa: F401
+    # ``tritium.nn`` imports estimator/ops modules from ``tritium.torch``.
+    # Load the facade first so the optional import guard cannot hide both
+    # packages behind a circular-import failure.
+    from . import nn  # noqa: F401
 
     __all__.extend(["autograd", "nn", "torch"])
 except ImportError:
