@@ -934,6 +934,7 @@ export function compileWebGpuResidentScheduleV1(
         let gradOutput: string;
         let output0: string;
         const copies: WebGpuResidentCopyV1[] = [];
+        const commitCopies: WebGpuResidentCopyV1[] = [];
         if (invocation.execution === "vjp") {
           gradOutput = requiredWebGpuRoleV1(input, "grad_output");
           output0 = requiredWebGpuRoleV1(output, "grad_q");
@@ -966,6 +967,22 @@ export function compileWebGpuResidentScheduleV1(
               byteLength: scratchElements * 4,
             }),
           );
+          commitCopies.push(
+            Object.freeze({
+              source: scratch,
+              sourceOffset: 0,
+              destination: gradK,
+              destinationOffset: 0,
+              byteLength: kvElements * 4,
+            }),
+            Object.freeze({
+              source: scratch,
+              sourceOffset: kvElements * 4,
+              destination: gradV,
+              destinationOffset: 0,
+              byteLength: kvElements * 4,
+            }),
+          );
         } else {
           gradOutput = q;
           output0 = requiredWebGpuRoleV1(output, "result");
@@ -992,6 +1009,7 @@ export function compileWebGpuResidentScheduleV1(
             [1, 1, 1],
           )]),
           copies: Object.freeze(copies),
+          commitCopies: Object.freeze(commitCopies),
         });
       }
       case "loss.softmax_cross_entropy|forward":

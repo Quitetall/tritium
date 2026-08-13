@@ -384,6 +384,22 @@ test("attention packs VJP scratch under Firefox storage-buffer limits", () => {
   assert.deepEqual(transaction.copies.map((copy) => copy.destination), [
     "grad_q", resources.resources[1].id,
   ]);
+  assert.deepEqual(transaction.commitCopies, [
+    {
+      source: resources.resources[1].id,
+      sourceOffset: 0,
+      destination: "grad_k",
+      destinationOffset: 0,
+      byteLength: 16,
+    },
+    {
+      source: resources.resources[1].id,
+      sourceOffset: 36,
+      destination: "grad_v",
+      destinationOffset: 0,
+      byteLength: 16,
+    },
+  ]);
   assert.deepEqual(transaction.commands[0].storageBindings, {
     1: "q", 2: "k", 3: "v", 4: "grad_output", 5: "grad_q",
     6: resources.resources[1].id,
