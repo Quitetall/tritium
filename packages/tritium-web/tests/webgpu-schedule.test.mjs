@@ -390,14 +390,14 @@ test("attention packs VJP scratch under Firefox storage-buffer limits", () => {
       sourceOffset: 0,
       destination: "grad_k",
       destinationOffset: 0,
-      byteLength: 16,
+      byteLength: 24,
     },
     {
       source: resources.resources[1].id,
-      sourceOffset: 36,
+      sourceOffset: 24,
       destination: "grad_v",
       destinationOffset: 0,
-      byteLength: 16,
+      byteLength: 24,
     },
   ]);
   assert.deepEqual(transaction.commands[0].storageBindings, {
