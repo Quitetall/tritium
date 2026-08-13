@@ -1073,14 +1073,21 @@ def capture_qwen36_kronecker_evidence(
 
     def accept(task: Any) -> None:
         current = session.next_request()
-        if (
-            current is None
-            or current.tensor_index != task.tensor_index
-            or current.tensor_name != task.tensor_name
-        ):
+        if current is None:
+            # Last grouped record may have been validated while traversal
+            # skipped from the first accepted record to a sealed catalog.
+            return
+        if current.tensor_index < task.tensor_index:
             raise RuntimeError("native Qwen capture acceptance order drifted")
-        if not session.accept_current():
-            raise RuntimeError("Qwen evidence session refused the published record")
+        if current.tensor_index == task.tensor_index:
+            if current.tensor_name != task.tensor_name:
+                raise RuntimeError("native Qwen capture acceptance name drifted")
+            if not session.accept_current():
+                raise RuntimeError("Qwen evidence session refused the published record")
+        # A grouped replay can publish later records before the first one is
+        # accepted. Native session traversal validates those records and counts
+        # them as reused while seeking the next missing task; no second
+        # accept_current call is valid for them.
 
     while True:
         task = session.next_request()

@@ -542,6 +542,10 @@ def test_qwen_capture_groups_dense_tasks_into_one_calibration_replay(tmp_path):
             self.cursor = 0
 
         def next_request(self):
+            while self.cursor < len(self.tasks) and (
+                tmp_path / "evidence" / f"{self.cursor:06d}.s2kf"
+            ).is_file():
+                self.cursor += 1
             return self.tasks[self.cursor] if self.cursor < len(self.tasks) else None
 
         def next_requests(self, maximum):
