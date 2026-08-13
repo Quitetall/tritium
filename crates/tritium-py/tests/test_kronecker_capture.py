@@ -64,6 +64,7 @@ def _writer(tmp_path, curvature, guided_reduction="mean-attention-mask"):
 
 def _embedding_writer(tmp_path, curvature):
     objective = {
+        "input-hessian": "tritium.input-gram@1",
         "guided-fisher": "tritium.model-loss-guided-fisher.mean-attention-mask@1",
         "forward-kl-kronecker": "tritium.softmax-fisher-rademacher.single-probe@1",
     }[curvature]
@@ -245,7 +246,9 @@ def test_capture_can_execute_containing_oracle_model(tmp_path):
     assert oracle.training is True
 
 
-@pytest.mark.parametrize("curvature", ["guided-fisher", "forward-kl-kronecker"])
+@pytest.mark.parametrize(
+    "curvature", ["input-hessian", "guided-fisher", "forward-kl-kronecker"]
+)
 def test_embedding_capture_streams_sparse_vocabulary_factors(tmp_path, curvature):
     class TinyEmbeddingModel(torch.nn.Module):
         def __init__(self):
@@ -284,28 +287,19 @@ def test_embedding_capture_streams_sparse_vocabulary_factors(tmp_path, curvature
     assert all(parameter.grad is None for parameter in model.parameters())
 
 
-def test_embedding_capture_rejects_input_hessian(tmp_path):
-    writer = KroneckerCalibrationWriter(
-        tmp_path / "bad-embedding",
-        tensor_index=2,
-        tensor_name="embed.weight",
-        rows=8,
-        columns=128,
+def test_embedding_capture_input_hessian_uses_sparse_identity_contract(tmp_path):
+    model = torch.nn.Sequential(torch.nn.Embedding(8, 128)).train()
+    receipt = capture_kronecker_embedding(
+        model,
+        [torch.tensor([[1, 3, 1]])],
+        module="0",
+        writer=_embedding_writer(tmp_path, "input-hessian"),
         curvature="input-hessian",
-        source_model_digest="01" * 32,
-        activation_cache_digest="02" * 32,
-        token_stream_digest="03" * 32,
-        damping=0.01,
-        objective_id="tritium.input-gram@1",
     )
-    with pytest.raises(ValueError, match="does not support input-hessian"):
-        capture_kronecker_embedding(
-            torch.nn.Sequential(torch.nn.Embedding(8, 128)),
-            [torch.tensor([[1]])],
-            module="0",
-            writer=writer,
-            curvature="input-hessian",
-        )
+    assert receipt.samples == 3
+    assert receipt.selected_samples == 3
+    assert receipt.module_calls == 1
+    assert model.training is True
 
 
 def test_qwen_capture_session_dispatches_embedding_and_output_head(tmp_path):

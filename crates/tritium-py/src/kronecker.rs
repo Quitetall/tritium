@@ -635,11 +635,6 @@ impl KroneckerEvidenceBuilder {
             ));
         }
         let curvature = parse_curvature(curvature)?;
-        if indexed_output && matches!(curvature, SaltV2Curvature::InputHessian) {
-            return Err(contract_error(
-                "indexed output factors are unsupported for input-hessian curvature",
-            ));
-        }
         let source_id = CurvatureSourceId::new(
             parse_digest("source_model_digest", source_model_digest)?,
             parse_digest("activation_cache_digest", activation_cache_digest)?,
@@ -745,6 +740,79 @@ impl KroneckerEvidenceBuilder {
         Ok((residency.input_segments(), residency.output_segments()))
     }
 
+    /// Atomically append one sparse indexed embedding batch using the
+    /// input-Hessian identity-output contract.
+    #[pyo3(signature = (
+        output_indices_u64le,
+        samples,
+        *,
+        token_weights_f64le = None,
+        token_mask_u8 = None
+    ))]
+    fn append_indexed_identity_batch(
+        &mut self,
+        py: Python<'_>,
+        output_indices_u64le: &[u8],
+        samples: usize,
+        token_weights_f64le: Option<&[u8]>,
+        token_mask_u8: Option<&[u8]>,
+    ) -> PyResult<(usize, usize)> {
+        if !self.indexed_output {
+            return Err(contract_error(
+                "Kronecker builder output-factor encoding does not match indexed identity operation",
+            ));
+        }
+        let builder = self
+            .builder
+            .as_ref()
+            .ok_or_else(|| KroneckerStateError::new_err("evidence builder is already finished"))?;
+        if !matches!(builder.spec().kind(), SaltV2Curvature::InputHessian) {
+            return Err(contract_error(
+                "indexed identity operation requires input-hessian curvature",
+            ));
+        }
+        let total_bytes = output_indices_u64le
+            .len()
+            .checked_add(token_weights_f64le.map_or(0, <[u8]>::len))
+            .and_then(|bytes| bytes.checked_add(token_mask_u8.map_or(0, <[u8]>::len)))
+            .filter(|bytes| *bytes <= self.max_batch_bytes)
+            .ok_or_else(|| contract_error("batch exceeds max_batch_bytes"))?;
+        debug_assert!(total_bytes <= self.max_batch_bytes);
+        let encoded_indices = decode_u64le("output indices", output_indices_u64le, samples)?;
+        let mut output_indices = Vec::new();
+        output_indices
+            .try_reserve_exact(samples)
+            .map_err(|_| resource_error("allocate output indices failed"))?;
+        for index in encoded_indices {
+            output_indices.push(
+                usize::try_from(index)
+                    .map_err(|_| contract_error("output index does not fit this platform"))?,
+            );
+        }
+        let token_weights = token_weights_f64le
+            .map(|bytes| decode_f64le("token weights", bytes, samples))
+            .transpose()?;
+        let token_mask = token_mask_u8
+            .map(|bytes| decode_mask(bytes, samples))
+            .transpose()?;
+        let builder = self.builder.as_mut().expect("checked active builder");
+        py.detach(move || {
+            builder.accumulate_indexed_identity_batch(
+                &output_indices,
+                samples,
+                token_weights.as_deref(),
+                token_mask.as_deref(),
+            )
+        })
+        .map_err(build_error)?;
+        let residency = self
+            .builder
+            .as_ref()
+            .expect("builder remains active after successful append")
+            .residency();
+        Ok((residency.input_segments(), residency.output_segments()))
+    }
+
     /// Atomically append one sparse indexed output-factor batch.
     #[pyo3(signature = (
         activations_f32le,
@@ -791,7 +859,6 @@ impl KroneckerEvidenceBuilder {
             .filter(|bytes| *bytes <= self.max_batch_bytes)
             .ok_or_else(|| contract_error("batch exceeds max_batch_bytes"))?;
         debug_assert!(total_bytes <= self.max_batch_bytes);
-        let activations = decode_f32le("activations", activations_f32le, expected_activations)?;
         let encoded_indices = decode_u64le("output indices", output_indices_u64le, samples)?;
         let mut output_indices = Vec::new();
         output_indices
@@ -803,6 +870,7 @@ impl KroneckerEvidenceBuilder {
                     .map_err(|_| contract_error("output index does not fit this platform"))?,
             );
         }
+        let activations = decode_f32le("activations", activations_f32le, expected_activations)?;
         let output_factors = match output_factors_f32le {
             Some(bytes) => decode_f32le("indexed output factors", bytes, samples)?,
             None => {

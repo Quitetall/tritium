@@ -17,6 +17,8 @@ const KFAC_DIGEST_CONTEXT: &str = "tritium salt v2 kfac metric v1";
 const SOURCE_ID_CONTEXT: &str = "tritium salt v2 curvature source id v1";
 const SELECTION_SAMPLE_CONTEXT: &str = "tritium salt v2 curvature selection sample v1";
 const INPUT_SAMPLE_CONTEXT: &str = "tritium salt v2 input curvature sample v1";
+const IDENTITY_INPUT_SAMPLE_CONTEXT: &str =
+    "tritium salt v2 indexed identity input curvature sample v1";
 const FISHER_SAMPLE_CONTEXT: &str = "tritium salt v2 fisher curvature sample v1";
 const INDEXED_FISHER_SAMPLE_CONTEXT: &str = "tritium salt v2 indexed fisher sample v1";
 
@@ -852,6 +854,96 @@ impl InputGramAccumulator {
 
         let sample_count = checked_sample_add(self.sample_count, samples)?;
         self.sample_count = sample_count;
+        self.local_segments = next_segments;
+        self.next_sample_ordinal = next_sample_ordinal;
+        Ok(())
+    }
+
+    /// Add one indexed-embedding identity metric batch without materializing
+    /// one-hot inputs or expanding an identity basis per token.
+    ///
+    /// Embedding lookup is a gather, not a dense linear call. Under the
+    /// input-Hessian identity-output approximation, each selected token
+    /// contributes `weight * I` in hidden space; the sparse row frequency is
+    /// accumulated separately by [`IndexedOutputFisherAccumulator`].
+    ///
+    /// # Errors
+    /// Rejects empty or malformed selection batches, invalid weights/masks, and
+    /// overflow without mutation.
+    pub(crate) fn accumulate_identity_batch(
+        &mut self,
+        samples: usize,
+        token_weights: Option<&[f64]>,
+        token_mask: Option<&[bool]>,
+    ) -> Result<(), CurvatureError> {
+        validate_batch_shape(
+            "indexed identity samples",
+            samples,
+            samples,
+            1,
+            token_weights,
+            token_mask,
+        )?;
+
+        let added_samples =
+            u64::try_from(samples).map_err(|_| CurvatureError::SampleOrdinalOverflow)?;
+        let next_sample_ordinal = self
+            .next_sample_ordinal
+            .checked_add(added_samples)
+            .ok_or(CurvatureError::SampleOrdinalOverflow)?;
+        let added_range = SampleRange {
+            start: self.next_sample_ordinal,
+            end: next_sample_ordinal,
+        };
+        if self
+            .merged_segments
+            .iter()
+            .any(|segment| segment.range.overlaps(added_range))
+        {
+            return Err(CurvatureError::OverlappingSampleRange);
+        }
+
+        let entries = self
+            .dimension
+            .checked_mul(self.dimension)
+            .ok_or(CurvatureError::DimensionTooLarge)?;
+        let mut next_segments = try_clone_input_segments(&self.local_segments)?;
+        for sample in 0..samples {
+            let ordinal = self
+                .next_sample_ordinal
+                .checked_add(
+                    u64::try_from(sample).map_err(|_| CurvatureError::SampleOrdinalOverflow)?,
+                )
+                .ok_or(CurvatureError::SampleOrdinalOverflow)?;
+            let weight = sample_weight(token_weights, sample);
+            let is_selected = selected(token_mask, sample);
+            let selection_leaf =
+                selection_sample_digest(self.source_id, ordinal, weight, is_selected);
+            let data_trace =
+                identity_input_sample_digest(self.dimension, weight, is_selected, selection_leaf);
+            let mut sums = zeroed_f64_values(entries)?;
+            if is_selected {
+                for diagonal in 0..self.dimension {
+                    sums[diagonal * self.dimension + diagonal] = weight;
+                }
+            }
+            push_input_segment(
+                &mut next_segments,
+                InputSegment {
+                    range: SampleRange {
+                        start: ordinal,
+                        end: ordinal + 1,
+                    },
+                    sums,
+                    total_weight: if is_selected { weight } else { 0.0 },
+                    selected_count: u64::from(is_selected),
+                    selection_trace: selection_leaf,
+                    data_trace,
+                },
+            )?;
+        }
+
+        self.sample_count = checked_sample_add(self.sample_count, samples)?;
         self.local_segments = next_segments;
         self.next_sample_ordinal = next_sample_ordinal;
         Ok(())
@@ -1952,6 +2044,20 @@ fn input_sample_digest(
     for &activation in activations {
         hasher.update(&canonical_f32_bits(activation).to_le_bytes());
     }
+    *hasher.finalize().as_bytes()
+}
+
+fn identity_input_sample_digest(
+    dimension: usize,
+    weight: f64,
+    selected: bool,
+    selection_sample: [u8; 32],
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(IDENTITY_INPUT_SAMPLE_CONTEXT);
+    hasher.update(&u64::try_from(dimension).unwrap_or(u64::MAX).to_le_bytes());
+    hasher.update(&canonical_f64_bits(weight).to_le_bytes());
+    hasher.update(&[u8::from(selected)]);
+    hasher.update(&selection_sample);
     *hasher.finalize().as_bytes()
 }
 

@@ -149,6 +149,24 @@ fn input_hessian_requires_no_output_gradients_and_uses_unit_rows() {
 }
 
 #[test]
+fn indexed_input_hessian_uses_identity_hidden_metric_and_sparse_row_frequency() {
+    let contract = spec(SaltV2Curvature::InputHessian);
+    let mut builder =
+        SaltV2KroneckerEvidenceBuilder::new_indexed_output(contract).expect("indexed identity");
+    builder
+        .accumulate_indexed_identity_batch(&[1, 0, 1, 0], 4, None, None)
+        .unwrap();
+    let evidence = builder.finish().unwrap();
+    assert_eq!(evidence.kind(), SaltV2Curvature::InputHessian);
+    assert_eq!(evidence.output_weights()[1], 0.5);
+    assert_eq!(evidence.output_weights()[0], 0.5);
+    let input = evidence.input_groups()[0].as_slice();
+    assert_eq!(input[0], 1.0);
+    assert_eq!(input[1], 0.0);
+    assert_eq!(input[GROUP * GROUP - 1], 1.0);
+}
+
+#[test]
 fn out_of_order_shards_merge_to_one_shot_canonical_evidence() {
     let contract = spec(SaltV2Curvature::GuidedFisher);
     let (activations, gradients) = samples();
@@ -318,8 +336,6 @@ fn indexed_output_builder_matches_dense_values_with_distinct_provenance() {
             .accumulate_indexed_output_batch(&activations, &indices, &factors, 2, None, None,)
             .is_err()
     );
-    assert!(
-        SaltV2KroneckerEvidenceBuilder::new_indexed_output(spec(SaltV2Curvature::InputHessian))
-            .is_err()
-    );
+    SaltV2KroneckerEvidenceBuilder::new_indexed_output(spec(SaltV2Curvature::InputHessian))
+        .expect("input-hessian indexed builder");
 }

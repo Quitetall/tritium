@@ -24,14 +24,21 @@ def _f64le(values):
     return struct.pack(f"<{len(values)}d", *values)
 
 
-def _builder(tmp_path, *, index=0, name="a.weight", indexed_output=False):
+def _builder(
+    tmp_path,
+    *,
+    index=0,
+    name="a.weight",
+    indexed_output=False,
+    curvature="guided-fisher",
+):
     return KroneckerEvidenceBuilder(
         str(tmp_path / "evidence"),
         index,
         name,
         2,
         128,
-        "guided-fisher",
+        curvature,
         "01" * 32,
         "02" * 32,
         "03" * 32,
@@ -155,6 +162,21 @@ def test_indexed_binary_batches_bind_rows_without_dense_factors(tmp_path):
         dense.append_indexed_batch(
             _f32le([1.0] * 128), struct.pack("<Q", 1), 1
         )
+
+
+def test_indexed_input_hessian_identity_batch(tmp_path):
+    builder = _builder(
+        tmp_path,
+        index=8,
+        name="model.embed_tokens.weight",
+        indexed_output=True,
+        curvature="input-hessian",
+    )
+    assert builder.append_indexed_identity_batch(
+        struct.pack("<2Q", 1, 0),
+        2,
+    ) == (1, 1)
+    assert builder.finish().tensor_index == 8
 
 
 def test_constructor_rejects_unbound_or_unsupported_contracts(tmp_path):
@@ -314,3 +336,24 @@ def test_pytorch_writer_streams_indexed_embedding_factors(tmp_path):
     with pytest.raises(ValueError, match="output_indices must have shape"):
         writer.append_indexed(torch.ones(2, 128), torch.tensor([[3, 1]]))
     assert writer.finish().tensor_index == 7
+
+
+def test_pytorch_writer_streams_indexed_embedding_identity_input_hessian(tmp_path):
+    torch = pytest.importorskip("torch")
+    writer = KroneckerCalibrationWriter(
+        tmp_path / "indexed-identity",
+        tensor_index=9,
+        tensor_name="model.embed_tokens.weight",
+        rows=4,
+        columns=128,
+        curvature="input-hessian",
+        source_model_digest="01" * 32,
+        activation_cache_digest="02" * 32,
+        token_stream_digest="03" * 32,
+        damping=0.25,
+        objective_id="tritium.input-gram@1",
+        indexed_output=True,
+        max_batch_bytes=4096,
+    )
+    assert writer.append_indexed_identity(torch.tensor([3, 1])) == (1, 1)
+    assert writer.finish().tensor_index == 9

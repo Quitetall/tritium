@@ -345,6 +345,14 @@ Resolution requires canonical `model.language_model`, `lm_head`, and retained
 MTP tensors fails closed; language-only diagnostics require an explicit
 `require_mtp=False` resolution and cannot enter flagship capture.
 
+Embedding tasks under `curvature="input-hessian"` use the indexed identity
+contract. A token lookup contributes an identity metric in hidden space plus a
+sparse row-frequency factor; Tritium streams this directly and never expands a
+vocabulary one-hot vector. This is a gather-specific identity-output Hessian,
+not a Fisher or forward-KL substitute. Guided-Fisher and forward-KL remain the
+output-aware embedding modes when their checkpoint-scale resource budgets are
+qualified.
+
 ### Native output-aware group fitting
 
 Captured S2KF records can be passed to the native joint solver without

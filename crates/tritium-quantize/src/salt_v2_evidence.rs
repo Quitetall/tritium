@@ -279,7 +279,7 @@ impl SaltV2KroneckerEvidenceBuilder {
     /// domain-separated sparse provenance identity.
     ///
     /// # Errors
-    /// Rejects input-Hessian curvature, invalid geometry, or allocation failure.
+    /// Rejects invalid geometry or allocation failure.
     pub fn new_indexed_output(
         spec: SaltV2KroneckerEvidenceSpec,
     ) -> Result<Self, SaltV2KroneckerEvidenceBuildError> {
@@ -294,9 +294,6 @@ impl SaltV2KroneckerEvidenceBuilder {
         spec: SaltV2KroneckerEvidenceSpec,
         sample_start: u64,
     ) -> Result<Self, SaltV2KroneckerEvidenceBuildError> {
-        if matches!(spec.kind, SaltV2Curvature::InputHessian) {
-            return Err(SaltV2KroneckerEvidenceBuildError::WrongOutputFactorEncoding);
-        }
         Self::new_at_with_output_encoding(spec, sample_start, true)
     }
 
@@ -317,12 +314,12 @@ impl SaltV2KroneckerEvidenceBuilder {
                 sample_start,
             )?);
         }
-        let output_fisher = if matches!(spec.kind, SaltV2Curvature::InputHessian) {
-            None
-        } else if indexed_output {
+        let output_fisher = if indexed_output {
             Some(OutputFisherBuilder::Indexed(
                 IndexedOutputFisherAccumulator::new_bound(spec.rows, spec.source_id, sample_start)?,
             ))
+        } else if matches!(spec.kind, SaltV2Curvature::InputHessian) {
+            None
         } else {
             Some(OutputFisherBuilder::Dense(
                 OutputFisherAccumulator::new_bound(spec.rows, spec.source_id, sample_start)?,
@@ -553,6 +550,65 @@ impl SaltV2KroneckerEvidenceBuilder {
                 scratch.extend_from_slice(&activations[row_start..row_start + GROUP_SIZE]);
             }
             input.accumulate_batch(&scratch, samples, token_weights, token_mask)?;
+        }
+        ensure_segment_limits(&next_inputs, next_output.as_ref())?;
+        self.input_groups = next_inputs;
+        self.output_fisher = next_output;
+        Ok(())
+    }
+
+    /// Atomically add one sparse embedding batch under input-Hessian identity
+    /// output curvature. Each token contributes one hidden-space identity
+    /// metric and one sparse output-row frequency.
+    ///
+    /// # Errors
+    /// Rejects a dense/non-input-Hessian builder, malformed arrays, invalid
+    /// masks/weights, out-of-range rows, or allocation failure atomically.
+    pub fn accumulate_indexed_identity_batch(
+        &mut self,
+        output_indices: &[usize],
+        samples: usize,
+        token_weights: Option<&[f64]>,
+        token_mask: Option<&[bool]>,
+    ) -> Result<(), SaltV2KroneckerEvidenceBuildError> {
+        if !matches!(self.spec.kind, SaltV2Curvature::InputHessian)
+            || !matches!(
+                self.output_fisher.as_ref(),
+                Some(OutputFisherBuilder::Indexed(_))
+            )
+        {
+            return Err(SaltV2KroneckerEvidenceBuildError::WrongOutputFactorEncoding);
+        }
+        if output_indices.len() != samples {
+            return Err(SaltV2KroneckerEvidenceBuildError::BatchLengthMismatch {
+                field: "output indices",
+                expected: samples,
+                got: output_indices.len(),
+            });
+        }
+        if samples == 0 {
+            return Err(CurvatureError::EmptyBatch.into());
+        }
+        let mut unit_factors = Vec::new();
+        unit_factors
+            .try_reserve_exact(samples)
+            .map_err(|_| SaltV2KroneckerEvidenceBuildError::AllocationFailed)?;
+        unit_factors.resize(samples, 1.0);
+
+        let mut next_output = try_clone_output_accumulator(self.output_fisher.as_ref())?;
+        let Some(OutputFisherBuilder::Indexed(accumulator)) = &mut next_output else {
+            return Err(SaltV2KroneckerEvidenceBuildError::WrongOutputFactorEncoding);
+        };
+        accumulator.accumulate_batch(
+            output_indices,
+            &unit_factors,
+            samples,
+            token_weights,
+            token_mask,
+        )?;
+        let mut next_inputs = try_clone_input_accumulators(&self.input_groups)?;
+        for input in &mut next_inputs {
+            input.accumulate_identity_batch(samples, token_weights, token_mask)?;
         }
         ensure_segment_limits(&next_inputs, next_output.as_ref())?;
         self.input_groups = next_inputs;

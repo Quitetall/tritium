@@ -374,6 +374,83 @@ class KroneckerCalibrationWriter:
             token_mask_u8=mask_bytes,
         )
 
+    def append_indexed_identity(
+        self,
+        output_indices: torch.Tensor,
+        *,
+        token_weights: Optional[torch.Tensor] = None,
+        token_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[int, int]:
+        """Append sparse rows under indexed identity-output input-Hessian curvature."""
+
+        if not self._indexed_output:
+            raise ValueError("dense-output writers require append")
+        if self._curvature != "input-hessian":
+            raise ValueError("indexed identity evidence requires input-hessian curvature")
+        if not isinstance(output_indices, torch.Tensor) or output_indices.ndim == 0:
+            raise TypeError("output_indices must be a tensor with a sample dimension")
+        integer_dtypes = {
+            torch.int8,
+            torch.int16,
+            torch.int32,
+            torch.int64,
+            torch.uint8,
+        }
+        if output_indices.dtype not in integer_dtypes:
+            raise TypeError("output_indices must use an integer dtype")
+        sample_shape = tuple(output_indices.shape)
+        samples = output_indices.numel()
+        if bool((output_indices < 0).any()) or bool(
+            (output_indices >= self._rows).any()
+        ):
+            raise ValueError(f"output_indices values must be in [0, {self._rows})")
+        if token_weights is not None and (
+            not isinstance(token_weights, torch.Tensor)
+            or tuple(token_weights.shape) != sample_shape
+        ):
+            raise ValueError(f"token_weights must have shape {sample_shape}")
+        if token_weights is not None:
+            _require_finite_tensor(token_weights, "calibration token weights")
+        if token_mask is not None and (
+            not isinstance(token_mask, torch.Tensor)
+            or tuple(token_mask.shape) != sample_shape
+        ):
+            raise ValueError(f"token_mask must have shape {sample_shape}")
+        required_bytes = samples * 8
+        if token_weights is not None:
+            required_bytes += token_weights.numel() * 8
+        if token_mask is not None:
+            required_bytes += token_mask.numel()
+        if required_bytes > self._max_batch_bytes:
+            raise ValueError(
+                f"batch requires {required_bytes} bytes, limit is {self._max_batch_bytes}"
+            )
+        indices_bytes = (
+            output_indices.detach()
+            .to(device="cpu", dtype=torch.int64)
+            .contiguous()
+            .numpy()
+            .astype("<u8", copy=False)
+            .tobytes()
+        )
+        weights_bytes = (
+            self._float_bytes(token_weights, torch.float64, "<f8")
+            if token_weights is not None
+            else None
+        )
+        mask_bytes = None
+        if token_mask is not None:
+            mask = token_mask.detach().to(device="cpu").contiguous().view(-1)
+            if not bool(((mask == 0) | (mask == 1)).all()):
+                raise ValueError("token_mask values must be boolean or 0/1")
+            mask_bytes = mask.to(torch.uint8).numpy().tobytes()
+        return self._native.append_indexed_identity_batch(
+            indices_bytes,
+            samples,
+            token_weights_f64le=weights_bytes,
+            token_mask_u8=mask_bytes,
+        )
+
     def finish(self):
         """Finalize and atomically publish one canonical native evidence record."""
 
@@ -593,10 +670,11 @@ def capture_kronecker_embedding(
     embedding is not the module that owns the calibration forward. Hooks stay
     attached to ``model``; batches execute through ``execution_model``.
 
-    The gradient with respect to each embedding output supplies the input-side
-    hidden-state factor. Its token id supplies a sparse one-hot output row.
-    Input-Hessian is rejected because token ids are not dense activation
-    vectors under the linear-module K-FAC contract.
+    For Fisher/KL curvature, the gradient with respect to each embedding
+    output supplies the hidden-state factor and its token id supplies a sparse
+    output row. For input-Hessian, lookup uses an explicit identity-output
+    contract: each selected token contributes ``I`` in hidden space and its
+    sparse row frequency. No dense one-hot vector is materialized.
     """
 
     if not isinstance(model, nn.Module):
@@ -605,10 +683,7 @@ def capture_kronecker_embedding(
         raise TypeError("execution_model must be a torch.nn.Module")
     if not isinstance(writer, KroneckerCalibrationWriter):
         raise TypeError("writer must be a KroneckerCalibrationWriter")
-    if curvature == "input-hessian":
-        writer.abort()
-        raise ValueError("embedding capture does not support input-hessian")
-    if curvature not in {"guided-fisher", "forward-kl-kronecker"}:
+    if curvature not in {"input-hessian", "guided-fisher", "forward-kl-kronecker"}:
         writer.abort()
         raise ValueError("unsupported embedding Kronecker curvature")
     if not writer.indexed_output:
@@ -629,11 +704,16 @@ def capture_kronecker_embedding(
                 "or mean-valid-causal-labels"
             )
         objective = f"tritium.model-loss-guided-fisher.{guided_loss_reduction}@1"
-    else:
+    elif curvature == "forward-kl-kronecker":
         if guided_loss_reduction is not None:
             writer.abort()
             raise ValueError("guided_loss_reduction is valid only for guided-fisher")
         objective = "tritium.softmax-fisher-rademacher.single-probe@1"
+    else:
+        if guided_loss_reduction is not None:
+            writer.abort()
+            raise ValueError("guided_loss_reduction is valid only for guided-fisher")
+        objective = "tritium.input-gram@1"
     if writer.objective_id != objective:
         writer.abort()
         raise ValueError("writer objective_id differs from the capture objective")
@@ -680,7 +760,7 @@ def capture_kronecker_embedding(
             raise ValueError("selected embedding must return one tensor")
         if tuple(output.shape) != tuple(indices.shape) + (writer.columns,):
             raise ValueError("selected embedding output geometry changed")
-        if not output.requires_grad:
+        if curvature != "input-hessian" and not output.requires_grad:
             output.requires_grad_(True)
         index_bytes = indices.numel() * indices.element_size()
         required_bytes = pending_index_bytes + index_bytes
@@ -733,11 +813,14 @@ def capture_kronecker_embedding(
                 else _causal_selection_mask(raw_labels, token_mask)
             )
             pending_index_bytes = snapshot_bytes
-            with torch.enable_grad():
+            context = torch.no_grad() if curvature == "input-hessian" else torch.enable_grad()
+            with context:
                 output = _invoke_model(runner, batch)
                 if not pending:
                     raise ValueError("selected embedding was not exercised by a calibration batch")
-                if curvature == "guided-fisher":
+                if curvature == "input-hessian":
+                    gradients = (None,) * len(pending)
+                elif curvature == "guided-fisher":
                     loss = _capture_output_tensor(output, "loss")
                     if loss.numel() != 1 or not loss.isfinite().all():
                         raise ValueError("guided-Fisher model loss must be one finite scalar")
@@ -779,11 +862,17 @@ def capture_kronecker_embedding(
                     else token_mask
                 )
                 mask = _capture_token_mask(selected_mask, sample_shape)
-                input_segments, output_segments = writer.append_indexed(
-                    gradients_for_call,
-                    indices,
-                    token_mask=mask,
-                )
+                if curvature == "input-hessian":
+                    input_segments, output_segments = writer.append_indexed_identity(
+                        indices,
+                        token_mask=mask,
+                    )
+                else:
+                    input_segments, output_segments = writer.append_indexed(
+                        gradients_for_call,
+                        indices,
+                        token_mask=mask,
+                    )
                 count = indices.numel()
                 samples += count
                 selected_samples += count if mask is None else int(mask.count_nonzero().item())
