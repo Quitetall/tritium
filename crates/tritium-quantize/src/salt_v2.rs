@@ -1681,12 +1681,12 @@ mod tests {
         let dense_fit =
             fit_joint_ternary(&weights, JointFitMetric::Dense(&dense), config).expect("dense fit");
         let diagonal_fit =
-            fit_joint_ternary(&weights, JointFitMetric::DiagonalF64(&diagonal), config)
+            fit_joint_ternary(&weights, JointFitMetric::DiagonalF64(diagonal), config)
                 .expect("diagonal fit");
         let affine_fit = fit_joint_ternary(
             &weights,
             JointFitMetric::DiagonalAffine {
-                values: &diagonal,
+                values: diagonal,
                 scale: 1.0,
                 shift: 0.0,
             },
