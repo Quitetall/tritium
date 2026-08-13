@@ -370,8 +370,11 @@ class Qwen36LanguageMtpOracle(nn.Module):
         **kwargs: Any,
     ) -> Qwen36LanguageMtpOutput:
         skip_logits = kwargs.pop("_tritium_skip_logits", False)
+        skip_mtp_logits = kwargs.pop("_tritium_skip_mtp_logits", skip_logits)
         if type(skip_logits) is not bool:
             raise Qwen36ComponentError("_tritium_skip_logits must be boolean")
+        if type(skip_mtp_logits) is not bool:
+            raise Qwen36ComponentError("_tritium_skip_mtp_logits must be boolean")
         if past_key_values is not None:
             raise Qwen36ComponentError(
                 "Qwen3.6 oracle does not share cached states between language and MTP graphs"
@@ -452,7 +455,7 @@ class Qwen36LanguageMtpOracle(nn.Module):
         )
         if not isinstance(mtp_hidden, torch.Tensor):
             raise Qwen36ComponentError("Qwen3.6 MTP graph must return one hidden-state tensor")
-        if skip_logits:
+        if skip_mtp_logits:
             mtp_logits = torch.empty(0, dtype=mtp_hidden.dtype, device=mtp_hidden.device)
         else:
             lm_head_device = self._lm_head.weight.device
@@ -562,6 +565,7 @@ def capture_qwen36_components(
         damping=damping,
         mtp_model=components.mtp_model,
         execution_model=execution_model,
+        output_head_model=components.root,
         guided_loss_reduction=guided_loss_reduction,
         max_evidence_bytes=max_evidence_bytes,
         max_batch_bytes=max_batch_bytes,

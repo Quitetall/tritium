@@ -842,8 +842,16 @@ def _resolve_qwen36_capture_module(
     task: Any,
     language_model: nn.Module,
     mtp_model: Optional[nn.Module],
+    output_head_model: Optional[nn.Module] = None,
 ) -> Tuple[nn.Module, str, nn.Module]:
-    if task.scope == "language":
+    if task.tensor_name == "lm_head.weight":
+        if output_head_model is None and hasattr(language_model, "lm_head"):
+            output_head_model = language_model
+        if output_head_model is None:
+            raise ValueError("Qwen output-head capture requires the root model")
+        target = output_head_model
+        candidates = ("lm_head",)
+    elif task.scope == "language":
         target = language_model
     elif task.scope == "mtp-drafter":
         if mtp_model is None:
@@ -879,6 +887,7 @@ def capture_qwen36_kronecker_evidence(
     damping: float,
     mtp_model: Optional[nn.Module] = None,
     execution_model: Optional[nn.Module] = None,
+    output_head_model: Optional[nn.Module] = None,
     guided_loss_reduction: Optional[str] = None,
     max_evidence_bytes: int = 64 * 1024 * 1024,
     max_batch_bytes: int = 256 * 1024 * 1024,
@@ -1003,7 +1012,7 @@ def capture_qwen36_kronecker_evidence(
             ):
                 raise RuntimeError("native Qwen capture prefetch order drifted")
         target, module_path, selected = _resolve_qwen36_capture_module(
-            task, language_model, mtp_model
+            task, language_model, mtp_model, output_head_model
         )
         indexed_output = isinstance(selected, nn.Embedding)
         if not indexed_output:
@@ -1015,7 +1024,7 @@ def capture_qwen36_kronecker_evidence(
                 validate_task(candidate)
                 candidate_target, candidate_path, candidate_module = (
                     _resolve_qwen36_capture_module(
-                        candidate, language_model, mtp_model
+                        candidate, language_model, mtp_model, output_head_model
                     )
                 )
                 if (
