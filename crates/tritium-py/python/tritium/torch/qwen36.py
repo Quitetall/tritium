@@ -121,10 +121,10 @@ class Qwen36MtpAdapter(nn.Module):
         if position_embeddings is None:
             if self._rotary_embeddings is None:
                 raise ValueError("position_embeddings or rotary_embeddings is required")
-                if position_ids is None:
-                    position_ids = torch.arange(
-                        hidden_states.shape[1], device=hidden_states.device
-                    ).expand(hidden_states.shape[0], -1)
+            if position_ids is None:
+                position_ids = torch.arange(
+                    hidden_states.shape[1], device=hidden_states.device
+                ).expand(hidden_states.shape[0], -1)
             rotary_device = getattr(
                 getattr(self._rotary_embeddings, "inv_freq", None),
                 "device",
@@ -411,7 +411,11 @@ class Qwen36LanguageMtpOracle(nn.Module):
             raise Qwen36ComponentError(
                 "Qwen3.6 oracle requires two-dimensional position_ids for MTP"
             )
-        mtp_device = self._mtp_model.fc.weight.device
+        mtp_weight = getattr(getattr(self._mtp_model, "fc", None), "weight", None)
+        if isinstance(mtp_weight, torch.Tensor):
+            mtp_device = mtp_weight.device
+        else:
+            mtp_device = next(self._mtp_model.parameters(), hidden[0]).device
         mtp_input_ids = input_ids.to(mtp_device) if input_ids is not None else None
         mtp_inputs_embeds = (
             inputs_embeds.to(mtp_device) if inputs_embeds is not None else None
