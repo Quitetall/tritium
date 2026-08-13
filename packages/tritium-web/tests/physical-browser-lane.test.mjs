@@ -140,3 +140,50 @@ test("no-op structural WebGPU cannot produce a physical lane", async () => {
     else Object.defineProperty(globalThis, "navigator", priorNavigator);
   }
 });
+
+test("Firefox wgpu identity proves hardware before vector qualification", async () => {
+  const devices = [];
+  const priorNavigator = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    value: {
+      gpu: {
+        async requestAdapter() {
+          return {
+            info: {
+              vendor: "",
+              architecture: "",
+              device: "",
+              description: "",
+              isFallbackAdapter: false,
+              wgpuBackend: "Vulkan",
+              wgpuDeviceType: "DiscreteGpu",
+              wgpuDriver: "NVIDIA",
+              wgpuDriverInfo: "610.57.04",
+              wgpuName: "NVIDIA GeForce RTX 4090",
+            },
+            async requestDevice() {
+              const device = new FakeDevice();
+              devices.push(device);
+              return device;
+            },
+          };
+        },
+      },
+    },
+  });
+  try {
+    await rejectsCode(
+      runPhysicalBrowserTrainingLaneV1({
+        nativeArtifact: Uint8Array.of(1),
+        nativeReferenceDigest: "0".repeat(64),
+      }),
+      "vector_conformance",
+    );
+    assert.equal(devices.length, 1);
+    assert.equal(devices[0].destroyed, true);
+  } finally {
+    if (priorNavigator === undefined) delete globalThis.navigator;
+    else Object.defineProperty(globalThis, "navigator", priorNavigator);
+  }
+});

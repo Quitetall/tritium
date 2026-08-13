@@ -348,7 +348,13 @@ export function physicalBrowserTrainingScenarioV1(): PhysicalBrowserTrainingScen
 
 async function adapterInfo(adapter: BrowserGpuAdapter): Promise<PhysicalBrowserAdapterIdentityV1> {
   let info = member(adapter, "info");
-  if (!record(info)) {
+  const hasStandardIdentity = (candidate: unknown): candidate is Readonly<Record<PropertyKey, unknown>> =>
+    record(candidate) &&
+    ["vendor", "architecture", "device", "description"].every((key) => {
+      const value = member(candidate, key);
+      return typeof value === "string" && value.trim().length > 0;
+    });
+  if (!hasStandardIdentity(info)) {
     const requestAdapterInfo = member(adapter, "requestAdapterInfo");
     if (typeof requestAdapterInfo === "function") {
       info = await Reflect.apply(requestAdapterInfo, adapter, []);
@@ -358,11 +364,43 @@ async function adapterInfo(adapter: BrowserGpuAdapter): Promise<PhysicalBrowserA
   if (member(info, "isFallbackAdapter") !== false) {
     fail("device_identity", "WebGPU adapter is fallback or cannot prove physical execution");
   }
+
+  // Firefox 153 exposes its physical Vulkan identity through wgpu-prefixed
+  // fields while leaving the standard GPUAdapterInfo strings empty. Accept
+  // that shape only when it also proves a discrete/integrated hardware
+  // adapter, preserving fail-closed behavior for anonymous or software
+  // adapters.
+  const wgpuName = member(info, "wgpuName");
+  const wgpuBackend = member(info, "wgpuBackend");
+  const wgpuDeviceType = member(info, "wgpuDeviceType");
+  const wgpuDriver = member(info, "wgpuDriver");
+  const wgpuDriverInfo = member(info, "wgpuDriverInfo");
+  const firefoxPhysical = typeof wgpuName === "string" && wgpuName.trim().length > 0 &&
+    typeof wgpuBackend === "string" && wgpuBackend.trim().length > 0 &&
+    (wgpuDeviceType === "DiscreteGpu" || wgpuDeviceType === "IntegratedGpu");
+  const text = (value: unknown): string | undefined =>
+    typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+  const standardVendor = text(member(info, "vendor"));
+  const standardArchitecture = text(member(info, "architecture"));
+  const standardDevice = text(member(info, "device"));
+  const standardDescription = text(member(info, "description"));
+  const vendor = standardVendor ?? (firefoxPhysical ? text(wgpuDriver) : undefined);
+  const architecture = standardArchitecture ?? (
+    firefoxPhysical ? `${String(wgpuBackend).trim()}/${String(wgpuDeviceType).trim()}` : undefined
+  );
+  const device = standardDevice ?? (firefoxPhysical ? text(wgpuName) : undefined);
+  const description = standardDescription ?? (
+    firefoxPhysical
+      ? [text(wgpuName), text(wgpuBackend), text(wgpuDriver), text(wgpuDriverInfo)]
+        .filter((value): value is string => value !== undefined)
+        .join(" ")
+      : undefined
+  );
   const identity = Object.freeze({
-    vendor: nonEmpty(member(info, "vendor"), "adapter.vendor"),
-    architecture: nonEmpty(member(info, "architecture"), "adapter.architecture"),
-    device: nonEmpty(member(info, "device"), "adapter.device"),
-    description: nonEmpty(member(info, "description"), "adapter.description"),
+    vendor: nonEmpty(vendor, "adapter.vendor"),
+    architecture: nonEmpty(architecture, "adapter.architecture"),
+    device: nonEmpty(device, "adapter.device"),
+    description: nonEmpty(description, "adapter.description"),
     software: false as const,
   });
   const joined = Object.values(identity).join(" ").toLowerCase();
