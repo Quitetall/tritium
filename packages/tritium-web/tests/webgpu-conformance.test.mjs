@@ -56,7 +56,7 @@ test("qualification runner destroys an admitted device when options fail", async
       submit() {},
       async onSubmittedWorkDone() {},
     },
-    lost: new Promise(() => {}),
+    lost: { then() {} },
     createShaderModule() {},
     async createComputePipelineAsync() {},
     createBuffer() {},

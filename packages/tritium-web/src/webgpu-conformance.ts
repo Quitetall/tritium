@@ -280,7 +280,13 @@ function validateDevice(device: unknown): asserts device is WebGpuDevicePortV1 {
   for (const method of ["writeBuffer", "submit", "onSubmittedWorkDone"]) {
     if (typeof device.queue[method] !== "function") fail(`device.queue.${method} is required`);
   }
-  if (!(device.lost instanceof Promise)) fail("device.lost must be a Promise");
+  // Firefox exposes GPUDevice.lost as a cross-realm thenable rather than an
+  // instanceof-our-global-Promise. Awaitability is the WebGPU contract; an
+  // instanceof check rejects valid browser implementations.
+  const lost = device.lost as unknown;
+  if (!record(lost) || typeof lost.then !== "function") {
+    fail("device.lost must be a Promise-like thenable");
+  }
 }
 
 function align16(value: number): number {
