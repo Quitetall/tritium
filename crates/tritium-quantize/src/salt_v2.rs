@@ -965,27 +965,6 @@ fn weighted_abs_quantile(weights: &[f32], metric_diagonal: &[f64], quantile: f64
     values.last().map_or(0.0, |value| f64::from(value.0))
 }
 
-fn metric_entry(metric: JointFitMetric<'_>, row: usize, col: usize) -> f64 {
-    match metric {
-        JointFitMetric::Identity => f64::from(row == col),
-        JointFitMetric::Diagonal(values) => {
-            if row == col {
-                f64::from(values[row])
-            } else {
-                0.0
-            }
-        }
-        JointFitMetric::DiagonalF64(values) => {
-            if row == col {
-                values[row]
-            } else {
-                0.0
-            }
-        }
-        JointFitMetric::Dense(dense) => dense.values[row * dense.dimension + col],
-    }
-}
-
 #[derive(Clone, Debug)]
 struct ScaleSolveOutcome {
     scales: Vec<f32>,
@@ -1004,26 +983,92 @@ fn solve_scales(
     let planes = trits.len();
     let mut normal = [[0.0_f64; 3]; 3];
     let mut rhs = [0.0_f64; 3];
-    for plane in 0..planes {
-        for other in 0..planes {
-            for row in 0..weights.len() {
-                let left = f64::from(trits[plane][row]);
-                if left == 0.0 {
-                    continue;
+    match metric {
+        JointFitMetric::Identity => {
+            for plane in 0..planes {
+                for other in 0..planes {
+                    normal[plane][other] = trits[plane]
+                        .iter()
+                        .zip(&trits[other])
+                        .map(|(left, right)| f64::from(*left) * f64::from(*right))
+                        .sum();
                 }
-                for (col, &other_trit) in trits[other].iter().enumerate() {
-                    normal[plane][other] +=
-                        left * metric_entry(metric, row, col) * f64::from(other_trit);
-                }
+                rhs[plane] = trits[plane]
+                    .iter()
+                    .zip(weights)
+                    .map(|(left, weight)| f64::from(*left) * f64::from(*weight))
+                    .sum();
             }
         }
-        for (row, plane_trit) in trits[plane].iter().enumerate() {
-            let left = f64::from(*plane_trit);
-            if left == 0.0 {
-                continue;
+        JointFitMetric::Diagonal(diagonal) => {
+            for plane in 0..planes {
+                for other in 0..planes {
+                    normal[plane][other] = trits[plane]
+                        .iter()
+                        .zip(&trits[other])
+                        .zip(diagonal)
+                        .map(|((left, right), weight)| {
+                            f64::from(*left) * f64::from(*right) * f64::from(*weight)
+                        })
+                        .sum();
+                }
+                rhs[plane] = trits[plane]
+                    .iter()
+                    .zip(weights)
+                    .zip(diagonal)
+                    .map(|((left, weight), curvature)| {
+                        f64::from(*left) * f64::from(*weight) * f64::from(*curvature)
+                    })
+                    .sum();
             }
-            for (col, &weight) in weights.iter().enumerate() {
-                rhs[plane] += left * metric_entry(metric, row, col) * f64::from(weight);
+        }
+        JointFitMetric::DiagonalF64(diagonal) => {
+            for plane in 0..planes {
+                for other in 0..planes {
+                    normal[plane][other] = trits[plane]
+                        .iter()
+                        .zip(&trits[other])
+                        .zip(diagonal)
+                        .map(|((left, right), weight)| {
+                            f64::from(*left) * f64::from(*right) * *weight
+                        })
+                        .sum();
+                }
+                rhs[plane] = trits[plane]
+                    .iter()
+                    .zip(weights)
+                    .zip(diagonal)
+                    .map(|((left, weight), curvature)| {
+                        f64::from(*left) * f64::from(*weight) * *curvature
+                    })
+                    .sum();
+            }
+        }
+        JointFitMetric::Dense(dense) => {
+            for plane in 0..planes {
+                for other in 0..planes {
+                    for row in 0..weights.len() {
+                        let left = f64::from(trits[plane][row]);
+                        if left == 0.0 {
+                            continue;
+                        }
+                        for (col, &other_trit) in trits[other].iter().enumerate() {
+                            normal[plane][other] += left
+                                * dense.values[row * dense.dimension + col]
+                                * f64::from(other_trit);
+                        }
+                    }
+                }
+                for (row, plane_trit) in trits[plane].iter().enumerate() {
+                    let left = f64::from(*plane_trit);
+                    if left == 0.0 {
+                        continue;
+                    }
+                    for (col, &weight) in weights.iter().enumerate() {
+                        rhs[plane] +=
+                            left * dense.values[row * dense.dimension + col] * f64::from(weight);
+                    }
+                }
             }
         }
     }
