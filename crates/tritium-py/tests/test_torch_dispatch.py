@@ -10,6 +10,15 @@ from tritium.nn import TernaryLinear  # noqa: E402
 from tritium import _tritium as _native  # noqa: E402
 
 
+def profiler_activities():
+    """Keep Kineto CUDA state usable after CPU-only profiling on GPU hosts."""
+
+    activities = [torch.profiler.ProfilerActivity.CPU]
+    if torch.cuda.is_available():
+        activities.append(torch.profiler.ProfilerActivity.CUDA)
+    return activities
+
+
 def assert_no_cuda_synchronization_in_region(profile, region_name):
     events = profile.events()
     regions = [
@@ -304,7 +313,7 @@ def test_native_cpu_cache_hit_profiles_without_projection_or_copy_ops():
     ternary_linear(x, weight, bias)
 
     with torch.profiler.profile(
-        activities=[torch.profiler.ProfilerActivity.CPU],
+        activities=profiler_activities(),
         acc_events=True,
     ) as profile:
         ternary_linear(x, weight, bias)
@@ -318,7 +327,14 @@ def test_native_cpu_cache_hit_profiles_without_projection_or_copy_ops():
         "aten::to",
     }
     assert event_names.isdisjoint(forbidden)
-    assert not any("memcpy" in name or "synchronize" in name for name in event_names)
+    # With CUDA activity enabled (required to keep later Kineto CUDA traces
+    # alive), profiler setup may itself emit cuda* synchronization events.
+    # Restrict this assertion to framework tensor/runtime operations.
+    assert not any(
+        ("memcpy" in name or "synchronize" in name)
+        and not name.startswith(("cuda", "cu"))
+        for name in event_names
+    )
 
 
 def test_native_cpu_backward_reuses_packed_weight_without_projection_or_matmul():
@@ -336,7 +352,7 @@ def test_native_cpu_backward_reuses_packed_weight_without_projection_or_matmul()
 
     output = ternary_linear(x, weight, bias)
     with torch.profiler.profile(
-        activities=[torch.profiler.ProfilerActivity.CPU],
+        activities=profiler_activities(),
         acc_events=True,
     ) as profile:
         output.backward(grad_output)
