@@ -219,7 +219,11 @@ def fit_kronecker_group(
             raise ValueError("S2KF evidence must be a regular non-symlink file")
         if path.stat().st_size > max_evidence_bytes:
             raise ValueError("S2KF evidence exceeds max_evidence_bytes")
-        evidence_bytes = path.read_bytes()
+        # Bound bytes read as well as the preflight stat. A file can grow or be
+        # replaced between those operations; never let that race turn a caller
+        # controlled evidence path into an unbounded allocation.
+        with path.open("rb") as stream:
+            evidence_bytes = stream.read(max_evidence_bytes + 1)
     else:
         evidence_bytes = bytes(evidence)
     if not evidence_bytes:
