@@ -273,6 +273,15 @@ pub enum JointFitMetric<'a> {
     Diagonal(&'a [f32]),
     /// Non-negative diagonal curvature stored without narrowing f64 evidence.
     DiagonalF64(&'a [f64]),
+    /// Affine diagonal curvature over f64 evidence without materializing a scaled vector.
+    DiagonalAffine {
+        /// Base input-side diagonal.
+        values: &'a [f64],
+        /// Output-side K-FAC scalar.
+        scale: f64,
+        /// Non-negative diagonal damping.
+        shift: f64,
+    },
     /// Dense symmetric PSD group curvature, scored as `error^T H error`.
     Dense(&'a DensePsdMetric),
 }
@@ -669,6 +678,33 @@ pub fn fit_joint_ternary(
             }
             values.to_vec()
         }
+        JointFitMetric::DiagonalAffine {
+            values,
+            scale,
+            shift,
+        } => {
+            if !scale.is_finite() || scale < 0.0 || !shift.is_finite() || shift < 0.0 {
+                return Err(JointFitError::InvalidMetric { index: 0 });
+            }
+            if values.len() != weights.len() {
+                return Err(JointFitError::MetricLengthMismatch {
+                    expected: weights.len(),
+                    got: values.len(),
+                });
+            }
+            let mut diagonal = Vec::with_capacity(values.len());
+            for (index, value) in values.iter().enumerate() {
+                let value = *value * scale + shift;
+                if !value.is_finite() || value < 0.0 {
+                    return Err(JointFitError::InvalidMetric { index });
+                }
+                diagonal.push(value);
+            }
+            if !diagonal.iter().any(|value| *value > 0.0) {
+                return Err(JointFitError::ZeroMetric);
+            }
+            diagonal
+        }
         JointFitMetric::Dense(dense) => {
             if dense.dimension != weights.len() {
                 return Err(JointFitError::DenseMetricDimensionMismatch {
@@ -1048,6 +1084,32 @@ fn solve_scales(
                     .sum();
             }
         }
+        JointFitMetric::DiagonalAffine {
+            values: diagonal,
+            scale,
+            shift,
+        } => {
+            for plane in 0..planes {
+                for other in 0..planes {
+                    normal[plane][other] = trits[plane]
+                        .iter()
+                        .zip(&trits[other])
+                        .zip(diagonal)
+                        .map(|((left, right), weight)| {
+                            f64::from(*left) * f64::from(*right) * (*weight * scale + shift)
+                        })
+                        .sum();
+                }
+                rhs[plane] = trits[plane]
+                    .iter()
+                    .zip(weights)
+                    .zip(diagonal)
+                    .map(|((left, weight), curvature)| {
+                        f64::from(*left) * f64::from(*weight) * (*curvature * scale + shift)
+                    })
+                    .sum();
+            }
+        }
         JointFitMetric::Dense(dense) => {
             for plane in 0..planes {
                 for other in 0..planes {
@@ -1375,6 +1437,16 @@ fn metric_objective(
                 accumulate_objective_term(&mut objective, squared * *weight)?;
             }
         }
+        JointFitMetric::DiagonalAffine {
+            values: diagonal,
+            scale,
+            shift,
+        } => {
+            for (value, weight) in error.iter().zip(diagonal) {
+                let squared = value * value;
+                accumulate_objective_term(&mut objective, squared * (*weight * scale + shift))?;
+            }
+        }
         JointFitMetric::Dense(dense) => {
             for row in 0..dense.dimension {
                 for col in 0..dense.dimension {
@@ -1611,10 +1683,24 @@ mod tests {
         let diagonal_fit =
             fit_joint_ternary(&weights, JointFitMetric::DiagonalF64(&diagonal), config)
                 .expect("diagonal fit");
+        let affine_fit = fit_joint_ternary(
+            &weights,
+            JointFitMetric::DiagonalAffine {
+                values: &diagonal,
+                scale: 1.0,
+                shift: 0.0,
+            },
+            config,
+        )
+        .expect("affine diagonal fit");
         assert_eq!(dense_fit.scales, diagonal_fit.scales);
         assert_eq!(dense_fit.trits, diagonal_fit.trits);
         assert_eq!(dense_fit.reconstruction, diagonal_fit.reconstruction);
         assert_eq!(dense_fit.objective, diagonal_fit.objective);
+        assert_eq!(dense_fit.scales, affine_fit.scales);
+        assert_eq!(dense_fit.trits, affine_fit.trits);
+        assert_eq!(dense_fit.reconstruction, affine_fit.reconstruction);
+        assert_eq!(dense_fit.objective, affine_fit.objective);
     }
 
     fn greedy_residual_reconstruction(weights: &[f32], planes: usize) -> Vec<f32> {
