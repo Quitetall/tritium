@@ -4303,6 +4303,7 @@ dependencies = [
  "blake3",
  "half",
  "proptest",
+ "rayon",
  "tritium-core",
  "tritium-format",
 ]
