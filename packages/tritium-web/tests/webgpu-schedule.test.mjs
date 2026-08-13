@@ -445,7 +445,7 @@ test("AdamW stages candidates and commits all three state planes transactionally
   const schedule = compileWebGpuResidentScheduleV1(representative.plan, BUDGET);
   const resources = schedule.auxiliaryResources().resources;
   const bytes = item.inputs[0].shape.reduce((size, dimension) => size * dimension, 4);
-  assert.deepEqual(resources.map((resource) => resource.byteLength), Array(5).fill(bytes));
+  assert.deepEqual(resources.map((resource) => resource.byteLength), [bytes, bytes, bytes, bytes * 2]);
   const transaction = schedule.transaction(
     representative.phase, representative.operationId, 4, 7,
   );
@@ -454,7 +454,7 @@ test("AdamW stages candidates and commits all three state planes transactionally
   assert.deepEqual(transaction.commands[0].storageBindings, {
     1: "parameter", 2: "gradient", 3: "moment1", 4: "moment2",
     5: resources[0].id, 6: resources[1].id, 7: resources[2].id,
-    8: resources[3].id, 9: resources[4].id,
+    8: resources[3].id,
   });
   assert.deepEqual(transaction.commitCopies.map((copy) => [copy.source, copy.destination]), [
     [resources[0].id, "parameter"],
@@ -479,15 +479,15 @@ test("cautious AdamW resets its atomic mask before every staged transaction", ()
   assert.deepEqual(transaction.commands.map((command) => command.stageIndex),
     [0, 1, 2, 3, 4, 5, 6]);
   assert.deepEqual(transaction.copies, [{
-    source: resources[6].id,
+    source: resources[5].id,
     sourceOffset: 0,
-    destination: resources[5].id,
+    destination: resources[4].id,
     destinationOffset: 0,
     byteLength: 4,
   }]);
-  assert.deepEqual([...resources[6].initialBytes], [0, 0, 0, 0]);
-  assert.equal(transaction.commands[3].storageBindings[10], resources[5].id);
-  assert.equal(transaction.commands[5].storageBindings[10], resources[5].id);
+  assert.deepEqual([...resources[5].initialBytes], [0, 0, 0, 0]);
+  assert.equal(transaction.commands[3].storageBindings[10], resources[4].id);
+  assert.equal(transaction.commands[5].storageBindings[10], resources[4].id);
   assert.equal(view(transaction.commands[0]).getUint32(32, true), 0x3ef9db22);
   assert.equal(view(transaction.commands[0]).getUint32(36, true), 0x3e120c4c);
 });
