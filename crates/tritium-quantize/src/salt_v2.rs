@@ -239,6 +239,24 @@ impl DensePsdMetric {
             values,
         })
     }
+
+    /// Return exact diagonal storage when all off-diagonal entries are zero.
+    ///
+    /// This is intentionally exact: callers may replace dense quadratic scoring with the
+    /// mathematically equivalent diagonal path only when no curvature information is discarded.
+    pub(crate) fn exact_diagonal(&self) -> Option<Vec<f64>> {
+        if (0..self.dimension).any(|row| {
+            (0..self.dimension)
+                .any(|column| row != column && self.values[row * self.dimension + column] != 0.0)
+        }) {
+            return None;
+        }
+        Some(
+            (0..self.dimension)
+                .map(|index| self.values[index * self.dimension + index])
+                .collect(),
+        )
+    }
 }
 
 /// Reconstruction curvature used by [`fit_joint_ternary`].
@@ -249,6 +267,8 @@ pub enum JointFitMetric<'a> {
     Identity,
     /// Non-negative diagonal curvature, one entry per weight.
     Diagonal(&'a [f32]),
+    /// Non-negative diagonal curvature stored without narrowing f64 evidence.
+    DiagonalF64(&'a [f64]),
     /// Dense symmetric PSD group curvature, scored as `error^T H error`.
     Dense(&'a DensePsdMetric),
 }
@@ -627,6 +647,24 @@ pub fn fit_joint_ternary(
             }
             values.iter().map(|value| f64::from(*value)).collect()
         }
+        JointFitMetric::DiagonalF64(values) => {
+            if values.len() != weights.len() {
+                return Err(JointFitError::MetricLengthMismatch {
+                    expected: weights.len(),
+                    got: values.len(),
+                });
+            }
+            if let Some(index) = values
+                .iter()
+                .position(|value| !value.is_finite() || *value < 0.0)
+            {
+                return Err(JointFitError::InvalidMetric { index });
+            }
+            if !values.iter().any(|value| *value > 0.0) {
+                return Err(JointFitError::ZeroMetric);
+            }
+            values.to_vec()
+        }
         JointFitMetric::Dense(dense) => {
             if dense.dimension != weights.len() {
                 return Err(JointFitError::DenseMetricDimensionMismatch {
@@ -933,6 +971,13 @@ fn metric_entry(metric: JointFitMetric<'_>, row: usize, col: usize) -> f64 {
         JointFitMetric::Diagonal(values) => {
             if row == col {
                 f64::from(values[row])
+            } else {
+                0.0
+            }
+        }
+        JointFitMetric::DiagonalF64(values) => {
+            if row == col {
+                values[row]
             } else {
                 0.0
             }
@@ -1275,6 +1320,12 @@ fn metric_objective(
                 accumulate_objective_term(&mut objective, squared * f64::from(*weight))?;
             }
         }
+        JointFitMetric::DiagonalF64(diagonal) => {
+            for (value, weight) in error.iter().zip(diagonal) {
+                let squared = value * value;
+                accumulate_objective_term(&mut objective, squared * *weight)?;
+            }
+        }
         JointFitMetric::Dense(dense) => {
             for row in 0..dense.dimension {
                 for col in 0..dense.dimension {
@@ -1487,6 +1538,34 @@ mod tests {
                 error * error
             })
             .sum()
+    }
+
+    #[test]
+    fn exact_diagonal_metric_fast_path_matches_dense_fit() {
+        let dense = DensePsdMetric::new(
+            4,
+            &[
+                2.0, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0, 0.0, 5.0, 0.0, 0.0, 0.0, 0.0, 7.0,
+            ],
+        )
+        .expect("diagonal metric");
+        let diagonal = dense.exact_diagonal().expect("exact diagonal");
+        let weights = [0.9, -0.6, 0.25, -0.15];
+        let config = JointFitConfig {
+            planes: 3,
+            max_iterations: 4,
+            em_restarts: 3,
+            ..JointFitConfig::default()
+        };
+        let dense_fit =
+            fit_joint_ternary(&weights, JointFitMetric::Dense(&dense), config).expect("dense fit");
+        let diagonal_fit =
+            fit_joint_ternary(&weights, JointFitMetric::DiagonalF64(&diagonal), config)
+                .expect("diagonal fit");
+        assert_eq!(dense_fit.scales, diagonal_fit.scales);
+        assert_eq!(dense_fit.trits, diagonal_fit.trits);
+        assert_eq!(dense_fit.reconstruction, diagonal_fit.reconstruction);
+        assert_eq!(dense_fit.objective, diagonal_fit.objective);
     }
 
     fn greedy_residual_reconstruction(weights: &[f32], planes: usize) -> Vec<f32> {

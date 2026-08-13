@@ -3667,6 +3667,11 @@ fn apply_metric(metric: JointFitMetric<'_>, values: &[f64]) -> Vec<f64> {
             .zip(diagonal)
             .map(|(value, weight)| value * f64::from(*weight))
             .collect(),
+        JointFitMetric::DiagonalF64(diagonal) => values
+            .iter()
+            .zip(diagonal)
+            .map(|(value, weight)| value * *weight)
+            .collect(),
         JointFitMetric::Dense(dense) => {
             let dimension = dense.dimension();
             let matrix = dense.as_slice();
@@ -3693,6 +3698,13 @@ fn metric_entry_local(metric: JointFitMetric<'_>, row: usize, column: usize) -> 
         JointFitMetric::Diagonal(diagonal) => {
             if row == column {
                 f64::from(diagonal[row])
+            } else {
+                0.0
+            }
+        }
+        JointFitMetric::DiagonalF64(diagonal) => {
+            if row == column {
+                diagonal[row]
             } else {
                 0.0
             }
@@ -3724,6 +3736,15 @@ fn reconstruction_objective(
                 f64::from(*curvature) * error * error
             })
             .sum(),
+        JointFitMetric::DiagonalF64(diagonal) => weights
+            .iter()
+            .zip(reconstruction)
+            .zip(diagonal)
+            .map(|((weight, reconstructed), curvature)| {
+                let error = f64::from(*weight) - f64::from(*reconstructed);
+                *curvature * error * error
+            })
+            .sum(),
         JointFitMetric::Dense(dense) => {
             let errors = weights
                 .iter()
@@ -3746,6 +3767,7 @@ fn reconstruction_objective(
 enum ResolvedCurvatureMetric<'a> {
     Borrowed(JointFitMetric<'a>),
     Owned(DensePsdMetric),
+    OwnedDiagonal(Vec<f64>),
 }
 
 impl ResolvedCurvatureMetric<'_> {
@@ -3753,6 +3775,7 @@ impl ResolvedCurvatureMetric<'_> {
         match self {
             Self::Borrowed(metric) => *metric,
             Self::Owned(metric) => JointFitMetric::Dense(metric),
+            Self::OwnedDiagonal(metric) => JointFitMetric::DiagonalF64(metric),
         }
     }
 }
@@ -3778,6 +3801,13 @@ fn curvature_metric<'a>(
             let input_group = group_index % groups_per_row;
             let input = &factors.input_groups[input_group];
             let scale = factors.output_weights[output_row];
+            if let Some(diagonal) = input.exact_diagonal() {
+                let values = diagonal
+                    .into_iter()
+                    .map(|value| value * scale + factors.damping)
+                    .collect::<Vec<_>>();
+                return Ok(ResolvedCurvatureMetric::OwnedDiagonal(values));
+            }
             input
                 .scaled_with_diagonal(scale, factors.damping)
                 .map(ResolvedCurvatureMetric::Owned)
