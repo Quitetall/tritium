@@ -178,7 +178,11 @@ def _probe(
                 release, run_id, str(forbidden_root),
             ],
             cwd=raw, text=True, capture_output=True, check=False, timeout=120,
-            env={**os.environ, "PATH": str(python.resolve(strict=True).parent)},
+            # Preserve a venv launcher symlink. Resolving it to the system
+            # interpreter drops that venv's site-packages under ``-I`` and
+            # makes an installed-wheel probe report a false missing
+            # distribution.
+            env={**os.environ, "PATH": str(python.absolute().parent)},
         )
     if result.returncode:
         raise QualificationError(
@@ -201,7 +205,7 @@ def assemble(
     api_report = api_report.resolve(strict=True)
     report = VERIFY["_report"](api_report, release)
     trace = _probe(
-        python=python.resolve(strict=True), wheel=wheel,
+        python=python.absolute(), wheel=wheel,
         source_revision=source_revision, release=release, run_id=run_id,
         forbidden_root=repo.resolve(strict=True),
     )
