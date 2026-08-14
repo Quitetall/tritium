@@ -130,6 +130,22 @@ class ActivationCalibrationReceipt:
     schema_version: int = 2
 
 
+@dataclass(frozen=True)
+class _SelectedLinear:
+    """One selected weight plus every distinct Linear consumer of it.
+
+    Coverage stores aliases for one exact parameter, while PyTorch can expose
+    that parameter through multiple distinct ``Linear`` modules.  Calibration
+    must observe every consumer so the fitted curvature represents the model
+    graph rather than whichever alias happens to be visited first.
+    """
+
+    path: str
+    module: nn.Linear
+    aliases: Tuple[str, ...]
+    capture_modules: Tuple[nn.Linear, ...]
+
+
 class KroneckerCalibrationWriter:
     """Stream one tensor's grouped curvature into the native S2KF producer.
 
@@ -1818,7 +1834,7 @@ def _source_model_digest(model: nn.Module) -> str:
 
 def _selected_linear_modules(
     prepared: PreparedModel,
-) -> Tuple[Tuple[str, nn.Linear, Tuple[str, ...]], ...]:
+) -> Tuple[_SelectedLinear, ...]:
     assert isinstance(prepared.model, nn.Module)
     selected = {
         alias
@@ -1826,39 +1842,44 @@ def _selected_linear_modules(
         if entry.disposition == "selected"
         for alias in entry.aliases
     }
-    records = []
-    seen = set()
-    weight_owners = {}
+    records: Dict[int, dict[str, Any]] = {}
     for path, module in prepared.model.named_modules(remove_duplicate=False):
         weight_name = f"{path}.weight" if path else "weight"
         if not isinstance(module, nn.Linear) or weight_name not in selected:
             continue
-        key = id(module)
-        if key in seen:
-            continue
-        seen.add(key)
-        prior_owner = weight_owners.get(id(module.weight))
-        if prior_owner is not None:
-            raise TritiumError(
-                "raw diagonal calibration does not yet merge distinct Linear modules sharing one weight",
-                code="unsupported_shared_parameter",
-                stage="calibrate",
-                details={"modules": [prior_owner, path]},
+        weight_key = id(module.weight)
+        record = records.get(weight_key)
+        if record is None:
+            aliases = next(
+                entry.aliases
+                for entry in prepared.coverage.entries
+                if weight_name in entry.aliases
             )
-        weight_owners[id(module.weight)] = path
-        aliases = next(
-            entry.aliases
-            for entry in prepared.coverage.entries
-            if weight_name in entry.aliases
+            record = {
+                "path": path,
+                "module": module,
+                "aliases": tuple(aliases),
+                "capture_modules": [],
+            }
+            records[weight_key] = record
+        if all(id(candidate) != id(module) for candidate in record["capture_modules"]):
+            record["capture_modules"].append(module)
+    result = tuple(
+        _SelectedLinear(
+            path=record["path"],
+            module=record["module"],
+            aliases=record["aliases"],
+            capture_modules=tuple(record["capture_modules"]),
         )
-        records.append((path, module, aliases))
-    if not records:
+        for record in records.values()
+    )
+    if not result:
         raise TritiumError(
             "raw calibration currently requires at least one selected Linear module",
             code="unsupported_module",
             stage="calibrate",
         )
-    covered = {alias for _, _, aliases in records for alias in aliases}
+    covered = {alias for record in result for alias in record.aliases}
     unsupported = sorted(
         entry.path
         for entry in prepared.coverage.entries
@@ -1872,7 +1893,7 @@ def _selected_linear_modules(
             stage="calibrate",
             details={"parameters": unsupported},
         )
-    return tuple(records)
+    return result
 
 
 def _invoke_model(model: nn.Module, batch: Any) -> Any:
@@ -2064,7 +2085,7 @@ def _collect_activations(
     if evidence_dir.exists() or evidence_dir.is_symlink():
         raise FileExistsError(f"calibration evidence already exists: {evidence_dir}")
     modules = _selected_linear_modules(prepared)
-    required_bytes = sum(module.in_features * 8 for _, module, _ in modules)
+    required_bytes = sum(record.module.in_features * 8 for record in modules)
     if required_bytes > max_evidence_bytes:
         raise TritiumError(
             "activation evidence exceeds max_evidence_bytes",
@@ -2076,10 +2097,10 @@ def _collect_activations(
             },
         )
     accumulators: Dict[str, torch.Tensor] = {
-        path: torch.zeros(module.in_features, dtype=torch.float64)
-        for path, module, _ in modules
+        record.path: torch.zeros(record.module.in_features, dtype=torch.float64)
+        for record in modules
     }
-    samples = {path: 0 for path, _, _ in modules}
+    samples = {record.path: 0 for record in modules}
     handles = []
 
     def hook_for(path: str):
@@ -2108,8 +2129,9 @@ def _collect_activations(
 
         return capture
 
-    for path, module, _ in modules:
-        handles.append(module.register_forward_pre_hook(hook_for(path)))
+    for record in modules:
+        for module in record.capture_modules:
+            handles.append(module.register_forward_pre_hook(hook_for(record.path)))
 
     model = prepared.model
     was_training = model.training
@@ -2150,7 +2172,8 @@ def _collect_activations(
     record_values = []
     records = []
     try:
-        for index, (path, module, aliases) in enumerate(modules):
+        for index, record in enumerate(modules):
+            path = record.path
             payload = accumulators[path].numpy().astype("<f8", copy=False).tobytes()
             if len(payload) > max_evidence_bytes:
                 raise TritiumError(
@@ -2164,9 +2187,9 @@ def _collect_activations(
             _hash_field(activation_digest, filename, payload)
             record = ActivationRecord(
                 module=path,
-                weight_aliases=tuple(aliases),
+                weight_aliases=record.aliases,
                 features=accumulators[path].numel(),
-                outputs=module.out_features,
+                outputs=record.module.out_features,
                 samples=samples[path],
                 file=filename,
                 digest=digest,

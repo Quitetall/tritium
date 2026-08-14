@@ -461,13 +461,20 @@ def test_live_module_calibration_fails_closed_on_incomplete_or_oversize_data(tmp
         TernaryConfig.ptq(profile="compact-v1", target_modules=("Linear",)),
         inplace=False,
     )
-    with pytest.raises(TritiumError) as caught:
-        calibrate(
-            shared,
-            [torch.ones(1, 2)],
-            evidence_dir=tmp_path / "shared",
-        )
-    assert caught.value.code == "unsupported_shared_parameter"
+    receipt = calibrate(
+        shared,
+        [torch.ones(1, 2)],
+        evidence_dir=tmp_path / "shared",
+    )
+    assert receipt.record_count == 1
+    assert receipt.records[0].module == "left"
+    assert set(receipt.records[0].weight_aliases) == {
+        "left.weight",
+        "right.weight",
+    }
+    # Both consumers run once; curvature records total observed rows, not
+    # merely rows seen through the canonical module alias.
+    assert receipt.records[0].samples == 2
 
 
 def test_live_module_fit_consumes_bound_curvature_and_rejects_source_drift(tmp_path):
