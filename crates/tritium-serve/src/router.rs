@@ -1868,6 +1868,18 @@ async fn metrics(State(st): State<AppState>) -> Response {
          # HELP tritium_artifact_resident_bytes Steady-state bytes resident for the admitted model.\n\
          # TYPE tritium_artifact_resident_bytes gauge\n\
          tritium_artifact_resident_bytes {}\n\
+         # HELP tritium_kv_pool_capacity_tokens Logical token capacity of the shared paged-KV pool (zero for dense batches).\n\
+         # TYPE tritium_kv_pool_capacity_tokens gauge\n\
+         tritium_kv_pool_capacity_tokens {}\n\
+         # HELP tritium_kv_pool_free_tokens Logical tokens currently free in the shared paged-KV pool (zero for dense batches).\n\
+         # TYPE tritium_kv_pool_free_tokens gauge\n\
+         tritium_kv_pool_free_tokens {}\n\
+         # HELP tritium_kv_pool_reservations_total Successful paged-KV page reservation operations.\n\
+         # TYPE tritium_kv_pool_reservations_total counter\n\
+         tritium_kv_pool_reservations_total {}\n\
+         # HELP tritium_kv_pool_releases_total Successful paged-KV page release operations.\n\
+         # TYPE tritium_kv_pool_releases_total counter\n\
+         tritium_kv_pool_releases_total {}\n\
          # HELP tritium_worker_phase Current decode-worker phase as one-hot fixed-cardinality gauges.\n\
          # TYPE tritium_worker_phase gauge\n\
          tritium_worker_phase{{phase=\"idle\"}} {}\n\
@@ -1954,6 +1966,10 @@ async fn metrics(State(st): State<AppState>) -> Response {
         u8::from(st.runtime.backend_faulted.load(Ordering::Acquire)),
         artifact_loaded_bytes,
         artifact_resident_bytes,
+        worker.kv_pool_capacity_tokens.load(Ordering::Acquire),
+        worker.kv_pool_free_tokens.load(Ordering::Acquire),
+        worker.kv_pool_reservations_total.load(Ordering::Relaxed),
+        worker.kv_pool_releases_total.load(Ordering::Relaxed),
         u8::from(phase == PHASE_IDLE),
         u8::from(phase == PHASE_PREFILL),
         u8::from(phase == PHASE_DECODE),

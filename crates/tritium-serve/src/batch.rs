@@ -302,10 +302,36 @@ fn req_seed(s: &Sampling) -> u64 {
 /// Return a vacated row's KV pages to the pool (no-op on a dense batch).
 /// Called at EVERY site that retires an Active or abandons a Pending.
 #[allow(clippy::needless_pass_by_ref_mut)]
-fn release_slot(batch: &mut tritium_cuda::BatchKv, row: usize) {
+fn release_slot(batch: &mut tritium_cuda::BatchKv, row: usize, telemetry: &WorkerTelemetry) {
     if batch.paged() {
-        let _ = batch.release_pages(row);
+        let before = kv_free_tokens(batch);
+        if batch.release_pages(row).is_ok() {
+            telemetry.observe_kv_release(before, kv_free_tokens(batch));
+        }
     }
+}
+
+/// Return shared paged-KV free capacity in logical tokens. Dense batches have
+/// no shared pool and intentionally report zero.
+fn kv_free_tokens(batch: &tritium_cuda::BatchKv) -> usize {
+    batch
+        .free_pages()
+        .saturating_mul(tritium_cuda::KV_PAGE_TOKENS)
+}
+
+/// Reserve row pages while publishing exact post-operation pool telemetry.
+fn reserve_pages(
+    batch: &mut tritium_cuda::BatchKv,
+    row: usize,
+    tokens: usize,
+    telemetry: &WorkerTelemetry,
+) -> Result<(), tritium_spec::BackendError> {
+    let before = kv_free_tokens(batch);
+    let result = batch.reserve_pages(row, tokens);
+    if result.is_ok() {
+        telemetry.observe_kv_reservation(before, kv_free_tokens(batch));
+    }
+    result
 }
 
 /// Emit one token on a slot's channel. Returns `false` when the request is
@@ -544,6 +570,7 @@ fn migrate_spec(
     batch: &mut tritium_cuda::BatchKv,
     draft: Option<&mut tritium_nn::ModelRunner>,
     pool: &[Option<Active>],
+    telemetry: &WorkerTelemetry,
 ) -> Option<Pending> {
     // The drafter's KV holds speculatively-fed tokens past the commit point;
     // its reconcile state died with the SpecSeq, so reset it explicitly (a
@@ -560,7 +587,7 @@ fn migrate_spec(
         // Spec admission pre-checked prompt + max_new against the pool
         // capacity and the pool is empty (all pages free), so this cannot
         // fail; error the stream loudly rather than trusting that silently.
-        if let Err(e) = batch.reserve_pages(row, s.history.len() + remaining) {
+        if let Err(e) = reserve_pages(batch, row, s.history.len() + remaining, telemetry) {
             let _ = s.tx.try_send(GenEvent::Error(format!(
                 "spec migration page reserve failed: {e}"
             )));
@@ -679,6 +706,7 @@ fn multi_spec_round(
     eos: u32,
     n_ctx: usize,
     log: &mut MultiFallbackLog,
+    telemetry: &WorkerTelemetry,
 ) -> MultiOutcome {
     let slots = pool.len();
     let rows: Vec<usize> = (0..slots).filter(|&r| pool[r].is_some()).collect();
@@ -1042,7 +1070,7 @@ fn multi_spec_round(
                 // already covers — this reserve is a defensive no-op that
                 // turns a bookkeeping bug into a slow round, not a wedge.
                 let need = batch.positions()[r] + tokens.len();
-                if batch.reserve_pages(r, need).is_err() {
+                if reserve_pages(batch, r, need, telemetry).is_err() {
                     eprintln!("tritium-serve: multi-slot verify page reserve (row {r})");
                     return MultiOutcome::Fallback;
                 }
@@ -1092,7 +1120,7 @@ fn multi_spec_round(
                         let _ = a.tx.try_send(GenEvent::Error(format!(
                             "speculative verify failed mid-commit: {e}"
                         )));
-                        release_slot(batch, r);
+                        release_slot(batch, r, telemetry);
                     }
                     mp.slots[r] = None;
                 }
@@ -1121,7 +1149,7 @@ fn multi_spec_round(
                     let _ = a.tx.try_send(GenEvent::Error(
                         "speculative verify returned an empty commit".into(),
                     ));
-                    release_slot(batch, r);
+                    release_slot(batch, r, telemetry);
                 }
                 mp.slots[r] = None;
                 drafter_broken = true;
@@ -1179,7 +1207,7 @@ fn multi_spec_round(
             if retire {
                 pool[r] = None;
                 mp.slots[r] = None;
-                release_slot(batch, r);
+                release_slot(batch, r, telemetry);
             }
         }
         if drafter_broken {
@@ -1249,6 +1277,7 @@ pub(crate) fn run_batched(
     // Whole-pool capacity in tokens (0 = dense/unlimited): requests that can
     // NEVER fit are errored loudly instead of parking forever.
     let pool_cap_tokens = batch.free_pages() * tritium_cuda::KV_PAGE_TOKENS;
+    telemetry.set_kv_pool(pool_cap_tokens, pool_cap_tokens);
     // A job that validated but found the page pool exhausted: retried before
     // pulling new work (FIFO), admitted once retirements free pages.
     let mut parked: Option<Job> = None;
@@ -1289,14 +1318,14 @@ pub(crate) fn run_batched(
             for (row, slot) in pool.iter_mut().enumerate() {
                 if let Some(a) = slot.take() {
                     let _ = a.tx.try_send(GenEvent::Error("server draining".into()));
-                    release_slot(&mut batch, row);
+                    release_slot(&mut batch, row, telemetry.as_ref());
                 }
             }
             if let Some(p) = pending.take() {
                 let row = p.row();
                 p.fail_draining();
                 if let Some(row) = row {
-                    release_slot(&mut batch, row);
+                    release_slot(&mut batch, row, telemetry.as_ref());
                 }
             }
             // Draining fails the solo spec sequence like an active slot.
@@ -1424,7 +1453,14 @@ pub(crate) fn run_batched(
                     }
                     if let Some(s) = spec.take() {
                         assert!(parked.is_none(), "parked job during solo spec");
-                        pending = migrate_spec(s, &mut runner, &mut batch, draft.as_mut(), &pool);
+                        pending = migrate_spec(
+                            s,
+                            &mut runner,
+                            &mut batch,
+                            draft.as_mut(),
+                            &pool,
+                            telemetry.as_ref(),
+                        );
                         if pending.is_some() {
                             parked = Some(Job::Generate {
                                 req,
@@ -1520,7 +1556,7 @@ pub(crate) fn run_batched(
                         // needed < max_ctx via the clamp above); if
                         // reserve_pages ever grows another error kind, match
                         // on it — a permanent error would park-loop.
-                        if batch.reserve_pages(row, needed).is_err() {
+                        if reserve_pages(&mut batch, row, needed, telemetry.as_ref()).is_err() {
                             parked = Some(Job::Generate {
                                 req,
                                 accepted_at,
@@ -1569,7 +1605,14 @@ pub(crate) fn run_batched(
                     }
                     if let Some(s) = spec.take() {
                         assert!(parked.is_none(), "parked job during solo spec");
-                        pending = migrate_spec(s, &mut runner, &mut batch, draft.as_mut(), &pool);
+                        pending = migrate_spec(
+                            s,
+                            &mut runner,
+                            &mut batch,
+                            draft.as_mut(),
+                            &pool,
+                            telemetry.as_ref(),
+                        );
                         if pending.is_some() {
                             parked = Some(Job::OpenTreeSession { prompt, resp });
                             continue;
@@ -1634,7 +1677,7 @@ pub(crate) fn run_batched(
                 let row = p.row();
                 pending = None;
                 if let Some(row) = row {
-                    release_slot(&mut batch, row);
+                    release_slot(&mut batch, row, telemetry.as_ref());
                 }
             } else {
                 phase.store(PHASE_PREFILL, Ordering::Release);
@@ -1647,7 +1690,7 @@ pub(crate) fn run_batched(
                         let row = p.row();
                         p.fail(e.to_string());
                         if let Some(row) = row {
-                            release_slot(&mut batch, row);
+                            release_slot(&mut batch, row, telemetry.as_ref());
                         }
                     }
                     Ok(logits) => {
@@ -1677,7 +1720,7 @@ pub(crate) fn run_batched(
                                     })();
                                     if let Err(e) = adopt {
                                         let _ = tx.try_send(GenEvent::Error(e));
-                                        release_slot(&mut batch, row);
+                                        release_slot(&mut batch, row, telemetry.as_ref());
                                     } else {
                                         next_active_id += 1;
                                         let mut active = Active {
@@ -1710,7 +1753,7 @@ pub(crate) fn run_batched(
                                                 .try_send(GenEvent::Error("empty logits".into()));
                                         }
                                         if !adopted {
-                                            release_slot(&mut batch, row);
+                                            release_slot(&mut batch, row, telemetry.as_ref());
                                         }
                                     }
                                 }
@@ -1870,6 +1913,7 @@ pub(crate) fn run_batched(
                 eos,
                 n_ctx,
                 &mut multi_log,
+                telemetry.as_ref(),
             );
             telemetry.observe_decode(decode_started.elapsed());
             match outcome {
@@ -1916,7 +1960,7 @@ pub(crate) fn run_batched(
                 for (row, slot) in pool.iter_mut().enumerate() {
                     if let Some(a) = slot.take() {
                         let _ = a.tx.try_send(GenEvent::Error(e.to_string()));
-                        release_slot(&mut batch, row);
+                        release_slot(&mut batch, row, telemetry.as_ref());
                     }
                 }
                 continue;
@@ -1934,7 +1978,7 @@ pub(crate) fn run_batched(
             ) else {
                 if let Some(a) = slot.take() {
                     let _ = a.tx.try_send(GenEvent::Error("empty logits".into()));
-                    release_slot(&mut batch, row);
+                    release_slot(&mut batch, row, telemetry.as_ref());
                 }
                 continue;
             };
@@ -1942,7 +1986,7 @@ pub(crate) fn run_batched(
             active.history.push(tok);
             if !emit(active, tok, eos, &all_logits[row]) {
                 *slot = None;
-                release_slot(&mut batch, row);
+                release_slot(&mut batch, row, telemetry.as_ref());
             }
         }
     }

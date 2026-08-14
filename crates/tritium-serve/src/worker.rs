@@ -51,9 +51,52 @@ pub(crate) struct WorkerTelemetry {
     pub(crate) decode_buckets: [AtomicU64; PHASE_DURATION_BUCKET_US.len()],
     pub(crate) decode_sum_us: AtomicU64,
     pub(crate) decode_count: AtomicU64,
+    /// Paged-KV pool capacity in logical tokens; zero for dense batches.
+    pub(crate) kv_pool_capacity_tokens: AtomicU64,
+    /// Paged-KV tokens currently free; zero for dense batches.
+    pub(crate) kv_pool_free_tokens: AtomicU64,
+    /// Successful upward page reservations observed by the batched worker.
+    pub(crate) kv_pool_reservations_total: AtomicU64,
+    /// Successful page releases observed by the batched worker.
+    pub(crate) kv_pool_releases_total: AtomicU64,
 }
 
 impl WorkerTelemetry {
+    /// Publish current paged-KV capacity/free gauges. Dense batches publish
+    /// zero for both values instead of pretending their per-slot arenas are a
+    /// shared pool.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn set_kv_pool(&self, capacity_tokens: usize, free_tokens: usize) {
+        let capacity = capacity_tokens.min(u64::MAX as usize) as u64;
+        let free = free_tokens.min(capacity as usize).min(u64::MAX as usize) as u64;
+        self.kv_pool_capacity_tokens
+            .store(capacity, Ordering::Release);
+        self.kv_pool_free_tokens.store(free, Ordering::Release);
+    }
+
+    /// Record one successful reservation and publish the post-operation free
+    /// gauge. Counters advance only when the pool actually lost pages.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn observe_kv_reservation(&self, before_free: usize, after_free: usize) {
+        if after_free < before_free {
+            self.kv_pool_reservations_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        self.kv_pool_free_tokens
+            .store(after_free.min(u64::MAX as usize) as u64, Ordering::Release);
+    }
+
+    /// Record one successful release and publish the post-operation free
+    /// gauge. Counters advance only when the pool actually gained pages.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn observe_kv_release(&self, before_free: usize, after_free: usize) {
+        if after_free > before_free {
+            self.kv_pool_releases_total.fetch_add(1, Ordering::Relaxed);
+        }
+        self.kv_pool_free_tokens
+            .store(after_free.min(u64::MAX as usize) as u64, Ordering::Release);
+    }
+
     pub(crate) fn observe_queue_wait(&self, elapsed: Duration) {
         observe_histogram(
             elapsed,

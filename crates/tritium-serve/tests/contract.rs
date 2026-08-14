@@ -1589,6 +1589,17 @@ async fn metrics_exposition() {
         "{text}"
     );
     assert!(
+        text.contains("# TYPE tritium_kv_pool_capacity_tokens gauge\n")
+            && text.contains("tritium_kv_pool_capacity_tokens 0\n")
+            && text.contains("# TYPE tritium_kv_pool_free_tokens gauge\n")
+            && text.contains("tritium_kv_pool_free_tokens 0\n")
+            && text.contains("# TYPE tritium_kv_pool_reservations_total counter\n")
+            && text.contains("tritium_kv_pool_reservations_total 0\n")
+            && text.contains("# TYPE tritium_kv_pool_releases_total counter\n")
+            && text.contains("tritium_kv_pool_releases_total 0\n"),
+        "{text}"
+    );
+    assert!(
         text.contains("# TYPE tritium_request_duration_seconds histogram"),
         "{text}"
     );
