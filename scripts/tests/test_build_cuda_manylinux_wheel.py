@@ -22,6 +22,7 @@ class BuildCudaManylinuxWheelTests(unittest.TestCase):
         self.assertEqual(contract["maturin"], "1.10.2")
         self.assertEqual(contract["linker"], "/io/scripts/manylinux-static-cxx-linker.sh")
         self.assertRegex(contract["static_cxx"], r"/gcc-toolset-14/root/usr/lib/gcc/.*/14/libstdc\+\+\.a$")
+        self.assertEqual(contract["cuda_host_cxx"], "/opt/rh/gcc-toolset-14/root/usr/bin/g++")
         self.assertEqual(contract["platform"], "manylinux_2_28_x86_64")
 
 

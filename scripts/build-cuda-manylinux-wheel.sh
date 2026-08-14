@@ -7,11 +7,13 @@ RUST_TOOLCHAIN="1.89.0"
 MATURIN_VERSION="1.10.2"
 PLATFORM_TAG="manylinux_2_28_x86_64"
 STATIC_CXX_LINKER="/io/scripts/manylinux-static-cxx-linker.sh"
+CUDA_HOST_CXX="/opt/rh/gcc-toolset-14/root/usr/bin/g++"
 
 if [[ "${1:-}" == "--print-contract" ]]; then
-  printf '{"image":"%s","rust":"%s","maturin":"%s","linker":"%s","static_cxx":"%s","platform":"%s"}\n' \
+  printf '{"image":"%s","rust":"%s","maturin":"%s","linker":"%s","static_cxx":"%s","cuda_host_cxx":"%s","platform":"%s"}\n' \
     "$IMAGE" "$RUST_TOOLCHAIN" "$MATURIN_VERSION" "$STATIC_CXX_LINKER" \
     "/opt/rh/gcc-toolset-14/root/usr/lib/gcc/x86_64-redhat-linux/14/libstdc++.a" \
+    "$CUDA_HOST_CXX" \
     "$PLATFORM_TAG"
   exit 0
 fi
@@ -77,6 +79,7 @@ docker run --rm \
   --env "HOST_GID=$(id -g)" \
   --env "TRITIUM_SOURCE_ID=source-git:$SOURCE_REVISION" \
   --env "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=$STATIC_CXX_LINKER" \
+  --env "CUDAHOSTCXX=$CUDA_HOST_CXX" \
   --env "PATH=/opt/rust/bin:$CUDA_HOME/bin:/opt/python/cp313-cp313/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
   "$IMAGE" bash -c "
     set -euo pipefail
