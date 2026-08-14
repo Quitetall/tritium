@@ -1412,7 +1412,7 @@ pub(crate) fn run_batched(
         // time (a valid job below parks itself as `pending` and ends the
         // pass via this condition).
         let mut admissions = 0usize;
-        let admission_cap = slots.checked_mul(2).unwrap_or(usize::MAX);
+        let admission_cap = slots.saturating_mul(2);
         while pending.is_none() {
             if admissions >= admission_cap {
                 break;
