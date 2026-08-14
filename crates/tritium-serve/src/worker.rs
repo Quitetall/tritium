@@ -59,6 +59,8 @@ pub(crate) struct WorkerTelemetry {
     pub(crate) kv_pool_reservations_total: AtomicU64,
     /// Successful page releases observed by the batched worker.
     pub(crate) kv_pool_releases_total: AtomicU64,
+    /// Failed page-release attempts; nonzero means reclamation needs review.
+    pub(crate) kv_pool_release_failures_total: AtomicU64,
 }
 
 impl WorkerTelemetry {
@@ -95,6 +97,13 @@ impl WorkerTelemetry {
         }
         self.kv_pool_free_tokens
             .store(after_free.min(u64::MAX as usize) as u64, Ordering::Release);
+    }
+
+    /// Record a failed release without fabricating a successful pool delta.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn observe_kv_release_failure(&self) {
+        self.kv_pool_release_failures_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn observe_queue_wait(&self, elapsed: Duration) {
@@ -573,5 +582,11 @@ mod tests {
             1
         );
         assert_eq!(telemetry.kv_pool_releases_total.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            telemetry
+                .kv_pool_release_failures_total
+                .load(Ordering::Relaxed),
+            0
+        );
     }
 }

@@ -1596,7 +1596,9 @@ async fn metrics_exposition() {
             && text.contains("# TYPE tritium_kv_pool_reservations_total counter\n")
             && text.contains("tritium_kv_pool_reservations_total 0\n")
             && text.contains("# TYPE tritium_kv_pool_releases_total counter\n")
-            && text.contains("tritium_kv_pool_releases_total 0\n"),
+            && text.contains("tritium_kv_pool_releases_total 0\n")
+            && text.contains("# TYPE tritium_kv_pool_release_failures_total counter\n")
+            && text.contains("tritium_kv_pool_release_failures_total 0\n"),
         "{text}"
     );
     assert!(

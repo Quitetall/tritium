@@ -305,8 +305,12 @@ fn req_seed(s: &Sampling) -> u64 {
 fn release_slot(batch: &mut tritium_cuda::BatchKv, row: usize, telemetry: &WorkerTelemetry) {
     if batch.paged() {
         let before = kv_free_tokens(batch);
-        if batch.release_pages(row).is_ok() {
-            telemetry.observe_kv_release(before, kv_free_tokens(batch));
+        match batch.release_pages(row) {
+            Ok(()) => telemetry.observe_kv_release(before, kv_free_tokens(batch)),
+            Err(error) => {
+                telemetry.observe_kv_release_failure();
+                eprintln!("tritium-serve: paged KV release failed for row {row}: {error}");
+            }
         }
     }
 }

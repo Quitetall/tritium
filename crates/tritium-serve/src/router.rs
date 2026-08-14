@@ -1898,6 +1898,9 @@ async fn metrics(State(st): State<AppState>) -> Response {
          # HELP tritium_kv_pool_releases_total Successful paged-KV page release operations.\n\
          # TYPE tritium_kv_pool_releases_total counter\n\
          tritium_kv_pool_releases_total {}\n\
+         # HELP tritium_kv_pool_release_failures_total Failed paged-KV page release attempts.\n\
+         # TYPE tritium_kv_pool_release_failures_total counter\n\
+         tritium_kv_pool_release_failures_total {}\n\
          # HELP tritium_worker_phase Current decode-worker phase as one-hot fixed-cardinality gauges.\n\
          # TYPE tritium_worker_phase gauge\n\
          tritium_worker_phase{{phase=\"idle\"}} {}\n\
@@ -1988,6 +1991,9 @@ async fn metrics(State(st): State<AppState>) -> Response {
         worker.kv_pool_free_tokens.load(Ordering::Acquire),
         worker.kv_pool_reservations_total.load(Ordering::Relaxed),
         worker.kv_pool_releases_total.load(Ordering::Relaxed),
+        worker
+            .kv_pool_release_failures_total
+            .load(Ordering::Relaxed),
         u8::from(phase == PHASE_IDLE),
         u8::from(phase == PHASE_PREFILL),
         u8::from(phase == PHASE_DECODE),
