@@ -429,6 +429,24 @@ pub fn build_router(
     build_router_with_limits(generator, tok, cfg, RequestLimits::default())
 }
 
+/// Build the loopback-only administrative drain router. This surface contains
+/// no model or metrics routes: callers can only start graceful drain by
+/// setting the same one-way flag used by SIGTERM handling.
+pub fn build_admin_router(draining: Arc<AtomicBool>) -> Router {
+    Router::new()
+        .route("/drain", get(admin_drain).post(admin_drain))
+        .with_state(draining)
+}
+
+async fn admin_drain(State(draining): State<Arc<AtomicBool>>) -> Response {
+    draining.store(true, Ordering::Release);
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({"status": "draining"})),
+    )
+        .into_response()
+}
+
 /// Build the router with explicit pre-admission request ceilings.
 pub fn build_router_with_limits(
     generator: Box<dyn Generator>,
@@ -2289,5 +2307,26 @@ mod tests {
                 "{path} must fail closed after a production backend fault",
             );
         }
+    }
+
+    #[tokio::test]
+    async fn admin_drain_is_single_purpose_and_one_way() {
+        let draining = Arc::new(AtomicBool::new(false));
+        let router = build_admin_router(draining.clone());
+        let response = router
+            .clone()
+            .oneshot(Request::post("/drain").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert!(draining.load(Ordering::Acquire));
+        assert_eq!(
+            router
+                .oneshot(Request::get("/drain").body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::ACCEPTED
+        );
     }
 }

@@ -27,8 +27,10 @@ readiness and receipt parity remain binding gates. URI-to-PVC staging is not yet
 implemented; the chart consumes a pre-provisioned read-only source PVC.
 
 KEDA defaults to `minReplicaCount: 1`; scale-to-zero is not admitted for CPU or
-GPU. SIGTERM triggers Tritium's graceful drain. An explicit preStop drain hook
-remains unavailable until the admin listener lands.
+GPU. The optional loopback admin listener exposes only `GET|POST /drain`; the
+main container's HTTP `preStop` hook calls it before Kubernetes sends SIGTERM.
+SIGTERM remains the fallback graceful-drain path. Set `admin.enabled: false`
+only for profiles that intentionally rely on signal-only shutdown.
 CUDA uses a `Recreate` Deployment strategy so a one-GPU cluster cannot deadlock
 waiting for surge capacity. This permits rollout downtime; use independently
 scheduled releases for zero-downtime GPU upgrades.

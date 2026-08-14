@@ -118,6 +118,12 @@ spec:
             - 0.0.0.0
             - --port
             - {{ int64 .Values.service.port | quote }}
+            {{- if .Values.admin.enabled }}
+            - --admin-host
+            - {{ .Values.admin.host | quote }}
+            - --admin-port
+            - {{ int64 .Values.admin.port | quote }}
+            {{- end }}
             - --model-id
             - {{ .Values.modelId | quote }}
             - --max-new
@@ -146,6 +152,19 @@ spec:
             - name: http
               containerPort: {{ .Values.service.port }}
               protocol: TCP
+            {{- if .Values.admin.enabled }}
+            - name: admin
+              containerPort: {{ .Values.admin.port }}
+              protocol: TCP
+            {{- end }}
+          {{- if .Values.admin.enabled }}
+          lifecycle:
+            preStop:
+              httpGet:
+                path: /drain
+                port: admin
+                scheme: HTTP
+          {{- end }}
           startupProbe:
             tcpSocket: {port: http}
             {{- toYaml .Values.probes.startup | nindent 12 }}

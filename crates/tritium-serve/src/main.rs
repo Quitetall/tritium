@@ -36,6 +36,8 @@ struct FileConfig {
     queue_cap: Option<usize>,
     host: Option<String>,
     port: Option<u16>,
+    admin_host: Option<String>,
+    admin_port: Option<u16>,
     model_id: Option<String>,
     max_new: Option<usize>,
     max_messages: Option<usize>,
@@ -62,6 +64,8 @@ struct LaunchConfig {
     queue_cap: usize,
     host: String,
     port: u16,
+    admin_host: String,
+    admin_port: Option<u16>,
     model_id: String,
     max_new: usize,
     max_messages: usize,
@@ -89,6 +93,8 @@ impl Default for LaunchConfig {
             queue_cap: 32,
             host: "127.0.0.1".to_owned(),
             port: 8080,
+            admin_host: "127.0.0.1".to_owned(),
+            admin_port: None,
             model_id: "tritium".to_owned(),
             max_new: 256,
             max_messages: 128,
@@ -192,6 +198,12 @@ fn apply_file_config(config: FileConfig, launch: &mut LaunchConfig) {
     if let Some(value) = config.port {
         launch.port = value;
     }
+    if let Some(value) = config.admin_host {
+        launch.admin_host = value;
+    }
+    if let Some(value) = config.admin_port {
+        launch.admin_port = Some(value);
+    }
     if let Some(value) = config.model_id {
         launch.model_id = value;
     }
@@ -273,6 +285,14 @@ fn apply_env_config(launch: &mut LaunchConfig) -> Result<(), Box<dyn std::error:
             .map_err(|_| "TRITIUM_HOST is not valid UTF-8")?;
     }
     env_value!("TRITIUM_PORT", launch.port);
+    if let Some(value) = std::env::var_os("TRITIUM_ADMIN_HOST") {
+        launch.admin_host = value
+            .into_string()
+            .map_err(|_| "TRITIUM_ADMIN_HOST is not valid UTF-8")?;
+    }
+    if let Some(value) = parse_env("TRITIUM_ADMIN_PORT")? {
+        launch.admin_port = Some(value);
+    }
     if let Some(value) = std::env::var_os("TRITIUM_MODEL_ID") {
         launch.model_id = value
             .into_string()
@@ -333,6 +353,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         mut queue_cap,
         mut host,
         mut port,
+        mut admin_host,
+        mut admin_port,
         mut model_id,
         mut max_new,
         mut max_messages,
@@ -376,6 +398,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--queue-cap" => queue_cap = val::<usize>(args.next(), "--queue-cap")?,
             "--host" => host = val::<String>(args.next(), "--host")?,
             "--port" => port = val(args.next(), "--port")?,
+            "--admin-host" => admin_host = val::<String>(args.next(), "--admin-host")?,
+            "--admin-port" => admin_port = Some(val(args.next(), "--admin-port")?),
             "--model-id" => model_id = val::<String>(args.next(), "--model-id")?,
             "--max-new" => max_new = val(args.next(), "--max-new")?,
             "--max-messages" => max_messages = val(args.next(), "--max-messages")?,
@@ -413,6 +437,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                      --model <legacy.gguf>) [--backend cpu|cuda] [--spec lookup] \
                      [--config <strict-json>] \
                      [--batch-slots N] [--queue-cap 32] [--host 127.0.0.1] [--port 8080] \
+                     [--admin-host 127.0.0.1] [--admin-port N] \
                      [--model-id tritium] \
                      [--max-new 256] [--max-messages 128] [--max-prompt-bytes 1048576] \
                      [--max-prompt-tokens 131072] [--max-completion-tokens 4096] \
@@ -571,6 +596,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // variable preserves compatibility; the plural comma-separated variable
     // supports bounded rotation without a restart-time authentication gap.
     let host_ip: std::net::IpAddr = host.parse().map_err(|e| format!("--host {host:?}: {e}"))?;
+    let admin_ip: std::net::IpAddr = admin_host
+        .parse()
+        .map_err(|e| format!("--admin-host {admin_host:?}: {e}"))?;
+    if admin_port.is_some_and(|port| port == 0) {
+        return Err("--admin-port must be >= 1 when enabled".into());
+    }
+    if admin_port.is_some() && !admin_ip.is_loopback() {
+        return Err(format!(
+            "--admin-host {admin_host} must be loopback when --admin-port is enabled"
+        )
+        .into());
+    }
     let mut auth_tokens = Vec::new();
     if let Ok(token) = std::env::var("TRITIUM_AUTH_TOKEN")
         && !token.is_empty()
@@ -803,9 +840,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
     eprintln!("tritium-serve: listening on http://{addr}/v1 (Ctrl-C to drain + stop)");
-    axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown_signal(draining))
-        .await?;
+    let public_server =
+        axum::serve(listener, router).with_graceful_shutdown(shutdown_signal(draining.clone()));
+    if let Some(admin_port) = admin_port {
+        let admin_addr = std::net::SocketAddr::new(admin_ip, admin_port);
+        let admin_listener = tokio::net::TcpListener::bind(admin_addr).await?;
+        eprintln!(
+            "tritium-serve: admin drain listener on http://{admin_addr}/drain (loopback-only)"
+        );
+        let admin_server = axum::serve(
+            admin_listener,
+            tritium_serve::build_admin_router(draining.clone()),
+        )
+        .with_graceful_shutdown(shutdown_signal(draining));
+        tokio::try_join!(public_server, admin_server)?;
+    } else {
+        public_server.await?;
+    }
     Ok(())
 }
 
