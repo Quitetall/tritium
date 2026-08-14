@@ -294,6 +294,19 @@ jobs:
             --wheel-artifact dist/*.whl \
             --source-revision ${{ github.sha }} \
             --release 1.1.0-rc.1
+      - name: qualify installed-wheel API signature
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/qualify-api-signature.py \
+            --repo "$GITHUB_WORKSPACE" \
+            --python "$(command -v python)" \
+            --wheel dist/*.whl \
+            --api-report docs/generated/api-diff-v1.0-v1.1.json \
+            --source-revision "${{ github.sha }}" \
+            --release 1.1.0-rc.1 \
+            --run-id "github-${{ github.run_id }}-${{ github.run_attempt }}-api-signature" \
+            --output-dir evidence/api-signature
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: wheel-functional-torch-2.11-python-3.13
@@ -301,6 +314,7 @@ jobs:
             evidence/torch-2.11-python-3.13.json
             evidence/tutorial-cpu/**
             evidence/tutorial-cpu/receipt.json
+            evidence/api-signature/**
           if-no-files-found: error
 
   tutorial-clean-wheel:

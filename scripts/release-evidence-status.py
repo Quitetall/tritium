@@ -118,6 +118,11 @@ TORCH_DISPATCH_CUDA_RECEIPT = runpy.run_path(
 validate_torch_dispatch_cuda = TORCH_DISPATCH_CUDA_RECEIPT["validate"]
 torch_dispatch_git_blob_at = TORCH_DISPATCH_CUDA_RECEIPT["git_blob_at"]
 DispatchCudaReceiptError = TORCH_DISPATCH_CUDA_RECEIPT["ReceiptError"]
+API_SIGNATURE_RECEIPT = runpy.run_path(
+    Path(__file__).with_name("verify-api-signature-receipt.py")
+)
+validate_api_signature = API_SIGNATURE_RECEIPT["validate"]
+ApiSignatureError = API_SIGNATURE_RECEIPT["ApiSignatureError"]
 ESTIMATOR_REFINEMENT_RECEIPT = runpy.run_path(
     Path(__file__).with_name("verify-estimator-refinement-receipt.py")
 )
@@ -148,6 +153,7 @@ KNOWN_KINDS = frozenset(
         "distributed-training",
         "export-reload",
         "observability",
+        "api-signature",
         "browser-conformance",
         "second-machine",
         "independent-review",
@@ -188,7 +194,7 @@ GATES = (
         (
             "installed-qat-tutorial", "frontend-lifecycle",
             "distributed-training", "export-reload",
-            "observability", "torch-dispatch-overhead", "torch-dispatch-cuda",
+            "observability", "api-signature", "torch-dispatch-overhead", "torch-dispatch-cuda",
         ),
     ),
     ("native-backends", ("backend-manifest", "cuda-training", "performance")),
@@ -480,6 +486,17 @@ def evaluate(
                     expected_source_revision=revision,
                     expected_release=release,
                 )
+            elif kind == "api-signature":
+                receipt = validate_api_signature(
+                    receipt_path,
+                    expected_revision=revision,
+                    expected_release=release,
+                    expected_wheel=artifact_path,
+                    expected_api_report=(
+                        Path(__file__).resolve().parent.parent
+                        / "docs/generated/api-diff-v1.0-v1.1.json"
+                    ),
+                )
             elif kind == "browser-conformance":
                 receipt = validate_browser_receipt(
                     receipt_path, revision, release, artifact_path
@@ -736,6 +753,21 @@ def evaluate(
             )
             if actual != declared or actual != qualified:
                 raise EvidenceError(f"{kind} receipt does not bind candidate wheel bytes")
+        elif kind == "api-signature":
+            identity = artifact.get("identity", {})
+            actual = (
+                artifact_path.name, _sha256(artifact_path), artifact_path.stat().st_size
+            )
+            declared = (
+                artifact_path.name, identity.get("sha256"), identity.get("bytes")
+            )
+            qualified = (
+                receipt["wheel"]["name"],
+                receipt["wheel"]["sha256"].removeprefix("sha256:"),
+                receipt["wheel"]["bytes"],
+            )
+            if actual != declared or actual != qualified:
+                raise EvidenceError("api-signature receipt does not bind candidate wheel bytes")
         elif kind == "torch-dispatch-overhead":
             identity = artifact.get("identity", {})
             actual = (
