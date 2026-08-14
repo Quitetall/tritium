@@ -20,8 +20,17 @@ class BuildCpuManylinuxWheelTests(unittest.TestCase):
         self.assertRegex(contract["image"], r"@sha256:[0-9a-f]{64}$")
         self.assertEqual(contract["rust"], "1.89.0")
         self.assertEqual(contract["maturin"], "1.10.2")
-        self.assertRegex(contract["gxx"], r"^gcc-c\+\+-[0-9].*\.x86_64$")
+        self.assertEqual(contract["linker"], "/io/scripts/manylinux-static-cxx-linker.sh")
+        self.assertRegex(contract["static_cxx"], r"/gcc-toolset-14/root/usr/lib/gcc/.*/14/libstdc\+\+\.a$")
         self.assertEqual(contract["platform"], "manylinux_2_28_x86_64")
+
+    def test_static_linker_contract_is_source_bound(self):
+        linker = SCRIPT.parent / "manylinux-static-cxx-linker.sh"
+        subprocess.run(["bash", "-n", str(linker)], check=True)
+        source = linker.read_text(encoding="utf-8")
+        self.assertIn("libstdc++.a", source)
+        self.assertIn("libstdc++fs.a", source)
+        self.assertIn("--start-group", source)
 
 
 if __name__ == "__main__":
