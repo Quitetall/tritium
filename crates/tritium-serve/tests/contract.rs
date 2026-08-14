@@ -1579,6 +1579,16 @@ async fn metrics_exposition() {
         "{text}"
     );
     assert!(
+        text.contains("# TYPE tritium_artifact_loaded_bytes gauge\n")
+            && text.contains("tritium_artifact_loaded_bytes 0\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("# TYPE tritium_artifact_resident_bytes gauge\n")
+            && text.contains("tritium_artifact_resident_bytes 0\n"),
+        "{text}"
+    );
+    assert!(
         text.contains("# TYPE tritium_request_duration_seconds histogram"),
         "{text}"
     );

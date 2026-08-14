@@ -1762,6 +1762,15 @@ async fn metrics(State(st): State<AppState>) -> Response {
         &worker.decode_sum_us,
         &worker.decode_count,
     );
+    let (artifact_loaded_bytes, artifact_resident_bytes) = st
+        .runtime
+        .production
+        .as_ref()
+        .map(|readiness| {
+            let receipt = readiness.receipt();
+            (receipt.loaded_bundle_bytes, receipt.resident_bytes)
+        })
+        .unwrap_or((0, 0));
     let body = format!(
         "# HELP tritium_metrics_schema_info Exposition schema version (fixed).\n\
          # TYPE tritium_metrics_schema_info gauge\n\
@@ -1853,6 +1862,12 @@ async fn metrics(State(st): State<AppState>) -> Response {
          # HELP tritium_backend_faulted Latched production backend fault state.\n\
          # TYPE tritium_backend_faulted gauge\n\
          tritium_backend_faulted {}\n\
+         # HELP tritium_artifact_loaded_bytes Bytes read from the admitted model bundle.\n\
+         # TYPE tritium_artifact_loaded_bytes gauge\n\
+         tritium_artifact_loaded_bytes {}\n\
+         # HELP tritium_artifact_resident_bytes Steady-state bytes resident for the admitted model.\n\
+         # TYPE tritium_artifact_resident_bytes gauge\n\
+         tritium_artifact_resident_bytes {}\n\
          # HELP tritium_worker_phase Current decode-worker phase as one-hot fixed-cardinality gauges.\n\
          # TYPE tritium_worker_phase gauge\n\
          tritium_worker_phase{{phase=\"idle\"}} {}\n\
@@ -1937,6 +1952,8 @@ async fn metrics(State(st): State<AppState>) -> Response {
         u8::from(st.runtime.worker_alive.load(Ordering::Relaxed)),
         st.runtime.backend_faults.load(Ordering::Relaxed),
         u8::from(st.runtime.backend_faulted.load(Ordering::Acquire)),
+        artifact_loaded_bytes,
+        artifact_resident_bytes,
         u8::from(phase == PHASE_IDLE),
         u8::from(phase == PHASE_PREFILL),
         u8::from(phase == PHASE_DECODE),
