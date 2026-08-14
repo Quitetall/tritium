@@ -19,6 +19,7 @@ contained_file = MODULE["_contained_file"]
 evaluate = MODULE["evaluate"]
 render = MODULE["render"]
 gate_row = MODULE["_gate_row"]
+check_ancestry = MODULE["_check_ancestry"]
 STATUS_MODULE = runpy.run_path(ROOT / "scripts" / "release-status")
 status_main = STATUS_MODULE["main"]
 WHEEL_MODULE = runpy.run_path(ROOT / "scripts" / "wheel-functional-smoke.py")
@@ -283,6 +284,24 @@ def entry(
 
 
 class ReleaseEvidenceStatusTests(unittest.TestCase):
+    def test_ancestry_accepts_deep_chain_without_recursion(self):
+        entries = {
+            f"r{index}": {
+                "parents": [] if index == 0 else [f"r{index - 1}"],
+            }
+            for index in range(2500)
+        }
+        check_ancestry(entries)
+
+    def test_ancestry_rejects_cycle_iteratively(self):
+        entries = {
+            "root": {"parents": ["middle"]},
+            "middle": {"parents": ["leaf"]},
+            "leaf": {"parents": ["middle"]},
+        }
+        with self.assertRaisesRegex(EvidenceError, "cycle"):
+            check_ancestry(entries)
+
     def test_candidate_artifact_path_must_be_contained(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)

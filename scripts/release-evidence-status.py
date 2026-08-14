@@ -284,24 +284,36 @@ def _gate_row(
 
 
 def _check_ancestry(entries: dict[str, dict[str, Any]]) -> None:
-    visiting: set[str] = set()
-    visited: set[str] = set()
-
-    def visit(receipt_id: str) -> None:
-        if receipt_id in visiting:
-            raise EvidenceError("receipt ancestry contains a cycle")
-        if receipt_id in visited:
-            return
-        visiting.add(receipt_id)
-        for parent in entries[receipt_id]["parents"]:
-            if parent not in entries:
-                raise EvidenceError(f"receipt {receipt_id!r} has unknown parent {parent!r}")
-            visit(parent)
-        visiting.remove(receipt_id)
-        visited.add(receipt_id)
-
-    for receipt_id in entries:
-        visit(receipt_id)
+    # Use an explicit stack. Registry metadata is attacker-controlled up to
+    # MAX_RECEIPT_BYTES; recursive DFS would turn a valid long ancestry chain
+    # into an uncaught RecursionError instead of a deterministic admission
+    # result.
+    state: dict[str, int] = {}
+    for root in entries:
+        if state.get(root) == 2:
+            continue
+        stack: list[tuple[str, bool]] = [(root, False)]
+        while stack:
+            receipt_id, exiting = stack.pop()
+            if exiting:
+                state[receipt_id] = 2
+                continue
+            current = state.get(receipt_id, 0)
+            if current == 1:
+                raise EvidenceError("receipt ancestry contains a cycle")
+            if current == 2:
+                continue
+            state[receipt_id] = 1
+            stack.append((receipt_id, True))
+            for parent in reversed(entries[receipt_id]["parents"]):
+                if parent not in entries:
+                    raise EvidenceError(
+                        f"receipt {receipt_id!r} has unknown parent {parent!r}"
+                    )
+                if state.get(parent, 0) == 1:
+                    raise EvidenceError("receipt ancestry contains a cycle")
+                if state.get(parent, 0) == 0:
+                    stack.append((parent, False))
 
 
 def review_scope_sha256(document: dict[str, Any]) -> str:
