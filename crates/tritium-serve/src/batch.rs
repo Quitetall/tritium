@@ -430,9 +430,10 @@ enum SpecOutcome {
 /// pushed into `history`, preserving the [`SpecSeq`] invariant.
 fn emit_spec(s: &mut SpecSeq, token: u32, eos: u32) -> SpecOutcome {
     let is_eos = s.req.stop_eos && token == eos;
-    let last = is_eos || s.emitted + 1 >= s.max_new;
+    let next_emitted = s.emitted.saturating_add(1);
+    let last = is_eos || next_emitted >= s.max_new;
     let sent = s.tx.try_send(GenEvent::Token(token, None)).is_ok();
-    s.emitted += 1;
+    s.emitted = next_emitted;
     if !sent {
         return SpecOutcome::Cancelled;
     }
@@ -1740,7 +1741,7 @@ pub(crate) fn run_batched(
             } else {
                 phase.store(PHASE_PREFILL, Ordering::Release);
                 let len = p.prompt().len();
-                let end = (p.done + chunk).min(len);
+                let end = p.done.saturating_add(chunk).min(len);
                 let positions: Vec<usize> = (p.done..end).collect();
                 match runner.forward(&p.prompt()[p.done..end], &positions) {
                     Err(e) => {
@@ -1780,10 +1781,17 @@ pub(crate) fn run_batched(
                                         let _ = tx.try_send(GenEvent::Error(e));
                                         release_slot(&mut batch, row, telemetry.as_ref());
                                     } else {
-                                        next_active_id += 1;
+                                        let Some(active_id) = next_active_id.checked_add(1) else {
+                                            let _ = tx.try_send(GenEvent::Error(
+                                                "active request id exhausted".into(),
+                                            ));
+                                            release_slot(&mut batch, row, telemetry.as_ref());
+                                            continue;
+                                        };
+                                        next_active_id = active_id;
                                         let mut active = Active {
                                             tx,
-                                            id: next_active_id,
+                                            id: active_id,
                                             logprobs: req.logprobs,
                                             stop_eos: req.stop_eos,
                                             remaining: max_new,
