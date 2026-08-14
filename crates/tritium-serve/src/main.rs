@@ -8,6 +8,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use serde::Deserialize;
 use tritium_serve::{
     AdmissionPolicy, IdPassthroughTokenizer, PrincipalRateLimit, RequestLimits, RunnerGenerator,
     ServeConfig,
@@ -20,6 +21,281 @@ use tritium_cpu as _;
 use tritium_cuda as _;
 
 const DESTRUCTIVE_CUDA_LOSS_ENV: &str = "TRITIUM_DESTRUCTIVE_CUDA_LOSS_QUALIFICATION";
+
+/// JSON/`TRITIUM_*` launch overlay. Secrets intentionally stay environment-only.
+/// `deny_unknown_fields` makes deployment typos fail before model/device init.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+struct FileConfig {
+    model: Option<String>,
+    bundle: Option<String>,
+    profile: Option<String>,
+    backend: Option<String>,
+    spec: Option<String>,
+    batch_slots: Option<usize>,
+    queue_cap: Option<usize>,
+    host: Option<String>,
+    port: Option<u16>,
+    model_id: Option<String>,
+    max_new: Option<usize>,
+    max_messages: Option<usize>,
+    max_prompt_bytes: Option<usize>,
+    max_prompt_tokens: Option<usize>,
+    max_completion_tokens: Option<usize>,
+    max_total_tokens: Option<usize>,
+    rate_limit_rpm: Option<u32>,
+    rate_limit_burst: Option<u32>,
+    eos: Option<u32>,
+    raw_tokens: Option<bool>,
+    draft_model: Option<String>,
+    kv_pool_tokens: Option<usize>,
+}
+
+#[derive(Debug)]
+struct LaunchConfig {
+    model_path: Option<String>,
+    bundle_path: Option<String>,
+    profile: String,
+    backend_name: String,
+    spec: Option<String>,
+    batch_slots: usize,
+    queue_cap: usize,
+    host: String,
+    port: u16,
+    model_id: String,
+    max_new: usize,
+    max_messages: usize,
+    max_prompt_bytes: usize,
+    max_prompt_tokens: usize,
+    max_new_tokens: usize,
+    max_total_tokens: usize,
+    rate_limit_rpm: u32,
+    rate_limit_burst: u32,
+    eos: u32,
+    raw_tokens: bool,
+    draft_model: Option<String>,
+    kv_pool_tokens: Option<usize>,
+}
+
+impl Default for LaunchConfig {
+    fn default() -> Self {
+        Self {
+            model_path: None,
+            bundle_path: None,
+            profile: "compact-v1".to_owned(),
+            backend_name: "cpu".to_owned(),
+            spec: None,
+            batch_slots: 1,
+            queue_cap: 32,
+            host: "127.0.0.1".to_owned(),
+            port: 8080,
+            model_id: "tritium".to_owned(),
+            max_new: 256,
+            max_messages: 128,
+            max_prompt_bytes: 1024 * 1024,
+            max_prompt_tokens: 128 * 1024,
+            max_new_tokens: 4096,
+            max_total_tokens: 128 * 1024,
+            rate_limit_rpm: 120,
+            rate_limit_burst: 8,
+            eos: 128_001,
+            raw_tokens: false,
+            draft_model: None,
+            kv_pool_tokens: None,
+        }
+    }
+}
+
+fn config_path(args: &[String]) -> Result<Option<String>, String> {
+    let mut from_args = None;
+    let mut index = 0;
+    while index < args.len() {
+        if args[index] == "--config" {
+            if from_args.is_some() {
+                return Err("--config may be specified only once".into());
+            }
+            let value = args
+                .get(index + 1)
+                .ok_or_else(|| "--config requires a value".to_owned())?;
+            from_args = Some(value.clone());
+            index += 1;
+        }
+        index += 1;
+    }
+    Ok(from_args.or_else(|| std::env::var("TRITIUM_CONFIG").ok()))
+}
+
+fn read_config(args: &[String]) -> Result<FileConfig, Box<dyn std::error::Error>> {
+    let Some(path) = config_path(args)? else {
+        return Ok(FileConfig::default());
+    };
+    let bytes = std::fs::read(&path).map_err(|error| format!("--config {path:?}: {error}"))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|error| format!("--config {path:?}: invalid JSON/config: {error}").into())
+}
+
+fn parse_env<T: std::str::FromStr>(name: &str) -> Result<Option<T>, Box<dyn std::error::Error>>
+where
+    T::Err: std::fmt::Display,
+{
+    let Some(value) = std::env::var_os(name) else {
+        return Ok(None);
+    };
+    let value = value
+        .into_string()
+        .map_err(|_| format!("{name} is not valid UTF-8"))?;
+    value
+        .parse::<T>()
+        .map(Some)
+        .map_err(|error| format!("{name}: invalid value {value:?}: {error}").into())
+}
+
+fn parse_env_bool(name: &str) -> Result<Option<bool>, Box<dyn std::error::Error>> {
+    let Some(value) = std::env::var_os(name) else {
+        return Ok(None);
+    };
+    let value = value
+        .into_string()
+        .map_err(|_| format!("{name} is not valid UTF-8"))?;
+    match value.as_str() {
+        "1" | "true" | "TRUE" => Ok(Some(true)),
+        "0" | "false" | "FALSE" => Ok(Some(false)),
+        _ => Err(format!("{name}: expected one of 1/0/true/false, got {value:?}").into()),
+    }
+}
+
+fn apply_file_config(config: FileConfig, launch: &mut LaunchConfig) {
+    if let Some(value) = config.model {
+        launch.model_path = Some(value);
+    }
+    if let Some(value) = config.bundle {
+        launch.bundle_path = Some(value);
+    }
+    if let Some(value) = config.profile {
+        launch.profile = value;
+    }
+    if let Some(value) = config.backend {
+        launch.backend_name = value;
+    }
+    if let Some(value) = config.spec {
+        launch.spec = Some(value);
+    }
+    if let Some(value) = config.batch_slots {
+        launch.batch_slots = value;
+    }
+    if let Some(value) = config.queue_cap {
+        launch.queue_cap = value;
+    }
+    if let Some(value) = config.host {
+        launch.host = value;
+    }
+    if let Some(value) = config.port {
+        launch.port = value;
+    }
+    if let Some(value) = config.model_id {
+        launch.model_id = value;
+    }
+    if let Some(value) = config.max_new {
+        launch.max_new = value;
+    }
+    if let Some(value) = config.max_messages {
+        launch.max_messages = value;
+    }
+    if let Some(value) = config.max_prompt_bytes {
+        launch.max_prompt_bytes = value;
+    }
+    if let Some(value) = config.max_prompt_tokens {
+        launch.max_prompt_tokens = value;
+    }
+    if let Some(value) = config.max_completion_tokens {
+        launch.max_new_tokens = value;
+    }
+    if let Some(value) = config.max_total_tokens {
+        launch.max_total_tokens = value;
+    }
+    if let Some(value) = config.rate_limit_rpm {
+        launch.rate_limit_rpm = value;
+    }
+    if let Some(value) = config.rate_limit_burst {
+        launch.rate_limit_burst = value;
+    }
+    if let Some(value) = config.eos {
+        launch.eos = value;
+    }
+    if let Some(value) = config.raw_tokens {
+        launch.raw_tokens = value;
+    }
+    if let Some(value) = config.draft_model {
+        launch.draft_model = Some(value);
+    }
+    if let Some(value) = config.kv_pool_tokens {
+        launch.kv_pool_tokens = Some(value);
+    }
+}
+
+fn apply_env_config(launch: &mut LaunchConfig) -> Result<(), Box<dyn std::error::Error>> {
+    macro_rules! env_string {
+        ($name:literal, $target:expr) => {
+            if let Some(value) = std::env::var_os($name) {
+                $target = Some(
+                    value
+                        .into_string()
+                        .map_err(|_| format!("{} is not valid UTF-8", $name))?,
+                );
+            }
+        };
+    }
+    macro_rules! env_value {
+        ($name:literal, $target:expr) => {
+            if let Some(value) = parse_env($name)? {
+                $target = value;
+            }
+        };
+    }
+    env_string!("TRITIUM_MODEL", launch.model_path);
+    env_string!("TRITIUM_BUNDLE", launch.bundle_path);
+    if let Some(value) = std::env::var_os("TRITIUM_PROFILE") {
+        launch.profile = value
+            .into_string()
+            .map_err(|_| "TRITIUM_PROFILE is not valid UTF-8")?;
+    }
+    if let Some(value) = std::env::var_os("TRITIUM_BACKEND") {
+        launch.backend_name = value
+            .into_string()
+            .map_err(|_| "TRITIUM_BACKEND is not valid UTF-8")?;
+    }
+    env_string!("TRITIUM_SPEC", launch.spec);
+    env_value!("TRITIUM_BATCH_SLOTS", launch.batch_slots);
+    env_value!("TRITIUM_QUEUE_CAP", launch.queue_cap);
+    if let Some(value) = std::env::var_os("TRITIUM_HOST") {
+        launch.host = value
+            .into_string()
+            .map_err(|_| "TRITIUM_HOST is not valid UTF-8")?;
+    }
+    env_value!("TRITIUM_PORT", launch.port);
+    if let Some(value) = std::env::var_os("TRITIUM_MODEL_ID") {
+        launch.model_id = value
+            .into_string()
+            .map_err(|_| "TRITIUM_MODEL_ID is not valid UTF-8")?;
+    }
+    env_value!("TRITIUM_MAX_NEW", launch.max_new);
+    env_value!("TRITIUM_MAX_MESSAGES", launch.max_messages);
+    env_value!("TRITIUM_MAX_PROMPT_BYTES", launch.max_prompt_bytes);
+    env_value!("TRITIUM_MAX_PROMPT_TOKENS", launch.max_prompt_tokens);
+    env_value!("TRITIUM_MAX_COMPLETION_TOKENS", launch.max_new_tokens);
+    env_value!("TRITIUM_MAX_TOTAL_TOKENS", launch.max_total_tokens);
+    env_value!("TRITIUM_RATE_LIMIT_RPM", launch.rate_limit_rpm);
+    env_value!("TRITIUM_RATE_LIMIT_BURST", launch.rate_limit_burst);
+    env_value!("TRITIUM_EOS", launch.eos);
+    if let Some(value) = parse_env_bool("TRITIUM_RAW_TOKENS")? {
+        launch.raw_tokens = value;
+    }
+    env_string!("TRITIUM_DRAFT_MODEL", launch.draft_model);
+    if let Some(value) = parse_env("TRITIUM_KV_POOL_TOKENS")? {
+        launch.kv_pool_tokens = Some(value);
+    }
+    Ok(())
+}
 
 fn destructive_cuda_loss_enabled(
     value: Option<&std::ffi::OsStr>,
@@ -39,28 +315,38 @@ fn destructive_cuda_loss_enabled(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut model_path: Option<String> = None;
-    let mut bundle_path: Option<String> = None;
-    let mut profile = "compact-v1".to_owned();
-    let mut backend_name = "cpu".to_owned();
-    let mut spec: Option<String> = None;
-    let mut batch_slots: usize = 1;
-    let mut queue_cap: usize = 32;
-    let mut host = "127.0.0.1".to_owned();
-    let mut port: u16 = 8080;
-    let mut model_id = "tritium".to_owned();
-    let mut max_new: usize = 256;
-    let mut max_messages: usize = 128;
-    let mut max_prompt_bytes: usize = 1024 * 1024;
-    let mut max_prompt_tokens: usize = 128 * 1024;
-    let mut max_new_tokens: usize = 4096;
-    let mut max_total_tokens: usize = 128 * 1024;
-    let mut rate_limit_rpm: u32 = 120;
-    let mut rate_limit_burst: u32 = 8;
-    let mut eos: u32 = 128_001;
-    let mut raw_tokens = false;
-    let mut draft_model: Option<String> = None;
-    let mut kv_pool_tokens: Option<usize> = None;
+    // Configuration precedence is deliberately visible and deterministic:
+    // built-in defaults < strict JSON file < `TRITIUM_*` environment < CLI.
+    // Parse overlays before model/backend initialization so malformed deploy
+    // configuration fails without allocating device or artifact state.
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    let mut launch = LaunchConfig::default();
+    apply_file_config(read_config(&raw_args)?, &mut launch);
+    apply_env_config(&mut launch)?;
+    let LaunchConfig {
+        mut model_path,
+        mut bundle_path,
+        mut profile,
+        mut backend_name,
+        mut spec,
+        mut batch_slots,
+        mut queue_cap,
+        mut host,
+        mut port,
+        mut model_id,
+        mut max_new,
+        mut max_messages,
+        mut max_prompt_bytes,
+        mut max_prompt_tokens,
+        mut max_new_tokens,
+        mut max_total_tokens,
+        mut rate_limit_rpm,
+        mut rate_limit_burst,
+        mut eos,
+        mut raw_tokens,
+        mut draft_model,
+        mut kv_pool_tokens,
+    } = launch;
 
     // Parse a required value for `name`, erroring (not silently defaulting) on a
     // missing or malformed value.
@@ -73,9 +359,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|_| format!("{name}: invalid value {s:?}").into())
     }
 
-    let mut args = std::env::args().skip(1);
+    let mut args = raw_args.into_iter();
     while let Some(a) = args.next() {
         match a.as_str() {
+            "--config" => {
+                // Already loaded in the pre-scan. Consume its value so it is
+                // not mistaken for a model/backend argument below.
+                let _ = val::<String>(args.next(), "--config")?;
+            }
             "--model" => model_path = Some(val::<String>(args.next(), "--model")?),
             "--bundle" => bundle_path = Some(val::<String>(args.next(), "--bundle")?),
             "--profile" => profile = val::<String>(args.next(), "--profile")?,
@@ -120,14 +411,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!(
                     "usage: tritium-serve (--bundle <schema-v3-dir> [--profile compact-v1] | \
                      --model <legacy.gguf>) [--backend cpu|cuda] [--spec lookup] \
+                     [--config <strict-json>] \
                      [--batch-slots N] [--queue-cap 32] [--host 127.0.0.1] [--port 8080] \
                      [--model-id tritium] \
                      [--max-new 256] [--max-messages 128] [--max-prompt-bytes 1048576] \
                      [--max-prompt-tokens 131072] [--max-completion-tokens 4096] \
                      [--max-total-tokens 131072] [--rate-limit-rpm 120] \
                      [--rate-limit-burst 8] [--eos 128001] [--raw-tokens] \
-                     [--draft-model <gguf>] [--kv-pool-tokens N]  (non-loopback \
-                     --host requires TRITIUM_AUTH_TOKEN or TRITIUM_AUTH_TOKENS)"
+                     [--draft-model <gguf>] [--kv-pool-tokens N]  (precedence: defaults < \
+                     config < TRITIUM_* < CLI; non-loopback --host requires \
+                     TRITIUM_AUTH_TOKEN or TRITIUM_AUTH_TOKENS)"
                 );
                 return Ok(());
             }
@@ -563,5 +856,33 @@ mod tests {
                 "{DESTRUCTIVE_CUDA_LOSS_ENV} must be unset or exactly `1`"
             ))
         );
+    }
+
+    #[test]
+    fn config_path_rejects_duplicate_cli_flags() {
+        let args = vec![
+            "--config".to_owned(),
+            "one.json".to_owned(),
+            "--config".to_owned(),
+            "two.json".to_owned(),
+        ];
+        assert_eq!(
+            config_path(&args),
+            Err("--config may be specified only once".to_owned())
+        );
+    }
+
+    #[test]
+    fn config_file_rejects_unknown_keys_before_startup() {
+        let path = std::env::temp_dir().join(format!(
+            "tritium-serve-config-{}-{}.json",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::write(&path, br#"{"queue-cap":4,"unknown-key":true}"#).unwrap();
+        let args = vec!["--config".to_owned(), path.to_string_lossy().into_owned()];
+        let error = read_config(&args).unwrap_err().to_string();
+        let _ = std::fs::remove_file(&path);
+        assert!(error.contains("unknown field `unknown-key`"), "{error}");
     }
 }
