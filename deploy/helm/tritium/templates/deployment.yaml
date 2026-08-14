@@ -162,6 +162,7 @@ spec:
             preStop:
               httpGet:
                 path: /drain
+                host: 127.0.0.1
                 port: admin
                 scheme: HTTP
           {{- end }}

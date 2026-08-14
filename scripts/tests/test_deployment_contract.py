@@ -52,6 +52,10 @@ class DeploymentContractTests(unittest.TestCase):
             "ephemeral-storage",
             "GPU resource limits require gpu.enabled=true",
             ".Values.probes.startup",
+            "--admin-port",
+            "preStop:",
+            "path: /drain",
+            "host: 127.0.0.1",
         ):
             source = (
                 (CHART / "values.yaml").read_text(encoding="utf-8")
