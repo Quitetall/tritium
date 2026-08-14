@@ -982,6 +982,26 @@ def test_module_conversion_rejects_rebound_calibration_aliases(tmp_path):
     assert captured.value.code == "coverage_mismatch"
 
 
+def test_activation_reload_rejects_duplicate_alias_ownership(tmp_path):
+    prepared = prepare(
+        torch.nn.Linear(2, 2, bias=False),
+        TernaryConfig.ptq(profile="compact-v1", target_modules=("Linear",)),
+        inplace=False,
+    )
+    evidence = tmp_path / "evidence"
+    calibrate(prepared, [torch.ones(1, 2)], evidence_dir=evidence)
+    manifest_path = evidence / "calibration.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["records"][0]["weight_aliases"] = ["weight", "weight"]
+    identity = dict(manifest)
+    identity.pop("evidence_id")
+    canonical = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+    manifest["evidence_id"] = f"sha256:{hashlib.sha256(canonical).hexdigest()}"
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    with pytest.raises(ValueError, match="aliases must be unique"):
+        ptq.load_activation_calibration(evidence)
+
+
 def test_load_quantized_module_rejects_linear_subclass_semantic_loss(tmp_path):
     class ShiftedLinear(torch.nn.Linear):
         def forward(self, value):

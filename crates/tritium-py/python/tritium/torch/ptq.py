@@ -1993,6 +1993,8 @@ def load_activation_calibration(
     cache_digest = hashlib.sha256()
     total_bytes = 0
     expected_files = {"calibration.json"}
+    seen_aliases: set[str] = set()
+    seen_modules: set[str] = set()
     for index, item in enumerate(values):
         if not isinstance(item, dict) or set(item) != record_fields:
             raise ValueError("activation record fields do not match schema version 1")
@@ -2009,6 +2011,14 @@ def load_activation_calibration(
             or any(not isinstance(alias, str) or not alias for alias in aliases)
         ):
             raise ValueError("activation record module aliases are invalid")
+        if len(set(aliases)) != len(aliases):
+            raise ValueError("activation record aliases must be unique")
+        if item["module"] in seen_modules:
+            raise ValueError("activation record modules must be unique")
+        if seen_aliases.intersection(aliases):
+            raise ValueError("activation record aliases must be globally unique")
+        seen_modules.add(item["module"])
+        seen_aliases.update(aliases)
         if (
             type(item["features"]) is not int
             or item["features"] <= 0
