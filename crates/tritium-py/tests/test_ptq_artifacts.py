@@ -909,6 +909,45 @@ def test_load_quantized_module_rejects_source_drift(tmp_path):
     assert captured.value.code == "source_changed"
 
 
+def test_module_conversion_rejects_rebound_calibration_aliases(tmp_path):
+    class TiedLinears(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.left = torch.nn.Linear(2, 2, bias=False)
+            self.right = torch.nn.Linear(2, 2, bias=False)
+            self.right.weight = self.left.weight
+
+        def forward(self, value):
+            return self.left(value) + self.right(value)
+
+    prepared = prepare(
+        TiedLinears(),
+        TernaryConfig.ptq(profile="compact-v1", target_modules=("Linear",)),
+        inplace=False,
+    )
+    evidence = tmp_path / "evidence"
+    calibration = calibrate(
+        prepared,
+        [torch.ones(1, 2)],
+        evidence_dir=evidence,
+    )
+    manifest_path = evidence / "calibration.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["records"][0]["weight_aliases"] = [
+        "right.weight",
+        "left.weight",
+    ]
+    identity = dict(manifest)
+    identity.pop("evidence_id")
+    canonical = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+    manifest["evidence_id"] = f"sha256:{hashlib.sha256(canonical).hexdigest()}"
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    tampered = ptq.load_activation_calibration(evidence)
+    with pytest.raises(TritiumError) as captured:
+        convert(prepared, tampered, work_dir=tmp_path / "work")
+    assert captured.value.code == "coverage_mismatch"
+
+
 def test_load_quantized_module_rejects_linear_subclass_semantic_loss(tmp_path):
     class ShiftedLinear(torch.nn.Linear):
         def forward(self, value):

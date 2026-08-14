@@ -2456,6 +2456,52 @@ def _fit_module(
             stage="convert",
         )
     parameters = dict(prepared.model.named_parameters(remove_duplicate=False))
+    expected_modules = _selected_linear_modules(prepared)
+    records = tuple(calibration.records)
+    observed_by_aliases = {
+        tuple(record.weight_aliases): record for record in records
+    }
+    expected_by_aliases = {
+        tuple(record.aliases): record for record in expected_modules
+    }
+    if (
+        len(observed_by_aliases) != len(records)
+        or set(observed_by_aliases) != set(expected_by_aliases)
+    ):
+        raise TritiumError(
+            "activation calibration aliases differ from prepared coverage",
+            code="coverage_mismatch",
+            stage="convert",
+        )
+    for aliases, expected in expected_by_aliases.items():
+        record = observed_by_aliases[aliases]
+        if record.module != expected.path:
+            raise TritiumError(
+                "activation calibration module differs from prepared coverage",
+                code="coverage_mismatch",
+                stage="convert",
+                module=record.module,
+            )
+        if (
+            record.features != expected.module.in_features
+            or record.outputs != expected.module.out_features
+        ):
+            raise TritiumError(
+                "activation calibration geometry differs from prepared coverage",
+                code="coverage_mismatch",
+                stage="convert",
+                module=record.module,
+            )
+        canonical = parameters.get(aliases[0])
+        if canonical is None or any(
+            parameters.get(alias) is not canonical for alias in aliases
+        ):
+            raise TritiumError(
+                "activation calibration aliases are not one shared parameter",
+                code="coverage_mismatch",
+                stage="convert",
+                module=record.module,
+            )
     adaptive = prepared.config.target_bpw is not None
     algorithm_id = (
         _adaptive_diagonal_algorithm_id()
@@ -2485,8 +2531,6 @@ def _fit_module(
                 },
             )
         return min(record.outputs, (max_working_bytes - fixed_bytes) // per_row_bytes)
-
-    records = tuple(calibration.records)
 
     def measured_error_curve(record: ActivationRecord) -> tuple[float, ...]:
         """Measure weighted reconstruction error for every admissible plane count."""
