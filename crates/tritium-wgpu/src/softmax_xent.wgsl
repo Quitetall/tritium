@@ -9,6 +9,10 @@ struct Params {
     padding_3: f32,
 };
 
+// Chrome Tint rejects a bitcast infinity literal. This finite sentinel still
+// underflows through exp() and preserves masked-softmax behavior.
+const NEGATIVE_LARGE: f32 = -3.402823466e+38;
+
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var<storage, read> logits: array<f32>;
 @group(0) @binding(2) var<storage, read> targets: array<f32>;
@@ -21,7 +25,7 @@ fn main() {
         var total = 0.0;
         for (var row = 0u; row < params.rows; row += 1u) {
             let base = row * params.cols;
-            var maximum = bitcast<f32>(0xff800000u);
+            var maximum = NEGATIVE_LARGE;
             for (var column = 0u; column < params.cols; column += 1u) {
                 maximum = max(maximum, logits[base + column]);
             }
@@ -38,7 +42,7 @@ fn main() {
     } else {
         for (var row = 0u; row < params.rows; row += 1u) {
             let base = row * params.cols;
-            var maximum = bitcast<f32>(0xff800000u);
+            var maximum = NEGATIVE_LARGE;
             for (var column = 0u; column < params.cols; column += 1u) {
                 maximum = max(maximum, logits[base + column]);
             }

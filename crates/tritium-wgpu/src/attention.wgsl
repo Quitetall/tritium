@@ -9,6 +9,10 @@ struct AttentionParams {
     padding_1: u32,
 }
 
+// Chrome Tint rejects a bitcast infinity literal. This finite sentinel still
+// underflows through exp() and preserves masked-softmax behavior.
+const NEGATIVE_LARGE: f32 = -3.402823466e+38;
+
 @group(0) @binding(0) var<uniform> params: AttentionParams;
 @group(0) @binding(1) var<storage, read> q: array<f32>;
 @group(0) @binding(2) var<storage, read> k: array<f32>;
@@ -31,9 +35,9 @@ fn compute_probabilities(head: u32, kv_head: u32, scale: f32) {
                 score += q[vector_index(query, head, params.n_head, lane)]
                     * k[vector_index(key, kv_head, params.n_kv_head, lane)];
             }
-            probabilities[row + key] = select(score * scale, bitcast<f32>(0xff800000u), params.causal != 0u && key > query);
+            probabilities[row + key] = select(score * scale, NEGATIVE_LARGE, params.causal != 0u && key > query);
         }
-        var maximum = bitcast<f32>(0xff800000u);
+        var maximum = NEGATIVE_LARGE;
         for (var key = 0u; key < params.seq; key++) {
             maximum = max(maximum, probabilities[row + key]);
         }
