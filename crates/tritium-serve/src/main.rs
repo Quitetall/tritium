@@ -333,6 +333,26 @@ fn destructive_cuda_loss_enabled(
     }
 }
 
+fn validate_bind_addresses(
+    host: &str,
+    admin_host: &str,
+    admin_port: Option<u16>,
+) -> Result<(std::net::IpAddr, std::net::IpAddr), String> {
+    let host_ip: std::net::IpAddr = host.parse().map_err(|e| format!("--host {host:?}: {e}"))?;
+    let admin_ip: std::net::IpAddr = admin_host
+        .parse()
+        .map_err(|e| format!("--admin-host {admin_host:?}: {e}"))?;
+    if admin_port.is_some_and(|port| port == 0) {
+        return Err("--admin-port must be >= 1 when enabled".into());
+    }
+    if admin_port.is_some() && !admin_ip.is_loopback() {
+        return Err(format!(
+            "--admin-host {admin_host} must be loopback when --admin-port is enabled"
+        ));
+    }
+    Ok((host_ip, admin_ip))
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Configuration precedence is deliberately visible and deterministic:
@@ -493,6 +513,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .into());
     }
+    let (host_ip, admin_ip) = validate_bind_addresses(&host, &admin_host, admin_port)?;
     // Resolve the named backend from the runtime registry (the same owned-init
     // pattern the acceptance tests use). `cpu` is always linked; `cuda` needs
     // the `cuda` cargo feature and a working device.
@@ -595,19 +616,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Binding beyond loopback requires at least one bearer key. The singular
     // variable preserves compatibility; the plural comma-separated variable
     // supports bounded rotation without a restart-time authentication gap.
-    let host_ip: std::net::IpAddr = host.parse().map_err(|e| format!("--host {host:?}: {e}"))?;
-    let admin_ip: std::net::IpAddr = admin_host
-        .parse()
-        .map_err(|e| format!("--admin-host {admin_host:?}: {e}"))?;
-    if admin_port.is_some_and(|port| port == 0) {
-        return Err("--admin-port must be >= 1 when enabled".into());
-    }
-    if admin_port.is_some() && !admin_ip.is_loopback() {
-        return Err(format!(
-            "--admin-host {admin_host} must be loopback when --admin-port is enabled"
-        )
-        .into());
-    }
     let mut auth_tokens = Vec::new();
     if let Ok(token) = std::env::var("TRITIUM_AUTH_TOKEN")
         && !token.is_empty()
@@ -906,6 +914,19 @@ mod tests {
             Err(format!(
                 "{DESTRUCTIVE_CUDA_LOSS_ENV} must be unset or exactly `1`"
             ))
+        );
+    }
+
+    #[test]
+    fn admin_bind_validation_is_loopback_and_preinit() {
+        assert!(validate_bind_addresses("0.0.0.0", "127.0.0.1", Some(9090)).is_ok());
+        assert_eq!(
+            validate_bind_addresses("0.0.0.0", "0.0.0.0", Some(9090)),
+            Err("--admin-host 0.0.0.0 must be loopback when --admin-port is enabled".into())
+        );
+        assert_eq!(
+            validate_bind_addresses("0.0.0.0", "127.0.0.1", Some(0)),
+            Err("--admin-port must be >= 1 when enabled".into())
         );
     }
 
