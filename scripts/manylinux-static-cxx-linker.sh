@@ -24,7 +24,7 @@ for arg in "$@"; do
     if [[ "$arg" == "stdc++" || "$arg" == "stdc++fs" ]]; then
       needs_stdcxx=1
     else
-      args+=("$arg")
+      args+=(-l "$arg")
     fi
     skip_next=0
     continue
