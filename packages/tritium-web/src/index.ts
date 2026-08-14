@@ -142,4 +142,3 @@ export type {
   WebGpuResidentTensorV1,
 } from "./webgpu-runtime.ts";
 export type { WebGpuTrainingAdapterOptionsV1 } from "./webgpu-adapter.ts";
-// Pre-commit staged-tree probe: no runtime behavior.
