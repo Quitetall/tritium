@@ -35,6 +35,12 @@ Every non-secret CLI setting has a matching uppercase `TRITIUM_*` variable
 `TRITIUM_MAX_COMPLETION_TOKENS`). Bearer credentials remain environment-only:
 use `TRITIUM_AUTH_TOKEN` or bounded rotation via `TRITIUM_AUTH_TOKENS`.
 
+For orchestrated shutdown, opt into a separate loopback-only listener with
+`--admin-host 127.0.0.1 --admin-port 9090` (or `admin-host`/`admin-port` in the
+strict config). It exposes only `GET|POST /drain`, which sets the same one-way
+drain flag as SIGTERM; it never serves model, health, readiness, or metrics
+routes. Kubernetes `preStop` hooks should target `127.0.0.1` explicitly.
+
 ## Metrics
 
 `GET /metrics` uses same authentication boundary as generation. Prometheus
