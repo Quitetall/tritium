@@ -14,7 +14,7 @@ with the listed stable diagnostic instead of silently falling back.
 
 | Target | Status | Evidence / failure |
 |---|---|---|
-| Linux x86_64 CPU wheel | **qualified** | [`compatibility-v1.1/linux-x86_64-cpu.json`](../release/compatibility-v1.1/linux-x86_64-cpu.json) SHA-256 `c90358ac0c489b780b7a145b9e560701f6687a00d2de5c46482b250112ba24ae`; revision `9195107acc25da1f97c29091c8360b660c5cfacb` |
+| Linux x86_64 CPU wheel | **qualified** | [`compatibility-v1.1/linux-x86_64-cpu.json`](../release/compatibility-v1.1/linux-x86_64-cpu.json) SHA-256 `99bb462da205e8b5eafadd1943f625cf8141cd59d2ba19808f6b7d8c9cc9ab5a`; revision `2801881e4bec792680e450b7fff16bd2d5cd2716` |
 | macOS arm64 CPU wheel | **pending** | Fresh no-compiler wheel receipt is not yet archived. |
 | Windows x86_64 CPU wheel | **pending** | Fresh no-compiler wheel receipt is not yet archived. |
 
@@ -45,7 +45,7 @@ with the listed stable diagnostic instead of silently falling back.
 
 | Target | Status | Evidence / failure |
 |---|---|---|
-| Node.js 22+ strict-TypeScript archive | **qualified** | [`compatibility-v1.1/node-22.json`](../release/compatibility-v1.1/node-22.json) SHA-256 `6e760e2502ca1ad6a8e75ba5eef610c4eacad4db7796c99c2d8e48abe6854033`; revision `9195107acc25da1f97c29091c8360b660c5cfacb` |
+| Node.js 22+ strict-TypeScript archive | **pending** | Current-HEAD npm archive passed its qualification receipt, but no canonical compatibility receipt is archived for this candidate. |
 | Chrome WebGPU training | **pending** | Actual-browser WebGPU receipt is not yet archived. |
 | Firefox WebGPU training | **pending** | Actual-browser WebGPU receipt is not yet archived. |
 | Safari WebGPU training | **pending** | Actual-browser WebGPU receipt is not yet archived. |
