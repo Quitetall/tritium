@@ -388,6 +388,40 @@ def test_live_module_calibration_streams_bounded_source_bound_curvature(tmp_path
         ptq.load_activation_calibration(evidence)
 
 
+def test_live_module_calibration_restores_mixed_submodule_training_modes(tmp_path):
+    class MixedModes(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.left = torch.nn.Sequential(torch.nn.Linear(3, 2, bias=False))
+            self.right = torch.nn.Sequential(torch.nn.Linear(2, 1, bias=False))
+
+        def forward(self, value):
+            return self.right(self.left(value))
+
+    prepared = prepare(
+        MixedModes(),
+        TernaryConfig.ptq(profile="compact-v1", target_modules=("Linear",)),
+        inplace=False,
+    )
+    prepared.model.train()
+    prepared.model.left.eval()
+    prepared.model.right.train()
+    before = {
+        name: module.training for name, module in prepared.model.named_modules()
+    }
+    calibrate(
+        prepared,
+        [torch.ones(2, 3)],
+        evidence_dir=tmp_path / "mixed-mode-evidence",
+    )
+    after = {
+        name: module.training for name, module in prepared.model.named_modules()
+    }
+    assert after == before
+    assert before["left"] is False
+    assert before["right"] is True
+
+
 def test_live_module_calibration_fails_closed_on_incomplete_or_oversize_data(tmp_path):
     class Conditional(torch.nn.Module):
         def __init__(self):

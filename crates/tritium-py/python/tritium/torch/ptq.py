@@ -2134,7 +2134,12 @@ def _collect_activations(
             handles.append(module.register_forward_pre_hook(hook_for(record.path)))
 
     model = prepared.model
-    was_training = model.training
+    # Calibration temporarily forces eval semantics, but callers may keep
+    # mixed train/eval islands (for example frozen normalization beside a
+    # train-mode head). Restore every module's exact prior flag.
+    training_flags = tuple(
+        (component, component.training) for component in model.modules()
+    )
     token_digest = hashlib.sha256()
     batches = 0
     try:
@@ -2146,7 +2151,8 @@ def _collect_activations(
     finally:
         for handle in handles:
             handle.remove()
-        model.train(was_training)
+        for component, training in training_flags:
+            component.training = training
     if batches == 0:
         raise TritiumError(
             "calibration data must yield at least one batch",
