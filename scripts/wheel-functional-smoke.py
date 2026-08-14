@@ -136,6 +136,24 @@ def validate_native_result(value: object) -> None:
         raise SmokeError(f"native ternary kernel returned invalid result: {value!r}")
 
 
+def require_native_source_identity(native: object, revision: str) -> None:
+    """Reject wheels whose compiled extension was built from another revision."""
+
+    expected = f"source-git:{revision}"
+    source_identity = getattr(native, "source_identity", None)
+    if not callable(source_identity):
+        raise SmokeError("candidate wheel does not expose native source identity")
+    try:
+        observed = source_identity()
+    except Exception as error:  # noqa: BLE001 - preserve a typed smoke failure
+        raise SmokeError("candidate wheel native source identity probe failed") from error
+    if observed != expected:
+        raise SmokeError(
+            "candidate wheel native source identity mismatch: "
+            f"expected {expected}, got {observed!r}"
+        )
+
+
 def _tiny_llama(transformers):
     config = transformers.LlamaConfig(
         vocab_size=32,
@@ -177,6 +195,7 @@ def run_smoke(
     require_installed(Path(tritium._tritium.__file__), forbidden_root, environment_root)
     require_distribution_file(Path(tritium.__file__), distribution_files)
     require_distribution_file(Path(tritium._tritium.__file__), distribution_files)
+    require_native_source_identity(tritium._tritium, revision)
     if device not in {"cpu", "cuda:0"}:
         raise SmokeError("device must be cpu or cuda:0")
     backend = device.split(":", 1)[0]

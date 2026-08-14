@@ -3,6 +3,7 @@ import importlib.util
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 
 SCRIPT = Path(__file__).parents[1] / "wheel-functional-smoke.py"
@@ -132,6 +133,20 @@ class WheelFunctionalSmokeTests(unittest.TestCase):
                 MODULE.SmokeError, "native ternary kernel"
             ):
                 MODULE.validate_native_result(value)
+
+    def test_native_source_identity_is_required_and_exact(self):
+        revision = "a" * 40
+        MODULE.require_native_source_identity(
+            SimpleNamespace(source_identity=lambda: f"source-git:{revision}"),
+            revision,
+        )
+        with self.assertRaisesRegex(MODULE.SmokeError, "does not expose native source identity"):
+            MODULE.require_native_source_identity(SimpleNamespace(), revision)
+        with self.assertRaisesRegex(MODULE.SmokeError, "source identity mismatch"):
+            MODULE.require_native_source_identity(
+                SimpleNamespace(source_identity=lambda: "source-git:" + "b" * 40),
+                revision,
+            )
 
     def test_smoke_device_choices_are_closed(self):
         self.assertEqual(MODULE.run_smoke.__defaults__, ("cpu",))
