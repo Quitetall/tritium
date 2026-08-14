@@ -522,7 +522,10 @@ fn spec_cycle(
         return Ok(emit_spec(s, next, eos));
     }
 
-    let mut tokens = Vec::with_capacity(1 + drafts.len());
+    let token_capacity = 1usize
+        .checked_add(drafts.len())
+        .ok_or_else(|| "speculative token tree size overflow".to_owned())?;
+    let mut tokens = Vec::with_capacity(token_capacity);
     tokens.push(pending);
     tokens.extend(&drafts);
     let parents: Vec<i32> = (0..tokens.len() as i32).map(|i| i - 1).collect();
@@ -591,7 +594,13 @@ fn migrate_spec(
         // Spec admission pre-checked prompt + max_new against the pool
         // capacity and the pool is empty (all pages free), so this cannot
         // fail; error the stream loudly rather than trusting that silently.
-        if let Err(e) = reserve_pages(batch, row, s.history.len() + remaining, telemetry) {
+        let Some(needed) = s.history.len().checked_add(remaining) else {
+            let _ = s.tx.try_send(GenEvent::Error(
+                "spec migration token footprint overflow".into(),
+            ));
+            return None;
+        };
+        if let Err(e) = reserve_pages(batch, row, needed, telemetry) {
             let _ = s.tx.try_send(GenEvent::Error(format!(
                 "spec migration page reserve failed: {e}"
             )));
@@ -721,14 +730,15 @@ fn multi_spec_round(
     // Even k=1 chains cost 2 nodes per slot; past the cap the one-bucket
     // verify cannot hold everyone. (Realistic pools are far smaller; a
     // grouped-rounds variant is the measured follow-up if ever needed.)
-    if 2 * n_live > TREE_NODE_CAP {
+    let tree_nodes = n_live.checked_mul(2);
+    if tree_nodes.is_none_or(|nodes| nodes > TREE_NODE_CAP) {
         if !log.cap {
             log.cap = true;
             eprintln!(
                 "tritium-serve: multi-slot spec idle — {n_live} live slots need \
                  {} tree nodes > the {TREE_NODE_CAP}-node verify bucket; \
                  lockstep until the pool shrinks (logged once)",
-                2 * n_live
+                tree_nodes.unwrap_or(usize::MAX)
             );
         }
         return MultiOutcome::Fallback;
@@ -782,7 +792,7 @@ fn multi_spec_round(
             continue; // suppressed: no drafter work this round
         }
         let p = pool[r].as_ref().expect("live row").history.len() - 1;
-        if p + 2 >= draft_ctx {
+        if p.saturating_add(2) >= draft_ctx {
             if caps[r].is_some() {
                 // A probe blocked at the drafter's context edge: plain step
                 // this round; the (cheap) probe attempt recurs next round.
@@ -795,7 +805,7 @@ fn multi_spec_round(
                     "tritium-serve: multi-slot spec idle — a slot's history \
                      ({} tokens) is at the drafter's context edge ({draft_ctx}); \
                      lockstep until it retires (logged once)",
-                    p + 1
+                    p.saturating_add(1)
                 );
             }
             return MultiOutcome::Fallback;
@@ -964,7 +974,16 @@ fn multi_spec_round(
     // affects the committed stream, so this is a pure cost knob.
     // Suppressed rows contribute their 1-node root only, not 1 + k.
     let n_draft = rows.iter().filter(|&&r| caps[r] != Some(0)).count();
-    let m_total = n_live + n_draft * k;
+    let Some(m_total) = n_draft
+        .checked_mul(k)
+        .and_then(|draft_nodes| n_live.checked_add(draft_nodes))
+    else {
+        if !log.cap {
+            log.cap = true;
+            eprintln!("tritium-serve: multi-slot spec idle — tree node count overflow");
+        }
+        return MultiOutcome::Fallback;
+    };
     if n_draft > 0
         && !tritium_cuda::TREE_BUCKETS.contains(&m_total)
         && let Some(b) = tritium_cuda::TREE_BUCKETS
@@ -995,7 +1014,7 @@ fn multi_spec_round(
                 // d <= n_ctx - history.len() — the solo spec_cycle's kv_room.
                 let p = a.history.len() - 1;
                 kr.min(a.remaining.saturating_sub(1))
-                    .min(n_ctx.saturating_sub(p + 1))
+                    .min(n_ctx.saturating_sub(p.saturating_add(1)))
             })
         })
         .collect();
@@ -1044,7 +1063,10 @@ fn multi_spec_round(
         let a = pool[r].as_ref().expect("live");
         fed[r] = chains[r].len();
         let take = d_max[r].min(chains[r].len());
-        let mut tokens = Vec::with_capacity(1 + take);
+        let Some(token_capacity) = 1usize.checked_add(take) else {
+            return MultiOutcome::Fallback;
+        };
+        let mut tokens = Vec::with_capacity(token_capacity);
         tokens.push(*a.history.last().expect("history holds the prompt"));
         tokens.extend(&chains[r][..take]);
         let parents: Vec<i32> = (0..tokens.len() as i32).map(|i| i - 1).collect();
@@ -1058,8 +1080,14 @@ fn multi_spec_round(
     while start < trees.len() {
         let mut end = start;
         let mut m_sum = 0usize;
-        while end < trees.len() && m_sum + trees[end].1.len() <= TREE_NODE_CAP {
-            m_sum += trees[end].1.len();
+        while end < trees.len()
+            && m_sum
+                .checked_add(trees[end].1.len())
+                .is_some_and(|next| next <= TREE_NODE_CAP)
+        {
+            m_sum = m_sum
+                .checked_add(trees[end].1.len())
+                .expect("checked tree group size");
             end += 1;
         }
         debug_assert!(end > start, "k clamp guarantees every chain fits a bucket");
@@ -1073,7 +1101,10 @@ fn multi_spec_round(
                 // nothing), which the admission's prompt+max_new reservation
                 // already covers — this reserve is a defensive no-op that
                 // turns a bookkeeping bug into a slow round, not a wedge.
-                let need = batch.positions()[r] + tokens.len();
+                let Some(need) = batch.positions()[r].checked_add(tokens.len()) else {
+                    eprintln!("tritium-serve: multi-slot verify token position overflow (row {r})");
+                    return MultiOutcome::Fallback;
+                };
                 if reserve_pages(batch, r, need, telemetry).is_err() {
                     eprintln!("tritium-serve: multi-slot verify page reserve (row {r})");
                     return MultiOutcome::Fallback;
@@ -1181,8 +1212,12 @@ fn multi_spec_round(
                 // accepted prefix). Rolling back to exactly that leaves a
                 // gap of at most one token (l <= fed + 1), closed next
                 // round.
-                let matched = 1 + (l - 1).min(fed[r] - 1);
-                if mp.dbatch.set_position(r, p + matched).is_err() {
+                let matched = 1usize.saturating_add((l - 1).min(fed[r] - 1));
+                let position_ok = match p.checked_add(matched) {
+                    Some(next_position) => mp.dbatch.set_position(r, next_position).is_ok(),
+                    None => false,
+                };
+                if !position_ok {
                     // Bad row/pos = corrupted bookkeeping: drop the
                     // enrollment (pool falls back after the loop) but KEEP
                     // emitting — the target side already committed.
@@ -1191,7 +1226,7 @@ fn multi_spec_round(
                 } else {
                     debug_assert_eq!(
                         mp.dbatch.positions()[r],
-                        p + 1 + (l - 1).min(fed[r] - 1),
+                        p.saturating_add(1usize.saturating_add((l - 1).min(fed[r] - 1))),
                         "drafter watermark mismatch after rollback (row {r})"
                     );
                 }
@@ -1258,11 +1293,18 @@ pub(crate) fn run_batched(
         None => runner.new_batch(slots),
         Some(t) => {
             let pages = t.div_ceil(tritium_cuda::KV_PAGE_TOKENS);
+            let Some(paged_tokens) = pages.checked_mul(tritium_cuda::KV_PAGE_TOKENS) else {
+                eprintln!("tritium-serve: --kv-pool-tokens page capacity overflow");
+                return;
+            };
+            let Some(dense_tokens) = slots.checked_mul(n_ctx) else {
+                eprintln!("tritium-serve: --batch-slots dense capacity overflow");
+                return;
+            };
             eprintln!(
                 "tritium-serve: paged KV — {pages} pages ({} tokens) shared by {slots} \
                  slots (dense would be {} tokens)",
-                pages * tritium_cuda::KV_PAGE_TOKENS,
-                slots * n_ctx,
+                paged_tokens, dense_tokens,
             );
             runner.new_batch_paged(slots, pages)
         }
@@ -1280,7 +1322,10 @@ pub(crate) fn run_batched(
     };
     // Whole-pool capacity in tokens (0 = dense/unlimited): requests that can
     // NEVER fit are errored loudly instead of parking forever.
-    let pool_cap_tokens = batch.free_pages() * tritium_cuda::KV_PAGE_TOKENS;
+    let Some(pool_cap_tokens) = batch.free_pages().checked_mul(tritium_cuda::KV_PAGE_TOKENS) else {
+        eprintln!("tritium-serve: paged KV free capacity overflow");
+        return;
+    };
     telemetry.set_kv_pool(pool_cap_tokens, pool_cap_tokens);
     // A job that validated but found the page pool exhausted: retried before
     // pulling new work (FIFO), admitted once retirements free pages.
@@ -1366,8 +1411,9 @@ pub(crate) fn run_batched(
         // time (a valid job below parks itself as `pending` and ends the
         // pass via this condition).
         let mut admissions = 0usize;
+        let admission_cap = slots.checked_mul(2).unwrap_or(usize::MAX);
         while pending.is_none() {
-            if admissions >= slots * 2 {
+            if admissions >= admission_cap {
                 break;
             }
             let free = pool.iter().position(Option::is_none);
@@ -1433,7 +1479,7 @@ pub(crate) fn run_batched(
                         telemetry.observe_queue_wait(accepted_at.elapsed());
                     }
                     let prompt_len = req.prompt_tokens.len();
-                    if prompt_len == 0 || prompt_len + 1 >= n_ctx {
+                    if prompt_len == 0 || prompt_len >= n_ctx.saturating_sub(1) {
                         let _ = tx.try_send(GenEvent::Error("prompt does not fit".into()));
                         continue;
                     }
@@ -1489,7 +1535,10 @@ pub(crate) fn run_batched(
                         && !tree_open
                         && matches!(req.sampling, Sampling::Greedy)
                         && req.logprobs.is_none()
-                        && (!batch.paged() || prompt_len + max_new <= pool_cap_tokens)
+                        && (!batch.paged()
+                            || prompt_len
+                                .checked_add(max_new)
+                                .is_some_and(|needed| needed <= pool_cap_tokens))
                         && !tx.is_closed()
                     {
                         match (
@@ -1544,7 +1593,12 @@ pub(crate) fn run_batched(
                     // error; a pool that is merely full right now parks the
                     // job until a retirement frees pages.
                     if batch.paged() {
-                        let needed = prompt_len + max_new;
+                        let Some(needed) = prompt_len.checked_add(max_new) else {
+                            let _ = tx.try_send(GenEvent::Error(
+                                "prompt + max_tokens token footprint overflow".into(),
+                            ));
+                            continue;
+                        };
                         if needed > pool_cap_tokens {
                             let _ = tx.try_send(GenEvent::Error(format!(
                                 "prompt + max_tokens = {needed} tokens exceeds the \
