@@ -84,8 +84,12 @@
       {
         "id": "node-22",
         "target": "Node.js 22+ strict-TypeScript archive",
-        "status": "pending",
-        "blocker": "Current-HEAD npm archive passed its qualification receipt, but no canonical compatibility receipt is archived for this candidate."
+        "status": "qualified",
+        "receipt": {
+          "path": "compatibility-v1.1/node-22.json",
+          "sha256": "0c13a5f9484ab1f557497b69048caa1a79fb4a4200c2c2f4d0b7ea17339706fe",
+          "source_revision": "2801881e4bec792680e450b7fff16bd2d5cd2716"
+        }
       },
       {
         "id": "chrome-webgpu",
