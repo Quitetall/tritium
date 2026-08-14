@@ -45,8 +45,12 @@ git config core.hooksPath .githooks
 ```
 
 The pre-commit hook runs `./scripts/verify-gates.sh precommit` against the
-staged tree. It checks staged whitespace and formatting without touching files
-or inspecting unrelated working-tree WIP. For explicit local tiers, run
+staged tree. It checks staged whitespace, Rust formatting, Python/shell/JSON
+syntax, and the web package check when those paths change. It builds an
+isolated staged snapshot, and uses an independent temporary repository for web
+release checks that require a clean Git tree. It never touches the caller's
+index or branch, never inspects unrelated working-tree WIP, and fails closed
+when a required checker is unavailable. For explicit local tiers, run
 `./scripts/verify-gates.sh prepush`, `ci`, or `release`.
 
 It checks the commit being pushed, not your working tree, so uncommitted work
