@@ -552,4 +552,26 @@ mod tests {
         assert!(faulted.load(Ordering::Acquire));
         assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn paged_kv_telemetry_counts_only_real_pool_deltas() {
+        let telemetry = WorkerTelemetry::default();
+        telemetry.set_kv_pool(4096, 4096);
+        telemetry.observe_kv_reservation(4096, 2048);
+        telemetry.observe_kv_reservation(2048, 2048);
+        telemetry.observe_kv_release(2048, 4096);
+        telemetry.observe_kv_release(4096, 4096);
+
+        assert_eq!(
+            telemetry.kv_pool_capacity_tokens.load(Ordering::Acquire),
+            4096
+        );
+        assert_eq!(telemetry.kv_pool_free_tokens.load(Ordering::Acquire), 4096);
+        assert_eq!(
+            telemetry.kv_pool_reservations_total.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(telemetry.kv_pool_releases_total.load(Ordering::Relaxed), 1);
+    }
 }
