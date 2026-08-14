@@ -1045,6 +1045,12 @@ fn request_timeout_error() -> ApiError {
 fn request_ready(state: &AppState) -> bool {
     state.runtime.worker_alive.load(Ordering::Relaxed)
         && !state.runtime.backend_faulted.load(Ordering::Acquire)
+        && state
+            .runtime
+            .telemetry
+            .kv_pool_release_failures_total
+            .load(Ordering::Acquire)
+            == 0
         && !state.runtime.draining.load(Ordering::Relaxed)
         && state
             .runtime
@@ -1663,6 +1669,24 @@ async fn health(State(st): State<AppState>) -> Response {
         )
             .into_response();
     }
+    if st
+        .runtime
+        .telemetry
+        .kv_pool_release_failures_total
+        .load(Ordering::Acquire)
+        > 0
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "status": "unhealthy",
+                "detail": "paged KV reclamation fault latched",
+                "model": &*st.model_id,
+                "worker_alive": true,
+            })),
+        )
+            .into_response();
+    }
     Json(serde_json::json!({
         "status": "ok",
         "model": &*st.model_id,
@@ -1701,13 +1725,23 @@ async fn readiness(State(st): State<AppState>) -> Response {
     let worker_alive = st.runtime.worker_alive.load(Ordering::Relaxed);
     let draining = st.runtime.draining.load(Ordering::Relaxed);
     let backend_faulted = st.runtime.backend_faulted.load(Ordering::Acquire);
+    let kv_pool_reclamation_faulted = st
+        .runtime
+        .telemetry
+        .kv_pool_release_failures_total
+        .load(Ordering::Acquire)
+        > 0;
     let queue_depth = st.jobs.max_capacity() - st.jobs.capacity();
     let artifact_ready = st
         .runtime
         .production
         .as_ref()
         .is_none_or(|state| state.is_serving());
-    let ready = worker_alive && !draining && !backend_faulted && artifact_ready;
+    let ready = worker_alive
+        && !draining
+        && !backend_faulted
+        && !kv_pool_reclamation_faulted
+        && artifact_ready;
     let status = if ready {
         StatusCode::OK
     } else {
@@ -1721,6 +1755,7 @@ async fn readiness(State(st): State<AppState>) -> Response {
             "worker_alive": worker_alive,
             "draining": draining,
             "backend_faulted": backend_faulted,
+            "kv_pool_reclamation_faulted": kv_pool_reclamation_faulted,
             "queue_depth": queue_depth,
             "production_artifact": st.runtime.production.is_some(),
             "artifact_ready": artifact_ready,
@@ -2207,7 +2242,7 @@ mod tests {
         }
     }
 
-    fn latching_router() -> Router {
+    fn latching_router() -> (Router, Arc<WorkerTelemetry>) {
         let cfg = ServeConfig::default();
         let draining = Arc::new(AtomicBool::new(false));
         let worker_alive = Arc::new(AtomicBool::new(true));
@@ -2228,7 +2263,7 @@ mod tests {
             },
             cfg.queue_cap,
         );
-        build_router_inner(
+        let router = build_router_inner(
             jobs,
             Arc::new(crate::IdPassthroughTokenizer::default()),
             cfg,
@@ -2240,11 +2275,12 @@ mod tests {
                 phase,
                 backend_faulted,
                 backend_faults,
-                telemetry,
+                telemetry: telemetry.clone(),
                 production: None,
             },
         )
-        .0
+        .0;
+        (router, telemetry)
     }
 
     fn chat_request() -> Request<Body> {
@@ -2291,7 +2327,7 @@ mod tests {
 
     #[tokio::test]
     async fn production_backend_latch_fails_health_readiness_and_new_work() {
-        let router = latching_router();
+        let (router, _) = latching_router();
         assert_eq!(
             router
                 .clone()
@@ -2311,6 +2347,26 @@ mod tests {
                 router.clone().oneshot(request).await.unwrap().status(),
                 StatusCode::SERVICE_UNAVAILABLE,
                 "{path} must fail closed after a production backend fault",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn kv_reclamation_failure_fails_health_readiness_and_new_work() {
+        let (router, telemetry) = latching_router();
+        telemetry
+            .kv_pool_release_failures_total
+            .fetch_add(1, Ordering::Release);
+        for path in ["/healthz", "/readyz", "/v1/chat/completions"] {
+            let request = if path == "/v1/chat/completions" {
+                chat_request()
+            } else {
+                Request::get(path).body(Body::empty()).unwrap()
+            };
+            assert_eq!(
+                router.clone().oneshot(request).await.unwrap().status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{path} must fail closed after a KV reclamation failure",
             );
         }
     }
