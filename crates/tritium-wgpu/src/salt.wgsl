@@ -89,7 +89,6 @@ fn main() {
             result[base + column] = 0.0;
         }
         for (var plane = 0u; plane < params.planes; plane += 1u) {
-            storageBarrier();
             var sum = 0.0;
             for (var column = 0u; column < params.cols; column += 1u) {
                 sum += abs(residual[column]);
@@ -101,7 +100,6 @@ fn main() {
                     let old = residual[column];
                     let trit = clamp(round_away(div_cr(old, scale)), -1.0, 1.0);
                     residual[column] = scale * trit;
-                    storageBarrier();
                     result[index] = result[index] + residual[column];
                     residual[column] = old - residual[column];
                 }
