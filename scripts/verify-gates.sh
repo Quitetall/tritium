@@ -140,6 +140,16 @@ JSON
     fi
 }
 
+run_model_acceptance() {
+    # The real BitNet CPU acceptance test is intentionally model-backed. Keep it
+    # out of the debug workspace sweep: scalar debug kernels can turn a 78-second
+    # release check into an unbounded local/CI timeout. The explicit optimized
+    # invocation still executes the same test and remains model-gated by its
+    # checked-in reference/model contract.
+    run cargo test --locked -p tritium-nn --test acceptance --release -- \
+        cpu_longer_greedy_matches_transformers --nocapture
+}
+
 case "$tier" in
     precommit)
         run git diff --cached --check
@@ -156,7 +166,9 @@ case "$tier" in
         # tritium-py is a PyO3 cdylib; standalone cargo-test binaries cannot
         # link Python without a development lib. Its shipped surface is gated
         # by the native wheel/pytest path below, matching CI's maturin lane.
-        run cargo test --locked --workspace --exclude tritium-py --no-fail-fast
+        run cargo test --locked --workspace --exclude tritium-py --no-fail-fast -- \
+            --skip cpu_longer_greedy_matches_transformers
+        run_model_acceptance
         run python -m unittest discover -s scripts/tests -p 'test_*.py'
         run python scripts/check-community-contract.py --json
         ;;
@@ -164,7 +176,9 @@ case "$tier" in
         run cargo fmt --all --check
         # Type-check every feature-gated surface without requiring GPU toolkits.
         run env TRITIUM_CHECK_ONLY=1 cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
-        run cargo test --locked --workspace --exclude tritium-py --no-fail-fast
+        run cargo test --locked --workspace --exclude tritium-py --no-fail-fast -- \
+            --skip cpu_longer_greedy_matches_transformers
+        run_model_acceptance
         run python -m unittest discover -s scripts/tests -p 'test_*.py'
         run python scripts/check-community-contract.py --json
         require_command cargo-deny
