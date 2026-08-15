@@ -48,6 +48,16 @@
         "blocker": "Driver, runtime, PyTorch and GPU-architecture receipts are not yet archived."
       },
       {
+        "id": "linux-x86_64-cuda13-sm89",
+        "target": "Linux CUDA 13 sm_89 wheel",
+        "status": "qualified",
+        "receipt": {
+          "path": "compatibility-v1.1/linux-x86_64-cuda13-sm89.json",
+          "sha256": "30c622f12cd0b8316c59e4d643b7f024d94fff2f75504dcfc902239d175d128d",
+          "source_revision": "a5fa917c4b8532f5c5c3e9d2ebd88aa04f054b48"
+        }
+      },
+      {
         "id": "non-nvidia-gpu-backend",
         "target": "Non-NVIDIA GPU execution backend (wgpu/Vulkan, ROCm)",
         "status": "pending",

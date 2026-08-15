@@ -30,6 +30,7 @@ with the listed stable diagnostic instead of silently falling back.
 | Target | Status | Evidence / failure |
 |---|---|---|
 | Linux CUDA wheels | **pending** | Driver, runtime, PyTorch and GPU-architecture receipts are not yet archived. |
+| Linux CUDA 13 sm_89 wheel | **qualified** | [`compatibility-v1.1/linux-x86_64-cuda13-sm89.json`](../release/compatibility-v1.1/linux-x86_64-cuda13-sm89.json) SHA-256 `30c622f12cd0b8316c59e4d643b7f024d94fff2f75504dcfc902239d175d128d`; revision `a5fa917c4b8532f5c5c3e9d2ebd88aa04f054b48` |
 | Non-NVIDIA GPU execution backend (wgpu/Vulkan, ROCm) | **pending** | The tritium-cli and tritium-benches wgpu/rocm lanes now exist (issue #4), but no `tritium report compare` ledger JSON from a physical non-NVIDIA GPU has been archived. Compile-only and Vulkan-on-NVIDIA runs do not qualify this row. |
 | ROCm wheel | **unsupported** | `TRITIUM_UNSUPPORTED_ROCM_WHEEL_V1_1` |
 | Metal-specific wheel | **unsupported** | `TRITIUM_UNSUPPORTED_METAL_WHEEL_V1_1` |
