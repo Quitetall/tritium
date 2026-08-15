@@ -186,7 +186,7 @@ def run_pytest(
 ) -> None:
     _run(
         [
-            str(python), "-m", "pytest", "-q", "--import-mode=importlib",
+            str(python), "-m", "pytest", "-q", "--noconftest", "--import-mode=importlib",
             str(source), "-k", selector, f"--junitxml={junit}",
         ],
         cwd=work,
@@ -208,7 +208,7 @@ def run_memcheck(
         [
             str(sanitizer), "--tool", "memcheck", "--target-processes", "all",
             "--error-exitcode", "86", "--log-file", str(log),
-            str(python), "-m", "pytest", "-q", "--import-mode=importlib",
+            str(python), "-m", "pytest", "-q", "--noconftest", "--import-mode=importlib",
             str(source), "-k", selector, f"--junitxml={junit}",
         ],
         cwd=work,
