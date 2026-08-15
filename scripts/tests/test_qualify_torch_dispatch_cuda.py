@@ -123,6 +123,43 @@ class QualifyTorchDispatchCudaTests(unittest.TestCase):
             launcher.symlink_to(interpreter)
             self.assertEqual(QUALIFY["python_launcher"](launcher), launcher.absolute())
 
+    def test_qualification_pytest_never_loads_repository_conftest(self):
+        """Installed-wheel probes must not import source-tree extension fixtures."""
+        commands: list[list[str]] = []
+
+        def fake_run(command, *, cwd, environment):
+            del cwd, environment
+            commands.append(command)
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            python = root / "python"
+            source = root / "test_torch_dispatch.py"
+            suite = root / "suite.xml"
+            memcheck = root / "memcheck.xml"
+            sanitizer = root / "compute-sanitizer"
+            for path in (python, source, suite, memcheck, sanitizer):
+                path.touch()
+            run_pytest = QUALIFY["run_pytest"]
+            run_memcheck = QUALIFY["run_memcheck"]
+            original_run = run_pytest.__globals__["_run"]
+            run_pytest.__globals__["_run"] = fake_run
+            try:
+                run_pytest(
+                    python, source, "native_cuda", suite, root, {}
+                )
+                run_memcheck(
+                    sanitizer, python, source, memcheck,
+                    root / "memcheck.log", root, {}
+                )
+            finally:
+                run_pytest.__globals__["_run"] = original_run
+
+        self.assertEqual(len(commands), 2)
+        for command in commands:
+            self.assertIn("--noconftest", command)
+            self.assertIn("--import-mode=importlib", command)
+
 
 if __name__ == "__main__":
     unittest.main()
