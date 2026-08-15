@@ -14,7 +14,7 @@ with the listed stable diagnostic instead of silently falling back.
 
 | Target | Status | Evidence / failure |
 |---|---|---|
-| Linux x86_64 CPU wheel | **qualified** | [`compatibility-v1.1/linux-x86_64-cpu.json`](../release/compatibility-v1.1/linux-x86_64-cpu.json) SHA-256 `175a0bc847683e830b7fd7a1ef69b2f2afe81ed870ee0192af7d92550370f43b`; revision `8cec0e58a1bfb66f917926b6b32cf5dd717134b0` |
+| Linux x86_64 CPU wheel | **qualified** | [`compatibility-v1.1/linux-x86_64-cpu.json`](../release/compatibility-v1.1/linux-x86_64-cpu.json) SHA-256 `2224890eeee18773e19eabc7fca874c25fb58af453ceb72e0fef16f2951bdd3d`; revision `a5fa917c4b8532f5c5c3e9d2ebd88aa04f054b48` |
 | macOS arm64 CPU wheel | **pending** | Fresh no-compiler wheel receipt is not yet archived. |
 | Windows x86_64 CPU wheel | **pending** | Fresh no-compiler wheel receipt is not yet archived. |
 
@@ -45,7 +45,7 @@ with the listed stable diagnostic instead of silently falling back.
 
 | Target | Status | Evidence / failure |
 |---|---|---|
-| Node.js 22+ strict-TypeScript archive | **qualified** | [`compatibility-v1.1/node-22.json`](../release/compatibility-v1.1/node-22.json) SHA-256 `0c668ff0bb6746906474d1a21d91df1dfd99bcca5781ab4be73760b3a5dd8f46`; revision `8cec0e58a1bfb66f917926b6b32cf5dd717134b0` |
+| Node.js 22+ strict-TypeScript archive | **qualified** | [`compatibility-v1.1/node-22.json`](../release/compatibility-v1.1/node-22.json) SHA-256 `cbd43f712d40bc379f06307b3602a56deccdac48d37150b81d02929492c68d0e`; revision `a5fa917c4b8532f5c5c3e9d2ebd88aa04f054b48` |
 | Chrome WebGPU training | **pending** | Actual-browser WebGPU receipt is not yet archived. |
 | Firefox WebGPU training | **pending** | Actual-browser WebGPU receipt is not yet archived. |
 | Safari WebGPU training | **pending** | Actual-browser WebGPU receipt is not yet archived. |
