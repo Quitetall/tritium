@@ -1,14 +1,15 @@
 {
   "schema": "tritium.compatibility-receipt.v1",
   "target_id": "linux-x86_64-cpu",
-  "source_revision": "2801881e4bec792680e450b7fff16bd2d5cd2716",
+  "source_revision": "8cec0e58a1bfb66f917926b6b32cf5dd717134b0",
   "passed": true,
   "install_smoke": true,
   "host_os": "linux",
   "host_arch": "x86_64",
   "wheel": "tritium_torch-1.1.0rc1-cp39-abi3-manylinux_2_28_x86_64.whl",
-  "sha256": "ceb66b9c09c561cc1a7413b1a7e0f9a3ba60aeb8fde3b9ffc3b25b254f6ae7de",
-  "bytes": 10806323,
+  "sha256": "60d9f7c7bc7083947a4d43302f08c224257a35b98c926a5b3d105e1b0610a0c6",
+  "bytes": 10806862,
   "version": "1.1.0rc1",
-  "platform_tag": "manylinux_2_28_x86_64"
+  "platform_tag": "manylinux_2_28_x86_64",
+  "upstream_receipt_id": "sha256:1b854842094801722536e88aeaa93072a94ca95be649f421fc07965b10b2a1b1"
 }
