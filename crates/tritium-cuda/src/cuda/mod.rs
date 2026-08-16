@@ -930,6 +930,30 @@ impl CudaDecodeModel {
         self.cache_len = 0;
     }
 
+    /// Truncate the KV cache to `new_len` tokens (a partial rewind). Like
+    /// [`Self::reset`], only the watermark moves — rows at and beyond
+    /// `new_len` are dead by the same watermark semantics every append and
+    /// attention range already honors (each step rewrites `d_ctrl` from the
+    /// host watermark), so there is no device work. Any uncommitted tree is
+    /// invalidated. This is what makes a partial-match drafter reconcile
+    /// expressible (ADR 0032): the proven prefix KV survives a rejected
+    /// speculative suffix instead of paying reset + ctx-linear re-prefill.
+    ///
+    /// # Errors
+    /// [`BackendError::InvalidInput`] if `new_len > cache_len` — truncate
+    /// only rewinds, it never invents rows.
+    pub fn truncate_kv(&mut self, new_len: usize) -> Result<(), BackendError> {
+        if new_len > self.cache_len {
+            return Err(BackendError::InvalidInput(format!(
+                "truncate_kv new_len={new_len} exceeds cache_len={}",
+                self.cache_len
+            )));
+        }
+        self.pending_tree = None;
+        self.cache_len = new_len;
+        Ok(())
+    }
+
     /// Number of tokens currently cached (the decode position the next `step` writes).
     #[must_use]
     pub fn cache_len(&self) -> usize {

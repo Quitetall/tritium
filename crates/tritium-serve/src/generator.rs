@@ -1079,20 +1079,29 @@ pub(crate) fn draft_greedy_tokens(
         return Vec::new(); // draft context exhausted; plain steps carry on
     }
     // Reconcile last call's speculatively-fed tokens against the now-
-    // committed history: matches ADVANCE the watermark (those KV rows are
-    // proven correct); the first mismatch means a rejected draft sits in
-    // the KV — the resident runner rejects position rewinds, so recover
-    // with a reset + full re-prefill (rare for a good drafter).
-    let mut clean = true;
+    // committed history: the matched prefix ADVANCES the watermark (those
+    // KV rows are proven correct); everything after the first mismatch is
+    // a rejected draft suffix sitting in the KV, rewound with
+    // `truncate_kv` so the proven prefix SURVIVES. Every partial-accept
+    // cycle mismatches here (the rejected draft vs the verifier's bonus
+    // token) — the reset + full re-prefill this replaces was ~ctx-linear
+    // and dominated the drafter's cost at long context. The target is
+    // also clamped to `p`: KV at/past pending's position would collide
+    // with the first feed below (the old `.min(p)` clamp moved
+    // `draft_pos` but left the KV long — a silent drafting stall).
+    let mut matched = draft_fed.len();
     for (i, &fed) in draft_fed.iter().enumerate() {
         if history.get(*draft_pos + i) != Some(&fed) {
-            clean = false;
+            matched = i;
             break;
         }
     }
-    if clean {
-        *draft_pos = (*draft_pos + draft_fed.len()).min(p);
+    let target = (*draft_pos + matched).min(p);
+    if draft.truncate_kv(target).is_ok() {
+        *draft_pos = target;
     } else {
+        // The watermark bookkeeping diverged from the runner (unexpected):
+        // recover exactly as the old mismatch arm did.
         draft.reset();
         *draft_pos = 0;
     }
@@ -1840,6 +1849,107 @@ impl Generator for RunnerGenerator {
 
 #[cfg(test)]
 mod tests {
+    /// Reconcile pins for `draft_greedy_tokens` (the ADR 0032 truncate-based
+    /// reconcile). PIN 1 — partial accept: a rejected draft suffix must be
+    /// truncated away (not reset), and the next drafts must equal a FRESH
+    /// drafter fed the same history (the reset + re-prefill semantics the
+    /// truncate replaces). PIN 2 — clean overshoot: when every fed token
+    /// matches but the advance lands past `p` (pending fed last cycle), the
+    /// old `.min(p)` clamp moved `draft_pos` while leaving the KV one row
+    /// long, and every later call returned `[]` — a PERMANENT silent
+    /// drafting stall. The reconcile must truncate to `p` and keep drafting.
+    /// Drafter-model-gated (skips cleanly when the GGUF is absent).
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn truncate_reconcile_pins() {
+        let path = format!(
+            "{}/blut/data/drafter-8L768-s3.gguf",
+            std::env::var("HOME").unwrap_or_default()
+        );
+        if !std::path::Path::new(&path).exists() {
+            eprintln!("skipping: {path} absent (drafter-gated test)");
+            return;
+        }
+        let bytes = std::fs::read(&path).expect("read drafter gguf");
+        let load = || -> Option<tritium_nn::ModelRunner> {
+            let init = tritium_runtime::BACKENDS
+                .iter()
+                .find(|e| e.name == "cuda")
+                .map(|e| e.init)?;
+            let backend = match init() {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("skipping: cuda backend failed to init ({e})");
+                    return None;
+                }
+            };
+            let file = tritium_format::read_gguf(&bytes).expect("parse drafter gguf");
+            Some(tritium_nn::ModelRunner::load(&file, &bytes, backend).expect("load drafter"))
+        };
+        let Some(mut a) = load() else {
+            return;
+        };
+        let eos = u32::MAX; // never drafted: no truncation noise in the pins
+        let mut hist: Vec<u32> = (1u32..=12).collect();
+        let mut fed = Vec::new();
+        let mut pos = 0usize;
+        let d1 = super::draft_greedy_tokens(&mut a, &mut fed, &mut pos, eos, &hist, 4, true);
+        assert!(!d1.is_empty(), "healthy drafter must draft on cycle 1");
+
+        // PIN 1 — partial accept: commit d1[0], then a bonus token that
+        // differs from d1[1] (bit-flip keeps it in-vocab), so the reconcile
+        // walk mismatches exactly at the rejected draft.
+        hist.push(d1[0]);
+        let bonus = d1.get(1).map_or(7u32, |&t| t ^ 1);
+        hist.push(bonus);
+        let got = super::draft_greedy_tokens(&mut a, &mut fed, &mut pos, eos, &hist, 4, true);
+        let Some(mut b) = load() else {
+            return;
+        };
+        let (mut bfed, mut bpos) = (Vec::new(), 0usize);
+        let want = super::draft_greedy_tokens(&mut b, &mut bfed, &mut bpos, eos, &hist, 4, true);
+        drop(b);
+        assert!(
+            !want.is_empty(),
+            "fresh drafter must draft on the same history"
+        );
+        assert_eq!(
+            got, want,
+            "truncate-reconcile drafts must equal a fresh drafter's (reset semantics)"
+        );
+
+        // PIN 2 — clean overshoot: commit exactly the fed tokens with no new
+        // pending — every fed token matches and the advance lands one past
+        // `p`. (After the `got` cycle, fed = [bonus, got[..len-1]], so
+        // hist ++ got[..len-1] puts fed's last token AT the pending slot.)
+        hist.extend_from_slice(&got[..got.len() - 1]);
+        let got2 = super::draft_greedy_tokens(&mut a, &mut fed, &mut pos, eos, &hist, 4, true);
+        let Some(mut c) = load() else {
+            return;
+        };
+        let (mut cfed, mut cpos) = (Vec::new(), 0usize);
+        let want2 = super::draft_greedy_tokens(&mut c, &mut cfed, &mut cpos, eos, &hist, 4, true);
+        drop(c);
+        assert!(
+            !want2.is_empty(),
+            "fresh drafter must draft on the overshoot history"
+        );
+        assert_eq!(
+            got2, want2,
+            "clean overshoot must truncate to p and keep drafting \
+             (the old .min(p) clamp stalled drafting permanently here)"
+        );
+
+        // And the stall really is gone: one more ordinary cycle drafts.
+        hist.push(got2[0]);
+        hist.push(got2.get(1).map_or(9u32, |&t| t ^ 1));
+        let got3 = super::draft_greedy_tokens(&mut a, &mut fed, &mut pos, eos, &hist, 4, true);
+        assert!(
+            !got3.is_empty(),
+            "drafting must survive the overshoot cycle"
+        );
+    }
+
     #[test]
     fn draft_policy_converges_down_on_rejections() {
         let mut p = super::DraftPolicy::Adaptive { acc: 0.75 };

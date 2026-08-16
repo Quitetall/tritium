@@ -2080,6 +2080,75 @@ fn cuda_draft_batch_matches_draft_chain() {
     );
 }
 
+/// Truncate-reconcile gate (ADR 0032): `truncate_kv(n)` followed by appending
+/// a suffix must be BIT-IDENTICAL to a fresh runner that fed only the
+/// surviving prefix + the same suffix through the same op shapes. This proves
+/// both halves of the watermark contract at once: rows past the truncation
+/// point are dead (no leak into any later attention range) and rows before it
+/// survive untouched. Also pins the error contract: an over-long truncate
+/// refuses WITHOUT disturbing state.
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_truncate_kv_matches_fresh_prefill() {
+    let _gpu = gpu_serial();
+    if !std::path::Path::new(&*DRAFTER_PATH).exists() {
+        eprintln!("skipping: {} absent (drafter-gated test)", *DRAFTER_PATH);
+        return;
+    }
+    let bytes = std::fs::read(&*DRAFTER_PATH).expect("read drafter gguf");
+    let Some(mut a) = load_on("cuda", &bytes) else {
+        return;
+    };
+    let Some(mut b) = load_on("cuda", &bytes) else {
+        return;
+    };
+
+    // Identical op sequence for every SURVIVING row on both runners: an M=24
+    // prefill, one M=1 step (the row the truncate must preserve), then the
+    // M=2 suffix. Runner A additionally grows a 3-row speculative suffix and
+    // rewinds it with truncate_kv before the real suffix.
+    let prompt: Vec<u32> = (1u32..=24).collect();
+    let positions: Vec<usize> = (0..prompt.len()).collect();
+    let _ = a.forward(&prompt, &positions).expect("prefill A");
+    let _ = b.forward(&prompt, &positions).expect("prefill B");
+    let n = prompt.len();
+    let _ = a.forward(&[50], &[n]).expect("keep-row A");
+    let _ = b.forward(&[50], &[n]).expect("keep-row B");
+
+    // A only: speculative rows at n+1..n+4, then rewind them.
+    let _ = a
+        .forward(&[90, 91, 92], &[n + 1, n + 2, n + 3])
+        .expect("speculative rows A");
+
+    // Error contract first: truncate beyond the watermark must refuse and
+    // leave the cache serving (the follow-up truncate + suffix succeed).
+    assert!(
+        a.truncate_kv(n + 10).is_err(),
+        "truncate_kv past the watermark must refuse"
+    );
+    a.truncate_kv(n + 1).expect("rewind speculative rows");
+
+    // A no-op truncate at the watermark is legal (the reconcile's clean
+    // full-match arm issues exactly this).
+    b.truncate_kv(n + 1).expect("no-op truncate at watermark");
+
+    // Same suffix on both — DIFFERENT tokens from the truncated rows, so a
+    // dead-row leak cannot cancel out.
+    let la = a
+        .forward(&[70, 71], &[n + 1, n + 2])
+        .expect("suffix after truncate A");
+    let lb = b.forward(&[70, 71], &[n + 1, n + 2]).expect("suffix B");
+    assert_eq!(la.len(), lb.len(), "logits width mismatch");
+    for (i, (x, y)) in la.iter().zip(lb.iter()).enumerate() {
+        assert_eq!(
+            x.to_bits(),
+            y.to_bits(),
+            "truncate-then-append diverged from fresh append at vocab idx {i} \
+             (truncated={x} fresh={y}) — dead rows leaked or live rows moved"
+        );
+    }
+}
+
 /// I1 paged leg (review follow-up on 503b520): the `page_mapped(r, p+k-1)`
 /// full-room guard must (a) refuse a draft whose tail outruns the row's page
 /// reservation WITHOUT any partial advance, and (b) once the reservation

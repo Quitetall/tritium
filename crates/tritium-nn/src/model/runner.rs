@@ -511,6 +511,43 @@ impl ModelRunner {
         }
     }
 
+    /// Truncate the KV state to `len` tokens (a partial rewind). With a
+    /// device-resident decoder this moves its watermark (rows past `len`
+    /// are dead by the same watermark semantics every append honors — the
+    /// host layer caches stay at their reset state while the resident
+    /// decoder serves, so they are left untouched); on the host path every
+    /// layer cache rolls back to `len`. `truncate_kv(len)` followed by
+    /// appending at positions `len..` is equivalent to a fresh sequence of
+    /// the surviving prefix plus those appends — that is what makes a
+    /// partial-match drafter reconcile affordable (ADR 0032): a rejected
+    /// speculative suffix is discarded without re-prefilling the prefix.
+    ///
+    /// # Errors
+    /// [`NnError::Shape`] if `len` exceeds the current cached length
+    /// (truncate only rewinds), or [`NnError::Backend`] from the resident
+    /// decoder. State is unchanged on error; callers recover with
+    /// [`reset`](Self::reset).
+    pub fn truncate_kv(&mut self, len: usize) -> Result<(), NnError> {
+        #[cfg(feature = "cuda")]
+        if let Some(r) = self.resident.as_mut() {
+            return r
+                .truncate_kv(len)
+                .map_err(|e| NnError::Backend(e.to_string()));
+        }
+        for c in &self.kv {
+            if len > c.len {
+                return Err(NnError::Shape {
+                    expected: c.len,
+                    got: len,
+                });
+            }
+        }
+        for c in &mut self.kv {
+            c.rollback_to(len);
+        }
+        Ok(())
+    }
+
     /// Drop the device-resident decoder (if built) so the next forward rebuilds it from
     /// the *current* weights. Call after mutating a layer's weights in place (e.g. a QAT
     /// [`replace_weights`](crate::layers::TernaryLinear::replace_weights) swap, plan
