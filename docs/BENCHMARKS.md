@@ -55,6 +55,137 @@ box they are a distance from a named reference point, **not** a claim about the 
 
 ## Ledger
 
+### 2026-08-09/16 adaptive spec stack @ 16f52f3f — governor, cost-model floors, batched fast tier, longctx drafter, truncate-reconcile
+
+**Box state:** the 2026-08-09 rows (§1–§3) were measured on the quiet box at their
+own commits (4190673…d073dc8, 73bcd00; per-section disclosure in the session
+records). The 2026-08-16 truncate-reconcile ABBA (§4) started and ran quiet
+(desktop graphics only, ~370 MiB across 3 processes, verified at launch); one
+transient 4.2 GiB compute process (PID 481169, exited before identification) was
+present at the end-of-run snapshot — the final short-ctx visits may carry it,
+disclosed in §4c. The §5 microbench ran CONTENDED (a game co-resident, 6.5 GiB /
+~50% util) — its 2.34× verdict margin is the signal, not the absolutes. RTX 4090,
+driver 610.57.04, CUDA 13.3. Binary provenance §4: clean `git archive` exports of
+8a808098 (baseline) and 16f52f3f (candidate), separate target dirs, binaries
+verified distinct; the plain reference server is the candidate binary at default
+env for every visit (the plain path is untouched by these commits).
+
+**Engine state — what this entry adds on top of the 08-08 sweep:**
+
+| lever | default | mechanism | measured win | scope |
+|---|---|---|---|---|
+| adaptive spec governor (round 28) | ON (`TRITIUM_SPEC_ADAPTIVE=0` kills) | τ-EWMA breakeven suppression + 4-token probe / 64 committed | long-ctx solo exact **2.42×** / fast+f16 **1.22×** over non-adaptive; dormant (1.000–1.002×) short-ctx + N=4 | solo + batched spec |
+| cost-model floors (round 29 L7) | ON (`TRITIUM_SPEC_COST_FLOORS=0` reverts fixed) | measured (V+k·d)/P breakevens, tier-aware; probe-resync EWMA split from steady-state d | **+4–10%** over fixed floors in the collapsed band; fast-tier floors derive 2.15–2.95 (fixed 1.5 was too low; exact truth at the 3.0 clamp) | governor floor inputs |
+| batched fast tier (round 29 L6) | `exact` (opt-in `TRITIUM_KERNEL_TIER=fast`) | L3b online-softmax fused body over `TreeCtrlAddr` (6 shims, 101→107 kernels) | batched spec fast-vs-exact **+22–40%** short / **+112–171%** long ctx (N∈{2,4}, both rungs); kernel pairs −58…−79% | paged/slots verify (completes RFC 0001's reach) |
+| longctx drafter (round 29 L5) | recommended `--draft-model drafter-8L768-longctx.gguf` | seq-4096 retrain (root cause: the 1024-token training window) | long-ctx τ **2.85–3.08** vs s3's ~1.1; short-ctx ≤1% cost | drafter artifact (blut-side) |
+| truncate-reconcile (682a0e7a) | ON (structural, no knob) | `truncate_kv` partial-match reconcile: a rejected draft suffix rewinds the drafter's KV watermark, the accepted-prefix KV survives — replaces reset + ctx-linear re-prefill on EVERY partial accept and probe | §4: long-ctx forced-on exact **+43–45%**, fast+f16 **+81–83%** (0.89→**1.62–1.65× vs plain**), governor-on **+45–52%**; drafter ms/token 32→3.0–3.8 (exact), 20–22→2.2 (fast) | solo + I0 spec drafter KV (batched enrollment: §5, not adopted) |
+
+#### 1. Governor + floors (rounds 28–29, quiet box 2026-08-09)
+
+measure_tau protocol (§2c/2c-long shapes of the 08-08 entry), ABBA at server
+launch. Long-ctx 3776 solo, adaptive-vs-forced: exact 2.42×, fast+f16 1.22×;
+short-ctx and batched N=4 dormant (1.000–1.002×). Losslessness pinned by
+forced-collapse==plain-greedy gates on both paths. Cost-model floors: +4–10%
+over the fixed floors in the collapsed band; the probe-resync split keeps
+recovery reachable (4–5 full-accept probes by tier). At these commits the
+governor landed 0.87–0.90× vs plain at long ctx (residual = probe cost) — §4
+re-measures that residual after the reconcile.
+
+#### 2. Batched fast tier (round 29, quiet box 2026-08-09)
+
+tier_fast_slots_bench harness (N∈{2,4} × {dense,paged} × both rungs):
+fast-vs-exact **+22–40% short ctx / +112–171% long ctx**; kernel pairs
+−58…−79%; RFC 0001 gates green (isolated ≤1.62e-5, in-situ ≤6.4e-6, τ EXACTLY
+pinned, committed streams identical across tiers).
+
+#### 3. Longctx drafter verdict (round 29 addendum, quiet box 2026-08-09)
+
+Long-ctx τ 2.85–3.08 (fast/exact) vs s3's ~1.1 — the 1024-token training
+window was the collapse. Short ctx unchanged (≤1% e2e). Honest half at that
+commit: forced-on long-ctx spec still lost e2e (0.65× exact / 0.76× fast+f16)
+because breakeven τ rises with context — the finding that motivated §4.
+
+#### 4. Truncate-based drafter reconcile (2026-08-16, quiet box, ABBA @ 682a0e7a)
+
+Harness: measure_tau_ctx (the §2c protocol, shape-parametrized; 1-prompt
+discarded warmup per server launch instead of a full discarded pass —
+disclosed deviation). Spec server 8124 w/ `--draft-model
+drafter-8L768-longctx.gguf`, plain reference 8125 (candidate binary, default
+env, exact/f32) — every ratio below is vs that same reference. Old =
+8a808098, New = 16f52f3f, order O N N O / N O O N per comparison.
+
+**§4a. Long ctx (6 wt103 prefixes of 3,520 tokens, 256 greedy each):**
+
+| config | e2e vs plain, Old (2 visits) | e2e vs plain, New (2 visits) | τ (old → new) | drafter ms/tok (old → new) |
+|---|---|---|---|---|
+| forced-on, exact/f32 | 0.615 / 0.617 | **0.882 / 0.893** | 3.901 → 3.901 (bit-pinned) | 32.2–33.2 → 3.0–3.8 |
+| forced-on, fast+f16 | 0.889 / 0.901 | **1.648 / 1.624** | 2.553 → 2.553 (bit-pinned) | 19.6–22.0 → 2.2 |
+| governor-on, fast+f16 | 1.078 / 1.124 | **1.638 / 1.630** | 3.76 → 3.67–3.86 | 14.1–15.4 → 3.7–3.8 |
+
+Reading. (1) Where drafts are forced, τ is IDENTICAL to three decimals across
+binaries — the reconcile changes drafter cost only, never a drafted token; the
+exact-tier leg stayed 6/6 token-identical to plain greedy on both binaries
+(fast-tier non-identity to the exact reference is the documented RFC 0001
+trade, deterministic across visits). (2) The mechanism receipt is the
+draft_token EWMA: the ~ctx-linear re-prefill term (~30 ms/tok at ctx≈3.6k) is
+gone, leaving the drafter's own step cost. (3) **Long-ctx spec now WINS
+outright: fast+f16 forced-on is 1.62–1.65× vs plain exact/f32** — it beats the
+08-08 sweep's best long-ctx config (plain + `TRITIUM_KV=f16`, ≈1.45× on the
+same basis). (4) The governor now agrees: suppression fell 830 → 535–569 of
+~1,536 committed tokens, probe-resync EWMA 10.2 → 3.4–3.5 ms, and governor-on
+e2e matches forced-on (1.63×) — the residual-probe-cost regime (§1's
+0.87–0.90×) is closed at this shape.
+
+**§4b. Governor-on baseline note:** the Old governor-on rows (1.08–1.12×)
+sit above §1's 0.87–0.90× because this run composes the longctx drafter +
+cost-model floors (both post-date §1's residual measurement) and a different
+prompt-set/day; the paired same-session columns are the claim, not the
+cross-day absolutes.
+
+**§4c. Short ctx (12 wt103 96-token prefixes, fast+f16, governor default):**
+Old 1.255 / 1.345 → New 1.341 / 1.423 vs plain. Means +6%, but per-visit τ
+ranged 5.0–6.4 (adaptive-k content variance) and the transient end-of-run
+process may touch the last two visits — recorded as **no regression**, not a
+win. Suppressed-plain counts fell 1,677–2,092 → 1,495–1,595 (cheaper probes
+un-stick suppression at short ctx too).
+
+Gates for §4 (all green before the bench): `cuda_truncate_kv_matches_fresh_prefill`
+(truncate-then-append BIT-IDENTICAL to fresh append on the surviving prefix),
+`cpu_truncate_kv_matches_fresh_prefill` (host-branch twin),
+`truncate_reconcile_pins` (partial-accept drafts token-equal to a fresh
+drafter; the old clean-overshoot stall pinned dead), spec_lookup 3/3,
+batch_serve 8/8 (release, serial). Reviews: 682a0e7a PASS WITH NITS (F1 doc
+accuracy — corrected in 2d9651ed's message; F2 host-branch test — added).
+
+#### 5. Batched enrollment leg — measured, NOT adopted (2026-08-16, contended box)
+
+`drafter_catchup_bench` (in-tree, `--ignored`): at the probe shape (ctx 4032,
+gap 64, drafter pool N=4), a masked k=1 `draft_batch` catch-up loop costs
+**222.6 ms median (3.48 ms/step)** vs **95.1 ms** for the enrollment path's
+reset + M=4032 re-prefill + adopt — **re-prefill wins 2.34×**, so the batched
+gap-close guard stays at gap ≤ 1 and multi-slot probe re-entries keep the
+enrollment re-prefill. Box was contended (game co-resident); the legs were
+same-process interleaved and the margin is 2.34×, but re-run the harness on a
+quiet box before citing the absolutes.
+
+#### Caveats
+
+- §1–§3 numbers were measured at their own commits on 2026-08-09; §4–§5 at
+  16f52f3f on 2026-08-16. No cross-day absolute comparisons — every claim is a
+  same-session ABBA pair.
+- §4's plain reference is the CANDIDATE binary (plain path untouched by
+  682a0e7a/2d9651ed/16f52f3f — the diff is drafter-KV-management only); Old
+  and New spec servers are clean-archive builds of their shas.
+- §4 long-ctx fast+f16 "wins outright" is vs plain exact/f32 on the same
+  visit; vs plain+f16 (the 08-08 §2b basis) the margin is ≈+12%, computed
+  across entries — re-measure same-session before citing that number.
+- The 1-prompt warmup (vs the full discarded cold pass of the §2c protocol)
+  trades a sharper first-prompt tail for 2× wall time; spec-vs-plain ratios
+  are within-visit and share it.
+
+**Still owed:** upstream llama.cpp Q2_0 quiet-box rerun (unchanged); quiet-box
+§5 absolutes; MI300X/Metal validation sessions (user-gated).
+
 ### 2026-08-08 final sweep @ 07b9d6a — the quiet-box ledger: absolutes + the adopted opt-in tiers
 
 **Box state: QUIET.** RTX 4090, driver 610.57.04, CUDA 13.3. Co-resident the whole
