@@ -2149,6 +2149,59 @@ fn cuda_truncate_kv_matches_fresh_prefill() {
     }
 }
 
+/// Host-branch twin of the truncate gate: the same truncate-then-append ==
+/// fresh-append equivalence on the CPU backend (no resident decoder), which
+/// exercises the facade's check-all-then-rollback arm — per-layer length
+/// validation, `rollback_to`, and the over-length refusal with state
+/// untouched. Bitwise, same op shapes on both runners.
+#[test]
+fn cpu_truncate_kv_matches_fresh_prefill() {
+    if !std::path::Path::new(&*DRAFTER_PATH).exists() {
+        eprintln!("skipping: {} absent (drafter-gated test)", *DRAFTER_PATH);
+        return;
+    }
+    let bytes = std::fs::read(&*DRAFTER_PATH).expect("read drafter gguf");
+    let Some(mut a) = load_on("cpu", &bytes) else {
+        return;
+    };
+    let Some(mut b) = load_on("cpu", &bytes) else {
+        return;
+    };
+
+    let prompt: Vec<u32> = (1u32..=16).collect();
+    let positions: Vec<usize> = (0..prompt.len()).collect();
+    let _ = a.forward(&prompt, &positions).expect("prefill A");
+    let _ = b.forward(&prompt, &positions).expect("prefill B");
+    let n = prompt.len();
+    let _ = a.forward(&[50], &[n]).expect("keep-row A");
+    let _ = b.forward(&[50], &[n]).expect("keep-row B");
+
+    // A only: speculative rows, then the error contract, then the rewind.
+    let _ = a
+        .forward(&[90, 91, 92], &[n + 1, n + 2, n + 3])
+        .expect("speculative rows A");
+    assert!(
+        a.truncate_kv(n + 10).is_err(),
+        "host truncate_kv past the cached length must refuse"
+    );
+    a.truncate_kv(n + 1).expect("host rewind");
+    b.truncate_kv(n + 1).expect("host no-op truncate at length");
+
+    let la = a
+        .forward(&[70, 71], &[n + 1, n + 2])
+        .expect("suffix after truncate A");
+    let lb = b.forward(&[70, 71], &[n + 1, n + 2]).expect("suffix B");
+    assert_eq!(la.len(), lb.len(), "logits width mismatch");
+    for (i, (x, y)) in la.iter().zip(lb.iter()).enumerate() {
+        assert_eq!(
+            x.to_bits(),
+            y.to_bits(),
+            "host truncate-then-append diverged from fresh append at vocab \
+             idx {i} (truncated={x} fresh={y})"
+        );
+    }
+}
+
 /// I1 paged leg (review follow-up on 503b520): the `page_mapped(r, p+k-1)`
 /// full-room guard must (a) refuse a draft whose tail outruns the row's page
 /// reservation WITHOUT any partial advance, and (b) once the reservation
