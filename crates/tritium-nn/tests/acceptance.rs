@@ -1897,7 +1897,7 @@ fn cuda_draft_chain_matches_per_step() {
 /// The small ADR 0021 drafter GGUF for the I1 batched-draft gate: the batched
 /// drafter is the consumer, and it fits alongside a training run's VRAM
 /// footprint where the 2B4T target would not. Skips cleanly when absent.
-#[cfg(feature = "cuda")]
+/// Ungated: the host-branch truncate gate uses it on the CPU backend too.
 static DRAFTER_PATH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     format!(
         "{}/blut/data/drafter-8L768-s3.gguf",
