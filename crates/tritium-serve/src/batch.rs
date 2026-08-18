@@ -888,7 +888,11 @@ fn multi_spec_round(
                     })
                     .and_then(|()| mp.dbatch.set_position(r, p).map_err(|e| e.to_string()));
                 match delta {
-                    Ok(()) => continue,
+                    Ok(()) => {
+                        crate::generator::SPEC_DELTA_RESYNCS
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        continue;
+                    }
                     Err(e) => eprintln!(
                         "tritium-serve: multi-slot spec delta re-sync (row {r}): {e} — \
                          falling back to the full re-prefill"

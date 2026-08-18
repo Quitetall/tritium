@@ -170,7 +170,11 @@ impl CudaDecodeModel {
     ///
     /// # Errors
     /// [`BackendError::InvalidInput`] on a bad row/len, a scale KV rung, or a
-    /// paged batch. The KV state is unchanged on error.
+    /// paged batch — all refused BEFORE any copy, state untouched. A device
+    /// copy/sync failure mid-loop may leave earlier layers' single-seq rows
+    /// overwritten with the watermark NOT advanced; callers recover with
+    /// `reset()` + re-prefill (the serve delta path's fallback does exactly
+    /// this).
     pub fn copy_batch_row_into_kv(
         &mut self,
         batch: &BatchKv,

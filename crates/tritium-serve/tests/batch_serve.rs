@@ -1652,6 +1652,132 @@ async fn cuda_batched_spec_adaptive_forced_collapse_stays_lossless() {
     );
 }
 
+/// Delta re-sync branch gate: the long-prompt twin of the forced-collapse
+/// test. With ~200-token prompts the kept-row prefix (dpos ≈ 200+) exceeds
+/// the probe-re-entry gap (≈ 64-70), so `multi_spec_round`'s DELTA
+/// enrollment path (adopt-from + gap forward + adopt back) fires instead of
+/// the full re-prefill — asserted via [`SPEC_DELTA_RESYNCS`], with the same
+/// losslessness teeth: every stream token-identical to plain greedy. (The
+/// short-prompt test above exercises the full-re-prefill arm — gap ≥ dpos
+/// there — so both arms of the branch are covered.)
+#[tokio::test(flavor = "multi_thread")]
+async fn cuda_batched_spec_delta_resync_fires_and_stays_lossless() {
+    if !Path::new(&*GGUF_PATH).exists() {
+        eprintln!("skipping: {} absent (gated real-model test)", *GGUF_PATH);
+        return;
+    }
+    if !Path::new(&*DRAFT_PATH).exists() {
+        eprintln!("skipping: {} absent (gated drafter test)", *DRAFT_PATH);
+        return;
+    }
+    let reference: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(REF_PATH).expect("read reference"))
+            .expect("parse reference");
+    let base: Vec<u32> = reference["token_ids"]
+        .as_array()
+        .expect("token_ids")
+        .iter()
+        .map(|v| v.as_u64().expect("id") as u32)
+        .collect();
+    let bytes = std::fs::read(&*GGUF_PATH).expect("read gguf");
+    let dbytes = std::fs::read(&*DRAFT_PATH).expect("read draft gguf");
+
+    let Some(target) = load_runner(&bytes) else {
+        return;
+    };
+    {
+        let draft = load_runner(&dbytes).expect("draft runner");
+        if draft.weights.vocab != target.weights.vocab {
+            eprintln!("skipping: drafter/target vocab mismatch");
+            return;
+        }
+    }
+
+    let horizon = 96usize; // > the 64-token probe period: probe re-entries fire
+    let prompts: Vec<Vec<u32>> = (0..3usize)
+        .map(|i| {
+            base.iter()
+                .cycle()
+                .skip(2 * i)
+                .take(200 + 3 * i) // dpos ≈ 200+ >> gap: the delta regime
+                .copied()
+                .collect()
+        })
+        .collect();
+    let ids: Vec<String> = prompts
+        .iter()
+        .map(|p| p.iter().map(u32::to_string).collect::<Vec<_>>().join(" "))
+        .collect();
+
+    let mut plain = RunnerGenerator::new(target, u32::MAX);
+    let mut want: Vec<Vec<u32>> = Vec::new();
+    for p in &prompts {
+        let req = GenRequest {
+            prompt_tokens: p.clone(),
+            max_new: horizon,
+            sampling: Sampling::Greedy,
+            stop_eos: false,
+            logprobs: None,
+        };
+        let mut out = Vec::new();
+        plain
+            .generate(&req, &mut |step| {
+                out.push(step.token);
+                true
+            })
+            .expect("plain reference generate");
+        assert_eq!(out.len(), horizon, "reference stream wrong length");
+        want.push(out);
+    }
+    drop(plain);
+
+    let _env = AdaptiveEnv::set("force");
+    let runner = load_runner(&bytes).expect("runner");
+    let draft = load_runner(&dbytes).expect("draft runner");
+    let tok = Arc::new(IdPassthroughTokenizer::new(128_000, u32::MAX));
+    let cfg = ServeConfig {
+        model_id: "tritium".into(),
+        queue_cap: 32,
+        max_new_default: horizon,
+        ..ServeConfig::default()
+    };
+    let (router, _draining) =
+        build_router_batched_with_draft(runner, draft, u32::MAX, 3, tok.clone(), cfg.clone())
+            .expect("batched router");
+    let _ = chat(&router, "128000 791", 2).await;
+
+    let deltas =
+        || tritium_serve::generator::SPEC_DELTA_RESYNCS.load(std::sync::atomic::Ordering::Relaxed);
+    let d0 = deltas();
+    let parse = |text: &str| -> Vec<u32> {
+        text.split_whitespace()
+            .map(|t| t.parse().expect("token id"))
+            .collect()
+    };
+    let handles: Vec<_> = (0..3)
+        .map(|i| {
+            let router = router.clone();
+            let ids = ids[i].clone();
+            tokio::spawn(async move { (i, chat(&router, &ids, horizon).await) })
+        })
+        .collect();
+    for h in handles {
+        let (i, text) = h.await.expect("join");
+        assert_eq!(
+            parse(&text),
+            want[i],
+            "delta-resync concurrent stream {i} != plain greedy (lossless)"
+        );
+    }
+    let fired = deltas() - d0;
+    println!("delta re-syncs fired: {fired} over 3x{horizon} @ ~200-token prompts");
+    assert!(
+        fired > 0,
+        "the delta enrollment path never fired — the long-prompt shape should \
+         put every probe re-entry in the gap < dpos regime"
+    );
+}
+
 /// ABBA bench for the adaptive lever at N=4 standard shape (ignored; run
 /// explicitly, serially, with --nocapture): four concurrent short-prompt
 /// greedy streams on a 4-slot drafter-attached worker, aggregate tok/s,

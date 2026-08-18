@@ -18,6 +18,10 @@ pub static SPEC_COMMITTED: AtomicU64 = AtomicU64::new(0);
 /// drafting SUPPRESSED (the long-ctx tau-collapse lever, [`SpecGovernor`]).
 /// A nonzero value is the observable "spec is off right now" signal.
 pub static SPEC_SUPPRESSED_PLAIN: AtomicU64 = AtomicU64::new(0);
+/// Multi-slot enrollment re-syncs that took the DELTA path (adopt-from +
+/// gap forward + adopt back) instead of the full reset + re-prefill — the
+/// probe re-entry fast path. Observability + test teeth for the branch.
+pub static SPEC_DELTA_RESYNCS: AtomicU64 = AtomicU64::new(0);
 
 /// Process-wide EWMA of one spec-decode phase's wall-clock cost in
 /// microseconds. Single-writer (the one decode worker thread) with `Relaxed`
