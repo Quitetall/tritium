@@ -108,6 +108,10 @@ pub(super) struct GraphPtrs {
     pub(super) d_token_embd_i8: sys::CUdeviceptr,
     pub(super) d_lm_head_scales: sys::CUdeviceptr,
     pub(super) d_output_norm: sys::CUdeviceptr,
+    /// Flash-profile partials scratch (0 when the m1 flash profile is off).
+    /// Extracted pre-capture like every other pointer — a `device_ptr` call
+    /// inside the capture body invalidates the capture.
+    pub(super) d_flash_partials: sys::CUdeviceptr,
 }
 
 /// Raw-loaded PTX modules + `CUfunction` handles for the v0.3.2 graph-captured decode.
@@ -127,6 +131,14 @@ pub(super) struct RawGraphKernels {
     /// v1.x split attention pair (preferred when head_dim % 4 == 0).
     pub(super) attn_scores_g: sys::CUfunction,
     pub(super) attn_reduce_g: sys::CUfunction,
+    /// DRAFTER-profile flash pair (M=1 `set_m1_flash_attention`): the M=N
+    /// batched-decode split/combine kernels, launched with n=1 and the ctrl
+    /// block's cache_len word as the 1-row positions array. Resolved
+    /// unconditionally (same module); captured only under the flash profile.
+    /// On the q8 rung the f32 symbol is resolved as filler — the profile is
+    /// refused on scale rungs before any capture.
+    pub(super) attn_split_partial_g: sys::CUfunction,
+    pub(super) attn_combine_g: sys::CUfunction,
     pub(super) rmsnorm: sys::CUfunction,
     pub(super) rmsnorm_quant: sys::CUfunction,
     pub(super) residual: sys::CUfunction,
@@ -220,6 +232,15 @@ impl RawGraphKernels {
                     KERNEL_NAME_ATTN_REDUCE_Q8,
                 ),
             )?,
+            attn_split_partial_g: get(
+                dm,
+                sel(
+                    KERNEL_NAME_ATTN_SPLIT_PARTIAL,
+                    KERNEL_NAME_ATTN_SPLIT_PARTIAL_H,
+                    KERNEL_NAME_ATTN_SPLIT_PARTIAL,
+                ),
+            )?,
+            attn_combine_g: get(dm, KERNEL_NAME_ATTN_COMBINE)?,
             // Shared-staged rmsnorm: BIT-IDENTICAL to the sequential rmsnorm_f32 (same sum
             // order, from shared), just ~8× faster — so greedy 256/256 holds. (A *parallel*
             // tree-reduction rmsnorm would reach ~132 tok/s but reorders the sum and breaks

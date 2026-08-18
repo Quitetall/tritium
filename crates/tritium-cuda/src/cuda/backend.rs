@@ -7274,6 +7274,8 @@ impl CudaBackend {
             batch_raw: None,
             imma_funcs,
             imma_min_m,
+            m1_flash: false,
+            m1_flash_partials: None,
         })
     }
 

@@ -719,6 +719,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .into());
             }
+            // Opt-in DRAFTER attention profile: TRITIUM_DRAFT_ATTN=flash
+            // routes the drafter's M=1 graph attention through the flash
+            // split/combine pair (ctx-parallel — the long-ctx drafter-step
+            // lever). Proposals-only: committed tokens are the target's
+            // argmax regardless, so losslessness is untouched; tau may
+            // shift. The TARGET runner never opts in (bit-pinned plain
+            // decode). Loud-reject on typos, per the env-knob house rule.
+            let mut d = d;
+            match std::env::var("TRITIUM_DRAFT_ATTN") {
+                Err(std::env::VarError::NotPresent) => {}
+                Ok(v) if v == "exact" => {}
+                Ok(v) if v == "flash" => d.set_m1_flash_attention(true),
+                Ok(v) => {
+                    return Err(
+                        format!("TRITIUM_DRAFT_ATTN={v:?} — use exact (default) or flash").into(),
+                    );
+                }
+                Err(e) => return Err(format!("TRITIUM_DRAFT_ATTN: {e}").into()),
+            }
             Some(d)
         }
     };
