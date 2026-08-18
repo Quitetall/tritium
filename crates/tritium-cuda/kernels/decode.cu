@@ -2685,6 +2685,9 @@ static __device__ __forceinline__ void gqa_attention_tree_fused_ctrl_body(
 // the static grid replays at every context length.
 #define TREE_NB_SLICE 512
 #define TREE_NB_MAX_NODES 8
+// One node per warp: the partials sizing and row = warp both assume it.
+static_assert(TREE_FUSED_THREADS / 32 == TREE_NB_MAX_NODES,
+              "TREE_NB_MAX_NODES must equal the warp count");
 
 template <class C>
 static __device__ __forceinline__ void gqa_attention_tree_fused_nb_body(

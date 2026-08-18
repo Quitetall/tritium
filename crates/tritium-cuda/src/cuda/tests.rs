@@ -3727,9 +3727,18 @@ fn tree_fused_nb_fast_tier_within_1e4_of_exact_pair() {
         (((seed >> 33) as i32 % 1000) as f32) * 1e-3 - 0.5
     };
 
-    // prefix 1300 spans 3 slices (512-key slices); 5 stays inside slice 0;
-    // hd 64 exercises the live-lane mask.
-    for (head_dim, prefix_len) in [(128usize, 1300usize), (128, 5), (64, 700)] {
+    // prefix 1300 spans 3 slices (512-key slices); 5 stays inside slice 0
+    // AND launches with 3 EMPTY trailing slices (production's static
+    // n_slice from max_ctx — pins the identity-partial/combine-skip path);
+    // hd 64 exercises the live-lane mask. extra_slices inflates n_slice
+    // past the occupied count; spike scales the first 32 K rows by 40 so
+    // slice 0 owns the global max and the other slices' local maxes sit
+    // far below it (the combine's exp-underflow regime).
+    for (head_dim, prefix_len, extra_slices, spike) in [
+        (128usize, 1300usize, 0usize, true),
+        (128, 5, 3, false),
+        (64, 700, 0, false),
+    ] {
         let (n_head, n_head_kv, m, max_anc) = (4usize, 2usize, 3usize, 4usize);
         let n_anc: Vec<i32> = vec![2, 4, 3];
         let p = prefix_len as i32;
@@ -3741,7 +3750,7 @@ fn tree_fused_nb_fast_tier_within_1e4_of_exact_pair() {
         ];
         let kv_rows = prefix_len + m + 8;
         let ctx_max = prefix_len + max_anc;
-        let n_slice = kv_rows.div_ceil(consts::TREE_NB_SLICE).max(1);
+        let n_slice = kv_rows.div_ceil(consts::TREE_NB_SLICE).max(1) + extra_slices;
         let tree_ctrl: Vec<i32> = vec![prefix_len as i32, m as i32, 0];
 
         let d_anc = stream.clone_htod(&anc).expect("anc");
@@ -3759,7 +3768,12 @@ fn tree_fused_nb_fast_tier_within_1e4_of_exact_pair() {
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let q: Vec<f32> = (0..m * n_head * head_dim).map(|_| nextf()).collect();
         let kv_len = kv_rows * n_head_kv * head_dim;
-        let kf: Vec<f32> = (0..kv_len).map(|_| nextf()).collect();
+        let mut kf: Vec<f32> = (0..kv_len).map(|_| nextf()).collect();
+        if spike {
+            for x in kf[..32 * n_head_kv * head_dim].iter_mut() {
+                *x *= 40.0;
+            }
+        }
         let vf: Vec<f32> = (0..kv_len).map(|_| nextf()).collect();
         let kh: Vec<u16> = kf.iter().map(|&x| f16::from_f32(x).to_bits()).collect();
         let vh: Vec<u16> = vf.iter().map(|&x| f16::from_f32(x).to_bits()).collect();
