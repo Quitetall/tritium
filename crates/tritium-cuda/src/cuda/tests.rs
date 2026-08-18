@@ -7068,9 +7068,16 @@ fn tb1_lut_gateup_l2defeated_bench() {
     let f_scan = module.load_function("tb1_mpgemm_tiled_i8_scaled").unwrap();
     let f_lut = module.load_function("tb1_mpgemm_lut_i8_scaled").unwrap();
 
-    // One timed batch of `iters` launches for cell (which, defeat).
+    // One timed batch of `iters` launches for cell (which, defeat). The
+    // rotation phase persists across warmup AND timed loops (and across
+    // rounds), so every replica's revisit distance is uniform — restarting
+    // at 0 per loop gave the smaller-arena format a ~0.5% resident-tail
+    // flatter (review 848d2f36 N1).
+    let mut rot = 0usize;
     let mut cell = |which: u8, defeat: bool| -> f64 {
-        for i in 0..iters as usize {
+        for _ in 0..iters as usize {
+            let i = rot;
+            rot += 1;
             let f = match which {
                 0 => &f_tq2,
                 1 => &f_scan,
@@ -7108,7 +7115,9 @@ fn tb1_lut_gateup_l2defeated_bench() {
         }
         stream.synchronize().unwrap();
         let t0 = std::time::Instant::now();
-        for i in 0..iters as usize {
+        for _ in 0..iters as usize {
+            let i = rot;
+            rot += 1;
             let f = match which {
                 0 => &f_tq2,
                 1 => &f_scan,
@@ -7156,7 +7165,7 @@ fn tb1_lut_gateup_l2defeated_bench() {
         (1, true, "scan defeated"),
         (2, true, "LUT  defeated"),
     ];
-    let mut mins = [f64::INFINITY; 6];
+    let mut samples: [Vec<f64>; 6] = Default::default();
     for r in 0..ROUNDS {
         let order: Vec<usize> = if r % 2 == 0 {
             (0..6).collect()
@@ -7165,14 +7174,21 @@ fn tb1_lut_gateup_l2defeated_bench() {
         };
         for ci in order {
             let (which, defeat, _) = cells[ci];
-            let us = cell(which, defeat);
-            if us < mins[ci] {
-                mins[ci] = us;
-            }
+            samples[ci].push(cell(which, defeat));
         }
     }
+    let mins: Vec<f64> = samples
+        .iter()
+        .map(|v| v.iter().copied().fold(f64::INFINITY, f64::min))
+        .collect();
     for (ci, (_, _, name)) in cells.iter().enumerate() {
-        println!("{name}: {:.2} µs/launch (min of {ROUNDS})", mins[ci]);
+        let mean = samples[ci].iter().sum::<f64>() / ROUNDS as f64;
+        let sigma =
+            (samples[ci].iter().map(|x| (x - mean).powi(2)).sum::<f64>() / ROUNDS as f64).sqrt();
+        println!(
+            "{name}: {:.2} µs/launch (min of {ROUNDS}, mean {mean:.2}, σ {sigma:.2})",
+            mins[ci]
+        );
     }
     println!(
         "ratios vs TQ2 — resident: scan {:.2}x, LUT {:.2}x | defeated: scan {:.2}x, LUT {:.2}x",
