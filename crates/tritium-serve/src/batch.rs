@@ -855,6 +855,47 @@ fn multi_spec_round(
         } else {
             mp.slots[r] = None;
         }
+        // Delta re-sync (kept rows only): a probe/recovery re-entry whose
+        // watermark fell behind keeps the row's OWN valid KV prefix — adopt
+        // it back into the single-seq cache, forward only the gap, adopt the
+        // extended prefix into the row. The row's rows [0, dpos) equal
+        // history[..dpos] for a kept row by construction (enrollment prefill
+        // + reconciled feeds; history is append-only), so this is the same
+        // end state as the full re-prefill at a cost sized by the gap + two
+        // D2D copies, not the whole history (measured 6.2 ms vs 71.3 ms at
+        // the 4K/64-gap probe shape, quiet box). Taken when the kept prefix
+        // exceeds the gap — the regime where the delta is strictly cheaper;
+        // short-prefix rows keep the full path. Any error falls through to
+        // the full path below.
+        if keep {
+            let dpos = mp.dbatch.positions()[r];
+            let gap = p.saturating_sub(dpos);
+            if gap < dpos {
+                let delta = draft
+                    .adopt_from_batch_row(&mp.dbatch, r, dpos)
+                    .map_err(|e| e.to_string())
+                    .and_then(|()| {
+                        let positions: Vec<usize> = (dpos..p).collect();
+                        draft
+                            .forward(&a.history[dpos..p], &positions)
+                            .map(|_| ())
+                            .map_err(|e| e.to_string())
+                    })
+                    .and_then(|()| {
+                        draft
+                            .adopt_into_batch_row(&mut mp.dbatch, r, p)
+                            .map_err(|e| e.to_string())
+                    })
+                    .and_then(|()| mp.dbatch.set_position(r, p).map_err(|e| e.to_string()));
+                match delta {
+                    Ok(()) => continue,
+                    Err(e) => eprintln!(
+                        "tritium-serve: multi-slot spec delta re-sync (row {r}): {e} — \
+                         falling back to the full re-prefill"
+                    ),
+                }
+            }
+        }
         draft.reset();
         let positions: Vec<usize> = (0..p).collect();
         let enrolled = draft

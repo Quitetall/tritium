@@ -2149,6 +2149,83 @@ fn cuda_truncate_kv_matches_fresh_prefill() {
     }
 }
 
+/// Delta re-sync equivalence (the batched probe re-entry primitive): the
+/// adopt-from → gap-forward → adopt-back sequence must leave a batch row
+/// drafting TOKEN-IDENTICALLY to the full reset + re-prefill enrollment on a
+/// twin runner. The single-seq cache is scrambled with a different sequence
+/// before the reverse adopt, so the restored prefix is proven to come from
+/// the ROW's bytes; rows past the old watermark ride the chunked-prefill
+/// bitwise property (prefill(0..p) == prefill(0..d) + prefill(d..p)).
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_delta_resync_matches_full_reprefill() {
+    let _gpu = gpu_serial();
+    if !std::path::Path::new(&*DRAFTER_PATH).exists() {
+        eprintln!("skipping: {} absent (drafter-gated test)", *DRAFTER_PATH);
+        return;
+    }
+    let bytes = std::fs::read(&*DRAFTER_PATH).expect("read drafter gguf");
+    let Some(mut a) = load_on("cuda", &bytes) else {
+        return;
+    };
+    let Some(mut b) = load_on("cuda", &bytes) else {
+        return;
+    };
+    let never_eos = u32::MAX;
+    let hist: Vec<u32> = (0..141u32).map(|i| 1 + (i % 997)).collect();
+    let (d0, p) = (100usize, 140usize); // enrolled watermark, pending's position
+
+    // A: enroll at d0 through the normal path, then the DELTA re-sync.
+    let positions: Vec<usize> = (0..d0).collect();
+    a.forward(&hist[..d0], &positions).expect("A prefill");
+    let mut batch_a = a.new_batch(2).expect("A batch");
+    a.adopt_into_batch_row(&mut batch_a, 0, d0)
+        .expect("A adopt");
+    batch_a.set_position(0, d0).expect("A set_position");
+    // Scramble the single-seq cache so the restored prefix must come from
+    // the row, not linger from the prefill above.
+    a.reset();
+    let other: Vec<u32> = std::iter::repeat_n(7u32, d0).collect();
+    a.forward(&other, &positions).expect("A scramble");
+    // The delta path: adopt-from, forward only the gap, adopt back.
+    a.adopt_from_batch_row(&batch_a, 0, d0)
+        .expect("A adopt-from");
+    let gap_pos: Vec<usize> = (d0..p).collect();
+    a.forward(&hist[d0..p], &gap_pos).expect("A gap forward");
+    a.adopt_into_batch_row(&mut batch_a, 0, p)
+        .expect("A adopt back");
+    batch_a.set_position(0, p).expect("A re-position");
+
+    // B: the full reset + re-prefill enrollment.
+    let mut batch_b = b.new_batch(2).expect("B batch");
+    b.reset();
+    let full_pos: Vec<usize> = (0..p).collect();
+    b.forward(&hist[..p], &full_pos).expect("B full prefill");
+    b.adopt_into_batch_row(&mut batch_b, 0, p).expect("B adopt");
+    batch_b.set_position(0, p).expect("B set_position");
+
+    // Both rows draft from the pending token: token-identical or the delta
+    // path corrupted the prefix.
+    batch_a.set_live(1, false).expect("A dead row");
+    batch_b.set_live(1, false).expect("B dead row");
+    let feeds = [hist[p], 0, 0, 0];
+    let out_a = a
+        .draft_batch(&mut batch_a, &feeds[..2], 8, never_eos)
+        .expect("A draft");
+    let out_b = b
+        .draft_batch(&mut batch_b, &feeds[..2], 8, never_eos)
+        .expect("B draft");
+    assert!(!out_a[0].is_empty(), "delta-resynced row must draft");
+    assert_eq!(
+        out_a[0], out_b[0],
+        "delta re-sync drafts diverged from the full re-prefill enrollment"
+    );
+    println!(
+        "delta re-sync == full re-prefill: {} drafted tokens identical",
+        out_a[0].len()
+    );
+}
+
 /// Host-branch twin of the truncate gate: the same truncate-then-append ==
 /// fresh-append equivalence on the CPU backend (no resident decoder), which
 /// exercises the facade's check-all-then-rollback arm — per-layer length

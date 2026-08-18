@@ -86,7 +86,7 @@ fn drafter_probe_catchup_ab() {
         batch.set_position(0, n).expect("set_position");
     };
 
-    // Warmup both legs once (clock + graph capture + IMMA shadows).
+    // Warmup all three legs once (clock + graph capture + IMMA shadows).
     enroll_at(&mut runner, &mut batch, P);
     enroll_at(&mut runner, &mut batch, P - GAP);
     for _ in 0..GAP {
@@ -97,48 +97,85 @@ fn drafter_probe_catchup_ab() {
             .expect("warmup catch-up step");
     }
     assert_eq!(batch.positions()[0], P, "warmup catch-up must reach p");
+    enroll_at(&mut runner, &mut batch, P - GAP);
+    runner
+        .adopt_from_batch_row(&batch, 0, P - GAP)
+        .expect("warmup adopt-from");
+    let gap_pos: Vec<usize> = (P - GAP..P).collect();
+    runner
+        .forward(&hist[P - GAP..P], &gap_pos)
+        .expect("warmup gap forward");
+    runner
+        .adopt_into_batch_row(&mut batch, 0, P)
+        .expect("warmup adopt back");
+    batch.set_position(0, P).expect("warmup re-position");
 
     let mut t_prefill = Vec::with_capacity(REPS);
     let mut t_catchup = Vec::with_capacity(REPS);
+    let mut t_delta = Vec::with_capacity(REPS);
     for rep in 0..REPS {
-        // Order-alternated within each pair: even reps a-then-b, odd b-then-a.
-        for leg in 0..2 {
-            if (rep + leg) % 2 == 0 {
-                // (a) enrollment re-prefill: reset + M=P prefill + adopt.
-                let t0 = std::time::Instant::now();
-                enroll_at(&mut runner, &mut batch, P);
-                t_prefill.push(t0.elapsed().as_secs_f64() * 1e3);
-            } else {
-                // (b) masked catch-up: 64 k=1 draft_batch steps (row 0 live).
-                enroll_at(&mut runner, &mut batch, P - GAP); // untimed restore
-                let t0 = std::time::Instant::now();
-                for _ in 0..GAP {
-                    let dpos = batch.positions()[0];
-                    let feeds = [hist[dpos], 0, 0, 0];
-                    runner
-                        .draft_batch(&mut batch, &feeds, 1, never_eos)
-                        .expect("catch-up step");
+        // Rotate the leg order each rep (abc / bca / cab ...) so no leg
+        // always rides the same clock state.
+        for leg in 0..3 {
+            match (rep + leg) % 3 {
+                0 => {
+                    // (a) enrollment re-prefill: reset + M=P prefill + adopt.
+                    let t0 = std::time::Instant::now();
+                    enroll_at(&mut runner, &mut batch, P);
+                    t_prefill.push(t0.elapsed().as_secs_f64() * 1e3);
                 }
-                t_catchup.push(t0.elapsed().as_secs_f64() * 1e3);
-                assert_eq!(batch.positions()[0], P, "catch-up must reach p");
+                1 => {
+                    // (b) masked catch-up: 64 k=1 draft_batch steps.
+                    enroll_at(&mut runner, &mut batch, P - GAP); // untimed restore
+                    let t0 = std::time::Instant::now();
+                    for _ in 0..GAP {
+                        let dpos = batch.positions()[0];
+                        let feeds = [hist[dpos], 0, 0, 0];
+                        runner
+                            .draft_batch(&mut batch, &feeds, 1, never_eos)
+                            .expect("catch-up step");
+                    }
+                    t_catchup.push(t0.elapsed().as_secs_f64() * 1e3);
+                    assert_eq!(batch.positions()[0], P, "catch-up must reach p");
+                }
+                _ => {
+                    // (c) delta re-sync: adopt-from + gap forward + adopt back.
+                    enroll_at(&mut runner, &mut batch, P - GAP); // untimed restore
+                    let t0 = std::time::Instant::now();
+                    runner
+                        .adopt_from_batch_row(&batch, 0, P - GAP)
+                        .expect("adopt-from");
+                    let gp: Vec<usize> = (P - GAP..P).collect();
+                    runner.forward(&hist[P - GAP..P], &gp).expect("gap forward");
+                    runner
+                        .adopt_into_batch_row(&mut batch, 0, P)
+                        .expect("adopt back");
+                    batch.set_position(0, P).expect("re-position");
+                    t_delta.push(t0.elapsed().as_secs_f64() * 1e3);
+                }
             }
         }
     }
 
     let mp = median(&mut t_prefill);
     let mc = median(&mut t_catchup);
+    let md = median(&mut t_delta);
     println!("re-prefill (reset + M={P} prefill + adopt): median {mp:.2} ms  {t_prefill:.1?}");
     println!(
         "masked catch-up ({GAP} x k=1 draft_batch @ N=4): median {mc:.2} ms ({:.2} ms/step)  {t_catchup:.1?}",
         mc / GAP as f64
     );
     println!(
-        "verdict at the probe shape: catch-up / re-prefill = {:.2}x ({})",
+        "delta re-sync (adopt-from + M={GAP} gap forward + adopt back): median {md:.2} ms  {t_delta:.1?}"
+    );
+    println!(
+        "verdicts at the probe shape: delta/re-prefill = {:.2}x, catch-up/re-prefill = {:.2}x ({})",
+        md / mp,
         mc / mp,
-        if mc < mp {
-            "catch-up wins — raising the gap-close guard is worth an e2e A/B"
+        if md < mp {
+            "delta wins — the enrollment delta path earns its keep"
         } else {
-            "re-prefill wins — the enrollment reset stays (record + close 1c)"
+            "re-prefill wins — record and keep the full path"
         }
     );
 }

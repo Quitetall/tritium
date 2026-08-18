@@ -65,6 +65,101 @@ fn adopt_copy_is_bit_exact() {
     println!("adoption copy bit-exact: 30 layers x 26 rows x K/V");
 }
 
+/// The REVERSE adoption (`copy_batch_row_into_kv`, the delta re-enrollment
+/// primitive): after the single-seq cache is deliberately scrambled with a
+/// different sequence, adopting the slot's rows back must restore every
+/// layer's K/V BIT-FOR-BIT and set the watermark — and the error contract
+/// must refuse a len past the row's watermark and any paged batch, state
+/// untouched.
+#[test]
+fn reverse_adopt_restores_bit_exact() {
+    let _gpu = gpu_serial();
+    if !Path::new(&*GGUF_PATH).exists() {
+        eprintln!("skipping: {} absent (gated real-model test)", *GGUF_PATH);
+        return;
+    }
+    let bytes = std::fs::read(&*GGUF_PATH).expect("read");
+    let file = tritium_format::read_gguf(&bytes).expect("parse");
+    let init = tritium_runtime::BACKENDS
+        .iter()
+        .find(|e| e.name == "cuda")
+        .expect("cuda")
+        .init;
+    let Ok(backend) = init() else { return };
+    let mut runner = tritium_nn::ModelRunner::load(&file, &bytes, backend).expect("load");
+    let prompt: Vec<u32> = [128000u32, 791, 6864, 315, 9822, 374]
+        .iter()
+        .cycle()
+        .take(26)
+        .copied()
+        .collect();
+    let positions: Vec<usize> = (0..prompt.len()).collect();
+    runner.forward(&prompt, &positions).expect("prefill");
+    let rm = runner.resident_cuda().expect("resident").expect("cuda");
+    let mut batch = rm.new_batch(2).expect("batch");
+    rm.copy_kv_into_batch_row(&mut batch, 1, 26).expect("adopt");
+    batch.set_position(1, 26).expect("set_position");
+
+    // Keep the golden bytes, then scramble the single-seq cache with a
+    // DIFFERENT sequence so restoration is proven, not inherited.
+    let layers = 30usize;
+    let mut golden = Vec::new();
+    for li in 0..layers {
+        for row in 0..26usize {
+            for v in [false, true] {
+                golden.push(rm.debug_kv_row(li, row, v).expect("golden"));
+            }
+        }
+    }
+    rm.reset();
+    let other: Vec<u32> = std::iter::repeat_n(42u32, 26).collect();
+    let other_pos: Vec<usize> = (0..26).collect();
+    rm.prefill(&other, &other_pos).expect("scramble prefill");
+    let scrambled = rm.debug_kv_row(0, 0, false).expect("scrambled row");
+    assert_ne!(
+        scrambled, golden[0],
+        "the scramble must actually overwrite the arena bytes"
+    );
+
+    // Error contract: len past the row's watermark refuses, state untouched.
+    assert!(
+        rm.copy_batch_row_into_kv(&batch, 1, 27).is_err(),
+        "reverse adopt past the row watermark must refuse"
+    );
+    assert_eq!(
+        rm.cache_len(),
+        26,
+        "failed reverse adopt must not move the watermark"
+    );
+
+    rm.copy_batch_row_into_kv(&batch, 1, 26)
+        .expect("reverse adopt");
+    assert_eq!(rm.cache_len(), 26, "reverse adopt must set the watermark");
+    let mut i = 0;
+    for li in 0..layers {
+        for row in 0..26usize {
+            for v in [false, true] {
+                let got = rm.debug_kv_row(li, row, v).expect("restored");
+                assert_eq!(
+                    got, golden[i],
+                    "layer {li} row {row} v={v} differs after reverse adoption"
+                );
+                i += 1;
+            }
+        }
+    }
+
+    // Paged refusal: the primitive is dense-only in v1.
+    let mut paged = rm.new_batch_paged(2, 4).expect("paged batch");
+    paged.reserve_pages(1, 26).expect("reserve");
+    paged.set_position(1, 26).expect("set_position");
+    assert!(
+        rm.copy_batch_row_into_kv(&paged, 1, 26).is_err(),
+        "reverse adopt must refuse paged batches"
+    );
+    println!("reverse adoption bit-exact: 30 layers x 26 rows x K/V + error contract");
+}
+
 /// A capture that fails mid-body must not poison the capture stream: the
 /// next graph capture + replay (and everything after) has to work.
 #[test]

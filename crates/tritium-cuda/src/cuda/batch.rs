@@ -154,6 +154,103 @@ impl CudaDecodeModel {
         Ok(())
     }
 
+    /// The REVERSE adoption: copy batch slot `row`'s KV rows `[0, len)` (every
+    /// layer, K and V) into this model's single-sequence arena and make them
+    /// the current sequence (`cache_len = len`, any pending tree invalidated).
+    /// After this, the single-seq path can extend the sequence directly — a
+    /// mid-stream `prefill` at positions `len..` attends the copied prefix —
+    /// which is what makes a DELTA re-enrollment expressible for a kept
+    /// multi-spec row whose watermark fell a probe-period behind: adopt-from,
+    /// forward only the gap, adopt back (three D2D/prefill costs sized by the
+    /// gap and the copy, not by a full re-prefill of the history).
+    ///
+    /// Dense batches only in v1: the one consumer (the drafter pool) is
+    /// always dense; paged rows are refused loudly and the caller falls back
+    /// to the reset + full re-prefill path.
+    ///
+    /// # Errors
+    /// [`BackendError::InvalidInput`] on a bad row/len, a scale KV rung, or a
+    /// paged batch. The KV state is unchanged on error.
+    pub fn copy_batch_row_into_kv(
+        &mut self,
+        batch: &BatchKv,
+        row: usize,
+        len: usize,
+    ) -> Result<(), BackendError> {
+        if self.kv_dtype.has_scales() {
+            return Err(BackendError::InvalidInput(
+                "continuous batching requires the f32 or f16 KV rung (the i8/t2 \
+                 scale arenas have no batch twin); set TRITIUM_KV=f32|f16"
+                    .into(),
+            ));
+        }
+        if batch.pages.is_some() {
+            return Err(BackendError::InvalidInput(
+                "copy_batch_row_into_kv: paged batches are not supported (the \
+                 drafter pool is dense; re-prefill instead)"
+                    .into(),
+            ));
+        }
+        if row >= batch.n {
+            return Err(BackendError::InvalidInput(format!(
+                "copy_batch_row_into_kv: row {row} >= batch n {}",
+                batch.n
+            )));
+        }
+        if len > batch.max_ctx || len > self.max_ctx {
+            return Err(BackendError::InvalidInput(format!(
+                "copy_batch_row_into_kv: len {len} exceeds max_ctx {}",
+                batch.max_ctx.min(self.max_ctx)
+            )));
+        }
+        if len > batch.positions[row] {
+            return Err(BackendError::InvalidInput(format!(
+                "copy_batch_row_into_kv: len {len} > row watermark {} — the \
+                 slot holds no such rows",
+                batch.positions[row]
+            )));
+        }
+        let src_off = row * batch.max_ctx * self.kv_width;
+        let count = len * self.kv_width;
+        let s = &self.stream;
+        for li in 0..self.layers.len() {
+            for (src, dst) in [
+                (&batch.kv_k[li], &mut self.kv_k[li]),
+                (&batch.kv_v[li], &mut self.kv_v[li]),
+            ] {
+                let (src_base, sg) = src.device_ptr(s);
+                let (dst_base, dg) = dst.device_ptr(s);
+                let src_ptr = src_base + (src_off * self.kv_elem) as sys::CUdeviceptr;
+                #[allow(unsafe_code)]
+                // SAFETY: raw byte copy between live device allocations on
+                // this model's stream: src holds the dense slot's rows
+                // [0, len) at the row's arena offset (bounds checked above,
+                // watermark checked against positions[row]); dst is the
+                // single-seq arena from element 0; both share this model's
+                // kv_elem.
+                unsafe {
+                    result::memcpy_dtod_async(
+                        dst_base,
+                        src_ptr,
+                        count * self.kv_elem,
+                        s.cu_stream(),
+                    )
+                }
+                .map_err(|e| driver_err("batch row reverse-adopt dtod", &e))?;
+                drop(sg);
+                drop(dg);
+            }
+        }
+        // The copied prefix becomes the current sequence only after the
+        // copies land; the sync also orders them before any subsequent
+        // prefill launched on this same stream.
+        s.synchronize()
+            .map_err(|e| driver_err("batch row reverse-adopt sync", &e))?;
+        self.pending_tree = None;
+        self.cache_len = len;
+        Ok(())
+    }
+
     /// Allocate batched-decode state for `n` concurrent sequences: a per-sequence KV arena
     /// (`[n, max_ctx, kv_width]` per layer) + the M=N scratch, all starting empty.
     ///

@@ -446,6 +446,30 @@ impl ModelRunner {
             .map_err(ResidentOpError::Op)
     }
 
+    /// (cuda) The REVERSE adoption: copy batch slot `row`'s KV rows `[0, len)`
+    /// into this runner's single-sequence cache and make them the current
+    /// sequence (watermark = `len`). A subsequent mid-stream `forward` at
+    /// positions `len..` extends the copied prefix — the delta re-enrollment
+    /// primitive for a kept multi-spec row whose drafter watermark fell a
+    /// probe-period behind (adopt-from, forward only the gap, adopt back).
+    /// Dense batches only; paged rows are refused (callers fall back to the
+    /// reset + full re-prefill path).
+    ///
+    /// # Errors
+    /// [`ResidentOpError`] — `Op(InvalidInput)` on a bad row/len, a scale KV
+    /// rung, or a paged batch; state unchanged on error.
+    #[cfg(feature = "cuda")]
+    pub fn adopt_from_batch_row(
+        &mut self,
+        batch: &tritium_cuda::BatchKv,
+        row: usize,
+        len: usize,
+    ) -> Result<(), ResidentOpError> {
+        self.resident_for_op()?
+            .copy_batch_row_into_kv(batch, row, len)
+            .map_err(ResidentOpError::Op)
+    }
+
     /// (cuda) One lockstep M=N decode step through the captured batch graph:
     /// feed each slot's token, return per-slot logits.
     ///
