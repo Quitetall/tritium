@@ -92,6 +92,7 @@ batches, mirror ABBA (pair, fused, nb, nb, fused, pair):
 | prefix | exact pair | fused (shipped fast tier) | nb+combine | nb/fused |
 |---|---:|---:|---:|---:|
 | 512, f16 | 107.8 µs | 40.9 µs | 85.4 µs | 2.09× (LOSES) |
+| 512, f32 | — | — | — | (also losing; row lost to output truncation, not re-run) |
 | 3968, f32 | 933.7 µs | 228.3 µs | **139.1 µs** | **0.609** |
 | 3968, f16 | 801.7 µs | 221.2 µs | **131.5 µs** | **0.594** |
 
@@ -103,7 +104,8 @@ prefix the (n_head × n_slice) grid underoccupies — hence opt-in, long-ctx
 scoped. RFC 0001 gate: worst rel 8.3e-5 (≤1e-4) including an
 empty-trailing-slices shape and a 40× magnitude-spike shape (the combine's
 exp-underflow regime). Implied verify effect at 4K fast+f16: attention
-~6.6 → ~3.9 ms of the 10.9 ms verify; the serve-level A/B is owed (below).
+~6.6 → ~3.9 ms of the 10.9 ms verify (denominator: the task-#65 session
+probe's verify EWMA, quiet box — re-derive when the owed e2e lands); the serve-level A/B is owed (below).
 
 #### 3. TB1 LUT verdict (tb1_lut_gateup_l2defeated_bench, quiet box)
 
@@ -123,10 +125,12 @@ removes them (bit-exact, gated) and buys only −13%. The sharper mechanism:
 TB1 is latency-bound on data-dependent serial sign addressing (uncoalesced
 per-lane window byte loads + the cross-block `sign_base` carry), which is
 why its byte-sensitivity is 1.2–1.3× where the dense TQ2 kernel's is 1.78× —
-the 23% byte saving has nothing to repay it. The docs/ternary-formats.md bar
+the 19–23% byte saving (19% at the bench's trits, 23% nominal at p=0.422)
+has nothing to repay it. The docs/ternary-formats.md bar
 ("close most of the 2.58× gap") is decisively unmet; integration is not
 considered. First-ever L2-defeated TB1 row (the round-16 verdict was
-resident-only), closing ADR 0036's unchecked "L7 A/B incl. bitmap+signs row".
+resident-only), closing the bitmap+signs half of ADR 0036's L7 A/B (the TQ1 half is the
+08-08 entry's §6 serve rows).
 
 #### Caveats + owed
 
