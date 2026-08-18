@@ -55,6 +55,98 @@ box they are a distance from a named reference point, **not** a claim about the 
 
 ## Ledger
 
+### 2026-08-18 spec-cost levers @ 82f80b1b — delta re-sync, node-blocked tree attention, TB1 LUT verdict
+
+**Box state:** every number below ran in verified-quiet windows (desktop
+graphics only, ~370 MiB, checked immediately before each bench; the RTX 4090 /
+610.57.04 / CUDA 13.3 box was otherwise held by a parallel session's training
+jobs for most of the day — two serve-level e2e attempts were CONTAMINATED
+mid-run by those jobs and are NOT recorded). Binary provenance: working tree
+at the named commits; kernel benches are in-tree harnesses.
+
+| lever | state | measured (quiet box) | scope |
+|---|---|---|---|
+| delta re-sync (f355b795) | **ADOPTED**, on by default | probe re-entry **6.22 ms vs 71.27 ms** full re-prefill at the ctx-4032/gap-64 shape (11.5×; masked catch-up 145.8 ms); drafts token-identical to the full path | kept multi-spec rows with gap < dpos; short-prefix rows keep the full path |
+| node-blocked tree attention (69f4aec3) | kernel-proven, **opt-in `TRITIUM_TREE_NB=1`**, e2e A/B owed | fused→NB @ prefix 3968: **221.2 → 131.5 µs/layer f16 (−40.6%)**, 228.3 → 139.1 g (−39.1%); prefix 512: +109% (underoccupied — long-ctx only) | fast tier, dense solo route, buckets ≤ 8; dual-graph prefix dispatch is the adoption follow-up |
+| drafter flash profile (879af54d) | mechanism shipped, **opt-in `TRITIUM_DRAFT_ATTN=flash`**, e2e A/B owed | chain==per-step gated under the profile; no quiet perf number yet | solo drafter M=1 graph attention |
+| TB1 LUT decode (848d2f36) | **REFUTED — integration not considered** | see §3 | task #58 closed with the sharper mechanism |
+
+#### 1. Delta re-sync (drafter_catchup_bench, quiet box)
+
+Median of 5, rotation-fair legs at the probe shape (ctx 4032, gap 64, drafter
+pool N=4, longctx drafter): re-prefill **71.27 ms** [71.0–71.8], masked
+catch-up **145.83 ms** (2.28 ms/step), delta re-sync **6.22 ms** [6.2–6.4].
+This also recaptures the round-30 §5 quiet-box absolutes owed by that entry
+(contended run was 95.1/222.6 ms — ordering unchanged). Gates:
+`reverse_adopt_restores_bit_exact` (bytes bit-for-bit after a real scramble +
+refusal contract), `cuda_delta_resync_matches_full_reprefill` (drafts
+token-identical), `cuda_batched_spec_delta_resync_fires_and_stays_lossless`
+(the branch fired 3× in situ, streams token-identical to plain greedy),
+batch_serve 8/8.
+
+#### 2. Node-blocked tree attention (tree_fused_vs_exact_pair_kernel_abba_bench, quiet box)
+
+BitNet verify shape (n_head 20 / kv 5 / hd 128, m=8 chain tree), 200-launch
+batches, mirror ABBA (pair, fused, nb, nb, fused, pair):
+
+| prefix | exact pair | fused (shipped fast tier) | nb+combine | nb/fused |
+|---|---:|---:|---:|---:|
+| 512, f16 | 107.8 µs | 40.9 µs | 85.4 µs | 2.09× (LOSES) |
+| 3968, f32 | 933.7 µs | 228.3 µs | **139.1 µs** | **0.609** |
+| 3968, f16 | 801.7 µs | 221.2 µs | **131.5 µs** | **0.594** |
+
+The mechanism: the fused body walks the whole [0, ctx) K/V range once per
+(node, head) block and is latency-bound (~2% of f32 peak); the NB kernel
+stages each 32-key tile decoded into shared once for all 8 node-warps, so the
+serial chains run at smem latency and the codec amortizes 8-fold. At short
+prefix the (n_head × n_slice) grid underoccupies — hence opt-in, long-ctx
+scoped. RFC 0001 gate: worst rel 8.3e-5 (≤1e-4) including an
+empty-trailing-slices shape and a 40× magnitude-spike shape (the combine's
+exp-underflow regime). Implied verify effect at 4K fast+f16: attention
+~6.6 → ~3.9 ms of the 10.9 ms verify; the serve-level A/B is owed (below).
+
+#### 3. TB1 LUT verdict (tb1_lut_gateup_l2defeated_bench, quiet box)
+
+Gateup shape (M=1, N=13824, K=2560), same-session interleaved, rotating
+replicas (4×L2 per format), continuous rotation phase, min-of-5 + σ:
+
+| kernel | L2-resident | L2-defeated | byte-sensitivity |
+|---|---:|---:|---:|
+| TQ2 mainline (2.06 b/w) | 8.48 µs | 15.13 µs | 1.78× |
+| TB1 scan (1.58 b/w) | 21.58 µs (2.54×) | 25.87 µs (**1.71×**) | 1.20× |
+| TB1 LUT (1.58 b/w) | 18.80 µs (2.22×) | 24.06 µs (**1.59×**) | 1.28× |
+
+Round 16's L2-resident 2.58× reproduces (2.54×). The redesign premise —
+that the per-element expansion chains (~60% of the compiled loop's
+instructions) were the cost — is REFUTED by its own success: the LUT kernel
+removes them (bit-exact, gated) and buys only −13%. The sharper mechanism:
+TB1 is latency-bound on data-dependent serial sign addressing (uncoalesced
+per-lane window byte loads + the cross-block `sign_base` carry), which is
+why its byte-sensitivity is 1.2–1.3× where the dense TQ2 kernel's is 1.78× —
+the 23% byte saving has nothing to repay it. The docs/ternary-formats.md bar
+("close most of the 2.58× gap") is decisively unmet; integration is not
+considered. First-ever L2-defeated TB1 row (the round-16 verdict was
+resident-only), closing ADR 0036's unchecked "L7 A/B incl. bitmap+signs row".
+
+#### Caveats + owed
+
+- The serve-level e2e A/B for the NB kernel and the flash drafter profile
+  (mirrored B/F/N/X legs at long ctx, `TRITIUM_DRAFT_K=legacy` to pin
+  bucket 8) is OWED: two attempts were contaminated mid-run by a parallel
+  session's GPU jobs and discarded. One honest signal from the contaminated
+  run, to be re-tested quiet: drafter ms/token did NOT move under flash —
+  if that reproduces, the drafter's ctx cost is not attention-dominated and
+  flash gets recorded as a no-win.
+- The NB kernel's +109% at prefix 512 means `TRITIUM_TREE_NB=1` must not be
+  set for short-ctx serving; adoption (default-on) requires the per-prefix
+  dual-graph dispatch.
+- TB1 numbers use the bench's ~1/3-zero trits (round-16 continuity), which
+  understates the format's byte edge at BitNet's real p=0.422 — disclosed by
+  the printed byte percentages; the verdict does not depend on it.
+
+**Still owed:** upstream llama.cpp Q2_0 rerun; MI300X/Metal sessions
+(user-gated).
+
 ### 2026-08-09/16 adaptive spec stack @ 16f52f3f — governor, cost-model floors, batched fast tier, longctx drafter, truncate-reconcile
 
 **Box state:** the 2026-08-09 rows (§1–§3) were measured on the quiet box at their
