@@ -1005,3 +1005,125 @@ extern "C" __global__ void tb1_mpgemm_tiled_i8_scaled(
         out[(long long)mi * n + ni] = (float)acc * scales[ni] * act_scale[mi];
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TB1 LUT decode (task #58 redesign attempt): identical format, identical
+// accumulator math and epilogue — only the UNPACK changes. The round-16
+// refutation blamed the warp prefix scan, but the compiled loop's histogram
+// says otherwise: the scan is 10 of ~137 instructions/block; ~60% is the
+// per-element bit-test/select chains (setp+selp+shift+or per trit, with a
+// data-dependent serial `sbit` carry across the 8 elements). This variant
+// deletes those chains with two shared LUTs:
+//
+//   s_pres[16]  : nibble  -> 4 bytes of 0x00/0x01 (presence expansion)
+//   s_dep[256]  : (nibble p, 4-bit sign window w) -> the COMPACTED low
+//                 popc(p) bits of w DEPOSITED as 0x00/0x01 bytes at p's set
+//                 positions. Window bits >= popc(p) are never consumed at
+//                 build time, so runtime passes a raw 4-bit window with
+//                 garbage high bits and needs NO mask.
+//
+// Ternary bytes then come from pure byte-SIMD:
+//   w8 = __vsub4(__vadd4(dep, dep), pres)   // {0,1}*2 - {0,1} = {-1, 0, +1}
+//
+// The scan, the sign-window funnel, and the running sign_base stay verbatim
+// (they were never the cost). Same launch geometry, same arena contract
+// (>= 2, use 4, trailing slack bytes), k % 256 == 0.
+extern "C" __global__ void tb1_mpgemm_lut_i8_scaled(
+    const signed char* __restrict__ qact,   // [M, K] packed int8, k % 4 == 0
+    const unsigned char* __restrict__ weights,
+    const unsigned int* __restrict__ row_offsets,  // [N] byte offset per row
+    const float* __restrict__ scales,
+    const float* __restrict__ act_scale,
+    float* __restrict__ out,
+    const int m,
+    const int n,
+    const int k) {
+    __shared__ unsigned int s_dep[256];
+    __shared__ unsigned int s_pres[16];
+    // Build the LUTs cooperatively (blockDim.x == 256 in the shared launch
+    // config; guard anyway so a smaller block still fills every entry).
+    for (int t = threadIdx.x; t < 256; t += blockDim.x) {
+        const int p = t >> 4;
+        const int w = t & 15;
+        unsigned int dep = 0;
+        int sbit = 0;
+        unsigned int pres = 0;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            if (p & (1 << j)) {
+                pres |= 1u << (8 * j);
+                if ((w >> sbit) & 1) {
+                    dep |= 1u << (8 * j);
+                }
+                ++sbit;
+            }
+        }
+        s_dep[t] = dep;
+        if (w == 0) {
+            s_pres[p] = pres;
+        }
+    }
+    __syncthreads();
+
+    const int warps_per_block = blockDim.x / WARP_SIZE;
+    const int warp_id = threadIdx.x / WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int mi = blockIdx.y;
+    if (mi >= m) {
+        return;
+    }
+    const int* arow = (const int*)(qact + (long long)mi * k);
+    const int ni = blockIdx.x * warps_per_block + warp_id;
+    if (ni >= n) {
+        return;
+    }
+    const int nb = k >> 8;
+    const unsigned char* presence = weights + row_offsets[ni];
+    const unsigned char* signs = presence + nb * 32;
+    int acc = 0;
+    int sign_base = 0;  // running bit offset into this row's sign stream
+    for (int b = 0; b < nb; ++b) {
+        const unsigned int pb = presence[b * 32 + lane];
+        const int cnt = __popc(pb);
+        // Inclusive prefix sum of per-lane popcounts across the warp.
+        int pre = cnt;
+#pragma unroll
+        for (int off = 1; off < WARP_SIZE; off <<= 1) {
+            const int up = __shfl_up_sync(0xffffffffu, pre, off);
+            if (lane >= off) {
+                pre += up;
+            }
+        }
+        const int my_start = sign_base + pre - cnt;  // exclusive prefix
+        // ≤8 sign bits span ≤2 bytes of the stream.
+        const int byte0 = my_start >> 3;
+        const unsigned int sw =
+            ((unsigned int)signs[byte0] | ((unsigned int)signs[byte0 + 1] << 8)) >>
+            (my_start & 7);
+        const int e = (b << 8) + lane * 8;
+        // Low nibble: window = sw's low bits; high nibble's window starts
+        // after the low nibble's popc(pl) consumed sign bits.
+        const unsigned int pl = pb & 15u;
+        const unsigned int ph = pb >> 4;
+        const int cl = __popc(pl);
+        {
+            const unsigned int dep = s_dep[(pl << 4) | (sw & 15u)];
+            const int w8 = (int)__vsub4(__vadd4(dep, dep), s_pres[pl]);
+            acc = __dp4a(w8, __ldg(arow + (e >> 2)), acc);
+        }
+        {
+            const unsigned int dep = s_dep[(ph << 4) | ((sw >> cl) & 15u)];
+            const int w8 = (int)__vsub4(__vadd4(dep, dep), s_pres[ph]);
+            acc = __dp4a(w8, __ldg(arow + ((e + 4) >> 2)), acc);
+        }
+        // Advance the running base by the whole block's nonzeros (lane 31's
+        // inclusive prefix).
+        sign_base += __shfl_sync(0xffffffffu, pre, WARP_SIZE - 1);
+    }
+    for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
+        acc += __shfl_down_sync(0xffffffffu, acc, off);
+    }
+    if (lane == 0) {
+        out[(long long)mi * n + ni] = (float)acc * scales[ni] * act_scale[mi];
+    }
+}

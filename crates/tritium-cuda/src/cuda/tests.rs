@@ -6745,6 +6745,7 @@ fn tb1_matches_tq2_tiled_scaled_bit_exact() {
         .load_function("tq2_0_add_mpgemm_tiled_i8_scaled")
         .unwrap();
     let f_tb1 = module.load_function("tb1_mpgemm_tiled_i8_scaled").unwrap();
+    let f_lut = module.load_function("tb1_mpgemm_lut_i8_scaled").unwrap();
 
     for &(m, n, k) in &[(1usize, 8usize, 1024usize), (2, 5, 512)] {
         let trits = mixed_trits(n, k, 0xB1 ^ (k as u64));
@@ -6800,6 +6801,17 @@ fn tb1_matches_tq2_tiled_scaled_bit_exact() {
                 a.to_bits(),
                 b.to_bits(),
                 "tb1 m{m} n{n} k{k} [{i}]: tq2={a} tb1={b}"
+            );
+        }
+        // The LUT decode variant (task #58 redesign) rides the same format,
+        // accumulator math, and epilogue — bit-identical or the deposit
+        // tables are wrong.
+        let ol = run_tb1(&stream, &f_lut, &trits, &qact, &scales, &act_scale, m, n, k);
+        for (i, (a, b)) in o2.iter().zip(&ol).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "tb1-lut m{m} n{n} k{k} [{i}]: tq2={a} lut={b}"
             );
         }
     }
@@ -6972,6 +6984,209 @@ fn tb1_tq1_tq2_gateup_bench() {
     bench("TQ2 (2.06 b/w)", 0);
     bench("TQ1 (1.69 b/w)", 1);
     bench("TB1 (1.58 b/w)", 2);
+}
+
+/// Task #58 redesign verdict bench: TB1-LUT (nibble-deposit decode) vs the
+/// original TB1 scan kernel vs the TQ2 mainline on the gateup shape at M=1 —
+/// BOTH L2-resident and L2-DEFEATED (rotating replicas; ADR 0036: byte
+/// results measured L2-resident are inadmissible for decode claims, and the
+/// round-16 TB1 verdict was L2-resident-only). Same-session interleaved:
+/// every cell timed once per round in mirror-alternated order, min-of-5.
+/// The bar (docs/ternary-formats.md): the redesign must close most of the
+/// 2.58× gap to TQ2 before integration is CONSIDERED.
+#[test]
+#[ignore = "verdict bench: run on a quiet box with --ignored --nocapture"]
+fn tb1_lut_gateup_l2defeated_bench() {
+    use cudarc::driver::{CudaContext, LaunchConfig, PushKernelArg};
+    use cudarc::nvrtc::Ptx;
+    let ctx = match CudaContext::new(0) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("skipping bench: no device ({e})");
+            return;
+        }
+    };
+    let stream = ctx.default_stream();
+    let module = ctx.load_module(Ptx::from_src(TQ2_0_ADD_PTX)).unwrap();
+    let (m, n, k) = (1usize, 13824usize, 2560usize); // BitNet fused gateup
+    let iters = 500u32;
+    const ROUNDS: usize = 5;
+
+    let l2_bytes = ctx
+        .attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE)
+        .map(|v| v.max(0) as usize)
+        .unwrap_or(72 << 20);
+
+    let trits = mixed_trits(n, k, 0xBE);
+    let nb = num_blocks(k);
+    let unit = vec![half::f16::ONE; nb];
+    let rb2 = nb * TQ2_0_BLOCK_BYTES;
+    let mut p2 = vec![0u8; n * rb2];
+    let mut tb1: Vec<u8> = Vec::new();
+    let mut off: Vec<u32> = Vec::new();
+    for ni in 0..n {
+        let row = &trits[ni * k..(ni + 1) * k];
+        tritium_format::pack_tq2_0_row(row, &unit, &mut p2[ni * rb2..(ni + 1) * rb2]).unwrap();
+        off.push(tb1.len() as u32);
+        tb1.extend(tritium_format::pack_tb1_row(row).unwrap());
+    }
+    tb1.extend_from_slice(&[0u8; 4]);
+    let reps2 = (4 * l2_bytes).div_ceil(p2.len()).max(2);
+    let repsb = (4 * l2_bytes).div_ceil(tb1.len()).max(2);
+    println!(
+        "L2 {} MiB | TQ2 {:.2} MiB x{reps2} | TB1 {:.2} MiB x{repsb} ({:.1}% of TQ2 bytes)",
+        l2_bytes >> 20,
+        p2.len() as f64 / (1 << 20) as f64,
+        tb1.len() as f64 / (1 << 20) as f64,
+        tb1.len() as f64 / p2.len() as f64 * 100.0,
+    );
+
+    let d_w2: Vec<_> = (0..reps2)
+        .map(|_| stream.clone_htod(&p2).unwrap())
+        .collect();
+    let d_wb: Vec<_> = (0..repsb)
+        .map(|_| stream.clone_htod(&tb1).unwrap())
+        .collect();
+    let d_off = stream.clone_htod(&off).unwrap();
+    let qact: Vec<i8> = (0..m * k).map(|i| ((i * 37) % 253) as i8).collect();
+    let scales = seeded_f32(1, n, 0.5, 2.0);
+    let act_scale = seeded_f32(2, m, 0.5, 1.5);
+    let d_qact = stream.clone_htod(&qact).unwrap();
+    let d_sc = stream.clone_htod(&scales).unwrap();
+    let d_as = stream.clone_htod(&act_scale).unwrap();
+    let mut d_out = stream.alloc_zeros::<f32>(m * n).unwrap();
+    let (m_i, n_i, k_i, rb2_i) = (m as i32, n as i32, k as i32, rb2 as i32);
+    let cfg = LaunchConfig {
+        grid_dim: ((n as u32).div_ceil(8), m as u32, 1),
+        block_dim: (8 * 32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let f_tq2 = module
+        .load_function("tq2_0_add_mpgemm_tiled_i8_scaled")
+        .unwrap();
+    let f_scan = module.load_function("tb1_mpgemm_tiled_i8_scaled").unwrap();
+    let f_lut = module.load_function("tb1_mpgemm_lut_i8_scaled").unwrap();
+
+    // One timed batch of `iters` launches for cell (which, defeat).
+    let mut cell = |which: u8, defeat: bool| -> f64 {
+        for i in 0..iters as usize {
+            let f = match which {
+                0 => &f_tq2,
+                1 => &f_scan,
+                _ => &f_lut,
+            };
+            let mut l = stream.launch_builder(f);
+            match which {
+                0 => l
+                    .arg(&d_qact)
+                    .arg(&d_w2[if defeat { i % reps2 } else { 0 }])
+                    .arg(&d_sc)
+                    .arg(&d_as)
+                    .arg(&mut d_out)
+                    .arg(&m_i)
+                    .arg(&n_i)
+                    .arg(&k_i)
+                    .arg(&rb2_i),
+                _ => l
+                    .arg(&d_qact)
+                    .arg(&d_wb[if defeat { i % repsb } else { 0 }])
+                    .arg(&d_off)
+                    .arg(&d_sc)
+                    .arg(&d_as)
+                    .arg(&mut d_out)
+                    .arg(&m_i)
+                    .arg(&n_i)
+                    .arg(&k_i),
+            };
+            // SAFETY: signatures as gated bit-exact above; every replica
+            // holds the full packed buffer for the configured shape.
+            #[allow(unsafe_code)]
+            unsafe {
+                l.launch(cfg).unwrap()
+            };
+        }
+        stream.synchronize().unwrap();
+        let t0 = std::time::Instant::now();
+        for i in 0..iters as usize {
+            let f = match which {
+                0 => &f_tq2,
+                1 => &f_scan,
+                _ => &f_lut,
+            };
+            let mut l = stream.launch_builder(f);
+            match which {
+                0 => l
+                    .arg(&d_qact)
+                    .arg(&d_w2[if defeat { i % reps2 } else { 0 }])
+                    .arg(&d_sc)
+                    .arg(&d_as)
+                    .arg(&mut d_out)
+                    .arg(&m_i)
+                    .arg(&n_i)
+                    .arg(&k_i)
+                    .arg(&rb2_i),
+                _ => l
+                    .arg(&d_qact)
+                    .arg(&d_wb[if defeat { i % repsb } else { 0 }])
+                    .arg(&d_off)
+                    .arg(&d_sc)
+                    .arg(&d_as)
+                    .arg(&mut d_out)
+                    .arg(&m_i)
+                    .arg(&n_i)
+                    .arg(&k_i),
+            };
+            // SAFETY: as above.
+            #[allow(unsafe_code)]
+            unsafe {
+                l.launch(cfg).unwrap()
+            };
+        }
+        stream.synchronize().unwrap();
+        t0.elapsed().as_secs_f64() * 1e6 / f64::from(iters)
+    };
+
+    // 6 cells × ROUNDS, mirror-alternated order per round, min per cell.
+    let cells: [(u8, bool, &str); 6] = [
+        (0, false, "TQ2  resident"),
+        (1, false, "scan resident"),
+        (2, false, "LUT  resident"),
+        (0, true, "TQ2  defeated"),
+        (1, true, "scan defeated"),
+        (2, true, "LUT  defeated"),
+    ];
+    let mut mins = [f64::INFINITY; 6];
+    for r in 0..ROUNDS {
+        let order: Vec<usize> = if r % 2 == 0 {
+            (0..6).collect()
+        } else {
+            (0..6).rev().collect()
+        };
+        for ci in order {
+            let (which, defeat, _) = cells[ci];
+            let us = cell(which, defeat);
+            if us < mins[ci] {
+                mins[ci] = us;
+            }
+        }
+    }
+    for (ci, (_, _, name)) in cells.iter().enumerate() {
+        println!("{name}: {:.2} µs/launch (min of {ROUNDS})", mins[ci]);
+    }
+    println!(
+        "ratios vs TQ2 — resident: scan {:.2}x, LUT {:.2}x | defeated: scan {:.2}x, LUT {:.2}x",
+        mins[1] / mins[0],
+        mins[2] / mins[0],
+        mins[4] / mins[3],
+        mins[5] / mins[3],
+    );
+    println!(
+        "byte-sensitivity (defeated/resident): TQ2 {:.2}x, scan {:.2}x, LUT {:.2}x",
+        mins[3] / mins[0],
+        mins[4] / mins[1],
+        mins[5] / mins[2],
+    );
 }
 
 /// **The framework-external linear path must not fall off a cliff for M > 1.**
