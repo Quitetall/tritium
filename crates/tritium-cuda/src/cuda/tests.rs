@@ -3696,6 +3696,226 @@ fn tree_fused_ctrl_fast_tier_within_1e4_of_exact_pair() {
     }
 }
 
+/// Task-#65 kernel gate: the node-blocked fast-tier partial+combine pair
+/// (`gqa_attention_tree_fused_nb_{g,h}` + `gqa_attention_combine_f32`) must
+/// stay within the RFC 0001 1e-4 max-rel bound against the exact ctrl
+/// scores→reduce pair at identical inputs — the same admission bar as the
+/// fused-ctrl body it can replace on small dense solo buckets. Shapes cover
+/// multi-slice prefixes (the staged path), a sub-slice prefix, and hd 64.
+#[test]
+fn tree_fused_nb_fast_tier_within_1e4_of_exact_pair() {
+    use cudarc::driver::{CudaContext, LaunchConfig, PushKernelArg};
+    use cudarc::nvrtc::Ptx;
+
+    let ctx = match CudaContext::new(0) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("skipping tree nb fast-tier gate: no device ({e})");
+            return;
+        }
+    };
+    let stream = ctx.default_stream();
+    let dm = ctx
+        .load_module(Ptx::from_src(DECODE_PTX))
+        .expect("load decode module");
+
+    let mut seed = 0x2e3bu64;
+    let mut nextf = move || {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (((seed >> 33) as i32 % 1000) as f32) * 1e-3 - 0.5
+    };
+
+    // prefix 1300 spans 3 slices (512-key slices); 5 stays inside slice 0;
+    // hd 64 exercises the live-lane mask.
+    for (head_dim, prefix_len) in [(128usize, 1300usize), (128, 5), (64, 700)] {
+        let (n_head, n_head_kv, m, max_anc) = (4usize, 2usize, 3usize, 4usize);
+        let n_anc: Vec<i32> = vec![2, 4, 3];
+        let p = prefix_len as i32;
+        #[rustfmt::skip]
+        let anc: Vec<i32> = vec![
+            p, p + 1, 0, 0,
+            p, p + 1, p + 2, p + 3,
+            p, p + 2, p + 3, 0,
+        ];
+        let kv_rows = prefix_len + m + 8;
+        let ctx_max = prefix_len + max_anc;
+        let n_slice = kv_rows.div_ceil(consts::TREE_NB_SLICE).max(1);
+        let tree_ctrl: Vec<i32> = vec![prefix_len as i32, m as i32, 0];
+
+        let d_anc = stream.clone_htod(&anc).expect("anc");
+        let d_n_anc = stream.clone_htod(&n_anc).expect("n_anc");
+        let d_ctrl = stream.clone_htod(&tree_ctrl).expect("tree_ctrl");
+        let (ss_i, nh_i, nhkv_i, hd_i, ma_i, m_i, ns_i) = (
+            ctx_max as i32,
+            n_head as i32,
+            n_head_kv as i32,
+            head_dim as i32,
+            max_anc as i32,
+            m as i32,
+            n_slice as i32,
+        );
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let q: Vec<f32> = (0..m * n_head * head_dim).map(|_| nextf()).collect();
+        let kv_len = kv_rows * n_head_kv * head_dim;
+        let kf: Vec<f32> = (0..kv_len).map(|_| nextf()).collect();
+        let vf: Vec<f32> = (0..kv_len).map(|_| nextf()).collect();
+        let kh: Vec<u16> = kf.iter().map(|&x| f16::from_f32(x).to_bits()).collect();
+        let vh: Vec<u16> = vf.iter().map(|&x| f16::from_f32(x).to_bits()).collect();
+        let d_q = stream.clone_htod(&q).expect("q");
+
+        let scores_cfg = LaunchConfig {
+            grid_dim: ((m * n_head) as u32, ctx_max.div_ceil(128) as u32, 1),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let reduce_cfg = LaunchConfig {
+            grid_dim: ((m * n_head) as u32, 1, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: (ctx_max * 4) as u32,
+        };
+        let nb_cfg = LaunchConfig {
+            grid_dim: ((n_head * n_slice) as u32, 1, 1),
+            block_dim: (consts::TREE_FUSED_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let comb_cfg = LaunchConfig {
+            grid_dim: ((m * n_head) as u32, 1, 1),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let scores_len = m * n_head * ctx_max;
+        let out_len = m * n_head * head_dim;
+        let part_len = consts::TREE_NB_MAX_NODES * n_head * n_slice * (head_dim + 2);
+
+        for dtype in ["g", "h"] {
+            let f_scores = dm
+                .load_function(&format!("gqa_attention_tree_scores_ctrl_{dtype}"))
+                .expect("exact scores fn");
+            let f_reduce = dm
+                .load_function(&format!("gqa_attention_tree_reduce_ctrl_{dtype}"))
+                .expect("exact reduce fn");
+            let f_nb = dm
+                .load_function(&format!("gqa_attention_tree_fused_nb_{dtype}"))
+                .expect("nb fn");
+            let f_comb = dm
+                .load_function("gqa_attention_combine_f32")
+                .expect("combine fn");
+            let mut d_sc: cudarc::driver::CudaSlice<f32> =
+                stream.alloc_zeros(scores_len).expect("sc");
+            let mut d_out_ref: cudarc::driver::CudaSlice<f32> =
+                stream.alloc_zeros(out_len).expect("out ref");
+            let mut d_out_fast: cudarc::driver::CudaSlice<f32> =
+                stream.alloc_zeros(out_len).expect("out fast");
+            let mut d_part: cudarc::driver::CudaSlice<f32> =
+                stream.alloc_zeros(part_len).expect("partials");
+
+            macro_rules! launch_all {
+                ($dk:expr, $dv:expr) => {{
+                    #[allow(unsafe_code)]
+                    {
+                        let mut l = stream.launch_builder(&f_scores);
+                        l.arg(&d_q)
+                            .arg($dk)
+                            .arg(&mut d_sc)
+                            .arg(&d_anc)
+                            .arg(&d_n_anc)
+                            .arg(&d_ctrl)
+                            .arg(&ss_i)
+                            .arg(&nh_i)
+                            .arg(&nhkv_i)
+                            .arg(&hd_i)
+                            .arg(&scale)
+                            .arg(&ma_i)
+                            .arg(&m_i);
+                        // SAFETY: ctrl scores signature; one-warp blocks.
+                        unsafe { l.launch(scores_cfg).expect("exact scores") };
+                        let mut l = stream.launch_builder(&f_reduce);
+                        l.arg($dv)
+                            .arg(&d_sc)
+                            .arg(&mut d_out_ref)
+                            .arg(&d_anc)
+                            .arg(&d_n_anc)
+                            .arg(&d_ctrl)
+                            .arg(&ss_i)
+                            .arg(&nh_i)
+                            .arg(&nhkv_i)
+                            .arg(&hd_i)
+                            .arg(&ma_i)
+                            .arg(&m_i);
+                        // SAFETY: ctrl reduce signature; blockDim.x == 128.
+                        unsafe { l.launch(reduce_cfg).expect("exact reduce") };
+                        let mut l = stream.launch_builder(&f_nb);
+                        l.arg(&d_q)
+                            .arg($dk)
+                            .arg($dv)
+                            .arg(&mut d_part)
+                            .arg(&d_anc)
+                            .arg(&d_n_anc)
+                            .arg(&d_ctrl)
+                            .arg(&nh_i)
+                            .arg(&nhkv_i)
+                            .arg(&hd_i)
+                            .arg(&scale)
+                            .arg(&ma_i)
+                            .arg(&m_i)
+                            .arg(&ns_i);
+                        // SAFETY: nb signature (q, k, v, partials, anc,
+                        // n_anc, ctrl, nh, nhkv, hd, scale, max_anc, m,
+                        // n_slice); blockDim.x == TREE_FUSED_THREADS.
+                        unsafe { l.launch(nb_cfg).expect("nb partial") };
+                        let mut l = stream.launch_builder(&f_comb);
+                        l.arg(&d_part)
+                            .arg(&mut d_out_fast)
+                            .arg(&nh_i)
+                            .arg(&hd_i)
+                            .arg(&m_i)
+                            .arg(&ns_i);
+                        // SAFETY: combine signature (partials, out, n_head,
+                        // head_dim, n, n_split); one warp per (row, head).
+                        unsafe { l.launch(comb_cfg).expect("nb combine") };
+                    }
+                }};
+            }
+            if dtype == "g" {
+                let d_k = stream.clone_htod(&kf).expect("k32");
+                let d_v = stream.clone_htod(&vf).expect("v32");
+                launch_all!(&d_k, &d_v);
+            } else {
+                let d_k = stream.clone_htod(&kh).expect("k16");
+                let d_v = stream.clone_htod(&vh).expect("v16");
+                launch_all!(&d_k, &d_v);
+            }
+
+            let o_ref = stream.clone_dtoh(&d_out_ref).expect("dtoh ref");
+            let o_fast = stream.clone_dtoh(&d_out_fast).expect("dtoh fast");
+            let mut worst = 0.0f32;
+            for (i, (&a, &b)) in o_fast.iter().zip(&o_ref).enumerate() {
+                assert!(
+                    a.is_finite(),
+                    "nb output not finite ({dtype}, hd={head_dim} \
+                     prefix={prefix_len}) at [{i}]: {a}"
+                );
+                let rel = (a - b).abs() / a.abs().max(b.abs()).max(1e-3);
+                if rel > worst {
+                    worst = rel;
+                }
+                assert!(
+                    rel <= 1e-4,
+                    "nb fast tier out of the RFC 0001 1e-4 bound \
+                     ({dtype}, hd={head_dim} prefix={prefix_len}) at [{i}]: \
+                     fast={a} exact={b} rel={rel:.3e}"
+                );
+            }
+            println!(
+                "tree nb {dtype} hd={head_dim} prefix={prefix_len} \
+                 n_slice={n_slice}: worst rel = {worst:.3e}"
+            );
+        }
+    }
+}
+
 /// Lever 6 kernel gate: the fast-tier fused twins over the PAGED and SLOTS
 /// tree routes (`gqa_attention_tree_fused_{ctrl_paged,slots,slots_paged}_{g,h}`)
 /// must stay within the RFC 0001 1e-4 max-rel bound against the exact
@@ -4098,12 +4318,35 @@ fn tree_fused_vs_exact_pair_kernel_abba_bench() {
             let f_fused = dm
                 .load_function(&format!("gqa_attention_tree_fused_ctrl_{dtype}"))
                 .expect("fused fn");
+            let f_nb = dm
+                .load_function(&format!("gqa_attention_tree_fused_nb_{dtype}"))
+                .expect("nb fn");
+            let f_comb = dm
+                .load_function("gqa_attention_combine_f32")
+                .expect("combine fn");
             let mut d_sc: cudarc::driver::CudaSlice<f32> =
                 stream.alloc_zeros(scores_len).expect("sc");
             let mut d_out_p: cudarc::driver::CudaSlice<f32> =
                 stream.alloc_zeros(out_len).expect("out p");
             let mut d_out_f: cudarc::driver::CudaSlice<f32> =
                 stream.alloc_zeros(out_len).expect("out f");
+            let mut d_out_b: cudarc::driver::CudaSlice<f32> =
+                stream.alloc_zeros(out_len).expect("out b");
+            let n_slice = kv_rows.div_ceil(consts::TREE_NB_SLICE).max(1);
+            let ns_i = n_slice as i32;
+            let mut d_part: cudarc::driver::CudaSlice<f32> = stream
+                .alloc_zeros(consts::TREE_NB_MAX_NODES * n_head * n_slice * (head_dim + 2))
+                .expect("nb partials");
+            let nb_cfg = LaunchConfig {
+                grid_dim: ((n_head * n_slice) as u32, 1, 1),
+                block_dim: (consts::TREE_FUSED_THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let comb_cfg = LaunchConfig {
+                grid_dim: ((m * n_head) as u32, 1, 1),
+                block_dim: (32, 1, 1),
+                shared_mem_bytes: 0,
+            };
 
             let d_k32 = stream.clone_htod(&kf).expect("k32");
             let d_v32 = stream.clone_htod(&vf).expect("v32");
@@ -4194,25 +4437,75 @@ fn tree_fused_vs_exact_pair_kernel_abba_bench() {
                 }
             };
 
-            // Warm both, then ABBA: pair, fused, fused, pair.
+            #[allow(unsafe_code)]
+            let mut run_nb = |timed: bool| -> f64 {
+                let t0 = Instant::now();
+                for _ in 0..ITERS {
+                    let mut l = stream.launch_builder(&f_nb);
+                    l.arg(&d_q);
+                    if dtype == "g" {
+                        l.arg(&d_k32).arg(&d_v32);
+                    } else {
+                        l.arg(&d_k16).arg(&d_v16);
+                    }
+                    l.arg(&mut d_part)
+                        .arg(&d_anc)
+                        .arg(&d_n_anc)
+                        .arg(&d_ctrl)
+                        .arg(&nh_i)
+                        .arg(&nhkv_i)
+                        .arg(&hd_i)
+                        .arg(&scale)
+                        .arg(&ma_i)
+                        .arg(&m_i)
+                        .arg(&ns_i);
+                    // SAFETY: nb signature; blockDim.x == TREE_FUSED_THREADS.
+                    unsafe { l.launch(nb_cfg).expect("nb partial") };
+                    let mut l = stream.launch_builder(&f_comb);
+                    l.arg(&d_part)
+                        .arg(&mut d_out_b)
+                        .arg(&nh_i)
+                        .arg(&hd_i)
+                        .arg(&m_i)
+                        .arg(&ns_i);
+                    // SAFETY: combine signature; one warp per (row, head).
+                    unsafe { l.launch(comb_cfg).expect("nb combine") };
+                }
+                stream.synchronize().expect("sync");
+                if timed {
+                    t0.elapsed().as_secs_f64() / ITERS as f64
+                } else {
+                    0.0
+                }
+            };
+
+            // Warm all three, then mirror ABBA: pair, fused, nb, nb, fused, pair.
             run_pair(false);
             run_fused(false);
+            run_nb(false);
             let p1 = run_pair(true);
             let f1 = run_fused(true);
+            let b1 = run_nb(true);
+            let b2 = run_nb(true);
             let f2 = run_fused(true);
             let p2 = run_pair(true);
-            let (p, f) = ((p1 + p2) / 2.0, (f1 + f2) / 2.0);
+            let (p, f, b) = ((p1 + p2) / 2.0, (f1 + f2) / 2.0, (b1 + b2) / 2.0);
             println!(
                 "[{dtype} prefix={prefix_len}] exact pair {:.1}us (A {:.1} B {:.1}) | \
-                 fused {:.1}us (A {:.1} B {:.1}) | fused/pair = {:.3} ({:+.1}%)",
+                 fused {:.1}us (A {:.1} B {:.1}) | nb+comb {:.1}us (A {:.1} B {:.1}) | \
+                 fused/pair = {:.3} | nb/fused = {:.3} ({:+.1}%)",
                 p * 1e6,
                 p1 * 1e6,
                 p2 * 1e6,
                 f * 1e6,
                 f1 * 1e6,
                 f2 * 1e6,
+                b * 1e6,
+                b1 * 1e6,
+                b2 * 1e6,
                 f / p,
-                (f / p - 1.0) * 100.0
+                b / f,
+                (b / f - 1.0) * 100.0
             );
         }
     }
@@ -6440,6 +6733,7 @@ fn adr_0022_twin_family_table_matches_decode_cu() {
         ("gqa_attention_tree_fused_ctrl_paged", 2),
         ("gqa_attention_tree_fused_slots", 2),
         ("gqa_attention_tree_fused_slots_paged", 2),
+        ("gqa_attention_tree_fused_nb", 2),
         ("lm_head_warp", 3),
     ];
     for (family, want) in table {
@@ -6452,7 +6746,7 @@ fn adr_0022_twin_family_table_matches_decode_cu() {
     }
     assert_eq!(
         names.len(),
-        107,
+        109,
         "decode.cu kernel count drifted from ADR 0022 — update the ADR \
          (65 → 64: gqa_attention_mdecode_f32 retired; 64 → 66: paged KV \
          twins added, ADR 0025 step 2; rmsnorm_quant_i8_fast was added and \
@@ -6510,7 +6804,15 @@ fn adr_0022_twin_family_table_matches_decode_cu() {
          instantiated per TreeCtrlAddr policy axis (the L6-s2 pattern), \
          RFC-bounded vs the exact pair of the SAME route by \
          tree_fused_addr_fast_tier_within_1e4_of_exact_pair; the exact \
-         paged/slots pairs are retained verbatim)"
+         paged/slots pairs are retained verbatim; 107 → 109: \
+         gqa_attention_tree_fused_nb_{{g,h}} — task-#65 node-blocked \
+         fast-tier partials: block per (head, prefix slice), the slice's \
+         K/V tiles decoded into shared ONCE and consumed by every node's \
+         warp (one node per warp, mb <= 8 — the long-ctx adaptive bucket; \
+         larger buckets keep the fused-ctrl body), ancestor tails on \
+         slice 0, partials folded by the EXISTING \
+         gqa_attention_combine_f32; same RFC 0001 fast-tier bounds, \
+         dense solo route only)"
     );
 }
 

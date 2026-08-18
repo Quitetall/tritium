@@ -1045,6 +1045,18 @@ impl CudaDecodeModel {
             } else {
                 None
             },
+            // Task-#65 node-blocked partials: bucket-independent size (the
+            // node cap x heads x static slice count), allocated once with
+            // the scratch when the opt-in is live.
+            d_nb_partials: if self.kernel_tier == KernelTier::Fast && self.tree_nb {
+                let n_slice = self.max_ctx.div_ceil(TREE_NB_SLICE);
+                Some(alloc(
+                    TREE_NB_MAX_NODES * self.n_head * n_slice * (self.head_dim + 2),
+                    "tree d_nb_partials",
+                )?)
+            } else {
+                None
+            },
         })
     }
 
@@ -1723,6 +1735,23 @@ impl CudaDecodeModel {
                 (true, false) => raw.attn_tree_fused_slots,
                 (true, true) => raw.attn_tree_fused_slots_paged,
             });
+        // Task #65 node-blocked variant: dense solo route, small buckets
+        // (one node per warp), opt-in — the slice-staged partial kernel plus
+        // the existing flash combine replace the fused body. The partials
+        // buffer was allocated with the scratch iff the opt-in was live.
+        let nb: Option<(sys::CUfunction, sys::CUfunction, sys::CUdeviceptr, usize)> =
+            (fused.is_some() && !slots && !paged && self.tree_nb && mb <= TREE_NB_MAX_NODES)
+                .then(|| {
+                    ts.d_nb_partials.as_ref().map(|b| {
+                        (
+                            raw.attn_tree_fused_nb,
+                            raw.attn_combine,
+                            dptr(b, s),
+                            self.max_ctx.div_ceil(TREE_NB_SLICE),
+                        )
+                    })
+                })
+                .flatten();
         // RFC 0001 Amendment 1 seam (TRITIUM_TREE_ATTN_DUMP, baked at scratch
         // alloc): snapshot d_attn per layer so the in-situ kernel-output
         // drift gate can compare the fast tier's fused attention against the
@@ -1732,6 +1761,43 @@ impl CudaDecodeModel {
         let dump_ptr: Option<sys::CUdeviceptr> = ts.d_attn_dump.as_ref().map(|d| dptr(d, s));
         let dump_stride = ts.m_cap * q_width;
         let attn = |kv_k: sys::CUdeviceptr, kv_v: sys::CUdeviceptr| {
+            if let Some((f_nb, f_comb, d_part, n_slice)) = nb {
+                // SAFETY: gqa_attention_tree_fused_nb_{g,h}(q, k, v,
+                // partials, anc, n_anc, ctrl, n_head, n_head_kv, head_dim,
+                // scale, max_anc, m, n_slice) — grid (n_head*n_slice), block
+                // TREE_FUSED_THREADS, static smem; then the flash combine
+                // gqa_attention_combine_f32(partials, out, n_head, head_dim,
+                // n = mb, n_split = n_slice) — one warp per (node, head).
+                let ns_i = n_slice as i32;
+                let grid = ((n_head * n_slice) as u32, 1, 1);
+                let mut params = [
+                    pp(&d_q),
+                    pp(&kv_k),
+                    pp(&kv_v),
+                    pp(&d_part),
+                    pp(&d_anc),
+                    pp(&d_nanc),
+                    pp(&d_ctrl),
+                    pp(&nh_i),
+                    pp(&nhkv_i),
+                    pp(&hd_i),
+                    pp(&scale),
+                    pp(&ma_i),
+                    pp(&mb_i),
+                    pp(&ns_i),
+                ];
+                raw_launch(f_nb, grid, (TREE_FUSED_THREADS, 1, 1), 0, cs, &mut params)?;
+                let cgrid = ((mb * n_head) as u32, 1, 1);
+                let mut cparams = [
+                    pp(&d_part),
+                    pp(&d_attn),
+                    pp(&nh_i),
+                    pp(&hd_i),
+                    pp(&mb_i),
+                    pp(&ns_i),
+                ];
+                return raw_launch(f_comb, cgrid, (32, 1, 1), 0, cs, &mut cparams);
+            }
             if let Some(ff) = fused {
                 // SAFETY: matches the fused family's signature — dense/slots
                 // `(q, k, v, out, anc, n_anc, ctrl, n_head, n_head_kv,

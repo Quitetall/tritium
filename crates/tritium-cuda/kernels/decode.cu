@@ -2654,6 +2654,231 @@ static __device__ __forceinline__ void gqa_attention_tree_fused_ctrl_body(
   }
 }
 
+
+// ── Node-blocked fast-tier tree attention (task #65, "flash-decoding for
+// trees"). The fused body above walks the WHOLE [0, ctx) K/V range once per
+// (node, head) block — a verify of mb nodes streams the shared prefix mb
+// times per head out of L2, and the kernel is latency-bound, not
+// compute-bound (~2% of f32 peak, 5.3x ctx slope at the m=8 bucket:
+// 39.7 -> 210.9 us/layer f16 from prefix 512 -> 3968, 2026-08-18 ABBA).
+// This variant blocks over (head, prefix SLICE) instead: each 32-key tile
+// of the slice is DECODED into shared once and every node's warp consumes
+// the staged tile — the per-warp serial chains shorten from L2 latency to
+// smem latency and the KV codec amortizes mb-fold. Per-node ancestor tails
+// (<= max_anc keys, node-specific) ride slice 0 unstaged in the original
+// per-warp pattern. Each (node, head, slice) emits a flash partial
+// {acc[head_dim], m, l}; gqa_attention_combine_f32 (the M=N decode pair's
+// combine, row = node, n_split = n_slice) folds them — identity partials
+// (m = -inf) for empty slices and pad nodes, whose combined rows come out
+// zero and are discarded (the trunk tail runs at real m).
+//
+// Numerics: the same RFC 0001 fast-tier class as the fused body — online
+// softmax with fmaf folds + exp_f32, <=1e-4 vs the exact pair, gated
+// isolated and in situ; tree-verify ACCEPTANCE arithmetic untouched.
+//
+// v1 scope (host-guarded in tree.rs): DENSE solo ctrl route only,
+// mb <= TREE_NB_MAX_NODES (ONE NODE PER WARP — the long-ctx adaptive
+// regime's bucket; larger buckets keep the fused body), head_dim % 4 == 0,
+// head_dim <= 128, blockDim.x == TREE_FUSED_THREADS. grid =
+// (n_head * n_slice, 1) with n_slice = ceil(max_ctx / TREE_NB_SLICE) STATIC
+// (graph capture); slices past the live prefix write identity partials, so
+// the static grid replays at every context length.
+#define TREE_NB_SLICE 512
+#define TREE_NB_MAX_NODES 8
+
+template <class C>
+static __device__ __forceinline__ void gqa_attention_tree_fused_nb_body(
+    const float* __restrict__ q, const typename C::T* __restrict__ k,
+    const typename C::T* __restrict__ v, float* __restrict__ partials,
+    const int* __restrict__ anc, const int* __restrict__ n_anc,
+    const int* __restrict__ tree_ctrl, const int n_head, const int n_head_kv,
+    const int head_dim, const float scale, const int max_anc, const int m,
+    const int n_slice) {
+  // Staged tile: 32 keys x (head_dim/4) f32 quads, row stride 33 quads.
+  __shared__ float4 s_kv[32][33];
+  const int h = blockIdx.x / n_slice;
+  const int sl = blockIdx.x - h * n_slice;
+  const int prefix_len = tree_ctrl[0];
+  const int real_m = tree_ctrl[1];
+  const int w2 = tree_ctrl[2];  // dense KV row base
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const int n_rep = n_head / n_head_kv;
+  const int kv = h / n_rep;
+  const int nq = head_dim >> 2;  // lane l owns dim quad l (l < nq)
+  const bool live = lane < nq;
+  const int row = warp;  // ONE NODE PER WARP (v1 contract: mb <= 8)
+  const bool node_live = row < m && row < real_m;
+
+  const float4* qv =
+      (const float4*)(q + ((long long)row * n_head + h) * head_dim);
+
+  float m_w = -INFINITY;
+  float s_w = 0.0f;
+  float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
+
+  // This slice's prefix key range (empty for slices past the live prefix).
+  const int start = sl * TREE_NB_SLICE;
+  const int end = min(start + TREE_NB_SLICE, prefix_len);
+  for (int t0 = start; t0 < end; t0 += 32) {
+    const int tn = min(32, end - t0);
+    // Stage + DECODE the K tile cooperatively (all 256 threads, dead-node
+    // warps included — they must reach every barrier).
+    for (int idx = threadIdx.x; idx < (tn << 5); idx += TREE_FUSED_THREADS) {
+      const int kr = idx >> 5;   // staged key row
+      const int d = idx & 31;    // quad
+      if (d < nq) {
+        const typename C::Row src =
+            C::row(k, (((long long)w2 + t0 + kr) * n_head_kv + kv) * head_dim);
+        s_kv[kr][d] = C::load4(src, d);
+      }
+    }
+    __syncthreads();
+    // Lane-per-key dots against the staged tile.
+    float sc_l = -INFINITY;
+    if (node_live && lane < tn) {
+      float dot = 0.0f;
+#pragma unroll 8
+      for (int d = 0; d < nq; ++d) {
+        const float4 qd = qv[d];
+        const float4 a = s_kv[lane][d];
+        dot = fmaf(qd.x, a.x, dot);
+        dot = fmaf(qd.y, a.y, dot);
+        dot = fmaf(qd.z, a.z, dot);
+        dot = fmaf(qd.w, a.w, dot);
+      }
+      sc_l = dot * scale;
+    }
+    float tmax = sc_l;
+    for (int off = 16; off > 0; off >>= 1) {
+      tmax = fmaxf(tmax, __shfl_xor_sync(0xffffffffu, tmax, off));
+    }
+    float p_l = 0.0f;
+    if (node_live) {
+      const float new_m = fmaxf(m_w, tmax);
+      if (new_m != m_w) {
+        const float c = exp_f32(m_w - new_m);
+        s_w *= c;
+        acc.x *= c;
+        acc.y *= c;
+        acc.z *= c;
+        acc.w *= c;
+        m_w = new_m;
+      }
+      p_l = (lane < tn) ? exp_f32(sc_l - m_w) : 0.0f;
+      float psum = p_l;
+      for (int off = 16; off > 0; off >>= 1) {
+        psum += __shfl_xor_sync(0xffffffffu, psum, off);
+      }
+      s_w += psum;
+    }
+    __syncthreads();  // all warps done reading K before V overwrites
+    // Stage + decode the V tile into the same buffer.
+    for (int idx = threadIdx.x; idx < (tn << 5); idx += TREE_FUSED_THREADS) {
+      const int kr = idx >> 5;
+      const int d = idx & 31;
+      if (d < nq) {
+        const typename C::Row src =
+            C::row(v, (((long long)w2 + t0 + kr) * n_head_kv + kv) * head_dim);
+        s_kv[kr][d] = C::load4(src, d);
+      }
+    }
+    __syncthreads();
+    // V fold: key-by-key in tile order from shared (weight broadcast).
+    if (node_live) {
+      for (int jj = 0; jj < tn; ++jj) {
+        const float w = __shfl_sync(0xffffffffu, p_l, jj);
+        if (live) {
+          const float4 vv = s_kv[jj][lane];
+          acc.x = fmaf(w, vv.x, acc.x);
+          acc.y = fmaf(w, vv.y, acc.y);
+          acc.z = fmaf(w, vv.z, acc.z);
+          acc.w = fmaf(w, vv.w, acc.w);
+        }
+      }
+    }
+    __syncthreads();  // fold done before the next K stage overwrites
+  }
+
+  // Slice 0 carries each node's ancestor tail (node-specific rows at the
+  // region top; <= max_anc keys) in the fused body's original unstaged
+  // per-warp pattern — warp-local only, no barriers.
+  if (sl == 0 && node_live) {
+    const int* arow = anc + (long long)row * max_anc;
+    const int na = n_anc[row];
+    for (int t0 = 0; t0 < na; t0 += 32) {
+      const int tn = min(32, na - t0);
+      float sc_l = -INFINITY;
+      if (lane < tn) {
+        const long long slot = (long long)w2 + arow[t0 + lane];
+        const typename C::Row kr = C::row(k, (slot * n_head_kv + kv) * head_dim);
+        float dot = 0.0f;
+#pragma unroll 8
+        for (int d = 0; d < nq; ++d) {
+          const float4 qd = qv[d];
+          const float4 a = C::load4(kr, d);
+          dot = fmaf(qd.x, a.x, dot);
+          dot = fmaf(qd.y, a.y, dot);
+          dot = fmaf(qd.z, a.z, dot);
+          dot = fmaf(qd.w, a.w, dot);
+        }
+        sc_l = dot * scale;
+      }
+      float tmax = sc_l;
+      for (int off = 16; off > 0; off >>= 1) {
+        tmax = fmaxf(tmax, __shfl_xor_sync(0xffffffffu, tmax, off));
+      }
+      const float new_m = fmaxf(m_w, tmax);
+      if (new_m != m_w) {
+        const float c = exp_f32(m_w - new_m);
+        s_w *= c;
+        acc.x *= c;
+        acc.y *= c;
+        acc.z *= c;
+        acc.w *= c;
+        m_w = new_m;
+      }
+      const float p_l = (lane < tn) ? exp_f32(sc_l - m_w) : 0.0f;
+      float psum = p_l;
+      for (int off = 16; off > 0; off >>= 1) {
+        psum += __shfl_xor_sync(0xffffffffu, psum, off);
+      }
+      s_w += psum;
+      for (int jj = 0; jj < tn; ++jj) {
+        const float w = __shfl_sync(0xffffffffu, p_l, jj);
+        const long long slot = (long long)w2 + arow[t0 + jj];
+        if (live) {
+          const typename C::Row vr = C::row(v, (slot * n_head_kv + kv) * head_dim);
+          const float4 vv = C::load4(vr, lane);
+          acc.x = fmaf(w, vv.x, acc.x);
+          acc.y = fmaf(w, vv.y, acc.y);
+          acc.z = fmaf(w, vv.z, acc.z);
+          acc.w = fmaf(w, vv.w, acc.w);
+        }
+      }
+    }
+  }
+
+  // Emit the flash partial (identity for dead/pad nodes and empty slices:
+  // m stayed -inf, s 0, acc 0 — the combine skips them; a whole-identity
+  // node combines to a zero row, discarded like every pad output).
+  // Scalar stores: the (head_dim + 2)-float partial stride is not 16-byte
+  // aligned, so a float4 store at row offsets faults (misaligned address).
+  float* part = partials +
+                (((long long)row * n_head + h) * n_slice + sl) * (head_dim + 2);
+  if (live) {
+    const int d0 = lane << 2;
+    part[d0 + 0] = acc.x;
+    part[d0 + 1] = acc.y;
+    part[d0 + 2] = acc.z;
+    part[d0 + 3] = acc.w;
+  }
+  if (lane == 0) {
+    part[head_dim] = node_live ? m_w : -INFINITY;
+    part[head_dim + 1] = node_live ? s_w : 0.0f;
+  }
+}
+
 extern "C" {
 
 __global__ void gqa_attention_scores_g(const float* __restrict__ q,
@@ -2791,6 +3016,37 @@ __global__ void gqa_attention_tree_fused_ctrl_g(
   gqa_attention_tree_fused_ctrl_body<KvLoadF32, TreeCtrlAddr<false, false>>(
       q, k, v, out, anc, n_anc, tree_ctrl, nullptr, n_head, n_head_kv,
       head_dim, scale, max_anc, m);
+}
+
+// gqa_attention_tree_fused_nb_g / _h — node-blocked fast-tier partials (see
+// the body's contract above). REQUIRES blockDim.x == TREE_FUSED_THREADS,
+// head_dim % 4 == 0, head_dim <= 128, m <= TREE_NB_MAX_NODES, dense solo
+// ctrl. Pair with gqa_attention_combine_f32 (n = m bucket, n_split =
+// n_slice).
+__global__ void gqa_attention_tree_fused_nb_g(
+    const float* __restrict__ q, const float* __restrict__ k,
+    const float* __restrict__ v, float* __restrict__ partials,
+    const int* __restrict__ anc, const int* __restrict__ n_anc,
+    const int* __restrict__ tree_ctrl, const int n_head, const int n_head_kv,
+    const int head_dim, const float scale, const int max_anc, const int m,
+    const int n_slice) {
+  gqa_attention_tree_fused_nb_body<KvLoadF32>(q, k, v, partials, anc, n_anc,
+                                              tree_ctrl, n_head, n_head_kv,
+                                              head_dim, scale, max_anc, m,
+                                              n_slice);
+}
+
+__global__ void gqa_attention_tree_fused_nb_h(
+    const float* __restrict__ q, const __half* __restrict__ k,
+    const __half* __restrict__ v, float* __restrict__ partials,
+    const int* __restrict__ anc, const int* __restrict__ n_anc,
+    const int* __restrict__ tree_ctrl, const int n_head, const int n_head_kv,
+    const int head_dim, const float scale, const int max_anc, const int m,
+    const int n_slice) {
+  gqa_attention_tree_fused_nb_body<KvLoadF16>(q, k, v, partials, anc, n_anc,
+                                              tree_ctrl, n_head, n_head_kv,
+                                              head_dim, scale, max_anc, m,
+                                              n_slice);
 }
 
 // ─── f16 KV-cache twins (ADR 0020, rung 1) — every kernel that touches the

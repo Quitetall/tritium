@@ -164,6 +164,12 @@ pub(super) const KERNEL_NAME_ATTN_TREE_REDUCE_CTRL_H: &str = "gqa_attention_tree
 /// the `_paged`/`_slots[_paged]` names below).
 pub(super) const KERNEL_NAME_ATTN_TREE_FUSED_CTRL: &str = "gqa_attention_tree_fused_ctrl_g";
 pub(super) const KERNEL_NAME_ATTN_TREE_FUSED_CTRL_H: &str = "gqa_attention_tree_fused_ctrl_h";
+pub(super) const KERNEL_NAME_ATTN_TREE_FUSED_NB: &str = "gqa_attention_tree_fused_nb_g";
+pub(super) const KERNEL_NAME_ATTN_TREE_FUSED_NB_H: &str = "gqa_attention_tree_fused_nb_h";
+/// Node-blocked tree partials: prefix keys per slice (keep in sync with
+/// decode.cu's TREE_NB_SLICE) and the one-node-per-warp bucket cap.
+pub(super) const TREE_NB_SLICE: usize = 512;
+pub(super) const TREE_NB_MAX_NODES: usize = 8;
 pub(super) const KERNEL_NAME_ATTN_TREE_FUSED_CTRL_PAGED: &str =
     "gqa_attention_tree_fused_ctrl_paged_g";
 pub(super) const KERNEL_NAME_ATTN_TREE_FUSED_CTRL_PAGED_H: &str =

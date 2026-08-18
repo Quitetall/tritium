@@ -659,6 +659,10 @@ struct TreeScratch {
     /// allocated; when present, graph capture bakes one dtod node per layer
     /// (graph route only — see [`CudaDecodeModel::tree_attn_dump`]).
     d_attn_dump: Option<CudaSlice<f32>>,
+    /// Task-#65 node-blocked partials `[TREE_NB_MAX_NODES · n_head · n_slice,
+    /// head_dim + 2]` f32 (n_slice = ceil(max_ctx / TREE_NB_SLICE)). `None`
+    /// unless the model was built under the fast tier with TRITIUM_TREE_NB=1.
+    d_nb_partials: Option<CudaSlice<f32>>,
 }
 
 /// Padded tree sizes with a captured verify-trunk graph. A verify with
@@ -835,6 +839,10 @@ pub struct CudaDecodeModel {
     /// dense single-slot graph route); `Exact` (default) is the ADR 0018
     /// bit-exact contract everywhere.
     kernel_tier: KernelTier,
+    /// Task-#65 opt-in (TRITIUM_TREE_NB=1, parsed at build): under the fast
+    /// tier, small-bucket dense solo verifies capture the node-blocked
+    /// partial+combine pair instead of the fused-ctrl body.
+    tree_nb: bool,
     /// i8-rung per-group scales, `[max_ctx, n_head_kv, head_dim/KV_QGROUP]`
     /// f32 per layer per direction; empty vecs on other rungs.
     kv_k_scales: Vec<CudaSlice<f32>>,
