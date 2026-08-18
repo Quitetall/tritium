@@ -2164,6 +2164,12 @@ fn cuda_draft_chain_flash_matches_per_step() {
         eprintln!("skipping: {} absent (drafter-gated test)", *DRAFTER_PATH);
         return;
     }
+    // The flash profile refuses the scale KV rungs (no q8 twin) — skip
+    // rather than fail under an ambient TRITIUM_KV=i8|t2.
+    if matches!(std::env::var("TRITIUM_KV").as_deref(), Ok("i8") | Ok("t2")) {
+        eprintln!("skipping: flash profile has no q8 twin (TRITIUM_KV scale rung set)");
+        return;
+    }
     let bytes = std::fs::read(&*DRAFTER_PATH).expect("read drafter gguf");
     let Some(mut r_step) = load_on("cuda", &bytes) else {
         return;

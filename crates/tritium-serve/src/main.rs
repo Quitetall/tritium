@@ -730,7 +730,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             match std::env::var("TRITIUM_DRAFT_ATTN") {
                 Err(std::env::VarError::NotPresent) => {}
                 Ok(v) if v == "exact" => {}
-                Ok(v) if v == "flash" => d.set_m1_flash_attention(true),
+                Ok(v) if v == "flash" => {
+                    d.set_m1_flash_attention(true);
+                    // Force the resident build NOW: the profile's config
+                    // errors (e.g. a scale KV rung, which the flash pair
+                    // refuses) must fail AT STARTUP — the lazy build would
+                    // otherwise swallow the refusal into the per-call draft
+                    // fallback and silently serve the slowest exact path
+                    // under a flash request (ADR 0021: a draft must never
+                    // silently degrade; review 879af54d F1).
+                    match d.try_resident_decoder() {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            return Err("TRITIUM_DRAFT_ATTN=flash: the draft model has no \
+                                        resident decoder"
+                                .into());
+                        }
+                        Err(e) => return Err(format!("TRITIUM_DRAFT_ATTN=flash: {e}").into()),
+                    }
+                }
                 Ok(v) => {
                     return Err(
                         format!("TRITIUM_DRAFT_ATTN={v:?} — use exact (default) or flash").into(),

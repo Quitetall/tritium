@@ -1006,6 +1006,16 @@ impl CudaDecodeModel {
                     .into(),
             ));
         }
+        // The split kernel's per-lane accumulator is acc[SPLIT_MAX_HD_PER_LANE
+        // = 8] over 32 lanes — head_dim past 256 would overflow the register
+        // array (UB). No shipped model comes close; refuse rather than trust.
+        if on && self.head_dim > 256 {
+            return Err(BackendError::InvalidInput(format!(
+                "set_m1_flash_attention: head_dim {} > 256 (the split kernel's \
+                 per-lane accumulator bound)",
+                self.head_dim
+            )));
+        }
         if on && self.m1_flash_partials.is_none() {
             let n_split = self.max_ctx.div_ceil(ATTN_SPLIT_CHUNK);
             let elems = self.n_head * n_split * (self.head_dim + 2);
