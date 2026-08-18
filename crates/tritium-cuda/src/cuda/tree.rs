@@ -1743,6 +1743,14 @@ impl CudaDecodeModel {
             (fused.is_some() && !slots && !paged && self.tree_nb && mb <= TREE_NB_MAX_NODES)
                 .then(|| {
                     ts.d_nb_partials.as_ref().map(|b| {
+                        // Loud-once per bucket capture: engagement proof for
+                        // the e2e A/B — the opt-in silently not firing is
+                        // the failure mode a contended run cannot
+                        // distinguish from "no effect".
+                        eprintln!(
+                            "tritium-cuda: tree verify capture bucket {mb}: \
+                             node-blocked fast tier (TRITIUM_TREE_NB=1)"
+                        );
                         (
                             raw.attn_tree_fused_nb,
                             raw.attn_combine,
