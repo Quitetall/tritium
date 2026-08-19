@@ -68,12 +68,6 @@ pub struct ModelRunner {
     /// so a non-CUDA backend probes the downcast exactly once.
     #[cfg(feature = "cuda")]
     resident_probed: bool,
-    /// (cuda) DRAFTER profile: route the resident's M=1 graph attention
-    /// through the flash split/combine pair (see
-    /// [`set_m1_flash_attention`](Self::set_m1_flash_attention)). Applied at
-    /// resident build.
-    #[cfg(feature = "cuda")]
-    m1_flash_attention: bool,
 }
 
 impl ModelRunner {
@@ -147,8 +141,6 @@ impl ModelRunner {
             resident: None,
             #[cfg(feature = "cuda")]
             resident_probed: false,
-            #[cfg(feature = "cuda")]
-            m1_flash_attention: false,
         })
     }
 
@@ -595,26 +587,6 @@ impl ModelRunner {
         }
     }
 
-    /// Opt this runner's M=1 GRAPH decode attention into the flash
-    /// split/combine pair (the DRAFTER profile — proposals-only models; the
-    /// pair is ctx-parallel but NOT bit-identical to the exact pair, so a
-    /// target model serving bit-pinned plain decode must never opt in).
-    /// Applied when the resident decoder is (re)built; any existing resident
-    /// is invalidated so the next forward rebuilds under the profile. On a
-    /// non-CUDA backend this is a stored no-op (the host path has no flash
-    /// pair). A scale KV rung (TRITIUM_KV=i8|t2) is refused loudly at build.
-    pub fn set_m1_flash_attention(&mut self, on: bool) {
-        #[cfg(feature = "cuda")]
-        {
-            self.m1_flash_attention = on;
-            self.invalidate_resident();
-        }
-        #[cfg(not(feature = "cuda"))]
-        {
-            let _ = on;
-        }
-    }
-
     /// Run one prefill / decode step over `tokens` at absolute positions
     /// `positions`, returning the next-token logits `[vocab]` for the last token.
     ///
@@ -912,17 +884,9 @@ impl ModelRunner {
         let Some(spec) = Self::build_decode_spec(&self.weights, &self.config) else {
             return Ok(false);
         };
-        let mut model = cuda
+        let model = cuda
             .build_decode_model(&spec)
             .map_err(|e| NnError::Backend(e.to_string()))?;
-        if self.m1_flash_attention {
-            // Before any capture (the model is fresh); a scale KV rung is a
-            // config error — refuse loudly rather than silently serving the
-            // exact pair under a flash-profile request.
-            model
-                .set_m1_flash_attention(true)
-                .map_err(|e| NnError::Backend(e.to_string()))?;
-        }
         self.resident = Some(model);
         Ok(true)
     }

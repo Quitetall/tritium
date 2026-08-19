@@ -67,8 +67,8 @@ at the named commits; kernel benches are in-tree harnesses.
 | lever | state | measured (quiet box) | scope |
 |---|---|---|---|
 | delta re-sync (f355b795) | **ADOPTED**, on by default | probe re-entry **6.22 ms vs 71.27 ms** full re-prefill at the ctx-4032/gap-64 shape (11.5×; masked catch-up 145.8 ms); drafts token-identical to the full path | kept multi-spec rows with gap < dpos; short-prefix rows keep the full path |
-| node-blocked tree attention (69f4aec3) | kernel-proven, **opt-in `TRITIUM_TREE_NB=1`**, e2e A/B owed | fused→NB @ prefix 3968: **221.2 → 131.5 µs/layer f16 (−40.6%)**, 228.3 → 139.1 g (−39.1%); prefix 512: +109% (underoccupied — long-ctx only) | fast tier, dense solo route, buckets ≤ 8; dual-graph prefix dispatch is the adoption follow-up |
-| drafter flash profile (879af54d) | mechanism shipped, **opt-in `TRITIUM_DRAFT_ATTN=flash`**, e2e A/B owed | chain==per-step gated under the profile; no quiet perf number yet | solo drafter M=1 graph attention |
+| node-blocked tree attention (69f4aec3) | **ADOPTED for long-ctx serving** via opt-in `TRITIUM_TREE_NB=1` (default off pending dual-graph dispatch) | kernel: fused→NB @ prefix 3968 **221.2 → 131.5 µs/layer f16 (−40.6%)**, 228.3 → 139.1 g (−39.1%); prefix 512 +109%; **e2e §4: +9.9%** (1.523 vs 1.386, verify EWMA −16%) | fast tier, dense solo route, buckets ≤ 8 |
+| drafter flash profile (879af54d) | **REFUTED and DELETED** (§4: e2e −2.6%, drafter +7%/step — the rmsnorm_fast precedent) | measured loss at its one motivating shape; the drafter's long-ctx step cost is NOT attention-dominated | removed; kernels (the shipped M=N pair) unaffected |
 | TB1 LUT decode (848d2f36) | **REFUTED — integration not considered** | see §3 | task #58 closed with the sharper mechanism |
 
 #### 1. Delta re-sync (drafter_catchup_bench, quiet box)
@@ -132,15 +132,50 @@ considered. First-ever L2-defeated TB1 row (the round-16 verdict was
 resident-only), closing the bitmap+signs half of ADR 0036's L7 A/B (the TQ1 half is the
 08-08 entry's §6 serve rows).
 
+#### 4. Serve-level e2e A/B (2026-08-19, opportunistic quiet legs)
+
+The parallel session's training campaign held the GPU for ~14 h; the legs ran
+in a validated-quiet window (per-leg gates: 3×<15% util pre, <15% post after
+a 4 s settle, warm plain reference < 15 s, spec wall < 26 s; every leg passed
+all four). Protocol: plain reference server (8125, default env, warm,
+constant); spec server (8124) relaunched per leg with
+`TRITIUM_SPEC_ADAPTIVE=0 TRITIUM_KERNEL_TIER=fast TRITIUM_KV=f16
+TRITIUM_DRAFT_K=legacy` (legacy k pins bucket 8 so the NB capture engages —
+verified per leg via the c5431fad capture line) + the leg's knobs; per leg
+one discarded warm pass then 3 recorded 3,520-token wt103 prompts × 256
+greedy. Mirror order B F N X X N F B:
+
+| config | e2e vs plain (2 visits) | spec wall | verify EWMA ms | drafter ms/tok | τ |
+|---|---|---:|---:|---:|---:|
+| B baseline | 1.385 / 1.388 | 8.15 / 8.15 s | 11.76 / 11.91 | 1.97 / 1.95 | 3.547 |
+| F `TRITIUM_DRAFT_ATTN=flash` | 1.350 / 1.349 | 8.38 / 8.38 s | 11.88 / 11.91 | 2.11 / 2.10 | 3.559 |
+| N `TRITIUM_TREE_NB=1` | **1.525 / 1.521** | **7.42 / 7.44 s** | **9.98 / 9.93** | 1.95 / 2.01 | 3.597 |
+| X both | 1.371 / 1.331 | 8.50 / 8.51 s | 8.60 / 8.64 | 2.06 / 2.11 | 3.116 |
+
+Verdicts. (1) **NB: +9.9% e2e** (means 1.523 vs 1.386), verify EWMA −16%,
+spec wall −8.8% — clears the 3% bar; ADOPTED for long-ctx serving as the
+opt-in (default-on still needs the per-prefix dual-graph dispatch; the
++109% short-prefix kernel loss stands). τ shifts 3.547→3.597 because the
+fast tier's ≤1e-4 verify drift flips occasional near-tie acceptances —
+deterministic per config, and losslessness is the verifier's as always.
+(2) **Flash: a measured LOSS** — e2e −2.6%, drafter +7%/step, reproducing
+the contaminated-run signal: the drafter's long-ctx step cost is NOT
+attention-dominated at this shape. Per the rmsnorm_fast precedent
+(measured, rejected, deleted) the profile is REMOVED in this commit; the
+M=N flash kernels it reused are untouched. (3) X inherits flash's loss
+(and a flash-shifted τ 3.116) — moot with flash deleted. Cross-check: the
+per-visit reproducibility is ±0.3% on every metric, tighter than any ABBA
+this campaign — the leg gates work.
+
+Note: e2e ratios here are NOT comparable to the round-30 §4a absolutes
+(different harness: fresh-spec-server legs with a discarded warm pass + a
+persistently-warm plain reference + legacy-k, vs measure_tau_ctx's
+cold-discard protocol) — within-table comparisons only.
+
 #### Caveats + owed
 
-- The serve-level e2e A/B for the NB kernel and the flash drafter profile
-  (mirrored B/F/N/X legs at long ctx, `TRITIUM_DRAFT_K=legacy` to pin
-  bucket 8) is OWED: two attempts were contaminated mid-run by a parallel
-  session's GPU jobs and discarded. One honest signal from the contaminated
-  run, to be re-tested quiet: drafter ms/token did NOT move under flash —
-  if that reproduces, the drafter's ctx cost is not attention-dominated and
-  flash gets recorded as a no-win.
+- (resolved 2026-08-19) The previously-owed e2e A/B landed as §4; the
+  contaminated-run flash signal reproduced quiet and the profile is deleted.
 - The NB kernel's +109% at prefix 512 means `TRITIUM_TREE_NB=1` must not be
   set for short-ctx serving; adoption (default-on) requires the per-prefix
   dual-graph dispatch.

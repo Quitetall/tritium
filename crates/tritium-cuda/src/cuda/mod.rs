@@ -911,18 +911,6 @@ pub struct CudaDecodeModel {
     /// Prefill M at/above which the IMMA path dispatches
     /// (`TRITIUM_IMMA_MIN_M`, default 32 — the tuned dp4a/IMMA crossover).
     imma_min_m: usize,
-    /// DRAFTER profile (opt-in via [`Self::set_m1_flash_attention`]): route
-    /// the M=1 decode attention through the flash `split_partial`/`combine`
-    /// pair (ctx-parallel online softmax, the M=N batched-decode kernels)
-    /// instead of the exact `scores`/`reduce` pair. NOT bit-identical to the
-    /// exact pair (chunked online-softmax order) — proposals-only models
-    /// (spec drafters) opt in; the target's plain decode stays exact.
-    m1_flash: bool,
-    /// Flash partials scratch `[n_head · n_split, head_dim + 2]` f32,
-    /// allocated by [`Self::set_m1_flash_attention`] (before any capture, so
-    /// the pointer is stable across graph replays). `None` while `m1_flash`
-    /// is off.
-    m1_flash_partials: Option<CudaSlice<f32>>,
 }
 
 impl core::fmt::Debug for CudaDecodeModel {
@@ -978,63 +966,6 @@ impl CudaDecodeModel {
     #[must_use]
     pub fn cache_len(&self) -> usize {
         self.cache_len
-    }
-
-    /// Opt this model's M=1 decode attention into the flash
-    /// `split_partial`/`combine` pair (the M=N batched-decode kernels,
-    /// ctx-parallel online softmax) instead of the exact `scores`/`reduce`
-    /// pair. The DRAFTER profile: proposals-only models trade the exact
-    /// pair's bit-pinned (and ctx-serial) reduce for a ~ctx-parallel one —
-    /// NOT bit-identical to the exact pair, so the target's plain decode
-    /// must never opt in (its greedy-identity gates pin the exact pair).
-    ///
-    /// Call BEFORE the first decode step: graphs bake the picked kernels at
-    /// capture, so flipping after a capture exists is refused rather than
-    /// silently ignored. Scope: the GRAPH decode path (`step_graph`,
-    /// `decode_greedy_step`/`_chain` — everything the drafter's serving path
-    /// uses); the eager `step()` keeps the exact pair (it is never on the
-    /// resident drafter's path).
-    ///
-    /// # Errors
-    /// [`BackendError::InvalidInput`] if a decode graph was already
-    /// captured, or (when enabling) the KV rung is a scale rung (i8/t2 —
-    /// the flash pair has no q8 twin).
-    pub fn set_m1_flash_attention(&mut self, on: bool) -> Result<(), BackendError> {
-        if self.graph.is_some() {
-            return Err(BackendError::InvalidInput(
-                "set_m1_flash_attention: a decode graph is already captured — \
-                 set the profile before the first decode step"
-                    .into(),
-            ));
-        }
-        if on && self.kv_dtype.has_scales() {
-            return Err(BackendError::InvalidInput(
-                "set_m1_flash_attention: the flash pair has no q8 twin — \
-                 use TRITIUM_KV=f32|f16 for a flash-profile drafter"
-                    .into(),
-            ));
-        }
-        // The split kernel's per-lane accumulator is acc[SPLIT_MAX_HD_PER_LANE
-        // = 8] over 32 lanes — head_dim past 256 would overflow the register
-        // array (UB). No shipped model comes close; refuse rather than trust.
-        if on && self.head_dim > 256 {
-            return Err(BackendError::InvalidInput(format!(
-                "set_m1_flash_attention: head_dim {} > 256 (the split kernel's \
-                 per-lane accumulator bound)",
-                self.head_dim
-            )));
-        }
-        if on && self.m1_flash_partials.is_none() {
-            let n_split = self.max_ctx.div_ceil(ATTN_SPLIT_CHUNK);
-            let elems = self.n_head * n_split * (self.head_dim + 2);
-            self.m1_flash_partials = Some(
-                self.stream
-                    .alloc_zeros::<f32>(elems)
-                    .map_err(|e| driver_err("m1 flash partials alloc", &e))?,
-            );
-        }
-        self.m1_flash = on;
-        Ok(())
     }
 
     /// Run one M=1 decode step for `token` at absolute position `pos`, returning the
@@ -3608,7 +3539,6 @@ impl CudaDecodeModel {
             d_token_embd_i8: self.d_token_embd_i8.as_ref().map_or(0, |b| dptr(b, s)),
             d_lm_head_scales: self.d_lm_head_scales.as_ref().map_or(0, |b| dptr(b, s)),
             d_output_norm: dptr(&self.d_output_norm, s),
-            d_flash_partials: self.m1_flash_partials.as_ref().map_or(0, |b| dptr(b, s)),
         };
         // Drain the events the device_ptr extraction recorded, so the capture (which
         // uses only raw launches) carries no pre-capture dependency.
@@ -3676,15 +3606,7 @@ impl CudaDecodeModel {
             p.d_ctrl,
         )?;
         self.g_attn(
-            q_ptr,
-            l.kv_k,
-            l.kv_v,
-            l.kv_k_sc,
-            l.kv_v_sc,
-            p.d_attn,
-            p.d_scores,
-            p.d_ctrl,
-            p.d_flash_partials,
+            q_ptr, l.kv_k, l.kv_v, l.kv_k_sc, l.kv_v_sc, p.d_attn, p.d_scores, p.d_ctrl,
         )?;
         if let Some(sn) = l.attn_sub_norm {
             // Fused sub-norm + quant: skips intermediate attn_sn buffer.
@@ -4032,7 +3954,6 @@ impl CudaDecodeModel {
         out: sys::CUdeviceptr,
         scores: sys::CUdeviceptr,
         ctrl: sys::CUdeviceptr,
-        flash_partials: sys::CUdeviceptr,
     ) -> Result<(), BackendError> {
         let (mc_i, nh_i, nhkv_i, hd_i) = (
             self.max_ctx as i32,
@@ -4042,69 +3963,6 @@ impl CudaDecodeModel {
         );
         let scale = self.attn_scale;
         let cs = self.cap_stream.cu_stream();
-        if self.m1_flash {
-            // DRAFTER flash profile: the M=N split/combine pair at n=1. The
-            // ctrl block's cache_len word (`ctrl[2]`, byte offset 8) IS the
-            // 1-row positions array — the kernel reads `positions[0]` and
-            // attends keys `0..=pos`, exactly the M=1 contract ("ctx =
-            // watermark+1"). Splits past the live ctx write identity
-            // partials, so the static grid replays at every context length
-            // (same property as the exact pair's early-exit fan-out). The
-            // partials pointer was extracted PRE-capture (GraphPtrs) — an
-            // in-capture `device_ptr` invalidates the capture.
-            if flash_partials == 0 {
-                return Err(BackendError::InvalidInput(
-                    "m1 flash profile set without its partials scratch".into(),
-                ));
-            }
-            let part_ptr = flash_partials;
-            let pos_ptr: sys::CUdeviceptr = ctrl + 8;
-            let n_split = self.max_ctx.div_ceil(ATTN_SPLIT_CHUNK);
-            let (n_i, ns_i, ck_i) = (1i32, n_split as i32, ATTN_SPLIT_CHUNK as i32);
-            {
-                let grid = ((self.n_head * n_split) as u32, 1, 1);
-                let mut params = vec![
-                    pp(&q),
-                    pp(&k),
-                    pp(&v),
-                    pp(&part_ptr),
-                    pp(&pos_ptr),
-                    pp(&mc_i),
-                    pp(&nh_i),
-                    pp(&nhkv_i),
-                    pp(&hd_i),
-                    pp(&scale),
-                    pp(&n_i),
-                    pp(&ns_i),
-                    pp(&ck_i),
-                ];
-                raw_launch(
-                    self.raw().attn_split_partial_g,
-                    grid,
-                    (32, 1, 1),
-                    0,
-                    cs,
-                    &mut params,
-                )?;
-            }
-            let grid = (self.n_head as u32, 1, 1);
-            let mut params = vec![
-                pp(&part_ptr),
-                pp(&out),
-                pp(&nh_i),
-                pp(&hd_i),
-                pp(&n_i),
-                pp(&ns_i),
-            ];
-            return raw_launch(
-                self.raw().attn_combine_g,
-                grid,
-                (32, 1, 1),
-                0,
-                cs,
-                &mut params,
-            );
-        }
         if self.head_dim.is_multiple_of(4) {
             // v1.x split pair — see `launch_attention` for the geometry rationale.
             {
