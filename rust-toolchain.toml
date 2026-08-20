@@ -3,4 +3,9 @@
 # generated code or silently widening the accepted toolchain surface.
 channel = "1.89.0"
 components = ["rustfmt", "clippy"]
-# GPU/edge targets added per-backend; wasm + aarch64 land with those crates.
+# The wasm targets must live HERE, not in the CI actions' `targets:` inputs:
+# with a rust-toolchain.toml present, rustup resolves THIS toolchain for every
+# cargo invocation, so targets installed on the actions' `stable` never apply
+# (both wasm lanes went red with E0463 can't-find-std the day this file
+# landed). Other GPU/edge targets still arrive per-backend.
+targets = ["wasm32-unknown-unknown", "wasm32-wasip1"]
