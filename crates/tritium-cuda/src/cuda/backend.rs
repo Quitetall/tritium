@@ -6580,12 +6580,13 @@ impl CudaBackend {
         // reject on typos; meaningless without the fast tier but harmless —
         // the capture guard requires both).
         let tree_nb = match std::env::var("TRITIUM_TREE_NB") {
-            Err(std::env::VarError::NotPresent) => false,
-            Ok(v) if v == "0" => false,
-            Ok(v) if v == "1" => true,
+            Err(std::env::VarError::NotPresent) => TreeNb::Auto,
+            Ok(v) if v == "auto" => TreeNb::Auto,
+            Ok(v) if v == "0" => TreeNb::Off,
+            Ok(v) if v == "1" => TreeNb::Force,
             Ok(v) => {
                 return Err(BackendError::InvalidInput(format!(
-                    "TRITIUM_TREE_NB={v:?} — use 1 or 0 (default)"
+                    "TRITIUM_TREE_NB={v:?} — use auto (default), 1 (force) or 0 (off)"
                 )));
             }
             Err(e) => {

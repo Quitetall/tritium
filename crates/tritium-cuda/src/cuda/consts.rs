@@ -170,6 +170,12 @@ pub(super) const KERNEL_NAME_ATTN_TREE_FUSED_NB_H: &str = "gqa_attention_tree_fu
 /// decode.cu's TREE_NB_SLICE) and the one-node-per-warp bucket cap.
 pub(super) const TREE_NB_SLICE: usize = 512;
 pub(super) const TREE_NB_MAX_NODES: usize = 8;
+/// Prefix length at/above which the dual-graph dispatch replays the
+/// node-blocked capture instead of the fused-ctrl one (measured crossover
+/// 2026-08-20: nb/fused 1.016/0.992 at prefix 1536, −18/−22% at 2048,
+/// −40% at 3968; +109% at 512 — below this the fused body's m·n_head grid
+/// occupancy wins).
+pub(super) const TREE_NB_MIN_PREFIX: usize = 1536;
 pub(super) const KERNEL_NAME_ATTN_TREE_FUSED_CTRL_PAGED: &str =
     "gqa_attention_tree_fused_ctrl_paged_g";
 pub(super) const KERNEL_NAME_ATTN_TREE_FUSED_CTRL_PAGED_H: &str =

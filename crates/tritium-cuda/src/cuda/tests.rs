@@ -4273,7 +4273,7 @@ fn tree_fused_vs_exact_pair_kernel_abba_bench() {
         (((seed >> 33) as i32 % 1000) as f32) * 1e-3 - 0.5
     };
 
-    for prefix_len in [512usize, 3968usize] {
+    for prefix_len in [512usize, 1024, 1536, 2048, 3072, 3968] {
         // Chain tree: row i's ancestors are rows prefix..prefix+i (self-inclusive).
         let n_anc: Vec<i32> = (1..=m as i32).collect();
         let mut anc: Vec<i32> = vec![0; m * max_anc];

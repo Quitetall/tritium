@@ -689,9 +689,24 @@ const TREE_BUCKET_MAX: usize = 48;
 /// translate every KV row through the baked `d_table` instead. Graphs bake
 /// the owning TreeScratch's buffer pointers — invalidated (dropped) if that
 /// scratch ever re-grows.
+/// Node-blocked tree-attention dispatch policy (task #65, `TRITIUM_TREE_NB`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum TreeNb {
+    /// Never node-blocked (kill switch).
+    Off,
+    /// Prefix-length dual-graph dispatch (the default).
+    Auto,
+    /// Always node-blocked where structurally possible (A/B).
+    Force,
+}
+
 struct TreeGraphs {
     d_ctrl: CudaSlice<i32>,
-    graphs: HashMap<usize, SendGraph>,
+    /// Captured trunks keyed by (bucket, node_blocked): under the fast tier
+    /// a small dense-solo bucket can hold BOTH variants, picked per replay
+    /// by prefix length (TREE_NB_MIN_PREFIX — the measured kernel
+    /// crossover). Slots/paged routes always use (bucket, false).
+    graphs: HashMap<(usize, bool), SendGraph>,
     /// Keeps the raw modules the captured graphs reference alive (read only
     /// by Drop — the ownership IS the point).
     #[allow(dead_code)]
@@ -839,10 +854,12 @@ pub struct CudaDecodeModel {
     /// dense single-slot graph route); `Exact` (default) is the ADR 0018
     /// bit-exact contract everywhere.
     kernel_tier: KernelTier,
-    /// Task-#65 opt-in (TRITIUM_TREE_NB=1, parsed at build): under the fast
-    /// tier, small-bucket dense solo verifies capture the node-blocked
-    /// partial+combine pair instead of the fused-ctrl body.
-    tree_nb: bool,
+    /// Task-#65 node-blocked dispatch policy (TRITIUM_TREE_NB, parsed at
+    /// build): `Auto` (default) replays the node-blocked capture on dense
+    /// solo buckets <= 8 at prefix >= TREE_NB_MIN_PREFIX and the fused-ctrl
+    /// capture below it (dual graphs per bucket); `Force`/`Off` pin one
+    /// variant (A/B + kill switch).
+    tree_nb: TreeNb,
     /// i8-rung per-group scales, `[max_ctx, n_head_kv, head_dim/KV_QGROUP]`
     /// f32 per layer per direction; empty vecs on other rungs.
     kv_k_scales: Vec<CudaSlice<f32>>,

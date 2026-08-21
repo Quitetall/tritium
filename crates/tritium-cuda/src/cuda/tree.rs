@@ -429,19 +429,33 @@ impl CudaDecodeModel {
                     None => self.tree_graphs = Some(tg),
                 }
             }
+            // Task #65 dual-graph dispatch: the node-blocked capture wins
+            // only past the measured prefix crossover; below it the fused
+            // body's occupancy wins. Auto picks per replay (both variants
+            // may be captured for one bucket); Force/Off pin one. Dense
+            // solo route only (`slot` = the I2 region route keeps fused).
+            let use_nb = self.kernel_tier == KernelTier::Fast
+                && slot.is_none()
+                && bucket <= TREE_NB_MAX_NODES
+                && match self.tree_nb {
+                    TreeNb::Off => false,
+                    TreeNb::Force => true,
+                    TreeNb::Auto => prefix_len >= TREE_NB_MIN_PREFIX,
+                };
+            let key = (bucket, use_nb);
             let have = match &slot {
                 Some((b, _)) => b
                     .tree_graphs
                     .as_ref()
                     .expect("tree graphs just ensured")
                     .graphs
-                    .contains_key(&bucket),
+                    .contains_key(&key),
                 None => self
                     .tree_graphs
                     .as_ref()
                     .expect("tree graphs just ensured")
                     .graphs
-                    .contains_key(&bucket),
+                    .contains_key(&key),
             };
             if !have {
                 if std::env::var_os("TRITIUM_TREE_DEBUG").is_some() {
@@ -472,13 +486,13 @@ impl CudaDecodeModel {
                             None,
                         ),
                     };
-                let g = self.record_graph_tree(&ts, bucket, d_ctrl, &kv, d_table, false)?;
+                let g = self.record_graph_tree(&ts, bucket, d_ctrl, &kv, d_table, false, use_nb)?;
                 let tg = match slot.as_mut() {
                     Some((b, _)) => b.tree_graphs.as_mut(),
                     None => self.tree_graphs.as_mut(),
                 }
                 .expect("tree graphs just ensured");
-                tg.graphs.insert(bucket, SendGraph(g));
+                tg.graphs.insert(key, SendGraph(g));
                 // The eager paged route may have created this TreeGraphs
                 // before `batch_raw` existed — (re)pin the modules the
                 // freshly captured graph references.
@@ -513,7 +527,7 @@ impl CudaDecodeModel {
                     .memcpy_htod(&ctrl, &mut tg.d_ctrl)
                     .map_err(|e| driver_err("tree ctrl htod", &e))?;
                 tg.graphs
-                    .get(&bucket)
+                    .get(&key)
                     .expect("tree graph just inserted")
                     .launch()
                     .map_err(|e| driver_err("tree graph launch", &e))?;
@@ -1048,7 +1062,7 @@ impl CudaDecodeModel {
             // Task-#65 node-blocked partials: bucket-independent size (the
             // node cap x heads x static slice count), allocated once with
             // the scratch when the opt-in is live.
-            d_nb_partials: if self.kernel_tier == KernelTier::Fast && self.tree_nb {
+            d_nb_partials: if self.kernel_tier == KernelTier::Fast && self.tree_nb != TreeNb::Off {
                 let n_slice = self.max_ctx.div_ceil(TREE_NB_SLICE);
                 Some(alloc(
                     TREE_NB_MAX_NODES * self.n_head * n_slice * (self.head_dim + 2),
@@ -1578,6 +1592,7 @@ impl CudaDecodeModel {
         kv: &[(sys::CUdeviceptr, sys::CUdeviceptr)],
         paged_table: Option<sys::CUdeviceptr>,
         slots: bool,
+        use_nb: bool,
     ) -> Result<CudaGraph, BackendError> {
         let s = &self.cap_stream;
         let mb = bucket;
@@ -1740,7 +1755,7 @@ impl CudaDecodeModel {
         // the existing flash combine replace the fused body. The partials
         // buffer was allocated with the scratch iff the opt-in was live.
         let nb: Option<(sys::CUfunction, sys::CUfunction, sys::CUdeviceptr, usize)> =
-            (fused.is_some() && !slots && !paged && self.tree_nb && mb <= TREE_NB_MAX_NODES)
+            (use_nb && fused.is_some() && !slots && !paged && mb <= TREE_NB_MAX_NODES)
                 .then(|| {
                     ts.d_nb_partials.as_ref().map(|b| {
                         // Loud-once per bucket capture: engagement proof for
@@ -1749,7 +1764,7 @@ impl CudaDecodeModel {
                         // distinguish from "no effect".
                         eprintln!(
                             "tritium-cuda: tree verify capture bucket {mb}: \
-                             node-blocked fast tier (TRITIUM_TREE_NB=1)"
+                             node-blocked fast tier"
                         );
                         (
                             raw.attn_tree_fused_nb,
@@ -2571,7 +2586,7 @@ impl CudaDecodeModel {
                 .as_ref()
                 .expect("slots graphs just ensured")
                 .graphs
-                .contains_key(&bucket);
+                .contains_key(&(bucket, false));
             if !have {
                 if std::env::var_os("TRITIUM_TREE_DEBUG").is_some() {
                     eprintln!("tree-slots-graph: capturing bucket {bucket}");
@@ -2589,12 +2604,12 @@ impl CudaDecodeModel {
                     .map(|li| (dptr(&batch.kv_k[li], cs), dptr(&batch.kv_v[li], cs)))
                     .collect();
                 let d_table = batch.pages.as_ref().map(|pg| dptr(&pg.d_table, cs));
-                let g = self.record_graph_tree(&ts, bucket, d_ctrl, &kv, d_table, true)?;
+                let g = self.record_graph_tree(&ts, bucket, d_ctrl, &kv, d_table, true, false)?;
                 let tg = batch
                     .tree_slots_graphs
                     .as_mut()
                     .expect("slots graphs just ensured");
-                tg.graphs.insert(bucket, SendGraph(g));
+                tg.graphs.insert((bucket, false), SendGraph(g));
                 tg.raw_keepalive = self.batch_raw.clone();
             }
             // Per-replay data: page-table content (paged), then the per-row
@@ -2614,7 +2629,7 @@ impl CudaDecodeModel {
                     .memcpy_htod(&row_ctrl, &mut tg.d_ctrl)
                     .map_err(|e| driver_err("tree slots ctrl htod", &e))?;
                 tg.graphs
-                    .get(&bucket)
+                    .get(&(bucket, false))
                     .expect("slots graph just inserted")
                     .launch()
                     .map_err(|e| driver_err("tree slots graph launch", &e))?;
