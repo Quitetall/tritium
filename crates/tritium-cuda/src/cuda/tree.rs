@@ -1584,6 +1584,7 @@ impl CudaDecodeModel {
     /// signatures match the single-slot ctrl twins word for word (only the
     /// ctrl INTERPRETATION differs), so the capture body below is shared
     /// verbatim across all four routes.
+    #[allow(clippy::too_many_arguments)] // graph-capture plumbing, repo precedent (batch.rs)
     fn record_graph_tree(
         &self,
         ts: &TreeScratch,
