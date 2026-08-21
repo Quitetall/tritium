@@ -55,6 +55,59 @@ box they are a distance from a named reference point, **not** a claim about the 
 
 ## Ledger
 
+### 2026-08-20 dual-graph dispatch + the stacked long-ctx headline @ 431b837f
+
+**Box state: quiet-validated per leg** (pre-gate 3×<15% util, post <15% after
+a 4 s settle, warm plain reference 20.57–20.61 s across all six legs — the
+tightest plain spread this campaign; the parallel session's job bursts were
+dodged leg-by-leg). RTX 4090, driver 610.57.04, CUDA 13.3, HEAD build.
+
+**The dispatch (02c8ff84 + 431b837f):** TreeGraphs captures are now keyed
+(bucket, node_blocked) and picked per replay against
+`TREE_NB_MIN_PREFIX = 1536` — the measured kernel crossover (extended prefix
+ladder, mirror ABBA: nb/fused 1.016/0.992 at 1536, −18/−22% at 2048, −40%
+at 3968, +109% at 512). `TRITIUM_TREE_NB` is tri-state (auto default / 1
+force / 0 off); the round-31 NB win needs no knob and short prefixes keep
+the fused body by construction (gated: `tree_nb_dispatch` pins the variant
+counts (1,0)→(1,1)→(1,1) across the threshold).
+
+**The stacked headline (measure_tau_ctx long protocol — the round-30 §4a
+harness: 6 wt103 3,520-token prefixes, 256 greedy, cold pass discarded,
+plain reference exact/f32 on 8125; order E C C E then G G):**
+
+| config | e2e vs plain (2 visits) | spec wall | τ | lossless |
+|---|---|---:|---:|---|
+| exact/f32 forced-on | 0.871 / 0.872 | 23.60 / 23.61 s | 3.901 | **6/6 + 6/6** |
+| **fast+f16 forced-on (auto-NB)** | **1.858 / 1.860** | **11.07 / 11.07 s** | 2.505 | 1/6 (RFC 0001 tier) |
+| governor-on fast+f16 | 1.741 / 1.745 | 11.81 / 11.81 s | 2.681 | 1/6; 304 suppressed-plain |
+
+Against round-30 §4a on the same protocol: exact 0.882/0.893 → 0.871/0.872
+(parity-class, cross-day clock drift); **fast+f16 1.648/1.624 → 1.858/1.860
+(+13.4%)**; governor 1.638/1.630 → 1.741/1.745 (+6.7%). The NB capture line
+fired on every fast-tier leg (engagement proven); spec walls are identical
+to 0.01 s across visits (deterministic replay). τ 2.505 vs round-30's 2.553:
+the NB verify's ≤1e-4 drift flips different near-ties than the fused body's
+— fast-tier semantics, the verifier still owns losslessness (the exact legs
+stay 12/12 token-identical to plain greedy). The governor now lands within
+6% of forced-on (was ~parity in round 30's terms) while still probing —
+τ 2.68 sits inside the fast floor band (2.15–2.95), so partial suppression
+is the cost model working as designed.
+
+**The long-ctx serving headline is now ≈1.86× vs plain exact/f32 (≈1.27× vs
+plain+f16, the 08-08 §2b basis) with zero configuration beyond the fast
+tier** — up from 0.37× before this campaign's rounds 27–31.
+
+#### Caveats
+
+- Cross-day comparisons to round 30 carry clock-state drift (the exact legs'
+  −1% bounds it); within-table pairs are same-session.
+- The plain reference is the HEAD binary (plain path untouched since
+  8a808098 — the diff is drafter/verify-KV management only).
+- identical=1/6 on the fast legs vs round-30's 0/6: NB's drift pattern
+  happens to match plain greedy on one prompt — same documented tier trade.
+
+**Still owed:** upstream llama.cpp Q2_0 rerun; MI300X/Metal (user-gated).
+
 ### 2026-08-18 spec-cost levers @ 82f80b1b — delta re-sync, node-blocked tree attention, TB1 LUT verdict
 
 **Box state:** every number below ran in verified-quiet windows (desktop
