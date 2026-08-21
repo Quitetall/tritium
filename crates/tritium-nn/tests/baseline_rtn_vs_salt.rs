@@ -77,6 +77,22 @@ fn group() -> usize {
     }
 }
 
+/// Rotation policy for the ternary arms.
+///
+/// **The sidecar SALT bundle carries NO rotation metadata**, and the ladder fits in the rotated
+/// basis, so an artifact written with rotation applied would reconstruct `W·H` instead of `W`.
+/// Anything the CLI can actually ship today must therefore be measured at `never`.
+fn rotate_policy() -> RotationPolicy {
+    match std::env::var("TRITIUM_ROTATE").as_deref() {
+        Ok("never") => RotationPolicy::Never,
+        Ok("auto") => RotationPolicy::Auto,
+        Ok("always") => RotationPolicy::Always,
+        Err(std::env::VarError::NotPresent) => RotationPolicy::Never,
+        Ok(other) => panic!("TRITIUM_ROTATE must be always|auto|never, got {other:?}"),
+        Err(error) => panic!("TRITIUM_ROTATE is not valid UTF-8: {error}"),
+    }
+}
+
 /// Salience-fold alpha for this run.
 fn fold_alpha() -> f64 {
     let alpha = match std::env::var("TRITIUM_FOLD_ALPHA") {
@@ -462,7 +478,7 @@ fn salt_vs_rtn_quality_per_byte() {
                     t,
                     group(),
                     GRID,
-                    RotationPolicy::Always,
+                    rotate_policy(),
                 )
             })
             .collect();
