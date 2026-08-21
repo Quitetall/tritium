@@ -84,6 +84,8 @@ fn fisher_sidecar_concentrates_planes_on_high_fisher_rows() {
             weight_path.to_str().unwrap(),
             "--output",
             out.to_str().unwrap(),
+            "--ladder",
+            "itf",
             "--bpw",
             "2.0",
         ];
@@ -149,6 +151,11 @@ fn mis_shaped_fisher_sidecar_is_rejected() {
             weight_path.to_str().unwrap(),
             "--output",
             out.to_str().unwrap(),
+            // --fisher allocates planes per group, which only the itf fitter does; the geometric
+            // ladder gives every group the same plane count and refuses the flag outright. Ask for
+            // itf so this exercises the SHAPE check it is actually about.
+            "--ladder",
+            "itf",
             "--bpw",
             "2.0",
             "--fisher",

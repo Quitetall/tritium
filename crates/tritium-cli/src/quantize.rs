@@ -22,6 +22,7 @@ use tritium_quantize::fisher::tile_sensitivity;
 use tritium_quantize::{BaseScaleScope, QuantConfig, Sensitivity, quantize_tensor};
 
 use crate::SaltSensitivityArg;
+use crate::quantize_ladder::{LadderArg, LadderConfig, quantize_tensor_ladder};
 
 /// Base-plane scale granularity (CLI mirror of [`BaseScaleScope`]).
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -52,7 +53,28 @@ pub(crate) fn run(
     sensitivity: SaltSensitivityArg,
     fisher: Option<&Path>,
     format: OutputFormat,
+    ladder: LadderArg,
+    ladder_cfg: LadderConfig,
 ) -> Result<()> {
+    if ladder == LadderArg::Geometric {
+        ladder_cfg.validate()?;
+        // The ladder assigns every plane from one anchor; there is no per-group plane budget for
+        // a Fisher or energy sensitivity to allocate. Silently ignoring these would be a knob that
+        // does nothing — refuse instead.
+        if fisher.is_some() {
+            anyhow::bail!(
+                "--fisher allocates planes per group and only applies to --ladder itf; the \
+                 geometric ladder gives every group the same plane count. Pass --ladder itf, or \
+                 drop --fisher."
+            );
+        }
+        if !matches!(sensitivity, SaltSensitivityArg::Uniform) {
+            anyhow::bail!(
+                "--sensitivity {sensitivity:?} allocates planes per group and only applies to \
+                 --ladder itf; the geometric ladder gives every group the same plane count."
+            );
+        }
+    }
     let sg = match scale_group {
         ScaleGroupArg::Block => BaseScaleScope::Block,
         ScaleGroupArg::Tensor => BaseScaleScope::Tensor,
@@ -129,10 +151,22 @@ pub(crate) fn run(
             sensitivity,
             scale_group: sg,
         };
-        let qt = quantize_tensor(&w, rows, k, &cfg).with_context(|| format!("quantize {name}"))?;
-        total_params += rows * k;
-        total_bits += qt.logical_bpw() * (rows * k) as f64;
-        quantized.push((name.clone(), qt.salt_rows));
+        match ladder {
+            LadderArg::Geometric => {
+                let rows_out = quantize_tensor_ladder(&w, rows, k, &ladder_cfg)
+                    .with_context(|| format!("ladder-quantize {name}"))?;
+                total_params += rows * k;
+                total_bits += ladder_cfg.realizable_bpw() * (rows * k) as f64;
+                quantized.push((name.clone(), rows_out));
+            }
+            LadderArg::Itf => {
+                let qt = quantize_tensor(&w, rows, k, &cfg)
+                    .with_context(|| format!("quantize {name}"))?;
+                total_params += rows * k;
+                total_bits += qt.logical_bpw() * (rows * k) as f64;
+                quantized.push((name.clone(), qt.salt_rows));
+            }
+        }
     }
 
     let refs: Vec<(&str, &[SaltRow])> = quantized
@@ -166,18 +200,36 @@ pub(crate) fn run(
     } else {
         format!("{sensitivity:?}")
     };
+    // Report the recipe that actually ran. The ladder ignores --bpw (its rate is fixed by the
+    // plane count and the container), so printing a "bpw target" for it would describe a knob that
+    // had no effect — the same class of mislabelling that hides configuration mismatches.
+    let recipe = match ladder {
+        LadderArg::Geometric => format!(
+            "ladder geometric, {} planes, g{}, grid {}, no rotation, no calibration fold",
+            ladder_cfg.planes, ladder_cfg.group, ladder_cfg.grid
+        ),
+        LadderArg::Itf => format!(
+            "itf free-scale, {bpw:.3} bpw target, {scale_group:?} scale, {sens_desc} sensitivity"
+        ),
+    };
     println!(
-        "quantized {} tensors ({:.2}M params) at {:.3} bpw target, {:?} scale, {} sensitivity → {} {} ({:.1} MiB, {:.3} avg bpw)",
+        "quantized {} tensors ({:.2}M params) | {recipe} → {} {} ({:.1} MiB, {:.3} avg bpw)",
         names.len(),
         total_params as f64 / 1e6,
-        bpw,
-        scale_group,
-        sens_desc,
         container,
         output.display(),
         out_bytes.len() as f64 / (1024.0 * 1024.0),
         avg_bpw,
     );
+    if ladder == LadderArg::Geometric {
+        println!(
+            "  note: a SALT bundle stores each plane as TQ2_0 (2.0625 bits/trit incl. its f16 \
+             scale), so this file costs {:.4} bpw. The ladder's one-anchor-per-group saving and \
+             the 1.625 B3 rate are NOT expressible in this container; no bits-per-weight claim \
+             against integer quantization is made here.",
+            ladder_cfg.realizable_bpw()
+        );
+    }
     Ok(())
 }
 

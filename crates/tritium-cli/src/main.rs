@@ -46,6 +46,7 @@ mod inspect;
 mod nvml_probe;
 mod pull;
 mod quantize;
+mod quantize_ladder;
 mod release;
 mod repack;
 mod report;
@@ -183,6 +184,24 @@ enum Command {
         /// (GGUF container holding the SALT rows).
         #[arg(long, value_enum, default_value_t = quantize::OutputFormat::Sidecar)]
         format: quantize::OutputFormat,
+        /// Fitter. `geometric` (default) is the balanced-ternary ladder: one anchor per group,
+        /// `s_p = s0*3^-(p-1)`. `itf` is the previous free-scale fit, kept for reproducing
+        /// published numbers and because it beats the ladder below 3 planes.
+        #[arg(long, value_enum, default_value_t = quantize_ladder::LadderArg::Geometric)]
+        ladder: quantize_ladder::LadderArg,
+        /// Plane count for `--ladder geometric`. 4 measures 1.024x fp on SmolLM2-360M in the
+        /// configuration this command can write (no calibration fold, no rotation); 3 measures
+        /// 1.335x. Below 3 the ladder is refused — see the error text.
+        #[arg(long, default_value_t = 4)]
+        planes: usize,
+        /// Scale-group width for `--ladder geometric`. Must be a multiple of 256: a TQ2_0 block
+        /// carries one f16 scale per 256 trits, so a smaller group would need two anchors in one
+        /// block.
+        #[arg(long, default_value_t = 256)]
+        group: usize,
+        /// Delta candidates per group for the ladder's `s0` grid search.
+        #[arg(long, default_value_t = 16)]
+        grid: usize,
     },
 }
 
@@ -473,6 +492,10 @@ fn main() -> anyhow::Result<()> {
             sensitivity,
             fisher,
             format,
+            ladder,
+            planes,
+            group,
+            grid,
         } => quantize::run(
             &input,
             &output,
@@ -481,6 +504,12 @@ fn main() -> anyhow::Result<()> {
             sensitivity,
             fisher.as_deref(),
             format,
+            ladder,
+            quantize_ladder::LadderConfig {
+                planes,
+                group,
+                grid,
+            },
         )?,
     }
     Ok(())
