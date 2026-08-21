@@ -1,14 +1,14 @@
 {
   "schema": "tritium.compatibility-receipt.v1",
   "target_id": "linux-x86_64-cuda13-sm89",
-  "source_revision": "de821b6d225124e5df46fc91d21060872b9efd17",
+  "source_revision": "b1efd23786e7369147255fbd5c1d32a680f0a739",
   "passed": true,
   "install_smoke": true,
   "host_os": "linux",
   "host_arch": "x86_64",
   "wheel": "tritium_torch-1.1.0rc1-cp39-abi3-manylinux_2_28_x86_64.whl",
-  "sha256": "7715602471757a7071494cce49fdc266c5f6f657f93ab55021322828a4b72bd7",
-  "bytes": 2807209,
+  "sha256": "f11ddcd4941ee2c0fee6aa74f8c9bb3a0053ad88f767d110d99e875b1817e1ca",
+  "bytes": 2807137,
   "version": "1.1.0rc1",
   "platform_tag": "manylinux_2_28_x86_64"
 }
