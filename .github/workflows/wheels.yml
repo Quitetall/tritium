@@ -404,13 +404,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python -I -m tritium.torch.qualify_observability \
+          python -B -I -m tritium.torch.qualify_observability \
             --output-dir evidence/observability-clean \
             --wheel-artifact dist/*.whl \
             --source-revision ${{ github.sha }} \
             --release 1.1.0-rc.1 \
             --run-id github-${{ github.run_id }}-${{ github.run_attempt }}-observability-clean
-          python -I -m tritium.torch.qualify_observability \
+          python -B -I -m tritium.torch.qualify_observability \
             --check-receipt evidence/observability-clean/receipt.json \
             --wheel-artifact dist/*.whl \
             --source-revision ${{ github.sha }} \

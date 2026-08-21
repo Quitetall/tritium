@@ -18,7 +18,7 @@ class ObservabilityQualificationTests(unittest.TestCase):
         job = workflow[start : start + 3 + match.start()]
 
         self.assertEqual(
-            job.count("python -I -m tritium.torch.qualify_observability"), 2
+            job.count("python -B -I -m tritium.torch.qualify_observability"), 2
         )
         for package in (
             "tensorboard==2.21.0",
