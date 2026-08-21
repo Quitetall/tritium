@@ -660,9 +660,10 @@ impl fmt::Display for Qwen35CoverageError {
             Self::MetadataFieldTooLong { field, maximum } => {
                 write!(f, "{field} exceeds maximum length {maximum}")
             }
-            Self::UnsupportedDtype(tensor) => {
-                write!(f, "tensor `{tensor}` does not use exact BF16 source dtype")
-            }
+            Self::UnsupportedDtype(tensor) => write!(
+                f,
+                "tensor `{tensor}` does not use exact BF16 source dtype; pre-quantized exports are not admissible"
+            ),
             Self::UnknownTensor(tensor) => {
                 write!(
                     f,

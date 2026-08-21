@@ -268,10 +268,16 @@ fn source_dtype_must_be_exact_bf16() {
     let mut metadata = fixture_metadata();
     tensor_mut(&mut metadata, "lm_head.weight").dtype = "F16".to_owned();
 
+    let error = build_manifest(&metadata).expect_err("F16 source must be rejected");
     assert!(matches!(
-        build_manifest(&metadata),
-        Err(Qwen35CoverageError::UnsupportedDtype(name)) if name == "lm_head.weight"
+        &error,
+        Qwen35CoverageError::UnsupportedDtype(tensor) if tensor == "lm_head.weight"
     ));
+    assert!(
+        error
+            .to_string()
+            .contains("pre-quantized exports are not admissible")
+    );
 }
 
 #[test]
