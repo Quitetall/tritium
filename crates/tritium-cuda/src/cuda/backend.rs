@@ -6576,9 +6576,10 @@ impl CudaBackend {
         // parsed once at model build — graphs bake the picked symbols at
         // capture, so this is the tier the whole process serves.
         let kernel_tier = kernel_tier_from_env()?;
-        // Task #65: node-blocked tree partials, opt-in for the A/B (loud-
-        // reject on typos; meaningless without the fast tier but harmless —
-        // the capture guard requires both).
+        // Task #65: node-blocked tree dispatch policy. Default `auto` =
+        // per-replay prefix dispatch under the fast tier; 1/0 force/kill
+        // (loud-reject on typos; meaningless without the fast tier but
+        // harmless — the capture guard requires both).
         let tree_nb = match std::env::var("TRITIUM_TREE_NB") {
             Err(std::env::VarError::NotPresent) => TreeNb::Auto,
             Ok(v) if v == "auto" => TreeNb::Auto,

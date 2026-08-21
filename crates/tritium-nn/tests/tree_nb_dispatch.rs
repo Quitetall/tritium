@@ -67,9 +67,9 @@ fn nb_dual_graph_dispatch_crosses_threshold() {
         let out = rm.tree_verify_greedy(&t, &p).expect("short verify");
         assert!(!out.is_empty(), "short verify must commit");
         assert_eq!(
-            rm.tree_graph_bucket_count(),
-            1,
-            "one capture (fused) below the threshold"
+            rm.tree_graph_variant_counts(),
+            (1, 0),
+            "exactly the FUSED capture below the threshold"
         );
     }
 
@@ -85,10 +85,10 @@ fn nb_dual_graph_dispatch_crosses_threshold() {
         let out = rm.tree_verify_greedy(&t, &p).expect("long verify");
         assert!(!out.is_empty(), "long verify must commit");
         assert_eq!(
-            rm.tree_graph_bucket_count(),
-            2,
+            rm.tree_graph_variant_counts(),
+            (1, 1),
             "the NB capture must join at prefix >= TREE_NB_MIN_PREFIX \
-             (dual graphs for one bucket)"
+             (dual graphs for one bucket, direction pinned)"
         );
         // And replaying BELOW the threshold again must not re-capture.
     }
@@ -102,8 +102,8 @@ fn nb_dual_graph_dispatch_crosses_threshold() {
         let out = rm.tree_verify_greedy(&t, &p).expect("short verify 2");
         assert!(!out.is_empty());
         assert_eq!(
-            rm.tree_graph_bucket_count(),
-            2,
+            rm.tree_graph_variant_counts(),
+            (1, 1),
             "no third capture — both variants reused"
         );
     }

@@ -437,6 +437,7 @@ impl CudaDecodeModel {
             let use_nb = self.kernel_tier == KernelTier::Fast
                 && slot.is_none()
                 && bucket <= TREE_NB_MAX_NODES
+                && self.head_dim <= TREE_FUSED_HDMAX
                 && match self.tree_nb {
                     TreeNb::Off => false,
                     TreeNb::Force => true,
@@ -1092,6 +1093,18 @@ impl CudaDecodeModel {
         self.tree_graphs.as_ref().map_or(0, |tg| tg.graphs.len())
     }
 
+    /// (fused, node_blocked) capture counts — the dual-graph dispatch gate's
+    /// DIRECTION teeth (a bare count cannot tell which variant fired where).
+    #[must_use]
+    pub fn tree_graph_variant_counts(&self) -> (usize, usize) {
+        self.tree_graphs.as_ref().map_or((0, 0), |tg| {
+            tg.graphs.keys().fold(
+                (0, 0),
+                |(f, n), &(_, nb)| if nb { (f, n + 1) } else { (f + 1, n) },
+            )
+        })
+    }
+
     /// RFC 0001 Amendment 1 observability seam: the per-layer attention
     /// outputs (`d_attn` — the tree-attention result BEFORE sub-norm/o-proj)
     /// of the LAST graph-route tree verify on the single-seq target,
@@ -1585,6 +1598,7 @@ impl CudaDecodeModel {
     /// ctrl INTERPRETATION differs), so the capture body below is shared
     /// verbatim across all four routes.
     #[allow(clippy::too_many_arguments)] // graph-capture plumbing, repo precedent (batch.rs)
+    #[allow(clippy::too_many_arguments)]
     fn record_graph_tree(
         &self,
         ts: &TreeScratch,

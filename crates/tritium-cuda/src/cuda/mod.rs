@@ -680,15 +680,6 @@ struct TreeScratch {
 pub const TREE_BUCKETS: [usize; 7] = [4, 8, 12, 16, 24, 32, 48];
 const TREE_BUCKET_MAX: usize = 48;
 
-/// Captured verify-trunk graphs + their `[prefix_len, real_m, kv_row_base]`
-/// ctrl buffer (i32[3]; the row base is 0 for the single-seq cache, or
-/// `r · max_ctx` when the graphs were captured against a `BatchKv` arena and
-/// replay targets slot `r` — I2). PAGED batches (I3) repurpose ctrl word 2 as
-/// the slot's page-table offset (`r · tstride`) — a paged slot's rows are
-/// page-scattered, so a row base is meaningless and the paged ctrl twins
-/// translate every KV row through the baked `d_table` instead. Graphs bake
-/// the owning TreeScratch's buffer pointers — invalidated (dropped) if that
-/// scratch ever re-grows.
 /// Node-blocked tree-attention dispatch policy (task #65, `TRITIUM_TREE_NB`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum TreeNb {
@@ -700,6 +691,15 @@ pub(crate) enum TreeNb {
     Force,
 }
 
+/// Captured verify-trunk graphs + their `[prefix_len, real_m, kv_row_base]`
+/// ctrl buffer (i32[3]; the row base is 0 for the single-seq cache, or
+/// `r · max_ctx` when the graphs were captured against a `BatchKv` arena and
+/// replay targets slot `r` — I2). PAGED batches (I3) repurpose ctrl word 2 as
+/// the slot's page-table offset (`r · tstride`) — a paged slot's rows are
+/// page-scattered, so a row base is meaningless and the paged ctrl twins
+/// translate every KV row through the baked `d_table` instead. Graphs bake
+/// the owning TreeScratch's buffer pointers — invalidated (dropped) if that
+/// scratch ever re-grows.
 struct TreeGraphs {
     d_ctrl: CudaSlice<i32>,
     /// Captured trunks keyed by (bucket, node_blocked): under the fast tier
