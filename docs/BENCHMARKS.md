@@ -72,7 +72,8 @@ the fused body by construction (gated: `tree_nb_dispatch` pins the variant
 counts (1,0)→(1,1)→(1,1) across the threshold).
 
 **The stacked headline (measure_tau_ctx long protocol — the round-30 §4a
-harness: 6 wt103 3,520-token prefixes, 256 greedy, cold pass discarded,
+harness: 6 wt103 3,520-token prefixes, 256 greedy, 1-prompt discarded
+warmup (the round-30 treatment),
 plain reference exact/f32 on 8125; order E C C E then G G):**
 
 | config | e2e vs plain (2 visits) | spec wall | τ | lossless |
@@ -83,7 +84,8 @@ plain reference exact/f32 on 8125; order E C C E then G G):**
 
 Against round-30 §4a on the same protocol: exact 0.882/0.893 → 0.871/0.872
 (parity-class, cross-day clock drift); **fast+f16 1.648/1.624 → 1.858/1.860
-(+13.4%)**; governor 1.638/1.630 → 1.741/1.745 (+6.7%). The NB capture line
+(+13.6%, pairwise +12.7/+14.5%)**; governor 1.638/1.630 → 1.741/1.745
+(+6.7%). The NB capture line
 fired on every fast-tier leg (engagement proven); spec walls are identical
 to 0.01 s across visits (deterministic replay). τ 2.505 vs round-30's 2.553:
 the NB verify's ≤1e-4 drift flips different near-ties than the fused body's
@@ -94,17 +96,20 @@ stay 12/12 token-identical to plain greedy). The governor now lands within
 is the cost model working as designed.
 
 **The long-ctx serving headline is now ≈1.86× vs plain exact/f32 (≈1.27× vs
-plain+f16, the 08-08 §2b basis) with zero configuration beyond the fast
-tier** — up from 0.37× before this campaign's rounds 27–31.
+plain+f16, the 08-08 §2b basis) with no configuration beyond the fast+f16
+opt-ins** — the same-config before was 0.97–0.98× (fast+f16, 08-08
+§2c-long), and the lossless exact tier's before was 0.37×.
 
 #### Caveats
 
-- Cross-day comparisons to round 30 carry clock-state drift (the exact legs'
-  −1% bounds it); within-table pairs are same-session.
+- Cross-day comparisons to round 30 carry clock-state drift (the exact
+  legs bound it at −1.2 to −2.4% per visit); within-table pairs are
+  same-session.
 - The plain reference is the HEAD binary (plain path untouched since
   8a808098 — the diff is drafter/verify-KV management only).
-- identical=1/6 on the fast legs vs round-30's 0/6: NB's drift pattern
-  happens to match plain greedy on one prompt — same documented tier trade.
+- identical=1/6 on the fast legs (the 08-08 §2c-long recorded 0/6 on this
+  shape, different binary): NB's drift pattern happens to match plain
+  greedy on one prompt — the same documented tier trade.
 
 **Still owed:** upstream llama.cpp Q2_0 rerun; MI300X/Metal (user-gated).
 
