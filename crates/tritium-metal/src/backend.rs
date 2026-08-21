@@ -97,17 +97,18 @@ struct Handles {
     pipeline_attn_v3: ComputePipelineState,
 }
 
+#[allow(unsafe_code)]
 // SAFETY: the wrapped handles are `MTLDevice` / `MTLCommandQueue` /
 // `MTLComputePipelineState`, all documented by Apple as thread-safe for
 // concurrent use. The backend only ever *reads* through them (creating command
 // buffers, encoders, and buffers — each itself confined to the calling `mpgemm`
 // invocation), never mutating shared state, so moving/sharing `Handles` across
-// threads cannot introduce a data race.
-#[allow(unsafe_code)]
+// threads cannot introduce a data race. (Comment sits below the attribute:
+// the pinned clippy 1.89 requires it directly adjacent to the unsafe item.)
 unsafe impl Send for Handles {}
+#[allow(unsafe_code)]
 // SAFETY: see the `Send` impl above — the same Apple thread-safety guarantee
 // covers shared (`&`) concurrent access.
-#[allow(unsafe_code)]
 unsafe impl Sync for Handles {}
 
 /// How the ternary weights are laid out in the device `MTLBuffer`.
@@ -137,13 +138,13 @@ pub struct MetalBuffer {
 /// Send+Sync wrapper around the weights `MTLBuffer`.
 struct WeightBuf(Buffer);
 
+#[allow(unsafe_code)]
 // SAFETY: `MTLBuffer` is documented as safe to access from multiple threads; the
 // buffer is filled once at upload time (before any sharing) and thereafter only
 // read by the kernel. See the `Handles` SAFETY note.
-#[allow(unsafe_code)]
 unsafe impl Send for WeightBuf {}
-// SAFETY: see the `Send` impl above.
 #[allow(unsafe_code)]
+// SAFETY: see the `Send` impl above.
 unsafe impl Sync for WeightBuf {}
 
 impl core::fmt::Debug for MetalBuffer {
