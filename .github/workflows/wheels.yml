@@ -333,14 +333,12 @@ jobs:
           set -euo pipefail
           test ! -e "$GITHUB_WORKSPACE/.git"
           test ! -e "$GITHUB_WORKSPACE/Cargo.toml"
-          ! command -v cargo
-          ! command -v rustc
-          ! command -v cc
-          ! command -v c++
-          ! command -v gcc
-          ! command -v g++
-          ! command -v clang
-          ! command -v clang++
+          for compiler in cargo rustc cc c++ gcc g++ clang clang++; do
+            if command -v "$compiler" >/dev/null 2>&1; then
+              echo "compiler must be absent in source-free lane: $compiler" >&2
+              exit 1
+            fi
+          done
       - name: install pinned binary runtime and exact wheel
         shell: bash
         run: |
