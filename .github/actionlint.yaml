@@ -1,0 +1,6 @@
+self-hosted-runner:
+  labels:
+    - gpu
+    - rocm
+    - cuda
+    - sm89

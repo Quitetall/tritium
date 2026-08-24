@@ -168,6 +168,16 @@ jobs:
         with:
           command: check licenses bans sources advisories
 
+  workflow-lint:
+    name: workflow lint (actionlint)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: taiki-e/install-action@7f4eb899022d8fe70b20c4f3de697aa85c309026
+        with:
+          tool: actionlint@1.7.7
+      - run: actionlint
+
   # API-stability gate (ADR 0011/0012): no UNINTENTIONAL breaking change to the
   # stable public-API crates vs the last v0.5.* release tag. Pre-1.0 breaks are
   # allowed but must be deliberate; this surfaces them. fetch-depth: 0 so the
@@ -492,6 +502,7 @@ jobs:
       - compatibility-matrix
       - web-package
       - cargo-deny
+      - workflow-lint
       - semver
       - cpu-bench-smoke
       - wasm
