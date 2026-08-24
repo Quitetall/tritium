@@ -50,14 +50,14 @@ use tritium_train::ops::ste::{self, RotationPolicy};
 const GROUP: usize = 128;
 const GRID: usize = 16;
 const FOLD_ALPHA: f64 = 0.75;
-/// Rotation policy for the census. **The rotated/unrotated split is only informative under
-/// `Auto`**: with `Always` every group rotates, so the "rot zero%" column equals the overall
-/// column and carries no information. Set `TRITIUM_CENSUS_ROTATE=auto` to exercise it.
 const CALIB_WINDOWS: usize = 8;
 const CALIB_SEQ: usize = 512;
 /// One `u16` rank prefix per 256 trits keeps TB1 sign lookup O(1).
 const TB1_RANK_BITS_PER_TRIT: f64 = 16.0 / 256.0;
 
+/// Rotation policy for the census. **The rotated/unrotated split is only informative under
+/// `Auto`**: with `Always` every group rotates, so the "rot zero%" column equals the overall
+/// column and carries no information. Set `TRITIUM_CENSUS_ROTATE=auto` to exercise it.
 fn rotation() -> RotationPolicy {
     match std::env::var("TRITIUM_CENSUS_ROTATE").as_deref() {
         Ok("auto") => RotationPolicy::Auto,
@@ -212,8 +212,8 @@ fn ladder_plane_census_and_codec_pricing() {
 
         println!("── T={t} ─────────────────────────────────────────────────────────────────────");
         println!(
-            "{:<6} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9}",
-            "plane", "zero%", "H(bits)", "B3", "TB1", "best", "rot zero%"
+            "{:<6} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>11}",
+            "plane", "zero%", "H(bits)", "B3", "TB1", "best", "rot zero%", "unrot zero%"
         );
         let mut dense_total = 0.0;
         let mut best_total = 0.0;
@@ -226,7 +226,7 @@ fn ladder_plane_census_and_codec_pricing() {
             best_total += best;
             entropy_total += s.entropy_bits();
             println!(
-                "{:<6} {:>8.2}% {:>9.4} {:>9.4} {:>9.4} {:>9.4} {:>8.2}%",
+                "{:<6} {:>8.2}% {:>9.4} {:>9.4} {:>9.4} {:>9.4} {:>8.2}% {:>10.2}%",
                 p,
                 100.0 * s.zero_fraction(),
                 s.entropy_bits(),
@@ -234,6 +234,7 @@ fn ladder_plane_census_and_codec_pricing() {
                 tb1,
                 best,
                 100.0 * rot[p].zero_fraction(),
+                100.0 * unrot[p].zero_fraction(),
             );
         }
 
