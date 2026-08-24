@@ -1,4 +1,5 @@
 # Repository controls require maintainer review. Keep this file itself owned.
+*                           @Quitetall
 /.github/                 @Quitetall
 /.githooks/               @Quitetall
 /Cargo.toml               @Quitetall

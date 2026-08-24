@@ -20,6 +20,13 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: read
+
+concurrency:
+  group: capstone-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   capstone-cpu:
     name: capstone cpu e2e smoke

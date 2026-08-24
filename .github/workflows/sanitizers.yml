@@ -66,6 +66,13 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: read
+
+concurrency:
+  group: sanitizers-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   # ── (1a) AddressSanitizer ────────────────────────────────────────────────
   # Real codegen with ASan-instrumented std (`-Zbuild-std`). Runs the actual

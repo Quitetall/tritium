@@ -13,6 +13,13 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   # Required lane: must be green on every push. No GPU, default features only.
   cpu-only-green:

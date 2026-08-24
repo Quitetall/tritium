@@ -9,6 +9,13 @@
 # within the book tree) are checked. CPU-only, on every push + PR.
 name: docs
 
+permissions:
+  contents: read
+
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: true
+
 on:
   push:
     branches: [main]
