@@ -78,8 +78,10 @@ jobs:
         platform:
           # Linux (manylinux, built in the maturin container).
           - { os: linux, runner: ubuntu-latest, target: x86_64, target_id: linux-x86_64-cpu, smoke: true }
-          # macOS (universal2 covers both Apple Silicon + Intel in one wheel).
-          - { os: macos, runner: macos-latest, target: universal2, target_id: macos-arm64-cpu, smoke: true }
+          # macOS arm64. The ONNX Runtime dependency has no prebuilt
+          # x86_64-apple-darwin binary, so universal2 would claim a slice that
+          # cannot be built. The qualified compatibility cell is arm64.
+          - { os: macos, runner: macos-latest, target: aarch64, target_id: macos-arm64-cpu, smoke: true }
           # Windows.
           - { os: windows, runner: windows-latest, target: x64, target_id: windows-x86_64-cpu, smoke: true }
     steps:
@@ -191,7 +193,7 @@ jobs:
           python-version: ${{ matrix.python }}
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
-          name: wheel-macos-universal2
+          name: wheel-macos-aarch64
           path: dist
       - name: install exact abi3 wheel and run native smoke
         shell: bash
