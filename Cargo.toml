@@ -93,8 +93,8 @@ cbindgen = "0.29"
 # behind a DEFAULT feature, which `default-features = false` turns off, so a
 # Vulkan-only mask yields zero adapters on every Mac. The feature is a no-op on
 # non-Apple targets (wgpu-hal cfgs the backend out), so it costs Linux nothing.
-wgpu = { version = "=23.0.1", default-features = false, features = ["wgsl", "metal"] }
-pollster = "0.4"
+wgpu = { version = "=26.0.1", default-features = false, features = ["wgsl", "metal"] }
+pollster = "1.0"
 # metal backend (MSL mpGEMM over Apple Metal, tritium-metal). metal-rs is declared under
 # tritium-metal's [target.'cfg(target_os = "macos")'] table, so it is NEVER resolved on a
 # non-macOS host. Exact pin keeps cargo-deny wildcards=deny meaningful. (tritium-rocm needs no
@@ -112,15 +112,15 @@ ndarray = { version = "=0.17.2", default-features = false, features = ["std"] }
 # onnx interop (tritium-onnx, behind its `onnx` feature). default-features off so the crate opts
 # into exactly download-binaries + tls-rustls (fetch a prebuilt onnxruntime at build — no system
 # lib). Exact pin keeps cargo-deny wildcards=deny meaningful. rc.12 wraps ONNX Runtime 1.24.
-ort = { version = "=2.0.0-rc.12", default-features = false }
+ort = { version = "=2.0.0-rc.13", default-features = false }
 prost = "0.14"
 # candle interop (tritium-candle, behind its `candle` feature; CPU-only — no cuda/mkl/accelerate)
-candle-core = { version = "0.9", default-features = false }
+candle-core = { version = "0.11", default-features = false }
 # burn interop (tritium-burn, behind its `burn` feature; CPU-only NdArray backend in the test).
 # burn-tensor gives Tensor/Backend/TensorData; burn-ndarray is the concrete CPU backend. `std`
 # (needed for NdArray + TensorData::to_vec) pulls the MPL-2.0 `colored` crate (allow-listed in deny.toml).
-burn-tensor = { version = "=0.20.1", default-features = false, features = ["std"] }
-burn-ndarray = { version = "=0.20.1", default-features = false, features = ["std"] }
+burn-tensor = { version = "=0.21.0", default-features = false, features = ["std"] }
+burn-ndarray = { version = "=0.21.0", default-features = false, features = ["std"] }
 # cli
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
@@ -129,7 +129,7 @@ anyhow = "1"
 memmap2 = "0.9"
 # serve (OpenAI HTTP/SSE server; all behind tritium-serve's `serve` feature)
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "macros", "signal", "time", "sync"] }
-axum = { version = "0.7", default-features = false, features = ["http1", "json", "tokio"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 async-stream = "0.3"
 futures-core = "0.3"
 http-body-util = "0.1"
@@ -140,7 +140,7 @@ proptest = "1"
 divan = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 
 # Lints applied workspace-wide; crates opt in with `[lints] workspace = true`.
 [workspace.lints.rust]
