@@ -34,8 +34,8 @@
     "verify:pack": "node scripts/verify-pack.mjs"
   },
   "devDependencies": {
-    "@noble/hashes": "2.2.0",
-    "esbuild": "0.28.1",
+    "@noble/hashes": "2.3.0",
+    "esbuild": "0.28.2",
     "typescript": "7.0.2"
   },
   "engines": {
