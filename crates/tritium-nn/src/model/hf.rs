@@ -307,7 +307,7 @@ pub(crate) enum NameSchema {
 
 impl NameSchema {
     /// Top-level (non-layer) slot name.
-    pub(super) fn top(self, slot: &str) -> &'static str {
+    pub(crate) fn top(self, slot: &str) -> &'static str {
         match (self, slot) {
             (NameSchema::Hf, "token_embd") => "model.embed_tokens.weight",
             (NameSchema::Hf, "output_norm") => "model.norm.weight",
@@ -320,7 +320,7 @@ impl NameSchema {
     }
 
     /// Per-layer slot name.
-    pub(super) fn layer(self, i: usize, slot: &str) -> String {
+    pub(crate) fn layer(self, i: usize, slot: &str) -> String {
         let s = match (self, slot) {
             (NameSchema::Hf, _) => {
                 return format!(

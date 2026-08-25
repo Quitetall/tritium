@@ -108,6 +108,45 @@ pub fn extract(runner: &ModelRunner) -> (Arch, Vec<Vec<f32>>, Vec<(usize, usize)
     (arch, fp, shapes)
 }
 
+/// HuggingFace tensor names for the weights [`extract`] returns, **in the same order**.
+///
+/// Anything that writes a quantized artifact has to label each matrix with the name the loader
+/// will look it up by, and [`extract`] returns a bare `Vec<Vec<f32>>`. Deriving the names in the
+/// consumer would mean a second copy of the naming convention living outside this crate, which is
+/// how a rename turns into an artifact that loads but is silently wired wrong. This delegates to
+/// the same `NameSchema` the loader itself uses, so there is exactly one spelling of each name.
+///
+/// Index 0 is the tied token embedding; then per layer `q, k, v, o, gate, up, down`.
+/// `extract_names_match_weights` pins the parallel to [`extract`].
+pub fn weight_names(a: &Arch) -> Vec<String> {
+    let schema = crate::model::NameSchema::Hf;
+    let mut names = vec![schema.top("token_embd").to_owned()];
+    for li in 0..a.n_layers {
+        for slot in ["q", "k", "v", "o", "gate", "up", "down"] {
+            names.push(schema.layer(li, slot));
+        }
+    }
+    names
+}
+
+/// HuggingFace names of the fp 1-D norms, paired with the [`Arch`] fields holding them.
+///
+/// These are the tensors [`fold`] modifies, and `ModelWeights::load_salt` reads them from the fp
+/// master rather than from the SALT bundle ("only 1D norms come from the fp master"). A converter
+/// that writes the bundle but not these norms produces a model that loads and is *wrong* — the
+/// weights carry the fold, the norms do not. Returned in `(name, values)` pairs so a writer cannot
+/// mis-pair them.
+pub fn norm_tensors(a: &Arch) -> Vec<(String, &[f32])> {
+    let schema = crate::model::NameSchema::Hf;
+    let mut out = Vec::with_capacity(2 * a.n_layers + 1);
+    for li in 0..a.n_layers {
+        out.push((schema.layer(li, "attn_norm"), a.attn_norms[li].as_slice()));
+        out.push((schema.layer(li, "ffn_norm"), a.ffn_norms[li].as_slice()));
+    }
+    out.push((schema.top("output_norm").to_owned(), a.out_norm.as_slice()));
+    out
+}
+
 /// The whole-model forward on the tape (validated bit-exact vs `ModelRunner` in
 /// `tape_model_conformance`): embed_gather → N GQA blocks → SwiGLU → tied head. `wids[0]` is the
 /// tied embed/head; then per layer `q,k,v,o,gate,up,down`. Returns `[tokens.len(), vocab]` logits.
@@ -291,4 +330,71 @@ pub fn fold(
         divide_rows(&mut w[base + 5], shapes[base + 5].1, &sd);
     }
     (w, arch)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn arch(n_layers: usize) -> Arch {
+        Arch {
+            attn_norms: vec![vec![1.0; 4]; n_layers],
+            ffn_norms: vec![vec![1.0; 4]; n_layers],
+            out_norm: vec![1.0; 4],
+            n_embd: 4,
+            n_head: 2,
+            n_head_kv: 1,
+            head_dim: 2,
+            ff: 8,
+            vocab: 16,
+            eps: 1e-5,
+            theta: 10_000.0,
+            n_layers,
+        }
+    }
+
+    /// `weight_names` has to stay parallel to `extract`, which pushes the tied embedding and then
+    /// seven projections per layer. Nothing in the type system enforces that; this does.
+    #[test]
+    fn weight_names_match_extract_layout() {
+        for n_layers in [1usize, 2, 5] {
+            assert_eq!(weight_names(&arch(n_layers)).len(), 1 + 7 * n_layers);
+        }
+    }
+
+    /// A rename in the loader's schema would otherwise show up as an artifact that writes fine and
+    /// resolves nothing — pin the exact strings the loader looks up.
+    #[test]
+    fn weight_names_are_the_hf_spellings() {
+        let names = weight_names(&arch(2));
+        assert_eq!(names[0], "model.embed_tokens.weight");
+        assert_eq!(names[1], "model.layers.0.self_attn.q_proj.weight");
+        assert_eq!(names[7], "model.layers.0.mlp.down_proj.weight");
+        assert_eq!(names[8], "model.layers.1.self_attn.q_proj.weight");
+    }
+
+    /// The norms are the half of the fold that lives outside the SALT bundle. Mis-pairing a name
+    /// with the wrong vector produces a model that loads and is wrong, so the pairing is returned
+    /// as tuples and asserted here.
+    #[test]
+    fn norm_tensors_pair_every_norm_with_its_name() {
+        let mut a = arch(2);
+        a.attn_norms[1] = vec![7.0; 4];
+        a.ffn_norms[0] = vec![9.0; 4];
+        let norms = norm_tensors(&a);
+        assert_eq!(norms.len(), 2 * 2 + 1);
+        let lookup = |name: &str| {
+            norms
+                .iter()
+                .find(|(n, _)| n == name)
+                .unwrap_or_else(|| panic!("missing {name}"))
+                .1
+        };
+        assert_eq!(lookup("model.layers.1.input_layernorm.weight")[0], 7.0);
+        assert_eq!(
+            lookup("model.layers.0.post_attention_layernorm.weight")[0],
+            9.0
+        );
+        assert_eq!(lookup("model.norm.weight").len(), 4);
+    }
 }
