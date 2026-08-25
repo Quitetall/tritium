@@ -1,7 +1,7 @@
 {
   "schema": "tritium.compatibility-receipt.v1",
   "target_id": "linux-x86_64-cuda13-sm89",
-  "source_revision": "3662cc3f5125942a154a98bc9a694f6e7cbd4582",
+  "source_revision": "445d7e2a0f508ad32095b16ace9d75f10a161ed3",
   "passed": true,
   "install_smoke": true,
   "host_os": "linux",
