@@ -1230,6 +1230,15 @@ where
     let campaign = workspace
         .open_master_campaign(spec)
         .map_err(Qwen36PtqDriverError::Workspace)?;
+    if campaign
+        .completion_path_is_present()
+        .map_err(Qwen36PtqDriverError::Workspace)?
+    {
+        let receipt = campaign
+            .reopen_complete_current()
+            .map_err(Qwen36PtqDriverError::Workspace)?;
+        return finish(&campaign, receipt);
+    }
     for (ordinal, expected) in campaign.spec().expected_masters().iter().enumerate() {
         let tensor_index =
             u64::try_from(ordinal).map_err(|_| Qwen36PtqDriverError::AllocationFailed)?;

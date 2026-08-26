@@ -773,6 +773,28 @@ impl<'source> Qwen36TensorWorkStore<'source> {
 }
 
 impl<'store, 'source> Qwen36AdditiveCampaignStore<'store, 'source> {
+    /// Strictly reopen an already sealed PTQ campaign without replaying its
+    /// producers. The completion seal remains authoritative; every referenced
+    /// slot and object is still verified before the receipt is returned.
+    #[cfg(unix)]
+    pub(crate) fn reopen_complete_current(
+        &self,
+    ) -> Result<Qwen36CompleteWorkspaceReceipt, Qwen36TensorWorkError> {
+        self.require_complete_verified(FixedCampaignMode::Skip)
+            .map(|(receipt, _, _)| receipt)
+    }
+
+    pub(crate) fn completion_path_is_present(&self) -> Result<bool, Qwen36TensorWorkError> {
+        match fs::symlink_metadata(self.completion_path()) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => Err(
+                Qwen36TensorWorkError::InvalidPath("complete additive workspace"),
+            ),
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(work_io("inspect completion seal", error)),
+        }
+    }
+
     /// Open or resume a scale-only child whose parent is this sealed PTQ campaign.
     ///
     /// Child metadata must bind every corresponding parent tensor master and
