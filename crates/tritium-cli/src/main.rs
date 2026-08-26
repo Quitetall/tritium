@@ -109,12 +109,18 @@ enum Command {
     },
     /// Load a GGUF model and greedily generate tokens from a JSON file of input IDs.
     Generate {
-        /// Path to the `.gguf` model file.
+        /// A `.gguf` model file, or a directory written by `tritium convert`.
         #[arg(long)]
         model: PathBuf,
-        /// Path to a JSON file holding the input token IDs, e.g. `[1, 128000, 9906]`.
-        #[arg(long)]
-        tokens: PathBuf,
+        /// Path to a JSON file holding the input token IDs, e.g. `[1, 128000, 9906]`. The
+        /// reproducible path: no tokenizer is consulted, so the same ids always go in and out.
+        #[arg(long, conflicts_with = "prompt", required_unless_present = "prompt")]
+        tokens: Option<PathBuf>,
+        /// Text prompt, tokenized with the MODEL'S OWN tokenizer (`tokenizer.json` in a
+        /// `tritium convert` directory, or the BPE embedded in a GGUF). Token ids are only
+        /// meaningful relative to the vocabulary that produced them, so there is no fallback.
+        #[arg(long, conflicts_with = "tokens")]
+        prompt: Option<String>,
         /// Maximum number of new tokens to generate.
         #[arg(long, default_value_t = 16)]
         max_new: usize,
@@ -427,12 +433,19 @@ fn main() -> anyhow::Result<()> {
         Command::Generate {
             model,
             tokens,
+            prompt,
             max_new,
             greedy,
             eos,
         } => {
-            let ids = generate::read_token_file(&tokens)?;
-            generate::run(&model, &ids, max_new, greedy, eos)?;
+            // clap guarantees exactly one of the two is present.
+            let ids = tokens.map(|p| generate::read_token_file(&p)).transpose()?;
+            let source = match (&ids, &prompt) {
+                (Some(ids), _) => generate::Prompt::Ids(ids),
+                (None, Some(text)) => generate::Prompt::Text(text),
+                (None, None) => unreachable!("clap requires --tokens or --prompt"),
+            };
+            generate::run(&model, &source, max_new, greedy, eos)?;
         }
         Command::Repack { input, output, to } => repack::run(&input, &output, to)?,
         Command::Transport { transport: command } => transport::run(command)?,
