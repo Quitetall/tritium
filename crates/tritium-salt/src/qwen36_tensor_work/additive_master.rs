@@ -148,6 +148,31 @@ impl Qwen36AdditiveCampaignSpec {
         &self.expected_masters
     }
 
+    /// Reconstruct a pure-PTQ specification from a sealed campaign manifest.
+    ///
+    /// Completion metadata is sufficient to recover campaign identity without
+    /// reopening source shards during resume.
+    #[cfg(unix)]
+    fn from_complete_manifest(manifest: &CompleteManifest) -> Result<Self, Qwen36TensorWorkError> {
+        let mut masters = Vec::new();
+        masters
+            .try_reserve_exact(manifest.masters.len())
+            .map_err(|_| Qwen36TensorWorkError::AllocationFailed)?;
+        for receipt in &manifest.masters {
+            let master = SaltV2MasterTensorSpec::from_canonical_bytes(
+                receipt.record.info().schema_metadata(),
+            )
+            .map_err(Qwen36TensorWorkError::Master)?;
+            if master.evidence().track != SaltV2MasterTrack::Ptq
+                || master.evidence().parent_master_id.is_some()
+            {
+                return Err(Qwen36TensorWorkError::RefinedCampaignRequiresParent);
+            }
+            masters.push(master);
+        }
+        Self::new(masters)
+    }
+
     #[cfg(unix)]
     fn new_scale_only(
         parent_completion: &Qwen36CompleteWorkspaceReceipt,
@@ -685,6 +710,86 @@ pub struct Qwen36ScaleOnlyCampaignStore<'parent, 'store, 'source> {
 }
 
 impl<'source> Qwen36TensorWorkStore<'source> {
+    /// Discover sealed pure-PTQ campaigns matching this immutable base.
+    ///
+    /// This reads only bounded completion metadata and master descriptors. It
+    /// deliberately does not widen source tensors or stream master payloads;
+    /// callers perform strict payload verification after selecting a candidate.
+    #[cfg(unix)]
+    pub(crate) fn find_existing_ptq_campaign_specs(
+        &self,
+    ) -> Result<Vec<Qwen36AdditiveCampaignSpec>, Qwen36TensorWorkError> {
+        let base_workspace = self.reopen_workspace()?;
+        let campaigns = self.root().join(CAMPAIGN_DIRECTORY);
+        let entries = match fs::read_dir(&campaigns) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(work_io("read additive campaign directory", error)),
+        };
+        let expected_summary = base_workspace
+            .summary()
+            .with_additive_present(base_workspace.summary().additive_required())?;
+        let mut candidates = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|error| work_io("read additive campaign entry", error))?;
+            let root = entry.path();
+            let metadata = fs::symlink_metadata(&root)
+                .map_err(|error| work_io("inspect additive campaign entry", error))?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(Qwen36TensorWorkError::InvalidPath(
+                    "additive campaign entry",
+                ));
+            }
+            let completion_path = root.join(COMPLETION_FILE);
+            let completion_bytes = match fs::symlink_metadata(&completion_path) {
+                Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                    return Err(Qwen36TensorWorkError::InvalidPath(
+                        "complete additive workspace",
+                    ));
+                }
+                Ok(_) => read_regular_bounded(
+                    &completion_path,
+                    MAX_WORKSPACE_BYTES as u64,
+                    "complete additive workspace",
+                )?,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(work_io("inspect completion seal", error)),
+            };
+            let manifest = CompleteManifest::from_canonical_bytes(&completion_bytes)?;
+            if manifest.base_workspace_id != base_workspace.workspace_id()
+                || manifest.proof_id != base_workspace.proof_id()
+                || manifest.manifest_content_id != base_workspace.manifest_content_id()
+                || manifest.source_model_id != base_workspace.source_model_id()
+                || manifest.coverage_policy_digest != *base_workspace.coverage_policy_digest()
+                || manifest.identity_status != base_workspace.identity_status()
+                || manifest.summary != expected_summary
+                || manifest.masters.len() != self.additive_slots().len()
+            {
+                continue;
+            }
+            let spec = match Qwen36AdditiveCampaignSpec::from_complete_manifest(&manifest) {
+                Ok(spec) => spec,
+                Err(Qwen36TensorWorkError::RefinedCampaignRequiresParent) => continue,
+                Err(error) => return Err(error),
+            };
+            let additive_coefficients = validate_spec_against_base(&spec, self, &base_workspace)?;
+            if manifest.additive_coefficients != additive_coefficients {
+                continue;
+            }
+            let descriptor =
+                campaign_descriptor_bytes(&base_workspace, &spec, additive_coefficients)?;
+            let campaign_id = ContentId::of_bytes(&descriptor);
+            if manifest.campaign_id != campaign_id
+                || entry.file_name().to_string_lossy() != campaign_id.to_string()
+            {
+                continue;
+            }
+            candidates.push(spec);
+        }
+        candidates.sort_by_key(|spec| spec.spec_id().to_string());
+        Ok(candidates)
+    }
+
     /// Open or resume an exclusive additive campaign over this exact base workspace.
     ///
     /// The campaign identity binds the byte-exact base workspace and every
@@ -4221,6 +4326,40 @@ mod tests {
         assert!(campaign.require_complete().is_err());
 
         drop(campaign);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn discovers_sealed_ptq_campaign_from_completion_without_source_replay() {
+        let root = fixture_root("sealed-ptq-discovery");
+        let _ = fs::remove_dir_all(&root);
+        let source = EmptySource;
+        let base = Qwen36TensorWorkStore::open_from_parts(&source, root.clone(), fixture_plan())
+            .expect("open fixture workspace");
+        base.reconcile_preserved().expect("seal fixture workspace");
+        let spec = fixture_campaign_spec();
+        let campaign = base
+            .open_master_campaign(spec.clone())
+            .expect("open fixture campaign");
+        for (ordinal, expected) in spec.expected_masters().iter().enumerate() {
+            campaign
+                .install_master(expected, |writer| {
+                    write_fixture_master(expected, writer, (ordinal + 1) as u8)
+                })
+                .expect("install fixture master");
+        }
+        let completion = campaign.seal_complete().expect("seal fixture campaign");
+        drop(campaign);
+
+        let candidates = base
+            .find_existing_ptq_campaign_specs()
+            .expect("discover sealed campaign");
+        assert_eq!(candidates, vec![spec.clone()]);
+        let reopened = base
+            .open_master_campaign(candidates.into_iter().next().unwrap())
+            .expect("reopen discovered campaign");
+        assert_eq!(reopened.reopen_complete_current().unwrap(), completion);
+
         let _ = fs::remove_dir_all(root);
     }
 
