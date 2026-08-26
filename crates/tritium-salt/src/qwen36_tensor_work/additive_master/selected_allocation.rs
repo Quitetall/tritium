@@ -635,6 +635,44 @@ impl Qwen36AllocatedCampaignStore<'_, '_, '_> {
 }
 
 impl<'store, 'source> Qwen36AdditiveCampaignStore<'store, 'source> {
+    /// Reopen an existing durable selection, or derive it once when absent.
+    ///
+    /// An existing selection is never silently replaced: its exact policy must
+    /// match `spec`, and every parent/map record is revalidated by
+    /// [`Self::reopen_selected_allocation`]. This keeps resumable package
+    /// reconciliation from repeating the expensive physical-allocation scans.
+    #[cfg(unix)]
+    pub fn reopen_or_allocate_selected_allocation<'parent>(
+        &'parent self,
+        spec: Qwen36SelectedAllocationSpec,
+    ) -> Result<Qwen36AllocatedCampaignStore<'parent, 'store, 'source>, Qwen36PhysicalAllocationError>
+    {
+        let selection_path = self.root.join(SELECTION_DIRECTORY).join(SELECTION_FILE);
+        match fs::symlink_metadata(&selection_path) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                Err(Qwen36PhysicalAllocationError::Campaign(
+                    Qwen36TensorWorkError::InvalidPath("selected allocation manifest"),
+                ))
+            }
+            Ok(_) => {
+                let allocated = self.reopen_selected_allocation()?;
+                if allocated.receipt().spec() != &spec {
+                    return Err(Qwen36PhysicalAllocationError::Campaign(
+                        Qwen36TensorWorkError::WorkspaceMismatch("selected allocation policy"),
+                    ));
+                }
+                Ok(allocated)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                self.allocate_selected_allocation(spec)
+            }
+            Err(error) => Err(Qwen36PhysicalAllocationError::Campaign(work_io(
+                "inspect selected allocation manifest",
+                error,
+            ))),
+        }
+    }
+
     /// Derive and durably bind the exact Compact/Near allocation from verified masters.
     ///
     /// The canonical package rate model converts both serialized and indexed-runtime
@@ -1292,6 +1330,20 @@ impl<'store, 'source> Qwen36AdditiveCampaignStore<'store, 'source> {
 }
 
 impl<'parent, 'store, 'source> Qwen36AllocatedCampaignStore<'parent, 'store, 'source> {
+    pub(crate) fn verify_cheap_current(&self) -> Result<(), Qwen36TensorWorkError> {
+        let (root, _objects, _directories) = self.parent.open_selection_store()?;
+        let current = read_selection_receipt(&root.join(SELECTION_FILE))?;
+        if current != self.receipt {
+            return Err(Qwen36TensorWorkError::WorkspaceMismatch(
+                "selected allocation receipt",
+            ));
+        }
+        validate_receipt_binding(&current, &self.parent_completion, self.parent.campaign_id)?;
+        validate_map_record_descriptors(&current)?;
+        self.parent
+            .verify_completion_receipt(&self.parent_completion)
+    }
+
     /// Strictly revalidate this allocation, both maps, and every parent prefix.
     ///
     /// # Errors

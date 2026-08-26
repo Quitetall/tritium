@@ -4716,7 +4716,13 @@ mod tests {
         assert_eq!(reopened.receipt().compact().selected_planes(), 2);
         assert_eq!(reopened.receipt().near_lossless().selected_planes(), 4);
 
+        let resumed = parent
+            .reopen_or_allocate_selected_allocation(full_tile_selection_spec())
+            .expect("resume existing physical allocation");
+        assert_eq!(resumed.receipt(), reopened.receipt());
+
         drop(reopened);
+        drop(resumed);
         drop(parent);
         drop(base);
         let _ = fs::remove_dir_all(root);
@@ -4877,6 +4883,11 @@ mod tests {
         let admitted = allocated
             .materialize_and_admit_packages()
             .expect("materialize and admit selected packages");
+        let resumed = allocated
+            .reopen_or_materialize_packages()
+            .expect("reopen materialized selected packages");
+        assert_eq!(resumed.receipt(), admitted.receipt());
+        drop(resumed);
         assert_eq!(
             admitted.receipt().compact().package_id(),
             PackageId::from_package_bytes(&compact)

@@ -1150,8 +1150,8 @@ pub fn reconcile_qwen36_ptq_packages(
             limits.compact(),
             limits.near_lossless(),
         )?;
-        let allocated = campaign.allocate_selected_allocation(spec)?;
-        let admitted_packages = allocated.materialize_and_admit_packages()?;
+        let allocated = campaign.reopen_or_allocate_selected_allocation(spec)?;
+        let admitted_packages = allocated.reopen_or_materialize_packages()?;
         export_admitted_package(
             &admitted_packages,
             SaltV2Profile::CompactV1,
