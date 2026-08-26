@@ -94,7 +94,7 @@ cbindgen = "0.29"
 # Vulkan-only mask yields zero adapters on every Mac. The feature is a no-op on
 # non-Apple targets (wgpu-hal cfgs the backend out), so it costs Linux nothing.
 wgpu = { version = "=23.0.1", default-features = false, features = ["wgsl", "metal"] }
-pollster = "0.4"
+pollster = "1.0"
 # metal backend (MSL mpGEMM over Apple Metal, tritium-metal). metal-rs is declared under
 # tritium-metal's [target.'cfg(target_os = "macos")'] table, so it is NEVER resolved on a
 # non-macOS host. Exact pin keeps cargo-deny wildcards=deny meaningful. (tritium-rocm needs no
@@ -115,7 +115,7 @@ ndarray = { version = "=0.17.2", default-features = false, features = ["std"] }
 ort = { version = "=2.0.0-rc.12", default-features = false }
 prost = "0.14"
 # candle interop (tritium-candle, behind its `candle` feature; CPU-only — no cuda/mkl/accelerate)
-candle-core = { version = "0.9", default-features = false }
+candle-core = { version = "0.11", default-features = false }
 # burn interop (tritium-burn, behind its `burn` feature; CPU-only NdArray backend in the test).
 # burn-tensor gives Tensor/Backend/TensorData; burn-ndarray is the concrete CPU backend. `std`
 # (needed for NdArray + TensorData::to_vec) pulls the MPL-2.0 `colored` crate (allow-listed in deny.toml).
@@ -129,7 +129,7 @@ anyhow = "1"
 memmap2 = "0.9"
 # serve (OpenAI HTTP/SSE server; all behind tritium-serve's `serve` feature)
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "macros", "signal", "time", "sync"] }
-axum = { version = "0.7", default-features = false, features = ["http1", "json", "tokio"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 async-stream = "0.3"
 futures-core = "0.3"
 http-body-util = "0.1"
