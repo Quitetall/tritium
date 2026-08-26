@@ -889,6 +889,13 @@ impl<'store, 'source> Qwen36AdditiveCampaignStore<'store, 'source> {
             .map(|(receipt, _, _)| receipt)
     }
 
+    #[cfg(not(unix))]
+    pub(crate) fn reopen_complete_current(
+        &self,
+    ) -> Result<Qwen36CompleteWorkspaceReceipt, Qwen36TensorWorkError> {
+        Err(Qwen36TensorWorkError::AdditiveCampaignUnsupportedPlatform)
+    }
+
     pub(crate) fn completion_path_is_present(&self) -> Result<bool, Qwen36TensorWorkError> {
         match fs::symlink_metadata(self.completion_path()) {
             Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => Err(
