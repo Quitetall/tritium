@@ -15,9 +15,10 @@ pub use grouping::{
 
 use core::fmt;
 use std::{
-    fs::{self, File},
-    io::{self, Write},
+    fs::{self, File, OpenOptions},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use tritium_format::{ModelId, salt_v2::SaltV2Codec};
@@ -1190,6 +1191,7 @@ where
             .map_err(|_| Qwen36PtqDriverError::AllocationFailed)?,
     )?;
     let source_model_id = admitted.proof().source_model_id();
+    let weight_spool = Qwen36WeightSpool::create(workspace.root())?;
 
     let mut expected_masters = Vec::new();
     expected_masters
@@ -1211,6 +1213,7 @@ where
                     tensor_index,
                     source,
                 })?;
+        weight_spool.write(tensor_index, &weights)?;
         let input = restart_input(slot, tensor_index, source_model_id, &weights, &record)?;
         expected_masters.push(
             plan_salt_v2_restartable_tensor_master(input, config).map_err(|source| {
@@ -1247,12 +1250,7 @@ where
             .install_master(expected, |writer| {
                 let record = evidence.reopen(tensor_index)?;
                 validate_record(slot, tensor_index, source_model_id, &record)?;
-                let weights = admitted.tensor_f32(slot.name()).map_err(|source| {
-                    Qwen36PtqDriverError::Source {
-                        tensor_index,
-                        source,
-                    }
-                })?;
+                let weights = weight_spool.read(tensor_index)?;
                 let input = restart_input(slot, tensor_index, source_model_id, &weights, &record)?;
                 let result = fit_salt_v2_restartable_tensor_master(input, config, writer).map_err(
                     |source| Qwen36PtqDriverError::Fit {
@@ -1444,6 +1442,157 @@ fn restart_input<'a>(
     })
 }
 
+/// Disk-backed source-weight handoff between PTQ planning and fitting.
+///
+/// Planning must materialize every master specification before the resumable
+/// campaign can open. Keeping all widened tensors in memory is unsafe for a
+/// 27B model, while widening the source a second time multiplies SafeTensors
+/// range reads. This short-lived spool keeps one tensor at a time in memory and
+/// makes the second phase read local bytes instead of reopening model shards.
+struct Qwen36WeightSpool {
+    root: PathBuf,
+}
+
+impl Qwen36WeightSpool {
+    fn create(workspace_root: &Path) -> Result<Self, Qwen36PtqDriverError> {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| {
+                evidence_io(
+                    "create source-weight spool",
+                    None,
+                    io::Error::other("clock before epoch"),
+                )
+            })?
+            .as_nanos();
+        let root = workspace_root.join(format!(".ptq-weight-spool-{}-{nonce}", std::process::id()));
+        fs::create_dir(&root)
+            .map_err(|error| evidence_io("create source-weight spool", None, error))?;
+        Ok(Self { root })
+    }
+
+    fn path(&self, tensor_index: u64) -> PathBuf {
+        self.root.join(format!("{tensor_index:06}.f32"))
+    }
+
+    fn write(&self, tensor_index: u64, weights: &[f32]) -> Result<(), Qwen36PtqDriverError> {
+        let path = self.path(tensor_index);
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|error| {
+                evidence_io(
+                    "create source-weight spool record",
+                    Some(tensor_index),
+                    error,
+                )
+            })?;
+        let count =
+            u64::try_from(weights.len()).map_err(|_| Qwen36PtqDriverError::AllocationFailed)?;
+        file.write_all(&count.to_le_bytes()).map_err(|error| {
+            evidence_io(
+                "write source-weight spool header",
+                Some(tensor_index),
+                error,
+            )
+        })?;
+        #[cfg(target_endian = "little")]
+        {
+            let byte_len = weights
+                .len()
+                .checked_mul(std::mem::size_of::<f32>())
+                .ok_or(Qwen36PtqDriverError::AllocationFailed)?;
+            // SAFETY: f32 is a plain four-byte value and the slice is read-only
+            // for the duration of this write. Little-endian hosts preserve the
+            // canonical on-disk representation directly.
+            let bytes =
+                unsafe { std::slice::from_raw_parts(weights.as_ptr().cast::<u8>(), byte_len) };
+            file.write_all(bytes).map_err(|error| {
+                evidence_io(
+                    "write source-weight spool payload",
+                    Some(tensor_index),
+                    error,
+                )
+            })?;
+        }
+        #[cfg(target_endian = "big")]
+        for weight in weights {
+            file.write_all(&weight.to_le_bytes()).map_err(|error| {
+                evidence_io(
+                    "write source-weight spool payload",
+                    Some(tensor_index),
+                    error,
+                )
+            })?;
+        }
+        file.sync_all().map_err(|error| {
+            evidence_io("sync source-weight spool record", Some(tensor_index), error)
+        })?;
+        Ok(())
+    }
+
+    fn read(&self, tensor_index: u64) -> Result<Vec<f32>, Qwen36PtqDriverError> {
+        let path = self.path(tensor_index);
+        let mut file = File::open(&path).map_err(|error| {
+            evidence_io("open source-weight spool record", Some(tensor_index), error)
+        })?;
+        let metadata = file.metadata().map_err(|error| {
+            evidence_io(
+                "inspect source-weight spool record",
+                Some(tensor_index),
+                error,
+            )
+        })?;
+        let mut count_bytes = [0_u8; 8];
+        file.read_exact(&mut count_bytes).map_err(|error| {
+            evidence_io("read source-weight spool header", Some(tensor_index), error)
+        })?;
+        let count = usize::try_from(u64::from_le_bytes(count_bytes))
+            .map_err(|_| Qwen36PtqDriverError::AllocationFailed)?;
+        let payload_bytes = count
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or(Qwen36PtqDriverError::AllocationFailed)?;
+        let expected_bytes = 8_u64
+            .checked_add(
+                u64::try_from(payload_bytes).map_err(|_| Qwen36PtqDriverError::AllocationFailed)?,
+            )
+            .ok_or(Qwen36PtqDriverError::AllocationFailed)?;
+        if metadata.len() != expected_bytes {
+            return Err(Qwen36PtqDriverError::EvidenceMismatch {
+                tensor_index,
+                field: "source-weight spool length",
+            });
+        }
+        let mut payload = Vec::new();
+        payload
+            .try_reserve_exact(payload_bytes)
+            .map_err(|_| Qwen36PtqDriverError::AllocationFailed)?;
+        payload.resize(payload_bytes, 0);
+        file.read_exact(&mut payload).map_err(|error| {
+            evidence_io(
+                "read source-weight spool payload",
+                Some(tensor_index),
+                error,
+            )
+        })?;
+        let mut weights = Vec::new();
+        weights
+            .try_reserve_exact(count)
+            .map_err(|_| Qwen36PtqDriverError::AllocationFailed)?;
+        for chunk in payload.chunks_exact(4) {
+            weights.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        }
+        Ok(weights)
+    }
+}
+
+impl Drop for Qwen36WeightSpool {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
 fn map_install_error(
     error: Qwen36AdditiveInstallError<Qwen36PtqDriverError>,
 ) -> Qwen36PtqDriverError {
@@ -1620,6 +1769,25 @@ mod tests {
         ));
         fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    #[test]
+    fn source_weight_spool_round_trips_little_endian_f32_and_cleans_up() {
+        let root = temp_root("weight-spool");
+        let spool_root;
+        {
+            let spool = Qwen36WeightSpool::create(&root).unwrap();
+            spool_root = spool.root.clone();
+            spool
+                .write(7, &[1.25, -0.5, 0.0, std::f32::consts::PI])
+                .unwrap();
+            assert_eq!(
+                spool.read(7).unwrap(),
+                vec![1.25, -0.5, 0.0, std::f32::consts::PI]
+            );
+        }
+        assert!(!spool_root.exists());
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn source_model_id() -> ModelId {
