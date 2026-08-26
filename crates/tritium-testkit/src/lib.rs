@@ -35,6 +35,7 @@
 #![deny(missing_docs)]
 
 mod codec_vectors;
+mod deltanet_activations;
 mod frozen;
 mod generate;
 mod jsonl;
@@ -47,6 +48,7 @@ mod vector;
 pub use codec_vectors::{
     Conv1dVector, FsqVector, generate_conv_vectors, generate_fsq_vectors, grade_conv, grade_fsq,
 };
+pub use deltanet_activations::{DELTANET_ACTIVATION_VECTORS, assert_deltanet_activations};
 pub use frozen::{
     FROZEN_COUNT, FROZEN_SEED, VECTOR_SET_VERSION, frozen_vectors, frozen_vectors_path,
 };

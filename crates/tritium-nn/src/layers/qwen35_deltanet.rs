@@ -866,3 +866,16 @@ mod tests {
         assert!(cache.is_empty());
     }
 }
+
+#[cfg(test)]
+mod activation_parity {
+    /// The ONNX backend carries a character-for-character copy of these three functions
+    /// (`deltanet_softplus`/`_sigmoid`/`_silu` in `tritium-onnx`). The duplication exists solely so
+    /// the two backends agree, and nothing asserted that until this test. `tritium-onnx` runs the
+    /// same vectors against its copy, so a change to either side now fails rather than silently
+    /// diverging. See ADR 0039 WS-G.
+    #[test]
+    fn native_activations_match_the_shared_golden_vectors() {
+        tritium_testkit::assert_deltanet_activations(super::softplus, super::sigmoid, super::silu);
+    }
+}
