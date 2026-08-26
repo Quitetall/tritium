@@ -1,5 +1,6 @@
 //! Deterministic Stage-7 token-evidence pack builder.
 
+use crate::hex::hex_digest;
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsString,
@@ -562,7 +563,7 @@ fn file_record(path: &Path, logical: &str) -> anyhow::Result<FileRecord> {
     );
     let mut file = File::open(path)?;
     let mut hasher = Sha256::new();
-    let bytes = std::io::copy(&mut file, &mut hasher)?;
+    let bytes = hash_reader(&mut file, &mut hasher)?;
     Ok(FileRecord {
         path: logical.to_owned(),
         bytes,
@@ -622,7 +623,7 @@ fn open_record(
         "{label} size differs"
     );
     let mut hasher = Sha256::new();
-    let bytes = std::io::copy(&mut file, &mut hasher)?;
+    let bytes = hash_reader(&mut file, &mut hasher)?;
     ensure!(
         bytes == record.bytes && hex_digest(&hasher.finalize()) == record.sha256,
         "{label} identity differs"
@@ -708,12 +709,21 @@ fn valid_hex(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn hex_digest(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push(char::from(HEX[usize::from(byte >> 4)]));
-        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+/// Stream `reader` into `hasher`, returning the number of bytes consumed.
+///
+/// Replaces `std::io::copy(&mut file, &mut hasher)`: sha2 0.11 dropped the `std::io::Write` impl on
+/// its hashers, and 0.11.0 exposes no `std` feature at all (only `alloc`/`oid`/`zeroize`), so there
+/// is nothing to turn back on. An explicit loop does not depend on an impl that has already moved
+/// once, and it keeps the byte count `io::copy` used to return.
+fn hash_reader(mut reader: impl std::io::Read, hasher: &mut Sha256) -> std::io::Result<u64> {
+    let mut buffer = [0u8; 64 * 1024];
+    let mut total = 0u64;
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(total);
+        }
+        hasher.update(&buffer[..read]);
+        total += read as u64;
     }
-    output
 }

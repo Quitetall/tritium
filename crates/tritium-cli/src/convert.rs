@@ -381,9 +381,8 @@ fn write_receipt(
 
 fn file_digest(path: &Path) -> Result<String> {
     let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
-    Ok(format!(
-        "{:x}",
-        <sha2::Sha256 as sha2::Digest>::digest(&bytes)
+    Ok(crate::hex::hex_digest(
+        &<sha2::Sha256 as sha2::Digest>::digest(&bytes),
     ))
 }
 

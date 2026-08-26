@@ -42,6 +42,7 @@ mod convert;
 mod generate;
 #[cfg(feature = "cuda")]
 mod hestia_gate;
+mod hex;
 mod inspect;
 #[cfg(feature = "cuda")]
 mod nvml_probe;
