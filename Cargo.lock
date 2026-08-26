@@ -4263,6 +4263,7 @@ dependencies = [
  "tritium-quantize",
  "tritium-runtime",
  "tritium-spec",
+ "tritium-testkit",
  "tritium-train",
 ]
 

@@ -4721,3 +4721,18 @@ mod tests {
             .0
     }
 }
+
+#[cfg(test)]
+mod deltanet_activation_parity {
+    /// The native DeltaNet in `tritium-nn` carries a character-for-character copy of these three
+    /// functions. Both crates assert the same golden vectors, so a change to either copy fails
+    /// here instead of producing a silent backend divergence. See ADR 0039 WS-G.
+    #[test]
+    fn onnx_activations_match_the_shared_golden_vectors() {
+        tritium_testkit::assert_deltanet_activations(
+            super::deltanet_softplus,
+            super::deltanet_sigmoid,
+            super::deltanet_silu,
+        );
+    }
+}
