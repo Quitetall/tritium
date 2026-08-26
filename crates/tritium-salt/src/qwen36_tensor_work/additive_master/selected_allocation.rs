@@ -1232,6 +1232,13 @@ impl<'store, 'source> Qwen36AdditiveCampaignStore<'store, 'source> {
         }
     }
 
+    #[cfg(not(unix))]
+    fn open_selection_store(
+        &self,
+    ) -> Result<(PathBuf, TensorWorkStore, Vec<PinnedDirectory>), Qwen36TensorWorkError> {
+        Err(Qwen36TensorWorkError::AdditiveCampaignUnsupportedPlatform)
+    }
+
     #[cfg(unix)]
     fn open_selection_store(
         &self,

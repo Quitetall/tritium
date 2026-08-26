@@ -197,6 +197,14 @@ impl Default for SaltV2Config {
     }
 }
 
+impl SaltV2Config {
+    /// Content identity of fitting choices independent of deployment rate.
+    #[must_use]
+    pub fn master_recipe_id(&self) -> [u8; 32] {
+        master_recipe_digest(self)
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 enum CurvatureValues<'a> {
     Diagonal(&'a [f32]),

@@ -26,7 +26,13 @@ class OciContractTests(unittest.TestCase):
             for ref in refs:
                 self.assertIn("@sha256:", ref)
                 self.assertRegex(ref.rsplit("@", 1)[1], DIGEST)
-            self.assertIn("gcr.io/distroless/cc-debian12:nonroot@sha256:", refs[-1])
+            # Assert the CONTRACT, not one image name: the runtime stage must be a
+            # digest-pinned, nonroot distroless image. Pinning the exact base broke this test
+            # when the runtime moved cc-debian12 -> base-nossl-debian13 to drop an unused
+            # OpenSSL, which was a deliberate improvement the test should not have blocked.
+            self.assertRegex(
+                refs[-1], r"^gcr\.io/distroless/[a-z0-9.\-]+:nonroot@sha256:[0-9a-f]{64}$"
+            )
 
     def test_runtime_contract_has_no_installer_or_mutable_volume(self):
         for flavor in ("cpu", "cuda"):

@@ -173,9 +173,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-      - uses: taiki-e/install-action@7f4eb899022d8fe70b20c4f3de697aa85c309026
-        with:
-          tool: actionlint@1.7.7
+      # Download the pinned release binary directly. `taiki-e/install-action` does not carry
+      # actionlint, so it falls back to cargo-binstall, which cannot find it either (actionlint
+      # is not published as a crate) and the job dies with exit 76. The checksum keeps this as
+      # pinned as the action would have been.
+      - name: install pinned actionlint binary
+        env:
+          ACTIONLINT_SHA256: 023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/actionlint_1.7.7_linux_amd64.tar.gz"
+          curl --fail --location --silent --show-error --retry 3 \
+            --output "$archive" \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.7/actionlint_1.7.7_linux_amd64.tar.gz
+          echo "$ACTIONLINT_SHA256  $archive" | sha256sum --check --strict
+          tar --extract --gzip --file "$archive" --directory "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
       - run: actionlint
 
   # API-stability gate (ADR 0011/0012): no UNINTENTIONAL breaking change to the

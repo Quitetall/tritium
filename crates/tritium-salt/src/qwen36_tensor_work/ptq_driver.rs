@@ -1191,6 +1191,38 @@ where
             .map_err(|_| Qwen36PtqDriverError::AllocationFailed)?,
     )?;
     let source_model_id = admitted.proof().source_model_id();
+    workspace
+        .reconcile_preserved()
+        .map_err(Qwen36PtqDriverError::Workspace)?;
+
+    #[cfg(unix)]
+    for spec in workspace
+        .find_existing_ptq_campaign_specs()
+        .map_err(Qwen36PtqDriverError::Workspace)?
+    {
+        if !existing_ptq_campaign_matches_evidence(
+            &workspace,
+            evidence,
+            &spec,
+            config,
+            source_model_id,
+        )? {
+            continue;
+        }
+        let campaign = workspace
+            .open_master_campaign(spec)
+            .map_err(Qwen36PtqDriverError::Workspace)?;
+        if campaign
+            .completion_path_is_present()
+            .map_err(Qwen36PtqDriverError::Workspace)?
+        {
+            let receipt = campaign
+                .reopen_complete_current()
+                .map_err(Qwen36PtqDriverError::Workspace)?;
+            return finish(&campaign, receipt);
+        }
+    }
+
     let weight_spool = Qwen36WeightSpool::create(workspace.root())?;
 
     let mut expected_masters = Vec::new();
@@ -1226,9 +1258,6 @@ where
     }
 
     let spec = Qwen36AdditiveCampaignSpec::new(expected_masters)
-        .map_err(Qwen36PtqDriverError::Workspace)?;
-    workspace
-        .reconcile_preserved()
         .map_err(Qwen36PtqDriverError::Workspace)?;
     let campaign = workspace
         .open_master_campaign(spec)
@@ -1272,6 +1301,45 @@ where
         .seal_complete()
         .map_err(Qwen36PtqDriverError::Workspace)?;
     finish(&campaign, receipt)
+}
+
+#[cfg(unix)]
+fn existing_ptq_campaign_matches_evidence(
+    workspace: &Qwen36TensorWorkStore<'_>,
+    evidence: &Qwen36PtqEvidenceDirectory,
+    spec: &Qwen36AdditiveCampaignSpec,
+    config: &SaltV2Config,
+    source_model_id: ModelId,
+) -> Result<bool, Qwen36PtqDriverError> {
+    let expected_recipe = config.master_recipe_id();
+    let expected_constraint = config.packing.fit_constraint();
+    let expected_max_planes =
+        u8::try_from(config.max_planes).map_err(|_| Qwen36PtqDriverError::AllocationFailed)?;
+    let mut activation_digest = None;
+    let mut token_stream_digest = None;
+    for (ordinal, (slot, expected)) in workspace
+        .additive_slots()
+        .iter()
+        .zip(spec.expected_masters())
+        .enumerate()
+    {
+        let tensor_index =
+            u64::try_from(ordinal).map_err(|_| Qwen36PtqDriverError::AllocationFailed)?;
+        let record = evidence.reopen(tensor_index)?;
+        validate_record(slot, tensor_index, source_model_id, &record)?;
+        bind_activation_cache(&mut activation_digest, tensor_index, &record)?;
+        bind_token_stream(&mut token_stream_digest, tensor_index, &record)?;
+        let master_evidence = expected.evidence();
+        if master_evidence.recipe_id != expected_recipe
+            || master_evidence.activation_digest != record.source_id().activation_cache_digest()
+            || master_evidence.curvature_digest != record.artifact().digest()
+            || expected.geometry().constraint != expected_constraint
+            || expected.geometry().max_planes != expected_max_planes
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn packing_codec(packing: SaltV2Packing) -> SaltV2Codec {
