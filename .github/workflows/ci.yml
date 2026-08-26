@@ -168,6 +168,25 @@ jobs:
         with:
           command: check licenses bans sources advisories
 
+  workflow-lint:
+    name: workflow lint (actionlint)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: install pinned actionlint binary
+        env:
+          ACTIONLINT_SHA256: 023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/actionlint_1.7.7_linux_amd64.tar.gz"
+          curl --fail --location --silent --show-error --retry 3 \
+            --output "$archive" \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.7/actionlint_1.7.7_linux_amd64.tar.gz
+          echo "$ACTIONLINT_SHA256  $archive" | sha256sum --check --strict
+          tar --extract --gzip --file "$archive" --directory "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+      - run: actionlint
+
   # API-stability gate (ADR 0011/0012): no UNINTENTIONAL breaking change to the
   # stable public-API crates vs the last v0.5.* release tag. Pre-1.0 breaks are
   # allowed but must be deliberate; this surfaces them. fetch-depth: 0 so the
@@ -492,6 +511,7 @@ jobs:
       - compatibility-matrix
       - web-package
       - cargo-deny
+      - workflow-lint
       - semver
       - cpu-bench-smoke
       - wasm
