@@ -25,7 +25,7 @@ use std::{
     error::Error,
     fmt,
     fs::{self, File},
-    io::{self, Read, Seek, SeekFrom, Write},
+    io::{self, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
 
@@ -72,6 +72,7 @@ const MAX_SELECTION_BYTES: u64 = 512 * 1024;
 const MAP_WRITE_BUFFER_BYTES: usize = 64 * 1024;
 const MAP_WRITE_BUFFER_BYTES_U64: u64 = 64 * 1024;
 const HESSIAN_CURVE_BYTES: u64 = 3 * std::mem::size_of::<f64>() as u64;
+const HESSIAN_CURVE_BUFFER_BYTES: usize = 64 * 1024;
 
 /// Immutable policy selecting one codec and two exact nested profile budgets.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -644,6 +645,7 @@ impl Qwen36AllocatedCampaignStore<'_, '_, '_> {
 struct HessianCurveSpool {
     path: PathBuf,
     file: File,
+    buffer: Vec<u8>,
     count: u64,
 }
 
@@ -655,15 +657,14 @@ impl HessianCurveSpool {
         Ok(Self {
             path,
             file,
+            buffer: Vec::with_capacity(HESSIAN_CURVE_BUFFER_BYTES),
             count: 0,
         })
     }
 
     fn push(&mut self, curve: UniformPrefixCurve) -> Result<(), Qwen36TensorWorkError> {
         for distortion in curve.distortions() {
-            self.file
-                .write_all(&distortion.to_le_bytes())
-                .map_err(|error| work_io("write selected Hessian curve spool", error))?;
+            self.buffer.extend_from_slice(&distortion.to_le_bytes());
         }
         self.count = self
             .count
@@ -671,6 +672,17 @@ impl HessianCurveSpool {
             .ok_or(Qwen36TensorWorkError::LengthOverflow(
                 "selected Hessian curve spool count",
             ))?;
+        if self.buffer.len() >= HESSIAN_CURVE_BUFFER_BYTES {
+            self.flush_buffer()?;
+        }
+        Ok(())
+    }
+
+    fn flush_buffer(&mut self) -> Result<(), Qwen36TensorWorkError> {
+        self.file
+            .write_all(&self.buffer)
+            .map_err(|error| work_io("write selected Hessian curve spool", error))?;
+        self.buffer.clear();
         Ok(())
     }
 
@@ -680,6 +692,7 @@ impl HessianCurveSpool {
                 "selected Hessian curve spool coverage",
             ));
         }
+        self.flush_buffer()?;
         self.file
             .sync_all()
             .map_err(|error| work_io("sync selected Hessian curve spool", error))?;
@@ -703,12 +716,13 @@ impl HessianCurveSpool {
         &self,
         planner: &mut PackedUniformProfilePlanner<'_>,
     ) -> Result<(), Qwen36PhysicalAllocationError> {
-        let mut file = File::open(&self.path).map_err(|error| {
+        let file = File::open(&self.path).map_err(|error| {
             Qwen36PhysicalAllocationError::Campaign(work_io(
                 "open selected Hessian curve spool",
                 error,
             ))
         })?;
+        let mut file = BufReader::new(file);
         for _ in 0..self.count {
             let mut bytes = [0_u8; HESSIAN_CURVE_BYTES as usize];
             file.read_exact(&mut bytes).map_err(|error| {
