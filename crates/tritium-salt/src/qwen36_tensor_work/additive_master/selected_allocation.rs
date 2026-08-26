@@ -71,6 +71,7 @@ const MAP_SCHEMA: &[u8] = b"tritium qwen3.6 packed selected allocation map v1";
 const MAX_SELECTION_BYTES: u64 = 512 * 1024;
 const MAP_WRITE_BUFFER_BYTES: usize = 64 * 1024;
 const MAP_WRITE_BUFFER_BYTES_U64: u64 = 64 * 1024;
+const HESSIAN_CURVE_BYTES: u64 = 3 * std::mem::size_of::<f64>() as u64;
 
 /// Immutable policy selecting one codec and two exact nested profile budgets.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -634,6 +635,127 @@ impl Qwen36AllocatedCampaignStore<'_, '_, '_> {
     }
 }
 
+/// Disk-backed Hessian prefix curves shared by both nested profile planners.
+///
+/// Physical allocation must not retain one curve per tile in memory. Replaying
+/// this short-lived spool also avoids reopening every verified master once per
+/// profile while preserving exact source order and bounded resident memory.
+#[cfg(unix)]
+struct HessianCurveSpool {
+    path: PathBuf,
+    file: File,
+    count: u64,
+}
+
+#[cfg(unix)]
+impl HessianCurveSpool {
+    fn create(root: &Path) -> Result<Self, Qwen36TensorWorkError> {
+        let (path, file) = create_temporary_file(root, ".selected-hessian-curves")
+            .map_err(Qwen36TensorWorkError::TensorStore)?;
+        Ok(Self {
+            path,
+            file,
+            count: 0,
+        })
+    }
+
+    fn push(&mut self, curve: UniformPrefixCurve) -> Result<(), Qwen36TensorWorkError> {
+        for distortion in curve.distortions() {
+            self.file
+                .write_all(&distortion.to_le_bytes())
+                .map_err(|error| work_io("write selected Hessian curve spool", error))?;
+        }
+        self.count = self
+            .count
+            .checked_add(1)
+            .ok_or(Qwen36TensorWorkError::LengthOverflow(
+                "selected Hessian curve spool count",
+            ))?;
+        Ok(())
+    }
+
+    fn finish(&mut self, expected: u64) -> Result<(), Qwen36TensorWorkError> {
+        if self.count != expected {
+            return Err(Qwen36TensorWorkError::WorkspaceMismatch(
+                "selected Hessian curve spool coverage",
+            ));
+        }
+        self.file
+            .sync_all()
+            .map_err(|error| work_io("sync selected Hessian curve spool", error))?;
+        let expected_bytes = expected.checked_mul(HESSIAN_CURVE_BYTES).ok_or(
+            Qwen36TensorWorkError::LengthOverflow("selected Hessian curve spool bytes"),
+        )?;
+        let actual_bytes = self
+            .file
+            .metadata()
+            .map_err(|error| work_io("inspect selected Hessian curve spool", error))?
+            .len();
+        if actual_bytes != expected_bytes {
+            return Err(Qwen36TensorWorkError::WorkspaceMismatch(
+                "selected Hessian curve spool length",
+            ));
+        }
+        Ok(())
+    }
+
+    fn replay(
+        &self,
+        planner: &mut PackedUniformProfilePlanner<'_>,
+    ) -> Result<(), Qwen36PhysicalAllocationError> {
+        let mut file = File::open(&self.path).map_err(|error| {
+            Qwen36PhysicalAllocationError::Campaign(work_io(
+                "open selected Hessian curve spool",
+                error,
+            ))
+        })?;
+        for _ in 0..self.count {
+            let mut bytes = [0_u8; HESSIAN_CURVE_BYTES as usize];
+            file.read_exact(&mut bytes).map_err(|error| {
+                Qwen36PhysicalAllocationError::Campaign(work_io(
+                    "read selected Hessian curve spool",
+                    error,
+                ))
+            })?;
+            let curve = UniformPrefixCurve::new([
+                f64::from_le_bytes(bytes[0..8].try_into().expect("curve field")),
+                f64::from_le_bytes(bytes[8..16].try_into().expect("curve field")),
+                f64::from_le_bytes(bytes[16..24].try_into().expect("curve field")),
+            ])
+            .map_err(|error| {
+                Qwen36PhysicalAllocationError::Allocation(UniformProfileAllocError::Allocation(
+                    error,
+                ))
+            })?;
+            planner
+                .push(curve)
+                .map_err(Qwen36PhysicalAllocationError::Allocation)?;
+        }
+        let mut trailing = [0_u8; 1];
+        if file.read(&mut trailing).map_err(|error| {
+            Qwen36PhysicalAllocationError::Campaign(work_io(
+                "check selected Hessian curve spool length",
+                error,
+            ))
+        })? != 0
+        {
+            return Err(Qwen36PhysicalAllocationError::Campaign(
+                Qwen36TensorWorkError::WorkspaceMismatch(
+                    "selected Hessian curve spool trailing bytes",
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+impl Drop for HessianCurveSpool {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
 impl<'store, 'source> Qwen36AdditiveCampaignStore<'store, 'source> {
     /// Reopen an existing durable selection, or derive it once when absent.
     ///
@@ -717,7 +839,13 @@ impl<'store, 'source> Qwen36AdditiveCampaignStore<'store, 'source> {
             compact_maximum - rate.tile_count(),
             SaltV2Profile::CompactV1,
         )?;
-        self.push_verified_hessian_curves(&parent_manifest.masters, &mut compact_planner)?;
+        let mut curve_spool = HessianCurveSpool::create(&self.root)
+            .map_err(Qwen36PhysicalAllocationError::Campaign)?;
+        self.spool_verified_hessian_curves(&parent_manifest.masters, &mut curve_spool)?;
+        curve_spool
+            .finish(rate.tile_count())
+            .map_err(Qwen36PhysicalAllocationError::Campaign)?;
+        curve_spool.replay(&mut compact_planner)?;
         let compact = compact_planner.finish()?;
 
         let near_maximum = maximum_present_planes(
@@ -741,7 +869,7 @@ impl<'store, 'source> Qwen36AdditiveCampaignStore<'store, 'source> {
             near_maximum - compact.present_planes,
             SaltV2Profile::NearLosslessV1,
         )?;
-        self.push_verified_hessian_curves(&parent_manifest.masters, &mut near_planner)?;
+        curve_spool.replay(&mut near_planner)?;
         let near = near_planner.finish()?;
         let tile_count = rate.tile_count();
         let counts = (0..tile_count).map(|tile| {
@@ -775,10 +903,10 @@ impl<'store, 'source> Qwen36AdditiveCampaignStore<'store, 'source> {
     }
 
     #[cfg(unix)]
-    fn push_verified_hessian_curves(
+    fn spool_verified_hessian_curves(
         &self,
         parent_masters: &[Qwen36AdditiveMasterReceipt],
-        planner: &mut PackedUniformProfilePlanner<'_>,
+        spool: &mut HessianCurveSpool,
     ) -> Result<(), Qwen36PhysicalAllocationError> {
         if parent_masters.len() != self.spec.expected_masters.len() {
             return Err(Qwen36TensorWorkError::WorkspaceMismatch(
@@ -817,9 +945,9 @@ impl<'store, 'source> Qwen36AdditiveCampaignStore<'store, 'source> {
                                         UniformProfileAllocError::Allocation(error),
                                     )
                                 })?;
-                                planner
+                                spool
                                     .push(curve)
-                                    .map_err(Qwen36PhysicalAllocationError::Allocation)?;
+                                    .map_err(Qwen36PhysicalAllocationError::Campaign)?;
                                 local_tiles = local_tiles.checked_add(1).ok_or({
                                     Qwen36PhysicalAllocationError::Campaign(
                                         Qwen36TensorWorkError::LengthOverflow(
@@ -2581,5 +2709,41 @@ mod tests {
     fn flagship_profile_map_size_is_exact_and_stays_out_of_small_manifests() {
         const QWEN36_ADDITIVE_TILES: u64 = 106_711_040;
         assert_eq!(packed_map_bytes(QWEN36_ADDITIVE_TILES).unwrap(), 26_677_760);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hessian_curve_spool_round_trips_exact_records_and_cleans_up() {
+        use super::{HESSIAN_CURVE_BYTES, HessianCurveSpool, UniformPrefixCurve};
+        use std::{
+            fs,
+            time::{SystemTime, UNIX_EPOCH},
+        };
+
+        let root = std::env::temp_dir().join(format!(
+            "tritium-selected-curves-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let (path, count) = {
+            let mut spool = HessianCurveSpool::create(&root).unwrap();
+            spool
+                .push(UniformPrefixCurve::new([9.0, 4.0, 1.0]).unwrap())
+                .unwrap();
+            spool
+                .push(UniformPrefixCurve::new([8.0, 8.0, 0.5]).unwrap())
+                .unwrap();
+            spool.finish(2).unwrap();
+            let path = spool.path.clone();
+            assert_eq!(fs::metadata(&path).unwrap().len(), 2 * HESSIAN_CURVE_BYTES);
+            (path, spool.count)
+        };
+        assert_eq!(count, 2);
+        assert!(!path.exists());
+        fs::remove_dir(&root).unwrap();
     }
 }
