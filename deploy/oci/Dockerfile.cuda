@@ -24,7 +24,7 @@ RUN test "${#SOURCE_REVISION}" -eq 40 \
     && test -n "${SOURCE_CREATED}"
 RUN cargo build --frozen --profile dist -p tritium-serve --features device-loss-qualification --bin tritium-serve
 
-FROM gcr.io/distroless/cc-debian12:nonroot@sha256:471dbca9cad607b9a32c10e9c31fb09ffaeb2d460e0afbff86c27abbc80b1b98
+FROM gcr.io/distroless/base-nossl-debian13:nonroot@sha256:5cab74e7f8a5e7c5f1c8a9e6268b1f352f053c36c656f493308340bcecbc636c
 ARG SOURCE_REVISION
 ARG SOURCE_CREATED
 LABEL org.opencontainers.image.title="Tritium Serve CUDA" \
@@ -39,6 +39,7 @@ LABEL org.opencontainers.image.title="Tritium Serve CUDA" \
       io.tritium.artifact.schema="3" \
       io.tritium.startup-receipt.schema="1"
 COPY --from=build --chown=65532:65532 /src/target/dist/tritium-serve /usr/local/bin/tritium-serve
+COPY --from=build /usr/lib/x86_64-linux-gnu/libgcc_s.so.1 /usr/lib/x86_64-linux-gnu/libgcc_s.so.1
 COPY --chown=65532:65532 LICENSE NOTICE /usr/share/licenses/tritium/
 COPY --chown=65532:65532 deploy/oci/models /models
 USER 65532:65532
