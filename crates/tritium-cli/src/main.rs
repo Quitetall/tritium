@@ -38,6 +38,7 @@ mod campaign;
 mod campaign_artifact;
 #[cfg(feature = "nccl")]
 mod campaign_world;
+mod convert;
 mod generate;
 #[cfg(feature = "cuda")]
 mod hestia_gate;
@@ -154,6 +155,41 @@ enum Command {
         /// Transport operation.
         #[command(subcommand)]
         transport: transport::TransportCommand,
+    },
+    /// Convert a Hugging Face fp model directory to a ready-to-run ternary model directory.
+    ///
+    /// Unlike `quantize`, this loads the whole model, so it can run the activation-aware salience
+    /// fold (`--calib`) — the lever every published SALT number was measured under — and it writes
+    /// the folded norms alongside the bundle. Writing only a bundle would produce a model whose
+    /// weights carry the fold and whose norms do not.
+    Convert {
+        /// Hugging Face model directory (config.json + safetensors shards).
+        #[arg(long)]
+        model: PathBuf,
+        /// Output directory: config.json + model.safetensors (folded norms) + model.tslb.
+        #[arg(long)]
+        out: PathBuf,
+        /// Calibration corpus for the salience fold: either a corpus JSON with a `train_ids`
+        /// array, or a UTF-8 text file tokenized with the model's own tokenizer. Without it the
+        /// fold is skipped and the result matches `tritium quantize`.
+        #[arg(long)]
+        calib: Option<PathBuf>,
+        /// Calibration tokens to use (rounded down to whole 512-token windows).
+        #[arg(long, default_value_t = 4096)]
+        calib_tokens: usize,
+        /// Salience-fold strength. 0.75 is the value every published SALT number used, but the
+        /// optimum shifts DOWN with model size (0.75 -> 0.50 observed), so it is worth sweeping.
+        #[arg(long, default_value_t = 0.75)]
+        fold_alpha: f64,
+        /// Plane count. 4 measures 1.024x fp on SmolLM2-360M without any fold; 3 measures 1.335x.
+        #[arg(long, default_value_t = 4)]
+        planes: usize,
+        /// Scale-group width. Must be a multiple of 256 (one f16 scale per TQ2_0 block).
+        #[arg(long, default_value_t = 256)]
+        group: usize,
+        /// Delta candidates per group for the ladder's `s0` grid search.
+        #[arg(long, default_value_t = 16)]
+        grid: usize,
     },
     /// SALT-quantize an fp safetensors model to a SALT bundle.
     Quantize {
@@ -484,6 +520,29 @@ fn main() -> anyhow::Result<()> {
                 format,
             )?,
         },
+        Command::Convert {
+            model,
+            out,
+            calib,
+            calib_tokens,
+            fold_alpha,
+            planes,
+            group,
+            grid,
+        } => convert::run(
+            &model,
+            &out,
+            &convert::ConvertConfig {
+                calib,
+                calib_tokens,
+                fold_alpha,
+                ladder: quantize_ladder::LadderConfig {
+                    planes,
+                    group,
+                    grid,
+                },
+            },
+        )?,
         Command::Quantize {
             input,
             output,
