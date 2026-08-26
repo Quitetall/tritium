@@ -1,19 +1,39 @@
-//! `tritium generate`: load a GGUF model and greedily decode tokens.
+//! `tritium generate`: load a model and greedily decode tokens.
 //!
-//! The subcommand is deterministic and offline-reproducible: input token IDs come
-//! from a JSON file (`--tokens`), generation is greedy, and the output is the list
-//! of newly generated token IDs printed one per line (plus a JSON array for easy
-//! machine consumption). The model is loaded through
-//! [`tritium_nn::ModelRunner`], which selects a backend via the runtime registry.
+//! The subcommand is deterministic and offline-reproducible: generation is greedy, and the output
+//! is the list of newly generated token IDs printed one per line (plus a JSON array for easy
+//! machine consumption). The model is loaded through [`tritium_nn::ModelRunner`], which selects a
+//! backend via the runtime registry.
 //!
-//! Like the rest of the CLI, every failure flows through [`anyhow::Result`]: a
-//! missing model, an unreadable token file, malformed JSON, or a model that is
-//! missing weights all yield a clean message and a non-zero exit — never a panic.
+//! # Two kinds of model, because a converter that produces nothing runnable is half a feature
+//!
+//! `--model` accepts either a `.gguf` file or a **directory written by `tritium convert`** (ADR
+//! 0038 WS-4). Until this existed, `convert` wrote an artifact that only the library could load:
+//! `generate` was GGUF-only and `report` takes fp masters, so the adoption spine stopped one step
+//! short of running anything.
+//!
+//! A converted directory is recognised by the presence of `model.tslb` beside `config.json`, and
+//! loaded with [`ModelRunner::from_salt`]. Dispatching on *content* rather than on the `--model`
+//! spelling means a mistyped path fails as "not a model" instead of being silently treated as the
+//! other kind.
+//!
+//! # Prompts
+//!
+//! `--tokens <file.json>` remains the reproducible path: exact ids in, exact ids out, no tokenizer
+//! in the loop. `--prompt "..."` is the ergonomic one, and it uses the **model's own** tokenizer —
+//! `tokenizer.json` from a converted directory (which `convert` copies for exactly this reason) or
+//! the BPE embedded in a GGUF. Ids are only meaningful relative to the vocabulary that produced
+//! them, so there is no default tokenizer to fall back on; if none is available, the command says
+//! so rather than emitting confident nonsense.
+//!
+//! Like the rest of the CLI, every failure flows through [`anyhow::Result`]: a missing model, an
+//! unreadable token file, malformed JSON, or a model that is missing weights all yield a clean
+//! message and a non-zero exit — never a panic.
 
 use std::path::Path;
 
-use anyhow::Context as _;
-use tritium_nn::ModelRunner;
+use anyhow::{Context as _, bail};
+use tritium_nn::{GgufBpeTokenizer, HfJsonTokenizer, ModelRunner, Tokenizer};
 
 /// Parse a JSON file of input token IDs.
 ///
@@ -70,7 +90,7 @@ pub(crate) fn render_output(tokens: &[u32]) -> String {
 /// caller maps this to a non-zero exit; nothing here panics on bad input.
 pub(crate) fn run(
     model_path: &Path,
-    tokens: &[u32],
+    prompt: &Prompt<'_>,
     max_new: usize,
     greedy: bool,
     eos: u32,
@@ -82,17 +102,97 @@ pub(crate) fn run(
         );
     }
 
-    let bytes = std::fs::read(model_path)
-        .with_context(|| format!("failed to read model `{}`", model_path.display()))?;
-    let mut runner = ModelRunner::load_cpu(&bytes)
-        .with_context(|| format!("failed to load model `{}`", model_path.display()))?;
+    let (mut runner, tokenizer) = load(model_path)?;
+
+    let tokens = match prompt {
+        Prompt::Ids(ids) => (*ids).to_vec(),
+        Prompt::Text(text) => {
+            let Some(tokenizer) = tokenizer.as_ref() else {
+                bail!(
+                    "--prompt needs a tokenizer, and `{}` does not carry one. A `tritium convert` \
+                     directory has tokenizer.json (copied from the source model); a GGUF must embed \
+                     its BPE. Use --tokens <ids.json> instead, or convert from a source snapshot \
+                     that includes tokenizer.json.",
+                    model_path.display()
+                );
+            };
+            tokenizer
+                .encode(text)
+                .map_err(|e| anyhow::anyhow!("tokenize prompt: {e}"))?
+        }
+    };
+    if tokens.is_empty() {
+        bail!("the prompt is empty — nothing to condition generation on");
+    }
 
     let generated = runner
-        .generate(tokens, max_new, eos)
+        .generate(&tokens, max_new, eos)
         .context("generation failed")?;
 
+    // Text out only when text went in: `--tokens` promises exact ids in, exact ids out, and a
+    // decoded string there would be a different contract than the reproducible path advertises.
+    if let (Prompt::Text(_), Some(tokenizer)) = (prompt, tokenizer.as_ref())
+        && let Ok(text) = tokenizer.decode(&generated)
+    {
+        println!("{text}");
+    }
     print!("{}", render_output(&generated));
     Ok(())
+}
+
+/// What to condition generation on.
+pub(crate) enum Prompt<'a> {
+    /// Exact token ids from `--tokens`. No tokenizer is consulted, so this path is reproducible
+    /// across tokenizer versions.
+    Ids(&'a [u32]),
+    /// Raw text from `--prompt`, tokenized with the model's own tokenizer.
+    Text(&'a str),
+}
+
+/// Load a model, plus its tokenizer when it carries one.
+///
+/// Dispatches on **content**: a directory holding `model.tslb` is a `tritium convert` output and
+/// loads through [`ModelRunner::from_salt`]; anything else is read as a GGUF file. A path that is
+/// neither fails as "not a model" rather than being silently misread as the other kind.
+fn load(model_path: &Path) -> anyhow::Result<(ModelRunner, Option<Box<dyn Tokenizer>>)> {
+    if model_path.is_dir() {
+        let bundle = model_path.join("model.tslb");
+        if !bundle.exists() {
+            bail!(
+                "`{}` is a directory but has no model.tslb, so it is not a `tritium convert` \
+                 output. Pass a converted directory or a .gguf file.",
+                model_path.display()
+            );
+        }
+        let runner = ModelRunner::from_salt(
+            model_path,
+            &bundle,
+            Box::new(tritium_cpu::CpuBackend::new()),
+        )
+        .with_context(|| format!("failed to load converted model `{}`", model_path.display()))?;
+
+        // `convert` copies these; a source snapshot without them still converts fine, so their
+        // absence is a missing capability rather than a broken model.
+        let tokenizer_json = model_path.join("tokenizer.json");
+        let tokenizer = if tokenizer_json.exists() {
+            HfJsonTokenizer::from_files(&tokenizer_json, &model_path.join("tokenizer_config.json"))
+                .ok()
+                .map(|t| Box::new(t) as Box<dyn Tokenizer>)
+        } else {
+            None
+        };
+        return Ok((runner, tokenizer));
+    }
+
+    let bytes = std::fs::read(model_path)
+        .with_context(|| format!("failed to read model `{}`", model_path.display()))?;
+    let runner = ModelRunner::load_cpu(&bytes)
+        .with_context(|| format!("failed to load model `{}`", model_path.display()))?;
+    let tokenizer = tritium_format::read_gguf(&bytes)
+        .ok()
+        .and_then(|f| GgufBpeTokenizer::from_gguf(&f).ok())
+        .map(|t| Box::new(t) as Box<dyn Tokenizer>);
+    Ok((runner, tokenizer))
 }
 
 #[cfg(test)]
@@ -152,7 +252,7 @@ mod tests {
     fn run_on_missing_model_errors_cleanly() {
         let err = run(
             Path::new("/nonexistent/model.gguf"),
-            &[1, 2, 3],
+            &Prompt::Ids(&[1, 2, 3]),
             4,
             true,
             128_001,
@@ -162,5 +262,17 @@ mod tests {
             format!("{err:#}").contains("failed to read model"),
             "{err:#}"
         );
+    }
+
+    /// A path that exists but is a directory without `model.tslb` must be rejected as "not a
+    /// converted model", not fall through to `std::fs::read` and surface a bare EISDIR.
+    #[test]
+    fn run_on_a_directory_without_a_bundle_names_the_missing_file() {
+        let dir = std::env::temp_dir().join(format!("tritium-gen-unit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let err = run(&dir, &Prompt::Ids(&[1, 2, 3]), 4, true, 128_001)
+            .expect_err("a directory with no bundle must error");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(format!("{err:#}").contains("model.tslb"), "{err:#}");
     }
 }
