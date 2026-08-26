@@ -26,6 +26,11 @@ mod weights;
 
 #[cfg(feature = "tokenizer")]
 pub use bpe_tokenizer::GgufBpeTokenizer;
+// The tensor-name schema the SALT loader resolves tensors by. Crate-visible so `calibrate` can
+// label a converted artifact with the same spellings, instead of a second copy of the convention
+// living in whichever crate writes the file. Deliberately not feature-gated: naming has nothing to
+// do with tokenizers, and it was briefly captured by the `tokenizer` cfg above.
+pub(crate) use hf::NameSchema;
 #[cfg(feature = "tokenizer")]
 pub use hf_json_tokenizer::HfJsonTokenizer;
 pub use qwen35::{

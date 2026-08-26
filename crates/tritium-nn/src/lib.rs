@@ -13,6 +13,7 @@
 //! No `unsafe` here — the numerics are plain Rust; the backend owns the SIMD/GPU.
 #![forbid(unsafe_code)]
 
+pub mod calibrate;
 mod config;
 mod error;
 mod evaluation;
