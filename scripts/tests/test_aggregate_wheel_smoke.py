@@ -53,6 +53,20 @@ class AggregateWheelSmokeTests(unittest.TestCase):
             self.assertEqual(receipt["target_id"], MODULE.TARGET_ID)
             self.assertEqual(len(receipt["cells"]), len(MODULE.expected_cells()))
 
+    def test_native_macos_arm64_platform_passes(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            write_matrix(root)
+            for path in root.glob("macos-arm64-cpu-*.json"):
+                value = json.loads(path.read_text())
+                value["platform_tag"] = "macosx_11_0_arm64"
+                value["wheel"] = value["wheel"].replace(
+                    "macosx_11_0_universal2", "macosx_11_0_arm64"
+                )
+                path.write_text(json.dumps(value), encoding="utf-8")
+            receipt = MODULE.aggregate(root, REVISION, RELEASE, "run-arm64")
+            self.assertTrue(receipt["passed"])
+
     def test_missing_cell_fails(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)

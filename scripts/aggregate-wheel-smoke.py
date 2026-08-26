@@ -24,7 +24,11 @@ VERSIONS = {
 TARGET_CONTRACTS = {
     "linux-x86_64-cpu": ("linux", {"x86_64", "amd64"}, r"manylinux.*_x86_64"),
     "windows-x86_64-cpu": ("win32", {"x86_64", "amd64"}, r"win_amd64"),
-    "macos-arm64-cpu": ("darwin", {"arm64", "aarch64"}, r"macosx_.*_universal2"),
+    "macos-arm64-cpu": (
+        "darwin",
+        {"arm64", "aarch64"},
+        r"macosx_.*_(?:arm64|universal2)",
+    ),
 }
 FIELDS = {
     "schema",
