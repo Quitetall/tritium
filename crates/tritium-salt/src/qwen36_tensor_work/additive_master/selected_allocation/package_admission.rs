@@ -538,9 +538,32 @@ impl Qwen36PackageAdmittedCampaignStore<'_, '_, '_, '_> {
         max_chunk_bytes: usize,
         mut visit: impl FnMut(&[u8]) -> Result<(), E>,
     ) -> Result<u64, Qwen36PackageVisitError<E>> {
+        self.try_visit_package_inner(profile, max_chunk_bytes, &mut visit, true)
+    }
+
+    /// Visit one package without repeating the strict parent scan after the
+    /// callback.  Callers must perform one strict `verify_current` after all
+    /// related package visits complete; this is used only by the paired export
+    /// path, which stages both profiles before publication.
+    pub(crate) fn try_visit_package_without_postcheck<E>(
+        &self,
+        profile: SaltV2Profile,
+        max_chunk_bytes: usize,
+        mut visit: impl FnMut(&[u8]) -> Result<(), E>,
+    ) -> Result<u64, Qwen36PackageVisitError<E>> {
+        self.try_visit_package_inner(profile, max_chunk_bytes, &mut visit, false)
+    }
+
+    fn try_visit_package_inner<E>(
+        &self,
+        profile: SaltV2Profile,
+        max_chunk_bytes: usize,
+        visit: &mut impl FnMut(&[u8]) -> Result<(), E>,
+        postcheck: bool,
+    ) -> Result<u64, Qwen36PackageVisitError<E>> {
         // Store construction performed full lineage validation. Receipt,
         // directory, and pinned-record checks are sufficient before opening
-        // the exact package handle; the post-visit check remains full.
+        // the exact package handle.
         self.verify_cheap_current()
             .map_err(Qwen36PackageVisitError::Admission)?;
         let (_, objects, _) = self
@@ -564,9 +587,12 @@ impl Qwen36PackageAdmittedCampaignStore<'_, '_, '_, '_> {
                 TensorVisitError::Sink(error) => Qwen36PackageVisitError::Sink(error),
             })?;
         // The post-visit full check detects parent mutation after a
-        // nontransactional sink received bytes.
-        self.verify_current()
-            .map_err(Qwen36PackageVisitError::Admission)?;
+        // nontransactional sink received bytes. Paired export defers this
+        // check until both profiles have been staged.
+        if postcheck {
+            self.verify_current()
+                .map_err(Qwen36PackageVisitError::Admission)?;
+        }
         Ok(selected.package_ledger().total_bytes)
     }
 

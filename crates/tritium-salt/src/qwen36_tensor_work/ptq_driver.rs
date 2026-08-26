@@ -1156,11 +1156,13 @@ pub fn reconcile_qwen36_ptq_packages(
             &admitted_packages,
             SaltV2Profile::CompactV1,
             &mut compact_output,
+            false,
         )?;
         export_admitted_package(
             &admitted_packages,
             SaltV2Profile::NearLosslessV1,
             &mut near_lossless_output,
+            true,
         )?;
         Ok(Qwen36PtqPackagesReceipt {
             completion,
@@ -1305,17 +1307,23 @@ fn export_admitted_package(
     admitted: &crate::Qwen36PackageAdmittedCampaignStore<'_, '_, '_, '_>,
     profile: SaltV2Profile,
     output: &mut impl Write,
+    postcheck: bool,
 ) -> Result<(), Qwen36PtqPackageError> {
-    admitted
-        .try_visit_package(profile, 64 * 1024, |chunk| output.write_all(chunk))
-        .map_err(|error| match error {
-            Qwen36PackageVisitError::Admission(error) => Qwen36PtqPackageError::Admission(error),
-            Qwen36PackageVisitError::Sink(error) => Qwen36PtqPackageError::Output {
-                profile,
-                operation: "write",
-                kind: error.kind(),
-            },
-        })?;
+    let visit = if postcheck {
+        admitted.try_visit_package(profile, 64 * 1024, |chunk| output.write_all(chunk))
+    } else {
+        admitted.try_visit_package_without_postcheck(profile, 64 * 1024, |chunk| {
+            output.write_all(chunk)
+        })
+    };
+    visit.map_err(|error| match error {
+        Qwen36PackageVisitError::Admission(error) => Qwen36PtqPackageError::Admission(error),
+        Qwen36PackageVisitError::Sink(error) => Qwen36PtqPackageError::Output {
+            profile,
+            operation: "write",
+            kind: error.kind(),
+        },
+    })?;
     output
         .flush()
         .map_err(|error| Qwen36PtqPackageError::Output {
