@@ -813,10 +813,10 @@ impl<'store, 'source> Qwen36AdditiveCampaignStore<'store, 'source> {
     ///
     /// The canonical package rate model converts both serialized and indexed-runtime
     /// ceilings into exact plane cardinalities. Parent masters are verified and decoded
-    /// once per profile directly into the callback-driven compact solver; only ranked
-    /// upgrade records and two-bit maps scale with tile count. Hessian prefix loss is the
-    /// optimization objective. Counts beyond a tile's admitted prefix receive zero gain
-    /// and therefore cannot be selected.
+    /// once into a bounded temporary curve spool, then replayed into each callback-driven
+    /// compact solver; only ranked upgrade records and two-bit maps scale with tile count.
+    /// Hessian prefix loss is the optimization objective. Counts beyond a tile's admitted
+    /// prefix receive zero gain and therefore cannot be selected.
     ///
     /// # Errors
     /// Fails closed for changed parent state, ragged or unindexable package geometry,
