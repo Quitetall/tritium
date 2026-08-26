@@ -538,7 +538,33 @@ impl Qwen36PackageAdmittedCampaignStore<'_, '_, '_, '_> {
         max_chunk_bytes: usize,
         mut visit: impl FnMut(&[u8]) -> Result<(), E>,
     ) -> Result<u64, Qwen36PackageVisitError<E>> {
-        self.verify_current()
+        self.try_visit_package_inner(profile, max_chunk_bytes, &mut visit, true)
+    }
+
+    /// Visit one package without repeating the strict parent scan after the
+    /// callback.  Callers must perform one strict `verify_current` after all
+    /// related package visits complete; this is used only by the paired export
+    /// path, which stages both profiles before publication.
+    pub(crate) fn try_visit_package_without_postcheck<E>(
+        &self,
+        profile: SaltV2Profile,
+        max_chunk_bytes: usize,
+        mut visit: impl FnMut(&[u8]) -> Result<(), E>,
+    ) -> Result<u64, Qwen36PackageVisitError<E>> {
+        self.try_visit_package_inner(profile, max_chunk_bytes, &mut visit, false)
+    }
+
+    fn try_visit_package_inner<E>(
+        &self,
+        profile: SaltV2Profile,
+        max_chunk_bytes: usize,
+        visit: &mut impl FnMut(&[u8]) -> Result<(), E>,
+        postcheck: bool,
+    ) -> Result<u64, Qwen36PackageVisitError<E>> {
+        // Store construction performed full lineage validation. Receipt,
+        // directory, and pinned-record checks are sufficient before opening
+        // the exact package handle.
+        self.verify_cheap_current()
             .map_err(Qwen36PackageVisitError::Admission)?;
         let (_, objects, _) = self
             .allocated
@@ -560,8 +586,13 @@ impl Qwen36PackageAdmittedCampaignStore<'_, '_, '_, '_> {
                 }
                 TensorVisitError::Sink(error) => Qwen36PackageVisitError::Sink(error),
             })?;
-        self.verify_current()
-            .map_err(Qwen36PackageVisitError::Admission)?;
+        // The post-visit full check detects parent mutation after a
+        // nontransactional sink received bytes. Paired export defers this
+        // check until both profiles have been staged.
+        if postcheck {
+            self.verify_current()
+                .map_err(Qwen36PackageVisitError::Admission)?;
+        }
         Ok(selected.package_ledger().total_bytes)
     }
 
@@ -1063,6 +1094,37 @@ impl<'parent, 'store, 'source> Qwen36AllocatedCampaignStore<'parent, 'store, 'so
         })
     }
 
+    /// Reopen an existing package admission, or materialize it once when absent.
+    ///
+    /// Existing admission is never replaced implicitly. Reopen performs full
+    /// receipt, package, and parent-lineage validation; absence alone permits
+    /// the resumable materialization path.
+    pub fn reopen_or_materialize_packages<'allocated>(
+        &'allocated self,
+    ) -> Result<
+        Qwen36PackageAdmittedCampaignStore<'allocated, 'parent, 'store, 'source>,
+        Qwen36PackageAdmissionError,
+    > {
+        let admission_path = self
+            .parent
+            .root
+            .join(super::SELECTION_DIRECTORY)
+            .join(ADMISSION_FILE);
+        match fs::symlink_metadata(&admission_path) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                Err(Qwen36TensorWorkError::InvalidPath("package admission manifest").into())
+            }
+            Ok(_) => self.reopen_package_admission(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                self.materialize_and_admit_packages()
+            }
+            Err(error) => Err(Qwen36PackageAdmissionError::Campaign(work_io(
+                "inspect package admission manifest",
+                error,
+            ))),
+        }
+    }
+
     /// Strictly reopen the already-published exact selected package admission.
     pub fn reopen_package_admission<'allocated>(
         &'allocated self,
@@ -1529,7 +1591,10 @@ fn verify_admission_records(
     near_reader
         .verify_unchanged()
         .map_err(|error| package_error(SaltV2Profile::NearLosslessV1, error))?;
-    allocated.verify_current()?;
+    // `validate_package_pair` already streams every parent master against both
+    // selected maps. Keep receipt/descriptor tamper checks, but avoid repeating
+    // that full campaign scan.
+    allocated.verify_cheap_current()?;
     Ok(())
 }
 

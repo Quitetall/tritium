@@ -25,7 +25,7 @@ use std::{
     error::Error,
     fmt,
     fs::{self, File},
-    io::{self, Read, Seek, SeekFrom, Write},
+    io::{self, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
 
@@ -71,6 +71,8 @@ const MAP_SCHEMA: &[u8] = b"tritium qwen3.6 packed selected allocation map v1";
 const MAX_SELECTION_BYTES: u64 = 512 * 1024;
 const MAP_WRITE_BUFFER_BYTES: usize = 64 * 1024;
 const MAP_WRITE_BUFFER_BYTES_U64: u64 = 64 * 1024;
+const HESSIAN_CURVE_BYTES: u64 = 3 * std::mem::size_of::<f64>() as u64;
+const HESSIAN_CURVE_BUFFER_BYTES: usize = 64 * 1024;
 
 /// Immutable policy selecting one codec and two exact nested profile budgets.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -634,15 +636,187 @@ impl Qwen36AllocatedCampaignStore<'_, '_, '_> {
     }
 }
 
+/// Disk-backed Hessian prefix curves shared by both nested profile planners.
+///
+/// Physical allocation must not retain one curve per tile in memory. Replaying
+/// this short-lived spool also avoids reopening every verified master once per
+/// profile while preserving exact source order and bounded resident memory.
+#[cfg(unix)]
+struct HessianCurveSpool {
+    path: PathBuf,
+    file: File,
+    buffer: Vec<u8>,
+    count: u64,
+}
+
+#[cfg(unix)]
+impl HessianCurveSpool {
+    fn create(root: &Path) -> Result<Self, Qwen36TensorWorkError> {
+        let (path, file) = create_temporary_file(root, ".selected-hessian-curves")
+            .map_err(Qwen36TensorWorkError::TensorStore)?;
+        Ok(Self {
+            path,
+            file,
+            buffer: Vec::with_capacity(HESSIAN_CURVE_BUFFER_BYTES),
+            count: 0,
+        })
+    }
+
+    fn push(&mut self, curve: UniformPrefixCurve) -> Result<(), Qwen36TensorWorkError> {
+        for distortion in curve.distortions() {
+            self.buffer.extend_from_slice(&distortion.to_le_bytes());
+        }
+        self.count = self
+            .count
+            .checked_add(1)
+            .ok_or(Qwen36TensorWorkError::LengthOverflow(
+                "selected Hessian curve spool count",
+            ))?;
+        if self.buffer.len() >= HESSIAN_CURVE_BUFFER_BYTES {
+            self.flush_buffer()?;
+        }
+        Ok(())
+    }
+
+    fn flush_buffer(&mut self) -> Result<(), Qwen36TensorWorkError> {
+        self.file
+            .write_all(&self.buffer)
+            .map_err(|error| work_io("write selected Hessian curve spool", error))?;
+        self.buffer.clear();
+        Ok(())
+    }
+
+    fn finish(&mut self, expected: u64) -> Result<(), Qwen36TensorWorkError> {
+        if self.count != expected {
+            return Err(Qwen36TensorWorkError::WorkspaceMismatch(
+                "selected Hessian curve spool coverage",
+            ));
+        }
+        self.flush_buffer()?;
+        self.file
+            .sync_all()
+            .map_err(|error| work_io("sync selected Hessian curve spool", error))?;
+        let expected_bytes = expected.checked_mul(HESSIAN_CURVE_BYTES).ok_or(
+            Qwen36TensorWorkError::LengthOverflow("selected Hessian curve spool bytes"),
+        )?;
+        let actual_bytes = self
+            .file
+            .metadata()
+            .map_err(|error| work_io("inspect selected Hessian curve spool", error))?
+            .len();
+        if actual_bytes != expected_bytes {
+            return Err(Qwen36TensorWorkError::WorkspaceMismatch(
+                "selected Hessian curve spool length",
+            ));
+        }
+        Ok(())
+    }
+
+    fn replay(
+        &self,
+        planner: &mut PackedUniformProfilePlanner<'_>,
+    ) -> Result<(), Qwen36PhysicalAllocationError> {
+        let file = File::open(&self.path).map_err(|error| {
+            Qwen36PhysicalAllocationError::Campaign(work_io(
+                "open selected Hessian curve spool",
+                error,
+            ))
+        })?;
+        let mut file = BufReader::new(file);
+        for _ in 0..self.count {
+            let mut bytes = [0_u8; HESSIAN_CURVE_BYTES as usize];
+            file.read_exact(&mut bytes).map_err(|error| {
+                Qwen36PhysicalAllocationError::Campaign(work_io(
+                    "read selected Hessian curve spool",
+                    error,
+                ))
+            })?;
+            let curve = UniformPrefixCurve::new([
+                f64::from_le_bytes(bytes[0..8].try_into().expect("curve field")),
+                f64::from_le_bytes(bytes[8..16].try_into().expect("curve field")),
+                f64::from_le_bytes(bytes[16..24].try_into().expect("curve field")),
+            ])
+            .map_err(|error| {
+                Qwen36PhysicalAllocationError::Allocation(UniformProfileAllocError::Allocation(
+                    error,
+                ))
+            })?;
+            planner
+                .push(curve)
+                .map_err(Qwen36PhysicalAllocationError::Allocation)?;
+        }
+        let mut trailing = [0_u8; 1];
+        if file.read(&mut trailing).map_err(|error| {
+            Qwen36PhysicalAllocationError::Campaign(work_io(
+                "check selected Hessian curve spool length",
+                error,
+            ))
+        })? != 0
+        {
+            return Err(Qwen36PhysicalAllocationError::Campaign(
+                Qwen36TensorWorkError::WorkspaceMismatch(
+                    "selected Hessian curve spool trailing bytes",
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+impl Drop for HessianCurveSpool {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
 impl<'store, 'source> Qwen36AdditiveCampaignStore<'store, 'source> {
+    /// Reopen an existing durable selection, or derive it once when absent.
+    ///
+    /// An existing selection is never silently replaced: its exact policy must
+    /// match `spec`, and every parent/map record is revalidated by
+    /// [`Self::reopen_selected_allocation`]. This keeps resumable package
+    /// reconciliation from repeating the expensive physical-allocation scans.
+    #[cfg(unix)]
+    pub fn reopen_or_allocate_selected_allocation<'parent>(
+        &'parent self,
+        spec: Qwen36SelectedAllocationSpec,
+    ) -> Result<Qwen36AllocatedCampaignStore<'parent, 'store, 'source>, Qwen36PhysicalAllocationError>
+    {
+        let selection_path = self.root.join(SELECTION_DIRECTORY).join(SELECTION_FILE);
+        match fs::symlink_metadata(&selection_path) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                Err(Qwen36PhysicalAllocationError::Campaign(
+                    Qwen36TensorWorkError::InvalidPath("selected allocation manifest"),
+                ))
+            }
+            Ok(_) => {
+                let allocated = self.reopen_selected_allocation()?;
+                if allocated.receipt().spec() != &spec {
+                    return Err(Qwen36PhysicalAllocationError::Campaign(
+                        Qwen36TensorWorkError::WorkspaceMismatch("selected allocation policy"),
+                    ));
+                }
+                Ok(allocated)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                self.allocate_selected_allocation(spec)
+            }
+            Err(error) => Err(Qwen36PhysicalAllocationError::Campaign(work_io(
+                "inspect selected allocation manifest",
+                error,
+            ))),
+        }
+    }
+
     /// Derive and durably bind the exact Compact/Near allocation from verified masters.
     ///
     /// The canonical package rate model converts both serialized and indexed-runtime
     /// ceilings into exact plane cardinalities. Parent masters are verified and decoded
-    /// once per profile directly into the callback-driven compact solver; only ranked
-    /// upgrade records and two-bit maps scale with tile count. Hessian prefix loss is the
-    /// optimization objective. Counts beyond a tile's admitted prefix receive zero gain
-    /// and therefore cannot be selected.
+    /// once into a bounded temporary curve spool, then replayed into each callback-driven
+    /// compact solver; only ranked upgrade records and two-bit maps scale with tile count.
+    /// Hessian prefix loss is the optimization objective. Counts beyond a tile's admitted
+    /// prefix receive zero gain and therefore cannot be selected.
     ///
     /// # Errors
     /// Fails closed for changed parent state, ragged or unindexable package geometry,
@@ -679,7 +853,13 @@ impl<'store, 'source> Qwen36AdditiveCampaignStore<'store, 'source> {
             compact_maximum - rate.tile_count(),
             SaltV2Profile::CompactV1,
         )?;
-        self.push_verified_hessian_curves(&parent_manifest.masters, &mut compact_planner)?;
+        let mut curve_spool = HessianCurveSpool::create(&self.root)
+            .map_err(Qwen36PhysicalAllocationError::Campaign)?;
+        self.spool_verified_hessian_curves(&parent_manifest.masters, &mut curve_spool)?;
+        curve_spool
+            .finish(rate.tile_count())
+            .map_err(Qwen36PhysicalAllocationError::Campaign)?;
+        curve_spool.replay(&mut compact_planner)?;
         let compact = compact_planner.finish()?;
 
         let near_maximum = maximum_present_planes(
@@ -703,7 +883,7 @@ impl<'store, 'source> Qwen36AdditiveCampaignStore<'store, 'source> {
             near_maximum - compact.present_planes,
             SaltV2Profile::NearLosslessV1,
         )?;
-        self.push_verified_hessian_curves(&parent_manifest.masters, &mut near_planner)?;
+        curve_spool.replay(&mut near_planner)?;
         let near = near_planner.finish()?;
         let tile_count = rate.tile_count();
         let counts = (0..tile_count).map(|tile| {
@@ -737,10 +917,10 @@ impl<'store, 'source> Qwen36AdditiveCampaignStore<'store, 'source> {
     }
 
     #[cfg(unix)]
-    fn push_verified_hessian_curves(
+    fn spool_verified_hessian_curves(
         &self,
         parent_masters: &[Qwen36AdditiveMasterReceipt],
-        planner: &mut PackedUniformProfilePlanner<'_>,
+        spool: &mut HessianCurveSpool,
     ) -> Result<(), Qwen36PhysicalAllocationError> {
         if parent_masters.len() != self.spec.expected_masters.len() {
             return Err(Qwen36TensorWorkError::WorkspaceMismatch(
@@ -779,9 +959,9 @@ impl<'store, 'source> Qwen36AdditiveCampaignStore<'store, 'source> {
                                         UniformProfileAllocError::Allocation(error),
                                     )
                                 })?;
-                                planner
+                                spool
                                     .push(curve)
-                                    .map_err(Qwen36PhysicalAllocationError::Allocation)?;
+                                    .map_err(Qwen36PhysicalAllocationError::Campaign)?;
                                 local_tiles = local_tiles.checked_add(1).ok_or({
                                     Qwen36PhysicalAllocationError::Campaign(
                                         Qwen36TensorWorkError::LengthOverflow(
@@ -1292,6 +1472,20 @@ impl<'store, 'source> Qwen36AdditiveCampaignStore<'store, 'source> {
 }
 
 impl<'parent, 'store, 'source> Qwen36AllocatedCampaignStore<'parent, 'store, 'source> {
+    pub(crate) fn verify_cheap_current(&self) -> Result<(), Qwen36TensorWorkError> {
+        let (root, _objects, _directories) = self.parent.open_selection_store()?;
+        let current = read_selection_receipt(&root.join(SELECTION_FILE))?;
+        if current != self.receipt {
+            return Err(Qwen36TensorWorkError::WorkspaceMismatch(
+                "selected allocation receipt",
+            ));
+        }
+        validate_receipt_binding(&current, &self.parent_completion, self.parent.campaign_id)?;
+        validate_map_record_descriptors(&current)?;
+        self.parent
+            .verify_completion_receipt(&self.parent_completion)
+    }
+
     /// Strictly revalidate this allocation, both maps, and every parent prefix.
     ///
     /// # Errors
@@ -2529,5 +2723,41 @@ mod tests {
     fn flagship_profile_map_size_is_exact_and_stays_out_of_small_manifests() {
         const QWEN36_ADDITIVE_TILES: u64 = 106_711_040;
         assert_eq!(packed_map_bytes(QWEN36_ADDITIVE_TILES).unwrap(), 26_677_760);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hessian_curve_spool_round_trips_exact_records_and_cleans_up() {
+        use super::{HESSIAN_CURVE_BYTES, HessianCurveSpool, UniformPrefixCurve};
+        use std::{
+            fs,
+            time::{SystemTime, UNIX_EPOCH},
+        };
+
+        let root = std::env::temp_dir().join(format!(
+            "tritium-selected-curves-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let (path, count) = {
+            let mut spool = HessianCurveSpool::create(&root).unwrap();
+            spool
+                .push(UniformPrefixCurve::new([9.0, 4.0, 1.0]).unwrap())
+                .unwrap();
+            spool
+                .push(UniformPrefixCurve::new([8.0, 8.0, 0.5]).unwrap())
+                .unwrap();
+            spool.finish(2).unwrap();
+            let path = spool.path.clone();
+            assert_eq!(fs::metadata(&path).unwrap().len(), 2 * HESSIAN_CURVE_BYTES);
+            (path, spool.count)
+        };
+        assert_eq!(count, 2);
+        assert!(!path.exists());
+        fs::remove_dir(&root).unwrap();
     }
 }

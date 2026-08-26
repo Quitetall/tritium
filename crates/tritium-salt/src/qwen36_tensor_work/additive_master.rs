@@ -773,6 +773,28 @@ impl<'source> Qwen36TensorWorkStore<'source> {
 }
 
 impl<'store, 'source> Qwen36AdditiveCampaignStore<'store, 'source> {
+    /// Strictly reopen an already sealed PTQ campaign without replaying its
+    /// producers. The completion seal remains authoritative; every referenced
+    /// slot and object is still verified before the receipt is returned.
+    #[cfg(unix)]
+    pub(crate) fn reopen_complete_current(
+        &self,
+    ) -> Result<Qwen36CompleteWorkspaceReceipt, Qwen36TensorWorkError> {
+        self.require_complete_verified(FixedCampaignMode::Skip)
+            .map(|(receipt, _, _)| receipt)
+    }
+
+    pub(crate) fn completion_path_is_present(&self) -> Result<bool, Qwen36TensorWorkError> {
+        match fs::symlink_metadata(self.completion_path()) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => Err(
+                Qwen36TensorWorkError::InvalidPath("complete additive workspace"),
+            ),
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(work_io("inspect completion seal", error)),
+        }
+    }
+
     /// Open or resume a scale-only child whose parent is this sealed PTQ campaign.
     ///
     /// Child metadata must bind every corresponding parent tensor master and
@@ -4175,6 +4197,8 @@ mod tests {
 
         let completion = campaign.seal_complete().expect("seal complete campaign");
         assert_eq!(completion, campaign.require_complete().unwrap());
+        assert!(campaign.completion_path_is_present().unwrap());
+        assert_eq!(completion, campaign.reopen_complete_current().unwrap());
         assert_eq!(completion.base_workspace_id(), base_receipt.workspace_id());
         assert_eq!(completion.campaign_id(), campaign.campaign_id());
         assert_eq!(completion.additive_coefficients(), 8);
@@ -4716,7 +4740,13 @@ mod tests {
         assert_eq!(reopened.receipt().compact().selected_planes(), 2);
         assert_eq!(reopened.receipt().near_lossless().selected_planes(), 4);
 
+        let resumed = parent
+            .reopen_or_allocate_selected_allocation(full_tile_selection_spec())
+            .expect("resume existing physical allocation");
+        assert_eq!(resumed.receipt(), reopened.receipt());
+
         drop(reopened);
+        drop(resumed);
         drop(parent);
         drop(base);
         let _ = fs::remove_dir_all(root);
@@ -4877,6 +4907,11 @@ mod tests {
         let admitted = allocated
             .materialize_and_admit_packages()
             .expect("materialize and admit selected packages");
+        let resumed = allocated
+            .reopen_or_materialize_packages()
+            .expect("reopen materialized selected packages");
+        assert_eq!(resumed.receipt(), admitted.receipt());
+        drop(resumed);
         assert_eq!(
             admitted.receipt().compact().package_id(),
             PackageId::from_package_bytes(&compact)

@@ -14,7 +14,7 @@ with the listed stable diagnostic instead of silently falling back.
 
 | Target | Status | Evidence / failure |
 |---|---|---|
-| Linux x86_64 CPU wheel | **qualified** | [`compatibility-v1.1/linux-x86_64-cpu.json`](../release/compatibility-v1.1/linux-x86_64-cpu.json) SHA-256 `843eb56dfa29dc89fe7fc0471ad79db65dac2af0980c20a9dca36214aba98da2`; revision `445d7e2a0f508ad32095b16ace9d75f10a161ed3` |
+| Linux x86_64 CPU wheel | **qualified** | [`compatibility-v1.1/linux-x86_64-cpu.json`](../release/compatibility-v1.1/linux-x86_64-cpu.json) SHA-256 `24e2fc23b1c70dfa0d25b1a2dfbb49d6f3d5f8006ce2ab257eb03cac416773e2`; revision `7a0e06a08c9977c0f93425d067193fbab44ca5d0` |
 | macOS arm64 CPU wheel | **pending** | Fresh no-compiler wheel receipt is not yet archived. |
 | Windows x86_64 CPU wheel | **pending** | Fresh no-compiler wheel receipt is not yet archived. |
 
@@ -30,7 +30,7 @@ with the listed stable diagnostic instead of silently falling back.
 | Target | Status | Evidence / failure |
 |---|---|---|
 | Linux CUDA wheels | **pending** | Driver, runtime, PyTorch and GPU-architecture receipts are not yet archived. |
-| Linux CUDA 13 sm_89 wheel | **qualified** | [`compatibility-v1.1/linux-x86_64-cuda13-sm89.json`](../release/compatibility-v1.1/linux-x86_64-cuda13-sm89.json) SHA-256 `56011088d810e5728113df26c5ac03e42715b098416b191060c356eb09db2cb2`; revision `445d7e2a0f508ad32095b16ace9d75f10a161ed3` |
+| Linux CUDA 13 sm_89 wheel | **qualified** | [`compatibility-v1.1/linux-x86_64-cuda13-sm89.json`](../release/compatibility-v1.1/linux-x86_64-cuda13-sm89.json) SHA-256 `73bf30c671ffb43ba5a8f38f9e8996d6e298a536c00e56cabc96ff309921bb7d`; revision `7a0e06a08c9977c0f93425d067193fbab44ca5d0` |
 | Non-NVIDIA GPU execution backend (wgpu/Vulkan, ROCm) | **pending** | The tritium-cli and tritium-benches wgpu/rocm lanes now exist (issue #4), but no `tritium report compare` ledger JSON from a physical non-NVIDIA GPU has been archived. Compile-only and Vulkan-on-NVIDIA runs do not qualify this row. |
 | ROCm wheel | **unsupported** | `TRITIUM_UNSUPPORTED_ROCM_WHEEL_V1_1` |
 | Metal-specific wheel | **unsupported** | `TRITIUM_UNSUPPORTED_METAL_WHEEL_V1_1` |
@@ -46,7 +46,7 @@ with the listed stable diagnostic instead of silently falling back.
 
 | Target | Status | Evidence / failure |
 |---|---|---|
-| Node.js 22+ strict-TypeScript archive | **qualified** | [`compatibility-v1.1/node-22.json`](../release/compatibility-v1.1/node-22.json) SHA-256 `a7750102955973a95ffc2e0c158f9cbec25108746a7793129862d6891befd849`; revision `445d7e2a0f508ad32095b16ace9d75f10a161ed3` |
+| Node.js 22+ strict-TypeScript archive | **qualified** | [`compatibility-v1.1/node-22.json`](../release/compatibility-v1.1/node-22.json) SHA-256 `55cfe6f0b127caa7b8070611d2f2b18b2ae4660d1a87b41d234c8982142e5a85`; revision `7a0e06a08c9977c0f93425d067193fbab44ca5d0` |
 | Chrome WebGPU training | **pending** | Actual-browser WebGPU receipt is not yet archived. |
 | Firefox WebGPU training | **pending** | Actual-browser WebGPU receipt is not yet archived. |
 | Safari WebGPU training | **pending** | Actual-browser WebGPU receipt is not yet archived. |

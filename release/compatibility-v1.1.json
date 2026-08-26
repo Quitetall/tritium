@@ -9,8 +9,8 @@
         "status": "qualified",
         "receipt": {
           "path": "compatibility-v1.1/linux-x86_64-cpu.json",
-          "sha256": "843eb56dfa29dc89fe7fc0471ad79db65dac2af0980c20a9dca36214aba98da2",
-          "source_revision": "445d7e2a0f508ad32095b16ace9d75f10a161ed3"
+          "sha256": "24e2fc23b1c70dfa0d25b1a2dfbb49d6f3d5f8006ce2ab257eb03cac416773e2",
+          "source_revision": "7a0e06a08c9977c0f93425d067193fbab44ca5d0"
         }
       },
       {
@@ -53,8 +53,8 @@
         "status": "qualified",
         "receipt": {
           "path": "compatibility-v1.1/linux-x86_64-cuda13-sm89.json",
-          "sha256": "56011088d810e5728113df26c5ac03e42715b098416b191060c356eb09db2cb2",
-          "source_revision": "445d7e2a0f508ad32095b16ace9d75f10a161ed3"
+          "sha256": "73bf30c671ffb43ba5a8f38f9e8996d6e298a536c00e56cabc96ff309921bb7d",
+          "source_revision": "7a0e06a08c9977c0f93425d067193fbab44ca5d0"
         }
       },
       {
@@ -97,8 +97,8 @@
         "status": "qualified",
         "receipt": {
           "path": "compatibility-v1.1/node-22.json",
-          "sha256": "a7750102955973a95ffc2e0c158f9cbec25108746a7793129862d6891befd849",
-          "source_revision": "445d7e2a0f508ad32095b16ace9d75f10a161ed3"
+          "sha256": "55cfe6f0b127caa7b8070611d2f2b18b2ae4660d1a87b41d234c8982142e5a85",
+          "source_revision": "7a0e06a08c9977c0f93425d067193fbab44ca5d0"
         }
       },
       {
