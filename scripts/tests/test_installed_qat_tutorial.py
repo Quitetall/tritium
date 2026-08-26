@@ -33,17 +33,13 @@ class InstalledQatTutorialTests(unittest.TestCase):
         self.assertIn("container: python:3.13-slim", job)
         self.assertNotIn("actions/checkout", job)
         self.assertIn('test ! -e "$GITHUB_WORKSPACE/.git"', job)
-        for compiler in (
-            "cargo",
-            "rustc",
-            "cc",
-            "c++",
-            "gcc",
-            "g++",
-            "clang",
-            "clang++",
-        ):
-            self.assertIn(f"! command -v {compiler}", job)
+        self.assertIn(
+            "for compiler in cargo rustc cc c++ gcc g++ clang clang++; do", job
+        )
+        self.assertIn('if command -v "$compiler" >/dev/null 2>&1; then', job)
+        self.assertIn(
+            "compiler must be absent in source-free lane: $compiler", job
+        )
         self.assertIn("python -I -m tritium.torch.tutorial_qat", job)
         self.assertIn("--check-receipt", job)
         self.assertIn("test_tutorial_qat.py", workflow)
