@@ -4197,6 +4197,8 @@ mod tests {
 
         let completion = campaign.seal_complete().expect("seal complete campaign");
         assert_eq!(completion, campaign.require_complete().unwrap());
+        assert!(campaign.completion_path_is_present().unwrap());
+        assert_eq!(completion, campaign.reopen_complete_current().unwrap());
         assert_eq!(completion.base_workspace_id(), base_receipt.workspace_id());
         assert_eq!(completion.campaign_id(), campaign.campaign_id());
         assert_eq!(completion.additive_coefficients(), 8);
