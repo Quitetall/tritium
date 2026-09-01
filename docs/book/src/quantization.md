@@ -307,6 +307,20 @@ stages. The high-level `tritium.torch.quantize(...)` facade now composes
 `torch.nn.Module` PTQ uses activation calibration and returns a module-scoped
 conversion result; it does not silently substitute Qwen S2KF evidence.
 
+Long CPU campaigns can be inspected without opening or mutating their records:
+
+```sh
+python scripts/qwen36-ptq-status.py \
+  --work-dir ./tritium-work \
+  --sample-seconds 20 \
+  --json
+```
+
+This operational snapshot reports staged-byte growth, producer PID liveness,
+published-master count, and seal state. It is not release evidence; source,
+recipe, artifact, and hardware claims still require the signed campaign and
+release receipts.
+
 For Transformers-backed Qwen3.6 capture, use the strict component boundary:
 
 ```python
