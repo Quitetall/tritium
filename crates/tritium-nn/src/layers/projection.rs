@@ -30,7 +30,13 @@ pub enum ProjectionActivationMode {
 }
 
 /// A linear projection: deployed ternary, additive SALT, or dense fp32.
+///
+/// `#[non_exhaustive]`: the `SaltV2` variant only exists under the `cuda`
+/// feature, so a downstream exhaustive match would compile cpu-only and
+/// break the moment feature unification enables `cuda` anywhere in the dep
+/// graph — always carry a wildcard arm.
 #[allow(missing_debug_implementations)] // `TernaryLinear` holds `&dyn DeviceBuffer`
+#[non_exhaustive]
 pub enum Projection {
     /// The deployed ternary weight (TQ2_0 on device + per-channel scales).
     Ternary(TernaryLinear),

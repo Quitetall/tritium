@@ -54,14 +54,8 @@ fn eval_tokens() -> Vec<u32> {
 fn dense(p: &Projection) -> (Vec<f32>, usize, usize) {
     match p {
         Projection::Dense(d) => (d.weights.clone(), d.n_out, d.k_in),
-        Projection::Salt(_)
-        | Projection::HostSaltV2(_)
-        | Projection::Ternary(_)
-        | Projection::Q2(_) => {
-            panic!("from_hf builds Dense projections")
-        }
-        #[cfg(feature = "cuda")]
-        Projection::SaltV2(_) => panic!("from_hf must not build resident SALT V2 projections"),
+        // Wildcard: Projection is #[non_exhaustive]; from_hf builds Dense only.
+        _ => panic!("from_hf builds Dense projections"),
     }
 }
 

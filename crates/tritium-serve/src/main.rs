@@ -368,6 +368,7 @@ serving:
   --spec lookup             prompt-lookup speculative decoding (greedy only)
   --draft-model <gguf>      model-drafter speculative decoding (needs --backend cuda)
   --batch-slots <N>         continuous-batching slots (default 1 = single stream)
+  --queue-cap <N>           admission queue depth (default 32)
   --kv-pool-tokens <N>      paged-KV pool size in tokens (default: dense per-slot KV)
 
 network:
