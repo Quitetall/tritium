@@ -353,13 +353,105 @@ fn validate_bind_addresses(
     Ok((host_ip, admin_ip))
 }
 
+const HELP: &str = "\
+tritium-serve — OpenAI-compatible HTTP/SSE server for Tritium ternary models
+
+usage: tritium-serve (--bundle <schema-v3-dir> | --model <legacy.gguf>) [options]
+
+model source (exactly one):
+  --bundle <dir>            strict schema-v3 Qwen bundle (production path)
+  --model <path.gguf>       legacy GGUF model (compatibility serving)
+
+serving:
+  --backend <name>          compute backend: cpu (default) | cuda
+  --profile <name>          bundle profile (default compact-v1)
+  --spec lookup             prompt-lookup speculative decoding (greedy only)
+  --draft-model <gguf>      model-drafter speculative decoding (needs --backend cuda)
+  --batch-slots <N>         continuous-batching slots (default 1 = single stream)
+  --kv-pool-tokens <N>      paged-KV pool size in tokens (default: dense per-slot KV)
+
+network:
+  --host <ip>               public bind address (default 127.0.0.1; non-loopback
+                            requires TRITIUM_AUTH_TOKEN or TRITIUM_AUTH_TOKENS)
+  --port <N>                public port (default 8080)
+  --admin-host <ip>         loopback drain listener host (default 127.0.0.1)
+  --admin-port <N>          enable the admin drain listener on this port
+
+request limits:
+  --model-id <s>            OpenAI `model` field (default tritium)
+  --max-new <N>             default max_tokens when a request omits it (256)
+  --max-messages <N>        max chat messages per request (128)
+  --max-prompt-bytes <N>    max request body prompt bytes (1048576)
+  --max-prompt-tokens <N>   max prompt tokens (131072)
+  --max-completion-tokens <N>  hard cap on requested max_tokens (4096)
+  --max-total-tokens <N>    max prompt+completion tokens (131072)
+  --rate-limit-rpm <N>      per-principal requests/minute (120)
+  --rate-limit-burst <N>    rate-limit burst allowance (8)
+
+tokens:
+  --eos <id>                stop token id (default 128001)
+  --raw-tokens              prompts/completions are space-separated token ids
+  --no-raw-tokens           override an inherited raw-tokens=true
+
+config:
+  --config <path.json>      strict JSON overlay (or TRITIUM_CONFIG=<path>)
+  -h, --help                print this help
+  -V, --version             print version and source identity
+
+precedence: defaults < --config JSON < TRITIUM_* environment < CLI flags.
+Every flag has a TRITIUM_* twin (e.g. --batch-slots / TRITIUM_BATCH_SLOTS).
+Performance knobs (TRITIUM_KERNEL_TIER, TRITIUM_KV, TRITIUM_TREE_NB,
+TRITIUM_LM_HEAD, TRITIUM_WEIGHTS, TRITIUM_SPEC_ADAPTIVE, ...) are engine
+env vars documented in docs/book/src/environment.md and docs/BENCHMARKS.md.";
+
+fn version_line() -> String {
+    format!(
+        "tritium-serve {}{}",
+        env!("CARGO_PKG_VERSION"),
+        option_env!("TRITIUM_SOURCE_ID")
+            .map(|s| format!(" ({s})"))
+            .unwrap_or_default()
+    )
+}
+
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() {
+    if let Err(e) = run().await {
+        // Display, not the Termination trait's Debug — no quoted/escaped
+        // strings, and a pointer at help.
+        eprintln!("tritium-serve error: {e}");
+        eprintln!("run `tritium-serve --help` for usage");
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Configuration precedence is deliberately visible and deterministic:
     // built-in defaults < strict JSON file < `TRITIUM_*` environment < CLI.
     // Parse overlays before model/backend initialization so malformed deploy
     // configuration fails without allocating device or artifact state.
-    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    // `--flag=value` is normalized to `--flag value` up front so both the
+    // config pre-scan and the main loop see one shape.
+    let raw_args: Vec<String> = std::env::args()
+        .skip(1)
+        .flat_map(|a| {
+            if let Some((flag, value)) = a.split_once('=').filter(|_| a.starts_with("--")) {
+                vec![flag.to_owned(), value.to_owned()]
+            } else {
+                vec![a]
+            }
+        })
+        .collect();
+    // Help/version must work even when the environment or config file is
+    // broken — answer them before any overlay parsing.
+    if raw_args.iter().any(|a| a == "-h" || a == "--help") {
+        println!("{HELP}");
+        return Ok(());
+    }
+    if raw_args.iter().any(|a| a == "-V" || a == "--version") {
+        println!("{}", version_line());
+        return Ok(());
+    }
     let mut launch = LaunchConfig::default();
     apply_file_config(read_config(&raw_args)?, &mut launch);
     apply_env_config(&mut launch)?;
@@ -443,6 +535,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--eos" => eos = val(args.next(), "--eos")?,
             "--raw-tokens" => raw_tokens = true,
+            "--no-raw-tokens" => raw_tokens = false,
             "--draft-model" => draft_model = Some(val(args.next(), "--draft-model")?),
             "--kv-pool-tokens" => {
                 let t: usize = val(args.next(), "--kv-pool-tokens")?;
@@ -451,25 +544,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 kv_pool_tokens = Some(t);
             }
-            "-h" | "--help" => {
-                eprintln!(
-                    "usage: tritium-serve (--bundle <schema-v3-dir> [--profile compact-v1] | \
-                     --model <legacy.gguf>) [--backend cpu|cuda] [--spec lookup] \
-                     [--config <strict-json>] \
-                     [--batch-slots N] [--queue-cap 32] [--host 127.0.0.1] [--port 8080] \
-                     [--admin-host 127.0.0.1] [--admin-port N] \
-                     [--model-id tritium] \
-                     [--max-new 256] [--max-messages 128] [--max-prompt-bytes 1048576] \
-                     [--max-prompt-tokens 131072] [--max-completion-tokens 4096] \
-                     [--max-total-tokens 131072] [--rate-limit-rpm 120] \
-                     [--rate-limit-burst 8] [--eos 128001] [--raw-tokens] \
-                     [--draft-model <gguf>] [--kv-pool-tokens N]  (precedence: defaults < \
-                     config < TRITIUM_* < CLI; non-loopback --host requires \
-                     TRITIUM_AUTH_TOKEN or TRITIUM_AUTH_TOKENS)"
-                );
-                return Ok(());
+            // -h/--help/-V/--version answered in the pre-scan (they must
+            // work even under a broken env/config).
+            other => {
+                return Err(format!("unknown argument {other:?} (try --help)").into());
             }
-            other => return Err(format!("unknown argument {other:?}").into()),
         }
     }
 
@@ -478,6 +557,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "provide exactly one of --bundle <schema-v3-dir> or --model <legacy.gguf>".into(),
         );
     }
+    // One identifying line before any multi-gigabyte load: version + source.
+    eprintln!("{}", version_line());
     if queue_cap == 0 {
         return Err("--queue-cap must be >= 1".into());
     }
@@ -583,10 +664,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         let model_path = model_path.expect("exactly-one validation established legacy path");
         eprintln!("tritium-serve: loading legacy {model_path} on `{backend_name}`...");
-        let bytes = std::fs::read(&model_path)?;
+        let bytes = std::fs::read(&model_path).map_err(|e| format!("--model {model_path}: {e}"))?;
         let backend =
             init().map_err(|error| format!("backend `{backend_name}` failed to init: {error}"))?;
-        let file = tritium_format::read_gguf(&bytes)?;
+        let file = tritium_format::read_gguf(&bytes)
+            .map_err(|e| format!("--model {model_path}: not a readable GGUF: {e}"))?;
         let runner = tritium_nn::ModelRunner::load(&file, &bytes, backend)?;
         let (tokenizer, template): (Arc<dyn tritium_nn::Tokenizer + Send + Sync>, _) = if raw_tokens
         {
@@ -835,7 +917,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .map_err(|e| format!("bind {addr} (--host/--port): {e}"))?;
     #[cfg(all(feature = "device-loss-qualification", unix))]
     if let Some(mut signal) = destructive_signal {
         tokio::spawn(async move {
@@ -852,7 +936,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         axum::serve(listener, router).with_graceful_shutdown(shutdown_signal(draining.clone()));
     if let Some(admin_port) = admin_port {
         let admin_addr = std::net::SocketAddr::new(admin_ip, admin_port);
-        let admin_listener = tokio::net::TcpListener::bind(admin_addr).await?;
+        let admin_listener = tokio::net::TcpListener::bind(admin_addr)
+            .await
+            .map_err(|e| format!("bind {admin_addr} (--admin-host/--admin-port): {e}"))?;
         eprintln!(
             "tritium-serve: admin drain listener on http://{admin_addr}/drain (loopback-only)"
         );
