@@ -55,7 +55,7 @@ trades accuracy against size along a smooth ~1.58–3 bpw curve. The CLI exposes
 it directly:
 
 ```sh
-tritium quantize --input model.safetensors --output model.tslb --bpw 2.0
+tritium quantize --input model.safetensors --output model.tslb --ladder itf --bpw 2.0
 ```
 
 `--bpw 1.585` is all-base ternary (the `T = 1` flat case); higher budgets buy

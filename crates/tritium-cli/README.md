@@ -1,6 +1,6 @@
 # tritium-cli
 
-Tritium command-line interface: quantize, report, serve, repack, and seekable
+Tritium command-line interface: quantize, report, repack, and seekable
 transport (installs the `tritium` binary).
 
 Part of [Tritium](https://github.com/Quitetall/tritium) — Apache-2.0 infrastructure for
@@ -21,3 +21,5 @@ tritium transport unpack model.salt.trns model.salt
 
 `inspect` reports logical bytes separately from transport bytes. Logical bytes
 remain resident-byte denominator; `TRNS` is never a serving format.
+
+Serving is the separate `tritium-serve` binary (build with `--features tritium-serve/serve`, or `--features tritium-serve/cuda` for GPU serving).
