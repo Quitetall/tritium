@@ -316,6 +316,10 @@ python scripts/qwen36-ptq-status.py \
   --json
 ```
 
+For a rate-based staged-record estimate, add an explicit record-size target
+(`--target-bytes N`). The estimate is operational only; signed campaign and
+release receipts remain authoritative.
+
 This operational snapshot reports staged-byte growth, producer PID liveness,
 published-master count, and seal state. It is not release evidence; source,
 recipe, artifact, and hardware claims still require the signed campaign and

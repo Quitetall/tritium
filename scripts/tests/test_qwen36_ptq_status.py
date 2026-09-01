@@ -4,6 +4,7 @@ import os
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -72,6 +73,27 @@ class Qwen36PtqStatusTests(unittest.TestCase):
             )
             output = result.stdout
         self.assertEqual(json.loads(output)["status"], "idle")
+
+    def test_rate_eta_is_bounded_by_sampled_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            current = root / f"record.tmp.{os.getpid()}.2.0"
+            current.write_bytes(b"x" * 100)
+
+            def grow_record(_seconds):
+                current.write_bytes(b"x" * 200)
+
+            with mock.patch.object(MODULE.time, "sleep", side_effect=grow_record):
+                snapshot = MODULE.inspect(root, sample_seconds=10, target_bytes=300)
+
+        self.assertEqual(snapshot["target_bytes"], 300)
+        self.assertEqual(snapshot["bytes_per_second"], 10.0)
+        self.assertEqual(snapshot["estimated_seconds_remaining"], 10.0)
+
+    def test_negative_target_bytes_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(MODULE.StatusError):
+                MODULE.inspect(Path(directory), target_bytes=-1)
 
 
 if __name__ == "__main__":

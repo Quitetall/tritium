@@ -94,15 +94,22 @@ def _record(root: Path, path: Path, pid: int) -> dict[str, Any]:
     }
 
 
-def inspect(work_dir: Path, sample_seconds: float = 0.0) -> dict[str, Any]:
+def inspect(
+    work_dir: Path,
+    sample_seconds: float = 0.0,
+    target_bytes: int | None = None,
+) -> dict[str, Any]:
     """Return a non-authoritative operational snapshot."""
     if sample_seconds < 0 or sample_seconds > 3600:
         raise StatusError("sample seconds must be between 0 and 3600")
+    if target_bytes is not None and target_bytes < 0:
+        raise StatusError("target bytes must be non-negative")
     root = _ordinary_dir(work_dir)
     temps, objects, seals = _discover(root)
     newest = max(temps, key=lambda item: item[0].stat().st_mtime_ns, default=None)
     staged = _record(root, *newest) if newest is not None else None
     rate: float | None = None
+    eta: float | None = None
     if staged is not None and sample_seconds:
         time.sleep(sample_seconds)
         try:
@@ -115,6 +122,8 @@ def inspect(work_dir: Path, sample_seconds: float = 0.0) -> dict[str, Any]:
         staged["mtime_ns"] = after_stat.st_mtime_ns
         staged["bytes_after_sample"] = after
         staged["sample_seconds"] = sample_seconds
+        if target_bytes is not None and rate > 0:
+            eta = max(target_bytes - after, 0) / rate
     status = "complete" if seals else "running" if staged else "idle"
     return {
         "schema": SCHEMA,
@@ -125,6 +134,8 @@ def inspect(work_dir: Path, sample_seconds: float = 0.0) -> dict[str, Any]:
         "published_master_count": objects,
         "seal_count": seals,
         "bytes_per_second": rate,
+        "target_bytes": target_bytes,
+        "estimated_seconds_remaining": eta,
     }
 
 
@@ -135,6 +146,10 @@ def _parser() -> argparse.ArgumentParser:
         "--sample-seconds", type=float, default=0.0,
         help="sample staged-byte growth for this many seconds (default: 0)",
     )
+    parser.add_argument(
+        "--target-bytes", type=int,
+        help="optional staged-record size target for a rate-based ETA",
+    )
     parser.add_argument("--json", action="store_true", help="emit canonical JSON")
     return parser
 
@@ -142,7 +157,7 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
-        snapshot = inspect(args.work_dir, args.sample_seconds)
+        snapshot = inspect(args.work_dir, args.sample_seconds, args.target_bytes)
     except StatusError as error:
         print(f"qwen36-ptq-status: ERROR: {error}", file=sys.stderr)
         return 2
@@ -163,6 +178,13 @@ def main(argv: list[str] | None = None) -> int:
             )
         if snapshot["bytes_per_second"] is not None:
             print(f"bytes_per_second={snapshot['bytes_per_second']:.3f}")
+        if snapshot["target_bytes"] is not None:
+            print(f"target_bytes={snapshot['target_bytes']}")
+            eta = snapshot["estimated_seconds_remaining"]
+            print(
+                "estimated_seconds_remaining="
+                + (f"{eta:.3f}" if eta is not None else "unknown")
+            )
     return 0
 
 
