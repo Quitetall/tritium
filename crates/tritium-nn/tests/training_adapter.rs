@@ -391,7 +391,9 @@ fn intermediate_growth_applies_one_mapping_to_every_layer_without_reordering_par
         let layer_offset = 1_000.0 * layer_index as f32;
         assert_eq!(
             gate.master
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|row| row[0])
                 .collect::<Vec<_>>(),
             [

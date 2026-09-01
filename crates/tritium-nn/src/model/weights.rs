@@ -192,7 +192,9 @@ fn load_dense(file: &GgufFile, bytes: &[u8], name: &str) -> Result<Vec<f32>, NnE
     let p = payload(file, bytes, info)?;
     match info.ggml_type {
         GGML_TYPE_F32 => Ok(p
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect()),
         GGML_TYPE_F16 => Ok(f16_bytes_to_f32(p)),

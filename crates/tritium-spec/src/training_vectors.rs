@@ -629,7 +629,9 @@ fn parse_digest(hex: &str) -> Result<[u8; 32], TrainingVectorError> {
         return Err(TrainingVectorError::InvalidManifestDigest(hex.to_owned()));
     }
     let mut digest = [0_u8; 32];
-    for (index, pair) in hex.as_bytes().chunks_exact(2).enumerate() {
+    // `as_chunks` over `chunks_exact`: the chunk size is a constant, so this yields `&[u8; 2]`
+    // and the two indexings below are checked at compile time rather than at runtime.
+    for (index, pair) in hex.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let high = hex_nibble(pair[0])
             .ok_or_else(|| TrainingVectorError::InvalidManifestDigest(hex.to_owned()))?;
         let low = hex_nibble(pair[1])

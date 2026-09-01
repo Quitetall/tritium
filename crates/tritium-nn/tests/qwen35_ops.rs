@@ -31,7 +31,12 @@ fn zero_centered_rmsnorm_matches_qwen35_transformers_golden() {
     ];
     let mut out = [0.0; 8];
 
-    for (x, out) in x.chunks_exact(4).zip(out.chunks_exact_mut(4)) {
+    for (x, out) in x
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(out.as_chunks_mut::<4>().0.iter_mut())
+    {
         rmsnorm_zero_centered(x, &weight, 1e-6, out).expect("valid Qwen3.5 RMSNorm");
     }
 
@@ -398,14 +403,14 @@ fn partial_neox_rope_matches_qwen36_high_position_transformers_goldens() {
     ];
 
     let mut x = vec![0.0; POSITIONS.len() * 256];
-    for head in x.chunks_exact_mut(256) {
+    for head in x.as_chunks_mut::<256>().0 {
         head[..32].fill(1.0);
     }
 
     rope_apply_partial_neox(&mut x, &POSITIONS, 1, 256, 64, 10_000_000.0)
         .expect("valid Qwen3.6 partial NeoX RoPE");
 
-    for (token, head) in x.chunks_exact(256).enumerate() {
+    for (token, head) in x.as_chunks::<256>().0.iter().enumerate() {
         assert_close(&head[..32], &EXPECTED_COS[token], 2e-6);
         assert_close(&head[32..64], &EXPECTED_SIN[token], 2e-6);
     }

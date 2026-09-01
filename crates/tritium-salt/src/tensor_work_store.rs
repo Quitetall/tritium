@@ -1623,7 +1623,10 @@ fn canonical_record_id(prefix: &str, name: &str) -> Option<ContentId> {
         return None;
     }
     let mut digest = [0_u8; 32];
-    for (output, encoded) in digest.iter_mut().zip(hex.as_bytes().chunks_exact(2)) {
+    for (output, encoded) in digest
+        .iter_mut()
+        .zip(hex.as_bytes().as_chunks::<2>().0.iter())
+    {
         *output = lower_hex_nibble(encoded[0])?
             .checked_mul(16)?
             .checked_add(lower_hex_nibble(encoded[1])?)?;

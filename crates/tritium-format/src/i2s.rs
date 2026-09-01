@@ -137,8 +137,10 @@ pub fn unpack_i2s_tensor(
 
     let quants = &payload[..n_quant_bytes];
     for (block, out) in quants
-        .chunks_exact(I2S_BLOCK_BYTES)
-        .zip(trits_out.chunks_exact_mut(I2S_BLOCK_ELEMS))
+        .as_chunks::<I2S_BLOCK_BYTES>()
+        .0
+        .iter()
+        .zip(trits_out.as_chunks_mut::<I2S_BLOCK_ELEMS>().0.iter_mut())
     {
         unpack_i2s_block(block, out)?;
     }

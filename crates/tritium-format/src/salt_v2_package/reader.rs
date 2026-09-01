@@ -1382,7 +1382,7 @@ fn scan_tensor<R: Read + Seek>(
                 .ok_or(SaltV2PackageError::LengthOverflow)?;
             let scale_bytes = &scales[descriptor.scale_start..scale_end];
             let mut decoded_scales = [f16::ZERO; 4];
-            for (index, bytes) in scale_bytes.chunks_exact(2).enumerate() {
+            for (index, bytes) in scale_bytes.as_chunks::<2>().0.iter().enumerate() {
                 decoded_scales[index] = f16::from_bits(u16::from_le_bytes([bytes[0], bytes[1]]));
             }
             let scale_count = scale_bytes.len() / 2;

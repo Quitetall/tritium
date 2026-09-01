@@ -108,7 +108,12 @@ fn salt_distillation_recovers_heldout_perplexity() {
     }
 
     // Non-overlapping training windows.
-    let windows: Vec<&[u32]> = train_ids.chunks_exact(TRAIN_SEQ).collect();
+    let windows: Vec<&[u32]> = train_ids
+        .as_chunks::<TRAIN_SEQ>()
+        .0
+        .iter()
+        .map(|w| w.as_slice())
+        .collect();
     assert!(!windows.is_empty(), "train corpus shorter than one window");
 
     // Held-out baselines (fp + full PTQ), on the disjoint eval split.

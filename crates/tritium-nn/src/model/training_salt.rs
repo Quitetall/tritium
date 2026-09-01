@@ -368,7 +368,7 @@ fn parse_hex_digest(file: &GgufFile, key: &str) -> Result<[u8; 32], NnError> {
         )));
     }
     let mut parsed = [0_u8; 32];
-    for (index, pair) in digest.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in digest.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let text = core::str::from_utf8(pair).expect("validated ASCII hex");
         parsed[index] = u8::from_str_radix(text, 16).expect("validated lowercase hex");
     }
@@ -720,7 +720,9 @@ fn load_f32(file: &GgufFile, bytes: &[u8], name: &str) -> Result<Vec<f32>, NnErr
         )));
     }
     Ok(payload
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
         .collect())
 }
@@ -1304,7 +1306,9 @@ mod tests {
             .dense
             .get("lm_head.weight")
             .expect("head dense")
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .flat_map(|row| {
                 let (salt, _) = export_training_salt_row(row, 1).expect("one-plane head row");
                 pack_salt_row(&salt).expect("pack one-plane head row")

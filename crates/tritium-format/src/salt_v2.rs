@@ -411,7 +411,12 @@ pub(crate) fn unpack_b3_into(
 pub fn pack_s34(trits: &[Trit]) -> Result<Vec<u8>, SaltV2CodecError> {
     let ledger = SaltV2Codec::S34.ledger(trits.len())?;
     let mut packed = vec![0u8; ledger.physical_bytes];
-    for (group_index, group) in trits.chunks_exact(S34_TRITS_PER_GROUP).enumerate() {
+    for (group_index, group) in trits
+        .as_chunks::<S34_TRITS_PER_GROUP>()
+        .0
+        .iter()
+        .enumerate()
+    {
         let zero_count = group.iter().filter(|trit| trit.is_zero()).count();
         if zero_count != 1 {
             return Err(SaltV2CodecError::S34ZeroCount {

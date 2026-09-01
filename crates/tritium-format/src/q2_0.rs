@@ -58,7 +58,7 @@ pub fn pack_q2_0_block(trits: &[Trit], scale: f16, out: &mut [u8]) -> Result<(),
     // (TQ2_0/TQ1_0 convention) and must not be used here.
     out[..2].copy_from_slice(&scale.to_bits().to_le_bytes());
     let qs = &mut out[2..];
-    for (byte, chunk) in qs.iter_mut().zip(trits.chunks_exact(4)) {
+    for (byte, chunk) in qs.iter_mut().zip(trits.as_chunks::<4>().0.iter()) {
         let mut q: u8 = 0;
         for (slot, trit) in chunk.iter().enumerate() {
             let code = (trit.get() + 1) as u8; // {0,1,2}
@@ -93,7 +93,7 @@ pub fn unpack_q2_0_block(
         });
     }
     let qs = &block[2..];
-    for (byte, out_chunk) in qs.iter().zip(trits_out.chunks_exact_mut(4)) {
+    for (byte, out_chunk) in qs.iter().zip(trits_out.as_chunks_mut::<4>().0.iter_mut()) {
         for (slot, trit_out) in out_chunk.iter_mut().enumerate() {
             let q = (byte >> (2 * slot)) & 3;
             // Code 3 decodes to +2 → TritError::OutOfRange(2) → DecodedOutOfRange(2).

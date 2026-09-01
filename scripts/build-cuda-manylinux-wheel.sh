@@ -3,7 +3,7 @@
 set -euo pipefail
 
 IMAGE="quay.io/pypa/manylinux_2_28_x86_64@sha256:a61875a2f84cab7df8de222ff12cabc08ff86eb4ad402ac90ba7bdaed9600cca"
-RUST_TOOLCHAIN="1.89.0"
+RUST_TOOLCHAIN="1.98.0"
 MATURIN_VERSION="1.10.2"
 PLATFORM_TAG="manylinux_2_28_x86_64"
 STATIC_CXX_LINKER="/io/scripts/manylinux-static-cxx-linker.sh"

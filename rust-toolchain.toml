@@ -1,7 +1,18 @@
 [toolchain]
-# Pin release and CI builds to MSRV. This prevents compiler drift from changing
-# generated code or silently widening the accepted toolchain surface.
-channel = "1.89.0"
+# The BUILD toolchain, pinned. This is deliberately NOT the MSRV any more.
+#
+# Those are two different questions and pinning one to the other cost us real work: burn 0.21
+# (via cubecl-zspace, which requires rustc 1.92) was unreachable purely because the build
+# toolchain was held down at the published compatibility floor.
+#
+#   build with : this pin              -- moves forward, still pinned
+#   support    : rust-version = "1.89" -- the promise to crates.io consumers, verified by the
+#                                         `msrv` CI lane, which must be bumped deliberately
+#
+# Still pinned to an exact version, not `stable`: `docs/security/threat-model.md` counts a
+# floating toolchain as a tampering vector, and this repo asserts bit-exact numerics across
+# CPU/CUDA/MCU, where silent compiler drift in generated code is a real hazard.
+channel = "1.98.0"
 components = ["rustfmt", "clippy"]
 # The wasm targets must live HERE, not in the CI actions' `targets:` inputs:
 # with a rust-toolchain.toml present, rustup resolves THIS toolchain for every

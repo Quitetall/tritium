@@ -629,7 +629,7 @@ fn validate_dense_plane(payload: &[u8], expected_len: usize) -> Result<(), Forma
             got: payload.len(),
         });
     }
-    for block in payload.chunks_exact(TQ2_0_BLOCK_BYTES) {
+    for block in payload.as_chunks::<TQ2_0_BLOCK_BYTES>().0 {
         for packed in &block[..QK_K / 4] {
             for shift in [0, 2, 4, 6] {
                 if (packed >> shift) & 0b11 == 0b11 {
