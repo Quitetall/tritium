@@ -57,6 +57,14 @@ class Qwen36PtqStatusTests(unittest.TestCase):
         self.assertEqual(snapshot["status"], "complete")
         self.assertEqual(snapshot["seal_count"], 1)
 
+    def test_dead_owner_is_reported_stalled(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "record.tmp.4000000000.1.0").write_bytes(b"orphan")
+            snapshot = MODULE.inspect(root)
+        self.assertEqual(snapshot["status"], "stalled")
+        self.assertFalse(snapshot["staged_record"]["pid_alive"])
+
     def test_json_cli_output_is_parseable(self):
         with tempfile.TemporaryDirectory() as directory:
             result = subprocess.run(

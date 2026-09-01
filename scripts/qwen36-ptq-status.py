@@ -75,6 +75,10 @@ def _pid_alive(pid: int) -> bool:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
+    except OverflowError:
+        # A filename can contain arbitrary decimal digits; values outside the
+        # host PID type cannot name a live process and are stale by definition.
+        return False
     except PermissionError:
         return True
     return True
@@ -124,7 +128,16 @@ def inspect(
         staged["sample_seconds"] = sample_seconds
         if target_bytes is not None and rate > 0:
             eta = max(target_bytes - after, 0) / rate
-    status = "complete" if seals else "running" if staged else "idle"
+    if seals:
+        status = "complete"
+    elif not staged:
+        status = "idle"
+    else:
+        # A leftover temp record after its owner exits is recoverable evidence,
+        # not proof of active work. Keep it distinct so operators do not wait
+        # indefinitely on a dead campaign.
+        live_staged = any(_pid_alive(pid) for _, pid in temps)
+        status = "running" if live_staged else "stalled"
     return {
         "schema": SCHEMA,
         "work_dir": str(root),
