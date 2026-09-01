@@ -104,8 +104,8 @@ fn measure(
         bail!("portable V3 corpus must contain exactly five HESTIA cases");
     }
     let vector_digest = format!(
-        "sha256:{:x}",
-        Sha256::digest(TrainingVectorSetV3::canonical_json())
+        "sha256:{}",
+        crate::hex::hex_digest(&Sha256::digest(TrainingVectorSetV3::canonical_json()))
     );
 
     let gradcheck = measured_gradcheck()?;
