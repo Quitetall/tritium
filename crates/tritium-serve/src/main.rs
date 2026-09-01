@@ -739,16 +739,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .into(),
         );
     }
-    let cfg = ServeConfig {
-        model_id,
-        queue_cap,
-        max_new_default: max_new,
+    // `ServeConfig`/`AdmissionPolicy` are #[non_exhaustive]: construct via
+    // Default + field mutation (the same pattern downstream crates must use).
+    let cfg = {
+        let mut c = ServeConfig::default();
+        c.model_id = model_id;
+        c.queue_cap = queue_cap;
+        c.max_new_default = max_new;
         // The v1.1 governed constructor owns rotating authentication. Keep the
         // legacy single-key field empty to make precedence unambiguous.
-        auth_token: None,
-        kv_pool_tokens,
-        chat_template,
-        ..ServeConfig::default()
+        c.auth_token = None;
+        c.kv_pool_tokens = kv_pool_tokens;
+        c.chat_template = chat_template;
+        c
     };
     let request_limits = RequestLimits {
         max_messages,
@@ -757,12 +760,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         max_new_tokens,
         max_total_tokens,
     };
-    let admission = AdmissionPolicy {
-        bearer_tokens: auth_tokens,
-        rate_limit: (rate_limit_rpm > 0).then_some(PrincipalRateLimit {
+    let admission = {
+        let mut a = AdmissionPolicy::default();
+        a.bearer_tokens = auth_tokens;
+        a.rate_limit = (rate_limit_rpm > 0).then_some(PrincipalRateLimit {
             requests_per_minute: rate_limit_rpm,
             burst: rate_limit_burst,
-        }),
+        });
+        a
     };
     // ADR 0021 model drafter: a SECOND runner in-process on the same device
     // (its own KV + decode graphs). Load failures are loud — a missing or

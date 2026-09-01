@@ -30,14 +30,11 @@ async fn serve_e2e_token_id_roundtrip() {
     let eos = 128_001;
     let generator = Box::new(RunnerGenerator::new(runner, eos));
     let tok: Arc<dyn Tokenizer + Send + Sync> = Arc::new(IdPassthroughTokenizer::new(128_000, eos));
-    let (router, _) = build_router(
-        generator,
-        tok,
-        ServeConfig {
-            max_new_default: 16,
-            ..ServeConfig::default()
-        },
-    );
+    let (router, _) = build_router(generator, tok, {
+        let mut c = ServeConfig::default();
+        c.max_new_default = 16;
+        c
+    });
 
     // A short token-ID prompt (the v0.80 passthrough tokenizer takes integer IDs).
     let req = Request::builder()

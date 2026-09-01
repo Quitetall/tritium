@@ -35,6 +35,7 @@ use crate::worker::{
 /// How `/v1/chat/completions` renders `messages` into the prompt string
 /// handed to the tokenizer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum ChatTemplate {
     /// Join message contents with newlines (the id-passthrough MVP: clients
     /// send integer token ids, roles carry no wire meaning).
@@ -94,6 +95,7 @@ impl ChatTemplate {
 
 /// Server configuration.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ServeConfig {
     /// The single served model id (matched against the request `model`).
     pub model_id: String,

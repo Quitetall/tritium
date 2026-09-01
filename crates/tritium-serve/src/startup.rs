@@ -223,6 +223,7 @@ impl ProductionReadiness {
 
 /// Startup admission or self-test failure.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum StartupError {
     /// Authenticated load receipt has unusable identity or policy fields.
     InvalidAdmission(&'static str),

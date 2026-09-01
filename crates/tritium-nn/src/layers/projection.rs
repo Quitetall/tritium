@@ -21,6 +21,7 @@ use crate::layers::{DenseLinear, HostSaltV2Linear, Q2Linear, SaltLinear, Ternary
 /// These variants name implemented numeric paths, not campaign evidence aliases:
 /// [`F32`](Self::F32) must never be reported as the planned A16 rung.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ProjectionActivationMode {
     /// Consume fp32 activations without per-token quantization.
     F32,

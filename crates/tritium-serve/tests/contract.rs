@@ -698,13 +698,11 @@ async fn backpressure_429_when_full() {
         step_delay_ms: 300,
         ..MockGenerator::new(vec![1, 2, 3, 4])
     };
-    let (router, _) = router_with(
-        mock,
-        ServeConfig {
-            queue_cap: 1,
-            ..ServeConfig::default()
-        },
-    );
+    let (router, _) = router_with(mock, {
+        let mut c = ServeConfig::default();
+        c.queue_cap = 1;
+        c
+    });
     let mut handles = Vec::new();
     for _ in 0..6 {
         let r = router.clone();
@@ -871,9 +869,10 @@ async fn worker_phase_is_causal_and_drain_skips_queued_prefill() {
         decode_entered: decode_entered.clone(),
         release_decode: release_decode.clone(),
     };
-    let cfg = ServeConfig {
-        queue_cap: 1,
-        ..ServeConfig::default()
+    let cfg = {
+        let mut c = ServeConfig::default();
+        c.queue_cap = 1;
+        c
     };
     let (router, draining) = build_router(Box::new(generator), shared_tok(), cfg);
 
@@ -1261,13 +1260,11 @@ async fn tree_endpoints_map_statuses_by_variant() {
 /// token are 401; the right token passes. (P1 network-exposure hardening.)
 #[tokio::test]
 async fn bearer_auth_enforced_when_configured() {
-    let (router, _d) = router_with(
-        MockGenerator::new(vec![10, 11]),
-        ServeConfig {
-            auth_token: Some("sekrit".into()),
-            ..ServeConfig::default()
-        },
-    );
+    let (router, _d) = router_with(MockGenerator::new(vec![10, 11]), {
+        let mut c = ServeConfig::default();
+        c.auth_token = Some("sekrit".into());
+        c
+    });
     // No token → 401.
     let req = Request::post("/v1/chat/completions")
         .header("content-type", "application/json")
@@ -1319,12 +1316,14 @@ async fn rotating_auth_has_per_principal_rate_buckets() {
         shared_tok(),
         ServeConfig::default(),
         RequestLimits::default(),
-        AdmissionPolicy {
-            bearer_tokens: vec!["old-key".into(), "new-key".into()],
-            rate_limit: Some(PrincipalRateLimit {
+        {
+            let mut a = AdmissionPolicy::default();
+            a.bearer_tokens = vec!["old-key".into(), "new-key".into()];
+            a.rate_limit = Some(PrincipalRateLimit {
                 requests_per_minute: 1,
                 burst: 1,
-            }),
+            });
+            a
         },
     )
     .expect("valid governed router");
@@ -1429,13 +1428,11 @@ async fn nonstream_timeout_408() {
         step_delay_ms: 400, // 4 tokens x 400ms = 1.6s > the 1s deadline
         ..MockGenerator::new(vec![1, 2, 3, 4])
     };
-    let (router, _d) = router_with(
-        mock,
-        ServeConfig {
-            request_timeout_secs: 1,
-            ..ServeConfig::default()
-        },
-    );
+    let (router, _d) = router_with(mock, {
+        let mut c = ServeConfig::default();
+        c.request_timeout_secs = 1;
+        c
+    });
     let (status, body) = send(
         &router,
         chat(json!({"model":"tritium","messages":[{"role":"user","content":"1"}]})),
@@ -1460,13 +1457,11 @@ async fn sse_deadline_cancels_generation() {
         step_delay_ms: 400, // total 1.6s of generation vs a 1s deadline
         ..MockGenerator::new(vec![1, 2, 3, 4])
     };
-    let (router, _d) = router_with(
-        mock,
-        ServeConfig {
-            request_timeout_secs: 1,
-            ..ServeConfig::default()
-        },
-    );
+    let (router, _d) = router_with(mock, {
+        let mut c = ServeConfig::default();
+        c.request_timeout_secs = 1;
+        c
+    });
     let t0 = std::time::Instant::now();
     let (status, body) = send(
         &router,
@@ -1674,13 +1669,11 @@ async fn metrics_exposition() {
     assert!(text.contains("# TYPE tritium_queue_depth gauge"), "{text}");
 
     // Auth uniformity: with a token configured, /metrics 401s like the rest.
-    let (router, _d) = router_with(
-        MockGenerator::new(vec![1]),
-        ServeConfig {
-            auth_token: Some("sekrit".into()),
-            ..ServeConfig::default()
-        },
-    );
+    let (router, _d) = router_with(MockGenerator::new(vec![1]), {
+        let mut c = ServeConfig::default();
+        c.auth_token = Some("sekrit".into());
+        c
+    });
     let req = Request::get("/metrics").body(Body::empty()).unwrap();
     let (status, _) = send(&router, req).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);

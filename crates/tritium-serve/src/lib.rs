@@ -11,7 +11,7 @@
 //! The [`Generator`] seam, the OpenAI DTOs, and the passthrough tokenizer are
 //! **always compiled** and runtime-free (no async deps), so the default workspace
 //! build (and the cpu-only CI matrix) pulls in no tokio/axum. The HTTP server —
-//! [`build_router`], the worker, and the SSE machinery — lives behind the
+//! `build_router`, the worker, and the SSE machinery — lives behind the
 //! `serve` feature (mirroring tritium-cuda/wgpu's gate); the `tritium-serve`
 //! binary has `required-features = ["serve"]`.
 //!

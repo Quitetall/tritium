@@ -152,11 +152,12 @@ async fn cuda_batched_serve_matches_single_sequence_greedy() {
     let batched_run = |bytes: &[u8], order: Vec<usize>, max_tokens: usize| {
         let runner = load_runner(bytes).expect("runner");
         let tok = Arc::new(IdPassthroughTokenizer::new(128_000, u32::MAX));
-        let cfg = ServeConfig {
-            model_id: "tritium".into(),
-            queue_cap: 32,
-            max_new_default: max_tokens,
-            ..ServeConfig::default()
+        let cfg = {
+            let mut c = ServeConfig::default();
+            c.model_id = "tritium".into();
+            c.queue_cap = 32;
+            c.max_new_default = max_tokens;
+            c
         };
         let (router, _draining) =
             build_router_batched(runner, u32::MAX, 4, tok, cfg).expect("batched router");
@@ -313,11 +314,12 @@ async fn cuda_batched_tree_session_coexists() {
     let (single_root, single_rounds) = {
         let runner = load_runner(&bytes).expect("runner");
         let tok = Arc::new(IdPassthroughTokenizer::new(128_000, u32::MAX));
-        let cfg = ServeConfig {
-            model_id: "tritium".into(),
-            queue_cap: 8,
-            max_new_default: 32,
-            ..ServeConfig::default()
+        let cfg = {
+            let mut c = ServeConfig::default();
+            c.model_id = "tritium".into();
+            c.queue_cap = 8;
+            c.max_new_default = 32;
+            c
         };
         let (router, _d) =
             tritium_serve::build_router(Box::new(RunnerGenerator::new(runner, u32::MAX)), tok, cfg);
@@ -327,11 +329,12 @@ async fn cuda_batched_tree_session_coexists() {
     // Batched server, 2 slots.
     let runner = load_runner(&bytes).expect("runner");
     let tok = Arc::new(IdPassthroughTokenizer::new(128_000, u32::MAX));
-    let cfg = ServeConfig {
-        model_id: "tritium".into(),
-        queue_cap: 8,
-        max_new_default: 128,
-        ..ServeConfig::default()
+    let cfg = {
+        let mut c = ServeConfig::default();
+        c.model_id = "tritium".into();
+        c.queue_cap = 8;
+        c.max_new_default = 128;
+        c
     };
     let (router, _draining) =
         build_router_batched(runner, u32::MAX, 2, tok, cfg).expect("batched router");
@@ -412,11 +415,12 @@ async fn cuda_batched_tree_session_coexists() {
     let single_accept = {
         let runner = load_runner(&bytes).expect("runner");
         let tok = Arc::new(IdPassthroughTokenizer::new(128_000, u32::MAX));
-        let cfg = ServeConfig {
-            model_id: "tritium".into(),
-            queue_cap: 8,
-            max_new_default: 32,
-            ..ServeConfig::default()
+        let cfg = {
+            let mut c = ServeConfig::default();
+            c.model_id = "tritium".into();
+            c.queue_cap = 8;
+            c.max_new_default = 32;
+            c
         };
         let (r, _d) =
             tritium_serve::build_router(Box::new(RunnerGenerator::new(runner, u32::MAX)), tok, cfg);
@@ -505,12 +509,13 @@ async fn cuda_batched_paged_streams_equal_dense() {
     let run = |bytes: &[u8], kv_pool_tokens: Option<usize>| {
         let runner = load_runner(bytes).expect("runner");
         let tok = Arc::new(IdPassthroughTokenizer::new(128_000, u32::MAX));
-        let cfg = ServeConfig {
-            model_id: "tritium".into(),
-            queue_cap: 32,
-            max_new_default: max_tokens,
-            kv_pool_tokens,
-            ..ServeConfig::default()
+        let cfg = {
+            let mut c = ServeConfig::default();
+            c.model_id = "tritium".into();
+            c.queue_cap = 32;
+            c.max_new_default = max_tokens;
+            c.kv_pool_tokens = kv_pool_tokens;
+            c
         };
         let (router, _draining) =
             build_router_batched(runner, u32::MAX, 4, tok, cfg).expect("batched router");
@@ -640,11 +645,12 @@ async fn cuda_batched_admission_interleaves_live_slot() {
         return;
     };
     let tok = Arc::new(IdPassthroughTokenizer::new(128_000, u32::MAX));
-    let cfg = ServeConfig {
-        model_id: "tritium".into(),
-        queue_cap: 8,
-        max_new_default: 256,
-        ..ServeConfig::default()
+    let cfg = {
+        let mut c = ServeConfig::default();
+        c.model_id = "tritium".into();
+        c.queue_cap = 8;
+        c.max_new_default = 256;
+        c
     };
     let (router, _draining) =
         build_router_batched(runner, u32::MAX, 2, tok, cfg).expect("batched router");
@@ -853,11 +859,12 @@ async fn cuda_batched_spec_solo_matches_single_worker() {
     let runner = load_runner(&bytes).expect("runner");
     let draft = load_runner(&dbytes).expect("draft runner");
     let tok = Arc::new(IdPassthroughTokenizer::new(128_000, u32::MAX));
-    let cfg = ServeConfig {
-        model_id: "tritium".into(),
-        queue_cap: 32,
-        max_new_default: horizon,
-        ..ServeConfig::default()
+    let cfg = {
+        let mut c = ServeConfig::default();
+        c.model_id = "tritium".into();
+        c.queue_cap = 32;
+        c.max_new_default = horizon;
+        c
     };
     let (router, _draining) = build_router_batched_with_draft(runner, draft, u32::MAX, 4, tok, cfg)
         .expect("batched router");
@@ -1049,11 +1056,12 @@ async fn cuda_batched_spec_multi_matches_single_worker() {
     let runner = load_runner(&bytes).expect("runner");
     let draft = load_runner(&dbytes).expect("draft runner");
     let tok = Arc::new(IdPassthroughTokenizer::new(128_000, u32::MAX));
-    let cfg = ServeConfig {
-        model_id: "tritium".into(),
-        queue_cap: 32,
-        max_new_default: horizon,
-        ..ServeConfig::default()
+    let cfg = {
+        let mut c = ServeConfig::default();
+        c.model_id = "tritium".into();
+        c.queue_cap = 32;
+        c.max_new_default = horizon;
+        c
     };
     let (router, _draining) =
         build_router_batched_with_draft(runner, draft, u32::MAX, 3, tok.clone(), cfg.clone())
@@ -1331,11 +1339,12 @@ async fn cuda_batched_spec_multi_f16_matches_single_worker() {
     let runner = load_runner(&bytes).expect("runner");
     let draft = load_runner(&dbytes).expect("draft runner");
     let tok = Arc::new(IdPassthroughTokenizer::new(128_000, u32::MAX));
-    let cfg = ServeConfig {
-        model_id: "tritium".into(),
-        queue_cap: 32,
-        max_new_default: horizon,
-        ..ServeConfig::default()
+    let cfg = {
+        let mut c = ServeConfig::default();
+        c.model_id = "tritium".into();
+        c.queue_cap = 32;
+        c.max_new_default = horizon;
+        c
     };
     let (router, _draining) = build_router_batched_with_draft(runner, draft, u32::MAX, 3, tok, cfg)
         .expect("batched router");
@@ -1422,11 +1431,12 @@ async fn cuda_batched_throughput_vs_sequential() {
     // Sequential baseline: plain single-request worker.
     let runner = load_runner(&bytes).expect("runner");
     let tok = Arc::new(IdPassthroughTokenizer::new(128_000, u32::MAX));
-    let cfg = ServeConfig {
-        model_id: "tritium".into(),
-        queue_cap: 32,
-        max_new_default: max_tokens,
-        ..ServeConfig::default()
+    let cfg = {
+        let mut c = ServeConfig::default();
+        c.model_id = "tritium".into();
+        c.queue_cap = 32;
+        c.max_new_default = max_tokens;
+        c
     };
     let (router, _d) = tritium_serve::build_router(
         Box::new(RunnerGenerator::new(runner, u32::MAX)),
@@ -1586,11 +1596,12 @@ async fn cuda_batched_spec_adaptive_forced_collapse_stays_lossless() {
     let runner = load_runner(&bytes).expect("runner");
     let draft = load_runner(&dbytes).expect("draft runner");
     let tok = Arc::new(IdPassthroughTokenizer::new(128_000, u32::MAX));
-    let cfg = ServeConfig {
-        model_id: "tritium".into(),
-        queue_cap: 32,
-        max_new_default: horizon,
-        ..ServeConfig::default()
+    let cfg = {
+        let mut c = ServeConfig::default();
+        c.model_id = "tritium".into();
+        c.queue_cap = 32;
+        c.max_new_default = horizon;
+        c
     };
     let (router, _draining) =
         build_router_batched_with_draft(runner, draft, u32::MAX, 3, tok.clone(), cfg.clone())
@@ -1735,11 +1746,12 @@ async fn cuda_batched_spec_delta_resync_fires_and_stays_lossless() {
     let runner = load_runner(&bytes).expect("runner");
     let draft = load_runner(&dbytes).expect("draft runner");
     let tok = Arc::new(IdPassthroughTokenizer::new(128_000, u32::MAX));
-    let cfg = ServeConfig {
-        model_id: "tritium".into(),
-        queue_cap: 32,
-        max_new_default: horizon,
-        ..ServeConfig::default()
+    let cfg = {
+        let mut c = ServeConfig::default();
+        c.model_id = "tritium".into();
+        c.queue_cap = 32;
+        c.max_new_default = horizon;
+        c
     };
     let (router, _draining) =
         build_router_batched_with_draft(runner, draft, u32::MAX, 3, tok.clone(), cfg.clone())
@@ -1826,11 +1838,12 @@ async fn cuda_batched_spec_adaptive_multi_bench() {
         })
         .collect();
     let tok = Arc::new(IdPassthroughTokenizer::new(128_000, u32::MAX));
-    let cfg = ServeConfig {
-        model_id: "tritium".into(),
-        queue_cap: 32,
-        max_new_default: horizon,
-        ..ServeConfig::default()
+    let cfg = {
+        let mut c = ServeConfig::default();
+        c.model_id = "tritium".into();
+        c.queue_cap = 32;
+        c.max_new_default = horizon;
+        c
     };
     let (router, _draining) = build_router_batched_with_draft(runner, draft, u32::MAX, n, tok, cfg)
         .expect("batched router");

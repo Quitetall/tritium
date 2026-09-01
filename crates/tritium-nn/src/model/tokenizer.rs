@@ -28,4 +28,11 @@ pub trait Tokenizer {
 
     /// The end-of-sequence token ID (generation stops when it is produced).
     fn eos(&self) -> u32;
+
+    /// Every end-of-sequence token id. Newer chat models (Qwen3-family) stop
+    /// on several ids; the default wraps [`eos`](Self::eos) so existing
+    /// implementors keep working. Generation loops should prefer this.
+    fn eos_ids(&self) -> Vec<u32> {
+        vec![self.eos()]
+    }
 }

@@ -1733,6 +1733,7 @@ impl AppliedIntermediateGrowthReceipt {
 
 /// Why checked SALT V2 growth planning or application failed.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum GrowthPlanError {
     /// A growth plan was not bound to a semantic source-checkpoint digest.
     InvalidSourceModelId,

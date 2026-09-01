@@ -19,6 +19,7 @@ pub struct ChatMessage {
 /// `stop`: either a single string or up to four strings (OpenAI allows both).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
+#[non_exhaustive]
 pub enum StopField {
     /// A single stop sequence.
     One(String),

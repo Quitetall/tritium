@@ -95,6 +95,11 @@ impl ModelRunner {
     /// [`KvCache`] per layer. The model starts on the host forward path; the device-resident
     /// decoder is built lazily and is skipped for any model carrying a SALT or
     /// dense projection.
+    ///
+    /// # Panics
+    /// Panics if the config's KV-cache geometry overflows or layer-metadata
+    /// reservation fails — use [`try_from_weights`](Self::try_from_weights)
+    /// for a fallible construction from untrusted configs.
     #[must_use]
     pub fn from_weights(
         config: ModelConfig,
@@ -430,7 +435,7 @@ impl ModelRunner {
 
     /// (cuda) Continuous-batching admission: copy this runner's single-sequence
     /// KV rows `[0, len)` into batch slot `row` (prefill the prompt through the
-    /// single-sequence path first, then adopt + [`BatchKv::set_position`]).
+    /// single-sequence path first, then adopt + [`BatchKv::set_position`](tritium_cuda::BatchKv::set_position)).
     ///
     /// # Errors
     /// [`ResidentOpError`] — `Op(InvalidInput)` on a bad row/len or a non-f32 KV rung.
