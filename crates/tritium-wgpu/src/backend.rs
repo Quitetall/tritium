@@ -412,9 +412,24 @@ fn pick_adapter(instance: &wgpu::Instance) -> Result<wgpu::Adapter, BackendError
     }
     const NVIDIA: u32 = 0x10DE;
     let want = std::env::var("TRITIUM_WGPU_ADAPTER").ok();
+    // An unmatched substring must FAIL, not silently select a different
+    // GPU — the exact silent-wrong-A/B class every other knob rejects.
+    if let Some(w) = want.as_ref()
+        && !adapters
+            .iter()
+            .any(|a| a.get_info().name.contains(w.as_str()))
+    {
+        return Err(BackendError::InvalidInput(format!(
+            "TRITIUM_WGPU_ADAPTER={w:?} matches none of the adapters listed above"
+        )));
+    }
     let idx = want
         .as_ref()
-        .and_then(|w| adapters.iter().position(|a| a.get_info().name.contains(w)))
+        .and_then(|w| {
+            adapters
+                .iter()
+                .position(|a| a.get_info().name.contains(w.as_str()))
+        })
         .or_else(|| {
             adapters.iter().position(|a| {
                 let i = a.get_info();

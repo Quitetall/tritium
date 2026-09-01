@@ -1,11 +1,21 @@
 //! The `tritium` command-line tool.
 //!
-//! Three subcommands:
-//! - `tritium inspect <PATH.gguf>` — parse a GGUF container and print a summary of
-//!   its version, metadata, architecture, alignment, and tensor table.
-//! - `tritium list-backends` — enumerate every backend the runtime discovered.
-//! - `tritium generate` — load a GGUF model and greedily decode tokens from a
-//!   reproducible JSON file of input token IDs.
+//! One binary, fourteen subcommands, grouped by concern:
+//! - **inspect / list-backends / generate** — parse a GGUF and print its
+//!   metadata + tensor table, enumerate the discovered compute backends,
+//!   greedily decode from a reproducible JSON token file.
+//! - **pull** — fetch GGUF models from the HuggingFace hub into the shared
+//!   local cache (resumable).
+//! - **report** — the reproducible benchmark/validation reports
+//!   (`sparsity`, `decode`, `ttft`, `compare`, `parity`, `salt`,
+//!   `salt-model`) that every docs/BENCHMARKS.md number reproduces from.
+//! - **repack / transport / convert / quantize** — ternary container
+//!   repacking, the seekable outer transport, HF→ternary conversion, and
+//!   SALT quantization.
+//! - **campaign / salt / release** — offline teacher targets, resumable
+//!   SALT V2 synthesis workflows, and release-candidate verification.
+//!
+//! Serving is the separate `tritium-serve` binary.
 //!
 //! Errors are surfaced through [`anyhow`]: a missing, short, or corrupt GGUF file
 //! prints a clean message and exits non-zero rather than panicking.
@@ -96,8 +106,10 @@ enum Command {
         salt: salt::SaltCommand,
     },
     /// Download a GGUF model from the HuggingFace hub into the local cache
-    /// (~/.cache/tritium-models, override with TRITIUM_MODEL_CACHE). Resumes
-    /// partial downloads on re-run.
+    /// (~/.cache/tritium-models; override with TRITIUM_MODEL_DIR or the
+    /// legacy TRITIUM_MODEL_CACHE — the same directory the report/bench
+    /// harnesses read). Gated repos need HF_TOKEN. Resumes partial
+    /// downloads on re-run.
     Pull {
         /// Hub repo, `owner/name` (e.g. `microsoft/bitnet-b1.58-2B-4T-gguf`).
         repo: String,
@@ -111,7 +123,7 @@ enum Command {
     /// Load a GGUF model and greedily generate tokens from a JSON file of input IDs.
     Generate {
         /// A `.gguf` model file, or a directory written by `tritium convert`.
-        #[arg(long)]
+        #[arg(long, alias = "input")]
         model: PathBuf,
         /// Path to a JSON file holding the input token IDs, e.g. `[1, 128000, 9906]`. The
         /// reproducible path: no tokenizer is consulted, so the same ids always go in and out.
@@ -125,8 +137,9 @@ enum Command {
         /// Maximum number of new tokens to generate.
         #[arg(long, default_value_t = 16)]
         max_new: usize,
-        /// Decode greedily (the only v0.20 strategy). `--greedy=false` still decodes
-        /// greedily but prints a note; sampling lands in a later wave.
+        /// Decode greedily — the only strategy this subcommand implements.
+        /// `--greedy=false` is REJECTED (sampling lives in `tritium-serve`'s
+        /// OpenAI API); the flag exists so scripts can be explicit.
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         greedy: bool,
         /// End-of-sequence token ID that stops generation early.
@@ -148,10 +161,10 @@ enum Command {
     /// Repack ternary GGUF tensors while preserving dequantized weight values.
     Repack {
         /// Path to source `.gguf` (I2_S, standard Q2_0, TQ1_0 or TQ2_0 tensors).
-        #[arg(long)]
+        #[arg(long, alias = "model")]
         input: PathBuf,
         /// Path to write the repacked `.gguf`.
-        #[arg(long)]
+        #[arg(long, alias = "out")]
         output: PathBuf,
         /// Target ternary format.
         #[arg(long, value_enum)]
@@ -171,10 +184,10 @@ enum Command {
     /// weights carry the fold and whose norms do not.
     Convert {
         /// Hugging Face model directory (config.json + safetensors shards).
-        #[arg(long)]
+        #[arg(long, alias = "input")]
         model: PathBuf,
         /// Output directory: config.json + model.safetensors (folded norms) + model.tslb.
-        #[arg(long)]
+        #[arg(long, alias = "output")]
         out: PathBuf,
         /// Calibration corpus for the salience fold: either a corpus JSON with a `train_ids`
         /// array, or a UTF-8 text file tokenized with the model's own tokenizer. Without it the
@@ -201,18 +214,20 @@ enum Command {
     /// SALT-quantize an fp safetensors model to a SALT bundle.
     Quantize {
         /// Path to the fp16/bf16/f32 `.safetensors` source model.
-        #[arg(long)]
+        #[arg(long, alias = "model")]
         input: PathBuf,
         /// Path to write the SALT bundle (`.tslb`).
-        #[arg(long)]
+        #[arg(long, alias = "out")]
         output: PathBuf,
         /// Target average bits-per-weight (`1.585` = all base ternary … `~4.75` at T=3).
-        #[arg(long, default_value_t = 2.0)]
-        bpw: f64,
+        /// Applies to `--ladder itf` only (default 2.0 there); the geometric
+        /// ladder derives its rate from `--planes` and REJECTS this flag.
+        #[arg(long)]
+        bpw: Option<f64>,
         /// Base-plane scale granularity: `block` (per-256-block) or `tensor` (per-tensor,
-        /// for a BitNet b1.58 master).
-        #[arg(long, value_enum, default_value_t = quantize::ScaleGroupArg::Block)]
-        scale_group: quantize::ScaleGroupArg,
+        /// for a BitNet b1.58 master). `--ladder itf` only (default `block`).
+        #[arg(long, value_enum)]
+        scale_group: Option<quantize::ScaleGroupArg>,
         /// Plane-allocation sensitivity: `uniform` (allocate purely by reconstruction-error
         /// reduction) or `energy` (weight `‖w‖²` proxy — spend planes on high-energy groups).
         #[arg(long, value_enum, default_value_t = SaltSensitivityArg::Uniform)]
@@ -256,13 +271,13 @@ enum ReportCommand {
     /// ground truth — run per model, per checkpoint).
     Sparsity {
         /// Path to the `.gguf` model file (I2_S / Q2_0 / TQ1_0 / TQ2_0 tensors).
-        #[arg(long)]
+        #[arg(long, alias = "input")]
         model: PathBuf,
     },
     /// Decode-only throughput after prefill.
     Decode {
         /// Path to the `.gguf` model file.
-        #[arg(long)]
+        #[arg(long, alias = "input")]
         model: PathBuf,
         /// Path to a JSON file holding the input token IDs.
         #[arg(long)]
@@ -283,7 +298,7 @@ enum ReportCommand {
     /// Time to first token / prefill latency.
     Ttft {
         /// Path to the `.gguf` model file.
-        #[arg(long)]
+        #[arg(long, alias = "input")]
         model: PathBuf,
         /// Path to a JSON file holding the input token IDs.
         #[arg(long)]
@@ -304,7 +319,7 @@ enum ReportCommand {
     /// numbers must reproduce from.
     Compare {
         /// Path to the `.gguf` model file.
-        #[arg(long)]
+        #[arg(long, alias = "input")]
         model: PathBuf,
         /// Path to a JSON file holding the input token IDs.
         #[arg(long)]
@@ -335,7 +350,7 @@ enum ReportCommand {
     /// CPU-vs-CUDA greedy parity.
     Parity {
         /// Path to the `.gguf` model file.
-        #[arg(long)]
+        #[arg(long, alias = "input")]
         model: PathBuf,
         /// Path to a JSON file holding the input token IDs.
         #[arg(long)]
@@ -353,7 +368,7 @@ enum ReportCommand {
     /// SALT bpw/error report for a flat JSON fp32 matrix.
     Salt {
         /// Path to a JSON array of row-major fp32 weights.
-        #[arg(long)]
+        #[arg(long, alias = "model")]
         input: PathBuf,
         /// Number of matrix rows.
         #[arg(long)]
@@ -376,7 +391,7 @@ enum ReportCommand {
     /// (Uniform vs sensitivity-allocated). Needs the fp master, not a quantized model.
     SaltModel {
         /// Path to the fp (bf16/f16/f32) safetensors master.
-        #[arg(long)]
+        #[arg(long, alias = "model")]
         input: PathBuf,
         /// Comma-separated bpw budgets, e.g. `1.585,2.0,2.5,3.0`.
         #[arg(long)]

@@ -32,6 +32,13 @@ struct ModelInfo {
 
 /// Default cache root (shared with the docs' quickstart examples).
 fn cache_root() -> PathBuf {
+    // TRITIUM_MODEL_DIR is the name every report/bench harness reads; the
+    // legacy TRITIUM_MODEL_CACHE stays honored so existing setups keep
+    // working. Same directory either way — downloads must land where the
+    // rest of the tooling looks.
+    if let Ok(dir) = std::env::var("TRITIUM_MODEL_DIR") {
+        return PathBuf::from(dir);
+    }
     if let Ok(dir) = std::env::var("TRITIUM_MODEL_CACHE") {
         return PathBuf::from(dir);
     }

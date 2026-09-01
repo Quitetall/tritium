@@ -32,7 +32,7 @@ mod ttrace {
     static ON: OnceLock<bool> = OnceLock::new();
 
     pub(super) fn on() -> bool {
-        *ON.get_or_init(|| std::env::var_os("TRITIUM_TREE_TRACE").is_some())
+        *ON.get_or_init(|| crate::cuda::consts::env_flag_on("TRITIUM_TREE_TRACE"))
     }
 
     /// Phase stopwatch: `lap(i)` adds the time since the previous lap (or
@@ -459,7 +459,7 @@ impl CudaDecodeModel {
                     .contains_key(&key),
             };
             if !have {
-                if std::env::var_os("TRITIUM_TREE_DEBUG").is_some() {
+                if env_flag_on("TRITIUM_TREE_DEBUG") {
                     eprintln!("tree-graph: capturing bucket {bucket}");
                 }
                 // Bake the TARGET's ctrl + KV arena pointers into the capture
@@ -1055,7 +1055,7 @@ impl CudaDecodeModel {
             // RFC 0001 Amendment 1 seam: env-gated per-layer attention-output
             // dump (see `tree_attn_dump`). Zero cost when unset (no buffer,
             // no captured copy nodes).
-            d_attn_dump: if std::env::var_os("TRITIUM_TREE_ATTN_DUMP").is_some() {
+            d_attn_dump: if env_flag_on("TRITIUM_TREE_ATTN_DUMP") {
                 Some(alloc(self.layers.len() * m * q_width, "tree d_attn_dump")?)
             } else {
                 None
@@ -2603,7 +2603,7 @@ impl CudaDecodeModel {
                 .graphs
                 .contains_key(&(bucket, false));
             if !have {
-                if std::env::var_os("TRITIUM_TREE_DEBUG").is_some() {
+                if env_flag_on("TRITIUM_TREE_DEBUG") {
                     eprintln!("tree-slots-graph: capturing bucket {bucket}");
                 }
                 let cs = &self.cap_stream;
