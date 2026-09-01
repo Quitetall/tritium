@@ -19,8 +19,10 @@ const NEGATIVE_LARGE: f32 = -3.402823466e+38;
 @group(0) @binding(3) var<storage, read> v: array<f32>;
 @group(0) @binding(4) var<storage, read> grad_output: array<f32>;
 @group(0) @binding(5) var<storage, read_write> output_0: array<f32>;
-@group(0) @binding(6) var<storage, read_write> scratch: array<f32>;
-@group(0) @binding(7) var<storage, read_write> probabilities: array<f32>;
+@group(0) @binding(6) var<storage, read_write> output_1: array<f32>;
+@group(0) @binding(7) var<storage, read_write> output_2: array<f32>;
+@group(0) @binding(8) var<storage, read_write> probabilities: array<f32>;
+@group(0) @binding(9) var<storage, read_write> grad_probabilities: array<f32>;
 
 fn vector_index(token: u32, head: u32, head_count: u32, lane: u32) -> u32 {
     return (token * head_count + head) * params.head_dim + lane;
@@ -60,10 +62,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let group_size = params.n_head / params.n_kv_head;
     let scale = inverseSqrt(f32(params.head_dim));
-    let kv_elements = params.seq * params.n_kv_head * params.head_dim;
-    let output_1_offset = 0u;
-    let output_2_offset = kv_elements;
-    let grad_probabilities_offset = kv_elements * 2u;
     if (params.execution == 0u) {
         for (var head = 0u; head < params.n_head; head++) {
             let kv_head = head / group_size;
@@ -82,6 +80,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
+    // Output buffers are newly allocated storage resources and have no
+    // defined initial contents. VJP writes accumulate across query/head loops,
+    // so clear every destination before the first accumulation.
+    for (var index = 0u; index < params.seq * params.n_head * params.head_dim; index++) {
+        output_0[index] = 0.0;
+    }
+    for (var index = 0u; index < params.seq * params.n_kv_head * params.head_dim; index++) {
+        output_1[index] = 0.0;
+        output_2[index] = 0.0;
+    }
+
     var head_cursor = params.n_head;
     loop {
         if (head_cursor == 0u) {
@@ -92,7 +101,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let kv_head = head / group_size;
         compute_probabilities(head, kv_head, scale);
         for (var index = 0u; index < params.seq * params.seq; index++) {
-            scratch[grad_probabilities_offset + index] = 0.0;
+            grad_probabilities[index] = 0.0;
         }
         for (var query = 0u; query < params.seq; query++) {
             for (var lane = 0u; lane < params.head_dim; lane++) {
@@ -100,8 +109,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 for (var key = 0u; key < params.seq; key++) {
                     let probability_index = query * params.seq + key;
                     let value_index = vector_index(key, kv_head, params.n_kv_head, lane);
-                    scratch[grad_probabilities_offset + probability_index] += gradient * v[value_index];
-                    scratch[output_2_offset + value_index] += gradient * probabilities[probability_index];
+                    grad_probabilities[probability_index] += gradient * v[value_index];
+                    output_2[value_index] += gradient * probabilities[probability_index];
                 }
             }
         }
@@ -109,14 +118,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let row = query * params.seq;
             var contraction = 0.0;
             for (var key = 0u; key < params.seq; key++) {
-                contraction += probabilities[row + key]
-                    * scratch[grad_probabilities_offset + row + key];
+                contraction += probabilities[row + key] * grad_probabilities[row + key];
             }
             for (var key = 0u; key < params.seq; key++) {
                 let index = row + key;
-                scratch[grad_probabilities_offset + index] = select(
+                grad_probabilities[index] = select(
                     probabilities[index]
-                        * (scratch[grad_probabilities_offset + index] - contraction) * scale,
+                        * (grad_probabilities[index] - contraction) * scale,
                     0.0,
                     params.causal != 0u && key > query,
                 );
@@ -124,12 +132,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
         for (var query = 0u; query < params.seq; query++) {
             for (var key = 0u; key < params.seq; key++) {
-                let gradient = scratch[grad_probabilities_offset + query * params.seq + key];
+                let gradient = grad_probabilities[query * params.seq + key];
                 for (var lane = 0u; lane < params.head_dim; lane++) {
                     let query_index = vector_index(query, head, params.n_head, lane);
                     let key_index = vector_index(key, kv_head, params.n_kv_head, lane);
                     output_0[query_index] += gradient * k[key_index];
-                    scratch[output_1_offset + key_index] += gradient * q[query_index];
+                    output_1[key_index] += gradient * q[query_index];
                 }
             }
         }
