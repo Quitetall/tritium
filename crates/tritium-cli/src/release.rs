@@ -77,7 +77,7 @@ fn digest_stream(mut reader: impl Read) -> anyhow::Result<StreamIdentity> {
     Ok(StreamIdentity {
         schema: "tritium.stream-identity.v1",
         bytes,
-        sha256: format!("{:x}", sha256.finalize()),
+        sha256: crate::hex::hex_digest(&sha256.finalize()),
         blake3: blake3.finalize().to_hex().to_string(),
         package_id: package.finalize().to_string(),
     })
@@ -116,7 +116,7 @@ fn digest(path: &Path) -> anyhow::Result<FileIdentity> {
     Ok(FileIdentity {
         schema: "tritium.file-identity.v1",
         bytes,
-        sha256: format!("{:x}", sha256.finalize()),
+        sha256: crate::hex::hex_digest(&sha256.finalize()),
         blake3: blake3.finalize().to_hex().to_string(),
     })
 }

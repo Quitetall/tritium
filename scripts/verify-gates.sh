@@ -150,6 +150,31 @@ run_model_acceptance() {
         cpu_longer_greedy_matches_transformers --nocapture
 }
 
+
+# Cross-check the non-unix configuration.
+#
+# `#[cfg(unix)]` definitions whose callers are ungated compile fine on Linux and fail only on
+# Windows (E0599, "no method named ..."). tritium-salt broke `main` this way on 2026-08-26:
+# 51 of its 64 cfg(unix) functions still have no `not(unix)` twin, so the class is one ungated
+# caller away from recurring, and NO amount of Linux checking sees it.
+#
+# `cargo check` does not link, so the gnu target needs only mingw for blake3's C build. The msvc
+# target fails earlier for want of an MSVC compiler -- use gnu.
+verify_non_unix_cfg() {
+    if ! rustup target list --installed 2>/dev/null | grep -q '^x86_64-pc-windows-gnu$'; then
+        echo "SKIPPED non-unix cfg check: rustup target add x86_64-pc-windows-gnu" >&2
+        return 0
+    fi
+    if ! command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
+        echo "SKIPPED non-unix cfg check: install mingw-w64 (x86_64-w64-mingw32-gcc)" >&2
+        return 0
+    fi
+    run env CC_x86_64_pc_windows_gnu=x86_64-w64-mingw32-gcc \
+        AR_x86_64_pc_windows_gnu=x86_64-w64-mingw32-ar \
+        cargo check --locked --workspace --exclude tritium-py --all-targets \
+        --target x86_64-pc-windows-gnu
+}
+
 case "$tier" in
     precommit)
         run git diff --cached --check
@@ -159,6 +184,15 @@ case "$tier" in
     prepush)
         run cargo fmt --all --check
         run cargo clippy --locked --workspace --all-targets -- -D warnings
+        # Default features are NOT the shipped surface. Optional deps and cfg-gated modules do not
+        # compile above, so a clean default run says nothing about them -- three separate CI
+        # failures on 2026-08-26 all came through this gap (a cuda/nccl-only digest site, an
+        # onnx-only test that reported "0 passed; 73 filtered out", and wgpu/pollster which are
+        # optional behind --features wgpu while backend.rs alone has 467 wgpu:: call sites).
+        # TRITIUM_CHECK_ONLY=1 keeps this toolkit-free, exactly as the release tier does.
+        run env TRITIUM_CHECK_ONLY=1 cargo clippy --locked --workspace --all-targets \
+            --all-features -- -D warnings
+        verify_non_unix_cfg
         ;;
     ci)
         run cargo fmt --all --check
