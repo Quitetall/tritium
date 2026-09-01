@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 /// stderr; anything else warns loudly and reads as off (the same 1/0
 /// contract as every other serving knob — `true`/`yes` silently doing
 /// nothing was the P3-6 audit finding).
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 pub(crate) fn spec_stats_enabled() -> bool {
     match std::env::var("TRITIUM_SPEC_STATS") {
         Err(std::env::VarError::NotPresent) => false,
