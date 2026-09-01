@@ -112,6 +112,7 @@ def inspect(work_dir: Path, sample_seconds: float = 0.0) -> dict[str, Any]:
         except OSError as error:
             raise StatusError("staged record disappeared during sample") from error
         rate = (after - staged["bytes"]) / sample_seconds
+        staged["mtime_ns"] = after_stat.st_mtime_ns
         staged["bytes_after_sample"] = after
         staged["sample_seconds"] = sample_seconds
     status = "complete" if seals else "running" if staged else "idle"
