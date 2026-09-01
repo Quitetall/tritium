@@ -57,6 +57,8 @@ fn run_quantize(input: &Path, output: &Path, format: &str) {
             output.to_str().unwrap(),
             "--bpw",
             "3.0",
+            "--ladder",
+            "itf",
             "--format",
             format,
         ])
