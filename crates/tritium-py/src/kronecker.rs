@@ -1677,10 +1677,10 @@ fn decode_le<const N: usize, T>(
     values
         .try_reserve_exact(expected)
         .map_err(|_| resource_error(format!("allocate {field} failed")))?;
-    for chunk in bytes.chunks_exact(N) {
-        let mut value = [0_u8; N];
-        value.copy_from_slice(chunk);
-        values.push(decode(value));
+    // `as_chunks::<N>` yields `&[u8; N]` directly, so the temporary and its `copy_from_slice`
+    // are gone: the length is carried by the type rather than re-checked each iteration.
+    for chunk in bytes.as_chunks::<N>().0 {
+        values.push(decode(*chunk));
     }
     Ok(values)
 }

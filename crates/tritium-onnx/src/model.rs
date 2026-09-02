@@ -4778,8 +4778,10 @@ fn verify_external_parts(
         ));
     }
     let scales: Vec<f32> = weights_bytes[scale_offset..]
-        .chunks_exact(core::mem::size_of::<f32>())
-        .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        .as_chunks::<{ core::mem::size_of::<f32>() }>()
+        .0
+        .iter()
+        .map(|bytes| f32::from_le_bytes(*bytes))
         .collect();
     Ok(VerifiedExternalParts {
         metadata,

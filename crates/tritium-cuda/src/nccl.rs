@@ -343,7 +343,7 @@ impl NcclProcessGroup {
         let header = [u64::from(local.is_ok()), local_count, rows, cols, step];
         let headers = self.all_gather_u64(&header).map_err(backend_dist_err)?;
         let first = [headers[0], headers[1], headers[2], headers[3], headers[4]];
-        if headers.chunks_exact(5).any(|rank| rank[0] == 0) {
+        if headers.as_chunks::<5>().0.iter().any(|rank| rank[0] == 0) {
             return match local {
                 Err(error) => Err(BackendError::InvalidInput(format!(
                     "local gradient-stream preflight failed: {error}"
@@ -353,23 +353,43 @@ impl NcclProcessGroup {
                 )),
             };
         }
-        if headers.chunks_exact(5).any(|rank| rank[1] != first[1]) {
+        if headers
+            .as_chunks::<5>()
+            .0
+            .iter()
+            .any(|rank| rank[1] != first[1])
+        {
             return Err(BackendError::InvalidInput(
                 "gradient manifest counts differ across NCCL ranks".into(),
             ));
         }
-        if headers.chunks_exact(5).any(|rank| rank[2] != first[2]) {
+        if headers
+            .as_chunks::<5>()
+            .0
+            .iter()
+            .any(|rank| rank[2] != first[2])
+        {
             return Err(BackendError::InvalidInput(
                 "local batch row counts differ across NCCL ranks; streamed Avg requires equal batches"
                     .into(),
             ));
         }
-        if headers.chunks_exact(5).any(|rank| rank[3] != first[3]) {
+        if headers
+            .as_chunks::<5>()
+            .0
+            .iter()
+            .any(|rank| rank[3] != first[3])
+        {
             return Err(BackendError::InvalidInput(
                 "softmax-xent column counts differ across NCCL ranks".into(),
             ));
         }
-        if headers.chunks_exact(5).any(|rank| rank[4] != first[4]) {
+        if headers
+            .as_chunks::<5>()
+            .0
+            .iter()
+            .any(|rank| rank[4] != first[4])
+        {
             return Err(BackendError::InvalidInput(
                 "optimizer steps differ across NCCL ranks".into(),
             ));

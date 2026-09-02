@@ -7727,8 +7727,10 @@ fn external_linear_tiled_f16_matches_the_untiled_f16_kernel() {
         backend.dev_download_u8(&d_tiled, &mut got_b).unwrap();
         backend.dev_download_u8(&d_plain, &mut want_b).unwrap();
         let to_f32 = |b: &[u8]| -> Vec<f32> {
-            b.chunks_exact(2)
-                .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+            b.as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| half::f16::from_le_bytes(*c).to_f32())
                 .collect()
         };
         let (got, want) = (to_f32(&got_b), to_f32(&want_b));

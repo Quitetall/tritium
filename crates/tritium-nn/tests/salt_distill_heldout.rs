@@ -256,7 +256,12 @@ fn salt_distillation_device_tape_recovers_heldout() {
         train_ids.truncate(n);
     }
 
-    let windows: Vec<&[u32]> = train_ids.chunks_exact(TRAIN_SEQ).collect();
+    let windows: Vec<&[u32]> = train_ids
+        .as_chunks::<TRAIN_SEQ>()
+        .0
+        .iter()
+        .map(|w| w.as_slice())
+        .collect();
     assert!(!windows.is_empty(), "train corpus shorter than one window");
 
     let backend = CudaBackend::new(0).expect("open CUDA device");
