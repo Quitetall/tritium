@@ -18,13 +18,22 @@
 name: wheels
 
 on:
-  push:
-    tags: ["v*"]
+  # Tags no longer trigger this workflow directly: release.yml owns the tag and
+  # calls it via workflow_call. Keeping both triggers would build the whole
+  # matrix twice on every release, and publish from whichever finished first.
+  workflow_call:
   pull_request:
-    # Build-only smoke: a tag/dispatch builds the full matrix; on PRs we keep the
-    # packaging path honest without running it on every commit to main.
+    # Build-only smoke: a release (or dispatch) builds the full matrix; on PRs we
+    # keep the packaging path honest without running it on every commit to main.
     paths:
       - "crates/tritium-py/**"
+      # The wheel links the whole workspace, so a dependency or toolchain move can
+      # break it without touching a path above. #34 bumped burn and the lockfile
+      # and never reached this workflow; that bump happened to be outside the wheel's
+      # graph, but nothing here established that -- it was luck, not coverage.
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
       - "scripts/verify-wheel.py"
       - "scripts/tests/test_verify_wheel.py"
       - "scripts/aggregate-wheel-smoke.py"

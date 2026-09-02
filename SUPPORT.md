@@ -40,6 +40,45 @@ stabilised there and the CPU kernels use them.
 
 Raising the floor is called out in `CHANGELOG.md` for the release that does it.
 
+## Publishing a release
+
+Tags drive publication. Pushing `vX.Y.Z` runs `.github/workflows/release.yml`, which
+calls `wheels.yml` for the build, then publishes the artifacts CI qualified — the
+same ones, not a second build that resembles them.
+
+| registry | package | credential |
+|---|---|---|
+| PyPI | `tritium-torch` | trusted publishing (OIDC) — no token stored |
+| GitHub Releases | wheels, SBOMs, `SHA256SUMS`, provenance attestation | `GITHUB_TOKEN` |
+| crates.io | 23 crates | `CARGO_REGISTRY_TOKEN` repo secret — **dormant until set** |
+
+A tag whose wheels do not carry its version fails the release before anything is
+published, so a wheel built from the wrong tree cannot ship under a tag.
+
+### One-time: register the PyPI trusted publisher
+
+Publication fails closed until this exists — deliberately, so a missing publisher
+never silently falls back to a long-lived token. On
+<https://pypi.org/manage/project/tritium-torch/settings/publishing/>, add a GitHub
+publisher:
+
+| field | value |
+|---|---|
+| Owner | `Quitetall` |
+| Repository | `tritium` |
+| Workflow | `release.yml` |
+| Environment | `pypi` |
+
+Then create the `pypi` environment under repository *Settings → Environments*. Scope
+the publisher to it; that environment is also where a manual approval gate goes if
+releases should require a second pair of eyes.
+
+### Re-running a failed publish
+
+A registry outage should not need a new tag. Run the workflow manually
+(*Actions → release → Run workflow*) with the existing tag: uploads are
+`skip-existing`, so re-running is safe and only fills what is missing.
+
 ## Asking for help
 
 Include the Tritium version and source revision, OS/architecture, installation

@@ -1,0 +1,198 @@
+# Tag -> artifacts -> registries, with provenance.
+#
+# Until this existed the repo had 39 tags and 0 GitHub Releases: wheels and SBOMs
+# lived only as 90-day Actions artifacts, so no downstream consumer could obtain a
+# build, and every publish was a human running a script with a long-lived token.
+# The 1.1.0rc1 wheels on PyPI were uploaded that way, from a tree 314 commits
+# past the tag they claim -- which is the failure this workflow is meant to end.
+#
+# The build is not duplicated here. wheels.yml owns the matrix, the abi3
+# compatibility sweep and the per-wheel SBOM; this calls it, so a release ships the
+# exact artifacts CI already qualified rather than a second build that merely
+# resembles them.
+#
+# PyPI uses trusted publishing (OIDC): no API token exists to leak or rotate. That
+# requires a one-time publisher registration on PyPI -- see SUPPORT.md; until it is
+# registered the pypi job fails closed rather than falling back to a secret.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  # Re-run publication for an existing tag without moving it (a transient registry
+  # failure should not need a new tag).
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to publish (e.g. v1.1.0-rc.2)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  # Never cancel a release mid-publish: a half-uploaded set of wheels is worse
+  # than a slow one.
+  group: release-${{ github.event.inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # The same matrix, verification and SBOM generation that gates every PR.
+  build:
+    uses: ./.github/workflows/wheels.yml
+    permissions:
+      contents: read
+
+  collect:
+    name: collect · checksums
+    needs: build
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v6.0.0
+        with:
+          pattern: wheel-*
+          path: staged
+          merge-multiple: true
+      - name: assert the tag and the artifacts agree
+        id: v
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          version="${tag#v}"
+          # PEP 440 normalises 1.1.0-rc.2 to 1.1.0rc2; compare on that spelling so a
+          # wheel built from the wrong tree cannot be released under this tag.
+          pep440="$(printf '%s' "$version" | tr -d '-' | sed 's/rc\./rc/')"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          found=0
+          for w in staged/*.whl; do
+            found=1
+            base="$(basename "$w")"
+            case "$base" in
+              tritium_torch-"$pep440"-*) ;;
+              *) echo "::error::$base does not carry version $pep440 (tag $tag)"; exit 1 ;;
+            esac
+          done
+          [ "$found" = 1 ] || { echo "::error::no wheels were produced"; exit 1; }
+          echo "all wheels carry $pep440"
+      - name: checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd staged
+          sha256sum *.whl *.json > SHA256SUMS
+          cat SHA256SUMS
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v5.0.0
+        with:
+          name: release-bundle
+          path: staged/
+          if-no-files-found: error
+
+  pypi:
+    name: publish · PyPI
+    needs: collect
+    runs-on: ubuntu-latest
+    # The environment is where the trusted publisher is scoped, and where a manual
+    # approval gate can be added without touching this file.
+    environment:
+      name: pypi
+      url: https://pypi.org/project/tritium-torch/
+    permissions:
+      # OIDC only. No PyPI token is stored in this repository.
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v6.0.0
+        with:
+          name: release-bundle
+          path: staged
+      - name: keep only wheels
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          mv staged/*.whl dist/
+          ls -l dist
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          packages-dir: dist
+          # A re-run after a partial upload must not fail the release.
+          skip-existing: true
+          attestations: true
+
+  github-release:
+    name: publish · GitHub Release
+    needs: collect
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      # Provenance attestation: this is what makes SECURITY.md's claim true.
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v6.0.0
+        with:
+          name: release-bundle
+          path: staged
+      - name: attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: staged/*.whl
+      - name: notes from CHANGELOG
+        shell: bash
+        run: python scripts/release-notes.py "${{ needs.collect.outputs.version }}" > NOTES.md
+      - name: create or update the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          prerelease=""
+          case "$TAG" in *-rc.*|*-alpha*|*-beta*) prerelease="--prerelease" ;; esac
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --notes-file NOTES.md $prerelease
+          else
+            gh release create "$TAG" --title "$TAG" --notes-file NOTES.md $prerelease --verify-tag
+          fi
+          gh release upload "$TAG" staged/* --clobber
+
+  crates:
+    name: publish · crates.io
+    needs: collect
+    runs-on: ubuntu-latest
+    environment:
+      name: crates-io
+      url: https://crates.io/crates/tritium-core
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.98.0
+      # Dormant until a token exists. `secrets` is not available to a job-level
+      # `if:`, so the guard is a step: the job goes green having published nothing,
+      # rather than failing every release until crates.io is wired up.
+      - name: publish all crates in dependency order
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+            echo "::notice::CARGO_REGISTRY_TOKEN is not set - skipping crates.io."
+            echo "Add it as a repository secret to enable this job."
+            exit 0
+          fi
+          scripts/publish-crates.sh
