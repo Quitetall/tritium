@@ -56,7 +56,8 @@ untrusted bytes (model file / corpus)
   a typed error, never an out-of-bounds read, panic, or `unwrap` on attacker data.
 - **Continuous fuzzing.** Every untrusted-byte parser has a `cargo-fuzz` target
   (`gguf_parse`, `safetensors_parse`, `salt_bundle_parse`, `salt_gguf_parse`,
-  `salt_legacy_parse`, `sparse_plane_parse`, `tqbin_parse`, `tqidx_parse`) run on a
+  `salt_legacy_parse`, `sparse_plane_parse`, `tqbin_parse`, `tqidx_parse`,
+  `unpack_i2s`, `unpack_tq_rows`, `zero_bitmap`) run on a
   scheduled CI lane; the v0.90 gate is ≥24h cumulative fuzzing with zero open
   findings and committed corpora.
 - **Memory safety.** The foundation crates are `#![forbid(unsafe_code)]` /
@@ -82,9 +83,14 @@ untrusted bytes (model file / corpus)
 
 ## Reporting a vulnerability
 
-Report suspected vulnerabilities privately to `briankhanglam@gmail.com` rather
-than through an issue, discussion, or chat. Do not send proprietary model or
-dataset contents unless a safe transfer has been agreed.
+Report suspected vulnerabilities through
+[GitHub's private vulnerability reporting](https://github.com/Quitetall/tritium/security/advisories/new)
+— the **Report a vulnerability** button on the Security tab. That route keeps the
+report private, gives us a place to draft a fix and an advisory with you, and can
+issue a CVE. Email `briankhanglam@gmail.com` only if you cannot use it.
+
+Either way, do not use an issue, discussion, or chat, and do not send proprietary
+model or dataset contents unless a safe transfer has been agreed.
 
 Include the affected version and full source/artifact identity, impact, minimal
 reproduction, required environment, and whether the issue is already public.
@@ -100,8 +106,9 @@ material user risk, but the reason and remaining exposure will be documented.
 
 ## Supply-chain and deployment boundary
 
-Release artifacts are admitted by digest, source revision, SBOM, provenance,
-and signature gates. Model/tokenizer licenses and authenticity remain separate
+Release artifacts are admitted by digest, source revision, and SBOM gates.
+Cryptographic build provenance and artifact signatures are **not yet
+implemented** — do not treat a downloaded artifact as attested. Model/tokenizer licenses and authenticity remain separate
 from numerical compatibility: a loadable artifact is not automatically trusted
 or redistributable. Operators must verify candidate/public manifests and should
 run serving images with the documented non-root, read-only, bounded-resource

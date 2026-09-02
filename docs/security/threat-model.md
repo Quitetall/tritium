@@ -145,7 +145,7 @@ The boundary is the developer/CI build machine. Realistic attacker = a compromis
 ## 5. Cross-cutting mitigations
 
 - **`#![forbid(unsafe_code)]` where it holds.** `tritium-format` (lib.rs:29) is the **only** crate-level `forbid(unsafe_code)` — confirmed — so no malformed model byte can corrupt memory; the worst realistic outcome is a contained panic or logic-level mis-load. (The SIMD/GPU kernels are necessarily `unsafe` and are covered by layered shape validation + sanitizers instead.)
-- **Fuzzing.** Committed cargo-fuzz harness with **8 targets** (`gguf`, `safetensors`, `salt_bundle`, `salt_gguf`, `salt_legacy`, `sparse_plane`, `tqbin`, `tqidx`) and **769 corpus files** checked into git. Gap: no `tq2` zero-bitmap target (see 4.1).
+- **Fuzzing.** Committed cargo-fuzz harness with **11 targets** (`gguf`, `safetensors`, `salt_bundle`, `salt_gguf`, `salt_legacy`, `sparse_plane`, `tqbin`, `tqidx`, `unpack_i2s`, `unpack_tq_rows`, `zero_bitmap`) and **769 corpus files** checked into git.
 - **Sanitizers + miri.** `.github/workflows/sanitizers.yml` runs ASan/MSan/TSan via `-Zbuild-std` over `tritium-cpu` (and a miri lane over `tritium-core` + `tritium-format --lib`), targeting exactly the unsafe/parse surfaces. **Caveat:** weekly + `workflow_dispatch`, **not a required per-push gate** — regressions in unsafe paths could merge unnoticed until the scheduled run. GPU device-side OOB is observable only via compute-sanitizer on the self-hosted GPU lane.
 - **`panic=abort`.** `[profile.release]` sets `panic="abort"` and `[profile.dist]` inherits it (Cargo.toml:132,136). This makes unwinding across `extern "C"` impossible (the safe FFI choice) but means `catch_unwind` is a **no-op in shipped artifacts** — an internal panic aborts the process (availability loss, not UB/RCE). This applies to both the FFI boundary and the server worker.
 - **Backend no-panic contract.** `BackendError` ("backends never panic on bad input", tritium-spec/src/lib.rs:240-241); enforced & tested for bad shapes, but **not** against unchecked `usize` product overflow (see 4.4).
@@ -189,7 +189,7 @@ Honest list of gaps the audits flagged, ordered by actionability. None are criti
 
 **Assurance / process:**
 9. **Sanitizer + miri lanes are weekly/manual, not required per-push gates** — a regression in an unsafe/parse path could merge and sit until the next scheduled run. Consider promoting at least a fast subset to a required gate.
-10. **No exact toolchain pin, no SHA-pinned Actions, SBOM not diff-gated** — trusted build inputs can drift silently; the SBOM is an artifact, not a baseline check.
+10. **SBOM not diff-gated** — the SBOM is an artifact, not a baseline check, so a new transitive dependency is not surfaced as a reviewable delta. (The other two halves of this item are now closed: `rust-toolchain.toml` pins an exact build toolchain and every GitHub Action is SHA-pinned.)
 
 **Accepted / inherent (documented, no fix planned):**
 11. `catch_unwind` is a no-op under `panic=abort` in release/dist — internal panics abort the process (availability, not UB). Applies to both FFI and the server worker. Understood and documented.
