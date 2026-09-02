@@ -281,7 +281,7 @@ impl TernaryBackend for CpuBackend {
         }
         let tq2_invalid_row = if format == TernaryFormat::Tq2_0 && row_bytes != 0 {
             packed.chunks_exact(row_bytes).position(|row| {
-                row.chunks_exact(TQ2_0_BLOCK_BYTES).any(|block| {
+                row.as_chunks::<TQ2_0_BLOCK_BYTES>().0.iter().any(|block| {
                     block[..tritium_format::QK_K / 4]
                         .iter()
                         .any(|&byte| byte & (byte >> 1) & 0x55 != 0)

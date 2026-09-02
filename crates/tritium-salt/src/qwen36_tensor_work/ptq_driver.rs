@@ -1648,7 +1648,7 @@ impl Qwen36WeightSpool {
         weights
             .try_reserve_exact(count)
             .map_err(|_| Qwen36PtqDriverError::AllocationFailed)?;
-        for chunk in payload.chunks_exact(4) {
+        for chunk in payload.as_chunks::<4>().0 {
             weights.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
         }
         Ok(weights)

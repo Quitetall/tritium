@@ -111,9 +111,7 @@ impl Tape {
     pub fn backward(&self, loss: ValueId) -> Vec<Vec<f32>> {
         let mut grads: Vec<Vec<f32>> = self.values.iter().map(|v| vec![0.0f32; v.len()]).collect();
         // seed dLoss/dLoss = 1 over the (scalar) loss buffer.
-        for g in &mut grads[loss] {
-            *g = 1.0;
-        }
+        grads[loss].fill(1.0);
         // Reusable buffer for input slice references (avoids 270 allocs).
         let mut input_buf: Vec<&[f32]> = Vec::new();
         for node in self.nodes.iter().rev() {

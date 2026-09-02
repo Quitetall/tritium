@@ -454,10 +454,11 @@ struct FailOnQ2Payload;
 impl Write for FailOnQ2Payload {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         let scale = f16::ONE.to_bits().to_le_bytes();
-        let q2_payload = bytes.len() == 4 * Q2_0_BLOCK_BYTES
-            && bytes
-                .chunks_exact(Q2_0_BLOCK_BYTES)
-                .all(|block| block[..2] == scale && block[2..].iter().all(|&code| code == 0x55));
+        let q2_payload =
+            bytes.len() == 4 * Q2_0_BLOCK_BYTES
+                && bytes.as_chunks::<Q2_0_BLOCK_BYTES>().0.iter().all(|block| {
+                    block[..2] == scale && block[2..].iter().all(|&code| code == 0x55)
+                });
         if q2_payload {
             Err(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,

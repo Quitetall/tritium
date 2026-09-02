@@ -44,7 +44,11 @@ members = [
 [workspace.package]
 version = "1.1.0-rc.1"         # Single local-RC source; scripts/check-release-version.py gates mirrors
 edition = "2024"
-rust-version = "1.89"          # AVX-512 intrinsics stable floor (Rust 1.89, 2025-08-07)
+rust-version = "1.89"          # AVX-512 intrinsics stable floor (Rust 1.89, 2025-08-07).
+                               # The published floor for crates.io consumers, INDEPENDENT of
+                               # rust-toolchain.toml (which pins what CI builds with). The
+                               # `msrv` CI lane proves this still compiles; raising it is a
+                               # deliberate, breaking-ish decision for downstream users.
 license = "Apache-2.0"         # FOSS; see LICENSE. Vendored deps attributed in NOTICE.
 repository = "https://github.com/Quitetall/tritium"
 authors = ["Brian Lam <briankhanglam@gmail.com>"]

@@ -535,7 +535,7 @@ fn verify_path_ppl(
     let parents: Vec<i32> = (0..CHAIN as i32).map(|i| i - 1).collect();
     let path: Vec<usize> = (0..CHAIN).collect();
     let (mut nll, mut count) = (0.0f64, 0usize);
-    for w in ids.chunks_exact(SEQ_LEN) {
+    for w in ids.as_chunks::<SEQ_LEN>().0 {
         runner.reset();
         let seed = runner.forward(&[w[0]], &[0]).expect("seed");
         let vocab = seed.len();

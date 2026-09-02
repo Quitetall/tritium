@@ -565,8 +565,9 @@ fn read_row<'a, R: Read + Seek>(
                 "read SALT plane descriptors",
             )?;
             let mut payload_bytes = 0usize;
-            for descriptor in
-                scratch[SALT_HEADER_BYTES..prefix_len].chunks_exact(PLANE_DESCRIPTOR_BYTES)
+            for descriptor in scratch[SALT_HEADER_BYTES..prefix_len]
+                .as_chunks::<PLANE_DESCRIPTOR_BYTES>()
+                .0
             {
                 let len = u32::from_le_bytes(
                     descriptor[1..]

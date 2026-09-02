@@ -422,7 +422,7 @@ mod tests {
         assert_eq!(row.planes.len(), 3);
         for plane in &row.planes {
             assert_eq!(plane.len(), 2 * TQ2_0_BLOCK_BYTES);
-            for block in plane.chunks_exact(TQ2_0_BLOCK_BYTES) {
+            for block in plane.as_chunks::<TQ2_0_BLOCK_BYTES>().0 {
                 assert!(block[..64].iter().all(|byte| *byte == 0x55));
                 assert_eq!(&block[64..], &[0, 0]);
             }

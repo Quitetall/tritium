@@ -79,7 +79,7 @@ impl Q2Linear {
             None => None,
         };
         let mut trits = [Trit::ZERO; Q2_0_GROUP_SIZE];
-        for (block_index, block) in packed.chunks_exact(Q2_0_BLOCK_BYTES).enumerate() {
+        for (block_index, block) in packed.as_chunks::<Q2_0_BLOCK_BYTES>().0.iter().enumerate() {
             let mut scale = f16::ZERO;
             unpack_q2_0_block(block, &mut trits, &mut scale)
                 .map_err(|error| NnError::Backend(format!("Q2_0 block {block_index}: {error}")))?;

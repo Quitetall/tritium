@@ -5935,7 +5935,9 @@ mod tests {
         assert_eq!(left.trits, right.trits);
         assert!(left.trits.iter().all(|plane| {
             plane
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .all(|group| group.iter().filter(|trit| **trit == 0).count() == 1)
         }));
         let objectives = s34_prefix_objectives(

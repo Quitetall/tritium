@@ -141,8 +141,10 @@ impl<'a> SparsePlaneRef<'a> {
         let entries = &bytes[entries_start..];
         let mut previous = None;
         for encoded in entries
-            .chunks_exact(4)
-            .map(|entry| u32::from_le_bytes(entry.try_into().expect("four-byte sparse entry")))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|entry| u32::from_le_bytes(*entry))
         {
             let column = encoded & !SIGN_BIT;
             if column as usize >= k {
@@ -188,11 +190,13 @@ impl<'a> SparsePlaneRef<'a> {
 
     /// Scales in block order.
     pub fn scales(self) -> impl ExactSizeIterator<Item = f16> + 'a {
-        self.scales.chunks_exact(2).map(|bytes| {
-            f16::from_bits(u16::from_le_bytes(
-                bytes.try_into().expect("two-byte sparse scale"),
-            ))
-        })
+        // `as_chunks::<2>` already yields `&[u8; 2]`, so the length is proven by the type and
+        // the old `try_into().expect(..)` is gone rather than merely relocated.
+        self.scales
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|bytes| f16::from_bits(u16::from_le_bytes(*bytes)))
     }
 
     /// Signed entries in canonical column order.
@@ -200,8 +204,10 @@ impl<'a> SparsePlaneRef<'a> {
     /// Top bit encodes a negative sign; remaining bits encode the column.
     pub fn encoded_entries(self) -> impl ExactSizeIterator<Item = u32> + 'a {
         self.entries
-            .chunks_exact(4)
-            .map(|bytes| u32::from_le_bytes(bytes.try_into().expect("four-byte sparse entry")))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|bytes| u32::from_le_bytes(*bytes))
     }
 
     /// Materialize this view as the legacy owned sparse-plane representation.

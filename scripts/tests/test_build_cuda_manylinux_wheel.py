@@ -18,7 +18,7 @@ class BuildCudaManylinuxWheelTests(unittest.TestCase):
         )
         contract = json.loads(completed.stdout)
         self.assertRegex(contract["image"], r"@sha256:[0-9a-f]{64}$")
-        self.assertEqual(contract["rust"], "1.89.0")
+        self.assertEqual(contract["rust"], "1.98.0")
         self.assertEqual(contract["maturin"], "1.10.2")
         self.assertEqual(contract["linker"], "/io/scripts/manylinux-static-cxx-linker.sh")
         self.assertRegex(contract["static_cxx"], r"/gcc-toolset-14/root/usr/lib/gcc/.*/14/libstdc\+\+\.a$")

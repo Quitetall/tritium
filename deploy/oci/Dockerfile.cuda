@@ -3,6 +3,11 @@
 ARG SOURCE_DATE_EPOCH
 # Rust and CUDA are separate pinned inputs. The runtime dlopens the host driver;
 # the CUDA toolkit and build shell never enter the final image.
+# Toolchain: this image deliberately stays on the PUBLISHED MSRV FLOOR (rust-version in
+# Cargo.toml), not on the build toolchain in rust-toolchain.toml. CI builds with a newer
+# pinned Rust; the shipped container building at the floor is a standing proof that the
+# floor actually works for a real artifact. Moving it means resolving a new base-image
+# digest and re-qualifying the image, which is its own change.
 FROM docker.io/library/rust:1.89.0-bookworm@sha256:c9ac3fa8945b61dede1e4500d25028aa8fd8a8fe46365fcf9c0422f8d999b9b0 AS rust-toolchain
 FROM docker.io/nvidia/cuda:13.0.1-devel-ubuntu22.04@sha256:bb3de902bc1b522231cffea98a4d25a16ddb9fc8685a958b48d83036f46fd0c2 AS build
 ARG SOURCE_REVISION

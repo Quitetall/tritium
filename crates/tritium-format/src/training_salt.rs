@@ -262,7 +262,7 @@ fn validate_plane(
             }
         }
         if structure == TernaryStructure::S34 {
-            for block in plane.trits[row * cols..(row + 1) * cols].chunks_exact(4) {
+            for block in plane.trits[row * cols..(row + 1) * cols].as_chunks::<4>().0 {
                 if block.iter().filter(|&&trit| trit == 0).count() != 1 {
                     return Err(invalid("plane violates S34 structure"));
                 }

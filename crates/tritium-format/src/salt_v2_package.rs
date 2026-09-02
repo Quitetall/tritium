@@ -2265,7 +2265,9 @@ fn decode_tensor_tiles(
                     .ok_or(SaltV2PackageError::LengthOverflow)?,
             )?;
             let decoded_scales = scale_bytes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|bytes| f16::from_bits(u16::from_le_bytes([bytes[0], bytes[1]])))
                 .collect::<Vec<_>>();
             let raw_trits = trits.into_iter().map(Trit::get).collect();
@@ -2432,7 +2434,12 @@ fn canonical_s34_trits(trits: &[Trit]) -> Result<Vec<Trit>, SaltV2PackageError> 
     canonical.extend_from_slice(trits);
 
     let full_groups = trits.len() / 4;
-    for (group_index, group) in trits[..full_groups * 4].chunks_exact(4).enumerate() {
+    for (group_index, group) in trits[..full_groups * 4]
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .enumerate()
+    {
         let zero_count = group.iter().filter(|trit| trit.is_zero()).count();
         if zero_count != 1 {
             return Err(SaltV2PackageError::S34IncompatibleGroup {

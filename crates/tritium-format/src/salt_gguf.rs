@@ -93,7 +93,7 @@ fn pack_salt_row_checked(row: &SaltRow, k: usize) -> Result<Vec<u8>, FormatError
     }
     let encoded = crate::pack_salt_row(row)?;
     for plane in &row.planes {
-        for block in plane.chunks_exact(crate::TQ2_0_BLOCK_BYTES) {
+        for block in plane.as_chunks::<{ crate::TQ2_0_BLOCK_BYTES }>().0 {
             let scale_offset = crate::TQ2_0_BLOCK_BYTES - 2;
             let bits = u16::from_le_bytes([block[scale_offset], block[scale_offset + 1]]);
             let scale = half::f16::from_bits(bits);

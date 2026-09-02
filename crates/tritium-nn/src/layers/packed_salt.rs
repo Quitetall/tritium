@@ -440,13 +440,18 @@ fn require_within(
 }
 
 fn validate_dense_scales(bytes: &[u8]) -> Result<(), NnError> {
-    if bytes.chunks_exact(TQ2_0_BLOCK_BYTES).any(|block| {
-        !f16::from_bits(u16::from_le_bytes([
-            block[TQ2_0_BLOCK_BYTES - 2],
-            block[TQ2_0_BLOCK_BYTES - 1],
-        ]))
-        .is_finite()
-    }) {
+    if bytes
+        .as_chunks::<TQ2_0_BLOCK_BYTES>()
+        .0
+        .iter()
+        .any(|block| {
+            !f16::from_bits(u16::from_le_bytes([
+                block[TQ2_0_BLOCK_BYTES - 2],
+                block[TQ2_0_BLOCK_BYTES - 1],
+            ]))
+            .is_finite()
+        })
+    {
         Err(NnError::Backend(
             "SALT dense plane contains a non-finite scale".to_owned(),
         ))
