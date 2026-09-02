@@ -316,9 +316,11 @@ python scripts/qwen36-ptq-status.py \
   --json
 ```
 
-For a rate-based staged-record estimate, add an explicit record-size target
-(`--target-bytes N`). The estimate is operational only; signed campaign and
-release receipts remain authoritative.
+When a `campaign.tq36p` descriptor is present, the probe also derives exact
+total record bytes and tensor count, then reports a whole-campaign ETA from the
+sampled rate. Use `--target-bytes N` only when estimating an isolated staged
+record. All estimates are operational only; signed campaign and release
+receipts remain authoritative.
 
 `status=stalled` means staged work exists but no recorded owner PID is alive;
 resume tooling must validate its checkpoint before continuing.

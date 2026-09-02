@@ -226,7 +226,8 @@ pub(crate) fn run(
             ladder_cfg.planes, ladder_cfg.group, ladder_cfg.grid
         ),
         LadderArg::Itf => format!(
-            "itf free-scale, {bpw:.3} bpw target, {scale_group:?} scale, {sens_desc} sensitivity"
+            "itf free-scale, {bpw:.3} bpw target, {:?} scale, {sens_desc} sensitivity",
+            scale_group.unwrap_or(ScaleGroupArg::Block)
         ),
     };
     println!(

@@ -222,7 +222,7 @@ impl CudaDecodeModel {
             // captures — batch arenas follow the rung); the scale rungs
             // (i8/t2) have no ctrl twins → eager.
             && (self.kv_elem == 4 || self.kv_dtype == KvDtype::F16)
-            && std::env::var_os("TRITIUM_TREE_EAGER").is_none()
+            && !env_flag_on("TRITIUM_TREE_EAGER")
         {
             TREE_BUCKETS
                 .iter()
@@ -2201,7 +2201,7 @@ impl CudaDecodeModel {
             && m <= TREE_BUCKET_MAX
             && self.max_ctx * 4 <= 48 * 1024
             && (self.kv_elem == 4 || self.kv_dtype == KvDtype::F16)
-            && std::env::var_os("TRITIUM_TREE_EAGER").is_none()
+            && !env_flag_on("TRITIUM_TREE_EAGER")
         {
             TREE_BUCKETS
                 .iter()
@@ -2448,12 +2448,11 @@ impl CudaDecodeModel {
         // the remaining conditions mirror `tree_forward` (a bucket always
         // exists — m_total <= TREE_BUCKET_MAX — and pads write nothing, so
         // there is no region-fit condition on the padded size).
-        let bucket =
-            if self.max_ctx * 4 <= 48 * 1024 && std::env::var_os("TRITIUM_TREE_EAGER").is_none() {
-                TREE_BUCKETS.iter().copied().find(|&b| b >= m_total)
-            } else {
-                None
-            };
+        let bucket = if self.max_ctx * 4 <= 48 * 1024 && !env_flag_on("TRITIUM_TREE_EAGER") {
+            TREE_BUCKETS.iter().copied().find(|&b| b >= m_total)
+        } else {
+            None
+        };
         if bucket.is_none() {
             static EAGER_WARN: std::sync::Once = std::sync::Once::new();
             EAGER_WARN.call_once(|| {

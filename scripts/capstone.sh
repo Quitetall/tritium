@@ -194,7 +194,7 @@ TSLB="$WORK/tiny.tslb"
 if command -v python3 >/dev/null 2>&1; then
   emit_safetensors "$ST"
   info "quantize (real safetensors -> SALT bundle .tslb):"
-  "$TRITIUM" quantize --input "$ST" --output "$TSLB" --bpw 2.0
+  "$TRITIUM" quantize --input "$ST" --output "$TSLB" --ladder itf --bpw 2.0
   [ -s "$TSLB" ] || fail SALT "quantize did not produce a non-empty .tslb bundle"
   pass SALT "quantize produced a SALT bundle ($(wc -c <"$TSLB") bytes) from a synthetic safetensors"
 else

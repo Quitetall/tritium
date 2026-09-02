@@ -21,6 +21,16 @@ from typing import Any, Iterable
 TEMP_RE = re.compile(r"^record\.tmp\.(?P<pid>[0-9]+)\.[^.]+\..+$")
 SCHEMA = "tritium.qwen36-ptq-status.v1"
 
+# `campaign.tq36p` and its nested master catalog are canonical Rust records.
+# Keep these offsets local to this read-only operational probe; malformed files
+# are ignored rather than treated as evidence.
+CAMPAIGN_PREFIX_BYTES = 313
+CAMPAIGN_CHECKSUM_BYTES = 32
+CATALOG_HEADER_BYTES = 16
+MASTER_METADATA_TRAILER_BYTES = 40
+RECORD_FIXED_BYTES = 136
+RECORD_FOOTER_BYTES = 32
+
 
 class StatusError(ValueError):
     """The requested campaign path or probe options are invalid."""
@@ -98,6 +108,97 @@ def _record(root: Path, path: Path, pid: int) -> dict[str, Any]:
     }
 
 
+def _u32(data: bytes, offset: int) -> int | None:
+    end = offset + 4
+    if offset < 0 or end > len(data):
+        return None
+    return int.from_bytes(data[offset:end], "little")
+
+
+def _u64(data: bytes, offset: int) -> int | None:
+    end = offset + 8
+    if offset < 0 or end > len(data):
+        return None
+    return int.from_bytes(data[offset:end], "little")
+
+
+def _campaign_totals(path: Path) -> tuple[int, int, int] | None:
+    """Return (record bytes, payload bytes, tensor count) for one campaign."""
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None
+    if len(data) < CAMPAIGN_PREFIX_BYTES + CAMPAIGN_CHECKSUM_BYTES:
+        return None
+    # The checksum is intentionally not recomputed here, but its envelope must
+    # be present before parsing bounded catalog fields.
+    if data[:8] != b"TSQ36CP\x00":
+        return None
+    catalog_length = _u32(data, CAMPAIGN_PREFIX_BYTES - 4)
+    if catalog_length is None:
+        return None
+    catalog_start = CAMPAIGN_PREFIX_BYTES
+    catalog_end = catalog_start + catalog_length
+    if catalog_end + CAMPAIGN_CHECKSUM_BYTES != len(data):
+        return None
+    catalog = data[catalog_start:catalog_end]
+    if len(catalog) < CATALOG_HEADER_BYTES or catalog[:8] != b"TSQ36SC\x00":
+        return None
+    count = _u32(catalog, 12)
+    if count is None:
+        return None
+    offset = CATALOG_HEADER_BYTES
+    total_records = 0
+    total_payload = 0
+    for _ in range(count):
+        metadata_length = _u32(catalog, offset)
+        if metadata_length is None:
+            return None
+        offset += 4
+        metadata_end = offset + metadata_length
+        if metadata_length < MASTER_METADATA_TRAILER_BYTES or metadata_end > len(catalog):
+            return None
+        metadata = catalog[offset:metadata_end]
+        payload = _u64(metadata, len(metadata) - MASTER_METADATA_TRAILER_BYTES)
+        name_length = _u32(metadata, 314)
+        if payload is None or name_length is None:
+            return None
+        rank_offset = 318 + name_length
+        rank = _u32(metadata, rank_offset)
+        if rank is None:
+            return None
+        record_bytes = (
+            RECORD_FIXED_BYTES
+            + name_length
+            + (rank * 8)
+            + metadata_length
+            + payload
+            + RECORD_FOOTER_BYTES
+        )
+        total_records += record_bytes
+        total_payload += payload
+        offset = metadata_end
+    if offset != len(catalog):
+        return None
+    return total_records, total_payload, count
+
+
+def _campaign_for(root: Path, staged: dict[str, Any] | None) -> Path | None:
+    candidates: list[Path] = []
+    if staged is not None:
+        staged_path = root / staged["path"]
+        candidate = staged_path.parent.parent / "campaign.tq36p"
+        if candidate.is_file() and not candidate.is_symlink():
+            candidates.append(candidate)
+    if not candidates:
+        candidates = [
+            path
+            for path in _regular_files(root)
+            if path.name == "campaign.tq36p"
+        ]
+    return max(candidates, key=lambda path: path.stat().st_mtime_ns, default=None)
+
+
 def inspect(
     work_dir: Path,
     sample_seconds: float = 0.0,
@@ -112,8 +213,11 @@ def inspect(
     temps, objects, seals = _discover(root)
     newest = max(temps, key=lambda item: item[0].stat().st_mtime_ns, default=None)
     staged = _record(root, *newest) if newest is not None else None
+    campaign = _campaign_for(root, staged)
+    campaign_totals = _campaign_totals(campaign) if campaign is not None else None
     rate: float | None = None
     eta: float | None = None
+    campaign_eta: float | None = None
     if staged is not None and sample_seconds:
         time.sleep(sample_seconds)
         try:
@@ -128,6 +232,8 @@ def inspect(
         staged["sample_seconds"] = sample_seconds
         if target_bytes is not None and rate > 0:
             eta = max(target_bytes - after, 0) / rate
+        if campaign_totals is not None and rate > 0:
+            campaign_eta = max(campaign_totals[0] - after, 0) / rate
     if seals:
         status = "complete"
     elif not staged:
@@ -149,6 +255,10 @@ def inspect(
         "bytes_per_second": rate,
         "target_bytes": target_bytes,
         "estimated_seconds_remaining": eta,
+        "campaign_expected_record_bytes": campaign_totals[0] if campaign_totals else None,
+        "campaign_expected_payload_bytes": campaign_totals[1] if campaign_totals else None,
+        "campaign_tensor_count": campaign_totals[2] if campaign_totals else None,
+        "campaign_estimated_seconds_remaining": campaign_eta,
     }
 
 
@@ -196,6 +306,16 @@ def main(argv: list[str] | None = None) -> int:
             eta = snapshot["estimated_seconds_remaining"]
             print(
                 "estimated_seconds_remaining="
+                + (f"{eta:.3f}" if eta is not None else "unknown")
+            )
+        if snapshot["campaign_expected_record_bytes"] is not None:
+            print(
+                "campaign_expected_record_bytes="
+                f"{snapshot['campaign_expected_record_bytes']}"
+            )
+            eta = snapshot["campaign_estimated_seconds_remaining"]
+            print(
+                "campaign_estimated_seconds_remaining="
                 + (f"{eta:.3f}" if eta is not None else "unknown")
             )
     return 0
