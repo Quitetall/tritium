@@ -21,6 +21,7 @@ use crate::layers::{DenseLinear, HostSaltV2Linear, Q2Linear, SaltLinear, Ternary
 /// These variants name implemented numeric paths, not campaign evidence aliases:
 /// [`F32`](Self::F32) must never be reported as the planned A16 rung.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ProjectionActivationMode {
     /// Consume fp32 activations without per-token quantization.
     F32,
@@ -29,7 +30,13 @@ pub enum ProjectionActivationMode {
 }
 
 /// A linear projection: deployed ternary, additive SALT, or dense fp32.
+///
+/// `#[non_exhaustive]`: the `SaltV2` variant only exists under the `cuda`
+/// feature, so a downstream exhaustive match would compile cpu-only and
+/// break the moment feature unification enables `cuda` anywhere in the dep
+/// graph — always carry a wildcard arm.
 #[allow(missing_debug_implementations)] // `TernaryLinear` holds `&dyn DeviceBuffer`
+#[non_exhaustive]
 pub enum Projection {
     /// The deployed ternary weight (TQ2_0 on device + per-channel scales).
     Ternary(TernaryLinear),

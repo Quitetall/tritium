@@ -21,7 +21,7 @@ use crate::error::NnError;
 use crate::ops::quantize_activation_int8;
 
 /// A dense fp32 projection. Two modes: the **A8 activation path** (the default,
-/// [`DenseLinear::new`] — int8-quantizes activations exactly as [`TernaryLinear`] does,
+/// [`DenseLinear::new`] — int8-quantizes activations exactly as [`TernaryLinear`](super::TernaryLinear) does,
 /// for the SALT weight-only accuracy eval), or an **exact fp32** matmul
 /// ([`DenseLinear::new_exact`] — no activation quantization, for running a standard fp
 /// model whose logits must match a `transformers` reference). `W` is row-major

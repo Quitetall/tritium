@@ -58,7 +58,8 @@ pub(crate) enum SaltCommand {
         /// Pack identity frozen by campaign/recipe provenance.
         #[arg(long)]
         expected_pack_id: String,
-        /// Frozen evidence partition to read.
+        /// Frozen evidence partition to read:
+        /// `calibration` | `refinement` | `validation` | `evaluation`.
         #[arg(long)]
         partition: Stage7Partition,
         /// First sequence ordinal in the selected partition.

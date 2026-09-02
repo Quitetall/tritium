@@ -118,3 +118,9 @@ pub use training::{
     TiedSwiGluTrainingModel, TrainingAdapterError, TrainingAttentionConstants, TrainingParameter,
     semantic_training_model_digest,
 };
+/// (cuda) The CUDA types this crate's own public API returns
+/// ([`ModelRunner::new_batch`](model::ModelRunner::new_batch) and friends) —
+/// re-exported so downstream code can name them without a direct,
+/// version-matched `tritium-cuda` dependency.
+#[cfg(feature = "cuda")]
+pub use tritium_cuda::{BatchKv, CudaDecodeModel, SaltV2ResidentTensor, TREE_BUCKETS};

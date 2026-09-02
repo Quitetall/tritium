@@ -455,3 +455,23 @@ pub(super) const DECODE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/deco
 pub(super) const TRAIN_GRAD_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/train_grad.ptx"));
 /// Direct SALT V2 D2/B3/S34 kernel, compiled with FMA contraction disabled.
 pub(super) const SALT_V2_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/salt_v2.ptx"));
+
+/// Boolean env knob: unset/`0` = off, `1` = on; anything else warns loudly
+/// (once per read site invocation) and reads as OFF — presence-detection is
+/// banned because `FLAG=0` turning a knob ON is the opposite of what every
+/// user expects (P2-9, CLI audit 2026-08-20).
+pub(super) fn env_flag_on(name: &str) -> bool {
+    match std::env::var(name) {
+        Err(std::env::VarError::NotPresent) => false,
+        Ok(v) if v == "1" => true,
+        Ok(v) if v == "0" => false,
+        Ok(v) => {
+            eprintln!("tritium-cuda: {name}={v:?} — use 1 or 0 (unset = 0); reading as 0");
+            false
+        }
+        Err(e) => {
+            eprintln!("tritium-cuda: {name}: {e}; reading as 0");
+            false
+        }
+    }
+}

@@ -96,9 +96,10 @@ pub(crate) fn run(
     eos: u32,
 ) -> anyhow::Result<()> {
     if !greedy {
-        eprintln!(
-            "note: only greedy decoding is implemented in v0.20; \
-             `--greedy=false` still decodes greedily"
+        // A knob that silently does nothing is worse than no knob: refuse.
+        anyhow::bail!(
+            "--greedy=false: sampling is not implemented in this subcommand — use \
+             tritium-serve's OpenAI API (temperature/top-k) for sampled decoding"
         );
     }
 

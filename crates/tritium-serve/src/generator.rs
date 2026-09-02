@@ -11,16 +11,41 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// Process-wide spec-decode telemetry, read by `/metrics` (the generator is
 /// deliberately runtime-free, so counters are statics rather than plumbing).
+/// `TRITIUM_SPEC_STATS`: unset/`0` = off, `1` = per-request spec stats on
+/// stderr; anything else warns loudly and reads as off (the same 1/0
+/// contract as every other serving knob — `true`/`yes` silently doing
+/// nothing was the P3-6 audit finding).
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) fn spec_stats_enabled() -> bool {
+    match std::env::var("TRITIUM_SPEC_STATS") {
+        Err(std::env::VarError::NotPresent) => false,
+        Ok(v) if v == "1" => true,
+        Ok(v) if v == "0" => false,
+        Ok(v) => {
+            eprintln!("tritium-serve: TRITIUM_SPEC_STATS={v:?} — use 1 or 0; reading as 0");
+            false
+        }
+        Err(e) => {
+            eprintln!("tritium-serve: TRITIUM_SPEC_STATS: {e}; reading as 0");
+            false
+        }
+    }
+}
+
+#[doc(hidden)]
 pub static SPEC_VERIFIES: AtomicU64 = AtomicU64::new(0);
 /// Tokens committed by spec verifies (tok/verify = committed / verifies).
+#[doc(hidden)]
 pub static SPEC_COMMITTED: AtomicU64 = AtomicU64::new(0);
 /// Plain-decode tokens committed while the adaptive spec governor had
-/// drafting SUPPRESSED (the long-ctx tau-collapse lever, [`SpecGovernor`]).
+/// drafting SUPPRESSED (the long-ctx tau-collapse lever, `SpecGovernor`).
 /// A nonzero value is the observable "spec is off right now" signal.
+#[doc(hidden)]
 pub static SPEC_SUPPRESSED_PLAIN: AtomicU64 = AtomicU64::new(0);
 /// Multi-slot enrollment re-syncs that took the DELTA path (adopt-from +
 /// gap forward + adopt back) instead of the full reset + re-prefill — the
 /// probe re-entry fast path. Observability + test teeth for the branch.
+#[doc(hidden)]
 pub static SPEC_DELTA_RESYNCS: AtomicU64 = AtomicU64::new(0);
 
 /// Process-wide EWMA of one spec-decode phase's wall-clock cost in
@@ -116,7 +141,7 @@ pub struct SpecCostModel {
     /// (see [`Self::record_draft`]).
     pub draft_tok: Ewma,
     /// Probe-time drafter wall per drafted token, µs — dominated by the
-    /// ~ctx-linear re-prefill after [`SpecGovernor::PROBE_PERIOD`] stale
+    /// ~ctx-linear re-prefill after `SpecGovernor::PROBE_PERIOD` stale
     /// plain tokens. TELEMETRY ONLY (`/metrics` phase="draft_resync"),
     /// deliberately excluded from the floors: the re-sync is an
     /// entry-transition cost of LEAVING suppression, not steady-state spec
@@ -178,7 +203,7 @@ impl SpecCostModel {
     /// SOLO derived floor at draft length `k`: `(V + k·d)/P`, clamped to
     /// [`Self::SOLO_CLAMP`]. `None` until V, P, and d each have
     /// [`Self::WARMUP`] samples (callers fall back to the fixed
-    /// [`SpecGovernor::TAU_FLOOR_SOLO`]). d is STEADY-STATE drafting cost
+    /// `SpecGovernor::TAU_FLOOR_SOLO`). d is STEADY-STATE drafting cost
     /// by construction — probe-time re-sync walls are recorded to
     /// [`Self::draft_resync`] and intentionally excluded (an
     /// entry-transition cost, not steady-state economics; see the field
@@ -245,13 +270,16 @@ impl SpecCostModel {
 /// The process-wide cost model (the generator is runtime-free, so statics
 /// rather than plumbing — the [`SPEC_VERIFIES`] pattern). Read by
 /// `/metrics` (`tritium_spec_cost_us`, `tritium_spec_floor`).
+#[doc(hidden)]
 pub static SPEC_COST: SpecCostModel = SpecCostModel::new();
 
 /// Last floor the solo governor actually applied (f64 bits; gauge
 /// `tritium_spec_floor{path="solo"}`). Starts at the fixed fallback.
+#[doc(hidden)]
 pub static SPEC_FLOOR_SOLO: AtomicU64 = AtomicU64::new(SpecGovernor::TAU_FLOOR_SOLO.to_bits());
 /// Last floor the batched governor actually applied (f64 bits; gauge
 /// `tritium_spec_floor{path="batched"}`). Starts at the fixed fallback.
+#[doc(hidden)]
 pub static SPEC_FLOOR_BATCHED: AtomicU64 =
     AtomicU64::new(SpecGovernor::TAU_FLOOR_BATCHED.to_bits());
 
@@ -274,6 +302,7 @@ pub struct GenRequest {
 
 /// Sampling strategy, lowered from the OpenAI request fields.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub enum Sampling {
     /// Deterministic argmax (OpenAI `temperature == 0`).
     Greedy,
@@ -313,6 +342,7 @@ pub struct Step {
 
 /// Why generation stopped (maps to the OpenAI `finish_reason`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FinishReason {
     /// EOS token or a stop string was hit.
     Stop,
@@ -333,6 +363,7 @@ impl FinishReason {
 
 /// A generation failure surfaced to the HTTP layer.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum GenError {
     /// The execution backend failed (stringified device/runner error).
     Backend(String),
@@ -356,6 +387,7 @@ impl std::error::Error for GenError {}
 /// instead of sniffing strings (a CUDA driver error containing "not supported"
 /// must not turn into a 501).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TreeOpError {
     /// Work admitted before shutdown but cancelled while queued → HTTP 503.
     Draining(String),
@@ -380,6 +412,8 @@ impl fmt::Display for TreeOpError {
         }
     }
 }
+
+impl std::error::Error for TreeOpError {}
 
 /// The inference seam: prefill a prompt and stream decode steps.
 ///
@@ -429,6 +463,7 @@ pub trait Generator: Send {
 
 /// A model-free generator that emits a fixed script of token IDs — the contract
 /// suite's reason to exist (drives the HTTP/SSE machinery with no weights).
+#[doc(hidden)]
 pub struct MockGenerator {
     /// Tokens to emit (truncated to `max_new`).
     pub script: Vec<u32>,
@@ -1275,7 +1310,7 @@ impl RunnerGenerator {
         if max_new == 0 {
             return Ok(());
         }
-        let stats = std::env::var("TRITIUM_SPEC_STATS").as_deref() == Ok("1");
+        let stats = spec_stats_enabled();
         // Acceptance-adaptive draft length (see DraftPolicy).
         let mut policy = DraftPolicy::from_env()?;
         // Adaptive spec on/off (see SpecGovernor — the long-ctx τ-collapse

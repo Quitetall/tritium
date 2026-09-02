@@ -48,8 +48,8 @@ pub(crate) enum OutputFormat {
 pub(crate) fn run(
     input: &Path,
     output: &Path,
-    bpw: f64,
-    scale_group: ScaleGroupArg,
+    bpw: Option<f64>,
+    scale_group: Option<ScaleGroupArg>,
     sensitivity: SaltSensitivityArg,
     fisher: Option<&Path>,
     format: OutputFormat,
@@ -58,6 +58,22 @@ pub(crate) fn run(
 ) -> Result<()> {
     if ladder == LadderArg::Geometric {
         ladder_cfg.validate()?;
+        // Same class as the --fisher refusal below: the geometric ladder
+        // derives its rate from --planes and has no bpw budget or base-scale
+        // scope to honor. A silently ignored flag is a knob that does
+        // nothing — refuse instead (the book's old examples passed --bpw).
+        if let Some(b) = bpw {
+            anyhow::bail!(
+                "--bpw {b} only applies to --ladder itf; the geometric ladder's rate comes \
+                 from --planes. Pass --ladder itf, or drop --bpw."
+            );
+        }
+        if scale_group.is_some() {
+            anyhow::bail!(
+                "--scale-group only applies to --ladder itf; the geometric ladder manages \
+                 its own plane scales. Pass --ladder itf, or drop --scale-group."
+            );
+        }
         // The ladder assigns every plane from one anchor; there is no per-group plane budget for
         // a Fisher or energy sensitivity to allocate. Silently ignoring these would be a knob that
         // does nothing — refuse instead.
@@ -75,7 +91,8 @@ pub(crate) fn run(
             );
         }
     }
-    let sg = match scale_group {
+    let bpw = bpw.unwrap_or(2.0);
+    let sg = match scale_group.unwrap_or(ScaleGroupArg::Block) {
         ScaleGroupArg::Block => BaseScaleScope::Block,
         ScaleGroupArg::Tensor => BaseScaleScope::Tensor,
     };
@@ -209,7 +226,8 @@ pub(crate) fn run(
             ladder_cfg.planes, ladder_cfg.group, ladder_cfg.grid
         ),
         LadderArg::Itf => format!(
-            "itf free-scale, {bpw:.3} bpw target, {scale_group:?} scale, {sens_desc} sensitivity"
+            "itf free-scale, {bpw:.3} bpw target, {:?} scale, {sens_desc} sensitivity",
+            scale_group.unwrap_or(ScaleGroupArg::Block)
         ),
     };
     println!(

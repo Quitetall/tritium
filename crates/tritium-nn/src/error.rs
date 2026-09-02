@@ -93,6 +93,7 @@ impl From<tritium_spec::BackendError> for NnError {
 /// [`ModelRunner`]: crate::ModelRunner
 #[cfg(feature = "cuda")]
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum ResidentOpError {
     /// This runner has no CUDA device-resident decoder (non-CUDA backend).
     Unavailable,

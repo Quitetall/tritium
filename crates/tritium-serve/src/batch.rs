@@ -1922,9 +1922,7 @@ pub(crate) fn run_batched(
                                         } else if sent {
                                             let mut history = req.prompt_tokens.clone();
                                             history.push(first);
-                                            let stats = std::env::var("TRITIUM_SPEC_STATS")
-                                                .as_deref()
-                                                == Ok("1");
+                                            let stats = crate::generator::spec_stats_enabled();
                                             spec = Some(SpecSeq {
                                                 tx,
                                                 history,

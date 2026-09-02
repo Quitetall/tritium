@@ -24,6 +24,7 @@ pub struct PrincipalRateLimit {
 /// the internal principal identity; secrets are never copied into metrics or
 /// logs. With an empty list, all loopback callers share one anonymous bucket.
 #[derive(Clone, Default, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct AdmissionPolicy {
     /// Rotating bearer-token whitelist. At most [`MAX_BEARER_TOKENS`].
     pub bearer_tokens: Vec<String>,

@@ -206,7 +206,7 @@ greedy. Mirror order B F N X X N F B:
 | config | e2e vs plain (2 visits) | spec wall | verify EWMA ms | drafter ms/tok | τ |
 |---|---|---:|---:|---:|---:|
 | B baseline | 1.385 / 1.388 | 8.15 / 8.15 s | 11.76 / 11.91 | 1.97 / 1.95 | 3.547 |
-| F `TRITIUM_DRAFT_ATTN=flash` | 1.350 / 1.349 | 8.38 / 8.38 s | 11.88 / 11.91 | 2.11 / 2.10 | 3.559 |
+| F `TRITIUM_DRAFT_ATTN=flash` (knob since DELETED) | 1.350 / 1.349 | 8.38 / 8.38 s | 11.88 / 11.91 | 2.11 / 2.10 | 3.559 |
 | N `TRITIUM_TREE_NB=1` | **1.525 / 1.521** | **7.42 / 7.44 s** | **9.98 / 9.93** | 1.95 / 2.01 | 3.597 |
 | X both | 1.371 / 1.331 | 8.50 / 8.51 s | 8.60 / 8.64 | 2.11 / 2.06 | 3.116 |
 
@@ -618,7 +618,7 @@ count and tau are contention-immune, the 1.105× e2e is same-session relative.
 
 Harness: measure_multi.py class (session scratchpad copy pointed at the clean-HEAD
 `tritium-serve`), Round-25 protocol: server at `--batch-slots 4`, shared draft k
-(`TRITIUM_MULTI_K=shared`, the shipped default; per-slot k was refuted at 9930062),
+(shared draft-k, the shipped default — the historical `TRITIUM_MULTI_K` knob no longer exists; per-slot k was refuted at 9930062),
 N concurrent 192-token wt103 streams, drafted-vs-undrafted ABBA×2 at the
 server-launch level, 5 samples/visit → n=20 per config, p50.
 

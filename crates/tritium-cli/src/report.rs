@@ -901,7 +901,14 @@ fn load_runner_with_caps(
         .iter()
         .find(|entry| entry.name == backend)
         .map(|entry| entry.init)
-        .with_context(|| format!("backend `{backend}` is not registered"))?;
+        .with_context(|| {
+            let known: Vec<&str> = tritium_runtime::BACKENDS.iter().map(|e| e.name).collect();
+            format!(
+                "backend `{backend}` is not registered (linked backends: {}; for cuda, \
+                 build with `--features cuda`)",
+                known.join(", ")
+            )
+        })?;
     let backend_obj = init().with_context(|| format!("backend `{backend}` failed to init"))?;
     let caps = backend_obj.capabilities();
     let file = tritium_format::read_gguf(&bytes)

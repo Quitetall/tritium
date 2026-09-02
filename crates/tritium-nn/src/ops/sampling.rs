@@ -103,10 +103,12 @@ pub fn sample_categorical(indices: &[u32], probs: &[f32], seed: u64) -> u32 {
     let mut state = seed;
     let r = next_unit(&mut state);
     let mut acc = 0.0_f32;
-    for (i, &p) in probs.iter().enumerate() {
+    // zip, not indexed: a caller passing mismatched lengths degrades to the
+    // shorter list instead of panicking (the lists are parallel by contract).
+    for (&idx, &p) in indices.iter().zip(probs.iter()) {
         acc += p;
         if r < acc {
-            return indices[i];
+            return idx;
         }
     }
     // Round-off fallback: return the last candidate (probs nominally sum to 1).

@@ -55,7 +55,7 @@ trades accuracy against size along a smooth ~1.58–3 bpw curve. The CLI exposes
 it directly:
 
 ```sh
-tritium quantize --input model.safetensors --output model.tslb --bpw 2.0
+tritium quantize --input model.safetensors --output model.tslb --ladder itf --bpw 2.0
 ```
 
 `--bpw 1.585` is all-base ternary (the `T = 1` flat case); higher budgets buy
@@ -306,6 +306,29 @@ stages. The high-level `tritium.torch.quantize(...)` facade now composes
 `prepare` → `calibrate` → `convert` for this Qwen source path. Live
 `torch.nn.Module` PTQ uses activation calibration and returns a module-scoped
 conversion result; it does not silently substitute Qwen S2KF evidence.
+
+Long CPU campaigns can be inspected without opening or mutating their records:
+
+```sh
+python scripts/qwen36-ptq-status.py \
+  --work-dir ./tritium-work \
+  --sample-seconds 20 \
+  --json
+```
+
+When a `campaign.tq36p` descriptor is present, the probe also derives exact
+total record bytes and tensor count, then reports a whole-campaign ETA from the
+sampled rate. Use `--target-bytes N` only when estimating an isolated staged
+record. All estimates are operational only; signed campaign and release
+receipts remain authoritative.
+
+`status=stalled` means staged work exists but no recorded owner PID is alive;
+resume tooling must validate its checkpoint before continuing.
+
+This operational snapshot reports staged-byte growth, producer PID liveness,
+published-master count, and seal state. It is not release evidence; source,
+recipe, artifact, and hardware claims still require the signed campaign and
+release receipts.
 
 For Transformers-backed Qwen3.6 capture, use the strict component boundary:
 

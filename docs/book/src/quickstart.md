@@ -22,7 +22,7 @@ curl http://127.0.0.1:8080/v1/chat/completions -H 'content-type: application/jso
   -d '{"model":"tritium","messages":[{"role":"user","content":"What is the capital of France?"}]}'
 ```
 
-No GPU? Use `--backend cpu` (and build without the `cuda` feature). No
+No GPU? Use `--backend cpu` — but note the server binary is feature-gated: build it with `cargo build --release -p tritium-serve --features tritium-serve/serve` (the bare `-p tritium-serve` build completes while silently producing no binary). No
 network exposure by default: the server binds loopback; `--host` beyond
 loopback refuses to start unless `TRITIUM_AUTH_TOKEN` or the comma-separated
 rotation set `TRITIUM_AUTH_TOKENS` is set. Expensive generation routes use a
@@ -141,7 +141,8 @@ tritium generate --model model.gguf --tokens tokens.json --max-new 16
 ```
 
 Flags: `--max-new <N>` (default 16), `--eos <ID>` (default 128001),
-`--greedy <bool>`.
+`--greedy <bool>` (only `true` is accepted — sampling lives in
+`tritium-serve`'s OpenAI API).
 
 ### `report`
 
@@ -166,7 +167,7 @@ container. `--bpw` is the single accuracy↔size knob (`1.585` = all base ternar
 `~4.75` at T=3); see [Quantization](./quantization.md).
 
 ```sh
-tritium quantize --input model.safetensors --output model.tslb --bpw 2.0
+tritium quantize --input model.safetensors --output model.tslb --ladder itf --bpw 2.0
 ```
 
 ### Optional seekable transport

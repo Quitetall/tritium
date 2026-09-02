@@ -118,9 +118,24 @@ cargo run --locked -p tritium-cli -- list-backends
 CUDA and other accelerator adapters are feature-gated because their toolchains
 and physical device receipts are target-specific. Portable targets use their
 own target-build and package gates. The source-level CLI and server tutorial is
-in the [quickstart](docs/book/src/quickstart.md). Release users should install
-only exact artifacts admitted by the candidate manifest once those artifacts
-are authorized and published.
+in the [quickstart](docs/book/src/quickstart.md); the engine's environment
+knobs are catalogued in
+[environment variables](docs/book/src/environment.md). Release users should
+install only exact artifacts admitted by the candidate manifest once those
+artifacts are authorized and published.
+
+### Install from crates.io (release candidate)
+
+Only prerelease versions are published, so `cargo install` needs the explicit
+version:
+
+```sh
+cargo install tritium-cli --version 1.1.0-rc.0            # the `tritium` tool
+cargo install tritium-serve --version 1.1.0-rc.0 \
+    --features serve                                       # the HTTP server
+```
+
+Add `--features cuda` to either for the CUDA backend (needs nvcc).
 
 ## Architecture
 

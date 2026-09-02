@@ -104,7 +104,8 @@ class FlagshipQualityReceiptTests(unittest.TestCase):
                         {
                             "name": f"task-{ordinal}", "dense_accuracy_pct": 70.0,
                             "refined_accuracy_pct": 69.6, "delta_pp": 0.4,
-                            "ci95_upper_pp": 0.9,
+                            "ci95_upper_pp": 0.9, "dense_cap_rate": 0.02,
+                            "refined_cap_rate": 0.03, "token_budget": 1024,
                         }
                         for ordinal in range(6)
                     ],
@@ -117,6 +118,30 @@ class FlagshipQualityReceiptTests(unittest.TestCase):
                 validate_tasks(tasks_path, "a" * 40, "1.1.0-rc.0", candidate),
                 tasks,
             )
+
+    def test_rejects_invalid_score_at_budget_fields(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            candidate, common = fixture(root)
+            tasks = seal(
+                {
+                    **common, "schema": MODULE["TASK_SCHEMA"], "run_id": "tasks-run",
+                    "tasks": [
+                        {
+                            "name": f"task-{ordinal}", "dense_accuracy_pct": 70.0,
+                            "refined_accuracy_pct": 69.6, "delta_pp": 0.4,
+                            "ci95_upper_pp": 0.9, "dense_cap_rate": 1.01,
+                            "refined_cap_rate": 0.03, "token_budget": 1024,
+                        }
+                        for ordinal in range(6)
+                    ],
+                    "mean_delta_pp": 0.4, "mean_ci95_upper_pp": 0.5,
+                }
+            )
+            path = root / "tasks.json"
+            path.write_bytes(canonical(tasks))
+            with self.assertRaisesRegex(FlagshipQualityError, "at most one"):
+                validate_tasks(path, "a" * 40, "1.1.0-rc.0", candidate)
 
     def test_rejects_confidence_boundary(self):
         with tempfile.TemporaryDirectory() as raw:
