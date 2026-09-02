@@ -11,6 +11,12 @@ see `docs/v1.0-api-freeze-audit.md` for the tier policy.
 
 ## [Unreleased] — 1.x dev
 
+> **Release-candidate mapping.** `1.1.0-rc.0` is published on crates.io for all 23
+> crates, and `v1.1.0-rc.1` is tagged. Both were cut from this section rather than
+> from dated `1.1.0-rc.*` headings, so there is no separate entry to read for them —
+> everything below is what shipped in those candidates. The next non-RC release
+> promotes this section to a dated `## [1.1.0]` heading.
+
 ### Changed
 
 - **Transactional WebGPU cancellation:** resident training now carries each
