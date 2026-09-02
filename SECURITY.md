@@ -83,9 +83,14 @@ untrusted bytes (model file / corpus)
 
 ## Reporting a vulnerability
 
-Report suspected vulnerabilities privately to `briankhanglam@gmail.com` rather
-than through an issue, discussion, or chat. Do not send proprietary model or
-dataset contents unless a safe transfer has been agreed.
+Report suspected vulnerabilities through
+[GitHub's private vulnerability reporting](https://github.com/Quitetall/tritium/security/advisories/new)
+— the **Report a vulnerability** button on the Security tab. That route keeps the
+report private, gives us a place to draft a fix and an advisory with you, and can
+issue a CVE. Email `briankhanglam@gmail.com` only if you cannot use it.
+
+Either way, do not use an issue, discussion, or chat, and do not send proprietary
+model or dataset contents unless a safe transfer has been agreed.
 
 Include the affected version and full source/artifact identity, impact, minimal
 reproduction, required environment, and whether the issue is already public.
