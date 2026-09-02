@@ -12,7 +12,7 @@ from typing import Any
 
 
 QUALITY_SCHEMA = "tritium.qwen36-quality.v1"
-TASK_SCHEMA = "tritium.qwen36-task-retention.v1"
+TASK_SCHEMA = "tritium.qwen36-task-retention.v2"
 MODEL_ID = "Qwen/Qwen3.6-27B"
 MODEL_REVISION = "6a9e13bd6fc8f0983b9b99948120bc37f49c13e9"
 COMMON_FIELDS = {
@@ -35,7 +35,7 @@ BASELINE_FIELDS = {
 TASK_FIELDS = COMMON_FIELDS | {"tasks", "mean_delta_pp", "mean_ci95_upper_pp"}
 TASK_RESULT_FIELDS = {
     "name", "dense_accuracy_pct", "refined_accuracy_pct", "delta_pp",
-    "ci95_upper_pp",
+    "ci95_upper_pp", "dense_cap_rate", "refined_cap_rate", "token_budget",
 }
 MAX_BYTES = 32 * 1024 * 1024
 
@@ -261,6 +261,13 @@ def validate_tasks(
         refined = number(task["refined_accuracy_pct"], "refined task accuracy")
         if dense > 100.0 or refined > 100.0:
             raise FlagshipQualityError("task accuracy exceeds 100 percent")
+        for field in ("dense_cap_rate", "refined_cap_rate"):
+            cap_rate = number(task[field], f"{field} for {name}")
+            if cap_rate > 1.0:
+                raise FlagshipQualityError(f"{field} for {name} must be at most one")
+        budget = task["token_budget"]
+        if isinstance(budget, bool) or not isinstance(budget, int) or budget <= 0:
+            raise FlagshipQualityError(f"token budget for {name} must be a positive integer")
         delta = number(task["delta_pp"], "task delta")
         upper = number(task["ci95_upper_pp"], "task CI upper")
         if not close(delta, max(0.0, dense - refined)) or delta > 1.0 or upper > 1.0:
