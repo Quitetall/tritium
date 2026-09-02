@@ -508,7 +508,7 @@ jobs:
   # `capstone-required` from their own workflows alongside this check.
   # The published compatibility floor, verified rather than asserted. `rust-toolchain.toml` now
   # pins the BUILD toolchain (1.98.0) and has stopped doubling as the MSRV, so without this lane
-  # `rust-version = "1.89"` in Cargo.toml would be an unchecked claim to every crates.io consumer.
+  # `rust-version` in Cargo.toml would be an unchecked claim to every crates.io consumer.
   #
   # `--locked` matters: the lockfile is part of the promise. A dependency that raises its own MSRV
   # (as burn 0.21 did, via cubecl-zspace requiring 1.92) must fail HERE, at the floor, rather than
