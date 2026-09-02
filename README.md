@@ -6,11 +6,6 @@
   </picture>
 </p>
 
-<p align="center">
-  <em>Ternary weights, honestly measured.</em><br>
-  <code>-1</code> &nbsp;<code>0</code>&nbsp; <code>+1</code>
-</p>
-
 [![CI](https://github.com/Quitetall/tritium/actions/workflows/ci.yml/badge.svg)](https://github.com/Quitetall/tritium/actions/workflows/ci.yml)
 [![Docs](https://github.com/Quitetall/tritium/actions/workflows/docs.yml/badge.svg)](https://github.com/Quitetall/tritium/actions/workflows/docs.yml)
 [![Sanitizers](https://github.com/Quitetall/tritium/actions/workflows/sanitizers.yml/badge.svg)](https://github.com/Quitetall/tritium/actions/workflows/sanitizers.yml)
@@ -19,6 +14,11 @@
 [![Benchmarks](https://img.shields.io/badge/benchmarks-reproducible_ledger-informational.svg)](docs/BENCHMARKS.md)
 [![docs.rs](https://img.shields.io/docsrs/tritium-core?logo=rust&label=docs.rs)](https://docs.rs/tritium-core)
 [![crates.io](https://img.shields.io/crates/v/tritium-core.svg?logo=rust)](https://crates.io/crates/tritium-core)
+
+<p align="center">
+  <em>Ternary weights, honestly measured.</em><br>
+  <code>-1</code> &nbsp;<code>0</code>&nbsp; <code>+1</code>
+</p>
 
 Tritium is Apache-2.0 infrastructure for converting dense neural networks into
 compact additive-ternary models, refining or training them with PyTorch, and
