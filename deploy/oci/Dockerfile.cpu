@@ -7,13 +7,13 @@ ARG SOURCE_DATE_EPOCH
 # pinned Rust; the shipped container building at the floor is a standing proof that the
 # floor actually works for a real artifact. Moving it means resolving a new base-image
 # digest and re-qualifying the image, which is its own change.
-FROM docker.io/library/rust:1.89.0-bookworm@sha256:c9ac3fa8945b61dede1e4500d25028aa8fd8a8fe46365fcf9c0422f8d999b9b0 AS build
+FROM docker.io/library/rust:1.98.0-bookworm@sha256:82150a52ec202c1b14d7817e14516c392bb7f5cfebd88f1ed531cb37ebd39922 AS build
 ARG SOURCE_REVISION
 ARG SOURCE_CREATED
 ARG SOURCE_DATE_EPOCH
 ARG CARGO_NET_OFFLINE=false
 ENV CARGO_NET_OFFLINE=${CARGO_NET_OFFLINE} \
-    RUSTUP_TOOLCHAIN=1.89.0 \
+    RUSTUP_TOOLCHAIN=1.98.0 \
     TRITIUM_SOURCE_ID=source-git:${SOURCE_REVISION}
 WORKDIR /src
 COPY . .

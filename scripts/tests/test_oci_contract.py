@@ -9,6 +9,25 @@ ROOT = Path(__file__).resolve().parents[2]
 DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
+def _ver(text: str) -> tuple[int, ...]:
+    """`1.98.0` -> (1, 98, 0), zero-padded so `1.96` and `1.96.0` compare equal."""
+    parts = tuple(int(p) for p in text.split("."))
+    return parts + (0,) * (3 - len(parts))
+
+
+def TOOLCHAIN_CHANNEL() -> str:
+    """The toolchain CI and the images build with, from rust-toolchain.toml."""
+    text = (ROOT / "rust-toolchain.toml").read_text(encoding="utf-8")
+    return re.search(r'(?m)^channel\s*=\s*"([^"]+)"', text).group(1)
+
+
+def WORKSPACE_MSRV() -> str:
+    """The published floor, from [workspace.package] rust-version -- not the build toolchain."""
+    text = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
+    return re.search(r'(?m)^rust-version\s*=\s*"([^"]+)"', text).group(1)
+
+
+
 class OciContractTests(unittest.TestCase):
     def dockerfile(self, flavor: str) -> str:
         return (ROOT / f"deploy/oci/Dockerfile.{flavor}").read_text(encoding="utf-8")
@@ -80,7 +99,47 @@ class OciContractTests(unittest.TestCase):
         for flavor in ("cpu", "cuda"):
             text = self.dockerfile(flavor)
             self.assertIn("cargo build --frozen --profile dist", text)
-            self.assertIn("RUSTUP_TOOLCHAIN=1.89.0", text)
+
+    def test_image_toolchain_is_the_workspace_toolchain_and_clears_the_msrv(self):
+        """The images must build with the workspace toolchain, and it must satisfy the MSRV.
+
+        This assertion used to be ``assertIn("RUSTUP_TOOLCHAIN=1.89.0", text)`` -- a literal
+        that agreed with the Dockerfiles only because all three were edited together. When the
+        MSRV moved to 1.96 the Dockerfiles kept 1.89.0 and this test kept passing, because a
+        string match cannot notice that ``cargo`` now refuses the pair:
+
+            error: rustc 1.89.0 is not supported by the following packages:
+              tritium-core@1.1.0-rc.1 requires rustc 1.96
+
+        Nothing builds these images in CI, so the text match was the only thing standing
+        between a toolchain bump and a broken container. Deriving both ends removes the
+        constant that drifted.
+        """
+        channel = TOOLCHAIN_CHANNEL()
+        msrv = WORKSPACE_MSRV()
+        self.assertGreaterEqual(
+            _ver(channel),
+            _ver(msrv),
+            f"rust-toolchain.toml pins {channel}, below the workspace MSRV {msrv}",
+        )
+        for flavor in ("cpu", "cuda"):
+            text = self.dockerfile(flavor)
+            pinned = re.findall(r"RUSTUP_TOOLCHAIN=([0-9][^ \\\n]*)", text)
+            self.assertTrue(pinned, f"Dockerfile.{flavor} pins no RUSTUP_TOOLCHAIN")
+            for got in pinned:
+                self.assertEqual(
+                    got,
+                    channel,
+                    f"Dockerfile.{flavor} builds with {got} but rust-toolchain.toml pins {channel}",
+                )
+            # The base image must carry that same toolchain, or RUSTUP_TOOLCHAIN silently
+            # triggers a download at build time and the digest pin stops meaning anything.
+            for ref in re.findall(r"^FROM\s+(\S*library/rust:\S+)", text, flags=re.MULTILINE):
+                self.assertIn(
+                    f"rust:{channel}-",
+                    ref,
+                    f"Dockerfile.{flavor} base image {ref} disagrees with toolchain {channel}",
+                )
 
     def test_image_metadata_matches_source_contracts(self):
         cargo = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
