@@ -1,0 +1,60 @@
+# CodeQL static analysis.
+#
+# This exists because the `protected main` ruleset already REQUIRES CodeQL
+# (`code_scanning` rule, tool `CodeQL`, security threshold `high_or_higher`) while nothing in the
+# repository produced a single analysis — `GET /code-scanning/analyses` returned "no analysis
+# found". A required control that emits nothing looks like protection and is not; with an admin
+# bypass in place, nobody would ever discover it.
+#
+# Languages follow `GET /repos/.../languages`: Rust dominates, with Python tooling under scripts/
+# and TypeScript/JavaScript in packages/tritium-web. `actions` is included deliberately — this
+# repo's threat model treats CI supply chain as a first-class surface, and that pack is what finds
+# script injection and unpinned-action patterns.
+#
+# `build-mode: none` everywhere: the compiled languages here need CUDA/ROCm/Metal toolkits that no
+# hosted runner has, and scanning source without building is the only mode that can run on a free
+# ubuntu-latest lane.
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Wednesday 03:00 UTC — deliberately offset from the Monday fuzz (ci.yml) and sanitizer
+    # (sanitizers.yml) crons so the three heavy scheduled lanes do not contend.
+    - cron: "0 3 * * 3"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      # Scoped to this job only; the workflow default above stays read-only.
+      security-events: write
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [rust, python, javascript-typescript, actions]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: initialize CodeQL
+        uses: github/codeql-action/init@486fec2a3ea2626afcd8c7e9208b4f515078dd7e # codeql-bundle-v2.26.4
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+      - name: analyze
+        uses: github/codeql-action/analyze@486fec2a3ea2626afcd8c7e9208b4f515078dd7e # codeql-bundle-v2.26.4
+        with:
+          category: "/language:${{ matrix.language }}"
