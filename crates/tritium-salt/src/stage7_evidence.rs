@@ -537,7 +537,7 @@ impl Stage7TokenEvidencePack {
                 return invalid("selected token sequence changed after admission");
             }
             ordered.update(bytes);
-            for chunk in bytes.chunks_exact(4) {
+            for chunk in bytes.as_chunks::<4>().0 {
                 let token = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
                 if token >= self.receipt.tokenizer_vocab_size {
                     return invalid("selected token id exceeds tokenizer vocabulary");
@@ -700,7 +700,7 @@ fn validate_payload_semantics(
             if !token_digests.insert(observed) {
                 return invalid("token evidence contains duplicate token sequences");
             }
-            for chunk in bytes.chunks_exact(4) {
+            for chunk in bytes.as_chunks::<4>().0 {
                 let token = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
                 if u64::from(token) >= manifest.tokenizer_vocab_size {
                     return invalid("token id exceeds tokenizer vocabulary");

@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="120" viewBox="0 0 512 120" role="img" aria-label="tritium">
+  <rect x="58" y="37" width="56" height="12" fill="#22D3EE"/>
+  <rect x="58" y="54" width="34" height="12" fill="#E8ECEF"/>
+  <rect x="36" y="71" width="56" height="12" fill="#3B82F6"/>
+  <text x="136" y="80" font-family="'JetBrains Mono',ui-monospace,Menlo,monospace"
+        font-weight="500" font-size="54" letter-spacing="-2.2" fill="#0B0F17">tritium</text>
+</svg>

@@ -236,7 +236,12 @@ fn cuda_l6_long_ctx_spec_kv_abba() {
         // The L6 route assertion: BOTH rungs must have run the graph route
         // (unless the eager counterfactual is explicitly requested for A/B).
         assert!(
-            r.graph_buckets >= 1 || std::env::var_os("TRITIUM_TREE_EAGER").is_some(),
+            // Intentional duplication of tritium-cuda's env_flag_on
+            // contract (unset/"0" = off, "1" = on) — that helper is
+            // pub(super) and unreachable from this crate's tests. If the
+            // contract ever broadens, update both.
+            r.graph_buckets >= 1
+                || matches!(std::env::var("TRITIUM_TREE_EAGER").as_deref(), Ok("1")),
             "[{rung}] spec leg ran eager — the L6 bench must exercise the \
              graph tree route"
         );

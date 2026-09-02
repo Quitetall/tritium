@@ -487,7 +487,7 @@ impl<R: Read + Seek> SaltGgufReader<R> {
 fn validate_row_scales(row: PackedSaltRowRef<'_>) -> Result<(), SaltGgufReadError> {
     for plane in row.planes() {
         if let Some(bytes) = plane.dense_bytes() {
-            for block in bytes.chunks_exact(TQ2_0_BLOCK_BYTES) {
+            for block in bytes.as_chunks::<TQ2_0_BLOCK_BYTES>().0 {
                 let bits = u16::from_le_bytes([
                     block[TQ2_0_BLOCK_BYTES - 2],
                     block[TQ2_0_BLOCK_BYTES - 1],
@@ -745,8 +745,9 @@ fn read_row<'a, R: Read + Seek>(
                 "read SALT plane descriptors",
             )?;
             let mut payload_bytes = 0usize;
-            for descriptor in
-                scratch[SALT_HEADER_BYTES..prefix_len].chunks_exact(PLANE_DESCRIPTOR_BYTES)
+            for descriptor in scratch[SALT_HEADER_BYTES..prefix_len]
+                .as_chunks::<PLANE_DESCRIPTOR_BYTES>()
+                .0
             {
                 let len = u32::from_le_bytes(
                     descriptor[1..]

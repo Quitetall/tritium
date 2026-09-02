@@ -594,11 +594,10 @@ impl<'a> OracleCursor<'a> {
             .ok_or_else(|| invalid_oracle(format!("{field} byte count overflows usize")))?;
         let bytes = self.take(byte_count, field)?;
         let mut output = try_vec_with_capacity(count, field)?;
-        for chunk in bytes.chunks_exact(size_of::<u32>()) {
-            let lane: [u8; 4] = chunk
-                .try_into()
-                .map_err(|_| invalid_oracle(format!("body is truncated in {field}")))?;
-            output.push(u32::from_le_bytes(lane));
+        // `as_chunks` proves the 4-byte length in the type, so the old fallible conversion was an
+        // unreachable error arm. `take` above already guarantees the byte count.
+        for lane in bytes.as_chunks::<{ size_of::<u32>() }>().0 {
+            output.push(u32::from_le_bytes(*lane));
         }
         Ok(output)
     }
@@ -609,11 +608,8 @@ impl<'a> OracleCursor<'a> {
             .ok_or_else(|| invalid_oracle(format!("{field} byte count overflows usize")))?;
         let bytes = self.take(byte_count, field)?;
         let mut output = try_vec_with_capacity(count, field)?;
-        for chunk in bytes.chunks_exact(size_of::<f32>()) {
-            let lane: [u8; 4] = chunk
-                .try_into()
-                .map_err(|_| invalid_oracle(format!("body is truncated in {field}")))?;
-            let value = f32::from_le_bytes(lane);
+        for lane in bytes.as_chunks::<{ size_of::<f32>() }>().0 {
+            let value = f32::from_le_bytes(*lane);
             if !value.is_finite() {
                 return Err(invalid_oracle(format!(
                     "{field} contains a non-finite value"

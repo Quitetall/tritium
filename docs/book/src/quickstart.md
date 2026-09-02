@@ -141,7 +141,8 @@ tritium generate --model model.gguf --tokens tokens.json --max-new 16
 ```
 
 Flags: `--max-new <N>` (default 16), `--eos <ID>` (default 128001),
-`--greedy <bool>`.
+`--greedy <bool>` (only `true` is accepted — sampling lives in
+`tritium-serve`'s OpenAI API).
 
 ### `report`
 

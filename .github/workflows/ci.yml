@@ -148,7 +148,7 @@ jobs:
           TRITIUM_NPM_RUN_ID: github-${{ github.run_id }}-${{ github.run_attempt }}-npm-archive
         run: npm run check
       - name: retain local-RC archive and receipt
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: tritium-web-${{ github.sha }}
           path: ${{ runner.temp }}/tritium-npm-evidence
@@ -479,7 +479,7 @@ jobs:
           --release 1.1.0-rc.1
           --run-id github-${{ github.run_id }}-${{ github.run_attempt }}-crate-archives
           --output crate-evidence/crate-archive-qualification.json
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: crate-candidates-${{ github.sha }}
           path: |
@@ -497,7 +497,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
       - run: cargo install cargo-cyclonedx --locked
       - run: cargo cyclonedx --all --format json
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: sbom-cyclonedx
           path: "**/*.cdx.json"
@@ -506,11 +506,38 @@ jobs:
   # Stable branch-protection target for jobs in this workflow. GitHub Actions
   # cannot express `needs` across workflow files; require `docs-required` and
   # `capstone-required` from their own workflows alongside this check.
+  # The published compatibility floor, verified rather than asserted. `rust-toolchain.toml` now
+  # pins the BUILD toolchain (1.98.0) and has stopped doubling as the MSRV, so without this lane
+  # `rust-version = "1.89"` in Cargo.toml would be an unchecked claim to every crates.io consumer.
+  #
+  # `--locked` matters: the lockfile is part of the promise. A dependency that raises its own MSRV
+  # (as burn 0.21 did, via cubecl-zspace requiring 1.92) must fail HERE, at the floor, rather than
+  # silently in a downstream user's build.
+  msrv:
+    name: MSRV floor (rust-version)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: read the floor from Cargo.toml
+        id: floor
+        run: |
+          set -euo pipefail
+          floor=$(python3 -c "import re,pathlib; print(re.search(r'^rust-version = \"([^\"]+)\"', pathlib.Path('Cargo.toml').read_text(), re.M).group(1))")
+          echo "version=$floor" >> "$GITHUB_OUTPUT"
+          echo "MSRV floor is $floor"
+      # Overrides rust-toolchain.toml for this job only.
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: ${{ steps.floor.outputs.version }}
+      - name: build the workspace at the floor
+        run: cargo +${{ steps.floor.outputs.version }} check --locked --workspace --exclude tritium-py --all-targets
+
   ci-required:
     name: ci-required
     if: ${{ always() }}
     needs:
       - cpu-only-green
+      - msrv
       - gpu-feature-check
       - compatibility-matrix
       - web-package

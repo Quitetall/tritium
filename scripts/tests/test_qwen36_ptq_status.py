@@ -98,6 +98,42 @@ class Qwen36PtqStatusTests(unittest.TestCase):
         self.assertEqual(snapshot["bytes_per_second"], 10.0)
         self.assertEqual(snapshot["estimated_seconds_remaining"], 10.0)
 
+    def test_campaign_descriptor_reports_full_expected_size(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            campaign_dir = root / "master-campaigns"
+            staging = campaign_dir / ".tmp"
+            staging.mkdir(parents=True)
+            current = staging / f"record.tmp.{os.getpid()}.2.0"
+            current.write_bytes(b"x")
+
+            metadata = bytearray(420)
+            metadata[314:318] = (1).to_bytes(4, "little")
+            metadata[318] = ord("x")
+            metadata[319:323] = (1).to_bytes(4, "little")
+            metadata[-40:-32] = (10).to_bytes(8, "little")
+            catalog = (
+                b"TSQ36SC\x00"
+                + (1).to_bytes(2, "little")
+                + b"\x00\x00"
+                + (1).to_bytes(4, "little")
+                + len(metadata).to_bytes(4, "little")
+                + metadata
+            )
+            descriptor = bytearray(313)
+            descriptor[:8] = b"TSQ36CP\x00"
+            descriptor[309:313] = len(catalog).to_bytes(4, "little")
+            (campaign_dir / "campaign.tq36p").write_bytes(
+                bytes(descriptor) + catalog + b"\x00" * 32
+            )
+
+            snapshot = MODULE.inspect(root)
+
+        self.assertEqual(snapshot["campaign_tensor_count"], 1)
+        self.assertEqual(snapshot["campaign_expected_payload_bytes"], 10)
+        self.assertEqual(snapshot["campaign_expected_record_bytes"], 607)
+        self.assertIsNone(snapshot["campaign_estimated_seconds_remaining"])
+
     def test_negative_target_bytes_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaises(MODULE.StatusError):

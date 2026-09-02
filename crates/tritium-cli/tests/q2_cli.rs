@@ -30,7 +30,7 @@ fn temp_dir(tag: &str) -> PathBuf {
 fn i2s_payload(trits: &[Trit], scale: f32) -> Vec<u8> {
     assert!(trits.len().is_multiple_of(128));
     let mut payload = vec![0u8; trits.len() / 4 + tritium_format::I2S_SCALE_BYTES];
-    for (block_index, block) in trits.chunks_exact(128).enumerate() {
+    for (block_index, block) in trits.as_chunks::<128>().0.iter().enumerate() {
         for group_position in 0..32 {
             let mut byte = 0u8;
             for group in 0..4 {

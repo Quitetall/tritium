@@ -145,7 +145,12 @@ fn packed_host_offload_recovers_heldout_within_track0_time() {
     {
         train_ids.truncate(limit);
     }
-    let windows: Vec<&[u32]> = train_ids.chunks_exact(TRAIN_SEQ).collect();
+    let windows: Vec<&[u32]> = train_ids
+        .as_chunks::<TRAIN_SEQ>()
+        .0
+        .iter()
+        .map(|w| w.as_slice())
+        .collect();
     assert!(!windows.is_empty(), "train corpus shorter than one window");
 
     let backend = CudaBackend::new(0).expect("open CUDA device");

@@ -1313,8 +1313,10 @@ impl CampaignWorld {
             #[cfg(feature = "nccl")]
             Self::Distributed { process_group, .. } => {
                 let words = digest
-                    .chunks_exact(8)
-                    .map(|chunk| u64::from_le_bytes(chunk.try_into().expect("eight-byte chunk")))
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|chunk| u64::from_le_bytes(*chunk))
                     .collect::<Vec<_>>();
                 process_group
                     .verify_u64_consensus(&words)
@@ -1365,7 +1367,9 @@ impl CampaignWorld {
                     bail!("NCCL hardware gather returned an invalid record count");
                 }
                 let fleet: Vec<CampaignHardwareIdentity> = gathered
-                    .chunks_exact(WORDS)
+                    .as_chunks::<WORDS>()
+                    .0
+                    .iter()
                     .enumerate()
                     .map(|(rank, record)| {
                         let len = usize::try_from(record[0])
@@ -3634,7 +3638,7 @@ fn parse_lower_hex_digest(value: &str) -> anyhow::Result<[u8; 32]> {
         bail!("campaign plan fingerprint is not lowercase 64-hex");
     }
     let mut digest = [0_u8; 32];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let pair = core::str::from_utf8(pair).expect("validated ASCII hex");
         digest[index] = u8::from_str_radix(pair, 16).expect("validated lowercase hex");
     }

@@ -190,6 +190,11 @@ case "$tier" in
         # onnx-only test that reported "0 passed; 73 filtered out", and wgpu/pollster which are
         # optional behind --features wgpu while backend.rs alone has 467 wgpu:: call sites).
         # TRITIUM_CHECK_ONLY=1 keeps this toolkit-free, exactly as the release tier does.
+        # tritium-py is deliberately NOT excluded here. It is excluded from `cargo test` below
+        # because pyo3 cannot link a standalone test binary without a Python development lib --
+        # but clippy does not link, and CI lints it. Running this tier is the point: a
+        # tritium-py-only lint reached CI red on 2026-09-01 because the author ran ad-hoc
+        # `--exclude tritium-py` commands instead of this script.
         run env TRITIUM_CHECK_ONLY=1 cargo clippy --locked --workspace --all-targets \
             --all-features -- -D warnings
         verify_non_unix_cfg

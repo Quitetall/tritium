@@ -1,4 +1,15 @@
-# Tritium
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/brand/tritium-header-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="assets/brand/tritium-header-light.svg">
+    <img alt="Tritium" src="assets/brand/tritium-header-dark.svg" width="420">
+  </picture>
+</p>
+
+<p align="center">
+  <em>Ternary weights, honestly measured.</em><br>
+  <code>-1</code> &nbsp;<code>0</code>&nbsp; <code>+1</code>
+</p>
 
 [![CI](https://github.com/Quitetall/tritium/actions/workflows/ci.yml/badge.svg)](https://github.com/Quitetall/tritium/actions/workflows/ci.yml)
 [![Docs](https://github.com/Quitetall/tritium/actions/workflows/docs.yml/badge.svg)](https://github.com/Quitetall/tritium/actions/workflows/docs.yml)
@@ -6,6 +17,8 @@
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2024-orange.svg)](Cargo.toml)
 [![Benchmarks](https://img.shields.io/badge/benchmarks-reproducible_ledger-informational.svg)](docs/BENCHMARKS.md)
+[![docs.rs](https://img.shields.io/docsrs/tritium-core?logo=rust&label=docs.rs)](https://docs.rs/tritium-core)
+[![crates.io](https://img.shields.io/crates/v/tritium-core.svg?logo=rust)](https://crates.io/crates/tritium-core)
 
 Tritium is Apache-2.0 infrastructure for converting dense neural networks into
 compact additive-ternary models, refining or training them with PyTorch, and
@@ -174,8 +187,8 @@ yet contain a sign-off candidate/registry. Current work-order blockers include:
   receipts remain open;
 - trainable whole-model ONNX is intentionally deferred to v1.3;
 - vision/multimodal tensors are identity-bound but deferred from v1.1;
-- public links and community channels remain inactive while the repository is
-  private, and an independent conduct adjudicator must be designated first.
+- community channels are not yet activated; see [COMMUNITY.md](COMMUNITY.md) for the
+  activation and moderation policy.
 
 ## Project policies
 

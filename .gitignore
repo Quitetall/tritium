@@ -57,7 +57,13 @@ scratch_st/
 
 # Research/ADR/plan docs live in the private tritium-research repo (docs/RESEARCH.md);
 # working copies remain on disk for active sessions but are untracked.
-docs/adr/
+# Research records are default-DENY here. The working front lives in the private
+# tritium-research repo; a record appears in this repo only once its decision has
+# shipped (docs/RESEARCH.md). Promotion is an explicit un-ignore of one file, which
+# is the forcing function: you cannot publish a record by accident, and the .gitignore
+# diff is the promotion audit trail.
+docs/adr/*
+!docs/adr/README.md
 docs/plans/
 docs/paper/
 docs/research-*.md
@@ -67,3 +73,4 @@ docs/OPTIMIZATION-LOG.md
 docs/receipts-ws-*
 docs/bastion-lamu-integration.md
 docs/drafter-blut-handoff.md
+packages/tritium-web/node_modules

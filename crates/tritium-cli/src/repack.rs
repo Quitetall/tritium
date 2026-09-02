@@ -471,7 +471,7 @@ fn collapse_g64_scales(
     output
         .try_reserve_exact(k_in / QK_K)
         .with_context(|| format!("{name}: allocate collapsed G256 scales"))?;
-    for (group256, chunk) in scales64.chunks_exact(4).enumerate() {
+    for (group256, chunk) in scales64.as_chunks::<4>().0.iter().enumerate() {
         let mut selected = None;
         for (within, &scale) in chunk.iter().enumerate() {
             if scale == f16::ZERO {
@@ -528,7 +528,7 @@ mod tests {
     fn pack_i2s_tensor(t: &[Trit], scale: f32) -> Vec<u8> {
         assert_eq!(t.len() % 128, 0);
         let mut out = vec![0u8; t.len() / 4 + I2S_SCALE_BYTES];
-        for (b, blk) in t.chunks_exact(128).enumerate() {
+        for (b, blk) in t.as_chunks::<128>().0.iter().enumerate() {
             for gp in 0..32 {
                 let mut byte = 0u8;
                 for group in 0..4 {
@@ -711,7 +711,9 @@ mod tests {
             let np = &bytes[(file.tensor_data_offset + ninfo.offset) as usize
                 ..(file.tensor_data_offset + ninfo.offset + ninfo.n_bytes) as usize];
             let got_dense: Vec<f32> = np
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect();
             assert_eq!(got_dense, dense);
@@ -753,8 +755,10 @@ mod tests {
         let dense_info = file.tensor("norm").expect("dense passthrough");
         let start = (file.tensor_data_offset + dense_info.offset) as usize;
         let got_dense: Vec<f32> = bytes[start..start + dense_info.n_bytes as usize]
-            .chunks_exact(4)
-            .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("f32 bytes")))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_le_bytes(*chunk))
             .collect();
         assert_eq!(got_dense, dense);
     }

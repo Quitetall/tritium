@@ -77,7 +77,7 @@ impl LadderConfig {
         }
         // A TQ2_0 block carries ONE f16 scale for 256 trits. The ladder's scale is per group, so a
         // block straddling two groups would need two anchors and could not be encoded.
-        if self.group % QK_K != 0 {
+        if !self.group.is_multiple_of(QK_K) {
             bail!(
                 "--group must be a multiple of {QK_K} for the SALT bundle: a TQ2_0 block holds one \
                  f16 scale per {QK_K} trits, so a smaller group would put two anchors in one block \

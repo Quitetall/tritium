@@ -18,7 +18,9 @@ use half::f16;
 #[must_use]
 pub fn f16_bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
     bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| f16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
         .collect()
 }

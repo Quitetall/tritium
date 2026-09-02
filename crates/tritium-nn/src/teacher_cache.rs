@@ -261,8 +261,8 @@ impl TeacherCacheReader {
             .ok_or(FormatError::TeacherCacheInvalidShape)?;
         self.reader.seek(SeekFrom::Start(offset))?;
         self.reader.read_exact(&mut self.bytes)?;
-        for (value, encoded) in out.iter_mut().zip(self.bytes.chunks_exact(4)) {
-            *value = f32::from_le_bytes(encoded.try_into().expect("four-byte chunk"));
+        for (value, encoded) in out.iter_mut().zip(self.bytes.as_chunks::<4>().0.iter()) {
+            *value = f32::from_le_bytes(*encoded);
         }
         Ok(())
     }
