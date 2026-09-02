@@ -56,7 +56,8 @@ untrusted bytes (model file / corpus)
   a typed error, never an out-of-bounds read, panic, or `unwrap` on attacker data.
 - **Continuous fuzzing.** Every untrusted-byte parser has a `cargo-fuzz` target
   (`gguf_parse`, `safetensors_parse`, `salt_bundle_parse`, `salt_gguf_parse`,
-  `salt_legacy_parse`, `sparse_plane_parse`, `tqbin_parse`, `tqidx_parse`) run on a
+  `salt_legacy_parse`, `sparse_plane_parse`, `tqbin_parse`, `tqidx_parse`,
+  `unpack_i2s`, `unpack_tq_rows`, `zero_bitmap`) run on a
   scheduled CI lane; the v0.90 gate is ≥24h cumulative fuzzing with zero open
   findings and committed corpora.
 - **Memory safety.** The foundation crates are `#![forbid(unsafe_code)]` /
@@ -100,8 +101,9 @@ material user risk, but the reason and remaining exposure will be documented.
 
 ## Supply-chain and deployment boundary
 
-Release artifacts are admitted by digest, source revision, SBOM, provenance,
-and signature gates. Model/tokenizer licenses and authenticity remain separate
+Release artifacts are admitted by digest, source revision, and SBOM gates.
+Cryptographic build provenance and artifact signatures are **not yet
+implemented** — do not treat a downloaded artifact as attested. Model/tokenizer licenses and authenticity remain separate
 from numerical compatibility: a loadable artifact is not automatically trusted
 or redistributable. Operators must verify candidate/public manifests and should
 run serving images with the documented non-root, read-only, bounded-resource

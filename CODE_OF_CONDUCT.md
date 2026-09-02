@@ -24,8 +24,10 @@ For ordinary conduct concerns not involving the maintainer, contact
 `briankhanglam@gmail.com`. If the concern involves the sole maintainer, do not
 send it to the subject: use
 [GitHub's private abuse-reporting route](https://support.github.com/contact/report-abuse).
-Project-level adjudication remains pending until an independent moderator is
-appointed; immediate platform safety measures may proceed. Security
+Project-level adjudication is handled by the maintainer named in
+[GOVERNANCE.md](GOVERNANCE.md), who will recuse and escalate to GitHub's abuse
+route for any report involving themselves; immediate platform safety measures may
+proceed in either case. Security
 vulnerabilities follow [SECURITY.md](SECURITY.md). Do not publish sensitive
 personal or vulnerability details in an issue.
 

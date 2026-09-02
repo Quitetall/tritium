@@ -4,7 +4,7 @@
 # deps version-pinned and ordered.
 #
 # Why `cargo package --workspace` and not per-crate `cargo publish --dry-run`:
-# this workspace has not been published to crates.io, so a per-crate
+# the pre-1.0 workspace was unpublished when this gate was written, so a per-crate
 # `cargo publish --dry-run` / `cargo package -p <x>` fails to "prepare for upload"
 # because each crate's internal deps (e.g. `tritium-core = "0.6.x"`) aren't on
 # crates.io yet (a chicken-and-egg only resolvable by an ordered release-time

@@ -174,8 +174,8 @@ yet contain a sign-off candidate/registry. Current work-order blockers include:
   receipts remain open;
 - trainable whole-model ONNX is intentionally deferred to v1.3;
 - vision/multimodal tensors are identity-bound but deferred from v1.1;
-- public links and community channels remain inactive while the repository is
-  private, and an independent conduct adjudicator must be designated first.
+- community channels are not yet activated; see [COMMUNITY.md](COMMUNITY.md) for the
+  activation and moderation policy.
 
 ## Project policies
 
