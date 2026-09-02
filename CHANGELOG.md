@@ -11,6 +11,14 @@ see `docs/v1.0-api-freeze-audit.md` for the tier policy.
 
 ## [Unreleased] — 1.x dev
 
+### Changed
+
+- **MSRV raised to 1.96, and it is now a policy rather than a constant.** `rust-version` was
+  `1.89` — the version where AVX-512 intrinsics stabilised, i.e. a hard *lower bound*
+  inherited as if it were a target. The floor now follows **latest stable minus two
+  releases, reviewed each release, never below 1.89** (see `SUPPORT.md`). This is
+  independent of `rust-toolchain.toml`, which pins the toolchain CI builds with.
+
 > **Release-candidate mapping.** `1.1.0-rc.0` is published on crates.io for all 23
 > crates, and `v1.1.0-rc.1` is tagged. Both were cut from this section rather than
 > from dated `1.1.0-rc.*` headings, so there is no separate entry to read for them —

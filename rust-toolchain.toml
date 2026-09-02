@@ -6,7 +6,7 @@
 # toolchain was held down at the published compatibility floor.
 #
 #   build with : this pin              -- moves forward, still pinned
-#   support    : rust-version = "1.89" -- the promise to crates.io consumers, verified by the
+#   support    : rust-version = "1.96" -- the promise to crates.io consumers, verified by the
 #                                         `msrv` CI lane, which must be bumped deliberately
 #
 # Still pinned to an exact version, not `stable`: `docs/security/threat-model.md` counts a

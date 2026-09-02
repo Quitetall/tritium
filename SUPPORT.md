@@ -18,6 +18,28 @@ only when the release compatibility matrix marks its exact cell `qualified`.
 `pending`, `unsupported`, compile-only, and locally modified configurations are
 not support claims.
 
+## Minimum supported Rust version
+
+**Policy: latest stable minus two releases, reviewed every release, never below 1.89.**
+
+`rust-version` in `Cargo.toml` is the published floor and the `msrv` CI lane compiles the
+whole workspace — every feature on — at exactly that version, so it is a verified claim
+rather than an aspiration.
+
+Two things this deliberately is not:
+
+- **It is not the toolchain we build with.** `rust-toolchain.toml` pins that separately and
+  moves ahead of the floor. Conflating the two once held the build back a full year and
+  blocked dependencies for no benefit.
+- **It is not a promise of indefinite support for old compilers.** Tritium tracks a moving
+  research frontier and its dependencies do too; a floor that never moves quietly becomes a
+  veto over the ecosystem. Raising it is a normal, announced change, not an emergency.
+
+The 1.89 lower bound is a hard technical limit, not a preference: AVX-512 intrinsics
+stabilised there and the CPU kernels use them.
+
+Raising the floor is called out in `CHANGELOG.md` for the release that does it.
+
 ## Asking for help
 
 Include the Tritium version and source revision, OS/architecture, installation

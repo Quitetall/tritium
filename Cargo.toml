@@ -44,11 +44,11 @@ members = [
 [workspace.package]
 version = "1.1.0-rc.1"         # Single local-RC source; scripts/check-release-version.py gates mirrors
 edition = "2024"
-rust-version = "1.89"          # AVX-512 intrinsics stable floor (Rust 1.89, 2025-08-07).
-                               # The published floor for crates.io consumers, INDEPENDENT of
-                               # rust-toolchain.toml (which pins what CI builds with). The
-                               # `msrv` CI lane proves this still compiles; raising it is a
-                               # deliberate, breaking-ish decision for downstream users.
+rust-version = "1.96"          # MSRV POLICY: latest stable minus two releases, reviewed each
+                               # release, and never below 1.89 (where AVX-512 intrinsics
+                               # stabilised — a hard lower bound, not a target). See SUPPORT.md.
+                               # Independent of rust-toolchain.toml, which pins what CI BUILDS
+                               # with; the `msrv` CI lane proves this floor still compiles.
 license = "Apache-2.0"         # FOSS; see LICENSE. Vendored deps attributed in NOTICE.
 repository = "https://github.com/Quitetall/tritium"
 authors = ["Brian Lam <briankhanglam@gmail.com>"]
@@ -123,8 +123,8 @@ candle-core = { version = "0.11", default-features = false }
 # burn interop (tritium-burn, behind its `burn` feature; CPU-only NdArray backend in the test).
 # burn-tensor gives Tensor/Backend/TensorData; burn-ndarray is the concrete CPU backend. `std`
 # (needed for NdArray + TensorData::to_vec) pulls the MPL-2.0 `colored` crate (allow-listed in deny.toml).
-burn-tensor = { version = "=0.20.1", default-features = false, features = ["std"] }
-burn-ndarray = { version = "=0.20.1", default-features = false, features = ["std"] }
+burn-tensor = { version = "=0.21.0", default-features = false, features = ["std"] }
+burn-ndarray = { version = "=0.21.0", default-features = false, features = ["std"] }
 # cli
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
