@@ -136,7 +136,7 @@ jobs:
           --artifact-id tritium-torch-${{ matrix.platform.target_id }}
           --output dist/tritium-torch-${{ matrix.platform.target_id }}.cdx.json
       - name: upload wheel artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: wheel-${{ matrix.platform.os }}-${{ matrix.platform.target }}
           path: |
@@ -171,7 +171,7 @@ jobs:
           --target-id ${{ matrix.platform.target_id }}
           --source-revision ${{ github.sha }}
           --smoke-evidence evidence/${{ matrix.platform.target_id }}-cp${{ matrix.python }}.json
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: abi3-${{ matrix.platform.os }}-cp${{ matrix.python }}
           path: evidence/*.json
@@ -202,7 +202,7 @@ jobs:
           --target-id macos-arm64-cpu
           --source-revision ${{ github.sha }}
           --smoke-evidence evidence/macos-arm64-cpu-cp${{ matrix.python }}.json
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: abi3-macos-cp${{ matrix.python }}
           path: evidence/*.json
@@ -226,7 +226,7 @@ jobs:
           --release 1.1.0-rc.1
           --run-id github-${{ github.run_id }}-${{ github.run_attempt }}-abi3-matrix
           --output receipts/python-abi3-39-plus.json
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: abi3-compatibility-receipt
           path: receipts/python-abi3-39-plus.json
@@ -311,7 +311,7 @@ jobs:
             --release 1.1.0-rc.1 \
             --run-id "github-${{ github.run_id }}-${{ github.run_attempt }}-api-signature" \
             --output-dir evidence/api-signature
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: wheel-functional-torch-2.11-python-3.13
           path: |
@@ -417,7 +417,7 @@ jobs:
             --wheel-artifact dist/*.whl \
             --source-revision ${{ github.sha }} \
             --release 1.1.0-rc.1
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: wheel-tutorial-source-free-python-3.13
           path: |
@@ -564,7 +564,7 @@ jobs:
           TRITIUM_OUTPUT_DIR="$PWD/evidence/colab/artifacts" \
             python -m jupyter nbconvert --execute --to notebook --inplace \
               --ExecutePreprocessor.timeout=600 evidence/colab/executed.ipynb
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: wheel-cuda13-torch2.11-python3.13-sm89
           path: |
