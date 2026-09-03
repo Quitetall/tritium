@@ -11,6 +11,16 @@ see `docs/v1.0-api-freeze-audit.md` for the tier policy.
 
 ## [Unreleased] — 1.x dev
 
+### Added
+
+- **A release pipeline.** `release.yml` turns a `vX.Y.Z` tag into published artifacts:
+  it calls `wheels.yml` for the build, verifies every wheel carries the tag's version,
+  then publishes to PyPI via **trusted publishing** (OIDC — no stored token), attaches
+  wheels + SBOMs + `SHA256SUMS` to a GitHub Release, and attests build provenance. A
+  crates.io job is wired but dormant until `CARGO_REGISTRY_TOKEN` is set. Before this,
+  the repo had 39 tags and 0 Releases, and every publish was a human with a token.
+  One-time PyPI publisher setup is in `SUPPORT.md`.
+
 ### Changed
 
 - **MSRV raised to 1.96, and it is now a policy rather than a constant.** `rust-version` was

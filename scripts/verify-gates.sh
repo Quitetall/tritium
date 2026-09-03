@@ -160,6 +160,23 @@ run_model_acceptance() {
 #
 # `cargo check` does not link, so the gnu target needs only mingw for blake3's C build. The msvc
 # target fails earlier for want of an MSVC compiler -- use gnu.
+verify_workflows() {
+    if ! command -v actionlint >/dev/null 2>&1; then
+        echo "SKIPPED workflow lint: install actionlint (CI runs it; a push can still go red)" >&2
+        return 0
+    fi
+    # actionlint shells out to shellcheck for every `run:` block, and SILENTLY SKIPS
+    # that half when shellcheck is absent -- so it exits 0 either way and the local
+    # run looks identical to CI's. On 2026-09-02 that cost a red `ci-required`: an
+    # SC2035 in release.yml (`sha256sum *.whl`, where an artifact named `-x` becomes
+    # a flag) passed here and failed there. Degrading quietly is the bug; say so.
+    if ! command -v shellcheck >/dev/null 2>&1; then
+        echo "WARNING workflow lint: shellcheck missing -- run: blocks are NOT linted," \
+             "and CI lints them. Install shellcheck to reproduce CI." >&2
+    fi
+    run actionlint
+}
+
 verify_non_unix_cfg() {
     if ! rustup target list --installed 2>/dev/null | grep -q '^x86_64-pc-windows-gnu$'; then
         echo "SKIPPED non-unix cfg check: rustup target add x86_64-pc-windows-gnu" >&2
@@ -198,6 +215,7 @@ case "$tier" in
         run env TRITIUM_CHECK_ONLY=1 cargo clippy --locked --workspace --all-targets \
             --all-features -- -D warnings
         verify_non_unix_cfg
+        verify_workflows
         ;;
     ci)
         run cargo fmt --all --check
