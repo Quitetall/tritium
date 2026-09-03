@@ -6,16 +6,24 @@ measurements say it should, and some are backend adapters that track a moving
 upstream. Freezing all three alike would freeze accidents as if they were design.
 
 This document assigns every published crate to a tier and states what that tier
-promises. It is the answer to a question the codebase previously left implicit —
-`scripts/check-semver.sh` already excluded crates as "the documented evolving 1.x
-tier", but that tier was documented nowhere.
+promises. It is the answer to a question the codebase previously left implicit:
+`scripts/check-semver.sh:12` already excluded `tritium-nn` and `tritium-train`
+as "the documented evolving 1.x tier" — a tier that was documented nowhere.
 
 ## Status of this document
 
 Tiers are declared here as of 2026-09-03 and are being applied incrementally.
-The current measured surface is 130 public enums and 240 pub-field structs
-without `#[non_exhaustive]`; the sealing pass runs Tier 1 first. Until a crate's
-header states its tier, treat this table as the authority.
+Until a crate's header states its tier, treat this table as the authority.
+
+The starting surface was measured on 2026-09-03 by walking every `pub enum` and
+`pub struct` under `crates/*/src/**` and checking whether `#[non_exhaustive]`
+appears in the attribute block immediately preceding it: **130 public enums and
+240 public structs with public fields carry no seal.** Treat that as an upper
+bound — it counts definitions, and some sit in private modules where they are not
+reachable from outside the crate. Sixty of the 130 unsealed enums live in
+`tritium-cuda`, `tritium-nn`, `tritium-train` and `tritium-serve` — the four
+crates the semver gate has historically excluded, so nothing has been watching
+them. The sealing pass runs Tier 1 first.
 
 ## The tiers
 

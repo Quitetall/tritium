@@ -20,6 +20,12 @@ exact candidate manifest at one exact `source_revision`, and no single revision
 comes close to satisfying a gate set. Read it as an upper bound on progress.
 
 **13 of the 38 evidence kinds have ever been produced anywhere. 25 have not.**
+The 13 produced are `api-signature`, `clean-install`, `crate-archive`,
+`cuda-training`, `estimator-validation`, `export-reload`, `frontend-lifecycle`,
+`installed-qat-tutorial`, `npm-archive`, `observability`, `source-admission`,
+`torch-dispatch-cuda` and `torch-dispatch-overhead`. The 25 that are not appear
+in the "Missing kinds" column below; the two lists sum to the 38 that `GATES`
+requires.
 
 | Gate | Status | Missing kinds | What the missing kinds require |
 |---|---|---|---|
@@ -36,10 +42,13 @@ comes close to satisfying a gate set. Read it as an upper bound on progress.
 | `zoo-community` | NONE | `model-zoo`, `generated-claims`, `governance-docs` | Claims and governance are document-derived and reachable now. `model-zoo` needs all four frozen entries, including the flagship. |
 | `reproduction-signoff` | NONE | `second-machine`, `independent-review` | A second machine, plus a reviewer whose identity differs from the reproduction operator. |
 
-Reachable on this hardware, with no new dependency: `generated-claims`,
-`governance-docs`, the four OCI legs, and `refinement`/`baseline-ablation`.
-Blocked on the in-flight conversion: `flagship-qwen`, `stage7-freeze`, `onnx`,
-and `model-zoo`. Blocked on hardware or people this project does not have:
+Reachable on this hardware **now**, needing neither new hardware nor the in-flight
+conversion: `generated-claims`, `governance-docs`, and the four OCI legs.
+Reachable on this hardware but **queued behind** the conversion, which is holding
+roughly fourteen cores: `refinement` and `baseline-ablation` — no new dependency,
+but they cannot complete until the CPU is free. Blocked on the conversion's
+*output*: `flagship-qwen`, `stage7-freeze`, `onnx`, and `model-zoo`. Blocked on
+hardware or people this project does not have:
 `distributed-training` (≥2 GPUs), `browser-conformance` (browsers),
 `serving-deployment-*` (Kubernetes), `compatibility-matrix` (cross-platform wheel
 builds), and `reproduction-signoff` (a second machine and a second person).
