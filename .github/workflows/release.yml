@@ -86,7 +86,8 @@ jobs:
         run: |
           set -euo pipefail
           cd staged
-          sha256sum *.whl *.json > SHA256SUMS
+          # `--` so an artifact whose name begins with a dash is a file, not a flag.
+          sha256sum -- *.whl *.json > SHA256SUMS
           cat SHA256SUMS
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v5.0.0
         with:
