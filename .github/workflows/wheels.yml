@@ -22,6 +22,15 @@ on:
   # calls it via workflow_call. Keeping both triggers would build the whole
   # matrix twice on every release, and publish from whichever finished first.
   workflow_call:
+    inputs:
+      build_cuda:
+        description: >-
+          Build and execute the CUDA 13 wheel. Requires a registered
+          [self-hosted, linux, x64, cuda, sm89] runner; without one the job
+          queues forever and every downstream release job waits on it.
+        required: false
+        type: boolean
+        default: false
   pull_request:
     # Build-only smoke: a release (or dispatch) builds the full matrix; on PRs we
     # keep the packaging path honest without running it on every commit to main.
@@ -438,9 +447,13 @@ jobs:
 
   cuda-wheel-smoke:
     name: Linux CUDA 13 wheel · Torch 2.11 · Python 3.13 · sm_89
-    if: >-
-      startsWith(github.ref, 'refs/tags/v') ||
-      (github.event_name == 'workflow_dispatch' && inputs.build_cuda)
+    # Opt-in only. This used to fire on any tag, which meant a release requested a
+    # self-hosted sm89 runner -- and no self-hosted runner is registered on this
+    # repository at all. A queued job is not a failed job: `build` would never
+    # complete, so collect/pypi/github-release/crates would never start and the
+    # release would hang rather than fail. `inputs.build_cuda` covers both the
+    # dispatch input and the workflow_call input above.
+    if: ${{ inputs.build_cuda }}
     runs-on: [self-hosted, linux, x64, cuda, sm89]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
