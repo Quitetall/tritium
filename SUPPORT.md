@@ -50,7 +50,7 @@ same ones, not a second build that resembles them.
 |---|---|---|
 | PyPI | `tritium-torch` | trusted publishing (OIDC) — no token stored |
 | GitHub Releases | wheels, SBOMs, `SHA256SUMS`, provenance attestation | `GITHUB_TOKEN` |
-| crates.io | 23 crates | `CARGO_REGISTRY_TOKEN` repo secret — **dormant until set** |
+| crates.io | 23 crates | trusted publishing (OIDC), or `CARGO_REGISTRY_TOKEN` — **dormant until one exists** |
 
 A tag whose wheels do not carry its version fails the release before anything is
 published, so a wheel built from the wrong tree cannot ship under a tag.
@@ -72,6 +72,24 @@ publisher:
 Then create the `pypi` environment under repository *Settings → Environments*. Scope
 the publisher to it; that environment is also where a manual approval gate goes if
 releases should require a second pair of eyes.
+
+### crates.io: trusted publishing or a token
+
+The release job prefers **trusted publishing** — `rust-lang/crates-io-auth-action`
+mints a token that lives only for that job, so nothing long-lived is stored. It is
+configured **per crate**, and this workspace publishes 23 of them, so a stored
+token remains supported rather than making OIDC an all-or-nothing migration.
+
+*Preferred* — on each crate's Settings → Trusted Publishing on crates.io, add a
+GitHub publisher with repository `Quitetall/tritium`, workflow `release.yml`,
+environment `crates-io`.
+
+*Or* — set a single `CARGO_REGISTRY_TOKEN` repository secret. Simpler to set up,
+but it is a long-lived credential with publish rights to every crate; scope it to
+the crates it needs and rotate it on a schedule.
+
+If both exist, OIDC wins. If neither does, the job reports that it skipped and the
+release still succeeds.
 
 ### Re-running a failed publish
 

@@ -175,6 +175,9 @@ jobs:
       url: https://crates.io/crates/tritium-core
     permissions:
       contents: read
+      # Required to mint the trusted-publishing token below. Without it the OIDC
+      # step fails and the job silently falls back to the stored secret.
+      id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -182,18 +185,33 @@ jobs:
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           toolchain: 1.98.0
-      # Dormant until a token exists. `secrets` is not available to a job-level
-      # `if:`, so the guard is a step: the job goes green having published nothing,
-      # rather than failing every release until crates.io is wired up.
+      # Preferred: crates.io trusted publishing. Mints a token that lives for the
+      # length of this job, so nothing long-lived is stored. It is configured per
+      # crate, and this workspace publishes 23 of them -- so a stored token stays
+      # supported rather than making OIDC an all-or-nothing migration.
+      - name: mint a short-lived crates.io token (OIDC)
+        id: auth
+        continue-on-error: true
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+      # Dormant until ONE of the two exists. `secrets` is not available to a
+      # job-level `if:`, so the guard is a step: the job goes green having published
+      # nothing, rather than failing every release until crates.io is wired up.
       - name: publish all crates in dependency order
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          OIDC_TOKEN: ${{ steps.auth.outputs.token }}
+          SECRET_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
-          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
-            echo "::notice::CARGO_REGISTRY_TOKEN is not set - skipping crates.io."
-            echo "Add it as a repository secret to enable this job."
+          if [ -n "${OIDC_TOKEN:-}" ]; then
+            echo "::notice::publishing with a short-lived trusted-publishing token"
+            export CARGO_REGISTRY_TOKEN="$OIDC_TOKEN"
+          elif [ -n "${SECRET_TOKEN:-}" ]; then
+            echo "::notice::publishing with the stored CARGO_REGISTRY_TOKEN secret"
+            export CARGO_REGISTRY_TOKEN="$SECRET_TOKEN"
+          else
+            echo "::notice::no crates.io credential - skipping. Register a trusted"
+            echo "publisher (preferred) or set the CARGO_REGISTRY_TOKEN secret."
             exit 0
           fi
           scripts/publish-crates.sh
