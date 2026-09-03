@@ -99,7 +99,7 @@ def validate_direct_url(document: object, wheel: Path, digest: str) -> None:
 def installed_distribution_identity(
     wheel: Path, digest: str
 ) -> tuple[str, frozenset[Path]]:
-    distribution = importlib.metadata.distribution("tritium-torch")
+    distribution = importlib.metadata.distribution("pytritium")
     direct_url = distribution.read_text("direct_url.json")
     if direct_url is None:
         raise SmokeError("installed distribution lacks direct_url.json")
@@ -108,7 +108,7 @@ def installed_distribution_identity(
     except json.JSONDecodeError as error:
         raise SmokeError("installed distribution has invalid direct_url.json") from error
     validate_direct_url(document, wheel, digest)
-    match = re.fullmatch(r"tritium_torch-([^-]+)-cp39-abi3-[^-]+\.whl", wheel.name)
+    match = re.fullmatch(r"pytritium-([^-]+)-cp39-abi3-[^-]+\.whl", wheel.name)
     if match is None or match.group(1) != distribution.version:
         raise SmokeError("installed distribution version does not match candidate wheel")
     if distribution.files is None:

@@ -38,7 +38,7 @@ def junit(names: tuple[str, ...]) -> str:
 
 def fixture(root: Path) -> tuple[Path, Path, dict[str, object]]:
     root.mkdir(parents=True, exist_ok=True)
-    wheel = root / "tritium_torch-1.1.0rc0-cp39-abi3-linux_x86_64.whl"
+    wheel = root / "pytritium-1.1.0rc0-cp39-abi3-linux_x86_64.whl"
     wheel.write_bytes(b"wheel")
     source = root / "test_torch_dispatch.py"
     source.write_text("def test_native_cuda(): pass\n", encoding="utf-8")

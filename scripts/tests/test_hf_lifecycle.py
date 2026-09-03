@@ -26,7 +26,7 @@ class HuggingFaceLifecycleWorkflowTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertNotIn("sys.path", source)
         self.assertNotIn("PYTHONPATH", source)
-        self.assertIn('distribution("tritium-torch")', source)
+        self.assertIn('distribution("pytritium")', source)
         self.assertIn("AutoModelForCausalLM.from_pretrained", source)
         self.assertIn("safe_serialization=True", source)
 

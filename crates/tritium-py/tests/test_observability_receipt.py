@@ -127,11 +127,11 @@ def _write_wheel(path: Path) -> dict[str, object]:
         "tritium/torch/_wheel_identity.py": b"# wheel identity\n",
         "tritium/torch/qualify_observability.py": b"# worker\n",
         "tritium/torch/observability_receipt.py": b"# validator\n",
-        "tritium_torch-1.1.0rc0.dist-info/METADATA": (
-            b"Metadata-Version: 2.4\nName: tritium-torch\nVersion: 1.1.0rc0\n\n"
+        "pytritium-1.1.0rc0.dist-info/METADATA": (
+            b"Metadata-Version: 2.4\nName: pytritium\nVersion: 1.1.0rc0\n\n"
         ),
     }
-    record_name = "tritium_torch-1.1.0rc0.dist-info/RECORD"
+    record_name = "pytritium-1.1.0rc0.dist-info/RECORD"
     rows = []
     for name, payload in files.items():
         digest = base64.urlsafe_b64encode(hashlib.sha256(payload).digest()).rstrip(b"=")
@@ -194,7 +194,7 @@ def _otel() -> dict[str, object]:
 
 
 def _receipt(root: Path) -> tuple[Path, Path, dict[str, object]]:
-    wheel = root / "tritium_torch-1.1.0rc0-cp313-abi3-manylinux.whl"
+    wheel = root / "pytritium-1.1.0rc0-cp313-abi3-manylinux.whl"
     installed = _write_wheel(wheel)
     telemetry = root / "telemetry"
     (telemetry / "tensorboard").mkdir(parents=True)

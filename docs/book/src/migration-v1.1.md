@@ -82,7 +82,7 @@ copied into an application.
 
 ## Python: distribution rename, stable import
 
-v1.0 used the distribution name `tritium`. v1.1 uses `tritium-torch` so the
+v1.0 used the distribution name `tritium`. v1.1 uses `pytritium` so the
 published project name describes the integration and avoids claiming the
 generic package name. The import namespace remains `tritium`.
 
@@ -92,7 +92,7 @@ distributions owning the same import package are not a supported environment:
 ```sh
 python -m pip show tritium
 python -m pip uninstall -y tritium
-TRITIUM_WHEEL=./dist/exact-digest-bound-tritium-torch-wheel.whl
+TRITIUM_WHEEL=./dist/exact-digest-bound-pytritium-wheel.whl
 python -m pip install "$TRITIUM_WHEEL"
 python -c "import tritium; print(tritium.compiled_backends())"
 ```
@@ -218,7 +218,7 @@ fixes but may change before `1.1.0`. See [Support and version policy](../../../S
 
 ## Migration checklist
 
-- Remove the old Python distribution before installing `tritium-torch`.
+- Remove the old Python distribution before installing `pytritium`.
 - Verify one exact candidate artifact digest and candidate source revision.
 - Run the stable Rust SemVer gate against `v1.0.0` if consuming frozen crates.
 - Recompile and review diffs for every evolving-tier Rust crate you consume.

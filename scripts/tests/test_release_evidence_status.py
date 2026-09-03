@@ -1513,7 +1513,7 @@ class ReleaseEvidenceStatusTests(unittest.TestCase):
             }
             for target, (_, _, platform_tag) in platforms.items():
                 wheel = candidate.parent / (
-                    f"tritium_torch-1.1.0rc0-cp39-abi3-{platform_tag}.whl"
+                    f"pytritium-1.1.0rc0-cp39-abi3-{platform_tag}.whl"
                 )
                 wheel.write_bytes(target.encode())
                 identity = (wheel.name, sha256(wheel), wheel.stat().st_size)

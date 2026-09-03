@@ -30,7 +30,7 @@ def _cache(hits: int) -> dict[str, int]:
 
 
 def fixture(root: Path, *, wrapper_ratio: float = 1.04):
-    wheel = root / "tritium_torch-1.1.0rc0-cp39-abi3-linux_x86_64.whl"
+    wheel = root / "pytritium-1.1.0rc0-cp39-abi3-linux_x86_64.whl"
     wheel.write_bytes(b"exact wheel bytes")
     cases = []
     for ordinal, policy in enumerate(MODULE["POLICY_CASES"]):

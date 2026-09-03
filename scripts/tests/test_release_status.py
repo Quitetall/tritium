@@ -59,7 +59,7 @@ def fixture(root: Path) -> tuple[Path, Path, dict]:
     artifact = candidate_root / "wheel.whl"
     artifact.write_bytes(b"wheel bytes")
     sha256 = hashlib.sha256(artifact.read_bytes()).hexdigest()
-    artifact_id = "tritium-torch-linux-cpu"
+    artifact_id = "pytritium-linux-cpu"
     sbom_sha = write_json(
         candidate_root / "wheel.cdx.json",
         {

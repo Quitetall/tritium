@@ -120,7 +120,7 @@ def _artifact(value: Any, wheel: Path) -> dict[str, Any]:
     if record["kind"] != "python-wheel" or record["name"] != wheel.name:
         raise ReceiptError("receipt artifact does not identify qualified wheel")
     match = re.fullmatch(
-        r"tritium_torch-([^-]+)-cp39-abi3-[^-]+\.whl", wheel.name
+        r"pytritium-([^-]+)-cp39-abi3-[^-]+\.whl", wheel.name
     )
     if match is None:
         raise ReceiptError("qualified wheel filename is not canonical Tritium abi3")

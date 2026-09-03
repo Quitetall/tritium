@@ -35,16 +35,16 @@ def build_wheel(
     files = {
         "tritium/__init__.py": b"from . import _tritium\n",
         native_name: b"native-placeholder",
-        "tritium_torch-1.1.0rc1.dist-info/METADATA": (
-            b"Metadata-Version: 2.3\nName: tritium-torch\nVersion: 1.1.0rc1\n"
+        "pytritium-1.1.0rc1.dist-info/METADATA": (
+            b"Metadata-Version: 2.3\nName: pytritium\nVersion: 1.1.0rc1\n"
         ),
-        "tritium_torch-1.1.0rc1.dist-info/WHEEL": (
+        "pytritium-1.1.0rc1.dist-info/WHEEL": (
             f"Wheel-Version: 1.0\nRoot-Is-Purelib: false\nTag: cp39-abi3-{platform_tag}\n".encode()
         ),
     }
     if extra:
         files.update(extra)
-    record_name = "tritium_torch-1.1.0rc1.dist-info/RECORD"
+    record_name = "pytritium-1.1.0rc1.dist-info/RECORD"
     rows = []
     for name, payload in files.items():
         encoded = digest(payload, hash_algorithm)
@@ -63,7 +63,7 @@ def build_wheel(
 class VerifyWheelTests(unittest.TestCase):
     def test_valid_abi3_wheel_passes(self):
         with tempfile.TemporaryDirectory() as raw:
-            wheel = Path(raw) / "tritium_torch-1.1.0rc1-cp39-abi3-linux_x86_64.whl"
+            wheel = Path(raw) / "pytritium-1.1.0rc1-cp39-abi3-linux_x86_64.whl"
             build_wheel(wheel)
             result = MODULE.inspect_wheel(wheel, "1.1.0rc1")
             self.assertEqual(result["platform_tag"], "linux_x86_64")
@@ -71,35 +71,35 @@ class VerifyWheelTests(unittest.TestCase):
 
     def test_record_corruption_fails(self):
         with tempfile.TemporaryDirectory() as raw:
-            wheel = Path(raw) / "tritium_torch-1.1.0rc1-cp39-abi3-linux_x86_64.whl"
+            wheel = Path(raw) / "pytritium-1.1.0rc1-cp39-abi3-linux_x86_64.whl"
             build_wheel(wheel, corrupt_record=True)
             with self.assertRaisesRegex(MODULE.WheelError, "RECORD hash mismatch"):
                 MODULE.inspect_wheel(wheel, "1.1.0rc1")
 
     def test_source_residue_fails(self):
         with tempfile.TemporaryDirectory() as raw:
-            wheel = Path(raw) / "tritium_torch-1.1.0rc1-cp39-abi3-linux_x86_64.whl"
+            wheel = Path(raw) / "pytritium-1.1.0rc1-cp39-abi3-linux_x86_64.whl"
             build_wheel(wheel, extra={"src/lib.rs": b"fn main() {}"})
             with self.assertRaisesRegex(MODULE.WheelError, "source/build residue"):
                 MODULE.inspect_wheel(wheel, "1.1.0rc1")
 
     def test_parent_traversal_member_fails(self):
         with tempfile.TemporaryDirectory() as raw:
-            wheel = Path(raw) / "tritium_torch-1.1.0rc1-cp39-abi3-linux_x86_64.whl"
+            wheel = Path(raw) / "pytritium-1.1.0rc1-cp39-abi3-linux_x86_64.whl"
             build_wheel(wheel, extra={"../escape": b"payload"})
             with self.assertRaisesRegex(MODULE.WheelError, "unsafe wheel member"):
                 MODULE.inspect_wheel(wheel, "1.1.0rc1")
 
     def test_absolute_member_fails(self):
         with tempfile.TemporaryDirectory() as raw:
-            wheel = Path(raw) / "tritium_torch-1.1.0rc1-cp39-abi3-linux_x86_64.whl"
+            wheel = Path(raw) / "pytritium-1.1.0rc1-cp39-abi3-linux_x86_64.whl"
             build_wheel(wheel, extra={"/escape": b"payload"})
             with self.assertRaisesRegex(MODULE.WheelError, "unsafe wheel member"):
                 MODULE.inspect_wheel(wheel, "1.1.0rc1")
 
     def test_symlink_member_fails(self):
         with tempfile.TemporaryDirectory() as raw:
-            wheel = Path(raw) / "tritium_torch-1.1.0rc1-cp39-abi3-linux_x86_64.whl"
+            wheel = Path(raw) / "pytritium-1.1.0rc1-cp39-abi3-linux_x86_64.whl"
             build_wheel(wheel)
             link = zipfile.ZipInfo("tritium/link")
             link.create_system = 3
@@ -111,21 +111,21 @@ class VerifyWheelTests(unittest.TestCase):
 
     def test_weak_record_hash_fails(self):
         with tempfile.TemporaryDirectory() as raw:
-            wheel = Path(raw) / "tritium_torch-1.1.0rc1-cp39-abi3-linux_x86_64.whl"
+            wheel = Path(raw) / "pytritium-1.1.0rc1-cp39-abi3-linux_x86_64.whl"
             build_wheel(wheel, hash_algorithm="md5")
             with self.assertRaisesRegex(MODULE.WheelError, "SHA-256 or stronger"):
                 MODULE.inspect_wheel(wheel, "1.1.0rc1")
 
     def test_split_dist_info_fails(self):
         with tempfile.TemporaryDirectory() as raw:
-            wheel = Path(raw) / "tritium_torch-1.1.0rc1-cp39-abi3-linux_x86_64.whl"
+            wheel = Path(raw) / "pytritium-1.1.0rc1-cp39-abi3-linux_x86_64.whl"
             build_wheel(wheel, extra={"other-1.0.dist-info/WHEEL": b"Wheel-Version: 1.0\n"})
             with self.assertRaisesRegex(MODULE.WheelError, "only canonical dist-info"):
                 MODULE.inspect_wheel(wheel, "1.1.0rc1")
 
     def test_windows_plain_pyd_is_accepted(self):
         with tempfile.TemporaryDirectory() as raw:
-            wheel = Path(raw) / "tritium_torch-1.1.0rc1-cp39-abi3-win_amd64.whl"
+            wheel = Path(raw) / "pytritium-1.1.0rc1-cp39-abi3-win_amd64.whl"
             build_wheel(
                 wheel,
                 native_name="tritium/_tritium.pyd",
@@ -137,7 +137,7 @@ class VerifyWheelTests(unittest.TestCase):
     def test_filename_version_must_match(self):
         with tempfile.TemporaryDirectory() as raw:
             # Deliberate mismatch: rc0-named file vs the rc1 expectation.
-            wheel = Path(raw) / "tritium_torch-1.1.0rc0-cp39-abi3-linux_x86_64.whl"
+            wheel = Path(raw) / "pytritium-1.1.0rc0-cp39-abi3-linux_x86_64.whl"
             build_wheel(wheel)
             with self.assertRaisesRegex(MODULE.WheelError, "filename version"):
                 MODULE.inspect_wheel(wheel, "1.1.0rc1")
@@ -188,7 +188,7 @@ class VerifyWheelTests(unittest.TestCase):
 
     def test_required_platform_tag_fails_closed(self):
         with tempfile.TemporaryDirectory() as raw:
-            wheel = Path(raw) / "tritium_torch-1.1.0rc1-cp39-abi3-linux_x86_64.whl"
+            wheel = Path(raw) / "pytritium-1.1.0rc1-cp39-abi3-linux_x86_64.whl"
             build_wheel(wheel)
             stderr = io.StringIO()
             with mock.patch.object(

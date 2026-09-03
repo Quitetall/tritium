@@ -44,7 +44,7 @@ class ObservabilityQualificationTests(unittest.TestCase):
         self.assertNotIn("sys.path", source)
         self.assertNotIn("PYTHONPATH", source)
         self.assertNotIn("allow-source", source)
-        self.assertIn('distribution("tritium-torch")', source)
+        self.assertIn('distribution("pytritium")', source)
         self.assertIn('mode="offline"', source)
         self.assertIn("compiler_absent", source)
         self.assertIn("repository_absent", source)

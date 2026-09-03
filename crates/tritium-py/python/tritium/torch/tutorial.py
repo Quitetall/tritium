@@ -241,7 +241,7 @@ def run_smollm2_release_demo(
         "passed": True,
         "model_id": model_id,
         "source_revision": revision,
-        "distribution_version": importlib.metadata.version("tritium-torch"),
+        "distribution_version": importlib.metadata.version("pytritium"),
         "device": device,
         "elapsed_seconds_excluding_download": elapsed,
         "max_seconds": max_seconds,

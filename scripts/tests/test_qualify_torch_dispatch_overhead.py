@@ -52,8 +52,8 @@ class _Distribution:
         return self.root / str(logical)
 
 
-def _wheel_fixture(root: Path, *, name: str = "tritium-torch"):
-    dist_info = "tritium_torch-1.1.0rc0.dist-info/"
+def _wheel_fixture(root: Path, *, name: str = "pytritium"):
+    dist_info = "pytritium-1.1.0rc0.dist-info/"
     payloads = {
         "tritium/__init__.py": b"package",
         "tritium/extra.py": b"complete inventory sentinel",
@@ -80,7 +80,7 @@ def _wheel_fixture(root: Path, *, name: str = "tritium-torch"):
     record = io.StringIO()
     csv.writer(record, lineterminator="\n").writerows(rows)
     payloads[record_name] = record.getvalue().encode()
-    wheel = root / "tritium_torch-1.1.0rc0-cp39-abi3-linux_x86_64.whl"
+    wheel = root / "pytritium-1.1.0rc0-cp39-abi3-linux_x86_64.whl"
     with zipfile.ZipFile(wheel, "w") as archive:
         for logical, payload in payloads.items():
             archive.writestr(logical, payload)
