@@ -14,7 +14,7 @@ QualificationError = MODULE["QualificationError"]
 
 
 def fixture(root: Path):
-    wheel = root / "tritium_torch-1.1.0rc0-py3-none-any.whl"
+    wheel = root / "pytritium-1.1.0rc0-py3-none-any.whl"
     wheel.write_bytes(b"candidate-wheel")
     wheel_sha256 = hashlib.sha256(wheel.read_bytes()).hexdigest()
     candidate = root / "manifest.json"

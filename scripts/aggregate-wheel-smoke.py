@@ -126,7 +126,7 @@ def _validate_cell(value: dict[str, object], revision: str, path: Path) -> str:
     wheel = _string(value["wheel"], f"{path.name}.wheel")
     candidate_version = _string(value["version"], f"{path.name}.version")
     wheel_match = re.fullmatch(
-        r"tritium_torch-(?P<version>[^-]+)-cp39-abi3-(?P<platform>[^-]+)\.whl", wheel
+        r"pytritium-(?P<version>[^-]+)-cp39-abi3-(?P<platform>[^-]+)\.whl", wheel
     )
     if wheel_match is None or wheel_match.group("platform") != platform_tag:
         raise AggregateError(f"{path.name} wheel filename does not bind its platform tag")
@@ -262,7 +262,7 @@ def validate_receipt(
             raise AggregateError("compatibility receipt target/cell identity mismatch")
         platform_pattern = TARGET_CONTRACTS[target][2]
         wheel_match = re.fullmatch(
-            r"tritium_torch-(?P<version>[^-]+)-cp39-abi3-(?P<platform>[^-]+)\.whl",
+            r"pytritium-(?P<version>[^-]+)-cp39-abi3-(?P<platform>[^-]+)\.whl",
             wheel,
         )
         if (

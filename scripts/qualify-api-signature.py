@@ -76,7 +76,7 @@ from urllib.parse import unquote, urlparse
 wheel, revision, release, run_id, forbidden = sys.argv[1:]
 wheel = Path(wheel).resolve(strict=True)
 forbidden = Path(forbidden).resolve(strict=True)
-dist = importlib.metadata.distribution("tritium-torch")
+dist = importlib.metadata.distribution("pytritium")
 files = dist.files
 if files is None:
     raise RuntimeError("installed distribution has no file inventory")

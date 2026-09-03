@@ -16,7 +16,7 @@
 # out rate limits instead of aborting, and skips versions that are already
 # live so the script is resumable after any interruption.
 #
-# Excluded: tritium-py (PyPI is its registry: tritium-torch wheels),
+# Excluded: tritium-py (PyPI is its registry: pytritium wheels),
 # tritium-benches (publish = false).
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."

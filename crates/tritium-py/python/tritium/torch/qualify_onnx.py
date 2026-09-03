@@ -534,7 +534,7 @@ def run(
         "torch": torch.__version__,
         "onnx": onnx.__version__,
         "onnxruntime": onnxruntime.__version__,
-        "tritium_distribution": importlib.metadata.version("tritium-torch"),
+        "tritium_distribution": importlib.metadata.version("pytritium"),
         "repository_absent": repository_absent,
         "compiler_absent": compiler_absent,
     }

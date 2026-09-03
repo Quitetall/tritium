@@ -18,7 +18,7 @@ def _rehash(receipt):
 
 class InstalledQatTutorialReceiptTests(unittest.TestCase):
     def _run(self, root: Path):
-        wheel = root / "tritium_torch-1.1.0rc0-cp39-abi3-linux_x86_64.whl"
+        wheel = root / "pytritium-1.1.0rc0-cp39-abi3-linux_x86_64.whl"
         wheel.write_bytes(b"exact candidate wheel")
         output = root / "tutorial"
         receipt = run_installed_qat_tutorial(

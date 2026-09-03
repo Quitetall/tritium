@@ -31,10 +31,10 @@ unmanifested file.
   },
   "artifacts": [
     {
-      "id": "tritium-torch-linux-cpu",
+      "id": "pytritium-linux-cpu",
       "kind": "python-wheel",
-      "path": "tritium_torch-1.1.0rc1-cp39-abi3-manylinux_2_28_x86_64.whl",
-      "sbom": "tritium-torch-linux-cpu.cdx.json"
+      "path": "pytritium-1.1.0rc1-cp39-abi3-manylinux_2_28_x86_64.whl",
+      "sbom": "pytritium-linux-cpu.cdx.json"
     }
   ]
 }

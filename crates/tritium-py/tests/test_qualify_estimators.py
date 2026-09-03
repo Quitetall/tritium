@@ -10,13 +10,13 @@ from tritium.torch import qualify_estimators as worker  # noqa: E402
 
 
 def test_worker_executes_complete_catalog_and_plugin_contract(tmp_path, monkeypatch):
-    wheel = tmp_path / "tritium_torch-1.1.0rc0-py3-none-any.whl"
+    wheel = tmp_path / "pytritium-1.1.0rc0-py3-none-any.whl"
     wheel.write_bytes(b"candidate-wheel")
     monkeypatch.setattr(
         worker.importlib.metadata,
         "version",
         lambda distribution: "1.1.0rc0"
-        if distribution == "tritium-torch"
+        if distribution == "pytritium"
         else pytest.fail(f"unexpected distribution lookup: {distribution}"),
     )
 

@@ -29,15 +29,15 @@ from .tutorial_receipt import (
 
 def _installed_distribution() -> tuple[str, Path]:
     try:
-        distribution = importlib.metadata.distribution("tritium-torch")
+        distribution = importlib.metadata.distribution("pytritium")
     except importlib.metadata.PackageNotFoundError as error:
-        raise RuntimeError("qualification requires installed tritium-torch") from error
+        raise RuntimeError("qualification requires installed pytritium") from error
     module = Path(tritium.__file__).resolve(strict=True)
     if distribution.files is None:
-        raise RuntimeError("installed tritium-torch has no file inventory")
+        raise RuntimeError("installed pytritium has no file inventory")
     owned = {distribution.locate_file(item).resolve() for item in distribution.files}
     if module not in owned:
-        raise RuntimeError("imported tritium package is not owned by tritium-torch")
+        raise RuntimeError("imported tritium package is not owned by pytritium")
     return distribution.version, module
 
 

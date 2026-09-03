@@ -26,13 +26,13 @@ from email.parser import Parser
 from pathlib import Path, PurePosixPath
 
 
-DIST_NAME = "tritium-torch"
-WHEEL_DIST_NAME = "tritium_torch"
+DIST_NAME = "pytritium"
+WHEEL_DIST_NAME = "pytritium"
 FORBIDDEN_SUFFIXES = (".c", ".cc", ".cpp", ".h", ".hpp", ".pyc", ".rs")
 FORBIDDEN_PARTS = {".git", "__pycache__", "target"}
 NATIVE_RE = re.compile(r"^tritium/_tritium(?:\.abi3\.(?:so|dylib|pyd)|\.pyd)$")
 FILENAME_RE = re.compile(
-    r"^tritium_torch-(?P<version>[^-]+)-cp39-abi3-(?P<platform>[^-]+)\.whl$"
+    r"^pytritium-(?P<version>[^-]+)-cp39-abi3-(?P<platform>[^-]+)\.whl$"
 )
 
 
@@ -154,7 +154,7 @@ def _verify_record(
 def inspect_wheel(path: Path, expected_version: str) -> dict[str, object]:
     match = FILENAME_RE.fullmatch(path.name)
     if match is None:
-        raise WheelError("wheel filename must be tritium_torch-VERSION-cp39-abi3-PLATFORM.whl")
+        raise WheelError("wheel filename must be pytritium-VERSION-cp39-abi3-PLATFORM.whl")
     if match.group("version") != expected_version:
         raise WheelError(
             f"wheel filename version {match.group('version')!r} != {expected_version!r}"

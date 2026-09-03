@@ -18,22 +18,22 @@ class GenerateWheelSbomTests(unittest.TestCase):
     def test_sbom_binds_wheel_files_and_declared_dependencies(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
-            wheel = root / "tritium_torch-1.1.0rc1-cp39-abi3-linux_x86_64.whl"
+            wheel = root / "pytritium-1.1.0rc1-cp39-abi3-linux_x86_64.whl"
             build_wheel(
                 wheel,
                 extra={
-                    "tritium_torch-1.1.0rc1.dist-info/METADATA": (
-                        b"Metadata-Version: 2.3\nName: tritium-torch\n"
+                    "pytritium-1.1.0rc1.dist-info/METADATA": (
+                        b"Metadata-Version: 2.3\nName: pytritium\n"
                         b"Version: 1.1.0rc1\nRequires-Dist: torch>=2.11\n"
                     )
                 },
             )
-            first = generate(wheel, "tritium-torch-linux-cpu")
-            second = generate(wheel, "tritium-torch-linux-cpu")
+            first = generate(wheel, "pytritium-linux-cpu")
+            second = generate(wheel, "pytritium-linux-cpu")
             self.assertEqual(first, second)
             self.assertEqual(
                 first["metadata"]["component"]["bom-ref"],
-                "tritium-torch-linux-cpu",
+                "pytritium-linux-cpu",
             )
             names = {component["name"] for component in first["components"]}
             self.assertIn("torch", names)
@@ -60,7 +60,7 @@ class GenerateWheelSbomTests(unittest.TestCase):
     def test_invalid_artifact_id_and_corrupt_wheel_fail_closed(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
-            wheel = root / "tritium_torch-1.1.0rc1-cp39-abi3-linux_x86_64.whl"
+            wheel = root / "pytritium-1.1.0rc1-cp39-abi3-linux_x86_64.whl"
             build_wheel(wheel, corrupt_record=True)
             with self.assertRaisesRegex(SbomError, "lowercase"):
                 generate(wheel, "Uppercase")

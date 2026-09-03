@@ -102,7 +102,7 @@ jobs:
           done
           # Every platform, or none. A partial set publishes a release that fails to
           # install on the platforms whose wheel silently went missing -- which is
-          # exactly how tritium-torch 1.1.0rc1 shipped Linux-only.
+          # exactly how pytritium 1.1.0rc1 shipped Linux-only.
           missing=""
           for plat in manylinux_2_28_x86_64 macosx_11_0_arm64 win_amd64; do
             ls staged/*-"$plat".whl >/dev/null 2>&1 || missing="$missing $plat"
@@ -134,7 +134,7 @@ jobs:
     # approval gate can be added without touching this file.
     environment:
       name: pypi
-      url: https://pypi.org/project/tritium-torch/
+      url: https://pypi.org/project/pytritium/
     permissions:
       # OIDC only. No PyPI token is stored in this repository.
       id-token: write

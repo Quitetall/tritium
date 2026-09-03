@@ -1,6 +1,6 @@
 # tritium-py
 
-PyO3 bindings for the tritium-torch Python package.
+PyO3 bindings for the pytritium Python package.
 
 Part of [Tritium](https://github.com/Quitetall/tritium) — Apache-2.0 infrastructure for
 quantizing, training, and serving additive-ternary ({-1, 0, +1}) neural networks with
