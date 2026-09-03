@@ -6,6 +6,12 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 readme = "README.md"
+# NOT a crates.io crate. It ships to PyPI as a wheel; the Rust crate is only the
+# extension module inside it. publish-crates.sh excluded it by omitting it from
+# ORDER -- an exclusion that lives in a different file and holds only as long as
+# nobody types `cargo publish -p tritium-py`. crates.io versions can be yanked but
+# never deleted, so one such command permanently squats the name.
+publish = false
 repository.workspace = true
 authors.workspace = true
 keywords.workspace = true

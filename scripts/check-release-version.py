@@ -12,7 +12,15 @@ from pathlib import Path
 from typing import Any
 
 
-RC_PATTERN = re.compile(r"1\.1\.0-rc\.(0|[1-9][0-9]*)")
+# A release version: X.Y.Z, optionally -rc.N. This used to be pinned literally to
+# `1.1.0-rc.N`, which meant the workspace could not hold any other version -- and
+# because this runs inside check-publish.sh, which is in the REQUIRED `publish-check`
+# CI job, tagging the 1.1.0 FINAL release would have turned ci-required red on the
+# release commit itself. A gate that forbids shipping is not a gate.
+RELEASE_PATTERN = re.compile(
+    r"(?P<base>0|[1-9][0-9]*(?:\.(?:0|[1-9][0-9]*)){2})"
+    r"(?:-rc\.(?P<rc>0|[1-9][0-9]*))?"
+)
 
 
 def require_equal(actual: Any, expected: str, label: str) -> None:
@@ -21,8 +29,10 @@ def require_equal(actual: Any, expected: str, label: str) -> None:
 
 
 def candidate_version(value: Any) -> str:
-    if not isinstance(value, str) or RC_PATTERN.fullmatch(value) is None:
-        raise ValueError(f"workspace version {value!r} is not a canonical 1.1.0-rc.N")
+    if not isinstance(value, str) or RELEASE_PATTERN.fullmatch(value) is None:
+        raise ValueError(
+            f"workspace version {value!r} is not a canonical X.Y.Z or X.Y.Z-rc.N"
+        )
     return value
 
 

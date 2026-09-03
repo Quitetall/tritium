@@ -56,7 +56,13 @@ jobs:
           ref: ${{ github.event.inputs.tag || github.ref }}
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v6.0.0
         with:
-          pattern: wheel-*
+          # Named exactly, not `wheel-*`. wheels.yml also uploads
+          # wheel-functional-*, wheel-tutorial-* and wheel-cuda13-* -- evidence
+          # bundles that carry repo-root prefixes, so a glob lands DIRECTORIES in
+          # staged/. `gh release upload` rejects a directory, and the version
+          # assertion and checksums below only walk the top level, so the extra
+          # trees would ship unchecked or break the upload outright.
+          pattern: wheel-{linux-x86_64,macos-aarch64,windows-x64}
           path: staged
           merge-multiple: true
       - name: assert the tag and the artifacts agree
@@ -70,17 +76,42 @@ jobs:
           # wheel built from the wrong tree cannot be released under this tag.
           pep440="$(printf '%s' "$version" | tr -d '-' | sed 's/rc\./rc/')"
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          # Derive the distribution name rather than writing it down. A literal here
+          # would silently stop matching the day the project is renamed, and the
+          # gate would pass by matching nothing.
+          dist="$(python3 -c "
+          import tomllib,pathlib
+          print(tomllib.loads(pathlib.Path('crates/tritium-py/pyproject.toml').read_text())['project']['name'].replace('-','_'))
+          ")"
+          echo "expecting ${dist}-${pep440}-* wheels"
+          # A stray directory means the artifact pattern over-matched; `gh release
+          # upload` rejects directories, and the checks below only walk the top level.
+          for d in staged/*/; do
+            [ -e "$d" ] || continue
+            echo "::error::staged/ contains a directory ($d) - the artifact pattern over-matched"
+            exit 1
+          done
           found=0
           for w in staged/*.whl; do
-            found=1
+            found=$((found + 1))
             base="$(basename "$w")"
             case "$base" in
-              tritium_torch-"$pep440"-*) ;;
-              *) echo "::error::$base does not carry version $pep440 (tag $tag)"; exit 1 ;;
+              "$dist"-"$pep440"-*) ;;
+              *) echo "::error::$base is not ${dist}-${pep440} (tag $tag)"; exit 1 ;;
             esac
           done
-          [ "$found" = 1 ] || { echo "::error::no wheels were produced"; exit 1; }
-          echo "all wheels carry $pep440"
+          # Every platform, or none. A partial set publishes a release that fails to
+          # install on the platforms whose wheel silently went missing -- which is
+          # exactly how tritium-torch 1.1.0rc1 shipped Linux-only.
+          missing=""
+          for plat in manylinux_2_28_x86_64 macosx_11_0_arm64 win_amd64; do
+            ls staged/*-"$plat".whl >/dev/null 2>&1 || missing="$missing $plat"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::missing platform wheels:$missing"; exit 1
+          fi
+          [ "$found" -eq 3 ] || { echo "::error::expected 3 wheels, found $found"; exit 1; }
+          echo "all $found wheels carry ${dist}-${pep440}, every platform present"
       - name: checksums
         shell: bash
         run: |
@@ -149,7 +180,18 @@ jobs:
           subject-path: staged/*.whl
       - name: notes from CHANGELOG
         shell: bash
-        run: python scripts/release-notes.py "${{ needs.collect.outputs.version }}" > NOTES.md
+        run: |
+          set -euo pipefail
+          # A workflow_dispatch re-run checks out the TAG, and tags cut before this
+          # pipeline existed have no release-notes.py -- v1.1.0-rc.1's tree is 320
+          # commits behind main. Fall back to GitHub's generated notes rather than
+          # failing a republish on a script the old tree never contained.
+          if [ -f scripts/release-notes.py ]; then
+            python scripts/release-notes.py "${{ needs.collect.outputs.version }}" > NOTES.md
+          else
+            echo "::notice::this tag predates scripts/release-notes.py; using generated notes"
+            : > NOTES.md
+          fi
       - name: create or update the release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -159,10 +201,13 @@ jobs:
           set -euo pipefail
           prerelease=""
           case "$TAG" in *-rc.*|*-alpha*|*-beta*) prerelease="--prerelease" ;; esac
+          # An empty NOTES.md means the fallback above fired; let GitHub generate them.
+          notes=(--notes-file NOTES.md)
+          [ -s NOTES.md ] || notes=(--generate-notes)
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release edit "$TAG" --notes-file NOTES.md $prerelease
+            gh release edit "$TAG" "${notes[@]}" $prerelease
           else
-            gh release create "$TAG" --title "$TAG" --notes-file NOTES.md $prerelease --verify-tag
+            gh release create "$TAG" --title "$TAG" "${notes[@]}" $prerelease --verify-tag
           fi
           gh release upload "$TAG" staged/* --clobber
 
@@ -210,8 +255,12 @@ jobs:
             echo "::notice::publishing with the stored CARGO_REGISTRY_TOKEN secret"
             export CARGO_REGISTRY_TOKEN="$SECRET_TOKEN"
           else
-            echo "::notice::no crates.io credential - skipping. Register a trusted"
-            echo "publisher (preferred) or set the CARGO_REGISTRY_TOKEN secret."
-            exit 0
+            echo "::error::no crates.io credential. Register a trusted publisher"
+            echo "(preferred) or set the CARGO_REGISTRY_TOKEN secret. Failing rather"
+            echo "than reporting a green release that published nothing."
+            exit 1
           fi
-          scripts/publish-crates.sh
+          # --yes-publish is REQUIRED. Without it publish-crates.sh takes its
+          # dry-run branch, prints "PREFLIGHT OK" and exits 0 -- so the job went
+          # green having uploaded no crate at all, with or without a credential.
+          scripts/publish-crates.sh --yes-publish
