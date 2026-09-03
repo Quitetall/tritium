@@ -7,6 +7,47 @@ every byte and prints `CANDIDATE_EVIDENCE_VALID`. That status does **not** mean
 `LOCAL_RC_READY`; model-zoo, browser, serving, package-matrix, signing and
 second-machine gates remain separate.
 
+## Gate status (measured 2026-09-03)
+
+The twelve gates and their 38 evidence kinds are defined in code, not here —
+`scripts/release-evidence-status.py`, constants `GATES` and `KNOWN_KINDS`. That is
+deliberate: a partial or adversarial registry cannot remove a gate.
+
+The table below is the measured **union** across every local registry under
+`release/v1.1/` (23 registries, 105 receipts). A union is more generous than any
+real report can be: `evaluate()` additionally requires a registry to bind one
+exact candidate manifest at one exact `source_revision`, and no single revision
+comes close to satisfying a gate set. Read it as an upper bound on progress.
+
+**13 of the 38 evidence kinds have ever been produced anywhere. 25 have not.**
+
+| Gate | Status | Missing kinds | What the missing kinds require |
+|---|---|---|---|
+| `qwen-source-admission` | EVIDENCE | — | — |
+| `packages` | PARTIAL | `compatibility-matrix` | Three platform wheels bound by SHA-256 into one candidate. macOS and Windows wheels cannot be produced on this box — needs the CI wheel matrix. |
+| `pytorch-hf` | PARTIAL | `distributed-training` | Two or more GPUs. |
+| `native-backends` | PARTIAL | `backend-manifest`, `performance` | Seven-target training traces. This box supplies CUDA + CPU only. |
+| `estimators-refinement` | PARTIAL | `refinement`, `baseline-ablation` | Local SALT campaign runs. Reachable here once the flagship conversion releases the CPU. |
+| `flagship-qwen` | **IN FLIGHT** | `conversion-refinement`, `quality`, `task-retention`, `runtime`, `physical-bytes` | The pinned Qwen3.6-27B PTQ conversion, running since 2026-09-01 (rev `6a9e13bd`, `packing="b3"`). |
+| `stage7-freeze` | NONE | `stage7-recipe-freeze` | The 1.7B recipe freeze — downstream of the flagship conversion. |
+| `onnx` | NONE | `onnx-inference` | Whole-Qwen ONNX execution traces — downstream of the flagship artifact. |
+| `browser` | NONE | `browser-conformance` | Real Chrome/Firefox/Safari with WebGPU. |
+| `serving` | NONE | `oci-runtime-{cpu,cuda}`, `oci-security-{cpu,cuda}`, `serving-deployment-{cpu,cuda}` | Docker for the four OCI legs (reachable here); Kubernetes for the two deployment legs (not available here). |
+| `zoo-community` | NONE | `model-zoo`, `generated-claims`, `governance-docs` | Claims and governance are document-derived and reachable now. `model-zoo` needs all four frozen entries, including the flagship. |
+| `reproduction-signoff` | NONE | `second-machine`, `independent-review` | A second machine, plus a reviewer whose identity differs from the reproduction operator. |
+
+Reachable on this hardware, with no new dependency: `generated-claims`,
+`governance-docs`, the four OCI legs, and `refinement`/`baseline-ablation`.
+Blocked on the in-flight conversion: `flagship-qwen`, `stage7-freeze`, `onnx`,
+and `model-zoo`. Blocked on hardware or people this project does not have:
+`distributed-training` (≥2 GPUs), `browser-conformance` (browsers),
+`serving-deployment-*` (Kubernetes), `compatibility-matrix` (cross-platform wheel
+builds), and `reproduction-signoff` (a second machine and a second person).
+
+Note that `release/v1.1/` is git-ignored, so this evidence exists only on the
+machine that produced it. It is neither backed up nor independently reviewable,
+which is a distinct risk from the gates themselves.
+
 ## Candidate layout
 
 Place exact unpublished payloads and their generated SBOMs below the ignored
