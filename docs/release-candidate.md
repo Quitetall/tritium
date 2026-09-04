@@ -32,26 +32,40 @@ requires.
 | `qwen-source-admission` | EVIDENCE | — | — |
 | `packages` | PARTIAL | `compatibility-matrix` | Three platform wheels bound by SHA-256 into one candidate. macOS and Windows wheels cannot be produced on this box — needs the CI wheel matrix. |
 | `pytorch-hf` | PARTIAL | `distributed-training` | Two or more GPUs. |
-| `native-backends` | PARTIAL | `backend-manifest`, `performance` | Seven-target training traces. This box supplies CUDA + CPU only. |
-| `estimators-refinement` | PARTIAL | `refinement`, `baseline-ablation` | Local SALT campaign runs. Reachable here once the flagship conversion releases the CPU. |
+| `native-backends` | PARTIAL | `backend-manifest`, `performance` | All seven trace families, in order — `FAMILIES = ("cpu", "cuda", "rocm", "metal", "wgpu", "wasi", "mcu")`. Needs AMD *and* Apple *and* an MCU board. |
+| `estimators-refinement` | PARTIAL | `refinement`, `baseline-ablation` | Local SALT campaign runs. No new dependency; queued until the flagship conversion releases the CPU. |
 | `flagship-qwen` | **IN FLIGHT** | `conversion-refinement`, `quality`, `task-retention`, `runtime`, `physical-bytes` | The pinned Qwen3.6-27B PTQ conversion, running since 2026-09-01 (rev `6a9e13bd`, `packing="b3"`). |
 | `stage7-freeze` | NONE | `stage7-recipe-freeze` | The 1.7B recipe freeze — downstream of the flagship conversion. |
 | `onnx` | NONE | `onnx-inference` | Whole-Qwen ONNX execution traces — downstream of the flagship artifact. |
-| `browser` | NONE | `browser-conformance` | Real Chrome/Firefox/Safari with WebGPU. |
-| `serving` | NONE | `oci-runtime-{cpu,cuda}`, `oci-security-{cpu,cuda}`, `serving-deployment-{cpu,cuda}` | Docker for the four OCI legs (reachable here); Kubernetes for the two deployment legs (not available here). |
-| `zoo-community` | NONE | `model-zoo`, `generated-claims`, `governance-docs` | Claims and governance are document-derived and reachable now. `model-zoo` needs all four frozen entries, including the flagship. |
+| `browser` | NONE | `browser-conformance` | **Three** lanes, all required: `--chrome-lane`, `--firefox-lane`, `--safari-lane`. The Safari lane is gated on a macOS `os.name`, so this needs Apple hardware, not merely a browser. |
+| `serving` | NONE | `oci-runtime-{cpu,cuda}`, `oci-security-{cpu,cuda}`, `serving-deployment-{cpu,cuda}` | OCI archives already exist for both flavors at rev `3e07eabb`, so no rebuild is needed. Runtime qualification loads the image (and checks its `RepoDigests`), needs a served model bundle, and drives live streaming completions plus SIGTERM phases. Security qualification needs `trivy` with a vulnerability DB under 24 h old. Deployment needs Kubernetes. |
+| `zoo-community` | NONE | `model-zoo`, `generated-claims`, `governance-docs` | All three come from **one** `qualify-zoo-community.py` call. It requires a `--governance-review` whose `independent_from_maintainers` field must be `True` (`verify-zoo-community-receipt.py:426-429`) and a named reviewer with an `organization` — i.e. a second person. It also requires four frozen model entries, the fourth being the flagship. |
 | `reproduction-signoff` | NONE | `second-machine`, `independent-review` | A second machine, plus a reviewer whose identity differs from the reproduction operator. |
 
-Reachable on this hardware **now**, needing neither new hardware nor the in-flight
-conversion: `generated-claims`, `governance-docs`, and the four OCI legs.
-Reachable on this hardware but **queued behind** the conversion, which is holding
-roughly fourteen cores: `refinement` and `baseline-ablation` — no new dependency,
-but they cannot complete until the CPU is free. Blocked on the conversion's
-*output*: `flagship-qwen`, `stage7-freeze`, `onnx`, and `model-zoo`. Blocked on
-hardware or people this project does not have:
-`distributed-training` (≥2 GPUs), `browser-conformance` (browsers),
-`serving-deployment-*` (Kubernetes), `compatibility-matrix` (cross-platform wheel
-builds), and `reproduction-signoff` (a second machine and a second person).
+**Three kinds require a second person, not two.** `independent-review` and
+`second-machine` are the obvious ones; `governance-docs` is the third, because its
+attestation must assert `independent_from_maintainers`. And because
+`qualify-zoo-community.py` emits its three receipts from a single call, that one
+requirement holds `model-zoo` and `generated-claims` hostage alongside it. There
+is no flag to produce one of the three alone.
+
+Grouping the 25 missing kinds by what actually unblocks them:
+
+- **The in-flight conversion** (9): the five `flagship-qwen` kinds,
+  `stage7-recipe-freeze`, `onnx-inference`, and — via the coupling above —
+  `model-zoo` and `generated-claims`.
+- **The CPU, once the conversion frees it** (2): `refinement`,
+  `baseline-ablation`. No new dependency.
+- **Work reachable on this hardware** (6): the four OCI kinds (archives exist;
+  needs `trivy` installed) and the two `serving-deployment` kinds (needs a local
+  Kubernetes).
+- **Hardware this project does not have** (5): `distributed-training` (≥2 GPUs,
+  rentable), `browser-conformance` (macOS, for the Safari lane),
+  `backend-manifest` and `performance` (AMD + Apple + MCU),
+  `compatibility-matrix` (macOS and Windows wheels — reachable through CI
+  runners rather than locally).
+- **A second person** (3, listed above), of which `second-machine` also needs a
+  second machine.
 
 Note that `release/v1.1/` is git-ignored, so this evidence exists only on the
 machine that produced it. It is neither backed up nor independently reviewable,

@@ -17,6 +17,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+mod frontier_v3;
 mod pipeline;
 mod qwen36_preflight;
 mod qwen36_source_admission;
@@ -24,6 +25,11 @@ mod qwen36_tensor_work;
 mod stage7_evidence;
 mod tensor_work_store;
 
+pub use frontier_v3::{
+    AdmittedSolverPlan, FRONTIER_SOLVER_ABI_V1, FrontierPlanError, FrontierSolver,
+    FrontierSolverError, ResourceDimension, ResourceVector, ResourceViolation, SolverDescriptor,
+    SolverFamily, SolverId, SolverRegistry, SolverRequest, SolverTrust,
+};
 pub use pipeline::{
     AdvanceOutcome, DriverFailure, FailureReceipt, HardwareReceipt, HardwareUsage, Metric,
     MetricReceipt, PhysicalLedger, PipelineStatus, ProvenanceReceipt, PublishedArtifact,
