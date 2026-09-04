@@ -270,7 +270,7 @@ fn profile_contract_round_trips_with_stable_schema() {
 }
 
 #[test]
-fn profile_refuses_bad_schema_empty_duplicate_and_recursive_fallback() {
+fn profile_refuses_bad_schema_empty_duplicate_and_self_fallback() {
     let budget = ResourceVector::new(1, 0, 1, 1, 1, 1, 1, None);
     let profile_id = FrontierProfileId::new("research.default").unwrap();
     assert!(matches!(
@@ -310,11 +310,13 @@ fn profile_refuses_bad_schema_empty_duplicate_and_recursive_fallback() {
             Some(profile_id),
             false,
         ),
-        Err(FrontierPlanError::RecursiveFallback { .. })
+        Err(FrontierPlanError::SelfReferentialFallback { .. })
     ));
 
     let bad_schema = r#"{"schema":"tritium.frontier-profile.v999","id":"research.default","ordering":"search","solver_ids":["salt.v3"],"minimum_trust":"experimental","budget":{"host_ram_bytes":1,"vram_bytes":0,"disk_bytes":1,"artifact_bytes":1,"resident_bytes":1,"transient_bytes":1,"fitting_millis":1,"runtime_latency_micros":null},"fallback_profile":null,"auto_select":false}"#;
     assert!(serde_json::from_str::<FrontierProfile>(bad_schema).is_err());
+    let unknown_field = r#"{"schema":"tritium.frontier-profile.v1","id":"research.default","ordering":"search","solver_ids":["salt.v3"],"minimum_trust":"experimental","budget":{"host_ram_bytes":1,"vram_bytes":0,"disk_bytes":1,"artifact_bytes":1,"resident_bytes":1,"transient_bytes":1,"fitting_millis":1,"runtime_latency_micros":null},"fallback_profile":null,"auto_select":false,"future_flag":true}"#;
+    assert!(serde_json::from_str::<FrontierProfile>(unknown_field).is_err());
 }
 
 #[test]

@@ -480,7 +480,7 @@ impl FrontierProfile {
             }
         }
         if fallback_profile.as_ref() == Some(&id) {
-            return Err(FrontierPlanError::RecursiveFallback { profile_id: id });
+            return Err(FrontierPlanError::SelfReferentialFallback { profile_id: id });
         }
         Ok(Self {
             id,
@@ -518,7 +518,11 @@ impl FrontierProfile {
         self.budget
     }
 
-    /// Explicit alternate profile, if caller supplied one.
+    /// Explicit alternate profile identity, if caller supplied one.
+    ///
+    /// [`SolverRegistry`] does not resolve profile identities or follow this
+    /// reference. A profile catalog must resolve and validate it when the
+    /// caller explicitly submits that alternate profile as a new request.
     pub const fn fallback_profile(&self) -> Option<&FrontierProfileId> {
         self.fallback_profile.as_ref()
     }
@@ -853,8 +857,8 @@ pub enum FrontierPlanError {
         /// Repeated solver identity.
         solver_id: SolverId,
     },
-    /// Profile names itself as its fallback.
-    RecursiveFallback {
+    /// Profile names itself as its direct fallback.
+    SelfReferentialFallback {
         /// Invalid profile identity.
         profile_id: FrontierProfileId,
     },
@@ -935,7 +939,7 @@ impl fmt::Display for FrontierPlanError {
                 formatter,
                 "frontier profile {profile_id} repeats solver {solver_id}"
             ),
-            Self::RecursiveFallback { profile_id } => write!(
+            Self::SelfReferentialFallback { profile_id } => write!(
                 formatter,
                 "frontier profile {profile_id} cannot fall back to itself"
             ),
