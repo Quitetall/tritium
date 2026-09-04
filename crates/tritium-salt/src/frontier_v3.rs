@@ -20,6 +20,7 @@ mod artifact;
 mod compatibility;
 mod orchestration;
 mod receipt;
+mod solvers;
 
 pub use artifact::{
     ArtifactByteLedger, ArtifactClaim, ByteBreakdown, FRONTIER_ARTIFACT_SCHEMA_V1,
@@ -35,6 +36,10 @@ pub use receipt::{
     FrontierObjectiveDirection, FrontierObjectiveSpec, FrontierObjectiveValue,
     FrontierParetoCandidate, FrontierParetoReceipt, FrontierSelection, FrontierStage,
     FrontierStageOutcome, FrontierStageReceipt,
+};
+pub use solvers::{
+    BuiltinSolverBlocker, BuiltinSolverCapability, BuiltinSolverStatus,
+    FRONTIER_SALT_V2_REFERENCE_SOLVER_ID, SaltV2ReferenceAdapter, builtin_solver_capabilities,
 };
 
 /// Object-safe solver planning ABI supported by this release.

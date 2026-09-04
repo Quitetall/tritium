@@ -26,18 +26,19 @@ mod stage7_evidence;
 mod tensor_work_store;
 
 pub use frontier_v3::{
-    AdmittedSolverPlan, ArtifactByteLedger, ArtifactClaim, ByteBreakdown,
-    FRONTIER_ARTIFACT_SCHEMA_V1, FRONTIER_PARETO_RECEIPT_SCHEMA_V1, FRONTIER_PROFILE_SCHEMA_V1,
-    FRONTIER_RUN_RECEIPT_SCHEMA_V1, FRONTIER_SOLVER_ABI_V1, FRONTIER_STAGE_RECEIPT_SCHEMA_V1,
+    AdmittedSolverPlan, ArtifactByteLedger, ArtifactClaim, BuiltinSolverBlocker,
+    BuiltinSolverCapability, BuiltinSolverStatus, ByteBreakdown, FRONTIER_ARTIFACT_SCHEMA_V1,
+    FRONTIER_PARETO_RECEIPT_SCHEMA_V1, FRONTIER_PROFILE_SCHEMA_V1, FRONTIER_RUN_RECEIPT_SCHEMA_V1,
+    FRONTIER_SALT_V2_REFERENCE_SOLVER_ID, FRONTIER_SOLVER_ABI_V1, FRONTIER_STAGE_RECEIPT_SCHEMA_V1,
     FRONTIER_STAGE_REQUEST_SCHEMA_V1, FrontierArtifactError, FrontierArtifactManifest,
     FrontierCompatibilityError, FrontierObjectiveDirection, FrontierObjectiveSpec,
     FrontierObjectiveValue, FrontierOrdering, FrontierParetoCandidate, FrontierParetoReceipt,
     FrontierPlanError, FrontierProfile, FrontierProfileCatalog, FrontierProfileId,
     FrontierRunReceipt, FrontierSelection, FrontierSolver, FrontierSolverError, FrontierStage,
     FrontierStageOutcome, FrontierStageReceipt, FrontierStageRequest, FrontierTensorArtifact,
-    ResourceDimension, ResourceVector, ResourceViolation, SolverDescriptor, SolverFamily, SolverId,
-    SolverRegistry, SolverRequest, SolverTrust, TensorRepresentation,
-    read_salt_v2_frontier_artifact,
+    ResourceDimension, ResourceVector, ResourceViolation, SaltV2ReferenceAdapter, SolverDescriptor,
+    SolverFamily, SolverId, SolverRegistry, SolverRequest, SolverTrust, TensorRepresentation,
+    builtin_solver_capabilities, read_salt_v2_frontier_artifact,
 };
 pub use pipeline::{
     AdvanceOutcome, DriverFailure, FailureReceipt, HardwareReceipt, HardwareUsage, Metric,
