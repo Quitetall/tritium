@@ -51,7 +51,7 @@ def generate(wheel_input: Path, artifact_id: str) -> dict[str, Any]:
             members = VERIFY._safe_members(archive)
             if len(members) > MAX_MEMBERS:
                 raise SbomError(f"wheel exceeds {MAX_MEMBERS} members")
-            dist_info = f"tritium_torch-{expected_version}.dist-info"
+            dist_info = f"pytritium-{expected_version}.dist-info"
             metadata = VERIFY._metadata(archive, members, f"{dist_info}/METADATA")
             for name, info in sorted(members.items()):
                 if info.is_dir():
@@ -98,7 +98,7 @@ def generate(wheel_input: Path, artifact_id: str) -> dict[str, Any]:
             "component": {
                 "type": "library",
                 "bom-ref": artifact_id,
-                "name": "tritium-torch",
+                "name": "pytritium",
                 "version": expected_version,
                 "hashes": [{"alg": "SHA-256", "content": identity["sha256"]}],
                 "properties": [

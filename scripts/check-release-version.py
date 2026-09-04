@@ -81,7 +81,7 @@ def check(root: Path) -> str:
     dynamic = pyproject["project"].get("dynamic", [])
     if dynamic != ["version"]:
         raise ValueError("Python package version must be sourced only from Cargo metadata")
-    require_equal(pyproject["project"].get("name"), "tritium-torch", "Python distribution name")
+    require_equal(pyproject["project"].get("name"), "pytritium", "Python distribution name")
     require_equal(
         pyproject["tool"]["maturin"].get("manifest-path"),
         "Cargo.toml",

@@ -14,7 +14,7 @@ from tritium.torch import hf_export_lifecycle as lifecycle  # noqa: E402
 
 
 def _qualify(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    wheel = tmp_path / "tritium_torch-1.1.0rc0-cp39-abi3-linux_x86_64.whl"
+    wheel = tmp_path / "pytritium-1.1.0rc0-cp39-abi3-linux_x86_64.whl"
     wheel.write_bytes(b"candidate wheel")
     monkeypatch.setattr(
         lifecycle,

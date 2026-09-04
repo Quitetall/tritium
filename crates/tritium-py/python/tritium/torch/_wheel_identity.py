@@ -72,7 +72,7 @@ def wheel_identity(wheel_path: Path) -> dict[str, object]:
         if metadata_files[0] != dist_info + "METADATA":
             raise ValueError("observability candidate wheel dist-info roots differ")
         metadata = BytesParser().parsebytes(files[metadata_files[0]])
-        if metadata.get("Name", "").lower().replace("_", "-") != "tritium-torch":
+        if metadata.get("Name", "").lower().replace("_", "-") != "pytritium":
             raise ValueError("observability candidate wheel distribution name differs")
         version = metadata.get("Version")
         if not version:

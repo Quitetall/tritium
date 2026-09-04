@@ -48,7 +48,7 @@ same ones, not a second build that resembles them.
 
 | registry | package | credential |
 |---|---|---|
-| PyPI | `tritium-torch` | trusted publishing (OIDC) — no token stored |
+| PyPI | `pytritium` | trusted publishing (OIDC) — no token stored |
 | GitHub Releases | wheels, SBOMs, `SHA256SUMS`, provenance attestation | `GITHUB_TOKEN` |
 | crates.io | 23 crates | trusted publishing (OIDC), or `CARGO_REGISTRY_TOKEN` — **dormant until one exists** |
 
@@ -59,7 +59,7 @@ published, so a wheel built from the wrong tree cannot ship under a tag.
 
 Publication fails closed until this exists — deliberately, so a missing publisher
 never silently falls back to a long-lived token. On
-<https://pypi.org/manage/project/tritium-torch/settings/publishing/>, add a GitHub
+<https://pypi.org/manage/project/pytritium/settings/publishing/>, add a GitHub
 publisher:
 
 | field | value |

@@ -3,7 +3,7 @@ requires = ["maturin>=1.7,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "tritium-torch"
+name = "pytritium"
 description = "Ternary-model (BitNet) inference from Python, backed by the Rust Tritium engine."
 requires-python = ">=3.9"
 license = { text = "Apache-2.0" }
@@ -16,6 +16,16 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dynamic = ["version"]
+
+# torch is NOT required to run inference: `import tritium` works without it, which is
+# what the description above promises. But 39 of the 57 python modules -- everything
+# under tritium.torch -- import it at MODULE scope, and until now nothing declared
+# that at all. `pip install pytritium` produced a package whose torch subpackage
+# raised ModuleNotFoundError, i.e. the name advertised the one thing the install did
+# not provide. Hence both halves of this change: the extra makes the dependency real
+# and installable, and the rename stops the distribution promising it unconditionally.
+[project.optional-dependencies]
+torch = ["torch>=2.11"]
 
 [project.urls]
 Repository = "https://github.com/Quitetall/tritium"

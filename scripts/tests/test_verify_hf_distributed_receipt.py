@@ -132,7 +132,7 @@ class VerifyHfDistributedReceiptTests(unittest.TestCase):
     def test_accepts_exact_two_device_ddp_and_fsdp_receipt(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
-            artifact = root / "tritium_torch.whl"
+            artifact = root / "pytritium.whl"
             artifact.write_bytes(b"candidate wheel")
             value = receipt(artifact, root)
             path = root / "receipt.json"
@@ -152,7 +152,7 @@ class VerifyHfDistributedReceiptTests(unittest.TestCase):
         for mutation in mutations:
             with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as raw:
                 root = Path(raw)
-                artifact = root / "tritium_torch.whl"
+                artifact = root / "pytritium.whl"
                 artifact.write_bytes(b"candidate wheel")
                 value = receipt(artifact, root)
                 if mutation == "shared-device":

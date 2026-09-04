@@ -44,16 +44,16 @@ MODEL_CONFIG = {
 
 def require_installed_distribution() -> None:
     try:
-        distribution = importlib.metadata.distribution("tritium-torch")
+        distribution = importlib.metadata.distribution("pytritium")
     except importlib.metadata.PackageNotFoundError as error:
         raise RuntimeError(
-            "distributed worker requires installed tritium-torch"
+            "distributed worker requires installed pytritium"
         ) from error
     module = Path(tritium.__file__).resolve(strict=True)
     if distribution.files is None or module not in {
         distribution.locate_file(item).resolve() for item in distribution.files
     }:
-        raise RuntimeError("imported tritium package is not owned by tritium-torch")
+        raise RuntimeError("imported tritium package is not owned by pytritium")
 
 
 def canonical(value: object) -> bytes:

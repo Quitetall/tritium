@@ -4,7 +4,7 @@ This tutorial starts with ordinary floating PyTorch modules, preserves a tied
 embedding/output weight, runs one hard-forward STE training step, freezes two
 additive ternary planes, checkpoints and resumes model plus AdamW state, exports
 a QAT-hard artifact, strict-reloads it, and checks bit-exact output parity. The
-runner ships inside `tritium-torch`; no Tritium checkout or compiler is used
+runner ships inside `pytritium`; no Tritium checkout or compiler is used
 after wheel installation.
 
 ## Install one exact candidate
@@ -19,7 +19,7 @@ python -m pip install --disable-pip-version-check --only-binary=:all: \
   torch==2.11.0 --index-url https://download.pytorch.org/whl/cpu
 python -m pip install --disable-pip-version-check --only-binary=:all: \
   safetensors==0.8.0
-TRITIUM_WHEEL=./dist/tritium_torch-1.1.0rc1-cp39-abi3-PLATFORM.whl
+TRITIUM_WHEEL=./dist/pytritium-1.1.0rc1-cp39-abi3-PLATFORM.whl
 TRITIUM_SOURCE_REVISION=0000000000000000000000000000000000000000 # replace
 python -m pip install --isolated --disable-pip-version-check \
   --no-index --no-deps --only-binary=:all: "$TRITIUM_WHEEL"
@@ -62,7 +62,7 @@ Successful output contains:
 - a path-sensitive identity over every QAT-hard file and byte;
 - exact candidate-wheel bytes, source revision, release, and unique run ID;
 - a content identity covering every tutorial-result field;
-- installed `tritium-torch` version and an owned package path, rejecting a
+- installed `pytritium` version and an owned package path, rejecting a
   source-tree/package shadow;
 - `qat-hard/model.safetensors` plus a strict manifest;
 - exact parity across latent evaluation, hard conversion, export, and reload.
