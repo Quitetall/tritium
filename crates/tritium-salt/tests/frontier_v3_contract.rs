@@ -2,9 +2,9 @@ use std::sync::Arc;
 
 use tritium_salt::{
     FRONTIER_PROFILE_SCHEMA_V1, FRONTIER_SOLVER_ABI_V1, FrontierOrdering, FrontierPlanError,
-    FrontierProfile, FrontierProfileCatalog, FrontierProfileId, FrontierSolver,
-    FrontierSolverError, ResourceDimension, ResourceVector, SolverDescriptor, SolverFamily,
-    SolverId, SolverRegistry, SolverRequest, SolverTrust,
+    FrontierProfile, FrontierProfileCatalog, FrontierProfileId, FrontierResourceEstimate,
+    FrontierSolver, FrontierSolverError, ResourceDimension, ResourceVector, SolverDescriptor,
+    SolverFamily, SolverId, SolverRegistry, SolverRequest, SolverTrust,
 };
 
 #[derive(Debug)]
@@ -97,8 +97,16 @@ impl FrontierSolver for FixedEstimateSolver {
         &self.descriptor
     }
 
-    fn estimate(&self, _request: &SolverRequest) -> Result<ResourceVector, FrontierSolverError> {
-        Ok(self.estimate)
+    fn estimate(
+        &self,
+        _request: &SolverRequest,
+    ) -> Result<FrontierResourceEstimate, FrontierSolverError> {
+        Ok(FrontierResourceEstimate::new(
+            self.estimate,
+            tritium_salt::ContentId::from_digest([71; 32]),
+            tritium_salt::ContentId::from_digest([72; 32]),
+        )
+        .unwrap())
     }
 }
 
@@ -277,6 +285,15 @@ fn admitted_plan_binds_solver_request_and_exact_estimate() {
     assert_eq!(plan.solver_id().as_str(), "salt.v3");
     assert_eq!(plan.request(), &request);
     assert_eq!(plan.estimate(), estimate);
+    assert_eq!(
+        plan.resource_estimate().machine_id(),
+        tritium_salt::ContentId::from_digest([71; 32])
+    );
+    assert_eq!(
+        plan.resource_estimate().evidence_id(),
+        tritium_salt::ContentId::from_digest([72; 32])
+    );
+    assert_eq!(plan.content_id(), plan.clone().content_id());
 }
 
 #[test]
@@ -291,6 +308,16 @@ fn serialized_contracts_cannot_bypass_constructor_validation() {
         r#"{"rows":0,"columns":4,"budget":{"host_ram_bytes":1,"vram_bytes":0,"disk_bytes":1,"artifact_bytes":1,"resident_bytes":1,"transient_bytes":1,"fitting_millis":1,"runtime_latency_micros":null}}"#
     )
     .is_err());
+    assert!(matches!(
+        FrontierResourceEstimate::new(
+            ResourceVector::new(1, 0, 1, 1, 1, 1, 1, None),
+            tritium_salt::ContentId::from_digest([0; 32]),
+            tritium_salt::ContentId::from_digest([1; 32]),
+        ),
+        Err(FrontierPlanError::ZeroReceiptDigest {
+            field: "resource machine_id"
+        })
+    ));
 }
 
 #[test]

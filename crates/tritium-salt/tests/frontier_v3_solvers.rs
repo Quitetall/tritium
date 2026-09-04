@@ -10,18 +10,26 @@ use tritium_quantize::{
 
 use tritium_salt::{
     BuiltinSolverBlocker, BuiltinSolverStatus, ContentId, FRONTIER_SALT_V2_REFERENCE_SOLVER_ID,
-    FrontierOrdering, FrontierProfile, FrontierProfileId, FrontierResourceEstimator,
-    FrontierSolverError, FrontierStage, FrontierStageRequest, ResourceVector,
-    SaltV2FrontierFitError, SaltV2ReferenceAdapter, SolverFamily, SolverId, SolverRegistry,
-    SolverRequest, SolverTrust, builtin_solver_capabilities,
+    FrontierOrdering, FrontierProfile, FrontierProfileId, FrontierResourceEstimate,
+    FrontierResourceEstimator, FrontierSolverError, FrontierStage, FrontierStageRequest,
+    ResourceVector, SaltV2FrontierFitError, SaltV2ReferenceAdapter, SolverFamily, SolverId,
+    SolverRegistry, SolverRequest, SolverTrust, builtin_solver_capabilities,
 };
 
 #[derive(Debug)]
 struct ExactResources(ResourceVector);
 
 impl FrontierResourceEstimator for ExactResources {
-    fn estimate(&self, _request: &SolverRequest) -> Result<ResourceVector, FrontierSolverError> {
-        Ok(self.0)
+    fn estimate(
+        &self,
+        _request: &SolverRequest,
+    ) -> Result<FrontierResourceEstimate, FrontierSolverError> {
+        Ok(FrontierResourceEstimate::new(
+            self.0,
+            ContentId::from_digest([41; 32]),
+            ContentId::from_digest([42; 32]),
+        )
+        .unwrap())
     }
 }
 
@@ -151,7 +159,7 @@ fn salt_reference_adapter_is_bit_identical_to_canonical_fitter() {
         .plan(&solver_id, SolverTrust::Registered, &solver_request)
         .unwrap();
     let planned_spec = adapter.plan_tensor(input, &config).unwrap();
-    let input_id = ContentId::of_bytes(&planned_spec.canonical_bytes().unwrap());
+    let input_id = solver.tensor_input_id(&plan, &planned_spec).unwrap();
     let request = FrontierStageRequest::new(
         ContentId::of_bytes(b"run"),
         ContentId::of_bytes(b"source"),
@@ -174,6 +182,14 @@ fn salt_reference_adapter_is_bit_identical_to_canonical_fitter() {
         config.master_recipe_id()
     );
     assert_eq!(adapted_result.stage_request_id(), request.content_id());
+    assert_eq!(
+        adapted_result.machine_id(),
+        ContentId::from_digest([41; 32])
+    );
+    assert_eq!(
+        adapted_result.estimate_evidence_id(),
+        ContentId::from_digest([42; 32])
+    );
     let receipt = adapted_result
         .completed_receipt(&request, estimate)
         .unwrap();

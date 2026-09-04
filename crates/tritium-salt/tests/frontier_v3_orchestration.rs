@@ -2,9 +2,10 @@ use std::sync::Arc;
 
 use tritium_salt::{
     FRONTIER_SOLVER_ABI_V1, FrontierOrdering, FrontierPlanError, FrontierProfile,
-    FrontierProfileId, FrontierRunReceipt, FrontierSolver, FrontierSolverError, FrontierStage,
-    FrontierStageOutcome, FrontierStageReceipt, FrontierStageRequest, ResourceVector,
-    SolverDescriptor, SolverFamily, SolverId, SolverRegistry, SolverRequest, SolverTrust,
+    FrontierProfileId, FrontierResourceEstimate, FrontierRunReceipt, FrontierSolver,
+    FrontierSolverError, FrontierStage, FrontierStageOutcome, FrontierStageReceipt,
+    FrontierStageRequest, ResourceVector, SolverDescriptor, SolverFamily, SolverId, SolverRegistry,
+    SolverRequest, SolverTrust,
 };
 
 fn id(byte: u8) -> tritium_salt::ContentId {
@@ -35,8 +36,11 @@ impl FrontierSolver for FixedSolver {
         &self.descriptor
     }
 
-    fn estimate(&self, _request: &SolverRequest) -> Result<ResourceVector, FrontierSolverError> {
-        Ok(resources())
+    fn estimate(
+        &self,
+        _request: &SolverRequest,
+    ) -> Result<FrontierResourceEstimate, FrontierSolverError> {
+        Ok(FrontierResourceEstimate::new(resources(), id(91), id(92)).unwrap())
     }
 }
 

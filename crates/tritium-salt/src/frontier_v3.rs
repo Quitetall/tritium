@@ -793,7 +793,58 @@ pub trait FrontierSolver: fmt::Debug + Send + Sync {
     fn descriptor(&self) -> &SolverDescriptor;
 
     /// Estimate complete resources without mutating artifacts or starting fitting.
-    fn estimate(&self, request: &SolverRequest) -> Result<ResourceVector, FrontierSolverError>;
+    fn estimate(
+        &self,
+        request: &SolverRequest,
+    ) -> Result<FrontierResourceEstimate, FrontierSolverError>;
+}
+
+/// Resource estimate plus exact machine and supporting-evidence identities.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FrontierResourceEstimate {
+    resources: ResourceVector,
+    machine_id: ContentId,
+    evidence_id: ContentId,
+}
+
+impl FrontierResourceEstimate {
+    /// Bind one complete estimate to machine inventory and estimator evidence.
+    pub fn new(
+        resources: ResourceVector,
+        machine_id: ContentId,
+        evidence_id: ContentId,
+    ) -> Result<Self, FrontierPlanError> {
+        if machine_id.as_bytes() == &[0; 32] {
+            return Err(FrontierPlanError::ZeroReceiptDigest {
+                field: "resource machine_id",
+            });
+        }
+        if evidence_id.as_bytes() == &[0; 32] {
+            return Err(FrontierPlanError::ZeroReceiptDigest {
+                field: "resource evidence_id",
+            });
+        }
+        Ok(Self {
+            resources,
+            machine_id,
+            evidence_id,
+        })
+    }
+
+    /// Complete estimated resource vector.
+    pub const fn resources(self) -> ResourceVector {
+        self.resources
+    }
+
+    /// Content identity of exact machine and accelerator inventory.
+    pub const fn machine_id(self) -> ContentId {
+        self.machine_id
+    }
+
+    /// Content identity of measurements or model supporting this estimate.
+    pub const fn evidence_id(self) -> ContentId {
+        self.evidence_id
+    }
 }
 
 /// Successful plan admitted against caller budget and trust requirements.
@@ -801,7 +852,7 @@ pub trait FrontierSolver: fmt::Debug + Send + Sync {
 pub struct AdmittedSolverPlan {
     descriptor: SolverDescriptor,
     request: SolverRequest,
-    estimate: ResourceVector,
+    estimate: FrontierResourceEstimate,
 }
 
 impl AdmittedSolverPlan {
@@ -822,7 +873,32 @@ impl AdmittedSolverPlan {
 
     /// Exact estimate checked against the hard budget.
     pub const fn estimate(&self) -> ResourceVector {
+        self.estimate.resources()
+    }
+
+    /// Evidence-bound estimate admitted by registry.
+    pub const fn resource_estimate(&self) -> FrontierResourceEstimate {
         self.estimate
+    }
+
+    /// Stable identity of descriptor, request, estimate, machine, and evidence.
+    pub fn content_id(&self) -> ContentId {
+        let descriptor =
+            serde_json::to_vec(&self.descriptor).expect("frontier solver descriptor serializes");
+        let request =
+            serde_json::to_vec(&self.request).expect("frontier solver request serializes");
+        let resources = serde_json::to_vec(&self.estimate.resources())
+            .expect("frontier resource vector serializes");
+        let mut identity =
+            Vec::with_capacity(64 + descriptor.len() + request.len() + resources.len());
+        identity.extend_from_slice(b"tritium frontier admitted solver plan v1\0");
+        for field in [&descriptor, &request, &resources] {
+            identity.extend_from_slice(&(field.len() as u64).to_le_bytes());
+            identity.extend_from_slice(field);
+        }
+        identity.extend_from_slice(self.estimate.machine_id().as_bytes());
+        identity.extend_from_slice(self.estimate.evidence_id().as_bytes());
+        ContentId::of_bytes(&identity)
     }
 }
 
@@ -911,15 +987,16 @@ impl SolverRegistry {
                     solver_id: solver_id.clone(),
                     source,
                 })?;
+        let resources = estimate.resources();
         if request.budget().runtime_latency_micros().is_some()
-            && estimate.runtime_latency_micros().is_none()
+            && resources.runtime_latency_micros().is_none()
         {
             return Err(FrontierPlanError::IncompleteEstimate {
                 solver_id: solver_id.clone(),
                 dimension: ResourceDimension::RuntimeLatencyMicros,
             });
         }
-        let violations = request.budget().violations(estimate);
+        let violations = request.budget().violations(resources);
         if !violations.is_empty() {
             return Err(FrontierPlanError::BudgetExceeded {
                 solver_id: solver_id.clone(),

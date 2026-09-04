@@ -10,8 +10,8 @@ use tritium_quantize::{
 };
 
 use super::{
-    AdmittedSolverPlan, FRONTIER_SOLVER_ABI_V1, FrontierPlanError, FrontierSolver,
-    FrontierSolverError, FrontierStage, FrontierStageOutcome, FrontierStageReceipt,
+    AdmittedSolverPlan, FRONTIER_SOLVER_ABI_V1, FrontierPlanError, FrontierResourceEstimate,
+    FrontierSolver, FrontierSolverError, FrontierStage, FrontierStageOutcome, FrontierStageReceipt,
     FrontierStageRequest, ResourceVector, SolverDescriptor, SolverFamily, SolverId, SolverRequest,
     SolverTrust,
 };
@@ -205,11 +205,14 @@ impl SaltV2ReferenceAdapter {
 /// Machine-specific resource estimation supplied separately from mathematical
 /// solver implementation.
 pub trait FrontierResourceEstimator: std::fmt::Debug + Send + Sync {
-    /// Estimate every required resource dimension for one immutable request.
+    /// Estimate every dimension and bind supporting machine/evidence identity.
     ///
     /// # Errors
     /// Returns evidence or hardware-model failure without starting fitting.
-    fn estimate(&self, request: &SolverRequest) -> Result<ResourceVector, FrontierSolverError>;
+    fn estimate(
+        &self,
+        request: &SolverRequest,
+    ) -> Result<FrontierResourceEstimate, FrontierSolverError>;
 }
 
 /// SALT reference adapter plus explicit resource estimator, suitable for
@@ -228,9 +231,9 @@ impl SaltV2FrontierSolver {
 
     /// Fit one ordinary tensor only after registry and portable-request admission.
     ///
-    /// `request.input_id` must be the [`ContentId`] of the canonical planned
-    /// tensor-master metadata. Every validation completes before the sink is
-    /// touched.
+    /// `request.input_id` must equal [`Self::tensor_input_id`]. Every admission
+    /// validation completes before the sink is touched. A post-fit metadata
+    /// invariant can still fail after writing a complete, unpublished stream.
     ///
     /// # Errors
     /// Rejects a forged or mismatched admission/request/input binding, then
@@ -245,11 +248,13 @@ impl SaltV2FrontierSolver {
     ) -> Result<SaltV2AdmittedTensorFitResult, SaltV2FrontierFitError> {
         let spec = self.adapter.plan_tensor(input, config)?;
         self.validate_fit_request(plan, request, &spec)?;
+        // Canonical fitter plans internally. Keep pre-plan for admission, then
+        // compare returned metadata so future fitter drift fails closed.
         let result = fit_salt_v2_tensor_master(input, config, sink)?;
         if result.spec() != &spec {
             return Err(SaltV2FrontierFitError::OutputMetadataMismatch);
         }
-        Ok(SaltV2AdmittedTensorFitResult::new(request, result))
+        Ok(SaltV2AdmittedTensorFitResult::new(plan, request, result))
     }
 
     /// Fit one restartable tensor only after exact admission and input binding.
@@ -267,11 +272,13 @@ impl SaltV2FrontierSolver {
     ) -> Result<SaltV2AdmittedTensorFitResult, SaltV2FrontierFitError> {
         let spec = self.adapter.plan_restartable_tensor(input, config)?;
         self.validate_fit_request(plan, request, &spec)?;
+        // See ordinary path: duplicate planning separates admission from the
+        // canonical fitter while its API does not accept a precomputed spec.
         let result = fit_salt_v2_restartable_tensor_master(input, config, sink)?;
         if result.spec() != &spec {
             return Err(SaltV2FrontierFitError::OutputMetadataMismatch);
         }
-        Ok(SaltV2AdmittedTensorFitResult::new(request, result))
+        Ok(SaltV2AdmittedTensorFitResult::new(plan, request, result))
     }
 
     fn validate_fit_request(
@@ -297,11 +304,31 @@ impl SaltV2FrontierSolver {
         {
             return Err(SaltV2FrontierFitError::ShapeMismatch);
         }
-        let metadata = spec.canonical_bytes().map_err(SaltV2Error::from)?;
-        if request.input_id() != ContentId::of_bytes(&metadata) {
+        if request.input_id() != self.tensor_input_id(plan, spec)? {
             return Err(SaltV2FrontierFitError::InputIdentityMismatch);
         }
         Ok(())
+    }
+
+    /// Bind opaque admission identity to canonical planned tensor metadata.
+    ///
+    /// # Errors
+    /// Rejects a plan for another solver or invalid canonical metadata.
+    pub fn tensor_input_id(
+        &self,
+        plan: &AdmittedSolverPlan,
+        spec: &SaltV2MasterTensorSpec,
+    ) -> Result<ContentId, SaltV2FrontierFitError> {
+        if plan.descriptor() != self.adapter.descriptor() {
+            return Err(SaltV2FrontierFitError::SolverMismatch);
+        }
+        let metadata = spec.canonical_bytes().map_err(SaltV2Error::from)?;
+        let mut identity = Vec::with_capacity(80 + metadata.len());
+        identity.extend_from_slice(b"tritium frontier admitted salt tensor input v1\0");
+        identity.extend_from_slice(plan.content_id().as_bytes());
+        identity.extend_from_slice(&(metadata.len() as u64).to_le_bytes());
+        identity.extend_from_slice(&metadata);
+        Ok(ContentId::of_bytes(&identity))
     }
 }
 
@@ -309,15 +336,29 @@ impl SaltV2FrontierSolver {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SaltV2AdmittedTensorFitResult {
     stage_request_id: ContentId,
+    resource_estimate: FrontierResourceEstimate,
     output_id: ContentId,
     result: SaltV2TensorMasterFitResult,
 }
 
 impl SaltV2AdmittedTensorFitResult {
-    fn new(request: &FrontierStageRequest, result: SaltV2TensorMasterFitResult) -> Self {
-        let output_id = ContentId::of_bytes(&result.receipt().tensor_master_id());
+    fn new(
+        plan: &AdmittedSolverPlan,
+        request: &FrontierStageRequest,
+        result: SaltV2TensorMasterFitResult,
+    ) -> Self {
+        let resource_estimate = plan.resource_estimate();
+        let mut identity = Vec::with_capacity(160);
+        identity.extend_from_slice(b"tritium frontier admitted salt tensor output v1\0");
+        identity.extend_from_slice(request.content_id().as_bytes());
+        identity.extend_from_slice(plan.content_id().as_bytes());
+        identity.extend_from_slice(resource_estimate.machine_id().as_bytes());
+        identity.extend_from_slice(resource_estimate.evidence_id().as_bytes());
+        identity.extend_from_slice(&result.receipt().tensor_master_id());
+        let output_id = ContentId::of_bytes(&identity);
         Self {
             stage_request_id: request.content_id(),
+            resource_estimate,
             output_id,
             result,
         }
@@ -331,6 +372,16 @@ impl SaltV2AdmittedTensorFitResult {
     /// Frontier content identity wrapping the canonical tensor-master identity.
     pub const fn output_id(&self) -> ContentId {
         self.output_id
+    }
+
+    /// Exact machine inventory identity supporting admitted estimate.
+    pub const fn machine_id(&self) -> ContentId {
+        self.resource_estimate.machine_id()
+    }
+
+    /// Exact evidence identity supporting admitted estimate.
+    pub const fn estimate_evidence_id(&self) -> ContentId {
+        self.resource_estimate.evidence_id()
     }
 
     /// Canonical SALT V2 metadata and payload receipt.
@@ -447,7 +498,10 @@ impl FrontierSolver for SaltV2FrontierSolver {
         self.adapter.descriptor()
     }
 
-    fn estimate(&self, request: &SolverRequest) -> Result<ResourceVector, FrontierSolverError> {
+    fn estimate(
+        &self,
+        request: &SolverRequest,
+    ) -> Result<FrontierResourceEstimate, FrontierSolverError> {
         self.estimator.estimate(request)
     }
 }
