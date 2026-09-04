@@ -26,10 +26,12 @@ mod stage7_evidence;
 mod tensor_work_store;
 
 pub use frontier_v3::{
-    AdmittedSolverPlan, FRONTIER_PROFILE_SCHEMA_V1, FRONTIER_SOLVER_ABI_V1, FrontierOrdering,
-    FrontierPlanError, FrontierProfile, FrontierProfileId, FrontierSolver, FrontierSolverError,
-    ResourceDimension, ResourceVector, ResourceViolation, SolverDescriptor, SolverFamily, SolverId,
-    SolverRegistry, SolverRequest, SolverTrust,
+    AdmittedSolverPlan, ArtifactByteLedger, ArtifactClaim, ByteBreakdown,
+    FRONTIER_ARTIFACT_SCHEMA_V1, FRONTIER_PROFILE_SCHEMA_V1, FRONTIER_SOLVER_ABI_V1,
+    FrontierArtifactError, FrontierArtifactManifest, FrontierOrdering, FrontierPlanError,
+    FrontierProfile, FrontierProfileId, FrontierSolver, FrontierSolverError,
+    FrontierTensorArtifact, ResourceDimension, ResourceVector, ResourceViolation, SolverDescriptor,
+    SolverFamily, SolverId, SolverRegistry, SolverRequest, SolverTrust, TensorRepresentation,
 };
 pub use pipeline::{
     AdvanceOutcome, DriverFailure, FailureReceipt, HardwareReceipt, HardwareUsage, Metric,

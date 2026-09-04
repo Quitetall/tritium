@@ -14,6 +14,13 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+mod artifact;
+
+pub use artifact::{
+    ArtifactByteLedger, ArtifactClaim, ByteBreakdown, FRONTIER_ARTIFACT_SCHEMA_V1,
+    FrontierArtifactError, FrontierArtifactManifest, FrontierTensorArtifact, TensorRepresentation,
+};
+
 /// Object-safe solver planning ABI supported by this release.
 pub const FRONTIER_SOLVER_ABI_V1: u16 = 1;
 
