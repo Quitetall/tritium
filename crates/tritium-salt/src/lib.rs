@@ -37,9 +37,10 @@ pub use frontier_v3::{
     FrontierResourceEstimator, FrontierRunReceipt, FrontierSelection, FrontierSolver,
     FrontierSolverError, FrontierStage, FrontierStageOutcome, FrontierStageReceipt,
     FrontierStageRequest, FrontierTensorArtifact, ResourceDimension, ResourceVector,
-    ResourceViolation, SaltV2FrontierSolver, SaltV2ReferenceAdapter, SolverDescriptor,
-    SolverFamily, SolverId, SolverRegistry, SolverRequest, SolverTrust, TensorRepresentation,
-    builtin_solver_capabilities, read_salt_v2_frontier_artifact,
+    ResourceViolation, SaltV2AdmittedTensorFitResult, SaltV2FrontierFitError, SaltV2FrontierSolver,
+    SaltV2ReferenceAdapter, SolverDescriptor, SolverFamily, SolverId, SolverRegistry,
+    SolverRequest, SolverTrust, TensorRepresentation, builtin_solver_capabilities,
+    read_salt_v2_frontier_artifact,
 };
 pub use pipeline::{
     AdvanceOutcome, DriverFailure, FailureReceipt, HardwareReceipt, HardwareUsage, Metric,

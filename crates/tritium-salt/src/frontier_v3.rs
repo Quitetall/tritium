@@ -39,8 +39,9 @@ pub use receipt::{
 };
 pub use solvers::{
     BuiltinSolverBlocker, BuiltinSolverCapability, BuiltinSolverStatus,
-    FRONTIER_SALT_V2_REFERENCE_SOLVER_ID, FrontierResourceEstimator, SaltV2FrontierSolver,
-    SaltV2ReferenceAdapter, builtin_solver_capabilities,
+    FRONTIER_SALT_V2_REFERENCE_SOLVER_ID, FrontierResourceEstimator, SaltV2AdmittedTensorFitResult,
+    SaltV2FrontierFitError, SaltV2FrontierSolver, SaltV2ReferenceAdapter,
+    builtin_solver_capabilities,
 };
 
 /// Object-safe solver planning ABI supported by this release.
@@ -1135,6 +1136,11 @@ pub enum FrontierPlanError {
         /// First mismatched binding field.
         field: &'static str,
     },
+    /// Portable stage request differs from its opaque registry admission token.
+    StageRequestPlanMismatch {
+        /// First mismatched binding field.
+        field: &'static str,
+    },
     /// Stage index cannot be incremented or represented.
     StageIndexOverflow,
     /// A terminal or completed-evaluation stage cannot advance.
@@ -1341,6 +1347,10 @@ impl fmt::Display for FrontierPlanError {
                     "stage receipt does not match request field {field}"
                 )
             }
+            Self::StageRequestPlanMismatch { field } => write!(
+                formatter,
+                "frontier stage request does not match admitted plan field {field}"
+            ),
             Self::StageIndexOverflow => formatter.write_str("frontier stage index overflow"),
             Self::CannotAdvanceTerminalStage {
                 stage_index,

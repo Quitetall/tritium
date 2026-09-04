@@ -1,6 +1,6 @@
 //! Built-in solver capability catalog and concrete native adapters.
 
-use std::{io::Write, sync::Arc};
+use std::{error::Error, fmt, io::Write, sync::Arc};
 
 use tritium_format::salt_v2_master::SaltV2MasterTensorSpec;
 use tritium_quantize::{
@@ -10,9 +10,12 @@ use tritium_quantize::{
 };
 
 use super::{
-    FRONTIER_SOLVER_ABI_V1, FrontierPlanError, FrontierSolver, FrontierSolverError, ResourceVector,
-    SolverDescriptor, SolverFamily, SolverId, SolverRequest, SolverTrust,
+    AdmittedSolverPlan, FRONTIER_SOLVER_ABI_V1, FrontierPlanError, FrontierSolver,
+    FrontierSolverError, FrontierStage, FrontierStageOutcome, FrontierStageReceipt,
+    FrontierStageRequest, ResourceVector, SolverDescriptor, SolverFamily, SolverId, SolverRequest,
+    SolverTrust,
 };
+use crate::ContentId;
 
 /// Stable identity of native bounded-memory SALT V2 CPU reference fitter.
 pub const FRONTIER_SALT_V2_REFERENCE_SOLVER_ID: &str = "salt.v2.cpu-reference.v1";
@@ -186,19 +189,6 @@ impl SaltV2ReferenceAdapter {
         plan_salt_v2_tensor_master(input, config)
     }
 
-    /// Fit one ordinary tensor into canonical rate-free Pmax bytes.
-    ///
-    /// # Errors
-    /// Returns canonical SALT V2 planning, fitting, or sink failure unchanged.
-    pub fn fit_tensor<W: Write>(
-        &self,
-        input: SaltV2TensorMasterFitInput<'_>,
-        config: &SaltV2Config,
-        sink: W,
-    ) -> Result<SaltV2TensorMasterFitResult, SaltV2Error> {
-        fit_salt_v2_tensor_master(input, config, sink)
-    }
-
     /// Plan one tensor from verified reopened curvature evidence.
     ///
     /// # Errors
@@ -209,19 +199,6 @@ impl SaltV2ReferenceAdapter {
         config: &SaltV2Config,
     ) -> Result<SaltV2MasterTensorSpec, SaltV2Error> {
         plan_salt_v2_restartable_tensor_master(input, config)
-    }
-
-    /// Fit one tensor from verified reopened curvature evidence.
-    ///
-    /// # Errors
-    /// Returns canonical SALT V2 restart, fitting, or sink failure unchanged.
-    pub fn fit_restartable_tensor<W: Write>(
-        &self,
-        input: SaltV2RestartableTensorMasterFitInput<'_>,
-        config: &SaltV2Config,
-        sink: W,
-    ) -> Result<SaltV2TensorMasterFitResult, SaltV2Error> {
-        fit_salt_v2_restartable_tensor_master(input, config, sink)
     }
 }
 
@@ -247,6 +224,221 @@ impl SaltV2FrontierSolver {
     /// Concrete fitting adapter paired with this planning object.
     pub const fn adapter(&self) -> &SaltV2ReferenceAdapter {
         &self.adapter
+    }
+
+    /// Fit one ordinary tensor only after registry and portable-request admission.
+    ///
+    /// `request.input_id` must be the [`ContentId`] of the canonical planned
+    /// tensor-master metadata. Every validation completes before the sink is
+    /// touched.
+    ///
+    /// # Errors
+    /// Rejects a forged or mismatched admission/request/input binding, then
+    /// propagates canonical SALT V2 fitting failures.
+    pub fn fit_admitted_tensor<W: Write>(
+        &self,
+        plan: &AdmittedSolverPlan,
+        request: &FrontierStageRequest,
+        input: SaltV2TensorMasterFitInput<'_>,
+        config: &SaltV2Config,
+        sink: W,
+    ) -> Result<SaltV2AdmittedTensorFitResult, SaltV2FrontierFitError> {
+        let spec = self.adapter.plan_tensor(input, config)?;
+        self.validate_fit_request(plan, request, &spec)?;
+        let result = fit_salt_v2_tensor_master(input, config, sink)?;
+        if result.spec() != &spec {
+            return Err(SaltV2FrontierFitError::OutputMetadataMismatch);
+        }
+        Ok(SaltV2AdmittedTensorFitResult::new(request, result))
+    }
+
+    /// Fit one restartable tensor only after exact admission and input binding.
+    ///
+    /// # Errors
+    /// Rejects a forged or mismatched admission/request/input binding, then
+    /// propagates canonical SALT V2 restart or fitting failures.
+    pub fn fit_admitted_restartable_tensor<W: Write>(
+        &self,
+        plan: &AdmittedSolverPlan,
+        request: &FrontierStageRequest,
+        input: SaltV2RestartableTensorMasterFitInput<'_>,
+        config: &SaltV2Config,
+        sink: W,
+    ) -> Result<SaltV2AdmittedTensorFitResult, SaltV2FrontierFitError> {
+        let spec = self.adapter.plan_restartable_tensor(input, config)?;
+        self.validate_fit_request(plan, request, &spec)?;
+        let result = fit_salt_v2_restartable_tensor_master(input, config, sink)?;
+        if result.spec() != &spec {
+            return Err(SaltV2FrontierFitError::OutputMetadataMismatch);
+        }
+        Ok(SaltV2AdmittedTensorFitResult::new(request, result))
+    }
+
+    fn validate_fit_request(
+        &self,
+        plan: &AdmittedSolverPlan,
+        request: &FrontierStageRequest,
+        spec: &SaltV2MasterTensorSpec,
+    ) -> Result<(), SaltV2FrontierFitError> {
+        request.validate_plan(plan)?;
+        if plan.descriptor() != self.adapter.descriptor() {
+            return Err(SaltV2FrontierFitError::SolverMismatch);
+        }
+        if request.stage() != FrontierStage::Fit {
+            return Err(SaltV2FrontierFitError::WrongStage {
+                found: request.stage(),
+            });
+        }
+        let [rows, columns] = spec.shape() else {
+            return Err(SaltV2FrontierFitError::ShapeMismatch);
+        };
+        if request.solver_request().rows() != *rows
+            || request.solver_request().columns() != *columns
+        {
+            return Err(SaltV2FrontierFitError::ShapeMismatch);
+        }
+        let metadata = spec.canonical_bytes().map_err(SaltV2Error::from)?;
+        if request.input_id() != ContentId::of_bytes(&metadata) {
+            return Err(SaltV2FrontierFitError::InputIdentityMismatch);
+        }
+        Ok(())
+    }
+}
+
+/// Completed canonical tensor fit bound to one admitted frontier request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SaltV2AdmittedTensorFitResult {
+    stage_request_id: ContentId,
+    output_id: ContentId,
+    result: SaltV2TensorMasterFitResult,
+}
+
+impl SaltV2AdmittedTensorFitResult {
+    fn new(request: &FrontierStageRequest, result: SaltV2TensorMasterFitResult) -> Self {
+        let output_id = ContentId::of_bytes(&result.receipt().tensor_master_id());
+        Self {
+            stage_request_id: request.content_id(),
+            output_id,
+            result,
+        }
+    }
+
+    /// Exact portable request identity admitted before fitting.
+    pub const fn stage_request_id(&self) -> ContentId {
+        self.stage_request_id
+    }
+
+    /// Frontier content identity wrapping the canonical tensor-master identity.
+    pub const fn output_id(&self) -> ContentId {
+        self.output_id
+    }
+
+    /// Canonical SALT V2 metadata and payload receipt.
+    pub const fn fit_result(&self) -> &SaltV2TensorMasterFitResult {
+        &self.result
+    }
+
+    /// Produce a completed Fit-stage receipt after caller measures resources.
+    ///
+    /// # Errors
+    /// Rejects a different stage request or incoherent measured budget claim.
+    pub fn completed_receipt(
+        &self,
+        request: &FrontierStageRequest,
+        measured: ResourceVector,
+    ) -> Result<FrontierStageReceipt, FrontierPlanError> {
+        if request.content_id() != self.stage_request_id {
+            return Err(FrontierPlanError::StageRequestPlanMismatch {
+                field: "request_id",
+            });
+        }
+        let receipt = FrontierStageReceipt::new(
+            request.run_id(),
+            request.source_id(),
+            request.stage_index(),
+            request.stage(),
+            request.profile_id().clone(),
+            request.solver().clone(),
+            request.input_id(),
+            Some(self.output_id),
+            request.estimate(),
+            measured,
+            request.budget(),
+            FrontierStageOutcome::Completed,
+            None,
+        )?;
+        request.validate_receipt(&receipt)?;
+        Ok(receipt)
+    }
+}
+
+/// Admission or canonical-fit failure from frontier SALT execution.
+#[derive(Debug, PartialEq)]
+#[non_exhaustive]
+pub enum SaltV2FrontierFitError {
+    /// Portable request differs from opaque registry admission.
+    Admission(FrontierPlanError),
+    /// Admission names another concrete solver implementation.
+    SolverMismatch,
+    /// Request attempts to execute a non-Fit pipeline stage.
+    WrongStage {
+        /// Rejected stage.
+        found: FrontierStage,
+    },
+    /// Admitted matrix shape differs from canonical tensor metadata.
+    ShapeMismatch,
+    /// Request input identity differs from canonical planned metadata.
+    InputIdentityMismatch,
+    /// Canonical fitter returned metadata differing from its admitted plan.
+    OutputMetadataMismatch,
+    /// Canonical SALT V2 planning, fitting, or sink failure.
+    Fit(SaltV2Error),
+}
+
+impl fmt::Display for SaltV2FrontierFitError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Admission(source) => write!(formatter, "frontier fit admission failed: {source}"),
+            Self::SolverMismatch => formatter.write_str("frontier fit solver does not match plan"),
+            Self::WrongStage { found } => {
+                write!(
+                    formatter,
+                    "frontier fit request has non-fit stage {found:?}"
+                )
+            }
+            Self::ShapeMismatch => {
+                formatter.write_str("frontier fit tensor shape does not match admitted request")
+            }
+            Self::InputIdentityMismatch => {
+                formatter.write_str("frontier fit input does not match canonical planned metadata")
+            }
+            Self::OutputMetadataMismatch => {
+                formatter.write_str("frontier fit output metadata differs from admitted plan")
+            }
+            Self::Fit(source) => write!(formatter, "frontier SALT V2 fit failed: {source}"),
+        }
+    }
+}
+
+impl Error for SaltV2FrontierFitError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Admission(source) => Some(source),
+            Self::Fit(source) => Some(source),
+            _ => None,
+        }
+    }
+}
+
+impl From<FrontierPlanError> for SaltV2FrontierFitError {
+    fn from(value: FrontierPlanError) -> Self {
+        Self::Admission(value)
+    }
+}
+
+impl From<SaltV2Error> for SaltV2FrontierFitError {
+    fn from(value: SaltV2Error) -> Self {
+        Self::Fit(value)
     }
 }
 

@@ -9,9 +9,11 @@ use tritium_quantize::{
 };
 
 use tritium_salt::{
-    BuiltinSolverBlocker, BuiltinSolverStatus, FRONTIER_SALT_V2_REFERENCE_SOLVER_ID,
-    FrontierResourceEstimator, FrontierSolverError, ResourceVector, SaltV2ReferenceAdapter,
-    SolverFamily, SolverRegistry, SolverRequest, SolverTrust, builtin_solver_capabilities,
+    BuiltinSolverBlocker, BuiltinSolverStatus, ContentId, FRONTIER_SALT_V2_REFERENCE_SOLVER_ID,
+    FrontierOrdering, FrontierProfile, FrontierProfileId, FrontierResourceEstimator,
+    FrontierSolverError, FrontierStage, FrontierStageRequest, ResourceVector,
+    SaltV2FrontierFitError, SaltV2ReferenceAdapter, SolverFamily, SolverId, SolverRegistry,
+    SolverRequest, SolverTrust, builtin_solver_capabilities,
 };
 
 #[derive(Debug)]
@@ -119,14 +121,64 @@ fn salt_reference_adapter_is_bit_identical_to_canonical_fitter() {
 
     let mut direct = Vec::new();
     let direct_result = fit_salt_v2_tensor_master(input, &config, &mut direct).unwrap();
+    let budget = ResourceVector::new(
+        u64::MAX,
+        u64::MAX,
+        u64::MAX,
+        u64::MAX,
+        u64::MAX,
+        u64::MAX,
+        u64::MAX,
+        None,
+    );
+    let estimate = ResourceVector::new(1024, 0, 1024, 1024, 1024, 1024, 10, None);
+    let solver_id = SolverId::new(FRONTIER_SALT_V2_REFERENCE_SOLVER_ID).unwrap();
+    let profile = FrontierProfile::new(
+        FrontierProfileId::new("test.salt-admitted").unwrap(),
+        FrontierOrdering::Fixed,
+        vec![solver_id.clone()],
+        SolverTrust::Registered,
+        budget,
+        None,
+        false,
+    )
+    .unwrap();
+    let solver = Arc::new(adapter.with_resource_estimator(Arc::new(ExactResources(estimate))));
+    let mut registry = SolverRegistry::new();
+    registry.register(solver.clone()).unwrap();
+    let solver_request = profile.request(2, 128).unwrap();
+    let plan = registry
+        .plan(&solver_id, SolverTrust::Registered, &solver_request)
+        .unwrap();
+    let planned_spec = adapter.plan_tensor(input, &config).unwrap();
+    let input_id = ContentId::of_bytes(&planned_spec.canonical_bytes().unwrap());
+    let request = FrontierStageRequest::new(
+        ContentId::of_bytes(b"run"),
+        ContentId::of_bytes(b"source"),
+        0,
+        FrontierStage::Fit,
+        &profile,
+        &plan,
+        input_id,
+    )
+    .unwrap();
+
     let mut adapted = Vec::new();
-    let adapted_result = adapter.fit_tensor(input, &config, &mut adapted).unwrap();
+    let adapted_result = solver
+        .fit_admitted_tensor(&plan, &request, input, &config, &mut adapted)
+        .unwrap();
     assert_eq!(adapted, direct);
-    assert_eq!(adapted_result, direct_result);
+    assert_eq!(adapted_result.fit_result(), &direct_result);
     assert_eq!(
-        adapted_result.spec().evidence().recipe_id,
+        adapted_result.fit_result().spec().evidence().recipe_id,
         config.master_recipe_id()
     );
+    assert_eq!(adapted_result.stage_request_id(), request.content_id());
+    let receipt = adapted_result
+        .completed_receipt(&request, estimate)
+        .unwrap();
+    assert_eq!(receipt.output_id(), Some(adapted_result.output_id()));
+    request.validate_receipt(&receipt).unwrap();
 
     let restartable = SaltV2RestartableTensorMasterFitInput {
         tensor,
@@ -144,11 +196,62 @@ fn salt_reference_adapter_is_bit_identical_to_canonical_fitter() {
     let direct_restart_result =
         fit_salt_v2_restartable_tensor_master(restartable, &config, &mut direct_restart).unwrap();
     let mut adapted_restart = Vec::new();
-    let adapted_restart_result = adapter
-        .fit_restartable_tensor(restartable, &config, &mut adapted_restart)
+    let adapted_restart_result = solver
+        .fit_admitted_restartable_tensor(
+            &plan,
+            &request,
+            restartable,
+            &config,
+            &mut adapted_restart,
+        )
         .unwrap();
     assert_eq!(adapted_restart, direct_restart);
-    assert_eq!(adapted_restart_result, direct_restart_result);
+    assert_eq!(adapted_restart_result.fit_result(), &direct_restart_result);
+
+    let wrong_stage = FrontierStageRequest::new(
+        ContentId::of_bytes(b"run"),
+        ContentId::of_bytes(b"source"),
+        0,
+        FrontierStage::Pack,
+        &profile,
+        &plan,
+        input_id,
+    )
+    .unwrap();
+    let mut rejected = Vec::new();
+    assert!(matches!(
+        solver.fit_admitted_tensor(&plan, &wrong_stage, input, &config, &mut rejected),
+        Err(SaltV2FrontierFitError::WrongStage {
+            found: FrontierStage::Pack
+        })
+    ));
+    assert!(rejected.is_empty());
+
+    let changed_config = SaltV2Config {
+        coordinate_sweeps: config.coordinate_sweeps + 1,
+        ..config
+    };
+    assert!(matches!(
+        solver.fit_admitted_tensor(&plan, &request, input, &changed_config, &mut rejected),
+        Err(SaltV2FrontierFitError::InputIdentityMismatch)
+    ));
+    assert!(rejected.is_empty());
+
+    let alternate_estimate = ResourceVector::new(2048, 0, 1024, 1024, 1024, 1024, 10, None);
+    let alternate_solver =
+        Arc::new(adapter.with_resource_estimator(Arc::new(ExactResources(alternate_estimate))));
+    let mut alternate_registry = SolverRegistry::new();
+    alternate_registry.register(alternate_solver).unwrap();
+    let alternate_plan = alternate_registry
+        .plan(&solver_id, SolverTrust::Registered, &solver_request)
+        .unwrap();
+    assert!(matches!(
+        solver.fit_admitted_tensor(&alternate_plan, &request, input, &config, &mut rejected),
+        Err(SaltV2FrontierFitError::Admission(
+            tritium_salt::FrontierPlanError::StageRequestPlanMismatch { field: "estimate" }
+        ))
+    ));
+    assert!(rejected.is_empty());
 }
 
 #[test]

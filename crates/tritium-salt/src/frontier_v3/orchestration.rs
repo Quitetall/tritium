@@ -136,6 +136,20 @@ impl FrontierStageRequest {
         ContentId::of_bytes(&bytes)
     }
 
+    /// Prove this portable request came from the exact in-process admission token.
+    pub fn validate_plan(&self, plan: &AdmittedSolverPlan) -> Result<(), FrontierPlanError> {
+        if self.solver != *plan.descriptor() {
+            return Err(FrontierPlanError::StageRequestPlanMismatch { field: "solver" });
+        }
+        if self.request != *plan.request() {
+            return Err(FrontierPlanError::StageRequestPlanMismatch { field: "request" });
+        }
+        if self.estimate != plan.estimate() {
+            return Err(FrontierPlanError::StageRequestPlanMismatch { field: "estimate" });
+        }
+        Ok(())
+    }
+
     /// Validate one worker receipt against every bound request field.
     pub fn validate_receipt(
         &self,
