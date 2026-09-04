@@ -457,6 +457,9 @@ struct FrontierArtifactManifestWire {
 
 impl FrontierArtifactManifest {
     /// Construct a canonical manifest and reconcile tensor payload byte totals.
+    ///
+    /// Whole-artifact claim is derived from tensor claims; callers cannot
+    /// independently strengthen or weaken it.
     pub fn new(
         source_id: ContentId,
         profile_id: FrontierProfileId,
@@ -575,6 +578,8 @@ impl From<FrontierArtifactManifest> for FrontierArtifactManifestWire {
 }
 
 fn representation_matches(family: SolverFamily, representation: TensorRepresentation) -> bool {
+    // Unknown future families or representations must remain rejected until
+    // this mapping receives an explicit contract decision.
     matches!(
         (family, representation),
         (
@@ -610,7 +615,7 @@ fn require_digest(field: &'static str, id: ContentId) -> Result<(), FrontierArti
     Ok(())
 }
 
-mod content_id_text {
+pub(super) mod content_id_text {
     use serde::{Deserialize, Deserializer, Serializer, de::Error as _};
 
     use crate::ContentId;
@@ -618,7 +623,10 @@ mod content_id_text {
     const PREFIX: &str = "tsc1_";
     const HEX: &[u8; 16] = b"0123456789abcdef";
 
-    pub(super) fn serialize<S>(id: &ContentId, serializer: S) -> Result<S::Ok, S::Error>
+    pub(in crate::frontier_v3) fn serialize<S>(
+        id: &ContentId,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
@@ -631,7 +639,9 @@ mod content_id_text {
         serializer.serialize_str(&text)
     }
 
-    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<ContentId, D::Error>
+    pub(in crate::frontier_v3) fn deserialize<'de, D>(
+        deserializer: D,
+    ) -> Result<ContentId, D::Error>
     where
         D: Deserializer<'de>,
     {
@@ -645,9 +655,7 @@ mod content_id_text {
             ));
         }
         let mut digest = [0_u8; 32];
-        let (pairs, remainder) = hex.as_bytes().as_chunks::<2>();
-        debug_assert!(remainder.is_empty());
-        for (index, pair) in pairs.iter().enumerate() {
+        for (index, pair) in hex.as_bytes().as_chunks::<2>().0.iter().enumerate() {
             digest[index] = decode(pair[0])
                 .and_then(|high| decode(pair[1]).map(|low| high << 4 | low))
                 .ok_or_else(|| {

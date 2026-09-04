@@ -1,0 +1,54 @@
+{
+  "schema": "tritium.frontier-pareto-receipt.v1",
+  "run_id": "tsc1_fa9863a9ced8371021c0fcf784dc86a8322dc6dd4d6b1c596e638c540f021faf",
+  "source_id": "tsc1_afd7e898ae082430ac69e1ce0bb3e1bf71689ce0659a2053a96e54bc902895b3",
+  "profile_id": "research.default",
+  "auto_select": true,
+  "objectives": [
+    {
+      "id": "artifact-bytes",
+      "direction": "minimize",
+      "unit": "bytes"
+    },
+    {
+      "id": "quality-retention-ppm",
+      "direction": "maximize",
+      "unit": "ppm"
+    }
+  ],
+  "candidates": [
+    {
+      "artifact_id": "tsc1_52c5670f44d7997fa882413dc353edd851ac829ce737d9004948bf78e3d28ba3",
+      "stage_receipt_id": "tsc1_f6c2f023c1a001be9df3b291c689ae5b4113f45bde62139b15337872cea3d71b",
+      "objectives": [
+        {
+          "objective_id": "artifact-bytes",
+          "value": 80
+        },
+        {
+          "objective_id": "quality-retention-ppm",
+          "value": 950000
+        }
+      ]
+    },
+    {
+      "artifact_id": "tsc1_b466da2520538eecdf25c73e4a6ab0398e675fd77cdfb16fbb10a37167b55b72",
+      "stage_receipt_id": "tsc1_385725442150536097cab50bce93777a7f3fa42bb16af2e88b7eb17db4884aa4",
+      "objectives": [
+        {
+          "objective_id": "artifact-bytes",
+          "value": 95
+        },
+        {
+          "objective_id": "quality-retention-ppm",
+          "value": 980000
+        }
+      ]
+    }
+  ],
+  "selection": {
+    "mode": "automatic",
+    "artifact_id": "tsc1_b466da2520538eecdf25c73e4a6ab0398e675fd77cdfb16fbb10a37167b55b72",
+    "policy_id": "tsc1_8eb298e026659667d46244d0126b7644b1c51473fd46edfc9dce86e8daa58669"
+  }
+}

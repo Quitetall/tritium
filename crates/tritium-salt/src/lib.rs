@@ -27,9 +27,12 @@ mod tensor_work_store;
 
 pub use frontier_v3::{
     AdmittedSolverPlan, ArtifactByteLedger, ArtifactClaim, ByteBreakdown,
-    FRONTIER_ARTIFACT_SCHEMA_V1, FRONTIER_PROFILE_SCHEMA_V1, FRONTIER_SOLVER_ABI_V1,
-    FrontierArtifactError, FrontierArtifactManifest, FrontierOrdering, FrontierPlanError,
-    FrontierProfile, FrontierProfileId, FrontierSolver, FrontierSolverError,
+    FRONTIER_ARTIFACT_SCHEMA_V1, FRONTIER_PARETO_RECEIPT_SCHEMA_V1, FRONTIER_PROFILE_SCHEMA_V1,
+    FRONTIER_SOLVER_ABI_V1, FRONTIER_STAGE_RECEIPT_SCHEMA_V1, FrontierArtifactError,
+    FrontierArtifactManifest, FrontierObjectiveDirection, FrontierObjectiveSpec,
+    FrontierObjectiveValue, FrontierOrdering, FrontierParetoCandidate, FrontierParetoReceipt,
+    FrontierPlanError, FrontierProfile, FrontierProfileId, FrontierSelection, FrontierSolver,
+    FrontierSolverError, FrontierStage, FrontierStageOutcome, FrontierStageReceipt,
     FrontierTensorArtifact, ResourceDimension, ResourceVector, ResourceViolation, SolverDescriptor,
     SolverFamily, SolverId, SolverRegistry, SolverRequest, SolverTrust, TensorRepresentation,
 };

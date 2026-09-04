@@ -14,11 +14,20 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+use crate::ContentId;
+
 mod artifact;
+mod receipt;
 
 pub use artifact::{
     ArtifactByteLedger, ArtifactClaim, ByteBreakdown, FRONTIER_ARTIFACT_SCHEMA_V1,
     FrontierArtifactError, FrontierArtifactManifest, FrontierTensorArtifact, TensorRepresentation,
+};
+pub use receipt::{
+    FRONTIER_PARETO_RECEIPT_SCHEMA_V1, FRONTIER_STAGE_RECEIPT_SCHEMA_V1,
+    FrontierObjectiveDirection, FrontierObjectiveSpec, FrontierObjectiveValue,
+    FrontierParetoCandidate, FrontierParetoReceipt, FrontierSelection, FrontierStage,
+    FrontierStageOutcome, FrontierStageReceipt,
 };
 
 /// Object-safe solver planning ABI supported by this release.
@@ -925,6 +934,82 @@ pub enum FrontierPlanError {
         /// Every exceeded dimension in stable schema order.
         violations: Vec<ResourceViolation>,
     },
+    /// Receipt contains an all-zero content identity.
+    ZeroReceiptDigest {
+        /// Invalid receipt field.
+        field: &'static str,
+    },
+    /// Receipt contains empty, padded, controlled, or overlong text.
+    InvalidReceiptText {
+        /// Invalid receipt field.
+        field: &'static str,
+    },
+    /// Stage estimate was never admissible under its bound hard budget.
+    UnadmittedStageEstimate {
+        /// Every estimate dimension exceeding budget.
+        violations: Vec<ResourceViolation>,
+    },
+    /// Stage omitted a measured dimension constrained by bound budget.
+    IncompleteStageMeasurement {
+        /// Missing measured resource dimension.
+        dimension: ResourceDimension,
+    },
+    /// Stage outcome, output, diagnostic, and measured resources disagree.
+    IncoherentStageOutcome {
+        /// Rejected terminal outcome.
+        outcome: FrontierStageOutcome,
+    },
+    /// Serialized stage or Pareto receipt uses an unsupported schema.
+    UnsupportedReceiptSchema {
+        /// Receipt kind.
+        kind: &'static str,
+        /// Schema found on input.
+        found: String,
+        /// Schema supported by this reader.
+        supported: &'static str,
+    },
+    /// Pareto receipt contains no objective definitions.
+    EmptyObjectiveSet,
+    /// Objective definitions or values are not in strict lexical order.
+    NonCanonicalObjectiveOrder {
+        /// Prior objective identity.
+        previous: String,
+        /// Current objective identity.
+        current: String,
+    },
+    /// Pareto candidate contains no objective values.
+    EmptyObjectiveValues,
+    /// Pareto receipt contains no candidates.
+    EmptyParetoCandidateSet,
+    /// Pareto candidates are not in strict artifact-digest order.
+    NonCanonicalParetoCandidateOrder {
+        /// Prior artifact identity.
+        previous: ContentId,
+        /// Current artifact identity.
+        current: ContentId,
+    },
+    /// Candidate objective identities do not exactly match receipt definitions.
+    ObjectiveSetMismatch {
+        /// Candidate artifact identity.
+        artifact_id: ContentId,
+    },
+    /// Candidate is dominated and therefore not on declared Pareto frontier.
+    DominatedParetoCandidate {
+        /// Dominated artifact identity.
+        dominated: ContentId,
+        /// Artifact proving dominance.
+        dominator: ContentId,
+    },
+    /// Receipt tried automatic selection under profile forbidding it.
+    AutomaticSelectionForbidden {
+        /// Bound profile identity.
+        profile_id: FrontierProfileId,
+    },
+    /// Selection names an artifact absent from candidate frontier.
+    UnknownSelectedCandidate {
+        /// Missing candidate artifact identity.
+        artifact_id: ContentId,
+    },
 }
 
 impl fmt::Display for FrontierPlanError {
@@ -992,6 +1077,71 @@ impl fmt::Display for FrontierPlanError {
                 formatter,
                 "solver {solver_id} exceeds {} hard resource budget(s)",
                 violations.len()
+            ),
+            Self::ZeroReceiptDigest { field } => {
+                write!(formatter, "receipt {field} digest is all zeroes")
+            }
+            Self::InvalidReceiptText { field } => {
+                write!(formatter, "receipt {field} text is invalid")
+            }
+            Self::UnadmittedStageEstimate { violations } => write!(
+                formatter,
+                "stage estimate exceeds {} bound hard resource budget(s)",
+                violations.len()
+            ),
+            Self::IncompleteStageMeasurement { dimension } => write!(
+                formatter,
+                "stage omitted measured resource dimension {dimension:?}"
+            ),
+            Self::IncoherentStageOutcome { outcome } => {
+                write!(
+                    formatter,
+                    "stage outcome {outcome:?} has incoherent evidence"
+                )
+            }
+            Self::UnsupportedReceiptSchema {
+                kind,
+                found,
+                supported,
+            } => write!(
+                formatter,
+                "unsupported {kind} receipt schema {found:?}; supported schema is {supported}"
+            ),
+            Self::EmptyObjectiveSet => {
+                formatter.write_str("Pareto receipt has no objective definitions")
+            }
+            Self::NonCanonicalObjectiveOrder { previous, current } => write!(
+                formatter,
+                "objective order is not canonical: {previous:?} before {current:?}"
+            ),
+            Self::EmptyObjectiveValues => {
+                formatter.write_str("Pareto candidate has no objective values")
+            }
+            Self::EmptyParetoCandidateSet => {
+                formatter.write_str("Pareto receipt has no candidates")
+            }
+            Self::NonCanonicalParetoCandidateOrder { previous, current } => write!(
+                formatter,
+                "Pareto candidate order is not canonical: {previous} before {current}"
+            ),
+            Self::ObjectiveSetMismatch { artifact_id } => write!(
+                formatter,
+                "Pareto candidate {artifact_id} objective set does not match definitions"
+            ),
+            Self::DominatedParetoCandidate {
+                dominated,
+                dominator,
+            } => write!(
+                formatter,
+                "Pareto candidate {dominated} is dominated by {dominator}"
+            ),
+            Self::AutomaticSelectionForbidden { profile_id } => write!(
+                formatter,
+                "frontier profile {profile_id} forbids automatic selection"
+            ),
+            Self::UnknownSelectedCandidate { artifact_id } => write!(
+                formatter,
+                "selected artifact {artifact_id} is absent from Pareto candidates"
             ),
         }
     }
