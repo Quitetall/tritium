@@ -311,6 +311,16 @@ impl FrontierTensorArtifact {
                 representation,
             });
         }
+        if let Some(required) = family_claim(solver.family())
+            && claim != required
+        {
+            return Err(FrontierArtifactError::ClaimFamilyMismatch {
+                tensor: name,
+                family: solver.family(),
+                declared: claim,
+                required,
+            });
+        }
         require_digest("recipe", recipe_id)?;
         require_digest("payload", payload_id)?;
         if serialized_bytes == 0 || resident_bytes == 0 {
@@ -608,6 +618,20 @@ fn representation_matches(family: SolverFamily, representation: TensorRepresenta
     )
 }
 
+fn family_claim(family: SolverFamily) -> Option<ArtifactClaim> {
+    match family {
+        SolverFamily::QteaSalientResidual => Some(ArtifactClaim::ResidualBearing),
+        SolverFamily::Salt
+        | SolverFamily::ExTernD
+        | SolverFamily::Twla
+        | SolverFamily::Twn
+        | SolverFamily::Ttq
+        | SolverFamily::SparseTernary
+        | SolverFamily::FoldedNineLevel => Some(ArtifactClaim::PureTernary),
+        SolverFamily::Custom => None,
+    }
+}
+
 fn require_digest(field: &'static str, id: ContentId) -> Result<(), FrontierArtifactError> {
     if id.as_bytes().iter().all(|byte| *byte == 0) {
         return Err(FrontierArtifactError::ZeroDigest { field });
@@ -721,6 +745,17 @@ pub enum FrontierArtifactError {
         /// Declared representation.
         representation: TensorRepresentation,
     },
+    /// Solver family cannot emit the declared claim class.
+    ClaimFamilyMismatch {
+        /// Tensor name.
+        tensor: String,
+        /// Declared solver family.
+        family: SolverFamily,
+        /// Claim encoded by caller.
+        declared: ArtifactClaim,
+        /// Claim required by solver family.
+        required: ArtifactClaim,
+    },
     /// Required digest is all zeroes.
     ZeroDigest {
         /// Digest field.
@@ -801,6 +836,15 @@ impl fmt::Display for FrontierArtifactError {
             } => write!(
                 formatter,
                 "tensor {tensor:?} representation {representation:?} does not match {family:?}"
+            ),
+            Self::ClaimFamilyMismatch {
+                tensor,
+                family,
+                declared,
+                required,
+            } => write!(
+                formatter,
+                "tensor {tensor:?} claim {declared:?} does not match {family:?} requirement {required:?}"
             ),
             Self::ZeroDigest { field } => write!(formatter, "{field} digest is all zeroes"),
             Self::InvalidTensorBytes {

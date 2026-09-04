@@ -37,8 +37,8 @@ fn heterogeneous_manifest_round_trips_with_exact_physical_ledger() {
         FrontierTensorArtifact::new(
             "model.layers.0.self_attn.q_proj.weight",
             vec![8, 8],
-            descriptor("salt.v3", SolverFamily::Salt),
-            TensorRepresentation::AdditiveTernaryPlanes,
+            descriptor("qtea.v1", SolverFamily::QteaSalientResidual),
+            TensorRepresentation::SalientTernaryResidual,
             ArtifactClaim::ResidualBearing,
             digest("q recipe"),
             digest("q payload"),
@@ -111,6 +111,36 @@ fn artifact_construction_refuses_incoherent_types_order_and_bytes() {
             4,
         ),
         Err(FrontierArtifactError::RepresentationFamilyMismatch { .. })
+    ));
+
+    assert!(matches!(
+        FrontierTensorArtifact::new(
+            "tensor",
+            vec![2, 2],
+            descriptor("qtea.v1", SolverFamily::QteaSalientResidual),
+            TensorRepresentation::SalientTernaryResidual,
+            ArtifactClaim::PureTernary,
+            digest("recipe"),
+            digest("payload"),
+            4,
+            4,
+        ),
+        Err(FrontierArtifactError::ClaimFamilyMismatch { .. })
+    ));
+
+    assert!(matches!(
+        FrontierTensorArtifact::new(
+            "tensor",
+            vec![2, 2],
+            descriptor("salt.v3", SolverFamily::Salt),
+            TensorRepresentation::AdditiveTernaryPlanes,
+            ArtifactClaim::ResidualBearing,
+            digest("recipe"),
+            digest("payload"),
+            4,
+            4,
+        ),
+        Err(FrontierArtifactError::ClaimFamilyMismatch { .. })
     ));
 
     let tensor = |name: &str, bytes: u64| {
