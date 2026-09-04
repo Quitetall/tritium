@@ -1,0 +1,64 @@
+{
+  "schema": "tritium.frontier-artifact.v1",
+  "source_id": "tsc1_afd7e898ae082430ac69e1ce0bb3e1bf71689ce0659a2053a96e54bc902895b3",
+  "profile_id": "compat.v2",
+  "claim": "pure-ternary",
+  "tensors": [
+    {
+      "name": "a.weight",
+      "shape": [
+        2,
+        2
+      ],
+      "element_count": 4,
+      "solver": {
+        "id": "salt.v2.compat",
+        "family": "salt",
+        "trust": "registered",
+        "abi_version": 1
+      },
+      "representation": "additive-ternary-planes",
+      "claim": "pure-ternary",
+      "recipe_id": "tsc1_b698c48aec1402573d34757ea6f108955f7b3acd8da90177075f46b0e5d449f9",
+      "payload_id": "tsc1_91aa878aaa17881168dc1c4697460f1282879efd17a5b26a1349e3e693c6f6f9",
+      "serialized_bytes": 1,
+      "resident_bytes": 1
+    },
+    {
+      "name": "z.weight",
+      "shape": [
+        2,
+        2
+      ],
+      "element_count": 4,
+      "solver": {
+        "id": "salt.v2.compat",
+        "family": "salt",
+        "trust": "registered",
+        "abi_version": 1
+      },
+      "representation": "additive-ternary-planes",
+      "claim": "pure-ternary",
+      "recipe_id": "tsc1_b698c48aec1402573d34757ea6f108955f7b3acd8da90177075f46b0e5d449f9",
+      "payload_id": "tsc1_8644d6688c44869100ad7f05df8d745bebba00c820f8c8f2a448506bd5f1f206",
+      "serialized_bytes": 1,
+      "resident_bytes": 1
+    }
+  ],
+  "ledger": {
+    "serialized": {
+      "tensor_payload_bytes": 2,
+      "metadata_bytes": 206,
+      "preserved_bytes": 0
+    },
+    "resident": {
+      "tensor_payload_bytes": 2,
+      "metadata_bytes": 4,
+      "preserved_bytes": 0
+    },
+    "transient_bytes": 19,
+    "total_serialized_bytes": 208,
+    "total_resident_bytes": 6,
+    "peak_working_set_bytes": 25
+  }
+}

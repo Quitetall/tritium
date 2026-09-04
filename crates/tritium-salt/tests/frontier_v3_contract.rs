@@ -2,15 +2,94 @@ use std::sync::Arc;
 
 use tritium_salt::{
     FRONTIER_PROFILE_SCHEMA_V1, FRONTIER_SOLVER_ABI_V1, FrontierOrdering, FrontierPlanError,
-    FrontierProfile, FrontierProfileId, FrontierSolver, FrontierSolverError, ResourceDimension,
-    ResourceVector, SolverDescriptor, SolverFamily, SolverId, SolverRegistry, SolverRequest,
-    SolverTrust,
+    FrontierProfile, FrontierProfileCatalog, FrontierProfileId, FrontierSolver,
+    FrontierSolverError, ResourceDimension, ResourceVector, SolverDescriptor, SolverFamily,
+    SolverId, SolverRegistry, SolverRequest, SolverTrust,
 };
 
 #[derive(Debug)]
 struct FixedEstimateSolver {
     descriptor: SolverDescriptor,
     estimate: ResourceVector,
+}
+
+fn profile_with_fallback(id: &str, fallback: Option<&str>) -> FrontierProfile {
+    FrontierProfile::new(
+        FrontierProfileId::new(id).unwrap(),
+        FrontierOrdering::Fixed,
+        vec![SolverId::new("salt.v3").unwrap()],
+        SolverTrust::Registered,
+        ResourceVector::new(10, 0, 10, 10, 10, 0, 10, None),
+        fallback.map(|value| FrontierProfileId::new(value).unwrap()),
+        false,
+    )
+    .unwrap()
+}
+
+#[test]
+fn profile_catalog_resolves_only_validated_explicit_fallback_chains() {
+    let tiny = ResourceVector::new(1, 0, 1, 1, 1, 0, 1, None);
+    let mut solvers = SolverRegistry::new();
+    solvers
+        .register(solver(
+            "salt.v3",
+            SolverTrust::Registered,
+            FRONTIER_SOLVER_ABI_V1,
+            tiny,
+        ))
+        .unwrap();
+
+    let mut catalog = FrontierProfileCatalog::new();
+    catalog
+        .register(profile_with_fallback("fallback.safe", None))
+        .unwrap();
+    catalog
+        .register(profile_with_fallback(
+            "research.default",
+            Some("fallback.safe"),
+        ))
+        .unwrap();
+    assert_eq!(catalog.ids(), ["fallback.safe", "research.default"]);
+    catalog.validate(&solvers).unwrap();
+    let chain = catalog
+        .fallback_chain(&FrontierProfileId::new("research.default").unwrap())
+        .unwrap();
+    assert_eq!(
+        chain
+            .iter()
+            .map(|profile| profile.id().as_str())
+            .collect::<Vec<_>>(),
+        ["research.default", "fallback.safe"]
+    );
+    assert!(matches!(
+        catalog.register(profile_with_fallback("fallback.safe", None)),
+        Err(FrontierPlanError::DuplicateProfile { .. })
+    ));
+}
+
+#[test]
+fn profile_catalog_refuses_missing_fallbacks_and_cycles() {
+    let solvers = SolverRegistry::new();
+    let mut missing = FrontierProfileCatalog::new();
+    missing
+        .register(profile_with_fallback("research.default", Some("missing")))
+        .unwrap();
+    assert!(matches!(
+        missing.fallback_chain(&FrontierProfileId::new("research.default").unwrap()),
+        Err(FrontierPlanError::UnknownProfile { .. })
+    ));
+
+    let mut cyclic = FrontierProfileCatalog::new();
+    cyclic
+        .register(profile_with_fallback("profile.a", Some("profile.b")))
+        .unwrap();
+    cyclic
+        .register(profile_with_fallback("profile.b", Some("profile.a")))
+        .unwrap();
+    assert!(matches!(
+        cyclic.validate(&solvers),
+        Err(FrontierPlanError::FallbackCycle { .. })
+    ));
 }
 
 impl FrontierSolver for FixedEstimateSolver {

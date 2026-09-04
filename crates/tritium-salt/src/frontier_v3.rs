@@ -17,12 +17,14 @@ use serde::{Deserialize, Serialize};
 use crate::ContentId;
 
 mod artifact;
+mod compatibility;
 mod receipt;
 
 pub use artifact::{
     ArtifactByteLedger, ArtifactClaim, ByteBreakdown, FRONTIER_ARTIFACT_SCHEMA_V1,
     FrontierArtifactError, FrontierArtifactManifest, FrontierTensorArtifact, TensorRepresentation,
 };
+pub use compatibility::{FrontierCompatibilityError, read_salt_v2_frontier_artifact};
 pub use receipt::{
     FRONTIER_PARETO_RECEIPT_SCHEMA_V1, FRONTIER_STAGE_RECEIPT_SCHEMA_V1,
     FrontierObjectiveDirection, FrontierObjectiveSpec, FrontierObjectiveValue,
@@ -591,6 +593,86 @@ impl From<FrontierProfile> for FrontierProfileWire {
     }
 }
 
+/// Immutable-by-identity catalog for V3 profiles and explicit fallback topology.
+#[derive(Clone, Debug, Default)]
+pub struct FrontierProfileCatalog {
+    profiles: BTreeMap<FrontierProfileId, FrontierProfile>,
+}
+
+impl FrontierProfileCatalog {
+    /// Construct an empty catalog. No profile or fallback exists implicitly.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register one profile, refusing replacement under an existing identity.
+    pub fn register(&mut self, profile: FrontierProfile) -> Result<(), FrontierPlanError> {
+        if self.profiles.contains_key(profile.id()) {
+            return Err(FrontierPlanError::DuplicateProfile {
+                profile_id: profile.id().clone(),
+            });
+        }
+        self.profiles.insert(profile.id().clone(), profile);
+        Ok(())
+    }
+
+    /// Registered profile IDs in deterministic lexical order.
+    pub fn ids(&self) -> Vec<&str> {
+        self.profiles
+            .keys()
+            .map(FrontierProfileId::as_str)
+            .collect()
+    }
+
+    /// Fetch one exact registered profile without resolving its fallback.
+    pub fn get(&self, profile_id: &FrontierProfileId) -> Option<&FrontierProfile> {
+        self.profiles.get(profile_id)
+    }
+
+    /// Validate fallback topology first, then every profile's solver/trust policy.
+    pub fn validate(&self, solvers: &SolverRegistry) -> Result<(), FrontierPlanError> {
+        for profile_id in self.profiles.keys() {
+            self.fallback_chain(profile_id)?;
+        }
+        for profile in self.profiles.values() {
+            solvers.validate_profile(profile)?;
+        }
+        Ok(())
+    }
+
+    /// Return a validated explicit fallback chain without planning or running it.
+    ///
+    /// Caller must submit each returned profile as a distinct request. This
+    /// method never performs automatic fallback.
+    pub fn fallback_chain(
+        &self,
+        profile_id: &FrontierProfileId,
+    ) -> Result<Vec<&FrontierProfile>, FrontierPlanError> {
+        let mut chain = Vec::new();
+        let mut seen = BTreeSet::new();
+        let mut current = Some(profile_id);
+        while let Some(current_id) = current {
+            if !seen.insert(current_id.clone()) {
+                let mut cycle: Vec<_> = chain
+                    .iter()
+                    .map(|profile: &&FrontierProfile| profile.id().clone())
+                    .collect();
+                cycle.push(current_id.clone());
+                return Err(FrontierPlanError::FallbackCycle { profiles: cycle });
+            }
+            let profile =
+                self.profiles
+                    .get(current_id)
+                    .ok_or_else(|| FrontierPlanError::UnknownProfile {
+                        profile_id: current_id.clone(),
+                    })?;
+            chain.push(profile);
+            current = profile.fallback_profile();
+        }
+        Ok(chain)
+    }
+}
+
 /// Shape and hard resource ceilings supplied to one planning attempt.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "SolverRequestWire", into = "SolverRequestWire")]
@@ -873,6 +955,21 @@ pub enum FrontierPlanError {
         /// Repeated solver identity.
         solver_id: SolverId,
     },
+    /// Catalog already contains this exact profile identity.
+    DuplicateProfile {
+        /// Duplicate profile identity.
+        profile_id: FrontierProfileId,
+    },
+    /// Requested profile or fallback target is not registered.
+    UnknownProfile {
+        /// Missing profile identity.
+        profile_id: FrontierProfileId,
+    },
+    /// Registered fallback topology contains a cycle.
+    FallbackCycle {
+        /// Traversed identities ending with repeated profile.
+        profiles: Vec<FrontierProfileId>,
+    },
     /// Profile names itself as its direct fallback.
     SelfReferentialFallback {
         /// Invalid profile identity.
@@ -1030,6 +1127,20 @@ impl fmt::Display for FrontierPlanError {
             } => write!(
                 formatter,
                 "frontier profile {profile_id} repeats solver {solver_id}"
+            ),
+            Self::DuplicateProfile { profile_id } => {
+                write!(
+                    formatter,
+                    "frontier profile {profile_id} is already registered"
+                )
+            }
+            Self::UnknownProfile { profile_id } => {
+                write!(formatter, "frontier profile {profile_id} is not registered")
+            }
+            Self::FallbackCycle { profiles } => write!(
+                formatter,
+                "frontier profile fallback chain contains a {}-entry cycle",
+                profiles.len()
             ),
             Self::SelfReferentialFallback { profile_id } => write!(
                 formatter,
