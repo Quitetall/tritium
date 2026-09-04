@@ -21,8 +21,8 @@ pub const FRONTIER_SALT_V2_REFERENCE_SOLVER_ID: &str = "salt.v2.cpu-reference.v1
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum BuiltinSolverBlocker {
-    /// Native implementation and conformance evidence do not exist yet.
-    NativeImplementationMissing,
+    /// Complete frontier fitter, artifact writer, and conformance evidence are missing.
+    FrontierIntegrationMissing,
 }
 
 /// Truthful execution status of one built-in solver identity.
@@ -71,7 +71,7 @@ impl BuiltinSolverCapability {
             id: SolverId::new(id)?,
             family,
             status: BuiltinSolverStatus::Unavailable {
-                blocker: BuiltinSolverBlocker::NativeImplementationMissing,
+                blocker: BuiltinSolverBlocker::FrontierIntegrationMissing,
             },
             descriptor: None,
         })

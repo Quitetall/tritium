@@ -76,7 +76,7 @@ fn builtin_catalog_advertises_only_real_executable_solver() {
         assert_eq!(
             capability.status(),
             BuiltinSolverStatus::Unavailable {
-                blocker: BuiltinSolverBlocker::NativeImplementationMissing
+                blocker: BuiltinSolverBlocker::FrontierIntegrationMissing
             }
         );
         assert!(capability.descriptor().is_none());
