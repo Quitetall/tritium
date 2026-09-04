@@ -1,13 +1,13 @@
 # Generated v1.0 to v1.1 API diff
 
-Report identity: `sha256:3fa9ee936516203b477134c30af742e1cbbd73ecdea1b7b77d6cc62334acb0bc`
+Report identity: `sha256:94c52fd44c74a947150e37aac07dbfde42d926064d090e692a3d2933318c4908`
 
 This is a structural source report for candidate `1.1.0-rc.1`
 against `v1.0.0`. It is not a package-install or runtime receipt.
 
 ## Frozen Rust tier
 
-The seven frozen crates require a green cargo-semver-checks run:
+The 21 frozen crates require a green cargo-semver-checks run:
 
 ```sh
 ./scripts/check-semver.sh v1.0.0

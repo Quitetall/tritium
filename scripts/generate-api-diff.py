@@ -8,6 +8,7 @@ import ast
 import hashlib
 import json
 import re
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -146,7 +147,22 @@ def python_all(source: str) -> set[str]:
 
 def semver_crates(root: Path) -> tuple[str, ...]:
     source = (root / "scripts/check-semver.sh").read_text(encoding="utf-8")
-    crates = tuple(re.findall(r"(?m)^\s+-p\s+(tritium-[a-z0-9-]+)\s*\\?\s*$", source))
+    assignments = tuple(
+        re.finditer(
+            r"(?ms)^CHECKED_CRATES=\(\s*(?P<body>.*?)^\)",
+            source,
+        )
+    )
+    if len(assignments) != 1:
+        raise ApiDiffError("SemVer gate has no unique CHECKED_CRATES assignment")
+    try:
+        crates = tuple(
+            shlex.split(assignments[0].group("body"), comments=True, posix=True)
+        )
+    except ValueError as error:
+        raise ApiDiffError("SemVer gate has an invalid CHECKED_CRATES assignment") from error
+    if any(re.fullmatch(r"tritium-[a-z0-9-]+", crate) is None for crate in crates):
+        raise ApiDiffError("SemVer gate CHECKED_CRATES scope is not literal")
     if not crates or len(crates) != len(set(crates)):
         raise ApiDiffError("SemVer gate has no unique frozen-crate scope")
     return crates
@@ -238,7 +254,11 @@ def render_json(report: dict[str, object]) -> str:
 
 def render_markdown(report: dict[str, object]) -> str:
     python = report["python"]
+    rust = report["rust"]
     assert isinstance(python, dict)
+    assert isinstance(rust, dict)
+    frozen_crates = rust["frozen_crates"]
+    assert isinstance(frozen_crates, list)
     retained = ", ".join(f"`{name}`" for name in python["retained"])
     added = "\n".join(f"- `{name}`" for name in python["added"])
     return f"""# Generated v1.0 to v1.1 API diff
@@ -250,7 +270,7 @@ against `{report['baseline']}`. It is not a package-install or runtime receipt.
 
 ## Frozen Rust tier
 
-The seven frozen crates require a green cargo-semver-checks run:
+The {len(frozen_crates)} frozen crates require a green cargo-semver-checks run:
 
 ```sh
 {report['rust']['verification']}

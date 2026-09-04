@@ -46,7 +46,7 @@
       "ternary_matmul"
     ]
   },
-  "report_id": "sha256:3fa9ee936516203b477134c30af742e1cbbd73ecdea1b7b77d6cc62334acb0bc",
+  "report_id": "sha256:94c52fd44c74a947150e37aac07dbfde42d926064d090e692a3d2933318c4908",
   "rust": {
     "frozen_crates": [
       "tritium-core",
@@ -55,7 +55,21 @@
       "tritium-runtime",
       "tritium-cpu",
       "tritium-quantize",
-      "tritium-testkit"
+      "tritium-testkit",
+      "tritium-ffi",
+      "tritium-nn",
+      "tritium-salt",
+      "tritium-train",
+      "tritium-serve",
+      "tritium-burn",
+      "tritium-candle",
+      "tritium-onnx",
+      "tritium-mcu",
+      "tritium-wasm",
+      "tritium-metal",
+      "tritium-rocm",
+      "tritium-wgpu",
+      "tritium-build-info"
     ],
     "result": "run-required",
     "verification": "./scripts/check-semver.sh v1.0.0"
