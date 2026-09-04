@@ -1,8 +1,8 @@
 # Generated v1.0 to v1.1 API diff
 
-Report identity: `sha256:3fa9ee936516203b477134c30af742e1cbbd73ecdea1b7b77d6cc62334acb0bc`
+Report identity: `sha256:a4a547b57908b66182af9f5ee1de59c024787de38ed99ab4eadcf2bbdf5cdfa3`
 
-This is a structural source report for candidate `1.1.0-rc.1`
+This is a structural source report for candidate `1.1.0-rc.2`
 against `v1.0.0`. It is not a package-install or runtime receipt.
 
 ## Frozen Rust tier

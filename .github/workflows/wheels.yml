@@ -241,7 +241,7 @@ jobs:
         run: >-
           python scripts/aggregate-wheel-smoke.py evidence
           --source-revision ${{ github.sha }}
-          --release 1.1.0-rc.1
+          --release "$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
           --run-id github-${{ github.run_id }}-${{ github.run_attempt }}-abi3-matrix
           --output receipts/python-abi3-39-plus.json
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
@@ -296,7 +296,7 @@ jobs:
           --wheel dist
           --forbidden-root ${{ github.workspace }}
           --source-revision ${{ github.sha }}
-          --release 1.1.0-rc.1
+          --release "$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
           --run-id github-${{ github.run_id }}-${{ github.run_attempt }}-cpu-functional
           --output evidence/torch-2.11-python-3.13.json
       - name: execute installed-wheel PyTorch QAT tutorial
@@ -308,14 +308,14 @@ jobs:
             --device cpu \
             --wheel-artifact dist/*.whl \
             --source-revision ${{ github.sha }} \
-            --release 1.1.0-rc.1 \
+            --release "$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')" \
             --run-id github-${{ github.run_id }}-${{ github.run_attempt }}-tutorial-cpu
           python -I -m tritium.torch.tutorial_qat \
             --check-receipt evidence/tutorial-cpu/receipt.json \
             --device cpu \
             --wheel-artifact dist/*.whl \
             --source-revision ${{ github.sha }} \
-            --release 1.1.0-rc.1
+            --release "$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
       - name: qualify installed-wheel API signature
         shell: bash
         run: |
@@ -326,7 +326,7 @@ jobs:
             --wheel dist/*.whl \
             --api-report docs/generated/api-diff-v1.0-v1.1.json \
             --source-revision "${{ github.sha }}" \
-            --release 1.1.0-rc.1 \
+            --release "$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')" \
             --run-id "github-${{ github.run_id }}-${{ github.run_attempt }}-api-signature" \
             --output-dir evidence/api-signature
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
@@ -382,14 +382,14 @@ jobs:
             --device cpu \
             --wheel-artifact dist/*.whl \
             --source-revision ${{ github.sha }} \
-            --release 1.1.0-rc.1 \
+            --release "$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')" \
             --run-id github-${{ github.run_id }}-${{ github.run_attempt }}-tutorial-clean
           python -I -m tritium.torch.tutorial_qat \
             --check-receipt evidence/tutorial-clean/receipt.json \
             --device cpu \
             --wheel-artifact dist/*.whl \
             --source-revision ${{ github.sha }} \
-            --release 1.1.0-rc.1
+            --release "$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
       - name: execute and validate installed Hugging Face lifecycle
         shell: bash
         run: |
@@ -398,13 +398,13 @@ jobs:
             --output-dir evidence/hf-lifecycle-clean \
             --wheel-artifact dist/*.whl \
             --source-revision ${{ github.sha }} \
-            --release 1.1.0-rc.1 \
+            --release "$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')" \
             --run-id github-${{ github.run_id }}-${{ github.run_attempt }}-hf-lifecycle-clean
           python -I -m tritium.torch.hf_lifecycle \
             --check-receipt evidence/hf-lifecycle-clean/receipt.json \
             --wheel-artifact dist/*.whl \
             --source-revision ${{ github.sha }} \
-            --release 1.1.0-rc.1
+            --release "$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
       - name: execute and validate whole-model hard export
         shell: bash
         run: |
@@ -413,13 +413,13 @@ jobs:
             --output-dir evidence/hf-export-clean \
             --wheel-artifact dist/*.whl \
             --source-revision ${{ github.sha }} \
-            --release 1.1.0-rc.1 \
+            --release "$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')" \
             --run-id github-${{ github.run_id }}-${{ github.run_attempt }}-hf-export-clean
           python -I -m tritium.torch.hf_export_lifecycle \
             --check-receipt evidence/hf-export-clean/receipt.json \
             --wheel-artifact dist/*.whl \
             --source-revision ${{ github.sha }} \
-            --release 1.1.0-rc.1
+            --release "$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
       - name: execute and validate installed observability adapters
         shell: bash
         run: |
@@ -428,13 +428,13 @@ jobs:
             --output-dir evidence/observability-clean \
             --wheel-artifact dist/*.whl \
             --source-revision ${{ github.sha }} \
-            --release 1.1.0-rc.1 \
+            --release "$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')" \
             --run-id github-${{ github.run_id }}-${{ github.run_attempt }}-observability-clean
           python -B -I -m tritium.torch.qualify_observability \
             --check-receipt evidence/observability-clean/receipt.json \
             --wheel-artifact dist/*.whl \
             --source-revision ${{ github.sha }} \
-            --release 1.1.0-rc.1
+            --release "$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: wheel-tutorial-source-free-python-3.13
@@ -515,14 +515,14 @@ jobs:
             --wheel "${wheels[0]}" \
             --compute-sanitizer "$(command -v compute-sanitizer)" \
             --source-revision "${{ github.sha }}" \
-            --release 1.1.0-rc.1 \
+            --release "$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')" \
             --run-id github-${{ github.run_id }}-${{ github.run_attempt }}-dispatch-cuda \
             --output-dir evidence/torch-dispatch-cuda
           python scripts/verify-torch-dispatch-cuda-receipt.py \
             evidence/torch-dispatch-cuda/receipt.json \
             --repo "$PWD" \
             --source-revision "${{ github.sha }}" \
-            --release 1.1.0-rc.1 \
+            --release "$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')" \
             --wheel "${wheels[0]}"
       - name: execute installed-wheel CUDA kernel and lifecycle
         shell: bash
@@ -532,7 +532,7 @@ jobs:
           --forbidden-root ${{ github.workspace }}
           --source-revision ${{ github.sha }}
           --device cuda:0
-          --release 1.1.0-rc.1
+          --release "$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
           --run-id github-${{ github.run_id }}-${{ github.run_attempt }}-cuda-functional
           --output evidence/cuda13-torch2.11-py3.13-sm89.json
       - name: execute installed-wheel CUDA PyTorch QAT tutorial
@@ -544,24 +544,27 @@ jobs:
             --device cuda:0 \
             --wheel-artifact dist-cuda/*.whl \
             --source-revision ${{ github.sha }} \
-            --release 1.1.0-rc.1 \
+            --release "$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')" \
             --run-id github-${{ github.run_id }}-${{ github.run_attempt }}-tutorial-cuda
           python -I -m tritium.torch.tutorial_qat \
             --check-receipt evidence/tutorial-cuda/receipt.json \
             --device cuda:0 \
             --wheel-artifact dist-cuda/*.whl \
             --source-revision ${{ github.sha }} \
-            --release 1.1.0-rc.1
+            --release "$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
       - name: qualify installed-wheel CUDA fp16 training
         shell: bash
         env:
           TRITIUM_CUDA_CHECKPOINT: ${{ runner.temp }}/tritium-cuda-training-state
           TRITIUM_CUDA_RECEIPT: ${{ github.workspace }}/evidence/cuda13-fp16-training.json
           TRITIUM_SOURCE_REVISION: ${{ github.sha }}
-          TRITIUM_RELEASE: 1.1.0-rc.1
           TRITIUM_RUN_ID: github-${{ github.run_id }}-${{ github.run_attempt }}-cuda-training
         run: |
           set -euo pipefail
+          # Derived, not written down: an `env:` literal here stamped the wrong release
+          # onto every receipt from the moment the workspace version moved.
+          TRITIUM_RELEASE="$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
+          export TRITIUM_RELEASE
           wheels=(dist-cuda/*.whl)
           test "${#wheels[@]}" -eq 1
           export TRITIUM_QUALIFIED_ARTIFACT="${wheels[0]}"
@@ -570,7 +573,7 @@ jobs:
           python scripts/verify-cuda-training-receipt.py \
             evidence/cuda13-fp16-training.json \
             --source-revision "${{ github.sha }}" \
-            --release 1.1.0-rc.1 \
+            --release "$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')" \
             --artifact "$TRITIUM_QUALIFIED_ARTIFACT"
       - name: execute generated five-minute SmolLM2 notebook
         shell: bash

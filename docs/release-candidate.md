@@ -86,7 +86,7 @@ unmanifested file.
 ```json
 {
   "schema": "tritium.release-inputs.v1",
-  "release": "1.1.0-rc.1",
+  "release": "1.1.0-rc.2",
   "source_revision": "FULL_40_CHARACTER_GIT_REVISION",
   "builder": {
     "id": "https://github.com/OWNER/REPOSITORY/actions/workflows/release.yml",
@@ -144,7 +144,7 @@ topology; every regular member is hashed and linked from the root component:
 ```bash
 npm pack ./packages/tritium-web --pack-destination release/v1.1
 python scripts/generate-npm-sbom.py \
-  --archive release/v1.1/tritium-ai-web-1.1.0-rc.1.tgz \
+  --archive release/v1.1/tritium-ai-web-1.1.0-rc.2.tgz \
   --artifact-id tritium-web-node22 \
   --source-revision "$(git rev-parse HEAD)" \
   --output release/v1.1/tritium-web-node22.cdx.json
@@ -189,13 +189,13 @@ streams, unsafe tar paths, links, and metadata drift fail closed.
 ```bash
 python scripts/package-helm-chart.py \
   --source deploy/helm/tritium \
-  --release 1.1.0-rc.1 \
-  --output release/v1.1/tritium-1.1.0-rc.1.tgz
+  --release 1.1.0-rc.2 \
+  --output release/v1.1/tritium-1.1.0-rc.2.tgz
 python scripts/generate-deployment-sbom.py \
-  --artifact release/v1.1/tritium-1.1.0-rc.1.tgz \
+  --artifact release/v1.1/tritium-1.1.0-rc.2.tgz \
   --artifact-id tritium-helm \
   --kind helm-chart \
-  --release 1.1.0-rc.1 \
+  --release 1.1.0-rc.2 \
   --source-revision "$(git rev-parse HEAD)" \
   --digest-tool target/release/tritium \
   --output release/v1.1/tritium-helm.cdx.json

@@ -42,7 +42,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.1.0-rc.1"         # Single local-RC source; scripts/check-release-version.py gates mirrors
+version = "1.1.0-rc.2"         # Single local-RC source; scripts/check-release-version.py gates mirrors
 edition = "2024"
 rust-version = "1.96"          # MSRV POLICY: latest stable minus two releases, reviewed each
                                # release, and never below 1.89 (where AVX-512 intrinsics
@@ -60,26 +60,26 @@ categories = ["science", "hardware-support", "mathematics"]
 # internal crates (path + caret version, bumped in lockstep with the workspace version at each
 # minor release). The explicit version is required for `cargo publish` (crates.io forbids bare path
 # deps) and lets cargo-deny keep `wildcards = "deny"` meaningful for *external* deps.
-tritium-build-info = { path = "crates/tritium-build-info", version = "1.1.0-rc.1" }
-tritium-core = { path = "crates/tritium-core", version = "1.1.0-rc.1" }
-tritium-spec = { path = "crates/tritium-spec", version = "1.1.0-rc.1" }
-tritium-format = { path = "crates/tritium-format", version = "1.1.0-rc.1" }
-tritium-runtime = { path = "crates/tritium-runtime", version = "1.1.0-rc.1" }
-tritium-testkit = { path = "crates/tritium-testkit", version = "1.1.0-rc.1" }
-tritium-cpu = { path = "crates/tritium-cpu", version = "1.1.0-rc.1" }
-tritium-cuda = { path = "crates/tritium-cuda", version = "1.1.0-rc.1" }
+tritium-build-info = { path = "crates/tritium-build-info", version = "1.1.0-rc.2" }
+tritium-core = { path = "crates/tritium-core", version = "1.1.0-rc.2" }
+tritium-spec = { path = "crates/tritium-spec", version = "1.1.0-rc.2" }
+tritium-format = { path = "crates/tritium-format", version = "1.1.0-rc.2" }
+tritium-runtime = { path = "crates/tritium-runtime", version = "1.1.0-rc.2" }
+tritium-testkit = { path = "crates/tritium-testkit", version = "1.1.0-rc.2" }
+tritium-cpu = { path = "crates/tritium-cpu", version = "1.1.0-rc.2" }
+tritium-cuda = { path = "crates/tritium-cuda", version = "1.1.0-rc.2" }
 # Non-NVIDIA GPU backends. Declared here so `tritium-cli` / `tritium-benches` can link
 # them behind their own optional features — without that linkage their `linkme`
 # self-registration never reaches a shipped binary and no AMD/Vulkan box can produce a
 # `report compare` ledger entry (issue #4).
-tritium-wgpu = { path = "crates/tritium-wgpu", version = "1.1.0-rc.1" }
-tritium-rocm = { path = "crates/tritium-rocm", version = "1.1.0-rc.1" }
-tritium-metal = { path = "crates/tritium-metal", version = "1.1.0-rc.1" }
-tritium-quantize = { path = "crates/tritium-quantize", version = "1.1.0-rc.1" }
-tritium-salt = { path = "crates/tritium-salt", version = "1.1.0-rc.1" }
-tritium-nn = { path = "crates/tritium-nn", version = "1.1.0-rc.1" }
-tritium-train = { path = "crates/tritium-train", version = "1.1.0-rc.1" }
-tritium-onnx = { path = "crates/tritium-onnx", version = "1.1.0-rc.1", default-features = false }
+tritium-wgpu = { path = "crates/tritium-wgpu", version = "1.1.0-rc.2" }
+tritium-rocm = { path = "crates/tritium-rocm", version = "1.1.0-rc.2" }
+tritium-metal = { path = "crates/tritium-metal", version = "1.1.0-rc.2" }
+tritium-quantize = { path = "crates/tritium-quantize", version = "1.1.0-rc.2" }
+tritium-salt = { path = "crates/tritium-salt", version = "1.1.0-rc.2" }
+tritium-nn = { path = "crates/tritium-nn", version = "1.1.0-rc.2" }
+tritium-train = { path = "crates/tritium-train", version = "1.1.0-rc.2" }
+tritium-onnx = { path = "crates/tritium-onnx", version = "1.1.0-rc.2", default-features = false }
 # foundation
 bytemuck = "1"
 blake3 = "1"

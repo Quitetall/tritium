@@ -1,6 +1,6 @@
 {
   "baseline": "v1.0.0",
-  "candidate_version": "1.1.0-rc.1",
+  "candidate_version": "1.1.0-rc.2",
   "python": {
     "added": [
       "KroneckerConflictError",
@@ -46,7 +46,7 @@
       "ternary_matmul"
     ]
   },
-  "report_id": "sha256:3fa9ee936516203b477134c30af742e1cbbd73ecdea1b7b77d6cc62334acb0bc",
+  "report_id": "sha256:a4a547b57908b66182af9f5ee1de59c024787de38ed99ab4eadcf2bbdf5cdfa3",
   "rust": {
     "frozen_crates": [
       "tritium-core",
