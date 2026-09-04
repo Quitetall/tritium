@@ -18,6 +18,7 @@ use crate::ContentId;
 
 mod artifact;
 mod compatibility;
+mod orchestration;
 mod receipt;
 
 pub use artifact::{
@@ -25,6 +26,10 @@ pub use artifact::{
     FrontierArtifactError, FrontierArtifactManifest, FrontierTensorArtifact, TensorRepresentation,
 };
 pub use compatibility::{FrontierCompatibilityError, read_salt_v2_frontier_artifact};
+pub use orchestration::{
+    FRONTIER_RUN_RECEIPT_SCHEMA_V1, FRONTIER_STAGE_REQUEST_SCHEMA_V1, FrontierRunReceipt,
+    FrontierStageRequest,
+};
 pub use receipt::{
     FRONTIER_PARETO_RECEIPT_SCHEMA_V1, FRONTIER_STAGE_RECEIPT_SCHEMA_V1,
     FrontierObjectiveDirection, FrontierObjectiveSpec, FrontierObjectiveValue,
@@ -1107,6 +1112,65 @@ pub enum FrontierPlanError {
         /// Missing candidate artifact identity.
         artifact_id: ContentId,
     },
+    /// Admitted solver is not a member of the profile or misses its trust floor.
+    ProfileSolverMismatch {
+        /// Bound profile identity.
+        profile_id: FrontierProfileId,
+        /// Rejected solver identity.
+        solver_id: SolverId,
+    },
+    /// Admitted request budget differs from the immutable profile budget.
+    ProfileBudgetMismatch {
+        /// Bound profile identity.
+        profile_id: FrontierProfileId,
+    },
+    /// Worker receipt differs from its exact stage request.
+    StageReceiptMismatch {
+        /// First mismatched binding field.
+        field: &'static str,
+    },
+    /// Stage index cannot be incremented or represented.
+    StageIndexOverflow,
+    /// A terminal or completed-evaluation stage cannot advance.
+    CannotAdvanceTerminalStage {
+        /// Terminal stage index.
+        stage_index: u32,
+        /// Terminal stage outcome.
+        outcome: FrontierStageOutcome,
+    },
+    /// Run receipt contains no stage evidence.
+    EmptyRunReceipt,
+    /// Run stage indices are not exactly zero-based and contiguous.
+    NonContiguousStageIndex {
+        /// Required stage index.
+        expected: u32,
+        /// Observed stage index.
+        found: u32,
+    },
+    /// Run-scoped identity or resource binding changed between stages.
+    RunReceiptIdentityDrift {
+        /// Stage containing drift.
+        stage_index: u32,
+        /// First drifted field.
+        field: &'static str,
+    },
+    /// A stage follows a failed or over-budget stage.
+    StageAfterTerminalOutcome {
+        /// Index of prior terminal stage.
+        terminal_index: u32,
+    },
+    /// Stage semantics move backward or repeat.
+    NonMonotonicStageOrder {
+        /// Prior stage.
+        previous: FrontierStage,
+        /// Current stage.
+        current: FrontierStage,
+    },
+    /// Stage input does not equal prior completed-stage output.
+    BrokenStageInputChain {
+        /// Stage with wrong input identity.
+        stage_index: u32,
+    },
 }
 
 impl fmt::Display for FrontierPlanError {
@@ -1253,6 +1317,52 @@ impl fmt::Display for FrontierPlanError {
             Self::UnknownSelectedCandidate { artifact_id } => write!(
                 formatter,
                 "selected artifact {artifact_id} is absent from Pareto candidates"
+            ),
+            Self::ProfileSolverMismatch {
+                profile_id,
+                solver_id,
+            } => write!(
+                formatter,
+                "solver {solver_id} is not admitted by frontier profile {profile_id}"
+            ),
+            Self::ProfileBudgetMismatch { profile_id } => write!(
+                formatter,
+                "solver request budget differs from frontier profile {profile_id}"
+            ),
+            Self::StageReceiptMismatch { field } => {
+                write!(
+                    formatter,
+                    "stage receipt does not match request field {field}"
+                )
+            }
+            Self::StageIndexOverflow => formatter.write_str("frontier stage index overflow"),
+            Self::CannotAdvanceTerminalStage {
+                stage_index,
+                outcome,
+            } => write!(
+                formatter,
+                "frontier stage {stage_index} with outcome {outcome:?} cannot advance"
+            ),
+            Self::EmptyRunReceipt => formatter.write_str("frontier run receipt is empty"),
+            Self::NonContiguousStageIndex { expected, found } => write!(
+                formatter,
+                "frontier run expected stage index {expected}, found {found}"
+            ),
+            Self::RunReceiptIdentityDrift { stage_index, field } => write!(
+                formatter,
+                "frontier run stage {stage_index} changed bound field {field}"
+            ),
+            Self::StageAfterTerminalOutcome { terminal_index } => write!(
+                formatter,
+                "frontier run continues after terminal stage {terminal_index}"
+            ),
+            Self::NonMonotonicStageOrder { previous, current } => write!(
+                formatter,
+                "frontier stage order does not advance: {previous:?} then {current:?}"
+            ),
+            Self::BrokenStageInputChain { stage_index } => write!(
+                formatter,
+                "frontier run stage {stage_index} input does not match prior output"
             ),
         }
     }

@@ -1,0 +1,57 @@
+{
+  "schema": "tritium.frontier-stage-request.v1",
+  "run_id": "tsc1_0101010101010101010101010101010101010101010101010101010101010101",
+  "source_id": "tsc1_0202020202020202020202020202020202020202020202020202020202020202",
+  "stage_index": 0,
+  "stage": "admit-source",
+  "profile": {
+    "schema": "tritium.frontier-profile.v1",
+    "id": "salt.reference.v1",
+    "ordering": "fixed",
+    "solver_ids": ["salt.v3"],
+    "minimum_trust": "registered",
+    "budget": {
+      "host_ram_bytes": 100,
+      "vram_bytes": 20,
+      "disk_bytes": 300,
+      "artifact_bytes": 40,
+      "resident_bytes": 50,
+      "transient_bytes": 60,
+      "fitting_millis": 700,
+      "runtime_latency_micros": 80
+    },
+    "fallback_profile": null,
+    "auto_select": false
+  },
+  "solver": {
+    "id": "salt.v3",
+    "family": "salt",
+    "trust": "registered",
+    "abi_version": 1
+  },
+  "input_id": "tsc1_0202020202020202020202020202020202020202020202020202020202020202",
+  "request": {
+    "rows": 16,
+    "columns": 32,
+    "budget": {
+      "host_ram_bytes": 100,
+      "vram_bytes": 20,
+      "disk_bytes": 300,
+      "artifact_bytes": 40,
+      "resident_bytes": 50,
+      "transient_bytes": 60,
+      "fitting_millis": 700,
+      "runtime_latency_micros": 80
+    }
+  },
+  "estimate": {
+    "host_ram_bytes": 100,
+    "vram_bytes": 20,
+    "disk_bytes": 300,
+    "artifact_bytes": 40,
+    "resident_bytes": 50,
+    "transient_bytes": 60,
+    "fitting_millis": 700,
+    "runtime_latency_micros": 80
+  }
+}

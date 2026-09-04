@@ -166,6 +166,12 @@ impl FrontierStageReceipt {
         })
     }
 
+    /// Content identity of canonical JSON for lineage and Pareto binding.
+    pub fn content_id(&self) -> ContentId {
+        let bytes = serde_json::to_vec(self).expect("frontier stage receipt serializes");
+        ContentId::of_bytes(&bytes)
+    }
+
     /// Campaign or fitting-run identity.
     pub const fn run_id(&self) -> ContentId {
         self.run_id
@@ -801,7 +807,7 @@ fn validate_objective_order<'a>(
     Ok(())
 }
 
-fn require_digest(field: &'static str, id: ContentId) -> Result<(), FrontierPlanError> {
+pub(super) fn require_digest(field: &'static str, id: ContentId) -> Result<(), FrontierPlanError> {
     if id.as_bytes() == &[0_u8; 32] {
         return Err(FrontierPlanError::ZeroReceiptDigest { field });
     }
