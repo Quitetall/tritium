@@ -1,8 +1,10 @@
 use tritium_format::ModelId;
 use tritium_quantize::{
     ActivationCacheBuilder, ActivationCacheSpec, ActivationChunk, ActivationDType,
-    ActivationDigest, CurvatureArtifact, CurvatureSourceId, SaltV2Config, SaltV2TensorFitInput,
-    SaltV2TensorMasterFitInput, fit_salt_v2_tensor_master, plan_salt_v2_tensor_master,
+    ActivationDigest, CurvatureArtifact, CurvatureSourceId, SaltV2Config,
+    SaltV2RestartableTensorMasterFitInput, SaltV2TensorFitInput, SaltV2TensorMasterFitInput,
+    fit_salt_v2_restartable_tensor_master, fit_salt_v2_tensor_master,
+    plan_salt_v2_restartable_tensor_master, plan_salt_v2_tensor_master,
 };
 use tritium_salt::{
     BuiltinSolverBlocker, BuiltinSolverStatus, FRONTIER_SALT_V2_REFERENCE_SOLVER_ID,
@@ -48,7 +50,17 @@ fn builtin_catalog_advertises_only_real_executable_solver() {
     );
     assert!(capabilities[0].descriptor().is_some());
 
-    for capability in &capabilities[1..] {
+    let expected_unavailable = [
+        "qtea-salient-residual.v1",
+        "externd.v1",
+        "twla.v1",
+        "twn.v1",
+        "ttq.v1",
+        "sparse-ternary.v1",
+        "folded-nine-level.v1",
+    ];
+    for (capability, expected_id) in capabilities[1..].iter().zip(expected_unavailable) {
+        assert_eq!(capability.id().as_str(), expected_id);
         assert_eq!(
             capability.status(),
             BuiltinSolverStatus::Unavailable {
@@ -103,4 +115,26 @@ fn salt_reference_adapter_is_bit_identical_to_canonical_fitter() {
         adapted_result.spec().evidence().recipe_id,
         config.master_recipe_id()
     );
+
+    let restartable = SaltV2RestartableTensorMasterFitInput {
+        tensor,
+        source_model_id: model_id,
+        tensor_index: 0,
+        source_tensor_digest: [9; 32],
+    };
+    assert_eq!(
+        adapter
+            .plan_restartable_tensor(restartable, &config)
+            .unwrap(),
+        plan_salt_v2_restartable_tensor_master(restartable, &config).unwrap()
+    );
+    let mut direct_restart = Vec::new();
+    let direct_restart_result =
+        fit_salt_v2_restartable_tensor_master(restartable, &config, &mut direct_restart).unwrap();
+    let mut adapted_restart = Vec::new();
+    let adapted_restart_result = adapter
+        .fit_restartable_tensor(restartable, &config, &mut adapted_restart)
+        .unwrap();
+    assert_eq!(adapted_restart, direct_restart);
+    assert_eq!(adapted_restart_result, direct_restart_result);
 }
