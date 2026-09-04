@@ -173,6 +173,9 @@ impl FrontierStageRequest {
         self.validate_receipt(receipt)?;
         if receipt.outcome() != FrontierStageOutcome::Completed
             || stage_rank(self.stage) >= stage_rank(stage)
+            // Evaluation is semantically terminal even if a future schema
+            // appends a higher-ranked post-processing stage.
+            || self.stage == FrontierStage::Evaluate
         {
             return Err(FrontierPlanError::CannotAdvanceTerminalStage {
                 stage_index: self.stage_index,
