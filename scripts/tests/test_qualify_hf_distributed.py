@@ -85,7 +85,7 @@ class QualifyHfDistributedTests(unittest.TestCase):
             root = Path(raw)
             stage = root / "stage"
             stage.mkdir()
-            artifact = root / "tritium_torch.whl"
+            artifact = root / "pytritium.whl"
             artifact.write_bytes(b"candidate wheel")
             checkpoints = {}
             for mode_name in ("ddp", "fsdp"):
@@ -124,7 +124,7 @@ class QualifyHfDistributedTests(unittest.TestCase):
             root = Path(raw)
             stage = root / "stage"
             stage.mkdir()
-            artifact = root / "tritium_torch.whl"
+            artifact = root / "pytritium.whl"
             artifact.write_bytes(b"candidate wheel")
             values = fragments()
             values[1] = json.loads(json.dumps(values[1]))

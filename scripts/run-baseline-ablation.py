@@ -211,9 +211,9 @@ def _runtime_environment() -> dict[str, str]:
     except ImportError as error:
         raise CampaignError("PyTorch is required for baseline execution") from error
     try:
-        tritium_version = importlib.metadata.version("tritium-torch")
+        tritium_version = importlib.metadata.version("pytritium")
     except importlib.metadata.PackageNotFoundError as error:
-        raise CampaignError("installed tritium-torch wheel is required") from error
+        raise CampaignError("installed pytritium wheel is required") from error
     return {
         "python": platform.python_version(),
         "torch": torch.__version__,

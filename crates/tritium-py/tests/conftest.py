@@ -1,6 +1,6 @@
 """Bind source-tree pytest runs to this checkout's Python package.
 
-The repository also builds and installs ``tritium-torch`` wheels.  A global
+The repository also builds and installs ``pytritium`` wheels.  A global
 wheel on ``sys.path`` must never make source tests pass against stale Python
 modules or a different native extension.
 """
@@ -52,7 +52,7 @@ def _installed_distribution_owns_source() -> bool:
     """
 
     try:
-        distribution = importlib.metadata.distribution("tritium-torch")
+        distribution = importlib.metadata.distribution("pytritium")
         import tritium
     except (importlib.metadata.PackageNotFoundError, ImportError):
         return False
@@ -68,7 +68,7 @@ def pytest_collection_modifyitems(config, items) -> None:  # type: ignore[no-unt
     if _installed_distribution_owns_source():
         return
     skip = pytest.mark.skip(
-        reason="requires installed tritium-torch wheel; run wheel qualification lane"
+        reason="requires installed pytritium wheel; run wheel qualification lane"
     )
     for item in items:
         if Path(str(item.fspath)).name in INSTALLED_WHEEL_ONLY:

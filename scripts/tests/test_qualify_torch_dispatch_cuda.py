@@ -34,7 +34,7 @@ class QualifyTorchDispatchCudaTests(unittest.TestCase):
             root = Path(raw)
             stage = root / "stage"
             stage.mkdir()
-            wheel = root / "tritium_torch-1.1.0rc0-cp39-abi3-linux_x86_64.whl"
+            wheel = root / "pytritium-1.1.0rc0-cp39-abi3-linux_x86_64.whl"
             wheel.write_bytes(b"wheel")
             source = root / "test_torch_dispatch.py"
             source.write_text("def test_native_cuda(): pass\n", encoding="utf-8")

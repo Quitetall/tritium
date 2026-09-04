@@ -52,7 +52,7 @@ see `docs/v1.0-api-freeze-audit.md` for the tier policy.
   first-order backward uses an opaque dispatcher VJP boundary so native packed
   caches remain available without tracing storage pointers through fake tensors.
 - **Python distribution rename:** install release candidates with
-  `pip install tritium-torch`; the import namespace remains `import tritium`.
+  `pip install pytritium`; the import namespace remains `import tritium`.
   This aligns packaging with ADR 0033 and avoids claiming the generic `tritium`
   distribution name. The Rust workspace and wheel now share the
   `1.1.0-rc.1` candidate version (rendered as PEP 440 `1.1.0rc1` in wheel
@@ -65,7 +65,7 @@ see `docs/v1.0-api-freeze-audit.md` for the tier policy.
 ### Added
 
 - **Source-bound Stage-7 PyTorch data:** `Stage7TokenEvidencePack` now exposes
-  strict, same-handle token-pack admission to the `tritium-torch` wheel without
+  strict, same-handle token-pack admission to the `pytritium` wheel without
   expanding token payloads into Python scalar lists. `Stage7CausalData.open`
   selects a bounded partition window, terminally rehashes the retained payload
   handle, records both ordered-member and raw-token identities, and yields

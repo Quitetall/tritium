@@ -287,7 +287,7 @@ def run(
         "environment": {
             "python": platform.python_version(),
             "torch": torch.__version__,
-            "tritium": importlib.metadata.version("tritium-torch"),
+            "tritium": importlib.metadata.version("pytritium"),
             "device": "cpu",
         },
         "estimators": cases,

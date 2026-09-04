@@ -236,9 +236,9 @@ def _allowed_installer_extra(
 
 
 def _verify_installed_wheel(wheel: Any, wheel_name: str) -> dict[str, Any]:
-    distribution = importlib.metadata.distribution("tritium-torch")
+    distribution = importlib.metadata.distribution("pytritium")
     if distribution.files is None:
-        raise RuntimeError("installed tritium-torch distribution has no file inventory")
+        raise RuntimeError("installed pytritium distribution has no file inventory")
     distribution_base = Path(distribution.locate_file(""))
     distribution_root = distribution_base.resolve(strict=True)
     wheel.seek(0)
@@ -278,8 +278,8 @@ def _verify_installed_wheel(wheel: Any, wheel_name: str) -> dict[str, Any]:
             if ((info.external_attr >> 16) & 0o170000) == 0o120000:
                 raise RuntimeError("wheel contains a symlink member")
         metadata = BytesParser().parsebytes(archive.read(metadata_names[0]))
-        if metadata.get("Name", "").lower().replace("_", "-") != "tritium-torch":
-            raise RuntimeError("wheel distribution name differs from tritium-torch")
+        if metadata.get("Name", "").lower().replace("_", "-") != "pytritium":
+            raise RuntimeError("wheel distribution name differs from pytritium")
         wheel_version = metadata.get("Version")
         if not wheel_version or wheel_version != distribution.version:
             raise RuntimeError("installed distribution version differs from wheel")
@@ -287,9 +287,9 @@ def _verify_installed_wheel(wheel: Any, wheel_name: str) -> dict[str, Any]:
         if (
             not wheel_name.endswith(".whl")
             or len(filename) != 5
-            or filename[0].lower().replace("-", "_") != "tritium_torch"
+            or filename[0].lower().replace("-", "_") != "pytritium"
             or filename[1] != wheel_version
-            or dist_info != f"tritium_torch-{wheel_version}.dist-info/"
+            or dist_info != f"pytritium-{wheel_version}.dist-info/"
         ):
             raise RuntimeError("wheel filename or dist-info identity differs")
         wheel_metadata = BytesParser().parsebytes(archive.read(wheel_names[0]))

@@ -34,7 +34,7 @@ def write_matrix(root):
                 "python_version": f"3.{minor}.7",
                 "host_os": host_os,
                 "host_arch": host_arch,
-                "wheel": f"tritium_torch-1.1.0rc0-cp39-abi3-{platform_tag}.whl",
+                "wheel": f"pytritium-1.1.0rc0-cp39-abi3-{platform_tag}.whl",
                 "sha256": {"linux": "11", "win32": "22", "darwin": "33"}[host_os] * 32,
                 "bytes": 1234,
                 "version": "1.1.0rc0",
@@ -106,7 +106,7 @@ class AggregateWheelSmokeTests(unittest.TestCase):
             value["host_os"] = "win32"
             value["host_arch"] = "amd64"
             value["platform_tag"] = "win_amd64"
-            value["wheel"] = "tritium_torch-1.1.0rc0-cp39-abi3-win_amd64.whl"
+            value["wheel"] = "pytritium-1.1.0rc0-cp39-abi3-win_amd64.whl"
             path.write_text(json.dumps(value), encoding="utf-8")
             with self.assertRaisesRegex(MODULE.AggregateError, "host does not match"):
                 MODULE.aggregate(root, REVISION, RELEASE, "run-1")

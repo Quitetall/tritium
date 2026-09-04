@@ -39,7 +39,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-candidate = os.environ.get("TRITIUM_WHEEL", "tritium-torch==1.1.0rc1")
+candidate = os.environ.get("TRITIUM_WHEEL", "pytritium==1.1.0rc1")
 candidate_path = Path(candidate)
 if candidate_path.is_dir():
     wheels = sorted(candidate_path.glob("*.whl"))

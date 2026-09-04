@@ -74,20 +74,20 @@ def _installed_distribution(
     wheel_inventory: dict[str, object],
 ) -> tuple[str, Path, dict[str, object]]:
     try:
-        distribution = importlib.metadata.distribution("tritium-torch")
+        distribution = importlib.metadata.distribution("pytritium")
     except importlib.metadata.PackageNotFoundError as error:
         raise RuntimeError(
-            "observability qualification requires installed tritium-torch"
+            "observability qualification requires installed pytritium"
         ) from error
     module = Path(tritium.__file__).resolve(strict=True)
     if distribution.files is None:
-        raise RuntimeError("installed tritium-torch distribution has no file inventory")
+        raise RuntimeError("installed pytritium distribution has no file inventory")
     owned_paths = [str(item).replace("\\", "/") for item in distribution.files]
     if len(owned_paths) != len(set(owned_paths)):
-        raise RuntimeError("installed tritium-torch file inventory contains duplicates")
+        raise RuntimeError("installed pytritium file inventory contains duplicates")
     owned = {distribution.locate_file(item).resolve() for item in distribution.files}
     if module not in owned:
-        raise RuntimeError("imported tritium package is not owned by tritium-torch")
+        raise RuntimeError("imported tritium package is not owned by pytritium")
     entries = wheel_inventory["entries"]
     assert isinstance(entries, list)
     expected = {str(entry["path"]): entry for entry in entries}
@@ -101,12 +101,12 @@ def _installed_distribution(
     if not set(expected).issubset(actual_paths) or not (
         actual_paths - set(expected)
     ).issubset(allowed_installer_files):
-        raise RuntimeError("installed tritium-torch file inventory differs from wheel")
+        raise RuntimeError("installed pytritium file inventory differs from wheel")
     installed_entries = []
     for logical in sorted(actual_paths):
         installed = distribution.locate_file(logical)
         if installed.is_symlink() or not installed.is_file():
-            raise RuntimeError("installed tritium-torch RECORD contains a non-file")
+            raise RuntimeError("installed pytritium RECORD contains a non-file")
         identity = {
             "path": logical,
             "bytes": installed.stat().st_size,
@@ -121,9 +121,9 @@ def _installed_distribution(
             identity["bytes"] != entry["bytes"]
             or identity["sha256"] != entry["sha256"]
         ):
-            raise RuntimeError("installed tritium-torch files differ from candidate wheel")
+            raise RuntimeError("installed pytritium files differ from candidate wheel")
     if distribution.version != wheel_inventory["distribution_version"]:
-        raise RuntimeError("installed tritium-torch version differs from candidate wheel")
+        raise RuntimeError("installed pytritium version differs from candidate wheel")
     record_entry = next(
         entry for entry in installed_entries if entry["path"] == record_path
     )

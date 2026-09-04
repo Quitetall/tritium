@@ -151,8 +151,8 @@ jobs:
         run: >-
           python scripts/generate-wheel-sbom.py
           --wheel dist
-          --artifact-id tritium-torch-${{ matrix.platform.target_id }}
-          --output dist/tritium-torch-${{ matrix.platform.target_id }}.cdx.json
+          --artifact-id pytritium-${{ matrix.platform.target_id }}
+          --output dist/pytritium-${{ matrix.platform.target_id }}.cdx.json
       - name: upload wheel artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
@@ -490,8 +490,8 @@ jobs:
         run: >-
           python scripts/generate-wheel-sbom.py
           --wheel dist-cuda
-          --artifact-id tritium-torch-linux-cuda13-sm89
-          --output dist-cuda/tritium-torch-linux-cuda13-sm89.cdx.json
+          --artifact-id pytritium-linux-cuda13-sm89
+          --output dist-cuda/pytritium-linux-cuda13-sm89.cdx.json
       - name: install pinned CUDA PyTorch and Hugging Face stack
         shell: bash
         run: |
