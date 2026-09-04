@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use tritium_format::ModelId;
 use tritium_quantize::{
     ActivationCacheBuilder, ActivationCacheSpec, ActivationChunk, ActivationDType,
@@ -6,10 +7,21 @@ use tritium_quantize::{
     fit_salt_v2_restartable_tensor_master, fit_salt_v2_tensor_master,
     plan_salt_v2_restartable_tensor_master, plan_salt_v2_tensor_master,
 };
+
 use tritium_salt::{
     BuiltinSolverBlocker, BuiltinSolverStatus, FRONTIER_SALT_V2_REFERENCE_SOLVER_ID,
-    SaltV2ReferenceAdapter, SolverFamily, SolverTrust, builtin_solver_capabilities,
+    FrontierResourceEstimator, FrontierSolverError, ResourceVector, SaltV2ReferenceAdapter,
+    SolverFamily, SolverRegistry, SolverRequest, SolverTrust, builtin_solver_capabilities,
 };
+
+#[derive(Debug)]
+struct ExactResources(ResourceVector);
+
+impl FrontierResourceEstimator for ExactResources {
+    fn estimate(&self, _request: &SolverRequest) -> Result<ResourceVector, FrontierSolverError> {
+        Ok(self.0)
+    }
+}
 
 fn tensor_fixture() -> (Vec<f32>, Vec<f32>, tritium_quantize::ActivationCache) {
     let activation_spec = ActivationCacheSpec::new(
@@ -137,4 +149,27 @@ fn salt_reference_adapter_is_bit_identical_to_canonical_fitter() {
         .unwrap();
     assert_eq!(adapted_restart, direct_restart);
     assert_eq!(adapted_restart_result, direct_restart_result);
+}
+
+#[test]
+fn salt_adapter_registers_only_with_explicit_resource_estimator() {
+    let resources = ResourceVector::new(11, 0, 13, 17, 19, 23, 29, None);
+    let adapter = SaltV2ReferenceAdapter::new().unwrap();
+    let mut registry = SolverRegistry::new();
+    registry
+        .register(Arc::new(
+            adapter.with_resource_estimator(Arc::new(ExactResources(resources))),
+        ))
+        .unwrap();
+    let request =
+        SolverRequest::new(2, 128, ResourceVector::new(11, 0, 13, 17, 19, 23, 29, None)).unwrap();
+    let plan = registry
+        .plan(
+            &tritium_salt::SolverId::new(FRONTIER_SALT_V2_REFERENCE_SOLVER_ID).unwrap(),
+            SolverTrust::Registered,
+            &request,
+        )
+        .unwrap();
+    assert_eq!(plan.estimate(), resources);
+    assert_eq!(plan.descriptor(), adapter.descriptor());
 }

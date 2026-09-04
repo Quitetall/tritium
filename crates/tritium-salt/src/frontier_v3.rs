@@ -39,7 +39,8 @@ pub use receipt::{
 };
 pub use solvers::{
     BuiltinSolverBlocker, BuiltinSolverCapability, BuiltinSolverStatus,
-    FRONTIER_SALT_V2_REFERENCE_SOLVER_ID, SaltV2ReferenceAdapter, builtin_solver_capabilities,
+    FRONTIER_SALT_V2_REFERENCE_SOLVER_ID, FrontierResourceEstimator, SaltV2FrontierSolver,
+    SaltV2ReferenceAdapter, builtin_solver_capabilities,
 };
 
 /// Object-safe solver planning ABI supported by this release.

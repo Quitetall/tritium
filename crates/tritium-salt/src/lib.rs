@@ -34,9 +34,10 @@ pub use frontier_v3::{
     FrontierCompatibilityError, FrontierObjectiveDirection, FrontierObjectiveSpec,
     FrontierObjectiveValue, FrontierOrdering, FrontierParetoCandidate, FrontierParetoReceipt,
     FrontierPlanError, FrontierProfile, FrontierProfileCatalog, FrontierProfileId,
-    FrontierRunReceipt, FrontierSelection, FrontierSolver, FrontierSolverError, FrontierStage,
-    FrontierStageOutcome, FrontierStageReceipt, FrontierStageRequest, FrontierTensorArtifact,
-    ResourceDimension, ResourceVector, ResourceViolation, SaltV2ReferenceAdapter, SolverDescriptor,
+    FrontierResourceEstimator, FrontierRunReceipt, FrontierSelection, FrontierSolver,
+    FrontierSolverError, FrontierStage, FrontierStageOutcome, FrontierStageReceipt,
+    FrontierStageRequest, FrontierTensorArtifact, ResourceDimension, ResourceVector,
+    ResourceViolation, SaltV2FrontierSolver, SaltV2ReferenceAdapter, SolverDescriptor,
     SolverFamily, SolverId, SolverRegistry, SolverRequest, SolverTrust, TensorRepresentation,
     builtin_solver_capabilities, read_salt_v2_frontier_artifact,
 };

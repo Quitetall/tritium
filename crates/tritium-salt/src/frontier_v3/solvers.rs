@@ -1,6 +1,6 @@
 //! Built-in solver capability catalog and concrete native adapters.
 
-use std::io::Write;
+use std::{io::Write, sync::Arc};
 
 use tritium_format::salt_v2_master::SaltV2MasterTensorSpec;
 use tritium_quantize::{
@@ -10,8 +10,8 @@ use tritium_quantize::{
 };
 
 use super::{
-    FRONTIER_SOLVER_ABI_V1, FrontierPlanError, SolverDescriptor, SolverFamily, SolverId,
-    SolverTrust,
+    FRONTIER_SOLVER_ABI_V1, FrontierPlanError, FrontierSolver, FrontierSolverError, ResourceVector,
+    SolverDescriptor, SolverFamily, SolverId, SolverRequest, SolverTrust,
 };
 
 /// Stable identity of native bounded-memory SALT V2 CPU reference fitter.
@@ -162,6 +162,18 @@ impl SaltV2ReferenceAdapter {
         &self.descriptor
     }
 
+    /// Attach caller-owned machine/resource estimation, making this adapter
+    /// installable in planning registry without fabricating hardware claims.
+    pub fn with_resource_estimator(
+        &self,
+        estimator: Arc<dyn FrontierResourceEstimator>,
+    ) -> SaltV2FrontierSolver {
+        SaltV2FrontierSolver {
+            adapter: self.clone(),
+            estimator,
+        }
+    }
+
     /// Plan one ordinary tensor using canonical SALT V2 validation.
     ///
     /// # Errors
@@ -210,5 +222,40 @@ impl SaltV2ReferenceAdapter {
         sink: W,
     ) -> Result<SaltV2TensorMasterFitResult, SaltV2Error> {
         fit_salt_v2_restartable_tensor_master(input, config, sink)
+    }
+}
+
+/// Machine-specific resource estimation supplied separately from mathematical
+/// solver implementation.
+pub trait FrontierResourceEstimator: std::fmt::Debug + Send + Sync {
+    /// Estimate every required resource dimension for one immutable request.
+    ///
+    /// # Errors
+    /// Returns evidence or hardware-model failure without starting fitting.
+    fn estimate(&self, request: &SolverRequest) -> Result<ResourceVector, FrontierSolverError>;
+}
+
+/// SALT reference adapter plus explicit resource estimator, suitable for
+/// [`super::SolverRegistry`] planning admission.
+#[derive(Debug)]
+pub struct SaltV2FrontierSolver {
+    adapter: SaltV2ReferenceAdapter,
+    estimator: Arc<dyn FrontierResourceEstimator>,
+}
+
+impl SaltV2FrontierSolver {
+    /// Concrete fitting adapter paired with this planning object.
+    pub const fn adapter(&self) -> &SaltV2ReferenceAdapter {
+        &self.adapter
+    }
+}
+
+impl FrontierSolver for SaltV2FrontierSolver {
+    fn descriptor(&self) -> &SolverDescriptor {
+        self.adapter.descriptor()
+    }
+
+    fn estimate(&self, request: &SolverRequest) -> Result<ResourceVector, FrontierSolverError> {
+        self.estimator.estimate(request)
     }
 }
