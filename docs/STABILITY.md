@@ -85,7 +85,19 @@ Two properties matter more than the blocking behaviour:
   never published guards a contract that does not exist.
 - Coverage is **every published library crate**, not a hand-picked subset. A
   crate excluded from the gate cannot break loudly; it can only break silently.
-  A Tier 3 break is expected — but it should still be visible.
+  A Tier 3 break is expected — but it should still be visible. The gate went
+  from 7 crates to 21 on 2026-09-03.
+
+Two honest gaps remain, both recorded in the script's own header rather than
+left for someone to discover:
+
+- **`tritium-cuda` is still excluded.** Its `cuda` feature needs an nvcc that CI
+  does not have. It is Tier 3, so it promises nothing — but it is also the
+  largest public surface nobody is watching, which is a different problem from
+  promising nothing.
+- **`tritium-serve` is checked with default features only**, and its surface
+  lives behind `serve`/`cuda`. The check therefore sees very little of it. That
+  is a gap, not a pass.
 
 ## Adding a crate
 
