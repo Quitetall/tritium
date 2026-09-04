@@ -161,6 +161,10 @@ impl FrontierStageRequest {
     }
 
     /// Build next request from one exact completed receipt.
+    ///
+    /// This convenience path preserves the admitted matrix shape, budget, and
+    /// estimate. A stage needing a different admission must obtain a new
+    /// [`AdmittedSolverPlan`] and call [`Self::new`] instead.
     pub fn next(
         &self,
         stage: FrontierStage,
@@ -169,7 +173,6 @@ impl FrontierStageRequest {
         self.validate_receipt(receipt)?;
         if receipt.outcome() != FrontierStageOutcome::Completed
             || stage_rank(self.stage) >= stage_rank(stage)
-            || self.stage == FrontierStage::Evaluate
         {
             return Err(FrontierPlanError::CannotAdvanceTerminalStage {
                 stage_index: self.stage_index,
@@ -178,7 +181,8 @@ impl FrontierStageRequest {
         }
         let output_id = receipt
             .output_id()
-            .expect("completed stage receipt always carries output identity");
+            .ok_or(FrontierPlanError::StageReceiptMismatch { field: "output_id" })?;
+        require_digest("output_id", output_id)?;
         let stage_index = self
             .stage_index
             .checked_add(1)
@@ -295,6 +299,10 @@ impl From<FrontierStageRequest> for FrontierStageRequestWire {
 }
 
 /// Validated ordered stage history carried across orchestrator retries/resume.
+///
+/// One run binds one immutable profile snapshot and one solver. Explicit
+/// profile fallback or solver substitution starts a new run, matching the
+/// registry rule that fallback is never automatic.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "FrontierRunReceiptWire", into = "FrontierRunReceiptWire")]
 pub struct FrontierRunReceipt {
