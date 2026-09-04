@@ -800,6 +800,7 @@ pub trait FrontierSolver: fmt::Debug + Send + Sync {
 }
 
 /// Resource estimate plus exact machine and supporting-evidence identities.
+/// Individual dimensions may be zero; zero means no use, not unknown.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrontierResourceEstimate {
     resources: ResourceVector,
@@ -889,8 +890,7 @@ impl AdmittedSolverPlan {
             serde_json::to_vec(&self.request).expect("frontier solver request serializes");
         let resources = serde_json::to_vec(&self.estimate.resources())
             .expect("frontier resource vector serializes");
-        let mut identity =
-            Vec::with_capacity(64 + descriptor.len() + request.len() + resources.len());
+        let mut identity = Vec::new();
         identity.extend_from_slice(b"tritium frontier admitted solver plan v1\0");
         for field in [&descriptor, &request, &resources] {
             identity.extend_from_slice(&(field.len() as u64).to_le_bytes());

@@ -159,7 +159,7 @@ fn salt_reference_adapter_is_bit_identical_to_canonical_fitter() {
         .plan(&solver_id, SolverTrust::Registered, &solver_request)
         .unwrap();
     let planned_spec = adapter.plan_tensor(input, &config).unwrap();
-    let input_id = solver.tensor_input_id(&plan, &planned_spec).unwrap();
+    let input_id = tritium_salt::SaltV2FrontierSolver::tensor_input_id(&planned_spec).unwrap();
     let request = FrontierStageRequest::new(
         ContentId::of_bytes(b"run"),
         ContentId::of_bytes(b"source"),

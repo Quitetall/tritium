@@ -304,28 +304,26 @@ impl SaltV2FrontierSolver {
         {
             return Err(SaltV2FrontierFitError::ShapeMismatch);
         }
-        if request.input_id() != self.tensor_input_id(plan, spec)? {
+        if request.input_id() != Self::tensor_input_id(spec)? {
             return Err(SaltV2FrontierFitError::InputIdentityMismatch);
         }
         Ok(())
     }
 
-    /// Bind opaque admission identity to canonical planned tensor metadata.
+    /// Identify canonical planned tensor metadata independent of execution machine.
+    ///
+    /// External orchestrators use this stable artifact identity when building a
+    /// [`FrontierStageRequest`]. Resource provenance belongs to plan/output
+    /// identity, so identical inputs deduplicate across machines.
     ///
     /// # Errors
-    /// Rejects a plan for another solver or invalid canonical metadata.
+    /// Rejects invalid canonical metadata.
     pub fn tensor_input_id(
-        &self,
-        plan: &AdmittedSolverPlan,
         spec: &SaltV2MasterTensorSpec,
     ) -> Result<ContentId, SaltV2FrontierFitError> {
-        if plan.descriptor() != self.adapter.descriptor() {
-            return Err(SaltV2FrontierFitError::SolverMismatch);
-        }
         let metadata = spec.canonical_bytes().map_err(SaltV2Error::from)?;
-        let mut identity = Vec::with_capacity(80 + metadata.len());
+        let mut identity = Vec::new();
         identity.extend_from_slice(b"tritium frontier admitted salt tensor input v1\0");
-        identity.extend_from_slice(plan.content_id().as_bytes());
         identity.extend_from_slice(&(metadata.len() as u64).to_le_bytes());
         identity.extend_from_slice(&metadata);
         Ok(ContentId::of_bytes(&identity))
@@ -348,13 +346,15 @@ impl SaltV2AdmittedTensorFitResult {
         result: SaltV2TensorMasterFitResult,
     ) -> Self {
         let resource_estimate = plan.resource_estimate();
-        let mut identity = Vec::with_capacity(160);
+        let mut identity = Vec::new();
         identity.extend_from_slice(b"tritium frontier admitted salt tensor output v1\0");
         identity.extend_from_slice(request.content_id().as_bytes());
         identity.extend_from_slice(plan.content_id().as_bytes());
         identity.extend_from_slice(resource_estimate.machine_id().as_bytes());
         identity.extend_from_slice(resource_estimate.evidence_id().as_bytes());
-        identity.extend_from_slice(&result.receipt().tensor_master_id());
+        let tensor_master_id = result.receipt().tensor_master_id();
+        identity.extend_from_slice(&(tensor_master_id.len() as u64).to_le_bytes());
+        identity.extend_from_slice(&tensor_master_id);
         let output_id = ContentId::of_bytes(&identity);
         Self {
             stage_request_id: request.content_id(),
