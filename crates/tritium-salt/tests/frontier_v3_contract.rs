@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
 use tritium_salt::{
-    FRONTIER_SOLVER_ABI_V1, FrontierPlanError, FrontierSolver, FrontierSolverError,
-    ResourceDimension, ResourceVector, SolverDescriptor, SolverFamily, SolverId, SolverRegistry,
-    SolverRequest, SolverTrust,
+    FRONTIER_PROFILE_SCHEMA_V1, FRONTIER_SOLVER_ABI_V1, FrontierOrdering, FrontierPlanError,
+    FrontierProfile, FrontierProfileId, FrontierSolver, FrontierSolverError, ResourceDimension,
+    ResourceVector, SolverDescriptor, SolverFamily, SolverId, SolverRegistry, SolverRequest,
+    SolverTrust,
 };
 
 #[derive(Debug)]
@@ -237,5 +238,124 @@ fn constrained_dimension_requires_an_estimate() {
             dimension: ResourceDimension::RuntimeLatencyMicros,
             ..
         })
+    ));
+}
+
+#[test]
+fn profile_contract_round_trips_with_stable_schema() {
+    let profile = FrontierProfile::new(
+        FrontierProfileId::new("research.default").unwrap(),
+        FrontierOrdering::Search,
+        vec![
+            SolverId::new("salt.v3").unwrap(),
+            SolverId::new("qtea.v1").unwrap(),
+        ],
+        SolverTrust::Experimental,
+        ResourceVector::new(1024, 512, 2048, 768, 896, 128, 60_000, None),
+        Some(FrontierProfileId::new("safe.salt-only").unwrap()),
+        false,
+    )
+    .unwrap();
+
+    let value = serde_json::to_value(&profile).unwrap();
+    assert_eq!(value["schema"], FRONTIER_PROFILE_SCHEMA_V1);
+    assert_eq!(value["ordering"], "search");
+    assert_eq!(value["fallback_profile"], "safe.salt-only");
+    assert_eq!(value["auto_select"], false);
+    assert!(value.get("elements").is_none());
+    assert_eq!(
+        serde_json::from_value::<FrontierProfile>(value).unwrap(),
+        profile
+    );
+}
+
+#[test]
+fn profile_refuses_bad_schema_empty_duplicate_and_recursive_fallback() {
+    let budget = ResourceVector::new(1, 0, 1, 1, 1, 1, 1, None);
+    let profile_id = FrontierProfileId::new("research.default").unwrap();
+    assert!(matches!(
+        FrontierProfile::new(
+            profile_id.clone(),
+            FrontierOrdering::Search,
+            Vec::new(),
+            SolverTrust::Experimental,
+            budget,
+            None,
+            false,
+        ),
+        Err(FrontierPlanError::EmptySolverSet { .. })
+    ));
+    assert!(matches!(
+        FrontierProfile::new(
+            profile_id.clone(),
+            FrontierOrdering::Fixed,
+            vec![
+                SolverId::new("salt.v3").unwrap(),
+                SolverId::new("salt.v3").unwrap(),
+            ],
+            SolverTrust::Registered,
+            budget,
+            None,
+            false,
+        ),
+        Err(FrontierPlanError::DuplicateProfileSolver { .. })
+    ));
+    assert!(matches!(
+        FrontierProfile::new(
+            profile_id.clone(),
+            FrontierOrdering::Search,
+            vec![SolverId::new("salt.v3").unwrap()],
+            SolverTrust::Experimental,
+            budget,
+            Some(profile_id),
+            false,
+        ),
+        Err(FrontierPlanError::RecursiveFallback { .. })
+    ));
+
+    let bad_schema = r#"{"schema":"tritium.frontier-profile.v999","id":"research.default","ordering":"search","solver_ids":["salt.v3"],"minimum_trust":"experimental","budget":{"host_ram_bytes":1,"vram_bytes":0,"disk_bytes":1,"artifact_bytes":1,"resident_bytes":1,"transient_bytes":1,"fitting_millis":1,"runtime_latency_micros":null},"fallback_profile":null,"auto_select":false}"#;
+    assert!(serde_json::from_str::<FrontierProfile>(bad_schema).is_err());
+}
+
+#[test]
+fn profile_validation_refuses_missing_or_under_trusted_members() {
+    let budget = ResourceVector::new(4, 0, 4, 4, 4, 4, 4, None);
+    let mut registry = SolverRegistry::new();
+    registry
+        .register(solver(
+            "salt.v3",
+            SolverTrust::Experimental,
+            FRONTIER_SOLVER_ABI_V1,
+            budget,
+        ))
+        .unwrap();
+    let registered = FrontierProfile::new(
+        FrontierProfileId::new("release.fixed").unwrap(),
+        FrontierOrdering::Fixed,
+        vec![SolverId::new("salt.v3").unwrap()],
+        SolverTrust::Registered,
+        budget,
+        None,
+        false,
+    )
+    .unwrap();
+    assert!(matches!(
+        registry.validate_profile(&registered),
+        Err(FrontierPlanError::InsufficientTrust { .. })
+    ));
+
+    let missing = FrontierProfile::new(
+        FrontierProfileId::new("research.missing").unwrap(),
+        FrontierOrdering::Search,
+        vec![SolverId::new("missing.v1").unwrap()],
+        SolverTrust::Experimental,
+        budget,
+        None,
+        true,
+    )
+    .unwrap();
+    assert!(matches!(
+        registry.validate_profile(&missing),
+        Err(FrontierPlanError::UnknownSolver { .. })
     ));
 }

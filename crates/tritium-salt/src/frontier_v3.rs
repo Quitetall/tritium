@@ -5,12 +5,20 @@
 //! no automatic fallback: callers must name and submit any fallback as a new
 //! planning request.
 
-use std::{collections::BTreeMap, error::Error, fmt, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    error::Error,
+    fmt,
+    sync::Arc,
+};
 
 use serde::{Deserialize, Serialize};
 
 /// Object-safe solver planning ABI supported by this release.
 pub const FRONTIER_SOLVER_ABI_V1: u16 = 1;
+
+/// Stable serialized schema for experimental V3 profiles.
+pub const FRONTIER_PROFILE_SCHEMA_V1: &str = "tritium.frontier-profile.v1";
 
 /// Stable, canonical solver identity.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -21,15 +29,7 @@ impl SolverId {
     /// Parse a lowercase ASCII identifier containing letters, digits, `.`, `_`, or `-`.
     pub fn new(value: impl Into<String>) -> Result<Self, FrontierPlanError> {
         let value = value.into();
-        let valid = !value.is_empty()
-            && value.len() <= 128
-            && value.as_bytes()[0].is_ascii_lowercase()
-            && value.bytes().all(|byte| {
-                byte.is_ascii_lowercase()
-                    || byte.is_ascii_digit()
-                    || matches!(byte, b'.' | b'_' | b'-')
-            });
-        if !valid {
+        if !valid_identifier(&value) {
             return Err(FrontierPlanError::InvalidSolverId { value });
         }
         Ok(Self(value))
@@ -59,6 +59,15 @@ impl From<SolverId> for String {
     fn from(value: SolverId) -> Self {
         value.0
     }
+}
+
+fn valid_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value.as_bytes()[0].is_ascii_lowercase()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
+        })
 }
 
 /// Mathematical family implemented by a solver.
@@ -96,6 +105,57 @@ pub enum SolverTrust {
     Registered,
     /// Independently qualified implementation for certified profiles.
     Certified,
+}
+
+/// Stable, canonical V3 profile identity.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct FrontierProfileId(String);
+
+impl FrontierProfileId {
+    /// Parse a lowercase ASCII profile identifier.
+    pub fn new(value: impl Into<String>) -> Result<Self, FrontierPlanError> {
+        let value = value.into();
+        if !valid_identifier(&value) {
+            return Err(FrontierPlanError::InvalidProfileId { value });
+        }
+        Ok(Self(value))
+    }
+
+    /// Canonical string form used by manifests and receipts.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for FrontierProfileId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl TryFrom<String> for FrontierProfileId {
+    type Error = FrontierPlanError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<FrontierProfileId> for String {
+    fn from(value: FrontierProfileId) -> Self {
+        value.0
+    }
+}
+
+/// Whether a profile searches candidate order or executes one frozen order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FrontierOrdering {
+    /// Search candidate composition and order with complete trial receipts.
+    Search,
+    /// Execute solver IDs in their declared order without searching alternatives.
+    Fixed,
 }
 
 /// Immutable identity and maturity metadata for one solver implementation.
@@ -369,6 +429,148 @@ impl ResourceViolation {
     }
 }
 
+/// Versioned V3 policy selecting candidate solvers and hard resource ceilings.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "FrontierProfileWire", into = "FrontierProfileWire")]
+pub struct FrontierProfile {
+    id: FrontierProfileId,
+    ordering: FrontierOrdering,
+    solver_ids: Vec<SolverId>,
+    minimum_trust: SolverTrust,
+    budget: ResourceVector,
+    fallback_profile: Option<FrontierProfileId>,
+    auto_select: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FrontierProfileWire {
+    schema: String,
+    id: FrontierProfileId,
+    ordering: FrontierOrdering,
+    solver_ids: Vec<SolverId>,
+    minimum_trust: SolverTrust,
+    budget: ResourceVector,
+    fallback_profile: Option<FrontierProfileId>,
+    auto_select: bool,
+}
+
+impl FrontierProfile {
+    /// Construct a profile, rejecting empty or ambiguous solver policy.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        id: FrontierProfileId,
+        ordering: FrontierOrdering,
+        solver_ids: Vec<SolverId>,
+        minimum_trust: SolverTrust,
+        budget: ResourceVector,
+        fallback_profile: Option<FrontierProfileId>,
+        auto_select: bool,
+    ) -> Result<Self, FrontierPlanError> {
+        if solver_ids.is_empty() {
+            return Err(FrontierPlanError::EmptySolverSet { profile_id: id });
+        }
+        let mut unique = BTreeSet::new();
+        for solver_id in &solver_ids {
+            if !unique.insert(solver_id) {
+                return Err(FrontierPlanError::DuplicateProfileSolver {
+                    profile_id: id,
+                    solver_id: solver_id.clone(),
+                });
+            }
+        }
+        if fallback_profile.as_ref() == Some(&id) {
+            return Err(FrontierPlanError::RecursiveFallback { profile_id: id });
+        }
+        Ok(Self {
+            id,
+            ordering,
+            solver_ids,
+            minimum_trust,
+            budget,
+            fallback_profile,
+            auto_select,
+        })
+    }
+
+    /// Stable profile identity.
+    pub const fn id(&self) -> &FrontierProfileId {
+        &self.id
+    }
+
+    /// Search or fixed-order execution policy.
+    pub const fn ordering(&self) -> FrontierOrdering {
+        self.ordering
+    }
+
+    /// Candidate solvers, preserving declared order.
+    pub fn solver_ids(&self) -> &[SolverId] {
+        &self.solver_ids
+    }
+
+    /// Minimum admitted maturity for every candidate.
+    pub const fn minimum_trust(&self) -> SolverTrust {
+        self.minimum_trust
+    }
+
+    /// Complete hard resource ceilings.
+    pub const fn budget(&self) -> ResourceVector {
+        self.budget
+    }
+
+    /// Explicit alternate profile, if caller supplied one.
+    pub const fn fallback_profile(&self) -> Option<&FrontierProfileId> {
+        self.fallback_profile.as_ref()
+    }
+
+    /// Whether validated Pareto output may be selected automatically.
+    pub const fn auto_select(&self) -> bool {
+        self.auto_select
+    }
+
+    /// Bind this profile's hard budget to one checked matrix shape.
+    pub fn request(&self, rows: u64, columns: u64) -> Result<SolverRequest, FrontierPlanError> {
+        SolverRequest::new(rows, columns, self.budget)
+    }
+}
+
+impl TryFrom<FrontierProfileWire> for FrontierProfile {
+    type Error = FrontierPlanError;
+
+    fn try_from(value: FrontierProfileWire) -> Result<Self, Self::Error> {
+        if value.schema != FRONTIER_PROFILE_SCHEMA_V1 {
+            return Err(FrontierPlanError::UnsupportedProfileSchema {
+                found: value.schema,
+                supported: FRONTIER_PROFILE_SCHEMA_V1,
+            });
+        }
+        Self::new(
+            value.id,
+            value.ordering,
+            value.solver_ids,
+            value.minimum_trust,
+            value.budget,
+            value.fallback_profile,
+            value.auto_select,
+        )
+    }
+}
+
+impl From<FrontierProfile> for FrontierProfileWire {
+    fn from(value: FrontierProfile) -> Self {
+        Self {
+            schema: FRONTIER_PROFILE_SCHEMA_V1.to_owned(),
+            id: value.id,
+            ordering: value.ordering,
+            solver_ids: value.solver_ids,
+            minimum_trust: value.minimum_trust,
+            budget: value.budget,
+            fallback_profile: value.fallback_profile,
+            auto_select: value.auto_select,
+        }
+    }
+}
+
 /// Shape and hard resource ceilings supplied to one planning attempt.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "SolverRequestWire", into = "SolverRequestWire")]
@@ -546,6 +748,27 @@ impl SolverRegistry {
         self.solvers.keys().map(SolverId::as_str).collect()
     }
 
+    /// Validate that every profile member is installed at the required trust tier.
+    pub fn validate_profile(&self, profile: &FrontierProfile) -> Result<(), FrontierPlanError> {
+        for solver_id in profile.solver_ids() {
+            let solver =
+                self.solvers
+                    .get(solver_id)
+                    .ok_or_else(|| FrontierPlanError::UnknownSolver {
+                        solver_id: solver_id.clone(),
+                    })?;
+            let actual = solver.descriptor().trust();
+            if actual < profile.minimum_trust() {
+                return Err(FrontierPlanError::InsufficientTrust {
+                    solver_id: solver_id.clone(),
+                    actual,
+                    required: profile.minimum_trust(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Plan one explicitly named solver with no automatic fallback.
     pub fn plan(
         &self,
@@ -605,6 +828,35 @@ pub enum FrontierPlanError {
     InvalidSolverId {
         /// Rejected input.
         value: String,
+    },
+    /// Profile identity is empty, non-canonical, or too long.
+    InvalidProfileId {
+        /// Rejected input.
+        value: String,
+    },
+    /// Serialized profile uses an unsupported schema.
+    UnsupportedProfileSchema {
+        /// Schema found on input.
+        found: String,
+        /// Schema supported by this reader.
+        supported: &'static str,
+    },
+    /// Profile declares no candidate solver.
+    EmptySolverSet {
+        /// Invalid profile identity.
+        profile_id: FrontierProfileId,
+    },
+    /// Profile repeats one solver identity.
+    DuplicateProfileSolver {
+        /// Invalid profile identity.
+        profile_id: FrontierProfileId,
+        /// Repeated solver identity.
+        solver_id: SolverId,
+    },
+    /// Profile names itself as its fallback.
+    RecursiveFallback {
+        /// Invalid profile identity.
+        profile_id: FrontierProfileId,
     },
     /// Solver descriptor targets an unsupported object-safe ABI.
     UnsupportedSolverAbi {
@@ -668,6 +920,25 @@ impl fmt::Display for FrontierPlanError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidSolverId { value } => write!(formatter, "invalid solver id {value:?}"),
+            Self::InvalidProfileId { value } => write!(formatter, "invalid profile id {value:?}"),
+            Self::UnsupportedProfileSchema { found, supported } => write!(
+                formatter,
+                "unsupported frontier profile schema {found:?}; supported schema is {supported}"
+            ),
+            Self::EmptySolverSet { profile_id } => {
+                write!(formatter, "frontier profile {profile_id} has no solvers")
+            }
+            Self::DuplicateProfileSolver {
+                profile_id,
+                solver_id,
+            } => write!(
+                formatter,
+                "frontier profile {profile_id} repeats solver {solver_id}"
+            ),
+            Self::RecursiveFallback { profile_id } => write!(
+                formatter,
+                "frontier profile {profile_id} cannot fall back to itself"
+            ),
             Self::UnsupportedSolverAbi {
                 solver_id,
                 found,
