@@ -136,20 +136,36 @@ opt-ins** — the same-config before was 0.97–0.98× (fast+f16, 08-08
 > distinct ratio, `[17.0]`. The one-byte delta is consistent with an 8-bit scale
 > where we assume f16, but that is inference; the measurement is the byte count.
 >
-> **3. So "Q2_0" currently names two different formats.** Ours follows llama.cpp
-> PR #24448; the artifacts in the wild follow Prism ML's fork. Which becomes the
-> standard is open — Q2_0-g64 was still standardizing as of the ADR 0040 intake —
-> so this is *not* recorded as a bug in either implementation. What it does mean:
-> the same-model "Bonsai Q2_0 vs its Tritium import" comparison is blocked on
-> reader work, not on hardware, and a type-id match is not evidence of format
-> agreement. Worth a loud reject rather than a bounds error when the block size
-> disagrees.
+> **3. Mainline settled it, and it agrees with us — the artifacts are the
+> outlier.** Checked against `ggml-org/llama.cpp` master directly:
+> `GGML_TYPE_Q2_0 = 42` exists (so Q2_0 did standardize, and the id is agreed by
+> mainline, by us, and by these files), and `ggml-common.h` defines
+> `#define QK2_0 64` with
+> `typedef struct { ggml_half d; uint8_t qs[QK2_0/4]; } block_q2_0;` — **2 + 16 =
+> 18 bytes per 64 elements**, enforced by a `static_assert`. That is exactly
+> `gguf.rs:418`. **Tritium's Q2_0 reader is correct and mainline-conformant; no
+> reader work is owed.**
 >
-> **4. The upstream leg needs its premise checked first.** Their model card says
-> Q2_0 is first-class in Prism ML's fork and "mainline `llama.cpp` support may
-> vary by version". If mainline cannot read Q2_0, the "upstream-master Q2_0
-> rerun" as written is not runnable, and the honest replacement is the Bonsai
-> same-model run labelled against the fork. One mainline build settles it.
+> The Prism ML fork's 17-byte variant is therefore not mainline Q2_0 despite
+> carrying type id 42 and the name. A mainline-conformant reader — including
+> current llama.cpp itself — cannot load these files, which is worth confirming
+> once by pointing a fresh mainline build at them. The transferable lesson stands
+> and sharpens: **a matching type id is not evidence of format agreement**, and
+> since these ids are now standardized, a divergent layout under a standardized
+> id is a defect in the artifact, not an open question. Our reader should still
+> say so loudly — "block size 17 ≠ expected 18" — rather than failing later with
+> a bounds error, which is the one genuine follow-up here and is diagnostics, not
+> capability.
+>
+> **4. What the debt now requires.** The upstream leg is runnable in principle:
+> mainline has Q2_0. What is missing is a **mainline-conformant Q2_0 GGUF**, and
+> the published Bonsai files are not one. Neither is anything on this box — the
+> three local llama.cpp checkouts (`Quitetall/llama.cpp` at 41a666dac, upstream
+> `ggml-org` at 10b1aa61a, and beellama.cpp) are all May 2026 and predate the
+> type entirely, carrying TQ1_0/TQ2_0 and no Q2_0. So closing this needs a fresh
+> mainline build plus a conformant artifact, and the fastest honest route may be
+> to quantize one ourselves with a current `llama-quantize` rather than hunt for
+> a published file.
 
 ### 2026-08-18 spec-cost levers @ 82f80b1b — delta re-sync, node-blocked tree attention, TB1 LUT verdict
 
