@@ -47,6 +47,30 @@
 # this was written, every one of them a case where a failure or a non-result was
 # indistinguishable from a pass.
 #
+# RELEASE TYPE: --release-type minor, and without it this gate checks NOTHING.
+# cargo-semver-checks derives the comparison from the version pair, and it
+# classifies 1.1.0-rc.0 -> 1.1.0-rc.2 as a MAJOR change — under SemVer a major
+# bump permits any breaking change, so every lint is skipped as irrelevant and
+# the tool correctly reports "no semver update required". Observed directly:
+#
+#   Checking tritium-core v1.1.0-rc.0 -> v1.1.0-rc.2 (major change)
+#    Checked [0.000s] 0 checks: 0 pass, 253 skip
+#    Summary no semver update required
+#
+# That is a green lane over zero executed lints, for EVERY crate, for the whole
+# release-candidate series. Forcing the minor lint set asks the question we
+# actually care about — "did anything break since the last published rc?" —
+# and makes the checks run:
+#
+#   Checking tritium-core v1.1.0-rc.0 -> v1.1.0-rc.2 (assume minor change)
+#    Checked [0.022s] 196 checks: 196 pass, 57 skip
+#
+# `minor` rather than `patch` on purpose: additions are expected during an rc,
+# breakage is what we want surfaced. Note this interacts with the baseline
+# choice — comparing against the old v1.0.0 git tag produced a minor delta and
+# so ran lints by accident; moving the baseline onto the published rc.0 is what
+# made the version pair major and silently emptied the gate.
+#
 # Usage:  ./scripts/check-semver.sh [baseline-rev]   # explicit git rev instead
 #         ./scripts/check-semver.sh --print-baseline          # newest stable tag
 #         ./scripts/check-semver.sh --print-baseline-version  # published baseline
@@ -154,7 +178,7 @@ main() {
   done
 
   if [[ "$mode" == "block" ]]; then
-    exec cargo "+$toolchain" semver-checks --default-features "${baseline_args[@]}" "${package_args[@]}"
+    exec cargo "+$toolchain" semver-checks --default-features --release-type minor "${baseline_args[@]}" "${package_args[@]}"
   fi
   if [[ "$mode" != "report" ]]; then
     echo "[check-semver] TRITIUM_SEMVER_MODE must be report or block, got '$mode'" >&2
@@ -162,7 +186,7 @@ main() {
   fi
 
   local status=0
-  cargo "+$toolchain" semver-checks --default-features "${baseline_args[@]}" "${package_args[@]}" || status=$?
+  cargo "+$toolchain" semver-checks --default-features --release-type minor "${baseline_args[@]}" "${package_args[@]}" || status=$?
   if (( status == 0 )); then
     echo "[check-semver] no breaking change against the published baseline."
     return 0

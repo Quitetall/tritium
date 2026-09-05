@@ -139,6 +139,43 @@ def test_report_mode_still_fails_when_the_checker_cannot_run(tmp_path):
     assert "FAILED TO RUN" in completed.stderr
 
 
+def test_invocation_forces_the_minor_lint_set():
+    """Without --release-type minor this gate executes ZERO lints.
+
+    cargo-semver-checks derives the comparison from the version pair and calls
+    1.1.0-rc.0 -> 1.1.0-rc.2 a MAJOR change; a major bump permits any breaking
+    change, so all 253 lints skip and it reports "no semver update required".
+    Measured: 0 checks / 0 pass / 253 skip without the flag, 196 checks / 196
+    pass / 57 skip with it. A green lane over zero lints is the failure mode
+    this whole file exists to avoid, so the flag is pinned here.
+    """
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        argfile = tmp_path / "args.txt"
+        fake = tmp_path / "cargo"
+        fake.write_text(
+            "#!/usr/bin/env bash\n"
+            f'printf "%s\\n" "$@" > {argfile}\n'
+            "exit 0\n"
+        )
+        fake.chmod(0o755)
+        subprocess.run(
+            ["bash", "scripts/check-semver.sh"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            env={**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}"},
+        )
+        args = argfile.read_text().splitlines()
+
+    assert "--release-type" in args, args
+    assert args[args.index("--release-type") + 1] == "minor"
+    assert "--default-features" in args
+    assert "--baseline-version" in args
+
+
 def test_default_features_workaround_expires_when_its_reason_does():
     """--default-features is only justified while the baseline is rc.0/rc.1.
 
