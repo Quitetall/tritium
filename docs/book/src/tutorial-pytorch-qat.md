@@ -41,14 +41,14 @@ python -I -m tritium.torch.tutorial_qat \
   --device cpu \
   --wheel-artifact "$TRITIUM_WHEEL" \
   --source-revision "$TRITIUM_SOURCE_REVISION" \
-  --release 1.1.0-rc.1 \
+  --release 1.1.0-rc.2 \
   --run-id local-tutorial-1
 python -I -m tritium.torch.tutorial_qat \
   --check-receipt ./tutorial-output/receipt.json \
   --device cpu \
   --wheel-artifact "$TRITIUM_WHEEL" \
   --source-revision "$TRITIUM_SOURCE_REVISION" \
-  --release 1.1.0-rc.1
+  --release 1.1.0-rc.2
 ```
 
 Successful output contains:
@@ -101,7 +101,7 @@ python -I -m tritium.torch.hf_lifecycle \
   --output-dir ./hf-lifecycle-output \
   --wheel-artifact "$TRITIUM_WHEEL" \
   --source-revision "$TRITIUM_SOURCE_REVISION" \
-  --release 1.1.0-rc.1 \
+  --release 1.1.0-rc.2 \
   --run-id local-hf-lifecycle-1
 ```
 

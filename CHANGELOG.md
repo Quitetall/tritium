@@ -11,6 +11,8 @@ see `docs/v1.0-api-freeze-audit.md` for the tier policy.
 
 ## [Unreleased] — 1.x dev
 
+## [1.1.0-rc.2] — 2026-09-03
+
 ### Added
 
 - **A release pipeline.** `release.yml` turns a `vX.Y.Z` tag into published artifacts:

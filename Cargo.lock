@@ -4338,7 +4338,7 @@ dependencies = [
 
 [[package]]
 name = "tritium-benches"
-version = "1.1.0-rc.1"
+version = "1.1.0-rc.2"
 dependencies = [
  "divan",
  "half",
@@ -4358,14 +4358,14 @@ dependencies = [
 
 [[package]]
 name = "tritium-build-info"
-version = "1.1.0-rc.1"
+version = "1.1.0-rc.2"
 dependencies = [
  "blake3",
 ]
 
 [[package]]
 name = "tritium-burn"
-version = "1.1.0-rc.1"
+version = "1.1.0-rc.2"
 dependencies = [
  "burn-ndarray",
  "burn-tensor",
@@ -4377,7 +4377,7 @@ dependencies = [
 
 [[package]]
 name = "tritium-candle"
-version = "1.1.0-rc.1"
+version = "1.1.0-rc.2"
 dependencies = [
  "candle-core",
  "half",
@@ -4388,7 +4388,7 @@ dependencies = [
 
 [[package]]
 name = "tritium-cli"
-version = "1.1.0-rc.1"
+version = "1.1.0-rc.2"
 dependencies = [
  "anyhow",
  "blake3",
@@ -4420,7 +4420,7 @@ dependencies = [
 
 [[package]]
 name = "tritium-core"
-version = "1.1.0-rc.1"
+version = "1.1.0-rc.2"
 dependencies = [
  "proptest",
  "serde",
@@ -4428,7 +4428,7 @@ dependencies = [
 
 [[package]]
 name = "tritium-cpu"
-version = "1.1.0-rc.1"
+version = "1.1.0-rc.2"
 dependencies = [
  "half",
  "linkme",
@@ -4443,7 +4443,7 @@ dependencies = [
 
 [[package]]
 name = "tritium-cuda"
-version = "1.1.0-rc.1"
+version = "1.1.0-rc.2"
 dependencies = [
  "cudarc",
  "half",
@@ -4462,7 +4462,7 @@ dependencies = [
 
 [[package]]
 name = "tritium-ffi"
-version = "1.1.0-rc.1"
+version = "1.1.0-rc.2"
 dependencies = [
  "cbindgen",
  "tritium-core",
@@ -4472,7 +4472,7 @@ dependencies = [
 
 [[package]]
 name = "tritium-format"
-version = "1.1.0-rc.1"
+version = "1.1.0-rc.2"
 dependencies = [
  "blake3",
  "bytemuck",
@@ -4485,7 +4485,7 @@ dependencies = [
 
 [[package]]
 name = "tritium-mcu"
-version = "1.1.0-rc.1"
+version = "1.1.0-rc.2"
 dependencies = [
  "tritium-core",
  "tritium-testkit",
@@ -4493,7 +4493,7 @@ dependencies = [
 
 [[package]]
 name = "tritium-metal"
-version = "1.1.0-rc.1"
+version = "1.1.0-rc.2"
 dependencies = [
  "half",
  "linkme",
@@ -4507,7 +4507,7 @@ dependencies = [
 
 [[package]]
 name = "tritium-nn"
-version = "1.1.0-rc.1"
+version = "1.1.0-rc.2"
 dependencies = [
  "blake3",
  "half",
@@ -4529,7 +4529,7 @@ dependencies = [
 
 [[package]]
 name = "tritium-onnx"
-version = "1.1.0-rc.1"
+version = "1.1.0-rc.2"
 dependencies = [
  "blake3",
  "half",
@@ -4543,7 +4543,7 @@ dependencies = [
 
 [[package]]
 name = "tritium-py"
-version = "1.1.0-rc.1"
+version = "1.1.0-rc.2"
 dependencies = [
  "blake3",
  "dlpark",
@@ -4571,7 +4571,7 @@ dependencies = [
 
 [[package]]
 name = "tritium-quantize"
-version = "1.1.0-rc.1"
+version = "1.1.0-rc.2"
 dependencies = [
  "blake3",
  "half",
@@ -4583,7 +4583,7 @@ dependencies = [
 
 [[package]]
 name = "tritium-rocm"
-version = "1.1.0-rc.1"
+version = "1.1.0-rc.2"
 dependencies = [
  "half",
  "linkme",
@@ -4596,7 +4596,7 @@ dependencies = [
 
 [[package]]
 name = "tritium-runtime"
-version = "1.1.0-rc.1"
+version = "1.1.0-rc.2"
 dependencies = [
  "linkme",
  "tritium-core",
@@ -4605,7 +4605,7 @@ dependencies = [
 
 [[package]]
 name = "tritium-salt"
-version = "1.1.0-rc.1"
+version = "1.1.0-rc.2"
 dependencies = [
  "blake3",
  "half",
@@ -4623,7 +4623,7 @@ dependencies = [
 
 [[package]]
 name = "tritium-serve"
-version = "1.1.0-rc.1"
+version = "1.1.0-rc.2"
 dependencies = [
  "async-stream",
  "axum",
@@ -4645,7 +4645,7 @@ dependencies = [
 
 [[package]]
 name = "tritium-spec"
-version = "1.1.0-rc.1"
+version = "1.1.0-rc.2"
 dependencies = [
  "blake3",
  "serde",
@@ -4655,7 +4655,7 @@ dependencies = [
 
 [[package]]
 name = "tritium-testkit"
-version = "1.1.0-rc.1"
+version = "1.1.0-rc.2"
 dependencies = [
  "blake3",
  "half",
@@ -4669,7 +4669,7 @@ dependencies = [
 
 [[package]]
 name = "tritium-train"
-version = "1.1.0-rc.1"
+version = "1.1.0-rc.2"
 dependencies = [
  "blake3",
  "half",
@@ -4687,7 +4687,7 @@ dependencies = [
 
 [[package]]
 name = "tritium-wasm"
-version = "1.1.0-rc.1"
+version = "1.1.0-rc.2"
 dependencies = [
  "blake3",
  "half",
@@ -4704,7 +4704,7 @@ dependencies = [
 
 [[package]]
 name = "tritium-wgpu"
-version = "1.1.0-rc.1"
+version = "1.1.0-rc.2"
 dependencies = [
  "bytemuck",
  "half",
