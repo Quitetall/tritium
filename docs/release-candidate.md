@@ -28,7 +28,7 @@ bound on progress.
 >
 > | kind | receipt schema | where |
 > |---|---|---|
-> | `clean-install` | `tritium.compatibility-receipt.v1` ×3 | `release-bundle` |
+> | `clean-install` | `tritium.wheel-functional-qualification.v1` | `wheel-functional-*` |
 > | `compatibility-matrix` | `tritium.abi3-matrix-qualification.v1` | `abi3-compatibility-receipt` |
 > | `api-signature` | `tritium.installed-api-signature.v1` | `wheel-functional-*` |
 > | `installed-qat-tutorial` | `tritium.installed-qat-tutorial.v3` | `wheel-functional-*`, `wheel-tutorial-*` |
@@ -38,7 +38,23 @@ bound on progress.
 >
 > The `release-bundle` artifact also carries the three wheels and three
 > CycloneDX SBOMs already named to the artifact-ID convention this document
-> specifies, so candidate assembly needs no hand-built inputs.
+> specifies, so candidate assembly needs no hand-built inputs. Confirmed by
+> doing it: the rc.2 candidate assembles clean (`assemble-release-candidate: OK:
+> 1.1.0-rc.2 (3 artifacts)`) at
+> `release/v1.1/candidates/d16c0dda-rc2-harvest/`, manifest SHA-256
+> `e766391e7ba16004…`. `release-status` then declines it only because it
+> requires the candidate's `source_revision` to equal the checked-out HEAD —
+> a correct guard, satisfied by running it from a worktree at `d16c0dda`.
+>
+> Map schemas to kinds by reading each **validator's** import in
+> `release-evidence-status.py:13-46`, not by matching filenames: `clean-install`
+> resolves through `wheel-functional-smoke.py`, *not* `verify-wheel.py`, so
+> `tritium.compatibility-receipt.v1` — which sits in the `release-bundle` and
+> looks like the obvious candidate — is an input to the abi3 aggregation rather
+> than a registry kind. Registering the set still requires per-kind binding work:
+> each registry entry's `id` must equal its receipt's own `receipt_id`, and the
+> `tritium.compatibility-receipt.v1` files carry neither that nor a `release`
+> field.
 >
 > What this changes: the barrier to a coherent gate report is **registration,
 > not production**, for a substantial share of the evidence. Two gates are now
