@@ -56,17 +56,37 @@ trap 'rmdir "$LOCK" 2>/dev/null; trap - EXIT; exit 130' INT TERM
 refs=$(cat)
 exec </dev/null
 
+recreate_worktree() {
+    git worktree remove --force "$WT" >/dev/null 2>&1
+    rm -rf "$WT"
+    git worktree prune >/dev/null 2>&1
+    git worktree add --detach "$WT" "$1" >/dev/null || return 1
+    git -C "$WT" clean -qfd
+}
+
 checkout_tip() {
     # Reuse the registered scratch worktree; (re)create it if missing/broken.
     if ! git -C "$WT" checkout --quiet --detach "$1" 2>/dev/null; then
-        git worktree remove --force "$WT" >/dev/null 2>&1
-        rm -rf "$WT"
-        git worktree prune >/dev/null 2>&1
-        git worktree add --detach "$WT" "$1" >/dev/null || return 1
+        recreate_worktree "$1" || return 1
+        return 0
     fi
     # Detached checkouts leave stale untracked files behind when files vanish
     # between tips; a clean tree keeps `cargo fmt --all` honest.
     git -C "$WT" clean -qfd
+
+    # A successful checkout is NOT proof of an intact tree. This worktree was
+    # once left with tracked files missing while HEAD was correct (2026-09-04:
+    # crates/tritium-salt/src/frontier_v3/artifact.rs among others). With a
+    # module file absent, `cargo fmt --all` cannot parse the crate and exits
+    # non-zero — which this hook reports as "the COMMIT is unformatted", sending
+    # you to inspect a commit that was fine. Because checkout SUCCEEDED, the
+    # branch above never fired and every push failed identically until the
+    # worktree was removed by hand. `clean -fd` does not help: these are
+    # deletions of tracked files, not untracked leftovers.
+    if [ -n "$(git -C "$WT" status --porcelain 2>/dev/null)" ]; then
+        echo "pre-push: scratch worktree $WT is dirty after checkout; recreating." >&2
+        recreate_worktree "$1" || return 1
+    fi
 }
 
 fail=0
