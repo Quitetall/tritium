@@ -107,8 +107,13 @@ material user risk, but the reason and remaining exposure will be documented.
 ## Supply-chain and deployment boundary
 
 Release artifacts are admitted by digest, source revision, and SBOM gates.
-Cryptographic build provenance and artifact signatures are **not yet
-implemented** — do not treat a downloaded artifact as attested. Model/tokenizer licenses and authenticity remain separate
+Python wheels attached to a GitHub Release carry **SLSA build provenance**
+attestations produced by `release.yml` (`actions/attest-build-provenance`) —
+verify one with `gh attestation verify <wheel> --repo Quitetall/tritium`.
+The same wheels on PyPI carry PEP 740 provenance, uploaded by the trusted-publishing step.
+crates.io crates and the OCI images are **not** attested: crates publish
+with a stored registry token, and the images are built outside CI. Do not
+treat those as attested. Model/tokenizer licenses and authenticity remain separate
 from numerical compatibility: a loadable artifact is not automatically trusted
 or redistributable. Operators must verify candidate/public manifests and should
 run serving images with the documented non-root, read-only, bounded-resource
