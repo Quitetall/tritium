@@ -198,6 +198,14 @@ jobs:
   semver:
     name: API stability (cargo-semver-checks)
     runs-on: ubuntu-latest
+    env:
+      # Belt-and-braces. check-semver.sh now passes --default-features, so the
+      # cuda / rocm build scripts are not reached at all -- that is the fix. The
+      # baseline (published 1.1.0-rc.0) predates the TRITIUM_CHECK_ONLY escape and
+      # panics without nvcc / hipcc, so the env alone was not enough; it stays so
+      # that a --current-features experiment on a hosted runner cannot regress
+      # into the build-script failure this lane died on for its whole life.
+      TRITIUM_CHECK_ONLY: "1"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
