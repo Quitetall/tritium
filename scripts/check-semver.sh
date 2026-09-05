@@ -38,6 +38,22 @@ set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
+# cargo-semver-checks builds rustdoc for every crate with ALL features, which
+# drags in tritium-cuda's build script (nvcc) and tritium-rocm's (hipcc). On a
+# machine without them the build script fails, rustdoc never runs, and
+# cargo-semver-checks exits 101 — so this gate's answer would otherwise depend on
+# whether the machine happens to have a CUDA toolkit installed. A gate that is
+# not deterministic across machines is not a gate.
+#
+# Forcing this cannot change the verdict: semver-checks reads API signatures out
+# of rustdoc JSON, never compiled kernel bytes. It is exported rather than
+# defaulted precisely because an override would reintroduce the nondeterminism.
+#
+# This was not a theoretical concern. Before the failure/finding split below, a
+# 101 here was reported as "BREAKING CHANGES REPORTED" and exited 0, so the CI
+# lane passed while checking nothing — for as long as the lane had existed.
+export TRITIUM_CHECK_ONLY=1
+
 # Published baseline. `latest_stable_baseline` below is retained because an
 # explicit git rev is still a supported comparison, and because the release-tag
 # smoke depends on its tag-selection semantics.
