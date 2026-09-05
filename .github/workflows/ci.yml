@@ -199,14 +199,12 @@ jobs:
     name: API stability (cargo-semver-checks)
     runs-on: ubuntu-latest
     env:
-      # cargo-semver-checks documents every crate with ALL features, which pulls
-      # the tritium-cuda / tritium-rocm build scripts -- and those invoke nvcc /
-      # hipcc unless told otherwise. On a hosted runner that fails the build
-      # script, rustdoc for tritium-nn/salt/serve/rocm never runs, and
-      # semver-checks exits 101. b90d327f made that exit a failure instead of a
-      # silent pass, which is when this lane went red: it had been broken and
-      # green for as long as it existed. Same mechanism gpu-feature-check uses;
-      # the API surface semver-checks inspects is signatures, not kernel bytes.
+      # Belt-and-braces. check-semver.sh now passes --default-features, so the
+      # cuda / rocm build scripts are not reached at all -- that is the fix. The
+      # baseline (published 1.1.0-rc.0) predates the TRITIUM_CHECK_ONLY escape and
+      # panics without nvcc / hipcc, so the env alone was not enough; it stays so
+      # that a --current-features experiment on a hosted runner cannot regress
+      # into the build-script failure this lane died on for its whole life.
       TRITIUM_CHECK_ONLY: "1"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
