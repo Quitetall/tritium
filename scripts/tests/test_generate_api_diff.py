@@ -102,6 +102,39 @@ except ImportError:
                 current_exports={"Model"},
             )
 
+    def test_semver_scope_is_extracted_from_literal_checked_crates_array(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            scripts = root / "scripts"
+            scripts.mkdir()
+            source = """CHECKED_CRATES=(
+  tritium-core tritium-spec
+  # Explicitly frozen.
+  \"tritium-runtime\"
+)
+"""
+            (scripts / "check-semver.sh").write_text(source, encoding="utf-8")
+            self.assertEqual(
+                MODULE.semver_crates(root),
+                ("tritium-core", "tritium-spec", "tritium-runtime"),
+            )
+
+    def test_semver_scope_rejects_dynamic_duplicate_or_ambiguous_arrays(self):
+        sources = (
+            "CHECKED_CRATES=(tritium-core $EXTRA)\n",
+            "CHECKED_CRATES=(tritium-core tritium-core)\n",
+            "CHECKED_CRATES=(tritium-core)\nCHECKED_CRATES=(tritium-spec)\n",
+            "package_args=(-p tritium-core)\n",
+        )
+        for source in sources:
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw)
+                scripts = root / "scripts"
+                scripts.mkdir()
+                (scripts / "check-semver.sh").write_text(source, encoding="utf-8")
+                with self.assertRaises(MODULE.ApiDiffError):
+                    MODULE.semver_crates(root)
+
     def test_repository_report_retains_v1_and_is_canonical(self):
         report = MODULE.repository_report(MODULE.ROOT, "v1.0.0")
         self.assertEqual(report["schema"], "tritium.api-diff.v1")
@@ -114,7 +147,11 @@ except ImportError:
             [
                 "tritium-core", "tritium-spec", "tritium-format",
                 "tritium-runtime", "tritium-cpu", "tritium-quantize",
-                "tritium-testkit",
+                "tritium-testkit", "tritium-ffi", "tritium-nn",
+                "tritium-salt", "tritium-train", "tritium-serve",
+                "tritium-burn", "tritium-candle", "tritium-onnx",
+                "tritium-mcu", "tritium-wasm", "tritium-metal",
+                "tritium-rocm", "tritium-wgpu", "tritium-build-info",
             ],
         )
         self.assertEqual(json.loads(MODULE.render_json(report)), report)

@@ -1,5 +1,6 @@
 """Regression coverage for the stable Rust API baseline selector."""
 
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -68,6 +69,42 @@ latest_stable_baseline
 
     assert completed.stdout.splitlines() == ["v1.0.0", "v1.1.0"]
     assert completed.stderr == ""
+
+
+def test_published_baseline_version_is_reported_and_overridable():
+    """The real baseline is a PUBLISHED version, not the never-published v1.0.0 tag."""
+    completed = subprocess.run(
+        ["bash", "scripts/check-semver.sh", "--print-baseline-version"],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.stdout.strip() == "1.1.0-rc.0"
+    assert completed.stderr == ""
+
+    overridden = subprocess.run(
+        ["bash", "scripts/check-semver.sh", "--print-baseline-version"],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "TRITIUM_SEMVER_BASELINE_VERSION": "1.2.0"},
+    )
+    assert overridden.stdout.strip() == "1.2.0"
+
+
+def test_unknown_mode_is_rejected_before_any_check_runs():
+    """A typo must fail loudly rather than silently pick report or block."""
+    completed = subprocess.run(
+        ["bash", "scripts/check-semver.sh"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "TRITIUM_SEMVER_MODE": "bogus"},
+    )
+    assert completed.returncode == 2
+    assert "must be report or block" in completed.stderr
 
 
 def test_semver_selector_rejects_leading_zero_components():

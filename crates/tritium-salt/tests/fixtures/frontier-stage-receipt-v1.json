@@ -1,0 +1,48 @@
+{
+  "schema": "tritium.frontier-stage-receipt.v1",
+  "run_id": "tsc1_fa9863a9ced8371021c0fcf784dc86a8322dc6dd4d6b1c596e638c540f021faf",
+  "source_id": "tsc1_afd7e898ae082430ac69e1ce0bb3e1bf71689ce0659a2053a96e54bc902895b3",
+  "stage_index": 3,
+  "stage": "fit",
+  "profile_id": "research.default",
+  "solver": {
+    "id": "salt.v3",
+    "family": "salt",
+    "trust": "registered",
+    "abi_version": 1
+  },
+  "input_id": "tsc1_7afb015d8488013722db54998f510794626d78bd4f235ff653b2ed7a68175250",
+  "output_id": "tsc1_2adde537a90dc77203b6b46883e1a4201f8f7794676fa10aa3f664f56c8ea70e",
+  "estimate": {
+    "host_ram_bytes": 4096,
+    "vram_bytes": 2048,
+    "disk_bytes": 8192,
+    "artifact_bytes": 80,
+    "resident_bytes": 150,
+    "transient_bytes": 64,
+    "fitting_millis": 900,
+    "runtime_latency_micros": 250
+  },
+  "measured": {
+    "host_ram_bytes": 4096,
+    "vram_bytes": 2048,
+    "disk_bytes": 8192,
+    "artifact_bytes": 85,
+    "resident_bytes": 160,
+    "transient_bytes": 64,
+    "fitting_millis": 950,
+    "runtime_latency_micros": 250
+  },
+  "budget": {
+    "host_ram_bytes": 4096,
+    "vram_bytes": 2048,
+    "disk_bytes": 8192,
+    "artifact_bytes": 100,
+    "resident_bytes": 200,
+    "transient_bytes": 64,
+    "fitting_millis": 1000,
+    "runtime_latency_micros": 250
+  },
+  "outcome": "completed",
+  "diagnostic": null
+}

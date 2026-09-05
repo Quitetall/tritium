@@ -19,13 +19,37 @@ real report can be: `evaluate()` additionally requires a registry to bind one
 exact candidate manifest at one exact `source_revision`, and no single revision
 comes close to satisfying a gate set. Read it as an upper bound on progress.
 
-**13 of the 38 evidence kinds have ever been produced anywhere. 25 have not.**
-The 13 produced are `api-signature`, `clean-install`, `crate-archive`,
-`cuda-training`, `estimator-validation`, `export-reload`, `frontend-lifecycle`,
-`installed-qat-tutorial`, `npm-archive`, `observability`, `source-admission`,
-`torch-dispatch-cuda` and `torch-dispatch-overhead`. The 25 that are not appear
-in the "Missing kinds" column below; the two lists sum to the 38 that `GATES`
-requires.
+**15 of the 38 evidence kinds have been produced. 23 have not.**
+The 15 are `api-signature`, `clean-install`, `crate-archive`, `cuda-training`,
+`estimator-validation`, `export-reload`, `frontend-lifecycle`,
+`installed-qat-tutorial`, `npm-archive`, `observability`, `oci-security-cpu`,
+`oci-security-cuda`, `source-admission`, `torch-dispatch-cuda` and
+`torch-dispatch-overhead`. The last two OCI ones were produced on 2026-09-03
+against the existing rev `3e07eabb` archives, and both pass with **zero
+high/critical vulnerabilities and zero secret findings**. The 23 that remain
+appear in the "Missing kinds" column below; the two lists sum to the 38 that
+`GATES` requires.
+
+### Reproducing the OCI security receipts
+
+Three things are non-obvious enough to be worth recording, because each one
+costs an hour to rediscover:
+
+1. `docker load` **rejects** these archives. They are pure OCI layout
+   (`index.json`), not Docker format (`manifest.json`).
+2. **podman cannot be used as the bridge.** It reads `oci-archive:` and keeps
+   the digest locally, but every push recompresses blobs through its storage and
+   changes the manifest digest — with `--format oci` too. `regctl image copy
+   "ocidir://<extracted>@sha256:<digest>" localhost:5000/<repo>:<tag>` preserves
+   it exactly.
+3. The digest to match is **not** the index digest. `verify-oci-archive.py`
+   prints the child image-manifest digest; the archive's `index.json` entry is
+   the index above it. `docker pull <repo>@<child digest>` is what puts the value
+   `qualify-oci-runtime.py` demands into `RepoDigests`.
+
+`qualify-oci-security.py` also expects the Trivy vulnerability database to
+already exist as an ordinary file — run `trivy image --download-db-only
+--cache-dir <dir>` first; it will not fetch one for you.
 
 | Gate | Status | Missing kinds | What the missing kinds require |
 |---|---|---|---|
@@ -38,7 +62,7 @@ requires.
 | `stage7-freeze` | NONE | `stage7-recipe-freeze` | The 1.7B recipe freeze — downstream of the flagship conversion. |
 | `onnx` | NONE | `onnx-inference` | Whole-Qwen ONNX execution traces — downstream of the flagship artifact. |
 | `browser` | NONE | `browser-conformance` | **Three** lanes, all required: `--chrome-lane`, `--firefox-lane`, `--safari-lane`. The Safari lane is gated on a macOS `os.name`, so this needs Apple hardware, not merely a browser. |
-| `serving` | NONE | `oci-runtime-{cpu,cuda}`, `oci-security-{cpu,cuda}`, `serving-deployment-{cpu,cuda}` | OCI archives already exist for both flavors at rev `3e07eabb`, so no rebuild is needed. Runtime qualification loads the image (and checks its `RepoDigests`), needs a served model bundle, and drives live streaming completions plus SIGTERM phases. Security qualification needs `trivy` with a vulnerability DB under 24 h old. Deployment needs Kubernetes. |
+| `serving` | PARTIAL | `oci-runtime-{cpu,cuda}`, `serving-deployment-{cpu,cuda}` | Both `oci-security-*` kinds are **done** (2026-09-03). The remaining four all need an **admissible serving bundle**, which does not exist on this box: `tritium-serve` rejects the only complete-looking candidate with `InvalidAdmission("manifest package")` because its `tritium.json` carries no top-level `manifest_package_id` and is marked `complete_model: false`. Deployment additionally needs Kubernetes, a Helm chart archive, and a `--bundle-manifest`. |
 | `zoo-community` | NONE | `model-zoo`, `generated-claims`, `governance-docs` | All three come from **one** `qualify-zoo-community.py` call. It requires a `--governance-review` whose `independent_from_maintainers` field must be `True` (`verify-zoo-community-receipt.py:426-429`) and a named reviewer with an `organization` — i.e. a second person. It also requires four frozen model entries, the fourth being the flagship. |
 | `reproduction-signoff` | NONE | `second-machine`, `independent-review` | A second machine, plus a reviewer whose identity differs from the reproduction operator. |
 
@@ -49,16 +73,17 @@ attestation must assert `independent_from_maintainers`. And because
 requirement holds `model-zoo` and `generated-claims` hostage alongside it. There
 is no flag to produce one of the three alone.
 
-Grouping the 25 missing kinds by what actually unblocks them:
+Grouping the 23 remaining kinds by what actually unblocks them:
 
-- **The in-flight conversion** (9): the five `flagship-qwen` kinds,
-  `stage7-recipe-freeze`, `onnx-inference`, and — via the coupling above —
-  `model-zoo` and `generated-claims`.
+- **An admissible serving bundle** (13): the five `flagship-qwen` kinds,
+  `stage7-recipe-freeze`, `onnx-inference`, `model-zoo` and `generated-claims`
+  (coupled as described above), plus `oci-runtime-{cpu,cuda}` and
+  `serving-deployment-{cpu,cuda}`. This is one dependency, not several — every
+  one of them ultimately waits on the in-flight conversion producing a bundle
+  whose manifest `tritium-serve` will admit. The two deployment kinds need
+  Kubernetes on top of that.
 - **The CPU, once the conversion frees it** (2): `refinement`,
   `baseline-ablation`. No new dependency.
-- **Work reachable on this hardware** (6): the four OCI kinds (archives exist;
-  needs `trivy` installed) and the two `serving-deployment` kinds (needs a local
-  Kubernetes).
 - **Hardware this project does not have** (5): `distributed-training` (≥2 GPUs,
   rentable), `browser-conformance` (macOS, for the Safari lane),
   `backend-manifest` and `performance` (AMD + Apple + MCU),

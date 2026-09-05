@@ -5,12 +5,50 @@
 //! no automatic fallback: callers must name and submit any fallback as a new
 //! planning request.
 
-use std::{collections::BTreeMap, error::Error, fmt, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    error::Error,
+    fmt,
+    sync::Arc,
+};
 
 use serde::{Deserialize, Serialize};
 
+use crate::ContentId;
+
+mod artifact;
+mod compatibility;
+mod orchestration;
+mod receipt;
+mod solvers;
+
+pub use artifact::{
+    ArtifactByteLedger, ArtifactClaim, ByteBreakdown, FRONTIER_ARTIFACT_SCHEMA_V1,
+    FrontierArtifactError, FrontierArtifactManifest, FrontierTensorArtifact, TensorRepresentation,
+};
+pub use compatibility::{FrontierCompatibilityError, read_salt_v2_frontier_artifact};
+pub use orchestration::{
+    FRONTIER_RUN_RECEIPT_SCHEMA_V1, FRONTIER_STAGE_REQUEST_SCHEMA_V1, FrontierRunReceipt,
+    FrontierStageRequest,
+};
+pub use receipt::{
+    FRONTIER_PARETO_RECEIPT_SCHEMA_V1, FRONTIER_STAGE_RECEIPT_SCHEMA_V1,
+    FrontierObjectiveDirection, FrontierObjectiveSpec, FrontierObjectiveValue,
+    FrontierParetoCandidate, FrontierParetoReceipt, FrontierSelection, FrontierStage,
+    FrontierStageOutcome, FrontierStageReceipt,
+};
+pub use solvers::{
+    BuiltinSolverBlocker, BuiltinSolverCapability, BuiltinSolverStatus,
+    FRONTIER_SALT_V2_REFERENCE_SOLVER_ID, FrontierResourceEstimator, SaltV2AdmittedTensorFitResult,
+    SaltV2FrontierFitError, SaltV2FrontierSolver, SaltV2ReferenceAdapter,
+    builtin_solver_capabilities,
+};
+
 /// Object-safe solver planning ABI supported by this release.
 pub const FRONTIER_SOLVER_ABI_V1: u16 = 1;
+
+/// Stable serialized schema for experimental V3 profiles.
+pub const FRONTIER_PROFILE_SCHEMA_V1: &str = "tritium.frontier-profile.v1";
 
 /// Stable, canonical solver identity.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -21,15 +59,7 @@ impl SolverId {
     /// Parse a lowercase ASCII identifier containing letters, digits, `.`, `_`, or `-`.
     pub fn new(value: impl Into<String>) -> Result<Self, FrontierPlanError> {
         let value = value.into();
-        let valid = !value.is_empty()
-            && value.len() <= 128
-            && value.as_bytes()[0].is_ascii_lowercase()
-            && value.bytes().all(|byte| {
-                byte.is_ascii_lowercase()
-                    || byte.is_ascii_digit()
-                    || matches!(byte, b'.' | b'_' | b'-')
-            });
-        if !valid {
+        if !valid_identifier(&value) {
             return Err(FrontierPlanError::InvalidSolverId { value });
         }
         Ok(Self(value))
@@ -59,6 +89,15 @@ impl From<SolverId> for String {
     fn from(value: SolverId) -> Self {
         value.0
     }
+}
+
+fn valid_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value.as_bytes()[0].is_ascii_lowercase()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
+        })
 }
 
 /// Mathematical family implemented by a solver.
@@ -96,6 +135,57 @@ pub enum SolverTrust {
     Registered,
     /// Independently qualified implementation for certified profiles.
     Certified,
+}
+
+/// Stable, canonical V3 profile identity.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct FrontierProfileId(String);
+
+impl FrontierProfileId {
+    /// Parse a lowercase ASCII profile identifier.
+    pub fn new(value: impl Into<String>) -> Result<Self, FrontierPlanError> {
+        let value = value.into();
+        if !valid_identifier(&value) {
+            return Err(FrontierPlanError::InvalidProfileId { value });
+        }
+        Ok(Self(value))
+    }
+
+    /// Canonical string form used by manifests and receipts.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for FrontierProfileId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl TryFrom<String> for FrontierProfileId {
+    type Error = FrontierPlanError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<FrontierProfileId> for String {
+    fn from(value: FrontierProfileId) -> Self {
+        value.0
+    }
+}
+
+/// Whether a profile searches candidate order or executes one frozen order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FrontierOrdering {
+    /// Search candidate composition and order with complete trial receipts.
+    Search,
+    /// Execute solver IDs in their declared order without searching alternatives.
+    Fixed,
 }
 
 /// Immutable identity and maturity metadata for one solver implementation.
@@ -369,6 +459,232 @@ impl ResourceViolation {
     }
 }
 
+/// Versioned V3 policy selecting candidate solvers and hard resource ceilings.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "FrontierProfileWire", into = "FrontierProfileWire")]
+pub struct FrontierProfile {
+    id: FrontierProfileId,
+    ordering: FrontierOrdering,
+    solver_ids: Vec<SolverId>,
+    minimum_trust: SolverTrust,
+    budget: ResourceVector,
+    fallback_profile: Option<FrontierProfileId>,
+    auto_select: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FrontierProfileWire {
+    schema: String,
+    id: FrontierProfileId,
+    ordering: FrontierOrdering,
+    solver_ids: Vec<SolverId>,
+    minimum_trust: SolverTrust,
+    budget: ResourceVector,
+    fallback_profile: Option<FrontierProfileId>,
+    auto_select: bool,
+}
+
+impl FrontierProfile {
+    /// Construct a profile, rejecting empty or ambiguous solver policy.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        id: FrontierProfileId,
+        ordering: FrontierOrdering,
+        solver_ids: Vec<SolverId>,
+        minimum_trust: SolverTrust,
+        budget: ResourceVector,
+        fallback_profile: Option<FrontierProfileId>,
+        auto_select: bool,
+    ) -> Result<Self, FrontierPlanError> {
+        if solver_ids.is_empty() {
+            return Err(FrontierPlanError::EmptySolverSet { profile_id: id });
+        }
+        let mut unique = BTreeSet::new();
+        for solver_id in &solver_ids {
+            if !unique.insert(solver_id) {
+                return Err(FrontierPlanError::DuplicateProfileSolver {
+                    profile_id: id,
+                    solver_id: solver_id.clone(),
+                });
+            }
+        }
+        if fallback_profile.as_ref() == Some(&id) {
+            return Err(FrontierPlanError::SelfReferentialFallback { profile_id: id });
+        }
+        Ok(Self {
+            id,
+            ordering,
+            solver_ids,
+            minimum_trust,
+            budget,
+            fallback_profile,
+            auto_select,
+        })
+    }
+
+    /// Stable profile identity.
+    pub const fn id(&self) -> &FrontierProfileId {
+        &self.id
+    }
+
+    /// Search or fixed-order execution policy.
+    pub const fn ordering(&self) -> FrontierOrdering {
+        self.ordering
+    }
+
+    /// Candidate solvers, preserving declared order.
+    pub fn solver_ids(&self) -> &[SolverId] {
+        &self.solver_ids
+    }
+
+    /// Minimum admitted maturity for every candidate.
+    pub const fn minimum_trust(&self) -> SolverTrust {
+        self.minimum_trust
+    }
+
+    /// Complete hard resource ceilings.
+    pub const fn budget(&self) -> ResourceVector {
+        self.budget
+    }
+
+    /// Explicit alternate profile identity, if caller supplied one.
+    ///
+    /// [`SolverRegistry`] does not resolve profile identities or follow this
+    /// reference. A profile catalog must resolve and validate it when the
+    /// caller explicitly submits that alternate profile as a new request.
+    pub const fn fallback_profile(&self) -> Option<&FrontierProfileId> {
+        self.fallback_profile.as_ref()
+    }
+
+    /// Whether validated Pareto output may be selected automatically.
+    pub const fn auto_select(&self) -> bool {
+        self.auto_select
+    }
+
+    /// Bind this profile's hard budget to one checked matrix shape.
+    pub fn request(&self, rows: u64, columns: u64) -> Result<SolverRequest, FrontierPlanError> {
+        SolverRequest::new(rows, columns, self.budget)
+    }
+}
+
+impl TryFrom<FrontierProfileWire> for FrontierProfile {
+    type Error = FrontierPlanError;
+
+    fn try_from(value: FrontierProfileWire) -> Result<Self, Self::Error> {
+        if value.schema != FRONTIER_PROFILE_SCHEMA_V1 {
+            return Err(FrontierPlanError::UnsupportedProfileSchema {
+                found: value.schema,
+                supported: FRONTIER_PROFILE_SCHEMA_V1,
+            });
+        }
+        Self::new(
+            value.id,
+            value.ordering,
+            value.solver_ids,
+            value.minimum_trust,
+            value.budget,
+            value.fallback_profile,
+            value.auto_select,
+        )
+    }
+}
+
+impl From<FrontierProfile> for FrontierProfileWire {
+    fn from(value: FrontierProfile) -> Self {
+        Self {
+            schema: FRONTIER_PROFILE_SCHEMA_V1.to_owned(),
+            id: value.id,
+            ordering: value.ordering,
+            solver_ids: value.solver_ids,
+            minimum_trust: value.minimum_trust,
+            budget: value.budget,
+            fallback_profile: value.fallback_profile,
+            auto_select: value.auto_select,
+        }
+    }
+}
+
+/// Immutable-by-identity catalog for V3 profiles and explicit fallback topology.
+#[derive(Clone, Debug, Default)]
+pub struct FrontierProfileCatalog {
+    profiles: BTreeMap<FrontierProfileId, FrontierProfile>,
+}
+
+impl FrontierProfileCatalog {
+    /// Construct an empty catalog. No profile or fallback exists implicitly.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register one profile, refusing replacement under an existing identity.
+    pub fn register(&mut self, profile: FrontierProfile) -> Result<(), FrontierPlanError> {
+        if self.profiles.contains_key(profile.id()) {
+            return Err(FrontierPlanError::DuplicateProfile {
+                profile_id: profile.id().clone(),
+            });
+        }
+        self.profiles.insert(profile.id().clone(), profile);
+        Ok(())
+    }
+
+    /// Registered profile IDs in deterministic lexical order.
+    pub fn ids(&self) -> Vec<&str> {
+        self.profiles
+            .keys()
+            .map(FrontierProfileId::as_str)
+            .collect()
+    }
+
+    /// Fetch one exact registered profile without resolving its fallback.
+    pub fn get(&self, profile_id: &FrontierProfileId) -> Option<&FrontierProfile> {
+        self.profiles.get(profile_id)
+    }
+
+    /// Validate fallback topology first, then every profile's solver/trust policy.
+    pub fn validate(&self, solvers: &SolverRegistry) -> Result<(), FrontierPlanError> {
+        for profile_id in self.profiles.keys() {
+            self.fallback_chain(profile_id)?;
+        }
+        for profile in self.profiles.values() {
+            solvers.validate_profile(profile)?;
+        }
+        Ok(())
+    }
+
+    /// Return a validated explicit fallback chain without planning or running it.
+    ///
+    /// Caller must submit each returned profile as a distinct request. This
+    /// method never performs automatic fallback.
+    pub fn fallback_chain(
+        &self,
+        profile_id: &FrontierProfileId,
+    ) -> Result<Vec<&FrontierProfile>, FrontierPlanError> {
+        let mut chain = Vec::new();
+        let mut seen = BTreeSet::new();
+        let mut current = Some(profile_id);
+        while let Some(current_id) = current {
+            if !seen.insert(current_id.clone()) {
+                let mut cycle: Vec<_> = chain
+                    .iter()
+                    .map(|profile: &&FrontierProfile| profile.id().clone())
+                    .collect();
+                cycle.push(current_id.clone());
+                return Err(FrontierPlanError::FallbackCycle { profiles: cycle });
+            }
+            let profile =
+                self.profiles
+                    .get(current_id)
+                    .ok_or_else(|| FrontierPlanError::UnknownProfile {
+                        profile_id: current_id.clone(),
+                    })?;
+            chain.push(profile);
+            current = profile.fallback_profile();
+        }
+        Ok(chain)
+    }
+}
+
 /// Shape and hard resource ceilings supplied to one planning attempt.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "SolverRequestWire", into = "SolverRequestWire")]
@@ -477,7 +793,59 @@ pub trait FrontierSolver: fmt::Debug + Send + Sync {
     fn descriptor(&self) -> &SolverDescriptor;
 
     /// Estimate complete resources without mutating artifacts or starting fitting.
-    fn estimate(&self, request: &SolverRequest) -> Result<ResourceVector, FrontierSolverError>;
+    fn estimate(
+        &self,
+        request: &SolverRequest,
+    ) -> Result<FrontierResourceEstimate, FrontierSolverError>;
+}
+
+/// Resource estimate plus exact machine and supporting-evidence identities.
+/// Individual dimensions may be zero; zero means no use, not unknown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FrontierResourceEstimate {
+    resources: ResourceVector,
+    machine_id: ContentId,
+    evidence_id: ContentId,
+}
+
+impl FrontierResourceEstimate {
+    /// Bind one complete estimate to machine inventory and estimator evidence.
+    pub fn new(
+        resources: ResourceVector,
+        machine_id: ContentId,
+        evidence_id: ContentId,
+    ) -> Result<Self, FrontierPlanError> {
+        if machine_id.as_bytes() == &[0; 32] {
+            return Err(FrontierPlanError::ZeroReceiptDigest {
+                field: "resource machine_id",
+            });
+        }
+        if evidence_id.as_bytes() == &[0; 32] {
+            return Err(FrontierPlanError::ZeroReceiptDigest {
+                field: "resource evidence_id",
+            });
+        }
+        Ok(Self {
+            resources,
+            machine_id,
+            evidence_id,
+        })
+    }
+
+    /// Complete estimated resource vector.
+    pub const fn resources(self) -> ResourceVector {
+        self.resources
+    }
+
+    /// Content identity of exact machine and accelerator inventory.
+    pub const fn machine_id(self) -> ContentId {
+        self.machine_id
+    }
+
+    /// Content identity of measurements or model supporting this estimate.
+    pub const fn evidence_id(self) -> ContentId {
+        self.evidence_id
+    }
 }
 
 /// Successful plan admitted against caller budget and trust requirements.
@@ -485,7 +853,7 @@ pub trait FrontierSolver: fmt::Debug + Send + Sync {
 pub struct AdmittedSolverPlan {
     descriptor: SolverDescriptor,
     request: SolverRequest,
-    estimate: ResourceVector,
+    estimate: FrontierResourceEstimate,
 }
 
 impl AdmittedSolverPlan {
@@ -506,7 +874,31 @@ impl AdmittedSolverPlan {
 
     /// Exact estimate checked against the hard budget.
     pub const fn estimate(&self) -> ResourceVector {
+        self.estimate.resources()
+    }
+
+    /// Evidence-bound estimate admitted by registry.
+    pub const fn resource_estimate(&self) -> FrontierResourceEstimate {
         self.estimate
+    }
+
+    /// Stable identity of descriptor, request, estimate, machine, and evidence.
+    pub fn content_id(&self) -> ContentId {
+        let descriptor =
+            serde_json::to_vec(&self.descriptor).expect("frontier solver descriptor serializes");
+        let request =
+            serde_json::to_vec(&self.request).expect("frontier solver request serializes");
+        let resources = serde_json::to_vec(&self.estimate.resources())
+            .expect("frontier resource vector serializes");
+        let mut identity = Vec::new();
+        identity.extend_from_slice(b"tritium frontier admitted solver plan v1\0");
+        for field in [&descriptor, &request, &resources] {
+            identity.extend_from_slice(&(field.len() as u64).to_le_bytes());
+            identity.extend_from_slice(field);
+        }
+        identity.extend_from_slice(self.estimate.machine_id().as_bytes());
+        identity.extend_from_slice(self.estimate.evidence_id().as_bytes());
+        ContentId::of_bytes(&identity)
     }
 }
 
@@ -546,6 +938,27 @@ impl SolverRegistry {
         self.solvers.keys().map(SolverId::as_str).collect()
     }
 
+    /// Validate that every profile member is installed at the required trust tier.
+    pub fn validate_profile(&self, profile: &FrontierProfile) -> Result<(), FrontierPlanError> {
+        for solver_id in profile.solver_ids() {
+            let solver =
+                self.solvers
+                    .get(solver_id)
+                    .ok_or_else(|| FrontierPlanError::UnknownSolver {
+                        solver_id: solver_id.clone(),
+                    })?;
+            let actual = solver.descriptor().trust();
+            if actual < profile.minimum_trust() {
+                return Err(FrontierPlanError::InsufficientTrust {
+                    solver_id: solver_id.clone(),
+                    actual,
+                    required: profile.minimum_trust(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Plan one explicitly named solver with no automatic fallback.
     pub fn plan(
         &self,
@@ -574,15 +987,16 @@ impl SolverRegistry {
                     solver_id: solver_id.clone(),
                     source,
                 })?;
+        let resources = estimate.resources();
         if request.budget().runtime_latency_micros().is_some()
-            && estimate.runtime_latency_micros().is_none()
+            && resources.runtime_latency_micros().is_none()
         {
             return Err(FrontierPlanError::IncompleteEstimate {
                 solver_id: solver_id.clone(),
                 dimension: ResourceDimension::RuntimeLatencyMicros,
             });
         }
-        let violations = request.budget().violations(estimate);
+        let violations = request.budget().violations(resources);
         if !violations.is_empty() {
             return Err(FrontierPlanError::BudgetExceeded {
                 solver_id: solver_id.clone(),
@@ -605,6 +1019,50 @@ pub enum FrontierPlanError {
     InvalidSolverId {
         /// Rejected input.
         value: String,
+    },
+    /// Profile identity is empty, non-canonical, or too long.
+    InvalidProfileId {
+        /// Rejected input.
+        value: String,
+    },
+    /// Serialized profile uses an unsupported schema.
+    UnsupportedProfileSchema {
+        /// Schema found on input.
+        found: String,
+        /// Schema supported by this reader.
+        supported: &'static str,
+    },
+    /// Profile declares no candidate solver.
+    EmptySolverSet {
+        /// Invalid profile identity.
+        profile_id: FrontierProfileId,
+    },
+    /// Profile repeats one solver identity.
+    DuplicateProfileSolver {
+        /// Invalid profile identity.
+        profile_id: FrontierProfileId,
+        /// Repeated solver identity.
+        solver_id: SolverId,
+    },
+    /// Catalog already contains this exact profile identity.
+    DuplicateProfile {
+        /// Duplicate profile identity.
+        profile_id: FrontierProfileId,
+    },
+    /// Requested profile or fallback target is not registered.
+    UnknownProfile {
+        /// Missing profile identity.
+        profile_id: FrontierProfileId,
+    },
+    /// Registered fallback topology contains a cycle.
+    FallbackCycle {
+        /// Traversed identities ending with repeated profile.
+        profiles: Vec<FrontierProfileId>,
+    },
+    /// Profile names itself as its direct fallback.
+    SelfReferentialFallback {
+        /// Invalid profile identity.
+        profile_id: FrontierProfileId,
     },
     /// Solver descriptor targets an unsupported object-safe ABI.
     UnsupportedSolverAbi {
@@ -662,12 +1120,185 @@ pub enum FrontierPlanError {
         /// Every exceeded dimension in stable schema order.
         violations: Vec<ResourceViolation>,
     },
+    /// Receipt contains an all-zero content identity.
+    ZeroReceiptDigest {
+        /// Invalid receipt field.
+        field: &'static str,
+    },
+    /// Receipt contains empty, padded, controlled, or overlong text.
+    InvalidReceiptText {
+        /// Invalid receipt field.
+        field: &'static str,
+    },
+    /// Stage estimate was never admissible under its bound hard budget.
+    UnadmittedStageEstimate {
+        /// Every estimate dimension exceeding budget.
+        violations: Vec<ResourceViolation>,
+    },
+    /// Stage omitted a measured dimension constrained by bound budget.
+    IncompleteStageMeasurement {
+        /// Missing measured resource dimension.
+        dimension: ResourceDimension,
+    },
+    /// Stage outcome, output, diagnostic, and measured resources disagree.
+    IncoherentStageOutcome {
+        /// Rejected terminal outcome.
+        outcome: FrontierStageOutcome,
+    },
+    /// Serialized stage or Pareto receipt uses an unsupported schema.
+    UnsupportedReceiptSchema {
+        /// Receipt kind.
+        kind: &'static str,
+        /// Schema found on input.
+        found: String,
+        /// Schema supported by this reader.
+        supported: &'static str,
+    },
+    /// Pareto receipt contains no objective definitions.
+    EmptyObjectiveSet,
+    /// Objective definitions or values are not in strict lexical order.
+    NonCanonicalObjectiveOrder {
+        /// Prior objective identity.
+        previous: String,
+        /// Current objective identity.
+        current: String,
+    },
+    /// Pareto candidate contains no objective values.
+    EmptyObjectiveValues,
+    /// Pareto receipt contains no candidates.
+    EmptyParetoCandidateSet,
+    /// Pareto candidates are not in strict artifact-digest order.
+    NonCanonicalParetoCandidateOrder {
+        /// Prior artifact identity.
+        previous: ContentId,
+        /// Current artifact identity.
+        current: ContentId,
+    },
+    /// Candidate objective identities do not exactly match receipt definitions.
+    ObjectiveSetMismatch {
+        /// Candidate artifact identity.
+        artifact_id: ContentId,
+    },
+    /// Candidate is dominated and therefore not on declared Pareto frontier.
+    DominatedParetoCandidate {
+        /// Dominated artifact identity.
+        dominated: ContentId,
+        /// Artifact proving dominance.
+        dominator: ContentId,
+    },
+    /// Receipt tried automatic selection under profile forbidding it.
+    AutomaticSelectionForbidden {
+        /// Bound profile identity.
+        profile_id: FrontierProfileId,
+    },
+    /// Selection names an artifact absent from candidate frontier.
+    UnknownSelectedCandidate {
+        /// Missing candidate artifact identity.
+        artifact_id: ContentId,
+    },
+    /// Admitted solver is not a member of the profile or misses its trust floor.
+    ProfileSolverMismatch {
+        /// Bound profile identity.
+        profile_id: FrontierProfileId,
+        /// Rejected solver identity.
+        solver_id: SolverId,
+    },
+    /// Admitted request budget differs from the immutable profile budget.
+    ProfileBudgetMismatch {
+        /// Bound profile identity.
+        profile_id: FrontierProfileId,
+    },
+    /// Worker receipt differs from its exact stage request.
+    StageReceiptMismatch {
+        /// First mismatched binding field.
+        field: &'static str,
+    },
+    /// Portable stage request differs from its opaque registry admission token.
+    StageRequestPlanMismatch {
+        /// First mismatched binding field.
+        field: &'static str,
+    },
+    /// Stage index cannot be incremented or represented.
+    StageIndexOverflow,
+    /// A terminal or completed-evaluation stage cannot advance.
+    CannotAdvanceTerminalStage {
+        /// Terminal stage index.
+        stage_index: u32,
+        /// Terminal stage outcome.
+        outcome: FrontierStageOutcome,
+    },
+    /// Run receipt contains no stage evidence.
+    EmptyRunReceipt,
+    /// Run stage indices are not exactly zero-based and contiguous.
+    NonContiguousStageIndex {
+        /// Required stage index.
+        expected: u32,
+        /// Observed stage index.
+        found: u32,
+    },
+    /// Run-scoped identity or resource binding changed between stages.
+    RunReceiptIdentityDrift {
+        /// Stage containing drift.
+        stage_index: u32,
+        /// First drifted field.
+        field: &'static str,
+    },
+    /// A stage follows a failed or over-budget stage.
+    StageAfterTerminalOutcome {
+        /// Index of prior terminal stage.
+        terminal_index: u32,
+    },
+    /// Stage semantics move backward or repeat.
+    NonMonotonicStageOrder {
+        /// Prior stage.
+        previous: FrontierStage,
+        /// Current stage.
+        current: FrontierStage,
+    },
+    /// Stage input does not equal prior completed-stage output.
+    BrokenStageInputChain {
+        /// Stage with wrong input identity.
+        stage_index: u32,
+    },
 }
 
 impl fmt::Display for FrontierPlanError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidSolverId { value } => write!(formatter, "invalid solver id {value:?}"),
+            Self::InvalidProfileId { value } => write!(formatter, "invalid profile id {value:?}"),
+            Self::UnsupportedProfileSchema { found, supported } => write!(
+                formatter,
+                "unsupported frontier profile schema {found:?}; supported schema is {supported}"
+            ),
+            Self::EmptySolverSet { profile_id } => {
+                write!(formatter, "frontier profile {profile_id} has no solvers")
+            }
+            Self::DuplicateProfileSolver {
+                profile_id,
+                solver_id,
+            } => write!(
+                formatter,
+                "frontier profile {profile_id} repeats solver {solver_id}"
+            ),
+            Self::DuplicateProfile { profile_id } => {
+                write!(
+                    formatter,
+                    "frontier profile {profile_id} is already registered"
+                )
+            }
+            Self::UnknownProfile { profile_id } => {
+                write!(formatter, "frontier profile {profile_id} is not registered")
+            }
+            Self::FallbackCycle { profiles } => write!(
+                formatter,
+                "frontier profile fallback chain contains a {}-entry cycle",
+                profiles.len()
+            ),
+            Self::SelfReferentialFallback { profile_id } => write!(
+                formatter,
+                "frontier profile {profile_id} cannot fall back to itself"
+            ),
             Self::UnsupportedSolverAbi {
                 solver_id,
                 found,
@@ -710,6 +1341,121 @@ impl fmt::Display for FrontierPlanError {
                 formatter,
                 "solver {solver_id} exceeds {} hard resource budget(s)",
                 violations.len()
+            ),
+            Self::ZeroReceiptDigest { field } => {
+                write!(formatter, "receipt {field} digest is all zeroes")
+            }
+            Self::InvalidReceiptText { field } => {
+                write!(formatter, "receipt {field} text is invalid")
+            }
+            Self::UnadmittedStageEstimate { violations } => write!(
+                formatter,
+                "stage estimate exceeds {} bound hard resource budget(s)",
+                violations.len()
+            ),
+            Self::IncompleteStageMeasurement { dimension } => write!(
+                formatter,
+                "stage omitted measured resource dimension {dimension:?}"
+            ),
+            Self::IncoherentStageOutcome { outcome } => {
+                write!(
+                    formatter,
+                    "stage outcome {outcome:?} has incoherent evidence"
+                )
+            }
+            Self::UnsupportedReceiptSchema {
+                kind,
+                found,
+                supported,
+            } => write!(
+                formatter,
+                "unsupported {kind} receipt schema {found:?}; supported schema is {supported}"
+            ),
+            Self::EmptyObjectiveSet => {
+                formatter.write_str("Pareto receipt has no objective definitions")
+            }
+            Self::NonCanonicalObjectiveOrder { previous, current } => write!(
+                formatter,
+                "objective order is not canonical: {previous:?} before {current:?}"
+            ),
+            Self::EmptyObjectiveValues => {
+                formatter.write_str("Pareto candidate has no objective values")
+            }
+            Self::EmptyParetoCandidateSet => {
+                formatter.write_str("Pareto receipt has no candidates")
+            }
+            Self::NonCanonicalParetoCandidateOrder { previous, current } => write!(
+                formatter,
+                "Pareto candidate order is not canonical: {previous} before {current}"
+            ),
+            Self::ObjectiveSetMismatch { artifact_id } => write!(
+                formatter,
+                "Pareto candidate {artifact_id} objective set does not match definitions"
+            ),
+            Self::DominatedParetoCandidate {
+                dominated,
+                dominator,
+            } => write!(
+                formatter,
+                "Pareto candidate {dominated} is dominated by {dominator}"
+            ),
+            Self::AutomaticSelectionForbidden { profile_id } => write!(
+                formatter,
+                "frontier profile {profile_id} forbids automatic selection"
+            ),
+            Self::UnknownSelectedCandidate { artifact_id } => write!(
+                formatter,
+                "selected artifact {artifact_id} is absent from Pareto candidates"
+            ),
+            Self::ProfileSolverMismatch {
+                profile_id,
+                solver_id,
+            } => write!(
+                formatter,
+                "solver {solver_id} is not admitted by frontier profile {profile_id}"
+            ),
+            Self::ProfileBudgetMismatch { profile_id } => write!(
+                formatter,
+                "solver request budget differs from frontier profile {profile_id}"
+            ),
+            Self::StageReceiptMismatch { field } => {
+                write!(
+                    formatter,
+                    "stage receipt does not match request field {field}"
+                )
+            }
+            Self::StageRequestPlanMismatch { field } => write!(
+                formatter,
+                "frontier stage request does not match admitted plan field {field}"
+            ),
+            Self::StageIndexOverflow => formatter.write_str("frontier stage index overflow"),
+            Self::CannotAdvanceTerminalStage {
+                stage_index,
+                outcome,
+            } => write!(
+                formatter,
+                "frontier stage {stage_index} with outcome {outcome:?} cannot advance"
+            ),
+            Self::EmptyRunReceipt => formatter.write_str("frontier run receipt is empty"),
+            Self::NonContiguousStageIndex { expected, found } => write!(
+                formatter,
+                "frontier run expected stage index {expected}, found {found}"
+            ),
+            Self::RunReceiptIdentityDrift { stage_index, field } => write!(
+                formatter,
+                "frontier run stage {stage_index} changed bound field {field}"
+            ),
+            Self::StageAfterTerminalOutcome { terminal_index } => write!(
+                formatter,
+                "frontier run continues after terminal stage {terminal_index}"
+            ),
+            Self::NonMonotonicStageOrder { previous, current } => write!(
+                formatter,
+                "frontier stage order does not advance: {previous:?} then {current:?}"
+            ),
+            Self::BrokenStageInputChain { stage_index } => write!(
+                formatter,
+                "frontier run stage {stage_index} input does not match prior output"
             ),
         }
     }

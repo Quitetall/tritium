@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
 use tritium_salt::{
-    FRONTIER_SOLVER_ABI_V1, FrontierPlanError, FrontierSolver, FrontierSolverError,
-    ResourceDimension, ResourceVector, SolverDescriptor, SolverFamily, SolverId, SolverRegistry,
-    SolverRequest, SolverTrust,
+    FRONTIER_PROFILE_SCHEMA_V1, FRONTIER_SOLVER_ABI_V1, FrontierOrdering, FrontierPlanError,
+    FrontierProfile, FrontierProfileCatalog, FrontierProfileId, FrontierResourceEstimate,
+    FrontierSolver, FrontierSolverError, ResourceDimension, ResourceVector, SolverDescriptor,
+    SolverFamily, SolverId, SolverRegistry, SolverRequest, SolverTrust,
 };
 
 #[derive(Debug)]
@@ -12,13 +13,100 @@ struct FixedEstimateSolver {
     estimate: ResourceVector,
 }
 
+fn profile_with_fallback(id: &str, fallback: Option<&str>) -> FrontierProfile {
+    FrontierProfile::new(
+        FrontierProfileId::new(id).unwrap(),
+        FrontierOrdering::Fixed,
+        vec![SolverId::new("salt.v3").unwrap()],
+        SolverTrust::Registered,
+        ResourceVector::new(10, 0, 10, 10, 10, 0, 10, None),
+        fallback.map(|value| FrontierProfileId::new(value).unwrap()),
+        false,
+    )
+    .unwrap()
+}
+
+#[test]
+fn profile_catalog_resolves_only_validated_explicit_fallback_chains() {
+    let tiny = ResourceVector::new(1, 0, 1, 1, 1, 0, 1, None);
+    let mut solvers = SolverRegistry::new();
+    solvers
+        .register(solver(
+            "salt.v3",
+            SolverTrust::Registered,
+            FRONTIER_SOLVER_ABI_V1,
+            tiny,
+        ))
+        .unwrap();
+
+    let mut catalog = FrontierProfileCatalog::new();
+    catalog
+        .register(profile_with_fallback("fallback.safe", None))
+        .unwrap();
+    catalog
+        .register(profile_with_fallback(
+            "research.default",
+            Some("fallback.safe"),
+        ))
+        .unwrap();
+    assert_eq!(catalog.ids(), ["fallback.safe", "research.default"]);
+    catalog.validate(&solvers).unwrap();
+    let chain = catalog
+        .fallback_chain(&FrontierProfileId::new("research.default").unwrap())
+        .unwrap();
+    assert_eq!(
+        chain
+            .iter()
+            .map(|profile| profile.id().as_str())
+            .collect::<Vec<_>>(),
+        ["research.default", "fallback.safe"]
+    );
+    assert!(matches!(
+        catalog.register(profile_with_fallback("fallback.safe", None)),
+        Err(FrontierPlanError::DuplicateProfile { .. })
+    ));
+}
+
+#[test]
+fn profile_catalog_refuses_missing_fallbacks_and_cycles() {
+    let solvers = SolverRegistry::new();
+    let mut missing = FrontierProfileCatalog::new();
+    missing
+        .register(profile_with_fallback("research.default", Some("missing")))
+        .unwrap();
+    assert!(matches!(
+        missing.fallback_chain(&FrontierProfileId::new("research.default").unwrap()),
+        Err(FrontierPlanError::UnknownProfile { .. })
+    ));
+
+    let mut cyclic = FrontierProfileCatalog::new();
+    cyclic
+        .register(profile_with_fallback("profile.a", Some("profile.b")))
+        .unwrap();
+    cyclic
+        .register(profile_with_fallback("profile.b", Some("profile.a")))
+        .unwrap();
+    assert!(matches!(
+        cyclic.validate(&solvers),
+        Err(FrontierPlanError::FallbackCycle { .. })
+    ));
+}
+
 impl FrontierSolver for FixedEstimateSolver {
     fn descriptor(&self) -> &SolverDescriptor {
         &self.descriptor
     }
 
-    fn estimate(&self, _request: &SolverRequest) -> Result<ResourceVector, FrontierSolverError> {
-        Ok(self.estimate)
+    fn estimate(
+        &self,
+        _request: &SolverRequest,
+    ) -> Result<FrontierResourceEstimate, FrontierSolverError> {
+        Ok(FrontierResourceEstimate::new(
+            self.estimate,
+            tritium_salt::ContentId::from_digest([71; 32]),
+            tritium_salt::ContentId::from_digest([72; 32]),
+        )
+        .unwrap())
     }
 }
 
@@ -197,6 +285,15 @@ fn admitted_plan_binds_solver_request_and_exact_estimate() {
     assert_eq!(plan.solver_id().as_str(), "salt.v3");
     assert_eq!(plan.request(), &request);
     assert_eq!(plan.estimate(), estimate);
+    assert_eq!(
+        plan.resource_estimate().machine_id(),
+        tritium_salt::ContentId::from_digest([71; 32])
+    );
+    assert_eq!(
+        plan.resource_estimate().evidence_id(),
+        tritium_salt::ContentId::from_digest([72; 32])
+    );
+    assert_eq!(plan.content_id(), plan.clone().content_id());
 }
 
 #[test]
@@ -211,6 +308,16 @@ fn serialized_contracts_cannot_bypass_constructor_validation() {
         r#"{"rows":0,"columns":4,"budget":{"host_ram_bytes":1,"vram_bytes":0,"disk_bytes":1,"artifact_bytes":1,"resident_bytes":1,"transient_bytes":1,"fitting_millis":1,"runtime_latency_micros":null}}"#
     )
     .is_err());
+    assert!(matches!(
+        FrontierResourceEstimate::new(
+            ResourceVector::new(1, 0, 1, 1, 1, 1, 1, None),
+            tritium_salt::ContentId::from_digest([0; 32]),
+            tritium_salt::ContentId::from_digest([1; 32]),
+        ),
+        Err(FrontierPlanError::ZeroReceiptDigest {
+            field: "resource machine_id"
+        })
+    ));
 }
 
 #[test]
@@ -237,5 +344,126 @@ fn constrained_dimension_requires_an_estimate() {
             dimension: ResourceDimension::RuntimeLatencyMicros,
             ..
         })
+    ));
+}
+
+#[test]
+fn profile_contract_round_trips_with_stable_schema() {
+    let profile = FrontierProfile::new(
+        FrontierProfileId::new("research.default").unwrap(),
+        FrontierOrdering::Search,
+        vec![
+            SolverId::new("salt.v3").unwrap(),
+            SolverId::new("qtea.v1").unwrap(),
+        ],
+        SolverTrust::Experimental,
+        ResourceVector::new(1024, 512, 2048, 768, 896, 128, 60_000, None),
+        Some(FrontierProfileId::new("safe.salt-only").unwrap()),
+        false,
+    )
+    .unwrap();
+
+    let value = serde_json::to_value(&profile).unwrap();
+    assert_eq!(value["schema"], FRONTIER_PROFILE_SCHEMA_V1);
+    assert_eq!(value["ordering"], "search");
+    assert_eq!(value["fallback_profile"], "safe.salt-only");
+    assert_eq!(value["auto_select"], false);
+    assert!(value.get("elements").is_none());
+    assert_eq!(
+        serde_json::from_value::<FrontierProfile>(value).unwrap(),
+        profile
+    );
+}
+
+#[test]
+fn profile_refuses_bad_schema_empty_duplicate_and_self_fallback() {
+    let budget = ResourceVector::new(1, 0, 1, 1, 1, 1, 1, None);
+    let profile_id = FrontierProfileId::new("research.default").unwrap();
+    assert!(matches!(
+        FrontierProfile::new(
+            profile_id.clone(),
+            FrontierOrdering::Search,
+            Vec::new(),
+            SolverTrust::Experimental,
+            budget,
+            None,
+            false,
+        ),
+        Err(FrontierPlanError::EmptySolverSet { .. })
+    ));
+    assert!(matches!(
+        FrontierProfile::new(
+            profile_id.clone(),
+            FrontierOrdering::Fixed,
+            vec![
+                SolverId::new("salt.v3").unwrap(),
+                SolverId::new("salt.v3").unwrap(),
+            ],
+            SolverTrust::Registered,
+            budget,
+            None,
+            false,
+        ),
+        Err(FrontierPlanError::DuplicateProfileSolver { .. })
+    ));
+    assert!(matches!(
+        FrontierProfile::new(
+            profile_id.clone(),
+            FrontierOrdering::Search,
+            vec![SolverId::new("salt.v3").unwrap()],
+            SolverTrust::Experimental,
+            budget,
+            Some(profile_id),
+            false,
+        ),
+        Err(FrontierPlanError::SelfReferentialFallback { .. })
+    ));
+
+    let bad_schema = r#"{"schema":"tritium.frontier-profile.v999","id":"research.default","ordering":"search","solver_ids":["salt.v3"],"minimum_trust":"experimental","budget":{"host_ram_bytes":1,"vram_bytes":0,"disk_bytes":1,"artifact_bytes":1,"resident_bytes":1,"transient_bytes":1,"fitting_millis":1,"runtime_latency_micros":null},"fallback_profile":null,"auto_select":false}"#;
+    assert!(serde_json::from_str::<FrontierProfile>(bad_schema).is_err());
+    let unknown_field = r#"{"schema":"tritium.frontier-profile.v1","id":"research.default","ordering":"search","solver_ids":["salt.v3"],"minimum_trust":"experimental","budget":{"host_ram_bytes":1,"vram_bytes":0,"disk_bytes":1,"artifact_bytes":1,"resident_bytes":1,"transient_bytes":1,"fitting_millis":1,"runtime_latency_micros":null},"fallback_profile":null,"auto_select":false,"future_flag":true}"#;
+    assert!(serde_json::from_str::<FrontierProfile>(unknown_field).is_err());
+}
+
+#[test]
+fn profile_validation_refuses_missing_or_under_trusted_members() {
+    let budget = ResourceVector::new(4, 0, 4, 4, 4, 4, 4, None);
+    let mut registry = SolverRegistry::new();
+    registry
+        .register(solver(
+            "salt.v3",
+            SolverTrust::Experimental,
+            FRONTIER_SOLVER_ABI_V1,
+            budget,
+        ))
+        .unwrap();
+    let registered = FrontierProfile::new(
+        FrontierProfileId::new("release.fixed").unwrap(),
+        FrontierOrdering::Fixed,
+        vec![SolverId::new("salt.v3").unwrap()],
+        SolverTrust::Registered,
+        budget,
+        None,
+        false,
+    )
+    .unwrap();
+    assert!(matches!(
+        registry.validate_profile(&registered),
+        Err(FrontierPlanError::InsufficientTrust { .. })
+    ));
+
+    let missing = FrontierProfile::new(
+        FrontierProfileId::new("research.missing").unwrap(),
+        FrontierOrdering::Search,
+        vec![SolverId::new("missing.v1").unwrap()],
+        SolverTrust::Experimental,
+        budget,
+        None,
+        true,
+    )
+    .unwrap();
+    assert!(matches!(
+        registry.validate_profile(&missing),
+        Err(FrontierPlanError::UnknownSolver { .. })
     ));
 }

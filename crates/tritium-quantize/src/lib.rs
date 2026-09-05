@@ -50,6 +50,7 @@ mod salt_v2_evidence;
 mod salt_v2_feedback;
 mod salt_v2_model;
 mod salt_v2_output;
+mod ternary_baselines;
 mod training_export;
 
 pub use allocate::{
@@ -132,6 +133,10 @@ pub use salt_v2_output::{
     OutputReconstructionAccumulator, OutputReconstructionError, OutputReconstructionReceipt,
     OutputReconstructionSchedule, OutputReconstructionScope, OutputReconstructionSpec,
     select_output_reconstruction,
+};
+pub use ternary_baselines::{
+    BaselineTernaryPlane, TernaryBaselineError, TernaryBaselineProjection, TtqState, TwnConfig,
+    project_ttq, project_twn,
 };
 pub use training_export::{
     TrainingSaltExportError, TrainingSaltExportStats, export_training_salt_row,
