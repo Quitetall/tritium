@@ -16,8 +16,46 @@ deliberate: a partial or adversarial registry cannot remove a gate.
 The table below is the measured **union** across every local registry under
 `release/v1.1/` (23 registries, 105 receipts). A union is more generous than any
 real report can be: `evaluate()` additionally requires a registry to bind one
-exact candidate manifest at one exact `source_revision`, and no single revision
-comes close to satisfying a gate set. Read it as an upper bound on progress.
+exact candidate manifest at one exact `source_revision`. Read it as an upper
+bound on progress.
+
+> **Corrected 2026-09-05 — the coherence problem is smaller than this section
+> first claimed.** The original text said "no single revision comes close to
+> satisfying a gate set". That is true of the *local* registries and false of
+> what CI produces. **Every release run emits a coherent, same-revision evidence
+> set that has never been harvested.** The rc.2 run (33955449151) alone produced
+> receipts at `d16c0dda` for **seven** evidence kinds:
+>
+> | kind | receipt schema | where |
+> |---|---|---|
+> | `clean-install` | `tritium.compatibility-receipt.v1` ×3 | `release-bundle` |
+> | `compatibility-matrix` | `tritium.abi3-matrix-qualification.v1` | `abi3-compatibility-receipt` |
+> | `api-signature` | `tritium.installed-api-signature.v1` | `wheel-functional-*` |
+> | `installed-qat-tutorial` | `tritium.installed-qat-tutorial.v3` | `wheel-functional-*`, `wheel-tutorial-*` |
+> | `export-reload` | `tritium.hf-export-reload.v1` | `wheel-tutorial-*` |
+> | `frontend-lifecycle` | `tritium.hf-lifecycle.v1` | `wheel-tutorial-*` |
+> | `observability` | `tritium.installed-observability.v1` | `wheel-tutorial-*` |
+>
+> The `release-bundle` artifact also carries the three wheels and three
+> CycloneDX SBOMs already named to the artifact-ID convention this document
+> specifies, so candidate assembly needs no hand-built inputs.
+>
+> What this changes: the barrier to a coherent gate report is **registration,
+> not production**, for a substantial share of the evidence. Two gates are now
+> within reach rather than blocked —
+>
+> - **`packages`** needs `clean-install`, `compatibility-matrix`, `crate-archive`,
+>   `npm-archive`. rc.2 supplies the first two at `d16c0dda`; the other two are
+>   not emitted by the release run and would have to be produced at that revision.
+> - **`pytorch-hf`** needs eight kinds. rc.2 supplies **five** of them
+>   (`installed-qat-tutorial`, `frontend-lifecycle`, `export-reload`,
+>   `observability`, `api-signature`). Of the remaining three,
+>   `torch-dispatch-overhead` and `torch-dispatch-cuda` are producible on this
+>   box's GPU, and only `distributed-training` needs hardware we lack — which
+>   makes this gate a **GPU-rental away from PASS**, not blocked.
+>
+> Every artifact above is still downloadable (`expired=false`), and each release
+> regenerates them, so nothing here is time-critical.
 
 **15 of the 38 evidence kinds have been produced. 23 have not.**
 The 15 are `api-signature`, `clean-install`, `crate-archive`, `cuda-training`,
@@ -54,7 +92,7 @@ already exist as an ordinary file — run `trivy image --download-db-only
 | Gate | Status | Missing kinds | What the missing kinds require |
 |---|---|---|---|
 | `qwen-source-admission` | EVIDENCE | — | — |
-| `packages` | PARTIAL | `compatibility-matrix` | **Not blocked — CI already produces this evidence on every release; it has simply never been harvested.** The rc.2 run (33955449151) uploaded an `abi3-compatibility-receipt` artifact that passes `aggregate-wheel-smoke.py`'s own validator: schema `tritium.abi3-matrix-qualification.v1`, bound to `d16c0dda`, `passed: true`, 16 cells spanning CPython 3.9.25–3.14.7 across exactly three platforms (`linux-x86_64-cpu`, `macos-arm64-cpu`, `windows-x86_64-cpu`) and three distinct wheels. What remains is registration, not production: the wheels must be local (the `release-bundle` artifact carries them) and bound into a candidate manifest at the same revision. |
+| `packages` | PARTIAL | `compatibility-matrix` | **Not blocked — CI produces this on every release and it has never been harvested.** The rc.2 `abi3-compatibility-receipt` passes `aggregate-wheel-smoke.py`'s own validator: `tritium.abi3-matrix-qualification.v1`, bound to `d16c0dda`, `passed: true`, 16 cells spanning CPython 3.9.25–3.14.7 across three platforms and three distinct wheels. Harvesting it advances the union 15→16. It does **not** by itself close the gate: `crate-archive` and `npm-archive` are not emitted by the release run, so a coherent `packages` PASS needs those two produced at the same revision. |
 | `pytorch-hf` | PARTIAL | `distributed-training` | Two or more GPUs. |
 | `native-backends` | PARTIAL | `backend-manifest`, `performance` | All seven trace families, in order — `FAMILIES = ("cpu", "cuda", "rocm", "metal", "wgpu", "wasi", "mcu")`. Needs AMD *and* Apple *and* an MCU board. |
 | `estimators-refinement` | PARTIAL | `refinement`, `baseline-ablation` | Local SALT campaign runs. No new dependency; queued until the flagship conversion releases the CPU. |
