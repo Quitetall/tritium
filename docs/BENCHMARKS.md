@@ -113,6 +113,44 @@ opt-ins** — the same-config before was 0.97–0.98× (fast+f16, 08-08
 
 **Still owed:** upstream llama.cpp Q2_0 rerun; MI300X/Metal (user-gated).
 
+> **2026-09-04 — what the Q2_0 debt actually is.** Recorded five times in this
+> ledger as "the artifacts remain absent". Investigated; it is worse than that,
+> and the correction is load-bearing for anyone who picks this up.
+>
+> **1. The named artifact does not exist publicly.** There is no Qwen3.5-4B Q2_0
+> GGUF on HuggingFace; the `-m qwen35-4b-q2_0.gguf` in the 07-30 repro line was a
+> locally-produced file that is not on this box. What *is* published is the
+> comparison this ledger already called the clean follow-up — Prism ML's
+> Ternary-Bonsai re-quantized to Q2_0 at 1.7B/4B/8B/27B, plus matching TQ2_0 at
+> 4B/8B (`darkstarinitiative/AJAN-SIMIT-Ternary-Bonsai-Q2_0-GGUF`, Apache-2.0).
+> The 1.7B and 4B are pulled to the model cache.
+>
+> **2. Our Q2_0 reader cannot read them, and the reason is not the type id.**
+> `tritium inspect` fails with `tensor offset/size outside the data section`.
+> `GGML_TYPE_Q2_0 = 42` (`gguf.rs:30`) matches the files exactly, so the reader
+> believes it understands them. The disagreement is the block layout: `gguf.rs:418`
+> expects **18 bytes per 64 elements** (f16 scale + 16 bytes of codes, 2.25 bpw),
+> and every type-42 tensor in both files measures **exactly 17.000 bytes per 64
+> elements** — 2.125 bpw, which is what their model card states. Derived from
+> consecutive tensor offsets: 197 tensors in the 1.7B and 253 in the 4B, one
+> distinct ratio, `[17.0]`. The one-byte delta is consistent with an 8-bit scale
+> where we assume f16, but that is inference; the measurement is the byte count.
+>
+> **3. So "Q2_0" currently names two different formats.** Ours follows llama.cpp
+> PR #24448; the artifacts in the wild follow Prism ML's fork. Which becomes the
+> standard is open — Q2_0-g64 was still standardizing as of the ADR 0040 intake —
+> so this is *not* recorded as a bug in either implementation. What it does mean:
+> the same-model "Bonsai Q2_0 vs its Tritium import" comparison is blocked on
+> reader work, not on hardware, and a type-id match is not evidence of format
+> agreement. Worth a loud reject rather than a bounds error when the block size
+> disagrees.
+>
+> **4. The upstream leg needs its premise checked first.** Their model card says
+> Q2_0 is first-class in Prism ML's fork and "mainline `llama.cpp` support may
+> vary by version". If mainline cannot read Q2_0, the "upstream-master Q2_0
+> rerun" as written is not runnable, and the honest replacement is the Bonsai
+> same-model run labelled against the fork. One mainline build settles it.
+
 ### 2026-08-18 spec-cost levers @ 82f80b1b — delta re-sync, node-blocked tree attention, TB1 LUT verdict
 
 **Box state:** every number below ran in verified-quiet windows (desktop
