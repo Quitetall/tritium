@@ -107,6 +107,38 @@ def test_unknown_mode_is_rejected_before_any_check_runs():
     assert "must be report or block" in completed.stderr
 
 
+def _run_with_fake_cargo(tmp_path, exit_code):
+    """Run the gate with a stub `cargo` that exits with `exit_code`."""
+    fake = tmp_path / "cargo"
+    fake.write_text(f'#!/usr/bin/env bash\nexit {exit_code}\n')
+    fake.chmod(0o755)
+    return subprocess.run(
+        ["bash", "scripts/check-semver.sh"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}"},
+    )
+
+
+def test_report_mode_tolerates_findings(tmp_path):
+    """Exit 1 means the checker RAN and found breaking changes: report, pass."""
+    completed = _run_with_fake_cargo(tmp_path, 1)
+    assert completed.returncode == 0
+    assert "BREAKING CHANGES REPORTED" in completed.stdout
+
+
+def test_report_mode_still_fails_when_the_checker_cannot_run(tmp_path):
+    """A gate that could not run is not a clean result, even in report mode.
+
+    Swallowing this would make the lane green while checking nothing, which is
+    indistinguishable from a pass to anyone reading CI.
+    """
+    completed = _run_with_fake_cargo(tmp_path, 127)
+    assert completed.returncode == 127
+    assert "FAILED TO RUN" in completed.stderr
+
+
 def test_semver_selector_rejects_leading_zero_components():
     command = r'''
 source scripts/check-semver.sh

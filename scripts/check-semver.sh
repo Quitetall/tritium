@@ -116,7 +116,21 @@ main() {
     echo "[check-semver] no breaking change against the published baseline."
     return 0
   fi
-  echo "[check-semver] BREAKING CHANGES REPORTED (cargo-semver-checks exit $status)."
+  # Report mode tolerates FINDINGS, never FAILURES. cargo-semver-checks exits 1
+  # when it ran and found breaking changes; any other status means it could not
+  # run at all (absent binary, a baseline version not on the registry, a crate
+  # that will not build). Swallowing that would make this lane green while
+  # checking nothing — the exact failure mode a report-only gate invites, and
+  # indistinguishable from a clean pass to anyone reading CI.
+  if (( status != 1 )); then
+    echo "[check-semver] cargo-semver-checks FAILED TO RUN (exit $status)." >&2
+    echo "[check-semver] This is a broken gate, not a clean result, so it fails" >&2
+    echo "[check-semver] even in report mode. Check that cargo-semver-checks is" >&2
+    echo "[check-semver] installed and that the baseline version exists on the" >&2
+    echo "[check-semver] registry for every crate listed above." >&2
+    return "$status"
+  fi
+  echo "[check-semver] BREAKING CHANGES REPORTED (cargo-semver-checks exit 1)."
   echo "[check-semver] Not a failure during the release-candidate window: record"
   echo "[check-semver] them in the CHANGELOG rc section. Set TRITIUM_SEMVER_MODE=block"
   echo "[check-semver] to make this gate fail again."
