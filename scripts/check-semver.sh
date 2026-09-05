@@ -24,6 +24,15 @@
 #   - tritium-cli / tritium-benches  binaries; no library API to freeze.
 #   - tritium-py     PyO3 cdylib — gated by wheel/API compatibility receipts.
 #
+# FEATURE SET: --default-features on both sides. cargo-semver-checks defaults to
+# --all-features, which turns on `cuda` / `rocm` and runs those build scripts. The
+# BASELINE is the published 1.1.0-rc.0, whose tritium-cuda / tritium-rocm build.rs
+# panic when nvcc / hipcc are absent and predate the TRITIUM_CHECK_ONLY escape --
+# published code cannot be patched, so no environment variable can make the
+# baseline build on a hosted runner. Default features compare the surface a
+# default consumer sees, symmetrically, and the baseline builds anywhere.
+# Revisit when the baseline is a version whose build scripts honour
+# TRITIUM_CHECK_ONLY (1.1.0-rc.2 onward): --all-features becomes possible again.
 # KNOWN GAP: `tritium-serve`'s surface sits behind the `serve`/`cuda` features,
 # so a default-feature check sees almost none of it. That is a gap, not a pass.
 #
@@ -37,6 +46,22 @@
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
+
+# cargo-semver-checks builds rustdoc for every crate with ALL features, which
+# drags in tritium-cuda's build script (nvcc) and tritium-rocm's (hipcc). On a
+# machine without them the build script fails, rustdoc never runs, and
+# cargo-semver-checks exits 101 — so this gate's answer would otherwise depend on
+# whether the machine happens to have a CUDA toolkit installed. A gate that is
+# not deterministic across machines is not a gate.
+#
+# Forcing this cannot change the verdict: semver-checks reads API signatures out
+# of rustdoc JSON, never compiled kernel bytes. It is exported rather than
+# defaulted precisely because an override would reintroduce the nondeterminism.
+#
+# This was not a theoretical concern. Before the failure/finding split below, a
+# 101 here was reported as "BREAKING CHANGES REPORTED" and exited 0, so the CI
+# lane passed while checking nothing — for as long as the lane had existed.
+export TRITIUM_CHECK_ONLY=1
 
 # Published baseline. `latest_stable_baseline` below is retained because an
 # explicit git rev is still a supported comparison, and because the release-tag
@@ -103,7 +128,7 @@ main() {
   done
 
   if [[ "$mode" == "block" ]]; then
-    exec cargo "+$toolchain" semver-checks "${baseline_args[@]}" "${package_args[@]}"
+    exec cargo "+$toolchain" semver-checks --default-features "${baseline_args[@]}" "${package_args[@]}"
   fi
   if [[ "$mode" != "report" ]]; then
     echo "[check-semver] TRITIUM_SEMVER_MODE must be report or block, got '$mode'" >&2
@@ -111,7 +136,7 @@ main() {
   fi
 
   local status=0
-  cargo "+$toolchain" semver-checks "${baseline_args[@]}" "${package_args[@]}" || status=$?
+  cargo "+$toolchain" semver-checks --default-features "${baseline_args[@]}" "${package_args[@]}" || status=$?
   if (( status == 0 )); then
     echo "[check-semver] no breaking change against the published baseline."
     return 0

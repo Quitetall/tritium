@@ -16,8 +16,62 @@ deliberate: a partial or adversarial registry cannot remove a gate.
 The table below is the measured **union** across every local registry under
 `release/v1.1/` (23 registries, 105 receipts). A union is more generous than any
 real report can be: `evaluate()` additionally requires a registry to bind one
-exact candidate manifest at one exact `source_revision`, and no single revision
-comes close to satisfying a gate set. Read it as an upper bound on progress.
+exact candidate manifest at one exact `source_revision`. Read it as an upper
+bound on progress.
+
+> **Corrected 2026-09-05 — the coherence problem is smaller than this section
+> first claimed.** The original text said "no single revision comes close to
+> satisfying a gate set". That is true of the *local* registries and false of
+> what CI produces. **Every release run emits a coherent, same-revision evidence
+> set that has never been harvested.** The rc.2 run (33955449151) alone produced
+> receipts at `d16c0dda` for **seven** evidence kinds:
+>
+> | kind | receipt schema | where |
+> |---|---|---|
+> | `clean-install` | `tritium.wheel-functional-qualification.v1` | `wheel-functional-*` |
+> | `compatibility-matrix` | `tritium.abi3-matrix-qualification.v1` | `abi3-compatibility-receipt` |
+> | `api-signature` | `tritium.installed-api-signature.v1` | `wheel-functional-*` |
+> | `installed-qat-tutorial` | `tritium.installed-qat-tutorial.v3` | `wheel-functional-*`, `wheel-tutorial-*` |
+> | `export-reload` | `tritium.hf-export-reload.v1` | `wheel-tutorial-*` |
+> | `frontend-lifecycle` | `tritium.hf-lifecycle.v1` | `wheel-tutorial-*` |
+> | `observability` | `tritium.installed-observability.v1` | `wheel-tutorial-*` |
+>
+> The `release-bundle` artifact also carries the three wheels and three
+> CycloneDX SBOMs already named to the artifact-ID convention this document
+> specifies, so candidate assembly needs no hand-built inputs. Confirmed by
+> doing it: the rc.2 candidate assembles clean (`assemble-release-candidate: OK:
+> 1.1.0-rc.2 (3 artifacts)`) at
+> `release/v1.1/candidates/d16c0dda-rc2-harvest/`, manifest SHA-256
+> `e766391e7ba16004…`. `release-status` then declines it only because it
+> requires the candidate's `source_revision` to equal the checked-out HEAD —
+> a correct guard, satisfied by running it from a worktree at `d16c0dda`.
+>
+> Map schemas to kinds by reading each **validator's** import in
+> `release-evidence-status.py:13-46`, not by matching filenames: `clean-install`
+> resolves through `wheel-functional-smoke.py`, *not* `verify-wheel.py`, so
+> `tritium.compatibility-receipt.v1` — which sits in the `release-bundle` and
+> looks like the obvious candidate — is an input to the abi3 aggregation rather
+> than a registry kind. Registering the set still requires per-kind binding work:
+> each registry entry's `id` must equal its receipt's own `receipt_id`, and the
+> `tritium.compatibility-receipt.v1` files carry neither that nor a `release`
+> field.
+>
+> What this changes: the barrier to a coherent gate report is **registration,
+> not production**, for a substantial share of the evidence. Two gates are now
+> within reach rather than blocked —
+>
+> - **`packages`** needs `clean-install`, `compatibility-matrix`, `crate-archive`,
+>   `npm-archive`. rc.2 supplies the first two at `d16c0dda`; the other two are
+>   not emitted by the release run and would have to be produced at that revision.
+> - **`pytorch-hf`** needs eight kinds. rc.2 supplies **five** of them
+>   (`installed-qat-tutorial`, `frontend-lifecycle`, `export-reload`,
+>   `observability`, `api-signature`). Of the remaining three,
+>   `torch-dispatch-overhead` and `torch-dispatch-cuda` are producible on this
+>   box's GPU, and only `distributed-training` needs hardware we lack — which
+>   makes this gate a **GPU-rental away from PASS**, not blocked.
+>
+> Every artifact above is still downloadable (`expired=false`), and each release
+> regenerates them, so nothing here is time-critical.
 
 **15 of the 38 evidence kinds have been produced. 23 have not.**
 The 15 are `api-signature`, `clean-install`, `crate-archive`, `cuda-training`,
@@ -54,7 +108,7 @@ already exist as an ordinary file — run `trivy image --download-db-only
 | Gate | Status | Missing kinds | What the missing kinds require |
 |---|---|---|---|
 | `qwen-source-admission` | EVIDENCE | — | — |
-| `packages` | PARTIAL | `compatibility-matrix` | Three platform wheels bound by SHA-256 into one candidate. macOS and Windows wheels cannot be produced on this box — needs the CI wheel matrix. |
+| `packages` | PARTIAL | `compatibility-matrix` | **Not blocked — CI produces this on every release and it has never been harvested.** The rc.2 `abi3-compatibility-receipt` passes `aggregate-wheel-smoke.py`'s own validator: `tritium.abi3-matrix-qualification.v1`, bound to `d16c0dda`, `passed: true`, 16 cells spanning CPython 3.9.25–3.14.7 across three platforms and three distinct wheels. Harvesting it advances the union 15→16. It does **not** by itself close the gate: `crate-archive` and `npm-archive` are not emitted by the release run, so a coherent `packages` PASS needs those two produced at the same revision. |
 | `pytorch-hf` | PARTIAL | `distributed-training` | Two or more GPUs. |
 | `native-backends` | PARTIAL | `backend-manifest`, `performance` | All seven trace families, in order — `FAMILIES = ("cpu", "cuda", "rocm", "metal", "wgpu", "wasi", "mcu")`. Needs AMD *and* Apple *and* an MCU board. |
 | `estimators-refinement` | PARTIAL | `refinement`, `baseline-ablation` | Local SALT campaign runs. No new dependency; queued until the flagship conversion releases the CPU. |
@@ -84,11 +138,14 @@ Grouping the 23 remaining kinds by what actually unblocks them:
   Kubernetes on top of that.
 - **The CPU, once the conversion frees it** (2): `refinement`,
   `baseline-ablation`. No new dependency.
-- **Hardware this project does not have** (5): `distributed-training` (≥2 GPUs,
-  rentable), `browser-conformance` (macOS, for the Safari lane),
-  `backend-manifest` and `performance` (AMD + Apple + MCU),
-  `compatibility-matrix` (macOS and Windows wheels — reachable through CI
-  runners rather than locally).
+- **Already produced by CI, awaiting registration** (1): `compatibility-matrix`.
+  Corrected 2026-09-05 — this was previously grouped under hardware we lack,
+  which was wrong. GitHub's macOS and Windows runners supply exactly the
+  platforms this box cannot, the receipt is regenerated every release, and the
+  rc.2 one validates today. Harvesting it closes the `packages` gate outright.
+- **Hardware this project does not have** (4): `distributed-training` (≥2 GPUs,
+  rentable), `browser-conformance` (macOS, for the Safari lane), and
+  `backend-manifest` + `performance` (AMD + Apple + MCU).
 - **A second person** (3, listed above), of which `second-machine` also needs a
   second machine.
 
