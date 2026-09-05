@@ -54,7 +54,7 @@ already exist as an ordinary file — run `trivy image --download-db-only
 | Gate | Status | Missing kinds | What the missing kinds require |
 |---|---|---|---|
 | `qwen-source-admission` | EVIDENCE | — | — |
-| `packages` | PARTIAL | `compatibility-matrix` | Three platform wheels bound by SHA-256 into one candidate. macOS and Windows wheels cannot be produced on this box — needs the CI wheel matrix. |
+| `packages` | PARTIAL | `compatibility-matrix` | **Not blocked — CI already produces this evidence on every release; it has simply never been harvested.** The rc.2 run (33955449151) uploaded an `abi3-compatibility-receipt` artifact that passes `aggregate-wheel-smoke.py`'s own validator: schema `tritium.abi3-matrix-qualification.v1`, bound to `d16c0dda`, `passed: true`, 16 cells spanning CPython 3.9.25–3.14.7 across exactly three platforms (`linux-x86_64-cpu`, `macos-arm64-cpu`, `windows-x86_64-cpu`) and three distinct wheels. What remains is registration, not production: the wheels must be local (the `release-bundle` artifact carries them) and bound into a candidate manifest at the same revision. |
 | `pytorch-hf` | PARTIAL | `distributed-training` | Two or more GPUs. |
 | `native-backends` | PARTIAL | `backend-manifest`, `performance` | All seven trace families, in order — `FAMILIES = ("cpu", "cuda", "rocm", "metal", "wgpu", "wasi", "mcu")`. Needs AMD *and* Apple *and* an MCU board. |
 | `estimators-refinement` | PARTIAL | `refinement`, `baseline-ablation` | Local SALT campaign runs. No new dependency; queued until the flagship conversion releases the CPU. |
@@ -84,11 +84,14 @@ Grouping the 23 remaining kinds by what actually unblocks them:
   Kubernetes on top of that.
 - **The CPU, once the conversion frees it** (2): `refinement`,
   `baseline-ablation`. No new dependency.
-- **Hardware this project does not have** (5): `distributed-training` (≥2 GPUs,
-  rentable), `browser-conformance` (macOS, for the Safari lane),
-  `backend-manifest` and `performance` (AMD + Apple + MCU),
-  `compatibility-matrix` (macOS and Windows wheels — reachable through CI
-  runners rather than locally).
+- **Already produced by CI, awaiting registration** (1): `compatibility-matrix`.
+  Corrected 2026-09-05 — this was previously grouped under hardware we lack,
+  which was wrong. GitHub's macOS and Windows runners supply exactly the
+  platforms this box cannot, the receipt is regenerated every release, and the
+  rc.2 one validates today. Harvesting it closes the `packages` gate outright.
+- **Hardware this project does not have** (4): `distributed-training` (≥2 GPUs,
+  rentable), `browser-conformance` (macOS, for the Safari lane), and
+  `backend-manifest` + `performance` (AMD + Apple + MCU).
 - **A second person** (3, listed above), of which `second-machine` also needs a
   second machine.
 
