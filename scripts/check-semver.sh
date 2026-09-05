@@ -33,8 +33,19 @@
 # default consumer sees, symmetrically, and the baseline builds anywhere.
 # Revisit when the baseline is a version whose build scripts honour
 # TRITIUM_CHECK_ONLY (1.1.0-rc.2 onward): --all-features becomes possible again.
-# KNOWN GAP: `tritium-serve`'s surface sits behind the `serve`/`cuda` features,
-# so a default-feature check sees almost none of it. That is a gap, not a pass.
+# That revisit is ENFORCED, not remembered — see the lift check in main(). A
+# workaround whose expiry depends on someone recalling why it exists is how a
+# temporary narrowing becomes permanent.
+#
+# KNOWN GAP, and it is wider than one crate. Under --default-features every
+# feature-gated surface goes unchecked, not just `tritium-serve`'s: `serve`,
+# `cuda`, `rocm`, `nccl`, `e2e` and `device-loss-qualification` are all opt-in
+# (`default = []`), so for tritium-{serve,cuda,rocm} the gate currently sees
+# close to nothing. It is a gap rather than a pass, and — this is the part worth
+# stating out loud — a NARROWED gate and a FULLY-COVERED one produce the same
+# green lane. Five checks were found vacuous in this repository during the week
+# this was written, every one of them a case where a failure or a non-result was
+# indistinguishable from a pass.
 #
 # Usage:  ./scripts/check-semver.sh [baseline-rev]   # explicit git rev instead
 #         ./scripts/check-semver.sh --print-baseline          # newest stable tag
@@ -113,6 +124,21 @@ main() {
     local version="${TRITIUM_SEMVER_BASELINE_VERSION:-$DEFAULT_BASELINE_VERSION}"
     baseline_args=(--baseline-version "$version")
     echo "[check-semver] baseline version (published on crates.io): $version"
+    # Expiry guard for --default-features. The narrowing exists only because the
+    # published 1.1.0-rc.0 and -rc.1 build scripts predate the TRITIUM_CHECK_ONLY
+    # escape and therefore cannot build without nvcc/hipcc. From 1.1.0-rc.2
+    # onward they honour it, so the reason evaporates — and a narrowed gate looks
+    # exactly like a covered one from CI. Fail loudly at that point rather than
+    # trusting anyone to notice.
+    if ! [[ "$version" =~ ^1\.1\.0-rc\.[01]$ ]]; then
+      echo "[check-semver] baseline $version postdates the --default-features workaround." >&2
+      echo "[check-semver] Its only justification was that 1.1.0-rc.0/rc.1 build scripts" >&2
+      echo "[check-semver] predate TRITIUM_CHECK_ONLY and cannot build without nvcc/hipcc." >&2
+      echo "[check-semver] Drop --default-features from both semver-checks invocations so" >&2
+      echo "[check-semver] the feature-gated surfaces (serve, cuda, rocm) are checked again," >&2
+      echo "[check-semver] then delete this guard and the FEATURE SET note in the header." >&2
+      return 2
+    fi
   fi
 
   local toolchain="${TRITIUM_SEMVER_TOOLCHAIN:-stable}"

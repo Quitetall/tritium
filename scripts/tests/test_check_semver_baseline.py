@@ -139,6 +139,40 @@ def test_report_mode_still_fails_when_the_checker_cannot_run(tmp_path):
     assert "FAILED TO RUN" in completed.stderr
 
 
+def test_default_features_workaround_expires_when_its_reason_does():
+    """--default-features is only justified while the baseline is rc.0/rc.1.
+
+    Those published build scripts predate the TRITIUM_CHECK_ONLY escape and
+    cannot build without nvcc/hipcc. From rc.2 onward they honour it, so the
+    narrowing loses its justification — and a narrowed gate is indistinguishable
+    from a covered one in CI, so it has to fail rather than be remembered.
+    """
+    for baseline in ("1.1.0-rc.2", "1.1.0-rc.7", "1.1.0", "1.2.0"):
+        completed = subprocess.run(
+            ["bash", "scripts/check-semver.sh"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            env={**os.environ, "TRITIUM_SEMVER_BASELINE_VERSION": baseline},
+        )
+        assert completed.returncode == 2, f"{baseline} should have been refused"
+        assert "postdates the --default-features workaround" in completed.stderr
+
+
+def test_current_rc_baselines_are_still_accepted():
+    """rc.0 and rc.1 must NOT trip the guard, or the gate cannot run at all."""
+    for baseline in ("1.1.0-rc.0", "1.1.0-rc.1"):
+        completed = subprocess.run(
+            ["bash", "scripts/check-semver.sh", "--print-baseline-version"],
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+            env={**os.environ, "TRITIUM_SEMVER_BASELINE_VERSION": baseline},
+        )
+        assert completed.stdout.strip() == baseline
+
+
 def test_semver_selector_rejects_leading_zero_components():
     command = r'''
 source scripts/check-semver.sh
