@@ -29,7 +29,7 @@ residual planes trade physical bytes for quality. Tritium treats the recipe,
 calibration evidence, ancestry, packed bytes, runtime memory, and measured model
 quality as one auditable artifact lifecycle—not as an informal `bits=2` label.
 
-> **Release status:** the repository uses the `1.1.0-rc.1` candidate version. It
+> **Release status:** the repository uses the `1.1.0-rc.2` candidate version. It
 > is neither `LOCAL_RC_READY` nor a public v1.1 release. Package, browser,
 > flagship-model, deployment, and second-machine gates remain open. The generated
 > [compatibility matrix](docs/compatibility.md) is authoritative: `pending` is

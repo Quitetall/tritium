@@ -81,7 +81,7 @@ Each component has a single responsibility:
   artifacts, evidence rules and current blockers.
 - **[Conformance](./conformance.md)** and **[Contributing](./contributing.md)**.
 
-> **Project status.** The repository uses the `1.1.0-rc.1` candidate version; it
+> **Project status.** The repository uses the `1.1.0-rc.2` candidate version; it
 > is neither `LOCAL_RC_READY` nor a qualified public v1.1 release. Stable-core
 > compatibility follows the v1.0 tier policy; evolving training, backend and
 > interop APIs retain the 1.x runway documented in

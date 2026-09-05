@@ -4,7 +4,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from scripts.tests.test_verify_wheel import build_wheel
+# DIST/VERSION are derived from Cargo.toml there; the SBOM generator reads the
+# wheel's own METADATA, so a literal here drifts the moment the workspace moves.
+from scripts.tests.test_verify_wheel import DIST, VERSION, build_wheel
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -18,14 +20,14 @@ class GenerateWheelSbomTests(unittest.TestCase):
     def test_sbom_binds_wheel_files_and_declared_dependencies(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
-            wheel = root / "pytritium-1.1.0rc1-cp39-abi3-linux_x86_64.whl"
+            wheel = root / f"{DIST}-cp39-abi3-linux_x86_64.whl"
             build_wheel(
                 wheel,
                 extra={
-                    "pytritium-1.1.0rc1.dist-info/METADATA": (
-                        b"Metadata-Version: 2.3\nName: pytritium\n"
-                        b"Version: 1.1.0rc1\nRequires-Dist: torch>=2.11\n"
-                    )
+                    f"{DIST}.dist-info/METADATA": (
+                        "Metadata-Version: 2.3\nName: pytritium\n"
+                        f"Version: {VERSION}\nRequires-Dist: torch>=2.11\n"
+                    ).encode()
                 },
             )
             first = generate(wheel, "pytritium-linux-cpu")
@@ -60,7 +62,7 @@ class GenerateWheelSbomTests(unittest.TestCase):
     def test_invalid_artifact_id_and_corrupt_wheel_fail_closed(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
-            wheel = root / "pytritium-1.1.0rc1-cp39-abi3-linux_x86_64.whl"
+            wheel = root / f"{DIST}-cp39-abi3-linux_x86_64.whl"
             build_wheel(wheel, corrupt_record=True)
             with self.assertRaisesRegex(SbomError, "lowercase"):
                 generate(wheel, "Uppercase")

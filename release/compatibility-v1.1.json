@@ -1,6 +1,6 @@
 {
   "schema": "tritium.compatibility.v1",
-  "release": "1.1.0-rc.1",
+  "release": "1.1.0-rc.2",
   "dimensions": {
     "platform": [
       {

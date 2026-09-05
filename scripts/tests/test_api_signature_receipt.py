@@ -11,6 +11,12 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 MODULE = runpy.run_path(ROOT / "scripts" / "verify-api-signature-receipt.py")
 
+# Derived, not written down. `_report` validates the fixture against the REAL
+# docs/generated/api-diff-v1.0-v1.1.json, whose candidate_version tracks the
+# workspace -- so a literal release here fails with "API diff report release
+# differs" on the first bump, which is exactly what happened at 1.1.0-rc.2.
+from scripts.tests.test_verify_wheel import CARGO_VERSION, VERSION as PEP440_VERSION
+
 
 def canonical(value) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
@@ -29,10 +35,10 @@ def make_receipt(root: Path):
         "root_exports": sorted([*python["retained"], *python["added"]]),
     }
     revision = "a" * 40
-    release = "1.1.0-rc.1"
+    release = CARGO_VERSION
     runtime = {
         "python_version": "3.13.5",
-        "distribution_version": "1.1.0rc1",
+        "distribution_version": PEP440_VERSION,
         "source_identity": f"source-git:{revision}",
         "module_path": "/venv/site-packages/tritium/__init__.py",
         "native_module_path": "/venv/site-packages/tritium/_tritium.abi3.so",
@@ -102,7 +108,7 @@ class ApiSignatureReceiptTests(unittest.TestCase):
             candidate = root / "manifest.json"
             document = {
                 "schema": "tritium.release-candidate.v1",
-                "release": "1.1.0-rc.1",
+                "release": CARGO_VERSION,
                 "source_revision": "a" * 40,
                 "artifacts": [{
                     "id": "cuda-wheel", "kind": "python-wheel", "path": wheel.name,
@@ -136,7 +142,7 @@ class ApiSignatureReceiptTests(unittest.TestCase):
             value = MODULE["validate"](
                 receipt,
                 expected_revision="a" * 40,
-                expected_release="1.1.0-rc.1",
+                expected_release=CARGO_VERSION,
                 expected_wheel=wheel,
                 expected_api_report=report,
             )
@@ -153,7 +159,7 @@ class ApiSignatureReceiptTests(unittest.TestCase):
             receipt.write_bytes(canonical(value) + b"\n")
             with self.assertRaisesRegex(MODULE["ApiSignatureError"], "namespace"):
                 MODULE["validate"](
-                    receipt, expected_revision="a" * 40, expected_release="1.1.0-rc.1",
+                    receipt, expected_revision="a" * 40, expected_release=CARGO_VERSION,
                     expected_wheel=wheel, expected_api_report=report,
                 )
 
@@ -164,7 +170,7 @@ class ApiSignatureReceiptTests(unittest.TestCase):
             trace.write_bytes(trace.read_bytes() + b"drift")
             with self.assertRaisesRegex(MODULE["ApiSignatureError"], "trace bytes"):
                 MODULE["validate"](
-                    receipt, expected_revision="a" * 40, expected_release="1.1.0-rc.1",
+                    receipt, expected_revision="a" * 40, expected_release=CARGO_VERSION,
                     expected_wheel=wheel, expected_api_report=report,
                 )
 
@@ -179,7 +185,7 @@ class ApiSignatureReceiptTests(unittest.TestCase):
             receipt.write_bytes(canonical(value) + b"\n")
             with self.assertRaisesRegex(MODULE["ApiSignatureError"], "offline"):
                 MODULE["validate"](
-                    receipt, expected_revision="a" * 40, expected_release="1.1.0-rc.1",
+                    receipt, expected_revision="a" * 40, expected_release=CARGO_VERSION,
                     expected_wheel=wheel, expected_api_report=report,
                 )
 
@@ -195,7 +201,7 @@ class ApiSignatureReceiptTests(unittest.TestCase):
             path = Path(raw) / "api.json"
             path.write_bytes(canonical(report) + b"\n")
             with self.assertRaisesRegex(MODULE["ApiSignatureError"], "lists"):
-                MODULE["_report"](path, "1.1.0-rc.1")
+                MODULE["_report"](path, CARGO_VERSION)
 
 
 if __name__ == "__main__":

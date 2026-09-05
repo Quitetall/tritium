@@ -5,6 +5,7 @@ import importlib.util
 import io
 import sys
 import tempfile
+import tomllib
 import unittest
 import zipfile
 from pathlib import Path
@@ -16,6 +17,20 @@ SPEC = importlib.util.spec_from_file_location("verify_wheel", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
+
+# The fixture version is DERIVED, not written down. These wheels are fed to
+# MODULE.main(), which reads [workspace.package] version from Cargo.toml and rejects
+# a filename that disagrees -- so a literal here stops testing what it claims the
+# moment the workspace is bumped. At 1.1.0-rc.2 it produced
+# "wheel filename version '1.1.0rc1' != '1.1.0rc2'", masking the platform-tag
+# assertion this file exists to make.
+# NOTE: MODULE._workspace_version already applies the PEP 440 conversion, so it is
+# NOT the Cargo spelling. Read the raw value for consumers that need `1.1.0-rc.2`.
+CARGO_VERSION = tomllib.loads(
+    (Path(__file__).resolve().parents[2] / "Cargo.toml").read_text(encoding="utf-8")
+)["workspace"]["package"]["version"]
+VERSION = MODULE._pep440_version(CARGO_VERSION)  # 1.1.0-rc.2 -> 1.1.0rc2
+DIST = f"pytritium-{VERSION}"
 
 
 def digest(payload, algorithm="sha256"):
@@ -35,16 +50,16 @@ def build_wheel(
     files = {
         "tritium/__init__.py": b"from . import _tritium\n",
         native_name: b"native-placeholder",
-        "pytritium-1.1.0rc1.dist-info/METADATA": (
-            b"Metadata-Version: 2.3\nName: pytritium\nVersion: 1.1.0rc1\n"
+        f"{DIST}.dist-info/METADATA": (
+            f"Metadata-Version: 2.3\nName: pytritium\nVersion: {VERSION}\n".encode()
         ),
-        "pytritium-1.1.0rc1.dist-info/WHEEL": (
+        f"{DIST}.dist-info/WHEEL": (
             f"Wheel-Version: 1.0\nRoot-Is-Purelib: false\nTag: cp39-abi3-{platform_tag}\n".encode()
         ),
     }
     if extra:
         files.update(extra)
-    record_name = "pytritium-1.1.0rc1.dist-info/RECORD"
+    record_name = f"{DIST}.dist-info/RECORD"
     rows = []
     for name, payload in files.items():
         encoded = digest(payload, hash_algorithm)
@@ -63,43 +78,43 @@ def build_wheel(
 class VerifyWheelTests(unittest.TestCase):
     def test_valid_abi3_wheel_passes(self):
         with tempfile.TemporaryDirectory() as raw:
-            wheel = Path(raw) / "pytritium-1.1.0rc1-cp39-abi3-linux_x86_64.whl"
+            wheel = Path(raw) / f"{DIST}-cp39-abi3-linux_x86_64.whl"
             build_wheel(wheel)
-            result = MODULE.inspect_wheel(wheel, "1.1.0rc1")
+            result = MODULE.inspect_wheel(wheel, VERSION)
             self.assertEqual(result["platform_tag"], "linux_x86_64")
             self.assertEqual(result["sha256"], hashlib.sha256(wheel.read_bytes()).hexdigest())
 
     def test_record_corruption_fails(self):
         with tempfile.TemporaryDirectory() as raw:
-            wheel = Path(raw) / "pytritium-1.1.0rc1-cp39-abi3-linux_x86_64.whl"
+            wheel = Path(raw) / f"{DIST}-cp39-abi3-linux_x86_64.whl"
             build_wheel(wheel, corrupt_record=True)
             with self.assertRaisesRegex(MODULE.WheelError, "RECORD hash mismatch"):
-                MODULE.inspect_wheel(wheel, "1.1.0rc1")
+                MODULE.inspect_wheel(wheel, VERSION)
 
     def test_source_residue_fails(self):
         with tempfile.TemporaryDirectory() as raw:
-            wheel = Path(raw) / "pytritium-1.1.0rc1-cp39-abi3-linux_x86_64.whl"
+            wheel = Path(raw) / f"{DIST}-cp39-abi3-linux_x86_64.whl"
             build_wheel(wheel, extra={"src/lib.rs": b"fn main() {}"})
             with self.assertRaisesRegex(MODULE.WheelError, "source/build residue"):
-                MODULE.inspect_wheel(wheel, "1.1.0rc1")
+                MODULE.inspect_wheel(wheel, VERSION)
 
     def test_parent_traversal_member_fails(self):
         with tempfile.TemporaryDirectory() as raw:
-            wheel = Path(raw) / "pytritium-1.1.0rc1-cp39-abi3-linux_x86_64.whl"
+            wheel = Path(raw) / f"{DIST}-cp39-abi3-linux_x86_64.whl"
             build_wheel(wheel, extra={"../escape": b"payload"})
             with self.assertRaisesRegex(MODULE.WheelError, "unsafe wheel member"):
-                MODULE.inspect_wheel(wheel, "1.1.0rc1")
+                MODULE.inspect_wheel(wheel, VERSION)
 
     def test_absolute_member_fails(self):
         with tempfile.TemporaryDirectory() as raw:
-            wheel = Path(raw) / "pytritium-1.1.0rc1-cp39-abi3-linux_x86_64.whl"
+            wheel = Path(raw) / f"{DIST}-cp39-abi3-linux_x86_64.whl"
             build_wheel(wheel, extra={"/escape": b"payload"})
             with self.assertRaisesRegex(MODULE.WheelError, "unsafe wheel member"):
-                MODULE.inspect_wheel(wheel, "1.1.0rc1")
+                MODULE.inspect_wheel(wheel, VERSION)
 
     def test_symlink_member_fails(self):
         with tempfile.TemporaryDirectory() as raw:
-            wheel = Path(raw) / "pytritium-1.1.0rc1-cp39-abi3-linux_x86_64.whl"
+            wheel = Path(raw) / f"{DIST}-cp39-abi3-linux_x86_64.whl"
             build_wheel(wheel)
             link = zipfile.ZipInfo("tritium/link")
             link.create_system = 3
@@ -107,31 +122,31 @@ class VerifyWheelTests(unittest.TestCase):
             with zipfile.ZipFile(wheel, "a") as archive:
                 archive.writestr(link, "target")
             with self.assertRaisesRegex(MODULE.WheelError, "must not be a symlink"):
-                MODULE.inspect_wheel(wheel, "1.1.0rc1")
+                MODULE.inspect_wheel(wheel, VERSION)
 
     def test_weak_record_hash_fails(self):
         with tempfile.TemporaryDirectory() as raw:
-            wheel = Path(raw) / "pytritium-1.1.0rc1-cp39-abi3-linux_x86_64.whl"
+            wheel = Path(raw) / f"{DIST}-cp39-abi3-linux_x86_64.whl"
             build_wheel(wheel, hash_algorithm="md5")
             with self.assertRaisesRegex(MODULE.WheelError, "SHA-256 or stronger"):
-                MODULE.inspect_wheel(wheel, "1.1.0rc1")
+                MODULE.inspect_wheel(wheel, VERSION)
 
     def test_split_dist_info_fails(self):
         with tempfile.TemporaryDirectory() as raw:
-            wheel = Path(raw) / "pytritium-1.1.0rc1-cp39-abi3-linux_x86_64.whl"
+            wheel = Path(raw) / f"{DIST}-cp39-abi3-linux_x86_64.whl"
             build_wheel(wheel, extra={"other-1.0.dist-info/WHEEL": b"Wheel-Version: 1.0\n"})
             with self.assertRaisesRegex(MODULE.WheelError, "only canonical dist-info"):
-                MODULE.inspect_wheel(wheel, "1.1.0rc1")
+                MODULE.inspect_wheel(wheel, VERSION)
 
     def test_windows_plain_pyd_is_accepted(self):
         with tempfile.TemporaryDirectory() as raw:
-            wheel = Path(raw) / "pytritium-1.1.0rc1-cp39-abi3-win_amd64.whl"
+            wheel = Path(raw) / f"{DIST}-cp39-abi3-win_amd64.whl"
             build_wheel(
                 wheel,
                 native_name="tritium/_tritium.pyd",
                 platform_tag="win_amd64",
             )
-            result = MODULE.inspect_wheel(wheel, "1.1.0rc1")
+            result = MODULE.inspect_wheel(wheel, VERSION)
             self.assertEqual(result["platform_tag"], "win_amd64")
 
     def test_filename_version_must_match(self):
@@ -140,7 +155,7 @@ class VerifyWheelTests(unittest.TestCase):
             wheel = Path(raw) / "pytritium-1.1.0rc0-cp39-abi3-linux_x86_64.whl"
             build_wheel(wheel)
             with self.assertRaisesRegex(MODULE.WheelError, "filename version"):
-                MODULE.inspect_wheel(wheel, "1.1.0rc1")
+                MODULE.inspect_wheel(wheel, VERSION)
 
     def test_directory_requires_exactly_one_wheel(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -188,7 +203,7 @@ class VerifyWheelTests(unittest.TestCase):
 
     def test_required_platform_tag_fails_closed(self):
         with tempfile.TemporaryDirectory() as raw:
-            wheel = Path(raw) / "pytritium-1.1.0rc1-cp39-abi3-linux_x86_64.whl"
+            wheel = Path(raw) / f"{DIST}-cp39-abi3-linux_x86_64.whl"
             build_wheel(wheel)
             stderr = io.StringIO()
             with mock.patch.object(

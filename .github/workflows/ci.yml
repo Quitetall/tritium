@@ -476,7 +476,7 @@ jobs:
           python scripts/qualify-crate-archives.py
           --archives target/package
           --source-revision ${{ github.sha }}
-          --release 1.1.0-rc.1
+          --release "$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
           --run-id github-${{ github.run_id }}-${{ github.run_attempt }}-crate-archives
           --output crate-evidence/crate-archive-qualification.json
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
