@@ -97,7 +97,7 @@ cbindgen = "0.29"
 # behind a DEFAULT feature, which `default-features = false` turns off, so a
 # Vulkan-only mask yields zero adapters on every Mac. The feature is a no-op on
 # non-Apple targets (wgpu-hal cfgs the backend out), so it costs Linux nothing.
-wgpu = { version = "=23.0.1", default-features = false, features = ["wgsl", "metal"] }
+wgpu = { version = "=29.0.4", default-features = false, features = ["wgsl", "metal"] }
 pollster = "1.0"
 # metal backend (MSL mpGEMM over Apple Metal, tritium-metal). metal-rs is declared under
 # tritium-metal's [target.'cfg(target_os = "macos")'] table, so it is NEVER resolved on a
@@ -116,7 +116,7 @@ ndarray = { version = "=0.17.2", default-features = false, features = ["std"] }
 # onnx interop (tritium-onnx, behind its `onnx` feature). default-features off so the crate opts
 # into exactly download-binaries + tls-rustls (fetch a prebuilt onnxruntime at build — no system
 # lib). Exact pin keeps cargo-deny wildcards=deny meaningful. rc.12 wraps ONNX Runtime 1.24.
-ort = { version = "=2.0.0-rc.12", default-features = false }
+ort = { version = "=2.0.0-rc.13", default-features = false }
 prost = "0.14"
 # candle interop (tritium-candle, behind its `candle` feature; CPU-only — no cuda/mkl/accelerate)
 candle-core = { version = "0.11", default-features = false }
