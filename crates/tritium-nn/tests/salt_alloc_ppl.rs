@@ -69,6 +69,10 @@ const EVAL_WINDOW: usize = 512;
 const CALIB_WINDOWS: usize = 8;
 const CALIB_SEQ: usize = 512;
 const GROUP: usize = 128;
+/// Linear tensors per transformer block in `extract()`'s layout: q,k,v,o,gate,up,down.
+/// Pinned by `calibrate::weight_names_match_extract_layout`; `layer` granularity mis-groups if the
+/// two ever disagree, so the assert below fails loudly rather than aggregating the wrong tensors.
+const SLOTS_PER_LAYER: usize = 7;
 const GRID: usize = 16;
 /// AWQ salience-fold strength, overridable with `TRITIUM_ALLOC_ALPHA`.
 ///
@@ -416,7 +420,9 @@ fn allocation_vs_uniform_planes_at_matched_bits() {
     // Groups are the finest unit; `tensor` and `layer` aggregate them so the SAME budget is spent
     // with fewer, better-conditioned decisions. Aggregation is exact: a unit's error curve is the
     // elementwise SUM of its groups' curves (errors are additive), its weight count is the sum, and
-    // its sensitivity is the weight-weighted mean of the groups' `H_g`. Allocating over units and
+    // its sensitivity is the weight-weighted mean of the groups' `max(0, H_g)` -- negatives are
+    // zeroed BEFORE summing, matching what the per-group path already did at the GroupCurve site,
+    // so one negative group cannot cancel its neighbours. Allocating over units and
     // broadcasting `T` back is therefore the same optimisation problem at a coarser resolution, not
     // a different one.
     let gran = granularity();
@@ -433,7 +439,7 @@ fn allocation_vs_uniform_planes_at_matched_bits() {
                 } else if ti == 0 {
                     0
                 } else {
-                    1 + (ti - 1) / 7
+                    1 + (ti - 1) / SLOTS_PER_LAYER
                 };
                 v.extend(std::iter::repeat_n(u, zs.len()));
             }
@@ -449,8 +455,12 @@ fn allocation_vs_uniform_planes_at_matched_bits() {
     for g in 0..n_groups {
         let u = unit_of[g];
         let c = flat_curves[g];
+        // ladder_curves() allocates every curve at exactly `t_max + 1`, so this holds by
+        // construction. Asserted rather than clamped: a shorter curve would make the aggregate a
+        // sum of repeated tail values -- silently wrong rather than loudly wrong.
+        debug_assert_eq!(c.len(), curve_len, "group {g} curve is not t_max+1 long");
         for t in 0..curve_len {
-            unit_curve[u][t] += c[t.min(c.len() - 1)];
+            unit_curve[u][t] += c[t];
         }
         unit_weights[u] += flat_sizes[g];
         unit_sens_num[u] += flat_sens[g].max(0.0) * flat_sizes[g] as f64;
@@ -490,8 +500,13 @@ fn allocation_vs_uniform_planes_at_matched_bits() {
         let alloc = allocate_with_curves(&curved, &cfg).expect("allocate");
         // Broadcast the unit decision back to every group it covers. At `group` granularity this is
         // the identity, so the default path is unchanged.
+        // `t_max` is env-driven, so this cast is not obviously safe: TRITIUM_ALLOC_TMAX=300 would
+        // wrap silently and quantize at a plane count nobody asked for.
         let counts: Vec<u8> = (0..n_groups)
-            .map(|g| alloc.plane_counts[unit_of[g]] as u8)
+            .map(|g| {
+                u8::try_from(alloc.plane_counts[unit_of[g]])
+                    .expect("plane count exceeds u8 — lower TRITIUM_ALLOC_TMAX")
+            })
             .collect();
 
         // Slice the flat allocation back per tensor, in the same order it was flattened.
@@ -566,7 +581,14 @@ fn allocation_vs_uniform_planes_at_matched_bits() {
             .map(|&t| f64::from(t) - t_ref as f64)
             .collect();
         let r = pearson(&delta_t, &group_rms);
-        println!("     corr(ΔT, group RMS) = {r:+.4}   (positive ⇒ demotes low-norm groups)");
+        // Undefined when either column is constant -- which happens for real: at `T_min = T_ref`
+        // the budget forces every unit to the same T, so ΔT has zero variance. Say so instead of
+        // printing NaN.
+        if r.is_nan() {
+            println!("     corr(ΔT, group RMS) = n/a   (ΔT is constant — no allocation freedom)");
+        } else {
+            println!("     corr(ΔT, group RMS) = {r:+.4}   (positive ⇒ demotes low-norm groups)");
+        }
     }
 
     println!(
