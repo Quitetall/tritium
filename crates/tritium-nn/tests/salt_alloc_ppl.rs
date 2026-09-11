@@ -33,9 +33,16 @@
 //! `d_j = E[x_j²]`. But the salience fold has already rescaled column `j` by `s_j`, and an error
 //! `e'_j` in the folded basis is `e'_j / s_j` in the original one — so the correct post-fold weight
 //! is `d_j / s_j²`. With `s_j ∝ rms_j^α` and `d_j ∝ rms_j²` that is `rms_j^(2−2α)`: at `α = 1` the
-//! fold has equalised everything and curvature allocation is a no-op, and at our `α = 0.75` a real
-//! `rms_j^0.5` residual remains. Getting this wrong (using `d_j` directly) would double-count the
-//! fold and allocate as if it had never been applied.
+//! fold has equalised the per-COLUMN shape -- but NOT the per-TENSOR one. `smooth_scales`
+//! normalises by `gm`, the geometric mean of `rms` over the tensor's columns, so the weight is
+//! really `rms_j^(2-2α)·gm^(2α)` and at `α = 1` it degenerates to `gm²`: flat inside a tensor,
+//! tensors ranked by their typical activation magnitude. That is pure per-tensor sensitivity, not a
+//! no-op. This comment asserted it WAS a no-op until 2026-09-10, when the α sweep measured the
+//! curvature arm at 1.318× fp against the flat arm's 1.363× — different, and ordered the opposite
+//! way from `α = 0.75`, where curvature is the worse arm (1.240× vs 1.221×).
+//!
+//! Getting this wrong (using `d_j` directly) would double-count the fold and allocate as if it had
+//! never been applied.
 //!
 //! Group sensitivity is the **mean** of that over the group's columns. Per-column weighting inside a
 //! group is not available: the Hadamard rotation mixes columns, so a diagonal weight in the original
@@ -62,10 +69,106 @@ const EVAL_WINDOW: usize = 512;
 const CALIB_WINDOWS: usize = 8;
 const CALIB_SEQ: usize = 512;
 const GROUP: usize = 128;
+/// Linear tensors per transformer block in `extract()`'s layout: q,k,v,o,gate,up,down.
+/// Pinned by `calibrate::weight_names_match_extract_layout`; `layer` granularity mis-groups if the
+/// two ever disagree, so the assert below fails loudly rather than aggregating the wrong tensors.
+const SLOTS_PER_LAYER: usize = 7;
 const GRID: usize = 16;
-const FOLD_ALPHA: f64 = 0.75;
+/// AWQ salience-fold strength, overridable with `TRITIUM_ALLOC_ALPHA`.
+///
+/// Sweepable because the fold and curvature allocation consume overlapping signal. The post-fold
+/// column weight is `d_j/s_j^2 = rms_j^(2-2*alpha) * gm^(2*alpha)`, so alpha trades a per-COLUMN
+/// shape against a per-TENSOR scale:
+///
+/// * `alpha = 0` -- full `rms^2` per-column signal, no per-tensor term. Allocation's best shot at
+///   the fine-grained sensitivity the objective was written for.
+/// * `alpha = 1` -- per-column shape gone, pure per-tensor `gm^2`. Measured 2026-09-10: 1.318x fp,
+///   BETTER than the flat arm's 1.363x. Coarse sensitivity beat fine sensitivity.
+/// * `alpha = 0.75` -- the shipping fold, and the only setting the 2026-08-03 demotion ever tested.
+///   There curvature is the WORSE arm (1.240x vs flat 1.221x).
+///
+/// The sign flip between those settings is why this is a knob and not a constant: no single alpha
+/// stands in for the family.
+fn fold_alpha() -> f64 {
+    std::env::var("TRITIUM_ALLOC_ALPHA")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.75)
+}
 /// B3 over a 128-trit run: `ceil(128/5) = 26` bytes.
 const B3_BITS_PER_TRIT: f64 = 1.625;
+
+/// Floor on planes per group, overridable with `TRITIUM_ALLOC_TMIN` (default `1`).
+///
+/// The cliff hypothesis: a demoted group falling to `T = 1` drops to flat AbsMean, while a promoted
+/// group gains at most 9.54 dB with sharp diminishing returns. The payoff is convex-bad downward and
+/// concave-small upward, and a sum-of-terms objective cannot see that asymmetry. The original run
+/// allowed `T in [1, 6]`; the 2026-08-03 histogram shows ~90k demotions against ~78k promotions --
+/// 8% of groups moving cost 12% perplexity. Raising the floor tests whether the damage lives in the
+/// demoted tail.
+/// Allocate on RELATIVE error (`TRITIUM_ALLOC_RELATIVE=1`) instead of absolute.
+///
+/// The objective is `Σ_g H_g·err_g(T_g)` with `err_g` an ABSOLUTE sum of squares. The ladder takes
+/// each group's Δ from its own `max|w|`, so `err_g(T) ≈ ‖w_g‖²·9^(−T)` and the objective carries a
+/// `‖w_g‖²` factor that has nothing to do with how much the group matters:
+///
+/// ```text
+/// absolute:  minimise  Σ H_g · ‖w_g‖² · 9^(−T_g)
+/// relative:  minimise  Σ H_g ·          9^(−T_g)
+/// ```
+///
+/// RMSNorm rescales every activation vector to unit RMS, so a group's absolute weight scale is
+/// largely arbitrary — uniform `T` is uniform RELATIVE precision, and that is the invariant the
+/// architecture is built around. Allocating on absolute error therefore hands planes to large-norm
+/// groups for reasons the network does not care about. Measured, and long mistaken for evidence of
+/// the mechanism rather than of the bug: `corr(ΔT, group RMS) = +0.3953` at α=0.75.
+///
+/// Normalising each curve by `curve[0]` (which IS `‖w_g‖²`) removes the factor exactly. Reporting
+/// still uses the absolute curves so the SSE columns stay comparable with the earlier runs.
+fn relative_curves() -> bool {
+    std::env::var("TRITIUM_ALLOC_RELATIVE").is_ok_and(|v| v == "1")
+}
+
+fn alloc_tmin() -> usize {
+    env_usize("TRITIUM_ALLOC_TMIN", 1)
+}
+
+/// Allocation granularity, overridable with `TRITIUM_ALLOC_GRAN` = `group` | `tensor` | `layer`.
+///
+/// `group` is 1.1M independent decisions, each driven by one noisy scalar -- the classic setup for
+/// over-fitting a proxy. Layer-wise bit allocation is the form that works in the wider literature,
+/// so if allocation only fails at the finest granularity, the defect is decision count rather than
+/// the sensitivity signal.
+fn granularity() -> String {
+    std::env::var("TRITIUM_ALLOC_GRAN").unwrap_or_else(|_| "group".to_owned())
+}
+
+/// Pearson correlation, used to ask whether the allocator demotes by *absolute* scale.
+///
+/// Uniform `T` is uniform RELATIVE precision (each group takes its own `max|w|` as the ladder
+/// anchor), and RMSNorm is what makes relative precision the meaningful quantity. If SSE-optimal
+/// allocation is really equalising ABSOLUTE error, demotions concentrate in low-norm groups and this
+/// correlation is strongly positive. Recorded as the cheap test for that hypothesis.
+fn pearson(x: &[f64], y: &[f64]) -> f64 {
+    let n = x.len() as f64;
+    if n < 2.0 {
+        return f64::NAN;
+    }
+    let mx = x.iter().sum::<f64>() / n;
+    let my = y.iter().sum::<f64>() / n;
+    let mut sxy = 0.0;
+    let mut sxx = 0.0;
+    let mut syy = 0.0;
+    for (&a, &b) in x.iter().zip(y) {
+        sxy += (a - mx) * (b - my);
+        sxx += (a - mx) * (a - mx);
+        syy += (b - my) * (b - my);
+    }
+    if sxx <= 0.0 || syy <= 0.0 {
+        return f64::NAN;
+    }
+    sxy / (sxx.sqrt() * syy.sqrt())
+}
 
 fn model_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_default();
@@ -223,7 +326,9 @@ fn alloc_bpw(counts: &[u8], sizes: &[usize], plane_bits: f64) -> f64 {
 
 #[test]
 #[ignore = "PTQ sweep over every tensor; needs SmolLM2-135M; run explicitly"]
-fn curvature_allocation_beats_uniform_planes_at_matched_bits() {
+fn allocation_vs_uniform_planes_at_matched_bits() {
+    // Renamed from `curvature_allocation_beats_uniform_planes_at_matched_bits`: it does not beat
+    // uniform, and a test name that asserts the outcome makes a negative result read as a failure.
     let dir = model_dir();
     if !dir.join("model.safetensors").exists() {
         eprintln!("skipping: {} absent", dir.display());
@@ -249,8 +354,9 @@ fn curvature_allocation_beats_uniform_planes_at_matched_bits() {
             &mut calib,
         );
     }
-    let curvature = column_curvature(&arch, &calib, &shapes, FOLD_ALPHA);
-    let (fp, arch) = fold(&fp, &shapes, &arch, &calib, FOLD_ALPHA);
+    let alpha = fold_alpha();
+    let curvature = column_curvature(&arch, &calib, &shapes, alpha);
+    let (fp, arch) = fold(&fp, &shapes, &arch, &calib, alpha);
 
     // Curves once; both allocated arms reuse them (they differ only in `H_g`).
     let mut all_curves: Vec<Vec<Vec<f64>>> = Vec::with_capacity(fp.len());
@@ -265,6 +371,31 @@ fn curvature_allocation_beats_uniform_planes_at_matched_bits() {
     let flat_sizes: Vec<usize> = all_sizes.iter().flatten().copied().collect();
     let total_weights: usize = flat_sizes.iter().sum();
     let flat_curves: Vec<&Vec<f64>> = all_curves.iter().flatten().collect();
+    let flat_sens: Vec<f64> = all_sens.iter().flatten().copied().collect();
+
+    // Curves the ALLOCATOR sees. Absolute by default; relative strips the `‖w_g‖²` scale factor.
+    // Reporting keeps `flat_curves` either way, so the SSE columns remain comparable across runs.
+    let relative = relative_curves();
+    let alloc_curves: Vec<Vec<f64>> = flat_curves
+        .iter()
+        .map(|c| {
+            if relative {
+                let e0 = c[0];
+                if e0 > 0.0 {
+                    return c.iter().map(|v| v / e0).collect();
+                }
+            }
+            (*c).clone()
+        })
+        .collect();
+    println!(
+        "allocation objective: {}\n",
+        if relative {
+            "RELATIVE (curves normalised by ‖w_g‖²)"
+        } else {
+            "absolute (Σ (w−ŵ)²)"
+        }
+    );
 
     // Total weight-space error the arm's plane counts actually realise. This is the column that
     // makes the table interpretable rather than merely negative: the water-filling MINIMISES this
@@ -278,16 +409,30 @@ fn curvature_allocation_beats_uniform_planes_at_matched_bits() {
             .sum()
     };
 
+    // `Sigma_g H_g * err_g(T_g)` -- the curvature arm's OWN objective, which the raw-SSE column
+    // above does not report. Without it the claim "the allocator achieved its own objective" is
+    // only checkable for the flat arm, where `H_g = 1` makes weighted and raw identical. If the
+    // curvature arm posts a HIGHER weighted error than uniform, the water-filling is not solving
+    // the problem it was handed and the result is an allocator bug, not a proxy gap.
+    let weighted_sse = |counts: &[u8]| -> f64 {
+        counts
+            .iter()
+            .zip(&flat_curves)
+            .zip(&flat_sens)
+            .map(|((&t, c), h)| h * c[usize::from(t).min(c.len() - 1)])
+            .sum()
+    };
+
     println!(
-        "SmolLM2-135M | fp {ppl_fp:.3} | fold α={FOLD_ALPHA} | g{GROUP} | ladder (always rot)\n\
+        "SmolLM2-135M | fp {ppl_fp:.3} | fold α={alpha} | g{GROUP} | ladder (always rot)\n\
          budget = uniform T={t_ref}; allocator may spend T∈[1,{t_max}] per group\n\
          bpw includes the {plane_bits:.0}-bit per-group plane-count field the decoder needs.\n"
     );
     println!(
-        "{:<34} {:>8} {:>9} {:>12} {:>11} {:>9}",
-        "arm", "mean T", "bpw", "recon SSE", "ppl", "× fp"
+        "{:<34} {:>8} {:>9} {:>12} {:>13} {:>11} {:>9}",
+        "arm", "mean T", "bpw", "recon SSE", "weighted SSE", "ppl", "× fp"
     );
-    println!("{}", "-".repeat(88));
+    println!("{}", "-".repeat(102));
 
     // ── Arm 1: uniform ────────────────────────────────────────────────────────────────────────
     let uniform: Vec<Vec<f32>> = fp
@@ -308,12 +453,73 @@ fn curvature_allocation_beats_uniform_planes_at_matched_bits() {
     let counts_uniform: Vec<u8> = vec![t_ref as u8; flat_sizes.len()];
     let ppl_u = perplexity_windowed(&uniform, &arch, &eval, EVAL_WINDOW);
     let sse_u = total_sse(&counts_uniform);
+    let wsse_u = weighted_sse(&counts_uniform);
     println!(
-        "{:<34} {:>8.3} {:>9.3} {sse_u:>12.5e} {ppl_u:>11.3} {:>8.3}×",
+        "{:<34} {:>8.3} {:>9.3} {sse_u:>12.5e} {:>13.5e} {ppl_u:>11.3} {:>8.3}×",
         format!("uniform T={t_ref}"),
         t_ref as f64,
         alloc_bpw(&counts_uniform, &flat_sizes, plane_bits),
+        wsse_u,
         ppl_u / ppl_fp,
+    );
+
+    // ── Allocation units ──────────────────────────────────────────────────────────────────────
+    // Groups are the finest unit; `tensor` and `layer` aggregate them so the SAME budget is spent
+    // with fewer, better-conditioned decisions. Aggregation is exact: a unit's error curve is the
+    // elementwise SUM of its groups' curves (errors are additive), its weight count is the sum, and
+    // its sensitivity is the weight-weighted mean of the groups' `max(0, H_g)` -- negatives are
+    // zeroed BEFORE summing, matching what the per-group path already did at the GroupCurve site,
+    // so one negative group cannot cancel its neighbours. Allocating over units and
+    // broadcasting `T` back is therefore the same optimisation problem at a coarser resolution, not
+    // a different one.
+    let gran = granularity();
+    let n_groups = flat_sizes.len();
+    let unit_of: Vec<usize> = match gran.as_str() {
+        "group" => (0..n_groups).collect(),
+        "tensor" | "layer" => {
+            let mut v = Vec::with_capacity(n_groups);
+            for (ti, zs) in all_sizes.iter().enumerate() {
+                // extract() lays tensors out as [token_embd] + per layer x 7 slots
+                // (q,k,v,o,gate,up,down) -- pinned by calibrate::weight_names_match_extract_layout.
+                let u = if gran == "tensor" {
+                    ti
+                } else if ti == 0 {
+                    0
+                } else {
+                    1 + (ti - 1) / SLOTS_PER_LAYER
+                };
+                v.extend(std::iter::repeat_n(u, zs.len()));
+            }
+            v
+        }
+        other => panic!("TRITIUM_ALLOC_GRAN must be group|tensor|layer, got {other:?}"),
+    };
+    let n_units = unit_of.iter().max().map_or(0, |m| m + 1);
+    let curve_len = t_max + 1;
+    let mut unit_curve = vec![vec![0.0f64; curve_len]; n_units];
+    let mut unit_weights = vec![0usize; n_units];
+    let mut unit_sens_num = vec![0.0f64; n_units];
+    for g in 0..n_groups {
+        let u = unit_of[g];
+        let c = &alloc_curves[g];
+        // ladder_curves() allocates every curve at exactly `t_max + 1`, so this holds by
+        // construction. Asserted rather than clamped: a shorter curve would make the aggregate a
+        // sum of repeated tail values -- silently wrong rather than loudly wrong.
+        debug_assert_eq!(c.len(), curve_len, "group {g} curve is not t_max+1 long");
+        for t in 0..curve_len {
+            unit_curve[u][t] += c[t];
+        }
+        unit_weights[u] += flat_sizes[g];
+        unit_sens_num[u] += flat_sens[g].max(0.0) * flat_sizes[g] as f64;
+    }
+    // Group RMS, for the demotion-vs-scale correlation. `curve[0]` is the group's ||w||^2 by
+    // construction, so no second pass over the weights is needed.
+    let group_rms: Vec<f64> = (0..n_groups)
+        .map(|g| (flat_curves[g][0] / flat_sizes[g] as f64).sqrt())
+        .collect();
+    let t_min = alloc_tmin();
+    println!(
+        "granularity = {gran} ({n_units} allocation units over {n_groups} groups), T_min = {t_min}\n"
     );
 
     // ── Arms 2 and 3: allocated, flat vs curvature-weighted ───────────────────────────────────
@@ -321,29 +527,34 @@ fn curvature_allocation_beats_uniform_planes_at_matched_bits() {
         ("allocated, flat H=1", false),
         ("allocated, curvature H", true),
     ] {
-        let curved: Vec<GroupCurve<'_>> = all_curves
-            .iter()
-            .zip(&all_sens)
-            .zip(&all_sizes)
-            .flat_map(|((cs, ss), zs)| {
-                cs.iter()
-                    .zip(ss)
-                    .zip(zs)
-                    .map(move |((c, &s), &z)| GroupCurve {
-                        curve: c,
-                        weights: z,
-                        sensitivity: if use_curv { s.max(0.0) } else { 1.0 },
-                    })
+        let curved: Vec<GroupCurve<'_>> = (0..n_units)
+            .map(|u| GroupCurve {
+                curve: &unit_curve[u],
+                weights: unit_weights[u],
+                sensitivity: if use_curv {
+                    unit_sens_num[u] / unit_weights[u] as f64
+                } else {
+                    1.0
+                },
             })
             .collect();
         let cfg = AllocConfig::from_bpw(
             tritium_quantize::TRIT_BITS * t_ref as f64,
             total_weights,
-            1,
+            t_min,
             t_max,
         );
         let alloc = allocate_with_curves(&curved, &cfg).expect("allocate");
-        let counts: Vec<u8> = alloc.plane_counts.iter().map(|&t| t as u8).collect();
+        // Broadcast the unit decision back to every group it covers. At `group` granularity this is
+        // the identity, so the default path is unchanged.
+        // `t_max` is env-driven, so this cast is not obviously safe: TRITIUM_ALLOC_TMAX=300 would
+        // wrap silently and quantize at a plane count nobody asked for.
+        let counts: Vec<u8> = (0..n_groups)
+            .map(|g| {
+                u8::try_from(alloc.plane_counts[unit_of[g]])
+                    .expect("plane count exceeds u8 — lower TRITIUM_ALLOC_TMAX")
+            })
+            .collect();
 
         // Slice the flat allocation back per tensor, in the same order it was flattened.
         let mut cursor = 0usize;
@@ -379,11 +590,14 @@ fn curvature_allocation_beats_uniform_planes_at_matched_bits() {
             / total_weights as f64;
         let ppl = perplexity_windowed(&q, &arch, &eval, EVAL_WINDOW);
         let sse = total_sse(&counts);
+        let wsse = weighted_sse(&counts);
         println!(
-            "{label:<34} {mean_t:>8.3} {:>9.3} {sse:>12.5e} {ppl:>11.3} {:>8.3}×   (SSE {:+.1}% vs uniform)",
+            "{label:<34} {mean_t:>8.3} {:>9.3} {sse:>12.5e} {:>13.5e} {ppl:>11.3} {:>8.3}×   (SSE {:+.1}%, wSSE {:+.1}% vs uniform)",
             alloc_bpw(&counts, &flat_sizes, plane_bits),
+            wsse,
             ppl / ppl_fp,
             100.0 * (sse - sse_u) / sse_u,
+            100.0 * (wsse - wsse_u) / wsse_u,
         );
 
         let mut hist = vec![0usize; t_max + 1];
@@ -391,6 +605,37 @@ fn curvature_allocation_beats_uniform_planes_at_matched_bits() {
             hist[usize::from(t)] += 1;
         }
         println!("     plane histogram (groups per T): {hist:?}");
+
+        // How much movement, and in which direction. 8% of groups moving cost 12% perplexity on
+        // 2026-08-03, so the interesting quantity is not the mean T (pinned by the budget) but the
+        // size and asymmetry of the tail.
+        let demoted = counts.iter().filter(|&&t| usize::from(t) < t_ref).count();
+        let promoted = counts.iter().filter(|&&t| usize::from(t) > t_ref).count();
+        let at_floor = counts.iter().filter(|&&t| usize::from(t) == t_min).count();
+        let moved = demoted + promoted;
+        println!(
+            "     moved {moved} groups ({:.2}%): {demoted} demoted, {promoted} promoted; {at_floor} at the T_min={t_min} floor ({:.2}%)",
+            100.0 * moved as f64 / n_groups as f64,
+            100.0 * at_floor as f64 / n_groups as f64,
+        );
+
+        // Does the allocator demote by ABSOLUTE scale? Uniform T is uniform RELATIVE precision, and
+        // if SSE-optimal allocation is equalising absolute error it must hand planes to large-norm
+        // groups and starve small-norm ones -- a strongly positive correlation here. Near zero
+        // refutes that hypothesis and points the failure elsewhere.
+        let delta_t: Vec<f64> = counts
+            .iter()
+            .map(|&t| f64::from(t) - t_ref as f64)
+            .collect();
+        let r = pearson(&delta_t, &group_rms);
+        // Undefined when either column is constant -- which happens for real: at `T_min = T_ref`
+        // the budget forces every unit to the same T, so ΔT has zero variance. Say so instead of
+        // printing NaN.
+        if r.is_nan() {
+            println!("     corr(ΔT, group RMS) = n/a   (ΔT is constant — no allocation freedom)");
+        } else {
+            println!("     corr(ΔT, group RMS) = {r:+.4}   (positive ⇒ demotes low-norm groups)");
+        }
     }
 
     println!(

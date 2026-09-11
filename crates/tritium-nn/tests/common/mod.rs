@@ -306,7 +306,13 @@ impl Evaluator {
 /// into a number. A second copy of this loop would make a host↔device delta ambiguous between "the
 /// forward differs" and "the scoring differs", which is exactly what the parity gate exists to
 /// distinguish.
-fn score_window(logits: &[f32], chunk: &[u32], vocab: usize, nll: &mut f64, scored: &mut usize) {
+pub fn score_window(
+    logits: &[f32],
+    chunk: &[u32],
+    vocab: usize,
+    nll: &mut f64,
+    scored: &mut usize,
+) {
     for tpos in 0..chunk.len() - 1 {
         let row = &logits[tpos * vocab..tpos * vocab + vocab];
         let m = row.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
