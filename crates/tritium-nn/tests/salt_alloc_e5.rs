@@ -226,6 +226,12 @@ fn measured_marginal_loss_allocation_vs_uniform() {
         return;
     }
     let t_ref = env_usize("TRITIUM_E5_T", 3);
+    // `t_ref - 1` below is a usize subtraction; TRITIUM_E5_T=0 would underflow rather than fail
+    // with something a reader can act on. There is also no plane to remove at T=0.
+    assert!(
+        t_ref >= 1,
+        "E5 needs TRITIUM_E5_T >= 1 (a plane must exist to remove)"
+    );
     let t_max = env_usize("TRITIUM_E5_TMAX", 6).max(t_ref);
     let plane_bits = ((t_max + 1) as f64).log2().ceil();
     let limit = env_usize("TRITIUM_E5_LIMIT", usize::MAX);
@@ -280,7 +286,8 @@ fn measured_marginal_loss_allocation_vs_uniform() {
     );
 
     // The tensor at T_ref-1, precomputed once per tensor and swapped in alone.
-    let mut deltas: Vec<f64> = load_cache(n_tensors, probe_tokens, t_ref);
+    let fingerprint = corpus_fingerprint(&eval);
+    let mut deltas: Vec<f64> = load_cache(n_tensors, probe_tokens, t_ref, fingerprint);
     let start = std::time::Instant::now();
     let mut measured = 0usize;
     for i in 0..n_tensors.min(limit) {
@@ -300,7 +307,7 @@ fn measured_marginal_loss_allocation_vs_uniform() {
             rate,
             rate * (n_tensors.saturating_sub(i + 1)) as f64 / 60.0
         );
-        save_cache(&deltas, probe_tokens, t_ref);
+        save_cache(&deltas, probe_tokens, t_ref, fingerprint);
     }
     if limit < n_tensors {
         println!("\nTRITIUM_E5_LIMIT={limit} — stopping before the allocation arm.");
@@ -391,7 +398,11 @@ fn measured_marginal_loss_allocation_vs_uniform() {
         ppl_m / ppl_fp,
         100.0 * (ppl_m - ppl_u_full) / ppl_u_full
     );
-    println!("     per-tensor T: {:?}", alloc.plane_counts);
+    let mut hist = vec![0usize; t_max + 1];
+    for &t in &alloc.plane_counts {
+        hist[t] += 1;
+    }
+    println!("     tensors per T: {hist:?}");
     println!(
         "     {helped}/{n_tensors} tensors IMPROVED when a plane was removed (clamped to 0 sensitivity)"
     );
@@ -402,7 +413,19 @@ fn measured_marginal_loss_allocation_vs_uniform() {
     );
 }
 
-fn load_cache(n: usize, probe_tokens: usize, t_ref: usize) -> Vec<f64> {
+/// Cheap identity for the eval corpus: length plus a sum over the ids.
+///
+/// The cache is keyed by measurement settings, and `probe_tokens` alone does NOT identify the
+/// corpus — two different corpora truncated to the same token count would silently share a cache.
+/// This whole campaign exists because a result was computed on one basis and read as another, so
+/// the cache refuses to be the next place that happens.
+fn corpus_fingerprint(eval: &[u32]) -> u64 {
+    eval.iter().fold(eval.len() as u64, |h, &t| {
+        h.wrapping_mul(1_000_003).wrapping_add(u64::from(t))
+    })
+}
+
+fn load_cache(n: usize, probe_tokens: usize, t_ref: usize, fingerprint: u64) -> Vec<f64> {
     let path = cache_path();
     let fresh = vec![f64::NAN; n];
     let Ok(text) = std::fs::read_to_string(&path) else {
@@ -412,6 +435,22 @@ fn load_cache(n: usize, probe_tokens: usize, t_ref: usize) -> Vec<f64> {
         return fresh;
     };
     // A cache measured under different settings is not reusable; start over rather than mix bases.
+    // A cache written before fingerprinting existed has no `corpus` field; accept it rather than
+    // discard hours of valid measurement, but say so.
+    match v["corpus"].as_u64() {
+        Some(f) if f == fingerprint => {}
+        Some(_) => {
+            eprintln!(
+                "e5 cache at {} is from a different corpus — ignoring",
+                path.display()
+            );
+            return fresh;
+        }
+        None => eprintln!(
+            "e5 cache at {} predates corpus fingerprinting — trusting it",
+            path.display()
+        ),
+    }
     if v["probe_tokens"].as_u64() != Some(probe_tokens as u64)
         || v["t_ref"].as_u64() != Some(t_ref as u64)
         || v["deltas"].as_array().map(Vec::len) != Some(n)
@@ -433,7 +472,7 @@ fn load_cache(n: usize, probe_tokens: usize, t_ref: usize) -> Vec<f64> {
     got
 }
 
-fn save_cache(deltas: &[f64], probe_tokens: usize, t_ref: usize) {
+fn save_cache(deltas: &[f64], probe_tokens: usize, t_ref: usize, fingerprint: u64) {
     let path = cache_path();
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -441,7 +480,18 @@ fn save_cache(deltas: &[f64], probe_tokens: usize, t_ref: usize) {
     let body = serde_json::json!({
         "probe_tokens": probe_tokens,
         "t_ref": t_ref,
+        "corpus": fingerprint,
         "deltas": deltas.iter().map(|d| if d.is_finite() { serde_json::json!(d) } else { serde_json::Value::Null }).collect::<Vec<_>>(),
     });
-    let _ = std::fs::write(&path, serde_json::to_string(&body).unwrap_or_default());
+    // `unwrap_or_default()` here would write an EMPTY file over a good cache on a serialisation
+    // failure — turning a recoverable hiccup into hours of lost measurement. Write only on success,
+    // and report a failed write rather than silently re-measuring everything next run.
+    match serde_json::to_string(&body) {
+        Ok(text) => {
+            if let Err(e) = std::fs::write(&path, text) {
+                eprintln!("e5 cache write failed ({}): {e}", path.display());
+            }
+        }
+        Err(e) => eprintln!("e5 cache serialise failed: {e}"),
+    }
 }
