@@ -222,7 +222,82 @@ pub fn accumulate(t: &Tape, id: ValueId, seq: usize, cols: usize, acc: &mut [f64
 /// Only the diagonal (`Σ x²` per channel) is accumulated, which is all the salience fold needs. The
 /// full Gram `Σ x xᵀ` that sequential error compensation would require stays in the test tree with
 /// the rest of the curvature machinery — see the module docs for why.
+/// Which projection group a tap is measuring the input to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tap {
+    /// Input to q, k, v — post-RMSNorm, so already unit-RMS per token.
+    AttnIn,
+    /// Input to gate, up — post-RMSNorm.
+    FfnIn,
+    /// Input to down — `silu(gate) * up`, the FFN intermediate. NOT normalised, and the widest
+    /// activation in the block, so this is where activation outliers are worst.
+    DownIn,
+}
+
+/// A calibration tap: `(which projection, layer index, tape, value, seq, cols)`.
+///
+/// The tape and value are passed rather than a slice so a caller that only wants a reduction never
+/// materialises a copy — [`accumulate`] reads straight out of the tape.
+pub type TapFn<'a> = dyn FnMut(Tap, usize, &Tape, ValueId, usize, usize) + 'a;
+
+/// Run the calibration forward pass and hand each tap's raw activations to `tap`.
+///
+/// [`calibrate`] is this with a closure that reduces to second moments. Anything wanting the
+/// activations themselves — the A8 headroom measurement, for one — needs them undiscarded, and
+/// duplicating this forward pass in a test would be a second implementation to keep in sync.
+pub fn calibrate_tapped(weights: &[Vec<f32>], a: &Arch, tokens: &[u32], tap: &mut TapFn<'_>) {
+    let mut t = Tape::new();
+    let wids: Vec<ValueId> = weights.iter().map(|w| t.leaf(w.clone())).collect();
+    let seq = tokens.len();
+    let mut hidden = t.embed_gather(wids[0], tokens, a.vocab, a.n_embd);
+    for li in 0..a.n_layers {
+        let base = 1 + 7 * li;
+        let an = t.leaf(a.attn_norms[li].clone());
+        let xn = t.rmsnorm(hidden, an, seq, a.n_embd, a.eps);
+        tap(Tap::AttnIn, li, &t, xn, seq, a.n_embd);
+        let attn = attention(
+            &mut t,
+            xn,
+            wids[base],
+            wids[base + 1],
+            wids[base + 2],
+            wids[base + 3],
+            seq,
+            a.n_embd,
+            a.n_head,
+            a.n_head_kv,
+            a.head_dim,
+            a.theta,
+        );
+        hidden = t.add(hidden, attn);
+        let fnw = t.leaf(a.ffn_norms[li].clone());
+        let hn = t.rmsnorm(hidden, fnw, seq, a.n_embd, a.eps);
+        tap(Tap::FfnIn, li, &t, hn, seq, a.n_embd);
+        let g = t.dense_matmul(hn, wids[base + 4], seq, a.ff, a.n_embd);
+        let u = t.dense_matmul(hn, wids[base + 5], seq, a.ff, a.n_embd);
+        let ga = t.silu(g);
+        let gated = t.mul(ga, u);
+        tap(Tap::DownIn, li, &t, gated, seq, a.ff);
+        let down = t.dense_matmul(gated, wids[base + 6], seq, a.n_embd, a.ff);
+        hidden = t.add(hidden, down);
+    }
+}
+
 pub fn calibrate(weights: &[Vec<f32>], a: &Arch, tokens: &[u32], c: &mut Calib) {
+    let seq = tokens.len();
+    calibrate_tapped(weights, a, tokens, &mut |kind, li, t, id, seq, cols| {
+        let acc = match kind {
+            Tap::AttnIn => &mut c.attn_in[li],
+            Tap::FfnIn => &mut c.ffn_in[li],
+            Tap::DownIn => &mut c.down_in[li],
+        };
+        accumulate(t, id, seq, cols, acc);
+    });
+    c.rows += seq;
+}
+
+#[allow(dead_code)]
+fn calibrate_old(weights: &[Vec<f32>], a: &Arch, tokens: &[u32], c: &mut Calib) {
     let mut t = Tape::new();
     let wids: Vec<ValueId> = weights.iter().map(|w| t.leaf(w.clone())).collect();
     let seq = tokens.len();
