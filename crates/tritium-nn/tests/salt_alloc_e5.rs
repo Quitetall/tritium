@@ -206,7 +206,15 @@ fn alloc_bpw(counts: &[u8], sizes: &[usize], plane_bits: f64) -> f64 {
 
 /// Quantize one tensor at a uniform plane count.
 fn quantize_at(w: &[f32], rows: usize, cols: usize, t: usize) -> Vec<f32> {
-    ste::salt_quantize_forward_grouped_geometric(w, rows, cols, t, GROUP, GRID, RotationPolicy::Always)
+    ste::salt_quantize_forward_grouped_geometric(
+        w,
+        rows,
+        cols,
+        t,
+        GROUP,
+        GRID,
+        RotationPolicy::Always,
+    )
 }
 
 #[test]
@@ -229,7 +237,12 @@ fn measured_marginal_loss_allocation_vs_uniform() {
 
     let mut calib = Calib::new(&arch);
     for w in 0..CALIB_WINDOWS {
-        calibrate(&fp, &arch, &train[w * CALIB_SEQ..(w + 1) * CALIB_SEQ], &mut calib);
+        calibrate(
+            &fp,
+            &arch,
+            &train[w * CALIB_SEQ..(w + 1) * CALIB_SEQ],
+            &mut calib,
+        );
     }
     let alpha = fold_alpha();
     let curvature = column_curvature(&arch, &calib, &shapes, alpha);
@@ -261,7 +274,10 @@ fn measured_marginal_loss_allocation_vs_uniform() {
     } else {
         perplexity_windowed(&uniform, &arch, &eval, EVAL_WINDOW)
     };
-    println!("uniform T={t_ref}: probe ppl {ppl_u_probe:.4} | full ppl {ppl_u_full:.4} ({:.3}× fp)\n", ppl_u_full / ppl_fp);
+    println!(
+        "uniform T={t_ref}: probe ppl {ppl_u_probe:.4} | full ppl {ppl_u_full:.4} ({:.3}× fp)\n",
+        ppl_u_full / ppl_fp
+    );
 
     // The tensor at T_ref-1, precomputed once per tensor and swapped in alone.
     let mut deltas: Vec<f64> = load_cache(n_tensors, probe_tokens, t_ref);
@@ -314,12 +330,19 @@ fn measured_marginal_loss_allocation_vs_uniform() {
         }
     }
 
-    println!("\n{:<28} {:>9} {:>12} {:>11} {:>9}", "arm", "bpw", "mean T", "ppl", "× fp");
+    println!(
+        "\n{:<28} {:>9} {:>12} {:>11} {:>9}",
+        "arm", "bpw", "mean T", "ppl", "× fp"
+    );
     println!("{}", "-".repeat(76));
     println!(
         "{:<28} {:>9.3} {:>12.3} {ppl_u_full:>11.3} {:>8.3}×",
         format!("uniform T={t_ref}"),
-        alloc_bpw(&vec![t_ref as u8; flat_sizes.len()], &flat_sizes, plane_bits),
+        alloc_bpw(
+            &vec![t_ref as u8; flat_sizes.len()],
+            &flat_sizes,
+            plane_bits
+        ),
         t_ref as f64,
         ppl_u_full / ppl_fp
     );
@@ -393,7 +416,10 @@ fn load_cache(n: usize, probe_tokens: usize, t_ref: usize) -> Vec<f64> {
         || v["t_ref"].as_u64() != Some(t_ref as u64)
         || v["deltas"].as_array().map(Vec::len) != Some(n)
     {
-        eprintln!("e5 cache at {} does not match this configuration — ignoring", path.display());
+        eprintln!(
+            "e5 cache at {} does not match this configuration — ignoring",
+            path.display()
+        );
         return fresh;
     }
     let got: Vec<f64> = v["deltas"]
