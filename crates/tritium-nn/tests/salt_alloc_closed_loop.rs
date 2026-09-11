@@ -251,6 +251,26 @@ fn closed_loop_allocation_beats_or_matches_uniform() {
     let budget = trits(&counts, &sizes);
     let mut best = evaluate(&counts, search_eval);
     let uniform_search = best;
+    // Two-stage acceptance. The cheap basis PROPOSES; the full split CONFIRMS.
+    //
+    // A search that only ever sees a subsample will fit that subsample. Measured on 2026-09-11:
+    // 14 moves, each verified to improve perplexity on 4,096 tokens, together made the model
+    // 1.228% WORSE on all 32,768 — the search basis does not preserve the ranking of allocations.
+    // Confirming each candidate on the full split before committing costs one extra full
+    // evaluation per proposal instead of running the entire search at full width.
+    let confirm = env_usize("TRITIUM_CL_CONFIRM", 1) == 1;
+    let mut best_full = evaluate(&counts, &eval);
+    let uniform_full = best_full;
+    let mut full_evals = 1usize;
+    let mut rejected_by_confirm = 0usize;
+    println!(
+        "uniform full-split ppl {best_full:.4} | confirmation {}\n",
+        if confirm {
+            "ON (full split must agree)"
+        } else {
+            "OFF"
+        }
+    );
     println!(
         "SmolLM2-135M | fp {ppl_fp:.3} | fold α={alpha} | g{GROUP} | ladder (always rot)\n\
          closed loop: {n} tensors, T∈[{t_min},{t_max}], budget = uniform T={t_ref} ({budget:.3e} trits)\n\
@@ -304,13 +324,30 @@ fn closed_loop_allocation_beats_or_matches_uniform() {
                 let ppl = evaluate(&cand, search_eval);
                 evals += 1;
                 if ppl < best - min_gain {
+                    // The cheap basis liked it. Does the objective itself agree?
+                    if confirm {
+                        let full = evaluate(&cand, &eval);
+                        full_evals += 1;
+                        if full >= best_full - min_gain {
+                            println!(
+                                "  round {round}: REJECTED by full split — search {best:.4}→{ppl:.4}                                  but full {best_full:.4}→{full:.4} [eval {evals}, full {full_evals}]"
+                            );
+                            rejected_by_confirm += 1;
+                            continue;
+                        }
+                        best_full = full;
+                    }
                     println!(
                         "  round {round}: tensor {donor} {} → {}, tensor {recipient} {} → {}   \
                          ppl {best:.4} → {ppl:.4}  ({:+.3}%)  [eval {evals}]",
-                        counts[donor] + 1,
+                        // `counts` is still the PRE-move state here — `counts = cand` is below —
+                        // so the new values are derived, not read. Printing `counts[donor] + 1`
+                        // labelled every move one plane too high on the donor and one too low on
+                        // the recipient.
                         counts[donor],
-                        counts[recipient] - 1,
+                        cand[donor],
                         counts[recipient],
+                        cand[recipient],
                         100.0 * (ppl - best) / best
                     );
                     counts = cand;
@@ -327,8 +364,17 @@ fn closed_loop_allocation_beats_or_matches_uniform() {
     }
 
     // Everything above ran on the search subsample; the verdict runs on the full split.
-    let ppl_uniform_full = evaluate(&vec![t_ref; n], &eval);
-    let ppl_best_full = evaluate(&counts, &eval);
+    let ppl_uniform_full = uniform_full;
+    let ppl_best_full = if confirm {
+        best_full
+    } else {
+        evaluate(&counts, &eval)
+    };
+    if confirm {
+        println!(
+            "confirmation: {full_evals} full-split evaluations, {rejected_by_confirm} proposals              rejected that the search basis had accepted"
+        );
+    }
     let mut hist = vec![0usize; t_max + 1];
     for &t in &counts {
         hist[t] += 1;
