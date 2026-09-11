@@ -186,6 +186,84 @@ pub fn forward(t: &mut Tape, wids: &[ValueId], a: &Arch, tokens: &[u32]) -> Valu
     t.dense_matmul(fnorm, wids[0], seq, a.vocab, a.n_embd) // tied head
 }
 
+/// An activation transform applied at a projection input: `(which projection, layer, values, seq, cols)`.
+///
+/// Values are mutated in place and re-entered on the tape, so the transform can be any precision
+/// model at all — int8 per row, int8 per group, ternary planes, or identity.
+pub type ActFn<'a> = dyn FnMut(Tap, usize, &mut [f32], usize, usize) + 'a;
+
+/// [`forward`] with activations quantized at every projection input.
+///
+/// Every perplexity this repo publishes is weight-quantized only: the tape consumes fp32
+/// activations. The shipping runtime does not — it int8-quantizes before each projection, which
+/// costs +2.76% at T=4 and DOUBLES the excess over fp. Measuring any other activation precision
+/// meant a second forward pass nobody had written.
+///
+/// **Not covered: `o_proj`'s input.** It lives inside [`attention`], which this does not
+/// instrument, so `o` keeps fp32 activations here. Results are therefore an upper bound on a real
+/// deployment at the same setting — one of seven projections per layer is unpenalised. Stated
+/// rather than hidden, because a "fully ternary" claim from this harness would be false.
+pub fn forward_aq(
+    t: &mut Tape,
+    wids: &[ValueId],
+    a: &Arch,
+    tokens: &[u32],
+    aq: &mut ActFn<'_>,
+) -> ValueId {
+    fn requant(
+        t: &mut Tape,
+        id: ValueId,
+        kind: Tap,
+        li: usize,
+        seq: usize,
+        cols: usize,
+        aq: &mut ActFn<'_>,
+    ) -> ValueId {
+        let mut v = t.value(id).to_vec();
+        aq(kind, li, &mut v, seq, cols);
+        t.leaf(v)
+    }
+
+    let seq = tokens.len();
+    let mut hidden = t.embed_gather(wids[0], tokens, a.vocab, a.n_embd);
+    for li in 0..a.n_layers {
+        let base = 1 + 7 * li;
+        let an = t.leaf(a.attn_norms[li].clone());
+        let xn = t.rmsnorm(hidden, an, seq, a.n_embd, a.eps);
+        let xn = requant(t, xn, Tap::AttnIn, li, seq, a.n_embd, aq);
+        let attn = attention(
+            t,
+            xn,
+            wids[base],
+            wids[base + 1],
+            wids[base + 2],
+            wids[base + 3],
+            seq,
+            a.n_embd,
+            a.n_head,
+            a.n_head_kv,
+            a.head_dim,
+            a.theta,
+        );
+        hidden = t.add(hidden, attn);
+        let fnw = t.leaf(a.ffn_norms[li].clone());
+        let hn = t.rmsnorm(hidden, fnw, seq, a.n_embd, a.eps);
+        let hn = requant(t, hn, Tap::FfnIn, li, seq, a.n_embd, aq);
+        let g = t.dense_matmul(hn, wids[base + 4], seq, a.ff, a.n_embd);
+        let u = t.dense_matmul(hn, wids[base + 5], seq, a.ff, a.n_embd);
+        let ga = t.silu(g);
+        let gated = t.mul(ga, u);
+        let gated = requant(t, gated, Tap::DownIn, li, seq, a.ff, aq);
+        let down = t.dense_matmul(gated, wids[base + 6], seq, a.n_embd, a.ff);
+        hidden = t.add(hidden, down);
+    }
+    let onw = t.leaf(a.out_norm.clone());
+    let fnorm = t.rmsnorm(hidden, onw, seq, a.n_embd, a.eps);
+    // The tied head is a projection too, and skipping it would understate a full-precision sweep.
+    let fnorm = requant(t, fnorm, Tap::Head, a.n_layers, seq, a.n_embd, aq);
+    t.dense_matmul(fnorm, wids[0], seq, a.vocab, a.n_embd)
+}
+
 /// Per-input-channel second moments for the projections whose scale is foldable.
 #[derive(Debug, Clone)]
 pub struct Calib {
@@ -232,6 +310,9 @@ pub enum Tap {
     /// Input to down — `silu(gate) * up`, the FFN intermediate. NOT normalised, and the widest
     /// activation in the block, so this is where activation outliers are worst.
     DownIn,
+    /// Input to the tied output head. Never a calibration tap; used by [`forward_aq`] so an
+    /// activation-precision sweep does not silently leave the largest projection at fp32.
+    Head,
 }
 
 /// A calibration tap: `(which projection, layer index, tape, value, seq, cols)`.
@@ -290,6 +371,9 @@ pub fn calibrate(weights: &[Vec<f32>], a: &Arch, tokens: &[u32], c: &mut Calib) 
             Tap::AttnIn => &mut c.attn_in[li],
             Tap::FfnIn => &mut c.ffn_in[li],
             Tap::DownIn => &mut c.down_in[li],
+            // The tied head has no foldable scale, so there is no accumulator for it and
+            // `calibrate_tapped` never emits this. Only `forward_aq` does.
+            Tap::Head => return,
         };
         accumulate(t, id, seq, cols, acc);
     });

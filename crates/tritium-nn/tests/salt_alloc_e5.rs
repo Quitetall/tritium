@@ -326,12 +326,32 @@ fn measured_marginal_loss_allocation_vs_uniform() {
     let flat_sizes: Vec<usize> = all_sizes.iter().flatten().copied().collect();
     let total_weights: usize = flat_sizes.iter().sum();
 
+    // `TRITIUM_E5_RELATIVE=1` normalises each group curve by `curve[0]` = ‖w_g‖².
+    //
+    // The allocator minimises `Σ H_g·err_g(T_g)` with err ABSOLUTE, and the ladder takes each
+    // group's Δ from its own max|w|, so `err_g(T) ≈ ‖w_g‖²·9^(−T)`. That `‖w_g‖²` is a pure scale
+    // term unrelated to how much a group matters, and RMSNorm makes absolute weight scale largely
+    // arbitrary. Measured 2026-09-11: removing it cuts the allocation penalty 8× (17.47% → 2.21%)
+    // and drives `corr(ΔT, group RMS)` from +0.3953 to +0.0041.
+    //
+    // E5's own verdict — "the loss is not separable" — was measured through the ABSOLUTE objective,
+    // so it inherits that bias and has to be re-run here before it can be believed.
+    let relative = std::env::var("TRITIUM_E5_RELATIVE").is_ok_and(|v| v == "1");
+    println!(
+        "allocation objective: {}",
+        if relative {
+            "RELATIVE (normalised by ‖w_g‖²)"
+        } else {
+            "absolute"
+        }
+    );
     let mut unit_curve = vec![vec![0.0f64; t_max + 1]; n_tensors];
     let mut unit_weights = vec![0usize; n_tensors];
     for (i, (cs, zs)) in all_curves.iter().zip(&all_sizes).enumerate() {
         for (c, &z) in cs.iter().zip(zs) {
+            let norm = if relative && c[0] > 0.0 { c[0] } else { 1.0 };
             for t in 0..=t_max {
-                unit_curve[i][t] += c[t];
+                unit_curve[i][t] += c[t] / norm;
             }
             unit_weights[i] += z;
         }

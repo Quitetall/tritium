@@ -106,6 +106,29 @@ const B3_BITS_PER_TRIT: f64 = 1.625;
 /// allowed `T in [1, 6]`; the 2026-08-03 histogram shows ~90k demotions against ~78k promotions --
 /// 8% of groups moving cost 12% perplexity. Raising the floor tests whether the damage lives in the
 /// demoted tail.
+/// Allocate on RELATIVE error (`TRITIUM_ALLOC_RELATIVE=1`) instead of absolute.
+///
+/// The objective is `Σ_g H_g·err_g(T_g)` with `err_g` an ABSOLUTE sum of squares. The ladder takes
+/// each group's Δ from its own `max|w|`, so `err_g(T) ≈ ‖w_g‖²·9^(−T)` and the objective carries a
+/// `‖w_g‖²` factor that has nothing to do with how much the group matters:
+///
+/// ```text
+/// absolute:  minimise  Σ H_g · ‖w_g‖² · 9^(−T_g)
+/// relative:  minimise  Σ H_g ·          9^(−T_g)
+/// ```
+///
+/// RMSNorm rescales every activation vector to unit RMS, so a group's absolute weight scale is
+/// largely arbitrary — uniform `T` is uniform RELATIVE precision, and that is the invariant the
+/// architecture is built around. Allocating on absolute error therefore hands planes to large-norm
+/// groups for reasons the network does not care about. Measured, and long mistaken for evidence of
+/// the mechanism rather than of the bug: `corr(ΔT, group RMS) = +0.3953` at α=0.75.
+///
+/// Normalising each curve by `curve[0]` (which IS `‖w_g‖²`) removes the factor exactly. Reporting
+/// still uses the absolute curves so the SSE columns stay comparable with the earlier runs.
+fn relative_curves() -> bool {
+    std::env::var("TRITIUM_ALLOC_RELATIVE").is_ok_and(|v| v == "1")
+}
+
 fn alloc_tmin() -> usize {
     env_usize("TRITIUM_ALLOC_TMIN", 1)
 }
@@ -350,6 +373,30 @@ fn allocation_vs_uniform_planes_at_matched_bits() {
     let flat_curves: Vec<&Vec<f64>> = all_curves.iter().flatten().collect();
     let flat_sens: Vec<f64> = all_sens.iter().flatten().copied().collect();
 
+    // Curves the ALLOCATOR sees. Absolute by default; relative strips the `‖w_g‖²` scale factor.
+    // Reporting keeps `flat_curves` either way, so the SSE columns remain comparable across runs.
+    let relative = relative_curves();
+    let alloc_curves: Vec<Vec<f64>> = flat_curves
+        .iter()
+        .map(|c| {
+            if relative {
+                let e0 = c[0];
+                if e0 > 0.0 {
+                    return c.iter().map(|v| v / e0).collect();
+                }
+            }
+            (*c).clone()
+        })
+        .collect();
+    println!(
+        "allocation objective: {}\n",
+        if relative {
+            "RELATIVE (curves normalised by ‖w_g‖²)"
+        } else {
+            "absolute (Σ (w−ŵ)²)"
+        }
+    );
+
     // Total weight-space error the arm's plane counts actually realise. This is the column that
     // makes the table interpretable rather than merely negative: the water-filling MINIMISES this
     // subject to the budget, so if an allocated arm posts lower error and worse perplexity, the
@@ -454,7 +501,7 @@ fn allocation_vs_uniform_planes_at_matched_bits() {
     let mut unit_sens_num = vec![0.0f64; n_units];
     for g in 0..n_groups {
         let u = unit_of[g];
-        let c = flat_curves[g];
+        let c = &alloc_curves[g];
         // ladder_curves() allocates every curve at exactly `t_max + 1`, so this holds by
         // construction. Asserted rather than clamped: a shorter curve would make the aggregate a
         // sum of repeated tail values -- silently wrong rather than loudly wrong.
