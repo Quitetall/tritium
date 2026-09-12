@@ -585,7 +585,9 @@ mod rotation_tests {
         let count = u32::from_le_bytes([plain[6], plain[7], plain[8], plain[9]]);
         assert_eq!(count, 1);
         assert_eq!(
-            SaltBundleIndex::new(&plain).expect("parse").rotation_group(),
+            SaltBundleIndex::new(&plain)
+                .expect("parse")
+                .rotation_group(),
             None
         );
     }
