@@ -77,7 +77,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use tritium_format::{SaltRow, salt_rows_to_dense, write_salt_bundle};
+use tritium_format::{SaltRow, salt_rows_to_dense, write_rotated_salt_bundle, write_salt_bundle};
 use tritium_nn::calibrate::{Calib, calibrate, extract, fold, norm_tensors, weight_names};
 use tritium_nn::{HfJsonTokenizer, ModelRunner, Tokenizer};
 
@@ -209,7 +209,16 @@ pub(crate) fn run(model: &Path, out: &Path, cfg: &ConvertConfig) -> Result<()> {
         .iter()
         .map(|(n, r)| (n.as_str(), r.as_slice()))
         .collect();
-    let bundle = write_salt_bundle(&refs).context("serialize SALT bundle")?;
+    // A rotated fit stores codes in the rotated basis, so the artifact has to say so: the runtime
+    // must apply the same Hadamard to the activation, and a reader that cannot would otherwise
+    // compute `W·H·x` silently. Version 2 makes such a reader fail closed instead.
+    let bundle = if cfg.ladder.rotate {
+        let group = u16::try_from(cfg.ladder.group)
+            .context("--group does not fit the bundle's u16 rotation field")?;
+        write_rotated_salt_bundle(&refs, group).context("serialize rotated SALT bundle")?
+    } else {
+        write_salt_bundle(&refs).context("serialize SALT bundle")?
+    };
     let bundle_path = out.join("model.tslb");
     std::fs::write(&bundle_path, &bundle)
         .with_context(|| format!("write {}", bundle_path.display()))?;

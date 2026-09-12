@@ -6,6 +6,7 @@
 //! fp32 matrix.
 
 use tritium_format::{PackedSaltRow, SaltRow};
+use tritium_train::ops::ste::fast_hadamard;
 
 use crate::error::NnError;
 use crate::layers::packed_salt::PackedSaltMatrix;
@@ -15,11 +16,23 @@ use crate::ops::quantize_activation_int8;
 #[derive(Clone, Debug)]
 pub struct SaltLinear {
     matrix: PackedSaltMatrix,
+    /// Hadamard group width the weights were fitted under, from the bundle header.
+    ///
+    /// `Some(g)` means the stored weights are `W·H`, so this projection MUST rotate each `g`-wide
+    /// slice of the activation before quantizing: `H·H = I`, hence `W·x = (W·H)·(H·x)`. Skipping it
+    /// computes `W·H·x` — wrong, but not detectably wrong, which is why the bundle version gates it.
+    rotation_group: Option<usize>,
 }
 
 impl SaltLinear {
-    pub(crate) fn from_packed_matrix(matrix: PackedSaltMatrix) -> Self {
-        Self { matrix }
+    pub(crate) fn from_packed_matrix(
+        matrix: PackedSaltMatrix,
+        rotation_group: Option<usize>,
+    ) -> Self {
+        Self {
+            matrix,
+            rotation_group,
+        }
     }
 
     /// Build a projection from one packed SALT row per output channel.
@@ -68,6 +81,9 @@ impl SaltLinear {
     ) -> Result<Self, NnError> {
         Ok(Self {
             matrix: PackedSaltMatrix::new(rows, n_out, k_in)?,
+            // Raw rows carry no bundle header, so there is nothing to say they were fitted in a
+            // rotated basis. Callers that know otherwise build through the bundle path.
+            rotation_group: None,
         })
     }
 
@@ -132,6 +148,30 @@ impl SaltLinear {
                 got: out.len(),
             });
         }
+
+        // Rotate BEFORE quantizing. The fit is in the rotated basis, so the int8 grid the
+        // activation lands on must be the rotated one too — and the Hadamard whitens, which should
+        // make the activation easier to quantize, not harder.
+        let rotated_scratch;
+        let act = match self.rotation_group {
+            None => act,
+            Some(group) => {
+                if !self.k_in().is_multiple_of(group) {
+                    return Err(NnError::Shape {
+                        expected: self.k_in(),
+                        got: group,
+                    });
+                }
+                let mut buf = act.to_vec();
+                for row in buf.chunks_mut(self.k_in()) {
+                    for slice in row.chunks_mut(group) {
+                        fast_hadamard(slice);
+                    }
+                }
+                rotated_scratch = buf;
+                &rotated_scratch
+            }
+        };
 
         let mut q_act = zeroed_scratch(act_len, "SALT quantized activations")?;
         let mut act_scale = zeroed_scratch(m, "SALT activation scales")?;

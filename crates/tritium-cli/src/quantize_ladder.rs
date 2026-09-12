@@ -64,6 +64,12 @@ pub(crate) struct LadderConfig {
     pub(crate) planes: usize,
     pub(crate) group: usize,
     pub(crate) grid: usize,
+    /// Fit each group in the Hadamard-rotated basis.
+    ///
+    /// The packed codes are then in that basis, so the artifact MUST be written as a rotated
+    /// bundle and the runtime MUST rotate the activation before projecting — `H` is symmetric, so
+    /// `(H·L)·x = L·(H·x)`. Measured worth on SmolLM2-135M: **21.1% at T=3**, 1.6% at T=4.
+    pub(crate) rotate: bool,
 }
 
 impl LadderConfig {
@@ -77,6 +83,14 @@ impl LadderConfig {
         }
         // A TQ2_0 block carries ONE f16 scale for 256 trits. The ladder's scale is per group, so a
         // block straddling two groups would need two anchors and could not be encoded.
+        // `fast_hadamard` asserts a power-of-two length, and the rotation group is the scale
+        // group. A multiple of 256 is not automatically a power of two (768 is not).
+        if self.rotate && !self.group.is_power_of_two() {
+            bail!(
+                "--group must be a power of two to rotate (the Hadamard requires it); got {}",
+                self.group
+            );
+        }
         if !self.group.is_multiple_of(QK_K) {
             bail!(
                 "--group must be a multiple of {QK_K} for the SALT bundle: a TQ2_0 block holds one \
@@ -125,7 +139,11 @@ pub(crate) fn quantize_tensor_ladder(
         cfg.planes,
         cfg.group,
         cfg.grid,
-        RotationPolicy::Never,
+        if cfg.rotate {
+            RotationPolicy::Always
+        } else {
+            RotationPolicy::Never
+        },
     );
     if fits.len() != rows * groups_per_row {
         bail!(

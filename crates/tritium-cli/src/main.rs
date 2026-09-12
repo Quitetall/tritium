@@ -216,6 +216,16 @@ enum Command {
         /// only to reproduce that measurement; a warning is printed.
         #[arg(long, default_value_t = 0.0)]
         fold_alpha: f64,
+        /// Fit in the original basis instead of the Hadamard-rotated one.
+        ///
+        /// Rotation is on by default because it is worth **21.1% at T=3** (1.071x fp against
+        /// 1.297x) and because the salience fold depends on it — the fold deliberately distorts
+        /// weights and the Hadamard is what re-conditions them for the ladder's rigid 1/3 spacing.
+        /// A rotated artifact is a version-2 bundle, which readers that cannot rotate reject
+        /// outright rather than silently computing `W·H·x`. Pass this only to reproduce the old
+        /// unrotated artifact.
+        #[arg(long)]
+        no_rotation: bool,
         /// Plane count. 4 measures 1.024x fp on SmolLM2-360M without any fold; 3 measures 1.335x.
         #[arg(long, default_value_t = 4)]
         planes: usize,
@@ -570,6 +580,7 @@ fn main() -> anyhow::Result<()> {
             calib,
             calib_tokens,
             fold_alpha,
+            no_rotation,
             planes,
             group,
             grid,
@@ -584,6 +595,7 @@ fn main() -> anyhow::Result<()> {
                     planes,
                     group,
                     grid,
+                    rotate: !no_rotation,
                 },
             },
         )?,
@@ -612,6 +624,9 @@ fn main() -> anyhow::Result<()> {
                 planes,
                 group,
                 grid,
+                // `quantize` writes a version-1 bundle and has no calibration path, so it stays in
+                // the original basis. Rotation lives on `convert`, which can also fold.
+                rotate: false,
             },
         )?,
     }

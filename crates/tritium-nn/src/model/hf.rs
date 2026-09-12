@@ -165,6 +165,8 @@ impl ModelWeights {
             };
             shards.tensor_f32_exact(name, &[len])
         };
+        // Read once, outside the per-tensor closure: rotation is a property of the bundle.
+        let rotation_group = source.rotation_group()?;
         let weights = build_standard_model_with_embedding(
             &config,
             &spec,
@@ -174,6 +176,7 @@ impl ModelWeights {
             |name, n_out, k_in| {
                 Ok(Projection::Salt(SaltLinear::from_packed_matrix(
                     source.matrix(name, Some(n_out), k_in)?,
+                    rotation_group,
                 )))
             },
         )?;
@@ -187,6 +190,22 @@ enum SaltTensorSource {
 }
 
 impl SaltTensorSource {
+    /// The Hadamard group width the artifact was fitted under, if it records one.
+    ///
+    /// Only TSLB carries this. A SALT-GGUF artifact has no rotation field, so it reports `None` and
+    /// is therefore assumed to be an unrotated fit — which is what every GGUF export has been.
+    fn rotation_group(&self) -> Result<Option<usize>, NnError> {
+        match self {
+            Self::Bundle(reader) => {
+                let reader = reader.try_borrow().map_err(|_| {
+                    NnError::Backend("reentrant SALT bundle header read".to_owned())
+                })?;
+                Ok(reader.rotation_group().map(usize::from))
+            }
+            Self::Gguf(_) => Ok(None),
+        }
+    }
+
     fn matrix(
         &self,
         name: &str,
