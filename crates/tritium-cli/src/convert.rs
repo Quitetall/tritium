@@ -13,7 +13,8 @@
 //! projection is a property of the model, not of any tensor, so the fold has to run on a loaded
 //! model. Hence a separate command.
 //!
-//! Measured value of the fold on SmolLM2-360M: **2.3× at T=2, 8.5% at T=3, 1.1% at T=4**.
+//! Measured value of the fold on SmolLM2-360M **with rotation**: 2.3× at T=2, 8.5% at T=3, 1.1%
+//! at T=4. Those gains do NOT survive without rotation — see below; the fold is conditional on it.
 //!
 //! # What the artifact has to contain, and why
 //!
@@ -49,12 +50,28 @@
 //! allocation: 12.4% lower weight SSE, 12% *worse* perplexity. The receipt says so in its own
 //! `interpretation` field, since that file is what a downstream consumer reads.
 //!
-//! # Configuration that has never been measured
+//! # Fold-without-rotation, measured — and it is worse than doing nothing
 //!
-//! Fold-without-rotation is a *new* point: the published numbers are fold **and** rotation, and
-//! `quantize`'s numbers are neither. The measured anchors for the no-fold/no-rotation path this
-//! shares are 1.335× fp at T=3 and 1.024× at T=4 (SmolLM2-360M, g256). What the fold is worth on
-//! top of those is not yet known, so this command reports its recipe and makes no quality claim.
+//! This used to read "a configuration that has never been measured". It has been, on 2026-09-12:
+//! SmolLM2-135M, WikiText-2 full 32,768-token split, all four corners of {fold, rotation}.
+//!
+//! | config | T=3 | T=4 | ships as |
+//! |---|---|---|---|
+//! | fold + rotation | **1.071×** | **1.013×** | every published number |
+//! | rotation only | 1.167× | 1.018× | — |
+//! | neither | 1.246× | 1.023× | `tritium quantize` |
+//! | **fold only** | **1.297×** | **1.029×** | **this command at `alpha > 0`** |
+//!
+//! **The fold is conditional on rotation, not independent of it.** Added with the Hadamard present
+//! it removes a 9.03% deficit at T=3; added without it, it *opens* a 4.1% one (1.297× against
+//! 1.246×). Same transform, opposite sign. The mechanism is already recorded elsewhere in this
+//! repo: the fold deliberately makes weight-space error **51% worse** (0.0252 → 0.0380) to protect
+//! channels activations excite, and the rotation is what re-conditions the distorted distribution
+//! for the ladder's rigid 1/3 spacing. Unrotated, that distortion is simply uncompensated.
+//!
+//! Hence `--fold-alpha` now defaults to **0**, and a warning is printed if it is set above it.
+//! Restore the default to 0.75 the moment the bundle can carry a rotation mask — the gap that
+//! closes is **21.1% at T=3**.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -102,6 +119,18 @@ pub(crate) fn run(model: &Path, out: &Path, cfg: &ConvertConfig) -> Result<()> {
             "--fold-alpha {} was requested but there is no calibration corpus to measure salience \
              from. Pass --calib <corpus>, or --fold-alpha 0 to convert without the fold (which is \
              what `tritium quantize` already does).",
+            cfg.fold_alpha
+        );
+    }
+
+    if cfg.fold_alpha != 0.0 {
+        // Measured 2026-09-12, SmolLM2-135M / WikiText-2 full split, against fold+rotation:
+        //   T=3  fold+rot 1.071x | fold only 1.297x | neither 1.246x
+        //   T=4  fold+rot 1.013x | fold only 1.029x | neither 1.023x
+        // The fold is CONDITIONAL on rotation, not independent of it: adding it helps when the
+        // Hadamard is present and hurts when it is not, at both plane counts.
+        eprintln!(
+            "warning: --fold-alpha {} without rotation produces a WORSE artifact than              --fold-alpha 0.\n         Measured on SmolLM2-135M: T=3 1.297x fp folded vs 1.246x              unfolded (published fold+rotation is 1.071x).\n         The fold distorts weights to              protect salient channels and relies on the Hadamard to re-condition them; this path              cannot rotate because the bundle carries no rotation metadata.",
             cfg.fold_alpha
         );
     }

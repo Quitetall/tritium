@@ -197,9 +197,24 @@ enum Command {
         /// Calibration tokens to use (rounded down to whole 512-token windows).
         #[arg(long, default_value_t = 4096)]
         calib_tokens: usize,
-        /// Salience-fold strength. 0.75 is the value every published SALT number used, but the
-        /// optimum shifts DOWN with model size (0.75 -> 0.50 observed), so it is worth sweeping.
-        #[arg(long, default_value_t = 0.75)]
+        /// Salience-fold strength. **Defaults to 0 because this path cannot rotate.**
+        ///
+        /// 0.75 is the value every published SALT number used — but those numbers are fold AND
+        /// rotation, and the bundle cannot yet carry rotation. Measured on SmolLM2-135M,
+        /// WikiText-2, against the published fold+rotation configuration:
+        ///
+        /// | config | T=3 | T=4 |
+        /// |---|---|---|
+        /// | fold + rotation (published) | 1.071x | 1.013x |
+        /// | fold only (what this path emits at alpha>0) | **1.297x** | **1.029x** |
+        /// | neither (alpha = 0) | 1.246x | 1.023x |
+        ///
+        /// The fold makes things WORSE without rotation — 1.297x against 1.246x at T=3 — because
+        /// it deliberately distorts weights (51% worse weight-space error) to protect channels
+        /// activations excite, and the Hadamard is what re-conditions the result for the ladder's
+        /// rigid 1/3 spacing. With no rotation that distortion is uncompensated. Set alpha > 0
+        /// only to reproduce that measurement; a warning is printed.
+        #[arg(long, default_value_t = 0.0)]
         fold_alpha: f64,
         /// Plane count. 4 measures 1.024x fp on SmolLM2-360M without any fold; 3 measures 1.335x.
         #[arg(long, default_value_t = 4)]
