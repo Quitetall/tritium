@@ -25,8 +25,27 @@ use crate::{
 /// Bundle magic: `b"TSLB"` (Tritium SALT Bundle).
 pub const SALT_BUNDLE_MAGIC: [u8; 4] = *b"TSLB";
 
-/// Current bundle format version.
+/// Bundle format version for an **unrotated** bundle.
+///
+/// Unchanged on purpose: an unrotated bundle written today is byte-identical to one written before
+/// rotation existed, and every reader ever shipped can still read it.
 pub const SALT_BUNDLE_VERSION: u8 = 1;
+
+/// Bundle format version for a bundle whose weights were fitted in a **rotated basis**.
+///
+/// A rotated fit reconstructs `W·H`, so a reader that does not rotate the activation computes
+/// `W·H·x` instead of `W·x` — silently, with no error and plausible-looking output. That is why
+/// this is a VERSION bump rather than a flag in the reserved byte: existing readers compare
+/// `version != SALT_BUNDLE_VERSION` and reject with [`FormatError::UnsupportedSaltVersion`], so
+/// they fail closed instead of returning wrong numbers.
+///
+/// The header then carries one `u16`: the rotation group width, which must equal the scale-group
+/// width the fitter used and must be a power of two (`fast_hadamard` requires it). Rotation is
+/// uniform across the bundle — every group of every tensor is rotated — because that is what
+/// `RotationPolicy::Always` does and what every published number used. A per-group mask, which
+/// `RotationPolicy::Auto` would need, is a future version: it costs 1 bit per group and has no
+/// measured benefit yet.
+pub const SALT_BUNDLE_VERSION_ROTATED: u8 = 2;
 
 /// One tensor recovered from a bundle: its name, shape (`rows × k`), and SALT rows.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -162,6 +181,18 @@ impl<'a> SaltTensorView<'a> {
 pub struct SaltBundleIndex<'a> {
     tensors: Vec<SaltTensorView<'a>>,
     by_name: HashMap<&'a str, usize>,
+    rotation_group: Option<u16>,
+}
+
+impl SaltBundleIndex<'_> {
+    /// The Hadamard group width the weights were fitted under, if any.
+    ///
+    /// `Some(g)` obliges the caller to rotate each `g`-wide slice of the activation before
+    /// projecting. `None` means the fit is in the original basis and the activation is used as-is.
+    #[must_use]
+    pub const fn rotation_group(&self) -> Option<u16> {
+        self.rotation_group
+    }
 }
 
 impl<'a> SaltBundleIndex<'a> {
@@ -175,10 +206,21 @@ impl<'a> SaltBundleIndex<'a> {
             return Err(FormatError::SaltBadMagic);
         }
         let version = c.take(1)?[0];
-        if version != SALT_BUNDLE_VERSION {
-            return Err(FormatError::UnsupportedSaltVersion(version));
-        }
         let _reserved = c.take(1)?;
+        let rotation_group = match version {
+            SALT_BUNDLE_VERSION => None,
+            SALT_BUNDLE_VERSION_ROTATED => {
+                let group = c.u16()?;
+                // A zero or non-power-of-two group would make `fast_hadamard` panic at runtime;
+                // reject it here where it is still a parse error.
+                if group == 0 || !group.is_power_of_two() {
+                    return Err(FormatError::UnsupportedSaltVersion(version));
+                }
+                // `Cursor::u16` widens to usize; the field is a u16 by construction.
+                Some(group as u16)
+            }
+            other => return Err(FormatError::UnsupportedSaltVersion(other)),
+        };
         let tensor_count = c.u32()?;
 
         struct Entry<'a> {
@@ -232,7 +274,11 @@ impl<'a> SaltBundleIndex<'a> {
                 got: bytes.len(),
             });
         }
-        Ok(Self { tensors, by_name })
+        Ok(Self {
+            tensors,
+            by_name,
+            rotation_group,
+        })
     }
 
     /// Number of indexed tensors.
@@ -259,6 +305,33 @@ impl<'a> SaltBundleIndex<'a> {
     }
 }
 
+/// Serialize a whole model whose weights were fitted in a **rotated basis**.
+///
+/// `rotation_group` is the scale-group width the fitter rotated over; it must be a power of two.
+/// The result is [`SALT_BUNDLE_VERSION_ROTATED`], which every reader that predates rotation
+/// rejects outright rather than silently reconstructing `W·H`.
+///
+/// A runtime reading this **must** apply the same Hadamard to each `rotation_group`-wide slice of
+/// the activation before projecting: the stored weights are `W·H`, and `H·H = I`, so
+/// `W·x = (W·H)·(H·x)`. Skipping it computes `W·H·x` and is wrong without being detectably wrong.
+///
+/// # Errors
+/// [`FormatError::WrongBlockLen`] if `rotation_group` is zero or not a power of two, plus every
+/// error [`write_salt_bundle`] can return.
+pub fn write_rotated_salt_bundle(
+    tensors: &[(&str, &[SaltRow])],
+    rotation_group: u16,
+) -> Result<Vec<u8>, FormatError> {
+    if rotation_group == 0 || !rotation_group.is_power_of_two() {
+        // `fast_hadamard` asserts a power-of-two length; refuse here rather than panic later.
+        return Err(FormatError::WrongBlockLen {
+            expected: rotation_group.next_power_of_two() as usize,
+            got: rotation_group as usize,
+        });
+    }
+    write_salt_bundle_with(tensors, Some(rotation_group), pack_salt_row)
+}
+
 /// Serialize a whole model to a SALT bundle. Each entry is `(name, salt_rows)`; the row
 /// length `k` is taken from the rows (so a tensor must have at least one row).
 ///
@@ -267,7 +340,7 @@ impl<'a> SaltBundleIndex<'a> {
 /// or a count/name exceeds its fixed-width index field; plus any underlying
 /// [`pack_salt_row`] error.
 pub fn write_salt_bundle(tensors: &[(&str, &[SaltRow])]) -> Result<Vec<u8>, FormatError> {
-    write_salt_bundle_with(tensors, pack_salt_row)
+    write_salt_bundle_with(tensors, None, pack_salt_row)
 }
 
 /// Serialize a whole model using progressive v2 rows.
@@ -282,13 +355,14 @@ pub fn write_progressive_salt_bundle(
     tensors: &[(&str, &[SaltRow])],
     max_sparse_density: f32,
 ) -> Result<Vec<u8>, FormatError> {
-    write_salt_bundle_with(tensors, |row| {
+    write_salt_bundle_with(tensors, None, |row| {
         pack_progressive_salt_row(row, max_sparse_density)
     })
 }
 
 fn write_salt_bundle_with<F>(
     tensors: &[(&str, &[SaltRow])],
+    rotation_group: Option<u16>,
     pack_row: F,
 ) -> Result<Vec<u8>, FormatError>
 where
@@ -354,8 +428,17 @@ where
 
     let mut out = Vec::new();
     out.extend_from_slice(&SALT_BUNDLE_MAGIC);
-    out.push(SALT_BUNDLE_VERSION);
-    out.push(0); // reserved
+    match rotation_group {
+        None => {
+            out.push(SALT_BUNDLE_VERSION);
+            out.push(0); // reserved
+        }
+        Some(group) => {
+            out.push(SALT_BUNDLE_VERSION_ROTATED);
+            out.push(0); // reserved
+            out.extend_from_slice(&group.to_le_bytes());
+        }
+    }
     out.extend_from_slice(&tensor_count.to_le_bytes());
     for ((name, _), packed) in tensors.iter().zip(&packed_tensors) {
         out.extend_from_slice(&packed.name_len.to_le_bytes());
@@ -475,6 +558,83 @@ pub fn read_salt_bundle_prefix(
         .copied()
         .map(|tensor| tensor.decode_prefix(max_planes))
         .collect()
+}
+
+#[cfg(test)]
+mod rotation_tests {
+    use super::*;
+
+    fn one_tensor() -> Vec<SaltRow> {
+        // Two planes of one 256-trit block: the smallest thing pack_salt_row accepts.
+        let plane = vec![0u8; crate::TQ2_0_BLOCK_BYTES];
+        vec![SaltRow {
+            k: crate::QK_K,
+            planes: vec![plane.clone(), plane],
+        }]
+    }
+
+    /// The degenerate control: rotation absent must change nothing at all.
+    #[test]
+    fn unrotated_bundle_is_byte_identical_to_the_pre_rotation_format() {
+        let rows = one_tensor();
+        let tensors: &[(&str, &[SaltRow])] = &[("w", &rows)];
+        let plain = write_salt_bundle(tensors).expect("write");
+        assert_eq!(plain[4], SALT_BUNDLE_VERSION, "version must stay 1");
+        assert_eq!(plain[5], 0, "reserved byte must stay 0");
+        // Header is magic|version|reserved|count with NO group field, exactly as before.
+        let count = u32::from_le_bytes([plain[6], plain[7], plain[8], plain[9]]);
+        assert_eq!(count, 1);
+        assert_eq!(
+            SaltBundleIndex::new(&plain).expect("parse").rotation_group(),
+            None
+        );
+    }
+
+    /// A rotated bundle must be unreadable by anything that cannot rotate, rather than
+    /// silently reconstructing `W·H`.
+    #[test]
+    fn a_rotated_bundle_fails_closed_on_a_reader_that_only_knows_version_1() {
+        let rows = one_tensor();
+        let tensors: &[(&str, &[SaltRow])] = &[("w", &rows)];
+        let rotated = write_rotated_salt_bundle(tensors, 256).expect("write rotated");
+        assert_eq!(rotated[4], SALT_BUNDLE_VERSION_ROTATED);
+
+        // Simulate the pre-rotation reader: it compared `version != SALT_BUNDLE_VERSION`.
+        assert_ne!(rotated[4], SALT_BUNDLE_VERSION);
+
+        let index = SaltBundleIndex::new(&rotated).expect("parse rotated");
+        assert_eq!(index.rotation_group(), Some(256));
+        assert_eq!(index.len(), 1);
+    }
+
+    /// A group width `fast_hadamard` would panic on must be a parse/serialise error instead.
+    #[test]
+    fn non_power_of_two_rotation_group_is_refused_on_both_sides() {
+        let rows = one_tensor();
+        let tensors: &[(&str, &[SaltRow])] = &[("w", &rows)];
+        assert!(write_rotated_salt_bundle(tensors, 300).is_err());
+        assert!(write_rotated_salt_bundle(tensors, 0).is_err());
+
+        let mut corrupt = write_rotated_salt_bundle(tensors, 256).expect("write");
+        corrupt[6] = 0x2C; // 300 -> not a power of two
+        corrupt[7] = 0x01;
+        assert!(
+            SaltBundleIndex::new(&corrupt).is_err(),
+            "a bundle claiming a non-power-of-two rotation group must not parse"
+        );
+    }
+
+    /// Rotated bundles must round-trip their payload unchanged; only the header differs.
+    #[test]
+    fn rotation_changes_only_the_header() {
+        let rows = one_tensor();
+        let tensors: &[(&str, &[SaltRow])] = &[("w", &rows)];
+        let plain = write_salt_bundle(tensors).expect("plain");
+        let rotated = write_rotated_salt_bundle(tensors, 256).expect("rotated");
+        // The rotated header is two bytes longer (the u16 group); everything after matches.
+        assert_eq!(rotated.len(), plain.len() + 2);
+        assert_eq!(&rotated[6 + 2..], &plain[6..]);
+    }
 }
 
 #[cfg(test)]

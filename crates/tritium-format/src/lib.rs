@@ -117,9 +117,9 @@ pub use salt::{
     unpack_salt_row, unpack_salt_row_prefix,
 };
 pub use salt_bundle::{
-    PackedSaltTensor, SALT_BUNDLE_MAGIC, SALT_BUNDLE_VERSION, SaltBundleIndex, SaltTensor,
-    SaltTensorView, read_salt_bundle, read_salt_bundle_prefix, write_progressive_salt_bundle,
-    write_salt_bundle,
+    PackedSaltTensor, SALT_BUNDLE_MAGIC, SALT_BUNDLE_VERSION, SALT_BUNDLE_VERSION_ROTATED,
+    SaltBundleIndex, SaltTensor, SaltTensorView, read_salt_bundle, read_salt_bundle_prefix,
+    write_progressive_salt_bundle, write_rotated_salt_bundle, write_salt_bundle,
 };
 pub use salt_bundle_reader::{
     PackedSaltStorageRequirements, SaltBundleReadError, SaltBundleReader, SaltBundleTensorInfo,
