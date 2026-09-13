@@ -150,11 +150,18 @@ impl ModelWeights {
         // The token table is one packed allocation shared by gather and the tied head. Validate
         // its declared config geometry before any model assembly.
         let n_embd = config.n_embd as usize;
+        // Read once, before anything consumes the source: rotation is a property of the bundle, not
+        // of any one tensor, and both the token table and every projection need it.
+        let rotation_group = source.rotation_group()?;
         let embedding_matrix =
             source.matrix(NameSchema::Hf.top("token_embd"), declared_vocab, n_embd)?;
         let embedding_rows = embedding_matrix.n_out();
-        let token_embd =
-            TokenEmbedding::from_packed_matrix(embedding_matrix, embedding_rows, n_embd)?;
+        let token_embd = TokenEmbedding::from_packed_matrix(
+            embedding_matrix,
+            embedding_rows,
+            n_embd,
+            rotation_group,
+        )?;
 
         // Only 1D norms come from the fp master.
         let provider = |name: &str, request: DenseTensorRequest| -> Result<Vec<f32>, NnError> {
@@ -174,6 +181,7 @@ impl ModelWeights {
             |name, n_out, k_in| {
                 Ok(Projection::Salt(SaltLinear::from_packed_matrix(
                     source.matrix(name, Some(n_out), k_in)?,
+                    rotation_group,
                 )))
             },
         )?;
@@ -187,6 +195,22 @@ enum SaltTensorSource {
 }
 
 impl SaltTensorSource {
+    /// The Hadamard group width the artifact was fitted under, if it records one.
+    ///
+    /// Only TSLB carries this. A SALT-GGUF artifact has no rotation field, so it reports `None` and
+    /// is therefore assumed to be an unrotated fit — which is what every GGUF export has been.
+    fn rotation_group(&self) -> Result<Option<usize>, NnError> {
+        match self {
+            Self::Bundle(reader) => {
+                let reader = reader.try_borrow().map_err(|_| {
+                    NnError::Backend("reentrant SALT bundle header read".to_owned())
+                })?;
+                Ok(reader.rotation_group().map(usize::from))
+            }
+            Self::Gguf(_) => Ok(None),
+        }
+    }
+
     fn matrix(
         &self,
         name: &str,

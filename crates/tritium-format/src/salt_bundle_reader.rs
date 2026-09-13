@@ -10,8 +10,9 @@ use core::fmt;
 use std::io::{ErrorKind, Read, Seek, SeekFrom};
 
 use crate::{
-    FormatError, PackedSaltRowRef, SALT_BUNDLE_MAGIC, SALT_BUNDLE_VERSION, SALT_HEADER_BYTES,
-    SALT_PROGRESSIVE_VERSION, SALT_VERSION, TQ2_0_BLOCK_BYTES, num_blocks,
+    FormatError, PackedSaltRowRef, SALT_BUNDLE_MAGIC, SALT_BUNDLE_VERSION,
+    SALT_BUNDLE_VERSION_ROTATED, SALT_HEADER_BYTES, SALT_PROGRESSIVE_VERSION, SALT_VERSION,
+    TQ2_0_BLOCK_BYTES, num_blocks,
 };
 
 const MAX_TENSORS: u64 = 1_000_000;
@@ -229,6 +230,18 @@ impl SaltBundleTensorInfo {
 pub struct SaltBundleReader<R> {
     source: Source<R>,
     tensors: Vec<IndexedTensor>,
+    rotation_group: Option<u16>,
+}
+
+impl<R> SaltBundleReader<R> {
+    /// The Hadamard group width the weights were fitted under, if any.
+    ///
+    /// `Some(g)` obliges the runtime to rotate each `g`-wide slice of the activation before
+    /// projecting — the stored weights are `W·H` and `H·H = I`, so `W·x = (W·H)·(H·x)`.
+    #[must_use]
+    pub const fn rotation_group(&self) -> Option<u16> {
+        self.rotation_group
+    }
 }
 
 impl<R: Read + Seek> SaltBundleReader<R> {
@@ -243,10 +256,20 @@ impl<R: Read + Seek> SaltBundleReader<R> {
             return Err(FormatError::SaltBadMagic.into());
         }
         let version = source.u8("read version")?;
-        if version != SALT_BUNDLE_VERSION {
+        if version != SALT_BUNDLE_VERSION && version != SALT_BUNDLE_VERSION_ROTATED {
             return Err(FormatError::UnsupportedSaltVersion(version).into());
         }
         let _reserved = source.u8("read reserved byte")?;
+        let rotation_group = if version == SALT_BUNDLE_VERSION_ROTATED {
+            let group = source.u16("read rotation group")?;
+            // `fast_hadamard` asserts a power-of-two length; refuse it here instead.
+            if group == 0 || !group.is_power_of_two() {
+                return Err(FormatError::UnsupportedSaltVersion(version).into());
+            }
+            Some(group)
+        } else {
+            None
+        };
         let tensor_count = u64::from(source.u32("read tensor count")?);
         enforce_limit("tensor count", tensor_count, MAX_TENSORS)?;
         let minimum_index_end = tensor_count
@@ -390,6 +413,7 @@ impl<R: Read + Seek> SaltBundleReader<R> {
         Ok(Self {
             source,
             tensors: entries,
+            rotation_group,
         })
     }
 

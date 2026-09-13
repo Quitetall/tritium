@@ -82,7 +82,7 @@ fn eval_tokens(path: &Path) -> Vec<u32> {
         .collect()
 }
 
-fn convert(model: &Path, out: &Path, corpus: &Path, alpha: f64) {
+fn convert_with(model: &Path, out: &Path, corpus: &Path, alpha: f64, rotate: bool) {
     let _ = std::fs::remove_dir_all(out);
     let mut cmd = Command::new(tritium_bin());
     cmd.args([
@@ -98,13 +98,33 @@ fn convert(model: &Path, out: &Path, corpus: &Path, alpha: f64) {
         "--fold-alpha",
         &alpha.to_string(),
     ]);
-    // alpha = 0 is the identity fold, so a corpus would only cost time — and passing one anyway
-    // would make the two arms differ in more than the knob under test.
+    if !rotate {
+        cmd.arg("--no-rotation");
+    }
     if alpha != 0.0 {
         cmd.args(["--calib", corpus.to_str().unwrap()]);
     }
     let status = cmd.status().expect("run tritium convert");
-    assert!(status.success(), "convert failed at alpha={alpha}");
+    assert!(
+        status.success(),
+        "convert failed at alpha={alpha} rotate={rotate}"
+    );
+}
+
+fn convert(model: &Path, out: &Path, corpus: &Path, alpha: f64) {
+    // Historic arms predate rotation and must stay in the original basis to remain comparable.
+    // `alpha = 0` is the identity fold, so a corpus would only cost time — and passing one anyway
+    // would make the two arms differ in more than the knob under test.
+    convert_with(model, out, corpus, alpha, false);
+}
+
+/// The Hadamard group an artifact declares, or `None` for an unrotated (version-1) bundle.
+fn bundle_rotation_group(dir: &Path) -> Option<usize> {
+    let file = std::fs::File::open(dir.join("model.tslb")).expect("open bundle");
+    tritium_format::SaltBundleReader::new_strict(std::io::BufReader::new(file))
+        .expect("parse bundle")
+        .rotation_group()
+        .map(usize::from)
 }
 
 fn score(mut runner: ModelRunner, tokens: &[u32]) -> f64 {
@@ -189,4 +209,81 @@ fn converted_model_scores_like_the_fitter_that_made_it() {
     );
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// **Does rotation survive into the artifact, and is it worth what the tape said?**
+///
+/// The tape measured rotation at **21.1% at T=3** and 1.6% at T=4 on SmolLM2-135M. That number was
+/// unreachable from any artifact until the bundle learned to record a rotation group: a rotated fit
+/// stores codes in the rotated basis, and a runtime that does not rotate the activation computes
+/// `W·H·x` instead of `W·x` — silently.
+///
+/// This asserts the loop is closed end to end. Both arms are converted the same way and scored
+/// through the same `ModelRunner`, so the int8-activation factor that makes an absolute tape anchor
+/// unusable here (see the header) divides out: what is left is rotation alone.
+///
+/// Deliberately a **ratio with a loose floor**, not an anchor. `convert` runs at `--planes 4
+/// --group 256` where the tape measured rotation worth only ~1.6%, and the artifact adds A8 on top,
+/// so demanding the tape's T=3 figure would be asserting a number nobody measured in this
+/// configuration. The claim under test is directional and falsifiable: rotation must not make the
+/// artifact worse, and the bundle must round-trip as a rotated one.
+#[test]
+#[ignore = "two full evaluations of a real model on CPU"]
+fn rotation_reaches_the_artifact_and_does_not_cost_quality() {
+    let model = PathBuf::from(
+        std::env::var("TRITIUM_MODEL_DIR").expect("set TRITIUM_MODEL_DIR to an fp model directory"),
+    );
+    let corpus = PathBuf::from(
+        std::env::var("TRITIUM_CORPUS").expect("set TRITIUM_CORPUS to a corpus json"),
+    );
+    let tokens = eval_tokens(&corpus);
+    assert_eq!(tokens.len(), EVAL_TOKENS, "corpus is too small");
+    let tmp = std::env::temp_dir().join(format!("tritium-rot-{}", std::process::id()));
+    let plain = tmp.join("plain");
+    let rotated = tmp.join("rotated");
+
+    // Same fold on both arms so rotation is the only difference.
+    convert_with(&model, &plain, &corpus, 0.75, false);
+    convert_with(&model, &rotated, &corpus, 0.75, true);
+
+    // The artifact must SAY it is rotated, or the runtime will not rotate and the codes are wrong.
+    // Asked through the reader rather than by indexing a header byte, so a future header field
+    // cannot leave this assertion quietly reading something else.
+    assert_eq!(
+        bundle_rotation_group(&rotated),
+        Some(256),
+        "a rotated conversion must record its Hadamard group; without it the runtime reconstructs \
+         W·H and the model is silently wrong"
+    );
+    assert_eq!(
+        bundle_rotation_group(&plain),
+        None,
+        "--no-rotation must still write a bundle that declares no rotation, which is what every \
+         reader predating version 2 can load"
+    );
+
+    let ppl_plain = score_converted(&plain, &tokens);
+    let ppl_rotated = score_converted(&rotated, &tokens);
+    let _ = std::fs::remove_dir_all(&tmp);
+
+    println!(
+        "convert --planes 4 --group 256 --fold-alpha 0.75\n  \
+         unrotated (v1) {ppl_plain:.4}\n  rotated   (v2) {ppl_rotated:.4}   ({:+.2}%)",
+        100.0 * (ppl_rotated - ppl_plain) / ppl_plain
+    );
+
+    assert!(
+        ppl_rotated.is_finite() && ppl_rotated > 0.0,
+        "rotated artifact scored {ppl_rotated}, which means the runtime rotation and the fit \
+         disagree — the codes are in one basis and the activation in the other"
+    );
+    // A 1% tolerance, not equality: rotation changes the fit, and at T=4/g256 the tape put its
+    // worth at ~1.6%, which A8 can plausibly mask. A wrong-basis runtime would be off by orders of
+    // magnitude, not percent, so this still catches the failure it exists to catch.
+    assert!(
+        ppl_rotated <= ppl_plain * 1.01,
+        "rotation made the artifact WORSE ({ppl_plain:.4} -> {ppl_rotated:.4}). The tape says \
+         rotation helps, so this means the runtime is not applying the same transform the fitter \
+         did — check group width and the order of rotate-then-quantize."
+    );
 }

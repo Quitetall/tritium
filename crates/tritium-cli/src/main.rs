@@ -197,10 +197,39 @@ enum Command {
         /// Calibration tokens to use (rounded down to whole 512-token windows).
         #[arg(long, default_value_t = 4096)]
         calib_tokens: usize,
-        /// Salience-fold strength. 0.75 is the value every published SALT number used, but the
-        /// optimum shifts DOWN with model size (0.75 -> 0.50 observed), so it is worth sweeping.
+        /// Salience-fold strength. 0.75 is the value every published SALT number used.
+        ///
+        /// Requires `--calib`, because there is no salience to fold without activation statistics.
+        /// Pass `--fold-alpha 0` to convert without it.
+        ///
+        /// The fold is **conditional on rotation**, not independent of it. Measured on
+        /// SmolLM2-135M, WikiText-2 full 32,768-token split, all four corners:
+        ///
+        /// | config | T=3 | T=4 |
+        /// |---|---|---|
+        /// | fold + rotation (the default) | **1.071x** | **1.013x** |
+        /// | rotation only | 1.167x | 1.018x |
+        /// | fold only | 1.297x | 1.029x |
+        /// | neither | 1.246x | 1.023x |
+        ///
+        /// Read the third row against the fourth: with no Hadamard the fold makes the artifact
+        /// WORSE, because it deliberately distorts weights (51% worse weight-space error) to
+        /// protect the channels activations excite, and the rotation is what re-conditions that
+        /// distortion for the ladder's rigid 1/3 spacing. So `--no-rotation --fold-alpha 0.75` is
+        /// the worst of the four and prints a warning; rotation is on by default, which is why
+        /// this is 0.75 again.
         #[arg(long, default_value_t = 0.75)]
         fold_alpha: f64,
+        /// Fit in the original basis instead of the Hadamard-rotated one.
+        ///
+        /// Rotation is on by default because it is worth **21.1% at T=3** (1.071x fp against
+        /// 1.297x) and because the salience fold depends on it — the fold deliberately distorts
+        /// weights and the Hadamard is what re-conditions them for the ladder's rigid 1/3 spacing.
+        /// A rotated artifact is a version-2 bundle, which readers that cannot rotate reject
+        /// outright rather than silently computing `W·H·x`. Pass this only to reproduce the old
+        /// unrotated artifact.
+        #[arg(long)]
+        no_rotation: bool,
         /// Plane count. 4 measures 1.024x fp on SmolLM2-360M without any fold; 3 measures 1.335x.
         #[arg(long, default_value_t = 4)]
         planes: usize,
@@ -555,6 +584,7 @@ fn main() -> anyhow::Result<()> {
             calib,
             calib_tokens,
             fold_alpha,
+            no_rotation,
             planes,
             group,
             grid,
@@ -569,6 +599,7 @@ fn main() -> anyhow::Result<()> {
                     planes,
                     group,
                     grid,
+                    rotate: !no_rotation,
                 },
             },
         )?,
@@ -597,6 +628,9 @@ fn main() -> anyhow::Result<()> {
                 planes,
                 group,
                 grid,
+                // `quantize` writes a version-1 bundle and has no calibration path, so it stays in
+                // the original basis. Rotation lives on `convert`, which can also fold.
+                rotate: false,
             },
         )?,
     }
