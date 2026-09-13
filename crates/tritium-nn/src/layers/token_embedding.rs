@@ -7,6 +7,7 @@ use std::sync::Arc;
 use rayon::prelude::*;
 use tritium_format::PackedSaltRow;
 use tritium_spec::TernaryBackend;
+use tritium_train::ops::ste::fast_hadamard;
 
 use crate::error::NnError;
 use crate::layers::HostSaltV2Linear;
@@ -33,7 +34,30 @@ enum Storage {
 pub struct TokenEmbedding {
     rows: usize,
     cols: usize,
+    /// Hadamard group width the table was fitted under, when the artifact records one.
+    ///
+    /// A rotated fit stores codes for `H·w`, so this table is **not** in the model's basis. That
+    /// matters differently for the two things it feeds. The tied head is a projection, so `H` can
+    /// move onto the activation: `(H·c)·h = c·(H·h)`. Gather has no activation to move it onto, so
+    /// the gathered row has to be rotated back before it enters the residual stream. Getting
+    /// either one wrong is silent — the model loads, runs, and emits noise.
+    rotation: Option<usize>,
     storage: Storage,
+}
+
+/// Apply the fitter's per-group Hadamard across one `cols`-wide row, in place.
+///
+/// `H` is its own inverse at normalized scale, so this is both the forward and the reverse. The
+/// group rule is `fit_group_geometric_rotated`'s: a group turns only when its own length is a power
+/// of two greater than one, which leaves a short tail (SmolLM2 is 576 wide at `g256`) in the
+/// original basis. Rotating a tail the fitter left alone is exactly as wrong as skipping a group it
+/// turned, and `fast_hadamard` asserts on a non-power-of-two length besides.
+fn rotate_row(row: &mut [f32], group: usize) {
+    for slice in row.chunks_mut(group) {
+        if slice.len().is_power_of_two() && slice.len() > 1 {
+            fast_hadamard(slice);
+        }
+    }
 }
 
 impl TokenEmbedding {
@@ -53,6 +77,7 @@ impl TokenEmbedding {
         Ok(Self {
             rows,
             cols,
+            rotation: None,
             storage: Storage::HostSaltV2(tensor),
         })
     }
@@ -79,14 +104,19 @@ impl TokenEmbedding {
         Ok(Self {
             rows,
             cols,
+            rotation: None,
             storage: Storage::SaltV2(tensor),
         })
     }
 
+    /// Build a token table around a packed SALT matrix, carrying the bundle's rotation group.
+    ///
+    /// `rotation` is `Some(group)` only for a version-2 (rotated) TSLB bundle. See the field.
     pub(crate) fn from_packed_matrix(
         matrix: PackedSaltMatrix,
         rows: usize,
         cols: usize,
+        rotation: Option<usize>,
     ) -> Result<Self, NnError> {
         if matrix.n_out() != rows || matrix.k_in() != cols {
             return Err(NnError::Shape {
@@ -97,6 +127,7 @@ impl TokenEmbedding {
         Ok(Self {
             rows,
             cols,
+            rotation,
             storage: Storage::Salt(matrix),
         })
     }
@@ -119,6 +150,7 @@ impl TokenEmbedding {
         Ok(Self {
             rows,
             cols,
+            rotation: None,
             storage: Storage::Dense(values),
         })
     }
@@ -136,6 +168,7 @@ impl TokenEmbedding {
         Ok(Self {
             rows,
             cols,
+            rotation: None,
             storage: Storage::Salt(PackedSaltMatrix::new(rows_data, rows, cols)?),
         })
     }
@@ -216,7 +249,15 @@ impl TokenEmbedding {
     /// for an out-of-vocabulary token.
     pub fn gather(&self, tokens: &[u32], out: &mut [f32]) -> Result<(), NnError> {
         match &self.storage {
-            Storage::Salt(matrix) => matrix.gather(tokens, out),
+            Storage::Salt(matrix) => {
+                matrix.gather(tokens, out)?;
+                // The decoded row is `H·w`; the residual stream wants `w`.
+                if let Some(group) = self.rotation {
+                    out.par_chunks_mut(self.cols)
+                        .for_each(|row| rotate_row(row, group));
+                }
+                Ok(())
+            }
             Storage::HostSaltV2(tensor) => tensor.gather_rows(tokens, out),
             #[cfg(feature = "cuda")]
             Storage::SaltV2(_) => Err(NnError::Backend(
@@ -319,7 +360,16 @@ impl TokenEmbedding {
             });
         }
         match &self.storage {
-            Storage::Salt(matrix) => matrix.project_exact(hidden, logits),
+            Storage::Salt(matrix) => match self.rotation {
+                // `(H·c)·h = c·(H·h)` — move the Hadamard onto the activation rather than
+                // reconstructing `vocab` rows just to turn them back.
+                Some(group) => {
+                    let mut rotated = hidden.to_vec();
+                    rotate_row(&mut rotated, group);
+                    matrix.project_exact(&rotated, logits)
+                }
+                None => matrix.project_exact(hidden, logits),
+            },
             Storage::HostSaltV2(tensor) => tensor.forward(hidden, 1, logits),
             #[cfg(feature = "cuda")]
             Storage::SaltV2(_) => Err(NnError::Backend(

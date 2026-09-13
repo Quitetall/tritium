@@ -80,6 +80,7 @@ use anyhow::{Context, Result, bail};
 use tritium_format::{SaltRow, salt_rows_to_dense, write_rotated_salt_bundle, write_salt_bundle};
 use tritium_nn::calibrate::{Calib, calibrate, extract, fold, norm_tensors, weight_names};
 use tritium_nn::{HfJsonTokenizer, ModelRunner, Tokenizer};
+use tritium_train::ops::ste::fast_hadamard;
 
 use crate::quantize_ladder::{LadderConfig, quantize_tensor_ladder};
 
@@ -123,7 +124,9 @@ pub(crate) fn run(model: &Path, out: &Path, cfg: &ConvertConfig) -> Result<()> {
         );
     }
 
-    if cfg.fold_alpha != 0.0 {
+    // Only when the Hadamard is absent. With rotation the fold is worth 21.1% at T=3, which
+    // is the opposite sign; printing this there would be actively misleading.
+    if cfg.fold_alpha != 0.0 && !cfg.ladder.rotate {
         // Measured 2026-09-12, SmolLM2-135M / WikiText-2 full split, against fold+rotation:
         //   T=3  fold+rot 1.071x | fold only 1.297x | neither 1.246x
         //   T=4  fold+rot 1.013x | fold only 1.029x | neither 1.023x
@@ -196,8 +199,21 @@ pub(crate) fn run(model: &Path, out: &Path, cfg: &ConvertConfig) -> Result<()> {
         // Score the PACKED rows, not a re-run of the fitter: the f16 block scales are rounded on
         // the way into TQ2_0, so decoding the artifact is the only way to report the error the
         // user's file actually has rather than the one the fit intended.
-        let decoded = salt_rows_to_dense(&fitted)
+        let mut decoded = salt_rows_to_dense(&fitted)
             .map_err(|e| anyhow::anyhow!("decode {name} for the fidelity receipt: {e}"))?;
+        // A rotated fit stores codes for `H·w`, so the raw decode is in the rotated basis and
+        // comparing it against `w` measures the Hadamard, not the quantizer — it reported 1.42
+        // relative error on a model whose real error is 0.038. `H` is its own inverse, so one more
+        // pass per group returns the original basis; the group rule is the fitter's, tail included.
+        if cfg.ladder.rotate {
+            for row in decoded.chunks_mut(k) {
+                for slice in row.chunks_mut(cfg.ladder.group) {
+                    if slice.len().is_power_of_two() && slice.len() > 1 {
+                        fast_hadamard(slice);
+                    }
+                }
+            }
+        }
         fidelity.push(TensorFidelity::measure(name, rows, k, w, &decoded)?);
         total_params += rows * k;
         quantized.push((name.clone(), fitted));
@@ -268,10 +284,17 @@ pub(crate) fn run(model: &Path, out: &Path, cfg: &ConvertConfig) -> Result<()> {
         })?;
 
     let bpw = cfg.ladder.realizable_bpw();
+    // The bundle version already encodes this, but the line a user reads should not have to
+    // be cross-checked against a byte offset.
+    let rotation_desc = if cfg.ladder.rotate {
+        format!("Hadamard per g{}", cfg.ladder.group)
+    } else {
+        "no rotation".to_owned()
+    };
     println!(
-        "converted {} tensors ({:.2}M params) | ladder geometric, {} planes, g{}, grid {}, no \
-         rotation, {fold_desc} → {} ({:.1} MiB bundle + {:.1} KiB norms + config + {copied_assets} \
-         tokenizer files, {bpw:.4} bpw)",
+        "converted {} tensors ({:.2}M params) | ladder geometric, {} planes, g{}, grid {}, \
+         {rotation_desc}, {fold_desc} → {} ({:.1} MiB bundle + {:.1} KiB norms + config + \
+         {copied_assets} tokenizer files, {bpw:.4} bpw)",
         names.len(),
         total_params as f64 / 1e6,
         cfg.ladder.planes,
@@ -381,9 +404,11 @@ fn write_receipt(
             "planes": cfg.ladder.planes,
             "group": cfg.ladder.group,
             "grid": cfg.ladder.grid,
-            // Recorded explicitly because its absence is load-bearing: the SALT bundle has nowhere
-            // to store a rotation matrix, so a rotated fit would reconstruct W*H instead of W.
-            "rotation": "none",
+            // Load-bearing either way. `fast_hadamard` is parameterless, so "hadamard" plus the
+            // group width is the whole transform — but a reader that ignores it reconstructs W*H
+            // instead of W, which is why the bundle version carries it too.
+            "rotation": if cfg.ladder.rotate { "hadamard" } else { "none" },
+            "rotation_group": if cfg.ladder.rotate { Some(cfg.ladder.group) } else { None },
             "fold_alpha": if cfg.calib.is_some() { cfg.fold_alpha } else { 0.0 },
             "calibration": fold_desc,
         },
