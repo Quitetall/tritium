@@ -410,7 +410,8 @@ config:
   -V, --version             print version and source identity
 
 precedence: defaults < --config JSON < TRITIUM_* environment < CLI flags.
-Every flag has a TRITIUM_* twin (e.g. --batch-slots / TRITIUM_BATCH_SLOTS).
+Every flag has a TRITIUM_* twin (e.g. --converted / TRITIUM_CONVERTED,
+--batch-slots / TRITIUM_BATCH_SLOTS).
 Performance knobs (TRITIUM_KERNEL_TIER, TRITIUM_KV, TRITIUM_TREE_NB,
 TRITIUM_LM_HEAD, TRITIUM_WEIGHTS, TRITIUM_SPEC_ADAPTIVE, ...) are engine
 env vars documented in docs/book/src/environment.md and docs/BENCHMARKS.md.";
