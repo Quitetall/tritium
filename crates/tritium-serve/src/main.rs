@@ -1,9 +1,11 @@
-//! The `tritium-serve` binary: load a strict schema-v3 Qwen bundle or an
-//! explicitly legacy GGUF model and serve OpenAI HTTP/SSE.
+//! The `tritium-serve` binary: load a strict schema-v3 Qwen bundle, a converted
+//! Hugging Face SALT directory, or an explicitly legacy GGUF model and serve
+//! OpenAI HTTP/SSE.
 //!
 //! Production usage: `tritium-serve --bundle <schema-v3-dir> --profile
-//! compact-v1 [--backend cpu|cuda]`. `--model <path.gguf>` retains compatibility
-//! serving but cannot satisfy production readiness.
+//! compact-v1 [--backend cpu|cuda]`. `--converted <dir>` serves local
+//! `tritium convert` output; `--model <path.gguf>` retains compatibility
+//! serving but neither local path satisfies production readiness.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -28,6 +30,7 @@ const DESTRUCTIVE_CUDA_LOSS_ENV: &str = "TRITIUM_DESTRUCTIVE_CUDA_LOSS_QUALIFICA
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 struct FileConfig {
     model: Option<String>,
+    converted: Option<String>,
     bundle: Option<String>,
     profile: Option<String>,
     backend: Option<String>,
@@ -56,6 +59,7 @@ struct FileConfig {
 #[derive(Debug)]
 struct LaunchConfig {
     model_path: Option<String>,
+    converted_path: Option<String>,
     bundle_path: Option<String>,
     profile: String,
     backend_name: String,
@@ -85,6 +89,7 @@ impl Default for LaunchConfig {
     fn default() -> Self {
         Self {
             model_path: None,
+            converted_path: None,
             bundle_path: None,
             profile: "compact-v1".to_owned(),
             backend_name: "cpu".to_owned(),
@@ -173,6 +178,9 @@ fn parse_env_bool(name: &str) -> Result<Option<bool>, Box<dyn std::error::Error>
 fn apply_file_config(config: FileConfig, launch: &mut LaunchConfig) {
     if let Some(value) = config.model {
         launch.model_path = Some(value);
+    }
+    if let Some(value) = config.converted {
+        launch.converted_path = Some(value);
     }
     if let Some(value) = config.bundle {
         launch.bundle_path = Some(value);
@@ -265,6 +273,7 @@ fn apply_env_config(launch: &mut LaunchConfig) -> Result<(), Box<dyn std::error:
         };
     }
     env_string!("TRITIUM_MODEL", launch.model_path);
+    env_string!("TRITIUM_CONVERTED", launch.converted_path);
     env_string!("TRITIUM_BUNDLE", launch.bundle_path);
     if let Some(value) = std::env::var_os("TRITIUM_PROFILE") {
         launch.profile = value
@@ -356,11 +365,12 @@ fn validate_bind_addresses(
 const HELP: &str = "\
 tritium-serve — OpenAI-compatible HTTP/SSE server for Tritium ternary models
 
-usage: tritium-serve (--bundle <schema-v3-dir> | --model <legacy.gguf>) [options]
+usage: tritium-serve (--bundle <schema-v3-dir> | --model <legacy.gguf> | --converted <dir>) [options]
 
 model source (exactly one):
   --bundle <dir>            strict schema-v3 Qwen bundle (production path)
   --model <path.gguf>       legacy GGUF model (compatibility serving)
+  --converted <dir>         directory written by `tritium convert` (local path)
 
 serving:
   --backend <name>          compute backend: cpu (default) | cuda
@@ -458,6 +468,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     apply_env_config(&mut launch)?;
     let LaunchConfig {
         mut model_path,
+        mut converted_path,
         mut bundle_path,
         mut profile,
         mut backend_name,
@@ -503,6 +514,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let _ = val::<String>(args.next(), "--config")?;
             }
             "--model" => model_path = Some(val::<String>(args.next(), "--model")?),
+            "--converted" => converted_path = Some(val::<String>(args.next(), "--converted")?),
             "--bundle" => bundle_path = Some(val::<String>(args.next(), "--bundle")?),
             "--profile" => profile = val::<String>(args.next(), "--profile")?,
             "--backend" => backend_name = val::<String>(args.next(), "--backend")?,
@@ -553,9 +565,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    if model_path.is_some() == bundle_path.is_some() {
+    let source_count = [
+        model_path.is_some(),
+        converted_path.is_some(),
+        bundle_path.is_some(),
+    ]
+    .into_iter()
+    .filter(|present| *present)
+    .count();
+    if source_count != 1 {
         return Err(
-            "provide exactly one of --bundle <schema-v3-dir> or --model <legacy.gguf>".into(),
+            "provide exactly one of --bundle <schema-v3-dir>, --model <legacy.gguf>, or --converted <dir>".into(),
         );
     }
     // One identifying line before any multi-gigabyte load: version + source.
@@ -661,6 +681,36 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             },
             Arc::new(tokenizer),
             tritium_serve::ChatTemplate::QwenIm,
+        )
+    } else if let Some(converted) = converted_path {
+        if raw_tokens
+            || spec_lookup
+            || draft_model.is_some()
+            || batch_slots != 1
+            || kv_pool_tokens.is_some()
+        {
+            return Err("--converted forbids --raw-tokens, --spec, --draft-model, --batch-slots != 1, and --kv-pool-tokens".into());
+        }
+        let dir = std::path::Path::new(&converted);
+        let bundle = dir.join("model.tslb");
+        if !bundle.is_file() {
+            return Err(format!("--converted {converted}: missing model.tslb").into());
+        }
+        eprintln!("tritium-serve: loading converted model {converted} on `{backend_name}`...");
+        let backend =
+            init().map_err(|error| format!("backend `{backend_name}` failed to init: {error}"))?;
+        let runner = tritium_nn::ModelRunner::from_salt(dir, &bundle, backend)
+            .map_err(|error| format!("--converted {converted}: {error}"))?;
+        let tokenizer = tritium_nn::HfJsonTokenizer::from_files(
+            &dir.join("tokenizer.json"),
+            &dir.join("tokenizer_config.json"),
+        )
+        .map_err(|error| format!("--converted {converted}: tokenizer: {error}"))?;
+        eos = tritium_nn::Tokenizer::eos(&tokenizer);
+        (
+            LoadedModel::Legacy(Box::new(runner)),
+            Arc::new(tokenizer),
+            tritium_serve::ChatTemplate::Concat,
         )
     } else {
         let model_path = model_path.expect("exactly-one validation established legacy path");
