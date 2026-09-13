@@ -9,6 +9,31 @@ exact byte accounting and receipt-backed benchmarks.
 See the [repository README](https://github.com/Quitetall/tritium#readme) and the
 [book](https://github.com/Quitetall/tritium/tree/main/docs/book) for usage.
 
+## Local converted models
+
+`tritium convert` directories can be served locally with the same OpenAI wire
+contract. This path loads `model.tslb`, `config.json`, and the copied HF
+tokenizer; it is a compatibility path and does not claim schema-v3 production
+admission or release qualification.
+
+```bash
+target/release/tritium-serve \
+  --converted /models/my-converted-model \
+  --backend cpu \
+  --model-id local-ternary \
+  --port 8099
+```
+
+```bash
+curl http://127.0.0.1:8099/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"model":"local-ternary","messages":[{"role":"user","content":"Hello"}],"max_tokens":32}'
+```
+
+`TRITIUM_CONVERTED` and the `converted` JSON configuration key provide the
+same model-path setting. `--converted` cannot be combined with speculative
+decoding, batching, raw token mode, or a draft model.
+
 ## Deployment configuration
 
 Launch configuration is fail-closed and has one precedence order:
