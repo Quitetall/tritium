@@ -156,13 +156,12 @@ impl ModelWeights {
         let embedding_matrix =
             source.matrix(NameSchema::Hf.top("token_embd"), declared_vocab, n_embd)?;
         let embedding_rows = embedding_matrix.n_out();
-        let token_embd =
-            TokenEmbedding::from_packed_matrix(
-                embedding_matrix,
-                embedding_rows,
-                n_embd,
-                rotation_group,
-            )?;
+        let token_embd = TokenEmbedding::from_packed_matrix(
+            embedding_matrix,
+            embedding_rows,
+            n_embd,
+            rotation_group,
+        )?;
 
         // Only 1D norms come from the fp master.
         let provider = |name: &str, request: DenseTensorRequest| -> Result<Vec<f32>, NnError> {
