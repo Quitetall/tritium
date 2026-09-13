@@ -122,8 +122,15 @@ def _run_with_fake_cargo(tmp_path, exit_code):
 
 
 def test_report_mode_tolerates_findings(tmp_path):
-    """Exit 1 means the checker RAN and found breaking changes: report, pass."""
+    """Legacy exit 1 means checker RAN and found breaking changes: report, pass."""
     completed = _run_with_fake_cargo(tmp_path, 1)
+    assert completed.returncode == 0
+    assert "BREAKING CHANGES REPORTED" in completed.stdout
+
+
+def test_report_mode_tolerates_modern_findings_exit_code(tmp_path):
+    """cargo-semver-checks 0.50+ uses exit 100 for deny-level findings."""
+    completed = _run_with_fake_cargo(tmp_path, 100)
     assert completed.returncode == 0
     assert "BREAKING CHANGES REPORTED" in completed.stdout
 
