@@ -32,10 +32,19 @@
 //! | `model.tslb` | the SALT bundle: embedding + every projection |
 //! | tokenizer assets | copied when present, so the directory is usable on its own |
 //!
-//! This is the same asymmetry that makes the Hadamard rotation unrepresentable — a rotated fit
-//! reconstructs `W·H` and the bundle has nowhere to record `H`. The fold escapes it only because
-//! its other half lands in a tensor the format already carries. Rotation stays off here for
-//! exactly that reason.
+//! Rotation used to be excluded for a related reason — a rotated fit reconstructs `W·H`, and the
+//! v1 bundle had nowhere to say so. That turned out to be a smaller gap than the doc claimed:
+//! `fast_hadamard` is a fixed, parameterless Walsh–Hadamard fully determined by the group width,
+//! so nothing has to record `H`, only **whether** and **how wide**. A version-2 bundle carries that
+//! one field, readers that predate it reject it outright rather than silently computing `W·H·x`,
+//! and rotation is now on by default. See `--no-rotation` to reproduce the old artifact.
+//!
+//! The runtime side is not symmetric, and the asymmetry is worth stating because getting it wrong
+//! is silent. A projection can move the Hadamard onto its activation — `(H·c)·x = c·(H·x)`, since
+//! `H` is symmetric and its own inverse — so `SaltLinear` rotates the activation before the int8
+//! grid. **Gather cannot**: an embedding row has no activation to move it onto, so `TokenEmbedding`
+//! un-rotates the decoded row instead. The tied head goes back to the projection rule, one
+//! `n_embd`-wide transform rather than `vocab` of them.
 //!
 //! # Reading the fidelity receipt
 //!
@@ -57,10 +66,10 @@
 //!
 //! | config | T=3 | T=4 | ships as |
 //! |---|---|---|---|
-//! | fold + rotation | **1.071×** | **1.013×** | every published number |
-//! | rotation only | 1.167× | 1.018× | — |
+//! | fold + rotation | **1.071×** | **1.013×** | every published number — **and now the default here** |
+//! | rotation only | 1.167× | 1.018× | `--fold-alpha 0` |
 //! | neither | 1.246× | 1.023× | `tritium quantize` |
-//! | **fold only** | **1.297×** | **1.029×** | **this command at `alpha > 0`** |
+//! | **fold only** | **1.297×** | **1.029×** | `--no-rotation` at `alpha > 0`, which warns |
 //!
 //! **The fold is conditional on rotation, not independent of it.** Added with the Hadamard present
 //! it removes a 9.03% deficit at T=3; added without it, it *opens* a 4.1% one (1.297× against
@@ -69,9 +78,19 @@
 //! channels activations excite, and the rotation is what re-conditions the distorted distribution
 //! for the ladder's rigid 1/3 spacing. Unrotated, that distortion is simply uncompensated.
 //!
-//! Hence `--fold-alpha` now defaults to **0**, and a warning is printed if it is set above it.
-//! Restore the default to 0.75 the moment the bundle can carry a rotation mask — the gap that
-//! closes is **21.1% at T=3**.
+//! `--fold-alpha` defaulted to **0** for exactly as long as this path could not rotate. It can now,
+//! so the default is **0.75** again and the warning fires only under `--no-rotation`, which is the
+//! one corner where the fold hurts.
+//!
+//! # What the published table does NOT include
+//!
+//! Every number above is weight-quantized with fp32 activations, measured through the research
+//! tape. `SaltLinear::forward` int8-quantizes the activation before every projection, and that is
+//! a further tax the table does not carry — +1.08% at T=4 on 360M, which as a fraction of the
+//! excess over fp *doubles* the gap. The end-to-end check that gates this path
+//! (`convert_roundtrip::rotation_reaches_the_artifact_and_does_not_cost_quality`) therefore scores
+//! through `ModelRunner`, A8 included: SmolLM2-135M at T=4/g256 with the fold, 29.3795 unrotated
+//! against **28.2470** rotated, and whole-model weight error 0.0382 → 0.0195.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -80,7 +99,7 @@ use anyhow::{Context, Result, bail};
 use tritium_format::{SaltRow, salt_rows_to_dense, write_rotated_salt_bundle, write_salt_bundle};
 use tritium_nn::calibrate::{Calib, calibrate, extract, fold, norm_tensors, weight_names};
 use tritium_nn::{HfJsonTokenizer, ModelRunner, Tokenizer};
-use tritium_train::ops::ste::fast_hadamard;
+use tritium_train::ops::ste::{fast_hadamard, group_is_rotatable};
 
 use crate::quantize_ladder::{LadderConfig, quantize_tensor_ladder};
 
@@ -203,12 +222,13 @@ pub(crate) fn run(model: &Path, out: &Path, cfg: &ConvertConfig) -> Result<()> {
             .map_err(|e| anyhow::anyhow!("decode {name} for the fidelity receipt: {e}"))?;
         // A rotated fit stores codes for `H·w`, so the raw decode is in the rotated basis and
         // comparing it against `w` measures the Hadamard, not the quantizer — it reported 1.42
-        // relative error on a model whose real error is 0.038. `H` is its own inverse, so one more
-        // pass per group returns the original basis; the group rule is the fitter's, tail included.
+        // relative error on a model whose real error is 0.0195. `H` is its own inverse, so one more
+        // pass per group returns the original basis. Must happen before `measure`, and `decoded`
+        // has no other reader.
         if cfg.ladder.rotate {
             for row in decoded.chunks_mut(k) {
                 for slice in row.chunks_mut(cfg.ladder.group) {
-                    if slice.len().is_power_of_two() && slice.len() > 1 {
+                    if group_is_rotatable(slice.len()) {
                         fast_hadamard(slice);
                     }
                 }

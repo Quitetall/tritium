@@ -197,24 +197,28 @@ enum Command {
         /// Calibration tokens to use (rounded down to whole 512-token windows).
         #[arg(long, default_value_t = 4096)]
         calib_tokens: usize,
-        /// Salience-fold strength. **Defaults to 0 because this path cannot rotate.**
+        /// Salience-fold strength. 0.75 is the value every published SALT number used.
         ///
-        /// 0.75 is the value every published SALT number used — but those numbers are fold AND
-        /// rotation, and the bundle cannot yet carry rotation. Measured on SmolLM2-135M,
-        /// WikiText-2, against the published fold+rotation configuration:
+        /// Requires `--calib`, because there is no salience to fold without activation statistics.
+        /// Pass `--fold-alpha 0` to convert without it.
+        ///
+        /// The fold is **conditional on rotation**, not independent of it. Measured on
+        /// SmolLM2-135M, WikiText-2 full 32,768-token split, all four corners:
         ///
         /// | config | T=3 | T=4 |
         /// |---|---|---|
-        /// | fold + rotation (published) | 1.071x | 1.013x |
-        /// | fold only (what this path emits at alpha>0) | **1.297x** | **1.029x** |
-        /// | neither (alpha = 0) | 1.246x | 1.023x |
+        /// | fold + rotation (the default) | **1.071x** | **1.013x** |
+        /// | rotation only | 1.167x | 1.018x |
+        /// | fold only | 1.297x | 1.029x |
+        /// | neither | 1.246x | 1.023x |
         ///
-        /// The fold makes things WORSE without rotation — 1.297x against 1.246x at T=3 — because
-        /// it deliberately distorts weights (51% worse weight-space error) to protect channels
-        /// activations excite, and the Hadamard is what re-conditions the result for the ladder's
-        /// rigid 1/3 spacing. With no rotation that distortion is uncompensated. Set alpha > 0
-        /// only to reproduce that measurement; a warning is printed.
-        #[arg(long, default_value_t = 0.0)]
+        /// Read the third row against the fourth: with no Hadamard the fold makes the artifact
+        /// WORSE, because it deliberately distorts weights (51% worse weight-space error) to
+        /// protect the channels activations excite, and the rotation is what re-conditions that
+        /// distortion for the ladder's rigid 1/3 spacing. So `--no-rotation --fold-alpha 0.75` is
+        /// the worst of the four and prints a warning; rotation is on by default, which is why
+        /// this is 0.75 again.
+        #[arg(long, default_value_t = 0.75)]
         fold_alpha: f64,
         /// Fit in the original basis instead of the Hadamard-rotated one.
         ///

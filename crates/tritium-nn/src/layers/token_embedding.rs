@@ -7,7 +7,7 @@ use std::sync::Arc;
 use rayon::prelude::*;
 use tritium_format::PackedSaltRow;
 use tritium_spec::TernaryBackend;
-use tritium_train::ops::ste::fast_hadamard;
+use tritium_train::ops::ste::{fast_hadamard, group_is_rotatable};
 
 use crate::error::NnError;
 use crate::layers::HostSaltV2Linear;
@@ -47,14 +47,11 @@ pub struct TokenEmbedding {
 
 /// Apply the fitter's per-group Hadamard across one `cols`-wide row, in place.
 ///
-/// `H` is its own inverse at normalized scale, so this is both the forward and the reverse. The
-/// group rule is `fit_group_geometric_rotated`'s: a group turns only when its own length is a power
-/// of two greater than one, which leaves a short tail (SmolLM2 is 576 wide at `g256`) in the
-/// original basis. Rotating a tail the fitter left alone is exactly as wrong as skipping a group it
-/// turned, and `fast_hadamard` asserts on a non-power-of-two length besides.
+/// `H` is its own inverse at normalized scale, so this is both the forward and the reverse, and
+/// [`group_is_rotatable`] is the fitter's own rule rather than a copy of it.
 fn rotate_row(row: &mut [f32], group: usize) {
     for slice in row.chunks_mut(group) {
-        if slice.len().is_power_of_two() && slice.len() > 1 {
+        if group_is_rotatable(slice.len()) {
             fast_hadamard(slice);
         }
     }

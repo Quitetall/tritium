@@ -150,6 +150,9 @@ impl ModelWeights {
         // The token table is one packed allocation shared by gather and the tied head. Validate
         // its declared config geometry before any model assembly.
         let n_embd = config.n_embd as usize;
+        // Read once, before anything consumes the source: rotation is a property of the bundle, not
+        // of any one tensor, and both the token table and every projection need it.
+        let rotation_group = source.rotation_group()?;
         let embedding_matrix =
             source.matrix(NameSchema::Hf.top("token_embd"), declared_vocab, n_embd)?;
         let embedding_rows = embedding_matrix.n_out();
@@ -158,7 +161,7 @@ impl ModelWeights {
                 embedding_matrix,
                 embedding_rows,
                 n_embd,
-                source.rotation_group()?,
+                rotation_group,
             )?;
 
         // Only 1D norms come from the fp master.
@@ -170,8 +173,6 @@ impl ModelWeights {
             };
             shards.tensor_f32_exact(name, &[len])
         };
-        // Read once, outside the per-tensor closure: rotation is a property of the bundle.
-        let rotation_group = source.rotation_group()?;
         let weights = build_standard_model_with_embedding(
             &config,
             &spec,

@@ -6,7 +6,7 @@
 //! fp32 matrix.
 
 use tritium_format::{PackedSaltRow, SaltRow};
-use tritium_train::ops::ste::fast_hadamard;
+use tritium_train::ops::ste::{fast_hadamard, group_is_rotatable};
 
 use crate::error::NnError;
 use crate::layers::packed_salt::PackedSaltMatrix;
@@ -159,15 +159,9 @@ impl SaltLinear {
                 let mut buf = act.to_vec();
                 for row in buf.chunks_mut(self.k_in()) {
                     for slice in row.chunks_mut(group) {
-                        // `k_in` need not divide by `group` — SmolLM2's `n_embd` is 576 and the
-                        // shipping group is 256, leaving a 64-wide tail. The fitter handles that
-                        // by rotating a group only when its own length is a power of two greater
-                        // than one (`fit_group_geometric_rotated`'s `rotatable`), so a short tail
-                        // is fitted in the ORIGINAL basis. Mirror that rule exactly: rotating a
-                        // tail the fitter left alone corrupts it just as surely as failing to
-                        // rotate a group the fitter turned, and `fast_hadamard` asserts on a
-                        // non-power-of-two length besides.
-                        if slice.len().is_power_of_two() && slice.len() > 1 {
+                        // `k_in` need not divide by `group` — SmolLM2's `n_embd` is 576 against the
+                        // shipping `g256`, leaving a 64-wide tail the fitter does not rotate.
+                        if group_is_rotatable(slice.len()) {
                             fast_hadamard(slice);
                         }
                     }

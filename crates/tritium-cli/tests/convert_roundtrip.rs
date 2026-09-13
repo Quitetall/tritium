@@ -118,6 +118,15 @@ fn convert(model: &Path, out: &Path, corpus: &Path, alpha: f64) {
     convert_with(model, out, corpus, alpha, false);
 }
 
+/// The Hadamard group an artifact declares, or `None` for an unrotated (version-1) bundle.
+fn bundle_rotation_group(dir: &Path) -> Option<usize> {
+    let file = std::fs::File::open(dir.join("model.tslb")).expect("open bundle");
+    tritium_format::SaltBundleReader::new_strict(std::io::BufReader::new(file))
+        .expect("parse bundle")
+        .rotation_group()
+        .map(usize::from)
+}
+
 fn score(mut runner: ModelRunner, tokens: &[u32]) -> f64 {
     teacher_forced_perplexity_windows(&mut runner, tokens, EVAL_WINDOW)
         .expect("score model")
@@ -238,18 +247,19 @@ fn rotation_reaches_the_artifact_and_does_not_cost_quality() {
     convert_with(&model, &rotated, &corpus, 0.75, true);
 
     // The artifact must SAY it is rotated, or the runtime will not rotate and the codes are wrong.
-    let bytes = std::fs::read(rotated.join("model.tslb")).expect("read rotated bundle");
+    // Asked through the reader rather than by indexing a header byte, so a future header field
+    // cannot leave this assertion quietly reading something else.
     assert_eq!(
-        bytes[4],
-        tritium_format::SALT_BUNDLE_VERSION_ROTATED,
-        "a rotated conversion must write a version-2 bundle; version 1 would be read without \
-         rotation and reconstruct W·H"
+        bundle_rotation_group(&rotated),
+        Some(256),
+        "a rotated conversion must record its Hadamard group; without it the runtime reconstructs \
+         W·H and the model is silently wrong"
     );
-    let plain_bytes = std::fs::read(plain.join("model.tslb")).expect("read plain bundle");
     assert_eq!(
-        plain_bytes[4],
-        tritium_format::SALT_BUNDLE_VERSION,
-        "--no-rotation must still write a version-1 bundle every existing reader can load"
+        bundle_rotation_group(&plain),
+        None,
+        "--no-rotation must still write a bundle that declares no rotation, which is what every \
+         reader predating version 2 can load"
     );
 
     let ppl_plain = score_converted(&plain, &tokens);

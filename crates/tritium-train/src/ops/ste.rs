@@ -181,6 +181,22 @@ pub fn salt_quantize_vjp(
 // Hadamard transform into the activations and quantizes `W·H`. The transform is `O(n log n)` with only
 // adds and subtracts, so it does not reintroduce multiplies into the ternary path.
 
+/// Whether a scale group of this width is rotated at all.
+///
+/// The single source of truth for a rule three layers have to agree on. The fitter
+/// (`fit_group_geometric_rotated`) leaves a group in the original basis when it is not a power of
+/// two, because [`fast_hadamard`] cannot transform it — and `cols` need not divide by the group, so
+/// a short tail is routine: SmolLM2 is 576 wide at the shipping `g256`.
+///
+/// Everything downstream of a rotated fit has to reproduce that decision exactly. `SaltLinear`
+/// rotates the activation, `TokenEmbedding` un-rotates the gathered row, and the converter
+/// un-rotates the decoded artifact to score fidelity. Rotating a tail the fitter left alone is as
+/// wrong as skipping a group it turned, and both are silent. Call this rather than re-deriving it.
+#[must_use]
+pub const fn group_is_rotatable(len: usize) -> bool {
+    len.is_power_of_two() && len > 1
+}
+
 /// In-place normalized fast Walsh–Hadamard transform. `v.len()` must be a power of two. The transform
 /// is its own inverse at this normalization (`H·H = I`), and preserves the L2 norm.
 ///
@@ -338,7 +354,7 @@ fn fit_group(
             .sum()
     };
     // A ragged final block is never rotated rather than zero-padded, so no phantom weights appear.
-    let rotatable = bs.len().is_power_of_two() && bs.len() > 1;
+    let rotatable = group_is_rotatable(bs.len());
     let rotated = (rotation != RotationPolicy::Never && rotatable).then(|| {
         buf.clear();
         buf.extend_from_slice(bs);
