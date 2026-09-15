@@ -63,5 +63,5 @@ pub use router::{
 #[cfg(feature = "serve")]
 pub use startup::{
     AdmittedArtifactV1, AdmittedGeneratorV1, ProductionReadiness, StartupError, StartupReceiptV1,
-    admit_qwen36_salt_v3, prepare_production_generator,
+    admit_qwen36_salt_v3, admit_qwen36_salt_v3_provisional, prepare_production_generator,
 };

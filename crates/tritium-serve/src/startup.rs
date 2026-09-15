@@ -18,6 +18,7 @@ const MAX_LABEL_BYTES: usize = 256;
 /// Authenticated schema-v3 artifact state before execution self-test.
 #[derive(Clone, Debug)]
 pub struct AdmittedArtifactV1 {
+    provisional: bool,
     server_source_revision: String,
     server_build_id: String,
     model_source_revision: String,
@@ -62,6 +63,47 @@ impl AdmittedArtifactV1 {
         effective_backend: &str,
         physical_device_id: &str,
     ) -> Result<Self, StartupError> {
+        Self::from_qwen36_salt_v3_mode(
+            receipt,
+            server_source_revision,
+            server_build_id,
+            backend_policy,
+            effective_backend,
+            physical_device_id,
+            false,
+        )
+    }
+
+    /// Admit measured language/MTP bundle for loopback research serving.
+    /// Package IDs use Tritium `trp1_` content IDs; release admission remains strict.
+    pub fn from_qwen36_salt_v3_provisional(
+        receipt: &Qwen35SaltV2LoadReceipt,
+        server_source_revision: &str,
+        server_build_id: &str,
+        backend_policy: &str,
+        effective_backend: &str,
+        physical_device_id: &str,
+    ) -> Result<Self, StartupError> {
+        Self::from_qwen36_salt_v3_mode(
+            receipt,
+            server_source_revision,
+            server_build_id,
+            backend_policy,
+            effective_backend,
+            physical_device_id,
+            true,
+        )
+    }
+
+    fn from_qwen36_salt_v3_mode(
+        receipt: &Qwen35SaltV2LoadReceipt,
+        server_source_revision: &str,
+        server_build_id: &str,
+        backend_policy: &str,
+        effective_backend: &str,
+        physical_device_id: &str,
+        provisional: bool,
+    ) -> Result<Self, StartupError> {
         if backend_policy != effective_backend {
             return Err(StartupError::InvalidAdmission(
                 "effective backend differs from fail-closed backend policy",
@@ -79,7 +121,11 @@ impl AdmittedArtifactV1 {
             ("preserved package", receipt.preserved_package_id()),
             ("config package", receipt.config_package_id()),
         ] {
-            validate_hex(value, IDENTITY_HEX_CHARS, label)?;
+            if provisional {
+                validate_package_id(value, label)?;
+            } else {
+                validate_hex(value, IDENTITY_HEX_CHARS, label)?;
+            }
         }
         validate_hex(
             server_source_revision,
@@ -106,6 +152,7 @@ impl AdmittedArtifactV1 {
             ));
         }
         Ok(Self {
+            provisional,
             server_source_revision: server_source_revision.to_owned(),
             server_build_id: server_build_id.to_owned(),
             model_source_revision: receipt.source_revision().to_owned(),
@@ -149,9 +196,35 @@ pub fn admit_qwen36_salt_v3(
     })
 }
 
+/// Bind provisional measured bundle. Caller must enforce loopback-only policy.
+pub fn admit_qwen36_salt_v3_provisional(
+    model: tritium_nn::Qwen35SaltV2LanguageMtpModel,
+    eos: u32,
+    server_source_revision: &str,
+    server_build_id: &str,
+    backend_policy: &str,
+    effective_backend: &str,
+    physical_device_id: &str,
+) -> Result<AdmittedGeneratorV1, StartupError> {
+    let artifact = AdmittedArtifactV1::from_qwen36_salt_v3_provisional(
+        model.receipt(),
+        server_source_revision,
+        server_build_id,
+        backend_policy,
+        effective_backend,
+        physical_device_id,
+    )?;
+    Ok(AdmittedGeneratorV1 {
+        generator: Box::new(QwenGenerator::new(model, eos)),
+        artifact,
+    })
+}
+
 /// Immutable evidence returned by a successful production startup.
 #[derive(Clone, Debug, Serialize)]
 pub struct StartupReceiptV1 {
+    /// True only for explicit loopback research serving; never release-qualified.
+    pub provisional: bool,
     /// Receipt schema version.
     pub schema_version: u32,
     /// Authenticated artifact kind.
@@ -282,6 +355,7 @@ pub fn prepare_production_generator(
     }
     let self_test_digest = self_test_digest(n_ctx, vocab, &steps[0]);
     let receipt = StartupReceiptV1 {
+        provisional: artifact.provisional,
         schema_version: 1,
         artifact_kind: "tritium-qwen36-salt-v3",
         server_source_revision: artifact.server_source_revision,
@@ -329,6 +403,19 @@ fn validate_hex(value: &str, bytes: usize, label: &'static str) -> Result<(), St
     Ok(())
 }
 
+fn validate_package_id(value: &str, label: &'static str) -> Result<(), StartupError> {
+    let valid = value.strip_prefix("trp1_").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    });
+    if !valid {
+        return Err(StartupError::InvalidAdmission(label));
+    }
+    Ok(())
+}
+
 fn validate_label(value: &str, label: &'static str) -> Result<(), StartupError> {
     if value.is_empty()
         || value.len() > MAX_LABEL_BYTES
@@ -348,6 +435,7 @@ mod tests {
 
     fn artifact() -> AdmittedArtifactV1 {
         AdmittedArtifactV1 {
+            provisional: false,
             server_source_revision: "a".repeat(40),
             server_build_id: "tritium-serve@1.1.0-rc.0".into(),
             model_source_revision: "b".repeat(40),

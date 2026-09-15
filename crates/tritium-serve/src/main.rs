@@ -54,6 +54,7 @@ struct FileConfig {
     raw_tokens: Option<bool>,
     draft_model: Option<String>,
     kv_pool_tokens: Option<usize>,
+    allow_incomplete_bundle: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -83,6 +84,7 @@ struct LaunchConfig {
     raw_tokens: bool,
     draft_model: Option<String>,
     kv_pool_tokens: Option<usize>,
+    allow_incomplete_bundle: bool,
 }
 
 impl Default for LaunchConfig {
@@ -113,6 +115,7 @@ impl Default for LaunchConfig {
             raw_tokens: false,
             draft_model: None,
             kv_pool_tokens: None,
+            allow_incomplete_bundle: false,
         }
     }
 }
@@ -251,6 +254,9 @@ fn apply_file_config(config: FileConfig, launch: &mut LaunchConfig) {
     if let Some(value) = config.kv_pool_tokens {
         launch.kv_pool_tokens = Some(value);
     }
+    if let Some(value) = config.allow_incomplete_bundle {
+        launch.allow_incomplete_bundle = value;
+    }
 }
 
 fn apply_env_config(launch: &mut LaunchConfig) -> Result<(), Box<dyn std::error::Error>> {
@@ -275,6 +281,10 @@ fn apply_env_config(launch: &mut LaunchConfig) -> Result<(), Box<dyn std::error:
     env_string!("TRITIUM_MODEL", launch.model_path);
     env_string!("TRITIUM_CONVERTED", launch.converted_path);
     env_string!("TRITIUM_BUNDLE", launch.bundle_path);
+    env_value!(
+        "TRITIUM_ALLOW_INCOMPLETE_BUNDLE",
+        launch.allow_incomplete_bundle
+    );
     if let Some(value) = std::env::var_os("TRITIUM_PROFILE") {
         launch.profile = value
             .into_string()
@@ -380,6 +390,7 @@ serving:
   --batch-slots <N>         continuous-batching slots (default 1 = single stream)
   --queue-cap <N>           admission queue depth (default 32)
   --kv-pool-tokens <N>      paged-KV pool size in tokens (default: dense per-slot KV)
+  --allow-incomplete-bundle allow measured language/MTP bundle on loopback only (research)
 
 network:
   --host <ip>               public bind address (default 127.0.0.1; non-loopback
@@ -493,6 +504,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         mut raw_tokens,
         mut draft_model,
         mut kv_pool_tokens,
+        mut allow_incomplete_bundle,
     } = launch;
 
     // Parse a required value for `name`, erroring (not silently defaulting) on a
@@ -558,6 +570,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 kv_pool_tokens = Some(t);
             }
+            "--allow-incomplete-bundle" => allow_incomplete_bundle = true,
             // -h/--help/-V/--version answered in the pre-scan (they must
             // work even under a broken env/config).
             other => {
@@ -578,6 +591,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Err(
             "provide exactly one of --bundle <schema-v3-dir>, --model <legacy.gguf>, or --converted <dir>".into(),
         );
+    }
+    if allow_incomplete_bundle && bundle_path.is_none() {
+        return Err("--allow-incomplete-bundle requires --bundle".into());
     }
     // One identifying line before any multi-gigabyte load: version + source.
     eprintln!("{}", version_line());
@@ -617,6 +633,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
     let (host_ip, admin_ip) = validate_bind_addresses(&host, &admin_host, admin_port)?;
+    if allow_incomplete_bundle && !host_ip.is_loopback() {
+        return Err("--allow-incomplete-bundle requires loopback --host".into());
+    }
     // Resolve the named backend from the runtime registry (the same owned-init
     // pattern the acceptance tests use). `cpu` is always linked; `cuda` needs
     // the `cuda` cargo feature and a working device.
@@ -880,15 +899,28 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 "tritium-serve:{}:{source_revision}",
                 env!("CARGO_PKG_VERSION")
             );
-            let admitted = tritium_serve::admit_qwen36_salt_v3(
-                *model,
-                eos,
-                source_revision,
-                &build_id,
-                &backend_name,
-                &backend_name,
-                &physical_device,
-            )?;
+            let admitted = if allow_incomplete_bundle {
+                eprintln!("WARNING: provisional bundle; language/MTP only; not release-qualified");
+                tritium_serve::admit_qwen36_salt_v3_provisional(
+                    *model,
+                    eos,
+                    source_revision,
+                    &build_id,
+                    &backend_name,
+                    &backend_name,
+                    &physical_device,
+                )?
+            } else {
+                tritium_serve::admit_qwen36_salt_v3(
+                    *model,
+                    eos,
+                    source_revision,
+                    &build_id,
+                    &backend_name,
+                    &backend_name,
+                    &physical_device,
+                )?
+            };
             let (router, draining, _) = tritium_serve::build_router_production(
                 admitted,
                 tok,
