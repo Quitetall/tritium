@@ -466,6 +466,27 @@ pub fn divide_rows(w: &mut [f32], cols: usize, s: &[f32]) {
 
 /// Apply the salience fold. Returns the rebalanced weights plus the `Arch` whose fp norms absorb
 /// the inverse — together an exact reparameterisation of the same function.
+///
+/// # The two projections this deliberately does not fold
+///
+/// Five of the seven per-layer projections are folded below. The other two are skipped for
+/// **different structural reasons**, and both are worth stating because the sensitivity proxy falls
+/// back to a global mean for exactly these — and the embedding is the most sensitive tensor in the
+/// model, at roughly 1000× the median.
+///
+/// **`o_proj` has no norm in front of it.** Its input is the concatenated attention head outputs,
+/// and the fold's other half has to land somewhere that cancels it exactly. There is no candidate:
+/// scaling `v_proj`'s output rows would work arithmetically for the value path, but the head
+/// outputs are `softmax(QKᵀ)·V`, and the softmax sits between `v` and here. Not a missing tap —
+/// there is nothing to fold *into*. (`Tap::OProjIn` exists for [`forward_aq`], which quantizes that
+/// activation; it is not a calibration tap and `calibrate_tapped` never emits it.)
+///
+/// **The tied head is blocked by the tie, not by a missing norm.** `out_norm` sits directly in
+/// front of it, so the fold would be well-formed in isolation. But the head's weights *are* the
+/// embedding table, and scaling its columns rescales every gathered token vector by the same
+/// per-channel `s`. That vector enters the residual stream unnormalised, so the scale propagates
+/// through the whole network with nothing to cancel it — RMSNorm renormalises globally and cannot
+/// undo a per-channel scale. An **untied** head would be foldable; this one is not.
 pub fn fold(
     fp: &[Vec<f32>],
     shapes: &[(usize, usize)],
