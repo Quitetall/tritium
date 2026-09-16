@@ -12,11 +12,11 @@
 
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
 use tritium_format::{
     DEFAULT_SPARSE_RESIDUAL_DENSITY, SafeTensors, SaltRow, write_progressive_salt_bundle,
-    write_salt_bundle, write_salt_gguf,
+    write_rotated_salt_bundle, write_salt_bundle, write_salt_gguf,
 };
 use tritium_quantize::fisher::tile_sensitivity;
 use tritium_quantize::{BaseScaleScope, QuantConfig, Sensitivity, quantize_tensor};
@@ -190,7 +190,28 @@ pub(crate) fn run(
         .iter()
         .map(|(n, r)| (n.as_str(), r.as_slice()))
         .collect();
+    // A rotated fit stores codes for `W·H`, so only a container that can RECORD the rotation may
+    // carry one. Version 2 of the TSLB bundle can; the progressive bundle and the GGUF export have
+    // no such field, and a reader that cannot rotate the activation would compute `W·H·x` with
+    // nothing to signal the error. Refuse rather than write a silently wrong artifact.
+    let rotate = ladder == LadderArg::Geometric && ladder_cfg.rotate;
+    if rotate && !matches!(format, OutputFormat::Sidecar) {
+        bail!(
+            "--rotate needs a container that can record the rotation, and only the default \
+             `--format sidecar` can. A progressive bundle or a SALT GGUF has no rotation field, so \
+             the runtime would reconstruct W·H instead of W with nothing to signal it. Drop \
+             --rotate, or write a sidecar bundle."
+        );
+    }
     let (out_bytes, container) = match format {
+        OutputFormat::Sidecar if rotate => {
+            let group = u16::try_from(ladder_cfg.group)
+                .context("--group does not fit the bundle's u16 rotation field")?;
+            (
+                write_rotated_salt_bundle(&refs, group).context("serialize rotated SALT bundle")?,
+                "rotated SALT bundle (v2)",
+            )
+        }
         OutputFormat::Sidecar => (
             write_salt_bundle(&refs).context("serialize SALT bundle")?,
             "SALT bundle",

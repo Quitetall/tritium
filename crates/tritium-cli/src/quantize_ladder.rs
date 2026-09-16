@@ -14,9 +14,12 @@
 //!
 //! - **No salience fold.** The AWQ-style fold needs activation statistics from a calibration
 //!   corpus; `tritium quantize` reads a safetensors file and nothing else.
-//! - **No rotation.** [`RotationPolicy::Never`] is the only correct choice here: the ladder fits in
-//!   the rotated basis, and the bundle carries no rotation metadata, so a rotated artifact would
-//!   silently reconstruct `W·H` instead of `W`.
+//! - **Rotation is opt-in, not unavailable.** It used to be impossible here: a rotated fit stores
+//!   codes for `W·H` and the v1 bundle had nowhere to say so. A version-2 bundle records the
+//!   Hadamard group, so `--rotate` works — but only with `--format sidecar`, because the
+//!   progressive bundle and the SALT GGUF still have no such field. That combination is refused
+//!   rather than written. Worth taking where the container allows: on SmolLM2-135M, no fold, T=3,
+//!   rotation is **1.167× fp against 1.246× without**.
 //!
 //! Measured on SmolLM2-360M, WikiText-2 32,768-token held-out (fp 14.909), in **exactly this
 //! configuration** — no fold, no rotation, `g256`:
@@ -32,6 +35,12 @@
 //! supplies that; without rotation the free-scale fitter adapts to heavy tails and the rigid grid
 //! cannot. Both `T=2` settings are unusable in absolute terms (21.9× and 323× fp), so the practical
 //! rule is `T≥3`, which [`LadderConfig::validate`] enforces.
+//!
+//! That `T≥3` floor is stated against the table above, which is unrotated. `--rotate` supplies
+//! exactly the conditioning the `T=2` failure is attributed to, so the floor may well be too
+//! conservative there — but nobody has measured `T=2` rotated through this path, and the guard
+//! stays until somebody does. A refusal that is merely conservative costs a user one flag; a
+//! relaxation justified by a mechanism nobody measured costs them a 323× model.
 //!
 //! # Byte accounting
 //!
@@ -123,7 +132,7 @@ impl LadderConfig {
 
 /// Fit one 2-D weight tensor with the ladder and pack it into per-output-channel [`SaltRow`]s.
 ///
-/// `wf` is row-major `[rows, cols]`. Rotation is fixed to [`RotationPolicy::Never`] — see the module
+/// `wf` is row-major `[rows, cols]`. Rotation follows [`LadderConfig::rotate`] — see the module
 /// docs; passing anything else would produce an artifact that reconstructs the wrong weights.
 pub(crate) fn quantize_tensor_ladder(
     wf: &[f32],

@@ -289,6 +289,19 @@ enum Command {
         /// Delta candidates per group for the ladder's `s0` grid search.
         #[arg(long, default_value_t = 16)]
         grid: usize,
+        /// Fit `--ladder geometric` in the Hadamard-rotated basis and record it in the bundle.
+        ///
+        /// Off by default here, unlike `convert`, because this command's other two containers
+        /// cannot carry the rotation: only `--format sidecar` writes a version-2 bundle, and
+        /// passing this with a progressive bundle or a SALT GGUF is refused rather than written
+        /// silently wrong.
+        ///
+        /// Worth taking when the container allows it. Measured on SmolLM2-135M, WikiText-2 full
+        /// split, in the no-fold configuration this command ships: **1.167x fp with rotation
+        /// against 1.246x without at T=3** — and rotation is what the ladder's rigid 1/3 spacing
+        /// needs, which is why the unrotated `--planes 2` case is 323x fp and refused outright.
+        #[arg(long)]
+        rotate: bool,
     },
 }
 
@@ -615,6 +628,7 @@ fn main() -> anyhow::Result<()> {
             planes,
             group,
             grid,
+            rotate,
         } => quantize::run(
             &input,
             &output,
@@ -628,9 +642,10 @@ fn main() -> anyhow::Result<()> {
                 planes,
                 group,
                 grid,
-                // `quantize` writes a version-1 bundle and has no calibration path, so it stays in
-                // the original basis. Rotation lives on `convert`, which can also fold.
-                rotate: false,
+                // Opt-in here, unlike `convert`: two of this command's three containers cannot
+                // record a rotation, so the default has to be the one every format can express.
+                // `quantize::run` refuses the combination rather than writing it silently wrong.
+                rotate,
             },
         )?,
     }
