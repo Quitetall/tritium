@@ -371,6 +371,7 @@ impl<R: Read + Seek> JointSaltBundleReader<R> {
             if end > file_len {
                 return Err(JointBundleError::Malformed("payload runs past end of file"));
             }
+            // Placement is checked below, once the directory's end is known.
             if by_name.insert(name.clone(), entries.len()).is_some() {
                 return Err(JointBundleError::Malformed("duplicate tensor name"));
             }
@@ -382,6 +383,25 @@ impl<R: Read + Seek> JointSaltBundleReader<R> {
                 scale_bytes,
                 stream_bytes,
             });
+        }
+        // Payloads must tile the region after the directory exactly: contiguous, in directory order,
+        // ending at the end of the file. That is the only layout the writer produces, and anything
+        // else — an offset back into the header, two tensors sharing bytes, a gap, trailing data —
+        // would decode as rows instead of failing. Bounds checks alone cannot catch it: an offset of
+        // zero is perfectly in range.
+        let mut expected = pos;
+        for entry in &entries {
+            if entry.payload_offset != expected {
+                return Err(JointBundleError::Malformed(
+                    "payloads are not contiguous in directory order",
+                ));
+            }
+            expected += entry.scale_bytes + entry.stream_bytes;
+        }
+        if expected != file_len {
+            return Err(JointBundleError::Malformed(
+                "payloads do not end at the end of the file",
+            ));
         }
         Ok(Self {
             source,
@@ -642,6 +662,42 @@ mod tests {
             read_any_salt_bundle(&joint).unwrap(),
             read_any_salt_bundle(&dense).unwrap()
         );
+    }
+
+    /// Every payload must sit exactly where the writer puts it: contiguous, in directory order, from
+    /// the end of the directory to the end of the file. A crafted offset pointing back into the
+    /// header — or two tensors sharing bytes — would otherwise decode as rows instead of an error.
+    #[test]
+    fn a_payload_offset_outside_the_payload_region_is_refused() {
+        let a = rows_from(128, 3, 2, 21);
+        let b = rows_from(128, 3, 2, 22);
+        let bytes = write_joint_salt_bundle(&[("a", &a), ("b", &b)], None).unwrap();
+        let alphabet = 9;
+        // First directory entry: name_len(2) + "a"(1) + rows(4) + k(4) → offset field.
+        let off_at = HEADER_BYTES + alphabet + 2 + 1 + 4 + 4;
+        let original = u64::from_le_bytes(bytes[off_at..off_at + 8].try_into().unwrap());
+
+        for (why, crafted) in [
+            ("into the header", 0u64),
+            ("one byte late, overlapping the next tensor", original + 1),
+        ] {
+            let mut bad = bytes.clone();
+            bad[off_at..off_at + 8].copy_from_slice(&crafted.to_le_bytes());
+            assert!(
+                matches!(
+                    JointSaltBundleReader::new_strict(Cursor::new(bad)),
+                    Err(JointBundleError::Malformed(_))
+                ),
+                "payload offset {why} was accepted"
+            );
+        }
+        // Trailing bytes after the last payload are unaccounted for and refused too.
+        let mut trailing = bytes;
+        trailing.push(0);
+        assert!(matches!(
+            JointSaltBundleReader::new_strict(Cursor::new(trailing)),
+            Err(JointBundleError::Malformed(_))
+        ));
     }
 
     #[test]
