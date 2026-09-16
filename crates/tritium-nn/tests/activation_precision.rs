@@ -36,7 +36,7 @@ use std::path::PathBuf;
 
 use common::{Calib, calibrate, extract, fold, score_window};
 use tritium_nn::ModelRunner;
-use tritium_nn::calibrate::forward_aq;
+use tritium_nn::calibrate::{Tap, forward_aq};
 use tritium_train::Tape;
 use tritium_train::ops::ste::{self, RotationPolicy};
 use tritium_train::tape::ValueId;
@@ -113,6 +113,19 @@ enum Mode {
     /// Additive ternary planes with the geometric ladder, i.e. the weight-side representation
     /// applied to activations. `T` planes ⇒ `T * 1.58` bits per value, multiply-free.
     Ternary(usize),
+    /// Ternary planes allocated **per tap**: `[attn_in, ffn_in, down_in, head]`.
+    ///
+    /// The A8 headroom measurement found the taps are not alike — 5.41 dB available on the FFN
+    /// intermediate against ~1.7 dB elsewhere, a 3.2x spread — and `down_in` is the one activation
+    /// in the block that is NOT post-RMSNorm. With only four decision units, allocation here is
+    /// nothing like the 211-tensor weight-side problem that has failed every test: the search space
+    /// is small enough to enumerate, and the budget accounting is exact.
+    TernaryPerTap([usize; 4]),
+}
+
+/// Ternary bits per activation value at `T` planes. `log2(3) = 1.58496`.
+fn ternary_bits(t: usize) -> f64 {
+    t as f64 * 3.0f64.log2()
 }
 
 impl Mode {
@@ -125,7 +138,26 @@ impl Mode {
             Mode::PerGroup(l) => {
                 format!("int{} per group g{ACT_GROUP}", (l + 1.0).log2() as u32 + 1)
             }
-            Mode::Ternary(t) => format!("TERNARY {t} plane(s), {:.2} bits", t as f64 * 1.585),
+            Mode::Ternary(t) => format!("TERNARY {t} plane(s), {:.2} bits", ternary_bits(t)),
+            Mode::TernaryPerTap(planes) => format!(
+                "TERNARY per tap {planes:?}, {:.2} bits avg",
+                planes.iter().map(|&t| ternary_bits(t)).sum::<f64>() / planes.len() as f64
+            ),
+        }
+    }
+
+    /// Planes this mode spends at one tap, for the per-tap arm; `None` for the uniform modes.
+    fn planes_at(self, kind: Tap) -> Option<usize> {
+        match self {
+            Mode::TernaryPerTap(planes) => Some(
+                planes[match kind {
+                    Tap::AttnIn => 0,
+                    Tap::FfnIn => 1,
+                    Tap::DownIn => 2,
+                    Tap::Head => 3,
+                }],
+            ),
+            _ => None,
         }
     }
 
@@ -144,6 +176,8 @@ impl Mode {
                     }
                 }
             }
+            // Resolved to a plane count by `perplexity_aq` before it gets here.
+            Mode::TernaryPerTap(_) => unreachable!("per-tap modes are resolved by the caller"),
             Mode::Ternary(t) => {
                 // The ladder fitter operates on a [rows, cols] matrix with per-group scales — the
                 // same code path the weights use. Rotation is Never: the Hadamard is a weight-side
@@ -179,9 +213,16 @@ fn perplexity_aq(
         }
         let mut t = Tape::new();
         let wids: Vec<ValueId> = weights.iter().map(|w| t.leaf(w.clone())).collect();
-        let out = forward_aq(&mut t, &wids, a, chunk, &mut |_kind, _li, v, seq, cols| {
-            mode.apply(v, seq, cols);
-        });
+        let out = forward_aq(
+            &mut t,
+            &wids,
+            a,
+            chunk,
+            &mut |kind, _li, v, seq, cols| match mode.planes_at(kind) {
+                Some(t) => Mode::Ternary(t).apply(v, seq, cols),
+                None => mode.apply(v, seq, cols),
+            },
+        );
         let logits = t.value(out).to_vec();
         score_window(&logits, chunk, a.vocab, &mut nll, &mut scored);
     }
@@ -253,10 +294,23 @@ fn activation_precision_sweep() {
         Mode::PerGroup(127.0),
         Mode::PerRow(7.0),
         Mode::PerGroup(7.0),
+        // L2. T=5 is 7.92 bits, CHEAPER than int8, and nobody has measured it. T=6 brackets it.
+        Mode::Ternary(6),
+        Mode::Ternary(5),
         Mode::Ternary(4),
         Mode::Ternary(3),
         Mode::Ternary(2),
         Mode::Ternary(1),
+        // L3. Four decision units, order [attn_in, ffn_in, down_in, head]. Every arm below averages
+        // 4 planes, so each is bit-neutral against uniform T=4 and the comparison is a pure
+        // allocation question. `down_in` is the tap the headroom measurement says is starved.
+        Mode::TernaryPerTap([4, 4, 4, 4]),
+        Mode::TernaryPerTap([3, 3, 5, 5]),
+        Mode::TernaryPerTap([3, 4, 5, 4]),
+        Mode::TernaryPerTap([4, 4, 6, 2]),
+        // The control: spend the extra planes where the headroom is LOWEST. If this ties the arm
+        // above, the per-tap signal is noise and the measurement says so.
+        Mode::TernaryPerTap([5, 5, 3, 3]),
     ] {
         let ppl = perplexity_aq(&qw, &arch, &eval, EVAL_WINDOW, mode);
         if baseline.is_nan() {

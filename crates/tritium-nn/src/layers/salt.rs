@@ -10,7 +10,7 @@ use tritium_train::ops::ste::{fast_hadamard, group_is_rotatable};
 
 use crate::error::NnError;
 use crate::layers::packed_salt::PackedSaltMatrix;
-use crate::ops::quantize_activation_int8;
+use crate::ops::{quantize_activation_int8, quantize_activation_int8_grouped};
 
 /// A bias-free additive ternary projection backed by packed SALT rows.
 #[derive(Clone, Debug)]
@@ -22,6 +22,9 @@ pub struct SaltLinear {
     /// slice of the activation before quantizing: `H·H = I`, hence `W·x = (W·H)·(H·x)`. Skipping it
     /// computes `W·H·x` — wrong, but not detectably wrong, which is why the bundle version gates it.
     rotation_group: Option<usize>,
+    /// Activation-quant granularity. `None` is the shipping per-token absmax; `Some(g)` takes one
+    /// absmax per `g` inputs instead. See [`Self::set_activation_group`].
+    activation_group: Option<usize>,
 }
 
 impl SaltLinear {
@@ -32,7 +35,29 @@ impl SaltLinear {
         Self {
             matrix,
             rotation_group,
+            activation_group: None,
         }
+    }
+
+    /// Switch this projection to per-group activation quantization, or back to per-token.
+    ///
+    /// One absmax per token means a single outlier sets the step for the whole row. Measured on
+    /// SmolLM2-135M, moving to `g128` recovers **64% of the A8 tax** at both `T=3` and `T=4`
+    /// (+1.19% → +0.43%, +1.08% → +0.43%), for no additional bits — the scales are transient.
+    ///
+    /// Off by default, because it is not free everywhere. Per-group scales cannot factor out of the
+    /// dot product, so [`quantize_activation_int8_grouped`] hands the GEMM dequantized f32 rather
+    /// than integers; on this path that costs nothing (`PackedSaltMatrix::project_rows` is an f32
+    /// dot with no integer fast path), but an int8 kernel cannot consume it, and `tritium-cpu`'s
+    /// AVX2 A8 path would silently fall back. Enable it per model, not per build.
+    pub fn set_activation_group(&mut self, group: Option<usize>) {
+        self.activation_group = group;
+    }
+
+    /// The activation-quant granularity in force, `None` for the shipping per-token absmax.
+    #[must_use]
+    pub const fn activation_group(&self) -> Option<usize> {
+        self.activation_group
     }
 
     /// Build a projection from one packed SALT row per output channel.
@@ -84,6 +109,7 @@ impl SaltLinear {
             // Raw rows carry no bundle header, so there is nothing to say they were fitted in a
             // rotated basis. Callers that know otherwise build through the bundle path.
             rotation_group: None,
+            activation_group: None,
         })
     }
 
@@ -173,7 +199,18 @@ impl SaltLinear {
 
         let mut q_act = zeroed_scratch(act_len, "SALT quantized activations")?;
         let mut act_scale = zeroed_scratch(m, "SALT activation scales")?;
-        quantize_activation_int8(act, m, self.k_in(), &mut q_act, &mut act_scale)?;
+        match self.activation_group {
+            None => quantize_activation_int8(act, m, self.k_in(), &mut q_act, &mut act_scale)?,
+            // Writes dequantized values and a scale of 1, so the fold below is unchanged.
+            Some(group) => quantize_activation_int8_grouped(
+                act,
+                m,
+                self.k_in(),
+                group,
+                &mut q_act,
+                &mut act_scale,
+            )?,
+        }
 
         self.matrix.project_rows(&q_act, m, out)?;
         for (row, scale) in out.chunks_mut(self.n_out()).zip(act_scale) {

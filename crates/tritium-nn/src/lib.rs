@@ -73,9 +73,9 @@ pub use model::{
     parse_training_salt_artifact_metadata,
 };
 pub use ops::{
-    QB, gqa_attention, quantize_activation_int8, rmsnorm, rmsnorm_zero_centered, rope_apply,
-    rope_apply_partial_neox, sample_categorical, sample_greedy, sample_top_k, sample_top_p,
-    softmax_rows, truncated_top_k, truncated_top_p,
+    QB, gqa_attention, quantize_activation_int8, quantize_activation_int8_grouped, rmsnorm,
+    rmsnorm_zero_centered, rope_apply, rope_apply_partial_neox, sample_categorical, sample_greedy,
+    sample_top_k, sample_top_p, softmax_rows, truncated_top_k, truncated_top_p,
 };
 #[cfg(feature = "cuda")]
 pub use pv_recovery::{

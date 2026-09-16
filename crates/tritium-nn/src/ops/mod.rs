@@ -13,7 +13,7 @@ mod rope;
 mod sampling;
 mod softmax;
 
-pub use act_quant::{QB, quantize_activation_int8};
+pub use act_quant::{QB, quantize_activation_int8, quantize_activation_int8_grouped};
 pub use attention::gqa_attention;
 pub use rmsnorm::{rmsnorm, rmsnorm_zero_centered};
 pub use rope::{rope_apply, rope_apply_partial_neox};

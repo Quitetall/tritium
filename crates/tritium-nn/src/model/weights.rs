@@ -31,7 +31,7 @@ use tritium_spec::TernaryBackend;
 
 use crate::config::{ArchSpec, ModelConfig};
 use crate::error::NnError;
-use crate::layers::{Projection, Q2Linear, TernaryLinear, TokenEmbedding, TransformerBlock};
+use crate::layers::{Mlp, Projection, Q2Linear, TernaryLinear, TokenEmbedding, TransformerBlock};
 use crate::tensor::f16_bytes_to_f32;
 
 /// The weights for one decoder layer, ready to run.
@@ -65,6 +65,56 @@ pub struct ModelWeights {
 }
 
 impl ModelWeights {
+    /// Switch every SALT projection in the model to per-group activation quantization, or back to
+    /// per-token. Returns how many projections were touched.
+    ///
+    /// One absmax per token lets a single outlier set the quantization step for a whole row, and
+    /// LLM activations are outlier-heavy. Measured on SmolLM2-135M, `g128` recovers **64% of the A8
+    /// tax** at both `T=3` and `T=4` for no additional bits — activation scales are transient.
+    ///
+    /// Off by default and switched per model rather than per build, because the per-group path
+    /// hands the GEMM dequantized f32 instead of integers (a per-group scale cannot factor out of
+    /// the dot product). On the SALT path that is free; an int8 kernel cannot consume it. See
+    /// [`SaltLinear::set_activation_group`].
+    ///
+    /// Only [`Projection::Salt`] responds. The count lets a caller assert it reached a model that
+    /// actually has SALT projections rather than silently configuring nothing — a zero return on a
+    /// model you believe is quantized means it is not, or not on this path.
+    pub fn set_salt_activation_group(&mut self, group: Option<usize>) -> usize {
+        fn apply(projection: &mut Projection, group: Option<usize>, count: &mut usize) {
+            if let Projection::Salt(salt) = projection {
+                salt.set_activation_group(group);
+                *count += 1;
+            }
+        }
+        let mut count = 0;
+        for layer in &mut self.layers {
+            for projection in [
+                &mut layer.q_proj,
+                &mut layer.k_proj,
+                &mut layer.v_proj,
+                &mut layer.o_proj,
+            ] {
+                apply(projection, group, &mut count);
+            }
+            let (gate, up, down) = match &mut layer.mlp {
+                Mlp::Relu2(mlp) => (&mut mlp.gate, &mut mlp.up, &mut mlp.down),
+                Mlp::SwiGlu(mlp) => (&mut mlp.gate, &mut mlp.up, &mut mlp.down),
+            };
+            for projection in [gate, up, down] {
+                apply(projection, group, &mut count);
+            }
+        }
+        // The tied head lives in `token_embd` and is NOT reached here: it projects through
+        // `TokenEmbedding::unembed_exact`, which applies no activation quantization at all
+        // ("No A8 activation quantization is applied on this path"). An untied head is a
+        // `Projection` like any other and is switched.
+        if let Some(head) = &mut self.lm_head {
+            apply(head, group, &mut count);
+        }
+        count
+    }
+
     /// Load all weights from a parsed GGUF `file` per `config`, uploading ternary
     /// tensors to `backend`. `bytes` is the full GGUF byte buffer (the reader does
     /// not retain payloads; the loader locates each with

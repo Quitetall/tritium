@@ -156,6 +156,111 @@ pub fn quantize_activation_int8(
     Ok(())
 }
 
+/// Per-**group** int8 absmax activation quant, returning **dequantized** f32.
+///
+/// The shipping quantizer takes one absmax per token over the whole row, so a single outlier sets
+/// the step for every value in it — and LLM activations are outlier-heavy, which is the entire
+/// premise AWQ and SmoothQuant exist to address. The weight side solved this years ago with
+/// per-group scales; the activation side never got the same treatment.
+///
+/// Measured headroom on SmolLM2-135M at `g128`: **5.41 dB** on the FFN intermediate, 57% of a whole
+/// SALT plane, at zero bit cost. Converted to perplexity through the research tape, per-group int8
+/// recovers **exactly 64% of the A8 tax** at both weight settings tested (+1.19% → +0.43% at `T=3`,
+/// +1.08% → +0.43% at `T=4`).
+///
+/// # Why this one dequantizes and [`quantize_activation_int8`] does not
+///
+/// A per-token scale is a scalar the whole dot product shares, so it factors out and folds into the
+/// GEMM output afterwards. A per-group scale does not: `Σ_k w_k x_k = Σ_g s_g Σ_{k∈g} w_k q_k`
+/// needs one partial sum per group, which is a kernel change, not a caller change. Multiplying each
+/// value back by its own group scale here is the same arithmetic with the sum left to the GEMM, so
+/// no kernel has to learn anything — and it keeps the quantization error, which is the entire point.
+///
+/// **The cost is that the output is no longer integer-valued.** `tritium-cpu`'s AVX2 path checks
+/// `act_is_a8_integer` at runtime and falls back to the general f32 GEMM, and any int8 kernel (DP4A)
+/// cannot consume this at all. On the SALT projection path that is free — `PackedSaltMatrix::
+/// project_rows` reconstructs to f32 and dots in f32 with no integer fast path to lose — which is
+/// why this is offered there first.
+///
+/// `out_scale` is filled with `1.0` (`0.0` for an all-zero row, matching
+/// [`quantize_activation_int8`]) so a caller's post-GEMM fold stays a single unconditional multiply.
+///
+/// A group wider than `cols`, or `cols` not divisible by the group, is fine: the final short group
+/// simply pays for its own absmax. `group == cols` reproduces [`quantize_activation_int8`]'s
+/// *values* exactly — dequantized rather than kept as integers — which is the degenerate control.
+///
+/// # Errors
+/// [`NnError::Shape`] if `act.len()` or `out_q.len()` ≠ `rows * cols`, `out_scale.len()` ≠ `rows`,
+/// or `group` is zero.
+pub fn quantize_activation_int8_grouped(
+    act: &[f32],
+    rows: usize,
+    cols: usize,
+    group: usize,
+    out_q: &mut [f32],
+    out_scale: &mut [f32],
+) -> Result<(), NnError> {
+    let elems = rows * cols;
+    if act.len() != elems {
+        return Err(NnError::Shape {
+            expected: elems,
+            got: act.len(),
+        });
+    }
+    if out_q.len() != elems {
+        return Err(NnError::Shape {
+            expected: elems,
+            got: out_q.len(),
+        });
+    }
+    if out_scale.len() != rows {
+        return Err(NnError::Shape {
+            expected: rows,
+            got: out_scale.len(),
+        });
+    }
+    if group == 0 {
+        return Err(NnError::Shape {
+            expected: 1,
+            got: 0,
+        });
+    }
+
+    for r in 0..rows {
+        let row = &act[r * cols..r * cols + cols];
+        let out_row = &mut out_q[r * cols..r * cols + cols];
+        let mut any = false;
+        for (src, dst) in row.chunks(group).zip(out_row.chunks_mut(group)) {
+            let mut gamma = 0.0_f32;
+            for &v in src {
+                let a = v.abs();
+                if a > gamma {
+                    gamma = a;
+                }
+            }
+            if gamma == 0.0 {
+                for q in dst.iter_mut() {
+                    *q = 0.0;
+                }
+                continue;
+            }
+            any = true;
+            // Same `Qp`, same round-half-to-even, same clamp as the per-token path — only the span
+            // the absmax is taken over differs. Dequantize immediately by the group's own step.
+            let s = QB / gamma;
+            let inv = gamma / QB;
+            for (q, &v) in dst.iter_mut().zip(src) {
+                *q = round_half_to_even(v * s).clamp(-128.0, QB) * inv;
+            }
+        }
+        // The values already carry their scale; a zero row still reports 0 so the two quantizers
+        // agree on what an empty row means.
+        out_scale[r] = if any { 1.0 } else { 0.0 };
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -320,5 +425,142 @@ mod tests {
                 got: 3
             })
         );
+    }
+}
+
+#[cfg(test)]
+mod grouped_tests {
+    use super::*;
+
+    /// Deterministic heavy-tailed activations: one large outlier per row, the rest small.
+    /// This is the shape the per-group idea exists for.
+    fn outlier_rows(rows: usize, cols: usize) -> Vec<f32> {
+        let mut v = vec![0.0f32; rows * cols];
+        for r in 0..rows {
+            for c in 0..cols {
+                let x = ((r * 31 + c * 17) % 97) as f32 / 97.0 - 0.5;
+                v[r * cols + c] = x * 0.1;
+            }
+            // One 6-sigma spike, in the first group.
+            v[r * cols + 3] = 6.0;
+        }
+        v
+    }
+
+    /// The degenerate control. `group == cols` is one absmax over the whole row, which is exactly
+    /// what the shipping quantizer does — so the two must agree on every value, allowing only for
+    /// the fact that one returns integers with a scale and the other returns their product.
+    #[test]
+    fn a_group_as_wide_as_the_row_reproduces_the_per_token_quantizer() {
+        let (rows, cols) = (5, 64);
+        let act = outlier_rows(rows, cols);
+
+        let mut q_row = vec![0.0f32; rows * cols];
+        let mut s_row = vec![0.0f32; rows];
+        quantize_activation_int8(&act, rows, cols, &mut q_row, &mut s_row).unwrap();
+
+        let mut q_grp = vec![0.0f32; rows * cols];
+        let mut s_grp = vec![0.0f32; rows];
+        quantize_activation_int8_grouped(&act, rows, cols, cols, &mut q_grp, &mut s_grp).unwrap();
+
+        for r in 0..rows {
+            assert_eq!(
+                s_grp[r], 1.0,
+                "row {r}: the grouped path carries its own scale"
+            );
+            for c in 0..cols {
+                let i = r * cols + c;
+                let expected = q_row[i] * s_row[r];
+                assert!(
+                    (q_grp[i] - expected).abs() <= 1e-6 * expected.abs().max(1e-6),
+                    "row {r} col {c}: grouped {} vs per-token dequant {expected}",
+                    q_grp[i]
+                );
+            }
+        }
+    }
+
+    /// The claim under test: finer groups cost less error on outlier-heavy rows. This is the
+    /// SQNR half of the A8-headroom argument, asserted rather than assumed.
+    #[test]
+    fn finer_groups_reduce_activation_quantization_error() {
+        let (rows, cols) = (4, 512);
+        let act = outlier_rows(rows, cols);
+
+        let sse = |group: usize| -> f64 {
+            let mut q = vec![0.0f32; rows * cols];
+            let mut s = vec![0.0f32; rows];
+            quantize_activation_int8_grouped(&act, rows, cols, group, &mut q, &mut s).unwrap();
+            act.iter()
+                .zip(&q)
+                .map(|(&a, &b)| f64::from(a - b) * f64::from(a - b))
+                .sum()
+        };
+
+        let whole_row = sse(cols);
+        let g128 = sse(128);
+        let g32 = sse(32);
+        assert!(
+            g128 < whole_row && g32 < g128,
+            "error must fall monotonically as groups narrow: row {whole_row:.3e}, \
+             g128 {g128:.3e}, g32 {g32:.3e} — if it does not, the outlier is not being \
+             confined and the whole per-group premise is wrong here"
+        );
+        // The spike sits in one group of 128, so the other three quarters of the row stop paying
+        // for it entirely. Anything less than a large factor means the quantizer is not isolating.
+        assert!(
+            whole_row / g128 > 4.0,
+            "a 6-sigma spike confined to 1 of 4 groups should cut error by far more than 4x; \
+             got {:.2}x",
+            whole_row / g128
+        );
+    }
+
+    /// A group wider than the row, and a row that does not divide by the group, must both behave —
+    /// SmolLM2 is 576 wide, which divides by neither 128 nor 256 evenly at every tensor.
+    #[test]
+    fn ragged_and_oversized_groups_are_handled() {
+        let (rows, cols) = (2, 100);
+        let act = outlier_rows(rows, cols);
+        for group in [1usize, 7, 64, 100, 4096] {
+            let mut q = vec![0.0f32; rows * cols];
+            let mut s = vec![0.0f32; rows];
+            quantize_activation_int8_grouped(&act, rows, cols, group, &mut q, &mut s)
+                .unwrap_or_else(|e| panic!("group {group}: {e}"));
+            assert!(
+                q.iter().all(|v| v.is_finite()),
+                "group {group} produced non-finite values"
+            );
+        }
+        // A group of 1 is lossless: every value is its own absmax and quantizes to +/-127.
+        let mut q = vec![0.0f32; rows * cols];
+        let mut s = vec![0.0f32; rows];
+        quantize_activation_int8_grouped(&act, rows, cols, 1, &mut q, &mut s).unwrap();
+        for (i, (&a, &b)) in act.iter().zip(&q).enumerate() {
+            assert!(
+                (a - b).abs() <= 1e-6 * a.abs().max(1e-6),
+                "index {i}: a group of one must be exact, {a} != {b}"
+            );
+        }
+    }
+
+    /// An all-zero row reports a zero scale, exactly as the per-token path does, so a caller's
+    /// fold cannot tell the two quantizers apart on the empty case.
+    #[test]
+    fn an_all_zero_row_matches_the_per_token_convention() {
+        let (rows, cols) = (2, 8);
+        let act = vec![0.0f32; rows * cols];
+        let mut q = vec![9.0f32; rows * cols];
+        let mut s = vec![9.0f32; rows];
+        quantize_activation_int8_grouped(&act, rows, cols, 4, &mut q, &mut s).unwrap();
+        assert!(q.iter().all(|&v| v == 0.0));
+        assert!(s.iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn a_zero_group_is_refused() {
+        let mut q = [0.0f32; 4];
+        let mut s = [0.0f32; 2];
+        assert!(quantize_activation_int8_grouped(&[0.0; 4], 2, 2, 0, &mut q, &mut s).is_err());
     }
 }

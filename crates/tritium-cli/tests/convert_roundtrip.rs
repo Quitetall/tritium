@@ -287,3 +287,96 @@ fn rotation_reaches_the_artifact_and_does_not_cost_quality() {
          did — check group width and the order of rotate-then-quantize."
     );
 }
+
+/// **How much of the int8-activation tax do per-group scales recover in the shipping runtime?**
+///
+/// `quantize_activation_int8` takes one absmax per token over the whole row, so one outlier sets
+/// the step for every value in it. The research tape says moving to per-group scales recovers
+/// **exactly 64%** of the A8 tax at both weight settings tested (+1.19% → +0.43% at `T=3`,
+/// +1.08% → +0.43% at `T=4`) for no additional bits — activation scales are transient.
+///
+/// That was measured through `forward_aq`, which is not what anybody runs. This measures it where
+/// it would ship: one converted artifact, four evaluations through `ModelRunner`, only the
+/// activation granularity moving.
+///
+/// Prediction, recorded before the first run so being wrong is visible: per-group is better than
+/// per-token by a few tenths of a percent, and `g128` is at least as good as `g256`.
+#[test]
+#[ignore = "four full evaluations of a real model on CPU"]
+fn per_group_activations_recover_part_of_the_a8_tax() {
+    let model = PathBuf::from(
+        std::env::var("TRITIUM_MODEL_DIR").expect("set TRITIUM_MODEL_DIR to an fp model directory"),
+    );
+    let corpus = PathBuf::from(
+        std::env::var("TRITIUM_CORPUS").expect("set TRITIUM_CORPUS to a corpus json"),
+    );
+    let tokens = eval_tokens(&corpus);
+    assert_eq!(tokens.len(), EVAL_TOKENS, "corpus is too small");
+
+    let dir = std::env::temp_dir().join(format!("tritium-a8g-{}", std::process::id()));
+    convert_with(&model, &dir, &corpus, 0.75, true);
+
+    let fp = score(
+        ModelRunner::from_hf(&model, Box::new(tritium_cpu::CpuBackend::new()))
+            .expect("load fp master"),
+        &tokens,
+    );
+
+    // Same artifact every time; only `set_salt_activation_group` differs.
+    let score_at = |group: Option<usize>| -> f64 {
+        let mut runner = ModelRunner::from_salt(
+            &dir,
+            &dir.join("model.tslb"),
+            Box::new(tritium_cpu::CpuBackend::new()),
+        )
+        .expect("load converted model");
+        let touched = runner.weights.set_salt_activation_group(group);
+        assert!(
+            touched > 0,
+            "no SALT projection was configured — the model is not on the path under test, so a \
+             flat result here would mean nothing"
+        );
+        score(runner, &tokens)
+    };
+
+    let per_token = score_at(None);
+    let g256 = score_at(Some(256));
+    let g128 = score_at(Some(128));
+    let g64 = score_at(Some(64));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    println!("\nSmolLM2-135M | convert --planes 4 --group 256, fold 0.75, rotated | fp {fp:.4}");
+    println!(
+        "{:<34} {:>11} {:>9} {:>14}",
+        "activation scales", "ppl", "x fp", "vs per-token"
+    );
+    println!("{}", "-".repeat(72));
+    for (label, ppl) in [
+        ("per token (SHIPPING)", per_token),
+        ("per group g256", g256),
+        ("per group g128", g128),
+        ("per group g64", g64),
+    ] {
+        let delta = if (ppl - per_token).abs() < 1e-12 {
+            "—".to_owned()
+        } else {
+            format!("{:+.2}%", 100.0 * (ppl - per_token) / per_token)
+        };
+        println!("{label:<34} {ppl:>11.4} {:>8.4}x {delta:>14}", ppl / fp);
+    }
+
+    assert!(
+        [g256, g128, g64].iter().all(|p| p.is_finite() && *p > 0.0),
+        "a per-group arm did not produce a usable model"
+    );
+    // The directional claim. Narrower groups can only reduce quantization error (each group's
+    // absmax is at most the row's), so a per-group arm scoring WORSE means the plumbing is wrong,
+    // not that the idea failed.
+    assert!(
+        g128 <= per_token,
+        "per-group g128 ({g128:.4}) is worse than per-token ({per_token:.4}). Each group's absmax \
+         is bounded by the row's, so this cannot be a property of the quantizer — check that the \
+         dequantized values are reaching the GEMM and that the per-token scale fold is not being \
+         applied twice"
+    );
+}
