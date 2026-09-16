@@ -164,9 +164,29 @@ pub fn quantize_activation_int8(
 /// per-group scales; the activation side never got the same treatment.
 ///
 /// Measured headroom on SmolLM2-135M at `g128`: **5.41 dB** on the FFN intermediate, 57% of a whole
-/// SALT plane, at zero bit cost. Converted to perplexity through the research tape, per-group int8
-/// recovers **exactly 64% of the A8 tax** at both weight settings tested (+1.19% → +0.43% at `T=3`,
-/// +1.08% → +0.43% at `T=4`).
+/// SALT plane, at zero bit cost. Through the research tape that converts to recovering **64% of the
+/// A8 tax** (+1.19% → +0.43% at `T=3`, +1.08% → +0.43% at `T=4`).
+///
+/// # In the shipping runtime it is worth ~0.24%, and only without rotation
+///
+/// Measured end to end through `ModelRunner` on a converted T=4/g256 artifact, both bases, four
+/// granularities (`convert_roundtrip::per_group_activation_scales_are_a_substitute_for_rotation`):
+///
+/// | activation scales | rotated | unrotated |
+/// |---|---|---|
+/// | per token (shipping) | 28.2470 | 29.3795 |
+/// | per group g128 | +0.07% | **−0.21%** |
+/// | per group g64 | −0.01% | **−0.24%** |
+///
+/// **Per-group scales and the Hadamard are substitutes, and rotation got there first.** The gain
+/// from per-group scales is `(cols·γ_row²) / Σ_g(width_g·γ_g²)` — large only when the row's maximum
+/// is *concentrated* in one group. Rotation mixes every coordinate into every other, which is
+/// exactly what flattens that ratio, and `SaltLinear::forward` rotates the activation before
+/// quantizing. The tape's figure is not wrong; `forward_aq` does not rotate activations, so it
+/// measured a distribution with its outliers intact.
+///
+/// Rotation itself is worth **3.85%** on the same artifact — roughly 16× the best per-group gain,
+/// and it collects the same win. So this stays available and off.
 ///
 /// # Why this one dequantizes and [`quantize_activation_int8`] does not
 ///

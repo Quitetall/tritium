@@ -317,6 +317,26 @@ fn rotation_reaches_the_artifact_and_does_not_cost_quality() {
 /// Prediction, recorded before the run: the unrotated artifact reproduces something like the tape's
 /// gap; the rotated one stays flat. If **both** are flat the hypothesis is wrong and the tape's
 /// number needs a different explanation.
+///
+/// # Measured 2026-09-16 — the direction holds, the magnitude does not
+///
+/// ```text
+/// SmolLM2-135M | --planes 4 --group 256 --fold-alpha 0.75 | fp 27.8762
+/// activation scales          rotated       vs A8   unrotated       vs A8
+/// per token (SHIPPING)       28.2470           —     29.3795           —
+/// per group g256             28.2521      +0.02%     29.3739      -0.02%
+/// per group g128             28.2679      +0.07%     29.3192      -0.21%
+/// per group g64              28.2445      -0.01%     29.3096      -0.24%
+/// ```
+///
+/// Unrotated, per-group scales help **monotonically** as the group narrows — the signature of the
+/// mechanism actually operating. Rotated, the three arms scatter within ±0.07% of the baseline,
+/// which is noise. The substitution account is confirmed.
+///
+/// But the size settles the lever: **0.24% at best**, against **3.85%** for rotation on the same
+/// artifact (29.3795 → 28.2470). Rotation is ~16× larger and collects the same win by the same
+/// mechanism, so there is no configuration where this is the thing to reach for. The plan ranked it
+/// the top open lever on the tape's +1.19% → +0.43%; measured where it would ship, it is dead.
 #[test]
 #[ignore = "ten full evaluations of a real model on CPU; the per-group arms leave the AVX2 integer path"]
 fn per_group_activation_scales_are_a_substitute_for_rotation() {

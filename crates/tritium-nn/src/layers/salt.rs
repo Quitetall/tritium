@@ -41,15 +41,20 @@ impl SaltLinear {
 
     /// Switch this projection to per-group activation quantization, or back to per-token.
     ///
-    /// One absmax per token means a single outlier sets the step for the whole row. Measured on
-    /// SmolLM2-135M, moving to `g128` recovers **64% of the A8 tax** at both `T=3` and `T=4`
-    /// (+1.19% → +0.43%, +1.08% → +0.43%), for no additional bits — the scales are transient.
+    /// One absmax per token means a single outlier sets the step for the whole row. The research
+    /// tape put the recovery at **64% of the A8 tax**; measured end to end here it is worth
+    /// **0.24% at best, and only on an UNROTATED artifact** — a rotated one shows nothing, because
+    /// the Hadamard already whitened the activation that per-group scales exist to exploit. See
+    /// [`quantize_activation_int8_grouped`] for the table and the mechanism.
     ///
-    /// Off by default, because it is not free everywhere. Per-group scales cannot factor out of the
-    /// dot product, so [`quantize_activation_int8_grouped`] hands the GEMM dequantized f32 rather
-    /// than integers; on this path that costs nothing (`PackedSaltMatrix::project_rows` is an f32
-    /// dot with no integer fast path), but an int8 kernel cannot consume it, and `tritium-cpu`'s
-    /// AVX2 A8 path would silently fall back. Enable it per model, not per build.
+    /// Off by default for two independent reasons. It is worth almost nothing in the configuration
+    /// that ships (rotation is on by default and is worth 3.85%, ~16× more, for the same reason).
+    /// And it is not free: per-group scales cannot factor out of the dot product, so
+    /// [`quantize_activation_int8_grouped`] hands the GEMM dequantized f32 rather than integers. On
+    /// this path that costs no accuracy (`PackedSaltMatrix::project_rows` is an f32 dot with no
+    /// integer fast path to lose) but it does cost time, and an int8 kernel cannot consume it at
+    /// all — `tritium-cpu`'s AVX2 A8 lane checks `act_is_a8_integer` and falls back. Measured: the
+    /// per-group arms roughly doubled the wall time of the evaluation that produced the table.
     pub fn set_activation_group(&mut self, group: Option<usize>) {
         self.activation_group = group;
     }

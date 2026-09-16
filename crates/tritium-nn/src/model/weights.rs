@@ -69,13 +69,15 @@ impl ModelWeights {
     /// per-token. Returns how many projections were touched.
     ///
     /// One absmax per token lets a single outlier set the quantization step for a whole row, and
-    /// LLM activations are outlier-heavy. Measured on SmolLM2-135M, `g128` recovers **64% of the A8
-    /// tax** at both `T=3` and `T=4` for no additional bits — activation scales are transient.
+    /// LLM activations are outlier-heavy. Measured end to end, this is worth **0.24% at best and
+    /// only on an unrotated artifact**; with rotation on — the default — it is worth nothing,
+    /// because the Hadamard already whitens the activation. See
+    /// [`SaltLinear::set_activation_group`] for the table and the mechanism.
     ///
     /// Off by default and switched per model rather than per build, because the per-group path
     /// hands the GEMM dequantized f32 instead of integers (a per-group scale cannot factor out of
-    /// the dot product). On the SALT path that is free; an int8 kernel cannot consume it. See
-    /// [`SaltLinear::set_activation_group`].
+    /// the dot product). On the SALT path that costs no accuracy; an int8 kernel cannot consume it
+    /// at all.
     ///
     /// Only [`Projection::Salt`] responds. The count lets a caller assert it reached a model that
     /// actually has SALT projections rather than silently configuring nothing — a zero return on a
