@@ -194,7 +194,17 @@ pub(crate) fn run(
     // carry one. Version 2 of the TSLB bundle can; the progressive bundle and the GGUF export have
     // no such field, and a reader that cannot rotate the activation would compute `W·H·x` with
     // nothing to signal the error. Refuse rather than write a silently wrong artifact.
-    let rotate = ladder == LadderArg::Geometric && ladder_cfg.rotate;
+    // `--rotate` is a property of the geometric ladder's fitter; ITF has no rotation path. Taking
+    // the flag and quietly dropping it is the same silent-wrong failure this whole guard exists to
+    // prevent, one level up: the user asked for a rotated artifact and would get an unrotated one
+    // with nothing to say so.
+    if ladder_cfg.rotate && ladder != LadderArg::Geometric {
+        bail!(
+            "--rotate applies to --ladder geometric only; the ITF fitter has no rotation path, so \
+             this flag would be silently dropped. Drop --rotate, or pass --ladder geometric."
+        );
+    }
+    let rotate = ladder_cfg.rotate;
     if rotate && !matches!(format, OutputFormat::Sidecar) {
         bail!(
             "--rotate needs a container that can record the rotation, and only the default \

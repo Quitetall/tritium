@@ -220,7 +220,7 @@ fn rotate_reconstructs_the_rotated_fit_and_is_refused_where_it_cannot_be_recorde
     let input = dir.join("w.safetensors");
     std::fs::write(&input, build_safetensors("w", rows, cols, &w)).expect("write input");
 
-    let run = |format: &str, output: &std::path::Path| -> bool {
+    let run_with = |ladder: &str, format: &str, output: &std::path::Path| -> bool {
         std::process::Command::new(tritium_bin())
             .args([
                 "quantize",
@@ -229,7 +229,7 @@ fn rotate_reconstructs_the_rotated_fit_and_is_refused_where_it_cannot_be_recorde
                 "--output",
                 output.to_str().unwrap(),
                 "--ladder",
-                "geometric",
+                ladder,
                 "--planes",
                 &planes.to_string(),
                 "--group",
@@ -242,6 +242,7 @@ fn rotate_reconstructs_the_rotated_fit_and_is_refused_where_it_cannot_be_recorde
             .expect("run tritium quantize")
             .success()
     };
+    let run = |format: &str, output: &std::path::Path| run_with("geometric", format, output);
 
     let sidecar = dir.join("rot.tslb");
     assert!(
@@ -328,6 +329,13 @@ fn rotate_reconstructs_the_rotated_fit_and_is_refused_where_it_cannot_be_recorde
              would produce a file whose codes are in a basis nothing can discover."
         );
     }
+
+    // A flag silently dropped is the same defect one level up: ITF has no rotation path, so taking
+    // `--rotate` there would hand back an unrotated artifact the user believes is rotated.
+    assert!(
+        !run_with("itf", "sidecar", &dir.join("rot-itf.tslb")),
+        "--rotate with --ladder itf must be REFUSED, not accepted and ignored"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
