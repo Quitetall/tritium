@@ -161,7 +161,8 @@ fn f16_block_scales_preserve_every_ladder_plane() {
 #[test]
 #[ignore = "needs a real fp master and a converted artifact"]
 fn artifact_decodes_to_the_fit_on_a_real_model() {
-    use tritium_format::{read_salt_bundle, salt_rows_to_dense};
+    use tritium_format::salt_joint_bundle::read_any_salt_bundle;
+    use tritium_format::salt_rows_to_dense;
     use tritium_nn::calibrate::weight_names;
 
     let dir = PathBuf::from(std::env::var("TRITIUM_MODEL_DIR").expect("set TRITIUM_MODEL_DIR"));
@@ -175,7 +176,8 @@ fn artifact_decodes_to_the_fit_on_a_real_model() {
     let names = weight_names(&arch);
 
     let bytes = std::fs::read(converted.join("model.tslb")).expect("read bundle");
-    let tensors = read_salt_bundle(&bytes).expect("parse bundle");
+    // `convert` writes TSLJ by default; either container decodes to the same rows.
+    let tensors = read_any_salt_bundle(&bytes).expect("parse bundle");
     println!("bundle carries {} tensors", tensors.len());
 
     let mut worst = (String::new(), 0.0f64);

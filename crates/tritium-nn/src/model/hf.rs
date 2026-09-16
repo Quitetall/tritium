@@ -20,7 +20,8 @@ use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
-use tritium_format::{SALT_BUNDLE_MAGIC, SaltBundleReader, SaltGgufReader};
+use tritium_format::salt_joint_bundle::{JointSaltBundleReader, SALT_JOINT_BUNDLE_MAGIC};
+use tritium_format::{PackedSaltRow, SALT_BUNDLE_MAGIC, SaltBundleReader, SaltGgufReader};
 
 use crate::config::{ArchSpec, MlpKind, ModelConfig};
 use crate::error::NnError;
@@ -140,9 +141,18 @@ impl ModelWeights {
                         NnError::MissingTensor(format!("index {}: {e}", bundle.display()))
                     })?,
             ))
+        } else if magic == SALT_JOINT_BUNDLE_MAGIC {
+            // Entropy-coded on disk, no padding; decoded back to TQ2_0 rows per tensor at load, so
+            // every consumer below sees exactly what a TSLB bundle would have given it.
+            SaltTensorSource::Joint(RefCell::new(
+                JointSaltBundleReader::new_strict(BufReader::with_capacity(64 * 1024, artifact))
+                    .map_err(|e| {
+                        NnError::MissingTensor(format!("index {}: {e}", bundle.display()))
+                    })?,
+            ))
         } else {
             return Err(NnError::MissingTensor(format!(
-                "{} is neither TSLB nor SALT-GGUF",
+                "{} is neither TSLB, TSLJ, nor SALT-GGUF",
                 bundle.display()
             )));
         };
@@ -191,6 +201,7 @@ impl ModelWeights {
 
 enum SaltTensorSource {
     Bundle(RefCell<SaltBundleReader<BufReader<File>>>),
+    Joint(RefCell<JointSaltBundleReader<BufReader<File>>>),
     Gguf(RefCell<SaltGgufReader<BufReader<File>>>),
 }
 
@@ -207,6 +218,12 @@ impl SaltTensorSource {
                 })?;
                 Ok(reader.rotation_group().map(usize::from))
             }
+            Self::Joint(reader) => {
+                let reader = reader.try_borrow().map_err(|_| {
+                    NnError::Backend("reentrant SALT bundle header read".to_owned())
+                })?;
+                Ok(reader.rotation_group().map(usize::from))
+            }
             Self::Gguf(_) => Ok(None),
         }
     }
@@ -218,6 +235,27 @@ impl SaltTensorSource {
         expected_k: usize,
     ) -> Result<PackedSaltMatrix, NnError> {
         match self {
+            Self::Joint(reader) => {
+                let mut reader = reader.try_borrow_mut().map_err(|_| {
+                    NnError::Backend(format!("reentrant SALT tensor read for `{name}`"))
+                })?;
+                let (rows, k) = reader
+                    .tensor_info(name)
+                    .map(|i| (i.rows, i.k))
+                    .ok_or_else(|| missing_salt_tensor(name))?;
+                validate_salt_shape(name, (rows, k), expected_rows, expected_k)?;
+                let decoded = reader.read_tensor(name).map_err(|error| {
+                    NnError::MissingTensor(format!("read SALT tensor `{name}`: {error}"))
+                })?;
+                let packed = decoded
+                    .into_iter()
+                    .map(PackedSaltRow::try_from)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| {
+                        NnError::MissingTensor(format!("pack SALT tensor `{name}`: {error}"))
+                    })?;
+                PackedSaltMatrix::new(packed, rows, k)
+            }
             Self::Bundle(reader) => {
                 let mut reader = reader.try_borrow_mut().map_err(|_| {
                     NnError::Backend(format!("reentrant SALT tensor read for `{name}`"))

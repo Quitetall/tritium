@@ -230,6 +230,14 @@ enum Command {
         /// unrotated artifact.
         #[arg(long)]
         no_rotation: bool,
+        /// Write the padded TQ2_0 bundle instead of the entropy-coded `TSLJ` one.
+        ///
+        /// The loaded model is identical either way: `TSLJ` decodes to byte-identical TQ2_0 rows at
+        /// load. Only the file differs. On a T=3 SmolLM2-135M the padded bundle is 7.965 bpw and
+        /// `TSLJ` is 4.577 — TQ2_0 stores a trit in 2 bits where log2(3) suffices and pads every
+        /// row to whole 256-trit blocks. Use this only for a consumer that reads TQ2_0 files.
+        #[arg(long)]
+        dense_container: bool,
         /// Plane count. 4 measures 1.024x fp on SmolLM2-360M without any fold; 3 measures 1.335x.
         #[arg(long, default_value_t = 4)]
         planes: usize,
@@ -598,6 +606,7 @@ fn main() -> anyhow::Result<()> {
             calib_tokens,
             fold_alpha,
             no_rotation,
+            dense_container,
             planes,
             group,
             grid,
@@ -614,6 +623,7 @@ fn main() -> anyhow::Result<()> {
                     grid,
                     rotate: !no_rotation,
                 },
+                dense_container,
             },
         )?,
         Command::Quantize {

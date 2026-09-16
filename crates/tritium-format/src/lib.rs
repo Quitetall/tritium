@@ -57,6 +57,7 @@ mod salt_bundle;
 mod salt_bundle_reader;
 mod salt_gguf;
 mod salt_gguf_reader;
+pub mod salt_joint_bundle;
 pub mod salt_joint_code;
 pub mod salt_v2;
 pub mod salt_v2_master;

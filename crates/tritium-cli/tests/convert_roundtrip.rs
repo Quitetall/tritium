@@ -83,6 +83,18 @@ fn eval_tokens(path: &Path) -> Vec<u32> {
 }
 
 fn convert_with(model: &Path, out: &Path, corpus: &Path, alpha: f64, rotate: bool) {
+    convert_full(model, out, corpus, alpha, rotate, 4, false);
+}
+
+fn convert_full(
+    model: &Path,
+    out: &Path,
+    corpus: &Path,
+    alpha: f64,
+    rotate: bool,
+    planes: usize,
+    dense: bool,
+) {
     let _ = std::fs::remove_dir_all(out);
     let mut cmd = Command::new(tritium_bin());
     cmd.args([
@@ -92,7 +104,7 @@ fn convert_with(model: &Path, out: &Path, corpus: &Path, alpha: f64, rotate: boo
         "--out",
         out.to_str().unwrap(),
         "--planes",
-        "4",
+        &planes.to_string(),
         "--group",
         "256",
         "--fold-alpha",
@@ -100,6 +112,9 @@ fn convert_with(model: &Path, out: &Path, corpus: &Path, alpha: f64, rotate: boo
     ]);
     if !rotate {
         cmd.arg("--no-rotation");
+    }
+    if dense {
+        cmd.arg("--dense-container");
     }
     if alpha != 0.0 {
         cmd.args(["--calib", corpus.to_str().unwrap()]);
@@ -120,11 +135,25 @@ fn convert(model: &Path, out: &Path, corpus: &Path, alpha: f64) {
 
 /// The Hadamard group an artifact declares, or `None` for an unrotated (version-1) bundle.
 fn bundle_rotation_group(dir: &Path) -> Option<usize> {
-    let file = std::fs::File::open(dir.join("model.tslb")).expect("open bundle");
-    tritium_format::SaltBundleReader::new_strict(std::io::BufReader::new(file))
-        .expect("parse bundle")
-        .rotation_group()
-        .map(usize::from)
+    let path = dir.join("model.tslb");
+    let mut magic = [0u8; 4];
+    std::io::Read::read_exact(
+        &mut std::fs::File::open(&path).expect("open bundle"),
+        &mut magic,
+    )
+    .expect("read magic");
+    let file = std::io::BufReader::new(std::fs::File::open(&path).expect("open bundle"));
+    // `convert` writes TSLJ by default and TQ2_0 under --dense-container; both record the group.
+    if magic == tritium_format::salt_joint_bundle::SALT_JOINT_BUNDLE_MAGIC {
+        tritium_format::salt_joint_bundle::JointSaltBundleReader::new_strict(file)
+            .expect("parse TSLJ bundle")
+            .rotation_group()
+    } else {
+        tritium_format::SaltBundleReader::new_strict(file)
+            .expect("parse TSLB bundle")
+            .rotation_group()
+    }
+    .map(usize::from)
 }
 
 fn score(mut runner: ModelRunner, tokens: &[u32]) -> f64 {
@@ -434,5 +463,93 @@ fn per_group_activation_scales_are_a_substitute_for_rotation() {
         "per-group scales bought {gain_plain:+.2}% unrotated and {gain_rot:+.2}% rotated. The \
          substitution account predicts the first is clearly larger; it is not, so the account is \
          wrong and the tape's recovery figure has some other cause"
+    );
+}
+
+/// **The unpadded container changes the file and nothing else.**
+///
+/// `convert` writes `TSLJ` by default: joint-symbol Huffman, no block padding, decoded back to
+/// TQ2_0 rows at load. That is only safe if the loaded model is *exactly* the one the padded file
+/// would have produced — not close, identical — because every published number was measured
+/// against TQ2_0 rows.
+///
+/// So the same model is converted twice, and three things are asserted:
+///
+/// 1. every tensor decodes to **byte-identical** rows from both files;
+/// 2. both load through `ModelRunner` and score **bit-identical** perplexity;
+/// 3. the `TSLJ` file is materially smaller.
+///
+/// Row identity alone would not be enough: it proves the format, not the loader's `TSLJ` branch.
+/// Perplexity through the runtime proves the whole path.
+#[test]
+#[ignore = "two conversions and two evaluations of a real model on CPU"]
+fn unpadded_container_changes_the_file_and_nothing_else() {
+    let model = PathBuf::from(
+        std::env::var("TRITIUM_MODEL_DIR").expect("set TRITIUM_MODEL_DIR to an fp model directory"),
+    );
+    let corpus = PathBuf::from(
+        std::env::var("TRITIUM_CORPUS").expect("set TRITIUM_CORPUS to a corpus json"),
+    );
+    // A short slice suffices: the claim is equality, and equality on any window is exact.
+    let tokens: Vec<u32> = eval_tokens(&corpus).into_iter().take(1024).collect();
+
+    let root = std::env::temp_dir().join(format!("tritium-tslj-{}", std::process::id()));
+    let joint = root.join("joint");
+    let dense = root.join("dense");
+    convert_full(&model, &joint, &corpus, 0.75, true, 3, false);
+    convert_full(&model, &dense, &corpus, 0.75, true, 3, true);
+
+    let jb = std::fs::read(joint.join("model.tslb")).expect("read TSLJ");
+    let db = std::fs::read(dense.join("model.tslb")).expect("read TSLB");
+    assert_eq!(
+        &jb[..4],
+        b"TSLJ",
+        "default convert must write the unpadded container"
+    );
+    assert_eq!(&db[..4], b"TSLB", "--dense-container must write TQ2_0");
+
+    use tritium_format::salt_joint_bundle::read_any_salt_bundle;
+    let jt = read_any_salt_bundle(&jb).expect("decode TSLJ");
+    let dt = read_any_salt_bundle(&db).expect("decode TSLB");
+    assert_eq!(jt.len(), dt.len(), "tensor count");
+    let params: usize = dt.iter().map(|t| t.rows * t.k).sum();
+    for (a, b) in jt.iter().zip(&dt) {
+        assert_eq!(
+            a, b,
+            "tensor `{}` decodes differently from the two containers",
+            b.name
+        );
+    }
+
+    let ppl_joint = score_converted(&joint, &tokens);
+    let ppl_dense = score_converted(&dense, &tokens);
+    let _ = std::fs::remove_dir_all(&root);
+
+    let bpw = |n: usize| n as f64 * 8.0 / params as f64;
+    println!(
+        "T=3 g256 rotated | {} tensors, {params} weights, all rows byte-identical\n  \
+         TSLB (padded TQ2_0) {:>12} bytes  {:.4} bpw  ppl {ppl_dense:.6}\n  \
+         TSLJ (joint, unpadded) {:>9} bytes  {:.4} bpw  ppl {ppl_joint:.6}\n  \
+         file {:+.2}%",
+        dt.len(),
+        db.len(),
+        bpw(db.len()),
+        jb.len(),
+        bpw(jb.len()),
+        100.0 * (jb.len() as f64 - db.len() as f64) / db.len() as f64
+    );
+
+    assert_eq!(
+        ppl_joint.to_bits(),
+        ppl_dense.to_bits(),
+        "the two containers scored {ppl_joint} and {ppl_dense}. Rows were identical, so the \
+         loader's TSLJ branch is building the matrix differently from the TSLB one"
+    );
+    assert!(
+        (jb.len() as f64) < 0.7 * db.len() as f64,
+        "TSLJ is {} bytes against TSLB's {}; measured at 4.58 vs 7.97 bpw, anything above 70% means \
+         the coder is not doing its job",
+        jb.len(),
+        db.len()
     );
 }

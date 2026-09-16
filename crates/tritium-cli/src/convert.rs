@@ -96,6 +96,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use tritium_format::salt_joint_bundle::write_joint_salt_bundle;
 use tritium_format::{SaltRow, salt_rows_to_dense, write_rotated_salt_bundle, write_salt_bundle};
 use tritium_nn::calibrate::{Calib, calibrate, extract, fold, norm_tensors, weight_names};
 use tritium_nn::{HfJsonTokenizer, ModelRunner, Tokenizer};
@@ -124,6 +125,9 @@ pub(crate) struct ConvertConfig {
     pub(crate) calib_tokens: usize,
     pub(crate) fold_alpha: f64,
     pub(crate) ladder: LadderConfig,
+    /// Write the padded TQ2_0 bundle instead of the entropy-coded one. The kernel format is the
+    /// same either way — only what sits on disk differs.
+    pub(crate) dense_container: bool,
 }
 
 pub(crate) fn run(model: &Path, out: &Path, cfg: &ConvertConfig) -> Result<()> {
@@ -248,12 +252,34 @@ pub(crate) fn run(model: &Path, out: &Path, cfg: &ConvertConfig) -> Result<()> {
     // A rotated fit stores codes in the rotated basis, so the artifact has to say so: the runtime
     // must apply the same Hadamard to the activation, and a reader that cannot would otherwise
     // compute `W·H·x` silently. Version 2 makes such a reader fail closed instead.
-    let bundle = if cfg.ladder.rotate {
-        let group = u16::try_from(cfg.ladder.group)
-            .context("--group does not fit the bundle's u16 rotation field")?;
-        write_rotated_salt_bundle(&refs, group).context("serialize rotated SALT bundle")?
+    let rotation_group = if cfg.ladder.rotate {
+        Some(
+            u16::try_from(cfg.ladder.group)
+                .context("--group does not fit the bundle's u16 rotation field")?,
+        )
     } else {
-        write_salt_bundle(&refs).context("serialize SALT bundle")?
+        None
+    };
+    // The file stores the information; the kernel format is rebuilt at load. TQ2_0 on disk spends
+    // 2 bits per trit where log2(3) suffices and pads every row to whole 256-trit blocks — measured
+    // 7.965 bpw for a T=3 SmolLM2-135M against 4.577 for the same weights entropy-coded.
+    let (bundle, container) = if cfg.dense_container {
+        let bytes = match rotation_group {
+            Some(group) => {
+                write_rotated_salt_bundle(&refs, group).context("serialize rotated SALT bundle")?
+            }
+            None => write_salt_bundle(&refs).context("serialize SALT bundle")?,
+        };
+        (
+            bytes,
+            "TQ2_0 planes, padded to 256-trit blocks (2 bits/trit + f16 scale per block)",
+        )
+    } else {
+        (
+            write_joint_salt_bundle(&refs, rotation_group)
+                .context("serialize joint-coded SALT bundle")?,
+            "TSLJ joint-symbol Huffman, unpadded (scales as TQ2_0 stores them)",
+        )
     };
     let bundle_path = out.join("model.tslb");
     std::fs::write(&bundle_path, &bundle)
@@ -288,6 +314,7 @@ pub(crate) fn run(model: &Path, out: &Path, cfg: &ConvertConfig) -> Result<()> {
         &fidelity,
         total_params,
         bundle.len(),
+        container,
     )?;
 
     // Load the artifact back before claiming success. Every failure mode this command can have —
@@ -303,7 +330,9 @@ pub(crate) fn run(model: &Path, out: &Path, cfg: &ConvertConfig) -> Result<()> {
             )
         })?;
 
-    let bpw = cfg.ladder.realizable_bpw();
+    // What the FILE costs, not the logical per-plane rate. This used to print the latter, which
+    // omitted block padding and read 6.1875 for a T=3 artifact that was 7.965 bpw on disk.
+    let bpw = bundle.len() as f64 * 8.0 / total_params as f64;
     // The bundle version already encodes this, but the line a user reads should not have to
     // be cross-checked against a byte offset.
     let rotation_desc = if cfg.ladder.rotate {
@@ -314,7 +343,7 @@ pub(crate) fn run(model: &Path, out: &Path, cfg: &ConvertConfig) -> Result<()> {
     println!(
         "converted {} tensors ({:.2}M params) | ladder geometric, {} planes, g{}, grid {}, \
          {rotation_desc}, {fold_desc} → {} ({:.1} MiB bundle + {:.1} KiB norms + config + \
-         {copied_assets} tokenizer files, {bpw:.4} bpw)",
+         {copied_assets} tokenizer files, {bpw:.4} bpw on disk)",
         names.len(),
         total_params as f64 / 1e6,
         cfg.ladder.planes,
@@ -394,6 +423,7 @@ fn write_receipt(
     fidelity: &[TensorFidelity],
     total_params: usize,
     bundle_bytes: usize,
+    container: &str,
 ) -> Result<f64> {
     let sq_error: f64 = fidelity.iter().map(|f| f.sq_error).sum();
     let sq_weight: f64 = fidelity.iter().map(|f| f.sq_weight).sum();
@@ -434,9 +464,11 @@ fn write_receipt(
         },
         "cost": {
             "parameters": total_params,
-            "bits_per_weight": cfg.ladder.realizable_bpw(),
+            // The file, measured. The kernel's in-memory rate is `in_memory_bits_per_weight`.
+            "bits_per_weight": bundle_bytes as f64 * 8.0 / total_params as f64,
+            "in_memory_bits_per_weight": cfg.ladder.realizable_bpw(),
             "bundle_bytes": bundle_bytes,
-            "container": "TQ2_0 planes (2 bits/trit + one f16 scale per 256)",
+            "container": container,
         },
         "fidelity": {
             "whole_model_relative_frobenius_error": whole_model,
