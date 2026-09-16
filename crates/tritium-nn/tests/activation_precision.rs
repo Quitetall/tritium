@@ -18,12 +18,61 @@
 //!
 //! # What this harness does and does not cover
 //!
-//! It quantizes the inputs to q/k/v, gate/up, down, and the tied head. It does **not** quantize
-//! `o_proj`'s input, which lives inside `attention()`. So one of seven projections per layer keeps
-//! fp32 activations and every number here is an **upper bound** on a real deployment at the same
-//! setting. A "fully ternary" claim from this file would be false, and is not made.
+//! It quantizes **every** projection input: q/k/v, `o`, gate/up, down, and the tied head.
+//! `o_proj`'s input used to be exempt because it lived inside `attention()`, which made every
+//! number here an upper bound with one of seven projections per layer unpenalised.
+//! `nn::attention_heads` splits that projection out, so the caveat is retired.
+//!
+//! What is still **not** covered: the attention interior itself — Q·Kᵀ, the softmax, and P·V run in
+//! fp32 regardless. So "fully ternary" remains false of this harness, and is not claimed.
 //!
 //! Weights are held at a fixed `T` throughout so the only moving part is activation precision.
+//!
+//! # Measured 2026-09-16 — SmolLM2-135M, weights ladder T=3/g128, fp 22.675
+//!
+//! ```text
+//! activation precision                       ppl       x fp      vs A-fp32
+//! fp32 (published basis)                  24.278     1.071x             —
+//! int8 per row (SHIPPING)                 24.542     1.082x        +1.09%
+//! int8 per group g128                     24.356     1.074x        +0.32%
+//! int4 per row                          1327.664    58.551x     +5368.51%
+//! int4 per group g128                     74.884     3.302x      +208.44%
+//! TERNARY 6 plane(s), 9.51 bits           24.289     1.071x        +0.04%
+//! TERNARY 5 plane(s), 7.92 bits           24.355     1.074x        +0.32%
+//! TERNARY 4 plane(s), 6.34 bits           25.126     1.108x        +3.49%
+//! TERNARY 3 plane(s), 4.75 bits           33.470     1.476x       +37.86%
+//! TERNARY 2 plane(s), 3.17 bits          350.623    15.463x     +1344.18%
+//! TERNARY 1 plane(s), 1.58 bits       377273.282 16638.066x  +1553850.66%
+//! per tap [4,4,4,4,4] (control)           25.126     1.108x        +3.49%
+//! per tap [3,4,5,4,4]                     25.220     1.112x        +3.88%
+//! per tap [3,3,6,4,4]                     25.821     1.139x        +6.35%
+//! per tap [4,4,6,3,3]                     29.961     1.321x       +23.40%
+//! per tap [5,5,2,4,4] (anti-control)      36.388     1.605x       +49.88%
+//! ```
+//!
+//! **Ternary x5 costs 7.92 bits — less than int8 — and beats the shipping int8 quantizer 3.4x**
+//! (+0.32% against +1.09%), matching int8-per-group exactly while needing no multiplies. That is
+//! the L2 result and it is the one to act on. x6 at 9.51 bits is near-lossless (+0.04%) but no
+//! longer cheaper than a byte.
+//!
+//! Ternary also dominates integers at sub-byte width by a wide margin: x4 at 6.34 bits is +3.49%
+//! where int4-per-group at 4 bits is +208% — 60x better. The additive ladder transfers to
+//! activations; a flat 4-bit grid does not.
+//!
+//! **Per-tap allocation loses, 4 arms out of 4.** Every arm spends 20 planes, so each is
+//! bit-neutral against the uniform control — which it reproduces to the digit (25.126), proving the
+//! plumbing changes nothing by itself.
+//!
+//! Two things make this a stronger negative than the weight-side campaign it echoes. First, the
+//! headroom signal is demonstrably REAL and correctly signed: the anti-control, which starves
+//! `down_in` (5.41 dB of measured headroom) to feed the taps with the least, is by far the worst
+//! arm at +49.88%. Second, the standing excuse for the weight-side failure was proxy over-fitting
+//! across 1.14M decisions from one noisy scalar each. **This problem has five decision units and an
+//! exactly-measured budget, and allocation still loses.** That explanation does not survive.
+//!
+//! What is visible instead is the 9x asymmetry: removing a plane costs about 9x what adding one
+//! saves, so `[4,4,6,3,3]` — which takes two planes from `o` and the head — pays +23.40% to buy
+//! two planes on the tap that most wants them. The opportunity is self-extinguishing.
 //!
 //! ```text
 //! TRITIUM_CORPUS=$HOME/.cache/tritium-corpora/wikitext2_400k_32k.json \
@@ -278,9 +327,9 @@ fn activation_precision_sweep() {
 
     println!(
         "SmolLM2-135M | fp {ppl_fp:.3} | fold α=0.75 | weights: ladder T={t_w}, g{WEIGHT_GROUP}\n\
-         Activations quantized at q/k/v, gate/up, down and the tied head.\n\
-         o_proj's input is NOT quantized (it lives inside attention()), so these are an UPPER\n\
-         BOUND on a real deployment at the same setting — 1 of 7 projections is unpenalised.\n"
+         Every projection input is quantized: q/k/v, o, gate/up, down and the tied head.\n\
+         o_proj's used to be exempt (it lived inside attention()); `attention_heads` splits it\n\
+         out, so the old 'upper bound, 1 of 7 unpenalised' caveat no longer applies.\n"
     );
     println!(
         "{:<34} {:>11} {:>10} {:>14}",
