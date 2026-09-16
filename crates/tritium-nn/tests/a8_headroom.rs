@@ -172,8 +172,8 @@ fn a8_headroom_per_group_vs_per_row() {
                     Tap::AttnIn => &mut attn,
                     Tap::FfnIn => &mut ffn,
                     Tap::DownIn => &mut down,
-                    // calibrate_tapped never emits Head; only forward_aq does.
-                    Tap::Head => return,
+                    // calibrate_tapped emits neither Head nor OProjIn; only forward_aq does.
+                    Tap::Head | Tap::OProjIn => return,
                 };
                 measure(act, seq, cols, slot);
                 measure(act, seq, cols, &mut per_layer[li]);
@@ -260,7 +260,7 @@ fn tapped_calibrate_matches_the_original() {
                 Tap::AttnIn => &mut b.attn_in[li],
                 Tap::FfnIn => &mut b.ffn_in[li],
                 Tap::DownIn => &mut b.down_in[li],
-                Tap::Head => return,
+                Tap::Head | Tap::OProjIn => return,
             };
             tritium_nn::calibrate::accumulate(t, id, seq, cols, acc);
         });

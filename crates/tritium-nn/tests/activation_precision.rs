@@ -113,14 +113,14 @@ enum Mode {
     /// Additive ternary planes with the geometric ladder, i.e. the weight-side representation
     /// applied to activations. `T` planes ⇒ `T * 1.58` bits per value, multiply-free.
     Ternary(usize),
-    /// Ternary planes allocated **per tap**: `[attn_in, ffn_in, down_in, head]`.
+    /// Ternary planes allocated **per tap**: `[attn_in, ffn_in, down_in, o_proj_in, head]`.
     ///
     /// The A8 headroom measurement found the taps are not alike — 5.41 dB available on the FFN
     /// intermediate against ~1.7 dB elsewhere, a 3.2x spread — and `down_in` is the one activation
-    /// in the block that is NOT post-RMSNorm. With only four decision units, allocation here is
+    /// in the block that is NOT post-RMSNorm. With only five decision units, allocation here is
     /// nothing like the 211-tensor weight-side problem that has failed every test: the search space
     /// is small enough to enumerate, and the budget accounting is exact.
-    TernaryPerTap([usize; 4]),
+    TernaryPerTap([usize; 5]),
 }
 
 /// Ternary bits per activation value at `T` planes. `log2(3) = 1.58496`.
@@ -154,7 +154,8 @@ impl Mode {
                     Tap::AttnIn => 0,
                     Tap::FfnIn => 1,
                     Tap::DownIn => 2,
-                    Tap::Head => 3,
+                    Tap::OProjIn => 3,
+                    Tap::Head => 4,
                 }],
             ),
             _ => None,
@@ -301,16 +302,19 @@ fn activation_precision_sweep() {
         Mode::Ternary(3),
         Mode::Ternary(2),
         Mode::Ternary(1),
-        // L3. Four decision units, order [attn_in, ffn_in, down_in, head]. Every arm below averages
-        // 4 planes, so each is bit-neutral against uniform T=4 and the comparison is a pure
-        // allocation question. `down_in` is the tap the headroom measurement says is starved.
-        Mode::TernaryPerTap([4, 4, 4, 4]),
-        Mode::TernaryPerTap([3, 3, 5, 5]),
-        Mode::TernaryPerTap([3, 4, 5, 4]),
-        Mode::TernaryPerTap([4, 4, 6, 2]),
-        // The control: spend the extra planes where the headroom is LOWEST. If this ties the arm
-        // above, the per-tap signal is noise and the measurement says so.
-        Mode::TernaryPerTap([5, 5, 3, 3]),
+        // L3. Five decision units, order [attn_in, ffn_in, down_in, o_proj_in, head]. Every arm
+        // below sums to 20 planes, so each is bit-neutral against uniform T=4 and the comparison is
+        // a pure allocation question. `down_in` is the tap the headroom measurement says is starved.
+        //
+        // The degenerate control comes first: an all-4 allocation must reproduce uniform T=4
+        // exactly, which is what proves the per-tap plumbing is not itself changing the answer.
+        Mode::TernaryPerTap([4, 4, 4, 4, 4]),
+        Mode::TernaryPerTap([3, 4, 5, 4, 4]),
+        Mode::TernaryPerTap([3, 3, 6, 4, 4]),
+        Mode::TernaryPerTap([4, 4, 6, 3, 3]),
+        // The anti-control: spend the extra planes where the measured headroom is LOWEST. If this
+        // ties the arms above, the per-tap signal is noise and the measurement says so out loud.
+        Mode::TernaryPerTap([5, 5, 2, 4, 4]),
     ] {
         let ppl = perplexity_aq(&qw, &arch, &eval, EVAL_WINDOW, mode);
         if baseline.is_nan() {

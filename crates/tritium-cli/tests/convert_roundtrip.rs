@@ -288,22 +288,38 @@ fn rotation_reaches_the_artifact_and_does_not_cost_quality() {
     );
 }
 
-/// **How much of the int8-activation tax do per-group scales recover in the shipping runtime?**
+/// **Do per-group activation scales still help once the activation is rotated?**
 ///
-/// `quantize_activation_int8` takes one absmax per token over the whole row, so one outlier sets
-/// the step for every value in it. The research tape says moving to per-group scales recovers
-/// **exactly 64%** of the A8 tax at both weight settings tested (+1.19% → +0.43% at `T=3`,
-/// +1.08% → +0.43% at `T=4`) for no additional bits — activation scales are transient.
+/// The A8 headroom measurement found **5.41 dB** available on the FFN intermediate from per-group
+/// scales, and through the research tape that converted to recovering **exactly 64% of the A8 tax**
+/// at both weight settings (+1.19% → +0.43% at `T=3`, +1.08% → +0.43% at `T=4`). On that evidence
+/// this was the highest-ranked open lever in the plan: a quality win for zero bits.
 ///
-/// That was measured through `forward_aq`, which is not what anybody runs. This measures it where
-/// it would ship: one converted artifact, four evaluations through `ModelRunner`, only the
-/// activation granularity moving.
+/// Measured here, in the shipping runtime, it is **worth nothing** — and the reason is mechanical.
 ///
-/// Prediction, recorded before the first run so being wrong is visible: per-group is better than
-/// per-token by a few tenths of a percent, and `g128` is at least as good as `g256`.
+/// # The two are substitutes, and rotation got there first
+///
+/// Per-group scales pay off in proportion to how *concentrated* the outliers are: `gain =
+/// (cols·γ_row²) / Σ_g(width_g·γ_g²)`, which is `1` for a flat row and large only when the row's
+/// maximum lives in one group. The Hadamard does exactly the thing that flattens that ratio — it
+/// mixes every coordinate into every other, which is why rotation helps the ladder in the first
+/// place — and `SaltLinear::forward` applies it to the activation **before** quantizing.
+///
+/// `forward_aq`, where the +1.19% → +0.43% was measured, does **not** rotate activations. So the
+/// tape measured per-group scales against an unrotated distribution with its outliers intact. Both
+/// numbers are right; they are measurements of different activations.
+///
+/// # Design
+///
+/// Two artifacts, identical but for `--no-rotation`, four activation granularities each, all eight
+/// through the same `ModelRunner`. Ratios within an arm, so the comparison is exact.
+///
+/// Prediction, recorded before the run: the unrotated artifact reproduces something like the tape's
+/// gap; the rotated one stays flat. If **both** are flat the hypothesis is wrong and the tape's
+/// number needs a different explanation.
 #[test]
-#[ignore = "four full evaluations of a real model on CPU"]
-fn per_group_activations_recover_part_of_the_a8_tax() {
+#[ignore = "ten full evaluations of a real model on CPU; the per-group arms leave the AVX2 integer path"]
+fn per_group_activation_scales_are_a_substitute_for_rotation() {
     let model = PathBuf::from(
         std::env::var("TRITIUM_MODEL_DIR").expect("set TRITIUM_MODEL_DIR to an fp model directory"),
     );
@@ -313,70 +329,90 @@ fn per_group_activations_recover_part_of_the_a8_tax() {
     let tokens = eval_tokens(&corpus);
     assert_eq!(tokens.len(), EVAL_TOKENS, "corpus is too small");
 
-    let dir = std::env::temp_dir().join(format!("tritium-a8g-{}", std::process::id()));
-    convert_with(&model, &dir, &corpus, 0.75, true);
-
+    let root = std::env::temp_dir().join(format!("tritium-a8g-{}", std::process::id()));
     let fp = score(
         ModelRunner::from_hf(&model, Box::new(tritium_cpu::CpuBackend::new()))
             .expect("load fp master"),
         &tokens,
     );
-
-    // Same artifact every time; only `set_salt_activation_group` differs.
-    let score_at = |group: Option<usize>| -> f64 {
-        let mut runner = ModelRunner::from_salt(
-            &dir,
-            &dir.join("model.tslb"),
-            Box::new(tritium_cpu::CpuBackend::new()),
-        )
-        .expect("load converted model");
-        let touched = runner.weights.set_salt_activation_group(group);
-        assert!(
-            touched > 0,
-            "no SALT projection was configured — the model is not on the path under test, so a \
-             flat result here would mean nothing"
-        );
-        score(runner, &tokens)
-    };
-
-    let per_token = score_at(None);
-    let g256 = score_at(Some(256));
-    let g128 = score_at(Some(128));
-    let g64 = score_at(Some(64));
-    let _ = std::fs::remove_dir_all(&dir);
-
-    println!("\nSmolLM2-135M | convert --planes 4 --group 256, fold 0.75, rotated | fp {fp:.4}");
+    println!("\nSmolLM2-135M | --planes 4 --group 256 --fold-alpha 0.75 | fp {fp:.4}");
     println!(
-        "{:<34} {:>11} {:>9} {:>14}",
-        "activation scales", "ppl", "x fp", "vs per-token"
+        "{:<22} {:>11} {:>11} {:>11} {:>11}",
+        "activation scales", "rotated", "vs A8", "unrotated", "vs A8"
     );
-    println!("{}", "-".repeat(72));
-    for (label, ppl) in [
-        ("per token (SHIPPING)", per_token),
-        ("per group g256", g256),
-        ("per group g128", g128),
-        ("per group g64", g64),
-    ] {
-        let delta = if (ppl - per_token).abs() < 1e-12 {
+    println!("{}", "-".repeat(70));
+
+    // [rotated, unrotated] x [per-token, g256, g128, g64].
+    let mut table = [[0.0f64; 4]; 2];
+    for (arm, rotate) in [(0usize, true), (1usize, false)] {
+        let dir = root.join(if rotate { "rot" } else { "plain" });
+        convert_with(&model, &dir, &corpus, 0.75, rotate);
+        for (slot, group) in [None, Some(256), Some(128), Some(64)]
+            .into_iter()
+            .enumerate()
+        {
+            let mut runner = ModelRunner::from_salt(
+                &dir,
+                &dir.join("model.tslb"),
+                Box::new(tritium_cpu::CpuBackend::new()),
+            )
+            .expect("load converted model");
+            let touched = runner.weights.set_salt_activation_group(group);
+            assert!(
+                touched > 0,
+                "no SALT projection was configured — the model is not on the path under test, so \
+                 a flat result here would mean nothing"
+            );
+            table[arm][slot] = score(runner, &tokens);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    let _ = std::fs::remove_dir_all(&root);
+
+    let pct = |v: f64, base: f64| {
+        if (v - base).abs() < 1e-12 {
             "—".to_owned()
         } else {
-            format!("{:+.2}%", 100.0 * (ppl - per_token) / per_token)
-        };
-        println!("{label:<34} {ppl:>11.4} {:>8.4}x {delta:>14}", ppl / fp);
+            format!("{:+.2}%", 100.0 * (v - base) / base)
+        }
+    };
+    for (slot, label) in [
+        "per token (SHIPPING)",
+        "per group g256",
+        "per group g128",
+        "per group g64",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        println!(
+            "{label:<22} {:>11.4} {:>11} {:>11.4} {:>11}",
+            table[0][slot],
+            pct(table[0][slot], table[0][0]),
+            table[1][slot],
+            pct(table[1][slot], table[1][0]),
+        );
     }
 
-    assert!(
-        [g256, g128, g64].iter().all(|p| p.is_finite() && *p > 0.0),
-        "a per-group arm did not produce a usable model"
+    let best = |row: [f64; 4]| row[1].min(row[2]).min(row[3]);
+    let gain_rot = 100.0 * (table[0][0] - best(table[0])) / table[0][0];
+    let gain_plain = 100.0 * (table[1][0] - best(table[1])) / table[1][0];
+    println!(
+        "\nbest per-group gain over per-token:  rotated {gain_rot:+.2}%  |  unrotated {gain_plain:+.2}%"
     );
-    // The directional claim. Narrower groups can only reduce quantization error (each group's
-    // absmax is at most the row's), so a per-group arm scoring WORSE means the plumbing is wrong,
-    // not that the idea failed.
+
     assert!(
-        g128 <= per_token,
-        "per-group g128 ({g128:.4}) is worse than per-token ({per_token:.4}). Each group's absmax \
-         is bounded by the row's, so this cannot be a property of the quantizer — check that the \
-         dequantized values are reaching the GEMM and that the per-token scale fold is not being \
-         applied twice"
+        table.iter().flatten().all(|p| p.is_finite() && *p > 0.0),
+        "an arm did not produce a usable model"
+    );
+    // The claim. Rotation whitens the activation, so it should leave per-group scales far less to
+    // recover than they find in the original basis. A failure here does NOT mean the plumbing is
+    // broken — it means the substitution account is wrong and the tape's +1.19% -> +0.43% needs
+    // another explanation.
+    assert!(
+        gain_plain > gain_rot,
+        "per-group scales bought {gain_plain:+.2}% unrotated and {gain_rot:+.2}% rotated. The \
+         substitution account predicts the first is clearly larger; it is not, so the account is \
+         wrong and the tape's recovery figure has some other cause"
     );
 }

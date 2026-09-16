@@ -26,7 +26,7 @@
 //! sharing kv dims — exactly the case the salience fold also skips.
 
 use tritium_train::Tape;
-use tritium_train::nn::attention;
+use tritium_train::nn::{attention, attention_heads};
 use tritium_train::tape::ValueId;
 
 use crate::{Mlp, ModelRunner, Projection};
@@ -199,10 +199,10 @@ pub type ActFn<'a> = dyn FnMut(Tap, usize, &mut [f32], usize, usize) + 'a;
 /// costs +2.76% at T=4 and DOUBLES the excess over fp. Measuring any other activation precision
 /// meant a second forward pass nobody had written.
 ///
-/// **Not covered: `o_proj`'s input.** It lives inside [`attention`], which this does not
-/// instrument, so `o` keeps fp32 activations here. Results are therefore an upper bound on a real
-/// deployment at the same setting — one of seven projections per layer is unpenalised. Stated
-/// rather than hidden, because a "fully ternary" claim from this harness would be false.
+/// **Every projection input is covered**, `o_proj`'s included: it used to live inside
+/// [`attention`], where nothing could reach it, so results carried an upper-bound caveat with one
+/// of seven projections per layer unpenalised. [`attention_heads`] splits the output projection off
+/// so this pass can tap and quantize it like any other.
 pub fn forward_aq(
     t: &mut Tape,
     wids: &[ValueId],
@@ -231,13 +231,15 @@ pub fn forward_aq(
         let an = t.leaf(a.attn_norms[li].clone());
         let xn = t.rmsnorm(hidden, an, seq, a.n_embd, a.eps);
         let xn = requant(t, xn, Tap::AttnIn, li, seq, a.n_embd, aq);
-        let attn = attention(
+        // Split so `o_proj`'s input is reachable. Running `attention` whole would leave one
+        // projection per layer at fp32 and make every number here an upper bound.
+        let qd = a.n_head * a.head_dim;
+        let heads = attention_heads(
             t,
             xn,
             wids[base],
             wids[base + 1],
             wids[base + 2],
-            wids[base + 3],
             seq,
             a.n_embd,
             a.n_head,
@@ -245,6 +247,8 @@ pub fn forward_aq(
             a.head_dim,
             a.theta,
         );
+        let heads = requant(t, heads, Tap::OProjIn, li, seq, qd, aq);
+        let attn = t.dense_matmul(heads, wids[base + 3], seq, a.n_embd, qd);
         hidden = t.add(hidden, attn);
         let fnw = t.leaf(a.ffn_norms[li].clone());
         let hn = t.rmsnorm(hidden, fnw, seq, a.n_embd, a.eps);
@@ -310,6 +314,14 @@ pub enum Tap {
     /// Input to down — `silu(gate) * up`, the FFN intermediate. NOT normalised, and the widest
     /// activation in the block, so this is where activation outliers are worst.
     DownIn,
+    /// Input to `o_proj` — the concatenated head outputs, `[seq, n_head * head_dim]`.
+    ///
+    /// The one projection input a block used to hide inside `attention`, which is why every
+    /// activation-precision number in this repo carried an "upper bound: 1 of 7 projections is
+    /// unpenalised" caveat, and why the salience proxy falls back to a global mean for `o`. Never a
+    /// calibration tap for the fold — the fold's other half divides the preceding norm, and `o_proj`
+    /// has no norm in front of it, only attention.
+    OProjIn,
     /// Input to the tied output head. Never a calibration tap; used by [`forward_aq`] so an
     /// activation-precision sweep does not silently leave the largest projection at fp32.
     Head,
@@ -371,9 +383,10 @@ pub fn calibrate(weights: &[Vec<f32>], a: &Arch, tokens: &[u32], c: &mut Calib) 
             Tap::AttnIn => &mut c.attn_in[li],
             Tap::FfnIn => &mut c.ffn_in[li],
             Tap::DownIn => &mut c.down_in[li],
-            // The tied head has no foldable scale, so there is no accumulator for it and
-            // `calibrate_tapped` never emits this. Only `forward_aq` does.
-            Tap::Head => return,
+            // Neither the tied head nor `o_proj` has a foldable scale — the fold's other half
+            // divides the norm feeding the projection, and these two have no norm in front of
+            // them. `calibrate_tapped` never emits either; only `forward_aq` does.
+            Tap::Head | Tap::OProjIn => return,
         };
         accumulate(t, id, seq, cols, acc);
     });
