@@ -48,6 +48,32 @@
 //! but the weights are the same tensor, so compensating it as a head corrupts it as a gather. This
 //! is the same tie that makes it unfoldable, and it is the most sensitive tensor in the model.
 //!
+//! # Measured 2026-09-16 — it works; the first run was under-sampled
+//!
+//! The first version collected the Gram from **1,024 tokens** and lost by +2.98%. GPTQ losing to
+//! plain rounding at 4.75 bits is a red flag for the experiment, not a result, and the cause was
+//! visible in the shapes: `down_proj`'s input is **1,536 wide**, so a Gram from fewer tokens than
+//! that is rank-deficient by construction. In its null directions `H⁻¹` is enormous, so
+//! compensation dumps error there freely — and on held-out data those directions carry activation.
+//!
+//! ```text
+//! Gram tokens   damp 0.01   damp 0.1
+//!     1,024       +3.02%      +1.31%
+//!     4,096       +0.73%      -0.15%
+//!    12,288       -0.49%      -0.46%     <- beats the shipping Euclidean fit
+//! ```
+//!
+//! Three things pin the diagnosis. The loss falls **monotonically** with sample count at either
+//! damping. More damping helps a *lot* when samples are scarce (+3.02% → +1.31%) — it is
+//! regularizing a badly-estimated matrix. And at 12,288 tokens the two dampings **converge** to
+//! within 0.03 points: once the Gram is well estimated there is nothing left for damping to fix.
+//!
+//! Weight-space error rises (0.0556 → 0.0674) while perplexity improves — the proxy-gap signature
+//! again, and the reason nothing in this project ranks recipes by reconstruction fidelity.
+//!
+//! **Not yet converged.** 4,096 → 12,288 still bought 1.22 points; standard GPTQ calibrates on
+//! ~262K tokens, 21× more than the largest arm here. −0.49% is a floor, not the number.
+//!
 //! ```text
 //! TRITIUM_CORPUS=$HOME/.cache/tritium-corpora/wikitext2_400k_32k.json \
 //!   cargo test -p tritium-nn --release --test salt_gptq -- --ignored --nocapture
