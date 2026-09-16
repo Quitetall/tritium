@@ -54,6 +54,39 @@
 //! - `T` + rank-`r` — the same bits as `T+1`, spent as a subspace correction.
 //! - `T+1` — the same bits spent as a plane. **This is the arm to beat.**
 //!
+//! # Measured 2026-09-16 — the plane wins, by 3.3× per bit
+//!
+//! ```text
+//! arm                                        ppl       × fp        vs T
+//! T=3 (shipping baseline)                24.2783    1.0707×           —
+//! T=3 + rank-r f16 correction (mean r=39) 24.0182   1.0592×      -1.07%
+//! T=4 — the same bytes as a plane        23.4131    1.0325×      -3.56%
+//! ```
+//!
+//! Byte-matched to within 0.25%, and the low-rank arm is **flattered**: its factors are kept in f32
+//! but charged as f16. Rounding them would only widen the gap. The Gram used 12,288 tokens, the
+//! count at which `salt_gptq` stops being under-sampled.
+//!
+//! The premise was half right. The correction captured **18.4%** of the residual energy at a mean
+//! rank of 39 — several times what rank 39 captures of a white residual in these dimensions, so the
+//! activation steering is doing real work and the residual *is* concentrated. It is not
+//! concentrated enough to pay for **16 bits per coefficient** against a plane's 2.06 bits per
+//! weight. That 8× price ratio decides it, and a plane sits on the scalar rate–distortion bound
+//! while f16 factors sit nowhere near any bound.
+//!
+//! # What this does not rule out
+//!
+//! Two things, both untested and both stated as hypotheses rather than findings:
+//!
+//! - **Fractional budgets.** This compares a full plane's bytes. A singular spectrum is concave —
+//!   the first directions carry the most — so at rank 1–8 the per-bit return is likely far higher
+//!   than at rank 39. Low rank's real niche may be filling the gap *between* `T` and `T+1`, which no
+//!   plane can do.
+//! - **Allocating rank.** Plane allocation failed across ~50 arms, and the explanation was that a
+//!   plane is a 9× step too coarse to express anything finer. Rank is not coarse. So this is the
+//!   one setting where that explanation predicts allocation *could* work — and the one setting
+//!   where a win would test the explanation rather than just the allocator.
+//!
 //! ```text
 //! TRITIUM_CORPUS=$HOME/.cache/tritium-corpora/wikitext2_400k_32k.json \
 //!   cargo test -p tritium-nn --release --test salt_lowrank -- --ignored --nocapture
@@ -425,11 +458,11 @@ fn low_rank_correction_against_one_more_plane() {
          210 projections corrected; the tied embedding stays at T={t_ref} in every arm.\n\
          mean byte-matched rank {mean_rank:.0}; correction captured {:.1}% of the residual energy\n\
          bit check: one plane {:.3e} bits vs rank factors {:.3e} bits ({:+.2}%)\n",
+        eval.len(),
         100.0 * captured / residual_energy.max(1e-30),
         bits_plane,
         bits_rank,
         100.0 * (bits_rank - bits_plane) / bits_plane,
-        eval.len()
     );
     println!("{:<40} {:>11} {:>10} {:>12}", "arm", "ppl", "× fp", "vs T");
     println!("{}", "-".repeat(78));
