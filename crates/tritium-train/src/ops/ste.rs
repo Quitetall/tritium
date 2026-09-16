@@ -540,6 +540,49 @@ fn ladder_grid_factor(j: usize) -> f32 {
     f
 }
 
+/// The ladder's grid-searched step `Δ` for one group at `t` planes.
+///
+/// The reachable values are exactly `Δ·k` for integer `k ∈ ±(3^t−1)/2` — a uniform grid — so `Δ`
+/// and `t` are the complete description of the quantizer for that group. The base-3 digits are the
+/// *encoding* of `k`, not part of the rounding decision.
+///
+/// Exposed so an activation-aware fitter (GPTQ-style error compensation) can reuse the project's
+/// own step selection instead of reimplementing it and drifting from it.
+#[must_use]
+pub fn ladder_step(bs: &[f32], t: usize, grid: usize) -> f32 {
+    let t = t.max(1);
+    let peak = bs.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+    if peak <= 0.0 || !peak.is_finite() {
+        return 0.0;
+    }
+    let delta0 = peak / ladder_kmax(t) as f32;
+    let mut best = delta0;
+    let mut best_sse = ladder_sse(bs, t, delta0);
+    for j in 1..grid {
+        let delta = delta0 * ladder_grid_factor(j);
+        let sse = ladder_sse(bs, t, delta);
+        if sse < best_sse {
+            best_sse = sse;
+            best = delta;
+        }
+    }
+    best
+}
+
+/// Round one value onto the ladder's grid at step `delta`: `clamp(round(w/Δ), ±(3^t−1)/2)·Δ`.
+///
+/// The single definition of what the ladder does to a scalar, shared with [`ladder_digits`] and
+/// [`ladder_sse`]. An activation-aware fitter must round with exactly this or it is fitting a
+/// different quantizer than the packer will encode.
+#[must_use]
+pub fn ladder_quantize_at(w: f32, t: usize, delta: f32) -> f32 {
+    if delta <= 0.0 || !delta.is_finite() {
+        return 0.0;
+    }
+    let kmax = ladder_kmax(t.max(1)) as f32;
+    (w / delta).round().clamp(-kmax, kmax) * delta
+}
+
 /// Assign one group to the ladder with step `delta`, returning plane-major trits.
 ///
 /// `k = clamp(round(w/Δ))` is the nearest lattice point — and because the ladder is a uniform grid,
@@ -1215,4 +1258,53 @@ pub fn lsq_vjp(
         g_a[r] = ga * grad_scale;
     }
     vec![g_wf, g_a]
+}
+
+#[cfg(test)]
+mod ladder_step_tests {
+    use super::*;
+
+    /// The exposed step + scalar rounding must reproduce the private fitter exactly, or an
+    /// activation-aware fitter built on them is quantizing something the packer will not encode.
+    #[test]
+    fn exposed_step_and_rounding_reproduce_the_private_fitter() {
+        let mut s = 0x9E3779B97F4A7C15u64;
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            ((s >> 40) as f32 / 8_388_608.0) - 1.0
+        };
+        for &n in &[16usize, 64, 128, 129] {
+            let bs: Vec<f32> = (0..n)
+                .map(|i| if i % 31 == 0 { next() * 9.0 } else { next() })
+                .collect();
+            for t in 1..=5 {
+                let delta = ladder_step(&bs, t, 16);
+                let (s0, planes) = fit_group_geometric(&bs, t, 16);
+                // `s₀ = Δ·3^(t−1)` by construction; check the exposed step agrees.
+                assert!(
+                    (s0 - delta * pow3(t - 1)).abs() <= 1e-6 * s0.abs().max(1e-6),
+                    "n={n} t={t}: exposed step {delta} implies s0 {} but the fitter chose {s0}",
+                    delta * pow3(t - 1)
+                );
+                let oracle = ladder_reconstruct(s0, &planes, bs.len());
+                for (i, (&w, &o)) in bs.iter().zip(&oracle).enumerate() {
+                    let mine = ladder_quantize_at(w, t, delta);
+                    assert!(
+                        (mine - o).abs() <= 1e-5 * o.abs().max(1e-5),
+                        "n={n} t={t} i={i}: exposed rounding {mine} vs fitter {o}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A dead group must round to zero rather than divide by it.
+    #[test]
+    fn a_dead_group_has_a_zero_step_and_quantizes_to_zero() {
+        assert_eq!(ladder_step(&[0.0; 32], 3, 16), 0.0);
+        assert_eq!(ladder_quantize_at(1.0, 3, 0.0), 0.0);
+        assert_eq!(ladder_quantize_at(1.0, 3, f32::NAN), 0.0);
+    }
 }
