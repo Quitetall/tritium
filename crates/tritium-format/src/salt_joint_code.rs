@@ -33,8 +33,16 @@ use core::fmt;
 
 /// Longest code word emitted. Bounds the decode table at `2^MAX_CODE_LEN` entries.
 pub const MAX_CODE_LEN: u8 = 15;
-/// Largest plane count a `u16` symbol can hold: `3^10 = 59049 ≤ 65536`.
-pub const MAX_JOINT_PLANES: usize = 10;
+/// Largest plane count the code supports: `3^9 = 19683`.
+///
+/// Bounded by the CODE, not the symbol type. A `u16` holds `3^10`, but a prefix code capped at
+/// [`MAX_CODE_LEN`] bits has at most `2^15 = 32768` code words, and every state is live on real
+/// weights (measured 6561/6561 at T=8). So `3^10 = 59049` live symbols cannot be coded at all.
+/// This was 10 until a review caught `build` failing at the advertised maximum.
+pub const MAX_JOINT_PLANES: usize = 9;
+
+// The two limits must stay consistent: every symbol of the largest alphabet needs a code word.
+const _: () = assert!(3usize.pow(MAX_JOINT_PLANES as u32) <= 1usize << MAX_CODE_LEN);
 
 /// Errors from building or decoding a joint code.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -66,6 +74,14 @@ pub enum JointCodeError {
     CorruptStream,
     /// `block` is zero, or a block index was past the end.
     BadBlock,
+    /// More live symbols than a code capped at [`MAX_CODE_LEN`] bits has code words. Unreachable
+    /// for `t ≤ MAX_JOINT_PLANES`; kept distinct so a capacity failure never reads as corruption.
+    TooManySymbols {
+        /// Symbols with non-zero frequency.
+        live: usize,
+        /// Code words available: `2^MAX_CODE_LEN`.
+        capacity: usize,
+    },
 }
 
 impl fmt::Display for JointCodeError {
@@ -91,6 +107,10 @@ impl fmt::Display for JointCodeError {
             Self::UncodedSymbol(s) => write!(f, "symbol {s} has no code word"),
             Self::CorruptStream => write!(f, "bitstream is truncated or holds no valid code word"),
             Self::BadBlock => write!(f, "block size is zero or block index is out of range"),
+            Self::TooManySymbols { live, capacity } => write!(
+                f,
+                "{live} live symbols exceed the {capacity} code words a {MAX_CODE_LEN}-bit code has"
+            ),
         }
     }
 }
@@ -203,6 +223,11 @@ impl JointCode {
                 expected: a,
                 got: freq.len(),
             });
+        }
+        let live = freq.iter().filter(|&&f| f > 0).count();
+        let capacity = 1usize << MAX_CODE_LEN;
+        if live > capacity {
+            return Err(JointCodeError::TooManySymbols { live, capacity });
         }
         let mut lengths = huffman_lengths(freq);
         limit_lengths(&mut lengths, freq, MAX_CODE_LEN);
@@ -340,8 +365,10 @@ fn limit_lengths(lengths: &mut [u8], freq: &[u64], max_len: u8) {
     let mut order: Vec<usize> = (0..lengths.len()).filter(|&s| lengths[s] > 0).collect();
     order.sort_by_key(|&s| freq[s]);
     while kraft > cap {
+        // Terminates: `build` refuses more live symbols than 2^max_len, and with every symbol at
+        // max_len the Kraft sum is exactly the live count, which is then ≤ cap.
         let Some(&s) = order.iter().find(|&&s| lengths[s] < max_len) else {
-            break; // unreachable while the alphabet fits in 2^max_len
+            break;
         };
         kraft -= 1u64 << (max_len - lengths[s] - 1);
         lengths[s] += 1;
@@ -710,6 +737,23 @@ mod tests {
             joint_symbols(&[&[0i8, 0][..], &[0i8][..]]),
             Err(JointCodeError::PlaneShape)
         );
+    }
+
+    /// Regression for a review finding: at the old maximum of 10 planes, every state live, `build`
+    /// failed with `CorruptStream`. Every state IS live on real weights, so the advertised maximum
+    /// must build and round-trip with a full alphabet.
+    #[test]
+    fn the_advertised_maximum_builds_with_every_state_live() {
+        let t = MAX_JOINT_PLANES;
+        let a = 3usize.pow(t as u32);
+        let code = JointCode::build(&vec![1u64; a], t).unwrap();
+        let symbols: Vec<u16> = (0..a as u16).collect();
+        let stream = encode(&code, &symbols, 512).unwrap();
+        assert_eq!(decode(&code, &stream).unwrap(), symbols);
+        assert!(matches!(
+            JointCode::build(&[1u64; 3], MAX_JOINT_PLANES + 1),
+            Err(JointCodeError::UnsupportedPlanes(_))
+        ));
     }
 
     #[test]
