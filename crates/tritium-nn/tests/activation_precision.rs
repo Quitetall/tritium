@@ -328,7 +328,7 @@ fn activation_precision_sweep() {
     println!(
         "SmolLM2-135M | fp {ppl_fp:.3} | fold α=0.75 | weights: ladder T={t_w}, g{WEIGHT_GROUP}\n\
          Every projection input is quantized: q/k/v, o, gate/up, down and the tied head.\n\
-         o_proj's used to be exempt (it lived inside attention()); `attention_heads` splits it\n\
+         o_proj's input used to be exempt (it lived inside attention()); `attention_heads` splits it\n\
          out, so the old 'upper bound, 1 of 7 unpenalised' caveat no longer applies.\n"
     );
     println!(
