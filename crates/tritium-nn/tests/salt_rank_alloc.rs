@@ -39,6 +39,44 @@
 //! - **anti-allocated** at 0.25 — cheapest-value ranks first, the sign check.
 //! - `T=4` — the same bytes as one plane, the reference for the 1.0 budget.
 //!
+//! # Measured 2026-09-16 — allocation ties uniform even with a continuous step
+//!
+//! ```text
+//! budget  uniform rank   allocated (absolute)   allocated (relative)   anti-allocated
+//!  0.10     -0.33%          -0.01% vs uniform      -0.01% vs uniform          —
+//!  0.25     -0.72%          +0.03%                 -0.02%                  +0.07%
+//!  1.00     -1.50%          +0.20%                 -0.01%                     —
+//! T=4 (one plane, same bytes as 1.00): -3.56%
+//!
+//! per resident bit vs a plane:  0.10 → 0.91–0.95×   0.25 → 0.77–0.83×   1.00 → 0.37–0.42×
+//! ```
+//!
+//! **The coarseness explanation is refuted.** It predicted allocation would work once the step was
+//! continuous and its value exactly priced. Both hold here — rank is any integer, and `σᵢ²` is proven
+//! (unit test above) to be exactly the output error each rank removes — and allocation still does
+//! not beat uniform. Relative pricing ties it to within 0.02 points at every budget; absolute
+//! pricing loses outright at the largest budget (+0.20%), the same direction the plane campaign
+//! found absolute pricing fails. The sign check barely registers: spending the budget on the *worst*
+//! priced ranks costs only +0.07%, so exact per-tensor output error carries almost no information
+//! about which tensor's error perplexity cares about.
+//!
+//! That leaves non-separability as the surviving account, now across a continuous axis as well as a
+//! discrete one: a tensor's output error is priced in isolation, and how much it matters depends on
+//! everything downstream of it.
+//!
+//! **Rank never beats a plane per resident bit.** It comes close at small budgets (0.95× at 0.1 of a
+//! plane) and falls off as the spectrum decays (0.42× at a full plane). Planes stay the better use
+//! of memory at every budget measured, before counting the two extra matmuls a correction costs at
+//! inference, for which the runtime has no path.
+//!
+//! # The one combination not yet tried
+//!
+//! The gradient experiment priced swaps by exact **task-loss** gradients and lost to random — but it
+//! stepped a whole plane, a 9× change where first order is invalid. This file makes the step small
+//! but prices it by **per-tensor** output error. A task-loss gradient with respect to a continuous
+//! per-tensor rank gate has neither failure: small steps, global signal. That is the differentiable
+//! allocation idea from the lever plan, and it is the only form both results leave open.
+//!
 //! ```text
 //! TRITIUM_CORPUS=$HOME/.cache/tritium-corpora/wikitext2_400k_32k.json \
 //!   cargo test -p tritium-nn --release --test salt_rank_alloc -- --ignored --nocapture
