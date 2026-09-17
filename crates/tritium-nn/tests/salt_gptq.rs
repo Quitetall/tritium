@@ -956,6 +956,24 @@ fn sequential_calibration_against_fp_calibration() {
 /// A stronger optimizer overfits a Gram more readily, so every arm's layer objective is reported on
 /// the calibration Gram AND on a held-out Gram built from the next 12,288 tokens. If the search
 /// wins on calibration and loses held-out, that is overfitting, and perplexity should agree.
+///
+/// # Measured 2026-09-17
+///
+/// ```text
+/// fit                              obj (cal)   obj (held)     ppl      vs RTN
+/// round-to-nearest (SHIPPING)        1.000×      1.000×     24.2783     —
+/// GPTQ                               0.236×      0.459×     24.1586   -0.49%
+/// GPTQ + trit search                 0.216×      0.454×     24.1894   -0.37%
+/// GPTQ + trit search + Δ refit       0.214×      0.451×     24.1231   -0.64%
+/// ```
+///
+/// The discrete search overfits, as predicted: 8.5% lower calibration objective than GPTQ, 1% lower
+/// held-out, and WORSE perplexity. Adding the closed-form step refits turns it into the best arm
+/// measured (−0.64%) — continuous parameters generalize where discrete moves chase the batch.
+///
+/// GPTQ's own row is the larger finding: 0.236× on the Gram it fitted, 0.459× on unseen tokens. Most
+/// of its apparent gain does not transfer, so Gram estimation — not the optimizer — is the binding
+/// limit, and more calibration tokens is the lever to pull before a stronger search.
 #[test]
 #[ignore = "needs SmolLM2-135M; two Gram sets, a search per projection, and four evaluations"]
 fn discrete_search_over_trit_moves_against_gptq() {
