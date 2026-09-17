@@ -714,15 +714,27 @@ fn activation_metric_fit_against_the_euclidean_one() {
 /// **Stage 3 of the standard additive-PTQ recipe: calibrate each layer on the QUANTIZED model's
 /// inputs, in order.**
 ///
-/// The sweep above collects every Gram from the fp model. That is the weaker GPTQ variant: layer
-/// `L` is fitted as if everything upstream were exact, so it compensates only its own rounding
-/// error and nothing it inherits. Reference GPTQ runs block by block — quantize block `L`, then push
-/// calibration data through the quantized prefix to collect block `L+1`'s inputs — so every block
-/// absorbs the error of every block before it.
+/// The sweep above collects every Gram from the fp model. Reference GPTQ runs block by block —
+/// quantize block `L`, push calibration data through the quantized prefix, collect block `L+1`'s
+/// inputs there.
 ///
-/// That inheritance is the non-separability every allocation experiment kept hitting: a tensor's
-/// error cannot be priced alone because what it costs depends on what came before and after. A fit
-/// that sees propagated error is the base allocation has never been tested on.
+/// **Measured 2026-09-17: no gain, and the reason corrects what this doc first claimed.**
+///
+/// ```text
+/// round-to-nearest (SHIPPING)   24.2783            —
+/// GPTQ, fp Grams                24.1586      -0.49%
+/// GPTQ, sequential Grams        24.1732      -0.43%
+/// ```
+///
+/// The first version of this doc said sequential calibration makes every block "absorb the error of
+/// every block before it". It does not. Plain sequential GPTQ minimizes `‖(W − Ŵ)·X̂‖`: the fp weights
+/// applied to the QUANTIZED inputs. That refits the layer to the shifted input distribution, but the
+/// target is still `W·X̂`, not the fp model's actual output `W·X`, so inherited error is never
+/// corrected — only not compounded. At T=3, where rounding error is small, that buys nothing.
+///
+/// Absorbing upstream error needs the asymmetric target `‖W·X − Ŵ·X̂‖`, which is GPTQ run on
+/// `W' = W·C·Ĥ⁻¹` with the cross-covariance `C = E[x·x̂ᵀ]` — see
+/// `asymmetric_calibration_absorbs_inherited_error`.
 ///
 /// Three arms at identical bits, all with the Gram at the full 12,288 tokens and damping 0.01:
 /// the shipping round-to-nearest fit, GPTQ on fp Grams (reproducing the sweep's best arm), and
