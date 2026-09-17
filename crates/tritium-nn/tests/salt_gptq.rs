@@ -1203,3 +1203,314 @@ fn trit_search_never_raises_the_damped_objective() {
         "the search found nothing to improve on a random problem"
     );
 }
+
+/// **Asymmetric calibration: target the fp model's output, from the quantized model's input.**
+///
+/// Sequential GPTQ minimizes `‖(W − Ŵ)·X̂‖` and so never corrects error inherited from upstream (see
+/// `sequential_calibration_against_fp_calibration`). The target that does is `‖W·X − Ŵ·X̂‖`: layer
+/// `L`, fed what the quantized prefix actually produces, reproducing what the fp model produced.
+///
+/// Summed over samples that objective is, up to a constant, `tr((Ŵ − W')·Ĥ·(Ŵ − W')ᵀ)` with
+///
+/// ```text
+/// Ĥ = Σ x̂·x̂ᵀ      C = Σ x·x̂ᵀ      W' = W·C·Ĥ⁻¹
+/// ```
+///
+/// so it is ordinary GPTQ with `Ĥ` as the metric and `W'` — the least-squares map from quantized
+/// inputs to fp outputs — as the target. `x` and `x̂` are the same tap on the same tokens, from the fp
+/// model and from the model whose embedding and layers < L are already quantized.
+///
+/// Arms: round-to-nearest (re-measured) and asymmetric sequential GPTQ. GPTQ on fp Grams (−0.49%)
+/// and plain sequential (−0.43%) were measured with this same configuration and are quoted.
+#[test]
+#[ignore = "needs SmolLM2-135M; two full forwards per layer per calibration window"]
+fn asymmetric_calibration_absorbs_inherited_error() {
+    let dir = model_dir();
+    if !dir.join("model.safetensors").exists() {
+        eprintln!("skipping: {} absent", dir.display());
+        return;
+    }
+    let t_ref = env_usize("TRITIUM_GPTQ_T", 3);
+    let windows = env_usize("TRITIUM_GPTQ_SEQ_WINDOWS", 48);
+    let damp = 0.01f64;
+    let runner =
+        ModelRunner::from_hf(&dir, Box::new(tritium_cpu::CpuBackend::new())).expect("from_hf");
+    let (arch0, fp0, shapes) = extract(&runner);
+    let (train, eval) = corpus();
+
+    let mut calib = Calib::new(&arch0);
+    for w in 0..CALIB_WINDOWS {
+        calibrate(
+            &fp0,
+            &arch0,
+            &train[w * CALIB_SEQ..(w + 1) * CALIB_SEQ],
+            &mut calib,
+        );
+    }
+    let (fp, arch) = fold(&fp0, &shapes, &arch0, &calib, 0.75);
+    let n_layers = arch.n_layers;
+    let q_width = arch.n_head * arch.head_dim;
+    let widths = [arch.n_embd, arch.n_embd, arch.ff, q_width]; // attn, ffn, down, o
+
+    let plain: Vec<Vec<f32>> = fp
+        .iter()
+        .zip(&shapes)
+        .map(|(w, &(r, c))| {
+            ste::salt_quantize_forward_grouped_geometric(
+                w,
+                r,
+                c,
+                t_ref,
+                GROUP,
+                GRID,
+                RotationPolicy::Always,
+            )
+        })
+        .collect();
+
+    // Capture layer `li`'s four tap activations for one window.
+    let capture = |weights: &[Vec<f32>], toks: &[u32], li: usize| -> [Vec<f32>; 4] {
+        let mut out: [Vec<f32>; 4] = Default::default();
+        let mut t = Tape::new();
+        let wids: Vec<ValueId> = weights.iter().map(|w| t.leaf(w.clone())).collect();
+        forward_aq(
+            &mut t,
+            &wids,
+            &arch,
+            toks,
+            &mut |kind, l, v, _seq, _cols| {
+                if l != li {
+                    return;
+                }
+                let slot = match kind {
+                    Tap::AttnIn => 0,
+                    Tap::FfnIn => 1,
+                    Tap::DownIn => 2,
+                    Tap::OProjIn => 3,
+                    Tap::Head => return,
+                };
+                out[slot] = v.to_vec();
+            },
+        );
+        out
+    };
+
+    let mut seq = fp.clone();
+    seq[0] = plain[0].clone();
+    println!(
+        "asymmetric sequential GPTQ over {} tokens per layer…",
+        windows * GRAM_SEQ
+    );
+    for li in 0..n_layers {
+        let mut hhat: Vec<Vec<f64>> = widths.iter().map(|&k| vec![0.0; k * k]).collect();
+        let mut cross: Vec<Vec<f64>> = widths.iter().map(|&k| vec![0.0; k * k]).collect();
+        let mut seen = 0usize;
+        for wnd in 0..windows {
+            let toks = &train[wnd * GRAM_SEQ..(wnd + 1) * GRAM_SEQ];
+            let x = capture(&fp, toks, li);
+            let xh = capture(&seq, toks, li);
+            let n = toks.len();
+            for s in 0..4 {
+                let k = widths[s];
+                accumulate_gram(&mut hhat[s], k, &xh[s], n);
+                // C = Σ x·x̂ᵀ, full (not symmetric).
+                let (xs, xhs) = (&x[s], &xh[s]);
+                cross[s].par_chunks_mut(k).enumerate().for_each(|(a, row)| {
+                    for r in 0..n {
+                        let xa = f64::from(xs[r * k + a]);
+                        if xa == 0.0 {
+                            continue;
+                        }
+                        let xr = &xhs[r * k..(r + 1) * k];
+                        for (c, v) in row.iter_mut().enumerate() {
+                            *v += xa * f64::from(xr[c]);
+                        }
+                    }
+                });
+            }
+            seen += n;
+        }
+        for s in 0..4 {
+            let k = widths[s];
+            mirror_and_scale(&mut hhat[s], k, seen);
+            for v in cross[s].iter_mut() {
+                *v /= seen as f64;
+            }
+        }
+
+        // Transform matrix per tap: C·Ĥ_d⁻¹.
+        let transforms: Vec<Option<Vec<f64>>> = (0..4)
+            .map(|s| {
+                let k = widths[s];
+                let hinv = damped_inverse(&hhat[s], k, damp)?;
+                Some(mat_mul(&cross[s], &hinv, k))
+            })
+            .collect();
+
+        let base = 1 + 7 * li;
+        for (slot, s) in [
+            (0usize, 0usize),
+            (1, 0),
+            (2, 0),
+            (3, 3),
+            (4, 1),
+            (5, 1),
+            (6, 2),
+        ] {
+            let i = base + slot;
+            let (rows, cols) = shapes[i];
+            let Some(m) = &transforms[s] else {
+                seq[i] = plain[i].clone();
+                continue;
+            };
+            let target = apply_right(&fp[i], cols, m);
+            seq[i] = gptq_tensor(&target, rows, cols, t_ref, &hhat[s], damp)
+                .unwrap_or_else(|| plain[i].clone());
+        }
+        if li % 5 == 0 {
+            println!("  layer {li}/{n_layers}");
+        }
+    }
+
+    let ppl_fp = perplexity_windowed(&fp, &arch, &eval, EVAL_WINDOW);
+    let ppl_plain = perplexity_windowed(&plain, &arch, &eval, EVAL_WINDOW);
+    let ppl_asym = perplexity_windowed(&seq, &arch, &eval, EVAL_WINDOW);
+    println!(
+        "\nSmolLM2-135M | WikiText-2 {} held-out | fold α=0.75 | g{GROUP} | T={t_ref} | {} tok, damp {damp}\n",
+        eval.len(),
+        windows * GRAM_SEQ
+    );
+    println!(
+        "{:<44} {:>11} {:>10} {:>10}",
+        "fit", "ppl", "× fp", "vs RTN"
+    );
+    println!("{}", "-".repeat(78));
+    println!("{:<44} {ppl_fp:>11.4}", "fp master");
+    println!(
+        "{:<44} {ppl_plain:>11.4} {:>9.4}× {:>10}",
+        "round-to-nearest (SHIPPING)",
+        ppl_plain / ppl_fp,
+        "—"
+    );
+    println!(
+        "{:<44} {:>11} {:>10} {:>10}",
+        "GPTQ, fp Grams (quoted)", "24.1586", "", "-0.49%"
+    );
+    println!(
+        "{:<44} {:>11} {:>10} {:>10}",
+        "GPTQ, sequential (quoted)", "24.1732", "", "-0.43%"
+    );
+    println!(
+        "{:<44} {ppl_asym:>11.4} {:>9.4}× {:>+9.2}%",
+        "GPTQ, asymmetric sequential",
+        ppl_asym / ppl_fp,
+        100.0 * (ppl_asym - ppl_plain) / ppl_plain
+    );
+    assert!(
+        ppl_asym.is_finite(),
+        "the asymmetric arm did not produce a usable model"
+    );
+}
+
+/// `A·B` for `k × k` row-major matrices.
+fn mat_mul(a: &[f64], b: &[f64], k: usize) -> Vec<f64> {
+    let mut m = vec![0.0f64; k * k];
+    m.par_chunks_mut(k).enumerate().for_each(|(i, row)| {
+        let arow = &a[i * k..(i + 1) * k];
+        for (j, v) in row.iter_mut().enumerate() {
+            *v = arow
+                .iter()
+                .enumerate()
+                .map(|(c, &x)| x * b[c * k + j])
+                .sum();
+        }
+    });
+    m
+}
+
+/// `W·M` for `W` row-major `[rows, cols]` and `M` `cols × cols`.
+fn apply_right(w: &[f32], cols: usize, m: &[f64]) -> Vec<f32> {
+    let mut out = vec![0.0f32; w.len()];
+    out.par_chunks_mut(cols)
+        .zip(w.par_chunks(cols))
+        .for_each(|(o, wr)| {
+            for (b, ob) in o.iter_mut().enumerate() {
+                *ob = wr
+                    .iter()
+                    .enumerate()
+                    .map(|(a, &wa)| f64::from(wa) * m[a * cols + b])
+                    .sum::<f64>() as f32;
+            }
+        });
+    out
+}
+
+/// The asymmetric objective's defining identity, on a small case with no damping:
+/// `Σ_s ‖W·x_s − Ŵ·x̂_s‖²  =  tr((Ŵ − W')·Ĥ·(Ŵ − W')ᵀ) + const`, `W' = W·C·Ĥ⁻¹`. The constant must not
+/// depend on `Ŵ`, so the difference between the two sides is checked to be identical for two
+/// unrelated `Ŵ`.
+#[test]
+fn asymmetric_target_reproduces_the_fp_output_objective() {
+    let (rows, k, n) = (3usize, 6usize, 400usize);
+    let mut s = 0x5EED_1234u64;
+    let mut next = || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        ((s >> 40) as f64 / 8_388_608.0) - 1.0
+    };
+    let w: Vec<f32> = (0..rows * k).map(|_| next() as f32).collect();
+    let x: Vec<f64> = (0..n * k).map(|_| next()).collect();
+    // x̂: a perturbed, mixed copy of x — what an upstream quantizer would do.
+    let xh: Vec<f64> = (0..n * k)
+        .map(|i| x[i] + 0.3 * x[(i / k) * k + (i % k + 1) % k] + 0.1 * next())
+        .collect();
+    let (mut hh, mut c) = (vec![0.0f64; k * k], vec![0.0f64; k * k]);
+    for r in 0..n {
+        for a in 0..k {
+            for b in 0..k {
+                hh[a * k + b] += xh[r * k + a] * xh[r * k + b];
+                c[a * k + b] += x[r * k + a] * xh[r * k + b];
+            }
+        }
+    }
+    // Undamped inverse (tiny damping keeps the helper's contract; 1e-12 is below every term here).
+    let hinv = damped_inverse(&hh, k, 1e-12).unwrap();
+    let wp = apply_right(&w, k, &mat_mul(&c, &hinv, k));
+
+    let lhs = |q: &[f32]| -> f64 {
+        (0..n)
+            .map(|r| {
+                (0..rows)
+                    .map(|i| {
+                        let (mut yx, mut yq) = (0.0f64, 0.0f64);
+                        for a in 0..k {
+                            yx += f64::from(w[i * k + a]) * x[r * k + a];
+                            yq += f64::from(q[i * k + a]) * xh[r * k + a];
+                        }
+                        (yx - yq) * (yx - yq)
+                    })
+                    .sum::<f64>()
+            })
+            .sum()
+    };
+    let rhs = |q: &[f32]| -> f64 {
+        (0..rows)
+            .map(|i| {
+                let e: Vec<f64> = (0..k)
+                    .map(|a| f64::from(q[i * k + a]) - f64::from(wp[i * k + a]))
+                    .collect();
+                (0..k)
+                    .map(|a| e[a] * (0..k).map(|b| hh[a * k + b] * e[b]).sum::<f64>())
+                    .sum::<f64>()
+            })
+            .sum()
+    };
+    let q1: Vec<f32> = (0..rows * k).map(|_| next() as f32).collect();
+    let q2: Vec<f32> = (0..rows * k).map(|_| (next() * 0.2) as f32).collect();
+    let (c1, c2) = (lhs(&q1) - rhs(&q1), lhs(&q2) - rhs(&q2));
+    assert!(
+        (c1 - c2).abs() <= 1e-4 * lhs(&q1).abs().max(1.0),
+        "objective and GPTQ form differ by a Ŵ-dependent amount: {c1} vs {c2}"
+    );
+}
