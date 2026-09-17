@@ -246,6 +246,24 @@ fn gptq_tensor(
     gram: &[f64],
     damp: f64,
 ) -> Option<Vec<f32>> {
+    let (mut out, _) = gptq_codes(w, rows, cols, t, gram, damp)?;
+    // Back to the model's basis.
+    for row in out.chunks_mut(cols) {
+        rotate_row(row, GROUP);
+    }
+    Some(out)
+}
+
+/// GPTQ in the rotated basis, returning the reconstruction STILL IN THAT BASIS plus the step `Δ`
+/// per (row, group) — everything a discrete search needs to continue from where GPTQ stopped.
+fn gptq_codes(
+    w: &[f32],
+    rows: usize,
+    cols: usize,
+    t: usize,
+    gram: &[f64],
+    damp: f64,
+) -> Option<(Vec<f32>, Vec<f32>)> {
     // Everything happens in the basis the codes are stored in.
     let mut work: Vec<f32> = w.to_vec();
     for row in work.chunks_mut(cols) {
@@ -291,11 +309,170 @@ fn gptq_tensor(
             });
     }
 
-    // Back to the model's basis.
-    for row in out.chunks_mut(cols) {
+    Some((out, delta))
+}
+
+/// **Discrete local search over the trit move set**, continuing from GPTQ's codes.
+///
+/// Per row the problem is a closest-vector problem: choose integers `k` (each `|k_j| ≤ (3^T−1)/2`)
+/// minimizing `(w − Δ⊙k)ᵀ·H·(w − Δ⊙k)`. GPTQ is one greedy sequential-rounding pass. This improves
+/// on it by coordinate descent with the moves the ternary representation makes natural: change
+/// `k_j` by `±1`, or by `±3^p` — a flip of a higher-plane trit, a jump rounding never considers.
+///
+/// Every move is priced exactly in O(1) from `g = H·r`: changing `r_j` by `δ` changes the objective by
+/// `2δ·g_j + δ²·H_jj`, and an accepted move updates `g` in O(k). So the objective falls
+/// monotonically and no move is accepted on an estimate.
+///
+/// With `refit_scale`, each sweep also re-solves every group's step `Δ` in closed form for its
+/// current codes (`ε = kᵀg / kᵀHk`) — the continuous half, alternating with the discrete half.
+///
+/// Returns the reconstruction in the model's basis. `H` here is the damped, rotated Gram.
+fn search_codes(
+    w: &[f32],
+    cols: usize,
+    t: usize,
+    h_rot: &[f64],
+    gptq_rot: &[f32],
+    delta: &[f32],
+    sweeps: usize,
+    refit_scale: bool,
+) -> Vec<f32> {
+    let per_row = cols.div_ceil(GROUP);
+    let kmax = (3i64.pow(t as u32) - 1) / 2;
+    let moves: Vec<i64> = (0..t)
+        .flat_map(|p| {
+            let m = 3i64.pow(p as u32);
+            [m, -m]
+        })
+        .collect();
+    let mut w_rot: Vec<f32> = w.to_vec();
+    for row in w_rot.chunks_mut(cols) {
         rotate_row(row, GROUP);
     }
-    Some(out)
+    let mut out = vec![0.0f32; w.len()];
+    out.par_chunks_mut(cols)
+        .zip(w_rot.par_chunks(cols))
+        .zip(gptq_rot.par_chunks(cols))
+        .zip(delta.par_chunks(per_row))
+        .for_each(|(((o, wr), qr), dr)| {
+            let mut d: Vec<f64> = dr.iter().map(|&v| f64::from(v)).collect();
+            let mut k: Vec<i64> = (0..cols)
+                .map(|j| {
+                    let dj = d[j / GROUP];
+                    if dj > 0.0 {
+                        (f64::from(qr[j]) / dj).round() as i64
+                    } else {
+                        0
+                    }
+                })
+                .collect();
+            let mut r: Vec<f64> = (0..cols)
+                .map(|j| f64::from(wr[j]) - d[j / GROUP] * k[j] as f64)
+                .collect();
+            let mut g: Vec<f64> = (0..cols)
+                .map(|a| {
+                    h_rot[a * cols..(a + 1) * cols]
+                        .iter()
+                        .zip(&r)
+                        .map(|(h, x)| h * x)
+                        .sum()
+                })
+                .collect();
+            for _ in 0..sweeps {
+                let mut improved = false;
+                for j in 0..cols {
+                    let dj = d[j / GROUP];
+                    if dj <= 0.0 {
+                        continue;
+                    }
+                    let hjj = h_rot[j * cols + j];
+                    let mut best = (0.0f64, 0i64);
+                    for &m in &moves {
+                        let nk = k[j] + m;
+                        if nk.abs() > kmax {
+                            continue;
+                        }
+                        let delta_r = -dj * m as f64;
+                        let change = 2.0 * delta_r * g[j] + delta_r * delta_r * hjj;
+                        if change < best.0 {
+                            best = (change, m);
+                        }
+                    }
+                    if best.1 != 0 && best.0 < -1e-15 {
+                        let delta_r = -dj * best.1 as f64;
+                        k[j] += best.1;
+                        r[j] += delta_r;
+                        for (a, ga) in g.iter_mut().enumerate() {
+                            *ga += delta_r * h_rot[a * cols + j];
+                        }
+                        improved = true;
+                    }
+                }
+                if refit_scale {
+                    for b in 0..per_row {
+                        let (lo, hi) = (b * GROUP, ((b + 1) * GROUP).min(cols));
+                        let num: f64 = (lo..hi).map(|j| k[j] as f64 * g[j]).sum();
+                        let mut den = 0.0f64;
+                        for a in lo..hi {
+                            if k[a] == 0 {
+                                continue;
+                            }
+                            for c in lo..hi {
+                                den += k[a] as f64 * h_rot[a * cols + c] * k[c] as f64;
+                            }
+                        }
+                        if den <= 0.0 {
+                            continue;
+                        }
+                        let eps = num / den;
+                        if d[b] + eps <= 0.0 {
+                            continue;
+                        }
+                        d[b] += eps;
+                        // r_b -= eps·k_b, so g -= eps·H[:, b]·k_b.
+                        for j in lo..hi {
+                            r[j] -= eps * k[j] as f64;
+                        }
+                        for (a, ga) in g.iter_mut().enumerate() {
+                            let hrow = &h_rot[a * cols..(a + 1) * cols];
+                            let s: f64 = (lo..hi).map(|c| hrow[c] * k[c] as f64).sum();
+                            *ga -= eps * s;
+                        }
+                        improved = true;
+                    }
+                }
+                if !improved {
+                    break;
+                }
+            }
+            for j in 0..cols {
+                o[j] = (d[j / GROUP] * k[j] as f64) as f32;
+            }
+            rotate_row(o, GROUP);
+        });
+    out
+}
+
+/// `tr((W − Ŵ)·H·(W − Ŵ)ᵀ)` — the layer objective, in the model's basis.
+fn layer_objective(w: &[f32], q: &[f32], cols: usize, h: &[f64]) -> f64 {
+    w.par_chunks(cols)
+        .zip(q.par_chunks(cols))
+        .map(|(wr, qr)| {
+            let e: Vec<f64> = wr.iter().zip(qr).map(|(&a, &b)| f64::from(a - b)).collect();
+            (0..cols)
+                .map(|a| {
+                    if e[a] == 0.0 {
+                        return 0.0;
+                    }
+                    e[a] * h[a * cols..(a + 1) * cols]
+                        .iter()
+                        .zip(&e)
+                        .map(|(x, y)| x * y)
+                        .sum::<f64>()
+                })
+                .sum::<f64>()
+        })
+        .sum()
 }
 
 /// Accumulate `Σ x xᵀ` (upper triangle) from a `[seq, k]` activation block.
@@ -753,5 +930,261 @@ fn sequential_calibration_against_fp_calibration() {
     assert!(
         ppl_seq.is_finite() && ppl_on_fp.is_finite(),
         "a GPTQ arm did not produce a usable model"
+    );
+}
+
+/// **Does discrete search over the trit moves beat GPTQ's greedy rounding — and does it generalize?**
+///
+/// Four arms at identical bits and container: round-to-nearest, GPTQ, GPTQ + trit search, and GPTQ +
+/// trit search + closed-form step refits. Grams are fp (the sweep's configuration) at 12,288 tokens.
+///
+/// A stronger optimizer overfits a Gram more readily, so every arm's layer objective is reported on
+/// the calibration Gram AND on a held-out Gram built from the next 12,288 tokens. If the search
+/// wins on calibration and loses held-out, that is overfitting, and perplexity should agree.
+#[test]
+#[ignore = "needs SmolLM2-135M; two Gram sets, a search per projection, and four evaluations"]
+fn discrete_search_over_trit_moves_against_gptq() {
+    let dir = model_dir();
+    if !dir.join("model.safetensors").exists() {
+        eprintln!("skipping: {} absent", dir.display());
+        return;
+    }
+    let t_ref = env_usize("TRITIUM_GPTQ_T", 3);
+    let windows = 48usize;
+    let damp = 0.01f64;
+    let sweeps = env_usize("TRITIUM_SEARCH_SWEEPS", 8);
+    let runner =
+        ModelRunner::from_hf(&dir, Box::new(tritium_cpu::CpuBackend::new())).expect("from_hf");
+    let (arch0, fp0, shapes) = extract(&runner);
+    let (train, eval) = corpus();
+    assert!(2 * windows * GRAM_SEQ <= train.len());
+
+    let mut calib = Calib::new(&arch0);
+    for w in 0..CALIB_WINDOWS {
+        calibrate(
+            &fp0,
+            &arch0,
+            &train[w * CALIB_SEQ..(w + 1) * CALIB_SEQ],
+            &mut calib,
+        );
+    }
+    let (fp, arch) = fold(&fp0, &shapes, &arch0, &calib, 0.75);
+    let n_layers = arch.n_layers;
+    let q_width = arch.n_head * arch.head_dim;
+
+    // [attn, ffn, down, o] per layer, from windows [first, first + windows).
+    let grams = |first: usize| -> Vec<[Vec<f64>; 4]> {
+        let mut all: Vec<[Vec<f64>; 4]> = (0..n_layers)
+            .map(|_| {
+                [
+                    vec![0.0f64; arch.n_embd * arch.n_embd],
+                    vec![0.0f64; arch.n_embd * arch.n_embd],
+                    vec![0.0f64; arch.ff * arch.ff],
+                    vec![0.0f64; q_width * q_width],
+                ]
+            })
+            .collect();
+        let mut seen = 0usize;
+        for wnd in first..first + windows {
+            let toks = &train[wnd * GRAM_SEQ..(wnd + 1) * GRAM_SEQ];
+            let mut t = Tape::new();
+            let wids: Vec<ValueId> = fp.iter().map(|w| t.leaf(w.clone())).collect();
+            forward_aq(
+                &mut t,
+                &wids,
+                &arch,
+                toks,
+                &mut |kind, l, v, seq, cols| match kind {
+                    Tap::AttnIn => accumulate_gram(&mut all[l][0], cols, v, seq),
+                    Tap::FfnIn => accumulate_gram(&mut all[l][1], cols, v, seq),
+                    Tap::DownIn => accumulate_gram(&mut all[l][2], cols, v, seq),
+                    Tap::OProjIn => accumulate_gram(&mut all[l][3], cols, v, seq),
+                    Tap::Head => {}
+                },
+            );
+            seen += toks.len();
+        }
+        for g in &mut all {
+            mirror_and_scale(&mut g[0], arch.n_embd, seen);
+            mirror_and_scale(&mut g[1], arch.n_embd, seen);
+            mirror_and_scale(&mut g[2], arch.ff, seen);
+            mirror_and_scale(&mut g[3], q_width, seen);
+        }
+        all
+    };
+    println!("calibration Grams…");
+    let cal = grams(0);
+    println!("held-out Grams…");
+    let held = grams(windows);
+
+    let plain: Vec<Vec<f32>> = fp
+        .iter()
+        .zip(&shapes)
+        .map(|(w, &(r, c))| {
+            ste::salt_quantize_forward_grouped_geometric(
+                w,
+                r,
+                c,
+                t_ref,
+                GROUP,
+                GRID,
+                RotationPolicy::Always,
+            )
+        })
+        .collect();
+    let mut gptq = plain.clone();
+    let mut search_v = plain.clone();
+    let mut search_vp = plain.clone();
+    // Objective totals: [rtn, gptq, V, V+P] × [cal, held].
+    let mut obj = [[0.0f64; 2]; 4];
+    println!("fitting (sweeps ≤ {sweeps})…");
+    for li in 0..n_layers {
+        let base = 1 + 7 * li;
+        for (slot, gi) in [
+            (0usize, 0usize),
+            (1, 0),
+            (2, 0),
+            (3, 3),
+            (4, 1),
+            (5, 1),
+            (6, 2),
+        ] {
+            let i = base + slot;
+            let (rows, cols) = shapes[i];
+            let Some((g_rot, delta)) = gptq_codes(&fp[i], rows, cols, t_ref, &cal[li][gi], damp)
+            else {
+                continue;
+            };
+            let mut g_dense = g_rot.clone();
+            for row in g_dense.chunks_mut(cols) {
+                rotate_row(row, GROUP);
+            }
+            // The search's objective: the same damped, rotated Gram GPTQ used.
+            let mut h = cal[li][gi].clone();
+            let mean: f64 = (0..cols).map(|a| h[a * cols + a]).sum::<f64>() / cols as f64;
+            for a in 0..cols {
+                h[a * cols + a] += damp * mean.max(1e-12);
+            }
+            rotate_gram(&mut h, cols, GROUP);
+            let v = search_codes(&fp[i], cols, t_ref, &h, &g_rot, &delta, sweeps, false);
+            let vp = search_codes(&fp[i], cols, t_ref, &h, &g_rot, &delta, sweeps, true);
+            for (a, q) in [&plain[i], &g_dense, &v, &vp].into_iter().enumerate() {
+                obj[a][0] += layer_objective(&fp[i], q, cols, &cal[li][gi]);
+                obj[a][1] += layer_objective(&fp[i], q, cols, &held[li][gi]);
+            }
+            gptq[i] = g_dense;
+            search_v[i] = v;
+            search_vp[i] = vp;
+        }
+        if li % 10 == 0 {
+            println!("  layer {li}/{n_layers}");
+        }
+    }
+    drop((cal, held));
+
+    let ppl_fp = perplexity_windowed(&fp, &arch, &eval, EVAL_WINDOW);
+    let ppls = [
+        perplexity_windowed(&plain, &arch, &eval, EVAL_WINDOW),
+        perplexity_windowed(&gptq, &arch, &eval, EVAL_WINDOW),
+        perplexity_windowed(&search_v, &arch, &eval, EVAL_WINDOW),
+        perplexity_windowed(&search_vp, &arch, &eval, EVAL_WINDOW),
+    ];
+
+    println!(
+        "\nSmolLM2-135M | WikiText-2 {} held-out | fold α=0.75 | g{GROUP} | T={t_ref} | fp Grams {} tok\n\
+         layer objective summed over 210 projections, relative to round-to-nearest\n",
+        eval.len(),
+        windows * GRAM_SEQ
+    );
+    println!(
+        "{:<34} {:>12} {:>12} {:>11} {:>10}",
+        "fit", "obj (cal)", "obj (held)", "ppl", "vs RTN"
+    );
+    println!("{}", "-".repeat(84));
+    println!("{:<34} {:>12} {:>12} {ppl_fp:>11.4}", "fp master", "—", "—");
+    for (a, label) in [
+        "round-to-nearest (SHIPPING)",
+        "GPTQ",
+        "GPTQ + trit search",
+        "GPTQ + trit search + Δ refit",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        println!(
+            "{label:<34} {:>11.3}× {:>11.3}× {:>11.4} {:>+9.2}%",
+            obj[a][0] / obj[0][0],
+            obj[a][1] / obj[0][1],
+            ppls[a],
+            100.0 * (ppls[a] - ppls[0]) / ppls[0]
+        );
+    }
+    // The search minimizes the DAMPED objective, whose monotonicity the unit test below proves. The
+    // undamped calibration objective reported here can move slightly the other way, so this only
+    // guards against gross failure.
+    assert!(
+        obj[3][0] <= obj[1][0] * 1.05,
+        "the search raised the calibration objective by more than 5% over GPTQ"
+    );
+}
+
+/// The search's contract on a small case: every move is exactly priced, so the damped objective it
+/// minimizes can never rise above GPTQ's starting point, with or without step refits.
+#[test]
+fn trit_search_never_raises_the_damped_objective() {
+    let (rows, cols, t) = (4usize, 256usize, 3usize);
+    let mut s = 0xABCD_EF01u64;
+    let mut next = || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        ((s >> 40) as f64 / 8_388_608.0) - 1.0
+    };
+    let w: Vec<f32> = (0..rows * cols).map(|_| next() as f32).collect();
+    let m = 600;
+    let x: Vec<f64> = (0..m * cols)
+        .map(|i| next() * (1.0 + 4.0 * ((i % cols) % 7 == 0) as u8 as f64))
+        .collect();
+    let mut gram = vec![0.0f64; cols * cols];
+    accumulate_gram(
+        &mut gram,
+        cols,
+        &x.iter().map(|&v| v as f32).collect::<Vec<_>>(),
+        m,
+    );
+    mirror_and_scale(&mut gram, cols, m);
+    let damp = 0.01;
+    let (g_rot, delta) = gptq_codes(&w, rows, cols, t, &gram, damp).expect("gptq");
+    let mut g_dense = g_rot.clone();
+    for row in g_dense.chunks_mut(cols) {
+        rotate_row(row, GROUP);
+    }
+    let mut hd = gram.clone();
+    let mean: f64 = (0..cols).map(|a| hd[a * cols + a]).sum::<f64>() / cols as f64;
+    for a in 0..cols {
+        hd[a * cols + a] += damp * mean;
+    }
+    let mut h_rot = hd.clone();
+    rotate_gram(&mut h_rot, cols, GROUP);
+
+    let base = layer_objective(&w, &g_dense, cols, &hd);
+    let v = search_codes(&w, cols, t, &h_rot, &g_rot, &delta, 8, false);
+    let vp = search_codes(&w, cols, t, &h_rot, &g_rot, &delta, 8, true);
+    let (ov, ovp) = (
+        layer_objective(&w, &v, cols, &hd),
+        layer_objective(&w, &vp, cols, &hd),
+    );
+    println!("damped objective: gptq {base:.6e}  search {ov:.6e}  search+refit {ovp:.6e}");
+    assert!(
+        ov <= base * (1.0 + 1e-6),
+        "trit search raised the objective"
+    );
+    assert!(
+        ovp <= base * (1.0 + 1e-6),
+        "trit search + refit raised the objective"
+    );
+    assert!(
+        ov < base,
+        "the search found nothing to improve on a random problem"
     );
 }
