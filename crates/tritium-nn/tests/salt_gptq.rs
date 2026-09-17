@@ -327,6 +327,9 @@ fn gptq_codes(
 /// current codes (`ε = kᵀg / kᵀHk`) — the continuous half, alternating with the discrete half.
 ///
 /// Returns the reconstruction in the model's basis. `H` here is the damped, rotated Gram.
+// Indexing `d` by group while `k`, `r` and `g` are indexed by column is the clearest form of the
+// closed-form step refit; an iterator over `d` alone would hide which ranges belong together.
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 fn search_codes(
     w: &[f32],
     cols: usize,
