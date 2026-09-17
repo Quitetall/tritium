@@ -530,3 +530,228 @@ fn activation_metric_fit_against_the_euclidean_one() {
          run's +2.98% was an under-sampled Gram overfitting the calibration batch, not the method."
     );
 }
+
+/// **Stage 3 of the standard additive-PTQ recipe: calibrate each layer on the QUANTIZED model's
+/// inputs, in order.**
+///
+/// The sweep above collects every Gram from the fp model. That is the weaker GPTQ variant: layer
+/// `L` is fitted as if everything upstream were exact, so it compensates only its own rounding
+/// error and nothing it inherits. Reference GPTQ runs block by block — quantize block `L`, then push
+/// calibration data through the quantized prefix to collect block `L+1`'s inputs — so every block
+/// absorbs the error of every block before it.
+///
+/// That inheritance is the non-separability every allocation experiment kept hitting: a tensor's
+/// error cannot be priced alone because what it costs depends on what came before and after. A fit
+/// that sees propagated error is the base allocation has never been tested on.
+///
+/// Three arms at identical bits, all with the Gram at the full 12,288 tokens and damping 0.01:
+/// the shipping round-to-nearest fit, GPTQ on fp Grams (reproducing the sweep's best arm), and
+/// GPTQ on sequential Grams. The tied embedding is round-to-nearest in all three, and it is
+/// quantized before layer 0's Gram is collected, so the sequential arm's inputs are the quantized
+/// model's inputs from the first token on.
+#[test]
+#[ignore = "needs SmolLM2-135M; one full forward per layer per calibration window"]
+fn sequential_calibration_against_fp_calibration() {
+    let dir = model_dir();
+    if !dir.join("model.safetensors").exists() {
+        eprintln!("skipping: {} absent", dir.display());
+        return;
+    }
+    let t_ref = env_usize("TRITIUM_GPTQ_T", 3);
+    let windows = env_usize("TRITIUM_GPTQ_SEQ_WINDOWS", 48);
+    let damp = 0.01f64;
+    let runner =
+        ModelRunner::from_hf(&dir, Box::new(tritium_cpu::CpuBackend::new())).expect("from_hf");
+    let (arch0, fp0, shapes) = extract(&runner);
+    let (train, eval) = corpus();
+    assert!(windows * GRAM_SEQ <= train.len());
+
+    let mut calib = Calib::new(&arch0);
+    for w in 0..CALIB_WINDOWS {
+        calibrate(
+            &fp0,
+            &arch0,
+            &train[w * CALIB_SEQ..(w + 1) * CALIB_SEQ],
+            &mut calib,
+        );
+    }
+    let (fp, arch) = fold(&fp0, &shapes, &arch0, &calib, 0.75);
+    let n_layers = arch.n_layers;
+    let q_width = arch.n_head * arch.head_dim;
+
+    let plain: Vec<Vec<f32>> = fp
+        .iter()
+        .zip(&shapes)
+        .map(|(w, &(r, c))| {
+            ste::salt_quantize_forward_grouped_geometric(
+                w,
+                r,
+                c,
+                t_ref,
+                GROUP,
+                GRID,
+                RotationPolicy::Always,
+            )
+        })
+        .collect();
+
+    // Grams for ONE layer, collected by running `weights` forward. Other layers' taps are ignored.
+    let layer_grams = |weights: &[Vec<f32>], li: usize| -> [Vec<f64>; 4] {
+        let mut ga = vec![0.0f64; arch.n_embd * arch.n_embd];
+        let mut gf = vec![0.0f64; arch.n_embd * arch.n_embd];
+        let mut gd = vec![0.0f64; arch.ff * arch.ff];
+        let mut go = vec![0.0f64; q_width * q_width];
+        let mut seen = 0usize;
+        for wnd in 0..windows {
+            let toks = &train[wnd * GRAM_SEQ..(wnd + 1) * GRAM_SEQ];
+            let mut t = Tape::new();
+            let wids: Vec<ValueId> = weights.iter().map(|w| t.leaf(w.clone())).collect();
+            forward_aq(&mut t, &wids, &arch, toks, &mut |kind, l, v, seq, cols| {
+                if l != li {
+                    return;
+                }
+                match kind {
+                    Tap::AttnIn => accumulate_gram(&mut ga, cols, v, seq),
+                    Tap::FfnIn => accumulate_gram(&mut gf, cols, v, seq),
+                    Tap::DownIn => accumulate_gram(&mut gd, cols, v, seq),
+                    Tap::OProjIn => accumulate_gram(&mut go, cols, v, seq),
+                    Tap::Head => {}
+                }
+            });
+            seen += toks.len();
+        }
+        mirror_and_scale(&mut ga, arch.n_embd, seen);
+        mirror_and_scale(&mut gf, arch.n_embd, seen);
+        mirror_and_scale(&mut gd, arch.ff, seen);
+        mirror_and_scale(&mut go, q_width, seen);
+        [ga, gf, gd, go]
+    };
+
+    let quantize_layer = |target: &mut [Vec<f32>], li: usize, g: &[Vec<f64>; 4]| -> usize {
+        let base = 1 + 7 * li;
+        let mut fell_back = 0;
+        for (slot, gram) in [
+            (0usize, &g[0]),
+            (1, &g[0]),
+            (2, &g[0]),
+            (3, &g[3]),
+            (4, &g[1]),
+            (5, &g[1]),
+            (6, &g[2]),
+        ] {
+            let i = base + slot;
+            let (rows, cols) = shapes[i];
+            match gptq_tensor(&fp[i], rows, cols, t_ref, gram, damp) {
+                Some(q) => target[i] = q,
+                None => {
+                    target[i] = plain[i].clone();
+                    fell_back += 1;
+                }
+            }
+        }
+        fell_back
+    };
+
+    // ── GPTQ on fp Grams: every layer's inputs come from the fp model.
+    println!("GPTQ on fp Grams ({} tokens)…", windows * GRAM_SEQ);
+    // fp Grams do not depend on quantization order, so every layer's come from one pass.
+    let fp_grams: Vec<[Vec<f64>; 4]> = {
+        let mut all: Vec<[Vec<f64>; 4]> = (0..n_layers)
+            .map(|_| {
+                [
+                    vec![0.0f64; arch.n_embd * arch.n_embd],
+                    vec![0.0f64; arch.n_embd * arch.n_embd],
+                    vec![0.0f64; arch.ff * arch.ff],
+                    vec![0.0f64; q_width * q_width],
+                ]
+            })
+            .collect();
+        let mut seen = 0usize;
+        for wnd in 0..windows {
+            let toks = &train[wnd * GRAM_SEQ..(wnd + 1) * GRAM_SEQ];
+            let mut t = Tape::new();
+            let wids: Vec<ValueId> = fp.iter().map(|w| t.leaf(w.clone())).collect();
+            forward_aq(
+                &mut t,
+                &wids,
+                &arch,
+                toks,
+                &mut |kind, l, v, seq, cols| match kind {
+                    Tap::AttnIn => accumulate_gram(&mut all[l][0], cols, v, seq),
+                    Tap::FfnIn => accumulate_gram(&mut all[l][1], cols, v, seq),
+                    Tap::DownIn => accumulate_gram(&mut all[l][2], cols, v, seq),
+                    Tap::OProjIn => accumulate_gram(&mut all[l][3], cols, v, seq),
+                    Tap::Head => {}
+                },
+            );
+            seen += toks.len();
+        }
+        for g in &mut all {
+            mirror_and_scale(&mut g[0], arch.n_embd, seen);
+            mirror_and_scale(&mut g[1], arch.n_embd, seen);
+            mirror_and_scale(&mut g[2], arch.ff, seen);
+            mirror_and_scale(&mut g[3], q_width, seen);
+        }
+        all
+    };
+    let mut on_fp = plain.clone();
+    let mut fb_fp = 0;
+    for (li, g) in fp_grams.iter().enumerate() {
+        fb_fp += quantize_layer(&mut on_fp, li, g);
+    }
+    drop(fp_grams);
+
+    // ── Sequential: layer L's Grams come from a model whose embedding and layers < L are already
+    // quantized. `seq` IS that model at every step.
+    println!("GPTQ on sequential Grams…");
+    let mut seq = fp.clone();
+    seq[0] = plain[0].clone();
+    let mut fb_seq = 0;
+    for li in 0..n_layers {
+        let g = layer_grams(&seq, li);
+        fb_seq += quantize_layer(&mut seq, li, &g);
+        if li % 10 == 0 {
+            println!("  layer {li}/{n_layers}");
+        }
+    }
+
+    let ppl_fp = perplexity_windowed(&fp, &arch, &eval, EVAL_WINDOW);
+    let ppl_plain = perplexity_windowed(&plain, &arch, &eval, EVAL_WINDOW);
+    let ppl_on_fp = perplexity_windowed(&on_fp, &arch, &eval, EVAL_WINDOW);
+    let ppl_seq = perplexity_windowed(&seq, &arch, &eval, EVAL_WINDOW);
+
+    println!(
+        "\nSmolLM2-135M | WikiText-2 {} held-out | fold α=0.75 | g{GROUP} | T={t_ref} | rotation\n\
+         Gram {} tokens, damp {damp} | fell back: fp {fb_fp}, sequential {fb_seq}\n",
+        eval.len(),
+        windows * GRAM_SEQ
+    );
+    println!(
+        "{:<40} {:>11} {:>10} {:>12}",
+        "fit", "ppl", "× fp", "vs RTN"
+    );
+    println!("{}", "-".repeat(78));
+    for (label, ppl) in [
+        ("fp master", ppl_fp),
+        ("round-to-nearest (SHIPPING)", ppl_plain),
+        ("GPTQ, fp Grams", ppl_on_fp),
+        ("GPTQ, sequential Grams", ppl_seq),
+    ] {
+        println!(
+            "{label:<40} {ppl:>11.4} {:>9.4}× {:>11.2}%",
+            ppl / ppl_fp,
+            100.0 * (ppl - ppl_plain) / ppl_plain
+        );
+    }
+    println!(
+        "\nsequential vs fp Grams: {:+.2}%  |  share of RTN's excess over fp recovered: fp Grams {:.1}%, \
+         sequential {:.1}%",
+        100.0 * (ppl_seq - ppl_on_fp) / ppl_on_fp,
+        100.0 * (ppl_plain - ppl_on_fp) / (ppl_plain - ppl_fp),
+        100.0 * (ppl_plain - ppl_seq) / (ppl_plain - ppl_fp)
+    );
+    assert!(
+        ppl_seq.is_finite() && ppl_on_fp.is_finite(),
+        "a GPTQ arm did not produce a usable model"
+    );
+}
