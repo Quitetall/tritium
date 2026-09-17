@@ -37,6 +37,35 @@
 //! their rotated form, both charged the same scale overhead (one f16 per plane per group). This is
 //! the screen; perplexity is the verdict, and only worth running where the screen shows a gap.
 //!
+//! # Measured 2026-09-17 — the mechanism works, the method loses
+//!
+//! ```text
+//! T   ladder    ATVQ refined   dB vs ladder   ATVQ dB/plane   (degenerate one-sided run)
+//! 1   0.38033   0.37861        +0.04          8.44            +0.04
+//! 2   0.14920   0.16008        -0.61          7.96            -0.46
+//! 3   0.05555   0.06825        -1.79          7.77            -3.87
+//! 4   0.01798   0.02914        -4.19          7.68            -8.16
+//! ```
+//!
+//! Distinct bases are doing what they were built for: against the degenerate shared-basis version,
+//! they recover about 2 dB at T=3 and 4 dB at T=4. That is the decorrelation working.
+//!
+//! It still loses at every `T ≥ 2`, and the per-plane column says why. Every ATVQ plane buys a
+//! roughly constant ~7.7–8.4 dB: it is an independent three-level quantizer of a near-Gaussian
+//! residual, and a three-level quantizer cannot do much better than that on such a source. The
+//! ladder's planes are not independent — they are the balanced-ternary digits of one integer, so
+//! together they form a uniform grid whose gain per plane approaches `log2(3)·6.02 = 9.54 dB`. Making
+//! the planes independent threw away exactly the cooperation that makes the ladder efficient.
+//!
+//! Not run to perplexity: the screen was to decide that, and it shows no gap in ATVQ's favor. The
+//! fold is a reminder that weight-space error can mislead, but the fold is activation-aware and this
+//! is not — nothing here would make a weight-space loss turn into a perplexity win.
+//!
+//! What it means for vector-style gains with a resident plane format: the per-weight uniform grid is
+//! already the right *product* code, and beating it needs joint structure across weights that
+//! independent planes cannot express. The joint gains within reach are in the activation metric
+//! (the trit search in `salt_gptq`) and in file entropy (`TSLJ`), not in the plane layout.
+//!
 //! ```text
 //! TRITIUM_CORPUS=$HOME/.cache/tritium-corpora/wikitext2_400k_32k.json \
 //!   cargo test -p tritium-nn --release --test salt_atvq -- --ignored --nocapture
