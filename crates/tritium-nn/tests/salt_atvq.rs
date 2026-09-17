@@ -12,6 +12,9 @@
 //! Ŵ_g = Σ_p  R_p · (s_p · t_p)        t_p ternary, s_p one scale per plane per group
 //! ```
 //!
+//! (`R_p` is `D_out·H·D_in` — see [`Rotation`] for why a one-sided sign pattern is degenerate, which
+//! the first run of this file measured without knowing.)
+//!
 //! Decode is still additions and subtractions: a sign flip, a fast Hadamard, a ternary matmul. What
 //! the extra rotations buy is **decorrelation between planes**. In one shared basis the residual left
 //! by plane `p` is cube-aligned, which is why greedy free-scale fitting wasted most of each plane's
@@ -80,13 +83,15 @@ fn corpus_train() -> Vec<u32> {
         .collect()
 }
 
-/// Plane `p`'s sign pattern over an `n`-wide group. Plane 0 has none, so `R_0` is exactly the
-/// Hadamard SALT already uses and `T=1` is the same construction in both methods.
-fn signs(p: usize, n: usize) -> Vec<f32> {
+/// A sign pattern over an `n`-wide group, seeded by plane and side. Plane 0 has none on either side,
+/// so `R_0` is exactly the Hadamard SALT already uses and `T=1` is the same construction.
+fn signs(p: usize, n: usize, side: u64) -> Vec<f32> {
     if p == 0 {
         return vec![1.0; n];
     }
-    let mut s = 0x9E37_79B9_7F4A_7C15u64 ^ (p as u64).wrapping_mul(0xD1B5_4A32_D192_ED03);
+    let mut s = 0x9E37_79B9_7F4A_7C15u64
+        ^ (p as u64).wrapping_mul(0xD1B5_4A32_D192_ED03)
+        ^ side.wrapping_mul(0x94D0_49BB_1331_11EB);
     (0..n)
         .map(|_| {
             s ^= s << 13;
@@ -97,26 +102,54 @@ fn signs(p: usize, n: usize) -> Vec<f32> {
         .collect()
 }
 
-/// `y ← R_pᵀ·x = D_p·H·x`.
-fn analyze(x: &[f32], d: &[f32], out: &mut [f32]) {
-    out.copy_from_slice(x);
-    if group_is_rotatable(out.len()) {
-        fast_hadamard(out);
-        for (o, &s) in out.iter_mut().zip(d) {
-            *o *= s;
-        }
-    }
+/// Plane `p`'s rotation `R_p = D_out·H·D_in`.
+///
+/// **Both sides are required.** The first version used `R_p = H·D_p`, which is degenerate: the
+/// reconstruction `Σ_p s_p·H·D_p·t_p = H·Σ_p s_p·(D_p·t_p)`, and a sign flip of a ternary vector is a
+/// ternary vector, so every plane was secretly in the same basis. Any `R_p` whose products `R_pᵀ·R_q`
+/// are signed permutations collapses the same way. A second sign pattern on the other side of the
+/// Hadamard makes `R_pᵀ·R_q = D_in^p·H·(D_out^p·D_out^q)·H·D_in^q` dense.
+struct Rotation {
+    d_in: Vec<f32>,
+    d_out: Vec<f32>,
 }
 
-/// `x ← R_p·y = H·D_p·y`.
-fn synthesize(y: &[f32], d: &[f32], out: &mut [f32]) {
-    if group_is_rotatable(out.len()) {
-        for ((o, &v), &s) in out.iter_mut().zip(y).zip(d) {
+impl Rotation {
+    fn new(p: usize, n: usize) -> Self {
+        Self {
+            d_in: signs(p, n, 1),
+            d_out: signs(p, n, 2),
+        }
+    }
+
+    /// `y ← R_pᵀ·x = D_in·H·D_out·x`.
+    fn analyze(&self, x: &[f32], out: &mut [f32]) {
+        if !group_is_rotatable(out.len()) {
+            out.copy_from_slice(x);
+            return;
+        }
+        for ((o, &v), &s) in out.iter_mut().zip(x).zip(&self.d_out) {
             *o = v * s;
         }
         fast_hadamard(out);
-    } else {
-        out.copy_from_slice(y);
+        for (o, &s) in out.iter_mut().zip(&self.d_in) {
+            *o *= s;
+        }
+    }
+
+    /// `x ← R_p·y = D_out·H·D_in·y`.
+    fn synthesize(&self, y: &[f32], out: &mut [f32]) {
+        if !group_is_rotatable(out.len()) {
+            out.copy_from_slice(y);
+            return;
+        }
+        for ((o, &v), &s) in out.iter_mut().zip(y).zip(&self.d_in) {
+            *o = v * s;
+        }
+        fast_hadamard(out);
+        for (o, &s) in out.iter_mut().zip(&self.d_out) {
+            *o *= s;
+        }
     }
 }
 
@@ -153,7 +186,7 @@ fn ternary_fit(y: &[f32], out: &mut [f32]) {
 /// every step can only lower the error.
 fn atvq_group(w: &[f32], t: usize, sweeps: usize) -> Vec<f32> {
     let n = w.len();
-    let ds: Vec<Vec<f32>> = (0..t).map(|p| signs(p, n)).collect();
+    let rots: Vec<Rotation> = (0..t).map(|p| Rotation::new(p, n)).collect();
     let mut contrib = vec![vec![0.0f32; n]; t];
     let mut resid = w.to_vec();
     let (mut y, mut fit) = (vec![0.0f32; n], vec![0.0f32; n]);
@@ -161,9 +194,9 @@ fn atvq_group(w: &[f32], t: usize, sweeps: usize) -> Vec<f32> {
         for (r, &c) in resid.iter_mut().zip(&contrib[p]) {
             *r += c;
         }
-        analyze(resid, &ds[p], &mut y);
+        rots[p].analyze(resid, &mut y);
         ternary_fit(&y, &mut fit);
-        synthesize(&fit, &ds[p], &mut contrib[p]);
+        rots[p].synthesize(&fit, &mut contrib[p]);
         for (r, &c) in resid.iter_mut().zip(&contrib[p]) {
             *r -= c;
         }
@@ -256,6 +289,25 @@ fn ternary_fit_is_optimal_and_one_plane_is_the_shared_basis() {
             "one plane is not the shared-basis ternary fit"
         );
     }
+    // The rotations must be orthogonal (synthesize inverts analyze) and genuinely distinct: R_0ᵀ·R_1
+    // applied to a basis vector must be DENSE. The degenerate H·D_p construction gives ±1 at one
+    // index and zero elsewhere, which is exactly the failure this guards.
+    let (r0, r1) = (Rotation::new(0, 128), Rotation::new(1, 128));
+    let mut e = vec![0.0f32; 128];
+    e[5] = 1.0;
+    let (mut a, mut b) = (vec![0.0f32; 128], vec![0.0f32; 128]);
+    r1.synthesize(&e, &mut a);
+    r1.analyze(&a, &mut b);
+    assert!(
+        (b[5] - 1.0).abs() < 1e-5 && b.iter().enumerate().all(|(i, v)| i == 5 || v.abs() < 1e-5)
+    );
+    r0.analyze(&a, &mut b); // R_0ᵀ·R_1·e
+    let nonzero = b.iter().filter(|v| v.abs() > 1e-4).count();
+    assert!(
+        nonzero > 64,
+        "R_0ᵀ·R_1 maps a basis vector to {nonzero} nonzeros; a signed permutation (degenerate) gives 1"
+    );
+
     // Refinement can only lower the error.
     let sse_w = |q: &[f32]| w.iter().zip(q).map(|(a, b)| (a - b) * (a - b)).sum::<f32>();
     assert!(sse_w(&atvq_group(&w, 3, 6)) <= sse_w(&atvq_group(&w, 3, 0)) + 1e-5);
