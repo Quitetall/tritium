@@ -553,3 +553,123 @@ fn unpadded_container_changes_the_file_and_nothing_else() {
         db.len()
     );
 }
+
+/// **Ternary activations in the shipping runtime.**
+///
+/// `T` ternary planes reach `3^T` levels at `T·log2(3)` bits, so **5 planes is 7.92 bits — under
+/// int8's 8** at 243 of its 256 levels. Through the research tape, that measured equal to
+/// int8-per-group (+0.32% over fp32 activations) and 3.4× better than the int8-per-token quantizer
+/// this runtime actually uses (+1.09%).
+///
+/// The tape does not rotate activations and this runtime does, which already killed one activation
+/// lever: per-group int8 recovers 64% of the A8 tax unrotated and nothing rotated, because the
+/// Hadamard whitens the outliers finer scales exist to catch. **Prediction: ternary ×5 lands on
+/// int8, not above it**, for the same reason and because 243 levels ≈ 256 levels.
+///
+/// Worth wiring regardless: it is the representation a multiply-free kernel would consume, and this
+/// says what it costs in accuracy before anyone writes one. It saves no memory — activations are
+/// transient — and buys no speed here, since `project_rows` still reconstructs to f32.
+#[test]
+#[ignore = "five full evaluations of a real model on CPU"]
+fn ternary_activations_in_the_runtime() {
+    use tritium_nn::ActivationPrecision as AP;
+
+    let model = PathBuf::from(
+        std::env::var("TRITIUM_MODEL_DIR").expect("set TRITIUM_MODEL_DIR to an fp model directory"),
+    );
+    let corpus = PathBuf::from(
+        std::env::var("TRITIUM_CORPUS").expect("set TRITIUM_CORPUS to a corpus json"),
+    );
+    let tokens = eval_tokens(&corpus);
+    let dir = std::env::temp_dir().join(format!("tritium-tern-{}", std::process::id()));
+    convert_full(&model, &dir, &corpus, 0.75, true, 3, false);
+
+    let fp = score(
+        ModelRunner::from_hf(&model, Box::new(tritium_cpu::CpuBackend::new()))
+            .expect("load fp master"),
+        &tokens,
+    );
+    let score_at = |p: AP| -> f64 {
+        let mut runner = ModelRunner::from_salt(
+            &dir,
+            &dir.join("model.tslb"),
+            Box::new(tritium_cpu::CpuBackend::new()),
+        )
+        .expect("load converted model");
+        let touched = runner.weights.set_salt_activation_precision(p);
+        assert!(touched > 0, "no SALT projection was configured");
+        score(runner, &tokens)
+    };
+
+    let base = score_at(AP::PerToken);
+    let arms = [
+        ("int8 per group g128", AP::PerGroup(128), 8.0),
+        (
+            "ternary ×4 (6.34 bits)",
+            AP::Ternary {
+                planes: 4,
+                group: 128,
+            },
+            6.34,
+        ),
+        (
+            "ternary ×5 (7.92 bits)",
+            AP::Ternary {
+                planes: 5,
+                group: 128,
+            },
+            7.92,
+        ),
+        (
+            "ternary ×6 (9.51 bits)",
+            AP::Ternary {
+                planes: 6,
+                group: 128,
+            },
+            9.51,
+        ),
+    ];
+    let scored: Vec<(&str, f64, f64)> = arms
+        .iter()
+        .map(|&(label, p, bits)| (label, bits, score_at(p)))
+        .collect();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    println!("\nSmolLM2-135M | T=3 g256 rotated artifact | fp {fp:.4}");
+    println!(
+        "{:<30} {:>7} {:>11} {:>9} {:>12}",
+        "activation", "bits", "ppl", "× fp", "vs int8/tok"
+    );
+    println!("{}", "-".repeat(74));
+    println!(
+        "{:<30} {:>7.2} {base:>11.4} {:>8.4}× {:>12}",
+        "int8 per token (SHIPPING)",
+        8.0,
+        base / fp,
+        "—"
+    );
+    for (label, bits, ppl) in &scored {
+        println!(
+            "{label:<30} {bits:>7.2} {ppl:>11.4} {:>8.4}× {:>11.2}%",
+            ppl / fp,
+            100.0 * (ppl - base) / base
+        );
+    }
+
+    let five = scored
+        .iter()
+        .find(|(l, _, _)| l.starts_with("ternary ×5"))
+        .expect("the five-plane arm")
+        .2;
+    assert!(
+        five.is_finite() && five > 0.0,
+        "the ternary activation path did not produce a usable model"
+    );
+    // 243 levels against int8's 256, so it must not be materially worse. A large gap would mean the
+    // ladder is being fitted in the wrong basis, not that 7.92 bits is too few.
+    assert!(
+        five <= base * 1.02,
+        "ternary ×5 ({five:.4}) is more than 2% worse than int8 per token ({base:.4}); at 243 of \
+         256 levels that is a wiring fault, most likely rotating the activation twice"
+    );
+}

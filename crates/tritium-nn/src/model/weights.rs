@@ -31,7 +31,9 @@ use tritium_spec::TernaryBackend;
 
 use crate::config::{ArchSpec, ModelConfig};
 use crate::error::NnError;
-use crate::layers::{Mlp, Projection, Q2Linear, TernaryLinear, TokenEmbedding, TransformerBlock};
+use crate::layers::{
+    ActivationPrecision, Mlp, Projection, Q2Linear, TernaryLinear, TokenEmbedding, TransformerBlock,
+};
 use crate::tensor::f16_bytes_to_f32;
 
 /// The weights for one decoder layer, ready to run.
@@ -83,9 +85,20 @@ impl ModelWeights {
     /// actually has SALT projections rather than silently configuring nothing — a zero return on a
     /// model you believe is quantized means it is not, or not on this path.
     pub fn set_salt_activation_group(&mut self, group: Option<usize>) -> usize {
-        fn apply(projection: &mut Projection, group: Option<usize>, count: &mut usize) {
+        self.set_salt_activation_precision(match group {
+            Some(g) => ActivationPrecision::PerGroup(g),
+            None => ActivationPrecision::PerToken,
+        })
+    }
+
+    /// Set every SALT projection's activation precision. Returns how many were touched.
+    ///
+    /// See [`ActivationPrecision`]. Only [`Projection::Salt`] responds; a zero return on a model you
+    /// believe is quantized means it is not, or not on this path.
+    pub fn set_salt_activation_precision(&mut self, precision: ActivationPrecision) -> usize {
+        fn apply(projection: &mut Projection, precision: ActivationPrecision, count: &mut usize) {
             if let Projection::Salt(salt) = projection {
-                salt.set_activation_group(group);
+                salt.set_activation_precision(precision);
                 *count += 1;
             }
         }
@@ -97,14 +110,14 @@ impl ModelWeights {
                 &mut layer.v_proj,
                 &mut layer.o_proj,
             ] {
-                apply(projection, group, &mut count);
+                apply(projection, precision, &mut count);
             }
             let (gate, up, down) = match &mut layer.mlp {
                 Mlp::Relu2(mlp) => (&mut mlp.gate, &mut mlp.up, &mut mlp.down),
                 Mlp::SwiGlu(mlp) => (&mut mlp.gate, &mut mlp.up, &mut mlp.down),
             };
             for projection in [gate, up, down] {
-                apply(projection, group, &mut count);
+                apply(projection, precision, &mut count);
             }
         }
         // The tied head lives in `token_embd` and is NOT reached here: it projects through
@@ -112,7 +125,7 @@ impl ModelWeights {
         // ("No A8 activation quantization is applied on this path"). An untied head is a
         // `Projection` like any other and is switched.
         if let Some(head) = &mut self.lm_head {
-            apply(head, group, &mut count);
+            apply(head, precision, &mut count);
         }
         count
     }

@@ -281,6 +281,102 @@ pub fn quantize_activation_int8_grouped(
     Ok(())
 }
 
+/// Additive **ternary** activation quantization: `T` planes on the geometric ladder, per group,
+/// returned dequantized.
+///
+/// The same representation the weights use, applied to the activation. `T` planes reach `3^T` levels
+/// and cost `T·log2(3)` bits, so **`T = 5` is 7.92 bits — less than int8's 8** while reaching 243 of
+/// its 256 levels. Measured through the research tape at `T=3` weights, against fp32 activations:
+///
+/// | activation | bits | vs A-fp32 |
+/// |---|---|---|
+/// | int8 per row (the shipping quantizer) | 8 | +1.09% |
+/// | int8 per group g128 | 8 | +0.32% |
+/// | **ternary ×5** | **7.92** | **+0.32%** |
+/// | ternary ×4 | 6.34 | +3.49% |
+/// | int4 per group g128 | 4 | +208% |
+///
+/// # What this is and is not for
+///
+/// Activations are transient, so this saves **no memory** — unlike the weight side, where planes buy
+/// bytes. Its point is that a ternary activation against a ternary weight makes the projection a sum
+/// of additions and subtractions, with no multiplies anywhere.
+///
+/// That payoff is not collected here. `PackedSaltMatrix::project_rows` reconstructs weights to f32
+/// and dots in f32, so this path spends the planes and still multiplies; realizing the win needs a
+/// kernel that consumes trits on both sides. What this does give is the accuracy of ~8-bit
+/// activations in the representation such a kernel would want, available to measure and to ship
+/// behind a switch.
+///
+/// The representation is not new: multi-base additive quantization of both operands is ABC-Net's,
+/// with binary bases. What is measured here is the ternary version's rate–accuracy on an LLM.
+///
+/// `out_scale` is filled with `1.0` (`0.0` for an all-zero row), matching
+/// [`quantize_activation_int8_grouped`], so a caller's post-GEMM fold is unchanged.
+///
+/// # Errors
+/// [`NnError::Shape`] if `act.len()` or `out_q.len()` ≠ `rows * cols`, `out_scale.len()` ≠ `rows`,
+/// `group` is zero, or `planes` is zero or above 9 (the ladder's limit).
+pub fn quantize_activation_ternary(
+    act: &[f32],
+    rows: usize,
+    cols: usize,
+    planes: usize,
+    group: usize,
+    out_q: &mut [f32],
+    out_scale: &mut [f32],
+) -> Result<(), NnError> {
+    let elems = rows * cols;
+    if act.len() != elems {
+        return Err(NnError::Shape {
+            expected: elems,
+            got: act.len(),
+        });
+    }
+    if out_q.len() != elems {
+        return Err(NnError::Shape {
+            expected: elems,
+            got: out_q.len(),
+        });
+    }
+    if out_scale.len() != rows {
+        return Err(NnError::Shape {
+            expected: rows,
+            got: out_scale.len(),
+        });
+    }
+    if group == 0 || planes == 0 || planes > 9 {
+        return Err(NnError::Shape {
+            expected: 1,
+            got: group.min(planes),
+        });
+    }
+    // `Never`: the activation reaching this point has already been rotated by the projection if the
+    // artifact is a rotated fit. Rotating again inside the fitter would double-count the Hadamard.
+    let fitted = tritium_train::ops::ste::salt_quantize_forward_grouped_geometric(
+        act,
+        rows,
+        cols,
+        planes,
+        group,
+        LADDER_GRID,
+        tritium_train::ops::ste::RotationPolicy::Never,
+    );
+    out_q.copy_from_slice(&fitted);
+    for (r, slot) in out_scale.iter_mut().enumerate() {
+        let row = &act[r * cols..r * cols + cols];
+        *slot = if row.iter().any(|v| *v != 0.0) {
+            1.0
+        } else {
+            0.0
+        };
+    }
+    Ok(())
+}
+
+/// Grid candidates the ladder searches for each group's step. Matches the weight-side default.
+const LADDER_GRID: usize = 16;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -582,5 +678,79 @@ mod grouped_tests {
         let mut q = [0.0f32; 4];
         let mut s = [0.0f32; 2];
         assert!(quantize_activation_int8_grouped(&[0.0; 4], 2, 2, 0, &mut q, &mut s).is_err());
+    }
+}
+
+#[cfg(test)]
+mod ternary_tests {
+    use super::*;
+
+    fn rows(n: usize, cols: usize, seed: u64) -> Vec<f32> {
+        let mut s = seed | 1;
+        (0..n * cols)
+            .map(|i| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                let v = ((s >> 40) as f32 / 8_388_608.0) - 1.0;
+                // One outlier per row, as post-norm activations have.
+                if i % cols == 3 { v * 12.0 } else { v }
+            })
+            .collect()
+    }
+
+    /// More planes must mean less error, and `T=5` — 7.92 bits, under int8's 8 — must land near
+    /// int8's accuracy. That pairing is the whole claim.
+    #[test]
+    fn error_falls_with_planes_and_five_planes_rival_int8() {
+        let (n, cols) = (8usize, 256usize);
+        let act = rows(n, cols, 0xA57);
+        let sse = |q: &[f32]| -> f64 {
+            act.iter()
+                .zip(q)
+                .map(|(&a, &b)| f64::from(a - b) * f64::from(a - b))
+                .sum()
+        };
+        let mut prev = f64::INFINITY;
+        let mut at5 = 0.0;
+        for t in 1..=6usize {
+            let mut q = vec![0.0f32; n * cols];
+            let mut sc = vec![0.0f32; n];
+            quantize_activation_ternary(&act, n, cols, t, 128, &mut q, &mut sc).unwrap();
+            let e = sse(&q);
+            assert!(e < prev, "T={t} did not improve on T={}", t - 1);
+            assert!(sc.iter().all(|&v| v == 1.0));
+            if t == 5 {
+                at5 = e;
+            }
+            prev = e;
+        }
+        let mut q8 = vec![0.0f32; n * cols];
+        let mut s8 = vec![0.0f32; n];
+        quantize_activation_int8(&act, n, cols, &mut q8, &mut s8).unwrap();
+        let deq: Vec<f32> = q8
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| v * s8[i / cols])
+            .collect();
+        let e8 = sse(&deq);
+        assert!(
+            at5 <= e8 * 1.5,
+            "5 ternary planes (7.92 bits) should rival int8 (8 bits): {at5:.4e} vs {e8:.4e}"
+        );
+    }
+
+    #[test]
+    fn a_zero_row_reports_a_zero_scale_and_misuse_is_refused() {
+        let mut q = vec![9.0f32; 8];
+        let mut sc = vec![9.0f32; 2];
+        quantize_activation_ternary(&[0.0; 8], 2, 4, 3, 4, &mut q, &mut sc).unwrap();
+        assert!(q.iter().all(|&v| v == 0.0) && sc.iter().all(|&v| v == 0.0));
+        let mut q = [0.0f32; 4];
+        let mut sc = [0.0f32; 2];
+        assert!(quantize_activation_ternary(&[0.0; 4], 2, 2, 3, 0, &mut q, &mut sc).is_err());
+        assert!(quantize_activation_ternary(&[0.0; 4], 2, 2, 0, 2, &mut q, &mut sc).is_err());
+        assert!(quantize_activation_ternary(&[0.0; 4], 2, 2, 10, 2, &mut q, &mut sc).is_err());
+        assert!(quantize_activation_ternary(&[0.0; 3], 2, 2, 3, 2, &mut q, &mut sc).is_err());
     }
 }

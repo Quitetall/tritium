@@ -29,7 +29,7 @@ pub use qwen35_deltanet::{Qwen35DeltaNet, Qwen35DeltaNetCache, Qwen35DeltaNetWei
 pub use qwen35_full_attention::{
     Qwen35FullAttention, Qwen35FullAttentionCache, Qwen35FullAttentionWeights,
 };
-pub use salt::SaltLinear;
+pub use salt::{ActivationPrecision, SaltLinear};
 pub use salt_v2_host::HostSaltV2Linear;
 pub use token_embedding::TokenEmbedding;
 pub use transformer_block::{BlockDump, BlockScratch, TransformerBlock};

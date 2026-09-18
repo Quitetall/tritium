@@ -13,6 +13,56 @@ use tritium_format::{
 
 use crate::error::NnError;
 
+/// Bytes one dense plane occupies in the arena: trits packed **sequentially**, two bits each, then
+/// one `f16` scale per 256-trit block.
+///
+/// The on-disk and on-wire form is TQ2_0, whose blocks are a fixed 256 trits — so a 576-wide row
+/// takes three of them and 25% of the last one holds nothing. Block alignment is a property of that
+/// codec, not of the model, and this arena is host-side and private: `PackedSaltRow` and
+/// `PackedSaltMatrix` have no readers outside this crate and `tritium-format`. Storing trits
+/// sequentially therefore drops the padding without touching any format or device kernel. Measured
+/// on SmolLM2-135M, padding was **21.1%** of resident trit storage, all of it in 576-wide rows.
+///
+/// Note this is NOT the TQ2_0 bit order, which interleaves (`byte c*32+m` holds trits
+/// `c*128+n*32+m`). Nothing outside this file may read the arena assuming otherwise.
+const fn compact_plane_len(k: usize) -> usize {
+    k.div_ceil(4) + k.div_ceil(QK_K) * 2
+}
+
+/// Rewrite one TQ2_0 dense plane into the compact layout, appending to `out`.
+fn push_compact_plane(out: &mut Vec<u8>, bytes: &[u8], k: usize) -> Result<(), NnError> {
+    let blocks = k.div_ceil(QK_K);
+    if bytes.len() != blocks * TQ2_0_BLOCK_BYTES {
+        return Err(NnError::Shape {
+            expected: blocks * TQ2_0_BLOCK_BYTES,
+            got: bytes.len(),
+        });
+    }
+    let trit_start = out.len();
+    out.resize(trit_start + k.div_ceil(4), 0);
+    let mut scales = Vec::with_capacity(blocks * 2);
+    let mut trits = [Trit::ZERO; QK_K];
+    let mut scale = f16::ZERO;
+    for block in 0..blocks {
+        let start = block * TQ2_0_BLOCK_BYTES;
+        unpack_tq2_0_block(
+            &bytes[start..start + TQ2_0_BLOCK_BYTES],
+            &mut trits,
+            &mut scale,
+        )
+        .map_err(|error| NnError::Backend(error.to_string()))?;
+        let base = block * QK_K;
+        for (i, trit) in trits.iter().enumerate().take(QK_K.min(k - base)) {
+            let col = base + i;
+            let code = (trit.get() + 1) as u8;
+            out[trit_start + col / 4] |= code << (2 * (col % 4));
+        }
+        scales.extend_from_slice(&scale.to_bits().to_le_bytes());
+    }
+    out.extend_from_slice(&scales);
+    Ok(())
+}
+
 const SPARSE_SIGN_BIT: u32 = 1 << 31;
 const SPARSE_INDEX_MASK: u32 = !SPARSE_SIGN_BIT;
 
@@ -63,11 +113,20 @@ struct MatrixRequirements {
 }
 
 impl MatrixRequirements {
-    fn from_streamed(requirements: PackedSaltStorageRequirements) -> Self {
+    /// `k_in` is needed because the arena stores compacted planes while the streamed requirement
+    /// counts TQ2_0 bytes. Every dense plane of a row has the same TQ2_0 length, so the plane count
+    /// divides out exactly.
+    fn from_streamed(requirements: PackedSaltStorageRequirements, k_in: usize) -> Self {
+        let tq2_len = k_in.div_ceil(QK_K) * TQ2_0_BLOCK_BYTES;
+        let dense_planes = if tq2_len == 0 {
+            0
+        } else {
+            requirements.dense_bytes() / tq2_len
+        };
         Self {
             rows: requirements.rows(),
             planes: requirements.planes(),
-            dense_bytes: requirements.dense_bytes(),
+            dense_bytes: dense_planes * compact_plane_len(k_in),
             sparse_scales: requirements.sparse_scales(),
             sparse_entries: requirements.sparse_entries(),
             sparse_planes: requirements.sparse_planes(),
@@ -88,10 +147,10 @@ impl MatrixRequirements {
                 checked_count_add(requirements.planes, row.plane_count(), "SALT plane count")?;
             for plane in row.planes() {
                 match plane {
-                    PlaneRepr::Dense(bytes) => {
+                    PlaneRepr::Dense(_) => {
                         requirements.dense_bytes = checked_count_add(
                             requirements.dense_bytes,
-                            bytes.len(),
+                            compact_plane_len(row.k()),
                             "SALT dense bytes",
                         )?;
                     }
@@ -134,7 +193,11 @@ impl PackedSaltMatrixBuilder {
         k_in: usize,
         requirements: PackedSaltStorageRequirements,
     ) -> Result<Self, NnError> {
-        Self::new(n_out, k_in, MatrixRequirements::from_streamed(requirements))
+        Self::new(
+            n_out,
+            k_in,
+            MatrixRequirements::from_streamed(requirements, k_in),
+        )
     }
 
     fn new(n_out: usize, k_in: usize, expected: MatrixRequirements) -> Result<Self, NnError> {
@@ -208,7 +271,8 @@ impl PackedSaltMatrixBuilder {
         for plane in row.planes() {
             if let Some(bytes) = plane.dense_bytes() {
                 validate_dense_scales(bytes)?;
-                add_dense = checked_count_add(add_dense, bytes.len(), "SALT dense bytes")?;
+                add_dense =
+                    checked_count_add(add_dense, compact_plane_len(self.k_in), "SALT dense bytes")?;
             } else if let Some(sparse) = plane.sparse() {
                 if sparse.scales().any(|scale| !scale.is_finite()) {
                     return Err(NnError::Backend(
@@ -234,7 +298,7 @@ impl PackedSaltMatrixBuilder {
         for plane in row.planes() {
             if let Some(bytes) = plane.dense_bytes() {
                 let byte_offset = self.dense_bytes.len();
-                self.dense_bytes.extend_from_slice(bytes);
+                push_compact_plane(&mut self.dense_bytes, bytes, self.k_in)?;
                 self.planes.push(PlaneMeta::Dense { byte_offset });
             } else if let Some(sparse) = plane.sparse() {
                 let scale_offset = self.sparse_scales.len();
@@ -277,7 +341,12 @@ impl PackedSaltMatrixBuilder {
             match plane {
                 PlaneRepr::Dense(bytes) => {
                     validate_dense_scales(bytes)?;
-                    add_dense = checked_count_add(add_dense, bytes.len(), "SALT dense bytes")?;
+                    let _ = bytes;
+                    add_dense = checked_count_add(
+                        add_dense,
+                        compact_plane_len(self.k_in),
+                        "SALT dense bytes",
+                    )?;
                 }
                 PlaneRepr::Sparse(sparse) => {
                     if sparse.scales.iter().any(|scale| !scale.is_finite()) {
@@ -307,7 +376,7 @@ impl PackedSaltMatrixBuilder {
             match plane {
                 PlaneRepr::Dense(bytes) => {
                     let byte_offset = self.dense_bytes.len();
-                    self.dense_bytes.extend_from_slice(bytes);
+                    push_compact_plane(&mut self.dense_bytes, bytes, self.k_in)?;
                     self.planes.push(PlaneMeta::Dense { byte_offset });
                 }
                 PlaneRepr::Sparse(sparse) => {
@@ -644,14 +713,18 @@ impl PackedSaltMatrix {
         for plane in &self.storage.planes[row.plane_start..row.plane_start + row.plane_len] {
             match *plane {
                 PlaneMeta::Dense { byte_offset } => {
-                    let start = byte_offset + block * TQ2_0_BLOCK_BYTES;
-                    let bytes = &self.storage.dense_bytes[start..start + TQ2_0_BLOCK_BYTES];
-                    let mut scale = f16::ZERO;
-                    unpack_tq2_0_block(bytes, trits, &mut scale)
-                        .map_err(|error| NnError::Backend(error.to_string()))?;
-                    let scale = scale.to_f32();
-                    for index in 0..logical_len {
-                        weight[index] += scale * trits[index].to_f32();
+                    let arena = &self.storage.dense_bytes;
+                    let scale_at = byte_offset + self.k_in.div_ceil(4) + block * 2;
+                    let scale =
+                        f16::from_bits(u16::from_le_bytes([arena[scale_at], arena[scale_at + 1]]))
+                            .to_f32();
+                    for (index, slot) in weight.iter_mut().enumerate().take(logical_len) {
+                        let col = start_col + index;
+                        let code = (arena[byte_offset + col / 4] >> (2 * (col % 4))) & 3;
+                        let trit = Trit::from_i8(code as i8 - 1)
+                            .map_err(|error| NnError::Backend(error.to_string()))?;
+                        trits[index] = trit;
+                        *slot += scale * trit.to_f32();
                     }
                 }
                 PlaneMeta::Sparse {
@@ -680,6 +753,118 @@ impl PackedSaltMatrix {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod compact_arena_tests {
+    use super::*;
+    use tritium_format::{SaltRow, num_blocks, pack_tq2_0_block, salt_rows_to_dense};
+
+    /// Build TQ2_0 rows with varied trits and a distinct scale per block.
+    fn rows_of(k: usize, n: usize, planes: usize, seed: u64) -> Vec<SaltRow> {
+        let mut s = seed | 1;
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        let blocks = num_blocks(k);
+        (0..n)
+            .map(|_| {
+                let planes = (0..planes)
+                    .map(|p| {
+                        let mut plane = vec![0u8; blocks * TQ2_0_BLOCK_BYTES];
+                        for b in 0..blocks {
+                            let mut trits = [Trit::ZERO; QK_K];
+                            for (i, t) in trits.iter_mut().enumerate() {
+                                if b * QK_K + i < k {
+                                    let v = (next() % 3) as i8 - 1;
+                                    *t = Trit::from_i8(v).unwrap();
+                                }
+                            }
+                            let scale = f16::from_f32(
+                                0.01 + p as f32 * 0.007 + (next() % 53) as f32 * 1e-4,
+                            );
+                            pack_tq2_0_block(
+                                &trits,
+                                scale,
+                                &mut plane[b * TQ2_0_BLOCK_BYTES..(b + 1) * TQ2_0_BLOCK_BYTES],
+                            )
+                            .unwrap();
+                        }
+                        plane
+                    })
+                    .collect();
+                SaltRow { k, planes }
+            })
+            .collect()
+    }
+
+    /// The contract: the compact arena must reconstruct **bit-identically** to decoding the TQ2_0
+    /// bytes it was built from, at every width — exact multiples of the block and ragged tails alike.
+    /// A silent divergence here would change every weight in the model.
+    #[test]
+    fn compact_arena_reconstructs_bit_identically_to_tq2_0() {
+        for (k, n, planes) in [
+            (576usize, 5usize, 3usize),
+            (256, 3, 2),
+            (269, 4, 3),
+            (1, 2, 1),
+            (1536, 2, 3),
+        ] {
+            let rows = rows_of(k, n, planes, 0xC0FFEE + k as u64);
+            let reference = salt_rows_to_dense(&rows).unwrap();
+            let packed: Vec<PackedSaltRow> = rows
+                .iter()
+                .cloned()
+                .map(|r| PackedSaltRow::try_from(r).unwrap())
+                .collect();
+            let matrix = PackedSaltMatrix::new(packed, n, k).unwrap();
+            let mut got = vec![0.0f32; n * k];
+            for r in 0..n {
+                matrix.dequant_row(r, &mut got[r * k..(r + 1) * k]).unwrap();
+            }
+            for (i, (a, b)) in reference.iter().zip(&got).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "k={k} index {i}: TQ2_0 decode {a} vs compact arena {b}"
+                );
+            }
+        }
+    }
+
+    /// And it must actually be smaller where the block padding was — the point of the change.
+    #[test]
+    fn the_arena_drops_the_block_padding() {
+        for (k, expect_saving) in [(576usize, true), (1536, false), (256, false), (269, true)] {
+            let rows = rows_of(k, 4, 3, 7);
+            let tq2 = 3 * num_blocks(k) * TQ2_0_BLOCK_BYTES;
+            let compact = 3 * compact_plane_len(k);
+            let packed: Vec<PackedSaltRow> = rows
+                .into_iter()
+                .map(|r| PackedSaltRow::try_from(r).unwrap())
+                .collect();
+            let matrix = PackedSaltMatrix::new(packed, 4, k).unwrap();
+            assert_eq!(
+                matrix.packed_bytes(),
+                4 * compact,
+                "k={k}: arena is not the compact size"
+            );
+            if expect_saving {
+                assert!(
+                    compact < tq2,
+                    "k={k}: compact {compact} not below TQ2_0 {tq2}"
+                );
+            } else {
+                assert_eq!(compact, tq2, "k={k} divides the block; nothing to save");
+            }
+        }
+        // The shipping shape: 576-wide rows lose a quarter of every third block.
+        assert_eq!(compact_plane_len(576), 150);
+        assert_eq!(num_blocks(576) * TQ2_0_BLOCK_BYTES, 198);
     }
 }
 

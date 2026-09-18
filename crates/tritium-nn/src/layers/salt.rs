@@ -10,7 +10,9 @@ use tritium_train::ops::ste::{fast_hadamard, group_is_rotatable};
 
 use crate::error::NnError;
 use crate::layers::packed_salt::PackedSaltMatrix;
-use crate::ops::{quantize_activation_int8, quantize_activation_int8_grouped};
+use crate::ops::{
+    quantize_activation_int8, quantize_activation_int8_grouped, quantize_activation_ternary,
+};
 
 /// A bias-free additive ternary projection backed by packed SALT rows.
 #[derive(Clone, Debug)]
@@ -22,9 +24,35 @@ pub struct SaltLinear {
     /// slice of the activation before quantizing: `H·H = I`, hence `W·x = (W·H)·(H·x)`. Skipping it
     /// computes `W·H·x` — wrong, but not detectably wrong, which is why the bundle version gates it.
     rotation_group: Option<usize>,
-    /// Activation-quant granularity. `None` is the shipping per-token absmax; `Some(g)` takes one
-    /// absmax per `g` inputs instead. See [`Self::set_activation_group`].
-    activation_group: Option<usize>,
+    /// How the activation is quantized before the projection. See [`ActivationPrecision`].
+    activation: ActivationPrecision,
+}
+
+/// How a SALT projection quantizes its activation.
+///
+/// Every variant costs the same memory — activations are transient — so this is an accuracy and
+/// arithmetic choice, not a size one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ActivationPrecision {
+    /// One int8 absmax per token, over the whole row. BitNet's reference quantizer and what ships.
+    #[default]
+    PerToken,
+    /// One int8 absmax per `g` inputs. Recovers 64% of the A8 tax on an UNROTATED artifact and
+    /// almost nothing on a rotated one — the Hadamard already whitens the outliers it exploits.
+    PerGroup(usize),
+    /// Additive ternary planes on the geometric ladder, `planes·log2(3)` bits per value: the weight
+    /// side's representation applied to the activation, so a kernel could contract trits against
+    /// trits with no multiplies. `planes = 5` is 7.92 bits, under int8, at 243 of its 256 levels.
+    ///
+    /// No such kernel exists here yet — `PackedSaltMatrix::project_rows` reconstructs to f32 and
+    /// multiplies — so today this buys the accuracy and not the arithmetic.
+    Ternary {
+        /// Ternary planes per value, `1..=9`.
+        planes: usize,
+        /// Inputs sharing one ladder anchor.
+        group: usize,
+    },
 }
 
 impl SaltLinear {
@@ -35,34 +63,27 @@ impl SaltLinear {
         Self {
             matrix,
             rotation_group,
-            activation_group: None,
+            activation: ActivationPrecision::PerToken,
         }
     }
 
-    /// Switch this projection to per-group activation quantization, or back to per-token.
-    ///
-    /// One absmax per token means a single outlier sets the step for the whole row. The research
-    /// tape put the recovery at **64% of the A8 tax**; measured end to end here it is worth
-    /// **0.24% at best, and only on an UNROTATED artifact** — a rotated one shows nothing, because
-    /// the Hadamard already whitened the activation that per-group scales exist to exploit. See
-    /// [`quantize_activation_int8_grouped`] for the table and the mechanism.
-    ///
-    /// Off by default for two independent reasons. It is worth almost nothing in the configuration
-    /// that ships (rotation is on by default and is worth 3.85%, ~16× more, for the same reason).
-    /// And it is not free: per-group scales cannot factor out of the dot product, so
-    /// [`quantize_activation_int8_grouped`] hands the GEMM dequantized f32 rather than integers. On
-    /// this path that costs no accuracy (`PackedSaltMatrix::project_rows` is an f32 dot with no
-    /// integer fast path to lose) but it does cost time, and an int8 kernel cannot consume it at
-    /// all — `tritium-cpu`'s AVX2 A8 lane checks `act_is_a8_integer` and falls back. Measured: the
-    /// per-group arms roughly doubled the wall time of the evaluation that produced the table.
-    pub fn set_activation_group(&mut self, group: Option<usize>) {
-        self.activation_group = group;
+    /// Set how this projection quantizes its activation. See [`ActivationPrecision`].
+    pub fn set_activation_precision(&mut self, precision: ActivationPrecision) {
+        self.activation = precision;
     }
 
-    /// The activation-quant granularity in force, `None` for the shipping per-token absmax.
+    /// Switch to per-group int8, or back to the shipping per-token absmax.
+    pub fn set_activation_group(&mut self, group: Option<usize>) {
+        self.activation = match group {
+            Some(g) => ActivationPrecision::PerGroup(g),
+            None => ActivationPrecision::PerToken,
+        };
+    }
+
+    /// The activation precision in force.
     #[must_use]
-    pub const fn activation_group(&self) -> Option<usize> {
-        self.activation_group
+    pub const fn activation_precision(&self) -> ActivationPrecision {
+        self.activation
     }
 
     /// Build a projection from one packed SALT row per output channel.
@@ -114,7 +135,7 @@ impl SaltLinear {
             // Raw rows carry no bundle header, so there is nothing to say they were fitted in a
             // rotated basis. Callers that know otherwise build through the bundle path.
             rotation_group: None,
-            activation_group: None,
+            activation: ActivationPrecision::PerToken,
         })
     }
 
@@ -204,13 +225,24 @@ impl SaltLinear {
 
         let mut q_act = zeroed_scratch(act_len, "SALT quantized activations")?;
         let mut act_scale = zeroed_scratch(m, "SALT activation scales")?;
-        match self.activation_group {
-            None => quantize_activation_int8(act, m, self.k_in(), &mut q_act, &mut act_scale)?,
-            // Writes dequantized values and a scale of 1, so the fold below is unchanged.
-            Some(group) => quantize_activation_int8_grouped(
+        match self.activation {
+            ActivationPrecision::PerToken => {
+                quantize_activation_int8(act, m, self.k_in(), &mut q_act, &mut act_scale)?;
+            }
+            // These write dequantized values and a scale of 1, so the fold below is unchanged.
+            ActivationPrecision::PerGroup(group) => quantize_activation_int8_grouped(
                 act,
                 m,
                 self.k_in(),
+                group,
+                &mut q_act,
+                &mut act_scale,
+            )?,
+            ActivationPrecision::Ternary { planes, group } => quantize_activation_ternary(
+                act,
+                m,
+                self.k_in(),
+                planes,
                 group,
                 &mut q_act,
                 &mut act_scale,

@@ -42,8 +42,17 @@ fn packed_salt_linear_matches_dense_a8_without_matrix_materialization() {
     salt_linear.forward(&act, m, &mut got).unwrap();
 
     assert_eq!(got, expected);
+    // The resident arena is NOT the encoded TQ2_0 size: a TQ2_0 block is a fixed 256 trits, so a
+    // 257-wide row would carry a second block that is 255/256 empty. The arena packs trits
+    // sequentially and keeps one scale per block, so it holds only what the row contains.
     let encoded_bytes: usize = rows.iter().flat_map(|row| &row.planes).map(Vec::len).sum();
-    assert_eq!(salt_linear.packed_bytes(), encoded_bytes);
+    let planes: usize = rows.iter().map(|row| row.planes.len()).sum();
+    let compact = planes * (k.div_ceil(4) + k.div_ceil(256) * 2);
+    assert_eq!(salt_linear.packed_bytes(), compact);
+    assert!(
+        compact < encoded_bytes,
+        "the arena ({compact}) should drop the block padding the encoding carries ({encoded_bytes})"
+    );
     assert!(salt_linear.resident_bytes() >= salt_linear.packed_bytes());
     assert!(salt_linear.packed_bytes() < n * k * size_of::<f32>());
 }
