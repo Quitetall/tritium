@@ -22,6 +22,20 @@ until `TRITIUM_SEMVER_MODE=block` is selected.
 This is local gate evidence only. It does not promote any missing model,
 hardware, browser, deployment, independent-review, or public-activation gate.
 
+### Latest CI verification (2026-09-18, run `35382017196`, commit `9b39c8b4`)
+
+The required CI workflow completed successfully. Supply-chain, compatibility
+matrix, Linux/macOS/Windows CPU validation, Metal, MSRV, Burn, Candle, ONNX,
+WASI, Web package, SBOM, API stability, publish readiness, workflow lint and
+CPU benchmark lanes all passed. CUDA, ROCm, wgpu, real-model serving, fuzzing
+and performance-regression lanes were skipped by runner policy; those skips are
+not release evidence. The compatibility receipt exists in CI output but is not
+yet harvested into a same-revision release candidate registry.
+
+This CI result validates source and packaging workflows only. It does not
+promote the Qwen flagship, hardware, deployment, model-zoo, reproduction,
+signing or public-activation gates.
+
 The preceding source revision (`2f5adf6728ad4654b2811b6a08359ad111004fbb`)
 also passed local package probes (not yet registered in a release candidate):
 `check-publish.sh` and 23-crate qualification, npm archive qualification, and
