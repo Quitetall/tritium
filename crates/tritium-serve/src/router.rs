@@ -1217,7 +1217,10 @@ async fn chat_completions(
             Some("temperature"),
         );
     }
-    if req.model.as_str() != &*st.model_id {
+    // LAMU's standalone REPL uses OpenAI's conventional `default` model
+    // selector when talking to a single-model endpoint. Treat it as an alias
+    // for configured model_id; responses still report the authenticated ID.
+    if req.model.as_str() != "default" && req.model.as_str() != &*st.model_id {
         return api_error(
             StatusCode::NOT_FOUND,
             "model_not_found",
