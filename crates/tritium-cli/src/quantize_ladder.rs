@@ -140,7 +140,6 @@ pub(crate) fn quantize_tensor_ladder(
     cols: usize,
     cfg: &LadderConfig,
 ) -> Result<Vec<SaltRow>> {
-    let groups_per_row = cols.div_ceil(cfg.group);
     let fits = ste::geometric_ladder_fit(
         wf,
         rows,
