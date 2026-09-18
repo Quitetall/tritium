@@ -26,6 +26,7 @@ mod pv_recovery;
 mod qwen35_config;
 #[cfg(feature = "cuda")]
 mod recovery;
+pub mod salt_fit;
 mod salt_v2_growth;
 mod teacher_cache;
 mod tensor;

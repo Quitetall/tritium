@@ -983,7 +983,9 @@ fn discrete_search_over_trit_moves_against_gptq() {
         return;
     }
     let t_ref = env_usize("TRITIUM_GPTQ_T", 3);
-    let windows = 48usize;
+    // Calibration tokens are the binding limit on this whole family: GPTQ reaches 0.236× of
+    // round-to-nearest's objective on the Gram it fitted and only 0.459× on unseen tokens.
+    let windows = env_usize("TRITIUM_SEARCH_WINDOWS", 48);
     let damp = 0.01f64;
     let sweeps = env_usize("TRITIUM_SEARCH_SWEEPS", 8);
     let runner =
