@@ -230,6 +230,21 @@ enum Command {
         /// unrotated artifact.
         #[arg(long)]
         no_rotation: bool,
+        /// Choose each weight's code in the ACTIVATION metric instead of rounding to the nearest
+        /// ladder point.
+        ///
+        /// Rounding minimizes `‖W − Ŵ‖²`, but the loss sees `W·x`, not `W`. This fits
+        /// `‖(W − Ŵ)·X‖²` with GPTQ error compensation, a discrete search over the trit moves, and
+        /// closed-form refits of each group's step. Same bits, same container, same file size.
+        ///
+        /// Measured on SmolLM2-135M at T=3: **−0.64% perplexity**. Requires `--calib`, and costs one
+        /// Gram per projection input plus a fit per tensor, so conversion takes markedly longer.
+        ///
+        /// Give it as much calibration text as you can spare: this family is limited by Gram
+        /// estimation, not by the fitter. A Gram from fewer tokens than a projection's input width
+        /// is rank-deficient by construction and makes the fit WORSE.
+        #[arg(long)]
+        activation_aware: bool,
         /// Write the padded TQ2_0 bundle instead of the entropy-coded `TSLJ` one.
         ///
         /// The loaded model is identical either way: `TSLJ` decodes to byte-identical TQ2_0 rows at
@@ -606,6 +621,7 @@ fn main() -> anyhow::Result<()> {
             calib_tokens,
             fold_alpha,
             no_rotation,
+            activation_aware,
             dense_container,
             planes,
             group,
@@ -624,6 +640,7 @@ fn main() -> anyhow::Result<()> {
                     rotate: !no_rotation,
                 },
                 dense_container,
+                activation_aware,
             },
         )?,
         Command::Quantize {

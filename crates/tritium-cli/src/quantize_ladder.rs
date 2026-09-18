@@ -154,14 +154,28 @@ pub(crate) fn quantize_tensor_ladder(
             RotationPolicy::Never
         },
     );
+    pack_group_fits(&fits, rows, cols, cfg)
+}
+
+/// Pack `(s₀, plane-major trits)` per group into per-output-channel [`SaltRow`]s.
+///
+/// The fits may come from the plain ladder or from the activation-aware fitter
+/// ([`tritium_nn::salt_fit::fit_tensor`]); both emit this shape, so the container is identical
+/// either way and only the digits differ.
+pub(crate) fn pack_group_fits(
+    fits: &[(f32, Vec<Vec<i8>>)],
+    rows: usize,
+    cols: usize,
+    cfg: &LadderConfig,
+) -> Result<Vec<SaltRow>> {
+    let groups_per_row = cols.div_ceil(cfg.group);
     if fits.len() != rows * groups_per_row {
         bail!(
-            "ladder fit returned {} groups, expected {} ({rows} rows x {groups_per_row} groups)",
+            "fit returned {} groups, expected {} ({rows} rows x {groups_per_row} groups)",
             fits.len(),
             rows * groups_per_row
         );
     }
-
     let blocks_per_row = cols.div_ceil(QK_K);
     let mut out = Vec::with_capacity(rows);
     for r in 0..rows {

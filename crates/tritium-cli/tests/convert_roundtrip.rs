@@ -673,3 +673,86 @@ fn ternary_activations_in_the_runtime() {
          256 levels that is a wiring fault, most likely rotating the activation twice"
     );
 }
+
+/// **`--activation-aware` must produce a better model than nearest-point rounding, at the same bits.**
+///
+/// The fit minimizes `‖(W − Ŵ)·X‖²` instead of `‖W − Ŵ‖²`, with GPTQ compensation, a discrete search
+/// over the trit moves and closed-form step refits. Container, bit count and file size are identical;
+/// only the digits differ. The harness measured −0.64% at T=3; this checks the CLI delivers it.
+///
+/// Both arms are converted with the same calibration corpus and token budget, so the fold is
+/// identical and the metric is the only variable. 12,288 calibration tokens because `down_proj`'s
+/// input is 1,536 wide and a Gram from fewer tokens than that is rank-deficient by construction —
+/// which made the fit LOSE by 2.98% when it was first measured at 1,024.
+#[test]
+#[ignore = "two conversions of a real model, one of them fitting against Grams"]
+fn activation_aware_convert_beats_nearest_point() {
+    let model = PathBuf::from(
+        std::env::var("TRITIUM_MODEL_DIR").expect("set TRITIUM_MODEL_DIR to an fp model directory"),
+    );
+    let corpus = PathBuf::from(
+        std::env::var("TRITIUM_CORPUS").expect("set TRITIUM_CORPUS to a corpus json"),
+    );
+    let tokens = eval_tokens(&corpus);
+    let root = std::env::temp_dir().join(format!("tritium-aa-{}", std::process::id()));
+
+    let convert = |out: &Path, aware: bool| {
+        let _ = std::fs::remove_dir_all(out);
+        let mut cmd = Command::new(tritium_bin());
+        cmd.args([
+            "convert",
+            "--model",
+            model.to_str().unwrap(),
+            "--out",
+            out.to_str().unwrap(),
+            "--planes",
+            "3",
+            "--group",
+            "256",
+            "--fold-alpha",
+            "0.75",
+            "--calib",
+            corpus.to_str().unwrap(),
+            "--calib-tokens",
+            "12288",
+        ]);
+        if aware {
+            cmd.arg("--activation-aware");
+        }
+        assert!(
+            cmd.status().expect("run tritium convert").success(),
+            "convert failed (activation_aware={aware})"
+        );
+    };
+
+    let plain = root.join("plain");
+    let aware = root.join("aware");
+    convert(&plain, false);
+    convert(&aware, true);
+
+    let plain_bytes = std::fs::metadata(plain.join("model.tslb")).unwrap().len();
+    let aware_bytes = std::fs::metadata(aware.join("model.tslb")).unwrap().len();
+    let ppl_plain = score_converted(&plain, &tokens);
+    let ppl_aware = score_converted(&aware, &tokens);
+    let _ = std::fs::remove_dir_all(&root);
+
+    println!(
+        "\nSmolLM2-135M | T=3 g256 rotated | fold 0.75 | 12,288 calibration tokens\n  \
+         nearest point      {ppl_plain:.4}   {plain_bytes} bytes\n  \
+         activation metric  {ppl_aware:.4}   {aware_bytes} bytes   ({:+.2}%)",
+        100.0 * (ppl_aware - ppl_plain) / ppl_plain
+    );
+
+    // Entropy coding makes the file size depend on the digits, so the two differ slightly. What must
+    // not differ is the bit cost of the representation, which is planes x width and identical.
+    assert!(
+        (aware_bytes as f64 - plain_bytes as f64).abs() < 0.02 * plain_bytes as f64,
+        "the two fits should cost within 2% of each other on disk: {plain_bytes} vs {aware_bytes}"
+    );
+    assert!(
+        ppl_aware < ppl_plain,
+        "the activation-metric fit ({ppl_aware:.4}) did not beat nearest-point ({ppl_plain:.4}). \
+         The harness measured -0.64% at this setting, so this is a wiring fault — most likely the \
+         wrong Gram reaching a projection, or the fit running on unfolded weights"
+    );
+}

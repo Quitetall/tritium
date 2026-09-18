@@ -102,7 +102,8 @@ use tritium_nn::calibrate::{Calib, calibrate, extract, fold, norm_tensors, weigh
 use tritium_nn::{HfJsonTokenizer, ModelRunner, Tokenizer};
 use tritium_train::ops::ste::{fast_hadamard, group_is_rotatable};
 
-use crate::quantize_ladder::{LadderConfig, quantize_tensor_ladder};
+use crate::quantize_ladder::{LadderConfig, pack_group_fits, quantize_tensor_ladder};
+use tritium_nn::salt_fit::{ActivationAwareConfig, TapGrams, fit_tensor};
 
 /// Calibration window length. Matches the research harness's `EVAL_WINDOW` so a `convert` run and
 /// a harness run see the same context structure; the fold only reads per-channel second moments,
@@ -128,6 +129,9 @@ pub(crate) struct ConvertConfig {
     /// Write the padded TQ2_0 bundle instead of the entropy-coded one. The kernel format is the
     /// same either way — only what sits on disk differs.
     pub(crate) dense_container: bool,
+    /// Fit in the activation metric (GPTQ + trit search + step refits) instead of rounding to the
+    /// nearest ladder point. Needs `--calib`, and costs one Gram per projection input.
+    pub(crate) activation_aware: bool,
 }
 
 pub(crate) fn run(model: &Path, out: &Path, cfg: &ConvertConfig) -> Result<()> {
@@ -136,6 +140,12 @@ pub(crate) fn run(model: &Path, out: &Path, cfg: &ConvertConfig) -> Result<()> {
         bail!(
             "--fold-alpha must be in [0, 1] (0 = identity fold, 1 = full salience); got {}",
             cfg.fold_alpha
+        );
+    }
+    if cfg.activation_aware && cfg.calib.is_none() {
+        bail!(
+            "--activation-aware fits against the activation Gram, which needs calibration text. \
+             Pass --calib <corpus>."
         );
     }
     if cfg.calib.is_none() && cfg.fold_alpha != 0.0 {
@@ -209,16 +219,55 @@ pub(crate) fn run(model: &Path, out: &Path, cfg: &ConvertConfig) -> Result<()> {
         None => (fp, arch, "no calibration fold".to_owned()),
     };
 
-    // Fit every projection with the ladder. `shapes[i]` is `(n_out, k_in)` for `weights[i]`.
+    // Grams for the activation-aware fit, on the FOLDED weights: the fit must see the distribution
+    // the deployed model sees. Collected once and shared by every projection of a layer.
+    let grams = if cfg.activation_aware {
+        let path = cfg.calib.as_ref().expect("validated above");
+        let tokens = load_calibration_tokens(path, model, cfg.calib_tokens, arch.vocab)?;
+        let windows: Vec<&[u32]> = tokens.chunks_exact(CALIB_WINDOW).collect();
+        println!(
+            "  collecting activation Grams over {} x {CALIB_WINDOW} tokens…",
+            windows.len()
+        );
+        Some(TapGrams::collect(&weights, &arch, &windows))
+    } else {
+        None
+    };
+    let fit_cfg = ActivationAwareConfig {
+        planes: cfg.ladder.planes,
+        group: cfg.ladder.group,
+        grid: cfg.ladder.grid,
+        damp: 0.01,
+        search_sweeps: 8,
+        refit_scale: true,
+        rotate: cfg.ladder.rotate,
+    };
+    let mut activation_aware_tensors = 0usize;
+
+    // Fit every projection. `shapes[i]` is `(n_out, k_in)` for `weights[i]`.
     let mut quantized: Vec<(String, Vec<SaltRow>)> = Vec::with_capacity(weights.len());
     let mut total_params = 0usize;
     let mut fidelity: Vec<TensorFidelity> = Vec::with_capacity(weights.len());
-    for ((name, w), &(rows, k)) in names.iter().zip(&weights).zip(&shapes) {
+    for (i, ((name, w), &(rows, k))) in names.iter().zip(&weights).zip(&shapes).enumerate() {
         if w.len() != rows * k {
             bail!("{name}: {} values for shape [{rows}, {k}]", w.len());
         }
-        let fitted = quantize_tensor_ladder(w, rows, k, &cfg.ladder)
-            .with_context(|| format!("ladder-quantize {name}"))?;
+        // The tied embedding has no Gram — it is a gather as well as a projection, so a fit that
+        // suits one corrupts the other — and neither does any tensor when `--calib` is absent.
+        let fitted = match grams.as_ref().filter(|_| i > 0).and_then(|g| {
+            let li = (i - 1) / 7;
+            let slot = (i - 1) % 7;
+            fit_tensor(w, rows, k, g.for_slot(li, slot), &fit_cfg)
+        }) {
+            Some(fits) => {
+                activation_aware_tensors += 1;
+                pack_group_fits(&fits, rows, k, &cfg.ladder)
+                    .with_context(|| format!("pack activation-aware fit for {name}"))?
+            }
+            // A Gram still singular after damping saw no signal; fall back rather than propagate.
+            None => quantize_tensor_ladder(w, rows, k, &cfg.ladder)
+                .with_context(|| format!("ladder-quantize {name}"))?,
+        };
         // Score the PACKED rows, not a re-run of the fitter: the f16 block scales are rounded on
         // the way into TQ2_0, so decoding the artifact is the only way to report the error the
         // user's file actually has rather than the one the fit intended.
@@ -335,6 +384,11 @@ pub(crate) fn run(model: &Path, out: &Path, cfg: &ConvertConfig) -> Result<()> {
     let bpw = bundle.len() as f64 * 8.0 / total_params as f64;
     // The bundle version already encodes this, but the line a user reads should not have to
     // be cross-checked against a byte offset.
+    let fit_desc = if activation_aware_tensors > 0 {
+        format!("activation-metric fit on {activation_aware_tensors} projections")
+    } else {
+        "nearest-point fit".to_owned()
+    };
     let rotation_desc = if cfg.ladder.rotate {
         format!("Hadamard per g{}", cfg.ladder.group)
     } else {
@@ -342,8 +396,8 @@ pub(crate) fn run(model: &Path, out: &Path, cfg: &ConvertConfig) -> Result<()> {
     };
     println!(
         "converted {} tensors ({:.2}M params) | ladder geometric, {} planes, g{}, grid {}, \
-         {rotation_desc}, {fold_desc} → {} ({:.1} MiB bundle + {:.1} KiB norms + config + \
-         {copied_assets} tokenizer files, {bpw:.4} bpw on disk)",
+         {rotation_desc}, {fit_desc}, {fold_desc} → {} ({:.1} MiB bundle + {:.1} KiB norms + \
+         config + {copied_assets} tokenizer files, {bpw:.4} bpw on disk)",
         names.len(),
         total_params as f64 / 1e6,
         cfg.ladder.planes,
