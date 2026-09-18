@@ -118,11 +118,7 @@ impl MatrixRequirements {
     /// divides out exactly.
     fn from_streamed(requirements: PackedSaltStorageRequirements, k_in: usize) -> Self {
         let tq2_len = k_in.div_ceil(QK_K) * TQ2_0_BLOCK_BYTES;
-        let dense_planes = if tq2_len == 0 {
-            0
-        } else {
-            requirements.dense_bytes() / tq2_len
-        };
+        let dense_planes = requirements.dense_bytes().checked_div(tq2_len).unwrap_or(0);
         Self {
             rows: requirements.rows(),
             planes: requirements.planes(),
