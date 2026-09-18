@@ -288,6 +288,7 @@ jobs:
               encoding="utf-8",
           )
           print(json.dumps({"artifacts": len(artifacts), "source_revision": document["source_revision"]}, sort_keys=True))
+          PY
       - name: checksums
         shell: bash
         run: |
