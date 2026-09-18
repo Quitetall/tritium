@@ -260,7 +260,7 @@ jobs:
               suffix = Path(filename).suffix
               kind = {
                   ".whl": "python-wheel",
-                  ".crate": "crate",
+                  ".crate": "rust-crate",
                   ".tgz": "npm-archive",
               }.get(suffix)
               if kind is None:
