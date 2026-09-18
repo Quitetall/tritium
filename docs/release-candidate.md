@@ -22,7 +22,7 @@ until `TRITIUM_SEMVER_MODE=block` is selected.
 This is local gate evidence only. It does not promote any missing model,
 hardware, browser, deployment, independent-review, or public-activation gate.
 
-### Latest CI verification (2026-09-18, run `35382017196`, commit `9b39c8b4`)
+### Latest CI verification (2026-09-18, run `35383127123`, commit `bf4c181d`)
 
 The required CI workflow completed successfully. Supply-chain, compatibility
 matrix, Linux/macOS/Windows CPU validation, Metal, MSRV, Burn, Candle, ONNX,
