@@ -338,7 +338,10 @@ impl CudaBackend {
         // Qwen's hidden/intermediate widths are 256-aligned. For those
         // matrices, stage each activation tile once per output-row block;
         // irregular shapes retain scalar exact dispatch.
-        let use_tiled = tensor.columns.is_multiple_of(256);
+        // Experimental until a broad shape sweep proves a win. The current
+        // 4090 benchmark favors scalar dispatch for short prompts; keep this
+        // opt-in so production latency never regresses by default.
+        let use_tiled = env_flag_on("TRITIUM_SALT_V2_TILED") && tensor.columns.is_multiple_of(256);
         let (grid_x, grid_y, block_x, shared_mem_bytes) = if use_tiled {
             (
                 n_u32.div_ceil(SALT_V2_TILED_THREADS),
