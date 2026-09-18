@@ -9,6 +9,19 @@ second-machine gates remain separate.
 
 ## Gate status (measured 2026-09-03)
 
+### Latest local verification (2026-09-18, `570a8802`)
+
+`scripts/verify-gates.sh release` completed with exit status 0 after the
+`rustls` security update to `0.23.45`. The run observed clean formatting,
+warning-free workspace Clippy, workspace tests, the 558.63-second CPU fidelity
+ladder, exact 32-token CPU greedy parity, 481 Python tests, community-contract
+validation, `cargo deny check`, release-version validation, and RC semver
+reporting. Semver reports intentional RC API changes but remains non-blocking
+until `TRITIUM_SEMVER_MODE=block` is selected.
+
+This is local gate evidence only. It does not promote any missing model,
+hardware, browser, deployment, independent-review, or public-activation gate.
+
 The twelve gates and their 38 evidence kinds are defined in code, not here —
 `scripts/release-evidence-status.py`, constants `GATES` and `KNOWN_KINDS`. That is
 deliberate: a partial or adversarial registry cannot remove a gate.
