@@ -194,6 +194,77 @@ jobs:
           fi
           [ "$found" -eq 3 ] || { echo "::error::expected 3 wheels, found $found"; exit 1; }
           echo "all $found wheels carry ${dist}-${pep440}, every platform present"
+      - name: emit deterministic release inputs
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ steps.v.outputs.version }}
+          SOURCE_REVISION: ${{ github.sha }}
+          BUILDER_ID: https://github.com/${{ github.repository }}/actions/workflows/release.yml
+          INVOCATION_ID: github-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          staged = Path("staged")
+          files = {
+              path.name: path
+              for path in staged.iterdir()
+              if path.is_file() and path.suffix in {".whl", ".crate", ".tgz"}
+          }
+          artifacts = []
+          seen = set()
+          for sbom in sorted(staged.glob("*.cdx.json")):
+              value = json.loads(sbom.read_text(encoding="utf-8"))
+              component = value.get("metadata", {}).get("component", {})
+              artifact_id = component.get("bom-ref")
+              properties = {
+                  item.get("name"): item.get("value")
+                  for item in component.get("properties", [])
+                  if isinstance(item, dict)
+              }
+              filename = properties.get("tritium:artifact:file")
+              if not isinstance(artifact_id, str) or not artifact_id:
+                  raise SystemExit(f"SBOM {sbom.name} lacks artifact id")
+              if not isinstance(filename, str) or filename not in files:
+                  raise SystemExit(f"SBOM {sbom.name} lacks a staged artifact binding")
+              if artifact_id in seen:
+                  raise SystemExit(f"duplicate release artifact id {artifact_id!r}")
+              seen.add(artifact_id)
+              suffix = Path(filename).suffix
+              kind = {
+                  ".whl": "python-wheel",
+                  ".crate": "crate",
+                  ".tgz": "npm-archive",
+              }.get(suffix)
+              if kind is None:
+                  raise SystemExit(f"unsupported release artifact {filename!r}")
+              artifacts.append({
+                  "id": artifact_id,
+                  "kind": kind,
+                  "path": filename,
+                  "sbom": sbom.name,
+              })
+          if not artifacts:
+              raise SystemExit("no SBOM-bound release artifacts found")
+          document = {
+              "schema": "tritium.release-inputs.v1",
+              "release": os.environ["RELEASE_VERSION"],
+              "source_revision": os.environ["SOURCE_REVISION"],
+              "builder": {
+                  "id": os.environ["BUILDER_ID"],
+                  "build_type": "https://tritium.ai/build/package/v1",
+                  "invocation_id": os.environ["INVOCATION_ID"],
+              },
+              "artifacts": sorted(artifacts, key=lambda item: item["id"]),
+          }
+          (staged / "release-inputs.json").write_text(
+              json.dumps(document, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          print(json.dumps({"artifacts": len(artifacts), "source_revision": document["source_revision"]}, sort_keys=True))
       - name: checksums
         shell: bash
         run: |
