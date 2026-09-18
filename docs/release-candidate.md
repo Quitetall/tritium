@@ -22,6 +22,15 @@ until `TRITIUM_SEMVER_MODE=block` is selected.
 This is local gate evidence only. It does not promote any missing model,
 hardware, browser, deployment, independent-review, or public-activation gate.
 
+The same HEAD also passed local package probes (not yet registered in a release
+candidate): `check-publish.sh` and 23-crate qualification, npm archive
+qualification, and one pinned manylinux CPU wheel clean-install plus
+differentiable smoke. Receipts are under the ignored
+`release/v1.1/evidence/{crate-archive,npm-archive,clean-install}-2f5adf67/`
+tree and bind the full revision
+`2f5adf6728ad4654b2811b6a08359ad111004fbb`. They remain local evidence until
+candidate assembly, compatibility-matrix harvesting, and registry binding.
+
 The twelve gates and their 38 evidence kinds are defined in code, not here —
 `scripts/release-evidence-status.py`, constants `GATES` and `KNOWN_KINDS`. That is
 deliberate: a partial or adversarial registry cannot remove a gate.
