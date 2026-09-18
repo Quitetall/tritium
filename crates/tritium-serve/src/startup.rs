@@ -323,6 +323,22 @@ impl std::error::Error for StartupError {}
 pub fn prepare_production_generator(
     admitted: AdmittedGeneratorV1,
 ) -> Result<(Box<dyn Generator>, ProductionReadiness), StartupError> {
+    prepare_production_generator_mode(admitted, true)
+}
+
+/// Prepare provisional research generator without blocking listener startup on
+/// full-model CPU self-test. Structural admission still runs; first request
+/// remains the execution probe.
+pub fn prepare_provisional_generator(
+    admitted: AdmittedGeneratorV1,
+) -> Result<(Box<dyn Generator>, ProductionReadiness), StartupError> {
+    prepare_production_generator_mode(admitted, false)
+}
+
+fn prepare_production_generator_mode(
+    admitted: AdmittedGeneratorV1,
+    run_self_test: bool,
+) -> Result<(Box<dyn Generator>, ProductionReadiness), StartupError> {
     let AdmittedGeneratorV1 {
         mut generator,
         artifact,
@@ -334,26 +350,32 @@ pub fn prepare_production_generator(
             "generator cannot execute one-token startup self-test",
         ));
     }
-    let request = GenRequest {
-        prompt_tokens: vec![0],
-        max_new: 1,
-        sampling: Sampling::Greedy,
-        stop_eos: false,
-        logprobs: None,
-    };
     let mut steps = Vec::with_capacity(1);
-    generator
-        .generate(&request, &mut |step| {
-            steps.push(step);
-            steps.len() < 2
-        })
-        .map_err(|error| StartupError::SelfTest(error.to_string()))?;
-    if steps.len() != 1 || steps[0].token as usize >= vocab {
-        return Err(StartupError::InvalidGenerator(
-            "generator returned invalid startup self-test steps",
-        ));
+    if run_self_test {
+        let request = GenRequest {
+            prompt_tokens: vec![0],
+            max_new: 1,
+            sampling: Sampling::Greedy,
+            stop_eos: false,
+            logprobs: None,
+        };
+        generator
+            .generate(&request, &mut |step| {
+                steps.push(step);
+                steps.len() < 2
+            })
+            .map_err(|error| StartupError::SelfTest(error.to_string()))?;
+        if steps.len() != 1 || steps[0].token as usize >= vocab {
+            return Err(StartupError::InvalidGenerator(
+                "generator returned invalid startup self-test steps",
+            ));
+        }
     }
-    let self_test_digest = self_test_digest(n_ctx, vocab, &steps[0]);
+    let self_test_digest = if run_self_test {
+        self_test_digest(n_ctx, vocab, &steps[0])
+    } else {
+        "provisional-self-test-skipped".to_owned()
+    };
     let receipt = StartupReceiptV1 {
         provisional: artifact.provisional,
         schema_version: 1,

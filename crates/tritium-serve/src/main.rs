@@ -921,13 +921,23 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     &physical_device,
                 )?
             };
-            let (router, draining, _) = tritium_serve::build_router_production(
-                admitted,
-                tok,
-                cfg,
-                request_limits,
-                admission,
-            )?;
+            let (router, draining, _) = if allow_incomplete_bundle {
+                tritium_serve::build_router_provisional(
+                    admitted,
+                    tok,
+                    cfg,
+                    request_limits,
+                    admission,
+                )?
+            } else {
+                tritium_serve::build_router_production(
+                    admitted,
+                    tok,
+                    cfg,
+                    request_limits,
+                    admission,
+                )?
+            };
             (router, draining)
         }
         LoadedModel::Legacy(runner) => {

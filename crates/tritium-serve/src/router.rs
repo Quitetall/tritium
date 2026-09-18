@@ -26,7 +26,10 @@ use crate::generator::{FinishReason, GenRequest, Generator, Sampling};
 use crate::sse::{
     IncrementalDetok, StopMatcher, content_chunk, error_chunk, role_chunk, terminal_chunk,
 };
-use crate::startup::{AdmittedGeneratorV1, ProductionReadiness, prepare_production_generator};
+use crate::startup::{
+    AdmittedGeneratorV1, ProductionReadiness, prepare_production_generator,
+    prepare_provisional_generator,
+};
 use crate::worker::{
     GenEvent, Job, PHASE_DECODE, PHASE_IDLE, PHASE_PREFILL, WorkerSignals, WorkerTelemetry,
     spawn_worker,
@@ -554,8 +557,37 @@ pub fn build_router_production(
     limits: RequestLimits,
     policy: AdmissionPolicy,
 ) -> std::io::Result<(Router, Arc<AtomicBool>, ProductionReadiness)> {
+    build_router_production_mode(admitted, tok, cfg, limits, policy, false)
+}
+
+/// Build a loopback-only provisional router without blocking on full-model
+/// startup self-test. Structural admission still runs; first request probes
+/// execution. Never release-qualified.
+pub fn build_router_provisional(
+    admitted: AdmittedGeneratorV1,
+    tok: Arc<dyn Tokenizer + Send + Sync>,
+    cfg: ServeConfig,
+    limits: RequestLimits,
+    policy: AdmissionPolicy,
+) -> std::io::Result<(Router, Arc<AtomicBool>, ProductionReadiness)> {
+    build_router_production_mode(admitted, tok, cfg, limits, policy, true)
+}
+
+fn build_router_production_mode(
+    admitted: AdmittedGeneratorV1,
+    tok: Arc<dyn Tokenizer + Send + Sync>,
+    cfg: ServeConfig,
+    limits: RequestLimits,
+    policy: AdmissionPolicy,
+    provisional: bool,
+) -> std::io::Result<(Router, Arc<AtomicBool>, ProductionReadiness)> {
     let admission = Arc::new(Admission::new(cfg.auth_token.as_deref(), policy)?);
-    let (generator, production) = prepare_production_generator(admitted)
+    let prepare = if provisional {
+        prepare_provisional_generator
+    } else {
+        prepare_production_generator
+    };
+    let (generator, production) = prepare(admitted)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     let draining = Arc::new(AtomicBool::new(false));
     let worker_alive = Arc::new(AtomicBool::new(true));

@@ -53,7 +53,8 @@ pub use admission::{AdmissionPolicy, MAX_BEARER_TOKENS, PrincipalRateLimit};
 #[cfg(feature = "serve")]
 pub use router::{
     ChatTemplate, RequestLimits, ServeConfig, build_admin_router, build_router,
-    build_router_governed, build_router_production, build_router_with_limits,
+    build_router_governed, build_router_production, build_router_provisional,
+    build_router_with_limits,
 };
 #[cfg(feature = "cuda")]
 pub use router::{
@@ -64,4 +65,5 @@ pub use router::{
 pub use startup::{
     AdmittedArtifactV1, AdmittedGeneratorV1, ProductionReadiness, StartupError, StartupReceiptV1,
     admit_qwen36_salt_v3, admit_qwen36_salt_v3_provisional, prepare_production_generator,
+    prepare_provisional_generator,
 };
