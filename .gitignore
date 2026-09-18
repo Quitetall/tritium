@@ -52,6 +52,7 @@ crates/*/fuzz/target/
 # Session-local tool state and scratch outputs (never source)
 .claude/
 .codex/
+.serena/
 graphify-out/
 scratch_st/
 
@@ -73,5 +74,4 @@ docs/OPTIMIZATION-LOG.md
 docs/receipts-ws-*
 docs/bastion-lamu-integration.md
 docs/drafter-blut-handoff.md
-packages/tritium-web/node_modules
 packages/tritium-web/node_modules
