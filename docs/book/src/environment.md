@@ -46,6 +46,7 @@ the defaults are the lossless/bit-exact configuration.
 | `TRITIUM_PREFILL_CHUNK` | integer (128) | Serve-side chunked-prefill size. |
 | `TRITIUM_KV_F16` | `1` \| `0` | Legacy alias for `TRITIUM_KV=f16`. |
 | `TRITIUM_WGPU_ADAPTER` | name substring | wgpu adapter selection; an unmatched substring FAILS (never silently picks another GPU). |
+| `TRITIUM_SALT_V2_TILED` | `1 \| 0` (default `0`) | Experimental shared-activation SALT V2 CUDA kernel. Opt in only for shape-specific A/B tests; scalar exact dispatch remains default until a broad benchmark proves a win. |
 
 ## Diagnostics (engine; `1`/`0`, default off)
 
