@@ -157,9 +157,9 @@ impl TapGrams {
     #[must_use]
     pub fn for_slot(&self, li: usize, slot: usize) -> &[f64] {
         match slot {
-            0 | 1 | 2 => &self.attn[li],
+            0..=2 => &self.attn[li],
             3 => &self.o[li],
-            4 | 5 => &self.ffn[li],
+            4..=5 => &self.ffn[li],
             _ => &self.down[li],
         }
     }
