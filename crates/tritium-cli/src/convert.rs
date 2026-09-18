@@ -224,7 +224,12 @@ pub(crate) fn run(model: &Path, out: &Path, cfg: &ConvertConfig) -> Result<()> {
     let grams = if cfg.activation_aware {
         let path = cfg.calib.as_ref().expect("validated above");
         let tokens = load_calibration_tokens(path, model, cfg.calib_tokens, arch.vocab)?;
-        let windows: Vec<&[u32]> = tokens.chunks_exact(CALIB_WINDOW).collect();
+        let windows: Vec<&[u32]> = tokens
+            .as_chunks::<CALIB_WINDOW>()
+            .0
+            .iter()
+            .map(|w| &w[..])
+            .collect();
         println!(
             "  collecting activation Grams over {} x {CALIB_WINDOW} tokens…",
             windows.len()
