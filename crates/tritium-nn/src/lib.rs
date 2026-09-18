@@ -26,6 +26,7 @@ mod pv_recovery;
 mod qwen35_config;
 #[cfg(feature = "cuda")]
 mod recovery;
+pub mod salt_fit;
 mod salt_v2_growth;
 mod teacher_cache;
 mod tensor;
@@ -38,7 +39,7 @@ pub use error::ResidentOpError;
 pub use evaluation::{TeacherForcedPerplexity, teacher_forced_perplexity_windows};
 pub use kv_cache::KvCache;
 pub use layers::{
-    BlockDump, BlockScratch, DenseLinear, HostSaltV2Linear, Mlp, Projection,
+    ActivationPrecision, BlockDump, BlockScratch, DenseLinear, HostSaltV2Linear, Mlp, Projection,
     ProjectionActivationMode, Q2Linear, Qwen35DeltaNet, Qwen35DeltaNetCache, Qwen35DeltaNetWeights,
     Qwen35FullAttention, Qwen35FullAttentionCache, Qwen35FullAttentionWeights, Relu2Mlp,
     SaltLinear, SwiGluMlp, TernaryLinear, TokenEmbedding, TransformerBlock,
@@ -73,7 +74,8 @@ pub use model::{
     parse_training_salt_artifact_metadata,
 };
 pub use ops::{
-    QB, gqa_attention, quantize_activation_int8, rmsnorm, rmsnorm_zero_centered, rope_apply,
+    QB, gqa_attention, quantize_activation_int8, quantize_activation_int8_grouped,
+    quantize_activation_ternary, rmsnorm, rmsnorm_zero_centered, rope_apply,
     rope_apply_partial_neox, sample_categorical, sample_greedy, sample_top_k, sample_top_p,
     softmax_rows, truncated_top_k, truncated_top_p,
 };

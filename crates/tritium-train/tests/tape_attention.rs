@@ -3,7 +3,7 @@
 //! the individually-gradchecked ops) must match a finite difference end-to-end.
 
 use tritium_train::Tape;
-use tritium_train::nn::attention;
+use tritium_train::nn::{attention, attention_heads};
 use tritium_train::ops::{dense, rope, shape, softmax};
 
 // Real GQA shape: 4 query heads share 2 KV heads (group size 2).
@@ -171,5 +171,59 @@ fn tape_attention_gradient_matches_finite_difference() {
                 "dL/d{name}[{i}]: analytic {analytic} vs numeric {numeric}"
             );
         }
+    }
+}
+
+/// The refactor control: `attention` must be `attention_heads` plus one matmul and nothing else.
+///
+/// `attention_heads` was split out so an activation-precision sweep can reach `o_proj`'s input —
+/// the one projection input a block used to hide. Every published tape number flows through
+/// `attention`, so equivalence is asserted bit-for-bit rather than assumed: the two paths run the
+/// same ops in the same order, and any drift here means the split changed the model.
+#[test]
+fn attention_is_attention_heads_plus_the_output_projection() {
+    let x = seeded(1, SEQ * N_EMBD);
+    let wq = seeded(2, QD * N_EMBD);
+    let wk = seeded(3, KVD * N_EMBD);
+    let wv = seeded(4, KVD * N_EMBD);
+    let wo = seeded(5, N_EMBD * QD);
+
+    let whole = {
+        let mut t = Tape::new();
+        let (xi, q, k, v, o) = (
+            t.leaf(x.clone()),
+            t.leaf(wq.clone()),
+            t.leaf(wk.clone()),
+            t.leaf(wv.clone()),
+            t.leaf(wo.clone()),
+        );
+        let out = attention(
+            &mut t, xi, q, k, v, o, SEQ, N_EMBD, N_HEAD, N_KV_HEAD, HEAD_DIM, THETA,
+        );
+        t.value(out).to_vec()
+    };
+
+    let split = {
+        let mut t = Tape::new();
+        let (xi, q, k, v, o) = (t.leaf(x), t.leaf(wq), t.leaf(wk), t.leaf(wv), t.leaf(wo));
+        let heads = attention_heads(
+            &mut t, xi, q, k, v, SEQ, N_EMBD, N_HEAD, N_KV_HEAD, HEAD_DIM, THETA,
+        );
+        assert_eq!(
+            t.value(heads).len(),
+            SEQ * QD,
+            "the head outputs are o_proj's input, so they must be [seq, n_head * head_dim]"
+        );
+        let out = t.dense_matmul(heads, o, SEQ, N_EMBD, QD);
+        t.value(out).to_vec()
+    };
+
+    assert_eq!(whole.len(), split.len());
+    for (i, (a, b)) in whole.iter().zip(&split).enumerate() {
+        assert_eq!(
+            a.to_bits(),
+            b.to_bits(),
+            "index {i}: whole {a} vs split {b} — the split must be exact, not merely close"
+        );
     }
 }
