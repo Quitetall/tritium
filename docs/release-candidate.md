@@ -36,6 +36,19 @@ This CI result validates source and packaging workflows only. It does not
 promote the Qwen flagship, hardware, deployment, model-zoo, reproduction,
 signing or public-activation gates.
 
+### Current-head local package probes (2026-09-18, `6211a513`)
+
+The current clean checkout passes `check-publish.sh` and local crate archive
+qualification for all 23 publishable crates. The npm archive probe passes its
+strict TypeScript, offline-install and 143-test suite. A pinned
+`manylinux_2_28_x86_64` abi3 wheel passes structure/install smoke and the
+six-operation functional smoke (`native_ternary_matmul`, QAT backward,
+optimizer step/checkpoint resume, HF safetensors reload and tied-weight
+identity). Receipts are persisted under the ignored
+`release/v1.1/evidence/{crate-archive,npm-archive,clean-install}-6211a513/`
+tree. They bind this exact source revision but are not yet assembled into a
+candidate manifest or registered in the release evidence registry.
+
 The preceding source revision (`2f5adf6728ad4654b2811b6a08359ad111004fbb`)
 also passed local package probes (not yet registered in a release candidate):
 `check-publish.sh` and 23-crate qualification, npm archive qualification, and
