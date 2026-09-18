@@ -225,7 +225,8 @@ jobs:
           INVOCATION_ID: github-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           set -euo pipefail
-          export SOURCE_REVISION="$(git rev-parse HEAD)"
+          SOURCE_REVISION="$(git rev-parse HEAD)"
+          export SOURCE_REVISION
           python3 - <<'PY'
           import json
           import os
