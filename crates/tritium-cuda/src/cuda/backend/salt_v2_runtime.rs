@@ -316,12 +316,24 @@ impl CudaBackend {
             BackendError::InvalidInput("SALT V2 output bytes exceed host usize".into())
         })?;
 
-        let d_activation = self.stream.clone_htod(activation).map_err(|error| {
-            alloc_or_backend("upload SALT V2 activation", &error, activation_bytes)
-        })?;
-        let mut d_output = self
-            .stream
-            .alloc_zeros::<f32>(output_elements)
+        // Qwen prompt/decode executes hundreds of projections per request. Keep
+        // transient activation/output allocations in a small backend-owned pool;
+        // this removes repeated device allocation/free synchronization while
+        // preserving exact launch and readback semantics.
+        let mut workspace = self
+            .salt_v2_workspace
+            .lock()
+            .map_err(|_| BackendError::Backend("SALT V2 workspace mutex poisoned".to_owned()))?;
+        let mut d_activation = workspace
+            .take(&self.stream, activation.len())
+            .map_err(|error| {
+                alloc_or_backend("allocate SALT V2 activation", &error, activation_bytes)
+            })?;
+        self.stream
+            .memcpy_htod(activation, &mut d_activation)
+            .map_err(|error| driver_err("upload SALT V2 activation", &error))?;
+        let mut d_output = workspace
+            .take(&self.stream, output_elements)
             .map_err(|error| alloc_or_backend("allocate SALT V2 output", &error, output_bytes))?;
         let cfg = LaunchConfig {
             grid_dim: (total_outputs.div_ceil(THREADS_PER_BLOCK), 1, 1),
@@ -363,9 +375,14 @@ impl CudaBackend {
             ))
         })?;
         staged.resize(output_elements, 0.0f32);
-        self.stream
-            .memcpy_dtoh(&d_output, &mut staged)
-            .map_err(|error| driver_err("download SALT V2 output", &error))?;
+        {
+            let d_output_view = d_output.slice(..output_elements);
+            self.stream
+                .memcpy_dtoh(&d_output_view, &mut staged)
+                .map_err(|error| driver_err("download SALT V2 output", &error))?;
+        }
+        workspace.put(d_activation);
+        workspace.put(d_output);
         if let Some((index, value)) = staged
             .iter()
             .copied()

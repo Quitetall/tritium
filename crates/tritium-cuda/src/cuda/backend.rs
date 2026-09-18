@@ -755,6 +755,47 @@ pub struct CudaBackend {
     /// memory so a repeated shape does not re-hit the on-disk cache / re-tune. Seeded
     /// from the on-disk cache via [`tune_or_load`] on first use of a bucket.
     pub(super) tuned_tiles: Mutex<HashMap<CacheKey, TileConfig>>,
+    /// Reusable f32 staging allocations for the SALT V2 host-orchestrated
+    /// projection path. Qwen prompt/decode invokes hundreds of projections;
+    /// retaining these buffers removes a cuMemAlloc/cuMemFree pair per call.
+    pub(super) salt_v2_workspace: Mutex<SaltV2Workspace>,
+}
+
+/// Process-local pool for transient SALT V2 activation/output buffers.
+///
+/// Buffers are returned only after the stream readback has completed. The pool
+/// is bounded so a workload with many one-off shapes cannot retain unbounded
+/// device memory. It is protected by the backend mutex because serving may
+/// share one backend across request workers.
+#[derive(Debug, Default)]
+pub(super) struct SaltV2Workspace {
+    buffers: Vec<CudaSlice<f32>>,
+}
+
+impl SaltV2Workspace {
+    const MAX_BUFFERS: usize = 8;
+
+    fn take(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        len: usize,
+    ) -> Result<CudaSlice<f32>, DriverError> {
+        if let Some(index) = self.buffers.iter().position(|buffer| buffer.len() >= len) {
+            return Ok(self.buffers.swap_remove(index));
+        }
+        // SAFETY: `len` is checked by the caller against the kernel ABI and the
+        // returned allocation is owned by this backend's CUDA stream.
+        #[allow(unsafe_code)]
+        unsafe {
+            stream.alloc(len)
+        }
+    }
+
+    fn put(&mut self, buffer: CudaSlice<f32>) {
+        if self.buffers.len() < Self::MAX_BUFFERS {
+            self.buffers.push(buffer);
+        }
+    }
 }
 
 impl CudaBackend {
@@ -1240,6 +1281,7 @@ impl CudaBackend {
             cuda_version,
             imma_jit: Mutex::new(HashMap::new()),
             tuned_tiles: Mutex::new(HashMap::new()),
+            salt_v2_workspace: Mutex::new(SaltV2Workspace::default()),
         })
     }
 
