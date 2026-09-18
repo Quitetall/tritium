@@ -131,6 +131,10 @@ jobs:
         with:
           name: release-package-evidence
           path: staged/package-evidence
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v6.0.0
+        with:
+          name: abi3-compatibility-receipt
+          path: staged/compatibility-evidence
       - name: flatten package evidence into release payload
         shell: bash
         run: |
@@ -140,7 +144,9 @@ jobs:
           cp staged/package-evidence/crates/crate-archive-qualification.json staged/
           cp staged/package-evidence/npm/*.tgz staged/
           cp staged/package-evidence/npm/*.json staged/
+          cp staged/compatibility-evidence/python-abi3-39-plus.json staged/
           rm -rf staged/package-evidence
+          rm -rf staged/compatibility-evidence
       - name: assert the tag and the artifacts agree
         id: v
         shell: bash
