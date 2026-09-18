@@ -1240,6 +1240,34 @@ fn trit_search_never_raises_the_damped_objective() {
 ///
 /// Arms: round-to-nearest (re-measured) and asymmetric sequential GPTQ. GPTQ on fp Grams (−0.49%)
 /// and plain sequential (−0.43%) were measured with this same configuration and are quoted.
+///
+/// # Measured 2026-09-17/18 — REFUTED at reachable calibration sizes
+///
+/// The full arm at 12,288 tokens scored **639.72 (28× fp, +2535%)**. Diagnosis, all with the
+/// transform applied and quantization SKIPPED so the fitter cannot be blamed:
+///
+/// ```text
+/// x̂ = x control, first form  drift 0.2143   ppl    33.59   <- identity transform, wrecked the model
+/// x̂ = x control, this form   drift 0.000000 ppl    23.30   <- exact, as the algebra requires
+///
+/// real x̂, 2048 tokens, damp:
+///   0.01                     drift 2.0622   ppl 59295.94
+///   0.1                      drift 0.6895   ppl   499.73
+///   1.0                      drift 0.1224   ppl    53.90
+///   10.0                     drift 0.0208   ppl    27.62   (+13.8% vs round-to-nearest)
+/// ```
+///
+/// The correction is monotone in damping and **harmful at every setting**: it only stops hurting in
+/// the limit where it vanishes. `C − Ĥ = Σ(x − x̂)·x̂ᵀ` is genuinely small, but `Ĥ⁻¹` scales it by
+/// `1/λ_min`, and 2,048 tokens against a 1,536-wide input leaves `Ĥ` near-singular, so what the
+/// correction mostly carries is sampling noise. The 12,288-token run failing far less badly (639 vs
+/// 59,296) is the same story with more samples.
+///
+/// This is the limit the trit search found from the other side: GPTQ reaches 0.236× of round-to-
+/// nearest's objective on the Gram it fitted and only 0.459× on held-out tokens. Calibration sample
+/// size binds everything in this family, and an asymmetric correction is the most sample-hungry
+/// member of it. Making it work needs orders more data than a CPU run at this scale affords, or a
+/// solve restricted to the well-excited subspace rather than a full `Ĥ⁻¹`.
 #[test]
 #[ignore = "needs SmolLM2-135M; two full forwards per layer per calibration window"]
 fn asymmetric_calibration_absorbs_inherited_error() {
@@ -1250,7 +1278,15 @@ fn asymmetric_calibration_absorbs_inherited_error() {
     }
     let t_ref = env_usize("TRITIUM_GPTQ_T", 3);
     let windows = env_usize("TRITIUM_GPTQ_SEQ_WINDOWS", 48);
-    let damp = 0.01f64;
+    let damp = std::env::var("TRITIUM_ASYM_DAMP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.01f64);
+    // `0` applies the transform but skips quantization, isolating it from the fitter.
+    let quantize = env_usize("TRITIUM_ASYM_QUANT", 1) == 1;
+    // `1` captures x̂ from the fp model too, so x̂ = x exactly, C = Ĥ, and W′ must equal W up to
+    // damping. Large drift under this control is conditioning; small drift means a wiring bug.
+    let control = env_usize("TRITIUM_ASYM_CONTROL", 0) == 1;
     let runner =
         ModelRunner::from_hf(&dir, Box::new(tritium_cpu::CpuBackend::new())).expect("from_hf");
     let (arch0, fp0, shapes) = extract(&runner);
@@ -1315,8 +1351,10 @@ fn asymmetric_calibration_absorbs_inherited_error() {
 
     let mut seq = fp.clone();
     seq[0] = plain[0].clone();
+    // How far the transform alone moves each weight matrix, before any quantization.
+    let (mut drift_se, mut drift_sw) = (0.0f64, 0.0f64);
     println!(
-        "asymmetric sequential GPTQ over {} tokens per layer…",
+        "asymmetric sequential over {} tokens per layer | damp {damp} | quantize {quantize}…",
         windows * GRAM_SEQ
     );
     for li in 0..n_layers {
@@ -1326,7 +1364,7 @@ fn asymmetric_calibration_absorbs_inherited_error() {
         for wnd in 0..windows {
             let toks = &train[wnd * GRAM_SEQ..(wnd + 1) * GRAM_SEQ];
             let x = capture(&fp, toks, li);
-            let xh = capture(&seq, toks, li);
+            let xh = capture(if control { &fp } else { &seq }, toks, li);
             let n = toks.len();
             for s in 0..4 {
                 let k = widths[s];
@@ -1356,12 +1394,23 @@ fn asymmetric_calibration_absorbs_inherited_error() {
             }
         }
 
-        // Transform matrix per tap: C·Ĥ_d⁻¹.
+        // Correction matrix per tap: (C − Ĥ)·Ĥ_d⁻¹, so the target is `W + W·M`.
+        //
+        // Algebraically `W·C·Ĥ⁻¹ = W + W·(C − Ĥ)·Ĥ⁻¹`, but the two are not the same computation. The
+        // first form damps W ITSELF: `W·Ĥ·(Ĥ+λI)⁻¹` shrinks every weight component lying along a
+        // direction the calibration data barely excites, and W has real energy there. Measured with
+        // x̂ = x, where the transform should be the identity, that cost 38% perplexity at a drift of
+        // 0.21. The residual form damps only the CORRECTION, so `x̂ = x ⇒ C = Ĥ ⇒ ΔW = 0` exactly, at
+        // any damping.
         let transforms: Vec<Option<Vec<f64>>> = (0..4)
             .map(|s| {
                 let k = widths[s];
                 let hinv = damped_inverse(&hhat[s], k, damp)?;
-                Some(mat_mul(&cross[s], &hinv, k))
+                let mut diff = cross[s].clone();
+                for (d, h) in diff.iter_mut().zip(&hhat[s]) {
+                    *d -= h;
+                }
+                Some(mat_mul(&diff, &hinv, k))
             })
             .collect();
 
@@ -1381,9 +1430,20 @@ fn asymmetric_calibration_absorbs_inherited_error() {
                 seq[i] = plain[i].clone();
                 continue;
             };
-            let target = apply_right(&fp[i], cols, m);
-            seq[i] = gptq_tensor(&target, rows, cols, t_ref, &hhat[s], damp)
-                .unwrap_or_else(|| plain[i].clone());
+            let mut target = apply_right(&fp[i], cols, m);
+            for (o, &w) in target.iter_mut().zip(&fp[i]) {
+                *o += w;
+            }
+            for (&a, &b) in fp[i].iter().zip(&target) {
+                drift_se += f64::from(a - b) * f64::from(a - b);
+                drift_sw += f64::from(a) * f64::from(a);
+            }
+            seq[i] = if quantize {
+                gptq_tensor(&target, rows, cols, t_ref, &hhat[s], damp)
+                    .unwrap_or_else(|| plain[i].clone())
+            } else {
+                target
+            };
         }
         if li % 5 == 0 {
             println!("  layer {li}/{n_layers}");
@@ -1420,10 +1480,26 @@ fn asymmetric_calibration_absorbs_inherited_error() {
     );
     println!(
         "{:<44} {ppl_asym:>11.4} {:>9.4}× {:>+9.2}%",
-        "GPTQ, asymmetric sequential",
+        if quantize {
+            "GPTQ, asymmetric sequential"
+        } else {
+            "asymmetric transform ONLY (no quantization)"
+        },
         ppl_asym / ppl_fp,
         100.0 * (ppl_asym - ppl_plain) / ppl_plain
     );
+    let drift = (drift_se / drift_sw).sqrt();
+    println!(
+        "\ntransform drift ‖W′−W‖/‖W‖ = {drift:.6}  (transform alone, before any quantization)"
+    );
+    if control {
+        // With x̂ = x the correction is W·(Ĥ−Ĥ)·Ĥ_d⁻¹ = 0 for any damping. Anything else is a bug in
+        // how the correction is formed, not conditioning.
+        assert!(
+            drift < 1e-5,
+            "the x̂ = x control moved the weights by {drift:.3e}; the correction must vanish exactly"
+        );
+    }
     assert!(
         ppl_asym.is_finite(),
         "the asymmetric arm did not produce a usable model"
