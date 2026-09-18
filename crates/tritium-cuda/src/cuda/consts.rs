@@ -410,6 +410,8 @@ pub(super) const KERNEL_NAME_ATTENTION_FWD: &str = "attention_forward_portable";
 pub(super) const KERNEL_NAME_ATTENTION_BWD: &str = "attention_backward_portable";
 /// Plan 0043 Stage 6: direct scalar-correct SALT V2 D2/B3/S34 execution.
 pub(super) const KERNEL_NAME_SALT_V2_EXACT: &str = "salt_v2_forward_exact";
+/// Prefill-oriented shared-activation SALT V2 kernel.
+pub(super) const KERNEL_NAME_SALT_V2_TILED: &str = "salt_v2_forward_tiled";
 /// Plan 0043 Stage 6: exact selected-row reconstruction for token embeddings.
 pub(super) const KERNEL_NAME_SALT_V2_GATHER: &str = "salt_v2_gather_rows";
 /// Destructive release-qualification kernel. Never used by model dispatch.
@@ -422,6 +424,8 @@ pub(super) const LMHEAD_ROW_TILE: u32 = 8;
 pub(super) const ACT_QUANT_THREADS: u32 = 256;
 /// CUDA threads per block for the 1-D launch grid (simple kernel).
 pub(super) const THREADS_PER_BLOCK: u32 = 256;
+/// Threads per block for the shared-activation SALT V2 prefill kernel.
+pub(super) const SALT_V2_TILED_THREADS: u32 = 128;
 /// Warps per block for the tiled kernel — each warp computes one output column,
 /// so a block covers this many `N` at once (8 warps = 256 threads). ncu note
 /// (2026-07-07): the small decode GEMMs run at 0.42–0.62 waves / 44–48% DRAM —

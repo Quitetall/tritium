@@ -215,6 +215,121 @@ extern "C" __global__ void salt_v2_forward_exact(
   output[output_index] = accumulator;
 }
 
+// Prefill-oriented variant. One block owns a tile of output rows and stages
+// each 256-coefficient activation tile once in shared memory. Reduction order,
+// codec decode, and scale application intentionally match the scalar kernel;
+// this changes memory traffic and launch geometry only.
+extern "C" __global__ void salt_v2_forward_tiled(
+    const float* activation,
+    const unsigned char* payload,
+    const __half* scales,
+    const unsigned char* index_metadata,
+    float* output,
+    uint32_t m,
+    uint32_t n,
+    uint32_t k,
+    uint32_t codec,
+    uint32_t scale_group_size,
+    uint32_t tile_count,
+    uint32_t plane_count,
+    uint64_t payload_bytes,
+    uint64_t scale_count,
+    uint32_t allocation_map_bytes,
+    uint32_t rank_prefix_count,
+    uint32_t terminal_map_value) {
+  const uint32_t row = static_cast<uint32_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const uint32_t mi = static_cast<uint32_t>(blockIdx.y);
+  const bool active = mi < m && row < n;
+
+  __shared__ float activation_tile[kAllocationTile];
+  const uint64_t row_base = static_cast<uint64_t>(row) * k;
+  const uint32_t tiles_per_row = (k + kAllocationTile - 1U) / kAllocationTile;
+  const uint32_t full_payload_bytes = plane_payload_bytes(codec, kAllocationTile);
+  const uint32_t full_scale_count =
+      (kAllocationTile + scale_group_size - 1U) / scale_group_size;
+  float accumulator = 0.0f;
+
+  for (uint32_t row_tile = 0; row_tile < tiles_per_row; ++row_tile) {
+    const uint32_t local_tile_start = row_tile * kAllocationTile;
+    const uint32_t logical_len =
+        min(kAllocationTile, k - local_tile_start);
+    for (uint32_t local = threadIdx.x; local < logical_len;
+         local += blockDim.x) {
+      activation_tile[local] =
+          activation[static_cast<uint64_t>(mi) * k + local_tile_start + local];
+    }
+    __syncthreads();
+
+    const uint64_t coefficient = row_base + local_tile_start;
+    const uint32_t tile = static_cast<uint32_t>(coefficient / kAllocationTile);
+    if (active && tile < tile_count) {
+      const uint32_t rank_block = tile / kRankStrideTiles;
+      uint32_t begin = 0U;
+      if (rank_block != 0U) {
+        const uint32_t prefix_index = rank_block - 1U;
+        if (prefix_index < rank_prefix_count) {
+          begin = read_rank_prefix(index_metadata, allocation_map_bytes, prefix_index);
+        }
+      }
+      const uint32_t scan_start = rank_block * kRankStrideTiles;
+      for (uint32_t prior = scan_start; prior < tile; ++prior) {
+        begin += plane_count_for_tile(
+            index_metadata, allocation_map_bytes, terminal_map_value, prior);
+      }
+      const uint32_t planes = plane_count_for_tile(
+          index_metadata, allocation_map_bytes, terminal_map_value, tile);
+      const uint32_t end = begin + planes;
+      const uint64_t total_coefficients = static_cast<uint64_t>(n) * k;
+      const uint64_t tile_base = static_cast<uint64_t>(tile) * kAllocationTile;
+      if (planes != 0U && end <= plane_count && tile_base < total_coefficients) {
+        const uint32_t physical_len = static_cast<uint32_t>(min(
+            static_cast<uint64_t>(kAllocationTile), total_coefficients - tile_base));
+        const uint32_t current_payload_bytes = plane_payload_bytes(codec, physical_len);
+        const uint32_t current_scale_count =
+            (physical_len + scale_group_size - 1U) / scale_group_size;
+        uint32_t local_start = 0U;
+        while (local_start < logical_len) {
+          const uint32_t group = local_start / scale_group_size;
+          const uint32_t group_end =
+              min((group + 1U) * scale_group_size, logical_len);
+          const uint32_t segment_len = group_end - local_start;
+          for (uint32_t plane = begin; plane < end; ++plane) {
+            const uint32_t local_plane = plane - begin;
+            const uint64_t payload_base =
+                static_cast<uint64_t>(begin) * full_payload_bytes +
+                static_cast<uint64_t>(local_plane) * current_payload_bytes;
+            const uint64_t scale_base =
+                static_cast<uint64_t>(begin) * full_scale_count +
+                static_cast<uint64_t>(local_plane) * current_scale_count;
+            const uint64_t scale_index = scale_base + group;
+            if (scale_index >= scale_count) continue;
+            float group_accumulator = 0.0f;
+            for (uint32_t offset = 0; offset < segment_len; ++offset) {
+              const uint32_t local = local_start + offset;
+              const int trit = decode_trit(
+                  payload, payload_bytes, payload_base, physical_len,
+                  current_payload_bytes, local, codec);
+              if (trit < 0) {
+                group_accumulator = __fsub_rn(group_accumulator, activation_tile[local]);
+              } else if (trit > 0) {
+                group_accumulator = __fadd_rn(group_accumulator, activation_tile[local]);
+              }
+            }
+            const float contribution = __fmul_rn(
+                group_accumulator, __half2float(scales[scale_index]));
+            accumulator = __fadd_rn(accumulator, contribution);
+          }
+          local_start = group_end;
+        }
+      }
+    }
+    __syncthreads();
+  }
+  if (active) {
+    output[static_cast<uint64_t>(mi) * n + row] = accumulator;
+  }
+}
+
 // Reconstruct selected semantic matrix rows directly from the resident codec
 // payload. `rows` may repeat and its order is preserved, which makes this the
 // token-embedding primitive for a `[vocab, hidden]` SALT V2 tensor.

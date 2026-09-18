@@ -335,12 +335,36 @@ impl CudaBackend {
         let mut d_output = workspace
             .take(&self.stream, output_elements)
             .map_err(|error| alloc_or_backend("allocate SALT V2 output", &error, output_bytes))?;
-        let cfg = LaunchConfig {
-            grid_dim: (total_outputs.div_ceil(THREADS_PER_BLOCK), 1, 1),
-            block_dim: (THREADS_PER_BLOCK, 1, 1),
-            shared_mem_bytes: 0,
+        // Qwen's hidden/intermediate widths are 256-aligned. For those
+        // matrices, stage each activation tile once per output-row block;
+        // irregular shapes retain scalar exact dispatch.
+        let use_tiled = tensor.columns.is_multiple_of(256);
+        let (grid_x, grid_y, block_x, shared_mem_bytes) = if use_tiled {
+            (
+                n_u32.div_ceil(SALT_V2_TILED_THREADS),
+                m_u32,
+                SALT_V2_TILED_THREADS,
+                256 * core::mem::size_of::<f32>() as u32,
+            )
+        } else {
+            (
+                total_outputs.div_ceil(THREADS_PER_BLOCK),
+                1,
+                THREADS_PER_BLOCK,
+                0,
+            )
         };
-        let mut launch = self.stream.launch_builder(&self.func_salt_v2_exact);
+        let cfg = LaunchConfig {
+            grid_dim: (grid_x, grid_y, 1),
+            block_dim: (block_x, 1, 1),
+            shared_mem_bytes,
+        };
+        let kernel = if use_tiled {
+            &self.func_salt_v2_tiled
+        } else {
+            &self.func_salt_v2_exact
+        };
+        let mut launch = self.stream.launch_builder(kernel);
         launch
             .arg(&d_activation)
             .arg(&tensor.payload)

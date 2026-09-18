@@ -549,6 +549,8 @@ pub struct CudaBackend {
     pub(super) _salt_v2_module: Arc<CudaModule>,
     /// Scalar-correct D2/B3/S34 forward. The first fast API aliases this handle.
     pub(super) func_salt_v2_exact: CudaFunction,
+    /// Shared-activation D2/B3/S34 forward used for prefill-shaped launches.
+    pub(super) func_salt_v2_tiled: CudaFunction,
     /// Exact selected-row reconstruction for SALT V2 token embeddings.
     pub(super) func_salt_v2_gather: CudaFunction,
     /// Device trap used only by destructive release qualification.
@@ -1138,6 +1140,9 @@ impl CudaBackend {
         let func_salt_v2_exact = salt_v2_module
             .load_function(KERNEL_NAME_SALT_V2_EXACT)
             .map_err(|e| driver_err("resolve salt_v2_forward_exact kernel", &e))?;
+        let func_salt_v2_tiled = salt_v2_module
+            .load_function(KERNEL_NAME_SALT_V2_TILED)
+            .map_err(|e| driver_err("resolve salt_v2_forward_tiled kernel", &e))?;
         let func_salt_v2_gather = salt_v2_module
             .load_function(KERNEL_NAME_SALT_V2_GATHER)
             .map_err(|e| driver_err("resolve salt_v2_gather_rows kernel", &e))?;
@@ -1173,6 +1178,7 @@ impl CudaBackend {
             func_salt,
             _salt_v2_module: salt_v2_module,
             func_salt_v2_exact,
+            func_salt_v2_tiled,
             func_salt_v2_gather,
             #[cfg(feature = "device-loss-qualification")]
             func_qualification_poison,
