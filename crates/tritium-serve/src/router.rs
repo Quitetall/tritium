@@ -1888,6 +1888,15 @@ async fn metrics(State(st): State<AppState>) -> Response {
          # HELP tritium_tokens_in_total Prompt tokens accepted into the generation queue.\n\
          # TYPE tritium_tokens_in_total counter\n\
          tritium_tokens_in_total {}\n\
+         # HELP tritium_decode_tokens_total Decode-token intervals observed by the worker.\n\
+         # TYPE tritium_decode_tokens_total counter\n\
+         tritium_decode_tokens_total {}\n\
+         # HELP tritium_decode_token_duration_seconds_sum Sum of wall-clock intervals between decode tokens.\n\
+         # TYPE tritium_decode_token_duration_seconds_sum counter\n\
+         tritium_decode_token_duration_seconds_sum {}\n\
+         # HELP tritium_decode_token_duration_seconds_count Decode-token intervals observed.\n\
+         # TYPE tritium_decode_token_duration_seconds_count counter\n\
+         tritium_decode_token_duration_seconds_count {}\n\
          # HELP tritium_stream_timeouts_total Streaming generations cancelled at their lifetime deadline.\n\
          # TYPE tritium_stream_timeouts_total counter\n\
          tritium_stream_timeouts_total {}\n\
@@ -2010,6 +2019,9 @@ async fn metrics(State(st): State<AppState>) -> Response {
         st.metrics.rate_rejections.load(Ordering::Relaxed),
         st.metrics.tokens_out.load(Ordering::Relaxed),
         st.metrics.tokens_in.load(Ordering::Relaxed),
+        worker.decode_token_count.load(Ordering::Relaxed),
+        worker.decode_token_sum_us.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+        worker.decode_token_count.load(Ordering::Relaxed),
         st.metrics.stream_timeouts.load(Ordering::Relaxed),
         st.metrics.stream_disconnects.load(Ordering::Relaxed),
         st.metrics.requests_inflight.load(Ordering::Relaxed),

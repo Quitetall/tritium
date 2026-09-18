@@ -51,6 +51,10 @@ pub(crate) struct WorkerTelemetry {
     pub(crate) decode_buckets: [AtomicU64; PHASE_DURATION_BUCKET_US.len()],
     pub(crate) decode_sum_us: AtomicU64,
     pub(crate) decode_count: AtomicU64,
+    /// Sum of wall-clock intervals between emitted decode tokens.
+    pub(crate) decode_token_sum_us: AtomicU64,
+    /// Number of emitted decode-token intervals observed.
+    pub(crate) decode_token_count: AtomicU64,
     /// Paged-KV pool capacity in logical tokens; zero for dense batches.
     pub(crate) kv_pool_capacity_tokens: AtomicU64,
     /// Paged-KV tokens currently free; zero for dense batches.
@@ -131,6 +135,13 @@ impl WorkerTelemetry {
             &self.decode_sum_us,
             &self.decode_count,
         );
+    }
+
+    pub(crate) fn observe_decode_token(&self, elapsed: Duration) {
+        let micros = elapsed.as_micros().min(u128::from(u64::MAX)) as u64;
+        self.decode_token_sum_us
+            .fetch_add(micros, Ordering::Relaxed);
+        self.decode_token_count.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -282,6 +293,7 @@ pub(crate) fn spawn_worker(
                         let _phase = PhaseGuard(phase.clone());
                         let generation_started = Instant::now();
                         let mut first_decode_at = None;
+                        let mut previous_token_at: Option<Instant> = None;
                         // Run the (panic-prone) generation under catch_unwind so one
                         // bad job can't kill the worker. `final_reason` lives inside
                         // the closure so its &mut borrow can't cross the unwind
@@ -292,7 +304,10 @@ pub(crate) fn spawn_worker(
                                 if first_decode_at.is_none() {
                                     telemetry.observe_prefill(generation_started.elapsed());
                                     first_decode_at = Some(Instant::now());
+                                } else if let Some(previous) = previous_token_at {
+                                    telemetry.observe_decode_token(previous.elapsed());
                                 }
+                                previous_token_at = Some(Instant::now());
                                 phase.store(PHASE_DECODE, Ordering::Release);
                                 if let Some(fr) = step.finish_reason {
                                     final_reason = fr;
