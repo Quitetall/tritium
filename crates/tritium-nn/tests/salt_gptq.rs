@@ -28,7 +28,44 @@ use tritium_quantize::{ColumnGroup, FeedbackMetric, FeedbackProblem, fit_with_fe
 use tritium_train::ops::ste::{self, RotationPolicy};
 
 const EVAL_WINDOW: usize = 512;
-const CALIB_WINDOWS: usize = 4;
+/// Calibration windows, overridable with `TRITIUM_GPTQ_CALIB_WINDOWS`.
+///
+/// The Gram is a `k × k` covariance — 576² for the attention and FFN taps, 1,536² for `down`. Four
+/// windows is 2,048 tokens against a 1,536-wide input, fewer samples than the covariance has
+/// dimensions, so `damped_inverse` returns mostly damping rather than data. Measured on
+/// SmolLM2-135M over WikiText-2, GPTQ's effect on held-out perplexity versus the plain fitter:
+///
+/// ```text
+/// cal tokens      T=2       T=3
+///      2,048   -18.3%    +5.6%
+///      4,096   -19.3%    +4.0%
+///      8,192   -22.7%    +0.4%
+///     16,384   -29.3%    -0.6%
+///     32,768   -31.1%    -2.3%
+/// ```
+///
+/// At T=3 the sign flips between 8,192 and 16,384 tokens: below that, sequential compensation
+/// against an under-sampled Hessian is worse than not compensating at all. The old default of four
+/// windows sat on the wrong side of that crossing, which is why GPTQ read as marginal here. Neither
+/// column has plateaued at 32,768, so this default is a floor, not an optimum.
+///
+/// T=1 is omitted deliberately: it runs at 10⁴–10⁵× fp in every arm and its deltas bounce
+/// (-91.8/-97.1/-79.2/-90.0/-94.5) with no trend. Differences between destroyed models are noise.
+const DEFAULT_CALIB_WINDOWS: usize = 32;
+
+fn calib_windows(train_len: usize) -> usize {
+    let requested = std::env::var("TRITIUM_GPTQ_CALIB_WINDOWS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_CALIB_WINDOWS)
+        .max(1);
+    let available = train_len / CALIB_SEQ;
+    assert!(
+        available > 0,
+        "corpus is shorter than one calibration window"
+    );
+    requested.min(available)
+}
 const CALIB_SEQ: usize = 512;
 const GROUP: usize = 128;
 const ITERS: usize = 5;
@@ -118,6 +155,7 @@ fn gptq_feedback_against_real_curvature() {
         ModelRunner::from_hf(&dir, Box::new(tritium_cpu::CpuBackend::new())).expect("from_hf");
     let (arch, fp, shapes) = extract(&runner);
     let (train, eval) = corpus();
+    let calib_windows = calib_windows(train.len());
     let ppl_fp = perplexity_windowed(&fp, &arch, &eval, EVAL_WINDOW);
 
     // TRITIUM_GPTQ_SMOOTH=<alpha> composes the salience fold with GPTQ. The two address DISJOINT
@@ -134,7 +172,7 @@ fn gptq_feedback_against_real_curvature() {
         None => (arch, fp),
         Some(alpha) => {
             let mut calib = Calib::new(&arch);
-            for w in 0..CALIB_WINDOWS {
+            for w in 0..calib_windows {
                 calibrate(
                     &fp,
                     &arch,
@@ -155,7 +193,7 @@ fn gptq_feedback_against_real_curvature() {
 
     // One pass per calibration window taps every layer.
     let mut grams = GramSet::new(&arch);
-    for w in 0..CALIB_WINDOWS {
+    for w in 0..calib_windows {
         grams.accumulate_forward(&fp, &arch, &train[w * CALIB_SEQ..(w + 1) * CALIB_SEQ]);
     }
     let n_layers = arch.n_layers;
@@ -171,7 +209,10 @@ fn gptq_feedback_against_real_curvature() {
         .into_iter()
         .map(|g| g.finish())
         .collect();
-    println!("grams collected: {n_layers} layers x 3 taps, {CALIB_WINDOWS} windows\n");
+    println!(
+        "grams collected: {n_layers} layers x 3 taps, {calib_windows} windows = {} tokens\n",
+        calib_windows * CALIB_SEQ
+    );
 
     // Invert once per tap (q/k/v share attn; gate/up share ffn).
     let inv = |h: &[f64], k: usize| damped_inverse(h, k, DAMP);
