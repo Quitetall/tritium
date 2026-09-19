@@ -607,6 +607,22 @@ fn uniform_rate_model(
     SaltV2UniformRateModel::new(codec, &specs).map_err(Into::into)
 }
 
+/// Largest plane count every tile can carry within `maximum_planes` total planes.
+///
+/// `maximum_planes` is the exact plane count a profile budget buys under the
+/// uniform rate model, where one plane costs the same bytes on every tile. The
+/// result is the flat rate that budget affords; whatever it leaves over is what
+/// the ranked allocator has left to spend.
+fn uniform_plane_floor(tile_count: u64, maximum_planes: u64) -> u8 {
+    let mut floor = 1;
+    for candidate in 2..=3 {
+        if u64::from(candidate) * tile_count <= maximum_planes {
+            floor = candidate;
+        }
+    }
+    floor
+}
+
 fn maximum_present_planes(
     rate: SaltV2UniformRateModel,
     maximum: PhysicalBytes,
@@ -845,13 +861,33 @@ impl<'store, 'source> Qwen36AdditiveCampaignStore<'store, 'source> {
 
         let compact_maximum =
             maximum_present_planes(rate, budgets.compact.maximum, SaltV2Profile::CompactV1)?;
-        let compact_floor =
-            PackedPlaneCounts::filled(rate.tile_count(), 1, SaltV2Profile::CompactV1)?;
-        let mut compact_planner = PackedUniformProfilePlanner::new(
+        let near_maximum = maximum_present_planes(
+            rate,
+            budgets.near_lossless.maximum,
+            SaltV2Profile::NearLosslessV1,
+        )?;
+        // Both profiles start flat at the plane count their own budget buys for
+        // every tile, and the compact profile may not climb above the flat rate
+        // the near-lossless budget buys. Every tile costs the same number of
+        // bytes per plane here, so a spread allocation and a flat one at the
+        // same total plane count cost exactly the same bytes; measured on the
+        // 27B artifact, spreading left 28% of near-lossless weight at one plane
+        // (0.67 relative reconstruction error) while the flat allocation its
+        // budget already paid for puts every tile at two.
+        let near_uniform = uniform_plane_floor(rate.tile_count(), near_maximum);
+        let compact_uniform =
+            uniform_plane_floor(rate.tile_count(), compact_maximum).min(near_uniform);
+        let compact_floor = PackedPlaneCounts::filled(
+            rate.tile_count(),
+            compact_uniform,
+            SaltV2Profile::CompactV1,
+        )?;
+        let mut compact_planner = PackedUniformProfilePlanner::new_with_ceiling(
             rate.tile_count(),
             &compact_floor,
-            compact_maximum - rate.tile_count(),
+            compact_maximum - u64::from(compact_uniform) * rate.tile_count(),
             SaltV2Profile::CompactV1,
+            near_uniform,
         )?;
         let mut curve_spool = HessianCurveSpool::create(&self.root)
             .map_err(Qwen36PhysicalAllocationError::Campaign)?;
@@ -862,11 +898,6 @@ impl<'store, 'source> Qwen36AdditiveCampaignStore<'store, 'source> {
         curve_spool.replay(&mut compact_planner)?;
         let compact = compact_planner.finish()?;
 
-        let near_maximum = maximum_present_planes(
-            rate,
-            budgets.near_lossless.maximum,
-            SaltV2Profile::NearLosslessV1,
-        )?;
         if near_maximum < compact.present_planes {
             let required = rate
                 .physical_bytes(compact.present_planes)
@@ -877,10 +908,17 @@ impl<'store, 'source> Qwen36AdditiveCampaignStore<'store, 'source> {
                 maximum: budgets.near_lossless.maximum,
             });
         }
+        // The compact ceiling guarantees this floor dominates the compact result
+        // tile by tile, so the nested-profile invariant holds by construction.
+        let near_floor = PackedPlaneCounts::filled(
+            rate.tile_count(),
+            near_uniform,
+            SaltV2Profile::NearLosslessV1,
+        )?;
         let mut near_planner = PackedUniformProfilePlanner::new(
             rate.tile_count(),
-            &compact.plane_counts,
-            near_maximum - compact.present_planes,
+            &near_floor,
+            near_maximum - u64::from(near_uniform) * rate.tile_count(),
             SaltV2Profile::NearLosslessV1,
         )?;
         curve_spool.replay(&mut near_planner)?;
@@ -2724,7 +2762,33 @@ fn codec_from_tag(tag: u8) -> Result<SaltV2Codec, Qwen36TensorWorkError> {
 
 #[cfg(test)]
 mod tests {
-    use super::packed_map_bytes;
+    use super::{packed_map_bytes, uniform_plane_floor};
+
+    /// The 27B flagship's own budgets, in exact planes.
+    ///
+    /// The near-lossless profile was sized at 11,951,636,448 resident bytes over 27,318,026,240
+    /// coefficients — 3.5 bits per weight, which is exactly two B3 planes plus their f16 scales at
+    /// g128. The shipped artifact nevertheless left 28% of that weight at one plane and pushed 73
+    /// tensors to three. The flat rate was always affordable; the allocator simply did not take it.
+    #[test]
+    fn the_flagship_near_lossless_budget_buys_a_flat_two_planes() {
+        const TILES: u64 = 106_711_040;
+        assert_eq!(uniform_plane_floor(TILES, 2 * TILES), 2);
+        assert_eq!(uniform_plane_floor(TILES, 2 * TILES + TILES - 1), 2);
+        assert_eq!(uniform_plane_floor(TILES, 3 * TILES), 3);
+        // The compact profile's 7,683,194,872 resident bytes are 2.2417 bits per weight, short of
+        // the 3.5 a flat second plane costs, so its floor stays at one.
+        assert_eq!(uniform_plane_floor(TILES, 2 * TILES - 1), 1);
+    }
+
+    #[test]
+    fn the_uniform_floor_never_leaves_the_format_plane_range() {
+        for tiles in [1u64, 2, 7, 1024] {
+            assert_eq!(uniform_plane_floor(tiles, 0), 1, "tiles {tiles}");
+            assert_eq!(uniform_plane_floor(tiles, tiles), 1, "tiles {tiles}");
+            assert_eq!(uniform_plane_floor(tiles, 99 * tiles), 3, "tiles {tiles}");
+        }
+    }
 
     #[test]
     fn flagship_profile_map_size_is_exact_and_stays_out_of_small_manifests() {

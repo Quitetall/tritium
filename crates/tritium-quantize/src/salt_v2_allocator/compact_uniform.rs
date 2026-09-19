@@ -285,16 +285,52 @@ pub struct PackedUniformProfilePlanner<'floor> {
     bundled_upgrades: Vec<CompactBundledUpgrade>,
     floor_distortion: ExactDistortion,
     available_upgrades: usize,
+    ceiling: u8,
 }
 
 impl<'floor> PackedUniformProfilePlanner<'floor> {
     /// Start a compact allocation against one exact packed floor.
+    ///
+    /// Equivalent to [`Self::new_with_ceiling`] at the format maximum of three
+    /// planes, so every tile may be upgraded as far as the budget reaches.
     pub fn new(
         expected_groups: u64,
         floors: &'floor PackedPlaneCounts,
         additional_capacity: u64,
         profile: SaltV2Profile,
     ) -> Result<Self, UniformProfileAllocError<core::convert::Infallible>> {
+        Self::new_with_ceiling(expected_groups, floors, additional_capacity, profile, 3)
+    }
+
+    /// Start a compact allocation that may not raise any tile above `ceiling`.
+    ///
+    /// A nested pair of profiles can only be uniform at the rate its budget buys
+    /// if the inner profile never exceeds that rate: the outer profile's floor
+    /// has to dominate the inner profile's result tile by tile, and a single
+    /// inner tile at three planes forces the outer floor below uniform for every
+    /// other tile. Capping the inner profile is what buys both of them a flat
+    /// allocation at the same total bytes.
+    ///
+    /// # Errors
+    /// Returns [`UniformProfileAllocError::FloorLength`] for a floor map of the
+    /// wrong length, [`UniformProfileAllocError::TooManyGroups`] beyond the
+    /// `u32` group index, and [`PhysicalAllocError::PlaneOrdinal`] for a ceiling
+    /// outside `1..=3` or below a floor entry.
+    pub fn new_with_ceiling(
+        expected_groups: u64,
+        floors: &'floor PackedPlaneCounts,
+        additional_capacity: u64,
+        profile: SaltV2Profile,
+        ceiling: u8,
+    ) -> Result<Self, UniformProfileAllocError<core::convert::Infallible>> {
+        if !(1..=3).contains(&ceiling) {
+            return Err(PhysicalAllocError::PlaneOrdinal {
+                group: 0,
+                expected: 3,
+                actual: ceiling,
+            }
+            .into());
+        }
         if floors.len != expected_groups {
             return Err(UniformProfileAllocError::FloorLength {
                 expected: expected_groups,
@@ -316,6 +352,7 @@ impl<'floor> PackedUniformProfilePlanner<'floor> {
             bundled_upgrades: Vec::new(),
             floor_distortion: ExactDistortion::ZERO,
             available_upgrades: 0,
+            ceiling,
         })
     }
 
@@ -348,15 +385,33 @@ impl<'floor> PackedUniformProfilePlanner<'floor> {
             .ok_or(PhysicalAllocError::AccountingOverflow {
                 profile: self.profile,
             })?;
+        if floor > self.ceiling {
+            return Err(PhysicalAllocError::PlaneOrdinal {
+                group,
+                expected: self.ceiling,
+                actual: floor,
+            }
+            .into());
+        }
         self.available_upgrades = self
             .available_upgrades
-            .checked_add(usize::from(3 - floor))
+            .checked_add(usize::from(self.ceiling - floor))
             .ok_or(PhysicalAllocError::AccountingOverflow {
                 profile: self.profile,
             })?;
         let compact_group = u32::try_from(group).expect("planner group bound checked at creation");
-        match floor {
-            1 => {
+        match (floor, self.ceiling) {
+            // A capped tile has one reachable upgrade at most, so neither the
+            // second unit step nor the bundled 1..3 jump can be offered.
+            (1, 2) => push_unit(
+                &mut self.unit_upgrades,
+                compact_group,
+                2,
+                exact_reduction(curve.distortions[0], curve.distortions[1], self.profile)?,
+                self.profile,
+            )?,
+            (floor, ceiling) if floor >= ceiling => {}
+            (1, _) => {
                 let first =
                     exact_reduction(curve.distortions[0], curve.distortions[1], self.profile)?;
                 let second =
@@ -393,14 +448,13 @@ impl<'floor> PackedUniformProfilePlanner<'floor> {
                     )?;
                 }
             }
-            2 => push_unit(
+            (2, _) => push_unit(
                 &mut self.unit_upgrades,
                 compact_group,
                 3,
                 exact_reduction(curve.distortions[1], curve.distortions[2], self.profile)?,
                 self.profile,
             )?,
-            3 => {}
             _ => unreachable!("packed counts admit only one through three"),
         }
         self.observed_groups += 1;
@@ -739,5 +793,170 @@ mod tests {
         assert_eq!(core::mem::size_of::<ExactReduction>(), 16);
         assert_eq!(core::mem::size_of::<CompactUnitUpgrade>(), 24);
         assert_eq!(core::mem::size_of::<CompactBundledUpgrade>(), 40);
+    }
+}
+
+#[cfg(test)]
+mod ceiling_tests {
+    use super::*;
+
+    fn curve(values: [f64; 3]) -> UniformPrefixCurve {
+        UniformPrefixCurve::new(values).expect("curve")
+    }
+
+    fn plan(
+        floor: u8,
+        capacity: u64,
+        ceiling: u8,
+        curves: &[UniformPrefixCurve],
+    ) -> PackedUniformProfileAllocation {
+        let groups = curves.len() as u64;
+        let floors =
+            PackedPlaneCounts::filled(groups, floor, SaltV2Profile::CompactV1).expect("floors");
+        let mut planner = PackedUniformProfilePlanner::new_with_ceiling(
+            groups,
+            &floors,
+            capacity,
+            SaltV2Profile::CompactV1,
+            ceiling,
+        )
+        .expect("planner");
+        for curve in curves {
+            planner.push(*curve).expect("push curve");
+        }
+        planner.finish().expect("finish")
+    }
+
+    fn fixture() -> Vec<UniformPrefixCurve> {
+        vec![
+            curve([9.0, 5.0, 4.0]),
+            curve([8.0, 7.0, 1.0]),
+            curve([6.0, 3.0, 0.5]),
+            curve([4.0, 4.0, 4.0]),
+            curve([7.0, 2.0, 1.5]),
+        ]
+    }
+
+    /// The degenerate control: the uncapped constructor must still be the old allocator exactly.
+    #[test]
+    fn default_constructor_equals_a_ceiling_of_three() {
+        let curves = fixture();
+        let groups = curves.len() as u64;
+        for capacity in 0..=2 * groups {
+            let floors =
+                PackedPlaneCounts::filled(groups, 1, SaltV2Profile::CompactV1).expect("floors");
+            let mut uncapped = PackedUniformProfilePlanner::new(
+                groups,
+                &floors,
+                capacity,
+                SaltV2Profile::CompactV1,
+            )
+            .expect("planner");
+            for curve in &curves {
+                uncapped.push(*curve).expect("push curve");
+            }
+            let uncapped = uncapped.finish().expect("finish");
+            let capped = plan(1, capacity, 3, &curves);
+            assert_eq!(
+                uncapped.plane_counts, capped.plane_counts,
+                "capacity {capacity}: an explicit ceiling of three must change nothing"
+            );
+            assert_eq!(uncapped.present_planes, capped.present_planes);
+            assert_eq!(uncapped.selected_upgrades, capped.selected_upgrades);
+        }
+    }
+
+    /// A ceiling of two must bind even where the curve makes the third plane the better buy.
+    ///
+    /// `[8.0, 7.0, 1.0]` drops 1.0 on its second plane and 6.0 on its third, so the uncapped
+    /// allocator reaches for the bundled 1..3 jump. That is exactly the move the cap forbids.
+    #[test]
+    fn a_ceiling_of_two_never_reaches_the_third_plane() {
+        let curves = fixture();
+        let groups = curves.len() as u64;
+        for capacity in 0..=2 * groups {
+            let capped = plan(1, capacity, 2, &curves);
+            for group in 0..groups {
+                assert!(
+                    capped.plane_counts.get(group).expect("count") <= 2,
+                    "capacity {capacity}, group {group}: capped allocation exceeded its ceiling"
+                );
+            }
+            assert!(
+                capped.present_planes <= 2 * groups,
+                "capacity {capacity}: capped allocation exceeded the flat two-plane cost"
+            );
+        }
+        // Teeth: without the cap the same budget does reach three planes, so the assertion above
+        // is testing the cap rather than a budget that was never able to get there.
+        let reference = plan(1, groups, 3, &curves);
+        assert!(
+            (0..groups).any(|group| reference.plane_counts.get(group) == Some(3)),
+            "fixture no longer exercises the third plane; the cap test has lost its teeth"
+        );
+    }
+
+    /// A budget that buys the flat rate must reach it on every tile that gains anything.
+    ///
+    /// A tile whose curve is flat gains nothing from a second plane, and the allocator is right to
+    /// leave it at one and hand the bytes back — the fixture's `[4.0, 4.0, 4.0]` is that tile.
+    #[test]
+    fn a_full_budget_under_the_cap_reaches_the_flat_rate() {
+        let curves = fixture();
+        let groups = curves.len() as u64;
+        let capped = plan(1, groups, 2, &curves);
+        for (group, curve) in curves.iter().enumerate() {
+            let expected = if curve.distortions[1] < curve.distortions[0] {
+                2
+            } else {
+                1
+            };
+            assert_eq!(
+                capped.plane_counts.get(group as u64),
+                Some(expected),
+                "group {group} did not land at the flat rate its budget paid for"
+            );
+        }
+    }
+
+    #[test]
+    fn a_floor_above_the_ceiling_is_rejected() {
+        let floors = PackedPlaneCounts::filled(2, 3, SaltV2Profile::CompactV1).expect("floors");
+        let mut planner = PackedUniformProfilePlanner::new_with_ceiling(
+            2,
+            &floors,
+            0,
+            SaltV2Profile::CompactV1,
+            2,
+        )
+        .expect("planner");
+        assert!(matches!(
+            planner.push(curve([9.0, 5.0, 4.0])),
+            Err(UniformProfileAllocError::Allocation(
+                PhysicalAllocError::PlaneOrdinal { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn a_ceiling_outside_the_format_range_is_rejected() {
+        let floors = PackedPlaneCounts::filled(2, 1, SaltV2Profile::CompactV1).expect("floors");
+        for ceiling in [0, 4] {
+            assert!(
+                matches!(
+                    PackedUniformProfilePlanner::new_with_ceiling(
+                        2,
+                        &floors,
+                        0,
+                        SaltV2Profile::CompactV1,
+                        ceiling,
+                    ),
+                    Err(UniformProfileAllocError::Allocation(
+                        PhysicalAllocError::PlaneOrdinal { .. }
+                    ))
+                ),
+                "ceiling {ceiling} was accepted"
+            );
+        }
     }
 }
