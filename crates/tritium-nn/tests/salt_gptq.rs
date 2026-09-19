@@ -51,6 +51,29 @@ const EVAL_WINDOW: usize = 512;
 ///
 /// T=1 is omitted deliberately: it runs at 10⁴–10⁵× fp in every arm and its deltas bounce
 /// (-91.8/-97.1/-79.2/-90.0/-94.5) with no trend. Differences between destroyed models are noise.
+///
+/// Repeating the sweep with `TRITIUM_GPTQ_SMOOTH=0.75` — the shipped configuration — the crossing
+/// lands in the same place, and GPTQ still pays on top of the fold:
+///
+/// ```text
+/// cal tokens      T=2       T=3
+///      2,048    +4.8%    +3.6%
+///      4,096    -5.9%    +1.1%
+///      8,192   -11.2%    -1.7%
+///     16,384   -13.1%    -4.3%
+///     32,768   -17.0%    -4.9%
+/// ```
+///
+/// Two readings follow. The crossing sits near 8k tokens folded and unfolded alike, which is the
+/// Gram's sample count against its dimension — the fold changes neither, so it cannot move it. And
+/// the fold and GPTQ overlap without being redundant: the fold alone takes T=2 from 6.40× fp to
+/// 2.79×, more than unfolded GPTQ ever recovers, yet GPTQ still buys a further 17% on top.
+///
+/// One caveat on the folded numbers: `calibrate` for the fold reads the same window loop as the
+/// Gram, so this knob moves both at once and the folded `plain` baseline drifts between arms
+/// (T=3: 31.822, 31.501, 31.686, 32.361, 32.155 — unordered). Each delta compares plain against
+/// GPTQ at an identical fold and is sound; cross-arm comparisons of absolute folded perplexity are
+/// not. Separating the two knobs is unfinished work.
 const DEFAULT_CALIB_WINDOWS: usize = 32;
 
 fn calib_windows(train_len: usize) -> usize {
