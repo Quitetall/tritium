@@ -72,6 +72,20 @@ __device__ __forceinline__ int decode_trit(
   return (code & (1U << (2U + sign_index))) != 0U ? 1 : -1;
 }
 
+// The scalar loop's add/sub/skip, expressed as one addend.
+//
+// `digit` is the codec's raw code: 0 means -1, 1 means the zero trit, 2 means
+// +1 (D2's out-of-range 3 also means zero). Returning a literal `+0.0f` for the
+// zero trit is exactly the skip it replaces. `__fadd_rn` yields -0 only when
+// both operands are -0, and an accumulator that starts at +0 can never reach
+// -0 under round-to-nearest (x + (-x) rounds to +0), so `acc + 0.0f == acc`
+// holds for every accumulator this kernel can build. Selecting an addend
+// instead of branching removes two divergent branches per coefficient; ncu
+// measured only 18.8 of 32 threads active per cycle before this.
+__device__ __forceinline__ float trit_addend(uint32_t digit, float activation_value) {
+  return digit == 0U ? -activation_value : (digit == 2U ? activation_value : 0.0f);
+}
+
 // Reduce one scale group's coefficients into a single accumulator.
 //
 // Produces bit-identical results to the `decode_trit`-per-coefficient loop this
@@ -102,50 +116,81 @@ __device__ __forceinline__ float reduce_group_segment(
   const uint32_t local_end = local_start + segment_len;
   uint32_t local = local_start;
 
+  // Both `local >= logical_len` and `byte_index >= plane_bytes` are monotone in
+  // `local`, so a coefficient that decodes as zero implies every later one does.
+  // Clamping the bound once lets the loops below run without a per-coefficient
+  // range test.
+  const uint32_t limit = min(local_end, logical_len);
+
   if (codec == 1U) {  // B3: five little-endian radix-3 digits per byte.
-    while (local < local_end) {
+    while (local < limit) {
       const uint32_t byte_index = local / 5U;
-      // Both guards are monotone in `local` (byte_index never decreases), so a
-      // coefficient that decodes as zero here means every later one does too.
-      if (byte_index >= plane_bytes || local >= logical_len) break;
-      uint32_t value = payload[base + byte_index];
-      const uint32_t digit_index = local - byte_index * 5U;
-#pragma unroll
-      for (uint32_t skipped = 0; skipped < 4U; ++skipped) {
-        if (skipped < digit_index) value /= 3U;
+      if (byte_index >= plane_bytes) break;
+      const uint32_t code = payload[base + byte_index];
+      // Five INDEPENDENT divisions by literals, which nvcc lowers to
+      // multiply-shift. The previous `value /= 3` walk made each digit depend on
+      // the one before it; ncu attributed 37.9% of this kernel's issue stalls to
+      // exactly that kind of fixed-latency execution dependency.
+      const uint32_t d0 = code % 3U;
+      const uint32_t d1 = (code / 3U) % 3U;
+      const uint32_t d2 = (code / 9U) % 3U;
+      const uint32_t d3 = (code / 27U) % 3U;
+      const uint32_t d4 = (code / 81U) % 3U;
+      const uint32_t run_base = byte_index * 5U;
+      const uint32_t run_end = min(limit, run_base + 5U);
+      const float* run_activation = segment_activation + (local - local_start);
+      if (local == run_base && run_end == run_base + 5U) {
+        // The common case: a whole byte's run lies inside the segment. Five
+        // independent addends, no loop, no per-coefficient index arithmetic.
+        accumulator = __fadd_rn(accumulator, trit_addend(d0, run_activation[0]));
+        accumulator = __fadd_rn(accumulator, trit_addend(d1, run_activation[1]));
+        accumulator = __fadd_rn(accumulator, trit_addend(d2, run_activation[2]));
+        accumulator = __fadd_rn(accumulator, trit_addend(d3, run_activation[3]));
+        accumulator = __fadd_rn(accumulator, trit_addend(d4, run_activation[4]));
+        local = run_end;
+        continue;
       }
-      const uint32_t run_end = min(local_end, (byte_index + 1U) * 5U);
       for (; local < run_end; ++local) {
-        if (local >= logical_len) return accumulator;
-        const uint32_t digit = value % 3U;
-        value /= 3U;
-        const float activation_value = segment_activation[local - local_start];
-        if (digit == 0U) {
-          accumulator = __fsub_rn(accumulator, activation_value);
-        } else if (digit == 2U) {
-          accumulator = __fadd_rn(accumulator, activation_value);
-        }
+        const uint32_t offset = local - run_base;
+        const uint32_t digit = offset == 0U ? d0
+                             : offset == 1U ? d1
+                             : offset == 2U ? d2
+                             : offset == 3U ? d3
+                                            : d4;
+        accumulator = __fadd_rn(
+            accumulator, trit_addend(digit, segment_activation[local - local_start]));
       }
     }
     return accumulator;
   }
 
   if (codec == 0U) {  // D2: four `trit + 1` codes per byte.
-    while (local < local_end) {
+    // `decode_trit` maps code 0 -> -1, 1 -> 0, 2 -> +1, and out-of-range 3 -> 0,
+    // which is what `trit_addend` selects on.
+    while (local < limit) {
       const uint32_t byte_index = local >> 2;
-      if (byte_index >= plane_bytes || local >= logical_len) break;
+      if (byte_index >= plane_bytes) break;
       const uint32_t code = payload[base + byte_index];
-      const uint32_t run_end = min(local_end, (byte_index + 1U) << 2);
+      const uint32_t c0 = code & 3U;
+      const uint32_t c1 = (code >> 2U) & 3U;
+      const uint32_t c2 = (code >> 4U) & 3U;
+      const uint32_t c3 = (code >> 6U) & 3U;
+      const uint32_t run_base = byte_index << 2;
+      const uint32_t run_end = min(limit, run_base + 4U);
+      const float* run_activation = segment_activation + (local - local_start);
+      if (local == run_base && run_end == run_base + 4U) {
+        accumulator = __fadd_rn(accumulator, trit_addend(c0, run_activation[0]));
+        accumulator = __fadd_rn(accumulator, trit_addend(c1, run_activation[1]));
+        accumulator = __fadd_rn(accumulator, trit_addend(c2, run_activation[2]));
+        accumulator = __fadd_rn(accumulator, trit_addend(c3, run_activation[3]));
+        local = run_end;
+        continue;
+      }
       for (; local < run_end; ++local) {
-        if (local >= logical_len) return accumulator;
-        const uint32_t pair = (code >> ((local & 3U) * 2U)) & 3U;
-        const float activation_value = segment_activation[local - local_start];
-        // `decode_trit` maps 0 -> -1, 1 -> 0, 2 -> +1, 3 -> 0.
-        if (pair == 0U) {
-          accumulator = __fsub_rn(accumulator, activation_value);
-        } else if (pair == 2U) {
-          accumulator = __fadd_rn(accumulator, activation_value);
-        }
+        const uint32_t offset = local - run_base;
+        const uint32_t pair = offset == 0U ? c0 : offset == 1U ? c1 : offset == 2U ? c2 : c3;
+        accumulator = __fadd_rn(
+            accumulator, trit_addend(pair, segment_activation[local - local_start]));
       }
     }
     return accumulator;
