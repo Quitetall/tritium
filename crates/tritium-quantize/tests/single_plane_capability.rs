@@ -323,3 +323,118 @@ fn a_pruned_joint_fit_is_not_a_single_plane_fit() {
          gap is the pruning, not the metric. Compare each against what the artifact measured."
     );
 }
+
+/// **What does each candidate fix for prefix pruning actually cost?**
+///
+/// Three ways out of the pruning defect were named, and two of them are the same measurement. A fit
+/// stored per plane count and a refit after allocation both end up fitting exactly the count that
+/// ships, so their quality is identical — they differ in master storage and in when the fit runs,
+/// not in what comes out. That leaves two distinct quality options against the status quo:
+///
+/// - **prune** — what ships today: fit three planes jointly, keep the first `T`.
+/// - **direct** — fit exactly `T` planes. Optimal at every `T`, costs a fit (and a stored copy) per
+///   count rather than one shared Pmax fit.
+/// - **greedy** — prefix-stable by construction: fit one plane, fit one plane to the residual, and
+///   again. One stored chain serves every `T`, like today, but each prefix is a real fit. What it
+///   gives up is joint optimality at the top count.
+///
+/// The question the table answers is whether prefix stability is free. If `greedy` matches `direct`
+/// at low `T` and loses to it at `T=3`, the cost of keeping one stored chain is exactly that gap,
+/// and it can be weighed against tripling the master.
+///
+/// All under Identity curvature so the metric plays no part. `direct` at `T=3` and `prune` at `T=3`
+/// are the same fit and must print the same number — a free control on the harness.
+#[test]
+#[ignore = "needs the Qwen3.6 fp master; set TRITIUM_FP_DIR"]
+fn what_each_fix_for_prefix_pruning_costs() {
+    let Ok(fp_dir) = std::env::var("TRITIUM_FP_DIR") else {
+        eprintln!("skipping: set TRITIUM_FP_DIR");
+        return;
+    };
+    let fp_dir = PathBuf::from(fp_dir);
+    let plane_config = |planes: usize| JointFitConfig {
+        planes,
+        scale_precision: ScalePrecision::F16,
+        ..JointFitConfig::default()
+    };
+
+    for name in [
+        "model.language_model.layers.0.mlp.down_proj.weight",
+        "model.language_model.layers.32.mlp.down_proj.weight",
+        "model.language_model.embed_tokens.weight",
+    ] {
+        let Some(weights) = read_fp_prefix(&fp_dir, name, ELEMENTS) else {
+            println!("{name}: fp master read failed\n");
+            continue;
+        };
+        // [strategy][plane count - 1]
+        let mut squared = [[0.0f64; 3]; 3];
+        let mut energy = 0.0f64;
+        for group in weights.chunks(GROUP) {
+            energy += group
+                .iter()
+                .map(|w| f64::from(*w) * f64::from(*w))
+                .sum::<f64>();
+
+            // prune: one joint Pmax fit, sliced.
+            let pmax = fit_joint_ternary(group, JointFitMetric::Identity, plane_config(3))
+                .expect("three-plane fit");
+            let mut running = vec![0.0f32; group.len()];
+            for (slot, plane) in squared[0].iter_mut().enumerate() {
+                let scale = pmax.scales[slot];
+                for (value, trit) in running.iter_mut().zip(&pmax.trits[slot]) {
+                    *value += scale * f32::from(*trit);
+                }
+                *plane += group
+                    .iter()
+                    .zip(&running)
+                    .map(|(want, got)| f64::from(want - got).powi(2))
+                    .sum::<f64>();
+            }
+
+            // direct: a separate joint fit at each count.
+            for planes in 1..=3 {
+                let fit = fit_joint_ternary(group, JointFitMetric::Identity, plane_config(planes))
+                    .expect("direct fit");
+                squared[1][planes - 1] += group
+                    .iter()
+                    .zip(&fit.reconstruction)
+                    .map(|(want, got)| f64::from(want - got).powi(2))
+                    .sum::<f64>();
+            }
+
+            // greedy: one plane at a time against the running residual.
+            let mut residual: Vec<f32> = group.to_vec();
+            for plane in &mut squared[2] {
+                let fit = fit_joint_ternary(&residual, JointFitMetric::Identity, plane_config(1))
+                    .expect("greedy plane fit");
+                for (value, got) in residual.iter_mut().zip(&fit.reconstruction) {
+                    *value -= got;
+                }
+                *plane += residual.iter().map(|r| f64::from(*r).powi(2)).sum::<f64>();
+            }
+        }
+
+        println!("{name}");
+        println!(
+            "{:>10} {:>8} {:>9} {:>9} {:>9} {:>17}",
+            "planes", "bpw", "prune", "direct", "greedy", "greedy vs direct"
+        );
+        println!("{}", "-".repeat(68));
+        for planes in 1..=3usize {
+            let error = |strategy: usize| (squared[strategy][planes - 1] / energy).sqrt();
+            let (prune, direct, greedy) = (error(0), error(1), error(2));
+            println!(
+                "{planes:>10} {:>8.2} {prune:>9.4} {direct:>9.4} {greedy:>9.4} {:>16.1}%",
+                1.625 * planes as f64 + 16.0 * planes as f64 / GROUP as f64,
+                (greedy / direct - 1.0) * 100.0
+            );
+        }
+        println!();
+    }
+    println!(
+        "`prune` is today's pipeline. `direct` is a fit per plane count, which is also exactly what a\n\
+         refit after allocation produces. `greedy` keeps one stored chain whose every prefix is a real\n\
+         fit. At three planes `prune` and `direct` are the same fit and must agree."
+    );
+}
