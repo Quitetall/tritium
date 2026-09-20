@@ -460,6 +460,47 @@ impl Qwen35TextRunner {
             .gather_with_backend(self.backend.as_ref(), tokens, output)
     }
 
+    /// Language-head logits for one hidden row of a bound output, `[vocab]`.
+    ///
+    /// [`Qwen35TextOutput::last_logits`] covers only the final row, which is all
+    /// sequential decoding needs. Verifying a speculative draft needs the rows
+    /// underneath it too: a forward over the accepted token plus `k` drafted
+    /// ones has to answer what the target itself would have emitted at each
+    /// position, and those answers live in rows `0..k`.
+    ///
+    /// Outputs minted by a different runner are rejected, matching the rest of
+    /// this type's provenance handling.
+    ///
+    /// # Errors
+    /// Returns [`NnError::Provenance`] for a foreign output, [`NnError::Shape`]
+    /// for a row past the output's sequence, or a projection error.
+    pub fn logits_for_row(
+        &self,
+        output: &Qwen35TextOutput,
+        row: usize,
+    ) -> Result<Vec<f32>, NnError> {
+        if !Arc::ptr_eq(output.runner_identity(), &self.identity) {
+            return Err(NnError::Provenance(
+                "Qwen3.5 language head received an output from a different runner".to_owned(),
+            ));
+        }
+        let sequence = output.sequence();
+        if row >= sequence {
+            return Err(NnError::Shape {
+                expected: sequence,
+                got: row,
+            });
+        }
+        let start = checked_mul(row, self.hidden_size, "language-head hidden row")?;
+        let mut logits = zeroed_scratch(self.vocab_size, "language-head row logits")?;
+        self.project_shared_head(
+            &output.final_hidden_states()[start..start + self.hidden_size],
+            1,
+            &mut logits,
+        )?;
+        Ok(logits)
+    }
+
     pub(crate) fn project_shared_head(
         &self,
         hidden_states: &[f32],

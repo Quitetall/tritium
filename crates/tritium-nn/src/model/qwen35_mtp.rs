@@ -393,6 +393,32 @@ impl UnverifiedQwen35Mtp {
         Qwen35MtpRunner { core: self.core }
     }
 
+    /// An executable MTP graph for **speculative drafting only**.
+    ///
+    /// This deliberately skips the oracle parity trace, and it carries no
+    /// [`Qwen35MtpParityReceipt`]. It asserts nothing about whether this MTP
+    /// head reproduces the official implementation's numerics, and a runner
+    /// obtained this way must never back a parity, quality, or release claim --
+    /// [`Self::status`] still reports [`Qwen35MtpStatus::Unverified`] for the
+    /// bundle it came from.
+    ///
+    /// What makes it sound anyway is the one use it is for. Speculative decoding
+    /// is lossless by construction: every drafted token is checked against the
+    /// target model's own distribution and kept only when it matches, so a
+    /// drafter decides how *fast* decoding runs and never what it emits. A wrong
+    /// draft costs a rejected token. That is why drafting needs no parity
+    /// certificate, while claiming our MTP matches Qwen's still does -- those
+    /// are different questions, and the oracle ledger answers the second one.
+    ///
+    /// Callers that need the verified path keep using the oracle trace, which is
+    /// the only route that returns a receipt.
+    #[must_use]
+    pub fn draft_only_runner(&self) -> Qwen35MtpRunner {
+        Qwen35MtpRunner {
+            core: Arc::clone(&self.core),
+        }
+    }
+
     /// Align one bound target-language output with shifted MTP token IDs.
     ///
     /// Token IDs, positions, and hidden rows all derive exclusively from the
