@@ -511,21 +511,14 @@ extern "C" __global__ void salt_v2_forward_warp(
     uint32_t rank_prefix_count,
     uint32_t terminal_map_value,
     uint32_t groups_per_row) {
-  extern __shared__ uint32_t salt_v2_warp_shared[];
+  extern __shared__ float contribution_slots[];
 
   const uint32_t lane = threadIdx.x & 31U;
   const uint32_t warp_in_block = threadIdx.x >> 5U;
   const uint32_t warps_per_block = blockDim.x >> 5U;
   const uint32_t slots_per_row = groups_per_row * kMaxPlanesPerTile;
-  const uint32_t tiles_per_row = k / kAllocationTile;
-  // Per warp: the ordered contribution slots, then the per-tile plane count and
-  // running plane offset the prepass fills in.
-  const uint32_t warp_words = slots_per_row + tiles_per_row * 2U;
-  uint32_t* warp_shared =
-      salt_v2_warp_shared + static_cast<size_t>(warp_in_block) * warp_words;
-  float* slots = reinterpret_cast<float*>(warp_shared);
-  uint32_t* tile_planes = warp_shared + slots_per_row;
-  uint32_t* tile_begin = tile_planes + tiles_per_row;
+  float* slots =
+      contribution_slots + static_cast<size_t>(warp_in_block) * slots_per_row;
 
   const uint64_t output_index =
       static_cast<uint64_t>(blockIdx.x) * warps_per_block + warp_in_block;
@@ -545,49 +538,6 @@ extern "C" __global__ void salt_v2_forward_warp(
   }
   __syncwarp();
 
-  // Prepass: resolve every tile of this row's plane offset ONCE.
-  //
-  // `begin` for a tile is the number of planes in all tiles before it. The
-  // scalar kernel recovers that per (tile, group) by anchoring on the nearest
-  // stored rank prefix and re-scanning up to `kRankStrideTiles` (256) tiles
-  // forward, so a row of 272 groups paid ~35k scattered one-byte reads of the
-  // allocation map -- several times the trit arithmetic itself, and the reason
-  // ncu reported 3.5 useful bytes per 32-byte sector. A running sum over the
-  // row's own tiles gives the identical value, because both are "planes in
-  // [0, tile)": the lanes read each tile's plane count once, and lane 0 carries
-  // the sum forward from a single anchor.
-  const uint32_t first_tile = static_cast<uint32_t>(row_base / kAllocationTile);
-  for (uint32_t offset = lane; offset < tiles_per_row; offset += 32U) {
-    const uint32_t tile = first_tile + offset;
-    // A tile whose own rank block has no stored prefix is one the scalar kernel
-    // abandons the row on, before it ever reads a plane count. Zero is already
-    // that kernel's break signal, so it carries the same meaning here.
-    const uint32_t rank_block = tile / kRankStrideTiles;
-    const bool prefix_present = rank_block == 0U || rank_block - 1U < rank_prefix_count;
-    tile_planes[offset] =
-        (tile < tile_count && prefix_present)
-            ? plane_count_for_tile(
-                  index_metadata, allocation_map_bytes, terminal_map_value, tile)
-            : 0U;
-  }
-  __syncwarp();
-  if (lane == 0U) {
-    const uint32_t rank_block = first_tile / kRankStrideTiles;
-    uint32_t running = 0U;
-    if (rank_block != 0U && rank_block - 1U < rank_prefix_count) {
-      running = read_rank_prefix(index_metadata, allocation_map_bytes, rank_block - 1U);
-    }
-    for (uint32_t prior = rank_block * kRankStrideTiles; prior < first_tile; ++prior) {
-      running += plane_count_for_tile(
-          index_metadata, allocation_map_bytes, terminal_map_value, prior);
-    }
-    for (uint32_t offset = 0; offset < tiles_per_row; ++offset) {
-      tile_begin[offset] = running;
-      running += tile_planes[offset];
-    }
-  }
-  __syncwarp();
-
   const uint32_t full_payload_bytes = plane_payload_bytes(codec, kAllocationTile);
   const uint32_t full_scale_count =
       (kAllocationTile + scale_group_size - 1U) / scale_group_size;
@@ -599,9 +549,20 @@ extern "C" __global__ void salt_v2_forward_warp(
     const uint32_t tile = static_cast<uint32_t>(coefficient / kAllocationTile);
     if (column >= k || tile >= tile_count) { break_unit = unit; break; }
 
-    const uint32_t tile_offset = tile - first_tile;
-    const uint32_t begin = tile_begin[tile_offset];
-    const uint32_t planes = tile_planes[tile_offset];
+    const uint32_t rank_block = tile / kRankStrideTiles;
+    uint32_t begin = 0U;
+    if (rank_block != 0U) {
+      const uint32_t prefix_index = rank_block - 1U;
+      if (prefix_index >= rank_prefix_count) { break_unit = unit; break; }
+      begin = read_rank_prefix(index_metadata, allocation_map_bytes, prefix_index);
+    }
+    const uint32_t scan_start = rank_block * kRankStrideTiles;
+    for (uint32_t prior = scan_start; prior < tile; ++prior) {
+      begin += plane_count_for_tile(
+          index_metadata, allocation_map_bytes, terminal_map_value, prior);
+    }
+    const uint32_t planes = plane_count_for_tile(
+        index_metadata, allocation_map_bytes, terminal_map_value, tile);
     const uint32_t end = begin + planes;
     if (planes == 0U || end > plane_count) { break_unit = unit; break; }
 
