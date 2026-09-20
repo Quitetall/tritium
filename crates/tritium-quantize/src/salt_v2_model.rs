@@ -2625,6 +2625,19 @@ fn fit_feedback_group(
     // Search always constructs the complete Pmax=3 master. `config.max_planes` limits the
     // allocation frontier later; consulting it here would make compact and near-lossless refit
     // different masters and violate the byte-prefix contract.
+    //
+    // That contract costs real quality, because `fit_joint_ternary` is not prefix-stable — see
+    // `salt_v2::prefix_stability`. Measured on the Qwen3.6-27B fp master under Identity curvature,
+    // relative Frobenius error of a sliced prefix against a fit at that count outright:
+    //
+    //   planes   prune   direct
+    //        1  0.7003   0.4369
+    //        2  0.3951   0.1641
+    //        3  0.0606   0.0606
+    //
+    // Three planes agree because there the prefix is the whole fit. Below it the stored master is
+    // 1.6x and 2.4x worse than the same weights fit at the count that actually ships, and the
+    // prefix losses written from this same loop carry that error into the allocator's ranking.
     const FULL_PLANES: usize = 3;
     let mut reconstruction = vec![0.0; request.working_weights.len()];
     let groups_per_row = request.columns / SALT_V2_SCALE_GROUP_SIZE;

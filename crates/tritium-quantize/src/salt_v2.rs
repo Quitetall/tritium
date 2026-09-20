@@ -2420,3 +2420,63 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod prefix_stability {
+    use super::*;
+
+    /// **A joint fit is not prefix-stable, and the master format depends on believing it is.**
+    ///
+    /// `salt_v2_master` stores "ordered Pmax planes ... every lower artifact slices this prefix",
+    /// and `salt_v2_model` builds that master from a single [`fit_joint_ternary`] at three planes.
+    /// That inherits a property greedy residual expansion has and joint optimization does not:
+    /// plane 0 of a three-plane fit is whatever best serves the trio, not the best single plane.
+    ///
+    /// Measured on the Qwen3.6-27B fp master, the gap is 60% on `down_proj` and 123% on
+    /// `embed_tokens` in relative Frobenius error, and it reproduces what the shipped artifact
+    /// actually decodes to. This keeps a deterministic, dependency-free version of that fact in the
+    /// test suite so the prefix assumption cannot be reintroduced as if it held.
+    ///
+    /// The assertion is deliberately one-directional: it requires the prefix to be strictly worse,
+    /// so it fails the moment someone makes the fit prefix-stable — at which point this test should
+    /// be deleted along with the workaround it documents, not weakened.
+    #[test]
+    fn plane_zero_of_a_joint_fit_is_not_the_best_single_plane() {
+        // A group whose mass sits in two well-separated magnitudes: a three-plane fit can spend its
+        // planes cooperatively, so its first plane has no reason to be a good standalone quantizer.
+        let weights: Vec<f32> = (0..128)
+            .map(|index| {
+                let base = if index % 4 == 0 { 1.0 } else { 0.05 };
+                base * if index % 2 == 0 { 1.0 } else { -1.0 } + 0.01 * ((index % 7) as f32 - 3.0)
+            })
+            .collect();
+        let config = |planes| JointFitConfig {
+            planes,
+            ..JointFitConfig::default()
+        };
+        let squared = |reconstruction: &[f32]| -> f64 {
+            weights
+                .iter()
+                .zip(reconstruction)
+                .map(|(want, got)| f64::from(want - got).powi(2))
+                .sum()
+        };
+
+        let single = fit_joint_ternary(&weights, JointFitMetric::Identity, config(1))
+            .expect("single-plane fit");
+        let triple = fit_joint_ternary(&weights, JointFitMetric::Identity, config(3))
+            .expect("three-plane fit");
+        let pruned: Vec<f32> = triple.trits[0]
+            .iter()
+            .map(|trit| triple.scales[0] * f32::from(*trit))
+            .collect();
+
+        let (direct, prefix) = (squared(&single.reconstruction), squared(&pruned));
+        assert!(
+            prefix > direct,
+            "the joint fit's first plane matched a direct single-plane fit \
+             (prefix {prefix:.6e}, direct {direct:.6e}); if fit_joint_ternary is now \
+             prefix-stable, delete this test and the pruning workarounds it documents"
+        );
+    }
+}

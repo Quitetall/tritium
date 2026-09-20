@@ -368,7 +368,7 @@ fn what_each_fix_for_prefix_pruning_costs() {
             continue;
         };
         // [strategy][plane count - 1]
-        let mut squared = [[0.0f64; 3]; 3];
+        let mut squared = [[0.0f64; 3]; 4];
         let mut energy = 0.0f64;
         for group in weights.chunks(GROUP) {
             energy += group
@@ -413,28 +413,59 @@ fn what_each_fix_for_prefix_pruning_costs() {
                 }
                 *plane += residual.iter().map(|r| f64::from(*r).powi(2)).sum::<f64>();
             }
+
+            // staged: anchor plane 0 as a real single-plane fit, then fit the remaining two
+            // jointly against its residual. Still one prefix-sliceable chain, so it needs no
+            // format change, but the count the allocator starves most is no longer a leftover.
+            let anchor = fit_joint_ternary(group, JointFitMetric::Identity, plane_config(1))
+                .expect("anchor fit");
+            let mut running = anchor.reconstruction.clone();
+            squared[3][0] += group
+                .iter()
+                .zip(&running)
+                .map(|(want, got)| f64::from(want - got).powi(2))
+                .sum::<f64>();
+            let tail: Vec<f32> = group
+                .iter()
+                .zip(&running)
+                .map(|(want, got)| want - got)
+                .collect();
+            let rest = fit_joint_ternary(&tail, JointFitMetric::Identity, plane_config(2))
+                .expect("staged tail fit");
+            for (index, slot) in squared[3].iter_mut().skip(1).enumerate() {
+                let scale = rest.scales[index];
+                for (value, trit) in running.iter_mut().zip(&rest.trits[index]) {
+                    *value += scale * f32::from(*trit);
+                }
+                *slot += group
+                    .iter()
+                    .zip(&running)
+                    .map(|(want, got)| f64::from(want - got).powi(2))
+                    .sum::<f64>();
+            }
         }
 
         println!("{name}");
         println!(
-            "{:>10} {:>8} {:>9} {:>9} {:>9} {:>17}",
-            "planes", "bpw", "prune", "direct", "greedy", "greedy vs direct"
+            "{:>8} {:>7} {:>9} {:>9} {:>9} {:>9} {:>17}",
+            "planes", "bpw", "prune", "direct", "greedy", "staged", "staged vs prune"
         );
-        println!("{}", "-".repeat(68));
+        println!("{}", "-".repeat(76));
         for planes in 1..=3usize {
             let error = |strategy: usize| (squared[strategy][planes - 1] / energy).sqrt();
-            let (prune, direct, greedy) = (error(0), error(1), error(2));
+            let (prune, direct, greedy, staged) = (error(0), error(1), error(2), error(3));
             println!(
-                "{planes:>10} {:>8.2} {prune:>9.4} {direct:>9.4} {greedy:>9.4} {:>16.1}%",
+                "{planes:>8} {:>7.2} {prune:>9.4} {direct:>9.4} {greedy:>9.4} {staged:>9.4} {:>16.1}%",
                 1.625 * planes as f64 + 16.0 * planes as f64 / GROUP as f64,
-                (greedy / direct - 1.0) * 100.0
+                (staged / prune - 1.0) * 100.0
             );
         }
         println!();
     }
     println!(
         "`prune` is today's pipeline. `direct` is a fit per plane count, which is also exactly what a\n\
-         refit after allocation produces. `greedy` keeps one stored chain whose every prefix is a real\n\
-         fit. At three planes `prune` and `direct` are the same fit and must agree."
+         refit after allocation produces, and needs the master to carry a fit per count. `greedy` and\n\
+         `staged` both keep one prefix-sliceable chain and so need no format change. At three planes\n\
+         `prune` and `direct` are the same fit and must agree."
     );
 }
