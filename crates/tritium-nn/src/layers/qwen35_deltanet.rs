@@ -854,10 +854,14 @@ impl Qwen35DeltaNet {
     }
 }
 
-/// Whether the opt-in device recurrence is enabled.
+/// Whether the device recurrence is enabled. On by default when the backend is
+/// CUDA; `TRITIUM_DELTANET_CUDA=0` forces the host reduction.
 ///
-/// Opt-in while the host reduction remains the reference: a wrong answer here is
-/// silent, so the default stays on the path the golden vectors pin.
+/// Default-on because it is a relocation rather than a reimplementation:
+/// `qwen35_deltanet_cuda::device_recurrence_matches_the_host_reduction_bit_for_bit`
+/// asserts equality, not a tolerance, and the same holds end to end on
+/// Qwen3.6-27B. It is worth 145 ms of every 270 ms decode token. The escape
+/// hatch stays because the host path is the reference the golden vectors pin.
 #[cfg(feature = "cuda")]
 fn deltanet_cuda_enabled() -> bool {
     match std::env::var("TRITIUM_DELTANET_CUDA") {
@@ -865,11 +869,11 @@ fn deltanet_cuda_enabled() -> bool {
         Ok(value) if value == "0" => false,
         Ok(value) => {
             eprintln!(
-                "tritium-nn: TRITIUM_DELTANET_CUDA={value:?} - use 1 or 0 (unset = 0); reading as 0"
+                "tritium-nn: TRITIUM_DELTANET_CUDA={value:?} - use 1 or 0 (unset = 1); reading as 1"
             );
-            false
+            true
         }
-        Err(_) => false,
+        Err(_) => true,
     }
 }
 

@@ -145,7 +145,8 @@ fn device_recurrence_matches_the_host_reduction_bit_for_bit() {
     };
 
     // SAFETY: the only mutation of this variable in the crate, and this test
-    // holds it for the whole body.
+    // holds it for the whole body. `0` is the explicit opt-out; the device path
+    // is the default, so the host run is the one that needs the flag.
     unsafe { std::env::set_var("TRITIUM_DELTANET_CUDA", "0") };
     let host = run(&cuda, 5);
     assert!(
@@ -157,6 +158,11 @@ fn device_recurrence_matches_the_host_reduction_bit_for_bit() {
     let device = run(&cuda, 5);
     let device_ran = residency_probe(&cuda);
     unsafe { std::env::remove_var("TRITIUM_DELTANET_CUDA") };
+    // With the variable unset the device path must still be the one chosen.
+    assert!(
+        residency_probe(&cuda),
+        "the device recurrence is supposed to be the default on a CUDA backend"
+    );
 
     assert!(
         device_ran,
