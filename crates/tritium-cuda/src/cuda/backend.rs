@@ -551,6 +551,8 @@ pub struct CudaBackend {
     pub(super) func_salt_v2_exact: CudaFunction,
     /// Shared-activation D2/B3/S34 forward used for prefill-shaped launches.
     pub(super) func_salt_v2_tiled: CudaFunction,
+    /// Warp-per-row SALT V2 forward (`KERNEL_NAME_SALT_V2_WARP`).
+    pub(super) func_salt_v2_warp: CudaFunction,
     /// Exact selected-row reconstruction for SALT V2 token embeddings.
     pub(super) func_salt_v2_gather: CudaFunction,
     /// Device trap used only by destructive release qualification.
@@ -1143,6 +1145,9 @@ impl CudaBackend {
         let func_salt_v2_tiled = salt_v2_module
             .load_function(KERNEL_NAME_SALT_V2_TILED)
             .map_err(|e| driver_err("resolve salt_v2_forward_tiled kernel", &e))?;
+        let func_salt_v2_warp = salt_v2_module
+            .load_function(KERNEL_NAME_SALT_V2_WARP)
+            .map_err(|error| driver_err("load SALT V2 warp forward kernel", &error))?;
         let func_salt_v2_gather = salt_v2_module
             .load_function(KERNEL_NAME_SALT_V2_GATHER)
             .map_err(|e| driver_err("resolve salt_v2_gather_rows kernel", &e))?;
@@ -1179,6 +1184,7 @@ impl CudaBackend {
             _salt_v2_module: salt_v2_module,
             func_salt_v2_exact,
             func_salt_v2_tiled,
+            func_salt_v2_warp,
             func_salt_v2_gather,
             #[cfg(feature = "device-loss-qualification")]
             func_qualification_poison,

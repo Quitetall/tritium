@@ -14,6 +14,10 @@ namespace {
 
 constexpr uint32_t kAllocationTile = 256;
 constexpr uint32_t kRankStrideTiles = 256;
+// `plane_count_for_tile` returns `code + 1` for a two-bit `code < 3`, so a
+// tile carries at most three planes. The warp kernel reserves that many
+// ordered contribution slots per scale group.
+constexpr uint32_t kMaxPlanesPerTile = 3;
 
 __device__ __forceinline__ int decode_trit(
     const unsigned char* payload,
@@ -457,6 +461,163 @@ extern "C" __global__ void salt_v2_forward_tiled(
   }
   if (active) {
     output[static_cast<uint64_t>(mi) * n + row] = accumulator;
+  }
+}
+
+// Warp-per-row decode.
+//
+// `salt_v2_forward_exact` hands one thread a whole `k`-long row. At decode
+// (m = 1) that is N threads for the entire launch, and ncu measured the
+// consequences: 0.56 waves per SM, so the grid does not fill the machine even
+// once; 5.13 of 12 active warps per scheduler with 1.18 eligible; and 1.4
+// useful bytes per 32-byte sector, because adjacent lanes own rows whose
+// payloads sit `k` apart.
+//
+// Here a warp owns one output and each lane owns whole scale groups, strided by
+// 32. The launch carries 32x the threads, and lanes read payload bytes tens of
+// bytes apart rather than `k`.
+//
+// The reduction stays bit-identical to the scalar kernel. Every value that
+// kernel accumulates is one `group_sum * scale` for a (tile, group, plane),
+// added in tile-major, then group, then plane order. A lane writes each of its
+// contributions into the slot naming its position in that sequence --
+// `unit * kMaxPlanesPerTile + plane_local` -- and lane 0 replays the additions
+// in index order with the same `__fadd_rn`. Untouched slots hold +0.0f, a no-op
+// for the reason `trit_addend` documents, so the padding is invisible.
+//
+// A scalar-kernel `break` truncates the rest of the row, so lanes agree on the
+// earliest unit that breaks and lane 0 stops there.
+//
+// Requires `k % kAllocationTile == 0` and `kAllocationTile % scale_group_size == 0`,
+// which together make every segment exactly `scale_group_size` long and put unit
+// `i` at column `i * scale_group_size`. The host checks both and falls back to
+// the scalar kernel otherwise.
+extern "C" __global__ void salt_v2_forward_warp(
+    const float* activation,
+    const unsigned char* payload,
+    const __half* scales,
+    const unsigned char* index_metadata,
+    float* output,
+    uint32_t m,
+    uint32_t n,
+    uint32_t k,
+    uint32_t codec,
+    uint32_t scale_group_size,
+    uint32_t tile_count,
+    uint32_t plane_count,
+    uint64_t payload_bytes,
+    uint64_t scale_count,
+    uint32_t allocation_map_bytes,
+    uint32_t rank_prefix_count,
+    uint32_t terminal_map_value,
+    uint32_t groups_per_row) {
+  extern __shared__ float contribution_slots[];
+
+  const uint32_t lane = threadIdx.x & 31U;
+  const uint32_t warp_in_block = threadIdx.x >> 5U;
+  const uint32_t warps_per_block = blockDim.x >> 5U;
+  const uint32_t slots_per_row = groups_per_row * kMaxPlanesPerTile;
+  float* slots =
+      contribution_slots + static_cast<size_t>(warp_in_block) * slots_per_row;
+
+  const uint64_t output_index =
+      static_cast<uint64_t>(blockIdx.x) * warps_per_block + warp_in_block;
+  const uint64_t output_count = static_cast<uint64_t>(m) * n;
+  // Warp-uniform: every lane of a warp shares `output_index`.
+  if (output_index >= output_count) return;
+
+  const uint32_t mi = static_cast<uint32_t>(output_index / n);
+  const uint32_t row = static_cast<uint32_t>(output_index % n);
+  const uint64_t row_base = static_cast<uint64_t>(row) * k;
+  const uint64_t row_end = row_base + k;
+  const uint64_t total_coefficients = static_cast<uint64_t>(n) * k;
+  const float* row_activation = activation + static_cast<uint64_t>(mi) * k;
+
+  for (uint32_t slot = lane; slot < slots_per_row; slot += 32U) {
+    slots[slot] = 0.0f;
+  }
+  __syncwarp();
+
+  const uint32_t full_payload_bytes = plane_payload_bytes(codec, kAllocationTile);
+  const uint32_t full_scale_count =
+      (kAllocationTile + scale_group_size - 1U) / scale_group_size;
+
+  uint32_t break_unit = groups_per_row;
+  for (uint32_t unit = lane; unit < groups_per_row; unit += 32U) {
+    const uint32_t column = unit * scale_group_size;
+    const uint64_t coefficient = row_base + column;
+    const uint32_t tile = static_cast<uint32_t>(coefficient / kAllocationTile);
+    if (column >= k || tile >= tile_count) { break_unit = unit; break; }
+
+    const uint32_t rank_block = tile / kRankStrideTiles;
+    uint32_t begin = 0U;
+    if (rank_block != 0U) {
+      const uint32_t prefix_index = rank_block - 1U;
+      if (prefix_index >= rank_prefix_count) { break_unit = unit; break; }
+      begin = read_rank_prefix(index_metadata, allocation_map_bytes, prefix_index);
+    }
+    const uint32_t scan_start = rank_block * kRankStrideTiles;
+    for (uint32_t prior = scan_start; prior < tile; ++prior) {
+      begin += plane_count_for_tile(
+          index_metadata, allocation_map_bytes, terminal_map_value, prior);
+    }
+    const uint32_t planes = plane_count_for_tile(
+        index_metadata, allocation_map_bytes, terminal_map_value, tile);
+    const uint32_t end = begin + planes;
+    if (planes == 0U || end > plane_count) { break_unit = unit; break; }
+
+    const uint64_t tile_base = static_cast<uint64_t>(tile) * kAllocationTile;
+    if (tile_base >= total_coefficients) { break_unit = unit; break; }
+    const uint32_t logical_len = static_cast<uint32_t>(
+        min(static_cast<uint64_t>(kAllocationTile), total_coefficients - tile_base));
+
+    const uint32_t local_start =
+        static_cast<uint32_t>(coefficient % kAllocationTile);
+    const uint32_t group = local_start / scale_group_size;
+    const uint32_t group_end = min((group + 1U) * scale_group_size, logical_len);
+    if (local_start >= group_end) { break_unit = unit; break; }
+    const uint64_t segment_len =
+        min(static_cast<uint64_t>(group_end - local_start), row_end - coefficient);
+
+    const uint32_t current_payload_bytes = plane_payload_bytes(codec, logical_len);
+    const uint32_t current_scale_count =
+        (logical_len + scale_group_size - 1U) / scale_group_size;
+
+    for (uint32_t plane = begin; plane < end; ++plane) {
+      const uint32_t local_plane = plane - begin;
+      const uint64_t payload_base =
+          static_cast<uint64_t>(begin) * full_payload_bytes +
+          static_cast<uint64_t>(local_plane) * current_payload_bytes;
+      const uint64_t scale_base =
+          static_cast<uint64_t>(begin) * full_scale_count +
+          static_cast<uint64_t>(local_plane) * current_scale_count;
+      const uint64_t scale_index = scale_base + group;
+      // The scalar kernel skips this plane and keeps going; the slot stays +0.0f.
+      if (scale_index >= scale_count) continue;
+      const float group_accumulator = reduce_group_segment(
+          payload, payload_bytes, payload_base, logical_len,
+          current_payload_bytes, row_activation + column, local_start,
+          static_cast<uint32_t>(segment_len), codec);
+      slots[unit * kMaxPlanesPerTile + local_plane] =
+          __fmul_rn(group_accumulator, __half2float(scales[scale_index]));
+    }
+  }
+
+  // Earliest breaking unit across the warp: the scalar kernel would have
+  // abandoned the row there, so nothing at or beyond it may contribute.
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    break_unit = min(break_unit, __shfl_xor_sync(0xffffffffU, break_unit, offset));
+  }
+  __syncwarp();
+
+  if (lane == 0U) {
+    const uint32_t live_slots = break_unit * kMaxPlanesPerTile;
+    float accumulator = 0.0f;
+    for (uint32_t slot = 0; slot < live_slots; ++slot) {
+      accumulator = __fadd_rn(accumulator, slots[slot]);
+    }
+    output[output_index] = accumulator;
   }
 }
 

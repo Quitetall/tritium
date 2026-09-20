@@ -1,4 +1,44 @@
 use super::*;
+use tritium_format::salt_v2_package::SALT_V2_ALLOCATION_TILE_SIZE;
+
+/// Geometry for the warp-per-row SALT V2 kernel, or `None` when the scalar
+/// kernel must handle the shape.
+///
+/// The warp kernel places group `i` of a row at column `i * scale_group_size`.
+/// That holds only when `k` is a whole number of allocation tiles and a scale
+/// group divides a tile: otherwise a row's groups straddle tile boundaries and
+/// segments come out shorter than one group, which is the variable-stride walk
+/// the scalar kernel does. A zero or over-large scale group is rejected outright.
+///
+/// Returns `(groups_per_row, warps_per_block, slot_bytes_per_warp)`. Slots are
+/// the ordered contribution buffer: three per group, because
+/// `plane_count_for_tile` yields at most three planes for a tile.
+pub(super) fn salt_v2_warp_dispatch(
+    columns: usize,
+    scale_group_size: u32,
+) -> Option<(u32, u32, u32)> {
+    let group = usize::try_from(scale_group_size).ok()?;
+    if group == 0 || !columns.is_multiple_of(SALT_V2_ALLOCATION_TILE_SIZE) {
+        return None;
+    }
+    if !SALT_V2_ALLOCATION_TILE_SIZE.is_multiple_of(group) {
+        return None;
+    }
+    let groups_per_row = u32::try_from(columns / group).ok()?;
+    let slot_bytes = groups_per_row
+        .checked_mul(3)?
+        .checked_mul(core::mem::size_of::<f32>() as u32)?;
+    if slot_bytes == 0 {
+        return None;
+    }
+    let warps_per_block = (SALT_V2_WARP_SHARED_BYTES / slot_bytes).min(SALT_V2_WARP_MAX_WARPS);
+    if warps_per_block == 0 {
+        // One warp's slots alone exceed the shared-memory budget.
+        return None;
+    }
+    Some((groups_per_row, warps_per_block, slot_bytes))
+}
+
 
 #[cfg(feature = "device-loss-qualification")]
 fn qualification_fatal_driver_error(error: &DriverError) -> bool {
@@ -342,7 +382,22 @@ impl CudaBackend {
         // 4090 benchmark favors scalar dispatch for short prompts; keep this
         // opt-in so production latency never regresses by default.
         let use_tiled = env_flag_on("TRITIUM_SALT_V2_TILED") && tensor.columns.is_multiple_of(256);
-        let (grid_x, grid_y, block_x, shared_mem_bytes) = if use_tiled {
+
+        // Warp-per-row dispatch; see `salt_v2_warp_dispatch`.
+        let warp_dispatch = salt_v2_warp_dispatch(tensor.columns, tensor.scale_group_size);
+        let (warp_groups_per_row, warps_per_block, warp_slot_bytes) =
+            warp_dispatch.unwrap_or((0, 0, 0));
+        let use_warp = !use_tiled && warps_per_block > 0;
+        let warp_groups_u32 = warp_groups_per_row;
+
+        let (grid_x, grid_y, block_x, shared_mem_bytes) = if use_warp {
+            (
+                total_outputs.div_ceil(warps_per_block),
+                1,
+                warps_per_block * 32,
+                warp_slot_bytes * warps_per_block,
+            )
+        } else if use_tiled {
             (
                 n_u32.div_ceil(SALT_V2_TILED_THREADS),
                 m_u32,
@@ -362,7 +417,9 @@ impl CudaBackend {
             block_dim: (block_x, 1, 1),
             shared_mem_bytes,
         };
-        let kernel = if use_tiled {
+        let kernel = if use_warp {
+            &self.func_salt_v2_warp
+        } else if use_tiled {
             &self.func_salt_v2_tiled
         } else {
             &self.func_salt_v2_exact
@@ -386,6 +443,11 @@ impl CudaBackend {
             .arg(&tensor.allocation_map_bytes)
             .arg(&tensor.rank_prefix_count)
             .arg(&tensor.terminal_map_value);
+        // Only the warp kernel takes the group count; the other two derive their
+        // own geometry from `k`.
+        if use_warp {
+            launch.arg(&warp_groups_u32);
+        }
         // SAFETY: the private handle owns codec payload/scales/index metadata
         // validated at upload. Input/output lengths and every scalar ABI bound
         // are checked above, and the kernel writes each `[M, N]` element once.
@@ -558,5 +620,43 @@ impl CudaBackend {
         }
         output.copy_from_slice(&staged);
         Ok(receipt)
+    }
+}
+
+#[cfg(test)]
+mod warp_dispatch_tests {
+    use super::salt_v2_warp_dispatch;
+
+    #[test]
+    fn the_warp_parity_gate_actually_reaches_the_warp_kernel() {
+        // `tests/salt_v2_warp.rs` builds a 512-column, 64-group tensor. If this
+        // shape were ineligible that file would silently be testing the scalar
+        // kernel a second time and asserting nothing about the warp kernel.
+        let (groups, warps, slot_bytes) =
+            salt_v2_warp_dispatch(512, 64).expect("512 columns at group 64 must use the warp path");
+        assert_eq!(groups, 8);
+        assert_eq!(slot_bytes, 8 * 3 * 4);
+        assert_eq!(warps, super::SALT_V2_WARP_MAX_WARPS);
+    }
+
+    #[test]
+    fn shapes_that_straddle_a_tile_stay_on_the_scalar_kernel() {
+        // 576 is the width the other SALT tests use: 2.25 allocation tiles, so a
+        // row's groups do not start at `i * scale_group_size` and the warp
+        // kernel's precondition fails.
+        assert!(salt_v2_warp_dispatch(576, 64).is_none());
+        // A scale group that does not divide a 256-coefficient tile.
+        assert!(salt_v2_warp_dispatch(512, 96).is_none());
+        // Degenerate widths.
+        assert!(salt_v2_warp_dispatch(512, 0).is_none());
+        assert!(salt_v2_warp_dispatch(0, 64).is_none());
+    }
+
+    #[test]
+    fn a_row_too_wide_for_one_warps_slots_falls_back() {
+        // Slots are 3 floats per group; 48 KiB holds 4096 of them, so a row of
+        // more than 4096 groups (262144 columns at group 64) cannot be served.
+        assert!(salt_v2_warp_dispatch(4096 * 64, 64).is_some());
+        assert!(salt_v2_warp_dispatch(4097 * 64, 64).is_none());
     }
 }

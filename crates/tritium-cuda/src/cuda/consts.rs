@@ -413,6 +413,8 @@ pub(super) const KERNEL_NAME_SALT_V2_EXACT: &str = "salt_v2_forward_exact";
 /// Prefill-oriented shared-activation SALT V2 kernel.
 pub(super) const KERNEL_NAME_SALT_V2_TILED: &str = "salt_v2_forward_tiled";
 /// Plan 0043 Stage 6: exact selected-row reconstruction for token embeddings.
+/// Warp-per-row SALT V2 forward: one warp owns an output, lanes own scale groups.
+pub(super) const KERNEL_NAME_SALT_V2_WARP: &str = "salt_v2_forward_warp";
 pub(super) const KERNEL_NAME_SALT_V2_GATHER: &str = "salt_v2_gather_rows";
 /// Destructive release-qualification kernel. Never used by model dispatch.
 #[cfg(feature = "device-loss-qualification")]
@@ -426,6 +428,12 @@ pub(super) const ACT_QUANT_THREADS: u32 = 256;
 pub(super) const THREADS_PER_BLOCK: u32 = 256;
 /// Threads per block for the shared-activation SALT V2 prefill kernel.
 pub(super) const SALT_V2_TILED_THREADS: u32 = 128;
+
+/// Shared-memory budget for the warp kernel's ordered contribution slots. 48 KiB
+/// is the per-block default; going past it needs an opt-in the launch avoids.
+pub(super) const SALT_V2_WARP_SHARED_BYTES: u32 = 48 * 1024;
+/// Most warps a warp-kernel block may carry (256 threads).
+pub(super) const SALT_V2_WARP_MAX_WARPS: u32 = 8;
 /// Warps per block for the tiled kernel — each warp computes one output column,
 /// so a block covers this many `N` at once (8 warps = 256 threads). ncu note
 /// (2026-07-07): the small decode GEMMs run at 0.42–0.62 waves / 44–48% DRAM —
