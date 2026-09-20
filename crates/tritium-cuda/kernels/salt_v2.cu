@@ -133,32 +133,10 @@ __device__ __forceinline__ float reduce_group_segment(
   const uint32_t limit = min(local_end, logical_len);
 
   if (codec == 1U) {  // B3: five little-endian radix-3 digits per byte.
-    // A 32-bit window over the payload, refreshed only when the byte being
-    // decoded leaves it. A lane walks its own group's bytes, so a warp's 32
-    // addresses are spread by the group stride -- roughly 410 bytes apart for a
-    // 64-coefficient group -- and ncu measured 3.5 of every 32-byte sector
-    // actually used. One aligned word covers four bytes, or twenty trits, so it
-    // cuts both the load count and the wasted sector traffic by four.
-    uint32_t window = 0U;
-    uint64_t window_base = UINT64_MAX;
     while (local < limit) {
       const uint32_t byte_index = local / 5U;
       if (byte_index >= plane_bytes) break;
-      const uint64_t byte_address = base + byte_index;
-      const uint64_t aligned = byte_address & ~static_cast<uint64_t>(3);
-      uint32_t code;
-      if (aligned + 4U <= payload_bytes) {
-        if (aligned != window_base) {
-          // `payload` comes from cudaMalloc and `aligned` is a multiple of four,
-          // so this load is naturally aligned.
-          window = *reinterpret_cast<const uint32_t*>(payload + aligned);
-          window_base = aligned;
-        }
-        code = (window >> ((byte_address & 3U) * 8U)) & 0xFFU;
-      } else {
-        // The final bytes of the payload, where a word would read past the end.
-        code = payload[byte_address];
-      }
+      const uint32_t code = payload[base + byte_index];
       // Recovering five radix-3 digits costs five constant divisions, roughly 33
       // instructions for five trits, and ncu puts this kernel at 75.8% SM
       // throughput -- it is instruction-bound, so that is the cost that matters.
