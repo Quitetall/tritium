@@ -36,12 +36,21 @@ __device__ __forceinline__ int decode_trit(
   }
 
   if (codec == 1) {  // B3: five little-endian radix-3 digits per byte.
-    constexpr unsigned char kPlace[5] = {1, 3, 9, 27, 81};
     const uint32_t byte_index = local_index / 5U;
     if (byte_index >= plane_bytes) return 0;
-    const unsigned char code = payload[base + byte_index];
-    const unsigned char digit = (code / kPlace[local_index % 5U]) % 3U;
-    return static_cast<int>(digit) - 1;
+    uint32_t value = payload[base + byte_index];
+    // Peel down to the requested digit with a CONSTANT divisor. The previous
+    // form indexed a `constexpr unsigned char kPlace[5]` with a runtime value,
+    // which nvcc cannot keep in registers: it materialized the table in LOCAL
+    // memory, and ncu measured those loads at 46.65% of every L1TEX sector this
+    // kernel requested (0.3 of 32 bytes per sector actually used). Dividing by
+    // the literal 3 instead compiles to a multiply-shift and touches no memory.
+    const uint32_t digit_index = local_index - byte_index * 5U;
+#pragma unroll
+    for (uint32_t skipped = 0; skipped < 4U; ++skipped) {
+      if (skipped < digit_index) value /= 3U;
+    }
+    return static_cast<int>(value % 3U) - 1;
   }
 
   // S34: one five-bit code per group of four. Low two bits choose the zero;
@@ -61,6 +70,100 @@ __device__ __forceinline__ int decode_trit(
   if (slot == zero_slot) return 0;
   const uint32_t sign_index = slot - (slot > zero_slot ? 1U : 0U);
   return (code & (1U << (2U + sign_index))) != 0U ? 1 : -1;
+}
+
+// Reduce one scale group's coefficients into a single accumulator.
+//
+// Produces bit-identical results to the `decode_trit`-per-coefficient loop this
+// replaces: coefficients are consumed in the same ascending `local` order, the
+// same `__fsub_rn`/`__fadd_rn` intrinsics run in the same sequence, and a zero
+// trit is skipped rather than added. The difference is purely how many loads it
+// takes to get there. The scalar form re-fetched the SAME payload byte once per
+// trit — five times per byte under B3, four under D2 — and ncu measured the
+// result at 1.1 useful bytes per 32-byte sector transmitted. Here the byte is
+// loaded once and its codes are unpacked in registers.
+//
+// `segment_activation` points at the coefficient `local_start` maps to, so the
+// activation index is the loop's own offset.
+__device__ __forceinline__ float reduce_group_segment(
+    const unsigned char* payload,
+    uint64_t payload_bytes,
+    uint64_t base,
+    uint32_t logical_len,
+    uint32_t plane_bytes,
+    const float* segment_activation,
+    uint32_t local_start,
+    uint32_t segment_len,
+    uint32_t codec) {
+  float accumulator = 0.0f;
+  // `decode_trit` returns 0 for every coefficient when the plane's bytes fall
+  // outside the payload, so the whole segment contributes nothing.
+  if (base + plane_bytes > payload_bytes) return accumulator;
+  const uint32_t local_end = local_start + segment_len;
+  uint32_t local = local_start;
+
+  if (codec == 1U) {  // B3: five little-endian radix-3 digits per byte.
+    while (local < local_end) {
+      const uint32_t byte_index = local / 5U;
+      // Both guards are monotone in `local` (byte_index never decreases), so a
+      // coefficient that decodes as zero here means every later one does too.
+      if (byte_index >= plane_bytes || local >= logical_len) break;
+      uint32_t value = payload[base + byte_index];
+      const uint32_t digit_index = local - byte_index * 5U;
+#pragma unroll
+      for (uint32_t skipped = 0; skipped < 4U; ++skipped) {
+        if (skipped < digit_index) value /= 3U;
+      }
+      const uint32_t run_end = min(local_end, (byte_index + 1U) * 5U);
+      for (; local < run_end; ++local) {
+        if (local >= logical_len) return accumulator;
+        const uint32_t digit = value % 3U;
+        value /= 3U;
+        const float activation_value = segment_activation[local - local_start];
+        if (digit == 0U) {
+          accumulator = __fsub_rn(accumulator, activation_value);
+        } else if (digit == 2U) {
+          accumulator = __fadd_rn(accumulator, activation_value);
+        }
+      }
+    }
+    return accumulator;
+  }
+
+  if (codec == 0U) {  // D2: four `trit + 1` codes per byte.
+    while (local < local_end) {
+      const uint32_t byte_index = local >> 2;
+      if (byte_index >= plane_bytes || local >= logical_len) break;
+      const uint32_t code = payload[base + byte_index];
+      const uint32_t run_end = min(local_end, (byte_index + 1U) << 2);
+      for (; local < run_end; ++local) {
+        if (local >= logical_len) return accumulator;
+        const uint32_t pair = (code >> ((local & 3U) * 2U)) & 3U;
+        const float activation_value = segment_activation[local - local_start];
+        // `decode_trit` maps 0 -> -1, 1 -> 0, 2 -> +1, 3 -> 0.
+        if (pair == 0U) {
+          accumulator = __fsub_rn(accumulator, activation_value);
+        } else if (pair == 2U) {
+          accumulator = __fadd_rn(accumulator, activation_value);
+        }
+      }
+    }
+    return accumulator;
+  }
+
+  // S34 keeps the shared scalar decoder: it already spans two bytes per code
+  // and is not the codec any shipped bundle uses.
+  for (; local < local_end; ++local) {
+    const int trit = decode_trit(payload, payload_bytes, base, logical_len,
+                                 plane_bytes, local, codec);
+    const float activation_value = segment_activation[local - local_start];
+    if (trit < 0) {
+      accumulator = __fsub_rn(accumulator, activation_value);
+    } else if (trit > 0) {
+      accumulator = __fadd_rn(accumulator, activation_value);
+    }
+  }
+  return accumulator;
 }
 
 __device__ __forceinline__ uint32_t plane_count_for_tile(
@@ -191,21 +294,11 @@ extern "C" __global__ void salt_v2_forward_exact(
                                   static_cast<uint64_t>(local_plane) * current_scale_count;
       const uint64_t scale_index = scale_base + group;
       if (scale_index >= scale_count) continue;
-      float group_accumulator = 0.0f;
-      for (uint64_t offset = 0; offset < segment_len; ++offset) {
-        const uint32_t local = local_start + static_cast<uint32_t>(offset);
-        const int trit = decode_trit(
-            payload, payload_bytes, payload_base, logical_len,
-            current_payload_bytes, local, codec);
-        const float activation_value =
-            activation[static_cast<uint64_t>(mi) * k +
-                       (coefficient - row_base) + offset];
-        if (trit < 0) {
-          group_accumulator = __fsub_rn(group_accumulator, activation_value);
-        } else if (trit > 0) {
-          group_accumulator = __fadd_rn(group_accumulator, activation_value);
-        }
-      }
+      const float group_accumulator = reduce_group_segment(
+          payload, payload_bytes, payload_base, logical_len,
+          current_payload_bytes,
+          activation + static_cast<uint64_t>(mi) * k + (coefficient - row_base),
+          local_start, static_cast<uint32_t>(segment_len), codec);
       const float contribution = __fmul_rn(
           group_accumulator, __half2float(scales[scale_index]));
       accumulator = __fadd_rn(accumulator, contribution);
@@ -303,18 +396,10 @@ extern "C" __global__ void salt_v2_forward_tiled(
                 static_cast<uint64_t>(local_plane) * current_scale_count;
             const uint64_t scale_index = scale_base + group;
             if (scale_index >= scale_count) continue;
-            float group_accumulator = 0.0f;
-            for (uint32_t offset = 0; offset < segment_len; ++offset) {
-              const uint32_t local = local_start + offset;
-              const int trit = decode_trit(
-                  payload, payload_bytes, payload_base, physical_len,
-                  current_payload_bytes, local, codec);
-              if (trit < 0) {
-                group_accumulator = __fsub_rn(group_accumulator, activation_tile[local]);
-              } else if (trit > 0) {
-                group_accumulator = __fadd_rn(group_accumulator, activation_tile[local]);
-              }
-            }
+            const float group_accumulator = reduce_group_segment(
+                payload, payload_bytes, payload_base, physical_len,
+                current_payload_bytes, activation_tile + local_start,
+                local_start, segment_len, codec);
             const float contribution = __fmul_rn(
                 group_accumulator, __half2float(scales[scale_index]));
             accumulator = __fadd_rn(accumulator, contribution);
