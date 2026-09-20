@@ -10,6 +10,7 @@ use tritium_format::salt_v2_package::{
 };
 
 mod salt_v2_reader_upload;
+pub(super) mod deltanet;
 mod salt_v2_runtime;
 pub use salt_v2_runtime::SaltV2GatherReceipt;
 
@@ -547,6 +548,9 @@ pub struct CudaBackend {
     pub(super) func_salt: CudaFunction,
     /// Direct SALT V2 codec PTX kept alive for `func_salt_v2_exact`.
     pub(super) _salt_v2_module: Arc<CudaModule>,
+    /// Gated DeltaNet recurrent-step PTX kept alive for `func_deltanet_step`.
+    pub(super) _deltanet_module: Arc<CudaModule>,
+    pub(super) func_deltanet_step: CudaFunction,
     /// Scalar-correct D2/B3/S34 forward. The first fast API aliases this handle.
     pub(super) func_salt_v2_exact: CudaFunction,
     /// Shared-activation D2/B3/S34 forward used for prefill-shaped launches.
@@ -1156,6 +1160,13 @@ impl CudaBackend {
             .load_function(KERNEL_NAME_QUALIFICATION_POISON)
             .map_err(|e| driver_err("resolve qualification context-poison kernel", &e))?;
 
+        let deltanet_module = ctx
+            .load_module(Ptx::from_src(QWEN35_DELTANET_PTX))
+            .map_err(|e| driver_err("load qwen35_deltanet ptx", &e))?;
+        let func_deltanet_step = deltanet_module
+            .load_function(KERNEL_NAME_DELTANET_STEP)
+            .map_err(|e| driver_err("resolve qwen35_deltanet_recurrent_step kernel", &e))?;
+
         let device_name = ctx
             .name()
             .unwrap_or_else(|_| "unknown CUDA device".to_owned());
@@ -1182,6 +1193,8 @@ impl CudaBackend {
             func_tiled_scaled,
             func_salt,
             _salt_v2_module: salt_v2_module,
+            _deltanet_module: deltanet_module,
+            func_deltanet_step,
             func_salt_v2_exact,
             func_salt_v2_tiled,
             func_salt_v2_warp,

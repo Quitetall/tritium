@@ -416,6 +416,8 @@ pub(super) const KERNEL_NAME_SALT_V2_TILED: &str = "salt_v2_forward_tiled";
 /// Warp-per-row SALT V2 forward: one warp owns an output, lanes own scale groups.
 pub(super) const KERNEL_NAME_SALT_V2_WARP: &str = "salt_v2_forward_warp";
 pub(super) const KERNEL_NAME_SALT_V2_GATHER: &str = "salt_v2_gather_rows";
+/// One Gated DeltaNet recurrent state update for every head of one token.
+pub(super) const KERNEL_NAME_DELTANET_STEP: &str = "qwen35_deltanet_recurrent_step";
 /// Destructive release-qualification kernel. Never used by model dispatch.
 #[cfg(feature = "device-loss-qualification")]
 pub(super) const KERNEL_NAME_QUALIFICATION_POISON: &str = "tritium_qualification_poison_context";
@@ -467,6 +469,9 @@ pub(super) const DECODE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/deco
 pub(super) const TRAIN_GRAD_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/train_grad.ptx"));
 /// Direct SALT V2 D2/B3/S34 kernel, compiled with FMA contraction disabled.
 pub(super) const SALT_V2_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/salt_v2.ptx"));
+/// Gated DeltaNet recurrent-step PTX.
+pub(super) const QWEN35_DELTANET_PTX: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/qwen35_deltanet.ptx"));
 
 /// Boolean env knob: unset/`0` = off, `1` = on; anything else warns loudly
 /// (once per read site invocation) and reads as OFF — presence-detection is

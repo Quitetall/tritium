@@ -256,6 +256,7 @@ mod backend;
 // but cuda::tests reaches them through `use super::*` via this glob.
 #[cfg_attr(not(test), allow(unused_imports))]
 use backend::*;
+pub use backend::deltanet::DeltaNetResidentState;
 pub use backend::{
     CudaBackend, SaltResidentLinear, SaltV2Forward, SaltV2ForwardMode, SaltV2ForwardReceipt,
     SaltV2GatherReceipt, SaltV2ResidentAllocationReceipt, SaltV2ResidentTensor,

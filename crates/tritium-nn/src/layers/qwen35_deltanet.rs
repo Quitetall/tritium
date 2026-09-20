@@ -177,6 +177,14 @@ pub struct Qwen35DeltaNetCache {
     conv_staging: Vec<f32>,
     recurrent_current: Vec<f32>,
     recurrent_staging: Vec<f32>,
+    /// The recurrence, resident on a CUDA device, when that path is in use.
+    ///
+    /// Allocated lazily on the first staged forward that sees a CUDA backend,
+    /// because the cache is constructed without one. While this is `Some`, the
+    /// device holds the authoritative state and the host `recurrent_*` buffers
+    /// are not maintained -- see [`Qwen35DeltaNetCache::recurrent_state`].
+    #[cfg(feature = "cuda")]
+    device: Option<tritium_cuda::DeltaNetResidentState>,
 }
 
 impl Qwen35DeltaNetCache {
@@ -241,9 +249,28 @@ impl Qwen35DeltaNetCache {
     }
 
     /// Committed fp32 recurrence, `[value_heads, key_head_dim, value_head_dim]`.
+    ///
+    /// Valid only while the host path owns the state. Under the device path this
+    /// buffer is not maintained, because keeping it current would mean copying
+    /// the whole state back per token, which is the cost that path exists to
+    /// remove. Check [`Self::is_device_resident`] before reading it.
     #[must_use]
     pub fn recurrent_state(&self) -> &[f32] {
         &self.recurrent_current
+    }
+
+    /// Whether the recurrence lives on a CUDA device rather than in
+    /// [`Self::recurrent_state`].
+    #[must_use]
+    pub fn is_device_resident(&self) -> bool {
+        #[cfg(feature = "cuda")]
+        {
+            self.device.is_some()
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            false
+        }
     }
 
     /// Start a fresh contiguous stream without freeing state allocations.
@@ -254,6 +281,13 @@ impl Qwen35DeltaNetCache {
         self.conv_staging.fill(0.0);
         self.recurrent_current.fill(0.0);
         self.recurrent_staging.fill(0.0);
+        // Releasing the device allocation is how the device path resets: this
+        // accessor holds no backend to issue a memset with, and the next staged
+        // forward reallocates zeroed.
+        #[cfg(feature = "cuda")]
+        {
+            self.device = None;
+        }
     }
 
     /// Pending committed length, used to preflight a whole-model transaction.
@@ -270,6 +304,10 @@ impl Qwen35DeltaNetCache {
         if let Some(staged_len) = self.staged_len.take() {
             std::mem::swap(&mut self.conv_current, &mut self.conv_staging);
             std::mem::swap(&mut self.recurrent_current, &mut self.recurrent_staging);
+            #[cfg(feature = "cuda")]
+            if let Some(device) = self.device.as_mut() {
+                device.commit();
+            }
             self.len = staged_len;
         }
     }
@@ -386,6 +424,8 @@ impl Qwen35DeltaNet {
                 self.spec.recurrent_state_len,
                 "staged recurrent state",
             )?,
+            #[cfg(feature = "cuda")]
+            device: None,
         })
     }
 
@@ -480,20 +520,36 @@ impl Qwen35DeltaNet {
             .forward(backend, normalized, sequence, &mut decay_logits)?;
 
         cache.conv_staging.copy_from_slice(&cache.conv_current);
-        cache
-            .recurrent_staging
-            .copy_from_slice(&cache.recurrent_current);
         self.depthwise_causal_conv(&raw_qkv, sequence, &mut cache.conv_staging, &mut convolved);
-        self.recurrent_forward(
+        #[cfg(feature = "cuda")]
+        let ran_on_device = self.recurrent_forward_cuda(
+            backend,
             &convolved,
             &z,
             &beta_logits,
             &decay_logits,
             sequence,
-            &mut cache.recurrent_staging,
+            cache,
             &mut core,
             &mut normalized_core,
-        );
+        )?;
+        #[cfg(not(feature = "cuda"))]
+        let ran_on_device = false;
+        if !ran_on_device {
+            cache
+                .recurrent_staging
+                .copy_from_slice(&cache.recurrent_current);
+            self.recurrent_forward(
+                &convolved,
+                &z,
+                &beta_logits,
+                &decay_logits,
+                sequence,
+                &mut cache.recurrent_staging,
+                &mut core,
+                &mut normalized_core,
+            );
+        }
         self.weights
             .out_proj
             .forward(backend, &normalized_core, sequence, &mut staged_output)?;
@@ -574,6 +630,145 @@ impl Qwen35DeltaNet {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Run the recurrence on a CUDA device when one is available and enabled.
+    ///
+    /// Returns `false` when the caller must fall back to
+    /// [`Self::recurrent_forward`]: a non-CUDA backend, the opt-in flag unset,
+    /// or a geometry the kernel does not accept.
+    ///
+    /// Every scalar that needs a transcendental is computed here, on the host,
+    /// and handed to the kernel already folded: `kk` and `qq` carry their L2
+    /// inverses (and the query scale), and `beta` and `decay` carry their
+    /// sigmoid and exponential. `expf` is not required to agree with
+    /// `f32::exp`, so leaving those on the host is what keeps the device state
+    /// bit-identical to the host reduction, which is only multiply and add.
+    ///
+    /// The gated RMSNorm tail stays on the host: it touches
+    /// `value_heads * value_head_dim` values per token, against the state's
+    /// `value_heads * key_head_dim * value_head_dim`.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    fn recurrent_forward_cuda(
+        &self,
+        backend: &dyn TernaryBackend,
+        convolved: &[f32],
+        z: &[f32],
+        beta_logits: &[f32],
+        decay_logits: &[f32],
+        sequence: usize,
+        cache: &mut Qwen35DeltaNetCache,
+        core: &mut [f32],
+        normalized_core: &mut [f32],
+    ) -> Result<bool, NnError> {
+        if !deltanet_cuda_enabled() {
+            return Ok(false);
+        }
+        let Some(cuda) = backend
+            .as_concrete()
+            .and_then(|concrete| concrete.downcast_ref::<tritium_cuda::CudaBackend>())
+        else {
+            return Ok(false);
+        };
+
+        let group_size = self.spec.num_value_heads / self.spec.num_key_heads;
+        let dk = self.spec.key_head_dim;
+        let dv = self.spec.value_head_dim;
+        if cache.device.is_none() {
+            match cuda.new_deltanet_state(self.spec.num_value_heads, dk, dv, group_size) {
+                Ok(state) => cache.device = Some(state),
+                // A geometry this kernel cannot serve is not an error; the host
+                // reduction handles every shape.
+                Err(_) => return Ok(false),
+            }
+        }
+        let device = cache
+            .device
+            .as_mut()
+            .expect("device state was just allocated");
+        cuda.deltanet_stage(device)
+            .map_err(|error| NnError::Backend(error.to_string()))?;
+
+        let query_scale = 1.0 / (dk as f32).sqrt();
+        let mut kk = zeroed_scratch(self.spec.key_width, "DeltaNet scaled key")?;
+        let mut qq = zeroed_scratch(self.spec.key_width, "DeltaNet scaled query")?;
+        let mut beta = zeroed_scratch(self.spec.num_value_heads, "DeltaNet beta")?;
+        let mut decay = zeroed_scratch(self.spec.num_value_heads, "DeltaNet decay")?;
+
+        for token in 0..sequence {
+            let qkv = &convolved[token * self.spec.conv_width..(token + 1) * self.spec.conv_width];
+            let query = &qkv[..self.spec.key_width];
+            let key = &qkv[self.spec.key_width..2 * self.spec.key_width];
+            let value = &qkv[2 * self.spec.key_width..];
+            let gate_base = token * self.spec.num_value_heads;
+            let value_base = token * self.spec.value_width;
+
+            // `q_inv` and `k_inv` depend only on the key head, so the host
+            // reduction's per-value-head recomputation is redundant, not
+            // different: heads of one group share the same vectors.
+            for key_head in 0..self.spec.num_key_heads {
+                let span = key_head * dk..(key_head + 1) * dk;
+                let q = &query[span.clone()];
+                let k = &key[span.clone()];
+                let q_inv = l2_inverse(q) * query_scale;
+                let k_inv = l2_inverse(k);
+                for lane in 0..dk {
+                    kk[key_head * dk + lane] = k[lane] * k_inv;
+                    qq[key_head * dk + lane] = q[lane] * q_inv;
+                }
+            }
+            for value_head in 0..self.spec.num_value_heads {
+                beta[value_head] = sigmoid(beta_logits[gate_base + value_head]);
+                let g = -self.weights.a_log[value_head].exp()
+                    * softplus(
+                        decay_logits[gate_base + value_head] + self.weights.dt_bias[value_head],
+                    );
+                decay[value_head] = g.exp();
+            }
+
+            cuda.deltanet_recurrent_step(
+                device,
+                &kk,
+                &qq,
+                value,
+                &beta,
+                &decay,
+                &mut core[value_base..value_base + self.spec.value_width],
+            )
+            .map_err(|error| NnError::Backend(error.to_string()))?;
+
+            self.gated_rms_norm(z, value_base, core, normalized_core);
+        }
+        Ok(true)
+    }
+
+    /// Per-head gated RMSNorm over one token's recurrent output.
+    fn gated_rms_norm(
+        &self,
+        z: &[f32],
+        value_base: usize,
+        core: &[f32],
+        normalized_core: &mut [f32],
+    ) {
+        let dv = self.spec.value_head_dim;
+        for value_head in 0..self.spec.num_value_heads {
+            let row_start = value_base + value_head * dv;
+            let row = &core[row_start..row_start + dv];
+            let mut variance = 0.0f32;
+            for &value in row {
+                variance += value * value;
+            }
+            variance /= dv as f32;
+            let inverse_rms = 1.0 / (variance + self.spec.rms_norm_eps()).sqrt();
+            for (value_lane, &row_value) in row.iter().enumerate() {
+                let lane = row_start + value_lane;
+                normalized_core[lane] = row_value
+                    * inverse_rms
+                    * self.weights.norm_weight[value_lane]
+                    * silu(z[lane]);
+            }
+        }
+    }
+
     fn recurrent_forward(
         &self,
         convolved: &[f32],
@@ -656,6 +851,25 @@ impl Qwen35DeltaNet {
                 }
             }
         }
+    }
+}
+
+/// Whether the opt-in device recurrence is enabled.
+///
+/// Opt-in while the host reduction remains the reference: a wrong answer here is
+/// silent, so the default stays on the path the golden vectors pin.
+#[cfg(feature = "cuda")]
+fn deltanet_cuda_enabled() -> bool {
+    match std::env::var("TRITIUM_DELTANET_CUDA") {
+        Ok(value) if value == "1" => true,
+        Ok(value) if value == "0" => false,
+        Ok(value) => {
+            eprintln!(
+                "tritium-nn: TRITIUM_DELTANET_CUDA={value:?} - use 1 or 0 (unset = 0); reading as 0"
+            );
+            false
+        }
+        Err(_) => false,
     }
 }
 

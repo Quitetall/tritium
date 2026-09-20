@@ -51,6 +51,9 @@ fn main() {
     println!("cargo:rerun-if-changed=kernels/train_grad.cu");
     // plan 0043 Stage 6: direct D2/B3/S34 SALT V2 scalar reference kernel.
     println!("cargo:rerun-if-changed=kernels/salt_v2.cu");
+    // The Gated DeltaNet recurrent step. Same `--fmad=false` host-bit-match
+    // discipline as the decode kernels: the host reduction is the reference.
+    println!("cargo:rerun-if-changed=kernels/qwen35_deltanet.cu");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
@@ -77,6 +80,7 @@ fn main() {
             "decode.ptx",
             "train_grad.ptx",
             "salt_v2.ptx",
+            "qwen35_deltanet.ptx",
         ] {
             std::fs::write(out_dir.join(ptx), "")
                 .expect("tritium-cuda: failed to write check-only placeholder PTX");
@@ -157,6 +161,17 @@ fn main() {
         &out_dir.join("salt_v2.ptx"),
         add_min_arch,
         salt_v2_flags,
+    );
+
+    // The Gated DeltaNet recurrent step, for the same reason: every scalar that
+    // needs a transcendental is computed host-side and passed in, so what runs
+    // here is multiply/add only and must round exactly as the host does.
+    compile_ptx(
+        &nvcc,
+        Path::new("kernels/qwen35_deltanet.cu"),
+        &out_dir.join("qwen35_deltanet.ptx"),
+        add_min_arch,
+        &["--fmad=false"],
     );
 }
 

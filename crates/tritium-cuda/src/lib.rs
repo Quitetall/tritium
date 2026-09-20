@@ -70,6 +70,10 @@ pub use cuda::TREE_BUCKETS;
 // building block a SALT decode forward composes per projection.
 #[cfg(feature = "cuda")]
 pub use cuda::SaltResidentLinear;
+// The Gated DeltaNet recurrence, resident on the device: 48 of Qwen3.6's 64
+// layers are linear attention, and its state update was the largest host cost in
+// a decode profile.
+pub use cuda::DeltaNetResidentState;
 
 // plan 0043 Stage 6: direct encoded D2/B3/S34 execution with explicit allocation
 // evidence. `FastAliasesExact` remains visible so callers cannot mistake the
