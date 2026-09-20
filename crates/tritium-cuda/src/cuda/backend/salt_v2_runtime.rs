@@ -31,7 +31,10 @@ pub(super) fn salt_v2_warp_dispatch(
     if slot_bytes == 0 {
         return None;
     }
-    let warps_per_block = (SALT_V2_WARP_SHARED_BYTES / slot_bytes).min(SALT_V2_WARP_MAX_WARPS);
+    // The B3 digit table is block-wide, so it comes out of the budget once
+    // rather than per warp.
+    let warp_budget = SALT_V2_WARP_SHARED_BYTES.checked_sub(SALT_V2_B3_TABLE_BYTES)?;
+    let warps_per_block = (warp_budget / slot_bytes).min(SALT_V2_WARP_MAX_WARPS);
     if warps_per_block == 0 {
         // One warp's slots alone exceed the shared-memory budget.
         return None;
@@ -395,7 +398,7 @@ impl CudaBackend {
                 total_outputs.div_ceil(warps_per_block),
                 1,
                 warps_per_block * 32,
-                warp_slot_bytes * warps_per_block,
+                SALT_V2_B3_TABLE_BYTES + warp_slot_bytes * warps_per_block,
             )
         } else if use_tiled {
             (
@@ -654,9 +657,12 @@ mod warp_dispatch_tests {
 
     #[test]
     fn a_row_too_wide_for_one_warps_slots_falls_back() {
-        // Slots are 3 floats per group; 48 KiB holds 4096 of them, so a row of
-        // more than 4096 groups (262144 columns at group 64) cannot be served.
-        assert!(salt_v2_warp_dispatch(4096 * 64, 64).is_some());
-        assert!(salt_v2_warp_dispatch(4097 * 64, 64).is_none());
+        // Slots are 3 floats per group, and the block-wide B3 digit table takes
+        // 512 B off the 48 KiB before any warp gets a share: 48640 / 12 = 4053
+        // groups. A width must also be a whole number of 256-coefficient tiles,
+        // which at group 64 means a multiple of 4 groups, so 4052 fits and the
+        // next admissible width, 4056, does not.
+        assert!(salt_v2_warp_dispatch(4052 * 64, 64).is_some());
+        assert!(salt_v2_warp_dispatch(4056 * 64, 64).is_none());
     }
 }

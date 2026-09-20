@@ -18,6 +18,11 @@ constexpr uint32_t kRankStrideTiles = 256;
 // tile carries at most three planes. The warp kernel reserves that many
 // ordered contribution slots per scale group.
 constexpr uint32_t kMaxPlanesPerTile = 3;
+// Every byte value, because the scalar decoder this table must match decodes
+// whatever byte it is handed, not only B3's 243 canonical codes.
+constexpr uint32_t kB3TableEntries = 256;
+// The table's footprint measured in the shared array's own element size.
+constexpr uint32_t kB3TableWords = kB3TableEntries * sizeof(unsigned short) / sizeof(float);
 
 __device__ __forceinline__ int decode_trit(
     const unsigned char* payload,
@@ -112,7 +117,8 @@ __device__ __forceinline__ float reduce_group_segment(
     const float* segment_activation,
     uint32_t local_start,
     uint32_t segment_len,
-    uint32_t codec) {
+    uint32_t codec,
+    const unsigned short* b3_digits) {
   float accumulator = 0.0f;
   // `decode_trit` returns 0 for every coefficient when the plane's bytes fall
   // outside the payload, so the whole segment contributes nothing.
@@ -131,15 +137,25 @@ __device__ __forceinline__ float reduce_group_segment(
       const uint32_t byte_index = local / 5U;
       if (byte_index >= plane_bytes) break;
       const uint32_t code = payload[base + byte_index];
-      // Five INDEPENDENT divisions by literals, which nvcc lowers to
-      // multiply-shift. The previous `value /= 3` walk made each digit depend on
-      // the one before it; ncu attributed 37.9% of this kernel's issue stalls to
-      // exactly that kind of fixed-latency execution dependency.
-      const uint32_t d0 = code % 3U;
-      const uint32_t d1 = (code / 3U) % 3U;
-      const uint32_t d2 = (code / 9U) % 3U;
-      const uint32_t d3 = (code / 27U) % 3U;
-      const uint32_t d4 = (code / 81U) % 3U;
+      // Recovering five radix-3 digits costs five constant divisions, roughly 33
+      // instructions for five trits, and ncu puts this kernel at 75.8% SM
+      // throughput -- it is instruction-bound, so that is the cost that matters.
+      // `b3_digits` is a 256-entry table holding all five digits of a byte at two
+      // bits each, built once per block in shared memory, which turns the whole
+      // group into one load and five shift/mask pairs. Callers without the table
+      // pass null and keep the divisions.
+      uint32_t packed;
+      if (b3_digits != nullptr) {
+        packed = b3_digits[code];
+      } else {
+        packed = (code % 3U) | (((code / 3U) % 3U) << 2U) | (((code / 9U) % 3U) << 4U) |
+                 (((code / 27U) % 3U) << 6U) | (((code / 81U) % 3U) << 8U);
+      }
+      const uint32_t d0 = packed & 3U;
+      const uint32_t d1 = (packed >> 2U) & 3U;
+      const uint32_t d2 = (packed >> 4U) & 3U;
+      const uint32_t d3 = (packed >> 6U) & 3U;
+      const uint32_t d4 = (packed >> 8U) & 3U;
       const uint32_t run_base = byte_index * 5U;
       const uint32_t run_end = min(limit, run_base + 5U);
       const float* run_activation = segment_activation + (local - local_start);
@@ -347,7 +363,7 @@ extern "C" __global__ void salt_v2_forward_exact(
           payload, payload_bytes, payload_base, logical_len,
           current_payload_bytes,
           activation + static_cast<uint64_t>(mi) * k + (coefficient - row_base),
-          local_start, static_cast<uint32_t>(segment_len), codec);
+          local_start, static_cast<uint32_t>(segment_len), codec, nullptr);
       const float contribution = __fmul_rn(
           group_accumulator, __half2float(scales[scale_index]));
       accumulator = __fadd_rn(accumulator, contribution);
@@ -448,7 +464,7 @@ extern "C" __global__ void salt_v2_forward_tiled(
             const float group_accumulator = reduce_group_segment(
                 payload, payload_bytes, payload_base, physical_len,
                 current_payload_bytes, activation_tile + local_start,
-                local_start, segment_len, codec);
+                local_start, segment_len, codec, nullptr);
             const float contribution = __fmul_rn(
                 group_accumulator, __half2float(scales[scale_index]));
             accumulator = __fadd_rn(accumulator, contribution);
@@ -511,14 +527,32 @@ extern "C" __global__ void salt_v2_forward_warp(
     uint32_t rank_prefix_count,
     uint32_t terminal_map_value,
     uint32_t groups_per_row) {
-  extern __shared__ float contribution_slots[];
+  extern __shared__ float salt_v2_warp_shared[];
 
   const uint32_t lane = threadIdx.x & 31U;
   const uint32_t warp_in_block = threadIdx.x >> 5U;
   const uint32_t warps_per_block = blockDim.x >> 5U;
   const uint32_t slots_per_row = groups_per_row * kMaxPlanesPerTile;
-  float* slots =
-      contribution_slots + static_cast<size_t>(warp_in_block) * slots_per_row;
+
+  // Block-wide B3 digit table, ahead of the per-warp contribution slots. Entry
+  // `c` holds all five radix-3 digits of byte `c` at two bits each, so decoding
+  // a byte becomes one shared load and five shift/mask pairs instead of five
+  // constant divisions -- roughly 33 instructions for five trits, on a kernel
+  // ncu measures at 75.8% SM throughput. Built for every byte value, not only
+  // B3's 243 canonical codes, because the scalar decoder this has to match
+  // applies `(c / 3^i) % 3` to whatever byte it is handed.
+  unsigned short* b3_digits = reinterpret_cast<unsigned short*>(salt_v2_warp_shared);
+  for (uint32_t code = threadIdx.x; code < kB3TableEntries; code += blockDim.x) {
+    b3_digits[code] = static_cast<unsigned short>(
+        (code % 3U) | (((code / 3U) % 3U) << 2U) | (((code / 9U) % 3U) << 4U) |
+        (((code / 27U) % 3U) << 6U) | (((code / 81U) % 3U) << 8U));
+  }
+  // Every warp in the block must reach this, including one whose output row is
+  // out of range, so the bounds check below cannot precede a block-wide barrier.
+  __syncthreads();
+
+  float* slots = salt_v2_warp_shared + kB3TableWords +
+                 static_cast<size_t>(warp_in_block) * slots_per_row;
 
   const uint64_t output_index =
       static_cast<uint64_t>(blockIdx.x) * warps_per_block + warp_in_block;
@@ -597,7 +631,7 @@ extern "C" __global__ void salt_v2_forward_warp(
       const float group_accumulator = reduce_group_segment(
           payload, payload_bytes, payload_base, logical_len,
           current_payload_bytes, row_activation + column, local_start,
-          static_cast<uint32_t>(segment_len), codec);
+          static_cast<uint32_t>(segment_len), codec, b3_digits);
       slots[unit * kMaxPlanesPerTile + local_plane] =
           __fmul_rn(group_accumulator, __half2float(scales[scale_index]));
     }

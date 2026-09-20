@@ -436,6 +436,9 @@ pub(super) const SALT_V2_TILED_THREADS: u32 = 128;
 pub(super) const SALT_V2_WARP_SHARED_BYTES: u32 = 48 * 1024;
 /// Most warps a warp-kernel block may carry (256 threads).
 pub(super) const SALT_V2_WARP_MAX_WARPS: u32 = 8;
+/// The warp kernel's block-wide B3 digit table: every byte value, five radix-3
+/// digits each at two bits, as `u16`.
+pub(super) const SALT_V2_B3_TABLE_BYTES: u32 = 256 * 2;
 /// Warps per block for the tiled kernel — each warp computes one output column,
 /// so a block covers this many `N` at once (8 warps = 256 threads). ncu note
 /// (2026-07-07): the small decode GEMMs run at 0.42–0.62 waves / 44–48% DRAM —
