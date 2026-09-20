@@ -10,9 +10,10 @@ use tritium_format::salt_v2_package::SALT_V2_ALLOCATION_TILE_SIZE;
 /// segments come out shorter than one group, which is the variable-stride walk
 /// the scalar kernel does. A zero or over-large scale group is rejected outright.
 ///
-/// Returns `(groups_per_row, warps_per_block, slot_bytes_per_warp)`. Slots are
-/// the ordered contribution buffer: three per group, because
-/// `plane_count_for_tile` yields at most three planes for a tile.
+/// Returns `(groups_per_row, warps_per_block, shared_bytes_per_warp)`. The
+/// shared block holds three ordered contribution slots per group -- because
+/// `plane_count_for_tile` yields at most three planes for a tile -- followed by
+/// the prepass's per-tile plane count and running plane offset.
 pub(super) fn salt_v2_warp_dispatch(
     columns: usize,
     scale_group_size: u32,
@@ -25,9 +26,13 @@ pub(super) fn salt_v2_warp_dispatch(
         return None;
     }
     let groups_per_row = u32::try_from(columns / group).ok()?;
+    let tiles_per_row = u32::try_from(columns / SALT_V2_ALLOCATION_TILE_SIZE).ok()?;
+    // Per warp: three ordered contribution slots per group, plus the prepass's
+    // per-tile plane count and running plane offset.
     let slot_bytes = groups_per_row
         .checked_mul(3)?
-        .checked_mul(core::mem::size_of::<f32>() as u32)?;
+        .checked_add(tiles_per_row.checked_mul(2)?)?
+        .checked_mul(core::mem::size_of::<u32>() as u32)?;
     if slot_bytes == 0 {
         return None;
     }
@@ -632,10 +637,11 @@ mod warp_dispatch_tests {
         // `tests/salt_v2_warp.rs` builds a 512-column, 64-group tensor. If this
         // shape were ineligible that file would silently be testing the scalar
         // kernel a second time and asserting nothing about the warp kernel.
-        let (groups, warps, slot_bytes) =
+        let (groups, warps, shared_bytes) =
             salt_v2_warp_dispatch(512, 64).expect("512 columns at group 64 must use the warp path");
         assert_eq!(groups, 8);
-        assert_eq!(slot_bytes, 8 * 3 * 4);
+        // 8 groups x 3 slots, plus 2 tiles x 2 prepass words.
+        assert_eq!(shared_bytes, (8 * 3 + 2 * 2) * 4);
         assert_eq!(warps, super::SALT_V2_WARP_MAX_WARPS);
     }
 
@@ -654,9 +660,12 @@ mod warp_dispatch_tests {
 
     #[test]
     fn a_row_too_wide_for_one_warps_slots_falls_back() {
-        // Slots are 3 floats per group; 48 KiB holds 4096 of them, so a row of
-        // more than 4096 groups (262144 columns at group 64) cannot be served.
-        assert!(salt_v2_warp_dispatch(4096 * 64, 64).is_some());
-        assert!(salt_v2_warp_dispatch(4097 * 64, 64).is_none());
+        // Per group: 3 contribution slots; per 256-column tile: 2 prepass words.
+        // At group 64 a row of g groups spans g / 4 tiles and so needs 3.5g
+        // words. 48 KiB is 12288 words, and g must be a multiple of 4 for the
+        // width to be a whole number of tiles at all, so 3508 fits (12278) and
+        // the next admissible width, 3512, does not (12292).
+        assert!(salt_v2_warp_dispatch(3508 * 64, 64).is_some());
+        assert!(salt_v2_warp_dispatch(3512 * 64, 64).is_none());
     }
 }
