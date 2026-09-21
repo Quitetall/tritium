@@ -415,6 +415,9 @@ pub(super) const KERNEL_NAME_SALT_V2_TILED: &str = "salt_v2_forward_tiled";
 /// Plan 0043 Stage 6: exact selected-row reconstruction for token embeddings.
 /// Warp-per-row SALT V2 forward: one warp owns an output, lanes own scale groups.
 pub(super) const KERNEL_NAME_SALT_V2_WARP: &str = "salt_v2_forward_warp";
+/// Warp-per-row SALT V2 forward with a shuffle tree-reduce instead of the
+/// exact kernel's ordered replay. Close, not bit-identical.
+pub(super) const KERNEL_NAME_SALT_V2_WARP_FAST: &str = "salt_v2_forward_warp_fast";
 pub(super) const KERNEL_NAME_SALT_V2_GATHER: &str = "salt_v2_gather_rows";
 /// One Gated DeltaNet recurrent state update for every head of one token.
 pub(super) const KERNEL_NAME_DELTANET_STEP: &str = "qwen35_deltanet_recurrent_step";

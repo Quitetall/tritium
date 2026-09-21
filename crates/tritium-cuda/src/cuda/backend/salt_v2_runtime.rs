@@ -272,6 +272,46 @@ impl CudaBackend {
         Ok(receipt)
     }
 
+    /// Execute the fast SALT V2 projection into caller-owned host memory.
+    ///
+    /// As [`Self::salt_v2_forward_exact_into`], but reduced by warp shuffle
+    /// rather than by replaying the scalar kernel's addition order, so results
+    /// are close to the CPU reference rather than equal to it. The returned
+    /// receipt names the kernel that actually ran: a shape the fast kernel
+    /// cannot serve answers with the exact image and says
+    /// [`SaltV2ForwardMode::FastAliasesExact`].
+    ///
+    /// # Errors
+    /// Returns the errors documented by [`Self::salt_v2_forward_exact_into`].
+    pub fn salt_v2_forward_fast_into(
+        &self,
+        tensor: &SaltV2ResidentTensor,
+        activation: &[f32],
+        m: usize,
+        output: &mut [f32],
+    ) -> Result<SaltV2ForwardReceipt, BackendError> {
+        let (receipt, output_elements) = self.salt_v2_forward_preflight(
+            tensor,
+            activation,
+            m,
+            Some(output.len()),
+            SaltV2ForwardMode::FastWarpReduce,
+        )?;
+        let staged =
+            self.salt_v2_forward_launch(tensor, activation, m, output_elements, receipt)?;
+        output.copy_from_slice(&staged);
+        Ok(receipt)
+    }
+
+    /// Whether the warp kernels can serve this tensor's geometry.
+    ///
+    /// Mirrors the launch's own choice, including the tiled opt-in, so the
+    /// receipt cannot claim a kernel the launch will not run.
+    fn salt_v2_warp_eligible(&self, tensor: &SaltV2ResidentTensor) -> bool {
+        let tiled = env_flag_on("TRITIUM_SALT_V2_TILED") && tensor.columns.is_multiple_of(256);
+        !tiled && salt_v2_warp_dispatch(tensor.columns, tensor.scale_group_size).is_some()
+    }
+
     pub(super) fn salt_v2_forward_preflight(
         &self,
         tensor: &SaltV2ResidentTensor,
@@ -312,8 +352,24 @@ impl CudaBackend {
                 got,
             });
         }
-        let receipt =
-            SaltV2ForwardReceipt::new(mode, tensor.receipt, activation_elements, output_elements)?;
+        // Label the receipt with the mode that will actually run. The fast kernel
+        // is a variant of the warp kernel, so it serves exactly the shapes the
+        // warp kernel serves; anything else answers with the exact image, and a
+        // receipt that claimed otherwise would be the only record a caller has.
+        let resolved = match mode {
+            SaltV2ForwardMode::FastWarpReduce
+                if !self.salt_v2_warp_eligible(tensor) =>
+            {
+                SaltV2ForwardMode::FastAliasesExact
+            }
+            other => other,
+        };
+        let receipt = SaltV2ForwardReceipt::new(
+            resolved,
+            tensor.receipt,
+            activation_elements,
+            output_elements,
+        )?;
         Ok((receipt, output_elements))
     }
 
@@ -392,13 +448,22 @@ impl CudaBackend {
             warp_dispatch.unwrap_or((0, 0, 0));
         let use_warp = !use_tiled && warps_per_block > 0;
         let warp_groups_u32 = warp_groups_per_row;
+        // The fast kernel is a variant of the warp kernel, so it serves exactly
+        // the shapes the warp kernel serves. Anything else keeps the exact
+        // image, and the receipt already says `FastAliasesExact` for that.
+        let use_fast = use_warp && receipt.mode() == SaltV2ForwardMode::FastWarpReduce;
 
         let (grid_x, grid_y, block_x, shared_mem_bytes) = if use_warp {
             (
                 total_outputs.div_ceil(warps_per_block),
                 1,
                 warps_per_block * 32,
-                SALT_V2_B3_TABLE_BYTES + warp_slot_bytes * warps_per_block,
+                // The fast kernel keeps no contribution slots; only the table.
+                if use_fast {
+                    SALT_V2_B3_TABLE_BYTES
+                } else {
+                    SALT_V2_B3_TABLE_BYTES + warp_slot_bytes * warps_per_block
+                },
             )
         } else if use_tiled {
             (
@@ -420,7 +485,9 @@ impl CudaBackend {
             block_dim: (block_x, 1, 1),
             shared_mem_bytes,
         };
-        let kernel = if use_warp {
+        let kernel = if use_fast {
+            &self.func_salt_v2_warp_fast
+        } else if use_warp {
             &self.func_salt_v2_warp
         } else if use_tiled {
             &self.func_salt_v2_tiled

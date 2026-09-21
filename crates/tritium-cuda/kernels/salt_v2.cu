@@ -655,6 +655,176 @@ extern "C" __global__ void salt_v2_forward_warp(
   }
 }
 
+// Fast SALT V2 forward: the warp kernel without the ordered replay.
+//
+// `salt_v2_forward_warp` reproduces the scalar kernel's addition order exactly,
+// and everything expensive about it is in service of that: three shared
+// contribution slots per group, a barrier, and a serial `__fadd_rn` chain on
+// lane 0 spanning the whole row. This variant drops all of it -- each lane
+// accumulates its own groups into a register and the warp finishes with a
+// shuffle tree-reduce.
+//
+// That reassociates the K-sum, so results are close but not bit-identical. It is
+// the same trade `salt_mpgemm_tiled_f32` already makes, and the reason
+// `SaltV2ForwardMode` distinguishes a fast entry point from the exact one: this
+// kernel is gated on relative error against the CPU reference, never equality.
+//
+// Dropping the slots also frees the shared memory they occupied. Only the B3
+// digit table remains, so a block no longer trades occupancy against row width
+// -- which for `down_proj` at K = 17408 was 26 KiB per block.
+extern "C" __global__ void salt_v2_forward_warp_fast(
+    const float* activation,
+    const unsigned char* payload,
+    const __half* scales,
+    const unsigned char* index_metadata,
+    float* output,
+    uint32_t m,
+    uint32_t n,
+    uint32_t k,
+    uint32_t codec,
+    uint32_t scale_group_size,
+    uint32_t tile_count,
+    uint32_t plane_count,
+    uint64_t payload_bytes,
+    uint64_t scale_count,
+    uint32_t allocation_map_bytes,
+    uint32_t rank_prefix_count,
+    uint32_t terminal_map_value,
+    uint32_t groups_per_row) {
+  extern __shared__ float salt_v2_warp_shared[];
+
+  const uint32_t lane = threadIdx.x & 31U;
+  const uint32_t warp_in_block = threadIdx.x >> 5U;
+  const uint32_t warps_per_block = blockDim.x >> 5U;
+  const uint32_t slots_per_row = groups_per_row * kMaxPlanesPerTile;
+
+  // Block-wide B3 digit table, ahead of the per-warp contribution slots. Entry
+  // `c` holds all five radix-3 digits of byte `c` at two bits each, so decoding
+  // a byte becomes one shared load and five shift/mask pairs instead of five
+  // constant divisions -- roughly 33 instructions for five trits, on a kernel
+  // ncu measures at 75.8% SM throughput. Built for every byte value, not only
+  // B3's 243 canonical codes, because the scalar decoder this has to match
+  // applies `(c / 3^i) % 3` to whatever byte it is handed.
+  unsigned short* b3_digits = reinterpret_cast<unsigned short*>(salt_v2_warp_shared);
+  for (uint32_t code = threadIdx.x; code < kB3TableEntries; code += blockDim.x) {
+    b3_digits[code] = static_cast<unsigned short>(
+        (code % 3U) | (((code / 3U) % 3U) << 2U) | (((code / 9U) % 3U) << 4U) |
+        (((code / 27U) % 3U) << 6U) | (((code / 81U) % 3U) << 8U));
+  }
+  // Every warp in the block must reach this, including one whose output row is
+  // out of range, so the bounds check below cannot precede a block-wide barrier.
+  __syncthreads();
+
+
+  const uint64_t output_index =
+      static_cast<uint64_t>(blockIdx.x) * warps_per_block + warp_in_block;
+  const uint64_t output_count = static_cast<uint64_t>(m) * n;
+  // Warp-uniform: every lane of a warp shares `output_index`.
+  if (output_index >= output_count) return;
+
+  const uint32_t mi = static_cast<uint32_t>(output_index / n);
+  const uint32_t row = static_cast<uint32_t>(output_index % n);
+  const uint64_t row_base = static_cast<uint64_t>(row) * k;
+  const uint64_t row_end = row_base + k;
+  const uint64_t total_coefficients = static_cast<uint64_t>(n) * k;
+  const float* row_activation = activation + static_cast<uint64_t>(mi) * k;
+
+  float lane_accumulator = 0.0f;
+
+  const uint32_t full_payload_bytes = plane_payload_bytes(codec, kAllocationTile);
+  const uint32_t full_scale_count =
+      (kAllocationTile + scale_group_size - 1U) / scale_group_size;
+
+  uint32_t break_unit = groups_per_row;
+  for (uint32_t unit = lane; unit < groups_per_row; unit += 32U) {
+    const uint32_t column = unit * scale_group_size;
+    const uint64_t coefficient = row_base + column;
+    const uint32_t tile = static_cast<uint32_t>(coefficient / kAllocationTile);
+    if (column >= k || tile >= tile_count) { break_unit = unit; break; }
+
+    const uint32_t rank_block = tile / kRankStrideTiles;
+    uint32_t begin = 0U;
+    if (rank_block != 0U) {
+      const uint32_t prefix_index = rank_block - 1U;
+      if (prefix_index >= rank_prefix_count) { break_unit = unit; break; }
+      begin = read_rank_prefix(index_metadata, allocation_map_bytes, prefix_index);
+    }
+    const uint32_t scan_start = rank_block * kRankStrideTiles;
+    for (uint32_t prior = scan_start; prior < tile; ++prior) {
+      begin += plane_count_for_tile(
+          index_metadata, allocation_map_bytes, terminal_map_value, prior);
+    }
+    const uint32_t planes = plane_count_for_tile(
+        index_metadata, allocation_map_bytes, terminal_map_value, tile);
+    const uint32_t end = begin + planes;
+    if (planes == 0U || end > plane_count) { break_unit = unit; break; }
+
+    const uint64_t tile_base = static_cast<uint64_t>(tile) * kAllocationTile;
+    if (tile_base >= total_coefficients) { break_unit = unit; break; }
+    const uint32_t logical_len = static_cast<uint32_t>(
+        min(static_cast<uint64_t>(kAllocationTile), total_coefficients - tile_base));
+
+    const uint32_t local_start =
+        static_cast<uint32_t>(coefficient % kAllocationTile);
+    const uint32_t group = local_start / scale_group_size;
+    const uint32_t group_end = min((group + 1U) * scale_group_size, logical_len);
+    if (local_start >= group_end) { break_unit = unit; break; }
+    const uint64_t segment_len =
+        min(static_cast<uint64_t>(group_end - local_start), row_end - coefficient);
+
+    const uint32_t current_payload_bytes = plane_payload_bytes(codec, logical_len);
+    const uint32_t current_scale_count =
+        (logical_len + scale_group_size - 1U) / scale_group_size;
+
+    for (uint32_t plane = begin; plane < end; ++plane) {
+      const uint32_t local_plane = plane - begin;
+      const uint64_t payload_base =
+          static_cast<uint64_t>(begin) * full_payload_bytes +
+          static_cast<uint64_t>(local_plane) * current_payload_bytes;
+      const uint64_t scale_base =
+          static_cast<uint64_t>(begin) * full_scale_count +
+          static_cast<uint64_t>(local_plane) * current_scale_count;
+      const uint64_t scale_index = scale_base + group;
+      // The scalar kernel skips this plane and keeps going; the slot stays +0.0f.
+      if (scale_index >= scale_count) continue;
+      const float group_accumulator = reduce_group_segment(
+          payload, payload_bytes, payload_base, logical_len,
+          current_payload_bytes, row_activation + column, local_start,
+          static_cast<uint32_t>(segment_len), codec, b3_digits);
+      lane_accumulator = __fadd_rn(
+          lane_accumulator,
+          __fmul_rn(group_accumulator, __half2float(scales[scale_index])));
+    }
+  }
+
+  // Earliest breaking unit across the warp: the scalar kernel would have
+  // abandoned the row there, so nothing at or beyond it may contribute.
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    break_unit = min(break_unit, __shfl_xor_sync(0xffffffffU, break_unit, offset));
+  }
+  if (break_unit != groups_per_row) {
+    // The scalar kernel abandons the rest of a row here, and every condition
+    // that reaches it is malformed metadata. Reconstructing which lanes'
+    // partials survive that truncation would cost more than the reduction this
+    // kernel exists to avoid, so fast mode refuses the row instead: the host
+    // rejects any non-finite output, so this fails the call rather than
+    // silently answering differently from the exact kernel.
+    if (lane == 0U) {
+      output[output_index] = __int_as_float(0x7FC00000);
+    }
+    return;
+  }
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    lane_accumulator =
+        __fadd_rn(lane_accumulator, __shfl_down_sync(0xFFFFFFFFU, lane_accumulator, offset));
+  }
+  if (lane == 0U) {
+    output[output_index] = lane_accumulator;
+  }
+}
+
 // Reconstruct selected semantic matrix rows directly from the resident codec
 // payload. `rows` may repeat and its order is preserved, which makes this the
 // token-embedding primitive for a `[vocab, hidden]` SALT V2 tensor.

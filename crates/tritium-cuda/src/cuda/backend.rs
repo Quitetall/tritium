@@ -311,7 +311,14 @@ pub enum SaltV2ForwardMode {
     /// Scalar deterministic kernel with CPU-reference reduction order.
     Exact,
     /// Public fast entry point currently dispatching the exact kernel unchanged.
+    ///
+    /// Retained for shapes the fast kernel cannot serve, where the fast entry
+    /// point still answers with the exact image and must say so.
     FastAliasesExact,
+    /// Warp-per-row forward reduced by shuffle instead of the exact kernel's
+    /// ordered replay. Reassociates the K-sum, so results are close to the CPU
+    /// reference rather than equal to it.
+    FastWarpReduce,
 }
 
 /// Checked requested-`CudaSlice` ledger for one SALT V2 forward.
@@ -557,6 +564,8 @@ pub struct CudaBackend {
     pub(super) func_salt_v2_tiled: CudaFunction,
     /// Warp-per-row SALT V2 forward (`KERNEL_NAME_SALT_V2_WARP`).
     pub(super) func_salt_v2_warp: CudaFunction,
+    /// Tolerance-gated warp forward (`KERNEL_NAME_SALT_V2_WARP_FAST`).
+    pub(super) func_salt_v2_warp_fast: CudaFunction,
     /// Exact selected-row reconstruction for SALT V2 token embeddings.
     pub(super) func_salt_v2_gather: CudaFunction,
     /// Device trap used only by destructive release qualification.
@@ -1152,6 +1161,9 @@ impl CudaBackend {
         let func_salt_v2_warp = salt_v2_module
             .load_function(KERNEL_NAME_SALT_V2_WARP)
             .map_err(|error| driver_err("load SALT V2 warp forward kernel", &error))?;
+        let func_salt_v2_warp_fast = salt_v2_module
+            .load_function(KERNEL_NAME_SALT_V2_WARP_FAST)
+            .map_err(|error| driver_err("load SALT V2 fast warp forward kernel", &error))?;
         let func_salt_v2_gather = salt_v2_module
             .load_function(KERNEL_NAME_SALT_V2_GATHER)
             .map_err(|e| driver_err("resolve salt_v2_gather_rows kernel", &e))?;
@@ -1198,6 +1210,7 @@ impl CudaBackend {
             func_salt_v2_exact,
             func_salt_v2_tiled,
             func_salt_v2_warp,
+            func_salt_v2_warp_fast,
             func_salt_v2_gather,
             #[cfg(feature = "device-loss-qualification")]
             func_qualification_poison,
@@ -7889,9 +7902,14 @@ impl CudaBackend {
 
     /// Execute the SALT V2 fast entry point.
     ///
-    /// This correctness-first implementation deliberately aliases
-    /// [`Self::salt_v2_forward_exact`]. The returned receipt is labeled
-    /// [`SaltV2ForwardMode::FastAliasesExact`]; no performance claim is implied.
+    /// Where the shape allows it this runs `salt_v2_forward_warp_fast`, which
+    /// reduces by warp shuffle instead of replaying the scalar kernel's addition
+    /// order, and the receipt is labeled [`SaltV2ForwardMode::FastWarpReduce`].
+    /// Results are then close to the CPU reference rather than equal to it.
+    ///
+    /// Shapes the fast kernel cannot serve fall back to the exact image and are
+    /// labeled [`SaltV2ForwardMode::FastAliasesExact`], so a caller can always
+    /// tell from the receipt which one answered.
     ///
     /// # Errors
     /// Returns the errors documented by [`Self::salt_v2_forward_exact`].
@@ -7901,7 +7919,7 @@ impl CudaBackend {
         activation: &[f32],
         m: usize,
     ) -> Result<SaltV2Forward, BackendError> {
-        self.salt_v2_forward_impl(tensor, activation, m, SaltV2ForwardMode::FastAliasesExact)
+        self.salt_v2_forward_impl(tensor, activation, m, SaltV2ForwardMode::FastWarpReduce)
     }
 
     fn salt_v2_forward_impl(

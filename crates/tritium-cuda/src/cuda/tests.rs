@@ -496,10 +496,33 @@ fn salt_v2_cuda_matches_cpu_and_dense_without_dense_weight_storage() {
                     "exact[{index}] {codec:?} {rows}x{columns}: GPU {got} vs dense {dense_want}"
                 );
             }
-            assert_eq!(fast.output, exact.output);
             assert_eq!(streamed_exact.output, exact.output);
             assert_eq!(exact.receipt.mode(), SaltV2ForwardMode::Exact);
-            assert_eq!(fast.receipt.mode(), SaltV2ForwardMode::FastAliasesExact);
+            // The fast entry point is no longer an alias where the warp kernels
+            // can serve the shape: it reduces by shuffle, which reassociates the
+            // K-sum. Assert against whichever kernel the receipt says ran, so
+            // this covers both without assuming which shapes are eligible.
+            match fast.receipt.mode() {
+                SaltV2ForwardMode::FastWarpReduce => {
+                    let scale = exact
+                        .output
+                        .iter()
+                        .fold(0.0f32, |peak, value| peak.max(value.abs()))
+                        .max(f32::MIN_POSITIVE);
+                    for (index, (got, want)) in
+                        fast.output.iter().zip(&exact.output).enumerate()
+                    {
+                        assert!(
+                            (got - want).abs() / scale <= 1e-5,
+                            "fast[{index}] {codec:?} {rows}x{columns}: {got} vs exact {want}"
+                        );
+                    }
+                }
+                SaltV2ForwardMode::FastAliasesExact => {
+                    assert_eq!(fast.output, exact.output);
+                }
+                other => panic!("unexpected fast mode {other:?}"),
+            }
 
             let allocation = resident.allocation_receipt();
             assert_eq!(streamed.allocation_receipt(), allocation);

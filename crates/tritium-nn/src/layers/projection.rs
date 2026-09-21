@@ -205,6 +205,22 @@ impl Projection {
     }
 }
 
+/// Whether the tolerance-gated SALT V2 forward is enabled.
+#[cfg(feature = "cuda")]
+fn salt_v2_fast_enabled() -> bool {
+    match std::env::var("TRITIUM_SALT_V2_FAST") {
+        Ok(value) if value == "1" => true,
+        Ok(value) if value == "0" => false,
+        Ok(value) => {
+            eprintln!(
+                "tritium-nn: TRITIUM_SALT_V2_FAST={value:?} - use 1 or 0 (unset = 0); reading as 0"
+            );
+            false
+        }
+        Err(_) => false,
+    }
+}
+
 #[cfg(feature = "cuda")]
 pub(crate) fn salt_v2_cuda_backend(
     backend: &dyn TernaryBackend,
@@ -228,7 +244,17 @@ pub(crate) fn salt_v2_forward_exact(
     out: &mut [f32],
 ) -> Result<(), NnError> {
     let cuda = salt_v2_cuda_backend(backend)?;
-    match cuda.salt_v2_forward_exact_into(tensor, act, m, out) {
+    // `TRITIUM_SALT_V2_FAST=1` reduces each row by warp shuffle instead of
+    // replaying the scalar kernel's addition order. That reassociates the K-sum,
+    // so it is opt-in: the exact kernel stays the default while the fast one's
+    // effect on model output is being measured, and it is gated on relative
+    // error against the CPU reference rather than equality.
+    let result = if salt_v2_fast_enabled() {
+        cuda.salt_v2_forward_fast_into(tensor, act, m, out)
+    } else {
+        cuda.salt_v2_forward_exact_into(tensor, act, m, out)
+    };
+    match result {
         Ok(_receipt) => Ok(()),
         Err(tritium_spec::BackendError::ShapeMismatch { expected, got }) => {
             Err(NnError::Shape { expected, got })
