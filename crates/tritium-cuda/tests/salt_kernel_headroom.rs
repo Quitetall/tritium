@@ -9,8 +9,8 @@
 //! Before designing a conversion, measure whether it is actually worth one. This
 //! times both at a real Qwen3.6-27B projection shape, matched on N, K and plane
 //! count, so the comparison is cost at equal work. It is not a numeric
-//! comparison: TQ2_0 scales per 256-trit block and SALT V2 per 64, so the two
-//! represent different weights on purpose.
+//! comparison: TQ2_0 scales per 256-trit block and this probe's SALT V2 tensor
+//! per 64, so the two represent different weights on purpose.
 //!
 //! Measured on a 4090, N = 17408, K = 5120, m = 1 (gate_proj / up_proj):
 //!
@@ -20,16 +20,20 @@
 //!
 //! Two things block using it as-is, and both are real work rather than wiring:
 //!
-//! 1. Scale granularity. TQ2_0 carries one f16 per 256-trit block; the Qwen
-//!    bundle scales per 64. Converting would change the model's numerics, so a
-//!    faithful swap needs a 64-block resident format, not a repack.
-//! 2. `TILED_K_MAX` is 8192, and `down_proj` has K = 17408. That is a third of
-//!    the MLP weight, excluded until the tile bound is lifted.
+//! 1. Scale granularity. TQ2_0 carries one f16 per 256-trit block. The shipped
+//!    Qwen3.6 bundle scales per 128, uniformly across all 506 tensors
+//!    (`tritium-format`'s `qwen36_bundle_survey`), so a repack would halve the
+//!    scale resolution and change the model's numerics. A faithful swap needs a
+//!    128-block resident format, not a repack.
+//! 2. `TILED_K_MAX` is 8192. 66 of the bundle's 506 tensors exceed it,
+//!    `down_proj` among them at K = 17408.
 //!
-//! `SaltResidentLinear` also pads ragged rows to a uniform plane count, so a
-//! tensor with any three-plane tile costs three planes everywhere -- at TQ2_0's
-//! ~2.06 bits per trit per plane that is a VRAM question the conversion has to
-//! answer before it is worth doing.
+//! 3. `SaltResidentLinear` pads ragged rows to a uniform plane count. The bundle
+//!    averages 1.281 planes per tile, which is 8.40 GiB in TQ2_0 at that
+//!    density against the 7.17 GiB it occupies now -- but 19.68 GiB if every
+//!    tensor pads to three. Where it lands between those depends on how many
+//!    tensors carry a single three-plane tile, and that decides whether this
+//!    fits on a 24 GB card at all.
 #![cfg(feature = "cuda")]
 
 use std::time::Instant;
