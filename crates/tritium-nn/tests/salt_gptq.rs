@@ -76,6 +76,29 @@ const EVAL_WINDOW: usize = 512;
 /// not. Those tables predate the split below: the fold now reads its own
 /// `TRITIUM_GPTQ_FOLD_WINDOWS`, pinned at 32 by default, so sweeping the Gram no longer moves the
 /// fold and the folded `plain` baseline is identical in every arm.
+///
+/// **Error-decayed propagation (ADR 0043 L-B), fold pinned at 32 windows.** GPTQ's change against
+/// the plain fit, by Gram size and decay `λ` on the propagated error:
+///
+/// ```text
+///                       T=2                          T=3
+/// tokens    λ=1    0.9    0.75    0.5     λ=1    0.9    0.75    0.5
+///  2,048   +4.6   -0.4   -5.6   -7.4     +2.1   +1.2   -0.2   -2.6     constant
+///  4,096   -2.5   -5.2   -8.6   -9.8     -1.2   -1.8   -3.1   -3.6     constant
+///  4,096          -3.6   -5.5   -7.4            -1.4   -2.2   -2.4     ramp
+/// 16,384  -13.1  -13.7  -13.8  -11.0     -4.3   -4.7   -5.1   -4.8     constant
+/// 16,384         -14.2  -14.5  -13.6            -4.6   -4.8   -5.3     ramp
+/// ```
+///
+/// Decay pays everywhere and pays most where the Gram is starved: at 2,048 tokens it turns a
+/// harmful GPTQ into a helpful one, and `λ = 0.5` there beats undecayed GPTQ on twice the tokens.
+/// The best `λ` falls as tokens fall (0.75 at 16k, 0.5 or lower at 4k and 2k), so a fixed `λ` is
+/// the wrong object and a schedule in tokens-per-dimension is the natural next step. The ramp
+/// shape wins at 16k and loses at 4k; its mean decay is milder than the constant's at equal `λ`, so
+/// that comparison does not yet separate *where* the decay lands from *how much* there is.
+///
+/// With the fold pinned, the folded sign flip is the Gram's alone and crosses between 2,048 and
+/// 4,096 tokens. The ~8k crossing in the folded table above was partly the under-calibrated fold.
 const DEFAULT_CALIB_WINDOWS: usize = 32;
 const DEFAULT_FOLD_WINDOWS: usize = 32;
 
