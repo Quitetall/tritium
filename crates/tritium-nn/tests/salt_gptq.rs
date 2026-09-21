@@ -73,14 +73,29 @@ const EVAL_WINDOW: usize = 512;
 /// Gram, so this knob moves both at once and the folded `plain` baseline drifts between arms
 /// (T=3: 31.822, 31.501, 31.686, 32.361, 32.155 — unordered). Each delta compares plain against
 /// GPTQ at an identical fold and is sound; cross-arm comparisons of absolute folded perplexity are
-/// not. Separating the two knobs is unfinished work.
+/// not. Those tables predate the split below: the fold now reads its own
+/// `TRITIUM_GPTQ_FOLD_WINDOWS`, pinned at 32 by default, so sweeping the Gram no longer moves the
+/// fold and the folded `plain` baseline is identical in every arm.
 const DEFAULT_CALIB_WINDOWS: usize = 32;
+const DEFAULT_FOLD_WINDOWS: usize = 32;
 
 fn calib_windows(train_len: usize) -> usize {
-    let requested = std::env::var("TRITIUM_GPTQ_CALIB_WINDOWS")
+    windows_from_env(
+        "TRITIUM_GPTQ_CALIB_WINDOWS",
+        DEFAULT_CALIB_WINDOWS,
+        train_len,
+    )
+}
+
+fn fold_windows(train_len: usize) -> usize {
+    windows_from_env("TRITIUM_GPTQ_FOLD_WINDOWS", DEFAULT_FOLD_WINDOWS, train_len)
+}
+
+fn windows_from_env(name: &str, default: usize, train_len: usize) -> usize {
+    let requested = std::env::var(name)
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(DEFAULT_CALIB_WINDOWS)
+        .unwrap_or(default)
         .max(1);
     let available = train_len / CALIB_SEQ;
     assert!(
@@ -131,7 +146,21 @@ fn plain(w: &[f32], rows: usize, cols: usize, t: usize) -> Vec<f32> {
 /// Column groups are exactly `GROUP` wide so each feedback block is one scale group per row — the
 /// identical partition the plain fitter uses, which keeps this an ablation of the FEEDBACK rather
 /// than of the grouping.
-fn gptq(w: &[f32], rows: usize, cols: usize, t: usize, h_inv: &[f64]) -> Option<Vec<f32>> {
+///
+/// `decay` scales the rounding error each group hands to the columns after it (ADR 0043 L-B, after
+/// QTEA). The library propagates `working − returned`, so the callback reports
+/// `working − λ·(working − fit)` and keeps the true fit aside; `λ = 1` is plain GPTQ bit for bit.
+/// Under [`DecayShape::Ramp`] early groups propagate in full and `λ` is reached only at the last
+/// group, which is where a short remaining suffix has to absorb everything pushed into it.
+fn gptq(
+    w: &[f32],
+    rows: usize,
+    cols: usize,
+    t: usize,
+    h_inv: &[f64],
+    decay: f64,
+    shape: DecayShape,
+) -> Option<Vec<f32>> {
     let weights: Vec<f64> = w.iter().map(|&v| f64::from(v)).collect();
     let groups: Vec<ColumnGroup> = (0..cols.div_ceil(GROUP))
         .map(|g| ColumnGroup {
@@ -146,7 +175,9 @@ fn gptq(w: &[f32], rows: usize, cols: usize, t: usize, h_inv: &[f64]) -> Option<
         groups: &groups,
         metric: FeedbackMetric::InverseHessian(h_inv),
     };
-    let state = fit_with_feedback(problem, |req: tritium_quantize::GroupFitRequest<'_>| {
+    let group_count = groups.len();
+    let mut shipped = vec![0.0f32; rows * cols];
+    fit_with_feedback(problem, |req: tritium_quantize::GroupFitRequest<'_>| {
         // The block arrives feedback-adjusted: earlier groups' rounding error has already been
         // pushed into it. Quantize it exactly as the plain fitter would.
         let block: Vec<f32> = req.working_weights.iter().map(|&v| v as f32).collect();
@@ -159,10 +190,65 @@ fn gptq(w: &[f32], rows: usize, cols: usize, t: usize, h_inv: &[f64]) -> Option<
             ITERS,
             RotationPolicy::Auto,
         );
-        Ok::<Vec<f64>, std::convert::Infallible>(fit.into_iter().map(f64::from).collect())
+        for row in 0..req.rows {
+            let from = row * req.columns;
+            let to = row * cols + req.column_start;
+            shipped[to..to + req.columns].copy_from_slice(&fit[from..from + req.columns]);
+        }
+        let lambda = match shape {
+            DecayShape::Constant => decay,
+            DecayShape::Ramp if group_count > 1 => {
+                1.0 - (1.0 - decay) * req.group_index as f64 / (group_count - 1) as f64
+            }
+            DecayShape::Ramp => decay,
+        };
+        Ok::<Vec<f64>, std::convert::Infallible>(
+            req.working_weights
+                .iter()
+                .zip(&fit)
+                .map(|(&working, &got)| working - lambda * (working - f64::from(got)))
+                .collect(),
+        )
     })
     .ok()?;
-    Some(state.reconstruction().iter().map(|&v| v as f32).collect())
+    Some(shipped)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum DecayShape {
+    Constant,
+    Ramp,
+}
+
+/// `TRITIUM_GPTQ_DECAYS=1.0,0.75,0.5` and `TRITIUM_GPTQ_DECAY_SHAPE=const|ramp`. Every listed decay
+/// reuses the one set of Grams, so a sweep costs one collection rather than one per arm.
+fn decay_arms() -> (Vec<f64>, DecayShape) {
+    let decays = std::env::var("TRITIUM_GPTQ_DECAYS")
+        .ok()
+        .map(|list| {
+            list.split(',')
+                .filter_map(|value| value.trim().parse::<f64>().ok())
+                .collect::<Vec<_>>()
+        })
+        .filter(|list| !list.is_empty())
+        .unwrap_or_else(|| vec![1.0]);
+    let shape = match std::env::var("TRITIUM_GPTQ_DECAY_SHAPE").as_deref() {
+        Ok("ramp") => DecayShape::Ramp,
+        _ => DecayShape::Constant,
+    };
+    (decays, shape)
+}
+
+fn planes_under_test() -> Vec<usize> {
+    std::env::var("TRITIUM_GPTQ_PLANES")
+        .ok()
+        .map(|list| {
+            list.split(',')
+                .filter_map(|value| value.trim().parse::<usize>().ok())
+                .collect::<Vec<_>>()
+        })
+        .filter(|list| !list.is_empty())
+        .unwrap_or_else(|| vec![1, 2, 3])
 }
 
 /// Does sequential compensation against real curvature beat the plain fitter on held-out ppl?
@@ -195,7 +281,8 @@ fn gptq_feedback_against_real_curvature() {
         None => (arch, fp),
         Some(alpha) => {
             let mut calib = Calib::new(&arch);
-            for w in 0..calib_windows {
+            let fold_windows = fold_windows(train.len());
+            for w in 0..fold_windows {
                 calibrate(
                     &fp,
                     &arch,
@@ -204,7 +291,7 @@ fn gptq_feedback_against_real_curvature() {
                 );
             }
             let (folded, farch) = fold(&fp, &shapes, &arch, &calib, alpha);
-            println!("salience fold applied first: alpha={alpha}");
+            println!("salience fold applied first: alpha={alpha}, {fold_windows} windows");
             (farch, folded)
         }
     };
@@ -255,7 +342,8 @@ fn gptq_feedback_against_real_curvature() {
         "configuration", "bpw", "ppl", "× fp"
     );
     println!("{}", "-".repeat(58));
-    for t in [1usize, 2, 3] {
+    let (decays, shape) = decay_arms();
+    for t in planes_under_test() {
         let bpw = ste::ternary_bits_per_weight(t, GROUP) + 1.0 / GROUP as f64;
 
         let base: Vec<Vec<f32>> = fp
@@ -271,33 +359,39 @@ fn gptq_feedback_against_real_curvature() {
         );
 
         // Same weights, but the six tapped projections go through GPTQ feedback.
-        let mut fed = base.clone();
-        for li in 0..n_layers {
-            let b = 1 + 7 * li;
-            let jobs: [(usize, &Option<Vec<f64>>); 6] = [
-                (b, &attn_inv[li]),
-                (b + 1, &attn_inv[li]),
-                (b + 2, &attn_inv[li]),
-                (b + 4, &ffn_inv[li]),
-                (b + 5, &ffn_inv[li]),
-                (b + 6, &down_inv[li]),
-            ];
-            for (idx, h_inv) in jobs {
-                if let Some(h) = h_inv {
-                    let (n, k) = shapes[idx];
-                    if let Some(q) = gptq(&fp[idx], n, k, t, h) {
-                        fed[idx] = q;
+        for &decay in &decays {
+            let mut fed = base.clone();
+            for li in 0..n_layers {
+                let b = 1 + 7 * li;
+                let jobs: [(usize, &Option<Vec<f64>>); 6] = [
+                    (b, &attn_inv[li]),
+                    (b + 1, &attn_inv[li]),
+                    (b + 2, &attn_inv[li]),
+                    (b + 4, &ffn_inv[li]),
+                    (b + 5, &ffn_inv[li]),
+                    (b + 6, &down_inv[li]),
+                ];
+                for (idx, h_inv) in jobs {
+                    if let Some(h) = h_inv {
+                        let (n, k) = shapes[idx];
+                        if let Some(q) = gptq(&fp[idx], n, k, t, h, decay, shape) {
+                            fed[idx] = q;
+                        }
                     }
                 }
             }
+            let p_fed = perplexity_windowed(&fed, &arch, &eval, EVAL_WINDOW);
+            println!(
+                "{:<22} {bpw:>8.2} {p_fed:>13.3} {:>9.2}×   ({:+.1}% vs plain)",
+                if decay == 1.0 {
+                    format!("T={t} +GPTQ")
+                } else {
+                    format!("T={t} +GPTQ {shape:?} λ={decay}")
+                },
+                p_fed / ppl_fp,
+                (p_fed / p_base - 1.0) * 100.0
+            );
         }
-        let p_fed = perplexity_windowed(&fed, &arch, &eval, EVAL_WINDOW);
-        println!(
-            "{:<22} {bpw:>8.2} {p_fed:>13.3} {:>9.2}×   ({:+.1}% vs plain)",
-            format!("T={t} +GPTQ"),
-            p_fed / ppl_fp,
-            (p_fed / p_base - 1.0) * 100.0
-        );
     }
     println!(
         "\nGPTQ covers 6 of 7 projections per block (q/k/v, gate/up, down). o_proj and the tied \
