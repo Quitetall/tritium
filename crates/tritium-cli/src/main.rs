@@ -252,6 +252,8 @@ enum Command {
         /// and pushing its full correction into later columns then does harm. Measured on
         /// SmolLM2-135M at the default 4,096 calibration tokens, decay takes GPTQ's gain at T=2
         /// from −2.5% to −9.8%, and at 2,048 tokens it turns a +4.6% loss into a −7.4% gain.
+        /// Through this command and `ModelRunner` (T=3, g256, rotated, 4,096 tokens): nearest
+        /// point 30.3090, plain GPTQ 30.2738, auto decay 30.1105 — −0.54% against plain GPTQ.
         /// Pass `1` for plain GPTQ.
         #[arg(long, default_value = "auto", value_parser = parse_decay)]
         gptq_decay: DecayArg,
