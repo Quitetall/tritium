@@ -245,6 +245,21 @@ enum Command {
         /// is rank-deficient by construction and makes the fit WORSE.
         #[arg(long)]
         activation_aware: bool,
+        /// How much of each column's rounding error `--activation-aware` propagates forward.
+        ///
+        /// `auto` (the default) sets it per tensor from the calibration size and the tensor's
+        /// input width: a Gram estimated from few tokens relative to its width is rank-deficient,
+        /// and pushing its full correction into later columns then does harm. Measured on
+        /// SmolLM2-135M at the default 4,096 calibration tokens, decay takes GPTQ's gain at T=2
+        /// from −2.5% to −9.8%, and at 2,048 tokens it turns a +4.6% loss into a −7.4% gain.
+        /// Pass `1` for plain GPTQ.
+        #[arg(long, default_value = "auto", value_parser = parse_decay)]
+        gptq_decay: Option<f64>,
+        /// Ramp the decay over the column order — full propagation at the first column, the decay
+        /// only at the last — instead of applying it uniformly. Wins by a further ~1% at 16k
+        /// calibration tokens and loses at 4k; leave it off unless calibration is generous.
+        #[arg(long)]
+        gptq_decay_ramp: bool,
         /// Write the padded TQ2_0 bundle instead of the entropy-coded `TSLJ` one.
         ///
         /// The loaded model is identical either way: `TSLJ` decodes to byte-identical TQ2_0 rows at
@@ -622,6 +637,8 @@ fn main() -> anyhow::Result<()> {
             fold_alpha,
             no_rotation,
             activation_aware,
+            gptq_decay,
+            gptq_decay_ramp,
             dense_container,
             planes,
             group,
@@ -641,6 +658,8 @@ fn main() -> anyhow::Result<()> {
                 },
                 dense_container,
                 activation_aware,
+                gptq_decay,
+                gptq_decay_ramp,
             },
         )?,
         Command::Quantize {
@@ -677,6 +696,23 @@ fn main() -> anyhow::Result<()> {
         )?,
     }
     Ok(())
+}
+
+/// `--gptq-decay`: `auto` means per-tensor from the calibration size; otherwise a number in (0, 1].
+fn parse_decay(value: &str) -> Result<Option<f64>, String> {
+    if value.eq_ignore_ascii_case("auto") {
+        return Ok(None);
+    }
+    let decay: f64 = value
+        .parse()
+        .map_err(|_| format!("expected `auto` or a number in (0, 1], got `{value}`"))?;
+    if decay > 0.0 && decay <= 1.0 {
+        Ok(Some(decay))
+    } else {
+        Err(format!(
+            "expected `auto` or a number in (0, 1], got `{value}`"
+        ))
+    }
 }
 
 #[cfg(test)]

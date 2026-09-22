@@ -132,6 +132,12 @@ pub(crate) struct ConvertConfig {
     /// Fit in the activation metric (GPTQ + trit search + step refits) instead of rounding to the
     /// nearest ladder point. Needs `--calib`, and costs one Gram per projection input.
     pub(crate) activation_aware: bool,
+    /// Fraction of each column's rounding error GPTQ propagates. `None` picks it per tensor from
+    /// the calibration size and the tensor's input width (`salt_fit::auto_decay`); `Some(1.0)` is
+    /// plain GPTQ.
+    pub(crate) gptq_decay: Option<f64>,
+    /// Ramp the decay over the column order instead of applying it uniformly.
+    pub(crate) gptq_decay_ramp: bool,
 }
 
 pub(crate) fn run(model: &Path, out: &Path, cfg: &ConvertConfig) -> Result<()> {
@@ -141,6 +147,9 @@ pub(crate) fn run(model: &Path, out: &Path, cfg: &ConvertConfig) -> Result<()> {
             "--fold-alpha must be in [0, 1] (0 = identity fold, 1 = full salience); got {}",
             cfg.fold_alpha
         );
+    }
+    if let Some(decay) = cfg.gptq_decay.filter(|d| !(*d > 0.0 && *d <= 1.0)) {
+        bail!("--gptq-decay must be `auto` or a number in (0, 1]; got {decay}");
     }
     if cfg.activation_aware && cfg.calib.is_none() {
         bail!(
@@ -234,9 +243,16 @@ pub(crate) fn run(model: &Path, out: &Path, cfg: &ConvertConfig) -> Result<()> {
             "  collecting activation Grams over {} x {CALIB_WINDOW} tokens…",
             windows.len()
         );
-        Some(TapGrams::collect(&weights, &arch, &windows))
+        Some((
+            TapGrams::collect(&weights, &arch, &windows),
+            windows.len() * CALIB_WINDOW,
+        ))
     } else {
         None
+    };
+    let (grams, calibration_tokens) = match grams {
+        Some((grams, tokens)) => (Some(grams), tokens),
+        None => (None, 0),
     };
     let fit_cfg = ActivationAwareConfig {
         planes: cfg.ladder.planes,
@@ -246,8 +262,12 @@ pub(crate) fn run(model: &Path, out: &Path, cfg: &ConvertConfig) -> Result<()> {
         search_sweeps: 8,
         refit_scale: true,
         rotate: cfg.ladder.rotate,
+        decay: 1.0,
+        decay_ramp: cfg.gptq_decay_ramp,
     };
     let mut activation_aware_tensors = 0usize;
+    // The decay each tensor was fitted with, for the receipt: auto varies it with input width.
+    let mut decays_used: Vec<f64> = Vec::new();
 
     // Fit every projection. `shapes[i]` is `(n_out, k_in)` for `weights[i]`.
     let mut quantized: Vec<(String, Vec<SaltRow>)> = Vec::with_capacity(weights.len());
@@ -262,10 +282,15 @@ pub(crate) fn run(model: &Path, out: &Path, cfg: &ConvertConfig) -> Result<()> {
         let fitted = match grams.as_ref().filter(|_| i > 0).and_then(|g| {
             let li = (i - 1) / 7;
             let slot = (i - 1) % 7;
-            fit_tensor(w, rows, k, g.for_slot(li, slot), &fit_cfg)
+            let decay = cfg
+                .gptq_decay
+                .unwrap_or_else(|| tritium_nn::salt_fit::auto_decay(calibration_tokens, k));
+            let tensor_cfg = ActivationAwareConfig { decay, ..fit_cfg };
+            fit_tensor(w, rows, k, g.for_slot(li, slot), &tensor_cfg).map(|fits| (fits, decay))
         }) {
-            Some(fits) => {
+            Some((fits, decay)) => {
                 activation_aware_tensors += 1;
+                decays_used.push(decay);
                 pack_group_fits(&fits, rows, k, &cfg.ladder)
                     .with_context(|| format!("pack activation-aware fit for {name}"))?
             }
@@ -390,7 +415,21 @@ pub(crate) fn run(model: &Path, out: &Path, cfg: &ConvertConfig) -> Result<()> {
     // The bundle version already encodes this, but the line a user reads should not have to
     // be cross-checked against a byte offset.
     let fit_desc = if activation_aware_tensors > 0 {
-        format!("activation-metric fit on {activation_aware_tensors} projections")
+        let (lo, hi) = decays_used
+            .iter()
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &d| {
+                (lo.min(d), hi.max(d))
+            });
+        let decay_desc = match (cfg.gptq_decay, cfg.gptq_decay_ramp) {
+            (Some(1.0), _) => "undecayed".to_owned(),
+            (Some(d), false) => format!("decay {d}"),
+            (Some(d), true) => format!("ramp decay to {d}"),
+            (None, ramp) => format!(
+                "auto decay {lo:.2}–{hi:.2}{}",
+                if ramp { " ramped" } else { "" }
+            ),
+        };
+        format!("activation-metric fit on {activation_aware_tensors} projections, {decay_desc}")
     } else {
         "nearest-point fit".to_owned()
     };

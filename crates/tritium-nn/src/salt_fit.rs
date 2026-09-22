@@ -48,6 +48,13 @@ pub struct ActivationAwareConfig {
     pub refit_scale: bool,
     /// Fit in the Hadamard-rotated basis, which is what the shipping artifact stores.
     pub rotate: bool,
+    /// Fraction of each column's rounding error that GPTQ pushes into the columns after it.
+    /// `1.0` is plain GPTQ. See [`auto_decay`] for why anything less can be better.
+    pub decay: f64,
+    /// Ramp the decay over the column order: the first column propagates in full and `decay` is
+    /// reached only at the last, where a short remaining suffix has to absorb everything pushed
+    /// into it (ADR 0043 L-B, after QTEA). Off, the same `decay` applies to every column.
+    pub decay_ramp: bool,
 }
 
 impl Default for ActivationAwareConfig {
@@ -60,8 +67,40 @@ impl Default for ActivationAwareConfig {
             search_sweeps: 8,
             refit_scale: true,
             rotate: true,
+            decay: 1.0,
+            decay_ramp: false,
         }
     }
+}
+
+/// Propagation decay for a Gram estimated from `calibration_tokens` samples of a `cols`-wide input.
+///
+/// GPTQ trusts `H⁻¹` completely: every column's rounding error is pushed in full into the columns
+/// after it. A Gram from few samples relative to its width is rank-deficient, and then what gets
+/// pushed is mostly the damping's guess, so trusting it less helps. Measured on SmolLM2-135M over
+/// WikiText-2 (folded, T=2/T=3, held-out perplexity against the plain fit), the best fraction
+/// falls as tokens fall:
+///
+/// ```text
+/// tokens   width   tokens/width   best λ    plain GPTQ → decayed
+/// 16,384   1,536      10.7        0.75      −13.1% → −13.8%   (T=2)
+///  4,096   1,536       2.7        ≤0.5       −2.5% →  −9.8%
+///  2,048   1,536       1.3        ≤0.5       +4.6% →  −7.4%
+/// ```
+///
+/// This interpolates `λ` linearly in `log(tokens/width)` between those two measured ends, `0.5` at
+/// a ratio of 2.7 and `0.75` at 10.7, and clamps outside them. It is a rule fitted to three points
+/// on one model, not a derivation; a wider sweep should replace the constants, not the shape.
+#[must_use]
+pub fn auto_decay(calibration_tokens: usize, cols: usize) -> f64 {
+    const LOW: (f64, f64) = (2.7, 0.5);
+    const HIGH: (f64, f64) = (10.7, 0.75);
+    if calibration_tokens == 0 || cols == 0 {
+        return LOW.1;
+    }
+    let ratio = calibration_tokens as f64 / cols as f64;
+    let t = ((ratio.ln() - LOW.0.ln()) / (HIGH.0.ln() - LOW.0.ln())).clamp(0.0, 1.0);
+    LOW.1 + t * (HIGH.1 - LOW.1)
 }
 
 /// Input Gram `E[x·xᵀ]` at each of the four projection inputs, per layer.
@@ -336,6 +375,13 @@ pub fn fit_tensor(
         if d_jj <= 0.0 || !d_jj.is_finite() {
             return None;
         }
+        // Decay on the propagated error: a multiplier on `err`, so `lambda == 1.0` is plain GPTQ
+        // to the bit. Under the ramp it runs from 1 at the first column to `cfg.decay` at the last.
+        let lambda = if cfg.decay_ramp && cols > 1 {
+            1.0 - (1.0 - cfg.decay) * j as f64 / (cols - 1) as f64
+        } else {
+            cfg.decay
+        };
         quantized
             .par_chunks_mut(cols)
             .zip(work.par_chunks_mut(cols))
@@ -343,7 +389,7 @@ pub fn fit_tensor(
             .for_each(|((q, wr), d)| {
                 let value = ladder_quantize_at(wr[j], cfg.planes, d[block]);
                 q[j] = value;
-                let err = f64::from(wr[j] - value) / d_jj;
+                let err = lambda * f64::from(wr[j] - value) / d_jj;
                 for j2 in (j + 1)..cols {
                     wr[j2] -= (err * chol[j2 * cols + j]) as f32;
                 }
@@ -569,6 +615,8 @@ mod tests {
                 search_sweeps: 0,
                 refit_scale: false,
                 rotate,
+                decay: 1.0,
+                decay_ramp: false,
             };
             let fits = fit_tensor(&w, rows, cols, &gram, &cfg).expect("fit");
             let oracle = ste::geometric_ladder_fit(
@@ -640,6 +688,8 @@ mod tests {
             search_sweeps: 0,
             refit_scale: false,
             rotate: false,
+            decay: 1.0,
+            decay_ramp: false,
         };
         let gptq = fit_to_dense(
             &fit_tensor(&w, rows, cols, &gram, &base).unwrap(),
@@ -697,6 +747,8 @@ mod tests {
             search_sweeps: 0,
             refit_scale: false,
             rotate: false,
+            decay: 1.0,
+            decay_ramp: false,
         };
         let dead = fit_tensor(&w, rows, cols, &vec![0.0f64; cols * cols], &cfg).expect("dead gram");
         let oracle =
@@ -711,5 +763,100 @@ mod tests {
         let mut broken = vec![0.0f64; cols * cols];
         broken[0] = f64::NAN;
         assert!(fit_tensor(&w, rows, cols, &broken, &cfg).is_none());
+    }
+}
+
+#[cfg(test)]
+mod decay_tests {
+    use super::*;
+
+    fn synthetic(rows: usize, cols: usize) -> (Vec<f32>, Vec<f64>) {
+        // Deterministic heavy-tailed weights and a full-rank, well-conditioned Gram.
+        let w: Vec<f32> = (0..rows * cols)
+            .map(|i| {
+                let x = ((i * 7919) % 1000) as f32 / 500.0 - 1.0;
+                x * x * x + 0.05 * x
+            })
+            .collect();
+        let mut gram = vec![0.0f64; cols * cols];
+        for a in 0..cols {
+            for b in 0..cols {
+                gram[a * cols + b] =
+                    0.3f64.powi((a as i32 - b as i32).abs()) * (1.0 + a as f64 / cols as f64);
+            }
+        }
+        (w, gram)
+    }
+
+    #[test]
+    fn a_decay_of_one_is_plain_gptq_with_or_without_the_ramp() {
+        let (w, gram) = synthetic(4, 128);
+        let base = ActivationAwareConfig {
+            planes: 2,
+            group: 64,
+            grid: 8,
+            search_sweeps: 0,
+            rotate: false,
+            ..ActivationAwareConfig::default()
+        };
+        let plain = fit_tensor(&w, 4, 128, &gram, &base).expect("fit");
+        let ramped = fit_tensor(
+            &w,
+            4,
+            128,
+            &gram,
+            &ActivationAwareConfig {
+                decay_ramp: true,
+                ..base
+            },
+        )
+        .expect("fit");
+        assert_eq!(plain, ramped, "at decay 1.0 the ramp must change nothing");
+    }
+
+    #[test]
+    fn a_decay_below_one_changes_the_propagation() {
+        let (w, gram) = synthetic(4, 128);
+        let base = ActivationAwareConfig {
+            planes: 2,
+            group: 64,
+            grid: 8,
+            search_sweeps: 0,
+            rotate: false,
+            ..ActivationAwareConfig::default()
+        };
+        let plain = fit_tensor(&w, 4, 128, &gram, &base).expect("fit");
+        let decayed = fit_tensor(
+            &w,
+            4,
+            128,
+            &gram,
+            &ActivationAwareConfig { decay: 0.5, ..base },
+        )
+        .expect("fit");
+        assert_ne!(
+            plain, decayed,
+            "decay 0.5 must alter the codes GPTQ produces"
+        );
+    }
+
+    #[test]
+    fn auto_decay_follows_the_measured_ends_and_clamps_outside_them() {
+        // The two measured ends, on down_proj's 1,536-wide input.
+        assert!((auto_decay(4_096, 1_536) - 0.5).abs() < 0.01);
+        assert!((auto_decay(16_384, 1_536) - 0.75).abs() < 0.01);
+        // Clamped past them.
+        assert_eq!(auto_decay(1_024, 1_536), 0.5);
+        assert_eq!(auto_decay(1 << 20, 1_536), 0.75);
+        // Monotone non-decreasing in tokens at fixed width.
+        let mut last = 0.0;
+        for tokens in [512, 1_024, 2_048, 4_096, 8_192, 16_384, 32_768] {
+            let d = auto_decay(tokens, 576);
+            assert!(d >= last, "auto_decay must not fall as tokens grow");
+            last = d;
+        }
+        // Degenerate inputs pick the cautious end rather than NaN.
+        assert_eq!(auto_decay(0, 576), 0.5);
+        assert_eq!(auto_decay(4_096, 0), 0.5);
     }
 }

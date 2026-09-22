@@ -756,3 +756,82 @@ fn activation_aware_convert_beats_nearest_point() {
          wrong Gram reaching a projection, or the fit running on unfolded weights"
     );
 }
+
+/// **The default `--gptq-decay auto` must beat undecayed GPTQ at the default calibration size.**
+///
+/// `--calib-tokens` defaults to 4,096, and against a 1,536-wide `down_proj` input that Gram is
+/// rank-starved: the harness measured plain GPTQ at −2.5% (T=2) and −1.2% (T=3) there, and decay
+/// at λ=0.5 at −9.8% and −3.6%. This checks the CLI delivers that difference through the runtime,
+/// on the shipped config, at the shipped default — the setting a user gets without reading anything.
+///
+/// Three arms, one fold, one Gram budget: nearest point, `--gptq-decay 1`, and the default `auto`.
+/// The nearest-point arm is context; the assertion is between the two GPTQ arms.
+#[test]
+#[ignore = "three conversions of a real model, two of them fitting against Grams"]
+fn decayed_gptq_beats_undecayed_at_the_default_calibration() {
+    let model = PathBuf::from(
+        std::env::var("TRITIUM_MODEL_DIR").expect("set TRITIUM_MODEL_DIR to an fp model directory"),
+    );
+    let corpus = PathBuf::from(
+        std::env::var("TRITIUM_CORPUS").expect("set TRITIUM_CORPUS to a corpus json"),
+    );
+    let tokens = eval_tokens(&corpus);
+    let root = std::env::temp_dir().join(format!("tritium-decay-{}", std::process::id()));
+
+    let convert = |out: &Path, decay: Option<&str>| {
+        let _ = std::fs::remove_dir_all(out);
+        let mut cmd = Command::new(tritium_bin());
+        cmd.args([
+            "convert",
+            "--model",
+            model.to_str().unwrap(),
+            "--out",
+            out.to_str().unwrap(),
+            "--planes",
+            "3",
+            "--group",
+            "256",
+            "--fold-alpha",
+            "0.75",
+            "--calib",
+            corpus.to_str().unwrap(),
+            "--calib-tokens",
+            "4096",
+        ]);
+        if let Some(decay) = decay {
+            cmd.args(["--activation-aware", "--gptq-decay", decay]);
+        }
+        assert!(
+            cmd.status().expect("run tritium convert").success(),
+            "convert failed (decay={decay:?})"
+        );
+    };
+
+    let nearest = root.join("nearest");
+    let undecayed = root.join("undecayed");
+    let auto = root.join("auto");
+    convert(&nearest, None);
+    convert(&undecayed, Some("1"));
+    convert(&auto, Some("auto"));
+
+    let ppl_nearest = score_converted(&nearest, &tokens);
+    let ppl_undecayed = score_converted(&undecayed, &tokens);
+    let ppl_auto = score_converted(&auto, &tokens);
+    let _ = std::fs::remove_dir_all(&root);
+
+    println!(
+        "\nSmolLM2-135M | T=3 g256 rotated | fold 0.75 | 4,096 calibration tokens (the default)\n  \
+         nearest point         {ppl_nearest:.4}\n  \
+         GPTQ, decay 1         {ppl_undecayed:.4}   ({:+.2}% vs nearest)\n  \
+         GPTQ, decay auto      {ppl_auto:.4}   ({:+.2}% vs nearest, {:+.2}% vs undecayed)",
+        100.0 * (ppl_undecayed - ppl_nearest) / ppl_nearest,
+        100.0 * (ppl_auto - ppl_nearest) / ppl_nearest,
+        100.0 * (ppl_auto - ppl_undecayed) / ppl_undecayed,
+    );
+    assert!(
+        ppl_auto < ppl_undecayed,
+        "auto decay ({ppl_auto:.4}) did not beat undecayed GPTQ ({ppl_undecayed:.4}) at 4,096 \
+         calibration tokens; the harness measured a 2–7 point gap here, so the decay is not \
+         reaching the fitter"
+    );
+}
