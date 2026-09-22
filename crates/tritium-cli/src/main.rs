@@ -254,7 +254,7 @@ enum Command {
         /// from −2.5% to −9.8%, and at 2,048 tokens it turns a +4.6% loss into a −7.4% gain.
         /// Pass `1` for plain GPTQ.
         #[arg(long, default_value = "auto", value_parser = parse_decay)]
-        gptq_decay: Option<f64>,
+        gptq_decay: DecayArg,
         /// Ramp the decay over the column order — full propagation at the first column, the decay
         /// only at the last — instead of applying it uniformly. Wins by a further ~1% at 16k
         /// calibration tokens and loses at 4k; leave it off unless calibration is generous.
@@ -658,7 +658,7 @@ fn main() -> anyhow::Result<()> {
                 },
                 dense_container,
                 activation_aware,
-                gptq_decay,
+                gptq_decay: gptq_decay.0,
                 gptq_decay_ramp,
             },
         )?,
@@ -698,16 +698,22 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `--gptq-decay`: `auto` means per-tensor from the calibration size; otherwise a number in (0, 1].
-fn parse_decay(value: &str) -> Result<Option<f64>, String> {
+/// `--gptq-decay`: `None` is `auto` (per tensor from the calibration size), else a value in (0, 1].
+///
+/// A newtype rather than a bare `Option<f64>`: clap reads an `Option<T>` field as "optional
+/// argument of type `T`", so a parser that itself returns `Option<f64>` mismatches at runtime.
+#[derive(Clone, Copy, Debug)]
+struct DecayArg(Option<f64>);
+
+fn parse_decay(value: &str) -> Result<DecayArg, String> {
     if value.eq_ignore_ascii_case("auto") {
-        return Ok(None);
+        return Ok(DecayArg(None));
     }
     let decay: f64 = value
         .parse()
         .map_err(|_| format!("expected `auto` or a number in (0, 1], got `{value}`"))?;
     if decay > 0.0 && decay <= 1.0 {
-        Ok(Some(decay))
+        Ok(DecayArg(Some(decay)))
     } else {
         Err(format!(
             "expected `auto` or a number in (0, 1], got `{value}`"
