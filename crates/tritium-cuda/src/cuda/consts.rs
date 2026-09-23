@@ -418,6 +418,8 @@ pub(super) const KERNEL_NAME_SALT_V2_WARP: &str = "salt_v2_forward_warp";
 /// Warp-per-row SALT V2 forward with a shuffle tree-reduce instead of the
 /// exact kernel's ordered replay. Close, not bit-identical.
 pub(super) const KERNEL_NAME_SALT_V2_WARP_FAST: &str = "salt_v2_forward_warp_fast";
+/// Row-streaming SALT V2 GEMV: a warp reads its row's plane-tile words coalesced.
+pub(super) const KERNEL_NAME_SALT_V2_STREAM: &str = "salt_v2_stream_f32";
 pub(super) const KERNEL_NAME_SALT_V2_GATHER: &str = "salt_v2_gather_rows";
 /// One Gated DeltaNet recurrent state update for every head of one token.
 pub(super) const KERNEL_NAME_DELTANET_STEP: &str = "qwen35_deltanet_recurrent_step";
@@ -442,6 +444,8 @@ pub(super) const SALT_V2_WARP_MAX_WARPS: u32 = 8;
 /// The warp kernel's block-wide B3 digit table: every byte value, five radix-3
 /// digits each at two bits, as `u16`.
 pub(super) const SALT_V2_B3_TABLE_BYTES: u32 = 256 * 2;
+/// Warps per block for the row-streaming SALT V2 GEMV.
+pub(super) const SALT_V2_STREAM_WARPS: u32 = 8;
 /// Warps per block for the tiled kernel — each warp computes one output column,
 /// so a block covers this many `N` at once (8 warps = 256 threads). ncu note
 /// (2026-07-07): the small decode GEMMs run at 0.42–0.62 waves / 44–48% DRAM —
@@ -483,6 +487,26 @@ pub(super) const QWEN35_DELTANET_PTX: &str =
 /// (once per read site invocation) and reads as OFF — presence-detection is
 /// banned because `FLAG=0` turning a knob ON is the opposite of what every
 /// user expects (P2-9, CLI audit 2026-08-20).
+/// Like [`env_flag_on`], but for an optimization that is on unless disabled.
+///
+/// Unset reads as on; `0` turns it off. Any other value warns and reads as on, so
+/// a typo cannot quietly disable a default.
+pub(super) fn env_flag_default_on(name: &str) -> bool {
+    match std::env::var(name) {
+        Err(std::env::VarError::NotPresent) => true,
+        Ok(v) if v == "1" => true,
+        Ok(v) if v == "0" => false,
+        Ok(v) => {
+            eprintln!("tritium-cuda: {name}={v:?} — use 1 or 0 (unset = 1); reading as 1");
+            true
+        }
+        Err(e) => {
+            eprintln!("tritium-cuda: {name}: {e}; reading as 1");
+            true
+        }
+    }
+}
+
 pub(super) fn env_flag_on(name: &str) -> bool {
     match std::env::var(name) {
         Err(std::env::VarError::NotPresent) => false,

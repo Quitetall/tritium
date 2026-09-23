@@ -1,6 +1,34 @@
 use super::*;
 use tritium_format::salt_v2_package::SALT_V2_ALLOCATION_TILE_SIZE;
 
+/// Per-warp shared bytes for the row-streaming kernel, or `None` when it cannot
+/// serve the tensor.
+///
+/// The kernel reads B3 plane-tiles as thirteen 32-bit words and splits each word
+/// at the 128-trit scale boundary, so it needs codec B3, scale group 128, and a
+/// width that is a whole number of 256-coefficient tiles. Its per-row table maps
+/// each of up to three plane-tiles per tile to a one-byte tile index, which caps
+/// a row at 256 tiles.
+pub(super) fn salt_v2_stream_dispatch(
+    columns: usize,
+    scale_group_size: u32,
+    codec_tag: u32,
+) -> Option<u32> {
+    const B3: u32 = 1;
+    if codec_tag != B3 || scale_group_size != 128 {
+        return None;
+    }
+    if columns == 0 || !columns.is_multiple_of(SALT_V2_ALLOCATION_TILE_SIZE) {
+        return None;
+    }
+    let tiles_per_row = columns / SALT_V2_ALLOCATION_TILE_SIZE;
+    if tiles_per_row > 256 {
+        return None;
+    }
+    // Up to three plane-tiles per tile, one byte each, rounded to whole words.
+    u32::try_from((tiles_per_row * 3).div_ceil(4) * 4).ok()
+}
+
 /// Geometry for the warp-per-row SALT V2 kernel, or `None` when the scalar
 /// kernel must handle the shape.
 ///
@@ -355,9 +383,26 @@ impl CudaBackend {
         // is a variant of the warp kernel, so it serves exactly the shapes the
         // warp kernel serves; anything else answers with the exact image, and a
         // receipt that claimed otherwise would be the only record a caller has.
+        // The fast entry point takes the best fast kernel the geometry allows:
+        // the row-streaming GEMV where it applies (opt out with
+        // TRITIUM_SALT_V2_STREAM=0), else the warp kernel's shuffle variant, else
+        // the exact image under its own name.
         let resolved = match mode {
-            SaltV2ForwardMode::FastWarpReduce if !self.salt_v2_warp_eligible(tensor) => {
-                SaltV2ForwardMode::FastAliasesExact
+            SaltV2ForwardMode::FastWarpReduce => {
+                let stream = env_flag_default_on("TRITIUM_SALT_V2_STREAM")
+                    && salt_v2_stream_dispatch(
+                        tensor.columns,
+                        tensor.scale_group_size,
+                        tensor.codec_tag,
+                    )
+                    .is_some();
+                if stream {
+                    SaltV2ForwardMode::FastRowStream
+                } else if self.salt_v2_warp_eligible(tensor) {
+                    SaltV2ForwardMode::FastWarpReduce
+                } else {
+                    SaltV2ForwardMode::FastAliasesExact
+                }
             }
             other => other,
         };
@@ -431,98 +476,140 @@ impl CudaBackend {
         let mut d_output = workspace
             .take(&self.stream, output_elements)
             .map_err(|error| alloc_or_backend("allocate SALT V2 output", &error, output_bytes))?;
-        // Qwen's hidden/intermediate widths are 256-aligned. For those
-        // matrices, stage each activation tile once per output-row block;
-        // irregular shapes retain scalar exact dispatch.
-        // Experimental until a broad shape sweep proves a win. The current
-        // 4090 benchmark favors scalar dispatch for short prompts; keep this
-        // opt-in so production latency never regresses by default.
-        let use_tiled = env_flag_on("TRITIUM_SALT_V2_TILED") && tensor.columns.is_multiple_of(256);
-
-        // Warp-per-row dispatch; see `salt_v2_warp_dispatch`.
-        let warp_dispatch = salt_v2_warp_dispatch(tensor.columns, tensor.scale_group_size);
-        let (warp_groups_per_row, warps_per_block, warp_slot_bytes) =
-            warp_dispatch.unwrap_or((0, 0, 0));
-        let use_warp = !use_tiled && warps_per_block > 0;
-        let warp_groups_u32 = warp_groups_per_row;
-        // The fast kernel is a variant of the warp kernel, so it serves exactly
-        // the shapes the warp kernel serves. Anything else keeps the exact
-        // image, and the receipt already says `FastAliasesExact` for that.
-        let use_fast = use_warp && receipt.mode() == SaltV2ForwardMode::FastWarpReduce;
-
-        let (grid_x, grid_y, block_x, shared_mem_bytes) = if use_warp {
-            (
-                total_outputs.div_ceil(warps_per_block),
-                1,
-                warps_per_block * 32,
-                // The fast kernel keeps no contribution slots; only the table.
-                if use_fast {
-                    SALT_V2_B3_TABLE_BYTES
-                } else {
-                    SALT_V2_B3_TABLE_BYTES + warp_slot_bytes * warps_per_block
-                },
-            )
-        } else if use_tiled {
-            (
-                n_u32.div_ceil(SALT_V2_TILED_THREADS),
-                m_u32,
-                SALT_V2_TILED_THREADS,
-                256 * core::mem::size_of::<f32>() as u32,
-            )
-        } else {
-            (
-                total_outputs.div_ceil(THREADS_PER_BLOCK),
-                1,
-                THREADS_PER_BLOCK,
-                0,
-            )
-        };
-        let cfg = LaunchConfig {
-            grid_dim: (grid_x, grid_y, 1),
-            block_dim: (block_x, 1, 1),
-            shared_mem_bytes,
-        };
-        let kernel = if use_fast {
-            &self.func_salt_v2_warp_fast
-        } else if use_warp {
-            &self.func_salt_v2_warp
-        } else if use_tiled {
-            &self.func_salt_v2_tiled
-        } else {
-            &self.func_salt_v2_exact
-        };
-        let mut launch = self.stream.launch_builder(kernel);
-        launch
-            .arg(&d_activation)
-            .arg(&tensor.payload)
-            .arg(&tensor.scales)
-            .arg(index_metadata)
-            .arg(&mut d_output)
-            .arg(&m_u32)
-            .arg(&n_u32)
-            .arg(&k_u32)
-            .arg(&tensor.codec_tag)
-            .arg(&tensor.scale_group_size)
-            .arg(&tile_count)
-            .arg(&plane_count)
-            .arg(&payload_bytes)
-            .arg(&scale_count)
-            .arg(&tensor.allocation_map_bytes)
-            .arg(&tensor.rank_prefix_count)
-            .arg(&tensor.terminal_map_value);
-        // Only the warp kernel takes the group count; the other two derive their
-        // own geometry from `k`.
-        if use_warp {
-            launch.arg(&warp_groups_u32);
-        }
-        // SAFETY: the private handle owns codec payload/scales/index metadata
-        // validated at upload. Input/output lengths and every scalar ABI bound
-        // are checked above, and the kernel writes each `[M, N]` element once.
-        #[allow(unsafe_code)]
-        unsafe {
+        if receipt.mode() == SaltV2ForwardMode::FastRowStream {
+            let table_bytes =
+                salt_v2_stream_dispatch(tensor.columns, tensor.scale_group_size, tensor.codec_tag)
+                    .ok_or_else(|| {
+                        BackendError::InvalidInput(
+                            "SALT V2 row-stream receipt on a tensor the kernel cannot serve".into(),
+                        )
+                    })?;
+            let cfg = LaunchConfig {
+                grid_dim: (total_outputs.div_ceil(SALT_V2_STREAM_WARPS), 1, 1),
+                block_dim: (SALT_V2_STREAM_WARPS * 32, 1, 1),
+                shared_mem_bytes: SALT_V2_B3_TABLE_BYTES + table_bytes * SALT_V2_STREAM_WARPS,
+            };
+            let mut launch = self.stream.launch_builder(&self.func_salt_v2_stream);
             launch
-                .launch(cfg)
-                .map_err(|error| driver_err("launch SALT V2 exact forward", &error))?;
+                .arg(&d_activation)
+                .arg(&tensor.payload)
+                .arg(&tensor.scales)
+                .arg(index_metadata)
+                .arg(&mut d_output)
+                .arg(&m_u32)
+                .arg(&n_u32)
+                .arg(&k_u32)
+                .arg(&tile_count)
+                .arg(&plane_count)
+                .arg(&tensor.allocation_map_bytes)
+                .arg(&tensor.rank_prefix_count)
+                .arg(&tensor.terminal_map_value)
+                .arg(&table_bytes);
+            // SAFETY: as for the other SALT V2 kernels -- validated resident
+            // handle, checked operand lengths, one write per `[M, N]` element.
+            // The kernel reads whole 52-byte B3 plane-tiles as aligned words,
+            // which the eligibility check guarantees.
+            #[allow(unsafe_code)]
+            unsafe {
+                launch
+                    .launch(cfg)
+                    .map_err(|error| driver_err("launch SALT V2 row-stream forward", &error))?;
+            }
+        } else {
+            // Qwen's hidden/intermediate widths are 256-aligned. For those
+            // matrices, stage each activation tile once per output-row block;
+            // irregular shapes retain scalar exact dispatch.
+            // Experimental until a broad shape sweep proves a win. The current
+            // 4090 benchmark favors scalar dispatch for short prompts; keep this
+            // opt-in so production latency never regresses by default.
+            let use_tiled =
+                env_flag_on("TRITIUM_SALT_V2_TILED") && tensor.columns.is_multiple_of(256);
+
+            // Warp-per-row dispatch; see `salt_v2_warp_dispatch`.
+            let warp_dispatch = salt_v2_warp_dispatch(tensor.columns, tensor.scale_group_size);
+            let (warp_groups_per_row, warps_per_block, warp_slot_bytes) =
+                warp_dispatch.unwrap_or((0, 0, 0));
+            let use_warp = !use_tiled && warps_per_block > 0;
+            let warp_groups_u32 = warp_groups_per_row;
+            // The fast kernel is a variant of the warp kernel, so it serves exactly
+            // the shapes the warp kernel serves. Anything else keeps the exact
+            // image, and the receipt already says `FastAliasesExact` for that.
+            let use_fast = use_warp && receipt.mode() == SaltV2ForwardMode::FastWarpReduce;
+
+            let (grid_x, grid_y, block_x, shared_mem_bytes) = if use_warp {
+                (
+                    total_outputs.div_ceil(warps_per_block),
+                    1,
+                    warps_per_block * 32,
+                    // The fast kernel keeps no contribution slots; only the table.
+                    if use_fast {
+                        SALT_V2_B3_TABLE_BYTES
+                    } else {
+                        SALT_V2_B3_TABLE_BYTES + warp_slot_bytes * warps_per_block
+                    },
+                )
+            } else if use_tiled {
+                (
+                    n_u32.div_ceil(SALT_V2_TILED_THREADS),
+                    m_u32,
+                    SALT_V2_TILED_THREADS,
+                    256 * core::mem::size_of::<f32>() as u32,
+                )
+            } else {
+                (
+                    total_outputs.div_ceil(THREADS_PER_BLOCK),
+                    1,
+                    THREADS_PER_BLOCK,
+                    0,
+                )
+            };
+            let cfg = LaunchConfig {
+                grid_dim: (grid_x, grid_y, 1),
+                block_dim: (block_x, 1, 1),
+                shared_mem_bytes,
+            };
+            let kernel = if use_fast {
+                &self.func_salt_v2_warp_fast
+            } else if use_warp {
+                &self.func_salt_v2_warp
+            } else if use_tiled {
+                &self.func_salt_v2_tiled
+            } else {
+                &self.func_salt_v2_exact
+            };
+            let mut launch = self.stream.launch_builder(kernel);
+            launch
+                .arg(&d_activation)
+                .arg(&tensor.payload)
+                .arg(&tensor.scales)
+                .arg(index_metadata)
+                .arg(&mut d_output)
+                .arg(&m_u32)
+                .arg(&n_u32)
+                .arg(&k_u32)
+                .arg(&tensor.codec_tag)
+                .arg(&tensor.scale_group_size)
+                .arg(&tile_count)
+                .arg(&plane_count)
+                .arg(&payload_bytes)
+                .arg(&scale_count)
+                .arg(&tensor.allocation_map_bytes)
+                .arg(&tensor.rank_prefix_count)
+                .arg(&tensor.terminal_map_value);
+            // Only the warp kernel takes the group count; the other two derive their
+            // own geometry from `k`.
+            if use_warp {
+                launch.arg(&warp_groups_u32);
+            }
+            // SAFETY: the private handle owns codec payload/scales/index metadata
+            // validated at upload. Input/output lengths and every scalar ABI bound
+            // are checked above, and the kernel writes each `[M, N]` element once.
+            #[allow(unsafe_code)]
+            unsafe {
+                launch
+                    .launch(cfg)
+                    .map_err(|error| driver_err("launch SALT V2 exact forward", &error))?;
+            }
         }
         let mut staged = Vec::new();
         staged.try_reserve_exact(output_elements).map_err(|error| {

@@ -319,6 +319,10 @@ pub enum SaltV2ForwardMode {
     /// ordered replay. Reassociates the K-sum, so results are close to the CPU
     /// reference rather than equal to it.
     FastWarpReduce,
+    /// Row-streaming forward: a warp reads its row's plane-tile words coalesced
+    /// and reduces by shuffle. B3 at scale group 128 only. Close to the CPU
+    /// reference rather than equal to it.
+    FastRowStream,
 }
 
 /// Checked requested-`CudaSlice` ledger for one SALT V2 forward.
@@ -566,6 +570,8 @@ pub struct CudaBackend {
     pub(super) func_salt_v2_warp: CudaFunction,
     /// Tolerance-gated warp forward (`KERNEL_NAME_SALT_V2_WARP_FAST`).
     pub(super) func_salt_v2_warp_fast: CudaFunction,
+    /// Row-streaming SALT V2 GEMV (`KERNEL_NAME_SALT_V2_STREAM`).
+    pub(super) func_salt_v2_stream: CudaFunction,
     /// Exact selected-row reconstruction for SALT V2 token embeddings.
     pub(super) func_salt_v2_gather: CudaFunction,
     /// Device trap used only by destructive release qualification.
@@ -1164,6 +1170,9 @@ impl CudaBackend {
         let func_salt_v2_warp_fast = salt_v2_module
             .load_function(KERNEL_NAME_SALT_V2_WARP_FAST)
             .map_err(|error| driver_err("load SALT V2 fast warp forward kernel", &error))?;
+        let func_salt_v2_stream = salt_v2_module
+            .load_function(KERNEL_NAME_SALT_V2_STREAM)
+            .map_err(|error| driver_err("load SALT V2 row-stream kernel", &error))?;
         let func_salt_v2_gather = salt_v2_module
             .load_function(KERNEL_NAME_SALT_V2_GATHER)
             .map_err(|e| driver_err("resolve salt_v2_gather_rows kernel", &e))?;
@@ -1211,6 +1220,7 @@ impl CudaBackend {
             func_salt_v2_tiled,
             func_salt_v2_warp,
             func_salt_v2_warp_fast,
+            func_salt_v2_stream,
             func_salt_v2_gather,
             #[cfg(feature = "device-loss-qualification")]
             func_qualification_poison,

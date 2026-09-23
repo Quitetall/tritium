@@ -503,7 +503,7 @@ fn salt_v2_cuda_matches_cpu_and_dense_without_dense_weight_storage() {
             // K-sum. Assert against whichever kernel the receipt says ran, so
             // this covers both without assuming which shapes are eligible.
             match fast.receipt.mode() {
-                SaltV2ForwardMode::FastWarpReduce => {
+                SaltV2ForwardMode::FastWarpReduce | SaltV2ForwardMode::FastRowStream => {
                     let scale = exact
                         .output
                         .iter()
