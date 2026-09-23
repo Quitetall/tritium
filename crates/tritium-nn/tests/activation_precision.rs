@@ -74,6 +74,40 @@
 //! saves, so `[4,4,6,3,3]` — which takes two planes from `o` and the head — pays +23.40% to buy
 //! two planes on the tap that most wants them. The opportunity is self-extinguishing.
 //!
+//! # Correction 2026-09-23 — the table above quantized activations in the WRONG basis (H7)
+//!
+//! The weights are fitted with `RotationPolicy::Always`: each 128-group is quantized in the Hadamard
+//! basis and rotated back. The ternary activation rows above used `RotationPolicy::Never`, on a
+//! comment claiming rotation "would double-count" the weight-side transform. It would not: both
+//! reconstructions are returned in the original basis, and `⟨H·w_q, H·x_q⟩` is exactly what a
+//! runtime feeding rotated activations to rotated weights computes. So every sub-byte activation
+//! number above describes a basis no rotated runtime executes. `TRITIUM_AP_ONLY=rotation` measures
+//! both (same model, fold, weights T=3, g128; the unrotated rows reproduce the table to the digit):
+//!
+//! ```text
+//! activation precision                ppl      x fp    vs A-fp32
+//! fp32                             24.278    1.071x          —
+//! int8 per group g128              24.356    1.074x     +0.32%
+//! int8 per group g128 ROTATED      24.296    1.071x     +0.07%
+//! int4 per group g128              74.884    3.302x   +208.44%
+//! int4 per group g128 ROTATED      32.245    1.422x    +32.81%
+//! TERNARY 5, 7.92 bits             24.355    1.074x     +0.32%
+//! TERNARY 5 ROTATED                24.304    1.072x     +0.11%
+//! TERNARY 4, 6.34 bits             25.126    1.108x     +3.49%
+//! TERNARY 4 ROTATED                24.489    1.080x     +0.87%
+//! TERNARY 3, 4.75 bits             33.470    1.476x    +37.86%
+//! TERNARY 3 ROTATED                26.220    1.156x     +8.00%
+//! TERNARY 2, 3.17 bits            350.623   15.463x  +1344.18%
+//! TERNARY 2 ROTATED                47.352    2.088x    +95.04%
+//! ```
+//!
+//! In the executed basis, activation quantization is 3-14x cheaper at every ternary width, and the
+//! cliff moves down by about one plane: rotated x3 (+8.0%) is where unrotated x4 was, and rotated
+//! x4 at 6.34 bits (+0.87%) beats the shipping int8-per-row quantizer (+1.09%) with fewer bits and
+//! no multiplies. The plan's promote bar (rotated x4 within +0.5%) is NOT met, so the fully-ternary
+//! operating point stays x5 — now at +0.11%, not +0.32%. The per-tap allocation rows above were
+//! also measured unrotated and are not re-run here.
+//!
 //! ```text
 //! TRITIUM_CORPUS=$HOME/.cache/tritium-corpora/wikitext2_400k_32k.json \
 //!   cargo test -p tritium-nn --release --test activation_precision -- --ignored --nocapture
@@ -162,6 +196,13 @@ enum Mode {
     /// Additive ternary planes with the geometric ladder, i.e. the weight-side representation
     /// applied to activations. `T` planes ⇒ `T * 1.58` bits per value, multiply-free.
     Ternary(usize),
+    /// [`Mode::PerGroup`] in the Hadamard basis: each `ACT_GROUP` span is rotated, quantized and
+    /// rotated back. The weights are fitted in the same 128-wide group basis
+    /// (`RotationPolicy::Always`), and `H` is orthonormal, so `⟨H·w_q, H·x_q⟩` is exactly what a
+    /// runtime that feeds rotated activations to rotated weights computes.
+    PerGroupRotated(f32),
+    /// [`Mode::Ternary`] in the Hadamard basis — the basis the deployed runtime quantizes in.
+    TernaryRotated(usize),
     /// Ternary planes allocated **per tap**: `[attn_in, ffn_in, down_in, o_proj_in, head]`.
     ///
     /// The A8 headroom measurement found the taps are not alike — 5.41 dB available on the FFN
@@ -188,6 +229,14 @@ impl Mode {
                 format!("int{} per group g{ACT_GROUP}", (l + 1.0).log2() as u32 + 1)
             }
             Mode::Ternary(t) => format!("TERNARY {t} plane(s), {:.2} bits", ternary_bits(t)),
+            Mode::PerGroupRotated(127.0) => format!("int8 per group g{ACT_GROUP} ROTATED"),
+            Mode::PerGroupRotated(l) => format!(
+                "int{} per group g{ACT_GROUP} ROTATED",
+                (l + 1.0).log2() as u32 + 1
+            ),
+            Mode::TernaryRotated(t) => {
+                format!("TERNARY {t} ROTATED, {:.2} bits", ternary_bits(t))
+            }
             Mode::TernaryPerTap(planes) => format!(
                 "TERNARY per tap {planes:?}, {:.2} bits avg",
                 planes.iter().map(|&t| ternary_bits(t)).sum::<f64>() / planes.len() as f64
@@ -228,19 +277,31 @@ impl Mode {
             }
             // Resolved to a plane count by `perplexity_aq` before it gets here.
             Mode::TernaryPerTap(_) => unreachable!("per-tap modes are resolved by the caller"),
-            Mode::Ternary(t) => {
-                // The ladder fitter operates on a [rows, cols] matrix with per-group scales — the
-                // same code path the weights use. Rotation is Never: the Hadamard is a weight-side
-                // transform folded into activations at deploy time, and applying it here as well
-                // would double-count it.
+            Mode::PerGroupRotated(levels) => {
+                for r in 0..seq {
+                    for g in v[r * cols..r * cols + cols].chunks_mut(ACT_GROUP) {
+                        if !g.len().is_power_of_two() {
+                            quant_span(g, levels);
+                            continue;
+                        }
+                        ste::fast_hadamard(g);
+                        quant_span(g, levels);
+                        ste::fast_hadamard(g); // normalized H is its own inverse
+                    }
+                }
+            }
+            // The ladder fitter operates on a [rows, cols] matrix with per-group scales — the same
+            // code path the weights use. `Ternary` quantizes the activation in the ORIGINAL basis;
+            // `TernaryRotated` in the group-Hadamard basis the weights were fitted in. The first is
+            // what this table published on 2026-09-16; the second is what a rotated runtime runs.
+            Mode::Ternary(t) | Mode::TernaryRotated(t) => {
+                let rotation = if matches!(self, Mode::TernaryRotated(_)) {
+                    RotationPolicy::Always
+                } else {
+                    RotationPolicy::Never
+                };
                 let q = ste::salt_quantize_forward_grouped_geometric(
-                    v,
-                    seq,
-                    cols,
-                    t,
-                    ACT_GROUP,
-                    GRID,
-                    RotationPolicy::Never,
+                    v, seq, cols, t, ACT_GROUP, GRID, rotation,
                 );
                 v.copy_from_slice(&q);
             }
@@ -337,8 +398,26 @@ fn activation_precision_sweep() {
     );
     println!("{}", "-".repeat(74));
 
-    let mut baseline = f64::NAN;
-    for mode in [
+    // `TRITIUM_AP_ONLY=rotation` runs just the basis comparison (H7) instead of the whole grid.
+    // `rotation-low` resumes it from x4 (each arm is ~5 min on a 16-core host).
+    let only = std::env::var("TRITIUM_AP_ONLY").unwrap_or_default();
+    let rotation_only = only == "rotation";
+    let rotation_arms = [
+        Mode::None,
+        Mode::PerGroup(127.0),
+        Mode::PerGroupRotated(127.0),
+        Mode::PerGroup(7.0),
+        Mode::PerGroupRotated(7.0),
+        Mode::Ternary(5),
+        Mode::TernaryRotated(5),
+        Mode::Ternary(4),
+        Mode::TernaryRotated(4),
+        Mode::Ternary(3),
+        Mode::TernaryRotated(3),
+        Mode::Ternary(2),
+        Mode::TernaryRotated(2),
+    ];
+    let full_arms = [
         Mode::None,
         Mode::PerRow(127.0),
         Mode::PerGroup(127.0),
@@ -364,7 +443,20 @@ fn activation_precision_sweep() {
         // The anti-control: spend the extra planes where the measured headroom is LOWEST. If this
         // ties the arms above, the per-tap signal is noise and the measurement says so out loud.
         Mode::TernaryPerTap([5, 5, 2, 4, 4]),
-    ] {
+    ];
+    // The fp32 row stays first: it is the baseline every "vs A-fp32" delta is taken against.
+    let resumed: Vec<Mode> = std::iter::once(Mode::None)
+        .chain(rotation_arms[8..].iter().copied())
+        .collect();
+    let arms: &[Mode] = if rotation_only {
+        &rotation_arms
+    } else if only == "rotation-low" {
+        &resumed
+    } else {
+        &full_arms
+    };
+    let mut baseline = f64::NAN;
+    for &mode in arms {
         let ppl = perplexity_aq(&qw, &arch, &eval, EVAL_WINDOW, mode);
         if baseline.is_nan() {
             baseline = ppl;
