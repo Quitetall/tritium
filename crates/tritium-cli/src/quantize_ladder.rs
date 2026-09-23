@@ -14,9 +14,12 @@
 //!
 //! - **No salience fold.** The AWQ-style fold needs activation statistics from a calibration
 //!   corpus; `tritium quantize` reads a safetensors file and nothing else.
-//! - **No rotation.** [`RotationPolicy::Never`] is the only correct choice here: the ladder fits in
-//!   the rotated basis, and the bundle carries no rotation metadata, so a rotated artifact would
-//!   silently reconstruct `W·H` instead of `W`.
+//! - **Rotation is opt-in, not unavailable.** It used to be impossible here: a rotated fit stores
+//!   codes for `W·H` and the v1 bundle had nowhere to say so. A version-2 bundle records the
+//!   Hadamard group, so `--rotate` works — but only with `--format sidecar`, because the
+//!   progressive bundle and the SALT GGUF still have no such field. That combination is refused
+//!   rather than written. Worth taking where the container allows: on SmolLM2-135M, no fold, T=3,
+//!   rotation is **1.167× fp against 1.246× without**.
 //!
 //! Measured on SmolLM2-360M, WikiText-2 32,768-token held-out (fp 14.909), in **exactly this
 //! configuration** — no fold, no rotation, `g256`:
@@ -32,6 +35,12 @@
 //! supplies that; without rotation the free-scale fitter adapts to heavy tails and the rigid grid
 //! cannot. Both `T=2` settings are unusable in absolute terms (21.9× and 323× fp), so the practical
 //! rule is `T≥3`, which [`LadderConfig::validate`] enforces.
+//!
+//! That `T≥3` floor is stated against the table above, which is unrotated. `--rotate` supplies
+//! exactly the conditioning the `T=2` failure is attributed to, so the floor may well be too
+//! conservative there — but nobody has measured `T=2` rotated through this path, and the guard
+//! stays until somebody does. A refusal that is merely conservative costs a user one flag; a
+//! relaxation justified by a mechanism nobody measured costs them a 323× model.
 //!
 //! # Byte accounting
 //!
@@ -64,6 +73,12 @@ pub(crate) struct LadderConfig {
     pub(crate) planes: usize,
     pub(crate) group: usize,
     pub(crate) grid: usize,
+    /// Fit each group in the Hadamard-rotated basis.
+    ///
+    /// The packed codes are then in that basis, so the artifact MUST be written as a rotated
+    /// bundle and the runtime MUST rotate the activation before projecting — `H` is symmetric, so
+    /// `(H·L)·x = L·(H·x)`. Measured worth on SmolLM2-135M: **21.1% at T=3**, 1.6% at T=4.
+    pub(crate) rotate: bool,
 }
 
 impl LadderConfig {
@@ -77,6 +92,14 @@ impl LadderConfig {
         }
         // A TQ2_0 block carries ONE f16 scale for 256 trits. The ladder's scale is per group, so a
         // block straddling two groups would need two anchors and could not be encoded.
+        // `fast_hadamard` asserts a power-of-two length, and the rotation group is the scale
+        // group. A multiple of 256 is not automatically a power of two (768 is not).
+        if self.rotate && !self.group.is_power_of_two() {
+            bail!(
+                "--group must be a power of two to rotate (the Hadamard requires it); got {}",
+                self.group
+            );
+        }
         if !self.group.is_multiple_of(QK_K) {
             bail!(
                 "--group must be a multiple of {QK_K} for the SALT bundle: a TQ2_0 block holds one \
@@ -109,7 +132,7 @@ impl LadderConfig {
 
 /// Fit one 2-D weight tensor with the ladder and pack it into per-output-channel [`SaltRow`]s.
 ///
-/// `wf` is row-major `[rows, cols]`. Rotation is fixed to [`RotationPolicy::Never`] — see the module
+/// `wf` is row-major `[rows, cols]`. Rotation follows [`LadderConfig::rotate`] — see the module
 /// docs; passing anything else would produce an artifact that reconstructs the wrong weights.
 pub(crate) fn quantize_tensor_ladder(
     wf: &[f32],
@@ -117,7 +140,6 @@ pub(crate) fn quantize_tensor_ladder(
     cols: usize,
     cfg: &LadderConfig,
 ) -> Result<Vec<SaltRow>> {
-    let groups_per_row = cols.div_ceil(cfg.group);
     let fits = ste::geometric_ladder_fit(
         wf,
         rows,
@@ -125,16 +147,34 @@ pub(crate) fn quantize_tensor_ladder(
         cfg.planes,
         cfg.group,
         cfg.grid,
-        RotationPolicy::Never,
+        if cfg.rotate {
+            RotationPolicy::Always
+        } else {
+            RotationPolicy::Never
+        },
     );
+    pack_group_fits(&fits, rows, cols, cfg)
+}
+
+/// Pack `(s₀, plane-major trits)` per group into per-output-channel [`SaltRow`]s.
+///
+/// The fits may come from the plain ladder or from the activation-aware fitter
+/// ([`tritium_nn::salt_fit::fit_tensor`]); both emit this shape, so the container is identical
+/// either way and only the digits differ.
+pub(crate) fn pack_group_fits(
+    fits: &[(f32, Vec<Vec<i8>>)],
+    rows: usize,
+    cols: usize,
+    cfg: &LadderConfig,
+) -> Result<Vec<SaltRow>> {
+    let groups_per_row = cols.div_ceil(cfg.group);
     if fits.len() != rows * groups_per_row {
         bail!(
-            "ladder fit returned {} groups, expected {} ({rows} rows x {groups_per_row} groups)",
+            "fit returned {} groups, expected {} ({rows} rows x {groups_per_row} groups)",
             fits.len(),
             rows * groups_per_row
         );
     }
-
     let blocks_per_row = cols.div_ceil(QK_K);
     let mut out = Vec::with_capacity(rows);
     for r in 0..rows {

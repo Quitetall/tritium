@@ -31,7 +31,9 @@ use tritium_spec::TernaryBackend;
 
 use crate::config::{ArchSpec, ModelConfig};
 use crate::error::NnError;
-use crate::layers::{Projection, Q2Linear, TernaryLinear, TokenEmbedding, TransformerBlock};
+use crate::layers::{
+    ActivationPrecision, Mlp, Projection, Q2Linear, TernaryLinear, TokenEmbedding, TransformerBlock,
+};
 use crate::tensor::f16_bytes_to_f32;
 
 /// The weights for one decoder layer, ready to run.
@@ -65,6 +67,69 @@ pub struct ModelWeights {
 }
 
 impl ModelWeights {
+    /// Switch every SALT projection in the model to per-group activation quantization, or back to
+    /// per-token. Returns how many projections were touched.
+    ///
+    /// One absmax per token lets a single outlier set the quantization step for a whole row, and
+    /// LLM activations are outlier-heavy. Measured end to end, this is worth **0.24% at best and
+    /// only on an unrotated artifact**; with rotation on — the default — it is worth nothing,
+    /// because the Hadamard already whitens the activation. See
+    /// [`SaltLinear::set_activation_group`] for the table and the mechanism.
+    ///
+    /// Off by default and switched per model rather than per build, because the per-group path
+    /// hands the GEMM dequantized f32 instead of integers (a per-group scale cannot factor out of
+    /// the dot product). On the SALT path that costs no accuracy; an int8 kernel cannot consume it
+    /// at all.
+    ///
+    /// Only [`Projection::Salt`] responds. The count lets a caller assert it reached a model that
+    /// actually has SALT projections rather than silently configuring nothing — a zero return on a
+    /// model you believe is quantized means it is not, or not on this path.
+    pub fn set_salt_activation_group(&mut self, group: Option<usize>) -> usize {
+        self.set_salt_activation_precision(match group {
+            Some(g) => ActivationPrecision::PerGroup(g),
+            None => ActivationPrecision::PerToken,
+        })
+    }
+
+    /// Set every SALT projection's activation precision. Returns how many were touched.
+    ///
+    /// See [`ActivationPrecision`]. Only [`Projection::Salt`] responds; a zero return on a model you
+    /// believe is quantized means it is not, or not on this path.
+    pub fn set_salt_activation_precision(&mut self, precision: ActivationPrecision) -> usize {
+        fn apply(projection: &mut Projection, precision: ActivationPrecision, count: &mut usize) {
+            if let Projection::Salt(salt) = projection {
+                salt.set_activation_precision(precision);
+                *count += 1;
+            }
+        }
+        let mut count = 0;
+        for layer in &mut self.layers {
+            for projection in [
+                &mut layer.q_proj,
+                &mut layer.k_proj,
+                &mut layer.v_proj,
+                &mut layer.o_proj,
+            ] {
+                apply(projection, precision, &mut count);
+            }
+            let (gate, up, down) = match &mut layer.mlp {
+                Mlp::Relu2(mlp) => (&mut mlp.gate, &mut mlp.up, &mut mlp.down),
+                Mlp::SwiGlu(mlp) => (&mut mlp.gate, &mut mlp.up, &mut mlp.down),
+            };
+            for projection in [gate, up, down] {
+                apply(projection, precision, &mut count);
+            }
+        }
+        // The tied head lives in `token_embd` and is NOT reached here: it projects through
+        // `TokenEmbedding::unembed_exact`, which applies no activation quantization at all
+        // ("No A8 activation quantization is applied on this path"). An untied head is a
+        // `Projection` like any other and is switched.
+        if let Some(head) = &mut self.lm_head {
+            apply(head, precision, &mut count);
+        }
+        count
+    }
+
     /// Load all weights from a parsed GGUF `file` per `config`, uploading ternary
     /// tensors to `backend`. `bytes` is the full GGUF byte buffer (the reader does
     /// not retain payloads; the loader locates each with

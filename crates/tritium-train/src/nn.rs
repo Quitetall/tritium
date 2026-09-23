@@ -30,6 +30,36 @@ pub fn attention(
     head_dim: usize,
     theta: f32,
 ) -> ValueId {
+    let cat = attention_heads(
+        t, x, wq, wk, wv, seq, n_embd, n_head, n_kv_head, head_dim, theta,
+    );
+    t.dense_matmul(cat, wo, seq, n_embd, n_head * head_dim)
+}
+
+/// [`attention`] **without** the output projection: returns the concatenated head outputs,
+/// `[seq, n_head * head_dim]`, which is `o_proj`'s input.
+///
+/// Split out so a caller can reach that activation. It is the one projection input in a block that
+/// [`attention`] used to hide, which made it the one projection an activation-precision sweep could
+/// not quantize — every such number was an upper bound with 1 of 7 projections unpenalised, and the
+/// salience fold has no calibration tap for it either.
+///
+/// The caller supplies the missing multiply: `t.dense_matmul(cat, wo, seq, n_embd, n_head *
+/// head_dim)`. [`attention`] is exactly that and nothing else, so the two cannot drift.
+#[allow(clippy::too_many_arguments)]
+pub fn attention_heads(
+    t: &mut Tape,
+    x: ValueId,
+    wq: ValueId,
+    wk: ValueId,
+    wv: ValueId,
+    seq: usize,
+    n_embd: usize,
+    n_head: usize,
+    n_kv_head: usize,
+    head_dim: usize,
+    theta: f32,
+) -> ValueId {
     assert!(
         n_head.is_multiple_of(n_kv_head),
         "n_head {n_head} must be a multiple of n_kv_head {n_kv_head}"
@@ -59,6 +89,5 @@ pub fn attention(
         let vt = t.transpose(vh, seq, head_dim);
         head_outs.push(t.dense_matmul(p, vt, seq, head_dim, seq)); // p · vh
     }
-    let cat = t.concat_cols(&head_outs, seq, &vec![head_dim; n_head]);
-    t.dense_matmul(cat, wo, seq, n_embd, qd)
+    t.concat_cols(&head_outs, seq, &vec![head_dim; n_head])
 }

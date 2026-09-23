@@ -13,7 +13,8 @@
 //! projection is a property of the model, not of any tensor, so the fold has to run on a loaded
 //! model. Hence a separate command.
 //!
-//! Measured value of the fold on SmolLM2-360M: **2.3× at T=2, 8.5% at T=3, 1.1% at T=4**.
+//! Measured value of the fold on SmolLM2-360M **with rotation**: 2.3× at T=2, 8.5% at T=3, 1.1%
+//! at T=4. Those gains do NOT survive without rotation — see below; the fold is conditional on it.
 //!
 //! # What the artifact has to contain, and why
 //!
@@ -31,10 +32,19 @@
 //! | `model.tslb` | the SALT bundle: embedding + every projection |
 //! | tokenizer assets | copied when present, so the directory is usable on its own |
 //!
-//! This is the same asymmetry that makes the Hadamard rotation unrepresentable — a rotated fit
-//! reconstructs `W·H` and the bundle has nowhere to record `H`. The fold escapes it only because
-//! its other half lands in a tensor the format already carries. Rotation stays off here for
-//! exactly that reason.
+//! Rotation used to be excluded for a related reason — a rotated fit reconstructs `W·H`, and the
+//! v1 bundle had nowhere to say so. That turned out to be a smaller gap than the doc claimed:
+//! `fast_hadamard` is a fixed, parameterless Walsh–Hadamard fully determined by the group width,
+//! so nothing has to record `H`, only **whether** and **how wide**. A version-2 bundle carries that
+//! one field, readers that predate it reject it outright rather than silently computing `W·H·x`,
+//! and rotation is now on by default. See `--no-rotation` to reproduce the old artifact.
+//!
+//! The runtime side is not symmetric, and the asymmetry is worth stating because getting it wrong
+//! is silent. A projection can move the Hadamard onto its activation — `(H·c)·x = c·(H·x)`, since
+//! `H` is symmetric and its own inverse — so `SaltLinear` rotates the activation before the int8
+//! grid. **Gather cannot**: an embedding row has no activation to move it onto, so `TokenEmbedding`
+//! un-rotates the decoded row instead. The tied head goes back to the projection rule, one
+//! `n_embd`-wide transform rather than `vocab` of them.
 //!
 //! # Reading the fidelity receipt
 //!
@@ -49,22 +59,51 @@
 //! allocation: 12.4% lower weight SSE, 12% *worse* perplexity. The receipt says so in its own
 //! `interpretation` field, since that file is what a downstream consumer reads.
 //!
-//! # Configuration that has never been measured
+//! # Fold-without-rotation, measured — and it is worse than doing nothing
 //!
-//! Fold-without-rotation is a *new* point: the published numbers are fold **and** rotation, and
-//! `quantize`'s numbers are neither. The measured anchors for the no-fold/no-rotation path this
-//! shares are 1.335× fp at T=3 and 1.024× at T=4 (SmolLM2-360M, g256). What the fold is worth on
-//! top of those is not yet known, so this command reports its recipe and makes no quality claim.
+//! This used to read "a configuration that has never been measured". It has been, on 2026-09-12:
+//! SmolLM2-135M, WikiText-2 full 32,768-token split, all four corners of {fold, rotation}.
+//!
+//! | config | T=3 | T=4 | ships as |
+//! |---|---|---|---|
+//! | fold + rotation | **1.071×** | **1.013×** | every published number — **and now the default here** |
+//! | rotation only | 1.167× | 1.018× | `--fold-alpha 0` |
+//! | neither | 1.246× | 1.023× | `tritium quantize` |
+//! | **fold only** | **1.297×** | **1.029×** | `--no-rotation` at `alpha > 0`, which warns |
+//!
+//! **The fold is conditional on rotation, not independent of it.** Added with the Hadamard present
+//! it removes a 9.03% deficit at T=3; added without it, it *opens* a 4.1% one (1.297× against
+//! 1.246×). Same transform, opposite sign. The mechanism is already recorded elsewhere in this
+//! repo: the fold deliberately makes weight-space error **51% worse** (0.0252 → 0.0380) to protect
+//! channels activations excite, and the rotation is what re-conditions the distorted distribution
+//! for the ladder's rigid 1/3 spacing. Unrotated, that distortion is simply uncompensated.
+//!
+//! `--fold-alpha` defaulted to **0** for exactly as long as this path could not rotate. It can now,
+//! so the default is **0.75** again and the warning fires only under `--no-rotation`, which is the
+//! one corner where the fold hurts.
+//!
+//! # What the published table does NOT include
+//!
+//! Every number above is weight-quantized with fp32 activations, measured through the research
+//! tape. `SaltLinear::forward` int8-quantizes the activation before every projection, and that is
+//! a further tax the table does not carry — +1.08% at T=4 on 360M, which as a fraction of the
+//! excess over fp *doubles* the gap. The end-to-end check that gates this path
+//! (`convert_roundtrip::rotation_reaches_the_artifact_and_does_not_cost_quality`) therefore scores
+//! through `ModelRunner`, A8 included: SmolLM2-135M at T=4/g256 with the fold, 29.3795 unrotated
+//! against **28.2470** rotated, and whole-model weight error 0.0382 → 0.0195.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use tritium_format::{SaltRow, salt_rows_to_dense, write_salt_bundle};
+use tritium_format::salt_joint_bundle::write_joint_salt_bundle;
+use tritium_format::{SaltRow, salt_rows_to_dense, write_rotated_salt_bundle, write_salt_bundle};
 use tritium_nn::calibrate::{Calib, calibrate, extract, fold, norm_tensors, weight_names};
 use tritium_nn::{HfJsonTokenizer, ModelRunner, Tokenizer};
+use tritium_train::ops::ste::{fast_hadamard, group_is_rotatable};
 
-use crate::quantize_ladder::{LadderConfig, quantize_tensor_ladder};
+use crate::quantize_ladder::{LadderConfig, pack_group_fits, quantize_tensor_ladder};
+use tritium_nn::salt_fit::{ActivationAwareConfig, TapGrams, fit_tensor};
 
 /// Calibration window length. Matches the research harness's `EVAL_WINDOW` so a `convert` run and
 /// a harness run see the same context structure; the fold only reads per-channel second moments,
@@ -87,6 +126,18 @@ pub(crate) struct ConvertConfig {
     pub(crate) calib_tokens: usize,
     pub(crate) fold_alpha: f64,
     pub(crate) ladder: LadderConfig,
+    /// Write the padded TQ2_0 bundle instead of the entropy-coded one. The kernel format is the
+    /// same either way — only what sits on disk differs.
+    pub(crate) dense_container: bool,
+    /// Fit in the activation metric (GPTQ + trit search + step refits) instead of rounding to the
+    /// nearest ladder point. Needs `--calib`, and costs one Gram per projection input.
+    pub(crate) activation_aware: bool,
+    /// Fraction of each column's rounding error GPTQ propagates. `None` picks it per tensor from
+    /// the calibration size and the tensor's input width (`salt_fit::auto_decay`); `Some(1.0)` is
+    /// plain GPTQ.
+    pub(crate) gptq_decay: Option<f64>,
+    /// Ramp the decay over the column order instead of applying it uniformly.
+    pub(crate) gptq_decay_ramp: bool,
 }
 
 pub(crate) fn run(model: &Path, out: &Path, cfg: &ConvertConfig) -> Result<()> {
@@ -97,11 +148,34 @@ pub(crate) fn run(model: &Path, out: &Path, cfg: &ConvertConfig) -> Result<()> {
             cfg.fold_alpha
         );
     }
+    if let Some(decay) = cfg.gptq_decay.filter(|d| !(*d > 0.0 && *d <= 1.0)) {
+        bail!("--gptq-decay must be `auto` or a number in (0, 1]; got {decay}");
+    }
+    if cfg.activation_aware && cfg.calib.is_none() {
+        bail!(
+            "--activation-aware fits against the activation Gram, which needs calibration text. \
+             Pass --calib <corpus>."
+        );
+    }
     if cfg.calib.is_none() && cfg.fold_alpha != 0.0 {
         bail!(
             "--fold-alpha {} was requested but there is no calibration corpus to measure salience \
              from. Pass --calib <corpus>, or --fold-alpha 0 to convert without the fold (which is \
              what `tritium quantize` already does).",
+            cfg.fold_alpha
+        );
+    }
+
+    // Only when the Hadamard is absent. With rotation the fold is worth 21.1% at T=3, which
+    // is the opposite sign; printing this there would be actively misleading.
+    if cfg.fold_alpha != 0.0 && !cfg.ladder.rotate {
+        // Measured 2026-09-12, SmolLM2-135M / WikiText-2 full split, against fold+rotation:
+        //   T=3  fold+rot 1.071x | fold only 1.297x | neither 1.246x
+        //   T=4  fold+rot 1.013x | fold only 1.029x | neither 1.023x
+        // The fold is CONDITIONAL on rotation, not independent of it: adding it helps when the
+        // Hadamard is present and hurts when it is not, at both plane counts.
+        eprintln!(
+            "warning: --fold-alpha {} without rotation produces a WORSE artifact than              --fold-alpha 0.\n         Measured on SmolLM2-135M: T=3 1.297x fp folded vs 1.246x              unfolded (published fold+rotation is 1.071x).\n         The fold distorts weights to              protect salient channels and relies on the Hadamard to re-condition them; this path              cannot rotate because the bundle carries no rotation metadata.",
             cfg.fold_alpha
         );
     }
@@ -154,21 +228,95 @@ pub(crate) fn run(model: &Path, out: &Path, cfg: &ConvertConfig) -> Result<()> {
         None => (fp, arch, "no calibration fold".to_owned()),
     };
 
-    // Fit every projection with the ladder. `shapes[i]` is `(n_out, k_in)` for `weights[i]`.
+    // Grams for the activation-aware fit, on the FOLDED weights: the fit must see the distribution
+    // the deployed model sees. Collected once and shared by every projection of a layer.
+    let grams = if cfg.activation_aware {
+        let path = cfg.calib.as_ref().expect("validated above");
+        let tokens = load_calibration_tokens(path, model, cfg.calib_tokens, arch.vocab)?;
+        let windows: Vec<&[u32]> = tokens
+            .as_chunks::<CALIB_WINDOW>()
+            .0
+            .iter()
+            .map(|w| &w[..])
+            .collect();
+        println!(
+            "  collecting activation Grams over {} x {CALIB_WINDOW} tokens…",
+            windows.len()
+        );
+        Some((
+            TapGrams::collect(&weights, &arch, &windows),
+            windows.len() * CALIB_WINDOW,
+        ))
+    } else {
+        None
+    };
+    let (grams, calibration_tokens) = match grams {
+        Some((grams, tokens)) => (Some(grams), tokens),
+        None => (None, 0),
+    };
+    let fit_cfg = ActivationAwareConfig {
+        planes: cfg.ladder.planes,
+        group: cfg.ladder.group,
+        grid: cfg.ladder.grid,
+        damp: 0.01,
+        search_sweeps: 8,
+        refit_scale: true,
+        rotate: cfg.ladder.rotate,
+        decay: 1.0,
+        decay_ramp: cfg.gptq_decay_ramp,
+    };
+    let mut activation_aware_tensors = 0usize;
+    // The decay each tensor was fitted with, for the receipt: auto varies it with input width.
+    let mut decays_used: Vec<f64> = Vec::new();
+
+    // Fit every projection. `shapes[i]` is `(n_out, k_in)` for `weights[i]`.
     let mut quantized: Vec<(String, Vec<SaltRow>)> = Vec::with_capacity(weights.len());
     let mut total_params = 0usize;
     let mut fidelity: Vec<TensorFidelity> = Vec::with_capacity(weights.len());
-    for ((name, w), &(rows, k)) in names.iter().zip(&weights).zip(&shapes) {
+    for (i, ((name, w), &(rows, k))) in names.iter().zip(&weights).zip(&shapes).enumerate() {
         if w.len() != rows * k {
             bail!("{name}: {} values for shape [{rows}, {k}]", w.len());
         }
-        let fitted = quantize_tensor_ladder(w, rows, k, &cfg.ladder)
-            .with_context(|| format!("ladder-quantize {name}"))?;
+        // The tied embedding has no Gram — it is a gather as well as a projection, so a fit that
+        // suits one corrupts the other — and neither does any tensor when `--calib` is absent.
+        let fitted = match grams.as_ref().filter(|_| i > 0).and_then(|g| {
+            let li = (i - 1) / 7;
+            let slot = (i - 1) % 7;
+            let decay = cfg
+                .gptq_decay
+                .unwrap_or_else(|| tritium_nn::salt_fit::auto_decay(calibration_tokens, k));
+            let tensor_cfg = ActivationAwareConfig { decay, ..fit_cfg };
+            fit_tensor(w, rows, k, g.for_slot(li, slot), &tensor_cfg).map(|fits| (fits, decay))
+        }) {
+            Some((fits, decay)) => {
+                activation_aware_tensors += 1;
+                decays_used.push(decay);
+                pack_group_fits(&fits, rows, k, &cfg.ladder)
+                    .with_context(|| format!("pack activation-aware fit for {name}"))?
+            }
+            // A Gram still singular after damping saw no signal; fall back rather than propagate.
+            None => quantize_tensor_ladder(w, rows, k, &cfg.ladder)
+                .with_context(|| format!("ladder-quantize {name}"))?,
+        };
         // Score the PACKED rows, not a re-run of the fitter: the f16 block scales are rounded on
         // the way into TQ2_0, so decoding the artifact is the only way to report the error the
         // user's file actually has rather than the one the fit intended.
-        let decoded = salt_rows_to_dense(&fitted)
+        let mut decoded = salt_rows_to_dense(&fitted)
             .map_err(|e| anyhow::anyhow!("decode {name} for the fidelity receipt: {e}"))?;
+        // A rotated fit stores codes for `H·w`, so the raw decode is in the rotated basis and
+        // comparing it against `w` measures the Hadamard, not the quantizer — it reported 1.42
+        // relative error on a model whose real error is 0.0195. `H` is its own inverse, so one more
+        // pass per group returns the original basis. Must happen before `measure`, and `decoded`
+        // has no other reader.
+        if cfg.ladder.rotate {
+            for row in decoded.chunks_mut(k) {
+                for slice in row.chunks_mut(cfg.ladder.group) {
+                    if group_is_rotatable(slice.len()) {
+                        fast_hadamard(slice);
+                    }
+                }
+            }
+        }
         fidelity.push(TensorFidelity::measure(name, rows, k, w, &decoded)?);
         total_params += rows * k;
         quantized.push((name.clone(), fitted));
@@ -180,7 +328,38 @@ pub(crate) fn run(model: &Path, out: &Path, cfg: &ConvertConfig) -> Result<()> {
         .iter()
         .map(|(n, r)| (n.as_str(), r.as_slice()))
         .collect();
-    let bundle = write_salt_bundle(&refs).context("serialize SALT bundle")?;
+    // A rotated fit stores codes in the rotated basis, so the artifact has to say so: the runtime
+    // must apply the same Hadamard to the activation, and a reader that cannot would otherwise
+    // compute `W·H·x` silently. Version 2 makes such a reader fail closed instead.
+    let rotation_group = if cfg.ladder.rotate {
+        Some(
+            u16::try_from(cfg.ladder.group)
+                .context("--group does not fit the bundle's u16 rotation field")?,
+        )
+    } else {
+        None
+    };
+    // The file stores the information; the kernel format is rebuilt at load. TQ2_0 on disk spends
+    // 2 bits per trit where log2(3) suffices and pads every row to whole 256-trit blocks — measured
+    // 7.965 bpw for a T=3 SmolLM2-135M against 4.577 for the same weights entropy-coded.
+    let (bundle, container) = if cfg.dense_container {
+        let bytes = match rotation_group {
+            Some(group) => {
+                write_rotated_salt_bundle(&refs, group).context("serialize rotated SALT bundle")?
+            }
+            None => write_salt_bundle(&refs).context("serialize SALT bundle")?,
+        };
+        (
+            bytes,
+            "TQ2_0 planes, padded to 256-trit blocks (2 bits/trit + f16 scale per block)",
+        )
+    } else {
+        (
+            write_joint_salt_bundle(&refs, rotation_group)
+                .context("serialize joint-coded SALT bundle")?,
+            "TSLJ joint-symbol Huffman, unpadded (scales as TQ2_0 stores them)",
+        )
+    };
     let bundle_path = out.join("model.tslb");
     std::fs::write(&bundle_path, &bundle)
         .with_context(|| format!("write {}", bundle_path.display()))?;
@@ -214,6 +393,7 @@ pub(crate) fn run(model: &Path, out: &Path, cfg: &ConvertConfig) -> Result<()> {
         &fidelity,
         total_params,
         bundle.len(),
+        container,
     )?;
 
     // Load the artifact back before claiming success. Every failure mode this command can have —
@@ -229,11 +409,39 @@ pub(crate) fn run(model: &Path, out: &Path, cfg: &ConvertConfig) -> Result<()> {
             )
         })?;
 
-    let bpw = cfg.ladder.realizable_bpw();
+    // What the FILE costs, not the logical per-plane rate. This used to print the latter, which
+    // omitted block padding and read 6.1875 for a T=3 artifact that was 7.965 bpw on disk.
+    let bpw = bundle.len() as f64 * 8.0 / total_params as f64;
+    // The bundle version already encodes this, but the line a user reads should not have to
+    // be cross-checked against a byte offset.
+    let fit_desc = if activation_aware_tensors > 0 {
+        let (lo, hi) = decays_used
+            .iter()
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &d| {
+                (lo.min(d), hi.max(d))
+            });
+        let decay_desc = match (cfg.gptq_decay, cfg.gptq_decay_ramp) {
+            (Some(1.0), _) => "undecayed".to_owned(),
+            (Some(d), false) => format!("decay {d}"),
+            (Some(d), true) => format!("ramp decay to {d}"),
+            (None, ramp) => format!(
+                "auto decay {lo:.2}–{hi:.2}{}",
+                if ramp { " ramped" } else { "" }
+            ),
+        };
+        format!("activation-metric fit on {activation_aware_tensors} projections, {decay_desc}")
+    } else {
+        "nearest-point fit".to_owned()
+    };
+    let rotation_desc = if cfg.ladder.rotate {
+        format!("Hadamard per g{}", cfg.ladder.group)
+    } else {
+        "no rotation".to_owned()
+    };
     println!(
-        "converted {} tensors ({:.2}M params) | ladder geometric, {} planes, g{}, grid {}, no \
-         rotation, {fold_desc} → {} ({:.1} MiB bundle + {:.1} KiB norms + config + {copied_assets} \
-         tokenizer files, {bpw:.4} bpw)",
+        "converted {} tensors ({:.2}M params) | ladder geometric, {} planes, g{}, grid {}, \
+         {rotation_desc}, {fit_desc}, {fold_desc} → {} ({:.1} MiB bundle + {:.1} KiB norms + \
+         config + {copied_assets} tokenizer files, {bpw:.4} bpw on disk)",
         names.len(),
         total_params as f64 / 1e6,
         cfg.ladder.planes,
@@ -313,6 +521,7 @@ fn write_receipt(
     fidelity: &[TensorFidelity],
     total_params: usize,
     bundle_bytes: usize,
+    container: &str,
 ) -> Result<f64> {
     let sq_error: f64 = fidelity.iter().map(|f| f.sq_error).sum();
     let sq_weight: f64 = fidelity.iter().map(|f| f.sq_weight).sum();
@@ -343,17 +552,21 @@ fn write_receipt(
             "planes": cfg.ladder.planes,
             "group": cfg.ladder.group,
             "grid": cfg.ladder.grid,
-            // Recorded explicitly because its absence is load-bearing: the SALT bundle has nowhere
-            // to store a rotation matrix, so a rotated fit would reconstruct W*H instead of W.
-            "rotation": "none",
+            // Load-bearing either way. `fast_hadamard` is parameterless, so "hadamard" plus the
+            // group width is the whole transform — but a reader that ignores it reconstructs W*H
+            // instead of W, which is why the bundle version carries it too.
+            "rotation": if cfg.ladder.rotate { "hadamard" } else { "none" },
+            "rotation_group": if cfg.ladder.rotate { Some(cfg.ladder.group) } else { None },
             "fold_alpha": if cfg.calib.is_some() { cfg.fold_alpha } else { 0.0 },
             "calibration": fold_desc,
         },
         "cost": {
             "parameters": total_params,
-            "bits_per_weight": cfg.ladder.realizable_bpw(),
+            // The file, measured. The kernel's in-memory rate is `in_memory_bits_per_weight`.
+            "bits_per_weight": bundle_bytes as f64 * 8.0 / total_params as f64,
+            "in_memory_bits_per_weight": cfg.ladder.realizable_bpw(),
             "bundle_bytes": bundle_bytes,
-            "container": "TQ2_0 planes (2 bits/trit + one f16 scale per 256)",
+            "container": container,
         },
         "fidelity": {
             "whole_model_relative_frobenius_error": whole_model,

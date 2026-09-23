@@ -197,10 +197,79 @@ enum Command {
         /// Calibration tokens to use (rounded down to whole 512-token windows).
         #[arg(long, default_value_t = 4096)]
         calib_tokens: usize,
-        /// Salience-fold strength. 0.75 is the value every published SALT number used, but the
-        /// optimum shifts DOWN with model size (0.75 -> 0.50 observed), so it is worth sweeping.
+        /// Salience-fold strength. 0.75 is the value every published SALT number used.
+        ///
+        /// Requires `--calib`, because there is no salience to fold without activation statistics.
+        /// Pass `--fold-alpha 0` to convert without it.
+        ///
+        /// The fold is **conditional on rotation**, not independent of it. Measured on
+        /// SmolLM2-135M, WikiText-2 full 32,768-token split, all four corners:
+        ///
+        /// | config | T=3 | T=4 |
+        /// |---|---|---|
+        /// | fold + rotation (the default) | **1.071x** | **1.013x** |
+        /// | rotation only | 1.167x | 1.018x |
+        /// | fold only | 1.297x | 1.029x |
+        /// | neither | 1.246x | 1.023x |
+        ///
+        /// Read the third row against the fourth: with no Hadamard the fold makes the artifact
+        /// WORSE, because it deliberately distorts weights (51% worse weight-space error) to
+        /// protect the channels activations excite, and the rotation is what re-conditions that
+        /// distortion for the ladder's rigid 1/3 spacing. So `--no-rotation --fold-alpha 0.75` is
+        /// the worst of the four and prints a warning; rotation is on by default, which is why
+        /// this is 0.75 again.
         #[arg(long, default_value_t = 0.75)]
         fold_alpha: f64,
+        /// Fit in the original basis instead of the Hadamard-rotated one.
+        ///
+        /// Rotation is on by default because it is worth **21.1% at T=3** (1.071x fp against
+        /// 1.297x) and because the salience fold depends on it — the fold deliberately distorts
+        /// weights and the Hadamard is what re-conditions them for the ladder's rigid 1/3 spacing.
+        /// A rotated artifact is a version-2 bundle, which readers that cannot rotate reject
+        /// outright rather than silently computing `W·H·x`. Pass this only to reproduce the old
+        /// unrotated artifact.
+        #[arg(long)]
+        no_rotation: bool,
+        /// Choose each weight's code in the ACTIVATION metric instead of rounding to the nearest
+        /// ladder point.
+        ///
+        /// Rounding minimizes `‖W − Ŵ‖²`, but the loss sees `W·x`, not `W`. This fits
+        /// `‖(W − Ŵ)·X‖²` with GPTQ error compensation, a discrete search over the trit moves, and
+        /// closed-form refits of each group's step. Same bits, same container, same file size.
+        ///
+        /// Measured on SmolLM2-135M at T=3: **−0.64% perplexity**. Requires `--calib`, and costs one
+        /// Gram per projection input plus a fit per tensor, so conversion takes markedly longer.
+        ///
+        /// Give it as much calibration text as you can spare: this family is limited by Gram
+        /// estimation, not by the fitter. A Gram from fewer tokens than a projection's input width
+        /// is rank-deficient by construction and makes the fit WORSE.
+        #[arg(long)]
+        activation_aware: bool,
+        /// How much of each column's rounding error `--activation-aware` propagates forward.
+        ///
+        /// `auto` (the default) sets it per tensor from the calibration size and the tensor's
+        /// input width: a Gram estimated from few tokens relative to its width is rank-deficient,
+        /// and pushing its full correction into later columns then does harm. Measured on
+        /// SmolLM2-135M at the default 4,096 calibration tokens, decay takes GPTQ's gain at T=2
+        /// from −2.5% to −9.8%, and at 2,048 tokens it turns a +4.6% loss into a −7.4% gain.
+        /// Through this command and `ModelRunner` (T=3, g256, rotated, 4,096 tokens): nearest
+        /// point 30.3090, plain GPTQ 30.2738, auto decay 30.1105 — −0.54% against plain GPTQ.
+        /// Pass `1` for plain GPTQ.
+        #[arg(long, default_value = "auto", value_parser = parse_decay)]
+        gptq_decay: DecayArg,
+        /// Ramp the decay over the column order — full propagation at the first column, the decay
+        /// only at the last — instead of applying it uniformly. Wins by a further ~1% at 16k
+        /// calibration tokens and loses at 4k; leave it off unless calibration is generous.
+        #[arg(long)]
+        gptq_decay_ramp: bool,
+        /// Write the padded TQ2_0 bundle instead of the entropy-coded `TSLJ` one.
+        ///
+        /// The loaded model is identical either way: `TSLJ` decodes to byte-identical TQ2_0 rows at
+        /// load. Only the file differs. On a T=3 SmolLM2-135M the padded bundle is 7.965 bpw and
+        /// `TSLJ` is 4.577 — TQ2_0 stores a trit in 2 bits where log2(3) suffices and pads every
+        /// row to whole 256-trit blocks. Use this only for a consumer that reads TQ2_0 files.
+        #[arg(long)]
+        dense_container: bool,
         /// Plane count. 4 measures 1.024x fp on SmolLM2-360M without any fold; 3 measures 1.335x.
         #[arg(long, default_value_t = 4)]
         planes: usize,
@@ -260,6 +329,19 @@ enum Command {
         /// Delta candidates per group for the ladder's `s0` grid search.
         #[arg(long, default_value_t = 16)]
         grid: usize,
+        /// Fit `--ladder geometric` in the Hadamard-rotated basis and record it in the bundle.
+        ///
+        /// Off by default here, unlike `convert`, because this command's other two containers
+        /// cannot carry the rotation: only `--format sidecar` writes a version-2 bundle, and
+        /// passing this with a progressive bundle or a SALT GGUF is refused rather than written
+        /// silently wrong.
+        ///
+        /// Worth taking when the container allows it. Measured on SmolLM2-135M, WikiText-2 full
+        /// split, in the no-fold configuration this command ships: **1.167x fp with rotation
+        /// against 1.246x without at T=3** — and rotation is what the ladder's rigid 1/3 spacing
+        /// needs, which is why the unrotated `--planes 2` case is 323x fp and refused outright.
+        #[arg(long)]
+        rotate: bool,
     },
 }
 
@@ -555,6 +637,11 @@ fn main() -> anyhow::Result<()> {
             calib,
             calib_tokens,
             fold_alpha,
+            no_rotation,
+            activation_aware,
+            gptq_decay,
+            gptq_decay_ramp,
+            dense_container,
             planes,
             group,
             grid,
@@ -569,7 +656,12 @@ fn main() -> anyhow::Result<()> {
                     planes,
                     group,
                     grid,
+                    rotate: !no_rotation,
                 },
+                dense_container,
+                activation_aware,
+                gptq_decay: gptq_decay.0,
+                gptq_decay_ramp,
             },
         )?,
         Command::Quantize {
@@ -584,6 +676,7 @@ fn main() -> anyhow::Result<()> {
             planes,
             group,
             grid,
+            rotate,
         } => quantize::run(
             &input,
             &output,
@@ -597,10 +690,37 @@ fn main() -> anyhow::Result<()> {
                 planes,
                 group,
                 grid,
+                // Opt-in here, unlike `convert`: two of this command's three containers cannot
+                // record a rotation, so the default has to be the one every format can express.
+                // `quantize::run` refuses the combination rather than writing it silently wrong.
+                rotate,
             },
         )?,
     }
     Ok(())
+}
+
+/// `--gptq-decay`: `None` is `auto` (per tensor from the calibration size), else a value in (0, 1].
+///
+/// A newtype rather than a bare `Option<f64>`: clap reads an `Option<T>` field as "optional
+/// argument of type `T`", so a parser that itself returns `Option<f64>` mismatches at runtime.
+#[derive(Clone, Copy, Debug)]
+struct DecayArg(Option<f64>);
+
+fn parse_decay(value: &str) -> Result<DecayArg, String> {
+    if value.eq_ignore_ascii_case("auto") {
+        return Ok(DecayArg(None));
+    }
+    let decay: f64 = value
+        .parse()
+        .map_err(|_| format!("expected `auto` or a number in (0, 1], got `{value}`"))?;
+    if decay > 0.0 && decay <= 1.0 {
+        Ok(DecayArg(Some(decay)))
+    } else {
+        Err(format!(
+            "expected `auto` or a number in (0, 1], got `{value}`"
+        ))
+    }
 }
 
 #[cfg(test)]

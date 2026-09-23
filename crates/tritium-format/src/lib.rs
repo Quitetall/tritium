@@ -57,6 +57,8 @@ mod salt_bundle;
 mod salt_bundle_reader;
 mod salt_gguf;
 mod salt_gguf_reader;
+pub mod salt_joint_bundle;
+pub mod salt_joint_code;
 pub mod salt_v2;
 pub mod salt_v2_master;
 pub mod salt_v2_package;
@@ -117,9 +119,9 @@ pub use salt::{
     unpack_salt_row, unpack_salt_row_prefix,
 };
 pub use salt_bundle::{
-    PackedSaltTensor, SALT_BUNDLE_MAGIC, SALT_BUNDLE_VERSION, SaltBundleIndex, SaltTensor,
-    SaltTensorView, read_salt_bundle, read_salt_bundle_prefix, write_progressive_salt_bundle,
-    write_salt_bundle,
+    PackedSaltTensor, SALT_BUNDLE_MAGIC, SALT_BUNDLE_VERSION, SALT_BUNDLE_VERSION_ROTATED,
+    SaltBundleIndex, SaltTensor, SaltTensorView, read_salt_bundle, read_salt_bundle_prefix,
+    write_progressive_salt_bundle, write_rotated_salt_bundle, write_salt_bundle,
 };
 pub use salt_bundle_reader::{
     PackedSaltStorageRequirements, SaltBundleReadError, SaltBundleReader, SaltBundleTensorInfo,

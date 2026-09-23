@@ -1,142 +1,134 @@
-//! **GPTQ sequential error compensation, finally fed.**
+//! **Lever 1 — change the metric the fit minimizes.**
 //!
-//! `tritium_quantize::fit_with_feedback` is a complete GPTQ/BlockLDLQ implementation in f64 —
-//! quantize column groups in order, and after each one push the residual it induced onto the
-//! not-yet-quantized columns through `H⁻¹`. It has never run, because nothing produced the `H`.
+//! SALT minimizes `‖W − Ŵ‖²`. The loss does not see `W`; it sees `W·x`. Those two are not the same
+//! objective, and this repo has measured them moving in *opposite* directions: the AWQ salience fold
+//! makes weight-space error **51% worse** (0.0252 → 0.0380) and perplexity **better**.
 //!
-//! `common::GramSet` now does. This wires the two together and measures whether the off-diagonal
-//! curvature — 34–68% of `‖H‖²`, per `salt_gram.rs` — is worth what it costs.
+//! The fold is the **diagonal** approximation of the right thing. It rescales each input channel by
+//! `(rms_j/gm)^α`, which is exactly a diagonal reweighting of the error metric. The full version
+//! uses the input Gram `H = E[x xᵀ]` and minimizes `‖(W − Ŵ)·X‖²` — and crucially, it can *act* on
+//! the off-diagonal, by pushing the error of each quantized column into the columns that are not
+//! yet quantized. That is OBQ/GPTQ, and it is the known-best PTQ technique nobody here has run.
 //!
-//! Coverage is six of seven projections per block: q/k/v (attn tap), gate/up (ffn tap), down (down
-//! tap). `o_proj` is skipped because its input is the attention concat, where GQA has query heads
-//! sharing kv dims — the same reason the salience fold skips it. The tied embed/head is skipped
-//! because it has no single input to take a Gram over.
+//! # Why this is the lever, and allocation was not
 //!
-//! `#[ignore]`d; run:
+//! Allocation is closed: ~50 arms, four campaigns, four signals up to exact task-loss gradients,
+//! and uniform won every time — because uniform `T` already *is* allocation by relative precision,
+//! and a plane is a fixed 9× step too coarse to express anything finer.
+//!
+//! Each plane already buys **9.54 dB**, which is `log2(3) × 6.02 dB/bit` — the information-theoretic
+//! maximum for 1.585 bits. The ladder is *on* the scalar rate-distortion bound. No redistribution of
+//! planes and no better plane can beat it, because the plane is already optimal.
+//!
+//! What is left is to leave the setting. The ladder is a **scalar**, **memoryless**, **Euclidean**
+//! quantizer; this file relaxes the third word. It changes no bits, no container, and no allocation
+//! — only which reconstruction the same bits encode.
+//!
+//! # What this does
+//!
+//! Per projection, in the rotated basis the artifact actually stores:
+//!
+//! 1. Collect the input Gram `H` at that projection's tap, on the **folded** model, so `H` is the
+//!    distribution the deployed weights see.
+//! 2. Rotate `H` to match: `H' = R·H·Rᵀ`, `R` block-diagonal Hadamard over scale groups. Skipping
+//!    this would compensate error in one basis using a metric expressed in another.
+//! 3. `H'⁻¹` with Tikhonov damping (a calibration Gram is routinely singular), then its Cholesky.
+//! 4. Walk the input columns in order. Round each on the ladder's own grid, then push the residual
+//!    into the columns still to come, weighted by `H⁻¹`.
+//!
+//! The step `Δ` per (row, group) is taken with the fitter's own grid search **when the column walk
+//! reaches that group**, on the already-compensated weights — the standard group-wise GPTQ order.
+//! Both arms therefore encode the identical container at the identical bit count; only the digits
+//! differ.
+//!
+//! # Not covered, and why it is structural
+//!
+//! The tied embedding/head is excluded. As an embedding it is a gather — there is no contraction
+//! over an input axis for a Gram to describe. As a head it is a projection and would be eligible,
+//! but the weights are the same tensor, so compensating it as a head corrupts it as a gather. This
+//! is the same tie that makes it unfoldable, and it is the most sensitive tensor in the model.
+//!
+//! # Measured 2026-09-16 — it works; the first run was under-sampled
+//!
+//! The first version collected the Gram from **1,024 tokens** and lost by +2.98%. GPTQ losing to
+//! plain rounding at 4.75 bits is a red flag for the experiment, not a result, and the cause was
+//! visible in the shapes: `down_proj`'s input is **1,536 wide**, so a Gram from fewer tokens than
+//! that is rank-deficient by construction. In its null directions `H⁻¹` is enormous, so
+//! compensation dumps error there freely — and on held-out data those directions carry activation.
+//!
 //! ```text
-//! TRITIUM_CORPUS=<corpus.json> cargo test -p tritium-nn --release \
-//!   --test salt_gptq -- --ignored --nocapture
+//! Gram tokens   damp 0.01   damp 0.1
+//!     1,024       +3.02%      +1.31%
+//!     4,096       +0.73%      -0.15%
+//!    12,288       -0.49%      -0.46%     <- beats the shipping Euclidean fit
+//! ```
+//!
+//! Three things pin the diagnosis. The loss falls **monotonically** with sample count at either
+//! damping. More damping helps a *lot* when samples are scarce (+3.02% → +1.31%) — it is
+//! regularizing a badly-estimated matrix. And at 12,288 tokens the two dampings **converge** to
+//! within 0.03 points: once the Gram is well estimated there is nothing left for damping to fix.
+//!
+//! Weight-space error rises (0.0556 → 0.0674) while perplexity improves — the proxy-gap signature
+//! again, and the reason nothing in this project ranks recipes by reconstruction fidelity.
+//!
+//! **Not yet converged.** 4,096 → 12,288 still bought 1.22 points; standard GPTQ calibrates on
+//! ~262K tokens, 21× more than the largest arm here. −0.49% is a floor, not the number.
+//!
+//! ```text
+//! TRITIUM_CORPUS=$HOME/.cache/tritium-corpora/wikitext2_400k_32k.json \
+//!   cargo test -p tritium-nn --release --test salt_gptq -- --ignored --nocapture
 //! ```
 
 mod common;
 
 use std::path::PathBuf;
 
-use common::{Calib, GramSet, calibrate, damped_inverse, extract, fold, perplexity_windowed};
+use common::{Calib, calibrate, damped_inverse, extract, fold, perplexity_windowed};
+use rayon::prelude::*;
 use tritium_nn::ModelRunner;
-use tritium_quantize::{ColumnGroup, FeedbackMetric, FeedbackProblem, fit_with_feedback};
-use tritium_train::ops::ste::{self, RotationPolicy};
+use tritium_nn::calibrate::{Tap, forward_aq};
+use tritium_train::Tape;
+use tritium_train::ops::ste::{
+    self, RotationPolicy, fast_hadamard, group_is_rotatable, ladder_quantize_at, ladder_step,
+};
+use tritium_train::tape::ValueId;
 
 const EVAL_WINDOW: usize = 512;
-/// Calibration windows, overridable with `TRITIUM_GPTQ_CALIB_WINDOWS`.
-///
-/// The Gram is a `k × k` covariance — 576² for the attention and FFN taps, 1,536² for `down`. Four
-/// windows is 2,048 tokens against a 1,536-wide input, fewer samples than the covariance has
-/// dimensions, so `damped_inverse` returns mostly damping rather than data. Measured on
-/// SmolLM2-135M over WikiText-2, GPTQ's effect on held-out perplexity versus the plain fitter:
-///
-/// ```text
-/// cal tokens      T=2       T=3
-///      2,048   -18.3%    +5.6%
-///      4,096   -19.3%    +4.0%
-///      8,192   -22.7%    +0.4%
-///     16,384   -29.3%    -0.6%
-///     32,768   -31.1%    -2.3%
-/// ```
-///
-/// At T=3 the sign flips between 8,192 and 16,384 tokens: below that, sequential compensation
-/// against an under-sampled Hessian is worse than not compensating at all. The old default of four
-/// windows sat on the wrong side of that crossing, which is why GPTQ read as marginal here. Neither
-/// column has plateaued at 32,768, so this default is a floor, not an optimum.
-///
-/// T=1 is omitted deliberately: it runs at 10⁴–10⁵× fp in every arm and its deltas bounce
-/// (-91.8/-97.1/-79.2/-90.0/-94.5) with no trend. Differences between destroyed models are noise.
-///
-/// Repeating the sweep with `TRITIUM_GPTQ_SMOOTH=0.75` — the shipped configuration — the crossing
-/// lands in the same place, and GPTQ still pays on top of the fold:
-///
-/// ```text
-/// cal tokens      T=2       T=3
-///      2,048    +4.8%    +3.6%
-///      4,096    -5.9%    +1.1%
-///      8,192   -11.2%    -1.7%
-///     16,384   -13.1%    -4.3%
-///     32,768   -17.0%    -4.9%
-/// ```
-///
-/// Two readings follow. The crossing sits near 8k tokens folded and unfolded alike, which is the
-/// Gram's sample count against its dimension — the fold changes neither, so it cannot move it. And
-/// the fold and GPTQ overlap without being redundant: the fold alone takes T=2 from 6.40× fp to
-/// 2.79×, more than unfolded GPTQ ever recovers, yet GPTQ still buys a further 17% on top.
-///
-/// One caveat on the folded numbers: `calibrate` for the fold reads the same window loop as the
-/// Gram, so this knob moves both at once and the folded `plain` baseline drifts between arms
-/// (T=3: 31.822, 31.501, 31.686, 32.361, 32.155 — unordered). Each delta compares plain against
-/// GPTQ at an identical fold and is sound; cross-arm comparisons of absolute folded perplexity are
-/// not. Those tables predate the split below: the fold now reads its own
-/// `TRITIUM_GPTQ_FOLD_WINDOWS`, pinned at 32 by default, so sweeping the Gram no longer moves the
-/// fold and the folded `plain` baseline is identical in every arm.
-///
-/// **Error-decayed propagation (ADR 0043 L-B), fold pinned at 32 windows.** GPTQ's change against
-/// the plain fit, by Gram size and decay `λ` on the propagated error:
-///
-/// ```text
-///                       T=2                          T=3
-/// tokens    λ=1    0.9    0.75    0.5     λ=1    0.9    0.75    0.5
-///  2,048   +4.6   -0.4   -5.6   -7.4     +2.1   +1.2   -0.2   -2.6     constant
-///  4,096   -2.5   -5.2   -8.6   -9.8     -1.2   -1.8   -3.1   -3.6     constant
-///  4,096          -3.6   -5.5   -7.4            -1.4   -2.2   -2.4     ramp
-/// 16,384  -13.1  -13.7  -13.8  -11.0     -4.3   -4.7   -5.1   -4.8     constant
-/// 16,384         -14.2  -14.5  -13.6            -4.6   -4.8   -5.3     ramp
-/// ```
-///
-/// Decay pays everywhere and pays most where the Gram is starved: at 2,048 tokens it turns a
-/// harmful GPTQ into a helpful one, and `λ = 0.5` there beats undecayed GPTQ on twice the tokens.
-/// The best `λ` falls as tokens fall (0.75 at 16k, 0.5 or lower at 4k and 2k), so a fixed `λ` is
-/// the wrong object and a schedule in tokens-per-dimension is the natural next step. The ramp
-/// shape wins at 16k and loses at 4k; its mean decay is milder than the constant's at equal `λ`, so
-/// that comparison does not yet separate *where* the decay lands from *how much* there is.
-///
-/// With the fold pinned, the folded sign flip is the Gram's alone and crosses between 2,048 and
-/// 4,096 tokens. The ~8k crossing in the folded table above was partly the under-calibrated fold.
-const DEFAULT_CALIB_WINDOWS: usize = 32;
-const DEFAULT_FOLD_WINDOWS: usize = 32;
-
-fn calib_windows(train_len: usize) -> usize {
-    windows_from_env(
-        "TRITIUM_GPTQ_CALIB_WINDOWS",
-        DEFAULT_CALIB_WINDOWS,
-        train_len,
-    )
-}
-
-fn fold_windows(train_len: usize) -> usize {
-    windows_from_env("TRITIUM_GPTQ_FOLD_WINDOWS", DEFAULT_FOLD_WINDOWS, train_len)
-}
-
-fn windows_from_env(name: &str, default: usize, train_len: usize) -> usize {
-    let requested = std::env::var(name)
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(default)
-        .max(1);
-    let available = train_len / CALIB_SEQ;
-    assert!(
-        available > 0,
-        "corpus is shorter than one calibration window"
-    );
-    requested.min(available)
-}
+const CALIB_WINDOWS: usize = 4;
 const CALIB_SEQ: usize = 512;
 const GROUP: usize = 128;
-const ITERS: usize = 5;
-/// GPTQ's standard ridge, as a fraction of `mean(diag H)`. A calibration Gram is routinely
-/// singular (a dead channel gives an exactly-zero row), so without damping the Cholesky fails.
-const DAMP: f64 = 0.01;
+const GRID: usize = 16;
+const GRAM_SEQ: usize = 256;
+
+fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+fn env_list_usize(key: &str, default: &[usize]) -> Vec<usize> {
+    std::env::var(key)
+        .ok()
+        .map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+        .filter(|v: &Vec<usize>| !v.is_empty())
+        .unwrap_or_else(|| default.to_vec())
+}
+
+fn env_list_f64(key: &str, default: &[f64]) -> Vec<f64> {
+    std::env::var(key)
+        .ok()
+        .map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+        .filter(|v: &Vec<f64>| !v.is_empty())
+        .unwrap_or_else(|| default.to_vec())
+}
 
 fn model_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_default();
-    PathBuf::from(home).join(".cache/tritium-models/smollm2-135m")
+    PathBuf::from(
+        std::env::var("TRITIUM_MODEL_DIR")
+            .unwrap_or_else(|_| format!("{home}/.cache/tritium-models/smollm2-135m")),
+    )
 }
 
 fn corpus() -> (Vec<u32>, Vec<u32>) {
@@ -145,279 +137,1476 @@ fn corpus() -> (Vec<u32>, Vec<u32>) {
             env!("CARGO_MANIFEST_DIR"),
             "/../../tools/reference/heldout_corpus.json"
         )
-        .to_string()
+        .to_owned()
     });
-    let j: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&path).expect("corpus json")).expect("parse");
+    let text = std::fs::read_to_string(&path).expect("corpus");
+    let v: serde_json::Value = serde_json::from_str(&text).expect("corpus json");
     let ids = |k: &str| -> Vec<u32> {
-        j[k].as_array()
+        v[k].as_array()
             .expect(k)
             .iter()
-            .map(|v| v.as_u64().expect("id") as u32)
+            .map(|x| x.as_u64().expect("id") as u32)
             .collect()
     };
     (ids("train_ids"), ids("eval_ids"))
 }
 
-/// The plain fitter: what every SALT number so far used.
-fn plain(w: &[f32], rows: usize, cols: usize, t: usize) -> Vec<f32> {
-    ste::salt_quantize_forward_grouped(w, rows, cols, t, GROUP, ITERS, RotationPolicy::Auto)
+/// Apply the fitter's per-group Hadamard across one `cols`-wide row, in place.
+fn rotate_row(row: &mut [f32], group: usize) {
+    for slice in row.chunks_mut(group) {
+        if group_is_rotatable(slice.len()) {
+            fast_hadamard(slice);
+        }
+    }
 }
 
-/// The same fitter, driven through GPTQ sequential feedback against a real inverse Hessian.
+/// `fast_hadamard` in f64: the same unnormalized Walsh–Hadamard recursion, then `1/√n`.
 ///
-/// Column groups are exactly `GROUP` wide so each feedback block is one scale group per row — the
-/// identical partition the plain fitter uses, which keeps this an ablation of the FEEDBACK rather
-/// than of the grouping.
+/// The Gram is a metric, and a Cholesky of its inverse amplifies rounding. The first version of this
+/// file round-tripped `H` through f32 to reuse `fast_hadamard`, which throws away half the digits of
+/// the very quantity being factorized. The basis is identical — only the precision differs.
+fn hadamard_f64(v: &mut [f64]) {
+    let n = v.len();
+    let mut len = 1;
+    while len < n {
+        for start in (0..n).step_by(len * 2) {
+            for i in start..start + len {
+                let (a, b) = (v[i], v[i + len]);
+                v[i] = a + b;
+                v[i + len] = a - b;
+            }
+        }
+        len *= 2;
+    }
+    let scale = 1.0 / (n as f64).sqrt();
+    for x in v.iter_mut() {
+        *x *= scale;
+    }
+}
+
+fn rotate_row_f64(row: &mut [f64], group: usize) {
+    for slice in row.chunks_mut(group) {
+        if group_is_rotatable(slice.len()) {
+            hadamard_f64(slice);
+        }
+    }
+}
+
+/// `H ← R·H·Rᵀ`, `R` block-diagonal Hadamard over scale groups.
 ///
-/// `decay` scales the rounding error each group hands to the columns after it (ADR 0043 L-B, after
-/// QTEA). The library propagates `working − returned`, so the callback reports
-/// `working − λ·(working − fit)` and keeps the true fit aside; `λ = 1` is plain GPTQ bit for bit.
-/// Under [`DecayShape::Ramp`] early groups propagate in full and `λ` is reached only at the last
-/// group, which is where a short remaining suffix has to absorb everything pushed into it.
-fn gptq(
+/// Two passes: rotate every row's groups (that is `H·Rᵀ`, since `R` is symmetric), then every
+/// column's. Uses the same group rule as the fitter, so the metric is expressed in exactly the basis
+/// the stored codes are in.
+fn rotate_gram(h: &mut [f64], k: usize, group: usize) {
+    h.par_chunks_mut(k)
+        .for_each(|row| rotate_row_f64(row, group));
+    let mut col = vec![0.0f64; k];
+    for c in 0..k {
+        for (r, v) in col.iter_mut().enumerate() {
+            *v = h[r * k + c];
+        }
+        rotate_row_f64(&mut col, group);
+        for (r, &v) in col.iter().enumerate() {
+            h[r * k + c] = v;
+        }
+    }
+}
+
+/// Lower Cholesky `A = L·Lᵀ`, row-major, lower triangle filled.
+fn lower_cholesky(a: &[f64], k: usize) -> Option<Vec<f64>> {
+    let mut l = vec![0.0f64; k * k];
+    for i in 0..k {
+        for j in 0..=i {
+            let mut sum = a[i * k + j];
+            for p in 0..j {
+                sum -= l[i * k + p] * l[j * k + p];
+            }
+            if i == j {
+                if sum <= 0.0 || sum.is_nan() {
+                    return None;
+                }
+                l[i * k + i] = sum.sqrt();
+            } else {
+                l[i * k + j] = sum / l[j * k + j];
+            }
+        }
+    }
+    Some(l)
+}
+
+/// GPTQ one tensor in the rotated basis. Returns the dense reconstruction in the ORIGINAL basis,
+/// so it drops into the same evaluator as the plain fit.
+///
+/// `w` is row-major `[rows, cols]`; `gram` is `cols × cols` in the original basis.
+fn gptq_tensor(
     w: &[f32],
     rows: usize,
     cols: usize,
     t: usize,
-    h_inv: &[f64],
-    decay: f64,
-    shape: DecayShape,
+    gram: &[f64],
+    damp: f64,
 ) -> Option<Vec<f32>> {
-    let weights: Vec<f64> = w.iter().map(|&v| f64::from(v)).collect();
-    let groups: Vec<ColumnGroup> = (0..cols.div_ceil(GROUP))
-        .map(|g| ColumnGroup {
-            start: g * GROUP,
-            end: ((g + 1) * GROUP).min(cols),
+    let (mut out, _) = gptq_codes(w, rows, cols, t, gram, damp)?;
+    // Back to the model's basis.
+    for row in out.chunks_mut(cols) {
+        rotate_row(row, GROUP);
+    }
+    Some(out)
+}
+
+/// GPTQ in the rotated basis, returning the reconstruction STILL IN THAT BASIS plus the step `Δ`
+/// per (row, group) — everything a discrete search needs to continue from where GPTQ stopped.
+fn gptq_codes(
+    w: &[f32],
+    rows: usize,
+    cols: usize,
+    t: usize,
+    gram: &[f64],
+    damp: f64,
+) -> Option<(Vec<f32>, Vec<f32>)> {
+    // Everything happens in the basis the codes are stored in.
+    let mut work: Vec<f32> = w.to_vec();
+    for row in work.chunks_mut(cols) {
+        rotate_row(row, GROUP);
+    }
+    let mut h = gram.to_vec();
+    rotate_gram(&mut h, cols, GROUP);
+    let hinv = damped_inverse(&h, cols, damp)?;
+    let chol = lower_cholesky(&hinv, cols)?;
+
+    let per_row = cols.div_ceil(GROUP);
+    let mut out = vec![0.0f32; rows * cols];
+    // One step per (row, group), taken when the walk first reaches that group.
+    let mut delta = vec![0.0f32; rows * per_row];
+
+    for j in 0..cols {
+        let block = j / GROUP;
+        if j % GROUP == 0 {
+            let end = ((block + 1) * GROUP).min(cols);
+            // The step comes from the CURRENT compensated weights — group-wise GPTQ order.
+            delta
+                .par_chunks_mut(per_row)
+                .zip(work.par_chunks(cols))
+                .for_each(|(d, wr)| {
+                    d[block] = ladder_step(&wr[j..end], t, GRID);
+                });
+        }
+        let d_jj = chol[j * cols + j];
+        if d_jj <= 0.0 || !d_jj.is_finite() {
+            return None;
+        }
+        // Quantize column j, then push its residual into the columns still to come.
+        out.par_chunks_mut(cols)
+            .zip(work.par_chunks_mut(cols))
+            .zip(delta.par_chunks(per_row))
+            .for_each(|((o, wr), d)| {
+                let q = ladder_quantize_at(wr[j], t, d[block]);
+                o[j] = q;
+                let err = f64::from(wr[j] - q) / d_jj;
+                for j2 in (j + 1)..cols {
+                    wr[j2] -= (err * chol[j2 * cols + j]) as f32;
+                }
+            });
+    }
+
+    Some((out, delta))
+}
+
+/// **Discrete local search over the trit move set**, continuing from GPTQ's codes.
+///
+/// Per row the problem is a closest-vector problem: choose integers `k` (each `|k_j| ≤ (3^T−1)/2`)
+/// minimizing `(w − Δ⊙k)ᵀ·H·(w − Δ⊙k)`. GPTQ is one greedy sequential-rounding pass. This improves
+/// on it by coordinate descent with the moves the ternary representation makes natural: change
+/// `k_j` by `±1`, or by `±3^p` — a flip of a higher-plane trit, a jump rounding never considers.
+///
+/// Every move is priced exactly in O(1) from `g = H·r`: changing `r_j` by `δ` changes the objective by
+/// `2δ·g_j + δ²·H_jj`, and an accepted move updates `g` in O(k). So the objective falls
+/// monotonically and no move is accepted on an estimate.
+///
+/// With `refit_scale`, each sweep also re-solves every group's step `Δ` in closed form for its
+/// current codes (`ε = kᵀg / kᵀHk`) — the continuous half, alternating with the discrete half.
+///
+/// Returns the reconstruction in the model's basis. `H` here is the damped, rotated Gram.
+// Indexing `d` by group while `k`, `r` and `g` are indexed by column is the clearest form of the
+// closed-form step refit; an iterator over `d` alone would hide which ranges belong together.
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+fn search_codes(
+    w: &[f32],
+    cols: usize,
+    t: usize,
+    h_rot: &[f64],
+    gptq_rot: &[f32],
+    delta: &[f32],
+    sweeps: usize,
+    refit_scale: bool,
+) -> Vec<f32> {
+    let per_row = cols.div_ceil(GROUP);
+    let kmax = (3i64.pow(t as u32) - 1) / 2;
+    let moves: Vec<i64> = (0..t)
+        .flat_map(|p| {
+            let m = 3i64.pow(p as u32);
+            [m, -m]
         })
         .collect();
-    let problem = FeedbackProblem {
-        rows,
-        columns: cols,
-        weights: &weights,
-        groups: &groups,
-        metric: FeedbackMetric::InverseHessian(h_inv),
-    };
-    let group_count = groups.len();
-    let mut shipped = vec![0.0f32; rows * cols];
-    fit_with_feedback(problem, |req: tritium_quantize::GroupFitRequest<'_>| {
-        // The block arrives feedback-adjusted: earlier groups' rounding error has already been
-        // pushed into it. Quantize it exactly as the plain fitter would.
-        let block: Vec<f32> = req.working_weights.iter().map(|&v| v as f32).collect();
-        let fit = ste::salt_quantize_forward_grouped(
-            &block,
-            req.rows,
-            req.columns,
-            t,
-            GROUP,
-            ITERS,
-            RotationPolicy::Auto,
-        );
-        for row in 0..req.rows {
-            let from = row * req.columns;
-            let to = row * cols + req.column_start;
-            shipped[to..to + req.columns].copy_from_slice(&fit[from..from + req.columns]);
-        }
-        let lambda = match shape {
-            DecayShape::Constant => decay,
-            DecayShape::Ramp if group_count > 1 => {
-                1.0 - (1.0 - decay) * req.group_index as f64 / (group_count - 1) as f64
+    let mut w_rot: Vec<f32> = w.to_vec();
+    for row in w_rot.chunks_mut(cols) {
+        rotate_row(row, GROUP);
+    }
+    let mut out = vec![0.0f32; w.len()];
+    out.par_chunks_mut(cols)
+        .zip(w_rot.par_chunks(cols))
+        .zip(gptq_rot.par_chunks(cols))
+        .zip(delta.par_chunks(per_row))
+        .for_each(|(((o, wr), qr), dr)| {
+            let mut d: Vec<f64> = dr.iter().map(|&v| f64::from(v)).collect();
+            let mut k: Vec<i64> = (0..cols)
+                .map(|j| {
+                    let dj = d[j / GROUP];
+                    if dj > 0.0 {
+                        (f64::from(qr[j]) / dj).round() as i64
+                    } else {
+                        0
+                    }
+                })
+                .collect();
+            let mut r: Vec<f64> = (0..cols)
+                .map(|j| f64::from(wr[j]) - d[j / GROUP] * k[j] as f64)
+                .collect();
+            let mut g: Vec<f64> = (0..cols)
+                .map(|a| {
+                    h_rot[a * cols..(a + 1) * cols]
+                        .iter()
+                        .zip(&r)
+                        .map(|(h, x)| h * x)
+                        .sum()
+                })
+                .collect();
+            for _ in 0..sweeps {
+                let mut improved = false;
+                for j in 0..cols {
+                    let dj = d[j / GROUP];
+                    if dj <= 0.0 {
+                        continue;
+                    }
+                    let hjj = h_rot[j * cols + j];
+                    let mut best = (0.0f64, 0i64);
+                    for &m in &moves {
+                        let nk = k[j] + m;
+                        if nk.abs() > kmax {
+                            continue;
+                        }
+                        let delta_r = -dj * m as f64;
+                        let change = 2.0 * delta_r * g[j] + delta_r * delta_r * hjj;
+                        if change < best.0 {
+                            best = (change, m);
+                        }
+                    }
+                    if best.1 != 0 && best.0 < -1e-15 {
+                        let delta_r = -dj * best.1 as f64;
+                        k[j] += best.1;
+                        r[j] += delta_r;
+                        for (a, ga) in g.iter_mut().enumerate() {
+                            *ga += delta_r * h_rot[a * cols + j];
+                        }
+                        improved = true;
+                    }
+                }
+                if refit_scale {
+                    for b in 0..per_row {
+                        let (lo, hi) = (b * GROUP, ((b + 1) * GROUP).min(cols));
+                        let num: f64 = (lo..hi).map(|j| k[j] as f64 * g[j]).sum();
+                        let mut den = 0.0f64;
+                        for a in lo..hi {
+                            if k[a] == 0 {
+                                continue;
+                            }
+                            for c in lo..hi {
+                                den += k[a] as f64 * h_rot[a * cols + c] * k[c] as f64;
+                            }
+                        }
+                        if den <= 0.0 {
+                            continue;
+                        }
+                        let eps = num / den;
+                        if d[b] + eps <= 0.0 {
+                            continue;
+                        }
+                        d[b] += eps;
+                        // r_b -= eps·k_b, so g -= eps·H[:, b]·k_b.
+                        for j in lo..hi {
+                            r[j] -= eps * k[j] as f64;
+                        }
+                        for (a, ga) in g.iter_mut().enumerate() {
+                            let hrow = &h_rot[a * cols..(a + 1) * cols];
+                            let s: f64 = (lo..hi).map(|c| hrow[c] * k[c] as f64).sum();
+                            *ga -= eps * s;
+                        }
+                        improved = true;
+                    }
+                }
+                if !improved {
+                    break;
+                }
             }
-            DecayShape::Ramp => decay,
-        };
-        Ok::<Vec<f64>, std::convert::Infallible>(
-            req.working_weights
-                .iter()
-                .zip(&fit)
-                .map(|(&working, &got)| working - lambda * (working - f64::from(got)))
-                .collect(),
-        )
-    })
-    .ok()?;
-    Some(shipped)
+            for j in 0..cols {
+                o[j] = (d[j / GROUP] * k[j] as f64) as f32;
+            }
+            rotate_row(o, GROUP);
+        });
+    out
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum DecayShape {
-    Constant,
-    Ramp,
-}
-
-/// `TRITIUM_GPTQ_DECAYS=1.0,0.75,0.5` and `TRITIUM_GPTQ_DECAY_SHAPE=const|ramp`. Every listed decay
-/// reuses the one set of Grams, so a sweep costs one collection rather than one per arm.
-fn decay_arms() -> (Vec<f64>, DecayShape) {
-    let decays = std::env::var("TRITIUM_GPTQ_DECAYS")
-        .ok()
-        .map(|list| {
-            list.split(',')
-                .filter_map(|value| value.trim().parse::<f64>().ok())
-                .collect::<Vec<_>>()
+/// `tr((W − Ŵ)·H·(W − Ŵ)ᵀ)` — the layer objective, in the model's basis.
+fn layer_objective(w: &[f32], q: &[f32], cols: usize, h: &[f64]) -> f64 {
+    w.par_chunks(cols)
+        .zip(q.par_chunks(cols))
+        .map(|(wr, qr)| {
+            let e: Vec<f64> = wr.iter().zip(qr).map(|(&a, &b)| f64::from(a - b)).collect();
+            (0..cols)
+                .map(|a| {
+                    if e[a] == 0.0 {
+                        return 0.0;
+                    }
+                    e[a] * h[a * cols..(a + 1) * cols]
+                        .iter()
+                        .zip(&e)
+                        .map(|(x, y)| x * y)
+                        .sum::<f64>()
+                })
+                .sum::<f64>()
         })
-        .filter(|list| !list.is_empty())
-        .unwrap_or_else(|| vec![1.0]);
-    let shape = match std::env::var("TRITIUM_GPTQ_DECAY_SHAPE").as_deref() {
-        Ok("ramp") => DecayShape::Ramp,
-        _ => DecayShape::Constant,
-    };
-    (decays, shape)
+        .sum()
 }
 
-fn planes_under_test() -> Vec<usize> {
-    std::env::var("TRITIUM_GPTQ_PLANES")
-        .ok()
-        .map(|list| {
-            list.split(',')
-                .filter_map(|value| value.trim().parse::<usize>().ok())
-                .collect::<Vec<_>>()
-        })
-        .filter(|list| !list.is_empty())
-        .unwrap_or_else(|| vec![1, 2, 3])
+/// Accumulate `Σ x xᵀ` (upper triangle) from a `[seq, k]` activation block.
+///
+/// Parallel over rows of `H`, which are independent. This is the hot loop — `O(seq·k²)` per tap, and
+/// the FFN intermediate is 1536 wide — so it has to be, or the sample counts GPTQ actually needs are
+/// out of reach.
+fn accumulate_gram(h: &mut [f64], k: usize, act: &[f32], seq: usize) {
+    h.par_chunks_mut(k).enumerate().for_each(|(i, row)| {
+        for r in 0..seq {
+            let x = &act[r * k..(r + 1) * k];
+            let xi = f64::from(x[i]);
+            if xi == 0.0 {
+                continue;
+            }
+            for (j, hij) in row.iter_mut().enumerate().skip(i) {
+                *hij += xi * f64::from(x[j]);
+            }
+        }
+    });
 }
 
-/// Does sequential compensation against real curvature beat the plain fitter on held-out ppl?
+fn mirror_and_scale(h: &mut [f64], k: usize, rows: usize) {
+    for i in 0..k {
+        for j in 0..i {
+            h[i * k + j] = h[j * k + i];
+        }
+    }
+    let n = rows.max(1) as f64;
+    for v in h.iter_mut() {
+        *v /= n;
+    }
+}
+
 #[test]
-#[ignore = "slow GPTQ sweep; needs SmolLM2-135M; run explicitly"]
-fn gptq_feedback_against_real_curvature() {
+#[ignore = "needs SmolLM2-135M; collects per-tap Grams and runs GPTQ over every projection"]
+fn activation_metric_fit_against_the_euclidean_one() {
     let dir = model_dir();
     if !dir.join("model.safetensors").exists() {
         eprintln!("skipping: {} absent", dir.display());
         return;
     }
+    let t_ref = env_usize("TRITIUM_GPTQ_T", 3);
     let runner =
         ModelRunner::from_hf(&dir, Box::new(tritium_cpu::CpuBackend::new())).expect("from_hf");
-    let (arch, fp, shapes) = extract(&runner);
+    let (arch0, fp0, shapes) = extract(&runner);
     let (train, eval) = corpus();
-    let calib_windows = calib_windows(train.len());
-    let ppl_fp = perplexity_windowed(&fp, &arch, &eval, EVAL_WINDOW);
 
-    // TRITIUM_GPTQ_SMOOTH=<alpha> composes the salience fold with GPTQ. The two address DISJOINT
-    // parts of the curvature -- the fold rescales columns by E[x_j²] (the diagonal), GPTQ propagates
-    // rounding residuals through H⁻¹ (the off-diagonal) -- so whether they add is a real question.
-    //
-    // Order matters: fold FIRST, then collect the Gram, because folding divides attn_norm/ffn_norm
-    // by s and therefore changes the very activations H is a covariance of. Collecting H on the
-    // unfolded model and applying it to folded weights would be measuring the wrong curvature.
-    let (arch, fp) = match std::env::var("TRITIUM_GPTQ_SMOOTH")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-    {
-        None => (arch, fp),
-        Some(alpha) => {
-            let mut calib = Calib::new(&arch);
-            let fold_windows = fold_windows(train.len());
-            for w in 0..fold_windows {
-                calibrate(
-                    &fp,
-                    &arch,
-                    &train[w * CALIB_SEQ..(w + 1) * CALIB_SEQ],
-                    &mut calib,
-                );
-            }
-            let (folded, farch) = fold(&fp, &shapes, &arch, &calib, alpha);
-            println!("salience fold applied first: alpha={alpha}, {fold_windows} windows");
-            (farch, folded)
-        }
-    };
-    let ppl_fp_check = perplexity_windowed(&fp, &arch, &eval, EVAL_WINDOW);
-    assert!(
-        (ppl_fp_check - ppl_fp).abs() < 1e-3 * ppl_fp,
-        "the fold must be function-preserving: {ppl_fp_check} vs {ppl_fp}"
-    );
-
-    // One pass per calibration window taps every layer.
-    let mut grams = GramSet::new(&arch);
-    for w in 0..calib_windows {
-        grams.accumulate_forward(&fp, &arch, &train[w * CALIB_SEQ..(w + 1) * CALIB_SEQ]);
+    let mut calib = Calib::new(&arch0);
+    for w in 0..CALIB_WINDOWS {
+        calibrate(
+            &fp0,
+            &arch0,
+            &train[w * CALIB_SEQ..(w + 1) * CALIB_SEQ],
+            &mut calib,
+        );
     }
+    let (fp, arch) = fold(&fp0, &shapes, &arch0, &calib, 0.75);
+
     let n_layers = arch.n_layers;
-    let attn: Vec<Vec<f64>> = std::mem::take(&mut grams.attn)
-        .into_iter()
-        .map(|g| g.finish())
+    let q_width = arch.n_head * arch.head_dim;
+
+    // ── Baseline: the shipping fit. Same container, same bits, Euclidean metric. Scored once.
+    let plain: Vec<Vec<f32>> = fp
+        .iter()
+        .zip(&shapes)
+        .map(|(w, &(r, c))| {
+            ste::salt_quantize_forward_grouped_geometric(
+                w,
+                r,
+                c,
+                t_ref,
+                GROUP,
+                GRID,
+                RotationPolicy::Always,
+            )
+        })
         .collect();
-    let ffn: Vec<Vec<f64>> = std::mem::take(&mut grams.ffn)
-        .into_iter()
-        .map(|g| g.finish())
-        .collect();
-    let down: Vec<Vec<f64>> = std::mem::take(&mut grams.down)
-        .into_iter()
-        .map(|g| g.finish())
-        .collect();
-    println!(
-        "grams collected: {n_layers} layers x 3 taps, {calib_windows} windows = {} tokens\n",
-        calib_windows * CALIB_SEQ
+    let werr = |q: &[Vec<f32>]| -> f64 {
+        let (mut se, mut sw) = (0.0f64, 0.0f64);
+        for (a, b) in fp.iter().zip(q) {
+            for (&x, &y) in a.iter().zip(b) {
+                se += f64::from(x - y) * f64::from(x - y);
+                sw += f64::from(x) * f64::from(x);
+            }
+        }
+        (se / sw).sqrt()
+    };
+    let ppl_fp = perplexity_windowed(&fp, &arch, &eval, EVAL_WINDOW);
+    let ppl_plain = perplexity_windowed(&plain, &arch, &eval, EVAL_WINDOW);
+
+    let windows_list = env_list_usize("TRITIUM_GPTQ_WINDOWS", &[4, 16, 48]);
+    let damp_list = env_list_f64("TRITIUM_GPTQ_DAMP", &[0.01, 0.1]);
+    let max_windows = *windows_list
+        .iter()
+        .max()
+        .expect("at least one window count");
+    assert!(
+        (max_windows * GRAM_SEQ) <= train.len(),
+        "{max_windows} × {GRAM_SEQ} calibration tokens exceeds the training split"
     );
 
-    // Invert once per tap (q/k/v share attn; gate/up share ffn).
-    let inv = |h: &[f64], k: usize| damped_inverse(h, k, DAMP);
-    let attn_inv: Vec<Option<Vec<f64>>> = attn.iter().map(|h| inv(h, arch.n_embd)).collect();
-    let ffn_inv: Vec<Option<Vec<f64>>> = ffn.iter().map(|h| inv(h, arch.n_embd)).collect();
-    let down_inv: Vec<Option<Vec<f64>>> = down.iter().map(|h| inv(h, arch.ff)).collect();
-    let failed = attn_inv.iter().filter(|v| v.is_none()).count()
-        + ffn_inv.iter().filter(|v| v.is_none()).count()
-        + down_inv.iter().filter(|v| v.is_none()).count();
     println!(
-        "inverses: {} ok, {failed} not positive-definite after damping\n",
-        3 * n_layers - failed
+        "SmolLM2-135M | WikiText-2 {} held-out | fold α=0.75 | g{GROUP} | T={t_ref} | rotation always\n\
+         down_proj's input is {} wide, so a Gram from fewer tokens than that is rank-deficient by\n\
+         construction.\n",
+        eval.len(),
+        arch.ff
+    );
+    println!(
+        "{:<44} {:>11} {:>10} {:>12} {:>10}",
+        "fit", "ppl", "× fp", "vs Eucl.", "wt err"
+    );
+    println!("{}", "-".repeat(92));
+    println!(
+        "{:<44} {ppl_fp:>11.4} {:>9.4}× {:>12} {:>10}",
+        "fp master", 1.0, "—", "—"
+    );
+    println!(
+        "{:<44} {ppl_plain:>11.4} {:>9.4}× {:>12} {:>10.4}",
+        "Euclidean ‖W−Ŵ‖² (SHIPPING)",
+        ppl_plain / ppl_fp,
+        "—",
+        werr(&plain)
     );
 
-    println!(
-        "{:<22} {:>8} {:>13} {:>10}",
-        "configuration", "bpw", "ppl", "× fp"
-    );
-    println!("{}", "-".repeat(58));
-    let (decays, shape) = decay_arms();
-    for t in planes_under_test() {
-        let bpw = ste::ternary_bits_per_weight(t, GROUP) + 1.0 / GROUP as f64;
+    // ── Grams accumulate as a running sum, so every smaller window count is a PREFIX of the larger
+    // one and can be snapshotted on the way past for free. That makes sample size a clean variable:
+    // the same tokens, in the same order, just more of them.
+    let mut g_attn: Vec<Vec<f64>> = vec![vec![0.0; arch.n_embd * arch.n_embd]; n_layers];
+    let mut g_ffn: Vec<Vec<f64>> = vec![vec![0.0; arch.n_embd * arch.n_embd]; n_layers];
+    let mut g_down: Vec<Vec<f64>> = vec![vec![0.0; arch.ff * arch.ff]; n_layers];
+    let mut g_o: Vec<Vec<f64>> = vec![vec![0.0; q_width * q_width]; n_layers];
+    let mut seen = 0usize;
+    let mut best: Option<(f64, String)> = None;
 
-        let base: Vec<Vec<f32>> = fp
-            .iter()
-            .zip(&shapes)
-            .map(|(w, &(n, k))| plain(w, n, k, t))
-            .collect();
-        let p_base = perplexity_windowed(&base, &arch, &eval, EVAL_WINDOW);
-        println!(
-            "{:<22} {bpw:>8.2} {p_base:>13.3} {:>9.2}×",
-            format!("T={t} plain"),
-            p_base / ppl_fp
+    for wnd in 0..max_windows {
+        let toks = &train[wnd * GRAM_SEQ..(wnd + 1) * GRAM_SEQ];
+        let mut t = Tape::new();
+        let wids: Vec<ValueId> = fp.iter().map(|w| t.leaf(w.clone())).collect();
+        forward_aq(&mut t, &wids, &arch, toks, &mut |kind, li, v, seq, cols| {
+            // Identity: this pass is a tap, not a quantizer.
+            match kind {
+                Tap::AttnIn => accumulate_gram(&mut g_attn[li], cols, v, seq),
+                Tap::FfnIn => accumulate_gram(&mut g_ffn[li], cols, v, seq),
+                Tap::DownIn => accumulate_gram(&mut g_down[li], cols, v, seq),
+                Tap::OProjIn => accumulate_gram(&mut g_o[li], cols, v, seq),
+                // The tied head is excluded — see the module docs.
+                Tap::Head => {}
+            }
+        });
+        seen += toks.len();
+
+        if !windows_list.contains(&(wnd + 1)) {
+            continue;
+        }
+        // Snapshot: finalize a COPY so the running sum keeps accumulating untouched.
+        let snap = |g: &[Vec<f64>], k: usize| -> Vec<Vec<f64>> {
+            g.iter()
+                .map(|h| {
+                    let mut c = h.clone();
+                    mirror_and_scale(&mut c, k, seen);
+                    c
+                })
+                .collect()
+        };
+        let (sa, sf, sd, so) = (
+            snap(&g_attn, arch.n_embd),
+            snap(&g_ffn, arch.n_embd),
+            snap(&g_down, arch.ff),
+            snap(&g_o, q_width),
         );
 
-        // Same weights, but the six tapped projections go through GPTQ feedback.
-        for &decay in &decays {
-            let mut fed = base.clone();
+        for &damp in &damp_list {
+            let mut gptq = plain.clone();
+            let (mut done, mut skipped) = (0usize, 0usize);
             for li in 0..n_layers {
-                let b = 1 + 7 * li;
-                let jobs: [(usize, &Option<Vec<f64>>); 6] = [
-                    (b, &attn_inv[li]),
-                    (b + 1, &attn_inv[li]),
-                    (b + 2, &attn_inv[li]),
-                    (b + 4, &ffn_inv[li]),
-                    (b + 5, &ffn_inv[li]),
-                    (b + 6, &down_inv[li]),
-                ];
-                for (idx, h_inv) in jobs {
-                    if let Some(h) = h_inv {
-                        let (n, k) = shapes[idx];
-                        if let Some(q) = gptq(&fp[idx], n, k, t, h, decay, shape) {
-                            fed[idx] = q;
+                let base = 1 + 7 * li;
+                for (slot, gram) in [
+                    (0usize, &sa[li]), // q
+                    (1, &sa[li]),      // k
+                    (2, &sa[li]),      // v
+                    (3, &so[li]),      // o
+                    (4, &sf[li]),      // gate
+                    (5, &sf[li]),      // up
+                    (6, &sd[li]),      // down
+                ] {
+                    let i = base + slot;
+                    let (rows, cols) = shapes[i];
+                    match gptq_tensor(&fp[i], rows, cols, t_ref, gram, damp) {
+                        Some(q) => {
+                            gptq[i] = q;
+                            done += 1;
                         }
+                        // A Gram still singular after damping saw no signal; fall back rather than
+                        // propagate garbage.
+                        None => skipped += 1,
                     }
                 }
             }
-            let p_fed = perplexity_windowed(&fed, &arch, &eval, EVAL_WINDOW);
+            let ppl = perplexity_windowed(&gptq, &arch, &eval, EVAL_WINDOW);
+            let label = format!("activation metric, {seen:>5} tok, damp {damp}");
             println!(
-                "{:<22} {bpw:>8.2} {p_fed:>13.3} {:>9.2}×   ({:+.1}% vs plain)",
-                if decay == 1.0 {
-                    format!("T={t} +GPTQ")
+                "{label:<44} {ppl:>11.4} {:>9.4}× {:>11.2}% {:>10.4}{}",
+                ppl / ppl_fp,
+                100.0 * (ppl - ppl_plain) / ppl_plain,
+                werr(&gptq),
+                if skipped > 0 {
+                    format!("  ({skipped} fell back)")
                 } else {
-                    format!("T={t} +GPTQ {shape:?} λ={decay}")
-                },
-                p_fed / ppl_fp,
-                (p_fed / p_base - 1.0) * 100.0
+                    String::new()
+                }
             );
+            assert!(
+                done > 0,
+                "no projection was fitted at {seen} tokens / damp {damp} — the arm is the \
+                 baseline under another name"
+            );
+            if best.as_ref().is_none_or(|(b, _)| ppl < *b) {
+                best = Some((ppl, label));
+            }
         }
     }
+
+    let (best_ppl, best_label) = best.expect("at least one arm ran");
     println!(
-        "\nGPTQ covers 6 of 7 projections per block (q/k/v, gate/up, down). o_proj and the tied \
-         embed/head keep the plain fit, so this understates what full coverage would give."
+        "\nbest activation-metric arm: {best_label} at {best_ppl:.4} ({:+.2}% vs shipping {ppl_plain:.4})",
+        100.0 * (best_ppl - ppl_plain) / ppl_plain
+    );
+    println!(
+        "\nRead DOWN the token column at fixed damping. If perplexity falls as samples grow, the first\n\
+         run's +2.98% was an under-sampled Gram overfitting the calibration batch, not the method."
+    );
+}
+
+/// **Stage 3 of the standard additive-PTQ recipe: calibrate each layer on the QUANTIZED model's
+/// inputs, in order.**
+///
+/// The sweep above collects every Gram from the fp model. Reference GPTQ runs block by block —
+/// quantize block `L`, push calibration data through the quantized prefix, collect block `L+1`'s
+/// inputs there.
+///
+/// **Measured 2026-09-17: no gain, and the reason corrects what this doc first claimed.**
+///
+/// ```text
+/// round-to-nearest (SHIPPING)   24.2783            —
+/// GPTQ, fp Grams                24.1586      -0.49%
+/// GPTQ, sequential Grams        24.1732      -0.43%
+/// ```
+///
+/// The first version of this doc said sequential calibration makes every block "absorb the error of
+/// every block before it". It does not. Plain sequential GPTQ minimizes `‖(W − Ŵ)·X̂‖`: the fp weights
+/// applied to the QUANTIZED inputs. That refits the layer to the shifted input distribution, but the
+/// target is still `W·X̂`, not the fp model's actual output `W·X`, so inherited error is never
+/// corrected — only not compounded. At T=3, where rounding error is small, that buys nothing.
+///
+/// Absorbing upstream error needs the asymmetric target `‖W·X − Ŵ·X̂‖`, which is GPTQ run on
+/// `W' = W·C·Ĥ⁻¹` with the cross-covariance `C = E[x·x̂ᵀ]` — see
+/// `asymmetric_calibration_absorbs_inherited_error`.
+///
+/// Three arms at identical bits, all with the Gram at the full 12,288 tokens and damping 0.01:
+/// the shipping round-to-nearest fit, GPTQ on fp Grams (reproducing the sweep's best arm), and
+/// GPTQ on sequential Grams. The tied embedding is round-to-nearest in all three, and it is
+/// quantized before layer 0's Gram is collected, so the sequential arm's inputs are the quantized
+/// model's inputs from the first token on.
+#[test]
+#[ignore = "needs SmolLM2-135M; one full forward per layer per calibration window"]
+fn sequential_calibration_against_fp_calibration() {
+    let dir = model_dir();
+    if !dir.join("model.safetensors").exists() {
+        eprintln!("skipping: {} absent", dir.display());
+        return;
+    }
+    let t_ref = env_usize("TRITIUM_GPTQ_T", 3);
+    let windows = env_usize("TRITIUM_GPTQ_SEQ_WINDOWS", 48);
+    let damp = 0.01f64;
+    let runner =
+        ModelRunner::from_hf(&dir, Box::new(tritium_cpu::CpuBackend::new())).expect("from_hf");
+    let (arch0, fp0, shapes) = extract(&runner);
+    let (train, eval) = corpus();
+    assert!(windows * GRAM_SEQ <= train.len());
+
+    let mut calib = Calib::new(&arch0);
+    for w in 0..CALIB_WINDOWS {
+        calibrate(
+            &fp0,
+            &arch0,
+            &train[w * CALIB_SEQ..(w + 1) * CALIB_SEQ],
+            &mut calib,
+        );
+    }
+    let (fp, arch) = fold(&fp0, &shapes, &arch0, &calib, 0.75);
+    let n_layers = arch.n_layers;
+    let q_width = arch.n_head * arch.head_dim;
+
+    let plain: Vec<Vec<f32>> = fp
+        .iter()
+        .zip(&shapes)
+        .map(|(w, &(r, c))| {
+            ste::salt_quantize_forward_grouped_geometric(
+                w,
+                r,
+                c,
+                t_ref,
+                GROUP,
+                GRID,
+                RotationPolicy::Always,
+            )
+        })
+        .collect();
+
+    // Grams for ONE layer, collected by running `weights` forward. Other layers' taps are ignored.
+    let layer_grams = |weights: &[Vec<f32>], li: usize| -> [Vec<f64>; 4] {
+        let mut ga = vec![0.0f64; arch.n_embd * arch.n_embd];
+        let mut gf = vec![0.0f64; arch.n_embd * arch.n_embd];
+        let mut gd = vec![0.0f64; arch.ff * arch.ff];
+        let mut go = vec![0.0f64; q_width * q_width];
+        let mut seen = 0usize;
+        for wnd in 0..windows {
+            let toks = &train[wnd * GRAM_SEQ..(wnd + 1) * GRAM_SEQ];
+            let mut t = Tape::new();
+            let wids: Vec<ValueId> = weights.iter().map(|w| t.leaf(w.clone())).collect();
+            forward_aq(&mut t, &wids, &arch, toks, &mut |kind, l, v, seq, cols| {
+                if l != li {
+                    return;
+                }
+                match kind {
+                    Tap::AttnIn => accumulate_gram(&mut ga, cols, v, seq),
+                    Tap::FfnIn => accumulate_gram(&mut gf, cols, v, seq),
+                    Tap::DownIn => accumulate_gram(&mut gd, cols, v, seq),
+                    Tap::OProjIn => accumulate_gram(&mut go, cols, v, seq),
+                    Tap::Head => {}
+                }
+            });
+            seen += toks.len();
+        }
+        mirror_and_scale(&mut ga, arch.n_embd, seen);
+        mirror_and_scale(&mut gf, arch.n_embd, seen);
+        mirror_and_scale(&mut gd, arch.ff, seen);
+        mirror_and_scale(&mut go, q_width, seen);
+        [ga, gf, gd, go]
+    };
+
+    let quantize_layer = |target: &mut [Vec<f32>], li: usize, g: &[Vec<f64>; 4]| -> usize {
+        let base = 1 + 7 * li;
+        let mut fell_back = 0;
+        for (slot, gram) in [
+            (0usize, &g[0]),
+            (1, &g[0]),
+            (2, &g[0]),
+            (3, &g[3]),
+            (4, &g[1]),
+            (5, &g[1]),
+            (6, &g[2]),
+        ] {
+            let i = base + slot;
+            let (rows, cols) = shapes[i];
+            match gptq_tensor(&fp[i], rows, cols, t_ref, gram, damp) {
+                Some(q) => target[i] = q,
+                None => {
+                    target[i] = plain[i].clone();
+                    fell_back += 1;
+                }
+            }
+        }
+        fell_back
+    };
+
+    // ── GPTQ on fp Grams: every layer's inputs come from the fp model.
+    println!("GPTQ on fp Grams ({} tokens)…", windows * GRAM_SEQ);
+    // fp Grams do not depend on quantization order, so every layer's come from one pass.
+    let fp_grams: Vec<[Vec<f64>; 4]> = {
+        let mut all: Vec<[Vec<f64>; 4]> = (0..n_layers)
+            .map(|_| {
+                [
+                    vec![0.0f64; arch.n_embd * arch.n_embd],
+                    vec![0.0f64; arch.n_embd * arch.n_embd],
+                    vec![0.0f64; arch.ff * arch.ff],
+                    vec![0.0f64; q_width * q_width],
+                ]
+            })
+            .collect();
+        let mut seen = 0usize;
+        for wnd in 0..windows {
+            let toks = &train[wnd * GRAM_SEQ..(wnd + 1) * GRAM_SEQ];
+            let mut t = Tape::new();
+            let wids: Vec<ValueId> = fp.iter().map(|w| t.leaf(w.clone())).collect();
+            forward_aq(
+                &mut t,
+                &wids,
+                &arch,
+                toks,
+                &mut |kind, l, v, seq, cols| match kind {
+                    Tap::AttnIn => accumulate_gram(&mut all[l][0], cols, v, seq),
+                    Tap::FfnIn => accumulate_gram(&mut all[l][1], cols, v, seq),
+                    Tap::DownIn => accumulate_gram(&mut all[l][2], cols, v, seq),
+                    Tap::OProjIn => accumulate_gram(&mut all[l][3], cols, v, seq),
+                    Tap::Head => {}
+                },
+            );
+            seen += toks.len();
+        }
+        for g in &mut all {
+            mirror_and_scale(&mut g[0], arch.n_embd, seen);
+            mirror_and_scale(&mut g[1], arch.n_embd, seen);
+            mirror_and_scale(&mut g[2], arch.ff, seen);
+            mirror_and_scale(&mut g[3], q_width, seen);
+        }
+        all
+    };
+    let mut on_fp = plain.clone();
+    let mut fb_fp = 0;
+    for (li, g) in fp_grams.iter().enumerate() {
+        fb_fp += quantize_layer(&mut on_fp, li, g);
+    }
+    drop(fp_grams);
+
+    // ── Sequential: layer L's Grams come from a model whose embedding and layers < L are already
+    // quantized. `seq` IS that model at every step.
+    println!("GPTQ on sequential Grams…");
+    let mut seq = fp.clone();
+    seq[0] = plain[0].clone();
+    let mut fb_seq = 0;
+    for li in 0..n_layers {
+        let g = layer_grams(&seq, li);
+        fb_seq += quantize_layer(&mut seq, li, &g);
+        if li % 10 == 0 {
+            println!("  layer {li}/{n_layers}");
+        }
+    }
+
+    let ppl_fp = perplexity_windowed(&fp, &arch, &eval, EVAL_WINDOW);
+    let ppl_plain = perplexity_windowed(&plain, &arch, &eval, EVAL_WINDOW);
+    let ppl_on_fp = perplexity_windowed(&on_fp, &arch, &eval, EVAL_WINDOW);
+    let ppl_seq = perplexity_windowed(&seq, &arch, &eval, EVAL_WINDOW);
+
+    println!(
+        "\nSmolLM2-135M | WikiText-2 {} held-out | fold α=0.75 | g{GROUP} | T={t_ref} | rotation\n\
+         Gram {} tokens, damp {damp} | fell back: fp {fb_fp}, sequential {fb_seq}\n",
+        eval.len(),
+        windows * GRAM_SEQ
+    );
+    println!(
+        "{:<40} {:>11} {:>10} {:>12}",
+        "fit", "ppl", "× fp", "vs RTN"
+    );
+    println!("{}", "-".repeat(78));
+    for (label, ppl) in [
+        ("fp master", ppl_fp),
+        ("round-to-nearest (SHIPPING)", ppl_plain),
+        ("GPTQ, fp Grams", ppl_on_fp),
+        ("GPTQ, sequential Grams", ppl_seq),
+    ] {
+        println!(
+            "{label:<40} {ppl:>11.4} {:>9.4}× {:>11.2}%",
+            ppl / ppl_fp,
+            100.0 * (ppl - ppl_plain) / ppl_plain
+        );
+    }
+    println!(
+        "\nsequential vs fp Grams: {:+.2}%  |  share of RTN's excess over fp recovered: fp Grams {:.1}%, \
+         sequential {:.1}%",
+        100.0 * (ppl_seq - ppl_on_fp) / ppl_on_fp,
+        100.0 * (ppl_plain - ppl_on_fp) / (ppl_plain - ppl_fp),
+        100.0 * (ppl_plain - ppl_seq) / (ppl_plain - ppl_fp)
+    );
+    assert!(
+        ppl_seq.is_finite() && ppl_on_fp.is_finite(),
+        "a GPTQ arm did not produce a usable model"
+    );
+}
+
+/// **Does discrete search over the trit moves beat GPTQ's greedy rounding — and does it generalize?**
+///
+/// Four arms at identical bits and container: round-to-nearest, GPTQ, GPTQ + trit search, and GPTQ +
+/// trit search + closed-form step refits. Grams are fp (the sweep's configuration) at 12,288 tokens.
+///
+/// A stronger optimizer overfits a Gram more readily, so every arm's layer objective is reported on
+/// the calibration Gram AND on a held-out Gram built from the next 12,288 tokens. If the search
+/// wins on calibration and loses held-out, that is overfitting, and perplexity should agree.
+///
+/// # Measured 2026-09-17
+///
+/// ```text
+/// fit                              obj (cal)   obj (held)     ppl      vs RTN
+/// round-to-nearest (SHIPPING)        1.000×      1.000×     24.2783     —
+/// GPTQ                               0.236×      0.459×     24.1586   -0.49%
+/// GPTQ + trit search                 0.216×      0.454×     24.1894   -0.37%
+/// GPTQ + trit search + Δ refit       0.214×      0.451×     24.1231   -0.64%
+/// ```
+///
+/// The discrete search overfits, as predicted: 8.5% lower calibration objective than GPTQ, 1% lower
+/// held-out, and WORSE perplexity. Adding the closed-form step refits turns it into the best arm
+/// measured (−0.64%) — continuous parameters generalize where discrete moves chase the batch.
+///
+/// GPTQ's own row is the larger finding: 0.236× on the Gram it fitted, 0.459× on unseen tokens. Most
+/// of its apparent gain does not transfer, so Gram estimation — not the optimizer — is the binding
+/// limit, and more calibration tokens is the lever to pull before a stronger search.
+#[test]
+#[ignore = "needs SmolLM2-135M; two Gram sets, a search per projection, and four evaluations"]
+fn discrete_search_over_trit_moves_against_gptq() {
+    let dir = model_dir();
+    if !dir.join("model.safetensors").exists() {
+        eprintln!("skipping: {} absent", dir.display());
+        return;
+    }
+    let t_ref = env_usize("TRITIUM_GPTQ_T", 3);
+    // Calibration tokens are the binding limit on this whole family: GPTQ reaches 0.236× of
+    // round-to-nearest's objective on the Gram it fitted and only 0.459× on unseen tokens.
+    let windows = env_usize("TRITIUM_SEARCH_WINDOWS", 48);
+    let damp = 0.01f64;
+    let sweeps = env_usize("TRITIUM_SEARCH_SWEEPS", 8);
+    let runner =
+        ModelRunner::from_hf(&dir, Box::new(tritium_cpu::CpuBackend::new())).expect("from_hf");
+    let (arch0, fp0, shapes) = extract(&runner);
+    let (train, eval) = corpus();
+    assert!(2 * windows * GRAM_SEQ <= train.len());
+
+    let mut calib = Calib::new(&arch0);
+    for w in 0..CALIB_WINDOWS {
+        calibrate(
+            &fp0,
+            &arch0,
+            &train[w * CALIB_SEQ..(w + 1) * CALIB_SEQ],
+            &mut calib,
+        );
+    }
+    let (fp, arch) = fold(&fp0, &shapes, &arch0, &calib, 0.75);
+    let n_layers = arch.n_layers;
+    let q_width = arch.n_head * arch.head_dim;
+
+    // [attn, ffn, down, o] per layer, from windows [first, first + windows).
+    let grams = |first: usize| -> Vec<[Vec<f64>; 4]> {
+        let mut all: Vec<[Vec<f64>; 4]> = (0..n_layers)
+            .map(|_| {
+                [
+                    vec![0.0f64; arch.n_embd * arch.n_embd],
+                    vec![0.0f64; arch.n_embd * arch.n_embd],
+                    vec![0.0f64; arch.ff * arch.ff],
+                    vec![0.0f64; q_width * q_width],
+                ]
+            })
+            .collect();
+        let mut seen = 0usize;
+        for wnd in first..first + windows {
+            let toks = &train[wnd * GRAM_SEQ..(wnd + 1) * GRAM_SEQ];
+            let mut t = Tape::new();
+            let wids: Vec<ValueId> = fp.iter().map(|w| t.leaf(w.clone())).collect();
+            forward_aq(
+                &mut t,
+                &wids,
+                &arch,
+                toks,
+                &mut |kind, l, v, seq, cols| match kind {
+                    Tap::AttnIn => accumulate_gram(&mut all[l][0], cols, v, seq),
+                    Tap::FfnIn => accumulate_gram(&mut all[l][1], cols, v, seq),
+                    Tap::DownIn => accumulate_gram(&mut all[l][2], cols, v, seq),
+                    Tap::OProjIn => accumulate_gram(&mut all[l][3], cols, v, seq),
+                    Tap::Head => {}
+                },
+            );
+            seen += toks.len();
+        }
+        for g in &mut all {
+            mirror_and_scale(&mut g[0], arch.n_embd, seen);
+            mirror_and_scale(&mut g[1], arch.n_embd, seen);
+            mirror_and_scale(&mut g[2], arch.ff, seen);
+            mirror_and_scale(&mut g[3], q_width, seen);
+        }
+        all
+    };
+    println!("calibration Grams…");
+    let cal = grams(0);
+    println!("held-out Grams…");
+    let held = grams(windows);
+
+    let plain: Vec<Vec<f32>> = fp
+        .iter()
+        .zip(&shapes)
+        .map(|(w, &(r, c))| {
+            ste::salt_quantize_forward_grouped_geometric(
+                w,
+                r,
+                c,
+                t_ref,
+                GROUP,
+                GRID,
+                RotationPolicy::Always,
+            )
+        })
+        .collect();
+    let mut gptq = plain.clone();
+    let mut search_v = plain.clone();
+    let mut search_vp = plain.clone();
+    // Objective totals: [rtn, gptq, V, V+P] × [cal, held].
+    let mut obj = [[0.0f64; 2]; 4];
+    println!("fitting (sweeps ≤ {sweeps})…");
+    for li in 0..n_layers {
+        let base = 1 + 7 * li;
+        for (slot, gi) in [
+            (0usize, 0usize),
+            (1, 0),
+            (2, 0),
+            (3, 3),
+            (4, 1),
+            (5, 1),
+            (6, 2),
+        ] {
+            let i = base + slot;
+            let (rows, cols) = shapes[i];
+            let Some((g_rot, delta)) = gptq_codes(&fp[i], rows, cols, t_ref, &cal[li][gi], damp)
+            else {
+                continue;
+            };
+            let mut g_dense = g_rot.clone();
+            for row in g_dense.chunks_mut(cols) {
+                rotate_row(row, GROUP);
+            }
+            // The search's objective: the same damped, rotated Gram GPTQ used.
+            let mut h = cal[li][gi].clone();
+            let mean: f64 = (0..cols).map(|a| h[a * cols + a]).sum::<f64>() / cols as f64;
+            for a in 0..cols {
+                h[a * cols + a] += damp * mean.max(1e-12);
+            }
+            rotate_gram(&mut h, cols, GROUP);
+            let v = search_codes(&fp[i], cols, t_ref, &h, &g_rot, &delta, sweeps, false);
+            let vp = search_codes(&fp[i], cols, t_ref, &h, &g_rot, &delta, sweeps, true);
+            for (a, q) in [&plain[i], &g_dense, &v, &vp].into_iter().enumerate() {
+                obj[a][0] += layer_objective(&fp[i], q, cols, &cal[li][gi]);
+                obj[a][1] += layer_objective(&fp[i], q, cols, &held[li][gi]);
+            }
+            gptq[i] = g_dense;
+            search_v[i] = v;
+            search_vp[i] = vp;
+        }
+        if li % 10 == 0 {
+            println!("  layer {li}/{n_layers}");
+        }
+    }
+    drop((cal, held));
+
+    let ppl_fp = perplexity_windowed(&fp, &arch, &eval, EVAL_WINDOW);
+    let ppls = [
+        perplexity_windowed(&plain, &arch, &eval, EVAL_WINDOW),
+        perplexity_windowed(&gptq, &arch, &eval, EVAL_WINDOW),
+        perplexity_windowed(&search_v, &arch, &eval, EVAL_WINDOW),
+        perplexity_windowed(&search_vp, &arch, &eval, EVAL_WINDOW),
+    ];
+
+    println!(
+        "\nSmolLM2-135M | WikiText-2 {} held-out | fold α=0.75 | g{GROUP} | T={t_ref} | fp Grams {} tok\n\
+         layer objective summed over 210 projections, relative to round-to-nearest\n",
+        eval.len(),
+        windows * GRAM_SEQ
+    );
+    println!(
+        "{:<34} {:>12} {:>12} {:>11} {:>10}",
+        "fit", "obj (cal)", "obj (held)", "ppl", "vs RTN"
+    );
+    println!("{}", "-".repeat(84));
+    println!("{:<34} {:>12} {:>12} {ppl_fp:>11.4}", "fp master", "—", "—");
+    for (a, label) in [
+        "round-to-nearest (SHIPPING)",
+        "GPTQ",
+        "GPTQ + trit search",
+        "GPTQ + trit search + Δ refit",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        println!(
+            "{label:<34} {:>11.3}× {:>11.3}× {:>11.4} {:>+9.2}%",
+            obj[a][0] / obj[0][0],
+            obj[a][1] / obj[0][1],
+            ppls[a],
+            100.0 * (ppls[a] - ppls[0]) / ppls[0]
+        );
+    }
+    // The search minimizes the DAMPED objective, whose monotonicity the unit test below proves. The
+    // undamped calibration objective reported here can move slightly the other way, so this only
+    // guards against gross failure.
+    assert!(
+        obj[3][0] <= obj[1][0] * 1.05,
+        "the search raised the calibration objective by more than 5% over GPTQ"
+    );
+}
+
+/// The search's contract on a small case: every move is exactly priced, so the damped objective it
+/// minimizes can never rise above GPTQ's starting point, with or without step refits.
+#[test]
+fn trit_search_never_raises_the_damped_objective() {
+    let (rows, cols, t) = (4usize, 256usize, 3usize);
+    let mut s = 0xABCD_EF01u64;
+    let mut next = || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        ((s >> 40) as f64 / 8_388_608.0) - 1.0
+    };
+    let w: Vec<f32> = (0..rows * cols).map(|_| next() as f32).collect();
+    let m = 600;
+    let x: Vec<f64> = (0..m * cols)
+        .map(|i| next() * (1.0 + 4.0 * ((i % cols) % 7 == 0) as u8 as f64))
+        .collect();
+    let mut gram = vec![0.0f64; cols * cols];
+    accumulate_gram(
+        &mut gram,
+        cols,
+        &x.iter().map(|&v| v as f32).collect::<Vec<_>>(),
+        m,
+    );
+    mirror_and_scale(&mut gram, cols, m);
+    let damp = 0.01;
+    let (g_rot, delta) = gptq_codes(&w, rows, cols, t, &gram, damp).expect("gptq");
+    let mut g_dense = g_rot.clone();
+    for row in g_dense.chunks_mut(cols) {
+        rotate_row(row, GROUP);
+    }
+    let mut hd = gram.clone();
+    let mean: f64 = (0..cols).map(|a| hd[a * cols + a]).sum::<f64>() / cols as f64;
+    for a in 0..cols {
+        hd[a * cols + a] += damp * mean;
+    }
+    let mut h_rot = hd.clone();
+    rotate_gram(&mut h_rot, cols, GROUP);
+
+    let base = layer_objective(&w, &g_dense, cols, &hd);
+    let v = search_codes(&w, cols, t, &h_rot, &g_rot, &delta, 8, false);
+    let vp = search_codes(&w, cols, t, &h_rot, &g_rot, &delta, 8, true);
+    let (ov, ovp) = (
+        layer_objective(&w, &v, cols, &hd),
+        layer_objective(&w, &vp, cols, &hd),
+    );
+    println!("damped objective: gptq {base:.6e}  search {ov:.6e}  search+refit {ovp:.6e}");
+    assert!(
+        ov <= base * (1.0 + 1e-6),
+        "trit search raised the objective"
+    );
+    assert!(
+        ovp <= base * (1.0 + 1e-6),
+        "trit search + refit raised the objective"
+    );
+    assert!(
+        ov < base,
+        "the search found nothing to improve on a random problem"
+    );
+}
+
+/// **Asymmetric calibration: target the fp model's output, from the quantized model's input.**
+///
+/// Sequential GPTQ minimizes `‖(W − Ŵ)·X̂‖` and so never corrects error inherited from upstream (see
+/// `sequential_calibration_against_fp_calibration`). The target that does is `‖W·X − Ŵ·X̂‖`: layer
+/// `L`, fed what the quantized prefix actually produces, reproducing what the fp model produced.
+///
+/// Summed over samples that objective is, up to a constant, `tr((Ŵ − W')·Ĥ·(Ŵ − W')ᵀ)` with
+///
+/// ```text
+/// Ĥ = Σ x̂·x̂ᵀ      C = Σ x·x̂ᵀ      W' = W·C·Ĥ⁻¹
+/// ```
+///
+/// so it is ordinary GPTQ with `Ĥ` as the metric and `W'` — the least-squares map from quantized
+/// inputs to fp outputs — as the target. `x` and `x̂` are the same tap on the same tokens, from the fp
+/// model and from the model whose embedding and layers < L are already quantized.
+///
+/// Arms: round-to-nearest (re-measured) and asymmetric sequential GPTQ. GPTQ on fp Grams (−0.49%)
+/// and plain sequential (−0.43%) were measured with this same configuration and are quoted.
+///
+/// # Measured 2026-09-17/18 — REFUTED at reachable calibration sizes
+///
+/// The full arm at 12,288 tokens scored **639.72 (28× fp, +2535%)**. Diagnosis, all with the
+/// transform applied and quantization SKIPPED so the fitter cannot be blamed:
+///
+/// ```text
+/// x̂ = x control, first form  drift 0.2143   ppl    33.59   <- identity transform, wrecked the model
+/// x̂ = x control, this form   drift 0.000000 ppl    23.30   <- exact, as the algebra requires
+///
+/// real x̂, 2048 tokens, damp:
+///   0.01                     drift 2.0622   ppl 59295.94
+///   0.1                      drift 0.6895   ppl   499.73
+///   1.0                      drift 0.1224   ppl    53.90
+///   10.0                     drift 0.0208   ppl    27.62   (+13.8% vs round-to-nearest)
+/// ```
+///
+/// The correction is monotone in damping and **harmful at every setting**: it only stops hurting in
+/// the limit where it vanishes. `C − Ĥ = Σ(x − x̂)·x̂ᵀ` is genuinely small, but `Ĥ⁻¹` scales it by
+/// `1/λ_min`, and 2,048 tokens against a 1,536-wide input leaves `Ĥ` near-singular, so what the
+/// correction mostly carries is sampling noise. The 12,288-token run failing far less badly (639 vs
+/// 59,296) is the same story with more samples.
+///
+/// This is the limit the trit search found from the other side: GPTQ reaches 0.236× of round-to-
+/// nearest's objective on the Gram it fitted and only 0.459× on held-out tokens. Calibration sample
+/// size binds everything in this family, and an asymmetric correction is the most sample-hungry
+/// member of it. Making it work needs orders more data than a CPU run at this scale affords, or a
+/// solve restricted to the well-excited subspace rather than a full `Ĥ⁻¹`.
+#[test]
+#[ignore = "needs SmolLM2-135M; two full forwards per layer per calibration window"]
+fn asymmetric_calibration_absorbs_inherited_error() {
+    let dir = model_dir();
+    if !dir.join("model.safetensors").exists() {
+        eprintln!("skipping: {} absent", dir.display());
+        return;
+    }
+    let t_ref = env_usize("TRITIUM_GPTQ_T", 3);
+    let windows = env_usize("TRITIUM_GPTQ_SEQ_WINDOWS", 48);
+    let damp = std::env::var("TRITIUM_ASYM_DAMP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.01f64);
+    // `0` applies the transform but skips quantization, isolating it from the fitter.
+    let quantize = env_usize("TRITIUM_ASYM_QUANT", 1) == 1;
+    // `1` captures x̂ from the fp model too, so x̂ = x exactly, C = Ĥ, and W′ must equal W up to
+    // damping. Large drift under this control is conditioning; small drift means a wiring bug.
+    let control = env_usize("TRITIUM_ASYM_CONTROL", 0) == 1;
+    let runner =
+        ModelRunner::from_hf(&dir, Box::new(tritium_cpu::CpuBackend::new())).expect("from_hf");
+    let (arch0, fp0, shapes) = extract(&runner);
+    let (train, eval) = corpus();
+
+    let mut calib = Calib::new(&arch0);
+    for w in 0..CALIB_WINDOWS {
+        calibrate(
+            &fp0,
+            &arch0,
+            &train[w * CALIB_SEQ..(w + 1) * CALIB_SEQ],
+            &mut calib,
+        );
+    }
+    let (fp, arch) = fold(&fp0, &shapes, &arch0, &calib, 0.75);
+    let n_layers = arch.n_layers;
+    let q_width = arch.n_head * arch.head_dim;
+    let widths = [arch.n_embd, arch.n_embd, arch.ff, q_width]; // attn, ffn, down, o
+
+    let plain: Vec<Vec<f32>> = fp
+        .iter()
+        .zip(&shapes)
+        .map(|(w, &(r, c))| {
+            ste::salt_quantize_forward_grouped_geometric(
+                w,
+                r,
+                c,
+                t_ref,
+                GROUP,
+                GRID,
+                RotationPolicy::Always,
+            )
+        })
+        .collect();
+
+    // Capture layer `li`'s four tap activations for one window.
+    let capture = |weights: &[Vec<f32>], toks: &[u32], li: usize| -> [Vec<f32>; 4] {
+        let mut out: [Vec<f32>; 4] = Default::default();
+        let mut t = Tape::new();
+        let wids: Vec<ValueId> = weights.iter().map(|w| t.leaf(w.clone())).collect();
+        forward_aq(
+            &mut t,
+            &wids,
+            &arch,
+            toks,
+            &mut |kind, l, v, _seq, _cols| {
+                if l != li {
+                    return;
+                }
+                let slot = match kind {
+                    Tap::AttnIn => 0,
+                    Tap::FfnIn => 1,
+                    Tap::DownIn => 2,
+                    Tap::OProjIn => 3,
+                    Tap::Head => return,
+                };
+                out[slot] = v.to_vec();
+            },
+        );
+        out
+    };
+
+    let mut seq = fp.clone();
+    seq[0] = plain[0].clone();
+    // How far the transform alone moves each weight matrix, before any quantization.
+    let (mut drift_se, mut drift_sw) = (0.0f64, 0.0f64);
+    println!(
+        "asymmetric sequential over {} tokens per layer | damp {damp} | quantize {quantize}…",
+        windows * GRAM_SEQ
+    );
+    for li in 0..n_layers {
+        let mut hhat: Vec<Vec<f64>> = widths.iter().map(|&k| vec![0.0; k * k]).collect();
+        let mut cross: Vec<Vec<f64>> = widths.iter().map(|&k| vec![0.0; k * k]).collect();
+        let mut seen = 0usize;
+        for wnd in 0..windows {
+            let toks = &train[wnd * GRAM_SEQ..(wnd + 1) * GRAM_SEQ];
+            let x = capture(&fp, toks, li);
+            let xh = capture(if control { &fp } else { &seq }, toks, li);
+            let n = toks.len();
+            for s in 0..4 {
+                let k = widths[s];
+                accumulate_gram(&mut hhat[s], k, &xh[s], n);
+                // C = Σ x·x̂ᵀ, full (not symmetric).
+                let (xs, xhs) = (&x[s], &xh[s]);
+                cross[s].par_chunks_mut(k).enumerate().for_each(|(a, row)| {
+                    for r in 0..n {
+                        let xa = f64::from(xs[r * k + a]);
+                        if xa == 0.0 {
+                            continue;
+                        }
+                        let xr = &xhs[r * k..(r + 1) * k];
+                        for (c, v) in row.iter_mut().enumerate() {
+                            *v += xa * f64::from(xr[c]);
+                        }
+                    }
+                });
+            }
+            seen += n;
+        }
+        for s in 0..4 {
+            let k = widths[s];
+            mirror_and_scale(&mut hhat[s], k, seen);
+            for v in cross[s].iter_mut() {
+                *v /= seen as f64;
+            }
+        }
+
+        // Correction matrix per tap: (C − Ĥ)·Ĥ_d⁻¹, so the target is `W + W·M`.
+        //
+        // Algebraically `W·C·Ĥ⁻¹ = W + W·(C − Ĥ)·Ĥ⁻¹`, but the two are not the same computation. The
+        // first form damps W ITSELF: `W·Ĥ·(Ĥ+λI)⁻¹` shrinks every weight component lying along a
+        // direction the calibration data barely excites, and W has real energy there. Measured with
+        // x̂ = x, where the transform should be the identity, that cost 38% perplexity at a drift of
+        // 0.21. The residual form damps only the CORRECTION, so `x̂ = x ⇒ C = Ĥ ⇒ ΔW = 0` exactly, at
+        // any damping.
+        let transforms: Vec<Option<Vec<f64>>> = (0..4)
+            .map(|s| {
+                let k = widths[s];
+                let hinv = damped_inverse(&hhat[s], k, damp)?;
+                let mut diff = cross[s].clone();
+                for (d, h) in diff.iter_mut().zip(&hhat[s]) {
+                    *d -= h;
+                }
+                Some(mat_mul(&diff, &hinv, k))
+            })
+            .collect();
+
+        let base = 1 + 7 * li;
+        for (slot, s) in [
+            (0usize, 0usize),
+            (1, 0),
+            (2, 0),
+            (3, 3),
+            (4, 1),
+            (5, 1),
+            (6, 2),
+        ] {
+            let i = base + slot;
+            let (rows, cols) = shapes[i];
+            let Some(m) = &transforms[s] else {
+                seq[i] = plain[i].clone();
+                continue;
+            };
+            let mut target = apply_right(&fp[i], cols, m);
+            for (o, &w) in target.iter_mut().zip(&fp[i]) {
+                *o += w;
+            }
+            for (&a, &b) in fp[i].iter().zip(&target) {
+                drift_se += f64::from(a - b) * f64::from(a - b);
+                drift_sw += f64::from(a) * f64::from(a);
+            }
+            seq[i] = if quantize {
+                gptq_tensor(&target, rows, cols, t_ref, &hhat[s], damp)
+                    .unwrap_or_else(|| plain[i].clone())
+            } else {
+                target
+            };
+        }
+        if li % 5 == 0 {
+            println!("  layer {li}/{n_layers}");
+        }
+    }
+
+    let ppl_fp = perplexity_windowed(&fp, &arch, &eval, EVAL_WINDOW);
+    let ppl_plain = perplexity_windowed(&plain, &arch, &eval, EVAL_WINDOW);
+    let ppl_asym = perplexity_windowed(&seq, &arch, &eval, EVAL_WINDOW);
+    println!(
+        "\nSmolLM2-135M | WikiText-2 {} held-out | fold α=0.75 | g{GROUP} | T={t_ref} | {} tok, damp {damp}\n",
+        eval.len(),
+        windows * GRAM_SEQ
+    );
+    println!(
+        "{:<44} {:>11} {:>10} {:>10}",
+        "fit", "ppl", "× fp", "vs RTN"
+    );
+    println!("{}", "-".repeat(78));
+    println!("{:<44} {ppl_fp:>11.4}", "fp master");
+    println!(
+        "{:<44} {ppl_plain:>11.4} {:>9.4}× {:>10}",
+        "round-to-nearest (SHIPPING)",
+        ppl_plain / ppl_fp,
+        "—"
+    );
+    println!(
+        "{:<44} {:>11} {:>10} {:>10}",
+        "GPTQ, fp Grams (quoted)", "24.1586", "", "-0.49%"
+    );
+    println!(
+        "{:<44} {:>11} {:>10} {:>10}",
+        "GPTQ, sequential (quoted)", "24.1732", "", "-0.43%"
+    );
+    println!(
+        "{:<44} {ppl_asym:>11.4} {:>9.4}× {:>+9.2}%",
+        if quantize {
+            "GPTQ, asymmetric sequential"
+        } else {
+            "asymmetric transform ONLY (no quantization)"
+        },
+        ppl_asym / ppl_fp,
+        100.0 * (ppl_asym - ppl_plain) / ppl_plain
+    );
+    let drift = (drift_se / drift_sw).sqrt();
+    println!(
+        "\ntransform drift ‖W′−W‖/‖W‖ = {drift:.6}  (transform alone, before any quantization)"
+    );
+    if control {
+        // With x̂ = x the correction is W·(Ĥ−Ĥ)·Ĥ_d⁻¹ = 0 for any damping. Anything else is a bug in
+        // how the correction is formed, not conditioning.
+        assert!(
+            drift < 1e-5,
+            "the x̂ = x control moved the weights by {drift:.3e}; the correction must vanish exactly"
+        );
+    }
+    assert!(
+        ppl_asym.is_finite(),
+        "the asymmetric arm did not produce a usable model"
+    );
+}
+
+/// `A·B` for `k × k` row-major matrices.
+fn mat_mul(a: &[f64], b: &[f64], k: usize) -> Vec<f64> {
+    let mut m = vec![0.0f64; k * k];
+    m.par_chunks_mut(k).enumerate().for_each(|(i, row)| {
+        let arow = &a[i * k..(i + 1) * k];
+        for (j, v) in row.iter_mut().enumerate() {
+            *v = arow
+                .iter()
+                .enumerate()
+                .map(|(c, &x)| x * b[c * k + j])
+                .sum();
+        }
+    });
+    m
+}
+
+/// `W·M` for `W` row-major `[rows, cols]` and `M` `cols × cols`.
+fn apply_right(w: &[f32], cols: usize, m: &[f64]) -> Vec<f32> {
+    let mut out = vec![0.0f32; w.len()];
+    out.par_chunks_mut(cols)
+        .zip(w.par_chunks(cols))
+        .for_each(|(o, wr)| {
+            for (b, ob) in o.iter_mut().enumerate() {
+                *ob = wr
+                    .iter()
+                    .enumerate()
+                    .map(|(a, &wa)| f64::from(wa) * m[a * cols + b])
+                    .sum::<f64>() as f32;
+            }
+        });
+    out
+}
+
+/// The asymmetric objective's defining identity, on a small case with no damping:
+/// `Σ_s ‖W·x_s − Ŵ·x̂_s‖²  =  tr((Ŵ − W')·Ĥ·(Ŵ − W')ᵀ) + const`, `W' = W·C·Ĥ⁻¹`. The constant must not
+/// depend on `Ŵ`, so the difference between the two sides is checked to be identical for two
+/// unrelated `Ŵ`.
+#[test]
+fn asymmetric_target_reproduces_the_fp_output_objective() {
+    let (rows, k, n) = (3usize, 6usize, 400usize);
+    let mut s = 0x5EED_1234u64;
+    let mut next = || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        ((s >> 40) as f64 / 8_388_608.0) - 1.0
+    };
+    let w: Vec<f32> = (0..rows * k).map(|_| next() as f32).collect();
+    let x: Vec<f64> = (0..n * k).map(|_| next()).collect();
+    // x̂: a perturbed, mixed copy of x — what an upstream quantizer would do.
+    let xh: Vec<f64> = (0..n * k)
+        .map(|i| x[i] + 0.3 * x[(i / k) * k + (i % k + 1) % k] + 0.1 * next())
+        .collect();
+    let (mut hh, mut c) = (vec![0.0f64; k * k], vec![0.0f64; k * k]);
+    for r in 0..n {
+        for a in 0..k {
+            for b in 0..k {
+                hh[a * k + b] += xh[r * k + a] * xh[r * k + b];
+                c[a * k + b] += x[r * k + a] * xh[r * k + b];
+            }
+        }
+    }
+    // Undamped inverse (tiny damping keeps the helper's contract; 1e-12 is below every term here).
+    let hinv = damped_inverse(&hh, k, 1e-12).unwrap();
+    let wp = apply_right(&w, k, &mat_mul(&c, &hinv, k));
+
+    let lhs = |q: &[f32]| -> f64 {
+        (0..n)
+            .map(|r| {
+                (0..rows)
+                    .map(|i| {
+                        let (mut yx, mut yq) = (0.0f64, 0.0f64);
+                        for a in 0..k {
+                            yx += f64::from(w[i * k + a]) * x[r * k + a];
+                            yq += f64::from(q[i * k + a]) * xh[r * k + a];
+                        }
+                        (yx - yq) * (yx - yq)
+                    })
+                    .sum::<f64>()
+            })
+            .sum()
+    };
+    let rhs = |q: &[f32]| -> f64 {
+        (0..rows)
+            .map(|i| {
+                let e: Vec<f64> = (0..k)
+                    .map(|a| f64::from(q[i * k + a]) - f64::from(wp[i * k + a]))
+                    .collect();
+                (0..k)
+                    .map(|a| e[a] * (0..k).map(|b| hh[a * k + b] * e[b]).sum::<f64>())
+                    .sum::<f64>()
+            })
+            .sum()
+    };
+    let q1: Vec<f32> = (0..rows * k).map(|_| next() as f32).collect();
+    let q2: Vec<f32> = (0..rows * k).map(|_| (next() * 0.2) as f32).collect();
+    let (c1, c2) = (lhs(&q1) - rhs(&q1), lhs(&q2) - rhs(&q2));
+    assert!(
+        (c1 - c2).abs() <= 1e-4 * lhs(&q1).abs().max(1.0),
+        "objective and GPTQ form differ by a Ŵ-dependent amount: {c1} vs {c2}"
     );
 }
