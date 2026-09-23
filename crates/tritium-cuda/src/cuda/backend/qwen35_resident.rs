@@ -298,7 +298,9 @@ impl CudaBackend {
         let query_width = spec.attention_heads * spec.attention_head_dim;
         let kv_width = spec.attention_kv_heads * spec.attention_head_dim;
         if spec.deltanet_key_heads == 0
-            || !spec.deltanet_value_heads.is_multiple_of(spec.deltanet_key_heads)
+            || !spec
+                .deltanet_value_heads
+                .is_multiple_of(spec.deltanet_key_heads)
             || spec.attention_kv_heads == 0
             || !spec.attention_heads.is_multiple_of(spec.attention_kv_heads)
             || !spec.attention_rotary_dim.is_multiple_of(2)
@@ -923,14 +925,21 @@ impl Qwen35Resident {
             .arg(&dk)
             .arg(&dv)
             .arg(&group);
-        // One block per value head, one thread per value lane, each writing only
-        // its own column of its own head's state -- updated in place, with no
-        // staging copy, because the executor never rolls a step back.
+        // One thread per value lane, each writing only its own column of its own
+        // head's state -- updated in place, with no staging copy, because the
+        // executor never rolls a step back. The lanes of a head are split across
+        // warp-sized blocks: one block per head is only 48 blocks on a 128-SM part,
+        // and measured 2.17 ms/token that way.
+        let (lane_blocks, lane_threads) = if dv.is_multiple_of(32) {
+            (dv / 32, 32)
+        } else {
+            (1, dv)
+        };
         run(
             &mut builder,
             LaunchConfig {
-                grid_dim: (value_head_blocks, 1, 1),
-                block_dim: (dv, 1, 1),
+                grid_dim: (value_head_blocks, lane_blocks, 1),
+                block_dim: (lane_threads, 1, 1),
                 shared_mem_bytes: 2 * dk * core::mem::size_of::<f32>() as u32,
             },
             "launch DeltaNet recurrent step",

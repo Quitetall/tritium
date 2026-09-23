@@ -35,7 +35,10 @@ extern "C" __global__ void qwen35_deltanet_recurrent_step(
   extern __shared__ float projected[];  // kk then qq, `key_head_dim` each
 
   const uint32_t head = blockIdx.x;
-  const uint32_t value_lane = threadIdx.x;
+  // Lanes may be split across `gridDim.y` blocks per head: they are independent,
+  // and one block per head is only 48 blocks on a 128-SM part. The host path
+  // launches with gridDim.y == 1, which is the original single-block form.
+  const uint32_t value_lane = blockIdx.y * blockDim.x + threadIdx.x;
   const uint32_t key_head = head / group_size;
   const float* head_kk = kk + static_cast<size_t>(key_head) * key_head_dim;
   const float* head_qq = qq + static_cast<size_t>(key_head) * key_head_dim;
