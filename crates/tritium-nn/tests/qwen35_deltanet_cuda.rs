@@ -10,9 +10,10 @@
 #![cfg(feature = "cuda")]
 
 use tritium_nn::{
-    DenseLinear, Projection, Qwen35DeltaNet, Qwen35DeltaNetConfig, Qwen35Dtype,
-    Qwen35FullAttentionConfig, Qwen35LayerType, Qwen35MtpConfig, Qwen35NormWeightSemantics,
-    Qwen35OutputGate, Qwen35RopeConfig, Qwen35RopeType, Qwen35TextConfig, Qwen35DeltaNetWeights,
+    DenseLinear, Projection, Qwen35DeltaNet, Qwen35DeltaNetConfig, Qwen35DeltaNetWeights,
+    Qwen35Dtype, Qwen35FullAttentionConfig, Qwen35LayerType, Qwen35MtpConfig,
+    Qwen35NormWeightSemantics, Qwen35OutputGate, Qwen35RopeConfig, Qwen35RopeType,
+    Qwen35TextConfig,
 };
 
 // Group size 3 matches Qwen3.6-27B's 48 value heads over 16 key heads, which is
@@ -154,9 +155,12 @@ fn device_recurrence_matches_the_host_reduction_bit_for_bit() {
         "the flag was clear but the recurrence still went to the device"
     );
 
+    // SAFETY: as above -- this test is the variable's only writer and no forward
+    // is in flight between calls.
     unsafe { std::env::set_var("TRITIUM_DELTANET_CUDA", "1") };
     let device = run(&cuda, 5);
     let device_ran = residency_probe(&cuda);
+    // SAFETY: as above.
     unsafe { std::env::remove_var("TRITIUM_DELTANET_CUDA") };
     // With the variable unset the device path must still be the one chosen.
     assert!(

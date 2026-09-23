@@ -629,7 +629,6 @@ impl Qwen35DeltaNet {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     /// Run the recurrence on a CUDA device when one is available and enabled.
     ///
     /// Returns `false` when the caller must fall back to
@@ -742,6 +741,7 @@ impl Qwen35DeltaNet {
     }
 
     /// Per-head gated RMSNorm over one token's recurrent output.
+    #[cfg(feature = "cuda")]
     fn gated_rms_norm(
         &self,
         z: &[f32],
@@ -761,14 +761,13 @@ impl Qwen35DeltaNet {
             let inverse_rms = 1.0 / (variance + self.spec.rms_norm_eps()).sqrt();
             for (value_lane, &row_value) in row.iter().enumerate() {
                 let lane = row_start + value_lane;
-                normalized_core[lane] = row_value
-                    * inverse_rms
-                    * self.weights.norm_weight[value_lane]
-                    * silu(z[lane]);
+                normalized_core[lane] =
+                    row_value * inverse_rms * self.weights.norm_weight[value_lane] * silu(z[lane]);
             }
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn recurrent_forward(
         &self,
         convolved: &[f32],

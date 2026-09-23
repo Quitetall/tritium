@@ -12,9 +12,7 @@
 
 use std::path::PathBuf;
 
-use tritium_nn::{
-    HfJsonTokenizer, Qwen35SaltV2LanguageMtpModel, Tokenizer, sample_greedy,
-};
+use tritium_nn::{HfJsonTokenizer, Qwen35SaltV2LanguageMtpModel, Tokenizer, sample_greedy};
 
 fn bundle_path() -> Option<PathBuf> {
     match std::env::var("TRITIUM_QWEN36_BUNDLE") {
@@ -37,8 +35,8 @@ fn mtp_draft_acceptance_rate_on_the_real_bundle() {
             return;
         }
     };
-    let profile = std::env::var("TRITIUM_QWEN36_PROFILE")
-        .unwrap_or_else(|_| "compact-v1".to_owned());
+    let profile =
+        std::env::var("TRITIUM_QWEN36_PROFILE").unwrap_or_else(|_| "compact-v1".to_owned());
     let model =
         Qwen35SaltV2LanguageMtpModel::load_bundle_profile(&bundle, &profile, backend).unwrap();
     let (model, tokenizer_json, tokenizer_config_json) = model.into_serving_assets();
