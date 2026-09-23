@@ -311,9 +311,10 @@ impl Qwen35TextRunner {
                 "Qwen3.5 text RMSNorm epsilon must be a finite positive f32 value",
             ));
         }
+        // A tied checkpoint is accepted: the loader hands the token table in as `lm_head`, so the
+        // runner's head is the same function either way.
         if config.model_type != "qwen3_5_text"
             || !config.use_cache
-            || config.tied_embeddings
             || config.full_attention.norm_weight_semantics
                 != Qwen35NormWeightSemantics::ZeroCenteredOnePlusWeight
         {

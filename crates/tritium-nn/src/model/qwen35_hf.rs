@@ -205,6 +205,22 @@ mod public_schema_tests {
             assert!(qwen35_language_mtp_tensor_schema(&invalid).is_err());
         }
     }
+
+    /// A tied checkpoint (Qwen3.5-0.8B) ships no `lm_head.weight`; the language schema must not
+    /// demand one, and must demand it again the moment the head is untied.
+    #[test]
+    fn language_schema_omits_the_head_exactly_when_tied() {
+        let mut text = Qwen35CheckpointConfig::pinned_qwen36_27b().text;
+        assert!(
+            language_schema(&text)
+                .unwrap()
+                .contains_key("lm_head.weight")
+        );
+        text.tied_embeddings = true;
+        let tied = language_schema(&text).unwrap();
+        assert!(!tied.contains_key("lm_head.weight"));
+        assert!(tied.contains_key("model.language_model.embed_tokens.weight"));
+    }
 }
 
 pub(super) trait Qwen35HfTensorSource {
@@ -696,12 +712,15 @@ pub(super) fn language_schema(
         &[hidden],
         TensorRole::Preserved,
     )?;
-    insert_spec(
-        &mut schema,
-        "lm_head.weight".to_owned(),
-        &[vocab, hidden],
-        TensorRole::Matrix,
-    )?;
+    // A tied checkpoint (Qwen3.5-0.8B) ships no head: the language head IS the token table.
+    if !config.tied_embeddings {
+        insert_spec(
+            &mut schema,
+            "lm_head.weight".to_owned(),
+            &[vocab, hidden],
+            TensorRole::Matrix,
+        )?;
+    }
 
     let key_width = checked_product(
         axis(config.delta_net.num_key_heads),
@@ -1093,7 +1112,15 @@ pub(super) fn load_language_weights<S: Qwen35HfTensorSource + ?Sized>(
         ));
     }
     let final_norm = shards.tensor_f32_exact("model.language_model.norm.weight", &[hidden])?;
-    let lm_head = shards.projection_exact("lm_head.weight", vocab, hidden)?;
+    let lm_head = shards.projection_exact(
+        if config.tied_embeddings {
+            "model.language_model.embed_tokens.weight"
+        } else {
+            "lm_head.weight"
+        },
+        vocab,
+        hidden,
+    )?;
     Ok(Qwen35TextWeights::new(
         embedding, layers, final_norm, lm_head,
     ))

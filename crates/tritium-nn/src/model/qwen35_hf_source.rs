@@ -382,6 +382,45 @@ impl Qwen35ContentVerifiedHfSource {
         ))
     }
 
+    /// [`Self::load_language`] with every language tensor passed through `transform` after it has
+    /// been read and verified, before assembly.
+    ///
+    /// This is a research seam, not a serving path: it lets a quantization experiment substitute
+    /// a reconstruction (`W → Q(W)`) for selected tensors of the exact reference and measure the
+    /// resulting model. `transform` receives the tensor name, its shape, and its fp32 values in
+    /// place, and must not change their length. The receipt still describes the SOURCE, not the
+    /// transformed model.
+    ///
+    /// # Errors
+    /// As [`Self::load_language`].
+    #[doc(hidden)]
+    #[allow(clippy::type_complexity)]
+    pub fn load_language_transformed(
+        self,
+        backend: Box<dyn TernaryBackend>,
+        transform: &dyn Fn(&str, &[usize], &mut [f32]),
+    ) -> Result<Qwen35HfLanguageModel, NnError> {
+        let weights = load_language_weights(
+            &Transforming {
+                inner: &self,
+                transform,
+            },
+            &self.source.config.text,
+        )?;
+        let runner = Qwen35TextRunner::new(&self.source.config.text, weights, backend)?;
+        let Self {
+            source,
+            identity,
+            language_receipt,
+        } = self;
+        Ok(Qwen35HfLanguageModel::from_verified_source(
+            source.config,
+            runner,
+            language_receipt,
+            identity,
+        ))
+    }
+
     /// Consume the verified source into exact-fp32 language and MTP graphs.
     ///
     /// The combined loader requires exactly the official 15-tensor `mtp.*`
@@ -450,6 +489,23 @@ impl Qwen35HfTensorSource for Qwen35ContentVerifiedHfSource {
                 "verified Qwen3.5 source tensor `{name}` changed after semantic identity verification"
             )));
         }
+        Ok(values)
+    }
+}
+
+/// A verified source whose tensors pass through a caller's transform (the research seam behind
+/// [`Qwen35ContentVerifiedHfSource::load_language_transformed`]). Verification runs first, on the
+/// source bytes, so the transform can never mask a changed checkpoint.
+#[allow(clippy::type_complexity)]
+struct Transforming<'a> {
+    inner: &'a Qwen35ContentVerifiedHfSource,
+    transform: &'a dyn Fn(&str, &[usize], &mut [f32]),
+}
+
+impl Qwen35HfTensorSource for Transforming<'_> {
+    fn tensor_f32_exact(&self, name: &str, expected: &[usize]) -> Result<Vec<f32>, NnError> {
+        let mut values = self.inner.tensor_f32_exact(name, expected)?;
+        (self.transform)(name, expected, &mut values);
         Ok(values)
     }
 }
