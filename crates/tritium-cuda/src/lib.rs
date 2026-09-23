@@ -75,6 +75,12 @@ pub use cuda::SaltResidentLinear;
 // a decode profile.
 #[cfg(feature = "cuda")]
 pub use cuda::DeltaNetResidentState;
+// The device-resident Qwen3.5/3.6 decode executor (SALT decode campaign, Phase 2).
+#[cfg(feature = "cuda")]
+pub use cuda::{
+    QWEN35_RESIDENT_MAX_CONTEXT, Qwen35Resident, Qwen35ResidentLayerSpec, Qwen35ResidentMixerSpec,
+    Qwen35ResidentSpec,
+};
 
 // plan 0043 Stage 6: direct encoded D2/B3/S34 execution with explicit allocation
 // evidence. `FastAliasesExact` remains visible so callers cannot mistake the

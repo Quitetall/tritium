@@ -629,6 +629,28 @@ impl Qwen35DeltaNet {
         }
     }
 
+    /// This mixer's weights for the resident executor, when every projection is a
+    /// resident SALT V2 tensor.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn resident_mixer_spec(&self) -> Option<tritium_cuda::Qwen35ResidentMixerSpec<'_>> {
+        let resident = |projection: &Projection| match projection {
+            Projection::SaltV2(tensor) => Some(Arc::clone(tensor)),
+            _ => None,
+        };
+        let weights = &self.weights;
+        Some(tritium_cuda::Qwen35ResidentMixerSpec::DeltaNet {
+            qkv: resident(&weights.qkv_proj)?,
+            z: resident(&weights.z_proj)?,
+            b: resident(&weights.b_proj)?,
+            a: resident(&weights.a_proj)?,
+            out: resident(&weights.out_proj)?,
+            conv_weight: &weights.conv_weight,
+            norm_weight: &weights.norm_weight,
+            dt_bias: &weights.dt_bias,
+            a_log: &weights.a_log,
+        })
+    }
+
     /// Run the recurrence on a CUDA device when one is available and enabled.
     ///
     /// Returns `false` when the caller must fall back to

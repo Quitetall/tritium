@@ -255,6 +255,10 @@ mod backend;
 // Lib code no longer references backend items directly (post-P2a/A2 churn),
 // but cuda::tests reaches them through `use super::*` via this glob.
 pub use backend::deltanet::DeltaNetResidentState;
+pub use backend::qwen35_resident::{
+    QWEN35_RESIDENT_MAX_CONTEXT, Qwen35Resident, Qwen35ResidentLayerSpec, Qwen35ResidentMixerSpec,
+    Qwen35ResidentSpec,
+};
 #[cfg_attr(not(test), allow(unused_imports))]
 use backend::*;
 pub use backend::{

@@ -306,6 +306,37 @@ pub struct Qwen35FullAttention {
 struct MixerIdentity;
 
 impl Qwen35FullAttention {
+    /// This mixer's weights for the resident executor, when every projection is a
+    /// resident SALT V2 tensor.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn resident_mixer_spec(&self) -> Option<tritium_cuda::Qwen35ResidentMixerSpec<'_>> {
+        let resident = |projection: &Projection| match projection {
+            Projection::SaltV2(tensor) => Some(Arc::clone(tensor)),
+            _ => None,
+        };
+        let weights = &self.weights;
+        Some(tritium_cuda::Qwen35ResidentMixerSpec::Attention {
+            q: resident(&weights.q_proj)?,
+            k: resident(&weights.k_proj)?,
+            v: resident(&weights.v_proj)?,
+            o: resident(&weights.o_proj)?,
+            q_norm: &weights.q_norm,
+            k_norm: &weights.k_norm,
+        })
+    }
+
+    /// RoPE base exactly as this layer applies it (the config's f64, rounded once).
+    #[cfg(feature = "cuda")]
+    pub(crate) fn rope_theta(&self) -> f32 {
+        self.spec.theta()
+    }
+
+    /// Rotated prefix width of each head.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn rotary_dim(&self) -> usize {
+        self.spec.rotary_dim
+    }
+
     /// Bind a typed Qwen3.5 text geometry to an exact full-attention weight set.
     ///
     /// # Errors

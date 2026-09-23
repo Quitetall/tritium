@@ -54,6 +54,8 @@ fn main() {
     // The Gated DeltaNet recurrent step. Same `--fmad=false` host-bit-match
     // discipline as the decode kernels: the host reduction is the reference.
     println!("cargo:rerun-if-changed=kernels/qwen35_deltanet.cu");
+    // Qwen3.5/3.6 resident decode kernels (fast tier; see the file header).
+    println!("cargo:rerun-if-changed=kernels/qwen35_decode.cu");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
@@ -81,6 +83,7 @@ fn main() {
             "train_grad.ptx",
             "salt_v2.ptx",
             "qwen35_deltanet.ptx",
+            "qwen35_decode.ptx",
         ] {
             std::fs::write(out_dir.join(ptx), "")
                 .expect("tritium-cuda: failed to write check-only placeholder PTX");
@@ -172,6 +175,17 @@ fn main() {
         &out_dir.join("qwen35_deltanet.ptx"),
         add_min_arch,
         &["--fmad=false"],
+    );
+
+    // The Qwen resident decode kernels are fast-tier by design: gated on relative
+    // error and greedy-token identity against the host path, so FMA contraction
+    // is allowed.
+    compile_ptx(
+        &nvcc,
+        Path::new("kernels/qwen35_decode.cu"),
+        &out_dir.join("qwen35_decode.ptx"),
+        add_min_arch,
+        &[],
     );
 }
 

@@ -26,6 +26,8 @@
 //! - `TRITIUM_QWEN36_ROUNDS`   rounds, a multiple of 4 under A/B (default 4)
 //! - `TRITIUM_QWEN36_WARMUP`   untimed leading decode steps per round (default 4)
 //! - `TRITIUM_QWEN36_AB`       optional `NAME=a,b` toggle for interleaved A/B
+//! - `TRITIUM_QWEN36_RESIDENT` `1` runs a round through the device-resident executor
+//!   (fast tier) instead of the host-orchestrated forward; usable as an A/B toggle
 
 fn main() {
     #[cfg(not(feature = "cuda"))]
@@ -153,6 +155,11 @@ mod cuda_qwen36 {
         );
         let runner = model.runner();
         let capacity = PROMPT.len() + warmup + steps + 1;
+        // Built once when eligible; each round decides from TRITIUM_QWEN36_RESIDENT
+        // whether to use it, so it can be one arm of an in-process A/B.
+        let mut resident = runner
+            .cuda_resident(capacity)
+            .expect("build resident executor");
 
         let mut results = Vec::new();
         for round in 0..rounds {
@@ -168,18 +175,35 @@ mod cuda_qwen36 {
                 unsafe { std::env::set_var(name, value) };
             }
 
-            let mut cache = runner.new_cache(capacity).expect("allocate cache");
-            let mut output = runner.forward(&PROMPT, &mut cache).expect("prefill");
-            let mut next = sample_greedy(output.last_logits()).expect("greedy token");
+            let use_resident = std::env::var("TRITIUM_QWEN36_RESIDENT").as_deref() == Ok("1");
             let mut tokens = Vec::with_capacity(warmup + steps);
             let mut timed = Vec::with_capacity(steps);
-            for step in 0..warmup + steps {
-                tokens.push(next);
-                let started = Instant::now();
-                output = runner.forward(&[next], &mut cache).expect("decode step");
-                next = sample_greedy(output.last_logits()).expect("greedy token");
-                if step >= warmup {
-                    timed.push(started.elapsed().as_secs_f64() * 1000.0);
+            if use_resident {
+                let executor = resident
+                    .as_mut()
+                    .expect("TRITIUM_QWEN36_RESIDENT=1 but this bundle has no resident executor");
+                executor.reset().expect("reset executor");
+                let mut next = executor.prefill(&PROMPT).expect("prefill");
+                for step in 0..warmup + steps {
+                    tokens.push(next);
+                    let started = Instant::now();
+                    next = executor.step(next).expect("decode step");
+                    if step >= warmup {
+                        timed.push(started.elapsed().as_secs_f64() * 1000.0);
+                    }
+                }
+            } else {
+                let mut cache = runner.new_cache(capacity).expect("allocate cache");
+                let mut output = runner.forward(&PROMPT, &mut cache).expect("prefill");
+                let mut next = sample_greedy(output.last_logits()).expect("greedy token");
+                for step in 0..warmup + steps {
+                    tokens.push(next);
+                    let started = Instant::now();
+                    output = runner.forward(&[next], &mut cache).expect("decode step");
+                    next = sample_greedy(output.last_logits()).expect("greedy token");
+                    if step >= warmup {
+                        timed.push(started.elapsed().as_secs_f64() * 1000.0);
+                    }
                 }
             }
             let per_token_ms = median(&mut timed);

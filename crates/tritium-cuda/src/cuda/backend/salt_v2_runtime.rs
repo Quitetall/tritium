@@ -1,6 +1,80 @@
 use super::*;
 use tritium_format::salt_v2_package::SALT_V2_ALLOCATION_TILE_SIZE;
 
+/// Launch the row-stream GEMV between two device buffers, with no host transfer.
+///
+/// The resident executor's projection primitive: `input` is `[m, columns]` and
+/// `output` `[m, rows]`, both already on the device. The caller has checked that the
+/// tensor is one [`salt_v2_stream_dispatch`] accepts and belongs to `stream`'s context.
+///
+/// # Errors
+/// Rejects a tensor the kernel cannot serve or a buffer too small for the shape, or
+/// returns a driver failure.
+pub(super) fn launch_salt_v2_stream_on(
+    stream: &CudaStream,
+    function: &CudaFunction,
+    tensor: &SaltV2ResidentTensor,
+    input: &CudaSlice<f32>,
+    m: u32,
+    output: &mut CudaSlice<f32>,
+) -> Result<(), BackendError> {
+    let table_bytes =
+        salt_v2_stream_dispatch(tensor.columns, tensor.scale_group_size, tensor.codec_tag)
+            .ok_or_else(|| {
+                BackendError::InvalidInput(
+                    "row-stream GEMV cannot serve this SALT V2 tensor".into(),
+                )
+            })?;
+    let m_usize = m as usize;
+    if input.len() < m_usize * tensor.columns || output.len() < m_usize * tensor.rows {
+        return Err(BackendError::ShapeMismatch {
+            expected: m_usize * tensor.rows,
+            got: output.len(),
+        });
+    }
+    let narrow = |value: usize, name: &str| {
+        u32::try_from(value)
+            .map_err(|_| BackendError::InvalidInput(format!("{name} exceeds the u32 kernel ABI")))
+    };
+    let n = narrow(tensor.rows, "SALT V2 rows")?;
+    let k = narrow(tensor.columns, "SALT V2 columns")?;
+    let tile_count = narrow(tensor.tile_count, "SALT V2 tile count")?;
+    let plane_count = narrow(tensor.plane_count, "SALT V2 plane count")?;
+    let outputs = narrow(m_usize * tensor.rows, "SALT V2 outputs")?;
+    let index_metadata = tensor.index_metadata.as_ref().unwrap_or(&tensor.payload);
+    let cfg = LaunchConfig {
+        grid_dim: (outputs.div_ceil(SALT_V2_STREAM_WARPS), 1, 1),
+        block_dim: (SALT_V2_STREAM_WARPS * 32, 1, 1),
+        shared_mem_bytes: SALT_V2_B3_TABLE_BYTES + table_bytes * SALT_V2_STREAM_WARPS,
+    };
+    let mut launch = stream.launch_builder(function);
+    launch
+        .arg(input)
+        .arg(&tensor.payload)
+        .arg(&tensor.scales)
+        .arg(index_metadata)
+        .arg(output)
+        .arg(&m)
+        .arg(&n)
+        .arg(&k)
+        .arg(&tile_count)
+        .arg(&plane_count)
+        .arg(&tensor.allocation_map_bytes)
+        .arg(&tensor.rank_prefix_count)
+        .arg(&tensor.terminal_map_value)
+        .arg(&table_bytes);
+    // SAFETY: validated resident handle, buffers checked against the shape above,
+    // one write per `[m, rows]` element, whole aligned B3 plane-tiles per the
+    // eligibility check.
+    #[allow(unsafe_code)]
+    unsafe {
+        launch
+            .launch(cfg)
+            .map(|_| ())
+            .map_err(|error| driver_err("launch SALT V2 row-stream forward", &error))
+    }
+}
+
 /// Per-warp shared bytes for the row-streaming kernel, or `None` when it cannot
 /// serve the tensor.
 ///
@@ -250,7 +324,7 @@ impl CudaBackend {
         )))
     }
 
-    fn validate_salt_v2_resident_context(
+    pub(super) fn validate_salt_v2_resident_context(
         &self,
         tensor: &SaltV2ResidentTensor,
     ) -> Result<(), BackendError> {

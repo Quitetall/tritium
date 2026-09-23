@@ -482,6 +482,9 @@ pub(super) const SALT_V2_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/sal
 /// Gated DeltaNet recurrent-step PTX.
 pub(super) const QWEN35_DELTANET_PTX: &str =
     include_str!(concat!(env!("OUT_DIR"), "/qwen35_deltanet.ptx"));
+/// Qwen3.5/3.6 resident decode kernels PTX.
+pub(super) const QWEN35_DECODE_PTX: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/qwen35_decode.ptx"));
 
 /// Boolean env knob: unset/`0` = off, `1` = on; anything else warns loudly
 /// (once per read site invocation) and reads as OFF — presence-detection is
