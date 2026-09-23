@@ -80,6 +80,142 @@ pub(super) fn launch_salt_v2_stream_multi_on(
     }
 }
 
+/// Quantize `groups` 128-coefficient groups of f32 activations to int8 with one
+/// scale per group, for the A8 row-stream GEMV.
+///
+/// # Errors
+/// Returns a driver failure.
+pub(super) fn launch_salt_v2_quant_act_on(
+    stream: &CudaStream,
+    function: &CudaFunction,
+    input: &CudaSlice<f32>,
+    quantized: &mut CudaSlice<i8>,
+    group_scale: &mut CudaSlice<f32>,
+    groups: u32,
+) -> Result<(), BackendError> {
+    let warps = 8u32;
+    let cfg = LaunchConfig {
+        grid_dim: (groups.div_ceil(warps), 1, 1),
+        block_dim: (warps * 32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut launch = stream.launch_builder(function);
+    launch
+        .arg(input)
+        .arg(quantized)
+        .arg(group_scale)
+        .arg(&groups);
+    // SAFETY: the caller sized `input`/`quantized` for `groups * 128` values and
+    // `group_scale` for `groups`; one warp writes each group once.
+    #[allow(unsafe_code)]
+    unsafe {
+        launch
+            .launch(cfg)
+            .map(|_| ())
+            .map_err(|error| driver_err("launch SALT V2 activation quantizer", &error))
+    }
+}
+
+/// Launch the A8 row-stream GEMV between device buffers (m = 1).
+///
+/// # Errors
+/// Rejects a tensor the kernel cannot serve, or returns a driver failure.
+pub(super) fn launch_salt_v2_stream_i8_on(
+    stream: &CudaStream,
+    function: &CudaFunction,
+    tensor: &SaltV2ResidentTensor,
+    quantized: &CudaSlice<i8>,
+    group_scale: &CudaSlice<f32>,
+    output: &mut CudaSlice<f32>,
+) -> Result<(), BackendError> {
+    let table_bytes =
+        salt_v2_stream_dispatch(tensor.columns, tensor.scale_group_size, tensor.codec_tag)
+            .ok_or_else(|| {
+                BackendError::InvalidInput("A8 row-stream GEMV cannot serve this tensor".into())
+            })?;
+    let narrow = |value: usize, name: &str| {
+        u32::try_from(value)
+            .map_err(|_| BackendError::InvalidInput(format!("{name} exceeds the u32 kernel ABI")))
+    };
+    let m = 1u32;
+    let n = narrow(tensor.rows, "SALT V2 rows")?;
+    let k = narrow(tensor.columns, "SALT V2 columns")?;
+    let tile_count = narrow(tensor.tile_count, "SALT V2 tile count")?;
+    let plane_count = narrow(tensor.plane_count, "SALT V2 plane count")?;
+    let index_metadata = tensor.index_metadata.as_ref().unwrap_or(&tensor.payload);
+    let cfg = LaunchConfig {
+        grid_dim: (n.div_ceil(SALT_V2_STREAM_WARPS), 1, 1),
+        block_dim: (SALT_V2_STREAM_WARPS * 32, 1, 1),
+        shared_mem_bytes: SALT_V2_B3_INT8_TABLE_BYTES + table_bytes * SALT_V2_STREAM_WARPS,
+    };
+    let mut launch = stream.launch_builder(function);
+    launch
+        .arg(quantized)
+        .arg(group_scale)
+        .arg(&tensor.payload)
+        .arg(&tensor.scales)
+        .arg(index_metadata)
+        .arg(output)
+        .arg(&m)
+        .arg(&n)
+        .arg(&k)
+        .arg(&tile_count)
+        .arg(&plane_count)
+        .arg(&tensor.allocation_map_bytes)
+        .arg(&tensor.rank_prefix_count)
+        .arg(&tensor.terminal_map_value)
+        .arg(&table_bytes);
+    // SAFETY: validated resident handle; the caller sized the quantized input for
+    // `columns` and the output for `rows`.
+    #[allow(unsafe_code)]
+    unsafe {
+        launch
+            .launch(cfg)
+            .map(|_| ())
+            .map_err(|error| driver_err("launch SALT V2 A8 row-stream forward", &error))
+    }
+}
+
+/// Launch a fused A8 row-stream GEMV over descriptors (m = 1).
+///
+/// # Errors
+/// Returns a driver failure.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn launch_salt_v2_stream_i8_multi_on(
+    stream: &CudaStream,
+    function: &CudaFunction,
+    descriptors: &CudaSlice<u64>,
+    tensor_count: u32,
+    total_rows: u32,
+    k: u32,
+    table_bytes: u32,
+    quantized: &CudaSlice<i8>,
+    group_scale: &CudaSlice<f32>,
+) -> Result<(), BackendError> {
+    let cfg = LaunchConfig {
+        grid_dim: (total_rows.div_ceil(SALT_V2_STREAM_WARPS), 1, 1),
+        block_dim: (SALT_V2_STREAM_WARPS * 32, 1, 1),
+        shared_mem_bytes: SALT_V2_B3_INT8_TABLE_BYTES + table_bytes * SALT_V2_STREAM_WARPS,
+    };
+    let mut launch = stream.launch_builder(function);
+    launch
+        .arg(quantized)
+        .arg(group_scale)
+        .arg(descriptors)
+        .arg(&tensor_count)
+        .arg(&total_rows)
+        .arg(&k)
+        .arg(&table_bytes);
+    // SAFETY: as `launch_salt_v2_stream_multi_on`.
+    #[allow(unsafe_code)]
+    unsafe {
+        launch
+            .launch(cfg)
+            .map(|_| ())
+            .map_err(|error| driver_err("launch SALT V2 fused A8 row-stream forward", &error))
+    }
+}
+
 /// Launch the row-stream GEMV between two device buffers, with no host transfer.
 ///
 /// The resident executor's projection primitive: `input` is `[m, columns]` and
@@ -481,6 +617,81 @@ impl CudaBackend {
             self.salt_v2_forward_launch(tensor, activation, m, output_elements, receipt)?;
         output.copy_from_slice(&staged);
         Ok(receipt)
+    }
+
+    /// A8 row-stream projection with host input and output, for gates and probes.
+    ///
+    /// Quantizes `activation` on the device to int8 with one scale per 128-wide
+    /// group (`q = round_ties_even(x * 127 / absmax)`, scale `absmax / 127`) and runs
+    /// the dp4a row-stream GEMV. Returns the output and the device's quantized
+    /// activations and scales, so a caller can build an exact reference from the
+    /// same inputs the kernel saw. `m` must be 1.
+    ///
+    /// # Errors
+    /// Rejects a tensor the kernel cannot serve or `m != 1`, or returns a driver
+    /// failure.
+    #[allow(clippy::type_complexity)]
+    pub fn salt_v2_forward_a8_probe(
+        &self,
+        tensor: &SaltV2ResidentTensor,
+        activation: &[f32],
+        m: usize,
+    ) -> Result<(Vec<f32>, Vec<i8>, Vec<f32>), BackendError> {
+        self.validate_salt_v2_resident_context(tensor)?;
+        if m != 1 || activation.len() != tensor.columns || !tensor.columns.is_multiple_of(128) {
+            return Err(BackendError::ShapeMismatch {
+                expected: tensor.columns,
+                got: activation.len(),
+            });
+        }
+        let groups = tensor.columns / 128;
+        let input = self
+            .stream
+            .clone_htod(activation)
+            .map_err(|error| driver_err("upload A8 probe activation", &error))?;
+        let mut quantized = self
+            .stream
+            .alloc_zeros::<i8>(tensor.columns)
+            .map_err(|error| driver_err("allocate A8 probe activations", &error))?;
+        let mut scale = self
+            .stream
+            .alloc_zeros::<f32>(groups)
+            .map_err(|error| driver_err("allocate A8 probe scales", &error))?;
+        let mut output = self
+            .stream
+            .alloc_zeros::<f32>(tensor.rows)
+            .map_err(|error| driver_err("allocate A8 probe output", &error))?;
+        launch_salt_v2_quant_act_on(
+            &self.stream,
+            &self.func_salt_v2_quant_act,
+            &input,
+            &mut quantized,
+            &mut scale,
+            u32::try_from(groups).map_err(|_| {
+                BackendError::InvalidInput("A8 probe group count exceeds u32".into())
+            })?,
+        )?;
+        launch_salt_v2_stream_i8_on(
+            &self.stream,
+            &self.func_salt_v2_stream_i8,
+            tensor,
+            &quantized,
+            &scale,
+            &mut output,
+        )?;
+        let mut host_output = vec![0.0f32; tensor.rows];
+        let mut host_quantized = vec![0i8; tensor.columns];
+        let mut host_scale = vec![0.0f32; groups];
+        self.stream
+            .memcpy_dtoh(&output, &mut host_output)
+            .map_err(|error| driver_err("read A8 probe output", &error))?;
+        self.stream
+            .memcpy_dtoh(&quantized, &mut host_quantized)
+            .map_err(|error| driver_err("read A8 probe activations", &error))?;
+        self.stream
+            .memcpy_dtoh(&scale, &mut host_scale)
+            .map_err(|error| driver_err("read A8 probe scales", &error))?;
+        Ok((host_output, host_quantized, host_scale))
     }
 
     /// Whether the warp kernels can serve this tensor's geometry.

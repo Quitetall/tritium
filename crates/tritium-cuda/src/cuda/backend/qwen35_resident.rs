@@ -21,7 +21,8 @@
 use std::sync::Arc;
 
 use super::salt_v2_runtime::{
-    SALT_STREAM_DESCRIPTOR_WORDS, launch_salt_v2_stream_multi_on, launch_salt_v2_stream_on,
+    SALT_STREAM_DESCRIPTOR_WORDS, launch_salt_v2_quant_act_on, launch_salt_v2_stream_i8_multi_on,
+    launch_salt_v2_stream_i8_on, launch_salt_v2_stream_multi_on, launch_salt_v2_stream_on,
     salt_stream_descriptor, salt_v2_stream_dispatch,
 };
 use super::*;
@@ -181,6 +182,9 @@ struct Layer {
 struct Kernels {
     stream_gemv: CudaFunction,
     stream_gemv_multi: CudaFunction,
+    quant_act: CudaFunction,
+    stream_i8: CudaFunction,
+    stream_i8_multi: CudaFunction,
     gather: CudaFunction,
     recurrent: CudaFunction,
     add_rmsnorm: CudaFunction,
@@ -225,6 +229,9 @@ struct Scratch {
     logits: CudaSlice<f32>,
     argmax_value: CudaSlice<f32>,
     argmax_index: CudaSlice<i32>,
+    /// A8 mode: the current projection input as int8, one scale per 128 group.
+    act_quantized: CudaSlice<i8>,
+    act_scale: CudaSlice<f32>,
 }
 
 /// Argmax stage-one blocks and threads: enough blocks to spread a 248K vocabulary.
@@ -484,6 +491,9 @@ impl CudaBackend {
         let kernels = Kernels {
             stream_gemv: self.func_salt_v2_stream.clone(),
             stream_gemv_multi: self.func_salt_v2_stream_multi.clone(),
+            quant_act: self.func_salt_v2_quant_act.clone(),
+            stream_i8: self.func_salt_v2_stream_i8.clone(),
+            stream_i8_multi: self.func_salt_v2_stream_i8_multi.clone(),
             gather: self.func_salt_v2_gather.clone(),
             recurrent: self.func_deltanet_step.clone(),
             add_rmsnorm: function("q35_add_rmsnorm")?,
@@ -536,6 +546,20 @@ impl CudaBackend {
                 .stream
                 .alloc_zeros::<i32>(ARGMAX_BLOCKS as usize)
                 .map_err(|error| alloc_or_backend("allocate argmax indices", &error, 512))?,
+            act_quantized: self
+                .stream
+                .alloc_zeros::<i8>(hidden.max(value_width).max(query_width).max(intermediate))
+                .map_err(|error| {
+                    alloc_or_backend(
+                        "allocate A8 activations",
+                        &error,
+                        hidden.max(value_width).max(query_width).max(intermediate),
+                    )
+                })?,
+            act_scale: zeros(
+                hidden.max(value_width).max(query_width).max(intermediate) / 128,
+                "allocate A8 activation scales",
+            )?,
         };
 
         // Fused input groups. Each descriptor bakes in a scratch buffer's device
@@ -642,6 +666,92 @@ fn run(
 /// launches each projection separately, for A/B).
 fn fused_enabled() -> bool {
     std::env::var("TRITIUM_QWEN35_FUSED").as_deref() != Ok("0")
+}
+
+/// Which projections take int8 activations (the relaxed A8 tier).
+///
+/// Opt-in, because it changes numerics and is gated on output quality:
+/// `TRITIUM_QWEN35_A8=1` (or `all`) quantizes every projection input; `mlp`
+/// quantizes only the MLP's, which carry ~60% of the weight bytes and feed no
+/// recurrent state -- measured on near-lossless-v1, quantizing everything let the
+/// DeltaNet state accumulate error from 2.8% at the first token to ~50% within a
+/// few, and flipped 4 of 42 greedy tokens. `mlp` still flipped 3 of 42 (worst
+/// relative logit error 0.49), so neither scope passes RFC 0001's greedy-identity
+/// bar; they are +6.7% (`all`) and +4.6% (`mlp`) end-to-end, measured, not adopted.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum A8Scope {
+    Off,
+    Mlp,
+    All,
+}
+
+fn a8_scope() -> A8Scope {
+    match std::env::var("TRITIUM_QWEN35_A8").as_deref() {
+        Ok("1") | Ok("all") => A8Scope::All,
+        Ok("mlp") => A8Scope::Mlp,
+        _ => A8Scope::Off,
+    }
+}
+
+/// One projection of a device vector, f32 or A8.
+#[allow(clippy::too_many_arguments)]
+fn project(
+    kernels: &Kernels,
+    stream: &CudaStream,
+    a8: bool,
+    tensor: &SaltV2ResidentTensor,
+    input: &CudaSlice<f32>,
+    output: &mut CudaSlice<f32>,
+    quantized: &mut CudaSlice<i8>,
+    scale: &mut CudaSlice<f32>,
+) -> Result<(), BackendError> {
+    if a8 {
+        let groups = to_u32(tensor.columns / 128, "activation groups")?;
+        launch_salt_v2_quant_act_on(stream, &kernels.quant_act, input, quantized, scale, groups)?;
+        launch_salt_v2_stream_i8_on(stream, &kernels.stream_i8, tensor, quantized, scale, output)
+    } else {
+        launch_salt_v2_stream_on(stream, &kernels.stream_gemv, tensor, input, 1, output)
+    }
+}
+
+/// A fused group of projections of one device vector, f32 or A8.
+#[allow(clippy::too_many_arguments)]
+fn project_fused(
+    kernels: &Kernels,
+    stream: &CudaStream,
+    a8: bool,
+    group: &FusedGroup,
+    k: u32,
+    table_bytes: u32,
+    input: &CudaSlice<f32>,
+    quantized: &mut CudaSlice<i8>,
+    scale: &mut CudaSlice<f32>,
+) -> Result<(), BackendError> {
+    if a8 {
+        launch_salt_v2_quant_act_on(stream, &kernels.quant_act, input, quantized, scale, k / 128)?;
+        launch_salt_v2_stream_i8_multi_on(
+            stream,
+            &kernels.stream_i8_multi,
+            &group.descriptors,
+            group.tensor_count,
+            group.total_rows,
+            k,
+            table_bytes,
+            quantized,
+            scale,
+        )
+    } else {
+        launch_salt_v2_stream_multi_on(
+            stream,
+            &kernels.stream_gemv_multi,
+            &group.descriptors,
+            group.tensor_count,
+            group.total_rows,
+            k,
+            table_bytes,
+            input,
+        )
+    }
 }
 
 fn elementwise(n: usize) -> LaunchConfig {
@@ -794,6 +904,9 @@ impl Qwen35Resident {
             .map_err(|error| driver_err("upload resident token", &error))?;
 
         self.gather()?;
+        let scope = a8_scope();
+        let a8 = scope == A8Scope::All;
+        let a8_mlp = scope != A8Scope::Off;
         let n = to_i32(self.hidden, "hidden")?;
         for index in 0..self.layers.len() {
             // The previous layer's MLP output is folded into the residual here,
@@ -810,9 +923,9 @@ impl Qwen35Resident {
                 index != 0,
             )?;
             if matches!(self.layers[index].mixer, Mixer::DeltaNet(_)) {
-                self.deltanet(index)?;
+                self.deltanet(index, a8)?;
             } else {
-                self.attention(index)?;
+                self.attention(index, a8)?;
             }
             add_rmsnorm(
                 &self.stream,
@@ -825,7 +938,7 @@ impl Qwen35Resident {
                 self.eps,
                 true,
             )?;
-            self.mlp(index)?;
+            self.mlp(index, a8_mlp)?;
         }
         add_rmsnorm(
             &self.stream,
@@ -838,13 +951,15 @@ impl Qwen35Resident {
             self.eps,
             true,
         )?;
-        launch_salt_v2_stream_on(
+        project(
+            &self.kernels,
             &self.stream,
-            &self.kernels.stream_gemv,
+            a8,
             &self.lm_head,
             &self.scratch.normalized,
-            1,
             &mut self.scratch.logits,
+            &mut self.scratch.act_quantized,
+            &mut self.scratch.act_scale,
         )?;
         self.position += 1;
         Ok(())
@@ -893,7 +1008,7 @@ impl Qwen35Resident {
         )
     }
 
-    fn deltanet(&mut self, index: usize) -> Result<(), BackendError> {
+    fn deltanet(&mut self, index: usize, a8: bool) -> Result<(), BackendError> {
         let key_width = self.key_heads * self.key_head_dim;
         let group = to_u32(self.value_heads / self.key_heads, "group size")?;
         let key_heads = to_i32(self.key_heads, "key heads")?;
@@ -921,50 +1036,58 @@ impl Qwen35Resident {
         let Mixer::DeltaNet(layer) = &mut entry.mixer else {
             return Err(invalid("resident Qwen layer is not a DeltaNet layer"));
         };
-        let gemv = &kernels.stream_gemv;
         match fused {
-            Some(group) => launch_salt_v2_stream_multi_on(
+            Some(group) => project_fused(
+                kernels,
                 stream,
-                &kernels.stream_gemv_multi,
-                &group.descriptors,
-                group.tensor_count,
-                group.total_rows,
+                a8,
+                group,
                 hidden_u32,
                 fused_table_bytes,
                 &scratch.normalized,
+                &mut scratch.act_quantized,
+                &mut scratch.act_scale,
             )?,
             None => {
-                launch_salt_v2_stream_on(
+                project(
+                    kernels,
                     stream,
-                    gemv,
+                    a8,
                     &layer.qkv,
                     &scratch.normalized,
-                    1,
                     &mut scratch.qkv,
+                    &mut scratch.act_quantized,
+                    &mut scratch.act_scale,
                 )?;
-                launch_salt_v2_stream_on(
+                project(
+                    kernels,
                     stream,
-                    gemv,
+                    a8,
                     &layer.z,
                     &scratch.normalized,
-                    1,
                     &mut scratch.z,
+                    &mut scratch.act_quantized,
+                    &mut scratch.act_scale,
                 )?;
-                launch_salt_v2_stream_on(
+                project(
+                    kernels,
                     stream,
-                    gemv,
+                    a8,
                     &layer.b,
                     &scratch.normalized,
-                    1,
                     &mut scratch.b,
+                    &mut scratch.act_quantized,
+                    &mut scratch.act_scale,
                 )?;
-                launch_salt_v2_stream_on(
+                project(
+                    kernels,
                     stream,
-                    gemv,
+                    a8,
                     &layer.a,
                     &scratch.normalized,
-                    1,
                     &mut scratch.a,
+                    &mut scratch.act_quantized,
+                    &mut scratch.act_scale,
                 )?;
             }
         }
@@ -1062,17 +1185,19 @@ impl Qwen35Resident {
             "launch q35_gated_rmsnorm",
         )?;
 
-        launch_salt_v2_stream_on(
+        project(
+            kernels,
             stream,
-            gemv,
+            a8,
             &layer.out,
             &scratch.gated,
-            1,
             &mut scratch.branch,
+            &mut scratch.act_quantized,
+            &mut scratch.act_scale,
         )
     }
 
-    fn attention(&mut self, index: usize) -> Result<(), BackendError> {
+    fn attention(&mut self, index: usize, a8: bool) -> Result<(), BackendError> {
         let heads = to_i32(self.heads, "heads")?;
         let kv_heads = to_i32(self.kv_heads, "kv heads")?;
         let head_dim = to_i32(self.head_dim, "head dim")?;
@@ -1105,42 +1230,48 @@ impl Qwen35Resident {
         let Mixer::Attention(layer) = &mut entry.mixer else {
             return Err(invalid("resident Qwen layer is not an attention layer"));
         };
-        let gemv = &kernels.stream_gemv;
         match fused {
-            Some(group) => launch_salt_v2_stream_multi_on(
+            Some(group) => project_fused(
+                kernels,
                 stream,
-                &kernels.stream_gemv_multi,
-                &group.descriptors,
-                group.tensor_count,
-                group.total_rows,
+                a8,
+                group,
                 hidden_u32,
                 fused_table_bytes,
                 &scratch.normalized,
+                &mut scratch.act_quantized,
+                &mut scratch.act_scale,
             )?,
             None => {
-                launch_salt_v2_stream_on(
+                project(
+                    kernels,
                     stream,
-                    gemv,
+                    a8,
                     &layer.q,
                     &scratch.normalized,
-                    1,
                     &mut scratch.fused_query,
+                    &mut scratch.act_quantized,
+                    &mut scratch.act_scale,
                 )?;
-                launch_salt_v2_stream_on(
+                project(
+                    kernels,
                     stream,
-                    gemv,
+                    a8,
                     &layer.k,
                     &scratch.normalized,
-                    1,
                     &mut scratch.key,
+                    &mut scratch.act_quantized,
+                    &mut scratch.act_scale,
                 )?;
-                launch_salt_v2_stream_on(
+                project(
+                    kernels,
                     stream,
-                    gemv,
+                    a8,
                     &layer.v,
                     &scratch.normalized,
-                    1,
                     &mut scratch.value,
+                    &mut scratch.act_quantized,
+                    &mut scratch.act_scale,
                 )?;
             }
         }
@@ -1209,17 +1340,19 @@ impl Qwen35Resident {
             "launch q35_sigmoid_mul",
         )?;
 
-        launch_salt_v2_stream_on(
+        project(
+            kernels,
             stream,
-            gemv,
+            a8,
             &layer.o,
             &scratch.attended,
-            1,
             &mut scratch.branch,
+            &mut scratch.act_quantized,
+            &mut scratch.act_scale,
         )
     }
 
-    fn mlp(&mut self, index: usize) -> Result<(), BackendError> {
+    fn mlp(&mut self, index: usize, a8: bool) -> Result<(), BackendError> {
         let hidden_u32 = to_u32(self.hidden, "hidden")?;
         let fused_table_bytes = self.fused_table_bytes;
         let (stream, kernels, scratch) = (&self.stream, &self.kernels, &mut self.scratch);
@@ -1229,34 +1362,38 @@ impl Qwen35Resident {
         } else {
             None
         };
-        let gemv = &kernels.stream_gemv;
         match fused {
-            Some(group) => launch_salt_v2_stream_multi_on(
+            Some(group) => project_fused(
+                kernels,
                 stream,
-                &kernels.stream_gemv_multi,
-                &group.descriptors,
-                group.tensor_count,
-                group.total_rows,
+                a8,
+                group,
                 hidden_u32,
                 fused_table_bytes,
                 &scratch.normalized,
+                &mut scratch.act_quantized,
+                &mut scratch.act_scale,
             )?,
             None => {
-                launch_salt_v2_stream_on(
+                project(
+                    kernels,
                     stream,
-                    gemv,
+                    a8,
                     &layer.gate,
                     &scratch.normalized,
-                    1,
                     &mut scratch.mlp_gate,
+                    &mut scratch.act_quantized,
+                    &mut scratch.act_scale,
                 )?;
-                launch_salt_v2_stream_on(
+                project(
+                    kernels,
                     stream,
-                    gemv,
+                    a8,
                     &layer.up,
                     &scratch.normalized,
-                    1,
                     &mut scratch.mlp_up,
+                    &mut scratch.act_quantized,
+                    &mut scratch.act_scale,
                 )?;
             }
         }
@@ -1269,13 +1406,15 @@ impl Qwen35Resident {
             .arg(&mut scratch.mlp_act)
             .arg(&n_i32);
         run(&mut builder, elementwise(n), "launch q35_swiglu")?;
-        launch_salt_v2_stream_on(
+        project(
+            kernels,
             stream,
-            gemv,
+            a8,
             &layer.down,
             &scratch.mlp_act,
-            1,
             &mut scratch.branch,
+            &mut scratch.act_quantized,
+            &mut scratch.act_scale,
         )
     }
 

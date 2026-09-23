@@ -174,3 +174,53 @@ fn other_codecs_take_the_warp_kernel_and_say_so() {
         "d2",
     );
 }
+
+/// The A8 row-stream GEMV against an exact reference built from the same int8
+/// activations and scales the kernel saw.
+///
+/// Quantization error is not the kernel's to answer for, so the reference uses
+/// the device's own quantized activations, dequantized. What remains is only the
+/// kernel's arithmetic: exact int32 partials, then a float fold per word.
+#[test]
+fn a8_kernel_matches_a_reference_on_its_own_quantized_inputs() {
+    let Ok(cuda) = CudaBackend::new(0) else {
+        eprintln!("skipping SALT V2 A8 parity: no CUDA device");
+        return;
+    };
+    for (label, tensor) in [
+        ("ragged", tensor(6, 1024, |tile| tile % 3 + 1)),
+        ("crossing", tensor(120, 768, |tile| (tile * 7) % 3 + 1)),
+    ] {
+        let rows = tensor.dims()[0] as usize;
+        let columns = tensor.dims()[1] as usize;
+        let package = SaltV2Package::new(SaltV2Codec::B3, vec![tensor.clone()]).unwrap();
+        let resident = cuda.upload_salt_v2(&tensor, SaltV2Codec::B3).unwrap();
+        let act = activation(1, columns);
+        let (output, quantized, scale) = cuda.salt_v2_forward_a8_probe(&resident, &act, 1).unwrap();
+        // The quantizer is itself checked: every value within half a step.
+        for (index, (&q, &x)) in quantized.iter().zip(&act).enumerate() {
+            let step = scale[index / 128];
+            assert!(
+                (f32::from(q) * step - x).abs() <= step * 0.5 + 1e-6,
+                "{label}: activation {index} quantized to {q} at step {step}, from {x}"
+            );
+        }
+        let dequantized: Vec<f32> = quantized
+            .iter()
+            .enumerate()
+            .map(|(index, &q)| f32::from(q) * scale[index / 128])
+            .collect();
+        let expected = salt_v2_matvec(&package, 0, &dequantized).unwrap().output;
+        assert_eq!(output.len(), rows);
+        let peak = expected
+            .iter()
+            .fold(0.0f32, |peak, value| peak.max(value.abs()))
+            .max(f32::MIN_POSITIVE);
+        for (lane, (&got, &want)) in output.iter().zip(&expected).enumerate() {
+            assert!(
+                (got - want).abs() / peak <= 1e-5,
+                "{label} lane {lane}: A8 {got} vs reference on its own inputs {want}"
+            );
+        }
+    }
+}

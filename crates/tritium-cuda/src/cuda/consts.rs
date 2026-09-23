@@ -422,6 +422,12 @@ pub(super) const KERNEL_NAME_SALT_V2_WARP_FAST: &str = "salt_v2_forward_warp_fas
 pub(super) const KERNEL_NAME_SALT_V2_STREAM: &str = "salt_v2_stream_f32";
 /// Several row-stream projections of one input in one launch.
 pub(super) const KERNEL_NAME_SALT_V2_STREAM_MULTI: &str = "salt_v2_stream_f32_multi";
+/// Per-128-group int8 activation quantizer for the A8 row-stream GEMV.
+pub(super) const KERNEL_NAME_SALT_V2_QUANT_ACT: &str = "salt_v2_quant_act_g128";
+/// A8 (int8 activation, dp4a) row-stream GEMV.
+pub(super) const KERNEL_NAME_SALT_V2_STREAM_I8: &str = "salt_v2_stream_i8";
+/// Fused multi-tensor A8 row-stream GEMV.
+pub(super) const KERNEL_NAME_SALT_V2_STREAM_I8_MULTI: &str = "salt_v2_stream_i8_multi";
 pub(super) const KERNEL_NAME_SALT_V2_GATHER: &str = "salt_v2_gather_rows";
 /// One Gated DeltaNet recurrent state update for every head of one token.
 pub(super) const KERNEL_NAME_DELTANET_STEP: &str = "qwen35_deltanet_recurrent_step";
@@ -448,6 +454,8 @@ pub(super) const SALT_V2_WARP_MAX_WARPS: u32 = 8;
 pub(super) const SALT_V2_B3_TABLE_BYTES: u32 = 256 * 2;
 /// Warps per block for the row-streaming SALT V2 GEMV.
 pub(super) const SALT_V2_STREAM_WARPS: u32 = 8;
+/// The A8 kernels' block-wide byte -> five-int8-trits table: 256 `u64`s.
+pub(super) const SALT_V2_B3_INT8_TABLE_BYTES: u32 = 256 * 8;
 /// Warps per block for the tiled kernel — each warp computes one output column,
 /// so a block covers this many `N` at once (8 warps = 256 threads). ncu note
 /// (2026-07-07): the small decode GEMMs run at 0.42–0.62 waves / 44–48% DRAM —
