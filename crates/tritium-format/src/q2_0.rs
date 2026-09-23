@@ -352,3 +352,108 @@ mod tests {
         ));
     }
 }
+
+/// Weights per PQ2_0 block: PrismML's group-128 variant of Q2_0 (their ggml type 142).
+pub const PQ2_0_GROUP_SIZE: usize = 128;
+
+/// Bytes in one PQ2_0 block: `f16 d + qs[32]` = 34, scale first like Q2_0.
+pub const PQ2_0_BLOCK_BYTES: usize = 2 + PQ2_0_GROUP_SIZE / 4;
+
+/// Rewrite PQ2_0 blocks as Q2_0 blocks, losslessly.
+///
+/// PQ2_0 is Q2_0's codec at twice the group size: the same scale-first layout, the same
+/// `code = value + 1` in two bits, the same `qs[j / 4] >> 2·(j % 4)` placement. Its 128 codes are
+/// therefore exactly two consecutive 64-code Q2_0 payloads, and giving both halves the block's one
+/// scale reproduces every weight bit for bit. The cost is one extra 2-byte scale per 128 weights
+/// (36 bytes instead of 34), which is what lets every existing Q2_0 path run a group-128 tensor.
+///
+/// # Errors
+/// [`FormatError::WrongBlockLen`] if `src` is not a whole number of PQ2_0 blocks or `dst` is not
+/// the matching number of Q2_0 blocks, and [`FormatError::DecodedOutOfRange`] if any code is 3
+/// (`+2`), which a ternary tensor never contains.
+pub fn split_pq2_0_into_q2_0(src: &[u8], dst: &mut [u8]) -> Result<(), FormatError> {
+    if !src.len().is_multiple_of(PQ2_0_BLOCK_BYTES) {
+        return Err(FormatError::WrongBlockLen {
+            expected: PQ2_0_BLOCK_BYTES,
+            got: src.len() % PQ2_0_BLOCK_BYTES,
+        });
+    }
+    let blocks = src.len() / PQ2_0_BLOCK_BYTES;
+    if dst.len() != blocks * 2 * Q2_0_BLOCK_BYTES {
+        return Err(FormatError::WrongBlockLen {
+            expected: blocks * 2 * Q2_0_BLOCK_BYTES,
+            got: dst.len(),
+        });
+    }
+    let half = Q2_0_GROUP_SIZE / 4;
+    for (block, out) in src
+        .as_chunks::<PQ2_0_BLOCK_BYTES>()
+        .0
+        .iter()
+        .zip(dst.as_chunks_mut::<{ 2 * Q2_0_BLOCK_BYTES }>().0.iter_mut())
+    {
+        let (scale, qs) = block.split_at(2);
+        if qs
+            .iter()
+            .any(|byte| (0..4).any(|slot| (byte >> (2 * slot)) & 3 == 3))
+        {
+            return Err(FormatError::DecodedOutOfRange(2));
+        }
+        let (first, second) = out.split_at_mut(Q2_0_BLOCK_BYTES);
+        first[..2].copy_from_slice(scale);
+        first[2..].copy_from_slice(&qs[..half]);
+        second[..2].copy_from_slice(scale);
+        second[2..].copy_from_slice(&qs[half..]);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod pq2_0_tests {
+    use super::*;
+
+    /// PrismML's reference decoder (`dequantize_row_pq2_0`), transcribed.
+    fn prism_dequantize(block: &[u8]) -> Vec<f32> {
+        let d = f32::from(f16::from_bits(u16::from_le_bytes([block[0], block[1]])));
+        (0..PQ2_0_GROUP_SIZE)
+            .map(|j| {
+                let q = (block[2 + j / 4] >> ((j % 4) * 2)) & 3;
+                (f32::from(q) - 1.0) * d
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_split_block_decodes_to_the_same_weights() {
+        let mut block = [0u8; PQ2_0_BLOCK_BYTES];
+        block[..2].copy_from_slice(&f16::from_f32(0.0371).to_bits().to_le_bytes());
+        for (i, byte) in block[2..].iter_mut().enumerate() {
+            // Codes cycle through 0, 1, 2 so every slot position sees every value.
+            *byte = (0..4).fold(0u8, |acc, slot| {
+                acc | ((((i * 4 + slot) % 3) as u8) << (2 * slot))
+            });
+        }
+        let want = prism_dequantize(&block);
+        let mut split = [0u8; 2 * Q2_0_BLOCK_BYTES];
+        split_pq2_0_into_q2_0(&block, &mut split).unwrap();
+        let mut got = Vec::new();
+        for half in split.as_chunks::<Q2_0_BLOCK_BYTES>().0 {
+            let mut trits = [Trit::ZERO; Q2_0_GROUP_SIZE];
+            let mut scale = f16::ZERO;
+            unpack_q2_0_block(half, &mut trits, &mut scale).unwrap();
+            got.extend(trits.iter().map(|t| t.to_f32() * f32::from(scale)));
+        }
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn a_plus_two_code_is_rejected() {
+        let mut block = [0u8; PQ2_0_BLOCK_BYTES];
+        block[2] = 0b11;
+        let mut split = [0u8; 2 * Q2_0_BLOCK_BYTES];
+        assert!(matches!(
+            split_pq2_0_into_q2_0(&block, &mut split),
+            Err(FormatError::DecodedOutOfRange(2))
+        ));
+    }
+}

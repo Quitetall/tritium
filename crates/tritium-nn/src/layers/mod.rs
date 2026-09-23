@@ -5,6 +5,7 @@
 //! [`crate::model::weights`]. Real forward math lands in WF-3; today they are
 //! documented stubs so the per-op waves can fill them in disjoint files.
 
+mod activation_basis;
 mod dense;
 mod linear;
 mod mlp;
@@ -20,6 +21,7 @@ mod transformer_block;
 
 pub(crate) use packed_salt::{PackedSaltMatrix, PackedSaltMatrixBuilder};
 
+pub use activation_basis::SignedBlockHadamard;
 pub use dense::DenseLinear;
 pub use linear::TernaryLinear;
 pub use mlp::{Mlp, Relu2Mlp, SwiGluMlp};

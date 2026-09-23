@@ -10,16 +10,18 @@ use tritium_spec::TernaryBackend;
 use tritium_train::ops::ste::{fast_hadamard, group_is_rotatable};
 
 use crate::error::NnError;
-use crate::layers::HostSaltV2Linear;
 use crate::layers::packed_salt::PackedSaltMatrix;
 #[cfg(feature = "cuda")]
 use crate::layers::projection::{salt_v2_cuda_backend, salt_v2_forward_exact};
+use crate::layers::{HostSaltV2Linear, Q2Linear};
 
 #[derive(Clone, Debug)]
 enum Storage {
     Dense(Vec<f32>),
     Salt(PackedSaltMatrix),
     HostSaltV2(Arc<HostSaltV2Linear>),
+    /// Group-scaled 2-bit ternary rows, which carry their own input basis.
+    Q2(Arc<Q2Linear>),
     #[cfg(feature = "cuda")]
     SaltV2(Arc<tritium_cuda::SaltV2ResidentTensor>),
 }
@@ -129,6 +131,31 @@ impl TokenEmbedding {
         })
     }
 
+    /// Build a token table around packed Q2_0 rows.
+    ///
+    /// The rows carry their own basis: a folded table stores `B·w` per token, and gather
+    /// un-rotates each row it reads through [`Q2Linear::gather_row`]. The table's own
+    /// `rotation` field stays unset, because the tensor already knows.
+    ///
+    /// # Errors
+    /// [`NnError::Shape`] when the matrix has empty geometry.
+    pub fn from_q2(tensor: Arc<Q2Linear>) -> Result<Self, NnError> {
+        let rows = tensor.n_out();
+        let cols = tensor.k_in();
+        if rows == 0 || cols == 0 {
+            return Err(NnError::Shape {
+                expected: 1,
+                got: rows.saturating_mul(cols),
+            });
+        }
+        Ok(Self {
+            rows,
+            cols,
+            rotation: None,
+            storage: Storage::Q2(tensor),
+        })
+    }
+
     /// Build a dense fp32 token table.
     ///
     /// # Errors
@@ -190,7 +217,7 @@ impl TokenEmbedding {
     pub fn as_dense(&self) -> Option<&[f32]> {
         match &self.storage {
             Storage::Dense(values) => Some(values),
-            Storage::Salt(_) | Storage::HostSaltV2(_) => None,
+            Storage::Salt(_) | Storage::HostSaltV2(_) | Storage::Q2(_) => None,
             #[cfg(feature = "cuda")]
             Storage::SaltV2(_) => None,
         }
@@ -206,7 +233,7 @@ impl TokenEmbedding {
             Storage::Salt(_) | Storage::HostSaltV2(_) => true,
             #[cfg(feature = "cuda")]
             Storage::SaltV2(_) => true,
-            Storage::Dense(_) => false,
+            Storage::Dense(_) | Storage::Q2(_) => false,
         }
     }
 
@@ -217,7 +244,7 @@ impl TokenEmbedding {
         match &self.storage {
             Storage::Dense(_) => 0,
             Storage::Salt(matrix) => matrix.sparse_plane_count(),
-            Storage::HostSaltV2(_) => 0,
+            Storage::HostSaltV2(_) | Storage::Q2(_) => 0,
             #[cfg(feature = "cuda")]
             Storage::SaltV2(_) => 0,
         }
@@ -231,6 +258,7 @@ impl TokenEmbedding {
             Storage::Dense(values) => values.capacity().saturating_mul(size_of::<f32>()),
             Storage::Salt(matrix) => matrix.resident_bytes(),
             Storage::HostSaltV2(tensor) => tensor.resident_bytes(),
+            Storage::Q2(tensor) => tensor.packed_bytes(),
             #[cfg(feature = "cuda")]
             Storage::SaltV2(tensor) => {
                 usize::try_from(tensor.allocation_receipt().steady_resident_bytes())
@@ -256,6 +284,21 @@ impl TokenEmbedding {
                 Ok(())
             }
             Storage::HostSaltV2(tensor) => tensor.gather_rows(tokens, out),
+            Storage::Q2(tensor) => {
+                let expected = tokens.len().checked_mul(self.cols).ok_or(NnError::Shape {
+                    expected: usize::MAX,
+                    got: out.len(),
+                })?;
+                if out.len() != expected {
+                    return Err(NnError::Shape {
+                        expected,
+                        got: out.len(),
+                    });
+                }
+                out.par_chunks_mut(self.cols)
+                    .zip(tokens.par_iter())
+                    .try_for_each(|(dst, &token)| tensor.gather_row(token as usize, dst))
+            }
             #[cfg(feature = "cuda")]
             Storage::SaltV2(_) => Err(NnError::Backend(
                 "resident SALT V2 embedding gather requires the backend-aware gather_with_backend"
@@ -330,7 +373,7 @@ impl TokenEmbedding {
                 let _receipt = cuda.salt_v2_gather_rows(tensor, tokens, out)?;
                 Ok(())
             }
-            Storage::Dense(_) | Storage::Salt(_) | Storage::HostSaltV2(_) => {
+            Storage::Dense(_) | Storage::Salt(_) | Storage::HostSaltV2(_) | Storage::Q2(_) => {
                 self.gather(tokens, out)
             }
         }
@@ -368,6 +411,8 @@ impl TokenEmbedding {
                 None => matrix.project_exact(hidden, logits),
             },
             Storage::HostSaltV2(tensor) => tensor.forward(hidden, 1, logits),
+            // A folded tied head rotates its input inside the projection.
+            Storage::Q2(tensor) => tensor.forward(hidden, 1, logits),
             #[cfg(feature = "cuda")]
             Storage::SaltV2(_) => Err(NnError::Backend(
                 "resident SALT V2 unembedding requires the backend-aware unembed_exact_with_backend"
@@ -404,7 +449,7 @@ impl TokenEmbedding {
         match &self.storage {
             #[cfg(feature = "cuda")]
             Storage::SaltV2(tensor) => salt_v2_forward_exact(backend, tensor, hidden, 1, logits),
-            Storage::Dense(_) | Storage::Salt(_) | Storage::HostSaltV2(_) => {
+            Storage::Dense(_) | Storage::Salt(_) | Storage::HostSaltV2(_) | Storage::Q2(_) => {
                 self.unembed_exact(hidden, logits)
             }
         }

@@ -90,7 +90,7 @@ pub use entropy_transport::{
 };
 pub use gguf::{
     DEFAULT_ALIGNMENT, GGML_TYPE_Q2_0, GGML_TYPE_TQ1_0, GGML_TYPE_TQ2_0, GgufError, GgufFile,
-    GgufValue, TensorInfo, read_gguf,
+    GgufValue, TensorInfo, read_gguf, read_gguf_prefix,
 };
 pub use gguf_write::{GgufStreamWriter, GgufTensorSpec, GgufWriteError, TensorOut, write_gguf};
 pub use i2s::{
@@ -101,8 +101,8 @@ pub use i2s_int8::{
     I2sInt8Weights, IMMA_K, IMMA_N, IMMA_WTILE_BYTES, convert_i2s_to_int8, convert_i2s_to_tq2_0,
 };
 pub use q2_0::{
-    Q2_0_BLOCK_BYTES, Q2_0_GROUP_SIZE, pack_q2_0_block, pack_q2_0_row, q2_0_num_blocks,
-    unpack_q2_0_block, unpack_q2_0_row,
+    PQ2_0_BLOCK_BYTES, PQ2_0_GROUP_SIZE, Q2_0_BLOCK_BYTES, Q2_0_GROUP_SIZE, pack_q2_0_block,
+    pack_q2_0_row, q2_0_num_blocks, split_pq2_0_into_q2_0, unpack_q2_0_block, unpack_q2_0_row,
 };
 pub use rows::{num_blocks, pack_tq1_0_row, pack_tq2_0_row, unpack_tq1_0_row, unpack_tq2_0_row};
 pub use runtime_evidence::{

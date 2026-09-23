@@ -548,6 +548,25 @@ fn align_up(pos: u64, align: u64) -> Result<u64, GgufError> {
 /// assert!(read_gguf(&[]).is_err());
 /// ```
 pub fn read_gguf(buf: &[u8]) -> Result<GgufFile, GgufError> {
+    parse_gguf(buf, buf.len() as u64)
+}
+
+/// Parse a GGUF container from a prefix of its bytes, bounds-checking tensors against the
+/// **file's** length rather than the prefix's.
+///
+/// A multi-gigabyte model does not need to be in memory to read its header: pass the first few
+/// megabytes and the file's total size, then read each payload directly from the file at
+/// `tensor_data_offset + offset`. Every span check [`read_gguf`] performs still happens, against
+/// `file_len`.
+///
+/// # Errors
+/// As [`read_gguf`], plus [`GgufError::Truncated`]-class errors when `prefix` ends before the
+/// header does — retry with a longer prefix.
+pub fn read_gguf_prefix(prefix: &[u8], file_len: u64) -> Result<GgufFile, GgufError> {
+    parse_gguf(prefix, file_len.max(prefix.len() as u64))
+}
+
+fn parse_gguf(buf: &[u8], file_len: u64) -> Result<GgufFile, GgufError> {
     let mut cur = Cursor::new(buf);
 
     let magic = cur.take(4)?;
@@ -605,7 +624,7 @@ pub fn read_gguf(buf: &[u8]) -> Result<GgufFile, GgufError> {
     let tensor_data_offset = align_up(header_end, alignment)?;
 
     // Total bytes available for payloads (0 if the data section was truncated away).
-    let data_section_len = (buf.len() as u64).saturating_sub(tensor_data_offset);
+    let data_section_len = file_len.saturating_sub(tensor_data_offset);
 
     // Size each tensor and bounds-check its [offset, offset+n_bytes) span.
     let mut tensors = Vec::with_capacity(raw_tensors.len());

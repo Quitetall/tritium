@@ -12,6 +12,7 @@ mod hf_json_tokenizer;
 mod hf_shards;
 mod qwen35;
 mod qwen35_execution;
+mod qwen35_gguf;
 mod qwen35_hf;
 mod qwen35_hf_source;
 mod qwen35_mtp;
@@ -40,6 +41,7 @@ pub use qwen35::{
 pub use qwen35_execution::{
     Qwen35ExecutionOutputBatch, Qwen35ExecutionVisitError, Qwen35UntrustedRuntimeTranscript,
 };
+pub use qwen35_gguf::{Qwen35GgufLanguageModel, Qwen35GgufLoadReceipt};
 pub use qwen35_hf::{
     Qwen35HfLanguageModel, Qwen35HfLanguageMtpModel, Qwen35HfLanguageMtpReceipt,
     Qwen35HfLanguageReceipt, Qwen35MtpPromotionError, Qwen35TensorSchemaEntry,

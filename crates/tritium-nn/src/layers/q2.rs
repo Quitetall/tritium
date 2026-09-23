@@ -15,6 +15,7 @@ use tritium_core::Trit;
 use tritium_format::{Q2_0_BLOCK_BYTES, Q2_0_GROUP_SIZE, q2_0_num_blocks, unpack_q2_0_block};
 
 use crate::error::NnError;
+use crate::layers::SignedBlockHadamard;
 use crate::ops::quantize_activation_int8;
 
 /// One `[n_out, k_in]` standard Q2_0 matrix retained in packed form.
@@ -26,6 +27,10 @@ pub struct Q2Linear {
     k_in: usize,
     packed: Arc<[u8]>,
     uniform_scale_override: Option<f32>,
+    /// The input basis the stored weights were folded under, if any. A folded tensor stores
+    /// `W·Bᵀ`, so [`Self::forward`] rotates its input by `B` and [`Self::gather_row`] un-rotates
+    /// the row it reads; nothing outside this type needs to know which applies where.
+    basis: Option<Arc<SignedBlockHadamard>>,
 }
 
 impl Q2Linear {
@@ -105,7 +110,71 @@ impl Q2Linear {
             k_in,
             packed: packed.into(),
             uniform_scale_override,
+            basis: None,
         })
+    }
+
+    /// Declare the input basis the stored weights were folded under.
+    ///
+    /// # Errors
+    /// [`NnError::Shape`] if the basis does not cover exactly `k_in` input features.
+    pub fn with_basis(mut self, basis: Arc<SignedBlockHadamard>) -> Result<Self, NnError> {
+        if basis.width() != self.k_in {
+            return Err(NnError::Shape {
+                expected: self.k_in,
+                got: basis.width(),
+            });
+        }
+        self.basis = Some(basis);
+        Ok(self)
+    }
+
+    /// The input basis the stored weights were folded under, if any.
+    #[must_use]
+    pub fn basis(&self) -> Option<&SignedBlockHadamard> {
+        self.basis.as_deref()
+    }
+
+    /// Read output row `row` back into the model basis, as a token embedding gathers it.
+    ///
+    /// Decodes the stored row (`scale · trit` per group) and, for a folded tensor, un-rotates it:
+    /// the stored row is `B·w`, and the residual stream needs `w`.
+    ///
+    /// # Errors
+    /// [`NnError::Shape`] if `row` is out of range or `out` is not `k_in` long.
+    pub fn gather_row(&self, row: usize, out: &mut [f32]) -> Result<(), NnError> {
+        if row >= self.n_out {
+            return Err(NnError::Shape {
+                expected: self.n_out,
+                got: row,
+            });
+        }
+        if out.len() != self.k_in {
+            return Err(NnError::Shape {
+                expected: self.k_in,
+                got: out.len(),
+            });
+        }
+        let row_bytes = q2_0_num_blocks(self.k_in) * Q2_0_BLOCK_BYTES;
+        let packed_row = &self.packed[row * row_bytes..(row + 1) * row_bytes];
+        for (block, values) in packed_row
+            .as_chunks::<Q2_0_BLOCK_BYTES>()
+            .0
+            .iter()
+            .zip(out.as_chunks_mut::<Q2_0_GROUP_SIZE>().0.iter_mut())
+        {
+            let scale = self.uniform_scale_override.unwrap_or_else(|| {
+                f32::from(f16::from_bits(u16::from_le_bytes([block[0], block[1]])))
+            });
+            for (index, value) in values.iter_mut().enumerate() {
+                let code = (block[2 + index / 4] >> (2 * (index % 4))) & 3;
+                *value = (f32::from(code) - 1.0) * scale;
+            }
+        }
+        if let Some(basis) = &self.basis {
+            basis.unrotate(out)?;
+        }
+        Ok(())
     }
 
     /// Output feature count.
@@ -150,6 +219,21 @@ impl Q2Linear {
             });
         }
 
+        // A folded tensor is fed the rotated activation, which is also what gets A8-quantized:
+        // the int8 grid has to be fitted to the values the dot product actually sees.
+        let rotated;
+        let act = match &self.basis {
+            Some(basis) => {
+                let mut copy = zeroed_scratch(act_len, "Q2_0 rotated activations")?;
+                copy.copy_from_slice(act);
+                for row in copy.chunks_exact_mut(self.k_in) {
+                    basis.rotate(row)?;
+                }
+                rotated = copy;
+                &rotated[..]
+            }
+            None => act,
+        };
         let mut q_act = zeroed_scratch(act_len, "Q2_0 quantized activations")?;
         let mut act_scales = zeroed_scratch(m, "Q2_0 activation scales")?;
         quantize_activation_int8(act, m, self.k_in, &mut q_act, &mut act_scales)?;

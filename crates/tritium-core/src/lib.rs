@@ -10,6 +10,7 @@
 //!   layout / pack code lives in `tritium-format`; this is just the shared name + bpw.
 //! - [`ScaleGranularity`] + [`absmean`] — the scaling contract (BitNet b1.58 AbsMean).
 //! - [`GemmShape`] — `(M, N, K)` problem geometry.
+//! - [`fwht_normalized`] — the normalized Sylvester–Walsh–Hadamard transform every basis uses.
 //! - [`reference_mpgemm`] — the slow, obviously-correct mixed-precision GEMM that
 //!   every backend kernel must match within tolerance.
 //!
@@ -25,6 +26,7 @@ extern crate alloc;
 
 mod dtype;
 mod error;
+mod hadamard;
 mod reference;
 mod scale;
 mod shape;
@@ -32,6 +34,7 @@ mod trit;
 
 pub use dtype::{DType, TernaryFormat};
 pub use error::TritError;
+pub use hadamard::fwht_normalized;
 pub use reference::{reference_conv1d, reference_fsq, reference_mpgemm};
 pub use scale::{ScaleGranularity, absmean};
 pub use shape::{ConvShape, GemmShape};
