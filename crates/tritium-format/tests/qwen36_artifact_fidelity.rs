@@ -60,15 +60,15 @@ fn read_fp_prefix(dir: &Path, name: &str, max_elements: usize) -> Option<Vec<f32
     file.read_exact(&mut raw).ok()?;
     Some(match dtype.as_str() {
         "BF16" => raw
-            .chunks_exact(2)
+            .chunks(2)
             .map(|b| f32::from_bits(u32::from(u16::from_le_bytes([b[0], b[1]])) << 16))
             .collect(),
         "F16" => raw
-            .chunks_exact(2)
+            .chunks(2)
             .map(|b| f32::from(half::f16::from_le_bytes([b[0], b[1]])))
             .collect(),
         _ => raw
-            .chunks_exact(4)
+            .chunks(4)
             .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
             .collect(),
     })
@@ -103,8 +103,8 @@ fn qwen36_artifact_error_against_the_fp_master() {
 
     println!("package: {package}\ncodec: {codec:?}\n");
     println!(
-        "{:<56} {:>7} {:>9} {:>7}  {}",
-        "tensor", "bpw", "rel err", "xform", "planes/tile"
+        "{:<56} {:>7} {:>9} {:>7}  planes/tile",
+        "tensor", "bpw", "rel err", "xform"
     );
     println!("{}", "-".repeat(110));
     for name in names {
