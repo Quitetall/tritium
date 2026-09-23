@@ -9,8 +9,8 @@ use tritium_format::salt_v2_package::{
     SaltV2IndexedRuntimeLedger, SaltV2Tensor, SaltV2Transform, pack_salt_v2_plane,
 };
 
-mod salt_v2_reader_upload;
 pub(super) mod deltanet;
+mod salt_v2_reader_upload;
 mod salt_v2_runtime;
 pub use salt_v2_runtime::SaltV2GatherReceipt;
 

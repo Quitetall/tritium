@@ -80,70 +80,78 @@ fn resident_tq2_0_salt_gemm_versus_the_codec_kernel() {
     };
     // N is kept modest so the probe builds quickly; both kernels scale in N, and
     // the ratio is what this measures.
-    let n: usize = std::env::var("TRITIUM_PROBE_N").ok().and_then(|v| v.parse().ok()).unwrap_or(1024);
+    let n: usize = std::env::var("TRITIUM_PROBE_N")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1024);
     let mut next = seeded();
     let blocks = num_blocks(K);
     let row_bytes = blocks * TQ2_0_BLOCK_BYTES;
 
     for planes in [1usize, 2, 3] {
-    let rows: Vec<SaltRow> = (0..n)
-        .map(|_| {
-            let planes = (0..planes)
-                .map(|plane| {
-                    let trits: Vec<Trit> = (0..K)
-                        .map(|_| Trit::from_i8(((next() >> 40) % 3) as i8 - 1).unwrap())
-                        .collect();
-                    let scales: Vec<f16> = (0..blocks)
-                        .map(|_| f16::from_f32(0.05 / (plane as f32 + 1.0)))
-                        .collect();
-                    let mut bytes = vec![0u8; row_bytes];
-                    pack_tq2_0_row(&trits, &scales, &mut bytes).unwrap();
-                    bytes
-                })
-                .collect();
-            SaltRow { k: K, planes }
-        })
-        .collect();
+        let rows: Vec<SaltRow> = (0..n)
+            .map(|_| {
+                let planes = (0..planes)
+                    .map(|plane| {
+                        let trits: Vec<Trit> = (0..K)
+                            .map(|_| Trit::from_i8(((next() >> 40) % 3) as i8 - 1).unwrap())
+                            .collect();
+                        let scales: Vec<f16> = (0..blocks)
+                            .map(|_| f16::from_f32(0.05 / (plane as f32 + 1.0)))
+                            .collect();
+                        let mut bytes = vec![0u8; row_bytes];
+                        pack_tq2_0_row(&trits, &scales, &mut bytes).unwrap();
+                        bytes
+                    })
+                    .collect();
+                SaltRow { k: K, planes }
+            })
+            .collect();
 
-    let tiles = (0..n * K / 256)
-        .map(|_| {
-            let plane_list = (0..planes)
-                .map(|_| {
-                    let trits = (0..256)
-                        .map(|_| ((next() >> 40) % 3) as i8 - 1)
-                        .collect::<Vec<i8>>();
-                    let scales = (0..256 / SCALE_GROUP)
-                        .map(|_| f16::from_f32(0.05))
-                        .collect();
-                    SaltV2Plane::new_with_scale_group_size(trits, scales, SCALE_GROUP).unwrap()
-                })
-                .collect::<Vec<_>>();
-            SaltV2Tile::new(plane_list).unwrap()
-        })
-        .collect();
-    let tensor = SaltV2Tensor::new_with_layout(
-        "probe.weight",
-        vec![n as u64, K as u64],
-        SaltV2Transform::None,
-        SCALE_GROUP,
-        tiles,
-    )
-    .unwrap();
+        let tiles = (0..n * K / 256)
+            .map(|_| {
+                let plane_list = (0..planes)
+                    .map(|_| {
+                        let trits = (0..256)
+                            .map(|_| ((next() >> 40) % 3) as i8 - 1)
+                            .collect::<Vec<i8>>();
+                        let scales = (0..256 / SCALE_GROUP)
+                            .map(|_| f16::from_f32(0.05))
+                            .collect();
+                        SaltV2Plane::new_with_scale_group_size(trits, scales, SCALE_GROUP).unwrap()
+                    })
+                    .collect::<Vec<_>>();
+                SaltV2Tile::new(plane_list).unwrap()
+            })
+            .collect();
+        let tensor = SaltV2Tensor::new_with_layout(
+            "probe.weight",
+            vec![n as u64, K as u64],
+            SaltV2Transform::None,
+            SCALE_GROUP,
+            tiles,
+        )
+        .unwrap();
 
-    let resident_v2 = cuda.upload_salt_v2(&tensor, SaltV2Codec::B3).unwrap();
-    let resident_tq2 = cuda.upload_salt(&rows, n, K).unwrap();
-    let activation: Vec<f32> = (0..K)
-        .map(|index| (index as f32 * 0.013).sin() * 0.5)
-        .collect();
+        let resident_v2 = cuda.upload_salt_v2(&tensor, SaltV2Codec::B3).unwrap();
+        let resident_tq2 = cuda.upload_salt(&rows, n, K).unwrap();
+        let activation: Vec<f32> = (0..K)
+            .map(|index| (index as f32 * 0.013).sin() * 0.5)
+            .collect();
 
-    eprintln!("N={n} K={K} planes={planes} m=1");
-    let codec = time_ms("salt_v2_forward_exact (codec, shipping)", 20, || {
-        let _ = cuda.salt_v2_forward_exact(&resident_v2, &activation, 1).unwrap();
-    });
-    let gemm = time_ms("salt_mpgemm_tiled_f32 (resident TQ2_0)", 20, || {
-        let _ = cuda.salt_forward(&resident_tq2, &activation, 1).unwrap();
-    });
-    eprintln!("  ratio: resident TQ2_0 is {:.2}x the codec kernel's cost\n", gemm / codec);
-    assert!(codec > 0.0 && gemm > 0.0);
+        eprintln!("N={n} K={K} planes={planes} m=1");
+        let codec = time_ms("salt_v2_forward_exact (codec, shipping)", 20, || {
+            let _ = cuda
+                .salt_v2_forward_exact(&resident_v2, &activation, 1)
+                .unwrap();
+        });
+        let gemm = time_ms("salt_mpgemm_tiled_f32 (resident TQ2_0)", 20, || {
+            let _ = cuda.salt_forward(&resident_tq2, &activation, 1).unwrap();
+        });
+        eprintln!(
+            "  ratio: resident TQ2_0 is {:.2}x the codec kernel's cost\n",
+            gemm / codec
+        );
+        assert!(codec > 0.0 && gemm > 0.0);
     }
 }

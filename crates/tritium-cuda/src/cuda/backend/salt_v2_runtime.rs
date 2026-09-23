@@ -42,7 +42,6 @@ pub(super) fn salt_v2_warp_dispatch(
     Some((groups_per_row, warps_per_block, slot_bytes))
 }
 
-
 #[cfg(feature = "device-loss-qualification")]
 fn qualification_fatal_driver_error(error: &DriverError) -> bool {
     matches!(
@@ -357,9 +356,7 @@ impl CudaBackend {
         // warp kernel serves; anything else answers with the exact image, and a
         // receipt that claimed otherwise would be the only record a caller has.
         let resolved = match mode {
-            SaltV2ForwardMode::FastWarpReduce
-                if !self.salt_v2_warp_eligible(tensor) =>
-            {
+            SaltV2ForwardMode::FastWarpReduce if !self.salt_v2_warp_eligible(tensor) => {
                 SaltV2ForwardMode::FastAliasesExact
             }
             other => other,

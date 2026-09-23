@@ -234,37 +234,36 @@ impl CudaBackend {
 
         let d_kk = self
             .stream
-            .memcpy_stod(kk)
+            .clone_htod(kk)
             .map_err(|error| driver_err("upload DeltaNet key projection", &error))?;
         let d_qq = self
             .stream
-            .memcpy_stod(qq)
+            .clone_htod(qq)
             .map_err(|error| driver_err("upload DeltaNet query projection", &error))?;
         let d_value = self
             .stream
-            .memcpy_stod(value)
+            .clone_htod(value)
             .map_err(|error| driver_err("upload DeltaNet value", &error))?;
         let d_beta = self
             .stream
-            .memcpy_stod(beta)
+            .clone_htod(beta)
             .map_err(|error| driver_err("upload DeltaNet beta", &error))?;
         let d_decay = self
             .stream
-            .memcpy_stod(decay)
+            .clone_htod(decay)
             .map_err(|error| driver_err("upload DeltaNet decay", &error))?;
-        let mut d_core = self
-            .stream
-            .alloc_zeros::<f32>(lane_len)
-            .map_err(|error| {
-                alloc_or_backend(
-                    "allocate DeltaNet core output",
-                    &error,
-                    lane_len * core::mem::size_of::<f32>(),
-                )
-            })?;
+        let mut d_core = self.stream.alloc_zeros::<f32>(lane_len).map_err(|error| {
+            alloc_or_backend(
+                "allocate DeltaNet core output",
+                &error,
+                lane_len * core::mem::size_of::<f32>(),
+            )
+        })?;
 
-        let shared_mem_bytes =
-            to_u32(2 * key_head_dim * core::mem::size_of::<f32>(), "DeltaNet shared bytes")?;
+        let shared_mem_bytes = to_u32(
+            2 * key_head_dim * core::mem::size_of::<f32>(),
+            "DeltaNet shared bytes",
+        )?;
         let cfg = LaunchConfig {
             grid_dim: (state.value_heads, 1, 1),
             block_dim: (state.value_head_dim, 1, 1),

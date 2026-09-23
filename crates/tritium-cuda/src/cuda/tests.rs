@@ -509,9 +509,7 @@ fn salt_v2_cuda_matches_cpu_and_dense_without_dense_weight_storage() {
                         .iter()
                         .fold(0.0f32, |peak, value| peak.max(value.abs()))
                         .max(f32::MIN_POSITIVE);
-                    for (index, (got, want)) in
-                        fast.output.iter().zip(&exact.output).enumerate()
-                    {
+                    for (index, (got, want)) in fast.output.iter().zip(&exact.output).enumerate() {
                         assert!(
                             (got - want).abs() / scale <= 1e-5,
                             "fast[{index}] {codec:?} {rows}x{columns}: {got} vs exact {want}"

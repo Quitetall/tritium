@@ -254,9 +254,9 @@ impl CudaBuffer {
 mod backend;
 // Lib code no longer references backend items directly (post-P2a/A2 churn),
 // but cuda::tests reaches them through `use super::*` via this glob.
+pub use backend::deltanet::DeltaNetResidentState;
 #[cfg_attr(not(test), allow(unused_imports))]
 use backend::*;
-pub use backend::deltanet::DeltaNetResidentState;
 pub use backend::{
     CudaBackend, SaltResidentLinear, SaltV2Forward, SaltV2ForwardMode, SaltV2ForwardReceipt,
     SaltV2GatherReceipt, SaltV2ResidentAllocationReceipt, SaltV2ResidentTensor,

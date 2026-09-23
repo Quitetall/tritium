@@ -55,8 +55,7 @@ fn warp_tensor() -> SaltV2Tensor {
                             f16::from_f32(0.0625 + step / 96.0)
                         })
                         .collect();
-                    SaltV2Plane::new_with_scale_group_size(trits, scales, SCALE_GROUP)
-                        .unwrap()
+                    SaltV2Plane::new_with_scale_group_size(trits, scales, SCALE_GROUP).unwrap()
                 })
                 .collect::<Vec<_>>();
             SaltV2Tile::new(planes).unwrap()
@@ -152,7 +151,10 @@ fn fast_forward_is_close_to_the_reference_and_says_which_kernel_ran() {
             // alias this gate would be measuring the exact kernel twice.
             let exact = cuda.salt_v2_forward_exact(&resident, &act, batch).unwrap();
             assert_eq!(exact.receipt.mode(), SaltV2ForwardMode::Exact);
-            assert_eq!(exact.output, expected, "{codec:?} batch {batch} exact drifted");
+            assert_eq!(
+                exact.output, expected,
+                "{codec:?} batch {batch} exact drifted"
+            );
         }
     }
 }
