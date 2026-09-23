@@ -88,3 +88,9 @@ harness = false
 [[bench]]
 name = "salt_codec"
 harness = false
+
+# Qwen3.6 SALT V2 greedy decode latency: `cuda` + bundle gated, reports rather
+# than gates (TRITIUM_QWEN36_BUNDLE; see the file header).
+[[bench]]
+name = "qwen36_decode"
+harness = false
