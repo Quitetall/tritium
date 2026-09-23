@@ -4577,6 +4577,7 @@ dependencies = [
  "half",
  "proptest",
  "rayon",
+ "serde_json",
  "tritium-core",
  "tritium-format",
 ]
