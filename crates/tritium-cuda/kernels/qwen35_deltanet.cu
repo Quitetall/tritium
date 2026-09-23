@@ -56,11 +56,15 @@ extern "C" __global__ void qwen35_deltanet_recurrent_step(
   // Pass 1: decay this lane's column and reduce it against the key. The host
   // decays the whole head first and then reduces; decaying each element as it is
   // read is the same value, because a lane only ever reads its own column.
+  //
+  // The decayed column is not written back here. Pass 2 recomputes the identical
+  // `__fmul_rn(state, decay)` and writes only the final value, so the state
+  // takes one write per step instead of two, and the column pass 2 rereads
+  // (a 32-lane block's is 16 KiB) is still in L1.
   float memory = 0.0f;
   for (uint32_t key_lane = 0; key_lane < key_head_dim; ++key_lane) {
     const size_t index = static_cast<size_t>(key_lane) * value_head_dim + value_lane;
     const float decayed = __fmul_rn(head_state[index], head_decay);
-    head_state[index] = decayed;
     memory = __fadd_rn(memory, __fmul_rn(projected[key_lane], decayed));
   }
 
@@ -72,8 +76,8 @@ extern "C" __global__ void qwen35_deltanet_recurrent_step(
   float mixed = 0.0f;
   for (uint32_t key_lane = 0; key_lane < key_head_dim; ++key_lane) {
     const size_t index = static_cast<size_t>(key_lane) * value_head_dim + value_lane;
-    const float updated =
-        __fadd_rn(head_state[index], __fmul_rn(projected[key_lane], delta));
+    const float decayed = __fmul_rn(head_state[index], head_decay);
+    const float updated = __fadd_rn(decayed, __fmul_rn(projected[key_lane], delta));
     head_state[index] = updated;
     mixed = __fadd_rn(mixed, __fmul_rn(projected[key_head_dim + key_lane], updated));
   }
