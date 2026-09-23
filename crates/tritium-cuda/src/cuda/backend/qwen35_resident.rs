@@ -20,6 +20,9 @@
 
 use std::sync::Arc;
 
+use super::salt_v2_repack::{
+    D0X_DESCRIPTOR_WORDS, D0X_ROWS, SaltV2D0x, d0x_descriptor, launch_salt_v2_d0x_on,
+};
 use super::salt_v2_runtime::{
     SALT_STREAM_DESCRIPTOR_WORDS, launch_salt_v2_quant_act_on, launch_salt_v2_stream_i8_multi_on,
     launch_salt_v2_stream_i8_on, launch_salt_v2_stream_multi_on, launch_salt_v2_stream_on,
@@ -166,11 +169,26 @@ struct FusedGroup {
     total_rows: u32,
 }
 
+/// Projections of one input in the D0X layout (dense plane 0 + extra planes),
+/// launched as one GEMV. Owns its repacked tensors.
+struct D0xGroup {
+    descriptors: CudaSlice<u64>,
+    _repacks: Vec<SaltV2D0x>,
+    tensor_count: u32,
+    total_rows: u32,
+    k: u32,
+}
+
 struct Layer {
     /// The mixer's input projections fused (DeltaNet qkv|z|b|a, attention q|k|v).
     fused_in: Option<FusedGroup>,
     /// The MLP's gate|up fused.
     fused_mlp: Option<FusedGroup>,
+    /// D0X twins: mixer input, MLP gate|up, mixer output, MLP down.
+    d0x_in: Option<D0xGroup>,
+    d0x_mlp: Option<D0xGroup>,
+    d0x_out: Option<D0xGroup>,
+    d0x_down: Option<D0xGroup>,
     input_norm: CudaSlice<f32>,
     post_attention_norm: CudaSlice<f32>,
     mixer: Mixer,
@@ -182,6 +200,7 @@ struct Layer {
 struct Kernels {
     stream_gemv: CudaFunction,
     stream_gemv_multi: CudaFunction,
+    d0x: CudaFunction,
     quant_act: CudaFunction,
     stream_i8: CudaFunction,
     stream_i8_multi: CudaFunction,
@@ -243,6 +262,10 @@ const ARGMAX_THREADS: u32 = 1024;
 /// Built by [`CudaBackend::build_qwen35_resident`]. Holds its own KV cache and
 /// recurrent state; [`Self::reset`] starts a new sequence.
 pub struct Qwen35Resident {
+    /// Environment toggles, read once per step: an environment read takes a lock
+    /// and allocates, and the step's ~600 launches leave the host little slack.
+    fused_on: bool,
+    d0x_on: bool,
     /// Per-warp shared table bytes for fused launches over `hidden` columns.
     fused_table_bytes: u32,
     stream: Arc<CudaStream>,
@@ -251,6 +274,7 @@ pub struct Qwen35Resident {
     layers: Vec<Layer>,
     final_norm: CudaSlice<f32>,
     lm_head: Arc<SaltV2ResidentTensor>,
+    d0x_lm_head: Option<D0xGroup>,
     inv_freq: CudaSlice<f32>,
     scratch: Scratch,
     hidden: usize,
@@ -462,6 +486,10 @@ impl CudaBackend {
             layers.push(Layer {
                 fused_in: None,
                 fused_mlp: None,
+                d0x_in: None,
+                d0x_mlp: None,
+                d0x_out: None,
+                d0x_down: None,
                 input_norm: upload(layer.input_norm, hidden, "input norm")?,
                 post_attention_norm: upload(layer.post_attention_norm, hidden, "post norm")?,
                 mixer,
@@ -491,6 +519,7 @@ impl CudaBackend {
         let kernels = Kernels {
             stream_gemv: self.func_salt_v2_stream.clone(),
             stream_gemv_multi: self.func_salt_v2_stream_multi.clone(),
+            d0x: self.func_salt_v2_d0x.clone(),
             quant_act: self.func_salt_v2_quant_act.clone(),
             stream_i8: self.func_salt_v2_stream_i8.clone(),
             stream_i8_multi: self.func_salt_v2_stream_i8_multi.clone(),
@@ -590,6 +619,72 @@ impl CudaBackend {
                 total_rows: first_row,
             })
         };
+        // D0X twins: each member repacked once, descriptors baking in the same
+        // scratch outputs. A group any member of which the repack refuses (rows
+        // not a multiple of the warp's rows) stays on the row-stream kernels.
+        // The D0X twins double the projections' device memory and measure at
+        // parity with the row-stream kernels for one token per step (2026-09-23),
+        // so they are built only on request.
+        let build_d0x = std::env::var("TRITIUM_QWEN35_D0X_BUILD").as_deref() == Ok("1");
+        let d0x = |members: &[(&SaltV2ResidentTensor, &CudaSlice<f32>)]| {
+            if !build_d0x
+                || members
+                    .iter()
+                    .any(|(tensor, _)| !tensor.rows.is_multiple_of(D0X_ROWS))
+            {
+                return Ok::<_, BackendError>(None);
+            }
+            let mut words = Vec::with_capacity(members.len() * D0X_DESCRIPTOR_WORDS);
+            let mut repacks = Vec::with_capacity(members.len());
+            let mut first_row = 0u32;
+            for (tensor, output) in members {
+                let repacked = self.repack_salt_v2_d0x(tensor)?;
+                let address = crate::cuda::graph_raw::dptr(*output, &self.stream);
+                words.extend(d0x_descriptor(&repacked, &self.stream, address, first_row)?);
+                first_row = first_row
+                    .checked_add(to_u32(tensor.rows, "D0X rows")?)
+                    .ok_or_else(|| invalid("D0X row count overflows u32"))?;
+                repacks.push(repacked);
+            }
+            let descriptors = self
+                .stream
+                .clone_htod(&words)
+                .map_err(|error| driver_err("upload D0X descriptors", &error))?;
+            Ok(Some(D0xGroup {
+                descriptors,
+                _repacks: repacks,
+                tensor_count: to_u32(members.len(), "D0X tensor count")?,
+                total_rows: first_row,
+                k: to_u32(members[0].0.columns, "D0X columns")?,
+            }))
+        };
+        for layer in &mut layers {
+            layer.d0x_mlp = d0x(&[
+                (&layer.gate, &scratch.mlp_gate),
+                (&layer.up, &scratch.mlp_up),
+            ])?;
+            layer.d0x_down = d0x(&[(&layer.down, &scratch.branch)])?;
+            match &layer.mixer {
+                Mixer::DeltaNet(mixer) => {
+                    layer.d0x_in = d0x(&[
+                        (&mixer.qkv, &scratch.qkv),
+                        (&mixer.z, &scratch.z),
+                        (&mixer.b, &scratch.b),
+                        (&mixer.a, &scratch.a),
+                    ])?;
+                    layer.d0x_out = d0x(&[(&mixer.out, &scratch.branch)])?;
+                }
+                Mixer::Attention(mixer) => {
+                    layer.d0x_in = d0x(&[
+                        (&mixer.q, &scratch.fused_query),
+                        (&mixer.k, &scratch.key),
+                        (&mixer.v, &scratch.value),
+                    ])?;
+                    layer.d0x_out = d0x(&[(&mixer.o, &scratch.branch)])?;
+                }
+            }
+        }
+        let d0x_lm_head = d0x(&[(&spec.lm_head, &scratch.logits)])?;
         for layer in &mut layers {
             layer.fused_mlp = Some(fuse(&[
                 (&layer.gate, &scratch.mlp_gate),
@@ -613,6 +708,8 @@ impl CudaBackend {
             .ok_or_else(|| invalid("hidden width is not one the row-stream GEMV serves"))?;
 
         Ok(Qwen35Resident {
+            fused_on: true,
+            d0x_on: true,
             fused_table_bytes,
             stream: Arc::clone(&self.stream),
             kernels,
@@ -620,6 +717,7 @@ impl CudaBackend {
             layers,
             final_norm: upload(spec.final_norm, hidden, "final norm")?,
             lm_head: Arc::clone(&spec.lm_head),
+            d0x_lm_head,
             inv_freq: self
                 .stream
                 .clone_htod(&inv_freq)
@@ -668,6 +766,13 @@ fn fused_enabled() -> bool {
     std::env::var("TRITIUM_QWEN35_FUSED").as_deref() != Ok("0")
 }
 
+/// Whether f32 projections take the D0X kernel when the executor was built with
+/// D0X twins (`TRITIUM_QWEN35_D0X_BUILD=1`); `TRITIUM_QWEN35_D0X=0` uses the
+/// row-stream kernels instead, for A/B.
+fn d0x_enabled() -> bool {
+    std::env::var("TRITIUM_QWEN35_D0X").as_deref() != Ok("0")
+}
+
 /// Which projections take int8 activations (the relaxed A8 tier).
 ///
 /// Opt-in, because it changes numerics and is gated on output quality:
@@ -699,12 +804,24 @@ fn project(
     kernels: &Kernels,
     stream: &CudaStream,
     a8: bool,
+    d0x: Option<&D0xGroup>,
     tensor: &SaltV2ResidentTensor,
     input: &CudaSlice<f32>,
     output: &mut CudaSlice<f32>,
     quantized: &mut CudaSlice<i8>,
     scale: &mut CudaSlice<f32>,
 ) -> Result<(), BackendError> {
+    if let Some(group) = d0x.filter(|_| !a8) {
+        return launch_salt_v2_d0x_on(
+            stream,
+            &kernels.d0x,
+            &group.descriptors,
+            group.tensor_count,
+            group.total_rows,
+            group.k,
+            input,
+        );
+    }
     if a8 {
         let groups = to_u32(tensor.columns / 128, "activation groups")?;
         launch_salt_v2_quant_act_on(stream, &kernels.quant_act, input, quantized, scale, groups)?;
@@ -720,6 +837,7 @@ fn project_fused(
     kernels: &Kernels,
     stream: &CudaStream,
     a8: bool,
+    d0x: Option<&D0xGroup>,
     group: &FusedGroup,
     k: u32,
     table_bytes: u32,
@@ -727,6 +845,17 @@ fn project_fused(
     quantized: &mut CudaSlice<i8>,
     scale: &mut CudaSlice<f32>,
 ) -> Result<(), BackendError> {
+    if let Some(group) = d0x.filter(|_| !a8) {
+        return launch_salt_v2_d0x_on(
+            stream,
+            &kernels.d0x,
+            &group.descriptors,
+            group.tensor_count,
+            group.total_rows,
+            group.k,
+            input,
+        );
+    }
     if a8 {
         launch_salt_v2_quant_act_on(stream, &kernels.quant_act, input, quantized, scale, k / 128)?;
         launch_salt_v2_stream_i8_multi_on(
@@ -905,6 +1034,8 @@ impl Qwen35Resident {
 
         self.gather()?;
         let scope = a8_scope();
+        self.fused_on = fused_enabled();
+        self.d0x_on = d0x_enabled();
         let a8 = scope == A8Scope::All;
         let a8_mlp = scope != A8Scope::Off;
         let n = to_i32(self.hidden, "hidden")?;
@@ -955,6 +1086,7 @@ impl Qwen35Resident {
             &self.kernels,
             &self.stream,
             a8,
+            self.d0x_lm_head.as_ref().filter(|_| self.d0x_on),
             &self.lm_head,
             &self.scratch.normalized,
             &mut self.scratch.logits,
@@ -1028,10 +1160,15 @@ impl Qwen35Resident {
         let fused_table_bytes = self.fused_table_bytes;
         let (stream, kernels, scratch) = (&self.stream, &self.kernels, &mut self.scratch);
         let entry = &mut self.layers[index];
-        let fused = if fused_enabled() {
+        let fused = if self.fused_on {
             entry.fused_in.as_ref()
         } else {
             None
+        };
+        let (d0x_in, d0x_out) = if self.d0x_on {
+            (entry.d0x_in.as_ref(), entry.d0x_out.as_ref())
+        } else {
+            (None, None)
         };
         let Mixer::DeltaNet(layer) = &mut entry.mixer else {
             return Err(invalid("resident Qwen layer is not a DeltaNet layer"));
@@ -1041,6 +1178,7 @@ impl Qwen35Resident {
                 kernels,
                 stream,
                 a8,
+                d0x_in,
                 group,
                 hidden_u32,
                 fused_table_bytes,
@@ -1053,6 +1191,7 @@ impl Qwen35Resident {
                     kernels,
                     stream,
                     a8,
+                    None,
                     &layer.qkv,
                     &scratch.normalized,
                     &mut scratch.qkv,
@@ -1063,6 +1202,7 @@ impl Qwen35Resident {
                     kernels,
                     stream,
                     a8,
+                    None,
                     &layer.z,
                     &scratch.normalized,
                     &mut scratch.z,
@@ -1073,6 +1213,7 @@ impl Qwen35Resident {
                     kernels,
                     stream,
                     a8,
+                    None,
                     &layer.b,
                     &scratch.normalized,
                     &mut scratch.b,
@@ -1083,6 +1224,7 @@ impl Qwen35Resident {
                     kernels,
                     stream,
                     a8,
+                    None,
                     &layer.a,
                     &scratch.normalized,
                     &mut scratch.a,
@@ -1189,6 +1331,7 @@ impl Qwen35Resident {
             kernels,
             stream,
             a8,
+            d0x_out,
             &layer.out,
             &scratch.gated,
             &mut scratch.branch,
@@ -1222,10 +1365,15 @@ impl Qwen35Resident {
             &self.inv_freq,
         );
         let entry = &mut self.layers[index];
-        let fused = if fused_enabled() {
+        let fused = if self.fused_on {
             entry.fused_in.as_ref()
         } else {
             None
+        };
+        let (d0x_in, d0x_out) = if self.d0x_on {
+            (entry.d0x_in.as_ref(), entry.d0x_out.as_ref())
+        } else {
+            (None, None)
         };
         let Mixer::Attention(layer) = &mut entry.mixer else {
             return Err(invalid("resident Qwen layer is not an attention layer"));
@@ -1235,6 +1383,7 @@ impl Qwen35Resident {
                 kernels,
                 stream,
                 a8,
+                d0x_in,
                 group,
                 hidden_u32,
                 fused_table_bytes,
@@ -1247,6 +1396,7 @@ impl Qwen35Resident {
                     kernels,
                     stream,
                     a8,
+                    None,
                     &layer.q,
                     &scratch.normalized,
                     &mut scratch.fused_query,
@@ -1257,6 +1407,7 @@ impl Qwen35Resident {
                     kernels,
                     stream,
                     a8,
+                    None,
                     &layer.k,
                     &scratch.normalized,
                     &mut scratch.key,
@@ -1267,6 +1418,7 @@ impl Qwen35Resident {
                     kernels,
                     stream,
                     a8,
+                    None,
                     &layer.v,
                     &scratch.normalized,
                     &mut scratch.value,
@@ -1344,6 +1496,7 @@ impl Qwen35Resident {
             kernels,
             stream,
             a8,
+            d0x_out,
             &layer.o,
             &scratch.attended,
             &mut scratch.branch,
@@ -1355,9 +1508,10 @@ impl Qwen35Resident {
     fn mlp(&mut self, index: usize, a8: bool) -> Result<(), BackendError> {
         let hidden_u32 = to_u32(self.hidden, "hidden")?;
         let fused_table_bytes = self.fused_table_bytes;
+        let d0x_on = self.d0x_on;
         let (stream, kernels, scratch) = (&self.stream, &self.kernels, &mut self.scratch);
         let layer = &self.layers[index];
-        let fused = if fused_enabled() {
+        let fused = if self.fused_on {
             layer.fused_mlp.as_ref()
         } else {
             None
@@ -1367,6 +1521,7 @@ impl Qwen35Resident {
                 kernels,
                 stream,
                 a8,
+                layer.d0x_mlp.as_ref().filter(|_| d0x_on),
                 group,
                 hidden_u32,
                 fused_table_bytes,
@@ -1379,6 +1534,7 @@ impl Qwen35Resident {
                     kernels,
                     stream,
                     a8,
+                    None,
                     &layer.gate,
                     &scratch.normalized,
                     &mut scratch.mlp_gate,
@@ -1389,6 +1545,7 @@ impl Qwen35Resident {
                     kernels,
                     stream,
                     a8,
+                    None,
                     &layer.up,
                     &scratch.normalized,
                     &mut scratch.mlp_up,
@@ -1410,6 +1567,7 @@ impl Qwen35Resident {
             kernels,
             stream,
             a8,
+            layer.d0x_down.as_ref().filter(|_| d0x_on),
             &layer.down,
             &scratch.mlp_act,
             &mut scratch.branch,

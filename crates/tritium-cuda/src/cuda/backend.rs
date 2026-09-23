@@ -12,6 +12,7 @@ use tritium_format::salt_v2_package::{
 pub(super) mod deltanet;
 pub(super) mod qwen35_resident;
 mod salt_v2_reader_upload;
+pub(super) mod salt_v2_repack;
 mod salt_v2_runtime;
 pub use salt_v2_runtime::SaltV2GatherReceipt;
 
@@ -578,6 +579,10 @@ pub struct CudaBackend {
     pub(super) func_salt_v2_stream: CudaFunction,
     /// Fused multi-tensor row-stream GEMV (`KERNEL_NAME_SALT_V2_STREAM_MULTI`).
     pub(super) func_salt_v2_stream_multi: CudaFunction,
+    /// D0X repack pass 1 / pass 2 and GEMV (`KERNEL_NAME_SALT_V2_D0X*`).
+    pub(super) func_salt_v2_repack_count: CudaFunction,
+    pub(super) func_salt_v2_repack_write: CudaFunction,
+    pub(super) func_salt_v2_d0x: CudaFunction,
     /// Per-128-group int8 activation quantizer (`KERNEL_NAME_SALT_V2_QUANT_ACT`).
     pub(super) func_salt_v2_quant_act: CudaFunction,
     /// A8 row-stream GEMV (`KERNEL_NAME_SALT_V2_STREAM_I8`).
@@ -1188,6 +1193,14 @@ impl CudaBackend {
         let func_salt_v2_stream_multi = salt_v2_module
             .load_function(KERNEL_NAME_SALT_V2_STREAM_MULTI)
             .map_err(|error| driver_err("load SALT V2 fused row-stream kernel", &error))?;
+        let load = |name: &str| {
+            salt_v2_module
+                .load_function(name)
+                .map_err(|error| driver_err("load SALT V2 D0X kernel", &error))
+        };
+        let func_salt_v2_repack_count = load(KERNEL_NAME_SALT_V2_D0X_COUNT)?;
+        let func_salt_v2_repack_write = load(KERNEL_NAME_SALT_V2_D0X_WRITE)?;
+        let func_salt_v2_d0x = load(KERNEL_NAME_SALT_V2_D0X)?;
         let func_salt_v2_quant_act = salt_v2_module
             .load_function(KERNEL_NAME_SALT_V2_QUANT_ACT)
             .map_err(|error| driver_err("load SALT V2 activation quantizer", &error))?;
@@ -1251,6 +1264,9 @@ impl CudaBackend {
             func_salt_v2_warp_fast,
             func_salt_v2_stream,
             func_salt_v2_stream_multi,
+            func_salt_v2_repack_count,
+            func_salt_v2_repack_write,
+            func_salt_v2_d0x,
             func_salt_v2_quant_act,
             func_salt_v2_stream_i8,
             func_salt_v2_stream_i8_multi,

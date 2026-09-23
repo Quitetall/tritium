@@ -422,6 +422,10 @@ pub(super) const KERNEL_NAME_SALT_V2_WARP_FAST: &str = "salt_v2_forward_warp_fas
 pub(super) const KERNEL_NAME_SALT_V2_STREAM: &str = "salt_v2_stream_f32";
 /// Several row-stream projections of one input in one launch.
 pub(super) const KERNEL_NAME_SALT_V2_STREAM_MULTI: &str = "salt_v2_stream_f32_multi";
+/// D0X repack (count, write) and GEMV.
+pub(super) const KERNEL_NAME_SALT_V2_D0X_COUNT: &str = "salt_v2_repack_count";
+pub(super) const KERNEL_NAME_SALT_V2_D0X_WRITE: &str = "salt_v2_repack_write";
+pub(super) const KERNEL_NAME_SALT_V2_D0X: &str = "salt_v2_d0x_f32";
 /// Per-128-group int8 activation quantizer for the A8 row-stream GEMV.
 pub(super) const KERNEL_NAME_SALT_V2_QUANT_ACT: &str = "salt_v2_quant_act_g128";
 /// A8 (int8 activation, dp4a) row-stream GEMV.

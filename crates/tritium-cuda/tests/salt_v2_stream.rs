@@ -224,3 +224,54 @@ fn a8_kernel_matches_a_reference_on_its_own_quantized_inputs() {
         }
     }
 }
+
+/// The D0X repack (dense plane 0 + per-row extra planes) and its GEMV against the
+/// CPU reference. The repack moves bytes without changing them, so any error left
+/// is the GEMV's reassociated K-sum: bounded like the row-stream kernel's.
+#[test]
+fn d0x_repack_and_kernel_match_the_reference() {
+    let Ok(cuda) = CudaBackend::new(0) else {
+        eprintln!("skipping SALT V2 D0X parity: no CUDA device");
+        return;
+    };
+    for (label, tensor) in [
+        ("ragged", tensor(8, 1024, |tile| tile % 3 + 1)),
+        ("single", tensor(4, 512, |_| 1)),
+        ("three", tensor(4, 512, |_| 3)),
+        ("crossing", tensor(120, 768, |tile| (tile * 7) % 3 + 1)),
+        // 80% of tiles carry a second plane, 40% a third: two planes dense (the
+        // one-plane tiles zero-padded), the third in the extra list.
+        (
+            "two-dense",
+            tensor(8, 1280, |tile| match tile % 5 {
+                0 => 1,
+                1 | 3 => 2,
+                _ => 3,
+            }),
+        ),
+        // 90% three-plane: all three dense, the rest padded.
+        (
+            "three-padded",
+            tensor(8, 2560, |tile| if tile % 10 == 0 { 2 } else { 3 }),
+        ),
+    ] {
+        let rows = tensor.dims()[0] as usize;
+        let columns = tensor.dims()[1] as usize;
+        let package = SaltV2Package::new(SaltV2Codec::B3, vec![tensor.clone()]).unwrap();
+        let resident = cuda.upload_salt_v2(&tensor, SaltV2Codec::B3).unwrap();
+        let act = activation(1, columns);
+        let expected = salt_v2_matvec(&package, 0, &act).unwrap().output;
+        let got = cuda.salt_v2_forward_d0x_probe(&resident, &act).unwrap();
+        assert_eq!(got.len(), rows, "{label}: output length");
+        let peak = expected
+            .iter()
+            .fold(0.0f32, |peak, value| peak.max(value.abs()))
+            .max(f32::MIN_POSITIVE);
+        for (row, (&g, &w)) in got.iter().zip(&expected).enumerate() {
+            assert!(
+                (g - w).abs() / peak <= 1e-5,
+                "{label} row {row}: {g} vs {w}"
+            );
+        }
+    }
+}

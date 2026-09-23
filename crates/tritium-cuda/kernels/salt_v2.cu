@@ -1131,6 +1131,364 @@ extern "C" __global__ void salt_v2_stream_f32_multi(
 }
 
 // ---------------------------------------------------------------------------
+// Load-time repack: dense plane 0 + per-row extra planes (the "D0X" layout).
+//
+// The row-stream kernels are co-limited by L1 wavefronts (~76%, 20 of every ~33
+// per 32 words are activation loads) and issue (~71%). Reusing a lane's 20
+// activations across several rows cuts the activation share, but on the ragged
+// B3 layout it diverged (plane p >= 1 runs whenever any lane's tile has it) and
+// needed per-row rank and tile-table setup. Every tile has at least one plane,
+// so plane 0 is dense: repacked row-major as 13 words per (row, tile), it has no
+// raggedness, no setup and fully coalesced rows. The remaining planes -- 1.5% of
+// down_proj's plane-tiles, ~20% of gate|up's -- go in a per-row list.
+//
+//   dense_payload  u32  [rows][tiles][13]   first plane of each tile
+//   dense_scales   u32  [rows][tiles]       its half2 scale pair
+//   row_ptr        u32  [rows + 1]          extra-plane prefix per row
+//   extra_tile     u8   [extras]            tile of each extra plane, ascending per row
+//   extra_payload  u32  [extras][13]
+//   extra_scales   u32  [extras]
+//
+// The bytes are the B3 bytes unchanged, so the repacked tensor holds the same
+// values; only their order (and so the K-sum association) differs.
+// ---------------------------------------------------------------------------
+
+// Pass 1: per row, how many tiles carry at least two and exactly three planes.
+// Summed on the host they give each plane's coverage, which picks how many planes
+// go dense. Malformed rows are counted in `bad` (the host refuses the tensor).
+extern "C" __global__ void salt_v2_repack_count(const unsigned char* __restrict__ index_metadata,
+                                                uint32_t* __restrict__ two_or_more,
+                                                uint32_t* __restrict__ three,
+                                                uint32_t* __restrict__ bad,
+                                                uint32_t rows,
+                                                uint32_t k,
+                                                uint32_t tile_count,
+                                                uint32_t allocation_map_bytes,
+                                                uint32_t terminal_map_value) {
+  const uint32_t lane = threadIdx.x & 31U;
+  const uint32_t row = blockIdx.x * (blockDim.x >> 5U) + (threadIdx.x >> 5U);
+  if (row >= rows) return;
+  const uint32_t tiles = k / kAllocationTile;
+  const uint32_t first_tile = row * tiles;
+  uint32_t two = 0U;
+  uint32_t full = 0U;
+  uint32_t malformed = first_tile + tiles > tile_count ? 1U : 0U;
+  for (uint32_t tile = lane; tile < tiles && malformed == 0U; tile += 32U) {
+    const uint32_t planes = plane_count_for_tile(index_metadata, allocation_map_bytes,
+                                                 terminal_map_value, first_tile + tile);
+    if (planes == 0U || planes > 3U) malformed = 1U;
+    two += planes >= 2U ? 1U : 0U;
+    full += planes == 3U ? 1U : 0U;
+  }
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    two += __shfl_xor_sync(0xFFFFFFFFU, two, offset);
+    full += __shfl_xor_sync(0xFFFFFFFFU, full, offset);
+    malformed |= __shfl_xor_sync(0xFFFFFFFFU, malformed, offset);
+  }
+  if (lane == 0U) {
+    two_or_more[row] = two;
+    three[row] = full;
+    if (malformed != 0U) atomicAdd(bad, 1U);
+  }
+}
+
+// Pass 2: scatter every plane-tile of a row. Plane j of tile t goes dense when
+// j < dense_planes, else to the row's extra list. Dense slots a tile does not
+// fill stay zero -- zero scale, so they contribute exactly nothing. A lane owns a
+// tile: a one-time copy, so simplicity over coalescing.
+extern "C" __global__ void salt_v2_repack_write(const unsigned char* __restrict__ payload,
+                                                const __half* __restrict__ scales,
+                                                const unsigned char* __restrict__ index_metadata,
+                                                const uint32_t* __restrict__ row_ptr,
+                                                uint32_t* __restrict__ dense_payload,
+                                                uint32_t* __restrict__ dense_scales,
+                                                unsigned char* __restrict__ extra_tile,
+                                                uint32_t* __restrict__ extra_payload,
+                                                uint32_t* __restrict__ extra_scales,
+                                                uint32_t rows,
+                                                uint32_t k,
+                                                uint32_t allocation_map_bytes,
+                                                uint32_t rank_prefix_count,
+                                                uint32_t terminal_map_value,
+                                                uint32_t dense_planes) {
+  const uint32_t lane = threadIdx.x & 31U;
+  const uint32_t row = blockIdx.x * (blockDim.x >> 5U) + (threadIdx.x >> 5U);
+  if (row >= rows) return;
+  const uint32_t tiles = k / kAllocationTile;
+  const uint32_t positions = tiles * 13U;
+  const uint32_t first_tile = row * tiles;
+  // Row's starting rank, as `stream_row_setup` derives it.
+  const uint32_t rank_block = first_tile / kRankStrideTiles;
+  uint32_t row_rank = 0U;
+  if (rank_block != 0U && rank_block - 1U < rank_prefix_count) {
+    row_rank = read_rank_prefix(index_metadata, allocation_map_bytes, rank_block - 1U);
+  }
+  uint32_t before = 0U;
+  for (uint32_t tile = rank_block * kRankStrideTiles + lane; tile < first_tile; tile += 32U) {
+    before += plane_count_for_tile(index_metadata, allocation_map_bytes, terminal_map_value, tile);
+  }
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    before += __shfl_xor_sync(0xFFFFFFFFU, before, offset);
+  }
+  row_rank += before;
+
+  const uint32_t* words = reinterpret_cast<const uint32_t*>(payload);
+  const uint32_t* scale_pairs = reinterpret_cast<const uint32_t*>(scales);
+  uint32_t plane_carry = 0U;
+  uint32_t extra_carry = row_ptr[row];
+  for (uint32_t chunk = 0; chunk < tiles; chunk += 32U) {
+    const uint32_t tile = chunk + lane;
+    const uint32_t planes =
+        tile < tiles ? plane_count_for_tile(index_metadata, allocation_map_bytes,
+                                            terminal_map_value, first_tile + tile)
+                     : 0U;
+    const uint32_t extras = planes > dense_planes ? planes - dense_planes : 0U;
+    uint32_t plane_scan = planes;
+    uint32_t extra_scan = extras;
+#pragma unroll
+    for (int offset = 1; offset < 32; offset <<= 1) {
+      const uint32_t up_planes = __shfl_up_sync(0xFFFFFFFFU, plane_scan, offset);
+      const uint32_t up_extras = __shfl_up_sync(0xFFFFFFFFU, extra_scan, offset);
+      if (lane >= static_cast<uint32_t>(offset)) {
+        plane_scan += up_planes;
+        extra_scan += up_extras;
+      }
+    }
+    const uint32_t first_plane = row_rank + plane_carry + plane_scan - planes;
+    const uint32_t first_extra = extra_carry + extra_scan - extras;
+    for (uint32_t plane = 0; plane < planes; ++plane) {
+      const size_t source = first_plane + plane;
+      if (plane < dense_planes) {
+        const size_t slot = (static_cast<size_t>(plane) * rows + row) * tiles + tile;
+        for (uint32_t word = 0; word < 13U; ++word) {
+          dense_payload[(static_cast<size_t>(plane) * rows + row) * positions + tile * 13U + word] =
+              words[source * 13U + word];
+        }
+        dense_scales[slot] = scale_pairs[source];
+      } else {
+        const size_t slot = first_extra + plane - dense_planes;
+        for (uint32_t word = 0; word < 13U; ++word) {
+          extra_payload[slot * 13U + word] = words[source * 13U + word];
+        }
+        extra_scales[slot] = scale_pairs[source];
+        extra_tile[slot] = static_cast<unsigned char>(tile);
+      }
+    }
+    plane_carry += __shfl_sync(0xFFFFFFFFU, plane_scan, 31);
+    extra_carry += __shfl_sync(0xFFFFFFFFU, extra_scan, 31);
+  }
+}
+
+// One tensor of a fused D0X launch. Mirrored by `d0x_descriptor` in
+// `salt_v2_repack.rs`.
+struct D0xTensor {
+  unsigned long long dense_payload;
+  unsigned long long dense_scales;
+  unsigned long long row_ptr;
+  unsigned long long extra_tile;
+  unsigned long long extra_payload;
+  unsigned long long extra_scales;
+  unsigned long long output;
+  uint32_t rows;
+  uint32_t first_row;
+  uint32_t dense_planes;
+  uint32_t reserved;
+};
+
+// Rows per block, and warps per block, of the D0X GEMV.
+constexpr uint32_t kD0xRows = 4U;
+constexpr uint32_t kD0xWarps = 8U;
+
+// One B3 word against 20 activations, as a scaled contribution.
+__device__ __forceinline__ float d0x_word(const unsigned short* __restrict__ b3_digits,
+                                          uint32_t bits,
+                                          const float (&a)[20],
+                                          uint32_t word,
+                                          uint32_t scale_bits,
+                                          float accumulator) {
+  const uint32_t p0 = b3_digits[bits & 0xFFU];
+  const uint32_t p1 = b3_digits[(bits >> 8U) & 0xFFU];
+  const uint32_t p2 = b3_digits[(bits >> 16U) & 0xFFU];
+  const uint32_t p3 = b3_digits[bits >> 24U];
+  float low = 0.0f;
+  float high = 0.0f;
+#pragma unroll
+  for (uint32_t digit = 0; digit < 5U; ++digit) low = fmaf(b3_trit(p0, digit), a[digit], low);
+#pragma unroll
+  for (uint32_t digit = 0; digit < 3U; ++digit) {
+    low = fmaf(b3_trit(p1, digit), a[5U + digit], low);
+  }
+#pragma unroll
+  for (uint32_t digit = 3; digit < 5U; ++digit) {
+    high = fmaf(b3_trit(p1, digit), a[5U + digit], high);
+  }
+#pragma unroll
+  for (uint32_t digit = 0; digit < 5U; ++digit) {
+    high = fmaf(b3_trit(p2, digit), a[10U + digit], high);
+  }
+#pragma unroll
+  for (uint32_t digit = 0; digit < 5U; ++digit) {
+    high = fmaf(b3_trit(p3, digit), a[15U + digit], high);
+  }
+  __half2 pair;
+  *reinterpret_cast<uint32_t*>(&pair) = scale_bits;
+  const float2 scale = __half22float2(pair);
+  const float low_scale = word <= 6U ? scale.x : scale.y;
+  const float high_scale = word <= 5U ? scale.x : scale.y;
+  accumulator = fmaf(low_scale, low, accumulator);
+  return fmaf(high_scale, high, accumulator);
+}
+
+__device__ __forceinline__ void d0x_activations(const float* __restrict__ activation,
+                                                uint32_t tile,
+                                                uint32_t word,
+                                                float (&a)[20]) {
+  const float4* chunk = reinterpret_cast<const float4*>(
+      activation + static_cast<size_t>(tile) * kAllocationTile + word * 20U);
+  const float4 a0 = __ldg(chunk);
+  const float4 a1 = __ldg(chunk + 1);
+  const float4 a2 = __ldg(chunk + 2);
+  const float4 a3 = __ldg(chunk + 3);
+  // Word 12's last four trits are padding: never read past the tile.
+  const float4 a4 = word == 12U ? make_float4(0.0f, 0.0f, 0.0f, 0.0f) : __ldg(chunk + 4);
+  a[0] = a0.x; a[1] = a0.y; a[2] = a0.z; a[3] = a0.w;
+  a[4] = a1.x; a[5] = a1.y; a[6] = a1.z; a[7] = a1.w;
+  a[8] = a2.x; a[9] = a2.y; a[10] = a2.z; a[11] = a2.w;
+  a[12] = a3.x; a[13] = a3.y; a[14] = a3.z; a[15] = a3.w;
+  a[16] = a4.x; a[17] = a4.y; a[18] = a4.z; a[19] = a4.w;
+}
+
+// Fused D0X GEMV (m = 1). A row group of `kD0xRows` consecutive rows of one
+// tensor (the host requires each member's rows to be a multiple of it) is owned by
+// `group_warps` warps (1, 2, 4 or 8) that split K between them; a block holds
+// `kD0xWarps / group_warps` groups. One warp per group suits short K (no barrier
+// work per group); several suit long K, where one warp per group would leave too
+// few warps (5120-row down_proj: 1280). Dense pass: a thread owns (tile, word)
+// positions, loads their 20 activations once and applies them to every dense
+// plane of every row -- coalesced, divergence-free. Extra pass: the rows'
+// remaining planes as one flattened word stream. Fast tier: relative error.
+extern "C" __global__ void __launch_bounds__(kD0xWarps * 32U)
+    salt_v2_d0x_f32(const float* __restrict__ activation,
+                    const D0xTensor* __restrict__ tensors,
+                    uint32_t tensor_count,
+                    uint32_t total_rows,
+                    uint32_t k,
+                    uint32_t group_warps) {
+  __shared__ unsigned short b3_digits[kB3TableEntries];
+  __shared__ float partial[kD0xWarps][kD0xRows];
+  for (uint32_t code = threadIdx.x; code < kB3TableEntries; code += blockDim.x) {
+    b3_digits[code] = static_cast<unsigned short>(
+        (code % 3U) | (((code / 3U) % 3U) << 2U) | (((code / 9U) % 3U) << 4U) |
+        (((code / 27U) % 3U) << 6U) | (((code / 81U) % 3U) << 8U));
+  }
+  __syncthreads();
+  const uint32_t lane = threadIdx.x & 31U;
+  const uint32_t warp = threadIdx.x >> 5U;
+  const uint32_t group = warp / group_warps;
+  const uint32_t group_thread = threadIdx.x - group * group_warps * 32U;
+  const uint32_t group_threads = group_warps * 32U;
+  const uint32_t first = (blockIdx.x * (kD0xWarps / group_warps) + group) * kD0xRows;
+  const bool active = first < total_rows;
+
+  float accumulator[kD0xRows];
+#pragma unroll
+  for (uint32_t r = 0; r < kD0xRows; ++r) accumulator[r] = 0.0f;
+  uint32_t row0 = 0U;
+  D0xTensor tensor;
+  if (active) {
+    uint32_t index = 0U;
+    while (index + 1U < tensor_count && first >= tensors[index + 1U].first_row) ++index;
+    tensor = tensors[index];
+    row0 = first - tensor.first_row;
+    const uint32_t tiles = k / kAllocationTile;
+    const uint32_t positions = tiles * 13U;
+    const size_t plane_words = static_cast<size_t>(tensor.rows) * positions;
+    const size_t plane_scales = static_cast<size_t>(tensor.rows) * tiles;
+    const uint32_t* dense = reinterpret_cast<const uint32_t*>(tensor.dense_payload) +
+                            static_cast<size_t>(row0) * positions;
+    const uint32_t* dense_scales = reinterpret_cast<const uint32_t*>(tensor.dense_scales) +
+                                   static_cast<size_t>(row0) * tiles;
+    const uint32_t dense_planes = tensor.dense_planes;
+
+    for (uint32_t position = group_thread; position < positions; position += group_threads) {
+      const uint32_t tile = position / 13U;
+      const uint32_t word = position - tile * 13U;
+      float a[20];
+      d0x_activations(activation, tile, word, a);
+#pragma unroll
+      for (uint32_t plane = 0; plane < 3U; ++plane) {
+        if (plane >= dense_planes) break;
+        uint32_t bits[kD0xRows];
+        uint32_t scale_bits[kD0xRows];
+#pragma unroll
+        for (uint32_t r = 0; r < kD0xRows; ++r) {
+          bits[r] = __ldcs(dense + plane * plane_words + static_cast<size_t>(r) * positions +
+                           position);
+          scale_bits[r] = __ldg(dense_scales + plane * plane_scales +
+                                static_cast<size_t>(r) * tiles + tile);
+        }
+#pragma unroll
+        for (uint32_t r = 0; r < kD0xRows; ++r) {
+          accumulator[r] = d0x_word(b3_digits, bits[r], a, word, scale_bits[r], accumulator[r]);
+        }
+      }
+    }
+
+    // Extra planes of the group's rows, flattened.
+    const uint32_t* row_ptr = reinterpret_cast<const uint32_t*>(tensor.row_ptr) + row0;
+    uint32_t bound[kD0xRows + 1U];
+#pragma unroll
+    for (uint32_t r = 0; r <= kD0xRows; ++r) bound[r] = row_ptr[r];
+    const unsigned char* extra_tile = reinterpret_cast<const unsigned char*>(tensor.extra_tile);
+    const uint32_t* extra_payload = reinterpret_cast<const uint32_t*>(tensor.extra_payload);
+    const uint32_t* extra_scales = reinterpret_cast<const uint32_t*>(tensor.extra_scales);
+    const uint32_t extra_words = (bound[kD0xRows] - bound[0]) * 13U;
+    for (uint32_t at = group_thread; at < extra_words; at += group_threads) {
+      const uint32_t extra = bound[0] + at / 13U;
+      const uint32_t word = at % 13U;
+      const uint32_t bits = __ldcs(extra_payload + static_cast<size_t>(extra) * 13U + word);
+      float a[20];
+      d0x_activations(activation, extra_tile[extra], word, a);
+      const float contribution =
+          d0x_word(b3_digits, bits, a, word, __ldg(extra_scales + extra), 0.0f);
+#pragma unroll
+      for (uint32_t r = 0; r < kD0xRows; ++r) {
+        if (extra >= bound[r] && extra < bound[r + 1U]) accumulator[r] += contribution;
+      }
+    }
+  }
+
+#pragma unroll
+  for (uint32_t r = 0; r < kD0xRows; ++r) {
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      accumulator[r] += __shfl_xor_sync(0xFFFFFFFFU, accumulator[r], offset);
+    }
+  }
+  if (group_warps == 1U) {
+    if (active && lane < kD0xRows) {
+      float value = accumulator[0];
+#pragma unroll
+      for (uint32_t r = 1; r < kD0xRows; ++r) value = lane == r ? accumulator[r] : value;
+      reinterpret_cast<float*>(tensor.output)[row0 + lane] = value;
+    }
+    return;
+  }
+  if (lane == 0U) {
+#pragma unroll
+    for (uint32_t r = 0; r < kD0xRows; ++r) partial[warp][r] = accumulator[r];
+  }
+  __syncthreads();
+  if (active && group_thread < kD0xRows) {
+    float sum = 0.0f;
+    for (uint32_t w = 0; w < group_warps; ++w) sum += partial[group * group_warps + w][group_thread];
+    reinterpret_cast<float*>(tensor.output)[row0 + group_thread] = sum;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // A8 row-streaming GEMV (relaxed tier): int8 activations, dp4a.
 //
 // ncu puts the f32 row-stream kernels at 71-80% L1/TEX throughput, above both
