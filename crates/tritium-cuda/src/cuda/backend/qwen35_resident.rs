@@ -20,7 +20,10 @@
 
 use std::sync::Arc;
 
-use super::salt_v2_runtime::{launch_salt_v2_stream_on, salt_v2_stream_dispatch};
+use super::salt_v2_runtime::{
+    SALT_STREAM_DESCRIPTOR_WORDS, launch_salt_v2_stream_multi_on, launch_salt_v2_stream_on,
+    salt_stream_descriptor, salt_v2_stream_dispatch,
+};
 use super::*;
 
 /// Largest context the executor's attention kernel keeps scores for in shared memory.
@@ -155,7 +158,18 @@ enum Mixer {
     Attention(Box<AttentionLayer>),
 }
 
+/// Several projections of one input, launched as one fused row-stream GEMV.
+struct FusedGroup {
+    descriptors: CudaSlice<u64>,
+    tensor_count: u32,
+    total_rows: u32,
+}
+
 struct Layer {
+    /// The mixer's input projections fused (DeltaNet qkv|z|b|a, attention q|k|v).
+    fused_in: Option<FusedGroup>,
+    /// The MLP's gate|up fused.
+    fused_mlp: Option<FusedGroup>,
     input_norm: CudaSlice<f32>,
     post_attention_norm: CudaSlice<f32>,
     mixer: Mixer,
@@ -166,6 +180,7 @@ struct Layer {
 
 struct Kernels {
     stream_gemv: CudaFunction,
+    stream_gemv_multi: CudaFunction,
     gather: CudaFunction,
     recurrent: CudaFunction,
     add_rmsnorm: CudaFunction,
@@ -221,6 +236,8 @@ const ARGMAX_THREADS: u32 = 1024;
 /// Built by [`CudaBackend::build_qwen35_resident`]. Holds its own KV cache and
 /// recurrent state; [`Self::reset`] starts a new sequence.
 pub struct Qwen35Resident {
+    /// Per-warp shared table bytes for fused launches over `hidden` columns.
+    fused_table_bytes: u32,
     stream: Arc<CudaStream>,
     kernels: Kernels,
     embedding: Arc<SaltV2ResidentTensor>,
@@ -436,6 +453,8 @@ impl CudaBackend {
             };
             let _ = index;
             layers.push(Layer {
+                fused_in: None,
+                fused_mlp: None,
                 input_norm: upload(layer.input_norm, hidden, "input norm")?,
                 post_attention_norm: upload(layer.post_attention_norm, hidden, "post norm")?,
                 mixer,
@@ -464,6 +483,7 @@ impl CudaBackend {
         };
         let kernels = Kernels {
             stream_gemv: self.func_salt_v2_stream.clone(),
+            stream_gemv_multi: self.func_salt_v2_stream_multi.clone(),
             gather: self.func_salt_v2_gather.clone(),
             recurrent: self.func_deltanet_step.clone(),
             add_rmsnorm: function("q35_add_rmsnorm")?,
@@ -518,7 +538,58 @@ impl CudaBackend {
                 .map_err(|error| alloc_or_backend("allocate argmax indices", &error, 512))?,
         };
 
+        // Fused input groups. Each descriptor bakes in a scratch buffer's device
+        // address, which is stable for the executor's life because scratch is
+        // allocated once and never reallocated.
+        let fuse = |members: &[(&SaltV2ResidentTensor, &CudaSlice<f32>)]| {
+            let mut words = Vec::with_capacity(members.len() * SALT_STREAM_DESCRIPTOR_WORDS);
+            let mut first_row = 0u32;
+            for (tensor, output) in members {
+                let address = crate::cuda::graph_raw::dptr(*output, &self.stream);
+                words.extend(salt_stream_descriptor(
+                    tensor,
+                    &self.stream,
+                    address,
+                    first_row,
+                )?);
+                first_row = first_row
+                    .checked_add(to_u32(tensor.rows, "fused rows")?)
+                    .ok_or_else(|| invalid("fused row count overflows u32"))?;
+            }
+            let descriptors = self
+                .stream
+                .clone_htod(&words)
+                .map_err(|error| driver_err("upload fused GEMV descriptors", &error))?;
+            Ok::<_, BackendError>(FusedGroup {
+                descriptors,
+                tensor_count: to_u32(members.len(), "fused tensor count")?,
+                total_rows: first_row,
+            })
+        };
+        for layer in &mut layers {
+            layer.fused_mlp = Some(fuse(&[
+                (&layer.gate, &scratch.mlp_gate),
+                (&layer.up, &scratch.mlp_up),
+            ])?);
+            layer.fused_in = Some(match &layer.mixer {
+                Mixer::DeltaNet(mixer) => fuse(&[
+                    (&mixer.qkv, &scratch.qkv),
+                    (&mixer.z, &scratch.z),
+                    (&mixer.b, &scratch.b),
+                    (&mixer.a, &scratch.a),
+                ])?,
+                Mixer::Attention(mixer) => fuse(&[
+                    (&mixer.q, &scratch.fused_query),
+                    (&mixer.k, &scratch.key),
+                    (&mixer.v, &scratch.value),
+                ])?,
+            });
+        }
+        let fused_table_bytes = salt_v2_stream_dispatch(hidden, 128, 1)
+            .ok_or_else(|| invalid("hidden width is not one the row-stream GEMV serves"))?;
+
         Ok(Qwen35Resident {
+            fused_table_bytes,
             stream: Arc::clone(&self.stream),
             kernels,
             embedding: Arc::clone(&spec.embedding),
@@ -565,6 +636,12 @@ fn run(
             .map(|_| ())
             .map_err(|error| driver_err(name, &error))
     }
+}
+
+/// Whether fused input projections are enabled (default on; `TRITIUM_QWEN35_FUSED=0`
+/// launches each projection separately, for A/B).
+fn fused_enabled() -> bool {
+    std::env::var("TRITIUM_QWEN35_FUSED").as_deref() != Ok("0")
 }
 
 fn elementwise(n: usize) -> LaunchConfig {
@@ -832,43 +909,65 @@ impl Qwen35Resident {
         // The host reference's `QK_L2_EPSILON`.
         let l2_epsilon = 1e-6f32;
         let eps = self.eps;
+        let hidden_u32 = to_u32(self.hidden, "hidden")?;
+        let fused_table_bytes = self.fused_table_bytes;
         let (stream, kernels, scratch) = (&self.stream, &self.kernels, &mut self.scratch);
-        let Mixer::DeltaNet(layer) = &mut self.layers[index].mixer else {
+        let entry = &mut self.layers[index];
+        let fused = if fused_enabled() {
+            entry.fused_in.as_ref()
+        } else {
+            None
+        };
+        let Mixer::DeltaNet(layer) = &mut entry.mixer else {
             return Err(invalid("resident Qwen layer is not a DeltaNet layer"));
         };
         let gemv = &kernels.stream_gemv;
-        launch_salt_v2_stream_on(
-            stream,
-            gemv,
-            &layer.qkv,
-            &scratch.normalized,
-            1,
-            &mut scratch.qkv,
-        )?;
-        launch_salt_v2_stream_on(
-            stream,
-            gemv,
-            &layer.z,
-            &scratch.normalized,
-            1,
-            &mut scratch.z,
-        )?;
-        launch_salt_v2_stream_on(
-            stream,
-            gemv,
-            &layer.b,
-            &scratch.normalized,
-            1,
-            &mut scratch.b,
-        )?;
-        launch_salt_v2_stream_on(
-            stream,
-            gemv,
-            &layer.a,
-            &scratch.normalized,
-            1,
-            &mut scratch.a,
-        )?;
+        match fused {
+            Some(group) => launch_salt_v2_stream_multi_on(
+                stream,
+                &kernels.stream_gemv_multi,
+                &group.descriptors,
+                group.tensor_count,
+                group.total_rows,
+                hidden_u32,
+                fused_table_bytes,
+                &scratch.normalized,
+            )?,
+            None => {
+                launch_salt_v2_stream_on(
+                    stream,
+                    gemv,
+                    &layer.qkv,
+                    &scratch.normalized,
+                    1,
+                    &mut scratch.qkv,
+                )?;
+                launch_salt_v2_stream_on(
+                    stream,
+                    gemv,
+                    &layer.z,
+                    &scratch.normalized,
+                    1,
+                    &mut scratch.z,
+                )?;
+                launch_salt_v2_stream_on(
+                    stream,
+                    gemv,
+                    &layer.b,
+                    &scratch.normalized,
+                    1,
+                    &mut scratch.b,
+                )?;
+                launch_salt_v2_stream_on(
+                    stream,
+                    gemv,
+                    &layer.a,
+                    &scratch.normalized,
+                    1,
+                    &mut scratch.a,
+                )?;
+            }
+        }
 
         let conv_width = layer.qkv.rows;
         let width = to_i32(conv_width, "conv width")?;
@@ -989,40 +1088,62 @@ impl Qwen35Resident {
         let query_width_i32 = to_i32(query_width, "query width")?;
         let scale = 1.0f32 / (self.head_dim as f32).sqrt();
         let eps = self.eps;
+        let hidden_u32 = to_u32(self.hidden, "hidden")?;
+        let fused_table_bytes = self.fused_table_bytes;
         let (stream, kernels, scratch, inv_freq) = (
             &self.stream,
             &self.kernels,
             &mut self.scratch,
             &self.inv_freq,
         );
-        let Mixer::Attention(layer) = &mut self.layers[index].mixer else {
+        let entry = &mut self.layers[index];
+        let fused = if fused_enabled() {
+            entry.fused_in.as_ref()
+        } else {
+            None
+        };
+        let Mixer::Attention(layer) = &mut entry.mixer else {
             return Err(invalid("resident Qwen layer is not an attention layer"));
         };
         let gemv = &kernels.stream_gemv;
-        launch_salt_v2_stream_on(
-            stream,
-            gemv,
-            &layer.q,
-            &scratch.normalized,
-            1,
-            &mut scratch.fused_query,
-        )?;
-        launch_salt_v2_stream_on(
-            stream,
-            gemv,
-            &layer.k,
-            &scratch.normalized,
-            1,
-            &mut scratch.key,
-        )?;
-        launch_salt_v2_stream_on(
-            stream,
-            gemv,
-            &layer.v,
-            &scratch.normalized,
-            1,
-            &mut scratch.value,
-        )?;
+        match fused {
+            Some(group) => launch_salt_v2_stream_multi_on(
+                stream,
+                &kernels.stream_gemv_multi,
+                &group.descriptors,
+                group.tensor_count,
+                group.total_rows,
+                hidden_u32,
+                fused_table_bytes,
+                &scratch.normalized,
+            )?,
+            None => {
+                launch_salt_v2_stream_on(
+                    stream,
+                    gemv,
+                    &layer.q,
+                    &scratch.normalized,
+                    1,
+                    &mut scratch.fused_query,
+                )?;
+                launch_salt_v2_stream_on(
+                    stream,
+                    gemv,
+                    &layer.k,
+                    &scratch.normalized,
+                    1,
+                    &mut scratch.key,
+                )?;
+                launch_salt_v2_stream_on(
+                    stream,
+                    gemv,
+                    &layer.v,
+                    &scratch.normalized,
+                    1,
+                    &mut scratch.value,
+                )?;
+            }
+        }
 
         let mut builder = stream.launch_builder(&kernels.attn_prep);
         builder
@@ -1099,25 +1220,46 @@ impl Qwen35Resident {
     }
 
     fn mlp(&mut self, index: usize) -> Result<(), BackendError> {
+        let hidden_u32 = to_u32(self.hidden, "hidden")?;
+        let fused_table_bytes = self.fused_table_bytes;
         let (stream, kernels, scratch) = (&self.stream, &self.kernels, &mut self.scratch);
         let layer = &self.layers[index];
+        let fused = if fused_enabled() {
+            layer.fused_mlp.as_ref()
+        } else {
+            None
+        };
         let gemv = &kernels.stream_gemv;
-        launch_salt_v2_stream_on(
-            stream,
-            gemv,
-            &layer.gate,
-            &scratch.normalized,
-            1,
-            &mut scratch.mlp_gate,
-        )?;
-        launch_salt_v2_stream_on(
-            stream,
-            gemv,
-            &layer.up,
-            &scratch.normalized,
-            1,
-            &mut scratch.mlp_up,
-        )?;
+        match fused {
+            Some(group) => launch_salt_v2_stream_multi_on(
+                stream,
+                &kernels.stream_gemv_multi,
+                &group.descriptors,
+                group.tensor_count,
+                group.total_rows,
+                hidden_u32,
+                fused_table_bytes,
+                &scratch.normalized,
+            )?,
+            None => {
+                launch_salt_v2_stream_on(
+                    stream,
+                    gemv,
+                    &layer.gate,
+                    &scratch.normalized,
+                    1,
+                    &mut scratch.mlp_gate,
+                )?;
+                launch_salt_v2_stream_on(
+                    stream,
+                    gemv,
+                    &layer.up,
+                    &scratch.normalized,
+                    1,
+                    &mut scratch.mlp_up,
+                )?;
+            }
+        }
         let n = layer.gate.rows;
         let n_i32 = to_i32(n, "intermediate")?;
         let mut builder = stream.launch_builder(&kernels.swiglu);

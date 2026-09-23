@@ -1,6 +1,85 @@
 use super::*;
 use tritium_format::salt_v2_package::SALT_V2_ALLOCATION_TILE_SIZE;
 
+/// Words per fused-launch descriptor: the C `SaltStreamTensor` in `salt_v2.cu` is
+/// four device pointers and eight `u32`s, 64 bytes.
+pub(super) const SALT_STREAM_DESCRIPTOR_WORDS: usize = 8;
+
+/// Pack one tensor of a fused row-stream launch into the kernel's descriptor.
+///
+/// The words mirror `SaltStreamTensor` field for field on a little-endian device:
+/// four pointers, then the eight `u32` fields paired into four words. `output` is
+/// the tensor's own destination, so one launch can fill several buffers.
+pub(super) fn salt_stream_descriptor(
+    tensor: &SaltV2ResidentTensor,
+    stream: &CudaStream,
+    output: sys::CUdeviceptr,
+    first_row: u32,
+) -> Result<[u64; SALT_STREAM_DESCRIPTOR_WORDS], BackendError> {
+    let narrow = |value: usize, name: &str| {
+        u32::try_from(value)
+            .map_err(|_| BackendError::InvalidInput(format!("{name} exceeds the u32 kernel ABI")))
+    };
+    let pair = |low: u32, high: u32| u64::from(low) | (u64::from(high) << 32);
+    let index_metadata = tensor.index_metadata.as_ref().unwrap_or(&tensor.payload);
+    Ok([
+        crate::cuda::graph_raw::dptr(&tensor.payload, stream),
+        crate::cuda::graph_raw::dptr(&tensor.scales, stream),
+        crate::cuda::graph_raw::dptr(index_metadata, stream),
+        output,
+        pair(
+            narrow(tensor.rows, "SALT V2 rows")?,
+            narrow(tensor.tile_count, "SALT V2 tile count")?,
+        ),
+        pair(
+            narrow(tensor.plane_count, "SALT V2 plane count")?,
+            tensor.allocation_map_bytes,
+        ),
+        pair(tensor.rank_prefix_count, tensor.terminal_map_value),
+        pair(first_row, 0),
+    ])
+}
+
+/// Launch a fused row-stream GEMV over `tensor_count` descriptors (m = 1).
+///
+/// # Errors
+/// Returns a driver failure.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn launch_salt_v2_stream_multi_on(
+    stream: &CudaStream,
+    function: &CudaFunction,
+    descriptors: &CudaSlice<u64>,
+    tensor_count: u32,
+    total_rows: u32,
+    k: u32,
+    table_bytes: u32,
+    input: &CudaSlice<f32>,
+) -> Result<(), BackendError> {
+    let cfg = LaunchConfig {
+        grid_dim: (total_rows.div_ceil(SALT_V2_STREAM_WARPS), 1, 1),
+        block_dim: (SALT_V2_STREAM_WARPS * 32, 1, 1),
+        shared_mem_bytes: SALT_V2_B3_TABLE_BYTES + table_bytes * SALT_V2_STREAM_WARPS,
+    };
+    let mut launch = stream.launch_builder(function);
+    launch
+        .arg(input)
+        .arg(descriptors)
+        .arg(&tensor_count)
+        .arg(&total_rows)
+        .arg(&k)
+        .arg(&table_bytes);
+    // SAFETY: every descriptor was built from a validated resident tensor this
+    // backend owns and an output buffer sized for that tensor's rows; the kernel
+    // writes each fused row once, into its own tensor's buffer.
+    #[allow(unsafe_code)]
+    unsafe {
+        launch
+            .launch(cfg)
+            .map(|_| ())
+            .map_err(|error| driver_err("launch SALT V2 fused row-stream forward", &error))
+    }
+}
+
 /// Launch the row-stream GEMV between two device buffers, with no host transfer.
 ///
 /// The resident executor's projection primitive: `input` is `[m, columns]` and

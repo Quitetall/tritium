@@ -859,42 +859,25 @@ __device__ __forceinline__ float b3_trit(uint32_t packed, uint32_t digit) {
          8388609.0f;
 }
 
-extern "C" __global__ void salt_v2_stream_f32(
-    const float* __restrict__ activation,
-    const unsigned char* __restrict__ payload,
-    const __half* __restrict__ scales,
-    const unsigned char* __restrict__ index_metadata,
-    float* __restrict__ output,
-    uint32_t m,
-    uint32_t n,
-    uint32_t k,
-    uint32_t tile_count,
-    uint32_t plane_count,
-    uint32_t allocation_map_bytes,
-    uint32_t rank_prefix_count,
-    uint32_t terminal_map_value,
-    uint32_t tile_table_bytes) {
-  extern __shared__ unsigned char stream_shared[];
-  unsigned short* b3_digits = reinterpret_cast<unsigned short*>(stream_shared);
-  for (uint32_t code = threadIdx.x; code < kB3TableEntries; code += blockDim.x) {
-    b3_digits[code] = static_cast<unsigned short>(
-        (code % 3U) | (((code / 3U) % 3U) << 2U) | (((code / 9U) % 3U) << 4U) |
-        (((code / 27U) % 3U) << 6U) | (((code / 81U) % 3U) << 8U));
-  }
-  // Block-wide barrier before any warp may leave for an out-of-range row.
-  __syncthreads();
-
-  const uint32_t lane = threadIdx.x & 31U;
-  const uint32_t warp_in_block = threadIdx.x >> 5U;
-  const uint32_t warps_per_block = blockDim.x >> 5U;
-  unsigned char* tile_of = stream_shared + kB3TableEntries * sizeof(unsigned short) +
-                           static_cast<size_t>(warp_in_block) * tile_table_bytes;
-
-  const uint64_t output_index =
-      static_cast<uint64_t>(blockIdx.x) * warps_per_block + warp_in_block;
-  if (output_index >= static_cast<uint64_t>(m) * n) return;
-  const uint32_t mi = static_cast<uint32_t>(output_index / n);
-  const uint32_t row = static_cast<uint32_t>(output_index % n);
+// One row of the row-streaming GEMV, shared by the single-tensor and fused
+// multi-tensor kernels. Must be called by a whole warp; `tile_of` is that warp's
+// slice of the per-row plane-tile table and `b3_digits` the block's digit table.
+__device__ __forceinline__ void stream_row(const unsigned short* __restrict__ b3_digits,
+                                           unsigned char* tile_of,
+                                           uint32_t lane,
+                                           const float* __restrict__ row_activation,
+                                           const unsigned char* __restrict__ payload,
+                                           const __half* __restrict__ scales,
+                                           const unsigned char* __restrict__ index_metadata,
+                                           float* out_slot,
+                                           uint32_t row,
+                                           uint32_t k,
+                                           uint32_t tile_count,
+                                           uint32_t plane_count,
+                                           uint32_t allocation_map_bytes,
+                                           uint32_t rank_prefix_count,
+                                           uint32_t terminal_map_value,
+                                           uint32_t tile_table_bytes) {
   const uint32_t tiles_per_row = k / kAllocationTile;
   const uint32_t first_tile = row * tiles_per_row;
 
@@ -949,7 +932,7 @@ extern "C" __global__ void salt_v2_stream_f32(
   const uint32_t plane_tiles = carried;
   if (row_rank + plane_tiles > plane_count) malformed = true;
   if (__any_sync(0xFFFFFFFFU, malformed)) {
-    if (lane == 0U) output[output_index] = __int_as_float(0x7FC00000);
+    if (lane == 0U) *out_slot = __int_as_float(0x7FC00000);
     return;
   }
   __syncwarp();
@@ -957,7 +940,6 @@ extern "C" __global__ void salt_v2_stream_f32(
   const uint32_t* words = reinterpret_cast<const uint32_t*>(payload) +
                           static_cast<size_t>(row_rank) * 13U;
   const __half2* scale_pairs = reinterpret_cast<const __half2*>(scales) + row_rank;
-  const float* row_activation = activation + static_cast<size_t>(mi) * k;
   const uint32_t total_words = plane_tiles * 13U;
 
   float accumulator = 0.0f;
@@ -1014,7 +996,111 @@ extern "C" __global__ void salt_v2_stream_f32(
   for (int offset = 16; offset > 0; offset >>= 1) {
     accumulator += __shfl_xor_sync(0xFFFFFFFFU, accumulator, offset);
   }
-  if (lane == 0U) output[output_index] = accumulator;
+  if (lane == 0U) *out_slot = accumulator;
+}
+
+extern "C" __global__ void salt_v2_stream_f32(
+    const float* __restrict__ activation,
+    const unsigned char* __restrict__ payload,
+    const __half* __restrict__ scales,
+    const unsigned char* __restrict__ index_metadata,
+    float* __restrict__ output,
+    uint32_t m,
+    uint32_t n,
+    uint32_t k,
+    uint32_t tile_count,
+    uint32_t plane_count,
+    uint32_t allocation_map_bytes,
+    uint32_t rank_prefix_count,
+    uint32_t terminal_map_value,
+    uint32_t tile_table_bytes) {
+  extern __shared__ unsigned char stream_shared[];
+  unsigned short* b3_digits = reinterpret_cast<unsigned short*>(stream_shared);
+  for (uint32_t code = threadIdx.x; code < kB3TableEntries; code += blockDim.x) {
+    b3_digits[code] = static_cast<unsigned short>(
+        (code % 3U) | (((code / 3U) % 3U) << 2U) | (((code / 9U) % 3U) << 4U) |
+        (((code / 27U) % 3U) << 6U) | (((code / 81U) % 3U) << 8U));
+  }
+  // Block-wide barrier before any warp may leave for an out-of-range row.
+  __syncthreads();
+
+  const uint32_t lane = threadIdx.x & 31U;
+  const uint32_t warp_in_block = threadIdx.x >> 5U;
+  const uint32_t warps_per_block = blockDim.x >> 5U;
+  unsigned char* tile_of = stream_shared + kB3TableEntries * sizeof(unsigned short) +
+                           static_cast<size_t>(warp_in_block) * tile_table_bytes;
+
+  const uint64_t output_index =
+      static_cast<uint64_t>(blockIdx.x) * warps_per_block + warp_in_block;
+  if (output_index >= static_cast<uint64_t>(m) * n) return;
+  const uint32_t mi = static_cast<uint32_t>(output_index / n);
+  const uint32_t row = static_cast<uint32_t>(output_index % n);
+  stream_row(b3_digits, tile_of, lane, activation + static_cast<size_t>(mi) * k, payload,
+             scales, index_metadata, output + output_index, row, k, tile_count, plane_count,
+             allocation_map_bytes, rank_prefix_count, terminal_map_value, tile_table_bytes);
+}
+
+// One tensor of a fused row-stream launch. Mirrored field-for-field by
+// `SaltStreamTensor` in `salt_v2_runtime.rs`; any change here must change there.
+struct SaltStreamTensor {
+  unsigned long long payload;
+  unsigned long long scales;
+  unsigned long long index_metadata;
+  unsigned long long output;
+  uint32_t rows;
+  uint32_t tile_count;
+  uint32_t plane_count;
+  uint32_t allocation_map_bytes;
+  uint32_t rank_prefix_count;
+  uint32_t terminal_map_value;
+  uint32_t first_row;
+  uint32_t reserved;
+};
+
+// Several projections of one input in one launch (m = 1).
+//
+// A Qwen3.6 layer feeds the same normalized vector to up to four projections.
+// Launched separately, the small ones cost latency, not bandwidth: DeltaNet's
+// 48-row b and a projections took ~10 us each for almost no bytes, and the
+// attention k and v ~12 us each. Here the tensors share one row space --
+// tensor t owns rows [first_row, first_row + rows) -- and each warp finds its
+// tensor from a four-entry table and streams that row exactly as
+// `salt_v2_stream_f32` would, writing to the tensor's own output buffer.
+extern "C" __global__ void salt_v2_stream_f32_multi(
+    const float* __restrict__ activation,
+    const SaltStreamTensor* __restrict__ tensors,
+    uint32_t tensor_count,
+    uint32_t total_rows,
+    uint32_t k,
+    uint32_t tile_table_bytes) {
+  extern __shared__ unsigned char stream_shared[];
+  unsigned short* b3_digits = reinterpret_cast<unsigned short*>(stream_shared);
+  for (uint32_t code = threadIdx.x; code < kB3TableEntries; code += blockDim.x) {
+    b3_digits[code] = static_cast<unsigned short>(
+        (code % 3U) | (((code / 3U) % 3U) << 2U) | (((code / 9U) % 3U) << 4U) |
+        (((code / 27U) % 3U) << 6U) | (((code / 81U) % 3U) << 8U));
+  }
+  __syncthreads();
+
+  const uint32_t lane = threadIdx.x & 31U;
+  const uint32_t warp_in_block = threadIdx.x >> 5U;
+  const uint32_t warps_per_block = blockDim.x >> 5U;
+  unsigned char* tile_of = stream_shared + kB3TableEntries * sizeof(unsigned short) +
+                           static_cast<size_t>(warp_in_block) * tile_table_bytes;
+  const uint32_t fused_row = blockIdx.x * warps_per_block + warp_in_block;
+  if (fused_row >= total_rows) return;
+
+  uint32_t index = 0U;
+  while (index + 1U < tensor_count && fused_row >= tensors[index + 1U].first_row) ++index;
+  const SaltStreamTensor tensor = tensors[index];
+  const uint32_t row = fused_row - tensor.first_row;
+  stream_row(b3_digits, tile_of, lane, activation,
+             reinterpret_cast<const unsigned char*>(tensor.payload),
+             reinterpret_cast<const __half*>(tensor.scales),
+             reinterpret_cast<const unsigned char*>(tensor.index_metadata),
+             reinterpret_cast<float*>(tensor.output) + row, row, k, tensor.tile_count,
+             tensor.plane_count, tensor.allocation_map_bytes, tensor.rank_prefix_count,
+             tensor.terminal_map_value, tile_table_bytes);
 }
 
 // Reconstruct selected semantic matrix rows directly from the resident codec

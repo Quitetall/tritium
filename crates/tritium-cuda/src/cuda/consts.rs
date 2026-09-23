@@ -420,6 +420,8 @@ pub(super) const KERNEL_NAME_SALT_V2_WARP: &str = "salt_v2_forward_warp";
 pub(super) const KERNEL_NAME_SALT_V2_WARP_FAST: &str = "salt_v2_forward_warp_fast";
 /// Row-streaming SALT V2 GEMV: a warp reads its row's plane-tile words coalesced.
 pub(super) const KERNEL_NAME_SALT_V2_STREAM: &str = "salt_v2_stream_f32";
+/// Several row-stream projections of one input in one launch.
+pub(super) const KERNEL_NAME_SALT_V2_STREAM_MULTI: &str = "salt_v2_stream_f32_multi";
 pub(super) const KERNEL_NAME_SALT_V2_GATHER: &str = "salt_v2_gather_rows";
 /// One Gated DeltaNet recurrent state update for every head of one token.
 pub(super) const KERNEL_NAME_DELTANET_STEP: &str = "qwen35_deltanet_recurrent_step";

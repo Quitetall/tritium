@@ -576,6 +576,8 @@ pub struct CudaBackend {
     pub(super) func_salt_v2_warp_fast: CudaFunction,
     /// Row-streaming SALT V2 GEMV (`KERNEL_NAME_SALT_V2_STREAM`).
     pub(super) func_salt_v2_stream: CudaFunction,
+    /// Fused multi-tensor row-stream GEMV (`KERNEL_NAME_SALT_V2_STREAM_MULTI`).
+    pub(super) func_salt_v2_stream_multi: CudaFunction,
     /// Exact selected-row reconstruction for SALT V2 token embeddings.
     pub(super) func_salt_v2_gather: CudaFunction,
     /// Device trap used only by destructive release qualification.
@@ -1177,6 +1179,9 @@ impl CudaBackend {
         let func_salt_v2_stream = salt_v2_module
             .load_function(KERNEL_NAME_SALT_V2_STREAM)
             .map_err(|error| driver_err("load SALT V2 row-stream kernel", &error))?;
+        let func_salt_v2_stream_multi = salt_v2_module
+            .load_function(KERNEL_NAME_SALT_V2_STREAM_MULTI)
+            .map_err(|error| driver_err("load SALT V2 fused row-stream kernel", &error))?;
         let func_salt_v2_gather = salt_v2_module
             .load_function(KERNEL_NAME_SALT_V2_GATHER)
             .map_err(|e| driver_err("resolve salt_v2_gather_rows kernel", &e))?;
@@ -1230,6 +1235,7 @@ impl CudaBackend {
             func_salt_v2_warp,
             func_salt_v2_warp_fast,
             func_salt_v2_stream,
+            func_salt_v2_stream_multi,
             func_salt_v2_gather,
             #[cfg(feature = "device-loss-qualification")]
             func_qualification_poison,
