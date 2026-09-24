@@ -9,7 +9,7 @@ use tritium_format::salt_v2::SaltV2Codec;
 use tritium_nn::Qwen35SaltV2LoadReceipt;
 
 use crate::generator::{GenRequest, Generator, Sampling, Step};
-use crate::qwen_generator::QwenGenerator;
+use crate::qwen_generator::{QwenGenerator, QwenNumerics};
 
 const IDENTITY_HEX_CHARS: usize = 64;
 const REVISION_HEX_CHARS: usize = 40;
@@ -171,6 +171,45 @@ impl AdmittedArtifactV1 {
     }
 }
 
+/// How [`admit_qwen36_salt_v3_with`] admits a bundle.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct QwenAdmitOptions {
+    /// Measured research bundle; the caller must enforce loopback-only serving.
+    pub provisional: bool,
+    /// The numerics tier requests are served at.
+    pub numerics: QwenNumerics,
+    /// Longest request (prompt + completion) the server will admit, if bounded;
+    /// sizes the fast tier's executor.
+    pub max_context: Option<usize>,
+}
+
+impl QwenAdmitOptions {
+    /// Exact-tier admission, provisional or not.
+    #[must_use]
+    pub const fn new(provisional: bool) -> Self {
+        Self {
+            provisional,
+            numerics: QwenNumerics::Exact,
+            max_context: None,
+        }
+    }
+
+    /// The same admission bounded to `max_context` tokens per request.
+    #[must_use]
+    pub const fn with_max_context(mut self, max_context: Option<usize>) -> Self {
+        self.max_context = max_context;
+        self
+    }
+
+    /// The same admission at `numerics`.
+    #[must_use]
+    pub const fn with_numerics(mut self, numerics: QwenNumerics) -> Self {
+        self.numerics = numerics;
+        self
+    }
+}
+
 /// Bind one strict Qwen bundle and its exact load receipt into an opaque
 /// production-serving capability.
 pub fn admit_qwen36_salt_v3(
@@ -182,18 +221,16 @@ pub fn admit_qwen36_salt_v3(
     effective_backend: &str,
     physical_device_id: &str,
 ) -> Result<AdmittedGeneratorV1, StartupError> {
-    let artifact = AdmittedArtifactV1::from_qwen36_salt_v3(
-        model.receipt(),
+    admit_qwen36_salt_v3_with(
+        model,
+        eos,
         server_source_revision,
         server_build_id,
         backend_policy,
         effective_backend,
         physical_device_id,
-    )?;
-    Ok(AdmittedGeneratorV1 {
-        generator: Box::new(QwenGenerator::new(model, eos)),
-        artifact,
-    })
+        QwenAdmitOptions::new(false),
+    )
 }
 
 /// Bind provisional measured bundle. Caller must enforce loopback-only policy.
@@ -206,16 +243,58 @@ pub fn admit_qwen36_salt_v3_provisional(
     effective_backend: &str,
     physical_device_id: &str,
 ) -> Result<AdmittedGeneratorV1, StartupError> {
-    let artifact = AdmittedArtifactV1::from_qwen36_salt_v3_provisional(
-        model.receipt(),
+    admit_qwen36_salt_v3_with(
+        model,
+        eos,
         server_source_revision,
         server_build_id,
         backend_policy,
         effective_backend,
         physical_device_id,
-    )?;
+        QwenAdmitOptions::new(true),
+    )
+}
+
+/// Bind a strict Qwen bundle under explicit [`QwenAdmitOptions`]: provisional
+/// or production, at a chosen numerics tier.
+///
+/// # Errors
+/// As [`admit_qwen36_salt_v3`]; and [`StartupError::Backend`] when the fast tier
+/// was requested and the backend accepted the model but the executor build failed.
+#[allow(clippy::too_many_arguments)]
+pub fn admit_qwen36_salt_v3_with(
+    model: tritium_nn::Qwen35SaltV2LanguageMtpModel,
+    eos: u32,
+    server_source_revision: &str,
+    server_build_id: &str,
+    backend_policy: &str,
+    effective_backend: &str,
+    physical_device_id: &str,
+    options: QwenAdmitOptions,
+) -> Result<AdmittedGeneratorV1, StartupError> {
+    let artifact = if options.provisional {
+        AdmittedArtifactV1::from_qwen36_salt_v3_provisional(
+            model.receipt(),
+            server_source_revision,
+            server_build_id,
+            backend_policy,
+            effective_backend,
+            physical_device_id,
+        )?
+    } else {
+        AdmittedArtifactV1::from_qwen36_salt_v3(
+            model.receipt(),
+            server_source_revision,
+            server_build_id,
+            backend_policy,
+            effective_backend,
+            physical_device_id,
+        )?
+    };
+    let generator = QwenGenerator::with_numerics(model, eos, options.numerics, options.max_context)
+        .map_err(StartupError::Backend)?;
     Ok(AdmittedGeneratorV1 {
-        generator: Box::new(QwenGenerator::new(model, eos)),
+        generator: Box::new(generator),
         artifact,
     })
 }
@@ -304,6 +383,9 @@ pub enum StartupError {
     InvalidGenerator(&'static str),
     /// Backend failed startup inference.
     SelfTest(String),
+    /// Backend accepted the model but could not build what serving needs (for
+    /// example the fast tier's resident executor).
+    Backend(String),
 }
 
 impl fmt::Display for StartupError {
@@ -313,6 +395,7 @@ impl fmt::Display for StartupError {
                 formatter.write_str(message)
             }
             Self::SelfTest(message) => write!(formatter, "startup self-test failed: {message}"),
+            Self::Backend(message) => write!(formatter, "backend setup failed: {message}"),
         }
     }
 }

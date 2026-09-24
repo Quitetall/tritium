@@ -55,6 +55,8 @@ struct FileConfig {
     draft_model: Option<String>,
     kv_pool_tokens: Option<usize>,
     allow_incomplete_bundle: Option<bool>,
+    numerics: Option<String>,
+    ctx: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -85,6 +87,8 @@ struct LaunchConfig {
     draft_model: Option<String>,
     kv_pool_tokens: Option<usize>,
     allow_incomplete_bundle: bool,
+    numerics: String,
+    ctx: Option<usize>,
 }
 
 impl Default for LaunchConfig {
@@ -116,6 +120,8 @@ impl Default for LaunchConfig {
             draft_model: None,
             kv_pool_tokens: None,
             allow_incomplete_bundle: false,
+            numerics: "exact".to_owned(),
+            ctx: None,
         }
     }
 }
@@ -257,6 +263,12 @@ fn apply_file_config(config: FileConfig, launch: &mut LaunchConfig) {
     if let Some(value) = config.allow_incomplete_bundle {
         launch.allow_incomplete_bundle = value;
     }
+    if let Some(value) = config.numerics {
+        launch.numerics = value;
+    }
+    if let Some(value) = config.ctx {
+        launch.ctx = Some(value);
+    }
 }
 
 fn apply_env_config(launch: &mut LaunchConfig) -> Result<(), Box<dyn std::error::Error>> {
@@ -296,6 +308,14 @@ fn apply_env_config(launch: &mut LaunchConfig) -> Result<(), Box<dyn std::error:
             .map_err(|_| "TRITIUM_BACKEND is not valid UTF-8")?;
     }
     env_string!("TRITIUM_SPEC", launch.spec);
+    if let Some(value) = parse_env("TRITIUM_CTX")? {
+        launch.ctx = Some(value);
+    }
+    if let Some(value) = std::env::var_os("TRITIUM_NUMERICS") {
+        launch.numerics = value
+            .into_string()
+            .map_err(|_| "TRITIUM_NUMERICS is not valid UTF-8")?;
+    }
     env_value!("TRITIUM_BATCH_SLOTS", launch.batch_slots);
     env_value!("TRITIUM_QUEUE_CAP", launch.queue_cap);
     if let Some(value) = std::env::var_os("TRITIUM_HOST") {
@@ -391,6 +411,13 @@ serving:
   --queue-cap <N>           admission queue depth (default 32)
   --kv-pool-tokens <N>      paged-KV pool size in tokens (default: dense per-slot KV)
   --allow-incomplete-bundle allow measured language/MTP bundle on loopback only (research)
+  --numerics <tier>         bundle numerics: exact (default, bit-identical host
+                            forward) | fast (device-resident CUDA executor, gated
+                            on relative error + greedy agreement; exact fallback)
+  --ctx <N>                 max prompt+completion tokens per request (also sizes
+                            the fast tier's executor, up to its cap)
+  --probe                   print this build's capabilities as JSON and exit; with
+                            --bundle <dir>, also the bundle's profiles and sizes
 
 network:
   --host <ip>               public bind address (default 127.0.0.1; non-loopback
@@ -427,6 +454,160 @@ Performance knobs (TRITIUM_KERNEL_TIER, TRITIUM_KV, TRITIUM_TREE_NB,
 TRITIUM_LM_HEAD, TRITIUM_WEIGHTS, TRITIUM_SPEC_ADAPTIVE, ...) are engine
 env vars documented in docs/book/src/environment.md and docs/BENCHMARKS.md.";
 
+/// A startup failure with a documented exit code and a stable class name, so an
+/// engine manager can classify it from the exit status or the one stderr line
+/// `tritium-serve: fatal[<class>]: <message>` (docs/serving/engine-contract.md).
+#[derive(Debug)]
+struct Fatal {
+    code: i32,
+    class: &'static str,
+    message: String,
+}
+
+impl std::fmt::Display for Fatal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for Fatal {}
+
+/// The requested backend is not linked into this binary.
+const EXIT_BACKEND_UNAVAILABLE: i32 = 3;
+/// The backend is linked but failed to initialize (no device, driver error).
+const EXIT_BACKEND_INIT: i32 = 4;
+/// The model, bundle or profile could not be loaded or admitted.
+const EXIT_MODEL_INVALID: i32 = 5;
+/// A device or host allocation failed while loading or preparing the model.
+const EXIT_OUT_OF_MEMORY: i32 = 6;
+/// The listener could not bind its address (for example, the port is in use).
+const EXIT_BIND: i32 = 7;
+/// The startup self-test (one deterministic decode) failed.
+const EXIT_SELF_TEST: i32 = 8;
+
+/// Wrap an error as a [`Fatal`] of `class`, promoting any out-of-memory failure
+/// to [`EXIT_OUT_OF_MEMORY`] whatever phase raised it.
+fn fatal<E: std::fmt::Display>(code: i32, class: &'static str) -> impl FnOnce(E) -> Fatal {
+    move |error| {
+        let message = error.to_string();
+        let lower = message.to_ascii_lowercase();
+        if lower.contains("out of memory")
+            || lower.contains("out_of_memory")
+            || lower.contains("outofmemory")
+        {
+            Fatal {
+                code: EXIT_OUT_OF_MEMORY,
+                class: "out_of_memory",
+                message,
+            }
+        } else {
+            Fatal {
+                code,
+                class,
+                message,
+            }
+        }
+    }
+}
+
+/// `--probe` output, schema `tritium-serve-probe/1`. Stable keys: additions only.
+fn probe_json(bundle: Option<&str>) -> Result<serde_json::Value, String> {
+    let backends: Vec<&str> = tritium_runtime::BACKENDS
+        .iter()
+        .map(|entry| entry.name)
+        .collect();
+    #[cfg(feature = "cuda")]
+    let numerics = ["exact", "fast"].as_slice();
+    #[cfg(not(feature = "cuda"))]
+    let numerics = ["exact"].as_slice();
+    #[cfg(feature = "cuda")]
+    let fast_max_context = serde_json::json!(tritium_cuda::QWEN35_RESIDENT_MAX_CONTEXT);
+    #[cfg(not(feature = "cuda"))]
+    let fast_max_context = serde_json::Value::Null;
+    let mut probe = serde_json::json!({
+        "schema": "tritium-serve-probe/1",
+        "version": env!("CARGO_PKG_VERSION"),
+        "version_line": version_line(),
+        "backends": backends,
+        "numerics": numerics,
+        "fast_max_context": fast_max_context,
+        "endpoints": [
+            "/healthz", "/readyz", "/metrics", "/v1/models", "/v1/chat/completions",
+            "/v1/tree/session", "/v1/tree/verify"
+        ],
+    });
+    let Some(dir) = bundle else {
+        return Ok(probe);
+    };
+    let dir = std::path::Path::new(dir);
+    let read = |name: &str| -> Result<serde_json::Value, String> {
+        let path = dir.join(name);
+        let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", path.display()))
+    };
+    let manifest = read("tritium.json")?;
+    let config = read("config.json")?;
+    let text = config.get("text_config").unwrap_or(&config);
+    let number = |key: &str| {
+        text.get(key)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    };
+    let layer_count = |kind: &str| {
+        text.get("layer_types")
+            .and_then(serde_json::Value::as_array)
+            .map_or(0, |types| {
+                types.iter().filter(|t| t.as_str() == Some(kind)).count() as u64
+            })
+    };
+    // The fast tier's per-token KV (f32 keys + values on full-attention layers)
+    // and its fixed recurrent + convolution state on DeltaNet layers.
+    let kv_bytes_per_token =
+        layer_count("full_attention") * number("num_key_value_heads") * number("head_dim") * 2 * 4;
+    let value_heads = number("linear_num_value_heads");
+    let conv_channels = number("linear_num_key_heads") * number("linear_key_head_dim") * 2
+        + value_heads * number("linear_value_head_dim");
+    let state_bytes = layer_count("linear_attention")
+        * (value_heads * number("linear_key_head_dim") * number("linear_value_head_dim")
+            + conv_channels * number("linear_conv_kernel_dim"))
+        * 4;
+    let profiles: Vec<serde_json::Value> = manifest
+        .get("profiles")
+        .and_then(serde_json::Value::as_object)
+        .map(|profiles| {
+            profiles
+                .iter()
+                .map(|(name, entry)| {
+                    let file = entry.get("file").and_then(serde_json::Value::as_str);
+                    serde_json::json!({
+                        "name": name,
+                        "file": file,
+                        "present": file.is_some_and(|file| dir.join(file).is_file()),
+                        "package_id": entry.get("package_id"),
+                        "resident_bytes": entry.get("resident_bytes"),
+                        "serialized_bytes": entry.get("serialized_bytes"),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    probe["bundle"] = serde_json::json!({
+        "path": dir.display().to_string(),
+        "artifact_kind": manifest.get("artifact_kind"),
+        "admission_id": manifest.get("admission_id"),
+        "source_revision": manifest.get("source_revision"),
+        "schema_version": manifest.get("schema_version"),
+        "complete_model": manifest.get("complete_model"),
+        "needs_allow_incomplete_bundle": manifest.get("complete_model") != Some(&serde_json::Value::Bool(true)),
+        "default_profile": "compact-v1",
+        "profiles": profiles,
+        "max_position_embeddings": text.get("max_position_embeddings"),
+        "fast_kv_bytes_per_token": kv_bytes_per_token,
+        "fast_state_bytes": state_bytes,
+    });
+    Ok(probe)
+}
+
 fn version_line() -> String {
     format!(
         "tritium-serve {}{}",
@@ -441,7 +622,12 @@ fn version_line() -> String {
 async fn main() {
     if let Err(e) = run().await {
         // Display, not the Termination trait's Debug — no quoted/escaped
-        // strings, and a pointer at help.
+        // strings. Classified failures get one stable, grep-able line and their
+        // documented exit code; anything else exits 1 with a pointer at help.
+        if let Some(fatal) = e.downcast_ref::<Fatal>() {
+            eprintln!("tritium-serve: fatal[{}]: {}", fatal.class, fatal.message);
+            std::process::exit(fatal.code);
+        }
         eprintln!("tritium-serve error: {e}");
         eprintln!("run `tritium-serve --help` for usage");
         std::process::exit(1);
@@ -475,6 +661,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         println!("{}", version_line());
         return Ok(());
     }
+    // Capability probe for engine managers (LAMU): what this build links and,
+    // for `--bundle <dir>`, what the bundle offers -- without loading a model.
+    if raw_args.iter().any(|a| a == "--probe") {
+        let bundle = raw_args
+            .iter()
+            .position(|a| a == "--bundle")
+            .and_then(|index| raw_args.get(index + 1).cloned())
+            .or_else(|| std::env::var("TRITIUM_BUNDLE").ok());
+        let probe = probe_json(bundle.as_deref())?;
+        println!("{}", serde_json::to_string_pretty(&probe)?);
+        return Ok(());
+    }
     let mut launch = LaunchConfig::default();
     apply_file_config(read_config(&raw_args)?, &mut launch);
     apply_env_config(&mut launch)?;
@@ -505,6 +703,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         mut draft_model,
         mut kv_pool_tokens,
         mut allow_incomplete_bundle,
+        mut numerics,
+        mut ctx,
     } = launch;
 
     // Parse a required value for `name`, erroring (not silently defaulting) on a
@@ -571,6 +771,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 kv_pool_tokens = Some(t);
             }
             "--allow-incomplete-bundle" => allow_incomplete_bundle = true,
+            "--numerics" => numerics = val::<String>(args.next(), "--numerics")?,
+            "--ctx" => ctx = Some(val::<usize>(args.next(), "--ctx")?),
             // -h/--help/-V/--version answered in the pre-scan (they must
             // work even under a broken env/config).
             other => {
@@ -594,6 +796,23 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     if allow_incomplete_bundle && bundle_path.is_none() {
         return Err("--allow-incomplete-bundle requires --bundle".into());
+    }
+    let numerics = match numerics.as_str() {
+        "exact" => tritium_serve::QwenNumerics::Exact,
+        "fast" => tritium_serve::QwenNumerics::Fast,
+        other => return Err(format!("--numerics: unknown tier {other:?} (exact | fast)").into()),
+    };
+    if numerics == tritium_serve::QwenNumerics::Fast && bundle_path.is_none() {
+        return Err("--numerics fast applies to --bundle serving".into());
+    }
+    // `--ctx N` bounds a request's prompt + completion tokens (and sizes the fast
+    // tier's executor, up to its own cap).
+    if let Some(ctx) = ctx {
+        if ctx == 0 {
+            return Err("--ctx must be at least 1".into());
+        }
+        max_total_tokens = max_total_tokens.min(ctx);
+        max_prompt_tokens = max_prompt_tokens.min(ctx);
     }
     // One identifying line before any multi-gigabyte load: version + source.
     eprintln!("{}", version_line());
@@ -653,7 +872,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     .collect::<Vec<_>>()
                     .join(", ")
             )
-        })?;
+        })
+        .map_err(fatal(EXIT_BACKEND_UNAVAILABLE, "backend_unavailable"))?;
     let spec_lookup = match spec.as_deref() {
         None => false,
         Some("lookup") => true,
@@ -679,9 +899,27 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         {
             return Err("--bundle forbids --raw-tokens, --spec, --draft-model, --batch-slots != 1, and --kv-pool-tokens".into());
         }
+        // Bundle serving needs a binary built from one clean Git revision (checked
+        // again at admission). Refuse here, before a multi-gigabyte load.
+        let clean_revision = option_env!("TRITIUM_SOURCE_ID")
+            .and_then(|identity| identity.strip_prefix("source-git:"))
+            .is_some_and(|revision| {
+                revision.len() == 40
+                    && revision
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            });
+        if !clean_revision {
+            return Err(
+                "--bundle serving needs a binary built from one clean Git revision \
+                        (this build's source identity is dirty or missing; see --version)"
+                    .into(),
+            );
+        }
         let bundle = std::path::Path::new(&bundle);
-        let backend =
-            init().map_err(|error| format!("backend `{backend_name}` failed to init: {error}"))?;
+        let backend = init()
+            .map_err(|error| format!("backend `{backend_name}` failed to init: {error}"))
+            .map_err(fatal(EXIT_BACKEND_INIT, "backend_init"))?;
         let physical_device = backend.physical_device_id().to_owned();
         eprintln!(
             "tritium-serve: loading strict bundle {} profile {profile} on `{backend_name}` ({physical_device})...",
@@ -689,7 +927,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         );
         let model = tritium_nn::Qwen35SaltV2LanguageMtpModel::load_bundle_profile(
             bundle, &profile, backend,
-        )?;
+        )
+        .map_err(|error| format!("bundle {} profile {profile}: {error}", bundle.display()))
+        .map_err(fatal(EXIT_MODEL_INVALID, "model_invalid"))?;
         let (model, tokenizer_json, tokenizer_config_json) = model.into_serving_assets();
         let tokenizer =
             tritium_nn::HfJsonTokenizer::from_bytes(&tokenizer_json, &tokenizer_config_json)?;
@@ -717,10 +957,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             return Err(format!("--converted {converted}: missing model.tslb").into());
         }
         eprintln!("tritium-serve: loading converted model {converted} on `{backend_name}`...");
-        let backend =
-            init().map_err(|error| format!("backend `{backend_name}` failed to init: {error}"))?;
+        let backend = init()
+            .map_err(|error| format!("backend `{backend_name}` failed to init: {error}"))
+            .map_err(fatal(EXIT_BACKEND_INIT, "backend_init"))?;
         let runner = tritium_nn::ModelRunner::from_salt(dir, &bundle, backend)
-            .map_err(|error| format!("--converted {converted}: {error}"))?;
+            .map_err(|error| format!("--converted {converted}: {error}"))
+            .map_err(fatal(EXIT_MODEL_INVALID, "model_invalid"))?;
         let tokenizer = tritium_nn::HfJsonTokenizer::from_files(
             &dir.join("tokenizer.json"),
             &dir.join("tokenizer_config.json"),
@@ -736,11 +978,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         let model_path = model_path.expect("exactly-one validation established legacy path");
         eprintln!("tritium-serve: loading legacy {model_path} on `{backend_name}`...");
         let bytes = std::fs::read(&model_path).map_err(|e| format!("--model {model_path}: {e}"))?;
-        let backend =
-            init().map_err(|error| format!("backend `{backend_name}` failed to init: {error}"))?;
+        let backend = init()
+            .map_err(|error| format!("backend `{backend_name}` failed to init: {error}"))
+            .map_err(fatal(EXIT_BACKEND_INIT, "backend_init"))?;
         let file = tritium_format::read_gguf(&bytes)
-            .map_err(|e| format!("--model {model_path}: not a readable GGUF: {e}"))?;
-        let runner = tritium_nn::ModelRunner::load(&file, &bytes, backend)?;
+            .map_err(|e| format!("--model {model_path}: not a readable GGUF: {e}"))
+            .map_err(fatal(EXIT_MODEL_INVALID, "model_invalid"))?;
+        let runner = tritium_nn::ModelRunner::load(&file, &bytes, backend)
+            .map_err(|e| format!("--model {model_path}: {e}"))
+            .map_err(fatal(EXIT_MODEL_INVALID, "model_invalid"))?;
         let (tokenizer, template): (Arc<dyn tritium_nn::Tokenizer + Send + Sync>, _) = if raw_tokens
         {
             (
@@ -901,7 +1147,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             );
             let admitted = if allow_incomplete_bundle {
                 eprintln!("WARNING: provisional bundle; language/MTP only; not release-qualified");
-                tritium_serve::admit_qwen36_salt_v3_provisional(
+                tritium_serve::admit_qwen36_salt_v3_with(
                     *model,
                     eos,
                     source_revision,
@@ -909,9 +1155,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     &backend_name,
                     &backend_name,
                     &physical_device,
-                )?
+                    tritium_serve::QwenAdmitOptions::new(true)
+                        .with_numerics(numerics)
+                        .with_max_context(ctx),
+                )
+                .map_err(fatal(EXIT_MODEL_INVALID, "model_invalid"))?
             } else {
-                tritium_serve::admit_qwen36_salt_v3(
+                tritium_serve::admit_qwen36_salt_v3_with(
                     *model,
                     eos,
                     source_revision,
@@ -919,7 +1169,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     &backend_name,
                     &backend_name,
                     &physical_device,
-                )?
+                    tritium_serve::QwenAdmitOptions::new(false)
+                        .with_numerics(numerics)
+                        .with_max_context(ctx),
+                )
+                .map_err(fatal(EXIT_MODEL_INVALID, "model_invalid"))?
             };
             let (router, draining, _) = if allow_incomplete_bundle {
                 tritium_serve::build_router_provisional(
@@ -928,7 +1182,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     cfg,
                     request_limits,
                     admission,
-                )?
+                )
+                .map_err(fatal(EXIT_SELF_TEST, "self_test"))?
             } else {
                 tritium_serve::build_router_production(
                     admitted,
@@ -936,7 +1191,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     cfg,
                     request_limits,
                     admission,
-                )?
+                )
+                .map_err(fatal(EXIT_SELF_TEST, "self_test"))?
             };
             (router, draining)
         }
@@ -1018,7 +1274,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
     let listener = tokio::net::TcpListener::bind(addr)
         .await
-        .map_err(|e| format!("bind {addr} (--host/--port): {e}"))?;
+        .map_err(|e| format!("bind {addr} (--host/--port): {e}"))
+        .map_err(fatal(EXIT_BIND, "bind"))?;
     #[cfg(all(feature = "device-loss-qualification", unix))]
     if let Some(mut signal) = destructive_signal {
         tokio::spawn(async move {

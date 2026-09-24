@@ -45,7 +45,7 @@ pub use generator::{
     FinishReason, GenError, GenRequest, Generator, MockGenerator, RunnerGenerator, Sampling, Step,
     TreeOpError,
 };
-pub use qwen_generator::QwenGenerator;
+pub use qwen_generator::{QwenGenerator, QwenNumerics};
 pub use tokenizer_passthrough::IdPassthroughTokenizer;
 
 #[cfg(feature = "serve")]
@@ -63,7 +63,7 @@ pub use router::{
 };
 #[cfg(feature = "serve")]
 pub use startup::{
-    AdmittedArtifactV1, AdmittedGeneratorV1, ProductionReadiness, StartupError, StartupReceiptV1,
-    admit_qwen36_salt_v3, admit_qwen36_salt_v3_provisional, prepare_production_generator,
-    prepare_provisional_generator,
+    AdmittedArtifactV1, AdmittedGeneratorV1, ProductionReadiness, QwenAdmitOptions, StartupError,
+    StartupReceiptV1, admit_qwen36_salt_v3, admit_qwen36_salt_v3_provisional,
+    admit_qwen36_salt_v3_with, prepare_production_generator, prepare_provisional_generator,
 };
