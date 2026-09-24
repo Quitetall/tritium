@@ -19,6 +19,28 @@
 //! - `full attn` is the softmax-attention reference: it also sees all positions, but carries no
 //!   recurrent state.
 //!
+//! # Measured 2026-09-23 — Qwen3.5-0.8B-Base, T=2, 4 × 2048 WikiText-2 test tokens
+//!
+//! ```text
+//! arm                        params      pos≥0   pos≥64  pos≥256  pos≥512 pos≥1024
+//! fp NLL                          —     3.8667   2.9892   2.8373   2.5336   2.5808
+//! Δ gates                    589824    +0.0062  -0.0003  +0.0009  +0.0006  +0.0011
+//! Δ mlp rows (control)       589824    -0.0019  +0.0002  +0.0003  +0.0016  +0.0010
+//! Δ deltanet proj         188743680    +0.1661  +0.1175  +0.1169  +0.1369  +0.1380
+//! Δ mlp (linear layers)   198180864    +0.1380  +0.1286  +0.0743  +0.1121  +0.1063
+//! Δ full attn              44040192    +0.1018  +0.0507  +0.0407  +0.0451  +0.0387
+//! Δ all projections       497614848    +0.5127  +0.3937  +0.3698  +0.3930  +0.3980
+//! ```
+//!
+//! **No recurrent amplification within 2k tokens.** The DeltaNet gates, which PrismML keeps in fp,
+//! cost ~0.001 nats at T=2, identical to their matched MLP rows, and flat with position. The
+//! DeltaNet projections rise from +0.117 to +0.138 past position 512 (+18%), but the matched MLP
+//! control moves by as much in both directions (0.074..0.129). The quadratic-validity result (H1)
+//! puts per-bucket sample noise at this order, so the rise is not resolved. Softmax attention's
+//! excess FALLS with position (0.10 → 0.04). Every family pays most at positions < 64.
+//! Bounds: 2k context, PTQ, one model. PrismML's claim is about long-context reasoning, which this
+//! does not reach, so T3 (temporal amplification) is unsupported at ≤ 2k and untested beyond.
+//!
 //! ```text
 //! TRITIUM_QWEN35_DIR=/mnt/4tb/models/qwen3.5-0.8b-base-tritium \
 //! TRITIUM_CORPUS=$HOME/.cache/tritium-corpora/wikitext2_400k_32k_qwen35.json \
