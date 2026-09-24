@@ -23,12 +23,37 @@
 //! `T`, Golay `T+½`, and the only uncoded way to reach `T+½` trits — time-sharing, alternate rows at
 //! `T` and `T+1`. Scored with the antithetic split (`even` = curvature cost, sample term cancelled).
 //!
+//! # Measured 2026-09-24 — SmolLM2-135M, full WikiText-2 eval (32,768 tokens), fp 22.675
+//!
+//! ```text
+//! structure               bits/w       ppl       even (curvature)   SNR dB
+//! ladder T=1               1.710  22506.406      +8.09769            8.40
+//! uniform 5-level scalar   2.447    219.137      +2.28345           12.18
+//! Golay-coded 1+½          2.502    129.231      +1.79460           13.10
+//! time-share 1/2           2.502   2321.279      +5.64457           10.81
+//! ladder T=2               3.295     46.405      +0.71623           16.52
+//! uniform 15-level scalar  4.032     28.396      +0.23924           20.76
+//! Golay-coded 2+½          4.087     27.362      +0.19744           21.38
+//! time-share 2/3           4.087     32.683      +0.41632           19.01
+//! ladder T=3               4.880     24.278      +0.07746           25.11
+//! ```
+//!
+//! **Coding the finest plane beats every uncoded structure at the same rate.** Against the ternary
+//! fallback (time-sharing) it is 18x better in perplexity at 2.50 bpw and -16% at 4.09 bpw (curvature
+//! cost -68% / -53%). Against the fairest uncoded rival — the best single scalar at that rate, which
+//! is not trit-plane storable — it is -41% / -3.6% perplexity and -21% / -17% curvature cost while
+//! spending 0.055 bpw more; net of that premium the gain is ~0.3-0.6 dB, which is what a lattice with
+//! 0.73 dB of granular gain should deliver. The finest plane stays a ternary plane, so the kernel is
+//! unchanged (one more add/subtract plane); only storage changes (6 message trits per 12 weights).
+//! Plain nearest-point decoding only — no GPTQ/BlockLDLQ yet. The odd (sample) term is small at this
+//! eval size (|odd| ≤ 0.05 nats except the destroyed T=1 arms).
+//!
 //! ```text
 //! TRITIUM_CORPUS=$HOME/.cache/tritium-corpora/wikitext2_400k_32k.json \
 //!   cargo test -p tritium-nn --release --test coded_planes -- --ignored --nocapture
 //! ```
 //! Knobs: `TRITIUM_H8_TS` (coarse planes for the coded arms, default `1,2`),
-//! `TRITIUM_H8_EVAL_WINDOWS` (default 64).
+//! `TRITIUM_H8_EVAL_WINDOWS` (default 64), `TRITIUM_H8_ARMS=uniform` (single-scalar comparators).
 
 mod common;
 
@@ -208,6 +233,9 @@ enum Arm {
     Ladder(usize),
     Golay(usize),
     TimeShare(usize),
+    /// A uniform scalar quantizer with `L` levels (odd), packed at `log2 L` bits: the best uncoded
+    /// SINGLE scalar at a fractional ternary rate (5 levels ≈ 1+½ trits, 15 ≈ 2+½).
+    Uniform(usize),
 }
 
 impl Arm {
@@ -216,15 +244,17 @@ impl Arm {
             Arm::Ladder(t) => format!("ladder T={t}"),
             Arm::Golay(t) => format!("Golay-coded {t}+½"),
             Arm::TimeShare(t) => format!("time-share {t}/{}", t + 1),
+            Arm::Uniform(l) => format!("uniform {l}-level scalar"),
         }
     }
     /// Stored bits per weight: trits plus one fp16 step per 128-group.
     fn bits(self) -> f64 {
-        let trits = match self {
-            Arm::Ladder(t) => t as f64,
-            Arm::Golay(t) | Arm::TimeShare(t) => t as f64 + 0.5,
+        let payload = match self {
+            Arm::Ladder(t) => t as f64 * 3f64.log2(),
+            Arm::Golay(t) | Arm::TimeShare(t) => (t as f64 + 0.5) * 3f64.log2(),
+            Arm::Uniform(l) => (l as f64).log2(),
         };
-        trits * 3f64.log2() + 16.0 / GROUP as f64
+        payload + 16.0 / GROUP as f64
     }
 }
 
@@ -248,6 +278,43 @@ fn quantize(w: &[f32], rows: usize, cols: usize, arm: Arm, code: &[[i8; BLOCK]])
                 .zip(w.par_chunks(cols))
                 .enumerate()
                 .for_each(|(r, (o, x))| o.copy_from_slice(&ladder(t + r % 2, x, 1)));
+            out
+        }
+        Arm::Uniform(levels) => {
+            let k = ((levels - 1) / 2) as f32;
+            let mut out = vec![0.0f32; w.len()];
+            out.par_chunks_mut(cols)
+                .zip(w.par_chunks(cols))
+                .for_each(|(o, x)| {
+                    let mut y = x.to_vec();
+                    hadamard_blocks(&mut y);
+                    for (og, g) in o.chunks_mut(GROUP).zip(y.chunks(GROUP)) {
+                        let peak = g.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+                        let mut best = (f32::INFINITY, 0.0f32);
+                        for i in 0..36 {
+                            let d = peak / k * (0.35 + 0.02 * i as f32);
+                            if d <= 0.0 {
+                                break;
+                            }
+                            let e: f32 = g
+                                .iter()
+                                .map(|v| (v - (v / d).round().clamp(-k, k) * d).powi(2))
+                                .sum();
+                            if e < best.0 {
+                                best = (e, d);
+                            }
+                        }
+                        let d = best.1;
+                        for (q, v) in og.iter_mut().zip(g) {
+                            *q = if d > 0.0 {
+                                (v / d).round().clamp(-k, k) * d
+                            } else {
+                                0.0
+                            };
+                        }
+                    }
+                    hadamard_blocks(o);
+                });
             out
         }
         Arm::Golay(t) => {
@@ -322,12 +389,20 @@ fn golay_coded_planes_against_the_ladder() {
     );
     let mut arms = Vec::new();
     for &t in &ts {
-        arms.extend([
-            Arm::Ladder(t),
-            Arm::Golay(t),
-            Arm::TimeShare(t),
-            Arm::Ladder(t + 1),
-        ]);
+        if arms
+            .last()
+            .is_none_or(|a| !matches!(a, Arm::Ladder(x) if *x == t))
+        {
+            arms.push(Arm::Ladder(t));
+        }
+        arms.extend([Arm::Golay(t), Arm::TimeShare(t), Arm::Ladder(t + 1)]);
+    }
+    // `TRITIUM_H8_ARMS=uniform` runs only the single-scalar comparators at the Golay rates.
+    if std::env::var("TRITIUM_H8_ARMS").is_ok_and(|v| v == "uniform") {
+        arms = ts
+            .iter()
+            .map(|&t| Arm::Uniform(if t == 1 { 5 } else { 15 }))
+            .collect();
     }
     for arm in arms {
         let started = Instant::now();
