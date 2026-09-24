@@ -510,6 +510,28 @@ fn fatal<E: std::fmt::Display>(code: i32, class: &'static str) -> impl FnOnce(E)
     }
 }
 
+/// Run one short generation before the listener binds, so the first real
+/// request does not pay for one-time device setup. The CUDA decode path builds
+/// its resident model, resolves its prefill kernels and captures its graphs on
+/// first use; measured on BitNet 2B4T under host load, that first request took
+/// 34 s against 0.12-0.48 s for the same request afterwards. Readiness then
+/// means ready. A prompt past the IMMA prefill threshold (32 tokens) exercises
+/// the prefill path too.
+fn warm_up(generator: &mut dyn tritium_serve::Generator) -> Result<(), Box<dyn std::error::Error>> {
+    let request = tritium_serve::GenRequest {
+        prompt_tokens: (0..40).map(|index| 100 + index).collect(),
+        max_new: 4,
+        sampling: tritium_serve::Sampling::Greedy,
+        stop_eos: false,
+        logprobs: None,
+    };
+    generator
+        .generate(&request, &mut |_| true)
+        .map_err(|error| format!("warm-up generation: {error}"))
+        .map_err(fatal(EXIT_SELF_TEST, "self_test"))?;
+    Ok(())
+}
+
 /// `--probe` output, schema `tritium-serve-probe/1`. Stable keys: additions only.
 fn probe_json(bundle: Option<&str>) -> Result<serde_json::Value, String> {
     let backends: Vec<&str> = tritium_runtime::BACKENDS
@@ -1231,6 +1253,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(d) = draft_runner {
                     generator = generator.with_draft_model(d);
                 }
+                warm_up(&mut generator)?;
                 tritium_serve::build_router_governed(
                     Box::new(generator),
                     tok,
@@ -1249,6 +1272,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(draft) = draft_runner {
                     generator = generator.with_draft_model(draft);
                 }
+                warm_up(&mut generator)?;
                 tritium_serve::build_router_governed(
                     Box::new(generator),
                     tok,

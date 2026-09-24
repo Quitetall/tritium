@@ -67,8 +67,10 @@ defaults < config file < environment < CLI.
 
 1. The process validates arguments (for `--bundle`, including that the binary
    was built from one clean Git revision; a dirty build exits 1 at once), then
-   loads the model and runs one
-   deterministic decode as a self-test. **Nothing listens during this phase:**
+   loads the model and runs a short
+   deterministic generation as a self-test and warm-up, so one-time device
+   setup (kernel compiles, graph capture) is done before readiness and the
+   first request is not slow. **Nothing listens during this phase:**
    connections to the port are refused. Loading a 12 GB bundle takes on the
    order of 1-2 minutes.
 2. It then binds `--host:--port`. From that moment:
