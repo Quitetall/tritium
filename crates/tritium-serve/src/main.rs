@@ -824,8 +824,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         "fast" => tritium_serve::QwenNumerics::Fast,
         other => return Err(format!("--numerics: unknown tier {other:?} (exact | fast)").into()),
     };
+    // The fast tier is a bundle executor; for other sources it falls back to
+    // exact like any other place it cannot run, so a manager can pass one tier
+    // flag for every source a binary serves.
     if numerics == tritium_serve::QwenNumerics::Fast && bundle_path.is_none() {
-        return Err("--numerics fast applies to --bundle serving".into());
+        eprintln!("tritium-serve: numerics fast applies to --bundle serving; serving exact");
     }
     // `--ctx N` bounds a request's prompt + completion tokens (and sizes the fast
     // tier's executor, up to its own cap).

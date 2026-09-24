@@ -52,7 +52,7 @@ Device memory for a fast-tier launch is about `resident_bytes + fast_state_bytes
 | `--bundle <dir>` / `--model <gguf>` / `--converted <dir>` | model source, exactly one |
 | `--profile <name>` | bundle profile (default `compact-v1`) |
 | `--backend cpu\|cuda` | must be one of the probe's `backends` |
-| `--numerics exact\|fast` | bundle numerics tier. `exact` (default): bit-identical host forward. `fast`: the device-resident CUDA executor, gated on relative error and greedy agreement against `exact` (`qwen36_resident_parity`); falls back to `exact` where it cannot run (CPU backend, a bundle it does not serve, a request longer than its context). Must be one of the probe's `numerics`. |
+| `--numerics exact\|fast` | bundle numerics tier. `exact` (default): bit-identical host forward. `fast`: the device-resident CUDA executor, gated on relative error and greedy agreement against `exact` (`qwen36_resident_parity`); falls back to `exact` where it cannot run (a non-bundle source, the CPU backend, a bundle it does not serve, a request longer than its context); the fallback is noted on stderr, never an error. Must be one of the probe's `numerics`. |
 | `--ctx <N>` | context size: the most prompt + completion tokens one request may use, the same quantity as `llama-server -c`. Also sizes the fast tier's KV (capped at `fast_max_context`). |
 | `--host <ip>` `--port <N>` | bind address; non-loopback requires `TRITIUM_AUTH_TOKEN(S)` |
 | `--model-id <s>` | the id `/v1/models` reports and responses carry |
