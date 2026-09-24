@@ -24,11 +24,32 @@
 //! (ScaleQ/AYOT): GPTQ calibrated on fp-sampled text instead of WikiText train, and H6's Kronecker
 //! GPTQ (λ_G = 0.5).
 //!
+//! # PARTIAL 2026-09-24 — T=3, 5 of 8 models (run stopped by host memory pressure)
+//!
+//! ```text
+//! model                    ppl      even   KL wiki   KL self      late   agree
+//! RTN                   24.278  +0.07746   0.08650   0.09386  +0.05483    5.78
+//! RTN fold α=0.5        24.188  +0.07577   0.08484   0.09188  +0.06041    6.25
+//! GPTQ wiki 16k         24.177  +0.06620   0.07490   0.08655  +0.05651    6.91
+//! Kronecker GPTQ 16k    24.027  +0.06220   0.07148   0.08107  +0.05125    7.78
+//! GPTQ wiki 2k          24.375  +0.07415   0.08208   0.08997  +0.06316    3.88
+//! control: folded fp rebuilt through runner_for agrees 64.00/64 tokens
+//!
+//! Kendall τ vs on-policy KL (KL self): even +1.00, KL wiki +1.00, ppl +0.60, agree +0.60, late +0.20
+//! ```
+//!
+//! On these five, the curvature (`even`) and full-distribution KL on WikiText rank exactly as the
+//! on-policy KL does; perplexity does not. The disagreement is RTN vs 2k-token GPTQ: ppl puts the
+//! GPTQ fit last, but its curvature, WikiText KL and on-policy KL are all BETTER than RTN's — RTN's
+//! error happens to be aligned with the eval text (odd −0.009 vs −0.002), and ppl rewards that.
+//! Greedy agreement (32 prompts, heavy-tailed) sides with ppl; `late` is the noisiest column.
+//! Kronecker GPTQ is best on every metric. Self-trace calibration and the null pair are not in yet.
+//!
 //! ```text
 //! TRITIUM_CORPUS=$HOME/.cache/tritium-corpora/wikitext2_400k_32k.json \
 //!   cargo test -p tritium-nn --release --test metric_validity -- --ignored --nocapture
 //! ```
-//! Knobs: `TRITIUM_H5_TS` (default `3,2`).
+//! Knobs: `TRITIUM_H5_TS` (default `3,2`), `TRITIUM_H5_ONLY` (comma-separated model labels).
 
 mod common;
 
@@ -464,56 +485,64 @@ fn perplexity_against_on_policy_metrics() {
     }
 
     for &t in &ts {
-        let models = vec![
-            Model {
-                label: "RTN".into(),
-                weights: ladder_all(&folded, &shapes, t),
-                arch: arch.clone(),
-            },
-            Model {
-                label: "RTN fold α=0.5".into(),
-                weights: ladder_all(&folded_half, &shapes, t),
-                arch: arch_half.clone(),
-            },
-            Model {
-                label: "GPTQ wiki 16k".into(),
-                weights: gptq_all(&folded, &shapes, t, &g16, 16_384, None),
-                arch: arch.clone(),
-            },
-            Model {
-                label: "Kronecker GPTQ 16k".into(),
-                weights: gptq_all(&folded, &shapes, t, &g16, 16_384, Some(&fishers)),
-                arch: arch.clone(),
-            },
-            Model {
-                label: "GPTQ wiki 2k".into(),
-                weights: gptq_all(&folded, &shapes, t, &g2, 2_048, None),
-                arch: arch.clone(),
-            },
-            Model {
-                label: "GPTQ self-trace 16k".into(),
-                weights: gptq_all(&folded, &shapes, t, &gself, 16_384, None),
-                arch: arch.clone(),
-            },
-            Model {
-                label: "RTN signs A (null)".into(),
-                weights: signed_ladder_all(&folded, &shapes, t, 0xA),
-                arch: arch.clone(),
-            },
-            Model {
-                label: "RTN signs B (null)".into(),
-                weights: signed_ladder_all(&folded, &shapes, t, 0xB),
-                arch: arch.clone(),
-            },
+        // Built, scored and dropped one at a time: eight whole models held at once (plus their
+        // antithetic twins) was enough to trip the host's memory reaper.
+        const LABELS: [&str; 8] = [
+            "RTN",
+            "RTN fold α=0.5",
+            "GPTQ wiki 16k",
+            "Kronecker GPTQ 16k",
+            "GPTQ wiki 2k",
+            "GPTQ self-trace 16k",
+            "RTN signs A (null)",
+            "RTN signs B (null)",
         ];
+        let build = |label: &str| -> Model {
+            let (weights, arch) = match label {
+                "RTN" => (ladder_all(&folded, &shapes, t), arch.clone()),
+                "RTN fold α=0.5" => (ladder_all(&folded_half, &shapes, t), arch_half.clone()),
+                "GPTQ wiki 16k" => (
+                    gptq_all(&folded, &shapes, t, &g16, 16_384, None),
+                    arch.clone(),
+                ),
+                "Kronecker GPTQ 16k" => (
+                    gptq_all(&folded, &shapes, t, &g16, 16_384, Some(&fishers)),
+                    arch.clone(),
+                ),
+                "GPTQ wiki 2k" => (
+                    gptq_all(&folded, &shapes, t, &g2, 2_048, None),
+                    arch.clone(),
+                ),
+                "GPTQ self-trace 16k" => (
+                    gptq_all(&folded, &shapes, t, &gself, 16_384, None),
+                    arch.clone(),
+                ),
+                "RTN signs A (null)" => (signed_ladder_all(&folded, &shapes, t, 0xA), arch.clone()),
+                _ => (signed_ladder_all(&folded, &shapes, t, 0xB), arch.clone()),
+            };
+            Model {
+                label: label.to_owned(),
+                weights,
+                arch,
+            }
+        };
+        // `TRITIUM_H5_ONLY` (comma-separated labels) resumes a run that was cut short.
+        let only: Option<Vec<String>> = std::env::var("TRITIUM_H5_ONLY")
+            .ok()
+            .map(|v| v.split(',').map(|x| x.trim().to_owned()).collect());
         println!("T={t}");
         println!(
             "{:<22} {:>9} {:>9} {:>9} {:>9} {:>9} {:>7}",
             "model", "ppl", "even", "KL wiki", "KL self", "late", "agree"
         );
         let mut table: Vec<[f64; 6]> = Vec::new();
-        for m in &models {
+        for label in LABELS {
+            if only.as_ref().is_some_and(|o| !o.iter().any(|x| x == label)) {
+                continue;
+            }
             let started = Instant::now();
+            let model = build(label);
+            let m = &model;
             let base_fp = if m.label.contains("0.5") {
                 &folded_half
             } else {
