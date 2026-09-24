@@ -21,7 +21,8 @@
 //! The model set contains ordered pairs whose true order is known in advance (RTN vs GPTQ, 2k vs
 //! 16k calibration tokens) and one NULL pair — two random sign gauges that are equal in expectation
 //! — so each metric's noise can be read off it. It also contains the self-trace calibration arm
-//! (ScaleQ/AYOT): GPTQ calibrated on fp-sampled text instead of WikiText train.
+//! (ScaleQ/AYOT): GPTQ calibrated on fp-sampled text instead of WikiText train, and H6's Kronecker
+//! GPTQ (λ_G = 0.5).
 //!
 //! ```text
 //! TRITIUM_CORPUS=$HOME/.cache/tritium-corpora/wikitext2_400k_32k.json \
@@ -34,9 +35,12 @@ mod common;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use common::{Arch, Calib, calibrate, extract, fold, forward, perplexity_windowed};
+use common::{Arch, Calib, calibrate, extract, fold, forward, output_fishers, perplexity_windowed};
 use rayon::prelude::*;
-use tritium_nn::salt_fit::{ActivationAwareConfig, TapGrams, auto_decay, fit_tensor, fit_to_dense};
+use tritium_nn::salt_fit::{
+    ActivationAwareConfig, OutputMetric, TapGrams, auto_decay, fit_tensor, fit_tensor_kronecker,
+    fit_to_dense,
+};
 use tritium_nn::{DenseLinear, Mlp, ModelRunner, ModelWeights, Projection, TokenEmbedding};
 use tritium_train::Tape;
 use tritium_train::ops::ste::{self, RotationPolicy};
@@ -292,6 +296,7 @@ fn gptq_all(
     t: usize,
     grams: &TapGrams,
     tokens: usize,
+    fishers: Option<&[Vec<f64>]>,
 ) -> Vec<Vec<f32>> {
     w.iter()
         .zip(shapes)
@@ -323,8 +328,23 @@ fn gptq_all(
                 decay_ramp: false,
             };
             let a = grams.for_slot((i - 1) / 7, (i - 1) % 7);
-            fit_tensor(v, rows, cols, a, &cfg)
-                .map_or_else(ladder, |f| fit_to_dense(&f, rows, cols, GROUP, true))
+            let fits = match fishers {
+                // Kronecker GPTQ at H6's winning output-side decay.
+                Some(g) => fit_tensor_kronecker(
+                    v,
+                    rows,
+                    cols,
+                    a,
+                    &OutputMetric {
+                        gram: &g[i - 1],
+                        damp: 0.01,
+                        decay: 0.5,
+                    },
+                    &cfg,
+                ),
+                None => fit_tensor(v, rows, cols, a, &cfg),
+            };
+            fits.map_or_else(ladder, |f| fit_to_dense(&f, rows, cols, GROUP, true))
         })
         .collect()
 }
@@ -411,6 +431,7 @@ fn perplexity_against_on_policy_metrics() {
     let g16 = TapGrams::collect(&folded, &arch, &wiki16);
     let g2 = TapGrams::collect(&folded, &arch, &wiki2);
     let gself = TapGrams::collect(&folded, &arch, &trace);
+    let fishers = output_fishers(&folded, &arch, &wiki16, 0xF15E_A5ED);
 
     let fp_nll = perplexity_windowed(&folded, &arch, &eval_tokens, WINDOW).ln();
     let fp_late = nll_from(&reference, &late_windows, 512);
@@ -456,17 +477,22 @@ fn perplexity_against_on_policy_metrics() {
             },
             Model {
                 label: "GPTQ wiki 16k".into(),
-                weights: gptq_all(&folded, &shapes, t, &g16, 16_384),
+                weights: gptq_all(&folded, &shapes, t, &g16, 16_384, None),
+                arch: arch.clone(),
+            },
+            Model {
+                label: "Kronecker GPTQ 16k".into(),
+                weights: gptq_all(&folded, &shapes, t, &g16, 16_384, Some(&fishers)),
                 arch: arch.clone(),
             },
             Model {
                 label: "GPTQ wiki 2k".into(),
-                weights: gptq_all(&folded, &shapes, t, &g2, 2_048),
+                weights: gptq_all(&folded, &shapes, t, &g2, 2_048, None),
                 arch: arch.clone(),
             },
             Model {
                 label: "GPTQ self-trace 16k".into(),
-                weights: gptq_all(&folded, &shapes, t, &gself, 16_384),
+                weights: gptq_all(&folded, &shapes, t, &gself, 16_384, None),
                 arch: arch.clone(),
             },
             Model {
