@@ -338,6 +338,55 @@ pub fn fit_tensor(
     gram: &[f64],
     cfg: &ActivationAwareConfig,
 ) -> Option<Vec<(f32, Vec<Vec<i8>>)>> {
+    fit_tensor_impl(w, rows, cols, gram, None, cfg)
+}
+
+/// The output side of a Kronecker curvature `A ⊗ G` for [`fit_tensor_kronecker`].
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub struct OutputMetric<'a> {
+    /// `G = E[δ·δᵀ]` over the tensor's output (`rows × rows`), δ the loss gradient at the output.
+    pub gram: &'a [f64],
+    /// Tikhonov damping as a fraction of `mean(diag G)`.
+    pub damp: f64,
+    /// Fraction of each row's rounding error pushed into the rows after it (the output-side twin
+    /// of [`ActivationAwareConfig::decay`]). `0.0` switches the output side off exactly.
+    pub decay: f64,
+}
+
+/// [`fit_tensor`] against a Kronecker curvature `A ⊗ G`: input Gram `A` as usual, plus an output
+/// metric `G` that couples the rows (H6, first-principles plan).
+///
+/// Input-only GPTQ minimises `tr(E·A·Eᵀ)`, which treats every output row as equally and
+/// independently important; a diagonal `G` would not change a single rounding decision, because the
+/// rows would stay decoupled. This minimises `tr(G·E·A·Eᵀ)` by nearest-plane rounding on the
+/// Kronecker lattice, whose inverse-Cholesky factor is `chol(A⁻¹) ⊗ chol(G⁻¹)`: within each column
+/// the rows are rounded in order and each row's residual is pushed into the rows after it through
+/// `chol(G⁻¹)`, then the column's combined residual is pushed into the later columns through
+/// `chol(A⁻¹)` exactly as plain GPTQ does. With `G = I` or `decay = 0` it IS plain GPTQ, bit for bit.
+///
+/// The discrete search stage (`cfg.search_sweeps`) still prices moves in the input metric only.
+#[doc(hidden)]
+#[must_use]
+pub fn fit_tensor_kronecker(
+    w: &[f32],
+    rows: usize,
+    cols: usize,
+    gram: &[f64],
+    output: &OutputMetric<'_>,
+    cfg: &ActivationAwareConfig,
+) -> Option<Vec<(f32, Vec<Vec<i8>>)>> {
+    fit_tensor_impl(w, rows, cols, gram, Some(output), cfg)
+}
+
+fn fit_tensor_impl(
+    w: &[f32],
+    rows: usize,
+    cols: usize,
+    gram: &[f64],
+    output: Option<&OutputMetric<'_>>,
+    cfg: &ActivationAwareConfig,
+) -> Option<Vec<(f32, Vec<Vec<i8>>)>> {
     let group = cfg.group.max(1);
     let per_row = cols.div_ceil(group);
     let kmax = (3i64.pow(cfg.planes as u32) - 1) / 2;
@@ -358,6 +407,13 @@ pub fn fit_tensor(
         h_damped[a * cols + a] += cfg.damp * mean.max(1e-12);
     }
     let (_, chol) = damped_inverse_cholesky(&h, cols, cfg.damp)?;
+    let row_chol = match output {
+        Some(out) => Some((
+            damped_inverse_cholesky(out.gram, rows, out.damp)?.1,
+            out.decay,
+        )),
+        None => None,
+    };
 
     // ── GPTQ: quantize each column, push its residual into the columns still to come.
     let mut quantized = vec![0.0f32; rows * cols];
@@ -382,14 +438,54 @@ pub fn fit_tensor(
         } else {
             cfg.decay
         };
-        quantized
-            .par_chunks_mut(cols)
-            .zip(work.par_chunks_mut(cols))
-            .zip(steps.par_chunks(per_row))
-            .for_each(|((q, wr), d)| {
-                let value = ladder_quantize_at(wr[j], cfg.planes, d[block]);
-                q[j] = value;
-                let err = lambda * f64::from(wr[j] - value) / d_jj;
+        let Some((ug, row_decay)) = &row_chol else {
+            quantized
+                .par_chunks_mut(cols)
+                .zip(work.par_chunks_mut(cols))
+                .zip(steps.par_chunks(per_row))
+                .for_each(|((q, wr), d)| {
+                    let value = ladder_quantize_at(wr[j], cfg.planes, d[block]);
+                    q[j] = value;
+                    let err = lambda * f64::from(wr[j] - value) / d_jj;
+                    for j2 in (j + 1)..cols {
+                        wr[j2] -= (err * chol[j2 * cols + j]) as f32;
+                    }
+                });
+            continue;
+        };
+        // Output side: round this column's rows in order, pushing each row's residual into the
+        // rows below it through chol(G⁻¹) before they are rounded.
+        let mut residual = vec![0.0f64; rows];
+        let mut normalized = vec![0.0f64; rows];
+        for i in 0..rows {
+            let wi = work[i * cols + j];
+            let value = ladder_quantize_at(wi, cfg.planes, steps[i * per_row + block]);
+            quantized[i * cols + j] = value;
+            residual[i] = f64::from(wi - value);
+            let u_ii = ug[i * rows + i];
+            if u_ii <= 0.0 || !u_ii.is_finite() {
+                return None;
+            }
+            normalized[i] = residual[i] / u_ii;
+            if *row_decay != 0.0 {
+                for i2 in (i + 1)..rows {
+                    work[i2 * cols + j] -= (row_decay * normalized[i] * ug[i2 * rows + i]) as f32;
+                }
+            }
+        }
+        // The column's residual as the later columns see it: `chol(G⁻¹)·(residual / diag)`, whose
+        // diagonal term is the raw residual itself — kept exact so `G = I` reproduces plain GPTQ.
+        let pushed: Vec<f64> = (0..rows)
+            .into_par_iter()
+            .map(|i2| {
+                let off: f64 = (0..i2).map(|i| ug[i2 * rows + i] * normalized[i]).sum();
+                residual[i2] + row_decay * off
+            })
+            .collect();
+        work.par_chunks_mut(cols)
+            .zip(pushed.par_iter())
+            .for_each(|(wr, &r)| {
+                let err = lambda * r / d_jj;
                 for j2 in (j + 1)..cols {
                     wr[j2] -= (err * chol[j2 * cols + j]) as f32;
                 }
@@ -858,5 +954,150 @@ mod decay_tests {
         // Degenerate inputs pick the cautious end rather than NaN.
         assert_eq!(auto_decay(0, 576), 0.5);
         assert_eq!(auto_decay(4_096, 0), 0.5);
+    }
+
+    fn xorshift(seed: u64) -> impl FnMut() -> f64 {
+        let mut s = seed;
+        move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            ((s >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
+        }
+    }
+
+    /// A random SPD matrix `M·Mᵀ/n + ridge·I`, correlated when `ridge` is small.
+    fn spd(n: usize, ridge: f64, seed: u64) -> Vec<f64> {
+        let mut next = xorshift(seed);
+        let m: Vec<f64> = (0..n * n).map(|_| next()).collect();
+        let mut out = vec![0.0f64; n * n];
+        for i in 0..n {
+            for j in 0..n {
+                out[i * n + j] =
+                    (0..n).map(|p| m[i * n + p] * m[j * n + p]).sum::<f64>() / n as f64;
+            }
+            out[i * n + i] += ridge;
+        }
+        out
+    }
+
+    fn gptq_cfg(decay: f64) -> ActivationAwareConfig {
+        ActivationAwareConfig {
+            planes: 2,
+            group: 128,
+            grid: 16,
+            damp: 0.01,
+            search_sweeps: 0,
+            refit_scale: false,
+            rotate: true,
+            decay,
+            decay_ramp: false,
+        }
+    }
+
+    /// The Kronecker fitter must BE plain GPTQ when the output side carries no coupling: with
+    /// `G = I` (rows decoupled) and with an arbitrary `G` but `decay = 0` (coupling switched off).
+    #[test]
+    fn kronecker_gptq_without_row_coupling_is_plain_gptq() {
+        let (rows, cols) = (24usize, 256usize);
+        let mut next = xorshift(0xC0FF_EE11);
+        let w: Vec<f32> = (0..rows * cols).map(|_| next() as f32).collect();
+        let a = spd(cols, 0.05, 7);
+        let mut identity = vec![0.0f64; rows * rows];
+        for i in 0..rows {
+            identity[i * rows + i] = 1.0;
+        }
+        let g = spd(rows, 0.05, 11);
+        let cfg = gptq_cfg(0.75);
+        let plain = fit_tensor(&w, rows, cols, &a, &cfg).expect("plain");
+        for (label, gram, decay) in [("G = I", &identity, 1.0), ("decay 0", &g, 0.0)] {
+            let kron = fit_tensor_kronecker(
+                &w,
+                rows,
+                cols,
+                &a,
+                &OutputMetric {
+                    gram,
+                    damp: 0.01,
+                    decay,
+                },
+                &cfg,
+            )
+            .expect("kronecker");
+            assert_eq!(
+                kron, plain,
+                "{label}: Kronecker GPTQ must reduce to plain GPTQ"
+            );
+        }
+    }
+
+    /// `tr(G·E·A·Eᵀ)` in the rotated basis the fit works in, for a dense reconstruction.
+    fn kronecker_objective(
+        w: &[f32],
+        q: &[f32],
+        rows: usize,
+        cols: usize,
+        a: &[f64],
+        g: &[f64],
+    ) -> f64 {
+        let mut e: Vec<f64> = w.iter().zip(q).map(|(x, y)| f64::from(x - y)).collect();
+        for row in e.chunks_mut(cols) {
+            rotate_row_f64(row, 128);
+        }
+        let mut a_rot = a.to_vec();
+        rotate_gram(&mut a_rot, cols, 128);
+        // M = E·A (rows × cols), then tr(G·M·Eᵀ) = Σ_{i,i'} G[i,i'] (M_i · E_i').
+        let m: Vec<f64> = (0..rows * cols)
+            .map(|x| {
+                let (i, c) = (x / cols, x % cols);
+                (0..cols)
+                    .map(|p| e[i * cols + p] * a_rot[p * cols + c])
+                    .sum()
+            })
+            .collect();
+        let mut total = 0.0;
+        for i in 0..rows {
+            for i2 in 0..rows {
+                let dot: f64 = (0..cols).map(|c| m[i * cols + c] * e[i2 * cols + c]).sum();
+                total += g[i * rows + i2] * dot;
+            }
+        }
+        total
+    }
+
+    /// On a strongly row-correlated `G`, coupling the rows must lower the objective it targets.
+    #[test]
+    fn kronecker_gptq_lowers_the_kronecker_objective() {
+        let (rows, cols) = (32usize, 128usize);
+        let mut next = xorshift(0x5EED_0042);
+        let w: Vec<f32> = (0..rows * cols).map(|_| next() as f32).collect();
+        let a = spd(cols, 0.05, 3);
+        let g = spd(rows, 0.01, 5);
+        let cfg = gptq_cfg(1.0);
+        let dense = |fits: &[(f32, Vec<Vec<i8>>)]| fit_to_dense(fits, rows, cols, 128, true);
+        let plain = dense(&fit_tensor(&w, rows, cols, &a, &cfg).expect("plain"));
+        let kron = dense(
+            &fit_tensor_kronecker(
+                &w,
+                rows,
+                cols,
+                &a,
+                &OutputMetric {
+                    gram: &g,
+                    damp: 0.01,
+                    decay: 1.0,
+                },
+                &cfg,
+            )
+            .expect("kronecker"),
+        );
+        let (op, ok) = (
+            kronecker_objective(&w, &plain, rows, cols, &a, &g),
+            kronecker_objective(&w, &kron, rows, cols, &a, &g),
+        );
+        assert!(
+            ok < op,
+            "Kronecker objective {ok} not below plain GPTQ's {op}"
+        );
     }
 }
