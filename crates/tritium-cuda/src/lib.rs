@@ -79,7 +79,7 @@ pub use cuda::DeltaNetResidentState;
 #[cfg(feature = "cuda")]
 pub use cuda::{
     QWEN35_RESIDENT_MAX_CONTEXT, Qwen35Resident, Qwen35ResidentLayerSpec, Qwen35ResidentMixerSpec,
-    Qwen35ResidentSpec,
+    Qwen35ResidentSnapshot, Qwen35ResidentSpec,
 };
 
 // plan 0043 Stage 6: direct encoded D2/B3/S34 execution with explicit allocation

@@ -238,6 +238,32 @@ struct Scratch {
 const ARGMAX_BLOCKS: u32 = 128;
 const ARGMAX_THREADS: u32 = 1024;
 
+/// A saved copy of a [`Qwen35Resident`]'s recurrent state at one position, for
+/// resuming a sequence whose prefix was already decoded (prompt reuse).
+pub struct Qwen35ResidentSnapshot {
+    position: usize,
+    /// Per DeltaNet layer: (convolution state, recurrent state).
+    states: Vec<(CudaSlice<f32>, CudaSlice<f32>)>,
+}
+
+impl std::fmt::Debug for Qwen35ResidentSnapshot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Qwen35ResidentSnapshot")
+            .field("position", &self.position)
+            .field("layers", &self.states.len())
+            .finish()
+    }
+}
+
+impl Qwen35ResidentSnapshot {
+    /// Tokens consumed when the snapshot was taken.
+    #[must_use]
+    pub const fn position(&self) -> usize {
+        self.position
+    }
+}
+
 /// A Qwen3.5/Qwen3.6 decoder resident on one CUDA device.
 ///
 /// Built by [`CudaBackend::build_qwen35_resident`]. Holds its own KV cache and
@@ -804,6 +830,103 @@ impl Qwen35Resident {
     #[must_use]
     pub const fn position(&self) -> usize {
         self.position
+    }
+
+    /// Save every DeltaNet layer's convolution and recurrent state, and the
+    /// current position, into `snapshot` -- reusing its buffers when it already
+    /// holds a snapshot of this executor.
+    ///
+    /// Full-attention KV is not copied: a later [`Self::restore`] relies on the
+    /// cache still holding, below the snapshot's position, the same tokens it
+    /// held when the snapshot was taken. Positions at or past it are
+    /// overwritten as decoding resumes. The caller tracks that token identity.
+    ///
+    /// # Errors
+    /// Returns a driver failure.
+    pub fn save_snapshot(
+        &self,
+        snapshot: &mut Option<Qwen35ResidentSnapshot>,
+    ) -> Result<(), BackendError> {
+        let fresh = snapshot.is_none();
+        if fresh {
+            let mut states = Vec::new();
+            for layer in &self.layers {
+                if let Mixer::DeltaNet(state) = &layer.mixer {
+                    let alloc = |len: usize| {
+                        self.stream
+                            .alloc_zeros::<f32>(len)
+                            .map_err(|error| alloc_or_backend("allocate snapshot", &error, len * 4))
+                    };
+                    states.push((
+                        alloc(state.conv_state.len())?,
+                        alloc(state.recurrent_state.len())?,
+                    ));
+                }
+            }
+            *snapshot = Some(Qwen35ResidentSnapshot {
+                position: 0,
+                states,
+            });
+        }
+        let saved = snapshot.as_mut().expect("allocated above");
+        let mut index = 0;
+        for layer in &self.layers {
+            if let Mixer::DeltaNet(state) = &layer.mixer {
+                let (conv, recurrent) = saved
+                    .states
+                    .get_mut(index)
+                    .ok_or_else(|| invalid("snapshot belongs to a different executor"))?;
+                self.stream
+                    .memcpy_dtod(&state.conv_state, conv)
+                    .map_err(|error| driver_err("save conv state", &error))?;
+                self.stream
+                    .memcpy_dtod(&state.recurrent_state, recurrent)
+                    .map_err(|error| driver_err("save recurrent state", &error))?;
+                index += 1;
+            }
+        }
+        saved.position = self.position;
+        Ok(())
+    }
+
+    /// Return to a state saved by [`Self::save_snapshot`]: copy the DeltaNet
+    /// states back and rewind the position. Decoding from here is identical to
+    /// decoding after a fresh prefill of the snapshot's tokens, provided the KV
+    /// cache still holds those tokens below the snapshot's position (see
+    /// [`Self::save_snapshot`]).
+    ///
+    /// # Errors
+    /// Rejects a snapshot from a different executor, or returns a driver failure.
+    pub fn restore_snapshot(
+        &mut self,
+        snapshot: &Qwen35ResidentSnapshot,
+    ) -> Result<(), BackendError> {
+        let mut index = 0;
+        for layer in &mut self.layers {
+            if let Mixer::DeltaNet(state) = &mut layer.mixer {
+                let (conv, recurrent) = snapshot
+                    .states
+                    .get(index)
+                    .ok_or_else(|| invalid("snapshot belongs to a different executor"))?;
+                if conv.len() != state.conv_state.len()
+                    || recurrent.len() != state.recurrent_state.len()
+                {
+                    return Err(invalid("snapshot belongs to a different executor"));
+                }
+                self.stream
+                    .memcpy_dtod(conv, &mut state.conv_state)
+                    .map_err(|error| driver_err("restore conv state", &error))?;
+                self.stream
+                    .memcpy_dtod(recurrent, &mut state.recurrent_state)
+                    .map_err(|error| driver_err("restore recurrent state", &error))?;
+                index += 1;
+            }
+        }
+        if index != snapshot.states.len() {
+            return Err(invalid("snapshot belongs to a different executor"));
+        }
+        self.position = snapshot.position;
+        Ok(())
     }
 
     /// Start a new sequence: zero every recurrent, convolution and KV buffer.

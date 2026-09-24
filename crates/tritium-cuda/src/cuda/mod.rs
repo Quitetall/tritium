@@ -257,7 +257,7 @@ mod backend;
 pub use backend::deltanet::DeltaNetResidentState;
 pub use backend::qwen35_resident::{
     QWEN35_RESIDENT_MAX_CONTEXT, Qwen35Resident, Qwen35ResidentLayerSpec, Qwen35ResidentMixerSpec,
-    Qwen35ResidentSpec,
+    Qwen35ResidentSnapshot, Qwen35ResidentSpec,
 };
 #[cfg_attr(not(test), allow(unused_imports))]
 use backend::*;

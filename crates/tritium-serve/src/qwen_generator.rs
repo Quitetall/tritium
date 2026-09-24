@@ -24,9 +24,9 @@ pub enum QwenNumerics {
 pub struct QwenGenerator {
     model: tritium_nn::Qwen35SaltV2LanguageMtpModel,
     eos: u32,
-    /// The fast tier's executor and the context it was sized for, when built.
+    /// The fast tier's executor, when built.
     #[cfg(feature = "cuda")]
-    resident: Option<(tritium_cuda::Qwen35Resident, usize)>,
+    resident: Option<Resident>,
 }
 
 impl QwenGenerator {
@@ -70,7 +70,7 @@ impl QwenGenerator {
                     .runner()
                     .cuda_resident(context)
                     .map_err(|error| format!("resident executor: {error}"))?
-                    .map(|executor| (executor, context));
+                    .map(|executor| Resident::new(executor, context));
             }
             if generator.is_resident() {
                 eprintln!("tritium-serve: numerics fast: device-resident executor");
@@ -151,38 +151,201 @@ fn step_for(
     )
 }
 
+/// Prompt tokens two requests must share before a shared-prefix snapshot is
+/// taken: below this, re-prefilling is cheaper than tracking it.
+#[cfg(feature = "cuda")]
+const MIN_SHARED_PREFIX: usize = 16;
+
+/// One saved executor state and the tokens it stands for.
+#[cfg(feature = "cuda")]
+#[derive(Default)]
+struct Checkpoint {
+    tokens: Vec<u32>,
+    snapshot: Option<tritium_cuda::Qwen35ResidentSnapshot>,
+    valid: bool,
+}
+
+/// The fast tier's executor plus what prompt reuse needs to know about it.
+///
+/// A chat client resends the whole conversation every turn, and LAMU prepends
+/// the same system prompt to every request, so most of each prompt was decoded
+/// before. The executor's attention KV already holds those tokens; what a new
+/// request needs is the DeltaNet recurrent state as of the end of the shared
+/// prefix. Two checkpoints cover the common cases: the end of the last prompt
+/// (a follow-up turn extends it) and the longest prefix the last two prompts
+/// shared (a system prompt across conversations). A checkpoint is used only
+/// while the KV cache still holds its tokens below its position, which
+/// `kv_tokens` tracks exactly. Resuming is bit-identical to a fresh prefill
+/// (`resident_snapshot_resume_is_bit_identical_to_a_fresh_prefill`).
+/// `TRITIUM_PREFIX_REUSE=0` disables it.
+#[cfg(feature = "cuda")]
+struct Resident {
+    executor: tritium_cuda::Qwen35Resident,
+    context: usize,
+    /// The tokens the KV cache holds, in position order.
+    kv_tokens: Vec<u32>,
+    last_prompt: Vec<u32>,
+    prompt_end: Checkpoint,
+    shared: Checkpoint,
+    reuse: bool,
+}
+
+#[cfg(feature = "cuda")]
+impl Resident {
+    fn new(executor: tritium_cuda::Qwen35Resident, context: usize) -> Self {
+        Self {
+            executor,
+            context,
+            kv_tokens: Vec::new(),
+            last_prompt: Vec::new(),
+            prompt_end: Checkpoint::default(),
+            shared: Checkpoint::default(),
+            reuse: std::env::var("TRITIUM_PREFIX_REUSE").as_deref() != Ok("0"),
+        }
+    }
+
+    fn invalidate(&mut self) {
+        self.kv_tokens.clear();
+        self.last_prompt.clear();
+        self.prompt_end.valid = false;
+        self.shared.valid = false;
+    }
+
+    /// Save the executor's state as `which` for `tokens`.
+    fn checkpoint(&mut self, which: bool, tokens: &[u32]) -> Result<(), GenError> {
+        let slot = if which {
+            &mut self.shared
+        } else {
+            &mut self.prompt_end
+        };
+        self.executor
+            .save_snapshot(&mut slot.snapshot)
+            .map_err(|error| GenError::Backend(error.to_string()))?;
+        slot.tokens.clear();
+        slot.tokens.extend_from_slice(tokens);
+        slot.valid = true;
+        Ok(())
+    }
+
+    /// Feed `tokens` (non-empty), recording them as the KV cache's contents.
+    fn feed(&mut self, tokens: &[u32]) -> Result<u32, GenError> {
+        let next = self
+            .executor
+            .prefill(tokens)
+            .map_err(|error| GenError::Backend(error.to_string()))?;
+        self.kv_tokens.extend_from_slice(tokens);
+        Ok(next)
+    }
+
+    /// Position the executor to decode `prompt`: resume from the longest usable
+    /// checkpoint or start over, then decode every prompt token but the last.
+    /// Returns how many prompt tokens remain (always at least one).
+    fn prepare(&mut self, prompt: &[u32]) -> Result<usize, GenError> {
+        let backend = |error: tritium_spec::BackendError| GenError::Backend(error.to_string());
+        let length = prompt.len();
+        let usable = |slot: &Checkpoint, kv: &[u32]| {
+            slot.valid
+                && slot.tokens.len() < length
+                && prompt.starts_with(&slot.tokens)
+                && kv.starts_with(&slot.tokens)
+        };
+        let mut start = 0;
+        if self.reuse {
+            let candidates = [&self.prompt_end, &self.shared];
+            let best = candidates
+                .into_iter()
+                .filter(|slot| usable(slot, &self.kv_tokens))
+                .max_by_key(|slot| slot.tokens.len());
+            if let Some(slot) = best {
+                let snapshot = slot
+                    .snapshot
+                    .as_ref()
+                    .expect("a valid checkpoint holds a snapshot");
+                start = slot.tokens.len();
+                self.executor.restore_snapshot(snapshot).map_err(backend)?;
+            }
+        }
+        if start == 0 {
+            self.executor.reset().map_err(backend)?;
+        }
+        self.kv_tokens.truncate(start);
+        // A prefix this prompt shares with the last one, past what was reused,
+        // is likely shared by the next one too: checkpoint it on the way.
+        if self.reuse {
+            let shared = self
+                .last_prompt
+                .iter()
+                .zip(prompt)
+                .take_while(|(a, b)| a == b)
+                .count()
+                .min(length - 1);
+            if shared >= start + MIN_SHARED_PREFIX {
+                self.feed(&prompt[start..shared])?;
+                self.checkpoint(true, &prompt[..shared])?;
+                start = shared;
+            }
+        }
+        if start + 1 < length {
+            self.feed(&prompt[start..length - 1])?;
+        }
+        self.last_prompt.clear();
+        self.last_prompt.extend_from_slice(prompt);
+        Ok(1)
+    }
+}
+
 #[cfg(feature = "cuda")]
 impl QwenGenerator {
     /// Decode on the resident executor. Greedy requests without logprobs read
     /// back only the next token id; the rest read back the logits row.
     fn generate_resident(
-        executor: &mut tritium_cuda::Qwen35Resident,
+        resident: &mut Resident,
+        eos: u32,
+        request: &GenRequest,
+        max_new: usize,
+        on_step: &mut dyn FnMut(Step) -> bool,
+    ) -> Result<(), GenError> {
+        let result = Self::generate_resident_inner(resident, eos, request, max_new, on_step);
+        if result.is_err() {
+            // The executor may have stopped mid-sequence: trust nothing cached.
+            resident.invalidate();
+        }
+        result
+    }
+
+    fn generate_resident_inner(
+        resident: &mut Resident,
         eos: u32,
         request: &GenRequest,
         max_new: usize,
         on_step: &mut dyn FnMut(Step) -> bool,
     ) -> Result<(), GenError> {
         let backend = |error: tritium_spec::BackendError| GenError::Backend(error.to_string());
-        executor.reset().map_err(backend)?;
         let prompt = &request.prompt_tokens;
+        let (&final_prompt, _) = prompt.split_last().ok_or(GenError::ContextOverflow)?;
+        resident.prepare(prompt)?;
         let fast_greedy =
             matches!(request.sampling, Sampling::Greedy) && request.logprobs.is_none();
         if fast_greedy {
-            let mut token = executor.prefill(prompt).map_err(backend)?;
+            let mut token = resident.feed(&[final_prompt])?;
+            resident.checkpoint(false, prompt)?;
             for index in 0..max_new {
                 let (step, last) = step_for(token, index, max_new, eos, request, None);
                 if !on_step(step) || last {
                     break;
                 }
-                token = executor.step(token).map_err(backend)?;
+                let next = resident.executor.step(token).map_err(backend)?;
+                resident.kv_tokens.push(token);
+                token = next;
             }
             return Ok(());
         }
-        let (&final_prompt, rest) = prompt.split_last().ok_or(GenError::ContextOverflow)?;
-        if !rest.is_empty() {
-            executor.prefill(rest).map_err(backend)?;
-        }
-        let mut logits = executor.step_logits(final_prompt).map_err(backend)?;
+        let mut logits = resident
+            .executor
+            .step_logits(final_prompt)
+            .map_err(backend)?;
+        resident.kv_tokens.push(final_prompt);
+        resident.checkpoint(false, prompt)?;
         for index in 0..max_new {
             let token = Self::sample(&logits, &request.sampling, index as u64)
                 .ok_or_else(|| GenError::Backend("sampler produced no token".into()))?;
@@ -190,7 +353,8 @@ impl QwenGenerator {
             if !on_step(step) || last {
                 break;
             }
-            logits = executor.step_logits(token).map_err(backend)?;
+            logits = resident.executor.step_logits(token).map_err(backend)?;
+            resident.kv_tokens.push(token);
         }
         Ok(())
     }
@@ -203,15 +367,16 @@ impl Generator for QwenGenerator {
         on_step: &mut dyn FnMut(Step) -> bool,
     ) -> Result<(), GenError> {
         #[cfg(feature = "cuda")]
-        if let Some((executor, resident_context)) = self.resident.as_mut() {
+        if let Some(resident) = self.resident.as_mut() {
+            let resident_context = resident.context;
             let prompt_len = request.prompt_tokens.len();
             let max_new = request
                 .max_new
                 .min(resident_context.saturating_sub(prompt_len));
             // A request that fits the executor's context runs there; a longer one
             // falls through to the exact host path below.
-            if prompt_len != 0 && prompt_len + request.max_new <= *resident_context {
-                return Self::generate_resident(executor, self.eos, request, max_new, on_step);
+            if prompt_len != 0 && prompt_len + request.max_new <= resident_context {
+                return Self::generate_resident(resident, self.eos, request, max_new, on_step);
             }
         }
         let runner = self.model.runner();

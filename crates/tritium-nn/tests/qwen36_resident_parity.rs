@@ -99,3 +99,62 @@ fn resident_executor_tracks_the_host_forward_on_the_real_bundle() {
         "resident executor chose a different greedy token than the host forward"
     );
 }
+
+/// Prompt reuse: resuming from a snapshot must be indistinguishable from
+/// prefilling the whole prompt. Snapshot after prompt A, decode unrelated tokens
+/// (dirtying the recurrent state and the KV cache past A), restore, then feed B's
+/// suffix; the logits must equal a fresh prefill of B bit for bit.
+#[test]
+#[ignore = "needs TRITIUM_QWEN36_BUNDLE and a CUDA device"]
+fn resident_snapshot_resume_is_bit_identical_to_a_fresh_prefill() {
+    let Ok(bundle) = std::env::var("TRITIUM_QWEN36_BUNDLE") else {
+        eprintln!("skipping: set TRITIUM_QWEN36_BUNDLE");
+        return;
+    };
+    let profile =
+        std::env::var("TRITIUM_QWEN36_PROFILE").unwrap_or_else(|_| "compact-v1".to_owned());
+    let backend = tritium_cuda::CudaBackend::new(0).expect("cuda device");
+    let model = Qwen35SaltV2LanguageMtpModel::load_bundle_profile(
+        &PathBuf::from(bundle),
+        &profile,
+        Box::new(backend),
+    )
+    .expect("load bundle");
+    let mut executor = model
+        .runner()
+        .cuda_resident(128)
+        .expect("build executor")
+        .expect("this bundle should be eligible for the resident executor");
+    let suffix = [7734u32, 264, 2716, 13901, 24228, 1204, 13, 198];
+    let whole: Vec<u32> = PROMPT.iter().copied().chain(suffix).collect();
+
+    // Fresh: the whole of B in one sequence.
+    executor.reset().unwrap();
+    let (&last, rest) = whole.split_last().unwrap();
+    executor.prefill(rest).unwrap();
+    let fresh = executor.step_logits(last).unwrap();
+
+    // Resumed: A, snapshot, unrelated decoding, restore, then B's suffix.
+    executor.reset().unwrap();
+    executor.prefill(&PROMPT).unwrap();
+    let mut snapshot = None;
+    executor.save_snapshot(&mut snapshot).unwrap();
+    assert_eq!(snapshot.as_ref().unwrap().position(), PROMPT.len());
+    for token in [11u32, 22, 33, 44, 55, 66, 77, 88, 99, 111] {
+        executor.step(token).unwrap();
+    }
+    executor
+        .restore_snapshot(snapshot.as_ref().unwrap())
+        .unwrap();
+    assert_eq!(executor.position(), PROMPT.len());
+    let (&suffix_last, suffix_rest) = suffix.split_last().unwrap();
+    executor.prefill(suffix_rest).unwrap();
+    let resumed = executor.step_logits(suffix_last).unwrap();
+
+    let differing = fresh
+        .iter()
+        .zip(&resumed)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    assert_eq!(differing, 0, "{differing} logits differ after resume");
+}
