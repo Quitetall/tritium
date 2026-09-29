@@ -13,7 +13,11 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use opentelemetry::Context;
+use opentelemetry::trace::{SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId, TraceState};
 use tokio::sync::mpsc;
+use tracing_futures::Instrument;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 use tritium_nn::Tokenizer;
 
 use crate::admission::{Admission, AdmissionDecision, AdmissionPolicy};
@@ -846,57 +850,95 @@ fn build_router_inner(
             let metrics = metrics_state.clone();
             async move {
                 let started = Instant::now();
-                let identity = RequestIdentity::from_headers(req.headers());
-                let method = method_class(req.method());
-                let route = route_class(req.method(), req.uri().path());
                 let _request_metrics = RequestMetricsGuard::new(metrics.clone());
-                let presented = req
-                    .headers()
-                    .get(axum::http::header::AUTHORIZATION)
-                    .and_then(|value| value.to_str().ok())
-                    .and_then(|value| value.strip_prefix("Bearer "));
-                let response = match admission.authenticate(presented) {
+                let identity = match RequestIdentity::from_headers(req.headers()) {
+                    Some(identity) => identity,
                     None => {
-                        let mut response = api_error(
-                            StatusCode::UNAUTHORIZED,
-                            "invalid_request_error",
-                            "missing or invalid bearer token",
+                        metrics.observe_admission(StatusCode::SERVICE_UNAVAILABLE);
+                        return api_error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "service_unavailable",
+                            "secure request identity generation unavailable",
                             None,
                         );
-                        response.headers_mut().insert(
-                            axum::http::header::WWW_AUTHENTICATE,
-                            axum::http::HeaderValue::from_static("Bearer"),
-                        );
-                        response
-                    }
-                    Some(principal) => {
-                        let governed = req.method() == axum::http::Method::POST
-                            && matches!(
-                                req.uri().path(),
-                                "/v1/chat/completions" | "/v1/tree/session" | "/v1/tree/verify"
-                            );
-                        if governed
-                            && let AdmissionDecision::Reject { retry_after_secs } =
-                                admission.admit(principal)
-                        {
-                            metrics.rate_rejections.fetch_add(1, Ordering::Relaxed);
-                            let mut response = api_error(
-                                StatusCode::TOO_MANY_REQUESTS,
-                                "rate_limit_exceeded",
-                                "principal request rate exceeded; retry later",
-                                None,
-                            );
-                            if let Ok(value) = HeaderValue::from_str(&retry_after_secs.to_string())
-                            {
-                                response.headers_mut().insert(header::RETRY_AFTER, value);
-                            }
-                            response
-                        } else {
-                            next.run(req).await
-                        }
                     }
                 };
-                finish_request(response, &identity, method, route, started, &metrics)
+                let method = method_class(req.method());
+                let route = route_class(req.method(), req.uri().path());
+                let request_metrics = metrics.clone();
+                let span = tracing::info_span!(
+                    "http.server.request",
+                    request_id = %identity.request_id,
+                    trace_id = %identity.trace_id,
+                    http_route = route,
+                    http_method = method,
+                    http_status = tracing::field::Empty,
+                );
+                if let Some(parent) = identity.parent_context() {
+                    let _ = span.set_parent(parent);
+                }
+                async move {
+                    let presented = req
+                        .headers()
+                        .get(axum::http::header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .and_then(|value| value.strip_prefix("Bearer "));
+                    let response = match admission.authenticate(presented) {
+                        None => {
+                            let mut response = api_error(
+                                StatusCode::UNAUTHORIZED,
+                                "invalid_request_error",
+                                "missing or invalid bearer token",
+                                None,
+                            );
+                            response.headers_mut().insert(
+                                axum::http::header::WWW_AUTHENTICATE,
+                                axum::http::HeaderValue::from_static("Bearer"),
+                            );
+                            response
+                        }
+                        Some(principal) => {
+                            let governed = req.method() == axum::http::Method::POST
+                                && matches!(
+                                    req.uri().path(),
+                                    "/v1/chat/completions" | "/v1/tree/session" | "/v1/tree/verify"
+                                );
+                            if governed
+                                && let AdmissionDecision::Reject { retry_after_secs } =
+                                    admission.admit(principal)
+                            {
+                                request_metrics
+                                    .rate_rejections
+                                    .fetch_add(1, Ordering::Relaxed);
+                                let mut response = api_error(
+                                    StatusCode::TOO_MANY_REQUESTS,
+                                    "rate_limit_exceeded",
+                                    "principal request rate exceeded; retry later",
+                                    None,
+                                );
+                                if let Ok(value) =
+                                    HeaderValue::from_str(&retry_after_secs.to_string())
+                                {
+                                    response.headers_mut().insert(header::RETRY_AFTER, value);
+                                }
+                                response
+                            } else {
+                                next.run(req).await
+                            }
+                        }
+                    };
+                    tracing::Span::current().record("http_status", response.status().as_u16());
+                    finish_request(
+                        response,
+                        &identity,
+                        method,
+                        route,
+                        started,
+                        &request_metrics,
+                    )
+                }
+                .instrument(span)
+                .await
             }
         },
     ));
@@ -911,8 +953,6 @@ fn now_secs() -> u64 {
 }
 
 static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
-static REQUEST_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
-
 fn make_id() -> String {
     format!(
         "chatcmpl-{:016x}",
@@ -924,33 +964,87 @@ struct RequestIdentity {
     request_id: String,
     trace_id: String,
     span_id: String,
+    trace_flags: String,
+    parent_span_id: Option<String>,
 }
+
+const REQUEST_ID_ENTROPY_BYTES: usize = 16;
+const TRACE_ID_ENTROPY_BYTES: usize = 16;
+const SPAN_ID_ENTROPY_BYTES: usize = 8;
+const MAX_IDENTITY_ENTROPY_ATTEMPTS: usize = 4;
 
 impl RequestIdentity {
-    fn from_headers(headers: &axum::http::HeaderMap) -> Self {
-        let sequence = REQUEST_ID_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
-        let request_id = format!("tritium-req-{sequence:016x}");
-        let trace_id = headers
-            .get("traceparent")
-            .and_then(parse_traceparent_trace_id)
-            .unwrap_or_else(|| format!("{sequence:016x}{:016x}", !sequence));
-        let mut span_id = sequence.rotate_left(17) ^ 0x9e37_79b9_7f4a_7c15;
-        if span_id == 0 {
-            span_id = 1;
-        }
-        Self {
-            request_id,
-            trace_id,
-            span_id: format!("{span_id:016x}"),
-        }
+    fn from_headers(headers: &axum::http::HeaderMap) -> Option<Self> {
+        Self::from_headers_with_fill(headers, |bytes| getrandom::fill(bytes).is_ok())
     }
 
-    fn traceparent(&self) -> String {
-        format!("00-{}-{}-01", self.trace_id, self.span_id)
+    fn from_headers_with_fill(
+        headers: &axum::http::HeaderMap,
+        mut fill: impl FnMut(&mut [u8]) -> bool,
+    ) -> Option<Self> {
+        let mut entropy =
+            [0_u8; REQUEST_ID_ENTROPY_BYTES + TRACE_ID_ENTROPY_BYTES + SPAN_ID_ENTROPY_BYTES];
+        let parent = headers
+            .get("traceparent")
+            .and_then(parse_traceparent_parent);
+        for _ in 0..MAX_IDENTITY_ENTROPY_ATTEMPTS {
+            if !fill(&mut entropy) {
+                return None;
+            }
+            let generated_trace_id = &entropy
+                [REQUEST_ID_ENTROPY_BYTES..REQUEST_ID_ENTROPY_BYTES + TRACE_ID_ENTROPY_BYTES];
+            let generated_span_id = &entropy[REQUEST_ID_ENTROPY_BYTES + TRACE_ID_ENTROPY_BYTES..];
+            if entropy[..REQUEST_ID_ENTROPY_BYTES]
+                .iter()
+                .all(|byte| *byte == 0)
+                || generated_span_id.iter().all(|byte| *byte == 0)
+                || (parent.is_none() && generated_trace_id.iter().all(|byte| *byte == 0))
+            {
+                continue;
+            }
+
+            let request_id = format!("tritium-req-{}", hex(&entropy[..REQUEST_ID_ENTROPY_BYTES]));
+            let (trace_id, parent_span_id, trace_flags) = parent
+                .clone()
+                .map(|(trace_id, parent_id, flags)| (trace_id, Some(parent_id), flags))
+                .unwrap_or_else(|| (hex(generated_trace_id), None, "01".to_owned()));
+            return Some(Self {
+                request_id,
+                trace_id,
+                span_id: hex(generated_span_id),
+                trace_flags,
+                parent_span_id,
+            });
+        }
+        None
+    }
+
+    fn parent_context(&self) -> Option<Context> {
+        let span_id = SpanId::from_hex(self.parent_span_id.as_deref()?).ok()?;
+        let trace_id = TraceId::from_hex(&self.trace_id).ok()?;
+        let flags = u8::from_str_radix(&self.trace_flags, 16).ok()?;
+        let remote = SpanContext::new(
+            trace_id,
+            span_id,
+            TraceFlags::new(flags),
+            true,
+            TraceState::NONE,
+        );
+        Some(Context::new().with_remote_span_context(remote))
     }
 }
 
-fn parse_traceparent_trace_id(value: &HeaderValue) -> Option<String> {
+fn hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
+
+fn parse_traceparent_parent(value: &HeaderValue) -> Option<(String, String, String)> {
     let value = value.to_str().ok()?;
     if !value.is_ascii() || value.len() != 55 {
         return None;
@@ -971,7 +1065,12 @@ fn parse_traceparent_trace_id(value: &HeaderValue) -> Option<String> {
     if trace_id.bytes().all(|byte| byte == b'0') || parent_id.bytes().all(|byte| byte == b'0') {
         return None;
     }
-    Some(trace_id.to_ascii_lowercase())
+    let trace_flags = u8::from_str_radix(flags, 16).ok()? & 0x01;
+    Some((
+        trace_id.to_ascii_lowercase(),
+        parent_id.to_ascii_lowercase(),
+        format!("{trace_flags:02x}"),
+    ))
 }
 
 fn is_hex(value: &str) -> bool {
@@ -1034,19 +1133,36 @@ fn finish_request(
 ) -> Response {
     let status = response.status();
     metrics.observe_admission(status);
+    let current = tracing::Span::current().context();
+    let current_span = current.span();
+    let span_context = current_span.span_context();
+    let (trace_id, span_id, trace_flags) = if span_context.is_valid() {
+        (
+            span_context.trace_id().to_string(),
+            span_context.span_id().to_string(),
+            format!("{:02x}", span_context.trace_flags().to_u8()),
+        )
+    } else {
+        (
+            identity.trace_id.clone(),
+            identity.span_id.clone(),
+            identity.trace_flags.clone(),
+        )
+    };
     response.headers_mut().insert(
         "x-request-id",
         HeaderValue::from_str(&identity.request_id).expect("request id is valid header value"),
     );
     response.headers_mut().insert(
         "traceparent",
-        HeaderValue::from_str(&identity.traceparent()).expect("traceparent is valid header value"),
+        HeaderValue::from_str(&format!("00-{trace_id}-{span_id}-{trace_flags}"))
+            .expect("traceparent is valid header value"),
     );
     eprintln!(
         "{{\"event\":\"http_request\",\"request_id\":\"{}\",\"trace_id\":\"{}\",\"span_id\":\"{}\",\"route\":\"{}\",\"method\":\"{}\",\"status\":{},\"duration_us\":{},\"status_class\":\"{}\",\"error_code\":\"{}\"}}",
         identity.request_id,
-        identity.trace_id,
-        identity.span_id,
+        trace_id,
+        span_id,
         route,
         method,
         status.as_u16(),
@@ -1273,7 +1389,12 @@ async fn chat_completions(
             .iter()
             .map(|m| (m.role.as_str(), m.content.as_str())),
     );
-    let prompt_tokens = match st.tok.encode(&prompt_text) {
+    let tokenization_span = tracing::info_span!("model.tokenize");
+    let tokenized = {
+        let _entered = tokenization_span.enter();
+        st.tok.encode(&prompt_text)
+    };
+    let prompt_tokens = match tokenized {
         Ok(t) => t,
         Err(e) => {
             return api_error(
@@ -1343,8 +1464,16 @@ async fn chat_completions(
     // Start latency accounting before queue admission so generation duration
     // includes bounded queue wait, not only response-body consumption.
     let generation_started = Instant::now();
+    let request_span = tracing::Span::current();
+    let queue_span = tracing::info_span!(
+        parent: &request_span,
+        "model.queue",
+        queue_wait_us = tracing::field::Empty,
+    );
     match st.jobs.try_send(Job::Generate {
         req: gen_req,
+        request_span,
+        queue_span,
         accepted_at: Some(generation_started),
         tx,
     }) {
@@ -1545,7 +1674,17 @@ fn stream_response(
     });
     let generation_metrics =
         GenerationMetricsGuard::with_start(metrics.clone(), generation_started);
+    let request_span = tracing::Span::current();
+    let stream_span = tracing::info_span!(
+        parent: &request_span,
+        "http.server.stream",
+        emitted_tokens = tracing::field::Empty,
+        finish_reason = tracing::field::Empty,
+    );
     let stream = async_stream::stream! {
+        // Retain the request span until lazy SSE consumption finishes, rather
+        // than closing the root when only response headers have been sent.
+        let _request_span_lifetime = request_span;
         let mut generation_metrics = generation_metrics;
         let mut disconnect = StreamDisconnectGuard {
             metrics: metrics.clone(),
@@ -1661,8 +1800,11 @@ fn stream_response(
             }
         }
         disconnect.completed = true;
+        tracing::Span::current().record("emitted_tokens", completion_tokens);
+        tracing::Span::current().record("finish_reason", finish.as_str());
         yield Ok(Event::default().data("[DONE]"));
-    };
+    }
+    .instrument(stream_span);
     Sse::new(stream)
         .keep_alive(KeepAlive::default())
         .into_response()
@@ -2268,6 +2410,27 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
+    #[test]
+    fn request_identity_rejects_an_exhausted_zero_entropy_source() {
+        let headers = axum::http::HeaderMap::new();
+        let mut attempts = 0;
+        let identity = RequestIdentity::from_headers_with_fill(&headers, |bytes| {
+            attempts += 1;
+            bytes.fill(0);
+            true
+        });
+
+        assert!(identity.is_none());
+        assert_eq!(attempts, MAX_IDENTITY_ENTROPY_ATTEMPTS);
+    }
+
+    #[test]
+    fn request_identity_stops_when_secure_entropy_is_unavailable() {
+        let headers = axum::http::HeaderMap::new();
+        let identity = RequestIdentity::from_headers_with_fill(&headers, |_| false);
+
+        assert!(identity.is_none());
+    }
 
     struct BackendFail;
 
