@@ -846,9 +846,11 @@ fn build_router_inner(
             let metrics = metrics_state.clone();
             async move {
                 let started = Instant::now();
+                let _request_metrics = RequestMetricsGuard::new(metrics.clone());
                 let identity = match RequestIdentity::from_headers(req.headers()) {
-                    Ok(identity) => identity,
-                    Err(_) => {
+                    Some(identity) => identity,
+                    None => {
+                        metrics.observe_admission(StatusCode::SERVICE_UNAVAILABLE);
                         return api_error(
                             StatusCode::SERVICE_UNAVAILABLE,
                             "service_unavailable",
@@ -859,7 +861,6 @@ fn build_router_inner(
                 };
                 let method = method_class(req.method());
                 let route = route_class(req.method(), req.uri().path());
-                let _request_metrics = RequestMetricsGuard::new(metrics.clone());
                 let presented = req
                     .headers()
                     .get(axum::http::header::AUTHORIZATION)
@@ -938,20 +939,33 @@ struct RequestIdentity {
 const REQUEST_ID_ENTROPY_BYTES: usize = 16;
 const TRACE_ID_ENTROPY_BYTES: usize = 16;
 const SPAN_ID_ENTROPY_BYTES: usize = 8;
+const MAX_IDENTITY_ENTROPY_ATTEMPTS: usize = 4;
 
 impl RequestIdentity {
-    fn from_headers(headers: &axum::http::HeaderMap) -> Result<Self, getrandom::Error> {
+    fn from_headers(headers: &axum::http::HeaderMap) -> Option<Self> {
+        Self::from_headers_with_fill(headers, |bytes| getrandom::fill(bytes).is_ok())
+    }
+
+    fn from_headers_with_fill(
+        headers: &axum::http::HeaderMap,
+        mut fill: impl FnMut(&mut [u8]) -> bool,
+    ) -> Option<Self> {
         let mut entropy =
             [0_u8; REQUEST_ID_ENTROPY_BYTES + TRACE_ID_ENTROPY_BYTES + SPAN_ID_ENTROPY_BYTES];
         let parent = headers
             .get("traceparent")
             .and_then(parse_traceparent_parent);
-        loop {
-            getrandom::fill(&mut entropy)?;
+        for _ in 0..MAX_IDENTITY_ENTROPY_ATTEMPTS {
+            if !fill(&mut entropy) {
+                return None;
+            }
             let generated_trace_id = &entropy
                 [REQUEST_ID_ENTROPY_BYTES..REQUEST_ID_ENTROPY_BYTES + TRACE_ID_ENTROPY_BYTES];
             let generated_span_id = &entropy[REQUEST_ID_ENTROPY_BYTES + TRACE_ID_ENTROPY_BYTES..];
-            if generated_span_id.iter().all(|byte| *byte == 0)
+            if entropy[..REQUEST_ID_ENTROPY_BYTES]
+                .iter()
+                .all(|byte| *byte == 0)
+                || generated_span_id.iter().all(|byte| *byte == 0)
                 || (parent.is_none() && generated_trace_id.iter().all(|byte| *byte == 0))
             {
                 continue;
@@ -961,13 +975,14 @@ impl RequestIdentity {
             let (trace_id, trace_flags) = parent
                 .clone()
                 .unwrap_or_else(|| (hex(generated_trace_id), "01".to_owned()));
-            return Ok(Self {
+            return Some(Self {
                 request_id,
                 trace_id,
                 span_id: hex(generated_span_id),
                 trace_flags,
             });
         }
+        None
     }
 
     fn traceparent(&self) -> String {
@@ -2304,6 +2319,28 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
+
+    #[test]
+    fn request_identity_rejects_an_exhausted_zero_entropy_source() {
+        let headers = axum::http::HeaderMap::new();
+        let mut attempts = 0;
+        let identity = RequestIdentity::from_headers_with_fill(&headers, |bytes| {
+            attempts += 1;
+            bytes.fill(0);
+            true
+        });
+
+        assert!(identity.is_none());
+        assert_eq!(attempts, MAX_IDENTITY_ENTROPY_ATTEMPTS);
+    }
+
+    #[test]
+    fn request_identity_stops_when_secure_entropy_is_unavailable() {
+        let headers = axum::http::HeaderMap::new();
+        let identity = RequestIdentity::from_headers_with_fill(&headers, |_| false);
+
+        assert!(identity.is_none());
+    }
 
     struct BackendFail;
 
