@@ -1,0 +1,91 @@
+{
+  "schema": "tritium.serve.dashboard-metrics.v1",
+  "title": "Tritium Serving",
+  "refresh": "30s",
+  "metrics": [
+    {
+      "name": "tritium_chat_requests_total",
+      "type": "counter",
+      "unit": "reqps",
+      "help": "Chat completions accepted into the queue.",
+      "panel": {
+        "title": "Accepted requests / second",
+        "description": "Accepted chat completions per second, five-minute rate.",
+        "expr": "sum(rate(tritium_chat_requests_total[5m]))",
+        "legend": "requests/s"
+      }
+    },
+    {
+      "name": "tritium_tokens_out_total",
+      "type": "counter",
+      "unit": "tok/s",
+      "help": "Completion tokens emitted to clients.",
+      "panel": {
+        "title": "Generated tokens / second",
+        "description": "Completion tokens emitted to clients per second.",
+        "expr": "sum(rate(tritium_tokens_out_total[5m]))",
+        "legend": "tokens/s"
+      }
+    },
+    {
+      "name": "tritium_time_to_first_token_seconds",
+      "type": "histogram",
+      "unit": "s",
+      "help": "Time from generation admission to first emitted token.",
+      "panel": {
+        "title": "Time to first token (p95)",
+        "description": "95th percentile from the exported fixed-bucket histogram.",
+        "expr": "histogram_quantile(0.95, sum by (le) (rate(tritium_time_to_first_token_seconds_bucket[5m])))",
+        "legend": "p95"
+      }
+    },
+    {
+      "name": "tritium_queue_depth",
+      "type": "gauge",
+      "unit": "short",
+      "help": "Jobs waiting in the decode queue.",
+      "panel": {
+        "title": "Decode queue depth",
+        "description": "Current number of jobs waiting for the decode worker.",
+        "expr": "tritium_queue_depth",
+        "legend": "queued"
+      }
+    },
+    {
+      "name": "tritium_queue_wait_seconds",
+      "type": "histogram",
+      "unit": "s",
+      "help": "Time from accepted request to decode-worker admission.",
+      "panel": {
+        "title": "Queue wait (p95)",
+        "description": "95th percentile request queue wait, from the exported fixed-bucket histogram.",
+        "expr": "histogram_quantile(0.95, sum by (le) (rate(tritium_queue_wait_seconds_bucket[5m])))",
+        "legend": "p95"
+      }
+    },
+    {
+      "name": "tritium_backend_faults_total",
+      "type": "counter",
+      "unit": "ops",
+      "help": "Backend faults observed by the decode worker.",
+      "panel": {
+        "title": "Backend faults / second",
+        "description": "Decode backend faults per second. Any sustained nonzero rate needs investigation.",
+        "expr": "sum(rate(tritium_backend_faults_total[5m]))",
+        "legend": "faults/s"
+      }
+    },
+    {
+      "name": "tritium_artifact_resident_bytes",
+      "type": "gauge",
+      "unit": "bytes",
+      "help": "Steady-state bytes resident for the admitted model.",
+      "panel": {
+        "title": "Resident model bytes",
+        "description": "Steady-state bytes resident for the admitted serving artifact.",
+        "expr": "tritium_artifact_resident_bytes",
+        "legend": "resident bytes"
+      }
+    }
+  ]
+}
