@@ -924,16 +924,22 @@ struct RequestIdentity {
     request_id: String,
     trace_id: String,
     span_id: String,
+    trace_flags: String,
 }
 
 impl RequestIdentity {
     fn from_headers(headers: &axum::http::HeaderMap) -> Self {
         let sequence = REQUEST_ID_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
         let request_id = format!("tritium-req-{sequence:016x}");
-        let trace_id = headers
+        let parent = headers
             .get("traceparent")
-            .and_then(parse_traceparent_trace_id)
-            .unwrap_or_else(|| format!("{sequence:016x}{:016x}", !sequence));
+            .and_then(parse_traceparent_parent);
+        let (trace_id, trace_flags) = parent.unwrap_or_else(|| {
+            (
+                format!("{sequence:016x}{:016x}", !sequence),
+                "01".to_owned(),
+            )
+        });
         let mut span_id = sequence.rotate_left(17) ^ 0x9e37_79b9_7f4a_7c15;
         if span_id == 0 {
             span_id = 1;
@@ -942,15 +948,16 @@ impl RequestIdentity {
             request_id,
             trace_id,
             span_id: format!("{span_id:016x}"),
+            trace_flags,
         }
     }
 
     fn traceparent(&self) -> String {
-        format!("00-{}-{}-01", self.trace_id, self.span_id)
+        format!("00-{}-{}-{}", self.trace_id, self.span_id, self.trace_flags)
     }
 }
 
-fn parse_traceparent_trace_id(value: &HeaderValue) -> Option<String> {
+fn parse_traceparent_parent(value: &HeaderValue) -> Option<(String, String)> {
     let value = value.to_str().ok()?;
     if !value.is_ascii() || value.len() != 55 {
         return None;
@@ -971,7 +978,8 @@ fn parse_traceparent_trace_id(value: &HeaderValue) -> Option<String> {
     if trace_id.bytes().all(|byte| byte == b'0') || parent_id.bytes().all(|byte| byte == b'0') {
         return None;
     }
-    Some(trace_id.to_ascii_lowercase())
+    let trace_flags = u8::from_str_radix(flags, 16).ok()? & 0x01;
+    Some((trace_id.to_ascii_lowercase(), format!("{trace_flags:02x}")))
 }
 
 fn is_hex(value: &str) -> bool {

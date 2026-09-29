@@ -303,6 +303,21 @@ async fn request_identity_headers_propagate_without_unbounded_cardinality() {
     assert_eq!(&traceparent[3..35], "4bf92f3577b34da6a3ce929d0e0e4736");
     assert_ne!(&traceparent[36..52], "00f067aa0ba902b7");
 
+    let unsampled = Request::get("/healthz")
+        .header(
+            "traceparent",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00",
+        )
+        .body(Body::empty())
+        .unwrap();
+    let response = router.clone().oneshot(unsampled).await.unwrap();
+    let traceparent = response
+        .headers()
+        .get("traceparent")
+        .and_then(|value| value.to_str().ok())
+        .unwrap();
+    assert_eq!(&traceparent[53..55], "00");
+
     let invalid = Request::get("/healthz")
         .header("traceparent", "not-a-trace-context")
         .body(Body::empty())
