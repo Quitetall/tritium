@@ -9,6 +9,21 @@ second-machine gates remain separate.
 
 ## Gate status (measured 2026-09-03)
 
+### Flagship campaign refresh (2026-09-29)
+
+The pinned Qwen3.6-27B additive-master campaign is now **sealed**, not in flight:
+the durable campaign workspace contains its completion record and all 506
+additive tensor-master slots. This closes the long-running tensor-fitting step
+only. It is not a deployable Qwen bundle or release qualification: conversion
+refinement, held-out quality, task retention, native runtime, physical-byte
+accounting, package admission, and candidate-bound receipts remain required.
+
+The operational probe reports the workspace seal but is explicitly
+non-authoritative. The completion record and campaign catalog have not yet been
+reopened and bound into a candidate-specific release receipt. The historical
+gate inventory below predates this completion and must not be read as the
+current campaign liveness status.
+
 ### Latest local verification (2026-09-18, `570a8802`)
 
 `scripts/verify-gates.sh release` completed with exit status 0 after the
@@ -237,15 +252,23 @@ unmanifested file.
 ## Assemble and verify
 
 ```bash
-cargo build --release -p tritium-cli
+RUSTC_WRAPPER= cargo build --release -p tritium-cli
+export TRITIUM_BIN="$(cargo metadata --no-deps --format-version 1 \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')/release/tritium"
+test -x "$TRITIUM_BIN"
 python scripts/assemble-release-candidate.py \
   --inputs /tmp/tritium-v1.1-inputs.json \
   --output release/v1.1/manifest.json \
-  --digest-tool target/release/tritium
+  --digest-tool "$TRITIUM_BIN"
 scripts/release-status \
   --candidate release/v1.1/manifest.json \
-  --digest-tool target/release/tritium
+  --digest-tool "$TRITIUM_BIN"
 ```
+
+The build uses an empty `RUSTC_WRAPPER` to avoid inheriting a stale local
+`sccache` setting. Keep this shell open for the later commands below: they use
+`$TRITIUM_BIN`, which is derived from Cargo's configured target directory rather
+than assuming the binary lives under the repository's `target/` directory.
 
 Assembly sorts artifacts by ID, streams SHA-256/BLAKE3 through shipped CLI,
 writes canonical in-toto/SLSA v1 statements, fsyncs data and directories, then
@@ -303,7 +326,7 @@ python scripts/generate-bundle-sbom.py \
   --artifact-id qwen-onnx \
   --kind onnx-bundle \
   --source-revision "$(git rev-parse HEAD)" \
-  --digest-tool target/release/tritium \
+  --digest-tool "$TRITIUM_BIN" \
   --output release/v1.1/qwen-onnx.cdx.json
 ```
 
@@ -327,7 +350,7 @@ python scripts/generate-deployment-sbom.py \
   --kind helm-chart \
   --release 1.1.0-rc.2 \
   --source-revision "$(git rev-parse HEAD)" \
-  --digest-tool target/release/tritium \
+  --digest-tool "$TRITIUM_BIN" \
   --output release/v1.1/tritium-helm.cdx.json
 ```
 
@@ -410,7 +433,7 @@ scripts/release-status \
   --candidate release/v1.1/manifest.json \
   --registry release/v1.1-evidence/registry.json \
   --json-output release/v1.1-evidence/status.json \
-  --digest-tool target/release/tritium
+  --digest-tool "$TRITIUM_BIN"
 ```
 
 The ADR 0033 gate list is compiled into the status tool rather than supplied by
@@ -444,14 +467,14 @@ python scripts/local-rc-signoff.py seal \
   --report release/v1.1-evidence/status.json \
   --registry release/v1.1-evidence/registry.json \
   --candidate release/v1.1/manifest.json \
-  --digest-tool target/release/tritium \
+  --digest-tool "$TRITIUM_BIN" \
   --principal release-maintainer --key /secure/release-key \
   --output release/v1.1-evidence/signoff.json
 python scripts/local-rc-signoff.py verify \
   --report release/v1.1-evidence/status.json \
   --registry release/v1.1-evidence/registry.json \
   --candidate release/v1.1/manifest.json \
-  --digest-tool target/release/tritium \
+  --digest-tool "$TRITIUM_BIN" \
   --principal release-maintainer \
   --statement release/v1.1-evidence/signoff.json \
   --signature release/v1.1-evidence/signoff.json.sig \
