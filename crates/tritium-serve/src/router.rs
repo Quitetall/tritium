@@ -846,7 +846,17 @@ fn build_router_inner(
             let metrics = metrics_state.clone();
             async move {
                 let started = Instant::now();
-                let identity = RequestIdentity::from_headers(req.headers());
+                let identity = match RequestIdentity::from_headers(req.headers()) {
+                    Ok(identity) => identity,
+                    Err(_) => {
+                        return api_error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "service_unavailable",
+                            "secure request identity generation unavailable",
+                            None,
+                        );
+                    }
+                };
                 let method = method_class(req.method());
                 let route = route_class(req.method(), req.uri().path());
                 let _request_metrics = RequestMetricsGuard::new(metrics.clone());
@@ -911,8 +921,6 @@ fn now_secs() -> u64 {
 }
 
 static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
-static REQUEST_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
-
 fn make_id() -> String {
     format!(
         "chatcmpl-{:016x}",
@@ -927,34 +935,54 @@ struct RequestIdentity {
     trace_flags: String,
 }
 
+const REQUEST_ID_ENTROPY_BYTES: usize = 16;
+const TRACE_ID_ENTROPY_BYTES: usize = 16;
+const SPAN_ID_ENTROPY_BYTES: usize = 8;
+
 impl RequestIdentity {
-    fn from_headers(headers: &axum::http::HeaderMap) -> Self {
-        let sequence = REQUEST_ID_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
-        let request_id = format!("tritium-req-{sequence:016x}");
+    fn from_headers(headers: &axum::http::HeaderMap) -> Result<Self, getrandom::Error> {
+        let mut entropy =
+            [0_u8; REQUEST_ID_ENTROPY_BYTES + TRACE_ID_ENTROPY_BYTES + SPAN_ID_ENTROPY_BYTES];
         let parent = headers
             .get("traceparent")
             .and_then(parse_traceparent_parent);
-        let (trace_id, trace_flags) = parent.unwrap_or_else(|| {
-            (
-                format!("{sequence:016x}{:016x}", !sequence),
-                "01".to_owned(),
-            )
-        });
-        let mut span_id = sequence.rotate_left(17) ^ 0x9e37_79b9_7f4a_7c15;
-        if span_id == 0 {
-            span_id = 1;
-        }
-        Self {
-            request_id,
-            trace_id,
-            span_id: format!("{span_id:016x}"),
-            trace_flags,
+        loop {
+            getrandom::fill(&mut entropy)?;
+            let generated_trace_id = &entropy
+                [REQUEST_ID_ENTROPY_BYTES..REQUEST_ID_ENTROPY_BYTES + TRACE_ID_ENTROPY_BYTES];
+            let generated_span_id = &entropy[REQUEST_ID_ENTROPY_BYTES + TRACE_ID_ENTROPY_BYTES..];
+            if generated_span_id.iter().all(|byte| *byte == 0)
+                || (parent.is_none() && generated_trace_id.iter().all(|byte| *byte == 0))
+            {
+                continue;
+            }
+
+            let request_id = format!("tritium-req-{}", hex(&entropy[..REQUEST_ID_ENTROPY_BYTES]));
+            let (trace_id, trace_flags) = parent
+                .clone()
+                .unwrap_or_else(|| (hex(generated_trace_id), "01".to_owned()));
+            return Ok(Self {
+                request_id,
+                trace_id,
+                span_id: hex(generated_span_id),
+                trace_flags,
+            });
         }
     }
 
     fn traceparent(&self) -> String {
         format!("00-{}-{}-{}", self.trace_id, self.span_id, self.trace_flags)
     }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
 }
 
 fn parse_traceparent_parent(value: &HeaderValue) -> Option<(String, String)> {

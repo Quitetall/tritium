@@ -83,6 +83,7 @@ tritium-onnx = { path = "crates/tritium-onnx", version = "1.1.0-rc.2", default-f
 # foundation
 bytemuck = "1"
 blake3 = "1"
+getrandom = "0.3.4"
 half = "2"
 linkme = "0.3"
 # cpu

@@ -294,6 +294,7 @@ async fn request_identity_headers_propagate_without_unbounded_cardinality() {
         .and_then(|value| value.to_str().ok())
         .unwrap();
     assert!(request_id.starts_with("tritium-req-"));
+    let request_id = request_id.to_owned();
     let traceparent = response
         .headers()
         .get("traceparent")
@@ -302,6 +303,7 @@ async fn request_identity_headers_propagate_without_unbounded_cardinality() {
     assert_eq!(traceparent.len(), 55);
     assert_eq!(&traceparent[3..35], "4bf92f3577b34da6a3ce929d0e0e4736");
     assert_ne!(&traceparent[36..52], "00f067aa0ba902b7");
+    let child_span_id = traceparent[36..52].to_owned();
 
     let unsampled = Request::get("/healthz")
         .header(
@@ -317,12 +319,22 @@ async fn request_identity_headers_propagate_without_unbounded_cardinality() {
         .and_then(|value| value.to_str().ok())
         .unwrap();
     assert_eq!(&traceparent[53..55], "00");
+    assert_eq!(&traceparent[3..35], "4bf92f3577b34da6a3ce929d0e0e4736");
+    assert_ne!(&traceparent[36..52], child_span_id);
+    assert!(traceparent[36..52].bytes().any(|byte| byte != b'0'));
+    assert_ne!(
+        response
+            .headers()
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok()),
+        Some(request_id.as_str())
+    );
 
     let invalid = Request::get("/healthz")
         .header("traceparent", "not-a-trace-context")
         .body(Body::empty())
         .unwrap();
-    let response = router.oneshot(invalid).await.unwrap();
+    let response = router.clone().oneshot(invalid).await.unwrap();
     let traceparent = response
         .headers()
         .get("traceparent")
@@ -330,6 +342,26 @@ async fn request_identity_headers_propagate_without_unbounded_cardinality() {
         .unwrap();
     assert_eq!(traceparent.len(), 55);
     assert_ne!(&traceparent[3..35], "00000000000000000000000000000000");
+    assert!(traceparent[36..52].bytes().any(|byte| byte != b'0'));
+    assert_eq!(&traceparent[53..55], "01");
+    assert!(
+        [&traceparent[3..35], &traceparent[36..52]]
+            .into_iter()
+            .flat_map(str::bytes)
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    );
+    let generated_trace_id = traceparent[3..35].to_owned();
+
+    let response = router
+        .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let traceparent = response
+        .headers()
+        .get("traceparent")
+        .and_then(|value| value.to_str().ok())
+        .unwrap();
+    assert_ne!(&traceparent[3..35], generated_trace_id);
 }
 
 /// Split an SSE body into its `data:` payloads (keep-alive comment lines skipped).
