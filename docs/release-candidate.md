@@ -9,20 +9,27 @@ second-machine gates remain separate.
 
 ## Gate status (measured 2026-09-03)
 
-### Flagship campaign refresh (2026-09-29)
+### Flagship campaign verification refresh (2026-09-29)
 
-The pinned Qwen3.6-27B additive-master campaign is now **sealed**, not in flight:
-the durable campaign workspace contains its completion record and all 506
-additive tensor-master slots. This closes the long-running tensor-fitting step
-only. It is not a deployable Qwen bundle or release qualification: conversion
-refinement, held-out quality, task retention, native runtime, physical-byte
-accounting, package admission, and candidate-bound receipts remain required.
+The previous refresh reported the pinned Qwen3.6-27B additive-master campaign
+as sealed with all 506 tensor-master slots. That completion is **not currently
+independently verifiable from the canonical workspaces checked**. The read-only
+`scripts/qwen36-ptq-status.py` probe reports `idle`, zero published masters, and
+zero seals for both `/mnt/4tb/tritium-qwen36-work` and
+`/mnt/4tb/tritium-qwen36-work-current`; these contain source-admission files,
+not the campaign catalog. Therefore the long-running fitting step remains
+`UNKNOWN` until the canonical campaign workspace and its seal can be reopened
+and verified. Do not interpret the earlier completion claim as a release gate
+pass.
 
-The operational probe reports the workspace seal but is explicitly
-non-authoritative. The completion record and campaign catalog have not yet been
-reopened and bound into a candidate-specific release receipt. The historical
-gate inventory below predates this completion and must not be read as the
-current campaign liveness status.
+Two bundle variants exist under `/mnt/4tb/tmp` with the same campaign and
+completion IDs but different selection IDs. Both manifests declare
+`complete_model: false`, `official_payload_authenticated: false`, and
+`source_identity_status: measured-awaiting-official-registration`. They are
+useful conversion outputs, not admissible complete-model release artifacts.
+Neither variant is bound to a candidate-specific flagship receipt. The
+historical gate inventory below predates this refresh and must not be read as
+current campaign liveness.
 
 ### Latest local verification (2026-09-18, `570a8802`)
 
