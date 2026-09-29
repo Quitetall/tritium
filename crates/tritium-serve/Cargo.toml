@@ -21,6 +21,13 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 blake3 = { workspace = true, optional = true }
 getrandom = { workspace = true, optional = true }
+opentelemetry = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+tracing-futures = { workspace = true, optional = true }
+tracing-opentelemetry = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
 
 # The HTTP/SSE server, behind the `serve` feature (mirrors tritium-cuda/wgpu's gate).
 tokio = { workspace = true, optional = true }
@@ -36,7 +43,7 @@ tritium-format = { workspace = true, optional = true }
 
 [features]
 default = []
-serve = ["dep:tokio", "dep:axum", "dep:tower", "dep:async-stream", "dep:futures-core", "dep:blake3", "dep:getrandom", "dep:tritium-cpu", "dep:tritium-runtime", "dep:tritium-format", "tritium-nn/tokenizer"]
+serve = ["dep:tokio", "dep:axum", "dep:tower", "dep:async-stream", "dep:futures-core", "dep:blake3", "dep:getrandom", "dep:opentelemetry", "dep:opentelemetry-otlp", "dep:opentelemetry_sdk", "dep:tracing", "dep:tracing-futures", "dep:tracing-opentelemetry", "dep:tracing-subscriber", "dep:tritium-cpu", "dep:tritium-runtime", "dep:tritium-format", "tritium-nn/tokenizer"]
 # Link the CUDA backend so `--backend cuda` can resolve (needs nvcc at build time).
 cuda = ["serve", "dep:tritium-cuda", "tritium-nn/cuda"]
 # CUDA release-image-only fault gate; omitted from normal library/server builds.
