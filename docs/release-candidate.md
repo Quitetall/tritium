@@ -12,15 +12,21 @@ second-machine gates remain separate.
 ### Flagship campaign verification refresh (2026-09-29)
 
 The previous refresh reported the pinned Qwen3.6-27B additive-master campaign
-as sealed with all 506 tensor-master slots. That completion is **not currently
-independently verifiable from the canonical workspaces checked**. The read-only
-`scripts/qwen36-ptq-status.py` probe reports `idle`, zero published masters, and
-zero seals for both `/mnt/4tb/tritium-qwen36-work` and
-`/mnt/4tb/tritium-qwen36-work-current`; these contain source-admission files,
-not the campaign catalog. Therefore the long-running fitting step remains
-`UNKNOWN` until the canonical campaign workspace and its seal can be reopened
-and verified. Do not interpret the earlier completion claim as a release gate
-pass.
+as sealed with all 506 tensor-master slots. The discovered campaign workspace
+does not support that claim. Its path is
+`/mnt/4tb/tmp/qwen36-ptq-bef4058c-v1/qwen36-source/tsc1_9553bf20975ed88ab3a673522930f9b585ae2e205959ea3dd00ee79c9587c0ba/tsc1_7e0c191fefc020e74bb0ea1da33d11f69a517a231970d6c9174ee66494e52aa1/tensor-work/v1`.
+The canonical status probe reports `stalled`, 506 expected masters, zero
+published additive-slot receipts, no completion seal, and one 447,083,070-byte
+staged record whose owner PID is no longer alive. The workspace has 360
+preserved-source slot references and 360 underlying `.twr` records; those are
+not fitted additive masters. Two shallow source workspaces under
+`/mnt/4tb/tritium-qwen36-work*` are idle and contain no campaign catalog.
+Therefore the long-running additive-master fitting step is **not complete in
+the discovered workspace**. The prior completion claim remains unresolved
+because the PTQ bundle variants below refer to the same campaign/completion IDs
+but no matching canonical seal was found in the Qwen workspaces or
+`release/v1.1/`. Do not interpret either the old claim or bundle metadata as a
+release-gate pass.
 
 Two bundle variants exist under `/mnt/4tb/tmp` with the same campaign and
 completion IDs but different selection IDs. Both manifests declare
