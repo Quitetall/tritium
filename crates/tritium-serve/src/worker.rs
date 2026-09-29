@@ -197,6 +197,10 @@ pub(crate) enum Job {
     Generate {
         /// The generation request.
         req: GenRequest,
+        /// Request span retained across the worker-thread handoff.
+        request_span: tracing::Span,
+        /// Admission-to-worker queue span, closed when the worker dequeues.
+        queue_span: tracing::Span,
         /// Monotonic admission timestamp used for queue-wait accounting.
         accepted_at: Option<Instant>,
         /// Per-request event channel (dropped by the handler on client
@@ -279,6 +283,8 @@ pub(crate) fn spawn_worker(
                 match job {
                     Job::Generate {
                         req,
+                        request_span,
+                        queue_span,
                         accepted_at,
                         tx,
                     } => {
@@ -287,13 +293,24 @@ pub(crate) fn spawn_worker(
                             continue;
                         }
                         if let Some(accepted_at) = accepted_at {
-                            telemetry.observe_queue_wait(accepted_at.elapsed());
+                            let elapsed = accepted_at.elapsed();
+                            telemetry.observe_queue_wait(elapsed);
+                            queue_span.record("queue_wait_us", elapsed.as_micros() as u64);
                         }
+                        drop(queue_span);
                         phase.store(PHASE_PREFILL, Ordering::Release);
                         let _phase = PhaseGuard(phase.clone());
                         let generation_started = Instant::now();
+                        let prefill_span = tracing::info_span!(
+                            parent: &request_span,
+                            "model.prefill",
+                            duration_us = tracing::field::Empty,
+                        );
+                        let mut decode_span = None;
+                        let mut prefill_entered = Some(prefill_span.enter());
                         let mut first_decode_at = None;
                         let mut previous_token_at: Option<Instant> = None;
+                        let mut emitted_tokens = 0u64;
                         // Run the (panic-prone) generation under catch_unwind so one
                         // bad job can't kill the worker. `final_reason` lives inside
                         // the closure so its &mut borrow can't cross the unwind
@@ -303,6 +320,17 @@ pub(crate) fn spawn_worker(
                             let res = generator.generate(&req, &mut |step| {
                                 if first_decode_at.is_none() {
                                     telemetry.observe_prefill(generation_started.elapsed());
+                                    drop(prefill_entered.take());
+                                    prefill_span.record(
+                                        "duration_us",
+                                        generation_started.elapsed().as_micros() as u64,
+                                    );
+                                    decode_span = Some(tracing::info_span!(
+                                        parent: &request_span,
+                                        "model.decode",
+                                        duration_us = tracing::field::Empty,
+                                        emitted_tokens = tracing::field::Empty,
+                                    ));
                                     first_decode_at = Some(Instant::now());
                                 } else if let Some(previous) = previous_token_at {
                                     telemetry.observe_decode_token(previous.elapsed());
@@ -316,16 +344,29 @@ pub(crate) fn spawn_worker(
                                 // Closed (gone) cancels this request and frees the
                                 // worker. Tokens delivered so far are an in-order
                                 // prefix — no gaps.
-                                tx.try_send(GenEvent::Token(step.token, step.logprobs))
-                                    .is_ok()
-                                    && !draining.load(Ordering::Relaxed)
+                                let sent = decode_span.as_ref().is_some_and(|span| {
+                                    span.in_scope(|| {
+                                        tx.try_send(GenEvent::Token(step.token, step.logprobs))
+                                            .is_ok()
+                                    })
+                                }) && !draining.load(Ordering::Relaxed);
+                                emitted_tokens += u64::from(sent);
+                                sent
                             });
                             (res, final_reason)
                         }));
+                        drop(prefill_entered.take());
                         if let Some(first_decode_at) = first_decode_at {
-                            telemetry.observe_decode(first_decode_at.elapsed());
+                            let elapsed = first_decode_at.elapsed();
+                            telemetry.observe_decode(elapsed);
+                            if let Some(span) = decode_span.as_ref() {
+                                span.record("duration_us", elapsed.as_micros() as u64);
+                                span.record("emitted_tokens", emitted_tokens);
+                            }
                         } else {
-                            telemetry.observe_prefill(generation_started.elapsed());
+                            let elapsed = generation_started.elapsed();
+                            telemetry.observe_prefill(elapsed);
+                            prefill_span.record("duration_us", elapsed.as_micros() as u64);
                         }
                         match outcome {
                             Ok((Ok(()), final_reason)) => {
@@ -511,6 +552,8 @@ mod tests {
                 sampling: Sampling::Greedy,
                 stop_eos: true,
             },
+            request_span: tracing::Span::none(),
+            queue_span: tracing::Span::none(),
             accepted_at: Some(Instant::now()),
             tx: events,
         })
@@ -558,12 +601,16 @@ mod tests {
         };
         jobs.try_send(Job::Generate {
             req: request.clone(),
+            request_span: tracing::Span::none(),
+            queue_span: tracing::Span::none(),
             accepted_at: Some(Instant::now()),
             tx: first_tx,
         })
         .unwrap();
         jobs.try_send(Job::Generate {
             req: request,
+            request_span: tracing::Span::none(),
+            queue_span: tracing::Span::none(),
             accepted_at: Some(Instant::now()),
             tx: second_tx,
         })

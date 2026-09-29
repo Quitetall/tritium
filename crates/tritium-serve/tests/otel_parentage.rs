@@ -35,35 +35,42 @@ fn request_span_exports_with_the_remote_w3c_parent() {
         .build()
         .unwrap();
     let tok: Arc<dyn Tokenizer + Send + Sync> = Arc::new(IdPassthroughTokenizer::default());
+    tracing::subscriber::set_global_default(subscriber)
+        .expect("install test tracing subscriber before serving");
 
-    let response_context = tracing::subscriber::with_default(subscriber, || {
-        runtime.block_on(async {
-            let (router, _) = build_router(
-                Box::new(MockGenerator::new(Vec::new())),
-                tok,
-                ServeConfig::default(),
-            );
-            let response = router
-                .oneshot(
-                    Request::get("/healthz")
-                        .header(
-                            "traceparent",
-                            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
-                        )
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-            response
-                .headers()
-                .get("traceparent")
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .to_owned()
-        })
+    let response_context = runtime.block_on(async {
+        let (router, _) = build_router(
+            Box::new(MockGenerator::new(vec![1])),
+            tok,
+            ServeConfig::default(),
+        );
+        let response = router
+            .oneshot(
+                Request::post("/v1/chat/completions")
+                    .header(
+                        "traceparent",
+                        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+                    )
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model":"tritium","messages":[{"role":"user","content":"1"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response_context = response
+            .headers()
+            .get("traceparent")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let _body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        response_context
     });
     provider.force_flush().unwrap();
     let spans = exporter.0.lock().unwrap();
@@ -77,6 +84,25 @@ fn request_span_exports_with_the_remote_w3c_parent() {
     );
     assert_eq!(request_span.parent_span_id.to_string(), "00f067aa0ba902b7");
     assert!(request_span.parent_span_is_remote);
+    for name in ["model.queue", "model.prefill", "model.decode"] {
+        let span = spans
+            .iter()
+            .find(|span| span.name == name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing {name}; exported spans: {:?}",
+                    spans
+                        .iter()
+                        .map(|span| span.name.to_string())
+                        .collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(
+            span.parent_span_id,
+            request_span.span_context.span_id(),
+            "{name} should be a child of the HTTP request"
+        );
+    }
     assert_eq!(
         &response_context[36..52],
         request_span.span_context.span_id().to_string()

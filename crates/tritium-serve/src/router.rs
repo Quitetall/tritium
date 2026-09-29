@@ -1464,8 +1464,16 @@ async fn chat_completions(
     // Start latency accounting before queue admission so generation duration
     // includes bounded queue wait, not only response-body consumption.
     let generation_started = Instant::now();
+    let request_span = tracing::Span::current();
+    let queue_span = tracing::info_span!(
+        parent: &request_span,
+        "model.queue",
+        queue_wait_us = tracing::field::Empty,
+    );
     match st.jobs.try_send(Job::Generate {
         req: gen_req,
+        request_span,
+        queue_span,
         accepted_at: Some(generation_started),
         tx,
     }) {
