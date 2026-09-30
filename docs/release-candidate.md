@@ -37,6 +37,41 @@ Neither variant is bound to a candidate-specific flagship receipt. The
 historical gate inventory below predates this refresh and must not be read as
 current campaign liveness.
 
+### Source identity and retained-bundle follow-up (2026-09-30)
+
+A second read-only probe compared the dead staged record's header with its
+actual length: it declares a 1,077,709,406-byte record but contains only
+447,083,070 bytes (about 41.5%). This is an incomplete tensor stream, not a
+recoverable published master. Resuming the current campaign store scavenges
+crash-left temporary records; do not promote this file or describe it as a
+completed tensor.
+
+The two observed bundles are
+`/mnt/4tb/tmp/qwen36-ptq-b3-r2-r3-565abdee` and
+`/mnt/4tb/tmp/qwen36-ptq-b56b4b7-v1-bundle`. Their manifests carry the same
+campaign ID, completion ID, and measured source-model ID, but distinct
+selection IDs. Both remain explicitly unauthenticated and incomplete; their
+different profile sizes do not establish two independently completed master
+campaigns.
+
+The inspected durable source directory,
+`/mnt/4tb/qwen36-27b-source-6a9e13bd6fc8f0983b9b99948120bc37f49c13e9`, holds
+about 1.1 GiB of Hugging Face cache data, including partial shard downloads,
+not the complete checkpoint. The pinned
+[official Qwen revision](https://huggingface.co/Qwen/Qwen3.6-27B/tree/6a9e13bd6fc8f0983b9b99948120bc37f49c13e9)
+contains 15 weight shards totaling 55,562,855,904 bytes; its
+[revision API metadata](https://huggingface.co/api/models/Qwen/Qwen3.6-27B/revision/6a9e13bd6fc8f0983b9b99948120bc37f49c13e9?blobs=true)
+provides the pinned per-file SHA-256 values for source verification.
+
+There is also a code-level admission prerequisite: `Qwen36SourceIdentityStatus`
+currently has only `MeasuredAwaitingOfficialRegistration`, whose
+`official_payload_authenticated()` result is false. A manifest edit cannot
+authenticate these bundles. Before another flagship run can produce admissible
+evidence, an independently verified official source identity must be
+registered in the source-admission contract, and the complete pinned source
+payload must be available and verified. No download or campaign restart was
+performed for this follow-up.
+
 ### Latest local verification (2026-09-18, `570a8802`)
 
 `scripts/verify-gates.sh release` completed with exit status 0 after the
