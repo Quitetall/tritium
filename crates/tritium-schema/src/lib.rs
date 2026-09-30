@@ -151,9 +151,89 @@ pub struct AdditiveLayout {
     pub transport: Transport,
 }
 
+/// Structural validation failure for an [`AdditiveLayout`].
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LayoutError {
+    /// Rows or columns are zero.
+    EmptyDimensions,
+    /// Group width is outside the currently specified aligned-tile set.
+    UnsupportedGroup,
+    /// The maximum plane count is zero.
+    EmptyPlaneStack,
+    /// A tied scale law has a zero numerator or denominator.
+    InvalidScaleRatio,
+    /// A basis block is not a nonzero power of two.
+    InvalidBasisBlock,
+    /// A basis block does not divide the row width.
+    BasisBlockDoesNotDivideColumns,
+    /// The entropy transport block width is zero.
+    EmptyTransportBlock,
+}
+
+impl AdditiveLayout {
+    /// Validate geometry and local invariants that do not depend on law admission.
+    ///
+    /// This intentionally does not decide whether `law` is admitted or whether
+    /// `max_planes` is within that law's cap; those checks require the
+    /// evidence-backed `ADMITTED_LAWS` registry introduced in the next schema
+    /// step.
+    pub fn validate(&self) -> Result<(), LayoutError> {
+        if self.rows == 0 || self.cols == 0 {
+            return Err(LayoutError::EmptyDimensions);
+        }
+        if !matches!(self.group, 32 | 64 | 128 | 256) {
+            return Err(LayoutError::UnsupportedGroup);
+        }
+        if self.max_planes == 0 {
+            return Err(LayoutError::EmptyPlaneStack);
+        }
+        if !self.law.has_valid_ratio() {
+            return Err(LayoutError::InvalidScaleRatio);
+        }
+        let basis_block = match self.basis {
+            Basis::Identity => None,
+            Basis::Hadamard { block } | Basis::SignedRht { block, .. } => Some(block),
+        };
+        if let Some(block) = basis_block {
+            if !block.is_power_of_two() {
+                return Err(LayoutError::InvalidBasisBlock);
+            }
+            if !self.cols.is_multiple_of(u64::from(block)) {
+                return Err(LayoutError::BasisBlockDoesNotDivideColumns);
+            }
+        }
+        if let Transport::JointHuffman { block: 0 } = self.transport {
+            return Err(LayoutError::EmptyTransportBlock);
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{PlaneRelation, ScaleAnchor, ScaleLaw, ScalePrecision};
+    use super::{
+        AdditiveLayout, Basis, LayoutError, PlaneAllocation, PlaneCodec, PlaneRelation,
+        ScaleAnchor, ScaleLaw, ScalePrecision, Transport,
+    };
+
+    fn valid_layout() -> AdditiveLayout {
+        AdditiveLayout {
+            rows: 2,
+            cols: 256,
+            group: 128,
+            max_planes: 3,
+            allocation: PlaneAllocation::Uniform,
+            codec: PlaneCodec::D2,
+            law: ScaleLaw {
+                anchor: ScaleAnchor::Group,
+                relation: PlaneRelation::Free,
+                precision: ScalePrecision::F16,
+            },
+            basis: Basis::Hadamard { block: 128 },
+            transport: Transport::Raw,
+        }
+    }
 
     #[test]
     fn tied_law_requires_positive_ratio_components() {
@@ -166,5 +246,33 @@ mod tests {
         assert!(law(1, 3).has_valid_ratio());
         assert!(!law(0, 3).has_valid_ratio());
         assert!(!law(1, 0).has_valid_ratio());
+    }
+
+    #[test]
+    fn layout_accepts_valid_structural_geometry() {
+        assert_eq!(valid_layout().validate(), Ok(()));
+    }
+
+    #[test]
+    fn layout_rejects_basis_block_that_does_not_divide_columns() {
+        let mut layout = valid_layout();
+        layout.basis = Basis::Hadamard { block: 64 };
+        layout.cols = 96;
+
+        assert_eq!(
+            layout.validate(),
+            Err(LayoutError::BasisBlockDoesNotDivideColumns)
+        );
+    }
+
+    #[test]
+    fn layout_rejects_invalid_ratio_and_transport_block() {
+        let mut layout = valid_layout();
+        layout.law.relation = PlaneRelation::Tied { num: 1, den: 0 };
+        assert_eq!(layout.validate(), Err(LayoutError::InvalidScaleRatio));
+
+        layout.law.relation = PlaneRelation::Free;
+        layout.transport = Transport::JointHuffman { block: 0 };
+        assert_eq!(layout.validate(), Err(LayoutError::EmptyTransportBlock));
     }
 }
