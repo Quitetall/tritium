@@ -59,6 +59,12 @@ on:
       - "scripts/tests/test_aggregate_wheel_smoke.py"
       - "scripts/wheel-functional-smoke.py"
       - "scripts/tests/test_wheel_functional_smoke.py"
+      - "crates/tritium-py/python/tritium/torch/qualify_dispatch_overhead.py"
+      - "scripts/qualify-torch-dispatch-overhead.py"
+      - "scripts/verify-torch-dispatch-overhead-receipt.py"
+      - "scripts/tests/test_qualify_torch_dispatch_overhead.py"
+      - "scripts/tests/test_verify_torch_dispatch_overhead_receipt.py"
+      - "scripts/tests/test_torch_dispatch_overhead_workflow.py"
       - "scripts/build-cuda-manylinux-wheel.sh"
       - "scripts/tests/test_build_cuda_manylinux_wheel.py"
       - "scripts/build-cpu-manylinux-wheel.sh"
@@ -366,6 +372,37 @@ jobs:
             --release "${{ needs.wheels.outputs.release }}" \
             --run-id "github-${{ github.run_id }}-${{ github.run_attempt }}-api-signature" \
             --output-dir evidence/api-signature
+      - name: qualify installed-wheel CPU dispatcher overhead
+        shell: bash
+        env:
+          RAYON_NUM_THREADS: "1"
+          OMP_NUM_THREADS: "1"
+          MKL_NUM_THREADS: "1"
+        run: |
+          set -euo pipefail
+          wheels=(dist/*.whl)
+          test "${#wheels[@]}" -eq 1
+          wheel="$GITHUB_WORKSPACE/${wheels[0]}"
+          cpu="$(python -c 'import os; print(min(os.sched_getaffinity(0)))')"
+          trace="$GITHUB_WORKSPACE/evidence/torch-dispatch-overhead-trace.json"
+          mkdir -p "$GITHUB_WORKSPACE/evidence"
+          cd "$RUNNER_TEMP"
+          python -I -B -m tritium.torch.qualify_dispatch_overhead \
+            --output "$trace" \
+            --wheel "$wheel" \
+            --source-revision "${{ inputs.source_revision || github.sha }}" \
+            --release "${{ needs.wheels.outputs.release }}" \
+            --run-id "github-${{ github.run_id }}-${{ github.run_attempt }}-torch-dispatch-overhead" \
+            --cpu "$cpu"
+          cd "$GITHUB_WORKSPACE"
+          python scripts/qualify-torch-dispatch-overhead.py \
+            --repo "$GITHUB_WORKSPACE" \
+            --wheel "$wheel" \
+            --trace "$trace" \
+            --source-revision "${{ inputs.source_revision || github.sha }}" \
+            --release "${{ needs.wheels.outputs.release }}" \
+            --run-id "github-${{ github.run_id }}-${{ github.run_attempt }}-torch-dispatch-overhead" \
+            --output-dir evidence/torch-dispatch-overhead
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: wheel-functional-torch-2.11-python-3.13
@@ -374,6 +411,8 @@ jobs:
             evidence/tutorial-cpu/**
             evidence/tutorial-cpu/receipt.json
             evidence/api-signature/**
+            evidence/torch-dispatch-overhead-trace.json
+            evidence/torch-dispatch-overhead/**
           if-no-files-found: error
 
   tutorial-clean-wheel:
