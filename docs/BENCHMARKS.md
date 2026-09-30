@@ -61,10 +61,10 @@ the CUDA-resident TQ2_0 path. The matrix is contexts 128 and 2048 × batch sizes
 8 for decode and tree verification. Decode measures 32 tokens; tree verification
 uses six draft nodes per sequence (eight slots stay within the 48-node batch limit).
 Each result retains five sample timings and the median. The JSON also records model
-SHA-256 and geometry, source revision/dirty state, GPU identity/activity before and after,
-relevant runtime options, and visible co-resident compute processes before and after.
-This is a performance baseline only, not a model-quality or release qualification
-receipt.
+SHA-256 and geometry, source revision/dirty state, GPU identity/activity before and at
+run end, relevant runtime options, and visible GPU processes before and at run end. The
+end sample can include the benchmark process itself (its PID is in the JSON). This is a
+performance baseline only, not a model-quality or release qualification receipt.
 
 Run from the repository root on the pinned RTX 4090 box:
 

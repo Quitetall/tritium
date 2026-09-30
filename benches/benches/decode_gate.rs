@@ -38,11 +38,12 @@ mod gate {
         source_revision: String,
         source_dirty: bool,
         started_unix_ms: u128,
+        benchmark_pid: u32,
         device: String,
         gpu_activity_before: String,
-        gpu_activity_after: String,
-        co_resident_compute_processes: String,
-        co_resident_compute_processes_after: String,
+        gpu_activity_at_end: String,
+        gpu_processes_before: String,
+        gpu_processes_at_end: String,
         model_path: String,
         model_bytes: u64,
         model_sha256: String,
@@ -75,17 +76,30 @@ mod gate {
     }
 
     fn model_path() -> PathBuf {
-        if let Some(path) = std::env::var_os("TRITIUM_BITNET_GGUF") {
-            return path.into();
+        let path = if let Some(path) = std::env::var_os("TRITIUM_BITNET_GGUF") {
+            PathBuf::from(path)
+        } else {
+            let root = std::env::var_os("TRITIUM_MODEL_DIR")
+                .map(PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("HOME")
+                        .map(|home| PathBuf::from(home).join(".cache/tritium-models"))
+                })
+                .unwrap_or_else(|| PathBuf::from(".cache/tritium-models"));
+            root.join("bitnet-2b4t-gguf/ggml-model-i2_s.gguf")
+        };
+        resolve_from_repo(path)
+    }
+
+    fn resolve_from_repo(path: PathBuf) -> PathBuf {
+        if path.is_absolute() {
+            path
+        } else {
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .expect("bench package is a workspace member")
+                .join(path)
         }
-        let root = std::env::var_os("TRITIUM_MODEL_DIR")
-            .map(PathBuf::from)
-            .or_else(|| {
-                std::env::var_os("HOME")
-                    .map(|home| PathBuf::from(home).join(".cache/tritium-models"))
-            })
-            .unwrap_or_else(|| PathBuf::from(".cache/tritium-models"));
-        root.join("bitnet-2b4t-gguf/ggml-model-i2_s.gguf")
     }
 
     fn run_text(program: &str, args: &[&str]) -> String {
@@ -361,11 +375,11 @@ mod gate {
     fn write_report(report: &Report) -> Result<(), Box<dyn Error>> {
         let serialized = serde_json::to_vec_pretty(report)?;
         if let Some(path) = std::env::var_os("TRITIUM_DECODE_GATE_OUT") {
-            let path = Path::new(&path);
+            let path = resolve_from_repo(PathBuf::from(path));
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            std::fs::write(path, &serialized)?;
+            std::fs::write(&path, &serialized)?;
             println!("wrote {}", path.display());
         } else {
             println!("{}", String::from_utf8(serialized)?);
@@ -392,7 +406,7 @@ mod gate {
                 "--format=csv,noheader",
             ],
         );
-        let co_resident_compute_processes = run_text(
+        let gpu_processes_before = run_text(
             "nvidia-smi",
             &[
                 "--query-compute-apps=pid,process_name,used_memory",
@@ -452,14 +466,14 @@ mod gate {
             )?);
         }
 
-        let gpu_activity_after = run_text(
+        let gpu_activity_at_end = run_text(
             "nvidia-smi",
             &[
                 "--query-gpu=utilization.gpu,memory.used",
                 "--format=csv,noheader",
             ],
         );
-        let co_resident_compute_processes_after = run_text(
+        let gpu_processes_at_end = run_text(
             "nvidia-smi",
             &[
                 "--query-compute-apps=pid,process_name,used_memory",
@@ -473,11 +487,12 @@ mod gate {
             source_revision: revision(),
             source_dirty: source_dirty(),
             started_unix_ms,
+            benchmark_pid: std::process::id(),
             device,
             gpu_activity_before,
-            gpu_activity_after,
-            co_resident_compute_processes,
-            co_resident_compute_processes_after,
+            gpu_activity_at_end,
+            gpu_processes_before,
+            gpu_processes_at_end,
             model_path: path.display().to_string(),
             model_bytes: bytes.len() as u64,
             model_sha256,
