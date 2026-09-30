@@ -8,6 +8,9 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+#[cfg(feature = "alloc")]
+extern crate alloc;
+
 /// Precision used to store additive plane scales.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -149,6 +152,76 @@ pub struct AdditiveLayout {
     pub basis: Basis,
     /// Outer entropy transport.
     pub transport: Transport,
+}
+
+/// Stable identifier for a schema family and its version.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct SchemaId {
+    /// Major version; incompatible schemas require a new major version.
+    pub major: u16,
+    /// Minor version; additive compatible schema evolution increments this.
+    pub minor: u16,
+}
+
+macro_rules! digest_id {
+    ($name:ident, $doc:literal) => {
+        #[doc = $doc]
+        #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+        pub struct $name([u8; 32]);
+
+        impl $name {
+            /// Construct from a BLAKE3-sized digest byte array.
+            #[must_use]
+            pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+                Self(bytes)
+            }
+
+            /// Borrow the digest bytes.
+            #[must_use]
+            pub const fn as_bytes(&self) -> &[u8; 32] {
+                &self.0
+            }
+        }
+    };
+}
+
+digest_id!(ModelId, "Content identity for a Tritium model manifest.");
+digest_id!(PackageId, "Content identity for a Tritium package.");
+digest_id!(BlobId, "Content identity for stored tensor or asset bytes.");
+digest_id!(
+    SemanticTensorDigest,
+    "Identity for a tensor's semantic values independent of its container."
+);
+
+/// Standardized reason category for an unresolved claim.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum UnknownReason {
+    /// The claim has not yet been evaluated.
+    NotEvaluated,
+    /// Required evidence is unavailable.
+    MissingEvidence,
+    /// Required hardware or runtime is unavailable.
+    MissingCapability,
+    /// Independent review is still required.
+    AwaitingIndependentReview,
+    /// The producer supplied a reason not represented by a standard code.
+    Other,
+}
+
+/// Outcome attached to a measured or verified claim.
+#[non_exhaustive]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Verdict {
+    /// The claim passed its declared check.
+    Pass,
+    /// The claim failed its declared check.
+    Fail,
+    /// No pass/fail conclusion can be drawn; never aggregates to pass.
+    Unknown {
+        /// Stable reason code; free-form details belong in the evidence event.
+        reason: UnknownReason,
+    },
 }
 
 /// Structural validation failure for an [`AdditiveLayout`].
