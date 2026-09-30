@@ -74,6 +74,63 @@ impl ScaleLaw {
     }
 }
 
+/// One admitted scale law and the largest plane stack supported for it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct AdmittedLaw {
+    /// The exact law tuple admitted by this schema version.
+    pub law: ScaleLaw,
+    /// Per-law maximum plane count; there is no shared/global plane cap.
+    pub max_planes: u8,
+}
+
+/// Initial fail-closed law registry from ADR 0044 D2.
+///
+/// The three-plane caps follow the current serialized SALT/training limits
+/// (`SALT_V2_MAX_PLANES` and `training_salt::MAX_PLANES`). Tensor-level I2_S
+/// import is the existing single-plane representation. A new law or a larger
+/// cap requires its own reference implementation and frozen conformance
+/// vectors before it is added here.
+pub const ADMITTED_LAWS: &[AdmittedLaw] = &[
+    AdmittedLaw {
+        law: ScaleLaw {
+            anchor: ScaleAnchor::Group,
+            relation: PlaneRelation::Free,
+            precision: ScalePrecision::F16,
+        },
+        max_planes: 3,
+    },
+    AdmittedLaw {
+        law: ScaleLaw {
+            anchor: ScaleAnchor::Group,
+            relation: PlaneRelation::Free,
+            precision: ScalePrecision::F32,
+        },
+        max_planes: 3,
+    },
+    AdmittedLaw {
+        law: ScaleLaw {
+            anchor: ScaleAnchor::Group,
+            relation: PlaneRelation::Tied { num: 1, den: 3 },
+            precision: ScalePrecision::F16,
+        },
+        max_planes: 3,
+    },
+    AdmittedLaw {
+        law: ScaleLaw {
+            anchor: ScaleAnchor::Tensor,
+            relation: PlaneRelation::Free,
+            precision: ScalePrecision::F32,
+        },
+        max_planes: 1,
+    },
+];
+
+/// Find the admission record for an exact law tuple.
+#[must_use]
+pub fn admitted_law(law: ScaleLaw) -> Option<&'static AdmittedLaw> {
+    ADMITTED_LAWS.iter().find(|admitted| admitted.law == law)
+}
+
 /// Input-axis transform associated with an additive tensor.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -236,6 +293,10 @@ pub enum LayoutError {
     EmptyPlaneStack,
     /// A tied scale law has a zero numerator or denominator.
     InvalidScaleRatio,
+    /// This schema version does not admit the requested scale law.
+    UnsupportedLaw,
+    /// The requested maximum plane count exceeds this law's own cap.
+    PlaneCountExceedsLaw,
     /// A basis block is not a nonzero power of two.
     InvalidBasisBlock,
     /// A basis block does not divide the row width.
@@ -264,6 +325,12 @@ impl AdditiveLayout {
         if !self.law.has_valid_ratio() {
             return Err(LayoutError::InvalidScaleRatio);
         }
+        let Some(admitted) = admitted_law(self.law) else {
+            return Err(LayoutError::UnsupportedLaw);
+        };
+        if self.max_planes > admitted.max_planes {
+            return Err(LayoutError::PlaneCountExceedsLaw);
+        }
         let basis_block = match self.basis {
             Basis::Identity => None,
             Basis::Hadamard { block } | Basis::SignedRht { block, .. } => Some(block),
@@ -286,8 +353,8 @@ impl AdditiveLayout {
 #[cfg(test)]
 mod tests {
     use super::{
-        AdditiveLayout, Basis, LayoutError, PlaneAllocation, PlaneCodec, PlaneRelation,
-        ScaleAnchor, ScaleLaw, ScalePrecision, Transport,
+        ADMITTED_LAWS, AdditiveLayout, Basis, LayoutError, PlaneAllocation, PlaneCodec,
+        PlaneRelation, ScaleAnchor, ScaleLaw, ScalePrecision, Transport, admitted_law,
     };
 
     fn valid_layout() -> AdditiveLayout {
@@ -347,5 +414,20 @@ mod tests {
         layout.law.relation = PlaneRelation::Free;
         layout.transport = Transport::JointHuffman { block: 0 };
         assert_eq!(layout.validate(), Err(LayoutError::EmptyTransportBlock));
+    }
+
+    #[test]
+    fn admission_is_exact_and_uses_per_law_plane_caps() {
+        assert_eq!(ADMITTED_LAWS.len(), 4);
+        for admitted in ADMITTED_LAWS {
+            assert_eq!(admitted_law(admitted.law), Some(admitted));
+        }
+
+        let mut layout = valid_layout();
+        layout.max_planes = 4;
+        assert_eq!(layout.validate(), Err(LayoutError::PlaneCountExceedsLaw));
+
+        layout.law.precision = ScalePrecision::Bf16;
+        assert_eq!(layout.validate(), Err(LayoutError::UnsupportedLaw));
     }
 }
