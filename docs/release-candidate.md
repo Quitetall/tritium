@@ -93,6 +93,29 @@ registered through the source-admission contract. The 506-tensor campaign has
 not been restarted, and the prior incomplete bundle variants remain
 inadmissible.
 
+The Rust `qwen36-preflight` then completed against this verified snapshot. It
+measured source model ID
+`trm1_126eb094f936c87bf7aeff60e57dadf5351ff082a48b8d63c7553919029cd3ca`,
+manifest content ID
+`tsc1_9553bf20975ed88ab3a673522930f9b585ae2e205959ea3dd00ee79c9587c0ba`,
+and proof ID
+`tsc1_7e0c191fefc020e74bb0ea1da33d11f69a517a231970d6c9174ee66494e52aa1`.
+The generated 221,951-byte proof is byte-identical to the proof already in the
+stalled campaign workspace (SHA-256
+`09b59e8e41d7e0f947e31d2fc8f4fb635804f162f0c7558a2df6ff6d98b834e0`). This
+confirms the preserved workspace used the exact same content-bound source.
+
+The source-admission receipt produced with the matching CI wheel and accepted
+by `verify-qwen36-source-admission-receipt.py` has receipt ID
+`sha256:718abe3e52eab53cc7e945fc0232dc18a42e3bac413544b855494594ae7ba08b`.
+It confirms the 1,199-tensor inventory (506 additive, 360 preserved, 15 MTP)
+but correctly still reports
+`identity_status=measured-awaiting-official-registration` and
+`official_payload_authenticated=false`. The current master-campaign status
+probe still reports `stalled`, zero of 506 published master receipts, no seal,
+and the same dead 447,083,070-byte staged record. Source admission is not
+fitting completion or a deployable model.
+
 ### Latest local verification (2026-09-18, `570a8802`)
 
 `scripts/verify-gates.sh release` completed with exit status 0 after the
