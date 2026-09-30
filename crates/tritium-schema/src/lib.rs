@@ -155,7 +155,7 @@ pub enum Basis {
         /// Seed used to derive signs.
         seed: u64,
         /// Stable domain identifier for sign derivation.
-        domain: u32,
+        domain: u64,
     },
 }
 
