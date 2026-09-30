@@ -7,6 +7,7 @@ resolver = "3"
 members = [
     "crates/tritium-build-info", # source identity for receipt-producing build scripts
     "crates/tritium-core",
+    "crates/tritium-schema",   # accepted ADR 0044 cross-language schema vocabulary
     "crates/tritium-spec",     # backend trait contract, no impls
     "crates/tritium-format",   # TQ1_0/TQ2_0 packing, GGUF + safetensors I/O
     "crates/tritium-testkit",  # reference vectors + conformance harness
@@ -62,6 +63,7 @@ categories = ["science", "hardware-support", "mathematics"]
 # deps) and lets cargo-deny keep `wildcards = "deny"` meaningful for *external* deps.
 tritium-build-info = { path = "crates/tritium-build-info", version = "1.1.0-rc.2" }
 tritium-core = { path = "crates/tritium-core", version = "1.1.0-rc.2" }
+tritium-schema = { path = "crates/tritium-schema", version = "1.1.0-rc.2" }
 tritium-spec = { path = "crates/tritium-spec", version = "1.1.0-rc.2" }
 tritium-format = { path = "crates/tritium-format", version = "1.1.0-rc.2" }
 tritium-runtime = { path = "crates/tritium-runtime", version = "1.1.0-rc.2" }

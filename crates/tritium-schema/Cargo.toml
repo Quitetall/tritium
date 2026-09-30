@@ -1,0 +1,22 @@
+[package]
+name = "tritium-schema"
+description = "Canonical, no_std schema vocabulary for Tritium additive tensors and artifacts."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme = "README.md"
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+default = ["std"]
+std = ["alloc"]
+alloc = []
+
+[dependencies]
+
+[lints]
+workspace = true
