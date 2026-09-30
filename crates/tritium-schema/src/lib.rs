@@ -13,6 +13,7 @@ extern crate alloc;
 
 /// Precision used to store additive plane scales.
 #[non_exhaustive]
+#[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum ScalePrecision {
     /// IEEE binary16.
@@ -25,6 +26,7 @@ pub enum ScalePrecision {
 
 /// Grouping axis to which an additive scale is anchored.
 #[non_exhaustive]
+#[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum ScaleAnchor {
     /// One scale per declared group.
@@ -39,6 +41,7 @@ pub enum ScaleAnchor {
 
 /// Relationship between scales of successive additive planes.
 #[non_exhaustive]
+#[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum PlaneRelation {
     /// Every plane has an independently fitted scale.
@@ -53,6 +56,7 @@ pub enum PlaneRelation {
 }
 
 /// Scale law represented as orthogonal anchor, relation, and storage precision.
+#[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct ScaleLaw {
     /// Scale grouping axis.
@@ -75,6 +79,7 @@ impl ScaleLaw {
 }
 
 /// One admitted scale law and the largest plane stack supported for it.
+#[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct AdmittedLaw {
     /// The exact law tuple admitted by this schema version.
@@ -133,6 +138,7 @@ pub fn admitted_law(law: ScaleLaw) -> Option<&'static AdmittedLaw> {
 
 /// Input-axis transform associated with an additive tensor.
 #[non_exhaustive]
+#[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum Basis {
     /// No transform.
@@ -155,6 +161,7 @@ pub enum Basis {
 
 /// Compact code used for each additive ternary plane.
 #[non_exhaustive]
+#[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum PlaneCodec {
     /// Two-bit ternary packing.
@@ -167,6 +174,7 @@ pub enum PlaneCodec {
 
 /// Optional entropy transport applied outside the tensor's plane codec.
 #[non_exhaustive]
+#[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum Transport {
     /// Store codec bytes directly.
@@ -180,6 +188,7 @@ pub enum Transport {
 
 /// Uniform or per-tile plane-count allocation policy.
 #[non_exhaustive]
+#[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum PlaneAllocation {
     /// Every tile uses the tensor's maximum plane count.
@@ -189,6 +198,7 @@ pub enum PlaneAllocation {
 }
 
 /// Semantic layout parameters for an additive tensor.
+#[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct AdditiveLayout {
     /// Number of matrix rows.
@@ -212,6 +222,7 @@ pub struct AdditiveLayout {
 }
 
 /// Stable identifier for a schema family and its version.
+#[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct SchemaId {
     /// Major version; incompatible schemas require a new major version.
@@ -223,6 +234,7 @@ pub struct SchemaId {
 macro_rules! digest_id {
     ($name:ident, $doc:literal) => {
         #[doc = $doc]
+        #[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
         #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
         pub struct $name([u8; 32]);
 
@@ -252,6 +264,7 @@ digest_id!(
 
 /// Standardized reason category for an unresolved claim.
 #[non_exhaustive]
+#[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum UnknownReason {
     /// The claim has not yet been evaluated.
@@ -268,6 +281,7 @@ pub enum UnknownReason {
 
 /// Outcome attached to a measured or verified claim.
 #[non_exhaustive]
+#[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Verdict {
     /// The claim passed its declared check.
@@ -283,6 +297,7 @@ pub enum Verdict {
 
 /// Structural validation failure for an [`AdditiveLayout`].
 #[non_exhaustive]
+#[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LayoutError {
     /// Rows or columns are zero.

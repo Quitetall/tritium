@@ -2,5 +2,7 @@
 
 The canonical Rust vocabulary for Tritium artifact and execution schemas. This
 crate is `no_std` by default when built without its `std` feature and has no
-runtime dependencies. Wire encodings and law admission are added in later
-steps; this initial foundation defines stable semantic values only.
+default runtime dependencies. The optional `schema-gen` feature derives the
+JSON Schema projections from these Rust types; run
+`cargo run -p tritium-schema --features schema-gen --bin tritium-schema-projections`
+to update them, or pass `--check` to detect drift.

@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Basis",
+  "description": "Input-axis transform associated with an additive tensor.",
+  "oneOf": [
+    {
+      "description": "No transform.",
+      "type": "string",
+      "const": "Identity"
+    },
+    {
+      "description": "Normalized, self-inverse Walsh–Hadamard transform.",
+      "type": "object",
+      "properties": {
+        "Hadamard": {
+          "type": "object",
+          "properties": {
+            "block": {
+              "description": "Power-of-two transform block width.",
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "block"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "Hadamard"
+      ]
+    },
+    {
+      "description": "Deterministic signed Walsh–Hadamard transform.",
+      "type": "object",
+      "properties": {
+        "SignedRht": {
+          "type": "object",
+          "properties": {
+            "block": {
+              "description": "Power-of-two transform block width.",
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "domain": {
+              "description": "Stable domain identifier for sign derivation.",
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "seed": {
+              "description": "Seed used to derive signs.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "block",
+            "seed",
+            "domain"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "SignedRht"
+      ]
+    }
+  ]
+}

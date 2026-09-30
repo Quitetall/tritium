@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ScalePrecision",
+  "description": "Precision used to store additive plane scales.",
+  "oneOf": [
+    {
+      "description": "IEEE binary16.",
+      "type": "string",
+      "const": "F16"
+    },
+    {
+      "description": "Brain floating-point 16-bit.",
+      "type": "string",
+      "const": "Bf16"
+    },
+    {
+      "description": "IEEE binary32.",
+      "type": "string",
+      "const": "F32"
+    }
+  ]
+}

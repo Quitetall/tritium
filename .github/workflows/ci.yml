@@ -39,6 +39,7 @@ jobs:
         with:
           components: rustfmt, clippy
       - run: cargo fmt --all --check
+      - run: cargo run --locked -p tritium-schema --features schema-gen --bin tritium-schema-projections -- --check
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       # tritium-py is a PyO3 extension module (cdylib) with no cargo tests — it is
       # exercised via maturin + pytest, not `cargo test`. Excluded here so its

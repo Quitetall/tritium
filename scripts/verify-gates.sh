@@ -200,6 +200,7 @@ case "$tier" in
         ;;
     prepush)
         run cargo fmt --all --check
+        run cargo run --locked -p tritium-schema --features schema-gen --bin tritium-schema-projections -- --check
         run cargo clippy --locked --workspace --all-targets -- -D warnings
         # Default features are NOT the shipped surface. Optional deps and cfg-gated modules do not
         # compile above, so a clean default run says nothing about them -- three separate CI
@@ -219,6 +220,7 @@ case "$tier" in
         ;;
     ci)
         run cargo fmt --all --check
+        run cargo run --locked -p tritium-schema --features schema-gen --bin tritium-schema-projections -- --check
         run cargo clippy --locked --workspace --all-targets -- -D warnings
         # tritium-py is a PyO3 cdylib; standalone cargo-test binaries cannot
         # link Python without a development lib. Its shipped surface is gated
@@ -231,6 +233,7 @@ case "$tier" in
         ;;
     release)
         run cargo fmt --all --check
+        run cargo run --locked -p tritium-schema --features schema-gen --bin tritium-schema-projections -- --check
         # Type-check every feature-gated surface without requiring GPU toolkits.
         run env TRITIUM_CHECK_ONLY=1 cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
         run cargo test --locked --workspace --exclude tritium-py --no-fail-fast -- \
