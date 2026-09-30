@@ -46,6 +46,13 @@
       "format": "uint64",
       "minimum": 0
     },
+    "tile": {
+      "description": "Canonical tile width. Currently fixed at [`ADDITIVE_TILE_SIZE`].",
+      "type": "integer",
+      "format": "uint16",
+      "maximum": 65535,
+      "minimum": 0
+    },
     "transport": {
       "description": "Outer entropy transport.",
       "$ref": "#/$defs/Transport"
@@ -54,6 +61,7 @@
   "required": [
     "rows",
     "cols",
+    "tile",
     "group",
     "max_planes",
     "allocation",

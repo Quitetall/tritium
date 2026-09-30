@@ -197,6 +197,9 @@ pub enum PlaneAllocation {
     PerTile,
 }
 
+/// Canonical coefficient tile width required by ADR 0044 D4.
+pub const ADDITIVE_TILE_SIZE: u16 = 256;
+
 /// Semantic layout parameters for an additive tensor.
 #[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -205,6 +208,8 @@ pub struct AdditiveLayout {
     pub rows: u64,
     /// Number of coefficients per row.
     pub cols: u64,
+    /// Canonical tile width. Currently fixed at [`ADDITIVE_TILE_SIZE`].
+    pub tile: u16,
     /// Scale group width.
     pub group: u16,
     /// Maximum plane count represented by this tensor.
@@ -304,6 +309,8 @@ pub enum LayoutError {
     EmptyDimensions,
     /// Group width is outside the currently specified aligned-tile set.
     UnsupportedGroup,
+    /// Tile width is not the canonical 256 coefficients.
+    UnsupportedTileSize,
     /// The maximum plane count is zero.
     EmptyPlaneStack,
     /// A tied scale law has a zero numerator or denominator.
@@ -333,6 +340,9 @@ impl AdditiveLayout {
         }
         if !matches!(self.group, 32 | 64 | 128 | 256) {
             return Err(LayoutError::UnsupportedGroup);
+        }
+        if self.tile != ADDITIVE_TILE_SIZE {
+            return Err(LayoutError::UnsupportedTileSize);
         }
         if self.max_planes == 0 {
             return Err(LayoutError::EmptyPlaneStack);
@@ -368,14 +378,15 @@ impl AdditiveLayout {
 #[cfg(test)]
 mod tests {
     use super::{
-        ADMITTED_LAWS, AdditiveLayout, Basis, LayoutError, PlaneAllocation, PlaneCodec,
-        PlaneRelation, ScaleAnchor, ScaleLaw, ScalePrecision, Transport, admitted_law,
+        ADDITIVE_TILE_SIZE, ADMITTED_LAWS, AdditiveLayout, Basis, LayoutError, PlaneAllocation,
+        PlaneCodec, PlaneRelation, ScaleAnchor, ScaleLaw, ScalePrecision, Transport, admitted_law,
     };
 
     fn valid_layout() -> AdditiveLayout {
         AdditiveLayout {
             rows: 2,
             cols: 256,
+            tile: ADDITIVE_TILE_SIZE,
             group: 128,
             max_planes: 3,
             allocation: PlaneAllocation::Uniform,
@@ -429,6 +440,13 @@ mod tests {
         layout.law.relation = PlaneRelation::Free;
         layout.transport = Transport::JointHuffman { block: 0 };
         assert_eq!(layout.validate(), Err(LayoutError::EmptyTransportBlock));
+    }
+
+    #[test]
+    fn layout_rejects_noncanonical_tile_width() {
+        let mut layout = valid_layout();
+        layout.tile = 128;
+        assert_eq!(layout.validate(), Err(LayoutError::UnsupportedTileSize));
     }
 
     #[test]
