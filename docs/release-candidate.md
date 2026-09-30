@@ -72,6 +72,27 @@ registered in the source-admission contract, and the complete pinned source
 payload must be available and verified. No download or campaign restart was
 performed for this follow-up.
 
+### Pinned source fetch and checksum verification (2026-09-30)
+
+The complete pinned Hugging Face snapshot has since been downloaded into the
+durable source directory above. `hf cache verify Qwen/Qwen3.6-27B --revision
+6a9e13bd6fc8f0983b9b99948120bc37f49c13e9 --local-dir
+/mnt/4tb/qwen36-27b-source-6a9e13bd6fc8f0983b9b99948120bc37f49c13e9
+--fail-on-missing-files` verified all 29 repository files and reported that all
+checksums match. Excluding Hugging Face's local `.cache` metadata, the directory
+contains exactly those 29 files totaling 55,586,107,940 bytes. Passing
+`--fail-on-extra-files` is not appropriate on this `--local-dir`: the CLI counts
+its own `.cache/huggingface` lock/metadata files as extras. Those files were
+preserved; no cleanup was needed.
+
+This verifies the downloaded files against the pinned Hub revision but does
+not itself satisfy Tritium's code-level source identity admission. The
+`Qwen36SourceIdentityStatus` remains unauthenticated until Tritium's semantic
+preflight is run and the independently verified official `ModelId` is
+registered through the source-admission contract. The 506-tensor campaign has
+not been restarted, and the prior incomplete bundle variants remain
+inadmissible.
+
 ### Latest local verification (2026-09-18, `570a8802`)
 
 `scripts/verify-gates.sh release` completed with exit status 0 after the
