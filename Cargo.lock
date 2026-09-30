@@ -5024,6 +5024,7 @@ dependencies = [
  "serde_json",
  "tritium-core",
  "tritium-format",
+ "tritium-schema",
  "tritium-spec",
 ]
 

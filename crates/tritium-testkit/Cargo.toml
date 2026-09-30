@@ -17,6 +17,7 @@ categories.workspace = true
 tritium-core = { workspace = true, features = ["serde"] }
 tritium-spec = { workspace = true }
 tritium-format = { workspace = true }
+tritium-schema = { workspace = true }
 half = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
