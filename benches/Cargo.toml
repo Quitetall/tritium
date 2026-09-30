@@ -42,6 +42,7 @@ tritium-metal = { workspace = true }
 # perplexity) the end-to-end bench couples its tokens/sec to.
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 
 # `cargo bench -p tritium-benches --features cuda` enables the CUDA backend (and its
 # build.rs `nvcc` PTX compile) so the GPU mpGEMM microbenches and the end-to-end
@@ -79,6 +80,10 @@ harness = false
 
 [[bench]]
 name = "e2e"
+harness = false
+
+[[bench]]
+name = "decode_gate"
 harness = false
 
 [[bench]]

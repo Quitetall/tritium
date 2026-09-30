@@ -4623,6 +4623,7 @@ dependencies = [
  "half",
  "serde",
  "serde_json",
+ "sha2",
  "tritium-core",
  "tritium-cpu",
  "tritium-cuda",
