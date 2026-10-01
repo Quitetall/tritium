@@ -271,6 +271,18 @@ consumed those tokens or bind an actual replay digest to an ordered S2KF
 evidence-set digest. Those capture/evidence links remain required before
 fitting; the legacy 506-record set is still not admitted for campaign use.
 
+A deterministic pre-capture replay contract is now persisted at
+`/mnt/2tb/tritium-release-evidence/qwen-calibration/replay-contract-2026-10-01.json`
+with ID
+`sha256:bb1e8d9d4f7a8564a76c6ca14378a0d1698dba01a3170c0e473c7c8936aadfcc`.
+It binds the verified pack receipt to the expected PyTorch batch digest
+`sha256:ca913e334bf22c73755d27b11848599008790f672600b8085daf5ec53022202c`
+under a fixed one-sequence-per-batch policy. The capture API already checks
+that digest against each replay before publishing records. The contract is not
+evidence that replay occurred: a pack-backed batch factory, a saved native
+capture receipt binding this digest to the ordered S2KF set, and a fresh native
+reopen of all 506 records are still required.
+
 ### Hosted package evidence from PR #51 (2026-10-01)
 
 PR #51 (`bbbafd99cada6dab821cea63e5cdf971f1ce79fb`) has successful hosted

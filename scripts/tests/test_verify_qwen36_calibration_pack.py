@@ -202,6 +202,61 @@ class QwenCalibrationPackTests(unittest.TestCase):
                 ):
                     MODULE.validate_receipt(receipt_path)
 
+    def test_replay_contract_derives_capture_hash_from_pack_tokens(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            payload = (7).to_bytes(4, "little") + (9).to_bytes(4, "little")
+            (root / "stage7.u32le").write_bytes(payload)
+            manifest = {
+                "tokens": {"path": "stage7.u32le"},
+                "partitions": {
+                    "calibration": {
+                        "sequences": [
+                            {"token_offset": 0, "token_count": 2},
+                        ]
+                    }
+                },
+            }
+            manifest["pack_id"] = "sha256:" + hashlib.sha256(
+                MODULE.canonical(manifest)
+            ).hexdigest()
+            manifest_path = root / "manifest.json"
+            manifest_path.write_text(MODULE.canonical(manifest).decode("utf-8"))
+            pack_receipt = {
+                "receipt_id": "sha256:" + "b" * 64,
+                "pack_id": manifest["pack_id"],
+                "calibration": {
+                    "ordered_token_sha256": "sha256:" + hashlib.sha256(payload).hexdigest()
+                },
+            }
+            with (
+                patch.object(MODULE, "TOKENS_PER_SEQUENCE", 2),
+                patch.object(MODULE, "SEQUENCES_PER_PARTITION", 1),
+            ):
+                contract = MODULE.make_replay_contract(manifest_path, pack_receipt)
+                self.assertEqual(contract["result"], "pre-capture-contract")
+                self.assertEqual(
+                    contract["ordered_token_sha256"],
+                    pack_receipt["calibration"]["ordered_token_sha256"],
+                )
+                self.assertEqual(contract["batch_count"], 1)
+                self.assertEqual(
+                    contract["batch_policy"]["input_ids"]["dtype"],
+                    "torch.int64",
+                )
+                self.assertEqual(
+                    contract["capture_batch_sha256"],
+                    "sha256:9f49d0fa51324c35e17756863f404d3bd1c60c322c9126db4fa2024d3c4525b2",
+                )
+                self.assertTrue(contract["contract_id"].startswith("sha256:"))
+                contract_path = root / "replay-contract.json"
+                MODULE._write_new(
+                    contract_path,
+                    contract,
+                    validator=MODULE.validate_replay_contract,
+                )
+                self.assertEqual(MODULE.validate_replay_contract(contract_path), contract)
+
 
 if __name__ == "__main__":
     unittest.main()

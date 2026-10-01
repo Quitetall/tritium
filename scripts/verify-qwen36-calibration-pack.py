@@ -19,6 +19,7 @@ from typing import Any
 
 
 SCHEMA = "tritium.qwen36-calibration-pack-receipt.v1"
+REPLAY_CONTRACT_SCHEMA = "tritium.qwen36-calibration-replay-contract.v1"
 PACK_SCHEMA = "tritium.stage7-token-evidence-pack.v1"
 REPOSITORY = "Qwen/Qwen3.6-27B"
 REVISION = "6a9e13bd6fc8f0983b9b99948120bc37f49c13e9"
@@ -513,7 +514,160 @@ def validate_receipt(path: Path) -> dict[str, Any]:
     return value
 
 
-def _write_new(path: Path, value: dict[str, Any]) -> None:
+def _hash_field(digest: Any, tag: str, payload: bytes) -> None:
+    encoded = tag.encode("utf-8")
+    digest.update(struct.pack("<Q", len(encoded)))
+    digest.update(encoded)
+    digest.update(struct.pack("<Q", len(payload)))
+    digest.update(payload)
+
+
+def make_replay_contract(
+    manifest_path: Path,
+    pack_receipt: dict[str, Any],
+) -> dict[str, Any]:
+    """Bind pack tokens to the exact PyTorch batch hash expected by capture.
+
+    The frozen replay policy yields one calibration sequence per batch, with
+    int64 input IDs and an all-ones int64 attention mask. This is only a
+    pre-capture contract: the capture API must still replay these batches and
+    match ``capture_batch_sha256`` before it can publish each S2KF record.
+    """
+    manifest = _load_json(manifest_path, "token evidence manifest", MAX_MANIFEST_BYTES)
+    if manifest.get("pack_id") != pack_receipt.get("pack_id"):
+        raise CalibrationPackError("replay contract pack identity differs")
+    expected_pack_id = "sha256:" + hashlib.sha256(
+        canonical({key: value for key, value in manifest.items() if key != "pack_id"})
+    ).hexdigest()
+    if expected_pack_id != manifest["pack_id"]:
+        raise CalibrationPackError("replay contract manifest ID differs")
+    token_path = _safe_payload_path(
+        manifest_path.parent.resolve(strict=True), manifest["tokens"]["path"]
+    )
+    calibration = manifest["partitions"]["calibration"]["sequences"]
+    if len(calibration) != SEQUENCES_PER_PARTITION:
+        raise CalibrationPackError("replay contract calibration sequence count differs")
+    raw_tokens = hashlib.sha256()
+    batches = hashlib.sha256()
+    mask_bytes = struct.pack(
+        "<" + "q" * TOKENS_PER_SEQUENCE,
+        *([1] * TOKENS_PER_SEQUENCE),
+    )
+    payload_fd = os.open(token_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        for index, sequence in enumerate(calibration):
+            if (
+                type(sequence.get("token_offset")) is not int
+                or sequence.get("token_count") != TOKENS_PER_SEQUENCE
+            ):
+                raise CalibrationPackError("replay contract sequence geometry differs")
+            os.lseek(payload_fd, sequence["token_offset"] * 4, os.SEEK_SET)
+            encoded = bytearray()
+            remaining = TOKENS_PER_SEQUENCE * 4
+            while remaining:
+                chunk = os.read(payload_fd, remaining)
+                if not chunk:
+                    raise CalibrationPackError("replay contract token payload is truncated")
+                encoded.extend(chunk)
+                remaining -= len(chunk)
+            raw_tokens.update(encoded)
+            input_ids = struct.pack(
+                "<" + "q" * TOKENS_PER_SEQUENCE,
+                *(token[0] for token in struct.iter_unpack("<I", encoded)),
+            )
+            tensors = (("attention_mask", mask_bytes), ("input_ids", input_ids))
+            for name, tensor_bytes in tensors:
+                tag = f"batch[{index}].{name}"
+                _hash_field(batches, f"{tag}:dtype", b"torch.int64")
+                _hash_field(
+                    batches,
+                    f"{tag}:shape",
+                    canonical([1, TOKENS_PER_SEQUENCE]),
+                )
+                _hash_field(batches, f"{tag}:chunk", tensor_bytes)
+    finally:
+        os.close(payload_fd)
+    expected_raw = _sha256_text(
+        pack_receipt["calibration"]["ordered_token_sha256"],
+        "receipt calibration ordered token digest",
+        prefixed=True,
+    )
+    if raw_tokens.hexdigest() != expected_raw:
+        raise CalibrationPackError("replay contract token window differs from pack receipt")
+    contract: dict[str, Any] = {
+        "schema": REPLAY_CONTRACT_SCHEMA,
+        "result": "pre-capture-contract",
+        "pack_receipt_id": pack_receipt["receipt_id"],
+        "pack_id": pack_receipt["pack_id"],
+        "ordered_token_sha256": "sha256:" + raw_tokens.hexdigest(),
+        "capture_batch_sha256": "sha256:" + batches.hexdigest(),
+        "batch_policy": {
+            "sequences_per_batch": 1,
+            "sequence_order": "calibration manifest order",
+            "input_ids": {"dtype": "torch.int64", "shape": [1, TOKENS_PER_SEQUENCE]},
+            "attention_mask": {
+                "dtype": "torch.int64",
+                "shape": [1, TOKENS_PER_SEQUENCE],
+                "values": "all-ones",
+            },
+            "mapping_keys": "lexicographic",
+        },
+        "batch_count": SEQUENCES_PER_PARTITION,
+        "token_count": SEQUENCES_PER_PARTITION * TOKENS_PER_SEQUENCE,
+    }
+    contract["contract_id"] = "sha256:" + hashlib.sha256(canonical(contract)).hexdigest()
+    return contract
+
+
+def validate_replay_contract(path: Path) -> dict[str, Any]:
+    value = _load_json(path, "calibration replay contract", 1024 * 1024)
+    fields = {
+        "schema", "result", "pack_receipt_id", "pack_id",
+        "ordered_token_sha256", "capture_batch_sha256", "batch_policy",
+        "batch_count", "token_count", "contract_id",
+    }
+    if set(value) != fields:
+        raise CalibrationPackError("calibration replay contract fields differ")
+    contract_id = _sha256_text(value["contract_id"], "contract ID", prefixed=True)
+    content = {key: item for key, item in value.items() if key != "contract_id"}
+    if hashlib.sha256(canonical(content)).hexdigest() != contract_id:
+        raise CalibrationPackError("calibration replay contract ID differs")
+    policy = {
+        "sequences_per_batch": 1,
+        "sequence_order": "calibration manifest order",
+        "input_ids": {"dtype": "torch.int64", "shape": [1, TOKENS_PER_SEQUENCE]},
+        "attention_mask": {
+            "dtype": "torch.int64",
+            "shape": [1, TOKENS_PER_SEQUENCE],
+            "values": "all-ones",
+        },
+        "mapping_keys": "lexicographic",
+    }
+    for field in (
+        "pack_receipt_id",
+        "pack_id",
+        "ordered_token_sha256",
+        "capture_batch_sha256",
+    ):
+        _sha256_text(value[field], f"contract.{field}", prefixed=True)
+    if (
+        value["schema"] != REPLAY_CONTRACT_SCHEMA
+        or value["result"] != "pre-capture-contract"
+        or value["batch_policy"] != policy
+        or type(value["batch_count"]) is not int
+        or value["batch_count"] != SEQUENCES_PER_PARTITION
+        or type(value["token_count"]) is not int
+        or value["token_count"] != SEQUENCES_PER_PARTITION * TOKENS_PER_SEQUENCE
+    ):
+        raise CalibrationPackError("calibration replay contract policy or geometry differs")
+    return value
+
+
+def _write_new(
+    path: Path,
+    value: dict[str, Any],
+    validator=validate_receipt,
+) -> None:
     if path.parent.is_symlink() or not path.parent.is_dir():
         raise CalibrationPackError("receipt parent must be an ordinary existing directory")
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
@@ -529,7 +683,7 @@ def _write_new(path: Path, value: dict[str, Any]) -> None:
             stream.write(encoded + b"\n")
             stream.flush()
             os.fsync(stream.fileno())
-        if validate_receipt(path) != value:
+        if validator(path) != value:
             raise CalibrationPackError("durable calibration receipt changed after publication")
     except OSError as error:
         path.unlink(missing_ok=True)
@@ -556,14 +710,43 @@ def main() -> int:
     parser.add_argument("--manifest", required=True, type=Path)
     parser.add_argument("--model-dir", required=True, type=Path)
     parser.add_argument("--official-source-identity", required=True, type=Path)
-    parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--output", type=Path)
+    parser.add_argument(
+        "--existing-receipt",
+        type=Path,
+        help="reopen and recheck an already published pack receipt instead of writing one",
+    )
+    parser.add_argument(
+        "--replay-contract-output",
+        type=Path,
+        help="optionally write a pre-capture digest contract for the frozen Qwen batch policy",
+    )
     args = parser.parse_args()
+    if (args.output is None) == (args.existing_receipt is None):
+        parser.error("provide exactly one of --output or --existing-receipt")
     try:
         receipt = verify_pack(args.manifest, args.model_dir, args.official_source_identity)
-        _write_new(args.output, receipt)
+        if args.existing_receipt is not None:
+            existing = validate_receipt(args.existing_receipt)
+            if existing != receipt:
+                raise CalibrationPackError("existing pack receipt differs from current inputs")
+        else:
+            _write_new(args.output, receipt)
+        if args.replay_contract_output is not None:
+            contract = make_replay_contract(args.manifest, receipt)
+            _write_new(
+                args.replay_contract_output,
+                contract,
+                validator=validate_replay_contract,
+            )
     except (CalibrationPackError, OSError) as error:
         parser.error(str(error))
     print(f"PASS {receipt['receipt_id']} pack={receipt['pack_id']}")
+    if args.replay_contract_output is not None:
+        print(
+            f"PRE-CAPTURE {contract['contract_id']} "
+            f"batch={contract['capture_batch_sha256']}"
+        )
     return 0
 
 
