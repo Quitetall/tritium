@@ -115,7 +115,12 @@ test("no-op structural WebGPU cannot produce a physical lane", async () => {
               description: "structural test adapter",
               isFallbackAdapter: false,
             },
-            async requestDevice() {
+            async requestDevice(descriptor) {
+              assert.equal(
+                descriptor.requiredLimits.maxStorageBuffersPerShaderStage,
+                9,
+              );
+              assert.equal(descriptor.requiredLimits.maxUniformBuffersPerShaderStage, 1);
               const device = new FakeDevice();
               devices.push(device);
               return device;
