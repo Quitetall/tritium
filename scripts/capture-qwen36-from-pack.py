@@ -37,6 +37,29 @@ def _validate_digest(value: str, label: str) -> None:
         raise ValueError(f"{label} must be 64 hexadecimal characters")
 
 
+def _validate_capture_recipe(args: argparse.Namespace) -> None:
+    if args.curvature is None:
+        raise ValueError("--execute requires --curvature")
+    if args.damping is None:
+        raise ValueError("--execute requires --damping")
+    if args.activation_cache_digest is None:
+        raise ValueError("--execute requires --activation-cache-digest")
+    _validate_digest(args.activation_cache_digest, "activation-cache digest")
+    if args.curvature == "guided-fisher" and args.guided_loss_reduction is None:
+        raise ValueError("guided-fisher requires --guided-loss-reduction")
+    if args.curvature != "guided-fisher" and args.guided_loss_reduction is not None:
+        raise ValueError("--guided-loss-reduction is valid only for guided-fisher")
+    if args.max_shared_modules <= 0 or min(
+        args.max_evidence_bytes,
+        args.max_batch_bytes,
+        args.max_capture_bytes,
+        args.max_objective_bytes,
+    ) <= 0:
+        raise ValueError("capture limits must be positive")
+    if not math.isfinite(args.damping) or args.damping < 0:
+        raise ValueError("damping must be finite and nonnegative")
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", required=True, type=Path)
@@ -50,15 +73,13 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--declared-revision", default=PINNED_REVISION)
     parser.add_argument(
         "--activation-cache-digest",
-        required=True,
         help="64-hex digest from the frozen activation-cache recipe; never inferred",
     )
     parser.add_argument(
         "--curvature",
-        required=True,
         choices=("input-hessian", "guided-fisher", "forward-kl-kronecker"),
     )
-    parser.add_argument("--damping", required=True, type=float)
+    parser.add_argument("--damping", type=float)
     parser.add_argument(
         "--guided-loss-reduction",
         choices=("sum", "mean-attention-mask", "mean-valid-causal-labels"),
@@ -100,20 +121,6 @@ def main() -> int:
         max_memory = _parse_max_memory(args.max_memory)
         if args.declared_revision != replay.receipt["revision"]:
             raise ValueError("declared revision differs from verified Qwen source")
-        _validate_digest(args.activation_cache_digest, "activation-cache digest")
-        if args.curvature == "guided-fisher" and args.guided_loss_reduction is None:
-            raise ValueError("guided-fisher requires --guided-loss-reduction")
-        if args.curvature != "guided-fisher" and args.guided_loss_reduction is not None:
-            raise ValueError("--guided-loss-reduction is valid only for guided-fisher")
-        if args.max_shared_modules <= 0 or min(
-            args.max_evidence_bytes,
-            args.max_batch_bytes,
-            args.max_capture_bytes,
-            args.max_objective_bytes,
-        ) <= 0:
-            raise ValueError("capture limits must be positive")
-        if not math.isfinite(args.damping) or args.damping < 0:
-            raise ValueError("damping must be finite and nonnegative")
     except (OSError, ValueError) as error:
         parser.error(str(error))
 
@@ -127,8 +134,12 @@ def main() -> int:
         print("NOT STARTED: model load and capture require --execute")
         return 0
 
-    if not args.offload_folder:
-        parser.error("--execute requires an explicit --offload-folder")
+    try:
+        _validate_capture_recipe(args)
+        if not args.offload_folder:
+            raise ValueError("--execute requires an explicit --offload-folder")
+    except ValueError as error:
+        parser.error(str(error))
     try:
         import torch
         from transformers import AutoModelForImageTextToText
