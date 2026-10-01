@@ -9,13 +9,11 @@
 
 use core::any::Any;
 
-use tritium_core::{
-    AdditiveView, GemmShape, TernaryFormat, Trit, reference_mpgemm, reference_ternary_matmul,
-};
+use tritium_core::{GemmShape, TernaryFormat, Trit, reference_mpgemm, reference_ternary_matmul};
+use tritium_format::AdditiveTensor;
 use tritium_format::{
     TQ1_0_BLOCK_BYTES, TQ2_0_BLOCK_BYTES, num_blocks, unpack_tq1_0_row, unpack_tq2_0_row,
 };
-use tritium_schema::AdditiveLayout;
 use tritium_spec::{
     BackendError, DeviceBuffer, DeviceCaps, MpGemm, TensorMatmul, TensorView, TernaryBackend,
 };
@@ -43,15 +41,12 @@ impl DeviceBuffer for RefBuffer {
 /// Owned semantic additive tensor held by the additive reference path.
 #[derive(Debug)]
 struct RefAdditiveBuffer {
-    layout: AdditiveLayout,
-    plane_count: u8,
-    trits: Vec<Trit>,
-    scales: Vec<f32>,
+    tensor: AdditiveTensor,
 }
 
 impl DeviceBuffer for RefAdditiveBuffer {
     fn len_bytes(&self) -> usize {
-        self.trits.len() + self.scales.len() * core::mem::size_of::<f32>()
+        self.tensor.trits().len() + core::mem::size_of_val(self.tensor.scales())
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -100,14 +95,21 @@ impl TernaryBackend for ReferenceBackend {
 
     fn upload_tensor(&self, tensor: TensorView<'_>) -> Result<Box<dyn DeviceBuffer>, BackendError> {
         match tensor {
-            TensorView::Additive(view) => Ok(Box::new(RefAdditiveBuffer {
-                layout: view.layout(),
-                plane_count: u8::try_from(view.plane_count()).map_err(|_| {
+            TensorView::Additive(view) => {
+                let plane_count = u8::try_from(view.plane_count()).map_err(|_| {
                     BackendError::InvalidInput("additive plane count exceeds u8".into())
-                })?,
-                trits: view.trits().to_vec(),
-                scales: view.scales().to_vec(),
-            })),
+                })?;
+                let tensor = AdditiveTensor::new(
+                    view.layout(),
+                    plane_count,
+                    view.trits().to_vec(),
+                    view.scales().to_vec(),
+                )
+                .map_err(|error| {
+                    BackendError::InvalidInput(format!("invalid additive tensor: {error:?}"))
+                })?;
+                Ok(Box::new(RefAdditiveBuffer { tensor }))
+            }
             TensorView::Dense { rows, cols, values } => {
                 let expected = rows.checked_mul(cols).ok_or_else(|| {
                     BackendError::InvalidInput("dense tensor dimensions overflow".into())
@@ -129,10 +131,7 @@ impl TernaryBackend for ReferenceBackend {
 
     fn matmul(&self, p: TensorMatmul<'_>) -> Result<(), BackendError> {
         if let Some(buf) = p.tensor.as_any().downcast_ref::<RefAdditiveBuffer>() {
-            let view = AdditiveView::new(buf.layout, buf.plane_count, &buf.trits, &buf.scales)
-                .map_err(|e| {
-                    BackendError::InvalidInput(format!("invalid reference tensor: {e:?}"))
-                })?;
+            let view = buf.tensor.view();
             return reference_ternary_matmul(p.act, &view, p.batch, p.transformed_act, p.out)
                 .map_err(|e| {
                     BackendError::InvalidInput(format!("reference matmul failed: {e:?}"))

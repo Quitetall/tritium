@@ -40,6 +40,7 @@ use core::fmt;
 use half::f16;
 use tritium_core::TritError;
 
+mod additive_tensor;
 mod artifact;
 mod codec_bundle;
 mod entropy_transport;
@@ -72,6 +73,7 @@ mod tqbin;
 mod tqidx;
 mod training_salt;
 
+pub use additive_tensor::{AdditiveTensor, AdditiveTensorError};
 pub use artifact::{
     ArtifactError, ModelId, PackageHasher, PackageId, SemanticModelManifest, SemanticTensor,
     SemanticTensorHasher,
