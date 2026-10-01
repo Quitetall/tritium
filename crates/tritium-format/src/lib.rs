@@ -109,7 +109,7 @@ pub use runtime_evidence::{
     RuntimeBlockOutputsAccumulator, RuntimeBlockOutputsEvidence, RuntimeEvidenceError,
     RuntimeFinalLogitsAccumulator, RuntimeFinalLogitsEvidence,
     RuntimeOutputReconstructionAccumulator, RuntimeOutputReconstructionEvidence,
-    RuntimeOutputScope,
+    RuntimeOutputScope, RuntimeOutputScopeAccumulator, RuntimeOutputScopeEvidence,
 };
 pub use safetensors::{
     SafeTensors, SafeTensorsError, SafeTensorsReader, VisitTensorBytesError, read_safetensors,

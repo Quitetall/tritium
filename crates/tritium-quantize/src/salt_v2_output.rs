@@ -5,7 +5,8 @@ use std::collections::BTreeSet;
 
 use tritium_format::{
     ModelId, RuntimeEvidenceError, RuntimeFinalLogitsAccumulator,
-    RuntimeOutputReconstructionAccumulator, RuntimeOutputScope,
+    RuntimeOutputReconstructionAccumulator, RuntimeOutputScope, RuntimeOutputScopeAccumulator,
+    RuntimeOutputScopeEvidence,
 };
 
 mod codec;
@@ -282,6 +283,7 @@ pub struct OutputReconstructionAccumulator {
     final_tokens: u64,
     teacher_hasher: blake3::Hasher,
     student_outputs: RuntimeOutputReconstructionAccumulator,
+    student_scope_outputs: Vec<RuntimeOutputScopeAccumulator>,
     runtime_final_logits: RuntimeFinalLogitsAccumulator,
 }
 
@@ -306,6 +308,29 @@ impl OutputReconstructionAccumulator {
             initialization_seed,
         )
         .map_err(map_runtime_evidence_error)?;
+        let mut student_scope_outputs = Vec::new();
+        student_scope_outputs
+            .try_reserve_exact(spec.scopes().len())
+            .map_err(|_| OutputReconstructionError::ReceiptAllocationFailed)?;
+        for scope in spec.scopes() {
+            student_scope_outputs.push(
+                RuntimeOutputScopeAccumulator::new(
+                    spec.spec_id(),
+                    &candidate_id,
+                    initialization_seed,
+                    match scope {
+                        OutputReconstructionScope::Block { start, end } => {
+                            RuntimeOutputScope::Block {
+                                start: *start,
+                                end: *end,
+                            }
+                        }
+                        OutputReconstructionScope::FinalLogits => RuntimeOutputScope::FinalLogits,
+                    },
+                )
+                .map_err(map_runtime_evidence_error)?,
+            );
+        }
         Ok(Self {
             spec: spec.clone(),
             candidate_id,
@@ -320,6 +345,7 @@ impl OutputReconstructionAccumulator {
             final_tokens: 0,
             teacher_hasher,
             student_outputs,
+            student_scope_outputs,
             runtime_final_logits: RuntimeFinalLogitsAccumulator::new(),
         })
     }
@@ -405,6 +431,9 @@ impl OutputReconstructionAccumulator {
                 student,
             )
             .map_err(map_runtime_evidence_error)?;
+        self.student_scope_outputs[self.scope_index]
+            .observe(batch_index, rows, columns, mask, student)
+            .map_err(map_runtime_evidence_error)?;
         match scope {
             OutputReconstructionScope::Block { .. } => {
                 for (row, selected) in mask.iter().copied().enumerate() {
@@ -472,6 +501,24 @@ impl OutputReconstructionAccumulator {
     /// # Errors
     /// Rejects incomplete scope coverage or missing block/logit measurements.
     pub fn finish(self) -> Result<OutputCandidateReceipt, OutputReconstructionError> {
+        self.finish_with_scope_evidence()
+            .map(|(candidate, _)| candidate)
+    }
+
+    /// Seal one candidate together with independent, batch-ordered digests for
+    /// every reconstruction scope.
+    ///
+    /// The scope digests let a runtime observe block-major model execution and
+    /// later compare each selected block/window without retaining activation
+    /// matrices or replaying the model once per scope. They are separate from
+    /// the frozen aggregate `student_output_digest` stored in `TSV2OUT` v2.
+    ///
+    /// # Errors
+    /// Rejects incomplete scope coverage or missing block/logit measurements.
+    pub fn finish_with_scope_evidence(
+        self,
+    ) -> Result<(OutputCandidateReceipt, Vec<RuntimeOutputScopeEvidence>), OutputReconstructionError>
+    {
         if self.scope_index != self.spec.scopes.len() || self.batch_index != 0 {
             return Err(OutputReconstructionError::IncompleteCandidate);
         }
@@ -497,6 +544,13 @@ impl OutputReconstructionAccumulator {
             .runtime_final_logits
             .finish()
             .map_err(map_runtime_evidence_error)?;
+        let mut scope_evidence = Vec::new();
+        scope_evidence
+            .try_reserve_exact(self.student_scope_outputs.len())
+            .map_err(|_| OutputReconstructionError::ReceiptAllocationFailed)?;
+        for output in self.student_scope_outputs {
+            scope_evidence.push(output.finish().map_err(map_runtime_evidence_error)?);
+        }
         let mut receipt = OutputCandidateReceipt {
             spec_id: self.spec.spec_id,
             candidate_id: self.candidate_id,
@@ -516,7 +570,7 @@ impl OutputReconstructionAccumulator {
             receipt_id: [0; 32],
         };
         receipt.receipt_id = receipt.derive_id();
-        Ok(receipt)
+        Ok((receipt, scope_evidence))
     }
 }
 
@@ -950,6 +1004,7 @@ const fn map_runtime_evidence_error(error: RuntimeEvidenceError) -> OutputRecons
             OutputReconstructionError::MissingCandidateIdentity
         }
         RuntimeEvidenceError::EmptySelection => OutputReconstructionError::EmptyTokenSelection,
+        RuntimeEvidenceError::InvalidBatchOrder => OutputReconstructionError::InvalidGeometry,
     }
 }
 

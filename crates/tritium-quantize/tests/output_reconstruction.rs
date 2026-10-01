@@ -138,6 +138,95 @@ fn block_and_teacher_logit_objectives_select_best_restart() {
 }
 
 #[test]
+fn candidate_finish_exposes_streamed_per_scope_evidence_for_single_pass_runtime_binding() {
+    let spec = spec(
+        OutputReconstructionSchedule::SlidingWindows {
+            block_count: 4,
+            window_size: 2,
+            stride: 1,
+        },
+        1,
+    );
+    let mut candidate =
+        OutputReconstructionAccumulator::new(&spec, [7; 32], 13).expect("valid candidate");
+    for scope in spec.scopes() {
+        match scope {
+            OutputReconstructionScope::Block { start, end } => {
+                let values = [*start as f32, *end as f32];
+                candidate
+                    .observe(*scope, 0, 1, 2, &[true], &values, &values)
+                    .expect("block observation");
+            }
+            OutputReconstructionScope::FinalLogits => candidate
+                .observe(*scope, 0, 1, 2, &[true], &[0.0, 0.0], &[1.0, -1.0])
+                .expect("logit observation"),
+        }
+    }
+
+    let (candidate, scopes) = candidate
+        .finish_with_scope_evidence()
+        .expect("complete candidate and scope evidence");
+    assert_eq!(scopes.len(), spec.scopes().len());
+    for (evidence, scope) in scopes.iter().zip(spec.scopes()) {
+        assert_eq!(
+            evidence.scope(),
+            match scope {
+                OutputReconstructionScope::Block { start, end } => {
+                    tritium_format::RuntimeOutputScope::Block {
+                        start: *start,
+                        end: *end,
+                    }
+                }
+                OutputReconstructionScope::FinalLogits => {
+                    tritium_format::RuntimeOutputScope::FinalLogits
+                }
+            }
+        );
+        assert_eq!(
+            evidence.observation_count(),
+            u64::from(spec.batches_per_scope())
+        );
+        assert!(evidence.value_count() > 0);
+        assert_ne!(evidence.digest(), &[0; 32]);
+    }
+    assert_ne!(candidate.student_output_digest(), &[0; 32]);
+}
+
+#[test]
+fn candidate_scope_evidence_preserves_batch_order_and_counts_across_each_scope() {
+    let spec = OutputReconstructionSpec::new(
+        ModelId::from_digest([1; 32]),
+        [2; 32],
+        [3; 32],
+        [4; 32],
+        OutputReconstructionSchedule::Blocks { block_count: 1 },
+        OutputObjectiveWeights::new(1.0, 0.0, 1.0, 1.0).expect("valid weights"),
+        2,
+        1,
+    )
+    .expect("valid two-batch spec");
+    let mut candidate =
+        OutputReconstructionAccumulator::new(&spec, [6; 32], 12).expect("valid candidate");
+    for scope in spec.scopes() {
+        for batch_index in 0..2 {
+            let batch = batch_index as f32;
+            let teacher = [batch + 1.0, batch + 2.0];
+            candidate
+                .observe(*scope, batch_index, 1, 2, &[true], &teacher, &teacher)
+                .expect("ordered observation");
+        }
+    }
+    let (_, scopes) = candidate
+        .finish_with_scope_evidence()
+        .expect("complete candidate");
+    assert_eq!(scopes.len(), 2);
+    for evidence in scopes {
+        assert_eq!(evidence.observation_count(), 2);
+        assert_eq!(evidence.value_count(), 4);
+    }
+}
+
+#[test]
 fn selected_runtime_final_logits_use_the_shared_execution_digest_domain() {
     let spec = spec(OutputReconstructionSchedule::Blocks { block_count: 1 }, 1);
     let candidate = exact_candidate(&spec, [5; 32], 7, &[3.0, -2.0]);

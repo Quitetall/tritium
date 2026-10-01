@@ -6,6 +6,8 @@ const FINAL_LOGITS_CONTEXT: &str = "tritium qwen3.5 runtime final logits v1";
 const BLOCK_OUTPUTS_CONTEXT: &str = "tritium qwen3.5 runtime block outputs v1";
 const OUTPUT_RECONSTRUCTION_STUDENT_CONTEXT: &str =
     "tritium salt v2 output reconstruction student v1";
+const OUTPUT_RECONSTRUCTION_SCOPE_CONTEXT: &str =
+    "tritium salt output reconstruction scope student v1";
 const MAX_FINAL_LOGIT_BATCHES: u64 = 1 << 20;
 const MAX_BLOCK_OUTPUT_OBSERVATIONS: u64 = 1 << 24;
 
@@ -26,6 +28,8 @@ pub enum RuntimeEvidenceError {
     MissingIdentity,
     /// A row-selection mask selected no values.
     EmptySelection,
+    /// Scope output batches were not observed in canonical order.
+    InvalidBatchOrder,
 }
 
 impl fmt::Display for RuntimeEvidenceError {
@@ -40,6 +44,9 @@ impl fmt::Display for RuntimeEvidenceError {
             }
             Self::MissingIdentity => formatter.write_str("runtime evidence identity is missing"),
             Self::EmptySelection => formatter.write_str("runtime evidence selected no rows"),
+            Self::InvalidBatchOrder => {
+                formatter.write_str("runtime evidence batch indexes are not in order")
+            }
         }
     }
 }
@@ -320,6 +327,171 @@ pub struct RuntimeOutputReconstructionAccumulator {
     value_count: u64,
 }
 
+/// Streaming evidence for one output-reconstruction scope across ordered batches.
+#[derive(Clone, Debug)]
+pub struct RuntimeOutputScopeAccumulator {
+    scope: RuntimeOutputScope,
+    hasher: blake3::Hasher,
+    observation_count: u64,
+    value_count: u64,
+    next_batch_index: u32,
+}
+
+/// Sealed digest and counts for one output-reconstruction scope.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RuntimeOutputScopeEvidence {
+    scope: RuntimeOutputScope,
+    digest: [u8; 32],
+    observation_count: u64,
+    value_count: u64,
+}
+
+impl RuntimeOutputScopeEvidence {
+    /// Scope represented by the digest.
+    #[must_use]
+    pub const fn scope(self) -> RuntimeOutputScope {
+        self.scope
+    }
+
+    /// Content digest bound to the scope, candidate, seed, and ordered batches.
+    #[must_use]
+    pub const fn digest(&self) -> &[u8; 32] {
+        &self.digest
+    }
+
+    /// Number of ordered batch observations.
+    #[must_use]
+    pub const fn observation_count(self) -> u64 {
+        self.observation_count
+    }
+
+    /// Number of f32 values included in the digest.
+    #[must_use]
+    pub const fn value_count(self) -> u64 {
+        self.value_count
+    }
+}
+
+impl RuntimeOutputScopeAccumulator {
+    /// Start a scope digest bound to one reconstruction spec, candidate, and seed.
+    ///
+    /// # Errors
+    /// Rejects zero spec or candidate identities and malformed scope ranges.
+    pub fn new(
+        spec_id: &[u8; 32],
+        candidate_id: &[u8; 32],
+        initialization_seed: u64,
+        scope: RuntimeOutputScope,
+    ) -> Result<Self, RuntimeEvidenceError> {
+        if spec_id == &[0; 32] || candidate_id == &[0; 32] {
+            return Err(RuntimeEvidenceError::MissingIdentity);
+        }
+        let mut hasher = blake3::Hasher::new_derive_key(OUTPUT_RECONSTRUCTION_SCOPE_CONTEXT);
+        hasher.update(spec_id);
+        hasher.update(candidate_id);
+        hasher.update(&initialization_seed.to_le_bytes());
+        match scope {
+            RuntimeOutputScope::Block { start, end } if start < end => {
+                hasher.update(&[1]);
+                hasher.update(&start.to_le_bytes());
+                hasher.update(&end.to_le_bytes());
+            }
+            RuntimeOutputScope::Block { .. } => {
+                return Err(RuntimeEvidenceError::InvalidGeometry);
+            }
+            RuntimeOutputScope::FinalLogits => {
+                hasher.update(&[2]);
+            }
+        }
+        Ok(Self {
+            scope,
+            hasher,
+            observation_count: 0,
+            value_count: 0,
+            next_batch_index: 0,
+        })
+    }
+
+    /// Observe one finite row-major output matrix in strictly increasing batch order.
+    ///
+    /// # Errors
+    /// Rejects malformed geometry, an empty selection, non-finite values,
+    /// out-of-order batch indexes, or counter overflow.
+    pub fn observe(
+        &mut self,
+        batch_index: u32,
+        rows: usize,
+        columns: usize,
+        mask: &[bool],
+        values: &[f32],
+    ) -> Result<(), RuntimeEvidenceError> {
+        let expected_values = rows
+            .checked_mul(columns)
+            .ok_or(RuntimeEvidenceError::InvalidGeometry)?;
+        if rows == 0 || columns == 0 || mask.len() != rows || values.len() != expected_values {
+            return Err(RuntimeEvidenceError::InvalidGeometry);
+        }
+        if mask.iter().all(|selected| !selected) {
+            return Err(RuntimeEvidenceError::EmptySelection);
+        }
+        if values.iter().any(|value| !value.is_finite()) {
+            return Err(RuntimeEvidenceError::NonFiniteOutput);
+        }
+        if batch_index != self.next_batch_index {
+            return Err(RuntimeEvidenceError::InvalidBatchOrder);
+        }
+        if self.scope == RuntimeOutputScope::FinalLogits && columns < 2 {
+            return Err(RuntimeEvidenceError::InvalidGeometry);
+        }
+        let row_count = u64::try_from(rows).map_err(|_| RuntimeEvidenceError::CountOverflow)?;
+        let column_count =
+            u64::try_from(columns).map_err(|_| RuntimeEvidenceError::CountOverflow)?;
+        let value_count =
+            u64::try_from(values.len()).map_err(|_| RuntimeEvidenceError::CountOverflow)?;
+        let next_observations = self
+            .observation_count
+            .checked_add(1)
+            .ok_or(RuntimeEvidenceError::CountOverflow)?;
+        let next_values = self
+            .value_count
+            .checked_add(value_count)
+            .ok_or(RuntimeEvidenceError::CountOverflow)?;
+        let next_batch_index = self
+            .next_batch_index
+            .checked_add(1)
+            .ok_or(RuntimeEvidenceError::CountOverflow)?;
+        self.hasher.update(&batch_index.to_le_bytes());
+        self.hasher.update(&row_count.to_le_bytes());
+        self.hasher.update(&column_count.to_le_bytes());
+        for selected in mask {
+            self.hasher.update(&[u8::from(*selected)]);
+        }
+        for value in values {
+            self.hasher.update(&value.to_bits().to_le_bytes());
+        }
+        self.observation_count = next_observations;
+        self.value_count = next_values;
+        self.next_batch_index = next_batch_index;
+        Ok(())
+    }
+
+    /// Seal a non-empty scope stream.
+    ///
+    /// # Errors
+    /// Rejects a scope with no batch observations.
+    pub fn finish(self) -> Result<RuntimeOutputScopeEvidence, RuntimeEvidenceError> {
+        if self.observation_count == 0 || self.value_count == 0 {
+            return Err(RuntimeEvidenceError::EmptyStream);
+        }
+        Ok(RuntimeOutputScopeEvidence {
+            scope: self.scope,
+            digest: *self.hasher.finalize().as_bytes(),
+            observation_count: self.observation_count,
+            value_count: self.value_count,
+        })
+    }
+}
+
 impl RuntimeOutputReconstructionAccumulator {
     /// Start a stream bound to one reconstruction spec, candidate, and seed.
     ///
@@ -566,6 +738,46 @@ mod tests {
                 &[1.0, 2.0],
             ),
             Err(RuntimeEvidenceError::EmptySelection)
+        );
+    }
+
+    #[test]
+    fn candidate_scope_stream_is_ordered_scope_and_identity_bound() {
+        fn stream(scope: RuntimeOutputScope, candidate: &[u8; 32]) -> [u8; 32] {
+            let mut accumulator =
+                RuntimeOutputScopeAccumulator::new(&[1; 32], candidate, 3, scope).unwrap();
+            accumulator
+                .observe(0, 2, 2, &[true, false], &[1.0, 2.0, 3.0, 4.0])
+                .unwrap();
+            accumulator.observe(1, 1, 2, &[true], &[5.0, 6.0]).unwrap();
+            let evidence = accumulator.finish().unwrap();
+            assert_eq!(evidence.scope(), scope);
+            assert_eq!(evidence.observation_count(), 2);
+            assert_eq!(evidence.value_count(), 6);
+            *evidence.digest()
+        }
+
+        let block = RuntimeOutputScope::Block { start: 2, end: 5 };
+        let expected = stream(block, &[2; 32]);
+        assert_ne!(
+            expected,
+            stream(RuntimeOutputScope::Block { start: 1, end: 5 }, &[2; 32])
+        );
+        assert_ne!(expected, stream(block, &[3; 32]));
+    }
+
+    #[test]
+    fn candidate_scope_stream_rejects_batch_reordering_and_empty_scope() {
+        let scope = RuntimeOutputScope::FinalLogits;
+        let mut accumulator =
+            RuntimeOutputScopeAccumulator::new(&[1; 32], &[2; 32], 3, scope).unwrap();
+        assert_eq!(
+            accumulator.observe(1, 1, 2, &[true], &[1.0, 2.0]),
+            Err(RuntimeEvidenceError::InvalidBatchOrder)
+        );
+        assert_eq!(
+            accumulator.finish().err(),
+            Some(RuntimeEvidenceError::EmptyStream)
         );
     }
 }
