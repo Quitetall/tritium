@@ -126,6 +126,31 @@ fn reference_backend_uploads_and_executes_additive_tensors() {
 }
 
 #[test]
+fn reference_backend_executes_dense_tensors() {
+    let backend = tritium_testkit::ReferenceBackend::new();
+    let tensor = backend
+        .upload_tensor(TensorView::Dense {
+            rows: 2,
+            cols: 3,
+            values: &[1.0, 2.0, 3.0, -1.0, 0.5, 2.0],
+        })
+        .expect("reference backend accepts dense tensors");
+    let mut transformed = [0.0; 3];
+    let mut output = [0.0; 2];
+    backend
+        .matmul(TensorMatmul {
+            act: &[2.0, -1.0, 4.0],
+            tensor: &*tensor,
+            batch: 1,
+            transformed_act: &mut transformed,
+            out: &mut output,
+        })
+        .expect("reference backend executes dense tensors");
+    assert_eq!(transformed, [2.0, -1.0, 4.0]);
+    assert_close(&output, &[12.0, 5.5]);
+}
+
+#[test]
 fn frozen_tied_group_three_plane_reference_vector() {
     let trits = [
         Trit::POS,
