@@ -8,3 +8,7 @@ Schema, CDDL, TypeScript, and Python typing projections from these Rust types; r
 to update them, or pass `--check` to detect drift. Generated outputs live under
 `schemas/json/v1`, `schemas/cddl`, `schemas/typescript`, and `schemas/python` at
 the workspace root and are checked by CI.
+
+The `.trit` container byte-layout document is generated from the reference codec
+constants with `cargo run -p tritium-format --bin
+tritium-format-projections`, or checked with `--check`.
