@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -16,7 +17,47 @@ MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 
 
+class _CompleteSession:
+    def __init__(self, receipt):
+        self.receipt = receipt
+
+    def next_request(self):
+        return None
+
+    def finish(self):
+        return self.receipt
+
+
 class QwenCalibrationReplayTests(unittest.TestCase):
+    def _open_replay(self, token_bytes: bytes):
+        receipt = {
+            "receipt_id": "sha256:" + "b" * 64,
+            "pack_id": "sha256:" + "c" * 64,
+            "source_model_id": "d" * 64,
+            "revision": MODULE._VERIFIER["REVISION"],
+        }
+        contract = {
+            "contract_id": "sha256:" + "e" * 64,
+            "capture_batch_sha256": "sha256:" + "f" * 64,
+            "pack_receipt_id": receipt["receipt_id"],
+            "pack_id": receipt["pack_id"],
+        }
+        with patch.dict(
+            MODULE._VERIFIER,
+            {
+                "validate_receipt": lambda _path: receipt,
+                "verify_pack": lambda *_args: receipt,
+                "make_replay_contract": lambda *_args: contract,
+            }
+        ), patch.object(MODULE, "_read_calibration_tokens", return_value=token_bytes):
+            replay = MODULE.Qwen36CalibrationReplay.open(
+                Path("manifest"),
+                Path("model"),
+                Path("official-identity"),
+                Path("pack-receipt"),
+            )
+        return replay, receipt, contract
+
     def test_batches_follow_the_frozen_single_sequence_policy(self):
         token_bytes = b"\x07\x00\x00\x00\x09\x00\x00\x00"
         with patch.dict(
@@ -123,6 +164,74 @@ class QwenCalibrationReplayTests(unittest.TestCase):
                     token_bytes, lambda values, shape: values
                 )
             )
+
+    def test_native_capture_receipt_binds_and_reopens_exact_evidence_set(self):
+        replay, pack_receipt, replay_contract = self._open_replay(b"tokens")
+        native = SimpleNamespace(
+            source_model_digest=pack_receipt["source_model_id"],
+            activation_cache_digest="1" * 64,
+            token_stream_digest=replay.token_stream_digest.removeprefix("sha256:"),
+            evidence_set_digest="2" * 64,
+            curvature="input-hessian",
+            damping=0.01,
+            records=506,
+            produced=506,
+            reused=0,
+        )
+        binding = replay.capture_binding(native)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            evidence_dir = root / "evidence"
+            evidence_dir.mkdir()
+            binding_path = root / "binding.json"
+            MODULE.write_capture_binding(binding_path, binding)
+            self.assertEqual(MODULE.validate_capture_binding(binding_path), binding)
+            with patch.dict(
+                MODULE._VERIFIER,
+                {
+                    "validate_receipt": lambda _path: pack_receipt,
+                    "validate_replay_contract": lambda _path: replay_contract,
+                    "verify_pack": lambda *_args: pack_receipt,
+                    "make_replay_contract": lambda *_args: replay_contract,
+                },
+            ), patch.object(
+                MODULE, "_read_calibration_tokens", return_value=b"tokens"
+            ):
+                reopened = MODULE.reopen_capture_binding(
+                    binding_path,
+                    manifest_path=root / "manifest.json",
+                    official_source_identity_path=root / "identity.json",
+                    pack_receipt_path=root / "pack.json",
+                    replay_contract_path=root / "replay.json",
+                    model_dir=root / "model",
+                    work_dir=root / "work",
+                    evidence_dir=evidence_dir,
+                    declared_revision=MODULE._VERIFIER["REVISION"],
+                    session_factory=lambda *args, **kwargs: _CompleteSession(native),
+                )
+            self.assertEqual(reopened, binding)
+
+    def test_capture_binding_rejects_wrong_replay_or_incomplete_catalog(self):
+        replay, pack_receipt, _contract = self._open_replay(b"tokens")
+        common = dict(
+            source_model_digest=pack_receipt["source_model_id"],
+            activation_cache_digest="1" * 64,
+            token_stream_digest="0" * 64,
+            evidence_set_digest="2" * 64,
+            curvature="input-hessian",
+            damping=0.01,
+            records=506,
+            produced=506,
+            reused=0,
+        )
+        with self.assertRaisesRegex(ValueError, "replay digest"):
+            replay.capture_binding(SimpleNamespace(**common))
+        common["token_stream_digest"] = replay.token_stream_digest.removeprefix(
+            "sha256:"
+        )
+        common["records"] = 505
+        with self.assertRaisesRegex(ValueError, "complete 506-record"):
+            replay.capture_binding(SimpleNamespace(**common))
 
     def test_unverified_constructor_is_not_available(self):
         with self.assertRaisesRegex(TypeError, "use Qwen36CalibrationReplay.open"):

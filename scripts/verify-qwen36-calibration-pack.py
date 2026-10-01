@@ -688,7 +688,7 @@ def _write_new(
     except OSError as error:
         path.unlink(missing_ok=True)
         raise CalibrationPackError("cannot durably write calibration pack receipt") from error
-    except CalibrationPackError:
+    except ValueError:
         path.unlink(missing_ok=True)
         raise
     if os.name == "posix":

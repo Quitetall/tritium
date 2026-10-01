@@ -288,6 +288,13 @@ model replay: the actual capture must use this factory, persist a native capture
 receipt binding its digest to the ordered S2KF set, and freshly reopen all 506
 records before fitting.
 
+The replay helper now exposes `capture_binding()` and durable
+`write_capture_binding()` for the native capture result. The separate
+`scripts/verify-qwen36-capture-binding.py` command revalidates the source pack,
+contract, native session identity and ordered S2KF evidence-set digest. Its
+reopen path is covered with a fake native session in unit tests only; no real
+Qwen capture receipt or complete 506-record evidence namespace exists yet.
+
 ### Hosted package evidence from PR #51 (2026-10-01)
 
 PR #51 (`bbbafd99cada6dab821cea63e5cdf971f1ce79fb`) has successful hosted

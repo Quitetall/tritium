@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 from pathlib import Path
 import runpy
@@ -16,6 +17,8 @@ _VERIFIER = runpy.run_path(
 )
 _CalibrationPackError = _VERIFIER["CalibrationPackError"]
 _CONSTRUCTOR_KEY = object()
+_CAPTURE_BINDING_SCHEMA = "tritium.qwen36-calibration-capture-binding.v1"
+_QWEN36_CAPTURE_RECORD_COUNT = 506
 
 
 def _read_calibration_tokens(
@@ -183,3 +186,253 @@ class Qwen36CalibrationReplay:
             return iter_capture_batches(self._token_bytes, tensor_factory)
 
         return factory
+
+    def capture_binding(
+        self,
+        native_receipt: Any,
+        *,
+        max_evidence_bytes: int = 64 * 1024 * 1024,
+    ) -> dict[str, Any]:
+        """Bind the native completion receipt to this pack's enforced replay hash."""
+        if type(max_evidence_bytes) is not int or max_evidence_bytes <= 0:
+            raise ValueError("max_evidence_bytes must be a positive integer")
+        fields = (
+            "source_model_digest",
+            "activation_cache_digest",
+            "token_stream_digest",
+            "evidence_set_digest",
+            "curvature",
+            "damping",
+            "records",
+            "produced",
+            "reused",
+        )
+        try:
+            values = {field: getattr(native_receipt, field) for field in fields}
+        except (AttributeError, TypeError) as error:
+            raise ValueError("native Qwen capture receipt is incomplete") from error
+        source_model_digest = _digest_text(
+            values["source_model_digest"], "capture source-model digest"
+        )
+        if source_model_digest != self.receipt["source_model_id"]:
+            raise ValueError("capture source model differs from verified Qwen pack")
+        token_stream_digest = _digest_text(
+            values["token_stream_digest"], "capture token-stream digest"
+        )
+        expected_token_digest = self._token_stream_digest.removeprefix("sha256:")
+        if token_stream_digest != expected_token_digest:
+            raise ValueError(
+                "capture replay digest differs from verified pack contract"
+            )
+        activation_digest = _digest_text(
+            values["activation_cache_digest"], "capture activation-cache digest"
+        )
+        evidence_set_digest = _digest_text(
+            values["evidence_set_digest"], "capture evidence-set digest"
+        )
+        if not isinstance(values["curvature"], str) or not values["curvature"]:
+            raise ValueError("capture curvature is invalid")
+        if (
+            type(values["damping"]) not in {int, float}
+            or not math.isfinite(values["damping"])
+            or values["damping"] < 0
+        ):
+            raise ValueError("capture damping is invalid")
+        counts = (values["records"], values["produced"], values["reused"])
+        if any(type(value) is not int or value < 0 for value in counts):
+            raise ValueError("capture record counts are invalid")
+        if values["records"] != _QWEN36_CAPTURE_RECORD_COUNT:
+            raise ValueError("capture receipt is not the complete 506-record catalog")
+        if values["produced"] + values["reused"] != values["records"]:
+            raise ValueError("capture production/reuse counts do not cover the catalog")
+        binding: dict[str, Any] = {
+            "schema": _CAPTURE_BINDING_SCHEMA,
+            "result": "native-capture-receipt",
+            "pack_receipt_id": self.receipt["receipt_id"],
+            "replay_contract_id": self.contract["contract_id"],
+            "pack_id": self.receipt["pack_id"],
+            "source_model_digest": source_model_digest,
+            "activation_cache_digest": activation_digest,
+            "capture_batch_sha256": self._token_stream_digest,
+            "token_stream_digest": token_stream_digest,
+            "evidence_set_digest": evidence_set_digest,
+            "curvature": values["curvature"],
+            "damping": float(values["damping"]),
+            "records": values["records"],
+            "produced": values["produced"],
+            "reused": values["reused"],
+            "max_evidence_bytes": max_evidence_bytes,
+            "native_reopen_required": True,
+        }
+        binding["binding_id"] = "sha256:" + hashlib.sha256(
+            _VERIFIER["canonical"](binding)
+        ).hexdigest()
+        return binding
+
+
+def _digest_text(value: Any, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value.removeprefix("sha256:")) != 64
+        or any(char not in "0123456789abcdef" for char in value.removeprefix("sha256:"))
+    ):
+        raise ValueError(f"{label} must be a lowercase 32-byte digest")
+    return value.removeprefix("sha256:")
+
+
+def validate_capture_binding(path: Path) -> dict[str, Any]:
+    value = _VERIFIER["_load_json"](path, "Qwen capture binding", 1024 * 1024)
+    fields = {
+        "schema", "result", "pack_receipt_id", "replay_contract_id", "pack_id",
+        "source_model_digest", "activation_cache_digest", "capture_batch_sha256",
+        "token_stream_digest", "evidence_set_digest", "curvature", "damping",
+        "records", "produced", "reused", "max_evidence_bytes",
+        "native_reopen_required", "binding_id",
+    }
+    if set(value) != fields:
+        raise ValueError("Qwen capture binding fields differ")
+    binding_id = _digest_text(value["binding_id"], "capture binding ID")
+    content = {key: item for key, item in value.items() if key != "binding_id"}
+    expected_id = hashlib.sha256(_VERIFIER["canonical"](content)).hexdigest()
+    if any(
+        type(value[field]) is not int or value[field] < 0
+        for field in ("records", "produced", "reused")
+    ):
+        raise ValueError("Qwen capture binding counts are invalid")
+    if (
+        value["schema"] != _CAPTURE_BINDING_SCHEMA
+        or value["result"] != "native-capture-receipt"
+        or binding_id != expected_id
+        or value["native_reopen_required"] is not True
+        or type(value["records"]) is not int
+        or value["records"] != _QWEN36_CAPTURE_RECORD_COUNT
+        or value["produced"] + value["reused"] != value["records"]
+        or type(value["max_evidence_bytes"]) is not int
+        or value["max_evidence_bytes"] <= 0
+        or type(value["damping"]) not in {int, float}
+        or not math.isfinite(value["damping"])
+        or value["damping"] < 0
+        or not isinstance(value["curvature"], str)
+        or not value["curvature"]
+    ):
+        raise ValueError("Qwen capture binding identity or geometry differs")
+    if not value["binding_id"].startswith("sha256:"):
+        raise ValueError("capture binding ID must use a sha256 prefix")
+    for field in (
+        "pack_receipt_id",
+        "replay_contract_id",
+        "pack_id",
+        "capture_batch_sha256",
+    ):
+        if not isinstance(value[field], str) or not value[field].startswith("sha256:"):
+            raise ValueError(f"capture binding {field} must use a sha256 prefix")
+        _digest_text(value[field], f"capture binding {field}")
+    for field in (
+        "source_model_digest",
+        "activation_cache_digest",
+        "token_stream_digest",
+        "evidence_set_digest",
+    ):
+        _digest_text(value[field], f"capture binding {field}")
+    batch_digest = _digest_text(
+        value["capture_batch_sha256"], "capture batch digest"
+    )
+    token_digest = _digest_text(
+        value["token_stream_digest"], "capture token-stream digest"
+    )
+    if batch_digest != token_digest:
+        raise ValueError("capture binding replay digests differ")
+    return value
+
+
+def write_capture_binding(path: Path, binding: dict[str, Any]) -> None:
+    """Durably publish one new, self-validating capture-binding receipt."""
+    _VERIFIER["_write_new"](
+        path,
+        binding,
+        validator=validate_capture_binding,
+    )
+
+
+def reopen_capture_binding(
+    binding_path: Path,
+    *,
+    manifest_path: Path,
+    official_source_identity_path: Path,
+    pack_receipt_path: Path,
+    replay_contract_path: Path,
+    model_dir: Path,
+    work_dir: Path,
+    evidence_dir: Path,
+    declared_revision: str,
+    session_factory: Any = None,
+) -> dict[str, Any]:
+    """Freshly reopen all S2KF records and compare the native set receipt."""
+    binding = validate_capture_binding(binding_path)
+    pack = _VERIFIER["validate_receipt"](pack_receipt_path)
+    replay = _VERIFIER["validate_replay_contract"](replay_contract_path)
+    verified_replay = Qwen36CalibrationReplay.open(
+        manifest_path,
+        model_dir,
+        official_source_identity_path,
+        pack_receipt_path,
+    )
+    if (
+        binding["pack_receipt_id"] != pack["receipt_id"]
+        or binding["pack_id"] != pack["pack_id"]
+        or binding["source_model_digest"] != pack["source_model_id"]
+        or replay["pack_receipt_id"] != pack["receipt_id"]
+        or binding["replay_contract_id"] != replay["contract_id"]
+        or binding["capture_batch_sha256"] != replay["capture_batch_sha256"]
+        or verified_replay.contract["contract_id"] != replay["contract_id"]
+    ):
+        raise ValueError(
+            "capture binding lineage differs from verified pack/replay receipts"
+        )
+    if declared_revision != pack["revision"]:
+        raise ValueError(
+            "native reopen revision differs from verified calibration source"
+        )
+    if evidence_dir.is_symlink() or not evidence_dir.is_dir():
+        raise ValueError(
+            "native reopen requires an existing ordinary evidence directory"
+        )
+    if session_factory is None:
+        from tritium._tritium import Qwen36KroneckerCaptureSession
+
+        session_factory = Qwen36KroneckerCaptureSession
+    session = session_factory(
+        os.fspath(model_dir),
+        declared_revision,
+        os.fspath(work_dir),
+        os.fspath(evidence_dir),
+        binding["curvature"],
+        binding["activation_cache_digest"],
+        binding["token_stream_digest"],
+        binding["damping"],
+        max_evidence_bytes=binding["max_evidence_bytes"],
+    )
+    missing = session.next_request()
+    if missing is not None:
+        raise ValueError(
+            "native S2KF namespace is incomplete: "
+            f"tensor {missing.tensor_index} {missing.tensor_name} is missing"
+        )
+    reopened = session.finish()
+    if reopened is None:
+        raise ValueError("native S2KF session did not seal a complete evidence set")
+    expected = {
+        "source_model_digest": binding["source_model_digest"],
+        "activation_cache_digest": binding["activation_cache_digest"],
+        "token_stream_digest": binding["token_stream_digest"],
+        "evidence_set_digest": binding["evidence_set_digest"],
+        "curvature": binding["curvature"],
+        "damping": binding["damping"],
+        "records": binding["records"],
+    }
+    actual = {field: getattr(reopened, field) for field in expected}
+    if actual != expected:
+        raise ValueError(
+            "fresh native evidence-set receipt differs from capture binding"
+        )
+    return binding
