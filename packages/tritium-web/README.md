@@ -132,6 +132,7 @@ atomically seals both lifecycle receipts:
 
 ```bash
 export TRITIUM_EVIDENCE_ROOT="${TMPDIR:-/tmp}/tritium-v11-$(git rev-parse HEAD)"
+WEB_RELEASE=$(node -p "JSON.parse(require('node:fs').readFileSync('packages/tritium-web/package.json', 'utf8')).version")
 TRITIUM_NPM_EVIDENCE_DIR="$TRITIUM_EVIDENCE_ROOT/npm" \
   npm --prefix packages/tritium-web run check
 python scripts/produce-browser-native-reference.py \
@@ -143,12 +144,12 @@ Then produce one physical lane from already-running W3C WebDriver endpoint:
 
 ```bash
 node scripts/run-browser-training-lane.mjs \
-  --artifact "$TRITIUM_EVIDENCE_ROOT/npm/tritium-ai-web-1.1.0-rc.1.tgz" \
+  --artifact "$TRITIUM_EVIDENCE_ROOT/npm/tritium-ai-web-$WEB_RELEASE.tgz" \
   --npm-receipt "$TRITIUM_EVIDENCE_ROOT/npm/npm-archive-receipt.json" \
   --native-artifact "$TRITIUM_EVIDENCE_ROOT/native/native.salt" \
   --native-reference-receipt "$TRITIUM_EVIDENCE_ROOT/native/receipt.json" \
   --webdriver-url http://127.0.0.1:9515 \
-  --engine chrome --expected-browser-version 140.0.1 \
+  --engine chrome --expected-browser-version "${CHROME_VERSION:?set exact version reported by the Chrome WebDriver session}" \
   --source-revision "$(git rev-parse HEAD)" \
   --run-id chrome-physical-1 \
   --output-dir "$TRITIUM_EVIDENCE_ROOT/chrome"
