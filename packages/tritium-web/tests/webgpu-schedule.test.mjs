@@ -372,17 +372,17 @@ test("convolution VJP clears resident accumulators and packs exact 80-byte ABI",
   }
 });
 
-test("attention packs VJP scratch under Firefox storage-buffer limits", () => {
+test("attention uses entrypoint-specific bindings and resident VJP scratch", () => {
   const item = corpus.cases.find((candidate) =>
     candidate.operation === "graph.attention" && candidate.execution === "vjp" &&
     candidate.expected.kind === "success");
   const representative = representativePlan(item);
   const schedule = compileWebGpuResidentScheduleV1(representative.plan, BUDGET);
   const resources = schedule.auxiliaryResources();
-  assert.deepEqual(resources.resources.map((resource) => resource.byteLength), [36, 84, 84]);
+  assert.deepEqual(resources.resources.map((resource) => resource.byteLength), [36, 24, 24, 36, 48]);
   const transaction = schedule.transaction(representative.phase, representative.operationId, 0);
   assert.deepEqual(transaction.copies.map((copy) => copy.destination), [
-    "grad_q", resources.resources[1].id,
+    "grad_q",
   ]);
   assert.deepEqual(transaction.commitCopies, [
     {
@@ -393,8 +393,8 @@ test("attention packs VJP scratch under Firefox storage-buffer limits", () => {
       byteLength: 24,
     },
     {
-      source: resources.resources[1].id,
-      sourceOffset: 24,
+      source: resources.resources[2].id,
+      sourceOffset: 0,
       destination: "grad_v",
       destinationOffset: 0,
       byteLength: 24,
@@ -403,7 +403,9 @@ test("attention packs VJP scratch under Firefox storage-buffer limits", () => {
   assert.deepEqual(transaction.commands[0].storageBindings, {
     1: "q", 2: "k", 3: "v", 4: "grad_output", 5: "grad_q",
     6: resources.resources[1].id,
-    7: resources.resources[0].id,
+    7: resources.resources[2].id,
+    8: resources.resources[0].id,
+    9: resources.resources[3].id,
   });
   assert.deepEqual([
     view(transaction.commands[0]).getUint32(0, true),
@@ -413,6 +415,19 @@ test("attention packs VJP scratch under Firefox storage-buffer limits", () => {
     view(transaction.commands[0]).getUint32(16, true),
     view(transaction.commands[0]).getUint32(20, true),
   ], [3, 2, 1, 2, 1, 1]);
+});
+
+test("attention forward binds only resources required by its shader entrypoint", () => {
+  const item = corpus.cases.find((candidate) =>
+    candidate.operation === "graph.attention" && candidate.execution === "forward" &&
+    candidate.expected.kind === "success");
+  const representative = representativePlan(item);
+  const schedule = compileWebGpuResidentScheduleV1(representative.plan, BUDGET);
+  const transaction = schedule.transaction(representative.phase, representative.operationId, 0);
+  const resources = schedule.auxiliaryResources();
+  assert.deepEqual(transaction.commands[0].storageBindings, {
+    1: "q", 2: "k", 3: "v", 5: "result", 8: resources.resources[0].id,
+  });
 });
 
 test("SGD computes into a candidate and commits only after dispatch", () => {

@@ -368,7 +368,8 @@ pub struct WgpuBackend {
     topk_kd_bind_group_layout: wgpu::BindGroupLayout,
     conv_pipeline: wgpu::ComputePipeline,
     conv_bind_group_layout: wgpu::BindGroupLayout,
-    attention_pipeline: wgpu::ComputePipeline,
+    attention_forward_pipeline: wgpu::ComputePipeline,
+    attention_vjp_pipeline: wgpu::ComputePipeline,
     attention_bind_group_layout: wgpu::BindGroupLayout,
     device_name: String,
     adapter_backend: String,
@@ -980,12 +981,21 @@ impl WgpuBackend {
                 bind_group_layouts: &[&attention_bind_group_layout],
                 push_constant_ranges: &[],
             });
-            let attention_pipeline =
+            let attention_forward_pipeline =
                 device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some("portable-attention-pipe"),
+                    label: Some("portable-attention-forward-pipe"),
                     layout: Some(&attention_layout),
                     module: &attention_shader,
-                    entry_point: Some("main"),
+                    entry_point: Some("attention_forward"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    cache: None,
+                });
+            let attention_vjp_pipeline =
+                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("portable-attention-vjp-pipe"),
+                    layout: Some(&attention_layout),
+                    module: &attention_shader,
+                    entry_point: Some("attention_vjp"),
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
                     cache: None,
                 });
@@ -1023,7 +1033,8 @@ impl WgpuBackend {
                 topk_kd_bind_group_layout,
                 conv_pipeline,
                 conv_bind_group_layout,
-                attention_pipeline,
+                attention_forward_pipeline,
+                attention_vjp_pipeline,
                 attention_bind_group_layout,
                 device_name,
                 adapter_backend,
@@ -2305,7 +2316,11 @@ impl WgpuBackend {
                 label: Some("portable-attention-pass"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.attention_pipeline);
+            pass.set_pipeline(if backward {
+                &self.attention_vjp_pipeline
+            } else {
+                &self.attention_forward_pipeline
+            });
             pass.set_bind_group(0, &bind_group, &[]);
             pass.dispatch_workgroups(1, 1, 1);
         }

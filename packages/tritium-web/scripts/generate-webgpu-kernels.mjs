@@ -57,6 +57,10 @@ const OPERATION_MODULES = Object.freeze({
 // Multi-entry modules therefore need an explicit per-entry subset; single-entry
 // modules safely default to every source-declared binding.
 const ENTRY_POINT_BINDINGS = Object.freeze({
+  attention: Object.freeze({
+    attention_forward: [0, 1, 2, 3, 5, 8],
+    attention_vjp: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+  }),
   int8_adamw: Object.freeze({
     dequantize: [0, 3, 4, 5, 6],
     square_variance: [0, 4],
@@ -127,8 +131,8 @@ const DISPATCH_FORMS = Object.freeze({
   "graph.causal_mask|vjp": [pw(10)],
   "graph.rope|forward": [one("rope", "rope_pairs_64")],
   "graph.rope|vjp": [one("rope", "rope_pairs_64")],
-  "graph.attention|forward": [one("attention", "single")],
-  "graph.attention|vjp": [one("attention", "single")],
+  "graph.attention|forward": [stage("attention", "single", null, "attention_forward")],
+  "graph.attention|vjp": [stage("attention", "single", null, "attention_vjp")],
   "loss.mse|forward": [pw(16, "linear_primary_input_64")],
   "loss.mse|vjp": [pw(17)],
   "loss.softmax_cross_entropy|forward": [one("softmax_xent", "single")],

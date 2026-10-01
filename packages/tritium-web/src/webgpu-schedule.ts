@@ -369,6 +369,7 @@ function stage(
   storageBindings: Readonly<Record<number, string>>,
   workgroups: readonly [number, number, number],
   expectedRepeat: "once" | "per_output" = "once",
+  expectedEntryPoint = "main",
 ): WebGpuResidentDispatchV1 {
   const form = webGpuDispatchFormV1(invocation.operation, invocation.execution);
   if (form.stages.length !== 1) {
@@ -376,7 +377,7 @@ function stage(
   }
   return indexedStage(
     invocation, 0, expectedModuleId, uniformBytes, storageBindings, workgroups, expectedRepeat,
-    "main",
+    expectedEntryPoint,
   );
 }
 
@@ -927,16 +928,18 @@ export function compileWebGpuResidentScheduleV1(
         const probabilities = auxiliary(
           "attention-probabilities", probabilityElements * 4, null,
         );
-        const scratchElements = sumU32(
-          "attention scratch outputs", kvElements, kvElements, probabilityElements,
-        );
-        const scratch = auxiliary("attention-scratch", scratchElements * 4, null);
-        let gradOutput: string;
         let output0: string;
+        let storageBindings: Readonly<Record<number, string>>;
+        let entryPoint: "attention_forward" | "attention_vjp";
         const copies: WebGpuResidentCopyV1[] = [];
         const commitCopies: WebGpuResidentCopyV1[] = [];
         if (invocation.execution === "vjp") {
-          gradOutput = requiredWebGpuRoleV1(input, "grad_output");
+          const gradKBuffer = auxiliary("attention-grad-k", kvElements * 4, null);
+          const gradVBuffer = auxiliary("attention-grad-v", kvElements * 4, null);
+          const gradProbabilities = auxiliary(
+            "attention-grad-probabilities", probabilityElements * 4, null,
+          );
+          const gradOutput = requiredWebGpuRoleV1(input, "grad_output");
           output0 = requiredWebGpuRoleV1(output, "grad_q");
           const gradK = requiredWebGpuRoleV1(output, "grad_k");
           const gradV = requiredWebGpuRoleV1(output, "grad_v");
@@ -949,7 +952,7 @@ export function compileWebGpuResidentScheduleV1(
             invocation.operation,
           );
           const zero = auxiliary(
-            "attention-zero", Math.max(queryElements, scratchElements) * 4, null,
+            "attention-zero", queryElements * 4, null,
           );
           copies.push(
             Object.freeze({
@@ -959,35 +962,35 @@ export function compileWebGpuResidentScheduleV1(
               destinationOffset: 0,
               byteLength: queryElements * 4,
             }),
-            Object.freeze({
-              source: zero,
-              sourceOffset: 0,
-              destination: scratch,
-              destinationOffset: 0,
-              byteLength: scratchElements * 4,
-            }),
           );
           commitCopies.push(
             Object.freeze({
-              source: scratch,
+              source: gradKBuffer,
               sourceOffset: 0,
               destination: gradK,
               destinationOffset: 0,
               byteLength: kvElements * 4,
             }),
             Object.freeze({
-              source: scratch,
-              sourceOffset: kvElements * 4,
+              source: gradVBuffer,
+              sourceOffset: 0,
               destination: gradV,
               destinationOffset: 0,
               byteLength: kvElements * 4,
             }),
           );
+          storageBindings = {
+            1: q, 2: k, 3: v, 4: gradOutput, 5: output0,
+            6: gradKBuffer, 7: gradVBuffer, 8: probabilities,
+            9: gradProbabilities,
+          };
+          entryPoint = "attention_vjp";
         } else {
-          gradOutput = q;
           output0 = requiredWebGpuRoleV1(output, "result");
           expect(buffers, output0, "f32", queryShape, "attention result");
           requireDisjointWrites(buffers, [q, k, v], [output0], invocation.operation);
+          storageBindings = { 1: q, 2: k, 3: v, 5: output0, 8: probabilities };
+          entryPoint = "attention_forward";
         }
         const params = uniform(32, (view) => {
           view.setUint32(0, seq, true);
@@ -1002,11 +1005,10 @@ export function compileWebGpuResidentScheduleV1(
             invocation,
             "attention",
             params,
-            {
-              1: q, 2: k, 3: v, 4: gradOutput, 5: output0,
-              6: scratch, 7: probabilities,
-            },
+            storageBindings,
             [1, 1, 1],
+            "once",
+            entryPoint,
           )]),
           copies: Object.freeze(copies),
           commitCopies: Object.freeze(commitCopies),
