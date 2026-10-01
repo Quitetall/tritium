@@ -237,6 +237,27 @@ temporary record of 447,083,070 bytes (its recorded PID is no longer alive).
 That partial file is retained; it is not a complete tensor master and is not
 evidence that the campaign can resume against approved calibration provenance.
 
+The Qwen token pack is distinct from Stage 7's SmolLM2-1.7B recipe-freeze pack.
+The Qwen pack declares tokenizer digest
+`sha256:72943ec7247b68e70aa6e5651a5b0abb870b07a1c1f90bd5da9badece7294407`,
+vocabulary size 248,320, and 512 calibration sequences. The pinned Qwen source
+config also declares text vocabulary size 248,320. By contrast,
+`release/v1.1/campaign-84284a4-cuda.json` names
+`HuggingFaceTB/SmolLM2-1.7B`, binds a different token-evidence manifest digest
+(`sha256:2664bb998a231865baf55cb76806c67e53022b479ddfa901346f9a1d7cb9a0ae`),
+and records tokenizer digest
+`sha256:4b0c039b16d1fb8cb6d06c8e1698671d03c9ef51372f1ffff1fe0aa0fd555ced`.
+Its Stage 7 recipe-freeze receipt cannot qualify Qwen's calibration tokenizer
+or capture.
+
+The Qwen pack's tokenizer digest has not yet been independently recomputed from
+the pinned Qwen tokenizer inventory. Its matching declared vocabulary size and
+content-addressed pack identity do not prove which tokenizer produced its token
+IDs. Before fitting, publish a Qwen-specific calibration provenance receipt
+that binds the official tokenizer identity, pack and selected 512-sequence
+window, dataset revisions/sample identities, and the actual replay digest to
+the ordered S2KF evidence-set digest.
+
 ### Hosted package evidence from PR #51 (2026-10-01)
 
 PR #51 (`bbbafd99cada6dab821cea63e5cdf971f1ce79fb`) has successful hosted
