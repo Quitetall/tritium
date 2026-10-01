@@ -1012,6 +1012,8 @@ def capture_qwen36_kronecker_evidence(
     exercises selected modules nested under ``language_model`` or ``mtp_model``;
     this is required when those modules are not reached by ``language_model``'s
     own forward. The source checkpoint is admitted before any task is exposed.
+    Every newly captured replay is hashed in canonical batch order and must
+    match ``token_stream_digest`` before its evidence record can be published.
     """
 
     if not isinstance(language_model, nn.Module):
@@ -1022,6 +1024,13 @@ def capture_qwen36_kronecker_evidence(
         raise TypeError("execution_model must be a torch.nn.Module")
     if not callable(data_factory):
         raise TypeError("data_factory must be callable")
+    if not isinstance(token_stream_digest, str):
+        raise ValueError("token_stream_digest must be a SHA-256 digest")
+    expected_token_digest = token_stream_digest.removeprefix("sha256:").lower()
+    if len(expected_token_digest) != 64 or any(
+        byte not in "0123456789abcdef" for byte in expected_token_digest
+    ):
+        raise ValueError("token_stream_digest must be a SHA-256 digest")
     if type(max_shared_modules) is not int or max_shared_modules <= 0:
         raise ValueError("max_shared_modules must be a positive integer")
     if curvature == "guided-fisher":
@@ -1055,16 +1064,32 @@ def capture_qwen36_kronecker_evidence(
         os.fspath(evidence_dir),
         curvature,
         bound_cache_digest,
-        token_stream_digest,
+        expected_token_digest,
         damping,
         max_evidence_bytes=max_evidence_bytes,
     )
+
+    def checked_data_factory(task: Any) -> Iterable[Any]:
+        def replay() -> Iterable[Any]:
+            digest = hashlib.sha256()
+            batches = 0
+            for batches, batch in enumerate(data_factory(task), 1):
+                _hash_value(digest, f"batch[{batches - 1}]", batch)
+                yield batch
+            if batches == 0:
+                raise ValueError("Qwen calibration replay must yield at least one batch")
+            if digest.hexdigest() != expected_token_digest:
+                raise ValueError(
+                    "Qwen calibration batches differ from token_stream_digest"
+                )
+
+        return replay()
 
     def validate_task(task: Any) -> None:
         if (
             task.curvature != curvature
             or task.activation_cache_digest != bound_cache_digest
-            or task.token_stream_digest != token_stream_digest.lower()
+            or task.token_stream_digest != expected_token_digest
             or task.damping != damping
         ):
             raise RuntimeError("native Qwen capture task drifted from the session contract")
@@ -1151,7 +1176,7 @@ def capture_qwen36_kronecker_evidence(
                 writers = [writer_for(item, indexed_output=False) for item, _, _ in grouped]
                 results = capture_kronecker_module_group(
                     target,
-                    data_factory(grouped[0][0]),
+                    checked_data_factory(grouped[0][0]),
                     modules=[path for _, path, _ in grouped],
                     writers=writers,
                     curvature=curvature,
@@ -1169,7 +1194,7 @@ def capture_qwen36_kronecker_evidence(
         capture = capture_kronecker_embedding if indexed_output else capture_kronecker_module
         result = capture(
             target,
-            data_factory(task),
+            checked_data_factory(task),
             module=module_path,
             writer=writer,
             curvature=curvature,
