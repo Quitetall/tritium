@@ -189,6 +189,23 @@ registry still references the original receipt pair, so `/mnt/4tb/tmp` must
 not be pruned until a new validated registry is published against the current
 candidate.
 
+### Revalidated durable source identity (2026-10-01)
+
+The official-identity verifier was rerun against the complete pinned snapshot
+at `/mnt/4tb/qwen36-27b-source-6a9e13bd6fc8f0983b9b99948120bc37f49c13e9`.
+It passed all 29 files (55,586,107,940 bytes) against the pinned Hub inventory
+and emitted
+`/mnt/2tb/tritium-release-evidence/qwen-source-admission/recheck-2026-10-01/official-source-identity.json`
+with receipt ID
+`sha256:868dd248ff845a39e7a02414196649730b492b8b625f27b2815dc4594e2582df`.
+The receipt binds the rebound durable source-admission receipt
+`sha256:abfb820bbc4fd65aff43b2c11e1471bd7bf7e9b72acd42073ff857a7cefe03d2`
+and the same measured source-model, manifest and proof IDs. This is a refreshed
+official-byte check and an authorization input; it does not rewrite the
+source-admission receipt's `official_payload_authenticated=false`, register the
+pair to a current release candidate, or produce tensor masters. The 506-master
+campaign remains stalled and was not restarted.
+
 ### Hosted package evidence from PR #51 (2026-10-01)
 
 PR #51 (`bbbafd99cada6dab821cea63e5cdf971f1ce79fb`) has successful hosted
