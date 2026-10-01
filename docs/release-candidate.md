@@ -279,9 +279,14 @@ It binds the verified pack receipt to the expected PyTorch batch digest
 `sha256:ca913e334bf22c73755d27b11848599008790f672600b8085daf5ec53022202c`
 under a fixed one-sequence-per-batch policy. The capture API already checks
 that digest against each replay before publishing records. The contract is not
-evidence that replay occurred: a pack-backed batch factory, a saved native
-capture receipt binding this digest to the ordered S2KF set, and a fresh native
-reopen of all 506 records are still required.
+evidence that replay occurred. `scripts/qwen36_calibration_replay.py` now
+reopens the official pack and receipt, retains only the verified 4,194,304-byte
+calibration token window, and yields the exact batches required by that digest.
+Opening it against the durable Qwen pack reproduced the same pack receipt,
+contract ID, and capture batch digest. This remains tooling verification, not a
+model replay: the actual capture must use this factory, persist a native capture
+receipt binding its digest to the ordered S2KF set, and freshly reopen all 506
+records before fitting.
 
 ### Hosted package evidence from PR #51 (2026-10-01)
 
