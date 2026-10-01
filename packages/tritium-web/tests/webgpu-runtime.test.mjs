@@ -500,7 +500,9 @@ test("dispatch rejects binding drift before submission", async () => {
   const runtime = await WebGpuResidentRuntimeV1.prepare(device, plan(), []);
   assert.throws(
     () => runtime.dispatch([{ ...command, storageBindings: { ...command.storageBindings, 9: "left" } }]),
-    (error) => error instanceof WebTrainingError && error.code === "invalid_schema",
+    (error) => error instanceof WebTrainingError &&
+      error.code === "invalid_schema" &&
+      error.message.includes("graph.add/forward stage 0: expected [1,2,3,4], got [1,2,3,4,9]"),
   );
   assert.equal(device.submits, 0);
   runtime.dispose();
