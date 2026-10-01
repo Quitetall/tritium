@@ -8,13 +8,18 @@ the 27B checkpoint and executing the capture requires the explicit flag.
 from __future__ import annotations
 
 import argparse
+import importlib
+import importlib.metadata
+import importlib.util
 import json
 import math
 from pathlib import Path
+from pathlib import PurePosixPath
 import runpy
 import subprocess
 import sys
 from typing import Any
+from urllib.parse import unquote, urlparse
 
 
 REPLAY = runpy.run_path(Path(__file__).with_name("qwen36_calibration_replay.py"))
@@ -22,6 +27,7 @@ PINNED_REVISION = REPLAY["_VERIFIER"]["REVISION"]
 STAGE7 = runpy.run_path(
     Path(__file__).with_name("verify-stage7-qualification-receipt.py")
 )
+WHEEL_RUNTIME = runpy.run_path(Path(__file__).with_name("wheel-functional-smoke.py"))
 
 
 def _parse_max_memory(values: list[str]) -> dict[Any, str]:
@@ -78,7 +84,117 @@ def _reject_json_constant(value: str) -> None:
     raise ValueError(f"non-finite JSON constant {value!r} is not allowed")
 
 
-def _validate_stage7_qualification(args: argparse.Namespace) -> dict[str, Any]:
+def _candidate_wheel(
+    candidate_path: Path, candidate: dict[str, Any], installed_wheel: Path
+) -> tuple[Path, str]:
+    artifacts = candidate.get("artifacts")
+    if not isinstance(artifacts, list):
+        raise ValueError("release candidate has no artifact inventory")
+    installed_wheel = installed_wheel.resolve(strict=True)
+    matches: list[tuple[Path, str]] = []
+    for artifact in artifacts:
+        if not isinstance(artifact, dict) or artifact.get("kind") != "python-wheel":
+            continue
+        logical_text = artifact.get("path")
+        if not isinstance(logical_text, str):
+            raise ValueError("candidate Python wheel path is invalid")
+        logical = PurePosixPath(logical_text)
+        if (
+            logical.is_absolute()
+            or not logical.parts
+            or ".." in logical.parts
+            or "\\" in logical_text
+            or logical.as_posix() != logical_text
+        ):
+            raise ValueError("candidate Python wheel path is unsafe")
+        path = candidate_path.parent
+        for part in logical.parts:
+            path = path / part
+            if path.is_symlink():
+                raise ValueError("candidate Python wheel path traverses a symlink")
+        if path.resolve(strict=False) != installed_wheel:
+            continue
+        if not path.is_file():
+            raise ValueError("candidate Python wheel artifact is missing")
+        identity = artifact.get("identity")
+        if not isinstance(identity, dict):
+            raise ValueError("candidate Python wheel identity is invalid")
+        expected_bytes = identity.get("bytes")
+        expected_digest = identity.get("sha256")
+        if (
+            isinstance(expected_bytes, bool)
+            or not isinstance(expected_bytes, int)
+            or expected_bytes <= 0
+            or not isinstance(expected_digest, str)
+            or len(expected_digest) != 64
+            or any(character not in "0123456789abcdef" for character in expected_digest)
+        ):
+            raise ValueError("candidate Python wheel identity is incomplete")
+        if path.stat().st_size != expected_bytes:
+            raise ValueError("installed Python wheel size differs from candidate")
+        actual_digest = WHEEL_RUNTIME["_sha256"](path)
+        if actual_digest != expected_digest:
+            raise ValueError("installed Python wheel digest differs from candidate")
+        matches.append((path.resolve(strict=True), actual_digest))
+    if len(matches) != 1:
+        raise ValueError("installed Tritium wheel is not a unique candidate artifact")
+    return matches[0]
+
+
+def _validate_capture_python_environment(
+    candidate_path: Path,
+    candidate: dict[str, Any],
+    revision: str,
+) -> Any:
+    try:
+        distribution = importlib.metadata.distribution("pytritium")
+        direct_url = distribution.read_text("direct_url.json")
+        if direct_url is None:
+            raise ValueError("installed pytritium wheel has no direct_url identity")
+        document = json.loads(
+            direct_url,
+            object_pairs_hook=_reject_duplicate_json_keys,
+            parse_constant=_reject_json_constant,
+        )
+        if not isinstance(document, dict) or not isinstance(document.get("url"), str):
+            raise ValueError("installed pytritium direct_url identity is malformed")
+        parsed = urlparse(document["url"])
+        if parsed.scheme != "file" or parsed.netloc not in {"", "localhost"}:
+            raise ValueError("installed pytritium wheel is not from a local candidate")
+        installed_wheel = Path(unquote(parsed.path))
+        wheel, wheel_digest = _candidate_wheel(
+            candidate_path, candidate, installed_wheel
+        )
+        _version, distribution_files = WHEEL_RUNTIME[
+            "installed_distribution_identity"
+        ](wheel, wheel_digest)
+
+        package_spec = importlib.util.find_spec("tritium")
+        if package_spec is None or package_spec.origin is None:
+            raise ValueError("candidate wheel does not provide the tritium package")
+        WHEEL_RUNTIME["require_distribution_file"](
+            Path(package_spec.origin), distribution_files
+        )
+        tritium = importlib.import_module("tritium")
+        qwen36 = importlib.import_module("tritium.torch.qwen36")
+        repository = Path(__file__).resolve().parent.parent
+        environment = Path(sys.prefix)
+        for module in (tritium, tritium._tritium, qwen36):
+            WHEEL_RUNTIME["require_installed"](
+                Path(module.__file__), repository, environment
+            )
+            WHEEL_RUNTIME["require_distribution_file"](
+                Path(module.__file__), distribution_files
+            )
+        WHEEL_RUNTIME["require_native_source_identity"](tritium._tritium, revision)
+        return qwen36
+    except Exception as error:
+        raise ValueError(f"capture Python environment is not candidate-bound: {error}") from error
+
+
+def _validate_stage7_qualification(
+    args: argparse.Namespace,
+) -> tuple[dict[str, Any], str, dict[str, Any]]:
     if args.stage7_qualification_receipt is None:
         raise ValueError("--execute requires --stage7-qualification-receipt")
     if args.release_candidate_manifest is None:
@@ -123,7 +239,21 @@ def _validate_stage7_qualification(args: argparse.Namespace) -> dict[str, Any]:
             "release candidate source_revision differs from capture checkout HEAD"
         )
     try:
-        return STAGE7["validate"](
+        status = subprocess.run(
+            ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+            cwd=Path(__file__).resolve().parent.parent,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise ValueError("cannot determine capture checkout cleanliness") from error
+    if status.strip():
+        raise ValueError(
+            "Qwen capture requires a clean checkout; use a clean candidate worktree"
+        )
+    try:
+        receipt = STAGE7["validate"](
             args.stage7_qualification_receipt,
             revision,
             release,
@@ -131,6 +261,7 @@ def _validate_stage7_qualification(args: argparse.Namespace) -> dict[str, Any]:
         )
     except (OSError, ValueError, RuntimeError, KeyError, TypeError) as error:
         raise ValueError(f"Stage 7 qualification receipt rejected: {error}") from error
+    return candidate, revision, receipt
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -218,17 +349,21 @@ def main() -> int:
         return 0
 
     try:
-        stage7 = _validate_stage7_qualification(args)
-        print(f"STAGE 7 PASS receipt={stage7['receipt_id']}")
+        candidate, source_revision, stage7 = _validate_stage7_qualification(args)
         _validate_capture_recipe(args)
         if not args.offload_folder:
             raise ValueError("--execute requires an explicit --offload-folder")
+        qwen36 = _validate_capture_python_environment(
+            args.release_candidate_manifest,
+            candidate,
+            source_revision,
+        )
+        print(f"STAGE 7 PASS receipt={stage7['receipt_id']}")
     except ValueError as error:
         parser.error(str(error))
     try:
         import torch
         from transformers import AutoModelForImageTextToText
-        from tritium.torch.qwen36 import attach_qwen36_mtp, capture_qwen36_components
 
         if not torch.cuda.is_available() and not args.allow_cpu:
             raise RuntimeError("no CUDA device detected; pass --allow-cpu to opt in")
@@ -242,7 +377,7 @@ def main() -> int:
             low_cpu_mem_usage=True,
             local_files_only=True,
         ).eval()
-        attach_qwen36_mtp(model, args.model_dir)
+        qwen36.attach_qwen36_mtp(model, args.model_dir)
         embedding_weight = model.model.language_model.embed_tokens.weight
         input_device = args.input_device or str(embedding_weight.device)
         if input_device == "meta":
@@ -250,7 +385,7 @@ def main() -> int:
                 "input embedding is disk-offloaded; specify --input-device explicitly"
             )
         tensor_factory = REPLAY["torch_int64_tensor_factory"](input_device)
-        native_receipt = capture_qwen36_components(
+        native_receipt = qwen36.capture_qwen36_components(
             model,
             replay.data_factory(tensor_factory),
             model_dir=args.model_dir,

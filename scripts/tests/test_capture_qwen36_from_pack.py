@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+from types import ModuleType, SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -85,6 +86,7 @@ class CaptureQwenFromPackTests(unittest.TestCase):
         verifier = {"validate_replay_contract": lambda _path: replay.contract}
         revision = "b" * 40
         checked = []
+        runtime_checked = []
         stderr = io.StringIO()
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -101,6 +103,16 @@ class CaptureQwenFromPackTests(unittest.TestCase):
                 checked.append((receipt_path, actual_revision, release, candidate_path))
                 return {"receipt_id": "sha256:" + "c" * 64}
 
+            def validate_runtime(candidate_path, document, actual_revision):
+                runtime_checked.append((candidate_path, document, actual_revision))
+                return object()
+
+            completed = lambda stdout: type("Completed", (), {"stdout": stdout})()
+            torch_fake = ModuleType("torch")
+            torch_fake.cuda = SimpleNamespace(is_available=lambda: False)
+            transformers_fake = ModuleType("transformers")
+            transformers_fake.AutoModelForImageTextToText = object()
+
             with (
                 mock.patch.object(MODULE, "REPLAY", {
                     "Qwen36CalibrationReplay": replay_module,
@@ -110,21 +122,154 @@ class CaptureQwenFromPackTests(unittest.TestCase):
                 mock.patch.object(
                     MODULE.subprocess,
                     "run",
-                    return_value=type("Completed", (), {"stdout": revision + "\n"})(),
+                    side_effect=[completed(revision + "\n"), completed("")],
+                ),
+                mock.patch.object(
+                    MODULE, "_validate_capture_python_environment", validate_runtime
                 ),
                 mock.patch.object(sys, "argv", [
                     str(SCRIPT), *self._base_args(), "--execute",
+                    "--curvature", "input-hessian", "--damping", "0.01",
+                    "--activation-cache-digest", "a" * 64,
+                    "--offload-folder", str(root / "offload"),
                     "--release-candidate-manifest", str(candidate),
                     "--stage7-qualification-receipt", str(receipt),
                 ]),
+                mock.patch.dict(sys.modules, {
+                    "torch": torch_fake,
+                    "transformers": transformers_fake,
+                }),
                 contextlib.redirect_stderr(stderr),
             ):
-                with self.assertRaises(SystemExit) as raised:
-                    MODULE.main()
+                result = MODULE.main()
 
-        self.assertEqual(raised.exception.code, 2)
-        self.assertIn("requires --curvature", stderr.getvalue())
+        self.assertEqual(result, 1)
+        self.assertIn("no CUDA device detected", stderr.getvalue())
         self.assertEqual(checked, [(receipt, revision, "1.1.0-rc.9", candidate)])
+        self.assertEqual(runtime_checked[0][0], candidate)
+        self.assertEqual(runtime_checked[0][1]["source_revision"], revision)
+        self.assertEqual(runtime_checked[0][2], revision)
+
+    def test_candidate_wheel_must_match_exact_manifest_bytes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            candidate_path = root / "manifest.json"
+            wheel = root / "linux" / "pytritium.whl"
+            wheel.parent.mkdir()
+            wheel.write_bytes(b"candidate wheel bytes")
+            digest = MODULE.WHEEL_RUNTIME["_sha256"](wheel)
+            candidate = {
+                "artifacts": [{
+                    "kind": "python-wheel",
+                    "path": "linux/pytritium.whl",
+                    "identity": {"bytes": wheel.stat().st_size, "sha256": digest},
+                }]
+            }
+            self.assertEqual(
+                MODULE._candidate_wheel(candidate_path, candidate, wheel),
+                (wheel.resolve(), digest),
+            )
+            candidate["artifacts"][0]["identity"]["sha256"] = "0" * 64
+            with self.assertRaisesRegex(ValueError, "digest differs from candidate"):
+                MODULE._candidate_wheel(candidate_path, candidate, wheel)
+
+    def test_capture_environment_binds_candidate_wheel_modules_and_native_revision(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            candidate_path = root / "release" / "manifest.json"
+            candidate_path.parent.mkdir()
+            wheel = candidate_path.parent / "pytritium.whl"
+            wheel.write_bytes(b"exact candidate wheel")
+            package = root / "venv" / "site-packages" / "tritium" / "__init__.py"
+            native = package.parent / "_tritium.abi3.so"
+            qwen36_path = package.parent / "torch" / "qwen36.py"
+            for path in (package, native, qwen36_path):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("candidate module")
+            installed_files = frozenset(path.resolve() for path in (package, native, qwen36_path))
+            digest = MODULE.WHEEL_RUNTIME["_sha256"](wheel)
+            candidate = {
+                "artifacts": [{
+                    "kind": "python-wheel",
+                    "path": wheel.name,
+                    "identity": {"bytes": wheel.stat().st_size, "sha256": digest},
+                }]
+            }
+            distribution = SimpleNamespace(
+                read_text=lambda name: json.dumps({"url": wheel.as_uri()})
+                if name == "direct_url.json" else None
+            )
+            tritium = SimpleNamespace(
+                __file__=str(package),
+                _tritium=SimpleNamespace(__file__=str(native)),
+            )
+            qwen36 = SimpleNamespace(__file__=str(qwen36_path))
+            source_checks = []
+            wheel_runtime = {
+                "installed_distribution_identity": lambda path, actual_digest: (
+                    "1.1.0rc.9", installed_files
+                ),
+                "require_distribution_file": lambda path, files: self.assertIn(
+                    path.resolve(), files
+                ),
+                "require_installed": lambda *_args: None,
+                "require_native_source_identity": lambda module, revision: source_checks.append(
+                    (module, revision)
+                ),
+            }
+            with (
+                mock.patch.object(
+                    MODULE.importlib.metadata, "distribution", return_value=distribution
+                ),
+                mock.patch.object(
+                    MODULE.importlib.util,
+                    "find_spec",
+                    return_value=SimpleNamespace(origin=str(package)),
+                ),
+                mock.patch.object(
+                    MODULE.importlib,
+                    "import_module",
+                    side_effect=lambda name: tritium if name == "tritium" else qwen36,
+                ),
+                mock.patch.dict(MODULE.WHEEL_RUNTIME, wheel_runtime),
+            ):
+                loaded = MODULE._validate_capture_python_environment(
+                    candidate_path, candidate, "e" * 40
+                )
+
+            self.assertIs(loaded, qwen36)
+            self.assertEqual(source_checks, [(tritium._tritium, "e" * 40)])
+
+    def test_execute_rejects_dirty_checkout_before_receipt_validation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            candidate = root / "candidate.json"
+            revision = "d" * 40
+            candidate.write_text(json.dumps({
+                "schema": "tritium.release-candidate.v1",
+                "release": "1.1.0-rc.9",
+                "source_revision": revision,
+            }))
+            args = MODULE._parser().parse_args(
+                self._base_args()
+                + [
+                    "--release-candidate-manifest", str(candidate),
+                    "--stage7-qualification-receipt", str(root / "stage7.json"),
+                ]
+            )
+            completed = lambda stdout: type("Completed", (), {"stdout": stdout})()
+            validator = mock.Mock()
+            with (
+                mock.patch.object(
+                    MODULE.subprocess,
+                    "run",
+                    side_effect=[completed(revision + "\n"), completed(" M local.py\n")],
+                ),
+                mock.patch.dict(MODULE.STAGE7, {"validate": validator}),
+            ):
+                with self.assertRaisesRegex(ValueError, "requires a clean checkout"):
+                    MODULE._validate_stage7_qualification(args)
+                validator.assert_not_called()
 
     def test_candidate_manifest_rejects_duplicate_identity_fields(self):
         with tempfile.TemporaryDirectory() as temporary:
