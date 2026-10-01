@@ -14,6 +14,7 @@ mod codec;
 const SPEC_HASH_CONTEXT: &str = "tritium salt v2 output reconstruction spec v1";
 const TEACHER_HASH_CONTEXT: &str = "tritium salt v2 output reconstruction teacher v1";
 const CANDIDATE_HASH_CONTEXT: &str = "tritium salt v2 output reconstruction candidate v1";
+const CANDIDATE_HASH_CONTEXT_V3: &str = "tritium salt v2 output reconstruction candidate v2";
 const RECEIPT_HASH_CONTEXT: &str = "tritium salt v2 output reconstruction receipt v1";
 const MAX_OUTPUT_RECONSTRUCTION_SCOPES: usize = 1 << 20;
 
@@ -496,29 +497,11 @@ impl OutputReconstructionAccumulator {
         Ok(())
     }
 
-    /// Seal exact aggregate losses and streamed evidence identities.
+    /// Seal exact aggregate losses and aggregate plus per-scope output evidence.
     ///
     /// # Errors
     /// Rejects incomplete scope coverage or missing block/logit measurements.
     pub fn finish(self) -> Result<OutputCandidateReceipt, OutputReconstructionError> {
-        self.finish_with_scope_evidence()
-            .map(|(candidate, _)| candidate)
-    }
-
-    /// Seal one candidate together with independent, batch-ordered digests for
-    /// every reconstruction scope.
-    ///
-    /// The scope digests let a runtime observe block-major model execution and
-    /// later compare each selected block/window without retaining activation
-    /// matrices or replaying the model once per scope. They are separate from
-    /// the frozen aggregate `student_output_digest` stored in `TSV2OUT` v2.
-    ///
-    /// # Errors
-    /// Rejects incomplete scope coverage or missing block/logit measurements.
-    pub fn finish_with_scope_evidence(
-        self,
-    ) -> Result<(OutputCandidateReceipt, Vec<RuntimeOutputScopeEvidence>), OutputReconstructionError>
-    {
         if self.scope_index != self.spec.scopes.len() || self.batch_index != 0 {
             return Err(OutputReconstructionError::IncompleteCandidate);
         }
@@ -567,10 +550,11 @@ impl OutputReconstructionAccumulator {
             teacher_cross_entropy: canonical_zero(teacher_cross_entropy),
             teacher_kl: canonical_zero(teacher_kl),
             objective: canonical_zero(objective),
+            scope_evidence,
             receipt_id: [0; 32],
         };
         receipt.receipt_id = receipt.derive_id();
-        Ok((receipt, scope_evidence))
+        Ok(receipt)
     }
 }
 
@@ -592,6 +576,7 @@ pub struct OutputCandidateReceipt {
     teacher_cross_entropy: f64,
     teacher_kl: f64,
     objective: f64,
+    scope_evidence: Vec<RuntimeOutputScopeEvidence>,
     receipt_id: [u8; 32],
 }
 
@@ -638,6 +623,12 @@ impl OutputCandidateReceipt {
         self.runtime_logit_count
     }
 
+    /// Scope digests committed by `TSV2OUT` v3 for block-major runtime matching.
+    #[must_use]
+    pub fn scope_evidence(&self) -> &[RuntimeOutputScopeEvidence] {
+        &self.scope_evidence
+    }
+
     /// Mean squared error across selected block outputs.
     #[must_use]
     pub const fn block_output_mse(&self) -> f64 {
@@ -669,6 +660,37 @@ impl OutputCandidateReceipt {
     }
 
     fn derive_id(&self) -> [u8; 32] {
+        if self.scope_evidence.is_empty() {
+            return self.derive_v2_id();
+        }
+        let mut hasher = blake3::Hasher::new_derive_key(CANDIDATE_HASH_CONTEXT_V3);
+        hasher.update(&self.spec_id);
+        hasher.update(&self.candidate_id);
+        hasher.update(&self.initialization_seed.to_le_bytes());
+        hasher.update(&self.teacher_evidence_digest);
+        hasher.update(&self.student_output_digest);
+        hasher.update(&self.runtime_final_logits_digest);
+        hasher.update(&self.runtime_batch_count.to_le_bytes());
+        hasher.update(&self.runtime_logit_count.to_le_bytes());
+        hasher.update(&self.observations.to_le_bytes());
+        hasher.update(&self.block_elements.to_le_bytes());
+        hasher.update(&self.final_tokens.to_le_bytes());
+        for value in [
+            self.block_output_mse,
+            self.teacher_cross_entropy,
+            self.teacher_kl,
+            self.objective,
+        ] {
+            hasher.update(&value.to_bits().to_le_bytes());
+        }
+        hasher.update(&(self.scope_evidence.len() as u64).to_le_bytes());
+        for evidence in &self.scope_evidence {
+            hash_scope_evidence(&mut hasher, evidence);
+        }
+        *hasher.finalize().as_bytes()
+    }
+
+    fn derive_v2_id(&self) -> [u8; 32] {
         let mut hasher = blake3::Hasher::new_derive_key(CANDIDATE_HASH_CONTEXT);
         hasher.update(&self.spec_id);
         hasher.update(&self.candidate_id);
@@ -805,10 +827,18 @@ pub fn select_output_reconstruction(
         .first()
         .map(|candidate| candidate.teacher_evidence_digest)
         .ok_or(OutputReconstructionError::InvalidCount)?;
+    let scope_evidence_mode = candidates
+        .first()
+        .is_some_and(|candidate| !candidate.scope_evidence.is_empty());
     let mut ids = BTreeSet::new();
     let mut seeds = BTreeSet::new();
     for candidate in &candidates {
-        if candidate.spec_id != spec.spec_id || candidate.receipt_id != candidate.derive_id() {
+        if candidate.spec_id != spec.spec_id
+            || candidate.receipt_id != candidate.derive_id()
+            || (!candidate.scope_evidence.is_empty()) != scope_evidence_mode
+            || (!candidate.scope_evidence.is_empty()
+                && !scope_evidence_matches_spec(spec, candidate))
+        {
             return Err(OutputReconstructionError::CandidateSpecMismatch);
         }
         if candidate.teacher_evidence_digest != teacher_evidence_digest {
@@ -847,6 +877,33 @@ pub fn select_output_reconstruction(
         selected_candidate_id,
         receipt_id,
     })
+}
+
+fn scope_evidence_matches_spec(
+    spec: &OutputReconstructionSpec,
+    candidate: &OutputCandidateReceipt,
+) -> bool {
+    candidate.scope_evidence.len() == spec.scopes.len()
+        && candidate
+            .scope_evidence
+            .iter()
+            .zip(&spec.scopes)
+            .all(|(evidence, expected)| {
+                let expected = match expected {
+                    OutputReconstructionScope::Block { start, end } => RuntimeOutputScope::Block {
+                        start: *start,
+                        end: *end,
+                    },
+                    OutputReconstructionScope::FinalLogits => RuntimeOutputScope::FinalLogits,
+                };
+                evidence.scope() == expected
+                    && evidence.spec_id() == &candidate.spec_id
+                    && evidence.candidate_id() == &candidate.candidate_id
+                    && evidence.initialization_seed() == candidate.initialization_seed
+                    && evidence.observation_count() == u64::from(spec.batches_per_scope)
+                    && evidence.value_count() > 0
+                    && evidence.digest() != &[0; 32]
+            })
 }
 
 fn schedule_scopes(
@@ -951,6 +1008,24 @@ fn hash_observation(
     for value in values {
         hasher.update(&value.to_bits().to_le_bytes());
     }
+}
+
+fn hash_scope_evidence(hasher: &mut blake3::Hasher, evidence: &RuntimeOutputScopeEvidence) {
+    match evidence.scope() {
+        RuntimeOutputScope::Block { start, end } => {
+            hasher.update(&[1]);
+            hasher.update(&start.to_le_bytes());
+            hasher.update(&end.to_le_bytes());
+        }
+        RuntimeOutputScope::FinalLogits => {
+            hasher.update(&[2]);
+            hasher.update(&0_u32.to_le_bytes());
+            hasher.update(&0_u32.to_le_bytes());
+        }
+    }
+    hasher.update(&evidence.observation_count().to_le_bytes());
+    hasher.update(&evidence.value_count().to_le_bytes());
+    hasher.update(evidence.digest());
 }
 
 fn distillation_losses(teacher: &[f32], student: &[f32], temperature: f64) -> (f64, f64) {

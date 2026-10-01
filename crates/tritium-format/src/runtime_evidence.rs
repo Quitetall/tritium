@@ -331,6 +331,9 @@ pub struct RuntimeOutputReconstructionAccumulator {
 #[derive(Clone, Debug)]
 pub struct RuntimeOutputScopeAccumulator {
     scope: RuntimeOutputScope,
+    spec_id: [u8; 32],
+    candidate_id: [u8; 32],
+    initialization_seed: u64,
     hasher: blake3::Hasher,
     observation_count: u64,
     value_count: u64,
@@ -341,16 +344,74 @@ pub struct RuntimeOutputScopeAccumulator {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RuntimeOutputScopeEvidence {
     scope: RuntimeOutputScope,
+    spec_id: [u8; 32],
+    candidate_id: [u8; 32],
+    initialization_seed: u64,
     digest: [u8; 32],
     observation_count: u64,
     value_count: u64,
 }
 
 impl RuntimeOutputScopeEvidence {
+    /// Reconstitute validated scope evidence from a canonical receipt record.
+    ///
+    /// This only reconstructs the claimed digest and counts; it does not
+    /// authenticate outputs. A consumer must compare the digest with a fresh
+    /// runtime stream before treating it as execution evidence.
+    ///
+    /// # Errors
+    /// Rejects malformed scopes, zero digests, and empty counts.
+    pub fn from_canonical_parts(
+        scope: RuntimeOutputScope,
+        spec_id: [u8; 32],
+        candidate_id: [u8; 32],
+        initialization_seed: u64,
+        digest: [u8; 32],
+        observation_count: u64,
+        value_count: u64,
+    ) -> Result<Self, RuntimeEvidenceError> {
+        if matches!(scope, RuntimeOutputScope::Block { start, end } if start >= end)
+            || spec_id == [0; 32]
+            || candidate_id == [0; 32]
+            || digest == [0; 32]
+            || observation_count == 0
+            || value_count == 0
+        {
+            return Err(RuntimeEvidenceError::InvalidGeometry);
+        }
+        Ok(Self {
+            scope,
+            spec_id,
+            candidate_id,
+            initialization_seed,
+            digest,
+            observation_count,
+            value_count,
+        })
+    }
+
     /// Scope represented by the digest.
     #[must_use]
     pub const fn scope(self) -> RuntimeOutputScope {
         self.scope
+    }
+
+    /// Reconstruction specification identity bound by the digest.
+    #[must_use]
+    pub const fn spec_id(&self) -> &[u8; 32] {
+        &self.spec_id
+    }
+
+    /// Candidate identity bound by the digest.
+    #[must_use]
+    pub const fn candidate_id(&self) -> &[u8; 32] {
+        &self.candidate_id
+    }
+
+    /// Deterministic initialization seed bound by the digest.
+    #[must_use]
+    pub const fn initialization_seed(self) -> u64 {
+        self.initialization_seed
     }
 
     /// Content digest bound to the scope, candidate, seed, and ordered batches.
@@ -405,6 +466,9 @@ impl RuntimeOutputScopeAccumulator {
         }
         Ok(Self {
             scope,
+            spec_id: *spec_id,
+            candidate_id: *candidate_id,
+            initialization_seed,
             hasher,
             observation_count: 0,
             value_count: 0,
@@ -485,6 +549,9 @@ impl RuntimeOutputScopeAccumulator {
         }
         Ok(RuntimeOutputScopeEvidence {
             scope: self.scope,
+            spec_id: self.spec_id,
+            candidate_id: self.candidate_id,
+            initialization_seed: self.initialization_seed,
             digest: *self.hasher.finalize().as_bytes(),
             observation_count: self.observation_count,
             value_count: self.value_count,

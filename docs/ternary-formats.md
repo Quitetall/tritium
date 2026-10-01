@@ -104,6 +104,23 @@ different: its G64 scales may vary within a row and remain packed in `Q2Linear`;
 code 3 (`+2`) and non-finite scales fail before the projection is published.
 `tritium report sparsity` applies the same scale semantics before counting zeros.
 
+## Output-reconstruction receipt: `TSV2OUT` v3 scope commitments
+
+Version 3 extends each candidate record with one digest and count pair for
+every ordered block/window and final-logit scope. The v3 candidate content
+identity commits both the historical aggregate student-output digest and these
+scope digests, so they cannot be attached later as an unrelated sidecar.
+Version 2 remains byte-stable and strictly readable, but does not carry block
+scope commitments and cannot satisfy block-output runtime admission.
+
+Each scope record encodes its scope tag and inclusive/exclusive block range (or
+the final-logit tag with a zero range), batch observation count, value count,
+and digest. Strict reopen checks the full scope order, candidate/spec/seed
+binding, expected batch coverage, objective and receipt identities. The scope
+digests are candidate-produced claims until an admitted runtime independently
+executes the exact selected package and matches every scope. Neither v2 nor v3
+alone establishes model quality or release qualification.
+
 ## TL1 / TL2: a non-goal, deliberately
 
 bitnet.cpp's TL1 (ARM) and TL2 (x86) are **kernel-tuning artifacts, not
