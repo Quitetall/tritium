@@ -15,11 +15,13 @@ categories.workspace = true
 default = ["std"]
 std = ["alloc"]
 alloc = []
+serde = ["dep:serde_nostd"]
 schema-gen = ["std", "dep:schemars", "dep:serde_json"]
 
 [dependencies]
 schemars = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
+serde_nostd = { workspace = true, optional = true }
 
 [[bin]]
 name = "tritium-schema-projections"

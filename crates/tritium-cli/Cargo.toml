@@ -17,6 +17,7 @@ path = "src/main.rs"
 
 [dependencies]
 tritium-format = { workspace = true }
+tritium-evidence = { workspace = true }
 tritium-runtime = { workspace = true }
 # Used directly to render `DeviceCaps` in `list-backends`.
 tritium-spec = { workspace = true }

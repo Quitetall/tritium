@@ -49,6 +49,7 @@ mod campaign_artifact;
 #[cfg(feature = "nccl")]
 mod campaign_world;
 mod convert;
+mod evidence;
 mod generate;
 #[cfg(feature = "cuda")]
 mod hestia_gate;
@@ -157,6 +158,12 @@ enum Command {
         /// Release evidence operation.
         #[command(subcommand)]
         release: release::ReleaseCommand,
+    },
+    /// Inspect and verify canonical, hash-chained evidence JSONL.
+    Evidence {
+        /// Evidence operation.
+        #[command(subcommand)]
+        evidence: evidence::EvidenceCommand,
     },
     /// Repack ternary GGUF tensors while preserving dequantized weight values.
     Repack {
@@ -548,6 +555,7 @@ fn main() -> anyhow::Result<()> {
         Command::Repack { input, output, to } => repack::run(&input, &output, to)?,
         Command::Transport { transport: command } => transport::run(command)?,
         Command::Release { release: command } => release::run(command)?,
+        Command::Evidence { evidence: command } => evidence::run(command)?,
         Command::Report { report: command } => match command {
             ReportCommand::Sparsity { model } => report::sparsity(&model)?,
             ReportCommand::Decode {

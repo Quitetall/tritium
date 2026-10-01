@@ -7,8 +7,8 @@ use std::{
 
 use schemars::JsonSchema;
 use tritium_schema::{
-    AdditiveLayout, AdmittedLaw, Basis, BlobId, LayoutError, ModelId, PackageId, PlaneAllocation,
-    PlaneCodec, PlaneRelation, ScaleAnchor, ScaleLaw, ScalePrecision, SchemaId,
+    AdditiveLayout, AdmittedLaw, Basis, BlobId, EvidenceEnvelope, LayoutError, ModelId, PackageId,
+    PlaneAllocation, PlaneCodec, PlaneRelation, ScaleAnchor, ScaleLaw, ScalePrecision, SchemaId,
     SemanticTensorDigest, Transport, UnknownReason, Verdict,
 };
 
@@ -38,6 +38,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     project!(AdmittedLaw, "admitted-law");
     project!(Basis, "basis");
     project!(BlobId, "blob-id");
+    project!(EvidenceEnvelope<serde_json::Value>, "evidence-envelope");
     project!(LayoutError, "layout-error");
     project!(ModelId, "model-id");
     project!(PackageId, "package-id");

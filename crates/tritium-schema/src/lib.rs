@@ -270,6 +270,11 @@ digest_id!(
 /// Standardized reason category for an unresolved claim.
 #[non_exhaustive]
 #[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde_nostd::Serialize, serde_nostd::Deserialize)
+)]
+#[cfg_attr(feature = "serde", serde(crate = "serde_nostd"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum UnknownReason {
     /// The claim has not yet been evaluated.
@@ -287,6 +292,11 @@ pub enum UnknownReason {
 /// Outcome attached to a measured or verified claim.
 #[non_exhaustive]
 #[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde_nostd::Serialize, serde_nostd::Deserialize)
+)]
+#[cfg_attr(feature = "serde", serde(crate = "serde_nostd"))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Verdict {
     /// The claim passed its declared check.
@@ -298,6 +308,39 @@ pub enum Verdict {
         /// Stable reason code; free-form details belong in the evidence event.
         reason: UnknownReason,
     },
+}
+
+/// Shared metadata envelope for one typed evidence payload.
+///
+/// Payload schemas remain event-specific; this type supplies the common
+/// version, identity, span, logical-time, and digest fields.
+#[cfg(feature = "alloc")]
+#[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde_nostd::Serialize, serde_nostd::Deserialize)
+)]
+#[cfg_attr(feature = "serde", serde(crate = "serde_nostd"))]
+#[derive(Clone, Debug, PartialEq)]
+pub struct EvidenceEnvelope<P> {
+    /// Registered event schema identifier, such as `tritium.quantize.fit`.
+    pub schema: alloc::string::String,
+    /// Version of this event schema.
+    pub v: u16,
+    /// Stable run identifier.
+    pub run: alloc::string::String,
+    /// Monotonic sequence number within this span, starting at zero.
+    pub seq: u64,
+    /// Stable span identifier.
+    pub span: alloc::string::String,
+    /// Parent span, if this span is nested.
+    pub parent: Option<alloc::string::String>,
+    /// Logical time within the run; wall-clock timing is intentionally separate.
+    pub t: u64,
+    /// Typed, event-specific payload.
+    pub payload: P,
+    /// Lowercase hexadecimal BLAKE3 digest of this event and its span predecessor.
+    pub digest: alloc::string::String,
 }
 
 /// Structural validation failure for an [`AdditiveLayout`].
