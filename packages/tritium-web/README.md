@@ -142,8 +142,10 @@ python scripts/produce-browser-native-reference.py \
 Then produce one physical lane from already-running W3C WebDriver endpoint:
 
 ```bash
+TRITIUM_WEB_VERSION="$(node -p 'require("./packages/tritium-web/package.json").version')"
+TRITIUM_WEB_ARCHIVE="$TRITIUM_EVIDENCE_ROOT/npm/tritium-ai-web-$TRITIUM_WEB_VERSION.tgz"
 node scripts/run-browser-training-lane.mjs \
-  --artifact "$TRITIUM_EVIDENCE_ROOT/npm/tritium-ai-web-1.1.0-rc.1.tgz" \
+  --artifact "$TRITIUM_WEB_ARCHIVE" \
   --npm-receipt "$TRITIUM_EVIDENCE_ROOT/npm/npm-archive-receipt.json" \
   --native-artifact "$TRITIUM_EVIDENCE_ROOT/native/native.salt" \
   --native-reference-receipt "$TRITIUM_EVIDENCE_ROOT/native/receipt.json" \
