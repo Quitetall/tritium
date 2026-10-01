@@ -8,9 +8,9 @@ pub use selected_allocation::{
     Qwen36AdmittedExecutionReceipt, Qwen36AdmittedExecutionSession, Qwen36ExecutionBackend,
     Qwen36ExecutionReplayError, Qwen36ExecutionSessionOpenError, Qwen36ExecutionVisitError,
     Qwen36FinalLogitsOutputBindingError, Qwen36FinalLogitsOutputBindingReceipt,
-    Qwen36PackageAdmissionError, Qwen36PackageAdmissionReceipt, Qwen36PackageAdmittedCampaignStore,
-    Qwen36PackageProfileReceipt, Qwen36PackageRuntimeLedger, Qwen36PackageScaleOnlyCampaignStore,
-    Qwen36PackageVisitError, Qwen36PvParentContext,
+    Qwen36OutputScopeBindingReceipt, Qwen36PackageAdmissionError, Qwen36PackageAdmissionReceipt,
+    Qwen36PackageAdmittedCampaignStore, Qwen36PackageProfileReceipt, Qwen36PackageRuntimeLedger,
+    Qwen36PackageScaleOnlyCampaignStore, Qwen36PackageVisitError, Qwen36PvParentContext,
 };
 pub use selected_allocation::{
     Qwen36AllocatedCampaignStore, Qwen36PhysicalAllocationError, Qwen36SelectedAllocationBindError,
@@ -3468,17 +3468,33 @@ mod tests {
     fn qwen_output_reconstruction_bytes(
         spec: &OutputReconstructionSpec,
         candidate_id: [u8; 32],
+        token_batches: &[&[u32]],
+        hidden_size: usize,
         final_logits: &[Vec<f32>],
     ) -> Vec<u8> {
+        assert_eq!(token_batches.len(), final_logits.len());
         let mut candidate =
             OutputReconstructionAccumulator::new(spec, candidate_id, 41).expect("candidate");
         for scope in spec.scopes() {
-            for (batch_index, logits) in final_logits.iter().enumerate() {
+            for (batch_index, (tokens, logits)) in
+                token_batches.iter().zip(final_logits).enumerate()
+            {
                 let batch_index = u32::try_from(batch_index).expect("fixture batch index");
                 match scope {
-                    OutputReconstructionScope::Block { .. } => candidate
-                        .observe(*scope, batch_index, 1, 1, &[true], &[0.0], &[0.0])
-                        .expect("block observation"),
+                    OutputReconstructionScope::Block { .. } => {
+                        let values = vec![0.0; tokens.len() * hidden_size];
+                        candidate
+                            .observe(
+                                *scope,
+                                batch_index,
+                                tokens.len(),
+                                hidden_size,
+                                &vec![true; tokens.len()],
+                                &values,
+                                &values,
+                            )
+                            .expect("block observation");
+                    }
                     OutputReconstructionScope::FinalLogits => candidate
                         .observe(
                             *scope,
@@ -3498,24 +3514,24 @@ mod tests {
             vec![candidate.finish().expect("complete output candidate")],
         )
         .expect("select output candidate");
-        selected.canonical_bytes().expect("canonical TSV2OUT v2")
+        selected.canonical_bytes().expect("canonical TSV2OUT v3")
     }
 
-    fn legacy_output_reconstruction_bytes(v2: &[u8]) -> Vec<u8> {
+    fn legacy_output_reconstruction_bytes(v3: &[u8]) -> Vec<u8> {
         const HEADER_BYTES: usize = 112;
         const V2_CANDIDATE_BYTES: usize = 272;
         const CANDIDATE_HASH_CONTEXT: &str = "tritium salt v2 output reconstruction candidate v1";
         const RECEIPT_HASH_CONTEXT: &str = "tritium salt v2 output reconstruction receipt v1";
-        let mut legacy = v2[..HEADER_BYTES].to_vec();
+        let mut legacy = v3[..HEADER_BYTES].to_vec();
         legacy[8..10].copy_from_slice(&1_u16.to_le_bytes());
         let legacy_start = legacy.len();
-        legacy.extend_from_slice(&v2[HEADER_BYTES..HEADER_BYTES + 136]);
-        legacy.extend_from_slice(&v2[HEADER_BYTES + 184..HEADER_BYTES + 240]);
+        legacy.extend_from_slice(&v3[HEADER_BYTES..HEADER_BYTES + 136]);
+        legacy.extend_from_slice(&v3[HEADER_BYTES + 184..HEADER_BYTES + 240]);
         let mut candidate = blake3::Hasher::new_derive_key(CANDIDATE_HASH_CONTEXT);
         candidate.update(&legacy[legacy_start..]);
         let candidate_receipt = *candidate.finalize().as_bytes();
         legacy.extend_from_slice(&candidate_receipt);
-        debug_assert_eq!(v2.len(), HEADER_BYTES + V2_CANDIDATE_BYTES + 32);
+        debug_assert!(v3.len() >= HEADER_BYTES + V2_CANDIDATE_BYTES + 32);
         let mut receipt = blake3::Hasher::new_derive_key(RECEIPT_HASH_CONTEXT);
         receipt.update(&legacy[12..44]);
         receipt.update(&legacy[44..76]);
@@ -3657,8 +3673,75 @@ mod tests {
         let candidate_id = receipt
             .output_candidate_id(&output_spec)
             .expect("campaign-bound candidate identity");
-        let output_bytes =
-            qwen_output_reconstruction_bytes(&output_spec, candidate_id, &runtime_logits);
+        let output_bytes = qwen_output_reconstruction_bytes(
+            &output_spec,
+            candidate_id,
+            &[first.as_slice(), second.as_slice()],
+            128,
+            &runtime_logits,
+        );
+        let first_mask = [true, true];
+        let second_mask = [true];
+        let scope_batches = [
+            (first.as_slice(), first_mask.as_slice()),
+            (second.as_slice(), second_mask.as_slice()),
+        ];
+        let scope_binding = session
+            .bind_output_reconstruction_scopes(&output_spec, &output_bytes, &receipt, scope_batches)
+            .expect("bind exact block scopes to campaign execution");
+        assert!(scope_binding.has_block_outputs());
+        assert_eq!(scope_binding.scope_count(), 2);
+        assert_eq!(scope_binding.block_scope_count(), 1);
+        assert_eq!(scope_binding.batch_count(), receipt.batch_count());
+        let scope_binding_bytes = scope_binding.canonical_bytes().expect("canonical scopes");
+        assert_eq!(scope_binding_bytes.len(), 592);
+        assert_eq!(&scope_binding_bytes[..8], b"TSQ36SB\0");
+        assert_eq!(&scope_binding_bytes[8..10], &1_u16.to_le_bytes());
+        assert_eq!(
+            scope_binding.binding_id(),
+            ContentId::of_bytes(&scope_binding_bytes)
+        );
+        assert_eq!(
+            session
+                .reopen_output_reconstruction_scopes_binding(
+                    &output_spec,
+                    &output_bytes,
+                    &receipt,
+                    scope_batches,
+                    &scope_binding_bytes,
+                )
+                .expect("replay and reopen exact scope binding"),
+            scope_binding
+        );
+        let mut corrupt_scope_binding = scope_binding_bytes.clone();
+        corrupt_scope_binding[48] ^= 1;
+        assert!(matches!(
+            session.reopen_output_reconstruction_scopes_binding(
+                &output_spec,
+                &output_bytes,
+                &receipt,
+                scope_batches,
+                &corrupt_scope_binding,
+            ),
+            Err(Qwen36FinalLogitsOutputBindingError::Runtime(
+                NnError::InvalidArtifact(_)
+            ))
+        ));
+        let changed_mask = [false, true];
+        assert!(matches!(
+            session.bind_output_reconstruction_scopes(
+                &output_spec,
+                &output_bytes,
+                &receipt,
+                [
+                    (first.as_slice(), changed_mask.as_slice()),
+                    (second.as_slice(), second_mask.as_slice()),
+                ],
+            ),
+            Err(Qwen36FinalLogitsOutputBindingError::Runtime(
+                NnError::Provenance(_)
+            ))
+        ));
         let binding = admitted
             .bind_output_reconstruction_final_logits(&output_spec, &output_bytes, &receipt)
             .expect("bind exact final logits to package execution");
@@ -3701,8 +3784,13 @@ mod tests {
             ))
         ));
 
-        let relabeled_bytes =
-            qwen_output_reconstruction_bytes(&output_spec, [99; 32], &runtime_logits);
+        let relabeled_bytes = qwen_output_reconstruction_bytes(
+            &output_spec,
+            [99; 32],
+            &[first.as_slice(), second.as_slice()],
+            128,
+            &runtime_logits,
+        );
         assert!(matches!(
             admitted.bind_output_reconstruction_final_logits(
                 &output_spec,
@@ -3716,8 +3804,13 @@ mod tests {
 
         let mut changed_logits = runtime_logits.clone();
         changed_logits[0][0] += 1.0;
-        let changed_output_bytes =
-            qwen_output_reconstruction_bytes(&output_spec, candidate_id, &changed_logits);
+        let changed_output_bytes = qwen_output_reconstruction_bytes(
+            &output_spec,
+            candidate_id,
+            &[first.as_slice(), second.as_slice()],
+            128,
+            &changed_logits,
+        );
         assert!(matches!(
             admitted.bind_output_reconstruction_final_logits(
                 &output_spec,
@@ -3746,6 +3839,8 @@ mod tests {
         let wrong_token_bytes = qwen_output_reconstruction_bytes(
             &wrong_token_spec,
             wrong_token_candidate,
+            &[first.as_slice(), second.as_slice()],
+            128,
             &runtime_logits,
         );
         assert!(matches!(

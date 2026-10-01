@@ -121,6 +121,16 @@ digests are candidate-produced claims until an admitted runtime independently
 executes the exact selected package and matches every scope. Neither v2 nor v3
 alone establishes model quality or release qualification.
 
+The SALT-owned `TSQ36OB` v1 bridge currently binds exact final logits to a
+campaign execution receipt. `TSQ36SB` v1 supplements it with the ordered digest
+and counts of every v3 block/window and final-logit scope. It is minted only by
+a live sealed execution session after replaying the same token batches and row
+masks, and strict reopen repeats that execution and comparison. A scope-binding
+receipt does not replace checkpoint-scale quality, runtime, or reproduction
+gates. Its canonical envelope contains the magic, version, zero reserved bits,
+embedded `TSQ36OB` byte length, scope and batch/observation/value counts, the
+scope-set digest, the complete `TSQ36OB` bytes, and a domain-separated checksum.
+
 ## TL1 / TL2: a non-goal, deliberately
 
 bitnet.cpp's TL1 (ARM) and TL2 (x86) are **kernel-tuning artifacts, not

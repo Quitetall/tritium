@@ -80,10 +80,10 @@ pub use qwen36_tensor_work::{
     Qwen36AdmittedExecutionReceipt, Qwen36AdmittedExecutionSession, Qwen36ExecutionBackend,
     Qwen36ExecutionReplayError, Qwen36ExecutionSessionOpenError, Qwen36ExecutionVisitError,
     Qwen36FinalLogitsOutputBindingError, Qwen36FinalLogitsOutputBindingReceipt,
-    Qwen36PackageAdmissionError, Qwen36PackageAdmissionReceipt, Qwen36PackageAdmittedCampaignStore,
-    Qwen36PackageProfileReceipt, Qwen36PackageRuntimeLedger, Qwen36PackageScaleOnlyCampaignStore,
-    Qwen36PackageVisitError, Qwen36PtqPackageError, Qwen36PtqPackagesReceipt,
-    Qwen36PvParentContext, reconcile_qwen36_ptq_packages,
+    Qwen36OutputScopeBindingReceipt, Qwen36PackageAdmissionError, Qwen36PackageAdmissionReceipt,
+    Qwen36PackageAdmittedCampaignStore, Qwen36PackageProfileReceipt, Qwen36PackageRuntimeLedger,
+    Qwen36PackageScaleOnlyCampaignStore, Qwen36PackageVisitError, Qwen36PtqPackageError,
+    Qwen36PtqPackagesReceipt, Qwen36PvParentContext, reconcile_qwen36_ptq_packages,
 };
 #[cfg(all(unix, feature = "cuda"))]
 pub use qwen36_tensor_work::{
