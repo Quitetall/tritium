@@ -370,9 +370,11 @@ def _audit_graph(graph, specs, onnx) -> None:
                 raise ValueError("module ONNX packed initializer geometry is invalid")
         for name in spec["scale_initializers"]:
             value = initializers[name]
-            if value.data_type != onnx.TensorProto.FLOAT16 or tuple(value.dims) != (
-                spec["rows"],
-                1,
+            if (
+                value.data_type != onnx.TensorProto.FLOAT16
+                or len(value.dims) != 2
+                or value.dims[0] != spec["rows"]
+                or not 1 <= value.dims[1] <= spec["columns"]
             ):
                 raise ValueError("module ONNX scale initializer geometry is invalid")
     float_types = {
