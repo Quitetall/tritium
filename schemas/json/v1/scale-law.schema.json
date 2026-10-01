@@ -17,6 +17,7 @@
       "$ref": "#/$defs/PlaneRelation"
     }
   },
+  "additionalProperties": false,
   "required": [
     "anchor",
     "relation",

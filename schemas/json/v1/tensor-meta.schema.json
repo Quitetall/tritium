@@ -1,77 +1,151 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "AdditiveLayout",
-  "description": "Semantic layout parameters for an additive tensor.",
-  "type": "object",
-  "properties": {
-    "allocation": {
-      "description": "Plane count allocation mode.",
-      "$ref": "#/$defs/PlaneAllocation"
+  "title": "TensorMeta",
+  "description": "Physical representation and semantic identity recorded for one tensor.",
+  "oneOf": [
+    {
+      "description": "Additive ternary tensor with a codec-independent semantic digest.",
+      "type": "object",
+      "properties": {
+        "Additive": {
+          "type": "object",
+          "properties": {
+            "blob": {
+              "description": "Content-addressed identity of the exact stored payload bytes.",
+              "$ref": "#/$defs/BlobId"
+            },
+            "layout": {
+              "description": "Tensor layout needed to decode the additive payload.",
+              "$ref": "#/$defs/AdditiveLayout"
+            },
+            "semantic_digest": {
+              "description": "Codec-independent identity of the tensor's semantic values.",
+              "$ref": "#/$defs/SemanticTensorDigest"
+            }
+          },
+          "required": [
+            "blob",
+            "layout",
+            "semantic_digest"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "Additive"
+      ]
     },
-    "basis": {
-      "description": "Input-axis basis.",
-      "$ref": "#/$defs/Basis"
-    },
-    "codec": {
-      "description": "Per-plane codec.",
-      "$ref": "#/$defs/PlaneCodec"
-    },
-    "cols": {
-      "description": "Number of coefficients per row.",
-      "type": "integer",
-      "format": "uint64",
-      "minimum": 0
-    },
-    "group": {
-      "description": "Scale group width.",
-      "type": "integer",
-      "format": "uint16",
-      "maximum": 65535,
-      "minimum": 0
-    },
-    "law": {
-      "description": "Scale law.",
-      "$ref": "#/$defs/ScaleLaw"
-    },
-    "max_planes": {
-      "description": "Maximum plane count represented by this tensor.",
-      "type": "integer",
-      "format": "uint8",
-      "maximum": 255,
-      "minimum": 0
-    },
-    "rows": {
-      "description": "Number of matrix rows.",
-      "type": "integer",
-      "format": "uint64",
-      "minimum": 0
-    },
-    "tile": {
-      "description": "Canonical tile width. Currently fixed at [`ADDITIVE_TILE_SIZE`].",
-      "type": "integer",
-      "format": "uint16",
-      "maximum": 65535,
-      "minimum": 0
-    },
-    "transport": {
-      "description": "Outer entropy transport.",
-      "$ref": "#/$defs/Transport"
+    {
+      "description": "Dense tensor preserved as a master, adapter, or auxiliary model tensor.",
+      "type": "object",
+      "properties": {
+        "Dense": {
+          "type": "object",
+          "properties": {
+            "blob": {
+              "description": "Content-addressed identity of the exact stored payload bytes.",
+              "$ref": "#/$defs/BlobId"
+            },
+            "dtype": {
+              "description": "Element representation of the dense payload.",
+              "$ref": "#/$defs/DenseDType"
+            },
+            "shape": {
+              "description": "Logical tensor shape in row-major axis order.",
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "format": "uint64",
+                "minimum": 0
+              }
+            }
+          },
+          "required": [
+            "blob",
+            "dtype",
+            "shape"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "Dense"
+      ]
     }
-  },
-  "additionalProperties": false,
-  "required": [
-    "rows",
-    "cols",
-    "tile",
-    "group",
-    "max_planes",
-    "allocation",
-    "codec",
-    "law",
-    "basis",
-    "transport"
   ],
   "$defs": {
+    "AdditiveLayout": {
+      "description": "Semantic layout parameters for an additive tensor.",
+      "type": "object",
+      "properties": {
+        "allocation": {
+          "description": "Plane count allocation mode.",
+          "$ref": "#/$defs/PlaneAllocation"
+        },
+        "basis": {
+          "description": "Input-axis basis.",
+          "$ref": "#/$defs/Basis"
+        },
+        "codec": {
+          "description": "Per-plane codec.",
+          "$ref": "#/$defs/PlaneCodec"
+        },
+        "cols": {
+          "description": "Number of coefficients per row.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "group": {
+          "description": "Scale group width.",
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "law": {
+          "description": "Scale law.",
+          "$ref": "#/$defs/ScaleLaw"
+        },
+        "max_planes": {
+          "description": "Maximum plane count represented by this tensor.",
+          "type": "integer",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0
+        },
+        "rows": {
+          "description": "Number of matrix rows.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "tile": {
+          "description": "Canonical tile width. Currently fixed at [`ADDITIVE_TILE_SIZE`].",
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "transport": {
+          "description": "Outer entropy transport.",
+          "$ref": "#/$defs/Transport"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "rows",
+        "cols",
+        "tile",
+        "group",
+        "max_planes",
+        "allocation",
+        "codec",
+        "law",
+        "basis",
+        "transport"
+      ]
+    },
     "Basis": {
       "description": "Input-axis transform associated with an additive tensor.",
       "oneOf": [
@@ -141,6 +215,38 @@
           "required": [
             "SignedRht"
           ]
+        }
+      ]
+    },
+    "BlobId": {
+      "description": "Content identity for stored tensor or asset bytes.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    },
+    "DenseDType": {
+      "description": "Dense element type available for preserved master or auxiliary tensors.",
+      "oneOf": [
+        {
+          "description": "IEEE binary16.",
+          "type": "string",
+          "const": "F16"
+        },
+        {
+          "description": "Brain floating-point 16-bit.",
+          "type": "string",
+          "const": "Bf16"
+        },
+        {
+          "description": "IEEE binary32.",
+          "type": "string",
+          "const": "F32"
         }
       ]
     },
@@ -288,6 +394,18 @@
           "const": "F32"
         }
       ]
+    },
+    "SemanticTensorDigest": {
+      "description": "Identity for a tensor's semantic values independent of its container.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0
+      },
+      "maxItems": 32,
+      "minItems": 32
     },
     "Transport": {
       "description": "Optional entropy transport applied outside the tensor's plane codec.",

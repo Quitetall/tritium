@@ -1,0 +1,97 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Level",
+  "description": "A named model level mapping tensor names to the blobs used at that level.",
+  "type": "object",
+  "properties": {
+    "name": {
+      "description": "Stable, model-local level name.",
+      "type": "string"
+    },
+    "provenance": {
+      "description": "How this level was produced.",
+      "$ref": "#/$defs/LevelProvenance"
+    },
+    "tensors": {
+      "description": "Tensor-name to content-addressed blob mapping.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/BlobId"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "name",
+    "provenance",
+    "tensors"
+  ],
+  "$defs": {
+    "BlobId": {
+      "description": "Content identity for stored tensor or asset bytes.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    },
+    "LevelProvenance": {
+      "description": "Provenance class for one directly usable model quality level.",
+      "oneOf": [
+        {
+          "description": "Fitted directly from the source weights with the referenced evidence run.",
+          "type": "object",
+          "properties": {
+            "Direct": {
+              "type": "object",
+              "properties": {
+                "evidence": {
+                  "description": "Stable evidence run-root digest identifying the fit.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "evidence"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Direct"
+          ]
+        },
+        {
+          "description": "Imported as a prefix view of another level; not a direct fit.",
+          "type": "object",
+          "properties": {
+            "ImportedPrefixOf": {
+              "type": "object",
+              "properties": {
+                "level": {
+                  "description": "Name of the source level whose stored planes form this prefix.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "level"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "ImportedPrefixOf"
+          ]
+        },
+        {
+          "description": "Imported without proof that it is a direct fit or exact prefix.",
+          "type": "string",
+          "const": "Imported"
+        }
+      ]
+    }
+  }
+}

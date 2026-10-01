@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LevelProvenance",
+  "description": "Provenance class for one directly usable model quality level.",
+  "oneOf": [
+    {
+      "description": "Fitted directly from the source weights with the referenced evidence run.",
+      "type": "object",
+      "properties": {
+        "Direct": {
+          "type": "object",
+          "properties": {
+            "evidence": {
+              "description": "Stable evidence run-root digest identifying the fit.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "evidence"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "Direct"
+      ]
+    },
+    {
+      "description": "Imported as a prefix view of another level; not a direct fit.",
+      "type": "object",
+      "properties": {
+        "ImportedPrefixOf": {
+          "type": "object",
+          "properties": {
+            "level": {
+              "description": "Name of the source level whose stored planes form this prefix.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "level"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "ImportedPrefixOf"
+      ]
+    },
+    {
+      "description": "Imported without proof that it is a direct fit or exact prefix.",
+      "type": "string",
+      "const": "Imported"
+    }
+  ]
+}
