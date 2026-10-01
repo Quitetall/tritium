@@ -231,6 +231,12 @@ The evidence remains preserved in `/mnt/4tb/tmp`; no file was moved or removed.
 The source-model ID match and structural inspection do not establish calibration
 coverage, accuracy, or a completed master campaign.
 
+A fresh read-only `scripts/qwen36-ptq-status.py` probe of the durable campaign
+workspace reports `stalled`, 0 of 506 published masters, no seal, and one dead
+temporary record of 447,083,070 bytes (its recorded PID is no longer alive).
+That partial file is retained; it is not a complete tensor master and is not
+evidence that the campaign can resume against approved calibration provenance.
+
 ### Hosted package evidence from PR #51 (2026-10-01)
 
 PR #51 (`bbbafd99cada6dab821cea63e5cdf971f1ce79fb`) has successful hosted
