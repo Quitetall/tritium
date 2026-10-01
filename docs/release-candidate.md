@@ -210,9 +210,11 @@ campaign remains stalled and was not restarted.
 
 The 506-file S2KF directory
 `/mnt/4tb/tmp/qwen36-evidence-a417374-1seq-clean-20260821` passes the
-installed native structural inspector: it contains the complete ordinal range,
-one input-Hessian curvature kind, the pinned source-model ID, and common
-activation-cache/token-stream identities. Its token-stream digest is
+installed native structural inspector `inspect_qwen36_ptq_evidence`: evidence
+ID `tsc1_11df78c64eaa9a27ec43f4a226d701c30bd897bbeca5c0b8692bae24631e2c71`,
+506 records, input-Hessian curvature, pinned source-model ID
+`126eb094f936c87bf7aeff60e57dadf5351ff082a48b8d63c7553919029cd3ca`, and
+common activation-cache/token-stream identities. Its token-stream digest is
 `d30fbc02209285448253dde628fe4c5285700cf86d66296c500eb6b1c38dcd2b`.
 
 That digest exactly matches the first 2,048-token member of token pack
@@ -226,6 +228,10 @@ the token-stream digest from its caller and the old capture invocation ledger
 has not been found. Do not start fitting from this evidence. Recover a
 source-bound capture transcript or recapture from the admitted frozen pack,
 recording the exact partition/window receipt, before resuming tensor masters.
+The pack receipt records the full calibration partition token digest as
+`sha256:98008cb043f6df722a81cca127f71eb8cb84f05445fbd7a35f1aff948f63fe15`,
+which differs from the legacy S2KF token-stream identity above. It does not
+change the unknown about what the historical capture actually consumed.
 
 The evidence remains preserved in `/mnt/4tb/tmp`; no file was moved or removed.
 The source-model ID match and structural inspection do not establish calibration
