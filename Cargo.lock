@@ -4848,6 +4848,7 @@ version = "1.1.0-rc.2"
 dependencies = [
  "blake3",
  "bytemuck",
+ "ciborium",
  "half",
  "proptest",
  "serde",
