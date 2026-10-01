@@ -8,15 +8,20 @@ the 27B checkpoint and executing the capture requires the explicit flag.
 from __future__ import annotations
 
 import argparse
+import json
 import math
 from pathlib import Path
 import runpy
+import subprocess
 import sys
 from typing import Any
 
 
 REPLAY = runpy.run_path(Path(__file__).with_name("qwen36_calibration_replay.py"))
 PINNED_REVISION = REPLAY["_VERIFIER"]["REVISION"]
+STAGE7 = runpy.run_path(
+    Path(__file__).with_name("verify-stage7-qualification-receipt.py")
+)
 
 
 def _parse_max_memory(values: list[str]) -> dict[Any, str]:
@@ -60,6 +65,57 @@ def _validate_capture_recipe(args: argparse.Namespace) -> None:
         raise ValueError("damping must be finite and nonnegative")
 
 
+def _validate_stage7_qualification(args: argparse.Namespace) -> dict[str, Any]:
+    if args.stage7_qualification_receipt is None:
+        raise ValueError("--execute requires --stage7-qualification-receipt")
+    if args.release_candidate_manifest is None:
+        raise ValueError("--execute requires --release-candidate-manifest")
+
+    candidate_path = args.release_candidate_manifest
+    try:
+        STAGE7["_ordinary_candidate"](candidate_path)
+        raw = candidate_path.read_bytes()
+        candidate = json.loads(raw)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+        raise ValueError("release candidate manifest must contain UTF-8 JSON") from error
+    if (
+        not isinstance(candidate, dict)
+        or candidate.get("schema") != "tritium.release-candidate.v1"
+    ):
+        raise ValueError("release candidate manifest schema mismatch")
+    release = candidate.get("release")
+    revision = candidate.get("source_revision")
+    if not isinstance(release, str) or not release:
+        raise ValueError("release candidate manifest has no release identity")
+    if not isinstance(revision, str) or len(revision) != 40 or any(
+        character not in "0123456789abcdef" for character in revision
+    ):
+        raise ValueError("release candidate manifest has an invalid source revision")
+    try:
+        checkout_revision = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=Path(__file__).resolve().parent.parent,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise ValueError("cannot determine capture checkout revision") from error
+    if revision != checkout_revision:
+        raise ValueError(
+            "release candidate source_revision differs from capture checkout HEAD"
+        )
+    try:
+        return STAGE7["validate"](
+            args.stage7_qualification_receipt,
+            revision,
+            release,
+            candidate_path,
+        )
+    except (OSError, ValueError, RuntimeError, KeyError, TypeError) as error:
+        raise ValueError(f"Stage 7 qualification receipt rejected: {error}") from error
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", required=True, type=Path)
@@ -70,6 +126,16 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--work-dir", required=True, type=Path)
     parser.add_argument("--evidence-dir", required=True, type=Path)
     parser.add_argument("--capture-binding-output", required=True, type=Path)
+    parser.add_argument(
+        "--release-candidate-manifest",
+        type=Path,
+        help="candidate manifest bound by the required Stage 7 freeze receipt",
+    )
+    parser.add_argument(
+        "--stage7-qualification-receipt",
+        type=Path,
+        help="candidate-bound Stage 7 recipe-freeze pass required by --execute",
+    )
     parser.add_argument("--declared-revision", default=PINNED_REVISION)
     parser.add_argument(
         "--activation-cache-digest",
@@ -135,6 +201,8 @@ def main() -> int:
         return 0
 
     try:
+        stage7 = _validate_stage7_qualification(args)
+        print(f"STAGE 7 PASS receipt={stage7['receipt_id']}")
         _validate_capture_recipe(args)
         if not args.offload_folder:
             raise ValueError("--execute requires an explicit --offload-folder")

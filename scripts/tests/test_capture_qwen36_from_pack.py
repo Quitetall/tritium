@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
+import json
 from pathlib import Path
+import sys
+import tempfile
 import unittest
+from unittest import mock
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "capture-qwen36-from-pack.py"
@@ -37,6 +43,88 @@ class CaptureQwenFromPackTests(unittest.TestCase):
         self.assertIsNone(args.activation_cache_digest)
         self.assertIsNone(args.curvature)
         self.assertIsNone(args.damping)
+
+    def test_execute_requires_stage7_receipt_before_model_loading(self):
+        replay = type("Replay", (), {
+            "receipt": {"receipt_id": "pack", "revision": MODULE.PINNED_REVISION},
+            "contract": {"contract_id": "contract"},
+            "token_stream_digest": "batch",
+        })()
+        replay_module = type("ReplayModule", (), {
+            "open": staticmethod(lambda *_args: replay),
+        })
+        verifier = {"validate_replay_contract": lambda _path: replay.contract}
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(MODULE, "REPLAY", {
+                "Qwen36CalibrationReplay": replay_module,
+                "_VERIFIER": verifier,
+            }),
+            mock.patch.object(sys, "argv", [
+                str(SCRIPT), *self._base_args(), "--execute",
+                "--curvature", "input-hessian", "--damping", "0.01",
+                "--activation-cache-digest", "a" * 64,
+                "--offload-folder", "offload",
+            ]),
+            contextlib.redirect_stderr(stderr),
+        ):
+            with self.assertRaises(SystemExit) as raised:
+                MODULE.main()
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("--stage7-qualification-receipt", stderr.getvalue())
+
+    def test_execute_validates_freeze_against_candidate_and_checkout_revision(self):
+        replay = type("Replay", (), {
+            "receipt": {"receipt_id": "pack", "revision": MODULE.PINNED_REVISION},
+            "contract": {"contract_id": "contract"},
+            "token_stream_digest": "batch",
+        })()
+        replay_module = type("ReplayModule", (), {
+            "open": staticmethod(lambda *_args: replay),
+        })
+        verifier = {"validate_replay_contract": lambda _path: replay.contract}
+        revision = "b" * 40
+        checked = []
+        stderr = io.StringIO()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            candidate = root / "candidate.json"
+            candidate.write_text(json.dumps({
+                "schema": "tritium.release-candidate.v1",
+                "release": "1.1.0-rc.9",
+                "source_revision": revision,
+            }))
+            receipt = root / "stage7.json"
+            receipt.write_text("{}\n")
+
+            def validate(receipt_path, actual_revision, release, candidate_path):
+                checked.append((receipt_path, actual_revision, release, candidate_path))
+                return {"receipt_id": "sha256:" + "c" * 64}
+
+            with (
+                mock.patch.object(MODULE, "REPLAY", {
+                    "Qwen36CalibrationReplay": replay_module,
+                    "_VERIFIER": verifier,
+                }),
+                mock.patch.dict(MODULE.STAGE7, {"validate": validate}),
+                mock.patch.object(
+                    MODULE.subprocess,
+                    "run",
+                    return_value=type("Completed", (), {"stdout": revision + "\n"})(),
+                ),
+                mock.patch.object(sys, "argv", [
+                    str(SCRIPT), *self._base_args(), "--execute",
+                    "--release-candidate-manifest", str(candidate),
+                    "--stage7-qualification-receipt", str(receipt),
+                ]),
+                contextlib.redirect_stderr(stderr),
+            ):
+                with self.assertRaises(SystemExit) as raised:
+                    MODULE.main()
+
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("requires --curvature", stderr.getvalue())
+        self.assertEqual(checked, [(receipt, revision, "1.1.0-rc.9", candidate)])
 
     def test_execution_recipe_requires_frozen_cache_digest(self):
         args = MODULE._parser().parse_args(
