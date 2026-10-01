@@ -160,6 +160,19 @@ package evidence are needed for actual registry publication. The campaign
 execution path still does not consume official-identity authorization. No
 fitting or campaign restart was performed.
 
+### Durable source-proof copy (2026-10-01)
+
+The 221,951-byte proof named by the retained source-admission receipt was copied
+byte-for-byte from `/mnt/4tb/tmp` to
+`/mnt/2tb/tritium-release-evidence/qwen-source-admission/sha256-0a45d3b593893aaf660d34ecd31cc66bf28ae4fd19d411ffa0671d2747ca2fd4/source-proof.tq36`.
+Its SHA-256 is
+`09b59e8e41d7e0f947e31d2fc8f4fb635804f162f0c7558a2df6ff6d98b834e0`, matching
+the receipt. This is a retention copy, not a replacement receipt or a new
+source-admission pass. The immutable receipt still records its original
+absolute `proof_path` under `/mnt/4tb/tmp`; preserve that original path until a
+portable receipt/consumer path is implemented and newly issued evidence is
+validated. The durable copy alone does not make `/mnt/4tb/tmp` safe to prune.
+
 ### Latest local verification (2026-09-18, `570a8802`)
 
 `scripts/verify-gates.sh release` completed with exit status 0 after the
