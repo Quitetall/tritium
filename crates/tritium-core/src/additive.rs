@@ -161,6 +161,18 @@ impl<'a> AdditiveView<'a> {
         self.plane_count
     }
 
+    /// Return the validated plane-major ternary coefficients.
+    #[must_use]
+    pub const fn trits(&self) -> &'a [Trit] {
+        self.trits
+    }
+
+    /// Return the stored scale values in their canonical plane/unit order.
+    #[must_use]
+    pub const fn scales(&self) -> &'a [f32] {
+        self.scales
+    }
+
     /// Decode one output row into `out`, using the declared additive scale law.
     pub fn dequant_row_into(&self, row: usize, out: &mut [f32]) -> Result<(), AdditiveError> {
         let rows = usize::try_from(self.layout.rows).map_err(|_| AdditiveError::SizeOverflow)?;

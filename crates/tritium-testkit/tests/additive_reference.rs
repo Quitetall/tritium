@@ -8,6 +8,7 @@ use tritium_schema::{
     AdditiveLayout, Basis, PlaneAllocation, PlaneCodec, PlaneRelation, ScaleAnchor, ScaleLaw,
     ScalePrecision, Transport,
 };
+use tritium_spec::{TensorMatmul, TensorView, TernaryBackend};
 
 fn layout(basis: Basis, law: ScaleLaw) -> AdditiveLayout {
     AdditiveLayout {
@@ -79,6 +80,47 @@ fn frozen_free_group_two_plane_reference_vector() {
         &mut output,
     )
     .expect("frozen vector matmul is valid");
+    assert_eq!(transformed, [1.0, 2.0, 3.0, 4.0]);
+    assert_close(&output, &[2.25]);
+}
+
+#[test]
+fn reference_backend_uploads_and_executes_additive_tensors() {
+    let trits = [
+        Trit::POS,
+        Trit::NEG,
+        Trit::ZERO,
+        Trit::POS,
+        Trit::ZERO,
+        Trit::POS,
+        Trit::NEG,
+        Trit::POS,
+    ];
+    let view = AdditiveView::new(
+        layout(
+            Basis::Identity,
+            law(ScaleAnchor::Group, PlaneRelation::Free),
+        ),
+        2,
+        &trits,
+        &[0.5, 0.25],
+    )
+    .expect("frozen vector layout is valid");
+    let backend = tritium_testkit::ReferenceBackend::new();
+    let tensor = backend
+        .upload_tensor(TensorView::Additive(view))
+        .expect("reference backend accepts additive tensors");
+    let mut transformed = [0.0; 4];
+    let mut output = [0.0; 1];
+    backend
+        .matmul(TensorMatmul {
+            act: &[1.0, 2.0, 3.0, 4.0],
+            tensor: &*tensor,
+            batch: 1,
+            transformed_act: &mut transformed,
+            out: &mut output,
+        })
+        .expect("reference backend executes additive tensors");
     assert_eq!(transformed, [1.0, 2.0, 3.0, 4.0]);
     assert_close(&output, &[2.25]);
 }

@@ -9,11 +9,16 @@
 
 use core::any::Any;
 
-use tritium_core::{GemmShape, TernaryFormat, Trit, reference_mpgemm};
+use tritium_core::{
+    AdditiveView, GemmShape, TernaryFormat, Trit, reference_mpgemm, reference_ternary_matmul,
+};
 use tritium_format::{
     TQ1_0_BLOCK_BYTES, TQ2_0_BLOCK_BYTES, num_blocks, unpack_tq1_0_row, unpack_tq2_0_row,
 };
-use tritium_spec::{BackendError, DeviceBuffer, DeviceCaps, MpGemm, TernaryBackend};
+use tritium_schema::AdditiveLayout;
+use tritium_spec::{
+    BackendError, DeviceBuffer, DeviceCaps, MpGemm, TensorMatmul, TensorView, TernaryBackend,
+};
 
 /// Device buffer for [`ReferenceBackend`]: the unpacked trits plus the shape they
 /// came from, so `mpgemm` needs no re-derivation.
@@ -28,6 +33,25 @@ pub(crate) struct RefBuffer {
 impl DeviceBuffer for RefBuffer {
     fn len_bytes(&self) -> usize {
         self.bytes
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// Owned semantic additive tensor held by the additive reference path.
+#[derive(Debug)]
+struct RefAdditiveBuffer {
+    layout: AdditiveLayout,
+    plane_count: u8,
+    trits: Vec<Trit>,
+    scales: Vec<f32>,
+}
+
+impl DeviceBuffer for RefAdditiveBuffer {
+    fn len_bytes(&self) -> usize {
+        self.trits.len() + self.scales.len() * core::mem::size_of::<f32>()
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -54,6 +78,36 @@ impl TernaryBackend for ReferenceBackend {
 
     fn capabilities(&self) -> DeviceCaps {
         DeviceCaps::new("reference", "tritium-testkit reference backend")
+    }
+
+    fn upload_tensor(&self, tensor: TensorView<'_>) -> Result<Box<dyn DeviceBuffer>, BackendError> {
+        match tensor {
+            TensorView::Additive(view) => Ok(Box::new(RefAdditiveBuffer {
+                layout: view.layout(),
+                plane_count: u8::try_from(view.plane_count()).map_err(|_| {
+                    BackendError::InvalidInput("additive plane count exceeds u8".into())
+                })?,
+                trits: view.trits().to_vec(),
+                scales: view.scales().to_vec(),
+            })),
+            TensorView::Dense { .. } => Err(BackendError::Backend(
+                "reference backend semantic upload currently accepts additive tensors only".into(),
+            )),
+        }
+    }
+
+    fn matmul(&self, p: TensorMatmul<'_>) -> Result<(), BackendError> {
+        let buf = p
+            .tensor
+            .as_any()
+            .downcast_ref::<RefAdditiveBuffer>()
+            .ok_or_else(|| {
+                BackendError::InvalidInput("tensor is not a reference additive tensor".into())
+            })?;
+        let view = AdditiveView::new(buf.layout, buf.plane_count, &buf.trits, &buf.scales)
+            .map_err(|e| BackendError::InvalidInput(format!("invalid reference tensor: {e:?}")))?;
+        reference_ternary_matmul(p.act, &view, p.batch, p.transformed_act, p.out)
+            .map_err(|e| BackendError::InvalidInput(format!("reference matmul failed: {e:?}")))
     }
 
     fn upload_weights(
