@@ -138,6 +138,22 @@ into campaign authorization and the release registry remains open. The prior
 incomplete bundle variants remain inadmissible, and the 506-tensor campaign
 has not been restarted.
 
+### Source identity release-registry linkage (2026-10-01)
+
+The release evidence evaluator now requires both `source-admission` and
+`official-source-identity` receipts for the `qwen-source-admission` gate. The
+official receipt must name the exact source-admission receipt ID as its sole
+registry parent; both entries must bind the same candidate source artifact, and
+repository, revision, semantic model ID, manifest ID, and proof ID must agree.
+Each registry entry ID must also equal the ID derived from its immutable
+receipt bytes. An admission receipt by itself therefore remains `MISSING`, not
+a source-identity pass.
+
+This implements the registry-side linkage only. Existing candidate registries
+must be regenerated from both receipts before this gate can pass, and the
+campaign execution path still does not consume official-identity
+authorization. No fitting or campaign restart was performed.
+
 ### Latest local verification (2026-09-18, `570a8802`)
 
 `scripts/verify-gates.sh release` completed with exit status 0 after the
