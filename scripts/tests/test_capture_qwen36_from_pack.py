@@ -126,6 +126,26 @@ class CaptureQwenFromPackTests(unittest.TestCase):
         self.assertIn("requires --curvature", stderr.getvalue())
         self.assertEqual(checked, [(receipt, revision, "1.1.0-rc.9", candidate)])
 
+    def test_candidate_manifest_rejects_duplicate_identity_fields(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            candidate = root / "candidate.json"
+            candidate.write_text(
+                '{"schema":"tritium.release-candidate.v1",'
+                '"release":"1.1.0-rc.9",'
+                '"source_revision":"' + "a" * 40 + '",'
+                '"source_revision":"' + "b" * 40 + '"}'
+            )
+            args = MODULE._parser().parse_args(
+                self._base_args()
+                + [
+                    "--release-candidate-manifest", str(candidate),
+                    "--stage7-qualification-receipt", str(root / "stage7.json"),
+                ]
+            )
+            with self.assertRaisesRegex(ValueError, "duplicate JSON key 'source_revision'"):
+                MODULE._validate_stage7_qualification(args)
+
     def test_execution_recipe_requires_frozen_cache_digest(self):
         args = MODULE._parser().parse_args(
             self._base_args() + ["--curvature", "input-hessian", "--damping", "0.01"]

@@ -65,6 +65,19 @@ def _validate_capture_recipe(args: argparse.Namespace) -> None:
         raise ValueError("damping must be finite and nonnegative")
 
 
+def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key {key!r}")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"non-finite JSON constant {value!r} is not allowed")
+
+
 def _validate_stage7_qualification(args: argparse.Namespace) -> dict[str, Any]:
     if args.stage7_qualification_receipt is None:
         raise ValueError("--execute requires --stage7-qualification-receipt")
@@ -75,9 +88,13 @@ def _validate_stage7_qualification(args: argparse.Namespace) -> dict[str, Any]:
     try:
         STAGE7["_ordinary_candidate"](candidate_path)
         raw = candidate_path.read_bytes()
-        candidate = json.loads(raw)
+        candidate = json.loads(
+            raw,
+            object_pairs_hook=_reject_duplicate_json_keys,
+            parse_constant=_reject_json_constant,
+        )
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
-        raise ValueError("release candidate manifest must contain UTF-8 JSON") from error
+        raise ValueError(f"release candidate manifest is invalid: {error}") from error
     if (
         not isinstance(candidate, dict)
         or candidate.get("schema") != "tritium.release-candidate.v1"
