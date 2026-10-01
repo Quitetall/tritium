@@ -1,8 +1,31 @@
 #![cfg(feature = "cuda")]
 
-use tritium_cuda::train::CudaTrainBackendV1;
-use tritium_spec::{TrainBackendV1, TrainingVectorSetV3};
+use tritium_cuda::train::{CudaTrainBackendV1, CudaTrainBackendV2};
+use tritium_spec::{
+    TrainBackendV1, TrainingOpManifestV2, TrainingVectorSetV2, TrainingVectorSetV3,
+};
 use tritium_testkit::run_supported_training_conformance;
+
+#[test]
+fn cuda_executes_every_v2_vector_for_its_advertised_operations() {
+    let vectors = TrainingVectorSetV2::parse_json(include_bytes!(
+        "../../../spec/training/v2/vectors/v2.json"
+    ))
+    .expect("parse canonical V2 training vectors");
+    let backend = CudaTrainBackendV2::new(0).expect("open CUDA device 0");
+    let report = run_supported_training_conformance(&backend, &vectors);
+    assert!(
+        report.is_ok(),
+        "{} CUDA V2 portable-training failures: {:?}",
+        report.failed.len(),
+        report.failed
+    );
+    assert_eq!(report.passed.len(), 117);
+    assert_eq!(
+        backend.capabilities().manifest_digest,
+        TrainingOpManifestV2::digest()
+    );
+}
 
 #[test]
 fn cuda_executes_every_vector_for_its_advertised_operations() {

@@ -7,7 +7,8 @@ use tritium_spec::{
     BackendError, TernaryBackend, TrainAttributeValueV1, TrainBackendError, TrainBackendV1,
     TrainBufferDataMutV1, TrainBufferDataRefV1, TrainCapabilitiesV1, TrainDTypeV1,
     TrainExecutionV1, TrainLimitsV1, TrainOperationErrorV1, TrainOutputV1, TrainReceiptV1,
-    TrainRequestV1, TrainingOpManifestV3, train_output_digest_v1, train_request_digest_v1,
+    TrainRequestV1, TrainingOpManifestV2, TrainingOpManifestV3, train_output_digest_v1,
+    train_request_digest_v1,
 };
 
 use super::DeviceTape;
@@ -2831,6 +2832,50 @@ impl TrainBackendV1 for CudaTrainBackendV1 {
             host_transfers: 0,
             device_resident: true,
         })
+    }
+}
+
+/// CUDA adapter for the frozen V2 portable-training manifest.
+///
+/// It shares the resident CUDA implementation with V3 while exposing only
+/// operations and receipt identity admitted by V2.
+#[derive(Debug)]
+pub struct CudaTrainBackendV2(CudaTrainBackendV1);
+
+impl CudaTrainBackendV2 {
+    /// Open one CUDA ordinal and bind receipts to its physical identity.
+    pub fn new(ordinal: usize) -> Result<Self, BackendError> {
+        Ok(Self(CudaTrainBackendV1::new(ordinal)?))
+    }
+}
+
+impl TrainBackendV1 for CudaTrainBackendV2 {
+    fn capabilities(&self) -> TrainCapabilitiesV1 {
+        let mut capabilities = self.0.capabilities();
+        capabilities.manifest_digest = TrainingOpManifestV2::digest();
+        capabilities.supported_operations = TrainingOpManifestV2::operations()
+            .iter()
+            .map(|operation| operation.id.to_owned())
+            .collect();
+        capabilities
+    }
+
+    fn execute(
+        &self,
+        request: TrainRequestV1<'_>,
+        output: &mut TrainOutputV1<'_>,
+    ) -> Result<TrainReceiptV1, TrainBackendError> {
+        if !TrainingOpManifestV2::operations()
+            .iter()
+            .any(|operation| operation.id == request.operation)
+        {
+            return Err(TrainBackendError::UnsupportedOperation(
+                request.operation.to_owned(),
+            ));
+        }
+        let mut receipt = self.0.execute(request, output)?;
+        receipt.manifest_digest = TrainingOpManifestV2::digest();
+        Ok(receipt)
     }
 }
 

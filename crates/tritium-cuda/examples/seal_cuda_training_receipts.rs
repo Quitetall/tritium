@@ -1,15 +1,26 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 
-use tritium_cuda::train::CudaTrainBackendV1;
-use tritium_spec::TrainingVectorSetV3;
-use tritium_testkit::seal_training_receipts;
+use tritium_cuda::train::{CudaTrainBackendV1, CudaTrainBackendV2};
+use tritium_spec::{TrainBackendV1, TrainingVectorSetV2, TrainingVectorSetV3};
+use tritium_testkit::{TrainingVectorCorpus, seal_training_receipts};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut arguments = std::env::args_os().skip(1);
-    let output_dir = arguments
+    let first = arguments
         .next()
-        .ok_or("usage: seal_cuda_training_receipts OUTPUT_DIR [DEVICE_INDEX]")?;
+        .ok_or("usage: seal_cuda_training_receipts [--schema v2|v3] OUTPUT_DIR [DEVICE_INDEX]")?;
+    let (schema, output_dir) = if first == "--schema" {
+        let schema = arguments
+            .next()
+            .ok_or("--schema requires v2 or v3")?
+            .into_string()
+            .map_err(|_| "schema must be UTF-8")?;
+        let output_dir = arguments.next().ok_or("--schema requires an OUTPUT_DIR")?;
+        (schema, output_dir)
+    } else {
+        ("v3".to_owned(), first)
+    };
     let device_index = arguments
         .next()
         .map(|raw| {
@@ -24,13 +35,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("unexpected arguments".into());
     }
 
-    let vectors = TrainingVectorSetV3::parse_json(include_bytes!(
-        "../../../spec/training/v3/vectors/v3.json"
-    ))?;
-    let backend = CudaTrainBackendV1::new(device_index)?;
-    let sealed = seal_training_receipts(&backend, &vectors)?;
-    fs::create_dir_all(&output_dir)?;
-    let output_dir = std::path::Path::new(&output_dir);
+    match schema.as_str() {
+        "v2" => {
+            let vectors = TrainingVectorSetV2::parse_json(include_bytes!(
+                "../../../spec/training/v2/vectors/v2.json"
+            ))?;
+            seal_and_write(
+                &CudaTrainBackendV2::new(device_index)?,
+                &vectors,
+                &output_dir,
+            )
+        }
+        "v3" => {
+            let vectors = TrainingVectorSetV3::parse_json(include_bytes!(
+                "../../../spec/training/v3/vectors/v3.json"
+            ))?;
+            seal_and_write(
+                &CudaTrainBackendV1::new(device_index)?,
+                &vectors,
+                &output_dir,
+            )
+        }
+        _ => Err("schema must be v2 or v3".into()),
+    }
+}
+
+fn seal_and_write(
+    backend: &impl TrainBackendV1,
+    vectors: &impl TrainingVectorCorpus,
+    output_dir: &std::ffi::OsStr,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let sealed = seal_training_receipts(backend, vectors)?;
+    fs::create_dir_all(output_dir)?;
+    let output_dir = std::path::Path::new(output_dir);
     let destination = output_dir.join(format!("{}.json", sealed.digest_hex()));
     if destination.exists() {
         if fs::read(&destination)? != sealed.bytes() {

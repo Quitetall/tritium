@@ -44,7 +44,7 @@ use crate::cuda::{CudaBackend, EmbedSegments, TrainingSaltLinear};
 
 mod portable;
 
-pub use portable::CudaTrainBackendV1;
+pub use portable::{CudaTrainBackendV1, CudaTrainBackendV2};
 
 /// `(g_a[M,K], g_w[N,K], g_s[N])` — the three matmul gradients returned together by
 /// [`GemmEngine::backward`].
