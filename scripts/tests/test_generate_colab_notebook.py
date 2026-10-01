@@ -30,6 +30,8 @@ class GenerateColabNotebookTests(unittest.TestCase):
         self.assertIn("SMOLLM2_REVISION", source)
         self.assertIn(f'pytritium=={MODULE.pypi_candidate()}', source)
         self.assertNotIn("pytritium==1.1.0rc1", source)
+        self.assertIn('"cuda" in tritium.compiled_backends()', source)
+        self.assertIn('else "cpu"', source)
         self.assertNotIn("/home/", source)
         self.assertNotIn("drive.mount", source)
 

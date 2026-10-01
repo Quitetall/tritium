@@ -86,6 +86,7 @@ immutable Hub revision remain visible here.""",
         nbformat.v4.new_code_cell(
             """import json
 import torch
+import tritium
 from tritium.torch import (
     SMOLLM2_MODEL_ID,
     SMOLLM2_REVISION,
@@ -97,7 +98,11 @@ receipt = run_smollm2_release_demo(
     output_dir,
     model_id=SMOLLM2_MODEL_ID,
     revision=SMOLLM2_REVISION,
-    device="cuda" if torch.cuda.is_available() else "cpu",
+    device=(
+        "cuda"
+        if torch.cuda.is_available() and "cuda" in tritium.compiled_backends()
+        else "cpu"
+    ),
     max_seconds=300.0,
 )
 print(json.dumps({
