@@ -3732,6 +3732,19 @@ impl CudaBackend {
         &self.stream
     }
 
+    /// Run synchronous host-side handle construction with this backend's context current.
+    ///
+    /// Some CUDA libraries (including cudarc's cuBLASLt handle constructor) require a
+    /// current context before they create a handle. The guard restores the caller's
+    /// prior context even when the operation returns an error or unwinds.
+    pub(crate) fn with_current_context<T>(
+        &self,
+        operation: impl FnOnce() -> T,
+    ) -> Result<T, BackendError> {
+        let _context = CurrentContextRestore::bind(self.stream.context())?;
+        Ok(operation())
+    }
+
     /// `Y[m,n] = s[n]·Σ_k A[m,k]·W[n,k]` on ALREADY-RESIDENT buffers — the device-resident companion
     /// to [`train_forward`](Self::train_forward): same kernel, same `--fmad=false` sequential
     /// reduction, no htod/dtoh. `d_y` must be preallocated `m*n` (e.g. via [`dev_alloc_zeros`]).
