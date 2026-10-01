@@ -139,16 +139,23 @@ python scripts/produce-browser-native-reference.py \
   --output-dir "$TRITIUM_EVIDENCE_ROOT/native"
 ```
 
-Then produce one physical lane from already-running W3C WebDriver endpoint:
+Then produce one physical lane from an already-running W3C WebDriver endpoint.
+Set the expected version to the exact numeric version reported by the browser
+binary configured for that endpoint, and confirm that binary is on the current
+stable channel (not beta, dev, nightly, or canary). The receipt producer checks
+that WebDriver reports the predeclared version:
 
 ```bash
+TRITIUM_WEB_VERSION="$(node -p 'require("./packages/tritium-web/package.json").version')"
+TRITIUM_WEB_ARCHIVE="$TRITIUM_EVIDENCE_ROOT/npm/tritium-ai-web-$TRITIUM_WEB_VERSION.tgz"
+TRITIUM_EXPECTED_BROWSER_VERSION="${TRITIUM_EXPECTED_BROWSER_VERSION:?set to the exact current-stable WebDriver browser version}"
 node scripts/run-browser-training-lane.mjs \
-  --artifact "$TRITIUM_EVIDENCE_ROOT/npm/tritium-ai-web-1.1.0-rc.1.tgz" \
+  --artifact "$TRITIUM_WEB_ARCHIVE" \
   --npm-receipt "$TRITIUM_EVIDENCE_ROOT/npm/npm-archive-receipt.json" \
   --native-artifact "$TRITIUM_EVIDENCE_ROOT/native/native.salt" \
   --native-reference-receipt "$TRITIUM_EVIDENCE_ROOT/native/receipt.json" \
   --webdriver-url http://127.0.0.1:9515 \
-  --engine chrome --expected-browser-version 140.0.1 \
+  --engine chrome --expected-browser-version "$TRITIUM_EXPECTED_BROWSER_VERSION" \
   --source-revision "$(git rev-parse HEAD)" \
   --run-id chrome-physical-1 \
   --output-dir "$TRITIUM_EVIDENCE_ROOT/chrome"
