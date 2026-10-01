@@ -12,6 +12,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import tomllib
 import uuid
 from typing import Any
 
@@ -20,7 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 MANIFEST_DIGEST = "9093a1a7f9a3422c399943782aadf4df6b11833cf2253db0db56ff2d9dedb098"
 VECTOR_DIGEST = "38b17f4c76c1d2f85cb35c713652a3d77627d02ba47933d2c8f31a88e0c594a7"
 SCENARIO_ID = "salt-ste-sgd-256-v1"
-RELEASE = "1.1.0-rc.1"
+RELEASE_PATTERN = re.compile(r"1\.1\.0-rc\.(?:0|[1-9][0-9]*)")
 MAX_ARTIFACT_BYTES = 8 * 1024 * 1024
 HEX64 = re.compile(r"[0-9a-f]{64}")
 METADATA_FIELDS = {
@@ -47,6 +48,20 @@ METADATA_FIELDS = {
 
 class NativeReferenceError(ValueError):
     """Native reference is stale, partial, non-resident, or byte-drifted."""
+
+
+def release_version(root: Path = ROOT) -> str:
+    """Read the candidate release from the workspace's authoritative manifest."""
+
+    try:
+        with (root / "Cargo.toml").open("rb") as stream:
+            workspace = tomllib.load(stream)["workspace"]
+        release = workspace["package"]["version"]
+    except (OSError, KeyError, tomllib.TOMLDecodeError) as error:
+        raise NativeReferenceError("workspace release version is unavailable") from error
+    if not isinstance(release, str) or RELEASE_PATTERN.fullmatch(release) is None:
+        raise NativeReferenceError("workspace release is not a canonical v1.1 candidate")
+    return release
 
 
 def canonical(value: Any) -> bytes:
@@ -116,7 +131,7 @@ def build_receipt(
     backend_build = metadata["backend_build"]
     physical_device = metadata["physical_device"]
     if (
-        backend_build != f"tritium-train@{RELEASE}+source-git:{revision}"
+        backend_build != f"tritium-train@{release_version()}+source-git:{revision}"
         or not physical_device.startswith("cpu:")
         or metadata["manifest_digest"] != MANIFEST_DIGEST
     ):
