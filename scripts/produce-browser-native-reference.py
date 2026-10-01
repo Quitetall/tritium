@@ -12,6 +12,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import tomllib
 import uuid
 from typing import Any
 
@@ -20,7 +21,9 @@ ROOT = Path(__file__).resolve().parents[1]
 MANIFEST_DIGEST = "9093a1a7f9a3422c399943782aadf4df6b11833cf2253db0db56ff2d9dedb098"
 VECTOR_DIGEST = "38b17f4c76c1d2f85cb35c713652a3d77627d02ba47933d2c8f31a88e0c594a7"
 SCENARIO_ID = "salt-ste-sgd-256-v1"
-RELEASE = "1.1.0-rc.1"
+RELEASE = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))[
+    "workspace"
+]["package"]["version"]
 MAX_ARTIFACT_BYTES = 8 * 1024 * 1024
 HEX64 = re.compile(r"[0-9a-f]{64}")
 METADATA_FIELDS = {
