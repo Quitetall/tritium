@@ -3,8 +3,8 @@
 `tritium-quantize` implements **SALT** — *Sensitivity-Allocated Layered Ternary*
 quantization. SALT spends extra capacity **only where the model is sensitive**,
 along a single accuracy↔size knob, while keeping inference multiply-free. It is
-designed in ADR 0001 (see the [research repository](https://github.com/Quitetall/tritium-research)) and scheduled by the
-v0.40 quantization ADR (see the [research repository](https://github.com/Quitetall/tritium-research)).
+designed in ADR 0001 and scheduled by the v0.40 quantization ADR; see the
+[research-record access policy](./research-records.md).
 
 ## Why not flat ternary
 
@@ -25,8 +25,8 @@ channel or per 128-element block, so compute stays regular):
 > storage form exists in `tritium-format`, but the quantizer currently writes
 > dense planes), and **6** (STE heal — the offline quantize path has no
 > `tritium-train` dependency, so no automatic heal runs there) are scheduled but
-> not yet wired into the offline pipeline. See
-> ADR 0006 (see the [research repository](https://github.com/Quitetall/tritium-research)).
+> not yet wired into the offline pipeline. See ADR 0006 and the
+> [research-record access policy](./research-records.md).
 
 1. **Residual ternary expansion.** Approximate the group as a sum of ternary
    planes, each fitting the previous residual:
@@ -420,6 +420,6 @@ SALT is an **engineering** synthesis of established techniques — residual tern
 expansion (ABC-Net, AQLM), non-uniform mode scales (Deep Compression,
 SqueezeLLM), sensitivity allocation (HAWQ, SqueezeLLM), and sparse residual
 planes (SpQR) — chosen so every plane is still ternary and runs on the existing
-add/sub/skip kernel. There is no new hardware path. See
-ADR 0001 (see the [research repository](https://github.com/Quitetall/tritium-research)) for the full derivation and the
-prior-art references.
+add/sub/skip kernel. There is no new hardware path. See ADR 0001 and the
+[research-record access policy](./research-records.md) for how to request the
+full derivation and prior-art references.

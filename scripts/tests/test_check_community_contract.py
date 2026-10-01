@@ -13,6 +13,7 @@ check = MODULE["check"]
 CommunityContractError = MODULE["CommunityContractError"]
 check_local_link = MODULE["_check_local_link"]
 github_anchors = MODULE["_github_anchors"]
+check_public_docs = MODULE["_check_public_docs"]
 
 
 class CommunityContractTests(unittest.TestCase):
@@ -39,6 +40,31 @@ class CommunityContractTests(unittest.TestCase):
                 check_local_link(
                     repo, source, "guide.md", "guide.md#missing-anchor"
                 )
+
+    def test_public_docs_reject_private_research_repository_links(self):
+        with tempfile.TemporaryDirectory() as raw:
+            repo = Path(raw)
+            book = repo / "docs" / "book" / "src"
+            book.mkdir(parents=True)
+            (repo / "README.md").write_text("public\n", encoding="utf-8")
+            (repo / "CONTRIBUTING.md").write_text("public\n", encoding="utf-8")
+            (book / "SUMMARY.md").write_text("# Summary\n", encoding="utf-8")
+            (book / "research-records.md").write_text(
+                "https://github.com/Quitetall/tritium/issues\n", encoding="utf-8"
+            )
+            chapter = book / "chapter.md"
+            chapter.write_text("public\n", encoding="utf-8")
+            self.assertEqual(check_public_docs(repo), 5)
+
+            chapter.write_text(
+                "https://github.com/Quitetall/tritium-research\n", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(CommunityContractError, "private research"):
+                check_public_docs(repo)
+
+            chapter.write_text("[missing](missing.md)\n", encoding="utf-8")
+            with self.assertRaisesRegex(CommunityContractError, "missing.md"):
+                check_public_docs(repo)
 
     def test_repository_governance_contract_passes(self):
         report = check(ROOT)

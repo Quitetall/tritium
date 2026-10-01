@@ -69,9 +69,10 @@ and tokenizer identity, model card, and required evidence ancestry validate.
 - Receipt-backed release tooling for wheels, crates, npm archives, OCI images,
   SBOMs, provenance, compatibility, model evidence, and local-RC sign-off.
 
-Implementation is not the same as release qualification. See
-the release ADR and execution plan in the
-[research repository](https://github.com/Quitetall/tritium-research) for the gates (see [docs/RESEARCH.md](docs/RESEARCH.md)).
+Implementation is not the same as release qualification. The public gates are
+listed in [the release-candidate guide](docs/release-candidate.md); the
+[research-record policy](docs/RESEARCH.md) explains how internal ADRs and plans
+are promoted into this repository.
 The [backend guide](docs/book/src/backends.md) describes source capabilities;
 an implementation without a generated compatibility cell and admitted receipt
 remains unqualified.

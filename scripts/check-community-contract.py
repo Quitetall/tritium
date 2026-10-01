@@ -36,7 +36,7 @@ GOVERNANCE_FILES = (
 
 REQUIRED_REPOSITORY_ROUTES = {
     "CONTRIBUTING.md": (
-        "https://github.com/Quitetall/tritium-research",
+        "https://github.com/Quitetall/tritium/issues",
     ),
     ".github/ISSUE_TEMPLATE/config.yml": (
         "https://github.com/Quitetall/tritium/security/policy",
@@ -69,6 +69,7 @@ REFERENCE_LINK_RE = re.compile(
     re.MULTILINE,
 )
 MAX_FILE_BYTES = 2 * 1024 * 1024
+PRIVATE_RESEARCH_URL = "https://github.com/Quitetall/tritium-research"
 
 
 class CommunityContractError(ValueError):
@@ -219,11 +220,40 @@ def _check_routes(relative: str, text: str) -> int:
     return len(REQUIRED_REPOSITORY_ROUTES.get(relative, ()))
 
 
+def _check_public_docs(repo: Path) -> int:
+    """Reject links to the private research archive from user-facing Markdown."""
+    paths = [repo / "README.md", repo / "CONTRIBUTING.md"]
+    book = repo / "docs" / "book" / "src"
+    paths.extend(sorted(book.rglob("*.md")))
+    for path in paths:
+        if path.is_symlink() or not path.is_file():
+            raise CommunityContractError(
+                f"public documentation file is missing or unsafe: {path.relative_to(repo)}"
+            )
+        relative = path.relative_to(repo).as_posix()
+        text = _text(path, relative)
+        if PRIVATE_RESEARCH_URL in text:
+            raise CommunityContractError(
+                f"public documentation links to private research archive: {relative}"
+            )
+        for target in _targets(text):
+            _check_local_link(repo, path, relative, target)
+    access_page = book / "research-records.md"
+    if "https://github.com/Quitetall/tritium/issues" not in _text(
+        access_page, "docs/book/src/research-records.md"
+    ):
+        raise CommunityContractError(
+            "research-records.md must link to the public issue tracker"
+        )
+    return len(paths)
+
+
 def check(repo: Path) -> dict[str, int | str]:
     """Validate governance files and return deterministic summary counters."""
     repo = repo.resolve(strict=True)
     local_links = 0
     repository_routes = 0
+    public_docs_checked = _check_public_docs(repo)
     for relative in GOVERNANCE_FILES:
         path = _ordinary(repo, relative)
         text = _text(path, relative)
@@ -254,6 +284,7 @@ def check(repo: Path) -> dict[str, int | str]:
         "governance_files": len(GOVERNANCE_FILES),
         "local_links": local_links,
         "repository_routes": repository_routes,
+        "public_docs_checked": public_docs_checked,
         "unstaffed_channels": 0,
     }
 
