@@ -2,7 +2,10 @@
 
 use core::fmt;
 
-use tritium_format::{RuntimeBlockOutputsAccumulator, RuntimeFinalLogitsAccumulator};
+use tritium_format::{
+    RuntimeBlockOutputsAccumulator, RuntimeFinalLogitsAccumulator, RuntimeOutputScope,
+    RuntimeOutputScopeAccumulator, RuntimeOutputScopeEvidence,
+};
 use tritium_spec::{DeviceCaps, TernaryBackend};
 
 use super::Qwen35SaltV2LanguageMtpModel;
@@ -22,6 +25,7 @@ const MAX_EXECUTION_BATCHES: u64 = 1 << 20;
 const MAX_IDENTITY_BYTES: usize = 4096;
 const MAX_CAPABILITY_FEATURES: usize = 4096;
 const MAX_TRANSCRIPT_BYTES: usize = 64 * 1024;
+const MAX_OUTPUT_SCOPES: usize = 4096;
 
 /// One runtime-produced output batch borrowed only for observer duration.
 #[derive(Clone, Copy, Debug)]
@@ -125,6 +129,51 @@ pub struct Qwen35UntrustedRuntimeTranscript {
     block_observation_count: u64,
     block_element_count: u64,
     logit_count: u64,
+}
+
+/// One-pass candidate-shaped outputs freshly observed from a caller-backend Qwen model.
+///
+/// This is untrusted runtime evidence, not a campaign admission receipt. A sealed
+/// campaign must compare every scope commitment and bind the token digest to its
+/// frozen specification before admitting it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Qwen35UntrustedOutputScopeTranscript {
+    token_stream_digest: [u8; 32],
+    batch_count: u64,
+    token_count: u64,
+    scope_evidence: Vec<RuntimeOutputScopeEvidence>,
+}
+
+impl Qwen35UntrustedOutputScopeTranscript {
+    /// This transcript carries no independently authenticated backend authority.
+    #[must_use]
+    pub const fn backend_claims_are_untrusted(&self) -> bool {
+        true
+    }
+
+    /// Exact ordered token batches executed from fresh model caches.
+    #[must_use]
+    pub const fn token_stream_digest(&self) -> &[u8; 32] {
+        &self.token_stream_digest
+    }
+
+    /// Number of fresh-cache batches executed.
+    #[must_use]
+    pub const fn batch_count(&self) -> u64 {
+        self.batch_count
+    }
+
+    /// Total input tokens executed.
+    #[must_use]
+    pub const fn token_count(&self) -> u64 {
+        self.token_count
+    }
+
+    /// Runtime-computed output commitments in the supplied scope order.
+    #[must_use]
+    pub fn scope_evidence(&self) -> &[RuntimeOutputScopeEvidence] {
+        &self.scope_evidence
+    }
 }
 
 impl Qwen35UntrustedRuntimeTranscript {
@@ -379,6 +428,237 @@ impl<E: std::error::Error + 'static> std::error::Error for Qwen35ExecutionVisitE
 }
 
 impl Qwen35SaltV2LanguageMtpModel {
+    /// Execute fresh-cache batches once and seal the exact block/window and final-logit scopes.
+    ///
+    /// Block scopes commit the post-block residual output at `end - 1`; their
+    /// declared start/end range is part of the digest identity. The caller supplies
+    /// the same per-token row-selection masks used during fitting. Final logits
+    /// cover the last input position of each batch, which must be selected by that
+    /// batch's mask. No activation history is retained.
+    ///
+    /// The returned transcript is not campaign-admitted: package, source, masks,
+    /// and candidate lineage still require comparison by the sealed campaign.
+    ///
+    /// # Errors
+    /// Rejects malformed scope sets, identities, masks, execution failures, or a
+    /// backend identity change during evaluation.
+    pub fn try_visit_untrusted_output_scopes<'batch, I>(
+        &self,
+        spec_id: &[u8; 32],
+        candidate_id: &[u8; 32],
+        initialization_seed: u64,
+        scopes: &[RuntimeOutputScope],
+        batches: I,
+    ) -> Result<
+        Qwen35UntrustedOutputScopeTranscript,
+        Qwen35ExecutionVisitError<core::convert::Infallible>,
+    >
+    where
+        I: IntoIterator<Item = (&'batch [u32], &'batch [bool])>,
+    {
+        if scopes.is_empty() || scopes.len() > MAX_OUTPUT_SCOPES {
+            return Err(Qwen35ExecutionVisitError::Runtime(NnError::Provenance(
+                "Qwen output scope count is invalid".to_owned(),
+            )));
+        }
+        let layer_count =
+            usize::try_from(self.runner().config().num_hidden_layers).map_err(|_| {
+                Qwen35ExecutionVisitError::Runtime(NnError::Provenance(
+                    "Qwen configured layer count exceeds usize".to_owned(),
+                ))
+            })?;
+        let mut accumulators = Vec::new();
+        let mut scope_ends = Vec::new();
+        accumulators.try_reserve_exact(scopes.len()).map_err(|_| {
+            Qwen35ExecutionVisitError::Runtime(NnError::ResourceExhausted(
+                "allocate Qwen output scope accumulators".to_owned(),
+            ))
+        })?;
+        scope_ends.try_reserve_exact(scopes.len()).map_err(|_| {
+            Qwen35ExecutionVisitError::Runtime(NnError::ResourceExhausted(
+                "allocate Qwen output scope schedule".to_owned(),
+            ))
+        })?;
+        let mut previous_end = 0_u32;
+        let mut final_logits_seen = false;
+        for (index, scope) in scopes.iter().copied().enumerate() {
+            let end = match scope {
+                RuntimeOutputScope::Block { start, end }
+                    if !final_logits_seen
+                        && start < end
+                        && usize::try_from(end).is_ok_and(|end| end <= layer_count)
+                        && end >= previous_end =>
+                {
+                    previous_end = end;
+                    Some(end)
+                }
+                RuntimeOutputScope::Block { .. } => {
+                    return Err(Qwen35ExecutionVisitError::Runtime(NnError::Provenance(
+                        "Qwen output block scopes are invalid or out of order".to_owned(),
+                    )));
+                }
+                RuntimeOutputScope::FinalLogits
+                    if !final_logits_seen && index + 1 == scopes.len() =>
+                {
+                    final_logits_seen = true;
+                    None
+                }
+                RuntimeOutputScope::FinalLogits => {
+                    return Err(Qwen35ExecutionVisitError::Runtime(NnError::Provenance(
+                        "Qwen final-logit scope must occur exactly once at the end".to_owned(),
+                    )));
+                }
+            };
+            let accumulator = RuntimeOutputScopeAccumulator::new(
+                spec_id,
+                candidate_id,
+                initialization_seed,
+                scope,
+            )
+            .map_err(|error| {
+                Qwen35ExecutionVisitError::Runtime(NnError::Provenance(format!(
+                    "Qwen output scope identity is invalid: {error}"
+                )))
+            })?;
+            accumulators.push(accumulator);
+            scope_ends.push(end);
+        }
+        if !final_logits_seen {
+            return Err(Qwen35ExecutionVisitError::Runtime(NnError::Provenance(
+                "Qwen output scope set is missing final logits".to_owned(),
+            )));
+        }
+
+        let backend_before = BackendIdentity::capture(self.runner().execution_backend())
+            .map_err(Qwen35ExecutionVisitError::Runtime)?;
+        let mut token_hasher = blake3::Hasher::new_derive_key(TOKEN_STREAM_CONTEXT);
+        let mut batch_count = 0_u64;
+        let mut token_count = 0_u64;
+        for (tokens, row_mask) in batches {
+            if tokens.is_empty() || row_mask.len() != tokens.len() {
+                return Err(Qwen35ExecutionVisitError::Runtime(NnError::Shape {
+                    expected: tokens.len(),
+                    got: row_mask.len(),
+                }));
+            }
+            if !row_mask[tokens.len() - 1] {
+                return Err(Qwen35ExecutionVisitError::Runtime(NnError::Provenance(
+                    "Qwen final-logit row is not selected by the output mask".to_owned(),
+                )));
+            }
+            if batch_count == MAX_EXECUTION_BATCHES {
+                return Err(Qwen35ExecutionVisitError::Runtime(
+                    NnError::ResourceExhausted(
+                        "Qwen execution batch count exceeds bound".to_owned(),
+                    ),
+                ));
+            }
+            let batch_index = u32::try_from(batch_count).map_err(|_| {
+                Qwen35ExecutionVisitError::Runtime(NnError::ResourceExhausted(
+                    "Qwen scope batch index exceeds u32".to_owned(),
+                ))
+            })?;
+            let token_len = u64::try_from(tokens.len()).map_err(|_| {
+                Qwen35ExecutionVisitError::Runtime(NnError::ResourceExhausted(
+                    "Qwen execution token count exceeds u64".to_owned(),
+                ))
+            })?;
+            let mut cache = self
+                .runner()
+                .new_cache(tokens.len())
+                .map_err(Qwen35ExecutionVisitError::Runtime)?;
+            let output = self
+                .runner()
+                .forward_with_block_observer(
+                    tokens,
+                    &mut cache,
+                    |block_index, _token_start, block_tokens, hidden_states| {
+                        let scope_end = block_index.checked_add(1).ok_or_else(|| {
+                            NnError::ResourceExhausted("Qwen block index overflow".to_owned())
+                        })?;
+                        for (accumulator, end) in accumulators.iter_mut().zip(&scope_ends) {
+                            if *end == Some(scope_end) {
+                                accumulator
+                                    .observe(
+                                        batch_index,
+                                        block_tokens.len(),
+                                        self.runner().hidden_size(),
+                                        row_mask,
+                                        hidden_states,
+                                    )
+                                    .map_err(|error| {
+                                        NnError::Provenance(format!(
+                                            "Qwen runtime block scope evidence failed: {error}"
+                                        ))
+                                    })?;
+                            }
+                        }
+                        Ok::<_, NnError>(())
+                    },
+                )
+                .map_err(|error| match error {
+                    super::qwen35::Qwen35TextForwardError::Runtime(error)
+                    | super::qwen35::Qwen35TextForwardError::Observer(error) => {
+                        Qwen35ExecutionVisitError::Runtime(error)
+                    }
+                })?;
+            let logits = output.last_logits();
+            let last = accumulators.last_mut().ok_or_else(|| {
+                Qwen35ExecutionVisitError::Runtime(NnError::Provenance(
+                    "Qwen final-logit accumulator is missing".to_owned(),
+                ))
+            })?;
+            last.observe(batch_index, 1, logits.len(), &[true], logits)
+                .map_err(|error| {
+                    Qwen35ExecutionVisitError::Runtime(NnError::Provenance(format!(
+                        "Qwen runtime final-logit scope evidence failed: {error}"
+                    )))
+                })?;
+            hash_batch_tokens(&mut token_hasher, batch_count, tokens);
+            batch_count = batch_count.checked_add(1).ok_or_else(|| {
+                Qwen35ExecutionVisitError::Runtime(NnError::ResourceExhausted(
+                    "Qwen execution batch count overflow".to_owned(),
+                ))
+            })?;
+            token_count = token_count.checked_add(token_len).ok_or_else(|| {
+                Qwen35ExecutionVisitError::Runtime(NnError::ResourceExhausted(
+                    "Qwen execution token count overflow".to_owned(),
+                ))
+            })?;
+        }
+        if batch_count == 0 {
+            return Err(Qwen35ExecutionVisitError::Runtime(NnError::Shape {
+                expected: 1,
+                got: 0,
+            }));
+        }
+        token_hasher.update(&batch_count.to_le_bytes());
+        token_hasher.update(&token_count.to_le_bytes());
+        let scope_evidence = accumulators
+            .into_iter()
+            .map(|accumulator| {
+                accumulator.finish().map_err(|error| {
+                    Qwen35ExecutionVisitError::Runtime(NnError::Provenance(format!(
+                        "Qwen output scope was not fully observed: {error}"
+                    )))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let backend_after = BackendIdentity::capture(self.runner().execution_backend())
+            .map_err(Qwen35ExecutionVisitError::Runtime)?;
+        if backend_after != backend_before {
+            return Err(Qwen35ExecutionVisitError::Runtime(NnError::Provenance(
+                "Qwen execution backend identity changed during evaluation".to_owned(),
+            )));
+        }
+        Ok(Qwen35UntrustedOutputScopeTranscript {
+            token_stream_digest: *token_hasher.finalize().as_bytes(),
+            batch_count,
+            token_count,
+            scope_evidence,
+        })
+    }
+
     /// Execute exact token batches and stream every post-block residual matrix.
     ///
     /// This is a separate observation contract from

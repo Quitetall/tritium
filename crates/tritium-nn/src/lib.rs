@@ -56,9 +56,9 @@ pub use model::{
     Qwen35MtpWeights, Qwen35SaltV2BundleAdmission, Qwen35SaltV2LanguageMtpModel,
     Qwen35SaltV2LoadReceipt, Qwen35TensorSchemaEntry, Qwen35TensorSchemaRole,
     Qwen35TensorStreamError, Qwen35TextCache, Qwen35TextLayerWeights, Qwen35TextMixerWeights,
-    Qwen35TextOutput, Qwen35TextRunner, Qwen35TextWeights, Qwen35UntrustedRuntimeTranscript,
-    Qwen35VerifiedHfLanguageMtpModel, Tokenizer, UnverifiedQwen35Mtp,
-    qwen35_language_mtp_tensor_schema, qwen36_27b_canonical_source_config,
+    Qwen35TextOutput, Qwen35TextRunner, Qwen35TextWeights, Qwen35UntrustedOutputScopeTranscript,
+    Qwen35UntrustedRuntimeTranscript, Qwen35VerifiedHfLanguageMtpModel, Tokenizer,
+    UnverifiedQwen35Mtp, qwen35_language_mtp_tensor_schema, qwen36_27b_canonical_source_config,
 };
 #[cfg(feature = "tokenizer")]
 pub use model::{GgufBpeTokenizer, HfJsonTokenizer};

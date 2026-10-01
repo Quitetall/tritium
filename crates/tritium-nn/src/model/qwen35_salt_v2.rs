@@ -1620,6 +1620,129 @@ mod tests {
         assert_ne!(block_execution.block_output_digest(), &[0; 32]);
         assert_eq!(block_execution.logit_count(), 0);
 
+        let scope_identity = ([31; 32], [32; 32], 41);
+        let scopes = [
+            tritium_format::RuntimeOutputScope::Block { start: 0, end: 1 },
+            tritium_format::RuntimeOutputScope::Block { start: 0, end: 2 },
+            tritium_format::RuntimeOutputScope::FinalLogits,
+        ];
+        let scoped_batches = [
+            (&[1_u32, 2][..], &[false, true][..]),
+            (&[3_u32][..], &[true][..]),
+        ];
+        let scoped = model
+            .try_visit_untrusted_output_scopes(
+                &scope_identity.0,
+                &scope_identity.1,
+                scope_identity.2,
+                &scopes,
+                scoped_batches,
+            )
+            .unwrap();
+        assert_eq!(scoped.batch_count(), 2);
+        assert_eq!(scoped.token_count(), 3);
+        assert!(scoped.backend_claims_are_untrusted());
+        assert_eq!(
+            scoped.token_stream_digest(),
+            block_execution.token_stream_digest()
+        );
+        let changed_mask = model
+            .try_visit_untrusted_output_scopes(
+                &scope_identity.0,
+                &scope_identity.1,
+                scope_identity.2,
+                &scopes,
+                [
+                    (&[1_u32, 2][..], &[true, true][..]),
+                    (&[3_u32][..], &[true][..]),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            changed_mask.token_stream_digest(),
+            scoped.token_stream_digest()
+        );
+        assert_ne!(changed_mask.scope_evidence(), scoped.scope_evidence());
+        assert!(matches!(
+            model.try_visit_untrusted_output_scopes(
+                &scope_identity.0,
+                &scope_identity.1,
+                scope_identity.2,
+                &[tritium_format::RuntimeOutputScope::FinalLogits],
+                [(&[1_u32][..], &[false][..])],
+            ),
+            Err(crate::Qwen35ExecutionVisitError::Runtime(_))
+        ));
+        assert!(matches!(
+            model.try_visit_untrusted_output_scopes(
+                &scope_identity.0,
+                &scope_identity.1,
+                scope_identity.2,
+                &[
+                    tritium_format::RuntimeOutputScope::Block { start: 0, end: 3 },
+                    tritium_format::RuntimeOutputScope::FinalLogits,
+                ],
+                scoped_batches,
+            ),
+            Err(crate::Qwen35ExecutionVisitError::Runtime(_))
+        ));
+        let expected = scopes
+            .iter()
+            .map(|scope| {
+                let mut accumulator = tritium_format::RuntimeOutputScopeAccumulator::new(
+                    &scope_identity.0,
+                    &scope_identity.1,
+                    scope_identity.2,
+                    *scope,
+                )
+                .unwrap();
+                match scope {
+                    tritium_format::RuntimeOutputScope::Block { .. } => {
+                        accumulator
+                            .observe(
+                                0,
+                                2,
+                                model.runner().hidden_size(),
+                                &[false, true],
+                                &vec![0.0; 2 * model.runner().hidden_size()],
+                            )
+                            .unwrap();
+                        accumulator
+                            .observe(
+                                1,
+                                1,
+                                model.runner().hidden_size(),
+                                &[true],
+                                &vec![0.0; model.runner().hidden_size()],
+                            )
+                            .unwrap();
+                    }
+                    tritium_format::RuntimeOutputScope::FinalLogits => {
+                        accumulator
+                            .observe(
+                                0,
+                                1,
+                                model.runner().vocab_size(),
+                                &[true],
+                                &vec![0.0; model.runner().vocab_size()],
+                            )
+                            .unwrap();
+                        accumulator
+                            .observe(
+                                1,
+                                1,
+                                model.runner().vocab_size(),
+                                &[true],
+                                &vec![0.0; model.runner().vocab_size()],
+                            )
+                            .unwrap();
+                    }
+                }
+                accumulator.finish().unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(scoped.scope_evidence(), expected);
+
         let block_canonical = block_execution.canonical_bytes().unwrap();
         let block_reopened = model
             .reexecute_untrusted_block_outputs(batches, &block_canonical, |_| {
