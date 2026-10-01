@@ -167,11 +167,19 @@ byte-for-byte from `/mnt/4tb/tmp` to
 `/mnt/2tb/tritium-release-evidence/qwen-source-admission/sha256-0a45d3b593893aaf660d34ecd31cc66bf28ae4fd19d411ffa0671d2747ca2fd4/source-proof.tq36`.
 Its SHA-256 is
 `09b59e8e41d7e0f947e31d2fc8f4fb635804f162f0c7558a2df6ff6d98b834e0`, matching
-the receipt. This is a retention copy, not a replacement receipt or a new
-source-admission pass. The immutable receipt still records its original
-absolute `proof_path` under `/mnt/4tb/tmp`; preserve that original path until a
-portable receipt/consumer path is implemented and newly issued evidence is
-validated. The durable copy alone does not make `/mnt/4tb/tmp` safe to prune.
+the receipt. `scripts/rebind-qwen36-source-evidence.py` then produced a new
+durable receipt pair under
+`/mnt/2tb/tritium-release-evidence/qwen-source-admission/rebound-2026-10-01/`.
+The admission receipt changes only the proof path; the official-identity
+receipt changes only its admission parent and derived receipt ID. The
+`rebind.json` records both parent IDs, both new IDs, and the exact changed
+fields. The reissued pair passes the source-admission and official-identity
+receipt validators. This is a host-local relocation that reuses the existing
+official inventory and Hub-response digest; it is not a fresh Hub/checkpoint
+verification or a new release-registry admission. The current tracked registry
+still references the original receipt pair, so `/mnt/4tb/tmp` must not be
+pruned until a new validated registry is published against the current
+candidate and the Rust source-proof consumer passes with the reissued pair.
 
 ### Latest local verification (2026-09-18, `570a8802`)
 
