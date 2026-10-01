@@ -21,6 +21,7 @@ mod frontier_v3;
 mod pipeline;
 mod qwen36_preflight;
 mod qwen36_source_admission;
+mod qwen36_source_identity;
 mod qwen36_tensor_work;
 mod stage7_evidence;
 mod tensor_work_store;
@@ -56,6 +57,7 @@ pub use qwen36_source_admission::{
     Qwen36AdmissionError, Qwen36AdmissionReceipt, Qwen36AdmittedSource, Qwen36LanguageCoverage,
     Qwen36SourceProof, Qwen36SourceProofError,
 };
+pub use qwen36_source_identity::{Qwen36SourceIdentityAuthorization, Qwen36SourceIdentityError};
 // Admission/execution symbols are unix-only (see qwen36_tensor_work).
 pub use qwen36_tensor_work::{
     Qwen36AdditiveCampaignSpec, Qwen36AdditiveCampaignStore, Qwen36AdditiveInstallError,

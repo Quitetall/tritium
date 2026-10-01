@@ -281,9 +281,20 @@ python scripts/admit-qwen36-source.py \
 
 Source admission performs no calibration, fitting, packaging, or quality
 claim. `identity_status` remains candidate-only until official payload
-authentication is independently registered. Advanced users with a fully
-collected canonical `S2KF` evidence directory can then resume the rate-free
-master stage directly from Python:
+authentication is independently registered. For the release path, verify the
+official snapshot against the pinned Hub inventory and persist its separate
+identity receipt:
+
+```sh
+python scripts/verify-qwen36-official-source-identity.py \
+  --model-dir /models/Qwen3.6-27B \
+  --source-admission-receipt ./tritium-work/source-admission.json \
+  --output ./tritium-work/official-source-identity.json
+```
+
+Advanced users with both receipts and a fully collected canonical `S2KF`
+evidence directory can then resume the rate-free master stage directly from
+Python:
 
 ```python
 from tritium.salt import reconcile_qwen36_ptq_masters
@@ -293,6 +304,8 @@ receipt = reconcile_qwen36_ptq_masters(
     revision="6a9e13bd6fc8f0983b9b99948120bc37f49c13e9",
     work_dir="./tritium-work",
     evidence_dir="./curvature-evidence",
+    source_admission_receipt="./tritium-work/source-admission.json",
+    official_identity_receipt="./tritium-work/official-source-identity.json",
 )
 print(receipt.campaign_id, receipt.additive_tensors)
 ```

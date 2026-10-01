@@ -156,9 +156,15 @@ the full candidate registry before retaining the new registry. Its fixture
 tests pass. An attempt to extend the retained `3662cc3f` registry rolled back
 its outputs because the old crate-archive receipt's lock digest no longer
 matches the current Cargo.lock. A current same-revision candidate and refreshed
-package evidence are needed for actual registry publication. The campaign
-execution path still does not consume official-identity authorization. No
-fitting or campaign restart was performed.
+package evidence are needed for actual registry publication. The Python Qwen
+reconciliation wrapper and both public Rust PTQ reconciliation entrypoints now
+require a validated source-identity authorization. The shared Rust driver binds
+that authorization to the retained preflight before it opens or resumes the
+campaign workspace. Candidate-only source admission remains available for
+research, but cannot invoke the canonical Qwen PTQ reconciler without the
+official-identity receipt pair. This closes the execution-path gap; it does not
+register the source gate or refresh stale package evidence. No fitting or
+campaign restart was performed.
 
 ### Durable source-proof copy (2026-10-01)
 
