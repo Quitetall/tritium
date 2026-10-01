@@ -2,7 +2,7 @@
 
 use core::fmt;
 
-use tritium_format::RuntimeFinalLogitsAccumulator;
+use tritium_format::{RuntimeBlockOutputsAccumulator, RuntimeFinalLogitsAccumulator};
 use tritium_spec::{DeviceCaps, TernaryBackend};
 
 use super::Qwen35SaltV2LanguageMtpModel;
@@ -29,6 +29,55 @@ pub struct Qwen35ExecutionOutputBatch<'a> {
     batch_index: u64,
     tokens: &'a [u32],
     logits: &'a [f32],
+}
+
+/// One post-block residual matrix borrowed only for the block observer call.
+#[derive(Clone, Copy, Debug)]
+pub struct Qwen35ExecutionBlockOutputBatch<'a> {
+    batch_index: u64,
+    block_index: u32,
+    token_start: u64,
+    tokens: &'a [u32],
+    hidden_size: usize,
+    hidden_states: &'a [f32],
+}
+
+impl<'a> Qwen35ExecutionBlockOutputBatch<'a> {
+    /// Zero-based execution batch.
+    #[must_use]
+    pub const fn batch_index(self) -> u64 {
+        self.batch_index
+    }
+
+    /// Zero-based transformer block index.
+    #[must_use]
+    pub const fn block_index(self) -> u32 {
+        self.block_index
+    }
+
+    /// First absolute token position represented by this output matrix.
+    #[must_use]
+    pub const fn token_start(self) -> u64 {
+        self.token_start
+    }
+
+    /// Exact input token sequence that produced these rows.
+    #[must_use]
+    pub const fn tokens(self) -> &'a [u32] {
+        self.tokens
+    }
+
+    /// Hidden width of each row.
+    #[must_use]
+    pub const fn hidden_size(self) -> usize {
+        self.hidden_size
+    }
+
+    /// Post-attention and post-MLP residual rows, `[tokens, hidden_size]`.
+    #[must_use]
+    pub const fn hidden_states(self) -> &'a [f32] {
+        self.hidden_states
+    }
 }
 
 impl<'a> Qwen35ExecutionOutputBatch<'a> {
@@ -151,6 +200,12 @@ impl Qwen35UntrustedRuntimeTranscript {
         &self.final_logits_digest
     }
 
+    /// Runtime-produced ordered block-output stream identity.
+    #[must_use]
+    pub const fn block_output_digest(&self) -> &[u8; 32] {
+        &self.block_output_digest
+    }
+
     /// Whether every declared batch includes final logits.
     #[must_use]
     pub const fn has_final_logits(&self) -> bool {
@@ -179,6 +234,18 @@ impl Qwen35UntrustedRuntimeTranscript {
     #[must_use]
     pub const fn logit_count(&self) -> u64 {
         self.logit_count
+    }
+
+    /// Number of post-block output matrices observed by the block-output visitor.
+    #[must_use]
+    pub const fn block_observation_count(&self) -> u64 {
+        self.block_observation_count
+    }
+
+    /// Total values across all observed post-block output matrices.
+    #[must_use]
+    pub const fn block_element_count(&self) -> u64 {
+        self.block_element_count
     }
 
     /// Encode canonical non-admissible `TSQ35EX` version-1 evidence.
@@ -312,6 +379,189 @@ impl<E: std::error::Error + 'static> std::error::Error for Qwen35ExecutionVisitE
 }
 
 impl Qwen35SaltV2LanguageMtpModel {
+    /// Execute exact token batches and stream every post-block residual matrix.
+    ///
+    /// This is a separate observation contract from
+    /// [`Self::try_visit_untrusted_final_logits`]. It emits borrowed matrices in
+    /// batch/layer order and retains no activation history. The transcript binds
+    /// only the block-output stream; it does not claim final-logit coverage or
+    /// campaign admission. A built-in sealed-backend execution is still required
+    /// before this evidence can support qualification.
+    ///
+    /// # Errors
+    /// Returns [`Qwen35ExecutionVisitError::Runtime`] for invalid input, execution,
+    /// identity, count, or transcript failures, and `Observer` if the caller
+    /// rejects one block output.
+    pub fn try_visit_untrusted_block_outputs<'batch, I, E>(
+        &self,
+        batches: I,
+        mut observer: impl FnMut(Qwen35ExecutionBlockOutputBatch<'_>) -> Result<(), E>,
+    ) -> Result<Qwen35UntrustedRuntimeTranscript, Qwen35ExecutionVisitError<E>>
+    where
+        I: IntoIterator<Item = &'batch [u32]>,
+    {
+        let backend_before = BackendIdentity::capture(self.runner().execution_backend())
+            .map_err(Qwen35ExecutionVisitError::Runtime)?;
+        let mut token_hasher = blake3::Hasher::new_derive_key(TOKEN_STREAM_CONTEXT);
+        let mut block_outputs = RuntimeBlockOutputsAccumulator::new();
+        let mut batch_count = 0_u64;
+        let mut token_count = 0_u64;
+
+        for tokens in batches {
+            if tokens.is_empty() {
+                return Err(Qwen35ExecutionVisitError::Runtime(NnError::Shape {
+                    expected: 1,
+                    got: tokens.len(),
+                }));
+            }
+            if batch_count == MAX_EXECUTION_BATCHES {
+                return Err(Qwen35ExecutionVisitError::Runtime(
+                    NnError::ResourceExhausted(
+                        "Qwen execution batch count exceeds bound".to_owned(),
+                    ),
+                ));
+            }
+            let token_len = u64::try_from(tokens.len()).map_err(|_| {
+                Qwen35ExecutionVisitError::Runtime(NnError::ResourceExhausted(
+                    "Qwen execution token count exceeds u64".to_owned(),
+                ))
+            })?;
+            let mut cache = self
+                .runner()
+                .new_cache(tokens.len())
+                .map_err(Qwen35ExecutionVisitError::Runtime)?;
+            let output = self
+                .runner()
+                .forward_with_block_observer(
+                    tokens,
+                    &mut cache,
+                    |block_index, token_start, block_tokens, hidden_states| {
+                        let token_start = u64::try_from(token_start).map_err(|_| {
+                            NnError::ResourceExhausted(
+                                "Qwen block token start exceeds u64".to_owned(),
+                            )
+                        })?;
+                        block_outputs
+                            .observe(
+                                batch_count,
+                                block_index,
+                                token_start,
+                                block_tokens.len(),
+                                self.runner().hidden_size(),
+                                hidden_states,
+                            )
+                            .map_err(|error| {
+                                NnError::Provenance(format!(
+                                    "Qwen runtime block-output evidence failed: {error}"
+                                ))
+                            })?;
+                        observer(Qwen35ExecutionBlockOutputBatch {
+                            batch_index: batch_count,
+                            block_index,
+                            token_start,
+                            tokens: block_tokens,
+                            hidden_size: self.runner().hidden_size(),
+                            hidden_states,
+                        })
+                        .map_err(BlockObserverFailure::Observer)
+                    },
+                )
+                .map_err(|error| match error {
+                    super::qwen35::Qwen35TextForwardError::Runtime(error) => {
+                        Qwen35ExecutionVisitError::Runtime(error)
+                    }
+                    super::qwen35::Qwen35TextForwardError::Observer(
+                        BlockObserverFailure::Runtime(error),
+                    ) => Qwen35ExecutionVisitError::Runtime(error),
+                    super::qwen35::Qwen35TextForwardError::Observer(
+                        BlockObserverFailure::Observer(error),
+                    ) => Qwen35ExecutionVisitError::Observer(error),
+                })?;
+            let _ = output;
+            hash_batch_tokens(&mut token_hasher, batch_count, tokens);
+            batch_count = batch_count.checked_add(1).ok_or_else(|| {
+                Qwen35ExecutionVisitError::Runtime(NnError::ResourceExhausted(
+                    "Qwen execution batch count overflow".to_owned(),
+                ))
+            })?;
+            token_count = token_count.checked_add(token_len).ok_or_else(|| {
+                Qwen35ExecutionVisitError::Runtime(NnError::ResourceExhausted(
+                    "Qwen execution token count overflow".to_owned(),
+                ))
+            })?;
+        }
+        if batch_count == 0 {
+            return Err(Qwen35ExecutionVisitError::Runtime(NnError::Shape {
+                expected: 1,
+                got: 0,
+            }));
+        }
+        token_hasher.update(&batch_count.to_le_bytes());
+        token_hasher.update(&token_count.to_le_bytes());
+        let block_outputs = block_outputs.finish().map_err(|error| {
+            Qwen35ExecutionVisitError::Runtime(NnError::Provenance(format!(
+                "Qwen runtime block-output evidence failed: {error}"
+            )))
+        })?;
+        let backend_after = BackendIdentity::capture(self.runner().execution_backend())
+            .map_err(Qwen35ExecutionVisitError::Runtime)?;
+        if backend_after != backend_before {
+            return Err(Qwen35ExecutionVisitError::Runtime(NnError::Provenance(
+                "Qwen execution backend identity changed during evaluation".to_owned(),
+            )));
+        }
+        let load = self.receipt();
+        let mut transcript = Qwen35UntrustedRuntimeTranscript {
+            transcript_id: [0; 32],
+            manifest_package_id: try_owned(load.manifest_package_id())
+                .map_err(Qwen35ExecutionVisitError::Runtime)?,
+            profile: try_owned(load.profile()).map_err(Qwen35ExecutionVisitError::Runtime)?,
+            package_id: try_owned(load.package_id()).map_err(Qwen35ExecutionVisitError::Runtime)?,
+            preserved_package_id: try_owned(load.preserved_package_id())
+                .map_err(Qwen35ExecutionVisitError::Runtime)?,
+            config_package_id: try_owned(load.config_package_id())
+                .map_err(Qwen35ExecutionVisitError::Runtime)?,
+            backend_id: backend_before.backend_id,
+            physical_device_id: backend_before.physical_device_id,
+            backend_caps_digest: backend_before.capabilities_digest,
+            token_stream_digest: *token_hasher.finalize().as_bytes(),
+            block_output_digest: *block_outputs.digest(),
+            final_logits_digest: [0; 32],
+            scope_coverage: BLOCK_OUTPUT_COVERAGE,
+            batch_count,
+            token_count,
+            block_observation_count: block_outputs.observation_count(),
+            block_element_count: block_outputs.element_count(),
+            logit_count: 0,
+        };
+        transcript.transcript_id = transcript
+            .derive_id()
+            .map_err(Qwen35ExecutionVisitError::Runtime)?;
+        Ok(transcript)
+    }
+
+    /// Re-execute tokens and require identical non-admissible block-output transcript bytes.
+    pub fn reexecute_untrusted_block_outputs<'batch, I, E>(
+        &self,
+        batches: I,
+        expected_canonical: &[u8],
+        observer: impl FnMut(Qwen35ExecutionBlockOutputBatch<'_>) -> Result<(), E>,
+    ) -> Result<Qwen35UntrustedRuntimeTranscript, Qwen35ExecutionVisitError<E>>
+    where
+        I: IntoIterator<Item = &'batch [u32]>,
+    {
+        let transcript = self.try_visit_untrusted_block_outputs(batches, observer)?;
+        let actual = transcript
+            .canonical_bytes()
+            .map_err(Qwen35ExecutionVisitError::Runtime)?;
+        if actual != expected_canonical {
+            return Err(Qwen35ExecutionVisitError::Runtime(NnError::Provenance(
+                "Qwen block-output transcript differs from fresh runtime output".to_owned(),
+            )));
+        }
+        Ok(transcript)
+    }
+
     /// Execute exact token batches and stream logits from a caller-supplied backend.
     ///
     /// Caller supplies tokens and an observer, never logits. A non-admissible
@@ -499,6 +749,17 @@ struct BackendIdentity {
     backend_id: String,
     physical_device_id: String,
     capabilities_digest: [u8; 32],
+}
+
+enum BlockObserverFailure<E> {
+    Runtime(NnError),
+    Observer(E),
+}
+
+impl<E> From<NnError> for BlockObserverFailure<E> {
+    fn from(error: NnError) -> Self {
+        Self::Runtime(error)
+    }
 }
 
 impl BackendIdentity {

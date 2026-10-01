@@ -1591,6 +1591,47 @@ mod tests {
         assert!(execution.has_final_logits());
         assert!(!execution.has_block_outputs());
 
+        let mut observed_blocks = Vec::new();
+        let block_execution = model
+            .try_visit_untrusted_block_outputs(batches, |block| {
+                assert_eq!(block.batch_index(), (observed_blocks.len() / 2) as u64);
+                assert_eq!(block.block_index(), (observed_blocks.len() % 2) as u32);
+                assert_eq!(block.token_start(), 0);
+                assert_eq!(block.hidden_size(), model.runner().hidden_size());
+                assert_eq!(
+                    block.hidden_states().len(),
+                    block.tokens().len() * block.hidden_size()
+                );
+                assert!(block.hidden_states().iter().all(|value| *value == 0.0));
+                observed_blocks.push((block.batch_index(), block.block_index()));
+                Ok::<_, core::convert::Infallible>(())
+            })
+            .unwrap();
+        assert_eq!(observed_blocks, [(0, 0), (0, 1), (1, 0), (1, 1)]);
+        assert_eq!(block_execution.batch_count(), 2);
+        assert_eq!(block_execution.token_count(), 3);
+        assert_eq!(block_execution.block_observation_count(), 4);
+        assert_eq!(
+            block_execution.block_element_count(),
+            6 * model.runner().hidden_size() as u64
+        );
+        assert!(block_execution.has_block_outputs());
+        assert!(!block_execution.has_final_logits());
+        assert_ne!(block_execution.block_output_digest(), &[0; 32]);
+        assert_eq!(block_execution.logit_count(), 0);
+
+        let block_canonical = block_execution.canonical_bytes().unwrap();
+        let block_reopened = model
+            .reexecute_untrusted_block_outputs(batches, &block_canonical, |_| {
+                Ok::<_, core::convert::Infallible>(())
+            })
+            .unwrap();
+        assert_eq!(block_reopened, block_execution);
+        assert!(matches!(
+            model.try_visit_untrusted_block_outputs([&[1_u32][..]], |_| Err("stop")),
+            Err(crate::Qwen35ExecutionVisitError::Observer("stop"))
+        ));
+
         let canonical = execution.canonical_bytes().unwrap();
         let reopened = model
             .reexecute_untrusted_final_logits(batches, &canonical, |_| {
