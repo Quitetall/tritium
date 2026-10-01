@@ -1,8 +1,10 @@
 import hashlib
+import json
 import runpy
 from pathlib import Path
 import subprocess
 import tempfile
+import tomllib
 import unittest
 
 
@@ -18,7 +20,7 @@ source_admission = MODULE["source_admission"]
 def metadata():
     result = {
         "backend_id": "cpu.reference.v1",
-        "backend_build": "tritium-train@1.1.0-rc.1+source-git:" + "a" * 40,
+        "backend_build": f"tritium-train@{MODULE['RELEASE']}+source-git:" + "a" * 40,
         "physical_device": "cpu:linux:x86_64:test",
         "manifest_digest": MODULE["MANIFEST_DIGEST"],
     }
@@ -41,6 +43,16 @@ def metadata():
 
 
 class NativeBrowserReferenceTests(unittest.TestCase):
+    def test_release_identity_tracks_canonical_workspace_version(self):
+        root = Path(__file__).resolve().parents[2]
+        cargo = tomllib.loads((root / "Cargo.toml").read_text(encoding="utf-8"))
+        package = json.loads(
+            (root / "packages/tritium-web/package.json").read_text(encoding="utf-8")
+        )
+        release = cargo["workspace"]["package"]["version"]
+        self.assertEqual(MODULE["RELEASE"], release)
+        self.assertEqual(package["version"], release)
+
     def test_source_admission_rejects_nonignored_untracked_files(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
