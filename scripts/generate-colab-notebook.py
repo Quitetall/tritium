@@ -4,12 +4,29 @@
 from __future__ import annotations
 
 import argparse
+import re
 from pathlib import Path
 
 import nbformat
 
 
 OUTPUT = Path("examples/colab/tritium-smollm2-v11.ipynb")
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def pypi_candidate() -> str:
+    """Return the current workspace release version in PEP 440 form."""
+
+    manifest = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
+    matches = re.findall(
+        r'^version = "(\d+\.\d+\.\d+(?:-rc\.(?:0|[1-9]\d*))?)"',
+        manifest,
+        flags=re.MULTILINE,
+    )
+    if len(matches) != 1:
+        raise ValueError("Cargo.toml must declare exactly one canonical workspace version")
+    version = matches[0]
+    return re.sub(r"-rc\.(\d+)$", r"rc\1", version)
 
 
 def notebook():
@@ -39,7 +56,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-candidate = os.environ.get("TRITIUM_WHEEL", "pytritium==1.1.0rc1")
+candidate = os.environ.get("TRITIUM_WHEEL", "pytritium==@PYPI_CANDIDATE@")
 candidate_path = Path(candidate)
 if candidate_path.is_dir():
     wheels = sorted(candidate_path.glob("*.whl"))
@@ -56,7 +73,7 @@ subprocess.check_call([
     "onnx==1.22.0", "onnxruntime==1.27.0", "onnxscript==0.7.1",
 ])
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
-""",
+""".replace("@PYPI_CANDIDATE@", pypi_candidate()),
             id="install",
         ),
         nbformat.v4.new_markdown_cell(
