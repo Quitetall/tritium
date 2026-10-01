@@ -206,6 +206,31 @@ source-admission receipt's `official_payload_authenticated=false`, register the
 pair to a current release candidate, or produce tensor masters. The 506-master
 campaign remains stalled and was not restarted.
 
+### Legacy Qwen calibration evidence audit (2026-10-01)
+
+The 506-file S2KF directory
+`/mnt/4tb/tmp/qwen36-evidence-a417374-1seq-clean-20260821` passes the
+installed native structural inspector: it contains the complete ordinal range,
+one input-Hessian curvature kind, the pinned source-model ID, and common
+activation-cache/token-stream identities. Its token-stream digest is
+`d30fbc02209285448253dde628fe4c5285700cf86d66296c500eb6b1c38dcd2b`.
+
+That digest exactly matches the first 2,048-token member of token pack
+`sha256:e17652c928e5d378f19c3d3344c167844101df9ab2ff4362a05f117ff5889f38`.
+The pack's calibration partition contains 512 members (1,048,576 tokens), with
+the frozen C4/OpenWebMath/StarCoderData 50/25/25 composition. ADR 0043 requires
+that coverage for scored rungs 2–4. This is therefore a provenance mismatch
+that blocks treating the legacy evidence as campaign-grade; it is not proof
+that the capture consumed only one sequence, because the capture API accepts
+the token-stream digest from its caller and the old capture invocation ledger
+has not been found. Do not start fitting from this evidence. Recover a
+source-bound capture transcript or recapture from the admitted frozen pack,
+recording the exact partition/window receipt, before resuming tensor masters.
+
+The evidence remains preserved in `/mnt/4tb/tmp`; no file was moved or removed.
+The source-model ID match and structural inspection do not establish calibration
+coverage, accuracy, or a completed master campaign.
+
 ### Hosted package evidence from PR #51 (2026-10-01)
 
 PR #51 (`bbbafd99cada6dab821cea63e5cdf971f1ce79fb`) has successful hosted
