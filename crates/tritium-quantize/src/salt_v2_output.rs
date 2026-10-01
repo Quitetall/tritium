@@ -3,13 +3,15 @@
 use core::fmt;
 use std::collections::BTreeSet;
 
-use tritium_format::{ModelId, RuntimeEvidenceError, RuntimeFinalLogitsAccumulator};
+use tritium_format::{
+    ModelId, RuntimeEvidenceError, RuntimeFinalLogitsAccumulator,
+    RuntimeOutputReconstructionAccumulator, RuntimeOutputScope,
+};
 
 mod codec;
 
 const SPEC_HASH_CONTEXT: &str = "tritium salt v2 output reconstruction spec v1";
 const TEACHER_HASH_CONTEXT: &str = "tritium salt v2 output reconstruction teacher v1";
-const STUDENT_HASH_CONTEXT: &str = "tritium salt v2 output reconstruction student v1";
 const CANDIDATE_HASH_CONTEXT: &str = "tritium salt v2 output reconstruction candidate v1";
 const RECEIPT_HASH_CONTEXT: &str = "tritium salt v2 output reconstruction receipt v1";
 const MAX_OUTPUT_RECONSTRUCTION_SCOPES: usize = 1 << 20;
@@ -279,7 +281,7 @@ pub struct OutputReconstructionAccumulator {
     teacher_kl_sum: f64,
     final_tokens: u64,
     teacher_hasher: blake3::Hasher,
-    student_hasher: blake3::Hasher,
+    student_outputs: RuntimeOutputReconstructionAccumulator,
     runtime_final_logits: RuntimeFinalLogitsAccumulator,
 }
 
@@ -297,11 +299,13 @@ impl OutputReconstructionAccumulator {
             return Err(OutputReconstructionError::MissingCandidateIdentity);
         }
         let mut teacher_hasher = blake3::Hasher::new_derive_key(TEACHER_HASH_CONTEXT);
-        let mut student_hasher = blake3::Hasher::new_derive_key(STUDENT_HASH_CONTEXT);
         teacher_hasher.update(spec.spec_id());
-        student_hasher.update(spec.spec_id());
-        student_hasher.update(&candidate_id);
-        student_hasher.update(&initialization_seed.to_le_bytes());
+        let student_outputs = RuntimeOutputReconstructionAccumulator::new(
+            spec.spec_id(),
+            &candidate_id,
+            initialization_seed,
+        )
+        .map_err(map_runtime_evidence_error)?;
         Ok(Self {
             spec: spec.clone(),
             candidate_id,
@@ -315,7 +319,7 @@ impl OutputReconstructionAccumulator {
             teacher_kl_sum: 0.0,
             final_tokens: 0,
             teacher_hasher,
-            student_hasher,
+            student_outputs,
             runtime_final_logits: RuntimeFinalLogitsAccumulator::new(),
         })
     }
@@ -386,15 +390,21 @@ impl OutputReconstructionAccumulator {
             mask,
             teacher,
         );
-        hash_observation(
-            &mut self.student_hasher,
-            scope,
-            batch_index,
-            rows,
-            columns,
-            mask,
-            student,
-        );
+        self.student_outputs
+            .observe(
+                match scope {
+                    OutputReconstructionScope::Block { start, end } => {
+                        RuntimeOutputScope::Block { start, end }
+                    }
+                    OutputReconstructionScope::FinalLogits => RuntimeOutputScope::FinalLogits,
+                },
+                batch_index,
+                rows,
+                columns,
+                mask,
+                student,
+            )
+            .map_err(map_runtime_evidence_error)?;
         match scope {
             OutputReconstructionScope::Block { .. } => {
                 for (row, selected) in mask.iter().copied().enumerate() {
@@ -478,7 +488,11 @@ impl OutputReconstructionAccumulator {
             return Err(OutputReconstructionError::NonFiniteObjective);
         }
         let teacher_evidence_digest = *self.teacher_hasher.finalize().as_bytes();
-        let student_output_digest = *self.student_hasher.finalize().as_bytes();
+        let student_outputs = self
+            .student_outputs
+            .finish()
+            .map_err(map_runtime_evidence_error)?;
+        let student_output_digest = *student_outputs.digest();
         let runtime_final_logits = self
             .runtime_final_logits
             .finish()
@@ -532,6 +546,12 @@ impl OutputCandidateReceipt {
     #[must_use]
     pub const fn candidate_id(&self) -> &[u8; 32] {
         &self.candidate_id
+    }
+
+    /// Seed that binds this restart's student-output stream identity.
+    #[must_use]
+    pub const fn initialization_seed(&self) -> u64 {
+        self.initialization_seed
     }
 
     /// Exact teacher stream identity shared by every valid restart.
@@ -926,6 +946,10 @@ const fn map_runtime_evidence_error(error: RuntimeEvidenceError) -> OutputRecons
         RuntimeEvidenceError::CountOverflow => OutputReconstructionError::CountOverflow,
         RuntimeEvidenceError::EmptyStream => OutputReconstructionError::IncompleteCandidate,
         RuntimeEvidenceError::InvalidGeometry => OutputReconstructionError::InvalidGeometry,
+        RuntimeEvidenceError::MissingIdentity => {
+            OutputReconstructionError::MissingCandidateIdentity
+        }
+        RuntimeEvidenceError::EmptySelection => OutputReconstructionError::EmptyTokenSelection,
     }
 }
 

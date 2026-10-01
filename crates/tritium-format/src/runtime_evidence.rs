@@ -4,6 +4,8 @@ use core::fmt;
 
 const FINAL_LOGITS_CONTEXT: &str = "tritium qwen3.5 runtime final logits v1";
 const BLOCK_OUTPUTS_CONTEXT: &str = "tritium qwen3.5 runtime block outputs v1";
+const OUTPUT_RECONSTRUCTION_STUDENT_CONTEXT: &str =
+    "tritium salt v2 output reconstruction student v1";
 const MAX_FINAL_LOGIT_BATCHES: u64 = 1 << 20;
 const MAX_BLOCK_OUTPUT_OBSERVATIONS: u64 = 1 << 24;
 
@@ -20,6 +22,10 @@ pub enum RuntimeEvidenceError {
     EmptyStream,
     /// Block output rows, columns, or value count are inconsistent.
     InvalidGeometry,
+    /// A required content identity was zero.
+    MissingIdentity,
+    /// A row-selection mask selected no values.
+    EmptySelection,
 }
 
 impl fmt::Display for RuntimeEvidenceError {
@@ -32,6 +38,8 @@ impl fmt::Display for RuntimeEvidenceError {
             Self::InvalidGeometry => {
                 formatter.write_str("runtime block-output geometry is invalid")
             }
+            Self::MissingIdentity => formatter.write_str("runtime evidence identity is missing"),
+            Self::EmptySelection => formatter.write_str("runtime evidence selected no rows"),
         }
     }
 }
@@ -262,6 +270,166 @@ impl Default for RuntimeBlockOutputsAccumulator {
     }
 }
 
+/// Scope tag used by the candidate student-output stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeOutputScope {
+    /// Inclusive/exclusive block range, including windows spanning multiple blocks.
+    Block {
+        /// First block included in the observed window.
+        start: u32,
+        /// First block not included in the observed window.
+        end: u32,
+    },
+    /// Final language-model logits.
+    FinalLogits,
+}
+
+/// Exact digest and counts for one candidate-shaped student-output stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RuntimeOutputReconstructionEvidence {
+    digest: [u8; 32],
+    observation_count: u64,
+    value_count: u64,
+}
+
+impl RuntimeOutputReconstructionEvidence {
+    /// Digest byte-compatible with the `TSV2OUT` v2 student stream.
+    #[must_use]
+    pub const fn digest(&self) -> &[u8; 32] {
+        &self.digest
+    }
+
+    /// Number of ordered scope/batch observations.
+    #[must_use]
+    pub const fn observation_count(self) -> u64 {
+        self.observation_count
+    }
+
+    /// Number of f32 values included in the stream.
+    #[must_use]
+    pub const fn value_count(self) -> u64 {
+        self.value_count
+    }
+}
+
+/// Streaming producer for the canonical output-reconstruction student digest.
+#[derive(Clone, Debug)]
+pub struct RuntimeOutputReconstructionAccumulator {
+    hasher: blake3::Hasher,
+    observation_count: u64,
+    value_count: u64,
+}
+
+impl RuntimeOutputReconstructionAccumulator {
+    /// Start a stream bound to one reconstruction spec, candidate, and seed.
+    ///
+    /// # Errors
+    /// Rejects zero spec or candidate identities.
+    pub fn new(
+        spec_id: &[u8; 32],
+        candidate_id: &[u8; 32],
+        initialization_seed: u64,
+    ) -> Result<Self, RuntimeEvidenceError> {
+        if spec_id == &[0; 32] || candidate_id == &[0; 32] {
+            return Err(RuntimeEvidenceError::MissingIdentity);
+        }
+        let mut hasher = blake3::Hasher::new_derive_key(OUTPUT_RECONSTRUCTION_STUDENT_CONTEXT);
+        hasher.update(spec_id);
+        hasher.update(candidate_id);
+        hasher.update(&initialization_seed.to_le_bytes());
+        Ok(Self {
+            hasher,
+            observation_count: 0,
+            value_count: 0,
+        })
+    }
+
+    /// Observe one finite row-major output matrix in canonical scope/batch order.
+    ///
+    /// # Errors
+    /// Rejects malformed geometry, an empty selection, non-finite values, or
+    /// counter overflow. The hash layout exactly preserves the frozen v2 stream.
+    pub fn observe(
+        &mut self,
+        scope: RuntimeOutputScope,
+        batch_index: u32,
+        rows: usize,
+        columns: usize,
+        mask: &[bool],
+        values: &[f32],
+    ) -> Result<(), RuntimeEvidenceError> {
+        let expected_values = rows
+            .checked_mul(columns)
+            .ok_or(RuntimeEvidenceError::InvalidGeometry)?;
+        if rows == 0 || columns == 0 || mask.len() != rows || values.len() != expected_values {
+            return Err(RuntimeEvidenceError::InvalidGeometry);
+        }
+        if mask.iter().all(|selected| !selected) {
+            return Err(RuntimeEvidenceError::EmptySelection);
+        }
+        if values.iter().any(|value| !value.is_finite()) {
+            return Err(RuntimeEvidenceError::NonFiniteOutput);
+        }
+        let row_count = u64::try_from(rows).map_err(|_| RuntimeEvidenceError::CountOverflow)?;
+        let column_count =
+            u64::try_from(columns).map_err(|_| RuntimeEvidenceError::CountOverflow)?;
+        let value_count =
+            u64::try_from(values.len()).map_err(|_| RuntimeEvidenceError::CountOverflow)?;
+        let next_observations = self
+            .observation_count
+            .checked_add(1)
+            .ok_or(RuntimeEvidenceError::CountOverflow)?;
+        let next_values = self
+            .value_count
+            .checked_add(value_count)
+            .ok_or(RuntimeEvidenceError::CountOverflow)?;
+
+        match scope {
+            RuntimeOutputScope::Block { start, end } if start < end => {
+                self.hasher.update(&[1]);
+                self.hasher.update(&start.to_le_bytes());
+                self.hasher.update(&end.to_le_bytes());
+            }
+            RuntimeOutputScope::Block { .. } => {
+                return Err(RuntimeEvidenceError::InvalidGeometry);
+            }
+            RuntimeOutputScope::FinalLogits if columns >= 2 => {
+                self.hasher.update(&[2]);
+            }
+            RuntimeOutputScope::FinalLogits => {
+                return Err(RuntimeEvidenceError::InvalidGeometry);
+            }
+        }
+        self.hasher.update(&batch_index.to_le_bytes());
+        self.hasher.update(&row_count.to_le_bytes());
+        self.hasher.update(&column_count.to_le_bytes());
+        for selected in mask {
+            self.hasher.update(&[u8::from(*selected)]);
+        }
+        for value in values {
+            self.hasher.update(&value.to_bits().to_le_bytes());
+        }
+        self.observation_count = next_observations;
+        self.value_count = next_values;
+        Ok(())
+    }
+
+    /// Seal a non-empty output stream.
+    ///
+    /// # Errors
+    /// Rejects a stream with no observations.
+    pub fn finish(self) -> Result<RuntimeOutputReconstructionEvidence, RuntimeEvidenceError> {
+        if self.observation_count == 0 || self.value_count == 0 {
+            return Err(RuntimeEvidenceError::EmptyStream);
+        }
+        Ok(RuntimeOutputReconstructionEvidence {
+            digest: *self.hasher.finalize().as_bytes(),
+            observation_count: self.observation_count,
+            value_count: self.value_count,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,5 +498,74 @@ mod tests {
             Err(RuntimeEvidenceError::NonFiniteOutput)
         );
         assert_eq!(accumulator.finish(), Err(RuntimeEvidenceError::EmptyStream));
+    }
+
+    #[test]
+    fn candidate_output_stream_binds_spec_candidate_seed_scopes_masks_and_values() {
+        fn stream(mask: &[bool], value: f32) -> [u8; 32] {
+            let mut accumulator =
+                RuntimeOutputReconstructionAccumulator::new(&[1; 32], &[2; 32], 3).unwrap();
+            accumulator
+                .observe(
+                    RuntimeOutputScope::Block { start: 4, end: 7 },
+                    0,
+                    2,
+                    2,
+                    mask,
+                    &[value, 2.0, 3.0, 4.0],
+                )
+                .unwrap();
+            *accumulator.finish().unwrap().digest()
+        }
+
+        let expected = stream(&[true, false], 1.0);
+        assert_ne!(expected, stream(&[false, true], 1.0));
+        assert_ne!(expected, stream(&[true, false], 9.0));
+
+        let mut other_seed =
+            RuntimeOutputReconstructionAccumulator::new(&[1; 32], &[2; 32], 4).unwrap();
+        other_seed
+            .observe(
+                RuntimeOutputScope::Block { start: 4, end: 7 },
+                0,
+                2,
+                2,
+                &[true, false],
+                &[1.0, 2.0, 3.0, 4.0],
+            )
+            .unwrap();
+        assert_ne!(expected, *other_seed.finish().unwrap().digest());
+    }
+
+    #[test]
+    fn candidate_output_stream_fails_closed_on_invalid_scope_or_empty_selection() {
+        assert_eq!(
+            RuntimeOutputReconstructionAccumulator::new(&[0; 32], &[2; 32], 0).err(),
+            Some(RuntimeEvidenceError::MissingIdentity)
+        );
+        let mut accumulator =
+            RuntimeOutputReconstructionAccumulator::new(&[1; 32], &[2; 32], 3).unwrap();
+        assert_eq!(
+            accumulator.observe(
+                RuntimeOutputScope::Block { start: 2, end: 2 },
+                0,
+                1,
+                2,
+                &[true],
+                &[1.0, 2.0],
+            ),
+            Err(RuntimeEvidenceError::InvalidGeometry)
+        );
+        assert_eq!(
+            accumulator.observe(
+                RuntimeOutputScope::FinalLogits,
+                0,
+                1,
+                2,
+                &[false],
+                &[1.0, 2.0],
+            ),
+            Err(RuntimeEvidenceError::EmptySelection)
+        );
     }
 }
