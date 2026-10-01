@@ -360,12 +360,23 @@ def _write_new(path: Path, value: dict[str, Any]) -> None:
     except OSError as error:
         raise OfficialIdentityError("output receipt must be a new ordinary file") from error
     try:
-        with os.fdopen(descriptor, "wb", closefd=False) as stream:
+        with os.fdopen(descriptor, "wb") as stream:
+            descriptor = -1
             stream.write(json.dumps(value, indent=2, sort_keys=True).encode("utf-8") + b"\n")
             stream.flush()
             os.fsync(stream.fileno())
-    finally:
-        os.close(descriptor)
+        if os.name == "posix":
+            directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            directory = os.open(path.parent, directory_flags)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+    except OSError as error:
+        if descriptor >= 0:
+            os.close(descriptor)
+        path.unlink(missing_ok=True)
+        raise OfficialIdentityError("cannot durably publish official identity receipt") from error
 
 
 def main() -> int:

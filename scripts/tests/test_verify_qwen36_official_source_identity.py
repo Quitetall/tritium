@@ -154,3 +154,14 @@ def test_identity_receipt_validator_rejects_a_forged_file_digest(
 
     with pytest.raises(MODULE.OfficialIdentityError, match="official Hub inventory"):
         MODULE.validate_identity_receipt(path)
+
+
+def test_receipt_writer_is_no_replace_and_durable(tmp_path: Path):
+    path = tmp_path / "receipt.json"
+    value = {"result": "pass", "receipt_id": "sha256:" + "1" * 64}
+    MODULE._write_new(path, value)
+    assert json.loads(path.read_text()) == value
+
+    with pytest.raises(MODULE.OfficialIdentityError, match="new ordinary file"):
+        MODULE._write_new(path, {"result": "forged"})
+    assert json.loads(path.read_text()) == value
