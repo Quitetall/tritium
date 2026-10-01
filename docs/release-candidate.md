@@ -115,6 +115,29 @@ probe still reports `stalled`, zero of 506 published master receipts, no seal,
 and the same dead 447,083,070-byte staged record. Source admission is not
 fitting completion or a deployable model.
 
+### Separate official source identity verification (2026-09-30)
+
+The new `verify-qwen36-official-source-identity.py` path separately fetches
+the pinned Hugging Face revision metadata, verifies every local file against
+the official file inventory (LFS SHA-256 for 16 files and Git blob SHA-1 for
+13 ordinary Git files), and requires the measured source-admission IDs to
+match the frozen Qwen3.6 identity. It verified 29 files totaling
+55,586,107,940 bytes, with official manifest digest
+`7911b682b615162590074c15baa429ff23c64b7c1d66bd2e134ef6fa3a2a3a3f`.
+
+Its generated receipt is
+`release/v1.1/evidence/qwen36-official-source-identity-2026-09-30/receipt.json`
+(receipt ID
+`sha256:154f7807dc5aa829dd061020c4cf8e10db1aefafd2f6f95d6ab8301d5c01dbc9`),
+bound to the measured source-admission receipt
+`sha256:0a45d3b593893aaf660d34ecd31cc66bf28ae4fd19d411ffa0671d2747ca2fd4`.
+This receipt does not mutate or replace source-admission evidence, and it is
+not yet a registered release gate. It establishes exact official snapshot
+bytes bound to the already measured semantic ID; integrating that registration
+into campaign authorization and the release registry remains open. The prior
+incomplete bundle variants remain inadmissible, and the 506-tensor campaign
+has not been restarted.
+
 ### Latest local verification (2026-09-18, `570a8802`)
 
 `scripts/verify-gates.sh release` completed with exit status 0 after the
