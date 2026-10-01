@@ -189,6 +189,29 @@ registry still references the original receipt pair, so `/mnt/4tb/tmp` must
 not be pruned until a new validated registry is published against the current
 candidate.
 
+### Hosted package evidence from PR #51 (2026-10-01)
+
+PR #51 (`bbbafd99cada6dab821cea63e5cdf971f1ce79fb`) has successful hosted
+package workflows. Its artifacts are retained under
+`/mnt/2tb/tritium-release-evidence/ci-bbbafd99/`. The workflows ran against
+the PR synthetic merge revision
+`fb670342ee85e340397c68705127b0268648261b`, not the branch head. The
+`crate-archive`, `npm-archive`, `compatibility-matrix`, and `clean-install`
+receipts each pass their owning validator at that exact revision. The
+compatibility receipt covers 16 CPython/platform cells; the clean-install
+receipt validates an installed Linux CPU wheel with PyTorch QAT forward and
+backward, optimizer update and resume, Hugging Face safetensors save/reload,
+and tied-weight identity checks.
+
+This harvest does **not** close the `packages` release gate: these receipts
+are not registered against a candidate manifest, and their synthetic merge
+revision differs from the checked-out branch head. Do not transplant them into
+the older `release/v1.1` candidate or registry. Rebuild/harvest from the final
+release revision and validate all four receipt kinds against one candidate
+before recording a gate pass. Hosted CUDA, Metal, ROCm, wgpu, real-model
+serving, fuzz, and performance-regression lanes were skipped by runner policy;
+those remain unqualified.
+
 ### Latest local verification (2026-09-18, `570a8802`)
 
 `scripts/verify-gates.sh release` completed with exit status 0 after the
