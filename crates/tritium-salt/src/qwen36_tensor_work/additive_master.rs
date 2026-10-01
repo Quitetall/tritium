@@ -3664,7 +3664,11 @@ mod tests {
             [121; 32],
             *receipt.token_stream_digest(),
             [122; 32],
-            OutputReconstructionSchedule::Blocks { block_count: 1 },
+            OutputReconstructionSchedule::SlidingWindows {
+                block_count: 2,
+                window_size: 2,
+                stride: 1,
+            },
             OutputObjectiveWeights::new(1.0, 0.0, 1.0, 1.0).expect("output objective"),
             2,
             1,
