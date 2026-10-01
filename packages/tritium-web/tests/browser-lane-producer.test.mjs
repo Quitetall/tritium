@@ -13,6 +13,7 @@ import {
   BrowserLaneProducerError,
   WebDriverClassicClient,
   assembleBrowserLaneV1,
+  browserQualificationCapabilitiesV1,
   qualifyBrowserLaneV1,
   validateNpmReceiptV1,
   validateNativeReferenceV1,
@@ -491,6 +492,7 @@ test("classic WebDriver client uses W3C session and async-script routes", async 
     const result = await client.executeAsync(session.id, "return 1", [[1, 2, 3]]);
     await client.deleteSession(session.id);
     assert.deepEqual(result, { ok: true, value: { passed: true } });
+    assert.deepEqual(requests[0].body, browserQualificationCapabilitiesV1("chrome"));
     assert.deepEqual(requests.map(({ method, url }) => [method, url]), [
       ["POST", "/session"],
       ["POST", "/session/session-1/timeouts"],
@@ -501,4 +503,40 @@ test("classic WebDriver client uses W3C session and async-script routes", async 
   } finally {
     await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
   }
+});
+
+test("qualification WebDriver enables physical WebGPU on Linux stable browsers", () => {
+  assert.deepEqual(browserQualificationCapabilitiesV1("chrome", "linux"), {
+    capabilities: {
+      alwaysMatch: {
+        browserName: "chrome",
+        "goog:chromeOptions": {
+          args: [
+            "--enable-features=Vulkan",
+            "--enable-unsafe-webgpu",
+            "--use-angle=vulkan",
+            "--enable-webgpu-developer-features",
+          ],
+        },
+      },
+    },
+  });
+  assert.deepEqual(browserQualificationCapabilitiesV1("firefox", "linux"), {
+    capabilities: {
+      alwaysMatch: {
+        browserName: "firefox",
+        "moz:firefoxOptions": { prefs: { "dom.webgpu.enabled": true } },
+      },
+    },
+  });
+  assert.deepEqual(browserQualificationCapabilitiesV1("safari", "darwin"), {
+    capabilities: { alwaysMatch: { browserName: "safari" } },
+  });
+  assert.deepEqual(browserQualificationCapabilitiesV1("chrome", "win32"), {
+    capabilities: { alwaysMatch: { browserName: "chrome" } },
+  });
+  assert.throws(
+    () => browserQualificationCapabilitiesV1("edge", "linux"),
+    (error) => error instanceof BrowserLaneProducerError && error.code === "webdriver",
+  );
 });

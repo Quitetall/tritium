@@ -326,6 +326,34 @@ function expectedPlatformName(osName, platformName) {
   return os === platform;
 }
 
+/**
+ * Browser launch settings used only by the physical qualification harness.
+ * Linux stable Chrome ships WebGPU behind platform flags; its developer
+ * features flag exposes the physical adapter identity required by this lane.
+ * Firefox stable keeps Linux WebGPU disabled by default, so its fresh
+ * WebDriver profile enables the documented preference for this test run.
+ * These settings never affect the installed Tritium package or user browsers.
+ */
+export function browserQualificationCapabilitiesV1(engine, platform = hostPlatform()) {
+  if (!ENGINES.has(engine)) fail("webdriver", "unsupported WebDriver engine");
+  const alwaysMatch = { browserName: engine === "chrome" ? "chrome" : engine };
+  if (platform === "linux" && engine === "chrome") {
+    alwaysMatch["goog:chromeOptions"] = {
+      args: [
+        "--enable-features=Vulkan",
+        "--enable-unsafe-webgpu",
+        "--use-angle=vulkan",
+        "--enable-webgpu-developer-features",
+      ],
+    };
+  } else if (platform === "linux" && engine === "firefox") {
+    alwaysMatch["moz:firefoxOptions"] = {
+      prefs: { "dom.webgpu.enabled": true },
+    };
+  }
+  return Object.freeze({ capabilities: { alwaysMatch } });
+}
+
 function validateBrowserTrace(traceValue, nativeReference) {
   const trace = object(traceValue, "browser trace");
   if (trace.schemaId !== "tritium.physical_browser_training_lane_trace" ||
@@ -563,7 +591,7 @@ export class WebDriverClassicClient {
   async createSession(engine) {
     if (!ENGINES.has(engine)) fail("webdriver", "unsupported WebDriver engine");
     const value = await this.request("POST", "/session", {
-      capabilities: { alwaysMatch: { browserName: engine === "chrome" ? "chrome" : engine } },
+      ...browserQualificationCapabilitiesV1(engine),
     });
     if (!value || typeof value.sessionId !== "string" || value.sessionId.length === 0 ||
         typeof value.capabilities !== "object" || value.capabilities === null) {

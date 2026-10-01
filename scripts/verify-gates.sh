@@ -33,6 +33,14 @@ cleanup_staged_snapshot() {
     fi
 }
 
+snapshot_git() (
+    # Git exports these while running hooks. Do not redirect commands for the
+    # isolated snapshot into the contributor's worktree or index.
+    unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_PREFIX GIT_COMMON_DIR \
+        GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+    git -C "$staged_snapshot" "$@"
+)
+
 prepare_staged_snapshot() {
     if [ -n "$staged_snapshot" ]; then
         return
@@ -40,7 +48,7 @@ prepare_staged_snapshot() {
     staged_snapshot=$(mktemp -d "${TMPDIR:-/tmp}/tritium-precommit.XXXXXX")
     trap cleanup_staged_snapshot EXIT HUP INT TERM
     git archive --format=tar HEAD | tar -x -C "$staged_snapshot"
-    git diff --cached --binary | git -C "$staged_snapshot" apply --binary -
+    git diff --cached --binary | snapshot_git apply --binary -
 }
 
 verify_fmt() {
@@ -122,10 +130,10 @@ JSON
         # The package's WASM release check requires a clean Git tree. Build an
         # independent temporary repository inside the staged snapshot; never
         # call git worktree while the caller's commit index is locked.
-        git -C "$staged_snapshot" init --quiet
+        snapshot_git init --quiet
         printf '%s\n' 'packages/tritium-web/node_modules' >>"$staged_snapshot/.gitignore"
-        git -C "$staged_snapshot" add -A
-        git -C "$staged_snapshot" \
+        snapshot_git add -A
+        snapshot_git \
             -c user.name=tritium-precommit \
             -c user.email=precommit@invalid \
             commit --quiet --no-verify -m "pre-commit staged snapshot"
@@ -133,8 +141,18 @@ JSON
             ln -s "$repo/packages/tritium-web/node_modules" \
                 "$staged_snapshot/packages/tritium-web/node_modules"
         fi
+        snapshot_target_dir=$(
+            cd "$staged_snapshot"
+            unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_PREFIX GIT_COMMON_DIR \
+                GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+            cargo metadata --no-deps --format-version 1 | \
+                node -p 'JSON.parse(require("node:fs").readFileSync(0, "utf8")).target_directory'
+        )
         (
             cd "$staged_snapshot"
+            unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_PREFIX GIT_COMMON_DIR \
+                GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+            export CARGO_TARGET_DIR="$snapshot_target_dir"
             run npm --prefix packages/tritium-web run check
         )
     fi
