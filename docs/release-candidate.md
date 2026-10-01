@@ -250,13 +250,20 @@ and records tokenizer digest
 Its Stage 7 recipe-freeze receipt cannot qualify Qwen's calibration tokenizer
 or capture.
 
-The Qwen pack's tokenizer digest has not yet been independently recomputed from
-the pinned Qwen tokenizer inventory. Its matching declared vocabulary size and
-content-addressed pack identity do not prove which tokenizer produced its token
-IDs. Before fitting, publish a Qwen-specific calibration provenance receipt
-that binds the official tokenizer identity, pack and selected 512-sequence
-window, dataset revisions/sample identities, and the actual replay digest to
-the ordered S2KF evidence-set digest.
+The tokenizer identity and token pack have now been independently verified by
+`scripts/verify-qwen36-calibration-pack.py` against the official source-identity
+receipt. The content-addressed receipt
+`/mnt/2tb/tritium-release-evidence/qwen-calibration/calibration-pack-e464c020.json`
+binds the official tokenizer identity, complete pack, exact 512-sequence
+calibration partition, dataset revisions and source-member identities. It
+confirms that the pack's tokenizer digest
+`sha256:72943ec7247b68e70aa6e5651a5b0abb870b07a1c1f90bd5da9badece7294407`
+matches the canonical inventory of the four pinned Qwen tokenizer assets, and
+that the calibration partition contains 1,048,576 ordered tokens. This receipt
+is pack-provenance evidence only: it does not prove that the model replay
+consumed those tokens or bind an actual replay digest to an ordered S2KF
+evidence-set digest. Those capture/evidence links remain required before
+fitting; the legacy 506-record set is still not admitted for campaign use.
 
 ### Hosted package evidence from PR #51 (2026-10-01)
 
