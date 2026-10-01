@@ -1,14 +1,41 @@
-use tritium_spec::{TrainBackendV1, TrainingVectorSetV3};
+use tritium_spec::{TrainBackendV1, TrainingVectorSetV2, TrainingVectorSetV3};
 use tritium_testkit::{
     TrainingReceiptBundleError, TrainingReceiptSourcePolicyV1, admit_training_receipts,
     render_development_training_capability_table, render_training_capability_table,
     seal_training_receipts,
 };
-use tritium_train::CpuTrainBackendV1;
+use tritium_train::{CpuTrainBackendV1, CpuTrainBackendV2};
 
 fn vectors() -> TrainingVectorSetV3 {
     TrainingVectorSetV3::parse_json(include_bytes!("../../../spec/training/v3/vectors/v3.json"))
         .expect("canonical vectors")
+}
+
+fn vectors_v2() -> TrainingVectorSetV2 {
+    TrainingVectorSetV2::parse_json(include_bytes!("../../../spec/training/v2/vectors/v2.json"))
+        .expect("canonical V2 vectors")
+}
+
+#[test]
+fn cpu_v2_report_seals_reopens_and_generates_table() {
+    let vectors = vectors_v2();
+    let backend = CpuTrainBackendV2::new();
+    let sealed = seal_training_receipts(&backend, &vectors).expect("seal V2 receipts");
+    let admitted = admit_training_receipts(
+        sealed.bytes(),
+        &vectors,
+        sealed.digest(),
+        TrainingReceiptSourcePolicyV1::Development,
+    )
+    .expect("admit V2 receipts");
+    assert_eq!(admitted.backend_id(), backend.capabilities().backend_id);
+    assert_eq!(admitted.operation_count(), 36);
+    assert_eq!(admitted.case_count(), 117);
+    assert_eq!(admitted.bundle_digest(), sealed.digest());
+
+    let table = render_development_training_capability_table(&[admitted])
+        .expect("render V2 development table");
+    assert!(table.contains("| 36 | 117 |"));
 }
 
 #[test]
