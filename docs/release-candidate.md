@@ -149,10 +149,16 @@ Each registry entry ID must also equal the ID derived from its immutable
 receipt bytes. An admission receipt by itself therefore remains `MISSING`, not
 a source-identity pass.
 
-This implements the registry-side linkage only. Existing candidate registries
-must be regenerated from both receipts before this gate can pass, and the
-campaign execution path still does not consume official-identity
-authorization. No fitting or campaign restart was performed.
+This implements the registry-side linkage only. The no-replace producer is
+`scripts/register-qwen36-source-identity.py`; it copies the verified identity
+receipt into the evidence root, adds the exact admission parent, and validates
+the full candidate registry before retaining the new registry. Its fixture
+tests pass. An attempt to extend the retained `3662cc3f` registry rolled back
+its outputs because the old crate-archive receipt's lock digest no longer
+matches the current Cargo.lock. A current same-revision candidate and refreshed
+package evidence are needed for actual registry publication. The campaign
+execution path still does not consume official-identity authorization. No
+fitting or campaign restart was performed.
 
 ### Latest local verification (2026-09-18, `570a8802`)
 
