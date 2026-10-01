@@ -176,10 +176,12 @@ receipt changes only its admission parent and derived receipt ID. The
 fields. The reissued pair passes the source-admission and official-identity
 receipt validators. This is a host-local relocation that reuses the existing
 official inventory and Hub-response digest; it is not a fresh Hub/checkpoint
-verification or a new release-registry admission. The current tracked registry
-still references the original receipt pair, so `/mnt/4tb/tmp` must not be
-pruned until a new validated registry is published against the current
-candidate and the Rust source-proof consumer passes with the reissued pair.
+verification or a new release-registry admission. A standalone Rust check
+using the in-progress `Qwen36SourceIdentityAuthorization` consumer opened this
+reissued pair and verified the proof bytes and receipt IDs. The current tracked
+registry still references the original receipt pair, so `/mnt/4tb/tmp` must
+not be pruned until a new validated registry is published against the current
+candidate.
 
 ### Latest local verification (2026-09-18, `570a8802`)
 
