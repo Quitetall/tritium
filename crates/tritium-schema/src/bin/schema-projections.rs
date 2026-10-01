@@ -9,9 +9,10 @@ use std::{
 use schemars::JsonSchema;
 use serde_json::{Map, Value};
 use tritium_schema::{
-    AdditiveLayout, AdmittedLaw, Basis, BlobId, EvidenceEnvelope, LayoutError, ModelId, PackageId,
-    PlaneAllocation, PlaneCodec, PlaneRelation, ScaleAnchor, ScaleLaw, ScalePrecision, SchemaId,
-    SemanticTensorDigest, Transport, UnknownReason, Verdict,
+    AdditiveLayout, AdmittedLaw, Basis, BlobId, DenseDType, EvidenceEnvelope, LayoutError, Level,
+    LevelProvenance, ModelId, ModelManifest, PackageId, PlaneAllocation, PlaneCodec, PlaneRelation,
+    ScaleAnchor, ScaleLaw, ScalePrecision, SchemaId, SemanticTensorDigest, TensorMeta, Transport,
+    UnknownReason, Verdict,
 };
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -40,9 +41,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     project!(AdmittedLaw, "admitted-law");
     project!(Basis, "basis");
     project!(BlobId, "blob-id");
+    project!(DenseDType, "dense-dtype");
     project!(EvidenceEnvelope<serde_json::Value>, "evidence-envelope");
     project!(LayoutError, "layout-error");
+    project!(Level, "level");
+    project!(LevelProvenance, "level-provenance");
     project!(ModelId, "model-id");
+    project!(ModelManifest, "model-manifest");
     project!(PackageId, "package-id");
     project!(PlaneAllocation, "plane-allocation");
     project!(PlaneCodec, "plane-codec");
@@ -53,6 +58,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     project!(SchemaId, "schema-id");
     project!(SemanticTensorDigest, "semantic-tensor-digest");
     project!(Transport, "transport");
+    project!(TensorMeta, "tensor-meta");
     project!(UnknownReason, "unknown-reason");
     project!(Verdict, "verdict");
 
@@ -65,8 +71,197 @@ fn main() -> Result<(), Box<dyn Error>> {
         check,
     )?;
     write_text_projection(&workspace.join("schemas/python/v1.pyi"), &python, check)?;
+    let cddl = render_cddl(&schemas)?;
+    write_text_projection(&workspace.join("schemas/cddl/v1.cddl"), &cddl, check)?;
 
     Ok(())
+}
+
+fn render_cddl(schemas: &[ProjectionSchema]) -> Result<String, String> {
+    let roots = schemas
+        .iter()
+        .map(|schema| (schema.name.clone(), root_definition(&schema.schema)))
+        .collect::<BTreeMap<_, _>>();
+    let definitions = collect_definitions(schemas, roots.keys())?;
+    let mut output = String::from(
+        ";; Generated from tritium-schema Rust types via JSON Schema; do not edit.\n\
+         ;; CBOR manifests use RFC 8949 deterministic encoding; digest IDs are 32-byte strings.\n\
+         cbor_value = uint / nint / bstr / tstr / [* cbor_value] / {* tstr => cbor_value} / bool / nil / float\n\n",
+    );
+    for (name, schema) in roots.iter().chain(definitions.iter()) {
+        output.push_str(&cddl_name(name));
+        output.push_str(" = ");
+        if is_digest_id(name) {
+            output.push_str("bstr .size 32");
+        } else {
+            output.push_str(&cddl_type(schema, name)?);
+        }
+        output.push_str("\n\n");
+    }
+    trim_blank_lines_at_eof(&mut output);
+    Ok(output)
+}
+
+fn is_digest_id(name: &str) -> bool {
+    matches!(
+        name,
+        "BlobId" | "ModelId" | "PackageId" | "SemanticTensorDigest"
+    )
+}
+
+fn cddl_name(name: &str) -> String {
+    let mut output = String::new();
+    for (index, character) in name.chars().enumerate() {
+        if character.is_ascii_uppercase() {
+            if index > 0 {
+                output.push('_');
+            }
+            output.push(character.to_ascii_lowercase());
+        } else if character.is_ascii_alphanumeric() || character == '_' {
+            output.push(character);
+        } else {
+            output.push('_');
+        }
+    }
+    output
+}
+
+fn cddl_type(schema: &Value, path: &str) -> Result<String, String> {
+    cddl_type_at(schema, path, 0)
+}
+
+fn cddl_type_at(schema: &Value, path: &str, indent: usize) -> Result<String, String> {
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+        return Ok(cddl_name(&local_reference(reference)?));
+    }
+    if let Some(value) = schema.get("const") {
+        return cddl_literal(value);
+    }
+    if let Some(values) = schema.get("enum").and_then(Value::as_array) {
+        return values
+            .iter()
+            .map(cddl_literal)
+            .collect::<Result<Vec<_>, _>>()
+            .map(|values| values.join(" / "));
+    }
+    for keyword in ["oneOf", "anyOf"] {
+        if let Some(variants) = schema.get(keyword).and_then(Value::as_array) {
+            return variants
+                .iter()
+                .enumerate()
+                .map(|(index, variant)| {
+                    cddl_type_at(variant, &format!("{path}Variant{index}"), indent)
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map(|variants| variants.join(" / "));
+        }
+    }
+    if let Some(properties) = object_properties(schema) {
+        let required = required_properties(schema);
+        if properties.is_empty() {
+            if let Some(value) = schema.get("additionalProperties")
+                && value != &Value::Bool(false)
+            {
+                return Ok(format!(
+                    "{{ * tstr => {} }}",
+                    cddl_type_at(value, path, indent + 1)?
+                ));
+            }
+            return Ok("{}".into());
+        }
+        let fields = properties
+            .iter()
+            .map(|(name, value)| {
+                let optional = if required.contains(name) { "" } else { "? " };
+                Ok(format!(
+                    "{}{optional}{}: {}",
+                    "  ".repeat(indent + 1),
+                    cddl_literal(&Value::String(name.clone()))?,
+                    cddl_type_at(value, &format!("{path}.{name}"), indent + 1)?
+                ))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        return Ok(format!(
+            "{{\n{}\n{}}}",
+            fields.join(",\n"),
+            "  ".repeat(indent)
+        ));
+    }
+    if let Some(types) = schema.get("type").and_then(Value::as_array) {
+        return types
+            .iter()
+            .map(|kind| {
+                let kind = kind
+                    .as_str()
+                    .ok_or_else(|| format!("non-string CDDL type at {path}"))?;
+                if kind == "null" {
+                    return Ok("nil".into());
+                }
+                let mut branch = schema.clone();
+                branch["type"] = Value::String(kind.to_owned());
+                cddl_type_at(&branch, path, indent)
+            })
+            .collect::<Result<Vec<_>, String>>()
+            .map(|types| types.join(" / "));
+    }
+    let Some(kind) = schema.get("type").and_then(Value::as_str) else {
+        return Ok("cbor_value".into());
+    };
+    match kind {
+        "string" => Ok("tstr".into()),
+        "object" => {
+            if let Some(value) = schema.get("additionalProperties")
+                && value != &Value::Bool(false)
+            {
+                Ok(format!(
+                    "{{ * tstr => {} }}",
+                    cddl_type_at(value, path, indent + 1)?
+                ))
+            } else {
+                Ok("{}".into())
+            }
+        }
+        "integer" => {
+            let max = match schema.get("format").and_then(Value::as_str) {
+                Some("uint8") => Some(u64::from(u8::MAX)),
+                Some("uint16") => Some(u64::from(u16::MAX)),
+                Some("uint32") => Some(u64::from(u32::MAX)),
+                Some("uint64") => None,
+                _ => return Err(format!("unsupported CDDL integer format at {path}")),
+            };
+            Ok(max.map_or_else(|| "uint".into(), |max| format!("0..{max}")))
+        }
+        "number" => Ok("float".into()),
+        "boolean" => Ok("bool".into()),
+        "array" => {
+            let item = schema
+                .get("items")
+                .ok_or_else(|| format!("array has no items schema at {path}"))?;
+            let size = schema
+                .get("minItems")
+                .and_then(Value::as_u64)
+                .zip(schema.get("maxItems").and_then(Value::as_u64))
+                .filter(|(min, max)| min == max)
+                .map(|(size, _)| format!(" .size {size}"))
+                .unwrap_or_default();
+            Ok(format!(
+                "[* {}]{size}",
+                cddl_type_at(item, path, indent + 1)?
+            ))
+        }
+        other => Err(format!(
+            "unsupported CDDL JSON Schema type {other:?} at {path}"
+        )),
+    }
+}
+
+fn cddl_literal(value: &Value) -> Result<String, String> {
+    match value {
+        Value::String(_) | Value::Number(_) | Value::Bool(_) | Value::Null => {
+            serde_json::to_string(value).map_err(|error| error.to_string())
+        }
+        _ => Err("CDDL only supports scalar constants".into()),
+    }
 }
 
 fn invalid_schema(message: String) -> std::io::Error {

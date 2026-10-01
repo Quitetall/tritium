@@ -1,0 +1,136 @@
+;; Generated from tritium-schema Rust types via JSON Schema; do not edit.
+;; CBOR manifests use RFC 8949 deterministic encoding; digest IDs are 32-byte strings.
+cbor_value = uint / nint / bstr / tstr / [* cbor_value] / {* tstr => cbor_value} / bool / nil / float
+
+additive_layout = {
+  "allocation": plane_allocation,
+  "basis": basis,
+  "codec": plane_codec,
+  "cols": uint,
+  "group": 0..65535,
+  "law": scale_law,
+  "max_planes": 0..255,
+  "rows": uint,
+  "tile": 0..65535,
+  "transport": transport
+}
+
+admitted_law = {
+  "law": scale_law,
+  "max_planes": 0..255
+}
+
+basis = "Identity" / {
+  "Hadamard": {
+    "block": 0..4294967295
+  }
+} / {
+  "SignedRht": {
+    "block": 0..4294967295,
+    "domain": uint,
+    "seed": uint
+  }
+}
+
+blob_id = bstr .size 32
+
+dense_d_type = "F16" / "Bf16" / "F32"
+
+evidence_envelope = {
+  "digest": tstr,
+  ? "parent": tstr / nil,
+  "payload": cbor_value,
+  "run": tstr,
+  "schema": tstr,
+  "seq": uint,
+  "span": tstr,
+  "t": uint,
+  "v": 0..65535
+}
+
+layout_error = "EmptyDimensions" / "UnsupportedGroup" / "UnsupportedTileSize" / "EmptyPlaneStack" / "InvalidScaleRatio" / "UnsupportedLaw" / "PlaneCountExceedsLaw" / "InvalidBasisBlock" / "BasisBlockDoesNotDivideColumns" / "EmptyTransportBlock"
+
+level = {
+  "name": tstr,
+  "provenance": level_provenance,
+  "tensors": { * tstr => blob_id }
+}
+
+level_provenance = {
+  "Direct": {
+    "evidence": tstr
+  }
+} / {
+  "ImportedPrefixOf": {
+    "level": tstr
+  }
+} / "Imported"
+
+model_id = bstr .size 32
+
+model_manifest = {
+  "architecture": tstr,
+  "assets": { * tstr => blob_id },
+  "legacy_ids": { * tstr => tstr },
+  "levels": [* level],
+  "schema": schema_id,
+  "tensors": { * tstr => tensor_meta }
+}
+
+package_id = bstr .size 32
+
+plane_allocation = "Uniform" / "PerTile"
+
+plane_codec = "D2" / "B3" / "S34"
+
+plane_relation = "Free" / {
+  "Tied": {
+    "den": 0..4294967295,
+    "num": 0..4294967295
+  }
+}
+
+scale_anchor = "Group" / "Row" / "Tensor" / "Channel"
+
+scale_law = {
+  "anchor": scale_anchor,
+  "precision": scale_precision,
+  "relation": plane_relation
+}
+
+scale_precision = "F16" / "Bf16" / "F32"
+
+schema_id = {
+  "major": 0..65535,
+  "minor": 0..65535
+}
+
+semantic_tensor_digest = bstr .size 32
+
+tensor_meta = {
+  "Additive": {
+    "blob": blob_id,
+    "layout": additive_layout,
+    "semantic_digest": semantic_tensor_digest
+  }
+} / {
+  "Dense": {
+    "blob": blob_id,
+    "dtype": dense_d_type,
+    "shape": [* uint]
+  }
+}
+
+transport = "Raw" / {
+  "JointHuffman": {
+    "block": 0..4294967295
+  }
+}
+
+unknown_reason = "NotEvaluated" / "MissingEvidence" / "MissingCapability" / "AwaitingIndependentReview" / "Other"
+
+verdict = "Pass" / "Fail" / {
+  "Unknown": {
+    "reason": unknown_reason
+  }
+}

@@ -1,9 +1,9 @@
 //! Canonical, dependency-free schema vocabulary for Tritium artifacts.
 //!
 //! This crate deliberately separates semantic values from their wire
-//! encodings. Encodings, law admission limits, and generated projections are
-//! introduced by later ADR 0044 phases; callers must not infer wire tags from
-//! Rust discriminants.
+//! encodings. Generated schema projections define the shared metadata shape;
+//! format-specific byte layouts remain owned by `tritium-format`. Callers must
+//! not infer wire tags from Rust discriminants.
 #![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -57,6 +57,7 @@ pub enum PlaneRelation {
 
 /// Scale law represented as orthogonal anchor, relation, and storage precision.
 #[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema-gen", serde(deny_unknown_fields))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct ScaleLaw {
     /// Scale grouping axis.
@@ -80,6 +81,7 @@ impl ScaleLaw {
 
 /// One admitted scale law and the largest plane stack supported for it.
 #[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema-gen", serde(deny_unknown_fields))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct AdmittedLaw {
     /// The exact law tuple admitted by this schema version.
@@ -202,6 +204,7 @@ pub const ADDITIVE_TILE_SIZE: u16 = 256;
 
 /// Semantic layout parameters for an additive tensor.
 #[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema-gen", serde(deny_unknown_fields))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct AdditiveLayout {
     /// Number of matrix rows.
@@ -228,12 +231,106 @@ pub struct AdditiveLayout {
 
 /// Stable identifier for a schema family and its version.
 #[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema-gen", serde(deny_unknown_fields))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct SchemaId {
     /// Major version; incompatible schemas require a new major version.
     pub major: u16,
     /// Minor version; additive compatible schema evolution increments this.
     pub minor: u16,
+}
+
+/// Dense element type available for preserved master or auxiliary tensors.
+#[non_exhaustive]
+#[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum DenseDType {
+    /// IEEE binary16.
+    F16,
+    /// Brain floating-point 16-bit.
+    Bf16,
+    /// IEEE binary32.
+    F32,
+}
+
+/// Physical representation and semantic identity recorded for one tensor.
+#[cfg(feature = "alloc")]
+#[non_exhaustive]
+#[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TensorMeta {
+    /// Additive ternary tensor with a codec-independent semantic digest.
+    Additive {
+        /// Content-addressed identity of the exact stored payload bytes.
+        blob: BlobId,
+        /// Tensor layout needed to decode the additive payload.
+        layout: AdditiveLayout,
+        /// Codec-independent identity of the tensor's semantic values.
+        semantic_digest: SemanticTensorDigest,
+    },
+    /// Dense tensor preserved as a master, adapter, or auxiliary model tensor.
+    Dense {
+        /// Content-addressed identity of the exact stored payload bytes.
+        blob: BlobId,
+        /// Element representation of the dense payload.
+        dtype: DenseDType,
+        /// Logical tensor shape in row-major axis order.
+        shape: alloc::vec::Vec<u64>,
+    },
+}
+
+/// Provenance class for one directly usable model quality level.
+#[cfg(feature = "alloc")]
+#[non_exhaustive]
+#[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LevelProvenance {
+    /// Fitted directly from the source weights with the referenced evidence run.
+    Direct {
+        /// Stable evidence run-root digest identifying the fit.
+        evidence: alloc::string::String,
+    },
+    /// Imported as a prefix view of another level; not a direct fit.
+    ImportedPrefixOf {
+        /// Name of the source level whose stored planes form this prefix.
+        level: alloc::string::String,
+    },
+    /// Imported without proof that it is a direct fit or exact prefix.
+    Imported,
+}
+
+/// A named model level mapping tensor names to the blobs used at that level.
+#[cfg(feature = "alloc")]
+#[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema-gen", serde(deny_unknown_fields))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Level {
+    /// Stable, model-local level name.
+    pub name: alloc::string::String,
+    /// How this level was produced.
+    pub provenance: LevelProvenance,
+    /// Tensor-name to content-addressed blob mapping.
+    pub tensors: alloc::collections::BTreeMap<alloc::string::String, BlobId>,
+}
+
+/// Canonical semantic metadata for a packaged model.
+#[cfg(feature = "alloc")]
+#[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema-gen", serde(deny_unknown_fields))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModelManifest {
+    /// Version of the schema used to interpret this manifest.
+    pub schema: SchemaId,
+    /// Architecture identifier used by the model loader.
+    pub architecture: alloc::string::String,
+    /// Shared tensor semantics indexed by canonical tensor name.
+    pub tensors: alloc::collections::BTreeMap<alloc::string::String, TensorMeta>,
+    /// Direct-fit or imported quality levels available in this package.
+    pub levels: alloc::vec::Vec<Level>,
+    /// Named non-weight assets such as config, tokenizer, and chat template.
+    pub assets: alloc::collections::BTreeMap<alloc::string::String, BlobId>,
+    /// Legacy identities preserved by migration for receipt resolution.
+    pub legacy_ids: alloc::collections::BTreeMap<alloc::string::String, alloc::string::String>,
 }
 
 macro_rules! digest_id {
@@ -270,6 +367,7 @@ digest_id!(
 /// Standardized reason category for an unresolved claim.
 #[non_exhaustive]
 #[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema-gen", serde(deny_unknown_fields))]
 #[cfg_attr(
     feature = "serde",
     derive(serde_nostd::Serialize, serde_nostd::Deserialize)
