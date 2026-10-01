@@ -93,6 +93,7 @@ pub use salt_v2::{
 pub use salt_v2_activation::{
     ActivationByteLedger, ActivationCache, ActivationCacheBuilder, ActivationCacheError,
     ActivationCacheSpec, ActivationChunk, ActivationDType, ActivationDigest, ActivationShard,
+    ActivationWindow,
 };
 pub use salt_v2_allocator::{
     ByteDelta, GroupCandidates, NestedProfileAllocation, NestedProfileBudgets, PackedPlaneCounts,

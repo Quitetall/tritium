@@ -1001,6 +1001,22 @@ pub enum ActivationCacheError {
         /// Maximum accepted byte count.
         limit: u64,
     },
+    /// A requested decoded token window is outside the activation cache.
+    WindowOutOfBounds {
+        /// Inclusive first global token offset.
+        start: u64,
+        /// Requested token count.
+        count: u64,
+        /// Total tokens in the activation cache.
+        total: u64,
+    },
+    /// A decoded token window would exceed the caller's explicit memory budget.
+    DecodedWindowLimitExceeded {
+        /// Conservative decoded-payload estimate for the requested window.
+        required: u64,
+        /// Caller-provided maximum decoded-payload budget.
+        limit: u64,
+    },
     /// Reading persisted cache bytes failed.
     ReadFailed {
         /// Portable I/O failure category.
@@ -1232,6 +1248,18 @@ impl fmt::Display for ActivationCacheError {
             Self::EncodedSizeLimitExceeded { limit } => write!(
                 formatter,
                 "activation cache exceeds the reader limit of {limit} bytes"
+            ),
+            Self::WindowOutOfBounds {
+                start,
+                count,
+                total,
+            } => write!(
+                formatter,
+                "activation window [{start}, {start}+{count}) is outside 0..{total}"
+            ),
+            Self::DecodedWindowLimitExceeded { required, limit } => write!(
+                formatter,
+                "decoded activation window payload estimate is {required} bytes, limit is {limit}"
             ),
             Self::ReadFailed { kind } => {
                 write!(formatter, "failed to read activation cache bytes: {kind:?}")
@@ -2427,6 +2455,55 @@ impl ActivationShard {
     }
 }
 
+/// A caller-bounded decoded interval from an [`ActivationCache`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct ActivationWindow {
+    token_start: u64,
+    token_count: u64,
+    feature_width: u64,
+    values: Vec<f32>,
+    token_mask: Vec<bool>,
+    sequence_ends: Vec<u64>,
+    decoded_byte_estimate: u64,
+}
+
+impl ActivationWindow {
+    /// Inclusive first global token offset.
+    pub const fn token_start(&self) -> u64 {
+        self.token_start
+    }
+
+    /// Number of decoded token rows.
+    pub const fn token_count(&self) -> u64 {
+        self.token_count
+    }
+
+    /// Number of feature scalars in each row.
+    pub const fn feature_width(&self) -> u64 {
+        self.feature_width
+    }
+
+    /// Decoded row-major activation values.
+    pub fn values(&self) -> &[f32] {
+        &self.values
+    }
+
+    /// One validity bit per token row.
+    pub fn token_mask(&self) -> &[bool] {
+        &self.token_mask
+    }
+
+    /// Global exclusive sequence ends contained in this token interval.
+    pub fn sequence_ends(&self) -> &[u64] {
+        &self.sequence_ends
+    }
+
+    /// Conservative decoded-payload estimate admitted by the caller's budget.
+    pub const fn decoded_byte_estimate(&self) -> u64 {
+        self.decoded_byte_estimate
+    }
+}
+
 /// Final canonical activation artifact with content-addressed shard indices.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ActivationCache {
@@ -2520,6 +2597,244 @@ impl ActivationCache {
     /// Returns exact canonical component and total byte counts.
     pub const fn byte_ledger(&self) -> ActivationByteLedger {
         self.byte_ledger
+    }
+
+    /// Decode one contiguous token interval without materializing the complete cache.
+    ///
+    /// The caller must supply a decoded-payload limit. The estimate is conservative:
+    /// it accounts for f32 values, one byte per token-mask entry, and the maximum
+    /// possible sequence-boundary table (`count * 8`), before any output allocation.
+    /// Fixed struct metadata, allocator bookkeeping and the already-owned encoded cache
+    /// are excluded. Only shard overlaps with the requested interval are decoded.
+    /// Sequence ends stay in global token coordinates and include an end exactly at
+    /// the interval boundary.
+    ///
+    /// # Errors
+    /// Rejects empty/out-of-range intervals, arithmetic overflow, a budget smaller than
+    /// the conservative estimate, or allocation failure.
+    pub fn read_window(
+        &self,
+        token_start: u64,
+        token_count: u64,
+        max_decoded_bytes: u64,
+    ) -> Result<ActivationWindow, ActivationCacheError> {
+        if token_count == 0 {
+            return Err(ActivationCacheError::EmptyChunk);
+        }
+        let token_end = token_start.checked_add(token_count).ok_or(
+            ActivationCacheError::ArithmeticOverflow {
+                context: "activation window token end",
+            },
+        )?;
+        if token_start >= self.spec.total_tokens || token_end > self.spec.total_tokens {
+            return Err(ActivationCacheError::WindowOutOfBounds {
+                start: token_start,
+                count: token_count,
+                total: self.spec.total_tokens,
+            });
+        }
+
+        let scalar_count = checked_mul(
+            token_count,
+            self.spec.feature_width,
+            "activation window scalar count",
+        )?;
+        let value_bytes = checked_mul(scalar_count, 4, "decoded activation window values")?;
+        let boundary_bytes = checked_mul(token_count, 8, "activation window boundary estimate")?;
+        let decoded_byte_estimate = checked_add(
+            checked_add(value_bytes, token_count, "activation window mask estimate")?,
+            boundary_bytes,
+            "activation window decoded memory estimate",
+        )?;
+        if decoded_byte_estimate > max_decoded_bytes {
+            return Err(ActivationCacheError::DecodedWindowLimitExceeded {
+                required: decoded_byte_estimate,
+                limit: max_decoded_bytes,
+            });
+        }
+
+        let scalar_capacity = usize_from_u64(scalar_count, "activation window scalar allocation")?;
+        let token_capacity = usize_from_u64(token_count, "activation window token allocation")?;
+        let mut values = Vec::new();
+        values
+            .try_reserve_exact(scalar_capacity)
+            .map_err(|_| ActivationCacheError::AllocationFailed { bytes: value_bytes })?;
+        let mut token_mask = Vec::new();
+        token_mask
+            .try_reserve_exact(token_capacity)
+            .map_err(|_| ActivationCacheError::AllocationFailed { bytes: token_count })?;
+        let boundary_capacity = self
+            .sequence_ends
+            .iter()
+            .filter(|boundary| **boundary > token_start && **boundary <= token_end)
+            .count();
+        let boundary_allocation_bytes = checked_mul(
+            len_u64(boundary_capacity, "activation window boundary allocation")?,
+            8,
+            "activation window boundary allocation",
+        )?;
+        let mut sequence_ends = Vec::new();
+        sequence_ends
+            .try_reserve_exact(boundary_capacity)
+            .map_err(|_| ActivationCacheError::AllocationFailed {
+                bytes: boundary_allocation_bytes,
+            })?;
+
+        let bytes_per_token = checked_mul(
+            self.spec.feature_width,
+            u64::from(self.spec.dtype.encoded_width()),
+            "activation window encoded row width",
+        )?;
+        let mut covered_tokens = 0_u64;
+        for shard in &self.shards {
+            let shard_start = shard.token_start;
+            let shard_end = shard.token_end();
+            let overlap_start = token_start.max(shard_start);
+            let overlap_end = token_end.min(shard_end);
+            if overlap_start >= overlap_end {
+                continue;
+            }
+
+            let record =
+                self.encoded_shard(shard.index)
+                    .ok_or(ActivationCacheError::TruncatedEncoding {
+                        context: "activation window shard record",
+                        needed: shard.encoded_bytes,
+                        remaining: 0,
+                    })?;
+            let value_start_in_record = SHARD_HEADER_BYTES;
+            let mask_start_in_record = checked_add(
+                value_start_in_record,
+                shard.value_bytes,
+                "activation shard mask offset",
+            )?;
+            let mask_start = usize_from_u64(mask_start_in_record, "activation shard mask offset")?;
+            let mask_length = usize_from_u64(shard.mask_bytes, "activation shard mask length")?;
+            let packed_mask = record
+                .get(
+                    mask_start
+                        ..mask_start.checked_add(mask_length).ok_or(
+                            ActivationCacheError::ArithmeticOverflow {
+                                context: "activation shard mask end",
+                            },
+                        )?,
+                )
+                .ok_or(ActivationCacheError::TruncatedEncoding {
+                    context: "activation shard mask",
+                    needed: shard.mask_bytes,
+                    remaining: 0,
+                })?;
+
+            let first_local = overlap_start - shard_start;
+            let overlap_count = overlap_end - overlap_start;
+            let value_offset = checked_add(
+                value_start_in_record,
+                checked_mul(
+                    first_local,
+                    bytes_per_token,
+                    "activation window shard offset",
+                )?,
+                "activation window shard value offset",
+            )?;
+            let window_value_bytes = checked_mul(
+                overlap_count,
+                bytes_per_token,
+                "activation window shard value bytes",
+            )?;
+            let value_begin = usize_from_u64(value_offset, "activation window value offset")?;
+            let value_length =
+                usize_from_u64(window_value_bytes, "activation window value length")?;
+            let encoded_values = record
+                .get(
+                    value_begin
+                        ..value_begin.checked_add(value_length).ok_or(
+                            ActivationCacheError::ArithmeticOverflow {
+                                context: "activation window value end",
+                            },
+                        )?,
+                )
+                .ok_or(ActivationCacheError::TruncatedEncoding {
+                    context: "activation window values",
+                    needed: window_value_bytes,
+                    remaining: 0,
+                })?;
+            for encoded in encoded_values.chunks_exact(usize::from(self.spec.dtype.encoded_width()))
+            {
+                let value = match self.spec.dtype {
+                    ActivationDType::Float32 => {
+                        let bytes: [u8; 4] = encoded.try_into().map_err(|_| {
+                            ActivationCacheError::TruncatedEncoding {
+                                context: "f32 activation scalar",
+                                needed: 4,
+                                remaining: encoded.len() as u64,
+                            }
+                        })?;
+                        f32::from_bits(u32::from_le_bytes(bytes))
+                    }
+                    ActivationDType::Float16 => {
+                        let bytes: [u8; 2] = encoded.try_into().map_err(|_| {
+                            ActivationCacheError::TruncatedEncoding {
+                                context: "f16 activation scalar",
+                                needed: 2,
+                                remaining: encoded.len() as u64,
+                            }
+                        })?;
+                        f16::from_bits(u16::from_le_bytes(bytes)).to_f32()
+                    }
+                    ActivationDType::BFloat16 => {
+                        let bytes: [u8; 2] = encoded.try_into().map_err(|_| {
+                            ActivationCacheError::TruncatedEncoding {
+                                context: "bf16 activation scalar",
+                                needed: 2,
+                                remaining: encoded.len() as u64,
+                            }
+                        })?;
+                        bf16::from_bits(u16::from_le_bytes(bytes)).to_f32()
+                    }
+                };
+                values.push(value);
+            }
+
+            let local_end = checked_add(first_local, overlap_count, "activation window local end")?;
+            for local_token in first_local..local_end {
+                let local_index = usize_from_u64(local_token, "activation window mask index")?;
+                let packed = packed_mask.get(local_index / 8).ok_or(
+                    ActivationCacheError::TruncatedEncoding {
+                        context: "activation window mask bit",
+                        needed: 1,
+                        remaining: 0,
+                    },
+                )?;
+                token_mask.push(packed & (1_u8 << (local_index % 8)) != 0);
+            }
+            sequence_ends.extend(
+                shard
+                    .sequence_ends
+                    .iter()
+                    .copied()
+                    .filter(|boundary| *boundary > token_start && *boundary <= token_end),
+            );
+            covered_tokens =
+                checked_add(covered_tokens, overlap_count, "activation window coverage")?;
+        }
+        if covered_tokens != token_count
+            || values.len() != scalar_capacity
+            || token_mask.len() != token_capacity
+        {
+            return Err(ActivationCacheError::AccountingMismatch {
+                expected: token_count,
+                got: covered_tokens,
+            });
+        }
+        Ok(ActivationWindow {
+            token_start,
+            token_count,
+            feature_width: self.spec.feature_width,
+            values,
+            token_mask,
+            sequence_ends,
+            decoded_byte_estimate,
+        })
     }
 }
 
