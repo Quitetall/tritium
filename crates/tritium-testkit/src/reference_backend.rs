@@ -9,11 +9,14 @@
 
 use core::any::Any;
 
-use tritium_core::{GemmShape, TernaryFormat, Trit, reference_mpgemm};
+use tritium_core::{GemmShape, TernaryFormat, Trit, reference_mpgemm, reference_ternary_matmul};
+use tritium_format::AdditiveTensor;
 use tritium_format::{
     TQ1_0_BLOCK_BYTES, TQ2_0_BLOCK_BYTES, num_blocks, unpack_tq1_0_row, unpack_tq2_0_row,
 };
-use tritium_spec::{BackendError, DeviceBuffer, DeviceCaps, MpGemm, TernaryBackend};
+use tritium_spec::{
+    BackendError, DeviceBuffer, DeviceCaps, MpGemm, TensorMatmul, TensorView, TernaryBackend,
+};
 
 /// Device buffer for [`ReferenceBackend`]: the unpacked trits plus the shape they
 /// came from, so `mpgemm` needs no re-derivation.
@@ -28,6 +31,40 @@ pub(crate) struct RefBuffer {
 impl DeviceBuffer for RefBuffer {
     fn len_bytes(&self) -> usize {
         self.bytes
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// Owned semantic additive tensor held by the additive reference path.
+#[derive(Debug)]
+struct RefAdditiveBuffer {
+    tensor: AdditiveTensor,
+}
+
+impl DeviceBuffer for RefAdditiveBuffer {
+    fn len_bytes(&self) -> usize {
+        self.tensor.trits().len() + core::mem::size_of_val(self.tensor.scales())
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// Owned dense f32 tensor held by the reference backend.
+#[derive(Debug)]
+struct RefDenseBuffer {
+    rows: usize,
+    cols: usize,
+    values: Vec<f32>,
+}
+
+impl DeviceBuffer for RefDenseBuffer {
+    fn len_bytes(&self) -> usize {
+        self.values.len() * core::mem::size_of::<f32>()
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -54,6 +91,90 @@ impl TernaryBackend for ReferenceBackend {
 
     fn capabilities(&self) -> DeviceCaps {
         DeviceCaps::new("reference", "tritium-testkit reference backend")
+    }
+
+    fn upload_tensor(&self, tensor: TensorView<'_>) -> Result<Box<dyn DeviceBuffer>, BackendError> {
+        match tensor {
+            TensorView::Additive(view) => {
+                let plane_count = u8::try_from(view.plane_count()).map_err(|_| {
+                    BackendError::InvalidInput("additive plane count exceeds u8".into())
+                })?;
+                let tensor = AdditiveTensor::new(
+                    view.layout(),
+                    plane_count,
+                    view.trits().to_vec(),
+                    view.scales().to_vec(),
+                )
+                .map_err(|error| {
+                    BackendError::InvalidInput(format!("invalid additive tensor: {error:?}"))
+                })?;
+                Ok(Box::new(RefAdditiveBuffer { tensor }))
+            }
+            TensorView::Dense { rows, cols, values } => {
+                let expected = rows.checked_mul(cols).ok_or_else(|| {
+                    BackendError::InvalidInput("dense tensor dimensions overflow".into())
+                })?;
+                if values.len() != expected {
+                    return Err(BackendError::ShapeMismatch {
+                        expected,
+                        got: values.len(),
+                    });
+                }
+                Ok(Box::new(RefDenseBuffer {
+                    rows,
+                    cols,
+                    values: values.to_vec(),
+                }))
+            }
+        }
+    }
+
+    fn matmul(&self, p: TensorMatmul<'_>) -> Result<(), BackendError> {
+        if let Some(buf) = p.tensor.as_any().downcast_ref::<RefAdditiveBuffer>() {
+            let view = buf.tensor.view();
+            return reference_ternary_matmul(p.act, &view, p.batch, p.transformed_act, p.out)
+                .map_err(|e| {
+                    BackendError::InvalidInput(format!("reference matmul failed: {e:?}"))
+                });
+        }
+        let buf = p
+            .tensor
+            .as_any()
+            .downcast_ref::<RefDenseBuffer>()
+            .ok_or_else(|| BackendError::InvalidInput("unknown reference tensor kind".into()))?;
+        let activation_count = p
+            .batch
+            .checked_mul(buf.cols)
+            .ok_or_else(|| BackendError::InvalidInput("activation dimensions overflow".into()))?;
+        let output_count = p
+            .batch
+            .checked_mul(buf.rows)
+            .ok_or_else(|| BackendError::InvalidInput("output dimensions overflow".into()))?;
+        if p.act.len() != activation_count || p.transformed_act.len() != activation_count {
+            return Err(BackendError::ShapeMismatch {
+                expected: activation_count,
+                got: p.act.len().max(p.transformed_act.len()),
+            });
+        }
+        if p.out.len() != output_count {
+            return Err(BackendError::ShapeMismatch {
+                expected: output_count,
+                got: p.out.len(),
+            });
+        }
+        p.transformed_act.copy_from_slice(p.act);
+        for batch in 0..p.batch {
+            for row in 0..buf.rows {
+                let weights = &buf.values[row * buf.cols..(row + 1) * buf.cols];
+                let activations = &p.act[batch * buf.cols..(batch + 1) * buf.cols];
+                p.out[batch * buf.rows + row] = activations
+                    .iter()
+                    .zip(weights)
+                    .map(|(activation, weight)| activation * weight)
+                    .sum();
+            }
+        }
+        Ok(())
     }
 
     fn upload_weights(

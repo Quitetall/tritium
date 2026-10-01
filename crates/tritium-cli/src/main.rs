@@ -49,6 +49,7 @@ mod campaign_artifact;
 #[cfg(feature = "nccl")]
 mod campaign_world;
 mod convert;
+mod evidence;
 mod generate;
 #[cfg(feature = "cuda")]
 mod hestia_gate;
@@ -78,6 +79,15 @@ const DEFAULT_EOS: u32 = 128_001;
     version
 )]
 struct Cli {
+    /// Evidence detail level. Events go to stderr unless `--evidence-out` is supplied.
+    #[arg(long, global = true, value_enum, default_value_t = evidence::EvidenceMode::Summary)]
+    evidence: evidence::EvidenceMode,
+    /// Write evidence JSONL to a new file instead of stderr; existing files are never replaced.
+    #[arg(long, global = true)]
+    evidence_out: Option<PathBuf>,
+    /// Stable identifier for this evidence run; required by deterministic mode.
+    #[arg(long, global = true)]
+    run_id: Option<String>,
     /// The subcommand to run.
     #[command(subcommand)]
     command: Command,
@@ -157,6 +167,12 @@ enum Command {
         /// Release evidence operation.
         #[command(subcommand)]
         release: release::ReleaseCommand,
+    },
+    /// Inspect and verify canonical, hash-chained evidence JSONL.
+    Evidence {
+        /// Evidence operation.
+        #[command(subcommand)]
+        evidence: evidence::EvidenceCommand,
     },
     /// Repack ternary GGUF tensors while preserving dequantized weight values.
     Repack {
@@ -345,6 +361,34 @@ enum Command {
     },
 }
 
+impl Command {
+    fn evidence_name(&self) -> &'static str {
+        match self {
+            Self::Inspect { .. } => "inspect",
+            Self::ListBackends => "list-backends",
+            Self::Campaign { .. } => "campaign",
+            Self::Salt { .. } => "salt",
+            Self::Pull { .. } => "pull",
+            Self::Generate { .. } => "generate",
+            Self::Report { report } => match report {
+                ReportCommand::Sparsity { .. } => "report.sparsity",
+                ReportCommand::Decode { .. } => "report.decode",
+                ReportCommand::Compare { .. } => "report.compare",
+                ReportCommand::Ttft { .. } => "report.ttft",
+                ReportCommand::Parity { .. } => "report.parity",
+                ReportCommand::Salt { .. } => "report.salt",
+                ReportCommand::SaltModel { .. } => "report.salt-model",
+            },
+            Self::Release { .. } => "release",
+            Self::Evidence { .. } => "evidence",
+            Self::Repack { .. } => "repack",
+            Self::Transport { .. } => "transport",
+            Self::Convert { .. } => "convert",
+            Self::Quantize { .. } => "quantize",
+        }
+    }
+}
+
 /// Benchmark/validation reports.
 #[derive(Subcommand, Debug)]
 enum ReportCommand {
@@ -518,186 +562,201 @@ pub(crate) enum SaltSensitivityArg {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    match cli.command {
-        Command::Inspect { path } => inspect::run(&path)?,
-        Command::ListBackends => backends::run(),
-        Command::Campaign { campaign: command } => campaign::run(command)?,
-        Command::Salt { salt: command } => salt::run(command)?,
-        Command::Pull {
-            repo,
-            file,
-            revision,
-        } => pull::run(&repo, file.as_deref(), &revision)?,
-        Command::Generate {
-            model,
-            tokens,
-            prompt,
-            max_new,
-            greedy,
-            eos,
-        } => {
-            // clap guarantees exactly one of the two is present.
-            let ids = tokens.map(|p| generate::read_token_file(&p)).transpose()?;
-            let source = match (&ids, &prompt) {
-                (Some(ids), _) => generate::Prompt::Ids(ids),
-                (None, Some(text)) => generate::Prompt::Text(text),
-                (None, None) => unreachable!("clap requires --tokens or --prompt"),
-            };
-            generate::run(&model, &source, max_new, greedy, eos)?;
-        }
-        Command::Repack { input, output, to } => repack::run(&input, &output, to)?,
-        Command::Transport { transport: command } => transport::run(command)?,
-        Command::Release { release: command } => release::run(command)?,
-        Command::Report { report: command } => match command {
-            ReportCommand::Sparsity { model } => report::sparsity(&model)?,
-            ReportCommand::Decode {
+    let command_name = cli.command.evidence_name();
+    let evidence =
+        evidence::EvidenceSession::start(cli.evidence, cli.evidence_out, cli.run_id, command_name)?;
+    let command_result = (|| -> anyhow::Result<()> {
+        match cli.command {
+            Command::Inspect { path } => inspect::run(&path)?,
+            Command::ListBackends => backends::run(),
+            Command::Campaign { campaign: command } => campaign::run(command)?,
+            Command::Salt { salt: command } => salt::run(command)?,
+            Command::Pull {
+                repo,
+                file,
+                revision,
+            } => pull::run(&repo, file.as_deref(), &revision)?,
+            Command::Generate {
                 model,
                 tokens,
-                backend,
-                decode_steps,
-                warmup,
-                format,
+                prompt,
+                max_new,
+                greedy,
+                eos,
             } => {
-                let ids = generate::read_token_file(&tokens)?;
-                report::decode(&model, &ids, &backend, decode_steps, warmup, format)?;
+                // clap guarantees exactly one of the two is present.
+                let ids = tokens.map(|p| generate::read_token_file(&p)).transpose()?;
+                let source = match (&ids, &prompt) {
+                    (Some(ids), _) => generate::Prompt::Ids(ids),
+                    (None, Some(text)) => generate::Prompt::Text(text),
+                    (None, None) => unreachable!("clap requires --tokens or --prompt"),
+                };
+                generate::run(&model, &source, max_new, greedy, eos)?;
             }
-            ReportCommand::Compare {
-                model,
-                tokens,
-                backend,
-                prompt_len,
-                decode_steps,
-                warmup,
-                reps,
-                runs,
-                format,
-            } => {
-                let ids = generate::read_token_file(&tokens)?;
-                report::compare(
-                    &model,
-                    &ids,
-                    &backend,
+            Command::Repack { input, output, to } => repack::run(&input, &output, to)?,
+            Command::Transport { transport: command } => transport::run(command)?,
+            Command::Release { release: command } => release::run(command)?,
+            Command::Evidence { evidence: command } => evidence::run(command)?,
+            Command::Report { report: command } => match command {
+                ReportCommand::Sparsity { model } => report::sparsity(&model)?,
+                ReportCommand::Decode {
+                    model,
+                    tokens,
+                    backend,
+                    decode_steps,
+                    warmup,
+                    format,
+                } => {
+                    let ids = generate::read_token_file(&tokens)?;
+                    report::decode(&model, &ids, &backend, decode_steps, warmup, format)?;
+                }
+                ReportCommand::Compare {
+                    model,
+                    tokens,
+                    backend,
                     prompt_len,
                     decode_steps,
                     warmup,
                     reps,
                     runs,
                     format,
-                )?
-            }
-            ReportCommand::Ttft {
+                } => {
+                    let ids = generate::read_token_file(&tokens)?;
+                    report::compare(
+                        &model,
+                        &ids,
+                        &backend,
+                        prompt_len,
+                        decode_steps,
+                        warmup,
+                        reps,
+                        runs,
+                        format,
+                    )?
+                }
+                ReportCommand::Ttft {
+                    model,
+                    tokens,
+                    backend,
+                    runs,
+                    format,
+                } => {
+                    let ids = generate::read_token_file(&tokens)?;
+                    report::ttft(&model, &ids, &backend, runs, format)?;
+                }
+                ReportCommand::Parity {
+                    model,
+                    tokens,
+                    max_new,
+                    eos,
+                    format,
+                } => {
+                    let ids = generate::read_token_file(&tokens)?;
+                    report::parity(&model, &ids, max_new, eos, format)?;
+                }
+                ReportCommand::Salt {
+                    input,
+                    rows,
+                    k,
+                    budgets,
+                    sensitivity,
+                    format,
+                } => report::salt(&input, rows, k, &budgets, sensitivity, format)?,
+                ReportCommand::SaltModel {
+                    input,
+                    budgets,
+                    sensitivity,
+                    scale_group,
+                    limit,
+                    per_tensor,
+                    format,
+                } => report::salt_model(
+                    &input,
+                    &budgets,
+                    sensitivity,
+                    scale_group,
+                    limit,
+                    per_tensor,
+                    format,
+                )?,
+            },
+            Command::Convert {
                 model,
-                tokens,
-                backend,
-                runs,
-                format,
-            } => {
-                let ids = generate::read_token_file(&tokens)?;
-                report::ttft(&model, &ids, &backend, runs, format)?;
-            }
-            ReportCommand::Parity {
-                model,
-                tokens,
-                max_new,
-                eos,
-                format,
-            } => {
-                let ids = generate::read_token_file(&tokens)?;
-                report::parity(&model, &ids, max_new, eos, format)?;
-            }
-            ReportCommand::Salt {
-                input,
-                rows,
-                k,
-                budgets,
-                sensitivity,
-                format,
-            } => report::salt(&input, rows, k, &budgets, sensitivity, format)?,
-            ReportCommand::SaltModel {
-                input,
-                budgets,
-                sensitivity,
-                scale_group,
-                limit,
-                per_tensor,
-                format,
-            } => report::salt_model(
-                &input,
-                &budgets,
-                sensitivity,
-                scale_group,
-                limit,
-                per_tensor,
-                format,
-            )?,
-        },
-        Command::Convert {
-            model,
-            out,
-            calib,
-            calib_tokens,
-            fold_alpha,
-            no_rotation,
-            activation_aware,
-            gptq_decay,
-            gptq_decay_ramp,
-            dense_container,
-            planes,
-            group,
-            grid,
-        } => convert::run(
-            &model,
-            &out,
-            &convert::ConvertConfig {
+                out,
                 calib,
                 calib_tokens,
                 fold_alpha,
-                ladder: quantize_ladder::LadderConfig {
-                    planes,
-                    group,
-                    grid,
-                    rotate: !no_rotation,
-                },
-                dense_container,
+                no_rotation,
                 activation_aware,
-                gptq_decay: gptq_decay.0,
+                gptq_decay,
                 gptq_decay_ramp,
-            },
-        )?,
-        Command::Quantize {
-            input,
-            output,
-            bpw,
-            scale_group,
-            sensitivity,
-            fisher,
-            format,
-            ladder,
-            planes,
-            group,
-            grid,
-            rotate,
-        } => quantize::run(
-            &input,
-            &output,
-            bpw,
-            scale_group,
-            sensitivity,
-            fisher.as_deref(),
-            format,
-            ladder,
-            quantize_ladder::LadderConfig {
+                dense_container,
                 planes,
                 group,
                 grid,
-                // Opt-in here, unlike `convert`: two of this command's three containers cannot
-                // record a rotation, so the default has to be the one every format can express.
-                // `quantize::run` refuses the combination rather than writing it silently wrong.
+            } => convert::run(
+                &model,
+                &out,
+                &convert::ConvertConfig {
+                    calib,
+                    calib_tokens,
+                    fold_alpha,
+                    ladder: quantize_ladder::LadderConfig {
+                        planes,
+                        group,
+                        grid,
+                        rotate: !no_rotation,
+                    },
+                    dense_container,
+                    activation_aware,
+                    gptq_decay: gptq_decay.0,
+                    gptq_decay_ramp,
+                },
+            )?,
+            Command::Quantize {
+                input,
+                output,
+                bpw,
+                scale_group,
+                sensitivity,
+                fisher,
+                format,
+                ladder,
+                planes,
+                group,
+                grid,
                 rotate,
-            },
-        )?,
+            } => quantize::run(
+                &input,
+                &output,
+                bpw,
+                scale_group,
+                sensitivity,
+                fisher.as_deref(),
+                format,
+                ladder,
+                quantize_ladder::LadderConfig {
+                    planes,
+                    group,
+                    grid,
+                    // Opt-in here, unlike `convert`: two of this command's three containers cannot
+                    // record a rotation, so the default has to be the one every format can express.
+                    // `quantize::run` refuses the combination rather than writing it silently wrong.
+                    rotate,
+                },
+            )?,
+        }
+        Ok(())
+    })();
+    let evidence_result = evidence.finish(command_name, command_result.is_ok());
+    match (command_result, evidence_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(command_error), Ok(())) => Err(command_error),
+        (Ok(()), Err(evidence_error)) => Err(evidence_error),
+        (Err(command_error), Err(evidence_error)) => Err(anyhow::anyhow!(
+            "command failed ({command_error}); evidence recording also failed ({evidence_error})"
+        )),
     }
-    Ok(())
 }
 
 /// `--gptq-decay`: `None` is `auto` (per tensor from the calibration size), else a value in (0, 1].
@@ -763,6 +822,21 @@ mod tests {
                 campaign: campaign::CampaignCommand::Run { config }
             } if config == std::path::Path::new("campaign.json")
         ));
+    }
+
+    #[test]
+    fn evidence_flags_are_global_and_deterministic_mode_accepts_run_id() {
+        let cli = Cli::try_parse_from([
+            "tritium",
+            "list-backends",
+            "--evidence",
+            "det",
+            "--run-id",
+            "stable-run",
+        ])
+        .expect("global evidence flags after the command");
+        assert_eq!(cli.evidence, evidence::EvidenceMode::Det);
+        assert_eq!(cli.run_id.as_deref(), Some("stable-run"));
     }
 
     #[test]

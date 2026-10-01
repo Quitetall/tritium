@@ -128,6 +128,29 @@ appear too.
 tritium list-backends
 ```
 
+### Evidence logs
+
+CLI commands emit a bounded `tritium.cli.command` event in `summary` mode by
+default. The canonical JSONL event is written to stderr; `--evidence off`
+disables it, and `--evidence-out <PATH>` writes an immutable new file instead
+(an existing path is never replaced). `full` records start and completion;
+`det` uses logical time and requires a caller-stable `--run-id`:
+
+```sh
+tritium --evidence full --evidence-out run.jsonl inspect model.gguf
+tritium evidence verify run.jsonl
+tritium evidence view run.jsonl
+```
+
+These initial CLI events contain only the command name and success status, not
+arguments or a semantic plan fingerprint. Use `--evidence-out` for a clean
+JSONL file; stderr can also contain diagnostics. Deterministic CLI lifecycle
+replay is not model-run determinism.
+
+Verification checks canonical encoding, event digests, per-span chains, and the
+run root. It does not qualify model quality, performance, hardware, or release
+claims; those require their own evidence and independent gates.
+
 ### `generate`
 
 Load a GGUF model and greedily decode tokens from a **reproducible JSON file of

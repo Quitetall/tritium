@@ -10,6 +10,16 @@ exact byte accounting and receipt-backed benchmarks.
 See the [repository README](https://github.com/Quitetall/tritium#readme) and the
 [book](https://github.com/Quitetall/tritium/tree/main/docs/book) for usage.
 
+CLI evidence output defaults to `summary` on stderr. Use `--evidence off` to
+disable, `--evidence-out <PATH>` to write a new immutable JSONL file, and
+`--evidence det --run-id <ID>` for deterministic logical-time events. Run
+`tritium evidence verify <PATH>` to check canonical encoding, event digests,
+span chains, and the run root. This verifies log integrity only, not empirical
+or release qualification. Current CLI events record command name and outcome
+only—not arguments or a semantic plan fingerprint. Use `--evidence-out` for a
+clean JSONL file; stderr may include diagnostics. `det` replay covers command
+lifecycle events only, not model execution determinism.
+
 For storage or transfer, wrap an existing fixed-codec artifact without changing
 runtime accounting:
 

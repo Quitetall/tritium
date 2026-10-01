@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "UnknownReason",
+  "description": "Standardized reason category for an unresolved claim.",
+  "oneOf": [
+    {
+      "description": "The claim has not yet been evaluated.",
+      "type": "string",
+      "const": "NotEvaluated"
+    },
+    {
+      "description": "Required evidence is unavailable.",
+      "type": "string",
+      "const": "MissingEvidence"
+    },
+    {
+      "description": "Required hardware or runtime is unavailable.",
+      "type": "string",
+      "const": "MissingCapability"
+    },
+    {
+      "description": "Independent review is still required.",
+      "type": "string",
+      "const": "AwaitingIndependentReview"
+    },
+    {
+      "description": "The producer supplied a reason not represented by a standard code.",
+      "type": "string",
+      "const": "Other"
+    }
+  ]
+}

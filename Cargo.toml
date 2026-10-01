@@ -7,6 +7,8 @@ resolver = "3"
 members = [
     "crates/tritium-build-info", # source identity for receipt-producing build scripts
     "crates/tritium-core",
+    "crates/tritium-schema",   # accepted ADR 0044 cross-language schema vocabulary
+    "crates/tritium-evidence", # typed, deterministic, hash-chained evidence log (ADR 0044)
     "crates/tritium-spec",     # backend trait contract, no impls
     "crates/tritium-format",   # TQ1_0/TQ2_0 packing, GGUF + safetensors I/O
     "crates/tritium-testkit",  # reference vectors + conformance harness
@@ -62,6 +64,8 @@ categories = ["science", "hardware-support", "mathematics"]
 # deps) and lets cargo-deny keep `wildcards = "deny"` meaningful for *external* deps.
 tritium-build-info = { path = "crates/tritium-build-info", version = "1.1.0-rc.2" }
 tritium-core = { path = "crates/tritium-core", version = "1.1.0-rc.2" }
+tritium-schema = { path = "crates/tritium-schema", version = "1.1.0-rc.2" }
+tritium-evidence = { path = "crates/tritium-evidence", version = "1.1.0-rc.2" }
 tritium-spec = { path = "crates/tritium-spec", version = "1.1.0-rc.2" }
 tritium-format = { path = "crates/tritium-format", version = "1.1.0-rc.2" }
 tritium-runtime = { path = "crates/tritium-runtime", version = "1.1.0-rc.2" }
@@ -83,6 +87,8 @@ tritium-onnx = { path = "crates/tritium-onnx", version = "1.1.0-rc.2", default-f
 # foundation
 bytemuck = "1"
 blake3 = "1"
+ciborium = "0.2.2"
+serde_json_canonicalizer = "=0.3.2"
 getrandom = "0.3.4"
 half = "2"
 linkme = "0.3"
@@ -151,7 +157,9 @@ tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
 proptest = "1"
 divan = "0.1"
 serde = { version = "1", features = ["derive"] }
+serde_nostd = { package = "serde", version = "1", features = ["derive"], default-features = false }
 serde_json = "1"
+schemars = { version = "=1.2.2", features = ["derive"] }
 sha2 = "0.11"
 
 # Lints applied workspace-wide; crates opt in with `[lints] workspace = true`.

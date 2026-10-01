@@ -27,7 +27,7 @@ use core::fmt;
 
 // Re-export the core vocabulary types the contract speaks so a backend author
 // needs only depend on `tritium-spec` to implement [`TernaryBackend`].
-pub use tritium_core::{DType, GemmShape, TernaryFormat, TritError};
+pub use tritium_core::{AdditiveView, DType, GemmShape, TernaryFormat, TritError};
 
 mod caps;
 pub use caps::DeviceCaps;
@@ -139,6 +139,48 @@ impl fmt::Debug for MpGemmProjectedVjp<'_> {
     }
 }
 
+/// Host-side tensor input for the unified tensor upload contract.
+#[derive(Clone, Copy, Debug)]
+pub enum TensorView<'a> {
+    /// Validated additive-ternary tensor with its scale law and basis.
+    Additive(AdditiveView<'a>),
+    /// Dense row-major f32 matrix. `rows` are output channels, `cols` inputs.
+    Dense {
+        /// Number of output rows.
+        rows: usize,
+        /// Number of input columns.
+        cols: usize,
+        /// Row-major dense values, exactly `rows * cols` elements.
+        values: &'a [f32],
+    },
+}
+
+/// Inputs for unified tensor-level matrix multiplication.
+pub struct TensorMatmul<'a> {
+    /// `[batch, K]` row-major activations.
+    pub act: &'a [f32],
+    /// Tensor returned by [`TernaryBackend::upload_tensor`].
+    pub tensor: &'a dyn DeviceBuffer,
+    /// Number of activation rows (`M`).
+    pub batch: usize,
+    /// `[batch, K]` scratch for basis-transformed activations.
+    pub transformed_act: &'a mut [f32],
+    /// `[batch, N]` output, overwritten.
+    pub out: &'a mut [f32],
+}
+
+impl fmt::Debug for TensorMatmul<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TensorMatmul")
+            .field("act_len", &self.act.len())
+            .field("tensor_bytes", &self.tensor.len_bytes())
+            .field("batch", &self.batch)
+            .field("transformed_act_len", &self.transformed_act.len())
+            .field("out_len", &self.out.len())
+            .finish()
+    }
+}
+
 /// Opaque handle to device-resident memory owned by a backend.
 ///
 /// The runtime treats this as an opaque token; the owning backend downcasts it
@@ -177,6 +219,31 @@ pub trait TernaryBackend: Send + Sync {
 
     /// What this device can do — used by the runtime to pick a backend.
     fn capabilities(&self) -> DeviceCaps;
+
+    /// Upload a semantic tensor without exposing its wire-format encoding.
+    ///
+    /// Compatibility default fails closed; backend implementations opt into
+    /// the tensor contract explicitly while the legacy packed path remains.
+    fn upload_tensor(
+        &self,
+        _tensor: TensorView<'_>,
+    ) -> Result<Box<dyn DeviceBuffer>, BackendError> {
+        Err(BackendError::Backend(format!(
+            "backend `{}` does not implement semantic tensor upload",
+            self.device_id()
+        )))
+    }
+
+    /// Multiply activations by a tensor uploaded through [`Self::upload_tensor`].
+    ///
+    /// Compatibility default fails closed. A backend must not silently route
+    /// an unsupported tensor through an unrelated packed format.
+    fn matmul(&self, _p: TensorMatmul<'_>) -> Result<(), BackendError> {
+        Err(BackendError::Backend(format!(
+            "backend `{}` does not implement semantic tensor matmul",
+            self.device_id()
+        )))
+    }
 
     /// Upload host-side packed weight bytes (`format`, shape `[N, K]`) to device
     /// memory, returning an opaque handle for reuse across `mpgemm` calls.

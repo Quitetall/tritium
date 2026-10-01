@@ -24,6 +24,7 @@ serde = ["dep:serde"]
 # Foundation crate: zero external runtime deps by design. The only thing every
 # backend links is types + reference math — keep it minimal and no_std-able.
 [dependencies]
+tritium-schema = { workspace = true }
 # Optional: only pulled in under the `serde` feature (derive-only, no_std-compatible).
 serde = { workspace = true, optional = true }
 

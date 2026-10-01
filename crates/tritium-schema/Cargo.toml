@@ -1,0 +1,32 @@
+[package]
+name = "tritium-schema"
+description = "Canonical, no_std schema vocabulary for Tritium additive tensors and artifacts."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme = "README.md"
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+default = ["std"]
+std = ["alloc"]
+alloc = []
+serde = ["dep:serde_nostd"]
+schema-gen = ["std", "dep:schemars", "dep:serde_json"]
+
+[dependencies]
+schemars = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+serde_nostd = { workspace = true, optional = true }
+
+[[bin]]
+name = "tritium-schema-projections"
+path = "src/bin/schema-projections.rs"
+required-features = ["schema-gen"]
+
+[lints]
+workspace = true
