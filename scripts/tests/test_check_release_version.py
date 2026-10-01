@@ -44,6 +44,10 @@ class ReleaseVersionTests(unittest.TestCase):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 MODULE.candidate_version(invalid)
 
+    def test_pypi_version_matches_cargo_rc_and_stable_spellings(self):
+        self.assertEqual(MODULE.pypi_version("1.1.0-rc.2"), "1.1.0rc2")
+        self.assertEqual(MODULE.pypi_version("1.1.0"), "1.1.0")
+
     def test_mirror_mismatch_is_actionable(self):
         with self.assertRaisesRegex(ValueError, "npm package version"):
             MODULE.require_equal("1.0.0", "1.1.0-rc.0", "npm package version")

@@ -356,7 +356,7 @@ unmanifested file.
     {
       "id": "pytritium-linux-cpu",
       "kind": "python-wheel",
-      "path": "pytritium-1.1.0rc1-cp39-abi3-manylinux_2_28_x86_64.whl",
+      "path": "pytritium-1.1.0rc2-cp39-abi3-manylinux_2_28_x86_64.whl",
       "sbom": "pytritium-linux-cpu.cdx.json"
     }
   ]

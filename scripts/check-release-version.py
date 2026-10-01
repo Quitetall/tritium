@@ -36,6 +36,12 @@ def candidate_version(value: Any) -> str:
     return value
 
 
+def pypi_version(value: str) -> str:
+    """Convert the accepted Cargo prerelease spelling to the wheel spelling."""
+
+    return re.sub(r"-rc\.(\d+)$", r"rc\1", value)
+
+
 def read_json(path: Path) -> dict[str, Any]:
     value = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(value, dict):
@@ -100,6 +106,26 @@ def check(root: Path) -> str:
 
     compatibility = read_json(root / "release/compatibility-v1.1.json")
     require_equal(compatibility.get("release"), version, "compatibility release")
+
+    wheel_version = pypi_version(version)
+    tutorial = (root / "docs/book/src/tutorial-pytorch-qat.md").read_text(
+        encoding="utf-8"
+    )
+    require_equal(
+        f"TRITIUM_WHEEL=./dist/pytritium-{wheel_version}-cp39-abi3-PLATFORM.whl"
+        in tutorial,
+        True,
+        "installed-artifact QAT tutorial wheel version",
+    )
+    candidate_guide = (root / "docs/release-candidate.md").read_text(
+        encoding="utf-8"
+    )
+    require_equal(
+        f'"path": "pytritium-{wheel_version}-cp39-abi3-manylinux_2_28_x86_64.whl"'
+        in candidate_guide,
+        True,
+        "release-candidate example wheel version",
+    )
     return version
 
 
