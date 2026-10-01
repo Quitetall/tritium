@@ -925,6 +925,7 @@ const fn map_runtime_evidence_error(error: RuntimeEvidenceError) -> OutputRecons
         }
         RuntimeEvidenceError::CountOverflow => OutputReconstructionError::CountOverflow,
         RuntimeEvidenceError::EmptyStream => OutputReconstructionError::IncompleteCandidate,
+        RuntimeEvidenceError::InvalidGeometry => OutputReconstructionError::InvalidGeometry,
     }
 }
 

@@ -106,7 +106,8 @@ pub use q2_0::{
 };
 pub use rows::{num_blocks, pack_tq1_0_row, pack_tq2_0_row, unpack_tq1_0_row, unpack_tq2_0_row};
 pub use runtime_evidence::{
-    RuntimeEvidenceError, RuntimeFinalLogitsAccumulator, RuntimeFinalLogitsEvidence,
+    RuntimeBlockOutputsAccumulator, RuntimeBlockOutputsEvidence, RuntimeEvidenceError,
+    RuntimeFinalLogitsAccumulator, RuntimeFinalLogitsEvidence,
 };
 pub use safetensors::{
     SafeTensors, SafeTensorsError, SafeTensorsReader, VisitTensorBytesError, read_safetensors,

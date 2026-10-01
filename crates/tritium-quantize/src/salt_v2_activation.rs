@@ -2663,11 +2663,19 @@ impl ActivationCache {
         token_mask
             .try_reserve_exact(token_capacity)
             .map_err(|_| ActivationCacheError::AllocationFailed { bytes: token_count })?;
-        let boundary_capacity = self
+        let boundary_start = self
             .sequence_ends
-            .iter()
-            .filter(|boundary| **boundary > token_start && **boundary <= token_end)
-            .count();
+            .partition_point(|boundary| *boundary <= token_start);
+        let boundary_end = self
+            .sequence_ends
+            .partition_point(|boundary| *boundary <= token_end);
+        let window_boundaries = self.sequence_ends.get(boundary_start..boundary_end).ok_or(
+            ActivationCacheError::AccountingMismatch {
+                expected: token_count,
+                got: 0,
+            },
+        )?;
+        let boundary_capacity = window_boundaries.len();
         let boundary_allocation_bytes = checked_mul(
             len_u64(boundary_capacity, "activation window boundary allocation")?,
             8,
@@ -2685,15 +2693,26 @@ impl ActivationCache {
             u64::from(self.spec.dtype.encoded_width()),
             "activation window encoded row width",
         )?;
+        let first_shard = usize_from_u64(
+            token_start / u64::from(self.spec.shard_tokens),
+            "activation window first shard",
+        )?;
+        let last_shard = usize_from_u64(
+            (token_end - 1) / u64::from(self.spec.shard_tokens),
+            "activation window last shard",
+        )?;
+        let window_shards = self.shards.get(first_shard..=last_shard).ok_or(
+            ActivationCacheError::ShardCountMismatch {
+                expected: self.spec.shard_count,
+                got: u32::try_from(self.shards.len()).unwrap_or(u32::MAX),
+            },
+        )?;
         let mut covered_tokens = 0_u64;
-        for shard in &self.shards {
+        for shard in window_shards {
             let shard_start = shard.token_start;
             let shard_end = shard.token_end();
             let overlap_start = token_start.max(shard_start);
             let overlap_end = token_end.min(shard_end);
-            if overlap_start >= overlap_end {
-                continue;
-            }
 
             let record =
                 self.encoded_shard(shard.index)
@@ -2807,16 +2826,10 @@ impl ActivationCache {
                 )?;
                 token_mask.push(packed & (1_u8 << (local_index % 8)) != 0);
             }
-            sequence_ends.extend(
-                shard
-                    .sequence_ends
-                    .iter()
-                    .copied()
-                    .filter(|boundary| *boundary > token_start && *boundary <= token_end),
-            );
             covered_tokens =
                 checked_add(covered_tokens, overlap_count, "activation window coverage")?;
         }
+        sequence_ends.extend_from_slice(window_boundaries);
         if covered_tokens != token_count
             || values.len() != scalar_capacity
             || token_mask.len() != token_capacity
