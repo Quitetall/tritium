@@ -68,9 +68,9 @@ currently has only `MeasuredAwaitingOfficialRegistration`, whose
 `official_payload_authenticated()` result is false. A manifest edit cannot
 authenticate these bundles. Before another flagship run can produce admissible
 evidence, an independently verified official source identity must be
-registered in the source-admission contract, and the complete pinned source
-payload must be available and verified. No download or campaign restart was
-performed for this follow-up.
+registered through a separate source-identity path, and the complete pinned
+source payload must be available and verified. No download or campaign restart
+was performed for this follow-up.
 
 ### Pinned source fetch and checksum verification (2026-09-30)
 
@@ -86,12 +86,11 @@ its own `.cache/huggingface` lock/metadata files as extras. Those files were
 preserved; no cleanup was needed.
 
 This verifies the downloaded files against the pinned Hub revision but does
-not itself satisfy Tritium's code-level source identity admission. The
-`Qwen36SourceIdentityStatus` remains unauthenticated until Tritium's semantic
-preflight is run and the independently verified official `ModelId` is
-registered through the source-admission contract. The 506-tensor campaign has
-not been restarted, and the prior incomplete bundle variants remain
-inadmissible.
+not by itself satisfy Tritium's code-level source identity admission. The
+source-admission receipt intentionally remains unauthenticated. A separate
+official-identity verifier and registration are still required before source
+admission can authorize the 506-tensor campaign. That campaign has not been
+restarted, and the prior incomplete bundle variants remain inadmissible.
 
 The Rust `qwen36-preflight` then completed against this verified snapshot. It
 measured source model ID
