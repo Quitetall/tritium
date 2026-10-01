@@ -396,7 +396,10 @@ def verify_pack(
             observed_token_digest = hashlib.sha256(sequence_bytes).hexdigest()
             if token_digest != observed_token_digest:
                 raise CalibrationPackError(f"{label} token payload digest differs")
-            if any(token[0] >= VOCAB_SIZE for token in struct.iter_unpack("<I", sequence_bytes)):
+            if any(
+                token[0] >= VOCAB_SIZE
+                for token in struct.iter_unpack("<I", sequence_bytes)
+            ):
                 raise CalibrationPackError(f"{label} token exceeds Qwen vocabulary")
             scope = {key: value for key, value in sequence.items() if key != "id"}
             expected_id = "sha256:" + hashlib.sha256(canonical(scope)).hexdigest()
@@ -446,6 +449,70 @@ def verify_pack(
     return receipt
 
 
+def validate_receipt(path: Path) -> dict[str, Any]:
+    """Reopen and verify the durable pack-provenance receipt's schema and ID."""
+    value = _load_json(path, "calibration pack receipt", 1024 * 1024)
+    fields = {
+        "schema", "result", "source_identity_receipt_id", "source_model_id",
+        "repository", "revision", "tokenizer_digest", "tokenizer_vocab_size",
+        "pack_id", "token_payload_sha256", "token_payload_bytes", "calibration",
+        "receipt_id",
+    }
+    if set(value) != fields:
+        raise CalibrationPackError("calibration pack receipt fields differ")
+    receipt_id = _sha256_text(value["receipt_id"], "receipt ID", prefixed=True)
+    content = {key: item for key, item in value.items() if key != "receipt_id"}
+    expected_id = hashlib.sha256(canonical(content)).hexdigest()
+    if receipt_id != expected_id:
+        raise CalibrationPackError("calibration pack receipt ID differs")
+    if (
+        value["schema"] != SCHEMA
+        or value["result"] != "pass"
+        or value["repository"] != REPOSITORY
+        or value["revision"] != REVISION
+        or value["tokenizer_vocab_size"] != VOCAB_SIZE
+        or value["token_payload_bytes"] != TOKEN_PAYLOAD_BYTES
+    ):
+        raise CalibrationPackError("calibration pack receipt pin or geometry differs")
+    for field in (
+        "source_identity_receipt_id", "tokenizer_digest", "pack_id",
+        "token_payload_sha256",
+    ):
+        _sha256_text(value[field], f"receipt.{field}", prefixed=True)
+    _sha256_text(value["source_model_id"], "receipt.source_model_id")
+    if value["source_model_id"] != OFFICIAL_IDENTITY_MODULE["SOURCE_MODEL_ID"]:
+        raise CalibrationPackError("calibration receipt source-model identity differs")
+    calibration = value["calibration"]
+    calibration_fields = {
+        "sampling_seed", "sequence_count", "tokens_per_sequence", "token_count",
+        "ordered_members_sha256", "ordered_token_sha256",
+        "sequence_provenance_sha256", "dataset_counts", "dataset_revisions",
+    }
+    if not isinstance(calibration, dict) or set(calibration) != calibration_fields:
+        raise CalibrationPackError("calibration receipt fields differ")
+    if (
+        type(calibration["sampling_seed"]) is not int
+        or calibration["sampling_seed"] < 0
+        or calibration["sequence_count"] != SEQUENCES_PER_PARTITION
+        or calibration["tokens_per_sequence"] != TOKENS_PER_SEQUENCE
+        or calibration["token_count"] != SEQUENCES_PER_PARTITION * TOKENS_PER_SEQUENCE
+        or type(calibration["token_count"]) is not int
+    ):
+        raise CalibrationPackError("calibration receipt window geometry differs")
+    for field in (
+        "ordered_members_sha256", "ordered_token_sha256", "sequence_provenance_sha256",
+    ):
+        _sha256_text(calibration[field], f"calibration.{field}", prefixed=True)
+    expected_counts = {name: dataset["sequences"] for name, dataset in DATASETS.items()}
+    expected_revisions = {name: dataset["revision"] for name, dataset in DATASETS.items()}
+    if (
+        calibration["dataset_counts"] != expected_counts
+        or calibration["dataset_revisions"] != expected_revisions
+    ):
+        raise CalibrationPackError("calibration receipt dataset provenance differs")
+    return value
+
+
 def _write_new(path: Path, value: dict[str, Any]) -> None:
     if path.parent.is_symlink() or not path.parent.is_dir():
         raise CalibrationPackError("receipt parent must be an ordinary existing directory")
@@ -462,9 +529,14 @@ def _write_new(path: Path, value: dict[str, Any]) -> None:
             stream.write(encoded + b"\n")
             stream.flush()
             os.fsync(stream.fileno())
+        if validate_receipt(path) != value:
+            raise CalibrationPackError("durable calibration receipt changed after publication")
     except OSError as error:
         path.unlink(missing_ok=True)
         raise CalibrationPackError("cannot durably write calibration pack receipt") from error
+    except CalibrationPackError:
+        path.unlink(missing_ok=True)
+        raise
     if os.name == "posix":
         try:
             directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))

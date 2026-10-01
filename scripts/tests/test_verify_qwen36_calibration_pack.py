@@ -106,7 +106,9 @@ class QwenCalibrationPackTests(unittest.TestCase):
                 "revision": MODULE.REVISION,
                 "result": "pass",
                 "receipt_id": "sha256:" + "1" * 64,
-                "source_model_id": "2" * 64,
+                "source_model_id": MODULE.OFFICIAL_IDENTITY_MODULE[
+                    "SOURCE_MODEL_ID"
+                ],
                 "files": files,
             }
             payload = (1).to_bytes(4, "little") + (2).to_bytes(4, "little")
@@ -180,6 +182,25 @@ class QwenCalibrationPackTests(unittest.TestCase):
                 receipt["calibration"]["ordered_token_sha256"],
                 "sha256:" + hashlib.sha256(payload).hexdigest(),
             )
+            receipt_path = root / "pack-receipt.json"
+            receipt_path.write_bytes(MODULE.canonical(receipt))
+            with patch.multiple(
+                MODULE,
+                SEQUENCES_PER_PARTITION=1,
+                TOKENS_PER_SEQUENCE=2,
+                TOKEN_PAYLOAD_BYTES=8,
+                DATASETS=dataset_layout,
+            ):
+                self.assertEqual(
+                    MODULE.validate_receipt(receipt_path)["receipt_id"],
+                    receipt["receipt_id"],
+                )
+                receipt["pack_id"] = "sha256:" + "4" * 64
+                receipt_path.write_bytes(MODULE.canonical(receipt))
+                with self.assertRaisesRegex(
+                    MODULE.CalibrationPackError, "receipt ID"
+                ):
+                    MODULE.validate_receipt(receipt_path)
 
 
 if __name__ == "__main__":
