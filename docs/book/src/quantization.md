@@ -196,9 +196,10 @@ The driver strictly resumes capture, additive PTQ fitting, allocation, native
 SALT V2 packaging, and causal evaluation. It admits only the campaign-frozen
 model/token prefix and emits qualifier-compatible receipts. A completed smoke
 proves workflow integrity and physical package production, not 1.7B recipe
-quality or Stage-7 qualification. SmolLM matrices requiring G64 use explicit
-SALT V2 package-version 2 scale geometry; G128-only packages remain canonical
-version 1.
+quality or Stage-7 qualification. SmolLM matrices requiring G64 or G256 use
+explicit SALT V2 package-version 2 scale geometry; G128-only packages remain
+canonical version 1. In version 2, geometry tags `0`, `1`, and `2` mean G128,
+G64, and G256 respectively; unknown tags are rejected.
 
 ## Stage-7 full recipe freeze
 
