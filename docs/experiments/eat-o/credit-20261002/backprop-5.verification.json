@@ -1,0 +1,16 @@
+{
+  "arithmetic_and_report": "PASS",
+  "quality": "UNKNOWN",
+  "examples": 4000,
+  "loss_sum": 172089210,
+  "correct": 3050,
+  "report_sha256": "991b03243dd6f0a61ae80c8f080af6683cb4083733c0801184e29f9d0476c4d6",
+  "checkpoint_sha256": "00f9002036abbab168afc74bb0b060cd1fdf1cef340e86324f836c730be500e0",
+  "binary_sha256": "7380ed8d7dc156fa40033afd7e0a96e04655b285f405eaf70c84cb7aa6e0ed02",
+  "final_banks": {
+    "0": 0,
+    "8": 792,
+    "16": 2,
+    "24": 0
+  }
+}

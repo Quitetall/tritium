@@ -22,6 +22,12 @@ pub(crate) struct Activation {
     pub(crate) hidden: Vec<i64>,
     pub(crate) output: Vec<i64>,
 }
+// Transient per-example sums, never optimizer history or checkpoint state.
+#[derive(Clone, Debug)]
+pub(crate) struct RawSums {
+    hidden: Vec<i64>,
+    output: Vec<i64>,
+}
 impl Model {
     pub(crate) fn new(inputs: usize, hidden: usize, outputs: usize, rng: &mut Rng) -> Self {
         Self {
@@ -80,6 +86,128 @@ impl Model {
             hidden,
             output,
         }
+    }
+    pub(crate) fn forward_raw(&self, x: &Example) -> (Activation, RawSums) {
+        let hidden_raw: Vec<i64> = self.trits[..self.inputs * self.hidden]
+            .chunks_exact(self.inputs)
+            .map(|row| {
+                row.iter()
+                    .zip(&x.pixels)
+                    .map(|(&w, &v)| i64::from(w) * i64::from(v))
+                    .sum()
+            })
+            .collect();
+        let hidden: Vec<i64> = hidden_raw
+            .iter()
+            .map(|v| (v / (1_i64 << self.input_shift)).max(0))
+            .collect();
+        let output_raw: Vec<i64> = self.trits[self.inputs * self.hidden..]
+            .chunks_exact(self.hidden)
+            .map(|row| {
+                row.iter()
+                    .zip(&hidden)
+                    .map(|(&w, &v)| i64::from(w) * v)
+                    .sum()
+            })
+            .collect();
+        let output = output_raw
+            .iter()
+            .map(|v| v / (1_i64 << self.output_shift))
+            .collect();
+        (
+            Activation {
+                version: self.version,
+                hidden,
+                output,
+            },
+            RawSums {
+                hidden: hidden_raw,
+                output: output_raw,
+            },
+        )
+    }
+    pub(crate) fn raw_work(&self, index: usize) -> u64 {
+        if index < self.inputs * self.hidden {
+            1 + self.outputs as u64
+        } else {
+            1
+        }
+    }
+    fn raw_hidden_delta(
+        &self,
+        x: &Example,
+        a: &Activation,
+        raw: &RawSums,
+        index: usize,
+        dir: i8,
+    ) -> i64 {
+        let row = index / self.inputs;
+        ((raw.hidden[row] + i64::from(dir) * i64::from(x.pixels[index % self.inputs]))
+            / (1_i64 << self.input_shift))
+            .max(0)
+            - a.hidden[row]
+    }
+    pub(crate) fn raw_improvement(
+        &self,
+        x: &Example,
+        a: &Activation,
+        raw: &RawSums,
+        index: usize,
+        dir: i8,
+    ) -> i128 {
+        assert_eq!(a.version, self.version, "stale activation");
+        assert!((-1..=1).contains(&(self.trits[index] + dir)));
+        let split = self.inputs * self.hidden;
+        let dh = if index < split {
+            self.raw_hidden_delta(x, a, raw, index, dir)
+        } else {
+            0
+        };
+        let rows = if index < split {
+            0..self.outputs
+        } else {
+            let row = (index - split) / self.hidden;
+            row..row + 1
+        };
+        rows.map(|row| {
+            let delta = if index < split {
+                i64::from(self.trits[split + row * self.hidden + index / self.inputs]) * dh
+            } else {
+                i64::from(dir) * a.hidden[(index - split) % self.hidden]
+            };
+            let dz = (raw.output[row] + delta) / (1_i64 << self.output_shift) - a.output[row];
+            let error = i128::from(a.output[row]) - if row == x.label { 256 } else { 0 };
+            -2 * error * i128::from(dz) - i128::from(dz) * i128::from(dz)
+        })
+        .sum()
+    }
+    // Call against the old model, then commit the trit/version change immediately.
+    pub(crate) fn apply_raw(
+        &self,
+        x: &Example,
+        a: &mut Activation,
+        raw: &mut RawSums,
+        index: usize,
+        dir: i8,
+    ) {
+        assert_eq!(a.version, self.version, "stale activation");
+        assert!((-1..=1).contains(&(self.trits[index] + dir)));
+        let split = self.inputs * self.hidden;
+        if index < split {
+            let row = index / self.inputs;
+            let dh = self.raw_hidden_delta(x, a, raw, index, dir);
+            raw.hidden[row] += i64::from(dir) * i64::from(x.pixels[index % self.inputs]);
+            a.hidden[row] += dh;
+            for k in 0..self.outputs {
+                raw.output[k] += i64::from(self.trits[split + k * self.hidden + row]) * dh;
+                a.output[k] = raw.output[k] / (1_i64 << self.output_shift);
+            }
+        } else {
+            let row = (index - split) / self.hidden;
+            raw.output[row] += i64::from(dir) * a.hidden[(index - split) % self.hidden];
+            a.output[row] = raw.output[row] / (1_i64 << self.output_shift);
+        }
+        a.version += 1;
     }
     pub(crate) fn loss_from(&self, x: &Example, a: &Activation) -> i128 {
         assert_eq!(a.version, self.version, "stale activation");
@@ -145,6 +273,65 @@ impl Model {
         let after: i128 = examples.iter().map(|x| self.loss(x)).sum();
         self.trits[index] = old;
         before - after
+    }
+
+    // Exact finite-change loss from a current activation. Recompute raw sums:
+    // rounded activations do not retain the division remainder or negative ReLU input.
+    pub(crate) fn candidate_work(&self, index: usize) -> u64 {
+        if index < self.inputs * self.hidden {
+            (self.inputs + self.hidden * self.outputs) as u64
+        } else {
+            self.hidden as u64
+        }
+    }
+    pub(crate) fn cached_improvement(
+        &self,
+        x: &Example,
+        a: &Activation,
+        index: usize,
+        direction: i8,
+    ) -> i128 {
+        assert_eq!(a.version, self.version, "stale activation");
+        assert!((-1..=1).contains(&(self.trits[index] + direction)));
+        let split = self.inputs * self.hidden;
+        let mut benefit = 0;
+        let (changed_hidden, hidden_delta) = if index < split {
+            let row = index / self.inputs;
+            let sum: i64 = self.trits[row * self.inputs..(row + 1) * self.inputs]
+                .iter()
+                .zip(&x.pixels)
+                .map(|(&w, &v)| i64::from(w) * i64::from(v))
+                .sum();
+            let next = ((sum + i64::from(direction) * i64::from(x.pixels[index % self.inputs]))
+                / (1_i64 << self.input_shift))
+                .max(0);
+            (row, next - a.hidden[row])
+        } else {
+            (0, 0)
+        };
+        let rows = if index < split {
+            0..self.outputs
+        } else {
+            let row = (index - split) / self.hidden;
+            row..row + 1
+        };
+        for row in rows {
+            let sum: i64 = self.trits[split + row * self.hidden..split + (row + 1) * self.hidden]
+                .iter()
+                .zip(&a.hidden)
+                .map(|(&w, &h)| i64::from(w) * h)
+                .sum();
+            let delta = if index < split {
+                i64::from(self.trits[split + row * self.hidden + changed_hidden]) * hidden_delta
+            } else {
+                i64::from(direction) * a.hidden[(index - split) % self.hidden]
+            };
+            let target = if row == x.label { 256 } else { 0 };
+            let before = i128::from(a.output[row]) - target;
+            let after = i128::from((sum + delta) / (1_i64 << self.output_shift)) - target;
+            benefit += before * before - after * after;
+        }
+        benefit
     }
 }
 
@@ -233,5 +420,57 @@ mod tests {
         let a = m.forward(&x);
         m.version += 1;
         m.loss_from(&x, &a);
+    }
+
+    #[test]
+    fn raw_cache_matches_sequential_full_recomputation() {
+        let mut rng = Rng(814);
+        for trial in 0..40 {
+            let mut m = Model::new(7, 5, 3, &mut rng);
+            m.input_shift = (trial % 9) as u8;
+            m.output_shift = (trial % 5) as u8;
+            let x = Example {
+                pixels: (0..7).map(|_| rng.below(256) as u8).collect(),
+                label: trial % 3,
+            };
+            let (mut a, mut raw) = m.forward_raw(&x);
+            assert_eq!(a, m.forward(&x));
+            for _ in 0..100 {
+                let i = rng.below(m.trits.len() as u64) as usize;
+                let dir = if m.trits[i] == 1 { -1 } else { 1 };
+                assert_eq!(
+                    m.raw_improvement(&x, &a, &raw, i, dir),
+                    m.improvement(std::slice::from_ref(&x), i, dir)
+                );
+                m.apply_raw(&x, &mut a, &mut raw, i, dir);
+                m.trits[i] += dir;
+                m.version += 1;
+                assert_eq!(a, m.forward(&x));
+            }
+        }
+    }
+    #[test]
+    fn cached_candidates_match_full_recomputation_with_rounding() {
+        let mut rng = Rng(193);
+        for trial in 0..80 {
+            let mut m = Model::new(7, 5, 3, &mut rng);
+            m.input_shift = (trial % 9) as u8;
+            m.output_shift = (trial % 5) as u8;
+            let x = Example {
+                pixels: (0..7).map(|_| rng.below(256) as u8).collect(),
+                label: trial % 3,
+            };
+            let a = m.forward(&x);
+            for i in 0..m.trits.len() {
+                for dir in [-1, 1] {
+                    if (-1..=1).contains(&(m.trits[i] + dir)) {
+                        assert_eq!(
+                            m.cached_improvement(&x, &a, i, dir),
+                            m.improvement(std::slice::from_ref(&x), i, dir)
+                        );
+                    }
+                }
+            }
+        }
     }
 }
