@@ -114,5 +114,10 @@ name = "seal_cuda_training_receipts"
 path = "examples/seal_cuda_training_receipts.rs"
 required-features = ["cuda"]
 
+[[example]]
+name = "stage7_native_matrix"
+path = "examples/stage7_native_matrix.rs"
+required-features = ["cuda"]
+
 [lints]
 workspace = true
