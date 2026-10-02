@@ -13,8 +13,9 @@ use tritium_format::salt_v2_master::{
 };
 use tritium_format::salt_v2_package::{
     SALT_V2_ALLOCATION_TILE_SIZE, SALT_V2_PACKAGE_ALIGNMENT, SALT_V2_SCALE_GROUP_SIZE,
-    SaltV2IndexedRuntimeLedger, SaltV2Package, SaltV2PackageError, SaltV2Plane, SaltV2Tensor,
-    SaltV2Tile, write_salt_v2_package,
+    SALT_V2_SCALE_GROUP_SIZE_64, SALT_V2_SCALE_GROUP_SIZE_256, SaltV2IndexedRuntimeLedger,
+    SaltV2Package, SaltV2PackageError, SaltV2Plane, SaltV2Tensor, SaltV2Tile,
+    write_salt_v2_package,
 };
 use tritium_format::{ModelId, PackageId};
 
@@ -152,7 +153,7 @@ impl Default for PhysicalRateTarget {
 /// Experimental model-level SALT V2 fitting recipe.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SaltV2Config {
-    /// Coefficients sharing a deployment scale. The reference/package contract is G128.
+    /// Coefficients sharing a deployment scale. Supported values are 64, 128, and 256.
     pub group_size: usize,
     /// Minimum plane count. The package's mandatory prefix is one plane.
     pub min_planes: usize,
@@ -905,7 +906,7 @@ pub struct SaltV2ModelFitResult {
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum SaltV2Error {
-    /// The semantic package supports G128 only in this reference path.
+    /// The semantic package does not support the requested scale-group geometry.
     UnsupportedReferenceGroupSize {
         /// Rejected group size.
         got: usize,
@@ -1750,7 +1751,7 @@ pub fn fit_salt_v2_master(
     validate_config(config)?;
     validate_external_stages(config)?;
     let quantized_parameters = validate_model_input(&input.model, config)?;
-    validate_feedback_artifacts(&input)?;
+    validate_feedback_artifacts(&input, config.group_size)?;
 
     let mut work = Vec::new();
     let mut feedback_receipts = Vec::new();
@@ -1859,13 +1860,14 @@ pub fn allocate_and_pack_salt_v2_master_with_packing(
     let mut tile_candidates = Vec::new();
     for tensor_work in work {
         for tile in &tensor_work.tiles {
-            let per_plane = plane_physical_bytes(packing, tile.logical_len)?;
+            let per_plane = plane_physical_bytes(packing, tile.logical_len, config.group_size)?;
             for candidate in &tile.candidates {
                 tile_candidates.push(public_candidate_metrics(candidate, per_plane)?);
             }
         }
     }
-    let (serialized_fixed_bytes, resident_fixed_bytes) = fixed_package_bytes(work, packing)?;
+    let (serialized_fixed_bytes, resident_fixed_bytes) =
+        fixed_package_bytes(work, packing, config.group_size)?;
 
     let overhead_resident = physical
         .preserved_resident_bytes
@@ -1977,7 +1979,8 @@ pub fn allocate_and_pack_salt_v2_master_with_packing(
             if !(hessian_error.is_finite() && frobenius_error.is_finite()) {
                 return Err(SaltV2Error::AccountingOverflow);
             }
-            let per_plane = plane_physical_bytes(config.packing, tile.logical_len)?;
+            let per_plane =
+                plane_physical_bytes(config.packing, tile.logical_len, config.group_size)?;
             let cumulative = multiply_physical(per_plane, planes)?;
             predicted_raw_serialized = predicted_raw_serialized
                 .checked_add(cumulative.serialized)
@@ -1986,12 +1989,14 @@ pub fn allocate_and_pack_salt_v2_master_with_packing(
                 .checked_add(cumulative.resident)
                 .ok_or(SaltV2Error::AccountingOverflow)?;
         }
-        tensors.push(SaltV2Tensor::new(
+        tensors.push(SaltV2Tensor::new_with_layout(
             tensor_work.name.clone(),
             vec![
                 u64::try_from(tensor_work.rows).map_err(|_| SaltV2Error::AccountingOverflow)?,
                 u64::try_from(tensor_work.cols).map_err(|_| SaltV2Error::AccountingOverflow)?,
             ],
+            tritium_format::salt_v2_package::SaltV2Transform::None,
+            config.group_size,
             tiles,
         )?);
         tensor_receipts.push(SaltV2TensorFitReceipt {
@@ -2131,7 +2136,10 @@ pub fn allocate_and_pack_salt_v2_master_with_packing(
 }
 
 fn validate_config(config: &SaltV2Config) -> Result<(), SaltV2Error> {
-    if config.group_size != SALT_V2_SCALE_GROUP_SIZE {
+    if !matches!(
+        config.group_size,
+        SALT_V2_SCALE_GROUP_SIZE_64 | SALT_V2_SCALE_GROUP_SIZE | SALT_V2_SCALE_GROUP_SIZE_256
+    ) {
         return Err(SaltV2Error::UnsupportedReferenceGroupSize {
             got: config.group_size,
         });
@@ -2293,11 +2301,14 @@ fn validate_tensor_input(
             got: tensor.curvature.kind,
         });
     }
-    validate_curvature_geometry(tensor_index, tensor)?;
+    validate_curvature_geometry(tensor_index, tensor, config.group_size)?;
     Ok(expected)
 }
 
-fn validate_feedback_artifacts(input: &SaltV2MasterFitInput<'_>) -> Result<(), SaltV2Error> {
+fn validate_feedback_artifacts(
+    input: &SaltV2MasterFitInput<'_>,
+    group_size: usize,
+) -> Result<(), SaltV2Error> {
     if input.feedback.len() != input.model.tensors.len() {
         return Err(SaltV2Error::FeedbackArtifactCountMismatch {
             expected: input.model.tensors.len(),
@@ -2330,11 +2341,10 @@ fn validate_feedback_artifacts(input: &SaltV2MasterFitInput<'_>) -> Result<(), S
                 tensor: tensor_index,
             });
         }
-        let aligned_partition = tensor.cols.is_multiple_of(SALT_V2_SCALE_GROUP_SIZE)
+        let aligned_partition = tensor.cols.is_multiple_of(group_size)
             && !feedback.groups().is_empty()
             && feedback.groups().iter().all(|group| {
-                group.start.is_multiple_of(SALT_V2_SCALE_GROUP_SIZE)
-                    && group.end.is_multiple_of(SALT_V2_SCALE_GROUP_SIZE)
+                group.start.is_multiple_of(group_size) && group.end.is_multiple_of(group_size)
             });
         if !aligned_partition {
             return Err(SaltV2Error::FeedbackScaleGeometry {
@@ -2351,6 +2361,7 @@ fn validate_feedback_artifacts(input: &SaltV2MasterFitInput<'_>) -> Result<(), S
 fn validate_curvature_geometry(
     tensor_index: usize,
     tensor: &SaltV2TensorFitInput<'_>,
+    group_size: usize,
 ) -> Result<(), SaltV2Error> {
     match tensor.curvature.values {
         CurvatureValues::Diagonal(diagonal) => {
@@ -2365,7 +2376,7 @@ fn validate_curvature_geometry(
             }
         }
         CurvatureValues::DenseGroups(groups) => {
-            let expected_groups = tensor.weights.len().div_ceil(SALT_V2_SCALE_GROUP_SIZE);
+            let expected_groups = tensor.weights.len().div_ceil(group_size);
             if groups.len() != expected_groups {
                 return Err(SaltV2Error::CurvatureGeometry {
                     tensor: tensor_index,
@@ -2373,9 +2384,9 @@ fn validate_curvature_geometry(
             }
             for (group_index, group) in groups.iter().enumerate() {
                 let start = group_index
-                    .checked_mul(SALT_V2_SCALE_GROUP_SIZE)
+                    .checked_mul(group_size)
                     .ok_or(SaltV2Error::AccountingOverflow)?;
-                let expected = (tensor.weights.len() - start).min(SALT_V2_SCALE_GROUP_SIZE);
+                let expected = (tensor.weights.len() - start).min(group_size);
                 if group.dimension() != expected {
                     return Err(SaltV2Error::CurvatureGeometry {
                         tensor: tensor_index,
@@ -2384,14 +2395,14 @@ fn validate_curvature_geometry(
             }
         }
         CurvatureValues::Kronecker(factors) => {
-            let groups_per_row = tensor.cols / SALT_V2_SCALE_GROUP_SIZE;
-            let valid = tensor.cols.is_multiple_of(SALT_V2_SCALE_GROUP_SIZE)
+            let groups_per_row = tensor.cols / group_size;
+            let valid = tensor.cols.is_multiple_of(group_size)
                 && groups_per_row > 0
                 && factors.input_groups.len() == groups_per_row
                 && factors
                     .input_groups
                     .iter()
-                    .all(|group| group.dimension() == SALT_V2_SCALE_GROUP_SIZE)
+                    .all(|group| group.dimension() == group_size)
                 && factors.output_weights.len() == tensor.rows
                 && factors
                     .output_weights
@@ -2416,6 +2427,7 @@ fn validate_curvature_geometry(
 fn fixed_package_bytes(
     work: &[TensorFitWork],
     packing: SaltV2Packing,
+    group_size: usize,
 ) -> Result<(u64, u64), SaltV2Error> {
     let codec = packing.codec();
     let mut tensors = Vec::with_capacity(work.len());
@@ -2428,7 +2440,7 @@ fn fixed_package_bytes(
                 .candidates
                 .first()
                 .ok_or(SaltV2Error::PhysicalAccountingMismatch)?;
-            let per_plane = plane_physical_bytes(packing, tile.logical_len)?;
+            let per_plane = plane_physical_bytes(packing, tile.logical_len, group_size)?;
             base_plane_serialized_bytes = base_plane_serialized_bytes
                 .checked_add(per_plane.serialized)
                 .ok_or(SaltV2Error::AccountingOverflow)?;
@@ -2437,12 +2449,14 @@ fn fixed_package_bytes(
                 .ok_or(SaltV2Error::AccountingOverflow)?;
             tiles.push(base.tile.clone());
         }
-        tensors.push(SaltV2Tensor::new(
+        tensors.push(SaltV2Tensor::new_with_layout(
             tensor.name.clone(),
             vec![
                 u64::try_from(tensor.rows).map_err(|_| SaltV2Error::AccountingOverflow)?,
                 u64::try_from(tensor.cols).map_err(|_| SaltV2Error::AccountingOverflow)?,
             ],
+            tritium_format::salt_v2_package::SaltV2Transform::None,
+            group_size,
             tiles,
         )?);
     }
@@ -2471,8 +2485,8 @@ struct MasterTensorPlanes {
 }
 
 impl MasterTensorPlanes {
-    fn new(coefficient_count: usize) -> Self {
-        let scale_count = coefficient_count / SALT_V2_SCALE_GROUP_SIZE;
+    fn new(coefficient_count: usize, group_size: usize) -> Self {
+        let scale_count = coefficient_count / group_size;
         Self {
             trits: (0..3).map(|_| vec![0; coefficient_count]).collect(),
             scales: (0..3)
@@ -2531,12 +2545,12 @@ fn fit_tensor_candidates_with_feedback(
     })
     .map_err(|error| map_feedback_run_error(tensor_index, error))?;
 
-    let mut master_planes = MasterTensorPlanes::new(tensor.weights.len());
+    let mut master_planes = MasterTensorPlanes::new(tensor.weights.len(), config.group_size);
     let mut final_records = Vec::with_capacity(feedback.groups().len());
     state
         .refit_suffix(0, |request| {
             let fitted = fit_feedback_group(tensor_index, tensor, config, request, false)?;
-            install_feedback_group(&mut master_planes, &fitted)?;
+            install_feedback_group(&mut master_planes, &fitted, config.group_size)?;
             final_records.push(feedback_pass_record(request, &fitted.reconstruction));
             Ok::<_, SaltV2Error>(fitted.reconstruction)
         })
@@ -2640,15 +2654,16 @@ fn fit_feedback_group(
     // prefix losses written from this same loop carry that error into the allocator's ranking.
     const FULL_PLANES: usize = 3;
     let mut reconstruction = vec![0.0; request.working_weights.len()];
-    let groups_per_row = request.columns / SALT_V2_SCALE_GROUP_SIZE;
+    let group_size = config.group_size;
+    let groups_per_row = request.columns / group_size;
     let mut placements = Vec::with_capacity(request.rows * groups_per_row);
     for row in 0..request.rows {
         for local_group in 0..groups_per_row {
-            let local_start = local_group * SALT_V2_SCALE_GROUP_SIZE;
+            let local_start = local_group * group_size;
             let compact_start = row * request.columns + local_start;
-            let compact_end = compact_start + SALT_V2_SCALE_GROUP_SIZE;
+            let compact_end = compact_start + group_size;
             let global_start = row * tensor.cols + request.column_start + local_start;
-            let global_end = global_start + SALT_V2_SCALE_GROUP_SIZE;
+            let global_end = global_start + group_size;
             let working = request.working_weights[compact_start..compact_end]
                 .iter()
                 .map(|value| *value as f32)
@@ -2656,7 +2671,7 @@ fn fit_feedback_group(
             if working.iter().any(|value| !value.is_finite()) {
                 return Err(SaltV2Error::AccountingOverflow);
             }
-            let global_group = global_start / SALT_V2_SCALE_GROUP_SIZE;
+            let global_group = global_start / group_size;
             let tile_index = global_start / SALT_V2_ALLOCATION_TILE_SIZE;
             let resolved_metric = curvature_metric(
                 tensor_index,
@@ -2665,6 +2680,7 @@ fn fit_feedback_group(
                 global_start,
                 global_end,
                 global_group,
+                group_size,
             )?;
             let metric = resolved_metric.as_joint_metric();
             let fit_config = JointFitConfig {
@@ -2717,7 +2733,7 @@ fn fit_feedback_group(
                 })?;
                 (fitted.scales, fitted.trits, order)
             };
-            for local in 0..SALT_V2_SCALE_GROUP_SIZE {
+            for local in 0..group_size {
                 reconstruction[compact_start + local] = (0..FULL_PLANES)
                     .map(|plane| f64::from(scales[plane]) * f64::from(trits[plane][local]))
                     .sum();
@@ -2738,12 +2754,13 @@ fn fit_feedback_group(
 fn install_feedback_group(
     master: &mut MasterTensorPlanes,
     fitted: &FeedbackGroupFit,
+    group_size: usize,
 ) -> Result<(), SaltV2Error> {
     for placement in &fitted.placements {
-        let group = placement.global_start / SALT_V2_SCALE_GROUP_SIZE;
+        let group = placement.global_start / group_size;
         let end = placement
             .global_start
-            .checked_add(SALT_V2_SCALE_GROUP_SIZE)
+            .checked_add(group_size)
             .ok_or(SaltV2Error::AccountingOverflow)?;
         let populated = master
             .populated_groups
@@ -2806,13 +2823,14 @@ fn materialize_feedback_tile_frontier(
     master: &MasterTensorPlanes,
 ) -> Result<TileFitWork, SaltV2Error> {
     const FULL_PLANES: usize = 3;
-    let first_scale = tile_start / SALT_V2_SCALE_GROUP_SIZE;
-    let scale_end = tile_end.div_ceil(SALT_V2_SCALE_GROUP_SIZE);
+    let first_scale = tile_start / config.group_size;
+    let scale_end = tile_end.div_ceil(config.group_size);
     let semantic_planes = (0..FULL_PLANES)
         .map(|plane| {
-            SaltV2Plane::new(
+            SaltV2Plane::new_with_scale_group_size(
                 master.trits[plane][tile_start..tile_end].to_vec(),
                 master.scales[plane][first_scale..scale_end].to_vec(),
+                config.group_size,
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -2820,8 +2838,8 @@ fn materialize_feedback_tile_frontier(
     let mut frobenius_errors = [0.0; FULL_PLANES];
     let mut group_start = tile_start;
     while group_start < tile_end {
-        let group_end = (group_start + SALT_V2_SCALE_GROUP_SIZE).min(tile_end);
-        let group = group_start / SALT_V2_SCALE_GROUP_SIZE;
+        let group_end = (group_start + config.group_size).min(tile_end);
+        let group = group_start / config.group_size;
         let resolved_metric = curvature_metric(
             tensor_index,
             tensor.curvature,
@@ -2829,6 +2847,7 @@ fn materialize_feedback_tile_frontier(
             group_start,
             group_end,
             group,
+            config.group_size,
         )?;
         let metric = resolved_metric.as_joint_metric();
         let source = &tensor.weights[group_start..group_end];
@@ -2924,14 +2943,14 @@ fn fit_tile_frontier(
         .map(|_| Vec::with_capacity(tile_len))
         .collect::<Vec<_>>();
     let mut plane_scales = (0..FULL_PLANES)
-        .map(|_| Vec::with_capacity(tile_len.div_ceil(SALT_V2_SCALE_GROUP_SIZE)))
+        .map(|_| Vec::with_capacity(tile_len.div_ceil(config.group_size)))
         .collect::<Vec<_>>();
     let mut hessian_errors = [0.0f64; FULL_PLANES];
     let mut frobenius_errors = [0.0f64; FULL_PLANES];
     let mut group_start = tile_start;
     while group_start < tile_end {
-        let group_end = (group_start + SALT_V2_SCALE_GROUP_SIZE).min(tile_end);
-        let group_index = group_start / SALT_V2_SCALE_GROUP_SIZE;
+        let group_end = (group_start + config.group_size).min(tile_end);
+        let group_index = group_start / config.group_size;
         let resolved_metric = curvature_metric(
             tensor_index,
             tensor.curvature,
@@ -2939,6 +2958,7 @@ fn fit_tile_frontier(
             group_start,
             group_end,
             group_index,
+            config.group_size,
         )?;
         let metric = resolved_metric.as_joint_metric();
         let weights = &tensor.weights[group_start..group_end];
@@ -3031,7 +3051,9 @@ fn fit_tile_frontier(
     let semantic_planes = plane_trits
         .into_iter()
         .zip(plane_scales)
-        .map(|(trits, scales)| SaltV2Plane::new(trits, scales))
+        .map(|(trits, scales)| {
+            SaltV2Plane::new_with_scale_group_size(trits, scales, config.group_size)
+        })
         .collect::<Result<Vec<_>, _>>()?;
     finish_tile_fit_work(
         tensor_index,
@@ -3867,6 +3889,7 @@ fn curvature_metric<'a>(
     start: usize,
     end: usize,
     group_index: usize,
+    group_size: usize,
 ) -> Result<ResolvedCurvatureMetric<'a>, SaltV2Error> {
     match artifact.values {
         CurvatureValues::Diagonal(diagonal) => Ok(ResolvedCurvatureMetric::Borrowed(
@@ -3876,7 +3899,7 @@ fn curvature_metric<'a>(
             JointFitMetric::Dense(&groups[group_index]),
         )),
         CurvatureValues::Kronecker(factors) => {
-            let groups_per_row = columns / SALT_V2_SCALE_GROUP_SIZE;
+            let groups_per_row = columns / group_size;
             let output_row = group_index / groups_per_row;
             let input_group = group_index % groups_per_row;
             let input = &factors.input_groups[input_group];
@@ -3901,6 +3924,7 @@ fn curvature_metric<'a>(
 fn plane_physical_bytes(
     packing: SaltV2Packing,
     logical_len: usize,
+    group_size: usize,
 ) -> Result<PhysicalBytes, SaltV2Error> {
     let codec_len = if packing == SaltV2Packing::S34 {
         logical_len
@@ -3912,7 +3936,7 @@ fn plane_physical_bytes(
     };
     let payload = packing.codec().ledger(codec_len)?.physical_bytes;
     let scales = logical_len
-        .div_ceil(SALT_V2_SCALE_GROUP_SIZE)
+        .div_ceil(group_size)
         .checked_mul(2)
         .ok_or(SaltV2Error::AccountingOverflow)?;
     let total = payload
@@ -3960,7 +3984,8 @@ fn allocator_candidates(
     for tensor in work {
         for tile in &tensor.tiles {
             let candidates = &tile.candidates;
-            let per_plane = plane_physical_bytes(config.packing, tile.logical_len)?;
+            let per_plane =
+                plane_physical_bytes(config.packing, tile.logical_len, config.group_size)?;
             let mut allocator = Vec::with_capacity(3);
             for plane_index in 0..3 {
                 if let Some(candidate) = candidates.get(plane_index) {
@@ -5233,12 +5258,31 @@ mod tests {
         let weights = weights(1);
         let diagonal = vec![1.0; weights.len()];
 
-        let mut malformed = config(10_000);
-        malformed.group_size = 64;
+        let mut unsupported_geometry = config(10_000);
+        unsupported_geometry.group_size = 32;
         assert!(matches!(
-            fit(&weights, &diagonal, &malformed),
-            Err(SaltV2Error::UnsupportedReferenceGroupSize { got: 64 })
+            fit(&weights, &diagonal, &unsupported_geometry),
+            Err(SaltV2Error::UnsupportedReferenceGroupSize { got: 32 })
         ));
+
+        for group_size in [64, 128, 256] {
+            let mut grouped = config(10_000);
+            grouped.group_size = group_size;
+            let fitted = fit(&weights, &diagonal, &grouped)
+                .unwrap_or_else(|error| panic!("G{group_size} fitting failed: {error}"));
+            let decoded =
+                tritium_format::salt_v2_package::read_salt_v2_package(&fitted.package_bytes)
+                    .expect("grouped package is readable");
+            assert!(
+                decoded
+                    .package
+                    .tensors()
+                    .iter()
+                    .flat_map(|tensor| tensor.tiles())
+                    .flat_map(|tile| tile.planes())
+                    .all(|plane| plane.scale_group_size() == group_size)
+            );
+        }
 
         let mut scale_only = config(10_000);
         scale_only.refinement = SaltV2Refinement::ScaleOnly { max_tokens: 8 };
