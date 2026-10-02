@@ -24,7 +24,7 @@
 //! (ScaleQ/AYOT): GPTQ calibrated on fp-sampled text instead of WikiText train, and H6's Kronecker
 //! GPTQ (λ_G = 0.5).
 //!
-//! # PARTIAL 2026-09-24 — T=3, 5 of 8 models (run stopped by host memory pressure)
+//! # Measured 2026-09-24/10-02 — T=3, all 8 models (two runs; T=2 not yet run)
 //!
 //! ```text
 //! model                    ppl      even   KL wiki   KL self      late   agree
@@ -33,17 +33,32 @@
 //! GPTQ wiki 16k         24.177  +0.06620   0.07490   0.08655  +0.05651    6.91
 //! Kronecker GPTQ 16k    24.027  +0.06220   0.07148   0.08107  +0.05125    7.78
 //! GPTQ wiki 2k          24.375  +0.07415   0.08208   0.08997  +0.06316    3.88
+//! GPTQ self-trace 16k   24.207  +0.06831   0.07437   0.07963  +0.05768    4.22
+//! RTN signs A (null)    24.570  +0.08234   0.09062   0.09643  +0.06942    3.72
+//! RTN signs B (null)    24.656  +0.08608   0.09281   0.09572  +0.07893    5.94
 //! control: folded fp rebuilt through runner_for agrees 64.00/64 tokens
 //!
-//! Kendall τ vs on-policy KL (KL self): even +1.00, KL wiki +1.00, ppl +0.60, agree +0.60, late +0.20
+//! metric     τ vs on-policy KL   null-pair gap / spread of the 6 methods
+//! KL wiki         +0.86                 0.15
+//! even            +0.79                 0.25
+//! ppl             +0.57                 0.25
+//! late            +0.43                 0.80
+//! agree           +0.36                 0.57
+//! KL self           —                   0.05
 //! ```
 //!
-//! On these five, the curvature (`even`) and full-distribution KL on WikiText rank exactly as the
-//! on-policy KL does; perplexity does not. The disagreement is RTN vs 2k-token GPTQ: ppl puts the
-//! GPTQ fit last, but its curvature, WikiText KL and on-policy KL are all BETTER than RTN's — RTN's
-//! error happens to be aligned with the eval text (odd −0.009 vs −0.002), and ppl rewards that.
-//! Greedy agreement (32 prompts, heavy-tailed) sides with ppl; `late` is the noisiest column.
-//! Kronecker GPTQ is best on every metric. Self-trace calibration and the null pair are not in yet.
+//! **Teacher-forced perplexity is the weakest of the cheap metrics.** Full-distribution KL to the fp
+//! model on the SAME WikiText windows tracks the on-policy KL best (τ +0.86) and the antithetic
+//! curvature next (+0.79); perplexity only +0.57. On-policy KL is also by far the least noisy: its
+//! null pair (two random sign gauges, equal in expectation) differs by 5% of the spread between real
+//! methods, against 25% for ppl. `late` and greedy `agree` are noise-dominated at this size.
+//!
+//! **Calibration domain decides the verdict.** GPTQ calibrated on fp-sampled text (ScaleQ/AYOT
+//! self-trace) has the BEST on-policy KL of every method (0.0796, ahead of Kronecker's 0.0811) but
+//! ranks behind WikiText-calibrated GPTQ and Kronecker on WikiText ppl and curvature: each
+//! calibration wins on the text it was calibrated on. Ppl on WikiText rewards domain match, not
+//! quantization quality. Kronecker GPTQ is best on every WikiText metric and second on-policy.
+//! Bounds: one model, T=3, PTQ-only, 8 models; τ over 8 items has wide intervals.
 //!
 //! ```text
 //! TRITIUM_CORPUS=$HOME/.cache/tritium-corpora/wikitext2_400k_32k.json \
