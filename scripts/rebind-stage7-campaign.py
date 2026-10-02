@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Rebind a pre-evidence Stage-7 campaign plan to clean repository HEAD.
+"""Rebind a Stage-7 campaign plan to clean repository HEAD.
 
-This tool changes only the campaign source revision and run identity. It does
-not copy, invent, or qualify measurements. Existing output is never replaced.
+With an empty prerequisite list, this creates the source-bound bootstrap plan
+used to produce the smoke/native/Gate-C receipts. With a populated list, all
+three receipts must already bind the target revision. The tool changes only
+campaign source revision and run identity; existing output is never replaced.
 """
 
 from __future__ import annotations
@@ -147,7 +149,14 @@ def _validate_prerequisites(
 ) -> None:
     _open_record(root, value["token_evidence_pack"], "campaign token evidence pack")
     evidence = value["evidence"]
-    if not isinstance(evidence, list) or len(evidence) != 3:
+    if not isinstance(evidence, list):
+        raise RebindError("campaign prerequisite evidence must be a list")
+    if evidence == []:
+        # A cleanly rebound empty inventory is the bootstrap plan used to
+        # produce source-bound smoke/native/Gate-C evidence. The terminal
+        # qualifier still requires all three receipts before it can run.
+        return
+    if len(evidence) != 3:
         raise RebindError("campaign prerequisite evidence inventory is incomplete")
     expected = ("smoke", "native-kernels", "hestia-gate-c")
     for ordinal, kind in enumerate(expected):

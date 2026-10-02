@@ -79,6 +79,28 @@ def test_rebind_updates_only_top_level_identity(tmp_path: Path, monkeypatch: pyt
     assert output.read_bytes() == MODULE.canonical(value) + b"\n"
 
 
+def test_rebind_bootstraps_empty_evidence_inventory_without_inventing_receipts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    template, source = setup(monkeypatch, tmp_path)
+    value = campaign()
+    token = b"tokens"
+    value["token_evidence_pack"] = {
+        "path": "token-evidence.json",
+        "bytes": len(token),
+        "sha256": hashlib.sha256(token).hexdigest(),
+    }
+    (tmp_path / "token-evidence.json").write_bytes(token)
+    write(template, value)
+
+    output = tmp_path / "out" / "campaign.json"
+    MODULE.rebind(template, source_root=source, run_id="bootstrap-run", output=output)
+    rebound = json.loads(output.read_text())
+    assert rebound["source_revision"] == "b" * 40
+    assert rebound["run_id"] == "bootstrap-run"
+    assert rebound["evidence"] == []
+
+
 def test_rebind_rejects_nested_stale_revision(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     template, source = setup(monkeypatch, tmp_path)
     value = campaign()
@@ -90,15 +112,10 @@ def test_rebind_rejects_nested_stale_revision(tmp_path: Path, monkeypatch: pytes
 
 def test_rebind_rejects_incomplete_prerequisites(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     template, source = setup(monkeypatch, tmp_path)
-    value = campaign()
-    token = b"tokens"
-    value["token_evidence_pack"] = {
-        "path": "token-evidence.json",
-        "bytes": len(token),
-        "sha256": hashlib.sha256(token).hexdigest(),
-    }
+    value = json.loads(template.read_text())
+    value["evidence"] = value["evidence"][:1]
     write(template, value)
-    with pytest.raises(MODULE.RebindError, match="inventory"):
+    with pytest.raises(MODULE.RebindError, match="incomplete"):
         MODULE.rebind(template, source_root=source, run_id="new-run", output=tmp_path / "out.json")
 
 
