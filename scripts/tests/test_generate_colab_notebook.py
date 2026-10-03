@@ -1,4 +1,7 @@
 import importlib.util
+import subprocess
+import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -34,6 +37,22 @@ class GenerateColabNotebookTests(unittest.TestCase):
         self.assertIn('else "cpu"', source)
         self.assertNotIn("/home/", source)
         self.assertNotIn("drive.mount", source)
+
+    def test_check_mode_reports_missing_and_stale_notebooks_without_tracebacks(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "tutorial.ipynb"
+            command = [sys.executable, str(SCRIPT), "--output", str(output), "--check"]
+
+            missing = subprocess.run(command, capture_output=True, text=True, check=False)
+            self.assertEqual(missing.returncode, 2)
+            self.assertIn("is stale; regenerate it", missing.stderr)
+            self.assertNotIn("Traceback", missing.stderr)
+
+            output.write_text("{}\n", encoding="utf-8")
+            stale = subprocess.run(command, capture_output=True, text=True, check=False)
+            self.assertEqual(stale.returncode, 2)
+            self.assertIn("is stale; regenerate it", stale.stderr)
+            self.assertNotIn("Traceback", stale.stderr)
 
 
 if __name__ == "__main__":

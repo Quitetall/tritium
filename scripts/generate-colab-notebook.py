@@ -162,7 +162,11 @@ def main() -> int:
     args = parser.parse_args()
     value = rendered()
     if args.check:
-        if args.output.read_text(encoding="utf-8") != value:
+        try:
+            current = args.output.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            current = None
+        if current != value:
             parser.error(f"{args.output} is stale; regenerate it")
         return 0
     args.output.parent.mkdir(parents=True, exist_ok=True)
