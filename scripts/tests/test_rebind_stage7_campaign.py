@@ -246,3 +246,31 @@ def test_rebind_file_reader_rejects_mutation_during_read(
     monkeypatch.setattr(MODULE.os, "read", mutate_after_chunk)
     with pytest.raises(MODULE.RebindError, match="changed while reading"):
         MODULE._read_regular_file(path, "receipt", MODULE.MAX_JSON_BYTES)
+
+
+def test_rebind_file_reader_rejects_parent_replacement_during_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    parent = tmp_path / "evidence"
+    parent.mkdir()
+    path = parent / "receipt.json"
+    path.write_bytes(b"a" * (256 * 1024))
+    replacement = tmp_path / "replacement"
+    replacement.mkdir()
+    (replacement / "receipt.json").write_bytes(b"b" * (256 * 1024))
+
+    original_read = MODULE.os.read
+    replaced = False
+
+    def replace_parent_after_chunk(descriptor: int, count: int) -> bytes:
+        nonlocal replaced
+        chunk = original_read(descriptor, count)
+        if not replaced:
+            replaced = True
+            parent.rename(tmp_path / "evidence-original")
+            parent.symlink_to(replacement, target_is_directory=True)
+        return chunk
+
+    monkeypatch.setattr(MODULE.os, "read", replace_parent_after_chunk)
+    with pytest.raises(MODULE.RebindError, match="changed while reading"):
+        MODULE._read_regular_file(path, "receipt", MODULE.MAX_JSON_BYTES)
