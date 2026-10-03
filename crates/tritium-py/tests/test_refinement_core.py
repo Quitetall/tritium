@@ -66,6 +66,31 @@ def test_refinement_rejects_workspace_smaller_than_one_output_row():
         )
 
 
+def test_input_validation_keeps_finite_masks_within_workspace_budget(monkeypatch):
+    master = torch.randn(37, 128)
+    parent = _planes(master, count=1)
+    observed_mask_bytes = []
+    original_isfinite = torch.isfinite
+
+    def tracked_isfinite(value):
+        mask = original_isfinite(value)
+        observed_mask_bytes.append(mask.numel() * mask.element_size())
+        return mask
+
+    monkeypatch.setattr(torch, "isfinite", tracked_isfinite)
+    max_working_bytes = 4096
+    refine_weight_diagonal(
+        master,
+        parent,
+        torch.ones(128),
+        RefinementConfig.scale_only(),
+        max_working_bytes=max_working_bytes,
+    )
+
+    assert observed_mask_bytes
+    assert max(observed_mask_bytes) <= max_working_bytes
+
+
 def test_dense_hard_pv_alternates_assignments_and_scales_without_regression():
     torch.manual_seed(223)
     master = torch.randn(9, 16)
