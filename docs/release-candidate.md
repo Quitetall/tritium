@@ -339,6 +339,27 @@ to a candidate manifest, does not replace the hosted pinned-environment run,
 and does not close the release gate. Re-run and register against the final
 release candidate before making a release claim.
 
+### Exact pushed-head CUDA rerun (`08a52cba`)
+
+The receipt was rebuilt and rerun on the exact pushed PR head
+`08a52cba8b8104018cc427500f43b708ba829ae9`, eliminating the source-revision
+gap from the earlier `577bdb2e` run. The portable CUDA wheel passed all eight
+native CUDA dispatcher tests on the RTX 4090; both selected tail-path tests
+passed Compute Sanitizer 2026.3.0 with zero errors. The independently verified
+receipt is
+`sha256:49ea0d53fe3417bcaa93fc69af71a6183a9a035eae53ba9782d28b636dec10a9`.
+It binds wheel SHA-256
+`0556e947831803a67597e4718600655aa4e3c387812c06e631e80c86ecbccb9a`, CUDA
+13.0, driver 615.71.09, Torch 2.11.0+cu130, and the same RTX 4090 UUID. Raw
+outputs are retained under
+`release/v1.1/evidence/torch-dispatch-cuda-08a52cba/` in the local candidate
+workspace.
+
+The wheel was built in the pinned manylinux/Python 3.13 image, but qualification
+executed with the host's Python 3.14.7. The hosted Python 3.13 CUDA job remains
+skipped. This exact-source local receipt is not registered to a candidate
+manifest and does not close the release gate.
+
 ### Latest local verification (2026-09-18, `570a8802`)
 
 `scripts/verify-gates.sh release` completed with exit status 0 after the
