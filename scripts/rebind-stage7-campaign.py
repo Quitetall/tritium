@@ -14,6 +14,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import stat
 import subprocess
 import tempfile
 from typing import Any
@@ -40,6 +41,86 @@ class RebindError(ValueError):
     """Campaign cannot be safely rebound to current source HEAD."""
 
 
+def _read_regular_file(path: Path, label: str, max_bytes: int) -> bytes:
+    """Read one bounded regular file and reject path or content replacement."""
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+    )
+    file_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+
+    def open_parent() -> tuple[int, str]:
+        absolute = Path(os.path.abspath(path))
+        parts = absolute.parts
+        if not parts or parts[0] != os.sep or len(parts) < 2:
+            raise RebindError(f"{label} must be an ordinary file")
+        parent_fd = os.open(os.sep, directory_flags)
+        try:
+            for component in parts[1:-1]:
+                next_fd = os.open(component, directory_flags, dir_fd=parent_fd)
+                os.close(parent_fd)
+                parent_fd = next_fd
+            return parent_fd, parts[-1]
+        except OSError:
+            os.close(parent_fd)
+            raise
+
+    parent_fd: int | None = None
+    try:
+        parent_fd, filename = open_parent()
+        descriptor = os.open(filename, file_flags, dir_fd=parent_fd)
+    except OSError as error:
+        if parent_fd is not None:
+            os.close(parent_fd)
+        raise RebindError(f"{label} must be an ordinary file") from error
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise RebindError(f"{label} must be an ordinary file")
+        if before.st_size <= 0 or before.st_size > max_bytes:
+            raise RebindError(f"{label} exceeds size bounds")
+
+        chunks: list[bytes] = []
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(64 * 1024, remaining))
+            if not chunk:
+                raise RebindError(f"{label} changed while reading")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise RebindError(f"{label} changed while reading")
+
+        after = os.fstat(descriptor)
+        current_parent_fd, current_filename = open_parent()
+        try:
+            current_path = os.stat(
+                current_filename, dir_fd=current_parent_fd, follow_symlinks=False
+            )
+        finally:
+            os.close(current_parent_fd)
+        identity = lambda item: (
+            item.st_dev, item.st_ino, item.st_size, item.st_mtime_ns, item.st_ctime_ns
+        )
+        if (
+            not stat.S_ISREG(current_path.st_mode)
+            or identity(before) != identity(after)
+            or identity(before) != identity(current_path)
+        ):
+            raise RebindError(f"{label} changed while reading")
+        payload = b"".join(chunks)
+        if len(payload) != before.st_size:
+            raise RebindError(f"{label} changed while reading")
+        return payload
+    except OSError as error:
+        raise RebindError(f"{label} changed while reading") from error
+    finally:
+        os.close(descriptor)
+        os.close(parent_fd)
+
+
 def canonical(value: Any) -> bytes:
     return json.dumps(
         value, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":")
@@ -56,13 +137,9 @@ def _reject_duplicate_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 
 def _load(path: Path) -> dict[str, Any]:
-    if path.is_symlink() or not path.is_file():
-        raise RebindError("campaign template must be an ordinary file")
-    if path.stat().st_size <= 0 or path.stat().st_size > MAX_JSON_BYTES:
-        raise RebindError("campaign template exceeds size bounds")
     try:
         value = json.loads(
-            path.read_bytes(),
+            _read_regular_file(path, "campaign template", MAX_JSON_BYTES),
             object_pairs_hook=_reject_duplicate_pairs,
             parse_constant=lambda token: (_ for _ in ()).throw(
                 ValueError(f"invalid JSON constant {token}")
@@ -110,7 +187,7 @@ def _count(value: Any, needle: str) -> int:
     return int(value == needle)
 
 
-def _open_record(root: Path, record: Any, label: str) -> Path:
+def _open_record(root: Path, record: Any, label: str) -> bytes:
     if not isinstance(record, dict) or set(record) != FILE_FIELDS:
         raise RebindError(f"{label} file record fields differ")
     logical_text = record["path"]
@@ -138,14 +215,13 @@ def _open_record(root: Path, record: Any, label: str) -> Path:
         cursor /= part
         if cursor.is_symlink():
             raise RebindError(f"{label}.path traverses a symlink")
-    if not path.is_file() or path.is_symlink():
-        raise RebindError(f"{label}.path must name an ordinary file")
-    if path.stat().st_size != record["bytes"]:
+    payload = _read_regular_file(path, f"{label}.path", MAX_JSON_BYTES)
+    if len(payload) != record["bytes"]:
         raise RebindError(f"{label}.bytes differs from file")
-    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    digest = hashlib.sha256(payload).hexdigest()
     if digest != record["sha256"]:
         raise RebindError(f"{label}.sha256 differs from file")
-    return path
+    return payload
 
 
 def _receipt_record(root: Path, path: Path, kind: str) -> dict[str, Any]:
@@ -170,12 +246,7 @@ def _receipt_record(root: Path, path: Path, kind: str) -> dict[str, Any]:
         cursor /= part
         if cursor.is_symlink():
             raise RebindError(f"{kind} receipt path traverses a symlink")
-    if not candidate.is_file():
-        raise RebindError(f"{kind} receipt must be an ordinary file")
-    size = candidate.stat().st_size
-    if size <= 0 or size > MAX_JSON_BYTES:
-        raise RebindError(f"{kind} receipt exceeds size bounds")
-    payload = candidate.read_bytes()
+    payload = _read_regular_file(candidate, f"{kind} receipt", MAX_JSON_BYTES)
     return {
         "kind": kind,
         "path": logical.as_posix(),
@@ -198,14 +269,14 @@ def _validate_prerequisites(
             raise RebindError(f"evidence[{ordinal}] fields differ")
         if record["kind"] != kind:
             raise RebindError("campaign prerequisite evidence order differs")
-        receipt_path = _open_record(
+        receipt_payload = _open_record(
             root,
             {field: record[field] for field in FILE_FIELDS},
             f"evidence[{ordinal}]",
         )
         try:
             receipt = json.loads(
-                receipt_path.read_bytes(),
+                receipt_payload,
                 object_pairs_hook=_reject_duplicate_pairs,
                 parse_constant=lambda token: (_ for _ in ()).throw(
                     ValueError(f"invalid JSON constant {token}")

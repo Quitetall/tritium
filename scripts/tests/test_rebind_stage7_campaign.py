@@ -205,3 +205,44 @@ def test_rebind_rejects_dirty_source_and_existing_output(
     output.write_text("existing")
     with pytest.raises(MODULE.RebindError, match="replace"):
         MODULE.rebind(template, source_root=source, run_id="new-run", output=output)
+
+
+def test_rebind_file_reader_rejects_symlinks(tmp_path: Path):
+    target = tmp_path / "receipt.json"
+    target.write_text("{}")
+    link = tmp_path / "receipt-link.json"
+    link.symlink_to(target)
+
+    with pytest.raises(MODULE.RebindError, match="ordinary file"):
+        MODULE._read_regular_file(link, "receipt", MODULE.MAX_JSON_BYTES)
+
+    real_dir = tmp_path / "real-dir"
+    real_dir.mkdir()
+    (real_dir / "nested.json").write_text("{}")
+    linked_dir = tmp_path / "linked-dir"
+    linked_dir.symlink_to(real_dir, target_is_directory=True)
+    with pytest.raises(MODULE.RebindError, match="ordinary file"):
+        MODULE._read_regular_file(
+            linked_dir / "nested.json", "receipt", MODULE.MAX_JSON_BYTES
+        )
+
+
+def test_rebind_file_reader_rejects_mutation_during_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    path = tmp_path / "receipt.json"
+    path.write_bytes(b"a" * (256 * 1024))
+    original_read = MODULE.os.read
+    mutated = False
+
+    def mutate_after_chunk(descriptor: int, count: int) -> bytes:
+        nonlocal mutated
+        chunk = original_read(descriptor, count)
+        if not mutated:
+            mutated = True
+            path.write_bytes(b"b" * (256 * 1024))
+        return chunk
+
+    monkeypatch.setattr(MODULE.os, "read", mutate_after_chunk)
+    with pytest.raises(MODULE.RebindError, match="changed while reading"):
+        MODULE._read_regular_file(path, "receipt", MODULE.MAX_JSON_BYTES)
