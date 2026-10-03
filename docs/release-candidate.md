@@ -360,6 +360,24 @@ executed with the host's Python 3.14.7. The hosted Python 3.13 CUDA job remains
 skipped. This exact-source local receipt is not registered to a candidate
 manifest and does not close the release gate.
 
+### Physical native-wgpu training corpus (`b3a556d1`)
+
+The native wgpu receipt sealer ran from a clean detached worktree at
+`b3a556d1c6eec85772ea2ed9aa95018705aece57` on the physical RTX 4090 via
+Vulkan. The receipt binds manifest digest
+`9093a1a7f9a3422c399943782aadf4df6b11833cf2253db0db56ff2d9dedb098`, vector
+digest `38b17f4c76c1d2f85cb35c713652a3d77627d02ba47933d2c8f31a88e0c594a7`,
+36 operations and all 117 frozen cases. The reopened development capability
+table reports 4,192 peak resident bytes and 132,032 peak scratch bytes. Receipt
+digest:
+`adeeeff34a2c3a7b8fe3952af9aa2144492aaf7e9583849baf0f42afa40ecb08`.
+
+This is physical development evidence, not candidate-registry admission or
+the seven-backend release gate. The hosted/self-hosted wgpu CI lane was skipped;
+candidate artifact binding, release admission, and the other required backend
+receipts remain separate obligations. The receipt is retained at
+`/mnt/2tb/tritium-wgpu-b3a-receipts/` in the local candidate workspace.
+
 ### Latest local verification (2026-09-18, `570a8802`)
 
 `scripts/verify-gates.sh release` completed with exit status 0 after the
