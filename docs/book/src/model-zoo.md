@@ -170,14 +170,28 @@ tritium report decode --model ggml-model-i2_s.gguf --tokens tokens.json \
 > plain build exposes `cpu`; building the CLI `--features cuda` makes `cuda`
 > selectable for `report --backend cuda`.
 
-## Caveats and pre-1.0 status
+## Current v1.1 qualification status
 
 - **Token-ID interface.** The CLI consumes/produces token IDs, not text. A
   tokenizer is the caller's responsibility.
-- **One verified model.** The acceptance gates are written for BitNet 2B4T in
-  `I2_S`. Other architectures are out of scope until a test pins them.
-- **Pre-1.0.** A real-model, fresh-environment capstone (download → infer →
-  SALT-quantize → fine-tune) is a **v1.0 exit gate** that requires hardware this
-  book's CI does not have; it is tracked in
-  ADR 0012 (see the [research-record access policy](./research-records.md)) and
-  is **not** claimed complete here.
+- **Candidate, not public release.** The workspace is currently version
+  `1.1.0-rc.2`. This is a v1.1 release candidate, not a qualified or published
+  v1.1 release. The v1.0.0 tag remains the frozen infrastructure milestone.
+- **The ladder is not a pass.** The generated table above names the intended
+  tutorial, recipe, native-reference and flagship roles. A model becomes an
+  admitted zoo entry only when the exact candidate artifact and its required
+  evidence receipts pass the release registry. A model name or a successful
+  small smoke test does not qualify its tier.
+- **BitNet is the native reference.** The current model-level inference and
+  parity contract documented here is BitNet b1.58 2B4T in `I2_S`. It does not
+  establish the quality, physical-size or runtime gates for the SmolLM2 or
+  Qwen targets in the v1.1 ladder.
+- **Flagship evidence is still open.** Qwen3.6-27B language and MTP conversion,
+  model-quality evaluation, physical-byte accounting and runtime evidence are
+  separate release gates. The current campaign status and exact missing
+  evidence are recorded in the
+  [release-candidate guide](../../release-candidate.md); do not infer
+  completion from provisional packages or target-table entries.
+- **Multimodal is not claimed.** Vision tensors are not part of the v1.1
+  language-plus-MTP flagship claim unless a later accepted decision expands the
+  scope and the corresponding artifacts and gates pass.
