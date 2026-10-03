@@ -1,0 +1,34 @@
+{
+  "carry-sgd": {
+    "lr": 12,
+    "accuracy_mean": 77.615,
+    "accuracy_sd": 1.476016598822658,
+    "accuracies": [
+      78.55,
+      78.075,
+      75.44999999999999,
+      76.85,
+      79.14999999999999
+    ],
+    "mean_loss": 45302.1269,
+    "state_bytes_per_parameter": 4.0,
+    "transitions_mean": 13288.6,
+    "reversals_mean": 10659.4
+  },
+  "carry-adam": {
+    "lr": 655,
+    "accuracy_mean": 89.775,
+    "accuracy_sd": 0.48637691145859585,
+    "accuracies": [
+      89.47500000000001,
+      90.60000000000001,
+      89.775,
+      89.64999999999999,
+      89.375
+    ],
+    "mean_loss": 23985.94305,
+    "state_bytes_per_parameter": 12.0,
+    "transitions_mean": 615930.2,
+    "reversals_mean": 488698
+  }
+}

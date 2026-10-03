@@ -1,0 +1,31 @@
+{
+  "grids": {
+    "carry-adam": [
+      7,
+      66,
+      655,
+      6554
+    ],
+    "carry-sgd": [
+      12,
+      16,
+      20,
+      24,
+      28
+    ]
+  },
+  "tune_seed": 101,
+  "tune_steps": 10000,
+  "tune_eval": "validation 0..999",
+  "seeds": [
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "steps": 20000,
+  "eval": "validation 1000..4999",
+  "binary_sha256": "39c8f152e459f17034ae2bb0e8d10fe4f5ac4857b988883080734524d24b612b",
+  "quality": "UNKNOWN"
+}

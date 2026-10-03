@@ -1,0 +1,12 @@
+sgd 0.015625 docs/experiments/eat-o/carry-20261003/ste/tune-sgd-6.json
+sgd 0.0078125 docs/experiments/eat-o/carry-20261003/ste/tune-sgd-7.json
+sgd 0.00390625 docs/experiments/eat-o/carry-20261003/ste/tune-sgd-8.json
+sgd 0.001953125 docs/experiments/eat-o/carry-20261003/ste/tune-sgd-9.json
+sgd 0.0009765625 docs/experiments/eat-o/carry-20261003/ste/tune-sgd-10.json
+sgd 0.00048828125 docs/experiments/eat-o/carry-20261003/ste/tune-sgd-11.json
+sgd 0.000244140625 docs/experiments/eat-o/carry-20261003/ste/tune-sgd-12.json
+adam 0.003 docs/experiments/eat-o/carry-20261003/ste/tune-adam-0.003.json
+adam 0.005 docs/experiments/eat-o/carry-20261003/ste/tune-adam-0.005.json
+adam 0.01 docs/experiments/eat-o/carry-20261003/ste/tune-adam-0.01.json
+adam 0.02 docs/experiments/eat-o/carry-20261003/ste/tune-adam-0.02.json
+adam 0.03 docs/experiments/eat-o/carry-20261003/ste/tune-adam-0.03.json

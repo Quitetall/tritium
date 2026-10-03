@@ -59,7 +59,8 @@ def run(a):
         values.append(value-1)
     w1 = torch.nn.Parameter(torch.tensor(values[:784*128], dtype=torch.float32).reshape(128, 784))
     w2 = torch.nn.Parameter(torch.tensor(values[784*128:], dtype=torch.float32).reshape(10, 128))
-    optimizer = torch.optim.Adam([w1, w2], lr=a.lr)
+    optimizer = (torch.optim.Adam([w1, w2], lr=a.lr) if a.optimizer == "adam"
+                 else torch.optim.SGD([w1, w2], lr=a.lr))
 
     def forward(inputs):
         q1 = ste(w1, w1.round().clamp(-1, 1))
@@ -103,7 +104,7 @@ def run(a):
     with checkpoint.open("xb") as stream:
         torch.save({"w1": w1.detach(), "w2": w2.detach(), "optimizer": optimizer.state_dict(),
                     "seed": a.seed, "completed_steps": completed}, stream)
-    result = {"algorithm": "fp32-ste-adam", "seed": a.seed, "steps": completed, "contraction_terms": contraction_terms,
+    result = {"algorithm": f"fp32-ste-{a.optimizer}", "seed": a.seed, "steps": completed, "contraction_terms": contraction_terms,
               "lr": a.lr, "evaluation_count": len(labels), "loss_sum": loss,
               "correct": correct, "elapsed_training_seconds": elapsed,
               "master_moments_bytes": sum(p.numel()*12 for p in (w1, w2)),
@@ -133,6 +134,7 @@ if __name__ == "__main__":
     p.add_argument("--work-limit", type=int, default=2**63-1)
     p.add_argument("--lr", type=float, default=0.001)
     p.add_argument("--threads", type=int, default=1)
+    p.add_argument("--optimizer", choices=["adam", "sgd"], default="adam")
     args = p.parse_args()
     if args.seed <= 0 or args.steps < 0 or not 0 < args.eval_limit <= 5000 or not 0 <= args.eval_offset < 5000 or args.eval_offset+args.eval_limit > 5000:
         p.error("invalid seed, steps, or evaluation limit")
