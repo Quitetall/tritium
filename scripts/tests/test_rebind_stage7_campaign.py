@@ -4,6 +4,7 @@ import importlib.util
 import hashlib
 import json
 from pathlib import Path
+import sys
 
 import pytest
 
@@ -79,6 +80,28 @@ def test_rebind_updates_only_top_level_identity(tmp_path: Path, monkeypatch: pyt
     assert output.read_bytes() == MODULE.canonical(value) + b"\n"
 
 
+def test_rebind_bootstraps_empty_evidence_inventory_without_inventing_receipts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    template, source = setup(monkeypatch, tmp_path)
+    value = campaign()
+    token = b"tokens"
+    value["token_evidence_pack"] = {
+        "path": "token-evidence.json",
+        "bytes": len(token),
+        "sha256": hashlib.sha256(token).hexdigest(),
+    }
+    (tmp_path / "token-evidence.json").write_bytes(token)
+    write(template, value)
+
+    output = tmp_path / "out" / "campaign.json"
+    MODULE.rebind(template, source_root=source, run_id="bootstrap-run", output=output)
+    rebound = json.loads(output.read_text())
+    assert rebound["source_revision"] == "b" * 40
+    assert rebound["run_id"] == "bootstrap-run"
+    assert rebound["evidence"] == []
+
+
 def test_rebind_rejects_nested_stale_revision(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     template, source = setup(monkeypatch, tmp_path)
     value = campaign()
@@ -90,15 +113,10 @@ def test_rebind_rejects_nested_stale_revision(tmp_path: Path, monkeypatch: pytes
 
 def test_rebind_rejects_incomplete_prerequisites(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     template, source = setup(monkeypatch, tmp_path)
-    value = campaign()
-    token = b"tokens"
-    value["token_evidence_pack"] = {
-        "path": "token-evidence.json",
-        "bytes": len(token),
-        "sha256": hashlib.sha256(token).hexdigest(),
-    }
+    value = json.loads(template.read_text())
+    value["evidence"] = value["evidence"][:1]
     write(template, value)
-    with pytest.raises(MODULE.RebindError, match="inventory"):
+    with pytest.raises(MODULE.RebindError, match="incomplete"):
         MODULE.rebind(template, source_root=source, run_id="new-run", output=tmp_path / "out.json")
 
 
@@ -116,3 +134,71 @@ def test_rebind_rejects_dirty_source_and_existing_output(
     output.write_text("existing")
     with pytest.raises(MODULE.RebindError, match="replace"):
         MODULE.rebind(template, source_root=source, run_id="new-run", output=output)
+
+
+def test_cli_receipt_flags_build_and_rebind_prerequisite_inventory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    root = tmp_path / "evidence"
+    root.mkdir()
+    token = b"tokens"
+    (root / "token-evidence.json").write_bytes(token)
+    value = campaign()
+    value["token_evidence_pack"] = {
+        "path": "token-evidence.json",
+        "bytes": len(token),
+        "sha256": hashlib.sha256(token).hexdigest(),
+    }
+    template = root / "campaign-template.json"
+    write(template, value)
+    source = tmp_path / "source"
+    source.mkdir()
+    monkeypatch.setattr(MODULE, "_source_identity", lambda _: "b" * 40)
+
+    receipts = {}
+    for kind, flag in (
+        ("smoke", "--smoke-receipt"),
+        ("native-kernels", "--native-receipt"),
+        ("hestia-gate-c", "--hestia-gate-c-receipt"),
+    ):
+        path = root / f"{kind}.json"
+        path.write_bytes(MODULE.canonical({"source_revision": "b" * 40}))
+        receipts[flag] = path
+
+    output = root / "campaign-ready.json"
+    argv = [
+        "rebind-stage7-campaign.py",
+        "--template", str(template),
+        "--source-root", str(source),
+        "--run-id", "ready-run",
+        "--output", str(output),
+    ]
+    for flag, path in receipts.items():
+        argv.extend([flag, str(path)])
+    monkeypatch.setattr(sys, "argv", argv)
+
+    assert MODULE.main() == 0
+    rebound = json.loads(output.read_text())
+    assert [row["kind"] for row in rebound["evidence"]] == [
+        "smoke", "native-kernels", "hestia-gate-c"
+    ]
+    for row in rebound["evidence"]:
+        data = (root / row["path"]).read_bytes()
+        assert row["bytes"] == len(data)
+        assert row["sha256"] == hashlib.sha256(data).hexdigest()
+
+
+def test_rebind_rejects_partial_receipt_flags(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    template, source = setup(monkeypatch, tmp_path)
+    output = tmp_path / "out.json"
+    with pytest.raises(MODULE.RebindError, match="all three receipt paths"):
+        MODULE.rebind(
+            template,
+            source_root=source,
+            run_id="new-run",
+            output=output,
+            smoke_receipt=tmp_path / "smoke.json",
+        )
+    assert not output.exists()

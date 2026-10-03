@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
-"""Rebind a pre-evidence Stage-7 campaign plan to clean repository HEAD.
+"""Rebind a Stage-7 campaign plan to clean repository HEAD.
 
-This tool changes only the campaign source revision and run identity. It does
-not copy, invent, or qualify measurements. Existing output is never replaced.
+With an empty prerequisite list, this creates the source-bound bootstrap plan
+used to produce the smoke/native/Gate-C receipts. With a populated list, all
+three receipts must already bind the target revision. The tool changes only
+campaign source revision and run identity; existing output is never replaced.
+Pass all three receipt flags to construct the frozen prerequisite inventory
+from ordinary receipt files beneath the template directory.
 """
 
 from __future__ import annotations
@@ -147,7 +151,14 @@ def _validate_prerequisites(
 ) -> None:
     _open_record(root, value["token_evidence_pack"], "campaign token evidence pack")
     evidence = value["evidence"]
-    if not isinstance(evidence, list) or len(evidence) != 3:
+    if not isinstance(evidence, list):
+        raise RebindError("campaign prerequisite evidence must be a list")
+    if evidence == []:
+        # A cleanly rebound empty inventory is the bootstrap plan used to
+        # produce source-bound smoke/native/Gate-C evidence. The terminal
+        # qualifier still requires all three receipts before it can run.
+        return
+    if len(evidence) != 3:
         raise RebindError("campaign prerequisite evidence inventory is incomplete")
     expected = ("smoke", "native-kernels", "hestia-gate-c")
     for ordinal, kind in enumerate(expected):
@@ -178,6 +189,38 @@ def _validate_prerequisites(
             raise RebindError(
                 f"evidence[{ordinal}] source revision differs from target HEAD"
             )
+
+
+def _evidence_record(root: Path, kind: str, raw_path: Path) -> dict[str, Any]:
+    """Create a contained campaign record for one ordinary receipt file."""
+
+    root = root.resolve(strict=True)
+    path = Path(os.path.abspath(raw_path))
+    try:
+        relative = path.relative_to(root)
+    except ValueError as error:
+        raise RebindError(
+            f"{kind} receipt must be beneath the campaign template directory"
+        ) from error
+    cursor = root
+    for part in relative.parts:
+        cursor /= part
+        if cursor.is_symlink():
+            raise RebindError(f"{kind} receipt path must not traverse a symlink")
+    if not path.is_file() or path.is_symlink():
+        raise RebindError(f"{kind} receipt must be an ordinary file")
+    size = path.stat().st_size
+    if size <= 0 or size > MAX_JSON_BYTES:
+        raise RebindError(f"{kind} receipt exceeds the JSON byte bound")
+    payload = path.read_bytes()
+    if len(payload) != size:
+        raise RebindError(f"{kind} receipt changed while it was being read")
+    return {
+        "kind": kind,
+        "path": relative.as_posix(),
+        "bytes": len(payload),
+        "sha256": hashlib.sha256(payload).hexdigest(),
+    }
 
 
 def _write_new(path: Path, value: dict[str, Any]) -> None:
@@ -218,12 +261,33 @@ def rebind(
     source_root: Path,
     run_id: str,
     output: Path,
+    smoke_receipt: Path | None = None,
+    native_receipt: Path | None = None,
+    hestia_gate_c_receipt: Path | None = None,
 ) -> dict[str, Any]:
+    receipt_paths = (smoke_receipt, native_receipt, hestia_gate_c_receipt)
+    if any(path is not None for path in receipt_paths) and not all(
+        path is not None for path in receipt_paths
+    ):
+        raise RebindError("all three receipt paths must be supplied together")
     source_root = source_root.resolve(strict=True)
     target_revision = _source_identity(source_root)
     if not RUN_ID.fullmatch(run_id):
         raise RebindError("run_id must be 1-128 ASCII alphanumeric, dot, underscore, or hyphen")
     value = _load(template)
+    if all(path is not None for path in receipt_paths):
+        if value["evidence"] != []:
+            raise RebindError(
+                "receipt paths can only populate an empty prerequisite inventory"
+            )
+        root = template.resolve(strict=True).parent
+        value["evidence"] = [
+            _evidence_record(root, kind, path)
+            for kind, path in zip(
+                ("smoke", "native-kernels", "hestia-gate-c"), receipt_paths
+            )
+            if path is not None
+        ]
     old_revision = value["source_revision"]
     if (
         not isinstance(old_revision, str)
@@ -259,6 +323,9 @@ def main() -> int:
     parser.add_argument("--source-root", required=True, type=Path)
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--smoke-receipt", type=Path)
+    parser.add_argument("--native-receipt", type=Path)
+    parser.add_argument("--hestia-gate-c-receipt", type=Path)
     args = parser.parse_args()
     try:
         result = rebind(
@@ -266,6 +333,9 @@ def main() -> int:
             source_root=args.source_root,
             run_id=args.run_id,
             output=args.output,
+            smoke_receipt=args.smoke_receipt,
+            native_receipt=args.native_receipt,
+            hestia_gate_c_receipt=args.hestia_gate_c_receipt,
         )
     except (OSError, RebindError) as error:
         parser.error(str(error))
