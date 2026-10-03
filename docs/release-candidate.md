@@ -318,6 +318,27 @@ before recording a gate pass. Hosted CUDA, Metal, ROCm, wgpu, real-model
 serving, fuzz, and performance-regression lanes were skipped by runner policy;
 those remain unqualified.
 
+### Local exact-source CUDA dispatcher evidence (`577bdb2e`)
+
+At source revision `577bdb2e21faf2b43ff35dd1101a5079d5dbf331`, the portable
+`manylinux_2_28_x86_64` CUDA wheel passed the physical RTX 4090 dispatcher
+qualifier: 8/8 native CUDA tests passed, and the two selected tail-path tests
+passed Compute Sanitizer 2026.3.0 with zero errors. The independently verified
+receipt is
+`sha256:f2f8b3c62503e419ae9ff8ea5b7195f2d9132e5c0fa3c06f9bc9b381cd25afaf`;
+it binds wheel SHA-256
+`295b3bb9f6a22c9276bfffb346e28179a6f2cc6c1aa94f80554da1ee439d93d9`, CUDA
+13.0, driver 615.71.09, Torch 2.11.0+cu130, and RTX 4090 UUID
+`1790118a-a6d7-4eaf-fcac-dcacac5f4351`. The verifier passed against that exact
+source worktree and wheel. Receipt and raw outputs are retained in the local
+candidate workspace at `release/v1.1/evidence/torch-dispatch-cuda-577bdb2/`.
+
+This run used Python 3.14.7, while the hosted CUDA workflow is pinned to
+Python 3.13. It is local, source-bound hardware evidence; it is not registered
+to a candidate manifest, does not replace the hosted pinned-environment run,
+and does not close the release gate. Re-run and register against the final
+release candidate before making a release claim.
+
 ### Latest local verification (2026-09-18, `570a8802`)
 
 `scripts/verify-gates.sh release` completed with exit status 0 after the
