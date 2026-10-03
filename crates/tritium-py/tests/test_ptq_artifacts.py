@@ -1036,14 +1036,21 @@ def test_quantize_composes_the_three_public_phases(monkeypatch, tmp_path):
         "calibrate",
         lambda *args, **kwargs: calls.append("calibrate") or sentinel_calibration,
     )
-    monkeypatch.setattr(
-        ptq, "convert", lambda *args, **kwargs: calls.append("convert") or sentinel_result
-    )
+    forwarded = {}
+
+    def fake_convert(*args, **kwargs):
+        calls.append("convert")
+        forwarded.update(kwargs)
+        return sentinel_result
+
+    monkeypatch.setattr(ptq, "convert", fake_convert)
     result = quantize(
         tmp_path / "model",
         TernaryConfig.ptq(profile="near-lossless-v1"),
         revision="revision",
         work_dir=tmp_path / "work",
+        source_admission_receipt=tmp_path / "source-admission.json",
+        official_identity_receipt=tmp_path / "official-identity.json",
         evidence_dir=tmp_path / "evidence",
         output_dir=tmp_path / "output",
         compact_max_bytes=1,
@@ -1053,3 +1060,5 @@ def test_quantize_composes_the_three_public_phases(monkeypatch, tmp_path):
     )
     assert result is sentinel_result
     assert calls == ["prepare", "calibrate", "convert"]
+    assert forwarded["source_admission_receipt"] == tmp_path / "source-admission.json"
+    assert forwarded["official_identity_receipt"] == tmp_path / "official-identity.json"

@@ -18,9 +18,9 @@ use tritium_quantize::{PhysicalBytes, SaltV2Config, SaltV2Curvature, SaltV2Packi
 #[cfg(unix)]
 use tritium_salt::Qwen36PtqPackagesReceipt;
 use tritium_salt::{
-    ContentId, Qwen36AdmittedSource, Qwen36CompleteWorkspaceReceipt,
+    ContentId, Qwen36AdmittedSource, Qwen36CampaignPreflight, Qwen36CompleteWorkspaceReceipt,
     Qwen36PreservedSafetensorsReceipt, Qwen36PtqEvidenceDirectory, Qwen36PtqPackageLimits,
-    Qwen36TensorWorkStore,
+    Qwen36SourceIdentityAuthorization, Qwen36TensorWorkStore,
 };
 
 use crate::hf_assets::{HfAssetReceipt, stage_language_assets, verify_language_asset};
@@ -634,13 +634,16 @@ pub(crate) fn admit_qwen36_source(
 /// with the GIL released. The result is structural master evidence, not a final
 /// allocated/exported model.
 #[pyfunction]
-#[pyo3(signature = (model_dir, declared_revision, work_dir, evidence_dir, *, packing = "b3", max_evidence_bytes = 67_108_864))]
+#[pyo3(signature = (model_dir, declared_revision, work_dir, evidence_dir, *, source_admission_receipt, official_identity_receipt, packing = "b3", max_evidence_bytes = 67_108_864))]
+#[allow(clippy::too_many_arguments)] // Mirrors the explicit keyword-only Python API.
 pub(crate) fn reconcile_qwen36_ptq_masters(
     py: Python<'_>,
     model_dir: &str,
     declared_revision: &str,
     work_dir: &str,
     evidence_dir: &str,
+    source_admission_receipt: &str,
+    official_identity_receipt: &str,
     packing: &str,
     max_evidence_bytes: u64,
 ) -> PyResult<Qwen36PtqMasterReceipt> {
@@ -649,6 +652,8 @@ pub(crate) fn reconcile_qwen36_ptq_masters(
         ("declared_revision", declared_revision),
         ("work_dir", work_dir),
         ("evidence_dir", evidence_dir),
+        ("source_admission_receipt", source_admission_receipt),
+        ("official_identity_receipt", official_identity_receipt),
     ] {
         if value.is_empty() {
             return Err(PyValueError::new_err(format!("{field} must not be empty")));
@@ -677,6 +682,8 @@ pub(crate) fn reconcile_qwen36_ptq_masters(
     let declared_revision = declared_revision.to_owned();
     let work_dir = work_dir.to_owned();
     let evidence_dir = evidence_dir.to_owned();
+    let source_admission_receipt = PathBuf::from(source_admission_receipt);
+    let official_identity_receipt = PathBuf::from(official_identity_receipt);
 
     py.detach(move || {
         let evidence = Qwen36PtqEvidenceDirectory::open_bounded(&evidence_dir, max_evidence_bytes)
@@ -685,15 +692,24 @@ pub(crate) fn reconcile_qwen36_ptq_masters(
             .reopen(0)
             .map_err(|error| error.to_string())?
             .kind();
-        let admitted =
-            Qwen36AdmittedSource::open(model_dir.as_ref(), &declared_revision, work_dir.as_ref())
-                .map_err(|error| error.to_string())?;
+        let authorization = Qwen36SourceIdentityAuthorization::open(
+            &source_admission_receipt,
+            &official_identity_receipt,
+        )
+        .map_err(|error| error.to_string())?;
+        let preflight = Qwen36CampaignPreflight::open(model_dir.as_ref(), &declared_revision)
+            .map_err(|error| error.to_string())?;
+        authorization
+            .bind(&preflight)
+            .map_err(|error| error.to_string())?;
+        let admitted = Qwen36AdmittedSource::admit(preflight, work_dir.as_ref())
+            .map_err(|error| error.to_string())?;
         let config = SaltV2Config {
             packing,
             curvature,
             ..SaltV2Config::default()
         };
-        tritium_salt::reconcile_qwen36_ptq(&admitted, &evidence, &config)
+        tritium_salt::reconcile_qwen36_ptq(&admitted, &authorization, &evidence, &config)
             .map(Qwen36PtqMasterReceipt::from)
             .map_err(|error| error.to_string())
     })
@@ -714,6 +730,8 @@ pub(crate) fn reconcile_qwen36_ptq_masters(
     compact_max_resident_bytes,
     near_lossless_max_bytes,
     near_lossless_max_resident_bytes,
+    source_admission_receipt,
+    official_identity_receipt,
     packing = "b3",
     max_evidence_bytes = 67_108_864
 ))]
@@ -729,6 +747,8 @@ pub(crate) fn reconcile_qwen36_ptq_packages(
     compact_max_resident_bytes: u64,
     near_lossless_max_bytes: u64,
     near_lossless_max_resident_bytes: u64,
+    source_admission_receipt: &str,
+    official_identity_receipt: &str,
     packing: &str,
     max_evidence_bytes: u64,
 ) -> PyResult<Qwen36PtqPackageReceipt> {
@@ -738,6 +758,8 @@ pub(crate) fn reconcile_qwen36_ptq_packages(
         ("work_dir", work_dir),
         ("evidence_dir", evidence_dir),
         ("output_dir", output_dir),
+        ("source_admission_receipt", source_admission_receipt),
+        ("official_identity_receipt", official_identity_receipt),
     ] {
         if value.is_empty() {
             return Err(PyValueError::new_err(format!("{field} must not be empty")));
@@ -780,6 +802,8 @@ pub(crate) fn reconcile_qwen36_ptq_packages(
     let work_dir = PathBuf::from(work_dir);
     let evidence_dir = PathBuf::from(evidence_dir);
     let output_dir = PathBuf::from(output_dir);
+    let source_admission_receipt = PathBuf::from(source_admission_receipt);
+    let official_identity_receipt = PathBuf::from(official_identity_receipt);
 
     py.detach(move || {
         validate_output_location(&output_dir, [&model_dir, &work_dir, &evidence_dir])?;
@@ -791,8 +815,18 @@ pub(crate) fn reconcile_qwen36_ptq_packages(
             .reopen(0)
             .map_err(|error| error.to_string())?
             .kind();
-        let admitted = Qwen36AdmittedSource::open(&model_dir, &declared_revision, &work_dir)
+        let authorization = Qwen36SourceIdentityAuthorization::open(
+            &source_admission_receipt,
+            &official_identity_receipt,
+        )
+        .map_err(|error| error.to_string())?;
+        let preflight = Qwen36CampaignPreflight::open(&model_dir, &declared_revision)
             .map_err(|error| error.to_string())?;
+        authorization
+            .bind(&preflight)
+            .map_err(|error| error.to_string())?;
+        let admitted =
+            Qwen36AdmittedSource::admit(preflight, &work_dir).map_err(|error| error.to_string())?;
         let config = SaltV2Config {
             packing: packing_value,
             curvature,
@@ -803,7 +837,13 @@ pub(crate) fn reconcile_qwen36_ptq_packages(
             |staging, compact, near, preserved_output| {
                 let hf_assets = stage_language_assets(&model_dir, staging)?;
                 let native = tritium_salt::reconcile_qwen36_ptq_packages(
-                    &admitted, &evidence, &config, limits, compact, near,
+                    &admitted,
+                    &authorization,
+                    &evidence,
+                    &config,
+                    limits,
+                    compact,
+                    near,
                 )
                 .map_err(|error| error.to_string())?;
                 let workspace =

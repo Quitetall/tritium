@@ -38,7 +38,8 @@ pub use qwen35::{
     Qwen35TextRunner, Qwen35TextWeights,
 };
 pub use qwen35_execution::{
-    Qwen35ExecutionOutputBatch, Qwen35ExecutionVisitError, Qwen35UntrustedRuntimeTranscript,
+    Qwen35ExecutionBlockOutputBatch, Qwen35ExecutionOutputBatch, Qwen35ExecutionVisitError,
+    Qwen35UntrustedOutputScopeTranscript, Qwen35UntrustedRuntimeTranscript,
 };
 pub use qwen35_hf::{
     Qwen35HfLanguageModel, Qwen35HfLanguageMtpModel, Qwen35HfLanguageMtpReceipt,

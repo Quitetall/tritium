@@ -1,0 +1,51 @@
+{
+  "analyzer_sha256": "bba1a00820ac679ec9856be562bedca7ef9ee32bb6803b0abb0b66d9ebd91a51",
+  "consistency_checks": "PASS",
+  "verified_runs": 25,
+  "contrasts_vs_adaptive24": {
+    "adaptive12": {
+      "loss_difference": 0.0,
+      "paired_t_95_ci": [
+        0.0,
+        0.0
+      ],
+      "accuracy_delta_pp": 0.0
+    },
+    "adaptive24": {
+      "loss_difference": 0.0,
+      "paired_t_95_ci": [
+        0.0,
+        0.0
+      ],
+      "accuracy_delta_pp": 0.0
+    },
+    "fixed8": {
+      "loss_difference": -1183.8727999999999,
+      "paired_t_95_ci": [
+        -3590.7788819021507,
+        1223.0332819021512
+      ],
+      "accuracy_delta_pp": 1.35
+    },
+    "fixed24": {
+      "loss_difference": 0.0,
+      "paired_t_95_ci": [
+        0.0,
+        0.0
+      ],
+      "accuracy_delta_pp": 0.0
+    },
+    "integer32": {
+      "loss_difference": 0.0,
+      "paired_t_95_ci": [
+        0.0,
+        0.0
+      ],
+      "accuracy_delta_pp": 0.0
+    }
+  },
+  "adaptive_budget_models_identical": true,
+  "adaptive24_fixed24_models_identical": true,
+  "fixed24_integer32_models_identical": true,
+  "qualification": "exploratory precision-policy ablation; no matched-work or release qualification"
+}

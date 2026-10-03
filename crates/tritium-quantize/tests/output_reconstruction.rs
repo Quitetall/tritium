@@ -12,30 +12,87 @@ const RECEIPT_HASH_CONTEXT: &str = "tritium salt v2 output reconstruction receip
 
 fn rehash_single_candidate_receipt(bytes: &mut [u8]) {
     const HEADER_BYTES: usize = 112;
-    const CANDIDATE_BYTES: usize = 272;
-    const CANDIDATE_PAYLOAD_BYTES: usize = CANDIDATE_BYTES - 32;
-    let mut candidate = blake3::Hasher::new_derive_key(CANDIDATE_HASH_CONTEXT);
-    candidate.update(&bytes[HEADER_BYTES..HEADER_BYTES + CANDIDATE_PAYLOAD_BYTES]);
-    bytes[HEADER_BYTES + CANDIDATE_PAYLOAD_BYTES..HEADER_BYTES + CANDIDATE_BYTES]
+    const V2_CANDIDATE_BYTES: usize = 272;
+    const SCOPE_BYTES: usize = 57;
+    let version = u16::from_le_bytes(bytes[8..10].try_into().unwrap());
+    let candidate_bytes = if version == 3 {
+        let scope_count = u32::from_le_bytes(
+            bytes[HEADER_BYTES + 240..HEADER_BYTES + 244]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        V2_CANDIDATE_BYTES + 4 + scope_count * SCOPE_BYTES
+    } else {
+        V2_CANDIDATE_BYTES
+    };
+    let candidate_bytes_for_receipt = &bytes[HEADER_BYTES..HEADER_BYTES + candidate_bytes];
+    let mut candidate = blake3::Hasher::new_derive_key(if version == 3 {
+        "tritium salt v2 output reconstruction candidate v2"
+    } else {
+        CANDIDATE_HASH_CONTEXT
+    });
+    if version == 3 {
+        for range in [
+            0..32,
+            32..64,
+            64..72,
+            72..104,
+            104..136,
+            136..168,
+            168..176,
+            176..184,
+            184..192,
+            192..200,
+            200..208,
+            208..240,
+        ] {
+            candidate.update(&candidate_bytes_for_receipt[range]);
+        }
+        let scope_count =
+            u32::from_le_bytes(candidate_bytes_for_receipt[240..244].try_into().unwrap()) as usize;
+        candidate.update(&(scope_count as u64).to_le_bytes());
+        for ordinal in 0..scope_count {
+            let start = 244 + ordinal * SCOPE_BYTES;
+            let record = &candidate_bytes_for_receipt[start..start + SCOPE_BYTES];
+            candidate.update(&record[..9]);
+            candidate.update(&record[9..17]);
+            candidate.update(&record[17..25]);
+            candidate.update(&record[25..]);
+        }
+    } else {
+        candidate.update(&candidate_bytes_for_receipt[..candidate_bytes - 32]);
+    }
+    bytes[HEADER_BYTES + candidate_bytes - 32..HEADER_BYTES + candidate_bytes]
         .copy_from_slice(candidate.finalize().as_bytes());
 
     let mut receipt = blake3::Hasher::new_derive_key(RECEIPT_HASH_CONTEXT);
     receipt.update(&bytes[12..44]);
     receipt.update(&bytes[44..76]);
     receipt.update(&1u64.to_le_bytes());
-    receipt.update(&bytes[HEADER_BYTES + CANDIDATE_PAYLOAD_BYTES..HEADER_BYTES + CANDIDATE_BYTES]);
+    receipt.update(&bytes[HEADER_BYTES + candidate_bytes - 32..HEADER_BYTES + candidate_bytes]);
     receipt.update(&bytes[76..108]);
-    bytes[HEADER_BYTES + CANDIDATE_BYTES..].copy_from_slice(receipt.finalize().as_bytes());
+    bytes[HEADER_BYTES + candidate_bytes..].copy_from_slice(receipt.finalize().as_bytes());
 }
 
 fn legacy_v1_from_v2(bytes: &[u8], candidate_count: usize) -> Vec<u8> {
     const HEADER_BYTES: usize = 112;
     const V2_CANDIDATE_BYTES: usize = 272;
+    let v3 = u16::from_le_bytes(bytes[8..10].try_into().unwrap()) == 3;
+    let v3_scope_count = if v3 {
+        u32::from_le_bytes(
+            bytes[HEADER_BYTES + 240..HEADER_BYTES + 244]
+                .try_into()
+                .unwrap(),
+        ) as usize
+    } else {
+        0
+    };
+    let candidate_bytes = V2_CANDIDATE_BYTES + if v3 { 4 + v3_scope_count * 57 } else { 0 };
     let mut legacy = bytes[..HEADER_BYTES].to_vec();
     legacy[8..10].copy_from_slice(&1_u16.to_le_bytes());
     let mut candidate_receipts = Vec::new();
     for ordinal in 0..candidate_count {
-        let start = HEADER_BYTES + ordinal * V2_CANDIDATE_BYTES;
+        let start = HEADER_BYTES + ordinal * candidate_bytes;
         let legacy_start = legacy.len();
         legacy.extend_from_slice(&bytes[start..start + 136]);
         legacy.extend_from_slice(&bytes[start + 184..start + 240]);
@@ -55,6 +112,42 @@ fn legacy_v1_from_v2(bytes: &[u8], candidate_count: usize) -> Vec<u8> {
     receipt.update(&legacy[76..108]);
     legacy.extend_from_slice(receipt.finalize().as_bytes());
     legacy
+}
+
+fn v2_from_v3(bytes: &[u8], candidate_count: usize) -> Vec<u8> {
+    const HEADER_BYTES: usize = 112;
+    const OLD_CANDIDATE_PAYLOAD_BYTES: usize = 240;
+    const V2_CANDIDATE_BYTES: usize = 272;
+    const SCOPE_BYTES: usize = 57;
+    let scope_count = u32::from_le_bytes(
+        bytes[HEADER_BYTES + 240..HEADER_BYTES + 244]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let v3_candidate_bytes = V2_CANDIDATE_BYTES + 4 + scope_count * SCOPE_BYTES;
+    let mut v2 = bytes[..HEADER_BYTES].to_vec();
+    v2[8..10].copy_from_slice(&2_u16.to_le_bytes());
+    let mut candidate_receipts = Vec::new();
+    for ordinal in 0..candidate_count {
+        let start = HEADER_BYTES + ordinal * v3_candidate_bytes;
+        let payload = &bytes[start..start + OLD_CANDIDATE_PAYLOAD_BYTES];
+        v2.extend_from_slice(payload);
+        let mut candidate = blake3::Hasher::new_derive_key(CANDIDATE_HASH_CONTEXT);
+        candidate.update(payload);
+        let id = *candidate.finalize().as_bytes();
+        v2.extend_from_slice(&id);
+        candidate_receipts.push(id);
+    }
+    let mut receipt = blake3::Hasher::new_derive_key(RECEIPT_HASH_CONTEXT);
+    receipt.update(&v2[12..44]);
+    receipt.update(&v2[44..76]);
+    receipt.update(&(candidate_count as u64).to_le_bytes());
+    for candidate_receipt in candidate_receipts {
+        receipt.update(&candidate_receipt);
+    }
+    receipt.update(&v2[76..108]);
+    v2.extend_from_slice(receipt.finalize().as_bytes());
+    v2
 }
 
 fn spec(schedule: OutputReconstructionSchedule, restarts: usize) -> OutputReconstructionSpec {
@@ -113,11 +206,12 @@ fn block_and_teacher_logit_objectives_select_best_restart() {
     assert_eq!(selected.candidates().len(), 2);
 
     let bytes = selected.canonical_bytes().expect("canonical receipt");
-    assert_eq!(bytes.len(), 688);
-    assert_eq!(&bytes[8..10], &2_u16.to_le_bytes());
+    assert_eq!(bytes.len(), 112 + 2 * (272 + 4 + 3 * 57) + 32);
+    assert_eq!(&bytes[8..10], &3_u16.to_le_bytes());
+    assert_eq!(selected.selected().scope_evidence().len(), 3);
     assert_eq!(
         blake3::hash(&bytes).to_hex().to_string(),
-        "4a447ba1e899750f5a7a3f5c2e3498a5817ae845179f6ff08ffa937db45ee269"
+        "2563bc3c5182fffa793d1d9780d5f0c432bae6c013fcb99eed15ecdca208f418"
     );
     let reopened =
         tritium_quantize::OutputReconstructionReceipt::from_canonical_bytes(&spec, &bytes)
@@ -134,6 +228,174 @@ fn block_and_teacher_logit_objectives_select_best_restart() {
     assert!(matches!(
         tritium_quantize::OutputReconstructionReceipt::from_canonical_bytes(&spec, &corrupt),
         Err(OutputReconstructionError::MalformedReceipt(_))
+    ));
+}
+
+#[test]
+fn candidate_scope_commitments_are_included_in_the_selected_receipt_identity() {
+    let spec = spec(
+        OutputReconstructionSchedule::SlidingWindows {
+            block_count: 4,
+            window_size: 2,
+            stride: 1,
+        },
+        1,
+    );
+    let mut candidate =
+        OutputReconstructionAccumulator::new(&spec, [7; 32], 13).expect("valid candidate");
+    for scope in spec.scopes() {
+        match scope {
+            OutputReconstructionScope::Block { start, end } => {
+                let values = [*start as f32, *end as f32];
+                candidate
+                    .observe(*scope, 0, 1, 2, &[true], &values, &values)
+                    .expect("block observation");
+            }
+            OutputReconstructionScope::FinalLogits => candidate
+                .observe(*scope, 0, 1, 2, &[true], &[0.0, 0.0], &[1.0, -1.0])
+                .expect("logit observation"),
+        }
+    }
+
+    let candidate = candidate.finish().expect("complete candidate");
+    let scopes = candidate.scope_evidence();
+    assert_eq!(scopes.len(), spec.scopes().len());
+    for (evidence, scope) in scopes.iter().zip(spec.scopes()) {
+        assert_eq!(
+            evidence.scope(),
+            match scope {
+                OutputReconstructionScope::Block { start, end } => {
+                    tritium_format::RuntimeOutputScope::Block {
+                        start: *start,
+                        end: *end,
+                    }
+                }
+                OutputReconstructionScope::FinalLogits => {
+                    tritium_format::RuntimeOutputScope::FinalLogits
+                }
+            }
+        );
+        assert_eq!(
+            evidence.observation_count(),
+            u64::from(spec.batches_per_scope())
+        );
+        assert!(evidence.value_count() > 0);
+        assert_ne!(evidence.digest(), &[0; 32]);
+    }
+    assert_ne!(candidate.student_output_digest(), &[0; 32]);
+}
+
+#[test]
+fn candidate_scope_commitments_preserve_batch_order_and_counts_across_each_scope() {
+    let spec = OutputReconstructionSpec::new(
+        ModelId::from_digest([1; 32]),
+        [2; 32],
+        [3; 32],
+        [4; 32],
+        OutputReconstructionSchedule::Blocks { block_count: 1 },
+        OutputObjectiveWeights::new(1.0, 0.0, 1.0, 1.0).expect("valid weights"),
+        2,
+        1,
+    )
+    .expect("valid two-batch spec");
+    let mut candidate =
+        OutputReconstructionAccumulator::new(&spec, [6; 32], 12).expect("valid candidate");
+    for scope in spec.scopes() {
+        for batch_index in 0..2 {
+            let batch = batch_index as f32;
+            let teacher = [batch + 1.0, batch + 2.0];
+            candidate
+                .observe(*scope, batch_index, 1, 2, &[true], &teacher, &teacher)
+                .expect("ordered observation");
+        }
+    }
+    let candidate = candidate.finish().expect("complete candidate");
+    let scopes = candidate.scope_evidence();
+    assert_eq!(scopes.len(), 2);
+    for evidence in scopes {
+        assert_eq!(evidence.observation_count(), 2);
+        assert_eq!(evidence.value_count(), 4);
+    }
+}
+
+#[test]
+fn selected_scope_commitments_reopen_with_the_exact_v3_candidate_receipt() {
+    let spec = spec(OutputReconstructionSchedule::Blocks { block_count: 2 }, 1);
+    let candidate = exact_candidate(&spec, [12; 32], 21, &[0.5, -0.5]);
+    let selected = select_output_reconstruction(&spec, vec![candidate]).expect("selected output");
+    let bytes = selected.canonical_bytes().expect("canonical receipt");
+    assert_eq!(&bytes[8..10], &3_u16.to_le_bytes());
+
+    let reopened =
+        tritium_quantize::OutputReconstructionReceipt::from_canonical_bytes(&spec, &bytes)
+            .expect("strict v3 receipt reopen");
+    assert_eq!(reopened, selected);
+    assert_eq!(
+        reopened.selected().scope_evidence().len(),
+        spec.scopes().len()
+    );
+    for (evidence, scope) in reopened
+        .selected()
+        .scope_evidence()
+        .iter()
+        .zip(spec.scopes())
+    {
+        assert_eq!(
+            evidence.scope(),
+            match scope {
+                OutputReconstructionScope::Block { start, end } => {
+                    tritium_format::RuntimeOutputScope::Block {
+                        start: *start,
+                        end: *end,
+                    }
+                }
+                OutputReconstructionScope::FinalLogits => {
+                    tritium_format::RuntimeOutputScope::FinalLogits
+                }
+            }
+        );
+        assert_eq!(evidence.candidate_id(), &[12; 32]);
+        assert_eq!(evidence.initialization_seed(), 21);
+    }
+
+    let mut corrupt = bytes;
+    corrupt[112 + 240 + 4 + 24] ^= 0x40;
+    assert!(
+        tritium_quantize::OutputReconstructionReceipt::from_canonical_bytes(&spec, &corrupt)
+            .is_err()
+    );
+
+    let legacy_v2 = v2_from_v3(&selected.canonical_bytes().expect("v3 receipt"), 1);
+    let reopened_v2 =
+        tritium_quantize::OutputReconstructionReceipt::from_canonical_bytes(&spec, &legacy_v2)
+            .expect("strict v2 compatibility reopen");
+    assert!(reopened_v2.selected().scope_evidence().is_empty());
+    assert_eq!(
+        reopened_v2.canonical_bytes().expect("v2 re-encode"),
+        legacy_v2
+    );
+}
+
+#[test]
+fn restart_selection_rejects_mixed_v2_and_v3_candidate_evidence() {
+    let spec = spec(OutputReconstructionSchedule::Blocks { block_count: 1 }, 2);
+    let selected = select_output_reconstruction(
+        &spec,
+        vec![
+            exact_candidate(&spec, [3; 32], 31, &[0.0, 0.0]),
+            exact_candidate(&spec, [4; 32], 41, &[0.0, 0.0]),
+        ],
+    )
+    .expect("select v3 candidates");
+    let v2_bytes = v2_from_v3(&selected.canonical_bytes().expect("v3 bytes"), 2);
+    let v2 = tritium_quantize::OutputReconstructionReceipt::from_canonical_bytes(&spec, &v2_bytes)
+        .expect("reopen v2");
+    let mut mixed = selected.candidates().to_vec();
+    mixed[0] = v2.candidates()[0].clone();
+
+    assert!(matches!(
+        select_output_reconstruction(&spec, mixed),
+        Err(OutputReconstructionError::CandidateSpecMismatch)
     ));
 }
 

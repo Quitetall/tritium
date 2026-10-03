@@ -4,6 +4,7 @@ mod output_binding;
 
 pub use output_binding::{
     Qwen36FinalLogitsOutputBindingError, Qwen36FinalLogitsOutputBindingReceipt,
+    Qwen36OutputScopeBindingReceipt,
 };
 
 use core::{convert::Infallible, fmt};

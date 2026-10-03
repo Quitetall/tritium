@@ -41,27 +41,37 @@ jobs:
   resolve:
     name: resolve exact release ref
     runs-on: ubuntu-latest
+    if: github.event_name != 'workflow_dispatch' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     outputs:
-      ref: ${{ steps.identity.outputs.ref }}
+      tag: ${{ steps.identity.outputs.tag }}
       revision: ${{ steps.identity.outputs.revision }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
-      - name: record checked-out identity
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+      - name: validate release tag and resolve reviewed commit
         id: identity
         shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
-          echo "ref=${{ github.event.inputs.tag || github.ref }}" >> "$GITHUB_OUTPUT"
-          echo "revision=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          identity="$(python scripts/resolve-release-ref.py \
+            --repo "$GITHUB_WORKSPACE" \
+            --tag "$RELEASE_TAG" \
+            --default-branch "$DEFAULT_BRANCH")"
+          tag="$(jq -r .tag <<<"$identity")"
+          revision="$(jq -r .revision <<<"$identity")"
+          printf 'tag=%s\nrevision=%s\n' "$tag" "$revision" >> "$GITHUB_OUTPUT"
 
   # The same matrix, verification and SBOM generation that gates every PR.
   build:
     uses: ./.github/workflows/wheels.yml
     needs: resolve
     with:
-      source_ref: ${{ needs.resolve.outputs.ref }}
+      source_ref: ${{ needs.resolve.outputs.revision }}
       source_revision: ${{ needs.resolve.outputs.revision }}
     permissions:
       contents: read
@@ -77,7 +87,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.resolve.outputs.ref }}
+          ref: ${{ needs.resolve.outputs.revision }}
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           toolchain: 1.98.0
@@ -138,7 +148,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.resolve.outputs.ref }}
+          ref: ${{ needs.resolve.outputs.revision }}
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v6.0.0
         with:
           # Named exactly, not `wheel-*`. wheels.yml also uploads
@@ -175,7 +185,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          tag="${{ needs.resolve.outputs.tag }}"
           version="${tag#v}"
           # PEP 440 normalises 1.1.0-rc.2 to 1.1.0rc2; compare on that spelling so a
           # wheel built from the wrong tree cannot be released under this tag.
@@ -217,6 +227,8 @@ jobs:
           fi
           [ "$found" -eq 3 ] || { echo "::error::expected 3 wheels, found $found"; exit 1; }
           echo "all $found wheels carry ${dist}-${pep440}, every platform present"
+      - name: test deterministic release-input admission
+        run: python -m unittest scripts.tests.test_generate_release_inputs -v
       - name: emit deterministic release inputs
         shell: bash
         env:
@@ -225,71 +237,13 @@ jobs:
           INVOCATION_ID: github-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           set -euo pipefail
-          SOURCE_REVISION="$(git rev-parse HEAD)"
-          export SOURCE_REVISION
-          python3 - <<'PY'
-          import json
-          import os
-          from pathlib import Path
-
-          staged = Path("staged")
-          files = {
-              path.name: path
-              for path in staged.iterdir()
-              if path.is_file() and path.suffix in {".whl", ".crate", ".tgz"}
-          }
-          artifacts = []
-          seen = set()
-          for sbom in sorted(staged.glob("*.cdx.json")):
-              value = json.loads(sbom.read_text(encoding="utf-8"))
-              component = value.get("metadata", {}).get("component", {})
-              artifact_id = component.get("bom-ref")
-              properties = {
-                  item.get("name"): item.get("value")
-                  for item in component.get("properties", [])
-                  if isinstance(item, dict)
-              }
-              filename = properties.get("tritium:artifact:file")
-              if not isinstance(artifact_id, str) or not artifact_id:
-                  raise SystemExit(f"SBOM {sbom.name} lacks artifact id")
-              if not isinstance(filename, str) or filename not in files:
-                  raise SystemExit(f"SBOM {sbom.name} lacks a staged artifact binding")
-              if artifact_id in seen:
-                  raise SystemExit(f"duplicate release artifact id {artifact_id!r}")
-              seen.add(artifact_id)
-              suffix = Path(filename).suffix
-              kind = {
-                  ".whl": "python-wheel",
-                  ".crate": "rust-crate",
-                  ".tgz": "npm-archive",
-              }.get(suffix)
-              if kind is None:
-                  raise SystemExit(f"unsupported release artifact {filename!r}")
-              artifacts.append({
-                  "id": artifact_id,
-                  "kind": kind,
-                  "path": filename,
-                  "sbom": sbom.name,
-              })
-          if not artifacts:
-              raise SystemExit("no SBOM-bound release artifacts found")
-          document = {
-              "schema": "tritium.release-inputs.v1",
-              "release": os.environ["RELEASE_VERSION"],
-              "source_revision": os.environ["SOURCE_REVISION"],
-              "builder": {
-                  "id": os.environ["BUILDER_ID"],
-                  "build_type": "https://tritium.ai/build/package/v1",
-                  "invocation_id": os.environ["INVOCATION_ID"],
-              },
-              "artifacts": sorted(artifacts, key=lambda item: item["id"]),
-          }
-          (staged / "release-inputs.json").write_text(
-              json.dumps(document, indent=2, sort_keys=True) + "\n",
-              encoding="utf-8",
-          )
-          print(json.dumps({"artifacts": len(artifacts), "source_revision": document["source_revision"]}, sort_keys=True))
-          PY
+          python3 scripts/generate-release-inputs.py \
+            --staged staged \
+            --release "$RELEASE_VERSION" \
+            --source-revision "$(git rev-parse HEAD)" \
+            --builder-id "$BUILDER_ID" \
+            --invocation-id "$INVOCATION_ID" \
+            --output staged/release-inputs.json
       - name: checksums
         shell: bash
         run: |
@@ -337,7 +291,7 @@ jobs:
 
   github-release:
     name: publish · GitHub Release
-    needs: collect
+    needs: [collect, resolve]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -347,7 +301,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          ref: ${{ needs.resolve.outputs.revision }}
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v6.0.0
         with:
           name: release-bundle
@@ -373,7 +327,7 @@ jobs:
       - name: create or update the release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          TAG: ${{ needs.resolve.outputs.tag }}
         shell: bash
         run: |
           set -euo pipefail
@@ -391,7 +345,7 @@ jobs:
 
   crates:
     name: publish · crates.io
-    needs: collect
+    needs: [collect, resolve]
     runs-on: ubuntu-latest
     environment:
       name: crates-io
@@ -404,7 +358,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          ref: ${{ needs.resolve.outputs.revision }}
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           toolchain: 1.98.0

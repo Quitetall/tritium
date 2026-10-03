@@ -41,5 +41,10 @@ pollster = { workspace = true }
 tritium-build-info = { workspace = true }
 serde_json = { workspace = true }
 
+[[example]]
+name = "seal_wgpu_training_receipts"
+path = "examples/seal_wgpu_training_receipts.rs"
+required-features = ["wgpu"]
+
 [lints]
 workspace = true

@@ -20,6 +20,7 @@ import {
 import { executePortableWasmRequest } from "./wasm.ts";
 import { createWebGpuTrainingAdapter } from "./webgpu-adapter.ts";
 import { webGpuKernelCandidateBundleV1 } from "./webgpu-kernels.ts";
+import { webGpuRequiredDeviceLimitsV1 } from "./webgpu-limits.ts";
 import type { WebGpuDevicePortV1 } from "./webgpu-runtime.ts";
 import {
   runWebGpuVectorConformanceV1,
@@ -149,7 +150,7 @@ export type PhysicalBrowserTrainingLaneOptionsV1 = Readonly<{
 type BrowserGpuAdapter = Readonly<Record<PropertyKey, unknown>> & {
   readonly info?: unknown;
   readonly limits?: unknown;
-  requestDevice(): Promise<unknown>;
+  requestDevice(descriptor?: unknown): Promise<unknown>;
 };
 
 type ReadbackLedger = {
@@ -532,7 +533,9 @@ async function acquireDevice(ledger: ReadbackLedger): Promise<AcquiredDevice> {
   if (typeof requestDevice !== "function") {
     fail("adapter_unavailable", "WebGPU adapter cannot request a device");
   }
-  const rawDevice = await Reflect.apply(requestDevice, adapter, []);
+  const rawDevice = await Reflect.apply(requestDevice, adapter, [{
+    requiredLimits: webGpuRequiredDeviceLimitsV1(),
+  }]);
   if (!record(rawDevice)) fail("adapter_unavailable", "WebGPU returned no device");
   let device: WebGpuDevicePortV1;
   try {

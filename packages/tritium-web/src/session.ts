@@ -16,6 +16,7 @@ import {
   saltExportLayout,
   SaltExportError,
 } from "./salt-export.ts";
+import { webGpuRequiredDeviceLimitsV1 } from "./webgpu-limits.ts";
 
 export type WebTrainingBackendPolicyV1 = "auto" | "webgpu" | "wasm";
 export type WebTrainingImplementationV1 = "webgpu" | "wasm-fallback";
@@ -2229,7 +2230,9 @@ async function requestDefaultWebGpuAdapter(): Promise<WebTrainingAdapterV1 | nul
   if (typeof physicalAdapter !== "object" || physicalAdapter === null) return null;
   const requestDevice = capturedMember(physicalAdapter, "requestDevice");
   if (typeof requestDevice !== "function") return null;
-  const device = await Reflect.apply(requestDevice, physicalAdapter, []);
+  const device = await Reflect.apply(requestDevice, physicalAdapter, [{
+    requiredLimits: webGpuRequiredDeviceLimitsV1(),
+  }]);
   if (typeof device !== "object" || device === null) {
     fail("adapter_unavailable", "WebGPU requestDevice returned no device");
   }

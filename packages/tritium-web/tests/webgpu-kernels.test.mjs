@@ -67,6 +67,18 @@ test("WGSL candidate dependency index keys every frozen tensor operation", () =>
     [0, 4],
   );
   assert.deepEqual(
+    bundle.modules.attention.entryPointBindings.attention_forward.map(
+      (binding) => binding.binding,
+    ),
+    [0, 1, 2, 3, 5, 8],
+  );
+  assert.deepEqual(
+    bundle.modules.attention.entryPointBindings.attention_vjp.map(
+      (binding) => binding.binding,
+    ),
+    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+  );
+  assert.deepEqual(
     bundle.candidateOperationModuleDependencies["graph.salt_ste"],
     ["salt", "pointwise"],
   );

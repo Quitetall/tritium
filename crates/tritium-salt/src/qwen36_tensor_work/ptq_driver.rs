@@ -33,7 +33,8 @@ use tritium_quantize::{
 use crate::{
     Qwen36AdditiveCampaignSpec, Qwen36AdditiveInstallError, Qwen36AdmittedSource,
     Qwen36CampaignPreflightError, Qwen36CompleteWorkspaceReceipt, Qwen36PhysicalAllocationError,
-    Qwen36SelectedAllocationSpec, Qwen36TensorWorkError,
+    Qwen36SelectedAllocationSpec, Qwen36SourceIdentityAuthorization, Qwen36SourceIdentityError,
+    Qwen36TensorWorkError,
     tensor_work_store::{absolute_path, create_temporary_file, ensure_durable_directory},
 };
 #[cfg(unix)]
@@ -1109,20 +1110,26 @@ impl From<Qwen36PackageAdmissionError> for Qwen36PtqPackageError {
 /// campaign after the exact-BF16 base workspace resumes, skips every strictly
 /// valid existing master, fits missing masters directly into unpublished store
 /// writers, and seals only after all 506 canonical records reopen successfully.
+/// The official-source authorization must bind to the same retained preflight
+/// before the driver opens or resumes campaign state.
 ///
 /// # Errors
 /// Fails closed on source mutation, evidence mismatch/corruption, recipe or fit
 /// failure, store conflict, incomplete output, or any campaign validation error.
 pub fn reconcile_qwen36_ptq(
     admitted: &Qwen36AdmittedSource,
+    authorization: &Qwen36SourceIdentityAuthorization,
     evidence: &Qwen36PtqEvidenceDirectory,
     config: &SaltV2Config,
 ) -> Result<Qwen36CompleteWorkspaceReceipt, Qwen36PtqDriverError> {
-    with_reconciled_qwen36_ptq_campaign(admitted, evidence, config, |_, receipt| Ok(receipt))
+    with_reconciled_qwen36_ptq_campaign(admitted, authorization, evidence, config, |_, receipt| {
+        Ok(receipt)
+    })
 }
 
 #[cfg(unix)]
 /// Reconcile masters, allocate two exact profiles, and export admitted packages.
+/// Requires the same official-source authorization as master reconciliation.
 ///
 /// Both package outputs are visited from their verified content-addressed records
 /// in bounded chunks. Output effects are deliberately nontransactional; callers
@@ -1135,45 +1142,53 @@ pub fn reconcile_qwen36_ptq(
 /// ceiling, exact allocation failure, package admission failure, or output I/O.
 pub fn reconcile_qwen36_ptq_packages(
     admitted: &Qwen36AdmittedSource,
+    authorization: &Qwen36SourceIdentityAuthorization,
     evidence: &Qwen36PtqEvidenceDirectory,
     config: &SaltV2Config,
     limits: Qwen36PtqPackageLimits,
     mut compact_output: impl Write,
     mut near_lossless_output: impl Write,
 ) -> Result<Qwen36PtqPackagesReceipt, Qwen36PtqPackageError> {
-    with_reconciled_qwen36_ptq_campaign(admitted, evidence, config, |campaign, completion| {
-        let codec = packing_codec(config.packing);
-        let spec = Qwen36SelectedAllocationSpec::for_uniform_full_tiles(
-            codec,
-            physical_allocator_id(),
-            physical_allocation_recipe_id(codec, limits, &completion),
-            campaign.spec().expected_masters(),
-            limits.compact(),
-            limits.near_lossless(),
-        )?;
-        let allocated = campaign.reopen_or_allocate_selected_allocation(spec)?;
-        let admitted_packages = allocated.reopen_or_materialize_packages()?;
-        export_admitted_package(
-            &admitted_packages,
-            SaltV2Profile::CompactV1,
-            &mut compact_output,
-            false,
-        )?;
-        export_admitted_package(
-            &admitted_packages,
-            SaltV2Profile::NearLosslessV1,
-            &mut near_lossless_output,
-            true,
-        )?;
-        Ok(Qwen36PtqPackagesReceipt {
-            completion,
-            admission: admitted_packages.receipt().clone(),
-        })
-    })
+    with_reconciled_qwen36_ptq_campaign(
+        admitted,
+        authorization,
+        evidence,
+        config,
+        |campaign, completion| {
+            let codec = packing_codec(config.packing);
+            let spec = Qwen36SelectedAllocationSpec::for_uniform_full_tiles(
+                codec,
+                physical_allocator_id(),
+                physical_allocation_recipe_id(codec, limits, &completion),
+                campaign.spec().expected_masters(),
+                limits.compact(),
+                limits.near_lossless(),
+            )?;
+            let allocated = campaign.reopen_or_allocate_selected_allocation(spec)?;
+            let admitted_packages = allocated.reopen_or_materialize_packages()?;
+            export_admitted_package(
+                &admitted_packages,
+                SaltV2Profile::CompactV1,
+                &mut compact_output,
+                false,
+            )?;
+            export_admitted_package(
+                &admitted_packages,
+                SaltV2Profile::NearLosslessV1,
+                &mut near_lossless_output,
+                true,
+            )?;
+            Ok(Qwen36PtqPackagesReceipt {
+                completion,
+                admission: admitted_packages.receipt().clone(),
+            })
+        },
+    )
 }
 
 fn with_reconciled_qwen36_ptq_campaign<R, E>(
     admitted: &Qwen36AdmittedSource,
+    authorization: &Qwen36SourceIdentityAuthorization,
     evidence: &Qwen36PtqEvidenceDirectory,
     config: &SaltV2Config,
     finish: impl FnOnce(
@@ -1184,6 +1199,9 @@ fn with_reconciled_qwen36_ptq_campaign<R, E>(
 where
     E: From<Qwen36PtqDriverError>,
 {
+    authorization
+        .bind(admitted.preflight())
+        .map_err(Qwen36PtqDriverError::SourceIdentity)?;
     let workspace =
         Qwen36TensorWorkStore::open(admitted).map_err(Qwen36PtqDriverError::Workspace)?;
     evidence.validate_complete(
@@ -1725,6 +1743,8 @@ pub enum Qwen36PtqDriverError {
         /// Typed preflight/source failure.
         source: Qwen36CampaignPreflightError,
     },
+    /// Official source identity authorization did not bind to this checkpoint.
+    SourceIdentity(Qwen36SourceIdentityError),
     /// Pure-PTQ planning or fitting failed.
     Fit {
         /// Global additive-tensor ordinal.
@@ -1781,6 +1801,12 @@ impl fmt::Display for Qwen36PtqDriverError {
                 formatter,
                 "Qwen3.6 PTQ tensor {tensor_index} source failed: {source}"
             ),
+            Self::SourceIdentity(source) => {
+                write!(
+                    formatter,
+                    "Qwen3.6 PTQ source authorization failed: {source}"
+                )
+            }
             Self::Fit {
                 tensor_index,
                 source,
@@ -1800,6 +1826,7 @@ impl std::error::Error for Qwen36PtqDriverError {
             Self::Evidence { source, .. } => Some(source),
             Self::EvidenceBuild { source, .. } => Some(source),
             Self::Source { source, .. } => Some(source),
+            Self::SourceIdentity(source) => Some(source),
             Self::Fit { source, .. } => Some(source),
             Self::Workspace(source) => Some(source),
             Self::InvalidEvidencePath(_)

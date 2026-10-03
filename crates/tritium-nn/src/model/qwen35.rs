@@ -5,6 +5,7 @@
 //! semantics are deliberately kept out of the homogeneous [`ModelRunner`]
 //! (`super::ModelRunner`).
 
+use core::convert::Infallible;
 use std::sync::Arc;
 
 use tritium_spec::TernaryBackend;
@@ -282,6 +283,17 @@ pub struct Qwen35TextRunner {
     layers: Vec<Qwen35TextLayer>,
     final_norm: Vec<f32>,
     lm_head: Projection,
+}
+
+pub(crate) enum Qwen35TextForwardError<E> {
+    Runtime(NnError),
+    Observer(E),
+}
+
+impl<E> From<NnError> for Qwen35TextForwardError<E> {
+    fn from(error: NnError) -> Self {
+        Self::Runtime(error)
+    }
 }
 
 impl Qwen35TextRunner {
@@ -572,6 +584,24 @@ impl Qwen35TextRunner {
         tokens: &[u32],
         cache: &mut Qwen35TextCache,
     ) -> Result<Qwen35TextOutput, NnError> {
+        match self.forward_with_block_observer(tokens, cache, |_, _, _, _| Ok::<_, Infallible>(()))
+        {
+            Ok(output) => Ok(output),
+            Err(Qwen35TextForwardError::Runtime(error)) => Err(error),
+            Err(Qwen35TextForwardError::Observer(never)) => match never {},
+        }
+    }
+
+    /// Execute one forward while borrowing each post-block residual matrix to an observer.
+    ///
+    /// Outputs are emitted in layer order and are valid only for the observer call. No
+    /// per-layer activation history is retained by the runner.
+    pub(crate) fn forward_with_block_observer<E>(
+        &self,
+        tokens: &[u32],
+        cache: &mut Qwen35TextCache,
+        mut observer: impl FnMut(u32, usize, &[u32], &[f32]) -> Result<(), E>,
+    ) -> Result<Qwen35TextOutput, Qwen35TextForwardError<E>> {
         let (base, new_len) = self.preflight_forward(tokens, cache)?;
         let sequence = tokens.len();
         let hidden_len = checked_mul(sequence, self.hidden_size, "hidden-state buffer")?;
@@ -606,6 +636,7 @@ impl Qwen35TextRunner {
             &mut residual,
             &mut normalized,
             &mut branch,
+            &mut observer,
         );
         let output = match result {
             Ok(output) => output,
@@ -617,7 +648,7 @@ impl Qwen35TextRunner {
 
         if let Err(error) = self.preflight_commit(cache, new_len) {
             self.abort_and_rollback(cache, base);
-            return Err(error);
+            return Err(error.into());
         }
         for layer in &mut cache.layers {
             if let Qwen35TextLayerCache::DeltaNet(cache) = layer {
@@ -629,7 +660,7 @@ impl Qwen35TextRunner {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn forward_provisional(
+    fn forward_provisional<E>(
         &self,
         backend: &dyn TernaryBackend,
         position_start: usize,
@@ -639,9 +670,12 @@ impl Qwen35TextRunner {
         residual: &mut [f32],
         normalized: &mut [f32],
         branch: &mut [f32],
-    ) -> Result<Qwen35TextOutput, NnError> {
+        observer: &mut impl FnMut(u32, usize, &[u32], &[f32]) -> Result<(), E>,
+    ) -> Result<Qwen35TextOutput, Qwen35TextForwardError<E>> {
         let sequence = input_token_ids.len();
-        for (layer, layer_cache) in self.layers.iter().zip(&mut cache.layers) {
+        for (block_index, (layer, layer_cache)) in
+            self.layers.iter().zip(&mut cache.layers).enumerate()
+        {
             normalize_rows(
                 residual,
                 &layer.input_norm,
@@ -660,7 +694,8 @@ impl Qwen35TextRunner {
                 _ => {
                     return Err(NnError::Backend(
                         "Qwen3.5 cache layer kind changed after preflight".to_owned(),
-                    ));
+                    )
+                    .into());
                 }
             }
             add_in_place(residual, branch);
@@ -674,6 +709,13 @@ impl Qwen35TextRunner {
             )?;
             layer.mlp.forward(backend, normalized, sequence, branch)?;
             add_in_place(residual, branch);
+            let block_index = u32::try_from(block_index).map_err(|_| {
+                Qwen35TextForwardError::Runtime(NnError::ResourceExhausted(
+                    "Qwen3.5 block index exceeds u32".to_owned(),
+                ))
+            })?;
+            observer(block_index, position_start, &input_token_ids, residual)
+                .map_err(Qwen35TextForwardError::Observer)?;
         }
 
         let mut final_hidden_states = zeroed_scratch(residual.len(), "final hidden states")?;
@@ -699,7 +741,8 @@ impl Qwen35TextRunner {
         {
             return Err(NnError::Backend(
                 "Qwen3.5 text forward produced a non-finite value".to_owned(),
-            ));
+            )
+            .into());
         }
         Ok(Qwen35TextOutput {
             runner_identity: Arc::clone(&self.identity),

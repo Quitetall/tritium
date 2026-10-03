@@ -3,8 +3,8 @@
 `tritium-quantize` implements **SALT** — *Sensitivity-Allocated Layered Ternary*
 quantization. SALT spends extra capacity **only where the model is sensitive**,
 along a single accuracy↔size knob, while keeping inference multiply-free. It is
-designed in ADR 0001 (see the [research repository](https://github.com/Quitetall/tritium-research)) and scheduled by the
-v0.40 quantization ADR (see the [research repository](https://github.com/Quitetall/tritium-research)).
+designed in ADR 0001 and scheduled by the v0.40 quantization ADR; see the
+[research-record access policy](./research-records.md).
 
 ## Why not flat ternary
 
@@ -25,8 +25,8 @@ channel or per 128-element block, so compute stays regular):
 > storage form exists in `tritium-format`, but the quantizer currently writes
 > dense planes), and **6** (STE heal — the offline quantize path has no
 > `tritium-train` dependency, so no automatic heal runs there) are scheduled but
-> not yet wired into the offline pipeline. See
-> ADR 0006 (see the [research repository](https://github.com/Quitetall/tritium-research)).
+> not yet wired into the offline pipeline. See ADR 0006 and the
+> [research-record access policy](./research-records.md).
 
 1. **Residual ternary expansion.** Approximate the group as a sum of ternary
    planes, each fitting the previous residual:
@@ -244,12 +244,19 @@ python scripts/rebind-stage7-campaign.py \
   --template /evidence/stage7/campaign-template.json \
   --source-root . \
   --run-id stage7-smollm2-17b-real-$(git rev-parse --short HEAD) \
+  --smoke-receipt /evidence/stage7/smoke.json \
+  --native-kernels-receipt /evidence/stage7/native-kernels.json \
+  --hestia-gate-c-receipt /evidence/stage7/hestia-gate-c.json \
   --output /evidence/stage7/campaign.json
 ```
 
-The rebinder changes only top-level `source_revision` and `run_id`; nested
-stale revisions, dirty trees, malformed templates, and existing outputs fail
-closed. It creates no measurements and does not qualify a recipe freeze.
+The three optional receipt flags must be supplied together. When supplied, the
+rebinder hashes those files and builds the ordered prerequisite evidence list;
+each receipt must live inside the template's evidence directory, use the frozen
+receipt schema for its kind, and name the clean target `HEAD`. Without the
+flags, the template must already contain that list. In both modes, nested stale
+revisions, dirty trees, malformed templates, and existing outputs fail closed.
+Rebinding creates no measurements and does not qualify a recipe freeze.
 
 ## SALT V2 Qwen master campaigns
 
@@ -281,9 +288,20 @@ python scripts/admit-qwen36-source.py \
 
 Source admission performs no calibration, fitting, packaging, or quality
 claim. `identity_status` remains candidate-only until official payload
-authentication is independently registered. Advanced users with a fully
-collected canonical `S2KF` evidence directory can then resume the rate-free
-master stage directly from Python:
+authentication is independently registered. For the release path, verify the
+official snapshot against the pinned Hub inventory and persist its separate
+identity receipt:
+
+```sh
+python scripts/verify-qwen36-official-source-identity.py \
+  --model-dir /models/Qwen3.6-27B \
+  --source-admission-receipt ./tritium-work/source-admission.json \
+  --output ./tritium-work/official-source-identity.json
+```
+
+Advanced users with both receipts and a fully collected canonical `S2KF`
+evidence directory can then resume the rate-free master stage directly from
+Python:
 
 ```python
 from tritium.salt import reconcile_qwen36_ptq_masters
@@ -293,6 +311,8 @@ receipt = reconcile_qwen36_ptq_masters(
     revision="6a9e13bd6fc8f0983b9b99948120bc37f49c13e9",
     work_dir="./tritium-work",
     evidence_dir="./curvature-evidence",
+    source_admission_receipt="./tritium-work/source-admission.json",
+    official_identity_receipt="./tritium-work/official-source-identity.json",
 )
 print(receipt.campaign_id, receipt.additive_tensors)
 ```
@@ -420,6 +440,6 @@ SALT is an **engineering** synthesis of established techniques — residual tern
 expansion (ABC-Net, AQLM), non-uniform mode scales (Deep Compression,
 SqueezeLLM), sensitivity allocation (HAWQ, SqueezeLLM), and sparse residual
 planes (SpQR) — chosen so every plane is still ternary and runs on the existing
-add/sub/skip kernel. There is no new hardware path. See
-ADR 0001 (see the [research repository](https://github.com/Quitetall/tritium-research)) for the full derivation and the
-prior-art references.
+add/sub/skip kernel. There is no new hardware path. See ADR 0001 and the
+[research-record access policy](./research-records.md) for how to request the
+full derivation and prior-art references.

@@ -3,14 +3,18 @@
 use core::fmt;
 use std::collections::BTreeSet;
 
-use tritium_format::{ModelId, RuntimeEvidenceError, RuntimeFinalLogitsAccumulator};
+use tritium_format::{
+    ModelId, RuntimeEvidenceError, RuntimeFinalLogitsAccumulator,
+    RuntimeOutputReconstructionAccumulator, RuntimeOutputScope, RuntimeOutputScopeAccumulator,
+    RuntimeOutputScopeEvidence,
+};
 
 mod codec;
 
 const SPEC_HASH_CONTEXT: &str = "tritium salt v2 output reconstruction spec v1";
 const TEACHER_HASH_CONTEXT: &str = "tritium salt v2 output reconstruction teacher v1";
-const STUDENT_HASH_CONTEXT: &str = "tritium salt v2 output reconstruction student v1";
 const CANDIDATE_HASH_CONTEXT: &str = "tritium salt v2 output reconstruction candidate v1";
+const CANDIDATE_HASH_CONTEXT_V3: &str = "tritium salt v2 output reconstruction candidate v2";
 const RECEIPT_HASH_CONTEXT: &str = "tritium salt v2 output reconstruction receipt v1";
 const MAX_OUTPUT_RECONSTRUCTION_SCOPES: usize = 1 << 20;
 
@@ -279,7 +283,8 @@ pub struct OutputReconstructionAccumulator {
     teacher_kl_sum: f64,
     final_tokens: u64,
     teacher_hasher: blake3::Hasher,
-    student_hasher: blake3::Hasher,
+    student_outputs: RuntimeOutputReconstructionAccumulator,
+    student_scope_outputs: Vec<RuntimeOutputScopeAccumulator>,
     runtime_final_logits: RuntimeFinalLogitsAccumulator,
 }
 
@@ -297,11 +302,36 @@ impl OutputReconstructionAccumulator {
             return Err(OutputReconstructionError::MissingCandidateIdentity);
         }
         let mut teacher_hasher = blake3::Hasher::new_derive_key(TEACHER_HASH_CONTEXT);
-        let mut student_hasher = blake3::Hasher::new_derive_key(STUDENT_HASH_CONTEXT);
         teacher_hasher.update(spec.spec_id());
-        student_hasher.update(spec.spec_id());
-        student_hasher.update(&candidate_id);
-        student_hasher.update(&initialization_seed.to_le_bytes());
+        let student_outputs = RuntimeOutputReconstructionAccumulator::new(
+            spec.spec_id(),
+            &candidate_id,
+            initialization_seed,
+        )
+        .map_err(map_runtime_evidence_error)?;
+        let mut student_scope_outputs = Vec::new();
+        student_scope_outputs
+            .try_reserve_exact(spec.scopes().len())
+            .map_err(|_| OutputReconstructionError::ReceiptAllocationFailed)?;
+        for scope in spec.scopes() {
+            student_scope_outputs.push(
+                RuntimeOutputScopeAccumulator::new(
+                    spec.spec_id(),
+                    &candidate_id,
+                    initialization_seed,
+                    match scope {
+                        OutputReconstructionScope::Block { start, end } => {
+                            RuntimeOutputScope::Block {
+                                start: *start,
+                                end: *end,
+                            }
+                        }
+                        OutputReconstructionScope::FinalLogits => RuntimeOutputScope::FinalLogits,
+                    },
+                )
+                .map_err(map_runtime_evidence_error)?,
+            );
+        }
         Ok(Self {
             spec: spec.clone(),
             candidate_id,
@@ -315,7 +345,8 @@ impl OutputReconstructionAccumulator {
             teacher_kl_sum: 0.0,
             final_tokens: 0,
             teacher_hasher,
-            student_hasher,
+            student_outputs,
+            student_scope_outputs,
             runtime_final_logits: RuntimeFinalLogitsAccumulator::new(),
         })
     }
@@ -386,15 +417,24 @@ impl OutputReconstructionAccumulator {
             mask,
             teacher,
         );
-        hash_observation(
-            &mut self.student_hasher,
-            scope,
-            batch_index,
-            rows,
-            columns,
-            mask,
-            student,
-        );
+        self.student_outputs
+            .observe(
+                match scope {
+                    OutputReconstructionScope::Block { start, end } => {
+                        RuntimeOutputScope::Block { start, end }
+                    }
+                    OutputReconstructionScope::FinalLogits => RuntimeOutputScope::FinalLogits,
+                },
+                batch_index,
+                rows,
+                columns,
+                mask,
+                student,
+            )
+            .map_err(map_runtime_evidence_error)?;
+        self.student_scope_outputs[self.scope_index]
+            .observe(batch_index, rows, columns, mask, student)
+            .map_err(map_runtime_evidence_error)?;
         match scope {
             OutputReconstructionScope::Block { .. } => {
                 for (row, selected) in mask.iter().copied().enumerate() {
@@ -457,7 +497,7 @@ impl OutputReconstructionAccumulator {
         Ok(())
     }
 
-    /// Seal exact aggregate losses and streamed evidence identities.
+    /// Seal exact aggregate losses and aggregate plus per-scope output evidence.
     ///
     /// # Errors
     /// Rejects incomplete scope coverage or missing block/logit measurements.
@@ -478,11 +518,22 @@ impl OutputReconstructionAccumulator {
             return Err(OutputReconstructionError::NonFiniteObjective);
         }
         let teacher_evidence_digest = *self.teacher_hasher.finalize().as_bytes();
-        let student_output_digest = *self.student_hasher.finalize().as_bytes();
+        let student_outputs = self
+            .student_outputs
+            .finish()
+            .map_err(map_runtime_evidence_error)?;
+        let student_output_digest = *student_outputs.digest();
         let runtime_final_logits = self
             .runtime_final_logits
             .finish()
             .map_err(map_runtime_evidence_error)?;
+        let mut scope_evidence = Vec::new();
+        scope_evidence
+            .try_reserve_exact(self.student_scope_outputs.len())
+            .map_err(|_| OutputReconstructionError::ReceiptAllocationFailed)?;
+        for output in self.student_scope_outputs {
+            scope_evidence.push(output.finish().map_err(map_runtime_evidence_error)?);
+        }
         let mut receipt = OutputCandidateReceipt {
             spec_id: self.spec.spec_id,
             candidate_id: self.candidate_id,
@@ -499,6 +550,7 @@ impl OutputReconstructionAccumulator {
             teacher_cross_entropy: canonical_zero(teacher_cross_entropy),
             teacher_kl: canonical_zero(teacher_kl),
             objective: canonical_zero(objective),
+            scope_evidence,
             receipt_id: [0; 32],
         };
         receipt.receipt_id = receipt.derive_id();
@@ -524,6 +576,7 @@ pub struct OutputCandidateReceipt {
     teacher_cross_entropy: f64,
     teacher_kl: f64,
     objective: f64,
+    scope_evidence: Vec<RuntimeOutputScopeEvidence>,
     receipt_id: [u8; 32],
 }
 
@@ -532,6 +585,12 @@ impl OutputCandidateReceipt {
     #[must_use]
     pub const fn candidate_id(&self) -> &[u8; 32] {
         &self.candidate_id
+    }
+
+    /// Seed that binds this restart's student-output stream identity.
+    #[must_use]
+    pub const fn initialization_seed(&self) -> u64 {
+        self.initialization_seed
     }
 
     /// Exact teacher stream identity shared by every valid restart.
@@ -562,6 +621,12 @@ impl OutputCandidateReceipt {
     #[must_use]
     pub const fn runtime_logit_count(&self) -> u64 {
         self.runtime_logit_count
+    }
+
+    /// Scope digests committed by `TSV2OUT` v3 for block-major runtime matching.
+    #[must_use]
+    pub fn scope_evidence(&self) -> &[RuntimeOutputScopeEvidence] {
+        &self.scope_evidence
     }
 
     /// Mean squared error across selected block outputs.
@@ -595,6 +660,37 @@ impl OutputCandidateReceipt {
     }
 
     fn derive_id(&self) -> [u8; 32] {
+        if self.scope_evidence.is_empty() {
+            return self.derive_v2_id();
+        }
+        let mut hasher = blake3::Hasher::new_derive_key(CANDIDATE_HASH_CONTEXT_V3);
+        hasher.update(&self.spec_id);
+        hasher.update(&self.candidate_id);
+        hasher.update(&self.initialization_seed.to_le_bytes());
+        hasher.update(&self.teacher_evidence_digest);
+        hasher.update(&self.student_output_digest);
+        hasher.update(&self.runtime_final_logits_digest);
+        hasher.update(&self.runtime_batch_count.to_le_bytes());
+        hasher.update(&self.runtime_logit_count.to_le_bytes());
+        hasher.update(&self.observations.to_le_bytes());
+        hasher.update(&self.block_elements.to_le_bytes());
+        hasher.update(&self.final_tokens.to_le_bytes());
+        for value in [
+            self.block_output_mse,
+            self.teacher_cross_entropy,
+            self.teacher_kl,
+            self.objective,
+        ] {
+            hasher.update(&value.to_bits().to_le_bytes());
+        }
+        hasher.update(&(self.scope_evidence.len() as u64).to_le_bytes());
+        for evidence in &self.scope_evidence {
+            hash_scope_evidence(&mut hasher, evidence);
+        }
+        *hasher.finalize().as_bytes()
+    }
+
+    fn derive_v2_id(&self) -> [u8; 32] {
         let mut hasher = blake3::Hasher::new_derive_key(CANDIDATE_HASH_CONTEXT);
         hasher.update(&self.spec_id);
         hasher.update(&self.candidate_id);
@@ -731,10 +827,18 @@ pub fn select_output_reconstruction(
         .first()
         .map(|candidate| candidate.teacher_evidence_digest)
         .ok_or(OutputReconstructionError::InvalidCount)?;
+    let scope_evidence_mode = candidates
+        .first()
+        .is_some_and(|candidate| !candidate.scope_evidence.is_empty());
     let mut ids = BTreeSet::new();
     let mut seeds = BTreeSet::new();
     for candidate in &candidates {
-        if candidate.spec_id != spec.spec_id || candidate.receipt_id != candidate.derive_id() {
+        if candidate.spec_id != spec.spec_id
+            || candidate.receipt_id != candidate.derive_id()
+            || (!candidate.scope_evidence.is_empty()) != scope_evidence_mode
+            || (!candidate.scope_evidence.is_empty()
+                && !scope_evidence_matches_spec(spec, candidate))
+        {
             return Err(OutputReconstructionError::CandidateSpecMismatch);
         }
         if candidate.teacher_evidence_digest != teacher_evidence_digest {
@@ -773,6 +877,33 @@ pub fn select_output_reconstruction(
         selected_candidate_id,
         receipt_id,
     })
+}
+
+fn scope_evidence_matches_spec(
+    spec: &OutputReconstructionSpec,
+    candidate: &OutputCandidateReceipt,
+) -> bool {
+    candidate.scope_evidence.len() == spec.scopes.len()
+        && candidate
+            .scope_evidence
+            .iter()
+            .zip(&spec.scopes)
+            .all(|(evidence, expected)| {
+                let expected = match expected {
+                    OutputReconstructionScope::Block { start, end } => RuntimeOutputScope::Block {
+                        start: *start,
+                        end: *end,
+                    },
+                    OutputReconstructionScope::FinalLogits => RuntimeOutputScope::FinalLogits,
+                };
+                evidence.scope() == expected
+                    && evidence.spec_id() == &candidate.spec_id
+                    && evidence.candidate_id() == &candidate.candidate_id
+                    && evidence.initialization_seed() == candidate.initialization_seed
+                    && evidence.observation_count() == u64::from(spec.batches_per_scope)
+                    && evidence.value_count() > 0
+                    && evidence.digest() != &[0; 32]
+            })
 }
 
 fn schedule_scopes(
@@ -879,6 +1010,24 @@ fn hash_observation(
     }
 }
 
+fn hash_scope_evidence(hasher: &mut blake3::Hasher, evidence: &RuntimeOutputScopeEvidence) {
+    match evidence.scope() {
+        RuntimeOutputScope::Block { start, end } => {
+            hasher.update(&[1]);
+            hasher.update(&start.to_le_bytes());
+            hasher.update(&end.to_le_bytes());
+        }
+        RuntimeOutputScope::FinalLogits => {
+            hasher.update(&[2]);
+            hasher.update(&0_u32.to_le_bytes());
+            hasher.update(&0_u32.to_le_bytes());
+        }
+    }
+    hasher.update(&evidence.observation_count().to_le_bytes());
+    hasher.update(&evidence.value_count().to_le_bytes());
+    hasher.update(evidence.digest());
+}
+
 fn distillation_losses(teacher: &[f32], student: &[f32], temperature: f64) -> (f64, f64) {
     let teacher_max = teacher
         .iter()
@@ -925,6 +1074,12 @@ const fn map_runtime_evidence_error(error: RuntimeEvidenceError) -> OutputRecons
         }
         RuntimeEvidenceError::CountOverflow => OutputReconstructionError::CountOverflow,
         RuntimeEvidenceError::EmptyStream => OutputReconstructionError::IncompleteCandidate,
+        RuntimeEvidenceError::InvalidGeometry => OutputReconstructionError::InvalidGeometry,
+        RuntimeEvidenceError::MissingIdentity => {
+            OutputReconstructionError::MissingCandidateIdentity
+        }
+        RuntimeEvidenceError::EmptySelection => OutputReconstructionError::EmptyTokenSelection,
+        RuntimeEvidenceError::InvalidBatchOrder => OutputReconstructionError::InvalidGeometry,
     }
 }
 

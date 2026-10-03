@@ -108,5 +108,10 @@ half = { workspace = true }
 [build-dependencies]
 tritium-build-info = { workspace = true }
 
+[[example]]
+name = "seal_cuda_training_receipts"
+path = "examples/seal_cuda_training_receipts.rs"
+required-features = ["cuda"]
+
 [lints]
 workspace = true

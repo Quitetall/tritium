@@ -56,30 +56,35 @@ fn compute_probabilities(head: u32, kv_head: u32, scale: f32) {
 }
 
 @compute @workgroup_size(1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn attention_forward(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x != 0u || gid.y != 0u || gid.z != 0u) {
         return;
     }
     let group_size = params.n_head / params.n_kv_head;
     let scale = inverseSqrt(f32(params.head_dim));
-    if (params.execution == 0u) {
-        for (var head = 0u; head < params.n_head; head++) {
-            let kv_head = head / group_size;
-            compute_probabilities(head, kv_head, scale);
-            for (var query = 0u; query < params.seq; query++) {
-                for (var lane = 0u; lane < params.head_dim; lane++) {
-                    var accumulator = 0.0;
-                    for (var key = 0u; key < params.seq; key++) {
-                        accumulator += probabilities[query * params.seq + key]
-                            * v[vector_index(key, kv_head, params.n_kv_head, lane)];
-                    }
-                    output_0[vector_index(query, head, params.n_head, lane)] = accumulator;
+    for (var head = 0u; head < params.n_head; head++) {
+        let kv_head = head / group_size;
+        compute_probabilities(head, kv_head, scale);
+        for (var query = 0u; query < params.seq; query++) {
+            for (var lane = 0u; lane < params.head_dim; lane++) {
+                var accumulator = 0.0;
+                for (var key = 0u; key < params.seq; key++) {
+                    accumulator += probabilities[query * params.seq + key]
+                        * v[vector_index(key, kv_head, params.n_kv_head, lane)];
                 }
+                output_0[vector_index(query, head, params.n_head, lane)] = accumulator;
             }
         }
+    }
+}
+
+@compute @workgroup_size(1)
+fn attention_vjp(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x != 0u || gid.y != 0u || gid.z != 0u) {
         return;
     }
-
+    let group_size = params.n_head / params.n_kv_head;
+    let scale = inverseSqrt(f32(params.head_dim));
     // Output buffers are newly allocated storage resources and have no
     // defined initial contents. VJP writes accumulate across query/head loops,
     // so clear every destination before the first accumulation.

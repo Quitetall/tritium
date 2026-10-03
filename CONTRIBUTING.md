@@ -7,8 +7,11 @@ gate. Small bug fixes may go directly to a pull request.
 
 ## Before opening a change
 
-- Read [GOVERNANCE.md](GOVERNANCE.md) and the applicable ADR or work order in
-  the [research repository](https://github.com/Quitetall/tritium-research) (see [docs/RESEARCH.md](docs/RESEARCH.md)).
+- Read [GOVERNANCE.md](GOVERNANCE.md), the
+  [public research-record policy](docs/RESEARCH.md), and the
+  [release-candidate guide](docs/release-candidate.md). The active planning
+  archive is maintainer-only; request a specific decision or work order through
+  the [issue tracker](https://github.com/Quitetall/tritium/issues).
 - Keep dependencies pointing inward as described in the
   [architecture guide](docs/book/src/architecture.md).
 - Do not weaken a frozen conformance, quality, physical-byte, or security gate to
@@ -93,9 +96,11 @@ licenses you do not have authority to redistribute.
 
 Public API, schema, backend-semantic, governance, and release-gate changes need
 an ADR or an amendment to an accepted ADR. Implementations should follow a
-reviewed work order in the [research repository](https://github.com/Quitetall/tritium-research). Reviewers verify findings against the
-source and evidence before requesting changes; automated review output is not a
-verdict by itself.
+reviewed work order. The maintainer-only planning archive is not a contributor
+prerequisite; request a relevant record through the
+[issue tracker](https://github.com/Quitetall/tritium/issues). Reviewers verify
+findings against the source and evidence before requesting changes; automated
+review output is not a verdict by itself.
 
 By contributing, you agree that your contribution is licensed under
 [Apache-2.0](LICENSE) and that you will follow the

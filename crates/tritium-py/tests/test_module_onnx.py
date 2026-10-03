@@ -105,6 +105,36 @@ def test_module_onnx_keeps_packed_state_runs_ort_and_supports_dynamic_batch(tmp_
         load_module_onnx(artifact.artifact_dir)
 
 
+def test_module_onnx_accepts_grouped_scale_initializers(tmp_path):
+    trits = torch.tensor(
+        [[1, -1, 0, 1, -1, 0, 1, -1], [0, 1, 1, -1, 0, -1, 1, 0]],
+        dtype=torch.int8,
+    )
+    plane = SimpleNamespace(
+        trits=trits,
+        scales=torch.tensor([[0.5, 0.25], [0.25, 0.125]], dtype=torch.float16),
+        group_size=4,
+    )
+    model = AdditiveTernaryLinear((plane,)).eval()
+    artifact = export_module_onnx(
+        model, torch.randn(2, 8), tmp_path / "grouped-scales"
+    )
+    graph = onnx.load(
+        artifact.artifact_dir / "model.onnx", load_external_data=False
+    )
+    scales = next(
+        value
+        for value in graph.graph.initializer
+        if value.name == "_packed_weight.scales_0"
+    )
+    assert tuple(scales.dims) == (2, 2)
+    replay = torch.randn(3, 8)
+    torch.testing.assert_close(
+        load_module_onnx(artifact.artifact_dir)(replay), model(replay),
+        rtol=1e-4, atol=1e-5,
+    )
+
+
 def test_public_facade_executes_qat_ptq_and_refinement_artifacts_in_ort(tmp_path):
     torch.manual_seed(131)
     example = torch.randn(2, 8)

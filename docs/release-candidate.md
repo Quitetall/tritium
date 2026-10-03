@@ -37,6 +37,347 @@ Neither variant is bound to a candidate-specific flagship receipt. The
 historical gate inventory below predates this refresh and must not be read as
 current campaign liveness.
 
+### Source identity and retained-bundle follow-up (2026-09-30)
+
+A second read-only probe compared the dead staged record's header with its
+actual length: it declares a 1,077,709,406-byte record but contains only
+447,083,070 bytes (about 41.5%). This is an incomplete tensor stream, not a
+recoverable published master. Resuming the current campaign store scavenges
+crash-left temporary records; do not promote this file or describe it as a
+completed tensor.
+
+The two observed bundles are
+`/mnt/4tb/tmp/qwen36-ptq-b3-r2-r3-565abdee` and
+`/mnt/4tb/tmp/qwen36-ptq-b56b4b7-v1-bundle`. Their manifests carry the same
+campaign ID, completion ID, and measured source-model ID, but distinct
+selection IDs. Both remain explicitly unauthenticated and incomplete; their
+different profile sizes do not establish two independently completed master
+campaigns.
+
+The inspected durable source directory,
+`/mnt/4tb/qwen36-27b-source-6a9e13bd6fc8f0983b9b99948120bc37f49c13e9`, holds
+about 1.1 GiB of Hugging Face cache data, including partial shard downloads,
+not the complete checkpoint. The pinned
+[official Qwen revision](https://huggingface.co/Qwen/Qwen3.6-27B/tree/6a9e13bd6fc8f0983b9b99948120bc37f49c13e9)
+contains 15 weight shards totaling 55,562,855,904 bytes; its
+[revision API metadata](https://huggingface.co/api/models/Qwen/Qwen3.6-27B/revision/6a9e13bd6fc8f0983b9b99948120bc37f49c13e9?blobs=true)
+provides the pinned per-file SHA-256 values for source verification.
+
+There is also a code-level admission prerequisite: `Qwen36SourceIdentityStatus`
+currently has only `MeasuredAwaitingOfficialRegistration`, whose
+`official_payload_authenticated()` result is false. A manifest edit cannot
+authenticate these bundles. Before another flagship run can produce admissible
+evidence, an independently verified official source identity must be
+registered through a separate source-identity path, and the complete pinned
+source payload must be available and verified. No download or campaign restart
+was performed for this follow-up.
+
+### Pinned source fetch and checksum verification (2026-09-30)
+
+The complete pinned Hugging Face snapshot has since been downloaded into the
+durable source directory above. `hf cache verify Qwen/Qwen3.6-27B --revision
+6a9e13bd6fc8f0983b9b99948120bc37f49c13e9 --local-dir
+/mnt/4tb/qwen36-27b-source-6a9e13bd6fc8f0983b9b99948120bc37f49c13e9
+--fail-on-missing-files` verified all 29 repository files and reported that all
+checksums match. Excluding Hugging Face's local `.cache` metadata, the directory
+contains exactly those 29 files totaling 55,586,107,940 bytes. Passing
+`--fail-on-extra-files` is not appropriate on this `--local-dir`: the CLI counts
+its own `.cache/huggingface` lock/metadata files as extras. Those files were
+preserved; no cleanup was needed.
+
+This verifies the downloaded files against the pinned Hub revision but does
+not by itself satisfy Tritium's code-level source identity admission. The
+source-admission receipt intentionally remains unauthenticated. A separate
+official-identity verifier and registration are still required before source
+admission can authorize the 506-tensor campaign. That campaign has not been
+restarted, and the prior incomplete bundle variants remain inadmissible.
+
+The Rust `qwen36-preflight` then completed against this verified snapshot. It
+measured source model ID
+`trm1_126eb094f936c87bf7aeff60e57dadf5351ff082a48b8d63c7553919029cd3ca`,
+manifest content ID
+`tsc1_9553bf20975ed88ab3a673522930f9b585ae2e205959ea3dd00ee79c9587c0ba`,
+and proof ID
+`tsc1_7e0c191fefc020e74bb0ea1da33d11f69a517a231970d6c9174ee66494e52aa1`.
+The generated 221,951-byte proof is byte-identical to the proof already in the
+stalled campaign workspace (SHA-256
+`09b59e8e41d7e0f947e31d2fc8f4fb635804f162f0c7558a2df6ff6d98b834e0`). This
+confirms the preserved workspace used the exact same content-bound source.
+
+The source-admission receipt produced with the matching CI wheel and accepted
+by `verify-qwen36-source-admission-receipt.py` has receipt ID
+`sha256:718abe3e52eab53cc7e945fc0232dc18a42e3bac413544b855494594ae7ba08b`.
+It confirms the 1,199-tensor inventory (506 additive, 360 preserved, 15 MTP)
+but correctly still reports
+`identity_status=measured-awaiting-official-registration` and
+`official_payload_authenticated=false`. The current master-campaign status
+probe still reports `stalled`, zero of 506 published master receipts, no seal,
+and the same dead 447,083,070-byte staged record. Source admission is not
+fitting completion or a deployable model.
+
+### Separate official source identity verification (2026-09-30)
+
+The new `verify-qwen36-official-source-identity.py` path separately fetches
+the pinned Hugging Face revision metadata, verifies every local file against
+the official file inventory (LFS SHA-256 for 16 files and Git blob SHA-1 for
+13 ordinary Git files), and requires the measured source-admission IDs to
+match the frozen Qwen3.6 identity. It verified 29 files totaling
+55,586,107,940 bytes, with official manifest digest
+`7911b682b615162590074c15baa429ff23c64b7c1d66bd2e134ef6fa3a2a3a3f`.
+
+Its generated receipt is
+`release/v1.1/evidence/qwen36-official-source-identity-2026-09-30/receipt.json`
+(receipt ID
+`sha256:154f7807dc5aa829dd061020c4cf8e10db1aefafd2f6f95d6ab8301d5c01dbc9`),
+bound to the measured source-admission receipt
+`sha256:0a45d3b593893aaf660d34ecd31cc66bf28ae4fd19d411ffa0671d2747ca2fd4`.
+This receipt does not mutate or replace source-admission evidence, and it is
+not yet a registered release gate. It establishes exact official snapshot
+bytes bound to the already measured semantic ID; integrating that registration
+into campaign authorization and the release registry remains open. The prior
+incomplete bundle variants remain inadmissible, and the 506-tensor campaign
+has not been restarted.
+
+### Source identity release-registry linkage (2026-10-01)
+
+The release evidence evaluator now requires both `source-admission` and
+`official-source-identity` receipts for the `qwen-source-admission` gate. The
+official receipt must name the exact source-admission receipt ID as its sole
+registry parent; both entries must bind the same candidate source artifact, and
+repository, revision, semantic model ID, manifest ID, and proof ID must agree.
+Each registry entry ID must also equal the ID derived from its immutable
+receipt bytes. An admission receipt by itself therefore remains `MISSING`, not
+a source-identity pass.
+
+This implements the registry-side linkage only. The no-replace producer is
+`scripts/register-qwen36-source-identity.py`; it copies the verified identity
+receipt into the evidence root, adds the exact admission parent, and validates
+the full candidate registry before retaining the new registry. Its fixture
+tests pass. An attempt to extend the retained `3662cc3f` registry rolled back
+its outputs because the old crate-archive receipt's lock digest no longer
+matches the current Cargo.lock. A current same-revision candidate and refreshed
+package evidence are needed for actual registry publication. The Python Qwen
+reconciliation wrapper and both public Rust PTQ reconciliation entrypoints now
+require a validated source-identity authorization. The shared Rust driver binds
+that authorization to the retained preflight before it opens or resumes the
+campaign workspace. Candidate-only source admission remains available for
+research, but cannot invoke the canonical Qwen PTQ reconciler without the
+official-identity receipt pair. This closes the execution-path gap; it does not
+register the source gate or refresh stale package evidence. No fitting or
+campaign restart was performed.
+
+### Durable source-proof copy (2026-10-01)
+
+The 221,951-byte proof named by the retained source-admission receipt was copied
+byte-for-byte from `/mnt/4tb/tmp` to
+`/mnt/2tb/tritium-release-evidence/qwen-source-admission/sha256-0a45d3b593893aaf660d34ecd31cc66bf28ae4fd19d411ffa0671d2747ca2fd4/source-proof.tq36`.
+Its SHA-256 is
+`09b59e8e41d7e0f947e31d2fc8f4fb635804f162f0c7558a2df6ff6d98b834e0`, matching
+the receipt. `scripts/rebind-qwen36-source-evidence.py` then produced a new
+durable receipt pair under
+`/mnt/2tb/tritium-release-evidence/qwen-source-admission/rebound-2026-10-01/`.
+The admission receipt changes only the proof path; the official-identity
+receipt changes only its admission parent and derived receipt ID. The
+`rebind.json` records both parent IDs, both new IDs, and the exact changed
+fields. The reissued pair passes the source-admission and official-identity
+receipt validators. This is a host-local relocation that reuses the existing
+official inventory and Hub-response digest; it is not a fresh Hub/checkpoint
+verification or a new release-registry admission. A standalone Rust check
+using the in-progress `Qwen36SourceIdentityAuthorization` consumer opened this
+reissued pair and verified the proof bytes and receipt IDs. The current tracked
+registry still references the original receipt pair, so `/mnt/4tb/tmp` must
+not be pruned until a new validated registry is published against the current
+candidate.
+
+### Revalidated durable source identity (2026-10-01)
+
+The official-identity verifier was rerun against the complete pinned snapshot
+at `/mnt/4tb/qwen36-27b-source-6a9e13bd6fc8f0983b9b99948120bc37f49c13e9`.
+It passed all 29 files (55,586,107,940 bytes) against the pinned Hub inventory
+and emitted
+`/mnt/2tb/tritium-release-evidence/qwen-source-admission/recheck-2026-10-01/official-source-identity.json`
+with receipt ID
+`sha256:868dd248ff845a39e7a02414196649730b492b8b625f27b2815dc4594e2582df`.
+The receipt binds the rebound durable source-admission receipt
+`sha256:abfb820bbc4fd65aff43b2c11e1471bd7bf7e9b72acd42073ff857a7cefe03d2`
+and the same measured source-model, manifest and proof IDs. This is a refreshed
+official-byte check and an authorization input; it does not rewrite the
+source-admission receipt's `official_payload_authenticated=false`, register the
+pair to a current release candidate, or produce tensor masters. The 506-master
+campaign remains stalled and was not restarted.
+
+### Legacy Qwen calibration evidence audit (2026-10-01)
+
+The 506-file S2KF directory
+`/mnt/4tb/tmp/qwen36-evidence-a417374-1seq-clean-20260821` passes the
+installed native structural inspector `inspect_qwen36_ptq_evidence`: evidence
+ID `tsc1_11df78c64eaa9a27ec43f4a226d701c30bd897bbeca5c0b8692bae24631e2c71`,
+506 records, input-Hessian curvature, pinned source-model ID
+`126eb094f936c87bf7aeff60e57dadf5351ff082a48b8d63c7553919029cd3ca`, and
+common activation-cache/token-stream identities. Its token-stream digest is
+`d30fbc02209285448253dde628fe4c5285700cf86d66296c500eb6b1c38dcd2b`.
+
+That digest exactly matches the first 2,048-token member of token pack
+`sha256:e17652c928e5d378f19c3d3344c167844101df9ab2ff4362a05f117ff5889f38`.
+The pack's calibration partition contains 512 members (1,048,576 tokens), with
+the frozen C4/OpenWebMath/StarCoderData 50/25/25 composition. ADR 0043 requires
+that coverage for scored rungs 2–4. This is therefore a provenance mismatch
+that blocks treating the legacy evidence as campaign-grade; it is not proof
+that the capture consumed only one sequence, because the capture API accepts
+the token-stream digest from its caller and the old capture invocation ledger
+has not been found. Do not start fitting from this evidence. Recover a
+source-bound capture transcript or recapture from the admitted frozen pack,
+recording the exact partition/window receipt, before resuming tensor masters.
+The pack receipt records the full calibration partition token digest as
+`sha256:98008cb043f6df722a81cca127f71eb8cb84f05445fbd7a35f1aff948f63fe15`,
+which differs from the legacy S2KF token-stream identity above. It does not
+change the unknown about what the historical capture actually consumed.
+
+The evidence remains preserved in `/mnt/4tb/tmp`; no file was moved or removed.
+The source-model ID match and structural inspection do not establish calibration
+coverage, accuracy, or a completed master campaign.
+
+A fresh read-only `scripts/qwen36-ptq-status.py` probe of the durable campaign
+workspace reports `stalled`, 0 of 506 published masters, no seal, and one dead
+temporary record of 447,083,070 bytes (its recorded PID is no longer alive).
+That partial file is retained; it is not a complete tensor master and is not
+evidence that the campaign can resume against approved calibration provenance.
+
+The Qwen token pack is distinct from Stage 7's SmolLM2-1.7B recipe-freeze pack.
+The Qwen pack declares tokenizer digest
+`sha256:72943ec7247b68e70aa6e5651a5b0abb870b07a1c1f90bd5da9badece7294407`,
+vocabulary size 248,320, and 512 calibration sequences. The pinned Qwen source
+config also declares text vocabulary size 248,320. By contrast,
+`release/v1.1/campaign-84284a4-cuda.json` names
+`HuggingFaceTB/SmolLM2-1.7B`, binds a different token-evidence manifest digest
+(`sha256:2664bb998a231865baf55cb76806c67e53022b479ddfa901346f9a1d7cb9a0ae`),
+and records tokenizer digest
+`sha256:4b0c039b16d1fb8cb6d06c8e1698671d03c9ef51372f1ffff1fe0aa0fd555ced`.
+Its Stage 7 recipe-freeze receipt cannot qualify Qwen's calibration tokenizer
+or capture.
+
+The tokenizer identity and token pack have now been independently verified by
+`scripts/verify-qwen36-calibration-pack.py` against the official source-identity
+receipt. The content-addressed receipt
+`/mnt/2tb/tritium-release-evidence/qwen-calibration/calibration-pack-e464c020.json`
+binds the official tokenizer identity, complete pack, exact 512-sequence
+calibration partition, dataset revisions and source-member identities. It
+confirms that the pack's tokenizer digest
+`sha256:72943ec7247b68e70aa6e5651a5b0abb870b07a1c1f90bd5da9badece7294407`
+matches the canonical inventory of the four pinned Qwen tokenizer assets, and
+that the calibration partition contains 1,048,576 ordered tokens. This receipt
+is pack-provenance evidence only: it does not prove that the model replay
+consumed those tokens or bind an actual replay digest to an ordered S2KF
+evidence-set digest. Those capture/evidence links remain required before
+fitting; the legacy 506-record set is still not admitted for campaign use.
+
+A deterministic pre-capture replay contract is now persisted at
+`/mnt/2tb/tritium-release-evidence/qwen-calibration/replay-contract-2026-10-01.json`
+with ID
+`sha256:bb1e8d9d4f7a8564a76c6ca14378a0d1698dba01a3170c0e473c7c8936aadfcc`.
+It binds the verified pack receipt to the expected PyTorch batch digest
+`sha256:ca913e334bf22c73755d27b11848599008790f672600b8085daf5ec53022202c`
+under a fixed one-sequence-per-batch policy. The capture API already checks
+that digest against each replay before publishing records. The contract is not
+evidence that replay occurred. `scripts/qwen36_calibration_replay.py` now
+reopens the official pack and receipt, retains only the verified 4,194,304-byte
+calibration token window, and yields the exact batches required by that digest.
+Opening it against the durable Qwen pack reproduced the same pack receipt,
+contract ID, and capture batch digest. This remains tooling verification, not a
+model replay: the actual capture must use this factory, persist a native capture
+receipt binding its digest to the ordered S2KF set, and freshly reopen all 506
+records before fitting.
+
+The replay helper now exposes `capture_binding()` and durable
+`write_capture_binding()` for the native capture result. The separate
+`scripts/verify-qwen36-capture-binding.py` command revalidates the source pack,
+contract, native session identity and ordered S2KF evidence-set digest. Its
+reopen path is covered with a fake native session in unit tests only; no real
+Qwen capture receipt or complete 506-record evidence namespace exists yet.
+
+### Hosted package evidence from PR #51 (2026-10-01)
+
+PR #51 (`bbbafd99cada6dab821cea63e5cdf971f1ce79fb`) has successful hosted
+package workflows. Its artifacts are retained under
+`/mnt/2tb/tritium-release-evidence/ci-bbbafd99/`. The workflows ran against
+the PR synthetic merge revision
+`fb670342ee85e340397c68705127b0268648261b`, not the branch head. The
+`crate-archive`, `npm-archive`, `compatibility-matrix`, and `clean-install`
+receipts each pass their owning validator at that exact revision. The
+compatibility receipt covers 16 CPython/platform cells; the clean-install
+receipt validates an installed Linux CPU wheel with PyTorch QAT forward and
+backward, optimizer update and resume, Hugging Face safetensors save/reload,
+and tied-weight identity checks.
+
+This harvest does **not** close the `packages` release gate: these receipts
+are not registered against a candidate manifest, and their synthetic merge
+revision differs from the checked-out branch head. Do not transplant them into
+the older `release/v1.1` candidate or registry. Rebuild/harvest from the final
+release revision and validate all four receipt kinds against one candidate
+before recording a gate pass. Hosted CUDA, Metal, ROCm, wgpu, real-model
+serving, fuzz, and performance-regression lanes were skipped by runner policy;
+those remain unqualified.
+
+### Local exact-source CUDA dispatcher evidence (`577bdb2e`)
+
+At source revision `577bdb2e21faf2b43ff35dd1101a5079d5dbf331`, the portable
+`manylinux_2_28_x86_64` CUDA wheel passed the physical RTX 4090 dispatcher
+qualifier: 8/8 native CUDA tests passed, and the two selected tail-path tests
+passed Compute Sanitizer 2026.3.0 with zero errors. The independently verified
+receipt is
+`sha256:f2f8b3c62503e419ae9ff8ea5b7195f2d9132e5c0fa3c06f9bc9b381cd25afaf`;
+it binds wheel SHA-256
+`295b3bb9f6a22c9276bfffb346e28179a6f2cc6c1aa94f80554da1ee439d93d9`, CUDA
+13.0, driver 615.71.09, Torch 2.11.0+cu130, and RTX 4090 UUID
+`1790118a-a6d7-4eaf-fcac-dcacac5f4351`. The verifier passed against that exact
+source worktree and wheel. Receipt and raw outputs are retained in the local
+candidate workspace at `release/v1.1/evidence/torch-dispatch-cuda-577bdb2/`.
+
+This run used Python 3.14.7, while the hosted CUDA workflow is pinned to
+Python 3.13. It is local, source-bound hardware evidence; it is not registered
+to a candidate manifest, does not replace the hosted pinned-environment run,
+and does not close the release gate. Re-run and register against the final
+release candidate before making a release claim.
+
+### Exact pushed-head CUDA rerun (`08a52cba`)
+
+The receipt was rebuilt and rerun on the exact pushed PR head
+`08a52cba8b8104018cc427500f43b708ba829ae9`, eliminating the source-revision
+gap from the earlier `577bdb2e` run. The portable CUDA wheel passed all eight
+native CUDA dispatcher tests on the RTX 4090; both selected tail-path tests
+passed Compute Sanitizer 2026.3.0 with zero errors. The independently verified
+receipt is
+`sha256:49ea0d53fe3417bcaa93fc69af71a6183a9a035eae53ba9782d28b636dec10a9`.
+It binds wheel SHA-256
+`0556e947831803a67597e4718600655aa4e3c387812c06e631e80c86ecbccb9a`, CUDA
+13.0, driver 615.71.09, Torch 2.11.0+cu130, and the same RTX 4090 UUID. Raw
+outputs are retained under
+`release/v1.1/evidence/torch-dispatch-cuda-08a52cba/` in the local candidate
+workspace.
+
+The wheel was built in the pinned manylinux/Python 3.13 image, but qualification
+executed with the host's Python 3.14.7. The hosted Python 3.13 CUDA job remains
+skipped. This exact-source local receipt is not registered to a candidate
+manifest and does not close the release gate.
+
+### Physical native-wgpu training corpus (`b3a556d1`)
+
+The native wgpu receipt sealer ran from a clean detached worktree at
+`b3a556d1c6eec85772ea2ed9aa95018705aece57` on the physical RTX 4090 via
+Vulkan. The receipt binds manifest digest
+`9093a1a7f9a3422c399943782aadf4df6b11833cf2253db0db56ff2d9dedb098`, vector
+digest `38b17f4c76c1d2f85cb35c713652a3d77627d02ba47933d2c8f31a88e0c594a7`,
+36 operations and all 117 frozen cases. The reopened development capability
+table reports 4,192 peak resident bytes and 132,032 peak scratch bytes. Receipt
+digest:
+`adeeeff34a2c3a7b8fe3952af9aa2144492aaf7e9583849baf0f42afa40ecb08`.
+
+This is physical development evidence, not candidate-registry admission or
+the seven-backend release gate. The hosted/self-hosted wgpu CI lane was skipped;
+candidate artifact binding, release admission, and the other required backend
+receipts remain separate obligations. The receipt is retained at
+`/mnt/2tb/tritium-wgpu-b3a-receipts/` in the local candidate workspace.
+
 ### Latest local verification (2026-09-18, `570a8802`)
 
 `scripts/verify-gates.sh release` completed with exit status 0 after the
@@ -187,9 +528,9 @@ already exist as an ordinary file — run `trivy image --download-db-only
 | `packages` | PARTIAL | `compatibility-matrix` | **Not blocked — CI produces this on every release and the release workflow now carries it into the payload.** The rc.2 `abi3-compatibility-receipt` passes `aggregate-wheel-smoke.py`'s own validator: `tritium.abi3-matrix-qualification.v1`, bound to `d16c0dda`, `passed: true`, 16 cells spanning CPython 3.9.25–3.14.7 across three platforms and three distinct wheels. Harvesting it advances the union 15→16. It does **not** by itself close the gate: crate, npm, clean-install, and compatibility receipts still must bind one exact revision before a coherent `packages` PASS. |
 | `pytorch-hf` | PARTIAL | `distributed-training` | Two or more GPUs. |
 | `native-backends` | PARTIAL | `backend-manifest`, `performance` | All seven trace families, in order — `FAMILIES = ("cpu", "cuda", "rocm", "metal", "wgpu", "wasi", "mcu")`. Needs AMD *and* Apple *and* an MCU board. |
-| `estimators-refinement` | PARTIAL | `refinement`, `baseline-ablation` | Local SALT campaign runs. No new dependency; queued until the flagship conversion releases the CPU. |
-| `flagship-qwen` | **IN FLIGHT** | `conversion-refinement`, `quality`, `task-retention`, `runtime`, `physical-bytes` | The pinned Qwen3.6-27B PTQ conversion, running since 2026-09-01 (rev `6a9e13bd`, `packing="b3"`). |
-| `stage7-freeze` | NONE | `stage7-recipe-freeze` | The 1.7B recipe freeze — downstream of the flagship conversion. |
+| `estimators-refinement` | PARTIAL | `refinement`, `baseline-ablation` | Separate local SALT campaign runs and baseline ablations; no current receipt is registered for these kinds. |
+| `flagship-qwen` | **NOT CONFIRMED RUNNING — last canonical record says stalled** | `conversion-refinement`, `quality`, `task-retention`, `runtime`, `physical-bytes` | The last canonical campaign probe found 0/506 published masters and no completion seal (see the 2026-09-29 refresh above). Its former `/mnt/4tb/tmp` workspace is no longer at the recorded path. Revalidate workspace location and calibration provenance before any resume; Stage 7 recipe freeze is a prerequisite. |
+| `stage7-freeze` | NONE | `stage7-recipe-freeze` | Complete the 1.7B recipe freeze before unsealing/running the pinned Qwen flagship, as required by plan 0043. |
 | `onnx` | NONE | `onnx-inference` | Whole-Qwen ONNX execution traces — downstream of the flagship artifact. |
 | `browser` | NONE | `browser-conformance` | **Three** lanes, all required: `--chrome-lane`, `--firefox-lane`, `--safari-lane`. The Safari lane is gated on a macOS `os.name`, so this needs Apple hardware, not merely a browser. |
 | `serving` | PARTIAL | `oci-runtime-{cpu,cuda}`, `serving-deployment-{cpu,cuda}` | Both `oci-security-*` kinds are **done** (2026-09-03). The remaining four all need an **admissible serving bundle**, which does not exist on this box: `tritium-serve` rejects the only complete-looking candidate with `InvalidAdmission("manifest package")` because its `tritium.json` carries no top-level `manifest_package_id` and is marked `complete_model: false`. Deployment additionally needs Kubernetes, a Helm chart archive, and a `--bundle-manifest`. |
@@ -255,7 +596,7 @@ unmanifested file.
     {
       "id": "pytritium-linux-cpu",
       "kind": "python-wheel",
-      "path": "pytritium-1.1.0rc1-cp39-abi3-manylinux_2_28_x86_64.whl",
+      "path": "pytritium-1.1.0rc2-cp39-abi3-manylinux_2_28_x86_64.whl",
       "sbom": "pytritium-linux-cpu.cdx.json"
     }
   ]

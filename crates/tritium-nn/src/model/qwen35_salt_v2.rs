@@ -1591,6 +1591,170 @@ mod tests {
         assert!(execution.has_final_logits());
         assert!(!execution.has_block_outputs());
 
+        let mut observed_blocks = Vec::new();
+        let block_execution = model
+            .try_visit_untrusted_block_outputs(batches, |block| {
+                assert_eq!(block.batch_index(), (observed_blocks.len() / 2) as u64);
+                assert_eq!(block.block_index(), (observed_blocks.len() % 2) as u32);
+                assert_eq!(block.token_start(), 0);
+                assert_eq!(block.hidden_size(), model.runner().hidden_size());
+                assert_eq!(
+                    block.hidden_states().len(),
+                    block.tokens().len() * block.hidden_size()
+                );
+                assert!(block.hidden_states().iter().all(|value| *value == 0.0));
+                observed_blocks.push((block.batch_index(), block.block_index()));
+                Ok::<_, core::convert::Infallible>(())
+            })
+            .unwrap();
+        assert_eq!(observed_blocks, [(0, 0), (0, 1), (1, 0), (1, 1)]);
+        assert_eq!(block_execution.batch_count(), 2);
+        assert_eq!(block_execution.token_count(), 3);
+        assert_eq!(block_execution.block_observation_count(), 4);
+        assert_eq!(
+            block_execution.block_element_count(),
+            6 * model.runner().hidden_size() as u64
+        );
+        assert!(block_execution.has_block_outputs());
+        assert!(!block_execution.has_final_logits());
+        assert_ne!(block_execution.block_output_digest(), &[0; 32]);
+        assert_eq!(block_execution.logit_count(), 0);
+
+        let scope_identity = ([31; 32], [32; 32], 41);
+        let scopes = [
+            tritium_format::RuntimeOutputScope::Block { start: 0, end: 1 },
+            tritium_format::RuntimeOutputScope::Block { start: 0, end: 2 },
+            tritium_format::RuntimeOutputScope::FinalLogits,
+        ];
+        let scoped_batches = [
+            (&[1_u32, 2][..], &[false, true][..]),
+            (&[3_u32][..], &[true][..]),
+        ];
+        let scoped = model
+            .try_visit_untrusted_output_scopes(
+                &scope_identity.0,
+                &scope_identity.1,
+                scope_identity.2,
+                &scopes,
+                scoped_batches,
+            )
+            .unwrap();
+        assert_eq!(scoped.batch_count(), 2);
+        assert_eq!(scoped.token_count(), 3);
+        assert!(scoped.backend_claims_are_untrusted());
+        assert_eq!(
+            scoped.token_stream_digest(),
+            block_execution.token_stream_digest()
+        );
+        let changed_mask = model
+            .try_visit_untrusted_output_scopes(
+                &scope_identity.0,
+                &scope_identity.1,
+                scope_identity.2,
+                &scopes,
+                [
+                    (&[1_u32, 2][..], &[true, true][..]),
+                    (&[3_u32][..], &[true][..]),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            changed_mask.token_stream_digest(),
+            scoped.token_stream_digest()
+        );
+        assert_ne!(changed_mask.scope_evidence(), scoped.scope_evidence());
+        assert!(matches!(
+            model.try_visit_untrusted_output_scopes(
+                &scope_identity.0,
+                &scope_identity.1,
+                scope_identity.2,
+                &[tritium_format::RuntimeOutputScope::FinalLogits],
+                [(&[1_u32][..], &[false][..])],
+            ),
+            Err(crate::Qwen35ExecutionVisitError::Runtime(_))
+        ));
+        assert!(matches!(
+            model.try_visit_untrusted_output_scopes(
+                &scope_identity.0,
+                &scope_identity.1,
+                scope_identity.2,
+                &[
+                    tritium_format::RuntimeOutputScope::Block { start: 0, end: 3 },
+                    tritium_format::RuntimeOutputScope::FinalLogits,
+                ],
+                scoped_batches,
+            ),
+            Err(crate::Qwen35ExecutionVisitError::Runtime(_))
+        ));
+        let expected = scopes
+            .iter()
+            .map(|scope| {
+                let mut accumulator = tritium_format::RuntimeOutputScopeAccumulator::new(
+                    &scope_identity.0,
+                    &scope_identity.1,
+                    scope_identity.2,
+                    *scope,
+                )
+                .unwrap();
+                match scope {
+                    tritium_format::RuntimeOutputScope::Block { .. } => {
+                        accumulator
+                            .observe(
+                                0,
+                                2,
+                                model.runner().hidden_size(),
+                                &[false, true],
+                                &vec![0.0; 2 * model.runner().hidden_size()],
+                            )
+                            .unwrap();
+                        accumulator
+                            .observe(
+                                1,
+                                1,
+                                model.runner().hidden_size(),
+                                &[true],
+                                &vec![0.0; model.runner().hidden_size()],
+                            )
+                            .unwrap();
+                    }
+                    tritium_format::RuntimeOutputScope::FinalLogits => {
+                        accumulator
+                            .observe(
+                                0,
+                                1,
+                                model.runner().vocab_size(),
+                                &[true],
+                                &vec![0.0; model.runner().vocab_size()],
+                            )
+                            .unwrap();
+                        accumulator
+                            .observe(
+                                1,
+                                1,
+                                model.runner().vocab_size(),
+                                &[true],
+                                &vec![0.0; model.runner().vocab_size()],
+                            )
+                            .unwrap();
+                    }
+                }
+                accumulator.finish().unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(scoped.scope_evidence(), expected);
+
+        let block_canonical = block_execution.canonical_bytes().unwrap();
+        let block_reopened = model
+            .reexecute_untrusted_block_outputs(batches, &block_canonical, |_| {
+                Ok::<_, core::convert::Infallible>(())
+            })
+            .unwrap();
+        assert_eq!(block_reopened, block_execution);
+        assert!(matches!(
+            model.try_visit_untrusted_block_outputs([&[1_u32][..]], |_| Err("stop")),
+            Err(crate::Qwen35ExecutionVisitError::Observer("stop"))
+        ));
+
         let canonical = execution.canonical_bytes().unwrap();
         let reopened = model
             .reexecute_untrusted_final_logits(batches, &canonical, |_| {

@@ -847,7 +847,10 @@ export class WebGpuResidentRuntimeV1 {
           const suppliedStorage = Object.keys(command.storageBindings).sort();
           if (expectedStorage.length !== suppliedStorage.length ||
               expectedStorage.some((binding, index) => binding !== suppliedStorage[index])) {
-            fail("invalid_schema", "WebGPU storage bindings differ from shader layout");
+            fail(
+              "invalid_schema",
+              `WebGPU storage bindings differ from shader layout for ${command.operation}/${command.execution} stage ${command.stageIndex}: expected [${expectedStorage.join(",")}], got [${suppliedStorage.join(",")}]`,
+            );
           }
           const limit = this.#device.limits.maxComputeWorkgroupsPerDimension;
           if (command.workgroups.some((value) =>

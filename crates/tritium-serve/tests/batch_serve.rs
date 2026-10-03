@@ -91,6 +91,27 @@ async fn chat(router: &Router, prompt_ids: &str, max_tokens: usize) -> String {
         .to_owned()
 }
 
+async fn metric(router: &Router, name: &str) -> u64 {
+    let req = Request::get("/metrics")
+        .body(Body::empty())
+        .expect("metrics request");
+    let resp = router.clone().oneshot(req).await.expect("metrics route");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp
+        .into_body()
+        .collect()
+        .await
+        .expect("metrics body")
+        .to_bytes();
+    let text = String::from_utf8(bytes.to_vec()).expect("metrics UTF-8");
+    text.lines()
+        .find_map(|line| {
+            line.strip_prefix(name)
+                .and_then(|value| value.trim().parse::<u64>().ok())
+        })
+        .unwrap_or_else(|| panic!("metric {name} absent from /metrics:\n{text}"))
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn cuda_batched_serve_matches_single_sequence_greedy() {
     if !Path::new(&*GGUF_PATH).exists() {
@@ -650,6 +671,7 @@ async fn cuda_batched_admission_interleaves_live_slot() {
         c.model_id = "tritium".into();
         c.queue_cap = 8;
         c.max_new_default = 256;
+        c.kv_pool_tokens = Some(4096);
         c
     };
     let (router, _draining) =
@@ -665,6 +687,23 @@ async fn cuda_batched_admission_interleaves_live_slot() {
     };
     // Warm: graph capture + first prefill paths off the clock.
     let _ = chat(&router, &join_ids(8), 2).await;
+    let disconnects_before = metric(&router, "tritium_stream_disconnects_total").await;
+    let warm_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let (reservations_before, releases_before) = loop {
+        let capacity = metric(&router, "tritium_kv_pool_capacity_tokens").await;
+        let free = metric(&router, "tritium_kv_pool_free_tokens").await;
+        let reservations = metric(&router, "tritium_kv_pool_reservations_total").await;
+        let releases = metric(&router, "tritium_kv_pool_releases_total").await;
+        if capacity == 4096 && free == capacity && reservations == releases && reservations >= 1 {
+            break (reservations, releases);
+        }
+        assert!(
+            std::time::Instant::now() < warm_deadline,
+            "warm paged-KV request did not settle: capacity={capacity}, free={free}, \
+             reservations={reservations}, releases={releases}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    };
 
     // A: short prompt, long budget — must outlive B's admission.
     let (a_handle, a_times) = spawn_stream(&router, &join_ids(16), 256);
@@ -722,6 +761,87 @@ async fn cuda_batched_admission_interleaves_live_slot() {
 
     a_handle.abort(); // measurement done; disconnecting A also exercises retire-on-close
     let _ = b_handle.await;
+
+    // Both A (client disconnect during decode) and B (normal completion) must
+    // release their real paged-KV reservations. Wait for the worker to observe
+    // A's dropped receiver, then require exact counter deltas and pool baseline.
+    let reclaim_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let capacity = metric(&router, "tritium_kv_pool_capacity_tokens").await;
+        let free = metric(&router, "tritium_kv_pool_free_tokens").await;
+        let reservations = metric(&router, "tritium_kv_pool_reservations_total").await;
+        let releases = metric(&router, "tritium_kv_pool_releases_total").await;
+        let release_failures = metric(&router, "tritium_kv_pool_release_failures_total").await;
+        if capacity == 4096
+            && free == capacity
+            && reservations - reservations_before == 2
+            && releases - releases_before == 2
+            && release_failures == 0
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < reclaim_deadline,
+            "paged-KV reservations did not return exactly once: capacity={capacity}, free={free}, \
+             reservations={reservations} (before {reservations_before}), \
+             releases={releases} (before {releases_before}), failures={release_failures}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    // C: cancel a fresh long-prompt request while the worker reports prefill.
+    // Waiting for the phase gauge plus the third reservation ties the abort to
+    // this request, not to a timer or the previous decode workload.
+    let prefill_deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+    while metric(&router, "tritium_worker_phase{phase=\"idle\"}").await != 1 {
+        assert!(
+            std::time::Instant::now() < prefill_deadline,
+            "worker did not return to idle before prefill-cancellation case"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let (c_handle, _) = spawn_stream(&router, &join_ids(3072), 4);
+    loop {
+        let prefill = metric(&router, "tritium_worker_phase{phase=\"prefill\"}").await;
+        let reservations = metric(&router, "tritium_kv_pool_reservations_total").await;
+        if prefill == 1 && reservations - reservations_before == 3 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < prefill_deadline,
+            "request C did not enter prefill: prefill={prefill}, \
+             reservations={reservations} (before {reservations_before})"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    c_handle.abort(); // dropping the SSE receiver cancels the in-flight prefill
+
+    loop {
+        let capacity = metric(&router, "tritium_kv_pool_capacity_tokens").await;
+        let free = metric(&router, "tritium_kv_pool_free_tokens").await;
+        let reservations = metric(&router, "tritium_kv_pool_reservations_total").await;
+        let releases = metric(&router, "tritium_kv_pool_releases_total").await;
+        let release_failures = metric(&router, "tritium_kv_pool_release_failures_total").await;
+        let disconnects = metric(&router, "tritium_stream_disconnects_total").await;
+        if capacity == 4096
+            && free == capacity
+            && reservations - reservations_before == 3
+            && releases - releases_before == 3
+            && release_failures == 0
+            && disconnects - disconnects_before == 2
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < prefill_deadline,
+            "decode/prefill cancellation did not reclaim exactly once: \
+             capacity={capacity}, free={free}, reservations={reservations} \
+             (before {reservations_before}), releases={releases} \
+             (before {releases_before}), failures={release_failures}, \
+             disconnects={disconnects} (before {disconnects_before})"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
 }
 
 /// Spawn a streaming chat request, accumulating every SSE delta's content
