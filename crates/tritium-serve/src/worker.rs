@@ -73,6 +73,7 @@ pub(crate) struct WorkerTelemetry {
 impl WorkerTelemetry {
     /// Publish whether the batch worker currently owns one waiting job outside
     /// the channel (seat- or page-starved admission).
+    #[cfg(feature = "cuda")]
     pub(crate) fn set_parked_queue_job(&self, parked: bool) {
         self.parked_queue_jobs
             .store(u64::from(parked), Ordering::Release);
