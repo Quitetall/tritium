@@ -47,6 +47,24 @@ enum Kind {
     Sgd,
     Sgd16,
     Adam,
+    /// `carry-sgd` plus any of the rich-state options in [`Rich`].
+    Rich,
+}
+
+/// Extra per-weight optimizer state for `--optimizer rich`, each part optional and composable.
+/// Ternary weights cost ~0.2 B, so a mixed-precision AdamW footprint (~16 B/weight) leaves room
+/// for all of these at once.
+#[derive(Clone, Copy, Debug, Default)]
+struct Rich {
+    /// Momentum EMA of the step, β = 1 − 2^-k (+4 B/weight).
+    momentum: Option<u32>,
+    /// Exact diagonal Gauss-Newton curvature, EMA 2^-k over examples, and damping δ = layer mean
+    /// curvature >> d. Step = Newton fraction 2^-lr of g/(c + δ) (+8 B/weight).
+    curvature: Option<(u32, u32)>,
+    /// Halve a weight's step on each reversal; recover one level every 1024 steps (+1 B/weight).
+    dampen: bool,
+    /// Polyak/EMA average of the latent, 2^-k; the DEPLOYED trits are round(average) (+4 B/weight).
+    average: Option<u32>,
 }
 
 /// Latent units per trit step for the 16-bit latent: ±8 trit steps fit i16.
@@ -68,6 +86,12 @@ struct Carry {
     transitions: u64,
     reversals: u64,
     last_dir: Vec<i8>,
+    rich: Rich,
+    mom: Vec<i32>,
+    curv: Vec<u64>,
+    damp: Vec<u8>,
+    avg: Vec<i32>,
+    steps: u64,
 }
 
 /// Floor square root by integer Newton iteration (no floating point anywhere).
@@ -119,13 +143,87 @@ impl Carry {
             transitions: 0,
             reversals: 0,
             last_dir: vec![0; n],
+            rich: Rich::default(),
+            mom: Vec::new(),
+            curv: Vec::new(),
+            damp: Vec::new(),
+            avg: Vec::new(),
+            steps: 0,
         }
+    }
+
+    fn with_rich(mut self, rich: Rich) -> Self {
+        let n = self.latent.len();
+        self.rich = rich;
+        if rich.momentum.is_some() {
+            self.mom = vec![0; n];
+        }
+        if rich.curvature.is_some() {
+            self.curv = vec![0; n];
+        }
+        if rich.dampen {
+            self.damp = vec![0; n];
+        }
+        if rich.average.is_some() {
+            self.avg = self.latent.clone();
+        }
+        self
+    }
+
+    /// Trits from the averaged latent (the deployed model when averaging is on).
+    fn averaged_trits(&self) -> Option<Vec<i8>> {
+        self.rich.average?;
+        Some(
+            self.avg
+                .iter()
+                .map(|&a| {
+                    let a = i64::from(a);
+                    ((a + a.signum() * (S / 2)) / S).clamp(-1, 1) as i8
+                })
+                .collect(),
+        )
+    }
+
+    /// Exact per-example diagonal Gauss-Newton of the squared loss, in 2⁻²² units:
+    /// output weight (k, j): 2·(h_j/8)² = h_j²·2¹⁷;
+    /// input weight (j, i), active ReLU: 2·Σ_k (w2[k,j]·p_i / 2¹¹)² = 2·p_i²·Σ_k w2[k,j]².
+    fn gauss_newton(model: &Model, x: &Example) -> Vec<u64> {
+        let a = model.forward(x);
+        let split = model.inputs * model.hidden;
+        let mut c = vec![0u64; model.trits.len()];
+        for k in 0..model.outputs {
+            for j in 0..model.hidden {
+                let h = a.hidden[j].unsigned_abs();
+                c[split + k * model.hidden + j] = (h * h) << 17;
+            }
+        }
+        for j in 0..model.hidden {
+            if a.hidden[j] == 0 {
+                continue;
+            }
+            let s2: u64 = (0..model.outputs)
+                .map(|k| u64::from(model.trits[split + k * model.hidden + j] != 0))
+                .sum();
+            if s2 == 0 {
+                continue;
+            }
+            for (ci, &p) in c[j * model.inputs..(j + 1) * model.inputs]
+                .iter_mut()
+                .zip(&x.pixels)
+            {
+                *ci = 2 * u64::from(p) * u64::from(p) * s2;
+            }
+        }
+        c
     }
 
     /// Allocated optimizer state (latent + moments), from actual capacities.
     fn state_bytes(&self) -> usize {
         4 * (self.latent.capacity() + self.m.capacity() + self.v.capacity())
             + 2 * self.latent16.capacity()
+            + 4 * (self.mom.capacity() + self.avg.capacity())
+            + 8 * self.curv.capacity()
+            + self.damp.capacity()
     }
 
     /// Full integer gradient in 2⁻¹¹ units: the numerator of `Model::sensitivity` without its
@@ -168,6 +266,10 @@ impl Carry {
     }
 
     fn step(&mut self, model: &mut Model, x: &Example) {
+        if self.kind == Kind::Rich {
+            self.step_rich(model, x);
+            return;
+        }
         let g = Self::gradient(model, x);
         if self.kind == Kind::Adam {
             // β1 = 1 − 2⁻³, β2 = 1 − 2⁻¹⁰.
@@ -197,7 +299,7 @@ impl Carry {
                 continue;
             }
             let delta = match self.kind {
-                Kind::Sgd16 => unreachable!("handled above"),
+                Kind::Sgd16 | Kind::Rich => unreachable!("handled above"),
                 Kind::Sgd => -(grad >> self.lr.clamp(0, 62)),
                 Kind::Adam => {
                     let gi = grad.clamp(i64::from(i32::MIN) / 2, i64::from(i32::MAX) / 2);
@@ -219,7 +321,7 @@ impl Carry {
                 continue;
             }
             let bound = match self.kind {
-                Kind::Sgd => i64::from(i32::MAX),
+                Kind::Sgd | Kind::Rich => i64::from(i32::MAX),
                 Kind::Adam | Kind::Sgd16 => 8 * S,
             };
             let latent = (i64::from(self.latent[i]) + delta).clamp(-bound, bound);
@@ -227,6 +329,79 @@ impl Carry {
             // The trit is the rounded latent: the carried remainder is never discarded.
             let t = ((latent + latent.signum() * (S / 2)) / S).clamp(-1, 1) as i8;
             self.apply(model, i, t);
+        }
+    }
+
+    fn step_rich(&mut self, model: &mut Model, x: &Example) {
+        let g = Self::gradient(model, x);
+        let n = g.len();
+        let split = model.inputs * model.hidden;
+        // Curvature: EMA of the exact per-example Gauss-Newton diagonal, and per-layer damping.
+        let mut delta_layer = [0u128; 2];
+        if let Some((ema, dshift)) = self.rich.curvature {
+            let gn = Self::gauss_newton(model, x);
+            for (c, &e) in self.curv.iter_mut().zip(&gn) {
+                let cur = i128::from(*c);
+                *c = (cur + ((i128::from(e) - cur) >> ema)).max(0) as u64;
+            }
+            for (layer, range) in [(0usize, 0..split), (1, split..n)] {
+                let len = range.len() as u128;
+                let mean = self.curv[range]
+                    .iter()
+                    .map(|&c| u128::from(c))
+                    .sum::<u128>()
+                    / len;
+                delta_layer[layer] = (mean >> dshift).max(1);
+            }
+        }
+        for (i, &grad) in g.iter().enumerate() {
+            // Step direction, in latent units for curvature, in gradient units otherwise.
+            let mut step: i64 = if self.rich.curvature.is_some() {
+                let layer = usize::from(i >= split);
+                let denom = u128::from(self.curv[i]) + delta_layer[layer];
+                // Newton fraction 2^-lr of g/(c+δ): Δlatent = g·2^(27−lr) / (c + δ).
+                let num = i128::from(grad) << (27 - self.lr.clamp(0, 27) as u32);
+                (num / denom as i128).clamp(i128::from(i32::MIN) / 2, i128::from(i32::MAX) / 2)
+                    as i64
+            } else {
+                grad
+            };
+            if let Some(k) = self.rich.momentum {
+                let m = i64::from(self.mom[i]);
+                let next = (m + ((step - m) >> k)).clamp(i64::from(i32::MIN), i64::from(i32::MAX));
+                self.mom[i] = next as i32;
+                step = next;
+            }
+            let mut delta = if self.rich.curvature.is_some() {
+                -step
+            } else {
+                -(step >> self.lr.clamp(0, 62))
+            };
+            if self.rich.dampen {
+                delta >>= self.damp[i];
+            }
+            if delta != 0 {
+                // Same bound as carry-sgd, so `rich` with no options is carry-sgd exactly.
+                let bound = i64::from(i32::MAX);
+                let latent = (i64::from(self.latent[i]) + delta).clamp(-bound, bound);
+                self.latent[i] = latent as i32;
+                let t = ((latent + latent.signum() * (S / 2)) / S).clamp(-1, 1) as i8;
+                let reversals = self.reversals;
+                self.apply(model, i, t);
+                if self.rich.dampen && self.reversals > reversals {
+                    self.damp[i] = (self.damp[i] + 1).min(8);
+                }
+            }
+            if let Some(k) = self.rich.average {
+                let a = i64::from(self.avg[i]);
+                self.avg[i] = (a + ((i64::from(self.latent[i]) - a) >> k)) as i32;
+            }
+        }
+        self.steps += 1;
+        if self.rich.dampen && self.steps.is_multiple_of(1024) {
+            for d in &mut self.damp {
+                *d = d.saturating_sub(1);
+            }
         }
     }
 
@@ -267,6 +442,7 @@ fn main() -> Result<(), String> {
         "carry-sgd" => Kind::Sgd,
         "carry-sgd16" => Kind::Sgd16,
         "carry-adam" => Kind::Adam,
+        "rich" => Kind::Rich,
         other => return Err(format!("unknown optimizer {other}")),
     };
     let num = |k: &str, d: i64| -> Result<i64, String> {
@@ -288,7 +464,30 @@ fn main() -> Result<(), String> {
     let eval = &eval[eval_offset..eval_offset + eval_limit];
     // Same initial trits and fresh-example order as ternary_lab for this seed.
     let mut model = Model::new(784, 128, 10, &mut Rng(seed));
-    let mut opt = Carry::new(&model, kind, lr);
+    let opt_shift = |k: &str| -> Result<Option<u32>, String> {
+        arg(&args, k)
+            .map(|v| v.parse().map_err(|_| format!("invalid {k}")))
+            .transpose()
+    };
+    let rich = Rich {
+        momentum: opt_shift("--momentum")?,
+        curvature: match (opt_shift("--curv-ema")?, opt_shift("--curv-damp")?) {
+            (Some(e), Some(d)) => Some((e, d)),
+            (None, None) => None,
+            _ => return Err("--curv-ema and --curv-damp go together".into()),
+        },
+        dampen: arg(&args, "--dampen") == Some("yes"),
+        average: opt_shift("--average")?,
+    };
+    if kind != Kind::Rich
+        && (rich.momentum.is_some()
+            || rich.curvature.is_some()
+            || rich.dampen
+            || rich.average.is_some())
+    {
+        return Err("rich-state options need --optimizer rich".into());
+    }
+    let mut opt = Carry::new(&model, kind, lr).with_rich(rich);
     opt.stochastic = arg(&args, "--stochastic") == Some("yes");
     let initial = evaluate(&model, eval);
     let start = std::time::Instant::now();
@@ -301,15 +500,28 @@ fn main() -> Result<(), String> {
     }
     let elapsed = start.elapsed().as_millis();
     model.validate()?;
-    let (loss, correct) = evaluate(&model, eval);
+    // With averaging on, the deployed model is round(average); the fast latent is reported too.
+    let (fast_loss, fast_correct) = evaluate(&model, eval);
+    let (loss, correct) = match opt.averaged_trits() {
+        Some(trits) => {
+            let mut deployed = model.clone();
+            deployed.trits = trits;
+            evaluate(&deployed, eval)
+        }
+        None => (fast_loss, fast_correct),
+    };
     let n = model.trits.len();
     let report = serde_json::json!({
         "optimizer": match kind {
             Kind::Sgd => "carry-sgd",
             Kind::Sgd16 => "carry-sgd16",
             Kind::Adam => "carry-adam",
+            Kind::Rich => "rich",
         },
         "stochastic_rounding": opt.stochastic,
+        "rich": format!("{:?}", opt.rich),
+        "fast_accuracy": fast_correct as f64 / eval.len() as f64,
+        "fast_mean_loss": fast_loss as f64 / eval.len() as f64,
         "seed": seed, "steps": steps, "lr": lr, "latent_units_per_trit": if kind == Kind::Sgd16 { S16 } else { S },
         "evaluation_offset": eval_offset, "evaluation_count": eval.len(),
         "initial_loss_sum": initial.0, "initial_correct": initial.1,
@@ -376,6 +588,41 @@ mod tests {
                 .zip(&before)
                 .all(|(&l, &t)| l == i32::from(t) * S as i32)
         );
+    }
+
+    /// `rich` with every option off is `carry-sgd`, bit for bit.
+    #[test]
+    fn rich_without_options_is_carry_sgd() {
+        let (m0, _) = tiny();
+        let xs: Vec<Example> = (0..40u8)
+            .map(|k| Example {
+                pixels: vec![k.wrapping_mul(37), 200 - k, k, 255 - k],
+                label: usize::from(k % 2),
+            })
+            .collect();
+        let (mut a, mut b) = (m0.clone(), m0.clone());
+        let mut sgd = Carry::new(&a, Kind::Sgd, 2);
+        let mut rich = Carry::new(&b, Kind::Rich, 2).with_rich(Rich::default());
+        for x in &xs {
+            sgd.step(&mut a, x);
+            rich.step(&mut b, x);
+        }
+        assert_eq!(a.trits, b.trits);
+        assert_eq!(sgd.latent, rich.latent);
+    }
+
+    /// Gauss-Newton diagonal agrees with a finite second difference of the unrounded output map
+    /// for an output-layer weight: d²L/dw² = 2·(h/8)².
+    #[test]
+    fn gauss_newton_output_layer_is_exact() {
+        let (m, x) = tiny();
+        let a = m.forward(&x);
+        let c = Carry::gauss_newton(&m, &x);
+        let split = m.inputs * m.hidden;
+        for j in 0..m.hidden {
+            let h = a.hidden[j] as u64;
+            assert_eq!(c[split + j], (h * h) << 17);
+        }
     }
 
     #[test]

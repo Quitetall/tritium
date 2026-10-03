@@ -1,0 +1,48 @@
+mom-k2-lr2 --momentum 2 --lr 2
+mom-k2-lr3 --momentum 2 --lr 3
+mom-k2-lr4 --momentum 2 --lr 4
+mom-k2-lr5 --momentum 2 --lr 5
+mom-k2-lr6 --momentum 2 --lr 6
+mom-k3-lr2 --momentum 3 --lr 2
+mom-k3-lr3 --momentum 3 --lr 3
+mom-k3-lr4 --momentum 3 --lr 4
+mom-k3-lr5 --momentum 3 --lr 5
+mom-k3-lr6 --momentum 3 --lr 6
+mom-k4-lr2 --momentum 4 --lr 2
+mom-k4-lr3 --momentum 4 --lr 3
+mom-k4-lr4 --momentum 4 --lr 4
+mom-k4-lr5 --momentum 4 --lr 5
+mom-k4-lr6 --momentum 4 --lr 6
+avg-k8-lr3 --average 8 --lr 3
+avg-k8-lr4 --average 8 --lr 4
+avg-k8-lr5 --average 8 --lr 5
+avg-k10-lr3 --average 10 --lr 3
+avg-k10-lr4 --average 10 --lr 4
+avg-k10-lr5 --average 10 --lr 5
+avg-k12-lr3 --average 12 --lr 3
+avg-k12-lr4 --average 12 --lr 4
+avg-k12-lr5 --average 12 --lr 5
+damp-lr2 --dampen yes --lr 2
+damp-lr3 --dampen yes --lr 3
+damp-lr4 --dampen yes --lr 4
+damp-lr5 --dampen yes --lr 5
+gn-d0-lr2 --curv-ema 6 --curv-damp 0 --lr 2
+gn-d0-lr4 --curv-ema 6 --curv-damp 0 --lr 4
+gn-d0-lr6 --curv-ema 6 --curv-damp 0 --lr 6
+gn-d0-lr8 --curv-ema 6 --curv-damp 0 --lr 8
+gn-d0-lr10 --curv-ema 6 --curv-damp 0 --lr 10
+gn-d2-lr2 --curv-ema 6 --curv-damp 2 --lr 2
+gn-d2-lr4 --curv-ema 6 --curv-damp 2 --lr 4
+gn-d2-lr6 --curv-ema 6 --curv-damp 2 --lr 6
+gn-d2-lr8 --curv-ema 6 --curv-damp 2 --lr 8
+gn-d2-lr10 --curv-ema 6 --curv-damp 2 --lr 10
+gn-d4-lr2 --curv-ema 6 --curv-damp 4 --lr 2
+gn-d4-lr4 --curv-ema 6 --curv-damp 4 --lr 4
+gn-d4-lr6 --curv-ema 6 --curv-damp 4 --lr 6
+gn-d4-lr8 --curv-ema 6 --curv-damp 4 --lr 8
+gn-d4-lr10 --curv-ema 6 --curv-damp 4 --lr 10
+gn-d6-lr2 --curv-ema 6 --curv-damp 6 --lr 2
+gn-d6-lr4 --curv-ema 6 --curv-damp 6 --lr 4
+gn-d6-lr6 --curv-ema 6 --curv-damp 6 --lr 6
+gn-d6-lr8 --curv-ema 6 --curv-damp 6 --lr 8
+gn-d6-lr10 --curv-ema 6 --curv-damp 6 --lr 10

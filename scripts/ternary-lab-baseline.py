@@ -59,6 +59,7 @@ def run(a):
         values.append(value-1)
     w1 = torch.nn.Parameter(torch.tensor(values[:784*128], dtype=torch.float32).reshape(128, 784))
     w2 = torch.nn.Parameter(torch.tensor(values[784*128:], dtype=torch.float32).reshape(10, 128))
+    ema = [w1.detach().clone(), w2.detach().clone()] if a.average_decay > 0 else None
     optimizer = (torch.optim.Adam([w1, w2], lr=a.lr) if a.optimizer == "adam"
                  else torch.optim.SGD([w1, w2], lr=a.lr))
 
@@ -83,9 +84,18 @@ def run(a):
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
+        if ema is not None:
+            with torch.no_grad():
+                for e, w in zip(ema, (w1, w2)):
+                    e.mul_(1 - a.average_decay).add_(w, alpha=a.average_decay)
         contraction_terms += 2*(784*128+128*10)+128*10
         completed += 1
     elapsed = time.monotonic()-start
+    if ema is not None:
+        # Deploy the averaged master weights (Polyak/EMA), quantized as in training.
+        with torch.no_grad():
+            w1.copy_(ema[0])
+            w2.copy_(ema[1])
     with torch.no_grad():
         out = forward(x[55000+a.eval_offset:55000+a.eval_offset+a.eval_limit])
         labels = y[55000+a.eval_offset:55000+a.eval_offset+a.eval_limit]
@@ -105,7 +115,7 @@ def run(a):
         torch.save({"w1": w1.detach(), "w2": w2.detach(), "optimizer": optimizer.state_dict(),
                     "seed": a.seed, "completed_steps": completed}, stream)
     result = {"algorithm": f"fp32-ste-{a.optimizer}", "seed": a.seed, "steps": completed, "contraction_terms": contraction_terms,
-              "lr": a.lr, "evaluation_count": len(labels), "loss_sum": loss,
+              "lr": a.lr, "average_decay": a.average_decay, "evaluation_count": len(labels), "loss_sum": loss,
               "correct": correct, "elapsed_training_seconds": elapsed,
               "master_moments_bytes": sum(p.numel()*12 for p in (w1, w2)),
               "qualification": "UNKNOWN", "split": "validation",
@@ -135,6 +145,7 @@ if __name__ == "__main__":
     p.add_argument("--lr", type=float, default=0.001)
     p.add_argument("--threads", type=int, default=1)
     p.add_argument("--optimizer", choices=["adam", "sgd"], default="adam")
+    p.add_argument("--average-decay", type=float, default=0.0)
     args = p.parse_args()
     if args.seed <= 0 or args.steps < 0 or not 0 < args.eval_limit <= 5000 or not 0 <= args.eval_offset < 5000 or args.eval_offset+args.eval_limit > 5000:
         p.error("invalid seed, steps, or evaluation limit")
