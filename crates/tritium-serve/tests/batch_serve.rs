@@ -687,6 +687,7 @@ async fn cuda_batched_admission_interleaves_live_slot() {
     };
     // Warm: graph capture + first prefill paths off the clock.
     let _ = chat(&router, &join_ids(8), 2).await;
+    let disconnects_before = metric(&router, "tritium_stream_disconnects_total").await;
     let warm_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let (reservations_before, releases_before) = loop {
         let capacity = metric(&router, "tritium_kv_pool_capacity_tokens").await;
@@ -784,6 +785,60 @@ async fn cuda_batched_admission_interleaves_live_slot() {
             "paged-KV reservations did not return exactly once: capacity={capacity}, free={free}, \
              reservations={reservations} (before {reservations_before}), \
              releases={releases} (before {releases_before}), failures={release_failures}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    // C: cancel a fresh long-prompt request while the worker reports prefill.
+    // Waiting for the phase gauge plus the third reservation ties the abort to
+    // this request, not to a timer or the previous decode workload.
+    let prefill_deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+    while metric(&router, "tritium_worker_phase{phase=\"idle\"}").await != 1 {
+        assert!(
+            std::time::Instant::now() < prefill_deadline,
+            "worker did not return to idle before prefill-cancellation case"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let (c_handle, _) = spawn_stream(&router, &join_ids(3072), 4);
+    loop {
+        let prefill = metric(&router, "tritium_worker_phase{phase=\"prefill\"}").await;
+        let reservations = metric(&router, "tritium_kv_pool_reservations_total").await;
+        if prefill == 1 && reservations - reservations_before == 3 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < prefill_deadline,
+            "request C did not enter prefill: prefill={prefill}, \
+             reservations={reservations} (before {reservations_before})"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    c_handle.abort(); // dropping the SSE receiver cancels the in-flight prefill
+
+    loop {
+        let capacity = metric(&router, "tritium_kv_pool_capacity_tokens").await;
+        let free = metric(&router, "tritium_kv_pool_free_tokens").await;
+        let reservations = metric(&router, "tritium_kv_pool_reservations_total").await;
+        let releases = metric(&router, "tritium_kv_pool_releases_total").await;
+        let release_failures = metric(&router, "tritium_kv_pool_release_failures_total").await;
+        let disconnects = metric(&router, "tritium_stream_disconnects_total").await;
+        if capacity == 4096
+            && free == capacity
+            && reservations - reservations_before == 3
+            && releases - releases_before == 3
+            && release_failures == 0
+            && disconnects - disconnects_before == 2
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < prefill_deadline,
+            "decode/prefill cancellation did not reclaim exactly once: \
+             capacity={capacity}, free={free}, reservations={reservations} \
+             (before {reservations_before}), releases={releases} \
+             (before {releases_before}), failures={release_failures}, \
+             disconnects={disconnects} (before {disconnects_before})"
         );
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
