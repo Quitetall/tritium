@@ -295,6 +295,32 @@ contract, native session identity and ordered S2KF evidence-set digest. Its
 reopen path is covered with a fake native session in unit tests only; no real
 Qwen capture receipt or complete 506-record evidence namespace exists yet.
 
+### Durable campaign workspace relocation (2026-10-03)
+
+The discovered PTQ work directory, legacy S2KF records, and token pack were
+moved out of `/mnt/4tb/tmp` to
+`/mnt/4tb/tritium-qwen36-campaign-20260813/{ptq-work,s2kf-evidence,token-pack}`.
+The pinned Qwen source snapshot remains at
+`/mnt/4tb/qwen36-27b-source-6a9e13bd6fc8f0983b9b99948120bc37f49c13e9`.
+The move preserved the campaign descriptor and its incomplete temporary
+record; a fresh read-only status probe still reports `stalled`, zero of 506
+published additive masters, no seal, and a dead owner PID for the
+447,083,070-byte temporary record.
+
+The durable S2KF directory contains 506 records. A byte comparison against the
+remaining `/mnt/4tb/tmp/qwen36-evidence-a417374-1seq-clean-20260821` alias
+found no differing record files; the durable directory additionally retains
+`.staging` and `source-admission.json`. The two record-name sets share hardlinked
+files on the same filesystem, so moving one directory did not free the record
+payload blocks while the other alias remains.
+
+This relocation is preservation only. The legacy S2KF set still has the
+calibration token-stream mismatch documented above and is not admissible for
+master fitting. Do not resume fitting from it. The verified token pack and
+replay contract still need a real native capture, a persisted source-bound
+capture receipt, and a fresh reopen of all 506 records before fitting may
+start. No compute was started during the relocation.
+
 ### Hosted package evidence from PR #51 (2026-10-01)
 
 PR #51 (`bbbafd99cada6dab821cea63e5cdf971f1ce79fb`) has successful hosted
