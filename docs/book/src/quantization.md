@@ -202,6 +202,24 @@ version 1.
 
 ## Stage-7 full recipe freeze
 
+Before rebinding a campaign template, produce the native CUDA receipt from a
+clean source checkout. This runs all 144 frozen codec/group/plane/dispatch
+cases under Compute Sanitizer, validates the measurements with the Stage-7
+qualifier, and publishes the receipt and sanitizer log without replacing
+existing files:
+
+```sh
+python scripts/run-stage7-native-matrix.py \
+  --output /evidence/stage7/native/native-receipt.json \
+  --device 0 \
+  --target-dir /mnt/4tb/tritium-stage7-target
+```
+
+The host needs the CUDA toolkit and Compute Sanitizer. The command refuses a
+dirty source checkout; the receipt is tied to its exact `HEAD`. This native
+kernel receipt is only one prerequisite: the smoke and HESTIA receipts must
+also be current before campaign rebinding.
+
 The full 1.7B successive-halving campaign is driven by the source-bound
 orchestrator:
 

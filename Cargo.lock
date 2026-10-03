@@ -4724,6 +4724,7 @@ dependencies = [
 name = "tritium-cuda"
 version = "1.1.0-rc.2"
 dependencies = [
+ "anyhow",
  "cudarc",
  "half",
  "linkme",
