@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Rebind a pre-evidence Stage-7 campaign plan to clean repository HEAD.
 
-This tool changes only the campaign source revision and run identity. It does
-not copy, invent, or qualify measurements. Existing output is never replaced.
+This tool changes the campaign source revision and run identity, and can build
+the prerequisite receipt index from three supplied receipts. It does not copy,
+invent, or qualify measurements. Existing output is never replaced.
 """
 
 from __future__ import annotations
@@ -142,6 +143,42 @@ def _open_record(root: Path, record: Any, label: str) -> Path:
     return path
 
 
+def _receipt_record(root: Path, path: Path, kind: str) -> dict[str, Any]:
+    """Create a contained campaign file record for one prerequisite receipt."""
+    candidate = path if path.is_absolute() else root / path
+    try:
+        relative = candidate.relative_to(root)
+    except ValueError as error:
+        raise RebindError(
+            f"{kind} receipt must be inside the campaign evidence directory"
+        ) from error
+    logical = PurePosixPath(relative.as_posix())
+    if (
+        logical.is_absolute()
+        or ".." in logical.parts
+        or "\\" in logical.as_posix()
+        or logical.as_posix() in ("", ".")
+    ):
+        raise RebindError(f"{kind} receipt path is not a contained POSIX path")
+    cursor = root
+    for part in logical.parts:
+        cursor /= part
+        if cursor.is_symlink():
+            raise RebindError(f"{kind} receipt path traverses a symlink")
+    if not candidate.is_file():
+        raise RebindError(f"{kind} receipt must be an ordinary file")
+    size = candidate.stat().st_size
+    if size <= 0 or size > MAX_JSON_BYTES:
+        raise RebindError(f"{kind} receipt exceeds size bounds")
+    payload = candidate.read_bytes()
+    return {
+        "kind": kind,
+        "path": logical.as_posix(),
+        "bytes": len(payload),
+        "sha256": hashlib.sha256(payload).hexdigest(),
+    }
+
+
 def _validate_prerequisites(
     value: dict[str, Any], root: Path, target_revision: str
 ) -> None:
@@ -218,6 +255,9 @@ def rebind(
     source_root: Path,
     run_id: str,
     output: Path,
+    smoke_receipt: Path | None = None,
+    native_kernels_receipt: Path | None = None,
+    hestia_gate_c_receipt: Path | None = None,
 ) -> dict[str, Any]:
     source_root = source_root.resolve(strict=True)
     target_revision = _source_identity(source_root)
@@ -235,6 +275,24 @@ def rebind(
         raise RebindError("campaign is already bound to current HEAD")
     if _count(value, old_revision) != 1:
         raise RebindError("old source revision appears outside top-level campaign identity")
+    supplied_receipts = (
+        smoke_receipt,
+        native_kernels_receipt,
+        hestia_gate_c_receipt,
+    )
+    if any(path is not None for path in supplied_receipts):
+        if not all(path is not None for path in supplied_receipts):
+            raise RebindError("all three prerequisite receipt paths must be supplied together")
+        evidence_root = template.resolve(strict=True).parent
+        value["evidence"] = [
+            _receipt_record(evidence_root, path, kind)
+            for path, kind in zip(
+                supplied_receipts,
+                ("smoke", "native-kernels", "hestia-gate-c"),
+                strict=True,
+            )
+            if path is not None
+        ]
     _validate_prerequisites(
         value, template.resolve(strict=True).parent, target_revision
     )
@@ -259,6 +317,18 @@ def main() -> int:
     parser.add_argument("--source-root", required=True, type=Path)
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument(
+        "--smoke-receipt", type=Path,
+        help="Stage-7 smoke receipt inside the template evidence directory",
+    )
+    parser.add_argument(
+        "--native-kernels-receipt", type=Path,
+        help="Stage-7 native-kernels receipt inside the template evidence directory",
+    )
+    parser.add_argument(
+        "--hestia-gate-c-receipt", type=Path,
+        help="Stage-7 HESTIA gate-C receipt inside the template evidence directory",
+    )
     args = parser.parse_args()
     try:
         result = rebind(
@@ -266,6 +336,9 @@ def main() -> int:
             source_root=args.source_root,
             run_id=args.run_id,
             output=args.output,
+            smoke_receipt=args.smoke_receipt,
+            native_kernels_receipt=args.native_kernels_receipt,
+            hestia_gate_c_receipt=args.hestia_gate_c_receipt,
         )
     except (OSError, RebindError) as error:
         parser.error(str(error))

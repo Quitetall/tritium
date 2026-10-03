@@ -79,6 +79,70 @@ def test_rebind_updates_only_top_level_identity(tmp_path: Path, monkeypatch: pyt
     assert output.read_bytes() == MODULE.canonical(value) + b"\n"
 
 
+def test_rebind_builds_prerequisite_evidence_from_receipt_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    template, source = setup(monkeypatch, tmp_path)
+    value = campaign(evidence=[])
+    value["token_evidence_pack"] = json.loads(template.read_text())["token_evidence_pack"]
+    write(template, value)
+    receipt_paths = tuple(tmp_path / f"{kind}.json" for kind in (
+        "smoke", "native-kernels", "hestia-gate-c",
+    ))
+
+    output = tmp_path / "out" / "campaign.json"
+    MODULE.rebind(
+        template,
+        source_root=source,
+        run_id="current-run",
+        output=output,
+        smoke_receipt=receipt_paths[0],
+        native_kernels_receipt=receipt_paths[1],
+        hestia_gate_c_receipt=receipt_paths[2],
+    )
+
+    rebound = json.loads(output.read_text())
+    assert [record["kind"] for record in rebound["evidence"]] == [
+        "smoke", "native-kernels", "hestia-gate-c",
+    ]
+    for record, receipt_path in zip(rebound["evidence"], receipt_paths, strict=True):
+        assert record["path"] == receipt_path.name
+        assert record["bytes"] == receipt_path.stat().st_size
+        assert record["sha256"] == hashlib.sha256(receipt_path.read_bytes()).hexdigest()
+
+
+def test_rebind_requires_all_receipt_paths_together(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    template, source = setup(monkeypatch, tmp_path)
+    with pytest.raises(MODULE.RebindError, match="all three"):
+        MODULE.rebind(
+            template,
+            source_root=source,
+            run_id="new-run",
+            output=tmp_path / "out.json",
+            smoke_receipt=tmp_path / "smoke.json",
+        )
+
+
+def test_rebind_receipt_paths_must_stay_inside_evidence_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    template, source = setup(monkeypatch, tmp_path)
+    outside = tmp_path.parent / "outside-smoke.json"
+    outside.write_text('{"source_revision":"' + "b" * 40 + '"}')
+    with pytest.raises(MODULE.RebindError, match="inside the campaign evidence directory"):
+        MODULE.rebind(
+            template,
+            source_root=source,
+            run_id="new-run",
+            output=tmp_path / "out.json",
+            smoke_receipt=outside,
+            native_kernels_receipt=tmp_path / "native-kernels.json",
+            hestia_gate_c_receipt=tmp_path / "hestia-gate-c.json",
+        )
+
+
 def test_rebind_rejects_nested_stale_revision(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     template, source = setup(monkeypatch, tmp_path)
     value = campaign()

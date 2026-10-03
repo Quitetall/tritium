@@ -244,12 +244,19 @@ python scripts/rebind-stage7-campaign.py \
   --template /evidence/stage7/campaign-template.json \
   --source-root . \
   --run-id stage7-smollm2-17b-real-$(git rev-parse --short HEAD) \
+  --smoke-receipt /evidence/stage7/smoke.json \
+  --native-kernels-receipt /evidence/stage7/native-kernels.json \
+  --hestia-gate-c-receipt /evidence/stage7/hestia-gate-c.json \
   --output /evidence/stage7/campaign.json
 ```
 
-The rebinder changes only top-level `source_revision` and `run_id`; nested
-stale revisions, dirty trees, malformed templates, and existing outputs fail
-closed. It creates no measurements and does not qualify a recipe freeze.
+The three optional receipt flags must be supplied together. When supplied, the
+rebinder hashes those files and builds the ordered prerequisite evidence list;
+each receipt must live inside the template's evidence directory and name the
+clean target `HEAD`. Without the flags, the template must already contain that
+list. In both modes, nested stale revisions, dirty trees, malformed templates,
+and existing outputs fail closed. Rebinding creates no measurements and does
+not qualify a recipe freeze.
 
 ## SALT V2 Qwen master campaigns
 
