@@ -749,6 +749,17 @@ fn cuda_batch_paged_matches_dense_bit_exact() {
     // Retire row 0: pages return to the pool; both twins go dead.
     paged.release_pages(0).expect("release");
     assert_eq!(paged.free_pages(), 1, "row0's page must come back");
+    // Cancellation/retirement cleanup may converge on the same row through
+    // more than one path. Releasing a vacated row again must not duplicate a
+    // page in the free list (which could let two rows alias the same KV page).
+    paged
+        .release_pages(0)
+        .expect("repeated release is idempotent");
+    assert_eq!(
+        paged.free_pages(),
+        1,
+        "a page must be returned exactly once"
+    );
     for b in [&mut dense, &mut paged] {
         b.set_live(0, false).expect("retire");
     }
