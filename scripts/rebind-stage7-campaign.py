@@ -29,6 +29,11 @@ MAX_JSON_BYTES = 32 * 1024 * 1024
 HEX = frozenset("0123456789abcdef")
 RUN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 FILE_FIELDS = {"path", "bytes", "sha256"}
+RECEIPT_SCHEMAS = {
+    "smoke": "tritium.stage7-smoke.v2",
+    "native-kernels": "tritium.stage7-native-kernels.v1",
+    "hestia-gate-c": "tritium.stage7-hestia-gate-c.v1",
+}
 
 
 class RebindError(ValueError):
@@ -210,8 +215,10 @@ def _validate_prerequisites(
             raise RebindError(f"evidence[{ordinal}] must contain strict UTF-8 JSON") from error
         if (
             not isinstance(receipt, dict)
-            or receipt.get("source_revision") != target_revision
+            or receipt.get("schema") != RECEIPT_SCHEMAS[kind]
         ):
+            raise RebindError(f"evidence[{ordinal}] receipt schema differs")
+        if receipt.get("source_revision") != target_revision:
             raise RebindError(
                 f"evidence[{ordinal}] source revision differs from target HEAD"
             )

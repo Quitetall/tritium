@@ -252,11 +252,11 @@ python scripts/rebind-stage7-campaign.py \
 
 The three optional receipt flags must be supplied together. When supplied, the
 rebinder hashes those files and builds the ordered prerequisite evidence list;
-each receipt must live inside the template's evidence directory and name the
-clean target `HEAD`. Without the flags, the template must already contain that
-list. In both modes, nested stale revisions, dirty trees, malformed templates,
-and existing outputs fail closed. Rebinding creates no measurements and does
-not qualify a recipe freeze.
+each receipt must live inside the template's evidence directory, use the frozen
+receipt schema for its kind, and name the clean target `HEAD`. Without the
+flags, the template must already contain that list. In both modes, nested stale
+revisions, dirty trees, malformed templates, and existing outputs fail closed.
+Rebinding creates no measurements and does not qualify a recipe freeze.
 
 ## SALT V2 Qwen master campaigns
 

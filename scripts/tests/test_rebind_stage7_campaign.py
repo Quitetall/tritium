@@ -43,7 +43,10 @@ def setup(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> tuple[Path, Path]:
     evidence = []
     for index, kind in enumerate(("smoke", "native-kernels", "hestia-gate-c")):
         filename = f"{kind}.json"
-        payload = MODULE.canonical({"kind": kind, "source_revision": "b" * 40})
+        payload = MODULE.canonical({
+            "schema": MODULE.RECEIPT_SCHEMAS[kind],
+            "source_revision": "b" * 40,
+        })
         (tmp_path / filename).write_bytes(payload)
         evidence.append({
             "kind": kind,
@@ -139,6 +142,28 @@ def test_rebind_receipt_paths_must_stay_inside_evidence_directory(
             output=tmp_path / "out.json",
             smoke_receipt=outside,
             native_kernels_receipt=tmp_path / "native-kernels.json",
+            hestia_gate_c_receipt=tmp_path / "hestia-gate-c.json",
+        )
+
+
+def test_rebind_rejects_wrong_prerequisite_receipt_schema(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    template, source = setup(monkeypatch, tmp_path)
+    receipt_path = tmp_path / "native-kernels.json"
+    receipt_path.write_bytes(MODULE.canonical({
+        "schema": "unrelated.receipt.v1",
+        "source_revision": "b" * 40,
+    }))
+
+    with pytest.raises(MODULE.RebindError, match="schema differs"):
+        MODULE.rebind(
+            template,
+            source_root=source,
+            run_id="new-run",
+            output=tmp_path / "out.json",
+            smoke_receipt=tmp_path / "smoke.json",
+            native_kernels_receipt=receipt_path,
             hestia_gate_c_receipt=tmp_path / "hestia-gate-c.json",
         )
 
