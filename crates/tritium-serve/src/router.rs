@@ -1823,8 +1823,22 @@ async fn models(State(st): State<AppState>) -> Response {
     .into_response()
 }
 
+fn effective_queue_depth(channel_depth: usize, parked_jobs: u64) -> usize {
+    channel_depth.saturating_add(usize::try_from(parked_jobs).unwrap_or(usize::MAX))
+}
+
+fn queue_depth(st: &AppState) -> usize {
+    effective_queue_depth(
+        st.jobs.max_capacity() - st.jobs.capacity(),
+        st.runtime
+            .telemetry
+            .parked_queue_jobs
+            .load(Ordering::Acquire),
+    )
+}
+
 async fn health(State(st): State<AppState>) -> Response {
-    let queue_depth = st.jobs.max_capacity() - st.jobs.capacity();
+    let queue_depth = queue_depth(&st);
     if !st.runtime.worker_alive.load(Ordering::Relaxed) {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1910,7 +1924,7 @@ async fn readiness(State(st): State<AppState>) -> Response {
         .kv_pool_release_failures_total
         .load(Ordering::Acquire)
         > 0;
-    let queue_depth = st.jobs.max_capacity() - st.jobs.capacity();
+    let queue_depth = queue_depth(&st);
     let artifact_ready = st
         .runtime
         .production
@@ -1952,7 +1966,7 @@ async fn readiness(State(st): State<AppState>) -> Response {
 /// Prometheus text exposition (behind the same auth as everything else).
 /// Gauges are scrape-time reads; counters live in [`Metrics`].
 async fn metrics(State(st): State<AppState>) -> Response {
-    let queue_depth = st.jobs.max_capacity() - st.jobs.capacity();
+    let queue_depth = queue_depth(&st);
     let phase = st.runtime.phase.load(Ordering::Acquire);
     let request_buckets = st
         .metrics
@@ -2091,7 +2105,7 @@ async fn metrics(State(st): State<AppState>) -> Response {
          tritium_time_to_first_token_seconds_sum {}\n\
          tritium_time_to_first_token_seconds_count {}\n\
          {}{}{}\n\
-         # HELP tritium_queue_depth Jobs waiting in the decode queue.\n\
+         # HELP tritium_queue_depth Jobs waiting in the channel or worker parked slot.\n\
          # TYPE tritium_queue_depth gauge\n\
          tritium_queue_depth {}\n\
          # HELP tritium_worker_alive Decode worker liveness (1 = alive).\n\
@@ -2410,6 +2424,15 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
+
+    #[test]
+    fn queue_depth_includes_the_worker_owned_parked_job() {
+        assert_eq!(effective_queue_depth(0, 0), 0);
+        assert_eq!(effective_queue_depth(0, 1), 1);
+        assert_eq!(effective_queue_depth(3, 1), 4);
+        assert_eq!(effective_queue_depth(usize::MAX, 1), usize::MAX);
+    }
+
     #[test]
     fn request_identity_rejects_an_exhausted_zero_entropy_source() {
         let headers = axum::http::HeaderMap::new();

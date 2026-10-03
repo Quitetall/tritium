@@ -321,6 +321,33 @@ fn release_slot(batch: &mut tritium_cuda::BatchKv, row: usize, telemetry: &Worke
     }
 }
 
+/// Keep the worker-owned FIFO wait visible alongside jobs still in the
+/// bounded channel. There is at most one parked admission in this worker.
+fn park_job(parked: &mut Option<Job>, job: Job, telemetry: &WorkerTelemetry) {
+    assert!(
+        parked.is_none(),
+        "batch worker supports one parked queue job"
+    );
+    *parked = Some(job);
+    telemetry.set_parked_queue_job(true);
+}
+
+fn job_client_gone(job: &Job) -> bool {
+    match job {
+        Job::Generate { tx, .. } => tx.is_closed(),
+        Job::OpenTreeSession { resp, .. } => resp.is_closed(),
+        Job::TreeVerify { resp, .. } => resp.is_closed(),
+    }
+}
+
+fn take_parked_job(parked: &mut Option<Job>, telemetry: &WorkerTelemetry) -> Option<Job> {
+    let job = parked.take();
+    if job.is_some() {
+        telemetry.set_parked_queue_job(false);
+    }
+    job
+}
+
 /// Return shared paged-KV free capacity in logical tokens. Dense batches have
 /// no shared pool and intentionally report zero.
 fn kv_free_tokens(batch: &tritium_cuda::BatchKv) -> usize {
@@ -1438,7 +1465,7 @@ pub(crate) fn run_batched(
             }
             multi = None; // drained slots take their enrollments with them
             tree_open = false;
-            match parked.take() {
+            match take_parked_job(&mut parked, telemetry.as_ref()) {
                 None => {}
                 Some(Job::Generate { tx, .. }) => {
                     let _ = tx.try_send(GenEvent::Error("server draining".into()));
@@ -1455,6 +1482,12 @@ pub(crate) fn run_batched(
                 // drain arm rather than silently dropping a responder.
                 Some(other) => unreachable!("non-admission job parked: {other:?}"),
             }
+        }
+        // A seat-starved job has already left the channel. Do not let a
+        // disconnected client occupy the worker's FIFO parked slot until an
+        // unrelated active generation finishes and a row becomes free.
+        if parked.as_ref().is_some_and(job_client_gone) {
+            let _ = take_parked_job(&mut parked, telemetry.as_ref());
         }
         // Admit into free slots: drain waiting jobs, block only when idle.
         // Cap admissions per pass: instantly-retiring jobs (errors, dead
@@ -1483,7 +1516,7 @@ pub(crate) fn run_batched(
                 if needs_seat && free.is_none() {
                     break; // still no seat; wait for a retirement
                 }
-                parked.take().expect("checked is_some")
+                take_parked_job(&mut parked, telemetry.as_ref()).expect("checked is_some")
             } else if any_live || spec.is_some() {
                 // C4: pull even when the pool is FULL — tree ops need no
                 // seat, and a seatless Generate parks below instead of
@@ -1572,13 +1605,17 @@ pub(crate) fn run_batched(
                             telemetry.as_ref(),
                         );
                         if pending.is_some() {
-                            parked = Some(Job::Generate {
-                                req,
-                                request_span,
-                                queue_span: tracing::Span::none(),
-                                accepted_at,
-                                tx,
-                            });
+                            park_job(
+                                &mut parked,
+                                Job::Generate {
+                                    req,
+                                    request_span,
+                                    queue_span: tracing::Span::none(),
+                                    accepted_at,
+                                    tx,
+                                },
+                                telemetry.as_ref(),
+                            );
                             continue; // pending set: the continuation prefills first
                         }
                         // Defensive migration failure (stream already
@@ -1643,13 +1680,17 @@ pub(crate) fn run_batched(
                     // is pulled past a parked job; it is retried as soon as a
                     // retirement frees a slot).
                     let Some(row) = pool.iter().position(Option::is_none) else {
-                        parked = Some(Job::Generate {
-                            req,
-                            request_span,
-                            queue_span: tracing::Span::none(),
-                            accepted_at,
-                            tx,
-                        });
+                        park_job(
+                            &mut parked,
+                            Job::Generate {
+                                req,
+                                request_span,
+                                queue_span: tracing::Span::none(),
+                                accepted_at,
+                                tx,
+                            },
+                            telemetry.as_ref(),
+                        );
                         break;
                     };
                     // Paged KV (C3): reserve the request's whole footprint up
@@ -1680,13 +1721,17 @@ pub(crate) fn run_batched(
                         // reserve_pages ever grows another error kind, match
                         // on it — a permanent error would park-loop.
                         if reserve_pages(&mut batch, row, needed, telemetry.as_ref()).is_err() {
-                            parked = Some(Job::Generate {
-                                req,
-                                request_span,
-                                queue_span: tracing::Span::none(),
-                                accepted_at,
-                                tx,
-                            });
+                            park_job(
+                                &mut parked,
+                                Job::Generate {
+                                    req,
+                                    request_span,
+                                    queue_span: tracing::Span::none(),
+                                    accepted_at,
+                                    tx,
+                                },
+                                telemetry.as_ref(),
+                            );
                             break;
                         }
                     }
@@ -1740,7 +1785,11 @@ pub(crate) fn run_batched(
                             telemetry.as_ref(),
                         );
                         if pending.is_some() {
-                            parked = Some(Job::OpenTreeSession { prompt, resp });
+                            park_job(
+                                &mut parked,
+                                Job::OpenTreeSession { prompt, resp },
+                                telemetry.as_ref(),
+                            );
                             continue;
                         }
                     }

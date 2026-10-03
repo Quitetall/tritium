@@ -65,9 +65,19 @@ pub(crate) struct WorkerTelemetry {
     pub(crate) kv_pool_releases_total: AtomicU64,
     /// Failed page-release attempts; nonzero means reclamation needs review.
     pub(crate) kv_pool_release_failures_total: AtomicU64,
+    /// Jobs removed from the bounded channel but still waiting in the batch
+    /// worker's single FIFO parked slot.
+    pub(crate) parked_queue_jobs: AtomicU64,
 }
 
 impl WorkerTelemetry {
+    /// Publish whether the batch worker currently owns one waiting job outside
+    /// the channel (seat- or page-starved admission).
+    pub(crate) fn set_parked_queue_job(&self, parked: bool) {
+        self.parked_queue_jobs
+            .store(u64::from(parked), Ordering::Release);
+    }
+
     /// Publish current paged-KV capacity/free gauges. Dense batches publish
     /// zero for both values instead of pretending their per-slot arenas are a
     /// shared pool.

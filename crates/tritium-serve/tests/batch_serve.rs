@@ -91,7 +91,7 @@ async fn chat(router: &Router, prompt_ids: &str, max_tokens: usize) -> String {
         .to_owned()
 }
 
-async fn metric(router: &Router, name: &str) -> u64 {
+async fn metrics_text(router: &Router) -> String {
     let req = Request::get("/metrics")
         .body(Body::empty())
         .expect("metrics request");
@@ -103,13 +103,20 @@ async fn metric(router: &Router, name: &str) -> u64 {
         .await
         .expect("metrics body")
         .to_bytes();
-    let text = String::from_utf8(bytes.to_vec()).expect("metrics UTF-8");
+    String::from_utf8(bytes.to_vec()).expect("metrics UTF-8")
+}
+
+fn metric_value(text: &str, name: &str) -> u64 {
     text.lines()
         .find_map(|line| {
             line.strip_prefix(name)
                 .and_then(|value| value.trim().parse::<u64>().ok())
         })
         .unwrap_or_else(|| panic!("metric {name} absent from /metrics:\n{text}"))
+}
+
+async fn metric(router: &Router, name: &str) -> u64 {
+    metric_value(&metrics_text(router).await, name)
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -839,6 +846,118 @@ async fn cuda_batched_admission_interleaves_live_slot() {
              (before {reservations_before}), releases={releases} \
              (before {releases_before}), failures={release_failures}, \
              disconnects={disconnects} (before {disconnects_before})"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    // D and E occupy both slots. F must stay in the queue, and canceling F
+    // must not acquire or release KV pages. Then cancel D/E during decode and
+    // require their two real reservations to return exactly once.
+    let (d_handle, d_times) = spawn_stream(&router, &join_ids(16), 1024);
+    let (e_handle, e_times) = spawn_stream(&router, &join_ids(17), 1024);
+    let active_deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+    while d_times.lock().expect("times lock").len() < 4
+        || e_times.lock().expect("times lock").len() < 4
+    {
+        assert!(
+            std::time::Instant::now() < active_deadline,
+            "requests D and E did not occupy both decode slots"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(!d_handle.is_finished() && !e_handle.is_finished());
+    let before_queue = metrics_text(&router).await;
+    let queue_reservations_before =
+        metric_value(&before_queue, "tritium_kv_pool_reservations_total");
+    let queue_releases_before = metric_value(&before_queue, "tritium_kv_pool_releases_total");
+    let queue_disconnects_before = metric_value(&before_queue, "tritium_stream_disconnects_total");
+    let queue_rejections_before = metric_value(&before_queue, "tritium_queue_rejections_total");
+    let chat_requests_before = metric_value(&before_queue, "tritium_chat_requests_total");
+    let (f_handle, f_times) = spawn_stream(&router, &join_ids(18), 4);
+    loop {
+        let text = metrics_text(&router).await;
+        let queue_depth = metric_value(&text, "tritium_queue_depth");
+        let queue_rejections = metric_value(&text, "tritium_queue_rejections_total");
+        let chat_requests = metric_value(&text, "tritium_chat_requests_total");
+        assert!(
+            !d_handle.is_finished() && !e_handle.is_finished() && !f_handle.is_finished(),
+            "a stream finished before the full-queue observation: queue_depth={queue_depth}, \
+             chat_requests={chat_requests} (before {chat_requests_before}), \
+             queue_rejections={queue_rejections} (before {queue_rejections_before})"
+        );
+        assert_eq!(
+            queue_rejections, queue_rejections_before,
+            "request F was rejected instead of queued"
+        );
+        if chat_requests - chat_requests_before == 1 && queue_depth == 1 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < active_deadline,
+            "request F was accepted but queue depth did not include the waiting job: \
+             queue_depth={queue_depth}, chat_requests={chat_requests} \
+             (before {chat_requests_before}), queue_rejections={queue_rejections}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(f_times.lock().expect("times lock").is_empty());
+    f_handle.abort();
+    let queued_cancel_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let text = metrics_text(&router).await;
+        let queue_depth = metric_value(&text, "tritium_queue_depth");
+        let reservations = metric_value(&text, "tritium_kv_pool_reservations_total");
+        let releases = metric_value(&text, "tritium_kv_pool_releases_total");
+        let disconnects = metric_value(&text, "tritium_stream_disconnects_total");
+        if queue_depth == 0
+            && reservations == queue_reservations_before
+            && releases == queue_releases_before
+            && disconnects - queue_disconnects_before == 1
+            && !d_handle.is_finished()
+            && !e_handle.is_finished()
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < queued_cancel_deadline,
+            "queued cancellation changed KV ownership or did not settle: \
+             queue_depth={queue_depth}, reservations={reservations} \
+             (before {queue_reservations_before}), releases={releases} \
+             (before {queue_releases_before}), disconnects={disconnects} \
+             (before {queue_disconnects_before}), D/E finished=({}, {})",
+            d_handle.is_finished(),
+            e_handle.is_finished(),
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    d_handle.abort();
+    e_handle.abort();
+    let _ = d_handle.await;
+    let _ = e_handle.await;
+    loop {
+        let free = metric(&router, "tritium_kv_pool_free_tokens").await;
+        let reservations = metric(&router, "tritium_kv_pool_reservations_total").await;
+        let releases = metric(&router, "tritium_kv_pool_releases_total").await;
+        let release_failures = metric(&router, "tritium_kv_pool_release_failures_total").await;
+        let disconnects = metric(&router, "tritium_stream_disconnects_total").await;
+        if free == 4096
+            // D/E acquired their reservations before the snapshot taken for
+            // F. Canceling them must release those existing reservations,
+            // not create new ones.
+            && reservations == queue_reservations_before
+            && releases - queue_releases_before == 2
+            && release_failures == 0
+            && disconnects - queue_disconnects_before == 3
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < active_deadline,
+            "active cancellations failed to restore pool: free={free}, \
+             reservations={reservations} (before {queue_reservations_before}), \
+             releases={releases} (before {queue_releases_before}), \
+             failures={release_failures}, disconnects={disconnects} \
+             (before {queue_disconnects_before})"
         );
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
