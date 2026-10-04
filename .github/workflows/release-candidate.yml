@@ -1,0 +1,226 @@
+# Build and assemble a release candidate from one exact commit without publishing.
+# This is intentionally separate from release.yml: dispatching this workflow has
+# no registry credentials, tag mutation, GitHub Release, or publication jobs.
+name: release candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_revision:
+        description: Full Git commit SHA to package and bind into the candidate
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-candidate-${{ inputs.source_revision }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: resolve exact candidate source
+    runs-on: ubuntu-24.04
+    outputs:
+      revision: ${{ steps.source.outputs.revision }}
+      version: ${{ steps.source.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source_revision }}
+          fetch-depth: 1
+      - name: verify exact candidate identity
+        id: source
+        shell: bash
+        env:
+          REQUESTED_REVISION: ${{ inputs.source_revision }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$REQUESTED_REVISION" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::source_revision must be a full lowercase Git SHA-1"
+            exit 1
+          fi
+          actual="$(git rev-parse HEAD)"
+          [ "$actual" = "$REQUESTED_REVISION" ] || {
+            echo "::error::checked-out source differs from requested revision"
+            exit 1
+          }
+          version="$(python3 -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("Cargo.toml").read_text())["workspace"]["package"]["version"])')"
+          if ! [[ "$version" =~ ^1\.1\.0-rc\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::candidate version is not canonical 1.1.0-rc.N"
+            exit 1
+          fi
+          printf 'revision=%s\nversion=%s\n' "$actual" "$version" >> "$GITHUB_OUTPUT"
+
+  wheels:
+    name: build release wheels
+    needs: resolve
+    uses: ./.github/workflows/wheels.yml
+    with:
+      source_ref: ${{ needs.resolve.outputs.revision }}
+      source_revision: ${{ needs.resolve.outputs.revision }}
+    permissions:
+      contents: read
+
+  package-evidence:
+    name: build crate and npm evidence
+    needs: resolve
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.revision }}
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.98.0
+          targets: wasm32-unknown-unknown
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: packages/tritium-web/package-lock.json
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v6.1.0
+        with:
+          python-version: "3.11"
+      - name: install locked packaging tools
+        run: |
+          set -euo pipefail
+          cargo install cargo-cyclonedx --locked
+          cargo install wasm-bindgen-cli --version 0.2.126 --locked
+      - name: package and qualify Rust crates
+        env:
+          SOURCE_REVISION: ${{ needs.resolve.outputs.revision }}
+          RELEASE_VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          ./scripts/check-publish.sh
+          mkdir -p release-artifacts/crates
+          cp target/package/*.crate release-artifacts/crates/
+          python scripts/generate-crate-sboms.py \
+            --archives target/package \
+            --output release-artifacts/crates \
+            --source-revision "$SOURCE_REVISION" \
+            --source-date-epoch 0
+          python scripts/qualify-crate-archives.py \
+            --archives target/package \
+            --source-revision "$SOURCE_REVISION" \
+            --release "$RELEASE_VERSION" \
+            --run-id "github-${{ github.run_id }}-${{ github.run_attempt }}-crate-archives" \
+            --output release-artifacts/crates/crate-archive-qualification.json
+      - name: package and qualify npm archive
+        working-directory: packages/tritium-web
+        env:
+          TRITIUM_NPM_EVIDENCE_DIR: ${{ github.workspace }}/release-artifacts/npm
+          TRITIUM_NPM_RUN_ID: github-${{ github.run_id }}-${{ github.run_attempt }}-npm-archive
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run check
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: candidate-package-evidence
+          path: release-artifacts/
+          if-no-files-found: error
+
+  assemble:
+    name: assemble and verify candidate bundle
+    needs: [resolve, wheels, package-evidence]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.revision }}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v6.0.0
+        with:
+          pattern: wheel-{linux-x86_64,macos-aarch64,windows-x64}
+          path: downloads/wheels
+          merge-multiple: true
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v6.0.0
+        with:
+          name: candidate-package-evidence
+          path: downloads/package-evidence
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v6.0.0
+        with:
+          name: abi3-compatibility-receipt
+          path: downloads/compatibility-evidence
+      - name: separate candidate payload and evidence receipts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p candidate evidence/wheels evidence/crates evidence/npm evidence/compatibility
+          cp downloads/wheels/*.whl candidate/
+          cp downloads/wheels/*.cdx.json candidate/
+          for receipt in downloads/wheels/*.json; do
+            case "$receipt" in *.cdx.json) continue ;; esac
+            cp "$receipt" evidence/wheels/
+          done
+          cp downloads/package-evidence/crates/*.crate candidate/
+          cp downloads/package-evidence/crates/*.cdx.json candidate/
+          cp downloads/package-evidence/crates/crate-archive-qualification.json evidence/crates/
+          cp downloads/package-evidence/npm/*.tgz candidate/
+          cp downloads/package-evidence/npm/*.cdx.json candidate/
+          cp downloads/package-evidence/npm/npm-archive-receipt.json evidence/npm/
+          cp downloads/compatibility-evidence/python-abi3-39-plus.json evidence/compatibility/
+      - name: assert complete wheel platform set
+        env:
+          RELEASE_VERSION: ${{ needs.resolve.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          pep440="$(printf '%s' "$RELEASE_VERSION" | tr -d '-' | sed 's/rc\./rc/')"
+          dist="$(python3 -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("crates/tritium-py/pyproject.toml").read_text())["project"]["name"].replace("-","_"))')"
+          count=0
+          for wheel in candidate/*.whl; do
+            count=$((count + 1))
+            case "$(basename "$wheel")" in
+              "$dist"-"$pep440"-*) ;;
+              *) echo "::error::wheel version differs from candidate: $wheel"; exit 1 ;;
+            esac
+          done
+          [ "$count" -eq 3 ] || { echo "::error::expected 3 platform wheels, got $count"; exit 1; }
+          for platform in manylinux_2_28_x86_64 macosx_11_0_arm64 win_amd64; do
+            compgen -G "candidate/*-$platform.whl" >/dev/null || {
+              echo "::error::missing wheel platform $platform"; exit 1;
+            }
+          done
+      - name: build release digest tool
+        run: cargo build --locked --release -p tritium-cli
+      - name: generate inputs, assemble and re-verify candidate
+        env:
+          RELEASE_VERSION: ${{ needs.resolve.outputs.version }}
+          SOURCE_REVISION: ${{ needs.resolve.outputs.revision }}
+          BUILDER_ID: https://github.com/${{ github.repository }}/actions/workflows/release-candidate.yml
+          INVOCATION_ID: github-${{ github.run_id }}-${{ github.run_attempt }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          target_dir="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
+          tritium_bin="$target_dir/release/tritium"
+          test -x "$tritium_bin"
+          python3 scripts/generate-release-inputs.py \
+            --staged candidate \
+            --release "$RELEASE_VERSION" \
+            --source-revision "$SOURCE_REVISION" \
+            --builder-id "$BUILDER_ID" \
+            --invocation-id "$INVOCATION_ID" \
+            --output candidate-inputs.json
+          python3 scripts/assemble-release-candidate.py \
+            --inputs candidate-inputs.json \
+            --output candidate/manifest.json \
+            --digest-tool "$tritium_bin"
+          scripts/release-status \
+            --candidate candidate/manifest.json \
+            --digest-tool "$tritium_bin"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: tritium-candidate-${{ needs.resolve.outputs.revision }}
+          path: candidate/
+          if-no-files-found: error
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: tritium-candidate-evidence-${{ needs.resolve.outputs.revision }}
+          path: |
+            candidate-inputs.json
+            evidence/
+          if-no-files-found: error
