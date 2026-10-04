@@ -1,6 +1,7 @@
 //! Public-seam tests for streamed SALT V2 block/sliding output reconstruction.
 
 use half::f16;
+use tritium_core::Trit;
 use tritium_format::{
     ModelId,
     salt_v2::SaltV2Codec,
@@ -195,6 +196,23 @@ fn fixed_trit_scale_refit_finds_nonnegative_scales_without_retaining_batches() {
         package.tensors()[0].tiles()[0].planes()[0].scales(),
         &[f16::from_f32(2.0), f16::from_f32(3.0)]
     );
+}
+
+#[test]
+fn fixed_trit_scale_refit_streams_activation_rows_through_the_stored_trits() {
+    let mut fit = FixedTritScaleRefitAccumulator::new(2, 8).expect("valid refit");
+    let trits = [
+        Trit::from_i8(1).unwrap(),
+        Trit::from_i8(0).unwrap(),
+        Trit::from_i8(0).unwrap(),
+        Trit::from_i8(1).unwrap(),
+    ];
+    fit.observe_fixed_trit_projection(&trits, &[1.0, 0.0, 0.0, 0.0], 2, 2.0)
+        .expect("first activation row");
+    fit.observe_fixed_trit_projection(&trits, &[0.0, 0.0, 0.0, 1.0], 2, 3.0)
+        .expect("second activation row");
+
+    assert_eq!(fit.finish().unwrap().scales(), &[2.0, 3.0]);
 }
 
 #[test]

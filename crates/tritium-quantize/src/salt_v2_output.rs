@@ -3,6 +3,7 @@
 use core::fmt;
 use std::collections::BTreeSet;
 
+use tritium_core::Trit;
 use tritium_format::{
     ModelId, RuntimeEvidenceError, RuntimeFinalLogitsAccumulator,
     RuntimeOutputReconstructionAccumulator, RuntimeOutputScope, RuntimeOutputScopeAccumulator,
@@ -736,6 +737,7 @@ pub struct OutputReconstructionReceipt {
 pub struct FixedTritScaleRefitAccumulator {
     gram: Vec<f64>,
     target_products: Vec<f64>,
+    projection_scratch: Vec<f64>,
     target_squared: f64,
     observations: u64,
     coordinate_sweeps: usize,
@@ -825,9 +827,15 @@ impl FixedTritScaleRefitAccumulator {
             .try_reserve_exact(group_count)
             .map_err(|_| OutputReconstructionError::ReceiptAllocationFailed)?;
         target_products.resize(group_count, 0.0);
+        let mut projection_scratch = Vec::new();
+        projection_scratch
+            .try_reserve_exact(group_count)
+            .map_err(|_| OutputReconstructionError::ReceiptAllocationFailed)?;
+        projection_scratch.resize(group_count, 0.0);
         Ok(Self {
             gram,
             target_products,
+            projection_scratch,
             target_squared: 0.0,
             observations: 0,
             coordinate_sweeps,
@@ -882,6 +890,57 @@ impl FixedTritScaleRefitAccumulator {
         self.target_squared = target_squared;
         self.observations = observations;
         Ok(())
+    }
+
+    /// Stream one activation row through the fixed trits and fit its teacher output.
+    ///
+    /// The trit and activation slices are row-major for one output channel;
+    /// each `scale_group_size`-wide segment contributes one feature to the
+    /// non-negative scale fit. Scratch storage is allocated once by the
+    /// accumulator and reused for every observation.
+    ///
+    /// # Errors
+    /// Rejects mismatched dimensions, invalid group width, non-finite values,
+    /// or counter/accumulator overflow without partially accepting the row.
+    pub fn observe_fixed_trit_projection(
+        &mut self,
+        trits: &[Trit],
+        activations: &[f32],
+        scale_group_size: usize,
+        teacher_output: f64,
+    ) -> Result<(), OutputReconstructionError> {
+        if trits.is_empty()
+            || trits.len() != activations.len()
+            || scale_group_size == 0
+            || trits.len().div_ceil(scale_group_size) != self.target_products.len()
+        {
+            return Err(OutputReconstructionError::InvalidGeometry);
+        }
+        if !teacher_output.is_finite() {
+            return Err(OutputReconstructionError::NonFiniteOutput { teacher: true });
+        }
+        if activations.iter().any(|value| !value.is_finite()) {
+            return Err(OutputReconstructionError::NonFiniteOutput { teacher: false });
+        }
+
+        let mut projected = std::mem::take(&mut self.projection_scratch);
+        let result = (|| {
+            for (group, output) in projected.iter_mut().enumerate() {
+                let start = group * scale_group_size;
+                let end = (start + scale_group_size).min(trits.len());
+                *output = trits[start..end]
+                    .iter()
+                    .zip(&activations[start..end])
+                    .map(|(trit, activation)| f64::from(trit.get()) * f64::from(*activation))
+                    .sum();
+                if !output.is_finite() {
+                    return Err(OutputReconstructionError::NonFiniteScaleRefit);
+                }
+            }
+            self.observe(&projected, teacher_output)
+        })();
+        self.projection_scratch = projected;
+        result
     }
 
     /// Solve the accumulated non-negative least-squares problem.
