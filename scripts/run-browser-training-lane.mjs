@@ -33,6 +33,14 @@ const MANIFEST_DIGEST = "9093a1a7f9a3422c399943782aadf4df6b11833cf2253db0db56ff2
 const VECTOR_DIGEST = "38b17f4c76c1d2f85cb35c713652a3d77627d02ba47933d2c8f31a88e0c594a7";
 const SCENARIO_ID = "salt-ste-sgd-256-v1";
 const ENGINES = new Set(["chrome", "firefox", "safari"]);
+// Chromium 154 on Linux ships WebGPU behind these switches. The lane still
+// rejects missing/software adapters; these switches only select its native
+// Vulkan implementation. Because the lane receipt binds source_revision, the
+// exact launch policy is bound by the producer revision as well.
+const CHROME_WEBGPU_ARGS = Object.freeze([
+  "--enable-unsafe-webgpu",
+  "--enable-features=Vulkan",
+]);
 const SOFTWARE_MARKERS = ["swiftshader", "llvmpipe", "software", "emulator", "lavapipe", "warp"];
 const MAX_ARCHIVE_BYTES = 512 * 1024 * 1024;
 const MAX_RECEIPT_BYTES = 1024 * 1024;
@@ -562,8 +570,14 @@ export class WebDriverClassicClient {
 
   async createSession(engine) {
     if (!ENGINES.has(engine)) fail("webdriver", "unsupported WebDriver engine");
+    const alwaysMatch = {
+      browserName: engine === "chrome" ? "chrome" : engine,
+    };
+    if (engine === "chrome") {
+      alwaysMatch["goog:chromeOptions"] = { args: [...CHROME_WEBGPU_ARGS] };
+    }
     const value = await this.request("POST", "/session", {
-      capabilities: { alwaysMatch: { browserName: engine === "chrome" ? "chrome" : engine } },
+      capabilities: { alwaysMatch },
     });
     if (!value || typeof value.sessionId !== "string" || value.sessionId.length === 0 ||
         typeof value.capabilities !== "object" || value.capabilities === null) {

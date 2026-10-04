@@ -498,6 +498,10 @@ test("classic WebDriver client uses W3C session and async-script routes", async 
       ["POST", "/session/session-1/execute/async"],
       ["DELETE", "/session/session-1"],
     ]);
+    assert.deepEqual(
+      requests[0].body.capabilities.alwaysMatch["goog:chromeOptions"].args,
+      ["--enable-unsafe-webgpu", "--enable-features=Vulkan"],
+    );
   } finally {
     await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
   }
