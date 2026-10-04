@@ -72,6 +72,13 @@ def exact_hex(value: Any, length: int, label: str) -> str:
     return value
 
 
+def exact_package_id(value: Any, label: str) -> str:
+    if (not isinstance(value, str) or not value.startswith("trp1_")
+            or len(value) != 69 or any(c not in HEX for c in value[5:])):
+        raise QualificationError(f"{label} must be a Tritium trp1 package ID")
+    return value
+
+
 def run(command: list[str], *, env: dict[str, str] | None = None,
         timeout: float = 120.0) -> str:
     try:
@@ -493,6 +500,8 @@ def validate_ready(value: dict[str, Any], revision: str, flavor: str,
         raise QualificationError("startup receipt backend policy differs")
     if receipt.get("profile") != profile or receipt.get("manifest_package_id") != manifest_blake3:
         raise QualificationError("startup receipt artifact identity differs")
+    for field in ("salt_package_id", "preserved_package_id", "config_package_id"):
+        exact_package_id(receipt.get(field), field)
     if type(receipt.get("loaded_bundle_bytes")) is not int or receipt["loaded_bundle_bytes"] <= 0:
         raise QualificationError("startup receipt loaded byte ledger is invalid")
     if type(receipt.get("resident_bytes")) is not int or receipt["resident_bytes"] <= 0:

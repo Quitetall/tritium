@@ -29,9 +29,9 @@ def readiness(flavor: str = "cpu"):
             "server_build_id": "tritium-serve:1.1.0-rc.0:" + "a" * 40,
             "model_source_revision": "b" * 40,
             "manifest_package_id": "c" * 64,
-            "salt_package_id": "d" * 64,
-            "preserved_package_id": "e" * 64,
-            "config_package_id": "f" * 64,
+            "salt_package_id": "trp1_" + "d" * 64,
+            "preserved_package_id": "trp1_" + "e" * 64,
+            "config_package_id": "trp1_" + "f" * 64,
             "profile": "compact-v1",
             "codec": "b3",
             "backend_policy": flavor,
@@ -247,6 +247,12 @@ class QualifyOciRuntimeTests(unittest.TestCase):
         value = readiness()
         with self.assertRaisesRegex(QualificationError, "artifact identity"):
             validate_ready(value, "a" * 40, "cpu", "compact-v1", "0" * 64)
+
+    def test_rejects_malformed_package_id_in_startup_receipt(self):
+        value = readiness()
+        value["startup_receipt"]["salt_package_id"] = "d" * 64
+        with self.assertRaisesRegex(QualificationError, "trp1 package ID"):
+            validate_ready(value, "a" * 40, "cpu", "compact-v1", "c" * 64)
 
     def test_atomic_receipt_refuses_overwrite(self):
         with tempfile.TemporaryDirectory() as raw:
