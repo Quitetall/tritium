@@ -22,6 +22,22 @@ fitting without a source-bound capture transcript or a recapture from the
 approved calibration pack. No campaign was started or modified for this
 refresh.
 
+### CUDA paged-KV cancellation smoke (2026-10-03)
+
+At source revision `8e8f6e0eecd6521adaf7e5911b580af4ffebba2a`, the focused
+CUDA BitNet serving test
+`cargo test --locked -p tritium-serve --features cuda --test batch_serve
+cuda_batched_admission_interleaves_live_slot -- --exact --nocapture
+--test-threads=1` passed on the local RTX 4090: one test passed, zero failed,
+in 249.85 seconds. The 2,048-token admission window took 428 ms while the
+other slot emitted 16 tokens (maximum measured inter-token gap 35.5 ms); the
+test's active, prefill, and queued-cancellation assertions also observed exact
+KV reservation release and zero release failures. The cold warm-up request
+logged 183 seconds, so this is not a decode-performance claim. This was a
+source-tree integration test using the local BitNet GGUF compatibility fixture,
+not a candidate-bound production-bundle receipt or the strict schema-v3
+readiness gate. The checkout also contained unrelated, uncommitted EAT-O work.
+
 ### Flagship campaign verification refresh (2026-09-29)
 
 The previous refresh reported the pinned Qwen3.6-27B additive-master campaign
