@@ -19,9 +19,10 @@ architecture when compiling, then retain the host command/version output with
 the bundle. For example:
 
 ```sh
-TRITIUM_WASM_PHYSICAL_DEVICE="wasmtime:<version>:<host-architecture>" \
+WASMTIME_VERSION="$(wasmtime --version | awk '{print $2}')"
+TRITIUM_WASM_PHYSICAL_DEVICE="wasmtime:${WASMTIME_VERSION}:$(uname -m)" \
   cargo run --locked --release --target wasm32-wasip1 -p tritium-wasm \
-  --example seal_wasi_training_receipts -- /tmp/tritium-wasi-receipts
+  --example seal_wasi_training_receipts -- release/v1.1/wasi-training-receipts
 ```
 
 The example requires a non-placeholder `wasmtime:` identity. This is an
