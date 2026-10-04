@@ -9,6 +9,20 @@ second-machine gates remain separate.
 
 ## Gate status (measured 2026-09-03)
 
+### Serving software regression refresh (2026-10-04)
+
+At source revision `c12812ada218dfbd8cfb524e31852b09deab18df`, the local
+CPU-feature serving suite passed with
+`RUSTC_WRAPPER='' cargo test --locked -p tritium-serve --features serve`:
+42 library tests, 4 binary tests, 2 CLI tests, 31 contract tests, and 1
+OpenTelemetry parentage test passed (80 total, 0 failed). The `batch_serve`,
+`e2e`, and `spec_lookup` integration targets registered zero tests under this
+feature selection; this run does not qualify CUDA, real-artifact serving, OCI,
+Kubernetes deployment, or model quality. The matching local check
+`RUSTC_WRAPPER='' cargo clippy --locked -p tritium-serve --features serve
+--all-targets -- -D warnings` also passed. These are contributor-run software
+checks, not independent release receipts; the serving gates below remain open.
+
 ### Flagship campaign status refresh (2026-10-03)
 
 The canonical read-only probe was rerun against the durable workspace
