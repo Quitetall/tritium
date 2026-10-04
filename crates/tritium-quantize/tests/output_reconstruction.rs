@@ -13,7 +13,7 @@ use tritium_quantize::{
     OutputReconstructionAccumulator, OutputReconstructionActivationLayer,
     OutputReconstructionActivationSet, OutputReconstructionActivationSource,
     OutputReconstructionError, OutputReconstructionSchedule, OutputReconstructionScope,
-    OutputReconstructionSpec, RuntimeFinalLogitsAccumulator,
+    OutputReconstructionSpec, RuntimeFinalLogitsAccumulator, fit_fixed_trit_tile_scale_refit,
     output_reconstruction_activation_digest, select_output_reconstruction,
 };
 
@@ -977,6 +977,60 @@ fn scheduled_output_window_reads_aligned_layer_caches_with_one_total_memory_budg
         ),
         Err(OutputReconstructionError::ActivationCache(_))
     ));
+}
+
+#[test]
+fn fixed_trit_tile_refit_recovers_shared_scales_from_residual_outputs() {
+    let activation_spec = ActivationCacheSpec::new(
+        0,
+        "model.layers.0.attn.q_proj.input",
+        3,
+        64,
+        ActivationDType::Float16,
+        ActivationDigest::from_bytes([9; 32]),
+        3,
+    )
+    .unwrap();
+    let mut builder = ActivationCacheBuilder::new(activation_spec.clone());
+    builder
+        .ingest(
+            ActivationChunk::new(
+                &activation_spec,
+                0,
+                3,
+                {
+                    let mut values = vec![0.0; 3 * 64];
+                    values[0] = 1.0;
+                    values[1] = 2.0;
+                    values[64] = 2.0;
+                    values[65] = 1.0;
+                    values[128] = 1.0;
+                    values[129] = -1.0;
+                    values
+                },
+                vec![true; 3],
+                vec![3],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let cache = builder.finalize().unwrap();
+    let activations = cache.read_window(0, 3, 4096).unwrap();
+    let mut trits = vec![Trit::ZERO; 128];
+    trits[0] = Trit::from_i8(1).unwrap();
+    trits[1] = Trit::from_i8(-1).unwrap();
+    trits[64] = Trit::from_i8(1).unwrap();
+    trits[65] = Trit::from_i8(1).unwrap();
+
+    // First output row uses 2*(x0-x1); second uses 0.5*(x0+x1).
+    let residual_outputs = [-2.0, 1.5, 2.0, 1.5, 4.0, 0.0];
+    let fitted =
+        fit_fixed_trit_tile_scale_refit(&activations, &residual_outputs, 2, 0, &trits, 64, 16)
+            .unwrap();
+
+    assert_eq!(fitted.scales(), &[2.0, 0.5]);
+    assert_eq!(fitted.observations(), 6);
+    assert!(fitted.squared_error() < 1e-12);
 }
 
 #[test]

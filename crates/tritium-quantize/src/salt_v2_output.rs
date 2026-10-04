@@ -8,7 +8,11 @@ use tritium_core::Trit;
 use tritium_format::{
     ModelId, RuntimeEvidenceError, RuntimeFinalLogitsAccumulator,
     RuntimeOutputReconstructionAccumulator, RuntimeOutputScope, RuntimeOutputScopeAccumulator,
-    RuntimeOutputScopeEvidence, salt_v2_package::SaltV2ScaleUpdate,
+    RuntimeOutputScopeEvidence,
+    salt_v2_package::{
+        SALT_V2_ALLOCATION_TILE_SIZE, SALT_V2_SCALE_GROUP_SIZE, SALT_V2_SCALE_GROUP_SIZE_64,
+        SALT_V2_SCALE_GROUP_SIZE_256, SaltV2ScaleUpdate,
+    },
 };
 
 mod codec;
@@ -1473,6 +1477,112 @@ impl FixedTritScaleRefitAccumulator {
             observations: self.observations,
         })
     }
+}
+
+/// Refit one SALT tile-plane's shared scales against residual dense outputs.
+///
+/// `residual_outputs` must contain the teacher layer output minus the current
+/// contribution of every coefficient outside this tile-plane. The tile-plane
+/// then fits the remaining target without changing any trit. Rows marked false
+/// by the activation window are skipped. Work and retained fit state are bounded
+/// by one 256-coefficient allocation tile, independent of model size.
+///
+/// # Errors
+/// Rejects noncanonical geometry, inconsistent activation/target shapes, an
+/// out-of-range tile, or invalid values.
+pub fn fit_fixed_trit_tile_scale_refit(
+    activations: &ActivationWindow,
+    residual_outputs: &[f32],
+    output_width: usize,
+    tile_index: usize,
+    trits: &[Trit],
+    scale_group_size: usize,
+    coordinate_sweeps: usize,
+) -> Result<FixedTritScaleRefit, OutputReconstructionError> {
+    let input_width = usize::try_from(activations.feature_width())
+        .map_err(|_| OutputReconstructionError::InvalidGeometry)?;
+    let token_count = usize::try_from(activations.token_count())
+        .map_err(|_| OutputReconstructionError::InvalidGeometry)?;
+    let total_coefficients = output_width
+        .checked_mul(input_width)
+        .ok_or(OutputReconstructionError::InvalidGeometry)?;
+    let target_values = token_count
+        .checked_mul(output_width)
+        .ok_or(OutputReconstructionError::InvalidGeometry)?;
+    let activation_values = token_count
+        .checked_mul(input_width)
+        .ok_or(OutputReconstructionError::InvalidGeometry)?;
+    if input_width == 0
+        || output_width == 0
+        || activations.values().len() != activation_values
+        || activations.token_mask().len() != token_count
+        || residual_outputs.len() != target_values
+        || !matches!(
+            scale_group_size,
+            SALT_V2_SCALE_GROUP_SIZE_64 | SALT_V2_SCALE_GROUP_SIZE | SALT_V2_SCALE_GROUP_SIZE_256
+        )
+        || trits.is_empty()
+        || trits.len() > SALT_V2_ALLOCATION_TILE_SIZE
+    {
+        return Err(OutputReconstructionError::InvalidGeometry);
+    }
+    let tile_start = tile_index
+        .checked_mul(SALT_V2_ALLOCATION_TILE_SIZE)
+        .ok_or(OutputReconstructionError::InvalidGeometry)?;
+    let tile_end = tile_start
+        .checked_add(trits.len())
+        .ok_or(OutputReconstructionError::InvalidGeometry)?;
+    if tile_start >= total_coefficients || tile_end > total_coefficients {
+        return Err(OutputReconstructionError::InvalidGeometry);
+    }
+    if residual_outputs.iter().any(|value| !value.is_finite()) {
+        return Err(OutputReconstructionError::NonFiniteOutput { teacher: true });
+    }
+
+    let group_count = trits.len().div_ceil(scale_group_size);
+    let mut fit = FixedTritScaleRefitAccumulator::new(group_count, coordinate_sweeps)?;
+    let mut group_outputs = Vec::new();
+    group_outputs
+        .try_reserve_exact(group_count)
+        .map_err(|_| OutputReconstructionError::ReceiptAllocationFailed)?;
+    group_outputs.resize(group_count, 0.0);
+
+    let first_output_row = tile_start / input_width;
+    let last_output_row = (tile_end - 1) / input_width;
+    for token in 0..token_count {
+        if !activations.token_mask()[token] {
+            continue;
+        }
+        let input_offset = token
+            .checked_mul(input_width)
+            .ok_or(OutputReconstructionError::InvalidGeometry)?;
+        let target_offset = token
+            .checked_mul(output_width)
+            .ok_or(OutputReconstructionError::InvalidGeometry)?;
+        for output_row in first_output_row..=last_output_row {
+            group_outputs.fill(0.0);
+            let row_start = output_row
+                .checked_mul(input_width)
+                .ok_or(OutputReconstructionError::InvalidGeometry)?;
+            let row_end = row_start
+                .checked_add(input_width)
+                .ok_or(OutputReconstructionError::InvalidGeometry)?;
+            let coefficient_start = tile_start.max(row_start);
+            let coefficient_end = tile_end.min(row_end);
+            for global_index in coefficient_start..coefficient_end {
+                let tile_offset = global_index - tile_start;
+                let group = tile_offset / scale_group_size;
+                let input_column = global_index - row_start;
+                group_outputs[group] += f64::from(trits[tile_offset].get())
+                    * f64::from(activations.values()[input_offset + input_column]);
+            }
+            fit.observe(
+                &group_outputs,
+                f64::from(residual_outputs[target_offset + output_row]),
+            )?;
+        }
+    }
+    fit.finish()
 }
 
 /// Strictly validated legacy `TSV2OUT` v1 identity.

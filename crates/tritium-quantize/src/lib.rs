@@ -136,7 +136,8 @@ pub use salt_v2_output::{
     OutputReconstructionActivationSource, OutputReconstructionActivationWindows,
     OutputReconstructionError, OutputReconstructionReceipt, OutputReconstructionScaleCandidate,
     OutputReconstructionSchedule, OutputReconstructionScope, OutputReconstructionSpec,
-    output_reconstruction_activation_digest, select_output_reconstruction,
+    fit_fixed_trit_tile_scale_refit, output_reconstruction_activation_digest,
+    select_output_reconstruction,
 };
 pub use ternary_baselines::{
     BaselineTernaryPlane, TernaryBaselineError, TernaryBaselineProjection, TtqState, TwnConfig,
