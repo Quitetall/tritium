@@ -49,13 +49,18 @@ model prefill/decode; it is not evidence of slow ternary token execution.
 
 Source inspection explains the phase boundary: the batched worker constructs
 the resident decoder and paged-KV pool before it receives queued jobs, while
-the router currently marks the worker alive as soon as the thread is spawned.
-Thus the first request can be accepted and wait in the queue during CUDA batch
-initialization, and readiness can report ready before batch initialization has
-finished. This conflicts with plan 0052's requirement that readiness remain
-false during startup. The fix and a public `/readyz`/chat-startup regression
-test remain open. This source-tree measurement uses the local BitNet GGUF
-fixture; it is not a Qwen candidate receipt or a release qualification.
+the router previously marked the worker alive as soon as the thread was
+spawned. That let chat requests queue during CUDA batch initialization while
+`/readyz` incorrectly reported ready. The router now tracks batch-worker
+readiness separately from liveness, rejects chat until decoder and KV-pool
+initialization succeeds, and clears readiness if the worker exits. The focused
+RTX 4090 test passed (1 passed, 0 failed; 223.90 seconds): `/readyz` was 503,
+`/healthz` was 200, and early chat was 503 during startup; readiness later
+became 200 after 165.043 seconds, and the existing admission/interleaving
+checks passed. This is local source-tree evidence using the BitNet GGUF fixture,
+not a candidate-bound schema-v3 readiness/deployment receipt, Qwen evidence, or
+a release qualification. Plan 0052's production artifact and deployment gates
+remain open.
 
 ### Flagship campaign verification refresh (2026-09-29)
 

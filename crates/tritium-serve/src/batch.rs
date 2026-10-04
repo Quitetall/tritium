@@ -1354,6 +1354,7 @@ pub(crate) fn run_batched(
     pool_tokens: Option<usize>,
     mut job_rx: mpsc::Receiver<Job>,
     draining: Arc<AtomicBool>,
+    worker_ready: Arc<AtomicBool>,
     phase: Arc<AtomicU8>,
     telemetry: Arc<WorkerTelemetry>,
 ) {
@@ -1364,6 +1365,13 @@ pub(crate) fn run_batched(
         }
     }
     let _phase_guard = PhaseGuard(phase.clone());
+    struct WorkerReadyGuard(Arc<AtomicBool>);
+    impl Drop for WorkerReadyGuard {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Release);
+        }
+    }
+    let _ready_guard = WorkerReadyGuard(worker_ready.clone());
     if slots == 0 {
         eprintln!("tritium-serve: --batch-slots must be >= 1");
         return;
@@ -1409,6 +1417,9 @@ pub(crate) fn run_batched(
         return;
     };
     telemetry.set_kv_pool(pool_cap_tokens, pool_cap_tokens);
+    // The thread is alive from spawn, but it must not admit user work until
+    // resident decoder and KV-pool initialization have succeeded.
+    worker_ready.store(true, Ordering::Release);
     // A job that validated but found the page pool exhausted: retried before
     // pulling new work (FIFO), admitted once retirements free pages.
     let mut parked: Option<Job> = None;

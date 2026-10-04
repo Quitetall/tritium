@@ -420,6 +420,7 @@ struct AppState {
 struct RuntimeState {
     draining: Arc<AtomicBool>,
     worker_alive: Arc<AtomicBool>,
+    worker_ready: Arc<AtomicBool>,
     phase: Arc<AtomicU8>,
     backend_faulted: Arc<AtomicBool>,
     backend_faults: Arc<AtomicU64>,
@@ -492,6 +493,7 @@ pub fn build_router_with_limits(
         RuntimeState {
             draining,
             worker_alive,
+            worker_ready: Arc::new(AtomicBool::new(true)),
             phase,
             backend_faulted,
             backend_faults,
@@ -542,6 +544,7 @@ pub fn build_router_governed(
         RuntimeState {
             draining,
             worker_alive,
+            worker_ready: Arc::new(AtomicBool::new(true)),
             phase,
             backend_faulted,
             backend_faults,
@@ -621,6 +624,7 @@ fn build_router_production_mode(
         RuntimeState {
             draining: draining.clone(),
             worker_alive,
+            worker_ready: Arc::new(AtomicBool::new(true)),
             phase,
             backend_faulted,
             backend_faults,
@@ -726,12 +730,14 @@ fn build_router_batched_inner(
     }
     let (jobs_tx, jobs_rx) = tokio::sync::mpsc::channel(cfg.queue_cap);
     let worker_alive = Arc::new(AtomicBool::new(true));
+    let worker_ready = Arc::new(AtomicBool::new(false));
     let draining = Arc::new(AtomicBool::new(false));
     let phase = Arc::new(AtomicU8::new(PHASE_IDLE));
     let backend_faulted = Arc::new(AtomicBool::new(false));
     let backend_faults = Arc::new(AtomicU64::new(0));
     let telemetry = Arc::new(WorkerTelemetry::default());
     let alive = worker_alive.clone();
+    let ready = worker_ready.clone();
     let drain_flag = draining.clone();
     let worker_phase = phase.clone();
     let worker_telemetry = telemetry.clone();
@@ -756,6 +762,7 @@ fn build_router_batched_inner(
                 pool_tokens,
                 jobs_rx,
                 drain_flag,
+                ready,
                 worker_phase,
                 worker_telemetry,
             );
@@ -769,6 +776,7 @@ fn build_router_batched_inner(
         RuntimeState {
             draining,
             worker_alive,
+            worker_ready,
             phase,
             backend_faulted,
             backend_faults,
@@ -1194,6 +1202,7 @@ fn request_timeout_error() -> ApiError {
 
 fn request_ready(state: &AppState) -> bool {
     state.runtime.worker_alive.load(Ordering::Relaxed)
+        && state.runtime.worker_ready.load(Ordering::Acquire)
         && !state.runtime.backend_faulted.load(Ordering::Acquire)
         && state
             .runtime
@@ -1916,6 +1925,7 @@ async fn health(State(st): State<AppState>) -> Response {
 
 async fn readiness(State(st): State<AppState>) -> Response {
     let worker_alive = st.runtime.worker_alive.load(Ordering::Relaxed);
+    let worker_ready = st.runtime.worker_ready.load(Ordering::Acquire);
     let draining = st.runtime.draining.load(Ordering::Relaxed);
     let backend_faulted = st.runtime.backend_faulted.load(Ordering::Acquire);
     let kv_pool_reclamation_faulted = st
@@ -1931,6 +1941,7 @@ async fn readiness(State(st): State<AppState>) -> Response {
         .as_ref()
         .is_none_or(|state| state.is_serving());
     let ready = worker_alive
+        && worker_ready
         && !draining
         && !backend_faulted
         && !kv_pool_reclamation_faulted
@@ -2507,6 +2518,7 @@ mod tests {
             RuntimeState {
                 draining,
                 worker_alive,
+                worker_ready: Arc::new(AtomicBool::new(true)),
                 phase,
                 backend_faulted,
                 backend_faults,

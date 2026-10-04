@@ -693,6 +693,78 @@ async fn cuda_batched_admission_interleaves_live_slot() {
     let (router, _draining) =
         build_router_batched(runner, u32::MAX, 2, tok, cfg).expect("batched router");
 
+    // The decode thread exists while it allocates the CUDA resident decoder
+    // and paged KV pool, but the service must not claim readiness until that
+    // initialization has completed.
+    let ready = router
+        .clone()
+        .oneshot(
+            Request::get("/readyz")
+                .body(Body::empty())
+                .expect("readiness request"),
+        )
+        .await
+        .expect("readiness route");
+    assert_eq!(
+        ready.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "batch startup must remain not-ready while the CUDA pool initializes"
+    );
+    let health = router
+        .clone()
+        .oneshot(
+            Request::get("/healthz")
+                .body(Body::empty())
+                .expect("health request"),
+        )
+        .await
+        .expect("health route");
+    assert_eq!(health.status(), StatusCode::OK);
+    let early_chat = router
+        .clone()
+        .oneshot(
+            Request::post("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "model": "tritium",
+                        "max_tokens": 2,
+                        "messages": [{"role": "user", "content": "1 2 3"}],
+                    })
+                    .to_string(),
+                ))
+                .expect("early chat request"),
+        )
+        .await
+        .expect("early chat route");
+    assert_eq!(early_chat.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let startup_started = std::time::Instant::now();
+    loop {
+        let ready = router
+            .clone()
+            .oneshot(
+                Request::get("/readyz")
+                    .body(Body::empty())
+                    .expect("readiness poll"),
+            )
+            .await
+            .expect("readiness poll route");
+        if ready.status() == StatusCode::OK {
+            break;
+        }
+        assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            startup_started.elapsed() < std::time::Duration::from_secs(300),
+            "batch CUDA startup did not become ready within five minutes"
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    }
+    println!(
+        "C1 batched CUDA startup became ready in {:.3}s",
+        startup_started.elapsed().as_secs_f64()
+    );
+
     let join_ids = |n: usize| {
         base.iter()
             .cycle()
