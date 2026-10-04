@@ -81,6 +81,49 @@ class GenerateReleaseInputsTests(unittest.TestCase):
         with self.assertRaisesRegex(ReleaseInputsError, "lack unique SBOM bindings"):
             build_inputs(self.staged, **self.args())
 
+    def test_binds_same_named_nested_wheels_to_colocated_sboms(self):
+        filename = "pytritium-1.1.0rc2-cp39-abi3-manylinux_2_28_x86_64.whl"
+        for directory, artifact_id in (("cpu", "wheel-cpu"), ("cuda", "wheel-cuda")):
+            target = self.staged / directory
+            target.mkdir()
+            (target / filename).write_bytes(directory.encode())
+            sbom(
+                target / f"{artifact_id}.cdx.json",
+                artifact_id=artifact_id,
+                filename=filename,
+            )
+
+        document = build_inputs(self.staged, **self.args())
+        wheels = {
+            item["id"]: item
+            for item in document["artifacts"]
+            if item["id"].startswith("wheel-")
+        }
+        self.assertEqual(wheels["wheel-cpu"]["path"], f"cpu/{filename}")
+        self.assertEqual(wheels["wheel-cpu"]["sbom"], "cpu/wheel-cpu.cdx.json")
+        self.assertEqual(wheels["wheel-cuda"]["path"], f"cuda/{filename}")
+        self.assertEqual(wheels["wheel-cuda"]["sbom"], "cuda/wheel-cuda.cdx.json")
+
+    def test_rejects_ambiguous_non_colocated_basename_binding(self):
+        filename = "same.whl"
+        for directory in ("cpu", "cuda"):
+            target = self.staged / directory
+            target.mkdir()
+            (target / filename).write_bytes(directory.encode())
+            sbom(
+                target / f"{directory}.cdx.json",
+                artifact_id=f"wheel-{directory}",
+                filename=filename,
+            )
+        sbom(
+            self.staged / "ambiguous.cdx.json",
+            artifact_id="wheel-ambiguous",
+            filename=filename,
+        )
+
+        with self.assertRaisesRegex(ReleaseInputsError, "ambiguously names artifact"):
+            build_inputs(self.staged, **self.args())
+
     def test_rejects_duplicate_artifact_binding(self):
         filename = "tritium-core-1.1.0-rc.2.crate"
         sbom(
