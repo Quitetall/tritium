@@ -7,7 +7,7 @@ use tritium_core::Trit;
 use tritium_format::{
     ModelId, RuntimeEvidenceError, RuntimeFinalLogitsAccumulator,
     RuntimeOutputReconstructionAccumulator, RuntimeOutputScope, RuntimeOutputScopeAccumulator,
-    RuntimeOutputScopeEvidence,
+    RuntimeOutputScopeEvidence, salt_v2_package::SaltV2ScaleUpdate,
 };
 
 mod codec;
@@ -16,6 +16,9 @@ const SPEC_HASH_CONTEXT: &str = "tritium salt v2 output reconstruction spec v1";
 const TEACHER_HASH_CONTEXT: &str = "tritium salt v2 output reconstruction teacher v1";
 const CANDIDATE_HASH_CONTEXT: &str = "tritium salt v2 output reconstruction candidate v1";
 const CANDIDATE_HASH_CONTEXT_V3: &str = "tritium salt v2 output reconstruction candidate v2";
+const SCALE_UPDATE_HASH_CONTEXT: &str = "tritium salt v2 output reconstruction scale updates v1";
+const SCALE_CANDIDATE_HASH_CONTEXT: &str =
+    "tritium salt v2 output reconstruction scale candidate v1";
 const RECEIPT_HASH_CONTEXT: &str = "tritium salt v2 output reconstruction receipt v1";
 const MAX_OUTPUT_RECONSTRUCTION_SCOPES: usize = 1 << 20;
 const MAX_FIXED_TRIT_REFIT_GROUPS: usize = 1024;
@@ -218,6 +221,91 @@ impl OutputReconstructionSpec {
     #[must_use]
     pub const fn spec_id(&self) -> &[u8; 32] {
         &self.spec_id
+    }
+
+    /// Derive an output-reconstruction candidate identity from its exact SALT
+    /// V2 scale updates, the exact parent-package digest, this frozen spec, and
+    /// its deterministic initialization seed. Updates must be non-empty and
+    /// strictly ordered by `(tensor, tile, plane)`; every scale must be finite
+    /// and positive.
+    ///
+    /// The returned identity can be passed to [`OutputReconstructionAccumulator::new`]
+    /// so the resulting output receipt names the exact scale mutation evaluated.
+    ///
+    /// # Errors
+    /// Rejects empty, unordered, duplicate, or invalid updates and overflowing
+    /// platform-sized indices/counts.
+    pub fn candidate_id_for_scale_updates(
+        &self,
+        parent_package_digest: &[u8; 32],
+        initialization_seed: u64,
+        updates: &[SaltV2ScaleUpdate],
+    ) -> Result<[u8; 32], OutputReconstructionError> {
+        if parent_package_digest == &[0; 32] {
+            return Err(OutputReconstructionError::MissingPackageIdentity);
+        }
+        if updates.is_empty() {
+            return Err(OutputReconstructionError::EmptyScaleUpdateSet);
+        }
+
+        let mut update_hasher = blake3::Hasher::new_derive_key(SCALE_UPDATE_HASH_CONTEXT);
+        update_hasher.update(
+            &u64::try_from(updates.len())
+                .map_err(|_| OutputReconstructionError::CountOverflow)?
+                .to_le_bytes(),
+        );
+        let mut previous_target = None;
+        for update in updates {
+            let target = (
+                update.tensor_index(),
+                update.tile_index(),
+                update.plane_index(),
+            );
+            if previous_target.is_some_and(|previous| target <= previous) {
+                return Err(OutputReconstructionError::NonCanonicalScaleUpdateOrder);
+            }
+            previous_target = Some(target);
+
+            update_hasher.update(
+                &u64::try_from(target.0)
+                    .map_err(|_| OutputReconstructionError::CountOverflow)?
+                    .to_le_bytes(),
+            );
+            update_hasher.update(
+                &u64::try_from(target.1)
+                    .map_err(|_| OutputReconstructionError::CountOverflow)?
+                    .to_le_bytes(),
+            );
+            update_hasher.update(
+                &u64::try_from(target.2)
+                    .map_err(|_| OutputReconstructionError::CountOverflow)?
+                    .to_le_bytes(),
+            );
+            update_hasher.update(
+                &u64::try_from(update.scales().len())
+                    .map_err(|_| OutputReconstructionError::CountOverflow)?
+                    .to_le_bytes(),
+            );
+            for scale in update.scales() {
+                let value = scale.to_f32();
+                if !value.is_finite() || value <= 0.0 {
+                    return Err(OutputReconstructionError::InvalidScaleUpdate);
+                }
+                update_hasher.update(&scale.to_bits().to_le_bytes());
+            }
+        }
+
+        let update_id = update_hasher.finalize();
+        let mut candidate_hasher = blake3::Hasher::new_derive_key(SCALE_CANDIDATE_HASH_CONTEXT);
+        candidate_hasher.update(&self.spec_id);
+        candidate_hasher.update(parent_package_digest);
+        candidate_hasher.update(&initialization_seed.to_le_bytes());
+        candidate_hasher.update(update_id.as_bytes());
+        let candidate_id = *candidate_hasher.finalize().as_bytes();
+        if candidate_id == [0; 32] {
+            return Err(OutputReconstructionError::MissingCandidateIdentity);
+        }
+        Ok(candidate_id)
     }
 
     fn derive_id(&self) -> [u8; 32] {
@@ -1380,6 +1468,14 @@ pub enum OutputReconstructionError {
     InvalidCount,
     /// Candidate identity is zero.
     MissingCandidateIdentity,
+    /// The parent package has no exact-byte identity.
+    MissingPackageIdentity,
+    /// A scale candidate contains no updates.
+    EmptyScaleUpdateSet,
+    /// Scale updates are not strictly ordered by tensor, tile, and plane.
+    NonCanonicalScaleUpdateOrder,
+    /// A candidate scale is non-finite or not positive.
+    InvalidScaleUpdate,
     /// Scope or batch arrived outside canonical order.
     ScopeOrder {
         /// Required scope.
@@ -1454,6 +1550,18 @@ impl fmt::Display for OutputReconstructionError {
             Self::InvalidCount => formatter.write_str("output-reconstruction count is invalid"),
             Self::MissingCandidateIdentity => {
                 formatter.write_str("output-reconstruction candidate identity is missing")
+            }
+            Self::MissingPackageIdentity => {
+                formatter.write_str("output-reconstruction parent package identity is missing")
+            }
+            Self::EmptyScaleUpdateSet => {
+                formatter.write_str("output-reconstruction scale candidate is empty")
+            }
+            Self::NonCanonicalScaleUpdateOrder => {
+                formatter.write_str("output-reconstruction scale updates are not canonical")
+            }
+            Self::InvalidScaleUpdate => {
+                formatter.write_str("output-reconstruction scale update is invalid")
             }
             Self::ScopeOrder { .. } => {
                 formatter.write_str("output-reconstruction observation order differs")

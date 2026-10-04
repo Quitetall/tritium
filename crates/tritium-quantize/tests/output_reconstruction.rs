@@ -706,6 +706,96 @@ fn observations_reject_nonfinite_values_and_unselected_final_tokens() {
 }
 
 #[test]
+fn scale_update_candidate_identity_binds_spec_seed_targets_and_f16_values() {
+    let spec = spec(OutputReconstructionSchedule::Blocks { block_count: 1 }, 1);
+    let updates = vec![
+        SaltV2ScaleUpdate::new(0, 0, 0, vec![f16::from_f32(0.5)]).expect("first update"),
+        SaltV2ScaleUpdate::new(0, 0, 1, vec![f16::from_f32(0.75)]).expect("second update"),
+    ];
+    let identity = spec
+        .candidate_id_for_scale_updates(&[31; 32], 23, &updates)
+        .expect("canonical updates identify a candidate");
+
+    assert_ne!(identity, [0; 32]);
+    assert_eq!(
+        identity,
+        spec.candidate_id_for_scale_updates(&[31; 32], 23, &updates)
+            .expect("identity is deterministic")
+    );
+    assert_ne!(
+        identity,
+        spec.candidate_id_for_scale_updates(&[31; 32], 24, &updates)
+            .unwrap()
+    );
+    assert_ne!(
+        identity,
+        spec.candidate_id_for_scale_updates(&[32; 32], 23, &updates)
+            .unwrap()
+    );
+    let other_spec = OutputReconstructionSpec::new(
+        ModelId::from_digest([1; 32]),
+        [2; 32],
+        [3; 32],
+        [5; 32],
+        OutputReconstructionSchedule::Blocks { block_count: 1 },
+        OutputObjectiveWeights::new(1.0, 0.0, 1.0, 1.0).unwrap(),
+        1,
+        1,
+    )
+    .unwrap();
+    assert_ne!(
+        identity,
+        other_spec
+            .candidate_id_for_scale_updates(&[31; 32], 23, &updates)
+            .unwrap()
+    );
+
+    let changed_scale = vec![
+        SaltV2ScaleUpdate::new(0, 0, 0, vec![f16::from_f32(0.5)]).unwrap(),
+        SaltV2ScaleUpdate::new(0, 0, 1, vec![f16::from_f32(0.875)]).unwrap(),
+    ];
+    assert_ne!(
+        identity,
+        spec.candidate_id_for_scale_updates(&[31; 32], 23, &changed_scale)
+            .unwrap()
+    );
+
+    let reordered_targets = vec![
+        SaltV2ScaleUpdate::new(0, 0, 0, vec![f16::from_f32(0.5)]).unwrap(),
+        SaltV2ScaleUpdate::new(0, 1, 0, vec![f16::from_f32(0.75)]).unwrap(),
+    ];
+    assert_ne!(
+        identity,
+        spec.candidate_id_for_scale_updates(&[31; 32], 23, &reordered_targets)
+            .unwrap()
+    );
+    assert!(matches!(
+        spec.candidate_id_for_scale_updates(&[31; 32], 23, &[]),
+        Err(OutputReconstructionError::EmptyScaleUpdateSet)
+    ));
+    assert!(matches!(
+        spec.candidate_id_for_scale_updates(&[0; 32], 23, &updates),
+        Err(OutputReconstructionError::MissingPackageIdentity)
+    ));
+    assert!(matches!(
+        spec.candidate_id_for_scale_updates(
+            &[31; 32],
+            23,
+            &[updates[1].clone(), updates[0].clone()]
+        ),
+        Err(OutputReconstructionError::NonCanonicalScaleUpdateOrder)
+    ));
+    let invalid_scale = [SaltV2ScaleUpdate::new(0, 0, 0, vec![f16::ZERO]).unwrap()];
+    assert!(matches!(
+        spec.candidate_id_for_scale_updates(&[31; 32], 23, &invalid_scale),
+        Err(OutputReconstructionError::InvalidScaleUpdate)
+    ));
+
+    let candidate = exact_candidate(&spec, identity, 23, &[0.0, 0.0]);
+    assert_eq!(candidate.candidate_id(), &identity);
+}
+
+#[test]
 fn strict_reopen_rejects_rehashed_but_unreachable_candidate_metrics() {
     let spec = spec(OutputReconstructionSchedule::Blocks { block_count: 1 }, 1);
     let candidate = exact_candidate(&spec, [6; 32], 1, &[0.0, 0.0]);
