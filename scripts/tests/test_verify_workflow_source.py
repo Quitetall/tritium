@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -11,6 +12,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts" / "verify-workflow-source.py"
 WORKFLOW = ROOT / ".github" / "workflows" / "wheels.yml"
+CI_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 
 
 class VerifyWorkflowSourceTests(unittest.TestCase):
@@ -38,6 +40,28 @@ class VerifyWorkflowSourceTests(unittest.TestCase):
                 "every checkout must be followed immediately by source verification",
             )
             self.assertIn("verify-workflow-source.py", remainder.split("      - ", 1)[0])
+
+    def test_ci_artifact_producers_bind_receipts_to_the_branch_source(self):
+        workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn(
+            "TRITIUM_SOURCE_REF: ${{ github.event.pull_request.head.sha || github.ref }}",
+            workflow,
+        )
+        self.assertIn(
+            "TRITIUM_SOURCE_REVISION: ${{ github.event.pull_request.head.sha || github.sha }}",
+            workflow,
+        )
+
+        for job_name in ("web-package", "wasm", "publish-check"):
+            start = workflow.index(f"  {job_name}:")
+            next_job = re.search(r"\n  [a-zA-Z][\w-]*:\n", workflow[start + 1 :])
+            end = start + 1 + next_job.start() if next_job else len(workflow)
+            block = workflow[start:end]
+            self.assertIn("ref: ${{ env.TRITIUM_SOURCE_REF }}", block, job_name)
+            self.assertIn("name: verify checked-out source revision", block, job_name)
+            self.assertIn("verify-workflow-source.py", block, job_name)
+            self.assertIn("$TRITIUM_SOURCE_REVISION", block, job_name)
+            self.assertNotIn("${{ github.sha }}", block, job_name)
 
     def test_accepts_exact_head_and_rejects_mismatch(self):
         with tempfile.TemporaryDirectory() as raw:
