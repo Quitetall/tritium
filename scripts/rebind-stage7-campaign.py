@@ -260,7 +260,14 @@ def _validate_prerequisites(
 ) -> None:
     _open_record(root, value["token_evidence_pack"], "campaign token evidence pack")
     evidence = value["evidence"]
-    if not isinstance(evidence, list) or len(evidence) != 3:
+    if not isinstance(evidence, list):
+        raise RebindError("campaign prerequisite evidence must be a list")
+    if evidence == []:
+        # A cleanly rebound empty inventory is the bootstrap plan used to
+        # produce source-bound smoke/native/Gate-C evidence. The terminal
+        # qualifier still requires all three receipts before it can run.
+        return
+    if len(evidence) != 3:
         raise RebindError("campaign prerequisite evidence inventory is incomplete")
     expected = ("smoke", "native-kernels", "hestia-gate-c")
     for ordinal, kind in enumerate(expected):
@@ -349,8 +356,6 @@ def rebind(
         or any(character not in HEX for character in old_revision)
     ):
         raise RebindError("campaign source_revision is not canonical")
-    if old_revision == target_revision:
-        raise RebindError("campaign is already bound to current HEAD")
     if _count(value, old_revision) != 1:
         raise RebindError("old source revision appears outside top-level campaign identity")
     supplied_receipts = (
@@ -358,7 +363,8 @@ def rebind(
         native_kernels_receipt,
         hestia_gate_c_receipt,
     )
-    if any(path is not None for path in supplied_receipts):
+    has_receipts = any(path is not None for path in supplied_receipts)
+    if has_receipts:
         if not all(path is not None for path in supplied_receipts):
             raise RebindError("all three prerequisite receipt paths must be supplied together")
         evidence_root = template.resolve(strict=True).parent
@@ -369,8 +375,10 @@ def rebind(
                 ("smoke", "native-kernels", "hestia-gate-c"),
                 strict=True,
             )
-            if path is not None
+                if path is not None
         ]
+    elif old_revision == target_revision:
+        raise RebindError("campaign is already bound to current HEAD")
     _validate_prerequisites(
         value, template.resolve(strict=True).parent, target_revision
     )

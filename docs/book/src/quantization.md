@@ -170,7 +170,20 @@ the complete payload digest, then rechecks the retained file handle after the
 selected read. Its JSON receipt identifies the exact ordered token window; it
 does not claim model execution or quality.
 
-Run the frozen 135M execution seam from the installed wheel:
+First bind a bootstrap campaign plan to the clean source revision. An empty
+receipt list is permitted only for this bootstrap; it cannot pass the final
+recipe qualifier:
+
+```sh
+python scripts/rebind-stage7-campaign.py \
+  --template /evidence/stage7/campaign-template.json \
+  --source-root . \
+  --run-id stage7-smollm2-17b-bootstrap-$(git rev-parse --short HEAD) \
+  --output /evidence/stage7/campaign-bootstrap.json
+```
+
+Run the frozen 135M execution seam from the installed wheel using that
+bootstrap plan:
 
 ```python
 from pathlib import Path
@@ -184,7 +197,7 @@ snapshot = (
 )
 
 result = run_stage7_smollm2_smoke(
-    "./stage7-campaign.json",
+    "/evidence/stage7/campaign-bootstrap.json",
     snapshot,
     "./stage7-smoke",
     device="cuda",
@@ -203,11 +216,10 @@ G64, and G256 respectively; unknown tags are rejected.
 
 ## Stage-7 full recipe freeze
 
-Before rebinding a campaign template, produce the native CUDA receipt from a
-clean source checkout. This runs all 144 frozen codec/group/plane/dispatch
-cases under Compute Sanitizer, validates the measurements with the Stage-7
-qualifier, and publishes the receipt and sanitizer log without replacing
-existing files:
+Produce the native CUDA receipt from the same clean source revision as the
+bootstrap plan. This runs all 144 frozen codec/group/plane/dispatch cases under
+Compute Sanitizer, validates the measurements with the Stage-7 qualifier, and
+publishes the receipt and sanitizer log without replacing existing files:
 
 ```sh
 python scripts/run-stage7-native-matrix.py \
@@ -217,9 +229,33 @@ python scripts/run-stage7-native-matrix.py \
 ```
 
 The host needs the CUDA toolkit and Compute Sanitizer. The command refuses a
-dirty source checkout; the receipt is tied to its exact `HEAD`. This native
-kernel receipt is only one prerequisite: the smoke and HESTIA receipts must
-also be current before campaign rebinding.
+dirty source checkout; the receipt is tied to its exact `HEAD`. Produce the
+HESTIA Gate-C receipt on that same revision:
+
+```sh
+cargo run --locked -p tritium-cli --features cuda -- \
+  salt seal-hestia-gate-c \
+  --release 1.1.0-rc.1 \
+  --source-revision "$(git rev-parse HEAD)" \
+  --output /evidence/stage7/hestia-gate-c.json \
+  --cuda-device 0
+```
+
+Finally assemble the three measured receipts into the executable campaign. The
+rebinder verifies each schema, digest, containment path, and exact source
+revision; it allows same-revision assembly only when all three receipt paths
+are supplied together:
+
+```sh
+python scripts/rebind-stage7-campaign.py \
+  --template /evidence/stage7/campaign-bootstrap.json \
+  --source-root . \
+  --run-id stage7-smollm2-17b-real-$(git rev-parse --short HEAD) \
+  --smoke-receipt /evidence/stage7/smoke/smoke-receipt.json \
+  --native-kernels-receipt /evidence/stage7/native/native-receipt.json \
+  --hestia-gate-c-receipt /evidence/stage7/hestia-gate-c.json \
+  --output /evidence/stage7/campaign.json
+```
 
 The full 1.7B successive-halving campaign is driven by the source-bound
 orchestrator:
@@ -255,27 +291,11 @@ six solver variants, full artifacts, and physical reports. The auxiliary runner
 advertises only baseline/refinement features. Missing or stale capability
 declarations fail before any measurement cache is written.
 
-Campaign templates are pre-evidence plans. When source code changes before a
-run, rebind the template to clean `HEAD` with no-replace output:
-
-```sh
-python scripts/rebind-stage7-campaign.py \
-  --template /evidence/stage7/campaign-template.json \
-  --source-root . \
-  --run-id stage7-smollm2-17b-real-$(git rev-parse --short HEAD) \
-  --smoke-receipt /evidence/stage7/smoke.json \
-  --native-kernels-receipt /evidence/stage7/native-kernels.json \
-  --hestia-gate-c-receipt /evidence/stage7/hestia-gate-c.json \
-  --output /evidence/stage7/campaign.json
-```
-
-The three optional receipt flags must be supplied together. When supplied, the
-rebinder hashes those files and builds the ordered prerequisite evidence list;
-each receipt must live inside the template's evidence directory, use the frozen
-receipt schema for its kind, and name the clean target `HEAD`. Without the
-flags, the template must already contain that list. In both modes, nested stale
-revisions, dirty trees, malformed templates, and existing outputs fail closed.
-Rebinding creates no measurements and does not qualify a recipe freeze.
+Campaign templates are pre-evidence plans. Bootstrap rebinding and final
+same-revision receipt assembly both use no-replace output. A partial receipt
+set, stale nested revision, dirty tree, malformed template, or existing output
+fails closed. Rebinding creates no measurements and does not qualify a recipe
+freeze.
 
 ## SALT V2 Qwen master campaigns
 
