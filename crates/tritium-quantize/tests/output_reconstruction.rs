@@ -1063,6 +1063,18 @@ fn fixed_trit_tile_refit_recovers_shared_scales_from_residual_outputs() {
         vec![2.0, 0.5]
     );
     assert!(candidate.squared_error() < 1e-12);
+    assert!(matches!(
+        fit_fixed_trit_tile_scale_refit(
+            &activations,
+            &residual_outputs,
+            2,
+            0,
+            &trits[..127],
+            64,
+            16,
+        ),
+        Err(OutputReconstructionError::InvalidGeometry)
+    ));
 }
 
 #[test]

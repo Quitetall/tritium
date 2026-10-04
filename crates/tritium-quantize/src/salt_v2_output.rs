@@ -1551,7 +1551,14 @@ pub fn fit_fixed_trit_tile_scale_refit(
     let tile_end = tile_start
         .checked_add(trits.len())
         .ok_or(OutputReconstructionError::InvalidGeometry)?;
-    if tile_start >= total_coefficients || tile_end > total_coefficients {
+    let expected_tile_len = total_coefficients
+        .checked_sub(tile_start)
+        .ok_or(OutputReconstructionError::InvalidGeometry)?
+        .min(SALT_V2_ALLOCATION_TILE_SIZE);
+    if tile_start >= total_coefficients
+        || tile_end > total_coefficients
+        || trits.len() != expected_tile_len
+    {
         return Err(OutputReconstructionError::InvalidGeometry);
     }
     if residual_outputs.iter().any(|value| !value.is_finite()) {
