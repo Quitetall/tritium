@@ -364,7 +364,7 @@ mod tests {
         let mut shared_projection = Projection::HostSaltV2(shared);
         assert!(
             shared_projection
-                .apply_host_salt_v2_scale_updates(3, std::slice::from_ref(&update))
+                .apply_host_salt_v2_scale_updates(0, std::slice::from_ref(&update))
                 .is_err()
         );
     }
