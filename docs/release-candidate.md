@@ -9,6 +9,20 @@ second-machine gates remain separate.
 
 ## Gate status (measured 2026-09-03)
 
+### PR CI on release-input-admission (2026-10-04)
+
+GitHub CI, docs, capstone CPU smoke, wheels, and CodeQL all passed for branch
+head `cecf528bce32d000fe7cb1e116cd3c9dcb276d46` in run
+[`37218555369`](https://github.com/Quitetall/tritium/actions/runs/37218555369).
+The CI matrix included the receipt-backed compatibility-matrix job. However,
+the downloaded crate and npm qualification receipts bind source revision
+`b4b475da036791e93015439095eb5829bd13ae94`, the PR merge tree, rather than the
+branch-head candidate. They are not admissible as package evidence for the
+branch-head revision. The exact-source workflow supports an explicit source
+revision, but no separate run has been dispatched for `cecf528`; package-matrix
+admission therefore remains open for that candidate. Hardware and release
+qualification are not implied by this PR CI result.
+
 ### Installed CPU wheel, HF lifecycle, and ONNX smoke (2026-10-04)
 
 At source revision `2f53bf00658f9d8412b98acff387763efb4e191d`, a CPU abi3 wheel
