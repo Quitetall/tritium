@@ -124,6 +124,33 @@ class GenerateReleaseInputsTests(unittest.TestCase):
         with self.assertRaisesRegex(ReleaseInputsError, "ambiguously names artifact"):
             build_inputs(self.staged, **self.args())
 
+    def test_rejects_backslash_in_artifact_directory_path(self):
+        directory = self.staged / "nested\\folder"
+        directory.mkdir()
+        (directory / "portable.whl").write_bytes(b"wheel")
+        sbom(
+            directory / "wheel.cdx.json",
+            artifact_id="nested-wheel",
+            filename="portable.whl",
+        )
+
+        with self.assertRaisesRegex(ReleaseInputsError, "portable POSIX separators"):
+            build_inputs(self.staged, **self.args())
+
+    def test_rejects_backslash_in_sbom_directory_path(self):
+        filename = "portable.whl"
+        (self.staged / filename).write_bytes(b"wheel")
+        directory = self.staged / "metadata\\folder"
+        directory.mkdir()
+        sbom(
+            directory / "wheel.cdx.json",
+            artifact_id="wheel",
+            filename=filename,
+        )
+
+        with self.assertRaisesRegex(ReleaseInputsError, "SBOM path.*portable POSIX"):
+            build_inputs(self.staged, **self.args())
+
     def test_rejects_duplicate_artifact_binding(self):
         filename = "tritium-core-1.1.0-rc.2.crate"
         sbom(

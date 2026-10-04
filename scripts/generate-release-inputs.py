@@ -110,6 +110,10 @@ def build_inputs(
         if not path.is_file():
             raise ReleaseInputsError(f"release artifact must be an ordinary file: {path}")
         relative = path.relative_to(staged).as_posix()
+        if "\\" in relative:
+            raise ReleaseInputsError(
+                f"release artifact path must use portable POSIX separators: {relative!r}"
+            )
         assets[relative] = path
     if not assets:
         raise ReleaseInputsError("staged directory contains no release artifacts")
@@ -120,6 +124,10 @@ def build_inputs(
     for sbom in sorted(sboms, key=lambda item: item.relative_to(staged).as_posix()):
         artifact_id, filename = _sbom_binding(sbom)
         sbom_relative = sbom.relative_to(staged).as_posix()
+        if "\\" in sbom_relative:
+            raise ReleaseInputsError(
+                f"SBOM path must use portable POSIX separators: {sbom_relative!r}"
+            )
         colocated = (sbom.parent / filename).relative_to(staged).as_posix()
         matches = [path for path in assets if PurePosixPath(path).name == filename]
         if colocated in assets:
