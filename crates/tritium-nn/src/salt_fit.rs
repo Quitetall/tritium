@@ -878,8 +878,8 @@ mod tests {
         for (anchor, planes) in &in_loop {
             assert!(anchor.is_finite() && *anchor >= 0.0);
             assert_eq!(planes.len(), 2);
-            for column in 0..2 {
-                let code = planes[0][column] as i32 * 3 + planes[1][column] as i32;
+            for (&high, &low) in planes[0].iter().zip(&planes[1]) {
+                let code = high as i32 * 3 + low as i32;
                 assert!((-4..=4).contains(&code), "invalid two-trit code {code}");
             }
         }
