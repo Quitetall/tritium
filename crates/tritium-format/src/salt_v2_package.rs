@@ -1,8 +1,8 @@
 //! Canonical SALT V2 tensor/package encoding.
 //!
 //! The package is deliberately semantic: a tensor is split into 256-coefficient
-//! allocation macrotiles, every plane has one zero-point-free f16 scale per 64
-//! or 128 coefficients as bound by its tensor layout tag, and the two optional
+//! allocation macrotiles. Each plane has one zero-point-free f16 scale per 64,
+//! 128, or 256 coefficients as bound by its tensor layout tag, and the two optional
 //! planes are described by one package-global
 //! two-bit stream for full allocation tiles. Complete map bytes are serialized
 //! once; its terminal 0/2/4/6 bits use unused high bits of the mandatory package
@@ -46,6 +46,9 @@ pub const SALT_V2_SCALE_GROUP_SIZE: usize = 128;
 /// Smaller scale group admitted for model widths such as SmolLM2's K=576.
 pub const SALT_V2_SCALE_GROUP_SIZE_64: usize = 64;
 
+/// Larger ablation scale group, stored using version-2 scale geometry tag 2.
+pub const SALT_V2_SCALE_GROUP_SIZE_256: usize = 256;
+
 /// Number of coefficients in one variable-plane allocation macrotile.
 pub const SALT_V2_ALLOCATION_TILE_SIZE: usize = 256;
 
@@ -73,7 +76,7 @@ pub const SALT_V2_PACKAGE_VERSION: u16 = 1;
 /// SALT V2 version carrying explicit per-tensor scale geometry.
 ///
 /// G128-only packages remain canonical version 1. Version 2 assigns one
-/// formerly reserved tensor-layout byte to G64/G128 geometry.
+/// formerly reserved tensor-layout byte to geometry tags 0=G128, 1=G64, 2=G256.
 pub const SALT_V2_PACKAGE_VERSION_SCALE_GEOMETRY: u16 = 2;
 
 /// Bytes in the fixed package header.
@@ -100,7 +103,7 @@ const SALT_V2_SEMANTIC_TENSOR_DOMAIN: &[u8] = b"tritium.salt-v2.semantic-tensor.
 fn validate_scale_group_size(scale_group_size: usize) -> Result<(), SaltV2PackageError> {
     if matches!(
         scale_group_size,
-        SALT_V2_SCALE_GROUP_SIZE_64 | SALT_V2_SCALE_GROUP_SIZE
+        SALT_V2_SCALE_GROUP_SIZE_64 | SALT_V2_SCALE_GROUP_SIZE | SALT_V2_SCALE_GROUP_SIZE_256
     ) {
         Ok(())
     } else {
@@ -131,7 +134,7 @@ impl SaltV2Plane {
 
     /// Construct a plane with an explicit canonical scale-group width.
     ///
-    /// G64 is encoded by a distinct tensor layout tag. G128 remains byte-identical
+    /// G64 and G256 use distinct tensor layout tags. G128 remains byte-identical
     /// to SALT V2 v1 packages.
     pub fn new_with_scale_group_size(
         raw_trits: Vec<i8>,
@@ -2849,6 +2852,7 @@ fn push_layout(
         (SALT_V2_PACKAGE_VERSION, SALT_V2_SCALE_GROUP_SIZE) => 0,
         (SALT_V2_PACKAGE_VERSION_SCALE_GEOMETRY, SALT_V2_SCALE_GROUP_SIZE) => 0,
         (SALT_V2_PACKAGE_VERSION_SCALE_GEOMETRY, SALT_V2_SCALE_GROUP_SIZE_64) => 1,
+        (SALT_V2_PACKAGE_VERSION_SCALE_GEOMETRY, SALT_V2_SCALE_GROUP_SIZE_256) => 2,
         _ => unreachable!("validated package version and scale geometry"),
     };
     match transform {
@@ -2897,6 +2901,7 @@ fn read_layout(
             SALT_V2_SCALE_GROUP_SIZE
         }
         (SALT_V2_PACKAGE_VERSION_SCALE_GEOMETRY, 1) => SALT_V2_SCALE_GROUP_SIZE_64,
+        (SALT_V2_PACKAGE_VERSION_SCALE_GEOMETRY, 2) => SALT_V2_SCALE_GROUP_SIZE_256,
         (SALT_V2_PACKAGE_VERSION, _) => {
             return Err(SaltV2PackageError::NonCanonicalTransformMetadata);
         }
@@ -3884,6 +3889,45 @@ mod tests {
                 .package,
             compact
         );
+    }
+
+    #[test]
+    fn g256_uses_versioned_scale_geometry_and_round_trips() {
+        let trits = structured_values(SALT_V2_ALLOCATION_TILE_SIZE, 1);
+        let plane = SaltV2Plane::new_with_scale_group_size(
+            trits,
+            vec![f16::from_f32(0.5)],
+            SALT_V2_SCALE_GROUP_SIZE_256,
+        )
+        .expect("valid G256 plane");
+        let tensor = SaltV2Tensor::new_with_layout(
+            "g256.weight",
+            vec![1, SALT_V2_ALLOCATION_TILE_SIZE as u64],
+            SaltV2Transform::None,
+            SALT_V2_SCALE_GROUP_SIZE_256,
+            vec![SaltV2Tile::new(vec![plane]).expect("valid G256 tile")],
+        )
+        .expect("valid G256 tensor");
+        let package =
+            SaltV2Package::new(SaltV2Codec::B3, vec![tensor]).expect("valid G256 package");
+        let encoded = write_salt_v2_package(&package).expect("encode G256 package");
+
+        assert_eq!(
+            u16::from_le_bytes([encoded.bytes[8], encoded.bytes[9]]),
+            SALT_V2_PACKAGE_VERSION_SCALE_GEOMETRY
+        );
+        assert_eq!(
+            read_salt_v2_package(&encoded.bytes)
+                .expect("decode G256 package")
+                .package,
+            package
+        );
+        let mut downgraded = encoded.bytes;
+        downgraded[8..10].copy_from_slice(&SALT_V2_PACKAGE_VERSION.to_le_bytes());
+        assert!(matches!(
+            read_salt_v2_package(&downgraded),
+            Err(SaltV2PackageError::NonCanonicalTransformMetadata)
+        ));
     }
 
     #[test]
