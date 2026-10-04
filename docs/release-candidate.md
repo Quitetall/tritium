@@ -62,6 +62,28 @@ not a candidate-bound schema-v3 readiness/deployment receipt, Qwen evidence, or
 a release qualification. Plan 0052's production artifact and deployment gates
 remain open.
 
+### IMMA startup policy comparison (2026-10-04)
+
+The same RTX 4090 integration test was repeated with only
+`TRITIUM_IMMA_TUNE` changed. Readiness time was measured from immediately before
+`build_router_batched` until `/readyz` returned 200:
+
+| Policy | Readiness time | Meaning |
+|---|---:|---|
+| default (`tune`) | 175.060 s | Runtime may search for tile choices, then load/compile the selected functions. |
+| `load` | 55.486 s | Avoids the runtime search; loads cached choices or uses the AOT choice. |
+| `off` | 10.004 s | Skips IMMA prefill setup; this is not performance-equivalent to the other policies. |
+
+Each run passed the same focused CUDA admission/interleaving test. These are
+single-run observations on one GPU, one BitNet fixture, and this source tree;
+they identify IMMA policy/setup as a major contributor to this cold-start case,
+but do not provide a general startup guarantee or isolate exact additive costs.
+`load` is a useful current operator workaround when its precomputed/AOT choice
+is acceptable. The default policy has not been changed: altering it would affect
+runtime behavior and needs a contract decision plus broader cold/warm and
+performance validation. `off` is diagnostic only, not a recommended equivalent
+serving configuration.
+
 ### Flagship campaign verification refresh (2026-09-29)
 
 The previous refresh reported the pinned Qwen3.6-27B additive-master campaign

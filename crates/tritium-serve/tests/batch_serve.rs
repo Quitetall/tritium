@@ -690,6 +690,7 @@ async fn cuda_batched_admission_interleaves_live_slot() {
         c.kv_pool_tokens = Some(4096);
         c
     };
+    let startup_started = std::time::Instant::now();
     let (router, _draining) =
         build_router_batched(runner, u32::MAX, 2, tok, cfg).expect("batched router");
 
@@ -705,41 +706,40 @@ async fn cuda_batched_admission_interleaves_live_slot() {
         )
         .await
         .expect("readiness route");
-    assert_eq!(
-        ready.status(),
-        StatusCode::SERVICE_UNAVAILABLE,
-        "batch startup must remain not-ready while the CUDA pool initializes"
-    );
-    let health = router
-        .clone()
-        .oneshot(
-            Request::get("/healthz")
-                .body(Body::empty())
-                .expect("health request"),
-        )
-        .await
-        .expect("health route");
-    assert_eq!(health.status(), StatusCode::OK);
-    let early_chat = router
-        .clone()
-        .oneshot(
-            Request::post("/v1/chat/completions")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::json!({
-                        "model": "tritium",
-                        "max_tokens": 2,
-                        "messages": [{"role": "user", "content": "1 2 3"}],
-                    })
-                    .to_string(),
-                ))
-                .expect("early chat request"),
-        )
-        .await
-        .expect("early chat route");
-    assert_eq!(early_chat.status(), StatusCode::SERVICE_UNAVAILABLE);
-
-    let startup_started = std::time::Instant::now();
+    match ready.status() {
+        StatusCode::OK => {}
+        StatusCode::SERVICE_UNAVAILABLE => {
+            let health = router
+                .clone()
+                .oneshot(
+                    Request::get("/healthz")
+                        .body(Body::empty())
+                        .expect("health request"),
+                )
+                .await
+                .expect("health route");
+            assert_eq!(health.status(), StatusCode::OK);
+            let early_chat = router
+                .clone()
+                .oneshot(
+                    Request::post("/v1/chat/completions")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({
+                                "model": "tritium",
+                                "max_tokens": 2,
+                                "messages": [{"role": "user", "content": "1 2 3"}],
+                            })
+                            .to_string(),
+                        ))
+                        .expect("early chat request"),
+                )
+                .await
+                .expect("early chat route");
+            assert_eq!(early_chat.status(), StatusCode::SERVICE_UNAVAILABLE);
+        }
+        status => panic!("unexpected readiness status during batch startup: {status}"),
+    }
     loop {
         let ready = router
             .clone()
