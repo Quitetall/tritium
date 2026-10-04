@@ -50,6 +50,42 @@ were not independently rehashed. Campaign status remains stalled (0/506
 published masters, zero seals). No source weights were altered, deleted, or
 fitted.
 
+### Qwen source and calibration preflight recovery (2026-10-04)
+
+The source-admission receipt still referenced a proof under `/mnt/4tb/tmp` that
+no longer exists. The same 221,951-byte `ingest.tq36` proof was found in both
+`/mnt/4tb/qwen36-source-admission/...` and the durable campaign workspace; both
+copies hash to the receipt's expected SHA-256
+`09b59e8e41d7e0f947e31d2fc8f4fb635804f162f0c7558a2df6ff6d98b834e0`. The
+old campaign receipt did not match the parent of the existing official-source
+identity receipt, so the strict no-overwrite
+`scripts/rebind-qwen36-source-evidence.py` was used with the matching admitted
+receipt and verified proof. It produced a fresh, strictly reopened receipt pair
+and copied proof under
+`/mnt/4tb/qwen36-source-admission/rebound-20261004/` (rebind receipt
+`sha256:f316adcfe1da1343f1cdf52168ade72e48b59b6275e0dd3a9c5ed721234ee7f8`).
+Original evidence was left unchanged.
+
+Using the verified local checkpoint, rebound official-source identity, and the
+existing token pack, `scripts/verify-qwen36-calibration-pack.py` passed and
+produced calibration-pack receipt
+`sha256:b5b2ba2801cc5125e6cc7561117268bf29a20f153a7e662c47a1ca2f078beb63` plus
+pre-capture replay contract
+`sha256:089f3800c6817c3a079fc146d9f087093031bee6b416c58eff708e28e0c5b55a`.
+The pack contains 512 calibration sequences (1,048,576 ordered tokens). The
+`scripts/capture-qwen36-from-pack.py` preflight passed against these exact
+identities and batch digest
+`sha256:ca913e334bf22c73755d27b11848599008790f672600b8085daf5ec53022202c`;
+it explicitly reported `NOT STARTED` because `--execute` was not supplied.
+
+The campaign workspace has 506 existing `.s2kf` files but no discovered
+pack-linked capture-binding receipt. These records are not admitted as the new
+verified pack's captured calibration evidence merely because the count matches
+the tensor count. The canonical fitter still reports 0/506 published masters
+and no seals. Next gates are a candidate-bound Stage-7 qualification, actual
+pack-linked model replay/capture, strict capture-binding verification of all
+506 records, and only then fitting. No GPU model load or capture was started.
+
 ### CUDA paged-KV cancellation smoke (2026-10-03)
 
 At source revision `8e8f6e0eecd6521adaf7e5911b580af4ffebba2a`, the focused
