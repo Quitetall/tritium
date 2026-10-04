@@ -22,6 +22,34 @@ fitting without a source-bound capture transcript or a recapture from the
 approved calibration pack. No campaign was started or modified for this
 refresh.
 
+### Local pinned-checkpoint inventory refresh (2026-10-04)
+
+Read-only inventory found all 15 named safetensors shards plus config, index,
+and tokenizer files in each of these local directories:
+
+- `/mnt/4tb/models/Qwen3.6-27B`
+- `/mnt/4tb/models/qwen36-27b-6a9e13bd`
+- `/mnt/4tb/qwen36-27b-source-6a9e13bd6fc8f0983b9b99948120bc37f49c13e9`
+
+The inspected Hugging Face cache metadata names pinned revision
+`6a9e13bd6fc8f0983b9b99948120bc37f49c13e9`. The durable source directory
+`/mnt/4tb/qwen36-27b-source-6a9e13bd6fc8f0983b9b99948120bc37f49c13e9` was
+checked against the existing pinned official identity receipt
+`sha256:154f7807dc5aa829dd061020c4cf8e10db1aefafd2f6f95d6ab8301d5c01dbc9`:
+all 29 file sizes and declared digests matched (15 safetensors shards and
+`tokenizer.json` by SHA-256; 13 small repository files by Git blob SHA-1).
+Its source-admission parent is `sha256:0a45d3b593893aaf660d34ecd31cc66bf28ae4fd19d411ffa0671d2747ca2fd4`.
+The shard files total 55,563,006,400 bytes; this is 150,496 bytes above the
+campaign's 55,562,855,904-byte raw tensor payload because the safetensors files
+also contain headers/metadata. That difference is expected and is not a model
+weight mismatch. This verifies that one local snapshot matches the pinned
+official file manifest; it does not turn the base source-admission receipt's
+`official_payload_authenticated: false` field into true or admit calibration
+evidence. The other two directories have the expected filenames and sizes but
+were not independently rehashed. Campaign status remains stalled (0/506
+published masters, zero seals). No source weights were altered, deleted, or
+fitted.
+
 ### CUDA paged-KV cancellation smoke (2026-10-03)
 
 At source revision `8e8f6e0eecd6521adaf7e5911b580af4ffebba2a`, the focused
