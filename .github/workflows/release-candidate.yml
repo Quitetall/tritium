@@ -159,6 +159,7 @@ jobs:
           --downloads "${{ steps.staging.outputs.root }}/downloads"
           --payload "${{ steps.staging.outputs.root }}/candidate"
           --evidence "${{ steps.staging.outputs.root }}/evidence"
+          --source-root "$GITHUB_WORKSPACE"
       - name: assert complete wheel platform set
         env:
           RELEASE_VERSION: ${{ needs.resolve.outputs.version }}

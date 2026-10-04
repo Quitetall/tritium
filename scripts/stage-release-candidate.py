@@ -78,15 +78,23 @@ def _require_names(files: dict[str, Path], expected: set[str], label: str) -> No
         raise StageError(f"{label} inventory differs: {'; '.join(details)}")
 
 
-def stage(downloads: Path, payload: Path, evidence: Path) -> dict[str, Any]:
+def stage(
+    downloads: Path, payload: Path, evidence: Path, source_root: Path
+) -> dict[str, Any]:
     """Create fresh, disjoint output directories with closed file inventories."""
-    downloads = _ordinary_directory(downloads, "downloads")
+    downloads = _ordinary_directory(downloads, "downloads").resolve()
+    source_root = _ordinary_directory(source_root, "source checkout").resolve()
+    payload = Path(os.path.abspath(payload))
+    evidence = Path(os.path.abspath(evidence))
+    if any(
+        directory == source_root or source_root in directory.parents
+        for directory in (downloads, payload, evidence)
+    ):
+        raise StageError("downloads and outputs must be outside the source checkout")
     _child_directories(
         downloads, {"wheels", "package-evidence", "compatibility-evidence"}, "downloads"
     )
     _child_directories(downloads / "package-evidence", {"crates", "npm"}, "package evidence")
-    payload = Path(os.path.abspath(payload))
-    evidence = Path(os.path.abspath(evidence))
     if payload == evidence or payload in evidence.parents or evidence in payload.parents:
         raise StageError("payload and evidence output directories must be disjoint")
     if (
@@ -207,9 +215,10 @@ def main() -> int:
     parser.add_argument("--downloads", type=Path, required=True)
     parser.add_argument("--payload", type=Path, required=True)
     parser.add_argument("--evidence", type=Path, required=True)
+    parser.add_argument("--source-root", type=Path, required=True)
     args = parser.parse_args()
     try:
-        result = stage(args.downloads, args.payload, args.evidence)
+        result = stage(args.downloads, args.payload, args.evidence, args.source_root)
     except (OSError, StageError) as error:
         parser.error(str(error))
     print(json.dumps(result, sort_keys=True, separators=(",", ":")))

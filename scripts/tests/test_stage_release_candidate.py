@@ -49,11 +49,13 @@ class StageReleaseCandidateTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.downloads = downloads(self.root / "downloads")
+        self.source_root = self.root / "checkout"
+        self.source_root.mkdir()
         self.payload = self.root / "candidate"
         self.evidence = self.root / "evidence"
 
     def test_stages_only_package_bytes_in_candidate_payload(self) -> None:
-        result = stage(self.downloads, self.payload, self.evidence)
+        result = stage(self.downloads, self.payload, self.evidence, self.source_root)
 
         self.assertEqual(result["schema"], "tritium.release-candidate-staging.v1")
         self.assertEqual(result["payload_files"], 10)
@@ -71,33 +73,33 @@ class StageReleaseCandidateTests(unittest.TestCase):
     def test_rejects_unexpected_downloaded_file(self) -> None:
         write(self.downloads / "wheels" / "unexpected.txt")
         with self.assertRaisesRegex(StageError, "wheel artifacts inventory differs"):
-            stage(self.downloads, self.payload, self.evidence)
+            stage(self.downloads, self.payload, self.evidence, self.source_root)
         self.assertFalse(self.payload.exists())
         self.assertFalse(self.evidence.exists())
 
     def test_rejects_missing_platform_wheel(self) -> None:
         (self.downloads / "wheels" / "pytritium-1.1.0rc2-cp39-abi3-win_amd64.whl").unlink()
         with self.assertRaisesRegex(StageError, "exactly three platform wheels"):
-            stage(self.downloads, self.payload, self.evidence)
+            stage(self.downloads, self.payload, self.evidence, self.source_root)
 
     def test_rejects_symlink_in_downloads(self) -> None:
         target = self.root / "outside.whl"
         target.write_bytes(b"not staged")
         (self.downloads / "wheels" / "linked.whl").symlink_to(target)
         with self.assertRaisesRegex(StageError, "non-regular file"):
-            stage(self.downloads, self.payload, self.evidence)
+            stage(self.downloads, self.payload, self.evidence, self.source_root)
 
     def test_rejects_payload_and_evidence_filename_collision(self) -> None:
         name = "tritium-core.cdx.json"
         (self.downloads / "wheels" / "pytritium-linux-x86_64-cpu.cdx.json").unlink()
         write(self.downloads / "wheels" / name)
         with self.assertRaisesRegex(StageError, "colliding artifact or SBOM"):
-            stage(self.downloads, self.payload, self.evidence)
+            stage(self.downloads, self.payload, self.evidence, self.source_root)
 
     def test_refuses_to_overwrite_output(self) -> None:
         self.payload.mkdir()
         with self.assertRaisesRegex(StageError, "must not already exist"):
-            stage(self.downloads, self.payload, self.evidence)
+            stage(self.downloads, self.payload, self.evidence, self.source_root)
 
     def test_refuses_output_inside_download_tree(self) -> None:
         with self.assertRaisesRegex(StageError, "outside the downloads tree"):
@@ -105,6 +107,25 @@ class StageReleaseCandidateTests(unittest.TestCase):
                 self.downloads,
                 self.downloads / "candidate",
                 self.evidence,
+                self.source_root,
+            )
+
+    def test_refuses_downloads_or_outputs_inside_source_checkout(self) -> None:
+        with self.assertRaisesRegex(StageError, "outside the source checkout"):
+            stage(
+                self.downloads,
+                self.source_root / "candidate",
+                self.evidence,
+                self.source_root,
+            )
+        source_downloads = self.source_root / "downloads"
+        source_downloads.mkdir()
+        with self.assertRaisesRegex(StageError, "outside the source checkout"):
+            stage(
+                source_downloads,
+                self.payload,
+                self.evidence,
+                self.source_root,
             )
 
 
