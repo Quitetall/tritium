@@ -9,13 +9,13 @@ use tritium_format::{
 };
 use tritium_quantize::{
     ActivationCache, ActivationCacheBuilder, ActivationCacheSpec, ActivationChunk, ActivationDType,
-    ActivationDigest, ActivationWindow, FixedTritScaleRefitAccumulator, OutputObjectiveWeights,
-    OutputReconstructionAccumulator, OutputReconstructionActivationLayer,
-    OutputReconstructionActivationSet, OutputReconstructionActivationSource,
-    OutputReconstructionError, OutputReconstructionSchedule, OutputReconstructionScope,
-    OutputReconstructionSpec, RuntimeFinalLogitsAccumulator, fit_fixed_trit_tile_scale_refit,
-    fit_fixed_trit_tile_scale_update, output_reconstruction_activation_digest,
-    select_output_reconstruction,
+    ActivationDigest, ActivationWindow, FixedTritScaleRefitAccumulator,
+    FixedTritTileScaleRefitAccumulator, OutputObjectiveWeights, OutputReconstructionAccumulator,
+    OutputReconstructionActivationLayer, OutputReconstructionActivationSet,
+    OutputReconstructionActivationSource, OutputReconstructionError, OutputReconstructionSchedule,
+    OutputReconstructionScope, OutputReconstructionSpec, RuntimeFinalLogitsAccumulator,
+    fit_fixed_trit_tile_scale_refit, fit_fixed_trit_tile_scale_update,
+    output_reconstruction_activation_digest, select_output_reconstruction,
 };
 
 const CANDIDATE_HASH_CONTEXT: &str = "tritium salt v2 output reconstruction candidate v1";
@@ -1037,6 +1037,35 @@ fn fixed_trit_tile_refit_recovers_shared_scales_from_residual_outputs() {
     assert_eq!(fitted.scales(), &[2.0, 0.5]);
     assert_eq!(fitted.observations(), 6);
     assert!(fitted.squared_error() < 1e-12);
+
+    let first_window = cache.read_window(0, 1, 4096).unwrap();
+    let second_window = cache.read_window(1, 2, 4096).unwrap();
+    let mut streamed = FixedTritTileScaleRefitAccumulator::new(2, 0, &trits, 64, 16).unwrap();
+    streamed
+        .observe_window(&first_window, &residual_outputs[..2])
+        .unwrap();
+    assert!(matches!(
+        streamed.observe_window(&second_window, &[f32::NAN; 4]),
+        Err(OutputReconstructionError::NonFiniteOutput { teacher: true })
+    ));
+    streamed
+        .observe_window(&second_window, &residual_outputs[2..])
+        .unwrap();
+    let streamed = streamed.finish_update(7, 1).unwrap();
+    assert_eq!(streamed.update().tensor_index(), 7);
+    assert_eq!(streamed.update().tile_index(), 0);
+    assert_eq!(streamed.update().plane_index(), 1);
+    assert_eq!(streamed.observations(), fitted.observations());
+    assert!((streamed.squared_error() - fitted.squared_error()).abs() < 1e-12);
+    assert_eq!(
+        streamed
+            .update()
+            .scales()
+            .iter()
+            .map(|scale| scale.to_f32())
+            .collect::<Vec<_>>(),
+        vec![2.0, 0.5]
+    );
 
     let candidate = fit_fixed_trit_tile_scale_update(
         &activations,

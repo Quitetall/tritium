@@ -130,9 +130,9 @@ pub use salt_v2_model::{
     plan_salt_v2_restartable_tensor_master, plan_salt_v2_tensor_master,
 };
 pub use salt_v2_output::{
-    FixedTritScaleRefit, FixedTritScaleRefitAccumulator, FixedTritTileScaleUpdate,
-    LegacyOutputReconstructionReceipt, OutputCandidateReceipt, OutputObjectiveWeights,
-    OutputReconstructionAccumulator, OutputReconstructionActivationLayer,
+    FixedTritScaleRefit, FixedTritScaleRefitAccumulator, FixedTritTileScaleRefitAccumulator,
+    FixedTritTileScaleUpdate, LegacyOutputReconstructionReceipt, OutputCandidateReceipt,
+    OutputObjectiveWeights, OutputReconstructionAccumulator, OutputReconstructionActivationLayer,
     OutputReconstructionActivationSet, OutputReconstructionActivationSource,
     OutputReconstructionActivationWindows, OutputReconstructionError, OutputReconstructionReceipt,
     OutputReconstructionScaleCandidate, OutputReconstructionSchedule, OutputReconstructionScope,
