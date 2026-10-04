@@ -33,14 +33,17 @@ test("WASM build reads guest from Cargo's effective target directory", () => {
 });
 
 test("effective WASM target directory honors Cargo configuration", async () => {
+  const environment = { ...process.env };
+  delete environment.CARGO_TARGET_DIR;
   const metadata = JSON.parse(
     execFileSync("cargo", ["metadata", "--no-deps", "--format-version", "1"], {
       cwd: repositoryRoot,
+      env: environment,
       encoding: "utf8",
     }),
   );
   assert.equal(
-    await resolveEffectiveCargoTargetDirectory({}, repositoryRoot),
+    await resolveEffectiveCargoTargetDirectory(environment, repositoryRoot),
     resolve(metadata.target_directory),
   );
 });
