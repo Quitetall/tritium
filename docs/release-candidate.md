@@ -84,6 +84,36 @@ did not run this tutorial. It therefore verifies installed Tritium wheel
 behavior on this host, but not a self-contained dependency environment or the
 cross-platform CUDA packaging matrix.
 
+### Current-revision CPU manylinux wheel and installed facade (2026-10-04)
+
+At exact source revision `d885a80a770c19332d09b79bb844773d1aadb7b3`,
+`/home/brianklam/.cache/tritium-prepush/worktree` was a clean detached worktree.
+`scripts/build-cpu-manylinux-wheel.sh` produced
+`/mnt/2tb/tritium-wheel-d885a80/pytritium-1.1.0rc2-cp39-abi3-manylinux_2_28_x86_64.whl`,
+10,514,698 bytes, SHA-256
+`7cb0e9c2ffb0adc3c6d132625e6341369b99984e50f7ea71a224a435643ac299`. The
+manylinux platform and isolated install check passed. The wheel-smoke receipt
+at `/mnt/2tb/tritium-wheel-d885a80/wheel-smoke.json` has SHA-256
+`509b8809b940475407fc49fc29d27d45ef4ac2ad75bcc85ac6a9d10bd758bf7b`.
+
+The installed-wheel functional smoke passed on CPU. Its receipt at
+`/mnt/2tb/tritium-wheel-d885a80/functional-receipt.json` has SHA-256
+`8e48e3eb7ae9f579e5367e3b0610b1ccfa8544212d0582b17fdc176610315e10` and
+receipt ID
+`sha256:c5b03196e628321d3e8995bc533a510581a8d892f15668d3d99da69e7225349c`.
+It exercised native CPU ternary matmul, HF QAT forward/backward, optimizer
+update/resume, safetensors save/reload, and tied-weight identity under CPython
+3.14.7, PyTorch 2.11.0+cu130, Transformers 5.5.3, and safetensors 0.7.0. The
+test venv installed the Tritium wheel but inherited dependency packages from
+the host Python site; it is not a fully isolated dependency-install test.
+
+The 24 tests in `crates/tritium-py/tests/test_torch_onnx.py` also passed from
+that installed-wheel venv, with `tritium` resolved under the venv's
+`site-packages`. The generation-adapter test uses a fake native runtime; this
+does not qualify a real ORT session or whole-Qwen generation. These are
+current-revision local package checks, not the cross-platform matrix, aggregate
+package gate, or independent release qualification.
+
 ### ONNX Python facade source regression refresh (2026-10-04)
 
 `python -m pytest crates/tritium-py/tests/test_torch_onnx.py -q` passed 24
