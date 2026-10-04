@@ -14,7 +14,8 @@ use tritium_quantize::{
     OutputReconstructionActivationSet, OutputReconstructionActivationSource,
     OutputReconstructionError, OutputReconstructionSchedule, OutputReconstructionScope,
     OutputReconstructionSpec, RuntimeFinalLogitsAccumulator, fit_fixed_trit_tile_scale_refit,
-    output_reconstruction_activation_digest, select_output_reconstruction,
+    fit_fixed_trit_tile_scale_update, output_reconstruction_activation_digest,
+    select_output_reconstruction,
 };
 
 const CANDIDATE_HASH_CONTEXT: &str = "tritium salt v2 output reconstruction candidate v1";
@@ -227,6 +228,11 @@ fn fixed_trit_scale_refit_never_uses_negative_scales() {
 
     assert_eq!(result.scales(), &[0.0]);
     assert_eq!(result.squared_error(), 4.0);
+    assert_eq!(result.to_f16_scales().unwrap(), vec![f16::ZERO]);
+    assert_eq!(
+        result.to_positive_f16_scales().unwrap(),
+        vec![f16::from_bits(1)]
+    );
 }
 
 #[test]
@@ -1031,6 +1037,32 @@ fn fixed_trit_tile_refit_recovers_shared_scales_from_residual_outputs() {
     assert_eq!(fitted.scales(), &[2.0, 0.5]);
     assert_eq!(fitted.observations(), 6);
     assert!(fitted.squared_error() < 1e-12);
+
+    let candidate = fit_fixed_trit_tile_scale_update(
+        &activations,
+        &residual_outputs,
+        2,
+        7,
+        0,
+        1,
+        &trits,
+        64,
+        16,
+    )
+    .unwrap();
+    assert_eq!(candidate.update().tensor_index(), 7);
+    assert_eq!(candidate.update().tile_index(), 0);
+    assert_eq!(candidate.update().plane_index(), 1);
+    assert_eq!(
+        candidate
+            .update()
+            .scales()
+            .iter()
+            .map(|scale| scale.to_f32())
+            .collect::<Vec<_>>(),
+        vec![2.0, 0.5]
+    );
+    assert!(candidate.squared_error() < 1e-12);
 }
 
 #[test]

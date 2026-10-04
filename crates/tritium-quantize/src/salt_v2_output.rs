@@ -1254,6 +1254,25 @@ impl FixedTritScaleRefit {
         Ok(scales)
     }
 
+    /// Convert scales to strictly positive f16 values for output candidates.
+    ///
+    /// Exact zeros become the smallest positive f16 subnormal. This preserves
+    /// the candidate identity contract; downstream package application and
+    /// output scoring still validate the resulting artifact.
+    ///
+    /// # Errors
+    /// Rejects an invalid or non-finite f64 scale or one that overflows f16.
+    pub fn to_positive_f16_scales(&self) -> Result<Vec<half::f16>, OutputReconstructionError> {
+        let mut scales = self.to_f16_scales()?;
+        let smallest_positive = half::f16::from_bits(1);
+        for scale in &mut scales {
+            if *scale == half::f16::ZERO {
+                *scale = smallest_positive;
+            }
+        }
+        Ok(scales)
+    }
+
     /// Sum of squared output error over observed calibration rows.
     #[must_use]
     pub const fn squared_error(&self) -> f64 {
@@ -1583,6 +1602,66 @@ pub fn fit_fixed_trit_tile_scale_refit(
         }
     }
     fit.finish()
+}
+
+/// Tile-local fixed-trit fit paired with its canonical package scale update.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FixedTritTileScaleUpdate {
+    update: SaltV2ScaleUpdate,
+    squared_error: f64,
+    observations: u64,
+}
+
+impl FixedTritTileScaleUpdate {
+    /// Canonically indexed replacement scales for this package plane.
+    #[must_use]
+    pub const fn update(&self) -> &SaltV2ScaleUpdate {
+        &self.update
+    }
+
+    /// Sum of squared residual-output error before f16 storage rounding.
+    #[must_use]
+    pub const fn squared_error(&self) -> f64 {
+        self.squared_error
+    }
+
+    /// Number of selected token/output rows consumed by the fit.
+    #[must_use]
+    pub const fn observations(&self) -> u64 {
+        self.observations
+    }
+}
+
+/// Fit one tile-plane and return a package-ready canonical scale update.
+#[allow(clippy::too_many_arguments)]
+pub fn fit_fixed_trit_tile_scale_update(
+    activations: &ActivationWindow,
+    residual_outputs: &[f32],
+    output_width: usize,
+    tensor_index: usize,
+    tile_index: usize,
+    plane_index: usize,
+    trits: &[Trit],
+    scale_group_size: usize,
+    coordinate_sweeps: usize,
+) -> Result<FixedTritTileScaleUpdate, OutputReconstructionError> {
+    let fit = fit_fixed_trit_tile_scale_refit(
+        activations,
+        residual_outputs,
+        output_width,
+        tile_index,
+        trits,
+        scale_group_size,
+        coordinate_sweeps,
+    )?;
+    let scales = fit.to_positive_f16_scales()?;
+    let update = SaltV2ScaleUpdate::new(tensor_index, tile_index, plane_index, scales)
+        .map_err(|_| OutputReconstructionError::InvalidScaleUpdate)?;
+    Ok(FixedTritTileScaleUpdate {
+        update,
+        squared_error: fit.squared_error(),
+        observations: fit.observations(),
+    })
 }
 
 /// Strictly validated legacy `TSV2OUT` v1 identity.
