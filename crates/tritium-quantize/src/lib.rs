@@ -130,10 +130,10 @@ pub use salt_v2_model::{
     plan_salt_v2_restartable_tensor_master, plan_salt_v2_tensor_master,
 };
 pub use salt_v2_output::{
-    LegacyOutputReconstructionReceipt, OutputCandidateReceipt, OutputObjectiveWeights,
-    OutputReconstructionAccumulator, OutputReconstructionError, OutputReconstructionReceipt,
-    OutputReconstructionSchedule, OutputReconstructionScope, OutputReconstructionSpec,
-    select_output_reconstruction,
+    FixedTritScaleRefit, FixedTritScaleRefitAccumulator, LegacyOutputReconstructionReceipt,
+    OutputCandidateReceipt, OutputObjectiveWeights, OutputReconstructionAccumulator,
+    OutputReconstructionError, OutputReconstructionReceipt, OutputReconstructionSchedule,
+    OutputReconstructionScope, OutputReconstructionSpec, select_output_reconstruction,
 };
 pub use ternary_baselines::{
     BaselineTernaryPlane, TernaryBaselineError, TernaryBaselineProjection, TtqState, TwnConfig,

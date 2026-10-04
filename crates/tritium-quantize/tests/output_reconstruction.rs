@@ -2,9 +2,9 @@
 
 use tritium_format::ModelId;
 use tritium_quantize::{
-    OutputObjectiveWeights, OutputReconstructionAccumulator, OutputReconstructionError,
-    OutputReconstructionSchedule, OutputReconstructionScope, OutputReconstructionSpec,
-    RuntimeFinalLogitsAccumulator, select_output_reconstruction,
+    FixedTritScaleRefitAccumulator, OutputObjectiveWeights, OutputReconstructionAccumulator,
+    OutputReconstructionError, OutputReconstructionSchedule, OutputReconstructionScope,
+    OutputReconstructionSpec, RuntimeFinalLogitsAccumulator, select_output_reconstruction,
 };
 
 const CANDIDATE_HASH_CONTEXT: &str = "tritium salt v2 output reconstruction candidate v1";
@@ -162,6 +162,29 @@ fn spec(schedule: OutputReconstructionSchedule, restarts: usize) -> OutputRecons
         restarts,
     )
     .expect("valid reconstruction spec")
+}
+
+#[test]
+fn fixed_trit_scale_refit_finds_nonnegative_scales_without_retaining_batches() {
+    // Orthogonal fixed-trit group outputs have the exact independent solution [2, 3].
+    let mut fit = FixedTritScaleRefitAccumulator::new(2, 8).expect("valid refit");
+    fit.observe(&[1.0, 0.0], 2.0).expect("first output row");
+    fit.observe(&[0.0, 1.0], 3.0).expect("second output row");
+    let result = fit.finish().expect("complete fit");
+
+    assert_eq!(result.observations(), 2);
+    assert_eq!(result.scales(), &[2.0, 3.0]);
+    assert_eq!(result.squared_error(), 0.0);
+}
+
+#[test]
+fn fixed_trit_scale_refit_never_uses_negative_scales() {
+    let mut fit = FixedTritScaleRefitAccumulator::new(1, 4).expect("valid refit");
+    fit.observe(&[1.0], -2.0).expect("valid output row");
+    let result = fit.finish().expect("complete fit");
+
+    assert_eq!(result.scales(), &[0.0]);
+    assert_eq!(result.squared_error(), 4.0);
 }
 
 fn exact_candidate(

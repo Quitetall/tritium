@@ -17,6 +17,8 @@ const CANDIDATE_HASH_CONTEXT: &str = "tritium salt v2 output reconstruction cand
 const CANDIDATE_HASH_CONTEXT_V3: &str = "tritium salt v2 output reconstruction candidate v2";
 const RECEIPT_HASH_CONTEXT: &str = "tritium salt v2 output reconstruction receipt v1";
 const MAX_OUTPUT_RECONSTRUCTION_SCOPES: usize = 1 << 20;
+const MAX_FIXED_TRIT_REFIT_GROUPS: usize = 1024;
+const MAX_FIXED_TRIT_REFIT_SWEEPS: usize = 100_000;
 
 /// Ordered model region evaluated by output reconstruction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -725,6 +727,199 @@ pub struct OutputReconstructionReceipt {
     receipt_id: [u8; 32],
 }
 
+/// Streaming non-negative least-squares fit for one output row with fixed trits.
+///
+/// Each observed value is the contribution of every fixed-trit scale group for
+/// one valid calibration token. Only the group Gram matrix and target products
+/// are retained, so callers can release activation batches immediately.
+#[derive(Clone, Debug)]
+pub struct FixedTritScaleRefitAccumulator {
+    gram: Vec<f64>,
+    target_products: Vec<f64>,
+    target_squared: f64,
+    observations: u64,
+    coordinate_sweeps: usize,
+}
+
+/// Non-negative scale solution for one output row and its calibration error.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FixedTritScaleRefit {
+    scales: Vec<f64>,
+    squared_error: f64,
+    observations: u64,
+}
+
+impl FixedTritScaleRefit {
+    /// Fitted non-negative scale for each fixed-trit group.
+    #[must_use]
+    pub fn scales(&self) -> &[f64] {
+        &self.scales
+    }
+
+    /// Sum of squared output error over observed calibration rows.
+    #[must_use]
+    pub const fn squared_error(&self) -> f64 {
+        self.squared_error
+    }
+
+    /// Number of valid calibration rows consumed by the fit.
+    #[must_use]
+    pub const fn observations(&self) -> u64 {
+        self.observations
+    }
+}
+
+impl FixedTritScaleRefitAccumulator {
+    /// Start a bounded-memory refit for one output row.
+    ///
+    /// `group_count` is the number of fixed-trit scale groups, and
+    /// `coordinate_sweeps` controls deterministic cyclic coordinate descent.
+    ///
+    /// # Errors
+    /// Rejects zero or excessive dimensions, zero sweeps, or allocation failure.
+    pub fn new(
+        group_count: usize,
+        coordinate_sweeps: usize,
+    ) -> Result<Self, OutputReconstructionError> {
+        if group_count == 0
+            || group_count > MAX_FIXED_TRIT_REFIT_GROUPS
+            || coordinate_sweeps == 0
+            || coordinate_sweeps > MAX_FIXED_TRIT_REFIT_SWEEPS
+        {
+            return Err(OutputReconstructionError::InvalidScaleRefit);
+        }
+        let gram_len = group_count
+            .checked_mul(group_count)
+            .ok_or(OutputReconstructionError::CountOverflow)?;
+        let mut gram = Vec::new();
+        gram.try_reserve_exact(gram_len)
+            .map_err(|_| OutputReconstructionError::ReceiptAllocationFailed)?;
+        gram.resize(gram_len, 0.0);
+        let mut target_products = Vec::new();
+        target_products
+            .try_reserve_exact(group_count)
+            .map_err(|_| OutputReconstructionError::ReceiptAllocationFailed)?;
+        target_products.resize(group_count, 0.0);
+        Ok(Self {
+            gram,
+            target_products,
+            target_squared: 0.0,
+            observations: 0,
+            coordinate_sweeps,
+        })
+    }
+
+    /// Add one row of fixed-trit group outputs and the matching teacher output.
+    ///
+    /// # Errors
+    /// Rejects the wrong group count, non-finite values, or counter overflow.
+    pub fn observe(
+        &mut self,
+        group_outputs: &[f64],
+        teacher_output: f64,
+    ) -> Result<(), OutputReconstructionError> {
+        let groups = self.target_products.len();
+        if group_outputs.len() != groups {
+            return Err(OutputReconstructionError::InvalidGeometry);
+        }
+        if !teacher_output.is_finite() {
+            return Err(OutputReconstructionError::NonFiniteOutput { teacher: true });
+        }
+        if group_outputs.iter().any(|value| !value.is_finite()) {
+            return Err(OutputReconstructionError::NonFiniteOutput { teacher: false });
+        }
+        let observations = self
+            .observations
+            .checked_add(1)
+            .ok_or(OutputReconstructionError::CountOverflow)?;
+        let target_squared = self.target_squared + teacher_output * teacher_output;
+        if !target_squared.is_finite() {
+            return Err(OutputReconstructionError::NonFiniteScaleRefit);
+        }
+        for group in 0..groups {
+            if !(self.target_products[group] + group_outputs[group] * teacher_output).is_finite() {
+                return Err(OutputReconstructionError::NonFiniteScaleRefit);
+            }
+            for other in 0..groups {
+                let index = group * groups + other;
+                if !(self.gram[index] + group_outputs[group] * group_outputs[other]).is_finite() {
+                    return Err(OutputReconstructionError::NonFiniteScaleRefit);
+                }
+            }
+        }
+        for group in 0..groups {
+            self.target_products[group] += group_outputs[group] * teacher_output;
+            for other in 0..groups {
+                let index = group * groups + other;
+                self.gram[index] += group_outputs[group] * group_outputs[other];
+            }
+        }
+        self.target_squared = target_squared;
+        self.observations = observations;
+        Ok(())
+    }
+
+    /// Solve the accumulated non-negative least-squares problem.
+    ///
+    /// Coordinates are visited in a fixed order. A zero diagonal produces a
+    /// zero scale; every coordinate update is bounded below by zero and cannot
+    /// increase the quadratic objective.
+    ///
+    /// # Errors
+    /// Rejects an empty stream or an invalid/non-finite accumulated solution.
+    pub fn finish(self) -> Result<FixedTritScaleRefit, OutputReconstructionError> {
+        if self.observations == 0 {
+            return Err(OutputReconstructionError::InvalidScaleRefit);
+        }
+        let groups = self.target_products.len();
+        let mut scales = vec![0.0; groups];
+        for _ in 0..self.coordinate_sweeps {
+            for group in 0..groups {
+                let diagonal = self.gram[group * groups + group];
+                if diagonal <= 0.0 {
+                    scales[group] = 0.0;
+                    continue;
+                }
+                let fitted_product = (0..groups)
+                    .map(|other| self.gram[group * groups + other] * scales[other])
+                    .sum::<f64>();
+                let updated = (scales[group]
+                    + (self.target_products[group] - fitted_product) / diagonal)
+                    .max(0.0);
+                if !updated.is_finite() {
+                    return Err(OutputReconstructionError::NonFiniteScaleRefit);
+                }
+                scales[group] = updated;
+            }
+        }
+        let linear = scales
+            .iter()
+            .zip(&self.target_products)
+            .map(|(scale, product)| scale * product)
+            .sum::<f64>();
+        let quadratic = scales
+            .iter()
+            .enumerate()
+            .map(|(row, scale)| {
+                scales
+                    .iter()
+                    .enumerate()
+                    .map(|(column, other)| scale * self.gram[row * groups + column] * other)
+                    .sum::<f64>()
+            })
+            .sum::<f64>();
+        let squared_error = (self.target_squared - 2.0 * linear + quadratic).max(0.0);
+        if !squared_error.is_finite() {
+            return Err(OutputReconstructionError::NonFiniteScaleRefit);
+        }
+        Ok(FixedTritScaleRefit {
+            scales,
+            squared_error,
+            observations: self.observations,
+        })
+    }
+}
+
 /// Strictly validated legacy `TSV2OUT` v1 identity.
 ///
 /// Version 1 predates runtime-comparable final-logit fields. It remains
@@ -1148,6 +1343,10 @@ pub enum OutputReconstructionError {
     MalformedReceipt(&'static str),
     /// A valid legacy v1 receipt lacks runtime-comparable final-logit evidence.
     LegacyReceiptMissingRuntimeEvidence,
+    /// Fixed-trit scale refit dimensions are empty, excessive, or have no observations.
+    InvalidScaleRefit,
+    /// Fixed-trit scale refit accumulated a non-finite intermediate or result.
+    NonFiniteScaleRefit,
 }
 
 impl fmt::Display for OutputReconstructionError {
@@ -1220,6 +1419,10 @@ impl fmt::Display for OutputReconstructionError {
             Self::LegacyReceiptMissingRuntimeEvidence => formatter.write_str(
                 "legacy TSV2OUT v1 receipt has no runtime-comparable final-logit evidence",
             ),
+            Self::InvalidScaleRefit => formatter.write_str("fixed-trit scale refit is invalid"),
+            Self::NonFiniteScaleRefit => {
+                formatter.write_str("fixed-trit scale refit became non-finite")
+            }
         }
     }
 }
