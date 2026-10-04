@@ -8,9 +8,12 @@ use tritium_format::{
     salt_v2_package::{SaltV2Package, SaltV2Plane, SaltV2ScaleUpdate, SaltV2Tensor, SaltV2Tile},
 };
 use tritium_quantize::{
-    FixedTritScaleRefitAccumulator, OutputObjectiveWeights, OutputReconstructionAccumulator,
-    OutputReconstructionError, OutputReconstructionSchedule, OutputReconstructionScope,
-    OutputReconstructionSpec, RuntimeFinalLogitsAccumulator, select_output_reconstruction,
+    ActivationCache, ActivationCacheBuilder, ActivationCacheSpec, ActivationChunk, ActivationDType,
+    ActivationDigest, FixedTritScaleRefitAccumulator, OutputObjectiveWeights,
+    OutputReconstructionAccumulator, OutputReconstructionActivationSet, OutputReconstructionError,
+    OutputReconstructionSchedule, OutputReconstructionScope, OutputReconstructionSpec,
+    RuntimeFinalLogitsAccumulator, output_reconstruction_activation_digest,
+    select_output_reconstruction,
 };
 
 const CANDIDATE_HASH_CONTEXT: &str = "tritium salt v2 output reconstruction candidate v1";
@@ -849,6 +852,152 @@ fn bound_scale_candidate_carries_updates_into_output_evidence() {
     assert!(matches!(
         OutputReconstructionAccumulator::for_scale_candidate(&other_spec, &candidate),
         Err(OutputReconstructionError::CandidateSpecMismatch)
+    ));
+}
+
+fn output_activation_cache(
+    layer_index: u32,
+    values: Vec<f32>,
+    token_mask: Vec<bool>,
+    sequence_ends: Vec<u64>,
+) -> ActivationCache {
+    let activation_spec = ActivationCacheSpec::new(
+        layer_index,
+        format!("model.layers.{layer_index}.residual.input"),
+        5,
+        2,
+        ActivationDType::Float16,
+        ActivationDigest::from_bytes([9; 32]),
+        2,
+    )
+    .expect("valid per-layer activation spec");
+    let mut builder = ActivationCacheBuilder::new(activation_spec.clone());
+    builder
+        .ingest(
+            ActivationChunk::new(&activation_spec, 0, 5, values, token_mask, sequence_ends)
+                .expect("valid layer activation chunk"),
+        )
+        .expect("ingest layer activation chunk");
+    builder.finalize().expect("complete layer activation cache")
+}
+
+#[test]
+fn scheduled_output_window_reads_aligned_layer_caches_with_one_total_memory_budget() {
+    let caches = [
+        output_activation_cache(
+            0,
+            vec![1.0, -1.0, 2.0, -2.0, 3.0, -3.0, 4.0, -4.0, 5.0, -5.0],
+            vec![true, false, true, true, false],
+            vec![2, 5],
+        ),
+        output_activation_cache(
+            1,
+            vec![
+                10.0, -10.0, 20.0, -20.0, 30.0, -30.0, 40.0, -40.0, 50.0, -50.0,
+            ],
+            vec![true, false, true, true, false],
+            vec![2, 5],
+        ),
+    ];
+    let activation_digest = output_reconstruction_activation_digest(caches.as_slice())
+        .expect("ordered layer caches have a stable set identity");
+    let spec = OutputReconstructionSpec::new(
+        ModelId::from_digest([1; 32]),
+        activation_digest,
+        [9; 32],
+        [8; 32],
+        OutputReconstructionSchedule::SlidingWindows {
+            block_count: 2,
+            window_size: 2,
+            stride: 1,
+        },
+        OutputObjectiveWeights::new(1.0, 0.0, 1.0, 1.0).unwrap(),
+        1,
+        1,
+    )
+    .expect("valid sliding-window reconstruction spec");
+    let activations = OutputReconstructionActivationSet::new(&spec, caches.as_slice())
+        .expect("activation set matches output spec");
+    let window = activations
+        .read_window(
+            OutputReconstructionScope::Block { start: 0, end: 2 },
+            1,
+            3,
+            102,
+        )
+        .expect("read one bounded window across both layers");
+
+    assert_eq!(window.first_block(), 0);
+    assert_eq!(window.block_count(), 2);
+    assert_eq!(window.decoded_bytes(), 102);
+    assert_eq!(
+        window.layer(0).unwrap().values(),
+        &[2.0, -2.0, 3.0, -3.0, 4.0, -4.0]
+    );
+    assert_eq!(
+        window.layer(1).unwrap().values(),
+        &[20.0, -20.0, 30.0, -30.0, 40.0, -40.0]
+    );
+    assert_eq!(window.layer(0).unwrap().token_mask(), &[false, true, true]);
+    assert_eq!(window.layer(0).unwrap().sequence_ends(), &[2]);
+    assert!(matches!(
+        activations.read_window(
+            OutputReconstructionScope::Block { start: 0, end: 2 },
+            1,
+            3,
+            101,
+        ),
+        Err(OutputReconstructionError::ActivationCache(_))
+    ));
+}
+
+#[test]
+fn scheduled_output_window_rejects_layer_cache_token_alignment_drift() {
+    let caches = [
+        output_activation_cache(
+            0,
+            vec![1.0, -1.0, 2.0, -2.0, 3.0, -3.0, 4.0, -4.0, 5.0, -5.0],
+            vec![true, false, true, true, false],
+            vec![2, 5],
+        ),
+        output_activation_cache(
+            1,
+            vec![
+                10.0, -10.0, 20.0, -20.0, 30.0, -30.0, 40.0, -40.0, 50.0, -50.0,
+            ],
+            vec![true, true, false, true, false],
+            vec![1, 5],
+        ),
+    ];
+    let spec = OutputReconstructionSpec::new(
+        ModelId::from_digest([1; 32]),
+        output_reconstruction_activation_digest(caches.as_slice()).unwrap(),
+        [9; 32],
+        [8; 32],
+        OutputReconstructionSchedule::SlidingWindows {
+            block_count: 2,
+            window_size: 2,
+            stride: 1,
+        },
+        OutputObjectiveWeights::new(1.0, 0.0, 1.0, 1.0).unwrap(),
+        1,
+        1,
+    )
+    .unwrap();
+    let activations = OutputReconstructionActivationSet::new(&spec, caches.as_slice()).unwrap();
+
+    assert!(matches!(
+        activations.read_window(
+            OutputReconstructionScope::Block { start: 0, end: 2 },
+            0,
+            5,
+            400,
+        ),
+        Err(OutputReconstructionError::ActivationWindowMismatch)
+    ));
+    assert!(matches!(
+        activations.read_window(OutputReconstructionScope::FinalLogits, 0, 1, 100),
+        Err(OutputReconstructionError::InvalidActivationWindowScope)
     ));
 }
 

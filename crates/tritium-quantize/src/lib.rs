@@ -132,9 +132,11 @@ pub use salt_v2_model::{
 pub use salt_v2_output::{
     FixedTritScaleRefit, FixedTritScaleRefitAccumulator, LegacyOutputReconstructionReceipt,
     OutputCandidateReceipt, OutputObjectiveWeights, OutputReconstructionAccumulator,
+    OutputReconstructionActivationLayer, OutputReconstructionActivationSet,
+    OutputReconstructionActivationSource, OutputReconstructionActivationWindows,
     OutputReconstructionError, OutputReconstructionReceipt, OutputReconstructionScaleCandidate,
     OutputReconstructionSchedule, OutputReconstructionScope, OutputReconstructionSpec,
-    select_output_reconstruction,
+    output_reconstruction_activation_digest, select_output_reconstruction,
 };
 pub use ternary_baselines::{
     BaselineTernaryPlane, TernaryBaselineError, TernaryBaselineProjection, TtqState, TwnConfig,

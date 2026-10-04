@@ -3,6 +3,7 @@
 use core::fmt;
 use std::collections::BTreeSet;
 
+use crate::salt_v2_activation::{ActivationCache, ActivationCacheError, ActivationWindow};
 use tritium_core::Trit;
 use tritium_format::{
     ModelId, RuntimeEvidenceError, RuntimeFinalLogitsAccumulator,
@@ -19,6 +20,7 @@ const CANDIDATE_HASH_CONTEXT_V3: &str = "tritium salt v2 output reconstruction c
 const SCALE_UPDATE_HASH_CONTEXT: &str = "tritium salt v2 output reconstruction scale updates v1";
 const SCALE_CANDIDATE_HASH_CONTEXT: &str =
     "tritium salt v2 output reconstruction scale candidate v1";
+const ACTIVATION_SET_HASH_CONTEXT: &str = "tritium salt v2 output reconstruction activation set v1";
 const RECEIPT_HASH_CONTEXT: &str = "tritium salt v2 output reconstruction receipt v1";
 const MAX_OUTPUT_RECONSTRUCTION_SCOPES: usize = 1 << 20;
 const MAX_FIXED_TRIT_REFIT_GROUPS: usize = 1024;
@@ -197,6 +199,12 @@ impl OutputReconstructionSpec {
     #[must_use]
     pub const fn token_stream_digest(&self) -> &[u8; 32] {
         &self.token_stream_digest
+    }
+
+    /// Content identity of the exact ordered layer activation-cache set.
+    #[must_use]
+    pub const fn activation_digest(&self) -> &[u8; 32] {
+        &self.activation_digest
     }
 
     /// Required batches for each scope.
@@ -383,6 +391,295 @@ impl OutputReconstructionSpec {
                 + self.objective.teacher_kl * teacher_kl,
         )
     }
+}
+
+/// Content metadata for one per-layer activation cache.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OutputReconstructionActivationLayer {
+    /// Zero-based transformer block index.
+    pub layer_index: u32,
+    /// Digest of the exact canonical cache bytes.
+    pub cache_digest: [u8; 32],
+    /// Digest of cache layer, tensor, shape, dtype, source, and shard policy.
+    pub schema_digest: [u8; 32],
+    /// Shared token-source provenance envelope.
+    pub source_digest: [u8; 32],
+    /// Number of token rows in this cache.
+    pub total_tokens: u64,
+    /// Feature width of each token row.
+    pub feature_width: u64,
+}
+
+/// Storage seam for reading layer activation windows without loading all caches.
+///
+/// A disk-backed adapter can retain only this layer metadata and open/decode one
+/// cache at a time in `read_layer_window`; it need not keep the model-wide cache
+/// set resident in memory.
+pub trait OutputReconstructionActivationSource {
+    /// Number of layer caches represented by the source.
+    fn layer_count(&self) -> usize;
+
+    /// Metadata for one canonical zero-based layer index.
+    fn layer_metadata(&self, layer_index: u32) -> Option<OutputReconstructionActivationLayer>;
+
+    /// Read one bounded interval from one layer's cache.
+    fn read_layer_window(
+        &self,
+        layer_index: u32,
+        token_start: u64,
+        token_count: u64,
+        max_decoded_bytes: u64,
+    ) -> Result<ActivationWindow, OutputReconstructionError>;
+}
+
+/// Compute the stable digest of canonical layer activation metadata.
+///
+/// This does not load cache payloads. Metadata must describe layers in exactly
+/// `0..layer_count`, with matching token count, feature width, and provenance.
+///
+/// # Errors
+/// Rejects empty, unordered, duplicated, or shape/provenance-inconsistent sets.
+pub fn output_reconstruction_activation_digest<S: OutputReconstructionActivationSource + ?Sized>(
+    source: &S,
+) -> Result<[u8; 32], OutputReconstructionError> {
+    validate_activation_source(source)?;
+    let mut hasher = blake3::Hasher::new_derive_key(ACTIVATION_SET_HASH_CONTEXT);
+    hasher.update(
+        &u64::try_from(source.layer_count())
+            .map_err(|_| OutputReconstructionError::CountOverflow)?
+            .to_le_bytes(),
+    );
+    for ordinal in 0..source.layer_count() {
+        let layer_index =
+            u32::try_from(ordinal).map_err(|_| OutputReconstructionError::CountOverflow)?;
+        let metadata = source
+            .layer_metadata(layer_index)
+            .ok_or(OutputReconstructionError::InvalidActivationCacheSet)?;
+        hasher.update(&metadata.layer_index.to_le_bytes());
+        hasher.update(&metadata.schema_digest);
+        hasher.update(&metadata.source_digest);
+        hasher.update(&metadata.total_tokens.to_le_bytes());
+        hasher.update(&metadata.feature_width.to_le_bytes());
+        hasher.update(&metadata.cache_digest);
+    }
+    Ok(*hasher.finalize().as_bytes())
+}
+
+impl OutputReconstructionActivationSource for [ActivationCache] {
+    fn layer_count(&self) -> usize {
+        self.len()
+    }
+
+    fn layer_metadata(&self, layer_index: u32) -> Option<OutputReconstructionActivationLayer> {
+        let cache = self.get(usize::try_from(layer_index).ok()?)?;
+        Some(OutputReconstructionActivationLayer {
+            layer_index: cache.spec().layer_index(),
+            cache_digest: cache.digest().into_bytes(),
+            schema_digest: cache.spec().schema_digest().into_bytes(),
+            source_digest: cache.spec().source_digest().into_bytes(),
+            total_tokens: cache.spec().total_tokens(),
+            feature_width: cache.spec().feature_width(),
+        })
+    }
+
+    fn read_layer_window(
+        &self,
+        layer_index: u32,
+        token_start: u64,
+        token_count: u64,
+        max_decoded_bytes: u64,
+    ) -> Result<ActivationWindow, OutputReconstructionError> {
+        self.get(
+            usize::try_from(layer_index)
+                .map_err(|_| OutputReconstructionError::InvalidActivationCacheSet)?,
+        )
+        .ok_or(OutputReconstructionError::InvalidActivationCacheSet)?
+        .read_window(token_start, token_count, max_decoded_bytes)
+        .map_err(OutputReconstructionError::ActivationCache)
+    }
+}
+
+/// Ordered, provenance-checked activation source for B3 evaluation.
+pub struct OutputReconstructionActivationSet<'a, S: OutputReconstructionActivationSource + ?Sized> {
+    spec: &'a OutputReconstructionSpec,
+    source: &'a S,
+}
+
+impl<S: OutputReconstructionActivationSource + ?Sized> fmt::Debug
+    for OutputReconstructionActivationSet<'_, S>
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OutputReconstructionActivationSet")
+            .field("spec_id", self.spec.spec_id())
+            .field("layer_count", &self.source.layer_count())
+            .finish()
+    }
+}
+
+impl<'a, S: OutputReconstructionActivationSource + ?Sized>
+    OutputReconstructionActivationSet<'a, S>
+{
+    /// Bind an activation source to a frozen output-reconstruction spec.
+    ///
+    /// The source can be disk-backed, so only a sliding window of activation
+    /// payloads needs to be decoded while all-layer provenance remains bound.
+    ///
+    /// # Errors
+    /// Rejects mismatched layer count, activation identity, or token provenance.
+    pub fn new(
+        spec: &'a OutputReconstructionSpec,
+        source: &'a S,
+    ) -> Result<OutputReconstructionActivationSet<'a, S>, OutputReconstructionError> {
+        validate_activation_source(source)?;
+        if u64::try_from(source.layer_count()).ok()
+            != Some(u64::from(schedule_block_count(spec.schedule)))
+        {
+            return Err(OutputReconstructionError::InvalidActivationCacheSet);
+        }
+        let first_layer = source
+            .layer_metadata(0)
+            .ok_or(OutputReconstructionError::InvalidActivationCacheSet)?;
+        if &first_layer.source_digest != spec.token_stream_digest() {
+            return Err(OutputReconstructionError::ActivationSetIdentityMismatch);
+        }
+        if output_reconstruction_activation_digest(source)? != *spec.activation_digest() {
+            return Err(OutputReconstructionError::ActivationSetIdentityMismatch);
+        }
+        Ok(Self { spec, source })
+    }
+
+    /// Read one scheduled block/window under one total decoded-payload budget.
+    ///
+    /// Every layer cache must report identical token masks and sequence
+    /// boundaries for the requested interval. The source is asked for one layer
+    /// at a time; a file-backed source may release each encoded cache immediately.
+    ///
+    /// # Errors
+    /// Rejects an unscheduled/non-block scope, inconsistent layer windows,
+    /// exceeded budget, invalid range, or a corrupt cache.
+    pub fn read_window(
+        &self,
+        scope: OutputReconstructionScope,
+        token_start: u64,
+        token_count: u64,
+        max_decoded_bytes: u64,
+    ) -> Result<OutputReconstructionActivationWindows, OutputReconstructionError> {
+        let OutputReconstructionScope::Block { start, end } = scope else {
+            return Err(OutputReconstructionError::InvalidActivationWindowScope);
+        };
+        if !self.spec.scopes().contains(&scope) || start >= end {
+            return Err(OutputReconstructionError::InvalidActivationWindowScope);
+        }
+        let block_count =
+            usize::try_from(end - start).map_err(|_| OutputReconstructionError::CountOverflow)?;
+        let mut windows = Vec::new();
+        windows
+            .try_reserve_exact(block_count)
+            .map_err(|_| OutputReconstructionError::ReceiptAllocationFailed)?;
+        let mut decoded_bytes = 0_u64;
+        for layer_index in start..end {
+            let remaining = max_decoded_bytes
+                .checked_sub(decoded_bytes)
+                .ok_or(OutputReconstructionError::ActivationWindowBudgetExceeded)?;
+            let window =
+                self.source
+                    .read_layer_window(layer_index, token_start, token_count, remaining)?;
+            if let Some(first) = windows.first()
+                && !activation_windows_align(first, &window)
+            {
+                return Err(OutputReconstructionError::ActivationWindowMismatch);
+            }
+            decoded_bytes = decoded_bytes
+                .checked_add(window.decoded_byte_estimate())
+                .ok_or(OutputReconstructionError::CountOverflow)?;
+            windows.push(window);
+        }
+        Ok(OutputReconstructionActivationWindows {
+            first_block: start,
+            windows,
+            decoded_bytes,
+        })
+    }
+}
+
+/// Bounded decoded activation windows for one scheduled block range.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OutputReconstructionActivationWindows {
+    first_block: u32,
+    windows: Vec<ActivationWindow>,
+    decoded_bytes: u64,
+}
+
+impl OutputReconstructionActivationWindows {
+    /// First block represented by this window set.
+    #[must_use]
+    pub const fn first_block(&self) -> u32 {
+        self.first_block
+    }
+
+    /// Number of blocks represented by this window set.
+    #[must_use]
+    pub fn block_count(&self) -> u32 {
+        u32::try_from(self.windows.len()).unwrap_or(u32::MAX)
+    }
+
+    /// Decoded payload estimate charged against the caller's total budget.
+    #[must_use]
+    pub const fn decoded_bytes(&self) -> u64 {
+        self.decoded_bytes
+    }
+
+    /// Activation rows for one absolute block index in this range.
+    #[must_use]
+    pub fn layer(&self, block_index: u32) -> Option<&ActivationWindow> {
+        let offset = block_index.checked_sub(self.first_block)?;
+        self.windows.get(usize::try_from(offset).ok()?)
+    }
+}
+
+fn validate_activation_source<S: OutputReconstructionActivationSource + ?Sized>(
+    source: &S,
+) -> Result<(), OutputReconstructionError> {
+    let count = source.layer_count();
+    if count == 0 {
+        return Err(OutputReconstructionError::InvalidActivationCacheSet);
+    }
+    let first = source
+        .layer_metadata(0)
+        .ok_or(OutputReconstructionError::InvalidActivationCacheSet)?;
+    for ordinal in 0..count {
+        let layer_index =
+            u32::try_from(ordinal).map_err(|_| OutputReconstructionError::CountOverflow)?;
+        let metadata = source
+            .layer_metadata(layer_index)
+            .ok_or(OutputReconstructionError::InvalidActivationCacheSet)?;
+        if metadata.layer_index != layer_index
+            || metadata.source_digest != first.source_digest
+            || metadata.total_tokens == 0
+            || metadata.total_tokens != first.total_tokens
+            || metadata.feature_width == 0
+            || metadata.feature_width != first.feature_width
+        {
+            return Err(OutputReconstructionError::InvalidActivationCacheSet);
+        }
+    }
+    Ok(())
+}
+
+fn schedule_block_count(schedule: OutputReconstructionSchedule) -> u32 {
+    match schedule {
+        OutputReconstructionSchedule::Blocks { block_count }
+        | OutputReconstructionSchedule::SlidingWindows { block_count, .. } => block_count,
+    }
+}
+
+fn activation_windows_align(first: &ActivationWindow, other: &ActivationWindow) -> bool {
+    first.token_start() == other.token_start()
+        && first.token_count() == other.token_count()
+        && first.feature_width() == other.feature_width()
+        && first.token_mask() == other.token_mask()
+        && first.sequence_ends() == other.sequence_ends()
 }
 
 /// Borrowed, content-bound SALT scale candidate for output evaluation.
@@ -1550,6 +1847,18 @@ pub enum OutputReconstructionError {
     InvalidCount,
     /// Candidate identity is zero.
     MissingCandidateIdentity,
+    /// Per-layer activation caches are empty, unordered, or inconsistent.
+    InvalidActivationCacheSet,
+    /// Activation-cache identity or source provenance differs from the frozen spec.
+    ActivationSetIdentityMismatch,
+    /// A requested activation scope is not a scheduled block/window.
+    InvalidActivationWindowScope,
+    /// Layer activation windows differ in token alignment, mask, or sequence boundaries.
+    ActivationWindowMismatch,
+    /// Decoded activation payload exceeds the caller's total window budget.
+    ActivationWindowBudgetExceeded,
+    /// A bounded activation cache failed to reopen its requested window.
+    ActivationCache(ActivationCacheError),
     /// The parent package has no exact-byte identity.
     MissingPackageIdentity,
     /// A scale candidate contains no updates.
@@ -1633,6 +1942,22 @@ impl fmt::Display for OutputReconstructionError {
             Self::MissingCandidateIdentity => {
                 formatter.write_str("output-reconstruction candidate identity is missing")
             }
+            Self::InvalidActivationCacheSet => {
+                formatter.write_str("output-reconstruction activation cache set is invalid")
+            }
+            Self::ActivationSetIdentityMismatch => {
+                formatter.write_str("output-reconstruction activation identity differs")
+            }
+            Self::InvalidActivationWindowScope => {
+                formatter.write_str("output-reconstruction activation window scope is invalid")
+            }
+            Self::ActivationWindowMismatch => {
+                formatter.write_str("output-reconstruction layer windows are not aligned")
+            }
+            Self::ActivationWindowBudgetExceeded => {
+                formatter.write_str("output-reconstruction activation window budget exceeded")
+            }
+            Self::ActivationCache(error) => write!(formatter, "activation cache: {error}"),
             Self::MissingPackageIdentity => {
                 formatter.write_str("output-reconstruction parent package identity is missing")
             }
