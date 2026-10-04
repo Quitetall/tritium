@@ -785,9 +785,22 @@ fn scale_update_candidate_identity_binds_spec_seed_targets_and_f16_values() {
         ),
         Err(OutputReconstructionError::NonCanonicalScaleUpdateOrder)
     ));
+    assert!(matches!(
+        spec.candidate_id_for_scale_updates(
+            &[31; 32],
+            23,
+            &[updates[0].clone(), updates[0].clone()]
+        ),
+        Err(OutputReconstructionError::NonCanonicalScaleUpdateOrder)
+    ));
     let invalid_scale = [SaltV2ScaleUpdate::new(0, 0, 0, vec![f16::ZERO]).unwrap()];
     assert!(matches!(
         spec.candidate_id_for_scale_updates(&[31; 32], 23, &invalid_scale),
+        Err(OutputReconstructionError::InvalidScaleUpdate)
+    ));
+    let nonfinite_scale = [SaltV2ScaleUpdate::new(0, 0, 0, vec![f16::NAN]).unwrap()];
+    assert!(matches!(
+        spec.candidate_id_for_scale_updates(&[31; 32], 23, &nonfinite_scale),
         Err(OutputReconstructionError::InvalidScaleUpdate)
     ));
 
