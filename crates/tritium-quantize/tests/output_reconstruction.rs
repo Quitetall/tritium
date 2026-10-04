@@ -9,11 +9,12 @@ use tritium_format::{
 };
 use tritium_quantize::{
     ActivationCache, ActivationCacheBuilder, ActivationCacheSpec, ActivationChunk, ActivationDType,
-    ActivationDigest, FixedTritScaleRefitAccumulator, OutputObjectiveWeights,
-    OutputReconstructionAccumulator, OutputReconstructionActivationSet, OutputReconstructionError,
-    OutputReconstructionSchedule, OutputReconstructionScope, OutputReconstructionSpec,
-    RuntimeFinalLogitsAccumulator, output_reconstruction_activation_digest,
-    select_output_reconstruction,
+    ActivationDigest, ActivationWindow, FixedTritScaleRefitAccumulator, OutputObjectiveWeights,
+    OutputReconstructionAccumulator, OutputReconstructionActivationLayer,
+    OutputReconstructionActivationSet, OutputReconstructionActivationSource,
+    OutputReconstructionError, OutputReconstructionSchedule, OutputReconstructionScope,
+    OutputReconstructionSpec, RuntimeFinalLogitsAccumulator,
+    output_reconstruction_activation_digest, select_output_reconstruction,
 };
 
 const CANDIDATE_HASH_CONTEXT: &str = "tritium salt v2 output reconstruction candidate v1";
@@ -881,9 +882,36 @@ fn output_activation_cache(
     builder.finalize().expect("complete layer activation cache")
 }
 
+struct TestActivationSource(Vec<ActivationCache>);
+
+impl OutputReconstructionActivationSource for TestActivationSource {
+    fn layer_count(&self) -> usize {
+        self.0.len()
+    }
+
+    fn layer_metadata(&self, layer_index: u32) -> Option<OutputReconstructionActivationLayer> {
+        self.0.as_slice().layer_metadata(layer_index)
+    }
+
+    fn read_layer_window(
+        &self,
+        layer_index: u32,
+        token_start: u64,
+        token_count: u64,
+        max_decoded_bytes: u64,
+    ) -> Result<ActivationWindow, OutputReconstructionError> {
+        self.0.as_slice().read_layer_window(
+            layer_index,
+            token_start,
+            token_count,
+            max_decoded_bytes,
+        )
+    }
+}
+
 #[test]
 fn scheduled_output_window_reads_aligned_layer_caches_with_one_total_memory_budget() {
-    let caches = [
+    let source = TestActivationSource(vec![
         output_activation_cache(
             0,
             vec![1.0, -1.0, 2.0, -2.0, 3.0, -3.0, 4.0, -4.0, 5.0, -5.0],
@@ -898,8 +926,8 @@ fn scheduled_output_window_reads_aligned_layer_caches_with_one_total_memory_budg
             vec![true, false, true, true, false],
             vec![2, 5],
         ),
-    ];
-    let activation_digest = output_reconstruction_activation_digest(caches.as_slice())
+    ]);
+    let activation_digest = output_reconstruction_activation_digest(&source)
         .expect("ordered layer caches have a stable set identity");
     let spec = OutputReconstructionSpec::new(
         ModelId::from_digest([1; 32]),
@@ -916,7 +944,7 @@ fn scheduled_output_window_reads_aligned_layer_caches_with_one_total_memory_budg
         1,
     )
     .expect("valid sliding-window reconstruction spec");
-    let activations = OutputReconstructionActivationSet::new(&spec, caches.as_slice())
+    let activations = OutputReconstructionActivationSet::new(&spec, &source)
         .expect("activation set matches output spec");
     let window = activations
         .read_window(
