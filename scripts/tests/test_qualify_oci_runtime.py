@@ -254,6 +254,12 @@ class QualifyOciRuntimeTests(unittest.TestCase):
         with self.assertRaisesRegex(QualificationError, "trp1 package ID"):
             validate_ready(value, "a" * 40, "cpu", "compact-v1", "c" * 64)
 
+    def test_rejects_package_id_encoding_for_manifest_digest(self):
+        value = readiness()
+        value["startup_receipt"]["manifest_package_id"] = "trp1_" + "c" * 64
+        with self.assertRaisesRegex(QualificationError, "manifest package digest"):
+            validate_ready(value, "a" * 40, "cpu", "compact-v1", "c" * 64)
+
     def test_atomic_receipt_refuses_overwrite(self):
         with tempfile.TemporaryDirectory() as raw:
             path = Path(raw) / "receipt.json"

@@ -498,7 +498,11 @@ def validate_ready(value: dict[str, Any], revision: str, flavor: str,
         raise QualificationError("startup receipt release build identity differs")
     if receipt.get("backend_policy") != flavor or receipt.get("effective_backend") != flavor:
         raise QualificationError("startup receipt backend policy differs")
-    if receipt.get("profile") != profile or receipt.get("manifest_package_id") != manifest_blake3:
+    expected_manifest_id = exact_hex(manifest_blake3, 64, "expected manifest BLAKE3")
+    receipt_manifest_id = exact_hex(
+        receipt.get("manifest_package_id"), 64, "manifest package digest"
+    )
+    if receipt.get("profile") != profile or receipt_manifest_id != expected_manifest_id:
         raise QualificationError("startup receipt artifact identity differs")
     for field in ("salt_package_id", "preserved_package_id", "config_package_id"):
         exact_package_id(receipt.get(field), field)
