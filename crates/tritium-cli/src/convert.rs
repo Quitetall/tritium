@@ -580,14 +580,7 @@ fn write_receipt(
             "rotation_group": if cfg.ladder.rotate { Some(cfg.ladder.group) } else { None },
             "fold_alpha": if cfg.calib.is_some() { cfg.fold_alpha } else { 0.0 },
             "calibration": fold_desc,
-            "gptq_scale_refit": if cfg.activation_aware {
-                match cfg.gptq_scale_refit {
-                    ScaleRefitMode::PostPass => "post-pass",
-                    ScaleRefitMode::InLoop => "in-loop",
-                }
-            } else {
-                "not-applicable"
-            },
+            "gptq_scale_refit": gptq_scale_refit_receipt_label(cfg),
         },
         "cost": {
             "parameters": total_params,
@@ -619,6 +612,16 @@ fn write_receipt(
     std::fs::write(path, serde_json::to_vec_pretty(&receipt)?)
         .with_context(|| format!("write {}", path.display()))?;
     Ok(whole_model)
+}
+
+fn gptq_scale_refit_receipt_label(cfg: &ConvertConfig) -> &'static str {
+    if !cfg.activation_aware {
+        return "not-applicable";
+    }
+    match cfg.gptq_scale_refit {
+        ScaleRefitMode::PostPass => "post-pass",
+        ScaleRefitMode::InLoop => "in-loop",
+    }
 }
 
 fn file_digest(path: &Path) -> Result<String> {
@@ -759,9 +762,8 @@ fn write_f32_safetensors(tensors: &[(String, &[f32])]) -> Vec<u8> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn in_loop_scale_refit_requires_activation_aware_conversion() {
-        let config = ConvertConfig {
+    fn config(scale_refit: ScaleRefitMode, activation_aware: bool) -> ConvertConfig {
+        ConvertConfig {
             calib: None,
             calib_tokens: 4096,
             fold_alpha: 0.0,
@@ -772,17 +774,37 @@ mod tests {
                 rotate: true,
             },
             dense_container: false,
-            activation_aware: false,
+            activation_aware,
             gptq_decay: None,
-            gptq_scale_refit: ScaleRefitMode::InLoop,
+            gptq_scale_refit: scale_refit,
             gptq_decay_ramp: false,
-        };
+        }
+    }
+
+    #[test]
+    fn in_loop_scale_refit_requires_activation_aware_conversion() {
         let error = run(
             Path::new("not-a-model"),
             Path::new("unused-output"),
-            &config,
+            &config(ScaleRefitMode::InLoop, false),
         )
         .expect_err("in-loop refit must require activation-aware fitting");
         assert!(error.to_string().contains("requires --activation-aware"));
+    }
+
+    #[test]
+    fn receipt_names_scale_refit_mode_and_marks_inactive_mode() {
+        assert_eq!(
+            gptq_scale_refit_receipt_label(&config(ScaleRefitMode::PostPass, true)),
+            "post-pass"
+        );
+        assert_eq!(
+            gptq_scale_refit_receipt_label(&config(ScaleRefitMode::InLoop, true)),
+            "in-loop"
+        );
+        assert_eq!(
+            gptq_scale_refit_receipt_label(&config(ScaleRefitMode::InLoop, false)),
+            "not-applicable"
+        );
     }
 }
