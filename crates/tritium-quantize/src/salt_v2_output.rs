@@ -883,6 +883,9 @@ impl FixedTritScaleRefitAccumulator {
                 let fitted_product = (0..groups)
                     .map(|other| self.gram[group * groups + other] * scales[other])
                     .sum::<f64>();
+                if !fitted_product.is_finite() {
+                    return Err(OutputReconstructionError::NonFiniteScaleRefit);
+                }
                 let updated = (scales[group]
                     + (self.target_products[group] - fitted_product) / diagonal)
                     .max(0.0);
@@ -908,10 +911,11 @@ impl FixedTritScaleRefitAccumulator {
                     .sum::<f64>()
             })
             .sum::<f64>();
-        let squared_error = (self.target_squared - 2.0 * linear + quadratic).max(0.0);
-        if !squared_error.is_finite() {
+        let raw_squared_error = self.target_squared - 2.0 * linear + quadratic;
+        if !linear.is_finite() || !quadratic.is_finite() || !raw_squared_error.is_finite() {
             return Err(OutputReconstructionError::NonFiniteScaleRefit);
         }
+        let squared_error = raw_squared_error.max(0.0);
         Ok(FixedTritScaleRefit {
             scales,
             squared_error,
