@@ -55,25 +55,24 @@ pub enum Projection {
 }
 
 impl Projection {
-    /// Physical SALT V2 tensor index, when this projection is host-resident.
-    ///
-    /// CUDA resident handles currently do not retain package-index identity.
+    /// Physical SALT V2 tensor index retained by this resident projection.
     #[must_use]
-    pub fn host_salt_v2_tensor_index(&self) -> Option<usize> {
+    pub fn salt_v2_tensor_index(&self) -> Option<usize> {
         match self {
             Projection::HostSaltV2(matrix) => Some(matrix.tensor_index()),
+            #[cfg(feature = "cuda")]
+            Projection::SaltV2(matrix) => matrix.tensor_index(),
             _ => None,
         }
     }
 
-    /// Apply scale-only candidate updates to a uniquely owned host SALT V2
-    /// resident matrix. Packed trits stay in place; CUDA residents and shared
-    /// host handles fail closed until their mutation paths are explicit.
+    /// Apply scale-only candidate updates to a uniquely owned SALT V2 resident.
+    /// Packed trits stay in place; CUDA updates transactionally replace scales.
     ///
     /// # Errors
-    /// Returns an error for non-host-SALT projections, shared resident handles,
-    /// or malformed updates. Validation occurs before the resident scales change.
-    pub fn apply_host_salt_v2_scale_updates(
+    /// Returns an error for unsupported projections, shared resident handles,
+    /// or malformed updates. Validation occurs before resident scales change.
+    pub fn apply_salt_v2_scale_updates(
         &mut self,
         tensor_index: usize,
         updates: &[SaltV2ScaleUpdate],
@@ -95,11 +94,25 @@ impl Projection {
                     .apply_scale_updates(tensor_index, updates)
             }
             #[cfg(feature = "cuda")]
-            Projection::SaltV2(_) => Err(NnError::Backend(
-                "in-place candidate scale updates are not implemented for CUDA SALT V2".into(),
-            )),
+            Projection::SaltV2(matrix) => {
+                if matrix.tensor_index() != Some(tensor_index) {
+                    return Err(NnError::Backend(format!(
+                        "SALT V2 scale update targets tensor {tensor_index}, but this CUDA projection is tensor {:?}",
+                        matrix.tensor_index()
+                    )));
+                }
+                Arc::get_mut(matrix)
+                    .ok_or_else(|| {
+                        NnError::Backend(
+                            "cannot update shared CUDA SALT V2 resident scales in place".into(),
+                        )
+                    })?
+                    .apply_scale_updates(tensor_index, updates)
+                    .map(|_| ())
+                    .map_err(|error| NnError::Backend(error.to_string()))
+            }
             _ => Err(NnError::Backend(
-                "scale updates require a host SALT V2 projection".into(),
+                "scale updates require a SALT V2 projection".into(),
             )),
         }
     }
@@ -353,7 +366,7 @@ mod tests {
         let mut projection = Projection::HostSaltV2(Arc::new(host_matrix()));
         let update = SaltV2ScaleUpdate::new(0, 0, 0, vec![f16::from_f32(2.0), f16::ONE]).unwrap();
         projection
-            .apply_host_salt_v2_scale_updates(0, std::slice::from_ref(&update))
+            .apply_salt_v2_scale_updates(0, std::slice::from_ref(&update))
             .unwrap();
         let matrix = match &projection {
             Projection::HostSaltV2(matrix) => matrix,
@@ -366,7 +379,7 @@ mod tests {
         let mismatched = SaltV2ScaleUpdate::new(1, 0, 0, vec![f16::ONE, f16::ONE]).unwrap();
         assert!(
             projection
-                .apply_host_salt_v2_scale_updates(1, std::slice::from_ref(&mismatched))
+                .apply_salt_v2_scale_updates(1, std::slice::from_ref(&mismatched))
                 .is_err()
         );
 
@@ -375,7 +388,7 @@ mod tests {
         let mut shared_projection = Projection::HostSaltV2(shared);
         assert!(
             shared_projection
-                .apply_host_salt_v2_scale_updates(0, std::slice::from_ref(&update))
+                .apply_salt_v2_scale_updates(0, std::slice::from_ref(&update))
                 .is_err()
         );
     }

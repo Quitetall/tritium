@@ -120,23 +120,21 @@ impl Qwen35TextMixer {
         }
     }
 
-    fn count_host_salt_v2_tensor_index(&self, tensor_index: usize) -> usize {
+    fn count_salt_v2_tensor_index(&self, tensor_index: usize) -> usize {
         match self {
-            Self::DeltaNet(layer) => layer.count_host_salt_v2_tensor_index(tensor_index),
-            Self::FullAttention(layer) => layer.count_host_salt_v2_tensor_index(tensor_index),
+            Self::DeltaNet(layer) => layer.count_salt_v2_tensor_index(tensor_index),
+            Self::FullAttention(layer) => layer.count_salt_v2_tensor_index(tensor_index),
         }
     }
 
-    fn apply_host_salt_v2_scale_updates(
+    fn apply_salt_v2_scale_updates(
         &mut self,
         tensor_index: usize,
         updates: &[SaltV2ScaleUpdate],
     ) -> Result<bool, NnError> {
         match self {
-            Self::DeltaNet(layer) => layer.apply_host_salt_v2_scale_updates(tensor_index, updates),
-            Self::FullAttention(layer) => {
-                layer.apply_host_salt_v2_scale_updates(tensor_index, updates)
-            }
+            Self::DeltaNet(layer) => layer.apply_salt_v2_scale_updates(tensor_index, updates),
+            Self::FullAttention(layer) => layer.apply_salt_v2_scale_updates(tensor_index, updates),
         }
     }
 }
@@ -318,16 +316,14 @@ impl<E> From<NnError> for Qwen35TextForwardError<E> {
 }
 
 impl Qwen35TextRunner {
-    /// Apply one tensor's scale-only candidate to its uniquely identified,
-    /// host-resident SALT V2 projection. The model graph is scanned before any
-    /// mutation, and the target matrix validates the complete update atomically.
-    /// CUDA-resident matrices do not yet retain package-index identity and are
-    /// therefore not eligible through this host path.
+    /// Apply one tensor's scale-only candidate to its uniquely identified SALT V2
+    /// projection. The full model graph is scanned before mutation; host and CUDA
+    /// residents validate the complete update before publishing changed scales.
     ///
     /// # Errors
     /// Rejects empty or mixed-tensor updates, missing or ambiguous tensor
     /// identity, shared resident storage, and malformed scale candidates.
-    pub fn apply_host_salt_v2_scale_updates(
+    pub fn apply_salt_v2_scale_updates(
         &mut self,
         updates: &[SaltV2ScaleUpdate],
     ) -> Result<(), NnError> {
@@ -344,43 +340,40 @@ impl Qwen35TextRunner {
             ));
         }
 
-        let mut matches =
-            usize::from(self.embedding.host_salt_v2_tensor_index() == Some(tensor_index))
-                + usize::from(self.lm_head.host_salt_v2_tensor_index() == Some(tensor_index));
+        let mut matches = usize::from(self.embedding.salt_v2_tensor_index() == Some(tensor_index))
+            + usize::from(self.lm_head.salt_v2_tensor_index() == Some(tensor_index));
         for layer in &self.layers {
-            matches += layer.mixer.count_host_salt_v2_tensor_index(tensor_index);
-            matches +=
-                usize::from(layer.mlp.gate.host_salt_v2_tensor_index() == Some(tensor_index));
-            matches += usize::from(layer.mlp.up.host_salt_v2_tensor_index() == Some(tensor_index));
-            matches +=
-                usize::from(layer.mlp.down.host_salt_v2_tensor_index() == Some(tensor_index));
+            matches += layer.mixer.count_salt_v2_tensor_index(tensor_index);
+            matches += usize::from(layer.mlp.gate.salt_v2_tensor_index() == Some(tensor_index));
+            matches += usize::from(layer.mlp.up.salt_v2_tensor_index() == Some(tensor_index));
+            matches += usize::from(layer.mlp.down.salt_v2_tensor_index() == Some(tensor_index));
         }
         if matches != 1 {
             return Err(NnError::Backend(format!(
-                "Qwen model has {matches} host SALT V2 projections for package tensor {tensor_index}; expected exactly one"
+                "Qwen model has {matches} SALT V2 projections for package tensor {tensor_index}; expected exactly one"
             )));
         }
 
-        if self.embedding.host_salt_v2_tensor_index() == Some(tensor_index) {
+        if self.embedding.salt_v2_tensor_index() == Some(tensor_index) {
             self.embedding
-                .apply_host_salt_v2_scale_updates(tensor_index, updates)?;
+                .apply_salt_v2_scale_updates(tensor_index, updates)?;
             return Ok(());
         }
-        if self.lm_head.host_salt_v2_tensor_index() == Some(tensor_index) {
+        if self.lm_head.salt_v2_tensor_index() == Some(tensor_index) {
             return self
                 .lm_head
-                .apply_host_salt_v2_scale_updates(tensor_index, updates);
+                .apply_salt_v2_scale_updates(tensor_index, updates);
         }
         for layer in &mut self.layers {
-            if layer.mixer.count_host_salt_v2_tensor_index(tensor_index) > 0 {
+            if layer.mixer.count_salt_v2_tensor_index(tensor_index) > 0 {
                 layer
                     .mixer
-                    .apply_host_salt_v2_scale_updates(tensor_index, updates)?;
+                    .apply_salt_v2_scale_updates(tensor_index, updates)?;
                 return Ok(());
             }
             for projection in [&mut layer.mlp.gate, &mut layer.mlp.up, &mut layer.mlp.down] {
-                if projection.host_salt_v2_tensor_index() == Some(tensor_index) {
-                    return projection.apply_host_salt_v2_scale_updates(tensor_index, updates);
+                if projection.salt_v2_tensor_index() == Some(tensor_index) {
+                    return projection.apply_salt_v2_scale_updates(tensor_index, updates);
                 }
             }
         }

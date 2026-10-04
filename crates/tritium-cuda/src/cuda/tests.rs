@@ -16,8 +16,8 @@ use tritium_cpu::salt_v2::salt_v2_matvec;
 use tritium_format::salt_v2::SaltV2Codec;
 use tritium_format::salt_v2_package::{
     SALT_V2_ALLOCATION_TILE_SIZE, SALT_V2_SCALE_GROUP_SIZE, SaltV2IndexedRuntimeLedger,
-    SaltV2Package, SaltV2PackageReader, SaltV2Plane, SaltV2Tensor, SaltV2Tile, SaltV2Transform,
-    write_salt_v2_package,
+    SaltV2Package, SaltV2PackageReader, SaltV2Plane, SaltV2ScaleUpdate, SaltV2Tensor, SaltV2Tile,
+    SaltV2Transform, write_salt_v2_package,
 };
 use tritium_testkit::{ConformanceVector, Tolerance, generate_vectors, run_conformance};
 
@@ -355,6 +355,78 @@ fn salt_v2_cuda_gathers_repeated_rows_without_dense_shadow() {
                 + receipt.output_bytes()
         );
     }
+}
+
+#[test]
+fn salt_v2_cuda_resident_scale_updates_are_identity_bound_and_transactional() {
+    let cuda = match CudaBackend::new(0) {
+        Ok(backend) => backend,
+        Err(error) => {
+            eprintln!("skipping SALT V2 CUDA scale-update gate: no device ({error})");
+            return;
+        }
+    };
+    let first = salt_v2_test_tensor(1, 8, &[1]);
+    let target = salt_v2_test_tensor(2, 8, &[1]);
+    let package = SaltV2Package::new(SaltV2Codec::D2, vec![first, target.clone()])
+        .expect("valid two-tensor update package");
+    let encoded = write_salt_v2_package(&package).expect("encode update package");
+    let mut reader = SaltV2PackageReader::new_strict(Cursor::new(encoded.bytes))
+        .expect("strict update package reader");
+    let tensor_index = reader
+        .tensor_names_encoded_order()
+        .position(|name| name == target.name())
+        .expect("target has a physical package index");
+    let mut resident = cuda
+        .upload_salt_v2_from_reader(&mut reader, target.name())
+        .expect("stream indexed update target");
+    assert_eq!(resident.tensor_index(), Some(tensor_index));
+
+    let activation: Vec<f32> = (1..=target.dims()[1] as usize)
+        .map(|value| value as f32)
+        .collect();
+    let before = cuda
+        .salt_v2_forward_exact(&resident, &activation, 1)
+        .expect("baseline forward")
+        .output;
+    let receipt = resident.allocation_receipt();
+
+    let wrong_index = SaltV2ScaleUpdate::new(tensor_index + 1, 0, 0, vec![f16::from_f32(2.0)])
+        .expect("nonempty wrong-index update");
+    assert!(
+        resident
+            .apply_scale_updates(tensor_index, std::slice::from_ref(&wrong_index))
+            .is_err()
+    );
+
+    let erasing = SaltV2ScaleUpdate::new(tensor_index, 0, 0, vec![f16::ZERO])
+        .expect("nonempty zero-scale update");
+    assert!(
+        resident
+            .apply_scale_updates(tensor_index, std::slice::from_ref(&erasing))
+            .is_err()
+    );
+    let after_rejections = cuda
+        .salt_v2_forward_exact(&resident, &activation, 1)
+        .expect("forward after rejected updates")
+        .output;
+    assert_eq!(
+        after_rejections, before,
+        "rejected update changed CUDA scales"
+    );
+
+    let valid = SaltV2ScaleUpdate::new(tensor_index, 0, 0, vec![f16::from_f32(2.0)])
+        .expect("valid scale candidate");
+    let scratch_bytes = resident
+        .apply_scale_updates(tensor_index, std::slice::from_ref(&valid))
+        .expect("transactional CUDA scale update");
+    assert_eq!(scratch_bytes, receipt.scale_bytes());
+    assert_eq!(resident.allocation_receipt(), receipt);
+    let after = cuda
+        .salt_v2_forward_exact(&resident, &activation, 1)
+        .expect("forward after valid update")
+        .output;
+    assert_ne!(after, before, "valid scale candidate did not change output");
 }
 
 #[test]

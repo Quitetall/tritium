@@ -37,6 +37,14 @@ impl CudaBackend {
         let info = reader.tensor_info(name).cloned().ok_or_else(|| {
             BackendError::InvalidInput(format!("SALT V2 tensor `{name}` is absent"))
         })?;
+        let tensor_index = reader
+            .tensor_names_encoded_order()
+            .position(|candidate| candidate == name)
+            .ok_or_else(|| {
+                BackendError::InvalidInput(format!(
+                    "SALT V2 tensor `{name}` has no physical package index"
+                ))
+            })?;
         let codec = reader.codec();
         let geometry = validate_geometry(&info, codec)?;
         let planned = info.runtime_ledger();
@@ -235,14 +243,18 @@ impl CudaBackend {
         };
         let receipt = SaltV2ResidentAllocationReceipt::new(codec, planned);
         Ok(SaltV2ResidentTensor {
+            stream: Arc::clone(&self.stream),
             payload: device_payload,
             scales: device_scales,
             index_metadata: device_index,
+            index_metadata_host: allocation_map,
+            tensor_index: Some(tensor_index),
             rows: geometry.rows,
             columns: geometry.columns,
             tile_count: info.tile_count(),
             plane_count: expected_planes,
             codec_tag: geometry.codec_tag,
+            codec,
             scale_group_size: geometry.scale_group_size,
             allocation_map_bytes: to_u32(map_bytes, "allocation map bytes")?,
             rank_prefix_count: to_u32(rank_prefix_count, "rank prefix count")?,

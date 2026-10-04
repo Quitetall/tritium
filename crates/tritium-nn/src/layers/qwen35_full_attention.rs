@@ -334,7 +334,7 @@ impl Qwen35FullAttention {
         self.activation_mode
     }
 
-    pub(crate) fn count_host_salt_v2_tensor_index(&self, tensor_index: usize) -> usize {
+    pub(crate) fn count_salt_v2_tensor_index(&self, tensor_index: usize) -> usize {
         [
             &self.weights.q_proj,
             &self.weights.k_proj,
@@ -342,11 +342,11 @@ impl Qwen35FullAttention {
             &self.weights.o_proj,
         ]
         .into_iter()
-        .filter(|projection| projection.host_salt_v2_tensor_index() == Some(tensor_index))
+        .filter(|projection| projection.salt_v2_tensor_index() == Some(tensor_index))
         .count()
     }
 
-    pub(crate) fn apply_host_salt_v2_scale_updates(
+    pub(crate) fn apply_salt_v2_scale_updates(
         &mut self,
         tensor_index: usize,
         updates: &[SaltV2ScaleUpdate],
@@ -358,8 +358,8 @@ impl Qwen35FullAttention {
             &mut self.weights.o_proj,
         ];
         for projection in projections {
-            if projection.host_salt_v2_tensor_index() == Some(tensor_index) {
-                projection.apply_host_salt_v2_scale_updates(tensor_index, updates)?;
+            if projection.salt_v2_tensor_index() == Some(tensor_index) {
+                projection.apply_salt_v2_scale_updates(tensor_index, updates)?;
                 return Ok(true);
             }
         }

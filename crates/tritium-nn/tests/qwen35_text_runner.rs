@@ -210,13 +210,17 @@ fn runner_with_host_qkv() -> Qwen35TextRunner {
     let host_qkv = Projection::HostSaltV2(Arc::new(
         HostSaltV2Linear::from_reader(&mut reader, "qkv").unwrap(),
     ));
+    runner_with_salt_qkv(host_qkv, Box::new(tritium_cpu::CpuBackend::new()))
+}
+
+fn runner_with_salt_qkv(qkv: Projection, backend: Box<dyn TernaryBackend>) -> Qwen35TextRunner {
     let weights = Qwen35TextWeights::new(
         TokenEmbedding::from_dense(parameter(0, V * H), V, H).unwrap(),
         vec![
             Qwen35TextLayerWeights::new(
                 parameter(13, H),
                 Qwen35TextMixerWeights::DeltaNet(Qwen35DeltaNetWeights::new(
-                    host_qkv,
+                    qkv,
                     dense_exact(7, 4, H),
                     dense_exact(8, 2, H),
                     dense_exact(9, 2, H),
@@ -240,9 +244,70 @@ fn runner_with_host_qkv() -> Qwen35TextRunner {
             2,
         ),
         weights,
-        Box::new(tritium_cpu::CpuBackend::new()),
+        backend,
     )
     .unwrap()
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_scale_updates_route_by_package_identity_through_qwen_layers() {
+    let cuda = match tritium_cuda::CudaBackend::new(0) {
+        Ok(cuda) => cuda,
+        Err(error) => {
+            eprintln!("skipping Qwen CUDA scale-update routing gate: no device ({error})");
+            return;
+        }
+    };
+    let tensor = SaltV2Tensor::new(
+        "qkv",
+        vec![8, H as u64],
+        vec![
+            SaltV2Tile::new(vec![
+                SaltV2Plane::new(vec![1; 8 * H], vec![f16::ONE]).unwrap(),
+            ])
+            .unwrap(),
+        ],
+    )
+    .unwrap();
+    let package = SaltV2Package::new(SaltV2Codec::D2, vec![tensor]).unwrap();
+    let encoded = write_salt_v2_package(&package).unwrap();
+    let mut reader = SaltV2PackageReader::new_strict(Cursor::new(encoded.bytes)).unwrap();
+    let resident = cuda.upload_salt_v2_from_reader(&mut reader, "qkv").unwrap();
+    assert_eq!(resident.tensor_index(), Some(0));
+    let mut runner = runner_with_salt_qkv(Projection::SaltV2(Arc::new(resident)), Box::new(cuda));
+
+    let before = runner
+        .forward(&[1, 2], &mut runner.new_cache(8).unwrap())
+        .unwrap();
+    let wrong = SaltV2ScaleUpdate::new(1, 0, 0, vec![f16::from_f32(2.0)]).unwrap();
+    assert!(
+        runner
+            .apply_salt_v2_scale_updates(std::slice::from_ref(&wrong))
+            .is_err()
+    );
+    let update = SaltV2ScaleUpdate::new(0, 0, 0, vec![f16::from_f32(2.0)]).unwrap();
+    runner
+        .apply_salt_v2_scale_updates(std::slice::from_ref(&update))
+        .unwrap();
+    let after = runner
+        .forward(&[1, 2], &mut runner.new_cache(8).unwrap())
+        .unwrap();
+    assert_ne!(before.final_hidden_states(), after.final_hidden_states());
+
+    let erasing = SaltV2ScaleUpdate::new(0, 0, 0, vec![f16::ZERO]).unwrap();
+    assert!(
+        runner
+            .apply_salt_v2_scale_updates(std::slice::from_ref(&erasing))
+            .is_err()
+    );
+    let after_rejection = runner
+        .forward(&[1, 2], &mut runner.new_cache(8).unwrap())
+        .unwrap();
+    assert_eq!(
+        after.final_hidden_states(),
+        after_rejection.final_hidden_states()
+    );
 }
 
 #[test]
@@ -251,7 +316,7 @@ fn scale_updates_route_by_package_tensor_identity_through_qwen_layers() {
     let wrong_tensor = SaltV2ScaleUpdate::new(1, 0, 0, vec![f16::from_f32(2.0)]).unwrap();
     assert!(
         runner
-            .apply_host_salt_v2_scale_updates(std::slice::from_ref(&wrong_tensor))
+            .apply_salt_v2_scale_updates(std::slice::from_ref(&wrong_tensor))
             .is_err()
     );
 
@@ -260,7 +325,7 @@ fn scale_updates_route_by_package_tensor_identity_through_qwen_layers() {
         .unwrap();
     let update = SaltV2ScaleUpdate::new(0, 0, 0, vec![f16::from_f32(2.0)]).unwrap();
     runner
-        .apply_host_salt_v2_scale_updates(std::slice::from_ref(&update))
+        .apply_salt_v2_scale_updates(std::slice::from_ref(&update))
         .unwrap();
     let after = runner
         .forward(&[1, 2], &mut runner.new_cache(8).unwrap())
@@ -270,7 +335,7 @@ fn scale_updates_route_by_package_tensor_identity_through_qwen_layers() {
     let erasing_update = SaltV2ScaleUpdate::new(0, 0, 0, vec![f16::ZERO]).unwrap();
     assert!(
         runner
-            .apply_host_salt_v2_scale_updates(std::slice::from_ref(&erasing_update))
+            .apply_salt_v2_scale_updates(std::slice::from_ref(&erasing_update))
             .is_err()
     );
     let after_rejection = runner
@@ -287,7 +352,7 @@ fn scale_updates_route_by_package_tensor_identity_through_qwen_layers() {
     ];
     assert!(
         runner
-            .apply_host_salt_v2_scale_updates(&mixed_tensor_updates)
+            .apply_salt_v2_scale_updates(&mixed_tensor_updates)
             .is_err()
     );
 }

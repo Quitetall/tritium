@@ -58,32 +58,51 @@ fn rotate_row(row: &mut [f32], group: usize) {
 }
 
 impl TokenEmbedding {
-    pub(crate) fn host_salt_v2_tensor_index(&self) -> Option<usize> {
+    pub(crate) fn salt_v2_tensor_index(&self) -> Option<usize> {
         match &self.storage {
             Storage::HostSaltV2(matrix) => Some(matrix.tensor_index()),
+            #[cfg(feature = "cuda")]
+            Storage::SaltV2(matrix) => matrix.tensor_index(),
             _ => None,
         }
     }
 
-    pub(crate) fn apply_host_salt_v2_scale_updates(
+    pub(crate) fn apply_salt_v2_scale_updates(
         &mut self,
         tensor_index: usize,
         updates: &[SaltV2ScaleUpdate],
     ) -> Result<bool, NnError> {
-        let Storage::HostSaltV2(matrix) = &mut self.storage else {
-            return Ok(false);
-        };
-        if matrix.tensor_index() != tensor_index {
-            return Ok(false);
+        match &mut self.storage {
+            Storage::HostSaltV2(matrix) => {
+                if matrix.tensor_index() != tensor_index {
+                    return Ok(false);
+                }
+                Arc::get_mut(matrix)
+                    .ok_or_else(|| {
+                        NnError::Backend(
+                            "cannot update shared host SALT V2 embedding scales in place".into(),
+                        )
+                    })?
+                    .apply_scale_updates(tensor_index, updates)?;
+                Ok(true)
+            }
+            #[cfg(feature = "cuda")]
+            Storage::SaltV2(matrix) => {
+                if matrix.tensor_index() != Some(tensor_index) {
+                    return Ok(false);
+                }
+                Arc::get_mut(matrix)
+                    .ok_or_else(|| {
+                        NnError::Backend(
+                            "cannot update shared CUDA SALT V2 embedding scales in place".into(),
+                        )
+                    })?
+                    .apply_scale_updates(tensor_index, updates)
+                    .map_err(|error| NnError::Backend(error.to_string()))?;
+                Ok(true)
+            }
+            _ => Ok(false),
         }
-        Arc::get_mut(matrix)
-            .ok_or_else(|| {
-                NnError::Backend(
-                    "cannot update shared host SALT V2 embedding scales in place".into(),
-                )
-            })?
-            .apply_scale_updates(tensor_index, updates)?;
-        Ok(true)
     }
 
     /// Build a token table around compact host SALT V2 storage.
