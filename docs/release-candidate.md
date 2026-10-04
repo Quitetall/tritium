@@ -9,6 +9,19 @@ second-machine gates remain separate.
 
 ## Gate status (measured 2026-09-03)
 
+### Flagship campaign status refresh (2026-10-03)
+
+The canonical read-only probe was rerun against the durable workspace
+`/mnt/4tb/tritium-qwen36-campaign-20260813` with
+`python scripts/qwen36-ptq-status.py --work-dir
+/mnt/4tb/tritium-qwen36-campaign-20260813 --json`. It still reports
+`status=stalled`, 0 of 506 published masters, zero seals, and one staged
+447,083,070-byte record whose recorded PID is not alive. This does not change
+the prior provenance finding: the legacy S2KF evidence is not admitted for
+fitting without a source-bound capture transcript or a recapture from the
+approved calibration pack. No campaign was started or modified for this
+refresh.
+
 ### Flagship campaign verification refresh (2026-09-29)
 
 The previous refresh reported the pinned Qwen3.6-27B additive-master campaign
