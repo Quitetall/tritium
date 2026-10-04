@@ -114,8 +114,12 @@ permissions:
 
 env:
   # Keep caller-controlled revisions in the environment, never inline them
-  # into shell source. Receipt-producing steps consume this value.
-  TRITIUM_SOURCE_REVISION: ${{ inputs.source_revision || github.sha }}
+  # into shell source. PR wheel artifacts bind to the PR head (rather than
+  # GitHub's synthetic merge SHA) so their receipts match the candidate commit.
+  # Other event types use the caller/dispatch SHA unless an exact revision was
+  # explicitly supplied.
+  TRITIUM_SOURCE_REF: ${{ inputs.source_ref || github.event.pull_request.head.sha || github.ref }}
+  TRITIUM_SOURCE_REVISION: ${{ inputs.source_revision || github.event.pull_request.head.sha || github.sha }}
 
 jobs:
   # One abi3 wheel per (os, target). `maturin-action` runs manylinux builds in a
@@ -145,7 +149,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: ${{ inputs.source_ref || github.ref }}
+          ref: ${{ env.TRITIUM_SOURCE_REF }}
       - name: verify checked-out source revision
         shell: bash
         run: python scripts/verify-workflow-source.py --expected-revision "$TRITIUM_SOURCE_REVISION"
@@ -231,7 +235,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: ${{ inputs.source_ref || github.ref }}
+          ref: ${{ env.TRITIUM_SOURCE_REF }}
       - name: verify checked-out source revision
         shell: bash
         run: python scripts/verify-workflow-source.py --expected-revision "$TRITIUM_SOURCE_REVISION"
@@ -267,7 +271,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: ${{ inputs.source_ref || github.ref }}
+          ref: ${{ env.TRITIUM_SOURCE_REF }}
       - name: verify checked-out source revision
         shell: bash
         run: python scripts/verify-workflow-source.py --expected-revision "$TRITIUM_SOURCE_REVISION"
@@ -300,7 +304,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: ${{ inputs.source_ref || github.ref }}
+          ref: ${{ env.TRITIUM_SOURCE_REF }}
       - name: verify checked-out source revision
         shell: bash
         run: python scripts/verify-workflow-source.py --expected-revision "$TRITIUM_SOURCE_REVISION"
@@ -329,7 +333,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: ${{ inputs.source_ref || github.ref }}
+          ref: ${{ env.TRITIUM_SOURCE_REF }}
       - name: verify checked-out source revision
         shell: bash
         run: python scripts/verify-workflow-source.py --expected-revision "$TRITIUM_SOURCE_REVISION"
@@ -568,7 +572,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: ${{ inputs.source_ref || github.ref }}
+          ref: ${{ env.TRITIUM_SOURCE_REF }}
       - name: verify checked-out source revision
         shell: bash
         run: python scripts/verify-workflow-source.py --expected-revision "$TRITIUM_SOURCE_REVISION"

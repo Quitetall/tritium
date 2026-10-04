@@ -16,7 +16,14 @@ WORKFLOW = ROOT / ".github" / "workflows" / "wheels.yml"
 class VerifyWorkflowSourceTests(unittest.TestCase):
     def test_workflow_checks_every_checkout_before_building_or_admitting(self):
         workflow = WORKFLOW.read_text(encoding="utf-8")
-        self.assertIn("TRITIUM_SOURCE_REVISION: ${{ inputs.source_revision || github.sha }}", workflow)
+        self.assertIn(
+            "TRITIUM_SOURCE_REF: ${{ inputs.source_ref || github.event.pull_request.head.sha || github.ref }}",
+            workflow,
+        )
+        self.assertIn(
+            "TRITIUM_SOURCE_REVISION: ${{ inputs.source_revision || github.event.pull_request.head.sha || github.sha }}",
+            workflow,
+        )
         self.assertNotIn("--source-revision ${{ inputs.source_revision", workflow)
         self.assertIn("test exact source identity contract", workflow)
         blocks = workflow.split("      - uses: actions/checkout@")
@@ -25,7 +32,7 @@ class VerifyWorkflowSourceTests(unittest.TestCase):
             steps = block.split("      - ", 1)
             checkout = steps[0]
             remainder = steps[1] if len(steps) == 2 else ""
-            self.assertIn("ref: ${{ inputs.source_ref || github.ref }}", checkout)
+            self.assertIn("ref: ${{ env.TRITIUM_SOURCE_REF }}", checkout)
             self.assertTrue(
                 remainder.startswith("name: verify checked-out source revision"),
                 "every checkout must be followed immediately by source verification",
