@@ -9,6 +9,39 @@ second-machine gates remain separate.
 
 ## Gate status (measured 2026-09-03)
 
+### Installed CPU wheel, HF lifecycle, and ONNX smoke (2026-10-04)
+
+At source revision `2f53bf00658f9d8412b98acff387763efb4e191d`, a CPU abi3 wheel
+was built from a clean `git archive` of that commit, keeping unrelated dirty
+working-tree edits out of the artifact. `scripts/verify-wheel.py
+/mnt/2tb/tritium-wheel-2f53bf00-clean --install-smoke` passed. The wheel is
+`pytritium-1.1.0rc2-cp39-abi3-linux_x86_64.whl`, SHA-256
+`ea6b94ca7ee1f8fc766ec6d63dd2d13fa1e20af6c068bd1413bb17767442701a`,
+10,228,737 bytes. Its `linux_x86_64` tag is host-local and is **not** a
+manylinux/release wheel.
+
+The installed-wheel functional smoke passed on CPU with PyTorch 2.11.0+cu130,
+Transformers 5.5.3, and safetensors 0.8.0. It exercised native ternary matmul,
+Hugging Face QAT forward/backward and optimizer update/resume, safe checkpoint
+save/reload, and tied-weight identity. Receipt:
+`/mnt/2tb/tritium-wheel-2f53bf00-clean/functional-receipt.json`, SHA-256
+`e6882d1179f54b694bbde145bdcff373a948a11445c79b2701c4a0d5e463376c`, receipt
+ID `sha256:ae75353764ac5c4fa7ebc7680f3e4ed07e0bb040e8f3f6e153f3566327b57eae`.
+Its Tritium package and extension were loaded from the isolated wheel venv and
+checked against the forbidden source-checkout path; dependency packages were
+available from the host Python site packages, so this is not a fully isolated
+dependency-install qualification.
+
+From outside the checkout, the installed-wheel HF lifecycle receipt tests and
+QAT tutorial receipt tests passed (2 + 5). The ONNX tests passed 28/28 using
+ONNX 1.23.1, ONNX Runtime 1.30.0, and ONNX Script 0.7.2; they exercise tiny
+module/graph artifacts, not whole-Qwen inference. Separately, the source-tree
+Python suite passed 363 tests and skipped 27: CUDA-extension tests, the two
+installed-wheel-only files, ONNX before its dependencies were added, and
+external cross-project migration tests. These local checks do not close the
+manylinux package matrix, CUDA wheel, two-physical-GPU distributed training,
+full-Qwen ONNX, model-quality, or independent-release gates.
+
 ### Serving software regression refresh (2026-10-04)
 
 At source revision `c12812ada218dfbd8cfb524e31852b09deab18df`, the local
