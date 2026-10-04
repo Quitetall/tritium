@@ -11,6 +11,7 @@
 
 use std::sync::Arc;
 
+use tritium_format::salt_v2_package::SaltV2ScaleUpdate;
 use tritium_spec::TernaryBackend;
 
 use crate::error::NnError;
@@ -54,6 +55,36 @@ pub enum Projection {
 }
 
 impl Projection {
+    /// Apply scale-only candidate updates to a uniquely owned host SALT V2
+    /// resident matrix. Packed trits stay in place; CUDA residents and shared
+    /// host handles fail closed until their mutation paths are explicit.
+    ///
+    /// # Errors
+    /// Returns an error for non-host-SALT projections, shared resident handles,
+    /// or malformed updates. Validation occurs before the resident scales change.
+    pub fn apply_host_salt_v2_scale_updates(
+        &mut self,
+        tensor_index: usize,
+        updates: &[SaltV2ScaleUpdate],
+    ) -> Result<(), NnError> {
+        match self {
+            Projection::HostSaltV2(matrix) => Arc::get_mut(matrix)
+                .ok_or_else(|| {
+                    NnError::Backend(
+                        "cannot update shared host SALT V2 resident scales in place".into(),
+                    )
+                })?
+                .apply_scale_updates(tensor_index, updates),
+            #[cfg(feature = "cuda")]
+            Projection::SaltV2(_) => Err(NnError::Backend(
+                "in-place candidate scale updates are not implemented for CUDA SALT V2".into(),
+            )),
+            _ => Err(NnError::Backend(
+                "scale updates require a host SALT V2 projection".into(),
+            )),
+        }
+    }
+
     /// Activation arithmetic used by this projection.
     #[must_use]
     pub fn activation_mode(&self) -> ProjectionActivationMode {
@@ -260,5 +291,66 @@ pub(crate) fn salt_v2_forward_exact(
             Err(NnError::Shape { expected, got })
         }
         Err(error) => Err(NnError::Backend(error.to_string())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+    use std::sync::Arc;
+
+    use half::f16;
+    use tritium_format::{
+        salt_v2::SaltV2Codec,
+        salt_v2_package::{
+            SaltV2Package, SaltV2PackageReader, SaltV2Plane, SaltV2ScaleUpdate, SaltV2Tensor,
+            SaltV2Tile, write_salt_v2_package,
+        },
+    };
+
+    use super::Projection;
+    use crate::layers::HostSaltV2Linear;
+
+    fn host_matrix() -> HostSaltV2Linear {
+        let tensor = SaltV2Tensor::new(
+            "weight",
+            vec![2, 128],
+            vec![
+                SaltV2Tile::new(vec![
+                    SaltV2Plane::new(vec![1; 256], vec![f16::ONE, f16::ONE]).unwrap(),
+                ])
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let package = SaltV2Package::new(SaltV2Codec::D2, vec![tensor]).unwrap();
+        let encoded = write_salt_v2_package(&package).unwrap();
+        let mut reader = SaltV2PackageReader::new_strict(Cursor::new(encoded.bytes)).unwrap();
+        HostSaltV2Linear::from_reader(&mut reader, "weight").unwrap()
+    }
+
+    #[test]
+    fn resident_scale_updates_mutate_only_unique_host_projection() {
+        let mut projection = Projection::HostSaltV2(Arc::new(host_matrix()));
+        let update = SaltV2ScaleUpdate::new(3, 0, 0, vec![f16::from_f32(2.0), f16::ONE]).unwrap();
+        projection
+            .apply_host_salt_v2_scale_updates(3, std::slice::from_ref(&update))
+            .unwrap();
+        let matrix = match &projection {
+            Projection::HostSaltV2(matrix) => matrix,
+            _ => unreachable!(),
+        };
+        let mut output = [0.0; 2];
+        matrix.forward(&vec![1.0; 128], 1, &mut output).unwrap();
+        assert_eq!(output, [256.0, 128.0]);
+
+        let shared = Arc::new(host_matrix());
+        let _other_owner = Arc::clone(&shared);
+        let mut shared_projection = Projection::HostSaltV2(shared);
+        assert!(
+            shared_projection
+                .apply_host_salt_v2_scale_updates(3, std::slice::from_ref(&update))
+                .is_err()
+        );
     }
 }
