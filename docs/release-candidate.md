@@ -69,6 +69,21 @@ qualification, Qwen test, CUDA QAT proof, performance result, or independent
 release gate. The wheel and receipts are durable local evidence under
 `/mnt/2tb/tritium-cuda-wheel-a6487b23/`.
 
+The installed-wheel QAT tutorial was also run separately on `cuda:0` from
+outside the checkout. It completed a two-plane tied-embedding QAT step with a
+finite nonzero gradient, optimizer save/resume, hard export, and strict artifact
+reload; `--check-receipt` reopened the receipt and artifact successfully. Its
+receipt is
+`/mnt/2tb/tritium-cuda-wheel-a6487b23/tutorial-cuda/receipt.json` (SHA-256
+`4de946cc4128bf3595e341d9351ba62d4f737837623015f87eccbc79441cdc98`,
+receipt ID `sha256:abc1f22c92faa68093ff9e7cedc162548c6e7c2a639871062c10f71462ed8ed0`).
+The hard artifact is a 2,533-byte tiny fixture, not a language model. This run
+used the venv's normal Python mode so its CUDA-enabled PyTorch from host
+user-site packages was visible; isolated `python -I` saw a non-CUDA PyTorch and
+did not run this tutorial. It therefore verifies installed Tritium wheel
+behavior on this host, but not a self-contained dependency environment or the
+cross-platform CUDA packaging matrix.
+
 ### Serving software regression refresh (2026-10-04)
 
 At source revision `c12812ada218dfbd8cfb524e31852b09deab18df`, the local
