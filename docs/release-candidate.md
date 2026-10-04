@@ -116,6 +116,38 @@ package gate, or independent release qualification.
 
 ### ONNX Python facade source regression refresh (2026-10-04)
 
+### Current-head CPU manylinux wheel refresh (2026-10-04)
+
+The exact clean candidate worktree at
+`/home/brianklam/.cache/tritium-prepush/worktree` was advanced to
+`9f19b20b53a2d19aca3c6839b2d67611ce592811` and remained clean. The pinned
+manylinux build produced
+`/mnt/2tb/tritium-wheel-9f19b20/pytritium-1.1.0rc2-cp39-abi3-manylinux_2_28_x86_64.whl`,
+10,514,737 bytes, SHA-256
+`4f7770f7cfd9c0d877c7e11926e04995a6c3051dcc6985b79842f32069724662`. Its
+platform-tag and install smoke passed. The verifier receipt is
+`/mnt/2tb/tritium-wheel-9f19b20/wheel-smoke.json`, SHA-256
+`aaaec33867016cdafca1e81d881a3ee60098bbe7ed4a548eca41d823a900173d`.
+
+The installed-wheel CPU functional smoke passed from the wheel's venv. Its
+receipt is `/mnt/2tb/tritium-wheel-9f19b20/functional-receipt.json`, SHA-256
+`228debaf0ef27a5b76864a0147d000106cec293a54ed71702d47c8ad4288bd3f`, receipt
+ID `sha256:270d6d4c8caf6270b1e30257500124e7b5652ef1c636288c5d8810983d68e7a2`.
+It exercises native ternary matmul, HF QAT forward/backward, optimizer
+step/checkpoint resume, safetensors save/reload and tied-weight identity on
+CPython 3.14.7 with PyTorch 2.11.0+cu130, Transformers 5.5.3 and safetensors
+0.7.0. The venv installed the Tritium wheel but inherited dependency packages
+from host site-packages, so this is not a fully isolated dependency test.
+
+All 24 `test_torch_onnx.py` tests also passed from that installed-wheel venv;
+the import resolved to its `site-packages`. The generation facade tests use a
+fake native runtime, not a real ONNX Runtime session or whole-Qwen execution.
+These checks are local candidate-revision package evidence only. They do not
+close the aggregate package gate, cross-platform matrix, real-Qwen ONNX,
+model-quality or independent-release gates.
+
+### ONNX Python facade source regression refresh (2026-10-04)
+
 `python -m pytest crates/tritium-py/tests/test_torch_onnx.py -q` passed 24
 tests on the current source checkout. In addition to strict manifest admission,
 typed artifact routing, batch-one forward and MTP calls, and greedy cached
