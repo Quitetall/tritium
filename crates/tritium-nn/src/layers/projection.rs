@@ -55,6 +55,17 @@ pub enum Projection {
 }
 
 impl Projection {
+    /// Physical SALT V2 tensor index, when this projection is host-resident.
+    ///
+    /// CUDA resident handles currently do not retain package-index identity.
+    #[must_use]
+    pub fn host_salt_v2_tensor_index(&self) -> Option<usize> {
+        match self {
+            Projection::HostSaltV2(matrix) => Some(matrix.tensor_index()),
+            _ => None,
+        }
+    }
+
     /// Apply scale-only candidate updates to a uniquely owned host SALT V2
     /// resident matrix. Packed trits stay in place; CUDA residents and shared
     /// host handles fail closed until their mutation paths are explicit.

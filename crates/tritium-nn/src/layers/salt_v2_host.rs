@@ -818,6 +818,29 @@ mod tests {
         assert_ne!(linear.scales(), baseline_scales);
     }
 
+    #[test]
+    fn resident_tensor_identity_follows_physical_package_order() {
+        let one = |name: &str| {
+            SaltV2Tensor::new(
+                name,
+                vec![1, 1],
+                vec![
+                    SaltV2Tile::new(vec![SaltV2Plane::new(vec![1], vec![f16::ONE]).unwrap()])
+                        .unwrap(),
+                ],
+            )
+            .unwrap()
+        };
+        let package =
+            SaltV2Package::new(SaltV2Codec::D2, vec![one("first"), one("second")]).unwrap();
+        let encoded = write_salt_v2_package(&package).unwrap();
+        let mut reader = SaltV2PackageReader::new_strict(Cursor::new(encoded.bytes)).unwrap();
+        let first = HostSaltV2Linear::from_reader(&mut reader, "first").unwrap();
+        let second = HostSaltV2Linear::from_reader(&mut reader, "second").unwrap();
+        assert_eq!(first.tensor_index(), 0);
+        assert_eq!(second.tensor_index(), 1);
+    }
+
     fn g64_plane(seed: usize) -> SaltV2Plane {
         SaltV2Plane::new_with_scale_group_size(
             (0..256)

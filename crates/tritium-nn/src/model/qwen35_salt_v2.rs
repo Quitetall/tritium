@@ -15,7 +15,7 @@ use serde::Deserialize;
 use tritium_format::{
     PackageHasher, SafeTensorsReader,
     salt_v2::SaltV2Codec,
-    salt_v2_package::{SaltV2PackageReader, SaltV2Transform},
+    salt_v2_package::{SaltV2PackageReader, SaltV2ScaleUpdate, SaltV2Transform},
 };
 use tritium_spec::TernaryBackend;
 
@@ -513,6 +513,20 @@ pub struct Qwen35SaltV2LanguageMtpModel {
 }
 
 impl Qwen35SaltV2LanguageMtpModel {
+    /// Apply one fitted scale-only candidate to a uniquely identified host
+    /// projection in the loaded language graph. MTP weights remain outside this
+    /// operation until their execution and update contract is verified.
+    ///
+    /// # Errors
+    /// Returns an error if tensor identity is absent or ambiguous, the resident
+    /// storage is shared or CUDA-backed, or candidate scales are invalid.
+    pub fn apply_host_salt_v2_scale_updates(
+        &mut self,
+        updates: &[SaltV2ScaleUpdate],
+    ) -> Result<(), NnError> {
+        self.runner.apply_host_salt_v2_scale_updates(updates)
+    }
+
     /// Load one profile package from an exported bundle directory.
     ///
     /// The caller selects `compact-v1` or `near-lossless-v1`; all filenames,

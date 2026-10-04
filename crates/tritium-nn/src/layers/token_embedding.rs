@@ -5,7 +5,7 @@ use core::mem::size_of;
 use std::sync::Arc;
 
 use rayon::prelude::*;
-use tritium_format::PackedSaltRow;
+use tritium_format::{PackedSaltRow, salt_v2_package::SaltV2ScaleUpdate};
 use tritium_spec::TernaryBackend;
 use tritium_train::ops::ste::{fast_hadamard, group_is_rotatable};
 
@@ -58,6 +58,34 @@ fn rotate_row(row: &mut [f32], group: usize) {
 }
 
 impl TokenEmbedding {
+    pub(crate) fn host_salt_v2_tensor_index(&self) -> Option<usize> {
+        match &self.storage {
+            Storage::HostSaltV2(matrix) => Some(matrix.tensor_index()),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn apply_host_salt_v2_scale_updates(
+        &mut self,
+        tensor_index: usize,
+        updates: &[SaltV2ScaleUpdate],
+    ) -> Result<bool, NnError> {
+        let Storage::HostSaltV2(matrix) = &mut self.storage else {
+            return Ok(false);
+        };
+        if matrix.tensor_index() != tensor_index {
+            return Ok(false);
+        }
+        Arc::get_mut(matrix)
+            .ok_or_else(|| {
+                NnError::Backend(
+                    "cannot update shared host SALT V2 embedding scales in place".into(),
+                )
+            })?
+            .apply_scale_updates(tensor_index, updates)?;
+        Ok(true)
+    }
+
     /// Build a token table around compact host SALT V2 storage.
     ///
     /// # Errors

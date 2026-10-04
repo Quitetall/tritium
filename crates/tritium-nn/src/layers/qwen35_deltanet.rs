@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 
+use tritium_format::salt_v2_package::SaltV2ScaleUpdate;
 use tritium_spec::TernaryBackend;
 
 use crate::error::NnError;
@@ -401,6 +402,40 @@ impl Qwen35DeltaNet {
     #[must_use]
     pub const fn activation_mode(&self) -> ProjectionActivationMode {
         self.activation_mode
+    }
+
+    pub(crate) fn count_host_salt_v2_tensor_index(&self, tensor_index: usize) -> usize {
+        [
+            &self.weights.qkv_proj,
+            &self.weights.z_proj,
+            &self.weights.b_proj,
+            &self.weights.a_proj,
+            &self.weights.out_proj,
+        ]
+        .into_iter()
+        .filter(|projection| projection.host_salt_v2_tensor_index() == Some(tensor_index))
+        .count()
+    }
+
+    pub(crate) fn apply_host_salt_v2_scale_updates(
+        &mut self,
+        tensor_index: usize,
+        updates: &[SaltV2ScaleUpdate],
+    ) -> Result<bool, NnError> {
+        let projections = [
+            &mut self.weights.qkv_proj,
+            &mut self.weights.z_proj,
+            &mut self.weights.b_proj,
+            &mut self.weights.a_proj,
+            &mut self.weights.out_proj,
+        ];
+        for projection in projections {
+            if projection.host_salt_v2_tensor_index() == Some(tensor_index) {
+                projection.apply_host_salt_v2_scale_updates(tensor_index, updates)?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Allocate zeroed fp32 current/staging state bound to this exact mixer.
