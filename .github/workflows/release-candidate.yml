@@ -144,24 +144,12 @@ jobs:
         with:
           name: abi3-compatibility-receipt
           path: downloads/compatibility-evidence
+      - name: test candidate staging contract
+        run: python3 -m unittest scripts.tests.test_stage_release_candidate -v
       - name: separate candidate payload and evidence receipts
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p candidate evidence/wheels evidence/crates evidence/npm evidence/compatibility
-          cp downloads/wheels/*.whl candidate/
-          cp downloads/wheels/*.cdx.json candidate/
-          for receipt in downloads/wheels/*.json; do
-            case "$receipt" in *.cdx.json) continue ;; esac
-            cp "$receipt" evidence/wheels/
-          done
-          cp downloads/package-evidence/crates/*.crate candidate/
-          cp downloads/package-evidence/crates/*.cdx.json candidate/
-          cp downloads/package-evidence/crates/crate-archive-qualification.json evidence/crates/
-          cp downloads/package-evidence/npm/*.tgz candidate/
-          cp downloads/package-evidence/npm/*.cdx.json candidate/
-          cp downloads/package-evidence/npm/npm-archive-receipt.json evidence/npm/
-          cp downloads/compatibility-evidence/python-abi3-39-plus.json evidence/compatibility/
+        run: >-
+          python3 scripts/stage-release-candidate.py
+          --downloads downloads --payload candidate --evidence evidence
       - name: assert complete wheel platform set
         env:
           RELEASE_VERSION: ${{ needs.resolve.outputs.version }}
