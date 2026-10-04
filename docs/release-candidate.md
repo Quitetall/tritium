@@ -42,6 +42,33 @@ external cross-project migration tests. These local checks do not close the
 manylinux package matrix, CUDA wheel, two-physical-GPU distributed training,
 full-Qwen ONNX, model-quality, or independent-release gates.
 
+### Installed CUDA manylinux wheel smoke (2026-10-04)
+
+At source revision `a6487b23f84c248f1440c5b71488db10621ad44c`,
+`scripts/build-cuda-manylinux-wheel.sh` built the CUDA-enabled abi3 wheel in
+the pinned manylinux 2.28 container against the host CUDA 13.4 toolkit. The
+wheel is
+`pytritium-1.1.0rc2-cp39-abi3-manylinux_2_28_x86_64.whl`, SHA-256
+`7e4bfe1c8ffc8e16a165a77b9a3807af2f873c8c49224379e1ab1a240655c35a`,
+2,889,220 bytes. `scripts/verify-wheel.py` passed its exact platform-tag,
+wheel-integrity, and isolated-install checks. Its wheel smoke receipt is
+`/mnt/2tb/tritium-cuda-wheel-a6487b23/wheel-smoke.json` (SHA-256
+`e94562b037e033415505b62b63c65411869a510095a71cba48c4f423e18e25b3`),
+bound to CPython 3.14.7 and target `linux-x86_64-cuda13-sm89`.
+
+The installed-wheel functional smoke then passed on the RTX 4090 with native
+device `cuda:0`: native ternary matmul, Hugging Face QAT forward/backward,
+optimizer update and resume, safetensors save/reload, and tied-weight identity.
+Receipt:
+`/mnt/2tb/tritium-cuda-wheel-a6487b23/functional-receipt.json`, SHA-256
+`feb46e27d24534bdbb92352d867b3f7b302e67bb035f9d616d3f6b3fe39bb1d0`,
+receipt ID `sha256:2a8af2b9db4d1923e2b63af848002d341c56d6b760dc97352c406ab002f301b6`.
+The native ternary operation used CUDA; the tiny PyTorch/HF QAT lifecycle ran
+on CPU. This is one local Linux/Python/GPU package smoke, not a wheel-matrix
+qualification, Qwen test, CUDA QAT proof, performance result, or independent
+release gate. The wheel and receipts are durable local evidence under
+`/mnt/2tb/tritium-cuda-wheel-a6487b23/`.
+
 ### Serving software regression refresh (2026-10-04)
 
 At source revision `c12812ada218dfbd8cfb524e31852b09deab18df`, the local
