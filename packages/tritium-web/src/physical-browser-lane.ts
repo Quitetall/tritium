@@ -430,6 +430,7 @@ async function adapterInfo(adapter: BrowserGpuAdapter): Promise<PhysicalBrowserA
   const standardArchitecture = text(member(info, "architecture"));
   const standardDevice = text(member(info, "device"));
   const standardDescription = text(member(info, "description"));
+  const rendererIsSanitized = webgl?.renderer.toLowerCase().includes(", or similar") ?? false;
   const vendor = standardVendor ?? (firefoxPhysical ? text(wgpuDriver) : webgl?.vendor);
   const architecture = standardArchitecture ?? (
     firefoxPhysical ? `${String(wgpuBackend).trim()}/${String(wgpuDeviceType).trim()}` : undefined
@@ -440,7 +441,9 @@ async function adapterInfo(adapter: BrowserGpuAdapter): Promise<PhysicalBrowserA
       ? [text(wgpuName), text(wgpuBackend), text(wgpuDriver), text(wgpuDriverInfo)]
         .filter((value): value is string => value !== undefined)
         .join(" ")
-      : webgl === undefined ? undefined : `${webgl.renderer} (${webgl.vendor}); WebGPU non-fallback`
+      : webgl === undefined ? undefined : `${webgl.renderer} (${webgl.vendor}); WebGPU non-fallback${
+          rendererIsSanitized ? "; browser-sanitized; exact adapter model unknown" : ""
+        }`
   );
   const identity = Object.freeze({
     vendor: nonEmpty(vendor, "adapter.vendor"),

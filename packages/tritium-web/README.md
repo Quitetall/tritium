@@ -164,8 +164,11 @@ publishes `lane.json` and canonical `trace.json`. It requires a clean revision
 and a clean-source npm receipt. Run separate current-stable endpoints for
 Chrome, Firefox and Safari; Safari lane additionally requires physical macOS.
 The producer enables WebGPU in its temporary Firefox profile and exposes the
-renderer identity needed by the hardware check. These settings do not modify
-the user's Firefox profile; fallback and software adapters remain rejected.
+renderer identity needed by the hardware check. Firefox may deliberately
+replace the exact renderer with a representative value ending in `, or
+similar`; the receipt labels that value as browser-sanitized and the exact
+adapter model remains unknown. These settings do not modify the user's Firefox
+profile; fallback and software adapters remain rejected.
 
 This package is private while the local v1.1 release candidate is under
 construction. Registry publication requires explicit release authorization.
