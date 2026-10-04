@@ -90,6 +90,31 @@ strict artifact records each selected weight's plane count. This first generic
 integration allocates at weight granularity; Stage-7 SALT model conversion
 retains finer allocation-tile maps.
 
+## Experimental GPTQ scale-refit placement
+
+The `tritium convert` command has an opt-in L-C experiment switch for the
+activation-aware geometric-ladder fitter. Its default is `post-pass`, which
+fits a group's top scale after the GPTQ pass. `in-loop` refits that scale when
+the group is complete, then propagates the changed quantization error into
+later columns:
+
+```sh
+tritium convert \
+  --model ./dense-model \
+  --out ./ternary-in-loop \
+  --activation-aware \
+  --calib ./calibration.txt \
+  --gptq-scale-refit in-loop
+```
+
+The in-loop mode requires `--activation-aware`; Tritium rejects it otherwise.
+The conversion receipt records `post-pass`, `in-loop`, or `not-applicable` so
+results cannot be confused. Keep model, calibration data, token count, and all
+other options fixed when comparing the two modes. This is an experimental
+selector, not evidence that in-loop refitting improves held-out quality, and it
+does not qualify or alter the frozen Stage-7 recipe. See the current
+[research-record policy](./research-records.md) for the campaign boundary.
+
 ## Stage-7 token evidence
 
 Collect the frozen source rows at the three immutable Hub revisions before
