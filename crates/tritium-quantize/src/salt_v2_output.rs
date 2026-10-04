@@ -308,6 +308,32 @@ impl OutputReconstructionSpec {
         Ok(candidate_id)
     }
 
+    /// Bind a scale-update slice to its parent package and output-evaluation spec.
+    /// The returned borrowed candidate keeps the exact updates paired with the
+    /// identity used by the output receipt without copying the update payload.
+    ///
+    /// # Errors
+    /// Returns the same errors as [`Self::candidate_id_for_scale_updates`].
+    pub fn scale_update_candidate<'a>(
+        &self,
+        parent_package_digest: &[u8; 32],
+        initialization_seed: u64,
+        updates: &'a [SaltV2ScaleUpdate],
+    ) -> Result<OutputReconstructionScaleCandidate<'a>, OutputReconstructionError> {
+        let candidate_id = self.candidate_id_for_scale_updates(
+            parent_package_digest,
+            initialization_seed,
+            updates,
+        )?;
+        Ok(OutputReconstructionScaleCandidate {
+            spec_id: self.spec_id,
+            parent_package_digest: *parent_package_digest,
+            initialization_seed,
+            updates,
+            candidate_id,
+        })
+    }
+
     fn derive_id(&self) -> [u8; 32] {
         let mut hasher = blake3::Hasher::new_derive_key(SPEC_HASH_CONTEXT);
         hasher.update(self.source_model_id.as_bytes());
@@ -359,6 +385,48 @@ impl OutputReconstructionSpec {
     }
 }
 
+/// Borrowed, content-bound SALT scale candidate for output evaluation.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct OutputReconstructionScaleCandidate<'a> {
+    spec_id: [u8; 32],
+    parent_package_digest: [u8; 32],
+    initialization_seed: u64,
+    updates: &'a [SaltV2ScaleUpdate],
+    candidate_id: [u8; 32],
+}
+
+impl OutputReconstructionScaleCandidate<'_> {
+    /// Frozen output-reconstruction spec identity for this candidate.
+    #[must_use]
+    pub const fn spec_id(&self) -> &[u8; 32] {
+        &self.spec_id
+    }
+
+    /// Exact-byte identity of the package to which the updates apply.
+    #[must_use]
+    pub const fn parent_package_digest(&self) -> &[u8; 32] {
+        &self.parent_package_digest
+    }
+
+    /// Deterministic initialization seed included in the candidate identity.
+    #[must_use]
+    pub const fn initialization_seed(&self) -> u64 {
+        self.initialization_seed
+    }
+
+    /// Canonical scale updates whose exact f16 payloads are hashed into this candidate.
+    #[must_use]
+    pub fn updates(&self) -> &[SaltV2ScaleUpdate] {
+        self.updates
+    }
+
+    /// Candidate identity to use when recording output-reconstruction evidence.
+    #[must_use]
+    pub const fn candidate_id(&self) -> &[u8; 32] {
+        &self.candidate_id
+    }
+}
+
 /// Streaming accumulator for one deterministic output-aware initialization.
 #[derive(Clone, Debug)]
 pub struct OutputReconstructionAccumulator {
@@ -380,6 +448,20 @@ pub struct OutputReconstructionAccumulator {
 }
 
 impl OutputReconstructionAccumulator {
+    /// Begin evaluating a content-bound scale candidate.
+    ///
+    /// # Errors
+    /// Rejects candidates created for another output-reconstruction spec.
+    pub fn for_scale_candidate(
+        spec: &OutputReconstructionSpec,
+        candidate: &OutputReconstructionScaleCandidate<'_>,
+    ) -> Result<Self, OutputReconstructionError> {
+        if candidate.spec_id != *spec.spec_id() {
+            return Err(OutputReconstructionError::CandidateSpecMismatch);
+        }
+        Self::new(spec, candidate.candidate_id, candidate.initialization_seed)
+    }
+
     /// Begin one candidate without retaining any activation or logit batch.
     ///
     /// # Errors

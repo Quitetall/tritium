@@ -809,6 +809,50 @@ fn scale_update_candidate_identity_binds_spec_seed_targets_and_f16_values() {
 }
 
 #[test]
+fn bound_scale_candidate_carries_updates_into_output_evidence() {
+    let output_spec = spec(OutputReconstructionSchedule::Blocks { block_count: 1 }, 1);
+    let updates = [SaltV2ScaleUpdate::new(0, 0, 0, vec![f16::ONE]).unwrap()];
+    let candidate = output_spec
+        .scale_update_candidate(&[41; 32], 7, &updates)
+        .expect("updates form a content-bound candidate");
+
+    assert_eq!(candidate.updates(), &updates);
+    assert_eq!(candidate.parent_package_digest(), &[41; 32]);
+    let mut output = OutputReconstructionAccumulator::for_scale_candidate(&output_spec, &candidate)
+        .expect("candidate belongs to this output spec");
+    output
+        .observe(
+            OutputReconstructionScope::Block { start: 0, end: 1 },
+            0,
+            1,
+            2,
+            &[true],
+            &[1.0, 0.0],
+            &[1.0, 0.0],
+        )
+        .unwrap();
+    output
+        .observe(
+            OutputReconstructionScope::FinalLogits,
+            0,
+            1,
+            2,
+            &[true],
+            &[0.0, 1.0],
+            &[0.0, 1.0],
+        )
+        .unwrap();
+    let receipt = output.finish().expect("complete output evidence");
+    assert_eq!(receipt.candidate_id(), candidate.candidate_id());
+
+    let other_spec = spec(OutputReconstructionSchedule::Blocks { block_count: 2 }, 1);
+    assert!(matches!(
+        OutputReconstructionAccumulator::for_scale_candidate(&other_spec, &candidate),
+        Err(OutputReconstructionError::CandidateSpecMismatch)
+    ));
+}
+
+#[test]
 fn strict_reopen_rejects_rehashed_but_unreachable_candidate_metrics() {
     let spec = spec(OutputReconstructionSchedule::Blocks { block_count: 1 }, 1);
     let candidate = exact_candidate(&spec, [6; 32], 1, &[0.0, 0.0]);
