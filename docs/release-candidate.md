@@ -202,6 +202,24 @@ and `991bca2c5458d8daa90d4688ee74aaaeabffc2109622da9c2d4233a3bcc78ad4`
 registry admission remain open. This also does not establish Node 22 or
 cross-platform package-matrix coverage.
 
+The same lane producer was rerun against the exact RC.2 npm archive for source
+revision `b95092301a544a460df0d90dc3771c26f44c2baf` (628,123 bytes, SHA-256
+`822bbaeeda9278b21a1791c18f0f403509e2681f8af13032936ce7fd0b49376e`) using
+the clean source worktree, its exact-source native reference, and retained npm
+qualification receipt. Chrome 157.0.8081.0 and Firefox 157 each completed all
+72 valid and 45 invalid-input cases with zero skips; both passed the full
+prepare/forward/backward/optimizer/checkpoint/resume/export/reload lifecycle,
+six injected fault classes, native artifact parity, and zero steady-state
+readbacks. Chrome identifies a non-fallback NVIDIA RTX 4090 adapter. Firefox
+identifies a non-fallback NVIDIA renderer but sanitizes the exact adapter model.
+Their trace SHA-256 values are
+`5294b2569e1486d3ab4a6d7a7ae1012d88f587189be52ae049c819dfe6c1c5b8` (Chrome)
+and `129b34281c53d44e009b7ada46341b266e6bce185a015ed048674b0a65eb980d`
+(Firefox). Lane and trace files are retained under
+`release/v1.1/evidence/browser-ci-b950923/`. These exact-source fragments still
+do not satisfy `browser-conformance`: the physical Safari lane, same-candidate
+aggregation, and registry admission remain open.
+
 ### ONNX Python facade source regression refresh (2026-10-04)
 
 ### ONNX Python facade source regression refresh (2026-10-04)
