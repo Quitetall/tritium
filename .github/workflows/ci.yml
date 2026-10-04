@@ -362,6 +362,13 @@ jobs:
           TRITIUM_WASM_PHYSICAL_DEVICE="wasmtime:${version}:${arch}" \
             cargo run --locked --release --target wasm32-wasip1 -p tritium-wasm \
             --example seal_wasi_training_receipts -- release/v1.1/ci-wasi-training-receipts
+          mapfile -t bundles < <(find release/v1.1/ci-wasi-training-receipts \
+            -maxdepth 1 -type f -name '*.json' -print)
+          test "${#bundles[@]}" -eq 1
+          receipt="${bundles[0]}"
+          digest="$(basename "$receipt" .json)"
+          cargo run --locked --release -p tritium-testkit \
+            --example training_capability_table -- --schema v2 "${digest}=${receipt}"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: wasi-training-receipts-${{ github.sha }}
