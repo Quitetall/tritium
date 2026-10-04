@@ -1176,6 +1176,42 @@ tail, cache-lifetime, stream-ordering, or memcheck coverage.
 Public activation is always `EXTERNAL_AUTH_REQUIRED` and is not inferred from
 local evidence.
 
+### Exact-source wheel CI evidence — 2026-10-04
+
+GitHub Actions wheel run [37220268418](https://github.com/Quitetall/tritium/actions/runs/37220268418)
+completed successfully from branch source revision
+`6ad03ea7fdc9731a428e2f94bdd3a244bd81bb01` (not the synthetic pull-request
+merge tree). It built Linux x86_64, Windows x64, and macOS arm64 CPU wheels;
+the source-free tutorial and installed PyTorch 2.11 / Python 3.13 functional
+job also passed. The Linux wheel SHA-256 was
+`7fbceb2182d0e6b418222cba54a1ed757bbb277a05aa607f0e96612457c0e3cd`.
+
+The run's ABI3 matrix passed for CPython 3.9–3.14 on Linux x86_64, Windows
+x64, and macOS arm64. Its matrix receipt is
+`sha256:2a87b3316fb9431e80e6a402497bcfb1419c896df9a57db7aa7cd8fd187ef730`
+(`github-37220268418-1-abi3-matrix`). The installed-wheel functional receipt
+is `sha256:2928c47113038399cd579cb6d7f01f2ab899f039291b9d0587d56d2d7b34e850`
+(`github-37220268418-1-cpu-functional`); it covers native ternary matmul,
+QAT forward/backward, optimizer update/resume, Hugging Face safetensors
+save/reload, and tied-weight identity. These are exact-source package checks,
+not a flagship-model quality result.
+
+The installed-wheel PyTorch dispatch-overhead receipt
+`sha256:5140cf6a73f0d1f739cf5e634fbdb451c8868b22dcc88987a2fcc3474120b3ec`
+(`github-37220268418-1-torch-dispatch-overhead`) independently verified
+against the exact wheel and source. All six decode, microbatch, and prefill
+forward/backward cases passed the 5% ceiling; the largest measured bootstrap
+upper ratio was `1.00925`. This is CPU wrapper-overhead evidence on a four-vCPU
+AMD EPYC 7763 runner. It does not qualify CUDA dispatch or replace the separate
+physical-GPU `torch-dispatch-cuda` receipt.
+
+The CUDA wheel lane was skipped because this was a pull-request run. The
+workflow receipts are not yet a complete v1.1 candidate registry: crate/npm
+archives, physical-GPU and other hardware gates, model-quality evidence,
+second-machine reproduction, independent release review, and explicit human
+activation remain separate requirements. Other required checks for the pull
+request were still running when this record was written.
+
 ## Local sign-off
 
 Evidence readiness and maintainer sign-off are separate layers. A complete
