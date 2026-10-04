@@ -38,6 +38,25 @@ source-tree integration test using the local BitNet GGUF compatibility fixture,
 not a candidate-bound production-bundle receipt or the strict schema-v3
 readiness gate. The checkout also contained unrelated, uncommitted EAT-O work.
 
+### CUDA cold-start phase diagnosis (2026-10-04)
+
+The same focused test was rerun with phase sums emitted after its first warm-up
+request. It passed (1 passed, 0 failed; 255.64 seconds). The first request
+measured 197.641 seconds from HTTP acceptance to decode-worker admission,
+0.006 seconds in prefill, 0.141 seconds in decode, 197.649 seconds to first
+token, and 197.791 seconds end to end. This localizes the cold delay before
+model prefill/decode; it is not evidence of slow ternary token execution.
+
+Source inspection explains the phase boundary: the batched worker constructs
+the resident decoder and paged-KV pool before it receives queued jobs, while
+the router currently marks the worker alive as soon as the thread is spawned.
+Thus the first request can be accepted and wait in the queue during CUDA batch
+initialization, and readiness can report ready before batch initialization has
+finished. This conflicts with plan 0052's requirement that readiness remain
+false during startup. The fix and a public `/readyz`/chat-startup regression
+test remain open. This source-tree measurement uses the local BitNet GGUF
+fixture; it is not a Qwen candidate receipt or a release qualification.
+
 ### Flagship campaign verification refresh (2026-09-29)
 
 The previous refresh reported the pinned Qwen3.6-27B additive-master campaign

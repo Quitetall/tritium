@@ -115,6 +115,15 @@ fn metric_value(text: &str, name: &str) -> u64 {
         .unwrap_or_else(|| panic!("metric {name} absent from /metrics:\n{text}"))
 }
 
+fn metric_f64(text: &str, name: &str) -> f64 {
+    text.lines()
+        .find_map(|line| {
+            line.strip_prefix(name)
+                .and_then(|value| value.trim().parse::<f64>().ok())
+        })
+        .unwrap_or_else(|| panic!("metric {name} absent from /metrics:\n{text}"))
+}
+
 async fn metric(router: &Router, name: &str) -> u64 {
     metric_value(&metrics_text(router).await, name)
 }
@@ -694,6 +703,16 @@ async fn cuda_batched_admission_interleaves_live_slot() {
     };
     // Warm: graph capture + first prefill paths off the clock.
     let _ = chat(&router, &join_ids(8), 2).await;
+    let warm_metrics = metrics_text(&router).await;
+    println!(
+        "C1 cold graph warmup phases: queue={:.3}s prefill={:.3}s decode={:.3}s \
+         generation={:.3}s time_to_first_token={:.3}s",
+        metric_f64(&warm_metrics, "tritium_queue_wait_seconds_sum"),
+        metric_f64(&warm_metrics, "tritium_prefill_duration_seconds_sum"),
+        metric_f64(&warm_metrics, "tritium_decode_duration_seconds_sum"),
+        metric_f64(&warm_metrics, "tritium_generation_duration_seconds_sum"),
+        metric_f64(&warm_metrics, "tritium_time_to_first_token_seconds_sum"),
+    );
     let disconnects_before = metric(&router, "tritium_stream_disconnects_total").await;
     let warm_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let (reservations_before, releases_before) = loop {
