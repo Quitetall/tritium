@@ -86,11 +86,13 @@ cross-platform CUDA packaging matrix.
 
 ### ONNX Python facade source regression refresh (2026-10-04)
 
-`python -m pytest crates/tritium-py/tests/test_torch_onnx.py -q` passed 22
-tests on the current source checkout. The tests cover strict manifest admission,
-typed artifact routing, batch-one forward and MTP calls, greedy cached
-generation, and rejection of unsupported training/export modes. This is a
-source-tree API regression check only: it does not execute the candidate
+`python -m pytest crates/tritium-py/tests/test_torch_onnx.py -q` passed 24
+tests on the current source checkout. In addition to strict manifest admission,
+typed artifact routing, batch-one forward and MTP calls, and greedy cached
+generation, the suite now exercises an opt-in Transformers `GenerationMixin`
+adapter that carries Tritium's tuple cache through the standard `.generate()`
+loop. The adapter is limited to batch-one CPU decoding without padding or beam
+search. The test uses a fake native runtime: it does not execute the candidate
 installed wheel, export a real authenticated Qwen bundle, or qualify whole-model
 Qwen generation. Those candidate-bound ONNX gates remain open.
 

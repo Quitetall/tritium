@@ -64,6 +64,7 @@ from .onnx import (
     OnnxCausalLMOutput,
     OnnxMtpOutput,
     QwenOnnxCausalLM,
+    as_transformers_generation_model,
     export_onnx,
     load_onnx,
 )
