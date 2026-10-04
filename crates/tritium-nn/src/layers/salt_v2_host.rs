@@ -24,6 +24,7 @@ use crate::NnError;
 /// per-tile or per-plane heap descriptors.
 #[derive(Clone, Debug)]
 pub struct HostSaltV2Linear {
+    tensor_index: usize,
     codec: SaltV2Codec,
     rows: usize,
     columns: usize,
@@ -53,6 +54,10 @@ impl HostSaltV2Linear {
         reader: &mut SaltV2PackageReader<R>,
         name: &str,
     ) -> Result<Self, NnError> {
+        let tensor_index = reader
+            .tensor_names_encoded_order()
+            .position(|candidate| candidate == name)
+            .ok_or_else(|| NnError::MissingTensor(name.to_owned()))?;
         let info = reader
             .tensor_info(name)
             .cloned()
@@ -135,6 +140,7 @@ impl HostSaltV2Linear {
         }
 
         Ok(Self {
+            tensor_index,
             codec,
             rows,
             columns,
@@ -148,6 +154,15 @@ impl HostSaltV2Linear {
             rank_prefixes: rank_prefixes.into_boxed_slice(),
             terminal_map_value,
         })
+    }
+
+    /// Physical record index of this matrix in its source package.
+    ///
+    /// Updates are bound to this identity so a same-shaped tensor cannot
+    /// accidentally receive another tensor's scale candidates.
+    #[must_use]
+    pub const fn tensor_index(&self) -> usize {
+        self.tensor_index
     }
 
     /// Output rows.
