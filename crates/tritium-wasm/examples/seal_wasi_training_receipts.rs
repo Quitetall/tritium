@@ -7,10 +7,13 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tritium_spec::TrainingVectorSetV2;
 use tritium_testkit::seal_training_receipts;
 use tritium_wasm::WasmTrainBackendV1;
+
+static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut arguments = std::env::args_os().skip(1);
@@ -41,10 +44,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let temporary = output_dir.join(format!(
             ".{}.{}.{}.tmp",
             sealed.digest_hex(),
-            std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?
-                .as_nanos()
+                .as_nanos(),
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ));
         let mut file = OpenOptions::new()
             .write(true)
