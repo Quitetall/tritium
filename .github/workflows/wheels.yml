@@ -199,7 +199,7 @@ jobs:
         run: >-
           python scripts/verify-wheel.py dist --install-smoke
           --target-id ${{ matrix.platform.target_id }}
-          --source-revision $TRITIUM_SOURCE_REVISION
+          --source-revision "$TRITIUM_SOURCE_REVISION"
           --receipt dist/${{ matrix.platform.target_id }}.json
       - name: generate exact-wheel CycloneDX SBOM
         shell: bash
@@ -247,7 +247,7 @@ jobs:
         run: >-
           python scripts/verify-wheel.py dist --install-smoke
           --target-id ${{ matrix.platform.target_id }}
-          --source-revision $TRITIUM_SOURCE_REVISION
+          --source-revision "$TRITIUM_SOURCE_REVISION"
           --smoke-evidence evidence/${{ matrix.platform.target_id }}-cp${{ matrix.python }}.json
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
@@ -283,7 +283,7 @@ jobs:
         run: >-
           python scripts/verify-wheel.py dist --install-smoke
           --target-id macos-arm64-cpu
-          --source-revision $TRITIUM_SOURCE_REVISION
+          --source-revision "$TRITIUM_SOURCE_REVISION"
           --smoke-evidence evidence/macos-arm64-cpu-cp${{ matrix.python }}.json
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
@@ -312,7 +312,7 @@ jobs:
       - name: aggregate exact interpreter matrix
         run: >-
           python scripts/aggregate-wheel-smoke.py evidence
-          --source-revision $TRITIUM_SOURCE_REVISION
+          --source-revision "$TRITIUM_SOURCE_REVISION"
           --release "${{ needs.wheels.outputs.release }}"
           --run-id github-${{ github.run_id }}-${{ github.run_attempt }}-abi3-matrix
           --output receipts/python-abi3-39-plus.json
@@ -372,7 +372,7 @@ jobs:
           python -I ${{ github.workspace }}/scripts/wheel-functional-smoke.py
           --wheel dist
           --forbidden-root ${{ github.workspace }}
-          --source-revision $TRITIUM_SOURCE_REVISION
+          --source-revision "$TRITIUM_SOURCE_REVISION"
           --release "${{ needs.wheels.outputs.release }}"
           --run-id github-${{ github.run_id }}-${{ github.run_attempt }}-cpu-functional
           --output evidence/torch-2.11-python-3.13.json
@@ -384,14 +384,14 @@ jobs:
             --output-dir evidence/tutorial-cpu \
             --device cpu \
             --wheel-artifact dist/*.whl \
-            --source-revision $TRITIUM_SOURCE_REVISION \
+            --source-revision "$TRITIUM_SOURCE_REVISION" \
             --release "${{ needs.wheels.outputs.release }}" \
             --run-id github-${{ github.run_id }}-${{ github.run_attempt }}-tutorial-cpu
           python -I -m tritium.torch.tutorial_qat \
             --check-receipt evidence/tutorial-cpu/receipt.json \
             --device cpu \
             --wheel-artifact dist/*.whl \
-            --source-revision $TRITIUM_SOURCE_REVISION \
+            --source-revision "$TRITIUM_SOURCE_REVISION" \
             --release "${{ needs.wheels.outputs.release }}"
       - name: qualify installed-wheel API signature
         shell: bash
@@ -491,14 +491,14 @@ jobs:
             --output-dir evidence/tutorial-clean \
             --device cpu \
             --wheel-artifact dist/*.whl \
-            --source-revision $TRITIUM_SOURCE_REVISION \
+            --source-revision "$TRITIUM_SOURCE_REVISION" \
             --release "${{ needs.wheels.outputs.release }}" \
             --run-id github-${{ github.run_id }}-${{ github.run_attempt }}-tutorial-clean
           python -I -m tritium.torch.tutorial_qat \
             --check-receipt evidence/tutorial-clean/receipt.json \
             --device cpu \
             --wheel-artifact dist/*.whl \
-            --source-revision $TRITIUM_SOURCE_REVISION \
+            --source-revision "$TRITIUM_SOURCE_REVISION" \
             --release "${{ needs.wheels.outputs.release }}"
       - name: execute and validate installed Hugging Face lifecycle
         shell: bash
@@ -507,13 +507,13 @@ jobs:
           python -I -m tritium.torch.hf_lifecycle \
             --output-dir evidence/hf-lifecycle-clean \
             --wheel-artifact dist/*.whl \
-            --source-revision $TRITIUM_SOURCE_REVISION \
+            --source-revision "$TRITIUM_SOURCE_REVISION" \
             --release "${{ needs.wheels.outputs.release }}" \
             --run-id github-${{ github.run_id }}-${{ github.run_attempt }}-hf-lifecycle-clean
           python -I -m tritium.torch.hf_lifecycle \
             --check-receipt evidence/hf-lifecycle-clean/receipt.json \
             --wheel-artifact dist/*.whl \
-            --source-revision $TRITIUM_SOURCE_REVISION \
+            --source-revision "$TRITIUM_SOURCE_REVISION" \
             --release "${{ needs.wheels.outputs.release }}"
       - name: execute and validate whole-model hard export
         shell: bash
@@ -522,13 +522,13 @@ jobs:
           python -I -m tritium.torch.hf_export_lifecycle \
             --output-dir evidence/hf-export-clean \
             --wheel-artifact dist/*.whl \
-            --source-revision $TRITIUM_SOURCE_REVISION \
+            --source-revision "$TRITIUM_SOURCE_REVISION" \
             --release "${{ needs.wheels.outputs.release }}" \
             --run-id github-${{ github.run_id }}-${{ github.run_attempt }}-hf-export-clean
           python -I -m tritium.torch.hf_export_lifecycle \
             --check-receipt evidence/hf-export-clean/receipt.json \
             --wheel-artifact dist/*.whl \
-            --source-revision $TRITIUM_SOURCE_REVISION \
+            --source-revision "$TRITIUM_SOURCE_REVISION" \
             --release "${{ needs.wheels.outputs.release }}"
       - name: execute and validate installed observability adapters
         shell: bash
@@ -537,13 +537,13 @@ jobs:
           python -B -I -m tritium.torch.qualify_observability \
             --output-dir evidence/observability-clean \
             --wheel-artifact dist/*.whl \
-            --source-revision $TRITIUM_SOURCE_REVISION \
+            --source-revision "$TRITIUM_SOURCE_REVISION" \
             --release "${{ needs.wheels.outputs.release }}" \
             --run-id github-${{ github.run_id }}-${{ github.run_attempt }}-observability-clean
           python -B -I -m tritium.torch.qualify_observability \
             --check-receipt evidence/observability-clean/receipt.json \
             --wheel-artifact dist/*.whl \
-            --source-revision $TRITIUM_SOURCE_REVISION \
+            --source-revision "$TRITIUM_SOURCE_REVISION" \
             --release "${{ needs.wheels.outputs.release }}"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
@@ -645,7 +645,7 @@ jobs:
           python -I ${{ github.workspace }}/scripts/wheel-functional-smoke.py
           --wheel dist-cuda
           --forbidden-root ${{ github.workspace }}
-          --source-revision $TRITIUM_SOURCE_REVISION
+          --source-revision "$TRITIUM_SOURCE_REVISION"
           --device cuda:0
           --release "$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
           --run-id github-${{ github.run_id }}-${{ github.run_attempt }}-cuda-functional
@@ -658,14 +658,14 @@ jobs:
             --output-dir evidence/tutorial-cuda \
             --device cuda:0 \
             --wheel-artifact dist-cuda/*.whl \
-            --source-revision $TRITIUM_SOURCE_REVISION \
+            --source-revision "$TRITIUM_SOURCE_REVISION" \
             --release "$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')" \
             --run-id github-${{ github.run_id }}-${{ github.run_attempt }}-tutorial-cuda
           python -I -m tritium.torch.tutorial_qat \
             --check-receipt evidence/tutorial-cuda/receipt.json \
             --device cuda:0 \
             --wheel-artifact dist-cuda/*.whl \
-            --source-revision $TRITIUM_SOURCE_REVISION \
+            --source-revision "$TRITIUM_SOURCE_REVISION" \
             --release "$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
       - name: qualify installed-wheel CUDA fp16 training
         shell: bash
