@@ -118,7 +118,7 @@ jobs:
       matrix:
         platform:
           # Linux (manylinux, built in the maturin container).
-          - { os: linux, runner: ubuntu-latest, target: x86_64, target_id: linux-x86_64-cpu, smoke: true }
+          - { os: linux, runner: ubuntu-24.04, target: x86_64, target_id: linux-x86_64-cpu, smoke: true }
           # macOS arm64. The ONNX Runtime dependency has no prebuilt
           # x86_64-apple-darwin binary, so universal2 would claim a slice that
           # cannot be built. The qualified compatibility cell is arm64.
@@ -204,7 +204,7 @@ jobs:
       matrix:
         python: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
         platform:
-          - { os: linux, runner: ubuntu-latest, target: x86_64, target_id: linux-x86_64-cpu }
+          - { os: linux, runner: ubuntu-24.04, target: x86_64, target_id: linux-x86_64-cpu }
           - { os: windows, runner: windows-latest, target: x64, target_id: windows-x86_64-cpu }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -268,7 +268,7 @@ jobs:
     # `wheels` is listed directly, not just transitively: job outputs are only
     # exposed to jobs that name the producer in their own `needs`.
     needs: [wheels, abi3-smoke, abi3-smoke-macos-arm64]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -294,7 +294,7 @@ jobs:
   torch-functional-smoke:
     name: installed wheel · Torch 2.11 · Python 3.13
     needs: wheels
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -418,7 +418,7 @@ jobs:
   tutorial-clean-wheel:
     name: source-free wheel tutorial · Python 3.13 slim
     needs: wheels
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     container: python:3.13-slim
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c

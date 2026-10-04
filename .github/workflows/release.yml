@@ -40,7 +40,7 @@ concurrency:
 jobs:
   resolve:
     name: resolve exact release ref
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     if: github.event_name != 'workflow_dispatch' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     outputs:
       tag: ${{ steps.identity.outputs.tag }}
@@ -82,7 +82,7 @@ jobs:
   # bind one coherent source revision.
   package-evidence:
     name: collect · crate and npm evidence
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: resolve
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -142,7 +142,7 @@ jobs:
   collect:
     name: collect · checksums
     needs: [resolve, build, package-evidence]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.v.outputs.version }}
     steps:
@@ -261,7 +261,7 @@ jobs:
   pypi:
     name: publish · PyPI
     needs: collect
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # The environment is where the trusted publisher is scoped, and where a manual
     # approval gate can be added without touching this file.
     environment:
@@ -292,7 +292,7 @@ jobs:
   github-release:
     name: publish · GitHub Release
     needs: [collect, resolve]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
       # Provenance attestation: this is what makes SECURITY.md's claim true.
@@ -346,7 +346,7 @@ jobs:
   crates:
     name: publish · crates.io
     needs: [collect, resolve]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     environment:
       name: crates-io
       url: https://crates.io/crates/tritium-core
