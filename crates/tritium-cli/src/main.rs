@@ -257,6 +257,13 @@ enum Command {
         /// Pass `1` for plain GPTQ.
         #[arg(long, default_value = "auto", value_parser = parse_decay)]
         gptq_decay: DecayArg,
+        /// Where to perform the one-scale-per-group GPTQ scale refit.
+        ///
+        /// `post-pass` is the existing default. `in-loop` refits a completed group before
+        /// propagating errors into later groups; it is an experimental L-C arm and requires
+        /// `--activation-aware`.
+        #[arg(long, value_enum, default_value_t = ScaleRefitArg::PostPass)]
+        gptq_scale_refit: ScaleRefitArg,
         /// Ramp the decay over the column order — full propagation at the first column, the decay
         /// only at the last — instead of applying it uniformly. Wins by a further ~1% at 16k
         /// calibration tokens and loses at 4k; leave it off unless calibration is generous.
@@ -640,6 +647,7 @@ fn main() -> anyhow::Result<()> {
             no_rotation,
             activation_aware,
             gptq_decay,
+            gptq_scale_refit,
             gptq_decay_ramp,
             dense_container,
             planes,
@@ -661,6 +669,10 @@ fn main() -> anyhow::Result<()> {
                 dense_container,
                 activation_aware,
                 gptq_decay: gptq_decay.0,
+                gptq_scale_refit: match gptq_scale_refit {
+                    ScaleRefitArg::PostPass => tritium_nn::salt_fit::ScaleRefitMode::PostPass,
+                    ScaleRefitArg::InLoop => tritium_nn::salt_fit::ScaleRefitMode::InLoop,
+                },
                 gptq_decay_ramp,
             },
         )?,
@@ -723,9 +735,34 @@ fn parse_decay(value: &str) -> Result<DecayArg, String> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+enum ScaleRefitArg {
+    #[default]
+    PostPass,
+    InLoop,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn convert_cli_accepts_explicit_gptq_scale_refit_mode() {
+        Cli::try_parse_from([
+            "tritium",
+            "convert",
+            "--model",
+            "model",
+            "--out",
+            "out",
+            "--activation-aware",
+            "--calib",
+            "tokens.json",
+            "--gptq-scale-refit",
+            "in-loop",
+        ])
+        .expect("convert CLI with in-loop scale refit");
+    }
 
     #[test]
     fn campaign_teacher_cache_cli_parses_fixed_window_inputs() {

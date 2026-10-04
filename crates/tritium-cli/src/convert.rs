@@ -103,7 +103,9 @@ use tritium_nn::{HfJsonTokenizer, ModelRunner, Tokenizer};
 use tritium_train::ops::ste::{fast_hadamard, group_is_rotatable};
 
 use crate::quantize_ladder::{LadderConfig, pack_group_fits, quantize_tensor_ladder};
-use tritium_nn::salt_fit::{ActivationAwareConfig, TapGrams, fit_tensor};
+use tritium_nn::salt_fit::{
+    ActivationAwareConfig, ScaleRefitMode, TapGrams, fit_tensor_with_scale_refit_mode,
+};
 
 /// Calibration window length. Matches the research harness's `EVAL_WINDOW` so a `convert` run and
 /// a harness run see the same context structure; the fold only reads per-channel second moments,
@@ -136,6 +138,8 @@ pub(crate) struct ConvertConfig {
     /// the calibration size and the tensor's input width (`salt_fit::auto_decay`); `Some(1.0)` is
     /// plain GPTQ.
     pub(crate) gptq_decay: Option<f64>,
+    /// Placement of the activation-aware ladder scale refit.
+    pub(crate) gptq_scale_refit: ScaleRefitMode,
     /// Ramp the decay over the column order instead of applying it uniformly.
     pub(crate) gptq_decay_ramp: bool,
 }
@@ -156,6 +160,9 @@ pub(crate) fn run(model: &Path, out: &Path, cfg: &ConvertConfig) -> Result<()> {
             "--activation-aware fits against the activation Gram, which needs calibration text. \
              Pass --calib <corpus>."
         );
+    }
+    if cfg.gptq_scale_refit == ScaleRefitMode::InLoop && !cfg.activation_aware {
+        bail!("--gptq-scale-refit in-loop requires --activation-aware");
     }
     if cfg.calib.is_none() && cfg.fold_alpha != 0.0 {
         bail!(
@@ -286,7 +293,15 @@ pub(crate) fn run(model: &Path, out: &Path, cfg: &ConvertConfig) -> Result<()> {
                 .gptq_decay
                 .unwrap_or_else(|| tritium_nn::salt_fit::auto_decay(calibration_tokens, k));
             let tensor_cfg = ActivationAwareConfig { decay, ..fit_cfg };
-            fit_tensor(w, rows, k, g.for_slot(li, slot), &tensor_cfg).map(|fits| (fits, decay))
+            fit_tensor_with_scale_refit_mode(
+                w,
+                rows,
+                k,
+                g.for_slot(li, slot),
+                &tensor_cfg,
+                cfg.gptq_scale_refit,
+            )
+            .map(|fits| (fits, decay))
         }) {
             Some((fits, decay)) => {
                 activation_aware_tensors += 1;
@@ -429,7 +444,13 @@ pub(crate) fn run(model: &Path, out: &Path, cfg: &ConvertConfig) -> Result<()> {
                 if ramp { " ramped" } else { "" }
             ),
         };
-        format!("activation-metric fit on {activation_aware_tensors} projections, {decay_desc}")
+        let scale_refit = match cfg.gptq_scale_refit {
+            ScaleRefitMode::PostPass => "post-pass scale refit",
+            ScaleRefitMode::InLoop => "in-loop scale refit",
+        };
+        format!(
+            "activation-metric fit on {activation_aware_tensors} projections, {decay_desc}, {scale_refit}"
+        )
     } else {
         "nearest-point fit".to_owned()
     };
@@ -559,6 +580,14 @@ fn write_receipt(
             "rotation_group": if cfg.ladder.rotate { Some(cfg.ladder.group) } else { None },
             "fold_alpha": if cfg.calib.is_some() { cfg.fold_alpha } else { 0.0 },
             "calibration": fold_desc,
+            "gptq_scale_refit": if cfg.activation_aware {
+                match cfg.gptq_scale_refit {
+                    ScaleRefitMode::PostPass => "post-pass",
+                    ScaleRefitMode::InLoop => "in-loop",
+                }
+            } else {
+                "not-applicable"
+            },
         },
         "cost": {
             "parameters": total_params,
@@ -724,4 +753,36 @@ fn write_f32_safetensors(tensors: &[(String, &[f32])]) -> Vec<u8> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn in_loop_scale_refit_requires_activation_aware_conversion() {
+        let config = ConvertConfig {
+            calib: None,
+            calib_tokens: 4096,
+            fold_alpha: 0.0,
+            ladder: LadderConfig {
+                planes: 3,
+                group: 256,
+                grid: 16,
+                rotate: true,
+            },
+            dense_container: false,
+            activation_aware: false,
+            gptq_decay: None,
+            gptq_scale_refit: ScaleRefitMode::InLoop,
+            gptq_decay_ramp: false,
+        };
+        let error = run(
+            Path::new("not-a-model"),
+            Path::new("unused-output"),
+            &config,
+        )
+        .expect_err("in-loop refit must require activation-aware fitting");
+        assert!(error.to_string().contains("requires --activation-aware"));
+    }
 }
