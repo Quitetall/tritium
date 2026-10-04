@@ -134,32 +134,42 @@ jobs:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v6.0.0
         with:
           pattern: wheel-{linux-x86_64,macos-aarch64,windows-x64}
-          path: downloads/wheels
+          path: ${{ runner.temp }}/tritium-candidate-${{ github.run_id }}/downloads/wheels
           merge-multiple: true
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v6.0.0
         with:
           name: candidate-package-evidence
-          path: downloads/package-evidence
+          path: ${{ runner.temp }}/tritium-candidate-${{ github.run_id }}/downloads/package-evidence
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v6.0.0
         with:
           name: abi3-compatibility-receipt
-          path: downloads/compatibility-evidence
+          path: ${{ runner.temp }}/tritium-candidate-${{ github.run_id }}/downloads/compatibility-evidence
+      - name: set isolated staging root
+        id: staging
+        env:
+          RUNNER_TEMP: ${{ runner.temp }}
+          RUN_ID: ${{ github.run_id }}
+        shell: bash
+        run: printf 'root=%s/tritium-candidate-%s\n' "$RUNNER_TEMP" "$RUN_ID" >> "$GITHUB_OUTPUT"
       - name: test candidate staging contract
         run: python3 -m unittest scripts.tests.test_stage_release_candidate -v
       - name: separate candidate payload and evidence receipts
         run: >-
           python3 scripts/stage-release-candidate.py
-          --downloads downloads --payload candidate --evidence evidence
+          --downloads "${{ steps.staging.outputs.root }}/downloads"
+          --payload "${{ steps.staging.outputs.root }}/candidate"
+          --evidence "${{ steps.staging.outputs.root }}/evidence"
       - name: assert complete wheel platform set
         env:
           RELEASE_VERSION: ${{ needs.resolve.outputs.version }}
+          STAGING_ROOT: ${{ steps.staging.outputs.root }}
         shell: bash
         run: |
           set -euo pipefail
           pep440="$(printf '%s' "$RELEASE_VERSION" | tr -d '-' | sed 's/rc\./rc/')"
           dist="$(python3 -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("crates/tritium-py/pyproject.toml").read_text())["project"]["name"].replace("-","_"))')"
           count=0
-          for wheel in candidate/*.whl; do
+          for wheel in "$STAGING_ROOT"/candidate/*.whl; do
             count=$((count + 1))
             case "$(basename "$wheel")" in
               "$dist"-"$pep440"-*) ;;
@@ -168,7 +178,7 @@ jobs:
           done
           [ "$count" -eq 3 ] || { echo "::error::expected 3 platform wheels, got $count"; exit 1; }
           for platform in manylinux_2_28_x86_64 macosx_11_0_arm64 win_amd64; do
-            compgen -G "candidate/*-$platform.whl" >/dev/null || {
+            compgen -G "$STAGING_ROOT/candidate/*-$platform.whl" >/dev/null || {
               echo "::error::missing wheel platform $platform"; exit 1;
             }
           done
@@ -180,6 +190,7 @@ jobs:
           SOURCE_REVISION: ${{ needs.resolve.outputs.revision }}
           BUILDER_ID: https://github.com/${{ github.repository }}/actions/workflows/release-candidate.yml
           INVOCATION_ID: github-${{ github.run_id }}-${{ github.run_attempt }}
+          STAGING_ROOT: ${{ steps.staging.outputs.root }}
         shell: bash
         run: |
           set -euo pipefail
@@ -187,28 +198,28 @@ jobs:
           tritium_bin="$target_dir/release/tritium"
           test -x "$tritium_bin"
           python3 scripts/generate-release-inputs.py \
-            --staged candidate \
+            --staged "$STAGING_ROOT/candidate" \
             --release "$RELEASE_VERSION" \
             --source-revision "$SOURCE_REVISION" \
             --builder-id "$BUILDER_ID" \
             --invocation-id "$INVOCATION_ID" \
-            --output candidate-inputs.json
+            --output "$STAGING_ROOT/candidate-inputs.json"
           python3 scripts/assemble-release-candidate.py \
-            --inputs candidate-inputs.json \
-            --output candidate/manifest.json \
+            --inputs "$STAGING_ROOT/candidate-inputs.json" \
+            --output "$STAGING_ROOT/candidate/manifest.json" \
             --digest-tool "$tritium_bin"
           scripts/release-status \
-            --candidate candidate/manifest.json \
+            --candidate "$STAGING_ROOT/candidate/manifest.json" \
             --digest-tool "$tritium_bin"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: tritium-candidate-${{ needs.resolve.outputs.revision }}
-          path: candidate/
+          path: ${{ steps.staging.outputs.root }}/candidate/
           if-no-files-found: error
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: tritium-candidate-evidence-${{ needs.resolve.outputs.revision }}
           path: |
-            candidate-inputs.json
-            evidence/
+            ${{ steps.staging.outputs.root }}/candidate-inputs.json
+            ${{ steps.staging.outputs.root }}/evidence/
           if-no-files-found: error
