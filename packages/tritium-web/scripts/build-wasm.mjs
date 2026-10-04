@@ -26,6 +26,31 @@ export function resolveCargoTargetDirectory(
   return resolve(repositoryRoot, configured);
 }
 
+export async function resolveEffectiveCargoTargetDirectory(
+  environment = process.env,
+  repositoryRoot = repository,
+) {
+  if (environment.CARGO_TARGET_DIR !== undefined) {
+    return resolveCargoTargetDirectory(environment, repositoryRoot);
+  }
+
+  const { stdout } = await run(
+    "cargo",
+    ["metadata", "--no-deps", "--format-version", "1"],
+    { cwd: repositoryRoot, env: environment },
+  );
+  let metadata;
+  try {
+    metadata = JSON.parse(stdout);
+  } catch {
+    throw new Error("Cargo metadata returned invalid JSON while resolving target directory");
+  }
+  if (typeof metadata.target_directory !== "string" || metadata.target_directory.length === 0) {
+    throw new Error("Cargo metadata omitted its effective target directory");
+  }
+  return resolve(metadata.target_directory);
+}
+
 export function canonicalSourceIdentity(head, status) {
   const revision = typeof head === "string" ? head.trim() : "";
   if (!/^[0-9a-f]{40}$/.test(revision)) {
@@ -95,10 +120,8 @@ function assertLinearMemoryMaximum(bytes) {
 }
 
 export async function buildPortableWasm(output) {
-  const guest = resolve(
-    resolveCargoTargetDirectory(),
-    "wasm32-unknown-unknown/release/tritium_wasm.wasm",
-  );
+  const targetDirectory = await resolveEffectiveCargoTargetDirectory();
+  const guest = resolve(targetDirectory, "wasm32-unknown-unknown/release/tritium_wasm.wasm");
   await mkdir(generated, { recursive: true });
   const sourceIdentity = await resolveSourceIdentity();
   await run(

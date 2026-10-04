@@ -1,11 +1,16 @@
 import assert from "node:assert/strict";
-import { resolve } from "node:path";
+import { execFileSync } from "node:child_process";
+import { dirname, resolve } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import {
   canonicalSourceIdentity,
   resolveCargoTargetDirectory,
+  resolveEffectiveCargoTargetDirectory,
 } from "../scripts/build-wasm.mjs";
+
+const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 
 test("WASM build reads guest from Cargo's effective target directory", () => {
   const repository = resolve("/tmp", "tritium-target-fixture");
@@ -24,6 +29,19 @@ test("WASM build reads guest from Cargo's effective target directory", () => {
   assert.throws(
     () => resolveCargoTargetDirectory({ CARGO_TARGET_DIR: "" }, repository),
     /non-empty filesystem path/,
+  );
+});
+
+test("effective WASM target directory honors Cargo configuration", async () => {
+  const metadata = JSON.parse(
+    execFileSync("cargo", ["metadata", "--no-deps", "--format-version", "1"], {
+      cwd: repositoryRoot,
+      encoding: "utf8",
+    }),
+  );
+  assert.equal(
+    await resolveEffectiveCargoTargetDirectory({}, repositoryRoot),
+    resolve(metadata.target_directory),
   );
 });
 
