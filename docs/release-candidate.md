@@ -114,8 +114,6 @@ does not qualify a real ORT session or whole-Qwen generation. These are
 current-revision local package checks, not the cross-platform matrix, aggregate
 package gate, or independent release qualification.
 
-### ONNX Python facade source regression refresh (2026-10-04)
-
 ### Current-head CPU manylinux wheel refresh (2026-10-04)
 
 The exact clean candidate worktree at
@@ -145,6 +143,8 @@ fake native runtime, not a real ONNX Runtime session or whole-Qwen execution.
 These checks are local candidate-revision package evidence only. They do not
 close the aggregate package gate, cross-platform matrix, real-Qwen ONNX,
 model-quality or independent-release gates.
+
+### ONNX Python facade source regression refresh (2026-10-04)
 
 ### ONNX Python facade source regression refresh (2026-10-04)
 
