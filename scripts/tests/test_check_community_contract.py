@@ -5,6 +5,7 @@ from pathlib import Path
 import runpy
 import tempfile
 import unittest
+from urllib.parse import unquote, urlsplit
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -14,6 +15,40 @@ CommunityContractError = MODULE["CommunityContractError"]
 check_local_link = MODULE["_check_local_link"]
 github_anchors = MODULE["_github_anchors"]
 check_public_docs = MODULE["_check_public_docs"]
+governance_files = MODULE["GOVERNANCE_FILES"]
+markdown_targets = MODULE["_targets"]
+
+
+def copy_contract_fixture(destination: Path) -> None:
+    """Copy only governance inputs and their local-link targets for mutation tests."""
+    checked = {ROOT / "README.md", ROOT / "CONTRIBUTING.md"}
+    checked.update(ROOT / relative for relative in governance_files)
+    checked.update((ROOT / "docs" / "book" / "src").rglob("*.md"))
+
+    paths = {path.relative_to(ROOT) for path in checked}
+    for source in checked:
+        try:
+            text = source.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        for target in markdown_targets(text):
+            parsed = urlsplit(target)
+            if parsed.scheme or parsed.netloc or not parsed.path:
+                continue
+            resolved = (source.parent / unquote(parsed.path)).resolve()
+            try:
+                paths.add(resolved.relative_to(ROOT))
+            except ValueError:
+                continue
+
+    for relative in sorted(paths, key=lambda path: (len(path.parts), path.as_posix())):
+        source = ROOT / relative
+        target = destination / relative
+        if source.is_dir():
+            shutil.copytree(source, target, dirs_exist_ok=True)
+        elif source.is_file():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
 
 
 class CommunityContractTests(unittest.TestCase):
@@ -75,7 +110,7 @@ class CommunityContractTests(unittest.TestCase):
     def test_broken_local_link_fails_closed(self):
         with tempfile.TemporaryDirectory() as raw:
             repo = Path(raw) / "repo"
-            shutil.copytree(ROOT, repo, ignore=shutil.ignore_patterns(".git", "target"))
+            copy_contract_fixture(repo)
             path = repo / "SUPPORT.md"
             path.write_text(
                 path.read_text(encoding="utf-8").replace(
@@ -90,7 +125,7 @@ class CommunityContractTests(unittest.TestCase):
     def test_contact_route_cannot_drift(self):
         with tempfile.TemporaryDirectory() as raw:
             repo = Path(raw) / "repo"
-            shutil.copytree(ROOT, repo, ignore=shutil.ignore_patterns(".git", "target"))
+            copy_contract_fixture(repo)
             path = repo / "SECURITY.md"
             path.write_text(
                 path.read_text(encoding="utf-8").replace(
@@ -104,7 +139,7 @@ class CommunityContractTests(unittest.TestCase):
     def test_public_unstaffed_channel_is_rejected(self):
         with tempfile.TemporaryDirectory() as raw:
             repo = Path(raw) / "repo"
-            shutil.copytree(ROOT, repo, ignore=shutil.ignore_patterns(".git", "target"))
+            copy_contract_fixture(repo)
             path = repo / "COMMUNITY.md"
             path.write_text(
                 path.read_text(encoding="utf-8")
