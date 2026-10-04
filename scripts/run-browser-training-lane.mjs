@@ -41,6 +41,13 @@ const CHROME_WEBGPU_ARGS = Object.freeze([
   "--enable-unsafe-webgpu",
   "--enable-features=Vulkan",
 ]);
+// Firefox Release keeps WebGPU opt-in on Linux. These preferences apply only
+// to geckodriver's temporary profile; hardware identity and non-fallback
+// checks still reject missing or software adapters.
+const FIREFOX_WEBGPU_PREFS = Object.freeze({
+  "dom.webgpu.enabled": true,
+  "webgl.enable-debug-renderer-info": true,
+});
 const SOFTWARE_MARKERS = ["swiftshader", "llvmpipe", "software", "emulator", "lavapipe", "warp"];
 const MAX_ARCHIVE_BYTES = 512 * 1024 * 1024;
 const MAX_RECEIPT_BYTES = 1024 * 1024;
@@ -575,6 +582,8 @@ export class WebDriverClassicClient {
     };
     if (engine === "chrome") {
       alwaysMatch["goog:chromeOptions"] = { args: [...CHROME_WEBGPU_ARGS] };
+    } else if (engine === "firefox") {
+      alwaysMatch["moz:firefoxOptions"] = { prefs: { ...FIREFOX_WEBGPU_PREFS } };
     }
     const value = await this.request("POST", "/session", {
       capabilities: { alwaysMatch },

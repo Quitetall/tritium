@@ -502,6 +502,12 @@ test("classic WebDriver client uses W3C session and async-script routes", async 
       requests[0].body.capabilities.alwaysMatch["goog:chromeOptions"].args,
       ["--enable-unsafe-webgpu", "--enable-features=Vulkan"],
     );
+    const firefoxSession = await client.createSession("firefox");
+    await client.deleteSession(firefoxSession.id);
+    assert.deepEqual(
+      requests[5].body.capabilities.alwaysMatch["moz:firefoxOptions"].prefs,
+      { "dom.webgpu.enabled": true, "webgl.enable-debug-renderer-info": true },
+    );
   } finally {
     await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
   }
