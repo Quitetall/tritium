@@ -144,6 +144,28 @@ These checks are local candidate-revision package evidence only. They do not
 close the aggregate package gate, cross-platform matrix, real-Qwen ONNX,
 model-quality or independent-release gates.
 
+### Current-revision browser npm archive (2026-10-04)
+
+At clean detached source revision
+`7867ee606b1c273e7dc2b72e762db4fba79fdb1d`, the offline browser package
+workflow passed with `npm run check`: generated-file checks, the pinned WASM
+build, strict TypeScript, package build, 145 Node tests, and archive
+verification. The locally built runtime was Node `v24.21.0` with npm `12.0.2`;
+this does not establish a Node 22 run or the cross-platform package matrix.
+
+The exact archive is
+`/mnt/2tb/tritium-npm-archive-7867ee60/tritium-ai-web-1.1.0-rc.2.tgz`,
+627,367 bytes, SHA-256
+`1d6363c21e49ffcbb80ddbd85f9eb4857706f43779070d3606aa4d154459200b`.
+Its strict npm qualification receipt
+`/mnt/2tb/tritium-npm-archive-7867ee60/npm-archive-receipt.json` validated
+with receipt ID
+`sha256:30ecad1f696cc44005a5426147517613ec73ed576e91c996c504309ea98d4659`.
+The package-lock CycloneDX SBOM was reproduced exactly from the archive-bound
+receipt and locked dependency inventory; it contains 49 dependency components.
+This is local package evidence, not a physical-browser WebGPU result or a
+release-candidate package-matrix pass.
+
 ### ONNX Python facade source regression refresh (2026-10-04)
 
 ### ONNX Python facade source regression refresh (2026-10-04)
