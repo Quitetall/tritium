@@ -353,6 +353,21 @@ jobs:
         with:
           tool: wasmtime
       - run: cargo test --locked --target wasm32-wasip1 -p tritium-wasm
+      - name: Seal portable-training receipts inside WASI guest
+        shell: bash
+        run: |
+          version="$(wasmtime --version | awk '{print $2}')"
+          arch="$(uname -m)"
+          test -n "$version"
+          TRITIUM_WASM_PHYSICAL_DEVICE="wasmtime:${version}:${arch}" \
+            cargo run --locked --release --target wasm32-wasip1 -p tritium-wasm \
+            --example seal_wasi_training_receipts -- release/v1.1/ci-wasi-training-receipts
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: wasi-training-receipts-${{ github.sha }}
+          path: release/v1.1/ci-wasi-training-receipts/*.json
+          if-no-files-found: error
+          retention-days: 90
 
   # wgpu lane (v0.70 backend breadth). Self-hosted, manual — runs only where a
   # Vulkan adapter + driver are present (the 4090 box). Mirrors the disabled `gpu`
