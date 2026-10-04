@@ -1,6 +1,11 @@
 //! Public-seam tests for streamed SALT V2 block/sliding output reconstruction.
 
-use tritium_format::ModelId;
+use half::f16;
+use tritium_format::{
+    ModelId,
+    salt_v2::SaltV2Codec,
+    salt_v2_package::{SaltV2Package, SaltV2Plane, SaltV2ScaleUpdate, SaltV2Tensor, SaltV2Tile},
+};
 use tritium_quantize::{
     FixedTritScaleRefitAccumulator, OutputObjectiveWeights, OutputReconstructionAccumulator,
     OutputReconstructionError, OutputReconstructionSchedule, OutputReconstructionScope,
@@ -175,6 +180,21 @@ fn fixed_trit_scale_refit_finds_nonnegative_scales_without_retaining_batches() {
     assert_eq!(result.observations(), 2);
     assert_eq!(result.scales(), &[2.0, 3.0]);
     assert_eq!(result.squared_error(), 0.0);
+
+    let plane = SaltV2Plane::new(vec![1; 256], vec![f16::ONE, f16::ONE]).unwrap();
+    let tensor = SaltV2Tensor::new(
+        "weight",
+        vec![256],
+        vec![SaltV2Tile::new(vec![plane]).unwrap()],
+    )
+    .unwrap();
+    let mut package = SaltV2Package::new(SaltV2Codec::D2, vec![tensor]).unwrap();
+    let update = SaltV2ScaleUpdate::new(0, 0, 0, result.to_f16_scales().unwrap()).unwrap();
+    package.apply_scale_updates(&[update]).unwrap();
+    assert_eq!(
+        package.tensors()[0].tiles()[0].planes()[0].scales(),
+        &[f16::from_f32(2.0), f16::from_f32(3.0)]
+    );
 }
 
 #[test]
@@ -185,6 +205,18 @@ fn fixed_trit_scale_refit_never_uses_negative_scales() {
 
     assert_eq!(result.scales(), &[0.0]);
     assert_eq!(result.squared_error(), 4.0);
+}
+
+#[test]
+fn fixed_trit_scale_refit_rejects_f16_overflow() {
+    let mut fit = FixedTritScaleRefitAccumulator::new(1, 2).expect("valid refit");
+    fit.observe(&[1.0], 100_000.0).expect("valid output row");
+    let result = fit.finish().expect("finite f64 fit");
+
+    assert_eq!(
+        result.to_f16_scales(),
+        Err(OutputReconstructionError::ScaleNotRepresentable)
+    );
 }
 
 fn exact_candidate(

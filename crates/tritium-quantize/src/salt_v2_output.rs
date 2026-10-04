@@ -756,6 +756,31 @@ impl FixedTritScaleRefit {
         &self.scales
     }
 
+    /// Convert fitted scales to the package's stored f16 precision.
+    ///
+    /// Package application still validates group-specific zero-scale
+    /// constraints against the fixed trits.
+    ///
+    /// # Errors
+    /// Rejects an invalid or non-finite f64 scale or one that overflows f16.
+    pub fn to_f16_scales(&self) -> Result<Vec<half::f16>, OutputReconstructionError> {
+        let mut scales = Vec::new();
+        scales
+            .try_reserve_exact(self.scales.len())
+            .map_err(|_| OutputReconstructionError::ReceiptAllocationFailed)?;
+        for &scale in &self.scales {
+            if !scale.is_finite() || scale < 0.0 {
+                return Err(OutputReconstructionError::NonFiniteScaleRefit);
+            }
+            let stored = half::f16::from_f64(scale);
+            if !stored.is_finite() || stored.to_bits() & 0x8000 != 0 {
+                return Err(OutputReconstructionError::ScaleNotRepresentable);
+            }
+            scales.push(stored);
+        }
+        Ok(scales)
+    }
+
     /// Sum of squared output error over observed calibration rows.
     #[must_use]
     pub const fn squared_error(&self) -> f64 {
@@ -1351,6 +1376,8 @@ pub enum OutputReconstructionError {
     InvalidScaleRefit,
     /// Fixed-trit scale refit accumulated a non-finite intermediate or result.
     NonFiniteScaleRefit,
+    /// A fitted f64 scale cannot be represented by the package's f16 scale field.
+    ScaleNotRepresentable,
 }
 
 impl fmt::Display for OutputReconstructionError {
@@ -1426,6 +1453,9 @@ impl fmt::Display for OutputReconstructionError {
             Self::InvalidScaleRefit => formatter.write_str("fixed-trit scale refit is invalid"),
             Self::NonFiniteScaleRefit => {
                 formatter.write_str("fixed-trit scale refit became non-finite")
+            }
+            Self::ScaleNotRepresentable => {
+                formatter.write_str("fixed-trit scale cannot be represented as f16")
             }
         }
     }

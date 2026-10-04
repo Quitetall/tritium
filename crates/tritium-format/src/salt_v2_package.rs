@@ -113,6 +113,34 @@ fn validate_scale_group_size(scale_group_size: usize) -> Result<(), SaltV2Packag
     }
 }
 
+fn validate_plane_scales(
+    trits: &[Trit],
+    scales: &[f16],
+    scale_group_size: usize,
+) -> Result<(), SaltV2PackageError> {
+    for (group_index, scale) in scales.iter().copied().enumerate() {
+        let value = scale.to_f32();
+        if !value.is_finite() {
+            return Err(SaltV2PackageError::NonFiniteScale {
+                group_index,
+                bits: scale.to_bits(),
+            });
+        }
+        if scale.to_bits() & 0x8000 != 0 {
+            return Err(SaltV2PackageError::NegativeScale {
+                group_index,
+                bits: scale.to_bits(),
+            });
+        }
+        let start = group_index * scale_group_size;
+        let end = (start + scale_group_size).min(trits.len());
+        if scale == f16::ZERO && trits[start..end].iter().any(|trit| !trit.is_zero()) {
+            return Err(SaltV2PackageError::ZeroScaleForNonzeroGroup { group_index });
+        }
+    }
+    Ok(())
+}
+
 /// A validated, zero-point-free additive ternary plane for one allocation tile.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SaltV2Plane {
@@ -167,26 +195,7 @@ impl SaltV2Plane {
             });
         }
 
-        for (group_index, scale) in scales.iter().copied().enumerate() {
-            let value = scale.to_f32();
-            if !value.is_finite() {
-                return Err(SaltV2PackageError::NonFiniteScale {
-                    group_index,
-                    bits: scale.to_bits(),
-                });
-            }
-            if scale.to_bits() & 0x8000 != 0 {
-                return Err(SaltV2PackageError::NegativeScale {
-                    group_index,
-                    bits: scale.to_bits(),
-                });
-            }
-            let start = group_index * scale_group_size;
-            let end = (start + scale_group_size).min(trits.len());
-            if scale == f16::ZERO && trits[start..end].iter().any(|trit| !trit.is_zero()) {
-                return Err(SaltV2PackageError::ZeroScaleForNonzeroGroup { group_index });
-            }
-        }
+        validate_plane_scales(&trits, &scales, scale_group_size)?;
 
         Ok(Self {
             trits,
@@ -205,6 +214,17 @@ impl SaltV2Plane {
     #[must_use]
     pub fn scales(&self) -> &[f16] {
         &self.scales
+    }
+
+    fn validate_replacement_scales(&self, scales: &[f16]) -> Result<(), SaltV2PackageError> {
+        let expected = self.trits.len().div_ceil(self.scale_group_size);
+        if scales.len() != expected {
+            return Err(SaltV2PackageError::WrongScaleCount {
+                expected,
+                got: scales.len(),
+            });
+        }
+        validate_plane_scales(&self.trits, scales, self.scale_group_size)
     }
 
     /// Number of coefficients sharing each zero-point-free scale.
@@ -717,6 +737,63 @@ pub struct SaltV2Package {
     tensors: Vec<SaltV2Tensor>,
 }
 
+/// Replacement scales for one plane in a semantic SALT V2 package.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SaltV2ScaleUpdate {
+    tensor_index: usize,
+    tile_index: usize,
+    plane_index: usize,
+    scales: Vec<f16>,
+}
+
+impl SaltV2ScaleUpdate {
+    /// Create one indexed scale replacement.
+    ///
+    /// # Errors
+    /// Rejects an empty scale vector. Package application validates the target
+    /// and exact scale count and rejects duplicate targets atomically.
+    pub fn new(
+        tensor_index: usize,
+        tile_index: usize,
+        plane_index: usize,
+        scales: Vec<f16>,
+    ) -> Result<Self, SaltV2PackageError> {
+        if scales.is_empty() {
+            return Err(SaltV2PackageError::InvalidScaleUpdate);
+        }
+        Ok(Self {
+            tensor_index,
+            tile_index,
+            plane_index,
+            scales,
+        })
+    }
+
+    /// Package-order tensor index.
+    #[must_use]
+    pub const fn tensor_index(&self) -> usize {
+        self.tensor_index
+    }
+
+    /// Tensor-local allocation tile index.
+    #[must_use]
+    pub const fn tile_index(&self) -> usize {
+        self.tile_index
+    }
+
+    /// Tile-local plane index.
+    #[must_use]
+    pub const fn plane_index(&self) -> usize {
+        self.plane_index
+    }
+
+    /// Replacement f16 scales in the plane's canonical group order.
+    #[must_use]
+    pub fn scales(&self) -> &[f16] {
+        &self.scales
+    }
+}
+
 impl SaltV2Package {
     /// Construct a package and reject duplicate tensor names.
     ///
@@ -818,6 +895,61 @@ impl SaltV2Package {
             )?);
         }
         Self::new(self.codec, prefix_tensors)
+    }
+
+    /// Apply indexed f16 scale updates in place while preserving every trit.
+    ///
+    /// Targets must be in canonical `(tensor, tile, plane)` order. The entire
+    /// set is validated before any scale changes. Invalid indices, duplicate or
+    /// out-of-order targets, or replacement scales reject the set without
+    /// partial mutation. Only target scales are copied; neither the package nor
+    /// an auxiliary target set is allocated.
+    ///
+    /// # Errors
+    /// Rejects empty or noncanonical update order, unknown targets, or malformed
+    /// scales.
+    pub fn apply_scale_updates(
+        &mut self,
+        updates: &[SaltV2ScaleUpdate],
+    ) -> Result<(), SaltV2PackageError> {
+        if updates.is_empty() {
+            return Err(SaltV2PackageError::InvalidScaleUpdate);
+        }
+        let mut previous_target = None;
+        for update in updates {
+            let target = (update.tensor_index, update.tile_index, update.plane_index);
+            if let Some(previous) = previous_target {
+                if target == previous {
+                    return Err(SaltV2PackageError::DuplicateScaleUpdate);
+                }
+                if target < previous {
+                    return Err(SaltV2PackageError::NonCanonicalScaleUpdateOrder);
+                }
+            }
+            previous_target = Some(target);
+        }
+
+        for update in updates {
+            let tensor = self
+                .tensors
+                .get(update.tensor_index)
+                .ok_or(SaltV2PackageError::ScaleUpdateTargetOutOfBounds)?;
+            let tile = tensor
+                .tiles
+                .get(update.tile_index)
+                .ok_or(SaltV2PackageError::ScaleUpdateTargetOutOfBounds)?;
+            let plane = tile
+                .planes
+                .get(update.plane_index)
+                .ok_or(SaltV2PackageError::ScaleUpdateTargetOutOfBounds)?;
+            plane.validate_replacement_scales(&update.scales)?;
+        }
+        for update in updates {
+            let plane = &mut self.tensors[update.tensor_index].tiles[update.tile_index].planes
+                [update.plane_index];
+            plane.scales.copy_from_slice(&update.scales);
+        }
+        Ok(())
     }
 }
 
@@ -1232,6 +1364,14 @@ pub enum SaltV2PackageError {
         /// Source plane count.
         available: usize,
     },
+    /// A scale-update set or scale vector was empty.
+    InvalidScaleUpdate,
+    /// More than one replacement targeted the same tensor/tile/plane.
+    DuplicateScaleUpdate,
+    /// Scale update targets were not in canonical tensor/tile/plane order.
+    NonCanonicalScaleUpdateOrder,
+    /// A scale update referenced a tensor, tile, or plane outside the package.
+    ScaleUpdateTargetOutOfBounds,
     /// Physical length arithmetic overflowed.
     LengthOverflow,
     /// A requested allocation could not be reserved.
@@ -1418,6 +1558,16 @@ impl fmt::Display for SaltV2PackageError {
                 f,
                 "prefix tensor {tensor_index} tile {tile_index} requests {requested} of {available} planes"
             ),
+            Self::InvalidScaleUpdate => write!(f, "SALT V2 scale update is empty"),
+            Self::DuplicateScaleUpdate => {
+                write!(f, "SALT V2 scale update target is duplicated")
+            }
+            Self::NonCanonicalScaleUpdateOrder => {
+                write!(f, "SALT V2 scale update targets are not in canonical order")
+            }
+            Self::ScaleUpdateTargetOutOfBounds => {
+                write!(f, "SALT V2 scale update target is outside the package")
+            }
             Self::LengthOverflow => write!(f, "SALT V2 package length arithmetic overflow"),
             Self::AllocationFailed => write!(f, "SALT V2 package allocation failed"),
             Self::Codec(error) => write!(f, "SALT V2 codec error: {error}"),
