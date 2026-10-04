@@ -216,7 +216,7 @@ Kubernetes deployment, or model quality. The matching local check
 --all-targets -- -D warnings` also passed. These are contributor-run software
 checks, not independent release receipts; the serving gates below remain open.
 
-### Flagship campaign status refresh (2026-10-03)
+### Flagship campaign status refresh (2026-10-04)
 
 The canonical read-only probe was rerun against the durable workspace
 `/mnt/4tb/tritium-qwen36-campaign-20260813` with
@@ -228,6 +228,16 @@ the prior provenance finding: the legacy S2KF evidence is not admitted for
 fitting without a source-bound capture transcript or a recapture from the
 approved calibration pack. No campaign was started or modified for this
 refresh.
+
+The probe was repeated on 2026-10-04. It again reports `stalled`, 0/506
+published masters, zero seals, and the same 447,083,070-byte temporary record
+with a dead recorded PID. The durable workspace contains 506 `.s2kf` capture
+records (about 3.8 GiB); these are activation/evidence records, not fitted
+master tensors. The source-admission receipt describes 27,318,026,240
+additive coefficients across the 506 target tensors, but a matching tensor
+count does not establish that these old captures used the approved 512-sequence
+calibration pack. The capture-binding receipt is still missing. The campaign
+was not restarted, and no fitting or model replay was run.
 
 ### Local pinned-checkpoint inventory refresh (2026-10-04)
 
