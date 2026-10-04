@@ -1031,6 +1031,32 @@ Verification requires:
 - digest-bound in-toto/SLSA v1 provenance tied to artifact SHA-256, source
   revision and builder identity.
 
+### Pre-tag candidate assembly (artifact-only)
+
+The `release-candidate` workflow builds the release package set from one exact
+commit and assembles the same candidate manifest before a release tag exists.
+Dispatch it from the default branch with a full commit SHA:
+
+```bash
+gh workflow run release-candidate.yml --ref main \
+  --field source_revision="$(git rev-parse HEAD)"
+```
+
+The workflow validates the checked-out commit and RC version, runs the reusable
+wheel matrix plus crate/npm qualification, and strictly reopens the assembled
+candidate with `scripts/release-status`. Download
+`tritium-candidate-<revision>` for the candidate directory and
+`tritium-candidate-evidence-<revision>` for the exact input document and
+qualification receipts. The evidence directory is intentionally separate from
+the candidate payload: release-status rejects unmanifested files inside that
+payload.
+
+This workflow has read-only repository permissions and does not publish to
+PyPI, crates.io, npm, or GitHub Releases, create or move tags, or claim whole-
+model, hardware, quality, independent-review, or release readiness. It makes
+exact-source packaging evidence available before a maintainer decides whether
+to proceed with a public release.
+
 For the browser package, build the exact npm archive first, then generate its
 closed CycloneDX inventory from archive bytes. The generator rejects path
 traversal, links, duplicate members, package identity drift and unsafe archive
