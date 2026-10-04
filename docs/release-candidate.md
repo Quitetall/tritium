@@ -84,6 +84,16 @@ did not run this tutorial. It therefore verifies installed Tritium wheel
 behavior on this host, but not a self-contained dependency environment or the
 cross-platform CUDA packaging matrix.
 
+### ONNX Python facade source regression refresh (2026-10-04)
+
+`python -m pytest crates/tritium-py/tests/test_torch_onnx.py -q` passed 22
+tests on the current source checkout. The tests cover strict manifest admission,
+typed artifact routing, batch-one forward and MTP calls, greedy cached
+generation, and rejection of unsupported training/export modes. This is a
+source-tree API regression check only: it does not execute the candidate
+installed wheel, export a real authenticated Qwen bundle, or qualify whole-model
+Qwen generation. Those candidate-bound ONNX gates remain open.
+
 ### Serving software regression refresh (2026-10-04)
 
 At source revision `c12812ada218dfbd8cfb524e31852b09deab18df`, the local
