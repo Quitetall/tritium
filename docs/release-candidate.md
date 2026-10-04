@@ -166,6 +166,28 @@ receipt and locked dependency inventory; it contains 49 dependency components.
 This is local package evidence, not a physical-browser WebGPU result or a
 release-candidate package-matrix pass.
 
+### Physical browser WebGPU lane fragments (2026-10-04)
+
+The exact RC.2 npm archive for clean source revision
+`7523eb94e4d9d092eee78c155daa4ef0d2473d63` (627,893 bytes, SHA-256
+`f9a869590467156dbb7d9aee83ff7eeb0d8b37246e95442ae5eb6243cef5cda4`) was
+run through the physical WebGPU WebDriver lane in Chrome 154.0.8037.92 and
+Firefox 157. Both traces report all 72 valid and 45 expected-invalid vectors,
+zero skipped cases, the complete prepare/forward/backward/step/checkpoint/
+resume/export/reload lifecycle, all six injected fault classes, zero
+steady-state readbacks, and an exported artifact byte-identical to the native
+reference. Chrome reports an NVIDIA RTX 4090 adapter. Firefox reports a
+browser-sanitized NVIDIA renderer string; its exact adapter model is unknown.
+
+The lane fragments and npm archive are retained at
+`/mnt/2tb/tritium-v11-browser-7523eb94/`. Trace SHA-256 values are
+`90ca8a1d6f8254760e8d25666b584de418d78474b61188bca8ab464caa288903` (Chrome)
+and `991bca2c5458d8daa90d4688ee74aaaeabffc2109622da9c2d4233a3bcc78ad4`
+(Firefox). These are contributor-run lane fragments, not a combined
+`browser-conformance` receipt: physical Safari, same-candidate aggregation and
+registry admission remain open. This also does not establish Node 22 or
+cross-platform package-matrix coverage.
+
 ### ONNX Python facade source regression refresh (2026-10-04)
 
 ### ONNX Python facade source regression refresh (2026-10-04)
@@ -856,7 +878,7 @@ already exist as an ordinary file — run `trivy image --download-db-only
 | `flagship-qwen` | **NOT CONFIRMED RUNNING — last canonical record says stalled** | `conversion-refinement`, `quality`, `task-retention`, `runtime`, `physical-bytes` | The last canonical campaign probe found 0/506 published masters and no completion seal (see the 2026-09-29 refresh above). Its former `/mnt/4tb/tmp` workspace is no longer at the recorded path. Revalidate workspace location and calibration provenance before any resume; Stage 7 recipe freeze is a prerequisite. |
 | `stage7-freeze` | NONE | `stage7-recipe-freeze` | Complete the 1.7B recipe freeze before unsealing/running the pinned Qwen flagship, as required by plan 0043. |
 | `onnx` | NONE | `onnx-inference` | Whole-Qwen ONNX execution traces — downstream of the flagship artifact. |
-| `browser` | NONE | `browser-conformance` | **Three** lanes, all required: `--chrome-lane`, `--firefox-lane`, `--safari-lane`. The Safari lane is gated on a macOS `os.name`, so this needs Apple hardware, not merely a browser. |
+| `browser` | **UNREGISTERED FRAGMENTS** | `browser-conformance` | Chrome and Firefox traces exist for source `7523eb94`, but no combined receipt is registered. **Three** lanes are required: `--chrome-lane`, `--firefox-lane`, `--safari-lane`. Safari is gated on macOS and needs Apple hardware. |
 | `serving` | PARTIAL | `oci-runtime-{cpu,cuda}`, `serving-deployment-{cpu,cuda}` | Both `oci-security-*` kinds are **done** (2026-09-03). The remaining four all need an **admissible serving bundle**, which does not exist on this box: `tritium-serve` rejects the only complete-looking candidate with `InvalidAdmission("manifest package")` because its `tritium.json` carries no top-level `manifest_package_id` and is marked `complete_model: false`. Deployment additionally needs Kubernetes, a Helm chart archive, and a `--bundle-manifest`. |
 | `zoo-community` | NONE | `model-zoo`, `generated-claims`, `governance-docs` | All three come from **one** `qualify-zoo-community.py` call. It requires a `--governance-review` whose `independent_from_maintainers` field must be `True` (`verify-zoo-community-receipt.py:426-429`) and a named reviewer with an `organization` — i.e. a second person. It also requires four frozen model entries, the fourth being the flagship. |
 | `reproduction-signoff` | NONE | `second-machine`, `independent-review` | A second machine, plus a reviewer whose identity differs from the reproduction operator. |
