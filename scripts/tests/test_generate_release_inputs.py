@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import runpy
 import tempfile
@@ -124,6 +125,7 @@ class GenerateReleaseInputsTests(unittest.TestCase):
         with self.assertRaisesRegex(ReleaseInputsError, "ambiguously names artifact"):
             build_inputs(self.staged, **self.args())
 
+    @unittest.skipIf(os.name == "nt", "Windows treats backslash as a path separator")
     def test_rejects_backslash_in_artifact_directory_path(self):
         directory = self.staged / "nested\\folder"
         directory.mkdir()
@@ -137,6 +139,7 @@ class GenerateReleaseInputsTests(unittest.TestCase):
         with self.assertRaisesRegex(ReleaseInputsError, "portable POSIX separators"):
             build_inputs(self.staged, **self.args())
 
+    @unittest.skipIf(os.name == "nt", "Windows treats backslash as a path separator")
     def test_rejects_backslash_in_sbom_directory_path(self):
         filename = "portable.whl"
         (self.staged / filename).write_bytes(b"wheel")
