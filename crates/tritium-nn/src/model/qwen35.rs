@@ -321,6 +321,113 @@ pub(crate) enum Qwen35TextForwardError<E> {
     Observer(E),
 }
 
+/// Paired raw vectors at one sampled token position for an internal PTQ probe.
+#[allow(dead_code)] // Consumed by the receipt-producing Stage-7 probe driver.
+pub(crate) struct Qwen35ProjectionProbeDepth<'a> {
+    /// Zero-based calibration-sequence ordinal.
+    pub(crate) sequence_index: u64,
+    /// One-based token position within that calibration sequence.
+    pub(crate) token_position: usize,
+    /// Dense reference's final-normalized hidden row.
+    pub(crate) reference_hidden: &'a [f32],
+    /// Single-matrix candidate's final-normalized hidden row.
+    pub(crate) candidate_hidden: &'a [f32],
+    /// Dense reference recurrent state at the selected DeltaNet layer.
+    pub(crate) reference_state: &'a [f32],
+    /// Candidate recurrent state at the same DeltaNet layer.
+    pub(crate) candidate_state: &'a [f32],
+}
+
+/// Failure while collecting one-matrix paired Qwen probe vectors.
+#[allow(dead_code)] // Consumed by the receipt-producing Stage-7 probe driver.
+#[derive(Debug)]
+pub(crate) enum Qwen35ProjectionProbeError<E> {
+    Runtime(NnError),
+    Observer(E),
+}
+
+struct Qwen35ProbeDepthOwned {
+    token_position: usize,
+    final_hidden: Vec<f32>,
+    recurrent_state: Vec<f32>,
+}
+
+fn probe_forward_sample(
+    runner: &Qwen35TextRunner,
+    tokens: &[u32],
+    positions: &[usize],
+    state_layer: usize,
+) -> Result<Vec<Qwen35ProbeDepthOwned>, NnError> {
+    let zero_based = positions
+        .iter()
+        .map(|position| position - 1)
+        .collect::<Vec<_>>();
+    let mut recurrent = (0..positions.len())
+        .map(|_| None)
+        .collect::<Vec<Option<Vec<f32>>>>();
+    let mut cache = runner.new_cache(tokens.len())?;
+    let output = match runner.forward_with_block_and_state_observer(
+        tokens,
+        &mut cache,
+        &zero_based,
+        |_, _, _, _| Ok::<_, Infallible>(()),
+        |block, token_position, state| {
+            if usize::try_from(block).ok() == Some(state_layer)
+                && let Ok(sample_index) = zero_based.binary_search(&token_position)
+            {
+                recurrent[sample_index] = Some(state.to_vec());
+            }
+        },
+    ) {
+        Ok(output) => output,
+        Err(Qwen35TextForwardError::Runtime(error)) => return Err(error),
+        Err(Qwen35TextForwardError::Observer(never)) => match never {},
+    };
+
+    let hidden_size = output.hidden_size();
+    let hidden = output.final_hidden_states();
+    let mut samples = Vec::new();
+    samples
+        .try_reserve_exact(positions.len())
+        .map_err(|error| NnError::Backend(format!("allocate Qwen probe samples: {error}")))?;
+    for (sample_index, &token_position) in positions.iter().enumerate() {
+        let row_start = (token_position - 1)
+            .checked_mul(hidden_size)
+            .ok_or(NnError::Shape {
+                expected: usize::MAX,
+                got: hidden.len(),
+            })?;
+        let row_end = row_start.checked_add(hidden_size).ok_or(NnError::Shape {
+            expected: usize::MAX,
+            got: hidden.len(),
+        })?;
+        let hidden_row = hidden.get(row_start..row_end).ok_or(NnError::Shape {
+            expected: row_end,
+            got: hidden.len(),
+        })?;
+        let recurrent_state = recurrent[sample_index].take().ok_or_else(|| {
+            NnError::MissingTensor(format!(
+                "Qwen probe did not observe recurrent state at layer {state_layer}, token {token_position}"
+            ))
+        })?;
+        if hidden_row
+            .iter()
+            .chain(&recurrent_state)
+            .any(|value| !value.is_finite())
+        {
+            return Err(NnError::Backend(
+                "Qwen probe sample contains a non-finite value".to_owned(),
+            ));
+        }
+        samples.push(Qwen35ProbeDepthOwned {
+            token_position,
+            final_hidden: hidden_row.to_vec(),
+            recurrent_state,
+        });
+    }
+    Ok(samples)
+}
+
 impl<E> From<NnError> for Qwen35TextForwardError<E> {
     fn from(error: NnError) -> Self {
         Self::Runtime(error)
@@ -386,6 +493,103 @@ impl Qwen35TextRunner {
         let result = execute(&*guard.runner)?;
         drop(guard);
         Ok(result)
+    }
+
+    /// Stream paired reference/candidate vectors for one projection without
+    /// retaining sequence histories. Each reference and candidate forward gets
+    /// a fresh cache; the candidate projection is restored before observations
+    /// are delivered to the caller. This collects raw samples only and does not
+    /// define a divergence metric or produce campaign evidence.
+    #[allow(dead_code)] // The receipt-producing Stage-7 probe driver will call this.
+    pub(crate) fn visit_projection_probe_pairs<'tokens, I, E>(
+        &mut self,
+        tensor_name: &str,
+        replacement: Projection,
+        sequences: I,
+        one_based_positions: &[usize],
+        state_layer: usize,
+        mut observer: impl FnMut(Qwen35ProjectionProbeDepth<'_>) -> Result<(), E>,
+    ) -> Result<u64, Qwen35ProjectionProbeError<E>>
+    where
+        I: IntoIterator<Item = &'tokens [u32]>,
+    {
+        if one_based_positions.is_empty()
+            || one_based_positions[0] == 0
+            || one_based_positions
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+        {
+            return Err(Qwen35ProjectionProbeError::Runtime(NnError::MissingConfig(
+                "Qwen probe positions must be nonempty, one-based, and strictly increasing".into(),
+            )));
+        }
+        if self.config.layer_types.get(state_layer) != Some(&Qwen35LayerType::DeltaNet) {
+            return Err(Qwen35ProjectionProbeError::Runtime(NnError::MissingConfig(
+                "Qwen probe recurrent-state layer must be DeltaNet".into(),
+            )));
+        }
+        if replacement.clone_salt_v2_resident().is_none() {
+            return Err(Qwen35ProjectionProbeError::Runtime(NnError::MissingConfig(
+                "Qwen probe candidate must use a resident SALT V2 projection".into(),
+            )));
+        }
+
+        let mut sequence_index = 0_u64;
+        for tokens in sequences {
+            if tokens.is_empty()
+                || one_based_positions
+                    .iter()
+                    .any(|position| *position > tokens.len())
+            {
+                return Err(Qwen35ProjectionProbeError::Runtime(NnError::Shape {
+                    expected: one_based_positions.last().copied().unwrap_or(1),
+                    got: tokens.len(),
+                }));
+            }
+            let reference = probe_forward_sample(self, tokens, one_based_positions, state_layer)
+                .map_err(Qwen35ProjectionProbeError::Runtime)?;
+            let candidate_projection = replacement.clone_salt_v2_resident().ok_or_else(|| {
+                Qwen35ProjectionProbeError::Runtime(NnError::MissingConfig(
+                    "Qwen probe SALT V2 resident could not be shared".into(),
+                ))
+            })?;
+            let candidate = self
+                .with_projection_override(tensor_name, candidate_projection, |runner| {
+                    probe_forward_sample(runner, tokens, one_based_positions, state_layer)
+                })
+                .map_err(Qwen35ProjectionProbeError::Runtime)?;
+            if reference.len() != candidate.len() {
+                return Err(Qwen35ProjectionProbeError::Runtime(NnError::Shape {
+                    expected: reference.len(),
+                    got: candidate.len(),
+                }));
+            }
+            for (reference, candidate) in reference.iter().zip(&candidate) {
+                if reference.token_position != candidate.token_position
+                    || reference.final_hidden.len() != candidate.final_hidden.len()
+                    || reference.recurrent_state.len() != candidate.recurrent_state.len()
+                {
+                    return Err(Qwen35ProjectionProbeError::Runtime(NnError::Provenance(
+                        "paired Qwen probe sample coordinates or shapes differ".to_owned(),
+                    )));
+                }
+                observer(Qwen35ProjectionProbeDepth {
+                    sequence_index,
+                    token_position: reference.token_position,
+                    reference_hidden: &reference.final_hidden,
+                    candidate_hidden: &candidate.final_hidden,
+                    reference_state: &reference.recurrent_state,
+                    candidate_state: &candidate.recurrent_state,
+                })
+                .map_err(Qwen35ProjectionProbeError::Observer)?;
+            }
+            sequence_index = sequence_index.checked_add(1).ok_or_else(|| {
+                Qwen35ProjectionProbeError::Runtime(NnError::ResourceExhausted(
+                    "Qwen probe sequence count exceeds u64".into(),
+                ))
+            })?;
+        }
+        Ok(sequence_index)
     }
 
     #[allow(dead_code)] // Used by the crate-internal paired Qwen measurement path.

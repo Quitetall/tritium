@@ -16,10 +16,11 @@ use tritium_spec::TernaryBackend;
 
 use crate::error::NnError;
 use crate::layers::{
-    DenseLinear, Projection, Qwen35DeltaNetWeights, Qwen35FullAttentionWeights, SwiGluMlp,
-    TokenEmbedding,
+    DenseLinear, HostSaltV2Linear, Projection, Qwen35DeltaNetWeights, Qwen35FullAttentionWeights,
+    SwiGluMlp, TokenEmbedding,
 };
 use crate::model::hf_shards::HfShardSet;
+use crate::model::qwen35::{Qwen35ProjectionProbeDepth, Qwen35ProjectionProbeError};
 use crate::model::qwen35_hf_source::{Qwen35HfSource, Qwen35HfSourceIdentity};
 use crate::model::qwen35_mtp_oracle::load_authorized_qwen35_mtp_oracle;
 use crate::model::{
@@ -369,6 +370,33 @@ impl Qwen35HfLanguageModel {
     #[must_use]
     pub const fn runner(&self) -> &Qwen35TextRunner {
         &self.runner
+    }
+
+    /// Visit paired dense-reference and one-matrix SALT V2 samples, sequence by
+    /// sequence. The observer sees only requested final-hidden and recurrent
+    /// state vectors; this method computes no divergence metric and creates no
+    /// measurement receipt.
+    #[allow(dead_code)] // The Stage-7 receipt producer is the next consumer.
+    pub(crate) fn visit_single_matrix_ptq_probe<'tokens, I, E>(
+        &mut self,
+        tensor_name: &str,
+        replacement: std::sync::Arc<HostSaltV2Linear>,
+        sequences: I,
+        one_based_positions: &[usize],
+        state_layer: usize,
+        observer: impl FnMut(Qwen35ProjectionProbeDepth<'_>) -> Result<(), E>,
+    ) -> Result<u64, Qwen35ProjectionProbeError<E>>
+    where
+        I: IntoIterator<Item = &'tokens [u32]>,
+    {
+        self.runner.visit_projection_probe_pairs(
+            tensor_name,
+            Projection::HostSaltV2(replacement),
+            sequences,
+            one_based_positions,
+            state_layer,
+            observer,
+        )
     }
 
     /// Non-campaign schema-consumption receipt for this load.

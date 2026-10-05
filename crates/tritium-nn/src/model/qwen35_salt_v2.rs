@@ -1593,15 +1593,28 @@ mod tests {
         .unwrap();
         let replacement =
             Arc::new(HostSaltV2Linear::from_reader(&mut probe_package, probe_name).unwrap());
-        let candidate_logits = model
+        let mut paired_positions = Vec::new();
+        let paired_sequences = [&[1_u32, 2][..], &[3_u32, 4][..]];
+        let paired_count = model
             .runner
-            .with_projection_override(probe_name, Projection::HostSaltV2(replacement), |runner| {
-                let mut candidate_cache = runner.new_cache(4)?;
-                let candidate = runner.forward(&[1, 2], &mut candidate_cache)?;
-                Ok(candidate.last_logits().to_vec())
-            })
+            .visit_projection_probe_pairs(
+                probe_name,
+                Projection::HostSaltV2(replacement),
+                paired_sequences,
+                &[1, 2],
+                0,
+                |sample| {
+                    assert_eq!(sample.sequence_index, (paired_positions.len() / 2) as u64);
+                    assert_eq!(sample.token_position, paired_positions.len() % 2 + 1);
+                    assert_eq!(sample.reference_hidden, sample.candidate_hidden);
+                    assert_eq!(sample.reference_state, sample.candidate_state);
+                    paired_positions.push((sample.sequence_index, sample.token_position));
+                    Ok::<_, core::convert::Infallible>(())
+                },
+            )
             .unwrap();
-        assert_eq!(candidate_logits, output.last_logits());
+        assert_eq!(paired_count, 2);
+        assert_eq!(paired_positions, [(0, 1), (0, 2), (1, 1), (1, 2)]);
         let mut restored_cache = model.runner().new_cache(4).unwrap();
         let restored = model
             .runner()

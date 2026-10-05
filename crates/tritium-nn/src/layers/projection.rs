@@ -55,6 +55,18 @@ pub enum Projection {
 }
 
 impl Projection {
+    /// Share the immutable resident storage for one SALT V2 projection.
+    /// Other projection families are intentionally not cloneable through this
+    /// measurement-only helper.
+    pub(crate) fn clone_salt_v2_resident(&self) -> Option<Self> {
+        match self {
+            Projection::HostSaltV2(matrix) => Some(Projection::HostSaltV2(Arc::clone(matrix))),
+            #[cfg(feature = "cuda")]
+            Projection::SaltV2(matrix) => Some(Projection::SaltV2(Arc::clone(matrix))),
+            _ => None,
+        }
+    }
+
     /// Physical SALT V2 tensor index retained by this resident projection.
     #[must_use]
     pub fn salt_v2_tensor_index(&self) -> Option<usize> {
