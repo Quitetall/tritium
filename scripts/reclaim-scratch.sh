@@ -123,7 +123,9 @@ human() { du -sh "$1" 2>/dev/null | cut -f1; }
 protected_campaign_path() {
     local name
     name="$(basename -- "$1")"
-    [[ "$name" == *campaign* || "$name" == *offload* || "$name" == *evidence* ]]
+    [[ "$name" == stage7-* || "$name" == qwen36-* || \
+       "$name" == tritium-qwen36-* || "$name" == *campaign* || \
+       "$name" == *offload* || "$name" == *evidence* ]]
 }
 
 removed_total=0
