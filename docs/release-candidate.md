@@ -286,6 +286,13 @@ count does not establish that these old captures used the approved 512-sequence
 calibration pack. The capture-binding receipt is still missing. The campaign
 was not restarted, and no fitting or model replay was run.
 
+The local synthetic resume/seal regression
+`RUSTC_WRAPPER='' cargo test --locked -p tritium-salt
+campaign_resumes_seals_and_preserves_the_base_workspace -- --nocapture`
+passed (1 test, 0 failed). It exercises restart, sealing, and preservation of
+the base workspace using a fixture. It does not reopen the recovered 506 Qwen
+captures, fit model tensors, or establish model quality or release readiness.
+
 ### Local pinned-checkpoint inventory refresh (2026-10-04)
 
 Read-only inventory found all 15 named safetensors shards plus config, index,
