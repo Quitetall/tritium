@@ -43,6 +43,8 @@ def receipt(delta_terminal: float = 1.0, control_terminal: float = 1.0) -> dict:
         "calibration_token_digest": "c" * 64,
         "recipe_id": "d" * 64,
         "matched_bpw": 1.58,
+        "sequence_count": MODULE.CALIBRATION_SEQUENCES,
+        "tokens_per_sequence": MODULE.TOKENS_PER_SEQUENCE,
         "runtime_adapter_sha256": "e" * 64,
         "machine": {
             "device": "cuda",
@@ -97,6 +99,22 @@ class QwenGdnSensitivityReceiptTests(unittest.TestCase):
         changed = receipt()
         changed["probes"][1]["tensor_class"] = changed["probes"][0]["tensor_class"]
         with self.assertRaisesRegex(MODULE.ReceiptError, "repeats tensor class"):
+            MODULE.verify(changed)
+
+    def test_receipt_requires_complete_partition_and_comparable_depth_curves(self):
+        changed = receipt()
+        changed["sequence_count"] = 128
+        with self.assertRaisesRegex(MODULE.ReceiptError, "complete frozen calibration"):
+            MODULE.verify(changed)
+
+        changed = receipt()
+        changed["probes"][1]["tensor_index"] = changed["probes"][0]["tensor_index"]
+        with self.assertRaisesRegex(MODULE.ReceiptError, "indexes must be unique"):
+            MODULE.verify(changed)
+
+        changed = receipt()
+        changed["probes"][1]["sequence_positions"] = [128, 1024, 2048]
+        with self.assertRaisesRegex(MODULE.ReceiptError, "same sequence-depth"):
             MODULE.verify(changed)
 
     def test_receipt_rejects_non_monotone_depth_and_duplicate_json_fields(self):

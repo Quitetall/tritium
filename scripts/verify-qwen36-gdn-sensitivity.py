@@ -23,6 +23,8 @@ REVISION = "6a9e13bd6fc8f0983b9b99948120bc37f49c13e9"
 FAMILIES = ("deltanet", "full_attention")
 TENSOR_CLASSES = ("qkv", "output", "gate_up", "down")
 THRESHOLD_RATIO = 2.0
+CALIBRATION_SEQUENCES = 512
+TOKENS_PER_SEQUENCE = 2048
 HEX = frozenset("0123456789abcdef")
 MAX_RECEIPT_BYTES = 16 * 1024 * 1024
 
@@ -71,6 +73,7 @@ def verify(value: Any) -> dict[str, Any]:
         "schema", "repository", "revision", "source_model_id",
         "calibration_pack_receipt_id", "calibration_token_digest",
         "recipe_id", "matched_bpw", "runtime_adapter_sha256", "machine",
+        "sequence_count", "tokens_per_sequence",
         "probes", "receipt_id",
     }
     if not isinstance(value, dict) or set(value) != required:
@@ -82,6 +85,13 @@ def verify(value: Any) -> dict[str, Any]:
     _digest(value["calibration_pack_receipt_id"], "calibration_pack_receipt_id", prefixed=True)
     _digest(value["runtime_adapter_sha256"], "runtime_adapter_sha256")
     bpw = _finite_nonnegative(value["matched_bpw"], "matched_bpw", positive=True)
+    if (
+        type(value["sequence_count"]) is not int
+        or type(value["tokens_per_sequence"]) is not int
+        or value["sequence_count"] != CALIBRATION_SEQUENCES
+        or value["tokens_per_sequence"] != TOKENS_PER_SEQUENCE
+    ):
+        raise ReceiptError("measurement must cover the complete frozen calibration partition")
     if not isinstance(value["machine"], dict) or set(value["machine"]) != {
         "device", "device_name", "runtime_version", "tritium_revision"
     }:
@@ -96,7 +106,9 @@ def verify(value: Any) -> dict[str, Any]:
         raise ReceiptError("the frozen probe set requires exactly eight matrices")
 
     seen_names: set[str] = set()
+    seen_indices: set[int] = set()
     classes_by_family: dict[str, set[str]] = {family: set() for family in FAMILIES}
+    common_positions: list[int] | None = None
     terminals: dict[str, list[float]] = {family: [] for family in FAMILIES}
     for index, probe in enumerate(probes):
         fields = {
@@ -118,6 +130,9 @@ def verify(value: Any) -> dict[str, Any]:
         seen_names.add(name)
         if isinstance(probe["tensor_index"], bool) or not isinstance(probe["tensor_index"], int) or probe["tensor_index"] < 0:
             raise ReceiptError(f"probe {index} tensor index is invalid")
+        if probe["tensor_index"] in seen_indices:
+            raise ReceiptError("probe tensor indexes must be unique")
+        seen_indices.add(probe["tensor_index"])
         _digest(probe["source_weight_sha256"], f"probe {index} source weight")
         _digest(probe["ternary_artifact_sha256"], f"probe {index} ternary artifact")
         if _finite_nonnegative(probe["bpw"], f"probe {index} bpw", positive=True) != bpw:
@@ -128,9 +143,15 @@ def verify(value: Any) -> dict[str, Any]:
             raise ReceiptError(f"probe {index} must contain a multi-depth divergence curve")
         previous = -1
         for depth in positions:
-            if isinstance(depth, bool) or not isinstance(depth, int) or depth <= previous:
+            if isinstance(depth, bool) or not isinstance(depth, int) or depth <= previous or depth > TOKENS_PER_SEQUENCE:
                 raise ReceiptError(f"probe {index} sequence positions must increase")
             previous = depth
+        if positions[-1] != TOKENS_PER_SEQUENCE:
+            raise ReceiptError("each divergence curve must reach terminal sequence depth")
+        if common_positions is None:
+            common_positions = positions
+        elif positions != common_positions:
+            raise ReceiptError("all probes must measure the same sequence-depth points")
         for point, metric in enumerate(curve):
             _finite_nonnegative(metric, f"probe {index} divergence point {point}")
         terminals[family].append(float(curve[-1]))
