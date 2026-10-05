@@ -1599,7 +1599,7 @@ mod tests {
             .runner
             .visit_projection_probe_pairs(
                 probe_name,
-                Projection::HostSaltV2(replacement),
+                Projection::HostSaltV2(Arc::clone(&replacement)),
                 paired_sequences,
                 &[1, 2],
                 0,
@@ -1615,6 +1615,23 @@ mod tests {
             .unwrap();
         assert_eq!(paired_count, 2);
         assert_eq!(paired_positions, [(0, 1), (0, 2), (1, 1), (1, 2)]);
+
+        let observer_error = model
+            .runner
+            .visit_projection_probe_pairs(
+                probe_name,
+                Projection::HostSaltV2(Arc::clone(&replacement)),
+                [&[1_u32, 2][..]],
+                &[1, 2],
+                0,
+                |_| Err("stop probe stream"),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            observer_error,
+            super::super::qwen35::Qwen35ProjectionProbeError::Observer("stop probe stream")
+        ));
+
         let mut restored_cache = model.runner().new_cache(4).unwrap();
         let restored = model
             .runner()
