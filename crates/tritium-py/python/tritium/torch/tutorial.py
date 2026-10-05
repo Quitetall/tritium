@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import hashlib
 import importlib.metadata
 import json
@@ -181,6 +182,15 @@ def run_smollm2_release_demo(
     )
     report_progress("generation-complete")
 
+    # PTQ preparation is in-place. The source, prepared, and compact names
+    # therefore keep the same packed model alive after the checkpoint reload
+    # has created an independent copy. Release those no-longer-needed aliases
+    # before tracing the second copy through ONNX, where exporter peak memory
+    # is substantially higher than ordinary inference.
+    del source, prepared, compact, calibration
+    gc.collect()
+    report_progress("ptq-source-released")
+
     report_progress("onnx-export-start")
     onnx_artifact = export_module_onnx(
         restored,
@@ -200,7 +210,7 @@ def run_smollm2_release_demo(
     )
     report_progress("onnx-replay-complete")
 
-    del source, prepared, compact, restored
+    del restored
     report_progress("qat-reload-start")
     qat_source = AutoModelForCausalLM.from_pretrained(
         model_id,
