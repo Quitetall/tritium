@@ -377,6 +377,28 @@ pub struct Qwen35DeltaNet {
 struct MixerIdentity;
 
 impl Qwen35DeltaNet {
+    /// Replace one named projection without changing this mixer's validated geometry.
+    #[allow(dead_code)] // Used by the crate-internal paired Qwen measurement path.
+    pub(crate) fn replace_projection(
+        &mut self,
+        name: &str,
+        replacement: Projection,
+    ) -> Result<Projection, NnError> {
+        let slot = match name {
+            "linear_attn.in_proj_qkv.weight" => &mut self.weights.qkv_proj,
+            "linear_attn.in_proj_z.weight" => &mut self.weights.z_proj,
+            "linear_attn.in_proj_b.weight" => &mut self.weights.b_proj,
+            "linear_attn.in_proj_a.weight" => &mut self.weights.a_proj,
+            "linear_attn.out_proj.weight" => &mut self.weights.out_proj,
+            _ => {
+                return Err(NnError::MissingTensor(format!(
+                    "unknown Qwen DeltaNet projection `{name}`"
+                )));
+            }
+        };
+        replace_projection(slot, replacement, "Qwen DeltaNet")
+    }
+
     /// Bind typed Qwen3.5 geometry and numeric semantics to exact weights.
     ///
     /// # Errors
@@ -982,6 +1004,26 @@ impl Qwen35DeltaNet {
             }
         }
     }
+}
+
+#[allow(dead_code)] // Called only from the crate-internal measurement override.
+fn replace_projection(
+    slot: &mut Projection,
+    replacement: Projection,
+    owner: &str,
+) -> Result<Projection, NnError> {
+    if replacement.n_out() != slot.n_out() || replacement.k_in() != slot.k_in() {
+        return Err(NnError::Shape {
+            expected: slot.n_out().saturating_mul(slot.k_in()),
+            got: replacement.n_out().saturating_mul(replacement.k_in()),
+        });
+    }
+    if replacement.activation_mode() != slot.activation_mode() {
+        return Err(NnError::Backend(format!(
+            "replacement projection changes {owner} activation arithmetic"
+        )));
+    }
+    Ok(std::mem::replace(slot, replacement))
 }
 
 /// Whether the device recurrence is enabled. On by default when the backend is

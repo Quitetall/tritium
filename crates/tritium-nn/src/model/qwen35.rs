@@ -137,6 +137,18 @@ impl Qwen35TextMixer {
             Self::FullAttention(layer) => layer.apply_salt_v2_scale_updates(tensor_index, updates),
         }
     }
+
+    #[allow(dead_code)] // Used by the crate-internal paired Qwen measurement path.
+    fn replace_projection(
+        &mut self,
+        name: &str,
+        replacement: Projection,
+    ) -> Result<Projection, NnError> {
+        match self {
+            Self::DeltaNet(layer) => layer.replace_projection(name, replacement),
+            Self::FullAttention(layer) => layer.replace_projection(name, replacement),
+        }
+    }
 }
 
 struct Qwen35TextLayer {
@@ -315,7 +327,109 @@ impl<E> From<NnError> for Qwen35TextForwardError<E> {
     }
 }
 
+#[allow(dead_code)] // Used by the crate-internal paired Qwen measurement path.
+struct ProjectionRestoreGuard<'a> {
+    runner: &'a mut Qwen35TextRunner,
+    tensor_name: String,
+    original: Option<Projection>,
+}
+
+impl Drop for ProjectionRestoreGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(original) = self.original.take() {
+            // The slot was resolved before guard creation and cannot be
+            // structurally removed while the callback holds the runner.
+            let _ = self
+                .runner
+                .replace_named_projection(&self.tensor_name, original);
+        }
+    }
+}
+
+#[allow(dead_code)] // Used by the crate-internal paired Qwen measurement path.
+fn replace_projection_slot(
+    slot: &mut Projection,
+    replacement: Projection,
+    tensor_name: &str,
+) -> Result<Projection, NnError> {
+    if replacement.n_out() != slot.n_out() || replacement.k_in() != slot.k_in() {
+        return Err(NnError::Shape {
+            expected: slot.n_out().saturating_mul(slot.k_in()),
+            got: replacement.n_out().saturating_mul(replacement.k_in()),
+        });
+    }
+    if replacement.activation_mode() != slot.activation_mode() {
+        return Err(NnError::Backend(format!(
+            "replacement projection `{tensor_name}` changes activation arithmetic"
+        )));
+    }
+    Ok(std::mem::replace(slot, replacement))
+}
+
 impl Qwen35TextRunner {
+    /// Temporarily replace one canonical language projection while executing a
+    /// paired measurement. The dense projection is restored on normal return,
+    /// error, and panic unwind. The model is single-threaded during the callback.
+    #[allow(dead_code)] // The GDN probe producer is the next consumer of this seam.
+    pub(crate) fn with_projection_override<T>(
+        &mut self,
+        tensor_name: &str,
+        replacement: Projection,
+        execute: impl FnOnce(&Self) -> Result<T, NnError>,
+    ) -> Result<T, NnError> {
+        let original = self.replace_named_projection(tensor_name, replacement)?;
+        let guard = ProjectionRestoreGuard {
+            runner: self,
+            tensor_name: tensor_name.to_owned(),
+            original: Some(original),
+        };
+        let result = execute(&*guard.runner)?;
+        drop(guard);
+        Ok(result)
+    }
+
+    #[allow(dead_code)] // Used by the crate-internal paired Qwen measurement path.
+    fn replace_named_projection(
+        &mut self,
+        tensor_name: &str,
+        replacement: Projection,
+    ) -> Result<Projection, NnError> {
+        let layer_path = tensor_name
+            .strip_prefix("model.language_model.layers.")
+            .ok_or_else(|| NnError::MissingTensor(tensor_name.to_owned()))?;
+        let (index_text, projection_name) = layer_path
+            .split_once('.')
+            .ok_or_else(|| NnError::MissingTensor(tensor_name.to_owned()))?;
+        let index = index_text
+            .parse::<usize>()
+            .map_err(|_| NnError::MissingTensor(tensor_name.to_owned()))?;
+        if index.to_string() != index_text {
+            return Err(NnError::MissingTensor(tensor_name.to_owned()));
+        }
+        let layer = self
+            .layers
+            .get_mut(index)
+            .ok_or_else(|| NnError::MissingTensor(tensor_name.to_owned()))?;
+
+        match projection_name {
+            "mlp.gate_proj.weight" => {
+                replace_projection_slot(&mut layer.mlp.gate, replacement, tensor_name)
+            }
+            "mlp.up_proj.weight" => {
+                replace_projection_slot(&mut layer.mlp.up, replacement, tensor_name)
+            }
+            "mlp.down_proj.weight" => {
+                replace_projection_slot(&mut layer.mlp.down, replacement, tensor_name)
+            }
+            _ if projection_name.starts_with("linear_attn.")
+                || projection_name.starts_with("self_attn.") =>
+            {
+                layer.mixer.replace_projection(projection_name, replacement)
+            }
+            _ => Err(NnError::MissingTensor(tensor_name.to_owned())),
+        }
+    }
+
     /// Apply one tensor's scale-only candidate to its uniquely identified SALT V2
     /// projection. The full model graph is scanned before mutation; host and CUDA
     /// residents validate the complete update before publishing changed scales.

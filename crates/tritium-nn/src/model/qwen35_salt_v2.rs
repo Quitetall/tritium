@@ -1540,14 +1540,14 @@ mod tests {
         assert_eq!(admission.salt_resident_bytes(), package_resident_bytes);
         assert!(admission.preserved_fp32_bytes() > 0);
 
-        let model = Qwen35SaltV2LanguageMtpModel::load_bundle_profile_with_policy(
+        let mut model = Qwen35SaltV2LanguageMtpModel::load_bundle_profile_with_policy(
             &files.directory,
             "compact-v1",
             Box::new(tritium_cpu::CpuBackend::new()),
             false,
         )
         .unwrap();
-        let receipt = model.receipt();
+        let receipt = model.receipt().clone();
         assert_eq!(receipt.profile(), "compact-v1");
         assert_eq!(receipt.declared_completion_id(), "test-completion");
         assert_eq!(receipt.declared_campaign_id(), "test-campaign");
@@ -1584,6 +1584,30 @@ mod tests {
         assert_eq!(output.last_logits(), &[0.0; 7]);
         assert_eq!(cache.len(), 2);
         assert!(!model.mtp().status().reason().is_empty());
+
+        let probe_name = "model.language_model.layers.0.mlp.gate_proj.weight";
+        assert!(schema.contains_key(probe_name));
+        let mut probe_package = SaltV2PackageReader::new_strict(
+            File::open(files.directory.join("compact.tsalt2")).unwrap(),
+        )
+        .unwrap();
+        let replacement =
+            Arc::new(HostSaltV2Linear::from_reader(&mut probe_package, probe_name).unwrap());
+        let candidate_logits = model
+            .runner
+            .with_projection_override(probe_name, Projection::HostSaltV2(replacement), |runner| {
+                let mut candidate_cache = runner.new_cache(4)?;
+                let candidate = runner.forward(&[1, 2], &mut candidate_cache)?;
+                Ok(candidate.last_logits().to_vec())
+            })
+            .unwrap();
+        assert_eq!(candidate_logits, output.last_logits());
+        let mut restored_cache = model.runner().new_cache(4).unwrap();
+        let restored = model
+            .runner()
+            .forward(&[1, 2], &mut restored_cache)
+            .unwrap();
+        assert_eq!(restored.last_logits(), output.last_logits());
 
         let batches = [&[1_u32, 2][..], &[3_u32][..]];
         let mut visited = 0_u64;
