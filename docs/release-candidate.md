@@ -9,6 +9,21 @@ second-machine gates remain separate.
 
 ## Gate status (measured 2026-09-03)
 
+### Hugging Face distributed CPU software checks (2026-10-04)
+
+At source commit `e8362849`,
+`/home/brianklam/.cache/tritium-py313-ci/bin/python -m pytest -q
+crates/tritium-py/tests/test_huggingface_distributed.py` passed three checks:
+two-rank CPU DDP training plus checkpoint reload, two-rank CPU FSDP training
+plus sharded checkpoint resume/export, and Accelerate CPU bf16 execution. The
+CUDA-only Accelerate test was skipped because this environment has CPU-only
+PyTorch (`2.11.0+cpu`; Transformers `5.5.3`).
+
+This verifies useful distributed software paths, but it is not the
+candidate-bound `distributed-training` release receipt and does not qualify
+multi-GPU execution, CUDA checkpointing, or performance. The `pytorch-hf` gate
+remains PARTIAL until its required two-or-more-GPU evidence is registered.
+
 ### PR CI on release-input-admission (2026-10-04)
 
 GitHub CI, docs, capstone CPU smoke, wheels, and CodeQL all passed for branch
