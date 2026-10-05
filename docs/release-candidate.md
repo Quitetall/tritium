@@ -21,6 +21,20 @@ crates/tritium-py/tests` passed 369 tests, with 27 skips. This is correctness
 and bounded-temporary evidence for the Python reference path, not a native
 fused-kernel or speed claim.
 
+### Packed linear output-row decode (2026-10-05)
+
+`AdditiveTernaryLinear` now decodes packed weights in output-row tiles capped at
+2^18 weight elements, instead of materializing the entire output-by-input
+matrix on every forward call. Bias is cast to the input dtype as before, and
+the input feature dimension is checked explicitly. The focused CPU/CUDA test
+compared a 40,000-by-8 two-plane layer against `F.linear` using a dense
+reference, in float32 and float16 on CPU and CUDA, while making the full
+decoder fail if called; all four cases passed. The complete
+`test_ptq_artifacts.py` file passed (33 tests). The full Python suite passed
+373 tests, with 27 skips. This is
+bounded-memory Python reference behavior only; it is not a fused kernel or a
+performance result.
+
 ## Gate status (measured 2026-09-03)
 
 ### Hugging Face distributed CPU software checks (2026-10-04)

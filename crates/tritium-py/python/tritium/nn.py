@@ -502,11 +502,26 @@ class AdditiveTernaryLinear(_AdditiveTernaryConsumer):
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         if not input.dtype.is_floating_point:
             raise TypeError("additive ternary linear input must be floating point")
-        return F.linear(
-            input,
-            self.packed_weight.dense(dtype=input.dtype),
-            self.bias.to(dtype=input.dtype) if self.bias is not None else None,
-        )
+        if input.shape[-1] != self.in_features:
+            raise RuntimeError(
+                f"input feature dimension {input.shape[-1]} does not match "
+                f"linear weight dimension {self.in_features}"
+            )
+        rows_per_chunk = max(1, (1 << 18) // max(1, self.in_features))
+        outputs = []
+        for start in range(0, self.out_features, rows_per_chunk):
+            end = min(start + rows_per_chunk, self.out_features)
+            rows = torch.arange(start, end, device=input.device)
+            weight = self.packed_weight._dense_rows(rows, dtype=input.dtype)
+            bias = (
+                self.bias[start:end].to(dtype=input.dtype)
+                if self.bias is not None
+                else None
+            )
+            outputs.append(F.linear(input, weight, bias))
+        if not outputs:
+            return input.new_empty((*input.shape[:-1], 0))
+        return torch.cat(outputs, dim=-1)
 
     def extra_repr(self) -> str:
         return (

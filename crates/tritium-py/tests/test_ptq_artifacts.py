@@ -183,6 +183,60 @@ def test_packed_embedding_lookup_matches_dense_reference_without_full_decode(
             embedding(torch.tensor([7], dtype=index_dtype, device=device))
 
 
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="CUDA is unavailable"
+            ),
+        ),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_packed_linear_matches_dense_reference_without_full_decode(
+    monkeypatch, device, dtype
+):
+    rows = 40_000
+    columns = 8
+    row_ids = torch.arange(rows, device=device).unsqueeze(1)
+    col_ids = torch.arange(columns, device=device).unsqueeze(0)
+    trits_a = ((row_ids + col_ids * 2).remainder(3) - 1).to(torch.int8)
+    trits_b = ((row_ids * 2 + col_ids).remainder(3) - 1).to(torch.int8)
+    scales_a = ((row_ids.remainder(13) + 1).expand(-1, 2).to(torch.float16)) / 8
+    scales_b = (((row_ids + 3).remainder(11) + 1).expand(-1, 2).to(torch.float16)) / 8
+    packed = AdditiveTernaryWeight(
+        [
+            SimpleNamespace(trits=trits_a, scales=scales_a, group_size=4),
+            SimpleNamespace(trits=trits_b, scales=scales_b, group_size=4),
+        ]
+    )
+    bias = torch.linspace(-0.1, 0.1, rows, dtype=torch.float32, device=device)
+    linear = AdditiveTernaryLinear.from_packed_weight(packed, bias)
+    inputs = (
+        torch.arange(48, dtype=torch.float32, device=device)
+        .reshape(2, 3, 8)
+        .div(17)
+        .to(dtype=dtype)
+    )
+    expected = torch.nn.functional.linear(
+        inputs,
+        packed.dense(dtype=inputs.dtype),
+        linear.bias.to(dtype=inputs.dtype),
+    )
+
+    def reject_full_decode(*, dtype):
+        raise AssertionError(f"full linear decode requested as {dtype}")
+
+    monkeypatch.setattr(packed, "dense", reject_full_decode)
+    actual = linear(inputs)
+
+    assert actual.shape == (2, 3, rows)
+    torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
+
+
 def _upgrade_bundle_to_v3(root: Path) -> None:
     manifest_path = root / "tritium.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
