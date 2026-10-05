@@ -1414,3 +1414,25 @@ the TypeScript compiler is not installed in this checkout; `npx` reported that
 it would not supply the missing compiler implicitly. No dependency was
 installed. The language-parity and physical-backend gates therefore remain
 open.
+
+### Estimator and refinement CPU regression checks — 2026-10-04
+
+At working revision `361b9b08aee5e4376a3d70453934dbeed129dd69`, the local
+estimator, refinement-core and PyTorch stage-4 regression suites reported:
+User-owned EAT-O files were modified in the worktree during these runs; these
+suites do not cover those files.
+
+```text
+PYTHONPATH=crates/tritium-py/python pytest -q -rs \
+  crates/tritium-py/tests/test_estimator_catalog.py \
+  crates/tritium-py/tests/test_refinement_core.py \
+  crates/tritium-py/tests/test_torch_stage4.py
+28 passed, 7 skipped
+```
+
+All seven skips were optional LamQuant codec-neural or BLUT-LAMU integrations
+not installed on this machine. These CPU/synthetic tests cover estimator
+projection, gradient, conversion, refinement, and adapter-parity behavior;
+they do not measure a large-model quality gain or qualify Qwen PTQ/refinement,
+accelerator execution, or release readiness. The absent integrations remain
+unverified rather than passing.
