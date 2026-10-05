@@ -257,6 +257,24 @@ receipt and locked dependency inventory; it contains 49 dependency components.
 This is local package evidence, not a physical-browser WebGPU result or a
 release-candidate package-matrix pass.
 
+### Current-head browser npm archive on Node 22 (2026-10-05)
+
+At clean detached source revision
+`f003db81e7de8429325db114c7c8467becc5280c`, the full offline browser package
+workflow passed with Node `v22.23.3` and npm `12.0.2`. Generated-file checks,
+the pinned WASM build, strict TypeScript, all 145 Node tests, offline install,
+and archive verification passed. The strict receipt was independently reopened
+by `scripts/verify-npm-archive-receipt.py`'s validator.
+
+Archive: `release/v1.1/evidence/npm-node22-f003/tritium-ai-web-1.1.0-rc.2.tgz`,
+628,405 bytes, SHA-256
+`5c2e1eed2fd6ad5540f006fca8d0a2b9b684a2e313518af7d7b8fad91b306447`.
+Receipt: `release/v1.1/evidence/npm-node22-f003/npm-archive-receipt.json`,
+ID `sha256:67408cc2fa5f088d107402bc81ebd43db7dda47cda732a1867e765bcb520bfc3`.
+The SBOM is retained beside the archive. This adds a Node 22 local package
+result for the exact current head; it does not establish the cross-platform
+package matrix, candidate CI admission, or physical-browser WebGPU conformance.
+
 ### Physical browser WebGPU lane fragments (2026-10-04)
 
 The exact RC.2 npm archive for clean source revision
