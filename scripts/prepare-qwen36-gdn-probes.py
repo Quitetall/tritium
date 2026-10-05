@@ -90,7 +90,14 @@ def _json_file(path: Path) -> tuple[dict[str, Any], str]:
 
 def _safetensors_header(model_dir: Path, shard_name: str) -> dict[str, Any]:
     logical = PurePosixPath(shard_name)
-    if logical.is_absolute() or len(logical.parts) != 1 or ".." in logical.parts:
+    if (
+        not shard_name
+        or "\\" in shard_name
+        or "\0" in shard_name
+        or logical.is_absolute()
+        or len(logical.parts) != 1
+        or ".." in logical.parts
+    ):
         raise PreflightError("index contains an unsafe shard path")
     path = model_dir / shard_name
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
@@ -201,18 +208,24 @@ def prepare(model_dir: Path, selections: list[str]) -> dict[str, Any]:
             tensor_metadata[name] = metadata
     if set(tensor_metadata) != set(weight_map):
         raise PreflightError("one or more indexed tensors are absent from Safetensors headers")
-    matrix_names = sorted(
-        name
-        for name, metadata in tensor_metadata.items()
-        if (
+    matrix_names = []
+    for name, metadata in tensor_metadata.items():
+        if not (
             name.startswith("model.language_model.")
             or name.startswith("lm_head.")
             or name.startswith("mtp.")
-        )
-        and isinstance(metadata, dict)
-        and isinstance(metadata.get("shape"), list)
-        and len(metadata["shape"]) == 2
-    )
+        ):
+            continue
+        shape = metadata.get("shape") if isinstance(metadata, dict) else None
+        if (
+            not isinstance(shape, list)
+            or not shape
+            or any(type(size) is not int or size <= 0 for size in shape)
+        ):
+            raise PreflightError(f"language/MTP matrix {name!r} has invalid geometry")
+        if len(shape) == 2:
+            matrix_names.append(name)
+    matrix_names.sort()
     if len(matrix_names) != 506:
         raise PreflightError("source headers do not yield the frozen 506 language/MTP matrices")
     matrix_ordinals = {name: ordinal for ordinal, name in enumerate(matrix_names)}

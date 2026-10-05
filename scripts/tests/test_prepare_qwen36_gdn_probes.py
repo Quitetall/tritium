@@ -15,7 +15,13 @@ MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 
 
-def fixture(root: Path, *, rank_one: str | None = None) -> list[str]:
+def fixture(
+    root: Path,
+    *,
+    rank_one: str | None = None,
+    malformed_matrix: str | None = None,
+    index_shard: str | None = None,
+) -> list[str]:
     layer_types = ["linear_attention" if layer % 4 != 3 else "full_attention" for layer in range(64)]
     (root / "config.json").write_text(json.dumps({
         "text_config": {
@@ -38,7 +44,13 @@ def fixture(root: Path, *, rank_one: str | None = None) -> list[str]:
     header = {
         name: {
             "dtype": "BF16",
-            "shape": [32] if name == rank_one else [8, 8],
+            "shape": (
+                [32]
+                if name == rank_one
+                else [0, 8]
+                if name == malformed_matrix
+                else [8, 8]
+            ),
             "data_offsets": [0, 0],
         }
         for _, _, name in probes
@@ -48,8 +60,11 @@ def fixture(root: Path, *, rank_one: str | None = None) -> list[str]:
         "dtype": "BF16", "shape": [8, 8], "data_offsets": [0, 0]
     }
     for index in range(497):
+        name = f"model.language_model.fixture_matrix_{index:03d}.weight"
         header[f"model.language_model.fixture_matrix_{index:03d}.weight"] = {
-            "dtype": "BF16", "shape": [8, 8], "data_offsets": [0, 0]
+            "dtype": "BF16",
+            "shape": [0, 8] if name == malformed_matrix else [8, 8],
+            "data_offsets": [0, 0],
         }
     for index in range(693):
         header[f"fixture.extra.{index:04d}"] = {
@@ -57,11 +72,11 @@ def fixture(root: Path, *, rank_one: str | None = None) -> list[str]:
         }
     encoded = json.dumps(header, separators=(",", ":")).encode()
     (root / shard).write_bytes(struct.pack("<Q", len(encoded)) + encoded)
-    weight_map = {name: shard for _, _, name in probes}
-    weight_map[duplicate_layer_output] = shard
+    weight_map = {name: index_shard or shard for _, _, name in probes}
+    weight_map[duplicate_layer_output] = index_shard or shard
     for index in range(497):
         name = f"model.language_model.fixture_matrix_{index:03d}.weight"
-        weight_map[name] = shard
+        weight_map[name] = index_shard or shard
     for index in range(693):
         weight_map[f"fixture.extra.{index:04d}"] = shard
     (root / "model.safetensors.index.json").write_text(json.dumps({"weight_map": weight_map}))
@@ -110,6 +125,23 @@ class QwenGdnProbePreflightTests(unittest.TestCase):
             root = Path(temporary)
             selections = fixture(root)[:-1]
             with self.assertRaisesRegex(MODULE.PreflightError, "exactly eight"):
+                MODULE.prepare(root, selections)
+
+    def test_rejects_malformed_geometry_outside_selected_probes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            selections = fixture(
+                root,
+                malformed_matrix="model.language_model.fixture_matrix_000.weight",
+            )
+            with self.assertRaisesRegex(MODULE.PreflightError, "invalid geometry"):
+                MODULE.prepare(root, selections)
+
+    def test_rejects_windows_style_shard_traversal(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            selections = fixture(root, index_shard=r"..\outside.safetensors")
+            with self.assertRaisesRegex(MODULE.PreflightError, "unsafe shard path"):
                 MODULE.prepare(root, selections)
 
 
