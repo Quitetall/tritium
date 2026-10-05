@@ -1436,3 +1436,23 @@ projection, gradient, conversion, refinement, and adapter-parity behavior;
 they do not measure a large-model quality gain or qualify Qwen PTQ/refinement,
 accelerator execution, or release readiness. The absent integrations remain
 unverified rather than passing.
+
+### TypeScript and generated-web-source check correction — 2026-10-04
+
+The previous note that the TypeScript compiler was unavailable was too broad:
+the compiler exists under `packages/tritium-web/node_modules`, but is not on
+the repository-root `npx` path. At revision
+`0fd7685c26b687f3e846237a23c39adfb2108d9b`, these direct checks passed:
+
+```text
+packages/tritium-web/node_modules/.bin/tsc -p bindings/typescript/tsconfig.json --noEmit
+packages/tritium-web/node_modules/.bin/tsc -p packages/tritium-web/tsconfig.json --noEmit
+```
+
+The generated-web-source check also passed as the first stage of
+`npm --prefix packages/tritium-web run typecheck`. That combined command then
+stopped at `build:wasm`: the script requires a completely clean Git worktree,
+and this checkout contains unrelated user-owned EAT-O changes. It did not
+compile the WASM guest or reach its own TypeScript stage. `wasm-bindgen` is not
+installed on this machine, so the complete WASM build remains unverified. The
+direct TypeScript passes do not close browser or physical WebGPU gates.
