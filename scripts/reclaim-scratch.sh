@@ -30,6 +30,7 @@ set -euo pipefail
 
 SCRATCH="${TRITIUM_SCRATCH:-/mnt/4tb/tmp}"
 APPLY=0
+INCLUDE_CAMPAIGNS=0
 KEEP_DAYS="${TRITIUM_SCRATCH_KEEP_DAYS:-7}"
 
 usage() {
@@ -37,6 +38,9 @@ usage() {
 usage: reclaim-scratch.sh [--apply] [--scratch DIR] [--keep-days N]
 
   --apply        actually delete (default is a dry run that only reports)
+  --include-campaigns
+                 allow campaign/offload/evidence directories to be considered
+                 (default: preserve them even when old or superseded)
   --scratch DIR  scratch root (default /mnt/4tb/tmp, or $TRITIUM_SCRATCH)
   --keep-days N  age threshold for the stale sweep (default 7)
 
@@ -50,6 +54,7 @@ USAGE
 while [ $# -gt 0 ]; do
     case "$1" in
         --apply) APPLY=1; shift ;;
+        --include-campaigns) INCLUDE_CAMPAIGNS=1; shift ;;
         --scratch) SCRATCH="$2"; shift 2 ;;
         --keep-days) KEEP_DAYS="$2"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
@@ -112,9 +117,22 @@ guard_self_test
 
 human() { du -sh "$1" 2>/dev/null | cut -f1; }
 
+# A closed file descriptor does not mean a multi-day campaign is disposable.
+# Keep campaign journals, captured evidence and offload snapshots unless the
+# operator explicitly opts them into pruning after checking their recovery copy.
+protected_campaign_path() {
+    local name
+    name="$(basename -- "$1")"
+    [[ "$name" == *campaign* || "$name" == *offload* || "$name" == *evidence* ]]
+}
+
 removed_total=0
 report() {
     local path="$1" reason="$2"
+    if [ "$INCLUDE_CAMPAIGNS" != 1 ] && protected_campaign_path "$path"; then
+        echo "  KEEP (campaign/evidence preservation; use --include-campaigns to override)  $(human "$path")  $path"
+        return
+    fi
     if in_use "$path"; then
         echo "  SKIP (open fds)  $(human "$path")  $path"
         return
