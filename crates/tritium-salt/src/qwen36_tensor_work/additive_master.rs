@@ -2654,8 +2654,8 @@ mod tests {
             SaltV2MasterTensorEncoder, SaltV2MasterTrack, SaltV2PrefixLoss,
         },
         salt_v2_package::{
-            SaltV2Package, SaltV2Plane, SaltV2StreamTensorSpec, SaltV2Tensor, SaltV2Tile,
-            SaltV2Transform, SaltV2UniformRateModel, write_salt_v2_package,
+            SaltV2Package, SaltV2Plane, SaltV2ScaleUpdate, SaltV2StreamTensorSpec, SaltV2Tensor,
+            SaltV2Tile, SaltV2Transform, SaltV2UniformRateModel, write_salt_v2_package,
         },
     };
     #[cfg(feature = "cuda")]
@@ -3631,6 +3631,8 @@ mod tests {
             .expect("open sealed CPU execution session");
         let first = [1_u32, 2];
         let second = [3_u32];
+        let first_mask = [true, true];
+        let second_mask = [true];
         let mut observed = 0_u64;
         let mut runtime_logits = Vec::new();
         let receipt = session
@@ -3677,6 +3679,38 @@ mod tests {
         let candidate_id = receipt
             .output_candidate_id(&output_spec)
             .expect("campaign-bound candidate identity");
+        // The scale-update candidate identity commits the actual fixed-trit
+        // updates, unlike the v1 execution-derived label. Keep this mismatch
+        // explicit: TSQ36SB v1 must not treat base-model replay as evidence for
+        // an updated candidate while the versioned candidate-replay ADR is open.
+        let updates =
+            [SaltV2ScaleUpdate::new(0, 0, 0, vec![f16::from_f32(0.5)])
+                .expect("valid scale update")];
+        let scale_candidate = output_spec
+            .scale_update_candidate(receipt.package_id().as_bytes(), 1, &updates)
+            .expect("content-bound scale update candidate");
+        assert_ne!(scale_candidate.candidate_id(), &candidate_id);
+        let mislabeled_candidate_bytes = qwen_output_reconstruction_bytes(
+            &output_spec,
+            *scale_candidate.candidate_id(),
+            &[first.as_slice(), second.as_slice()],
+            128,
+            &runtime_logits,
+        );
+        assert!(matches!(
+            session.bind_output_reconstruction_scopes(
+                &output_spec,
+                &mislabeled_candidate_bytes,
+                &receipt,
+                [
+                    (first.as_slice(), first_mask.as_slice()),
+                    (second.as_slice(), second_mask.as_slice()),
+                ],
+            ),
+            Err(Qwen36FinalLogitsOutputBindingError::Runtime(
+                NnError::Provenance(_)
+            ))
+        ));
         let output_bytes = qwen_output_reconstruction_bytes(
             &output_spec,
             candidate_id,
@@ -3684,8 +3718,6 @@ mod tests {
             128,
             &runtime_logits,
         );
-        let first_mask = [true, true];
-        let second_mask = [true];
         let scope_batches = [
             (first.as_slice(), first_mask.as_slice()),
             (second.as_slice(), second_mask.as_slice()),
