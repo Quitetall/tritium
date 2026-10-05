@@ -179,7 +179,9 @@ def run_smollm2_release_demo(
         do_sample=False,
         use_cache=False,
     )
+    report_progress("generation-complete")
 
+    report_progress("onnx-export-start")
     onnx_artifact = export_module_onnx(
         restored,
         tokens,
@@ -188,6 +190,7 @@ def run_smollm2_release_demo(
         output_names=("logits",),
         dynamic_axes={"input_ids": {0: "batch", 1: "sequence"}},
     )
+    report_progress("onnx-export-complete")
     replay = torch.cat((tokens, tokens[:, :2]), dim=1)
     with torch.no_grad():
         replay_expected = restored(input_ids=replay, use_cache=False).logits
@@ -195,9 +198,10 @@ def run_smollm2_release_demo(
     torch.testing.assert_close(
         replay_observed, replay_expected, rtol=1e-4, atol=1e-5
     )
-    report_progress("onnx-export-and-replay")
+    report_progress("onnx-replay-complete")
 
     del source, prepared, compact, restored
+    report_progress("qat-reload-start")
     qat_source = AutoModelForCausalLM.from_pretrained(
         model_id,
         revision=revision,
@@ -227,6 +231,7 @@ def run_smollm2_release_demo(
     optimizer.zero_grad(set_to_none=True)
     if not math.isfinite(float(loss.detach())):
         raise RuntimeError("SmolLM2 QAT step produced non-finite loss")
+    report_progress("qat-step-complete")
     qat_dir = target / "qat-checkpoint"
     qat.save_pretrained(qat_dir, safe_serialization=True)
     optimizer_path = qat_dir / "optimizer.pt"
@@ -243,6 +248,7 @@ def run_smollm2_release_demo(
     )
     if not resumed_optimizer.state:
         raise RuntimeError("SmolLM2 QAT optimizer resumed no state")
+    report_progress("qat-resume-complete")
 
     elapsed = time.monotonic() - started
     if elapsed >= max_seconds:
