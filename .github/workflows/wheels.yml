@@ -76,6 +76,8 @@ on:
       - "scripts/generate-colab-notebook.py"
       - "scripts/tests/test_generate_colab_notebook.py"
       - "examples/colab/tritium-smollm2-v11.ipynb"
+      - "scripts/qualify-smollm2-release-tutorial.py"
+      - "scripts/tests/test_qualify_smollm2_release_tutorial.py"
       - "examples/python/installed_qat.py"
       - "scripts/tests/test_installed_qat_tutorial.py"
       - "scripts/tests/test_hf_lifecycle.py"
@@ -557,6 +559,56 @@ jobs:
             evidence/hf-lifecycle-clean/**
             evidence/hf-export-clean/**
             evidence/observability-clean/**
+          if-no-files-found: error
+
+  smollm2-cpu-tutorial:
+    name: pinned SmolLM2 PTQ/QAT tutorial · CPU
+    needs: wheels
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.TRITIUM_SOURCE_REF }}
+      - name: verify checked-out source revision
+        shell: bash
+        run: python scripts/verify-workflow-source.py --expected-revision "$TRITIUM_SOURCE_REVISION"
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.13"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: wheel-linux-x86_64
+          path: dist
+      - name: install pinned CPU model runtime
+        run: >-
+          python -m pip install --disable-pip-version-check --only-binary=:all:
+          torch==2.11.0 --index-url https://download.pytorch.org/whl/cpu
+      - name: install pinned model and ONNX dependencies
+        run: >-
+          python -m pip install --disable-pip-version-check --only-binary=:all:
+          transformers==5.5.3 safetensors==0.8.0 onnx==1.22.0
+          onnxruntime==1.27.0 onnxscript==0.7.1
+      - name: install the exact candidate wheel
+        shell: bash
+        run: >-
+          python -m pip install --isolated --disable-pip-version-check
+          --no-index --no-deps --only-binary=:all: dist/*.whl
+      - name: run and validate pinned SmolLM2 CPU tutorial
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m unittest scripts.tests.test_qualify_smollm2_release_tutorial -v
+          python -I scripts/qualify-smollm2-release-tutorial.py \
+            --wheel dist/*.whl \
+            --output-dir evidence/smollm2-cpu \
+            --source-revision "$TRITIUM_SOURCE_REVISION" \
+            --release "${{ needs.wheels.outputs.release }}" \
+            --run-id "github-${{ github.run_id }}-${{ github.run_attempt }}-smollm2-cpu"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: smollm2-cpu-tutorial
+          path: evidence/smollm2-cpu/**
           if-no-files-found: error
 
   cuda-wheel-smoke:
