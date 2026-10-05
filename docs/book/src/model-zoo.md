@@ -70,8 +70,10 @@ packing — the file `ggml-model-i2_s.gguf` (1 187 801 280 bytes ≈ 1.106 GiB; 
 exact byte count is committed as `tritium_benches::BITNET_2B4T_I2S_BYTES` and is
 the denominator of the decode roofline — see [Benchmarks](./benchmarks.md)).
 
-This is the **only** model the repo runs end-to-end. The geometry the code is
-built around (`crates/tritium-nn/src/config.rs`,
+For the legacy native GGUF inference path, this is the reference model used by
+the model-gated accuracy and performance harnesses. It is separate from the
+PyTorch/Hugging Face SmolLM2 tutorial and the SALT PTQ campaign paths. The
+geometry the native GGUF code is built around (`crates/tritium-nn/src/config.rs`,
 `crates/tritium-nn/tests/bench_cpu_hotpaths.rs`): `n_embd = 2560`,
 `feed_forward_length = 6912`, `n_head = 20`, `n_head_kv = 5` (GQA),
 `head_dim = 128`, 30 transformer blocks, a ReLU² MLP, and `attn_sub_norm` /
