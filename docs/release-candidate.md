@@ -33,6 +33,15 @@ opcheck, full-graph eager-backend compilation, `torch.func.grad`, and vmap
 behavior. It is narrow local software evidence, not a built-wheel check, GPU
 qualification, or a distributed-training receipt.
 
+The focused Qwen3.6 capture integration suite also passed on CPU:
+`/home/brianklam/.cache/tritium-py313-ci/bin/python -m pytest -q
+crates/tritium-py/tests/test_kronecker_capture.py
+crates/tritium-py/tests/test_qwen36_components.py` reported 41 passed and 1
+CUDA-only skip. These synthetic checks cover Qwen component resolution,
+capture-session resume/publication, token-stream binding, and small-model
+capture behavior. They do not establish the pinned checkpoint's real 506-record
+calibration capture, MTP production parity, or a release receipt.
+
 ### PR CI on release-input-admission (2026-10-04)
 
 GitHub CI, docs, capstone CPU smoke, wheels, and CodeQL all passed for branch
