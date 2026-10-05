@@ -195,13 +195,46 @@ impl ModelWeights {
             &arch,
             crate::model::hf::NameSchema::Gguf,
             |name, _expected_len| load_dense(file, bytes, name),
-            // Shape hints unused: load_ternary derives [N, K] from the
-            // file's own dims (pre-existing behavior). TODO(non-BitNet GGUF):
-            // check them against the config-derived n_out/k_in so a
-            // config/file head_dim disagreement fails at load, not runtime.
-            |name, _n_out, _k_in| load_projection(file, bytes, backend, name),
+            // GGUF stores matrix dimensions fastest-first as [K, N]. Check
+            // those against the config-derived projection shape before any
+            // packed weights are decoded or uploaded.
+            |name, n_out, k_in| {
+                validate_projection_shape(file, name, n_out, k_in)?;
+                load_projection(file, bytes, backend, name)
+            },
         )
     }
+}
+
+/// Reject a GGUF projection whose declared `[K, N]` shape disagrees with the
+/// model configuration. Without this check, a malformed file can be accepted
+/// and fail later during inference with a less useful backend shape error.
+fn validate_projection_shape(
+    file: &GgufFile,
+    name: &str,
+    n_out: usize,
+    k_in: usize,
+) -> Result<(), NnError> {
+    let info = require(file, name)?;
+    if info.dims.len() != 2 {
+        return Err(NnError::Backend(format!(
+            "{name}: expected GGUF projection dims [K={k_in}, N={n_out}], got {:?}",
+            info.dims
+        )));
+    }
+    let expected = [
+        u64::try_from(k_in)
+            .map_err(|_| NnError::Backend(format!("{name}: K dimension exceeds u64")))?,
+        u64::try_from(n_out)
+            .map_err(|_| NnError::Backend(format!("{name}: N dimension exceeds u64")))?,
+    ];
+    if info.dims != expected {
+        return Err(NnError::Backend(format!(
+            "{name}: expected GGUF projection dims [K={k_in}, N={n_out}], got {:?}",
+            info.dims
+        )));
+    }
+    Ok(())
 }
 
 /// Look up a tensor or return [`NnError::MissingTensor`].
@@ -486,6 +519,24 @@ fn load_ternary(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn projection_shape_must_match_model_geometry_in_gguf_dimension_order() {
+        let blob = gguf_with_q2("output.weight", 3, 256, &[1.0, 1.0, 1.0]);
+        let file = tritium_format::read_gguf(&blob).expect("parse Q2_0 GGUF");
+
+        validate_projection_shape(&file, "output.weight", 3, 256)
+            .expect("config geometry matches GGUF [K, N]");
+
+        let error = validate_projection_shape(&file, "output.weight", 256, 3)
+            .expect_err("equal element count with swapped axes is still malformed");
+        assert!(
+            error
+                .to_string()
+                .contains("expected GGUF projection dims [K=3, N=256]")
+        );
+        assert!(error.to_string().contains("[256, 3]"));
+    }
 
     /// Minimal single-tensor GGUF v3 blob: one TQ2_0 tensor `name`,
     /// `n_out` rows × `k_in` cols, per-ROW scales (uniform within each row).
