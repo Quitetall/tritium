@@ -4,7 +4,16 @@ For differentiable PyTorch training from a binary wheel, use the
 [installed-wheel QAT tutorial](./tutorial-pytorch-qat.md). It runs without a
 source checkout or compiler and strict-reloads its hard artifact.
 
-## Chat with a model in three commands
+## Legacy GGUF chat smoke test
+
+This example exercises Tritium's GGUF compatibility loader and chat server. It
+does **not** run Tritium SALT PTQ or refinement, and it is not the planned
+Qwen3.6 ternary release artifact. Use it to try the existing chat path; use the
+[installed-wheel QAT tutorial](./tutorial-pytorch-qat.md) to exercise Tritium's
+current differentiable training API. Whole-model flagship conversion and its
+quality/runtime gates are still release work.
+
+### Start a GGUF model in three commands
 
 ```sh
 cargo build --release -p tritium-cli -p tritium-serve --features tritium-serve/cuda
