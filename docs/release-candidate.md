@@ -1477,3 +1477,22 @@ qualified by this run. The two TypeScript projects pass direct `tsc --noEmit`
 checks as recorded above. This verifies local reference/package source
 behavior only; the full wheel build/install, WebAssembly build and physical
 browser WebGPU checks remain separate gates.
+
+### Hosted CI and wheel matrix — 2026-10-04
+
+For pushed revision `93ec04188bab40fc0b9308507f6e049c0ac9ca03`, hosted checks
+completed without failures:
+
+| Workflow | Result | Scope limit |
+|---|---:|---|
+| CI (`37258090450`) | 19 passed, 7 skipped | CUDA/ROCm/Metal/wgpu hardware, fuzz, performance, and real-model serving jobs were skipped |
+| Wheels (`37258090477`) | 22 passed, 1 skipped | CUDA wheel job skipped; CPU wheel builds and installed-wheel/tutorial checks passed |
+| CodeQL (`37258090452`) | passed | Static analysis only |
+| Docs (`37258090451`) | passed | Documentation build/link checks |
+| Capstone CPU smoke (`37258090459`) | passed | CPU E2E smoke; not a GPU or model-quality result |
+
+The CI run covered CPU Linux/macOS/Windows checks, GPU-feature compilation,
+WASI conformance, API stability, packaging readiness, compatibility/community
+contract checks, serving contract mocks and the source-free web archive. These
+hosted checks improve release confidence but do not close the skipped physical
+backend, real-model, performance, or model-quality release gates.
