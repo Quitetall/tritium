@@ -4,6 +4,7 @@ import hashlib
 import json
 import struct
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -12,7 +13,11 @@ import torch  # noqa: E402
 
 import tritium.torch.artifacts as artifacts  # noqa: E402
 import tritium.torch.ptq as ptq  # noqa: E402
-from tritium.nn import AdditiveTernaryEmbedding, AdditiveTernaryLinear  # noqa: E402
+from tritium.nn import (  # noqa: E402
+    AdditiveTernaryEmbedding,
+    AdditiveTernaryLinear,
+    AdditiveTernaryWeight,
+)
 from tritium.torch import (  # noqa: E402
     TernaryConfig,
     TritiumError,
@@ -78,6 +83,104 @@ def _fake_verify(path, package_id, serialized, resident):
 def _fake_verify_preserved(path, package_id, tensors, payload, serialized):
     assert Path(path).stat().st_size == serialized
     return package_id, tensors, payload, serialized
+
+
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="CUDA is unavailable"
+            ),
+        ),
+    ],
+)
+def test_packed_embedding_lookup_matches_dense_reference_without_full_decode(
+    monkeypatch, index_dtype, device
+):
+    trits_a = torch.tensor(
+        [
+            [1, 0, -1, 1, 0],
+            [-1, 1, 0, -1, 1],
+            [0, 1, 1, 0, -1],
+            [1, -1, 0, 1, -1],
+            [0, 0, 1, -1, 1],
+            [-1, 0, 1, 0, 1],
+            [1, 1, -1, 0, 0],
+        ],
+        dtype=torch.int8,
+    )
+    trits_b = torch.tensor(
+        [
+            [0, 1, 0, -1, 0],
+            [1, 0, -1, 0, 1],
+            [-1, 0, 1, 1, 0],
+            [0, 1, -1, 0, 1],
+            [1, -1, 0, 0, 1],
+            [0, 1, 0, 1, -1],
+            [-1, 0, 1, 1, 0],
+        ],
+        dtype=torch.int8,
+    )
+    scales_a = torch.tensor(
+        [
+            [0.5, 1.0],
+            [1.5, 0.25],
+            [0.75, 2.0],
+            [1.0, 1.25],
+            [0.5, 0.5],
+            [1.75, 1.0],
+            [0.25, 1.5],
+        ],
+        dtype=torch.float16,
+    )
+    scales_b = torch.tensor(
+        [
+            [0.25, 0.5],
+            [0.5, 1.0],
+            [1.0, 0.25],
+            [0.75, 0.5],
+            [1.0, 1.5],
+            [0.25, 0.75],
+            [0.5, 0.25],
+        ],
+        dtype=torch.float16,
+    )
+    trits_a = trits_a.to(device)
+    trits_b = trits_b.to(device)
+    scales_a = scales_a.to(device)
+    scales_b = scales_b.to(device)
+    packed = AdditiveTernaryWeight(
+        [
+            SimpleNamespace(trits=trits_a, scales=scales_a, group_size=3),
+            SimpleNamespace(trits=trits_b, scales=scales_b, group_size=3),
+        ]
+    )
+    embedding = AdditiveTernaryEmbedding(packed, padding_idx=0)
+    tokens = torch.tensor([[1, 1, 5], [6, 0, 1]], dtype=index_dtype, device=device)
+    dense_reference = packed.dense(dtype=torch.float32)
+    expected = torch.nn.functional.embedding(tokens, dense_reference, padding_idx=0)
+
+    def reject_full_decode(*, dtype):
+        raise AssertionError(f"full embedding decode requested as {dtype}")
+
+    monkeypatch.setattr(packed, "dense", reject_full_decode)
+    actual = embedding(tokens)
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    long_tokens = torch.arange(60_000, dtype=index_dtype, device=device).remainder(7)
+    long_actual = embedding(long_tokens)
+    long_expected = torch.nn.functional.embedding(long_tokens, dense_reference)
+    torch.testing.assert_close(long_actual, long_expected, rtol=0, atol=0)
+    assert embedding(
+        torch.empty((2, 0), dtype=index_dtype, device=device)
+    ).shape == (2, 0, 5)
+    if device == "cpu":
+        with pytest.raises(IndexError):
+            embedding(torch.tensor([7], dtype=index_dtype, device=device))
 
 
 def _upgrade_bundle_to_v3(root: Path) -> None:

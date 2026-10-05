@@ -7,6 +7,20 @@ every byte and prints `CANDIDATE_EVIDENCE_VALID`. That status does **not** mean
 `LOCAL_RC_READY`; model-zoo, browser, serving, package-matrix, signing and
 second-machine gates remain separate.
 
+### Packed embedding selected-row decode (2026-10-05)
+
+`AdditiveTernaryEmbedding` now decodes packed trit bytes only for token IDs in
+the current input, in bounded chunks of at most 2^18 weight elements before
+per-plane accumulation. It does not build a dense vocabulary-by-hidden-size
+weight table. A CPU/CUDA regression compares outputs exactly with the dense
+reference for duplicate IDs, two planes, a partial final scale group and long
+inputs spanning multiple chunks; it also checks int32/int64 IDs and empty
+sequences while making the full-matrix decoder unavailable to the layer.
+`PYTHONPATH=crates/tritium-py/python python3 -m pytest -q
+crates/tritium-py/tests` passed 369 tests, with 27 skips. This is correctness
+and bounded-temporary evidence for the Python reference path, not a native
+fused-kernel or speed claim.
+
 ## Gate status (measured 2026-09-03)
 
 ### Hugging Face distributed CPU software checks (2026-10-04)

@@ -319,6 +319,50 @@ class AdditiveTernaryWeight(nn.Module):
             output = plane if output is None else output + plane
         return output
 
+    def _dense_rows(self, indices: torch.Tensor, *, dtype: torch.dtype) -> torch.Tensor:
+        """Decode referenced rows in bounded chunks for embedding lookup."""
+        if not dtype.is_floating_point:
+            raise TypeError("additive ternary embedding output must be floating point")
+        if indices.dtype not in (torch.int32, torch.int64):
+            raise TypeError("additive ternary embedding indices must be int32 or int64")
+
+        flat_indices = indices.to(dtype=torch.int64).reshape(-1)
+        rows_per_chunk = max(1, (1 << 18) // self.in_features)
+        columns = torch.arange(self.in_features, device=indices.device)
+        group_ids = columns // self.group_size
+        powers = torch.tensor((1, 3, 9, 27, 81), device=indices.device)
+        output = torch.empty(
+            (flat_indices.numel(), self.in_features),
+            dtype=dtype,
+            device=indices.device,
+        )
+        for start in range(0, flat_indices.numel(), rows_per_chunk):
+            end = min(start + rows_per_chunk, flat_indices.numel())
+            selected_rows = flat_indices[start:end]
+            positions = selected_rows.unsqueeze(1) * self.in_features + columns
+            chunk = None
+            for plane_index in range(self.plane_count):
+                packed = getattr(self, f"packed_trits_{plane_index}")
+                byte_indices = torch.div(positions, 5, rounding_mode="floor")
+                digit_indices = torch.remainder(positions, 5)
+                packed_values = packed.index_select(
+                    0, byte_indices.reshape(-1)
+                ).reshape_as(positions)
+                digits = torch.div(
+                    packed_values.to(torch.int64),
+                    powers[digit_indices],
+                    rounding_mode="floor",
+                ).remainder(3)
+                trits = digits.to(dtype=dtype) - 1
+                scales = getattr(self, f"scales_{plane_index}").index_select(
+                    0, selected_rows
+                )
+                expanded_scales = scales.index_select(1, group_ids).to(dtype=dtype)
+                plane = trits * expanded_scales
+                chunk = plane if chunk is None else chunk + plane
+            output[start:end].copy_(chunk)
+        return output.reshape(*indices.shape, self.in_features)
+
     def trit_counts(self) -> tuple[tuple[int, int, int], ...]:
         """Return per-plane ``(-1, 0, +1)`` counts without a dense float shadow."""
 
@@ -543,15 +587,7 @@ class AdditiveTernaryEmbedding(_AdditiveTernaryConsumer):
         )
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        return F.embedding(
-            input,
-            self.packed_weight.dense(dtype=self.output_dtype),
-            self.padding_idx,
-            self.max_norm,
-            self.norm_type,
-            self.scale_grad_by_freq,
-            self.sparse,
-        )
+        return self.packed_weight._dense_rows(input, dtype=self.output_dtype)
 
     def extra_repr(self) -> str:
         return (
