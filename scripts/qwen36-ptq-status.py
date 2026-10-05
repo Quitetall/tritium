@@ -265,6 +265,10 @@ def inspect(
         "staged_record": staged,
         "staged_record_count": len(temps),
         "published_master_count": objects,
+        "expected_master_count": campaign_totals[2] if campaign_totals else None,
+        "remaining_master_count": (
+            max(campaign_totals[2] - objects, 0) if campaign_totals else None
+        ),
         "seal_count": seals,
         "bytes_per_second": rate,
         "target_bytes": target_bytes,
@@ -304,6 +308,13 @@ def main(argv: list[str] | None = None) -> int:
         staged = snapshot["staged_record"]
         print(f"status={snapshot['status']}")
         print(f"published_masters={snapshot['published_master_count']}")
+        expected = snapshot["expected_master_count"]
+        if expected is not None:
+            print(
+                "master_progress="
+                f"{snapshot['published_master_count']}/{expected}"
+            )
+            print(f"masters_remaining={snapshot['remaining_master_count']}")
         print(f"sealed={snapshot['seal_count']}")
         if staged is None:
             print("staged_record=none")
