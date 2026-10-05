@@ -1634,6 +1634,35 @@ mod tests {
         assert_ne!(block_execution.block_output_digest(), &[0; 32]);
         assert_eq!(block_execution.logit_count(), 0);
 
+        let mut observed_states = Vec::new();
+        let state_observed_execution = model
+            .try_visit_untrusted_block_outputs_with_states(
+                batches,
+                &[0],
+                |_| Ok::<_, core::convert::Infallible>(()),
+                |batch_index, block_index, token_position, state| {
+                    observed_states.push((
+                        batch_index,
+                        block_index,
+                        token_position,
+                        state.to_vec(),
+                    ));
+                },
+            )
+            .unwrap();
+        assert_eq!(state_observed_execution, block_execution);
+        assert_eq!(observed_states.len(), 2);
+        assert_eq!(
+            observed_states
+                .iter()
+                .map(|(batch, block, token, state)| (*batch, *block, *token, state.len()))
+                .collect::<Vec<_>>(),
+            [(0, 0, 0, 8), (1, 0, 0, 8)]
+        );
+        assert!(observed_states.iter().all(|(_, _, _, state)| {
+            !state.is_empty() && state.iter().all(|value| value.is_finite())
+        }));
+
         let scope_identity = ([31; 32], [32; 32], 41);
         let scopes = [
             tritium_format::RuntimeOutputScope::Block { start: 0, end: 1 },

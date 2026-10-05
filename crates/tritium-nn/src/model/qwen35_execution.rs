@@ -675,7 +675,25 @@ impl Qwen35SaltV2LanguageMtpModel {
     pub fn try_visit_untrusted_block_outputs<'batch, I, E>(
         &self,
         batches: I,
+        observer: impl FnMut(Qwen35ExecutionBlockOutputBatch<'_>) -> Result<(), E>,
+    ) -> Result<Qwen35UntrustedRuntimeTranscript, Qwen35ExecutionVisitError<E>>
+    where
+        I: IntoIterator<Item = &'batch [u32]>,
+    {
+        self.try_visit_untrusted_block_outputs_with_states(batches, &[], observer, |_, _, _, _| {})
+    }
+
+    /// Internal research seam for block outputs plus selected recurrent states.
+    ///
+    /// State samples are borrowed synchronously and include batch, block, and
+    /// token-row coordinates. This does not add state data to the public block
+    /// transcript or qualify it for campaign admission.
+    pub(crate) fn try_visit_untrusted_block_outputs_with_states<'batch, I, E>(
+        &self,
+        batches: I,
+        state_positions: &[usize],
         mut observer: impl FnMut(Qwen35ExecutionBlockOutputBatch<'_>) -> Result<(), E>,
+        mut state_observer: impl FnMut(u64, u32, usize, &[f32]),
     ) -> Result<Qwen35UntrustedRuntimeTranscript, Qwen35ExecutionVisitError<E>>
     where
         I: IntoIterator<Item = &'batch [u32]>,
@@ -712,9 +730,10 @@ impl Qwen35SaltV2LanguageMtpModel {
                 .map_err(Qwen35ExecutionVisitError::Runtime)?;
             let output = self
                 .runner()
-                .forward_with_block_observer(
+                .forward_with_block_and_state_observer(
                     tokens,
                     &mut cache,
+                    state_positions,
                     |block_index, token_start, block_tokens, hidden_states| {
                         let token_start = u64::try_from(token_start).map_err(|_| {
                             NnError::ResourceExhausted(
@@ -744,6 +763,9 @@ impl Qwen35SaltV2LanguageMtpModel {
                             hidden_states,
                         })
                         .map_err(BlockObserverFailure::Observer)
+                    },
+                    |block_index, token_position, state| {
+                        state_observer(batch_count, block_index, token_position, state);
                     },
                 )
                 .map_err(|error| match error {
