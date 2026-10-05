@@ -9,7 +9,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 onnx = pytest.importorskip("onnx")
-pytest.importorskip("onnxruntime")
+ort = pytest.importorskip("onnxruntime")
 pytest.importorskip("onnxscript")
 
 from tritium.nn import AdditiveTernaryLinear  # noqa: E402
@@ -29,6 +29,15 @@ from tritium.torch import (  # noqa: E402
     prepare,
     refine,
 )
+from tritium.torch.module_onnx import _session_options  # noqa: E402
+
+
+def test_packed_onnx_runtime_disables_dense_constant_folding():
+    options = _session_options(ort)
+    assert (
+        options.graph_optimization_level
+        == ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    )
 
 
 def _model():

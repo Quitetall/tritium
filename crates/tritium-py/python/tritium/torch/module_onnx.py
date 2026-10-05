@@ -219,6 +219,17 @@ def _runtime_dependencies():
     return onnx, onnxruntime
 
 
+def _session_options(ort):
+    """Keep packed decode graphs compact instead of constant-folding weights."""
+
+    options = ort.SessionOptions()
+    # ORT's default graph optimizer evaluates the standard-ONNX trit decoder
+    # during session creation, materializing every full-precision target
+    # matrix. That defeats packed residency and can require tens of GiB.
+    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    return options
+
+
 def _export_dependencies():
     dependencies = _runtime_dependencies()
     try:
@@ -230,6 +241,48 @@ def _export_dependencies():
             stage="module_onnx",
         ) from error
     return dependencies
+
+
+def _translate_packed_ternary_plane(
+    packed,
+    scales,
+    rows: int,
+    columns: int,
+    group_size: int,
+    dtype_code: int,
+):
+    """Translate opaque packed decode to a compact standard-ONNX subgraph."""
+
+    from onnxscript import opset18 as op
+
+    packed = op.Cast(packed, to=7)  # int64
+    packed = op.Unsqueeze(packed, op.Constant(value_ints=[1]))
+    digits = []
+    for position in range(5):
+        quotient = op.Div(packed, op.Constant(value_int=3**position))
+        digits.append(
+            op.Mod(quotient, op.Constant(value_int=3), fmod=0)
+        )
+    decoded = op.Concat(*digits, axis=1)
+    decoded = op.Reshape(decoded, op.Constant(value_ints=[-1]))
+    decoded = op.Slice(
+        decoded,
+        op.Constant(value_ints=[0]),
+        op.Constant(value_ints=[rows * columns]),
+        op.Constant(value_ints=[0]),
+    )
+    decoded = op.Sub(decoded, op.Constant(value_int=1))
+    decoded = op.Reshape(decoded, op.Constant(value_ints=[rows, columns]))
+    decoded = op.Cast(decoded, to=dtype_code)
+    scales = op.Cast(scales, to=dtype_code)
+    columns_index = op.Range(
+        op.Constant(value_int=0),
+        op.Constant(value_int=columns),
+        op.Constant(value_int=1),
+    )
+    group_index = op.Div(columns_index, op.Constant(value_int=group_size))
+    expanded_scales = op.Gather(scales, group_index, axis=1)
+    return op.Mul(decoded, expanded_scales)
 
 
 def _packed_specs(model: nn.Module):
@@ -538,6 +591,10 @@ def export_module_onnx(
             do_constant_folding=False,
             external_data=True,
             dynamic_shapes=dynamic_shapes,
+            custom_translation_table={
+                torch.ops.tritium.decode_packed_ternary_plane.default:
+                    _translate_packed_ternary_plane,
+            },
         )
         # Path-based checking supplies ONNX with the external-data base directory.
         # Checking an in-memory ModelProto makes valid large graphs look missing.
@@ -553,7 +610,11 @@ def export_module_onnx(
         for path in staging.iterdir():
             if path.stat().st_size == 0 and path.name not in external_locations:
                 path.unlink()
-        session = ort.InferenceSession(str(graph_path), providers=["CPUExecutionProvider"])
+        session = ort.InferenceSession(
+            str(graph_path),
+            sess_options=_session_options(ort),
+            providers=["CPUExecutionProvider"],
+        )
         observed = session.run(
             list(names_out),
             {name: value.detach().contiguous().numpy() for name, value in zip(names_in, inputs)},
@@ -726,7 +787,11 @@ def load_module_onnx(
     )
     if not create_session:
         return artifact
-    session = ort.InferenceSession(str(graph_path), providers=["CPUExecutionProvider"])
+    session = ort.InferenceSession(
+        str(graph_path),
+        sess_options=_session_options(ort),
+        providers=["CPUExecutionProvider"],
+    )
     if tuple(item.name for item in session.get_inputs()) != artifact.input_names:
         raise ValueError("ORT module inputs differ from manifest")
     if tuple(item.name for item in session.get_outputs()) != artifact.output_names:

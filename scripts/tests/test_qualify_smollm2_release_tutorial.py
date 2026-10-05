@@ -14,7 +14,7 @@ SPEC.loader.exec_module(MODULE)
 
 def passing_receipt():
     return {
-        "schema": "tritium.smollm2-five-minute.v1",
+        "schema": "tritium.smollm2-five-minute.v2",
         "passed": True,
         "model_id": MODULE.SMOLLM2_MODEL_ID,
         "source_revision": MODULE.SMOLLM2_REVISION,
@@ -23,6 +23,11 @@ def passing_receipt():
         "coverage": {"selected_parameters": 100},
         "storage": {"selected_dense_bytes": 1000, "compact_checkpoint_bytes": 500},
         "onnx_artifact_id": "sha256:onnx",
+        "onnx_graph_optimization_level": "ORT_DISABLE_ALL",
+        "onnx_parity_rtol": 1e-4,
+        "onnx_parity_atol": 1e-4,
+        "onnx_replay_max_abs_error": 5e-5,
+        "onnx_replay_max_tolerance_ratio": 0.5,
         "qat_optimizer_state_entries": 1,
     }
 
@@ -51,6 +56,17 @@ class SmolLM2ReleaseTutorialTests(unittest.TestCase):
         receipt = passing_receipt()
         receipt["storage"]["compact_checkpoint_bytes"] = 1000
         with self.assertRaisesRegex(ValueError, "did not reduce"):
+            MODULE.validate_receipt(receipt, max_seconds=300.0)
+
+    def test_receipt_rejects_unsafe_onnx_memory_or_parity_claim(self):
+        receipt = passing_receipt()
+        receipt["onnx_graph_optimization_level"] = "ORT_ENABLE_ALL"
+        with self.assertRaisesRegex(ValueError, "expanded packed weights"):
+            MODULE.validate_receipt(receipt, max_seconds=300.0)
+
+        receipt = passing_receipt()
+        receipt["onnx_replay_max_tolerance_ratio"] = 1.01
+        with self.assertRaisesRegex(ValueError, "measured parity"):
             MODULE.validate_receipt(receipt, max_seconds=300.0)
 
     def test_wheel_workflow_runs_pinned_smollm2_from_candidate_cpu_wheel(self):

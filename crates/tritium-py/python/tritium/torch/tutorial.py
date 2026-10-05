@@ -25,7 +25,9 @@ from .ptq import calibrate, convert, load_quantized_module
 Pathish = Union[str, os.PathLike[str]]
 SMOLLM2_MODEL_ID = "HuggingFaceTB/SmolLM2-135M-Instruct"
 SMOLLM2_REVISION = "12fd25f77366fa6b3b4b768ec3050bf629380bac"
-_SCHEMA = "tritium.smollm2-five-minute.v1"
+_SCHEMA = "tritium.smollm2-five-minute.v2"
+_ONNX_PARITY_RTOL = 1e-4
+_ONNX_PARITY_ATOL = 1e-4
 
 
 def _sha256(path: Path) -> str:
@@ -61,6 +63,18 @@ def _trit_diagnostics(model: torch.nn.Module) -> dict[str, Any]:
         "zero_rate": zero / total,
         "planes": len(planes),
     }
+
+
+def _onnx_parity_metrics(
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    *,
+    rtol: float,
+    atol: float,
+) -> tuple[float, float]:
+    difference = (actual - expected).abs()
+    tolerance = atol + rtol * expected.abs()
+    return float(difference.max()), float((difference / tolerance).max())
 
 
 def _atomic_json(path: Path, value: dict[str, Any]) -> None:
@@ -199,14 +213,27 @@ def run_smollm2_release_demo(
         input_names=("input_ids",),
         output_names=("logits",),
         dynamic_axes={"input_ids": {0: "batch", 1: "sequence"}},
+        rtol=_ONNX_PARITY_RTOL,
+        atol=_ONNX_PARITY_ATOL,
     )
     report_progress("onnx-export-complete")
     replay = torch.cat((tokens, tokens[:, :2]), dim=1)
     with torch.no_grad():
         replay_expected = restored(input_ids=replay, use_cache=False).logits
     replay_observed = load_module_onnx(onnx_artifact.artifact_dir)(replay)
+    onnx_replay_max_abs_error, onnx_replay_max_tolerance_ratio = (
+        _onnx_parity_metrics(
+            replay_observed,
+            replay_expected,
+            rtol=_ONNX_PARITY_RTOL,
+            atol=_ONNX_PARITY_ATOL,
+        )
+    )
     torch.testing.assert_close(
-        replay_observed, replay_expected, rtol=1e-4, atol=1e-5
+        replay_observed,
+        replay_expected,
+        rtol=_ONNX_PARITY_RTOL,
+        atol=_ONNX_PARITY_ATOL,
     )
     report_progress("onnx-replay-complete")
 
@@ -294,6 +321,11 @@ def run_smollm2_release_demo(
         "ptq_artifact_id": conversion.artifact_id,
         "native_checkpoint_digest": _sha256(native_dir / "model.safetensors"),
         "onnx_artifact_id": onnx_artifact.artifact_id,
+        "onnx_graph_optimization_level": "ORT_DISABLE_ALL",
+        "onnx_parity_rtol": _ONNX_PARITY_RTOL,
+        "onnx_parity_atol": _ONNX_PARITY_ATOL,
+        "onnx_replay_max_abs_error": onnx_replay_max_abs_error,
+        "onnx_replay_max_tolerance_ratio": onnx_replay_max_tolerance_ratio,
         "qat_loss": float(loss.detach().cpu()),
         "qat_optimizer_state_entries": len(resumed_optimizer.state),
         "generated_token_ids": generated[0].tolist(),

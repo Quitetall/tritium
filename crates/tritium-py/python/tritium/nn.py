@@ -15,6 +15,64 @@ from .torch.projection import ProjectionContext, validate_projection
 from .torch.projection import expand_plane_scales
 
 _B3_MAX_VALID_BYTE = 3**5 - 1
+_ONNX_DTYPE_TO_TORCH = {
+    1: torch.float32,
+    10: torch.float16,
+    11: torch.float64,
+    16: torch.bfloat16,
+}
+_TORCH_DTYPE_TO_ONNX = {value: key for key, value in _ONNX_DTYPE_TO_TORCH.items()}
+
+
+def _decode_packed_ternary_plane(
+    packed: torch.Tensor,
+    scales: torch.Tensor,
+    rows: int,
+    columns: int,
+    group_size: int,
+    dtype_code: int,
+) -> torch.Tensor:
+    dtype = _ONNX_DTYPE_TO_TORCH[dtype_code]
+    powers = packed.new_tensor((1, 3, 9, 27, 81), dtype=torch.int16)
+    digits = (packed.to(torch.int16).unsqueeze(1) // powers.unsqueeze(0)) % 3
+    trits = (digits.flatten()[: rows * columns] - 1).reshape(rows, columns)
+    trits = trits.to(dtype=dtype)
+    scales = scales.to(dtype=dtype)
+    scales = expand_plane_scales(
+        scales, rows=rows, columns=columns, group_size=group_size
+    )
+    return trits * scales
+
+
+@torch.library.custom_op("tritium::decode_packed_ternary_plane", mutates_args=())
+def _decode_packed_ternary_plane_op(
+    packed: torch.Tensor,
+    scales: torch.Tensor,
+    rows: int,
+    columns: int,
+    group_size: int,
+    dtype_code: int,
+) -> torch.Tensor:
+    """Opaque-to-Dynamo packed plane decode with a portable eager implementation."""
+
+    return _decode_packed_ternary_plane(
+        packed, scales, rows, columns, group_size, dtype_code
+    )
+
+
+@_decode_packed_ternary_plane_op.register_fake
+def _decode_packed_ternary_plane_fake(
+    packed: torch.Tensor,
+    scales: torch.Tensor,
+    rows: int,
+    columns: int,
+    group_size: int,
+    dtype_code: int,
+) -> torch.Tensor:
+    del packed, group_size
+    return scales.new_empty(
+        (rows, columns), dtype=_ONNX_DTYPE_TO_TORCH[dtype_code]
+    )
 
 
 def _estimator_extra_state(estimator: Estimator) -> torch.Tensor:
@@ -227,12 +285,30 @@ class AdditiveTernaryWeight(nn.Module):
         output = None
         for index in range(self.plane_count):
             packed = getattr(self, f"packed_trits_{index}")
+            scales = getattr(self, f"scales_{index}")
+            if torch.onnx.is_in_onnx_export():
+                try:
+                    dtype_code = _TORCH_DTYPE_TO_ONNX[dtype]
+                except KeyError as error:
+                    raise TypeError(
+                        f"unsupported ONNX ternary weight dtype {dtype}"
+                    ) from error
+                plane = _decode_packed_ternary_plane_op(
+                    packed,
+                    scales,
+                    self.out_features,
+                    self.in_features,
+                    self.group_size,
+                    dtype_code,
+                )
+                output = plane if output is None else output + plane
+                continue
             powers = packed.new_tensor((1, 3, 9, 27, 81), dtype=torch.int16)
             digits = (packed.to(torch.int16).unsqueeze(1) // powers.unsqueeze(0)) % 3
             trits = (digits.flatten()[: self.weight_elements] - 1).reshape(
                 self.out_features, self.in_features
             ).to(dtype=dtype)
-            scales = getattr(self, f"scales_{index}").to(dtype=dtype)
+            scales = scales.to(dtype=dtype)
             scales = expand_plane_scales(
                 scales,
                 rows=self.out_features,

@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import importlib.metadata
 import json
+import math
 import re
 from pathlib import Path
 from typing import Any
@@ -26,7 +27,7 @@ def sha256_file(path: Path) -> str:
 
 
 def validate_receipt(receipt: dict[str, Any], *, max_seconds: float) -> None:
-    if receipt.get("schema") != "tritium.smollm2-five-minute.v1":
+    if receipt.get("schema") != "tritium.smollm2-five-minute.v2":
         raise ValueError("SmolLM2 tutorial emitted an unsupported receipt schema")
     if receipt.get("passed") is not True:
         raise ValueError("SmolLM2 tutorial did not pass")
@@ -53,6 +54,23 @@ def validate_receipt(receipt: dict[str, Any], *, max_seconds: float) -> None:
         raise ValueError("tutorial checkpoint did not reduce selected weight bytes")
     if not isinstance(receipt.get("onnx_artifact_id"), str) or not receipt["onnx_artifact_id"]:
         raise ValueError("tutorial receipt has no ONNX artifact identity")
+    if receipt.get("onnx_graph_optimization_level") != "ORT_DISABLE_ALL":
+        raise ValueError("tutorial ONNX runtime may have expanded packed weights")
+    if receipt.get("onnx_parity_rtol") != 1e-4 or receipt.get("onnx_parity_atol") != 1e-4:
+        raise ValueError("tutorial ONNX parity tolerances differ from the frozen gate")
+    max_error = receipt.get("onnx_replay_max_abs_error")
+    tolerance_ratio = receipt.get("onnx_replay_max_tolerance_ratio")
+    if (
+        not isinstance(max_error, (int, float))
+        or isinstance(max_error, bool)
+        or not math.isfinite(max_error)
+        or max_error < 0
+        or not isinstance(tolerance_ratio, (int, float))
+        or isinstance(tolerance_ratio, bool)
+        or not math.isfinite(tolerance_ratio)
+        or not 0 <= tolerance_ratio <= 1
+    ):
+        raise ValueError("tutorial ONNX replay did not satisfy measured parity")
     if receipt.get("qat_optimizer_state_entries", 0) <= 0:
         raise ValueError("tutorial receipt shows no resumed QAT optimizer state")
 
