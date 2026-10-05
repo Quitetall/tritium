@@ -38,17 +38,34 @@ def validate_receipt(receipt: dict[str, Any], *, max_seconds: float) -> None:
     if receipt.get("device") != "cpu":
         raise ValueError("tutorial receipt is not CPU evidence")
     elapsed = receipt.get("elapsed_seconds_excluding_download")
-    if not isinstance(elapsed, (int, float)) or not 0 <= elapsed < max_seconds:
+    if (
+        not isinstance(elapsed, (int, float))
+        or isinstance(elapsed, bool)
+        or not math.isfinite(elapsed)
+        or not 0 <= elapsed < max_seconds
+    ):
         raise ValueError("tutorial receipt exceeds its measured wall-time limit")
     coverage = receipt.get("coverage")
-    if not isinstance(coverage, dict) or coverage.get("selected_parameters", 0) <= 0:
+    selected_parameters = (
+        coverage.get("selected_parameters") if isinstance(coverage, dict) else None
+    )
+    if (
+        not isinstance(selected_parameters, int)
+        or isinstance(selected_parameters, bool)
+        or selected_parameters <= 0
+    ):
         raise ValueError("tutorial receipt contains no PTQ-converted parameters")
     storage = receipt.get("storage")
     if not isinstance(storage, dict):
         raise ValueError("tutorial receipt has no physical storage accounting")
     dense_bytes = storage.get("selected_dense_bytes")
     packed_bytes = storage.get("compact_checkpoint_bytes")
-    if not isinstance(dense_bytes, int) or not isinstance(packed_bytes, int):
+    if (
+        not isinstance(dense_bytes, int)
+        or isinstance(dense_bytes, bool)
+        or not isinstance(packed_bytes, int)
+        or isinstance(packed_bytes, bool)
+    ):
         raise ValueError("tutorial receipt byte accounting is invalid")
     if dense_bytes <= 0 or packed_bytes <= 0 or packed_bytes >= dense_bytes:
         raise ValueError("tutorial checkpoint did not reduce selected weight bytes")
@@ -71,7 +88,12 @@ def validate_receipt(receipt: dict[str, Any], *, max_seconds: float) -> None:
         or not 0 <= tolerance_ratio <= 1
     ):
         raise ValueError("tutorial ONNX replay did not satisfy measured parity")
-    if receipt.get("qat_optimizer_state_entries", 0) <= 0:
+    optimizer_state_entries = receipt.get("qat_optimizer_state_entries")
+    if (
+        not isinstance(optimizer_state_entries, int)
+        or isinstance(optimizer_state_entries, bool)
+        or optimizer_state_entries <= 0
+    ):
         raise ValueError("tutorial receipt shows no resumed QAT optimizer state")
 
 

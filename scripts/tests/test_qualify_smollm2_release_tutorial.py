@@ -58,6 +58,27 @@ class SmolLM2ReleaseTutorialTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "did not reduce"):
             MODULE.validate_receipt(receipt, max_seconds=300.0)
 
+    def test_receipt_rejects_boolean_values_in_numeric_claims(self):
+        for field, mutate in (
+            ("elapsed_seconds_excluding_download", lambda value: value.update(
+                elapsed_seconds_excluding_download=True
+            )),
+            ("coverage.selected_parameters", lambda value: value["coverage"].update(
+                selected_parameters=True
+            )),
+            ("storage.selected_dense_bytes", lambda value: value["storage"].update(
+                selected_dense_bytes=True
+            )),
+            ("qat_optimizer_state_entries", lambda value: value.update(
+                qat_optimizer_state_entries=True
+            )),
+        ):
+            with self.subTest(field=field):
+                receipt = passing_receipt()
+                mutate(receipt)
+                with self.assertRaises(ValueError):
+                    MODULE.validate_receipt(receipt, max_seconds=300.0)
+
     def test_receipt_rejects_unsafe_onnx_memory_or_parity_claim(self):
         receipt = passing_receipt()
         receipt["onnx_graph_optimization_level"] = "ORT_ENABLE_ALL"
