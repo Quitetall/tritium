@@ -15,7 +15,9 @@ use serde::Deserialize;
 use tritium_format::{
     PackageHasher, SafeTensorsReader,
     salt_v2::SaltV2Codec,
-    salt_v2_package::{SaltV2PackageReader, SaltV2ScaleUpdate, SaltV2Transform},
+    salt_v2_package::{
+        SaltV2PackageReader, SaltV2ScaleUpdate, SaltV2ScaleUpdateChild, SaltV2Transform,
+    },
 };
 use tritium_spec::TernaryBackend;
 
@@ -118,6 +120,9 @@ pub struct Qwen35SaltV2LoadReceipt {
     declared_official_payload_authenticated: bool,
     config_package_id: String,
     package_id: String,
+    parent_package_id: Option<String>,
+    scale_update_set_digest: Option<[u8; 32]>,
+    scale_update_lineage_id: Option<[u8; 32]>,
     preserved_package_id: String,
     codec: SaltV2Codec,
     matrix_tensors: usize,
@@ -201,6 +206,24 @@ impl Qwen35SaltV2LoadReceipt {
     #[must_use]
     pub fn package_id(&self) -> &str {
         &self.package_id
+    }
+
+    /// Parent SALT package identity when this load executed an immutable child.
+    #[must_use]
+    pub fn parent_package_id(&self) -> Option<&str> {
+        self.parent_package_id.as_deref()
+    }
+
+    /// Canonical update-set identity for an immutable scale-update child.
+    #[must_use]
+    pub const fn scale_update_set_digest(&self) -> Option<&[u8; 32]> {
+        self.scale_update_set_digest.as_ref()
+    }
+
+    /// Lineage identity binding the parent, update set, and child package.
+    #[must_use]
+    pub const fn scale_update_lineage_id(&self) -> Option<&[u8; 32]> {
+        self.scale_update_lineage_id.as_ref()
     }
 
     /// Exact-byte identity of the preserved safetensors companion.
@@ -543,7 +566,31 @@ impl Qwen35SaltV2LanguageMtpModel {
         profile: &str,
         backend: Box<dyn TernaryBackend>,
     ) -> Result<Self, NnError> {
-        Self::load_bundle_profile_with_policy(bundle_dir, profile, backend, true)
+        Self::load_bundle_profile_with_policy(bundle_dir, profile, backend, true, None)
+    }
+
+    /// Load an immutable scale-update child package against the exact parent
+    /// profile named by the bundle manifest. The child must preserve the
+    /// parent's codec and physical-byte ledgers, and its lineage must bind the
+    /// parent and child package IDs.
+    ///
+    /// The bundle manifest remains the authority for model identity and
+    /// preserved tensors; the returned load receipt identifies the child as
+    /// the package actually used for execution.
+    pub fn load_bundle_scale_update_child(
+        bundle_dir: &Path,
+        profile: &str,
+        child_package_path: &Path,
+        lineage: SaltV2ScaleUpdateChild,
+        backend: Box<dyn TernaryBackend>,
+    ) -> Result<Self, NnError> {
+        Self::load_bundle_profile_with_policy(
+            bundle_dir,
+            profile,
+            backend,
+            true,
+            Some((child_package_path, lineage)),
+        )
     }
 
     /// Load a small non-pinned bundle for cross-crate integration tests.
@@ -554,14 +601,33 @@ impl Qwen35SaltV2LanguageMtpModel {
     /// # Errors
     /// Returns the same structural, provenance, geometry, and backend errors as
     /// [`Self::load_bundle_profile`].
-    #[cfg(feature = "test-fixtures")]
+    #[cfg(any(test, feature = "test-fixtures"))]
     #[doc(hidden)]
     pub fn load_bundle_profile_test_fixture(
         bundle_dir: &Path,
         profile: &str,
         backend: Box<dyn TernaryBackend>,
     ) -> Result<Self, NnError> {
-        Self::load_bundle_profile_with_policy(bundle_dir, profile, backend, false)
+        Self::load_bundle_profile_with_policy(bundle_dir, profile, backend, false, None)
+    }
+
+    /// Fixture-only counterpart of [`Self::load_bundle_scale_update_child`].
+    #[cfg(any(test, feature = "test-fixtures"))]
+    #[doc(hidden)]
+    pub fn load_bundle_scale_update_child_test_fixture(
+        bundle_dir: &Path,
+        profile: &str,
+        child_package_path: &Path,
+        lineage: SaltV2ScaleUpdateChild,
+        backend: Box<dyn TernaryBackend>,
+    ) -> Result<Self, NnError> {
+        Self::load_bundle_profile_with_policy(
+            bundle_dir,
+            profile,
+            backend,
+            false,
+            Some((child_package_path, lineage)),
+        )
     }
 
     fn load_bundle_profile_with_policy(
@@ -569,6 +635,7 @@ impl Qwen35SaltV2LanguageMtpModel {
         profile: &str,
         backend: Box<dyn TernaryBackend>,
         require_pinned_config: bool,
+        child: Option<(&Path, SaltV2ScaleUpdateChild)>,
     ) -> Result<Self, NnError> {
         if !matches!(profile, "compact-v1" | "near-lossless-v1") {
             return Err(NnError::InvalidArtifact(
@@ -597,8 +664,61 @@ impl Qwen35SaltV2LanguageMtpModel {
         if require_pinned_config {
             config.validate_pinned_qwen36_27b(&manifest.source_revision)?;
         }
-        let package_path = bundle_dir.join(&profile_manifest.file);
-        let package_file = open_regular(&package_path, "SALT V2 profile")?;
+        let parent_package_file =
+            open_regular(&bundle_dir.join(&profile_manifest.file), "SALT V2 profile")?;
+        let parent_package = SaltV2PackageReader::new_strict(parent_package_file)
+            .map_err(|error| NnError::InvalidArtifact(format!("open SALT V2 profile: {error}")))?;
+        if parent_package.package_id().to_string() != profile_manifest.package_id {
+            return Err(NnError::Provenance(
+                "SALT V2 parent profile identity differs from manifest".into(),
+            ));
+        }
+        let parent_ledger = parent_package.ledger();
+        let parent_runtime_ledger = parent_package
+            .indexed_runtime_ledger()
+            .map_err(|error| NnError::InvalidArtifact(error.to_string()))?;
+        if parent_ledger.total_bytes != profile_manifest.serialized_bytes
+            || parent_runtime_ledger.steady_resident_bytes() != profile_manifest.resident_bytes
+            || codec_name(parent_package.codec()) != manifest.packing
+        {
+            return Err(NnError::Provenance(
+                "SALT V2 profile codec or physical ledger differs from manifest".into(),
+            ));
+        }
+        let expected_loaded_package_id = child.map_or_else(
+            || profile_manifest.package_id.clone(),
+            |(_, lineage)| lineage.child_package_id().to_string(),
+        );
+        let child_lineage = child.map(|(_, lineage)| lineage);
+        let (package, package_ledger, runtime_ledger) = if let Some((child_path, lineage)) = child {
+            if lineage.parent_package_id().to_string() != profile_manifest.package_id {
+                return Err(NnError::Provenance(
+                    "scale-update child lineage names a different parent profile".into(),
+                ));
+            }
+            let child_file = open_regular(child_path, "SALT V2 scale-update child")?;
+            let child_package = SaltV2PackageReader::new_strict(child_file).map_err(|error| {
+                NnError::InvalidArtifact(format!("open SALT V2 scale-update child: {error}"))
+            })?;
+            let child_ledger = child_package.ledger();
+            let child_runtime_ledger = child_package
+                .indexed_runtime_ledger()
+                .map_err(|error| NnError::InvalidArtifact(error.to_string()))?;
+            if child_package.package_id() != lineage.child_package_id()
+                || child_package.package_id() == parent_package.package_id()
+                || child_ledger.total_bytes != parent_ledger.total_bytes
+                || child_runtime_ledger.steady_resident_bytes()
+                    != parent_runtime_ledger.steady_resident_bytes()
+                || codec_name(child_package.codec()) != manifest.packing
+            {
+                return Err(NnError::Provenance(
+                    "scale-update child identity, codec, or physical ledger is invalid".into(),
+                ));
+            }
+            (child_package, child_ledger, child_runtime_ledger)
+        } else {
+            (parent_package, parent_ledger, parent_runtime_ledger)
+        };
         let preserved_bytes = read_regular(
             &bundle_dir.join(&manifest.preserved.file),
             MAX_PRESERVED_BYTES,
@@ -616,13 +736,7 @@ impl Qwen35SaltV2LanguageMtpModel {
                 "preserved tensor identity differs from bundle manifest".into(),
             ));
         }
-        let package = SaltV2PackageReader::new_strict(package_file)
-            .map_err(|error| NnError::InvalidArtifact(format!("open SALT V2 profile: {error}")))?;
-        let package_ledger = package.ledger();
-        let runtime_ledger = package
-            .indexed_runtime_ledger()
-            .map_err(|error| NnError::InvalidArtifact(error.to_string()))?;
-        if package.package_id().to_string() != profile_manifest.package_id
+        if package.package_id().to_string() != expected_loaded_package_id
             || package_ledger.total_bytes != profile_manifest.serialized_bytes
             || runtime_ledger.steady_resident_bytes() != profile_manifest.resident_bytes
             || codec_name(package.codec()) != manifest.packing
@@ -696,6 +810,10 @@ impl Qwen35SaltV2LanguageMtpModel {
                 declared_official_payload_authenticated: manifest.official_payload_authenticated,
                 config_package_id,
                 package_id,
+                parent_package_id: child_lineage
+                    .map(|lineage| lineage.parent_package_id().to_string()),
+                scale_update_set_digest: child_lineage.map(|lineage| lineage.update_set_digest()),
+                scale_update_lineage_id: child_lineage.map(|lineage| lineage.lineage_id()),
                 preserved_package_id,
                 codec,
                 matrix_tensors,
@@ -1261,7 +1379,8 @@ mod tests {
     use tritium_format::{
         PackageId,
         salt_v2_package::{
-            SaltV2Package, SaltV2Plane, SaltV2Tensor, SaltV2Tile, write_salt_v2_package,
+            SaltV2Package, SaltV2Plane, SaltV2ScaleUpdate, SaltV2Tensor, SaltV2Tile,
+            write_salt_v2_package, write_salt_v2_scale_update_child,
         },
     };
     use tritium_spec::{BackendError, DeviceBuffer, DeviceCaps, GemmShape, MpGemm, TernaryFormat};
@@ -1545,6 +1664,7 @@ mod tests {
             "compact-v1",
             Box::new(tritium_cpu::CpuBackend::new()),
             false,
+            None,
         )
         .unwrap();
         let receipt = model.receipt().clone();
@@ -1578,6 +1698,105 @@ mod tests {
                 + package_serialized_bytes
                 + preserved_serialized_bytes
         );
+
+        let mut parent_package = SaltV2PackageReader::new_strict(
+            File::open(files.directory.join("compact.tsalt2")).unwrap(),
+        )
+        .unwrap();
+        let child_update = SaltV2ScaleUpdate::new(0, 0, 0, vec![f16::from_f32(0.75)]).unwrap();
+        let (child_output, child_lineage) = write_salt_v2_scale_update_child(
+            &mut parent_package,
+            std::io::Cursor::new(Vec::new()),
+            std::slice::from_ref(&child_update),
+        )
+        .unwrap();
+        let child_path = files.directory.join("scale-child.tsalt2");
+        fs::write(&child_path, child_output.into_inner()).unwrap();
+        let child_model =
+            Qwen35SaltV2LanguageMtpModel::load_bundle_scale_update_child_test_fixture(
+                &files.directory,
+                "compact-v1",
+                &child_path,
+                child_lineage,
+                Box::new(tritium_cpu::CpuBackend::new()),
+            )
+            .unwrap();
+        assert_eq!(
+            child_model.receipt().package_id(),
+            child_lineage.child_package_id().to_string()
+        );
+        let parent_package_id = child_lineage.parent_package_id().to_string();
+        assert_eq!(
+            child_model.receipt().parent_package_id(),
+            Some(parent_package_id.as_str())
+        );
+        assert_eq!(
+            child_model.receipt().scale_update_set_digest(),
+            Some(&child_lineage.update_set_digest())
+        );
+        assert_eq!(
+            child_model.receipt().scale_update_lineage_id(),
+            Some(&child_lineage.lineage_id())
+        );
+        assert_eq!(
+            child_model.receipt().manifest_package_id(),
+            receipt.manifest_package_id()
+        );
+        assert_eq!(
+            child_model.receipt().serialized_bytes(),
+            package_serialized_bytes
+        );
+        assert_eq!(
+            child_model.receipt().preserved_package_id(),
+            receipt.preserved_package_id()
+        );
+        let mut mutated_child = fs::read(&child_path).unwrap();
+        let mutation_index = mutated_child.len() / 2;
+        mutated_child[mutation_index] ^= 1;
+        let mutated_child_path = files.directory.join("mutated-scale-child.tsalt2");
+        fs::write(&mutated_child_path, mutated_child).unwrap();
+        assert!(
+            Qwen35SaltV2LanguageMtpModel::load_bundle_scale_update_child_test_fixture(
+                &files.directory,
+                "compact-v1",
+                &mutated_child_path,
+                child_lineage,
+                Box::new(tritium_cpu::CpuBackend::new()),
+            )
+            .is_err()
+        );
+
+        let mut original_parent = SaltV2PackageReader::new_strict(
+            File::open(files.directory.join("compact.tsalt2")).unwrap(),
+        )
+        .unwrap();
+        let (intermediate_child, _) = write_salt_v2_scale_update_child(
+            &mut original_parent,
+            std::io::Cursor::new(Vec::new()),
+            std::slice::from_ref(&child_update),
+        )
+        .unwrap();
+        let mut other_parent =
+            SaltV2PackageReader::new_strict(std::io::Cursor::new(intermediate_child.into_inner()))
+                .unwrap();
+        let (other_child, other_lineage) = write_salt_v2_scale_update_child(
+            &mut other_parent,
+            std::io::Cursor::new(Vec::new()),
+            &[SaltV2ScaleUpdate::new(0, 0, 0, vec![f16::from_f32(0.875)]).unwrap()],
+        )
+        .unwrap();
+        let other_child_path = files.directory.join("other-parent-scale-child.tsalt2");
+        fs::write(&other_child_path, other_child.into_inner()).unwrap();
+        assert!(matches!(
+            Qwen35SaltV2LanguageMtpModel::load_bundle_scale_update_child_test_fixture(
+                &files.directory,
+                "compact-v1",
+                &other_child_path,
+                other_lineage,
+                Box::new(tritium_cpu::CpuBackend::new()),
+            ),
+            Err(NnError::Provenance(_))
+        ));
 
         let mut cache = model.runner().new_cache(4).unwrap();
         let output = model.runner().forward(&[1, 2], &mut cache).unwrap();
@@ -1901,6 +2120,7 @@ mod tests {
             "compact-v1",
             Box::new(RelabelingBackend(tritium_cpu::CpuBackend::new())),
             false,
+            None,
         )
         .unwrap();
         let relabeled_transcript = relabeled
@@ -1923,6 +2143,7 @@ mod tests {
                 "compact-v1",
                 cuda,
                 false,
+                None,
             )
             .unwrap();
             assert!(model.receipt().device_resident_salt());

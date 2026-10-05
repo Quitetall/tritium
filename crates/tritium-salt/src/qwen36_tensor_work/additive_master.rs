@@ -11,6 +11,7 @@ pub use selected_allocation::{
     Qwen36OutputScopeBindingReceipt, Qwen36PackageAdmissionError, Qwen36PackageAdmissionReceipt,
     Qwen36PackageAdmittedCampaignStore, Qwen36PackageProfileReceipt, Qwen36PackageRuntimeLedger,
     Qwen36PackageScaleOnlyCampaignStore, Qwen36PackageVisitError, Qwen36PvParentContext,
+    Qwen36RefinedCandidateExecutionReceipt, Qwen36RefinedCandidateReplay,
 };
 pub use selected_allocation::{
     Qwen36AllocatedCampaignStore, Qwen36PhysicalAllocationError, Qwen36SelectedAllocationBindError,
@@ -2654,8 +2655,9 @@ mod tests {
             SaltV2MasterTensorEncoder, SaltV2MasterTrack, SaltV2PrefixLoss,
         },
         salt_v2_package::{
-            SaltV2Package, SaltV2Plane, SaltV2ScaleUpdate, SaltV2StreamTensorSpec, SaltV2Tensor,
-            SaltV2Tile, SaltV2Transform, SaltV2UniformRateModel, write_salt_v2_package,
+            SaltV2Package, SaltV2PackageReader, SaltV2Plane, SaltV2ScaleUpdate,
+            SaltV2StreamTensorSpec, SaltV2Tensor, SaltV2Tile, SaltV2Transform,
+            SaltV2UniformRateModel, write_salt_v2_package, write_salt_v2_scale_update_child,
         },
     };
     #[cfg(feature = "cuda")]
@@ -2664,11 +2666,12 @@ mod tests {
         Projection, SwiGluMlp, TiedSwiGluTrainingModel, TokenEmbedding, TransformerBlock,
     };
     use tritium_nn::{
-        NnError, QWEN36_27B_REVISION, Qwen35CheckpointConfig, Qwen35TensorSchemaRole,
-        Qwen35TensorStreamError, qwen35_language_mtp_tensor_schema,
+        NnError, QWEN36_27B_REVISION, Qwen35CheckpointConfig, Qwen35SaltV2LanguageMtpModel,
+        Qwen35TensorSchemaRole, Qwen35TensorStreamError, qwen35_language_mtp_tensor_schema,
     };
     use tritium_quantize::{
         ByteDelta, NestedProfileBudgets, OutputObjectiveWeights, OutputReconstructionAccumulator,
+        OutputReconstructionReceipt, OutputReconstructionScaleCandidate,
         OutputReconstructionSchedule, OutputReconstructionScope, OutputReconstructionSpec,
         PhysicalBytes, ProfileBudget, Qwen35SourceDtype, Qwen35TensorRole, Qwen35TensorScope,
         SaltV2Profile, select_output_reconstruction,
@@ -3517,6 +3520,91 @@ mod tests {
         selected.canonical_bytes().expect("canonical TSV2OUT v3")
     }
 
+    fn qwen_refined_output_reconstruction_bytes(
+        model: &Qwen35SaltV2LanguageMtpModel,
+        spec: &OutputReconstructionSpec,
+        candidate: OutputReconstructionScaleCandidate<'_>,
+        scope_batches: &[(&[u32], &[bool])],
+    ) -> Vec<u8> {
+        let mut block_outputs = Vec::new();
+        model
+            .try_visit_untrusted_block_outputs(
+                scope_batches.iter().map(|(tokens, _)| *tokens),
+                |block| {
+                    block_outputs.push((
+                        block.batch_index(),
+                        block.block_index(),
+                        block.hidden_size(),
+                        block.hidden_states().to_vec(),
+                    ));
+                    Ok::<_, Infallible>(())
+                },
+            )
+            .expect("collect refined block outputs");
+        let mut final_logits = Vec::new();
+        model
+            .try_visit_untrusted_final_logits(
+                scope_batches.iter().map(|(tokens, _)| *tokens),
+                |batch| {
+                    final_logits.push(batch.logits().to_vec());
+                    Ok::<_, Infallible>(())
+                },
+            )
+            .expect("collect refined final logits");
+
+        let mut accumulator = OutputReconstructionAccumulator::new(
+            spec,
+            *candidate.candidate_id(),
+            candidate.initialization_seed(),
+        )
+        .expect("start refined output candidate");
+        for scope in spec.scopes() {
+            for (batch_index, (tokens, mask)) in scope_batches.iter().enumerate() {
+                let batch_index = u32::try_from(batch_index).expect("fixture batch index");
+                match scope {
+                    OutputReconstructionScope::Block { end, .. } => {
+                        let block_index = end.checked_sub(1).expect("nonempty block scope");
+                        let (_, _, hidden_size, values) = block_outputs
+                            .iter()
+                            .find(|(batch, block, _, _)| {
+                                *batch == u64::from(batch_index) && *block == block_index
+                            })
+                            .expect("scope endpoint output");
+                        accumulator
+                            .observe(
+                                *scope,
+                                batch_index,
+                                tokens.len(),
+                                *hidden_size,
+                                mask,
+                                values,
+                                values,
+                            )
+                            .expect("observe refined block output");
+                    }
+                    OutputReconstructionScope::FinalLogits => {
+                        let logits = &final_logits[usize::try_from(batch_index).unwrap()];
+                        accumulator
+                            .observe(
+                                *scope,
+                                batch_index,
+                                1,
+                                logits.len(),
+                                &[true],
+                                logits,
+                                logits,
+                            )
+                            .expect("observe refined final logits");
+                    }
+                }
+            }
+        }
+        select_output_reconstruction(spec, vec![accumulator.finish().unwrap()])
+            .unwrap()
+            .canonical_bytes()
+            .unwrap()
+    }
+
     fn legacy_output_reconstruction_bytes(v3: &[u8]) -> Vec<u8> {
         const HEADER_BYTES: usize = 112;
         const V2_CANDIDATE_BYTES: usize = 272;
@@ -3680,12 +3768,13 @@ mod tests {
             .output_candidate_id(&output_spec)
             .expect("campaign-bound candidate identity");
         // The scale-update candidate identity commits the actual fixed-trit
-        // updates, unlike the v1 execution-derived label. Keep this mismatch
-        // explicit: TSQ36SB v1 must not treat base-model replay as evidence for
-        // an updated candidate while the versioned candidate-replay ADR is open.
+        // updates, unlike the parent execution-derived label. Base-model output
+        // evidence must therefore be rejected for this child candidate.
         let updates =
-            [SaltV2ScaleUpdate::new(0, 0, 0, vec![f16::from_f32(0.5)])
-                .expect("valid scale update")];
+            [
+                SaltV2ScaleUpdate::new(0, 0, 0, vec![f16::from_f32(0.5), f16::from_f32(0.75)])
+                    .expect("valid scale update"),
+            ];
         let scale_candidate = output_spec
             .scale_update_candidate(receipt.package_id().as_bytes(), 1, &updates)
             .expect("content-bound scale update candidate");
@@ -3722,6 +3811,64 @@ mod tests {
             (first.as_slice(), first_mask.as_slice()),
             (second.as_slice(), second_mask.as_slice()),
         ];
+        let mut parent_package = SaltV2PackageReader::new_strict(
+            std::fs::File::open(bundle.join("compact.tsalt2")).unwrap(),
+        )
+        .expect("open refined parent package");
+        let (child_output, child_lineage) = write_salt_v2_scale_update_child(
+            &mut parent_package,
+            Cursor::new(Vec::new()),
+            &updates,
+        )
+        .expect("write immutable refined child");
+        let child_package_path = bundle.join("compact.refined.tsalt2");
+        fs::write(&child_package_path, child_output.into_inner()).expect("persist refined child");
+        let child_model =
+            Qwen35SaltV2LanguageMtpModel::load_bundle_scale_update_child_test_fixture(
+                &bundle,
+                "compact-v1",
+                &child_package_path,
+                child_lineage,
+                Box::new(tritium_cpu::CpuBackend::new()),
+            )
+            .expect("load refined child fixture");
+        let refined_output_bytes = qwen_refined_output_reconstruction_bytes(
+            &child_model,
+            &output_spec,
+            scale_candidate,
+            &scope_batches,
+        );
+        let refined_receipt = session
+            .replay_refined_candidate_test_fixture(Qwen36RefinedCandidateReplay {
+                parent_execution: &receipt,
+                bundle_dir: &bundle,
+                child_package_path: &child_package_path,
+                lineage: child_lineage,
+                spec: &output_spec,
+                output_bytes: &refined_output_bytes,
+                scale_candidate,
+                scope_batches: &scope_batches,
+            })
+            .expect("replay and admit exact refined child");
+        assert_eq!(
+            refined_receipt.parent_package_id(),
+            receipt.package_id().as_bytes()
+        );
+        assert_eq!(
+            refined_receipt.child_package_id(),
+            child_lineage.child_package_id().as_bytes()
+        );
+        assert_eq!(
+            refined_receipt.child_lineage_id(),
+            &child_lineage.lineage_id()
+        );
+        let parsed_refined_output =
+            OutputReconstructionReceipt::from_canonical_bytes(&output_spec, &refined_output_bytes)
+                .expect("reopen refined output receipt");
+        assert_eq!(
+            refined_receipt.output_binding_ids().1,
+            parsed_refined_output.receipt_id()
+        );
         let scope_binding = session
             .bind_output_reconstruction_scopes(&output_spec, &output_bytes, &receipt, scope_batches)
             .expect("bind exact block scopes to campaign execution");

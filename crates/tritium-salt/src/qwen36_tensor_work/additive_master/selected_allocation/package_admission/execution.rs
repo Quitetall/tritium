@@ -1,21 +1,29 @@
 //! Campaign-owned execution admission over exact selected Qwen packages.
 
 mod output_binding;
+mod refined_candidate;
 
 pub use output_binding::{
     Qwen36FinalLogitsOutputBindingError, Qwen36FinalLogitsOutputBindingReceipt,
     Qwen36OutputScopeBindingReceipt,
 };
+use refined_candidate::ChildReplayEvidence;
+pub use refined_candidate::Qwen36RefinedCandidateExecutionReceipt;
 
 use core::{convert::Infallible, fmt};
 use std::{error::Error, path::Path};
 
-use tritium_format::{ModelId, PackageId};
+use tritium_format::{
+    ModelId, PackageId, RuntimeOutputScope, salt_v2_package::SaltV2ScaleUpdateChild,
+};
 use tritium_nn::{
     NnError, Qwen35ExecutionOutputBatch, Qwen35ExecutionVisitError, Qwen35SaltV2LanguageMtpModel,
     Qwen35UntrustedRuntimeTranscript,
 };
-use tritium_quantize::SaltV2Profile;
+use tritium_quantize::{
+    OutputReconstructionScaleCandidate, OutputReconstructionScope, OutputReconstructionSpec,
+    SaltV2Profile,
+};
 
 use crate::{ContentId, Qwen36PreservedSafetensorsError};
 
@@ -447,6 +455,27 @@ pub struct Qwen36AdmittedExecutionSession<'admission, 'allocated, 'parent, 'stor
     authority: ExecutionAuthority,
 }
 
+/// Exact inputs for a fresh, campaign-admitted scale-refined child replay.
+#[derive(Debug)]
+pub struct Qwen36RefinedCandidateReplay<'a> {
+    /// Current admitted PTQ parent execution receipt.
+    pub parent_execution: &'a Qwen36AdmittedExecutionReceipt,
+    /// Bundle directory containing the parent manifest and preserved tensors.
+    pub bundle_dir: &'a Path,
+    /// Immutable child SALT package bytes to execute.
+    pub child_package_path: &'a Path,
+    /// Verified parent/update/child package lineage.
+    pub lineage: SaltV2ScaleUpdateChild,
+    /// Frozen output-evaluation specification.
+    pub spec: &'a OutputReconstructionSpec,
+    /// Canonical output-reconstruction receipt bytes selected for this child.
+    pub output_bytes: &'a [u8],
+    /// Content-bound scale candidate matching the child lineage.
+    pub scale_candidate: OutputReconstructionScaleCandidate<'a>,
+    /// Ordered tokens and row masks for all frozen block and final-logit scopes.
+    pub scope_batches: &'a [(&'a [u32], &'a [bool])],
+}
+
 impl fmt::Debug for Qwen36AdmittedExecutionSession<'_, '_, '_, '_, '_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -462,6 +491,174 @@ impl fmt::Debug for Qwen36AdmittedExecutionSession<'_, '_, '_, '_, '_> {
 impl<'admission, 'allocated, 'parent, 'store, 'source>
     Qwen36AdmittedExecutionSession<'admission, 'allocated, 'parent, 'store, 'source>
 {
+    /// Freshly replay and admit an immutable scale-refined child of this exact
+    /// campaign package. The supplied scope batches are executed once for final
+    /// logits and again for the frozen output-reconstruction scopes; both passes
+    /// use the same ordered tokens.
+    ///
+    /// A structurally valid output receipt is not enough: this method reloads the
+    /// child package, validates its parent lineage and physical ledgers, replays
+    /// it on the sealed built-in backend, and binds the resulting transcript to
+    /// the selected output receipt and current campaign admission.
+    ///
+    /// # Errors
+    /// Fails closed if the campaign admission changes, the child is not descended
+    /// from this session's exact package, package loading or runtime replay fails,
+    /// or any output/candidate/transcript identity differs.
+    pub fn replay_refined_candidate(
+        &self,
+        replay: Qwen36RefinedCandidateReplay<'_>,
+    ) -> Result<Qwen36RefinedCandidateExecutionReceipt, Qwen36ExecutionVisitError<Infallible>> {
+        self.admission
+            .verify_current()
+            .map_err(Qwen36ExecutionVisitError::Admission)?;
+        output_binding::validate_execution(&self.authority, replay.parent_execution)
+            .map_err(Qwen36ExecutionVisitError::Runtime)?;
+        if replay.lineage.parent_package_id() != self.authority.package_id
+            || replay.scale_candidate.parent_package_digest()
+                != self.authority.package_id.as_bytes()
+            || replay.scale_candidate.spec_id() != replay.spec.spec_id()
+            || replay.spec.source_model_id() != self.authority.source_model_id
+            || replay.spec.token_stream_digest() != replay.parent_execution.token_stream_digest()
+            || replay.scope_batches.is_empty()
+        {
+            return Err(Qwen36ExecutionVisitError::Runtime(NnError::Provenance(
+                "refined candidate does not match this admitted parent and output schedule"
+                    .to_owned(),
+            )));
+        }
+
+        let mut child_authority = self.authority.clone();
+        child_authority.package_id = replay.lineage.child_package_id();
+        let child_model = match child_authority.backend {
+            Qwen36ExecutionBackend::Cpu => {
+                Qwen35SaltV2LanguageMtpModel::load_bundle_scale_update_child(
+                    replay.bundle_dir,
+                    profile_name(child_authority.profile),
+                    replay.child_package_path,
+                    replay.lineage,
+                    Box::new(tritium_cpu::CpuBackend::new()),
+                )
+            }
+            #[cfg(feature = "cuda")]
+            Qwen36ExecutionBackend::Cuda { ordinal } => {
+                let ordinal = usize::try_from(ordinal).map_err(|_| {
+                    Qwen36ExecutionVisitError::Runtime(NnError::Backend(
+                        "CUDA ordinal exceeds usize".to_owned(),
+                    ))
+                })?;
+                let backend = tritium_cuda::CudaBackend::new(ordinal)
+                    .map_err(|error| Qwen36ExecutionVisitError::Runtime(NnError::from(error)))?;
+                Qwen35SaltV2LanguageMtpModel::load_bundle_scale_update_child(
+                    replay.bundle_dir,
+                    profile_name(child_authority.profile),
+                    replay.child_package_path,
+                    replay.lineage,
+                    Box::new(backend),
+                )
+            }
+            #[cfg(not(feature = "cuda"))]
+            Qwen36ExecutionBackend::Cuda { .. } => {
+                return Err(Qwen36ExecutionVisitError::Runtime(NnError::Backend(
+                    "CUDA refined replay requires the cuda feature".to_owned(),
+                )));
+            }
+        }
+        .map_err(Qwen36ExecutionVisitError::Runtime)?;
+
+        self.replay_refined_candidate_with_model(replay, child_model)
+    }
+
+    fn replay_refined_candidate_with_model(
+        &self,
+        replay: Qwen36RefinedCandidateReplay<'_>,
+        child_model: Qwen35SaltV2LanguageMtpModel,
+    ) -> Result<Qwen36RefinedCandidateExecutionReceipt, Qwen36ExecutionVisitError<Infallible>> {
+        self.admission
+            .verify_current()
+            .map_err(Qwen36ExecutionVisitError::Admission)?;
+        output_binding::validate_execution(&self.authority, replay.parent_execution)
+            .map_err(Qwen36ExecutionVisitError::Runtime)?;
+        if replay.lineage.parent_package_id() != self.authority.package_id
+            || replay.scale_candidate.parent_package_digest()
+                != self.authority.package_id.as_bytes()
+            || replay.scale_candidate.spec_id() != replay.spec.spec_id()
+            || replay.spec.source_model_id() != self.authority.source_model_id
+            || replay.spec.token_stream_digest() != replay.parent_execution.token_stream_digest()
+            || replay.scope_batches.is_empty()
+        {
+            return Err(Qwen36ExecutionVisitError::Runtime(NnError::Provenance(
+                "refined candidate does not match this admitted parent and output schedule"
+                    .to_owned(),
+            )));
+        }
+        let mut child_authority = self.authority.clone();
+        child_authority.package_id = replay.lineage.child_package_id();
+        validate_loaded_model(&child_authority, &child_model)
+            .map_err(Qwen36ExecutionVisitError::Runtime)?;
+
+        let scopes = output_runtime_scopes(replay.spec)?;
+        let mut final_batches = Vec::new();
+        final_batches
+            .try_reserve_exact(replay.scope_batches.len())
+            .map_err(|_| {
+                Qwen36ExecutionVisitError::Runtime(NnError::ResourceExhausted(
+                    "allocate refined replay batch references".to_owned(),
+                ))
+            })?;
+        final_batches.extend(replay.scope_batches.iter().map(|(tokens, _)| *tokens));
+        let transcript = child_model
+            .try_visit_untrusted_final_logits(final_batches.iter().copied(), |_| {
+                Ok::<_, Infallible>(())
+            })
+            .map_err(map_execution_error)?;
+        validate_transcript(&child_authority, &transcript)
+            .map_err(Qwen36ExecutionVisitError::Runtime)?;
+        let scope_transcript = child_model
+            .try_visit_untrusted_output_scopes(
+                replay.spec.spec_id(),
+                replay.scale_candidate.candidate_id(),
+                replay.scale_candidate.initialization_seed(),
+                &scopes,
+                replay.scope_batches.iter().copied(),
+            )
+            .map_err(map_execution_error)?;
+
+        self.admission
+            .verify_current()
+            .map_err(Qwen36ExecutionVisitError::Admission)?;
+        Qwen36RefinedCandidateExecutionReceipt::from_child_replay(
+            replay.parent_execution,
+            replay.lineage,
+            ChildReplayEvidence {
+                spec: replay.spec,
+                output_bytes: replay.output_bytes,
+                scale_candidate: replay.scale_candidate,
+                transcript: &transcript,
+                scope_transcript: &scope_transcript,
+                backend: child_authority.backend,
+            },
+        )
+        .map_err(Qwen36ExecutionVisitError::Runtime)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replay_refined_candidate_test_fixture(
+        &self,
+        replay: Qwen36RefinedCandidateReplay<'_>,
+    ) -> Result<Qwen36RefinedCandidateExecutionReceipt, Qwen36ExecutionVisitError<Infallible>> {
+        let child_model =
+            Qwen35SaltV2LanguageMtpModel::load_bundle_scale_update_child_test_fixture(
+                replay.bundle_dir,
+                profile_name(self.authority.profile),
+                replay.child_package_path,
+                replay.lineage,
+                Box::new(tritium_cpu::CpuBackend::new()),
+            )
+            .map_err(Qwen36ExecutionVisitError::Runtime)?;
+        self.replay_refined_candidate_with_model(replay, child_model)
+    }
+
     /// Execute exact token batches and mint campaign-admitted final-logit evidence.
     ///
     /// # Errors
@@ -708,6 +905,25 @@ struct ExecutionAuthority {
     identity_status: &'static str,
     official_payload_authenticated: bool,
     backend: Qwen36ExecutionBackend,
+}
+
+fn output_runtime_scopes(
+    spec: &OutputReconstructionSpec,
+) -> Result<Vec<RuntimeOutputScope>, Qwen36ExecutionVisitError<Infallible>> {
+    let mut scopes = Vec::new();
+    scopes.try_reserve_exact(spec.scopes().len()).map_err(|_| {
+        Qwen36ExecutionVisitError::Runtime(NnError::ResourceExhausted(
+            "allocate refined output-scope schedule".to_owned(),
+        ))
+    })?;
+    scopes.extend(spec.scopes().iter().map(|scope| match scope {
+        OutputReconstructionScope::Block { start, end } => RuntimeOutputScope::Block {
+            start: *start,
+            end: *end,
+        },
+        OutputReconstructionScope::FinalLogits => RuntimeOutputScope::FinalLogits,
+    }));
+    Ok(scopes)
 }
 
 fn execution_authority(

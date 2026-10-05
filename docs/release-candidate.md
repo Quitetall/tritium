@@ -360,6 +360,40 @@ recipe-freeze measurements, establish a terminal recipe decision, or create a
 candidate-bound `stage7-recipe-freeze` release receipt. That empirical gate
 remains open.
 
+### GDN sensitivity receipt verifier alignment (2026-10-05)
+
+The local GDN sensitivity receipt verifier now requires both output- and
+state-divergence curves at every frozen sequence-depth point. It reports
+DeltaNet maximum and full-attention median terminal state divergence as
+diagnostics; the frozen routing decision remains based only on terminal output
+divergence. The focused verifier and probe-preflight suites pass (16 tests),
+Python compilation passes, and `git diff --check` passes. These are local
+software checks only: no measurement receipt was produced and no Qwen weights
+were loaded.
+
+The production measurement producer is still missing. The Qwen runtime now has
+an internal paired-sampling seam that can collect final hidden rows and selected
+DeltaNet recurrent states at frozen token positions; fixture tests exercise it.
+That is not yet a source-bound measurement producer: no agreed divergence
+calculation has been applied, no eight-probe measurement has run against the
+approved calibration pack, and no measurement receipt has been produced. Do not
+start those probes until the divergence metric is frozen. No probe execution or
+flagship campaign was started for this software change.
+
+### Admitted scale-refined child execution (2026-10-05)
+
+`Qwen36AdmittedExecutionSession::replay_refined_candidate` now reopens an
+immutable scale-update child under the exact admitted parent profile, validates
+parent/child identity and physical ledgers, freshly executes final logits and
+the frozen output scopes on the sealed built-in backend, and mints the separate
+`TSQ36RC v1` refined-execution receipt. The focused synthetic end-to-end test
+`admitted_qwen_execution_binds_campaign_packages_backend_tokens_and_outputs`
+passed, and `cargo test --locked -p tritium-salt --lib` passed (65 passed, 2
+ignored). `cargo clippy --locked -p tritium-salt --all-targets -- -D warnings`
+also passed. This verifies the campaign API and receipt path on a small CPU fixture
+only. No pinned Qwen checkpoint was loaded; this is not Stage-9 quality,
+performance, physical-size, CUDA, or release evidence.
+
 ### Flagship campaign status refresh (2026-10-04)
 
 The canonical read-only probe was rerun against the durable workspace
@@ -801,6 +835,10 @@ The replay helper now exposes `capture_binding()` and durable
 contract, native session identity and ordered S2KF evidence-set digest. Its
 reopen path is covered with a fake native session in unit tests only; no real
 Qwen capture receipt or complete 506-record evidence namespace exists yet.
+On 2026-10-05, the capture-from-pack, calibration-replay, and calibration-pack
+validator suites passed locally (22 tests and 10 subtests). They validate
+software behavior with fixtures; they do not provide a real native reopen or
+admit the recovered legacy captures.
 
 ### Hosted package evidence from PR #51 (2026-10-01)
 
