@@ -599,12 +599,36 @@ jobs:
         run: |
           set -euo pipefail
           python -m unittest scripts.tests.test_qualify_smollm2_release_tutorial -v
-          python -I scripts/qualify-smollm2-release-tutorial.py \
+          python -u -I scripts/qualify-smollm2-release-tutorial.py \
             --wheel dist/*.whl \
             --output-dir evidence/smollm2-cpu \
             --source-revision "$TRITIUM_SOURCE_REVISION" \
             --release "${{ needs.wheels.outputs.release }}" \
-            --run-id "github-${{ github.run_id }}-${{ github.run_attempt }}-smollm2-cpu"
+            --run-id "github-${{ github.run_id }}-${{ github.run_attempt }}-smollm2-cpu" &
+          tutorial_pid=$!
+          while kill -0 "$tutorial_pid" 2>/dev/null; do
+            printf '[SMOLLM2_RESOURCE] utc=%s ' "$(date -u +%FT%TZ)"
+            awk '/MemAvailable:/ { printf "mem_available_kib=%s ", $2 }' /proc/meminfo
+            printf 'runner_temp_disk='
+            df -Pk "$RUNNER_TEMP" | awk 'NR == 2 { printf "available_kib=%s ", $4 }'
+            if [[ -r /sys/fs/cgroup/memory.current ]]; then
+              printf 'cgroup_memory_current_bytes=%s ' "$(< /sys/fs/cgroup/memory.current)"
+            fi
+            if [[ -r /sys/fs/cgroup/memory.events ]]; then
+              printf 'cgroup_memory_events='
+              tr '\n' ',' < /sys/fs/cgroup/memory.events
+              printf ' '
+            fi
+            printf 'top_processes_rss_kib_comm='
+            ps -eo rss=,comm= --sort=-rss | sed -n '1,5p' | tr '\n' ';'
+            printf '\n'
+            sleep 15
+          done
+          set +e
+          wait "$tutorial_pid"
+          tutorial_status=$?
+          set -e
+          exit "$tutorial_status"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: smollm2-cpu-tutorial
