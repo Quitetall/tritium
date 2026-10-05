@@ -187,5 +187,5 @@ tritium report decode --model ggml-model-i2_s.gguf --tokens tokens.json \
 - **v1.1 is not yet qualified.** A parser, layer fixture, source-admission
   receipt, or passing small-model test is narrower than full-model fidelity,
   physical-byte accounting, runtime, or independent reproduction. The
-  [release plan](../../plans/0044-v11-full-public-release.md) defines the gates;
-  a pending or missing receipt is not a pass.
+  tracked [release evidence record](../../release-candidate.md) shows which
+  gates have evidence. A pending or missing receipt is not a pass.
