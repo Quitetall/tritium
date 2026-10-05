@@ -1456,3 +1456,24 @@ and this checkout contains unrelated user-owned EAT-O changes. It did not
 compile the WASM guest or reach its own TypeScript stage. `wasm-bindgen` is not
 installed on this machine, so the complete WASM build remains unverified. The
 direct TypeScript passes do not close browser or physical WebGPU gates.
+
+### PyTorch and browser-source software checks — 2026-10-04
+
+At code baseline `0fd7685c26b687f3e846237a23c39adfb2108d9b`, the broader local
+reference suite reported:
+
+```text
+PYTHONPATH=crates/tritium-py/python pytest -q -rs \
+  crates/tritium-py/tests/test_torch_api.py \
+  crates/tritium-py/tests/test_autograd.py \
+  crates/tritium-py/tests/test_hf_lifecycle_receipt.py
+24 passed, 2 skipped
+npm --prefix packages/tritium-web run check:generated
+passed
+```
+
+Both skips require the installed `pytritium` wheel; no local wheel was
+qualified by this run. The two TypeScript projects pass direct `tsc --noEmit`
+checks as recorded above. This verifies local reference/package source
+behavior only; the full wheel build/install, WebAssembly build and physical
+browser WebGPU checks remain separate gates.
