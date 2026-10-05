@@ -32,6 +32,7 @@ def receipt(delta_terminal: float = 1.0, control_terminal: float = 1.0) -> dict:
                     "weight_mse": 0.25,
                     "sequence_positions": [128, 512, 2048],
                     "output_divergence": [terminal / 4, terminal / 2, terminal],
+                    "state_divergence": [terminal / 2, terminal, terminal * 2],
                 }
             )
     result = {
@@ -96,6 +97,8 @@ class QwenGdnSensitivityReceiptTests(unittest.TestCase):
         verified = MODULE.verify(receipt(delta_terminal=2.0, control_terminal=1.0))
         self.assertEqual(verified["gate"], "pass")
         self.assertEqual(verified["route_to_refined_track"], [])
+        self.assertEqual(verified["deltanet_state_divergence_max"], 4.0)
+        self.assertEqual(verified["full_attention_state_divergence_median"], 2.0)
         self.assertEqual(verified["evidence_scope"], "receipt-structure-and-rule-only")
 
     def test_receipt_routes_delta_family_when_terminal_exceeds_two_times_median(self):
@@ -158,6 +161,24 @@ class QwenGdnSensitivityReceiptTests(unittest.TestCase):
             MODULE.verify(changed)
         with self.assertRaisesRegex(MODULE.ReceiptError, "duplicate field"):
             MODULE._object([("schema", MODULE.SCHEMA), ("schema", MODULE.SCHEMA)])
+
+    def test_receipt_requires_comparable_state_divergence_curves(self):
+        changed = receipt()
+        del changed["probes"][0]["state_divergence"]
+        reseal(changed)
+        with self.assertRaisesRegex(MODULE.ReceiptError, "frozen schema"):
+            MODULE.verify(changed)
+
+        changed = receipt()
+        changed["probes"][0]["state_divergence"] = [0.5, 1.0]
+        reseal(changed)
+        with self.assertRaisesRegex(MODULE.ReceiptError, "state-divergence curve"):
+            MODULE.verify(changed)
+
+        changed = receipt()
+        changed["probes"][0]["state_divergence"][1] = float("inf")
+        with self.assertRaisesRegex(MODULE.ReceiptError, "outside its allowed range"):
+            MODULE.verify(changed)
 
     def test_measurement_can_be_joined_to_exact_preflight_names_and_ordinals(self):
         measured = receipt()

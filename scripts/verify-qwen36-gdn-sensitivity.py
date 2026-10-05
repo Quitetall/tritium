@@ -181,12 +181,14 @@ def verify(value: Any, preflight: Any | None = None) -> dict[str, Any]:
     seen_indices: set[int] = set()
     classes_by_family: dict[str, set[str]] = {family: set() for family in FAMILIES}
     common_positions: list[int] | None = None
-    terminals: dict[str, list[float]] = {family: [] for family in FAMILIES}
+    output_terminals: dict[str, list[float]] = {family: [] for family in FAMILIES}
+    state_terminals: dict[str, list[float]] = {family: [] for family in FAMILIES}
     for index, probe in enumerate(probes):
         fields = {
             "family", "tensor_class", "tensor_name", "tensor_index",
             "source_weight_sha256", "ternary_artifact_sha256", "bpw",
             "weight_mse", "sequence_positions", "output_divergence",
+            "state_divergence",
         }
         if not isinstance(probe, dict) or set(probe) != fields:
             raise ReceiptError(f"probe {index} fields differ from the frozen schema")
@@ -210,9 +212,15 @@ def verify(value: Any, preflight: Any | None = None) -> dict[str, Any]:
         if _finite_nonnegative(probe["bpw"], f"probe {index} bpw", positive=True) != bpw:
             raise ReceiptError("all probes must use the same matched bpw")
         _finite_nonnegative(probe["weight_mse"], f"probe {index} weight MSE")
-        positions, curve = probe["sequence_positions"], probe["output_divergence"]
+        positions = probe["sequence_positions"]
+        curve = probe["output_divergence"]
+        state_curve = probe["state_divergence"]
         if not isinstance(positions, list) or not isinstance(curve, list) or len(positions) < 2 or len(positions) != len(curve):
             raise ReceiptError(f"probe {index} must contain a multi-depth divergence curve")
+        if not isinstance(state_curve, list) or len(state_curve) != len(positions):
+            raise ReceiptError(
+                f"probe {index} state-divergence curve must match its sequence-depth points"
+            )
         previous = -1
         for depth in positions:
             if isinstance(depth, bool) or not isinstance(depth, int) or depth <= previous or depth > TOKENS_PER_SEQUENCE:
@@ -226,16 +234,22 @@ def verify(value: Any, preflight: Any | None = None) -> dict[str, Any]:
             raise ReceiptError("all probes must measure the same sequence-depth points")
         for point, metric in enumerate(curve):
             _finite_nonnegative(metric, f"probe {index} divergence point {point}")
-        terminals[family].append(float(curve[-1]))
+        for point, metric in enumerate(state_curve):
+            _finite_nonnegative(metric, f"probe {index} state divergence point {point}")
+        output_terminals[family].append(float(curve[-1]))
+        state_terminals[family].append(float(state_curve[-1]))
 
-    counts = {family: len(terminals[family]) for family in FAMILIES}
+    counts = {family: len(output_terminals[family]) for family in FAMILIES}
     if counts != {"deltanet": 4, "full_attention": 4}:
         raise ReceiptError("probe set must contain four matrices from each block family")
     if any(classes != set(TENSOR_CLASSES) for classes in classes_by_family.values()):
         raise ReceiptError("each family must cover the four frozen tensor classes")
-    full = sorted(terminals["full_attention"])
+    full = sorted(output_terminals["full_attention"])
     control_median = (full[1] + full[2]) / 2
-    delta_max = max(terminals["deltanet"])
+    delta_max = max(output_terminals["deltanet"])
+    full_state = sorted(state_terminals["full_attention"])
+    state_control_median = (full_state[1] + full_state[2]) / 2
+    delta_state_max = max(state_terminals["deltanet"])
     routed_classes = sorted(
         {
             probe["tensor_class"]
@@ -262,6 +276,8 @@ def verify(value: Any, preflight: Any | None = None) -> dict[str, Any]:
         "matched_bpw": bpw,
         "deltanet_terminal_divergence_max": delta_max,
         "full_attention_terminal_divergence_median": control_median,
+        "deltanet_state_divergence_max": delta_state_max,
+        "full_attention_state_divergence_median": state_control_median,
         "threshold_ratio": THRESHOLD_RATIO,
         "gate": "fail" if routed_classes else "pass",
         "route_to_refined_track": routed_classes,
