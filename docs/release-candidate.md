@@ -24,6 +24,15 @@ candidate-bound `distributed-training` release receipt and does not qualify
 multi-GPU execution, CUDA checkpointing, or performance. The `pytorch-hf` gate
 remains PARTIAL until its required two-or-more-GPU evidence is registered.
 
+The source-tree PyTorch dispatcher checks also passed on this branch head:
+`/home/brianklam/.cache/tritium-py313-ci/bin/python -m pytest -q
+crates/tritium-py/tests/test_torch_dispatch.py -k
+'opcheck_and_fullgraph_compile or supports_functorch_grad_and_vmap'` reported
+2 passed, 34 deselected. This checks the CPU ternary op's `torch.library`
+opcheck, full-graph eager-backend compilation, `torch.func.grad`, and vmap
+behavior. It is narrow local software evidence, not a built-wheel check, GPU
+qualification, or a distributed-training receipt.
+
 ### PR CI on release-input-admission (2026-10-04)
 
 GitHub CI, docs, capstone CPU smoke, wheels, and CodeQL all passed for branch
