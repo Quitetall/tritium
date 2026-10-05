@@ -67,7 +67,76 @@ def _finite_nonnegative(value: Any, label: str, *, positive: bool = False) -> fl
     return result
 
 
-def verify(value: Any) -> dict[str, Any]:
+def verify_preflight(value: Any, probes: list[dict[str, Any]]) -> str:
+    """Bind a measured probe list to the content-addressed local preflight."""
+    required = {
+        "schema", "repository", "revision", "state", "evidence_scope",
+        "config_sha256", "weight_index_sha256", "probes", "limitations",
+        "preflight_id",
+    }
+    if not isinstance(value, dict) or set(value) != required:
+        raise ReceiptError("probe preflight fields differ from its frozen schema")
+    if (
+        value["schema"] != "tritium.qwen36-gdn-probe-preflight.v1"
+        or value["repository"] != REPOSITORY
+        or value["revision"] != REVISION
+        or value["state"] != "prepared-not-measured"
+        or value["evidence_scope"] != "local-config-index-and-safetensors-header-only"
+    ):
+        raise ReceiptError("probe preflight is not the expected pinned local inventory record")
+    _digest(value["config_sha256"], "preflight config")
+    _digest(value["weight_index_sha256"], "preflight weight index")
+    if not isinstance(value["limitations"], list) or not all(
+        isinstance(item, str) and item for item in value["limitations"]
+    ):
+        raise ReceiptError("probe preflight limitations are malformed")
+    prepared_probes = value["probes"]
+    if not isinstance(prepared_probes, list) or len(prepared_probes) != 8:
+        raise ReceiptError("probe preflight must contain exactly eight selections")
+    selected_fields = ("family", "tensor_class", "tensor_name", "tensor_index")
+    expected = []
+    for item in prepared_probes:
+        if not isinstance(item, dict) or set(item) != {
+            "family", "tensor_class", "tensor_name", "tensor_index",
+            "layer", "shape", "source_shard",
+        }:
+            raise ReceiptError("probe preflight selection fields are malformed")
+        if (
+            item["family"] not in FAMILIES
+            or item["tensor_class"] not in TENSOR_CLASSES
+            or not isinstance(item["tensor_name"], str)
+            or not item["tensor_name"]
+            or isinstance(item["tensor_index"], bool)
+            or not isinstance(item["tensor_index"], int)
+            or item["tensor_index"] < 0
+            or isinstance(item["layer"], bool)
+            or not isinstance(item["layer"], int)
+            or item["layer"] < 0
+            or not isinstance(item["shape"], list)
+            or len(item["shape"]) != 2
+            or any(type(size) is not int or size <= 0 for size in item["shape"])
+            or not isinstance(item["source_shard"], str)
+            or not item["source_shard"]
+        ):
+            raise ReceiptError("probe preflight selection values are malformed")
+        expected.append(tuple(item[field] for field in selected_fields))
+    expected.sort()
+    measured = sorted(
+        tuple(item[field] for field in selected_fields)
+        for item in probes
+    )
+    if expected != measured:
+        raise ReceiptError("measured probes differ from the prepared tensor names or ordinals")
+    preflight_id = value["preflight_id"]
+    _digest(preflight_id, "preflight_id", prefixed=True)
+    body = {key: item for key, item in value.items() if key != "preflight_id"}
+    expected_id = "sha256:" + hashlib.sha256(canonical(body)).hexdigest()
+    if preflight_id != expected_id:
+        raise ReceiptError("preflight_id does not match canonical preflight content")
+    return preflight_id
+
+
+def verify(value: Any, preflight: Any | None = None) -> dict[str, Any]:
     """Validate the frozen eight-probe receipt and derive its routing decision."""
     required = {
         "schema", "repository", "revision", "source_model_id",
@@ -183,7 +252,7 @@ def verify(value: Any) -> dict[str, Any]:
     expected_id = "sha256:" + hashlib.sha256(canonical(body)).hexdigest()
     if declared_id != expected_id:
         raise ReceiptError("receipt_id does not match canonical receipt content")
-    return {
+    result = {
         "schema": "tritium.qwen36-gdn-sensitivity-verification.v1",
         "receipt_id": declared_id,
         "result": "receipt-structure-valid",
@@ -195,34 +264,50 @@ def verify(value: Any) -> dict[str, Any]:
         "route_to_refined_track": routed_classes,
         "evidence_scope": "receipt-structure-and-rule-only",
     }
+    if preflight is not None:
+        result["preflight_id"] = verify_preflight(preflight, probes)
+        result["evidence_scope"] = "receipt-structure-rule-and-local-preflight-join-only"
+    return result
+
+
+def _load_receipt(path: Path, label: str) -> Any:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_size <= 0 or before.st_size > MAX_RECEIPT_BYTES:
+            raise ReceiptError(f"{label} must be a bounded ordinary file")
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            payload = stream.read(MAX_RECEIPT_BYTES + 1)
+        after = os.fstat(descriptor)
+        if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
+            after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns
+        ) or len(payload) != before.st_size:
+            raise ReceiptError(f"{label} changed while being read")
+    finally:
+        os.close(descriptor)
+    try:
+        return json.loads(
+            payload.decode("utf-8"),
+            object_pairs_hook=_object,
+            parse_constant=lambda item: (_ for _ in ()).throw(ReceiptError(f"invalid number {item}")),
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ReceiptError(f"{label} must be strict UTF-8 JSON") from error
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("receipt", type=Path)
+    parser.add_argument(
+        "--preflight", type=Path,
+        help="optionally require exact agreement with a prepared local probe-selection manifest",
+    )
     args = parser.parse_args()
     try:
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(args.receipt, flags)
-        try:
-            before = os.fstat(descriptor)
-            if not stat.S_ISREG(before.st_mode) or before.st_size <= 0 or before.st_size > MAX_RECEIPT_BYTES:
-                raise ReceiptError("receipt must be a bounded ordinary file")
-            with os.fdopen(descriptor, "rb", closefd=False) as stream:
-                payload = stream.read(MAX_RECEIPT_BYTES + 1)
-            after = os.fstat(descriptor)
-            if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
-                after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns
-            ) or len(payload) != before.st_size:
-                raise ReceiptError("receipt changed while being read")
-        finally:
-            os.close(descriptor)
-        value = json.loads(
-            payload.decode("utf-8"),
-            object_pairs_hook=_object,
-            parse_constant=lambda item: (_ for _ in ()).throw(ReceiptError(f"invalid number {item}")),
-        )
-        result = verify(value)
+        value = _load_receipt(args.receipt, "receipt")
+        preflight = _load_receipt(args.preflight, "preflight") if args.preflight else None
+        result = verify(value, preflight)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ReceiptError) as error:
         parser.error(str(error))
     print(json.dumps(result, sort_keys=True, separators=(",", ":")))

@@ -41,6 +41,12 @@ def _pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
+def canonical(value: Any) -> bytes:
+    return json.dumps(
+        value, allow_nan=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+
 def _read_regular(path: Path, limit: int) -> tuple[bytes, os.stat_result]:
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
@@ -259,7 +265,7 @@ def prepare(model_dir: Path, selections: list[str]) -> dict[str, Any]:
                 "shape": shape,
                 "source_shard": shard,
             })
-    return {
+    prepared = {
         "schema": "tritium.qwen36-gdn-probe-preflight.v1",
         "repository": REPOSITORY,
         "revision": REVISION,
@@ -275,6 +281,8 @@ def prepare(model_dir: Path, selections: list[str]) -> dict[str, Any]:
             "does not produce a measurement or release receipt",
         ],
     }
+    prepared["preflight_id"] = "sha256:" + hashlib.sha256(canonical(prepared)).hexdigest()
+    return prepared
 
 
 def main() -> int:

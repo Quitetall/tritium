@@ -64,6 +64,33 @@ def reseal(value: dict) -> None:
     ).hexdigest()
 
 
+def preflight(value: dict) -> dict:
+    probes = []
+    for probe in value["probes"]:
+        probes.append({
+            "family": probe["family"],
+            "tensor_class": probe["tensor_class"],
+            "tensor_name": probe["tensor_name"],
+            "tensor_index": probe["tensor_index"],
+            "layer": probe["tensor_index"],
+            "shape": [8, 8],
+            "source_shard": "model-00001-of-00015.safetensors",
+        })
+    result = {
+        "schema": "tritium.qwen36-gdn-probe-preflight.v1",
+        "repository": MODULE.REPOSITORY,
+        "revision": MODULE.REVISION,
+        "state": "prepared-not-measured",
+        "evidence_scope": "local-config-index-and-safetensors-header-only",
+        "config_sha256": "a" * 64,
+        "weight_index_sha256": "b" * 64,
+        "probes": probes,
+        "limitations": ["local metadata only"],
+    }
+    result["preflight_id"] = "sha256:" + hashlib.sha256(MODULE.canonical(result)).hexdigest()
+    return result
+
+
 class QwenGdnSensitivityReceiptTests(unittest.TestCase):
     def test_receipt_derives_pass_when_delta_terminal_is_within_threshold(self):
         verified = MODULE.verify(receipt(delta_terminal=2.0, control_terminal=1.0))
@@ -124,6 +151,31 @@ class QwenGdnSensitivityReceiptTests(unittest.TestCase):
             MODULE.verify(changed)
         with self.assertRaisesRegex(MODULE.ReceiptError, "duplicate field"):
             MODULE._object([("schema", MODULE.SCHEMA), ("schema", MODULE.SCHEMA)])
+
+    def test_measurement_can_be_joined_to_exact_preflight_names_and_ordinals(self):
+        measured = receipt()
+        prepared = preflight(measured)
+        result = MODULE.verify(measured, prepared)
+        self.assertEqual(result["preflight_id"], prepared["preflight_id"])
+        self.assertEqual(
+            result["evidence_scope"],
+            "receipt-structure-rule-and-local-preflight-join-only",
+        )
+
+    def test_preflight_join_rejects_changed_ordinal_and_invalid_content_id(self):
+        measured = receipt()
+        prepared = preflight(measured)
+        prepared["probes"][0]["tensor_index"] += 1
+        prepared["preflight_id"] = "sha256:" + hashlib.sha256(
+            MODULE.canonical({key: item for key, item in prepared.items() if key != "preflight_id"})
+        ).hexdigest()
+        with self.assertRaisesRegex(MODULE.ReceiptError, "names or ordinals"):
+            MODULE.verify(measured, prepared)
+
+        prepared = preflight(measured)
+        prepared["config_sha256"] = "f" * 64
+        with self.assertRaisesRegex(MODULE.ReceiptError, "preflight_id"):
+            MODULE.verify(measured, prepared)
 
 
 if __name__ == "__main__":
