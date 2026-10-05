@@ -82,7 +82,7 @@ def _json_file(path: Path) -> tuple[dict[str, Any], str]:
     return value, hashlib.sha256(data).hexdigest()
 
 
-def _tensor_metadata(model_dir: Path, shard_name: str, tensor_name: str) -> list[int]:
+def _safetensors_header(model_dir: Path, shard_name: str) -> dict[str, Any]:
     logical = PurePosixPath(shard_name)
     if logical.is_absolute() or len(logical.parts) != 1 or ".." in logical.parts:
         raise PreflightError("index contains an unsafe shard path")
@@ -122,11 +122,9 @@ def _tensor_metadata(model_dir: Path, shard_name: str, tensor_name: str) -> list
         header = json.loads(chunks, object_pairs_hook=_pairs)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise PreflightError(f"Safetensors shard {shard_name} has an invalid header") from error
-    metadata = header.get(tensor_name) if isinstance(header, dict) else None
-    shape = metadata.get("shape") if isinstance(metadata, dict) else None
-    if not isinstance(shape, list) or len(shape) != 2 or any(type(size) is not int or size <= 0 for size in shape):
-        raise PreflightError(f"selected tensor {tensor_name} is not a rank-2 matrix")
-    return shape
+    if not isinstance(header, dict):
+        raise PreflightError(f"Safetensors shard {shard_name} header must be an object")
+    return header
 
 
 def _family_and_class(name: str, config: dict[str, Any]) -> tuple[str, str, int]:
@@ -181,6 +179,37 @@ def prepare(model_dir: Path, selections: list[str]) -> dict[str, Any]:
     weight_map = index.get("weight_map")
     if not isinstance(weight_map, dict) or len(weight_map) != 1199:
         raise PreflightError("weight index differs from the frozen 1,199-tensor inventory")
+    if not all(isinstance(shard, str) for shard in weight_map.values()):
+        raise PreflightError("weight index contains an invalid shard inventory")
+    shards = sorted(set(weight_map.values()))
+    if not shards:
+        raise PreflightError("weight index contains an empty shard inventory")
+    headers = {shard: _safetensors_header(model_dir, shard) for shard in shards}
+    tensor_metadata: dict[str, dict[str, Any]] = {}
+    for shard, header in headers.items():
+        for name, metadata in header.items():
+            if name not in weight_map:
+                continue
+            if weight_map[name] != shard or name in tensor_metadata:
+                raise PreflightError(f"weight index/header disagreement for tensor {name!r}")
+            tensor_metadata[name] = metadata
+    if set(tensor_metadata) != set(weight_map):
+        raise PreflightError("one or more indexed tensors are absent from Safetensors headers")
+    matrix_names = sorted(
+        name
+        for name, metadata in tensor_metadata.items()
+        if (
+            name.startswith("model.language_model.")
+            or name.startswith("lm_head.")
+            or name.startswith("mtp.")
+        )
+        and isinstance(metadata, dict)
+        and isinstance(metadata.get("shape"), list)
+        and len(metadata["shape"]) == 2
+    )
+    if len(matrix_names) != 506:
+        raise PreflightError("source headers do not yield the frozen 506 language/MTP matrices")
+    matrix_ordinals = {name: ordinal for ordinal, name in enumerate(matrix_names)}
     if len(selections) != 8:
         raise PreflightError("provide exactly eight FAMILY/CLASS=TENSOR selections")
 
@@ -215,11 +244,17 @@ def prepare(model_dir: Path, selections: list[str]) -> dict[str, Any]:
             shard = weight_map.get(name)
             if not isinstance(shard, str):
                 raise PreflightError(f"selected tensor {name!r} is absent from the pinned index")
-            shape = _tensor_metadata(model_dir, shard, name)
+            metadata = tensor_metadata[name]
+            shape = metadata.get("shape") if isinstance(metadata, dict) else None
+            if not isinstance(shape, list) or len(shape) != 2 or any(
+                type(size) is not int or size <= 0 for size in shape
+            ):
+                raise PreflightError(f"selected tensor {name} is not a rank-2 matrix")
             probes.append({
                 "family": family,
                 "tensor_class": tensor_class,
                 "tensor_name": name,
+                "tensor_index": matrix_ordinals[name],
                 "layer": layer,
                 "shape": shape,
                 "source_shard": shard,
@@ -236,7 +271,7 @@ def prepare(model_dir: Path, selections: list[str]) -> dict[str, Any]:
         "limitations": [
             "does not authenticate the checkpoint against Hugging Face",
             "does not verify calibration-pack provenance",
-            "does not load tensor payloads or execute the model",
+            "reads headers for all indexed shards but does not load tensor payloads or execute the model",
             "does not produce a measurement or release receipt",
         ],
     }
