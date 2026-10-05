@@ -1,12 +1,14 @@
 # Model Zoo
 
-This chapter is about **what Tritium actually loads** — which on-disk model
-formats the loader accepts, the one reference model the test/perf gates exercise,
-and how to drive a compatible GGUF through the [`tritium` CLI](./quickstart.md).
+This chapter describes **the low-level GGUF inference path** — which on-disk
+types its loader handles, the reference model its legacy test/performance gates
+target, and how to drive a compatible GGUF through the [`tritium` CLI](./quickstart.md).
 It is deliberately conservative: a model is listed as **verified-compatible**
-only where the repo's tests run it end-to-end, and as **expected-compatible**
-where the loader's type handling implies it should work but no committed test
-exercises that exact artifact. The source of truth is the loader
+only where a recorded test or receipt exercises the exact artifact, and as
+**expected-compatible** where loader behavior suggests compatibility but that
+artifact has not been tested. Model names in the generated v1.1 ladder are
+release targets, not evidence that their weights are bundled or qualified. The
+source of truth for low-level loader behavior is the loader
 (`crates/tritium-nn/src/model/weights.rs`) and the GGUF reader
 (`crates/tritium-format/src/gguf.rs`) — when this page and the code disagree, the
 code wins.
