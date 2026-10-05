@@ -74,6 +74,16 @@ software CI evidence only. It does not replace the package-matrix release
 receipt, physical backend evidence, real-model serving or quality gates, or
 independent release qualification.
 
+The next exact-source run for head
+`d32b2cab40b4f5ccedd74ea878062997485c7405` also completed successfully:
+[CI run `37254882104`](https://github.com/Quitetall/tritium/actions/runs/37254882104)
+passed its required aggregate, and
+[wheel run `37254882146`](https://github.com/Quitetall/tritium/actions/runs/37254882146)
+passed. CI skipped fuzz parsers, CUDA conformance/parity, real-model serving
+E2E, ROCm, performance regression, wgpu, and Metal. The result validates the
+exact software revision and package workflow, but does not close the omitted
+hardware, performance, real-model, or independent release gates.
+
 ### Installed CPU wheel, HF lifecycle, and ONNX smoke (2026-10-04)
 
 At source revision `2f53bf00658f9d8412b98acff387763efb4e191d`, a CPU abi3 wheel
