@@ -84,6 +84,22 @@ E2E, ROCm, performance regression, wgpu, and Metal. The result validates the
 exact software revision and package workflow, but does not close the omitted
 hardware, performance, real-model, or independent release gates.
 
+### PR CI refresh — research note commit (2026-10-04)
+
+GitHub CI run
+[`37256062399`](https://github.com/Quitetall/tritium/actions/runs/37256062399)
+completed successfully for PR head `8289f9103a329c06dabca62856d7dc529bd280d3`
+on `feat/release-input-admission`. The required aggregate and all enabled jobs
+passed, including Linux/macOS/Windows CPU formatting, lint and tests, the
+receipt-backed compatibility matrix, web package, crate packaging, API
+stability, WASI, mocked serving, ONNX CPU, Burn/Candle interop, MSRV, supply
+chain, SBOM and workflow lint. Source-bound evidence jobs use the PR head and
+verify it with `verify-workflow-source.py`; the general PR CPU matrix validates
+GitHub's merge result, as the workflow documents. The run skipped fuzz,
+CUDA/ROCm/Metal/wgpu execution, real-model serving and performance regression.
+This is software-CI evidence only; it does not close physical backend, model
+quality, runtime-performance, flagship, or independent release gates.
+
 ### Installed CPU wheel, HF lifecycle, and ONNX smoke (2026-10-04)
 
 At source revision `2f53bf00658f9d8412b98acff387763efb4e191d`, a CPU abi3 wheel
