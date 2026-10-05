@@ -1459,21 +1459,21 @@ direct TypeScript passes do not close browser or physical WebGPU gates.
 
 ### Clean-worktree web package recheck — 2026-10-05
 
-The earlier WASM limitation is superseded for the exact pushed source revision
-`f478869115dcb48a66d4d3c213c892e7bec24c11`. A clean detached worktree passed
-the full `npm --prefix packages/tritium-web run check` with exit code 0:
+The earlier WASM limitation is now superseded for the current pushed source
+revision `fd927eab0b3db893f3fe59e272907d9e026125e6`. A clean detached worktree
+passed the full `npm --prefix packages/tritium-web run check` with exit code 0:
 generated-file checks, pinned release WASM build, strict TypeScript, 145 Node
-tests, and offline archive verification. `wasm-bindgen 0.2.126` was installed
+tests, and offline archive verification. `wasm-bindgen 0.2.126` is installed
 under the isolated local cache path
-`/home/brianklam/.cache/tritium-release-tools/bin`; the unrelated dirty EAT-O
-files in the main checkout were not included.
+`/home/brianklam/.cache/tritium-release-tools/bin`; unrelated dirty EAT-O files
+in the main checkout were not included.
 
 The retained local receipt
-`release/v1.1/evidence/npm-archive-f4788691/npm-archive-receipt.json` has ID
-`sha256:34b85503e365c6878254a97a94a8aefc465789be927b7ea98fc1a7917fcc7b65` and
-independently validates against the adjacent 627,846-byte archive
+`release/v1.1/evidence/npm-archive-fd927eab/npm-archive-receipt.json` has ID
+`sha256:84349d4888e0dd92ab65668f9535d736500a7f4f0a245ded48f3b4b58de1e3f5` and
+independently validates against the adjacent 627,849-byte archive
 `tritium-ai-web-1.1.0-rc.2.tgz` (SHA-256
-`036de02a207ebaf869915099abf248a31614c5a0e9798ec585f1b3f8b2b97986`). Its
+`e556029b3fc5531abf265d3bd2b556c722ae60ce3488b61c1b31bcf4939a8fbd`). Its
 CycloneDX SBOM is retained in the same directory. This remains exact-revision
 local package evidence, not candidate-registry admission, a cross-platform
 package matrix, or physical browser/WebGPU qualification; regenerate it for a
