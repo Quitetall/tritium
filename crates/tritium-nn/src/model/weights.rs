@@ -149,34 +149,15 @@ impl ModelWeights {
     ) -> Result<Self, NnError> {
         // GGUF-specific integrity check the generic builder (vocab =
         // len/n_embd) can't express: the file's declared embedding dims must
-        // agree with the CONFIG's n_embd. Dims-vs-payload consistency is
-        // already enforced by the reader (n_bytes is computed FROM dims and
-        // bounds-checked), so element_count suffices — no decode needed
+        // agree with the CONFIG's n_embd. GGUF stores matrix dimensions
+        // fastest-first as [hidden, vocab], so compare both axes rather than
+        // only the element count (which cannot distinguish a transposed table).
+        // Dims-vs-payload consistency is already enforced by the reader
+        // (n_bytes is computed FROM dims and bounds-checked), so no decode is needed
         // (review: the old full F16->f32 decode here was information-free,
         // ~657MB read + ~1.3GB transient per load).
         let n_embd = checked_usize(u64::from(config.n_embd), "model hidden size")?;
-        let embd_info = require(file, "token_embd.weight")?;
-        let vocab = checked_usize(
-            *embd_info
-                .dims
-                .last()
-                .ok_or_else(|| NnError::MissingTensor("token_embd.weight (no dims)".to_owned()))?,
-            "token_embd.weight vocabulary",
-        )?;
-        let embd_len = embd_info
-            .element_count()
-            .map_err(|e| NnError::Backend(format!("token_embd.weight dims: {e}")))?
-            .try_into()
-            .map_err(|_| {
-                NnError::Backend("token_embd.weight element count exceeds usize".into())
-            })?;
-        let expected_embd_len = checked_product(vocab, n_embd, "token_embd.weight shape")?;
-        if embd_len != expected_embd_len {
-            return Err(NnError::Shape {
-                expected: expected_embd_len,
-                got: embd_len,
-            });
-        }
+        validate_embedding_shape(file, n_embd)?;
 
         // P2e: one config-driven skeleton for every loading path — the GGUF
         // dialect supplies the name schema, `load_dense` the norms/embedding,
@@ -234,6 +215,28 @@ fn validate_projection_shape(
             info.dims
         )));
     }
+    Ok(())
+}
+
+/// Validate a GGUF token embedding's fastest-first `[hidden, vocab]` axes and
+/// return its vocabulary row count before loading or widening the payload.
+fn validate_embedding_shape(file: &GgufFile, n_embd: usize) -> Result<(), NnError> {
+    let name = "token_embd.weight";
+    let info = require(file, name)?;
+    if info.dims.len() != 2 {
+        return Err(NnError::Backend(format!(
+            "{name}: expected GGUF embedding dims [hidden={n_embd}, vocab], got {:?}",
+            info.dims
+        )));
+    }
+    let hidden = checked_usize(info.dims[0], "token_embd.weight hidden dimension")?;
+    if hidden != n_embd {
+        return Err(NnError::Backend(format!(
+            "{name}: expected GGUF embedding dims [hidden={n_embd}, vocab], got {:?}",
+            info.dims
+        )));
+    }
+    checked_usize(info.dims[1], "token_embd.weight vocabulary")?;
     Ok(())
 }
 
@@ -536,6 +539,35 @@ mod tests {
                 .contains("expected GGUF projection dims [K=3, N=256]")
         );
         assert!(error.to_string().contains("[256, 3]"));
+    }
+
+    #[test]
+    fn embedding_shape_must_match_hidden_width_not_only_element_count() {
+        let info = TensorInfo::new(
+            "token_embd.weight".to_owned(),
+            vec![4, 3], // GGUF fastest-first: [hidden, vocab]
+            GGML_TYPE_F16,
+            12,
+            24,
+        );
+        let file = GgufFile::new(3, Default::default(), vec![info], 0);
+        validate_embedding_shape(&file, 4).expect("config geometry matches GGUF [hidden, vocab]");
+
+        let transposed_info = TensorInfo::new(
+            "token_embd.weight".to_owned(),
+            vec![3, 4], // same element count, wrong hidden width
+            GGML_TYPE_F16,
+            12,
+            24,
+        );
+        let transposed_file = GgufFile::new(3, Default::default(), vec![transposed_info], 0);
+        let error = validate_embedding_shape(&transposed_file, 4)
+            .expect_err("same element count must not hide a transposed embedding");
+        assert!(
+            error
+                .to_string()
+                .contains("expected GGUF embedding dims [hidden=4, vocab]")
+        );
     }
 
     /// Minimal single-tensor GGUF v3 blob: one TQ2_0 tensor `name`,
