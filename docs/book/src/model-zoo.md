@@ -170,14 +170,22 @@ tritium report decode --model ggml-model-i2_s.gguf --tokens tokens.json \
 > plain build exposes `cpu`; building the CLI `--features cuda` makes `cuda`
 > selectable for `report --backend cuda`.
 
-## Caveats and pre-1.0 status
+## Release-status boundaries
 
 - **Token-ID interface.** The CLI consumes/produces token IDs, not text. A
   tokenizer is the caller's responsibility.
-- **One verified model.** The acceptance gates are written for BitNet 2B4T in
-  `I2_S`. Other architectures are out of scope until a test pins them.
-- **Pre-1.0.** A real-model, fresh-environment capstone (download → infer →
-  SALT-quantize → fine-tune) is a **v1.0 exit gate** that requires hardware this
-  book's CI does not have; it is tracked in
-  ADR 0012 (see the [research-record access policy](./research-records.md)) and
-  is **not** claimed complete here.
+- **Loader coverage is not zoo admission.** The BitNet tables above describe
+  the low-level GGUF inference path. They do not establish support for every
+  model in the generated v1.1 admission ladder, nor do they replace the
+  candidate-bound receipts required for an audited model card.
+- **No model weights are bundled.** The generated ladder names release targets;
+  it is not a list of downloadable Tritium artifacts. Check the current
+  [release-candidate evidence](../../release-candidate.md) for each target's
+  admitted status. In particular, the pinned Qwen language-plus-MTP conversion
+  remains open until all 506 matrix masters, artifact sealing, and quality and
+  runtime gates are evidenced.
+- **v1.1 is not yet qualified.** A parser, layer fixture, source-admission
+  receipt, or passing small-model test is narrower than full-model fidelity,
+  physical-byte accounting, runtime, or independent reproduction. The
+  [release plan](../../plans/0044-v11-full-public-release.md) defines the gates;
+  a pending or missing receipt is not a pass.
