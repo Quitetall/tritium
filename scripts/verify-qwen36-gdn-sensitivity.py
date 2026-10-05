@@ -61,7 +61,10 @@ def _digest(value: Any, label: str, *, prefixed: bool = False) -> str:
 def _finite_nonnegative(value: Any, label: str, *, positive: bool = False) -> float:
     if isinstance(value, bool) or not isinstance(value, (float, int)):
         raise ReceiptError(f"{label} must be a finite number")
-    result = float(value)
+    try:
+        result = float(value)
+    except (OverflowError, ValueError) as error:
+        raise ReceiptError(f"{label} must be a finite number") from error
     if not math.isfinite(result) or result < 0 or (positive and result == 0):
         raise ReceiptError(f"{label} is outside its allowed range")
     return result

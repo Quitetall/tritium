@@ -122,6 +122,13 @@ class QwenGdnSensitivityReceiptTests(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.ReceiptError, "same matched bpw"):
             MODULE.verify(changed_bpw)
 
+    def test_receipt_rejects_json_integer_that_overflows_float_conversion(self):
+        changed = receipt()
+        changed["probes"][0]["weight_mse"] = 10**1000
+        reseal(changed)
+        with self.assertRaisesRegex(MODULE.ReceiptError, "finite number"):
+            MODULE.verify(changed)
+
     def test_receipt_requires_four_distinct_classes_per_family(self):
         changed = receipt()
         changed["probes"][1]["tensor_class"] = changed["probes"][0]["tensor_class"]
