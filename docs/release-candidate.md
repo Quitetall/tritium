@@ -1391,3 +1391,26 @@ The statement binds candidate-manifest, registry and report SHA-256 identities,
 release revision and signer principal. Any evidence change invalidates it. Key
 generation, signer authorization and the local tag remain explicit maintainer
 actions; no publication or tag push is inferred.
+
+### Portable training contract CPU checks — 2026-10-04
+
+At source revision `1cb50800ceebeb02d9262ebaaee4fef6848e3b4a`, focused local
+contract checks passed:
+
+```text
+cargo test --locked -p tritium-spec --test train_backend_contract --test training_vectors
+4 backend-contract tests passed; 6 vector/schema tests passed
+cargo test --locked -p tritium-train --test portable_vectors
+5 tests passed, including canonical V2 and V3 CPU corpus replay
+PYTHONPATH=crates/tritium-py/python pytest -q crates/tritium-py/tests/test_training_manifest.py
+10 passed
+```
+
+These results check the CPU reference and cross-language Python manifest
+reader. They do not qualify an accelerator, browser runtime, physical backend,
+performance, or release candidate. The planned TypeScript check
+(`npx tsc -p bindings/typescript/tsconfig.json --noEmit`) could not run because
+the TypeScript compiler is not installed in this checkout; `npx` reported that
+it would not supply the missing compiler implicitly. No dependency was
+installed. The language-parity and physical-backend gates therefore remain
+open.
