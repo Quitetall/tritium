@@ -124,21 +124,36 @@ def run_smollm2_release_demo(
     attention_mask = batch["attention_mask"]
     started = time.monotonic()
 
+    def report_progress(stage: str) -> None:
+        # Keep long-running release/tutorial jobs diagnosable if the runner is
+        # interrupted before it can publish the final receipt. Do not include
+        # prompts, paths, or model outputs in this progress stream.
+        elapsed = time.monotonic() - started
+        print(
+            f"[tritium-tutorial] stage={stage} elapsed_seconds={elapsed:.3f}",
+            flush=True,
+        )
+
+    report_progress("begin")
+
     recipe = TernaryConfig.ptq(
         profile="compact-v1", target_modules=("Linear", "Embedding")
     )
     prepared = prepare(source, recipe, inplace=True)
+    report_progress("ptq-prepared")
     calibration = calibrate(
         prepared,
         [{"input_ids": tokens, "attention_mask": attention_mask, "use_cache": False}],
         evidence_dir=target / "calibration",
     )
+    report_progress("calibrated")
     conversion = convert(
         prepared,
         calibration,
         work_dir=target / "conversion",
         max_working_bytes=256 * 1024 * 1024,
     )
+    report_progress("converted")
     compact = load_quantized_module(prepared.model, conversion, inplace=True).eval()
     physical_bytes = _state_bytes(compact)
     diagnostics = _trit_diagnostics(compact)
@@ -156,6 +171,7 @@ def run_smollm2_release_demo(
             input_ids=tokens, attention_mask=attention_mask, use_cache=False
         ).logits
     torch.testing.assert_close(observed, expected)
+    report_progress("native-checkpoint-roundtrip")
     generated = restored.generate(
         tokens,
         attention_mask=attention_mask,
@@ -179,6 +195,7 @@ def run_smollm2_release_demo(
     torch.testing.assert_close(
         replay_observed, replay_expected, rtol=1e-4, atol=1e-5
     )
+    report_progress("onnx-export-and-replay")
 
     del source, prepared, compact, restored
     qat_source = AutoModelForCausalLM.from_pretrained(
@@ -195,6 +212,7 @@ def run_smollm2_release_demo(
             planes=1,
         ),
     ).to(device)
+    report_progress("qat-prepared")
     qat_tokens = tokens.to(device)
     qat_mask = attention_mask.to(device)
     optimizer = torch.optim.AdamW(qat.parameters(), lr=1e-5, weight_decay=0.0)
@@ -231,6 +249,7 @@ def run_smollm2_release_demo(
         raise RuntimeError(
             f"SmolLM2 tutorial exceeded wall-time budget: {elapsed:.3f}s >= {max_seconds:.3f}s"
         )
+    report_progress("qualification-passed")
     selected_bytes = sum(
         entry.logical_bytes
         for entry in conversion.coverage.entries
