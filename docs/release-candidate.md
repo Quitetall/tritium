@@ -299,6 +299,19 @@ Kubernetes deployment, or model quality. The matching local check
 --all-targets -- -D warnings` also passed. These are contributor-run software
 checks, not independent release receipts; the serving gates below remain open.
 
+### Stage-7 campaign orchestration regression checks (2026-10-04)
+
+At source revision `b127fae2ee094647e5d6c61dadf465903701dd99`, Python 3.14.7
+ran
+`python -m pytest -q scripts/tests/test_run_stage7_recipe_freeze.py
+scripts/tests/test_qualify_stage7_recipe_freeze.py
+scripts/tests/test_verify_stage7_qualification_receipt.py`: 63 passed in
+16.32 seconds. These synthetic tests exercise campaign orchestration, resume,
+qualification, and strict receipt verification. They do not run the SmolLM2
+recipe-freeze measurements, establish a terminal recipe decision, or create a
+candidate-bound `stage7-recipe-freeze` release receipt. That empirical gate
+remains open.
+
 ### Flagship campaign status refresh (2026-10-04)
 
 The canonical read-only probe was rerun against the durable workspace
