@@ -1230,6 +1230,29 @@ second-machine reproduction, independent release review, and explicit human
 activation remain separate requirements. Other required checks for the pull
 request were still running when this record was written.
 
+### Serving deployment contract checks — 2026-10-04
+
+At source revision `34acd332e5bce398d1c59324108e6fc7feb58047`, the focused
+deployment contract suite passed 117 tests and 61 subtests:
+
+```text
+pytest -q scripts/tests/test_deployment_contract.py \
+  scripts/tests/test_qualify_kubernetes_deployment.py \
+  scripts/tests/test_qualify_oci_security.py \
+  scripts/tests/test_qualify_oci_runtime.py \
+  scripts/tests/test_verify_oci_archive.py
+117 passed, 61 subtests passed
+```
+
+`./scripts/check-deployment-manifests` also passed using the repository's
+digest-pinned Helm 3.18.4 container with networking disabled and image pulls
+disabled. It linted the chart, rejected CUDA configuration without GPU
+resources, and rendered the default and CUDA/KEDA/ServiceMonitor configurations
+with the required CUDA `Recreate` strategy. These are contract and chart
+rendering checks only: no Kubernetes cluster, schema-v3 model bundle, OCI
+runtime, NVIDIA deployment, autoscaling event or rollback was exercised.
+Plan 0052's empirical serving and deployment gates remain open.
+
 ## Local sign-off
 
 Evidence readiness and maintainer sign-off are separate layers. A complete
