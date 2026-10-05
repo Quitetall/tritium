@@ -402,11 +402,15 @@ were loaded.
 The production measurement producer is still missing. The Qwen runtime now has
 an internal paired-sampling seam that can collect final hidden rows and selected
 DeltaNet recurrent states at frozen token positions; fixture tests exercise it.
-That is not yet a source-bound measurement producer: no agreed divergence
-calculation has been applied, no eight-probe measurement has run against the
+Proposed [ADR 0049](adr/0049-qwen36-gdn-sensitivity-metric.md) now defines
+absolute RMS output/state metrics, fixed sample positions and state-layer
+selection, but it is still `PROPOSED`; the v2 receipt schema and verifier are
+not implemented. Therefore no accepted metric contract or source-bound
+measurement producer exists yet. No eight-probe measurement has run against the
 approved calibration pack, and no measurement receipt has been produced. Do not
-start those probes until the divergence metric is frozen. No probe execution or
-flagship campaign was started for this software change.
+start those probes until ADR 0049 is accepted, the v2 verifier and producer are
+implemented and independently checked, and campaign authorization is explicit.
+No probe execution or flagship campaign was started for this software change.
 
 ### Admitted scale-refined child execution (2026-10-05)
 
