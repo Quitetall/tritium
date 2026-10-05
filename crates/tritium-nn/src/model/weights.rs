@@ -290,6 +290,13 @@ fn checked_product(lhs: usize, rhs: usize, label: &str) -> Result<usize, NnError
 /// Load a dense (F32 or F16) tensor as fp32, in ggml memory order.
 fn load_dense(file: &GgufFile, bytes: &[u8], name: &str) -> Result<Vec<f32>, NnError> {
     let info = require(file, name)?;
+    let expected_rank = if name == "token_embd.weight" { 2 } else { 1 };
+    if info.dims.len() != expected_rank {
+        return Err(NnError::Backend(format!(
+            "{name}: expected rank-{expected_rank} GGUF dense tensor, got dims {:?}",
+            info.dims
+        )));
+    }
     let p = payload(file, bytes, info)?;
     match info.ggml_type {
         GGML_TYPE_F32 => Ok(p
@@ -567,6 +574,25 @@ mod tests {
             error
                 .to_string()
                 .contains("expected GGUF embedding dims [hidden=4, vocab]")
+        );
+    }
+
+    #[test]
+    fn dense_vector_loader_rejects_same_size_rank_mismatch() {
+        let info = TensorInfo::new(
+            "output_norm.weight".to_owned(),
+            vec![1, 4],
+            GGML_TYPE_F32,
+            4,
+            16,
+        );
+        let file = GgufFile::new(3, Default::default(), vec![info], 0);
+        let error = load_dense(&file, &[], "output_norm.weight")
+            .expect_err("vector-like norm must not accept a rank-2 tensor");
+        assert!(
+            error
+                .to_string()
+                .contains("expected rank-1 GGUF dense tensor")
         );
     }
 
