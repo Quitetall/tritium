@@ -1519,3 +1519,22 @@ performance evidence. Accelerator DDP/FSDP on two distinct physical GPUs,
 CUDA-specific qualification, and the known PyTorch CPU full-state-export issue
 remain open. User-owned EAT-O files were modified during these tests and were
 not part of their scope.
+
+### Exact-wheel CUDA/fp16 smoke — 2026-10-05
+
+At pushed source revision `dc4ea62b792d159cc1785258ae9d9baca692f0c2`, the
+exact Linux x86-64 CPU wheel from hosted workflow `37259200813` was installed
+in an isolated virtual environment and exercised on the physical RTX 4090 by
+`crates/tritium-py/tests/hf_cuda_worker.py`. The installed `tritium` import
+resolved inside that virtual environment, not from the source checkout. The
+worker completed five fp16 training steps on a one-layer randomly initialized
+Llama fixture, observed zero host transfers in the profiled ternary operator,
+and exactly restored the saved Accelerate checkpoint. The receipt is
+`/mnt/2tb/tritium-release-evidence/hf-cuda-dc4ea62-20261004/cuda-training-receipt.json`
+(`sha256:aa999302ab9349c89ca74fb4696998bc86e8a46c7b1496a2246e9cecaf929431`),
+verified with `scripts/verify-cuda-training-receipt.py` against the exact
+wheel SHA-256 `cfde3d156cc2dfcd57e92f66f6493c4e0f9f82153ac4381c3fc19211ee301cc3`.
+The five measured steps took 62.55 ms; this tiny synthetic smoke is not a
+training-performance claim, multi-GPU qualification, Qwen quality result, or
+candidate-wide release receipt. The temporary venv and checkpoint were used
+only for this run and are not release evidence.
