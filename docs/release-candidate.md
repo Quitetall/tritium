@@ -1496,3 +1496,26 @@ WASI conformance, API stability, packaging readiness, compatibility/community
 contract checks, serving contract mocks and the source-free web archive. These
 hosted checks improve release confidence but do not close the skipped physical
 backend, real-model, performance, or model-quality release gates.
+
+### Hugging Face QAT/PTQ and distributed CPU integration — 2026-10-04
+
+At code revision `d80c8a8255eac2015d26c69cf28fd83572e803bb`, local CPU tests
+passed for the tiny randomly initialized Llama fixture:
+
+```text
+PYTHONPATH=crates/tritium-py/python pytest -q -rs crates/tritium-py/tests/test_huggingface_qat.py
+7 passed
+PYTHONPATH=crates/tritium-py/python pytest -q -rs \
+  crates/tritium-py/tests/test_huggingface_distributed.py::test_two_rank_cpu_ddp_step_and_checkpoint \
+  crates/tritium-py/tests/test_huggingface_distributed.py::test_two_rank_cpu_fsdp_step_and_sharded_state_resume \
+  crates/tritium-py/tests/test_huggingface_distributed.py::test_accelerate_cpu_bf16_in_fresh_runtime
+3 passed
+```
+
+These checks cover QAT and PTQ save/reload, tied embedding/head storage,
+Trainer checkpoint resume, Accelerate state/RNG resume, and two-rank CPU/Gloo
+DDP/FSDP semantics. They use a synthetic tiny model and are not Qwen quality or
+performance evidence. Accelerator DDP/FSDP on two distinct physical GPUs,
+CUDA-specific qualification, and the known PyTorch CPU full-state-export issue
+remain open. User-owned EAT-O files were modified during these tests and were
+not part of their scope.
