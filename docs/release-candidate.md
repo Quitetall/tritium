@@ -317,8 +317,6 @@ aggregation, and registry admission remain open.
 
 ### ONNX Python facade source regression refresh (2026-10-04)
 
-### ONNX Python facade source regression refresh (2026-10-04)
-
 `python -m pytest crates/tritium-py/tests/test_torch_onnx.py -q` passed 24
 tests on the current source checkout. In addition to strict manifest admission,
 typed artifact routing, batch-one forward and MTP calls, and greedy cached
@@ -327,7 +325,13 @@ adapter that carries Tritium's tuple cache through the standard `.generate()`
 loop. The adapter is limited to batch-one CPU decoding without padding or beam
 search. The test uses a fake native runtime: it does not execute the candidate
 installed wheel, export a real authenticated Qwen bundle, or qualify whole-model
-Qwen generation. Those candidate-bound ONNX gates remain open.
+Qwen generation. Those candidate-bound ONNX gates remain open. The same focused
+suite was rerun on 2026-10-05 at source revision
+`5afd487b6dcc97b3447c70ca8852adc19ecdd17a` with
+`/home/brianklam/.cache/tritium-py313-ci/bin/python -m pytest -q
+crates/tritium-py/tests/test_torch_onnx.py`; it again passed 24 tests. The
+rerun confirms the source-level facade result at the current release branch
+head only; it does not upgrade the test's fake runtime to real Qwen ORT evidence.
 
 ### Serving software regression refresh (2026-10-04)
 
