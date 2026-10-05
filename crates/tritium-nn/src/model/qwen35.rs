@@ -15,7 +15,7 @@ use crate::error::NnError;
 use crate::layers::{
     Projection, ProjectionActivationMode, Qwen35DeltaNet, Qwen35DeltaNetCache,
     Qwen35DeltaNetWeights, Qwen35FullAttention, Qwen35FullAttentionCache,
-    Qwen35FullAttentionWeights, SwiGluMlp, TokenEmbedding,
+    Qwen35FullAttentionWeights, RecurrentStateObserver, SwiGluMlp, TokenEmbedding,
 };
 use crate::ops::rmsnorm_zero_centered;
 use crate::qwen35_config::{Qwen35LayerType, Qwen35NormWeightSemantics, Qwen35TextConfig};
@@ -685,7 +685,22 @@ impl Qwen35TextRunner {
         &self,
         tokens: &[u32],
         cache: &mut Qwen35TextCache,
+        observer: impl FnMut(u32, usize, &[u32], &[f32]) -> Result<(), E>,
+    ) -> Result<Qwen35TextOutput, Qwen35TextForwardError<E>> {
+        self.forward_with_block_and_state_observer(tokens, cache, &[], observer, |_, _, _| {})
+    }
+
+    /// Execute one forward while borrowing block outputs and selected DeltaNet states.
+    ///
+    /// State callbacks occur only at the requested zero-based token rows and only
+    /// for DeltaNet layers. No state or activation history is retained by the runner.
+    pub(crate) fn forward_with_block_and_state_observer<E>(
+        &self,
+        tokens: &[u32],
+        cache: &mut Qwen35TextCache,
+        state_positions: &[usize],
         mut observer: impl FnMut(u32, usize, &[u32], &[f32]) -> Result<(), E>,
+        mut state_observer: impl FnMut(u32, usize, &[f32]),
     ) -> Result<Qwen35TextOutput, Qwen35TextForwardError<E>> {
         let (base, new_len) = self.preflight_forward(tokens, cache)?;
         let sequence = tokens.len();
@@ -721,7 +736,9 @@ impl Qwen35TextRunner {
             &mut residual,
             &mut normalized,
             &mut branch,
+            state_positions,
             &mut observer,
+            &mut state_observer,
         );
         let output = match result {
             Ok(output) => output,
@@ -755,12 +772,19 @@ impl Qwen35TextRunner {
         residual: &mut [f32],
         normalized: &mut [f32],
         branch: &mut [f32],
+        state_positions: &[usize],
         observer: &mut impl FnMut(u32, usize, &[u32], &[f32]) -> Result<(), E>,
+        state_observer: &mut impl FnMut(u32, usize, &[f32]),
     ) -> Result<Qwen35TextOutput, Qwen35TextForwardError<E>> {
         let sequence = input_token_ids.len();
         for (block_index, (layer, layer_cache)) in
             self.layers.iter().zip(&mut cache.layers).enumerate()
         {
+            let block_index = u32::try_from(block_index).map_err(|_| {
+                Qwen35TextForwardError::Runtime(NnError::ResourceExhausted(
+                    "Qwen3.5 block index exceeds u32".to_owned(),
+                ))
+            })?;
             normalize_rows(
                 residual,
                 &layer.input_norm,
@@ -770,7 +794,19 @@ impl Qwen35TextRunner {
             )?;
             match (&layer.mixer, layer_cache) {
                 (Qwen35TextMixer::DeltaNet(mixer), Qwen35TextLayerCache::DeltaNet(cache)) => {
-                    mixer.stage_forward(backend, normalized, sequence, cache, branch)?
+                    let mut report_state = |position: usize, state: &[f32]| {
+                        state_observer(block_index, position, state);
+                    };
+                    let mut recurrent_observer =
+                        RecurrentStateObserver::new(state_positions, &mut report_state);
+                    mixer.stage_forward_with_state_observer(
+                        backend,
+                        normalized,
+                        sequence,
+                        cache,
+                        branch,
+                        &mut recurrent_observer,
+                    )?
                 }
                 (
                     Qwen35TextMixer::FullAttention(mixer),
@@ -794,11 +830,6 @@ impl Qwen35TextRunner {
             )?;
             layer.mlp.forward(backend, normalized, sequence, branch)?;
             add_in_place(residual, branch);
-            let block_index = u32::try_from(block_index).map_err(|_| {
-                Qwen35TextForwardError::Runtime(NnError::ResourceExhausted(
-                    "Qwen3.5 block index exceeds u32".to_owned(),
-                ))
-            })?;
             observer(block_index, position_start, &input_token_ids, residual)
                 .map_err(Qwen35TextForwardError::Observer)?;
         }

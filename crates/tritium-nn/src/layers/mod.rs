@@ -19,6 +19,7 @@ mod token_embedding;
 mod transformer_block;
 
 pub(crate) use packed_salt::{PackedSaltMatrix, PackedSaltMatrixBuilder};
+pub(crate) use qwen35_deltanet::RecurrentStateObserver;
 
 pub use dense::DenseLinear;
 pub use linear::TernaryLinear;

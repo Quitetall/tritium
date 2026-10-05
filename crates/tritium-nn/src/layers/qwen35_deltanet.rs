@@ -35,7 +35,7 @@ struct DeltaNetSpec {
     rms_norm_eps_bits: u32,
 }
 
-type RecurrentStateCallback<'a> = dyn FnMut(usize, &[f32]) + 'a;
+type RecurrentStateCallback<'a> = dyn for<'state> FnMut(usize, &'state [f32]) + 'a;
 
 pub(crate) struct RecurrentStateObserver<'a> {
     positions: &'a [usize],
@@ -43,6 +43,26 @@ pub(crate) struct RecurrentStateObserver<'a> {
 }
 
 impl RecurrentStateObserver<'_> {
+    pub(crate) fn new<'a, F>(
+        positions: &'a [usize],
+        callback: &'a mut F,
+    ) -> RecurrentStateObserver<'a>
+    where
+        F: for<'state> FnMut(usize, &'state [f32]) + 'a,
+    {
+        RecurrentStateObserver {
+            positions,
+            callback: Some(callback),
+        }
+    }
+
+    pub(crate) fn disabled() -> Self {
+        Self {
+            positions: &[],
+            callback: None,
+        }
+    }
+
     fn observes(&self, position: usize) -> bool {
         self.positions.binary_search(&position).is_ok()
     }
@@ -537,10 +557,7 @@ impl Qwen35DeltaNet {
         cache: &mut Qwen35DeltaNetCache,
         out: &mut [f32],
     ) -> Result<(), NnError> {
-        let mut observer = RecurrentStateObserver {
-            positions: &[],
-            callback: None,
-        };
+        let mut observer = RecurrentStateObserver::disabled();
         self.stage_forward_with_state_observer(
             backend,
             normalized,
@@ -1206,10 +1223,7 @@ mod tests {
         let mut observed_output = [f32::NAN; 6];
         let mut snapshots = Vec::new();
         let mut callback = |position, state: &[f32]| snapshots.push((position, state.to_vec()));
-        let mut observer = RecurrentStateObserver {
-            positions: &[0, 2],
-            callback: Some(&mut callback),
-        };
+        let mut observer = RecurrentStateObserver::new(&[0, 2], &mut callback);
         layer
             .stage_forward_with_state_observer(
                 &backend,
@@ -1267,10 +1281,8 @@ mod tests {
         let mut cache = layer.new_cache().unwrap();
         let mut output = [f32::NAN; 4];
         for positions in [&[2][..], &[1, 0][..], &[0, 0][..]] {
-            let mut observer = RecurrentStateObserver {
-                positions,
-                callback: None,
-            };
+            let mut observer = RecurrentStateObserver::disabled();
+            observer.positions = positions;
             let error = layer
                 .stage_forward_with_state_observer(
                     &backend,
