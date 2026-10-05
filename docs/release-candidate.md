@@ -56,6 +56,24 @@ revision, but no separate run has been dispatched for `cecf528`; package-matrix
 admission therefore remains open for that candidate. Hardware and release
 qualification are not implied by this PR CI result.
 
+### Exact-source PR CI refresh (2026-10-04)
+
+GitHub Actions run
+[`37253818275`](https://github.com/Quitetall/tritium/actions/runs/37253818275)
+completed successfully for exact branch head
+`f2b2b3a35058638171df4928f8e120f453bcb760` on
+`feat/release-input-admission`. The workflow's source-bound jobs verified and
+used the PR head revision. The required CI aggregate passed, including the
+cross-platform CPU test/lint/format matrix, source-bound compatibility and
+package checks, CPU serving contract, ONNX CPU custom op, Burn/Candle CPU
+interop, MSRV, API stability, supply-chain, SBOM, and workflow lint checks.
+
+The run explicitly skipped fuzz parsers, CUDA conformance/parity, real-model
+serving E2E, ROCm, performance regression, wgpu, and Metal. This is exact-source
+software CI evidence only. It does not replace the package-matrix release
+receipt, physical backend evidence, real-model serving or quality gates, or
+independent release qualification.
+
 ### Installed CPU wheel, HF lifecycle, and ONNX smoke (2026-10-04)
 
 At source revision `2f53bf00658f9d8412b98acff387763efb4e191d`, a CPU abi3 wheel
