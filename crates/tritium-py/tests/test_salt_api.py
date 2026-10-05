@@ -123,6 +123,8 @@ def test_native_boundary_rejects_revision_before_source_io(tmp_path):
             "wrong-revision",
             str(tmp_path / "work"),
             str(tmp_path / "evidence"),
+            source_admission_receipt=str(tmp_path / "source-admission.json"),
+            official_identity_receipt=str(tmp_path / "official-source-identity.json"),
         )
 
     with pytest.raises(ValueError, match="pinned Qwen3.6 revision"):
@@ -136,6 +138,8 @@ def test_native_boundary_rejects_revision_before_source_io(tmp_path):
             compact_max_resident_bytes=1,
             near_lossless_max_bytes=1,
             near_lossless_max_resident_bytes=1,
+            source_admission_receipt=str(tmp_path / "source-admission.json"),
+            official_identity_receipt=str(tmp_path / "official-source-identity.json"),
         )
 
 
