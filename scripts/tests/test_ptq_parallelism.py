@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import subprocess
@@ -53,6 +54,10 @@ with tempfile.TemporaryDirectory(prefix="tritium-ptq-parallelism-") as root:
 """
 
 
+@unittest.skipUnless(
+    importlib.util.find_spec("torch"),
+    "the PTQ parallelism probe runs in the installed-wheel PyTorch lane",
+)
 class PublicPtqParallelismTests(unittest.TestCase):
     def _convert(self, rayon_threads: int) -> dict[str, object]:
         env = os.environ.copy()
