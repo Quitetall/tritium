@@ -337,7 +337,12 @@ class AdditiveTernaryWeight(nn.Module):
             chunk = None
             for plane_index in range(self.plane_count):
                 packed = getattr(self, f"packed_trits_{plane_index}")
-                byte_indices = torch.div(positions, 5, rounding_mode="floor")
+                # `torch.div(..., rounding_mode="floor")` exports as float32
+                # Div+Floor. Large matrices cross 2^24 flattened elements, where
+                # float32 no longer represents every integer and packed-byte
+                # gathers silently select the wrong trit. Integer floor division
+                # preserves the exact byte offset through ONNX export.
+                byte_indices = torch.floor_divide(positions, 5)
                 digit_indices = torch.remainder(positions, 5)
                 packed_values = packed.index_select(
                     0, byte_indices.reshape(-1)

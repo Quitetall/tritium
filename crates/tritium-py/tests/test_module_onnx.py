@@ -340,3 +340,30 @@ def test_huggingface_ptq_exports_tied_embedding_and_dynamic_sequence(tmp_path):
     expected = model(replay).logits.detach()
     observed = load_module_onnx(artifact.artifact_dir)(replay)
     torch.testing.assert_close(observed, expected, rtol=1e-4, atol=1e-5)
+
+
+def test_packed_linear_onnx_keeps_large_flattened_indices_exact(tmp_path):
+    rows, columns = 29128, 576
+    trits = torch.zeros((rows, columns), dtype=torch.int8)
+    trits[-1, 67] = 1
+    plane = SimpleNamespace(
+        trits=trits,
+        scales=torch.ones((rows, 1), dtype=torch.float16),
+        group_size=columns,
+    )
+    model = AdditiveTernaryLinear((plane,)).eval()
+    hidden = torch.zeros((1, 1, columns), dtype=torch.float32)
+    hidden[0, 0, 67] = 1.0
+
+    artifact = export_module_onnx(
+        model,
+        hidden,
+        tmp_path / "large-index-bundle",
+        input_names=("hidden",),
+        output_names=("logits",),
+    )
+
+    expected = model(hidden)
+    observed = load_module_onnx(artifact.artifact_dir)(hidden)
+    assert expected[0, 0, -1] == 1.0
+    torch.testing.assert_close(observed, expected, rtol=1e-4, atol=1e-5)
