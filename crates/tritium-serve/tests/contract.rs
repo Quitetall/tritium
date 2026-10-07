@@ -1435,8 +1435,10 @@ async fn oversized_body_rejected() {
 
 #[tokio::test]
 async fn dropped_sse_body_records_client_disconnect() {
+    let emitted = Arc::new(AtomicUsize::new(0));
     let mock = MockGenerator {
         step_delay_ms: 100,
+        emitted: Some(emitted.clone()),
         ..MockGenerator::new(vec![1, 2, 3, 4, 5, 6, 7, 8])
     };
     let (router, _) = router_with(mock, ServeConfig::default());
@@ -1452,17 +1454,72 @@ async fn dropped_sse_body_records_client_disconnect() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let mut body = response.into_body();
-    assert!(body.frame().await.transpose().unwrap().is_some());
+    // Wait for a content token, not merely the role-first SSE frame, before
+    // simulating a disconnect. This proves generation actually started.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let mut bytes = Vec::new();
+        loop {
+            let frame = body
+                .frame()
+                .await
+                .transpose()
+                .expect("SSE body frame")
+                .expect("stream should emit a token before disconnect");
+            if let Ok(data) = frame.into_data() {
+                bytes.extend_from_slice(&data);
+                if String::from_utf8_lossy(&bytes).contains("\"content\"") {
+                    break;
+                }
+            }
+        }
+    })
+    .await
+    .expect("first content token should arrive");
     drop(body);
-    tokio::task::yield_now().await;
 
-    let request = Request::get("/metrics").body(Body::empty()).unwrap();
-    let (status, body) = send(&router, request).await;
-    assert_eq!(status, StatusCode::OK);
-    let text = String::from_utf8(body).unwrap();
+    async fn metrics(router: &Router) -> String {
+        let request = Request::get("/metrics").body(Body::empty()).unwrap();
+        let (status, body) = send(router, request).await;
+        assert_eq!(status, StatusCode::OK);
+        String::from_utf8(body).unwrap()
+    }
+
+    // The stream-side active gauge drops before the synchronous worker sees
+    // the closed receiver, so one in-flight token may still be counted. Wait
+    // for the producer counter itself to stabilize after the disconnect.
+    let text = metrics(&router).await;
     assert!(
         text.contains("tritium_stream_disconnects_total 1\n"),
-        "{text}"
+        "disconnect was not recorded: {text}"
+    );
+    let settled = tokio::time::timeout(Duration::from_secs(3), async {
+        let mut previous = emitted.load(Ordering::SeqCst);
+        let mut stable_for = Duration::ZERO;
+        loop {
+            let current = emitted.load(Ordering::SeqCst);
+            if current == previous {
+                stable_for += Duration::from_millis(10);
+                if stable_for >= Duration::from_millis(150) {
+                    break current;
+                }
+            } else {
+                previous = current;
+                stable_for = Duration::ZERO;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    let emitted_after_settle = settled.expect("worker did not settle after disconnect");
+    assert!(
+        emitted_after_settle < 8,
+        "worker emitted all tokens after disconnect"
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        emitted.load(Ordering::SeqCst),
+        emitted_after_settle,
+        "worker kept generating after disconnect was settled"
     );
 }
 
