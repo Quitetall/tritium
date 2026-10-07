@@ -432,18 +432,21 @@ The user selected the immutable-child-package path for sliding-window scale
 updates. The existing `TSQ36RC v1` path is the required replay/lineage mechanism;
 the base `TSQ36EX v1` stays final-logit-only, and child scope evidence must not
 be mislabeled as a `TSQ36SB` binding. This decision resolves the lineage choice,
-not the B3 optimizer. On 2026-10-07, commit `2689b865` added the bounded-memory
-`FixedTritScaleUpdateCandidateBuilder`: it streams activation/residual windows,
-emits canonical f16 scale updates, and binds the owned candidate to the frozen
-spec, parent digest, and seed. The output-reconstruction integration suite
-passed (23 tests), package Clippy passed with warnings denied, and `cargo fmt
---all -- --check` passed. The separate focused Qwen admission fixture (1 test)
-covers immutable child materialization and fresh child replay. These are CPU
-fixtures, not Qwen quality or hardware evidence. Production B3 remains open:
-projection-level residual generation, deterministic per-window candidate
-scoring/selection, and joining the selected fitted updates to the existing child
-replay path. No full Qwen campaign or paid compute is authorized by this
-decision.
+not the B3 optimizer. On 2026-10-07, commits `2689b865` and `e032d89e` added the
+bounded-memory `FixedTritScaleUpdateCandidateBuilder`: it streams activation
+windows, emits canonical f16 scale updates, binds the owned candidate to the
+frozen spec/parent/seed, and derives residuals as `teacher - (current projection
+- active tile-plane contribution)`. Shape and finite-value errors are rejected.
+The output-reconstruction integration suite passed (23 tests), package Clippy
+passed with warnings denied, and `cargo fmt --all -- --check` passed. The focused
+Qwen admission fixture (1 test) also passed, but it exercises the existing
+immutable-child replay path separately; the new builder has not yet been
+connected to it. These are CPU fixtures, not Qwen quality or hardware evidence.
+Production B3 remains open: a Qwen adapter must supply aligned
+teacher/current/tile outputs, deterministic per-window candidates must be scored
+and selected against the frozen objective, and selected updates must be joined
+to child materialization and exact replay. No full Qwen campaign or paid compute
+is authorized by this decision.
 
 ### Flagship campaign status refresh (2026-10-04)
 
