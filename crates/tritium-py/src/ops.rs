@@ -374,12 +374,6 @@ pub(crate) fn fit_joint_ternary_diagonal_groups_with_objective(
             weight_bytes.len()
         )));
     }
-    let (weight_chunks, remainder) = weight_bytes.as_chunks::<{ std::mem::size_of::<f32>() }>();
-    debug_assert!(remainder.is_empty());
-    let weights = weight_chunks
-        .iter()
-        .map(|bytes| f32::from_le_bytes(*bytes))
-        .collect::<Vec<_>>();
     let scale_precision = match scale_precision {
         "f32" => ScalePrecision::F32,
         "f16" => ScalePrecision::F16,
@@ -401,22 +395,33 @@ pub(crate) fn fit_joint_ternary_diagonal_groups_with_objective(
             modulated: modulated_relay,
         },
     };
-    let (scales_by_group, trits_by_plane, objective) = py
-        .detach(move || {
-            // Retain only one group's compact row fits at a time. Collecting all
-            // rows before assembly duplicates the full matrix's trit planes in
-            // temporary Vecs. Indexed collection within each group preserves row
-            // order and deterministic error selection.
-            let mut scales_by_group = Vec::with_capacity(groups);
-            let mut trits_by_plane = (0..planes)
-                .map(|_| Vec::with_capacity(expected_weights))
+    let (scales_by_group, trits_by_plane, objective) = (|| {
+        // Retain only one group's compact row fits at a time. Collecting all
+        // rows before assembly duplicates the full matrix's trit planes in
+        // temporary Vecs. Indexed collection within each group preserves row
+        // order and deterministic error selection.
+        let mut scales_by_group = Vec::with_capacity(groups);
+        let mut trits_by_plane = (0..planes)
+            .map(|_| Vec::with_capacity(expected_weights))
+            .collect::<Vec<_>>();
+        let mut objective = 0.0;
+        let group_weight_bytes = expected_weight_bytes / groups;
+        for (group, group_weight_bytes_slice) in
+            weight_bytes.chunks_exact(group_weight_bytes).enumerate()
+        {
+            // Decode only this group's rows. The source is immutable Python
+            // bytes, so it remains safe while the GIL is released for fits.
+            let (group_weight_chunks, remainder) =
+                group_weight_bytes_slice.as_chunks::<{ std::mem::size_of::<f32>() }>();
+            debug_assert!(remainder.is_empty());
+            let group_weights = group_weight_chunks
+                .iter()
+                .map(|bytes| f32::from_le_bytes(*bytes))
                 .collect::<Vec<_>>();
-            let mut objective = 0.0;
-            let group_weight_count = rows * columns;
-            for (group, group_weights) in weights.chunks_exact(group_weight_count).enumerate() {
-                let start = group * columns;
-                let group_diagonal = &diagonal[start..start + columns];
-                let fits: Vec<Result<CompactJointFit, String>> = group_weights
+            let start = group * columns;
+            let group_diagonal = &diagonal[start..start + columns];
+            let fits: Vec<Result<CompactJointFit, String>> = py.detach(|| {
+                group_weights
                     .par_chunks_exact(columns)
                     .map(|row_weights| {
                         fit_joint_ternary(
@@ -427,24 +432,25 @@ pub(crate) fn fit_joint_ternary_diagonal_groups_with_objective(
                         .map(|fit| (fit.scales, fit.trits, fit.objective))
                         .map_err(|error| error.to_string())
                     })
-                    .collect();
-                let mut fits = fits.into_iter();
-                let mut scales_by_row = Vec::with_capacity(rows);
-                for _ in 0..rows {
-                    let (scales, trits, row_objective) = fits
-                        .next()
-                        .ok_or_else(|| "internal grouped-fit row count mismatch".to_owned())??;
-                    objective += row_objective;
-                    scales_by_row.push(scales);
-                    for (plane, row_trits) in trits.into_iter().enumerate() {
-                        trits_by_plane[plane].extend(row_trits.into_iter().map(|trit| trit as u8));
-                    }
+                    .collect()
+            });
+            let mut fits = fits.into_iter();
+            let mut scales_by_row = Vec::with_capacity(rows);
+            for _ in 0..rows {
+                let (scales, trits, row_objective) = fits
+                    .next()
+                    .ok_or_else(|| "internal grouped-fit row count mismatch".to_owned())??;
+                objective += row_objective;
+                scales_by_row.push(scales);
+                for (plane, row_trits) in trits.into_iter().enumerate() {
+                    trits_by_plane[plane].extend(row_trits.into_iter().map(|trit| trit as u8));
                 }
-                scales_by_group.push(scales_by_row);
             }
-            Ok::<_, String>((scales_by_group, trits_by_plane, objective))
-        })
-        .map_err(PyValueError::new_err)?;
+            scales_by_group.push(scales_by_row);
+        }
+        Ok::<_, String>((scales_by_group, trits_by_plane, objective))
+    })()
+    .map_err(PyValueError::new_err)?;
     let trits_by_plane = trits_by_plane
         .iter()
         .map(|trits| PyBytes::new(py, trits).unbind())
