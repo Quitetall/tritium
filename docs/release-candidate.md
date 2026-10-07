@@ -2339,6 +2339,23 @@ software allocation reduction only; the pinned hosted 300-second tutorial
 gate remains unverified for this change and must be rerun before any timing
 claim.
 
+### SALT V2 assignment/scale temporary storage reduction — 2026-10-07
+
+The exact assignment codebook now uses fixed stack storage for its bounded
+`3^P` states and an in-place deterministic sort (state ID is the unique tie
+breaker). Scale canonicalization also moves each sign-corrected trit plane
+through one owning vector instead of cloning it again after ordering. The
+exhaustive assignment/tie oracle, scale-sign/order reconstruction test, public
+solver conformance test, full quantizer unit suite (235 tests), and strict
+quantizer Clippy passed.
+
+The same local G128 benchmark measured medians of 77.46 µs (P=1), 323.1 µs
+(P=2), and 797.8 µs (P=3), versus the immediately preceding run's 77.24 µs,
+324.7 µs, and 811.7 µs. The differences are within the observed host noise and
+do not establish a speedup. The benefit claimed here is bounded temporary
+storage/allocation reduction only; the hosted 300-second tutorial has not yet
+run against this source.
+
 ### Telemetry-enabled hosted SmolLM2 tutorial — 2026-10-07
 
 Wheel workflow [37664061975](https://github.com/Quitetall/tritium/actions/runs/37664061975)

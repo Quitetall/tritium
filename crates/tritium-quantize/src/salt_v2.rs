@@ -580,8 +580,8 @@ pub fn exact_ternary_assignment(
 
     const CODES: [i8; 3] = [0, -1, 1];
     let states = 3_usize.pow(scales.len() as u32);
-    let mut codebook = Vec::with_capacity(states);
-    for state in 0..states {
+    let mut codebook = [(0.0_f32, [0_i8; 3], 0_usize); 27];
+    for (state, entry) in codebook.iter_mut().take(states).enumerate() {
         let mut encoded = state;
         let mut reconstruction = 0.0_f32;
         let mut candidate = [0_i8; 3];
@@ -591,9 +591,11 @@ pub fn exact_ternary_assignment(
             candidate[plane] = trit;
             reconstruction += scales[plane] * f32::from(trit);
         }
-        codebook.push((reconstruction, candidate, state));
+        *entry = (reconstruction, candidate, state);
     }
-    codebook.sort_by(|left, right| {
+    let codebook = &mut codebook[..states];
+    // State is unique, making this a deterministic total order without a heap-backed sort buffer.
+    codebook.sort_unstable_by(|left, right| {
         left.0
             .total_cmp(&right.0)
             .then_with(|| left.2.cmp(&right.2))
@@ -624,7 +626,7 @@ pub fn exact_ternary_assignment(
             || min_reconstruction_gap
                 <= (f64::from(weight.abs()) + f64::from(max_reconstruction)) * (1.0 / 67_108_864.0);
         if ill_conditioned {
-            for &(reconstruction, candidate, state) in &codebook {
+            for &(reconstruction, candidate, state) in codebook.iter() {
                 let error = f64::from(weight) - f64::from(reconstruction);
                 let squared = error * error;
                 if squared < best_error || (squared == best_error && state < best_state) {
@@ -1338,31 +1340,29 @@ fn solve_scales(
 
     // Plane signs are a representation symmetry. Canonicalize each negative solved coefficient
     // by flipping that plane's trits, then sort scales and trit planes with the same permutation.
-    let mut canonical_trits = trits.to_vec();
-    let mut signed_scales = rhs[..planes].to_vec();
-    for (scale, plane_trits) in signed_scales.iter_mut().zip(&mut canonical_trits) {
-        if *scale < 0.0 {
-            *scale = -*scale;
-            for trit in plane_trits {
+    let mut signed_planes = Vec::with_capacity(planes);
+    for (source, (scale, plane)) in rhs[..planes].iter().zip(trits).enumerate() {
+        let mut scale = *scale;
+        let mut plane_trits = plane.clone();
+        if scale < 0.0 {
+            scale = -scale;
+            for trit in &mut plane_trits {
                 *trit = -*trit;
             }
         }
+        signed_planes.push((scale, source, plane_trits));
     }
-    let mut order: Vec<usize> = (0..planes).collect();
-    order.sort_by(|left, right| {
-        signed_scales[*right]
-            .total_cmp(&signed_scales[*left])
-            .then_with(|| left.cmp(right))
+    signed_planes.sort_unstable_by(|left, right| {
+        right
+            .0
+            .total_cmp(&left.0)
+            .then_with(|| left.1.cmp(&right.1))
     });
     let mut scales = Vec::with_capacity(planes);
     let mut ordered_trits = Vec::with_capacity(planes);
-    for (plane, source) in order.into_iter().enumerate() {
-        scales.push(deployment_scale(
-            signed_scales[source] as f32,
-            precision,
-            plane,
-        )?);
-        ordered_trits.push(canonical_trits[source].clone());
+    for (plane, (scale, _, plane_trits)) in signed_planes.into_iter().enumerate() {
+        scales.push(deployment_scale(scale as f32, precision, plane)?);
+        ordered_trits.push(plane_trits);
     }
     Ok(ScaleSolveOutcome {
         scales,
