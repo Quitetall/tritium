@@ -1906,7 +1906,7 @@ Ran 44 tests in 3.056s — OK
 ```
 
 The Python skips were explicit: ONNX was not installed in the host environment,
-two checks require an installed candidate wheel, eight checks require the
+seven checks require an installed candidate wheel, eight checks require the
 CUDA-enabled Tritium extension, and the remaining checks require external
 LamQuant/BLUT checkouts. They are not release passes. Separately, hosted CI run
 [`37588299083`](https://github.com/Quitetall/tritium/actions/runs/37588299083)
