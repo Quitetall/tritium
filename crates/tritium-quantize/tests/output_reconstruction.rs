@@ -1320,9 +1320,8 @@ fn four_fitted_scale_restarts_select_by_frozen_output_objective() {
     let selected = select_output_reconstruction(&spec, receipts).unwrap();
     assert_eq!(selected.selected_candidate_id(), &selected_id);
     assert_eq!(selected.selected().initialization_seed(), selected_seed);
-    let selected_fit = fitted
-        .iter()
-        .find(|candidate| candidate.candidate_id() == selected.selected_candidate_id())
+    let selected_fit = selected
+        .selected_fitted_scale_update_candidate(&spec, &parent, &fitted)
         .expect("selected output receipt maps to the exact fitted update set");
     assert_eq!(
         selected_fit
@@ -1331,6 +1330,41 @@ fn four_fitted_scale_restarts_select_by_frozen_output_objective() {
             .candidate_id(),
         selected.selected_candidate_id()
     );
+    assert!(matches!(
+        selected.selected_fitted_scale_update_candidate(&spec, &[78; 32], &fitted),
+        Err(tritium_quantize::OutputReconstructionError::CandidateParentMismatch)
+    ));
+    assert!(matches!(
+        selected.selected_fitted_scale_update_candidate(&spec, &parent, &fitted[..3]),
+        Err(tritium_quantize::OutputReconstructionError::RestartCount {
+            expected: 4,
+            got: 3
+        })
+    ));
+    let mut reordered = fitted.clone();
+    reordered.reverse();
+    assert_eq!(
+        selected
+            .selected_fitted_scale_update_candidate(&spec, &parent, &reordered)
+            .unwrap()
+            .candidate_id(),
+        selected.selected_candidate_id(),
+        "fitted candidate order does not affect exact selection mapping"
+    );
+    let mut alternate_builder = FixedTritScaleUpdateCandidateBuilder::new(&spec, &parent, 55);
+    alternate_builder
+        .begin_tile_plane(3, 0, 0, 1, &trits, &[f16::ONE, f16::ONE], 64, 8)
+        .unwrap();
+    alternate_builder
+        .observe_window_from_current_projection(&activation, &[1.0], &[2.0])
+        .unwrap();
+    let alternate = alternate_builder.finish().unwrap();
+    let mut mismatched = fitted.clone();
+    mismatched[0] = alternate;
+    assert!(matches!(
+        selected.selected_fitted_scale_update_candidate(&spec, &parent, &mismatched),
+        Err(tritium_quantize::OutputReconstructionError::FittedCandidateSetMismatch)
+    ));
     assert_eq!(selected.candidates().len(), spec.restarts());
 }
 

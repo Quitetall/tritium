@@ -2434,6 +2434,65 @@ impl OutputReconstructionReceipt {
             .expect("validated output-reconstruction receipt retains selected candidate")
     }
 
+    /// Resolve the selected receipt to the exact fitted SALT scale-update candidate.
+    ///
+    /// This verifies that the complete fitted restart set and output-scored restart
+    /// set have the same candidate identities and seeds, and that every fit is
+    /// bound to `parent_package_digest`. The returned candidate is therefore the
+    /// exact owned update set whose output evidence won selection.
+    ///
+    /// # Errors
+    /// Rejects spec, parent, restart-count, or fitted-candidate-set mismatches.
+    pub fn selected_fitted_scale_update_candidate<'a>(
+        &self,
+        spec: &OutputReconstructionSpec,
+        parent_package_digest: &[u8; 32],
+        fitted_candidates: &'a [FixedTritScaleUpdateCandidate],
+    ) -> Result<&'a FixedTritScaleUpdateCandidate, OutputReconstructionError> {
+        if self.spec_id != *spec.spec_id() {
+            return Err(OutputReconstructionError::CandidateSpecMismatch);
+        }
+        if fitted_candidates.len() != spec.restarts {
+            return Err(OutputReconstructionError::RestartCount {
+                expected: spec.restarts,
+                got: fitted_candidates.len(),
+            });
+        }
+        if self.candidates.len() != fitted_candidates.len() {
+            return Err(OutputReconstructionError::FittedCandidateSetMismatch);
+        }
+
+        let mut fitted_ids = BTreeSet::new();
+        let mut fitted_seeds = BTreeSet::new();
+        for fitted in fitted_candidates {
+            let candidate = fitted.as_scale_candidate(spec)?;
+            if candidate.parent_package_digest() != parent_package_digest {
+                return Err(OutputReconstructionError::CandidateParentMismatch);
+            }
+            if !fitted_ids.insert(*candidate.candidate_id()) {
+                return Err(OutputReconstructionError::DuplicateCandidate);
+            }
+            if !fitted_seeds.insert(candidate.initialization_seed()) {
+                return Err(OutputReconstructionError::DuplicateInitializationSeed);
+            }
+            if !self.candidates.iter().any(|scored| {
+                scored.candidate_id == *candidate.candidate_id()
+                    && scored.initialization_seed == candidate.initialization_seed()
+            }) {
+                return Err(OutputReconstructionError::FittedCandidateSetMismatch);
+            }
+        }
+
+        let selected = self.selected();
+        fitted_candidates
+            .iter()
+            .find(|fitted| {
+                fitted.candidate_id == self.selected_candidate_id
+                    && fitted.initialization_seed == selected.initialization_seed
+            })
+            .ok_or(OutputReconstructionError::FittedCandidateSetMismatch)
+    }
+
     /// Content identity of spec, teacher stream, all basins, and selection.
     #[must_use]
     pub const fn receipt_id(&self) -> &[u8; 32] {
@@ -2790,6 +2849,10 @@ pub enum OutputReconstructionError {
     },
     /// Candidate belongs to another spec or its receipt identity changed.
     CandidateSpecMismatch,
+    /// A fitted scale candidate is bound to a different parent package.
+    CandidateParentMismatch,
+    /// Fitted scale candidates do not exactly match the scored restart set.
+    FittedCandidateSetMismatch,
     /// Teacher bytes differ across restart evaluations.
     TeacherEvidenceMismatch,
     /// Candidate content identity is duplicated.
@@ -2892,6 +2955,12 @@ impl fmt::Display for OutputReconstructionError {
             ),
             Self::CandidateSpecMismatch => {
                 formatter.write_str("output-reconstruction candidate spec differs")
+            }
+            Self::CandidateParentMismatch => {
+                formatter.write_str("fitted scale candidate parent package differs")
+            }
+            Self::FittedCandidateSetMismatch => {
+                formatter.write_str("fitted scale candidates differ from scored restart set")
             }
             Self::TeacherEvidenceMismatch => formatter
                 .write_str("output-reconstruction teacher evidence differs across restarts"),

@@ -3989,12 +3989,18 @@ mod tests {
         }
         let selected_output = select_output_reconstruction(&refined_spec, output_candidates)
             .expect("select among actual child replays");
-        let selected_id = selected_output.selected_candidate_id();
-        let (selected_fit, (child_package_path, child_lineage)) = fitted_candidates
+        let selected_fit = selected_output
+            .selected_fitted_scale_update_candidate(
+                &refined_spec,
+                receipt.package_id().as_bytes(),
+                &fitted_candidates,
+            )
+            .expect("selected output receipt maps to exact parent-bound fit");
+        let selected_index = fitted_candidates
             .iter()
-            .zip(&child_artifacts)
-            .find(|(candidate, _)| candidate.candidate_id() == selected_id)
-            .expect("selected output receipt maps to its fitted child");
+            .position(|candidate| candidate.candidate_id() == selected_fit.candidate_id())
+            .expect("selected fit belongs to materialized child set");
+        let (child_package_path, child_lineage) = &child_artifacts[selected_index];
         let scale_candidate = selected_fit
             .as_scale_candidate(&refined_spec)
             .expect("reopen selected fitted child candidate");

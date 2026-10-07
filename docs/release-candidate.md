@@ -472,6 +472,16 @@ all integration suites passed) and Clippy passed with warnings denied. This
 proves software composition on synthetic CPU data, not Qwen quality, full-model
 coordination, CUDA, or production qualification.
 
+`OutputReconstructionReceipt::selected_fitted_scale_update_candidate` now
+provides that join as a reusable checked API. It verifies spec and parent
+identity, the full frozen restart count, unique fitted IDs/seeds, and an exact
+ID-plus-seed match for every scored restart before returning the selected owned
+update set. Focused tests reject wrong-parent and missing-restart inputs; the
+admitted-child fixture now uses this resolver instead of manually matching
+candidate IDs. Additional tests prove candidate-list reordering is harmless and
+substituting an unscored fit is rejected. This adds no receipt fields or
+wire-version changes, and enforces ADR 0050's exact child-candidate binding.
+
 The admitted-session API now composes the visitor with the frozen spec, a
 verified parent execution, an activation source, and a parent-bound scale-fit
 builder. It reopens each requested block window against the activation-cache
