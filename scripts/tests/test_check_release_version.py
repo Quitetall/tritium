@@ -59,14 +59,20 @@ class ReleaseVersionTests(unittest.TestCase):
             root = Path(raw)
             docs = root / "docs/book/src"
             docs.mkdir(parents=True)
+            chart_dir = root / "deploy/helm/tritium"
+            chart_dir.mkdir(parents=True)
             readme = root / "README.md"
             quantization = docs / "quantization.md"
+            chart = chart_dir / "Chart.yaml"
             readme.write_text(
                 f"cargo install tritium-cli --version {version}\n"
                 f"cargo install tritium-serve --version {version}\n",
                 encoding="utf-8",
             )
             quantization.write_text(f"--release {version}\n", encoding="utf-8")
+            chart.write_text(
+                f"version: {version}\nappVersion: {version}\n", encoding="utf-8"
+            )
 
             MODULE.check_document_versions(root, version)
 
@@ -75,6 +81,18 @@ class ReleaseVersionTests(unittest.TestCase):
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(ValueError, "README CLI installation command"):
+                MODULE.check_document_versions(root, version)
+
+            readme.write_text(
+                f"cargo install tritium-cli --version {version}\n"
+                f"cargo install tritium-serve --version {version}\n",
+                encoding="utf-8",
+            )
+            chart.write_text(
+                f"version: 1.1.0-rc.1\nappVersion: {version}\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "Helm chart version"):
                 MODULE.check_document_versions(root, version)
 
 

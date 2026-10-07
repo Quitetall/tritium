@@ -74,6 +74,11 @@ def check_document_versions(root: Path, version: str) -> None:
         f"--release {version}",
         "Stage-7 quantization command release version",
     )
+    chart = (root / "deploy/helm/tritium/Chart.yaml").read_text(
+        encoding="utf-8"
+    )
+    require_contains(chart, f"version: {version}", "Helm chart version")
+    require_contains(chart, f"appVersion: {version}", "Helm chart appVersion")
 
 
 def check(root: Path) -> str:
