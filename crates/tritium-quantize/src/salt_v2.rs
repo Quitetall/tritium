@@ -784,12 +784,42 @@ pub fn fit_joint_ternary(
     if !metric_sum.is_finite() {
         return Err(JointFitError::ScaleSolveFailed);
     }
+    let weighted_abs_order = if config.em_restarts > 1 {
+        weighted_abs_order(weights, &metric_diagonal)
+    } else {
+        Vec::new()
+    };
+    fit_joint_ternary_prepared(
+        weights,
+        fit_metric,
+        config,
+        &metric_diagonal,
+        metric_sum,
+        &weighted_abs_order,
+    )
+}
+
+fn fit_joint_ternary_prepared(
+    weights: &[f32],
+    fit_metric: JointFitMetric<'_>,
+    config: JointFitConfig,
+    metric_diagonal: &[f64],
+    metric_sum: f64,
+    weighted_abs_order: &[WeightedAbsEntry],
+) -> Result<JointTernaryFit, JointFitError> {
     let relay_starts =
         usize::from(config.relay_basins.softened) + usize::from(config.relay_basins.modulated);
     let mut starts =
         Vec::with_capacity(config.em_restarts + relay_starts + usize::from(config.planes > 1));
     for restart in 0..config.em_restarts {
-        let scales = deterministic_initial_scales(weights, &metric_diagonal, config, restart)?;
+        let scales = deterministic_initial_scales(
+            weights,
+            metric_diagonal,
+            metric_sum,
+            weighted_abs_order,
+            config,
+            restart,
+        )?;
         starts.push(optimize_start(
             weights,
             fit_metric,
@@ -826,13 +856,16 @@ pub fn fit_joint_ternary(
     // A lower-plane embedding is an additional basin, not one of the configured OA-EM restarts.
     // It guarantees P-monotonicity without pretending the non-convex solver is globally optimal.
     if config.planes > 1 {
-        let lower = fit_joint_ternary(
+        let lower = fit_joint_ternary_prepared(
             weights,
             fit_metric,
             JointFitConfig {
                 planes: config.planes - 1,
                 ..config
             },
+            metric_diagonal,
+            metric_sum,
+            weighted_abs_order,
         )?;
         let lower_receipt = lower.restart_receipts[lower.selected_start].clone();
         let lower_accepted_objectives = lower.accepted_objectives;
@@ -974,10 +1007,11 @@ fn optimize_start(
 fn deterministic_initial_scales(
     weights: &[f32],
     metric_diagonal: &[f64],
+    metric_sum: f64,
+    weighted_abs_order: &[WeightedAbsEntry],
     config: JointFitConfig,
     restart: usize,
 ) -> Result<Vec<f32>, JointFitError> {
-    let metric_sum: f64 = metric_diagonal.iter().sum();
     let mut scales = Vec::with_capacity(config.planes);
     if config.planes == 2 && restart + 1 == config.em_restarts {
         // Reserve one deterministic P2 basin for a max-minus-min decomposition. This exactly
@@ -1026,7 +1060,7 @@ fn deterministic_initial_scales(
         }
     } else {
         let quantile = 0.5 + 0.45 * (restart as f64 / config.em_restarts as f64);
-        let anchor = weighted_abs_quantile(weights, metric_diagonal, quantile);
+        let anchor = weighted_abs_quantile(weighted_abs_order, quantile);
         for plane in 0..config.planes {
             let divisor = 2_f64.powi(plane as i32);
             let modulation = 1.0 + 0.125 * (((restart + plane) % 3) as f64 - 1.0);
@@ -1041,8 +1075,10 @@ fn deterministic_initial_scales(
     Ok(scales)
 }
 
-fn weighted_abs_quantile(weights: &[f32], metric_diagonal: &[f64], quantile: f64) -> f64 {
-    let mut values: Vec<(f32, f64, usize)> = weights
+type WeightedAbsEntry = (f32, f64, usize);
+
+fn weighted_abs_order(weights: &[f32], metric_diagonal: &[f64]) -> Vec<WeightedAbsEntry> {
+    let mut values: Vec<WeightedAbsEntry> = weights
         .iter()
         .zip(metric_diagonal)
         .enumerate()
@@ -1053,10 +1089,14 @@ fn weighted_abs_quantile(weights: &[f32], metric_diagonal: &[f64], quantile: f64
             .total_cmp(&right.0)
             .then_with(|| left.2.cmp(&right.2))
     });
+    values
+}
+
+fn weighted_abs_quantile(values: &[WeightedAbsEntry], quantile: f64) -> f64 {
     let total: f64 = values.iter().map(|value| value.1).sum();
     let target = total * quantile.clamp(0.0, 1.0);
     let mut cumulative = 0.0;
-    for (value, weight, _) in &values {
+    for (value, weight, _) in values {
         cumulative += weight;
         if cumulative >= target {
             return f64::from(*value);
@@ -1726,6 +1766,79 @@ mod tests {
                 error * error
             })
             .sum()
+    }
+
+    #[test]
+    fn cached_weighted_abs_order_preserves_quantile_bits() {
+        let weights = [0.0, -2.0, 0.5, 1.5, -2.0, 0.25, 8.0, -0.75];
+        let diagonal = [3.0, 0.25, 1.0, 4.0, 2.0, 0.5, 0.0, 7.0];
+        let cached = weighted_abs_order(&weights, &diagonal);
+        for quantile in [0.0_f64, 0.25, 0.5, 0.75, 0.95, 1.0] {
+            let mut reference: Vec<WeightedAbsEntry> = weights
+                .iter()
+                .zip(&diagonal)
+                .enumerate()
+                .map(|(index, (value, weight))| (value.abs(), *weight, index))
+                .collect();
+            reference.sort_by(|left, right| {
+                left.0
+                    .total_cmp(&right.0)
+                    .then_with(|| left.2.cmp(&right.2))
+            });
+            let total: f64 = reference.iter().map(|value| value.1).sum();
+            let target = total * quantile.clamp(0.0, 1.0);
+            let mut cumulative = 0.0;
+            let expected = reference
+                .iter()
+                .find_map(|(value, weight, _)| {
+                    cumulative += *weight;
+                    (cumulative >= target).then_some(f64::from(*value))
+                })
+                .or_else(|| reference.last().map(|value| f64::from(value.0)))
+                .unwrap_or(0.0);
+            assert_eq!(
+                weighted_abs_quantile(&cached, quantile).to_bits(),
+                expected.to_bits(),
+                "quantile {quantile}"
+            );
+        }
+    }
+
+    #[test]
+    fn cached_start_context_preserves_existing_three_plane_output() {
+        let weights: Vec<f32> = (0..128)
+            .map(|index| ((index * 37 % 101) as f32 - 50.0) / 37.0)
+            .collect();
+        let diagonal = [1.0_f64; 128];
+        let fit = fit_joint_ternary(
+            &weights,
+            JointFitMetric::DiagonalF64(&diagonal),
+            JointFitConfig {
+                planes: 3,
+                max_iterations: 16,
+                ridge: 1e-8,
+                em_restarts: 4,
+                ridge_condition_limit: 1e6,
+                scale_precision: ScalePrecision::F16,
+                relay_basins: RelayBasins {
+                    softened: true,
+                    modulated: true,
+                },
+            },
+        )
+        .expect("three-plane row fit");
+        let mut fingerprint = 0xcbf2_9ce4_8422_2325_u64;
+        for &scale in &fit.scales {
+            for byte in scale.to_bits().to_le_bytes() {
+                fingerprint = (fingerprint ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3);
+            }
+        }
+        for plane in &fit.trits {
+            for &trit in plane {
+                fingerprint = (fingerprint ^ u64::from(trit as u8)).wrapping_mul(0x100_0000_01b3);
+            }
+        }
+        assert_eq!(fingerprint, 0xd20d_9b32_8141_ebad);
     }
 
     #[test]

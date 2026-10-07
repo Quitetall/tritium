@@ -13,6 +13,7 @@ import unittest
 _PROBE = r"""
 import hashlib
 import json
+import os
 import tempfile
 import time
 
@@ -72,11 +73,18 @@ class PublicPtqParallelismTests(unittest.TestCase):
         env["MKL_NUM_THREADS"] = "1"
         completed = subprocess.run(
             [sys.executable, "-c", _PROBE],
-            check=True,
+            check=False,
             capture_output=True,
             text=True,
             env=env,
             timeout=90,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            "public convert probe subprocess failed\n"
+            f"stdout:\n{completed.stdout}\n"
+            f"stderr:\n{completed.stderr}",
         )
         return json.loads(completed.stdout)
 
