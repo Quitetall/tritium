@@ -78,7 +78,7 @@ mod common;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use common::{Calib, calibrate, extract, fold, perplexity_windowed};
+use common::{Calib, calibrate, extract, fold, output_fishers, perplexity_windowed};
 use rayon::prelude::*;
 use tritium_nn::ModelRunner;
 use tritium_nn::salt_fit::{TapGrams, auto_decay};
@@ -317,7 +317,7 @@ fn rotate_gram(h: &[f64], n: usize) -> Vec<f64> {
 /// in block order then rounds block `b` at the target `w_b + Σ_{a<b} e_a·Ũ_ab` with
 /// `Ũ_ab = U_ab·U_bb⁻¹` — LDLQ when the block is one column, QuIP#'s BlockLDLQ here. Returns `Ũ`
 /// (`n × n`, only the strictly block-upper part is meaningful), or `None` if `H + λI` is not PD.
-fn block_ldlq_factor(h: &[f64], n: usize, damp: f64) -> Option<Vec<f64>> {
+fn block_ldlq_factor(h: &[f64], n: usize, damp: f64, block: usize) -> Option<Vec<f64>> {
     let mean = (0..n).map(|i| h[i * n + i]).sum::<f64>() / n as f64;
     let lambda = damp * mean.max(1e-12);
     // Lower Cholesky of the reversed matrix P·H·P.
@@ -342,8 +342,8 @@ fn block_ldlq_factor(h: &[f64], n: usize, damp: f64) -> Option<Vec<f64>> {
     // U = P·L·P is upper triangular with H + λI = U·Uᵀ.
     let u = |i: usize, j: usize| l[rev(i) * n + rev(j)];
     let mut ut = vec![0.0f64; n * n];
-    for b0 in (0..n).step_by(BLOCK) {
-        let bs = BLOCK.min(n - b0);
+    for b0 in (0..n).step_by(block) {
+        let bs = block.min(n - b0);
         // Inverse of the upper-triangular diagonal block U_bb.
         let mut inv = vec![0.0f64; bs * bs];
         for c in 0..bs {
@@ -399,6 +399,74 @@ fn golay_ldlq_row(
     out
 }
 
+/// Golay-coded `T + ½` fitted against a Kronecker curvature `A ⊗ G` (input Gram ⊗ output Fisher)
+/// by nearest-plane in (12-column block, row) order. With `U = U_A ⊗ U_G` upper triangular, row `i`
+/// of block `b` is decoded at
+/// `y_{i,b} + Σ_{j<i} e_{j,b}·Ũ_G[j,i] + Σ_{a<b} r_{i,a}·Ũ_A[a,b]`, `r_{i,a} = Σ_{j≤i} e_{j,a}·Ũ_G[j,i]`,
+/// with `e = y − q` against the original targets (the LDLQ form). `ut_a` is the 12-block factor of
+/// the rotated input Gram, `ut_g` the 1-block factor of the output Fisher; `decay_g` scales the
+/// row coupling (`0` switches it off), `decay_a` the column push. With `G = I` this is
+/// [`golay_ldlq_row`] on every row.
+#[allow(clippy::too_many_arguments)]
+fn golay_kron_tensor(
+    y: &[f32],
+    rows: usize,
+    cols: usize,
+    steps: &[Vec<f64>],
+    t: usize,
+    ut_a: &[f64],
+    ut_g: &[f64],
+    decay_a: f64,
+    decay_g: f64,
+    code: &[[i8; BLOCK]],
+) -> Vec<f32> {
+    let k = kmax(t) as f64;
+    let mut acc_a = vec![0.0f64; rows * cols];
+    let mut out = vec![0.0f32; rows * cols];
+    for b0 in (0..cols).step_by(BLOCK) {
+        // Row-sequential decode with output-side feedback inside the block.
+        let mut acc_g = vec![[0.0f64; BLOCK]; rows];
+        let mut err = vec![[0.0f64; BLOCK]; rows];
+        for i in 0..rows {
+            let target: Vec<f64> = (0..BLOCK)
+                .map(|m| f64::from(y[i * cols + b0 + m]) + acc_a[i * cols + b0 + m] + acc_g[i][m])
+                .collect();
+            let (units, _) = golay_decode_block(&target, b0, &steps[i], k, code);
+            for m in 0..BLOCK {
+                let q = steps[i][(b0 + m) / GROUP] * units[m] as f64;
+                out[i * cols + b0 + m] = q as f32;
+                err[i][m] = f64::from(y[i * cols + b0 + m]) - q;
+            }
+            if decay_g != 0.0 {
+                let e = err[i];
+                acc_g[i + 1..]
+                    .par_iter_mut()
+                    .enumerate()
+                    .for_each(|(off, a)| {
+                        let c = decay_g * ut_g[i * rows + i + 1 + off];
+                        if c != 0.0 {
+                            for m in 0..BLOCK {
+                                a[m] += e[m] * c;
+                            }
+                        }
+                    });
+            }
+        }
+        // r_{i,b} = e_{i,b} + decay_g·Σ_{j<i} e_{j,b}·Ũ_G[j,i] — exactly e + acc_g.
+        acc_a
+            .par_chunks_mut(cols)
+            .zip(err.par_iter().zip(acc_g.par_iter()))
+            .for_each(|(acc_row, (e, ag))| {
+                let r: Vec<f64> = (0..BLOCK).map(|m| e[m] + ag[m]).collect();
+                for c in b0 + BLOCK..cols {
+                    let push: f64 = (0..BLOCK).map(|m| r[m] * ut_a[(b0 + m) * cols + c]).sum();
+                    acc_row[c] += decay_a * push;
+                }
+            });
+    }
+    out
+}
+
 #[derive(Clone, Copy)]
 enum Arm {
     Ladder(usize),
@@ -409,6 +477,8 @@ enum Arm {
     Uniform(usize),
     /// Golay-coded `T + ½` fitted with block-LDLQ (GPTQ over 12-blocks) against the input Gram.
     GolayLdlq(usize),
+    /// [`Arm::GolayLdlq`] with the output side too: Kronecker `A ⊗ G`, λ_G = 0.5 (H6's best).
+    GolayKron(usize),
 }
 
 impl Arm {
@@ -417,6 +487,7 @@ impl Arm {
             Arm::Ladder(t) => format!("ladder T={t}"),
             Arm::Golay(t) => format!("Golay-coded {t}+½"),
             Arm::GolayLdlq(t) => format!("Golay {t}+½ + BlockLDLQ"),
+            Arm::GolayKron(t) => format!("Golay {t}+½ + Kron LDLQ"),
             Arm::TimeShare(t) => format!("time-share {t}/{}", t + 1),
             Arm::Uniform(l) => format!("uniform {l}-level scalar"),
         }
@@ -425,7 +496,9 @@ impl Arm {
     fn bits(self) -> f64 {
         let payload = match self {
             Arm::Ladder(t) => t as f64 * 3f64.log2(),
-            Arm::Golay(t) | Arm::GolayLdlq(t) | Arm::TimeShare(t) => (t as f64 + 0.5) * 3f64.log2(),
+            Arm::Golay(t) | Arm::GolayLdlq(t) | Arm::GolayKron(t) | Arm::TimeShare(t) => {
+                (t as f64 + 0.5) * 3f64.log2()
+            }
             Arm::Uniform(l) => (l as f64).log2(),
         };
         payload + 16.0 / GROUP as f64
@@ -439,6 +512,7 @@ fn quantize(
     arm: Arm,
     code: &[[i8; BLOCK]],
     gram: Option<(&[f64], f64)>,
+    fisher: Option<&[f64]>,
 ) -> Vec<f32> {
     let ladder = |t: usize, x: &[f32], r: usize| {
         ste::salt_quantize_forward_grouped_geometric(
@@ -501,9 +575,9 @@ fn quantize(
         Arm::GolayLdlq(t) => {
             // No Gram (the tied embedding) or a singular one: the plain Golay fit.
             let Some(ut) =
-                gram.and_then(|(h, _)| block_ldlq_factor(&rotate_gram(h, cols), cols, 0.01))
+                gram.and_then(|(h, _)| block_ldlq_factor(&rotate_gram(h, cols), cols, 0.01, BLOCK))
             else {
-                return quantize(w, rows, cols, Arm::Golay(t), code, None);
+                return quantize(w, rows, cols, Arm::Golay(t), code, None, None);
             };
             let decay = gram.map_or(1.0, |(_, d)| d);
             let mut out = vec![0.0f32; w.len()];
@@ -517,6 +591,27 @@ fn quantize(
                     hadamard_blocks(&mut rec);
                     o.copy_from_slice(&rec);
                 });
+            out
+        }
+        Arm::GolayKron(t) => {
+            let (Some((h, decay_a)), Some(g)) = (gram, fisher) else {
+                return quantize(w, rows, cols, Arm::Golay(t), code, None, None);
+            };
+            let (Some(ut_a), Some(ut_g)) = (
+                block_ldlq_factor(&rotate_gram(h, cols), cols, 0.01, BLOCK),
+                block_ldlq_factor(g, rows, 0.01, 1),
+            ) else {
+                return quantize(w, rows, cols, Arm::GolayLdlq(t), code, gram, None);
+            };
+            let mut y = w.to_vec();
+            y.par_chunks_mut(cols).for_each(hadamard_blocks);
+            let steps: Vec<Vec<f64>> = y
+                .par_chunks(cols)
+                .map(|r| golay_fit(r, t, code).0)
+                .collect();
+            let mut out =
+                golay_kron_tensor(&y, rows, cols, &steps, t, &ut_a, &ut_g, decay_a, 0.5, code);
+            out.par_chunks_mut(cols).for_each(hadamard_blocks);
             out
         }
         Arm::Golay(t) => {
@@ -581,7 +676,7 @@ fn block_ldlq_factor_reduces_to_plain_decoding_on_an_identity_metric() {
     for i in 0..n {
         eye[i * n + i] = 1.0;
     }
-    let ut = block_ldlq_factor(&eye, n, 0.0).expect("identity is PD");
+    let ut = block_ldlq_factor(&eye, n, 0.0, BLOCK).expect("identity is PD");
     assert!(
         ut.iter().all(|v| v.abs() < 1e-12),
         "identity metric must not couple blocks"
@@ -598,12 +693,34 @@ fn block_ldlq_factor_reduces_to_plain_decoding_on_an_identity_metric() {
     assert_eq!(golay_ldlq_row(&y, &steps, 1, &ut, 1.0, &code), plain);
 }
 
+/// With `G = I` the Kronecker fit couples no rows: it is BlockLDLQ on every row, bit for bit.
+#[test]
+fn kronecker_golay_with_identity_output_metric_is_block_ldlq() {
+    let (rows, cols) = (6, 48);
+    let h = spd(cols, 0.05, 21);
+    let ut_a = block_ldlq_factor(&h, cols, 0.0, BLOCK).expect("PD");
+    let mut eye = vec![0.0f64; rows * rows];
+    for i in 0..rows {
+        eye[i * rows + i] = 1.0;
+    }
+    let ut_g = block_ldlq_factor(&eye, rows, 0.0, 1).expect("PD");
+    let code = golay_codewords();
+    let mut next = xorshift(33);
+    let y: Vec<f32> = (0..rows * cols).map(|_| next() as f32).collect();
+    let steps: Vec<Vec<f64>> = y.chunks(cols).map(|r| golay_fit(r, 1, &code).0).collect();
+    let kron = golay_kron_tensor(&y, rows, cols, &steps, 1, &ut_a, &ut_g, 0.75, 0.5, &code);
+    for (i, row) in y.chunks(cols).enumerate() {
+        let ldlq = golay_ldlq_row(row, &steps[i], 1, &ut_a, 0.75, &code);
+        assert_eq!(&kron[i * cols..(i + 1) * cols], ldlq.as_slice(), "row {i}");
+    }
+}
+
 /// On a correlated metric, block feedback must lower the objective it targets, `e·H·eᵀ`.
 #[test]
 fn block_ldlq_lowers_the_metric_objective() {
     let n = 96;
     let h = spd(n, 0.02, 4);
-    let ut = block_ldlq_factor(&h, n, 0.0).expect("PD");
+    let ut = block_ldlq_factor(&h, n, 0.0, BLOCK).expect("PD");
     let code = golay_codewords();
     let objective = |e: &[f64]| -> f64 {
         (0..n)
@@ -691,12 +808,24 @@ fn golay_coded_planes_against_the_ladder() {
     if ldlq {
         arms = ts.iter().flat_map(|&t| [Arm::GolayLdlq(t)]).collect();
     }
+    // `TRITIUM_H8_ARMS=kron`: the Kronecker (input Gram ⊗ output Fisher) version of the same fit.
+    let kron = std::env::var("TRITIUM_H8_ARMS").is_ok_and(|v| v == "kron");
+    if kron {
+        arms = ts.iter().map(|&t| Arm::GolayKron(t)).collect();
+    }
+    let ldlq = ldlq || kron;
     let calib_tokens = 32 * WINDOW;
     let grams = ldlq.then(|| {
         let windows: Vec<&[u32]> = (0..32)
             .map(|w| &train[w * WINDOW..(w + 1) * WINDOW])
             .collect();
         TapGrams::collect(&folded, &arch, &windows)
+    });
+    let fishers = kron.then(|| {
+        let windows: Vec<&[u32]> = (0..32)
+            .map(|w| &train[w * WINDOW..(w + 1) * WINDOW])
+            .collect();
+        output_fishers(&folded, &arch, &windows, 0xF15E_A5ED)
     });
     for arm in arms {
         let started = Instant::now();
@@ -711,7 +840,11 @@ fn golay_coded_planes_against_the_ladder() {
                         auto_decay(calib_tokens, cols),
                     )
                 });
-                quantize(w, rows, cols, arm, &code, gram)
+                let fisher = fishers
+                    .as_ref()
+                    .filter(|_| i > 0)
+                    .map(|f| f[i - 1].as_slice());
+                quantize(w, rows, cols, arm, &code, gram, fisher)
             })
             .collect();
         let (mut sig, mut err) = (0.0f64, 0.0f64);
