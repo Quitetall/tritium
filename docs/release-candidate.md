@@ -2099,3 +2099,23 @@ artifact path, not a direct private solver call. On branch head
 checks fitted trits/scales and weighted error, exercises deterministic resume,
 and rejects source-weight drift. This confirms the public artifact contract on
 a small CPU fixture; it is not a model-level quality or performance result.
+
+### Exact-source hosted SmolLM2 tutorial rerun — 2026-10-07
+
+Actions run [37629720595](https://github.com/Quitetall/tritium/actions/runs/37629720595)
+completed with only the pinned SmolLM2 CPU tutorial failing; the CI aggregate,
+CodeQL, CPU wheels, abi3 matrix, publish readiness, docs, and source-free wheel
+tutorial passed. The tutorial ran on exact source revision
+`8bef95b6fb7acc8320d77823d6ef001f4bb3a78f` and finished at `690.001s` against
+the unchanged `300s` budget. Stage markers show calibration at `0.441s`,
+conversion at `552.095s` (about `551.654s` after calibration), native checkpoint
+round-trip at `565.363s`, generation at `593.501s`, ONNX export at `665.686s`,
+ONNX replay at `685.167s`, and QAT resume at `690.001s`.
+
+Sampled memory stayed above about `12.8 GiB` and runner temp disk above `83.5
+GiB`; this remains a CPU-time failure, not OOM or disk pressure. Conversion was
+about 35% faster than the preceding hosted run's `852.602s`, but the code was
+unchanged and hosted runner variation was not controlled. Treat this as noisy
+measurement, not evidence of an optimization. The gate is still red by
+`390.001s`, and profiler-backed optimization plus an exact-candidate rerun
+remain required.
