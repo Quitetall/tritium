@@ -515,6 +515,27 @@ not merely a separately hand-labeled candidate ID. All 26 output-reconstruction
 tests and quantize Clippy passed. This remains synthetic: it does not score a
 loaded child model against dense Qwen teacher outputs or establish model quality.
 
+### Dynamic packed-embedding ONNX export repair (2026-10-07)
+
+Commit `cf87c4fc` removes the dynamic-slice `copy_` from the `torch.export`
+capture path in `AdditiveTernaryWeight._dense_rows`. Dynamo capture decodes the
+selected token rows as one functional tensor; ordinary eager execution retains
+the bounded 2^18-weight-element chunk path. The regression uses a 576-wide,
+three-plane embedding and replays dynamic sequences on both sides of the eager
+chunk threshold. The full source-tree Python suite passed (374 passed, 27
+skipped), and the focused test passed on Python 3.13 / Torch 2.11.0 CPU with a
+tiny tied-weight Llama through the public ONNX exporter. That local environment
+used ONNX 1.23.1, ONNX Runtime 1.30.0 and ONNXScript 0.7.2, not the pinned
+SmolLM2 lane's exact ONNX dependency versions. The pinned model is not cached
+locally, so no second full tutorial run was started.
+
+Exact-source hosted run `37570157130` for `cf87c4fc` built Linux, macOS and
+Windows wheels, and its source-free tutorial and installed-wheel checks passed.
+At the last status check, the pinned SmolLM2 CPU tutorial was still running; it
+has no terminal result yet. Therefore the previously observed SmolLM2 exporter
+failure is not yet confirmed fixed by the exact candidate-wheel gate. This
+source-tree evidence does not qualify the release candidate.
+
 The restart seed now also controls the actual initial scale vector: a
 domain-separated BLAKE3 derivation binds each initial scale to the frozen spec,
 parent package, seed, tensor, tile, plane, and scale-group index. The synthetic
