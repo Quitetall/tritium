@@ -1825,3 +1825,21 @@ The five measured steps took 62.55 ms; this tiny synthetic smoke is not a
 training-performance claim, multi-GPU qualification, Qwen quality result, or
 candidate-wide release receipt. The temporary venv and checkpoint were used
 only for this run and are not release evidence.
+
+### PTQ public `convert()` artifact seam — 2026-10-07
+
+At pushed source revision `0ac608ab94f4c37e5dd85da7dd89245a06c8d466`, the
+focused source-tree PTQ artifact suite passed:
+
+```text
+PYTHONPATH=crates/tritium-py/python pytest -q -rs crates/tritium-py/tests/test_ptq_artifacts.py
+37 passed in 3.08s
+```
+
+This verifies the public `prepare`/`calibrate`/`convert()` artifact path chosen
+for the PTQ test seam. It is a local CPU software test, not a real-checkpoint
+quality, performance, wheel-install, or release-receipt result. The clean-tree
+web package check passed generated-file validation and compiled the Rust WASM
+guest, but stopped because the pinned `wasm-bindgen 0.2.126` executable was not
+available on this host's `PATH`; TypeScript, package tests, and archive
+verification therefore remain unverified locally for this checkout.
