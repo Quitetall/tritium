@@ -2088,3 +2088,14 @@ remained above `83 GiB`; this was a CPU-time failure, not OOM or disk pressure.
 The exact-source workflow is
 [37626387409](https://github.com/Quitetall/tritium/actions/runs/37626387409)
 on revision `19656644ad3c26c9e4f6f3948ba08c304c6b4b24`.
+
+### Public PTQ artifact-path regression — 2026-10-07
+
+The chosen PTQ test seam is the public `prepare` → `calibrate` → `convert()`
+artifact path, not a direct private solver call. On branch head
+`8bef95b6fb7acc8320d77823d6ef001f4bb3a78f`, the focused source-tree test
+`test_live_module_fit_consumes_bound_curvature_and_rejects_source_drift` passed
+(1 passed, 36 deselected). It writes and reloads the conversion artifact,
+checks fitted trits/scales and weighted error, exercises deterministic resume,
+and rejects source-weight drift. This confirms the public artifact contract on
+a small CPU fixture; it is not a model-level quality or performance result.
