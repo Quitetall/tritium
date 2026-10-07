@@ -10,6 +10,7 @@ import struct
 import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
+from itertools import product
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -2302,7 +2303,7 @@ def _scale_group_size(columns: int) -> int:
     return columns
 
 
-def _diagonal_additive_projection(
+def _joint_additive_projection(
     master: torch.Tensor, curvature: torch.Tensor, planes: int
 ) -> TernaryProjection:
     if master.ndim != 2 or curvature.ndim != 1 or curvature.numel() != master.shape[1]:
@@ -2361,45 +2362,59 @@ def _diagonal_additive_projection(
         scale_values.append(stored_scale)
         residual = residual - trits_f64 * stored_scale.unsqueeze(-1)
 
-    # Greedy residual fitting is deterministic and cheap, but coordinate
-    # refinement closes much of its additive-plane error without changing the
-    # export contract. Keep all updates in FP64; round to stored FP16 only at
-    # the final receipt boundary.
-    if group_size < master.shape[1]:
-        for _ in range(20):
-            for index in range(planes):
-                decoded_without = torch.zeros_like(grouped_master)
-                for other, (other_trits, other_scale) in enumerate(
-                    zip(trit_values, scale_values)
-                ):
-                    if other != index:
-                        decoded_without = (
-                            decoded_without
-                            + other_trits.to(torch.float64) * other_scale.unsqueeze(-1)
-                        )
-                residual_without = grouped_master - decoded_without
-                current_scale = scale_values[index].clamp_min(
-                    torch.finfo(torch.float64).tiny
-                )
-                trits = (
-                    (residual_without / current_scale.unsqueeze(-1))
-                    .round()
-                    .clamp(-1, 1)
-                    .to(torch.int8)
-                )
-                trits_f64 = trits.to(torch.float64)
-                denominator = (trits_f64.square() * grouped_diagonal).sum(dim=2)
-                numerator = (residual_without * trits_f64 * grouped_diagonal).sum(
-                    dim=2
-                )
-                scale = torch.where(
-                    denominator > 0,
-                    numerator
-                    / denominator.clamp_min(torch.finfo(torch.float64).tiny),
-                    torch.zeros_like(numerator),
-                ).clamp_min(0)
-                trit_values[index] = trits
-                scale_values[index] = scale
+    # With scales fixed, each coefficient can choose its best joint code from
+    # all 3^P additive states. Then refit each nonnegative scale conditional on
+    # the other hard planes. Both steps are exact block-coordinate minimizers
+    # of the active diagonal-curvature objective; stable enumeration and strict
+    # replacement on improvement make ties deterministic. Evaluate a few
+    # states at a time to keep working memory bounded independently of 3^P.
+    states = tuple(product((-1, 0, 1), repeat=planes))
+    state_values = torch.tensor(states, dtype=torch.float64)
+    state_batch = 3
+    for _ in range(20):
+        previous_trits = tuple(value.clone() for value in trit_values)
+        scale_matrix = torch.stack(scale_values, dim=-1)
+        best_error = torch.full_like(grouped_master, torch.inf)
+        best_state = torch.zeros_like(grouped_master, dtype=torch.int64)
+        for start in range(0, len(states), state_batch):
+            stop = min(len(states), start + state_batch)
+            state_chunk = state_values[start:stop]
+            levels = torch.einsum("sp,rgp->srg", state_chunk, scale_matrix)
+            residuals = grouped_master.unsqueeze(0) - levels.unsqueeze(-1)
+            state_errors = residuals.square() * grouped_diagonal.unsqueeze(0)
+            chunk_error, chunk_state = state_errors.min(dim=0)
+            improved = chunk_error < best_error
+            best_error = torch.minimum(best_error, chunk_error)
+            best_state = torch.where(improved, chunk_state + start, best_state)
+
+        assignments = state_values[best_state]
+        trit_values = [
+            assignments[..., index].to(torch.int8) for index in range(planes)
+        ]
+
+        for index in range(planes):
+            residual_without = grouped_master.clone()
+            for other, (other_trits, other_scale) in enumerate(
+                zip(trit_values, scale_values)
+            ):
+                if other != index:
+                    residual_without -= (
+                        other_trits.to(torch.float64) * other_scale.unsqueeze(-1)
+                    )
+            trits_f64 = trit_values[index].to(torch.float64)
+            denominator = (trits_f64.square() * grouped_diagonal).sum(dim=2)
+            numerator = (residual_without * trits_f64 * grouped_diagonal).sum(dim=2)
+            scale_values[index] = torch.where(
+                denominator > 0,
+                numerator / denominator.clamp_min(torch.finfo(torch.float64).tiny),
+                torch.zeros_like(numerator),
+            ).clamp_min(0)
+
+        if all(
+            torch.equal(previous, updated)
+            for previous, updated in zip(previous_trits, trit_values)
+        ):
+            break
 
     fitted_planes = [
         TernaryPlane(
@@ -2429,7 +2444,7 @@ def _diagonal_additive_projection(
     projection = TernaryProjection(
         dense=dense,
         planes=tuple(fitted_planes),
-        algorithm_id=_diagonal_algorithm_id(planes),
+        algorithm_id=_joint_algorithm_id(planes),
         schema_version=1,
     )
     validate_projection(
@@ -2441,14 +2456,14 @@ def _diagonal_additive_projection(
     return projection
 
 
-def _diagonal_algorithm_id(planes: int) -> str:
-    return f"tritium.diagonal-additive-{planes}@1"
+def _joint_algorithm_id(planes: int) -> str:
+    return f"tritium.joint-additive-{planes}@1"
 
 
-def _adaptive_diagonal_algorithm_id() -> str:
+def _adaptive_joint_algorithm_id() -> str:
     """Identity for measured weight-level rate-distortion allocation."""
 
-    return "tritium.diagonal-additive-adaptive@1"
+    return "tritium.joint-additive-adaptive@1"
 
 
 def _fit_module(
@@ -2545,9 +2560,9 @@ def _fit_module(
             )
     adaptive = prepared.config.target_bpw is not None
     algorithm_id = (
-        _adaptive_diagonal_algorithm_id()
+        _adaptive_joint_algorithm_id()
         if adaptive
-        else _diagonal_algorithm_id(prepared.config.planes)
+        else _joint_algorithm_id(prepared.config.planes)
     )
     recipe_id = module_recipe_id(
         source_digest,
@@ -2611,7 +2626,7 @@ def _fit_module(
                 (dense.square() * grouped_curvature).sum()
             )
             for planes in range(1, prepared.config.planes + 1):
-                projection = _diagonal_additive_projection(
+                projection = _joint_additive_projection(
                     master_chunk, objective_curvature, planes
                 )
                 error = (
@@ -2656,7 +2671,7 @@ def _fit_module(
         for start in range(0, master.shape[0], rows_per_chunk):
             stop = min(master.shape[0], start + rows_per_chunk)
             master_chunk = master[start:stop]
-            projection = _diagonal_additive_projection(
+            projection = _joint_additive_projection(
                 master_chunk, curvature, writer.plane_count
             )
             error = (

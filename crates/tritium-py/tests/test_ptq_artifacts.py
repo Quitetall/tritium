@@ -723,19 +723,19 @@ def test_live_module_fit_consumes_bound_curvature_and_rejects_source_drift(tmp_p
     assert resumed == result
     assert result.artifact_dir == work_dir.resolve()
     assert result.evidence_id == receipt.evidence_id
-    assert result.algorithm_id == "tritium.diagonal-additive-3@1"
+    assert result.algorithm_id == "tritium.joint-additive-3@1"
     assert result.recipe_id.startswith("sha256:")
     assert result.config == prepared.config
     assert result.coverage == prepared.coverage
     fitted = result.weight("weight")
     assert result.weight_names == ("weight",)
     assert len(fitted.planes) == 3
-    assert fitted.weighted_mse == pytest.approx(9.7121347e-5)
-    assert fitted.planes[0].trits[0].tolist() == [1, -1, 0]
+    assert fitted.weighted_mse == pytest.approx(7.7390429e-8)
+    assert fitted.planes[0].trits[0].tolist() == [1, 0, 0]
     assert fitted.planes[0].scales[0].item() == 0.7001953125
-    assert fitted.planes[1].trits[0].tolist() == [1, 1, 0]
+    assert fitted.planes[1].trits[0].tolist() == [1, -1, 0]
     assert fitted.planes[1].scales[0].item() == 0.300048828125
-    assert fitted.planes[2].trits[0].tolist() == [0, 0, 1]
+    assert fitted.planes[2].trits[0].tolist() == [0, -1, 1]
     assert fitted.planes[2].scales[0].item() == 0.0999755859375
     for plane in fitted.planes:
         assert set(plane.trits.unique().tolist()) <= {-1, 0, 1}
@@ -764,7 +764,7 @@ def test_live_module_fit_consumes_bound_curvature_and_rejects_source_drift(tmp_p
     adaptive_result = convert(
         rate_limited, receipt, work_dir=tmp_path / "rate-work"
     )
-    assert adaptive_result.algorithm_id == "tritium.diagonal-additive-adaptive@1"
+    assert adaptive_result.algorithm_id == "tritium.joint-additive-adaptive@1"
     assert adaptive_result.achieved_bpw <= 2.0
     assert len(adaptive_result.weight("weight").planes) == 1
     assert load_quantized_module(model, adaptive_result)(
@@ -851,11 +851,78 @@ def test_live_module_convert_fits_later_planes_against_stored_low_precision_scal
         1,
         1,
         0,
-        1,
+        0,
         0,
         -1,
         1,
     ]
+
+
+def test_live_module_convert_uses_joint_additive_trit_assignment(tmp_path):
+    weight = torch.tensor(
+        [
+            [
+                0.599121,
+                1.831055,
+                -2.544922,
+                -0.483154,
+                0.517578,
+                -2.634766,
+                1.576172,
+                2.402344,
+            ]
+        ],
+        dtype=torch.float16,
+    )
+    curvature = torch.tensor(
+        [
+            2.540206,
+            3.080229,
+            3.783262,
+            1.873168,
+            2.096422,
+            3.563944,
+            2.739383,
+            1.179104,
+        ],
+        dtype=torch.float32,
+    )
+    model = torch.nn.Linear(8, 1, bias=False, dtype=torch.float16)
+    with torch.no_grad():
+        model.weight.copy_(weight)
+    prepared = prepare(
+        model,
+        TernaryConfig.ptq(profile="compact-v1", target_modules=("Linear",)),
+        inplace=False,
+    )
+    calibration = calibrate(
+        prepared,
+        [curvature.sqrt().to(torch.float16).unsqueeze(0)],
+        evidence_dir=tmp_path / "joint-assignment-evidence",
+    )
+
+    result = convert(
+        prepared,
+        calibration,
+        work_dir=tmp_path / "joint-assignment-work",
+    )
+
+    fitted = result.weight("weight")
+    assert len(fitted.planes) == 3
+    # The existing greedy residual fit scores 0.00183255 on this exact fixture.
+    # Joint 3^P assignment plus conditioned scale refits must beat it by a clear
+    # margin after the artifact's stored-f16 scale rounding.
+    assert fitted.weighted_mse == pytest.approx(0.0007622533, rel=1e-5)
+    decoded = torch.zeros_like(weight, dtype=torch.float64)
+    for plane in fitted.planes:
+        decoded += plane.trits.to(torch.float64) * plane.scales.to(torch.float64)
+    assert torch.isfinite(decoded).all()
+    assert all(
+        set(plane.trits.unique().tolist()) <= {-1, 0, 1}
+        and torch.isfinite(plane.scales).all()
+        and (plane.scales >= 0).all()
+        for plane in fitted.planes
+    )
 
 
 def test_live_module_convert_resumes_missing_weight_and_rejects_tampering(tmp_path):
