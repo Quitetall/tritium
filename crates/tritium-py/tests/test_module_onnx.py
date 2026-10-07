@@ -69,10 +69,10 @@ def _external_data_model():
     return AdditiveTernaryLinear((plane,)).eval()
 
 
-def test_packed_linear_decodes_weights_in_megabyte_bounded_chunks(monkeypatch):
+def test_packed_linear_decodes_weights_in_bounded_chunks(monkeypatch):
     plane = SimpleNamespace(
-        trits=torch.zeros((100_000, 16), dtype=torch.int8),
-        scales=torch.ones((100_000, 1), dtype=torch.float16),
+        trits=torch.zeros((300_000, 16), dtype=torch.int8),
+        scales=torch.ones((300_000, 1), dtype=torch.float16),
         group_size=16,
     )
     model = AdditiveTernaryLinear((plane,), bias=None).eval()
@@ -86,9 +86,9 @@ def test_packed_linear_decodes_weights_in_megabyte_bounded_chunks(monkeypatch):
     monkeypatch.setattr(AdditiveTernaryWeight, "_dense_rows", record_chunk)
     actual = model(torch.ones((1, 16)))
 
-    assert actual.shape == (1, 100_000)
-    assert decoded_rows == [65_536, 34_464]
-    assert all(rows * model.in_features <= 1 << 20 for rows in decoded_rows)
+    assert actual.shape == (1, 300_000)
+    assert decoded_rows == [262_144, 37_856]
+    assert all(rows * model.in_features <= 1 << 22 for rows in decoded_rows)
 
 
 def test_module_onnx_keeps_packed_state_runs_ort_and_supports_dynamic_batch(tmp_path):

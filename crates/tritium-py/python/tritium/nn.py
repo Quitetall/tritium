@@ -14,7 +14,7 @@ from .torch.ops import ternary_linear
 from .torch.projection import ProjectionContext, validate_projection
 from .torch.projection import expand_plane_scales
 
-_ADDITIVE_LINEAR_DECODE_CHUNK_ELEMENTS = 1 << 20
+_ADDITIVE_LINEAR_DECODE_CHUNK_ELEMENTS = 1 << 22
 _B3_MAX_VALID_BYTE = 3**5 - 1
 _ONNX_DTYPE_TO_TORCH = {
     1: torch.float32,
