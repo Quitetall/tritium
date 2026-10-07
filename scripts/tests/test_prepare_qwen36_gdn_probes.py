@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 from pathlib import Path
 import struct
+import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "prepare-qwen36-gdn-probes.py"
@@ -22,6 +25,7 @@ def fixture(
     malformed_matrix: str | None = None,
     index_shard: str | None = None,
 ) -> list[str]:
+    root.mkdir(parents=True, exist_ok=True)
     layer_types = ["linear_attention" if layer % 4 != 3 else "full_attention" for layer in range(64)]
     (root / "config.json").write_text(json.dumps({
         "text_config": {
@@ -98,6 +102,35 @@ class QwenGdnProbePreflightTests(unittest.TestCase):
             ["model.language_model.layers.0.linear_attn.in_proj_qkv.weight"],
             497,
         )
+
+    def test_output_is_canonical_private_and_never_overwrites(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            selections = fixture(root / "model")
+            prepared = MODULE.prepare(root / "model", selections)
+            output = root / "preflight.json"
+
+            MODULE.write_preflight(output, prepared)
+
+            self.assertEqual(output.read_bytes(), MODULE.canonical(prepared) + b"\n")
+            self.assertEqual(json.loads(output.read_text()), prepared)
+            self.assertEqual(os.stat(output).st_mode & 0o777, 0o600)
+            with self.assertRaises(FileExistsError):
+                MODULE.write_preflight(output, {"state": "replacement"})
+            self.assertEqual(output.read_bytes(), MODULE.canonical(prepared) + b"\n")
+
+    def test_cli_persists_the_same_preflight_it_prints(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            selections = fixture(root / "model")
+            expected = MODULE.prepare(root / "model", selections)
+            output = root / "cli-preflight.json"
+            argv = [str(SCRIPT), str(root / "model"), "--output", str(output)]
+            for selection in selections:
+                argv.extend(("--probe", selection))
+            with mock.patch.object(sys, "argv", argv):
+                self.assertEqual(MODULE.main(), 0)
+            self.assertEqual(json.loads(output.read_text()), expected)
 
     def test_rejects_wrong_family_class_and_non_matrix_tensor(self):
         with tempfile.TemporaryDirectory() as temporary:

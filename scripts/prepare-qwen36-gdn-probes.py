@@ -16,6 +16,7 @@ from pathlib import Path, PurePosixPath
 import re
 import stat
 import struct
+import tempfile
 from typing import Any
 
 
@@ -298,9 +299,45 @@ def prepare(model_dir: Path, selections: list[str]) -> dict[str, Any]:
     return prepared
 
 
+def write_preflight(output: Path, result: dict[str, Any]) -> None:
+    """Atomically publish one local preflight without replacing existing evidence."""
+
+    requested = Path(output).absolute()
+    parent = requested.parent.resolve(strict=True)
+    if not parent.is_dir():
+        raise PreflightError("output parent must be an ordinary directory")
+    target = parent / requested.name
+    if target.exists() or target.is_symlink():
+        raise FileExistsError(f"preflight output already exists: {target}")
+
+    payload = canonical(result) + b"\n"
+    fd, temporary_name = tempfile.mkstemp(prefix=".tritium-gdn-preflight-", dir=parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        # A same-filesystem hard link publishes atomically and fails rather
+        # than replacing a file or symlink created after the initial check.
+        os.link(temporary, target, follow_symlinks=False)
+        directory_fd = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("model_dir", type=Path)
+    parser.add_argument(
+        "--output",
+        type=Path,
+        help="atomically save the preflight JSON; an existing path is never replaced",
+    )
     parser.add_argument(
         "--probe", action="append", default=[], metavar="FAMILY/CLASS=TENSOR_NAME",
         help="repeat exactly eight times, once for each frozen family/class",
@@ -308,6 +345,8 @@ def main() -> int:
     args = parser.parse_args()
     try:
         result = prepare(args.model_dir, args.probe)
+        if args.output is not None:
+            write_preflight(args.output, result)
     except (OSError, PreflightError) as error:
         parser.error(str(error))
     print(json.dumps(result, sort_keys=True, separators=(",", ":")))
