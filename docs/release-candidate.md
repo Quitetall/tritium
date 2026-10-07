@@ -2202,5 +2202,29 @@ wheel, the new wheel was built locally with a different manylinux tag, and
 host load varied substantially during the trials. The algorithm/configuration
 was unchanged. The PTQ artifact suite passed 39/39, including exact
 legacy-per-group parity and a public `convert()` two-group artifact
-round-trip; the row-parallelism regression also passed. The grouped bridge
-change is still uncommitted and has not passed CI or the hosted tutorial gate.
+round-trip; the row-parallelism regression also passed. The grouped bridge is
+committed as `9248f275`; its CI, docs, CodeQL, capstone, and wheel-platform
+matrix passed. Its pinned tutorial had not completed when that wheel workflow
+was superseded by the next candidate.
+
+### SALT G128 joint-fit microbenchmark — 2026-10-07
+
+A deterministic Divan benchmark now exercises the production diagonal-F64
+solver configuration on one 128-weight group, separately for one, two, and
+three planes. It uses the public bridge's 16-iteration cap, four deterministic
+restarts, f16 scale scoring, `1e-8` ridge, `1e6` conditioning limit, and both
+relay basins. Fixture construction and an output-shape/finite-objective
+preflight are outside the timed loop. The source under test was solver commit
+`0969789962b8be74366b3116552e987d81b5a263`; the benchmark harness SHA-256 is
+`cd969158503fc0409348632534eef9ecf3f319497ddbdacc42f76318e744036d`.
+
+On the Intel i9-14900K, Rust 1.98.0 optimized build, one Divan run measured
+median fit times of `83.56 µs` (P=1), `318.1 µs` (P=2), and `780.3 µs` (P=3),
+with 100 samples per case. This is a local microbenchmark baseline, not a
+before/after speedup claim or hosted tutorial evidence: the host load average
+was about `29.8` across 32 logical CPUs, and no matched pre-optimization run was
+made. Re-run both variants under matched conditions before attributing
+performance changes to the fused diagonal-statistic pass.
+
+Command: `RUSTC_WRAPPER= cargo bench --offline -p tritium-benches --bench
+salt_fit`.

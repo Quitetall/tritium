@@ -26,6 +26,7 @@ divan = { workspace = true }
 tritium-runtime = { workspace = true }
 # The end-to-end tokens/sec bench drives the v0.20 `ModelRunner` over the real GGUF.
 tritium-nn = { workspace = true }
+tritium-quantize = { workspace = true }
 # The CUDA backend, linked ONLY for the GPU lane. It is a dev-dependency with its own
 # `cuda` feature off by default, so the standard cpu-only build/bench of this crate
 # pulls in no `cudarc` and runs no `nvcc`. The crate-level `cuda` feature below turns
@@ -87,4 +88,8 @@ harness = false
 
 [[bench]]
 name = "salt_codec"
+harness = false
+
+[[bench]]
+name = "salt_fit"
 harness = false

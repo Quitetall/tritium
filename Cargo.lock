@@ -4629,6 +4629,7 @@ dependencies = [
  "tritium-format",
  "tritium-metal",
  "tritium-nn",
+ "tritium-quantize",
  "tritium-rocm",
  "tritium-runtime",
  "tritium-spec",
