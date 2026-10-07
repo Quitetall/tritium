@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import argparse
 import re
 import subprocess
 import sys
@@ -163,6 +164,9 @@ def check(root: Path) -> str:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--json", action="store_true", help="emit the checked version as JSON")
+    args = parser.parse_args()
     root = Path(__file__).resolve().parent.parent
     try:
         version = check(root)
@@ -176,7 +180,10 @@ def main() -> int:
     ) as error:
         print(f"release-version: FAIL: {error}", file=sys.stderr)
         return 1
-    print(f"release-version: OK: {version}")
+    if args.json:
+        print(json.dumps({"version": version}, sort_keys=True))
+    else:
+        print(f"release-version: OK: {version}")
     return 0
 
 

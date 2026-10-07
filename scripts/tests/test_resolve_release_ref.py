@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[2]
 MODULE = runpy.run_path(ROOT / "scripts" / "resolve-release-ref.py")
 ReleaseRefError = MODULE["ReleaseRefError"]
 resolve_release_ref = MODULE["resolve_release_ref"]
+resolve_candidate_revision = MODULE["resolve_candidate_revision"]
 
 
 def git(root: Path, *args: str) -> str:
@@ -61,6 +62,36 @@ class ResolveReleaseRefTests(unittest.TestCase):
         with self.assertRaises(ReleaseRefError):
             resolve_release_ref(self.repo, "v1.1.0-rc.2", "../main", fetch_remote=None)
 
+    def test_candidate_requires_full_commit_reachable_from_default_branch(self):
+        self.assertEqual(
+            resolve_candidate_revision(
+                self.repo, self.trusted_revision, "main", fetch_remote=None
+            ),
+            {"revision": self.trusted_revision},
+        )
+        self.assertEqual(
+            resolve_candidate_revision(
+                self.repo, None, "main", fetch_remote=None
+            ),
+            {"revision": self.trusted_revision},
+        )
+        for revision in (self.trusted_revision[:12], "f" * 40):
+            with self.subTest(revision=revision), self.assertRaises(ReleaseRefError):
+                resolve_candidate_revision(
+                    self.repo, revision, "main", fetch_remote=None
+                )
+
+    def test_candidate_rejects_commit_outside_default_branch(self):
+        git(self.repo, "checkout", "--orphan", "unreviewed")
+        (self.repo / "untrusted.txt").write_text("untrusted\n", encoding="utf-8")
+        git(self.repo, "add", "untrusted.txt")
+        git(self.repo, "commit", "-m", "unreviewed candidate")
+        revision = git(self.repo, "rev-parse", "HEAD")
+        with self.assertRaisesRegex(ReleaseRefError, "not reachable"):
+            resolve_candidate_revision(
+                self.repo, revision, "main", fetch_remote=None
+            )
+
     def test_release_workflow_only_checks_out_verified_commit(self):
         workflow = (ROOT / ".github/workflows/release.yml").read_text(
             encoding="utf-8"
@@ -74,6 +105,15 @@ class ResolveReleaseRefTests(unittest.TestCase):
         self.assertIn("github.ref == format('refs/heads/{0}'", workflow)
         self.assertNotIn("needs.resolve.outputs.ref", workflow)
         self.assertNotIn("ref: ${{ github.event.inputs.tag", workflow)
+
+    def test_candidate_mode_cannot_reach_publishers(self):
+        workflow = (ROOT / ".github/workflows/release.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("options: [candidate, publish]", workflow)
+        self.assertIn("publish=false", workflow)
+        self.assertIn("if: needs.resolve.outputs.publish == 'true'", workflow)
+        self.assertEqual(workflow.count("if: needs.resolve.outputs.publish == 'true'"), 3)
 
 
 if __name__ == "__main__":

@@ -7,6 +7,15 @@ every byte and prints `CANDIDATE_EVIDENCE_VALID`. That status does **not** mean
 `LOCAL_RC_READY`; model-zoo, browser, serving, package-matrix, signing and
 second-machine gates remain separate.
 
+The `release` Actions workflow has a non-publishing `candidate` dispatch mode.
+It accepts only a full commit ID reachable from the default branch (or uses
+that branch's current tip), then builds the same wheel, crate, npm, SBOM, and
+release-input bundle as the tag-based path. Candidate mode must leave PyPI,
+GitHub Releases, and crates.io untouched. The default dispatch mode remains
+`publish` and requires an existing reviewed release tag; tag pushes also retain
+the existing publish behavior. This workflow creates package evidence, not a
+release-candidate admission or activation receipt.
+
 ### Packed embedding selected-row decode (2026-10-05)
 
 `AdditiveTernaryEmbedding` now decodes packed trit bytes only for token IDs in

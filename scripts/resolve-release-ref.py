@@ -85,10 +85,53 @@ def resolve_release_ref(
     return {"tag": tag, "revision": revision}
 
 
+def resolve_candidate_revision(
+    repo: Path,
+    revision: str | None,
+    default_branch: str,
+    *,
+    fetch_remote: str | None = "origin",
+) -> dict[str, str]:
+    """Resolve a full commit ID already reachable from the default branch."""
+
+    branch_check = _git(repo, "check-ref-format", "--branch", default_branch, check=False)
+    if branch_check.returncode != 0:
+        raise ReleaseRefError("default branch is not a valid Git branch name")
+
+    if fetch_remote is not None:
+        _git(
+            repo,
+            "fetch",
+            "--no-tags",
+            fetch_remote,
+            f"+refs/heads/{default_branch}:refs/remotes/{fetch_remote}/{default_branch}",
+        )
+    default_ref = f"refs/remotes/{fetch_remote or 'origin'}/{default_branch}"
+    if revision is None or revision == "":
+        revision_result = _git(repo, "rev-parse", "--verify", f"{default_ref}^{{commit}}")
+        revision = revision_result.stdout.strip()
+    if not isinstance(revision, str) or REVISION_PATTERN.fullmatch(revision) is None:
+        raise ReleaseRefError("candidate revision must be a full lowercase commit ID")
+    resolved = _git(repo, "rev-parse", "--verify", f"{revision}^{{commit}}", check=False)
+    if resolved.returncode != 0 or resolved.stdout.strip() != revision:
+        raise ReleaseRefError("candidate revision is absent or is not a commit")
+    ancestry = _git(repo, "merge-base", "--is-ancestor", revision, default_ref, check=False)
+    if ancestry.returncode == 1:
+        raise ReleaseRefError(
+            f"candidate revision {revision!r} is not reachable from {default_branch!r}"
+        )
+    if ancestry.returncode != 0:
+        raise ReleaseRefError(
+            ancestry.stderr.strip() or "cannot verify candidate revision ancestry"
+        )
+    return {"revision": revision}
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo", type=Path, default=Path.cwd())
-    parser.add_argument("--tag", required=True)
+    parser.add_argument("--tag")
+    parser.add_argument("--candidate-revision")
     parser.add_argument("--default-branch", required=True)
     parser.add_argument(
         "--no-fetch",
@@ -97,12 +140,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     try:
-        identity = resolve_release_ref(
-            args.repo.resolve(strict=True),
-            args.tag,
-            args.default_branch,
-            fetch_remote=None if args.no_fetch else "origin",
-        )
+        if args.candidate_revision is not None:
+            identity = resolve_candidate_revision(
+                args.repo.resolve(strict=True),
+                args.candidate_revision,
+                args.default_branch,
+                fetch_remote=None if args.no_fetch else "origin",
+            )
+        else:
+            if args.tag is None:
+                raise ReleaseRefError("--tag is required for release-tag resolution")
+            identity = resolve_release_ref(
+                args.repo.resolve(strict=True),
+                args.tag,
+                args.default_branch,
+                fetch_remote=None if args.no_fetch else "origin",
+            )
     except (OSError, ReleaseRefError) as error:
         print(f"resolve-release-ref: ERROR: {error}", file=sys.stderr)
         return 1
