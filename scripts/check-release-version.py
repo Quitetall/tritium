@@ -28,6 +28,11 @@ def require_equal(actual: Any, expected: str, label: str) -> None:
         raise ValueError(f"{label} is {actual!r}, expected {expected!r}")
 
 
+def require_contains(text: str, expected: str, label: str) -> None:
+    if expected not in text:
+        raise ValueError(f"{label} is missing current release text {expected!r}")
+
+
 def candidate_version(value: Any) -> str:
     if not isinstance(value, str) or RELEASE_PATTERN.fullmatch(value) is None:
         raise ValueError(
@@ -47,6 +52,28 @@ def read_json(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"{path} must contain a JSON object")
     return value
+
+
+def check_document_versions(root: Path, version: str) -> None:
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    require_contains(
+        readme,
+        f"cargo install tritium-cli --version {version}",
+        "README CLI installation command",
+    )
+    require_contains(
+        readme,
+        f"cargo install tritium-serve --version {version}",
+        "README serving installation command",
+    )
+    quantization = (root / "docs/book/src/quantization.md").read_text(
+        encoding="utf-8"
+    )
+    require_contains(
+        quantization,
+        f"--release {version}",
+        "Stage-7 quantization command release version",
+    )
 
 
 def check(root: Path) -> str:
@@ -126,6 +153,7 @@ def check(root: Path) -> str:
         True,
         "release-candidate example wheel version",
     )
+    check_document_versions(root, version)
     return version
 
 

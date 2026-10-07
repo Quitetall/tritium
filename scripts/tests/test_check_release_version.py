@@ -1,4 +1,5 @@
 import importlib.util
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -51,6 +52,30 @@ class ReleaseVersionTests(unittest.TestCase):
     def test_mirror_mismatch_is_actionable(self):
         with self.assertRaisesRegex(ValueError, "npm package version"):
             MODULE.require_equal("1.0.0", "1.1.0-rc.0", "npm package version")
+
+    def test_user_facing_install_and_stage7_commands_follow_candidate_version(self):
+        version = "1.1.0-rc.2"
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            docs = root / "docs/book/src"
+            docs.mkdir(parents=True)
+            readme = root / "README.md"
+            quantization = docs / "quantization.md"
+            readme.write_text(
+                f"cargo install tritium-cli --version {version}\n"
+                f"cargo install tritium-serve --version {version}\n",
+                encoding="utf-8",
+            )
+            quantization.write_text(f"--release {version}\n", encoding="utf-8")
+
+            MODULE.check_document_versions(root, version)
+
+            readme.write_text(
+                readme.read_text().replace(version, "1.1.0-rc.1"),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "README CLI installation command"):
+                MODULE.check_document_versions(root, version)
 
 
 if __name__ == "__main__":
