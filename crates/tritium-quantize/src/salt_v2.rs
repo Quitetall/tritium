@@ -1203,8 +1203,10 @@ fn solve_scales(
                 }
             }
             for plane in 0..planes {
-                for other in 0..plane {
-                    normal[plane][other] = normal[other][plane];
+                let (previous_rows, current_and_after) = normal.split_at_mut(plane);
+                let current_row = &mut current_and_after[0];
+                for (lower, previous_row) in current_row[..plane].iter_mut().zip(previous_rows) {
+                    *lower = previous_row[plane];
                 }
             }
         }
