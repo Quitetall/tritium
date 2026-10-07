@@ -471,6 +471,14 @@ the scoped Qwen/quantize Clippy gate passed. This seam still does not bind
 teacher weights or activation caches, score full-model candidates, or
 materialize/replay immutable child packages.
 
+The admitted-Qwen CPU fixture now also exercises the immutable-child boundary:
+it rejects a scale candidate whose parent digest differs from the strict reader,
+then writes, reloads, and replays the matching child through the existing
+`TSQ36RC v1` path. The focused fixture and `tritium-salt` Clippy passed. This is
+test coverage around existing seams; it does not yet feed a
+`FixedTritScaleUpdateCandidateBuilder` result into that path, nor does it add a
+production candidate-materialization coordinator or Qwen empirical evidence.
+
 ### Flagship campaign status refresh (2026-10-04)
 
 The canonical read-only probe was rerun against the durable workspace

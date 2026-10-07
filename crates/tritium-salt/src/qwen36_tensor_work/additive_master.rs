@@ -2641,7 +2641,7 @@ mod tests {
     use std::{
         cell::Cell,
         convert::Infallible,
-        io::{self, Cursor, Write},
+        io::{self, Cursor, Read, Seek, Write},
     };
 
     use half::f16;
@@ -2656,8 +2656,9 @@ mod tests {
         },
         salt_v2_package::{
             SaltV2Package, SaltV2PackageReader, SaltV2Plane, SaltV2ScaleUpdate,
-            SaltV2StreamTensorSpec, SaltV2Tensor, SaltV2Tile, SaltV2Transform,
-            SaltV2UniformRateModel, write_salt_v2_package, write_salt_v2_scale_update_child,
+            SaltV2ScaleUpdateChild, SaltV2ScaleUpdateChildError, SaltV2StreamTensorSpec,
+            SaltV2Tensor, SaltV2Tile, SaltV2Transform, SaltV2UniformRateModel,
+            write_salt_v2_package, write_salt_v2_scale_update_child,
         },
     };
     #[cfg(feature = "cuda")]
@@ -2689,6 +2690,48 @@ mod tests {
         WorkspacePlan,
     };
     use super::*;
+
+    #[derive(Debug)]
+    enum ScaleCandidateChildError {
+        ParentIdentityMismatch,
+        Child(SaltV2ScaleUpdateChildError),
+    }
+
+    impl fmt::Display for ScaleCandidateChildError {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::ParentIdentityMismatch => {
+                    formatter.write_str("scale candidate is bound to a different parent")
+                }
+                Self::Child(error) => write!(formatter, "scale candidate child: {error}"),
+            }
+        }
+    }
+
+    impl std::error::Error for ScaleCandidateChildError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            match self {
+                Self::ParentIdentityMismatch => None,
+                Self::Child(error) => Some(error),
+            }
+        }
+    }
+
+    fn materialize_output_scale_candidate_child<R, W>(
+        candidate: OutputReconstructionScaleCandidate<'_>,
+        parent: &mut SaltV2PackageReader<R>,
+        output: W,
+    ) -> Result<(W, SaltV2ScaleUpdateChild), ScaleCandidateChildError>
+    where
+        R: Read + Seek,
+        W: Read + Write + Seek,
+    {
+        if candidate.parent_package_digest() != parent.package_id().as_bytes() {
+            return Err(ScaleCandidateChildError::ParentIdentityMismatch);
+        }
+        write_salt_v2_scale_update_child(parent, output, candidate.updates())
+            .map_err(ScaleCandidateChildError::Child)
+    }
 
     #[derive(Debug)]
     struct EmptySource;
@@ -3811,14 +3854,29 @@ mod tests {
             (first.as_slice(), first_mask.as_slice()),
             (second.as_slice(), second_mask.as_slice()),
         ];
+        let mismatched_parent_candidate = output_spec
+            .scale_update_candidate(&[99; 32], 1, &updates)
+            .expect("content-bound candidate for mismatch test");
+        let mut wrong_parent = SaltV2PackageReader::new_strict(
+            std::fs::File::open(bundle.join("compact.tsalt2")).unwrap(),
+        )
+        .expect("open parent for identity rejection");
+        assert!(matches!(
+            materialize_output_scale_candidate_child(
+                mismatched_parent_candidate,
+                &mut wrong_parent,
+                Cursor::new(Vec::new()),
+            ),
+            Err(ScaleCandidateChildError::ParentIdentityMismatch)
+        ));
         let mut parent_package = SaltV2PackageReader::new_strict(
             std::fs::File::open(bundle.join("compact.tsalt2")).unwrap(),
         )
         .expect("open refined parent package");
-        let (child_output, child_lineage) = write_salt_v2_scale_update_child(
+        let (child_output, child_lineage) = materialize_output_scale_candidate_child(
+            scale_candidate,
             &mut parent_package,
             Cursor::new(Vec::new()),
-            &updates,
         )
         .expect("write immutable refined child");
         let child_package_path = bundle.join("compact.refined.tsalt2");
