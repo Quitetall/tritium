@@ -1163,25 +1163,19 @@ fn solve_scales(
             }
         }
         JointFitMetric::DiagonalF64(diagonal) => {
-            for plane in 0..planes {
-                for other in 0..planes {
-                    normal[plane][other] = trits[plane]
-                        .iter()
-                        .zip(&trits[other])
-                        .zip(diagonal)
-                        .map(|((left, right), weight)| {
-                            f64::from(*left) * f64::from(*right) * *weight
-                        })
-                        .sum();
+            // Each normal-matrix entry and rhs component must still accumulate in row order,
+            // but all of them can share one pass over the weights and curvature. The previous
+            // plane-major implementation traversed this same data P² + P times per scale solve.
+            for index in 0..weights.len() {
+                let curvature = diagonal[index];
+                let weight = f64::from(weights[index]);
+                for plane in 0..planes {
+                    let left = f64::from(trits[plane][index]);
+                    rhs[plane] += left * weight * curvature;
+                    for other in 0..planes {
+                        normal[plane][other] += left * f64::from(trits[other][index]) * curvature;
+                    }
                 }
-                rhs[plane] = trits[plane]
-                    .iter()
-                    .zip(weights)
-                    .zip(diagonal)
-                    .map(|((left, weight), curvature)| {
-                        f64::from(*left) * f64::from(*weight) * *curvature
-                    })
-                    .sum();
             }
         }
         JointFitMetric::DiagonalAffine {
