@@ -2269,3 +2269,20 @@ raised the budget error. This is a functional tutorial run that fails the timing
 gate, not an OOM or a model-quality result. The separately selected test seam
 for future regression coverage is the public `tritium.torch.convert()` artifact
 path; the existing focused public grouped-fit artifact round-trip passed locally.
+
+The next hosted wheel workflow, run
+[37652633017](https://github.com/Quitetall/tritium/actions/runs/37652633017),
+tested pushed source commit `46bf27caf8e68edc9993b758ff39435e26119b00` and
+failed the same frozen tutorial gate at `818.029s` against `300s`. The run
+completed rather than timing out at the job level; this is still a wall-time
+failure, not an OOM. The optimization that skips assignment reconstruction when
+the current trit assignment is unchanged was committed as `ee55d6dc` and pushed
+after that run finished. Workflow run
+[37655145029](https://github.com/Quitetall/tritium/actions/runs/37655145029)
+for `ee55d6dc` completed with an overall failure, although its job API lists
+only three passing platform-wheel jobs and one skipped CUDA job; it contains no
+SmolLM2 tutorial job and exposes no failed job log. The wheel artifacts passed,
+but this run gives no timing result for the solver change. No performance
+effect is claimed. The exact cause of the workflow-level failure and the absent
+tutorial job are unresolved. CUDA, ROCm, Metal, wgpu, real-model serving, and
+performance-regression jobs were skipped and remain unverified.
