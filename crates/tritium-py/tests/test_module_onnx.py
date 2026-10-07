@@ -12,7 +12,7 @@ onnx = pytest.importorskip("onnx")
 ort = pytest.importorskip("onnxruntime")
 pytest.importorskip("onnxscript")
 
-from tritium.nn import AdditiveTernaryLinear  # noqa: E402
+from tritium.nn import AdditiveTernaryLinear, AdditiveTernaryWeight  # noqa: E402
 from tritium.torch import (  # noqa: E402
     ModuleOnnxLineage,
     RefinementConfig,
@@ -67,6 +67,28 @@ def _external_data_model():
         group_size=128,
     )
     return AdditiveTernaryLinear((plane,)).eval()
+
+
+def test_packed_linear_decodes_weights_in_megabyte_bounded_chunks(monkeypatch):
+    plane = SimpleNamespace(
+        trits=torch.zeros((100_000, 16), dtype=torch.int8),
+        scales=torch.ones((100_000, 1), dtype=torch.float16),
+        group_size=16,
+    )
+    model = AdditiveTernaryLinear((plane,), bias=None).eval()
+    decoded_rows = []
+    decode = AdditiveTernaryWeight._dense_rows
+
+    def record_chunk(weight, indices, *, dtype):
+        decoded_rows.append(indices.numel())
+        return decode(weight, indices, dtype=dtype)
+
+    monkeypatch.setattr(AdditiveTernaryWeight, "_dense_rows", record_chunk)
+    actual = model(torch.ones((1, 16)))
+
+    assert actual.shape == (1, 100_000)
+    assert decoded_rows == [65_536, 34_464]
+    assert all(rows * model.in_features <= 1 << 20 for rows in decoded_rows)
 
 
 def test_module_onnx_keeps_packed_state_runs_ort_and_supports_dynamic_batch(tmp_path):

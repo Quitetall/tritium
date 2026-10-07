@@ -14,6 +14,7 @@ from .torch.ops import ternary_linear
 from .torch.projection import ProjectionContext, validate_projection
 from .torch.projection import expand_plane_scales
 
+_ADDITIVE_LINEAR_DECODE_CHUNK_ELEMENTS = 1 << 20
 _B3_MAX_VALID_BYTE = 3**5 - 1
 _ONNX_DTYPE_TO_TORCH = {
     1: torch.float32,
@@ -525,7 +526,9 @@ class AdditiveTernaryLinear(_AdditiveTernaryConsumer):
                 f"input feature dimension {input.shape[-1]} does not match "
                 f"linear weight dimension {self.in_features}"
             )
-        rows_per_chunk = max(1, (1 << 18) // max(1, self.in_features))
+        rows_per_chunk = max(
+            1, _ADDITIVE_LINEAR_DECODE_CHUNK_ELEMENTS // max(1, self.in_features)
+        )
         outputs = []
         for start in range(0, self.out_features, rows_per_chunk):
             end = min(start + rows_per_chunk, self.out_features)
