@@ -2302,3 +2302,23 @@ memory and over 80 GiB temporary disk during the run; this is not an OOM or
 disk-pressure failure. The upload step was skipped after the timing failure,
 so the stage log is the available hosted evidence; the wheel, abi3 matrix, and
 other independent smoke artifacts were uploaded successfully.
+
+The exact-source follow-up on commit `aec05035d992dd6fdd24628bfbd8fc80815bb6fd`
+is Actions run
+[37660642998](https://github.com/Quitetall/tritium/actions/runs/37660642998).
+Platform wheels, installed-wheel smoke, source-free tutorial, abi3 matrix, and
+matrix admission passed; the CUDA wheel was skipped. The pinned tutorial
+completed its functional path but failed the unchanged 300-second budget at
+`1001.291s`. Stage timings were calibration `0.620s`, conversion `778.364s`,
+native checkpoint round-trip `800.979s`, generation `851.183s`, ONNX export
+`965.086s`, ONNX replay `994.313s`, QAT step `999.878s`, and optimizer resume
+`1001.291s`. The runner retained at least `12,398,168 KiB` available memory
+and `87,492,580 KiB` temporary disk; this was neither OOM nor disk pressure.
+The tutorial error was raised only after those functional stages completed.
+
+Compared with run `37655983490`, conversion was about 36 seconds shorter and
+total time about 34 seconds shorter, but hosted runs are not controlled
+same-runner A/B measurements. No speedup is attributed to the assignment-skip
+change. The frozen hosted timing gate remains red; local installed-wheel pass
+evidence does not replace it. CUDA, ROCm, Metal, wgpu, physical performance, and
+real-model serving remain unverified or skipped.
