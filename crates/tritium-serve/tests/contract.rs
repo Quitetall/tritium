@@ -67,6 +67,52 @@ struct PhaseGateGen {
     release_decode: Arc<AtomicBool>,
 }
 
+struct CancelGateGen {
+    calls: Arc<AtomicUsize>,
+    prefill_entered: Arc<AtomicBool>,
+    release_prefill: Arc<AtomicBool>,
+    cancellation_observed: Arc<AtomicBool>,
+}
+
+impl Generator for CancelGateGen {
+    fn generate(
+        &mut self,
+        _req: &GenRequest,
+        on_step: &mut dyn FnMut(Step) -> bool,
+    ) -> Result<(), GenError> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.prefill_entered.store(true, Ordering::SeqCst);
+            while !self.release_prefill.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+            let continued = on_step(Step {
+                token: 10,
+                finished: true,
+                logprobs: None,
+                finish_reason: Some(FinishReason::Stop),
+            });
+            self.cancellation_observed
+                .store(!continued, Ordering::SeqCst);
+        } else {
+            let _ = on_step(Step {
+                token: 10,
+                finished: true,
+                logprobs: None,
+                finish_reason: Some(FinishReason::Stop),
+            });
+        }
+        Ok(())
+    }
+
+    fn n_ctx(&self) -> usize {
+        4096
+    }
+
+    fn vocab(&self) -> usize {
+        128_256
+    }
+}
+
 impl Generator for PhaseGateGen {
     fn generate(
         &mut self,
@@ -1521,6 +1567,61 @@ async fn dropped_sse_body_records_client_disconnect() {
         emitted_after_settle,
         "worker kept generating after disconnect was settled"
     );
+}
+
+#[tokio::test]
+async fn sse_disconnect_during_prefill_cancels_worker_and_recovers() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let prefill_entered = Arc::new(AtomicBool::new(false));
+    let release_prefill = Arc::new(AtomicBool::new(false));
+    let cancellation_observed = Arc::new(AtomicBool::new(false));
+    let generator = CancelGateGen {
+        calls: calls.clone(),
+        prefill_entered: prefill_entered.clone(),
+        release_prefill: release_prefill.clone(),
+        cancellation_observed: cancellation_observed.clone(),
+    };
+    let (router, _) = build_router(Box::new(generator), shared_tok(), ServeConfig::default());
+
+    let response = router
+        .clone()
+        .oneshot(chat(json!({
+            "model": "tritium",
+            "messages": [{"role": "user", "content": "1"}],
+            "stream": true
+        })))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body();
+    // The first SSE frame is the role chunk; wait until the worker is blocked
+    // in prefill before simulating a client disconnect.
+    assert!(body.frame().await.transpose().unwrap().is_some());
+    wait_flag(&prefill_entered).await;
+    drop(body);
+
+    release_prefill.store(true, Ordering::SeqCst);
+    wait_flag(&cancellation_observed).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    // A new request must be serviced after the cancelled generation retires.
+    let (status, body) = tokio::time::timeout(
+        Duration::from_secs(2),
+        send(
+            &router,
+            chat(json!({
+                "model": "tritium",
+                "messages": [{"role": "user", "content": "2"}],
+                "max_tokens": 1
+            })),
+        ),
+    )
+    .await
+    .expect("worker should recover after a prefill disconnect");
+    assert_eq!(status, StatusCode::OK);
+    let response: Value = serde_json::from_slice(&body).expect("OpenAI response JSON");
+    assert_eq!(response["choices"][0]["message"]["content"], "10");
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
 
 /// Non-streaming requests are bounded by the request timeout: the handler
