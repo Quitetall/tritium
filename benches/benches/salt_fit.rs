@@ -5,12 +5,15 @@
 //! a correctness preflight are outside the timed loop.
 
 use divan::{Bencher, counter::ItemsCount};
+use rayon::prelude::*;
 use tritium_quantize::{
     JointFitConfig, JointFitMetric, RelayBasins, ScalePrecision, fit_joint_ternary,
 };
 
 const GROUP_SIZE: usize = 128;
+const ROWS: usize = 64;
 const PLANES: [usize; 3] = [1, 2, 3];
+const THREAD_COUNTS: [usize; 2] = [1, 4];
 
 fn fixture() -> (Vec<f32>, Vec<f64>) {
     let weights = (0..GROUP_SIZE)
@@ -75,4 +78,41 @@ fn joint_diagonal_g128(bencher: Bencher, planes: usize) {
             .expect("SALT G128 fit");
             divan::black_box(fit.objective);
         });
+}
+
+/// Measure independent row-fit throughput with the four-worker limit of the hosted CPU lane.
+///
+/// The row values are repeated from the deterministic G128 fixture to isolate solver throughput
+/// from fixture-generation cost. The worker pool is constructed before timing, matching the
+/// production path where Rayon initializes once and processes many rows.
+#[divan::bench(args = THREAD_COUNTS)]
+fn joint_diagonal_g128_rows(bencher: Bencher, threads: usize) {
+    let (row, diagonal) = fixture();
+    let weights = row.repeat(ROWS);
+    let fit_config = config(2);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .expect("row-fit benchmark pool");
+    let fit_rows = || {
+        pool.install(|| {
+            weights
+                .par_chunks_exact(GROUP_SIZE)
+                .map(|row_weights| {
+                    fit_joint_ternary(
+                        row_weights,
+                        JointFitMetric::DiagonalF64(&diagonal),
+                        fit_config,
+                    )
+                    .expect("SALT G128 row fit")
+                    .objective
+                })
+                .sum::<f64>()
+        })
+    };
+    assert!(fit_rows().is_finite(), "row-fit preflight objective");
+
+    bencher
+        .counter(ItemsCount::new(ROWS))
+        .bench_local(|| divan::black_box(fit_rows()));
 }

@@ -2339,6 +2339,19 @@ software allocation reduction only; the pinned hosted 300-second tutorial
 gate remains unverified for this change and must be rerun before any timing
 claim.
 
+### G128 PTQ row-parallelism benchmark — 2026-10-07
+
+The `salt_fit` benchmark now includes a 64-row P=2 throughput case. It uses
+the same deterministic G128 fixture and SALT fit configuration as the
+single-group microbenchmark, with a Rayon pool created outside the timed loop.
+On the Intel i9-14900K (32 logical CPUs), Rust 1.98.0, the one-worker median
+was `19.77ms` per 64 rows and the four-worker median was `6.283ms` (`3.15x`);
+30 samples per case. The exact solver output is checked by the existing
+exhaustive and bit-conformance tests. This indicates that the row-parallel
+path scales well on this local CPU. It is not a hosted-runner measurement or a
+full-model conversion timing, so it does not establish that the pinned tutorial
+will meet its `300s` gate.
+
 ### SALT V2 assignment/scale temporary storage reduction — 2026-10-07
 
 The exact assignment codebook now uses fixed stack storage for its bounded

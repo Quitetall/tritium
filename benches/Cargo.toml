@@ -21,6 +21,7 @@ half = { workspace = true }
 
 [dev-dependencies]
 divan = { workspace = true }
+rayon = { workspace = true }
 # The runtime registry is how the GPU + e2e benches obtain an owned backend trait
 # object (find the registered `init` by name), exactly as `tests/acceptance.rs` does.
 tritium-runtime = { workspace = true }
