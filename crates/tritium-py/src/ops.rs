@@ -22,6 +22,7 @@ type DenseJointFitResult = (Vec<f32>, Vec<Vec<i8>>, Vec<f32>, f64);
 type DiagonalJointFitBatchResult = (Vec<Vec<f32>>, Vec<Py<PyBytes>>);
 type GroupedDiagonalJointFitBatchResult = (Vec<Vec<Vec<f32>>>, Vec<Py<PyBytes>>);
 type GroupedDiagonalJointFitBatchObjectiveResult = (Vec<Vec<Vec<f32>>>, Vec<Py<PyBytes>>, f64);
+type CompactJointFit = (Vec<f32>, Vec<Vec<i8>>, f64);
 
 /// Allocate additive ternary planes from measured group error curves.
 ///
@@ -403,8 +404,12 @@ pub(crate) fn fit_joint_ternary_diagonal_groups_with_objective(
     let (scales_by_group, trits_by_plane, objective) = py
         .detach(move || {
             // Flattened group-major row indices preserve each group's row order.
-            // One indexed Rayon collection keeps errors and output deterministic.
-            let fits: Vec<Result<_, String>> = weights
+            // Extract only deployment data while each fit is live: retaining every
+            // full JointTernaryFit also retains reconstruction and restart/solve
+            // telemetry for the entire matrix, even though this bridge does not
+            // publish that evidence. Indexed collection keeps errors and output
+            // deterministic.
+            let fits: Vec<Result<CompactJointFit, String>> = weights
                 .par_chunks_exact(columns)
                 .enumerate()
                 .map(|(index, row_weights)| {
@@ -416,6 +421,7 @@ pub(crate) fn fit_joint_ternary_diagonal_groups_with_objective(
                         JointFitMetric::DiagonalF64(group_diagonal),
                         config,
                     )
+                    .map(|fit| (fit.scales, fit.trits, fit.objective))
                     .map_err(|error| error.to_string())
                 })
                 .collect();
@@ -429,12 +435,12 @@ pub(crate) fn fit_joint_ternary_diagonal_groups_with_objective(
             for _ in 0..groups {
                 let mut scales_by_row = Vec::with_capacity(rows);
                 for _ in 0..rows {
-                    let fit = fits
+                    let (scales, trits, row_objective) = fits
                         .next()
                         .ok_or_else(|| "internal grouped-fit row count mismatch".to_owned())??;
-                    objective += fit.objective;
-                    scales_by_row.push(fit.scales);
-                    for (plane, row_trits) in fit.trits.into_iter().enumerate() {
+                    objective += row_objective;
+                    scales_by_row.push(scales);
+                    for (plane, row_trits) in trits.into_iter().enumerate() {
                         trits_by_plane[plane].extend(row_trits.into_iter().map(|trit| trit as u8));
                     }
                 }
