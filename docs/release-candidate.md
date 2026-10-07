@@ -1941,6 +1941,20 @@ receipt for this one Linux x86-64 CPython 3.14 cell is
 `6bfc30d333e1ae92fcb2d5a261e7280027271b2d4ecfa8f5e96b60aefd27aa53`). The
 functional smoke used a venv with host dependencies visible; it proves exact
 wheel loading and runtime behavior but is not a fully isolated dependency
-installation. Neither receipt is yet bound to a current candidate manifest or
-registered in its evidence registry; other platforms/interpreters, CUDA, full
-package-matrix, model-quality, and public-release gates remain open.
+installation. Other platforms/interpreters, CUDA, full package-matrix,
+model-quality, and public-release gates remain open.
+
+The wheel is now bound to an explicitly partial package-probe candidate at
+`/mnt/2tb/tritium-release-evidence/pytritium-cpu-671cef66/candidate/manifest.json`
+(manifest SHA-256
+`6be0b70b10416dea9f917a7859bb26329711a9806ba7f01c727c6e94e605c796`). The
+clean worktree's `release-status` check accepted the manifest as
+`CANDIDATE_EVIDENCE_VALID`; its registry binds the functional receipt above to
+the exact wheel. The durable report is
+`/mnt/2tb/tritium-release-evidence/pytritium-cpu-671cef66/registry/report.json`
+(SHA-256
+`bce08e2fcd1a04835d80e67e4ad27fd06e9d035a691555800af2fb4c38932a3c`). It
+correctly reports `LOCAL_RC_BLOCKED`: the `packages` row has only `clean-install`
+and still misses `compatibility-matrix`, `crate-archive`, and `npm-archive`;
+the other eleven release gates also remain missing. This one-wheel probe is not
+the complete public RC and does not replace the prior candidate records.
