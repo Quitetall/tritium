@@ -613,6 +613,20 @@ jobs:
             awk '/MemAvailable:/ { printf "mem_available_kib=%s ", $2 }' /proc/meminfo
             printf 'runner_temp_disk='
             df -Pk "$RUNNER_TEMP" | awk 'NR == 2 { printf "available_kib=%s ", $4 }'
+            printf 'runner_logical_cpus='
+            nproc | tr -d '\n'
+            printf ' load_average='
+            awk '{ printf "1m=%s,5m=%s,15m=%s ", $1, $2, $3 }' /proc/loadavg
+            if [[ -r /sys/fs/cgroup/cpu.max ]]; then
+              printf 'cgroup_cpu_max='
+              tr ' ' '/' < /sys/fs/cgroup/cpu.max | tr -d '\n'
+              printf ' '
+            fi
+            if [[ -r /sys/fs/cgroup/cpu.stat ]]; then
+              printf 'cgroup_cpu_stat='
+              tr '\n' ',' < /sys/fs/cgroup/cpu.stat
+              printf ' '
+            fi
             if [[ -r /sys/fs/cgroup/memory.current ]]; then
               printf 'cgroup_memory_current_bytes=%s ' "$(< /sys/fs/cgroup/memory.current)"
             fi
