@@ -1,5 +1,7 @@
 //! Joint additive-ternary fitting for SALT V2.
 
+use std::borrow::Cow;
+
 use half::f16;
 
 /// Precision used when scoring fitted scales.
@@ -700,8 +702,8 @@ pub fn fit_joint_ternary(
     if let Some(index) = weights.iter().position(|weight| !weight.is_finite()) {
         return Err(JointFitError::NonFiniteWeight { index });
     }
-    let metric_diagonal: Vec<f64> = match fit_metric {
-        JointFitMetric::Identity => vec![1.0; weights.len()],
+    let metric_diagonal: Cow<'_, [f64]> = match fit_metric {
+        JointFitMetric::Identity => Cow::Owned(vec![1.0; weights.len()]),
         JointFitMetric::Diagonal(values) => {
             if values.len() != weights.len() {
                 return Err(JointFitError::MetricLengthMismatch {
@@ -718,7 +720,7 @@ pub fn fit_joint_ternary(
             if !values.iter().any(|value| *value > 0.0) {
                 return Err(JointFitError::ZeroMetric);
             }
-            values.iter().map(|value| f64::from(*value)).collect()
+            Cow::Owned(values.iter().map(|value| f64::from(*value)).collect())
         }
         JointFitMetric::DiagonalF64(values) => {
             if values.len() != weights.len() {
@@ -736,7 +738,7 @@ pub fn fit_joint_ternary(
             if !values.iter().any(|value| *value > 0.0) {
                 return Err(JointFitError::ZeroMetric);
             }
-            values.to_vec()
+            Cow::Borrowed(values)
         }
         JointFitMetric::DiagonalAffine {
             values,
@@ -763,7 +765,7 @@ pub fn fit_joint_ternary(
             if !diagonal.iter().any(|value| *value > 0.0) {
                 return Err(JointFitError::ZeroMetric);
             }
-            diagonal
+            Cow::Owned(diagonal)
         }
         JointFitMetric::Dense(dense) => {
             if dense.dimension != weights.len() {
@@ -772,9 +774,11 @@ pub fn fit_joint_ternary(
                     got: dense.dimension,
                 });
             }
-            (0..dense.dimension)
-                .map(|index| dense.values[index * dense.dimension + index].max(0.0))
-                .collect()
+            Cow::Owned(
+                (0..dense.dimension)
+                    .map(|index| dense.values[index * dense.dimension + index].max(0.0))
+                    .collect(),
+            )
         }
     };
     let metric_sum: f64 = metric_diagonal.iter().sum();
@@ -1105,7 +1109,9 @@ fn weighted_abs_order(weights: &[f32], metric_diagonal: &[f64]) -> Vec<WeightedA
         .enumerate()
         .map(|(index, (value, weight))| (value.abs(), *weight, index))
         .collect();
-    values.sort_by(|left, right| {
+    // The original index is a unique tiebreaker, so this total order is identical
+    // to stable sorting while avoiding a temporary allocation for every fitted row.
+    values.sort_unstable_by(|left, right| {
         left.0
             .total_cmp(&right.0)
             .then_with(|| left.2.cmp(&right.2))
@@ -1894,6 +1900,7 @@ mod tests {
                     .total_cmp(&right.0)
                     .then_with(|| left.2.cmp(&right.2))
             });
+            assert_eq!(cached, reference, "quantile ordering must remain canonical");
             let total: f64 = reference.iter().map(|value| value.1).sum();
             let target = total * quantile.clamp(0.0, 1.0);
             let mut cumulative = 0.0;

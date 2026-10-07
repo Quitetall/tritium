@@ -2322,3 +2322,40 @@ same-runner A/B measurements. No speedup is attributed to the assignment-skip
 change. The frozen hosted timing gate remains red; local installed-wheel pass
 evidence does not replace it. CUDA, ROCm, Metal, wgpu, physical performance, and
 real-model serving remain unverified or skipped.
+
+### Native PTQ row-fit allocation reduction — 2026-10-07
+
+The native SALT V2 row fitter now borrows validated `DiagonalF64` evidence
+instead of copying the 128-value group diagonal for every row, and uses an
+in-place unstable sort for deterministic weighted-absolute initialization
+ordering. The original index remains the unique tie-breaker, so the total order
+and all quantile anchors are unchanged. The quantize crate's 235 unit tests,
+public diagonal/affine bit-conformance test, and strict Clippy check passed.
+
+The optimized local microbenchmark medians were 76.66 µs (P=1), 311.3 µs
+(P=2), and 769.0 µs (P=3), 30 samples per case. Nearby runs on this busy host
+varied by roughly 2×, so these numbers do not establish a speedup. This is a
+software allocation reduction only; the pinned hosted 300-second tutorial
+gate remains unverified for this change and must be rerun before any timing
+claim.
+
+### Telemetry-enabled hosted SmolLM2 tutorial — 2026-10-07
+
+Wheel workflow [37664061975](https://github.com/Quitetall/tritium/actions/runs/37664061975)
+tested source commit `e35e6b25d7b53aa3971b5922fa622f62955fe751`. All functional
+tutorial stages completed, but the frozen 300-second gate failed at
+`828.685s`. Calibration took `0.520s`; conversion completed at `646.665s`,
+native checkpoint round-trip at `665.490s`, generation at `707.171s`, ONNX
+export at `799.370s`, replay at `822.754s`, and QAT optimizer resume at
+`828.685s`.
+
+The runner reported four logical CPUs. Samples retained about 13.4–14.5 GiB
+available memory and 83.4–84.3 GiB temporary disk. Across the logged
+`cpu.stat` samples, `nr_throttled` and `throttled_usec` stayed at zero. Load
+average rose from below one to roughly five while the Python conversion ran.
+This rules out OOM, disk pressure, and observed cgroup throttling as causes;
+the measured failure is concentrated in native PTQ solver CPU time on the
+four-CPU runner. It does not establish whether additional CPU parallelism,
+per-core throughput, or both explain the gap to local timing. The frozen gate
+remains red, and no model-quality or release qualification follows from the
+functional completion.
