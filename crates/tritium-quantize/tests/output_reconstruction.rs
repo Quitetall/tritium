@@ -1214,6 +1214,98 @@ fn scale_update_candidate_builder_streams_windows_and_binds_the_owned_candidate(
 }
 
 #[test]
+fn four_fitted_scale_restarts_select_by_frozen_output_objective() {
+    let spec = spec(OutputReconstructionSchedule::Blocks { block_count: 2 }, 4);
+    let parent = [77; 32];
+    let activation_spec = ActivationCacheSpec::new(
+        0,
+        "model.layers.0.residual.input".to_owned(),
+        5,
+        128,
+        ActivationDType::Float32,
+        ActivationDigest::from_bytes([9; 32]),
+        2,
+    )
+    .unwrap();
+    let mut activation_builder = ActivationCacheBuilder::new(activation_spec.clone());
+    let mut values = vec![0.0; 5 * 128];
+    values[0] = 1.0;
+    activation_builder
+        .ingest(
+            ActivationChunk::new(&activation_spec, 0, 5, values, vec![true; 5], vec![5]).unwrap(),
+        )
+        .unwrap();
+    let cache = activation_builder.finalize().unwrap();
+    let activation = cache.read_window(0, 1, 4096).unwrap();
+    let mut trits = [Trit::ZERO; 128];
+    trits[0] = Trit::from_i8(1).unwrap();
+    trits[64] = Trit::from_i8(-1).unwrap();
+    let mut fitted = Vec::new();
+    for seed in [11, 22, 33, 44] {
+        let mut builder = FixedTritScaleUpdateCandidateBuilder::new(&spec, &parent, seed);
+        builder
+            .begin_tile_plane(3, 0, 0, 1, &trits, &[f16::ONE, f16::ONE], 64, 8)
+            .unwrap();
+        builder
+            .observe_window_from_current_projection(&activation, &[2.0], &[1.0])
+            .unwrap();
+        fitted.push(builder.finish().unwrap());
+    }
+
+    let selected_seed = 33;
+    let selected_id = *fitted
+        .iter()
+        .find(|candidate| {
+            candidate.updates().len() == 1 && {
+                candidate
+                    .as_scale_candidate(&spec)
+                    .unwrap()
+                    .initialization_seed()
+                    == selected_seed
+            }
+        })
+        .expect("expected restart candidate")
+        .candidate_id();
+    let mut receipts = Vec::new();
+    for candidate in &fitted {
+        let scale_candidate = candidate.as_scale_candidate(&spec).unwrap();
+        let is_selected = scale_candidate.initialization_seed() == selected_seed;
+        let mut score =
+            OutputReconstructionAccumulator::for_scale_candidate(&spec, &scale_candidate).unwrap();
+        for scope in spec.scopes() {
+            let (teacher, student): (&[f32], &[f32]) = match scope {
+                OutputReconstructionScope::Block { .. } if is_selected => {
+                    (&[0.0, 0.0], &[0.0, 0.0])
+                }
+                OutputReconstructionScope::Block { .. } => (&[0.0, 0.0], &[2.0, -2.0]),
+                OutputReconstructionScope::FinalLogits if is_selected => (&[1.0, 0.0], &[1.0, 0.0]),
+                OutputReconstructionScope::FinalLogits => (&[1.0, 0.0], &[0.0, 1.0]),
+            };
+            score
+                .observe(*scope, 0, 1, teacher.len(), &[true], teacher, student)
+                .unwrap();
+        }
+        receipts.push(score.finish().unwrap());
+    }
+
+    let selected = select_output_reconstruction(&spec, receipts).unwrap();
+    assert_eq!(selected.selected_candidate_id(), &selected_id);
+    assert_eq!(selected.selected().initialization_seed(), selected_seed);
+    let selected_fit = fitted
+        .iter()
+        .find(|candidate| candidate.candidate_id() == selected.selected_candidate_id())
+        .expect("selected output receipt maps to the exact fitted update set");
+    assert_eq!(
+        selected_fit
+            .as_scale_candidate(&spec)
+            .unwrap()
+            .candidate_id(),
+        selected.selected_candidate_id()
+    );
+    assert_eq!(selected.candidates().len(), spec.restarts());
+}
+
+#[test]
 fn packed_parent_plane_starts_owned_candidate_fit() {
     let plane = SaltV2Plane::new(vec![1i8; 256], vec![f16::ONE; 2]).unwrap();
     let tensor = SaltV2Tensor::new(

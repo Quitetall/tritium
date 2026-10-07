@@ -486,6 +486,13 @@ still needs its ADR/API decision; deterministic whole-model scoring/selection,
 restart orchestration, admitted production captures, and Qwen empirical evidence
 remain open.
 
+The quantize suite now also composes four independently seeded fits with the
+frozen output scorer and restart selector. It verifies that the selected
+`OutputCandidateReceipt` maps back to the exact fitted scale-update candidate,
+not merely a separately hand-labeled candidate ID. All 26 output-reconstruction
+tests and quantize Clippy passed. This remains synthetic: it does not score a
+loaded child model against dense Qwen teacher outputs or establish model quality.
+
 ### Flagship campaign status refresh (2026-10-04)
 
 The canonical read-only probe was rerun against the durable workspace
