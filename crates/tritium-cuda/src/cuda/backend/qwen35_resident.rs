@@ -269,6 +269,13 @@ impl Qwen35ResidentSnapshot {
 /// Built by [`CudaBackend::build_qwen35_resident`]. Holds its own KV cache and
 /// recurrent state; [`Self::reset`] starts a new sequence.
 pub struct Qwen35Resident {
+    /// `TRITIUM_QWEN35_FUSED`, read once per step (an environment read takes a
+    /// lock and allocates; per layer it was 128 reads a step).
+    fused_on: bool,
+    /// The token `scratch.token` holds on the device, when known: the last one
+    /// uploaded, or the greedy token `step` read back. Feeding that same token
+    /// next needs no upload.
+    device_token: Option<u32>,
     /// Per-warp shared table bytes for fused launches over `hidden` columns.
     fused_table_bytes: u32,
     stream: Arc<CudaStream>,
@@ -639,6 +646,8 @@ impl CudaBackend {
             .ok_or_else(|| invalid("hidden width is not one the row-stream GEMV serves"))?;
 
         Ok(Qwen35Resident {
+            fused_on: true,
+            device_token: None,
             fused_table_bytes,
             stream: Arc::clone(&self.stream),
             kernels,
@@ -960,7 +969,8 @@ impl Qwen35Resident {
 
     /// Feed `tokens` in order, returning the greedy token after the last one.
     ///
-    /// Each token runs as one decode step; batched prefill is later work.
+    /// Each token runs as one decode step, without the language head for all
+    /// but the last; batched prefill is later work.
     ///
     /// # Errors
     /// As [`Self::step`]; rejects an empty prompt.
@@ -969,7 +979,8 @@ impl Qwen35Resident {
             .split_last()
             .ok_or_else(|| invalid("resident Qwen prefill needs at least one token"))?;
         for &token in rest {
-            self.forward(token)?;
+            // Nobody reads these tokens' logits: skip the language head.
+            self.forward(token, false)?;
         }
         self.step(last)
     }
@@ -980,12 +991,14 @@ impl Qwen35Resident {
     /// Rejects a token outside the vocabulary or a full context, or returns a
     /// driver failure.
     pub fn step(&mut self, token: u32) -> Result<u32, BackendError> {
-        self.forward(token)?;
+        self.forward(token, true)?;
         self.argmax()?;
         let mut next = [0u32; 1];
         self.stream
             .memcpy_dtoh(&self.scratch.token, &mut next)
             .map_err(|error| driver_err("read resident Qwen token", &error))?;
+        // The argmax wrote this token into `scratch.token`: feeding it next is free.
+        self.device_token = Some(next[0]);
         Ok(next[0])
     }
 
@@ -995,7 +1008,7 @@ impl Qwen35Resident {
     /// # Errors
     /// As [`Self::step`].
     pub fn step_logits(&mut self, token: u32) -> Result<Vec<f32>, BackendError> {
-        self.forward(token)?;
+        self.forward(token, true)?;
         let mut logits = vec![0.0f32; self.vocab];
         self.stream
             .memcpy_dtoh(&self.scratch.logits, &mut logits)
@@ -1003,9 +1016,9 @@ impl Qwen35Resident {
         Ok(logits)
     }
 
-    /// Run one token through every layer and the language head, leaving the
-    /// logits in scratch.
-    fn forward(&mut self, token: u32) -> Result<(), BackendError> {
+    /// Run one token through every layer and, with `head`, the language head,
+    /// leaving the logits in scratch.
+    fn forward(&mut self, token: u32, head: bool) -> Result<(), BackendError> {
         if token as usize >= self.vocab {
             return Err(invalid(format!(
                 "token {token} outside the {}-row vocabulary",
@@ -1022,12 +1035,16 @@ impl Qwen35Resident {
         self.stream
             .memcpy_htod(&ctrl, &mut self.scratch.ctrl)
             .map_err(|error| driver_err("upload resident ctrl", &error))?;
-        self.stream
-            .memcpy_htod(&[token], &mut self.scratch.token)
-            .map_err(|error| driver_err("upload resident token", &error))?;
+        if self.device_token != Some(token) {
+            self.stream
+                .memcpy_htod(&[token], &mut self.scratch.token)
+                .map_err(|error| driver_err("upload resident token", &error))?;
+            self.device_token = Some(token);
+        }
 
         self.gather()?;
         let scope = a8_scope();
+        self.fused_on = fused_enabled();
         let a8 = scope == A8Scope::All;
         let a8_mlp = scope != A8Scope::Off;
         let n = to_i32(self.hidden, "hidden")?;
@@ -1074,16 +1091,18 @@ impl Qwen35Resident {
             self.eps,
             true,
         )?;
-        project(
-            &self.kernels,
-            &self.stream,
-            a8,
-            &self.lm_head,
-            &self.scratch.normalized,
-            &mut self.scratch.logits,
-            &mut self.scratch.act_quantized,
-            &mut self.scratch.act_scale,
-        )?;
+        if head {
+            project(
+                &self.kernels,
+                &self.stream,
+                a8,
+                &self.lm_head,
+                &self.scratch.normalized,
+                &mut self.scratch.logits,
+                &mut self.scratch.act_quantized,
+                &mut self.scratch.act_scale,
+            )?;
+        }
         self.position += 1;
         Ok(())
     }
@@ -1151,7 +1170,7 @@ impl Qwen35Resident {
         let fused_table_bytes = self.fused_table_bytes;
         let (stream, kernels, scratch) = (&self.stream, &self.kernels, &mut self.scratch);
         let entry = &mut self.layers[index];
-        let fused = if fused_enabled() {
+        let fused = if self.fused_on {
             entry.fused_in.as_ref()
         } else {
             None
@@ -1345,7 +1364,7 @@ impl Qwen35Resident {
             &self.inv_freq,
         );
         let entry = &mut self.layers[index];
-        let fused = if fused_enabled() {
+        let fused = if self.fused_on {
             entry.fused_in.as_ref()
         } else {
             None
@@ -1480,7 +1499,7 @@ impl Qwen35Resident {
         let fused_table_bytes = self.fused_table_bytes;
         let (stream, kernels, scratch) = (&self.stream, &self.kernels, &mut self.scratch);
         let layer = &self.layers[index];
-        let fused = if fused_enabled() {
+        let fused = if self.fused_on {
             layer.fused_mlp.as_ref()
         } else {
             None
