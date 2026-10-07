@@ -3890,19 +3890,27 @@ mod tests {
                     OutputReconstructionError::InvalidGeometry
                 ))
             ));
-            session
-                .observe_scale_refit_scheduled_windows(
+            let mut candidate_parent = SaltV2PackageReader::new_strict(
+                std::fs::File::open(bundle.join("compact.tsalt2")).unwrap(),
+            )
+            .expect("reopen exact parent for production candidate fitter");
+            let candidate = session
+                .fit_scale_refit_tile_plane_candidate(
                     &receipt,
                     &refined_spec,
                     activation_caches.as_slice(),
                     &[(0, 2), (2, 1)],
                     1 << 20,
                     projection_name,
+                    0,
+                    0,
+                    seed,
+                    8,
                     &teacher,
-                    &mut fit_builder,
+                    &mut candidate_parent,
                 )
-                .unwrap();
-            fitted_candidates.push(fit_builder.finish().unwrap());
+                .expect("production B3 tile-plane candidate fitter");
+            fitted_candidates.push(candidate);
         }
         assert!(
             fitted_candidates

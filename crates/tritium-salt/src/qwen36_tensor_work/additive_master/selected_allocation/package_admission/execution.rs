@@ -788,6 +788,148 @@ impl<'admission, 'allocated, 'parent, 'store, 'source>
         Ok(())
     }
 
+    /// Fit one deterministic fixed-trit tile-plane candidate from an admitted parent.
+    ///
+    /// This is the bounded primitive used by a B3 window search: it reopens the
+    /// selected packed plane from the exact admitted package, observes every
+    /// frozen block/token window containing the named projection, and returns
+    /// one content-bound scale-update candidate. Callers can evaluate this
+    /// candidate by materializing an immutable child package and replaying it;
+    /// candidates are never applied to the admitted parent in place.
+    ///
+    /// # Errors
+    /// Rejects a different parent/execution, non-projection tensor, missing
+    /// tile-plane target, malformed schedule, or any activation/refit failure.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fit_scale_refit_tile_plane_candidate<
+        R: Read + Seek,
+        S: OutputReconstructionActivationSource + ?Sized,
+    >(
+        &self,
+        parent_execution: &Qwen36AdmittedExecutionReceipt,
+        spec: &OutputReconstructionSpec,
+        activation_source: &S,
+        token_windows: &[(u64, u64)],
+        max_decoded_bytes: u64,
+        tensor_name: &str,
+        tile_index: usize,
+        plane_index: usize,
+        initialization_seed: u64,
+        coordinate_sweeps: usize,
+        teacher: &Projection,
+        parent: &mut SaltV2PackageReader<R>,
+    ) -> Result<FixedTritScaleUpdateCandidate, Qwen36ScaleRefitWindowError> {
+        self.admission
+            .verify_current()
+            .map_err(Qwen36ScaleRefitWindowError::Admission)?;
+        output_binding::validate_execution(&self.authority, parent_execution)
+            .map_err(Qwen36ScaleRefitWindowError::Runtime)?;
+        let projection_layer = qwen_language_projection_layer(tensor_name)
+            .ok_or(Qwen36ScaleRefitWindowError::InvalidTensorName)?;
+        if spec.source_model_id() != self.authority.source_model_id
+            || spec.token_stream_digest() != parent_execution.token_stream_digest()
+            || parent_execution.package_id() != self.authority.package_id
+            || parent.package_id() != self.authority.package_id
+            || !spec.scopes().iter().any(|scope| {
+                matches!(scope, OutputReconstructionScope::Block { start, end }
+                    if projection_layer >= *start && projection_layer < *end)
+            })
+        {
+            return Err(Qwen36ScaleRefitWindowError::ProvenanceMismatch);
+        }
+
+        let tensor_index = parent
+            .tensor_names_encoded_order()
+            .position(|name| name == tensor_name)
+            .ok_or_else(|| {
+                Qwen36ScaleRefitWindowError::Runtime(NnError::InvalidArtifact(
+                    "scale-refit tensor is absent from the admitted package".to_owned(),
+                ))
+            })?;
+        let tensor_info = parent.tensor_info(tensor_name).ok_or_else(|| {
+            Qwen36ScaleRefitWindowError::Runtime(NnError::InvalidArtifact(
+                "scale-refit tensor metadata is absent from the admitted package".to_owned(),
+            ))
+        })?;
+        if tensor_info.dims().len() != 2 {
+            return Err(Qwen36ScaleRefitWindowError::Runtime(
+                NnError::InvalidArtifact("scale-refit tensor is not a matrix".to_owned()),
+            ));
+        }
+        let output_width = usize::try_from(tensor_info.dims()[0]).map_err(|_| {
+            Qwen36ScaleRefitWindowError::Fit(OutputReconstructionError::InvalidGeometry)
+        })?;
+        let scale_group_size = tensor_info.scale_group_size();
+        let codec = parent.codec();
+        let mut builder = FixedTritScaleUpdateCandidateBuilder::new(
+            spec,
+            parent.package_id().as_bytes(),
+            initialization_seed,
+        );
+        let mut matched_plane = false;
+        let mut fit_error = None;
+        parent
+            .visit_packed_tensor(tensor_name, |packed_plane| {
+                if matched_plane
+                    || packed_plane.tile_index() != tile_index
+                    || packed_plane.plane_index() != plane_index
+                {
+                    return;
+                }
+                matched_plane = true;
+                let result = (|| {
+                    builder
+                        .begin_packed_tile_plane(
+                            tensor_index,
+                            codec,
+                            packed_plane,
+                            output_width,
+                            scale_group_size,
+                            coordinate_sweeps,
+                        )
+                        .map_err(Qwen36ScaleRefitWindowError::Fit)?;
+                    self.observe_scale_refit_scheduled_windows(
+                        parent_execution,
+                        spec,
+                        activation_source,
+                        token_windows,
+                        max_decoded_bytes,
+                        tensor_name,
+                        teacher,
+                        &mut builder,
+                    )?;
+                    builder
+                        .finish_tile_plane()
+                        .map_err(Qwen36ScaleRefitWindowError::Fit)
+                })();
+                if let Err(error) = result {
+                    fit_error = Some(error);
+                }
+            })
+            .map_err(|error| {
+                Qwen36ScaleRefitWindowError::Runtime(NnError::InvalidArtifact(format!(
+                    "read admitted scale-refit parent plane: {error}"
+                )))
+            })?;
+        parent.verify_unchanged().map_err(|error| {
+            Qwen36ScaleRefitWindowError::Runtime(NnError::InvalidArtifact(format!(
+                "verify admitted scale-refit parent: {error}"
+            )))
+        })?;
+        if let Some(error) = fit_error {
+            return Err(error);
+        }
+        if !matched_plane {
+            return Err(Qwen36ScaleRefitWindowError::Fit(
+                OutputReconstructionError::InvalidGeometry,
+            ));
+        }
+        self.admission
+            .verify_current()
+            .map_err(Qwen36ScaleRefitWindowError::Admission)?;
+        builder.finish().map_err(Qwen36ScaleRefitWindowError::Fit)
+    }
+
     /// Freshly replay and admit an immutable scale-refined child of this exact
     /// campaign package. The supplied scope batches are executed once for final
     /// logits and again for the frozen output-reconstruction scopes; both passes
