@@ -403,36 +403,32 @@ pub(crate) fn fit_joint_ternary_diagonal_groups_with_objective(
     };
     let (scales_by_group, trits_by_plane, objective) = py
         .detach(move || {
-            // Flattened group-major row indices preserve each group's row order.
-            // Extract only deployment data while each fit is live: retaining every
-            // full JointTernaryFit also retains reconstruction and restart/solve
-            // telemetry for the entire matrix, even though this bridge does not
-            // publish that evidence. Indexed collection keeps errors and output
-            // deterministic.
-            let fits: Vec<Result<CompactJointFit, String>> = weights
-                .par_chunks_exact(columns)
-                .enumerate()
-                .map(|(index, row_weights)| {
-                    let group = index / rows;
-                    let start = group * columns;
-                    let group_diagonal = &diagonal[start..start + columns];
-                    fit_joint_ternary(
-                        row_weights,
-                        JointFitMetric::DiagonalF64(group_diagonal),
-                        config,
-                    )
-                    .map(|fit| (fit.scales, fit.trits, fit.objective))
-                    .map_err(|error| error.to_string())
-                })
-                .collect();
-
-            let mut fits = fits.into_iter();
+            // Retain only one group's compact row fits at a time. Collecting all
+            // rows before assembly duplicates the full matrix's trit planes in
+            // temporary Vecs. Indexed collection within each group preserves row
+            // order and deterministic error selection.
             let mut scales_by_group = Vec::with_capacity(groups);
             let mut trits_by_plane = (0..planes)
                 .map(|_| Vec::with_capacity(expected_weights))
                 .collect::<Vec<_>>();
             let mut objective = 0.0;
-            for _ in 0..groups {
+            let group_weight_count = rows * columns;
+            for (group, group_weights) in weights.chunks_exact(group_weight_count).enumerate() {
+                let start = group * columns;
+                let group_diagonal = &diagonal[start..start + columns];
+                let fits: Vec<Result<CompactJointFit, String>> = group_weights
+                    .par_chunks_exact(columns)
+                    .map(|row_weights| {
+                        fit_joint_ternary(
+                            row_weights,
+                            JointFitMetric::DiagonalF64(group_diagonal),
+                            config,
+                        )
+                        .map(|fit| (fit.scales, fit.trits, fit.objective))
+                        .map_err(|error| error.to_string())
+                    })
+                    .collect();
+                let mut fits = fits.into_iter();
                 let mut scales_by_row = Vec::with_capacity(rows);
                 for _ in 0..rows {
                     let (scales, trits, row_objective) = fits
