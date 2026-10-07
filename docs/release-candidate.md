@@ -2129,9 +2129,20 @@ above roughly `11.2 GiB` and runner temp disk above `81.8 GiB`, so this was
 again a CPU-time failure rather than memory or disk exhaustion. The run's
 conversion time differs substantially from the earlier exact-source run, so
 the pair confirms that hosted CPU timing is variable; neither result alone
-identifies a code regression or improvement. The local bridge edit has only
-been checked on a smaller deterministic fixture and has not yet been included
-in a hosted model-level run.
+identifies a code regression or improvement. At the time of this run, the
+local bridge edit had only been checked on a smaller deterministic fixture;
+the later exact-candidate hosted run is recorded below.
+
+The exact-candidate hosted run
+[37637322050](https://github.com/Quitetall/tritium/actions/runs/37637322050)
+then exercised commit `44942a8a156a3350cbbb613791ef1c09e6eb5e77`, including
+the binary bridge. It completed the tutorial's functional stages but failed
+the unchanged 300-second limit at `1033.296s`; conversion completed at
+`805.704s`. Sampled available memory stayed above about `12.0 GiB` and runner
+temp disk above `83.4 GiB`. This remains a CPU-time failure. Relative to run
+`37632137262`, the observed conversion was about 47 seconds shorter, but the
+hosted runs were not controlled or same-runner A/B comparisons. Do not
+attribute that difference to the bridge or claim a speedup.
 
 ### Local exact-candidate PTQ profile — 2026-10-07
 
@@ -2157,5 +2168,5 @@ not a comparative benchmark. Raw pstats remain at
 `/tmp/tritium-ptq-profile-44942a8a.pstats` (SHA-256
 `ad8871ac616d73ceb6f5b418f1bd255ed2efc75e73cdfcdc047e6a1cb7dc2f8b`); the
 receipt and profile are local temporary evidence, not yet part of the release
-evidence bundle. The exact-candidate hosted tutorial was still running when
-this profile was recorded.
+evidence bundle. The same commit's hosted tutorial later failed the 300-second
+gate as recorded above.
