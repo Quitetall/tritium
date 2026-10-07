@@ -1161,40 +1161,32 @@ fn scale_update_candidate_builder_streams_windows_and_binds_the_owned_candidate(
     let parent = [55; 32];
     let mut candidate_builder = FixedTritScaleUpdateCandidateBuilder::new(&spec, &parent, 17);
     candidate_builder
-        .begin_tile_plane(7, 0, 1, 2, &trits, 64, 16)
+        .begin_tile_plane(7, 0, 1, 2, &trits, &[f16::ONE, f16::ONE], 64, 16)
         .unwrap();
     assert!(matches!(
-        candidate_builder.observe_window_with_current_output(
+        candidate_builder.observe_window_from_current_projection(
             &first_window,
             &[10.0],
-            &[15.0, 14.5],
-            &[3.0, -4.0],
+            &[11.0, 21.5],
         ),
         Err(OutputReconstructionError::InvalidGeometry)
     ));
     assert!(matches!(
-        candidate_builder.observe_window_with_current_output(
+        candidate_builder.observe_window_from_current_projection(
             &first_window,
             &[10.0, 20.0],
-            &[f32::INFINITY, 14.5],
-            &[3.0, -4.0],
+            &[f32::INFINITY, 21.5],
         ),
         Err(OutputReconstructionError::NonFiniteOutput { teacher: false })
     ));
     candidate_builder
-        .observe_window_with_current_output(
-            &first_window,
-            &[10.0, 20.0],
-            &[15.0, 14.5],
-            &[3.0, -4.0],
-        )
+        .observe_window_from_current_projection(&first_window, &[10.0, 20.0], &[11.0, 21.5])
         .unwrap();
     candidate_builder
-        .observe_window_with_current_output(
+        .observe_window_from_current_projection(
             &second_window,
             &[30.0, 40.0, 50.0, 60.0],
-            &[33.0, 48.5, 44.0, 64.0],
-            &[5.0, 10.0, -2.0, 4.0],
+            &[29.0, 41.5, 48.0, 60.0],
         )
         .unwrap();
 

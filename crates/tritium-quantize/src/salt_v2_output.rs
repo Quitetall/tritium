@@ -1660,6 +1660,122 @@ impl<'a> FixedTritTileScaleRefitAccumulator<'a> {
         Ok(())
     }
 
+    /// Evaluate this fixed-trit tile-plane's exact current contribution for a window.
+    ///
+    /// The returned rows are zero for masked tokens. Only the requested tile-plane
+    /// is evaluated; output storage is bounded by this window.
+    ///
+    /// # Errors
+    /// Rejects invalid geometry, non-finite activations, or malformed base scales.
+    pub fn current_tile_plane_outputs(
+        &self,
+        activations: &ActivationWindow,
+        scales: &[half::f16],
+    ) -> Result<Vec<f32>, OutputReconstructionError> {
+        let input_width = usize::try_from(activations.feature_width())
+            .map_err(|_| OutputReconstructionError::InvalidGeometry)?;
+        let token_count = usize::try_from(activations.token_count())
+            .map_err(|_| OutputReconstructionError::InvalidGeometry)?;
+        let total_coefficients = self
+            .output_width
+            .checked_mul(input_width)
+            .ok_or(OutputReconstructionError::InvalidGeometry)?;
+        let output_count = token_count
+            .checked_mul(self.output_width)
+            .ok_or(OutputReconstructionError::InvalidGeometry)?;
+        let activation_count = token_count
+            .checked_mul(input_width)
+            .ok_or(OutputReconstructionError::InvalidGeometry)?;
+        let group_count = self.trits.len().div_ceil(self.scale_group_size);
+        if input_width == 0
+            || token_count == 0
+            || activations.values().len() != activation_count
+            || activations.token_mask().len() != token_count
+            || scales.len() != group_count
+        {
+            return Err(OutputReconstructionError::InvalidGeometry);
+        }
+        if activations.values().iter().any(|value| !value.is_finite()) {
+            return Err(OutputReconstructionError::NonFiniteOutput { teacher: false });
+        }
+        if scales
+            .iter()
+            .any(|scale| !scale.is_finite() || scale.to_f32() <= 0.0)
+        {
+            return Err(OutputReconstructionError::InvalidScaleUpdate);
+        }
+
+        let tile_start = self
+            .tile_index
+            .checked_mul(SALT_V2_ALLOCATION_TILE_SIZE)
+            .ok_or(OutputReconstructionError::InvalidGeometry)?;
+        let tile_end = tile_start
+            .checked_add(self.trits.len())
+            .ok_or(OutputReconstructionError::InvalidGeometry)?;
+        let expected_tile_len = total_coefficients
+            .checked_sub(tile_start)
+            .ok_or(OutputReconstructionError::InvalidGeometry)?
+            .min(SALT_V2_ALLOCATION_TILE_SIZE);
+        if tile_start >= total_coefficients
+            || tile_end > total_coefficients
+            || self.trits.len() != expected_tile_len
+        {
+            return Err(OutputReconstructionError::InvalidGeometry);
+        }
+
+        let mut outputs = Vec::new();
+        outputs
+            .try_reserve_exact(output_count)
+            .map_err(|_| OutputReconstructionError::ReceiptAllocationFailed)?;
+        outputs.resize(output_count, 0.0);
+        let mut group_outputs = Vec::new();
+        group_outputs
+            .try_reserve_exact(group_count)
+            .map_err(|_| OutputReconstructionError::ReceiptAllocationFailed)?;
+        group_outputs.resize(group_count, 0.0_f64);
+        let first_output_row = tile_start / input_width;
+        let last_output_row = (tile_end - 1) / input_width;
+        for token in 0..token_count {
+            if !activations.token_mask()[token] {
+                continue;
+            }
+            let input_offset = token
+                .checked_mul(input_width)
+                .ok_or(OutputReconstructionError::InvalidGeometry)?;
+            let output_offset = token
+                .checked_mul(self.output_width)
+                .ok_or(OutputReconstructionError::InvalidGeometry)?;
+            for output_row in first_output_row..=last_output_row {
+                group_outputs.fill(0.0);
+                let row_start = output_row
+                    .checked_mul(input_width)
+                    .ok_or(OutputReconstructionError::InvalidGeometry)?;
+                let row_end = row_start
+                    .checked_add(input_width)
+                    .ok_or(OutputReconstructionError::InvalidGeometry)?;
+                let coefficient_start = tile_start.max(row_start);
+                let coefficient_end = tile_end.min(row_end);
+                for global_index in coefficient_start..coefficient_end {
+                    let tile_offset = global_index - tile_start;
+                    let group = tile_offset / self.scale_group_size;
+                    let input_column = global_index - row_start;
+                    group_outputs[group] += f64::from(self.trits[tile_offset].get())
+                        * f64::from(activations.values()[input_offset + input_column]);
+                }
+                let contribution = group_outputs
+                    .iter()
+                    .zip(scales)
+                    .map(|(projected, scale)| projected * f64::from(scale.to_f32()))
+                    .sum::<f64>() as f32;
+                if !contribution.is_finite() {
+                    return Err(OutputReconstructionError::NonFiniteOutput { teacher: false });
+                }
+                outputs[output_offset + output_row] = contribution;
+            }
+        }
+        Ok(outputs)
+    }
+
     /// Finish the accumulated non-negative scale solution.
     ///
     /// # Errors
@@ -1784,6 +1900,7 @@ struct ActiveTileScaleFit<'a> {
     tensor_index: usize,
     plane_index: usize,
     output_width: usize,
+    current_scales: Vec<half::f16>,
     accumulator: FixedTritTileScaleRefitAccumulator<'a>,
 }
 
@@ -1832,6 +1949,7 @@ impl<'spec, 'trits> FixedTritScaleUpdateCandidateBuilder<'spec, 'trits> {
         plane_index: usize,
         output_width: usize,
         trits: &'trits [Trit],
+        current_scales: &[half::f16],
         scale_group_size: usize,
         coordinate_sweeps: usize,
     ) -> Result<(), OutputReconstructionError> {
@@ -1842,9 +1960,25 @@ impl<'spec, 'trits> FixedTritScaleUpdateCandidateBuilder<'spec, 'trits> {
         if self.last_target.is_some_and(|previous| target <= previous) {
             return Err(OutputReconstructionError::NonCanonicalScaleUpdateOrder);
         }
+        if trits.is_empty() || scale_group_size == 0 {
+            return Err(OutputReconstructionError::InvalidGeometry);
+        }
+        let expected_scale_count = trits.len().div_ceil(scale_group_size);
+        if current_scales.len() != expected_scale_count
+            || current_scales
+                .iter()
+                .any(|scale| !scale.is_finite() || scale.to_f32() <= 0.0)
+        {
+            return Err(OutputReconstructionError::InvalidScaleUpdate);
+        }
         self.updates
             .try_reserve(1)
             .map_err(|_| OutputReconstructionError::ReceiptAllocationFailed)?;
+        let mut current_scales_owned = Vec::new();
+        current_scales_owned
+            .try_reserve_exact(current_scales.len())
+            .map_err(|_| OutputReconstructionError::ReceiptAllocationFailed)?;
+        current_scales_owned.extend_from_slice(current_scales);
         let accumulator = FixedTritTileScaleRefitAccumulator::new(
             output_width,
             tile_index,
@@ -1856,6 +1990,7 @@ impl<'spec, 'trits> FixedTritScaleUpdateCandidateBuilder<'spec, 'trits> {
             tensor_index,
             plane_index,
             output_width,
+            current_scales: current_scales_owned,
             accumulator,
         });
         Ok(())
@@ -1940,6 +2075,35 @@ impl<'spec, 'trits> FixedTritScaleUpdateCandidateBuilder<'spec, 'trits> {
         active
             .accumulator
             .observe_window(activations, &residual_outputs)
+    }
+
+    /// Derive the active tile-plane contribution from the stored trits and base scales.
+    ///
+    /// The exact contribution is subtracted from the current full projection
+    /// output before the fixed-trit scale fit observes the residual. Base scales
+    /// are fixed for the lifetime of this candidate builder.
+    ///
+    /// # Errors
+    /// Rejects calls without an active fit, invalid output geometry, or non-finite values.
+    pub fn observe_window_from_current_projection(
+        &mut self,
+        activations: &ActivationWindow,
+        teacher_outputs: &[f32],
+        current_projection_outputs: &[f32],
+    ) -> Result<(), OutputReconstructionError> {
+        let active = self
+            .active
+            .as_ref()
+            .ok_or(OutputReconstructionError::NoActiveScaleFit)?;
+        let tile_outputs = active
+            .accumulator
+            .current_tile_plane_outputs(activations, &active.current_scales)?;
+        self.observe_window_with_current_output(
+            activations,
+            teacher_outputs,
+            current_projection_outputs,
+            &tile_outputs,
+        )
     }
 
     /// Finish the current tile-plane and append its canonical package update.
