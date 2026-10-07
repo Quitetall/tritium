@@ -1,0 +1,24 @@
+scales-ss14 --s-shift 14
+scales-ss16 --s-shift 16
+scales-ss18 --s-shift 18
+scales-ss20 --s-shift 20
+scales-ss22 --s-shift 22
+scales-ss24 --s-shift 24
+planes2-ws11 --planes 2 --w-shift 11
+planes2-ws12 --planes 2 --w-shift 12
+planes2-ws13 --planes 2 --w-shift 13
+planes2-ws14 --planes 2 --w-shift 14
+planes2-ws15 --planes 2 --w-shift 15
+planes3-ws11 --planes 3 --w-shift 11
+planes3-ws12 --planes 3 --w-shift 12
+planes3-ws13 --planes 3 --w-shift 13
+planes3-ws14 --planes 3 --w-shift 14
+planes3-ws15 --planes 3 --w-shift 15
+width256-ws12 --hidden 256 --w-shift 12
+width256-ws13 --hidden 256 --w-shift 13
+width256-ws14 --hidden 256 --w-shift 14
+width256-ws15 --hidden 256 --w-shift 15
+width512-ws12 --hidden 512 --w-shift 12
+width512-ws13 --hidden 512 --w-shift 13
+width512-ws14 --hidden 512 --w-shift 14
+width512-ws15 --hidden 512 --w-shift 15

@@ -1,0 +1,50 @@
+base-1 1 --w-shift 13
+global7168-1 1 --global-scale 7168 --w-shift 15
+learned-1 1 --global-scale 6144 --w-shift 14 --s-shift 22
+planes2-1 1 --planes 2 --w-shift 14
+planes3-1 1 --planes 3 --w-shift 14
+width256-1 1 --hidden 256 --w-shift 13
+width512-1 1 --hidden 512 --w-shift 13
+g-planes3-1 1 --global-scale 6144 --planes 3 --w-shift 15
+g-width512-1 1 --global-scale 6144 --hidden 512 --w-shift 15
+g-w512-p3-1 1 --global-scale 6144 --hidden 512 --planes 3 --w-shift 15
+base-2 2 --w-shift 13
+global7168-2 2 --global-scale 7168 --w-shift 15
+learned-2 2 --global-scale 6144 --w-shift 14 --s-shift 22
+planes2-2 2 --planes 2 --w-shift 14
+planes3-2 2 --planes 3 --w-shift 14
+width256-2 2 --hidden 256 --w-shift 13
+width512-2 2 --hidden 512 --w-shift 13
+g-planes3-2 2 --global-scale 6144 --planes 3 --w-shift 15
+g-width512-2 2 --global-scale 6144 --hidden 512 --w-shift 15
+g-w512-p3-2 2 --global-scale 6144 --hidden 512 --planes 3 --w-shift 15
+base-3 3 --w-shift 13
+global7168-3 3 --global-scale 7168 --w-shift 15
+learned-3 3 --global-scale 6144 --w-shift 14 --s-shift 22
+planes2-3 3 --planes 2 --w-shift 14
+planes3-3 3 --planes 3 --w-shift 14
+width256-3 3 --hidden 256 --w-shift 13
+width512-3 3 --hidden 512 --w-shift 13
+g-planes3-3 3 --global-scale 6144 --planes 3 --w-shift 15
+g-width512-3 3 --global-scale 6144 --hidden 512 --w-shift 15
+g-w512-p3-3 3 --global-scale 6144 --hidden 512 --planes 3 --w-shift 15
+base-4 4 --w-shift 13
+global7168-4 4 --global-scale 7168 --w-shift 15
+learned-4 4 --global-scale 6144 --w-shift 14 --s-shift 22
+planes2-4 4 --planes 2 --w-shift 14
+planes3-4 4 --planes 3 --w-shift 14
+width256-4 4 --hidden 256 --w-shift 13
+width512-4 4 --hidden 512 --w-shift 13
+g-planes3-4 4 --global-scale 6144 --planes 3 --w-shift 15
+g-width512-4 4 --global-scale 6144 --hidden 512 --w-shift 15
+g-w512-p3-4 4 --global-scale 6144 --hidden 512 --planes 3 --w-shift 15
+base-5 5 --w-shift 13
+global7168-5 5 --global-scale 7168 --w-shift 15
+learned-5 5 --global-scale 6144 --w-shift 14 --s-shift 22
+planes2-5 5 --planes 2 --w-shift 14
+planes3-5 5 --planes 3 --w-shift 14
+width256-5 5 --hidden 256 --w-shift 13
+width512-5 5 --hidden 512 --w-shift 13
+g-planes3-5 5 --global-scale 6144 --planes 3 --w-shift 15
+g-width512-5 5 --global-scale 6144 --hidden 512 --w-shift 15
+g-w512-p3-5 5 --global-scale 6144 --hidden 512 --planes 3 --w-shift 15
