@@ -60,6 +60,37 @@
 //! quantization quality. Kronecker GPTQ is best on every WikiText metric and second on-policy.
 //! Bounds: one model, T=3, PTQ-only, 8 models; τ over 8 items has wide intervals.
 //!
+//! # Measured 2026-10-07 — T=2, all 8 models
+//!
+//! ```text
+//! model                    ppl      even   KL wiki   KL self      late   agree
+//! RTN                   46.405  +0.71623   0.77002   0.76500  +0.76700    0.69
+//! RTN fold α=0.5        44.985  +0.69338   0.73932   0.73378  +0.73225    0.53
+//! GPTQ wiki 16k         40.263  +0.61521   0.63262   0.68906  +0.62448    0.91
+//! Kronecker GPTQ 16k    38.918  +0.58743   0.60422   0.64178  +0.59426    2.47
+//! GPTQ wiki 2k          42.305  +0.67040   0.67201   0.72045  +0.66328    2.28
+//! GPTQ self-trace 16k   41.560  +0.63941   0.63707   0.64049  +0.61851    2.62
+//! RTN signs A (null)    43.130  +0.68399   0.68487   0.68708  +0.64805    1.94
+//! RTN signs B (null)    45.618  +0.67863   0.74513   0.72558  +0.69701    0.62
+//!
+//! metric     τ vs on-policy KL   null-pair gap / spread (T=2)   (T=3)
+//! even            +0.64                 0.04                     0.25
+//! ppl             +0.64                 0.33                     0.25
+//! KL wiki         +0.64                 0.36                     0.15
+//! KL self           —                   0.31                     0.05
+//! late            +0.86                 0.28                     0.80
+//! agree           +0.71                 0.63                     0.57
+//! ```
+//!
+//! **Across both rates, the antithetic curvature is the metric that does not lie.** At T=2 the null
+//! pair — two random sign gauges, equal in expectation — differs by 5.8% in perplexity (43.13 vs
+//! 45.62) and by similar amounts in both KLs, yet by 0.8% in curvature (0.684 vs 0.679): the fixed
+//! evaluation sample's first-order term moves every teacher-forced metric, and the antithetic
+//! split cancels it. Its noise floor is 0.04 of the method spread at T=2 and 0.25 at T=3; no other
+//! metric is low at both. Kronecker GPTQ is best on every WikiText metric at both rates; self-trace
+//! calibration ties it on-policy at T=2 (0.6405 vs 0.6418) as it beat it at T=3.
+//! Rank agreement over 8 items has wide intervals; read the noise floors, not single τ values.
+//!
 //! ```text
 //! TRITIUM_CORPUS=$HOME/.cache/tritium-corpora/wikitext2_400k_32k.json \
 //!   cargo test -p tritium-nn --release --test metric_validity -- --ignored --nocapture
