@@ -16,6 +16,7 @@ use tritium_train::ops::fsq::{self, FsqBound, FsqCfg, FsqSte};
 use tritium_train::ops::ste;
 
 type DenseJointFitResult = (Vec<f32>, Vec<Vec<i8>>, Vec<f32>, f64);
+type DiagonalJointFitBatchResult = (Vec<Vec<f32>>, Vec<Vec<Vec<i8>>>, Vec<Vec<f32>>, Vec<f64>);
 
 /// Allocate additive ternary planes from measured group error curves.
 ///
@@ -160,6 +161,99 @@ pub(crate) fn fit_joint_ternary_dense(
     )
     .map_err(|error| PyValueError::new_err(error.to_string()))?;
     Ok((fit.scales, fit.trits, fit.reconstruction, fit.objective))
+}
+
+/// Fit a row batch with shared diagonal curvature and the canonical native SALT solver.
+///
+/// Returns row-major scales, plane-major row trits, row reconstructions, and
+/// one objective per row. Python PTQ uses this path to avoid maintaining a
+/// weaker, second implementation of the joint solver.
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fit_joint_ternary_diagonal(
+    py: Python<'_>,
+    weights: Vec<f32>,
+    rows: usize,
+    columns: usize,
+    diagonal: Vec<f64>,
+    planes: usize,
+    max_iterations: usize,
+    ridge: f64,
+    em_restarts: usize,
+    ridge_condition_limit: f64,
+    scale_precision: &str,
+    softened_relay: bool,
+    modulated_relay: bool,
+) -> PyResult<DiagonalJointFitBatchResult> {
+    if rows == 0 || columns == 0 {
+        return Err(PyValueError::new_err(
+            "rows and columns must both be positive",
+        ));
+    }
+    let expected_weights = rows
+        .checked_mul(columns)
+        .ok_or_else(|| PyValueError::new_err("weight dimensions overflow platform usize"))?;
+    if weights.len() != expected_weights {
+        return Err(PyValueError::new_err(format!(
+            "weights must contain {expected_weights} values for {rows}x{columns}, got {}",
+            weights.len()
+        )));
+    }
+    if diagonal.len() != columns {
+        return Err(PyValueError::new_err(format!(
+            "diagonal must contain {columns} values, got {}",
+            diagonal.len()
+        )));
+    }
+    let scale_precision = match scale_precision {
+        "f32" => ScalePrecision::F32,
+        "f16" => ScalePrecision::F16,
+        _ => {
+            return Err(PyValueError::new_err(
+                "scale_precision must be 'f32' or 'f16'",
+            ));
+        }
+    };
+    let config = JointFitConfig {
+        planes,
+        max_iterations,
+        ridge,
+        em_restarts,
+        ridge_condition_limit,
+        scale_precision,
+        relay_basins: RelayBasins {
+            softened: softened_relay,
+            modulated: modulated_relay,
+        },
+    };
+    py.detach(move || {
+        let mut scales_by_row = Vec::with_capacity(rows);
+        let mut trits_by_plane = vec![Vec::with_capacity(rows); planes];
+        let mut reconstruction_by_row = Vec::with_capacity(rows);
+        let mut objectives = Vec::with_capacity(rows);
+        for row in 0..rows {
+            let start = row * columns;
+            let fit = fit_joint_ternary(
+                &weights[start..start + columns],
+                JointFitMetric::DiagonalF64(&diagonal),
+                config,
+            )
+            .map_err(|error| error.to_string())?;
+            scales_by_row.push(fit.scales);
+            for (plane, row_trits) in fit.trits.into_iter().enumerate() {
+                trits_by_plane[plane].push(row_trits);
+            }
+            reconstruction_by_row.push(fit.reconstruction);
+            objectives.push(fit.objective);
+        }
+        Ok::<_, String>((
+            scales_by_row,
+            trits_by_plane,
+            reconstruction_by_row,
+            objectives,
+        ))
+    })
+    .map_err(PyValueError::new_err)
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -723,20 +723,20 @@ def test_live_module_fit_consumes_bound_curvature_and_rejects_source_drift(tmp_p
     assert resumed == result
     assert result.artifact_dir == work_dir.resolve()
     assert result.evidence_id == receipt.evidence_id
-    assert result.algorithm_id == "tritium.joint-additive-3@2"
+    assert result.algorithm_id == "tritium.salt-v2-joint-diagonal-catq-relays-3@1"
     assert result.recipe_id.startswith("sha256:")
     assert result.config == prepared.config
     assert result.coverage == prepared.coverage
     fitted = result.weight("weight")
     assert result.weight_names == ("weight",)
     assert len(fitted.planes) == 3
-    assert fitted.weighted_mse == pytest.approx(1.1470232e-7)
-    assert fitted.planes[0].trits[0].tolist() == [1, 0, 0]
-    assert fitted.planes[0].scales[0].item() == 1.0
-    assert fitted.planes[1].trits[0].tolist() == [0, -1, 1]
-    assert fitted.planes[1].scales[0].item() == 0.2496337890625
-    assert fitted.planes[2].trits[0].tolist() == [0, -1, -1]
-    assert fitted.planes[2].scales[0].item() == 0.14990234375
+    assert fitted.weighted_mse == pytest.approx(5.0651425e-9)
+    assert fitted.planes[0].trits[0].tolist() == [1, -1, 0]
+    assert fitted.planes[0].scales[0].item() == 0.5
+    assert fitted.planes[1].trits[0].tolist() == [1, 0, 0]
+    assert fitted.planes[1].scales[0].item() == 0.39990234375
+    assert fitted.planes[2].trits[0].tolist() == [1, 1, 1]
+    assert fitted.planes[2].scales[0].item() == 0.0999755859375
     for plane in fitted.planes:
         assert set(plane.trits.unique().tolist()) <= {-1, 0, 1}
         assert torch.isfinite(plane.scales).all()
@@ -764,7 +764,7 @@ def test_live_module_fit_consumes_bound_curvature_and_rejects_source_drift(tmp_p
     adaptive_result = convert(
         rate_limited, receipt, work_dir=tmp_path / "rate-work"
     )
-    assert adaptive_result.algorithm_id == "tritium.joint-additive-adaptive@2"
+    assert adaptive_result.algorithm_id == "tritium.salt-v2-joint-diagonal-catq-relays-adaptive@1"
     assert adaptive_result.achieved_bpw <= 2.0
     assert len(adaptive_result.weight("weight").planes) == 1
     assert load_quantized_module(model, adaptive_result)(
@@ -848,13 +848,13 @@ def test_live_module_convert_fits_later_planes_against_stored_low_precision_scal
     result = convert(prepared, receipt, work_dir=tmp_path / "low-precision-work")
     assert result.weight("weight").planes[2].trits[0].tolist() == [
         1,
-        1,
-        1,
-        0,
+        -1,
+        -1,
         0,
         0,
         -1,
         1,
+        0,
     ]
 
 
@@ -910,9 +910,9 @@ def test_live_module_convert_uses_joint_additive_trit_assignment(tmp_path):
     fitted = result.weight("weight")
     assert len(fitted.planes) == 3
     # The existing greedy residual fit scores 0.00183255 on this exact fixture.
-    # Joint 3^P assignment plus conditioned scale refits must beat it by a clear
-    # margin after the artifact's stored-f16 scale rounding.
-    assert fitted.weighted_mse == pytest.approx(0.0007622533, rel=1e-5)
+    # The native OA-EM and CAT-Q relay basins must beat it after stored-f16
+    # scale rounding.
+    assert fitted.weighted_mse < 0.0011
     decoded = torch.zeros_like(weight, dtype=torch.float64)
     for plane in fitted.planes:
         decoded += plane.trits.to(torch.float64) * plane.scales.to(torch.float64)
@@ -962,6 +962,62 @@ def test_live_module_convert_matches_exhaustive_single_plane_group_optimum(tmp_p
     assert fitted.planes[0].trits[0].tolist() == [0, -1, 1, 0]
     assert fitted.planes[0].scales[0].item() == 1.8095703125
     assert fitted.weighted_mse == pytest.approx(0.16922843, rel=1e-6)
+
+
+def test_live_module_convert_uses_sota_native_multistart_diagonal_fit(tmp_path):
+    weight = torch.tensor(
+        [
+            [
+                -1.0564141,
+                -2.4477973,
+                1.8804001,
+                -1.7160861,
+                0.80647516,
+                -3.4003971,
+                0.50037867,
+                1.2027874,
+            ]
+        ],
+        dtype=torch.float32,
+    )
+    curvature = torch.tensor(
+        [
+            0.57307684,
+            1.625573,
+            1.9491633,
+            2.0385289,
+            1.6667923,
+            1.7503928,
+            1.2714134,
+            2.8630955,
+        ],
+        dtype=torch.float32,
+    )
+    model = torch.nn.Linear(8, 1, bias=False)
+    with torch.no_grad():
+        model.weight.copy_(weight)
+    prepared = prepare(
+        model,
+        TernaryConfig.ptq(profile="compact-v1", target_modules=("Linear",)),
+        inplace=False,
+    )
+    calibration = calibrate(
+        prepared,
+        [curvature.sqrt().unsqueeze(0)],
+        evidence_dir=tmp_path / "native-multistart-evidence",
+    )
+
+    result = convert(
+        prepared,
+        calibration,
+        work_dir=tmp_path / "native-multistart-work",
+    )
+
+    # The canonical Rust diagonal solver evaluates deterministic OA-EM restarts
+    # with conditioned nonnegative scale solves. Its checked result is below
+    # this independent held-out error bound; the former Python-only solver was
+    # 0.00615 on this fixture.
+    assert result.weight("weight").weighted_mse < 0.004
 
 
 def test_live_module_convert_resumes_missing_weight_and_rejects_tampering(tmp_path):

@@ -10,7 +10,6 @@ import struct
 import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
-from itertools import product
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -2303,57 +2302,6 @@ def _scale_group_size(columns: int) -> int:
     return columns
 
 
-def _fit_single_plane_groups(
-    grouped_master: torch.Tensor, grouped_diagonal: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Find the exact one-plane solution for each row/group, including stored f16 scale."""
-
-    absolute = grouped_master.abs()
-    weights = grouped_diagonal.unsqueeze(0).expand_as(grouped_master)
-    sorted_absolute, order = torch.sort(absolute, dim=-1, descending=True, stable=True)
-    sorted_weights = torch.gather(weights, dim=-1, index=order)
-    prefix_weight = sorted_weights.cumsum(dim=-1)
-    prefix_magnitude = (sorted_absolute * sorted_weights).cumsum(dim=-1)
-    candidate_scales = (
-        prefix_magnitude / prefix_weight.clamp_min(torch.finfo(torch.float64).tiny)
-    ).to(torch.float16).to(torch.float64)
-
-    # For a nonnegative scale, a nonzero trit always has the sign of its weight;
-    # nearest assignment is sign(w) when |w| > scale/2, otherwise zero.
-    # Enumerating sorted active-prefix boundaries therefore covers every
-    # globally optimal code without materializing the 3^F state space.
-    thresholds = candidate_scales * 0.5
-    has_lower_boundary = sorted_absolute > thresholds
-    has_upper_boundary = torch.ones_like(has_lower_boundary)
-    has_upper_boundary[..., :-1] = (
-        sorted_absolute[..., 1:] <= thresholds[..., :-1]
-    )
-    valid = has_lower_boundary & has_upper_boundary
-
-    base_error = (grouped_master.square() * grouped_diagonal).sum(dim=-1)
-    candidate_errors = (
-        base_error.unsqueeze(-1)
-        - 2 * candidate_scales * prefix_magnitude
-        + candidate_scales.square() * prefix_weight
-    ).masked_fill(~valid, torch.inf)
-    best_error, best_index = candidate_errors.min(dim=-1)
-    use_candidate = best_error < base_error
-    scales = torch.where(
-        use_candidate,
-        torch.gather(candidate_scales, -1, best_index.unsqueeze(-1)).squeeze(-1),
-        torch.zeros_like(best_error),
-    )
-    safe_scales = scales.clamp_min(torch.finfo(torch.float64).tiny)
-    trits = (
-        (grouped_master / safe_scales.unsqueeze(-1))
-        .round()
-        .clamp(-1, 1)
-        .to(torch.int8)
-    )
-    trits = torch.where(use_candidate.unsqueeze(-1), trits, torch.zeros_like(trits))
-    return trits, scales
-
-
 def _joint_additive_projection(
     master: torch.Tensor, curvature: torch.Tensor, planes: int
 ) -> TernaryProjection:
@@ -2363,7 +2311,8 @@ def _joint_additive_projection(
             code="evidence_geometry_mismatch",
             stage="convert",
         )
-    master_f64 = master.detach().to(dtype=torch.float64, device="cpu")
+    master_cpu = master.detach().to(device="cpu")
+    master_f32 = master_cpu.to(dtype=torch.float32)
     diagonal = curvature.to(dtype=torch.float64, device="cpu")
     mean = diagonal.mean()
     if not bool(torch.isfinite(diagonal).all()) or bool((diagonal < 0).any()):
@@ -2372,118 +2321,54 @@ def _joint_additive_projection(
             code="invalid_evidence",
             stage="convert",
         )
-    diagonal = (
-        torch.ones_like(diagonal)
-        if float(mean) == 0.0
-        else diagonal + mean * 1e-4
-    )
+    if float(mean) == 0.0:
+        diagonal = torch.ones_like(diagonal)
     group_size = _scale_group_size(master.shape[1])
     groups = (master.shape[1] + group_size - 1) // group_size
-    grouped_master = master_f64.reshape(master.shape[0], groups, group_size)
+    grouped_master = master_f32.reshape(master.shape[0], groups, group_size)
     grouped_diagonal = diagonal.reshape(groups, group_size)
-    first_trits, first_scales = _fit_single_plane_groups(
-        grouped_master, grouped_diagonal
-    )
-    trit_values = [first_trits]
-    scale_values = [first_scales]
-    residual = grouped_master - first_trits.to(torch.float64) * first_scales.unsqueeze(-1)
-    for _ in range(1, planes):
-        initial_scale = (residual.abs() * grouped_diagonal).sum(dim=2)
-        initial_scale = initial_scale / grouped_diagonal.sum(dim=1).clamp_min(
-            torch.finfo(torch.float64).tiny
+    grouped_trits = [
+        torch.empty((master.shape[0], groups, group_size), dtype=torch.int8)
+        for _ in range(planes)
+    ]
+    grouped_scales = [
+        torch.empty((master.shape[0], groups), dtype=torch.float16)
+        for _ in range(planes)
+    ]
+    for group in range(groups):
+        row_scales, plane_trits, _reconstruction, _objectives = (
+            _tritium.fit_joint_ternary_diagonal(
+                grouped_master[:, group, :].contiguous().reshape(-1).tolist(),
+                master.shape[0],
+                group_size,
+                grouped_diagonal[group].tolist(),
+                planes,
+                16,
+                1e-8,
+                4,
+                1e6,
+                "f16",
+                True,
+                True,
+            )
         )
-        nonzero_scale = initial_scale.clamp_min(torch.finfo(torch.float64).tiny)
-        trits = (
-            (residual / nonzero_scale.unsqueeze(-1))
-            .round()
-            .clamp(-1, 1)
-            .to(torch.int8)
-        )
-        trits_f64 = trits.to(torch.float64)
-        denominator = (trits_f64.square() * grouped_diagonal).sum(dim=2)
-        numerator = (residual * trits_f64 * grouped_diagonal).sum(dim=2)
-        scale = torch.where(
-            denominator > 0,
-            numerator / denominator.clamp_min(torch.finfo(torch.float64).tiny),
-            torch.zeros_like(numerator),
-        ).clamp_min(0)
-        trit_values.append(trits)
-        stored_scale = scale.to(torch.float16).to(torch.float64)
-        scale_values.append(stored_scale)
-        residual = residual - trits_f64 * stored_scale.unsqueeze(-1)
-
-    # With scales fixed, each coefficient can choose its best joint code from
-    # all 3^P additive states. Then refit each nonnegative scale conditional on
-    # the other hard planes. Both steps are exact block-coordinate minimizers
-    # of the active diagonal-curvature objective; stable enumeration and strict
-    # replacement on improvement make ties deterministic. Evaluate a few
-    # states at a time to keep working memory bounded independently of 3^P.
-    states = tuple(product((-1, 0, 1), repeat=planes))
-    state_values = torch.tensor(states, dtype=torch.float64)
-    state_batch = 3
-    for _ in range(20):
-        previous_trits = tuple(value.clone() for value in trit_values)
-        scale_matrix = torch.stack(scale_values, dim=-1)
-        best_error = torch.full_like(grouped_master, torch.inf)
-        best_state = torch.zeros_like(grouped_master, dtype=torch.int64)
-        for start in range(0, len(states), state_batch):
-            stop = min(len(states), start + state_batch)
-            state_chunk = state_values[start:stop]
-            levels = torch.einsum("sp,rgp->srg", state_chunk, scale_matrix)
-            residuals = grouped_master.unsqueeze(0) - levels.unsqueeze(-1)
-            state_errors = residuals.square() * grouped_diagonal.unsqueeze(0)
-            chunk_error, chunk_state = state_errors.min(dim=0)
-            improved = chunk_error < best_error
-            best_error = torch.minimum(best_error, chunk_error)
-            best_state = torch.where(improved, chunk_state + start, best_state)
-
-        assignments = state_values[best_state]
-        trit_values = [
-            assignments[..., index].to(torch.int8) for index in range(planes)
-        ]
-
-        for index in range(planes):
-            residual_without = grouped_master.clone()
-            for other, (other_trits, other_scale) in enumerate(
-                zip(trit_values, scale_values)
-            ):
-                if other != index:
-                    residual_without -= (
-                        other_trits.to(torch.float64) * other_scale.unsqueeze(-1)
-                    )
-            trits_f64 = trit_values[index].to(torch.float64)
-            denominator = (trits_f64.square() * grouped_diagonal).sum(dim=2)
-            numerator = (residual_without * trits_f64 * grouped_diagonal).sum(dim=2)
-            scale_values[index] = torch.where(
-                denominator > 0,
-                numerator / denominator.clamp_min(torch.finfo(torch.float64).tiny),
-                torch.zeros_like(numerator),
-            ).clamp_min(0)
-
-        if all(
-            torch.equal(previous, updated)
-            for previous, updated in zip(previous_trits, trit_values)
-        ):
-            break
+        for plane in range(planes):
+            grouped_trits[plane][:, group, :] = torch.tensor(
+                plane_trits[plane], dtype=torch.int8
+            )
+            grouped_scales[plane][:, group] = torch.tensor(
+                [scales[plane] for scales in row_scales], dtype=torch.float16
+            )
 
     fitted_planes = [
         TernaryPlane(
-            trits=trits.reshape_as(master),
-            scales=scale.to(torch.float16),
+            trits=trits.reshape_as(master_cpu),
+            scales=scales,
             group_size=group_size,
         )
-        for trits, scale in zip(trit_values, scale_values)
+        for trits, scales in zip(grouped_trits, grouped_scales)
     ]
-    decoded = torch.zeros_like(master_f64)
-    for plane in fitted_planes:
-        stored_scale_f64 = expand_plane_scales(
-            plane.scales,
-            rows=master.shape[0],
-            columns=master.shape[1],
-            group_size=group_size,
-        ).to(torch.float64)
-        decoded = decoded + plane.trits.to(torch.float64) * stored_scale_f64
-    dense = torch.zeros_like(master, device="cpu")
+    dense = torch.zeros_like(master_cpu)
     for plane in fitted_planes:
         dense = dense + plane.trits.to(master.dtype) * expand_plane_scales(
             plane.scales,
@@ -2507,13 +2392,13 @@ def _joint_additive_projection(
 
 
 def _joint_algorithm_id(planes: int) -> str:
-    return f"tritium.joint-additive-{planes}@2"
+    return f"tritium.salt-v2-joint-diagonal-catq-relays-{planes}@1"
 
 
 def _adaptive_joint_algorithm_id() -> str:
     """Identity for measured weight-level rate-distortion allocation."""
 
-    return "tritium.joint-additive-adaptive@2"
+    return "tritium.salt-v2-joint-diagonal-catq-relays-adaptive@1"
 
 
 def _fit_module(
