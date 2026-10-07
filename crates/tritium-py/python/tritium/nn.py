@@ -331,14 +331,8 @@ class AdditiveTernaryWeight(nn.Module):
         columns = torch.arange(self.in_features, device=indices.device)
         group_ids = columns // self.group_size
         powers = torch.tensor((1, 3, 9, 27, 81), device=indices.device)
-        output = torch.empty(
-            (flat_indices.numel(), self.in_features),
-            dtype=dtype,
-            device=indices.device,
-        )
-        for start in range(0, flat_indices.numel(), rows_per_chunk):
-            end = min(start + rows_per_chunk, flat_indices.numel())
-            selected_rows = flat_indices[start:end]
+
+        def decode_rows(selected_rows: torch.Tensor) -> torch.Tensor:
             positions = selected_rows.unsqueeze(1) * self.in_features + columns
             chunk = None
             for plane_index in range(self.plane_count):
@@ -360,7 +354,26 @@ class AdditiveTernaryWeight(nn.Module):
                 expanded_scales = scales.index_select(1, group_ids).to(dtype=dtype)
                 plane = trits * expanded_scales
                 chunk = plane if chunk is None else chunk + plane
-            output[start:end].copy_(chunk)
+            assert chunk is not None
+            return chunk
+
+        # torch.export (used by the Dynamo ONNX exporter) cannot prove that a
+        # dynamically sliced output and its independently gathered chunk have
+        # identical symbolic lengths. Decode the requested rows as one
+        # functional tensor during graph capture; eager execution keeps the
+        # bounded-memory chunked path below.
+        if torch.compiler.is_compiling():
+            return decode_rows(flat_indices).reshape(*indices.shape, self.in_features)
+
+        output = torch.empty(
+            (flat_indices.numel(), self.in_features),
+            dtype=dtype,
+            device=indices.device,
+        )
+        for start in range(0, flat_indices.numel(), rows_per_chunk):
+            end = min(start + rows_per_chunk, flat_indices.numel())
+            selected_rows = flat_indices[start:end]
+            output[start:end].copy_(decode_rows(selected_rows))
         return output.reshape(*indices.shape, self.in_features)
 
     def trit_counts(self) -> tuple[tuple[int, int, int], ...]:

@@ -183,6 +183,39 @@ def test_packed_embedding_lookup_matches_dense_reference_without_full_decode(
             embedding(torch.tensor([7], dtype=index_dtype, device=device))
 
 
+def test_packed_embedding_export_handles_dynamic_sequences_across_chunk_boundary():
+    trits = torch.arange(7 * 576, dtype=torch.int8).reshape(7, 576).remainder(3) - 1
+    scales = torch.ones((7, 1), dtype=torch.float32)
+    packed = AdditiveTernaryWeight(
+        [
+            SimpleNamespace(trits=trits, scales=scales, group_size=576)
+            for _ in range(3)
+        ]
+    )
+    embedding = AdditiveTernaryEmbedding(packed).eval()
+    tokens = torch.tensor([[1, 2, 3], [3, 2, 1]], dtype=torch.int64)
+    tokens = tokens.transpose(0, 1).contiguous()
+    exported = torch.export.export(
+        embedding,
+        (tokens,),
+        dynamic_shapes=(
+            {
+                0: torch.export.Dim("batch", min=1),
+                1: torch.export.Dim("sequence", min=1),
+            },
+        ),
+        strict=False,
+    )
+
+    for replay in (
+        torch.arange(2 * 9, dtype=torch.int64).reshape(2, 9).remainder(7),
+        torch.arange(600, dtype=torch.int64).reshape(1, 600).remainder(7),
+    ):
+        torch.testing.assert_close(
+            exported.module()(replay), embedding(replay), rtol=0, atol=0
+        )
+
+
 @pytest.mark.parametrize(
     "device",
     [
