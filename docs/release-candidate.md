@@ -1858,3 +1858,28 @@ The ONNX test used an isolated Python 3.14 environment with the CI-pinned
 `onnx==1.22.0`, `onnxruntime==1.27.0`, and `onnxscript==0.7.1`, while reusing
 the host's PyTorch installation. These are small-model software checks; they
 do not establish flagship quality, hardware performance, or release readiness.
+
+### Portable web package source build and archive — 2026-10-07
+
+At clean source revision `09f2e9021fca33163f98d33bb3cee45057203c21`,
+`packages/tritium-web` passed its complete local check in a detached worktree:
+
+```text
+npm run check
+generated-file checks: passed
+wasm32-unknown-unknown release build and wasm-bindgen: passed
+strict TypeScript: passed
+Node tests: 145 passed, 0 failed, 0 skipped
+source-free npm archive verification: passed
+```
+
+The durable output is `/mnt/2tb/tritium-release-evidence/npm-web-09f2e902/`:
+`npm-archive-receipt.json` has receipt ID
+`sha256:09826a94ef97a870cdd48b5eb5efb909a0c06ec99ed877536e3b1497e70bef2d`,
+and binds the 627,707-byte `tritium-ai-web-1.1.0-rc.2.tgz` with SHA-256
+`7a852ad0ca43d5998c0aeb3d9686ff0ec4b0a602261e13c2599d0c808959de47`.
+The SBOM is `tritium-web-node22.cdx.json`. The build used Node 24.21.0/npm
+12.0.2 and the upstream checksum-verified `wasm-bindgen 0.2.126` Linux binary.
+This qualifies the local source-free package path only; it is not physical
+Chrome/Firefox/Safari WebGPU evidence, a browser performance result, or
+candidate-registry admission.
