@@ -982,21 +982,26 @@ fn optimize_start(
         }
 
         let assignment = assignment_for_metric(weights, &state.scales, metric)?;
-        let (assignment_reconstruction, assignment_objective) =
-            reconstruct_planes_and_objective(weights, &state.scales, &assignment, metric)?;
-        if assignment_objective < state.objective {
-            let objective_before = state.objective;
-            state.trits = assignment;
-            state.reconstruction = assignment_reconstruction;
-            state.objective = assignment_objective;
-            state.accepted_objectives.push(assignment_objective);
-            state.receipt.accepted_updates.push(JointFitUpdateReceipt {
-                iteration,
-                phase: JointFitUpdatePhase::Assignment,
-                objective_before,
-                objective_after: assignment_objective,
-            });
-            improved = true;
+        // The current reconstruction/objective already correspond to these exact
+        // scales and trits. In the common converged case, avoid rebuilding and
+        // rescoring the full row just to rediscover the same state.
+        if assignment != state.trits {
+            let (assignment_reconstruction, assignment_objective) =
+                reconstruct_planes_and_objective(weights, &state.scales, &assignment, metric)?;
+            if assignment_objective < state.objective {
+                let objective_before = state.objective;
+                state.trits = assignment;
+                state.reconstruction = assignment_reconstruction;
+                state.objective = assignment_objective;
+                state.accepted_objectives.push(assignment_objective);
+                state.receipt.accepted_updates.push(JointFitUpdateReceipt {
+                    iteration,
+                    phase: JointFitUpdatePhase::Assignment,
+                    objective_before,
+                    objective_after: assignment_objective,
+                });
+                improved = true;
+            }
         }
         if !improved {
             break;
