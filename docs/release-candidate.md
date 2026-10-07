@@ -536,6 +536,26 @@ has no terminal result yet. Therefore the previously observed SmolLM2 exporter
 failure is not yet confirmed fixed by the exact candidate-wheel gate. This
 source-tree evidence does not qualify the release candidate.
 
+### Large flattened-index ONNX parity repair (2026-10-07)
+
+Commit `41dc1f4c` replaces `torch.div(..., rounding_mode="floor")` in packed
+row decoding with integer `torch.floor_divide`. ONNX had lowered the former to
+float32 divide/floor; flattened positions above 2^24 could therefore select
+incorrect packed-byte indices in large linear layers. The regression test
+crosses the first affected index and checks exported ONNX output against eager
+execution. The `test_module_onnx.py` suite passed (8 tests), as did the related
+dynamic-sequence embedding export test and `git diff --check`.
+
+Exact-revision hosted wheel workflow `37572547065` completed successfully.
+Its pinned SmolLM2-1.7B CPU PTQ/QAT tutorial step passed against revision
+`41dc1f4c`, including the ONNX replay/parity gate; Linux, macOS, and Windows
+wheel builds, the installed-wheel Torch test, source-free tutorial, and the
+abi3 matrix also passed. The tutorial evidence artifact was uploaded as
+`smollm2-cpu-tutorial` (artifact `11461188114`, 1,298,452,082 bytes). At this
+recording, Rust CodeQL remained in progress. CUDA, ROCm, Metal, wgpu, real-model
+serving, and performance lanes were skipped by runner policy, so this does not
+close those release gates or qualify the flagship Qwen artifact.
+
 The restart seed now also controls the actual initial scale vector: a
 domain-separated BLAKE3 derivation binds each initial scale to the frozen spec,
 parent package, seed, tensor, tile, plane, and scale-group index. The synthetic
