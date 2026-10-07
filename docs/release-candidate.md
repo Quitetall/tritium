@@ -432,9 +432,14 @@ The user selected the immutable-child-package path for sliding-window scale
 updates. The existing `TSQ36RC v1` path is the required replay/lineage mechanism;
 the base `TSQ36EX v1` stays final-logit-only, and child scope evidence must not
 be mislabeled as a `TSQ36SB` binding. This decision resolves the lineage choice,
-not the B3 optimizer: deterministic per-window candidate generation, frozen
-objective scoring/selection, child materialization from selected updates, and
-fresh replay admission are still open. No full Qwen campaign or paid compute is
+not the B3 optimizer. Local fixture checks on 2026-10-07 passed: the output
+reconstruction suite (22 tests) covers bounded activation-window reads,
+fixed-trit scale fitting, candidate identity, and restart selection; the focused
+Qwen admission fixture (1 test) covers immutable child materialization and fresh
+child replay. These are CPU fixtures, not Qwen quality or hardware evidence.
+Production B3 remains open: deterministic per-window candidate generation,
+frozen-objective scoring/selection, and joining the selected fitted updates to
+the existing child replay path. No full Qwen campaign or paid compute is
 authorized by this decision.
 
 ### Flagship campaign status refresh (2026-10-04)
