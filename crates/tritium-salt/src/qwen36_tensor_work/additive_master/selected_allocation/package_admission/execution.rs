@@ -705,6 +705,89 @@ impl<'admission, 'allocated, 'parent, 'store, 'source>
             .map_err(Qwen36ScaleRefitWindowError::Admission)
     }
 
+    /// Observe every frozen scheduled block window that contains one projection.
+    ///
+    /// Token windows are supplied in increasing, non-overlapping order and must
+    /// match the spec's frozen batch count. Windows are streamed one at a time;
+    /// each admitted scope is reopened and checked by
+    /// [`Self::observe_scale_refit_scope`]. Final-logit scopes are deliberately
+    /// excluded because they are scored by the output-reconstruction receipt,
+    /// not used as layer-local scale-fit observations.
+    ///
+    /// The builder is incremental. If any observation fails, the caller must
+    /// discard it rather than finish or publish a partial candidate.
+    ///
+    /// # Errors
+    /// Rejects malformed batch schedules, absent projection scopes, changed
+    /// admission, mismatched identities, or invalid activation/output data.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn observe_scale_refit_scheduled_windows<
+        S: OutputReconstructionActivationSource + ?Sized,
+    >(
+        &self,
+        parent_execution: &Qwen36AdmittedExecutionReceipt,
+        spec: &OutputReconstructionSpec,
+        activation_source: &S,
+        token_windows: &[(u64, u64)],
+        max_decoded_bytes: u64,
+        tensor_name: &str,
+        teacher: &Projection,
+        builder: &mut FixedTritScaleUpdateCandidateBuilder<'_>,
+    ) -> Result<(), Qwen36ScaleRefitWindowError> {
+        if token_windows.len() != usize::try_from(spec.batches_per_scope()).unwrap_or(usize::MAX) {
+            return Err(Qwen36ScaleRefitWindowError::Fit(
+                OutputReconstructionError::InvalidCount,
+            ));
+        }
+        let mut previous_end = None;
+        for &(token_start, token_count) in token_windows {
+            let Some(token_end) = token_start.checked_add(token_count) else {
+                return Err(Qwen36ScaleRefitWindowError::Fit(
+                    OutputReconstructionError::InvalidGeometry,
+                ));
+            };
+            if token_count == 0 || previous_end.is_some_and(|end| token_start < end) {
+                return Err(Qwen36ScaleRefitWindowError::Fit(
+                    OutputReconstructionError::InvalidGeometry,
+                ));
+            }
+            previous_end = Some(token_end);
+        }
+
+        let layer_index = qwen_language_projection_layer(tensor_name)
+            .ok_or(Qwen36ScaleRefitWindowError::InvalidTensorName)?;
+        let mut observed_scope = false;
+        for &scope in spec.scopes() {
+            let OutputReconstructionScope::Block { start, end } = scope else {
+                continue;
+            };
+            if layer_index < start || layer_index >= end {
+                continue;
+            }
+            observed_scope = true;
+            for &(token_start, token_count) in token_windows {
+                self.observe_scale_refit_scope(
+                    parent_execution,
+                    spec,
+                    activation_source,
+                    scope,
+                    token_start,
+                    token_count,
+                    max_decoded_bytes,
+                    tensor_name,
+                    teacher,
+                    builder,
+                )?;
+            }
+        }
+        if !observed_scope {
+            return Err(Qwen36ScaleRefitWindowError::Fit(
+                OutputReconstructionError::InvalidActivationWindowScope,
+            ));
+        }
+        Ok(())
+    }
+
     /// Freshly replay and admit an immutable scale-refined child of this exact
     /// campaign package. The supplied scope batches are executed once for final
     /// logits and again for the frozen output-reconstruction scopes; both passes

@@ -2674,7 +2674,7 @@ mod tests {
         ActivationCache, ActivationCacheBuilder, ActivationCacheSpec, ActivationChunk,
         ActivationDType, ActivationDigest, ByteDelta, FixedTritScaleUpdateCandidateBuilder,
         NestedProfileBudgets, OutputCandidateReceipt, OutputObjectiveWeights,
-        OutputReconstructionAccumulator, OutputReconstructionReceipt,
+        OutputReconstructionAccumulator, OutputReconstructionError, OutputReconstructionReceipt,
         OutputReconstructionScaleCandidate, OutputReconstructionSchedule,
         OutputReconstructionScope, OutputReconstructionSpec, PhysicalBytes, ProfileBudget,
         Qwen35SourceDtype, Qwen35TensorRole, Qwen35TensorScope, SaltV2Profile,
@@ -3860,14 +3860,42 @@ mod tests {
                 })
                 .unwrap();
             fit_parent.verify_unchanged().unwrap();
-            session
-                .observe_scale_refit_scope(
+            assert!(matches!(
+                session.observe_scale_refit_scheduled_windows(
                     &receipt,
                     &refined_spec,
                     activation_caches.as_slice(),
-                    OutputReconstructionScope::Block { start: 0, end: 2 },
-                    0,
-                    3,
+                    &[(0, 3)],
+                    1 << 20,
+                    projection_name,
+                    &teacher,
+                    &mut fit_builder,
+                ),
+                Err(Qwen36ScaleRefitWindowError::Fit(
+                    OutputReconstructionError::InvalidCount
+                ))
+            ));
+            assert!(matches!(
+                session.observe_scale_refit_scheduled_windows(
+                    &receipt,
+                    &refined_spec,
+                    activation_caches.as_slice(),
+                    &[(0, 2), (1, 2)],
+                    1 << 20,
+                    projection_name,
+                    &teacher,
+                    &mut fit_builder,
+                ),
+                Err(Qwen36ScaleRefitWindowError::Fit(
+                    OutputReconstructionError::InvalidGeometry
+                ))
+            ));
+            session
+                .observe_scale_refit_scheduled_windows(
+                    &receipt,
+                    &refined_spec,
+                    activation_caches.as_slice(),
+                    &[(0, 2), (2, 1)],
                     1 << 20,
                     projection_name,
                     &teacher,
