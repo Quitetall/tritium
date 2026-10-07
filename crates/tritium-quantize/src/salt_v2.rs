@@ -578,25 +578,85 @@ pub fn exact_ternary_assignment(
 
     const CODES: [i8; 3] = [0, -1, 1];
     let states = 3_usize.pow(scales.len() as u32);
+    let mut codebook = Vec::with_capacity(states);
+    for state in 0..states {
+        let mut encoded = state;
+        let mut reconstruction = 0.0_f32;
+        let mut candidate = [0_i8; 3];
+        for plane in 0..scales.len() {
+            let trit = CODES[encoded % 3];
+            encoded /= 3;
+            candidate[plane] = trit;
+            reconstruction += scales[plane] * f32::from(trit);
+        }
+        codebook.push((reconstruction, candidate, state));
+    }
+    codebook.sort_by(|left, right| {
+        left.0
+            .total_cmp(&right.0)
+            .then_with(|| left.2.cmp(&right.2))
+    });
+    let max_reconstruction = codebook
+        .iter()
+        .map(|entry| entry.0.abs())
+        .fold(0.0_f32, f32::max);
+    let min_reconstruction_gap = codebook
+        .windows(2)
+        .filter_map(|pair| {
+            let gap = f64::from(pair[1].0) - f64::from(pair[0].0);
+            (gap > 0.0).then_some(gap)
+        })
+        .fold(f64::INFINITY, f64::min);
+
     let mut trits = vec![vec![0_i8; weights.len()]; scales.len()];
     for (weight_index, &weight) in weights.iter().enumerate() {
         let mut best_error = f64::INFINITY;
         let mut best_codes = [0_i8; 3];
-        for state in 0..states {
-            let mut encoded = state;
-            let mut reconstruction = 0.0_f32;
-            let mut candidate = [0_i8; 3];
-            for plane in 0..scales.len() {
-                let trit = CODES[encoded % 3];
-                encoded /= 3;
-                candidate[plane] = trit;
-                reconstruction += scales[plane] * f32::from(trit);
+        let mut best_state = usize::MAX;
+        // At extreme dynamic ranges, distinct f32 reconstructions can collapse
+        // to the same f64 squared error. Preserve the original first-state tie
+        // behavior there; ordinary values use the exact nearest-code fast path.
+        let ill_conditioned = !weight.is_finite()
+            || !max_reconstruction.is_finite()
+            || f64::from(weight.abs()) > f64::from(max_reconstruction.max(1.0)) * 67_108_864.0
+            || min_reconstruction_gap
+                <= (f64::from(weight.abs()) + f64::from(max_reconstruction)) * (1.0 / 67_108_864.0);
+        if ill_conditioned {
+            for &(reconstruction, candidate, state) in &codebook {
+                let error = f64::from(weight) - f64::from(reconstruction);
+                let squared = error * error;
+                if squared < best_error || (squared == best_error && state < best_state) {
+                    best_error = squared;
+                    best_codes = candidate;
+                    best_state = state;
+                }
             }
+            for plane in 0..scales.len() {
+                trits[plane][weight_index] = best_codes[plane];
+            }
+            continue;
+        }
+        let insertion = codebook.partition_point(|entry| entry.0.total_cmp(&weight).is_lt());
+        let mut candidates = [usize::MAX; 2];
+        let mut candidate_count = 0;
+        if insertion < codebook.len() {
+            candidates[candidate_count] = insertion;
+            candidate_count += 1;
+        }
+        if insertion > 0 {
+            let lower_value = codebook[insertion - 1].0;
+            candidates[candidate_count] =
+                codebook.partition_point(|entry| entry.0.total_cmp(&lower_value).is_lt());
+            candidate_count += 1;
+        }
+        for &candidate_index in &candidates[..candidate_count] {
+            let (reconstruction, candidate, state) = codebook[candidate_index];
             let error = f64::from(weight) - f64::from(reconstruction);
             let squared = error * error;
-            if squared < best_error {
+            if squared < best_error || (squared == best_error && state < best_state) {
                 best_error = squared;
                 best_codes = candidate;
+                best_state = state;
             }
         }
         for plane in 0..scales.len() {
@@ -1413,28 +1473,28 @@ fn metric_objective(
     reconstruction: &[f32],
     metric: JointFitMetric<'_>,
 ) -> Result<f64, JointFitError> {
-    let error: Vec<f64> = weights
-        .iter()
-        .zip(reconstruction)
-        .map(|(weight, fitted)| f64::from(*weight) - f64::from(*fitted))
-        .collect();
     let mut objective = 0.0_f64;
     match metric {
         JointFitMetric::Identity => {
-            for value in error {
+            for (&weight, &fitted) in weights.iter().zip(reconstruction) {
+                let value = f64::from(weight) - f64::from(fitted);
                 accumulate_objective_term(&mut objective, value * value)?;
             }
         }
         JointFitMetric::Diagonal(diagonal) => {
-            for (value, weight) in error.iter().zip(diagonal) {
+            for ((&weight, &fitted), curvature) in weights.iter().zip(reconstruction).zip(diagonal)
+            {
+                let value = f64::from(weight) - f64::from(fitted);
                 let squared = value * value;
-                accumulate_objective_term(&mut objective, squared * f64::from(*weight))?;
+                accumulate_objective_term(&mut objective, squared * f64::from(*curvature))?;
             }
         }
         JointFitMetric::DiagonalF64(diagonal) => {
-            for (value, weight) in error.iter().zip(diagonal) {
+            for ((&weight, &fitted), curvature) in weights.iter().zip(reconstruction).zip(diagonal)
+            {
+                let value = f64::from(weight) - f64::from(fitted);
                 let squared = value * value;
-                accumulate_objective_term(&mut objective, squared * *weight)?;
+                accumulate_objective_term(&mut objective, squared * *curvature)?;
             }
         }
         JointFitMetric::DiagonalAffine {
@@ -1442,12 +1502,19 @@ fn metric_objective(
             scale,
             shift,
         } => {
-            for (value, weight) in error.iter().zip(diagonal) {
+            for ((&weight, &fitted), curvature) in weights.iter().zip(reconstruction).zip(diagonal)
+            {
+                let value = f64::from(weight) - f64::from(fitted);
                 let squared = value * value;
-                accumulate_objective_term(&mut objective, squared * (*weight * scale + shift))?;
+                accumulate_objective_term(&mut objective, squared * (*curvature * scale + shift))?;
             }
         }
         JointFitMetric::Dense(dense) => {
+            let error: Vec<f64> = weights
+                .iter()
+                .zip(reconstruction)
+                .map(|(weight, fitted)| f64::from(*weight) - f64::from(*fitted))
+                .collect();
             for row in 0..dense.dimension {
                 for col in 0..dense.dimension {
                     let weighted = error[row] * dense.values[row * dense.dimension + col];
@@ -1894,6 +1961,58 @@ mod tests {
         }
 
         assert_eq!(got_error.to_bits(), oracle_error.to_bits());
+    }
+
+    #[test]
+    fn exact_assignment_preserves_exhaustive_codes_and_tie_order() {
+        fn reference(weights: &[f32], scales: &[f32]) -> Vec<Vec<i8>> {
+            const CODES: [i8; 3] = [0, -1, 1];
+            let states = 3_usize.pow(scales.len() as u32);
+            let mut trits = vec![vec![0_i8; weights.len()]; scales.len()];
+            for (weight_index, &weight) in weights.iter().enumerate() {
+                let mut best_error = f64::INFINITY;
+                let mut best_codes = [0_i8; 3];
+                for state in 0..states {
+                    let mut encoded = state;
+                    let mut reconstruction = 0.0_f32;
+                    let mut candidate = [0_i8; 3];
+                    for plane in 0..scales.len() {
+                        let trit = CODES[encoded % 3];
+                        encoded /= 3;
+                        candidate[plane] = trit;
+                        reconstruction += scales[plane] * f32::from(trit);
+                    }
+                    let error = f64::from(weight) - f64::from(reconstruction);
+                    let squared = error * error;
+                    if squared < best_error {
+                        best_error = squared;
+                        best_codes = candidate;
+                    }
+                }
+                for plane in 0..scales.len() {
+                    trits[plane][weight_index] = best_codes[plane];
+                }
+            }
+            trits
+        }
+
+        let weights = [-3.0_f32, -1.0, -0.5, 0.0, 0.5, 1.0, 3.0, f32::MAX];
+        let cases: &[&[f32]] = &[
+            &[1.0],
+            &[1.0, 0.5],
+            &[1.0, 1.0],
+            &[1.0, 0.5, 0.25],
+            &[0.0, 0.0, 0.0],
+            &[f32::MAX, f32::MAX, f32::MAX],
+            &[1.0e30, 1.0e30, f32::from_bits(1)],
+        ];
+        for scales in cases {
+            assert_eq!(
+                exact_ternary_assignment(&weights, scales).expect("valid assignment"),
+                reference(&weights, scales),
+                "scale set {scales:?}",
+            );
+        }
     }
 
     #[test]
