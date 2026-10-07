@@ -377,6 +377,20 @@ pub struct Qwen35DeltaNet {
 struct MixerIdentity;
 
 impl Qwen35DeltaNet {
+    #[allow(dead_code)] // Consumed by the B3 bounded projection-window adapter.
+    pub(crate) fn projection(&self, name: &str) -> Result<&Projection, NnError> {
+        match name {
+            "linear_attn.in_proj_qkv.weight" => Ok(&self.weights.qkv_proj),
+            "linear_attn.in_proj_z.weight" => Ok(&self.weights.z_proj),
+            "linear_attn.in_proj_b.weight" => Ok(&self.weights.b_proj),
+            "linear_attn.in_proj_a.weight" => Ok(&self.weights.a_proj),
+            "linear_attn.out_proj.weight" => Ok(&self.weights.out_proj),
+            _ => Err(NnError::MissingTensor(format!(
+                "unknown Qwen DeltaNet projection `{name}`"
+            ))),
+        }
+    }
+
     /// Replace one named projection without changing this mixer's validated geometry.
     #[allow(dead_code)] // Used by the crate-internal paired Qwen measurement path.
     pub(crate) fn replace_projection(

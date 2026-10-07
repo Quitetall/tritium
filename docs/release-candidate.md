@@ -449,6 +449,16 @@ deterministic per-window candidates must be scored and selected against the froz
 objective; selected updates must then be joined to child materialization and exact
 replay. No full Qwen campaign or paid compute is authorized by this decision.
 
+On 2026-10-06, an internal Qwen adapter seam was added to recompute any canonical
+language projection over a bounded, caller-supplied activation window. It resolves
+MLP, DeltaNet, and full-attention projection names and emits finite checked outputs
+synchronously, without retaining model histories. A loaded SALT V2 fixture test
+exercised the seam and passed; targeted `tritium-nn` Clippy with warnings denied
+also passed. This supplies current-package projection outputs only: dense teacher
+projection capture, exact parent trit/scale streaming, sliding-window/restart
+orchestration, candidate scoring/selection, child materialization, and exact child
+replay remain unconnected. No real model or campaign was run.
+
 ### Flagship campaign status refresh (2026-10-04)
 
 The canonical read-only probe was rerun against the durable workspace

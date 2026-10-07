@@ -307,6 +307,19 @@ pub struct Qwen35FullAttention {
 struct MixerIdentity;
 
 impl Qwen35FullAttention {
+    #[allow(dead_code)] // Consumed by the B3 bounded projection-window adapter.
+    pub(crate) fn projection(&self, name: &str) -> Result<&Projection, NnError> {
+        match name {
+            "self_attn.q_proj.weight" => Ok(&self.weights.q_proj),
+            "self_attn.k_proj.weight" => Ok(&self.weights.k_proj),
+            "self_attn.v_proj.weight" => Ok(&self.weights.v_proj),
+            "self_attn.o_proj.weight" => Ok(&self.weights.o_proj),
+            _ => Err(NnError::MissingTensor(format!(
+                "unknown Qwen full-attention projection `{name}`"
+            ))),
+        }
+    }
+
     /// Replace one named projection without changing this mixer's validated geometry.
     #[allow(dead_code)] // Used by the crate-internal paired Qwen measurement path.
     pub(crate) fn replace_projection(

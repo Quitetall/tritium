@@ -1806,6 +1806,16 @@ mod tests {
 
         let probe_name = "model.language_model.layers.0.mlp.gate_proj.weight";
         assert!(schema.contains_key(probe_name));
+        let mut projected_rows = 0;
+        model
+            .runner()
+            .visit_named_projection_outputs(probe_name, &[1.0; 4], 1, |output| {
+                assert_eq!(output.len(), 6);
+                assert!(output.iter().all(|value| *value == 0.0));
+                projected_rows += 1;
+            })
+            .unwrap();
+        assert_eq!(projected_rows, 1);
         let mut probe_package = SaltV2PackageReader::new_strict(
             File::open(files.directory.join("compact.tsalt2")).unwrap(),
         )

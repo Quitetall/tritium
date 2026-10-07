@@ -106,6 +106,14 @@ enum Qwen35TextMixer {
 }
 
 impl Qwen35TextMixer {
+    #[allow(dead_code)] // Consumed by the B3 bounded projection-window adapter.
+    fn projection(&self, name: &str) -> Result<&Projection, NnError> {
+        match self {
+            Self::DeltaNet(layer) => layer.projection(name),
+            Self::FullAttention(layer) => layer.projection(name),
+        }
+    }
+
     const fn kind(&self) -> Qwen35LayerType {
         match self {
             Self::DeltaNet(_) => Qwen35LayerType::DeltaNet,
@@ -474,6 +482,93 @@ fn replace_projection_slot(
 }
 
 impl Qwen35TextRunner {
+    /// Recompute one named projection over a bounded row-major activation window.
+    ///
+    /// This measurement seam lets PTQ compare the exact deployed projection
+    /// against teacher outputs computed from the original dense checkpoint,
+    /// without retaining a full-model activation history. `observer` runs
+    /// synchronously with one owned output window; it must not treat this local
+    /// projection result as model-quality or release evidence by itself.
+    #[allow(dead_code)] // Consumed by the B3 candidate-builder adapter.
+    pub(crate) fn visit_named_projection_outputs(
+        &self,
+        tensor_name: &str,
+        activations: &[f32],
+        rows: usize,
+        mut observer: impl FnMut(&[f32]),
+    ) -> Result<(), NnError> {
+        if rows == 0 {
+            return Err(NnError::Shape {
+                expected: 1,
+                got: 0,
+            });
+        }
+        let projection = self.named_projection(tensor_name)?;
+        let input_count = rows.checked_mul(projection.k_in()).ok_or(NnError::Shape {
+            expected: usize::MAX,
+            got: activations.len(),
+        })?;
+        let output_count = rows.checked_mul(projection.n_out()).ok_or(NnError::Shape {
+            expected: usize::MAX,
+            got: rows,
+        })?;
+        if activations.len() != input_count {
+            return Err(NnError::Shape {
+                expected: input_count,
+                got: activations.len(),
+            });
+        }
+        if activations.iter().any(|value| !value.is_finite()) {
+            return Err(NnError::Backend(
+                "Qwen projection input contains a non-finite value".to_owned(),
+            ));
+        }
+        let mut outputs = Vec::new();
+        outputs.try_reserve_exact(output_count).map_err(|error| {
+            NnError::Backend(format!("allocate Qwen projection output window: {error}"))
+        })?;
+        outputs.resize(output_count, 0.0);
+        projection.forward(self.backend.as_ref(), activations, rows, &mut outputs)?;
+        if outputs.iter().any(|value| !value.is_finite()) {
+            return Err(NnError::Backend(
+                "Qwen projection output contains a non-finite value".to_owned(),
+            ));
+        }
+        observer(&outputs);
+        Ok(())
+    }
+
+    #[allow(dead_code)] // Consumed by the B3 candidate-builder adapter.
+    fn named_projection(&self, tensor_name: &str) -> Result<&Projection, NnError> {
+        let layer_path = tensor_name
+            .strip_prefix("model.language_model.layers.")
+            .ok_or_else(|| NnError::MissingTensor(tensor_name.to_owned()))?;
+        let (index_text, projection_name) = layer_path
+            .split_once('.')
+            .ok_or_else(|| NnError::MissingTensor(tensor_name.to_owned()))?;
+        let index = index_text
+            .parse::<usize>()
+            .map_err(|_| NnError::MissingTensor(tensor_name.to_owned()))?;
+        if index.to_string() != index_text {
+            return Err(NnError::MissingTensor(tensor_name.to_owned()));
+        }
+        let layer = self
+            .layers
+            .get(index)
+            .ok_or_else(|| NnError::MissingTensor(tensor_name.to_owned()))?;
+        match projection_name {
+            "mlp.gate_proj.weight" => Ok(&layer.mlp.gate),
+            "mlp.up_proj.weight" => Ok(&layer.mlp.up),
+            "mlp.down_proj.weight" => Ok(&layer.mlp.down),
+            _ if projection_name.starts_with("linear_attn.")
+                || projection_name.starts_with("self_attn.") =>
+            {
+                layer.mixer.projection(projection_name)
+            }
+            _ => Err(NnError::MissingTensor(tensor_name.to_owned())),
+        }
+    }
+
     /// Temporarily replace one canonical language projection while executing a
     /// paired measurement. The dense projection is restored on normal return,
     /// error, and panic unwind. The model is single-threaded during the callback.
