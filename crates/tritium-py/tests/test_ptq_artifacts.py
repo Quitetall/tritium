@@ -723,20 +723,20 @@ def test_live_module_fit_consumes_bound_curvature_and_rejects_source_drift(tmp_p
     assert resumed == result
     assert result.artifact_dir == work_dir.resolve()
     assert result.evidence_id == receipt.evidence_id
-    assert result.algorithm_id == "tritium.joint-additive-3@1"
+    assert result.algorithm_id == "tritium.joint-additive-3@2"
     assert result.recipe_id.startswith("sha256:")
     assert result.config == prepared.config
     assert result.coverage == prepared.coverage
     fitted = result.weight("weight")
     assert result.weight_names == ("weight",)
     assert len(fitted.planes) == 3
-    assert fitted.weighted_mse == pytest.approx(7.7390429e-8)
+    assert fitted.weighted_mse == pytest.approx(1.1470232e-7)
     assert fitted.planes[0].trits[0].tolist() == [1, 0, 0]
-    assert fitted.planes[0].scales[0].item() == 0.7001953125
-    assert fitted.planes[1].trits[0].tolist() == [1, -1, 0]
-    assert fitted.planes[1].scales[0].item() == 0.300048828125
-    assert fitted.planes[2].trits[0].tolist() == [0, -1, 1]
-    assert fitted.planes[2].scales[0].item() == 0.0999755859375
+    assert fitted.planes[0].scales[0].item() == 1.0
+    assert fitted.planes[1].trits[0].tolist() == [0, -1, 1]
+    assert fitted.planes[1].scales[0].item() == 0.2496337890625
+    assert fitted.planes[2].trits[0].tolist() == [0, -1, -1]
+    assert fitted.planes[2].scales[0].item() == 0.14990234375
     for plane in fitted.planes:
         assert set(plane.trits.unique().tolist()) <= {-1, 0, 1}
         assert torch.isfinite(plane.scales).all()
@@ -764,7 +764,7 @@ def test_live_module_fit_consumes_bound_curvature_and_rejects_source_drift(tmp_p
     adaptive_result = convert(
         rate_limited, receipt, work_dir=tmp_path / "rate-work"
     )
-    assert adaptive_result.algorithm_id == "tritium.joint-additive-adaptive@1"
+    assert adaptive_result.algorithm_id == "tritium.joint-additive-adaptive@2"
     assert adaptive_result.achieved_bpw <= 2.0
     assert len(adaptive_result.weight("weight").planes) == 1
     assert load_quantized_module(model, adaptive_result)(
@@ -923,6 +923,45 @@ def test_live_module_convert_uses_joint_additive_trit_assignment(tmp_path):
         and (plane.scales >= 0).all()
         for plane in fitted.planes
     )
+
+
+def test_live_module_convert_matches_exhaustive_single_plane_group_optimum(tmp_path):
+    weight = torch.tensor(
+        [[-0.021139266, -1.6771822, 2.070698, 0.78463697]], dtype=torch.float32
+    )
+    curvature = torch.tensor(
+        [1.9608706, 3.7671776, 1.9031862, 2.4522407], dtype=torch.float32
+    )
+    model = torch.nn.Linear(4, 1, bias=False)
+    with torch.no_grad():
+        model.weight.copy_(weight)
+    config = TernaryConfig(
+        mode="ptq",
+        estimator="salt-v2",
+        target_modules=("Linear",),
+        planes=1,
+        profile="compact-v1",
+        target_bpw=None,
+    )
+    prepared = prepare(model, config, inplace=False)
+    calibration = calibrate(
+        prepared,
+        [curvature.sqrt().unsqueeze(0)],
+        evidence_dir=tmp_path / "single-plane-oracle-evidence",
+    )
+
+    result = convert(
+        prepared,
+        calibration,
+        work_dir=tmp_path / "single-plane-oracle-work",
+    )
+
+    fitted = result.weight("weight")
+    # Independent enumeration of all 3^4 trit vectors, each with its optimal
+    # nonnegative scale, gives this stored-f16 weighted error and code.
+    assert fitted.planes[0].trits[0].tolist() == [0, -1, 1, 0]
+    assert fitted.planes[0].scales[0].item() == 1.8095703125
+    assert fitted.weighted_mse == pytest.approx(0.16922843, rel=1e-6)
 
 
 def test_live_module_convert_resumes_missing_weight_and_rejects_tampering(tmp_path):
