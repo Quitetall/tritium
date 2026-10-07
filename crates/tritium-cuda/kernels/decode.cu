@@ -5926,6 +5926,8 @@ __global__ void gqa_attention_combine_f32(const float* __restrict__ partials,
 //                   Later replays re-run with a STALE ctrl — they rewrite the
 //                   same KV row with the same values (deterministic kernels),
 //                   which is idempotent and unobserved past the watermark.
+//   eos < 0      -> never halts on a token (a caller that does not stop on
+//                   EOS passes -1; no argmax result is negative here).
 //   id == eos    -> store the id, then halt BEFORE advancing ctrl (matches
 //                   the host loop's "the draft believes the turn ends here"
 //                   early break: the EOS itself is drafted, never fed).
@@ -5943,7 +5945,10 @@ __global__ void draft_chain_advance(int* __restrict__ ctrl,
     chain_out[step] = -1;
     return;
   }
-  const int t = am_out[0];
+  // An all-NaN logits row leaves the argmax at -1; the host `sample_greedy`
+  // returns index 0 there, so map it the same way (and never feed -1 into
+  // ctrl, where the next replay would gather an out-of-range embedding row).
+  const int t = am_out[0] < 0 ? 0 : am_out[0];
   chain_out[step] = t;
   if (t == eos) {
     halt[0] = 1;

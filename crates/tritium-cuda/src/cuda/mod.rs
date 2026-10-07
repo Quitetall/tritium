@@ -1852,7 +1852,8 @@ impl CudaDecodeModel {
             .memcpy_dtoh(&*out, &mut id)
             .map_err(|e| driver_err("decode graph argmax dtoh", &e))?;
         self.cache_len += 1;
-        Ok(id[0] as u32)
+        // All-NaN row: the device argmax yields -1, the host `sample_greedy` 0.
+        Ok(id[0].max(0) as u32)
     }
 
     /// The shared [`step_graph`]/[`step_graph_argmax`] core: guards, lazy
