@@ -22,8 +22,11 @@ escalation arms only after startup succeeds.
 `artifact.profile` selects its admitted Compact or NearLossless package.
 Default image and manifest digests are zero placeholders for lint/render only.
 They are not deployable release identities. Override both with admitted values.
-The current binary path is legacy GGUF compatibility; schema-v3 production
-readiness and receipt parity remain binding gates. URI-to-PVC staging is not yet
+The Deployment invokes `tritium-serve --bundle /artifacts/bundle --profile
+<profile>`, which uses the strict schema-v3 production loader and startup
+self-test; legacy GGUF and local-conversion paths are not used by this chart.
+Exact image, bundle, readiness, drain and startup-receipt parity still require
+the candidate-bound deployment qualification. URI-to-PVC staging is not yet
 implemented; the chart consumes a pre-provisioned read-only source PVC.
 
 KEDA defaults to `minReplicaCount: 1`; scale-to-zero is not admitted for CPU or
