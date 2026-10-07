@@ -48,6 +48,24 @@
 //! Plain nearest-point decoding only — no GPTQ/BlockLDLQ yet. The odd (sample) term is small at this
 //! eval size (|odd| ≤ 0.05 nats except the destroyed T=1 arms).
 //!
+//! # Measured 2026-10-07 — Golay + block-LDLQ (`TRITIUM_H8_ARMS=ldlq`), 16k-token Grams, auto decay
+//!
+//! ```text
+//! structure                 bits/w      ppl    even (curvature)   odd      SNR dB
+//! Golay 1+½ (plain)          2.502   129.231      +1.79460      -0.05427    13.10
+//! Golay 1+½ + BlockLDLQ      2.502    82.633      +1.56199      -0.26885    12.24
+//! Golay 2+½ (plain)          4.087    27.362      +0.19744      -0.00956    21.38
+//! Golay 2+½ + BlockLDLQ      4.087    26.520      +0.16777      -0.01115    20.50
+//! ladder T=2 + GPTQ (H6)     3.295    40.263      +0.61521
+//! ladder T=3 + GPTQ (H6)     4.880    24.177      +0.06620
+//! ```
+//!
+//! Block feedback composes with the code: −36% ppl at 1+½ and −15% curvature at 2+½ over the plain
+//! Golay fit (SNR falls, as it must — the fit now minimizes the Gram metric, not MSE). At 4.09 bpw the
+//! curvature cost (0.168) is half of what ladder+GPTQ reaches by interpolating its T=2 and T=3
+//! points at the same bytes (~0.34). The 1+½ arm carries a large calibrated first-order term
+//! (odd −0.27), the same domain-alignment effect H6 measured for calibrated fits.
+//!
 //! ```text
 //! TRITIUM_CORPUS=$HOME/.cache/tritium-corpora/wikitext2_400k_32k.json \
 //!   cargo test -p tritium-nn --release --test coded_planes -- --ignored --nocapture
