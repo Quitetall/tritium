@@ -721,7 +721,7 @@ impl<'admission, 'allocated, 'parent, 'store, 'source>
     /// Rejects malformed batch schedules, absent projection scopes, changed
     /// admission, mismatched identities, or invalid activation/output data.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn observe_scale_refit_scheduled_windows<
+    pub fn observe_scale_refit_scheduled_windows<
         S: OutputReconstructionActivationSource + ?Sized,
     >(
         &self,
