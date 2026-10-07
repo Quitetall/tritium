@@ -542,9 +542,14 @@ impl Qwen35TextRunner {
     /// projection activation window. The teacher must preserve the package's
     /// activation arithmetic (for example, an exact-fp32 dense projection for
     /// SALT V2); callers bind the activation source and teacher identity in
-    /// their campaign receipt.
-    #[allow(dead_code)] // Consumed by the B3 candidate-builder adapter.
-    pub(crate) fn visit_named_projection_output_pairs(
+    /// their campaign receipt. Outputs are borrowed only for the synchronous
+    /// callback and are not retained by the runner.
+    ///
+    /// # Errors
+    /// Rejects unknown projection names, incompatible teacher geometry or
+    /// activation arithmetic, mismatched input shape, non-finite inputs or
+    /// outputs, and allocation/backend failures.
+    pub fn visit_named_projection_output_pairs(
         &self,
         tensor_name: &str,
         teacher: &Projection,

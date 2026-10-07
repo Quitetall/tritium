@@ -449,15 +449,16 @@ deterministic per-window candidates must be scored and selected against the froz
 objective; selected updates must then be joined to child materialization and exact
 replay. No full Qwen campaign or paid compute is authorized by this decision.
 
-On 2026-10-06, an internal Qwen adapter seam was added to recompute any canonical
-language projection over a bounded, caller-supplied activation window. It resolves
-MLP, DeltaNet, and full-attention projection names and emits finite checked outputs
-synchronously, without retaining model histories. A loaded SALT V2 fixture test
-exercised the seam and passed; targeted `tritium-nn` Clippy with warnings denied
-also passed. This supplies current-package projection outputs only: dense teacher
-projection capture, exact parent trit/scale streaming, sliding-window/restart
-orchestration, candidate scoring/selection, child materialization, and exact child
-replay remain unconnected. No real model or campaign was run.
+On 2026-10-06, the bounded Qwen paired-projection visitor was exposed as a
+campaign-facing API. It resolves canonical MLP, DeltaNet, and full-attention
+projection names, validates teacher/current geometry and activation arithmetic,
+and synchronously lends finite outputs to the caller without retaining them.
+The loaded SALT V2 fixture exercises it. ADR 0028 Amendment 2026-10-06 records
+the provenance boundary: callers bind teacher identity, activation identity,
+projection name/index, spec, and parent. This supplies an adapter seam only;
+dense teacher acquisition, production activation binding, candidate fitting and
+selection, child materialization, and exact child replay are not yet connected
+to the same production flow. No real model or campaign was run.
 
 The next B3 slice adds paired bounded-window evaluation of a caller-supplied
 dense teacher projection and the exact named projection in the current Qwen
