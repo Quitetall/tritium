@@ -2302,9 +2302,9 @@ def _scale_group_size(columns: int) -> int:
     return columns
 
 
-def _joint_additive_projection(
+def _joint_additive_fit(
     master: torch.Tensor, curvature: torch.Tensor, planes: int
-) -> TernaryProjection:
+) -> tuple[tuple[TernaryPlane, ...], float]:
     if master.ndim != 2 or curvature.ndim != 1 or curvature.numel() != master.shape[1]:
         raise TritiumError(
             "calibration curvature does not match the selected weight",
@@ -2341,21 +2341,45 @@ def _joint_additive_projection(
     # call, while the solver inputs and deterministic per-row order stay fixed.
     weight_bytes = group_weights.numpy().astype("<f4", copy=False).tobytes(order="C")
     diagonal_values = grouped_diagonal.contiguous().reshape(-1).tolist()
-    scales_by_group, plane_trits = _tritium.fit_joint_ternary_diagonal_groups(
-        weight_bytes,
-        master.shape[0],
-        groups,
-        group_size,
-        diagonal_values,
-        planes,
-        16,
-        1e-8,
-        4,
-        1e6,
-        "f16",
-        True,
-        True,
+    fit_with_objective = getattr(
+        _tritium, "_fit_joint_ternary_diagonal_groups_with_objective", None
     )
+    if fit_with_objective is None:
+        # Source checkouts can temporarily pair this Python module with the
+        # previously built extension. Keep that development path functional;
+        # freshly built wheels use the objective-returning native entrypoint.
+        scales_by_group, plane_trits = _tritium.fit_joint_ternary_diagonal_groups(
+            weight_bytes,
+            master.shape[0],
+            groups,
+            group_size,
+            diagonal_values,
+            planes,
+            16,
+            1e-8,
+            4,
+            1e6,
+            "f16",
+            True,
+            True,
+        )
+        objective = None
+    else:
+        scales_by_group, plane_trits, objective = fit_with_objective(
+            weight_bytes,
+            master.shape[0],
+            groups,
+            group_size,
+            diagonal_values,
+            planes,
+            16,
+            1e-8,
+            4,
+            1e6,
+            "f16",
+            True,
+            True,
+        )
     scale_values = torch.tensor(scales_by_group, dtype=torch.float16).permute(2, 1, 0)
     for plane in range(planes):
         trits = (
@@ -2374,6 +2398,29 @@ def _joint_additive_projection(
         )
         for trits, scales in zip(grouped_trits, grouped_scales)
     ]
+    if objective is None:
+        dense = torch.zeros_like(master_cpu)
+        for plane in fitted_planes:
+            dense = dense + plane.trits.to(master.dtype) * expand_plane_scales(
+                plane.scales,
+                rows=master.shape[0],
+                columns=master.shape[1],
+                group_size=plane.group_size,
+            ).to(master.dtype)
+        error = (
+            master_cpu.to(torch.float64) - dense.to(torch.float64)
+        ).square()
+        objective = float(
+            (error * curvature.detach().to(device="cpu", dtype=torch.float64)).sum()
+        )
+    return tuple(fitted_planes), float(objective) if float(mean) > 0.0 else 0.0
+
+
+def _joint_additive_projection(
+    master: torch.Tensor, curvature: torch.Tensor, planes: int
+) -> TernaryProjection:
+    fitted_planes, _objective = _joint_additive_fit(master, curvature, planes)
+    master_cpu = master.detach().to(device="cpu")
     dense = torch.zeros_like(master_cpu)
     for plane in fitted_planes:
         dense = dense + plane.trits.to(master.dtype) * expand_plane_scales(
@@ -2384,7 +2431,7 @@ def _joint_additive_projection(
         ).to(master.dtype)
     projection = TernaryProjection(
         dense=dense,
-        planes=tuple(fitted_planes),
+        planes=fitted_planes,
         algorithm_id=_joint_algorithm_id(planes),
         schema_version=1,
     )
@@ -2612,15 +2659,11 @@ def _fit_module(
         for start in range(0, master.shape[0], rows_per_chunk):
             stop = min(master.shape[0], start + rows_per_chunk)
             master_chunk = master[start:stop]
-            projection = _joint_additive_projection(
+            fitted_planes, chunk_objective = _joint_additive_fit(
                 master_chunk, curvature, writer.plane_count
             )
-            error = (
-                master_chunk.detach().cpu().to(torch.float64)
-                - projection.dense.to(torch.float64)
-            ).square()
-            weighted_error += float((error * curvature).sum())
-            writer.append(projection.planes)
+            weighted_error += chunk_objective
+            writer.append(fitted_planes)
         denominator = curvature.sum().clamp_min(1e-30) * master.shape[0]
         return weighted_error / float(denominator)
 

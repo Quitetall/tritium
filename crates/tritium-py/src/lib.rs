@@ -436,6 +436,10 @@ fn _tritium(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(ops::fit_joint_ternary_diagonal, m)?)?;
     m.add_function(wrap_pyfunction!(ops::fit_joint_ternary_diagonal_groups, m)?)?;
     m.add_function(wrap_pyfunction!(
+        ops::fit_joint_ternary_diagonal_groups_with_objective,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
         torch_native::_ternary_linear_cpu_dlpack,
         m
     )?)?;

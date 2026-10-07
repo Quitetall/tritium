@@ -1438,6 +1438,23 @@ def test_grouped_diagonal_projection_matches_legacy_per_group_fits():
     master = torch.randn(5, 256, dtype=torch.float32)
     curvature = torch.linspace(0.25, 2.0, master.shape[1], dtype=torch.float64)
     projection = ptq._joint_additive_projection(master, curvature, planes=2)
+    fitted_planes, objective = ptq._joint_additive_fit(
+        master, curvature, planes=2
+    )
+
+    assert len(fitted_planes) == len(projection.planes)
+    assert all(
+        torch.equal(fit.trits, expected.trits)
+        and torch.equal(fit.scales, expected.scales)
+        for fit, expected in zip(fitted_planes, projection.planes)
+    )
+    expected_objective = float(
+        (
+            (master.to(torch.float64) - projection.dense.to(torch.float64)).square()
+            * curvature
+        ).sum()
+    )
+    assert objective == pytest.approx(expected_objective, rel=1e-6, abs=1e-8)
 
     rows, columns, group_size, groups = master.shape[0], master.shape[1], 128, 2
     grouped_master = master.reshape(rows, groups, group_size)

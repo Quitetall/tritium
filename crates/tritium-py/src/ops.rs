@@ -21,6 +21,7 @@ use tritium_train::ops::ste;
 type DenseJointFitResult = (Vec<f32>, Vec<Vec<i8>>, Vec<f32>, f64);
 type DiagonalJointFitBatchResult = (Vec<Vec<f32>>, Vec<Py<PyBytes>>);
 type GroupedDiagonalJointFitBatchResult = (Vec<Vec<Vec<f32>>>, Vec<Py<PyBytes>>);
+type GroupedDiagonalJointFitBatchObjectiveResult = (Vec<Vec<Vec<f32>>>, Vec<Py<PyBytes>>, f64);
 
 /// Allocate additive ternary planes from measured group error curves.
 ///
@@ -301,6 +302,47 @@ pub(crate) fn fit_joint_ternary_diagonal_groups(
     softened_relay: bool,
     modulated_relay: bool,
 ) -> PyResult<GroupedDiagonalJointFitBatchResult> {
+    let (scales, trits, _objective) = fit_joint_ternary_diagonal_groups_with_objective(
+        py,
+        weights,
+        rows,
+        groups,
+        columns,
+        diagonal,
+        planes,
+        max_iterations,
+        ridge,
+        em_restarts,
+        ridge_condition_limit,
+        scale_precision,
+        softened_relay,
+        modulated_relay,
+    )?;
+    Ok((scales, trits))
+}
+
+/// Private PTQ bridge returning the already-scored objective as well as the fit planes.
+///
+/// Keep `fit_joint_ternary_diagonal_groups`'s public two-value result stable; the
+/// underscore-prefixed entrypoint avoids rebuilding a dense matrix only to score it.
+#[pyfunction(name = "_fit_joint_ternary_diagonal_groups_with_objective")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fit_joint_ternary_diagonal_groups_with_objective(
+    py: Python<'_>,
+    weights: &Bound<'_, PyBytes>,
+    rows: usize,
+    groups: usize,
+    columns: usize,
+    diagonal: Vec<f64>,
+    planes: usize,
+    max_iterations: usize,
+    ridge: f64,
+    em_restarts: usize,
+    ridge_condition_limit: f64,
+    scale_precision: &str,
+    softened_relay: bool,
+    modulated_relay: bool,
+) -> PyResult<GroupedDiagonalJointFitBatchObjectiveResult> {
     if rows == 0 || groups == 0 || columns == 0 {
         return Err(PyValueError::new_err(
             "rows, groups, and columns must all be positive",
@@ -358,7 +400,7 @@ pub(crate) fn fit_joint_ternary_diagonal_groups(
             modulated: modulated_relay,
         },
     };
-    let (scales_by_group, trits_by_plane) = py
+    let (scales_by_group, trits_by_plane, objective) = py
         .detach(move || {
             // Flattened group-major row indices preserve each group's row order.
             // One indexed Rayon collection keeps errors and output deterministic.
@@ -383,12 +425,14 @@ pub(crate) fn fit_joint_ternary_diagonal_groups(
             let mut trits_by_plane = (0..planes)
                 .map(|_| Vec::with_capacity(expected_weights))
                 .collect::<Vec<_>>();
+            let mut objective = 0.0;
             for _ in 0..groups {
                 let mut scales_by_row = Vec::with_capacity(rows);
                 for _ in 0..rows {
                     let fit = fits
                         .next()
                         .ok_or_else(|| "internal grouped-fit row count mismatch".to_owned())??;
+                    objective += fit.objective;
                     scales_by_row.push(fit.scales);
                     for (plane, row_trits) in fit.trits.into_iter().enumerate() {
                         trits_by_plane[plane].extend(row_trits.into_iter().map(|trit| trit as u8));
@@ -396,14 +440,14 @@ pub(crate) fn fit_joint_ternary_diagonal_groups(
                 }
                 scales_by_group.push(scales_by_row);
             }
-            Ok::<_, String>((scales_by_group, trits_by_plane))
+            Ok::<_, String>((scales_by_group, trits_by_plane, objective))
         })
         .map_err(PyValueError::new_err)?;
     let trits_by_plane = trits_by_plane
         .iter()
         .map(|trits| PyBytes::new(py, trits).unbind())
         .collect();
-    Ok((scales_by_group, trits_by_plane))
+    Ok((scales_by_group, trits_by_plane, objective))
 }
 
 #[allow(clippy::too_many_arguments)]
