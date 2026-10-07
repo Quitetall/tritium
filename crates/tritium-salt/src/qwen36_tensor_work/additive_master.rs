@@ -3925,6 +3925,21 @@ mod tests {
             (first.as_slice(), first_mask.as_slice()),
             (second.as_slice(), second_mask.as_slice()),
         ];
+        let mut wrong_parent =
+            SaltV2PackageReader::new_strict(Cursor::new(fixture_selected_package(true)))
+                .expect("open unrelated valid package");
+        let wrong_parent_result = session.materialize_scale_update_candidate_child(
+            &receipt,
+            &refined_spec,
+            &fitted_candidates[0],
+            &mut wrong_parent,
+            Cursor::new(Vec::new()),
+        );
+        assert!(matches!(
+            wrong_parent_result,
+            Err(Qwen36ExecutionVisitError::Runtime(NnError::Provenance(_)))
+        ));
+
         let mut output_candidates = Vec::new();
         let mut child_artifacts = Vec::new();
         for fitted in &fitted_candidates {
