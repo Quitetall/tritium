@@ -1917,3 +1917,30 @@ Existing local RC manifests are still bound to older source revisions, and the
 local release CLI is not installed on this host. These software regressions do
 not qualify candidate artifacts, physical backends, flagship model quality,
 performance, or v1.1 release readiness.
+
+### Current-source Linux CPU abi3 wheel — 2026-10-07
+
+At exact source revision `671cef6698717a5da7a66607f2493d02525348f3`, a CPU
+abi3 wheel was built from a clean detached worktree with the pinned
+`manylinux_2_28_x86_64` image, Rust 1.98.0, and maturin 1.10.2. The durable
+artifact and receipts are under
+`/mnt/2tb/tritium-release-evidence/pytritium-cpu-671cef66/`.
+`verify-wheel.py --install-smoke` passed; the 10,526,236-byte wheel SHA-256 is
+`4082854acf38e1ffb4f7cf28178654e4ae7f06f446baef981a7b92f0415b2318`.
+
+The exact wheel then passed the installed functional smoke on CPU under
+CPython 3.14.7, PyTorch 2.11.0+cu130, Transformers 5.5.3, and safetensors
+0.7.0. The receipt ID is
+`sha256:6be8b85d8906e3974940ddf5c59e1cf7de3dfd8f4b55324de20b2ba0a2f66113`
+(file SHA-256
+`3db36d8083e4b73afd2ef80b648a230ca81b4814483c9913ac1288889fa6bdbe`). It
+proves native CPU matmul, Hugging Face QAT forward/backward, optimizer update
+and resume, safetensors save/reload, and tied-weight identity. The compatibility
+receipt for this one Linux x86-64 CPython 3.14 cell is
+`compatibility-receipt-cp314.json` (SHA-256
+`6bfc30d333e1ae92fcb2d5a261e7280027271b2d4ecfa8f5e96b60aefd27aa53`). The
+functional smoke used a venv with host dependencies visible; it proves exact
+wheel loading and runtime behavior but is not a fully isolated dependency
+installation. Neither receipt is yet bound to a current candidate manifest or
+registered in its evidence registry; other platforms/interpreters, CUDA, full
+package-matrix, model-quality, and public-release gates remain open.
