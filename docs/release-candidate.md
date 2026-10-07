@@ -1843,3 +1843,18 @@ web package check passed generated-file validation and compiled the Rust WASM
 guest, but stopped because the pinned `wasm-bindgen 0.2.126` executable was not
 available on this host's `PATH`; TypeScript, package tests, and archive
 verification therefore remain unverified locally for this checkout.
+
+The current Hugging Face and ONNX paths also passed focused CPU checks:
+
+```text
+PYTHONPATH=crates/tritium-py/python pytest -q -rs crates/tritium-py/tests/test_huggingface_qat.py
+7 passed in 1.62s
+PYTHONPATH=crates/tritium-py/python /tmp/tritium-onnx-check/bin/python -m pytest -q -rs \
+  crates/tritium-py/tests/test_module_onnx.py::test_public_facade_executes_qat_ptq_and_refinement_artifacts_in_ort
+1 passed in 6.19s
+```
+
+The ONNX test used an isolated Python 3.14 environment with the CI-pinned
+`onnx==1.22.0`, `onnxruntime==1.27.0`, and `onnxscript==0.7.1`, while reusing
+the host's PyTorch installation. These are small-model software checks; they
+do not establish flagship quality, hardware performance, or release readiness.
