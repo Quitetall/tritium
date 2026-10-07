@@ -456,9 +456,21 @@ and synchronously lends finite outputs to the caller without retaining them.
 The loaded SALT V2 fixture exercises it. The local ADR 0028 working copy records
 the provenance boundary: callers bind teacher identity, activation identity,
 projection name/index, spec, and parent. That amendment has not been promoted
-from the private research repository into this public checkout. This first
-visitor was only an adapter seam; dense teacher acquisition, full campaign data
-capture, candidate selection, and child publication remain separate work.
+from the private research repository into this public checkout. This visitor is
+only an adapter seam; dense teacher acquisition, full campaign data capture,
+and production candidate orchestration remain open.
+
+The admitted-child CPU fixture now closes another software seam: it fits two
+seeded scale candidates under a two-restart spec, materializes each as its own
+immutable child, evaluates each loaded child into an output candidate receipt,
+selects through the frozen objective, maps the winning receipt back to the exact
+fitted candidate and child lineage, and freshly replays that child into
+`TSQ36RC`. The fixture uses each child's own outputs as its teacher, so it
+exercises identity joining and deterministic tie selection, not dense-teacher
+quality ranking. The full `tritium-salt` suite passed (65 unit tests, 2 ignored;
+all integration suites passed) and Clippy passed with warnings denied. This
+proves software composition on synthetic CPU data, not Qwen quality, full-model
+coordination, CUDA, or production qualification.
 
 The admitted-session API now composes the visitor with the frozen spec, a
 verified parent execution, an activation source, and a parent-bound scale-fit
