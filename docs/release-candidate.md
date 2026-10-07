@@ -2132,3 +2132,30 @@ the pair confirms that hosted CPU timing is variable; neither result alone
 identifies a code regression or improvement. The local bridge edit has only
 been checked on a smaller deterministic fixture and has not yet been included
 in a hosted model-level run.
+
+### Local exact-candidate PTQ profile — 2026-10-07
+
+Commit `44942a8a156a3350cbbb613791ef1c09e6eb5e77` was profiled through the
+public `prepare → calibrate → convert()` tutorial on the cached, pinned
+`HuggingFaceTB/SmolLM2-135M-Instruct` revision
+`12fd25f77366fa6b3b4b768ec3050bf629380bac`. This used the checked-out Python
+package and its locally built abi3 extension in
+`/tmp/tritium-release-wheel-perf`, Python 3.14.7, PyTorch 2.11.0+cu130,
+Transformers 5.5.3, CPU on an Intel i9-14900K host (32 logical CPUs). The
+profiled tutorial passed functionally in `779.871s` with an explicit
+`max_seconds=1800`; this is not a pass of the frozen 300-second hosted gate and
+is not an installed-wheel or model-quality qualification. Its receipt SHA-256
+is `a980e19b48b46d94078222d56465cd69642b8e2106ebcd99f42e47a9657b3ff6`; the
+selected dense/checkpoint byte counts were `537,919,488` / `92,192,265` (5.83x).
+
+The cProfile trace attributes `559.044s` to `convert()`; the native
+`fit_joint_ternary_diagonal` bridge was called 2,106 times and is the clearest
+hot path in this trace. Python-side timings are inclusive across the
+checkpointing call tree and must not be summed. The host was concurrently
+loaded (1-minute load average peaked near 70), so elapsed time is diagnostic,
+not a comparative benchmark. Raw pstats remain at
+`/tmp/tritium-ptq-profile-44942a8a.pstats` (SHA-256
+`ad8871ac616d73ceb6f5b418f1bd255ed2efc75e73cdfcdc047e6a1cb7dc2f8b`); the
+receipt and profile are local temporary evidence, not yet part of the release
+evidence bundle. The exact-candidate hosted tutorial was still running when
+this profile was recorded.
