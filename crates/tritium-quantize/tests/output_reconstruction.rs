@@ -1230,6 +1230,7 @@ fn four_fitted_scale_restarts_select_by_frozen_output_objective() {
     let mut activation_builder = ActivationCacheBuilder::new(activation_spec.clone());
     let mut values = vec![0.0; 5 * 128];
     values[0] = 1.0;
+    values[64] = 1.0;
     activation_builder
         .ingest(
             ActivationChunk::new(&activation_spec, 0, 5, values, vec![true; 5], vec![5]).unwrap(),
@@ -1239,7 +1240,7 @@ fn four_fitted_scale_restarts_select_by_frozen_output_objective() {
     let activation = cache.read_window(0, 1, 4096).unwrap();
     let mut trits = [Trit::ZERO; 128];
     trits[0] = Trit::from_i8(1).unwrap();
-    trits[64] = Trit::from_i8(-1).unwrap();
+    trits[64] = Trit::from_i8(1).unwrap();
     let mut fitted = Vec::new();
     for seed in [11, 22, 33, 44] {
         let mut builder = FixedTritScaleUpdateCandidateBuilder::new(&spec, &parent, seed);
@@ -1247,12 +1248,40 @@ fn four_fitted_scale_restarts_select_by_frozen_output_objective() {
             .begin_tile_plane(3, 0, 0, 1, &trits, &[f16::ONE, f16::ONE], 64, 8)
             .unwrap();
         builder
-            .observe_window_from_current_projection(&activation, &[2.0], &[1.0])
+            .observe_window_from_current_projection(&activation, &[1.0], &[2.0])
             .unwrap();
         fitted.push(builder.finish().unwrap());
     }
 
     let selected_seed = 33;
+    let mut repeated_builder =
+        FixedTritScaleUpdateCandidateBuilder::new(&spec, &parent, selected_seed);
+    repeated_builder
+        .begin_tile_plane(3, 0, 0, 1, &trits, &[f16::ONE, f16::ONE], 64, 8)
+        .unwrap();
+    repeated_builder
+        .observe_window_from_current_projection(&activation, &[1.0], &[2.0])
+        .unwrap();
+    let repeated = repeated_builder.finish().unwrap();
+    let original = fitted
+        .iter()
+        .find(|candidate| {
+            candidate
+                .as_scale_candidate(&spec)
+                .unwrap()
+                .initialization_seed()
+                == selected_seed
+        })
+        .unwrap();
+    assert_eq!(repeated.candidate_id(), original.candidate_id());
+    assert_eq!(repeated.updates(), original.updates());
+    assert!(
+        fitted
+            .iter()
+            .skip(1)
+            .any(|candidate| candidate.updates() != original.updates())
+    );
+
     let selected_id = *fitted
         .iter()
         .find(|candidate| {

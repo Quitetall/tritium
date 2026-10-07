@@ -493,6 +493,16 @@ not merely a separately hand-labeled candidate ID. All 26 output-reconstruction
 tests and quantize Clippy passed. This remains synthetic: it does not score a
 loaded child model against dense Qwen teacher outputs or establish model quality.
 
+The restart seed now also controls the actual initial scale vector: a
+domain-separated BLAKE3 derivation binds each initial scale to the frozen spec,
+parent package, seed, tensor, tile, plane, and scale-group index. The synthetic
+rank-deficient fit verifies that the seeded starts can produce distinct f16
+update vectors, and repeating one seed reproduces the exact candidate ID and
+update bytes. This closes a software mismatch where distinct candidate IDs
+previously labeled the same zero-start fit. It remains a synthetic solver test,
+not evidence that four starts improve Qwen quality; the production scorer must
+choose among candidates using the frozen output objective.
+
 ### Flagship campaign status refresh (2026-10-04)
 
 The canonical read-only probe was rerun against the durable workspace

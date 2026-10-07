@@ -26,6 +26,7 @@ const CANDIDATE_HASH_CONTEXT_V3: &str = "tritium salt v2 output reconstruction c
 const SCALE_UPDATE_HASH_CONTEXT: &str = "tritium salt v2 output reconstruction scale updates v1";
 const SCALE_CANDIDATE_HASH_CONTEXT: &str =
     "tritium salt v2 output reconstruction scale candidate v1";
+const SCALE_REFIT_START_CONTEXT: &str = "tritium salt v2 fixed-trit scale-refit start v1";
 const ACTIVATION_SET_HASH_CONTEXT: &str = "tritium salt v2 output reconstruction activation set v1";
 const RECEIPT_HASH_CONTEXT: &str = "tritium salt v2 output reconstruction receipt v1";
 const MAX_OUTPUT_RECONSTRUCTION_SCOPES: usize = 1 << 20;
@@ -1211,6 +1212,7 @@ pub struct FixedTritScaleRefitAccumulator {
     gram: Vec<f64>,
     target_products: Vec<f64>,
     projection_scratch: Vec<f64>,
+    initial_scales: Vec<f64>,
     target_squared: f64,
     observations: u64,
     coordinate_sweeps: usize,
@@ -1315,10 +1317,24 @@ impl FixedTritScaleRefitAccumulator {
         group_count: usize,
         coordinate_sweeps: usize,
     ) -> Result<Self, OutputReconstructionError> {
+        Self::new_with_initial_scales(group_count, coordinate_sweeps, None)
+    }
+
+    fn new_with_initial_scales(
+        group_count: usize,
+        coordinate_sweeps: usize,
+        initial_scales: Option<&[f64]>,
+    ) -> Result<Self, OutputReconstructionError> {
         if group_count == 0
             || group_count > MAX_FIXED_TRIT_REFIT_GROUPS
             || coordinate_sweeps == 0
             || coordinate_sweeps > MAX_FIXED_TRIT_REFIT_SWEEPS
+            || initial_scales.is_some_and(|scales| {
+                scales.len() != group_count
+                    || scales
+                        .iter()
+                        .any(|scale| !scale.is_finite() || *scale < 0.0)
+            })
         {
             return Err(OutputReconstructionError::InvalidScaleRefit);
         }
@@ -1339,10 +1355,20 @@ impl FixedTritScaleRefitAccumulator {
             .try_reserve_exact(group_count)
             .map_err(|_| OutputReconstructionError::ReceiptAllocationFailed)?;
         projection_scratch.resize(group_count, 0.0);
+        let mut initial_scales_owned = Vec::new();
+        initial_scales_owned
+            .try_reserve_exact(group_count)
+            .map_err(|_| OutputReconstructionError::ReceiptAllocationFailed)?;
+        if let Some(scales) = initial_scales {
+            initial_scales_owned.extend_from_slice(scales);
+        } else {
+            initial_scales_owned.resize(group_count, 0.0);
+        }
         Ok(Self {
             gram,
             target_products,
             projection_scratch,
+            initial_scales: initial_scales_owned,
             target_squared: 0.0,
             observations: 0,
             coordinate_sweeps,
@@ -1463,7 +1489,7 @@ impl FixedTritScaleRefitAccumulator {
             return Err(OutputReconstructionError::InvalidScaleRefit);
         }
         let groups = self.target_products.len();
-        let mut scales = vec![0.0; groups];
+        let mut scales = self.initial_scales;
         for _ in 0..self.coordinate_sweeps {
             for group in 0..groups {
                 let diagonal = self.gram[group * groups + group];
@@ -1528,6 +1554,24 @@ impl FixedTritTileScaleRefitAccumulator {
         scale_group_size: usize,
         coordinate_sweeps: usize,
     ) -> Result<Self, OutputReconstructionError> {
+        Self::new_with_initial_scales(
+            output_width,
+            tile_index,
+            trits,
+            scale_group_size,
+            coordinate_sweeps,
+            None,
+        )
+    }
+
+    fn new_with_initial_scales(
+        output_width: usize,
+        tile_index: usize,
+        trits: &[Trit],
+        scale_group_size: usize,
+        coordinate_sweeps: usize,
+        initial_scales: Option<&[f64]>,
+    ) -> Result<Self, OutputReconstructionError> {
         if output_width == 0
             || trits.is_empty()
             || trits.len() > SALT_V2_ALLOCATION_TILE_SIZE
@@ -1541,7 +1585,11 @@ impl FixedTritTileScaleRefitAccumulator {
             return Err(OutputReconstructionError::InvalidGeometry);
         }
         let group_count = trits.len().div_ceil(scale_group_size);
-        let fit = FixedTritScaleRefitAccumulator::new(group_count, coordinate_sweeps)?;
+        let fit = FixedTritScaleRefitAccumulator::new_with_initial_scales(
+            group_count,
+            coordinate_sweeps,
+            initial_scales,
+        )?;
         let mut owned_trits = Vec::new();
         owned_trits
             .try_reserve_exact(trits.len())
@@ -1918,6 +1966,43 @@ struct ActiveTileScaleFit {
     accumulator: FixedTritTileScaleRefitAccumulator,
 }
 
+fn deterministic_scale_refit_initial_scales(
+    spec_id: &[u8; 32],
+    parent_package_digest: &[u8; 32],
+    initialization_seed: u64,
+    tensor_index: usize,
+    tile_index: usize,
+    plane_index: usize,
+    current_scales: &[half::f16],
+) -> Vec<f64> {
+    current_scales
+        .iter()
+        .enumerate()
+        .map(|(group_index, scale)| {
+            let mut hasher = blake3::Hasher::new_derive_key(SCALE_REFIT_START_CONTEXT);
+            hasher.update(spec_id);
+            hasher.update(parent_package_digest);
+            for value in [
+                initialization_seed,
+                tensor_index as u64,
+                tile_index as u64,
+                plane_index as u64,
+                group_index as u64,
+            ] {
+                hasher.update(&value.to_le_bytes());
+            }
+            let digest = hasher.finalize();
+            let random = u64::from_le_bytes(
+                digest.as_bytes()[..8]
+                    .try_into()
+                    .expect("BLAKE3 prefix always has eight bytes"),
+            );
+            let unit = (random >> 11) as f64 / ((1_u64 << 53) as f64);
+            f64::from(scale.to_f32()) * (0.75 + 0.5 * unit)
+        })
+        .collect()
+}
+
 /// Bounded-memory builder for an immutable output-aware scale candidate.
 ///
 /// It retains only canonical f16 scale updates and the active tile's compact
@@ -2010,12 +2095,22 @@ impl<'spec> FixedTritScaleUpdateCandidateBuilder<'spec> {
             .try_reserve_exact(current_scales.len())
             .map_err(|_| OutputReconstructionError::ReceiptAllocationFailed)?;
         current_scales_owned.extend_from_slice(current_scales);
-        let accumulator = FixedTritTileScaleRefitAccumulator::new(
+        let initial_scales = deterministic_scale_refit_initial_scales(
+            self.spec.spec_id(),
+            &self.parent_package_digest,
+            self.initialization_seed,
+            tensor_index,
+            tile_index,
+            plane_index,
+            current_scales,
+        );
+        let accumulator = FixedTritTileScaleRefitAccumulator::new_with_initial_scales(
             output_width,
             tile_index,
             trits,
             scale_group_size,
             coordinate_sweeps,
+            Some(&initial_scales),
         )?;
         self.active = Some(ActiveTileScaleFit {
             tensor_index,
