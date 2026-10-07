@@ -426,6 +426,17 @@ also passed. This verifies the campaign API and receipt path on a small CPU fixt
 only. No pinned Qwen checkpoint was loaded; this is not Stage-9 quality,
 performance, physical-size, CUDA, or release evidence.
 
+#### B3 lineage decision (2026-10-06)
+
+The user selected the immutable-child-package path for sliding-window scale
+updates. The existing `TSQ36RC v1` path is the required replay/lineage mechanism;
+the base `TSQ36EX v1` stays final-logit-only, and child scope evidence must not
+be mislabeled as a `TSQ36SB` binding. This decision resolves the lineage choice,
+not the B3 optimizer: deterministic per-window candidate generation, frozen
+objective scoring/selection, child materialization from selected updates, and
+fresh replay admission are still open. No full Qwen campaign or paid compute is
+authorized by this decision.
+
 ### Flagship campaign status refresh (2026-10-04)
 
 The canonical read-only probe was rerun against the durable workspace
