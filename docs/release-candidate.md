@@ -2286,3 +2286,19 @@ but this run gives no timing result for the solver change. No performance
 effect is claimed. The exact cause of the workflow-level failure and the absent
 tutorial job are unresolved. CUDA, ROCm, Metal, wgpu, real-model serving, and
 performance-regression jobs were skipped and remain unverified.
+
+The following run,
+[37655983490](https://github.com/Quitetall/tritium/actions/runs/37655983490),
+did execute the tutorial on source `d2e072c62d7b3c775b3c19105d84216d10ce2dac`
+and Linux CPU wheel SHA-256
+`f572e4695a1d134e9ddfb903c1e086cf2bc93b409e698dbd220c9b76cc5536e4`. PTQ,
+checkpoint round-trip, generation, ONNX export/replay, and QAT/resume all
+completed, but the frozen 300-second tutorial budget failed at `1035.006s`.
+The stage log reports PTQ conversion at `814.560s`; the preceding hosted run
+`37652633017` reported conversion at `646.857s` and total time `818.029s`.
+These are not a controlled A/B and do not establish that the solver change
+caused the slower result. The runner reported roughly 12–14 GiB available
+memory and over 80 GiB temporary disk during the run; this is not an OOM or
+disk-pressure failure. The upload step was skipped after the timing failure,
+so the stage log is the available hosted evidence; the wheel, abi3 matrix, and
+other independent smoke artifacts were uploaded successfully.
