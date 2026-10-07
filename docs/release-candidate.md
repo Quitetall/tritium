@@ -1958,3 +1958,37 @@ correctly reports `LOCAL_RC_BLOCKED`: the `packages` row has only `clean-install
 and still misses `compatibility-matrix`, `crate-archive`, and `npm-archive`;
 the other eleven release gates also remain missing. This one-wheel probe is not
 the complete public RC and does not replace the prior candidate records.
+
+### Current-source publishable crate archive qualification — 2026-10-07
+
+From the same clean source revision `671cef6698717a5da7a66607f2493d02525348f3`,
+the following command produced the crate archives:
+
+```text
+CARGO_TARGET_DIR=/mnt/2tb/tritium-crates-cargo-package-671cef66 cargo package --locked --workspace --no-verify --allow-dirty --target-dir /mnt/2tb/tritium-crates-cargo-package-671cef66
+```
+
+The command also packages the two workspace members marked `publish = []`; the
+original output is preserved under
+`/mnt/2tb/tritium-crates-cargo-package-671cef66/`. The exact 23 publishable
+archives, excluding only those two non-published members, are retained under
+`/mnt/2tb/tritium-crate-archives-671cef66/`.
+
+`scripts/qualify-crate-archives.py` passed its exact inventory and source/VCS
+checks, then built an isolated consumer with vendored dependencies and
+`CARGO_NET_OFFLINE=true`:
+
+```text
+python scripts/qualify-crate-archives.py --archives /mnt/2tb/tritium-crate-archives-671cef66 \
+  --source-revision 671cef6698717a5da7a66607f2493d02525348f3 \
+  --release 1.1.0-rc.2 --run-id local-crates-671cef66-20261007 \
+  --output /mnt/2tb/tritium-release-evidence/pytritium-cpu-671cef66/crate-archive-receipt.json
+qualify-crate-archives: PASS: 23 crates
+```
+
+Receipt schema is `tritium.crate-archive-qualification.v1`, ID
+`sha256:bbce29000f8a5a12add933e34d2bc7846596bd90d06d255f230c83270cfd05e6`,
+file SHA-256
+`8e75bce8c49195d156983531a71d53f91294d9748d28ba705c7832bd47b75443`. This
+is a successful local offline crate-consumer check, but the receipt is not yet
+registered against a candidate manifest; it does not close the package gate.
