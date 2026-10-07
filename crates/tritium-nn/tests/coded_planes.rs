@@ -66,6 +66,21 @@
 //! points at the same bytes (~0.34). The 1+½ arm carries a large calibrated first-order term
 //! (odd −0.27), the same domain-alignment effect H6 measured for calibrated fits.
 //!
+//! # Measured 2026-10-07 — Kronecker Golay (`TRITIUM_H8_ARMS=kron`), A ⊗ G from 16k tokens, λ_G = 0.5
+//!
+//! ```text
+//! structure                  bits/w      ppl    even (curvature)   odd      SNR dB
+//! Golay 1+½ + BlockLDLQ       2.502    82.633      +1.56199      -0.26885    12.24
+//! Golay 1+½ + Kron LDLQ       2.502    76.719      +1.43840      -0.21953    11.84
+//! Golay 2+½ + BlockLDLQ       4.087    26.520      +0.16777      -0.01115    20.50
+//! Golay 2+½ + Kron LDLQ       4.087    26.570      +0.15976      -0.00125    20.11
+//! ```
+//!
+//! The output side composes with the code exactly as it did with the ladder (H6): −7.2% ppl and
+//! −7.9% curvature at 1+½; at 2+½ the ppl change is inside the noise floor and the curvature falls
+//! 4.8%. The best 4.09-bpw fit is now Golay 2+½ + Kronecker LDLQ (curvature 0.160 against ~0.34 for
+//! ladder+GPTQ interpolated at the same bytes). Cost: about 2.5× the BlockLDLQ fit time (row loop).
+//!
 //! ```text
 //! TRITIUM_CORPUS=$HOME/.cache/tritium-corpora/wikitext2_400k_32k.json \
 //!   cargo test -p tritium-nn --release --test coded_planes -- --ignored --nocapture
