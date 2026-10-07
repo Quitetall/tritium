@@ -936,6 +936,22 @@ register a current release candidate, change
 `official_payload_authenticated: false`, admit calibration evidence, or prove
 PTQ quality. No model replay, fitting, or campaign was started.
 
+The frozen calibration pack was revalidated against this fresh identity using
+`/mnt/4tb/tritium-qwen36-campaign-20260813/token-pack/manifest.json`. The new
+pack receipt is
+`/mnt/2tb/tritium-release-evidence/qwen-calibration/recheck-2026-10-07/calibration-pack.json`
+(`sha256:5faa6dafa3d05fca967a19b9516d0c80aa69a3a330b14e3156c7c4ff0cc15e9f`);
+its replay contract is
+`/mnt/2tb/tritium-release-evidence/qwen-calibration/recheck-2026-10-07/replay-contract.json`
+(`sha256:3df79a3aac599069dd88dd98e77e74866a5153ca42d37c0ea81a7797456120b3`).
+Both preserve the existing frozen pack ID and batch digest
+`sha256:ca913e334bf22c73755d27b11848599008790f672600b8085daf5ec53022202c`
+for 512 sequences / 1,048,576 calibration tokens. The capture-from-pack
+preflight passed against these exact receipts and printed `NOT STARTED` because
+`--execute` was not supplied. The new receipts establish source/pack/replay
+consistency; they do not prove actual model replay or admit the legacy 506 S2KF
+records. Candidate-bound Stage-7 qualification and actual capture remain gates.
+
 ### Legacy Qwen calibration evidence audit (2026-10-01)
 
 The 506-file S2KF directory
