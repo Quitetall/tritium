@@ -2025,3 +2025,28 @@ archive SHA-256, byte count, release identity, and source revision. This is
 candidate-revision package evidence, but it is not yet registered against a
 complete candidate manifest and therefore does not close the aggregate package
 gate.
+
+### PTQ parallelism probe on a loaded workstation — 2026-10-07
+
+The public `prepare`/`calibrate`/`convert()` parallelism probe was run against
+source revision `44869608` and the installed `1.1.0rc2` abi3 wheel with SHA-256
+`b21343f103aec89c0e843f72730dafb23dbdc49c639677e531d96f684888c94b`:
+
+```text
+PYTHONPATH=crates/tritium-py/python \
+  /tmp/tritium-release-wheel-perf/bin/python -m unittest \
+  scripts.tests.test_ptq_parallelism -v
+serial_seconds=36.949 parallel_seconds=36.595 speedup=1.01x
+FAIL: expected at least 1.5x speedup
+```
+
+The artifact identity and weighted-error assertions passed before the speedup
+assertion failed. The workstation was heavily contended at the time: a
+contemporaneous reading showed load average `35.90` with 32 CPUs available, and
+multiple unrelated Rust builds were active. Treat this as a noisy local
+performance result, not proof that parallel fitting regressed or that the
+performance target passed. The test now prints CPU count, affinity, and load
+average with its timings so a clean rerun can distinguish host contention from
+a solver regression. The exact-source hosted tutorial run `37621206763` was
+still active when this entry was recorded; its final result remains authoritative
+for that hosted lane.
