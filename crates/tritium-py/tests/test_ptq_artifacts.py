@@ -25,6 +25,7 @@ from tritium.torch import (  # noqa: E402
     convert,
     inspect,
     load,
+    load_module_conversion,
     load_quantized_module,
     prepare,
     quantize,
@@ -717,7 +718,7 @@ def test_live_module_fit_consumes_bound_curvature_and_rejects_source_drift(tmp_p
     )
     work_dir = tmp_path / "conversion-work"
     result = convert(prepared, receipt, work_dir=work_dir)
-    reopened = ptq.load_module_conversion(result.artifact_dir)
+    reopened = load_module_conversion(result.artifact_dir)
     resumed = convert(prepared, receipt, work_dir=work_dir)
     assert reopened.recipe_id == result.recipe_id
     assert resumed == result
