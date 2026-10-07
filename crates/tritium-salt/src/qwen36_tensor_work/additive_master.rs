@@ -2656,10 +2656,10 @@ mod tests {
             SaltV2MasterTensorEncoder, SaltV2MasterTrack, SaltV2PrefixLoss,
         },
         salt_v2_package::{
-            SaltV2Package, SaltV2PackageReader, SaltV2Plane, SaltV2ScaleUpdate,
-            SaltV2ScaleUpdateChild, SaltV2ScaleUpdateChildError, SaltV2StreamTensorSpec,
-            SaltV2Tensor, SaltV2Tile, SaltV2Transform, SaltV2UniformRateModel,
-            write_salt_v2_package, write_salt_v2_scale_update_child,
+            SaltV2Package, SaltV2PackageReader, SaltV2Plane, SaltV2ScaleUpdateChild,
+            SaltV2ScaleUpdateChildError, SaltV2StreamTensorSpec, SaltV2Tensor, SaltV2Tile,
+            SaltV2Transform, SaltV2UniformRateModel, write_salt_v2_package,
+            write_salt_v2_scale_update_child,
         },
     };
     #[cfg(feature = "cuda")]
@@ -2674,12 +2674,13 @@ mod tests {
     };
     use tritium_quantize::{
         ActivationCache, ActivationCacheBuilder, ActivationCacheSpec, ActivationChunk,
-        ActivationDType, ActivationDigest, ByteDelta, FixedTritScaleUpdateCandidateBuilder,
-        NestedProfileBudgets, OutputObjectiveWeights, OutputReconstructionAccumulator,
-        OutputReconstructionReceipt, OutputReconstructionScaleCandidate,
-        OutputReconstructionSchedule, OutputReconstructionScope, OutputReconstructionSpec,
-        PhysicalBytes, ProfileBudget, Qwen35SourceDtype, Qwen35TensorRole, Qwen35TensorScope,
-        SaltV2Profile, output_reconstruction_activation_digest, select_output_reconstruction,
+        ActivationDType, ActivationDigest, ByteDelta, FixedTritScaleUpdateCandidate,
+        FixedTritScaleUpdateCandidateBuilder, NestedProfileBudgets, OutputObjectiveWeights,
+        OutputReconstructionAccumulator, OutputReconstructionReceipt,
+        OutputReconstructionScaleCandidate, OutputReconstructionSchedule,
+        OutputReconstructionScope, OutputReconstructionSpec, PhysicalBytes, ProfileBudget,
+        Qwen35SourceDtype, Qwen35TensorRole, Qwen35TensorScope, SaltV2Profile,
+        output_reconstruction_activation_digest, select_output_reconstruction,
     };
     #[cfg(feature = "cuda")]
     use tritium_train::{
@@ -2695,46 +2696,24 @@ mod tests {
     };
     use super::*;
 
-    #[derive(Debug)]
-    enum ScaleCandidateChildError {
-        ParentIdentityMismatch,
-        Child(SaltV2ScaleUpdateChildError),
-    }
-
-    impl fmt::Display for ScaleCandidateChildError {
-        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            match self {
-                Self::ParentIdentityMismatch => {
-                    formatter.write_str("scale candidate is bound to a different parent")
-                }
-                Self::Child(error) => write!(formatter, "scale candidate child: {error}"),
-            }
-        }
-    }
-
-    impl std::error::Error for ScaleCandidateChildError {
-        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-            match self {
-                Self::ParentIdentityMismatch => None,
-                Self::Child(error) => Some(error),
-            }
-        }
-    }
-
     fn materialize_output_scale_candidate_child<R, W>(
-        candidate: OutputReconstructionScaleCandidate<'_>,
+        candidate: &FixedTritScaleUpdateCandidate,
+        spec: &OutputReconstructionSpec,
         parent: &mut SaltV2PackageReader<R>,
         output: W,
-    ) -> Result<(W, SaltV2ScaleUpdateChild), ScaleCandidateChildError>
+    ) -> Result<(W, SaltV2ScaleUpdateChild), String>
     where
         R: Read + Seek,
         W: Read + Write + Seek,
     {
+        let candidate = candidate
+            .as_scale_candidate(spec)
+            .map_err(|error| error.to_string())?;
         if candidate.parent_package_digest() != parent.package_id().as_bytes() {
-            return Err(ScaleCandidateChildError::ParentIdentityMismatch);
+            return Err("scale candidate is bound to a different parent".to_owned());
         }
         write_salt_v2_scale_update_child(parent, output, candidate.updates())
-            .map_err(ScaleCandidateChildError::Child)
+            .map_err(|error: SaltV2ScaleUpdateChildError| error.to_string())
     }
 
     #[derive(Debug)]
@@ -3921,18 +3900,11 @@ mod tests {
             fitted_scale_candidate.parent_package_digest(),
             receipt.package_id().as_bytes()
         );
+        let scale_candidate = fitted_scale_candidate;
 
         // The scale-update candidate identity commits the actual fixed-trit
         // updates, unlike the parent execution-derived label. Base-model output
         // evidence must therefore be rejected for this child candidate.
-        let updates =
-            [
-                SaltV2ScaleUpdate::new(0, 0, 0, vec![f16::from_f32(0.5), f16::from_f32(0.75)])
-                    .expect("valid scale update"),
-            ];
-        let scale_candidate = output_spec
-            .scale_update_candidate(receipt.package_id().as_bytes(), 1, &updates)
-            .expect("content-bound scale update candidate");
         assert_ne!(scale_candidate.candidate_id(), &candidate_id);
         let mislabeled_candidate_bytes = qwen_output_reconstruction_bytes(
             &output_spec,
@@ -3966,27 +3938,13 @@ mod tests {
             (first.as_slice(), first_mask.as_slice()),
             (second.as_slice(), second_mask.as_slice()),
         ];
-        let mismatched_parent_candidate = output_spec
-            .scale_update_candidate(&[99; 32], 1, &updates)
-            .expect("content-bound candidate for mismatch test");
-        let mut wrong_parent = SaltV2PackageReader::new_strict(
-            std::fs::File::open(bundle.join("compact.tsalt2")).unwrap(),
-        )
-        .expect("open parent for identity rejection");
-        assert!(matches!(
-            materialize_output_scale_candidate_child(
-                mismatched_parent_candidate,
-                &mut wrong_parent,
-                Cursor::new(Vec::new()),
-            ),
-            Err(ScaleCandidateChildError::ParentIdentityMismatch)
-        ));
         let mut parent_package = SaltV2PackageReader::new_strict(
             std::fs::File::open(bundle.join("compact.tsalt2")).unwrap(),
         )
         .expect("open refined parent package");
         let (child_output, child_lineage) = materialize_output_scale_candidate_child(
-            scale_candidate,
+            &fitted_candidate,
+            &output_spec,
             &mut parent_package,
             Cursor::new(Vec::new()),
         )

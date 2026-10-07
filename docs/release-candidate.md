@@ -472,17 +472,19 @@ now starts a fit from a strict packed parent plane and produces a spec- and
 parent-bound candidate. The focused fixture, quantize tests, formatting, and
 scoped Clippy passed. This is software-path evidence only: the fixture uses
 synthetic activations and teacher weights, not the pinned Qwen teacher or
-admitted production captures. Full deterministic candidate scoring/selection,
-builder-produced child publication/replay, and Qwen empirical evidence remain
-open.
+admitted production captures. Full deterministic candidate scoring/selection
+and Qwen empirical evidence remain open.
 
-The admitted-Qwen CPU fixture now also exercises the immutable-child boundary:
-it rejects a scale candidate whose parent digest differs from the strict reader,
-then writes, reloads, and replays the matching child through the existing
-`TSQ36RC v1` path. The focused fixture and `tritium-salt` Clippy passed. This is
-test coverage around existing seams; it does not yet feed a
-`FixedTritScaleUpdateCandidateBuilder` result into that path, nor does it add a
-production candidate-materialization coordinator or Qwen empirical evidence.
+The fixture now feeds the actual fitted candidate through the existing child
+package writer. It reopens the candidate under its exact frozen spec, checks the
+parent digest against a strict reader, emits `SaltV2ScaleUpdateChild` lineage,
+then reloads the child and replays it through `TSQ36RC v1`; it no longer
+substitutes hand-authored scales. The focused fixture and `tritium-salt` Clippy
+passed. This proves the synthetic candidate-to-child-to-replay composition,
+not a shipped campaign coordinator. A production admission-bound materializer
+still needs its ADR/API decision; deterministic whole-model scoring/selection,
+restart orchestration, admitted production captures, and Qwen empirical evidence
+remain open.
 
 ### Flagship campaign status refresh (2026-10-04)
 
