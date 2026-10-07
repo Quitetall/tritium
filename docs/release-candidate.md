@@ -2195,6 +2195,33 @@ The accompanying cProfile runs reduced calls to
 `fit_joint_ternary_diagonal*` from 2,106 to 224 (89.4% fewer). Its profile is
 at `/tmp/tritium-ptq-groups-convert.pstats` (SHA-256
 `d7c6a02b6aaf11e7cf294efc99b481363bb82392154fa03903be9f0bb846e1aa`).
+The grouped cProfile run took `88.697s` total; `_joint_additive_projection`
+accounted for `78.124s` cumulative, and the native
+`fit_joint_ternary_diagonal_groups` call accounted for `66.955s` self time.
+Thus the measured local hot path is still native solver work, not Python/native
+call count or artifact sealing. These figures are profiled local timings and
+should guide optimization only; they do not explain the hosted runner's roughly
+ninefold slower conversion by themselves.
+
+### Installed-wheel SmolLM2 CPU tutorial — 2026-10-07
+
+Built and installed the Linux CPU abi3 wheel (`pytritium 1.1.0rc2`) into an
+isolated Python 3.14 environment with its optional ONNX dependencies, then ran
+the pinned SmolLM2 tutorial through the public `prepare` → `calibrate` →
+`convert()` path. The tutorial completed PTQ, generation, native checkpoint
+round-trip, ONNX export/replay, and a QAT update plus optimizer resume in
+`190.242s`, below its frozen `300s` local limit. Receipt:
+`/tmp/tritium-ptq-installed-wheel-final-1791390391/receipt.json`.
+
+The receipt records 211 selected and 61 preserved parameters, `537,919,488`
+selected dense bytes versus a `92,192,265`-byte compact checkpoint (5.83× for
+this small fixture), ONNX replay max absolute error `8.01e-5` against `1e-4`
+tolerance, and PTQ artifact `sha256:2beb214271ee9e1581e721f4f87937a3e12c1266ba4bc2e8bc99ab57b56059d4`.
+The generated sample was a short sentence; this is functional CPU smoke evidence,
+not a model-quality claim. It does not qualify the hosted CI tutorial, GPU
+performance, Qwen, or public release. The first attempt used an environment
+missing ONNX optional dependencies and stopped at ONNX export; the successful
+rerun used the existing isolated environment containing ONNX and ONNX Runtime.
 
 This is promising local evidence for the bridge change, not release
 qualification or a controlled performance claim: the baseline is the hosted

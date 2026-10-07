@@ -926,8 +926,8 @@ fn optimize_start(
     kind: JointFitStartKind,
 ) -> Result<FitState, JointFitError> {
     let trits = assignment_for_metric(weights, &scales, metric)?;
-    let reconstruction = reconstruct_planes(&scales, &trits, weights.len());
-    let objective = metric_objective(weights, &reconstruction, metric)?;
+    let (reconstruction, objective) =
+        reconstruct_planes_and_objective(weights, &scales, &trits, metric)?;
     let mut state = FitState {
         scales,
         trits,
@@ -953,9 +953,12 @@ fn optimize_start(
             config.ridge_condition_limit,
             config.scale_precision,
         )?;
-        let scale_reconstruction =
-            reconstruct_planes(&scale_outcome.scales, &scale_outcome.trits, weights.len());
-        let scale_objective = metric_objective(weights, &scale_reconstruction, metric)?;
+        let (scale_reconstruction, scale_objective) = reconstruct_planes_and_objective(
+            weights,
+            &scale_outcome.scales,
+            &scale_outcome.trits,
+            metric,
+        )?;
         let scale_accepted = scale_objective < state.objective;
         state.receipt.scale_solves.push(ScaleSolveReceipt {
             iteration,
@@ -979,9 +982,8 @@ fn optimize_start(
         }
 
         let assignment = assignment_for_metric(weights, &state.scales, metric)?;
-        let assignment_reconstruction =
-            reconstruct_planes(&state.scales, &assignment, weights.len());
-        let assignment_objective = metric_objective(weights, &assignment_reconstruction, metric)?;
+        let (assignment_reconstruction, assignment_objective) =
+            reconstruct_planes_and_objective(weights, &state.scales, &assignment, metric)?;
         if assignment_objective < state.objective {
             let objective_before = state.objective;
             state.trits = assignment;
@@ -1502,6 +1504,49 @@ fn reconstruct_planes(scales: &[f32], trits: &[Vec<i8>], len: usize) -> Vec<f32>
     reconstruction
 }
 
+/// Reconstruct additive planes and evaluate diagonal objectives in one ordered pass.
+///
+/// The reconstructed f32 values are accumulated in exactly the same plane order as
+/// [`reconstruct_planes`]. For diagonal metrics, this avoids writing then rereading
+/// the full reconstruction solely to compute the objective. Dense metrics retain the
+/// existing quadratic evaluator because their objective depends on off-diagonal terms.
+fn reconstruct_planes_and_objective(
+    weights: &[f32],
+    scales: &[f32],
+    trits: &[Vec<i8>],
+    metric: JointFitMetric<'_>,
+) -> Result<(Vec<f32>, f64), JointFitError> {
+    if matches!(metric, JointFitMetric::Dense(_)) {
+        let reconstruction = reconstruct_planes(scales, trits, weights.len());
+        let objective = metric_objective(weights, &reconstruction, metric)?;
+        return Ok((reconstruction, objective));
+    }
+
+    let mut reconstruction = vec![0.0_f32; weights.len()];
+    let mut objective = 0.0_f64;
+    for index in 0..weights.len() {
+        let mut fitted = 0.0_f32;
+        for (scale, plane) in scales.iter().zip(trits) {
+            fitted += *scale * f32::from(plane[index]);
+        }
+        reconstruction[index] = fitted;
+        let error = f64::from(weights[index]) - f64::from(fitted);
+        let curvature = match metric {
+            JointFitMetric::Identity => 1.0,
+            JointFitMetric::Diagonal(values) => f64::from(values[index]),
+            JointFitMetric::DiagonalF64(values) => values[index],
+            JointFitMetric::DiagonalAffine {
+                values,
+                scale,
+                shift,
+            } => values[index] * scale + shift,
+            JointFitMetric::Dense(_) => unreachable!("dense metric returned above"),
+        };
+        accumulate_objective_term(&mut objective, error * error * curvature)?;
+    }
+    Ok((reconstruction, objective.max(0.0)))
+}
+
 fn metric_objective(
     weights: &[f32],
     reconstruction: &[f32],
@@ -1760,6 +1805,43 @@ mod tests {
                 error * error
             })
             .sum()
+    }
+
+    #[test]
+    fn fused_reconstruction_objective_is_bit_identical_to_reference_paths() {
+        let weights = [0.75, -0.5, 0.25, -1.25];
+        let scales = [0.625, 0.1875];
+        let trits = [vec![1, -1, 0, 1], vec![-1, 0, 1, -1]];
+        let diagonal_f32 = [0.5, 1.25, 2.0, 0.75];
+        let diagonal_f64 = [0.5, 1.25, 2.0, 0.75];
+
+        let assert_same = |metric| {
+            let expected_reconstruction = reconstruct_planes(&scales, &trits, weights.len());
+            let expected_objective =
+                metric_objective(&weights, &expected_reconstruction, metric).unwrap();
+            let (actual_reconstruction, actual_objective) =
+                reconstruct_planes_and_objective(&weights, &scales, &trits, metric).unwrap();
+            assert_eq!(actual_reconstruction, expected_reconstruction);
+            assert_eq!(actual_objective.to_bits(), expected_objective.to_bits());
+        };
+
+        assert_same(JointFitMetric::Identity);
+        assert_same(JointFitMetric::Diagonal(&diagonal_f32));
+        assert_same(JointFitMetric::DiagonalF64(&diagonal_f64));
+        assert_same(JointFitMetric::DiagonalAffine {
+            values: &diagonal_f64,
+            scale: 0.75,
+            shift: 0.125,
+        });
+        let dense = DensePsdMetric::new(
+            weights.len(),
+            &[
+                2.0, 0.25, 0.0, 0.0, 0.25, 1.5, 0.0, 0.0, 0.0, 0.0, 0.75, 0.125, 0.0, 0.0, 0.125,
+                1.0,
+            ],
+        )
+        .unwrap();
+        assert_same(JointFitMetric::Dense(&dense));
     }
 
     #[test]
