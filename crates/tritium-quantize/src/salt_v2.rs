@@ -918,6 +918,11 @@ struct FitState {
     receipt: JointFitRestartReceipt,
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static ASSIGNMENT_FOR_METRIC_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn optimize_start(
     weights: &[f32],
     metric: JointFitMetric<'_>,
@@ -943,6 +948,8 @@ fn optimize_start(
         },
     };
 
+    // The initial trits came from assignment_for_metric at the initial scales.
+    let mut assignment_checked_for_current_scales = true;
     for iteration in 0..config.max_iterations {
         let mut improved = false;
         let scale_outcome = solve_scales(
@@ -979,28 +986,35 @@ fn optimize_start(
                 objective_after: scale_objective,
             });
             improved = true;
+            assignment_checked_for_current_scales = false;
         }
 
-        let assignment = assignment_for_metric(weights, &state.scales, metric)?;
-        // The current reconstruction/objective already correspond to these exact
-        // scales and trits. In the common converged case, avoid rebuilding and
-        // rescoring the full row just to rediscover the same state.
-        if assignment != state.trits {
-            let (assignment_reconstruction, assignment_objective) =
-                reconstruct_planes_and_objective(weights, &state.scales, &assignment, metric)?;
-            if assignment_objective < state.objective {
-                let objective_before = state.objective;
-                state.trits = assignment;
-                state.reconstruction = assignment_reconstruction;
-                state.objective = assignment_objective;
-                state.accepted_objectives.push(assignment_objective);
-                state.receipt.accepted_updates.push(JointFitUpdateReceipt {
-                    iteration,
-                    phase: JointFitUpdatePhase::Assignment,
-                    objective_before,
-                    objective_after: assignment_objective,
-                });
-                improved = true;
+        // Re-evaluate assignments only after an accepted scale change. A rejected
+        // scale candidate leaves the current scales unchanged, and the assignment
+        // step for those scales was already evaluated in the prior iteration.
+        if !assignment_checked_for_current_scales {
+            let assignment = assignment_for_metric(weights, &state.scales, metric)?;
+            assignment_checked_for_current_scales = true;
+            // The current reconstruction/objective already correspond to these exact
+            // scales and trits. Avoid rebuilding and rescoring the row when the
+            // assignment step rediscovers the same state.
+            if assignment != state.trits {
+                let (assignment_reconstruction, assignment_objective) =
+                    reconstruct_planes_and_objective(weights, &state.scales, &assignment, metric)?;
+                if assignment_objective < state.objective {
+                    let objective_before = state.objective;
+                    state.trits = assignment;
+                    state.reconstruction = assignment_reconstruction;
+                    state.objective = assignment_objective;
+                    state.accepted_objectives.push(assignment_objective);
+                    state.receipt.accepted_updates.push(JointFitUpdateReceipt {
+                        iteration,
+                        phase: JointFitUpdatePhase::Assignment,
+                        objective_before,
+                        objective_after: assignment_objective,
+                    });
+                    improved = true;
+                }
             }
         }
         if !improved {
@@ -1431,6 +1445,9 @@ fn assignment_for_metric(
     scales: &[f32],
     metric: JointFitMetric<'_>,
 ) -> Result<Vec<Vec<i8>>, JointFitError> {
+    #[cfg(test)]
+    ASSIGNMENT_FOR_METRIC_CALLS.with(|calls| calls.set(calls.get() + 1));
+
     let mut trits = exact_ternary_assignment(weights, scales)?;
     let JointFitMetric::Dense(dense) = metric else {
         return Ok(trits);
@@ -2335,6 +2352,29 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn converged_scale_candidate_does_not_recompute_current_assignment() {
+        ASSIGNMENT_FOR_METRIC_CALLS.with(|calls| calls.set(0));
+
+        let state = optimize_start(
+            &[1.0, -1.0],
+            JointFitMetric::Identity,
+            JointFitConfig::default(),
+            vec![1.0],
+            JointFitStartKind::DeterministicRestart(0),
+        )
+        .expect("exact one-plane fit");
+
+        assert_eq!(state.objective, 0.0);
+        ASSIGNMENT_FOR_METRIC_CALLS.with(|calls| {
+            assert_eq!(
+                calls.get(),
+                1,
+                "initial assignment remains valid because the scale candidate was not accepted"
+            );
+        });
     }
 
     #[test]
