@@ -2642,7 +2642,7 @@ mod tests {
     use std::{
         cell::Cell,
         convert::Infallible,
-        io::{self, Cursor, Read, Seek, Write},
+        io::{self, Cursor, Write},
     };
 
     use half::f16;
@@ -2656,10 +2656,8 @@ mod tests {
             SaltV2MasterTensorEncoder, SaltV2MasterTrack, SaltV2PrefixLoss,
         },
         salt_v2_package::{
-            SaltV2Package, SaltV2PackageReader, SaltV2Plane, SaltV2ScaleUpdateChild,
-            SaltV2ScaleUpdateChildError, SaltV2StreamTensorSpec, SaltV2Tensor, SaltV2Tile,
-            SaltV2Transform, SaltV2UniformRateModel, write_salt_v2_package,
-            write_salt_v2_scale_update_child,
+            SaltV2Package, SaltV2PackageReader, SaltV2Plane, SaltV2StreamTensorSpec, SaltV2Tensor,
+            SaltV2Tile, SaltV2Transform, SaltV2UniformRateModel, write_salt_v2_package,
         },
     };
     #[cfg(feature = "cuda")]
@@ -2674,9 +2672,9 @@ mod tests {
     };
     use tritium_quantize::{
         ActivationCache, ActivationCacheBuilder, ActivationCacheSpec, ActivationChunk,
-        ActivationDType, ActivationDigest, ByteDelta, FixedTritScaleUpdateCandidate,
-        FixedTritScaleUpdateCandidateBuilder, NestedProfileBudgets, OutputCandidateReceipt,
-        OutputObjectiveWeights, OutputReconstructionAccumulator, OutputReconstructionReceipt,
+        ActivationDType, ActivationDigest, ByteDelta, FixedTritScaleUpdateCandidateBuilder,
+        NestedProfileBudgets, OutputCandidateReceipt, OutputObjectiveWeights,
+        OutputReconstructionAccumulator, OutputReconstructionReceipt,
         OutputReconstructionScaleCandidate, OutputReconstructionSchedule,
         OutputReconstructionScope, OutputReconstructionSpec, PhysicalBytes, ProfileBudget,
         Qwen35SourceDtype, Qwen35TensorRole, Qwen35TensorScope, SaltV2Profile,
@@ -2695,26 +2693,6 @@ mod tests {
         WorkspacePlan,
     };
     use super::*;
-
-    fn materialize_output_scale_candidate_child<R, W>(
-        candidate: &FixedTritScaleUpdateCandidate,
-        spec: &OutputReconstructionSpec,
-        parent: &mut SaltV2PackageReader<R>,
-        output: W,
-    ) -> Result<(W, SaltV2ScaleUpdateChild), String>
-    where
-        R: Read + Seek,
-        W: Read + Write + Seek,
-    {
-        let candidate = candidate
-            .as_scale_candidate(spec)
-            .map_err(|error| error.to_string())?;
-        if candidate.parent_package_digest() != parent.package_id().as_bytes() {
-            return Err("scale candidate is bound to a different parent".to_owned());
-        }
-        write_salt_v2_scale_update_child(parent, output, candidate.updates())
-            .map_err(|error: SaltV2ScaleUpdateChildError| error.to_string())
-    }
 
     #[derive(Debug)]
     struct EmptySource;
@@ -3957,13 +3935,15 @@ mod tests {
                 std::fs::File::open(bundle.join("compact.tsalt2")).unwrap(),
             )
             .expect("open refined parent package");
-            let (child_output, child_lineage) = materialize_output_scale_candidate_child(
-                fitted,
-                &refined_spec,
-                &mut parent_package,
-                Cursor::new(Vec::new()),
-            )
-            .expect("write immutable refined child");
+            let (child_output, child_lineage) = session
+                .materialize_scale_update_candidate_child(
+                    &receipt,
+                    &refined_spec,
+                    fitted,
+                    &mut parent_package,
+                    Cursor::new(Vec::new()),
+                )
+                .expect("admitted session writes immutable refined child");
             let child_package_path = bundle.join(format!(
                 "compact.refined-{}.tsalt2",
                 scale_candidate.initialization_seed()

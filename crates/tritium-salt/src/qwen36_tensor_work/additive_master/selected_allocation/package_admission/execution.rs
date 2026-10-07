@@ -11,20 +11,28 @@ use refined_candidate::ChildReplayEvidence;
 pub use refined_candidate::Qwen36RefinedCandidateExecutionReceipt;
 
 use core::{convert::Infallible, fmt};
-use std::{error::Error, path::Path};
+use std::{
+    error::Error,
+    io::{Read, Seek, Write},
+    path::Path,
+};
 
 use tritium_format::{
-    ModelId, PackageId, RuntimeOutputScope, salt_v2_package::SaltV2ScaleUpdateChild,
+    ModelId, PackageId, RuntimeOutputScope,
+    salt_v2_package::{
+        SaltV2PackageReader, SaltV2ScaleUpdateChild, SaltV2ScaleUpdateChildError,
+        write_salt_v2_scale_update_child,
+    },
 };
 use tritium_nn::{
     NnError, Projection, Qwen35ExecutionOutputBatch, Qwen35ExecutionVisitError,
     Qwen35SaltV2LanguageMtpModel, Qwen35UntrustedRuntimeTranscript,
 };
 use tritium_quantize::{
-    FixedTritScaleUpdateCandidateBuilder, OutputReconstructionActivationSet,
-    OutputReconstructionActivationSource, OutputReconstructionError,
-    OutputReconstructionScaleCandidate, OutputReconstructionScope, OutputReconstructionSpec,
-    SaltV2Profile,
+    FixedTritScaleUpdateCandidate, FixedTritScaleUpdateCandidateBuilder,
+    OutputReconstructionActivationSet, OutputReconstructionActivationSource,
+    OutputReconstructionError, OutputReconstructionScaleCandidate, OutputReconstructionScope,
+    OutputReconstructionSpec, SaltV2Profile,
 };
 
 use crate::{ContentId, Qwen36PreservedSafetensorsError};
@@ -534,6 +542,74 @@ impl fmt::Debug for Qwen36AdmittedExecutionSession<'_, '_, '_, '_, '_> {
 impl<'admission, 'allocated, 'parent, 'store, 'source>
     Qwen36AdmittedExecutionSession<'admission, 'allocated, 'parent, 'store, 'source>
 {
+    /// Materialize one fitted restart as a strict immutable child of this session's package.
+    ///
+    /// The parent reader must be the strict package instance used by this admitted
+    /// execution session. The returned child lineage binds the exact parent and
+    /// fitted scale update. Callers must stage `output` and publish it atomically
+    /// only after this method succeeds; the writer may contain partial bytes on error.
+    /// Each restart may be materialized for candidate scoring, then the selected
+    /// restart must be resolved from its output receipt with
+    /// [`tritium_quantize::OutputReconstructionReceipt::selected_fitted_scale_update_candidate`].
+    ///
+    /// # Errors
+    /// Rejects changed admission, a different parent execution/package, mismatched
+    /// fit specification or parent identity, invalid package updates, and I/O errors.
+    pub fn materialize_scale_update_candidate_child<R, W>(
+        &self,
+        parent_execution: &Qwen36AdmittedExecutionReceipt,
+        spec: &OutputReconstructionSpec,
+        candidate: &FixedTritScaleUpdateCandidate,
+        parent: &mut SaltV2PackageReader<R>,
+        output: W,
+    ) -> Result<(W, SaltV2ScaleUpdateChild), Qwen36ExecutionVisitError<Infallible>>
+    where
+        R: Read + Seek,
+        W: Read + Write + Seek,
+    {
+        self.admission
+            .verify_current()
+            .map_err(Qwen36ExecutionVisitError::Admission)?;
+        output_binding::validate_execution(&self.authority, parent_execution)
+            .map_err(Qwen36ExecutionVisitError::Runtime)?;
+        if spec.source_model_id() != self.authority.source_model_id
+            || spec.token_stream_digest() != parent_execution.token_stream_digest()
+            || parent_execution.package_id() != self.authority.package_id
+            || parent.package_id() != self.authority.package_id
+        {
+            return Err(Qwen36ExecutionVisitError::Runtime(NnError::Provenance(
+                "scale-update child parent differs from admitted execution".to_owned(),
+            )));
+        }
+        let scale_candidate = candidate.as_scale_candidate(spec).map_err(|error| {
+            Qwen36ExecutionVisitError::Runtime(NnError::InvalidArtifact(format!(
+                "validate scale-update candidate: {error}"
+            )))
+        })?;
+        if scale_candidate.parent_package_digest() != self.authority.package_id.as_bytes() {
+            return Err(Qwen36ExecutionVisitError::Runtime(NnError::Provenance(
+                "scale-update candidate is bound to a different admitted package".to_owned(),
+            )));
+        }
+        let (output, lineage) =
+            write_salt_v2_scale_update_child(parent, output, scale_candidate.updates()).map_err(
+                |error: SaltV2ScaleUpdateChildError| {
+                    Qwen36ExecutionVisitError::Runtime(NnError::InvalidArtifact(format!(
+                        "materialize scale-update child: {error}"
+                    )))
+                },
+            )?;
+        parent.verify_unchanged().map_err(|error| {
+            Qwen36ExecutionVisitError::Runtime(NnError::InvalidArtifact(format!(
+                "verify scale-update parent after child materialization: {error}"
+            )))
+        })?;
+        self.admission
+            .verify_current()
+            .map_err(Qwen36ExecutionVisitError::Admission)?;
+        Ok((output, lineage))
+    }
+
     /// Observe one frozen output-reconstruction scope in an exact fixed-trit fit.
     ///
     /// The activation set is reopened against `spec` for every call, and the
