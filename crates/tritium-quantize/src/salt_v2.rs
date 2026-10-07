@@ -1193,9 +1193,18 @@ fn solve_scales(
                 for plane in 0..planes {
                     let left = f64::from(trits[plane][index]);
                     rhs[plane] += left * weight * curvature;
-                    for other in 0..planes {
+                    // The normal matrix is a weighted Gram matrix. Accumulate
+                    // only one triangle, then mirror it; each mirrored entry
+                    // sees the same row order and the same commutative trit
+                    // product as the former full-matrix loop.
+                    for other in plane..planes {
                         normal[plane][other] += left * f64::from(trits[other][index]) * curvature;
                     }
+                }
+            }
+            for plane in 0..planes {
+                for other in 0..plane {
+                    normal[plane][other] = normal[other][plane];
                 }
             }
         }
