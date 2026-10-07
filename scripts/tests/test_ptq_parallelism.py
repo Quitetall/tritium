@@ -45,8 +45,14 @@ with tempfile.TemporaryDirectory(prefix="tritium-ptq-parallelism-") as root:
     for plane in fitted.planes:
         digest.update(plane.trits.numpy().tobytes())
         digest.update(plane.scales.numpy().tobytes())
+    benchmark_environment = {"cpu_count": os.cpu_count()}
+    if hasattr(os, "sched_getaffinity"):
+        benchmark_environment["affinity_cpus"] = len(os.sched_getaffinity(0))
+    if hasattr(os, "getloadavg"):
+        benchmark_environment["load_average_1m"] = os.getloadavg()[0]
     print(json.dumps({
         "algorithm_id": artifact.algorithm_id,
+        "benchmark_environment": benchmark_environment,
         "elapsed_seconds": elapsed,
         "fit_digest": digest.hexdigest(),
         "weighted_mse": fitted.weighted_mse,
@@ -88,7 +94,9 @@ class PublicPtqParallelismTests(unittest.TestCase):
             "public PTQ convert rows=8192 columns=64 "
             f"serial_seconds={serial['elapsed_seconds']:.3f} "
             f"parallel_seconds={parallel['elapsed_seconds']:.3f} "
-            f"speedup={speedup:.2f}x"
+            f"speedup={speedup:.2f}x "
+            f"serial_environment={serial['benchmark_environment']} "
+            f"parallel_environment={parallel['benchmark_environment']}"
         )
         self.assertGreaterEqual(
             speedup,
