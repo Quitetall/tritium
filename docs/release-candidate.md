@@ -2067,9 +2067,24 @@ parallelism` step in Actions run
 (job `112810906163`). The test exercises public `prepare` → `calibrate` →
 `convert()` and passed its assertions that serial and four-thread runs produce
 the same algorithm ID, fitted-artifact digest, and weighted error, with at least
-1.5× measured speedup. The exact timing lines are not yet available: the run's
-pinned SmolLM2 CPU tutorial job is still active. The separate general Python
-unit-test job correctly skips this probe because PyTorch is absent there; the
-installed-wheel lane is its authoritative execution environment. This is a
-bounded row-fitting result, not a whole-model throughput or release-performance
-claim.
+1.5× measured speedup. The pinned SmolLM2 CPU tutorial in the same workflow
+finished with `1,081.175s` elapsed against the unchanged `300s` budget. Its
+stage markers place public conversion at `853.208s` total elapsed, or about
+`852.602s` after the `0.606s` calibration point. The prior exact-source run
+`37621206763` recorded `863.433s` of conversion, so this run is roughly 1.3%
+faster by wall clock on different hosted runners—not a statistically isolated
+solver improvement and nowhere near sufficient for the five-minute gate. The
+entire tutorial still fails the time gate. The separate general Python unit-test
+job correctly skips the PTQ probe because PyTorch is absent there; the
+installed-wheel lane is its authoritative execution environment. The passing
+parallelism probe is a bounded row-fitting result, not a whole-model throughput
+or release-performance claim.
+
+The run's remaining measured stages were approximately `20.784s` for native
+checkpoint round-trip, `43.831s` for generation, `129.405s` for ONNX export,
+`26.648s` for ONNX replay, and `7.161s` from QAT reload start through resume.
+Sampled available memory remained at least `12.2 GiB`, and runner temp disk
+remained above `83 GiB`; this was a CPU-time failure, not OOM or disk pressure.
+The exact-source workflow is
+[37626387409](https://github.com/Quitetall/tritium/actions/runs/37626387409)
+on revision `19656644ad3c26c9e4f6f3948ba08c304c6b4b24`.
