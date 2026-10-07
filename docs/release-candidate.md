@@ -453,24 +453,28 @@ On 2026-10-06, the bounded Qwen paired-projection visitor was exposed as a
 campaign-facing API. It resolves canonical MLP, DeltaNet, and full-attention
 projection names, validates teacher/current geometry and activation arithmetic,
 and synchronously lends finite outputs to the caller without retaining them.
-The loaded SALT V2 fixture exercises it. ADR 0028 Amendment 2026-10-06 records
+The loaded SALT V2 fixture exercises it. The local ADR 0028 working copy records
 the provenance boundary: callers bind teacher identity, activation identity,
-projection name/index, spec, and parent. This supplies an adapter seam only;
-dense teacher acquisition, production activation binding, candidate fitting and
-selection, child materialization, and exact child replay are not yet connected
-to the same production flow. No real model or campaign was run.
+projection name/index, spec, and parent. That amendment has not been promoted
+from the private research repository into this public checkout. This first
+visitor was only an adapter seam; dense teacher acquisition, full campaign data
+capture, candidate selection, and child publication remain separate work.
 
-The next B3 slice adds paired bounded-window evaluation of a caller-supplied
-dense teacher projection and the exact named projection in the current Qwen
-package. The seam rejects width or activation-arithmetic mismatches, and the
-loaded SALT fixture verifies expected teacher/student rows. The tile refit now
-owns a copy of at most one 256-trit allocation tile. It can also start directly
-from a strict reader's borrowed packed plane: canonical decode happens at the
-boundary, then the reader buffer may be released. A package-reader integration
-test verifies that lifetime handoff and the focused test passes. Formatting and
-the scoped Qwen/quantize Clippy gate passed. This seam still does not bind
-teacher weights or activation caches, score full-model candidates, or
-materialize/replay immutable child packages.
+The admitted-session API now composes the visitor with the frozen spec, a
+verified parent execution, an activation source, and a parent-bound scale-fit
+builder. It reopens each requested block window against the activation-cache
+digest, chooses the cache for the named projection's layer, and feeds paired
+teacher/current outputs into the active plane fit. It checks package admission
+again after the window. The builder accepts zero scales only when the matching
+trit group is all zero, matching the SALT V2 package contract; it rejects
+negative zero and zero-scaled nonzero groups. A synthetic admitted-Qwen fixture
+now starts a fit from a strict packed parent plane and produces a spec- and
+parent-bound candidate. The focused fixture, quantize tests, formatting, and
+scoped Clippy passed. This is software-path evidence only: the fixture uses
+synthetic activations and teacher weights, not the pinned Qwen teacher or
+admitted production captures. Full deterministic candidate scoring/selection,
+builder-produced child publication/replay, and Qwen empirical evidence remain
+open.
 
 The admitted-Qwen CPU fixture now also exercises the immutable-child boundary:
 it rejects a scale candidate whose parent digest differs from the strict reader,

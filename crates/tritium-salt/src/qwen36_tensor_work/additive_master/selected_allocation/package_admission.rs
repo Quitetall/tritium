@@ -9,7 +9,7 @@ pub use execution::{
     Qwen36ExecutionReplayError, Qwen36ExecutionSessionOpenError, Qwen36ExecutionVisitError,
     Qwen36FinalLogitsOutputBindingError, Qwen36FinalLogitsOutputBindingReceipt,
     Qwen36OutputScopeBindingReceipt, Qwen36RefinedCandidateExecutionReceipt,
-    Qwen36RefinedCandidateReplay,
+    Qwen36RefinedCandidateReplay, Qwen36ScaleRefitWindowError,
 };
 #[cfg(feature = "cuda")]
 pub use pv::{

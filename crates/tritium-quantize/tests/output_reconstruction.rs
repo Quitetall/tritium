@@ -1250,6 +1250,45 @@ fn packed_parent_plane_starts_owned_candidate_fit() {
 }
 
 #[test]
+fn scale_refit_accepts_zero_scale_only_for_all_zero_trit_groups() {
+    let spec = spec(
+        OutputReconstructionSchedule::SlidingWindows {
+            block_count: 2,
+            window_size: 2,
+            stride: 1,
+        },
+        1,
+    );
+    let mut valid = FixedTritScaleUpdateCandidateBuilder::new(&spec, &[55; 32], 1);
+    valid
+        .begin_tile_plane(0, 0, 0, 2, &[Trit::ZERO; 256], &[f16::ZERO; 2], 128, 1)
+        .unwrap();
+
+    let mut negative_zero = FixedTritScaleUpdateCandidateBuilder::new(&spec, &[55; 32], 2);
+    assert!(matches!(
+        negative_zero.begin_tile_plane(
+            0,
+            0,
+            0,
+            2,
+            &[Trit::ZERO; 256],
+            &[f16::from_bits(0x8000); 2],
+            128,
+            1,
+        ),
+        Err(OutputReconstructionError::InvalidScaleUpdate)
+    ));
+
+    let mut nonzero_trit = FixedTritScaleUpdateCandidateBuilder::new(&spec, &[55; 32], 3);
+    let mut trits = [Trit::ZERO; 256];
+    trits[0] = Trit::from_i8(1).unwrap();
+    assert!(matches!(
+        nonzero_trit.begin_tile_plane(0, 0, 0, 2, &trits, &[f16::ZERO; 2], 128, 1,),
+        Err(OutputReconstructionError::InvalidScaleUpdate)
+    ));
+}
+
+#[test]
 fn scheduled_output_window_rejects_layer_cache_token_alignment_drift() {
     let caches = [
         output_activation_cache(

@@ -23,6 +23,7 @@ pub use additive_master::{
     Qwen36PackageAdmittedCampaignStore, Qwen36PackageProfileReceipt, Qwen36PackageRuntimeLedger,
     Qwen36PackageScaleOnlyCampaignStore, Qwen36PackageVisitError, Qwen36PvParentContext,
     Qwen36RefinedCandidateExecutionReceipt, Qwen36RefinedCandidateReplay,
+    Qwen36ScaleRefitWindowError,
 };
 #[cfg(all(unix, feature = "cuda"))]
 pub use additive_master::{

@@ -1707,7 +1707,14 @@ impl FixedTritTileScaleRefitAccumulator {
         }
         if scales
             .iter()
-            .any(|scale| !scale.is_finite() || scale.to_f32() <= 0.0)
+            .any(|scale| !scale.is_finite() || scale.to_bits() & 0x8000 != 0)
+            || self
+                .trits
+                .chunks(self.scale_group_size)
+                .zip(scales)
+                .any(|(group, scale)| {
+                    *scale == half::f16::ZERO && group.iter().any(|trit| !trit.is_zero())
+                })
         {
             return Err(OutputReconstructionError::InvalidScaleUpdate);
         }
@@ -1943,6 +1950,17 @@ impl<'spec> FixedTritScaleUpdateCandidateBuilder<'spec> {
         }
     }
 
+    /// Whether this in-progress fit is bound to the exact frozen spec and parent.
+    #[must_use]
+    pub fn is_bound_to(
+        &self,
+        spec: &OutputReconstructionSpec,
+        parent_package_digest: &[u8; 32],
+    ) -> bool {
+        self.spec.spec_id() == spec.spec_id()
+            && &self.parent_package_digest == parent_package_digest
+    }
+
     /// Begin the next canonical tensor/tile/plane fit.
     ///
     /// # Errors
@@ -1974,7 +1992,13 @@ impl<'spec> FixedTritScaleUpdateCandidateBuilder<'spec> {
         if current_scales.len() != expected_scale_count
             || current_scales
                 .iter()
-                .any(|scale| !scale.is_finite() || scale.to_f32() <= 0.0)
+                .any(|scale| !scale.is_finite() || scale.to_bits() & 0x8000 != 0)
+            || trits
+                .chunks(scale_group_size)
+                .zip(current_scales)
+                .any(|(group, scale)| {
+                    *scale == half::f16::ZERO && group.iter().any(|trit| !trit.is_zero())
+                })
         {
             return Err(OutputReconstructionError::InvalidScaleUpdate);
         }

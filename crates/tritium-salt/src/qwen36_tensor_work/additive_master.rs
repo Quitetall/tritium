@@ -12,6 +12,7 @@ pub use selected_allocation::{
     Qwen36PackageAdmittedCampaignStore, Qwen36PackageProfileReceipt, Qwen36PackageRuntimeLedger,
     Qwen36PackageScaleOnlyCampaignStore, Qwen36PackageVisitError, Qwen36PvParentContext,
     Qwen36RefinedCandidateExecutionReceipt, Qwen36RefinedCandidateReplay,
+    Qwen36ScaleRefitWindowError,
 };
 pub use selected_allocation::{
     Qwen36AllocatedCampaignStore, Qwen36PhysicalAllocationError, Qwen36SelectedAllocationBindError,
@@ -2663,19 +2664,22 @@ mod tests {
     };
     #[cfg(feature = "cuda")]
     use tritium_nn::{
-        ArchSpec, DenseLinear, DevicePvRecoverySession, Mlp, MlpKind, ModelConfig, ModelWeights,
-        Projection, SwiGluMlp, TiedSwiGluTrainingModel, TokenEmbedding, TransformerBlock,
+        ArchSpec, DevicePvRecoverySession, Mlp, MlpKind, ModelConfig, ModelWeights, SwiGluMlp,
+        TiedSwiGluTrainingModel, TokenEmbedding, TransformerBlock,
     };
     use tritium_nn::{
-        NnError, QWEN36_27B_REVISION, Qwen35CheckpointConfig, Qwen35SaltV2LanguageMtpModel,
-        Qwen35TensorSchemaRole, Qwen35TensorStreamError, qwen35_language_mtp_tensor_schema,
+        DenseLinear, NnError, Projection, QWEN36_27B_REVISION, Qwen35CheckpointConfig,
+        Qwen35SaltV2LanguageMtpModel, Qwen35TensorSchemaRole, Qwen35TensorStreamError,
+        qwen35_language_mtp_tensor_schema,
     };
     use tritium_quantize::{
-        ByteDelta, NestedProfileBudgets, OutputObjectiveWeights, OutputReconstructionAccumulator,
+        ActivationCache, ActivationCacheBuilder, ActivationCacheSpec, ActivationChunk,
+        ActivationDType, ActivationDigest, ByteDelta, FixedTritScaleUpdateCandidateBuilder,
+        NestedProfileBudgets, OutputObjectiveWeights, OutputReconstructionAccumulator,
         OutputReconstructionReceipt, OutputReconstructionScaleCandidate,
         OutputReconstructionSchedule, OutputReconstructionScope, OutputReconstructionSpec,
         PhysicalBytes, ProfileBudget, Qwen35SourceDtype, Qwen35TensorRole, Qwen35TensorScope,
-        SaltV2Profile, select_output_reconstruction,
+        SaltV2Profile, output_reconstruction_activation_digest, select_output_reconstruction,
     };
     #[cfg(feature = "cuda")]
     use tritium_train::{
@@ -3792,9 +3796,41 @@ mod tests {
         assert_eq!(receipt.token_count(), 3);
         assert_eq!(receipt.logit_count(), 256);
 
+        let activation_caches = (0..2_u32)
+            .map(|layer_index| {
+                let cache_spec = ActivationCacheSpec::new(
+                    layer_index,
+                    format!("model.language_model.layers.{layer_index}.input"),
+                    3,
+                    128,
+                    ActivationDType::Float32,
+                    ActivationDigest::from_bytes(*receipt.token_stream_digest()),
+                    3,
+                )
+                .expect("valid admitted activation fixture spec");
+                let mut cache = ActivationCacheBuilder::new(cache_spec.clone());
+                cache
+                    .ingest(
+                        ActivationChunk::new(
+                            &cache_spec,
+                            0,
+                            3,
+                            vec![0.0; 3 * 128],
+                            vec![true; 3],
+                            vec![2, 3],
+                        )
+                        .expect("valid aligned activation fixture chunk"),
+                    )
+                    .expect("ingest activation fixture");
+                cache.finalize().expect("finalize activation fixture")
+            })
+            .collect::<Vec<ActivationCache>>();
+        let activation_digest =
+            output_reconstruction_activation_digest(activation_caches.as_slice()).unwrap();
+
         let output_spec = OutputReconstructionSpec::new(
             completion.source_model_id(),
-            [121; 32],
+            activation_digest,
             *receipt.token_stream_digest(),
             [122; 32],
             OutputReconstructionSchedule::SlidingWindows {
@@ -3810,6 +3846,82 @@ mod tests {
         let candidate_id = receipt
             .output_candidate_id(&output_spec)
             .expect("campaign-bound candidate identity");
+
+        let projection_name = "model.language_model.layers.0.mlp.gate_proj.weight";
+        let mut fit_builder = FixedTritScaleUpdateCandidateBuilder::new(
+            &output_spec,
+            receipt.package_id().as_bytes(),
+            7,
+        );
+        assert!(fit_builder.is_bound_to(&output_spec, receipt.package_id().as_bytes()));
+        let mut fit_parent = SaltV2PackageReader::new_strict(
+            std::fs::File::open(bundle.join("compact.tsalt2")).unwrap(),
+        )
+        .expect("open exact refit parent");
+        let tensor_index = fit_parent
+            .tensor_names_encoded_order()
+            .position(|name| name == projection_name)
+            .expect("projection in package tensor order");
+        let tensor_info = fit_parent
+            .tensor_info(projection_name)
+            .expect("projection metadata");
+        let output_width = usize::try_from(tensor_info.dims()[0]).unwrap();
+        let scale_group_size = tensor_info.scale_group_size();
+        let codec = fit_parent.codec();
+        let mut plane_started = false;
+        fit_parent
+            .visit_packed_tensor(projection_name, |plane| {
+                if !plane_started {
+                    assert_eq!(
+                        plane.scales().len(),
+                        plane.logical_len().div_ceil(scale_group_size),
+                        "scale geometry differs: len={} logical={} group={}",
+                        plane.scales().len(),
+                        plane.logical_len(),
+                        scale_group_size,
+                    );
+                    fit_builder
+                        .begin_packed_tile_plane(
+                            tensor_index,
+                            codec,
+                            plane,
+                            output_width,
+                            scale_group_size,
+                            8,
+                        )
+                        .unwrap();
+                    plane_started = true;
+                }
+            })
+            .unwrap();
+        fit_parent.verify_unchanged().unwrap();
+        let teacher = Projection::Dense(
+            DenseLinear::new_exact(vec![0.0; output_width * 128], output_width, 128).unwrap(),
+        );
+        session
+            .observe_scale_refit_scope(
+                &receipt,
+                &output_spec,
+                activation_caches.as_slice(),
+                OutputReconstructionScope::Block { start: 0, end: 2 },
+                0,
+                3,
+                1 << 20,
+                projection_name,
+                &teacher,
+                &mut fit_builder,
+            )
+            .unwrap();
+        let fitted_candidate = fit_builder.finish().unwrap();
+        assert_eq!(fitted_candidate.updates().len(), 1);
+        let fitted_scale_candidate = fitted_candidate
+            .as_scale_candidate(&output_spec)
+            .expect("fitted candidate retains its frozen spec identity");
+        assert_eq!(
+            fitted_scale_candidate.parent_package_digest(),
+            receipt.package_id().as_bytes()
+        );
+
         // The scale-update candidate identity commits the actual fixed-trit
         // updates, unlike the parent execution-derived label. Base-model output
         // evidence must therefore be rejected for this child candidate.

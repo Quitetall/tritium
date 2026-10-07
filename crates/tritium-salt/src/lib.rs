@@ -84,7 +84,7 @@ pub use qwen36_tensor_work::{
     Qwen36PackageAdmittedCampaignStore, Qwen36PackageProfileReceipt, Qwen36PackageRuntimeLedger,
     Qwen36PackageScaleOnlyCampaignStore, Qwen36PackageVisitError, Qwen36PtqPackageError,
     Qwen36PtqPackagesReceipt, Qwen36PvParentContext, Qwen36RefinedCandidateExecutionReceipt,
-    Qwen36RefinedCandidateReplay, reconcile_qwen36_ptq_packages,
+    Qwen36RefinedCandidateReplay, Qwen36ScaleRefitWindowError, reconcile_qwen36_ptq_packages,
 };
 #[cfg(all(unix, feature = "cuda"))]
 pub use qwen36_tensor_work::{
