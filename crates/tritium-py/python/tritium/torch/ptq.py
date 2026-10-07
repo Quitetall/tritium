@@ -2335,38 +2335,36 @@ def _joint_additive_projection(
         torch.empty((master.shape[0], groups), dtype=torch.float16)
         for _ in range(planes)
     ]
-    for group in range(groups):
-        group_weights = grouped_master[:, group, :].contiguous()
-        # Keep the native bridge binary: converting every f32 coefficient to a
-        # Python float creates millions of boxed objects on language-model
-        # matrices. The adapter consumes a little-endian, row-major f32 buffer.
-        weight_bytes = (
-            group_weights.numpy()
-            .astype("<f4", copy=False)
-            .tobytes(order="C")
+    group_weights = grouped_master.permute(1, 0, 2).contiguous()
+    # Keep grouped coefficients binary across the private native bridge. The
+    # group-major layout lets Rayon schedule rows from every scale group in one
+    # call, while the solver inputs and deterministic per-row order stay fixed.
+    weight_bytes = group_weights.numpy().astype("<f4", copy=False).tobytes(order="C")
+    diagonal_values = grouped_diagonal.contiguous().reshape(-1).tolist()
+    scales_by_group, plane_trits = _tritium.fit_joint_ternary_diagonal_groups(
+        weight_bytes,
+        master.shape[0],
+        groups,
+        group_size,
+        diagonal_values,
+        planes,
+        16,
+        1e-8,
+        4,
+        1e6,
+        "f16",
+        True,
+        True,
+    )
+    scale_values = torch.tensor(scales_by_group, dtype=torch.float16).permute(2, 1, 0)
+    for plane in range(planes):
+        trits = (
+            torch.frombuffer(bytearray(plane_trits[plane]), dtype=torch.int8)
+            .reshape(groups, master.shape[0], group_size)
+            .permute(1, 0, 2)
         )
-        row_scales, plane_trits = _tritium.fit_joint_ternary_diagonal(
-            weight_bytes,
-            master.shape[0],
-            group_size,
-            grouped_diagonal[group].tolist(),
-            planes,
-            16,
-            1e-8,
-            4,
-            1e6,
-            "f16",
-            True,
-            True,
-        )
-        for plane in range(planes):
-            trits = torch.frombuffer(
-                bytearray(plane_trits[plane]), dtype=torch.int8
-            ).reshape(master.shape[0], group_size)
-            grouped_trits[plane][:, group, :] = trits
-            grouped_scales[plane][:, group] = torch.tensor(
-                [scales[plane] for scales in row_scales], dtype=torch.float16
-            )
+        grouped_trits[plane].copy_(trits)
+        grouped_scales[plane].copy_(scale_values[plane])
 
     fitted_planes = [
         TernaryPlane(

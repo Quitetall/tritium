@@ -1431,3 +1431,109 @@ def test_quantize_composes_the_three_public_phases(monkeypatch, tmp_path):
     assert calls == ["prepare", "calibrate", "convert"]
     assert forwarded["source_admission_receipt"] == tmp_path / "source-admission.json"
     assert forwarded["official_identity_receipt"] == tmp_path / "official-identity.json"
+
+
+def test_grouped_diagonal_projection_matches_legacy_per_group_fits():
+    torch.manual_seed(19)
+    master = torch.randn(5, 256, dtype=torch.float32)
+    curvature = torch.linspace(0.25, 2.0, master.shape[1], dtype=torch.float64)
+    projection = ptq._joint_additive_projection(master, curvature, planes=2)
+
+    rows, columns, group_size, groups = master.shape[0], master.shape[1], 128, 2
+    grouped_master = master.reshape(rows, groups, group_size)
+    grouped_diagonal = curvature.reshape(groups, group_size)
+    expected_trits = [
+        torch.empty((rows, groups, group_size), dtype=torch.int8) for _ in range(2)
+    ]
+    expected_scales = [torch.empty((rows, groups), dtype=torch.float16) for _ in range(2)]
+    for group in range(groups):
+        weights = (
+            grouped_master[:, group, :]
+            .contiguous()
+            .numpy()
+            .astype("<f4", copy=False)
+            .tobytes(order="C")
+        )
+        row_scales, plane_trits = ptq._tritium.fit_joint_ternary_diagonal(
+            weights,
+            rows,
+            group_size,
+            grouped_diagonal[group].tolist(),
+            2,
+            16,
+            1e-8,
+            4,
+            1e6,
+            "f16",
+            True,
+            True,
+        )
+        for plane in range(2):
+            expected_trits[plane][:, group, :] = torch.frombuffer(
+                bytearray(plane_trits[plane]), dtype=torch.int8
+            ).reshape(rows, group_size)
+            expected_scales[plane][:, group] = torch.tensor(
+                [scales[plane] for scales in row_scales], dtype=torch.float16
+            )
+
+    expected_dense = torch.zeros_like(master)
+    for index, plane in enumerate(projection.planes):
+        assert torch.equal(plane.trits, expected_trits[index].reshape_as(master))
+        assert torch.equal(plane.scales, expected_scales[index])
+        expected_dense += expected_trits[index].reshape_as(master).to(master.dtype) * (
+            ptq.expand_plane_scales(
+                expected_scales[index],
+                rows=rows,
+                columns=columns,
+                group_size=group_size,
+            ).to(master.dtype)
+        )
+    assert torch.equal(projection.dense, expected_dense)
+
+
+def test_public_convert_persists_grouped_fit_artifact(tmp_path):
+    torch.manual_seed(23)
+    model = torch.nn.Linear(256, 4, bias=False)
+    prepared = prepare(
+        model,
+        TernaryConfig(
+            mode="ptq",
+            estimator="salt-v2",
+            target_modules=("Linear",),
+            planes=2,
+            profile="compact-v1",
+            target_bpw=None,
+        ),
+        inplace=False,
+    )
+    calibration = calibrate(
+        prepared,
+        [torch.randn(3, 256)],
+        evidence_dir=tmp_path / "grouped-public-calibration",
+    )
+
+    result = convert(
+        prepared,
+        calibration,
+        work_dir=tmp_path / "grouped-public-work",
+        max_working_bytes=256 * 1024,
+    )
+
+    fitted = result.weight("weight")
+    assert len(fitted.planes) == 2
+    assert fitted.planes[0].trits.shape == (4, 256)
+    assert fitted.planes[0].scales.shape == (4, 2)
+    reopened = load_module_conversion(result.artifact_dir)
+    assert reopened.artifact_id == result.artifact_id
+    torch.testing.assert_close(
+        reopened.weight("weight").planes[0].trits,
+        fitted.planes[0].trits,
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        reopened.weight("weight").planes[1].scales,
+        fitted.planes[1].scales,
+        rtol=0,
+        atol=0,
+    )

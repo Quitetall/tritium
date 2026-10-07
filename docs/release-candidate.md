@@ -2144,7 +2144,7 @@ temp disk above `83.4 GiB`. This remains a CPU-time failure. Relative to run
 hosted runs were not controlled or same-runner A/B comparisons. Do not
 attribute that difference to the bridge or claim a speedup.
 
-### Local exact-candidate PTQ profile — 2026-10-07
+### Local dev-build PTQ profile — 2026-10-07
 
 Commit `44942a8a156a3350cbbb613791ef1c09e6eb5e77` was profiled through the
 public `prepare → calibrate → convert()` tutorial on the cached, pinned
@@ -2153,20 +2153,54 @@ public `prepare → calibrate → convert()` tutorial on the cached, pinned
 package and its locally built abi3 extension in
 `/tmp/tritium-release-wheel-perf`, Python 3.14.7, PyTorch 2.11.0+cu130,
 Transformers 5.5.3, CPU on an Intel i9-14900K host (32 logical CPUs). The
-profiled tutorial passed functionally in `779.871s` with an explicit
-`max_seconds=1800`; this is not a pass of the frozen 300-second hosted gate and
-is not an installed-wheel or model-quality qualification. Its receipt SHA-256
-is `a980e19b48b46d94078222d56465cd69642b8e2106ebcd99f42e47a9657b3ff6`; the
+extension came from `maturin develop` without `--release`, so it used the
+development profile, not the optimized wheel profile. The tutorial passed
+functionally in `779.871s` with an explicit `max_seconds=1800`; this is not a
+pass of the frozen 300-second hosted gate, a release-wheel timing result, or a
+model-quality qualification. Its receipt SHA-256 is
+`a980e19b48b46d94078222d56465cd69642b8e2106ebcd99f42e47a9657b3ff6`; the
 selected dense/checkpoint byte counts were `537,919,488` / `92,192,265` (5.83x).
 
-The cProfile trace attributes `559.044s` to `convert()`; the native
-`fit_joint_ternary_diagonal` bridge was called 2,106 times and is the clearest
-hot path in this trace. Python-side timings are inclusive across the
-checkpointing call tree and must not be summed. The host was concurrently
-loaded (1-minute load average peaked near 70), so elapsed time is diagnostic,
-not a comparative benchmark. Raw pstats remain at
+In this development-build trace, `convert()` took `559.044s` and the native
+`fit_joint_ternary_diagonal` bridge was called 2,106 times. This identifies a
+candidate area to inspect, but does not prove it is the optimized wheel's
+dominant cost. Python-side timings are inclusive across the checkpointing call
+tree and must not be summed. The host was concurrently loaded (1-minute load
+average peaked near 70), so elapsed time is diagnostic, not a comparative
+benchmark. Raw pstats remain at
 `/tmp/tritium-ptq-profile-44942a8a.pstats` (SHA-256
 `ad8871ac616d73ceb6f5b418f1bd255ed2efc75e73cdfcdc047e6a1cb7dc2f8b`); the
 receipt and profile are local temporary evidence, not yet part of the release
 evidence bundle. The same commit's hosted tutorial later failed the 300-second
 gate as recorded above.
+
+### Release-wheel grouped PTQ bridge experiment — 2026-10-07
+
+The optimized Linux wheel from run `37637322050` was compared with a local
+release-profile wheel that batches scale groups into one private native call.
+Both used the public `prepare → calibrate → convert()` path, the same cached
+SmolLM2-135M source and calibration receipt, `max_working_bytes=256 MiB`, and
+the same `tritium.salt-v2-joint-diagonal-catq-relays-3@1` algorithm. The
+baseline wheel SHA-256 is
+`962f9a8d057d316be5bfe992e5c4ac271ba5c8eb62461cb5b9b462480e105b06`; the
+experimental local release wheel SHA-256 is
+`64fb7adf0f999ce166744dccb0495f9af6e916f629e3b68c1abf07fc5cffb398`.
+
+Across two unprofiled local conversions per wheel, baseline times were
+`105.094s` and `125.474s`; grouped-call times were `87.340s` and `91.390s`.
+The observed medians were `115.284s` and `89.365s` (22.5% lower for the
+grouped build). All four conversions emitted the identical artifact ID
+`sha256:2beb214271ee9e1581e721f4f87937a3e12c1266ba4bc2e8bc99ab57b56059d4`.
+The accompanying cProfile runs reduced calls to
+`fit_joint_ternary_diagonal*` from 2,106 to 224 (89.4% fewer). Its profile is
+at `/tmp/tritium-ptq-groups-convert.pstats` (SHA-256
+`d7c6a02b6aaf11e7cf294efc99b481363bb82392154fa03903be9f0bb846e1aa`).
+
+This is promising local evidence for the bridge change, not release
+qualification or a controlled performance claim: the baseline is the hosted
+wheel, the new wheel was built locally with a different manylinux tag, and
+host load varied substantially during the trials. The algorithm/configuration
+was unchanged. The PTQ artifact suite passed 39/39, including exact
+legacy-per-group parity and a public `convert()` two-group artifact
+round-trip; the row-parallelism regression also passed. The grouped bridge
+change is still uncommitted and has not passed CI or the hosted tutorial gate.
