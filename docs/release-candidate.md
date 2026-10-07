@@ -1892,3 +1892,28 @@ The SBOM is `tritium-web-node22.cdx.json`. The build used Node 24.21.0/npm
 This qualifies the local source-free package path only; it is not physical
 Chrome/Firefox/Safari WebGPU evidence, a browser performance result, or
 candidate-registry admission.
+
+### Candidate-source Python and release-admission regression checks — 2026-10-07
+
+At source revision `6ac1c040d3908a39301e437088a0052812770ec9`, the complete
+Python binding suite passed on the local CPU environment:
+
+```text
+PYTHONPATH=crates/tritium-py/python pytest -q -rs crates/tritium-py/tests
+377 passed, 27 skipped, 15 warnings in 223.15s
+python -m unittest scripts.tests.test_release_evidence_status scripts.tests.test_release_status -v
+Ran 44 tests in 3.056s — OK
+```
+
+The Python skips were explicit: ONNX was not installed in the host environment,
+two checks require an installed candidate wheel, eight checks require the
+CUDA-enabled Tritium extension, and the remaining checks require external
+LamQuant/BLUT checkouts. They are not release passes. Separately, hosted CI run
+[`37588299083`](https://github.com/Quitetall/tritium/actions/runs/37588299083)
+completed successfully for this source revision; its CUDA, ROCm, wgpu, Metal,
+physical-model-serving and performance jobs were skipped on hosted runners.
+
+Existing local RC manifests are still bound to older source revisions, and the
+local release CLI is not installed on this host. These software regressions do
+not qualify candidate artifacts, physical backends, flagship model quality,
+performance, or v1.1 release readiness.
