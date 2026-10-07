@@ -4831,6 +4831,7 @@ dependencies = [
  "ndarray",
  "ort",
  "pyo3",
+ "rayon",
  "rustix",
  "serde",
  "serde_json",

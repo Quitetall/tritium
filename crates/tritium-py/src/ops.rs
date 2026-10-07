@@ -6,6 +6,7 @@
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use rayon::prelude::*;
 
 use tritium_quantize::{
     AllocConfig, DensePsdMetric, GroupCurve, JointFitConfig, JointFitMetric, RelayBasins,
@@ -227,18 +228,25 @@ pub(crate) fn fit_joint_ternary_diagonal(
         },
     };
     py.detach(move || {
+        // Output rows are independent, and production matrices can contain
+        // tens of thousands of them. Preserve indexed order while fitting rows
+        // concurrently; collect errors in row order below so diagnostics stay
+        // deterministic. The solver/configuration and each row's objective are
+        // unchanged.
+        let fits: Vec<Result<_, String>> = weights
+            .par_chunks_exact(columns)
+            .map(|row_weights| {
+                fit_joint_ternary(row_weights, JointFitMetric::DiagonalF64(&diagonal), config)
+                    .map_err(|error| error.to_string())
+            })
+            .collect();
+
         let mut scales_by_row = Vec::with_capacity(rows);
         let mut trits_by_plane = vec![Vec::with_capacity(rows); planes];
         let mut reconstruction_by_row = Vec::with_capacity(rows);
         let mut objectives = Vec::with_capacity(rows);
-        for row in 0..rows {
-            let start = row * columns;
-            let fit = fit_joint_ternary(
-                &weights[start..start + columns],
-                JointFitMetric::DiagonalF64(&diagonal),
-                config,
-            )
-            .map_err(|error| error.to_string())?;
+        for fit in fits {
+            let fit = fit?;
             scales_by_row.push(fit.scales);
             for (plane, row_trits) in fit.trits.into_iter().enumerate() {
                 trits_by_plane[plane].push(row_trits);
