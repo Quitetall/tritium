@@ -2389,3 +2389,21 @@ four-CPU runner. It does not establish whether additional CPU parallelism,
 per-core throughput, or both explain the gap to local timing. The frozen gate
 remains red, and no model-quality or release qualification follows from the
 functional completion.
+
+### Native PTQ fit-result memory reduction baseline — 2026-10-07
+
+Wheel workflow [37676403818](https://github.com/Quitetall/tritium/actions/runs/37676403818)
+tested parent commit `369f69f3bc7d2c19db180fd2da2b6f7966a3b7ea`, before the
+two follow-up bridge-memory commits. The pinned tutorial completed its full
+functional path but failed the unchanged 300-second wall-time gate at
+`624.605s`. Calibration took `0.428s`; PTQ conversion completed at `488.073s`,
+native checkpoint round-trip at `501.302s`, generation at `529.505s`, ONNX
+export at `603.480s`, replay at `619.631s`, and QAT optimizer resume at
+`624.605s`.
+
+The runner had four logical CPUs, at least about 12 GiB available memory during
+the final sample, and over 83 GiB temporary disk. It was not an OOM or disk
+failure. This result establishes the hosted parent baseline for commits
+`ea2c7cd5` and `909add9c`; it does not qualify those changes or pass the frozen
+timing gate. The candidate workflows must be inspected separately before
+claiming any performance effect.
