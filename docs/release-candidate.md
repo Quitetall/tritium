@@ -30,19 +30,33 @@ crates/tritium-py/tests` passed 369 tests, with 27 skips. This is correctness
 and bounded-temporary evidence for the Python reference path, not a native
 fused-kernel or speed claim.
 
-### Packed linear output-row decode (2026-10-05)
+### Packed linear output-row decode (2026-10-07)
 
-`AdditiveTernaryLinear` now decodes packed weights in output-row tiles capped at
-2^18 weight elements, instead of materializing the entire output-by-input
+`AdditiveTernaryLinear` decodes packed weights in output-row tiles capped at
+2^22 weight elements, instead of materializing the entire output-by-input
 matrix on every forward call. Bias is cast to the input dtype as before, and
-the input feature dimension is checked explicitly. The focused CPU/CUDA test
-compared a 40,000-by-8 two-plane layer against `F.linear` using a dense
-reference, in float32 and float16 on CPU and CUDA, while making the full
-decoder fail if called; all four cases passed. The complete
-`test_ptq_artifacts.py` file passed (33 tests). The full Python suite passed
-373 tests, with 27 skips. This is
-bounded-memory Python reference behavior only; it is not a fused kernel or a
-performance result.
+the input feature dimension is checked explicitly. The chunk-bound regression
+constructs a 300,000-by-16 layer and verifies the exact two tiles (262,144 and
+37,856 rows); the full `test_module_onnx.py` file passed all 9 tests.
+
+The exact local candidate wheel
+`pytritium-1.1.0rc2-cp39-abi3-linux_x86_64.whl` (SHA-256
+`b21343f103aec89c0e843f72730dafb23dbdc49c639677e531d96f684888c94b`) ran the
+pinned SmolLM2-135M tutorial on CPU in 255.23 seconds, excluding first model
+download. The wheel binds source-tree object
+`88fa42cf1b29b4f4d07bd36c99234ce316eb3fd4` (commit `917fd4ae`), model revision
+`12fd25f77366fa6b3b4b768ec3050bf629380bac`, and receipt run ID
+`local-4m-88fa42cf`. The receipt SHA-256 is
+`fe61ada1279767f06c8891b0683de35f1443a66e759e49e776aceed552f0125e`; it records
+ONNX replay max absolute error `8.01e-5`, max tolerance ratio `0.368`, and
+selected dense/checkpoint bytes `537,919,488` / `92,192,265` (5.83x). The wheel
+and complete 2.2 GiB tutorial output are preserved under
+`/mnt/2tb/tritium-smollm2-917fd4ae-local/`.
+
+This is local CPU evidence only: the wheel's `linux_x86_64` tag is not a
+manylinux release artifact, and the hosted candidate-wheel/tutorial gate had
+not completed when this record was updated. It does not establish a native
+fused kernel or cross-machine performance claim.
 
 ## Gate status (measured 2026-09-03)
 
