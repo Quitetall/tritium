@@ -1017,7 +1017,23 @@ def test_live_module_convert_uses_sota_native_multistart_diagonal_fit(tmp_path):
     # with conditioned nonnegative scale solves. Its checked result is below
     # this independent held-out error bound; the former Python-only solver was
     # 0.00615 on this fixture.
-    assert result.weight("weight").weighted_mse < 0.004
+    fitted = result.weight("weight")
+    assert fitted.weighted_mse < 0.004
+
+    # Exercise the public artifact boundary too: a passing in-memory fit is not
+    # enough if the durable conversion receipt cannot be reopened with the
+    # same identity and fitted trits/scales.
+    reopened = ptq.load_module_conversion(result.artifact_dir)
+    assert reopened.artifact_id == result.artifact_id
+    assert reopened.algorithm_id == result.algorithm_id
+    reopened_fit = reopened.weight("weight")
+    assert reopened_fit.weighted_mse == fitted.weighted_mse
+    assert len(reopened_fit.planes) == len(fitted.planes)
+    for reopened_plane, fitted_plane in zip(
+        reopened_fit.planes, fitted.planes, strict=True
+    ):
+        torch.testing.assert_close(reopened_plane.trits, fitted_plane.trits, rtol=0, atol=0)
+        torch.testing.assert_close(reopened_plane.scales, fitted_plane.scales, rtol=0, atol=0)
 
 
 def test_live_module_convert_resumes_missing_weight_and_rejects_tampering(tmp_path):
