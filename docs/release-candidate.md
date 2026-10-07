@@ -1992,3 +1992,22 @@ file SHA-256
 `8e75bce8c49195d156983531a71d53f91294d9748d28ba705c7832bd47b75443`. This
 is a successful local offline crate-consumer check, but the receipt is not yet
 registered against a candidate manifest; it does not close the package gate.
+
+### Exact-source CI crate archive qualification — 2026-10-07
+
+The successful CI run [37596503849](https://github.com/Quitetall/tritium/actions/runs/37596503849)
+on source revision `2587652f2b7862c84b3a5f236d0c62860cfb60bb` uploaded the
+`crate-candidates-2587652f2b7862c84b3a5f236d0c62860cfb60bb` artifact. It retains
+the exact 23 publishable `.crate` files, their 23 CycloneDX documents, and the
+offline consumer receipt. The receipt is
+`sha256:ca07a50bbb5e32da291d9bd87b7d69ca7b7f6c7ae9717bd8ec8d9e192da8004d`
+(`tritium.crate-archive-qualification.v1`, run
+`github-37596503849-1-crate-archives`).
+
+The receipt was independently revalidated against the downloaded archives and
+the exact-source `Cargo.lock`; all 23 packages are recorded as compiled in the
+offline, isolated Cargo-home consumer. All 23 SBOM roots also match their
+archive SHA-256, byte count, release identity, and source revision. This is
+candidate-revision package evidence, but it is not yet registered against a
+complete candidate manifest and therefore does not close the aggregate package
+gate.
