@@ -2119,3 +2119,16 @@ unchanged and hosted runner variation was not controlled. Treat this as noisy
 measurement, not evidence of an optimization. The gate is still red by
 `390.001s`, and profiler-backed optimization plus an exact-candidate rerun
 remain required.
+
+A second exact-source run, Actions run
+[37632137262](https://github.com/Quitetall/tritium/actions/runs/37632137262),
+again used revision `15bc7e25739a136637e14a5cb4a21e226491ff1c` (before the
+local Python/Rust bridge edit described below). It failed the same tutorial
+time gate at `1074.451s`; conversion completed at `852.649s`. Memory remained
+above roughly `11.2 GiB` and runner temp disk above `81.8 GiB`, so this was
+again a CPU-time failure rather than memory or disk exhaustion. The run's
+conversion time differs substantially from the earlier exact-source run, so
+the pair confirms that hosted CPU timing is variable; neither result alone
+identifies a code regression or improvement. The local bridge edit has only
+been checked on a smaller deterministic fixture and has not yet been included
+in a hosted model-level run.

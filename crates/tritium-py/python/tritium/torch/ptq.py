@@ -2336,26 +2336,34 @@ def _joint_additive_projection(
         for _ in range(planes)
     ]
     for group in range(groups):
-        row_scales, plane_trits, _reconstruction, _objectives = (
-            _tritium.fit_joint_ternary_diagonal(
-                grouped_master[:, group, :].contiguous().reshape(-1).tolist(),
-                master.shape[0],
-                group_size,
-                grouped_diagonal[group].tolist(),
-                planes,
-                16,
-                1e-8,
-                4,
-                1e6,
-                "f16",
-                True,
-                True,
-            )
+        group_weights = grouped_master[:, group, :].contiguous()
+        # Keep the native bridge binary: converting every f32 coefficient to a
+        # Python float creates millions of boxed objects on language-model
+        # matrices. The adapter consumes a little-endian, row-major f32 buffer.
+        weight_bytes = (
+            group_weights.numpy()
+            .astype("<f4", copy=False)
+            .tobytes(order="C")
+        )
+        row_scales, plane_trits = _tritium.fit_joint_ternary_diagonal(
+            weight_bytes,
+            master.shape[0],
+            group_size,
+            grouped_diagonal[group].tolist(),
+            planes,
+            16,
+            1e-8,
+            4,
+            1e6,
+            "f16",
+            True,
+            True,
         )
         for plane in range(planes):
-            grouped_trits[plane][:, group, :] = torch.tensor(
-                plane_trits[plane], dtype=torch.int8
-            )
+            trits = torch.frombuffer(
+                bytearray(plane_trits[plane]), dtype=torch.int8
+            ).reshape(master.shape[0], group_size)
+            grouped_trits[plane][:, group, :] = trits
             grouped_scales[plane][:, group] = torch.tensor(
                 [scales[plane] for scales in row_scales], dtype=torch.float16
             )

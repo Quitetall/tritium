@@ -1,11 +1,13 @@
 //! Autograd-op bindings: the `tritium-train` tape ops (ternary Conv1d, FSQ, STE) exposed as flat-buffer
 //! forward/vjp `#[pyfunction]`s. The Python side ([`tritium.autograd`]) wraps each pair in a
 //! `torch.autograd.Function`, so LamQuant drops ternary conv/FSQ layers into their PyTorch encoder in
-//! place. Tensors cross the boundary as flat `f32`/`u32` lists plus explicit shape args (a numpy/dlpack
-//! zero-copy bridge is a perf follow-on); every shape error is a `ValueError`, never a panic.
+//! place. Most tensors cross the boundary as flat `f32`/`u32` lists plus explicit shape args. The
+//! hot joint-PTQ adapter uses binary buffers to avoid boxing every model coefficient as a Python
+//! scalar; a fully zero-copy numpy/dlpack bridge remains a separate optimization. Shape errors are
+//! always a `ValueError`, never a panic.
 
 use pyo3::exceptions::PyValueError;
-use pyo3::prelude::*;
+use pyo3::{prelude::*, types::PyBytes};
 use rayon::prelude::*;
 
 use tritium_quantize::{
@@ -17,7 +19,7 @@ use tritium_train::ops::fsq::{self, FsqBound, FsqCfg, FsqSte};
 use tritium_train::ops::ste;
 
 type DenseJointFitResult = (Vec<f32>, Vec<Vec<i8>>, Vec<f32>, f64);
-type DiagonalJointFitBatchResult = (Vec<Vec<f32>>, Vec<Vec<Vec<i8>>>, Vec<Vec<f32>>, Vec<f64>);
+type DiagonalJointFitBatchResult = (Vec<Vec<f32>>, Vec<Py<PyBytes>>);
 
 /// Allocate additive ternary planes from measured group error curves.
 ///
@@ -166,14 +168,15 @@ pub(crate) fn fit_joint_ternary_dense(
 
 /// Fit a row batch with shared diagonal curvature and the canonical native SALT solver.
 ///
-/// Returns row-major scales, plane-major row trits, row reconstructions, and
-/// one objective per row. Python PTQ uses this path to avoid maintaining a
-/// weaker, second implementation of the joint solver.
+/// Receives weights as little-endian row-major f32 bytes and returns row-major
+/// scales plus one byte buffer per plane of row-major i8 trits. The private
+/// Python PTQ adapter uses bytes rather than boxed Python numbers, and does not
+/// transfer reconstructions/objectives that it does not consume.
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn fit_joint_ternary_diagonal(
     py: Python<'_>,
-    weights: Vec<f32>,
+    weights: &Bound<'_, PyBytes>,
     rows: usize,
     columns: usize,
     diagonal: Vec<f64>,
@@ -194,12 +197,22 @@ pub(crate) fn fit_joint_ternary_diagonal(
     let expected_weights = rows
         .checked_mul(columns)
         .ok_or_else(|| PyValueError::new_err("weight dimensions overflow platform usize"))?;
-    if weights.len() != expected_weights {
+    let expected_weight_bytes = expected_weights
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| PyValueError::new_err("weight byte length overflows platform usize"))?;
+    let weight_bytes = weights.as_bytes();
+    if weight_bytes.len() != expected_weight_bytes {
         return Err(PyValueError::new_err(format!(
-            "weights must contain {expected_weights} values for {rows}x{columns}, got {}",
-            weights.len()
+            "weights must contain {expected_weight_bytes} little-endian bytes for {rows}x{columns} f32 values, got {}",
+            weight_bytes.len()
         )));
     }
+    let (weight_chunks, remainder) = weight_bytes.as_chunks::<{ std::mem::size_of::<f32>() }>();
+    debug_assert!(remainder.is_empty());
+    let weights = weight_chunks
+        .iter()
+        .map(|bytes| f32::from_le_bytes(*bytes))
+        .collect::<Vec<_>>();
     if diagonal.len() != columns {
         return Err(PyValueError::new_err(format!(
             "diagonal must contain {columns} values, got {}",
@@ -227,41 +240,40 @@ pub(crate) fn fit_joint_ternary_diagonal(
             modulated: modulated_relay,
         },
     };
-    py.detach(move || {
-        // Output rows are independent, and production matrices can contain
-        // tens of thousands of them. Preserve indexed order while fitting rows
-        // concurrently; collect errors in row order below so diagnostics stay
-        // deterministic. The solver/configuration and each row's objective are
-        // unchanged.
-        let fits: Vec<Result<_, String>> = weights
-            .par_chunks_exact(columns)
-            .map(|row_weights| {
-                fit_joint_ternary(row_weights, JointFitMetric::DiagonalF64(&diagonal), config)
-                    .map_err(|error| error.to_string())
-            })
-            .collect();
+    let (scales_by_row, trits_by_plane) = py
+        .detach(move || {
+            // Output rows are independent, and production matrices can contain
+            // tens of thousands of them. Preserve indexed order while fitting rows
+            // concurrently; collect errors in row order below so diagnostics stay
+            // deterministic. The solver/configuration and each row's objective are
+            // unchanged.
+            let fits: Vec<Result<_, String>> = weights
+                .par_chunks_exact(columns)
+                .map(|row_weights| {
+                    fit_joint_ternary(row_weights, JointFitMetric::DiagonalF64(&diagonal), config)
+                        .map_err(|error| error.to_string())
+                })
+                .collect();
 
-        let mut scales_by_row = Vec::with_capacity(rows);
-        let mut trits_by_plane = vec![Vec::with_capacity(rows); planes];
-        let mut reconstruction_by_row = Vec::with_capacity(rows);
-        let mut objectives = Vec::with_capacity(rows);
-        for fit in fits {
-            let fit = fit?;
-            scales_by_row.push(fit.scales);
-            for (plane, row_trits) in fit.trits.into_iter().enumerate() {
-                trits_by_plane[plane].push(row_trits);
+            let mut scales_by_row = Vec::with_capacity(rows);
+            let mut trits_by_plane = (0..planes)
+                .map(|_| Vec::with_capacity(expected_weights))
+                .collect::<Vec<_>>();
+            for fit in fits {
+                let fit = fit?;
+                scales_by_row.push(fit.scales);
+                for (plane, row_trits) in fit.trits.into_iter().enumerate() {
+                    trits_by_plane[plane].extend(row_trits.into_iter().map(|trit| trit as u8));
+                }
             }
-            reconstruction_by_row.push(fit.reconstruction);
-            objectives.push(fit.objective);
-        }
-        Ok::<_, String>((
-            scales_by_row,
-            trits_by_plane,
-            reconstruction_by_row,
-            objectives,
-        ))
-    })
-    .map_err(PyValueError::new_err)
+            Ok::<_, String>((scales_by_row, trits_by_plane))
+        })
+        .map_err(PyValueError::new_err)?;
+    let trits_by_plane = trits_by_plane
+        .iter()
+        .map(|trits| PyBytes::new(py, trits).unbind())
+        .collect();
+    Ok((scales_by_row, trits_by_plane))
 }
 
 #[allow(clippy::too_many_arguments)]
