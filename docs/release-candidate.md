@@ -919,6 +919,23 @@ source-admission receipt's `official_payload_authenticated=false`, register the
 pair to a current release candidate, or produce tensor masters. The 506-master
 campaign remains stalled and was not restarted.
 
+### Fresh pinned-source identity check (2026-10-07)
+
+The official-source verifier was rerun against the durable 52-GiB snapshot and
+the rebound source-admission receipt. It passed all 29 local files against the
+immutable Hugging Face revision `6a9e13bd6fc8f0983b9b99948120bc37f49c13e9`,
+covering 55,586,107,940 bytes. The fresh receipt is
+`/mnt/2tb/tritium-release-evidence/qwen-source-admission/recheck-2026-10-07/official-source-identity.json`
+with ID
+`sha256:c045300d5de262d4d72887d711ddfc6f413e83adc3b560332e32abecc6414eca`.
+It binds source-admission receipt
+`sha256:abfb820bbc4fd65aff43b2c11e1471bd7bf7e9b72acd42073ff857a7cefe03d2`
+and the already measured model, manifest, and proof identities. This confirms
+the durable source bytes still match the pinned public snapshot; it does not
+register a current release candidate, change
+`official_payload_authenticated: false`, admit calibration evidence, or prove
+PTQ quality. No model replay, fitting, or campaign was started.
+
 ### Legacy Qwen calibration evidence audit (2026-10-01)
 
 The 506-file S2KF directory
