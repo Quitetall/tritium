@@ -1557,7 +1557,16 @@ mod tests {
         let mut preserved = BTreeMap::new();
         for (name, spec) in &schema {
             match spec.role {
-                TensorRole::Matrix => matrices.push(zero_matrix(name, &spec.shape)),
+                TensorRole::Matrix => matrices.push(
+                    if matches!(
+                        name.as_str(),
+                        "mtp.fc.weight" | "model.language_model.embed_tokens.weight"
+                    ) {
+                        signal_matrix(name, &spec.shape)
+                    } else {
+                        zero_matrix(name, &spec.shape)
+                    },
+                ),
                 TensorRole::Preserved => {
                     preserved.insert(name.clone(), spec.shape.clone());
                 }
@@ -1569,7 +1578,7 @@ mod tests {
         let profile_id = PackageId::from_package_bytes(&encoded.bytes).to_string();
         fs::write(files.directory.join("compact.tsalt2"), &encoded.bytes).unwrap();
         fs::write(files.directory.join("near-lossless.tsalt2"), &encoded.bytes).unwrap();
-        let preserved_bytes = zero_bf16_safetensors(&preserved);
+        let preserved_bytes = signal_bf16_safetensors(&preserved);
         let preserved_id = PackageId::from_package_bytes(&preserved_bytes).to_string();
         let preserved_payload_bytes = safetensors_payload_bytes(&preserved_bytes).unwrap();
         let preserved_serialized_bytes = preserved_bytes.len() as u64;
@@ -1703,7 +1712,12 @@ mod tests {
             File::open(files.directory.join("compact.tsalt2")).unwrap(),
         )
         .unwrap();
-        let child_update = SaltV2ScaleUpdate::new(0, 0, 0, vec![f16::from_f32(0.75)]).unwrap();
+        let mtp_fc_index = parent_package
+            .tensor_names_encoded_order()
+            .position(|name| name == "mtp.fc.weight")
+            .expect("MTP fusion projection is in package order");
+        let child_update =
+            SaltV2ScaleUpdate::new(mtp_fc_index, 0, 0, vec![f16::from_f32(1.0)]).unwrap();
         let (child_output, child_lineage) = write_salt_v2_scale_update_child(
             &mut parent_package,
             std::io::Cursor::new(Vec::new()),
@@ -1721,6 +1735,36 @@ mod tests {
                 Box::new(tritium_cpu::CpuBackend::new()),
             )
             .unwrap();
+        let mut parent_target_cache = model.runner().new_cache(4).unwrap();
+        let parent_target = model
+            .runner()
+            .forward(&[1, 2], &mut parent_target_cache)
+            .unwrap();
+        let parent_draft = model.mtp().draft_only_runner();
+        let mut parent_draft_cache = parent_draft.new_cache(4).unwrap();
+        let parent_draft_output = parent_draft
+            .forward(model.runner(), &parent_target, 1, &mut parent_draft_cache)
+            .unwrap();
+        let mut child_target_cache = child_model.runner().new_cache(4).unwrap();
+        let child_target = child_model
+            .runner()
+            .forward(&[1, 2], &mut child_target_cache)
+            .unwrap();
+        let child_draft = child_model.mtp().draft_only_runner();
+        let mut child_draft_cache = child_draft.new_cache(4).unwrap();
+        let child_draft_output = child_draft
+            .forward(
+                child_model.runner(),
+                &child_target,
+                1,
+                &mut child_draft_cache,
+            )
+            .unwrap();
+        assert_ne!(
+            child_draft_output.final_hidden_states(),
+            parent_draft_output.final_hidden_states(),
+            "an immutable MTP scale-update child must affect draft-only output"
+        );
         assert_eq!(
             child_model.receipt().package_id(),
             child_lineage.child_package_id().to_string()
@@ -1928,12 +1972,23 @@ mod tests {
                     block.hidden_states().len(),
                     block.tokens().len() * block.hidden_size()
                 );
-                assert!(block.hidden_states().iter().all(|value| *value == 0.0));
-                observed_blocks.push((block.batch_index(), block.block_index()));
+                assert!(block.hidden_states().iter().all(|value| value.is_finite()));
+                assert!(block.hidden_states().iter().any(|value| *value != 0.0));
+                observed_blocks.push((
+                    block.batch_index(),
+                    block.block_index(),
+                    block.hidden_states().to_vec(),
+                ));
                 Ok::<_, core::convert::Infallible>(())
             })
             .unwrap();
-        assert_eq!(observed_blocks, [(0, 0), (0, 1), (1, 0), (1, 1)]);
+        assert_eq!(
+            observed_blocks
+                .iter()
+                .map(|(batch, block, _)| (*batch, *block))
+                .collect::<Vec<_>>(),
+            [(0, 0), (0, 1), (1, 0), (1, 1)]
+        );
         assert_eq!(block_execution.batch_count(), 2);
         assert_eq!(block_execution.token_count(), 3);
         assert_eq!(block_execution.block_observation_count(), 4);
@@ -2053,24 +2108,27 @@ mod tests {
                 .unwrap();
                 match scope {
                     tritium_format::RuntimeOutputScope::Block { .. } => {
-                        accumulator
-                            .observe(
-                                0,
-                                2,
-                                model.runner().hidden_size(),
-                                &[false, true],
-                                &vec![0.0; 2 * model.runner().hidden_size()],
-                            )
-                            .unwrap();
-                        accumulator
-                            .observe(
-                                1,
-                                1,
-                                model.runner().hidden_size(),
-                                &[true],
-                                &vec![0.0; model.runner().hidden_size()],
-                            )
-                            .unwrap();
+                        let tritium_format::RuntimeOutputScope::Block { end, .. } = scope else {
+                            unreachable!("matched block output scope")
+                        };
+                        let block_index = end - 1;
+                        for (batch_index, (tokens, mask)) in scoped_batches.iter().enumerate() {
+                            let (_, _, values) = observed_blocks
+                                .iter()
+                                .find(|(batch, block, _)| {
+                                    *batch == batch_index as u64 && *block == block_index
+                                })
+                                .expect("every requested block output was observed");
+                            accumulator
+                                .observe(
+                                    batch_index as u32,
+                                    tokens.len(),
+                                    model.runner().hidden_size(),
+                                    mask,
+                                    values,
+                                )
+                                .unwrap();
+                        }
                     }
                     tritium_format::RuntimeOutputScope::FinalLogits => {
                         accumulator
@@ -2251,7 +2309,29 @@ mod tests {
         .unwrap()
     }
 
-    fn zero_bf16_safetensors(tensors: &BTreeMap<String, Vec<usize>>) -> Vec<u8> {
+    fn signal_matrix(name: &str, shape: &[usize]) -> SaltV2Tensor {
+        let coefficients = shape.iter().product::<usize>();
+        let base = SaltV2Plane::new(
+            vec![1; coefficients],
+            vec![f16::from_f32(0.5); coefficients.div_ceil(128)],
+        )
+        .unwrap();
+        let mut relay_trits = vec![0; coefficients];
+        relay_trits[..shape[1]].fill(1);
+        let relay = SaltV2Plane::new(
+            relay_trits,
+            vec![f16::from_f32(0.25); coefficients.div_ceil(128)],
+        )
+        .unwrap();
+        SaltV2Tensor::new(
+            name,
+            shape.iter().map(|dimension| *dimension as u64).collect(),
+            vec![SaltV2Tile::new(vec![base, relay]).unwrap()],
+        )
+        .unwrap()
+    }
+
+    fn signal_bf16_safetensors(tensors: &BTreeMap<String, Vec<usize>>) -> Vec<u8> {
         let mut header = serde_json::Map::new();
         header.insert("__metadata__".into(), serde_json::json!({"format": "pt"}));
         let mut offset = 0usize;
@@ -2274,7 +2354,12 @@ mod tests {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&(encoded_header.len() as u64).to_le_bytes());
         bytes.extend_from_slice(&encoded_header);
-        bytes.resize(bytes.len() + offset, 0);
+        for (name, shape) in tensors {
+            let nonzero = shape.len() == 1 || name == "model.language_model.embed_tokens.weight";
+            for _ in 0..shape.iter().product::<usize>() {
+                bytes.extend_from_slice(&if nonzero { 0x3f80_u16 } else { 0_u16 }.to_le_bytes());
+            }
+        }
         bytes
     }
 
