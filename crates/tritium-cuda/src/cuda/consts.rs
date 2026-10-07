@@ -422,6 +422,11 @@ pub(super) const KERNEL_NAME_SALT_V2_WARP_FAST: &str = "salt_v2_forward_warp_fas
 pub(super) const KERNEL_NAME_SALT_V2_STREAM: &str = "salt_v2_stream_f32";
 /// Several row-stream projections of one input in one launch.
 pub(super) const KERNEL_NAME_SALT_V2_STREAM_MULTI: &str = "salt_v2_stream_f32_multi";
+/// Multi-row (prefill) twin of the fused row-stream GEMV.
+pub(super) const KERNEL_NAME_SALT_V2_STREAM_ROWS: &str = "salt_v2_stream_rows_f32";
+/// Activation rows one `salt_v2_stream_rows_f32` block applies a weight word to
+/// (its `kStreamRowsMax`); grid.y covers more.
+pub(super) const SALT_V2_STREAM_ROWS_MAX: u32 = 8;
 /// Per-128-group int8 activation quantizer for the A8 row-stream GEMV.
 pub(super) const KERNEL_NAME_SALT_V2_QUANT_ACT: &str = "salt_v2_quant_act_g128";
 /// A8 (int8 activation, dp4a) row-stream GEMV.

@@ -578,6 +578,8 @@ pub struct CudaBackend {
     pub(super) func_salt_v2_stream: CudaFunction,
     /// Fused multi-tensor row-stream GEMV (`KERNEL_NAME_SALT_V2_STREAM_MULTI`).
     pub(super) func_salt_v2_stream_multi: CudaFunction,
+    /// Multi-row prefill row-stream GEMV (`KERNEL_NAME_SALT_V2_STREAM_ROWS`).
+    pub(super) func_salt_v2_stream_rows: CudaFunction,
     /// Per-128-group int8 activation quantizer (`KERNEL_NAME_SALT_V2_QUANT_ACT`).
     pub(super) func_salt_v2_quant_act: CudaFunction,
     /// A8 row-stream GEMV (`KERNEL_NAME_SALT_V2_STREAM_I8`).
@@ -1188,6 +1190,9 @@ impl CudaBackend {
         let func_salt_v2_stream_multi = salt_v2_module
             .load_function(KERNEL_NAME_SALT_V2_STREAM_MULTI)
             .map_err(|error| driver_err("load SALT V2 fused row-stream kernel", &error))?;
+        let func_salt_v2_stream_rows = salt_v2_module
+            .load_function(KERNEL_NAME_SALT_V2_STREAM_ROWS)
+            .map_err(|error| driver_err("load SALT V2 multi-row row-stream kernel", &error))?;
         let func_salt_v2_quant_act = salt_v2_module
             .load_function(KERNEL_NAME_SALT_V2_QUANT_ACT)
             .map_err(|error| driver_err("load SALT V2 activation quantizer", &error))?;
@@ -1251,6 +1256,7 @@ impl CudaBackend {
             func_salt_v2_warp_fast,
             func_salt_v2_stream,
             func_salt_v2_stream_multi,
+            func_salt_v2_stream_rows,
             func_salt_v2_quant_act,
             func_salt_v2_stream_i8,
             func_salt_v2_stream_i8_multi,

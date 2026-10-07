@@ -224,3 +224,39 @@ fn a8_kernel_matches_a_reference_on_its_own_quantized_inputs() {
         }
     }
 }
+
+/// The multi-row (prefill) row-stream GEMV against the per-row stream kernel:
+/// every output bit-identical, for row counts inside one group of eight, at its
+/// edge, and spanning several groups (grid.y).
+#[test]
+fn multi_row_stream_is_bit_identical_to_the_per_row_kernel() {
+    let Ok(cuda) = CudaBackend::new(0) else {
+        eprintln!("skipping SALT V2 multi-row parity: no CUDA device");
+        return;
+    };
+    for (label, tensor) in [
+        ("ragged", tensor(8, 1024, |tile| tile % 3 + 1)),
+        ("crossing", tensor(120, 768, |tile| (tile * 7) % 3 + 1)),
+    ] {
+        let columns = tensor.dims()[1] as usize;
+        let resident = cuda.upload_salt_v2(&tensor, SaltV2Codec::B3).unwrap();
+        for m in [1usize, 2, 3, 8, 9, 17] {
+            let act = activation(m, columns);
+            let reference = cuda.salt_v2_forward_fast(&resident, &act, m).unwrap();
+            assert_eq!(
+                reference.receipt.mode(),
+                SaltV2ForwardMode::FastRowStream,
+                "{label} m {m}: reference must be the row-stream kernel"
+            );
+            let rows = cuda.salt_v2_forward_rows_probe(&resident, &act, m).unwrap();
+            assert_eq!(rows.len(), reference.output.len(), "{label} m {m}: length");
+            for (index, (got, want)) in rows.iter().zip(&reference.output).enumerate() {
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "{label} m {m} output {index}: {got} vs {want}"
+                );
+            }
+        }
+    }
+}

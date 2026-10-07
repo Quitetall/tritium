@@ -158,3 +158,97 @@ fn resident_snapshot_resume_is_bit_identical_to_a_fresh_prefill() {
         .count();
     assert_eq!(differing, 0, "{differing} logits differ after resume");
 }
+
+/// Batched prefill (`TRITIUM_QWEN35_BATCHED_PREFILL`, default on) must compute
+/// exactly what feeding the prompt one decode step at a time does: for prompts
+/// that end inside, on and past chunk boundaries, from a reset and from a
+/// restored snapshot, the logits after the prompt and over the next decode
+/// steps (which read every DeltaNet state and KV row the prompt wrote) are
+/// equal bit for bit.
+#[test]
+#[ignore = "needs TRITIUM_QWEN36_BUNDLE and a CUDA device"]
+fn batched_prefill_is_bit_identical_to_token_by_token() {
+    let Ok(bundle) = std::env::var("TRITIUM_QWEN36_BUNDLE") else {
+        eprintln!("skipping: set TRITIUM_QWEN36_BUNDLE");
+        return;
+    };
+    let profile =
+        std::env::var("TRITIUM_QWEN36_PROFILE").unwrap_or_else(|_| "compact-v1".to_owned());
+    let backend = tritium_cuda::CudaBackend::new(0).expect("cuda device");
+    let model = Qwen35SaltV2LanguageMtpModel::load_bundle_profile(
+        &PathBuf::from(bundle),
+        &profile,
+        Box::new(backend),
+    )
+    .expect("load bundle");
+    let mut executor = model
+        .runner()
+        .cuda_resident(PROMPT.len() + 256)
+        .expect("build executor")
+        .expect("this bundle should be eligible for the resident executor");
+    // Deterministic, varied ids well inside the vocabulary.
+    let mut seed = 0x2545_f491u32;
+    let tokens: Vec<u32> = (0..210)
+        .map(|_| {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 8) % 150_000
+        })
+        .collect();
+    let decode = [11u32, 2716, 13];
+
+    // Feed `prompt` (all but its last token through `prefill`), then the decode
+    // tokens, returning every logits row as bits.
+    let mut run = |batched: bool, prefix: bool, prompt: &[u32]| {
+        // SAFETY: run filtered (`--test-threads=1` or this test alone); the
+        // executor reads the variable on this thread only.
+        unsafe {
+            std::env::set_var(
+                "TRITIUM_QWEN35_BATCHED_PREFILL",
+                if batched { "1" } else { "0" },
+            );
+        }
+        executor.reset().unwrap();
+        if prefix {
+            // A snapshot after a shared prefix, dirtied, then restored.
+            executor.prefill(&PROMPT).unwrap();
+            let mut snapshot = None;
+            executor.save_snapshot(&mut snapshot).unwrap();
+            for token in [5u32, 6, 7, 8, 9] {
+                executor.step(token).unwrap();
+            }
+            executor
+                .restore_snapshot(snapshot.as_ref().unwrap())
+                .unwrap();
+        }
+        let (&last, rest) = prompt.split_last().unwrap();
+        if !rest.is_empty() {
+            executor.prefill(rest).unwrap();
+        }
+        let mut rows = vec![executor.step_logits(last).unwrap()];
+        for &token in &decode {
+            rows.push(executor.step_logits(token).unwrap());
+        }
+        rows.into_iter()
+            .map(|row| row.into_iter().map(f32::to_bits).collect::<Vec<_>>())
+            .collect::<Vec<_>>()
+    };
+
+    for prefix in [false, true] {
+        for len in [2usize, 3, 4, 8, 17, 65, 66, 67, 130, 201] {
+            let prompt = &tokens[..len];
+            let reference = run(false, prefix, prompt);
+            let batched = run(true, prefix, prompt);
+            for (step, (a, b)) in reference.iter().zip(&batched).enumerate() {
+                let differing = a.iter().zip(b).filter(|(x, y)| x != y).count();
+                assert_eq!(
+                    differing, 0,
+                    "prompt {len} (prefix {prefix}): {differing} logits differ at step {step}"
+                );
+            }
+            eprintln!(
+                "prompt {len:3} prefix {prefix}: bit-identical over {} rows",
+                reference.len()
+            );
+        }
+    }
+}

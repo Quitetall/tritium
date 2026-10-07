@@ -28,6 +28,8 @@
 //! - `TRITIUM_QWEN36_AB`       optional `NAME=a,b` toggle for interleaved A/B
 //! - `TRITIUM_QWEN36_RESIDENT` `1` runs a round through the device-resident executor
 //!   (fast tier) instead of the host-orchestrated forward; usable as an A/B toggle
+//! - `TRITIUM_QWEN36_PROMPT_LEN` prompt tokens (default 26, the prompt below; longer
+//!   prompts repeat it), for time-to-first-token, which every round also reports
 
 fn main() {
     #[cfg(not(feature = "cuda"))]
@@ -105,6 +107,7 @@ mod cuda_qwen36 {
     struct Round {
         arm: usize,
         per_token_ms: f64,
+        prefill_ms: f64,
         tokens: Vec<u32>,
     }
 
@@ -154,7 +157,13 @@ mod cuda_qwen36 {
             loaded.elapsed().as_secs_f64()
         );
         let runner = model.runner();
-        let capacity = PROMPT.len() + warmup + steps + 1;
+        let prompt: Vec<u32> = PROMPT
+            .iter()
+            .copied()
+            .cycle()
+            .take(env_usize("TRITIUM_QWEN36_PROMPT_LEN", PROMPT.len()))
+            .collect();
+        let capacity = prompt.len() + warmup + steps + 1;
         // Built once when eligible; each round decides from TRITIUM_QWEN36_RESIDENT
         // whether to use it, so it can be one arm of an in-process A/B.
         let mut resident = runner
@@ -178,12 +187,15 @@ mod cuda_qwen36 {
             let use_resident = std::env::var("TRITIUM_QWEN36_RESIDENT").as_deref() == Ok("1");
             let mut tokens = Vec::with_capacity(warmup + steps);
             let mut timed = Vec::with_capacity(steps);
+            let prefill_ms;
             if use_resident {
                 let executor = resident
                     .as_mut()
                     .expect("TRITIUM_QWEN36_RESIDENT=1 but this bundle has no resident executor");
                 executor.reset().expect("reset executor");
-                let mut next = executor.prefill(&PROMPT).expect("prefill");
+                let started = Instant::now();
+                let mut next = executor.prefill(&prompt).expect("prefill");
+                prefill_ms = started.elapsed().as_secs_f64() * 1000.0;
                 for step in 0..warmup + steps {
                     tokens.push(next);
                     let started = Instant::now();
@@ -194,8 +206,10 @@ mod cuda_qwen36 {
                 }
             } else {
                 let mut cache = runner.new_cache(capacity).expect("allocate cache");
-                let mut output = runner.forward(&PROMPT, &mut cache).expect("prefill");
+                let started = Instant::now();
+                let mut output = runner.forward(&prompt, &mut cache).expect("prefill");
                 let mut next = sample_greedy(output.last_logits()).expect("greedy token");
+                prefill_ms = started.elapsed().as_secs_f64() * 1000.0;
                 for step in 0..warmup + steps {
                     tokens.push(next);
                     let started = Instant::now();
@@ -208,21 +222,24 @@ mod cuda_qwen36 {
             }
             let per_token_ms = median(&mut timed);
             eprintln!(
-                "round {round:2} {:<32} {per_token_ms:8.2} ms/token  {:7.2} tok/s",
+                "round {round:2} {:<32} {per_token_ms:8.2} ms/token  {:7.2} tok/s  \
+                 prefill {prefill_ms:9.1} ms",
                 arms[arm].label,
                 1000.0 / per_token_ms
             );
             results.push(Round {
                 arm,
                 per_token_ms,
+                prefill_ms,
                 tokens,
             });
         }
 
         println!(
             "qwen36_decode: bundle={} profile={profile} device={device} steps={steps} \
-             warmup={warmup} rounds={rounds}",
-            bundle.display()
+             warmup={warmup} rounds={rounds} prompt={}",
+            bundle.display(),
+            prompt.len()
         );
         for (index, arm) in arms.iter().enumerate() {
             let mut per_token: Vec<f64> = results
@@ -231,8 +248,14 @@ mod cuda_qwen36 {
                 .map(|round| round.per_token_ms)
                 .collect();
             let ms = median(&mut per_token);
+            let mut prefill: Vec<f64> = results
+                .iter()
+                .filter(|round| round.arm == index)
+                .map(|round| round.prefill_ms)
+                .collect();
+            let prefill_ms = median(&mut prefill);
             println!(
-                "  {:<32} median {ms:8.2} ms/token  {:7.2} tok/s  (n={})",
+                "  {:<32} median {ms:8.2} ms/token  {:7.2} tok/s  prefill {prefill_ms:9.1} ms  (n={})",
                 arm.label,
                 1000.0 / ms,
                 per_token.len()

@@ -80,6 +80,54 @@ pub(super) fn launch_salt_v2_stream_multi_on(
     }
 }
 
+/// Launch the multi-row (prefill) fused row-stream GEMV over `tensor_count`
+/// descriptors: `m` activation rows of `k` floats, each tensor writing an
+/// `[m, rows]` output. Every output equals `launch_salt_v2_stream_multi_on` run
+/// on that activation row alone, bit for bit.
+///
+/// # Errors
+/// Returns a driver failure.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn launch_salt_v2_stream_rows_on(
+    stream: &CudaStream,
+    function: &CudaFunction,
+    descriptors: &CudaSlice<u64>,
+    tensor_count: u32,
+    total_rows: u32,
+    k: u32,
+    table_bytes: u32,
+    input: &CudaSlice<f32>,
+    m: u32,
+) -> Result<(), BackendError> {
+    let cfg = LaunchConfig {
+        grid_dim: (
+            total_rows.div_ceil(SALT_V2_STREAM_WARPS),
+            m.div_ceil(SALT_V2_STREAM_ROWS_MAX),
+            1,
+        ),
+        block_dim: (SALT_V2_STREAM_WARPS * 32, 1, 1),
+        shared_mem_bytes: SALT_V2_B3_TABLE_BYTES + table_bytes * SALT_V2_STREAM_WARPS,
+    };
+    let mut launch = stream.launch_builder(function);
+    launch
+        .arg(input)
+        .arg(descriptors)
+        .arg(&tensor_count)
+        .arg(&total_rows)
+        .arg(&k)
+        .arg(&table_bytes)
+        .arg(&m);
+    // SAFETY: as `launch_salt_v2_stream_multi_on`; the caller sized `input` for
+    // `m * k` floats and every descriptor's output for `m * rows` floats.
+    #[allow(unsafe_code)]
+    unsafe {
+        launch
+            .launch(cfg)
+            .map(|_| ())
+            .map_err(|error| driver_err("launch SALT V2 multi-row row-stream forward", &error))
+    }
+}
+
 /// Quantize `groups` 128-coefficient groups of f32 activations to int8 with one
 /// scale per group, for the A8 row-stream GEMV.
 ///
@@ -617,6 +665,70 @@ impl CudaBackend {
             self.salt_v2_forward_launch(tensor, activation, m, output_elements, receipt)?;
         output.copy_from_slice(&staged);
         Ok(receipt)
+    }
+
+    /// Run the multi-row prefill row-stream GEMV on `m` activation rows, for
+    /// parity gates. Returns `[m, rows]` outputs.
+    ///
+    /// # Errors
+    /// Rejects a tensor the kernel cannot serve or a wrong activation length, or
+    /// returns a driver failure.
+    pub fn salt_v2_forward_rows_probe(
+        &self,
+        tensor: &SaltV2ResidentTensor,
+        activation: &[f32],
+        m: usize,
+    ) -> Result<Vec<f32>, BackendError> {
+        self.validate_salt_v2_resident_context(tensor)?;
+        let table_bytes =
+            salt_v2_stream_dispatch(tensor.columns, tensor.scale_group_size, tensor.codec_tag)
+                .ok_or_else(|| {
+                    BackendError::InvalidInput("multi-row stream needs a row-stream tensor".into())
+                })?;
+        if m == 0 || activation.len() != m * tensor.columns {
+            return Err(BackendError::ShapeMismatch {
+                expected: m * tensor.columns,
+                got: activation.len(),
+            });
+        }
+        let narrow = |value: usize| {
+            u32::try_from(value)
+                .map_err(|_| BackendError::InvalidInput("exceeds the u32 kernel ABI".into()))
+        };
+        let input = self
+            .stream
+            .clone_htod(activation)
+            .map_err(|error| driver_err("upload multi-row probe input", &error))?;
+        let output = self
+            .stream
+            .alloc_zeros::<f32>(m * tensor.rows)
+            .map_err(|error| {
+                alloc_or_backend("allocate multi-row probe output", &error, m * tensor.rows)
+            })?;
+        let words = salt_stream_descriptor(
+            tensor,
+            &self.stream,
+            crate::cuda::graph_raw::dptr(&output, &self.stream),
+            0,
+        )?;
+        let descriptors = self
+            .stream
+            .clone_htod(&words)
+            .map_err(|error| driver_err("upload multi-row probe descriptor", &error))?;
+        launch_salt_v2_stream_rows_on(
+            &self.stream,
+            &self.func_salt_v2_stream_rows,
+            &descriptors,
+            1,
+            narrow(tensor.rows)?,
+            narrow(tensor.columns)?,
+            table_bytes,
+            &input,
+            narrow(m)?,
+        )?;
+        self.stream
+            .clone_dtoh(&output)
+            .map_err(|error| driver_err("read multi-row probe output", &error))
     }
 
     /// A8 row-stream projection with host input and output, for gates and probes.

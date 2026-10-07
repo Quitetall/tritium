@@ -1130,6 +1130,138 @@ extern "C" __global__ void salt_v2_stream_f32_multi(
              tensor.terminal_map_value, tile_table_bytes);
 }
 
+// Multi-row twin of `salt_v2_stream_f32_multi`, for prefill.
+//
+// Decoding T prompt tokens one at a time streams every weight T times. Here a
+// warp streams one weight row once and applies each decoded word to up to
+// `kStreamRowsMax` activation rows; grid.y takes further groups of rows. The
+// per-row arithmetic is `stream_row`'s, statement for statement: the same words
+// per lane in the same order, the same `fmaf` chain into `low`/`high`, the same
+// two scale folds and the same xor reduction. The file is built with
+// `--fmad=false`, so every output is bit-identical to `salt_v2_stream_f32_multi`
+// run on that activation row alone.
+//
+// Activation row r is `activation + r * k`; tensor t writes row r of its output
+// at `output + r * rows_t + row`, so each output buffer is [m, rows_t].
+constexpr uint32_t kStreamRowsMax = 8U;
+
+extern "C" __global__ void salt_v2_stream_rows_f32(
+    const float* __restrict__ activation,
+    const SaltStreamTensor* __restrict__ tensors,
+    uint32_t tensor_count,
+    uint32_t total_rows,
+    uint32_t k,
+    uint32_t tile_table_bytes,
+    uint32_t m) {
+  extern __shared__ unsigned char stream_shared[];
+  unsigned short* b3_digits = reinterpret_cast<unsigned short*>(stream_shared);
+  for (uint32_t code = threadIdx.x; code < kB3TableEntries; code += blockDim.x) {
+    b3_digits[code] = static_cast<unsigned short>(
+        (code % 3U) | (((code / 3U) % 3U) << 2U) | (((code / 9U) % 3U) << 4U) |
+        (((code / 27U) % 3U) << 6U) | (((code / 81U) % 3U) << 8U));
+  }
+  __syncthreads();
+
+  const uint32_t lane = threadIdx.x & 31U;
+  const uint32_t warp_in_block = threadIdx.x >> 5U;
+  const uint32_t warps_per_block = blockDim.x >> 5U;
+  unsigned char* tile_of = stream_shared + kB3TableEntries * sizeof(unsigned short) +
+                           static_cast<size_t>(warp_in_block) * tile_table_bytes;
+  const uint32_t fused_row = blockIdx.x * warps_per_block + warp_in_block;
+  const uint32_t first_act = blockIdx.y * kStreamRowsMax;
+  if (fused_row >= total_rows || first_act >= m) return;
+  const uint32_t acts = min(kStreamRowsMax, m - first_act);
+
+  uint32_t index = 0U;
+  while (index + 1U < tensor_count && fused_row >= tensors[index + 1U].first_row) ++index;
+  const SaltStreamTensor tensor = tensors[index];
+  const uint32_t row = fused_row - tensor.first_row;
+  float* output = reinterpret_cast<float*>(tensor.output) + row;
+  const float* activations = activation + static_cast<size_t>(first_act) * k;
+
+  uint32_t row_rank = 0U;
+  uint32_t plane_tiles = 0U;
+  if (!stream_row_setup(tile_of, lane, reinterpret_cast<const unsigned char*>(tensor.index_metadata),
+                        row, k, tensor.tile_count, tensor.plane_count,
+                        tensor.allocation_map_bytes, tensor.rank_prefix_count,
+                        tensor.terminal_map_value, tile_table_bytes, row_rank, plane_tiles)) {
+    if (lane == 0U) {
+      for (uint32_t r = 0; r < acts; ++r) {
+        output[static_cast<size_t>(first_act + r) * tensor.rows] = __int_as_float(0x7FC00000);
+      }
+    }
+    return;
+  }
+
+  const uint32_t* words = reinterpret_cast<const uint32_t*>(tensor.payload) +
+                          static_cast<size_t>(row_rank) * 13U;
+  const __half2* scale_pairs = reinterpret_cast<const __half2*>(tensor.scales) + row_rank;
+  const uint32_t total_words = plane_tiles * 13U;
+
+  float accumulator[kStreamRowsMax];
+#pragma unroll
+  for (uint32_t r = 0; r < kStreamRowsMax; ++r) accumulator[r] = 0.0f;
+  for (uint32_t index = lane; index < total_words; index += 32U) {
+    const uint32_t plane_tile = index / 13U;
+    const uint32_t word = index - plane_tile * 13U;
+    const uint32_t bits = __ldcs(words + index);
+    const float2 scale = __half22float2(scale_pairs[plane_tile]);
+    const size_t offset = static_cast<size_t>(tile_of[plane_tile]) * kAllocationTile + word * 20U;
+    const uint32_t p0 = b3_digits[bits & 0xFFU];
+    const uint32_t p1 = b3_digits[(bits >> 8U) & 0xFFU];
+    const uint32_t p2 = b3_digits[(bits >> 16U) & 0xFFU];
+    const uint32_t p3 = b3_digits[bits >> 24U];
+    const float low_scale = word <= 6U ? scale.x : scale.y;
+    const float high_scale = word <= 5U ? scale.x : scale.y;
+#pragma unroll
+    for (uint32_t r = 0; r < kStreamRowsMax; ++r) {
+      if (r >= acts) break;
+      const float4* chunk =
+          reinterpret_cast<const float4*>(activations + static_cast<size_t>(r) * k + offset);
+      const float4 a0 = __ldg(chunk);
+      const float4 a1 = __ldg(chunk + 1);
+      const float4 a2 = __ldg(chunk + 2);
+      const float4 a3 = __ldg(chunk + 3);
+      // Word 12's last four trits are padding past the tile: never read.
+      const float4 a4 = word == 12U ? make_float4(0.0f, 0.0f, 0.0f, 0.0f) : __ldg(chunk + 4);
+      const float a[20] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w, a2.x, a2.y,
+                           a2.z, a2.w, a3.x, a3.y, a3.z, a3.w, a4.x, a4.y, a4.z, a4.w};
+      float low = 0.0f;
+      float high = 0.0f;
+#pragma unroll
+      for (uint32_t digit = 0; digit < 5U; ++digit) low = fmaf(b3_trit(p0, digit), a[digit], low);
+#pragma unroll
+      for (uint32_t digit = 0; digit < 3U; ++digit) {
+        low = fmaf(b3_trit(p1, digit), a[5U + digit], low);
+      }
+#pragma unroll
+      for (uint32_t digit = 3; digit < 5U; ++digit) {
+        high = fmaf(b3_trit(p1, digit), a[5U + digit], high);
+      }
+#pragma unroll
+      for (uint32_t digit = 0; digit < 5U; ++digit) {
+        high = fmaf(b3_trit(p2, digit), a[10U + digit], high);
+      }
+#pragma unroll
+      for (uint32_t digit = 0; digit < 5U; ++digit) {
+        high = fmaf(b3_trit(p3, digit), a[15U + digit], high);
+      }
+      accumulator[r] = fmaf(low_scale, low, accumulator[r]);
+      accumulator[r] = fmaf(high_scale, high, accumulator[r]);
+    }
+  }
+#pragma unroll
+  for (uint32_t r = 0; r < kStreamRowsMax; ++r) {
+    if (r >= acts) break;
+    float value = accumulator[r];
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      value += __shfl_xor_sync(0xFFFFFFFFU, value, offset);
+    }
+    if (lane == 0U) output[static_cast<size_t>(first_act + r) * tensor.rows] = value;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // A8 row-streaming GEMV (relaxed tier): int8 activations, dp4a.
 //
