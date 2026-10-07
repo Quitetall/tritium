@@ -538,6 +538,97 @@ impl Qwen35TextRunner {
         Ok(())
     }
 
+    /// Recompute aligned teacher and current-package outputs for one bounded
+    /// projection activation window. The teacher must preserve the package's
+    /// activation arithmetic (for example, an exact-fp32 dense projection for
+    /// SALT V2); callers bind the activation source and teacher identity in
+    /// their campaign receipt.
+    #[allow(dead_code)] // Consumed by the B3 candidate-builder adapter.
+    pub(crate) fn visit_named_projection_output_pairs(
+        &self,
+        tensor_name: &str,
+        teacher: &Projection,
+        activations: &[f32],
+        rows: usize,
+        mut observer: impl FnMut(&[f32], &[f32]),
+    ) -> Result<(), NnError> {
+        if rows == 0 {
+            return Err(NnError::Shape {
+                expected: 1,
+                got: 0,
+            });
+        }
+        let current = self.named_projection(tensor_name)?;
+        if teacher.k_in() != current.k_in() || teacher.n_out() != current.n_out() {
+            return Err(NnError::Shape {
+                expected: current.n_out().saturating_mul(current.k_in()),
+                got: teacher.n_out().saturating_mul(teacher.k_in()),
+            });
+        }
+        if teacher.activation_mode() != current.activation_mode() {
+            return Err(NnError::Backend(
+                "Qwen teacher and package projection use different activation arithmetic"
+                    .to_owned(),
+            ));
+        }
+        let input_count = rows.checked_mul(current.k_in()).ok_or(NnError::Shape {
+            expected: usize::MAX,
+            got: activations.len(),
+        })?;
+        if activations.len() != input_count {
+            return Err(NnError::Shape {
+                expected: input_count,
+                got: activations.len(),
+            });
+        }
+        if activations.iter().any(|value| !value.is_finite()) {
+            return Err(NnError::Backend(
+                "Qwen projection input contains a non-finite value".to_owned(),
+            ));
+        }
+        let output_count = rows.checked_mul(current.n_out()).ok_or(NnError::Shape {
+            expected: usize::MAX,
+            got: rows,
+        })?;
+        let mut teacher_outputs = Vec::new();
+        teacher_outputs
+            .try_reserve_exact(output_count)
+            .map_err(|error| {
+                NnError::Backend(format!("allocate Qwen teacher output window: {error}"))
+            })?;
+        teacher_outputs.resize(output_count, 0.0);
+        let mut current_outputs = Vec::new();
+        current_outputs
+            .try_reserve_exact(output_count)
+            .map_err(|error| {
+                NnError::Backend(format!("allocate Qwen package output window: {error}"))
+            })?;
+        current_outputs.resize(output_count, 0.0);
+        teacher.forward(
+            self.backend.as_ref(),
+            activations,
+            rows,
+            &mut teacher_outputs,
+        )?;
+        current.forward(
+            self.backend.as_ref(),
+            activations,
+            rows,
+            &mut current_outputs,
+        )?;
+        if teacher_outputs
+            .iter()
+            .chain(&current_outputs)
+            .any(|value| !value.is_finite())
+        {
+            return Err(NnError::Backend(
+                "Qwen paired projection output contains a non-finite value".to_owned(),
+            ));
+        }
+        observer(&teacher_outputs, &current_outputs);
+        Ok(())
+    }
+
     #[allow(dead_code)] // Consumed by the B3 candidate-builder adapter.
     fn named_projection(&self, tensor_name: &str) -> Result<&Projection, NnError> {
         let layer_path = tensor_name

@@ -1807,15 +1807,44 @@ mod tests {
         let probe_name = "model.language_model.layers.0.mlp.gate_proj.weight";
         assert!(schema.contains_key(probe_name));
         let mut projected_rows = 0;
+        let teacher = Projection::Dense(
+            crate::layers::DenseLinear::new_exact(
+                vec![
+                    1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+                    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                ],
+                6,
+                4,
+            )
+            .unwrap(),
+        );
         model
             .runner()
-            .visit_named_projection_outputs(probe_name, &[1.0; 4], 1, |output| {
-                assert_eq!(output.len(), 6);
-                assert!(output.iter().all(|value| *value == 0.0));
-                projected_rows += 1;
-            })
+            .visit_named_projection_output_pairs(
+                probe_name,
+                &teacher,
+                &[1.0, 2.0, 3.0, 4.0],
+                1,
+                |teacher, current| {
+                    assert_eq!(teacher, &[1.0, 2.0, 3.0, 4.0, 0.0, 0.0]);
+                    assert_eq!(current, &[0.0; 6]);
+                    projected_rows += 1;
+                },
+            )
             .unwrap();
         assert_eq!(projected_rows, 1);
+        let a8_teacher =
+            Projection::Dense(crate::layers::DenseLinear::new(vec![0.0; 24], 6, 4).unwrap());
+        assert!(matches!(
+            model.runner().visit_named_projection_output_pairs(
+                probe_name,
+                &a8_teacher,
+                &[1.0; 4],
+                1,
+                |_, _| panic!("mismatched arithmetic must not reach observer"),
+            ),
+            Err(NnError::Backend(_))
+        ));
         let mut probe_package = SaltV2PackageReader::new_strict(
             File::open(files.directory.join("compact.tsalt2")).unwrap(),
         )

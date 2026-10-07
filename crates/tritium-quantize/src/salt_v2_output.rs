@@ -1228,10 +1228,10 @@ pub struct FixedTritScaleRefit {
 /// read one activation/teacher-output window, observe it, and release its dense
 /// rows before reading the next window.
 #[derive(Clone, Debug)]
-pub struct FixedTritTileScaleRefitAccumulator<'a> {
+pub struct FixedTritTileScaleRefitAccumulator {
     output_width: usize,
     tile_index: usize,
-    trits: &'a [Trit],
+    trits: Vec<Trit>,
     scale_group_size: usize,
     input_width: Option<usize>,
     fit: FixedTritScaleRefitAccumulator,
@@ -1513,7 +1513,7 @@ impl FixedTritScaleRefitAccumulator {
     }
 }
 
-impl<'a> FixedTritTileScaleRefitAccumulator<'a> {
+impl FixedTritTileScaleRefitAccumulator {
     /// Start a streaming fit for one package allocation tile-plane.
     ///
     /// # Errors
@@ -1522,7 +1522,7 @@ impl<'a> FixedTritTileScaleRefitAccumulator<'a> {
     pub fn new(
         output_width: usize,
         tile_index: usize,
-        trits: &'a [Trit],
+        trits: &[Trit],
         scale_group_size: usize,
         coordinate_sweeps: usize,
     ) -> Result<Self, OutputReconstructionError> {
@@ -1540,10 +1540,15 @@ impl<'a> FixedTritTileScaleRefitAccumulator<'a> {
         }
         let group_count = trits.len().div_ceil(scale_group_size);
         let fit = FixedTritScaleRefitAccumulator::new(group_count, coordinate_sweeps)?;
+        let mut owned_trits = Vec::new();
+        owned_trits
+            .try_reserve_exact(trits.len())
+            .map_err(|_| OutputReconstructionError::ReceiptAllocationFailed)?;
+        owned_trits.extend_from_slice(trits);
         Ok(Self {
             output_width,
             tile_index,
-            trits,
+            trits: owned_trits,
             scale_group_size,
             input_width: None,
             fit,
@@ -1896,12 +1901,12 @@ impl FixedTritScaleUpdateCandidate {
 }
 
 #[derive(Debug)]
-struct ActiveTileScaleFit<'a> {
+struct ActiveTileScaleFit {
     tensor_index: usize,
     plane_index: usize,
     output_width: usize,
     current_scales: Vec<half::f16>,
-    accumulator: FixedTritTileScaleRefitAccumulator<'a>,
+    accumulator: FixedTritTileScaleRefitAccumulator,
 }
 
 /// Bounded-memory builder for an immutable output-aware scale candidate.
@@ -1909,16 +1914,16 @@ struct ActiveTileScaleFit<'a> {
 /// It retains only canonical f16 scale updates and the active tile's compact
 /// fit state; activation and residual windows can be released after each call.
 #[derive(Debug)]
-pub struct FixedTritScaleUpdateCandidateBuilder<'spec, 'trits> {
+pub struct FixedTritScaleUpdateCandidateBuilder<'spec> {
     spec: &'spec OutputReconstructionSpec,
     parent_package_digest: [u8; 32],
     initialization_seed: u64,
     updates: Vec<SaltV2ScaleUpdate>,
-    active: Option<ActiveTileScaleFit<'trits>>,
+    active: Option<ActiveTileScaleFit>,
     last_target: Option<(usize, usize, usize)>,
 }
 
-impl<'spec, 'trits> FixedTritScaleUpdateCandidateBuilder<'spec, 'trits> {
+impl<'spec> FixedTritScaleUpdateCandidateBuilder<'spec> {
     /// Start a candidate bound to a frozen spec, exact parent, and seed.
     #[must_use]
     pub fn new(
@@ -1948,7 +1953,7 @@ impl<'spec, 'trits> FixedTritScaleUpdateCandidateBuilder<'spec, 'trits> {
         tile_index: usize,
         plane_index: usize,
         output_width: usize,
-        trits: &'trits [Trit],
+        trits: &[Trit],
         current_scales: &[half::f16],
         scale_group_size: usize,
         coordinate_sweeps: usize,

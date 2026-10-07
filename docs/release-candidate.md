@@ -459,6 +459,17 @@ projection capture, exact parent trit/scale streaming, sliding-window/restart
 orchestration, candidate scoring/selection, child materialization, and exact child
 replay remain unconnected. No real model or campaign was run.
 
+The next B3 slice adds paired bounded-window evaluation of a caller-supplied
+dense teacher projection and the exact named projection in the current Qwen
+package. The seam rejects width or activation-arithmetic mismatches, and the
+loaded SALT fixture verifies expected teacher/student rows. The tile refit now
+owns a copy of at most one 256-trit allocation tile, so a package reader can
+release its decoded plane buffer immediately after `begin_tile_plane`. The
+focused Qwen test, output-reconstruction builder test, formatting, and scoped
+Clippy pass. This still does not bind teacher weights or activation caches,
+stream planes from the admitted parent package, score full-model candidates, or
+materialize/replay children.
+
 ### Flagship campaign status refresh (2026-10-04)
 
 The canonical read-only probe was rerun against the durable workspace

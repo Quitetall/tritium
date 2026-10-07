@@ -1163,6 +1163,7 @@ fn scale_update_candidate_builder_streams_windows_and_binds_the_owned_candidate(
     candidate_builder
         .begin_tile_plane(7, 0, 1, 2, &trits, &[f16::ONE, f16::ONE], 64, 16)
         .unwrap();
+    drop(trits);
     assert!(matches!(
         candidate_builder.observe_window_from_current_projection(
             &first_window,
