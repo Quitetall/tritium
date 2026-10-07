@@ -2057,3 +2057,19 @@ about 11 GiB in sampled logs) and temporary disk stayed above 80 GiB. This
 confirms a CPU-time blocker rather than OOM or disk pressure. It does not isolate
 a single solver hotspot within conversion; profiler-backed optimization and an
 exact-candidate rerun are still required. The gate remains red and unchanged.
+
+### Exact-source installed-wheel PTQ parallelism — 2026-10-07
+
+On source revision `19656644ad3c26c9e4f6f3948ba08c304c6b4b24`, the exact
+Linux CPU abi3 wheel passed the installed-wheel `qualify public PTQ row-fitting
+parallelism` step in Actions run
+[37626387409](https://github.com/Quitetall/tritium/actions/runs/37626387409)
+(job `112810906163`). The test exercises public `prepare` → `calibrate` →
+`convert()` and passed its assertions that serial and four-thread runs produce
+the same algorithm ID, fitted-artifact digest, and weighted error, with at least
+1.5× measured speedup. The exact timing lines are not yet available: the run's
+pinned SmolLM2 CPU tutorial job is still active. The separate general Python
+unit-test job correctly skips this probe because PyTorch is absent there; the
+installed-wheel lane is its authoritative execution environment. This is a
+bounded row-fitting result, not a whole-model throughput or release-performance
+claim.
