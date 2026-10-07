@@ -2048,5 +2048,12 @@ performance result, not proof that parallel fitting regressed or that the
 performance target passed. The test now prints CPU count, affinity, and load
 average with its timings so a clean rerun can distinguish host contention from
 a solver regression. The exact-source hosted tutorial run `37621206763` was
-still active when this entry was recorded; its final result remains authoritative
-for that hosted lane.
+still active when this entry was recorded. It has now completed and failed the
+300-second end-to-end limit at 1,088.645 seconds. Stage receipts in the job log
+show conversion from 0.605 seconds after calibration to 864.038 seconds
+(863.433 seconds of conversion), ONNX export in 127.408 seconds, and 224.607
+seconds for the remaining measured work. Memory stayed available (at least
+about 11 GiB in sampled logs) and temporary disk stayed above 80 GiB. This
+confirms a CPU-time blocker rather than OOM or disk pressure. It does not isolate
+a single solver hotspot within conversion; profiler-backed optimization and an
+exact-candidate rerun are still required. The gate remains red and unchanged.
