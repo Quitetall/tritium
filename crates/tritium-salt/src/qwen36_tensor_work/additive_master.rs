@@ -3821,6 +3821,29 @@ mod tests {
             Projection::Dense(DenseLinear::new_exact(vec![0.0; 128 * 128], 128, 128).unwrap());
         let mut fitted_candidates = Vec::new();
         for seed in [7, 11] {
+            let mut invalid_parent = SaltV2PackageReader::new_strict(
+                std::fs::File::open(bundle.join("compact.tsalt2")).unwrap(),
+            )
+            .expect("open parent for candidate-order rejection");
+            assert!(matches!(
+                session.fit_scale_refit_candidate(
+                    &receipt,
+                    &refined_spec,
+                    activation_caches.as_slice(),
+                    &[(0, 2), (2, 1)],
+                    1 << 20,
+                    &[
+                        (projection_name, 0, 0, &teacher),
+                        (projection_name, 0, 0, &teacher),
+                    ],
+                    seed,
+                    8,
+                    &mut invalid_parent,
+                ),
+                Err(Qwen36ScaleRefitWindowError::Fit(
+                    OutputReconstructionError::NonCanonicalScaleUpdateOrder
+                ))
+            ));
             let mut fit_builder = FixedTritScaleUpdateCandidateBuilder::new(
                 &refined_spec,
                 receipt.package_id().as_bytes(),
@@ -3895,27 +3918,27 @@ mod tests {
             )
             .expect("reopen exact parent for production candidate fitter");
             let candidate = session
-                .fit_scale_refit_tile_plane_candidate(
+                .fit_scale_refit_candidate(
                     &receipt,
                     &refined_spec,
                     activation_caches.as_slice(),
                     &[(0, 2), (2, 1)],
                     1 << 20,
-                    projection_name,
-                    0,
-                    0,
+                    &[
+                        (projection_name, 0, 0, &teacher),
+                        (projection_name, 1, 0, &teacher),
+                    ],
                     seed,
                     8,
-                    &teacher,
                     &mut candidate_parent,
                 )
-                .expect("production B3 tile-plane candidate fitter");
+                .expect("production B3 multi-plane candidate fitter");
             fitted_candidates.push(candidate);
         }
         assert!(
             fitted_candidates
                 .iter()
-                .all(|candidate| candidate.updates().len() == 1)
+                .all(|candidate| candidate.updates().len() == 2)
         );
         let first_scale_candidate = fitted_candidates[0]
             .as_scale_candidate(&refined_spec)
