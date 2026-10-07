@@ -463,12 +463,13 @@ The next B3 slice adds paired bounded-window evaluation of a caller-supplied
 dense teacher projection and the exact named projection in the current Qwen
 package. The seam rejects width or activation-arithmetic mismatches, and the
 loaded SALT fixture verifies expected teacher/student rows. The tile refit now
-owns a copy of at most one 256-trit allocation tile, so a package reader can
-release its decoded plane buffer immediately after `begin_tile_plane`. The
-focused Qwen test, output-reconstruction builder test, formatting, and scoped
-Clippy pass. This still does not bind teacher weights or activation caches,
-stream planes from the admitted parent package, score full-model candidates, or
-materialize/replay children.
+owns a copy of at most one 256-trit allocation tile. It can also start directly
+from a strict reader's borrowed packed plane: canonical decode happens at the
+boundary, then the reader buffer may be released. A package-reader integration
+test verifies that lifetime handoff and the focused test passes. Formatting and
+the scoped Qwen/quantize Clippy gate passed. This seam still does not bind
+teacher weights or activation caches, score full-model candidates, or
+materialize/replay immutable child packages.
 
 ### Flagship campaign status refresh (2026-10-04)
 

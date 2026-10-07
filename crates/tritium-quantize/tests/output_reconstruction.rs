@@ -1,11 +1,14 @@
 //! Public-seam tests for streamed SALT V2 block/sliding output reconstruction.
 
+use std::io::Cursor;
+
 use half::f16;
 use tritium_core::Trit;
 use tritium_format::{
     ModelId,
     salt_v2::SaltV2Codec,
     salt_v2_package::{SaltV2Package, SaltV2Plane, SaltV2ScaleUpdate, SaltV2Tensor, SaltV2Tile},
+    salt_v2_package::{SaltV2PackageReader, write_salt_v2_package},
 };
 use tritium_quantize::{
     ActivationCache, ActivationCacheBuilder, ActivationCacheSpec, ActivationChunk, ActivationDType,
@@ -1208,6 +1211,42 @@ fn scale_update_candidate_builder_streams_windows_and_binds_the_owned_candidate(
     assert_eq!(borrowed.parent_package_digest(), &parent);
     assert_eq!(borrowed.initialization_seed(), 17);
     assert_eq!(borrowed.candidate_id(), candidate.candidate_id());
+}
+
+#[test]
+fn packed_parent_plane_starts_owned_candidate_fit() {
+    let plane = SaltV2Plane::new(vec![1i8; 256], vec![f16::ONE; 2]).unwrap();
+    let tensor = SaltV2Tensor::new(
+        "projection.weight",
+        vec![2, 128],
+        vec![SaltV2Tile::new(vec![plane]).unwrap()],
+    )
+    .unwrap();
+    let package = SaltV2Package::new(SaltV2Codec::B3, vec![tensor]).unwrap();
+    let encoded = write_salt_v2_package(&package).unwrap();
+    let mut reader = SaltV2PackageReader::new_strict(Cursor::new(encoded.bytes)).unwrap();
+    let codec = reader.codec();
+    let spec = spec(
+        OutputReconstructionSchedule::SlidingWindows {
+            block_count: 2,
+            window_size: 2,
+            stride: 1,
+        },
+        1,
+    );
+    let mut builder = FixedTritScaleUpdateCandidateBuilder::new(&spec, &[44; 32], 5);
+    reader
+        .visit_packed_tensor("projection.weight", |plane| {
+            builder
+                .begin_packed_tile_plane(3, codec, plane, 2, 128, 8)
+                .unwrap();
+        })
+        .unwrap();
+    reader.verify_unchanged().unwrap();
+    assert!(matches!(
+        builder.begin_tile_plane(3, 1, 0, 2, &[Trit::ZERO], &[f16::ONE], 128, 8),
+        Err(OutputReconstructionError::ScaleFitAlreadyActive)
+    ));
 }
 
 #[test]

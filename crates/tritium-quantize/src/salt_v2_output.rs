@@ -9,9 +9,11 @@ use tritium_format::{
     ModelId, RuntimeEvidenceError, RuntimeFinalLogitsAccumulator,
     RuntimeOutputReconstructionAccumulator, RuntimeOutputScope, RuntimeOutputScopeAccumulator,
     RuntimeOutputScopeEvidence,
+    salt_v2::SaltV2Codec,
     salt_v2_package::{
-        SALT_V2_ALLOCATION_TILE_SIZE, SALT_V2_SCALE_GROUP_SIZE, SALT_V2_SCALE_GROUP_SIZE_64,
-        SALT_V2_SCALE_GROUP_SIZE_256, SaltV2ScaleUpdate,
+        PackedSaltV2PlaneRef, SALT_V2_ALLOCATION_TILE_SIZE, SALT_V2_SCALE_GROUP_SIZE,
+        SALT_V2_SCALE_GROUP_SIZE_64, SALT_V2_SCALE_GROUP_SIZE_256, SaltV2ScaleUpdate,
+        unpack_salt_v2_plane,
     },
 };
 
@@ -2001,6 +2003,44 @@ impl<'spec> FixedTritScaleUpdateCandidateBuilder<'spec> {
         Ok(())
     }
 
+    /// Begin a fit directly from one strictly-read SALT V2 parent plane.
+    ///
+    /// The packed plane is decoded canonically and copied into the bounded
+    /// active-tile state, allowing the reader's borrowed buffer to be released
+    /// as soon as this method returns. `tensor_index` is campaign-defined; the
+    /// caller must bind it to the package tensor name in campaign provenance.
+    ///
+    /// # Errors
+    /// Rejects noncanonical packed data or the same geometry/order errors as
+    /// [`Self::begin_tile_plane`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn begin_packed_tile_plane(
+        &mut self,
+        tensor_index: usize,
+        codec: SaltV2Codec,
+        packed_plane: PackedSaltV2PlaneRef<'_>,
+        output_width: usize,
+        scale_group_size: usize,
+        coordinate_sweeps: usize,
+    ) -> Result<(), OutputReconstructionError> {
+        let trits = unpack_salt_v2_plane(
+            codec,
+            packed_plane.packed_bytes(),
+            packed_plane.logical_len(),
+        )
+        .map_err(|_| OutputReconstructionError::InvalidPackedTritPlane)?;
+        self.begin_tile_plane(
+            tensor_index,
+            packed_plane.tile_index(),
+            packed_plane.plane_index(),
+            output_width,
+            &trits,
+            packed_plane.scales(),
+            scale_group_size,
+            coordinate_sweeps,
+        )
+    }
+
     /// Add one activation/residual window to the active tile-plane fit.
     ///
     /// # Errors
@@ -2655,6 +2695,8 @@ pub enum OutputReconstructionError {
     NoActiveScaleFit,
     /// A fitted f64 scale cannot be represented by the package's f16 scale field.
     ScaleNotRepresentable,
+    /// A packed parent-package plane failed canonical ternary decoding.
+    InvalidPackedTritPlane,
 }
 
 impl fmt::Display for OutputReconstructionError {
@@ -2767,6 +2809,9 @@ impl fmt::Display for OutputReconstructionError {
             }
             Self::ScaleNotRepresentable => {
                 formatter.write_str("fixed-trit scale cannot be represented as f16")
+            }
+            Self::InvalidPackedTritPlane => {
+                formatter.write_str("packed parent plane is not canonical ternary data")
             }
         }
     }
