@@ -10,12 +10,13 @@ use tritium_format::{
 use tritium_quantize::{
     ActivationCache, ActivationCacheBuilder, ActivationCacheSpec, ActivationChunk, ActivationDType,
     ActivationDigest, ActivationWindow, FixedTritScaleRefitAccumulator,
-    FixedTritTileScaleRefitAccumulator, OutputObjectiveWeights, OutputReconstructionAccumulator,
-    OutputReconstructionActivationLayer, OutputReconstructionActivationSet,
-    OutputReconstructionActivationSource, OutputReconstructionError, OutputReconstructionSchedule,
-    OutputReconstructionScope, OutputReconstructionSpec, RuntimeFinalLogitsAccumulator,
-    fit_fixed_trit_tile_scale_refit, fit_fixed_trit_tile_scale_update,
-    output_reconstruction_activation_digest, select_output_reconstruction,
+    FixedTritScaleUpdateCandidateBuilder, FixedTritTileScaleRefitAccumulator,
+    OutputObjectiveWeights, OutputReconstructionAccumulator, OutputReconstructionActivationLayer,
+    OutputReconstructionActivationSet, OutputReconstructionActivationSource,
+    OutputReconstructionError, OutputReconstructionSchedule, OutputReconstructionScope,
+    OutputReconstructionSpec, RuntimeFinalLogitsAccumulator, fit_fixed_trit_tile_scale_refit,
+    fit_fixed_trit_tile_scale_update, output_reconstruction_activation_digest,
+    select_output_reconstruction,
 };
 
 const CANDIDATE_HASH_CONTEXT: &str = "tritium salt v2 output reconstruction candidate v1";
@@ -1104,6 +1105,88 @@ fn fixed_trit_tile_refit_recovers_shared_scales_from_residual_outputs() {
         ),
         Err(OutputReconstructionError::InvalidGeometry)
     ));
+}
+
+#[test]
+fn scale_update_candidate_builder_streams_windows_and_binds_the_owned_candidate() {
+    let activation_spec = ActivationCacheSpec::new(
+        0,
+        "model.layers.0.attn.q_proj.input",
+        3,
+        64,
+        ActivationDType::Float16,
+        ActivationDigest::from_bytes([9; 32]),
+        3,
+    )
+    .unwrap();
+    let mut cache_builder = ActivationCacheBuilder::new(activation_spec.clone());
+    cache_builder
+        .ingest(
+            ActivationChunk::new(
+                &activation_spec,
+                0,
+                3,
+                {
+                    let mut values = vec![0.0; 3 * 64];
+                    values[0] = 1.0;
+                    values[1] = 2.0;
+                    values[64] = 2.0;
+                    values[65] = 1.0;
+                    values[128] = 1.0;
+                    values[129] = -1.0;
+                    values
+                },
+                vec![true; 3],
+                vec![3],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let cache = cache_builder.finalize().unwrap();
+    let first_window = cache.read_window(0, 1, 4096).unwrap();
+    let second_window = cache.read_window(1, 2, 4096).unwrap();
+    let mut trits = vec![Trit::ZERO; 128];
+    trits[0] = Trit::from_i8(1).unwrap();
+    trits[1] = Trit::from_i8(-1).unwrap();
+    trits[64] = Trit::from_i8(1).unwrap();
+    trits[65] = Trit::from_i8(1).unwrap();
+    let spec = spec(
+        OutputReconstructionSchedule::SlidingWindows {
+            block_count: 2,
+            window_size: 2,
+            stride: 1,
+        },
+        1,
+    );
+    let parent = [55; 32];
+    let mut candidate_builder = FixedTritScaleUpdateCandidateBuilder::new(&spec, &parent, 17);
+    candidate_builder
+        .begin_tile_plane(7, 0, 1, 2, &trits, 64, 16)
+        .unwrap();
+    candidate_builder
+        .observe_window(&first_window, &[-2.0, 1.5])
+        .unwrap();
+    candidate_builder
+        .observe_window(&second_window, &[2.0, 1.5, 4.0, 0.0])
+        .unwrap();
+
+    let candidate = candidate_builder.finish().unwrap();
+    assert_eq!(candidate.updates().len(), 1);
+    assert_eq!(candidate.updates()[0].tensor_index(), 7);
+    assert_eq!(candidate.updates()[0].tile_index(), 0);
+    assert_eq!(candidate.updates()[0].plane_index(), 1);
+    assert_eq!(
+        candidate.updates()[0]
+            .scales()
+            .iter()
+            .map(|scale| scale.to_f32())
+            .collect::<Vec<_>>(),
+        vec![2.0, 0.5]
+    );
+    let borrowed = candidate.as_scale_candidate(&spec).unwrap();
+    assert_eq!(borrowed.parent_package_digest(), &parent);
+    assert_eq!(borrowed.initialization_seed(), 17);
+    assert_eq!(borrowed.candidate_id(), candidate.candidate_id());
 }
 
 #[test]

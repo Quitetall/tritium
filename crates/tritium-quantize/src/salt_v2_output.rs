@@ -1733,6 +1733,195 @@ pub struct FixedTritTileScaleUpdate {
     observations: u64,
 }
 
+/// Owned, immutable candidate assembled from streamed fixed-trit scale fits.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FixedTritScaleUpdateCandidate {
+    spec_id: [u8; 32],
+    parent_package_digest: [u8; 32],
+    initialization_seed: u64,
+    updates: Vec<SaltV2ScaleUpdate>,
+    candidate_id: [u8; 32],
+}
+
+impl FixedTritScaleUpdateCandidate {
+    /// Canonical scale updates owned by this candidate.
+    #[must_use]
+    pub fn updates(&self) -> &[SaltV2ScaleUpdate] {
+        &self.updates
+    }
+
+    /// Stable identity of the exact candidate contents and provenance.
+    #[must_use]
+    pub const fn candidate_id(&self) -> &[u8; 32] {
+        &self.candidate_id
+    }
+
+    /// Re-open this owned candidate through its frozen output-reconstruction spec.
+    ///
+    /// # Errors
+    /// Rejects a different spec or any candidate whose recomputed identity differs.
+    pub fn as_scale_candidate<'a>(
+        &'a self,
+        spec: &OutputReconstructionSpec,
+    ) -> Result<OutputReconstructionScaleCandidate<'a>, OutputReconstructionError> {
+        if spec.spec_id() != &self.spec_id {
+            return Err(OutputReconstructionError::CandidateSpecMismatch);
+        }
+        let candidate = spec.scale_update_candidate(
+            &self.parent_package_digest,
+            self.initialization_seed,
+            &self.updates,
+        )?;
+        if candidate.candidate_id() != &self.candidate_id {
+            return Err(OutputReconstructionError::MissingCandidateIdentity);
+        }
+        Ok(candidate)
+    }
+}
+
+#[derive(Debug)]
+struct ActiveTileScaleFit<'a> {
+    tensor_index: usize,
+    plane_index: usize,
+    accumulator: FixedTritTileScaleRefitAccumulator<'a>,
+}
+
+/// Bounded-memory builder for an immutable output-aware scale candidate.
+///
+/// It retains only canonical f16 scale updates and the active tile's compact
+/// fit state; activation and residual windows can be released after each call.
+#[derive(Debug)]
+pub struct FixedTritScaleUpdateCandidateBuilder<'spec, 'trits> {
+    spec: &'spec OutputReconstructionSpec,
+    parent_package_digest: [u8; 32],
+    initialization_seed: u64,
+    updates: Vec<SaltV2ScaleUpdate>,
+    active: Option<ActiveTileScaleFit<'trits>>,
+    last_target: Option<(usize, usize, usize)>,
+}
+
+impl<'spec, 'trits> FixedTritScaleUpdateCandidateBuilder<'spec, 'trits> {
+    /// Start a candidate bound to a frozen spec, exact parent, and seed.
+    #[must_use]
+    pub fn new(
+        spec: &'spec OutputReconstructionSpec,
+        parent_package_digest: &[u8; 32],
+        initialization_seed: u64,
+    ) -> Self {
+        Self {
+            spec,
+            parent_package_digest: *parent_package_digest,
+            initialization_seed,
+            updates: Vec::new(),
+            active: None,
+            last_target: None,
+        }
+    }
+
+    /// Begin the next canonical tensor/tile/plane fit.
+    ///
+    /// # Errors
+    /// Rejects overlapping fits, noncanonical target order, invalid geometry,
+    /// or allocation failure.
+    #[allow(clippy::too_many_arguments)]
+    pub fn begin_tile_plane(
+        &mut self,
+        tensor_index: usize,
+        tile_index: usize,
+        plane_index: usize,
+        output_width: usize,
+        trits: &'trits [Trit],
+        scale_group_size: usize,
+        coordinate_sweeps: usize,
+    ) -> Result<(), OutputReconstructionError> {
+        if self.active.is_some() {
+            return Err(OutputReconstructionError::ScaleFitAlreadyActive);
+        }
+        let target = (tensor_index, tile_index, plane_index);
+        if self.last_target.is_some_and(|previous| target <= previous) {
+            return Err(OutputReconstructionError::NonCanonicalScaleUpdateOrder);
+        }
+        self.updates
+            .try_reserve(1)
+            .map_err(|_| OutputReconstructionError::ReceiptAllocationFailed)?;
+        let accumulator = FixedTritTileScaleRefitAccumulator::new(
+            output_width,
+            tile_index,
+            trits,
+            scale_group_size,
+            coordinate_sweeps,
+        )?;
+        self.active = Some(ActiveTileScaleFit {
+            tensor_index,
+            plane_index,
+            accumulator,
+        });
+        Ok(())
+    }
+
+    /// Add one activation/residual window to the active tile-plane fit.
+    ///
+    /// # Errors
+    /// Rejects calls without an active fit or invalid/non-finite window data.
+    pub fn observe_window(
+        &mut self,
+        activations: &ActivationWindow,
+        residual_outputs: &[f32],
+    ) -> Result<(), OutputReconstructionError> {
+        self.active
+            .as_mut()
+            .ok_or(OutputReconstructionError::NoActiveScaleFit)?
+            .accumulator
+            .observe_window(activations, residual_outputs)
+    }
+
+    /// Finish the current tile-plane and append its canonical package update.
+    ///
+    /// # Errors
+    /// Rejects calls without an active fit or an empty/invalid observation stream.
+    pub fn finish_tile_plane(&mut self) -> Result<(), OutputReconstructionError> {
+        let active = self
+            .active
+            .take()
+            .ok_or(OutputReconstructionError::NoActiveScaleFit)?;
+        let update = active
+            .accumulator
+            .finish_update(active.tensor_index, active.plane_index)?;
+        self.updates.push(update.update().clone());
+        self.last_target = Some((
+            update.update().tensor_index(),
+            update.update().tile_index(),
+            update.update().plane_index(),
+        ));
+        Ok(())
+    }
+
+    /// Finish the complete candidate and compute its immutable content identity.
+    ///
+    /// # Errors
+    /// Rejects an active or empty fit set, invalid parent identity, or invalid updates.
+    pub fn finish(mut self) -> Result<FixedTritScaleUpdateCandidate, OutputReconstructionError> {
+        if let Some(active) = self.active.take() {
+            let update = active
+                .accumulator
+                .finish_update(active.tensor_index, active.plane_index)?;
+            self.updates.push(update.update().clone());
+        }
+        let candidate_id = self.spec.candidate_id_for_scale_updates(
+            &self.parent_package_digest,
+            self.initialization_seed,
+            &self.updates,
+        )?;
+        Ok(FixedTritScaleUpdateCandidate {
+            spec_id: *self.spec.spec_id(),
+            parent_package_digest: self.parent_package_digest,
+            initialization_seed: self.initialization_seed,
+            updates: self.updates,
+            candidate_id,
+        })
+    }
+}
+
 impl FixedTritTileScaleUpdate {
     /// Canonically indexed replacement scales for this package plane.
     #[must_use]
@@ -2224,6 +2413,10 @@ pub enum OutputReconstructionError {
     InvalidScaleRefit,
     /// Fixed-trit scale refit accumulated a non-finite intermediate or result.
     NonFiniteScaleRefit,
+    /// A candidate builder already has a tile-plane fit in progress.
+    ScaleFitAlreadyActive,
+    /// A tile-plane operation was requested without an active fit.
+    NoActiveScaleFit,
     /// A fitted f64 scale cannot be represented by the package's f16 scale field.
     ScaleNotRepresentable,
 }
@@ -2329,6 +2522,12 @@ impl fmt::Display for OutputReconstructionError {
             Self::InvalidScaleRefit => formatter.write_str("fixed-trit scale refit is invalid"),
             Self::NonFiniteScaleRefit => {
                 formatter.write_str("fixed-trit scale refit became non-finite")
+            }
+            Self::ScaleFitAlreadyActive => {
+                formatter.write_str("fixed-trit scale candidate already has an active fit")
+            }
+            Self::NoActiveScaleFit => {
+                formatter.write_str("fixed-trit scale candidate has no active fit")
             }
             Self::ScaleNotRepresentable => {
                 formatter.write_str("fixed-trit scale cannot be represented as f16")
