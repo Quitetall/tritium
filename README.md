@@ -144,8 +144,8 @@ Only prerelease versions are published, so `cargo install` needs the explicit
 version:
 
 ```sh
-cargo install tritium-cli --version 1.1.0-rc.0            # the `tritium` tool
-cargo install tritium-serve --version 1.1.0-rc.0 \
+cargo install tritium-cli --version 1.1.0-rc.2            # the `tritium` tool
+cargo install tritium-serve --version 1.1.0-rc.2 \
     --features serve                                       # the HTTP server
 ```
 
