@@ -228,6 +228,7 @@ case "$tier" in
         run_model_acceptance
         run python -m unittest discover -s scripts/tests -p 'test_*.py'
         run python scripts/check-community-contract.py --json
+        run ./scripts/check-deployment-manifests
         ;;
     release)
         run cargo fmt --all --check
@@ -238,6 +239,7 @@ case "$tier" in
         run_model_acceptance
         run python -m unittest discover -s scripts/tests -p 'test_*.py'
         run python scripts/check-community-contract.py --json
+        run ./scripts/check-deployment-manifests
         require_command cargo-deny
         run cargo deny check
         run python scripts/check-release-version.py

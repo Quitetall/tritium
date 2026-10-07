@@ -125,6 +125,18 @@ jobs:
       - run: python scripts/generate-compatibility.py --check
       - run: python scripts/check-community-contract.py --json
 
+  deployment-manifests:
+    name: Helm deployment manifests (pinned chart contract)
+    runs-on: ubuntu-24.04
+    env:
+      # The checker pulls this immutable image before invoking Helm; its lint
+      # and render calls then run with --network none and --pull=never.
+      TRITIUM_PULL_HELM_IMAGE: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: qualify CPU/CUDA chart renders
+        run: ./scripts/check-deployment-manifests
+
   # Exact browser-package lane. The local RC stays private, but the candidate
   # tarball and its digest-bound clean-install receipt are retained as CI
   # evidence. Consumers need no Rust toolchain or lifecycle scripts.
