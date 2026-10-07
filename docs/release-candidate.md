@@ -2228,3 +2228,17 @@ performance changes to the fused diagonal-statistic pass.
 
 Command: `RUSTC_WRAPPER= cargo bench --offline -p tritium-benches --bench
 salt_fit`.
+
+### Hosted pinned SmolLM2 PTQ/QAT tutorial — 2026-10-07
+
+Wheel workflow [37644673976](https://github.com/Quitetall/tritium/actions/runs/37644673976)
+tested source commit `0969789962b8be74366b3116552e987d81b5a263`. The platform
+wheel builds, clean-install checks, source-free tutorial, abi3 matrix, and matrix
+admission passed, but the pinned SmolLM2 PTQ/QAT tutorial job failed its frozen
+300-second wall-time limit after completing its stages in `1017.603s`. PTQ
+conversion completed at `788.529s`; native checkpoint round-trip, generation,
+ONNX export/replay, QAT step, and QAT resume also completed before the runner
+raised the budget error. This is a functional tutorial run that fails the timing
+gate, not an OOM or a model-quality result. The separately selected test seam
+for future regression coverage is the public `tritium.torch.convert()` artifact
+path; the existing focused public grouped-fit artifact round-trip passed locally.
