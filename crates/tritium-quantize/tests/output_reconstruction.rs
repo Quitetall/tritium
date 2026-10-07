@@ -1163,11 +1163,39 @@ fn scale_update_candidate_builder_streams_windows_and_binds_the_owned_candidate(
     candidate_builder
         .begin_tile_plane(7, 0, 1, 2, &trits, 64, 16)
         .unwrap();
+    assert!(matches!(
+        candidate_builder.observe_window_with_current_output(
+            &first_window,
+            &[10.0],
+            &[15.0, 14.5],
+            &[3.0, -4.0],
+        ),
+        Err(OutputReconstructionError::InvalidGeometry)
+    ));
+    assert!(matches!(
+        candidate_builder.observe_window_with_current_output(
+            &first_window,
+            &[10.0, 20.0],
+            &[f32::INFINITY, 14.5],
+            &[3.0, -4.0],
+        ),
+        Err(OutputReconstructionError::NonFiniteOutput { teacher: false })
+    ));
     candidate_builder
-        .observe_window(&first_window, &[-2.0, 1.5])
+        .observe_window_with_current_output(
+            &first_window,
+            &[10.0, 20.0],
+            &[15.0, 14.5],
+            &[3.0, -4.0],
+        )
         .unwrap();
     candidate_builder
-        .observe_window(&second_window, &[2.0, 1.5, 4.0, 0.0])
+        .observe_window_with_current_output(
+            &second_window,
+            &[30.0, 40.0, 50.0, 60.0],
+            &[33.0, 48.5, 44.0, 64.0],
+            &[5.0, 10.0, -2.0, 4.0],
+        )
         .unwrap();
 
     let candidate = candidate_builder.finish().unwrap();

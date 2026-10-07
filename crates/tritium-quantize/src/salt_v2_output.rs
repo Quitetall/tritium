@@ -1783,6 +1783,7 @@ impl FixedTritScaleUpdateCandidate {
 struct ActiveTileScaleFit<'a> {
     tensor_index: usize,
     plane_index: usize,
+    output_width: usize,
     accumulator: FixedTritTileScaleRefitAccumulator<'a>,
 }
 
@@ -1854,6 +1855,7 @@ impl<'spec, 'trits> FixedTritScaleUpdateCandidateBuilder<'spec, 'trits> {
         self.active = Some(ActiveTileScaleFit {
             tensor_index,
             plane_index,
+            output_width,
             accumulator,
         });
         Ok(())
@@ -1873,6 +1875,71 @@ impl<'spec, 'trits> FixedTritScaleUpdateCandidateBuilder<'spec, 'trits> {
             .ok_or(OutputReconstructionError::NoActiveScaleFit)?
             .accumulator
             .observe_window(activations, residual_outputs)
+    }
+
+    /// Derive the fixed-trit residual for one window and observe it.
+    ///
+    /// For a current full projection output `y` and the active tile-plane's
+    /// current contribution `p`, the refit target is
+    /// `teacher - (y - p)`: the teacher output minus every contribution except
+    /// the tile-plane whose non-negative scales are being refit.
+    ///
+    /// # Errors
+    /// Rejects calls without an active fit, mismatched output geometry, or
+    /// non-finite/unrepresentable values.
+    pub fn observe_window_with_current_output(
+        &mut self,
+        activations: &ActivationWindow,
+        teacher_outputs: &[f32],
+        current_projection_outputs: &[f32],
+        active_tile_plane_outputs: &[f32],
+    ) -> Result<(), OutputReconstructionError> {
+        let active = self
+            .active
+            .as_mut()
+            .ok_or(OutputReconstructionError::NoActiveScaleFit)?;
+        let token_count = usize::try_from(activations.token_count())
+            .map_err(|_| OutputReconstructionError::InvalidGeometry)?;
+        let output_count = token_count
+            .checked_mul(active.output_width)
+            .ok_or(OutputReconstructionError::InvalidGeometry)?;
+        if token_count == 0
+            || teacher_outputs.len() != output_count
+            || current_projection_outputs.len() != output_count
+            || active_tile_plane_outputs.len() != output_count
+        {
+            return Err(OutputReconstructionError::InvalidGeometry);
+        }
+        if teacher_outputs.iter().any(|value| !value.is_finite()) {
+            return Err(OutputReconstructionError::NonFiniteOutput { teacher: true });
+        }
+        if current_projection_outputs
+            .iter()
+            .chain(active_tile_plane_outputs)
+            .any(|value| !value.is_finite())
+        {
+            return Err(OutputReconstructionError::NonFiniteOutput { teacher: false });
+        }
+
+        let mut residual_outputs = Vec::new();
+        residual_outputs
+            .try_reserve_exact(output_count)
+            .map_err(|_| OutputReconstructionError::ReceiptAllocationFailed)?;
+        for ((teacher, current), active_tile) in teacher_outputs
+            .iter()
+            .zip(current_projection_outputs)
+            .zip(active_tile_plane_outputs)
+        {
+            let residual = f64::from(*teacher) - (f64::from(*current) - f64::from(*active_tile));
+            let residual = residual as f32;
+            if !residual.is_finite() {
+                return Err(OutputReconstructionError::NonFiniteOutput { teacher: false });
+            }
+            residual_outputs.push(residual);
+        }
+        active
+            .accumulator
+            .observe_window(activations, &residual_outputs)
     }
 
     /// Finish the current tile-plane and append its canonical package update.
