@@ -895,13 +895,13 @@ fn fit_joint_ternary_prepared(
             reconstruction: lower.reconstruction,
             objective: lower.objective,
             accepted_objectives: lower_accepted_objectives,
-            receipt: JointFitRestartReceipt {
+            receipt: Some(JointFitRestartReceipt {
                 kind: JointFitStartKind::LowerPlaneFallback,
                 initial_objective: lower_receipt.initial_objective,
                 final_objective: lower_receipt.final_objective,
                 accepted_updates: lower_receipt.accepted_updates,
                 scale_solves: lower_receipt.scale_solves,
-            },
+            }),
         });
     }
 
@@ -911,7 +911,17 @@ fn fit_joint_ternary_prepared(
         .min_by(|(_, left), (_, right)| left.objective.total_cmp(&right.objective))
         .map(|(index, _)| index)
         .expect("validated positive restart count");
-    let restart_receipts = starts.iter().map(|state| state.receipt.clone()).collect();
+    // These receipts are returned once; cloning their nested vectors only to
+    // drop the originals needlessly doubles per-fit allocations and copies.
+    let restart_receipts = starts
+        .iter_mut()
+        .map(|state| {
+            state
+                .receipt
+                .take()
+                .expect("fit-state receipt is present before result assembly")
+        })
+        .collect();
     let selected = starts.swap_remove(selected_start);
     Ok(JointTernaryFit {
         scales: selected.scales,
@@ -931,7 +941,7 @@ struct FitState {
     reconstruction: Vec<f32>,
     objective: f64,
     accepted_objectives: Vec<f64>,
-    receipt: JointFitRestartReceipt,
+    receipt: Option<JointFitRestartReceipt>,
 }
 
 #[cfg(test)]
@@ -974,13 +984,13 @@ fn optimize_start(
         reconstruction,
         objective,
         accepted_objectives: vec![objective],
-        receipt: JointFitRestartReceipt {
+        receipt: Some(JointFitRestartReceipt {
             kind,
             initial_objective: objective,
             final_objective: objective,
             accepted_updates: Vec::new(),
             scale_solves: Vec::new(),
-        },
+        }),
     };
 
     // The initial trits came from assignment_for_metric at the initial scales.
@@ -1011,11 +1021,16 @@ fn optimize_start(
         #[cfg(test)]
         record_solver_phase(2, reconstruction_started);
         let scale_accepted = scale_objective < state.objective;
-        state.receipt.scale_solves.push(ScaleSolveReceipt {
-            iteration,
-            telemetry: scale_outcome.telemetry,
-            accepted: scale_accepted,
-        });
+        state
+            .receipt
+            .as_mut()
+            .expect("fit-state receipt is present during optimization")
+            .scale_solves
+            .push(ScaleSolveReceipt {
+                iteration,
+                telemetry: scale_outcome.telemetry,
+                accepted: scale_accepted,
+            });
         if scale_accepted {
             let objective_before = state.objective;
             state.scales = scale_outcome.scales;
@@ -1023,12 +1038,17 @@ fn optimize_start(
             state.reconstruction = scale_reconstruction;
             state.objective = scale_objective;
             state.accepted_objectives.push(scale_objective);
-            state.receipt.accepted_updates.push(JointFitUpdateReceipt {
-                iteration,
-                phase: JointFitUpdatePhase::Scale,
-                objective_before,
-                objective_after: scale_objective,
-            });
+            state
+                .receipt
+                .as_mut()
+                .expect("fit-state receipt is present during optimization")
+                .accepted_updates
+                .push(JointFitUpdateReceipt {
+                    iteration,
+                    phase: JointFitUpdatePhase::Scale,
+                    objective_before,
+                    objective_after: scale_objective,
+                });
             improved = true;
             assignment_checked_for_current_scales = false;
         }
@@ -1059,12 +1079,17 @@ fn optimize_start(
                     state.reconstruction = assignment_reconstruction;
                     state.objective = assignment_objective;
                     state.accepted_objectives.push(assignment_objective);
-                    state.receipt.accepted_updates.push(JointFitUpdateReceipt {
-                        iteration,
-                        phase: JointFitUpdatePhase::Assignment,
-                        objective_before,
-                        objective_after: assignment_objective,
-                    });
+                    state
+                        .receipt
+                        .as_mut()
+                        .expect("fit-state receipt is present during optimization")
+                        .accepted_updates
+                        .push(JointFitUpdateReceipt {
+                            iteration,
+                            phase: JointFitUpdatePhase::Assignment,
+                            objective_before,
+                            objective_after: assignment_objective,
+                        });
                     improved = true;
                 }
             }
@@ -1073,7 +1098,11 @@ fn optimize_start(
             break;
         }
     }
-    state.receipt.final_objective = state.objective;
+    state
+        .receipt
+        .as_mut()
+        .expect("fit-state receipt is present during optimization")
+        .final_objective = state.objective;
     Ok(state)
 }
 

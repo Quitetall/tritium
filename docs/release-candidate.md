@@ -2619,3 +2619,31 @@ unchanged from run `37853447148` (`756.794s` conversion, `972.680s` total), and
 does not test the codebook-deduplication change because it was not in the tested
 source revision. It reinforces that the release tutorial gate is still a
 substantial CPU optimization blocker.
+
+### Move solver receipts instead of cloning — 2026-10-08
+
+`fit_joint_ternary_prepared` used to clone every restart receipt, including its
+nested accepted-update and scale-solve vectors, into the result, then drop the
+originals with the candidate states. It now moves those receipts out of the
+internal fit states. Public `JointTernaryFit` fields, receipt ordering, solver
+decisions, and artifact schema are unchanged; the existing bitwise-determinism
+test compares full results, including receipts.
+
+Validation on this working tree: full `tritium-quantize` suite (235 passed, 1
+ignored), strict Clippy, formatting, and the freshly rebuilt public
+`prepare` → `calibrate` → `convert()` artifact test all pass. The six persisted
+files retain the baseline fixture hashes recorded above. One optimized G64/P3
+benchmark sample measured `20.56ms`/64 rows at one thread and `9.409ms` at four
+threads; the host load average was 8.58 and unrelated CPU-heavy processes were
+active. This is not a controlled before/after and establishes no speedup. The
+change removes redundant nested-vector copies by construction, but its runtime
+impact and contribution to the frozen tutorial gate remain unqualified.
+
+The preceding exact-head run
+[37856071971](https://github.com/Quitetall/tritium/actions/runs/37856071971)
+on source `5f0feca67a31b4c1634c868550894cdeb465bdc9` confirms the same result:
+the pinned CPU tutorial completed all functions but failed `300s`, with PTQ
+conversion at `757.355s` and total time `973.779s`. Wheel, installed-wheel
+smoke, and ABI3 jobs passed. Because this revision predates the codebook
+deduplication, it is a control only and provides no hosted performance evidence
+for that change.
