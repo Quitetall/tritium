@@ -2443,3 +2443,30 @@ results to an 8 MiB trit-output estimate or 4,096 rows, whichever is smaller.
 Local Rust tests (16), public PTQ/refinement tests (43), strict Clippy, and
 exact-output benchmark preflights pass. It has not yet been measured by hosted
 CI; the frozen 300-second gate remains open.
+
+### Hosted PTQ timing confirmation and G64/P3 benchmark — 2026-10-08
+
+Wheel workflow [37846314955](https://github.com/Quitetall/tritium/actions/runs/37846314955)
+tested source `314c9f53e7df659e3819455e67abe414b2f85579`. Its pinned
+SmolLM2-135M CPU tutorial completed conversion at `756.593s` and all later
+functional stages (checkpoint round-trip, generation, ONNX export/replay, QAT
+step and optimizer resume) at `972.244s`, then failed the unchanged 300-second
+gate. The runner reported four logical CPUs, about 11.4–15.3 GiB available
+memory and over 83 GiB temporary disk; observed cgroup throttling remained
+zero. This is consistent with the previously identified native solver CPU
+cost, not an OOM, disk-pressure, or tutorial-functionality failure. It is not
+a controlled performance comparison or model-quality result.
+
+To match the production compact recipe more closely, `salt_fit` now includes
+64-column, three-plane independent row fits at one and four threads. A local
+optimized-build sample on the i9-14900K measured a four-thread median of
+`9.999ms` for 64 rows (`6.400 K rows/s`); the one-thread median was `24.10ms`.
+A shorter initial sample measured `8.514ms`, showing material run-to-run
+variation. This is an exploratory microbenchmark only: fixture values are
+synthetic, there is no before/after candidate comparison, and it does not
+qualify the hosted tutorial. The user's selected PTQ regression seam remains the public
+`convert()` artifact path; `test_public_convert_persists_grouped_fit_artifact`
+already exercises it. Next action is a controlled solver-level optimization
+experiment that preserves artifact bytes on the fixed fixture, followed by a
+fresh hosted tutorial rerun; do not relax its budget or reduce the model/profile
+to make the gate pass.

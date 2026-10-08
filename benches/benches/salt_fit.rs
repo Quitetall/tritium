@@ -1,4 +1,4 @@
-//! SALT V2 joint fitter microbenchmarks for the production G128 PTQ path.
+//! SALT V2 joint fitter microbenchmarks for the production G64 and G128 PTQ paths.
 //!
 //! The cases use the same restart count, iteration cap, scale precision, ridge,
 //! and relay basins as the public additive PTQ bridge. Fixture construction and
@@ -12,24 +12,74 @@ use tritium_quantize::{
 
 const GROUP_SIZE: usize = 128;
 const ROWS: usize = 64;
+const PTQ_GROUP_SIZE: usize = 64;
+const PTQ_ROWS: usize = 64;
 const PLANES: [usize; 3] = [1, 2, 3];
 const THREAD_COUNTS: [usize; 2] = [1, 4];
 
 fn fixture() -> (Vec<f32>, Vec<f64>) {
-    let weights = (0..GROUP_SIZE)
+    fixture_with_group_size(GROUP_SIZE)
+}
+
+fn fixture_with_group_size(group_size: usize) -> (Vec<f32>, Vec<f64>) {
+    let weights = (0..group_size)
         .map(|index| {
             let bits = mix64(index as u64 ^ 0x243f_6a88_85a3_08d3);
             let centered = ((bits >> 40) as i32) - (1 << 23);
             centered as f32 / (1 << 22) as f32
         })
         .collect();
-    let diagonal = (0..GROUP_SIZE)
+    let diagonal = (0..group_size)
         .map(|index| {
             let bits = mix64(index as u64 ^ 0x1319_8a2e_0370_7344);
             0.25 + ((bits >> 40) as f64) / ((1_u64 << 24) as f64)
         })
         .collect();
     (weights, diagonal)
+}
+
+/// Match the public compact PTQ bridge's 64-column scale group and three-plane
+/// recipe, measuring independent output-row throughput at the hosted runner's
+/// four-worker limit. This excludes model loading, calibration, and artifact IO.
+#[divan::bench(args = THREAD_COUNTS)]
+fn joint_diagonal_g64_p3_ptq_rows(bencher: Bencher, threads: usize) {
+    let (row, diagonal) = fixture_with_group_size(PTQ_GROUP_SIZE);
+    let weights = (0..PTQ_ROWS)
+        .flat_map(|row_index| {
+            row.iter().enumerate().map(move |(column, value)| {
+                let perturbation = ((mix64((row_index * PTQ_GROUP_SIZE + column) as u64) >> 48)
+                    as i16) as f32
+                    / 65536.0;
+                *value + perturbation
+            })
+        })
+        .collect::<Vec<_>>();
+    let fit_config = config(3);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .expect("PTQ row-fit benchmark pool");
+    let fit_rows = || {
+        pool.install(|| {
+            weights
+                .par_chunks_exact(PTQ_GROUP_SIZE)
+                .map(|row_weights| {
+                    fit_joint_ternary(
+                        row_weights,
+                        JointFitMetric::DiagonalF64(&diagonal),
+                        fit_config,
+                    )
+                    .expect("SALT G64 P3 row fit")
+                    .objective
+                })
+                .sum::<f64>()
+        })
+    };
+    assert!(fit_rows().is_finite(), "PTQ row-fit preflight objective");
+
+    bencher
+        .counter(ItemsCount::new(PTQ_ROWS))
+        .bench_local(|| divan::black_box(fit_rows()));
 }
 
 fn mix64(mut value: u64) -> u64 {
