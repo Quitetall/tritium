@@ -693,6 +693,8 @@ pub fn fit_joint_ternary(
     fit_metric: JointFitMetric<'_>,
     config: JointFitConfig,
 ) -> Result<JointTernaryFit, JointFitError> {
+    #[cfg(test)]
+    let validation_started = std::time::Instant::now();
     if !(1..=3).contains(&config.planes) {
         return Err(JointFitError::InvalidPlaneCount { got: config.planes });
     }
@@ -800,11 +802,17 @@ pub fn fit_joint_ternary(
     if !metric_sum.is_finite() {
         return Err(JointFitError::ScaleSolveFailed);
     }
+    #[cfg(test)]
+    record_solver_phase(3, validation_started);
+    #[cfg(test)]
+    let order_started = std::time::Instant::now();
     let weighted_abs_order = if config.em_restarts > 1 {
         weighted_abs_order(weights, &metric_diagonal)
     } else {
         WeightedAbsOrder::default()
     };
+    #[cfg(test)]
+    record_solver_phase(4, order_started);
     fit_joint_ternary_prepared(
         weights,
         fit_metric,
@@ -828,6 +836,8 @@ fn fit_joint_ternary_prepared(
     let mut starts =
         Vec::with_capacity(config.em_restarts + relay_starts + usize::from(config.planes > 1));
     for restart in 0..config.em_restarts {
+        #[cfg(test)]
+        let initialization_started = std::time::Instant::now();
         let scales = deterministic_initial_scales(
             weights,
             metric_diagonal,
@@ -836,6 +846,8 @@ fn fit_joint_ternary_prepared(
             config,
             restart,
         )?;
+        #[cfg(test)]
+        record_solver_phase(5, initialization_started);
         starts.push(optimize_start(
             weights,
             fit_metric,
@@ -860,12 +872,16 @@ fn fit_joint_ternary_prepared(
         if !enabled {
             continue;
         }
+        #[cfg(test)]
+        let relay_started = std::time::Instant::now();
         let scales = relay::basin_scales(
             weights,
             config.planes,
             kind == JointFitStartKind::ModulatedRelayBasin,
             config.scale_precision,
         )?;
+        #[cfg(test)]
+        record_solver_phase(6, relay_started);
         starts.push(optimize_start(weights, fit_metric, config, scales, kind)?);
     }
 
@@ -947,7 +963,7 @@ struct FitState {
 #[cfg(test)]
 std::thread_local! {
     static ASSIGNMENT_FOR_METRIC_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static SOLVER_PHASE_NANOS: std::cell::Cell<[u128; 3]> = const { std::cell::Cell::new([0; 3]) };
+    static SOLVER_PHASE_NANOS: std::cell::Cell<[u128; 7]> = const { std::cell::Cell::new([0; 7]) };
 }
 
 #[cfg(test)]
@@ -1865,6 +1881,7 @@ mod relay {
     /// Odd-symmetric with `f(0) = 0`, bounded by `|f| <= 1` on `|v| <= 1` for
     /// `delta` in `[0, 1]`, and approaching the hard ternary indicator with
     /// threshold `delta` as `sharpness -> inf`.
+    #[cfg(test)]
     fn relay(v: f64, sharpness: f64, delta: f64) -> f64 {
         (((v - delta) * sharpness).tanh() + ((v + delta) * sharpness).tanh())
             / (2.0 * sharpness.tanh())
@@ -1872,6 +1889,7 @@ mod relay {
 
     // `1 - tanh^2` saturates to exactly zero for large inputs instead of overflowing like
     // `cosh`-based forms, which keeps every descent step finite.
+    #[cfg(test)]
     fn sech_squared(x: f64) -> f64 {
         let tanh = x.tanh();
         1.0 - tanh * tanh
@@ -1963,10 +1981,15 @@ mod relay {
                 let u = centered / scale;
                 let lower = (u - threshold) * sharpness;
                 let upper = (u + threshold) * sharpness;
-                let soft = relay(u, sharpness, threshold);
-                let soft_du = sharpness * (sech_squared(lower) + sech_squared(upper)) / norm;
-                let soft_dthreshold =
-                    sharpness * (sech_squared(upper) - sech_squared(lower)) / norm;
+                let tanh_lower = lower.tanh();
+                let tanh_upper = upper.tanh();
+                let soft = (tanh_lower + tanh_upper) / norm;
+                let soft_du = sharpness
+                    * ((1.0 - tanh_lower * tanh_lower) + (1.0 - tanh_upper * tanh_upper))
+                    / norm;
+                let soft_dthreshold = sharpness
+                    * ((1.0 - tanh_upper * tanh_upper) - (1.0 - tanh_lower * tanh_lower))
+                    / norm;
                 let error = centered - scale * soft;
                 grad_scale += error * (u * soft_du - soft);
                 grad_threshold -= error * scale * soft_dthreshold;
@@ -1984,6 +2007,77 @@ mod relay {
             scale,
             threshold,
             shift,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn descend_reference(normalized: &[f64], modulated: bool) -> PlaneFit {
+            let count = normalized.len() as f64;
+            let mut scale = 1.0_f64;
+            let mut threshold = 0.5_f64;
+            let mut shift = if modulated {
+                (normalized.iter().sum::<f64>() / count).clamp(SHIFT_BOUNDS.0, SHIFT_BOUNDS.1)
+            } else {
+                0.0
+            };
+            for step in 0..STEPS {
+                let sharpness = sharpness_at(step);
+                let norm = 2.0 * sharpness.tanh();
+                let mut grad_scale = 0.0_f64;
+                let mut grad_threshold = 0.0_f64;
+                let mut grad_shift = 0.0_f64;
+                for &value in normalized {
+                    let centered = value - shift;
+                    let u = centered / scale;
+                    let lower = (u - threshold) * sharpness;
+                    let upper = (u + threshold) * sharpness;
+                    let soft = relay(u, sharpness, threshold);
+                    let soft_du = sharpness * (sech_squared(lower) + sech_squared(upper)) / norm;
+                    let soft_dthreshold =
+                        sharpness * (sech_squared(upper) - sech_squared(lower)) / norm;
+                    let error = centered - scale * soft;
+                    grad_scale += error * (u * soft_du - soft);
+                    grad_threshold -= error * scale * soft_dthreshold;
+                    grad_shift += error * (soft_du - 1.0);
+                }
+                let step_factor = 2.0 * STEP_SIZE / count;
+                scale = (scale - step_factor * grad_scale).clamp(SCALE_BOUNDS.0, SCALE_BOUNDS.1);
+                if modulated {
+                    threshold = (threshold - step_factor * grad_threshold)
+                        .clamp(THRESHOLD_BOUNDS.0, THRESHOLD_BOUNDS.1);
+                    shift =
+                        (shift - step_factor * grad_shift).clamp(SHIFT_BOUNDS.0, SHIFT_BOUNDS.1);
+                }
+            }
+            PlaneFit {
+                scale,
+                threshold,
+                shift,
+            }
+        }
+
+        #[test]
+        fn fused_relay_descent_matches_reference_bits() {
+            for length in [1, 3, 16, 64, 128] {
+                for seed in 0..8 {
+                    let normalized = (0..length)
+                        .map(|index| {
+                            let value = (index * 37 + seed * 19) % 101;
+                            (value as f64 - 50.0) / 13.0
+                        })
+                        .collect::<Vec<_>>();
+                    for modulated in [false, true] {
+                        let expected = descend_reference(&normalized, modulated);
+                        let actual = descend(&normalized, modulated);
+                        assert_eq!(actual.scale.to_bits(), expected.scale.to_bits());
+                        assert_eq!(actual.threshold.to_bits(), expected.threshold.to_bits());
+                        assert_eq!(actual.shift.to_bits(), expected.shift.to_bits());
+                    }
+                }
+            }
         }
     }
 }
@@ -2120,7 +2214,7 @@ mod tests {
             },
         };
 
-        SOLVER_PHASE_NANOS.with(|elapsed| elapsed.set([0; 3]));
+        SOLVER_PHASE_NANOS.with(|elapsed| elapsed.set([0; 7]));
         let started = std::time::Instant::now();
         for weights in &rows {
             fit_joint_ternary(weights, JointFitMetric::DiagonalF64(&diagonal), config)
@@ -2130,11 +2224,15 @@ mod tests {
         let phases = SOLVER_PHASE_NANOS.with(std::cell::Cell::get);
         assert!(phases.iter().sum::<u128>() <= total);
         eprintln!(
-            "G64/P3 256-row profile: total={:.3}ms assignment={:.3}ms scale_solve={:.3}ms reconstruction={:.3}ms other={:.3}ms",
+            "G64/P3 256-row profile: total={:.3}ms assignment={:.3}ms scale_solve={:.3}ms reconstruction={:.3}ms validate_metric={:.3}ms weighted_order={:.3}ms init_scales={:.3}ms relay_scales={:.3}ms other={:.3}ms",
             total as f64 / 1_000_000.0,
             phases[0] as f64 / 1_000_000.0,
             phases[1] as f64 / 1_000_000.0,
             phases[2] as f64 / 1_000_000.0,
+            phases[3] as f64 / 1_000_000.0,
+            phases[4] as f64 / 1_000_000.0,
+            phases[5] as f64 / 1_000_000.0,
+            phases[6] as f64 / 1_000_000.0,
             (total - phases.iter().sum::<u128>()) as f64 / 1_000_000.0,
         );
     }

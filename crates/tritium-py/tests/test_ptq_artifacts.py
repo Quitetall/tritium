@@ -1554,3 +1554,15 @@ def test_public_convert_persists_grouped_fit_artifact(tmp_path):
         rtol=0,
         atol=0,
     )
+
+    expected_artifact_sha256 = {
+        "conversion.json": "503ddde487f57c4fbd4dddeb9763ae57928baedade51301084d319830cec57d6",
+        "weight-00000.json": "976cf1306784e7f985d55ec5d08a2cfe2aa46dc6134ac7dd0e2991b64bb6765f",
+        "weight-00000-plane-0.scales.f16le": "c8de1782128b6c8ef79d641a0dc86a9208f7e60d0b4013c1e9f91956c6b717c9",
+        "weight-00000-plane-0.trits.i8": "e1c9310f5390604cfdb0e5953b59495628895dd5ff298deabd3cfbfac326bd17",
+        "weight-00000-plane-1.scales.f16le": "e5693158a3db67a5e05fa6e08e47120098d2dcaae10d2b4c291259bf650a17b0",
+        "weight-00000-plane-1.trits.i8": "9adb3b527c09db1060b01d6e7802de025cb0bfedaa66271bb1f7e1895703ac12",
+    }
+    for artifact_name, expected_digest in expected_artifact_sha256.items():
+        artifact_path = Path(result.artifact_dir) / artifact_name
+        assert hashlib.sha256(artifact_path.read_bytes()).hexdigest() == expected_digest

@@ -2698,3 +2698,34 @@ conversion at `757.355s` and total time `973.779s`. Wheel, installed-wheel
 smoke, and ABI3 jobs passed. Because this revision predates the codebook
 deduplication, it is a control only and provides no hosted performance evidence
 for that change.
+
+### Relay-basin hot-loop reuse — 2026-10-09
+
+The release-mode test-only phase profiler was extended to separate metric
+validation, weighted-order construction, deterministic starts, and relay-basin
+scale initialization. On its synthetic 256-row G64/P3 fixture, baseline source
+`4550a1ba` reported `83.722ms` total and `37.965ms` in relay initialization.
+The candidate reuses the already-computed two edge `tanh` values for both the
+relay value and its derivatives; this preserves the old f64 operation order and
+outputs. Its diagnostic profile reported `65.895ms` total and `21.103ms` in
+relay initialization. The test-only timing is directional, not a production
+claim.
+
+The optimized `salt_fit` benchmark was then run on pinned CPU IDs 27–30 with
+separate Cargo target directories, preventing one checkout from reusing the
+other checkout's compiled quantizer. Same-command medians over 64 G64/P3 rows:
+
+| Source | One thread | Four threads |
+|---|---:|---:|
+| Baseline `4550a1ba` | `37.36ms` | `9.792ms` |
+| Candidate | `29.65ms` | `7.859ms` |
+
+This fixture indicates about 20% lower solver latency locally; it is not a
+full-model result and the hosted 300-second gate is still authoritative. A
+bitwise reference test covers both relay variants over lengths 1–128 and eight
+deterministic inputs. The public `prepare` → `calibrate` → `convert()` artifact
+test passes and now asserts SHA-256 identities for all six persisted output
+files; all match the existing fixed-fixture values. The full quantizer suite
+passes (236 passed, 1 ignored), strict Clippy and formatting pass. Exact-head
+hosted qualification remains open: workflows on `4550a1ba` predate this change
+and must finish before the candidate is pushed.
