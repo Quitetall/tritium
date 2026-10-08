@@ -2494,3 +2494,16 @@ Full-model PTQ artifact identity and the hosted 300-second tutorial remain
 unverified for this change. Next: perform
 a matched old/new public `convert()` artifact comparison, then rerun the exact
 hosted tutorial before attributing any runtime effect.
+
+The exact pre-optimization wheel workflow [37849611144](https://github.com/Quitetall/tritium/actions/runs/37849611144)
+then completed on source `cab6c07555c1d5e32cdde9f17b2cff1d80746e86` with the
+same CPU-time failure. The pinned tutorial converted at `757.190s` and finished
+all functional stages at `978.399s`, exceeding the unchanged `300.000s` limit.
+Checkpoint round-trip completed at `777.949s`, generation at `820.966s`, ONNX
+export at `945.624s`, replay at `971.381s`, and QAT optimizer resume at
+`978.399s`. The hosted runner had four logical CPUs, roughly 13.5 GiB or more
+available memory during the late stages, over 83 GiB temporary disk, and no
+recorded cgroup CPU-throttle events. This is a baseline for the subsequent
+solver-cache candidate, not evidence that candidate improves performance or
+model quality. The next gates remain an exact public `convert()` artifact
+comparison and the hosted tutorial on the candidate commit.
