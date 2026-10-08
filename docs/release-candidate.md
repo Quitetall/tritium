@@ -2407,3 +2407,39 @@ failure. This result establishes the hosted parent baseline for commits
 `ea2c7cd5` and `909add9c`; it does not qualify those changes or pass the frozen
 timing gate. The candidate workflows must be inspected separately before
 claiming any performance effect.
+
+### Hosted compact-fit batching regression and bounded-batch follow-up — 2026-10-08
+
+Wheel workflow [37678462152](https://github.com/Quitetall/tritium/actions/runs/37678462152)
+tested `909add9c0a8136753eba94a80aca738836ec21ed`. All functional stages
+completed, but the pinned tutorial failed the unchanged 300-second limit at
+`983.764s`; PTQ conversion took `764.628s`. Checkpoint round-trip completed at
+`785.224s`, generation at `827.808s`, ONNX export at `951.673s`, replay at
+`976.718s`, and QAT resume at `983.764s`. The exact source-free tutorial,
+platform wheels, ABI matrix, CI, docs, CodeQL, and capstone smoke passed; GPU,
+ROCm, Metal, wgpu, and real-model serving lanes were skipped.
+
+During PTQ, both the parent and candidate runners exposed four logical CPUs,
+about 13.7–13.9 GiB mean available memory, similar mean load-1 (4.91 vs. 4.85),
+and zero cgroup CPU-throttle events. The candidate accumulated about 2,956
+cgroup CPU-seconds during conversion vs. about 1,817 for the parent. This is a
+strong regression signal for the candidate execution path, but not a controlled
+same-host A/B: CPU model/frequency and runner placement are not pinned, so the
+source change is not yet proven to be the sole cause.
+
+A new four-thread `salt_fit` bridge-collection benchmark compares flat full-fit
+collection, flat compact collection, one-group-at-a-time compact collection,
+and eight-group batches on the same deterministic 2,048-row fixture. All four
+paths assert exact equality of scales, trits, and aggregate objective before
+timing. The two exploratory runs were noisy and contradictory: the first
+measured medians of 189.7 ms (flat full), 191.8 ms (flat compact), and 255.2 ms
+(one-group compact); the second measured 207.7 ms, 292.3 ms, 210.1 ms, and
+196.5 ms (eight-group batch), respectively. These do not support a stable
+speedup or regression claim; local load was high and changed during the runs.
+
+The unpushed follow-up `e4aadccc` now decodes weights per bounded group batch,
+fits multiple adjacent groups in each Rayon pass, and limits retained fit
+results to an 8 MiB trit-output estimate or 4,096 rows, whichever is smaller.
+Local Rust tests (16), public PTQ/refinement tests (43), strict Clippy, and
+exact-output benchmark preflights pass. It has not yet been measured by hosted
+CI; the frozen 300-second gate remains open.
