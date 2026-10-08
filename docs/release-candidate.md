@@ -1021,6 +1021,12 @@ available without a live writer. This operational probe made no campaign
 changes. The historical S2KF records remain calibration-evidence inputs, not
 fitted weights, and the missing capture-to-approved-token-pack binding still
 prevents resuming fitting from them.
+A targeted search for the legacy and approved token-stream digests and
+capture/replay transcript markers across the campaign workspace, the recovered
+506-record evidence directory, and the Qwen calibration evidence directory
+found only the calibration-pack and replay-contract receipts; no capture
+invocation transcript surfaced. This search is bounded to those roots and file
+types, so it does not establish that no copy exists elsewhere.
 
 The Qwen token pack is distinct from Stage 7's SmolLM2-1.7B recipe-freeze pack.
 The Qwen pack declares tokenizer digest
