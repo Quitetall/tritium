@@ -1012,12 +1012,14 @@ fn optimize_start(
 
         #[cfg(test)]
         let reconstruction_started = std::time::Instant::now();
-        let (scale_reconstruction, scale_objective) = reconstruct_planes_and_objective(
-            weights,
-            &scale_outcome.scales,
-            &scale_outcome.trits,
-            metric,
-        )?;
+        let (scale_reconstruction, scale_objective) =
+            reconstruct_planes_and_objective_with_transform(
+                weights,
+                &scale_outcome.scales,
+                &state.trits,
+                metric,
+                &scale_outcome.transform,
+            )?;
         #[cfg(test)]
         record_solver_phase(2, reconstruction_started);
         let scale_accepted = scale_objective < state.objective;
@@ -1033,8 +1035,8 @@ fn optimize_start(
             });
         if scale_accepted {
             let objective_before = state.objective;
+            apply_scale_solve_transform(&mut state.trits, &scale_outcome.transform);
             state.scales = scale_outcome.scales;
-            state.trits = scale_outcome.trits;
             state.reconstruction = scale_reconstruction;
             state.objective = scale_objective;
             state.accepted_objectives.push(scale_objective);
@@ -1224,8 +1226,14 @@ fn weighted_abs_quantile(order: &WeightedAbsOrder, quantile: f64) -> f64 {
 #[derive(Clone, Debug)]
 struct ScaleSolveOutcome {
     scales: Vec<f32>,
-    trits: Vec<Vec<i8>>,
+    transform: ScaleSolveTransform,
     telemetry: ScaleSolveTelemetry,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ScaleSolveTransform {
+    trit_order: [usize; 3],
+    trit_signs: [i8; 3],
 }
 
 fn solve_scales(
@@ -1425,19 +1433,18 @@ fn solve_scales(
         return Err(JointFitError::ScaleSolveFailed);
     }
 
-    // Plane signs are a representation symmetry. Canonicalize each negative solved coefficient
-    // by flipping that plane's trits, then sort scales and trit planes with the same permutation.
+    // Plane signs are a representation symmetry. Record the sign and permutation
+    // rather than cloning each trit vector; the caller applies the transform only
+    // if this scale candidate is accepted.
     let mut signed_planes = Vec::with_capacity(planes);
-    for (source, (scale, plane)) in rhs[..planes].iter().zip(trits).enumerate() {
+    for (source, scale) in rhs[..planes].iter().enumerate() {
         let mut scale = *scale;
-        let mut plane_trits = plane.clone();
+        let mut sign = 1_i8;
         if scale < 0.0 {
             scale = -scale;
-            for trit in &mut plane_trits {
-                *trit = -*trit;
-            }
+            sign = -1;
         }
-        signed_planes.push((scale, source, plane_trits));
+        signed_planes.push((scale, source, sign));
     }
     signed_planes.sort_unstable_by(|left, right| {
         right
@@ -1446,14 +1453,19 @@ fn solve_scales(
             .then_with(|| left.1.cmp(&right.1))
     });
     let mut scales = Vec::with_capacity(planes);
-    let mut ordered_trits = Vec::with_capacity(planes);
-    for (plane, (scale, _, plane_trits)) in signed_planes.into_iter().enumerate() {
+    let mut trit_order = [0_usize; 3];
+    let mut trit_signs = [1_i8; 3];
+    for (plane, (scale, source, sign)) in signed_planes.into_iter().enumerate() {
         scales.push(deployment_scale(scale as f32, precision, plane)?);
-        ordered_trits.push(plane_trits);
+        trit_order[plane] = source;
+        trit_signs[plane] = sign;
     }
     Ok(ScaleSolveOutcome {
         scales,
-        trits: ordered_trits,
+        transform: ScaleSolveTransform {
+            trit_order,
+            trit_signs,
+        },
         telemetry: ScaleSolveTelemetry {
             condition_before,
             condition_after,
@@ -1671,6 +1683,74 @@ fn reconstruct_planes_and_objective(
         accumulate_objective_term(&mut objective, error * error * curvature)?;
     }
     Ok((reconstruction, objective.max(0.0)))
+}
+
+fn reconstruct_planes_and_objective_with_transform(
+    weights: &[f32],
+    scales: &[f32],
+    trits: &[Vec<i8>],
+    metric: JointFitMetric<'_>,
+    transform: &ScaleSolveTransform,
+) -> Result<(Vec<f32>, f64), JointFitError> {
+    if matches!(metric, JointFitMetric::Dense(_)) {
+        let mut reconstruction = vec![0.0_f32; weights.len()];
+        for index in 0..weights.len() {
+            for (plane, scale) in scales.iter().enumerate() {
+                let source = transform.trit_order[plane];
+                let trit = trits[source][index] * transform.trit_signs[plane];
+                reconstruction[index] += *scale * f32::from(trit);
+            }
+        }
+        let objective = metric_objective(weights, &reconstruction, metric)?;
+        return Ok((reconstruction, objective));
+    }
+
+    let mut reconstruction = vec![0.0_f32; weights.len()];
+    let mut objective = 0.0_f64;
+    for index in 0..weights.len() {
+        let mut fitted = 0.0_f32;
+        for (plane, scale) in scales.iter().enumerate() {
+            let source = transform.trit_order[plane];
+            let trit = trits[source][index] * transform.trit_signs[plane];
+            fitted += *scale * f32::from(trit);
+        }
+        reconstruction[index] = fitted;
+        let error = f64::from(weights[index]) - f64::from(fitted);
+        let curvature = match metric {
+            JointFitMetric::Identity => 1.0,
+            JointFitMetric::Diagonal(values) => f64::from(values[index]),
+            JointFitMetric::DiagonalF64(values) => values[index],
+            JointFitMetric::DiagonalAffine {
+                values,
+                scale,
+                shift,
+            } => values[index] * scale + shift,
+            JointFitMetric::Dense(_) => unreachable!("dense metric returned above"),
+        };
+        accumulate_objective_term(&mut objective, error * error * curvature)?;
+    }
+    Ok((reconstruction, objective.max(0.0)))
+}
+
+fn apply_scale_solve_transform(trits: &mut Vec<Vec<i8>>, transform: &ScaleSolveTransform) {
+    let planes = trits.len();
+    let mut sources: [Option<Vec<i8>>; 3] = std::array::from_fn(|_| None);
+    for (slot, plane) in sources.iter_mut().zip(std::mem::take(trits)) {
+        *slot = Some(plane);
+    }
+    let mut ordered = Vec::with_capacity(planes);
+    for plane in 0..planes {
+        let mut values = sources[transform.trit_order[plane]]
+            .take()
+            .expect("scale-solve permutation selects each source plane once");
+        if transform.trit_signs[plane] < 0 {
+            for trit in &mut values {
+                *trit = -*trit;
+            }
+        }
+        ordered.push(values);
+    }
+    *trits = ordered;
 }
 
 fn metric_objective(
@@ -2550,10 +2630,28 @@ mod tests {
 
         assert!(outcome.scales.windows(2).all(|pair| pair[0] >= pair[1]));
         assert!(outcome.scales.iter().all(|scale| *scale >= 0.0));
-        assert_eq!(outcome.trits[0], vec![-1, 1, -1, 1]);
-        assert_eq!(outcome.trits[1], vec![-1, 1, 1, -1]);
-        let fitted = reconstruct(&outcome.scales, &outcome.trits, weights.len());
+        let mut canonical_trits = trits.clone();
+        apply_scale_solve_transform(&mut canonical_trits, &outcome.transform);
+        assert_eq!(canonical_trits[0], vec![-1, 1, -1, 1]);
+        assert_eq!(canonical_trits[1], vec![-1, 1, 1, -1]);
+        let fitted = reconstruct(&outcome.scales, &canonical_trits, weights.len());
         assert!(squared_error(&weights, &fitted) < 1e-20);
+        let reference = reconstruct_planes_and_objective(
+            &weights,
+            &outcome.scales,
+            &canonical_trits,
+            JointFitMetric::Identity,
+        )
+        .expect("canonical reference objective");
+        let mapped = reconstruct_planes_and_objective_with_transform(
+            &weights,
+            &outcome.scales,
+            &trits,
+            JointFitMetric::Identity,
+            &outcome.transform,
+        )
+        .expect("mapped candidate objective");
+        assert_eq!(mapped, reference);
     }
 
     #[test]

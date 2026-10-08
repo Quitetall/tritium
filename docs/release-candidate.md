@@ -2639,6 +2639,18 @@ active. This is not a controlled before/after and establishes no speedup. The
 change removes redundant nested-vector copies by construction, but its runtime
 impact and contribution to the frozen tutorial gate remain unqualified.
 
+The same allocation pass also changes scale-solve candidates to carry a
+three-plane sign/permutation map instead of cloned trit vectors. Candidate
+reconstruction/objective is evaluated through that map with the existing fused
+diagonal scoring order; the state planes are transformed in place only after
+the candidate is accepted. This removes per-iteration plane copies, including
+for rejected M-step candidates, without changing public receipts or canonical
+plane ordering. The full Rust suite and strict Clippy pass, and the rebuilt
+public `convert()` test again preserves all six artifact hashes. No fresh
+runtime comparison is claimed: during the attempted local bench window, host
+load exceeded 10 with unrelated multi-core work active. The optimization remains
+an evidence-backed allocation reduction whose wall-time impact is unmeasured.
+
 The preceding exact-head run
 [37856071971](https://github.com/Quitetall/tritium/actions/runs/37856071971)
 on source `5f0feca67a31b4c1634c868550894cdeb465bdc9` confirms the same result:
