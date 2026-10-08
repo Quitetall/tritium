@@ -1012,6 +1012,16 @@ temporary record of 447,083,070 bytes (its recorded PID is no longer alive).
 That partial file is retained; it is not a complete tensor master and is not
 evidence that the campaign can resume against approved calibration provenance.
 
+The probe was refreshed on 2026-10-08 using
+`python scripts/qwen36-ptq-status.py --work-dir
+/mnt/4tb/tritium-qwen36-campaign-20260813 --json`. It still reports zero
+published masters, zero seals, and that same dead staged record; expected
+payload for the 506 fitted tensors is 23,156,295,680 bytes. No rate or ETA is
+available without a live writer. This operational probe made no campaign
+changes. The historical S2KF records remain calibration-evidence inputs, not
+fitted weights, and the missing capture-to-approved-token-pack binding still
+prevents resuming fitting from them.
+
 The Qwen token pack is distinct from Stage 7's SmolLM2-1.7B recipe-freeze pack.
 The Qwen pack declares tokenizer digest
 `sha256:72943ec7247b68e70aa6e5651a5b0abb870b07a1c1f90bd5da9badece7294407`,
