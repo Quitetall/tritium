@@ -2639,6 +2639,18 @@ active. This is not a controlled before/after and establishes no speedup. The
 change removes redundant nested-vector copies by construction, but its runtime
 impact and contribution to the frozen tutorial gate remain unqualified.
 
+A matched short `salt_fit` comparison was then run on this host, pinned to CPU
+IDs 27–30, using the same command and one sample per revision:
+`taskset -c 27-30 env CARGO_BUILD_JOBS=1 cargo bench --locked -p
+tritium-benches --bench salt_fit -- joint_diagonal_g64_p3_ptq_rows
+--min-time 1 --sample-count 10`. At one thread, baseline `f4398109` measured
+`36.49ms`/64 rows and candidate `61af063a` measured `36.95ms`; at four threads,
+baseline measured `9.414ms` and candidate `9.581ms`. This is neutral to slightly
+slower within a single sample per revision and establishes no runtime benefit.
+The allocation reductions are supported structurally and by correctness tests,
+but wall-time impact remains unproven. This microbenchmark is not a substitute
+for the hosted full-model tutorial gate.
+
 The same allocation pass also changes scale-solve candidates to carry a
 three-plane sign/permutation map instead of cloned trit vectors. Candidate
 reconstruction/objective is evaluated through that map with the existing fused
