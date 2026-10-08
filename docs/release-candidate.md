@@ -2551,5 +2551,32 @@ for P3 (the bench config uses four deterministic restarts, 16 max iterations,
 F16 scoring, and both relay basins). The P3 distribution had a `2.156ms`
 slowest sample, so this short fixture benchmark is an algorithm-scaling signal,
 not a stable performance claim or a function-level profile. `samply` could not
-start a recording in this environment (`mmap failed`), so the next code
-optimization still needs finer attribution before changes are chosen.
+start a recording in this environment (`mmap failed`), and `gdb` attach was
+denied by ptrace policy, so the next code optimization still needs finer
+attribution before changes are chosen.
+
+### Exact-head tutorial and ABI3 result — 2026-10-08
+
+The workflow on source revision
+`1b38b8007be85166e8fa6cd1cf3f1c54fa059be5` completed as
+[run 37853447148](https://github.com/Quitetall/tritium/actions/runs/37853447148).
+All wheel builds, installed-wheel functional smoke, source-free tutorial, and
+the ABI3 matrix passed; the pinned SmolLM2 CPU tutorial alone failed its frozen
+`300s` wall-time gate. It completed every function stage, with conversion at
+`756.794s` and total tutorial time `972.680s` (`672.680s` over budget).
+Checkpoint round-trip completed at `777.183s`, generation at `819.440s`, ONNX
+export at `941.074s`, replay at `965.791s`, and QAT optimizer resume at
+`972.680s`. The matching pre-cache baseline run `37849611144` recorded
+`757.190s` conversion and `978.399s` total. This small difference across
+separate hosted runners does not demonstrate a speedup; treat the cache as
+artifact-preserving, not as a meaningful tutorial optimization.
+
+The candidate runner had four logical CPUs, at least about `12.0 GiB` available
+memory in late samples, more than `83 GiB` temporary disk, and zero recorded
+cgroup CPU throttling. This remains a CPU-time failure, not an OOM or storage
+failure. The exact-source ABI3 receipt downloaded from the same run passed the
+owning `validate_receipt` check for release `1.1.0-rc.2`: schema
+`tritium.abi3-matrix-qualification.v1`, 16 cells, run ID
+`github-37853447148-1-abi3-matrix`, receipt ID
+`sha256:c30797a66685f64c294c4309f4264d5c4d846ff3fab0ac3a9f59ee878ff76c4f`.
+As before, matrix evidence alone does not close the full `packages` gate.
