@@ -2522,3 +2522,23 @@ This closes the compatibility-matrix evidence requirement for that exact
 source revision, but it is not yet attached to a release-candidate manifest or
 registered in the release evidence registry; the `packages` gate therefore
 remains open.
+
+### Matched public `convert()` artifact comparison — 2026-10-08
+
+The selected regression seam is the public Python `prepare` → `calibrate` →
+`convert()` path, exercised by
+`test_public_convert_persists_grouped_fit_artifact`. The test passed once with
+a freshly built `tritium-py` extension from baseline `c1aec7b9` and once from
+candidate `1b38b8007be85166e8fa6cd1cf3f1c54fa059be5`, using the same unchanged
+Python PTQ wrapper, fixture, locked dependencies, and test source. The resulting
+conversion manifest, weight manifest, both plane trit payloads, and both plane
+scale payloads were byte-identical (matching SHA-256 per file). This closes
+artifact-identity coverage for this deterministic small CPU fixture; it does
+not establish a full-model quality/runtime result or SOTA behavior.
+
+The exact-head wheel workflow
+[37853447148](https://github.com/Quitetall/tritium/actions/runs/37853447148)
+was still running at the time of this check, with the pinned SmolLM2 CPU
+tutorial active. Do not push a new commit until that `cancel-in-progress`
+workflow finishes. Its final tutorial timing remains the next authoritative
+measurement for this candidate.
