@@ -49,8 +49,9 @@ the cost of dp4a-only prefill. Pick tq1 for VRAM, tq2 for prefill speed.
 `tritium-format` exposes `write_entropy_transport` and
 `read_entropy_transport` for an outer `TRNS` container. It splits any canonical
 fixed-codec artifact into deterministic power-of-two chunks (64 KiB by default),
-chooses raw bytes or a canonical byte-Huffman payload per chunk, and records a
-content digest plus physical offset in a fixed index. `read_range` decodes only
+chooses the smallest raw, canonical byte-Huffman, or byte-rANS payload per
+chunk, and records a content digest plus physical offset in a fixed index.
+`read_range` decodes only
 chunks intersecting requested logical bytes, so package inspection, HTTP range
 fetch, and resumable transfer do not require whole-artifact materialization.
 `read_entropy_transport_seekable` accepts any `Read + Seek` source and reads
@@ -61,8 +62,11 @@ avoiding eager materialization of the full `.trns` file.
 This is transport/interchange compression, not a new runtime codec. Expanded
 TQ/SALT bytes remain the resident and physical-runtime denominator; no bpw,
 VRAM, or kernel-throughput claim may use `TRNS` bytes. Raw fallback keeps
-incompressible chunks from growing, while per-chunk digests and canonical
-metadata make mutation and non-deterministic encoders fail closed.
+incompressible chunks from growing. TRNS v2 adds rANS while readers retain v1
+raw/Huffman compatibility. The v2 rANS model is 256 little-endian `u16`
+frequencies normalized to 4096, followed by a little-endian 32-bit state and
+the renormalization stream. Per-chunk digests and canonical metadata make
+mutation and non-deterministic encoders fail closed.
 
 ## TB1 bitmap+signs: measured, refuted, kept
 

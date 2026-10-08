@@ -190,9 +190,10 @@ tritium transport unpack model.tslb.trns model-restored.tslb
 cmp model.tslb model-restored.tslb
 ```
 
-Transport compression is not runtime quantization. `inspect` keeps logical
-fixed-codec bytes as resident denominator; compressed bytes must not be used for
-VRAM, bpw, or kernel-throughput claims.
+TRNS v2 selects raw, canonical Huffman, or byte-rANS independently for each
+chunk, and `inspect` reports their counts. Transport compression is not runtime
+quantization: logical fixed-codec bytes remain the resident denominator.
+Compressed bytes must not be used for VRAM, bpw, or kernel-throughput claims.
 
 > The exact subcommand surface is defined in `crates/tritium-cli/src/main.rs`; if
 > a flag here ever drifts, that file is the source of truth.
