@@ -2542,3 +2542,14 @@ was still running at the time of this check, with the pinned SmolLM2 CPU
 tutorial active. Do not push a new commit until that `cancel-in-progress`
 workflow finishes. Its final tutorial timing remains the next authoritative
 measurement for this candidate.
+
+The same machine's existing `salt_fit` G128 single-group microbench was run
+with `CARGO_BUILD_JOBS=1 cargo bench --locked -p tritium-benches --bench
+salt_fit -- joint_diagonal_g128 --min-time 1 --sample-count 10`. On the
+i9-14900K, median latency was `73.78µs` for P1, `294.3µs` for P2, and `745µs`
+for P3 (the bench config uses four deterministic restarts, 16 max iterations,
+F16 scoring, and both relay basins). The P3 distribution had a `2.156ms`
+slowest sample, so this short fixture benchmark is an algorithm-scaling signal,
+not a stable performance claim or a function-level profile. `samply` could not
+start a recording in this environment (`mmap failed`), so the next code
+optimization still needs finer attribution before changes are chosen.
