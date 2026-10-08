@@ -2727,5 +2727,24 @@ deterministic inputs. The public `prepare` → `calibrate` → `convert()` artif
 test passes and now asserts SHA-256 identities for all six persisted output
 files; all match the existing fixed-fixture values. The full quantizer suite
 passes (236 passed, 1 ignored), strict Clippy and formatting pass. Exact-head
-hosted qualification remains open: workflows on `4550a1ba` predate this change
-and must finish before the candidate is pushed.
+hosted qualification remains open: workflows on `4550a1ba` predate this change.
+
+A second matched benchmark used the larger G128 fixture with separate target
+directories and the same CPU pinning. Single-fit medians were `146.2µs`,
+`505µs`, and `1.17ms` for baseline P1/P2/P3, versus `107µs`, `398.7µs`, and
+`957µs` for the candidate. The P2 64-row batch measured `32.76ms` baseline vs
+`25.82ms` candidate at one thread, and `8.22ms` vs `6.462ms` at four threads.
+These synthetic local results indicate a consistent reduction, but do not
+establish full-model quality, end-to-end PTQ time, or release performance.
+
+The exact-head hosted workflow
+[run 37860276563](https://github.com/Quitetall/tritium/actions/runs/37860276563)
+on `4550a1bac07f3c5d610db7ad092ffa14be02d108` has completed. Wheel builds,
+installed-wheel smoke, and ABI3 qualification passed; the CUDA wheel was
+skipped. The pinned SmolLM2 CPU tutorial completed all stages but failed the
+unchanged `300s` gate at `919.186s`: PTQ conversion was `700.368s`, native
+checkpoint round-trip `721.012s`, generation `763.559s`, ONNX export
+`887.330s`, ONNX replay `912.259s`, and QAT resume `919.186s` (calibration
+was `0.599s`). The optimization is not yet measured by hosted end-to-end
+qualification; the candidate exact-head run remains required and the tutorial
+is still far over budget.
