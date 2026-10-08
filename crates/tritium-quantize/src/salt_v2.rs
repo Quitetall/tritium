@@ -600,6 +600,18 @@ pub fn exact_ternary_assignment(
             .total_cmp(&right.0)
             .then_with(|| left.2.cmp(&right.2))
     });
+    // Equal reconstructions have identical error for every weight. Retain only
+    // the lowest state for each total-ordered value so the assignment loop does
+    // not need a second binary search to find the first lower duplicate.
+    let mut unique_states = 0;
+    for index in 0..states {
+        let entry = codebook[index];
+        if unique_states == 0 || codebook[unique_states - 1].0.total_cmp(&entry.0).is_ne() {
+            codebook[unique_states] = entry;
+            unique_states += 1;
+        }
+    }
+    let codebook = &codebook[..unique_states];
     let max_reconstruction = codebook
         .iter()
         .map(|entry| entry.0.abs())
@@ -648,9 +660,7 @@ pub fn exact_ternary_assignment(
             candidate_count += 1;
         }
         if insertion > 0 {
-            let lower_value = codebook[insertion - 1].0;
-            candidates[candidate_count] =
-                codebook.partition_point(|entry| entry.0.total_cmp(&lower_value).is_lt());
+            candidates[candidate_count] = insertion - 1;
             candidate_count += 1;
         }
         for &candidate_index in &candidates[..candidate_count] {
@@ -927,6 +937,16 @@ struct FitState {
 #[cfg(test)]
 std::thread_local! {
     static ASSIGNMENT_FOR_METRIC_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SOLVER_PHASE_NANOS: std::cell::Cell<[u128; 3]> = const { std::cell::Cell::new([0; 3]) };
+}
+
+#[cfg(test)]
+fn record_solver_phase(phase: usize, started: std::time::Instant) {
+    SOLVER_PHASE_NANOS.with(|elapsed| {
+        let mut totals = elapsed.get();
+        totals[phase] = totals[phase].saturating_add(started.elapsed().as_nanos());
+        elapsed.set(totals);
+    });
 }
 
 fn optimize_start(
@@ -936,9 +956,18 @@ fn optimize_start(
     scales: Vec<f32>,
     kind: JointFitStartKind,
 ) -> Result<FitState, JointFitError> {
+    #[cfg(test)]
+    let assignment_started = std::time::Instant::now();
     let trits = assignment_for_metric(weights, &scales, metric)?;
+    #[cfg(test)]
+    record_solver_phase(0, assignment_started);
+
+    #[cfg(test)]
+    let reconstruction_started = std::time::Instant::now();
     let (reconstruction, objective) =
         reconstruct_planes_and_objective(weights, &scales, &trits, metric)?;
+    #[cfg(test)]
+    record_solver_phase(2, reconstruction_started);
     let mut state = FitState {
         scales,
         trits,
@@ -958,6 +987,8 @@ fn optimize_start(
     let mut assignment_checked_for_current_scales = true;
     for iteration in 0..config.max_iterations {
         let mut improved = false;
+        #[cfg(test)]
+        let scale_solve_started = std::time::Instant::now();
         let scale_outcome = solve_scales(
             weights,
             &state.trits,
@@ -966,12 +997,19 @@ fn optimize_start(
             config.ridge_condition_limit,
             config.scale_precision,
         )?;
+        #[cfg(test)]
+        record_solver_phase(1, scale_solve_started);
+
+        #[cfg(test)]
+        let reconstruction_started = std::time::Instant::now();
         let (scale_reconstruction, scale_objective) = reconstruct_planes_and_objective(
             weights,
             &scale_outcome.scales,
             &scale_outcome.trits,
             metric,
         )?;
+        #[cfg(test)]
+        record_solver_phase(2, reconstruction_started);
         let scale_accepted = scale_objective < state.objective;
         state.receipt.scale_solves.push(ScaleSolveReceipt {
             iteration,
@@ -999,14 +1037,22 @@ fn optimize_start(
         // scale candidate leaves the current scales unchanged, and the assignment
         // step for those scales was already evaluated in the prior iteration.
         if !assignment_checked_for_current_scales {
+            #[cfg(test)]
+            let assignment_started = std::time::Instant::now();
             let assignment = assignment_for_metric(weights, &state.scales, metric)?;
+            #[cfg(test)]
+            record_solver_phase(0, assignment_started);
             assignment_checked_for_current_scales = true;
             // The current reconstruction/objective already correspond to these exact
             // scales and trits. Avoid rebuilding and rescoring the row when the
             // assignment step rediscovers the same state.
             if assignment != state.trits {
+                #[cfg(test)]
+                let reconstruction_started = std::time::Instant::now();
                 let (assignment_reconstruction, assignment_objective) =
                     reconstruct_planes_and_objective(weights, &state.scales, &assignment, metric)?;
+                #[cfg(test)]
+                record_solver_phase(2, reconstruction_started);
                 if assignment_objective < state.objective {
                     let objective_before = state.objective;
                     state.trits = assignment;
@@ -1934,6 +1980,54 @@ mod tests {
                 "quantile {quantile}"
             );
         }
+    }
+
+    #[test]
+    #[ignore = "manual G64/P3 solver phase profile"]
+    fn profile_g64_p3_solver_phases() {
+        let rows: Vec<Vec<f32>> = (0..256)
+            .map(|row| {
+                (0..64)
+                    .map(|column| {
+                        let value = (row * 64 + column) * 37 % 101;
+                        (value as f32 - 50.0) / 37.0
+                    })
+                    .collect()
+            })
+            .collect();
+        let diagonal: Vec<f64> = (0..64)
+            .map(|column| 0.25 + ((column * 17 % 31) as f64 / 31.0))
+            .collect();
+        let config = JointFitConfig {
+            planes: 3,
+            max_iterations: 16,
+            ridge: 1e-8,
+            em_restarts: 4,
+            ridge_condition_limit: 1e6,
+            scale_precision: ScalePrecision::F16,
+            relay_basins: RelayBasins {
+                softened: true,
+                modulated: true,
+            },
+        };
+
+        SOLVER_PHASE_NANOS.with(|elapsed| elapsed.set([0; 3]));
+        let started = std::time::Instant::now();
+        for weights in &rows {
+            fit_joint_ternary(weights, JointFitMetric::DiagonalF64(&diagonal), config)
+                .expect("profile G64/P3 row fit");
+        }
+        let total = started.elapsed().as_nanos();
+        let phases = SOLVER_PHASE_NANOS.with(std::cell::Cell::get);
+        assert!(phases.iter().sum::<u128>() <= total);
+        eprintln!(
+            "G64/P3 256-row profile: total={:.3}ms assignment={:.3}ms scale_solve={:.3}ms reconstruction={:.3}ms other={:.3}ms",
+            total as f64 / 1_000_000.0,
+            phases[0] as f64 / 1_000_000.0,
+            phases[1] as f64 / 1_000_000.0,
+            phases[2] as f64 / 1_000_000.0,
+            (total - phases.iter().sum::<u128>()) as f64 / 1_000_000.0,
+        );
     }
 
     #[test]

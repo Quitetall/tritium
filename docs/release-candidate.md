@@ -2580,3 +2580,36 @@ owning `validate_receipt` check for release `1.1.0-rc.2`: schema
 `github-37853447148-1-abi3-matrix`, receipt ID
 `sha256:c30797a66685f64c294c4309f4264d5c4d846ff3fab0ac3a9f59ee878ff76c4f`.
 As before, matrix evidence alone does not close the full `packages` gate.
+
+### Exact assignment codebook deduplication probe — 2026-10-08
+
+The solver's exact ternary assignment codebook now removes duplicate
+reconstructions after total-order sorting. Equal reconstruction values have
+identical error for every weight; retaining the first (lowest state) preserves
+the prior tie order while avoiding a second search for the start of a duplicate
+run. The exhaustive assignment-oracle tests pass. A test-only ignored phase
+profile was added to attribute G64/P3 work without changing the production API.
+
+The public `prepare` → `calibrate` → `convert()` artifact test was rebuilt
+against this exact working-tree Rust extension and passed (`1 passed`). All six
+persisted files matched the previously recorded baseline/candidate comparison:
+conversion manifest `503ddde4…cec57d6`, weight manifest
+`976cf130…bb6765f`, plane-0 scales `c8de1782…b717c9`, plane-0 trits
+`e1c9310f…326bd17`, plane-1 scales `e5693158…0a17b0`, and plane-1 trits
+`9adb3b52…703ac12`. This is deterministic small-fixture artifact identity,
+not full-model equivalence or quality evidence.
+
+The test-only phase profile over 256 deterministic G64/P3 rows measured
+`552.816ms` total: assignment `211.214ms`, scale solving `118.757ms`,
+reconstruction `141.629ms`, and uninstrumented remainder `81.216ms`. An earlier
+same-harness profile before codebook deduplication measured `565.809ms` total,
+with assignment at `252.060ms`; this instrumentation is diagnostic, not a
+release benchmark. Matched optimized `salt_fit` runs on this host varied across
+roughly `20.2–23.2ms` (one thread) and `5.4–6.9ms` (four threads) per 64-row
+fixture, with candidate samples overlapping baseline samples. Therefore no
+production speedup is established. Strict quantizer tests (235 passed, 1
+ignored), strict Clippy, formatting, and the public artifact test pass. The
+hosted run [37856071971](https://github.com/Quitetall/tritium/actions/runs/37856071971)
+has passed its wheel, install-smoke, and ABI3 jobs; its pinned SmolLM2 CPU
+tutorial is still in progress, so do not push another commit until it is
+terminal.
