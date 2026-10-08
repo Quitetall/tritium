@@ -2470,3 +2470,27 @@ already exercises it. Next action is a controlled solver-level optimization
 experiment that preserves artifact bytes on the fixed fixture, followed by a
 fresh hosted tutorial rerun; do not relax its budget or reduce the model/profile
 to make the gate pass.
+
+### Exact weighted-quantile total cache — 2026-10-08
+
+The production row fitter reuses the same ordered absolute-weight/curvature
+context across all three plane-count basins, but recomputed its total curvature
+for each restart quantile. `WeightedAbsOrder` now stores the total in the same
+sorted summation order, eliminating those repeated sums while keeping each
+prefix scan allocation-free. The quantile regression checks total and selected
+value bits against the previous ordered fold, and the three-plane solver
+fingerprint remains unchanged. The full quantizer suite passed (235 unit tests
+plus integration tests), as did strict Clippy and formatting.
+
+The local G64/P3 benchmark sample after the first implementation (which also
+allocated a cumulative-prefix vector) measured medians of `23.10ms`/64 rows
+at one thread and `6.085ms`/64 rows at four threads. The earlier same-host
+candidate-free sample measured `24.10ms` and `9.999ms`, respectively. A shorter
+pre-change sample had measured `8.514ms` at four threads, so host/run variation
+is material. These are not a controlled before/after, and no speedup is
+claimed. The final allocation-free revision measured `23.03ms` and `5.971ms`
+medians under the same G64/P3 harness, again with no matched old/new run.
+Full-model PTQ artifact identity and the hosted 300-second tutorial remain
+unverified for this change. Next: perform
+a matched old/new public `convert()` artifact comparison, then rerun the exact
+hosted tutorial before attributing any runtime effect.

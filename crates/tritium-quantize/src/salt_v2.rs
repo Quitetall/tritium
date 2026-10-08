@@ -793,7 +793,7 @@ pub fn fit_joint_ternary(
     let weighted_abs_order = if config.em_restarts > 1 {
         weighted_abs_order(weights, &metric_diagonal)
     } else {
-        Vec::new()
+        WeightedAbsOrder::default()
     };
     fit_joint_ternary_prepared(
         weights,
@@ -811,7 +811,7 @@ fn fit_joint_ternary_prepared(
     config: JointFitConfig,
     metric_diagonal: &[f64],
     metric_sum: f64,
-    weighted_abs_order: &[WeightedAbsEntry],
+    weighted_abs_order: &WeightedAbsOrder,
 ) -> Result<JointTernaryFit, JointFitError> {
     let relay_starts =
         usize::from(config.relay_basins.softened) + usize::from(config.relay_basins.modulated);
@@ -1035,7 +1035,7 @@ fn deterministic_initial_scales(
     weights: &[f32],
     metric_diagonal: &[f64],
     metric_sum: f64,
-    weighted_abs_order: &[WeightedAbsEntry],
+    weighted_abs_order: &WeightedAbsOrder,
     config: JointFitConfig,
     restart: usize,
 ) -> Result<Vec<f32>, JointFitError> {
@@ -1104,7 +1104,13 @@ fn deterministic_initial_scales(
 
 type WeightedAbsEntry = (f32, f64, usize);
 
-fn weighted_abs_order(weights: &[f32], metric_diagonal: &[f64]) -> Vec<WeightedAbsEntry> {
+#[derive(Default)]
+struct WeightedAbsOrder {
+    entries: Vec<WeightedAbsEntry>,
+    total_weight: f64,
+}
+
+fn weighted_abs_order(weights: &[f32], metric_diagonal: &[f64]) -> WeightedAbsOrder {
     let mut values: Vec<WeightedAbsEntry> = weights
         .iter()
         .zip(metric_diagonal)
@@ -1118,20 +1124,26 @@ fn weighted_abs_order(weights: &[f32], metric_diagonal: &[f64]) -> Vec<WeightedA
             .total_cmp(&right.0)
             .then_with(|| left.2.cmp(&right.2))
     });
-    values
+    // The scale-start schedule asks several weighted quantiles from this same
+    // order. Cache the exact sorted-order total so every restart avoids
+    // re-summing the same group; keep each prefix scan allocation-free.
+    let total_weight = values.iter().map(|value| value.1).sum();
+    WeightedAbsOrder {
+        entries: values,
+        total_weight,
+    }
 }
 
-fn weighted_abs_quantile(values: &[WeightedAbsEntry], quantile: f64) -> f64 {
-    let total: f64 = values.iter().map(|value| value.1).sum();
-    let target = total * quantile.clamp(0.0, 1.0);
+fn weighted_abs_quantile(order: &WeightedAbsOrder, quantile: f64) -> f64 {
+    let target = order.total_weight * quantile.clamp(0.0, 1.0);
     let mut cumulative = 0.0;
-    for (value, weight, _) in values {
+    for (value, weight, _) in &order.entries {
         cumulative += weight;
         if cumulative >= target {
             return f64::from(*value);
         }
     }
-    values.last().map_or(0.0, |value| f64::from(value.0))
+    order.entries.last().map_or(0.0, |value| f64::from(value.0))
 }
 
 #[derive(Clone, Debug)]
@@ -1900,15 +1912,19 @@ mod tests {
                     .total_cmp(&right.0)
                     .then_with(|| left.2.cmp(&right.2))
             });
-            assert_eq!(cached, reference, "quantile ordering must remain canonical");
+            assert_eq!(
+                cached.entries, reference,
+                "quantile ordering must remain canonical"
+            );
             let total: f64 = reference.iter().map(|value| value.1).sum();
+            assert_eq!(cached.total_weight.to_bits(), total.to_bits());
             let target = total * quantile.clamp(0.0, 1.0);
             let mut cumulative = 0.0;
             let expected = reference
                 .iter()
-                .find_map(|(value, weight, _)| {
-                    cumulative += *weight;
-                    (cumulative >= target).then_some(f64::from(*value))
+                .find_map(|value| {
+                    cumulative += value.1;
+                    (cumulative >= target).then_some(f64::from(value.0))
                 })
                 .or_else(|| reference.last().map(|value| f64::from(value.0)))
                 .unwrap_or(0.0);
