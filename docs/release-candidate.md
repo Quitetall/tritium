@@ -2651,6 +2651,22 @@ The allocation reductions are supported structurally and by correctness tests,
 but wall-time impact remains unproven. This microbenchmark is not a substitute
 for the hosted full-model tutorial gate.
 
+The previously active exact-head workflow has now completed as
+[run 37858286157](https://github.com/Quitetall/tritium/actions/runs/37858286157)
+on source `f439810937b96f487b8f0164d3009b5cd93899f5`. Wheel builds, installed
+wheel smoke, the source-free tutorial, and ABI3 qualification passed; the CUDA
+wheel was skipped. The pinned CPU tutorial completed all functions but failed
+the unchanged `300s` gate at `919.186s`. Stage timings were calibration
+`0.599s`, PTQ conversion `700.368s`, native checkpoint round-trip `721.012s`,
+generation `763.559s`, ONNX export `887.330s`, ONNX replay `912.259s`, and QAT
+resume `919.186s`. Compared with the earlier hosted conversion near `757s`,
+this run is about 7.5% faster, but separate-run variance prevents attributing
+that difference to a specific code change. The tutorial remains roughly
+`619s` over budget, with ONNX export also taking about `124s`; both require
+optimization without changing the frozen model or recipe. This run predates
+the local receipt-move and deferred-plane-copy commits, which are now eligible
+for an exact-head hosted measurement.
+
 To narrow the next optimization target without another full-model run, the
 existing ignored native phase profiler was run with
 `cargo test --locked -p tritium-quantize profile_g64_p3_solver_phases --
