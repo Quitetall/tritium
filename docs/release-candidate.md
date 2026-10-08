@@ -2651,6 +2651,17 @@ The allocation reductions are supported structurally and by correctness tests,
 but wall-time impact remains unproven. This microbenchmark is not a substitute
 for the hosted full-model tutorial gate.
 
+To narrow the next optimization target without another full-model run, the
+existing ignored native phase profiler was run with
+`cargo test --locked -p tritium-quantize profile_g64_p3_solver_phases --
+--ignored --nocapture`. Its synthetic 256-row G64/P3 fixture reported
+`526.671ms` total: assignment `209.351ms` (39.7%), scale solve `113.536ms`
+(21.6%), reconstruction/objective `121.110ms` (23.0%), and other fit work
+`82.675ms` (15.7%). This debug-test fixture is not a full-model or optimized
+build measurement, but it makes solver assignment and reconstruction the
+leading code-level targets; receipt/bridge copies are not the only plausible
+cost. No quality-affecting solver iteration or basin settings were changed.
+
 The same allocation pass also changes scale-solve candidates to carry a
 three-plane sign/permutation map instead of cloned trit vectors. Candidate
 reconstruction/objective is evaluated through that map with the existing fused
