@@ -2610,6 +2610,12 @@ fixture, with candidate samples overlapping baseline samples. Therefore no
 production speedup is established. Strict quantizer tests (235 passed, 1
 ignored), strict Clippy, formatting, and the public artifact test pass. The
 hosted run [37856071971](https://github.com/Quitetall/tritium/actions/runs/37856071971)
-has passed its wheel, install-smoke, and ABI3 jobs; its pinned SmolLM2 CPU
-tutorial is still in progress, so do not push another commit until it is
-terminal.
+has passed its wheel, install-smoke, and ABI3 jobs. The pinned SmolLM2 CPU
+tutorial completed every functional stage but failed the frozen `300s` budget:
+PTQ conversion completed at `757.355s`, checkpoint round-trip at `777.642s`,
+generation at `819.383s`, ONNX export at `942.070s`, replay at `966.852s`, and
+QAT optimizer resume at `973.779s` (`673.779s` over budget). This is effectively
+unchanged from run `37853447148` (`756.794s` conversion, `972.680s` total), and
+does not test the codebook-deduplication change because it was not in the tested
+source revision. It reinforces that the release tutorial gate is still a
+substantial CPU optimization blocker.
