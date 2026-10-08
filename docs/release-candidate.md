@@ -2507,3 +2507,18 @@ recorded cgroup CPU-throttle events. This is a baseline for the subsequent
 solver-cache candidate, not evidence that candidate improves performance or
 model quality. The next gates remain an exact public `convert()` artifact
 comparison and the hosted tutorial on the candidate commit.
+
+### PR #51 exact-head ABI3 matrix — 2026-10-08
+
+The wheel workflow for candidate `74d57c6a5397a650b0e858515cbe59c092a5c67b`
+produced `abi3-compatibility-receipt` at
+[run 37852101721](https://github.com/Quitetall/tritium/actions/runs/37852101721).
+The owning validator in `scripts/aggregate-wheel-smoke.py` accepted the
+downloaded receipt against the exact source revision and release
+`1.1.0-rc.2`: schema `tritium.abi3-matrix-qualification.v1`, `passed: true`,
+16 CPython/platform cells, receipt ID
+`sha256:69e0d6a0c40b53bbd72a461bfc35088079c8bc810a931c27df255d129e0290d6`.
+This closes the compatibility-matrix evidence requirement for that exact
+source revision, but it is not yet attached to a release-candidate manifest or
+registered in the release evidence registry; the `packages` gate therefore
+remains open.
