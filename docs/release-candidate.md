@@ -205,6 +205,19 @@ kernel and weight to those two inputs changed the projection output by up to
 `0.0302734375` (maximum tolerance ratio `0.06952`, zero failures), close to the
 observed `0.0322265625` down-projection boundary drift.
 
+The saved block-11 arrays further decompose the product: `silu_11 * linear_82`
+reconstructs `mul_3418` exactly. At the largest product-error element (flattened
+index 1229, token 0 / feature 1229), the ONNX activation and up value are about
+`28.809845` and `52.649776`, versus reference values `28.809803` and
+`52.649719`. Replacing only the ONNX activation with the reference activation
+reduces the maximum product error from `0.00390625` to `0.00219727`; replacing
+only the ONNX up value reduces it to `0.00170898`. Both upstream differences
+contribute, and neither single-input swap eliminates the mismatch. Across all
+captured elements, maximum absolute gate, up, and activation differences are
+`4.19617e-5`, `5.72205e-5`, and `4.19617e-5`, respectively. These are still
+cross-host array comparisons and do not establish which runtime operation or
+hardware path introduced the upstream differences.
+
 This supports the MLP product input as the main contributor to the large
 absolute down-projection drift, rather than showing a standalone down-projection
 kernel error. It is not an exact same-host replay: ONNX ran on AMD EPYC 7763,
