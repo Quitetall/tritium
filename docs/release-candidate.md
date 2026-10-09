@@ -4174,3 +4174,40 @@ reference/observed output tensors, so it is not sufficient to reproduce the
 failure offline by itself. The next diagnostic revision adds those bounded
 replay tensors to the failure-only ledger; it must remain opt-in and must not
 change the frozen tolerance.
+
+### Exact-head parity replay capture — 2026-10-09
+
+Commit `162fbd86db7cc02d070578ce75ce7ea392201b87` reran the pinned CPU tutorial
+in wheels run
+[37932163696](https://github.com/Quitetall/tritium/actions/runs/37932163696).
+The required ABI3 wheel matrix and clean-install wheel jobs passed. The pinned
+tutorial again failed only at whole-model ONNX CPU parity, with 4 of 344,064
+logits outside the unchanged `rtol=atol=1e-4` bound; maximum absolute
+difference was `0.00010919570922851562`, maximum relative difference was
+`1.7615385055541992`, at `(0, 0, 34041)`. Conversion, native checkpoint
+round-trip, and generation completed first. The 4-vCPU AMD EPYC 7763 runner
+reported about 14 GiB available memory, over 80 GiB temporary disk, no cgroup
+CPU throttling, and unset OMP/MKL thread caps. This repeated failure is not a
+resource-exhaustion result and does not justify changing tolerance.
+
+The opt-in failure artifact uploaded successfully (`smollm2-onnx-parity-diagnostic`,
+31,578,834 bytes; artifact SHA-256
+`80ed584b565f01888927096917e55e517a46f40849d854af9d2421400e925bb5`, seven-day
+retention). Downloaded files were verified against the manifest:
+
+| Role | File | Bytes | SHA-256 |
+|---|---|---:|---|
+| ONNX graph | `model.onnx` | 47,492,097 | `15a9b51b73ef991b4d8e1080ef872f090d19920f142dc47bf0eb4a8bb1022877` |
+| External initializers | `model.onnx.data` | 30,828,135 | `5a8c3e5330da8e5a57ea2f0af81502aacbccbd43a1ed192fc8ea97afc860103b` |
+| Input IDs | `replay-000.bin` | 56 | `9149d0808454c31f025f663e24d89b7df315bc11117df48a58890547aefd8f97` |
+| PyTorch reference logits | `replay-001.bin` | 1,376,256 | `c18126bdc8174f10b1d879eb417631c7a9e22e628a70821ce85ac0f6f40f897d` |
+| ORT observed logits | `replay-002.bin` | 1,376,256 | `62708bdb40f16dc66aeaf8a8eda349ff38cd665f904db1d37e36c567141a20ab` |
+
+The arrays bind checkpoint digest
+`sha256:057411d950e9d681f3bcea79e1378eaada734e0a3556ff64590e200144fbd3e2`,
+input shape `[1, 7]`, and output shape `[1, 7, 49152]`; the diagnostic manifest
+SHA-256 is `02b8699ab5cfab8becc4412b562db22be93f56e6ef056e3a8130557bc9e84671`.
+This is now sufficient for exact offline replay. It is still a failure, not a
+parity pass. Next: reproduce ORT's captured output locally, then expose and
+compare intermediate graph boundaries against the original model to locate the
+first divergent operation before proposing a correction.
