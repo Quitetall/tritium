@@ -432,10 +432,10 @@ fn successful_scale_update_rejects_previous_cache_and_output_weight_state() {
         .apply_salt_v2_scale_updates(std::slice::from_ref(&update))
         .unwrap();
 
-    assert!(matches!(
-        runner.forward(&[3], &mut cache),
-        Err(NnError::Provenance(_))
-    ));
+    let rejected = runner.forward(&[3], &mut cache);
+    assert!(
+        matches!(rejected, Err(NnError::Backend(message)) if message.contains("different runner"))
+    );
     assert_eq!(cache.len(), 2);
     assert!(matches!(
         runner.reference_states(&cache, 1024),
@@ -448,7 +448,7 @@ fn successful_scale_update_rejects_previous_cache_and_output_weight_state() {
     cache.reset();
     assert!(matches!(
         runner.forward(&[1], &mut cache),
-        Err(NnError::Provenance(_))
+        Err(NnError::Backend(message)) if message.contains("different runner")
     ));
 
     let mut fresh = runner.new_cache(8).unwrap();
@@ -488,7 +488,7 @@ fn successful_identical_scale_update_also_starts_a_new_weight_state() {
     ));
     assert!(matches!(
         runner.forward(&[3], &mut cache),
-        Err(NnError::Provenance(_))
+        Err(NnError::Backend(message)) if message.contains("different runner")
     ));
     let after = runner
         .forward(&[1, 2], &mut runner.new_cache(8).unwrap())

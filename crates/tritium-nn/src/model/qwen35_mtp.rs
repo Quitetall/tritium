@@ -1339,7 +1339,7 @@ mod tests {
                 |runner| {
                     assert!(matches!(
                         runner.forward(&[3], &mut cache),
-                        Err(NnError::Provenance(_))
+                        Err(NnError::Backend(message)) if message.contains("different runner")
                     ));
                     assert_eq!(cache.len(), 2);
                     assert!(matches!(
@@ -1374,7 +1374,7 @@ mod tests {
         ));
         assert!(matches!(
             target.forward(&[3], &mut candidate_cache),
-            Err(NnError::Provenance(_))
+            Err(NnError::Backend(message)) if message.contains("different runner")
         ));
         assert_eq!(candidate_cache.len(), 2);
         assert!(mtp.align_step(&parent, 1).is_ok());

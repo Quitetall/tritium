@@ -1,7 +1,7 @@
 # Qwen weight-state isolation
 
 Date: 2026-10-09
-Evidence class: implementation with validation pending; not release qualification
+Evidence class: host implementation tests; not release qualification
 Parent: ADR 0033 / plans 0043 and 0051
 Contract: private research commit
 `5bf90a94de0e17bbc8eb9c53be72f51cd21b0484`,
@@ -34,33 +34,44 @@ change, and the numerical tolerances and release gates are unchanged.
 
 ## Verification state
 
-Scoped `rustfmt --edition 2024 --check` and `git diff --check` passed. The first
-narrow Cargo test invocation reached its 300-second limit (`exit 124`) after
-waiting for the shared build cache and starting dependency compilation. It did
-not produce a test result.
-
-The managed validation unit
+The original managed validation unit
 `tritium-qwen-state-validation-20261009.service`, invocation
-`fbe2afd403004624a7be26ca8d308f48`, waits for the already-running managed push
-before sequentially running the following with the existing SSD cache and two
-build workers:
+`fbe2afd403004624a7be26ca8d308f48`, terminated with exit 101: nine integration
+tests passed and two new assertions failed. The assertions expected
+`NnError::Provenance`, but the existing public `forward` foreign-cache contract
+returns `NnError::Backend("Qwen3.5 text cache belongs to a different runner")`.
+A targeted reproduction confirmed that rejection; the tests now check the
+existing error variant and reason. Snapshot/head and MTP provenance checks
+retain their `Provenance` assertions. Temporary diagnostic logging was removed.
+
+Subsequent commands used the existing
+`/mnt/4tb/tmp/tritium-research-target` cache, `RUSTC_WRAPPER=`,
+`CARGO_BUILD_JOBS=2` and `TMPDIR=/mnt/4tb/tmp`:
 
 ```sh
-timeout 600 cargo test --locked -p tritium-nn --test qwen35_text_runner
-timeout 600 cargo test --locked -p tritium-nn --lib
-timeout 600 cargo clippy --locked -p tritium-nn --all-targets -- -D warnings
+timeout 300 cargo test --locked -p tritium-nn --test qwen35_text_runner
+timeout 300 cargo test --locked -p tritium-nn --lib
+timeout 1200 cargo clippy --locked -p tritium-nn --all-targets -- -D warnings
 ```
 
-Validation remains pending until terminal results are inspected. New tests
-cover successful/rejected/identical scale updates, stale cache cursor/reset
+The integration suite passed 11/11 tests; the library suite passed 167/167.
+Neither suite had ignored tests. The first scoped Clippy run reached its
+300-second limit (exit 124) without a terminal lint result. Its follow-up is
+managed by `tritium-qwen-state-lint-20261009.service`, invocation
+`587e01aa7d2f41eb814cf63ab8198ff1`, with a 1,200-second limit. That job completed
+successfully (exit 0); Cargo reported 3m 32s. Scoped
+`rustfmt --edition 2024 --check` and `git diff --check` also passed.
+
+New tests cover successful/rejected/identical
+scale updates, stale cache cursor/reset
 behavior, native snapshots and head outputs, temporary parent/candidate cache
 and output separation, MTP alignment, and success/error/unwind/invalid-override
 restoration. Controlled host tests do not establish physical CUDA behavior.
 
 ## Remaining obligations
 
-Inspect the managed validation results and repair any failures before calling
-this slice verified. Production MTP needs independent authorization bound to
+Complete pushed-tree checks and CI before calling this software slice verified.
+Production MTP needs independent authorization bound to
 the executed artifact: the current dense-source oracle identity is not a
 license to relabel a lossy packed candidate as that dense model. Final Qwen
 fitting/refinement, source/quality/runtime/physical-byte gates, backend/browser/
