@@ -103,8 +103,10 @@ class SmolLM2ReleaseTutorialTests(unittest.TestCase):
         self.assertIn("torch==2.11.0", job)
         self.assertIn("transformers==5.5.3", job)
         self.assertIn("onnxruntime==1.27.0", job)
-        self.assertIn('          OMP_NUM_THREADS: "1"', job)
-        self.assertIn('          MKL_NUM_THREADS: "1"', job)
+        # On the same 4-core hosted runner, forcing one thread increased
+        # ONNX/eager mismatches from 4 to 147; preserve the runner default.
+        self.assertNotIn('          OMP_NUM_THREADS: "1"', job)
+        self.assertNotIn('          MKL_NUM_THREADS: "1"', job)
         self.assertIn("getconf _NPROCESSORS_ONLN", job)
         self.assertIn("nproc --all", job)
         self.assertIn("/proc/cpuinfo", job)
