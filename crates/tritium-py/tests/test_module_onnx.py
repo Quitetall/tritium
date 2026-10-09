@@ -101,13 +101,11 @@ def test_onnx_parity_failure_can_retain_opt_in_diagnostic_graph(
     assert manifest["schema_version"] == 1
     assert manifest["checkpoint_digest"].startswith("sha256:")
     assert manifest["failure_type"] == "AssertionError"
-    graph_entry = next(
-        item for item in manifest["files"] if item["file"] == "model.onnx"
-    )
-    assert (
-        "sha256:" + hashlib.sha256(graph.read_bytes()).hexdigest()
-        == graph_entry["sha256"]
-    )
+    assert any(item["file"] == "model.onnx" for item in manifest["files"])
+    for item in manifest["files"]:
+        payload = (retained / item["file"]).read_bytes()
+        assert len(payload) == item["bytes"]
+        assert "sha256:" + hashlib.sha256(payload).hexdigest() == item["sha256"]
     arrays = manifest["replay_arrays"]
     assert [item["role"] for item in arrays] == [
         "input", "expected-output", "observed-output"

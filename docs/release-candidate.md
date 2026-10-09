@@ -4232,3 +4232,39 @@ thread pinning as a fix or a hardware-agnostic parity result. The next
 diagnostic must compare intermediate model/graph boundaries on both the
 captured input and the matching compact model, then isolate the first operation
 whose error grows across the bound.
+
+#### Exact packed-model reconstruction and hidden-state boundary replay
+
+The local compact model was reconstructed from the captured graph by copying
+its packed-trit and row-scale initializers into the matching
+`AdditiveTernaryWeight` buffers. Its recomputed source-model digest exactly
+matched the captured checkpoint digest
+`sha256:057411d950e9d681f3bcea79e1378eaada734e0a3556ff64590e200144fbd3e2`.
+This makes the local comparison use the hosted quantized weights rather than a
+fresh PTQ conversion. The reconstruction is diagnostic-only; no model weights
+were added to the repository or released.
+
+On the captured input, the reconstructed PyTorch model produced logits with
+SHA-256
+`ba06ae53bf3d99698da81211cf541d597318389a9058c0d8d11dda29fb27afac`. Compared
+with the captured hosted PyTorch reference, maximum absolute difference was
+`5.14984130859375e-05`, with zero tolerance violations. Against that same
+reference, local four-thread ORT had maximum absolute difference
+`9.250640869140625e-05`, also with zero violations (maximum normalized
+tolerance ratio `0.7068673`).
+
+The instrumented graph exposed 455 hidden-size-shaped intermediate values.
+For every one of the 31 PyTorch hidden-state boundaries, a matching graph value
+was found with normalized error below the frozen tolerance. The highest
+reported best-match boundary ratio was about `0.69` in the four-thread run; the
+final hidden-state boundary ratio was about `0.124`. Thus this local replay
+does not identify an intermediate hidden-state value that independently
+crosses tolerance. It does not reproduce the hosted AMD failure and does not
+establish the source of the hosted mismatch. Final LM-head amplification of
+accumulated drift remains a hypothesis, not a finding.
+
+The next useful experiment is a matched final-projection comparison using the
+captured packed weights and the ORT final hidden state, without changing the
+parity threshold. It is deferred until the local CPU has thermal headroom; at
+the time of this note the package sensor reported 73°C. Hosted parity remains
+RED, and the v1.1 release gate is not cleared.
