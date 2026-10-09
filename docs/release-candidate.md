@@ -3123,6 +3123,21 @@ The recipe and `300s` gate are unchanged; the CPU PTQ conversion remains the
 dominant software optimization target. CI, CodeQL, docs and capstone passed at
 this source; the pinned tutorial was the only failed wheel job.
 
+The following exact-source wheel workflow on `20568878414404cbd674f520a01e20fddf32561e`
+([run 37871960575](https://github.com/Quitetall/tritium/actions/runs/37871960575))
+again passed CI, CodeQL, docs, capstone, platform wheels, installed-wheel
+checks and ABI3. Its pinned tutorial failed the unchanged `300s` gate at
+`576.953s`. Stage markers were calibration `0.541s`, conversion `377.213s`
+cumulative (`376.672s` conversion time), native checkpoint round-trip
+`397.353s`, generation `442.564s`, ONNX export `543.937s`, ONNX replay
+`570.468s`, and QAT resume `576.953s`. The four-CPU runner had roughly 11–14
+GiB available memory, over 81 GiB temporary disk, and no cgroup CPU
+throttling; sampled five-minute load average was about 3. This run is not a
+controlled comparison with the prior `508.990s` run, and does not identify a
+specific cause for the slower result. It used the same solver code as the prior
+run and predates the midpoint-allocation change below. Functional completion
+is not a timing pass.
+
 ### Pinned SmolLM2 row-fit phase profile — 2026-10-08
 
 To separate solver work from the full-model timing, the public
