@@ -4552,3 +4552,67 @@ gate failed.
 Next compare those block-11 internals against PyTorch on the exact pinned
 tutorial, then test a source-backed numerical correction. Keep the tolerance
 frozen and the gate RED until that tutorial passes.
+
+#### Block-11 trace and PTQ artifact result — 2026-10-09
+
+The next exact-wheel run,
+[37948541947](https://github.com/Quitetall/tritium/actions/runs/37948541947)
+for `3fefc60ab99674354daef0acb3780a7c1ea1f462`, built the Linux x86_64,
+macOS arm64, and Windows x64 wheels. Its installed-wheel job passed the public
+row-fitting qualification and the public `prepare → calibrate → convert()`
+artifact test, along with the differentiable lifecycle and installed QAT
+tutorial. Thus the prior `1.35x` hosted row-fit measurement did not reproduce;
+its check is still a performance guard and should not be weakened. The pinned
+SmolLM2 tutorial still failed the unchanged tolerance with 4 of 344,064 logits
+outside bounds: maximum failing absolute difference
+`0.0001201331615447998` at `(0, 0, 45178)` and maximum failing relative
+difference `2.28125` at `(0, 0, 34041)`. The tutorial remains RED.
+
+The diagnostic artifact (`11625330761`, 37,075,459 bytes; archive SHA-256
+`d911a644a443ba7c2bc88c1a83f8e0a13fd4fa6090c780e3f38804b7ec721dd0`) has
+manifest SHA-256
+`ad9b6ef2644d28144a90e8fd2d37fb2cca126c00fe982360dbdf27a02e103014`. Its
+110 replay arrays and two ONNX files passed manifest byte-count and SHA-256
+verification. The new reference hooks and ONNX values for `layers[11]` agree
+on the MLP path:
+
+| Boundary | ONNX value | Maximum absolute difference | Maximum tolerance ratio | Failures |
+|---|---|---:|---:|---:|
+| Attention residual | `add_2782` | `0.000194549560546875` | `0.244010` | 0 |
+| Post-attention norm | `mul_3395` | `2.115964889526367e-06` | `0.015906` | 0 |
+| Gate projection | `linear_81` | `4.00543212890625e-05` | `0.033786` | 0 |
+| Up projection | `linear_82` | `6.4849853515625e-05` | `0.050380` | 0 |
+| Activation | `silu_11` | `4.00543212890625e-05` | `0.017944` | 0 |
+| Product before down projection | `mul_3418` | `0.00390625` | `0.048836` | 0 |
+| Down projection / MLP output | `linear_83` | `0.0322265625` | `0.135166` | 0 |
+| Block output | `add_2832` | `0.0322265625` | `0.192853` | 0 |
+
+The largest first outlier appears at the down-projection output, at token 0,
+hidden coordinate 507 (`12212.943` ONNX versus `12212.911` reference). This is
+still inside the frozen elementwise tolerance. The attention, normalization,
+and gate/up/activation boundaries before it are also within tolerance. This
+narrows the numeric investigation to the down-projection input/reduction and
+subsequent accumulation, but does not yet distinguish small input drift from
+matmul accumulation behavior or establish a correction.
+
+The two adjacent hosted runs also expose a separate reproducibility issue.
+The ONNX graph bytes are identical (`model.onnx` SHA-256
+`15a9b51b73ef991b4d8e1080ef872f090d19920f142dc47bf0eb4a8bb1022877`), but
+the provisional packed checkpoint digest changed from
+`sha256:057411d950e9d681f3bcea79e1378eaada734e0a3556ff64590e200144fbd3e2`
+to `sha256:3bb026489b8ca00f2696a040bd48a0b4055906f097c7952348dc89259fffae2a`.
+The external tensor payloads have equal size (30,828,135 bytes) but different
+hashes. A byte comparison found 270 changed bytes across 113 packed tensors:
+253 bytes in scale tensors (106 tensors) and 17 bytes in packed-trit tensors
+(7 tensors). The tutorials use the same pinned base-model revision and fixed
+prompt, and this commit changed only diagnostic capture and docs. Treat the
+cause as UNKNOWN, not as proof of solver nondeterminism; next verify source
+checkpoint identity and repeat conversion under controlled thread settings.
+This variation means the two parity traces are not byte-for-byte the same
+candidate and must not be described as one model's repeatability evidence.
+
+Next: investigate and make PTQ artifact production reproducible (or identify
+and explicitly receipt a supported source of nondeterminism), then run the
+block-11 analysis on that stable candidate and test a source-backed numeric
+correction. Keep the parity and release gates RED until the exact pinned
+tutorial passes.
