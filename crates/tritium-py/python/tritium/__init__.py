@@ -85,7 +85,7 @@ __all__ = [
 # API look like a successful core-only import.
 import importlib.util as _importlib_util
 
-if _importlib_util.find_spec("torch") is not None:  # pragma: no branch
+try:
     from . import autograd  # noqa: F401
     from . import torch  # noqa: F401
     # ``tritium.nn`` imports estimator/ops modules from ``tritium.torch``;
@@ -93,3 +93,8 @@ if _importlib_util.find_spec("torch") is not None:  # pragma: no branch
     from . import nn  # noqa: F401
 
     __all__.extend(["autograd", "nn", "torch"])
+except ModuleNotFoundError as error:
+    # A missing optional dependency is allowed. If PyTorch is installed,
+    # preserve missing-module failures from its own or Tritium's imports.
+    if error.name != "torch" or _importlib_util.find_spec("torch") is not None:
+        raise
