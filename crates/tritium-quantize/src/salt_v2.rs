@@ -612,6 +612,12 @@ pub fn exact_ternary_assignment(
         }
     }
     let codebook = &codebook[..unique_states];
+    // Adjacent-codebook midpoints partition the real line into nearest-code
+    // regions. Compute them in f64 so they are exact for the f32 endpoints.
+    let midpoints = codebook
+        .windows(2)
+        .map(|pair| (f64::from(pair[0].0) + f64::from(pair[1].0)) * 0.5)
+        .collect::<Vec<_>>();
     let max_reconstruction = codebook
         .iter()
         .map(|entry| entry.0.abs())
@@ -626,9 +632,7 @@ pub fn exact_ternary_assignment(
 
     let mut trits = vec![vec![0_i8; weights.len()]; scales.len()];
     for (weight_index, &weight) in weights.iter().enumerate() {
-        let mut best_error = f64::INFINITY;
         let mut best_codes = [0_i8; 3];
-        let mut best_state = usize::MAX;
         // At extreme dynamic ranges, distinct f32 reconstructions can collapse
         // to the same f64 squared error. Preserve the original first-state tie
         // behavior there; ordinary values use the exact nearest-code fast path.
@@ -638,6 +642,8 @@ pub fn exact_ternary_assignment(
             || min_reconstruction_gap
                 <= (f64::from(weight.abs()) + f64::from(max_reconstruction)) * (1.0 / 67_108_864.0);
         if ill_conditioned {
+            let mut best_error = f64::INFINITY;
+            let mut best_state = usize::MAX;
             for &(reconstruction, candidate, state) in codebook.iter() {
                 let error = f64::from(weight) - f64::from(reconstruction);
                 let squared = error * error;
@@ -652,27 +658,25 @@ pub fn exact_ternary_assignment(
             }
             continue;
         }
-        let insertion = codebook.partition_point(|entry| entry.0.total_cmp(&weight).is_lt());
-        let mut candidates = [usize::MAX; 2];
-        let mut candidate_count = 0;
-        if insertion < codebook.len() {
-            candidates[candidate_count] = insertion;
-            candidate_count += 1;
-        }
-        if insertion > 0 {
-            candidates[candidate_count] = insertion - 1;
-            candidate_count += 1;
-        }
-        for &candidate_index in &candidates[..candidate_count] {
-            let (reconstruction, candidate, state) = codebook[candidate_index];
-            let error = f64::from(weight) - f64::from(reconstruction);
-            let squared = error * error;
-            if squared < best_error || (squared == best_error && state < best_state) {
-                best_error = squared;
-                best_codes = candidate;
-                best_state = state;
+        let value = f64::from(weight);
+        let upper = midpoints.partition_point(|midpoint| *midpoint < value);
+        let candidate_index = if upper < midpoints.len() && midpoints[upper] == value {
+            // At an exact midpoint, retain the original exhaustive oracle's
+            // deterministic lower-state tie break.
+            if codebook[upper].2 < codebook[upper + 1].2 {
+                upper
+            } else {
+                upper + 1
             }
-        }
+        } else if upper == 0 {
+            0
+        } else if upper == midpoints.len() {
+            codebook.len() - 1
+        } else {
+            upper
+        };
+        let (_, candidate, _) = codebook[candidate_index];
+        best_codes = candidate;
         for plane in 0..scales.len() {
             trits[plane][weight_index] = best_codes[plane];
         }
@@ -2255,6 +2259,56 @@ mod tests {
         let diagonal: Vec<f64> = (0..64)
             .map(|column| 0.25 + ((column * 17 % 31) as f64 / 31.0))
             .collect();
+        report_compact_g64_p2_phase_profile(&rows, &diagonal, "synthetic");
+    }
+
+    #[test]
+    #[ignore = "requires fixture from scripts/profile-smollm2-ptq-solver.py"]
+    fn profile_smollm2_g64_p2_solver_phases() {
+        const HEADER_BYTES: usize = 16;
+        let fixture_path = std::env::var_os("TRITIUM_SMOLLM2_PROFILE_FIXTURE")
+            .expect("set TRITIUM_SMOLLM2_PROFILE_FIXTURE to a generated fixture path");
+        let bytes = std::fs::read(fixture_path).expect("read SmolLM2 profile fixture");
+        assert!(
+            bytes.len() >= HEADER_BYTES,
+            "fixture is shorter than its header"
+        );
+        assert_eq!(&bytes[..8], b"TRIPRF01", "unknown fixture format");
+        let rows = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+        let columns = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+        assert_eq!(rows, 256, "fixture row count must be 256");
+        assert_eq!(columns, 64, "fixture group width must be 64");
+        let weight_bytes = rows.checked_mul(columns).unwrap().checked_mul(4).unwrap();
+        let expected_bytes = HEADER_BYTES + weight_bytes + columns * 8;
+        assert_eq!(
+            bytes.len(),
+            expected_bytes,
+            "fixture has an invalid byte length"
+        );
+        let weight_data = &bytes[HEADER_BYTES..HEADER_BYTES + weight_bytes];
+        let weights = weight_data
+            .chunks(4)
+            .map(|value| f32::from_le_bytes(value.try_into().expect("validated f32 chunk")))
+            .collect::<Vec<_>>()
+            .chunks_exact(columns)
+            .map(<[f32]>::to_vec)
+            .collect::<Vec<_>>();
+        let diagonal_data = &bytes[HEADER_BYTES + weight_bytes..];
+        let diagonal = diagonal_data
+            .chunks(8)
+            .map(|value| f64::from_le_bytes(value.try_into().expect("validated f64 chunk")))
+            .collect::<Vec<_>>();
+        report_compact_g64_p2_phase_profile(&weights, &diagonal, "pinned SmolLM2 layer");
+    }
+
+    fn report_compact_g64_p2_phase_profile(
+        rows: &[Vec<f32>],
+        diagonal: &[f64],
+        fixture_kind: &str,
+    ) {
+        assert_eq!(rows.len(), 256);
+        assert!(rows.iter().all(|row| row.len() == 64));
+        assert_eq!(diagonal.len(), 64);
         let config = JointFitConfig {
             planes: 2,
             max_iterations: 16,
@@ -2270,15 +2324,15 @@ mod tests {
 
         SOLVER_PHASE_NANOS.with(|elapsed| elapsed.set([0; 7]));
         let started = std::time::Instant::now();
-        for weights in &rows {
-            fit_joint_ternary(weights, JointFitMetric::DiagonalF64(&diagonal), config)
+        for row in rows {
+            fit_joint_ternary(row, JointFitMetric::DiagonalF64(diagonal), config)
                 .expect("profile compact G64/P2 row fit");
         }
         let total = started.elapsed().as_nanos();
         let phases = SOLVER_PHASE_NANOS.with(std::cell::Cell::get);
         assert!(phases.iter().sum::<u128>() <= total);
         eprintln!(
-            "G64/P2 compact 256-row profile: total={:.3}ms assignment={:.3}ms scale_solve={:.3}ms reconstruction={:.3}ms validate_metric={:.3}ms weighted_order={:.3}ms init_scales={:.3}ms relay_scales={:.3}ms other={:.3}ms",
+            "G64/P2 compact {fixture_kind} 256-row profile: total={:.3}ms assignment={:.3}ms scale_solve={:.3}ms reconstruction={:.3}ms validate_metric={:.3}ms weighted_order={:.3}ms init_scales={:.3}ms relay_scales={:.3}ms other={:.3}ms",
             total as f64 / 1_000_000.0,
             phases[0] as f64 / 1_000_000.0,
             phases[1] as f64 / 1_000_000.0,
@@ -2609,6 +2663,98 @@ mod tests {
         for scales in cases {
             assert_eq!(
                 exact_ternary_assignment(&weights, scales).expect("valid assignment"),
+                reference(&weights, scales),
+                "scale set {scales:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn exact_assignment_matches_exhaustive_oracle_around_every_codebook_midpoint() {
+        fn reference(weights: &[f32], scales: &[f32]) -> Vec<Vec<i8>> {
+            const CODES: [i8; 3] = [0, -1, 1];
+            let states = 3_usize.pow(scales.len() as u32);
+            let mut trits = vec![vec![0_i8; weights.len()]; scales.len()];
+            for (weight_index, &weight) in weights.iter().enumerate() {
+                let mut best_error = f64::INFINITY;
+                let mut best_state = usize::MAX;
+                let mut best_codes = [0_i8; 3];
+                for state in 0..states {
+                    let mut encoded = state;
+                    let mut reconstruction = 0.0_f32;
+                    let mut codes = [0_i8; 3];
+                    for plane in 0..scales.len() {
+                        let code = CODES[encoded % 3];
+                        encoded /= 3;
+                        codes[plane] = code;
+                        reconstruction += scales[plane] * f32::from(code);
+                    }
+                    let error = f64::from(weight) - f64::from(reconstruction);
+                    let squared = error * error;
+                    if squared < best_error || (squared == best_error && state < best_state) {
+                        best_error = squared;
+                        best_state = state;
+                        best_codes = codes;
+                    }
+                }
+                for plane in 0..scales.len() {
+                    trits[plane][weight_index] = best_codes[plane];
+                }
+            }
+            trits
+        }
+
+        fn next_up(value: f32) -> f32 {
+            if value == 0.0 {
+                return f32::from_bits(1);
+            }
+            if value.is_sign_positive() {
+                f32::from_bits(value.to_bits() + 1)
+            } else {
+                f32::from_bits(value.to_bits() - 1)
+            }
+        }
+
+        fn next_down(value: f32) -> f32 {
+            if value == 0.0 {
+                return -f32::from_bits(1);
+            }
+            if value.is_sign_positive() {
+                f32::from_bits(value.to_bits() - 1)
+            } else {
+                f32::from_bits(value.to_bits() + 1)
+            }
+        }
+
+        for scales in [
+            &[0.75][..],
+            &[1.0, 0.5],
+            &[1.0, 1.0],
+            &[1.0, 0.5, 0.25],
+            &[0.125, 0.0625, 0.03125],
+        ] {
+            const CODES: [i8; 3] = [0, -1, 1];
+            let mut reconstructions = (0..3_usize.pow(scales.len() as u32))
+                .map(|mut state| {
+                    let mut reconstruction = 0.0_f32;
+                    for scale in scales {
+                        let code = CODES[state % 3];
+                        state /= 3;
+                        reconstruction += *scale * f32::from(code);
+                    }
+                    reconstruction
+                })
+                .collect::<Vec<_>>();
+            reconstructions.sort_by(f32::total_cmp);
+            reconstructions.dedup_by(|left, right| left.total_cmp(right).is_eq());
+
+            let mut weights = reconstructions.clone();
+            for pair in reconstructions.windows(2) {
+                let midpoint = ((f64::from(pair[0]) + f64::from(pair[1])) * 0.5) as f32;
+                weights.extend([next_down(midpoint), midpoint, next_up(midpoint)]);
+            }
+            assert_eq!(
+                exact_ternary_assignment(&weights, scales).unwrap(),
                 reference(&weights, scales),
                 "scale set {scales:?}",
             );

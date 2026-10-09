@@ -2928,8 +2928,48 @@ and G64 groups (the SmolLM2 hidden/intermediate widths use G64). On a
 deterministic synthetic 256-row fixture it measured `30.176ms` total:
 assignment `11.472ms`, relay initialization `9.874ms`, scale solve `2.453ms`,
 reconstruction `3.773ms`, and remaining validation/overhead `2.604ms`. This
-identifies assignment and relay initialization as the largest sampled solver
-phases, but it is not a model-backed profile or an optimization result and must
-not be extrapolated to the tutorial. The next useful step is a phase profile on
-real SmolLM2 rows, followed by a semantics- and quality-checked optimization
-and an exact-source hosted rerun. No threshold or solver recipe was changed.
+identified assignment and relay initialization as the largest sampled phases,
+but it was not model-backed and was not extrapolated to the tutorial.
+
+A pinned-model profile then used the public `prepare` → `calibrate` → `convert()`
+path on `model.layers.0.mlp.up_proj` (1536x576), with four PyTorch/Rayon threads.
+Calibration took `0.003s`; public conversion took `1.328s` and produced artifact
+`sha256:4059a7c249fbf4d3aaa58a56d4d6c630da175d2c440a365fef025ea3e0b58c44`
+with weighted MSE `8.28580185e-05`. The fixture binds model
+`HuggingFaceTB/SmolLM2-135M-Instruct` revision
+`12fd25f77366fa6b3b4b768ec3050bf629380bac`, calibration
+`sha256:7c42611e41b1e60300c1a123a6a3107e1d33becbd1129a4c3fd6b13d3f310dfd`,
+and fixture digest
+`2b4f5a522531a5894e98b2a0593db9764f1cef34962e62ecf9594e618437ff18`. The
+matching release-mode row profile measured `36.303ms` for 256 real rows:
+assignment `14.810ms` (40.8%), relay initialization `11.131ms` (30.7%), scale
+solve `2.744ms` (7.6%), reconstruction `4.453ms` (12.3%), and other work
+`3.165ms` (8.7%). This supports the synthetic phase ranking on this layer.
+The one-layer timing is not a full-model or hosted-CI result; it does not
+qualify the `300s` gate or establish model quality. The updated
+`profile-smollm2-ptq-solver.py` harness captures a fresh fixture without saving
+model weights into the repository. Next, optimize the assignment/relay solver
+without changing recipe semantics, validate byte/quality behavior, then rerun
+the exact-source hosted tutorial. No threshold or solver recipe was changed.
+
+The exact-assignment inner loop now binary-searches precomputed f64 midpoints
+between adjacent unique f32 reconstructions, avoiding per-weight squared-error
+comparisons in the ordinary case. It retains exhaustive assignment for
+ill-conditioned values and the original state-order tie rule. The exhaustive
+oracle test covers each codebook midpoint and its neighboring f32 values; the
+three exact-assignment tests pass. On the same pinned 256-row release-mode
+fixture, the solver phase profile measured `29.607ms` total with assignment at
+`7.385ms`, versus the preceding single profile at `36.303ms` total and
+`14.810ms` assignment. Relay initialization remains dominant at `11.954ms`.
+These are single-run phase observations, not a controlled benchmark result.
+
+After rebuilding the Python extension in release mode, three public
+`prepare → calibrate → convert()` runs measured `1.045s`, `0.972s`, and
+`0.998s` (median `0.998s`) for the selected SmolLM2 layer. All three produced
+the same PTQ artifact identity
+`sha256:4059a7c249fbf4d3aaa58a56d4d6c630da175d2c440a365fef025ea3e0b58c44`,
+weighted MSE `8.28580185e-05`, calibration identity, and fixture digest
+`2b4f5a522531a5894e98b2a0593db9764f1cef34962e62ecf9594e618437ff18`. The
+previous public-path observation was one `1.328s` run, so it is not a paired
+baseline and no speedup claim is made. This remains a one-layer profile, not a
+full-model qualification or hosted 300-second gate result.
