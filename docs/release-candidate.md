@@ -2874,3 +2874,30 @@ These qualify two of seven backend families at this exact candidate source.
 They are not a seven-backend aggregate, a performance receipt, or final release
 qualification; the other backend families and final-source regeneration
 remain open.
+
+### Matched portable-training V2 CPU/CUDA/WASI receipts — 2026-10-08
+
+The frozen V2 release corpus was executed and independently admitted for three
+backend families at clean source `4256284069e0135da1f62e2853eafc96f764cc53`.
+CPU ran on the i9-14900K, CUDA on the RTX 4090, and WASI in a Wasmtime 48.0.1
+guest on `x86_64`. The WASI bundle came from exact-head CI run
+[37864560574](https://github.com/Quitetall/tritium/actions/runs/37864560574)
+and was reopened locally from the clean source checkout. The three-way
+`training_capability_table --schema v2` admission reports 36 operations, 117
+cases, peak resident bytes `4192`, and peak scratch bytes `132032` for each
+family. Manifest digest:
+`9093a1a7f9a3422c399943782aadf4df6b11833cf2253db0db56ff2d9dedb098`; vector
+digest:
+`38b17f4c76c1d2f85cb35c713652a3d77627d02ba47933d2c8f31a88e0c594a7`.
+
+| Backend | Receipt bundle | Durable receipt directory |
+|---|---|---|
+| CPU | `cc5b2af1ed0ca930b9deb0311db55f1dbd88dc9bd2c4ce1c1c678ef283d90973` | `/mnt/2tb/tritium-release-evidence/training-backends/42562840/cpu-v2/` |
+| CUDA | `fc7f02867170e96832596a0c61b7994690d66a59a07213449bce9ee9d9d49f46` | `/mnt/2tb/tritium-release-evidence/training-backends/42562840/cuda-v2/` |
+| WASI | `dda13a83c8f6c22f9daf5a4f18d80384a767eb4b18686c5d5c4b7a5ac712b0ff` | `/mnt/2tb/tritium-release-evidence/training-backends/42562840/wasi-v2/` |
+
+These are three of seven required V2 release families at this exact source;
+they do not form the aggregate qualification or the separate performance
+receipt. ROCm, Metal, native wgpu, MCU, and final-source regeneration remain
+open. V3 CPU/CUDA receipts above are separate extension evidence and are not
+substituted into the frozen V2 release corpus.
