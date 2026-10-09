@@ -2875,7 +2875,7 @@ They are not a seven-backend aggregate, a performance receipt, or final release
 qualification; the other backend families and final-source regeneration
 remain open.
 
-### Matched portable-training V2 CPU/CUDA/WASI receipts — 2026-10-08
+### Matched portable-training V2 CPU/CUDA/wgpu/WASI receipts — 2026-10-08
 
 The frozen V2 release corpus was executed and independently admitted for four
 backend families at clean source `4256284069e0135da1f62e2853eafc96f764cc53`.
@@ -2883,7 +2883,7 @@ CPU ran on the i9-14900K, CUDA on the RTX 4090, native wgpu on the discrete
 RTX 4090/Vulkan adapter, and WASI in a Wasmtime 48.0.1 guest on `x86_64`. The
 WASI bundle came from exact-head CI run
 [37864560574](https://github.com/Quitetall/tritium/actions/runs/37864560574)
-and was reopened locally from the clean source checkout. The three-way
+and was reopened locally from the clean source checkout. The four-way
 `training_capability_table --schema v2` admission reports 36 operations, 117
 cases, peak resident bytes `4192`, and peak scratch bytes `132032` for each
 family. Manifest digest:
