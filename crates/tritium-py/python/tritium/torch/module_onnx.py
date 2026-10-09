@@ -391,6 +391,82 @@ def _capture_terminal_intermediates(
         diagnostic_graph.unlink(missing_ok=True)
 
 
+def _capture_reference_terminal_outputs(
+    model: nn.Module,
+    input_names: Sequence[str],
+    inputs: Sequence[Tensor],
+) -> Tuple[Tuple[str, str, Tensor], ...]:
+    """Best-effort capture of a HF model's final hidden state on the reference path."""
+
+    config = getattr(model, "config", None)
+    config = getattr(config, "text_config", config)
+    layer_count = getattr(config, "num_hidden_layers", None)
+    hidden_size = getattr(config, "hidden_size", None)
+    vocab_size = getattr(config, "vocab_size", None)
+    if any(type(value) is not int or value <= 0 for value in (layer_count, hidden_size, vocab_size)):
+        return ()
+    token_input = next(
+        (
+            value
+            for name, value in zip(input_names, inputs, strict=True)
+            if "input_ids" in name
+            and value.ndim >= 2
+            and value.dtype in {torch.int8, torch.int16, torch.int32, torch.int64}
+        ),
+        None,
+    )
+    if token_input is None:
+        return ()
+    batch = 1
+    for size in token_input.shape[:-1]:
+        batch *= int(size)
+    sequence = int(token_input.shape[-1])
+    estimated_bytes = (
+        (layer_count + 1) * batch * sequence * hidden_size * 4
+        + batch * sequence * vocab_size * 4
+    )
+    if estimated_bytes > _MAX_TERMINAL_PARITY_CAPTURE_BYTES:
+        return ()
+    try:
+        with torch.no_grad():
+            result = model(*inputs, output_hidden_states=True, use_cache=False)
+    except TypeError:
+        return ()
+    if isinstance(result, Mapping):
+        hidden_states = result.get("hidden_states")
+        logits = result.get("logits")
+    else:
+        hidden_states = getattr(result, "hidden_states", None)
+        logits = getattr(result, "logits", None)
+    if (
+        not isinstance(hidden_states, (tuple, list))
+        or not hidden_states
+        or not isinstance(hidden_states[-1], Tensor)
+    ):
+        return ()
+    terminal_hidden = hidden_states[-1]
+    capture_tensors = [terminal_hidden]
+    if isinstance(logits, Tensor):
+        capture_tensors.append(logits)
+    if sum(value.numel() * value.element_size() for value in capture_tensors) > (
+        _MAX_TERMINAL_PARITY_CAPTURE_BYTES
+    ):
+        return ()
+    arrays = []
+    if isinstance(logits, Tensor):
+        arrays.append(
+            ("reference-output-replay", "logits", logits.detach().cpu().contiguous())
+        )
+    arrays.append(
+        (
+            "reference-terminal-hidden",
+            "hidden_states[-1]",
+            terminal_hidden.detach().cpu().contiguous(),
+        )
+    )
+    return tuple(arrays)
+
+
 def _retain_parity_failure(
     staging: Path,
     diagnostic_root: Path,
@@ -892,6 +968,18 @@ def export_module_onnx(
                         except Exception as diagnostic_error:
                             print(
                                 "could not capture terminal ONNX intermediates: "
+                                f"{type(diagnostic_error).__name__}",
+                                file=sys.stderr,
+                            )
+                        try:
+                            additional_arrays += _capture_reference_terminal_outputs(
+                                model,
+                                names_in,
+                                inputs,
+                            )
+                        except Exception as diagnostic_error:
+                            print(
+                                "could not capture reference terminal outputs: "
                                 f"{type(diagnostic_error).__name__}",
                                 file=sys.stderr,
                             )

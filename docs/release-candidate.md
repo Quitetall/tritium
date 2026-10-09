@@ -58,6 +58,36 @@ manylinux release artifact, and the hosted candidate-wheel/tutorial gate had
 not completed when this record was updated. It does not establish a native
 fused kernel or cross-machine performance claim.
 
+### Hosted SmolLM2 ONNX parity diagnosis (2026-10-09)
+
+Hosted Actions run [`37936540167`](https://github.com/Quitetall/tritium/actions/runs/37936540167)
+tested exact PR head `be644fb2b9fdc0b9ad7583950717d124348042dd`. The pinned
+SmolLM2 tutorial failed its frozen PyTorch/ONNX Runtime parity assertion by 4
+elements out of 344,064; the largest absolute delta was `0.0001091957` against
+the existing `0.0001` absolute tolerance. The opt-in diagnostic artifact
+(`smollm2-onnx-parity-diagnostic`, artifact ID `11617749672`, 32,789,616 bytes)
+was downloaded and its manifest and all recorded array hashes verified.
+
+The captured ONNX terminal graph exposes seven output-projection MatMul shards
+and their shared activation. Concatenating those seven captured shards
+reproduces the original hosted ONNX Runtime logits exactly (`max_abs=0`). The
+four failing positions are spread across three shards (one in `linear_210`, one
+in `linear_214`, two in `linear_215`), which argues against one isolated shard
+being the sole cause. A local exact PyTorch reconstruction applied to the
+hosted activation had three tolerance failures against the hosted PyTorch
+logits, including the `linear_214` position; applying the same reconstruction
+to the hosted ONNX activation matched hosted ONNX shards within tolerance.
+These are diagnostic comparisons, not a proof of the source: the hosted
+PyTorch final hidden state was not yet captured, so upstream activation drift
+remains a leading hypothesis rather than an established root cause.
+
+The release parity gate remains FAIL for this run. No tolerance or frozen
+contract was changed. The next diagnostic is to capture the reference
+framework's final hidden state on the same hosted worker and compare it directly
+with the ONNX shared activation, subject to the existing diagnostic size cap.
+This evidence does not qualify model quality, release readiness, or GPU
+performance.
+
 ## Gate status (measured 2026-09-03)
 
 ### Hugging Face distributed CPU software checks (2026-10-04)

@@ -35,6 +35,7 @@ from tritium.torch import (  # noqa: E402
     refine,
 )
 from tritium.torch.module_onnx import (  # noqa: E402
+    _capture_reference_terminal_outputs,
     _capture_terminal_intermediates,
     _session_options,
     _terminal_intermediate_names,
@@ -178,6 +179,50 @@ def test_terminal_intermediate_capture_replays_concat_shards_and_shared_input(
     ]
 
 
+def test_reference_terminal_capture_is_bounded_and_best_effort():
+    input_ids = torch.tensor([[1, 2, 3]], dtype=torch.int64)
+    hidden = torch.arange(12, dtype=torch.float32).reshape(1, 3, 4)
+    logits = torch.arange(30, dtype=torch.float32).reshape(1, 3, 10)
+
+    class TinyReference:
+        config = SimpleNamespace(
+            num_hidden_layers=2,
+            hidden_size=4,
+            vocab_size=10,
+        )
+
+        def __call__(self, *args, **kwargs):
+            assert kwargs == {"output_hidden_states": True, "use_cache": False}
+            return SimpleNamespace(logits=logits, hidden_states=(hidden, hidden))
+
+    captured = _capture_reference_terminal_outputs(
+        TinyReference(), ["input_ids"], [input_ids]
+    )
+    assert [(role, name) for role, name, _value in captured] == [
+        ("reference-output-replay", "logits"),
+        ("reference-terminal-hidden", "hidden_states[-1]"),
+    ]
+    assert torch.equal(captured[0][2], logits)
+    assert torch.equal(captured[1][2], hidden)
+
+    class OversizedReference(TinyReference):
+        config = SimpleNamespace(
+            num_hidden_layers=96,
+            hidden_size=8192,
+            vocab_size=10_000_000,
+        )
+
+        def __call__(self, *_args, **_kwargs):
+            raise AssertionError("oversized capture must not invoke the model")
+
+    assert (
+        _capture_reference_terminal_outputs(
+            OversizedReference(), ["input_ids"], [input_ids]
+        )
+        == ()
+    )
+
+
 def test_terminal_capture_failure_preserves_primary_parity_diagnostic(
     tmp_path, monkeypatch
 ):
@@ -194,6 +239,9 @@ def test_terminal_capture_failure_preserves_primary_parity_diagnostic(
     monkeypatch.setattr(torch.testing, "assert_close", fail_assert_close)
     monkeypatch.setattr(
         module_onnx, "_capture_terminal_intermediates", fail_terminal_capture
+    )
+    monkeypatch.setattr(
+        module_onnx, "_capture_reference_terminal_outputs", fail_terminal_capture
     )
     model = _model()
     with pytest.raises(AssertionError, match="injected"):
