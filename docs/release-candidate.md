@@ -3874,3 +3874,37 @@ disk exhaustion, and cgroup throttling as explanations. The result is about
 controlled regression measurement. Conversion and ONNX export remain the
 dominant work; keep the frozen gate and optimize them independently with
 artifact/quality parity before the next hosted rerun.
+
+### Optimized solver phase profile on cached SmolLM2 rows — 2026-10-09
+
+The existing exact-checkpoint-derived 256-row G64 fixture
+`/mnt/4tb/tritium-evidence/ptq-profile-fdd5bd17-exact.bin` was profiled with
+the optimized Rust test binary, without running a full-model conversion:
+
+```sh
+TRITIUM_SMOLLM2_PROFILE_FIXTURE=/mnt/4tb/tritium-evidence/ptq-profile-fdd5bd17-exact.bin \
+  cargo test --release --locked -p tritium-quantize --lib \
+  profile_smollm2_g64_p2_solver_phases -- --ignored --nocapture
+TRITIUM_SMOLLM2_PROFILE_FIXTURE=/mnt/4tb/tritium-evidence/ptq-profile-fdd5bd17-exact.bin \
+  cargo test --release --locked -p tritium-quantize --lib \
+  profile_smollm2_g64_p3_solver_phases -- --ignored --nocapture
+```
+
+For P3 with both production relay flags enabled, the mean of five 256-row
+passes was `58.444ms`: assignment `20.960ms` (35.9%), scale solving
+`10.686ms` (18.3%), reconstruction/objective `10.734ms` (18.4%), relay scale
+initialization `11.443ms` (19.6%), and other measured/uninstrumented work
+`4.621ms` (7.9%). P2 dual-relay measured `27.631ms` per 256 rows, of which
+`8.865ms` (32.1%) was relay initialization. The P2 relay-off/softened-only/
+modulated-only/dual-relay objectives remained respectively
+`0.130944935`/`0.130882743`/`0.130848182`/`0.130786244`.
+
+These are optimized local kernel-profile measurements, not a full public
+`prepare` → `calibrate` → `convert()` timing or a release-performance claim.
+The fixture is G64 while public PTQ uses G128 when geometry permits, and the
+standalone solver profile does not include public batching or recursive
+lower-plane fallback cost. The result rules out treating relay initialization
+as negligible and makes the exact assignment and relay routines the next
+semantics-preserving investigation targets. Do not change the frozen relay
+iteration schedule, basin flags, group-size recipe, or 300-second tutorial
+gate based on this profile.
