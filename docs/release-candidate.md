@@ -3497,3 +3497,28 @@ artifact and weighted MSE. An initial pair accidentally overlapped and is
 excluded. This indicates useful row-level thread scaling on the local
 i9-14900K for this layer, but it is a small sample and does not account for the
 hosted runner gap or qualify whole-model conversion.
+
+### Exact-head hosted tutorial rerun — 2026-10-09
+
+Wheel workflow [37882565847](https://github.com/Quitetall/tritium/actions/runs/37882565847)
+tested `c36fc676b21d5906117589be0f9afe42ce702091`, which contains the same
+quantizer implementation as `fdd5bd17` plus documentation-only commits. Linux,
+macOS, and Windows wheels, installed-wheel checks, the source-free Python 3.13
+tutorial, and the ABI3 matrix passed; the opt-in CUDA lane was skipped. The
+pinned SmolLM2 CPU tutorial completed the full functional path but failed its
+unchanged `300s` wall-time gate at `608.171s`. Calibration completed at
+`0.710s`, conversion at `376.087s` cumulative (`375.377s` conversion), native
+checkpoint round-trip at `399.035s`, generation at `449.399s`, ONNX export at
+`565.891s`, ONNX replay at `601.133s`, and QAT resume at `608.171s`.
+
+The runner exposed four logical CPUs and over `12 GiB` available memory and
+`81 GiB` free temporary disk in the final sample; no cgroup throttling events
+were recorded. Sampled one-minute host load peaked at `5.53`, above the four
+logical CPUs, so host contention is plausible but not proven as the cause of
+the slower result. This is another functional-but-over-budget result, not an
+OOM or disk failure. The hosted timing gate remains unchanged and failed; local
+four-thread success and single-layer scaling do not qualify the hosted wheel
+or explain the whole-model gap. The next performance work must remain matched
+to this exact tutorial and preserve the deterministic public `convert()`
+artifact; if portable CPU optimization cannot close the gap, the runner
+contract itself needs an evidence-backed ADR rather than a relaxed timeout.
