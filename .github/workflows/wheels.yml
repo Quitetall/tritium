@@ -604,8 +604,11 @@ jobs:
           --no-index --no-deps --only-binary=:all: dist/*.whl
       - name: run and validate pinned SmolLM2 CPU tutorial
         shell: bash
+        env:
+          TRITIUM_ONNX_PARITY_FAILURE_DIR: ${{ runner.temp }}/tritium-onnx-parity-failure
         run: |
           set -euo pipefail
+          mkdir -p "$TRITIUM_ONNX_PARITY_FAILURE_DIR"
           python -m unittest scripts.tests.test_qualify_smollm2_release_tutorial -v
           python -u -I scripts/qualify-smollm2-release-tutorial.py \
             --wheel dist/*.whl \
@@ -656,6 +659,14 @@ jobs:
           tutorial_status=$?
           set -e
           exit "$tutorial_status"
+      - name: retain opt-in ONNX parity diagnostic
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: smollm2-onnx-parity-diagnostic
+          path: ${{ runner.temp }}/tritium-onnx-parity-failure/**
+          if-no-files-found: ignore
+          retention-days: 7
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: smollm2-cpu-tutorial

@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import shutil
+import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -228,6 +229,46 @@ def _session_options(ort):
     # matrix. That defeats packed residency and can require tens of GiB.
     options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
     return options
+
+
+def _retain_parity_failure(
+    staging: Path,
+    diagnostic_root: Path,
+    artifact_name: str,
+    checkpoint_digest: str,
+    rtol: float,
+    atol: float,
+    error: AssertionError,
+) -> None:
+    """Retain a digest-ledgered graph only when explicitly requested."""
+
+    diagnostic_root.mkdir(parents=True, exist_ok=True)
+    destination = diagnostic_root / artifact_name
+    destination.mkdir(exist_ok=False)
+    try:
+        files = []
+        for source in sorted(staging.iterdir()):
+            if source.is_symlink() or not source.is_file():
+                raise ValueError("parity diagnostic staging contains a non-file")
+            target = destination / source.name
+            shutil.copy2(source, target)
+            digest, byte_count = _digest_file(target)
+            files.append(
+                {"file": target.name, "sha256": digest, "bytes": byte_count}
+            )
+        diagnostic = {
+            "schema_version": 1,
+            "artifact_kind": "tritium.onnx-parity-failure-diagnostic.v1",
+            "checkpoint_digest": checkpoint_digest,
+            "rtol": rtol,
+            "atol": atol,
+            "failure_type": type(error).__name__,
+            "files": files,
+        }
+        (destination / "diagnostic.json").write_bytes(_canonical(diagnostic))
+    except Exception:
+        shutil.rmtree(destination, ignore_errors=True)
+        raise
 
 
 def _export_dependencies():
@@ -622,9 +663,33 @@ def export_module_onnx(
             {name: value.detach().contiguous().numpy() for name, value in zip(names_in, inputs)},
         )
         for actual, wanted in zip(observed, expected):
-            torch.testing.assert_close(
-                torch.from_numpy(actual), wanted.detach().cpu(), rtol=rtol, atol=atol
-            )
+            try:
+                torch.testing.assert_close(
+                    torch.from_numpy(actual), wanted.detach().cpu(),
+                    rtol=rtol, atol=atol,
+                )
+            except AssertionError as error:
+                diagnostic_root = os.environ.get(
+                    "TRITIUM_ONNX_PARITY_FAILURE_DIR"
+                )
+                if diagnostic_root:
+                    try:
+                        _retain_parity_failure(
+                            staging,
+                            Path(diagnostic_root),
+                            target.name,
+                            checkpoint_digest,
+                            rtol,
+                            atol,
+                            error,
+                        )
+                    except Exception as diagnostic_error:
+                        print(
+                            "could not retain ONNX parity diagnostic: "
+                            f"{type(diagnostic_error).__name__}",
+                            file=sys.stderr,
+                        )
+                raise
         files = []
         for path in sorted(staging.iterdir()):
             if path.name == _MANIFEST:

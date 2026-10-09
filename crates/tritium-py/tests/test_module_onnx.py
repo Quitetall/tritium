@@ -1,6 +1,7 @@
 """Real ORT gates for packed generic module ONNX bundles."""
 
 import copy
+import hashlib
 import json
 
 from types import SimpleNamespace
@@ -65,6 +66,45 @@ def test_packed_onnx_runtime_disables_dense_constant_folding():
     assert (
         options.graph_optimization_level
         == ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    )
+
+
+@pytest.mark.parametrize("retain_diagnostics", [False, True])
+def test_onnx_parity_failure_can_retain_opt_in_diagnostic_graph(
+    tmp_path, monkeypatch, retain_diagnostics
+):
+    diagnostic_root = tmp_path / "diagnostics"
+    if retain_diagnostics:
+        monkeypatch.setenv("TRITIUM_ONNX_PARITY_FAILURE_DIR", str(diagnostic_root))
+    else:
+        monkeypatch.delenv("TRITIUM_ONNX_PARITY_FAILURE_DIR", raising=False)
+
+    def fail_assert_close(*args, **kwargs):
+        raise AssertionError("injected")
+
+    monkeypatch.setattr(
+        torch.testing, "assert_close", fail_assert_close
+    )
+
+    with pytest.raises(AssertionError, match="injected"):
+        export_module_onnx(_model(), torch.randn(2, 8), tmp_path / "bundle")
+
+    assert not (tmp_path / "bundle").exists()
+    if not retain_diagnostics:
+        assert not diagnostic_root.exists()
+        return
+    retained = diagnostic_root / "bundle"
+    graph = retained / "model.onnx"
+    manifest = json.loads((retained / "diagnostic.json").read_text())
+    assert manifest["schema_version"] == 1
+    assert manifest["checkpoint_digest"].startswith("sha256:")
+    assert manifest["failure_type"] == "AssertionError"
+    graph_entry = next(
+        item for item in manifest["files"] if item["file"] == "model.onnx"
+    )
+    assert (
+        "sha256:" + hashlib.sha256(graph.read_bytes()).hexdigest()
+        == graph_entry["sha256"]
     )
 
 
