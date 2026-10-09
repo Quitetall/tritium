@@ -126,6 +126,14 @@ reported artifact ID
 `sha256:e6c97ef3265a863571796a71eec08a6a792472574a0fb0e3d7b53be6705ae18c`
 and algorithm `tritium.salt-v2-joint-diagonal-catq-relays-1@1`.
 
+A follow-up local sensitivity probe held the loaded source model and data fixed
+while collecting calibration with Torch intra-op thread counts 1 and 4, then
+with MKLDNN enabled and disabled at four threads. All four receipts had the
+same activation digest and evidence ID as the repeated four-thread run above.
+This rules out those two toggles as causes on this local CPU/runtime only; it
+does not rule out CPU-vendor kernels, Torch build differences, or other hosted
+environment differences.
+
 This is positive repeatability evidence for one controlled local CPU run, not
 an explanation of the differing hosted external-data bytes: those runs may
 differ in source/build or execution environment, and their exact environment
