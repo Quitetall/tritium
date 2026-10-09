@@ -32,6 +32,27 @@ from tritium.torch import (  # noqa: E402
 from tritium.torch.module_onnx import _session_options  # noqa: E402
 
 
+def _assert_exact_packed_initializer_parity(model, graph):
+    """Hard ternary codes and narrowed scales must survive ONNX export exactly."""
+    from onnx import numpy_helper
+
+    initializers = {value.name: value for value in graph.graph.initializer}
+    for path, packed_weight in model.named_modules():
+        if not isinstance(packed_weight, AdditiveTernaryWeight):
+            continue
+        prefix = f"{path}." if path else ""
+        for plane in range(packed_weight.plane_count):
+            for field, expected in (
+                ("packed_trits", getattr(packed_weight, f"packed_trits_{plane}")),
+                ("scales", getattr(packed_weight, f"scales_{plane}")),
+            ):
+                name = f"{prefix}{field}_{plane}"
+                assert name in initializers
+                actual = numpy_helper.to_array(initializers[name])
+                assert actual.dtype == expected.detach().cpu().numpy().dtype
+                assert (actual == expected.detach().cpu().numpy()).all()
+
+
 def test_packed_onnx_runtime_disables_dense_constant_folding():
     options = _session_options(ort)
     assert (
@@ -109,6 +130,7 @@ def test_module_onnx_keeps_packed_state_runs_ort_and_supports_dynamic_batch(tmp_
     assert load_module_onnx(artifact.artifact_dir, create_session=False) == artifact
 
     graph = onnx.load(artifact.artifact_dir / "model.onnx", load_external_data=False)
+    _assert_exact_packed_initializer_parity(model, graph)
     initializers = {value.name: value for value in graph.graph.initializer}
     assert {
         f"_packed_weight.packed_trits_{index}" for index in range(3)
@@ -184,6 +206,10 @@ def test_public_facade_executes_qat_ptq_and_refinement_artifacts_in_ort(tmp_path
         tmp_path / "qat-onnx",
         example_inputs=example,
     )
+    qat_graph = onnx.load(
+        qat_bundle.artifact_dir / "model.onnx", load_external_data=False
+    )
+    _assert_exact_packed_initializer_parity(qat_hard.model, qat_graph)
     qat_runtime = load_onnx(qat_bundle.artifact_dir)
     assert qat_runtime.artifact.lineage.mode == "qat-hard"
     torch.testing.assert_close(
@@ -196,6 +222,10 @@ def test_public_facade_executes_qat_ptq_and_refinement_artifacts_in_ort(tmp_path
         model=qat_shell,
         example_inputs=example,
     )
+    reopened_graph = onnx.load(
+        reopened_bundle.artifact_dir / "model.onnx", load_external_data=False
+    )
+    _assert_exact_packed_initializer_parity(qat_hard.model, reopened_graph)
     reopened_runtime = load_onnx(reopened_bundle.artifact_dir)
     assert reopened_runtime.artifact.lineage.artifact_id == qat_artifact.artifact_id
     assert reopened_runtime.artifact.lineage.mode == "qat-hard"
