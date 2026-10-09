@@ -4411,3 +4411,37 @@ reference-hidden-input replay, this weighs against a shard-specific LM-head
 bug; it does not rule out the shared head kernel's sensitivity to its input.
 This is additional diagnostic evidence from the same captured model and input,
 not an independent run or a parity pass.
+
+#### First decoder attention-residual comparison — 2026-10-09
+
+Commit `69a469ab3074aab8f19b0505b11c7dcf1a82cf5a` adds an opt-in diagnostic
+capture of the first Llama-style decoder block's attention residual on both
+the ONNX and PyTorch paths. The focused ONNX module suite passed (`18 passed`),
+and the hosted installed-wheel job passed its public PTQ artifact test. The
+exact-source tutorial in
+[run 37942531392](https://github.com/Quitetall/tritium/actions/runs/37942531392)
+still failed the same four logits at the frozen tolerance.
+
+The new failure artifact (`11622647303`, 36,113,907 bytes; archive SHA-256
+`57f51e0be3065c048d909e9395abcf8af19ed5467a9b45de3761c19171d51ed5`;
+manifest SHA-256
+`b8afac589f7ac21f70679ac3a8d3d89db86025db2316a2792561a6830f3e2de0`) passed
+all manifest file-size and SHA-256 checks locally. It carries the same
+quantized checkpoint digest as the prior run.
+
+The captured ONNX first attention residual `add_340` differs from the
+PyTorch input to `layers[0].post_attention_layernorm` by at most
+`3.5762786865234375e-07` (maximum normalized tolerance ratio `0.001263`, zero
+violations). The first full-block residual `add_390`, compared with
+`hidden_states[1]`, differs by at most `5.7220458984375e-06` (maximum
+normalized ratio `0.02114`, zero violations). The numerical difference is
+therefore still very small at block one, but grows between the attention
+residual and the full block output. This narrows the next search to
+post-attention normalization, MLP projections/activation, and the second
+residual add; it does not identify which of those operations introduces the
+additional drift. No tolerance or inference behavior was changed.
+
+Next diagnostic: failure-only capture the first block's
+`post_attention_layernorm` output and MLP output on the reference path, plus
+the matching hidden-size ONNX values. Compare these before any solver or
+export-kernel change, then rerun the exact pinned tutorial.
