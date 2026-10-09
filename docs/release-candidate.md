@@ -3263,3 +3263,19 @@ They are not a physical WebGPU browser lane: this Linux host lacks the
 candidate-bound WebDriver/browser inputs, and Chrome is Canary rather than the
 stable release required by plan 0050. Firefox and Safari physical lanes and the
 combined three-browser receipt remain open.
+
+### Compact PTQ batch-cap experiment — 2026-10-09
+
+On branch HEAD `12f64c43` (PTQ implementation identical to `7b4163e8`; the
+worktree also contained unrelated EAT-O edits), a public `prepare` →
+`calibrate` → `convert()` probe used a seeded `Linear(2048, 576)` layer, four
+Rayon threads, and a 256 MiB working cap. With
+`MAX_COMPACT_FIT_BATCH_ROWS=4096`, three conversions
+measured `0.867s`, `0.857s`, and `0.868s` (median `0.867s`). Temporarily raising
+the internal row cap to `16384` measured `0.896s`, `0.872s`, and `0.880s`
+(median `0.880s`). All six trit/scale digests and weighted objectives matched
+exactly, but the larger cap was about 1.4% slower, so the constant was restored
+to `4096`. After restoration, the public PTQ artifact suite passed
+(`35 passed, 4 skipped`) and the 8,192×64 parallel-conversion test passed
+(`3.48×` four-thread speedup, identical fitted artifact). This rejects the
+larger-cap tuning for this fixture; it is not full-model timing evidence.
