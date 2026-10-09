@@ -349,7 +349,26 @@ def test_qat_threshold_codes_survive_hard_export_and_onnx_reload(
         # exactly on torch.round's ties-to-even zero code.
         assert expected_trits[:, 0].tolist() == [0, 0, 0]
 
+    prepared.model.eval()
+    source_input = torch.ones((2, 2), dtype=source_dtype)
+    live_hard_output = prepared.model(source_input)
     hard = convert(prepared)
+    torch.testing.assert_close(
+        hard.model(source_input), live_hard_output, rtol=0, atol=0
+    )
+    expected_packed = AdditiveTernaryWeight(projection.planes)
+    for field in ("packed_trits_0", "scales_0"):
+        expected_bytes = (
+            getattr(expected_packed, field).detach().cpu().numpy().tobytes()
+        )
+        actual_bytes = (
+            getattr(hard.model.packed_weight, field)
+            .detach()
+            .cpu()
+            .numpy()
+            .tobytes()
+        )
+        assert actual_bytes == expected_bytes
     bundle = export_onnx(
         hard,
         tmp_path / f"qat-boundary-{str(source_dtype).split('.')[-1]}",
