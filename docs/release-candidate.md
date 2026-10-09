@@ -3951,3 +3951,27 @@ separate-source run (`564.266s`); this is not controlled evidence of a
 performance change. Wheel builds, installed-wheel smoke, source-free tutorial,
 and ABI3 cells passed; CUDA was skipped. This run predates the assignment
 reconstruction reuse change and does not measure it.
+
+### Exact-head hosted tutorial after assignment-reconstruction reuse — 2026-10-09
+
+Hosted wheels workflow
+[37900294298](https://github.com/Quitetall/tritium/actions/runs/37900294298)
+ran exact source revision `d0d9cbbd8f8960d31a2086cedf2b0ea74729985d`. The
+pinned SmolLM2 CPU tutorial completed every functional phase, but the release
+gate rejected its `563.814s` total against the unchanged `300s` budget, a
+`263.814s` overrun. Stage markers recorded calibration at `0.604s`, conversion
+at `341.168s` (`340.564s` after calibration), native checkpoint round-trip at
+`361.850s`, generation at `404.756s`, ONNX export at `531.509s`, ONNX replay
+at `556.860s`, and QAT resume at `563.814s`. No qualification receipt was
+published.
+
+The hosted runner exposed four logical CPUs, at least `11.1 GiB` available
+memory, at least `81.7 GiB` temporary disk, and zero sampled cgroup CPU-throttle
+periods. There is no observed OOM, disk exhaustion, or CPU throttling to explain
+the failure. The total is `0.141s` below the separate `563.955s` run on
+`d9951794`; this uncontrolled difference does not establish a speedup from
+commit `d0d9cbbd`. CI run [37900294261](https://github.com/Quitetall/tritium/actions/runs/37900294261)
+passed. macOS, Linux and Windows CPU wheels, the source-free tutorial,
+installed-wheel smoke and all ABI3 matrix cells passed in the wheels workflow;
+the CUDA wheel lane was skipped. The frozen tutorial gate remains open, with
+conversion and ONNX export still the dominant timed stages.
