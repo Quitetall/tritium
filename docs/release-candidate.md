@@ -4151,3 +4151,26 @@ do not change the frozen tolerance or infer a general hardware-specific cause
 from the available samples. Next diagnostic: localize the full-model difference
 to intermediate graph boundaries, then rerun the exact hosted tutorial after a
 source-backed correction.
+
+### Retained exact-head parity graph — 2026-10-09
+
+The next run, [37930189844](https://github.com/Quitetall/tritium/actions/runs/37930189844)
+for commit `2152c3a8`, exercised the opt-in failure capture. The pinned tutorial
+again failed at whole-model ONNX CPU parity: 4 of 344,064 logits, maximum
+absolute difference `0.00010919570922851562`, and maximum relative difference
+`1.7615385055541992` at output index `(0, 0, 34041)`. The runner was a 4-vCPU
+AMD EPYC 9V74 80-Core Processor with about 14 GiB available memory, over 80 GiB
+temporary disk, and no CPU throttling. Conversion and native checkpoint replay
+completed; the failure is still numerical parity, not resource exhaustion.
+
+GitHub artifact `smollm2-onnx-parity-diagnostic` (29,196,868 bytes, seven-day
+retention) was downloaded and independently hash-checked. Its ONNX graph is
+47,492,097 bytes (`sha256:15a9b51b73ef991b4d8e1080ef872f090d19920f142dc47bf0eb4a8bb1022877`);
+external data is 30,828,135 bytes
+(`sha256:5a8c3e5330da8e5a57ea2f0af81502aacbccbd43a1ed192fc8ea97afc860103b`).
+Static graph inspection found 23,676 opset-18 nodes, 483 external initializers,
+and logits shaped `[1, sequence, 49152]`. This capture omitted replay inputs and
+reference/observed output tensors, so it is not sufficient to reproduce the
+failure offline by itself. The next diagnostic revision adds those bounded
+replay tensors to the failure-only ledger; it must remain opt-in and must not
+change the frozen tolerance.

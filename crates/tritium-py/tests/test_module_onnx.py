@@ -86,8 +86,10 @@ def test_onnx_parity_failure_can_retain_opt_in_diagnostic_graph(
         torch.testing, "assert_close", fail_assert_close
     )
 
+    model = _model()
+    replay = torch.randn(2, 8)
     with pytest.raises(AssertionError, match="injected"):
-        export_module_onnx(_model(), torch.randn(2, 8), tmp_path / "bundle")
+        export_module_onnx(model, replay, tmp_path / "bundle")
 
     assert not (tmp_path / "bundle").exists()
     if not retain_diagnostics:
@@ -106,6 +108,23 @@ def test_onnx_parity_failure_can_retain_opt_in_diagnostic_graph(
         "sha256:" + hashlib.sha256(graph.read_bytes()).hexdigest()
         == graph_entry["sha256"]
     )
+    arrays = manifest["replay_arrays"]
+    assert [item["role"] for item in arrays] == [
+        "input", "expected-output", "observed-output"
+    ]
+    input_entry, expected_entry, observed_entry = arrays
+    assert input_entry["shape"] == [2, 8]
+    assert (retained / input_entry["file"]).read_bytes() == (
+        replay.numpy().tobytes(order="C")
+    )
+    assert (retained / expected_entry["file"]).read_bytes() == (
+        model(replay).detach().numpy().tobytes(order="C")
+    )
+    for item in arrays:
+        payload = (retained / item["file"]).read_bytes()
+        assert len(payload) == item["bytes"]
+        assert "sha256:" + hashlib.sha256(payload).hexdigest() == item["sha256"]
+    assert observed_entry["shape"] == [2, 2]
 
 
 def _model():

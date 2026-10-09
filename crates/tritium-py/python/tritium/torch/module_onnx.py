@@ -239,8 +239,12 @@ def _retain_parity_failure(
     rtol: float,
     atol: float,
     error: AssertionError,
+    input_names: Sequence[str],
+    inputs: Sequence[Tensor],
+    observed: Sequence[Any],
+    expected: Sequence[Tensor],
 ) -> None:
-    """Retain a digest-ledgered graph only when explicitly requested."""
+    """Retain a digest-ledgered graph and replay tensors when opted in."""
 
     diagnostic_root.mkdir(parents=True, exist_ok=True)
     destination = diagnostic_root / artifact_name
@@ -256,6 +260,44 @@ def _retain_parity_failure(
             files.append(
                 {"file": target.name, "sha256": digest, "bytes": byte_count}
             )
+        arrays = []
+        diagnostic_values = [
+            ("input", name, value)
+            for name, value in zip(input_names, inputs)
+        ]
+        diagnostic_values.extend(
+            ("expected-output", str(index), value)
+            for index, value in enumerate(expected)
+        )
+        diagnostic_values.extend(
+            ("observed-output", str(index), value)
+            for index, value in enumerate(observed)
+        )
+        for index, (role, name, value) in enumerate(diagnostic_values):
+            if isinstance(value, Tensor):
+                tensor = value.detach().cpu().contiguous()
+                payload = tensor.reshape(-1).view(torch.uint8).numpy().tobytes()
+                dtype = str(tensor.dtype)
+                shape = list(tensor.shape)
+            else:
+                payload = value.tobytes(order="C")
+                dtype = str(value.dtype)
+                shape = list(value.shape)
+            filename = f"replay-{index:03d}.bin"
+            array_path = destination / filename
+            array_path.write_bytes(payload)
+            digest = "sha256:" + hashlib.sha256(payload).hexdigest()
+            arrays.append(
+                {
+                    "role": role,
+                    "name": name,
+                    "file": filename,
+                    "dtype": dtype,
+                    "shape": shape,
+                    "sha256": digest,
+                    "bytes": len(payload),
+                }
+            )
         diagnostic = {
             "schema_version": 1,
             "artifact_kind": "tritium.onnx-parity-failure-diagnostic.v1",
@@ -264,6 +306,7 @@ def _retain_parity_failure(
             "atol": atol,
             "failure_type": type(error).__name__,
             "files": files,
+            "replay_arrays": arrays,
         }
         (destination / "diagnostic.json").write_bytes(_canonical(diagnostic))
     except Exception:
@@ -682,6 +725,10 @@ def export_module_onnx(
                             rtol,
                             atol,
                             error,
+                            names_in,
+                            inputs,
+                            observed,
+                            expected,
                         )
                     except Exception as diagnostic_error:
                         print(
