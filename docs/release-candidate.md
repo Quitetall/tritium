@@ -4445,3 +4445,35 @@ Next diagnostic: failure-only capture the first block's
 `post_attention_layernorm` output and MLP output on the reference path, plus
 the matching hidden-size ONNX values. Compare these before any solver or
 export-kernel change, then rerun the exact pinned tutorial.
+
+#### First decoder MLP-path comparison — 2026-10-09
+
+The follow-up capture in commit `f327be170e3af683209eb07cf3697d795ae5026c`
+passed the Linux, macOS arm64, and Windows x64 wheel builds, and the hosted
+installed-wheel public PTQ artifact test passed. The pinned tutorial in
+[run 37944234191](https://github.com/Quitetall/tritium/actions/runs/37944234191)
+still failed at ONNX parity with the same 4 of 344,064 logits outside the
+unchanged tolerance.
+
+The failure artifact (`11622579947`, 36,220,278 bytes; archive SHA-256
+`b77d0d9bf3b54062436f3a9ad2a745f1b0f874c8b0673eab56fe049290c2eb17`; manifest
+SHA-256 `20e906c662363ed99f2a3c849058a816bbbca78eb91ca08d424007c92eacedb6`)
+passed local byte-count and SHA-256 verification. It binds the same quantized
+checkpoint digest as the preceding diagnostic.
+
+The mapped first-block values are:
+
+| Boundary | ONNX value | PyTorch value | Maximum absolute difference | Tolerance failures |
+|---|---|---|---:|---:|
+| Attention residual | `add_340` | `layers[0].attention_residual` | `3.5762786865234375e-07` | 0 |
+| Post-attention norm output | `mul_381` | `layers[0].post_attention_layernorm.output` | `4.023313522338867e-07` | 0 |
+| MLP output | `linear_6` | `layers[0].mlp.output` | `4.76837158203125e-06` | 0 |
+| Block output | `add_390` | `hidden_states[1]` | `5.7220458984375e-06` | 0 |
+
+This makes the post-attention norm an unlikely source of the larger first-block
+drift: its output is nearly identical, while the MLP output differs by about
+an order of magnitude more. The MLP branch therefore adds measurable but
+in-tolerance drift in block zero. Its gate/up projections, activation, and
+down projection were not separately compared, so the responsible operation
+remains unknown. Next capture and compare the gate/up projection outputs and
+activation before changing numerical kernels or release tolerances.
