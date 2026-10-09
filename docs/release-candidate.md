@@ -3081,3 +3081,26 @@ BF16-input ONNX Runtime limitation was avoided by running the exported compact
 artifact with FP32 activations; it is not evidence for BF16 runtime operators.
 This is tiny source-tree functional evidence only, not whole-model quality,
 candidate-wheel, or release qualification.
+
+### Exact-head browser package prerequisites — 2026-10-08
+
+On clean source revision `df14566869b10246ceee4b014eb690606c245767`, the
+`@tritium-ai/web@1.1.0-rc.2` package gate passed locally with 145 tests and
+zero skips. Its source-free offline npm archive receipt is
+`sha256:db55fea699a9316f3d5f647c41e063c8febbb03556185a28abadebafec01b473`;
+the archive is SHA-256
+`2baa1a628ef80290cce954f73ba58b13a17b5e0c0e22237de3ce1a1e67f83dec`.
+The same exact source produced the native CPU reference receipt
+`sha256:e84e871399076c4860342c46a2213c8b0b0fbed31f10b4f95c849816cd8f2dd3`,
+with `native.salt` SHA-256
+`6e889858c06a7eb91133f69a948ab8356a444c677eecd9e800ec689380a6e17e`.
+Both evidence bundles are retained at
+`/mnt/2tb/tritium-release-evidence/web-df145668/`.
+
+This does not qualify browser WebGPU. A local ChromeDriver endpoint was not
+available. The RTX 4090 also had 20,191 MiB allocated, 3,950 MiB free, and 36%
+utilization at inspection, so the exclusive-device browser lane was not
+started against an active shared GPU workload. Physical Firefox and physical
+macOS Safari lanes remain separately required. The Chrome lane can be attempted
+after a compatible local WebDriver is available and exclusive GPU use is safe;
+the three-lane candidate receipt remains open.
