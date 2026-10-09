@@ -11,17 +11,27 @@ class _Native:
     mtp_verified = True
 
     @staticmethod
-    def reference_language(transactions, max_context):
+    def reference_language(transactions, max_context, *, include_states=False,
+                           max_state_bytes=268435456, state_steps=None):
         assert max_context >= sum(len(value) for value in transactions)
-        return [
-            SimpleNamespace(
+        outputs = []
+        committed = []
+        for index, tokens in enumerate(transactions):
+            committed.extend(tokens)
+            selected = include_states and (state_steps is None or index in state_steps)
+            outputs.append(SimpleNamespace(
                 token_ids=list(tokens),
                 last_logits=[0.25, 0.75],
                 final_hidden_states=[0.5, -0.5] * len(tokens),
                 hidden_size=2,
-            )
-            for tokens in transactions
-        ]
+                state_names=["present_k.0"] if selected else [],
+                state_shapes=[[1, len(committed)]] if selected else [],
+                states=[list(map(float, committed))] if selected else [],
+            ))
+        assert not include_states or max_state_bytes >= sum(
+            len(output.states[0]) * 4 for output in outputs if output.states
+        )
+        return outputs
 
     @staticmethod
     def generate(prompt, max_new_tokens):
@@ -46,10 +56,13 @@ class _Native:
 class _Ort:
     @staticmethod
     def __call__(tokens, past_key_values=None):
-        del past_key_values
+        state = tokens.to(dtype=torch.float32)
+        if past_key_values is not None:
+            state = torch.cat((past_key_values[0], state), dim=1)
         return SimpleNamespace(
             logits=torch.tensor([[[0.25, 0.75]]], dtype=torch.float32),
-            past_key_values=(tokens.to(dtype=torch.float32),),
+            past_key_values=(state,),
+            state_names=("present_k.0",),
         )
 
     @staticmethod
@@ -239,9 +252,64 @@ def test_language_replay_does_not_certify_invalid_cache(state):
             result.past_key_values = state
             return result
 
-    cases = qualify_onnx._language_cases(_Native(), InvalidCacheOrt())
-    assert all(
-        not case["states_exact"]
-        for case in cases
-        if case["kind"] in {"prompt", "cached-decode"}
-    )
+    with pytest.raises(qualify_onnx.OnnxQualificationError, match="cache"):
+        qualify_onnx._language_cases(_Native(), InvalidCacheOrt())
+
+
+def test_native_cache_comparison_measures_drift_despite_identical_logits_and_replay():
+    reference = _Native.reference_language([[1, 2]], 3, include_states=True)[0]
+    observed = _Ort()(torch.tensor([[1, 2]]))
+    observed.past_key_values = (observed.past_key_values[0] + 0.125,)
+    assert qualify_onnx._native_state_error(reference, observed) == 0.125
+
+
+@pytest.mark.parametrize("field,value", [
+    ("state_names", []),
+    ("state_names", ["present_v.0"]),
+    ("state_names", [True]),
+    ("state_shapes", [[2, 1]]),
+    ("state_shapes", [[True, 2]]),
+    ("states", []),
+    ("states", [[float("nan"), 2.0]]),
+    ("states", [[1.0]]),
+])
+def test_native_cache_comparison_rejects_missing_or_malformed_observations(field, value):
+    reference = _Native.reference_language([[1, 2]], 3, include_states=True)[0]
+    setattr(reference, field, value)
+    observed = _Ort()(torch.tensor([[1, 2]]))
+    with pytest.raises(qualify_onnx.OnnxQualificationError, match="cache"):
+        qualify_onnx._native_state_error(reference, observed)
+
+
+def test_language_cases_include_native_decode_cache_error_in_frozen_tolerance():
+    class DriftedOrt(_Ort):
+        @staticmethod
+        def __call__(tokens, past_key_values=None):
+            result = _Ort.__call__(tokens, past_key_values)
+            if past_key_values is not None:
+                result.past_key_values = (result.past_key_values[0] + 0.125,)
+            return result
+
+    cases = qualify_onnx._language_cases(_Native(), DriftedOrt())
+    assert [case["max_abs_error"] for case in cases] == [0, 0.125, 0.125] * 2
+    assert all(case["states_exact"] for case in cases)  # replay is exact, native isn't
+    assert all(case["tolerance"] == 1e-3 for case in cases)
+
+
+def test_language_worker_selects_decode_only_to_fit_the_qwen_snapshot_budget():
+    class RecordingNative(_Native):
+        calls = []
+
+        @classmethod
+        def reference_language(cls, transactions, max_context, **kwargs):
+            cls.calls.append((transactions, kwargs))
+            return _Native.reference_language(transactions, max_context, **kwargs)
+
+    qualify_onnx._language_cases(RecordingNative(), _Ort())
+    assert len(RecordingNative.calls) == 4
+    for transactions, kwargs in RecordingNative.calls:
+        assert kwargs["include_states"] is True
+        if len(transactions) == 2:
+            assert kwargs["state_steps"] == [1]
+        else:
+            assert "state_steps" not in kwargs

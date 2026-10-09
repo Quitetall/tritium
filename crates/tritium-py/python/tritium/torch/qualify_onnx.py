@@ -118,6 +118,41 @@ def _states_equal(left: Sequence[torch.Tensor], right: Sequence[torch.Tensor]) -
     )
 
 
+def _native_state_error(reference: Any, observed: Any) -> float:
+    """Compare executed native observations with the actual ONNX cache outputs."""
+    names = getattr(reference, "state_names", None)
+    shapes = getattr(reference, "state_shapes", None)
+    values = getattr(reference, "states", None)
+    observed_names = getattr(observed, "state_names", None)
+    observed_states = getattr(observed, "past_key_values", None)
+    inventories = (names, shapes, values, observed_names, observed_states)
+    if any(not isinstance(value, (list, tuple)) or not value for value in inventories):
+        raise OnnxQualificationError("native/ONNX cache observations are missing")
+    if (
+        len({len(value) for value in inventories}) != 1
+        or any(type(name) is not str or not name for name in names)
+        or len(set(names)) != len(names)
+        or tuple(names) != tuple(observed_names)
+    ):
+        raise OnnxQualificationError("native/ONNX cache inventory differs")
+    errors: list[float] = []
+    for shape, payload, state in zip(shapes, values, observed_states, strict=True):
+        if (
+            not _valid_state(state)
+            or not isinstance(shape, (list, tuple))
+            or not shape
+            or any(type(axis) is not int or axis <= 0 for axis in shape)
+            or tuple(shape) != tuple(state.shape)
+            or not isinstance(payload, (list, tuple))
+            or len(payload) != state.numel()
+            or any(type(value) not in (int, float) or not math.isfinite(value)
+                   for value in payload)
+        ):
+            raise OnnxQualificationError("native/ONNX cache geometry or values are invalid")
+        errors.append(_maximum_error(payload, state.flatten().tolist()))
+    return max(errors)
+
+
 def _greedy(values: Sequence[float]) -> int:
     if not values:
         raise OnnxQualificationError("cannot select a token from empty logits")
@@ -159,11 +194,18 @@ def _language_cases(native: Any, ort_model: Any) -> list[dict[str, Any]]:
     cases: list[dict[str, Any]] = []
     for ordinal, raw_prompt in enumerate(PROMPTS):
         prompt = list(raw_prompt)
-        reference = native.reference_language([prompt], len(prompt) + 8)[0]
+        reference = native.reference_language(
+            [prompt], len(prompt) + 8, include_states=True
+        )[0]
         observed = ort_model(torch.tensor([prompt], dtype=torch.int64))
         replay = ort_model(torch.tensor([prompt], dtype=torch.int64))
         logits = observed.logits[0, -1].tolist()
-        error = _maximum_error(reference.last_logits, logits)
+        error = max(
+            _maximum_error(reference.last_logits, logits),
+            _maximum_error(reference.last_logits, replay.logits[0, -1].tolist()),
+            _native_state_error(reference, observed),
+            _native_state_error(reference, replay),
+        )
         tokens_exact = list(reference.token_ids) == prompt
         states_exact = _states_equal(observed.past_key_values, replay.past_key_values)
         output_exact = _greedy(reference.last_logits) == _greedy(logits)
@@ -180,7 +222,8 @@ def _language_cases(native: Any, ort_model: Any) -> list[dict[str, Any]]:
 
         next_token = _greedy(reference.last_logits)
         native_steps = native.reference_language(
-            [prompt, [next_token]], len(prompt) + 8
+            [prompt, [next_token]], len(prompt) + 8, include_states=True,
+            state_steps=[1],
         )
         continuation = ort_model(
             torch.tensor([[next_token]], dtype=torch.int64),
@@ -192,7 +235,14 @@ def _language_cases(native: Any, ort_model: Any) -> list[dict[str, Any]]:
             past_key_values=replay_prompt.past_key_values,
         )
         continued_logits = continuation.logits[0, -1].tolist()
-        continued_error = _maximum_error(native_steps[-1].last_logits, continued_logits)
+        continued_error = max(
+            _maximum_error(native_steps[-1].last_logits, continued_logits),
+            _maximum_error(native_steps[-1].last_logits,
+                           replay_continuation.logits[0, -1].tolist()),
+            _native_state_error(native_steps[-1], continuation),
+            _native_state_error(native_steps[-1], replay_continuation),
+            _native_state_error(reference, replay_prompt),
+        )
         cases.append(
             _case(
                 "cached-decode",

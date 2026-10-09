@@ -5,7 +5,10 @@ use std::sync::Mutex;
 
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use tritium_nn::{Qwen35SaltV2LanguageMtpModel, Qwen35SaltV2LoadReceipt};
+use tritium_nn::{
+    QWEN35_REFERENCE_STATE_MAX_BYTES, Qwen35ReferenceState, Qwen35SaltV2LanguageMtpModel,
+    Qwen35SaltV2LoadReceipt,
+};
 use tritium_spec::TernaryBackend;
 
 /// Immutable identities, coverage, and physical ledgers for a packed Qwen load.
@@ -231,9 +234,9 @@ pub(crate) struct QwenModel {
 
 /// One native packed-language oracle transaction.
 ///
-/// Exposes only published numeric outputs. Cache internals and runner identity
-/// remain opaque, so callers can compare ONNX prompt/decode semantics without
-/// manufacturing native cache state or bypassing MTP promotion.
+/// Exposes published numeric outputs and optional owned cache observations.
+/// Mutable cache handles and runner identity remain opaque; observations cannot
+/// manufacture native state or bypass MTP promotion.
 #[pyclass(module = "tritium", frozen, skip_from_py_object)]
 #[derive(Clone)]
 pub(crate) struct QwenReferenceLanguageOutput {
@@ -242,6 +245,7 @@ pub(crate) struct QwenReferenceLanguageOutput {
     hidden_size: usize,
     final_hidden_states: Vec<f32>,
     last_logits: Vec<f32>,
+    reference_states: Vec<Qwen35ReferenceState>,
 }
 
 #[pymethods]
@@ -269,6 +273,33 @@ impl QwenReferenceLanguageOutput {
     #[getter]
     fn last_logits(&self) -> Vec<f32> {
         self.last_logits.clone()
+    }
+
+    /// Canonical graph output names; empty unless observations were requested.
+    #[getter]
+    fn state_names(&self) -> Vec<String> {
+        self.reference_states
+            .iter()
+            .map(|state| state.name().to_owned())
+            .collect()
+    }
+
+    /// Axes in the same order as `state_names`.
+    #[getter]
+    fn state_shapes(&self) -> Vec<Vec<usize>> {
+        self.reference_states
+            .iter()
+            .map(|state| state.shape().to_vec())
+            .collect()
+    }
+
+    /// Independent flattened FP32 copies, never mutable cache handles.
+    #[getter]
+    fn states(&self) -> Vec<Vec<f32>> {
+        self.reference_states
+            .iter()
+            .map(|state| state.values().to_vec())
+            .collect()
     }
 }
 
@@ -377,14 +408,26 @@ impl QwenModel {
     /// exactly one token. This is a qualification oracle, not a mutable cache
     /// escape hatch. MTP stays unavailable until its production oracle promotes
     /// the loaded graph.
-    #[pyo3(signature = (transactions, max_context))]
+    /// `include_states` is opt-in. All transactions share `max_state_bytes`
+    /// (1..=256 MiB) for retained FP32 values, excluding Python getter copies.
+    /// `state_steps` optionally selects transaction indices (default: all).
+    /// Device-owned DeltaNet state cannot be observed through stale host buffers.
+    #[pyo3(signature = (transactions, max_context, *, include_states = false, max_state_bytes = 268_435_456, state_steps = None))]
     fn reference_language(
         &self,
         py: Python<'_>,
         transactions: Vec<Vec<i64>>,
         max_context: usize,
+        include_states: bool,
+        max_state_bytes: usize,
+        state_steps: Option<Vec<usize>>,
     ) -> PyResult<Vec<QwenReferenceLanguageOutput>> {
+        let mut state_budget = ReferenceStateBudget::new(include_states, max_state_bytes)
+            .map_err(PyValueError::new_err)?;
         let (transactions, required_context) = reference_transactions(transactions)?;
+        let selected_states =
+            reference_state_steps(include_states, state_steps, transactions.len())
+                .map_err(PyValueError::new_err)?;
         if max_context < required_context {
             return Err(PyValueError::new_err(format!(
                 "max_context {max_context} is smaller than transaction length {required_context}"
@@ -403,16 +446,35 @@ impl QwenModel {
             outputs.try_reserve_exact(transactions.len()).map_err(|_| {
                 PyRuntimeError::new_err("could not allocate Qwen reference output table")
             })?;
-            for tokens in transactions {
+            for (step, tokens) in transactions.into_iter().enumerate() {
                 let output = runner
                     .forward(&tokens, &mut cache)
                     .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+                let reference_states = if selected_states[step] {
+                    let remaining = state_budget.remaining.ok_or_else(|| {
+                        PyRuntimeError::new_err("cache observation budget is not enabled")
+                    })?;
+                    let states = runner
+                        .reference_states(&cache, remaining)
+                        .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+                    let bytes = states
+                        .iter()
+                        .map(|state| state.values().len() * size_of::<f32>())
+                        .sum();
+                    state_budget
+                        .consume(bytes)
+                        .map_err(PyRuntimeError::new_err)?;
+                    states
+                } else {
+                    Vec::new()
+                };
                 outputs.push(QwenReferenceLanguageOutput {
                     position_start: output.position_start(),
                     token_ids: tokens,
                     hidden_size: output.hidden_size(),
                     final_hidden_states: output.final_hidden_states().to_vec(),
                     last_logits: output.last_logits().to_vec(),
+                    reference_states,
                 });
             }
             Ok(outputs)
@@ -552,6 +614,63 @@ fn reference_transactions(transactions: Vec<Vec<i64>>) -> PyResult<(Vec<Vec<u32>
     Ok((converted, total))
 }
 
+struct ReferenceStateBudget {
+    remaining: Option<usize>,
+}
+
+fn reference_state_steps(
+    enabled: bool,
+    steps: Option<Vec<usize>>,
+    count: usize,
+) -> Result<Vec<bool>, String> {
+    if !enabled && steps.is_some() {
+        return Err("state_steps requires include_states=True".to_owned());
+    }
+    let mut selected = Vec::new();
+    selected
+        .try_reserve_exact(count)
+        .map_err(|_| "could not allocate cache observation selection".to_owned())?;
+    selected.resize(count, enabled && steps.is_none());
+    if let Some(steps) = steps {
+        if steps.is_empty() {
+            return Err("state_steps must not be empty".to_owned());
+        }
+        for step in steps {
+            let value = selected
+                .get_mut(step)
+                .ok_or_else(|| "state_steps index is outside transactions".to_owned())?;
+            if *value {
+                return Err("state_steps must not contain duplicate indices".to_owned());
+            }
+            *value = true;
+        }
+    }
+    Ok(selected)
+}
+
+impl ReferenceStateBudget {
+    fn new(enabled: bool, bytes: usize) -> Result<Self, String> {
+        if enabled && (bytes == 0 || bytes > QWEN35_REFERENCE_STATE_MAX_BYTES) {
+            return Err(format!(
+                "max_state_bytes must be in 1..={QWEN35_REFERENCE_STATE_MAX_BYTES}"
+            ));
+        }
+        Ok(Self {
+            remaining: enabled.then_some(bytes),
+        })
+    }
+
+    fn consume(&mut self, bytes: usize) -> Result<(), String> {
+        if let Some(remaining) = self.remaining {
+            self.remaining =
+                Some(remaining.checked_sub(bytes).ok_or_else(|| {
+                    "aggregate Qwen cache observation budget exceeded".to_owned()
+                })?);
+        }
+        Ok(())
+    }
+}
+
 fn greedy_token(logits: &[f32]) -> Result<u32, String> {
     let (&first, remaining) = logits
         .split_first()
@@ -575,7 +694,43 @@ fn greedy_token(logits: &[f32]) -> Result<u32, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{greedy_token, parse_device, reference_transactions};
+    use super::{
+        ReferenceStateBudget, greedy_token, parse_device, reference_state_steps,
+        reference_transactions,
+    };
+
+    #[test]
+    fn state_selection_can_observe_decode_without_retaining_prefill() {
+        assert_eq!(
+            reference_state_steps(false, None, 2).unwrap(),
+            [false, false]
+        );
+        assert_eq!(reference_state_steps(true, None, 2).unwrap(), [true, true]);
+        assert_eq!(
+            reference_state_steps(true, Some(vec![1]), 2).unwrap(),
+            [false, true]
+        );
+        for steps in [vec![], vec![2], vec![1, 1]] {
+            assert!(reference_state_steps(true, Some(steps), 2).is_err());
+        }
+        assert!(reference_state_steps(false, Some(vec![1]), 2).is_err());
+    }
+
+    #[test]
+    fn reference_state_budget_is_opt_in_and_shared_across_transactions() {
+        let disabled = ReferenceStateBudget::new(false, 0).unwrap();
+        assert_eq!(disabled.remaining, None);
+        assert!(ReferenceStateBudget::new(true, 0).is_err());
+        assert!(ReferenceStateBudget::new(true, 268_435_457).is_err());
+        let mut budget = ReferenceStateBudget::new(true, 544).unwrap();
+        budget.consume(256).unwrap();
+        assert_eq!(budget.remaining, Some(288));
+        assert!(budget.consume(289).is_err());
+        assert_eq!(budget.remaining, Some(288));
+        budget.consume(288).unwrap();
+        assert_eq!(budget.remaining, Some(0));
+        assert!(budget.consume(1).is_err());
+    }
 
     #[test]
     fn greedy_token_uses_first_maximum_and_rejects_nonfinite_logits() {

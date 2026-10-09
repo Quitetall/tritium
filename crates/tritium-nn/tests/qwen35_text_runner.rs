@@ -192,6 +192,71 @@ fn exact_runner() -> Qwen35TextRunner {
     .unwrap()
 }
 
+#[test]
+fn reference_states_preserve_hybrid_layout_and_owned_prefill() {
+    let runner = exact_runner();
+    let mut cache = runner.new_cache(8).unwrap();
+    runner.forward(&[1, 4, 2], &mut cache).unwrap();
+    let states = runner.reference_states(&cache, 256).unwrap();
+    assert_eq!(
+        states.iter().map(|state| state.name()).collect::<Vec<_>>(),
+        [
+            "next_conv.0",
+            "next_recurrent.0",
+            "present_k.1",
+            "present_v.1"
+        ]
+    );
+    assert_eq!(
+        states
+            .iter()
+            .map(|state| state.shape().to_vec())
+            .collect::<Vec<_>>(),
+        [vec![8, 4], vec![2, 2, 2], vec![3, 1, 4], vec![3, 1, 4]]
+    );
+    assert_eq!(
+        states
+            .iter()
+            .map(|state| state.values().len())
+            .sum::<usize>(),
+        64
+    );
+    assert!(
+        states
+            .iter()
+            .flat_map(|state| state.values())
+            .all(|v| v.is_finite())
+    );
+    let frozen = states.clone();
+    runner.forward(&[6], &mut cache).unwrap();
+    let decoded = runner.reference_states(&cache, 288).unwrap();
+    assert_eq!(decoded[2].shape(), [4, 1, 4]);
+    assert_eq!(decoded[2].values()[..12], states[2].values()[..]);
+    assert_ne!(decoded[0], states[0]);
+    cache.reset();
+    assert_eq!(states, frozen);
+    assert!(runner.reference_states(&cache, 256).is_err());
+}
+
+#[test]
+fn reference_states_enforce_budget_and_exact_runner_provenance() {
+    let runner = exact_runner();
+    let other = exact_runner();
+    let mut cache = runner.new_cache(8).unwrap();
+    assert!(runner.reference_states(&cache, 256).is_err());
+    runner.forward(&[1, 4, 2], &mut cache).unwrap();
+    for budget in [0, 255, 268_435_457] {
+        assert!(runner.reference_states(&cache, budget).is_err());
+    }
+    assert!(matches!(
+        other.reference_states(&cache, 256),
+        Err(NnError::Provenance(_))
+    ));
+    assert_eq!(cache.len(), 3);
+    let retry = runner.reference_states(&cache, 256).unwrap();
+    assert_eq!(runner.reference_states(&cache, 256).unwrap(), retry);
+}
+
 fn runner_with_host_qkv() -> Qwen35TextRunner {
     let tensor = SaltV2Tensor::new(
         "qkv",

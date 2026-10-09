@@ -11,6 +11,8 @@ use std::sync::Arc;
 use tritium_format::salt_v2_package::SaltV2ScaleUpdate;
 use tritium_spec::TernaryBackend;
 
+use super::qwen35_reference::{Qwen35ReferenceState, ReferenceStateView, snapshot_states};
+
 use crate::error::NnError;
 use crate::layers::{
     Projection, ProjectionActivationMode, Qwen35DeltaNet, Qwen35DeltaNetCache,
@@ -1157,6 +1159,91 @@ impl Qwen35TextRunner {
         })
     }
 
+    /// Observe committed hybrid state in canonical ONNX graph output order.
+    ///
+    /// Owns immutable FP32 copies, bounded by `max_state_bytes` (1..=256 MiB
+    /// of values). Never advances or lends out mutable cache state. Device-owned
+    /// DeltaNet recurrence is rejected, not read from stale host buffers.
+    /// Observations are numeric evidence, not qualification receipts.
+    ///
+    /// # Errors
+    /// Returns [`NnError::Provenance`] for a foreign cache, or
+    /// [`NnError::Backend`] for empty/inconsistent/device-owned/non-finite state,
+    /// invalid budgets or allocation errors. No partial observation is returned.
+    pub fn reference_states(
+        &self,
+        cache: &Qwen35TextCache,
+        max_state_bytes: usize,
+    ) -> Result<Vec<Qwen35ReferenceState>, NnError> {
+        if !Arc::ptr_eq(&cache.runner_identity, &self.identity) {
+            return Err(NnError::Provenance(
+                "Qwen cache observation received a foreign runner cache".to_owned(),
+            ));
+        }
+        self.validate_cache_layers(cache)?;
+        if cache.is_empty()
+            || cache.len() > cache.max_context
+            || cache.max_context > self.max_context
+        {
+            return Err(NnError::Backend(
+                "Qwen cache observation requires a nonempty committed cursor".to_owned(),
+            ));
+        }
+        let mut views = Vec::new();
+        views
+            .try_reserve_exact(checked_mul(
+                cache.layers.len(),
+                2,
+                "cache observation table",
+            )?)
+            .map_err(|error| {
+                NnError::Backend(format!("allocate Qwen cache observation table: {error}"))
+            })?;
+        for (index, layer) in cache.layers.iter().enumerate() {
+            match layer {
+                Qwen35TextLayerCache::DeltaNet(state) => {
+                    if state.is_device_resident() {
+                        return Err(NnError::Backend(format!(
+                            "Qwen cache observation layer {index} is device-owned; host state is not authoritative"
+                        )));
+                    }
+                    views.push(ReferenceStateView {
+                        name: format!("next_conv.{index}"),
+                        shape: vec![state.conv_width(), state.conv_kernel_dim()],
+                        values: state.conv_state(),
+                    });
+                    views.push(ReferenceStateView {
+                        name: format!("next_recurrent.{index}"),
+                        shape: vec![
+                            state.num_value_heads(),
+                            state.key_head_dim(),
+                            state.value_head_dim(),
+                        ],
+                        values: state.recurrent_state(),
+                    });
+                }
+                Qwen35TextLayerCache::FullAttention(state) => {
+                    let shape = vec![
+                        cache.len(),
+                        axis(self.config.full_attention.num_key_value_heads, "KV heads")?,
+                        axis(self.config.full_attention.head_dim, "KV head dimension")?,
+                    ];
+                    views.push(ReferenceStateView {
+                        name: format!("present_k.{index}"),
+                        shape: shape.clone(),
+                        values: state.keys(),
+                    });
+                    views.push(ReferenceStateView {
+                        name: format!("present_v.{index}"),
+                        shape,
+                        values: state.values(),
+                    });
+                }
+            }
+        }
+        snapshot_states(views, max_state_bytes)
+    }
+
     /// Run one initial prefill or one-token cached continuation transaction.
     ///
     /// Positions are derived as the contiguous interval beginning at
@@ -1395,24 +1482,7 @@ impl Qwen35TextRunner {
                 got: 0,
             });
         }
-        if cache.layers.len() != self.layers.len() {
-            return Err(NnError::Backend(
-                "Qwen3.5 text cache layer count is inconsistent".to_owned(),
-            ));
-        }
-        for (index, (layer, layer_cache)) in self.layers.iter().zip(&cache.layers).enumerate() {
-            if layer.mixer.kind() != layer_cache.kind()
-                || layer_cache.committed_len() != cache.committed_len
-                || matches!(
-                    layer_cache,
-                    Qwen35TextLayerCache::DeltaNet(cache) if cache.staged_len().is_some()
-                )
-            {
-                return Err(NnError::Backend(format!(
-                    "Qwen3.5 text cache layer {index} is inconsistent with the global cursor"
-                )));
-            }
-        }
+        self.validate_cache_layers(cache)?;
         if cache.committed_len != 0 && self.has_delta_net && tokens.len() != 1 {
             return Err(invalid_config(
                 "Qwen3.5 cached DeltaNet continuation must contain exactly one token",
@@ -1438,6 +1508,28 @@ impl Qwen35TextRunner {
             });
         }
         Ok((cache.committed_len, new_len))
+    }
+
+    fn validate_cache_layers(&self, cache: &Qwen35TextCache) -> Result<(), NnError> {
+        if cache.layers.len() != self.layers.len() {
+            return Err(NnError::Backend(
+                "Qwen3.5 text cache layer count is inconsistent".to_owned(),
+            ));
+        }
+        for (index, (layer, layer_cache)) in self.layers.iter().zip(&cache.layers).enumerate() {
+            if layer.mixer.kind() != layer_cache.kind()
+                || layer_cache.committed_len() != cache.committed_len
+                || matches!(
+                    layer_cache,
+                    Qwen35TextLayerCache::DeltaNet(cache) if cache.staged_len().is_some()
+                )
+            {
+                return Err(NnError::Backend(format!(
+                    "Qwen3.5 text cache layer {index} is inconsistent with the global cursor"
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn preflight_commit(&self, cache: &Qwen35TextCache, new_len: usize) -> Result<(), NnError> {
