@@ -118,7 +118,9 @@ def _states_equal(left: Sequence[torch.Tensor], right: Sequence[torch.Tensor]) -
     )
 
 
-def _native_state_error(reference: Any, observed: Any) -> float:
+def _native_state_error(
+    reference: Any, observed: Any, *, expected_names: tuple[str, ...] | None = None
+) -> float:
     """Compare executed native observations with the actual ONNX cache outputs."""
     names = getattr(reference, "state_names", None)
     shapes = getattr(reference, "state_shapes", None)
@@ -133,6 +135,7 @@ def _native_state_error(reference: Any, observed: Any) -> float:
         or any(type(name) is not str or not name for name in names)
         or len(set(names)) != len(names)
         or tuple(names) != tuple(observed_names)
+        or (expected_names is not None and tuple(names) != expected_names)
     ):
         raise OnnxQualificationError("native/ONNX cache inventory differs")
     errors: list[float] = []
@@ -352,14 +355,20 @@ def _mtp_cases(native: Any, ort_model: Any) -> list[dict[str, Any]]:
                 _maximum_error(reference.final_hidden_states, observed.final_hidden.reshape(-1).tolist()),
                 _maximum_error(reference.last_logits, replay.logits[0, -1].tolist()),
                 _maximum_error(reference.final_hidden_states, replay.final_hidden.reshape(-1).tolist()),
+                _native_state_error(
+                    reference, observed, expected_names=("present_k.0", "present_v.0")
+                ),
+                _native_state_error(
+                    reference, replay, expected_names=("present_k.0", "present_v.0")
+                ),
             )
             phase = "prefill" if step == 0 else "cached-decode"
             cases.append(
                 _case(
                     "mtp", f"mtp-{phase}-{ordinal}", error,
                     tokens_exact=shifted[0].tolist() == tokens[1:] + [next_token],
-                    # Replay identity is an additional determinism check, not
-                    # native-versus-ONNX cache parity; that oracle remains open.
+                    # Exact replay is an additional determinism check; native
+                    # KV parity is independently covered by the numeric error.
                     states_exact=_states_equal(observed_cache, replay_cache),
                     output_exact=(
                         _greedy(reference.last_logits) == _greedy(logits)

@@ -41,16 +41,23 @@ class _Native:
     def reference_mtp(transactions, sampled, max_context):
         assert len(transactions) == len(sampled)
         assert max_context >= sum(map(len, transactions))
-        return [
-            SimpleNamespace(
-                shifted_input_ids=list(tokens[1:]) + [next_token],
+        outputs = []
+        committed = []
+        for tokens, next_token in zip(transactions, sampled, strict=True):
+            shifted = list(tokens[1:]) + [next_token]
+            committed.extend(shifted)
+            outputs.append(SimpleNamespace(
+                shifted_input_ids=shifted,
                 target_hidden_states=[0.5, -0.5] * len(tokens),
                 hidden_size=2,
                 last_logits=[0.25, 0.75],
                 final_hidden_states=[0.5, -0.5] * len(tokens),
-            )
-            for tokens, next_token in zip(transactions, sampled, strict=True)
-        ]
+                state_names=["present_k.0", "present_v.0"],
+                state_shapes=[[len(committed), 1, 1]] * 2,
+                states=[list(map(float, committed)),
+                        [float(value) + 0.5 for value in committed]],
+            ))
+        return outputs
 
 
 class _Ort:
@@ -72,13 +79,16 @@ class _Ort:
 
     @staticmethod
     def draft(shifted, hidden, past_key_values=None):
-        state = shifted.to(dtype=torch.float32)
+        state = shifted.to(dtype=torch.float32).reshape(-1, 1, 1)
+        value = state + 0.5
         if past_key_values is not None:
-            state = torch.cat((past_key_values[0], state), dim=1)
+            state = torch.cat((past_key_values[0], state), dim=0)
+            value = torch.cat((past_key_values[1], value), dim=0)
         return SimpleNamespace(
             logits=torch.tensor([[[0.25, 0.75]]], dtype=torch.float32),
             final_hidden=hidden.unsqueeze(0).clone(),
-            past_key_values=(state,),
+            past_key_values=(state, value),
+            state_names=("present_k.0", "present_v.0"),
         )
 
 
@@ -232,11 +242,95 @@ def test_mtp_detects_replay_cache_drift():
             result = super().draft(shifted, hidden, past_key_values)
             self.calls += 1
             if self.calls % 2 == 0:
-                result.past_key_values = (result.past_key_values[0] + 1,)
+                result.past_key_values = tuple(state + 1 for state in result.past_key_values)
             return result
 
     cases = qualify_onnx._mtp_cases(_Native(), ReplayDriftedOrt())
     assert all(not case["states_exact"] for case in cases)
+
+
+@pytest.mark.parametrize("phase", ["prefill", "cached-decode"])
+@pytest.mark.parametrize("arm", ["observed", "replay", "both"])
+@pytest.mark.parametrize("slot", [0, 1])
+def test_mtp_native_cache_error_covers_both_arms_and_both_kv_slots(phase, arm, slot):
+    class CacheDriftedOrt(_Ort):
+        def __init__(self):
+            self.calls = 0
+
+        def draft(self, shifted, hidden, past_key_values=None):
+            result = super().draft(shifted, hidden, past_key_values)
+            current_arm = "observed" if self.calls % 2 == 0 else "replay"
+            self.calls += 1
+            current_phase = "prefill" if past_key_values is None else "cached-decode"
+            if current_phase == phase and arm in (current_arm, "both"):
+                states = list(result.past_key_values)
+                states[slot] = states[slot] + 0.125
+                result.past_key_values = tuple(states)
+            return result
+
+    cases = qualify_onnx._mtp_cases(_Native(), CacheDriftedOrt())
+    for case in cases:
+        if phase in case["case_id"]:
+            assert case["max_abs_error"] == 0.125
+            assert case["tolerance"] == 1e-3
+            # An identical wrong replay is still disqualified by native values.
+            if arm == "both":
+                assert case["states_exact"] is True
+            assert case["token_ids_exact"] and case["output_exact"]
+
+
+@pytest.mark.parametrize("field,value", [
+    ("state_names", []),
+    ("state_names", ["present_v.0", "present_k.0"]),
+    ("state_shapes", [[1, 1, 1], [1, 1, 1]]),
+    ("states", []),
+    ("states", [[float("nan")], [0.0]]),
+])
+def test_mtp_rejects_missing_or_malformed_native_cache(field, value):
+    class MalformedCacheNative(_Native):
+        @staticmethod
+        def reference_mtp(transactions, sampled, max_context):
+            results = _Native.reference_mtp(transactions, sampled, max_context)
+            setattr(results[0], field, value)
+            return results
+
+    with pytest.raises(qualify_onnx.OnnxQualificationError, match="cache"):
+        qualify_onnx._mtp_cases(MalformedCacheNative(), _Ort())
+
+
+def test_mtp_rejects_reordered_onnx_cache_inventory_even_when_values_match():
+    class ReorderedOrt(_Ort):
+        @staticmethod
+        def draft(shifted, hidden, past_key_values=None):
+            result = _Ort.draft(shifted, hidden, past_key_values)
+            result.state_names = tuple(reversed(result.state_names))
+            return result
+
+    with pytest.raises(qualify_onnx.OnnxQualificationError, match="cache inventory"):
+        qualify_onnx._mtp_cases(_Native(), ReorderedOrt())
+
+
+def test_mtp_rejects_matching_but_incomplete_native_and_onnx_cache_inventories():
+    class MissingValueNative(_Native):
+        @staticmethod
+        def reference_mtp(transactions, sampled, max_context):
+            results = _Native.reference_mtp(transactions, sampled, max_context)
+            for result in results:
+                result.state_names = result.state_names[:1]
+                result.state_shapes = result.state_shapes[:1]
+                result.states = result.states[:1]
+            return results
+
+    class MissingValueOrt(_Ort):
+        @staticmethod
+        def draft(shifted, hidden, past_key_values=None):
+            result = _Ort.draft(shifted, hidden, past_key_values)
+            result.state_names = result.state_names[:1]
+            result.past_key_values = result.past_key_values[:1]
+            return result
+
+    with pytest.raises(qualify_onnx.OnnxQualificationError, match="cache inventory"):
+        qualify_onnx._mtp_cases(MissingValueNative(), MissingValueOrt())
 
 
 @pytest.mark.parametrize("state", [
