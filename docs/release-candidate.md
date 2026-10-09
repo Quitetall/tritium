@@ -4386,3 +4386,28 @@ identify the first divergent internal operation or establish a correction.
 Keep the parity gate RED and the tolerance unchanged; next compare earlier
 in-block activation boundaries to locate where the small drift first appears
 and test a source-backed numerical fix on the exact hosted gate.
+
+#### Output-shard breakdown for the same replay
+
+The retained seven-shard outputs were compared with slices of the captured
+PyTorch logits using the same per-element tolerance. Their vocabulary ranges
+and failures were:
+
+| ONNX output | Vocabulary range | Failing values | Maximum normalized tolerance ratio |
+|---|---:|---:|---:|
+| `linear_210` | `[0, 7281)` | 1 | 1.0498 |
+| `linear_211` | `[7281, 14562)` | 0 | 0.9412 |
+| `linear_212` | `[14562, 21843)` | 0 | 0.8652 |
+| `linear_213` | `[21843, 29124)` | 0 | 0.9041 |
+| `linear_214` | `[29124, 36405)` | 1 | 1.0919 |
+| `linear_215` | `[36405, 43686)` | 2 | 1.0720 |
+| `linear_216` | `[43686, 49152)` | 0 | 0.9979 |
+
+The four failing values are therefore sparse across three shards rather than
+concentrated in one output shard. The largest absolute difference in some
+non-failing values is larger than the largest failing difference, because
+those logits have a larger relative tolerance allowance. Together with the
+reference-hidden-input replay, this weighs against a shard-specific LM-head
+bug; it does not rule out the shared head kernel's sensitivity to its input.
+This is additional diagnostic evidence from the same captured model and input,
+not an independent run or a parity pass.
