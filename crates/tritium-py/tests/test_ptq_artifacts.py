@@ -796,21 +796,22 @@ def test_public_convert_repeats_identically_into_independent_artifacts(tmp_path)
         TernaryConfig.ptq(profile="compact-v1", target_modules=("Linear",)),
         inplace=False,
     )
-    calibration = calibrate(
-        prepared,
-        [
-            torch.tensor(
-                [
-                    [1.0, 0.5, -0.25, 0.75, 0.125, -1.0, 0.375, 0.625],
-                    [0.25, -0.5, 1.0, 0.125, -0.75, 0.5, 0.875, -0.25],
-                ]
-            )
-        ],
-        evidence_dir=tmp_path / "evidence",
+    batches = [
+        torch.tensor(
+            [
+                [1.0, 0.5, -0.25, 0.75, 0.125, -1.0, 0.375, 0.625],
+                [0.25, -0.5, 1.0, 0.125, -0.75, 0.5, 0.875, -0.25],
+            ]
+        )
+    ]
+    calibration = calibrate(prepared, batches, evidence_dir=tmp_path / "evidence-a")
+    repeated_calibration = calibrate(
+        prepared, batches, evidence_dir=tmp_path / "evidence-b"
     )
+    assert calibration.evidence_id == repeated_calibration.evidence_id
 
     first = convert(prepared, calibration, work_dir=tmp_path / "first")
-    second = convert(prepared, calibration, work_dir=tmp_path / "second")
+    second = convert(prepared, repeated_calibration, work_dir=tmp_path / "second")
 
     assert first.artifact_id == second.artifact_id
     assert first.recipe_id == second.recipe_id
