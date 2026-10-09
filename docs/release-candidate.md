@@ -376,6 +376,17 @@ and `129b34281c53d44e009b7ada46341b266e6bce185a015ed048674b0a65eb980d`
 do not satisfy `browser-conformance`: the physical Safari lane, same-candidate
 aggregation, and registry admission remain open.
 
+### Browser-lane producer regression checks — 2026-10-09
+
+At source revision `b350a166ee38b99949c524751bc1b11325d4ca8e`,
+`node --test packages/tritium-web/tests/browser-lane-producer.test.mjs`
+passed all 7 tests. The suite covers npm/native-reference receipt binding,
+browser-trace assembly, canonical vector inventory, cancellation/allocation
+fault evidence, and WebDriver session/script routes. This is local producer and
+validator software evidence only; it creates no physical browser trace and does
+not close Safari, same-candidate aggregation, or browser-conformance registry
+gates.
+
 ### ONNX Python facade source regression refresh (2026-10-04)
 
 `python -m pytest crates/tritium-py/tests/test_torch_onnx.py -q` passed 24
