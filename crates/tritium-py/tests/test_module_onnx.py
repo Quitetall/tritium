@@ -100,6 +100,72 @@ def test_onnx_runtime_thread_policy_rejects_invalid_values(
         _session_options(ort)
 
 
+def test_terminal_output_matmuls_accumulate_in_double_without_changing_output_type():
+    from onnx import TensorProto, checker, helper
+
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 2])
+    logits = helper.make_tensor_value_info("logits", TensorProto.FLOAT, [1, 4])
+    graph = helper.make_graph(
+        [
+            helper.make_node("MatMul", ["x", "left"], ["left_logits"]),
+            helper.make_node("MatMul", ["x", "right"], ["right_logits"]),
+            helper.make_node(
+                "Concat", ["left_logits", "right_logits"], ["logits"], axis=-1
+            ),
+        ],
+        "terminal-logits",
+        [x],
+        [logits],
+        initializer=[
+            helper.make_tensor("left", TensorProto.FLOAT, [2, 2], [1, 0, 0, 1]),
+            helper.make_tensor("right", TensorProto.FLOAT, [2, 2], [0, 1, 1, 0]),
+        ],
+    )
+    model = helper.make_model(
+        graph, opset_imports=[helper.make_opsetid("", 18)]
+    )
+
+    promoted = module_onnx._promote_terminal_output_matmuls(model.graph, onnx)
+
+    assert promoted == 2
+    assert [node.input for node in model.graph.node if node.op_type == "Concat"] == [
+        ["left_logits", "right_logits"]
+    ]
+    casts = [node for node in model.graph.node if node.op_type == "Cast"]
+    assert sum(
+        next(attribute.i for attribute in node.attribute if attribute.name == "to")
+        == TensorProto.DOUBLE
+        for node in casts
+    ) == 4
+    assert sum(
+        next(attribute.i for attribute in node.attribute if attribute.name == "to")
+        == TensorProto.FLOAT
+        for node in casts
+    ) == 2
+    checker.check_model(model)
+
+
+def test_exported_float32_output_projection_promotes_only_terminal_matmul(tmp_path):
+    model = torch.nn.Sequential(_model(), torch.nn.Linear(2, 4, bias=False)).eval()
+    artifact = export_module_onnx(
+        model, torch.randn(2, 8), tmp_path / "output-projection"
+    )
+    graph = onnx.load(artifact.artifact_dir / "model.onnx", load_external_data=False)
+    double_casts = [
+        node
+        for node in graph.graph.node
+        if node.op_type == "Cast"
+        and any(
+            attribute.name == "to" and attribute.i == onnx.TensorProto.DOUBLE
+            for attribute in node.attribute
+        )
+    ]
+    assert len(double_casts) == 2
+    runtime = load_module_onnx(artifact.artifact_dir)
+    replay = torch.randn(3, 8)
+    torch.testing.assert_close(runtime(replay), model(replay), rtol=1e-4, atol=1e-5)
+
+
 def test_cpu_model_name_reads_first_linux_cpu_label(tmp_path):
     cpuinfo = tmp_path / "cpuinfo"
     cpuinfo.write_text(

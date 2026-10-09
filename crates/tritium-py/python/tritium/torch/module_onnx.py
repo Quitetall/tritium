@@ -1397,6 +1397,105 @@ def _tensor_outputs(value: Any) -> Tuple[Tensor, ...]:
     return tuple(values)
 
 
+def _promote_terminal_output_matmuls(graph, onnx) -> int:
+    """Use FP64 accumulation only for float32 MatMul/Gemm output projections."""
+
+    producers = {
+        output: node
+        for node in graph.node
+        for output in node.output
+    }
+    terminal_matmul_outputs: set[str] = set()
+    for graph_output in graph.output:
+        if (
+            graph_output.type.WhichOneof("value") != "tensor_type"
+            or graph_output.type.tensor_type.elem_type != onnx.TensorProto.FLOAT
+        ):
+            continue
+        producer = producers.get(graph_output.name)
+        if producer is None:
+            continue
+        terminal_values = (
+            tuple(producer.input) if producer.op_type == "Concat"
+            else (graph_output.name,)
+        )
+        for value in terminal_values:
+            terminal = producers.get(value)
+            if (
+                terminal is not None
+                and terminal.op_type in {"MatMul", "Gemm"}
+                and len(terminal.input) in ({2} if terminal.op_type == "MatMul" else {2, 3})
+                and len(terminal.output) == 1
+            ):
+                terminal_matmul_outputs.add(terminal.output[0])
+    if not terminal_matmul_outputs:
+        return 0
+
+    used_names = {
+        name
+        for node in graph.node
+        for name in (*node.input, *node.output, node.name)
+        if name
+    }
+    used_names.update(
+        value.name
+        for value in (*graph.input, *graph.output, *graph.value_info, *graph.initializer)
+    )
+
+    def fresh_name(stem: str) -> str:
+        candidate = f"{stem}__tritium_fp64"
+        ordinal = 0
+        while candidate in used_names:
+            ordinal += 1
+            candidate = f"{stem}__tritium_fp64_{ordinal}"
+        used_names.add(candidate)
+        return candidate
+
+    rewritten = []
+    promoted = 0
+    for node in graph.node:
+        if not node.output or node.output[0] not in terminal_matmul_outputs:
+            rewritten.append(node)
+            continue
+        original_output = node.output[0]
+        double_inputs = []
+        casts = []
+        for index, input_name in enumerate(node.input):
+            double_input = fresh_name(f"{original_output}_input_{index}")
+            casts.append(
+                onnx.helper.make_node(
+                    "Cast",
+                    [input_name],
+                    [double_input],
+                    name=fresh_name(f"{original_output}_cast_in_{index}"),
+                    to=onnx.TensorProto.DOUBLE,
+                )
+            )
+            double_inputs.append(double_input)
+        double_output = fresh_name(original_output)
+        double_matmul = onnx.NodeProto()
+        double_matmul.CopyFrom(node)
+        del double_matmul.input[:]
+        double_matmul.input.extend(double_inputs)
+        del double_matmul.output[:]
+        double_matmul.output.append(double_output)
+        rewritten.extend(casts)
+        rewritten.append(double_matmul)
+        rewritten.append(
+            onnx.helper.make_node(
+                "Cast",
+                [double_output],
+                [original_output],
+                name=fresh_name(f"{original_output}_cast_out"),
+                to=onnx.TensorProto.FLOAT,
+            )
+        )
+        promoted += 1
+    del graph.node[:]
+    graph.node.extend(rewritten)
+    return promoted
+
+
 def export_module_onnx(
     model: nn.Module,
     example_inputs: Union[Tensor, Sequence[Tensor]],
@@ -1523,6 +1622,9 @@ def export_module_onnx(
                     _translate_packed_ternary_plane,
             },
         )
+        graph = onnx.load(graph_path, load_external_data=False)
+        if _promote_terminal_output_matmuls(graph.graph, onnx):
+            onnx.save_model(graph, graph_path, save_as_external_data=False)
         # Path-based checking supplies ONNX with the external-data base directory.
         # Checking an in-memory ModelProto makes valid large graphs look missing.
         onnx.checker.check_model(str(graph_path))
