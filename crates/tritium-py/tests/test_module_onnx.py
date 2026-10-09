@@ -185,6 +185,65 @@ def test_intermediate_float32_matmuls_are_promoted_for_model_parity():
     checker.check_model(model)
 
 
+def test_float32_matmul_with_constant_weight_is_promoted():
+    from onnx import TensorProto, checker, helper
+
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 2])
+    logits = helper.make_tensor_value_info("logits", TensorProto.FLOAT, [1, 2])
+    weight = helper.make_tensor(
+        "weight_value", TensorProto.FLOAT, [2, 2], [1, 0, 0, 1]
+    )
+    graph = helper.make_graph(
+        [
+            helper.make_node("Constant", [], ["weight_source"], value=weight),
+            helper.make_node("Transpose", ["weight_source"], ["weight"]),
+            helper.make_node("MatMul", ["x", "weight"], ["logits"]),
+        ],
+        "constant-backed-projection",
+        [x],
+        [logits],
+    )
+    model = helper.make_model(
+        graph, opset_imports=[helper.make_opsetid("", 18)]
+    )
+
+    promoted = module_onnx._promote_float32_matmuls_to_fp64(model.graph, onnx)
+
+    assert promoted == 1
+    assert sum(node.op_type == "Cast" for node in model.graph.node) == 3
+    checker.check_model(model)
+
+
+def test_float32_matmul_with_reshaped_constant_weight_is_promoted():
+    from onnx import TensorProto, checker, helper
+
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 2])
+    logits = helper.make_tensor_value_info("logits", TensorProto.FLOAT, [1, 2])
+    weight = helper.make_tensor(
+        "weight_value", TensorProto.FLOAT, [4], [1, 0, 0, 1]
+    )
+    shape = helper.make_tensor("weight_shape", TensorProto.INT64, [2], [2, 2])
+    graph = helper.make_graph(
+        [
+            helper.make_node("Constant", [], ["weight_source"], value=weight),
+            helper.make_node("Reshape", ["weight_source", "weight_shape"], ["weight"]),
+            helper.make_node("MatMul", ["x", "weight"], ["logits"]),
+        ],
+        "reshaped-constant-backed-projection",
+        [x],
+        [logits],
+        initializer=[shape],
+    )
+    model = helper.make_model(
+        graph, opset_imports=[helper.make_opsetid("", 18)]
+    )
+
+    promoted = module_onnx._promote_float32_matmuls_to_fp64(model.graph, onnx)
+
+    assert promoted == 1
+    checker.check_model(model)
+
+
 def test_exported_float32_matmuls_use_fp64_accumulation(tmp_path):
     torch.manual_seed(131)
     model = torch.nn.Sequential(

@@ -1408,6 +1408,70 @@ def _promote_float32_matmuls_to_fp64(graph, onnx) -> int:
         (initializer.name, initializer.data_type)
         for initializer in graph.initializer
     )
+    # Dynamo commonly exports model weights as Constant -> Transpose chains,
+    # rather than initializers or declared value_info. Recover the element type
+    # through those type-preserving nodes so eligible projections are not
+    # silently omitted from the precision rewrite.
+    unary_type_preserving_ops = {"Flatten", "Identity", "Transpose"}
+    data_type_preserving_ops = {
+        "Expand",
+        "Gather",
+        "Reshape",
+        "Slice",
+        "Squeeze",
+        "Tile",
+        "Unsqueeze",
+    }
+    for node in graph.node:
+        if not node.output or not node.output[0]:
+            continue
+        output_type = None
+        if node.op_type == "Constant":
+            for attribute in node.attribute:
+                if attribute.name == "value" and attribute.HasField("t"):
+                    output_type = attribute.t.data_type
+                    break
+                if (
+                    attribute.name == "sparse_value"
+                    and attribute.HasField("sparse_tensor")
+                ):
+                    output_type = attribute.sparse_tensor.values.data_type
+                    break
+        elif node.op_type == "Cast":
+            output_type = next(
+                (
+                    attribute.i
+                    for attribute in node.attribute
+                    if attribute.name == "to"
+                ),
+                None,
+            )
+        elif node.op_type in unary_type_preserving_ops and node.input:
+            output_type = value_types.get(node.input[0])
+        elif node.op_type in data_type_preserving_ops and node.input:
+            # These operators' auxiliary shape/index inputs are commonly
+            # INT64; the output still has the first (data) input's element type.
+            output_type = value_types.get(node.input[0])
+        elif node.op_type == "Concat" and node.input:
+            input_types = [value_types.get(name) for name in node.input if name]
+            if input_types and input_types[0] is not None and all(
+                value_type == input_types[0] for value_type in input_types
+            ):
+                output_type = input_types[0]
+        elif node.op_type in {"MatMul", "Gemm"}:
+            input_types = [value_types.get(name) for name in node.input if name]
+            if len(input_types) >= 2 and input_types[0] is not None and all(
+                value_type == input_types[0] for value_type in input_types
+            ):
+                output_type = input_types[0]
+        if output_type is not None:
+            value_types.setdefault(node.output[0], output_type)
+        if node.op_type == "Split" and node.input:
+            input_type = value_types.get(node.input[0])
+            if input_type is not None:
+                for output in node.output:
+                    if output:
+                        value_types.setdefault(output, input_type)
     promoted_outputs: set[str] = set()
     for node in graph.node:
         if (
@@ -1417,14 +1481,16 @@ def _promote_float32_matmuls_to_fp64(graph, onnx) -> int:
         ):
             continue
         output_type = value_types.get(node.output[0])
-        input_types = [value_types.get(name) for name in node.input if name]
+        input_names = [name for name in node.input if name]
+        input_types = [value_types.get(name) for name in input_names]
+        inputs_are_float32 = len(input_types) >= 2 and all(
+            value_type == onnx.TensorProto.FLOAT for value_type in input_types
+        )
         if output_type is None and input_types and all(
             value_type == onnx.TensorProto.FLOAT for value_type in input_types
-        ):
+        ) and inputs_are_float32:
             output_type = onnx.TensorProto.FLOAT
-        if output_type == onnx.TensorProto.FLOAT and all(
-            value_type == onnx.TensorProto.FLOAT for value_type in input_types
-        ):
+        if output_type == onnx.TensorProto.FLOAT and inputs_are_float32:
             promoted_outputs.add(node.output[0])
     if not promoted_outputs:
         return 0
