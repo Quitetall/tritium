@@ -3975,3 +3975,14 @@ passed. macOS, Linux and Windows CPU wheels, the source-free tutorial,
 installed-wheel smoke and all ABI3 matrix cells passed in the wheels workflow;
 the CUDA wheel lane was skipped. The frozen tutorial gate remains open, with
 conversion and ONNX export still the dominant timed stages.
+
+### Public PTQ artifact invariance across fit chunk sizes — 2026-10-09
+
+Extended `test_public_convert_persists_grouped_fit_artifact` to run the public
+`prepare` → `calibrate` → `convert()` path twice with different working-memory
+budgets. The constrained run fits one row per chunk; the roomier run fits all
+four rows together. Their persisted ternary/scale payload bytes and reloaded
+module outputs match exactly. The existing constrained-run artifact digests
+remain pinned. The focused test passed, and the complete PTQ artifact file
+passed (`39 passed`); this is deterministic CPU regression coverage, not model
+quality, performance, or release qualification evidence.

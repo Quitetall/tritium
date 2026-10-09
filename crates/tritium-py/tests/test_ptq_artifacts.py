@@ -1569,14 +1569,45 @@ def test_public_convert_persists_grouped_fit_artifact(tmp_path):
         artifact_path = Path(result.artifact_dir) / artifact_name
         assert hashlib.sha256(artifact_path.read_bytes()).hexdigest() == expected_digest
 
+    # The public artifact path must be invariant to the memory budget used to
+    # batch row fitting. The second conversion has enough room to fit all four
+    # rows together, so this also checks that chunking is not serialized into
+    # different ternary payload bytes.
+    roomy = convert(
+        prepared,
+        calibration,
+        work_dir=tmp_path / "grouped-public-roomy-work",
+        max_working_bytes=1024 * 1024,
+    )
+    assert roomy.weights[0].fit_chunk_rows == 4
+    roomy_payloads = sorted(
+        path.name
+        for path in Path(roomy.artifact_dir).iterdir()
+        if path.name.endswith((".scales.f16le", ".trits.i8"))
+    )
+    constrained_payloads = sorted(
+        path.name
+        for path in Path(result.artifact_dir).iterdir()
+        if path.name.endswith((".scales.f16le", ".trits.i8"))
+    )
+    assert roomy_payloads == constrained_payloads
+    for artifact_name in constrained_payloads:
+        assert (Path(roomy.artifact_dir) / artifact_name).read_bytes() == (
+            Path(result.artifact_dir) / artifact_name
+        ).read_bytes()
+
     # Exercise the user-facing replay route from the sealed on-disk package, not
     # just the in-memory weight receipt above. Compare against the exact hard
     # additive projection so scale dtype and packed-trit round-tripping are both
     # covered by the same public convert() fixture.
     inputs = torch.randn(5, 256)
     reopened_model = load_quantized_module(model, result.artifact_dir)
+    roomy_model = load_quantized_module(model, roomy.artifact_dir)
     hard_weight = AdditiveTernaryWeight(fitted.planes).dense(dtype=inputs.dtype)
     expected_output = torch.nn.functional.linear(inputs, hard_weight)
     torch.testing.assert_close(
         reopened_model(inputs), expected_output, rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        roomy_model(inputs), reopened_model(inputs), rtol=0, atol=0
     )
