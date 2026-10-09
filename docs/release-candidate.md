@@ -3572,3 +3572,38 @@ matched thread-count experiment, hosted CI qualification, a model-quality
 result, or evidence that the runner gap is solved. The unchanged hosted gate
 still fails at `608.171s`; keep its `300s` contract intact until an
 evidence-backed portable fix or an ADR-approved contract change clears it.
+
+### Exact manylinux wheel tutorial on the local 14900K — 2026-10-09
+
+The Linux x86_64 CPU wheel built by hosted workflow
+[37884828952](https://github.com/Quitetall/tritium/actions/runs/37884828952)
+was downloaded for the exact pushed source revision `87f744b02ef5eab04fe12b8942a4061bb4620a4f`.
+Its provenance receipt passed, and the wheel passed `scripts/verify-wheel.py`
+including clean-install smoke. Wheel SHA-256 is
+`208943db3d895ddb3639a0ad307c701070336e4f05b1c755e883f234d4ca8bd1`.
+
+The same installed wheel, pinned local SmolLM2 cache, 14900K host, Torch/OMP/MKL
+four-thread settings, and qualification script were run once with four Rayon
+threads and once with sixteen. Both receipts passed the frozen validator and
+produced the same PTQ artifact ID
+`sha256:26dc412dfbb432458e4a85386c77a6bae895de89b7e14a1d8a192a4ae50fbaf6`
+and storage ratio `5.835×`. Four Rayon threads completed in `207.174s`, with
+conversion at `112.451s` cumulative (`112.111s` after calibration), checkpoint
+round-trip `121.025s`, generation `137.143s`, ONNX export `189.414s`, ONNX
+replay `202.852s`, and QAT resume `207.174s`. Sixteen Rayon threads completed
+in `138.501s`, with conversion at `46.675s` cumulative (`46.354s` after
+calibration), checkpoint `55.088s`, generation `70.875s`, ONNX export
+`121.596s`, replay `134.453s`, and QAT resume `138.501s`.
+
+On this host and workload, sixteen threads were about `2.42×` faster for
+conversion and `1.50×` faster end-to-end. The measured receipts are
+`/mnt/4tb/tritium-evidence/smollm2-installed-wheel-87f744b0-r4/receipt.json`
+and
+`/mnt/4tb/tritium-evidence/smollm2-installed-wheel-87f744b0-r16/receipt.json`;
+the downloaded wheel and its provenance/install receipts are under
+`/mnt/4tb/tritium-evidence/wheel-smollm2-87f744b0/`.
+
+This is a matched local thread-count result, not hosted-runner evidence. It
+supports testing explicit Rayon oversubscription as a hosted configuration
+experiment, but does not establish that sixteen workers help a four-vCPU
+shared runner. The hosted 300-second gate remains independent and unchanged.
