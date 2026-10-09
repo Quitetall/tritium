@@ -837,6 +837,24 @@ pub fn fit_joint_ternary(
     };
     #[cfg(test)]
     record_solver_phase(4, order_started);
+    let mut relay_scale_prefixes: [Option<Vec<Vec<f32>>>; 2] = [None, None];
+    for (index, enabled, modulated) in [
+        (0, config.relay_basins.softened, false),
+        (1, config.relay_basins.modulated, true),
+    ] {
+        if enabled {
+            #[cfg(test)]
+            let relay_started = std::time::Instant::now();
+            relay_scale_prefixes[index] = Some(relay::basin_scale_prefixes(
+                weights,
+                config.planes,
+                modulated,
+                config.scale_precision,
+            )?);
+            #[cfg(test)]
+            record_solver_phase(6, relay_started);
+        }
+    }
     fit_joint_ternary_prepared(
         weights,
         fit_metric,
@@ -844,6 +862,7 @@ pub fn fit_joint_ternary(
         &metric_diagonal,
         metric_sum,
         &weighted_abs_order,
+        &relay_scale_prefixes,
     )
 }
 
@@ -854,6 +873,7 @@ fn fit_joint_ternary_prepared(
     metric_diagonal: &[f64],
     metric_sum: f64,
     weighted_abs_order: &WeightedAbsOrder,
+    relay_scale_prefixes: &[Option<Vec<Vec<f32>>>; 2],
 ) -> Result<JointTernaryFit, JointFitError> {
     let relay_starts =
         usize::from(config.relay_basins.softened) + usize::from(config.relay_basins.modulated);
@@ -883,12 +903,14 @@ fn fit_joint_ternary_prepared(
 
     // Relay basins are extra candidates appended after the configured OA-EM restarts, so the
     // deterministic restart indices and receipts are byte-identical when both basins are off.
-    for (enabled, kind) in [
+    for (index, enabled, kind) in [
         (
+            0,
             config.relay_basins.softened,
             JointFitStartKind::SoftenedRelayBasin,
         ),
         (
+            1,
             config.relay_basins.modulated,
             JointFitStartKind::ModulatedRelayBasin,
         ),
@@ -896,16 +918,11 @@ fn fit_joint_ternary_prepared(
         if !enabled {
             continue;
         }
-        #[cfg(test)]
-        let relay_started = std::time::Instant::now();
-        let scales = relay::basin_scales(
-            weights,
-            config.planes,
-            kind == JointFitStartKind::ModulatedRelayBasin,
-            config.scale_precision,
-        )?;
-        #[cfg(test)]
-        record_solver_phase(6, relay_started);
+        let scales = relay_scale_prefixes[index]
+            .as_ref()
+            .and_then(|prefixes| prefixes.get(config.planes - 1))
+            .expect("enabled relay basin has cached scales for every plane prefix")
+            .clone();
         starts.push(optimize_start(weights, fit_metric, config, scales, kind)?);
     }
 
@@ -922,6 +939,7 @@ fn fit_joint_ternary_prepared(
             metric_diagonal,
             metric_sum,
             weighted_abs_order,
+            relay_scale_prefixes,
         )?;
         let lower_receipt = lower.restart_receipts[lower.selected_start].clone();
         let lower_accepted_objectives = lower.accepted_objectives;
@@ -1950,14 +1968,30 @@ mod relay {
     /// After each plane the HARD projection of the soft fit — the exact ternary assignment of
     /// the shift-centered residual at the fitted scale and threshold — is subtracted, so only
     /// the `scale * trit` contribution ever leaves the basin.
+    #[cfg(test)]
     pub(super) fn basin_scales(
         weights: &[f32],
         planes: usize,
         modulated: bool,
         precision: ScalePrecision,
     ) -> Result<Vec<f32>, JointFitError> {
+        Ok(basin_scale_prefixes(weights, planes, modulated, precision)?
+            .pop()
+            .unwrap_or_default())
+    }
+
+    /// Fit all sequential relay planes once and retain each independently sorted prefix.
+    /// Recursive P3 → P2 → P1 fitting consumes these prefixes, avoiding repeated descent for
+    /// earlier planes while preserving the exact restart scales at every recursion depth.
+    pub(super) fn basin_scale_prefixes(
+        weights: &[f32],
+        planes: usize,
+        modulated: bool,
+        precision: ScalePrecision,
+    ) -> Result<Vec<Vec<f32>>, JointFitError> {
         let mut residual = weights.to_vec();
         let mut scales = Vec::with_capacity(planes);
+        let mut prefixes = Vec::with_capacity(planes);
         // Every plane's descent needs the residual normalized by that plane's
         // absmean. Reuse one buffer instead of allocating a new f64 vector for
         // each of the three deterministic relay basins.
@@ -1970,6 +2004,9 @@ mod relay {
                 / residual.len() as f64;
             if absmean <= 0.0 {
                 scales.push(deployment_scale(0.0, precision, plane)?);
+                let mut prefix = scales.clone();
+                prefix.sort_by(|left, right| right.total_cmp(left));
+                prefixes.push(prefix);
                 continue;
             }
             normalized.clear();
@@ -1992,9 +2029,11 @@ mod relay {
                     *value -= scale * trit;
                 }
             }
+            let mut prefix = scales.clone();
+            prefix.sort_by(|left, right| right.total_cmp(left));
+            prefixes.push(prefix);
         }
-        scales.sort_by(|left, right| right.total_cmp(left));
-        Ok(scales)
+        Ok(prefixes)
     }
 
     /// Minimize `L = mean_i (c_i - a * relay(c_i / a, s_k, delta))^2` with `c_i = w_i - mu` by
@@ -2131,6 +2170,81 @@ mod relay {
                 scale,
                 threshold,
                 shift,
+            }
+        }
+
+        fn basin_scale_prefixes_reference(
+            weights: &[f32],
+            planes: usize,
+            modulated: bool,
+            precision: ScalePrecision,
+        ) -> Result<Vec<Vec<f32>>, JointFitError> {
+            let mut residual = weights.to_vec();
+            let mut scales = Vec::with_capacity(planes);
+            let mut prefixes = Vec::with_capacity(planes);
+            for plane in 0..planes {
+                let absmean = residual
+                    .iter()
+                    .map(|value| f64::from(value.abs()))
+                    .sum::<f64>()
+                    / residual.len() as f64;
+                if absmean <= 0.0 {
+                    scales.push(deployment_scale(0.0, precision, plane)?);
+                } else {
+                    let normalized = residual
+                        .iter()
+                        .map(|value| f64::from(*value) / absmean)
+                        .collect::<Vec<_>>();
+                    let fit = descend_reference(&normalized, modulated);
+                    let scale = deployment_scale((fit.scale * absmean) as f32, precision, plane)?;
+                    scales.push(scale);
+                    if scale > 0.0 {
+                        let shift = (fit.shift * absmean) as f32;
+                        let threshold = scale * fit.threshold as f32;
+                        for value in &mut residual {
+                            let centered = *value - shift;
+                            let trit = if centered > threshold {
+                                1.0
+                            } else if centered < -threshold {
+                                -1.0
+                            } else {
+                                0.0
+                            };
+                            *value -= scale * trit;
+                        }
+                    }
+                }
+                let mut prefix = scales.clone();
+                prefix.sort_by(|left, right| right.total_cmp(left));
+                prefixes.push(prefix);
+            }
+            Ok(prefixes)
+        }
+
+        #[test]
+        fn cached_scale_prefixes_match_independent_legacy_fits() {
+            for length in [1, 3, 16, 64, 128] {
+                for seed in 0..8 {
+                    let weights = (0..length)
+                        .map(|index| {
+                            let value = (index * 37 + seed * 19) % 101;
+                            (value as f32 - 50.0) / 13.0
+                        })
+                        .collect::<Vec<_>>();
+                    for modulated in [false, true] {
+                        let expected = basin_scale_prefixes_reference(
+                            &weights,
+                            3,
+                            modulated,
+                            ScalePrecision::F16,
+                        )
+                        .expect("reference prefixes");
+                        let actual =
+                            basin_scale_prefixes(&weights, 3, modulated, ScalePrecision::F16)
+                                .expect("cached prefixes");
+                        assert_eq!(actual, expected);
+                    }
+                }
             }
         }
 
@@ -2328,10 +2442,11 @@ mod tests {
         let diagonal: Vec<f64> = (0..64)
             .map(|column| 0.25 + ((column * 17 % 31) as f64 / 31.0))
             .collect();
-        report_compact_g64_p2_phase_profile(
+        report_compact_g64_phase_profile(
             &rows,
             &diagonal,
             "synthetic relay-on",
+            2,
             RelayBasins {
                 softened: true,
                 modulated: true,
@@ -2342,6 +2457,67 @@ mod tests {
     #[test]
     #[ignore = "requires fixture from scripts/profile-smollm2-ptq-solver.py"]
     fn profile_smollm2_g64_p2_solver_phases() {
+        let (weights, diagonal) = load_smollm2_profile_fixture();
+        let baseline_objective = report_compact_g64_phase_profile(
+            &weights,
+            &diagonal,
+            "pinned SmolLM2 relay-off",
+            2,
+            RelayBasins::default(),
+        );
+        let softened_objective = report_compact_g64_phase_profile(
+            &weights,
+            &diagonal,
+            "pinned SmolLM2 softened-only",
+            2,
+            RelayBasins {
+                softened: true,
+                modulated: false,
+            },
+        );
+        let modulated_objective = report_compact_g64_phase_profile(
+            &weights,
+            &diagonal,
+            "pinned SmolLM2 modulated-only",
+            2,
+            RelayBasins {
+                softened: false,
+                modulated: true,
+            },
+        );
+        let dual_objective = report_compact_g64_phase_profile(
+            &weights,
+            &diagonal,
+            "pinned SmolLM2 dual-relay",
+            2,
+            RelayBasins {
+                softened: true,
+                modulated: true,
+            },
+        );
+        assert!(softened_objective <= baseline_objective);
+        assert!(modulated_objective <= baseline_objective);
+        assert!(dual_objective <= softened_objective);
+        assert!(dual_objective <= modulated_objective);
+    }
+
+    #[test]
+    #[ignore = "requires fixture from scripts/profile-smollm2-ptq-solver.py"]
+    fn profile_smollm2_g64_p3_solver_phases() {
+        let (weights, diagonal) = load_smollm2_profile_fixture();
+        report_compact_g64_phase_profile(
+            &weights,
+            &diagonal,
+            "pinned SmolLM2 P3 dual-relay",
+            3,
+            RelayBasins {
+                softened: true,
+                modulated: true,
+            },
+        );
+    }
+
+    fn load_smollm2_profile_fixture() -> (Vec<Vec<f32>>, Vec<f64>) {
         const HEADER_BYTES: usize = 16;
         let fixture_path = std::env::var_os("TRITIUM_SMOLLM2_PROFILE_FIXTURE")
             .expect("set TRITIUM_SMOLLM2_PROFILE_FIXTURE to a generated fixture path");
@@ -2375,56 +2551,21 @@ mod tests {
             .chunks(8)
             .map(|value| f64::from_le_bytes(value.try_into().expect("validated f64 chunk")))
             .collect::<Vec<_>>();
-        let baseline_objective = report_compact_g64_p2_phase_profile(
-            &weights,
-            &diagonal,
-            "pinned SmolLM2 relay-off",
-            RelayBasins::default(),
-        );
-        let softened_objective = report_compact_g64_p2_phase_profile(
-            &weights,
-            &diagonal,
-            "pinned SmolLM2 softened-only",
-            RelayBasins {
-                softened: true,
-                modulated: false,
-            },
-        );
-        let modulated_objective = report_compact_g64_p2_phase_profile(
-            &weights,
-            &diagonal,
-            "pinned SmolLM2 modulated-only",
-            RelayBasins {
-                softened: false,
-                modulated: true,
-            },
-        );
-        let dual_objective = report_compact_g64_p2_phase_profile(
-            &weights,
-            &diagonal,
-            "pinned SmolLM2 dual-relay",
-            RelayBasins {
-                softened: true,
-                modulated: true,
-            },
-        );
-        assert!(softened_objective <= baseline_objective);
-        assert!(modulated_objective <= baseline_objective);
-        assert!(dual_objective <= softened_objective);
-        assert!(dual_objective <= modulated_objective);
+        (weights, diagonal)
     }
 
-    fn report_compact_g64_p2_phase_profile(
+    fn report_compact_g64_phase_profile(
         rows: &[Vec<f32>],
         diagonal: &[f64],
         fixture_kind: &str,
+        planes: usize,
         relay_basins: RelayBasins,
     ) -> f64 {
         assert_eq!(rows.len(), 256);
         assert!(rows.iter().all(|row| row.len() == 64));
         assert_eq!(diagonal.len(), 64);
         let config = JointFitConfig {
-            planes: 2,
+            planes,
             max_iterations: 16,
             ridge: 1e-8,
             em_restarts: 4,
@@ -2449,7 +2590,7 @@ mod tests {
         assert!(phases.iter().sum::<u128>() <= total);
         let divisor = REPEATS as f64 * 1_000_000.0;
         eprintln!(
-            "G64/P2 compact {fixture_kind} 256-row profile over {REPEATS} repeats: total={:.3}ms assignment={:.3}ms scale_solve={:.3}ms reconstruction={:.3}ms validate_metric={:.3}ms weighted_order={:.3}ms init_scales={:.3}ms relay_scales={:.3}ms other={:.3}ms objective_sum={:.9}",
+            "G64/P{planes} compact {fixture_kind} 256-row profile over {REPEATS} repeats: total={:.3}ms assignment={:.3}ms scale_solve={:.3}ms reconstruction={:.3}ms validate_metric={:.3}ms weighted_order={:.3}ms init_scales={:.3}ms relay_scales={:.3}ms other={:.3}ms objective_sum={:.9}",
             total as f64 / divisor,
             phases[0] as f64 / divisor,
             phases[1] as f64 / divisor,
