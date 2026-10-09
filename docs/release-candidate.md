@@ -3461,3 +3461,39 @@ comparison does not isolate CPU model, sustained frequency, or wheel/compiler
 differences. Keep the CI gate unchanged and investigate portable CPU
 throughput plus the hosted runner's effective compute before attributing the
 full gap to Tritium solver code.
+
+### Pinned SmolLM2 solver phase breakdown — 2026-10-09
+
+The release-mode `tritium-quantize` phase profiler was run against the retained
+real SmolLM2 `model.layers.0.mlp.up_proj` row-group fixture
+`/mnt/4tb/tritium-evidence/ptq-profile-fdd5bd17-exact.bin` (SHA-256
+`2b4f5a522531a5894e98b2a0593db9764f1cef34962e62ecf9594e618437ff18`). The
+locked P2 dual-relay profile averaged `23.245ms` per 256-row batch over five
+repeats: assignment `6.768ms`, scale solve `2.726ms`, reconstruction
+`4.261ms`, relay-scale initialization `7.125ms`, with weighted-order setup
+`0.234ms`. The P3 dual-relay profile averaged `57.634ms`: assignment
+`20.809ms` (36%), scale solve `10.662ms` (18%), reconstruction `10.241ms`
+(18%), relay-scale initialization `11.283ms` (20%), and weighted-order setup
+`0.242ms` (under 1%). The P2 relay-off profile was `11.098ms`; adding both
+relay basins improved this fixture's summed objective from `0.130944935` to
+`0.130786244`, but that local row-batch objective is not a model-quality
+result.
+
+Both focused profiles passed using the same fixture and environment, with the
+respective filters `profile_smollm2_g64_p2_solver_phases` and
+`profile_smollm2_g64_p3_solver_phases`. This shifts the
+next optimization investigation toward exact assignment and relay work, not
+weighted-order allocation. Measurements are local and isolated to one real
+projection's row group; they do not establish whole-model speed, hosted-gate
+improvement, or quality. Preserve the frozen objective and compare deterministic
+public `convert()` artifact bytes before accepting a solver change.
+
+A sequential public-conversion thread-count check on the same pinned projection
+then measured `3.189s` and `3.026s` with one Rayon/PyTorch thread, and `1.109s`
+and `1.076s` with four. The median of these two samples per setting is `3.108s`
+versus `1.093s` (about `2.84×`); all four conversions emitted the same
+`sha256:4059a7c249fbf4d3aaa58a56d4d6c630da175d2c440a365fef025ea3e0b58c44`
+artifact and weighted MSE. An initial pair accidentally overlapped and is
+excluded. This indicates useful row-level thread scaling on the local
+i9-14900K for this layer, but it is a small sample and does not account for the
+hosted runner gap or qualify whole-model conversion.
