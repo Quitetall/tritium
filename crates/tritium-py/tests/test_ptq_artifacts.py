@@ -1568,3 +1568,15 @@ def test_public_convert_persists_grouped_fit_artifact(tmp_path):
     for artifact_name, expected_digest in expected_artifact_sha256.items():
         artifact_path = Path(result.artifact_dir) / artifact_name
         assert hashlib.sha256(artifact_path.read_bytes()).hexdigest() == expected_digest
+
+    # Exercise the user-facing replay route from the sealed on-disk package, not
+    # just the in-memory weight receipt above. Compare against the exact hard
+    # additive projection so scale dtype and packed-trit round-tripping are both
+    # covered by the same public convert() fixture.
+    inputs = torch.randn(5, 256)
+    reopened_model = load_quantized_module(model, result.artifact_dir)
+    hard_weight = AdditiveTernaryWeight(fitted.planes).dense(dtype=inputs.dtype)
+    expected_output = torch.nn.functional.linear(inputs, hard_weight)
+    torch.testing.assert_close(
+        reopened_model(inputs), expected_output, rtol=0, atol=0
+    )
