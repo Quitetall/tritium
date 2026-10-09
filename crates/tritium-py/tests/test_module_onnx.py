@@ -12,7 +12,11 @@ onnx = pytest.importorskip("onnx")
 ort = pytest.importorskip("onnxruntime")
 pytest.importorskip("onnxscript")
 
-from tritium.nn import AdditiveTernaryLinear, AdditiveTernaryWeight  # noqa: E402
+from tritium.nn import (  # noqa: E402
+    AdditiveTernaryLinear,
+    AdditiveTernaryWeight,
+    TernaryLinear,
+)
 from tritium.torch import (  # noqa: E402
     ModuleOnnxLineage,
     RefinementConfig,
@@ -30,6 +34,7 @@ from tritium.torch import (  # noqa: E402
     refine,
 )
 from tritium.torch.module_onnx import _session_options  # noqa: E402
+from tritium.torch.estimators import ProjectionContext  # noqa: E402
 
 
 def _assert_exact_packed_initializer_parity(model, graph):
@@ -304,6 +309,59 @@ def test_public_facade_executes_qat_ptq_and_refinement_artifacts_in_ort(tmp_path
         hard_pv.load_model(teacher)(example),
         rtol=1e-4,
         atol=1e-5,
+    )
+
+
+@pytest.mark.parametrize("source_dtype", [torch.float32, torch.bfloat16])
+def test_qat_threshold_codes_survive_hard_export_and_onnx_reload(
+    tmp_path, source_dtype
+):
+    midpoint = torch.tensor(1.0, dtype=torch.float32)
+    below = torch.nextafter(midpoint, torch.tensor(0.0))
+    above = torch.nextafter(midpoint, torch.tensor(2.0))
+    latent = torch.tensor(
+        [[below.item(), 3.0], [1.0, 3.0], [above.item(), 3.0]],
+        dtype=source_dtype,
+    )
+    dense = torch.nn.Linear(2, 3, bias=False, dtype=source_dtype)
+    with torch.no_grad():
+        dense.weight.copy_(latent)
+    prepared = prepare(
+        dense,
+        TernaryConfig.qat(
+            estimator="salt-ste",
+            target_modules=("Linear",),
+            planes=1,
+        ),
+        inplace=True,
+    )
+    assert isinstance(prepared.model, TernaryLinear)
+    projection = prepared.model.estimator.project(
+        prepared.model.weight,
+        context=ProjectionContext(step=0, training=False, role="weight"),
+    )
+    expected_trits = projection.planes[0].trits.detach().clone()
+    assert expected_trits[:, 1].tolist() == [1, 1, 1]
+    if source_dtype == torch.float32:
+        assert expected_trits[:, 0].tolist() == [0, 0, 1]
+    else:
+        # BF16 cannot distinguish the adjacent FP32 values, so all three land
+        # exactly on torch.round's ties-to-even zero code.
+        assert expected_trits[:, 0].tolist() == [0, 0, 0]
+
+    hard = convert(prepared)
+    bundle = export_onnx(
+        hard,
+        tmp_path / f"qat-boundary-{str(source_dtype).split('.')[-1]}",
+        example_inputs=torch.ones((1, 2), dtype=torch.float32),
+    )
+    graph = onnx.load(bundle.artifact_dir / "model.onnx", load_external_data=False)
+    _assert_exact_packed_initializer_parity(hard.model, graph)
+    runtime = load_onnx(bundle.artifact_dir)
+    runtime_input = torch.ones((2, 2), dtype=torch.float32)
+    expected = hard.model(runtime_input)
+    torch.testing.assert_close(
+        runtime(runtime_input), expected, rtol=0, atol=0
     )
 
 
