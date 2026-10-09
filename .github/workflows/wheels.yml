@@ -673,6 +673,15 @@ jobs:
           name: smollm2-cpu-tutorial
           path: evidence/smollm2-cpu/**
           if-no-files-found: error
+      # Receipt consumers should not need to download model/optimizer payloads
+      # just to inspect the measured tutorial gate. Keep the full replay archive
+      # above and publish its unchanged receipt separately.
+      - name: retain lightweight SmolLM2 tutorial receipt
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: smollm2-cpu-tutorial-receipt
+          path: evidence/smollm2-cpu/receipt.json
+          if-no-files-found: error
 
   cuda-wheel-smoke:
     name: Linux CUDA 13 wheel · Torch 2.11 · Python 3.13 · sm_89
