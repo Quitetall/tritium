@@ -3051,6 +3051,22 @@ that these internal search/saturation changes preserve the fixture's emitted
 artifact bytes. This is a focused development-tree check, not candidate-wheel
 or release admission.
 
+The subsequent exact-source hosted wheel workflow for `11c8295418edcb7f843a4f832bc4b8de40dad142`
+([run 37869695032](https://github.com/Quitetall/tritium/actions/runs/37869695032))
+also failed only its frozen tutorial-time gate. The same workflow recorded
+calibration `0.490s`, conversion `292.793s`, native checkpoint round trip
+`308.949s`, generation `344.480s`, ONNX export `426.530s`, ONNX replay
+`448.500s`, and QAT resume/final `454.424s` / `454.425s`, exceeding `300s` by
+`154.425s`. Its resource samples showed four logical CPUs, available memory
+around 13.4 GiB, temporary disk above 83 GiB, and no cgroup CPU throttling;
+sampled load average peaked at `5.64` (1 minute) on those four CPUs. The
+preceding exact-source run at `345fde73` measured `369.647s` total and
+`244.956s` conversion. These runs are not controlled repeats, and the changed
+runner load makes attribution of the slowdown uncertain; they do confirm the
+hosted gate remains red without any threshold change. CI, CodeQL, docs and
+capstone passed at `11c82954`; the pinned tutorial was the only wheel-workflow
+failure.
+
 ### Exact QAT hard-code ONNX round-trip (2026-10-08)
 
 At source `5c03ee0d`,
