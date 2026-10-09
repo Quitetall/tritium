@@ -779,6 +779,52 @@ def test_live_module_fit_consumes_bound_curvature_and_rejects_source_drift(tmp_p
     assert caught.value.code == "source_changed"
 
 
+def test_public_convert_repeats_identically_into_independent_artifacts(tmp_path):
+    """The public PTQ seam must produce identical bytes for fixed inputs."""
+    model = torch.nn.Linear(8, 2, bias=False)
+    with torch.no_grad():
+        model.weight.copy_(
+            torch.tensor(
+                [
+                    [0.91, -0.42, 0.13, 0.72, -0.31, 0.55, -0.08, -0.64],
+                    [-0.23, 0.87, -0.76, 0.18, 0.46, -0.59, 0.34, 0.11],
+                ]
+            )
+        )
+    prepared = prepare(
+        model,
+        TernaryConfig.ptq(profile="compact-v1", target_modules=("Linear",)),
+        inplace=False,
+    )
+    calibration = calibrate(
+        prepared,
+        [
+            torch.tensor(
+                [
+                    [1.0, 0.5, -0.25, 0.75, 0.125, -1.0, 0.375, 0.625],
+                    [0.25, -0.5, 1.0, 0.125, -0.75, 0.5, 0.875, -0.25],
+                ]
+            )
+        ],
+        evidence_dir=tmp_path / "evidence",
+    )
+
+    first = convert(prepared, calibration, work_dir=tmp_path / "first")
+    second = convert(prepared, calibration, work_dir=tmp_path / "second")
+
+    assert first.artifact_id == second.artifact_id
+    assert first.recipe_id == second.recipe_id
+    assert first.weight_names == second.weight_names
+    for name in first.weight_names:
+        left = first.weight(name)
+        right = second.weight(name)
+        assert left.weighted_mse == right.weighted_mse
+        assert len(left.planes) == len(right.planes)
+        for left_plane, right_plane in zip(left.planes, right.planes, strict=True):
+            torch.testing.assert_close(left_plane.trits, right_plane.trits, rtol=0, atol=0)
+            torch.testing.assert_close(left_plane.scales, right_plane.scales, rtol=0, atol=0)
+
+
 def test_adaptive_module_artifact_packs_variable_weight_plane_count(tmp_path):
     model = torch.nn.Linear(64, 2, bias=False)
     prepared = prepare(
