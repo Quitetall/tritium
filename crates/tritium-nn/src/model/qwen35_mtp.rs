@@ -1327,6 +1327,127 @@ mod tests {
     }
 
     #[test]
+    fn projection_probe_isolates_parent_cache_outputs_and_mtp_alignment() {
+        let mut target = a8_runner(Arc::new(AtomicBool::new(false)));
+        let mtp = a8_mtp(&target);
+        let mut cache = target.new_cache(8).unwrap();
+        let parent = target.forward(&[1, 2], &mut cache).unwrap();
+        let (candidate, mut candidate_cache) = target
+            .with_projection_override(
+                "model.language_model.layers.0.mlp.gate_proj.weight",
+                a8_projection(I, H),
+                |runner| {
+                    assert!(matches!(
+                        runner.forward(&[3], &mut cache),
+                        Err(NnError::Provenance(_))
+                    ));
+                    assert_eq!(cache.len(), 2);
+                    assert!(matches!(
+                        runner.logits_for_row(&parent, 0),
+                        Err(NnError::Provenance(_))
+                    ));
+                    let mut candidate_cache = runner.new_cache(8)?;
+                    let candidate = runner.forward(&[1, 2], &mut candidate_cache)?;
+                    assert!(matches!(
+                        mtp.align_step(&candidate, 1),
+                        Err(NnError::Provenance(_))
+                    ));
+                    let draft = mtp.draft_only_runner();
+                    let mut draft_cache = draft.new_cache(8)?;
+                    assert!(matches!(
+                        draft.forward(runner, &parent, 1, &mut draft_cache),
+                        Err(NnError::Provenance(_))
+                    ));
+                    assert!(draft_cache.is_empty());
+                    Ok((candidate, candidate_cache))
+                },
+            )
+            .unwrap();
+
+        assert!(matches!(
+            target.logits_for_row(&candidate, 0),
+            Err(NnError::Provenance(_))
+        ));
+        assert!(matches!(
+            target.reference_states(&candidate_cache, 1024),
+            Err(NnError::Provenance(_))
+        ));
+        assert!(matches!(
+            target.forward(&[3], &mut candidate_cache),
+            Err(NnError::Provenance(_))
+        ));
+        assert_eq!(candidate_cache.len(), 2);
+        assert!(mtp.align_step(&parent, 1).is_ok());
+        assert!(target.logits_for_row(&parent, 0).is_ok());
+        target.forward(&[3], &mut cache).unwrap();
+    }
+
+    #[test]
+    fn invalid_projection_override_preserves_parent_weight_state() {
+        let mut target = a8_runner(Arc::new(AtomicBool::new(false)));
+        let identity = Arc::clone(target.identity());
+        let mut cache = target.new_cache(8).unwrap();
+        let output = target.forward(&[1, 2], &mut cache).unwrap();
+        for (name, replacement) in [
+            ("missing-projection", a8_projection(I, H)),
+            (
+                "model.language_model.layers.0.mlp.gate_proj.weight",
+                a8_projection(I - 1, H),
+            ),
+        ] {
+            assert!(
+                target
+                    .with_projection_override::<()>(name, replacement, |_| panic!(
+                        "invalid override must not execute"
+                    ))
+                    .is_err()
+            );
+            assert!(Arc::ptr_eq(&identity, target.identity()));
+            assert!(target.logits_for_row(&output, 0).is_ok());
+        }
+        target.forward(&[3], &mut cache).unwrap();
+    }
+
+    #[test]
+    fn projection_probe_restores_parent_identity_on_error_and_unwind() {
+        let mut target = a8_runner(Arc::new(AtomicBool::new(false)));
+        let mtp = a8_mtp(&target);
+        let mut cache = target.new_cache(8).unwrap();
+        let parent = target.forward(&[1, 2], &mut cache).unwrap();
+        let identity = Arc::clone(target.identity());
+        let mut candidate_identity = None;
+        let error = target.with_projection_override(
+            "model.language_model.layers.0.mlp.gate_proj.weight",
+            a8_projection(I, H),
+            |runner| {
+                candidate_identity = Some(Arc::clone(runner.identity()));
+                Err::<(), _>(NnError::Backend("stop probe".into()))
+            },
+        );
+        assert!(error.is_err());
+        assert!(!Arc::ptr_eq(
+            &identity,
+            candidate_identity.as_ref().unwrap()
+        ));
+        assert!(Arc::ptr_eq(&identity, target.identity()));
+
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = target.with_projection_override(
+                "model.language_model.layers.0.mlp.gate_proj.weight",
+                a8_projection(I, H),
+                |runner| -> Result<(), NnError> {
+                    assert!(!Arc::ptr_eq(&identity, runner.identity()));
+                    panic!("intentional probe unwind")
+                },
+            );
+        }));
+        assert!(unwind.is_err());
+        assert!(Arc::ptr_eq(&identity, target.identity()));
+        assert!(mtp.align_step(&parent, 1).is_ok());
+        target.forward(&[3], &mut cache).unwrap();
+    }
+
+    #[test]
     fn only_production_checkpoint_receipt_qualifies_for_production() {
         let mut receipt = Qwen35MtpParityReceipt {
             source_model_id: tritium_format::ModelId::from_digest([1; 32]),

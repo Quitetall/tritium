@@ -449,6 +449,7 @@ struct ProjectionRestoreGuard<'a> {
     runner: &'a mut Qwen35TextRunner,
     tensor_name: String,
     original: Option<Projection>,
+    original_identity: Arc<RunnerIdentity>,
 }
 
 impl Drop for ProjectionRestoreGuard<'_> {
@@ -456,9 +457,13 @@ impl Drop for ProjectionRestoreGuard<'_> {
         if let Some(original) = self.original.take() {
             // The slot was resolved before guard creation and cannot be
             // structurally removed while the callback holds the runner.
-            let _ = self
+            if self
                 .runner
-                .replace_named_projection(&self.tensor_name, original);
+                .replace_named_projection(&self.tensor_name, original)
+                .is_ok()
+            {
+                self.runner.identity = Arc::clone(&self.original_identity);
+            }
         }
     }
 }
@@ -670,6 +675,8 @@ impl Qwen35TextRunner {
     /// Temporarily replace one canonical language projection while executing a
     /// paired measurement. The dense projection is restored on normal return,
     /// error, and panic unwind. The model is single-threaded during the callback.
+    /// The candidate uses a separate identity: parent caches and outputs cannot
+    /// cross into it, and candidate objects cannot be used after restoration.
     #[allow(dead_code)] // The GDN probe producer is the next consumer of this seam.
     pub(crate) fn with_projection_override<T>(
         &mut self,
@@ -678,10 +685,12 @@ impl Qwen35TextRunner {
         execute: impl FnOnce(&Self) -> Result<T, NnError>,
     ) -> Result<T, NnError> {
         let original = self.replace_named_projection(tensor_name, replacement)?;
+        let original_identity = std::mem::replace(&mut self.identity, Arc::new(RunnerIdentity));
         let guard = ProjectionRestoreGuard {
             runner: self,
             tensor_name: tensor_name.to_owned(),
             original: Some(original),
+            original_identity,
         };
         let result = execute(&*guard.runner)?;
         drop(guard);
@@ -830,11 +839,23 @@ impl Qwen35TextRunner {
     /// Apply one tensor's scale-only candidate to its uniquely identified SALT V2
     /// projection. The full model graph is scanned before mutation; host and CUDA
     /// residents validate the complete update before publishing changed scales.
+    /// Success starts a new weight-state identity, invalidating all existing
+    /// caches and outputs. Create a fresh cache; resetting an old one does not
+    /// rebind it. Rejected updates preserve the previous identity.
     ///
     /// # Errors
     /// Rejects empty or mixed-tensor updates, missing or ambiguous tensor
     /// identity, shared resident storage, and malformed scale candidates.
     pub fn apply_salt_v2_scale_updates(
+        &mut self,
+        updates: &[SaltV2ScaleUpdate],
+    ) -> Result<(), NnError> {
+        self.apply_scale_updates_to_projection(updates)?;
+        self.identity = Arc::new(RunnerIdentity);
+        Ok(())
+    }
+
+    fn apply_scale_updates_to_projection(
         &mut self,
         updates: &[SaltV2ScaleUpdate],
     ) -> Result<(), NnError> {

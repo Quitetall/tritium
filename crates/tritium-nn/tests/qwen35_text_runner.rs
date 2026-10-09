@@ -422,6 +422,80 @@ fn scale_updates_route_by_package_tensor_identity_through_qwen_layers() {
     );
 }
 
+#[test]
+fn successful_scale_update_rejects_previous_cache_and_output_weight_state() {
+    let mut runner = runner_with_host_qkv();
+    let mut cache = runner.new_cache(8).unwrap();
+    let output = runner.forward(&[1, 2], &mut cache).unwrap();
+    let update = SaltV2ScaleUpdate::new(0, 0, 0, vec![f16::from_f32(2.0)]).unwrap();
+    runner
+        .apply_salt_v2_scale_updates(std::slice::from_ref(&update))
+        .unwrap();
+
+    assert!(matches!(
+        runner.forward(&[3], &mut cache),
+        Err(NnError::Provenance(_))
+    ));
+    assert_eq!(cache.len(), 2);
+    assert!(matches!(
+        runner.reference_states(&cache, 1024),
+        Err(NnError::Provenance(_))
+    ));
+    assert!(matches!(
+        runner.logits_for_row(&output, 0),
+        Err(NnError::Provenance(_))
+    ));
+    cache.reset();
+    assert!(matches!(
+        runner.forward(&[1], &mut cache),
+        Err(NnError::Provenance(_))
+    ));
+
+    let mut fresh = runner.new_cache(8).unwrap();
+    let updated = runner.forward(&[1, 2], &mut fresh).unwrap();
+    assert_ne!(output.final_hidden_states(), updated.final_hidden_states());
+    assert!(runner.reference_states(&fresh, 1024).is_ok());
+    assert!(runner.logits_for_row(&updated, 0).is_ok());
+}
+
+#[test]
+fn rejected_scale_updates_preserve_cache_and_output_weight_state() {
+    let mut runner = runner_with_host_qkv();
+    let mut cache = runner.new_cache(8).unwrap();
+    let output = runner.forward(&[1, 2], &mut cache).unwrap();
+    for update in [
+        SaltV2ScaleUpdate::new(1, 0, 0, vec![f16::ONE]).unwrap(),
+        SaltV2ScaleUpdate::new(0, 0, 0, vec![f16::ZERO]).unwrap(),
+    ] {
+        assert!(runner.apply_salt_v2_scale_updates(&[update]).is_err());
+        assert!(runner.reference_states(&cache, 1024).is_ok());
+        assert!(runner.logits_for_row(&output, 0).is_ok());
+    }
+    runner.forward(&[3], &mut cache).unwrap();
+    assert_eq!(cache.len(), 3);
+}
+
+#[test]
+fn successful_identical_scale_update_also_starts_a_new_weight_state() {
+    let mut runner = runner_with_host_qkv();
+    let mut cache = runner.new_cache(8).unwrap();
+    let before = runner.forward(&[1, 2], &mut cache).unwrap();
+    let update = SaltV2ScaleUpdate::new(0, 0, 0, vec![f16::ONE]).unwrap();
+    runner.apply_salt_v2_scale_updates(&[update]).unwrap();
+    assert!(matches!(
+        runner.logits_for_row(&before, 0),
+        Err(NnError::Provenance(_))
+    ));
+    assert!(matches!(
+        runner.forward(&[3], &mut cache),
+        Err(NnError::Provenance(_))
+    ));
+    let after = runner
+        .forward(&[1, 2], &mut runner.new_cache(8).unwrap())
+        .unwrap();
+    assert_eq!(before.final_hidden_states(), after.final_hidden_states());
+}
+
 fn assert_close(actual: &[f32], expected: &[f32], tolerance: f32) {
     assert_eq!(actual.len(), expected.len());
     for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {

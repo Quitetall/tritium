@@ -539,6 +539,9 @@ impl Qwen35SaltV2LanguageMtpModel {
     /// Apply one fitted scale-only candidate to a uniquely identified host or
     /// CUDA projection in the loaded language graph. MTP weights remain outside this
     /// operation until their execution and update contract is verified.
+    /// Success invalidates existing language caches/outputs and the previous MTP
+    /// target binding. Reload an immutable child to reassemble target and MTP
+    /// together; the load receipt does not qualify an in-place mutated candidate.
     ///
     /// # Errors
     /// Returns an error if tensor identity is absent or ambiguous, resident
