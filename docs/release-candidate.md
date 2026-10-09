@@ -4129,3 +4129,25 @@ package artifacts, so the full `packages` gate remains open. At the time of
 recording (2026-10-09 10:53 UTC), the wheels run's pinned SmolLM2 CPU tutorial
 was still in progress; its timing/quality result is not inferred from the
 successful matrix or other wheel jobs.
+
+### Exact-head SmolLM2 CPU ONNX parity failure — 2026-10-09
+
+The next exact-head wheels run, [37926625146](https://github.com/Quitetall/tritium/actions/runs/37926625146)
+for `bc995de7753b9492c1e1e70dc42307bd77bec904`, completed the pinned tutorial's
+conversion and native checkpoint round-trip in 44.268 seconds, then failed the
+unchanged ONNX CPU parity assertion. On the 4-vCPU AMD EPYC 9V45 runner, with
+roughly 14 GiB available memory, over 80 GiB temporary disk, no CPU throttling,
+and OMP/MKL thread caps unset, the comparison had 3 mismatches among 344,064
+logit elements. Maximum absolute error was `0.00010390579700469971` against
+`atol=1e-4`; the worst relative error was `1.671875` against `rtol=1e-4`.
+The workflow's ABI3 matrix and other wheel jobs passed, but the overall wheels
+run and required pinned tutorial gate did not.
+
+A local standalone check of the first `model.layers.0.self_attn.q_proj` on the
+i9-14900K compared PyTorch with both ONNX `MatMul+Add` and `Gemm` lowerings;
+each differed by at most `9.53674316406e-07`. This rules out neither later
+layers nor the full-graph numerical path. The mismatch remains unresolved;
+do not change the frozen tolerance or infer a general hardware-specific cause
+from the available samples. Next diagnostic: localize the full-model difference
+to intermediate graph boundaries, then rerun the exact hosted tutorial after a
+source-backed correction.
