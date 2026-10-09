@@ -78,6 +78,10 @@ on:
       - "examples/colab/tritium-smollm2-v11.ipynb"
       - "scripts/qualify-smollm2-release-tutorial.py"
       - "scripts/tests/test_qualify_smollm2_release_tutorial.py"
+      - "scripts/qualify-onnx-inference.py"
+      - "scripts/verify-onnx-inference-receipt.py"
+      - "scripts/tests/test_qualify_onnx_inference.py"
+      - "scripts/tests/test_verify_onnx_inference_receipt.py"
       - "examples/python/installed_qat.py"
       - "scripts/tests/test_installed_qat_tutorial.py"
       - "scripts/tests/test_hf_lifecycle.py"
@@ -355,7 +359,7 @@ jobs:
       - name: install pinned Hugging Face dependencies
         run: >-
           python -m pip install --disable-pip-version-check --only-binary=:all:
-          transformers==5.5.3 safetensors==0.8.0 pytest==9.0.2
+          transformers==5.5.3 safetensors==0.8.0 pytest==9.0.2 zstandard==0.25.0
       - name: install exact Tritium wheel without dependency resolution
         shell: bash
         run: >-
@@ -363,12 +367,14 @@ jobs:
           --no-index --no-deps --only-binary=:all: dist/*.whl
       - name: qualify public PTQ row-fitting parallelism
         run: python -m unittest scripts.tests.test_ptq_parallelism -v
-      - name: test exact-wheel public PTQ artifacts
+      - name: test exact-wheel public PTQ artifacts and ONNX custody
         env:
           TRITIUM_TEST_INSTALLED_WHEEL: "1"
         run: >-
           python -I -m pytest -q
           crates/tritium-py/tests/test_ptq_artifacts.py
+          crates/tritium-py/tests/test_bundle_binding.py
+          crates/tritium-py/tests/test_qualify_onnx_worker.py
       - name: test installed tutorial receipt admission
         run: >-
           python -m unittest discover

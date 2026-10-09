@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import hashlib
 import importlib.metadata
 import json
@@ -12,11 +13,12 @@ from pathlib import Path
 import platform
 import shutil
 import tempfile
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterator, Mapping, Sequence
 
 import torch
 
 from .. import QwenModel
+from .bundle_binding import BoundBundle, BundleBindingError
 from .config import TernaryConfig
 from .conversion import prepare_qat
 from .onnx import export_onnx, load_onnx
@@ -57,7 +59,7 @@ def _ordinary(path: Path, label: str) -> Path:
 def _directory(path: Path, label: str) -> Path:
     if path.is_symlink() or not path.is_dir():
         raise OnnxQualificationError(f"{label} must be an ordinary directory")
-    return path.resolve(strict=True)
+    return Path(os.path.abspath(path))
 
 
 def _artifact(value: Mapping[str, Any], kind: str, label: str) -> dict[str, Any]:
@@ -366,7 +368,8 @@ def _unknown_operator_fault() -> None:
     )
 
 
-def _faults(bundle: Path) -> list[dict[str, Any]]:
+@contextmanager
+def _fault_workspace(bundle: Path) -> Iterator[Path]:
     # Keep the fault workspace on the bundle filesystem so the potentially
     # tens-of-gigabytes external arena can be hard-linked, never copied.
     with tempfile.TemporaryDirectory(
@@ -375,64 +378,78 @@ def _faults(bundle: Path) -> list[dict[str, Any]]:
         root = Path(raw)
         graph = root / "graph"
         _copy_bundle(bundle, graph)
-        language = graph / "language.onnx"
-        with language.open("r+b") as stream:
-            stream.seek(-1, os.SEEK_END)
-            value = stream.read(1)
-            stream.seek(-1, os.SEEK_END)
-            stream.write(bytes([value[0] ^ 0x01]))
-
         weights = root / "weights"
         _copy_bundle(bundle, weights, weights=b"corrupt")
-
         traversal = root / "traversal"
         _copy_bundle(bundle, traversal)
-        manifest = json.loads((traversal / "tritium-onnx-manifest.json").read_bytes())
-        manifest["language"]["file"] = "../language.onnx"
-        (traversal / "tritium-onnx-manifest.json").write_text(
-            json.dumps(manifest, sort_keys=True, separators=(",", ":")),
-            encoding="utf-8",
-        )
-
         checkpoint = root / "trainable-import"
         checkpoint.mkdir()
         (checkpoint / "optimizer.pt").write_bytes(b"training state")
+        yield root
 
-        return [
-            _rejected(
-                "graph-corruption",
-                lambda: load_onnx(graph),
-                message_tokens=("digest", "hash"),
+
+def _faults(bundle: Path, root: Path) -> list[dict[str, Any]]:
+    graph, weights, traversal = (root / name for name in ("graph", "weights", "traversal"))
+    checkpoint = root / "trainable-import"
+    # The small copied graph/manifest files must still match the admitted
+    # source before intentional faults. Weight links retain the same inode.
+    for destination in (graph, weights, traversal):
+        for name in ("language.onnx", "mtp.onnx", "tritium-onnx-manifest.json"):
+            if _sha256(destination / name) != _sha256(bundle / name):
+                raise OnnxQualificationError("fault workspace differs from bound candidate")
+    original = (bundle / "weights.bin").stat()
+    for destination in (graph, traversal):
+        linked = (destination / "weights.bin").stat()
+        if (linked.st_dev, linked.st_ino) != (original.st_dev, original.st_ino):
+            raise OnnxQualificationError("fault weights are not the bound candidate inode")
+    language = graph / "language.onnx"
+    with language.open("r+b") as stream:
+        stream.seek(-1, os.SEEK_END)
+        value = stream.read(1)
+        stream.seek(-1, os.SEEK_END)
+        stream.write(bytes([value[0] ^ 0x01]))
+    manifest = json.loads((traversal / "tritium-onnx-manifest.json").read_bytes())
+    manifest["language"]["file"] = "../language.onnx"
+    (traversal / "tritium-onnx-manifest.json").write_text(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+
+    return [
+        _rejected(
+            "graph-corruption",
+            lambda: load_onnx(graph),
+            message_tokens=("digest", "hash"),
+        ),
+        _rejected(
+            "weights-corruption",
+            lambda: load_onnx(weights),
+            message_tokens=("digest", "hash", "length", "bytes"),
+        ),
+        _rejected(
+            "path-traversal",
+            lambda: load_onnx(traversal),
+            message_tokens=("path", "unsafe", "canonical", "file"),
+        ),
+        _rejected(
+            "unknown-operator",
+            _unknown_operator_fault,
+            message_tokens=("unknownqualificationop",),
+        ),
+        _rejected(
+            "trainable-export",
+            lambda: export_onnx(
+                prepare_qat(torch.nn.Linear(4, 4), TernaryConfig.qat()),
+                root / "trainable-export",
             ),
-            _rejected(
-                "weights-corruption",
-                lambda: load_onnx(weights),
-                message_tokens=("digest", "hash", "length", "bytes"),
-            ),
-            _rejected(
-                "path-traversal",
-                lambda: load_onnx(traversal),
-                message_tokens=("path", "unsafe", "canonical", "file"),
-            ),
-            _rejected(
-                "unknown-operator",
-                _unknown_operator_fault,
-                message_tokens=("unknownqualificationop",),
-            ),
-            _rejected(
-                "trainable-export",
-                lambda: export_onnx(
-                    prepare_qat(torch.nn.Linear(4, 4), TernaryConfig.qat()),
-                    root / "trainable-export",
-                ),
-                codes=("trainable_onnx_requires_v1_3",),
-            ),
-            _rejected(
-                "trainable-import",
-                lambda: load_onnx(checkpoint),
-                codes=("trainable_onnx_requires_v1_3",),
-            ),
-        ]
+            codes=("trainable_onnx_requires_v1_3",),
+        ),
+        _rejected(
+            "trainable-import",
+            lambda: load_onnx(checkpoint),
+            codes=("trainable_onnx_requires_v1_3",),
+        ),
+    ]
 
 
 def _source_free_environment() -> tuple[bool, bool]:
@@ -454,6 +471,8 @@ def run(
     model_artifact_id: str,
     onnx_bundle: Path,
     native_bundle: Path,
+    onnx_archive: Path,
+    native_archive: Path,
     profile: str,
     conversion_mode: str,
     source_revision: str,
@@ -490,6 +509,41 @@ def run(
     ):
         raise OnnxQualificationError("candidate manifest digest is malformed")
 
+    try:
+        # Create/remove hardlinks outside the custody lifetime: link operations
+        # change ctime even though the authenticated payload bytes stay intact.
+        with _fault_workspace(onnx_bundle) as faults, BoundBundle(
+            onnx_archive, onnx_bundle, artifact_identity
+        ) as onnx_bound, BoundBundle(native_archive, native_bundle, model_identity) as native_bound:
+            return _execute(
+                onnx_bundle=onnx_bound.bundle, native_bundle=native_bound.bundle,
+                wheel_identity=wheel_identity, artifact_identity=artifact_identity,
+                model_identity=model_identity, model_artifact_id=model_artifact_id,
+                profile=profile, conversion_mode=conversion_mode,
+                source_revision=source_revision, release=release, run_id=run_id,
+                candidate_manifest_sha256=candidate_manifest_sha256,
+                fault_workspace=faults,
+            )
+    except (BundleBindingError, OSError) as error:
+        raise OnnxQualificationError(str(error)) from error
+
+
+def _execute(
+    *,
+    onnx_bundle: Path,
+    native_bundle: Path,
+    wheel_identity: dict[str, Any],
+    artifact_identity: dict[str, Any],
+    model_identity: dict[str, Any],
+    model_artifact_id: str,
+    profile: str,
+    conversion_mode: str,
+    source_revision: str,
+    release: str,
+    run_id: str,
+    candidate_manifest_sha256: str,
+    fault_workspace: Path,
+) -> dict[str, Any]:
     native = QwenModel.load(str(native_bundle), profile=profile, device="cpu")
     _require_mtp_oracle(native)
     ort_model = load_onnx(onnx_bundle, device="cpu")
@@ -581,7 +635,7 @@ def run(
             "persistent_dense_shadows": 0,
         },
         "cases": cases,
-        "faults": _faults(onnx_bundle),
+        "faults": _faults(onnx_bundle, fault_workspace),
     }
 
 
@@ -609,6 +663,8 @@ def main() -> int:
     parser.add_argument("--model-artifact-id", required=True)
     parser.add_argument("--onnx-bundle", type=Path, required=True)
     parser.add_argument("--native-bundle", type=Path, required=True)
+    parser.add_argument("--onnx-archive", type=Path, required=True)
+    parser.add_argument("--native-archive", type=Path, required=True)
     parser.add_argument("--profile", required=True)
     parser.add_argument("--conversion-mode", required=True)
     parser.add_argument("--source-revision", required=True)
@@ -625,6 +681,8 @@ def main() -> int:
         model_artifact_id=args.model_artifact_id,
         onnx_bundle=args.onnx_bundle,
         native_bundle=args.native_bundle,
+        onnx_archive=args.onnx_archive,
+        native_archive=args.native_archive,
         profile=args.profile,
         conversion_mode=args.conversion_mode,
         source_revision=args.source_revision,
