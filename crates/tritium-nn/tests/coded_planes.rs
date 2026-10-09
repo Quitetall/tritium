@@ -81,6 +81,29 @@
 //! 4.8%. The best 4.09-bpw fit is now Golay 2+½ + Kronecker LDLQ (curvature 0.160 against ~0.34 for
 //! ladder+GPTQ interpolated at the same bytes). Cost: about 2.5× the BlockLDLQ fit time (row loop).
 //!
+//! # Trellis-coded trit-planes (2026-10-09) — same model, plain nearest-path (Viterbi) fits
+//!
+//! `T` coarse planes plus one bit per weight choosing 2 of the 3 finest-trit cosets along a
+//! shift-register trellis (rate `T·log₂3 + 1`): every reconstruction is still a sum of `T + 1`
+//! trit planes. Tables searched on seeded Gaussian rows.
+//!
+//! ```text
+//! structure                 bits/w      ppl    even (curvature)   odd      SNR dB
+//! trellis 1+1bit S=64        2.710    68.944      +1.23159      +0.02081    14.12
+//! trellis 1+1bit S=256       2.710    71.071      +1.23538      +0.04741    14.09
+//! trellis 2+1bit S=64        4.295    22.939      +0.15112      +0.00083    22.47
+//! trellis 2+1bit S=256       4.295    22.850      +0.14749      +0.00057    22.62
+//! ```
+//!
+//! **The trellis ties the Golay code; it does not beat it.** Different rates, so both are read
+//! against the ladder curve (SNR linear in bits, curvature log-linear, between T and T+1):
+//! SNR gain +0.60 dB (S=64) / +0.57 (S=256) at 1+1bit and +0.53 / +0.68 at 2+1bit, against Golay
+//! +0.64 / +0.57; curvature 0.70× / 0.84× the interpolated ladder against Golay 0.74× / 0.84×.
+//! The prototype's +0.1 dB edge over Golay (on sampled groups) does not survive the whole model,
+//! and 256 states buy nothing over 64 at T=1 (ppl delta is inside the odd-term noise). Golay keeps
+//! the advantage that matters for hardware: independent 12-blocks (random access, one table
+//! lookup) versus a sequential Viterbi path per row. Golay stays the coded structure.
+//!
 //! ```text
 //! TRITIUM_CORPUS=$HOME/.cache/tritium-corpora/wikitext2_400k_32k.json \
 //!   cargo test -p tritium-nn --release --test coded_planes -- --ignored --nocapture
