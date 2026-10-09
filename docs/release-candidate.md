@@ -2802,3 +2802,27 @@ These are two of the seven required backend families at one exact source
 revision. They do not yet form an aggregate release receipt, cover WASI/MCU,
 ROCm, Metal or native wgpu, or qualify the separate performance gate. The
 bundles must be regenerated if the source changes before candidate freeze.
+
+### Exact-head SmolLM2 tutorial outcome — 2026-10-09
+
+The completed hosted wheel workflow
+[run 37861626145](https://github.com/Quitetall/tritium/actions/runs/37861626145)
+tested source `8c5a994e11763503dd35d38e8a128b08dbf47266`. Wheel builds for
+Linux, macOS, and Windows, installed-wheel smoke, the source-free tutorial, and
+the ABI3 matrix passed. The CUDA wheel lane was skipped as configured. The
+pinned SmolLM2 CPU tutorial completed its functional path but failed the frozen
+`300s` budget at `749.959s`. Stage markers recorded conversion at `526.575s`,
+native checkpoint round-trip at `547.678s`, generation at `591.284s`, ONNX
+export at `717.628s`, ONNX replay at `742.924s`, and QAT resume at `749.959s`;
+calibration took `0.610s`. The job failed only when enforcing the wall-time
+budget after QAT resume. No tutorial receipt artifact was uploaded by this
+failed job, so these timings are preserved from its hosted job log.
+
+This run is about `169s` faster end-to-end than the prior recorded hosted run at
+`919.186s`, but the runs are not a controlled before/after experiment and this
+result remains `450s` over budget. It therefore does not attribute the
+difference to a particular optimization and does not pass the release gate.
+The public `prepare` → `calibrate` → `convert()` artifact-path test
+`test_public_convert_persists_grouped_fit_artifact` passes locally and verifies
+the persisted artifact hashes; the latest hosted failure confirms that this
+software seam is functional but does not yet make full-model PTQ fast enough.
