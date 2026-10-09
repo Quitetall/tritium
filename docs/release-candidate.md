@@ -3165,6 +3165,27 @@ or held-out quality result. It prioritizes exact assignment and reconstruction
 as well as relay initialization for further profiling; no recipe change or
 performance claim is made.
 
+### CPU FSDP DCP export route and bounded PTQ artifact regression — 2026-10-08
+
+At source commit `d99feaff`, the two-rank CPU FSDP QAT step, sharded DCP
+checkpoint/resume, offline shard merge into a fresh model, exact-logit
+comparison, and safe-serialization export passed:
+
+```text
+PYTHONPATH=crates/tritium-py/python \
+  /home/brianklam/.cache/tritium-py313-ci/bin/python -m pytest -q \
+  crates/tritium-py/tests/test_huggingface_distributed.py::test_two_rank_cpu_fsdp_step_and_sharded_state_resume
+1 passed in 3.17s
+```
+
+This supported route avoids the known crashing PyTorch 2.11 CPU
+`FSDP.state_dict()` full-state gather; it does not establish that upstream
+full-state gathering is fixed or qualify accelerator DDP/FSDP. The separate
+public `prepare → calibrate → convert()` PTQ artifact test now caps the live
+fit at one output row (`40 KiB`), reopens the exported artifact, and pins all
+six payload/manifest hashes. The PTQ artifact suite passed (`39 passed`); this
+is a bounded-memory regression check, not a full-model memory or timing gate.
+
 ### Exact-assignment midpoint scratch reduction — 2026-10-08
 
 The exact assignment loop now stores its at-most 26 f64 codebook midpoints in
