@@ -4211,3 +4211,24 @@ This is now sufficient for exact offline replay. It is still a failure, not a
 parity pass. Next: reproduce ORT's captured output locally, then expose and
 compare intermediate graph boundaries against the original model to locate the
 first divergent operation before proposing a correction.
+
+#### Local runtime replay — 2026-10-09
+
+The captured graph and input were replayed on the i9-14900K with ORT 1.27.0,
+the package's `_session_options()` (`ORT_DISABLE_ALL`), CPUExecutionProvider,
+and otherwise identical settings while changing only `intra_op_num_threads`.
+The local output hash differs from the hosted output at both settings, so this
+is a numerical replay, not byte-identical reproduction:
+
+| ORT intra-op threads | Local max abs vs PyTorch | Tolerance failures | Max tolerance ratio | Max abs vs hosted ORT |
+|---:|---:|---:|---:|---:|
+| 1 | `0.0001380443572998047` | 3 / 344,064 | `1.0363115` | `0.0000476837158203125` |
+| 4 | `0.00009250640869140625` | 0 / 344,064 | `0.7068673` | `0.000057220458984375` |
+
+Both local runs had their worst normalized error at `(0, 0, 34041)`. This
+confirms that CPU intra-op scheduling changes the observed drift on this host,
+but it does not explain the hosted EPYC's four-thread failure. Do not treat
+thread pinning as a fix or a hardware-agnostic parity result. The next
+diagnostic must compare intermediate model/graph boundaries on both the
+captured input and the matching compact model, then isolate the first operation
+whose error grows across the bound.
