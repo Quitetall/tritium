@@ -4263,8 +4263,18 @@ crosses tolerance. It does not reproduce the hosted AMD failure and does not
 establish the source of the hosted mismatch. Final LM-head amplification of
 accumulated drift remains a hypothesis, not a finding.
 
-The next useful experiment is a matched final-projection comparison using the
-captured packed weights and the ORT final hidden state, without changing the
-parity threshold. It is deferred until the local CPU has thermal headroom; at
-the time of this note the package sensor reported 73°C. Hosted parity remains
-RED, and the v1.1 release gate is not cleared.
+The matched local final-projection comparison is now complete. The last
+hidden-state candidate was `mul_8378`. Applying the reconstructed model's
+PyTorch `lm_head` to that ORT-produced hidden state differed from local ORT
+logits by at most `1.5020370483398438e-05`; compared with the captured hosted
+PyTorch reference, it differed by at most `8.58306884765625e-05`, with zero
+tolerance violations. This weakens the hypothesis that final-projection
+amplification alone explains the local replay, but it does not exclude an
+AMD-specific interaction or earlier accumulated drift.
+
+The hosted AMD failure remains unresolved. The next diagnostic must capture
+the final graph's individual LM-head output shards and their shared hidden-state
+input on the failing runner, while leaving the frozen tolerance unchanged.
+Until that hosted evidence is available and a source-backed correction passes
+the pinned tutorial, ONNX parity remains RED and the v1.1 release gate is not
+cleared.
