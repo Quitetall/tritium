@@ -104,7 +104,6 @@ class SmolLM2ReleaseTutorialTests(unittest.TestCase):
         self.assertIn("transformers==5.5.3", job)
         self.assertIn("onnxruntime==1.27.0", job)
         self.assertIn("--wheel dist/*.whl", job)
-        self.assertIn('RAYON_NUM_THREADS: "16"', job)
         self.assertIn('device="cpu"', SCRIPT.read_text())
         self.assertIn("SMOLLM2_MODEL_ID", SCRIPT.read_text())
         self.assertIn("SMOLLM2_REVISION", SCRIPT.read_text())

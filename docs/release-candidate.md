@@ -3630,3 +3630,25 @@ pressure or cgroup quota throttling. The local exact-wheel 4-versus-16 Rayon
 comparison motivates a single hosted `RAYON_NUM_THREADS=16` configuration
 experiment; the result must be measured on hosted CI before drawing a conclusion.
 The `300s` release gate is unchanged.
+
+### Hosted Rayon oversubscription trial — 2026-10-09 (rejected)
+
+Hosted workflow
+[37886032266](https://github.com/Quitetall/tritium/actions/runs/37886032266)
+ran the same pinned tutorial with `RAYON_NUM_THREADS=16` on four logical
+CPUs. Every functional phase completed, but the frozen budget still failed at
+`558.784s`. Conversion was `340.113s` cumulative (`339.513s` after
+calibration), versus `342.597s` cumulative (`341.999s` after calibration) in
+the immediately preceding default-thread hosted run. End-to-end time changed
+from `564.452s` to `558.784s` (about `1%`); because these were separate hosted
+runners, this small difference is not controlled evidence of a speedup.
+
+The 16-thread run's 39 resource samples showed four logical CPUs, at least
+`12.82 GiB` available memory, `83.28 GiB` temporary disk, zero cgroup throttle
+events, and a peak one-minute host load of `17.82`. The preceding default
+thread run peaked at `5.68`; different runners and external load prevent
+causal attribution, but the 16-thread setting clearly did not close the gate
+and coincided with substantial runnable-thread pressure. The speculative
+setting was removed; the workflow again uses the runtime's default Rayon pool.
+Keep the `300s` contract unchanged and pursue solver-level improvements with
+matched artifact/quality checks.

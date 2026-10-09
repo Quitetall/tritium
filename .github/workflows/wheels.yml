@@ -598,10 +598,6 @@ jobs:
           --no-index --no-deps --only-binary=:all: dist/*.whl
       - name: run and validate pinned SmolLM2 CPU tutorial
         shell: bash
-        env:
-          # Trial the locally measured thread configuration on the 4-vCPU runner.
-          # This changes no timeout or acceptance criteria; hosted timing decides.
-          RAYON_NUM_THREADS: "16"
         run: |
           set -euo pipefail
           python -m unittest scripts.tests.test_qualify_smollm2_release_tutorial -v
