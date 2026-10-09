@@ -190,6 +190,29 @@ and abi3 matrix passed for this commit; CUDA, fuzz, GPU/backend physical, and
 performance gates were skipped. The overall wheels workflow remains FAIL
 because the pinned SmolLM2 ONNX parity gate fails.
 
+#### Bounded down-projection replay (2026-10-09)
+
+A follow-up diagnostic decoded the exact `linear_83` packed ternary weight and
+scales from the verified hosted artifact, then replayed the captured projection
+inputs through local PyTorch `F.linear`. With the captured ONNX product as input,
+the local output matched hosted ONNX `linear_83` within `3.05176e-5` maximum
+absolute error (maximum tolerance ratio `0.02550`, zero failures). With the
+reference product (`activation * up`) and the same reconstructed weight, the
+local output matched the captured reference MLP output within `0.001953125`
+(maximum tolerance ratio `0.02586`, zero failures). The captured ONNX product
+and reference product differed by up to `0.00390625`; applying the same local
+kernel and weight to those two inputs changed the projection output by up to
+`0.0302734375` (maximum tolerance ratio `0.06952`, zero failures), close to the
+observed `0.0322265625` down-projection boundary drift.
+
+This supports the MLP product input as the main contributor to the large
+absolute down-projection drift, rather than showing a standalone down-projection
+kernel error. It is not an exact same-host replay: ONNX ran on AMD EPYC 7763,
+while this local PyTorch replay ran on Intel Core i9-14900K. It therefore
+localizes a likely source but does not prove causality, establish backend parity,
+or satisfy any release gate. The fixed `1e-4` terminal-logit parity gate remains
+red; no tolerance or release contract changed.
+
 ## Gate status (measured 2026-09-03)
 
 ### Hugging Face distributed CPU software checks (2026-10-04)
