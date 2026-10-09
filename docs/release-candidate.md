@@ -3986,3 +3986,36 @@ module outputs match exactly. The existing constrained-run artifact digests
 remain pinned. The focused test passed, and the complete PTQ artifact file
 passed (`39 passed`); this is deterministic CPU regression coverage, not model
 quality, performance, or release qualification evidence.
+
+### Exact-head release CI and frontend receipt harvest — 2026-10-09
+
+Hosted workflows ran source revision `7ada97b07dc367be2e82b100965b13c6942c597f`.
+The wheels run [37907965102](https://github.com/Quitetall/tritium/actions/runs/37907965102)
+passed Linux, Windows, and macOS wheel builds, all 16 ABI3 compatibility cells,
+installed-wheel functional smoke, API-signature, dispatch-overhead, installed
+QAT tutorial, and source-free Hugging Face lifecycle/export/observability jobs.
+The pinned SmolLM2 CPU tutorial completed every function but failed the unchanged
+300-second gate at `562.013s`: calibration `0.597s`, PTQ conversion `341.725s`,
+checkpoint round-trip `362.344s`, generation `405.068s`, ONNX export `530.135s`,
+ONNX replay `555.090s`, and QAT resume `562.013s`. No tutorial qualification
+receipt was emitted. Preserve the timeout and improve the measured bottlenecks.
+
+The exact-CI-wheel candidate and a new local evidence registry were assembled
+under ignored `release/v1.1/` outputs. The receipt validators accept the newly
+harvested frontend lifecycle, export/reload, and observability evidence alongside
+the earlier API, CPU dispatch, and installed tutorial receipts. The evaluated
+registry passes `packages`; PyTorch/HF still lacks distributed-training and
+CUDA-dispatch receipts. This local registry evaluation is not release activation
+or a clean-worktree release check.
+
+The same revision's general CI and capstone CPU E2E smoke workflows
+([37907964977](https://github.com/Quitetall/tritium/actions/runs/37907964977),
+[37907965003](https://github.com/Quitetall/tritium/actions/runs/37907965003))
+passed their required checks. GPU/device tests were skipped or unavailable; CPU
+smoke does not qualify serving deployment, GPU performance, or model quality.
+The general CI's single WASI training bundle was independently validated against
+all 117 frozen cases and 36 operations. Its exact raw artifact is retained at
+`release/v1.1/ci-wasi-training-receipts/7ada97b07dc367be2e82b100965b13c6942c597f-wasi-portable.json`
+(SHA-256 `00e594f23ca34be48c83dde7cd6385a109f47cd54c57f512239c0ac5cb6896ee`).
+It establishes only the `wasi` family; the seven-family backend-manifest and
+performance gates remain open.
