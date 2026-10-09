@@ -578,6 +578,24 @@ pub fn exact_ternary_assignment(
         return Err(JointFitError::InvalidScale { index });
     }
 
+    let mut trits = (0..scales.len())
+        .map(|_| vec![0_i8; weights.len()])
+        .collect::<Vec<_>>();
+    exact_ternary_assignment_into_validated(weights, scales, &mut trits);
+    Ok(trits)
+}
+
+/// Refill a correctly shaped assignment buffer after the caller has validated inputs.
+///
+/// Joint fitting validates weights and configuration once per row, then reassigns after
+/// accepted scale updates. Reusing these plane buffers avoids allocating `P * len` trits for
+/// every alternating-descent pass.
+fn exact_ternary_assignment_into_validated(weights: &[f32], scales: &[f32], trits: &mut [Vec<i8>]) {
+    debug_assert!(!weights.is_empty());
+    debug_assert!((1..=3).contains(&scales.len()));
+    debug_assert_eq!(trits.len(), scales.len());
+    debug_assert!(trits.iter().all(|plane| plane.len() == weights.len()));
+
     const CODES: [i8; 3] = [0, -1, 1];
     let states = 3_usize.pow(scales.len() as u32);
     let mut codebook = [(0.0_f32, [0_i8; 3], 0_usize); 27];
@@ -634,7 +652,6 @@ pub fn exact_ternary_assignment(
         })
         .fold(f64::INFINITY, f64::min);
 
-    let mut trits = vec![vec![0_i8; weights.len()]; scales.len()];
     for (weight_index, &weight) in weights.iter().enumerate() {
         let mut best_codes = [0_i8; 3];
         // At extreme dynamic ranges, distinct f32 reconstructions can collapse
@@ -685,7 +702,6 @@ pub fn exact_ternary_assignment(
             trits[plane][weight_index] = best_codes[plane];
         }
     }
-    Ok(trits)
 }
 
 /// Jointly fit up to three zero-point-free additive ternary planes.
@@ -992,7 +1008,10 @@ fn optimize_start(
 ) -> Result<FitState, JointFitError> {
     #[cfg(test)]
     let assignment_started = std::time::Instant::now();
-    let trits = assignment_for_metric(weights, &scales, metric)?;
+    let mut trits = (0..config.planes)
+        .map(|_| vec![0_i8; weights.len()])
+        .collect::<Vec<_>>();
+    assignment_for_metric_into_validated(weights, &scales, metric, &mut trits)?;
     #[cfg(test)]
     record_solver_phase(0, assignment_started);
 
@@ -1019,6 +1038,7 @@ fn optimize_start(
 
     // The initial trits came from assignment_for_metric at the initial scales.
     let mut assignment_checked_for_current_scales = true;
+    let mut assignment_scratch: Option<Vec<Vec<i8>>> = None;
     for iteration in 0..config.max_iterations {
         let mut improved = false;
         #[cfg(test)]
@@ -1085,23 +1105,28 @@ fn optimize_start(
         if !assignment_checked_for_current_scales {
             #[cfg(test)]
             let assignment_started = std::time::Instant::now();
-            let assignment = assignment_for_metric(weights, &state.scales, metric)?;
+            let scratch = assignment_scratch.get_or_insert_with(|| {
+                (0..config.planes)
+                    .map(|_| vec![0_i8; weights.len()])
+                    .collect()
+            });
+            assignment_for_metric_into_validated(weights, &state.scales, metric, scratch)?;
             #[cfg(test)]
             record_solver_phase(0, assignment_started);
             assignment_checked_for_current_scales = true;
             // The current reconstruction/objective already correspond to these exact
             // scales and trits. Avoid rebuilding and rescoring the row when the
             // assignment step rediscovers the same state.
-            if assignment != state.trits {
+            if *scratch != state.trits {
                 #[cfg(test)]
                 let reconstruction_started = std::time::Instant::now();
                 let (assignment_reconstruction, assignment_objective) =
-                    reconstruct_planes_and_objective(weights, &state.scales, &assignment, metric)?;
+                    reconstruct_planes_and_objective(weights, &state.scales, scratch, metric)?;
                 #[cfg(test)]
                 record_solver_phase(2, reconstruction_started);
                 if assignment_objective < state.objective {
                     let objective_before = state.objective;
-                    state.trits = assignment;
+                    std::mem::swap(&mut state.trits, scratch);
                     state.reconstruction = assignment_reconstruction;
                     state.objective = assignment_objective;
                     state.accepted_objectives.push(assignment_objective);
@@ -1580,22 +1605,25 @@ fn deployment_scale(
     }
 }
 
-fn assignment_for_metric(
+fn assignment_for_metric_into_validated(
     weights: &[f32],
     scales: &[f32],
     metric: JointFitMetric<'_>,
-) -> Result<Vec<Vec<i8>>, JointFitError> {
+    trits: &mut [Vec<i8>],
+) -> Result<(), JointFitError> {
+    debug_assert_eq!(trits.len(), scales.len());
+    debug_assert!(trits.iter().all(|plane| plane.len() == weights.len()));
     #[cfg(test)]
     ASSIGNMENT_FOR_METRIC_CALLS.with(|calls| calls.set(calls.get() + 1));
 
-    let mut trits = exact_ternary_assignment(weights, scales)?;
+    exact_ternary_assignment_into_validated(weights, scales, trits);
     let JointFitMetric::Dense(dense) = metric else {
-        return Ok(trits);
+        return Ok(());
     };
 
     const CODES: [i8; 3] = [0, -1, 1];
     let states = 3_usize.pow(scales.len() as u32);
-    let mut reconstruction = reconstruct_planes(scales, &trits, weights.len());
+    let mut reconstruction = reconstruct_planes(scales, trits, weights.len());
     let mut error: Vec<f64> = weights
         .iter()
         .zip(&reconstruction)
@@ -1653,7 +1681,7 @@ fn assignment_for_metric(
             break;
         }
     }
-    Ok(trits)
+    Ok(())
 }
 
 fn reconstruct_planes(scales: &[f32], trits: &[Vec<i8>], len: usize) -> Vec<f32> {
