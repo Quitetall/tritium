@@ -3795,6 +3795,28 @@ controlled evidence of an improvement. Keep the frozen budget unchanged; the
 next software work must target conversion and export separately, preserve exact
 PTQ artifact/quality checks, and earn a fresh hosted rerun.
 
+### Exact-head hosted tutorial rerun — 2026-10-09 (still over budget)
+
+Hosted wheels workflow
+[37896910296](https://github.com/Quitetall/tritium/actions/runs/37896910296)
+ran source revision `a5ca03cf58daf1c7417f321b56e0d2f931c29b6b`. Every
+functional phase completed, but the pinned SmolLM2 CPU tutorial took
+`564.266s`, exceeding the unchanged `300s` gate by `264.266s`. Stage markers
+were calibration `0.600s`, conversion `341.395s`, native checkpoint
+round-trip `361.967s`, generation `404.932s`, ONNX export `531.289s`, ONNX
+replay `557.243s`, and QAT resume `564.266s`. The export interval was
+`126.225s`. No qualification receipt was published.
+
+The conversion interval is about `0.3%` below the separate preceding hosted
+run's `342.314s`, and end-to-end time is about `0.8%` below its `568.999s`;
+these are not controlled measurements and establish no speedup. Across 40
+resource samples the runner exposed four logical CPUs, at least about
+`11.5 GiB` available memory, and at least about `81.7 GiB` temporary disk; no
+cgroup CPU throttling was observed. This remains a wall-time failure, not an
+observed memory, disk, or CPU-throttle failure. CI, docs, capstone CPU smoke,
+and CodeQL passed for this same source revision; the wheels workflow failed
+only on the tutorial timing gate.
+
 ### Reject default ONNX graph optimization for packed artifacts — 2026-10-09
 
 The PyTorch 2.11 ONNX `optimize=True` setting was tested against the existing
