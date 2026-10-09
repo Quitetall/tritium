@@ -4278,3 +4278,17 @@ input on the failing runner, while leaving the frozen tolerance unchanged.
 Until that hosted evidence is available and a source-backed correction passes
 the pinned tutorial, ONNX parity remains RED and the v1.1 release gate is not
 cleared.
+
+#### Failure-only terminal shard capture
+
+The pinned wheels tutorial now enables
+`TRITIUM_ONNX_PARITY_CAPTURE_TERMINAL=1`. On an ONNX parity failure, the
+diagnostic path identifies a bounded final `Concat` of `MatMul`/`Gemm` shards,
+replays the original inputs through a temporary graph that exposes those shard
+outputs and their shared non-input activation, then removes that temporary
+graph. The original exported graph and qualification run are unchanged. These
+additional arrays are stored with the existing graph/reference/observed ledger;
+if optional intermediate capture fails, the primary parity artifact is still
+retained. The local module suite passed (`16 passed`), and `actionlint` passed
+for the edited wheel workflow. This proves the diagnostic seam on a small
+synthetic graph only; no hosted AMD shard capture has been collected yet.

@@ -231,6 +231,87 @@ def _session_options(ort):
     return options
 
 
+def _terminal_intermediate_names(graph, output_names: Sequence[str]) -> Tuple[str, ...]:
+    """Find bounded concat shards and their shared MatMul/Gemm activation."""
+
+    producers = {
+        output: node for node in graph.node for output in node.output if output
+    }
+    initializers = {value.name for value in graph.initializer}
+    graph_inputs = {value.name for value in graph.input}
+    for output_name in output_names:
+        concat = producers.get(output_name)
+        if concat is None or concat.op_type != "Concat":
+            continue
+        shards = tuple(name for name in concat.input if name)
+        if not 2 <= len(shards) <= 16:
+            continue
+        shard_producers = tuple(producers.get(name) for name in shards)
+        if any(
+            node is None or node.op_type not in {"MatMul", "Gemm"}
+            for node in shard_producers
+        ):
+            return shards
+        common_inputs = None
+        for node in shard_producers:
+            activation_inputs = {
+                name for name in node.input if name and name not in initializers
+            }
+            common_inputs = (
+                activation_inputs
+                if common_inputs is None
+                else common_inputs.intersection(activation_inputs)
+            )
+        shared = sorted((common_inputs or set()) - graph_inputs)
+        if len(shared) == 1:
+            return (*shards, shared[0])
+        return shards
+    return ()
+
+
+def _capture_terminal_intermediates(
+    staging: Path,
+    input_names: Sequence[str],
+    inputs: Sequence[Tensor],
+    output_names: Sequence[str],
+    onnx,
+    ort,
+) -> Tuple[Tuple[str, str, Any], ...]:
+    """Replay bounded terminal ONNX values without changing the original graph."""
+
+    graph_path = staging / _GRAPH
+    graph = onnx.load(graph_path, load_external_data=False)
+    candidates = _terminal_intermediate_names(graph.graph, output_names)
+    available = {
+        value.name: value
+        for value in (*graph.graph.input, *graph.graph.output, *graph.graph.value_info)
+    }
+    captured_names = tuple(name for name in candidates if name in available)
+    if not captured_names:
+        return ()
+    for name in captured_names:
+        graph.graph.output.add().CopyFrom(available[name])
+    diagnostic_graph = staging / ".terminal-diagnostic.onnx"
+    try:
+        onnx.save(graph, diagnostic_graph)
+        session = ort.InferenceSession(
+            str(diagnostic_graph),
+            sess_options=_session_options(ort),
+            providers=["CPUExecutionProvider"],
+        )
+        feed = {
+            name: value.detach().contiguous().numpy()
+            for name, value in zip(input_names, inputs, strict=True)
+        }
+        values = session.run(list(captured_names), feed)
+        return tuple(
+            ("terminal-intermediate", name, value)
+            for name, value in zip(captured_names, values, strict=True)
+        )
+    finally:
+        diagnostic_graph.unlink(missing_ok=True)
+
+
 def _retain_parity_failure(
     staging: Path,
     diagnostic_root: Path,
@@ -243,6 +324,7 @@ def _retain_parity_failure(
     inputs: Sequence[Tensor],
     observed: Sequence[Any],
     expected: Sequence[Tensor],
+    additional_arrays: Sequence[Tuple[str, str, Any]] = (),
 ) -> None:
     """Retain a digest-ledgered graph and replay tensors when opted in."""
 
@@ -273,6 +355,7 @@ def _retain_parity_failure(
             ("observed-output", str(index), value)
             for index, value in enumerate(observed)
         )
+        diagnostic_values.extend(additional_arrays)
         for index, (role, name, value) in enumerate(diagnostic_values):
             if isinstance(value, Tensor):
                 tensor = value.detach().cpu().contiguous()
@@ -716,6 +799,23 @@ def export_module_onnx(
                     "TRITIUM_ONNX_PARITY_FAILURE_DIR"
                 )
                 if diagnostic_root:
+                    additional_arrays = ()
+                    if os.environ.get("TRITIUM_ONNX_PARITY_CAPTURE_TERMINAL") == "1":
+                        try:
+                            additional_arrays = _capture_terminal_intermediates(
+                                staging,
+                                names_in,
+                                inputs,
+                                names_out,
+                                onnx,
+                                ort,
+                            )
+                        except Exception as diagnostic_error:
+                            print(
+                                "could not capture terminal ONNX intermediates: "
+                                f"{type(diagnostic_error).__name__}",
+                                file=sys.stderr,
+                            )
                     try:
                         _retain_parity_failure(
                             staging,
@@ -729,6 +829,7 @@ def export_module_onnx(
                             inputs,
                             observed,
                             expected,
+                            additional_arrays,
                         )
                     except Exception as diagnostic_error:
                         print(

@@ -34,7 +34,12 @@ from tritium.torch import (  # noqa: E402
     prepare,
     refine,
 )
-from tritium.torch.module_onnx import _session_options  # noqa: E402
+from tritium.torch.module_onnx import (  # noqa: E402
+    _capture_terminal_intermediates,
+    _session_options,
+    _terminal_intermediate_names,
+)
+import tritium.torch.module_onnx as module_onnx  # noqa: E402
 from tritium.torch.estimators import ProjectionContext  # noqa: E402
 
 
@@ -67,6 +72,141 @@ def test_packed_onnx_runtime_disables_dense_constant_folding():
         options.graph_optimization_level
         == ort.GraphOptimizationLevel.ORT_DISABLE_ALL
     )
+
+
+def test_terminal_intermediate_capture_replays_concat_shards_and_shared_input(
+    tmp_path,
+):
+    from onnx import TensorProto, helper, numpy_helper
+
+    x_info = helper.make_tensor_value_info(
+        "input", TensorProto.FLOAT, [1, 1, 4]
+    )
+    hidden_info = helper.make_tensor_value_info(
+        "shared_hidden", TensorProto.FLOAT, [1, 1, 4]
+    )
+    shard0_info = helper.make_tensor_value_info(
+        "shard0", TensorProto.FLOAT, [1, 1, 2]
+    )
+    shard1_info = helper.make_tensor_value_info(
+        "shard1", TensorProto.FLOAT, [1, 1, 3]
+    )
+    logits_info = helper.make_tensor_value_info(
+        "logits", TensorProto.FLOAT, [1, 1, 5]
+    )
+    weight0 = torch.arange(8, dtype=torch.float32).reshape(4, 2)
+    weight1 = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+    graph = helper.make_graph(
+        [
+            helper.make_node("Identity", ["input"], ["shared_hidden"]),
+            helper.make_node("MatMul", ["shared_hidden", "weight0"], ["shard0"]),
+            helper.make_node("MatMul", ["shared_hidden", "weight1"], ["shard1"]),
+            helper.make_node("Concat", ["shard0", "shard1"], ["logits"], axis=2),
+        ],
+        "terminal-diagnostic",
+        [x_info],
+        [logits_info],
+        initializer=[
+            numpy_helper.from_array(weight0.numpy(), name="weight0"),
+            numpy_helper.from_array(weight1.numpy(), name="weight1"),
+        ],
+    )
+    graph.value_info.extend([hidden_info, shard0_info, shard1_info])
+    model_path = tmp_path / "model.onnx"
+    onnx.save(
+        helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)]),
+        model_path,
+    )
+    assert _terminal_intermediate_names(graph, ["logits"]) == (
+        "shard0",
+        "shard1",
+        "shared_hidden",
+    )
+
+    sample = torch.tensor([[[1.0, 2.0, 3.0, 4.0]]])
+    captured = _capture_terminal_intermediates(
+        tmp_path,
+        ["input"],
+        [sample],
+        ["logits"],
+        onnx,
+        ort,
+    )
+    assert [name for _role, name, _value in captured] == [
+        "shard0",
+        "shard1",
+        "shared_hidden",
+    ]
+    assert all(role == "terminal-intermediate" for role, _name, _value in captured)
+    values = {name: value for _role, name, value in captured}
+    assert torch.equal(torch.from_numpy(values["shared_hidden"]), sample)
+    assert torch.equal(
+        torch.from_numpy(values["shard0"]), sample @ weight0
+    )
+    assert torch.equal(
+        torch.from_numpy(values["shard1"]), sample @ weight1
+    )
+    assert not (tmp_path / ".terminal-diagnostic.onnx").exists()
+
+
+def test_terminal_capture_failure_preserves_primary_parity_diagnostic(
+    tmp_path, monkeypatch
+):
+    diagnostic_root = tmp_path / "diagnostics"
+    monkeypatch.setenv("TRITIUM_ONNX_PARITY_FAILURE_DIR", str(diagnostic_root))
+    monkeypatch.setenv("TRITIUM_ONNX_PARITY_CAPTURE_TERMINAL", "1")
+
+    def fail_assert_close(*args, **kwargs):
+        raise AssertionError("injected")
+
+    def fail_terminal_capture(*args, **kwargs):
+        raise RuntimeError("injected terminal capture failure")
+
+    monkeypatch.setattr(torch.testing, "assert_close", fail_assert_close)
+    monkeypatch.setattr(
+        module_onnx, "_capture_terminal_intermediates", fail_terminal_capture
+    )
+    model = _model()
+    with pytest.raises(AssertionError, match="injected"):
+        export_module_onnx(model, torch.randn(2, 8), tmp_path / "bundle")
+
+    manifest = json.loads(
+        (diagnostic_root / "bundle" / "diagnostic.json").read_text()
+    )
+    assert [item["role"] for item in manifest["replay_arrays"]] == [
+        "input",
+        "expected-output",
+        "observed-output",
+    ]
+
+
+def test_terminal_intermediates_are_added_to_parity_diagnostic(tmp_path, monkeypatch):
+    diagnostic_root = tmp_path / "diagnostics"
+    monkeypatch.setenv("TRITIUM_ONNX_PARITY_FAILURE_DIR", str(diagnostic_root))
+    monkeypatch.setenv("TRITIUM_ONNX_PARITY_CAPTURE_TERMINAL", "1")
+
+    def fail_assert_close(*args, **kwargs):
+        raise AssertionError("injected")
+
+    terminal_value = torch.tensor([[[-0.25, 0.5]]]).numpy()
+    monkeypatch.setattr(torch.testing, "assert_close", fail_assert_close)
+    monkeypatch.setattr(
+        module_onnx,
+        "_capture_terminal_intermediates",
+        lambda *_args: (("terminal-intermediate", "shard0", terminal_value),),
+    )
+    with pytest.raises(AssertionError, match="injected"):
+        export_module_onnx(_model(), torch.randn(2, 8), tmp_path / "bundle")
+
+    retained = diagnostic_root / "bundle"
+    manifest = json.loads((retained / "diagnostic.json").read_text())
+    terminal_entry = next(
+        item
+        for item in manifest["replay_arrays"]
+        if item["role"] == "terminal-intermediate"
+    )
+    assert terminal_entry["name"] == "shard0"
+    assert (retained / terminal_entry["file"]).read_bytes() == terminal_value.tobytes()
 
 
 @pytest.mark.parametrize("retain_diagnostics", [False, True])

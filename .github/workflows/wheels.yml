@@ -606,6 +606,7 @@ jobs:
         shell: bash
         env:
           TRITIUM_ONNX_PARITY_FAILURE_DIR: ${{ runner.temp }}/tritium-onnx-parity-failure
+          TRITIUM_ONNX_PARITY_CAPTURE_TERMINAL: "1"
         run: |
           set -euo pipefail
           mkdir -p "$TRITIUM_ONNX_PARITY_FAILURE_DIR"
