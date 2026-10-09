@@ -3801,3 +3801,24 @@ Three optimized synthetic G64/P3 profile runs measured `40.524`, `43.672`, and
 does not establish full-model improvement. This is retained as a bounded
 allocation-footprint reduction, not a performance claim; hosted public-wheel
 PTQ and the pinned tutorial remain the authority.
+
+### Exact-head hosted tutorial rerun — 2026-10-09 (still over budget)
+
+Hosted wheels workflow
+[37895510065](https://github.com/Quitetall/tritium/actions/runs/37895510065)
+ran the exact pushed revision `291df8fafa5a71417b352d51ed314d3eb44ec31e`.
+All functional phases completed, but the pinned SmolLM2 tutorial took
+`568.999s`, exceeding the unchanged `300s` gate by `268.999s`. Stage markers
+recorded calibration at `0.605s`, conversion at `342.314s`, native checkpoint
+round-trip at `363.153s`, generation at `406.494s`, ONNX export at `536.318s`,
+ONNX replay at `561.959s`, and QAT resume at `568.999s`. No qualification
+receipt was published.
+
+The hosted runner exposed four logical CPUs, at least `12.5 GiB` available
+memory, at least `83 GiB` temporary disk, and zero cgroup CPU-throttle periods
+through the final sample. This again rules out observed memory exhaustion,
+disk exhaustion, and cgroup throttling as explanations. The result is about
+`2.7%` slower than the preceding `553.777s` separate run, which is not a
+controlled regression measurement. Conversion and ONNX export remain the
+dominant work; keep the frozen gate and optimize them independently with
+artifact/quality parity before the next hosted rerun.
