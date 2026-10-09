@@ -3,6 +3,7 @@
 import copy
 import hashlib
 import json
+import os
 
 from types import SimpleNamespace
 
@@ -557,6 +558,9 @@ def test_onnx_parity_failure_can_retain_opt_in_diagnostic_graph(
     diagnostic_root = tmp_path / "diagnostics"
     if retain_diagnostics:
         monkeypatch.setenv("TRITIUM_ONNX_PARITY_FAILURE_DIR", str(diagnostic_root))
+        monkeypatch.setenv("OMP_NUM_THREADS", "3")
+        monkeypatch.setenv("MKL_NUM_THREADS", "2")
+        monkeypatch.setenv("HF_TOKEN", "must-not-be-recorded")
     else:
         monkeypatch.delenv("TRITIUM_ONNX_PARITY_FAILURE_DIR", raising=False)
 
@@ -582,6 +586,25 @@ def test_onnx_parity_failure_can_retain_opt_in_diagnostic_graph(
     assert manifest["schema_version"] == 1
     assert manifest["checkpoint_digest"].startswith("sha256:")
     assert manifest["failure_type"] == "AssertionError"
+    runtime = manifest["runtime"]
+    assert runtime["versions"]["torch"] == torch.__version__
+    assert runtime["versions"]["onnx"]
+    assert runtime["versions"]["onnxruntime"]
+    assert runtime["providers"] == ["CPUExecutionProvider"]
+    assert runtime["session"]["graph_optimization_level"] == "ORT_DISABLE_ALL"
+    assert runtime["session"]["intra_op_num_threads"] == 0
+    assert runtime["session"]["inter_op_num_threads"] == 0
+    assert runtime["cpu"]["logical_count"] == os.cpu_count()
+    assert runtime["thread_environment"]["OMP_NUM_THREADS"] == "3"
+    assert runtime["thread_environment"]["MKL_NUM_THREADS"] == "2"
+    assert set(runtime["thread_environment"]) <= {
+        "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "OMP_PROC_BIND",
+        "KMP_AFFINITY",
+    }
+    assert "HF_TOKEN" not in json.dumps(runtime)
     assert any(item["file"] == "model.onnx" for item in manifest["files"])
     for item in manifest["files"]:
         payload = (retained / item["file"]).read_bytes()

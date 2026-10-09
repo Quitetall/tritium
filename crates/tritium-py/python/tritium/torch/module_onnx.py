@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import platform
 import shutil
 import sys
 import tempfile
@@ -30,6 +31,8 @@ _MANIFEST = "tritium-module-onnx.json"
 _GRAPH = "model.onnx"
 _MAX_TERMINAL_PARITY_CAPTURE_BYTES = 64 * 1024 * 1024
 _PARITY_DIAGNOSTIC_LAYER_INDEX = 11
+_ORT_INTRA_OP_THREADS = 0
+_ORT_INTER_OP_THREADS = 0
 _TOP_FIELDS_V1 = {
     "schema_version",
     "artifact_kind",
@@ -230,7 +233,59 @@ def _session_options(ort):
     # during session creation, materializing every full-precision target
     # matrix. That defeats packed residency and can require tens of GiB.
     options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    # Keep ORT's existing runtime-default thread-pool policy explicit so failure
+    # receipts can distinguish the requested setting from CPU affinity.
+    options.intra_op_num_threads = _ORT_INTRA_OP_THREADS
+    options.inter_op_num_threads = _ORT_INTER_OP_THREADS
     return options
+
+
+def _parity_runtime_info(onnx, ort, session) -> dict[str, Any]:
+    """Return bounded, secret-free runtime context for opt-in failure artifacts."""
+
+    affinity_count = None
+    get_affinity = getattr(os, "sched_getaffinity", None)
+    if callable(get_affinity):
+        try:
+            affinity_count = len(get_affinity(0))
+        except OSError:
+            pass
+    get_providers = getattr(session, "get_providers", None)
+    providers = list(get_providers()) if callable(get_providers) else []
+    thread_environment = {
+        name: os.environ[name]
+        for name in (
+            "OMP_NUM_THREADS",
+            "MKL_NUM_THREADS",
+            "OPENBLAS_NUM_THREADS",
+            "OMP_PROC_BIND",
+            "KMP_AFFINITY",
+        )
+        if name in os.environ
+    }
+    return {
+        "versions": {
+            "python": platform.python_version(),
+            "torch": str(torch.__version__),
+            "onnx": str(getattr(onnx, "__version__", "unknown")),
+            "onnxruntime": str(getattr(ort, "__version__", "unknown")),
+        },
+        "cpu": {
+            "system": platform.system(),
+            "release": platform.release(),
+            "machine": platform.machine(),
+            "processor": platform.processor() or None,
+            "logical_count": os.cpu_count(),
+            "affinity_count": affinity_count,
+        },
+        "providers": providers,
+        "session": {
+            "graph_optimization_level": "ORT_DISABLE_ALL",
+            "intra_op_num_threads": _ORT_INTRA_OP_THREADS,
+            "inter_op_num_threads": _ORT_INTER_OP_THREADS,
+        },
+        "thread_environment": thread_environment,
+    }
 
 
 def _terminal_intermediate_names(graph, output_names: Sequence[str]) -> Tuple[str, ...]:
@@ -983,6 +1038,7 @@ def _retain_parity_failure(
     inputs: Sequence[Tensor],
     observed: Sequence[Any],
     expected: Sequence[Tensor],
+    runtime: Mapping[str, Any],
     additional_arrays: Sequence[Tuple[str, str, Any]] = (),
 ) -> None:
     """Retain a digest-ledgered graph and replay tensors when opted in."""
@@ -1047,6 +1103,7 @@ def _retain_parity_failure(
             "rtol": rtol,
             "atol": atol,
             "failure_type": type(error).__name__,
+            "runtime": dict(runtime),
             "files": files,
             "replay_arrays": arrays,
         }
@@ -1513,6 +1570,7 @@ def export_module_onnx(
                             inputs,
                             observed,
                             expected,
+                            _parity_runtime_info(onnx, ort, session),
                             additional_arrays,
                         )
                     except Exception as diagnostic_error:
