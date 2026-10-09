@@ -3122,3 +3122,30 @@ compute-time miss, not an OOM, disk-space failure, or skipped functionality.
 The recipe and `300s` gate are unchanged; the CPU PTQ conversion remains the
 dominant software optimization target. CI, CodeQL, docs and capstone passed at
 this source; the pinned tutorial was the only failed wheel job.
+
+### Pinned SmolLM2 row-fit phase profile — 2026-10-08
+
+To separate solver work from the full-model timing, the public
+`prepare` → `calibrate` → `convert()` path captured the pinned
+`model.layers.0.mlp.up_proj` source/evidence block at G64. Conversion took
+`1.006s` for the complete projection and reproduced artifact
+`sha256:4059a7c249fbf4d3aaa58a56d4d6c630da175d2c440a365fef025ea3e0b58c44`,
+weighted MSE `8.28580185e-05`, calibration identity
+`sha256:7c42611e41b1e60300c1a123a6a3107e1d33becbd1129a4c3fd6b13d3f310dfd`,
+and fixture identity
+`2b4f5a522531a5894e98b2a0593db9764f1cef34962e62ecf9594e618437ff18`. The
+64.5 KiB native profiling fixture is retained at
+`/mnt/2tb/tritium-release-evidence/ptq-profile-df145668/`.
+
+The release-mode Rust profiler ran five repeats of 256 rows for each matched
+initialization on that exact fixture. Mean time per 256-row set was relay-off
+`12.123ms`, softened-only `18.770ms`, modulated-only `19.126ms`, and dual-relay
+`26.637ms`. The corresponding aggregate weighted objectives were
+`0.130944935`, `0.130882743`, `0.130848182`, and `0.130786244`: dual-relay
+remains the best of these four on this fixture, with a `0.1212%` lower
+objective than relay-off. In the dual-relay run, assignment consumed
+`7.146ms`, relay initialization `9.661ms`, reconstruction `4.342ms`, and scale
+solve `2.728ms`. This 64.5 KiB fixture is not a full-model timing
+or held-out quality result. It prioritizes exact assignment and reconstruction
+as well as relay initialization for further profiling; no recipe change or
+performance claim is made.
