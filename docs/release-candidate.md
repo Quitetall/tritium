@@ -3235,3 +3235,31 @@ GiB` temporary disk, and zero cgroup CPU throttling. CI and CodeQL passed on
 the same pushed commit. The local assignment-buffer reuse commit
 `5740deae` is not part of this run and still requires exact-revision hosted
 verification; this rerun does not clear the timing gate.
+
+### Exact-revision Web package and browser-reference prerequisites — 2026-10-09
+
+On clean detached worktree `7b4163e814e3705dbe63639c3382a92b1f6a07d0`,
+`npm --prefix packages/tritium-web run check` passed: generated-file drift
+checks, pinned `wasm-bindgen 0.2.126` WASM build, strict TypeScript, all 145
+package tests, and offline source-free archive verification. The retained npm
+archive evidence is under
+`/mnt/4tb/tritium-release-evidence/web-7b4163e8/`:
+
+- Archive `tritium-ai-web-1.1.0-rc.2.tgz`: `627649` bytes,
+  SHA-256 `b0acf28f66dda7675e6cf773eb6db14fbc0891c00b31c1ee86f3d1adb5ee7d39`.
+- npm archive receipt ID:
+  `sha256:5a0f2eca8bd120a083e23cf0a7c215d4b21957fa454bec5e04a684b39c1c44a2`;
+  it binds source revision `7b4163e8`, the exact archive, strict types, offline
+  install and WASM guest digest
+  `4d29c529718a0b7b7811988a5a7f277c64fca100915297d9dceaf0c819382718`.
+- The native CPU browser-reference producer passed its export/reload byte
+  identity check. Receipt ID:
+  `sha256:dccab7242c6d2900148cc2dd68eb1432bc1b51d4ca18607461b026fdabbd62f6`;
+  its exact 224-byte SALT package has SHA-256
+  `6e889858c06a7eb91133f69a948ab8356a444c677eecd9e800ec689380a6e17e`.
+
+These close local package and native-reference prerequisite evidence only.
+They are not a physical WebGPU browser lane: this Linux host lacks the
+candidate-bound WebDriver/browser inputs, and Chrome is Canary rather than the
+stable release required by plan 0050. Firefox and Safari physical lanes and the
+combined three-browser receipt remain open.
