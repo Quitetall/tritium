@@ -2973,3 +2973,16 @@ weighted MSE `8.28580185e-05`, calibration identity, and fixture digest
 previous public-path observation was one `1.328s` run, so it is not a paired
 baseline and no speedup claim is made. This remains a one-layer profile, not a
 full-model qualification or hosted 300-second gate result.
+
+Follow-up relay profiling added an exact binary64 saturation shortcut for
+`tanh` inputs at or beyond `±20`; the configured sharpness denominator is
+exactly `2.0` because the schedule starts at `30`. The bitwise relay descent
+reference passes, with a boundary/extreme-value test added for the shortcut.
+On the same pinned Rust fixture, one release profile recorded `28.595ms`
+total and `10.576ms` relay initialization (the prior single profile was
+`29.607ms` and `11.954ms`). Three public artifact-path conversions measured
+`0.977s`, `0.936s`, and `0.937s` (median `0.937s`), with the same artifact
+identity, weighted error, calibration identity, and fixture digest. These are
+not paired controlled benchmarks; no speedup claim is made. The result is
+limited to the same one-layer profile and does not satisfy full-model or hosted
+release gates.

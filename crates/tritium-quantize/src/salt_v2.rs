@@ -1871,6 +1871,8 @@ mod relay {
     const THRESHOLD_BOUNDS: (f64, f64) = (0.05, 0.95);
     /// Normalized shift bounds for the modulated variant.
     const SHIFT_BOUNDS: (f64, f64) = (-2.0, 2.0);
+    /// `tanh(±20)` rounds exactly to `±1` in binary64, so the shortcut preserves bits.
+    const TANH_SATURATION: f64 = 20.0;
 
     /// Deployment-signature wrapper over the f64 relay core, exercised by the property tests;
     /// the descent evaluates the core directly.
@@ -1978,7 +1980,8 @@ mod relay {
         };
         for step in 0..STEPS {
             let sharpness = sharpness_at(step);
-            let norm = 2.0 * sharpness.tanh();
+            // Every scheduled sharpness is >= 30, where binary64 tanh is exactly one.
+            let norm = 2.0;
             let mut grad_scale = 0.0_f64;
             let mut grad_threshold = 0.0_f64;
             let mut grad_shift = 0.0_f64;
@@ -1987,8 +1990,8 @@ mod relay {
                 let u = centered / scale;
                 let lower = (u - threshold) * sharpness;
                 let upper = (u + threshold) * sharpness;
-                let tanh_lower = lower.tanh();
-                let tanh_upper = upper.tanh();
+                let tanh_lower = relay_tanh(lower);
+                let tanh_upper = relay_tanh(upper);
                 let soft = (tanh_lower + tanh_upper) / norm;
                 let soft_du = sharpness
                     * ((1.0 - tanh_lower * tanh_lower) + (1.0 - tanh_upper * tanh_upper))
@@ -2016,9 +2019,43 @@ mod relay {
         }
     }
 
+    #[inline]
+    fn relay_tanh(value: f64) -> f64 {
+        if value >= TANH_SATURATION {
+            1.0
+        } else if value <= -TANH_SATURATION {
+            -1.0
+        } else {
+            value.tanh()
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn saturation_shortcut_matches_binary64_tanh_at_boundary_and_extremes() {
+            let positive_boundary = TANH_SATURATION.to_bits();
+            let negative_boundary = (-TANH_SATURATION).to_bits();
+            let values = [
+                f64::from_bits(positive_boundary - 1),
+                TANH_SATURATION,
+                f64::from_bits(positive_boundary + 1),
+                f64::from_bits(negative_boundary - 1),
+                -TANH_SATURATION,
+                f64::from_bits(negative_boundary + 1),
+                -100.0,
+                100.0,
+            ];
+            for value in values {
+                assert_eq!(
+                    relay_tanh(value).to_bits(),
+                    value.tanh().to_bits(),
+                    "{value}"
+                );
+            }
+        }
 
         fn descend_reference(normalized: &[f64], modulated: bool) -> PlaneFit {
             let count = normalized.len() as f64;
