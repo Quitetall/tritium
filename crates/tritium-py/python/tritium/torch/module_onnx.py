@@ -332,9 +332,12 @@ def _first_decoder_attention_residual_name(
 
 
 def _first_decoder_block_internal_names(
-    graph, hidden_size: Optional[int], layer_count: Optional[int]
+    graph,
+    hidden_size: Optional[int],
+    layer_count: Optional[int],
+    intermediate_size: Optional[int] = None,
 ) -> Tuple[str, ...]:
-    """Select hidden-size values inside block zero, excluding its residual ends."""
+    """Select hidden/MLP-width values inside block zero, excluding its residuals."""
 
     residual_adds = _decoder_layer_residual_add_names(
         graph, hidden_size, layer_count
@@ -366,7 +369,8 @@ def _first_decoder_block_internal_names(
                 tensor_type.elem_type == 1
                 and tensor_type.HasField("shape")
                 and len(tensor_type.shape.dim) == 3
-                and tensor_type.shape.dim[-1].dim_value == hidden_size
+                and tensor_type.shape.dim[-1].dim_value
+                in {hidden_size, intermediate_size}
             ):
                 internal.append(name)
     return tuple(internal)
@@ -440,6 +444,7 @@ def _capture_terminal_intermediates(
     *,
     hidden_size: Optional[int] = None,
     layer_count: Optional[int] = None,
+    intermediate_size: Optional[int] = None,
 ) -> Tuple[Tuple[str, str, Any], ...]:
     """Replay bounded terminal ONNX values without changing the original graph."""
 
@@ -453,7 +458,7 @@ def _capture_terminal_intermediates(
         graph.graph, hidden_size, layer_count
     )
     first_block_internal_names = _first_decoder_block_internal_names(
-        graph.graph, hidden_size, layer_count
+        graph.graph, hidden_size, layer_count, intermediate_size
     )
     available = {
         value.name: value
@@ -540,6 +545,7 @@ def _capture_reference_terminal_outputs(
     config = getattr(config, "text_config", config)
     layer_count = getattr(config, "num_hidden_layers", None)
     hidden_size = getattr(config, "hidden_size", None)
+    intermediate_size = getattr(config, "intermediate_size", None)
     vocab_size = getattr(config, "vocab_size", None)
     if any(type(value) is not int or value <= 0 for value in (layer_count, hidden_size, vocab_size)):
         return ()
@@ -566,9 +572,19 @@ def _capture_reference_terminal_outputs(
         first_layer, "post_attention_layernorm", None
     )
     first_mlp = getattr(first_layer, "mlp", None)
+    gate_projection = getattr(first_mlp, "gate_proj", None)
+    up_projection = getattr(first_mlp, "up_proj", None)
+    mlp_activation = getattr(first_mlp, "act_fn", None)
     can_capture_attention_residual = isinstance(post_attention_layernorm, nn.Module)
     can_capture_mlp_input = can_capture_attention_residual
     can_capture_mlp_output = isinstance(first_mlp, nn.Module)
+    can_capture_mlp_projections = (
+        type(intermediate_size) is int
+        and intermediate_size > 0
+        and isinstance(gate_projection, nn.Module)
+        and isinstance(up_projection, nn.Module)
+        and isinstance(mlp_activation, nn.Module)
+    )
     estimated_bytes = (
         (
             layer_count
@@ -581,6 +597,12 @@ def _capture_reference_terminal_outputs(
         * sequence
         * hidden_size
         * 4
+        + 3
+        * int(can_capture_mlp_projections)
+        * batch
+        * sequence
+        * (intermediate_size if can_capture_mlp_projections else 0)
+        * 4
         + batch * sequence * vocab_size * 4
     )
     if estimated_bytes > _MAX_TERMINAL_PARITY_CAPTURE_BYTES:
@@ -588,6 +610,9 @@ def _capture_reference_terminal_outputs(
     attention_residuals = []
     mlp_inputs = []
     mlp_outputs = []
+    gate_projection_outputs = []
+    up_projection_outputs = []
+    mlp_activation_outputs = []
 
     def capture_attention_residual(_module, args):
         if args and isinstance(args[0], Tensor):
@@ -620,6 +645,26 @@ def _capture_reference_terminal_outputs(
                 )
             )
         )
+    if can_capture_mlp_projections:
+        hooks.extend(
+            (
+                gate_projection.register_forward_hook(
+                    lambda module, args, output: capture_module_output(
+                        gate_projection_outputs, module, args, output
+                    )
+                ),
+                up_projection.register_forward_hook(
+                    lambda module, args, output: capture_module_output(
+                        up_projection_outputs, module, args, output
+                    )
+                ),
+                mlp_activation.register_forward_hook(
+                    lambda module, args, output: capture_module_output(
+                        mlp_activation_outputs, module, args, output
+                    )
+                ),
+            )
+        )
     try:
         with torch.no_grad():
             result = model(*inputs, output_hidden_states=True, use_cache=False)
@@ -649,6 +694,12 @@ def _capture_reference_terminal_outputs(
         capture_tensors.append(mlp_inputs[0])
     if mlp_outputs:
         capture_tensors.append(mlp_outputs[0])
+    if gate_projection_outputs:
+        capture_tensors.append(gate_projection_outputs[0])
+    if up_projection_outputs:
+        capture_tensors.append(up_projection_outputs[0])
+    if mlp_activation_outputs:
+        capture_tensors.append(mlp_activation_outputs[0])
     if sum(value.numel() * value.element_size() for value in capture_tensors) > (
         _MAX_TERMINAL_PARITY_CAPTURE_BYTES
     ):
@@ -672,6 +723,30 @@ def _capture_reference_terminal_outputs(
                 "reference-mlp-input",
                 "layers[0].post_attention_layernorm.output",
                 mlp_inputs[0].detach().cpu().contiguous(),
+            )
+        )
+    if gate_projection_outputs:
+        arrays.append(
+            (
+                "reference-mlp-gate-projection",
+                "layers[0].mlp.gate_proj.output",
+                gate_projection_outputs[0].detach().cpu().contiguous(),
+            )
+        )
+    if up_projection_outputs:
+        arrays.append(
+            (
+                "reference-mlp-up-projection",
+                "layers[0].mlp.up_proj.output",
+                up_projection_outputs[0].detach().cpu().contiguous(),
+            )
+        )
+    if mlp_activation_outputs:
+        arrays.append(
+            (
+                "reference-mlp-activation",
+                "layers[0].mlp.act_fn.output",
+                mlp_activation_outputs[0].detach().cpu().contiguous(),
             )
         )
     if mlp_outputs:
@@ -1203,6 +1278,9 @@ def export_module_onnx(
                                 ),
                                 layer_count=getattr(
                                     reference_config, "num_hidden_layers", None
+                                ),
+                                intermediate_size=getattr(
+                                    reference_config, "intermediate_size", None
                                 ),
                             )
                         except Exception as diagnostic_error:

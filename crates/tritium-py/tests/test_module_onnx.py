@@ -100,6 +100,7 @@ def test_terminal_intermediate_capture_replays_concat_shards_and_shared_input(
     )
     weight0 = torch.arange(8, dtype=torch.float32).reshape(4, 2)
     weight1 = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+    weight2 = torch.ones((4, 6), dtype=torch.float32)
     residual_bias = torch.ones(4, dtype=torch.float32)
     graph = helper.make_graph(
         [
@@ -108,6 +109,9 @@ def test_terminal_intermediate_capture_replays_concat_shards_and_shared_input(
                 "Add", ["shared_hidden", "residual_bias"], ["residual_a"]
             ),
             helper.make_node("Identity", ["residual_a"], ["mlp_boundary"]),
+            helper.make_node(
+                "MatMul", ["residual_a", "weight2"], ["mlp_projection"]
+            ),
             helper.make_node(
                 "Add", ["mlp_boundary", "residual_bias"], ["residual_b"]
             ),
@@ -121,6 +125,7 @@ def test_terminal_intermediate_capture_replays_concat_shards_and_shared_input(
         initializer=[
             numpy_helper.from_array(weight0.numpy(), name="weight0"),
             numpy_helper.from_array(weight1.numpy(), name="weight1"),
+            numpy_helper.from_array(weight2.numpy(), name="weight2"),
             numpy_helper.from_array(residual_bias.numpy(), name="residual_bias"),
         ],
     )
@@ -133,12 +138,16 @@ def test_terminal_intermediate_capture_replays_concat_shards_and_shared_input(
     mlp_boundary_info = helper.make_tensor_value_info(
         "mlp_boundary", TensorProto.FLOAT, [1, 1, 4]
     )
+    mlp_projection_info = helper.make_tensor_value_info(
+        "mlp_projection", TensorProto.FLOAT, [1, 1, 6]
+    )
     graph.value_info.extend(
         [
             hidden_info,
             residual_info,
             residual_b_info,
             mlp_boundary_info,
+            mlp_projection_info,
             shard0_info,
             shard1_info,
         ]
@@ -160,8 +169,8 @@ def test_terminal_intermediate_capture_replays_concat_shards_and_shared_input(
         graph, hidden_size=4, layer_count=1
     ) == "residual_a"
     assert _first_decoder_block_internal_names(
-        graph, hidden_size=4, layer_count=1
-    ) == ("mlp_boundary",)
+        graph, hidden_size=4, layer_count=1, intermediate_size=6
+    ) == ("mlp_boundary", "mlp_projection")
 
     sample = torch.tensor([[[1.0, 2.0, 3.0, 4.0]]])
     captured = _capture_terminal_intermediates(
@@ -173,6 +182,7 @@ def test_terminal_intermediate_capture_replays_concat_shards_and_shared_input(
         ort,
         hidden_size=4,
         layer_count=1,
+        intermediate_size=6,
     )
     assert [(role, name) for role, name, _value in captured] == [
         ("terminal-output-replay", "logits"),
@@ -182,6 +192,7 @@ def test_terminal_intermediate_capture_replays_concat_shards_and_shared_input(
         ("terminal-layer-residual", "residual_b"),
         ("terminal-attention-residual", "residual_a"),
         ("terminal-first-block-internal", "mlp_boundary"),
+        ("terminal-first-block-internal", "mlp_projection"),
     ]
     values = {name: value for _role, name, value in captured}
     assert torch.equal(
@@ -199,6 +210,10 @@ def test_terminal_intermediate_capture_replays_concat_shards_and_shared_input(
         torch.from_numpy(values["residual_a"]), sample + residual_bias
     )
     assert torch.equal(torch.from_numpy(values["mlp_boundary"]), sample + residual_bias)
+    assert torch.equal(
+        torch.from_numpy(values["mlp_projection"]),
+        (sample + residual_bias) @ weight2,
+    )
     assert torch.equal(
         torch.from_numpy(values["shard0"]), sample @ weight0
     )
@@ -230,6 +245,7 @@ def test_terminal_intermediate_capture_replays_concat_shards_and_shared_input(
         "residual_b",
         "residual_a",
         "mlp_boundary",
+        "mlp_projection",
     ]
 
 
@@ -304,10 +320,20 @@ def test_reference_terminal_capture_includes_first_attention_residual():
         def __init__(self):
             super().__init__()
             self.post_attention_layernorm = torch.nn.Identity()
-            self.mlp = torch.nn.Identity()
+            self.mlp = TinyMLP()
 
         def forward(self, value):
             return self.mlp(self.post_attention_layernorm(value + 1))
+
+    class TinyMLP(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gate_proj = torch.nn.Identity()
+            self.up_proj = torch.nn.Identity()
+            self.act_fn = torch.nn.SiLU()
+
+        def forward(self, value):
+            return self.act_fn(self.gate_proj(value)) * self.up_proj(value)
 
     class TinyBackbone(torch.nn.Module):
         def __init__(self):
@@ -320,6 +346,7 @@ def test_reference_terminal_capture_includes_first_attention_residual():
             self.config = SimpleNamespace(
                 num_hidden_layers=1,
                 hidden_size=4,
+                intermediate_size=4,
                 vocab_size=10,
             )
             self.model = TinyBackbone()
@@ -340,6 +367,18 @@ def test_reference_terminal_capture_includes_first_attention_residual():
             "reference-mlp-input",
             "layers[0].post_attention_layernorm.output",
         ),
+        (
+            "reference-mlp-gate-projection",
+            "layers[0].mlp.gate_proj.output",
+        ),
+        (
+            "reference-mlp-up-projection",
+            "layers[0].mlp.up_proj.output",
+        ),
+        (
+            "reference-mlp-activation",
+            "layers[0].mlp.act_fn.output",
+        ),
         ("reference-mlp-output", "layers[0].mlp.output"),
         ("reference-hidden-state", "hidden_states[0]"),
         ("reference-terminal-hidden", "hidden_states[-1]"),
@@ -347,6 +386,15 @@ def test_reference_terminal_capture_includes_first_attention_residual():
     torch.testing.assert_close(captured[1][2], hidden + 1, rtol=0, atol=0)
     torch.testing.assert_close(captured[2][2], hidden + 1, rtol=0, atol=0)
     torch.testing.assert_close(captured[3][2], hidden + 1, rtol=0, atol=0)
+    torch.testing.assert_close(captured[4][2], hidden + 1, rtol=0, atol=0)
+    torch.testing.assert_close(
+        captured[5][2], torch.nn.functional.silu(hidden + 1), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        captured[6][2], torch.nn.functional.silu(hidden + 1) * (hidden + 1),
+        rtol=0,
+        atol=0,
+    )
 
 
 def test_terminal_capture_failure_preserves_primary_parity_diagnostic(
