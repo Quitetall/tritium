@@ -457,10 +457,7 @@ impl QwenModel {
                     let states = runner
                         .reference_states(&cache, remaining)
                         .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
-                    let bytes = states
-                        .iter()
-                        .map(|state| state.values().len() * size_of::<f32>())
-                        .sum();
+                    let bytes = states.iter().map(|state| size_of_val(state.values())).sum();
                     state_budget
                         .consume(bytes)
                         .map_err(PyRuntimeError::new_err)?;
