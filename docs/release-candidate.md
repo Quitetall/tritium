@@ -101,6 +101,37 @@ the real output-capture path and exact replay. A new hosted run must locate the
 first divergent block before a numerical fix can be chosen. None of this
 evidence qualifies model quality, release readiness or GPU performance.
 
+### Local SmolLM2 PTQ repeatability probe (2026-10-09)
+
+At branch commit `a4722e32f52bd4f3857cd165429018809aa62c72`, the public
+`prepare → calibrate → convert()` path was run twice in one CPU process on the
+pinned `HuggingFaceTB/SmolLM2-135M-Instruct` revision
+`12fd25f77366fa6b3b4b768ec3050bf629380bac`. Both runs used the same in-memory
+source model, tokenized calibration prompt, `compact-v1` recipe, independent
+calibration directories and independent conversion directories. Torch, OMP
+and MKL were limited to four threads. The environment used PyTorch
+`2.11.0+cpu` and Transformers `5.5.3`; the loaded native extension SHA-256 was
+`b5dfa449617303a5ab856b181d30da569dabff3362a55002c2176ac888cbde4b`.
+
+Both calibration receipts matched byte-for-byte: source model digest
+`sha256:07b6b933f97ef0d84d39eab5f6761de34eb07f1d14c43f1f22f70a06d54266b7`,
+activation digest
+`sha256:1d2d330288e5fa4335e2d1800616140a7900d7d18f9de9d3cba543ab42267dea`,
+token stream digest
+`sha256:5acad51abbb317a90c2b286ffa90e1d8a37b5c63c33c645843f20f245e85f737`,
+and evidence ID
+`sha256:bfdf8ddcd58a33c50196566d0bb02593aa745ae06e8381d6368c84e3c0167ae6`.
+The two conversion directories also compared byte-for-byte equal; both
+reported artifact ID
+`sha256:e6c97ef3265a863571796a71eec08a6a792472574a0fb0e3d7b53be6705ae18c`
+and algorithm `tritium.salt-v2-joint-diagonal-catq-relays-1@1`.
+
+This is positive repeatability evidence for one controlled local CPU run, not
+an explanation of the differing hosted external-data bytes: those runs may
+differ in source/build or execution environment, and their exact environment
+was not reproduced here. It is not the full SmolLM2 release tutorial, an ONNX
+parity pass, GPU evidence, model-quality evidence, or release qualification.
+
 ## Gate status (measured 2026-09-03)
 
 ### Hugging Face distributed CPU software checks (2026-10-04)
