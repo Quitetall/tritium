@@ -4777,3 +4777,42 @@ and explicitly receipt a supported source of nondeterminism), then run the
 block-11 analysis on that stable candidate and test a source-backed numeric
 correction. Keep the parity and release gates RED until the exact pinned
 tutorial passes.
+
+#### Exact-candidate replay and ORT thread sensitivity — 2026-10-09
+
+The next exact-source wheels run
+[37957402595](https://github.com/Quitetall/tritium/actions/runs/37957402595)
+tested commit `350331f86b799fb33b17f2032cd91732521b9fca`. Platform wheel jobs,
+the installed-wheel suite, source-free tutorial and abi3 matrix passed; the
+pinned SmolLM2 tutorial still failed 4 of 344,064 logits. Its maximum failing
+absolute difference was `0.0001201331615447998` at `(0, 0, 45178)` and its
+maximum failing relative difference was `2.28125` at `(0, 0, 34041)`. The
+failure tolerance remains unchanged. The new diagnostic identifies the runner
+as Intel Xeon Platinum 8573C, with four logical/affinity CPUs, Python 3.13.16,
+PyTorch 2.11.0+cpu and ONNX Runtime 1.27.0. ORT requested
+`intra_op_num_threads=0` and `inter_op_num_threads=0`; the effective runtime
+thread count was not captured.
+
+The retained diagnostic (`11630785486`, 37,075,831 bytes; archive SHA-256
+`a64fc3f023317af7234df71653f60a74712de06a8704a5191aeed6c1085da724`) has
+manifest SHA-256
+`5f4e246482d3f4022c1c84bc1f2025fa03cce64eff86cfef841f9bf04f77bd97`.
+All 110 replay arrays and both ONNX files passed byte-count and SHA-256
+verification. The checkpoint digest and both ONNX file hashes match the
+earlier Intel-hosted candidate in run `37948541947` exactly, so this repeats
+that candidate's same four failing coordinates and block-11 trace rather than
+introducing another PTQ artifact. The previously observed AMD candidate from
+run `37955929152` remains a distinct checkpoint and external-data payload.
+
+Both exact hosted ONNX candidates were replayed locally on the Core i9-14900K
+with pinned ORT 1.27.0 and graph optimization disabled. For the Intel-hosted
+candidate, explicit intra-op thread counts 1, 2, 4 and automatic (`0`) produced
+4, 0, 0 and 112 failing logits respectively; thread count 1 reproduced the
+hosted observed logits byte-for-byte. For the distinct AMD-hosted candidate,
+the same sweep produced 3, 0, 0 and 334 failing logits; again, thread count 1
+reproduced the hosted output byte-for-byte. These local replays make ORT thread
+policy a concrete numerical sensitivity and a candidate for the next
+controlled experiment. They do not establish the effective hosted thread
+count, prove a cross-host fix, or measure performance. Do not silently change
+the runtime default: choose and validate a configurable policy, then rerun the
+hosted parity and installed-wheel performance gates before claiming repair.
