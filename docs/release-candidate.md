@@ -3689,18 +3689,22 @@ against the frozen request/capability schemas; do not claim the smoke path or
 synthetic runner responses as recipe-freeze evidence.
 
 An interface audit on 2026-10-09 confirmed that the missing producer is not
-just command-line glue. The current Python `fit_kronecker_group` bridge fixes
-the grouped geometry at 128 columns and exposes joint-fit restart/iteration
-and relay options; the frozen grid spans G64/G128/G256 and six solver
-variants. The lower-level Rust tree contains separate feedback and output-
-reconstruction primitives, but no tracked runner binds those primitives,
-curvature capture, recipe identity, model evaluation, packed artifacts, and
-physical reports into the orchestrator's one-row response contract. Keep the
-runner work scoped to that full evidence path rather than advertising partial
-capabilities. The current orchestrator, qualifier, and causal-data protocol
-tests pass (`66 passed` across `test_run_stage7_recipe_freeze.py`,
-`test_qualify_stage7_recipe_freeze.py`, and `test_stage7_causal_data.py`); these
-are contract tests, not model measurements or Stage-7 qualification evidence.
+just command-line glue. Keep two geometries distinct: ADR 0035 freezes the
+durable S2KF curvature evidence at G128, while ADR 0028 and plan 0043 make
+G64/G128/G256 *deployment scale groups* recipe ablations. The current
+`SaltV2Config` reference fitter and Python `fit_kronecker_group` bridge both
+only fit G128 deployment groups against G128 curvature blocks, so candidate
+group geometries need an explicit adapter or fitter generalization that
+preserves the frozen S2KF bytes and meaning. The lower-level Rust tree contains
+separate feedback and output-reconstruction primitives, but no tracked runner
+binds those primitives, curvature capture, recipe identity, model evaluation,
+packed artifacts, and physical reports into the orchestrator's one-row
+response contract. Keep the runner work scoped to that full evidence path
+rather than advertising partial capabilities. The current orchestrator,
+qualifier, and causal-data protocol tests pass (`66 passed` across
+`test_run_stage7_recipe_freeze.py`, `test_qualify_stage7_recipe_freeze.py`,
+and `test_stage7_causal_data.py`); these are contract tests, not model
+measurements or Stage-7 qualification evidence.
 
 ### Exact-head hosted tutorial rerun — 2026-10-09 (still over budget)
 
