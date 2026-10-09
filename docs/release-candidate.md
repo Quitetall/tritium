@@ -226,6 +226,42 @@ localizes a likely source but does not prove causality, establish backend parity
 or satisfy any release gate. The fixed `1e-4` terminal-logit parity gate remains
 red; no tolerance or release contract changed.
 
+#### Local parity and CPU accumulation sensitivity (2026-10-09)
+
+The pinned source model was then run through the public PTQ and ONNX path on
+the local Core i9-14900K CPU. The source digest remained
+`sha256:07b6b933f97ef0d84d39eab5f6761de34eb07f1d14c43f1f22f70a06d54266b7`;
+the deterministic local calibration and conversion matched the earlier local
+identities (`bfdf8ddc…` and `e6c97ef3…`). `export_module_onnx` passed the same
+`1e-4` parity check and produced artifact `d95d6f40436410cc84da7e68c9c4072b6b420bcfcb5e85a309d3ecb9d247e72f`.
+This is a same-host result for the local PTQ artifact, not the hosted artifact
+or a model-quality gate.
+
+A separate replay used the exact hosted ONNX graph and its captured AMD
+quantized-model reference on this Intel host with the CI-pinned ONNX Runtime
+1.27.0 and `ORT_DISABLE_ALL`. The terminal outputs passed at explicit
+intra-op thread counts 2 and 4 (max tolerance ratios `0.862` and `0.707`), but
+failed at 1 thread (3 logits; max ratio `1.036`) and ORT's automatic thread
+count (334 logits; max ratio `1.886`). Thus thread configuration materially
+changes this near-threshold result even on one host. However, this does not
+explain the original AMD-hosted failure: the runner had four available CPUs,
+yet the exact graph still failed there. A fixed thread count alone is not an
+established cross-host remedy.
+
+As a numerical diagnostic only, all 216 `node_linear_*` MatMul operations in
+the hosted graph were rewritten in scratch to cast operands to FP64, multiply,
+then cast outputs back to FP32. The hosted captured reference then passed on
+this Intel host at 1, 4, and automatic thread counts (maximum tolerance ratio
+`0.646`); casting only block 11's three projections did not remove the
+thread-sensitive failures. A corresponding local-artifact replay also passed
+at all three thread settings. This suggests accumulation behavior distributed
+across projections is worth investigating, but it is not a source change or a
+fix: the rewrite was cross-host, only one 7-token sample, and not measured
+reliably for performance, peak memory, or accelerator/browser compatibility.
+Do not adopt FP64 projection math without those gates. The terminal parity
+failure on the AMD runner remains unresolved, and the `1e-4` contract remains
+unchanged.
+
 ## Gate status (measured 2026-09-03)
 
 ### Hugging Face distributed CPU software checks (2026-10-04)
