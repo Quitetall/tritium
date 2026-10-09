@@ -3050,3 +3050,18 @@ It passed and matched every pinned file hash for the public artifact, proving
 that these internal search/saturation changes preserve the fixture's emitted
 artifact bytes. This is a focused development-tree check, not candidate-wheel
 or release admission.
+
+### Exact QAT hard-code ONNX round-trip (2026-10-08)
+
+At source `5c03ee0d`,
+`/home/brianklam/.cache/tritium-py313-ci/bin/python -m pytest -q
+crates/tritium-py/tests/test_module_onnx.py` passed (`11 passed`). The real CPU
+ONNX gates now compare raw initializer bytes for every packed ternary plane and
+FP16 scale against the hard model, including direct and strictly reopened
+QAT-hard exports. A deterministic tiny Linear case checks values immediately
+below, at, and above the AbsMean half-step for FP32 and BF16 source weights,
+then requires exact artifact-code/scale parity and exact ORT output parity. A
+BF16-input ONNX Runtime limitation was avoided by running the exported compact
+artifact with FP32 activations; it is not evidence for BF16 runtime operators.
+This is tiny source-tree functional evidence only, not whole-model quality,
+candidate-wheel, or release qualification.
