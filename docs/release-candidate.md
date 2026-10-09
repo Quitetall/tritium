@@ -2903,3 +2903,33 @@ they do not form the aggregate qualification or the separate performance
 receipt. ROCm, Metal, MCU, and final-source regeneration remain open. V3
 CPU/CUDA receipts above are separate extension evidence and are not substituted
 into the frozen V2 release corpus.
+
+### Exact-source hosted SmolLM2 CPU tutorial timing — 2026-10-09
+
+Wheel workflow
+[37864560617](https://github.com/Quitetall/tritium/actions/runs/37864560617)
+tested source `4256284069e0135da1f62e2853eafc96f764cc53`. Platform wheel
+builds, installed-wheel checks, source-free tutorial, and ABI3 jobs passed; the
+pinned SmolLM2 CPU tutorial was the failing job. It completed the functional
+path, then failed the unchanged `300s` budget at `731.451s`. Stage markers
+recorded calibration at `0.596s`, PTQ conversion at `518.445s`, native
+checkpoint round-trip at `540.157s`, generation at `587.918s`, ONNX export at
+`695.296s`, ONNX replay at `724.651s`, and QAT resume at `731.451s`. Thus PTQ
+conversion consumed `517.849s` after calibration; ONNX export consumed another
+`107.271s`. Runner samples showed about `12.0 GiB` or more available memory,
+about `83.4 GiB` or more temporary disk, four logical CPUs, and no CPU
+throttling. This is a CPU-time failure, not memory/disk exhaustion or cgroup
+throttling. The functional checks completing do not qualify the frozen timing
+gate.
+
+To narrow the next optimization, an ignored release-mode solver profile was
+added and run with the tutorial's two-plane, four-restart, dual-relay recipe
+and G64 groups (the SmolLM2 hidden/intermediate widths use G64). On a
+deterministic synthetic 256-row fixture it measured `30.176ms` total:
+assignment `11.472ms`, relay initialization `9.874ms`, scale solve `2.453ms`,
+reconstruction `3.773ms`, and remaining validation/overhead `2.604ms`. This
+identifies assignment and relay initialization as the largest sampled solver
+phases, but it is not a model-backed profile or an optimization result and must
+not be extrapolated to the tutorial. The next useful step is a phase profile on
+real SmolLM2 rows, followed by a semantics- and quality-checked optimization
+and an exact-source hosted rerun. No threshold or solver recipe was changed.

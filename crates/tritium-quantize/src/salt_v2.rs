@@ -2240,6 +2240,58 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "manual G64/P2 compact PTQ solver phase profile"]
+    fn profile_g64_p2_compact_solver_phases() {
+        let rows: Vec<Vec<f32>> = (0..256)
+            .map(|row| {
+                (0..64)
+                    .map(|column| {
+                        let value = (row * 64 + column) * 37 % 101;
+                        (value as f32 - 50.0) / 37.0
+                    })
+                    .collect()
+            })
+            .collect();
+        let diagonal: Vec<f64> = (0..64)
+            .map(|column| 0.25 + ((column * 17 % 31) as f64 / 31.0))
+            .collect();
+        let config = JointFitConfig {
+            planes: 2,
+            max_iterations: 16,
+            ridge: 1e-8,
+            em_restarts: 4,
+            ridge_condition_limit: 1e6,
+            scale_precision: ScalePrecision::F16,
+            relay_basins: RelayBasins {
+                softened: true,
+                modulated: true,
+            },
+        };
+
+        SOLVER_PHASE_NANOS.with(|elapsed| elapsed.set([0; 7]));
+        let started = std::time::Instant::now();
+        for weights in &rows {
+            fit_joint_ternary(weights, JointFitMetric::DiagonalF64(&diagonal), config)
+                .expect("profile compact G64/P2 row fit");
+        }
+        let total = started.elapsed().as_nanos();
+        let phases = SOLVER_PHASE_NANOS.with(std::cell::Cell::get);
+        assert!(phases.iter().sum::<u128>() <= total);
+        eprintln!(
+            "G64/P2 compact 256-row profile: total={:.3}ms assignment={:.3}ms scale_solve={:.3}ms reconstruction={:.3}ms validate_metric={:.3}ms weighted_order={:.3}ms init_scales={:.3}ms relay_scales={:.3}ms other={:.3}ms",
+            total as f64 / 1_000_000.0,
+            phases[0] as f64 / 1_000_000.0,
+            phases[1] as f64 / 1_000_000.0,
+            phases[2] as f64 / 1_000_000.0,
+            phases[3] as f64 / 1_000_000.0,
+            phases[4] as f64 / 1_000_000.0,
+            phases[5] as f64 / 1_000_000.0,
+            phases[6] as f64 / 1_000_000.0,
+            (total - phases.iter().sum::<u128>()) as f64 / 1_000_000.0,
+        );
+    }
+
+    #[test]
     fn cached_start_context_preserves_existing_three_plane_output() {
         let weights: Vec<f32> = (0..128)
             .map(|index| ((index * 37 % 101) as f32 - 50.0) / 37.0)
