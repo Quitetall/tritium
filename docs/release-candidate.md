@@ -2781,3 +2781,24 @@ size is 41,317 bytes. The durable receipt is stored at
 This qualifies the CPU family at that exact source revision only; it is not a
 seven-backend aggregate, a performance receipt, or final release qualification.
 The other six target families and final-source regeneration remain open.
+
+### Matched portable-training CPU/CUDA receipts — 2026-10-08
+
+At clean source `cea334e0c681422e9ee72d8e0e902193c9dcb92e`, the V2 CPU and
+CUDA backends independently executed and reopened against the same frozen
+36-operation/117-case corpus. CPU ran on the i9-14900K; CUDA ran on the
+physical RTX 4090. The paired admission command was
+`cargo run --locked -p tritium-testkit --example training_capability_table --
+--schema v2 <CPU_DIGEST>=<CPU_RECEIPT> <CUDA_DIGEST>=<CUDA_RECEIPT>`.
+Both receipts report peak resident bytes `4192` and peak scratch bytes
+`132032`.
+
+| Backend | BLAKE3 bundle ID | SHA-256 | Bytes | Durable receipt directory |
+|---|---|---|---:|---|
+| CPU | `e6712fadbf08b6470b6c00c10f5ee9c15057d51886c23ff2563b871cab9f5a10` | `f326baadc08606ced3f05d1a58220c8f8bd131d7b4b41bf4a7e32002865c5b52` | 41,317 | `/mnt/2tb/tritium-release-evidence/training-backends/cea334e0/cpu-v2/` |
+| CUDA | `521cbd37d2857d78813f9a70bfcf15f43c27d363dd2021b66e265e86c7592868` | `cfafb62826188b9b63dc8124f14cf53c13435814cabb238b04fc05b0d8b544d9` | 41,259 | `/mnt/2tb/tritium-release-evidence/training-backends/cea334e0/cuda-v2/` |
+
+These are two of the seven required backend families at one exact source
+revision. They do not yet form an aggregate release receipt, cover WASI/MCU,
+ROCm, Metal or native wgpu, or qualify the separate performance gate. The
+bundles must be regenerated if the source changes before candidate freeze.
