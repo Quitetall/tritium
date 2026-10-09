@@ -3149,3 +3149,20 @@ solve `2.728ms`. This 64.5 KiB fixture is not a full-model timing
 or held-out quality result. It prioritizes exact assignment and reconstruction
 as well as relay initialization for further profiling; no recipe change or
 performance claim is made.
+
+### Exact-assignment midpoint scratch reduction — 2026-10-08
+
+The exact assignment loop now stores its at-most 26 f64 codebook midpoints in
+a fixed stack array instead of allocating a `Vec` for every row fit. Midpoint
+arithmetic, ordering, exact ties, and ill-conditioned exhaustive fallback are
+unchanged. `cargo test --locked -p tritium-quantize --no-fail-fast` passed
+(`238` unit tests, all applicable integration tests, and three intentionally
+ignored model/manual-profile tests); strict Clippy and all three exhaustive
+exact-assignment oracle tests passed. After rebuilding the release Python
+bridge, the public `convert()` artifact test passed with all six pinned file
+hashes unchanged. The same pinned model layer retained the same artifact ID,
+weighted MSE, and fixture identity; public conversion measured `1.006s` before
+and `1.011s` after this edit. Release row-fit measurements also varied by less
+than 1% for the dual-relay profile. These single-run differences are within
+measurement noise and establish no speedup. This is an allocation reduction
+with byte-preservation evidence, not a release timing-gate pass.

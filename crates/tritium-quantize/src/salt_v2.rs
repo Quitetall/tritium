@@ -614,10 +614,14 @@ pub fn exact_ternary_assignment(
     let codebook = &codebook[..unique_states];
     // Adjacent-codebook midpoints partition the real line into nearest-code
     // regions. Compute them in f64 so they are exact for the f32 endpoints.
-    let midpoints = codebook
-        .windows(2)
-        .map(|pair| (f64::from(pair[0].0) + f64::from(pair[1].0)) * 0.5)
-        .collect::<Vec<_>>();
+    // The codebook has at most 27 entries, so keep its at most 26 boundaries on
+    // the stack. This path runs once per fitted row; a heap allocation here
+    // compounds across every row and accepted solver iteration.
+    let mut midpoint_storage = [0.0_f64; 26];
+    for (index, pair) in codebook.windows(2).enumerate() {
+        midpoint_storage[index] = (f64::from(pair[0].0) + f64::from(pair[1].0)) * 0.5;
+    }
+    let midpoints = &midpoint_storage[..unique_states.saturating_sub(1)];
     let max_reconstruction = codebook
         .iter()
         .map(|entry| entry.0.abs())
