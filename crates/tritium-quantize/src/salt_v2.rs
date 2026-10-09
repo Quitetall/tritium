@@ -942,7 +942,6 @@ fn fit_joint_ternary_prepared(
             relay_scale_prefixes,
         )?;
         let lower_receipt = lower.restart_receipts[lower.selected_start].clone();
-        let lower_accepted_objectives = lower.accepted_objectives;
         let mut scales = lower.scales;
         scales.push(0.0);
         let mut trits = lower.trits;
@@ -952,7 +951,6 @@ fn fit_joint_ternary_prepared(
             trits,
             reconstruction: lower.reconstruction,
             objective: lower.objective,
-            accepted_objectives: lower_accepted_objectives,
             receipt: Some(JointFitRestartReceipt {
                 kind: JointFitStartKind::LowerPlaneFallback,
                 initial_objective: lower_receipt.initial_objective,
@@ -971,7 +969,7 @@ fn fit_joint_ternary_prepared(
         .expect("validated positive restart count");
     // These receipts are returned once; cloning their nested vectors only to
     // drop the originals needlessly doubles per-fit allocations and copies.
-    let restart_receipts = starts
+    let restart_receipts: Vec<JointFitRestartReceipt> = starts
         .iter_mut()
         .map(|state| {
             state
@@ -980,13 +978,14 @@ fn fit_joint_ternary_prepared(
                 .expect("fit-state receipt is present before result assembly")
         })
         .collect();
+    let accepted_objectives = fit_receipt_objectives(&restart_receipts[selected_start]);
     let selected = starts.swap_remove(selected_start);
     Ok(JointTernaryFit {
         scales: selected.scales,
         trits: selected.trits,
         reconstruction: selected.reconstruction,
         objective: selected.objective,
-        accepted_objectives: selected.accepted_objectives,
+        accepted_objectives,
         restart_receipts,
         selected_start,
     })
@@ -998,8 +997,19 @@ struct FitState {
     trits: Vec<Vec<i8>>,
     reconstruction: Vec<f32>,
     objective: f64,
-    accepted_objectives: Vec<f64>,
     receipt: Option<JointFitRestartReceipt>,
+}
+
+fn fit_receipt_objectives(receipt: &JointFitRestartReceipt) -> Vec<f64> {
+    let mut objectives = Vec::with_capacity(receipt.accepted_updates.len() + 1);
+    objectives.push(receipt.initial_objective);
+    objectives.extend(
+        receipt
+            .accepted_updates
+            .iter()
+            .map(|update| update.objective_after),
+    );
+    objectives
 }
 
 #[cfg(test)]
@@ -1044,7 +1054,6 @@ fn optimize_start(
         trits,
         reconstruction,
         objective,
-        accepted_objectives: vec![objective],
         receipt: Some(JointFitRestartReceipt {
             kind,
             initial_objective: objective,
@@ -1101,7 +1110,6 @@ fn optimize_start(
             state.scales = scale_outcome.scales;
             state.reconstruction = scale_reconstruction;
             state.objective = scale_objective;
-            state.accepted_objectives.push(scale_objective);
             state
                 .receipt
                 .as_mut()
@@ -1147,7 +1155,6 @@ fn optimize_start(
                     std::mem::swap(&mut state.trits, scratch);
                     state.reconstruction = assignment_reconstruction;
                     state.objective = assignment_objective;
-                    state.accepted_objectives.push(assignment_objective);
                     state
                         .receipt
                         .as_mut()
