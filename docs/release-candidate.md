@@ -3547,3 +3547,28 @@ were mixed. P2 dual-relay median time was `23.104ms` for the candidate
 whole-model or hosted result, and P3 regressed. The candidate was removed; no
 production source change remains. Do not attribute a speedup or use this
 experiment to explain the hosted `608.171s` failure.
+
+### Local 14900K tutorial with expanded Rayon parallelism — 2026-10-09
+
+The pinned SmolLM2 tutorial was rerun from the source-tree Python package on
+the local i9-14900K with `RAYON_NUM_THREADS=16` and Torch/OMP/MKL limited to
+four threads. It completed in `145.838s` against the tutorial's `300s` limit.
+The receipt passed the release tutorial's schema, storage, ONNX parity, and
+elapsed-time validator. Conversion completed at `51.905s` cumulative;
+checkpoint round-trip at `60.297s`, generation at `76.091s`, ONNX export at
+`126.107s`, ONNX replay at `140.766s`, and QAT resume at `145.838s`.
+
+The receipt records `211` selected and `61` preserved parameters out of
+`134,515,008` total, with `537,919,488` selected dense bytes versus
+`92,192,265` compact checkpoint bytes (`5.835×`). Its PTQ artifact is
+`sha256:26dc412dfbb432458e4a85386c77a6bae895de89b7e14a1d8a192a4ae50fbaf6`;
+the native checkpoint digest is
+`sha256:e78430ab2461da6a78ee2ef9d9d813d302f399cca756bc7cc49d6fbdb5edbd18`,
+and ONNX replay's maximum tolerance ratio is `0.415`. The durable bundle is
+`/mnt/4tb/tritium-evidence/smollm2-cpu-tutorial-14900k-r16-73687d9a/`.
+
+This is local source-tree evidence only: it is not a wheel-installed run, a
+matched thread-count experiment, hosted CI qualification, a model-quality
+result, or evidence that the runner gap is solved. The unchanged hosted gate
+still fails at `608.171s`; keep its `300s` contract intact until an
+evidence-backed portable fix or an ADR-approved contract change clears it.
