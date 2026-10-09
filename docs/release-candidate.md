@@ -2848,3 +2848,25 @@ difference is not attributed to a code change. The latest run is still
 `227.413s` over budget and does not qualify the full-model tutorial. It tested
 `2960a097`, before the locally committed relay-normalization buffer reuse, so a
 new exact-head wheel/tutorial run is required for that source change.
+
+### Portable training CPU V3 receipt — 2026-10-08
+
+On clean source `4256284069e0135da1f62e2853eafc96f764cc53`, the V3 CPU
+training backend executed on the physical i9-14900K host against the current
+37-operation/122-case corpus. The source-free
+`training_capability_table --schema v3` admission reopened the receipt and
+reported `cpu.reference.v1`, peak resident bytes `4192`, and peak scratch bytes
+`132032`. The source identity is
+`tritium-train@1.1.0-rc.2+source-git:4256284069e0135da1f62e2853eafc96f764cc53`;
+the manifest digest is
+`fda9e905f09151ae4fa55183e460bf9bc9b3dd35d77be7b225bb210da8b40fc5`, the
+vector digest is
+`c8df31ee8ac867d9009909f11fc9513d3b7464e403ebd88ea6437a26ab78009f`, and the
+receipt digest is
+`038176fdb5deace9f37826ddccb4573f0290eafa74fccfdee702bd32d5802fe7`. The
+durable receipt is stored at
+`/mnt/2tb/tritium-release-evidence/training-backends/42562840/cpu-v3/`.
+
+This is the CPU family only at this exact candidate source. It is not a
+seven-backend aggregate, a performance receipt, or final release qualification;
+the other backend families and final-source regeneration remain open.
