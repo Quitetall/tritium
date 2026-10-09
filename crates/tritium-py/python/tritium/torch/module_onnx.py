@@ -331,6 +331,47 @@ def _first_decoder_attention_residual_name(
     return residual_adds[0] if residual_adds else None
 
 
+def _first_decoder_block_internal_names(
+    graph, hidden_size: Optional[int], layer_count: Optional[int]
+) -> Tuple[str, ...]:
+    """Select hidden-size values inside block zero, excluding its residual ends."""
+
+    residual_adds = _decoder_layer_residual_add_names(
+        graph, hidden_size, layer_count
+    )
+    if not residual_adds:
+        return ()
+    first_add, block_output = residual_adds[:2]
+    node_indices = {
+        output: index
+        for index, node in enumerate(graph.node)
+        for output in node.output
+    }
+    first_index = node_indices.get(first_add)
+    output_index = node_indices.get(block_output)
+    if first_index is None or output_index is None or output_index <= first_index:
+        return ()
+    available = {
+        value.name: value
+        for value in (*graph.input, *graph.output, *graph.value_info)
+    }
+    internal = []
+    for node in graph.node[first_index + 1 : output_index]:
+        for name in node.output:
+            value = available.get(name)
+            if value is None or not value.type.HasField("tensor_type"):
+                continue
+            tensor_type = value.type.tensor_type
+            if (
+                tensor_type.elem_type == 1
+                and tensor_type.HasField("shape")
+                and len(tensor_type.shape.dim) == 3
+                and tensor_type.shape.dim[-1].dim_value == hidden_size
+            ):
+                internal.append(name)
+    return tuple(internal)
+
+
 def _terminal_capture_size_bytes(
     graph,
     names: Sequence[str],
@@ -411,6 +452,9 @@ def _capture_terminal_intermediates(
     attention_residual_name = _first_decoder_attention_residual_name(
         graph.graph, hidden_size, layer_count
     )
+    first_block_internal_names = _first_decoder_block_internal_names(
+        graph.graph, hidden_size, layer_count
+    )
     available = {
         value.name: value
         for value in (*graph.graph.input, *graph.graph.output, *graph.graph.value_info)
@@ -418,7 +462,12 @@ def _capture_terminal_intermediates(
     captured_names = tuple(
         name
         for name in dict.fromkeys(
-            (*candidates, *residual_names, attention_residual_name)
+            (
+                *candidates,
+                *residual_names,
+                attention_residual_name,
+                *first_block_internal_names,
+            )
         )
         if name is not None
         if name in available
@@ -464,6 +513,8 @@ def _capture_terminal_intermediates(
                         if name == attention_residual_name
                         else "terminal-layer-residual"
                         if name in residual_names
+                        else "terminal-first-block-internal"
+                        if name in first_block_internal_names
                         else "terminal-intermediate"
                     ),
                     name,
@@ -514,9 +565,18 @@ def _capture_reference_terminal_outputs(
     post_attention_layernorm = getattr(
         first_layer, "post_attention_layernorm", None
     )
+    first_mlp = getattr(first_layer, "mlp", None)
     can_capture_attention_residual = isinstance(post_attention_layernorm, nn.Module)
+    can_capture_mlp_input = can_capture_attention_residual
+    can_capture_mlp_output = isinstance(first_mlp, nn.Module)
     estimated_bytes = (
-        (layer_count + 1 + int(can_capture_attention_residual))
+        (
+            layer_count
+            + 1
+            + int(can_capture_attention_residual)
+            + int(can_capture_mlp_input)
+            + int(can_capture_mlp_output)
+        )
         * batch
         * sequence
         * hidden_size
@@ -526,25 +586,47 @@ def _capture_reference_terminal_outputs(
     if estimated_bytes > _MAX_TERMINAL_PARITY_CAPTURE_BYTES:
         return ()
     attention_residuals = []
+    mlp_inputs = []
+    mlp_outputs = []
 
     def capture_attention_residual(_module, args):
         if args and isinstance(args[0], Tensor):
             attention_residuals.append(args[0])
 
-    hook = (
-        post_attention_layernorm.register_forward_pre_hook(
-            capture_attention_residual
+    def capture_module_output(target, _module, _args, output):
+        value = output[0] if isinstance(output, (tuple, list)) and output else output
+        if isinstance(value, Tensor):
+            target.append(value)
+
+    hooks = []
+    if can_capture_attention_residual:
+        hooks.append(
+            post_attention_layernorm.register_forward_pre_hook(
+                capture_attention_residual
+            )
         )
-        if can_capture_attention_residual
-        else None
-    )
+        hooks.append(
+            post_attention_layernorm.register_forward_hook(
+                lambda module, args, output: capture_module_output(
+                    mlp_inputs, module, args, output
+                )
+            )
+        )
+    if can_capture_mlp_output:
+        hooks.append(
+            first_mlp.register_forward_hook(
+                lambda module, args, output: capture_module_output(
+                    mlp_outputs, module, args, output
+                )
+            )
+        )
     try:
         with torch.no_grad():
             result = model(*inputs, output_hidden_states=True, use_cache=False)
     except TypeError:
         return ()
     finally:
-        if hook is not None:
+        for hook in hooks:
             hook.remove()
     if isinstance(result, Mapping):
         hidden_states = result.get("hidden_states")
@@ -563,6 +645,10 @@ def _capture_reference_terminal_outputs(
         capture_tensors.append(logits)
     if attention_residuals:
         capture_tensors.append(attention_residuals[0])
+    if mlp_inputs:
+        capture_tensors.append(mlp_inputs[0])
+    if mlp_outputs:
+        capture_tensors.append(mlp_outputs[0])
     if sum(value.numel() * value.element_size() for value in capture_tensors) > (
         _MAX_TERMINAL_PARITY_CAPTURE_BYTES
     ):
@@ -578,6 +664,22 @@ def _capture_reference_terminal_outputs(
                 "reference-attention-residual",
                 "layers[0].attention_residual",
                 attention_residuals[0].detach().cpu().contiguous(),
+            )
+        )
+    if mlp_inputs:
+        arrays.append(
+            (
+                "reference-mlp-input",
+                "layers[0].post_attention_layernorm.output",
+                mlp_inputs[0].detach().cpu().contiguous(),
+            )
+        )
+    if mlp_outputs:
+        arrays.append(
+            (
+                "reference-mlp-output",
+                "layers[0].mlp.output",
+                mlp_outputs[0].detach().cpu().contiguous(),
             )
         )
     arrays.extend(
