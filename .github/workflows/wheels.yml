@@ -622,8 +622,13 @@ jobs:
             awk '/MemAvailable:/ { printf "mem_available_kib=%s ", $2 }' /proc/meminfo
             printf 'runner_temp_disk='
             df -Pk "$RUNNER_TEMP" | awk 'NR == 2 { printf "available_kib=%s ", $4 }'
-            printf 'runner_logical_cpus='
-            nproc | tr -d '\n'
+            printf 'runner_online_cpus='
+            getconf _NPROCESSORS_ONLN | tr -d '\n'
+            printf ' runner_total_logical_cpus='
+            nproc --all | tr -d '\n'
+            printf ' runner_cpu_model='
+            awk -F: '/model name/ { gsub(/^[[:space:]]+/, "", $2); printf "%s", $2; exit }' /proc/cpuinfo
+            printf ' omp_num_threads=%s mkl_num_threads=%s' "${OMP_NUM_THREADS:-unset}" "${MKL_NUM_THREADS:-unset}"
             printf ' load_average='
             awk '{ printf "1m=%s,5m=%s,15m=%s ", $1, $2, $3 }' /proc/loadavg
             if [[ -r /sys/fs/cgroup/cpu.max ]]; then
