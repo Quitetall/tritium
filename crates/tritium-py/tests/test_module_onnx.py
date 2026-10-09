@@ -73,12 +73,31 @@ def _assert_exact_packed_initializer_parity(model, graph):
                 assert actual.tobytes(order="C") == expected_array.tobytes(order="C")
 
 
-def test_packed_onnx_runtime_disables_dense_constant_folding():
+def test_packed_onnx_runtime_disables_dense_constant_folding(monkeypatch):
+    monkeypatch.delenv("TRITIUM_ONNX_INTRA_OP_THREADS", raising=False)
     options = _session_options(ort)
     assert (
         options.graph_optimization_level
         == ort.GraphOptimizationLevel.ORT_DISABLE_ALL
     )
+    assert options.intra_op_num_threads == 4
+    assert options.inter_op_num_threads == 0
+
+
+def test_onnx_runtime_thread_policy_can_be_overridden(monkeypatch):
+    monkeypatch.setenv("TRITIUM_ONNX_INTRA_OP_THREADS", "2")
+
+    assert _session_options(ort).intra_op_num_threads == 2
+
+
+@pytest.mark.parametrize("configured", ["-1", "257", "auto", "2.5"])
+def test_onnx_runtime_thread_policy_rejects_invalid_values(
+    monkeypatch, configured
+):
+    monkeypatch.setenv("TRITIUM_ONNX_INTRA_OP_THREADS", configured)
+
+    with pytest.raises(ValueError, match="TRITIUM_ONNX_INTRA_OP_THREADS"):
+        _session_options(ort)
 
 
 def test_cpu_model_name_reads_first_linux_cpu_label(tmp_path):
@@ -572,6 +591,7 @@ def test_onnx_parity_failure_can_retain_opt_in_diagnostic_graph(
         monkeypatch.setenv("TRITIUM_ONNX_PARITY_FAILURE_DIR", str(diagnostic_root))
         monkeypatch.setenv("OMP_NUM_THREADS", "3")
         monkeypatch.setenv("MKL_NUM_THREADS", "2")
+        monkeypatch.setenv("TRITIUM_ONNX_INTRA_OP_THREADS", "3")
         monkeypatch.setenv("HF_TOKEN", "must-not-be-recorded")
     else:
         monkeypatch.delenv("TRITIUM_ONNX_PARITY_FAILURE_DIR", raising=False)
@@ -604,7 +624,7 @@ def test_onnx_parity_failure_can_retain_opt_in_diagnostic_graph(
     assert runtime["versions"]["onnxruntime"]
     assert runtime["providers"] == ["CPUExecutionProvider"]
     assert runtime["session"]["graph_optimization_level"] == "ORT_DISABLE_ALL"
-    assert runtime["session"]["intra_op_num_threads"] == 0
+    assert runtime["session"]["intra_op_num_threads"] == 3
     assert runtime["session"]["inter_op_num_threads"] == 0
     assert runtime["cpu"]["logical_count"] == os.cpu_count()
     assert runtime["cpu"]["model_name"] is None or isinstance(
@@ -612,12 +632,14 @@ def test_onnx_parity_failure_can_retain_opt_in_diagnostic_graph(
     )
     assert runtime["thread_environment"]["OMP_NUM_THREADS"] == "3"
     assert runtime["thread_environment"]["MKL_NUM_THREADS"] == "2"
+    assert runtime["thread_environment"]["TRITIUM_ONNX_INTRA_OP_THREADS"] == "3"
     assert set(runtime["thread_environment"]) <= {
         "OMP_NUM_THREADS",
         "MKL_NUM_THREADS",
         "OPENBLAS_NUM_THREADS",
         "OMP_PROC_BIND",
         "KMP_AFFINITY",
+        "TRITIUM_ONNX_INTRA_OP_THREADS",
     }
     assert "HF_TOKEN" not in json.dumps(runtime)
     assert any(item["file"] == "model.onnx" for item in manifest["files"])

@@ -31,7 +31,8 @@ _MANIFEST = "tritium-module-onnx.json"
 _GRAPH = "model.onnx"
 _MAX_TERMINAL_PARITY_CAPTURE_BYTES = 64 * 1024 * 1024
 _PARITY_DIAGNOSTIC_LAYER_INDEX = 11
-_ORT_INTRA_OP_THREADS = 0
+_ORT_DEFAULT_INTRA_OP_THREADS = 4
+_ORT_INTRA_OP_THREADS_ENV = "TRITIUM_ONNX_INTRA_OP_THREADS"
 _ORT_INTER_OP_THREADS = 0
 _TOP_FIELDS_V1 = {
     "schema_version",
@@ -225,6 +226,25 @@ def _runtime_dependencies():
     return onnx, onnxruntime
 
 
+def _ort_intra_op_threads() -> int:
+    """Resolve a bounded explicit ORT thread policy (0 restores ORT auto)."""
+
+    configured = os.environ.get(_ORT_INTRA_OP_THREADS_ENV)
+    if configured is None:
+        return _ORT_DEFAULT_INTRA_OP_THREADS
+    try:
+        thread_count = int(configured, 10)
+    except ValueError as error:
+        raise ValueError(
+            f"{_ORT_INTRA_OP_THREADS_ENV} must be an integer from 0 to 256"
+        ) from error
+    if not 0 <= thread_count <= 256:
+        raise ValueError(
+            f"{_ORT_INTRA_OP_THREADS_ENV} must be an integer from 0 to 256"
+        )
+    return thread_count
+
+
 def _session_options(ort):
     """Keep packed decode graphs compact instead of constant-folding weights."""
 
@@ -233,9 +253,10 @@ def _session_options(ort):
     # during session creation, materializing every full-precision target
     # matrix. That defeats packed residency and can require tens of GiB.
     options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
-    # Keep ORT's existing runtime-default thread-pool policy explicit so failure
-    # receipts can distinguish the requested setting from CPU affinity.
-    options.intra_op_num_threads = _ORT_INTRA_OP_THREADS
+    # ORT auto thread-pool selection changed FP32 accumulation on two exact
+    # hosted artifacts. A bounded explicit default stabilizes that reduction;
+    # callers can override it with TRITIUM_ONNX_INTRA_OP_THREADS (0..256).
+    options.intra_op_num_threads = _ort_intra_op_threads()
     options.inter_op_num_threads = _ORT_INTER_OP_THREADS
     return options
 
@@ -279,6 +300,7 @@ def _parity_runtime_info(onnx, ort, session) -> dict[str, Any]:
             "OPENBLAS_NUM_THREADS",
             "OMP_PROC_BIND",
             "KMP_AFFINITY",
+            _ORT_INTRA_OP_THREADS_ENV,
         )
         if name in os.environ
     }
@@ -301,7 +323,7 @@ def _parity_runtime_info(onnx, ort, session) -> dict[str, Any]:
         "providers": providers,
         "session": {
             "graph_optimization_level": "ORT_DISABLE_ALL",
-            "intra_op_num_threads": _ORT_INTRA_OP_THREADS,
+            "intra_op_num_threads": _ort_intra_op_threads(),
             "inter_op_num_threads": _ORT_INTER_OP_THREADS,
         },
         "thread_environment": thread_environment,
