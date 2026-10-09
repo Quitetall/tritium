@@ -2764,3 +2764,20 @@ checkpoint round-trip `721.012s`, generation `763.559s`, ONNX export
 was `0.599s`). The optimization is not yet measured by hosted end-to-end
 qualification; the candidate exact-head run remains required and the tutorial
 is still far over budget.
+
+### Portable training CPU backend receipt — 2026-10-08
+
+On clean source commit `672ad1bd1325229a13bd2a0125b77dfca73b2d66`, the V2 CPU
+training backend was run on the physical i9-14900K host against the frozen
+36-operation/117-case corpus. The source-free receipt was independently
+reopened under `ReleaseCandidate` policy by
+`training_capability_table`; it records peak resident bytes `4192` and peak
+scratch bytes `132032`. Bundle BLAKE3 is
+`2c9e9ffcc9720fc0518078c391ebbf6f9a8dbeba6e4f502a78be8e1c41a66d04`, its
+SHA-256 is
+`395eb08bb873509e0ce069fdcd785cd2e53e05273c678af59e2e7111b0585a29`, and its
+size is 41,317 bytes. The durable receipt is stored at
+`/mnt/2tb/tritium-release-evidence/training-backends/672ad1bd/cpu-v2/`.
+This qualifies the CPU family at that exact source revision only; it is not a
+seven-backend aggregate, a performance receipt, or final release qualification.
+The other six target families and final-source regeneration remain open.
