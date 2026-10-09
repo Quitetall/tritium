@@ -3762,3 +3762,26 @@ dispatcher-overhead checks. Linux, macOS, Windows, and the ABI3 matrix also
 passed. The pinned SmolLM2 CPU tutorial is a separate job and remained in
 progress at the time of this record; its required `300s` result is not yet
 established by the PTQ-lane pass.
+
+### Exact-head hosted tutorial result — 2026-10-09 (over budget)
+
+Hosted wheels workflow
+[37894032395](https://github.com/Quitetall/tritium/actions/runs/37894032395)
+ran source revision `4125338a91d8bd1fccc847a950c5985ea0a7f949`. The installed
+wheel PTQ tests, source-free tutorial, cross-platform wheel builds, ABI3 matrix,
+CI, and CodeQL passed. The pinned SmolLM2 PTQ/QAT tutorial completed every
+functional phase but took `553.777s`, failing the unchanged `300s` wall-time
+gate by `253.777s`. Calibration completed at `0.643s`; conversion at
+`337.492s`; native checkpoint round-trip at `358.487s`; generation at
+`403.171s`; ONNX export at `520.114s`; ONNX replay at `546.504s`; and QAT
+resume at `553.777s`. No tutorial qualification receipt was published.
+
+The runner exposed four logical CPUs, more than `12 GiB` available memory and
+`83 GiB` temporary disk, with zero cgroup CPU-throttle periods; load average
+peaked at `5.70`. The result is therefore another wall-time failure, not an
+observed OOM, disk shortage, or cgroup-throttle failure. Conversion dominates
+and ONNX export is the next largest interval. Relative to the preceding hosted
+run at `562.706s`, this separate-run result is about `1.6%` lower, which is not
+controlled evidence of an improvement. Keep the frozen budget unchanged; the
+next software work must target conversion and export separately, preserve exact
+PTQ artifact/quality checks, and earn a fresh hosted rerun.
