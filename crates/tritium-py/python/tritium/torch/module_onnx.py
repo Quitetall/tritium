@@ -303,10 +303,21 @@ def _capture_terminal_intermediates(
             name: value.detach().contiguous().numpy()
             for name, value in zip(input_names, inputs, strict=True)
         }
-        values = session.run(list(captured_names), feed)
-        return tuple(
-            ("terminal-intermediate", name, value)
-            for name, value in zip(captured_names, values, strict=True)
+        run_names = (*output_names, *captured_names)
+        values = session.run(list(run_names), feed)
+        output_values = values[: len(output_names)]
+        intermediate_values = values[len(output_names) :]
+        return (
+            *(
+                ("terminal-output-replay", name, value)
+                for name, value in zip(output_names, output_values, strict=True)
+            ),
+            *(
+                ("terminal-intermediate", name, value)
+                for name, value in zip(
+                    captured_names, intermediate_values, strict=True
+                )
+            ),
         )
     finally:
         diagnostic_graph.unlink(missing_ok=True)

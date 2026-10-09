@@ -132,13 +132,20 @@ def test_terminal_intermediate_capture_replays_concat_shards_and_shared_input(
         onnx,
         ort,
     )
-    assert [name for _role, name, _value in captured] == [
-        "shard0",
-        "shard1",
-        "shared_hidden",
+    assert [(role, name) for role, name, _value in captured] == [
+        ("terminal-output-replay", "logits"),
+        ("terminal-intermediate", "shard0"),
+        ("terminal-intermediate", "shard1"),
+        ("terminal-intermediate", "shared_hidden"),
     ]
-    assert all(role == "terminal-intermediate" for role, _name, _value in captured)
     values = {name: value for _role, name, value in captured}
+    assert torch.equal(
+        torch.from_numpy(values["logits"]),
+        torch.cat(
+            [torch.from_numpy(values["shard0"]), torch.from_numpy(values["shard1"])],
+            dim=-1,
+        ),
+    )
     assert torch.equal(torch.from_numpy(values["shared_hidden"]), sample)
     assert torch.equal(
         torch.from_numpy(values["shard0"]), sample @ weight0
@@ -147,6 +154,12 @@ def test_terminal_intermediate_capture_replays_concat_shards_and_shared_input(
         torch.from_numpy(values["shard1"]), sample @ weight1
     )
     assert not (tmp_path / ".terminal-diagnostic.onnx").exists()
+    assert [name for _role, name, _value in captured] == [
+        "logits",
+        "shard0",
+        "shard1",
+        "shared_hidden",
+    ]
 
 
 def test_terminal_capture_failure_preserves_primary_parity_diagnostic(

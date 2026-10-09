@@ -4287,8 +4287,10 @@ diagnostic path identifies a bounded final `Concat` of `MatMul`/`Gemm` shards,
 replays the original inputs through a temporary graph that exposes those shard
 outputs and their shared non-input activation, then removes that temporary
 graph. The original exported graph and qualification run are unchanged. These
-additional arrays are stored with the existing graph/reference/observed ledger;
-if optional intermediate capture fails, the primary parity artifact is still
-retained. The local module suite passed (`16 passed`), and `actionlint` passed
-for the edited wheel workflow. This proves the diagnostic seam on a small
-synthetic graph only; no hosted AMD shard capture has been collected yet.
+additional arrays include the secondary graph's output as a scheduling-drift
+control and are stored with the original graph/reference/observed ledger. The
+secondary replay is diagnostic, not qualification evidence. If optional
+intermediate capture fails, the primary parity artifact is still retained.
+The local module suite passed (`16 passed`), and `actionlint` passed for the
+edited wheel workflow. This proves the diagnostic seam on a small synthetic
+graph only; no hosted AMD shard capture has been collected yet.
