@@ -587,6 +587,8 @@ def export_module_onnx(
             output_names=names_out,
             opset_version=opset,
             dynamo=True,
+            # On PyTorch 2.11, optimize=True removes required packed ternary
+            # initializers; the strict graph audit must continue to see them.
             optimize=False,
             do_constant_folding=False,
             external_data=True,

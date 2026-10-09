@@ -3786,6 +3786,27 @@ controlled evidence of an improvement. Keep the frozen budget unchanged; the
 next software work must target conversion and export separately, preserve exact
 PTQ artifact/quality checks, and earn a fresh hosted rerun.
 
+### Reject default ONNX graph optimization for packed artifacts — 2026-10-09
+
+The PyTorch 2.11 ONNX `optimize=True` setting was tested against the existing
+public QAT/PTQ/refinement ONNX integration test by overriding only the exporter
+argument at runtime. The first QAT export failed closed in Tritium's graph
+audit with `dense_shadow_detected`: optimization removed a required packed
+ternary initializer. No artifact was published and no runtime or performance
+result was claimed. Keep `optimize=False` until a selective packed-preserving
+optimization path passes strict initializer reachability, no-dense-shadow,
+exact ORT parity, and full artifact tests. The pinned PyTorch exporter
+documentation says `optimize` defaults to true since 2.7, so Tritium's explicit
+false is intentional, not a stale default assumption ([PyTorch 2.11 ONNX
+exporter documentation](https://docs.pytorch.org/docs/2.11/onnx.html)).
+
+The hosted export phase log measured graph capture at `32.396s`, decompositions
+at about `55.587s`, and translation at about `11.088s`. Roughly `30.611s` of
+the `129.682s` export phase is outside those three logged spans. These timings
+identify capture and decomposition as investigation targets, not guaranteed
+optimization wins; any replacement must retain packed initializer reachability
+and exact ONNX Runtime parity.
+
 ### Relay scale-prefix allocation reduction — 2026-10-09
 
 Commit `6aa06c19` replaces the relay initializer's per-prefix heap-backed
