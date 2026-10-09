@@ -49,8 +49,10 @@ def _assert_exact_packed_initializer_parity(model, graph):
                 name = f"{prefix}{field}_{plane}"
                 assert name in initializers
                 actual = numpy_helper.to_array(initializers[name])
-                assert actual.dtype == expected.detach().cpu().numpy().dtype
-                assert (actual == expected.detach().cpu().numpy()).all()
+                expected_array = expected.detach().cpu().numpy()
+                assert actual.dtype == expected_array.dtype
+                assert actual.shape == expected_array.shape
+                assert actual.tobytes(order="C") == expected_array.tobytes(order="C")
 
 
 def test_packed_onnx_runtime_disables_dense_constant_folding():
