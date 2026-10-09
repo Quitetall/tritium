@@ -162,6 +162,15 @@ def run_smollm2_release_demo(
         evidence_dir=target / "calibration",
     )
     report_progress("calibrated")
+    # These content identities are safe, compact evidence for distinguishing
+    # calibration drift from solver or ONNX-runtime drift across hosted CPUs.
+    print(
+        "[tritium-tutorial] receipt=calibration "
+        f"source_model_digest={calibration.source_model_digest} "
+        f"activation_cache_digest={calibration.activation_cache_digest} "
+        f"evidence_id={calibration.evidence_id}",
+        flush=True,
+    )
     conversion = convert(
         prepared,
         calibration,
@@ -169,6 +178,13 @@ def run_smollm2_release_demo(
         max_working_bytes=256 * 1024 * 1024,
     )
     report_progress("converted")
+    print(
+        "[tritium-tutorial] receipt=ptq-conversion "
+        f"artifact_id={conversion.artifact_id} "
+        f"recipe_id={conversion.recipe_id} "
+        f"algorithm_id={conversion.algorithm_id}",
+        flush=True,
+    )
     compact = load_quantized_module(prepared.model, conversion, inplace=True).eval()
     physical_bytes = _state_bytes(compact)
     diagnostics = _trit_diagnostics(compact)

@@ -132,6 +132,18 @@ differ in source/build or execution environment, and their exact environment
 was not reproduced here. It is not the full SmolLM2 release tutorial, an ONNX
 parity pass, GPU evidence, model-quality evidence, or release qualification.
 
+The two preceding hosted failures were observed on different 4-core CPU
+models: run [`37946168132`](https://github.com/Quitetall/tritium/actions/runs/37946168132)
+reported AMD EPYC 9V74, while run
+[`37948541947`](https://github.com/Quitetall/tritium/actions/runs/37948541947)
+reported Intel Xeon Platinum 8573C. Both had `OMP_NUM_THREADS` and
+`MKL_NUM_THREADS` unset. This makes hardware-dependent calibration drift
+plausible, but the old logs do not record calibration or PTQ artifact IDs, so
+the host difference is not a proven cause. The tutorial now prints the source,
+activation, evidence, recipe, algorithm and conversion content identities;
+compare those fields in the next exact-source hosted run before selecting a
+numerical or thread-pinning change.
+
 ## Gate status (measured 2026-09-03)
 
 ### Hugging Face distributed CPU software checks (2026-10-04)
