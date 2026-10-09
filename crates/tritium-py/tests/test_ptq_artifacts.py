@@ -1533,9 +1533,11 @@ def test_public_convert_persists_grouped_fit_artifact(tmp_path):
         prepared,
         calibration,
         work_dir=tmp_path / "grouped-public-work",
-        max_working_bytes=256 * 1024,
+        max_working_bytes=40 * 1024,
     )
 
+    assert result.weights[0].fit_chunk_rows == 1
+    assert result.weights[0].max_working_bytes == 40 * 1024
     fitted = result.weight("weight")
     assert len(fitted.planes) == 2
     assert fitted.planes[0].trits.shape == (4, 256)
@@ -1556,8 +1558,8 @@ def test_public_convert_persists_grouped_fit_artifact(tmp_path):
     )
 
     expected_artifact_sha256 = {
-        "conversion.json": "503ddde487f57c4fbd4dddeb9763ae57928baedade51301084d319830cec57d6",
-        "weight-00000.json": "976cf1306784e7f985d55ec5d08a2cfe2aa46dc6134ac7dd0e2991b64bb6765f",
+        "conversion.json": "f963c196f88b71f9a9b1da74a5ff51250eedab6166809559965b5ca3a3778a06",
+        "weight-00000.json": "011e8fb42cab4529ed5064d82a76b2d7cfc58a63deb1178534cb618f25f75610",
         "weight-00000-plane-0.scales.f16le": "c8de1782128b6c8ef79d641a0dc86a9208f7e60d0b4013c1e9f91956c6b717c9",
         "weight-00000-plane-0.trits.i8": "e1c9310f5390604cfdb0e5953b59495628895dd5ff298deabd3cfbfac326bd17",
         "weight-00000-plane-1.scales.f16le": "e5693158a3db67a5e05fa6e08e47120098d2dcaae10d2b4c291259bf650a17b0",
