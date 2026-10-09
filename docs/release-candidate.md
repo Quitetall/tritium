@@ -4100,3 +4100,32 @@ checks, not installed-wheel or whole-Qwen evidence; they do not satisfy
 multi-GPU training, physical browser, full-model ONNX, or candidate-bound
 release gates. The WASM build was not run because the shared Cargo target is
 still occupied by the independent Qwen coded-plane test.
+
+### Exact-head CI and ABI3 matrix — 2026-10-09
+
+For committed source revision
+`650bddc5ddbb7401c7a693b4ff6f23bae550ecbb` (PR #51), required CI run
+[37919058237](https://github.com/Quitetall/tritium/actions/runs/37919058237)
+completed successfully. This includes CPU Linux/macOS/Windows checks, the
+receipt-backed compatibility workflow, CPU benchmark smoke, mock serving,
+Helm contract, source-free Web package, WASI training vectors, supply-chain,
+semver, packaging, SBOM, and GPU-feature Clippy. CUDA parity, ROCm, Metal,
+WGPU hardware conformance, real-model serving, parser fuzzing, and performance
+regression jobs were skipped; none is counted as a pass here.
+
+The matching wheels run
+[37919058210](https://github.com/Quitetall/tritium/actions/runs/37919058210)
+produced a 16-cell `tritium.abi3-matrix-qualification.v1` receipt for CPython
+3.9–3.14 across Linux x86_64, Windows x64, and macOS arm64. The downloaded
+receipt passed `scripts/aggregate-wheel-smoke.py`'s `validate_receipt` for the
+exact source SHA and release `1.1.0-rc.2`; receipt ID is
+`sha256:1369e8ef87078a426dc27a3bb6bcc81fbf685c79dbbea1a33590c3b077666452`,
+run ID `github-37919058210-1-abi3-matrix`. Its SHA-256 is
+`52d37e775cb3c2161af864bb66115af885d27124fc0150f7d389c865301f9de5`; retained
+at `release/v1.1/evidence/abi3-37919058210/python-abi3-39-plus.json`.
+This closes only the ABI3 compatibility-matrix evidence for this exact source.
+No candidate manifest/registry currently binds this receipt and the matching
+package artifacts, so the full `packages` gate remains open. At the time of
+recording (2026-10-09 10:53 UTC), the wheels run's pinned SmolLM2 CPU tutorial
+was still in progress; its timing/quality result is not inferred from the
+successful matrix or other wheel jobs.
