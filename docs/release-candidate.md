@@ -4038,3 +4038,14 @@ receipt validation on fixtures. It is software regression evidence only; it
 does not create a current-revision candidate registry, satisfy the second-person
 governance review, or qualify any release gate. No GitHub Actions run was
 visible for this revision when checked.
+
+The broader `scripts/tests` suite was also run at this revision. It reported
+`633 passed, 1 failed, 4 warnings, 177 subtests passed in 60.17s`. The sole
+failure was `test_public_convert_parallelizes_rows_without_changing_fitted_artifact`:
+serial conversion took `0.130s`, four-thread conversion `0.095s` (1.36× versus
+the unchanged 1.5× assertion), with load average `30.60` during the probe. The
+separate Qwen coded-plane CPU test was concurrently live at roughly 12 CPU cores;
+host load later read `37.10` on a 32-CPU machine. Artifact identity and weighted
+error assertions passed. Treat the speed result as **inconclusive under
+contention**, not as a pass or a demonstrated regression; rerun this probe after
+the external workload ends. No performance threshold was changed.
