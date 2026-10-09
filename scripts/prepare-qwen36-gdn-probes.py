@@ -24,6 +24,7 @@ REPOSITORY = "Qwen/Qwen3.6-27B"
 REVISION = "6a9e13bd6fc8f0983b9b99948120bc37f49c13e9"
 CLASSES = ("qkv", "output", "gate_up", "down")
 FAMILIES = ("deltanet", "full_attention")
+STATE_LAYER_RULE = "probed-deltanet-or-next-deltanet-after-full-attention"
 MAX_JSON_BYTES = 16 * 1024 * 1024
 MAX_HEADER_BYTES = 64 * 1024 * 1024
 LAYER_NAME = re.compile(r"^model\.language_model\.layers\.(0|[1-9][0-9]*)\.(.+)$")
@@ -175,6 +176,21 @@ def _family_and_class(name: str, config: dict[str, Any]) -> tuple[str, str, int]
     return family, tensor_class, layer
 
 
+def _state_observation_layer(family: str, layer: int, layer_types: list[Any]) -> int:
+    """Resolve the recurrent-state observation layer under ADR 0049's rule."""
+
+    if family == "deltanet":
+        return layer
+    if family != "full_attention":
+        raise PreflightError(f"unsupported probe family {family!r}")
+    for candidate in range(layer + 1, len(layer_types)):
+        if layer_types[candidate] == "linear_attention":
+            return candidate
+    raise PreflightError(
+        "full-attention probe has no following DeltaNet state-observation layer"
+    )
+
+
 def prepare(model_dir: Path, selections: list[str]) -> dict[str, Any]:
     if model_dir.is_symlink() or not model_dir.is_dir():
         raise PreflightError("model directory must be an ordinary directory")
@@ -276,15 +292,19 @@ def prepare(model_dir: Path, selections: list[str]) -> dict[str, Any]:
                 "tensor_name": name,
                 "tensor_index": matrix_ordinals[name],
                 "layer": layer,
+                "state_layer": _state_observation_layer(
+                    family, layer, text["layer_types"]
+                ),
                 "shape": shape,
                 "source_shard": shard,
             })
     prepared = {
-        "schema": "tritium.qwen36-gdn-probe-preflight.v1",
+        "schema": "tritium.qwen36-gdn-probe-preflight.v2",
         "repository": REPOSITORY,
         "revision": REVISION,
         "state": "prepared-not-measured",
         "evidence_scope": "local-config-index-and-safetensors-header-only",
+        "state_layer_rule": STATE_LAYER_RULE,
         "config_sha256": config_digest,
         "weight_index_sha256": index_digest,
         "probes": probes,

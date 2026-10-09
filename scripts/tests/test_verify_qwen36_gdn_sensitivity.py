@@ -92,7 +92,123 @@ def preflight(value: dict) -> dict:
     return result
 
 
+def v2_receipt(delta_terminal: float = 1.0, control_terminal: float = 1.0) -> dict:
+    value = receipt(delta_terminal, control_terminal)
+    value["schema"] = MODULE.SCHEMA_V2
+    value["metric_id"] = MODULE.METRIC_ID_V2
+    value["sample_positions"] = list(MODULE.SAMPLED_POSITIONS_V2)
+    value["state_layer_rule"] = MODULE.STATE_LAYER_RULE_V2
+    value["verifier_sha256"] = MODULE._verifier_sha256()
+    delta_layers = (0, 1, 2, 4)
+    attention_layers = (3, 7, 11, 15)
+    for probe in value["probes"]:
+        family_index = MODULE.TENSOR_CLASSES.index(probe["tensor_class"])
+        layer = (
+            delta_layers[family_index]
+            if probe["family"] == "deltanet"
+            else attention_layers[family_index]
+        )
+        probe["layer"] = layer
+        probe["state_layer"] = layer if probe["family"] == "deltanet" else layer + 1
+        probe["sequence_positions"] = list(MODULE.SAMPLED_POSITIONS_V2)
+    value["receipt_id"] = "sha256:" + hashlib.sha256(
+        MODULE.canonical({key: item for key, item in value.items() if key != "receipt_id"})
+    ).hexdigest()
+    return value
+
+
+def v2_preflight(value: dict) -> dict:
+    probes = []
+    for probe in value["probes"]:
+        probes.append({
+            "family": probe["family"],
+            "tensor_class": probe["tensor_class"],
+            "tensor_name": probe["tensor_name"],
+            "tensor_index": probe["tensor_index"],
+            "layer": probe["layer"],
+            "state_layer": probe["state_layer"],
+            "shape": [8, 8],
+            "source_shard": "model-00001-of-00015.safetensors",
+        })
+    result = {
+        "schema": MODULE.PREFLIGHT_SCHEMA_V2,
+        "repository": MODULE.REPOSITORY,
+        "revision": MODULE.REVISION,
+        "state": "prepared-not-measured",
+        "evidence_scope": "local-config-index-and-safetensors-header-only",
+        "state_layer_rule": MODULE.STATE_LAYER_RULE_V2,
+        "config_sha256": "a" * 64,
+        "weight_index_sha256": "b" * 64,
+        "probes": probes,
+        "limitations": ["local metadata only"],
+    }
+    result["preflight_id"] = "sha256:" + hashlib.sha256(MODULE.canonical(result)).hexdigest()
+    return result
+
+
 class QwenGdnSensitivityReceiptTests(unittest.TestCase):
+    def test_v2_metric_receipt_joins_exact_state_layers_and_derives_route(self):
+        value = v2_receipt(delta_terminal=2.0, control_terminal=1.0)
+        verified = MODULE.verify(value, v2_preflight(value))
+        self.assertEqual(verified["schema"], "tritium.qwen36-gdn-sensitivity-verification.v2")
+        self.assertEqual(verified["metric_id"], MODULE.METRIC_ID_V2)
+        self.assertEqual(verified["gate"], "pass")
+        self.assertEqual(verified["route_to_refined_track"], [])
+        self.assertEqual(
+            verified["evidence_scope"],
+            "v2-receipt-structure-rule-and-local-preflight-join-only",
+        )
+        above_boundary = v2_receipt(delta_terminal=2.01, control_terminal=1.0)
+        self.assertEqual(
+            MODULE.verify(above_boundary, v2_preflight(above_boundary))["gate"],
+            "fail",
+        )
+
+    def test_v2_rejects_wrong_verifier_digest_positions_and_state_layer_join(self):
+        value = v2_receipt()
+        value["verifier_sha256"] = "f" * 64
+        reseal(value)
+        with self.assertRaisesRegex(MODULE.ReceiptError, "verifier digest"):
+            MODULE.verify(value, v2_preflight(value))
+
+        value = v2_receipt()
+        value["sample_positions"] = [128, 1024, 2048]
+        reseal(value)
+        with self.assertRaisesRegex(MODULE.ReceiptError, "sample positions"):
+            MODULE.verify(value, v2_preflight(value))
+
+        value = v2_receipt()
+        prepared = v2_preflight(value)
+        prepared["probes"][4]["state_layer"] += 1
+        prepared["preflight_id"] = "sha256:" + hashlib.sha256(
+            MODULE.canonical({key: item for key, item in prepared.items() if key != "preflight_id"})
+        ).hexdigest()
+        with self.assertRaisesRegex(MODULE.ReceiptError, "names or ordinals"):
+            MODULE.verify(value, prepared)
+
+    def test_v2_rejects_missing_curve_points_and_nonfinite_measurements(self):
+        value = v2_receipt()
+        value["probes"][0]["output_divergence"].pop()
+        with self.assertRaisesRegex(MODULE.ReceiptError, "output curve"):
+            MODULE.verify(value, v2_preflight(value))
+
+        value = v2_receipt()
+        value["probes"][0]["state_divergence"][0] = float("inf")
+        with self.assertRaisesRegex(MODULE.ReceiptError, "non-finite"):
+            MODULE.verify(value, v2_preflight(value))
+
+    def test_v2_routes_zero_control_only_for_positive_terminal_divergence(self):
+        value = v2_receipt(delta_terminal=0.0, control_terminal=0.0)
+        value["probes"][0]["output_divergence"][-1] = 0.01
+        reseal(value)
+        verified = MODULE.verify(value, v2_preflight(value))
+        self.assertEqual(verified["route_to_refined_track"], ["qkv"])
+
+    def test_v1_receipt_cannot_claim_a_v2_preflight_layer_join(self):
+        prepared = v2_preflight(v2_receipt())
+        with self.assertRaisesRegex(MODULE.ReceiptError, "requires measurement layer bindings"):
+            MODULE.verify(receipt(), prepared)
+
     def test_receipt_derives_pass_when_delta_terminal_is_within_threshold(self):
         verified = MODULE.verify(receipt(delta_terminal=2.0, control_terminal=1.0))
         self.assertEqual(verified["gate"], "pass")

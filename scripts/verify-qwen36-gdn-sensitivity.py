@@ -18,6 +18,11 @@ from typing import Any
 
 
 SCHEMA = "tritium.qwen36-gdn-sensitivity-measurement.v1"
+SCHEMA_V2 = "tritium.qwen36-gdn-sensitivity-measurement.v2"
+PREFLIGHT_SCHEMA_V2 = "tritium.qwen36-gdn-probe-preflight.v2"
+METRIC_ID_V2 = "qwen36-gdn-rms-hidden-v1"
+SAMPLED_POSITIONS_V2 = (128, 512, 2048)
+STATE_LAYER_RULE_V2 = "probed-deltanet-or-next-deltanet-after-full-attention"
 REPOSITORY = "Qwen/Qwen3.6-27B"
 REVISION = "6a9e13bd6fc8f0983b9b99948120bc37f49c13e9"
 FAMILIES = ("deltanet", "full_attention")
@@ -25,6 +30,7 @@ TENSOR_CLASSES = ("qkv", "output", "gate_up", "down")
 THRESHOLD_RATIO = 2.0
 CALIBRATION_SEQUENCES = 512
 TOKENS_PER_SEQUENCE = 2048
+LANGUAGE_LAYER_COUNT = 64
 HEX = frozenset("0123456789abcdef")
 MAX_RECEIPT_BYTES = 16 * 1024 * 1024
 
@@ -72,21 +78,28 @@ def _finite_nonnegative(value: Any, label: str, *, positive: bool = False) -> fl
 
 def verify_preflight(value: Any, probes: list[dict[str, Any]]) -> str:
     """Bind a measured probe list to the content-addressed local preflight."""
+    schema = value.get("schema") if isinstance(value, dict) else None
     required = {
         "schema", "repository", "revision", "state", "evidence_scope",
         "config_sha256", "weight_index_sha256", "probes", "limitations",
         "preflight_id",
     }
+    if schema == PREFLIGHT_SCHEMA_V2:
+        required.add("state_layer_rule")
     if not isinstance(value, dict) or set(value) != required:
         raise ReceiptError("probe preflight fields differ from its frozen schema")
     if (
-        value["schema"] != "tritium.qwen36-gdn-probe-preflight.v1"
+        value["schema"] not in {
+            "tritium.qwen36-gdn-probe-preflight.v1", PREFLIGHT_SCHEMA_V2
+        }
         or value["repository"] != REPOSITORY
         or value["revision"] != REVISION
         or value["state"] != "prepared-not-measured"
         or value["evidence_scope"] != "local-config-index-and-safetensors-header-only"
     ):
         raise ReceiptError("probe preflight is not the expected pinned local inventory record")
+    if schema == PREFLIGHT_SCHEMA_V2 and value["state_layer_rule"] != STATE_LAYER_RULE_V2:
+        raise ReceiptError("probe preflight uses an unknown recurrent state-layer rule")
     _digest(value["config_sha256"], "preflight config")
     _digest(value["weight_index_sha256"], "preflight weight index")
     if not isinstance(value["limitations"], list) or not all(
@@ -98,11 +111,15 @@ def verify_preflight(value: Any, probes: list[dict[str, Any]]) -> str:
         raise ReceiptError("probe preflight must contain exactly eight selections")
     selected_fields = ("family", "tensor_class", "tensor_name", "tensor_index")
     expected = []
+    seen_family_layers: set[tuple[str, int]] = set()
     for item in prepared_probes:
-        if not isinstance(item, dict) or set(item) != {
+        item_fields = {
             "family", "tensor_class", "tensor_name", "tensor_index",
             "layer", "shape", "source_shard",
-        }:
+        }
+        if schema == PREFLIGHT_SCHEMA_V2:
+            item_fields.add("state_layer")
+        if not isinstance(item, dict) or set(item) != item_fields:
             raise ReceiptError("probe preflight selection fields are malformed")
         if (
             item["family"] not in FAMILIES
@@ -120,12 +137,38 @@ def verify_preflight(value: Any, probes: list[dict[str, Any]]) -> str:
             or any(type(size) is not int or size <= 0 for size in item["shape"])
             or not isinstance(item["source_shard"], str)
             or not item["source_shard"]
+            or schema == PREFLIGHT_SCHEMA_V2
+            and (
+                type(item["layer"]) is not int
+                or type(item["state_layer"]) is not int
+                or item["layer"] < 0
+                or item["layer"] >= LANGUAGE_LAYER_COUNT
+                or item["state_layer"] < 0
+                or item["state_layer"] >= LANGUAGE_LAYER_COUNT
+                or item["family"] == "deltanet"
+                and item["state_layer"] != item["layer"]
+                or item["family"] == "full_attention"
+                and item["state_layer"] <= item["layer"]
+            )
         ):
             raise ReceiptError("probe preflight selection values are malformed")
-        expected.append(tuple(item[field] for field in selected_fields))
+        if schema == PREFLIGHT_SCHEMA_V2:
+            layer_key = (item["family"], item["layer"])
+            if layer_key in seen_family_layers:
+                raise ReceiptError("probe preflight repeats a layer within one family")
+            seen_family_layers.add(layer_key)
+        extra_fields = ("layer", "state_layer") if schema == PREFLIGHT_SCHEMA_V2 else ()
+        expected.append(tuple(item[field] for field in selected_fields + extra_fields))
     expected.sort()
+    if schema == PREFLIGHT_SCHEMA_V2 and any(
+        not isinstance(item, dict) or "layer" not in item or "state_layer" not in item
+        for item in probes
+    ):
+        raise ReceiptError("v2 preflight requires measurement layer bindings")
     measured = sorted(
-        tuple(item[field] for field in selected_fields)
+        tuple(item[field] for field in selected_fields + (
+            ("layer", "state_layer") if schema == PREFLIGHT_SCHEMA_V2 else ()
+        ))
         for item in probes
     )
     if expected != measured:
@@ -139,8 +182,8 @@ def verify_preflight(value: Any, probes: list[dict[str, Any]]) -> str:
     return preflight_id
 
 
-def verify(value: Any, preflight: Any | None = None) -> dict[str, Any]:
-    """Validate the frozen eight-probe receipt and derive its routing decision."""
+def _verify_v1(value: Any, preflight: Any | None = None) -> dict[str, Any]:
+    """Validate legacy diagnostic v1 receipts and derive their routing decision."""
     required = {
         "schema", "repository", "revision", "source_model_id",
         "calibration_pack_receipt_id", "calibration_token_digest",
@@ -287,6 +330,120 @@ def verify(value: Any, preflight: Any | None = None) -> dict[str, Any]:
         result["preflight_id"] = verify_preflight(preflight, probes)
         result["evidence_scope"] = "receipt-structure-rule-and-local-preflight-join-only"
     return result
+
+
+def _verifier_sha256() -> str:
+    return hashlib.sha256(Path(__file__).resolve().read_bytes()).hexdigest()
+
+
+def _verify_v2(value: Any, preflight: Any | None) -> dict[str, Any]:
+    """Validate the proposed metric-bound v2 receipt without running a model."""
+
+    required = {
+        "schema", "metric_id", "sample_positions", "state_layer_rule",
+        "verifier_sha256", "repository", "revision", "source_model_id",
+        "calibration_pack_receipt_id", "calibration_token_digest", "recipe_id",
+        "matched_bpw", "runtime_adapter_sha256", "machine", "sequence_count",
+        "tokens_per_sequence", "probes", "receipt_id",
+    }
+    if not isinstance(value, dict) or set(value) != required:
+        raise ReceiptError("v2 receipt fields differ from its frozen schema")
+    if value["schema"] != SCHEMA_V2 or value["metric_id"] != METRIC_ID_V2:
+        raise ReceiptError("receipt does not identify the proposed hidden-state RMS metric")
+    if value["state_layer_rule"] != STATE_LAYER_RULE_V2:
+        raise ReceiptError("receipt uses an unknown recurrent state-layer rule")
+    if (
+        not isinstance(value["sample_positions"], list)
+        or any(type(position) is not int for position in value["sample_positions"])
+        or value["sample_positions"] != list(SAMPLED_POSITIONS_V2)
+    ):
+        raise ReceiptError("receipt sample positions differ from the frozen metric positions")
+    if value["verifier_sha256"] != _verifier_sha256():
+        raise ReceiptError("receipt verifier digest differs from this verifier implementation")
+    probes = value["probes"]
+    if not isinstance(probes, list) or len(probes) != 8:
+        raise ReceiptError("the frozen probe set requires exactly eight matrices")
+    seen_family_layers: set[tuple[str, int]] = set()
+    for index, probe in enumerate(probes):
+        if not isinstance(probe, dict) or not {"layer", "state_layer"} <= set(probe):
+            raise ReceiptError(f"v2 probe {index} lacks its selected recurrent state layer")
+        layer, state_layer = probe["layer"], probe["state_layer"]
+        if (
+            type(layer) is not int
+            or type(state_layer) is not int
+            or layer < 0
+            or layer >= LANGUAGE_LAYER_COUNT
+            or state_layer < 0
+            or state_layer >= LANGUAGE_LAYER_COUNT
+        ):
+            raise ReceiptError(f"v2 probe {index} has invalid layer identity")
+        layer_key = (probe.get("family"), layer)
+        if layer_key in seen_family_layers:
+            raise ReceiptError(f"v2 probe {index} repeats a layer within one family")
+        seen_family_layers.add(layer_key)
+        if probe.get("family") == "deltanet" and state_layer != layer:
+            raise ReceiptError(f"v2 DeltaNet probe {index} must observe its own recurrent layer")
+        if probe.get("family") == "full_attention" and state_layer <= layer:
+            raise ReceiptError(
+                f"v2 full-attention probe {index} must observe a later DeltaNet layer"
+            )
+        if probe.get("sequence_positions") != list(SAMPLED_POSITIONS_V2):
+            raise ReceiptError(f"v2 probe {index} has noncanonical metric sample positions")
+        if (
+            not isinstance(probe.get("output_divergence"), list)
+            or len(probe["output_divergence"]) != len(SAMPLED_POSITIONS_V2)
+        ):
+            raise ReceiptError(f"v2 probe {index} output curve does not match the metric positions")
+        if (
+            not isinstance(probe.get("state_divergence"), list)
+            or len(probe["state_divergence"]) != len(SAMPLED_POSITIONS_V2)
+        ):
+            raise ReceiptError(f"v2 probe {index} state curve does not match the metric positions")
+
+    if preflight is None:
+        raise ReceiptError("v2 measurement verification requires its exact local probe preflight")
+    preflight_id = verify_preflight(preflight, probes)
+
+    # Reuse all frozen identity, coverage, finiteness, curve, and routing checks
+    # from v1 after translating only the version-specific fields in memory.
+    diagnostic = dict(value)
+    for field in ("metric_id", "sample_positions", "state_layer_rule", "verifier_sha256"):
+        diagnostic.pop(field)
+    diagnostic["schema"] = SCHEMA
+    diagnostic["probes"] = []
+    for probe in probes:
+        diagnostic_probe = dict(probe)
+        diagnostic_probe.pop("layer")
+        diagnostic_probe.pop("state_layer")
+        diagnostic["probes"].append(diagnostic_probe)
+    try:
+        diagnostic["receipt_id"] = "sha256:" + hashlib.sha256(
+            canonical({key: item for key, item in diagnostic.items() if key != "receipt_id"})
+        ).hexdigest()
+    except (TypeError, ValueError) as error:
+        raise ReceiptError("v2 receipt contains noncanonical or non-finite JSON values") from error
+    result = _verify_v1(diagnostic)
+    declared_id = value["receipt_id"]
+    _digest(declared_id, "receipt_id", prefixed=True)
+    body = {key: item for key, item in value.items() if key != "receipt_id"}
+    expected_id = "sha256:" + hashlib.sha256(canonical(body)).hexdigest()
+    if declared_id != expected_id:
+        raise ReceiptError("receipt_id does not match canonical v2 receipt content")
+    result["schema"] = "tritium.qwen36-gdn-sensitivity-verification.v2"
+    result["receipt_id"] = declared_id
+    result["preflight_id"] = preflight_id
+    result["metric_id"] = METRIC_ID_V2
+    result["verifier_sha256"] = value["verifier_sha256"]
+    result["evidence_scope"] = "v2-receipt-structure-rule-and-local-preflight-join-only"
+    return result
+
+
+def verify(value: Any, preflight: Any | None = None) -> dict[str, Any]:
+    """Dispatch versioned receipts; v1 remains diagnostic-only."""
+
+    if isinstance(value, dict) and value.get("schema") == SCHEMA_V2:
+        return _verify_v2(value, preflight)
+    return _verify_v1(value, preflight)
 
 
 def _load_receipt(path: Path, label: str) -> Any:

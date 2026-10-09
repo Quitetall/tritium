@@ -24,6 +24,7 @@ def fixture(
     rank_one: str | None = None,
     malformed_matrix: str | None = None,
     index_shard: str | None = None,
+    final_full_attention: bool = False,
 ) -> list[str]:
     root.mkdir(parents=True, exist_ok=True)
     layer_types = ["linear_attention" if layer % 4 != 3 else "full_attention" for layer in range(64)]
@@ -44,6 +45,12 @@ def fixture(
         ("full_attention", "gate_up", "model.language_model.layers.11.mlp.gate_proj.weight"),
         ("full_attention", "down", "model.language_model.layers.15.mlp.down_proj.weight"),
     ]
+    if final_full_attention:
+        probes[7] = (
+            "full_attention",
+            "down",
+            "model.language_model.layers.63.mlp.down_proj.weight",
+        )
     shard = "model-00001-of-00001.safetensors"
     header = {
         name: {
@@ -94,9 +101,20 @@ class QwenGdnProbePreflightTests(unittest.TestCase):
             selections = fixture(root)
             prepared = MODULE.prepare(root, selections)
         self.assertEqual(prepared["state"], "prepared-not-measured")
+        self.assertEqual(prepared["schema"], "tritium.qwen36-gdn-probe-preflight.v2")
         self.assertEqual(prepared["evidence_scope"], "local-config-index-and-safetensors-header-only")
+        self.assertEqual(prepared["state_layer_rule"], MODULE.STATE_LAYER_RULE)
         self.assertEqual(len(prepared["probes"]), 8)
         self.assertTrue(all(probe["shape"] == [8, 8] for probe in prepared["probes"]))
+        by_name = {probe["tensor_name"]: probe for probe in prepared["probes"]}
+        self.assertEqual(
+            by_name["model.language_model.layers.0.linear_attn.in_proj_qkv.weight"]["state_layer"],
+            0,
+        )
+        self.assertEqual(
+            by_name["model.language_model.layers.15.mlp.down_proj.weight"]["state_layer"],
+            16,
+        )
         self.assertEqual(
             {probe["tensor_name"]: probe["tensor_index"] for probe in prepared["probes"]}
             ["model.language_model.layers.0.linear_attn.in_proj_qkv.weight"],
@@ -158,6 +176,13 @@ class QwenGdnProbePreflightTests(unittest.TestCase):
             root = Path(temporary)
             selections = fixture(root)[:-1]
             with self.assertRaisesRegex(MODULE.PreflightError, "exactly eight"):
+                MODULE.prepare(root, selections)
+
+    def test_rejects_full_attention_probe_without_following_deltanet_state(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            selections = fixture(root, final_full_attention=True)
+            with self.assertRaisesRegex(MODULE.PreflightError, "no following DeltaNet"):
                 MODULE.prepare(root, selections)
 
     def test_rejects_malformed_geometry_outside_selected_probes(self):
