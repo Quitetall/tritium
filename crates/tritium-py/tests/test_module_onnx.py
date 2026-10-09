@@ -37,6 +37,7 @@ from tritium.torch import (  # noqa: E402
 from tritium.torch.module_onnx import (  # noqa: E402
     _capture_reference_terminal_outputs,
     _capture_terminal_intermediates,
+    _first_decoder_attention_residual_name,
     _decoder_layer_residual_names,
     _session_options,
     _terminal_intermediate_names,
@@ -141,6 +142,9 @@ def test_terminal_intermediate_capture_replays_concat_shards_and_shared_input(
     assert _decoder_layer_residual_names(graph, hidden_size=4, layer_count=1) == (
         "residual_b",
     )
+    assert _first_decoder_attention_residual_name(
+        graph, hidden_size=4, layer_count=1
+    ) == "residual_a"
 
     sample = torch.tensor([[[1.0, 2.0, 3.0, 4.0]]])
     captured = _capture_terminal_intermediates(
@@ -159,6 +163,7 @@ def test_terminal_intermediate_capture_replays_concat_shards_and_shared_input(
         ("terminal-intermediate", "shard1"),
         ("terminal-intermediate", "shared_hidden"),
         ("terminal-layer-residual", "residual_b"),
+        ("terminal-attention-residual", "residual_a"),
     ]
     values = {name: value for _role, name, value in captured}
     assert torch.equal(
@@ -171,6 +176,9 @@ def test_terminal_intermediate_capture_replays_concat_shards_and_shared_input(
     assert torch.equal(torch.from_numpy(values["shared_hidden"]), sample)
     assert torch.equal(
         torch.from_numpy(values["residual_b"]), sample + 2 * residual_bias
+    )
+    assert torch.equal(
+        torch.from_numpy(values["residual_a"]), sample + residual_bias
     )
     assert torch.equal(
         torch.from_numpy(values["shard0"]), sample @ weight0
@@ -201,6 +209,7 @@ def test_terminal_intermediate_capture_replays_concat_shards_and_shared_input(
         "shard1",
         "shared_hidden",
         "residual_b",
+        "residual_a",
     ]
 
 
@@ -264,6 +273,52 @@ def test_reference_terminal_capture_is_bounded_and_best_effort():
         )
         == ()
     )
+
+
+def test_reference_terminal_capture_includes_first_attention_residual():
+    input_ids = torch.tensor([[1, 2, 3]], dtype=torch.int64)
+    hidden = torch.ones((1, 3, 4), dtype=torch.float32)
+    logits = torch.zeros((1, 3, 10), dtype=torch.float32)
+
+    class TinyDecoderLayer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.post_attention_layernorm = torch.nn.Identity()
+
+        def forward(self, value):
+            return self.post_attention_layernorm(value + 1)
+
+    class TinyBackbone(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = torch.nn.ModuleList([TinyDecoderLayer()])
+
+    class TinyHookedReference(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(
+                num_hidden_layers=1,
+                hidden_size=4,
+                vocab_size=10,
+            )
+            self.model = TinyBackbone()
+
+        def forward(self, _input_ids, *, output_hidden_states, use_cache):
+            assert output_hidden_states is True
+            assert use_cache is False
+            self.model.layers[0](hidden)
+            return SimpleNamespace(logits=logits, hidden_states=(hidden, hidden))
+
+    captured = _capture_reference_terminal_outputs(
+        TinyHookedReference(), ["input_ids"], [input_ids]
+    )
+    assert [(role, name) for role, name, _value in captured] == [
+        ("reference-output-replay", "logits"),
+        ("reference-attention-residual", "layers[0].attention_residual"),
+        ("reference-hidden-state", "hidden_states[0]"),
+        ("reference-terminal-hidden", "hidden_states[-1]"),
+    ]
+    torch.testing.assert_close(captured[1][2], hidden + 1, rtol=0, atol=0)
 
 
 def test_terminal_capture_failure_preserves_primary_parity_diagnostic(
