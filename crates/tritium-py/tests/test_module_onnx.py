@@ -37,6 +37,7 @@ from tritium.torch import (  # noqa: E402
 from tritium.torch.module_onnx import (  # noqa: E402
     _capture_reference_terminal_outputs,
     _capture_terminal_intermediates,
+    _decoder_layer_residual_names,
     _session_options,
     _terminal_intermediate_names,
 )
@@ -97,9 +98,14 @@ def test_terminal_intermediate_capture_replays_concat_shards_and_shared_input(
     )
     weight0 = torch.arange(8, dtype=torch.float32).reshape(4, 2)
     weight1 = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+    residual_bias = torch.ones(4, dtype=torch.float32)
     graph = helper.make_graph(
         [
             helper.make_node("Identity", ["input"], ["shared_hidden"]),
+            helper.make_node(
+                "Add", ["shared_hidden", "residual_bias"], ["residual_a"]
+            ),
+            helper.make_node("Add", ["residual_a", "residual_bias"], ["residual_b"]),
             helper.make_node("MatMul", ["shared_hidden", "weight0"], ["shard0"]),
             helper.make_node("MatMul", ["shared_hidden", "weight1"], ["shard1"]),
             helper.make_node("Concat", ["shard0", "shard1"], ["logits"], axis=2),
@@ -110,9 +116,18 @@ def test_terminal_intermediate_capture_replays_concat_shards_and_shared_input(
         initializer=[
             numpy_helper.from_array(weight0.numpy(), name="weight0"),
             numpy_helper.from_array(weight1.numpy(), name="weight1"),
+            numpy_helper.from_array(residual_bias.numpy(), name="residual_bias"),
         ],
     )
-    graph.value_info.extend([hidden_info, shard0_info, shard1_info])
+    residual_info = helper.make_tensor_value_info(
+        "residual_a", TensorProto.FLOAT, [1, 1, 4]
+    )
+    residual_b_info = helper.make_tensor_value_info(
+        "residual_b", TensorProto.FLOAT, [1, 1, 4]
+    )
+    graph.value_info.extend(
+        [hidden_info, residual_info, residual_b_info, shard0_info, shard1_info]
+    )
     model_path = tmp_path / "model.onnx"
     onnx.save(
         helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)]),
@@ -123,6 +138,9 @@ def test_terminal_intermediate_capture_replays_concat_shards_and_shared_input(
         "shard1",
         "shared_hidden",
     )
+    assert _decoder_layer_residual_names(graph, hidden_size=4, layer_count=1) == (
+        "residual_b",
+    )
 
     sample = torch.tensor([[[1.0, 2.0, 3.0, 4.0]]])
     captured = _capture_terminal_intermediates(
@@ -132,12 +150,15 @@ def test_terminal_intermediate_capture_replays_concat_shards_and_shared_input(
         ["logits"],
         onnx,
         ort,
+        hidden_size=4,
+        layer_count=1,
     )
     assert [(role, name) for role, name, _value in captured] == [
         ("terminal-output-replay", "logits"),
         ("terminal-intermediate", "shard0"),
         ("terminal-intermediate", "shard1"),
         ("terminal-intermediate", "shared_hidden"),
+        ("terminal-layer-residual", "residual_b"),
     ]
     values = {name: value for _role, name, value in captured}
     assert torch.equal(
@@ -148,6 +169,9 @@ def test_terminal_intermediate_capture_replays_concat_shards_and_shared_input(
         ),
     )
     assert torch.equal(torch.from_numpy(values["shared_hidden"]), sample)
+    assert torch.equal(
+        torch.from_numpy(values["residual_b"]), sample + 2 * residual_bias
+    )
     assert torch.equal(
         torch.from_numpy(values["shard0"]), sample @ weight0
     )
@@ -176,6 +200,7 @@ def test_terminal_intermediate_capture_replays_concat_shards_and_shared_input(
         "shard0",
         "shard1",
         "shared_hidden",
+        "residual_b",
     ]
 
 
@@ -193,17 +218,35 @@ def test_reference_terminal_capture_is_bounded_and_best_effort():
 
         def __call__(self, *args, **kwargs):
             assert kwargs == {"output_hidden_states": True, "use_cache": False}
-            return SimpleNamespace(logits=logits, hidden_states=(hidden, hidden))
+            return SimpleNamespace(
+                logits=logits, hidden_states=(hidden, hidden, hidden)
+            )
 
     captured = _capture_reference_terminal_outputs(
         TinyReference(), ["input_ids"], [input_ids]
     )
     assert [(role, name) for role, name, _value in captured] == [
         ("reference-output-replay", "logits"),
+        ("reference-hidden-state", "hidden_states[0]"),
+        ("reference-hidden-state", "hidden_states[1]"),
         ("reference-terminal-hidden", "hidden_states[-1]"),
     ]
     assert torch.equal(captured[0][2], logits)
-    assert torch.equal(captured[1][2], hidden)
+    assert all(torch.equal(item[2], hidden) for item in captured[1:])
+
+    class ModernReference(TinyReference):
+        def __call__(self, *args, **kwargs):
+            assert kwargs == {"output_hidden_states": True, "use_cache": False}
+            return SimpleNamespace(logits=logits, hidden_states=(hidden, hidden))
+
+    modern_capture = _capture_reference_terminal_outputs(
+        ModernReference(), ["input_ids"], [input_ids]
+    )
+    assert [(role, name) for role, name, _value in modern_capture] == [
+        ("reference-output-replay", "logits"),
+        ("reference-hidden-state", "hidden_states[0]"),
+        ("reference-terminal-hidden", "hidden_states[-1]"),
+    ]
 
     class OversizedReference(TinyReference):
         config = SimpleNamespace(
@@ -270,7 +313,9 @@ def test_terminal_intermediates_are_added_to_parity_diagnostic(tmp_path, monkeyp
     monkeypatch.setattr(
         module_onnx,
         "_capture_terminal_intermediates",
-        lambda *_args: (("terminal-intermediate", "shard0", terminal_value),),
+        lambda *_args, **_kwargs: (
+            ("terminal-intermediate", "shard0", terminal_value),
+        ),
     )
     with pytest.raises(AssertionError, match="injected"):
         export_module_onnx(_model(), torch.randn(2, 8), tmp_path / "bundle")

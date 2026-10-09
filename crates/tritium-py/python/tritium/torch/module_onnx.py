@@ -270,6 +270,45 @@ def _terminal_intermediate_names(graph, output_names: Sequence[str]) -> Tuple[st
     return ()
 
 
+def _decoder_layer_residual_names(
+    graph, hidden_size: Optional[int], layer_count: Optional[int]
+) -> Tuple[str, ...]:
+    """Select Llama-style decoder block outputs when graph geometry is explicit."""
+
+    if (
+        type(hidden_size) is not int
+        or hidden_size <= 0
+        or type(layer_count) is not int
+        or layer_count <= 0
+    ):
+        return ()
+    available = {
+        value.name: value
+        for value in (*graph.input, *graph.output, *graph.value_info)
+    }
+    residual_adds = []
+    for node in graph.node:
+        if node.op_type != "Add" or len(node.output) != 1:
+            continue
+        value = available.get(node.output[0])
+        if value is None or not value.type.HasField("tensor_type"):
+            continue
+        tensor_type = value.type.tensor_type
+        if (
+            tensor_type.elem_type != 1  # TensorProto.FLOAT
+            or not tensor_type.HasField("shape")
+            or len(tensor_type.shape.dim) != 3
+            or tensor_type.shape.dim[-1].dim_value != hidden_size
+        ):
+            continue
+        residual_adds.append(node.output[0])
+    # Llama-family decoder blocks have two residual Add outputs apiece. Refuse
+    # to guess layer boundaries if export structure differs from that contract.
+    if len(residual_adds) != layer_count * 2:
+        return ()
+    return tuple(residual_adds[1::2])
+
+
 def _terminal_capture_size_bytes(
     graph,
     names: Sequence[str],
@@ -335,17 +374,27 @@ def _capture_terminal_intermediates(
     output_names: Sequence[str],
     onnx,
     ort,
+    *,
+    hidden_size: Optional[int] = None,
+    layer_count: Optional[int] = None,
 ) -> Tuple[Tuple[str, str, Any], ...]:
     """Replay bounded terminal ONNX values without changing the original graph."""
 
     graph_path = staging / _GRAPH
     graph = onnx.load(graph_path, load_external_data=False)
     candidates = _terminal_intermediate_names(graph.graph, output_names)
+    residual_names = _decoder_layer_residual_names(
+        graph.graph, hidden_size, layer_count
+    )
     available = {
         value.name: value
         for value in (*graph.graph.input, *graph.graph.output, *graph.graph.value_info)
     }
-    captured_names = tuple(name for name in candidates if name in available)
+    captured_names = tuple(
+        name
+        for name in dict.fromkeys((*candidates, *residual_names))
+        if name in available
+    )
     if not captured_names:
         return ()
     capture_names = (*output_names, *captured_names)
@@ -381,7 +430,13 @@ def _capture_terminal_intermediates(
                 for name, value in zip(output_names, output_values, strict=True)
             ),
             *(
-                ("terminal-intermediate", name, value)
+                (
+                    "terminal-layer-residual"
+                    if name in residual_names
+                    else "terminal-intermediate",
+                    name,
+                    value,
+                )
                 for name, value in zip(
                     captured_names, intermediate_values, strict=True
                 )
@@ -440,12 +495,11 @@ def _capture_reference_terminal_outputs(
         logits = getattr(result, "logits", None)
     if (
         not isinstance(hidden_states, (tuple, list))
-        or not hidden_states
-        or not isinstance(hidden_states[-1], Tensor)
+        or len(hidden_states) not in {layer_count, layer_count + 1}
+        or any(not isinstance(value, Tensor) for value in hidden_states)
     ):
         return ()
-    terminal_hidden = hidden_states[-1]
-    capture_tensors = [terminal_hidden]
+    capture_tensors = list(hidden_states)
     if isinstance(logits, Tensor):
         capture_tensors.append(logits)
     if sum(value.numel() * value.element_size() for value in capture_tensors) > (
@@ -457,12 +511,17 @@ def _capture_reference_terminal_outputs(
         arrays.append(
             ("reference-output-replay", "logits", logits.detach().cpu().contiguous())
         )
-    arrays.append(
+    arrays.extend(
         (
-            "reference-terminal-hidden",
-            "hidden_states[-1]",
-            terminal_hidden.detach().cpu().contiguous(),
+            "reference-terminal-hidden"
+            if index == len(hidden_states) - 1
+            else "reference-hidden-state",
+            "hidden_states[-1]"
+            if index == len(hidden_states) - 1
+            else f"hidden_states[{index}]",
+            value.detach().cpu().contiguous(),
         )
+        for index, value in enumerate(hidden_states)
     )
     return tuple(arrays)
 
@@ -957,6 +1016,10 @@ def export_module_onnx(
                     additional_arrays = ()
                     if os.environ.get("TRITIUM_ONNX_PARITY_CAPTURE_TERMINAL") == "1":
                         try:
+                            reference_config = getattr(model, "config", None)
+                            reference_config = getattr(
+                                reference_config, "text_config", reference_config
+                            )
                             additional_arrays = _capture_terminal_intermediates(
                                 staging,
                                 names_in,
@@ -964,6 +1027,12 @@ def export_module_onnx(
                                 names_out,
                                 onnx,
                                 ort,
+                                hidden_size=getattr(
+                                    reference_config, "hidden_size", None
+                                ),
+                                layer_count=getattr(
+                                    reference_config, "num_hidden_layers", None
+                                ),
                             )
                         except Exception as diagnostic_error:
                             print(

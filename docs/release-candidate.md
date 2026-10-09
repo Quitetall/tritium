@@ -62,31 +62,44 @@ fused kernel or cross-machine performance claim.
 
 Hosted Actions run [`37936540167`](https://github.com/Quitetall/tritium/actions/runs/37936540167)
 tested exact PR head `be644fb2b9fdc0b9ad7583950717d124348042dd`. The pinned
-SmolLM2 tutorial failed its frozen PyTorch/ONNX Runtime parity assertion by 4
-elements out of 344,064; the largest absolute delta was `0.0001091957` against
-the existing `0.0001` absolute tolerance. The opt-in diagnostic artifact
-(`smollm2-onnx-parity-diagnostic`, artifact ID `11617749672`, 32,789,616 bytes)
-was downloaded and its manifest and all recorded array hashes verified.
+SmolLM2 tutorial failed its frozen parity assertion by 4 elements out of
+344,064. Its diagnostic artifact (`11617749672`, 32,789,616 bytes) was
+downloaded; its manifest and recorded array hashes verified. The terminal graph
+had seven output-projection MatMul shards sharing one activation. Their
+concatenation reproduced the hosted ONNX logits exactly. Failures were spread
+across three shards, so no single shard was established as the source.
 
-The captured ONNX terminal graph exposes seven output-projection MatMul shards
-and their shared activation. Concatenating those seven captured shards
-reproduces the original hosted ONNX Runtime logits exactly (`max_abs=0`). The
-four failing positions are spread across three shards (one in `linear_210`, one
-in `linear_214`, two in `linear_215`), which argues against one isolated shard
-being the sole cause. A local exact PyTorch reconstruction applied to the
-hosted activation had three tolerance failures against the hosted PyTorch
-logits, including the `linear_214` position; applying the same reconstruction
-to the hosted ONNX activation matched hosted ONNX shards within tolerance.
-These are diagnostic comparisons, not a proof of the source: the hosted
-PyTorch final hidden state was not yet captured, so upstream activation drift
-remains a leading hypothesis rather than an established root cause.
+The next exact-source hosted run,
+[`37938221670`](https://github.com/Quitetall/tritium/actions/runs/37938221670),
+tested `d717ca4ec732c63268ffc32474bc2b2ecfaecf35`. All CPU wheel builds, the
+installed-wheel suite, the full abi3 matrix and the source-free tutorial passed;
+the pinned tutorial still failed parity by 3 of 344,064 elements. Its uploaded
+diagnostic (`smollm2-onnx-parity-diagnostic`, artifact ID `11619396796`,
+35,186,496 bytes) passed file-hash verification. The second PyTorch reference
+forward reproduced the original expected logits byte-for-byte. Its final
+hidden state differed from the ONNX shared activation by at most
+`0.00011158`, with zero failures under the frozen hidden-state tolerance.
 
-The release parity gate remains FAIL for this run. No tolerance or frozen
-contract was changed. The next diagnostic is to capture the reference
-framework's final hidden state on the same hosted worker and compare it directly
-with the ONNX shared activation, subject to the existing diagnostic size cap.
-This evidence does not qualify model quality, release readiness, or GPU
-performance.
+As a localized probe, the terminal projection subgraph was extracted from that
+hosted ONNX artifact and replayed locally with ONNX Runtime 1.30. Feeding it the
+captured ONNX activation retained the same three failing output coordinates
+against the reference logits; feeding it the captured PyTorch final hidden
+state produced zero failures. Replaying the captured ONNX activation through
+that extracted head differed from the original hosted ONNX logits by at most
+`1.24e-5` and remained within tolerance. This makes upstream activation drift
+the leading diagnosis, not a proven first-divergent layer; the local replay is
+not a substitute for hosted ONNX Runtime 1.27 evidence.
+
+The parity gate remains FAIL and its tolerance is unchanged. The next
+diagnostic now captures all 30 Llama-style decoder residual boundaries plus the
+reference model's layer hidden states; it accepts hidden-state tuples with
+either `num_hidden_layers` or `num_hidden_layers + 1` entries. The capture
+selector was exercised against the hosted graph and selected exactly 30 block
+outputs; the full diagnostic replay retained 39 ONNX arrays without altering
+the source artifact. A tiny Llama model using Transformers 5.5.3 also exercised
+the real output-capture path and exact replay. A new hosted run must locate the
+first divergent block before a numerical fix can be chosen. None of this
+evidence qualifies model quality, release readiness or GPU performance.
 
 ## Gate status (measured 2026-09-03)
 
