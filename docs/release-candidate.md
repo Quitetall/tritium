@@ -3202,3 +3202,19 @@ and `1.011s` after this edit. Release row-fit measurements also varied by less
 than 1% for the dual-relay profile. These single-run differences are within
 measurement noise and establish no speedup. This is an allocation reduction
 with byte-preservation evidence, not a release timing-gate pass.
+
+### Repeated exact-source hosted SmolLM2 tutorial — 2026-10-08
+
+Wheel run [37873233844](https://github.com/Quitetall/tritium/actions/runs/37873233844)
+tested commit `cdf782997a7544865bb43ec8ddff7c29ba422ab0`. All platform wheels,
+ABI3 jobs, installed-wheel checks and the source-free tutorial passed. The
+pinned SmolLM2 tutorial completed its functional path but failed the unchanged
+`300s` limit at `521.387s`. Calibration completed at `0.508s`; conversion
+completed at `345.197s` cumulative (`344.689s` conversion); native checkpoint
+round-trip at `361.661s`; generation at `396.508s`; ONNX export at `494.346s`;
+ONNX replay at `515.632s`; and QAT resume at `521.387s`. Samples recorded four
+logical CPUs, at least `12.2 GiB` available memory, at least `81.5 GiB`
+temporary disk, and zero cgroup CPU throttling. The tutorial remains
+functionally complete but misses the frozen timing gate. Conversion is still
+the dominant stage; the available evidence does not yet isolate a new
+model-scale optimization beyond the existing row-fit profile.
