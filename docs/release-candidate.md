@@ -4060,3 +4060,23 @@ host load later read `37.10` on a 32-CPU machine. Artifact identity and weighted
 error assertions passed. Treat the speed result as **inconclusive under
 contention**, not as a pass or a demonstrated regression; rerun this probe after
 the external workload ends. No performance threshold was changed.
+
+### Current PyTorch/Hugging Face and ONNX source checks — 2026-10-09
+
+At source revision `44530ec99d9ef95d0c6f096a7f403aee6fce0a1f`, the focused
+CPU source-tree suites passed:
+
+```text
+PYTHONPATH=crates/tritium-py/python python3 -m pytest -q \
+  crates/tritium-py/tests/test_huggingface_qat.py \
+  crates/tritium-py/tests/test_torch_onnx.py
+31 passed in 1.25s
+```
+
+The WebGPU package's generated-source check and direct TypeScript type-check
+also passed (`npm run check:generated` and
+`node_modules/.bin/tsc -p tsconfig.json --noEmit`). These are local source
+checks, not installed-wheel or whole-Qwen evidence; they do not satisfy
+multi-GPU training, physical browser, full-model ONNX, or candidate-bound
+release gates. The WASM build was not run because the shared Cargo target is
+still occupied by the independent Qwen coded-plane test.
