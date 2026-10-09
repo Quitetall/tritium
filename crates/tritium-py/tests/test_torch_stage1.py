@@ -265,6 +265,17 @@ def test_envelope_alias_reads(tmp_path):
     assert payload["epoch"] == 3  # extras preserved
 
 
+def test_envelope_rejects_missing_rng_state(tmp_path):
+    path = tmp_path / "missing-rng.ckpt"
+    torch.save(
+        {"model": {}, "opt": {}, "config": {}, "step": 1},
+        path,
+    )
+
+    with pytest.raises(ValueError, match="rng"):
+        ckpt.load_envelope(path)
+
+
 def test_envelope_extra_key_collision(tmp_path):
     with pytest.raises(ValueError, match="collide"):
         ckpt.save_envelope(

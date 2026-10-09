@@ -165,7 +165,9 @@ def load_envelope(path: str | os.PathLike, map_location: str = "cpu") -> dict[st
                 if alias in payload:
                     payload[canonical] = payload[alias]
                     break
-    missing = [k for k in ("model", "opt", "config", "step") if k not in payload]
+    missing = [
+        key for key in ("model", "opt", "config", "step", "rng") if key not in payload
+    ]
     if missing:
         raise ValueError(f"not a v1 envelope (missing {missing}): {path}")
     return payload
