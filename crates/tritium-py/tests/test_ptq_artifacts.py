@@ -1613,6 +1613,39 @@ def test_public_convert_persists_grouped_fit_artifact(tmp_path):
     )
 
 
+def test_public_convert_persists_one_plane_compact_recipe(tmp_path):
+    torch.manual_seed(41)
+    model = torch.nn.Linear(64, 3, bias=False)
+    prepared = prepare(
+        model,
+        TernaryConfig.ptq(
+            profile="compact-v1", target_modules=("Linear",), planes=1
+        ),
+        inplace=False,
+    )
+    calibration = calibrate(
+        prepared,
+        [torch.randn(2, 64)],
+        evidence_dir=tmp_path / "one-plane-calibration",
+    )
+
+    result = convert(
+        prepared,
+        calibration,
+        work_dir=tmp_path / "one-plane-work",
+    )
+
+    fitted = result.weight("weight")
+    assert len(fitted.planes) == 1
+    reopened = load_module_conversion(result.artifact_dir)
+    assert reopened.artifact_id == result.artifact_id
+    inputs = torch.randn(4, 64)
+    replayed = load_quantized_module(model, result.artifact_dir)
+    expected_weight = AdditiveTernaryWeight(fitted.planes).dense(dtype=inputs.dtype)
+    expected = torch.nn.functional.linear(inputs, expected_weight)
+    torch.testing.assert_close(replayed(inputs), expected, rtol=0, atol=0)
+
+
 def test_public_convert_persists_g64_grouped_fit_artifact(tmp_path):
     """Public conversion must retain G64 scale geometry through reload."""
 

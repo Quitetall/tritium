@@ -152,7 +152,7 @@ def run_smollm2_release_demo(
     report_progress("begin")
 
     recipe = TernaryConfig.ptq(
-        profile="compact-v1", target_modules=("Linear", "Embedding")
+        profile="compact-v1", target_modules=("Linear", "Embedding"), planes=1
     )
     prepared = prepare(source, recipe, inplace=True)
     report_progress("ptq-prepared")
