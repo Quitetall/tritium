@@ -3741,3 +3741,24 @@ Conversion accounts for `342.267s` and ONNX export adds `124.347s`, making both
 the immediate optimization targets. Keep the `300s` gate unchanged and require
 matched artifact/quality checks plus hosted confirmation before retaining any
 optimization.
+
+### Installed-wheel PTQ test ownership correction — 2026-10-09
+
+The exact-wheel PTQ test added to the Torch wheel lane initially failed in run
+[37891962910](https://github.com/Quitetall/tritium/actions/runs/37891962910)
+before test collection. The shared `conftest.py` unconditionally prepended the
+source package; importing it then failed because the source checkout does not
+contain the wheel's native `_tritium` extension. This was a test-harness
+ownership error, not a PTQ conversion or artifact failure.
+
+Commit `082123ce` adds the explicit `TRITIUM_TEST_INSTALLED_WHEEL=1` mode. It
+skips source rebinding and fails closed unless the imported `tritium` module is
+owned by the installed `pytritium` distribution. Ordinary source-tree pytest
+continues to bind to the checkout. In rerun
+[37893322305](https://github.com/Quitetall/tritium/actions/runs/37893322305),
+the installed-wheel Torch job passed, including exact-wheel public PTQ artifact
+tests, the differentiable lifecycle, tutorial QAT, API signature, and CPU
+dispatcher-overhead checks. Linux, macOS, Windows, and the ABI3 matrix also
+passed. The pinned SmolLM2 CPU tutorial is a separate job and remained in
+progress at the time of this record; its required `300s` result is not yet
+established by the PTQ-lane pass.
