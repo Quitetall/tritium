@@ -3671,3 +3671,35 @@ the compiler had already optimized away most loop overhead. The difference is
 within run-to-run noise and was not confirmed on the public conversion or
 hosted tutorial. The implementation was discarded; no production code change
 remains. Do not count this as a speedup or release-gate evidence.
+
+### Stage-7 production runner gap — 2026-10-09
+
+The source-bound Stage-7 orchestrator and strict qualifier are present, but
+the documented `measure-one-recipe.py` and
+`measure-baselines-and-refinements.py` commands are placeholders, not
+repository executables. A current tracked-file search found no measurement or
+auxiliary runner. The existing `run_stage7_smollm2_smoke` path proves capture,
+generic additive conversion, package writing/reopen, and causal-loss replay on
+the 135M smoke model; plan 0043 explicitly says this is not the full S2KF
+recipe used for Stage-7 quality decisions. It cannot emit the required
+one-layer, four-layer, and full-model grid measurements or matched baselines
+and refinement records. The Stage-7 gate therefore remains open before any
+recipe-freeze compute is authorized. Implement and test source-bound runners
+against the frozen request/capability schemas; do not claim the smoke path or
+synthetic runner responses as recipe-freeze evidence.
+
+### Exact-head hosted tutorial rerun — 2026-10-09 (still over budget)
+
+Hosted wheels workflow
+[37888637013](https://github.com/Quitetall/tritium/actions/runs/37888637013)
+ran source revision `fedf1b0a2fbf603d29d138b5c9fb0163acb4b383`. All functional
+phases completed, but the pinned SmolLM2 tutorial took `352.656s`, exceeding
+the frozen `300s` limit by `52.656s`. Stage markers were calibration `0.412s`,
+conversion `212.031s`, checkpoint round-trip `225.738s`, generation
+`254.709s`, ONNX export `330.528s`, ONNX replay `347.456s`, and QAT resume
+`352.656s`. The job failed only on the elapsed-time gate; this is not a
+candidate-wide package pass or model-quality result. The prior exact-head run
+on `df661840` took `564.452s`; because these were separate hosted runners, the
+large difference is not attributable to this test-only change. Retain the
+`300s` contract and require repeatable, matched software/configuration evidence
+before claiming a timing improvement.
