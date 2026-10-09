@@ -4019,3 +4019,22 @@ all 117 frozen cases and 36 operations. Its exact raw artifact is retained at
 (SHA-256 `00e594f23ca34be48c83dde7cd6385a109f47cd54c57f512239c0ac5cb6896ee`).
 It establishes only the `wasi` family; the seven-family backend-manifest and
 performance gates remain open.
+
+### Current release-registry validator regression checks — 2026-10-09
+
+At source revision `727a505a279a7fbcf723346a5f533af13712b740`, the focused
+local release-gate suites passed:
+
+```text
+python3 -m pytest -q \
+  scripts/tests/test_release_evidence_status.py \
+  scripts/tests/test_assemble_release_candidate.py \
+  scripts/tests/test_verify_zoo_community_receipt.py
+42 passed, 3 subtests passed in 6.07s
+```
+
+This exercises registry admission, candidate assembly, and model-zoo/community
+receipt validation on fixtures. It is software regression evidence only; it
+does not create a current-revision candidate registry, satisfy the second-person
+governance review, or qualify any release gate. No GitHub Actions run was
+visible for this revision when checked.
