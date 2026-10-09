@@ -4341,3 +4341,48 @@ passed for the edited wheel workflow. A local smoke against the retained
 SmolLM2 graph estimated 2,768,640 bytes and retrieved all seven shards plus
 `slice_187`; its temporary graph was removed. This is local diagnostic-path
 evidence only; no hosted AMD shard capture has been collected yet.
+
+#### Hosted decoder-boundary replay — 2026-10-09
+
+The next exact-source wheels run, [37940378594](https://github.com/Quitetall/tritium/actions/runs/37940378594)
+for `6078b2c12d0df2f15926dc121c1d342c886328e2`, passed the Linux, macOS arm64,
+and Windows x64 wheel jobs. The opt-in CUDA job was skipped by policy. The
+pinned SmolLM2 tutorial again failed only at ONNX CPU parity: 4 of 344,064
+logits exceeded the frozen `rtol=atol=1e-4` bound. The greatest failing
+absolute difference was `0.00010919570922851562` at `(0, 0, 34041)`; the
+greatest failing relative difference was `1.7615385055541992`.
+
+The run uploaded diagnostic artifact `smollm2-onnx-parity-diagnostic`
+(artifact ID `11621208335`, 36,083,548 bytes; archive SHA-256
+`7211101791c87b7397bb3112c1cb83dc72d07c8aab8adbc2a5fbe3aaf62a0345`). The
+downloaded manifest SHA-256 is
+`73d17201e9bc4f5a64cdc3030a929102733c40a823fb96dfa0f1168aedf79aab`; all 74
+replay arrays and both ONNX files passed the manifest's byte-count and
+SHA-256 checks. The graph and external-data hashes match the preceding
+capture, and the quantized checkpoint digest is
+`sha256:057411d950e9d681f3bcea79e1378eaada734e0a3556ff64590e200144fbd3e2`.
+
+On a local replay with ONNX Runtime 1.27.0 and the captured input, the first
+29 captured decoder residuals (`add_390` through `add_6606`) each had zero
+elementwise tolerance violations against the corresponding PyTorch hidden
+states `[1]` through `[29]`. The first residual already differed by up to
+`5.7220458984375e-06`; the largest normalized tolerance ratio among these
+boundaries was `0.6632399559` at `add_6606` versus `hidden_states[29]` (maximum
+absolute difference `0.0322265625`). The final normalized hidden tensor
+`slice_187` differed from the PyTorch terminal hidden state by at most
+`0.000118255615234375`, with zero tolerance violations (maximum normalized
+ratio `0.1101463139`). These are boundary checks, not proof that every internal
+operation is equivalent; the final pre-normalization residual is not directly
+comparable to the post-normalization terminal state.
+
+An isolated replay of the terminal ONNX head produced zero failing logits when
+fed the PyTorch terminal hidden tensor, but reproduced the same four failing
+logits when fed ONNX's `slice_187`. The isolated replay is not byte-identical
+to the full-graph replay (maximum output difference `1.239776611328125e-05`),
+so it is diagnostic only. This localizes the observed failure to differences
+already present in the ONNX-produced terminal hidden input, which the output
+head then carries across the logit tolerance for four elements. It does not
+identify the first divergent internal operation or establish a correction.
+Keep the parity gate RED and the tolerance unchanged; next compare earlier
+in-block activation boundaries to locate where the small drift first appears
+and test a source-backed numerical fix on the exact hosted gate.
