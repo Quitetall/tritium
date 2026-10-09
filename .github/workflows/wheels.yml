@@ -603,6 +603,9 @@ jobs:
           python -m pip install --isolated --disable-pip-version-check
           --no-index --no-deps --only-binary=:all: dist/*.whl
       - name: run and validate pinned SmolLM2 CPU tutorial
+        env:
+          OMP_NUM_THREADS: "1"
+          MKL_NUM_THREADS: "1"
         shell: bash
         run: |
           set -euo pipefail
