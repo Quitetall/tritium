@@ -3908,3 +3908,46 @@ as negligible and makes the exact assignment and relay routines the next
 semantics-preserving investigation targets. Do not change the frozen relay
 iteration schedule, basin flags, group-size recipe, or 300-second tutorial
 gate based on this profile.
+
+### Reuse exact-assignment reconstruction — 2026-10-09
+
+The joint solver's initial exact assignment now returns the selected additive
+codebook value alongside the trits. For identity and diagonal metrics, the
+initial objective scorer consumes that reconstruction rather than summing the
+same planes again in a second pass. Dense-metric coordinate correction retains
+its existing path. Code choices, scale solves, relay basins, and the stored
+representation are unchanged.
+
+The focused bitwise test covers P1/P2/P3, ordinary values, and extreme values
+that take the ill-conditioned exhaustive-assignment fallback. The complete
+`tritium-quantize` suite passed (241 passed, 4 ignored), as did strict Clippy
+and formatting. A fresh isolated local abi3 wheel was installed into a
+temporary environment, and the public `prepare` → `calibrate` → `convert()`
+tests `test_live_module_fit_consumes_bound_curvature_and_rejects_source_drift`
+and `test_public_convert_persists_grouped_fit_artifact` passed. The latter
+checks all six existing artifact SHA-256 values and reloads the sealed output.
+
+Local optimized solver-profile timings were noisy and do not establish a
+runtime improvement; no full-model timing or hosted tutorial result is claimed
+for this change. The exact-head 300-second tutorial gate remains open.
+
+### Exact-head hosted tutorial rerun — 2026-10-09 (still over budget)
+
+Hosted wheels workflow
+[37898468521](https://github.com/Quitetall/tritium/actions/runs/37898468521)
+ran source revision `d9951794e9a0c16a265b93dab2e9e1fa580e420a`. All tutorial
+functions completed, but the pinned SmolLM2 CPU tutorial took `563.955s`,
+exceeding the unchanged `300s` budget by `263.955s`. Stage markers recorded
+calibration at `0.605s`, conversion at `340.657s` (about `340.052s` after
+calibration), native checkpoint round-trip at `361.435s`, generation at
+`404.654s`, ONNX export at `531.236s`, ONNX replay at `556.975s`, and QAT
+resume at `563.955s`. No qualification receipt was published.
+
+The runner exposed four logical CPUs, at least about `11.5 GiB` available
+memory, at least about `81.8 GiB` temporary disk, and zero recorded cgroup CPU
+throttling. The run is another CPU wall-time failure, not observed OOM, disk
+pressure, or cgroup throttling. Its total is `0.311s` lower than the prior
+separate-source run (`564.266s`); this is not controlled evidence of a
+performance change. Wheel builds, installed-wheel smoke, source-free tutorial,
+and ABI3 cells passed; CUDA was skipped. This run predates the assignment
+reconstruction reuse change and does not measure it.

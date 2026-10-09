@@ -591,10 +591,29 @@ pub fn exact_ternary_assignment(
 /// accepted scale updates. Reusing these plane buffers avoids allocating `P * len` trits for
 /// every alternating-descent pass.
 fn exact_ternary_assignment_into_validated(weights: &[f32], scales: &[f32], trits: &mut [Vec<i8>]) {
+    exact_ternary_assignment_into_validated_with_reconstruction(weights, scales, trits, None);
+}
+
+/// Assign exact ternary codes and optionally retain each winning codebook value.
+///
+/// The initial solver state immediately needs both the selected trits and their additive
+/// reconstruction. Returning the winning codebook value avoids repeating the plane sum in a
+/// second full pass; the value is accumulated in the same plane order as `reconstruct_planes`.
+fn exact_ternary_assignment_into_validated_with_reconstruction(
+    weights: &[f32],
+    scales: &[f32],
+    trits: &mut [Vec<i8>],
+    mut reconstruction: Option<&mut [f32]>,
+) {
     debug_assert!(!weights.is_empty());
     debug_assert!((1..=3).contains(&scales.len()));
     debug_assert_eq!(trits.len(), scales.len());
     debug_assert!(trits.iter().all(|plane| plane.len() == weights.len()));
+    debug_assert!(
+        reconstruction
+            .as_ref()
+            .is_none_or(|values| values.len() == weights.len())
+    );
 
     const CODES: [i8; 3] = [0, -1, 1];
     let states = 3_usize.pow(scales.len() as u32);
@@ -665,6 +684,7 @@ fn exact_ternary_assignment_into_validated(weights: &[f32], scales: &[f32], trit
         if ill_conditioned {
             let mut best_error = f64::INFINITY;
             let mut best_state = usize::MAX;
+            let mut best_reconstruction = 0.0_f32;
             for &(reconstruction, candidate, state) in codebook.iter() {
                 let error = f64::from(weight) - f64::from(reconstruction);
                 let squared = error * error;
@@ -672,10 +692,14 @@ fn exact_ternary_assignment_into_validated(weights: &[f32], scales: &[f32], trit
                     best_error = squared;
                     best_codes = candidate;
                     best_state = state;
+                    best_reconstruction = reconstruction;
                 }
             }
             for plane in 0..scales.len() {
                 trits[plane][weight_index] = best_codes[plane];
+            }
+            if let Some(values) = reconstruction.as_deref_mut() {
+                values[weight_index] = best_reconstruction;
             }
             continue;
         }
@@ -696,10 +720,13 @@ fn exact_ternary_assignment_into_validated(weights: &[f32], scales: &[f32], trit
         } else {
             upper
         };
-        let (_, candidate, _) = codebook[candidate_index];
+        let (fitted, candidate, _) = codebook[candidate_index];
         best_codes = candidate;
         for plane in 0..scales.len() {
             trits[plane][weight_index] = best_codes[plane];
+        }
+        if let Some(values) = reconstruction.as_deref_mut() {
+            values[weight_index] = fitted;
         }
     }
 }
@@ -1034,21 +1061,41 @@ fn optimize_start(
     scales: Vec<f32>,
     kind: JointFitStartKind,
 ) -> Result<FitState, JointFitError> {
-    #[cfg(test)]
-    let assignment_started = std::time::Instant::now();
     let mut trits = (0..config.planes)
         .map(|_| vec![0_i8; weights.len()])
         .collect::<Vec<_>>();
-    assignment_for_metric_into_validated(weights, &scales, metric, &mut trits)?;
-    #[cfg(test)]
-    record_solver_phase(0, assignment_started);
-
-    #[cfg(test)]
-    let reconstruction_started = std::time::Instant::now();
-    let (reconstruction, objective) =
-        reconstruct_planes_and_objective(weights, &scales, &trits, metric)?;
-    #[cfg(test)]
-    record_solver_phase(2, reconstruction_started);
+    let (reconstruction, objective) = if matches!(metric, JointFitMetric::Dense(_)) {
+        #[cfg(test)]
+        let assignment_started = std::time::Instant::now();
+        assignment_for_metric_into_validated(weights, &scales, metric, &mut trits)?;
+        #[cfg(test)]
+        record_solver_phase(0, assignment_started);
+        #[cfg(test)]
+        let reconstruction_started = std::time::Instant::now();
+        let fitted = reconstruct_planes_and_objective(weights, &scales, &trits, metric)?;
+        #[cfg(test)]
+        record_solver_phase(2, reconstruction_started);
+        fitted
+    } else {
+        let mut reconstruction = vec![0.0_f32; weights.len()];
+        #[cfg(test)]
+        let assignment_started = std::time::Instant::now();
+        assignment_for_metric_into_validated_with_reconstruction(
+            weights,
+            &scales,
+            metric,
+            &mut trits,
+            Some(&mut reconstruction),
+        )?;
+        #[cfg(test)]
+        record_solver_phase(0, assignment_started);
+        #[cfg(test)]
+        let reconstruction_started = std::time::Instant::now();
+        let objective = metric_objective(weights, &reconstruction, metric)?;
+        #[cfg(test)]
+        record_solver_phase(2, reconstruction_started);
+        (reconstruction, objective)
+    };
     let mut state = FitState {
         scales,
         trits,
@@ -1636,12 +1683,32 @@ fn assignment_for_metric_into_validated(
     metric: JointFitMetric<'_>,
     trits: &mut [Vec<i8>],
 ) -> Result<(), JointFitError> {
+    assignment_for_metric_into_validated_with_reconstruction(weights, scales, metric, trits, None)
+}
+
+fn assignment_for_metric_into_validated_with_reconstruction(
+    weights: &[f32],
+    scales: &[f32],
+    metric: JointFitMetric<'_>,
+    trits: &mut [Vec<i8>],
+    mut reconstruction_out: Option<&mut [f32]>,
+) -> Result<(), JointFitError> {
     debug_assert_eq!(trits.len(), scales.len());
     debug_assert!(trits.iter().all(|plane| plane.len() == weights.len()));
+    debug_assert!(
+        reconstruction_out
+            .as_ref()
+            .is_none_or(|values| values.len() == weights.len())
+    );
     #[cfg(test)]
     ASSIGNMENT_FOR_METRIC_CALLS.with(|calls| calls.set(calls.get() + 1));
 
-    exact_ternary_assignment_into_validated(weights, scales, trits);
+    exact_ternary_assignment_into_validated_with_reconstruction(
+        weights,
+        scales,
+        trits,
+        reconstruction_out.as_deref_mut(),
+    );
     let JointFitMetric::Dense(dense) = metric else {
         return Ok(());
     };
@@ -1705,6 +1772,9 @@ fn assignment_for_metric_into_validated(
         if !changed {
             break;
         }
+    }
+    if let Some(values) = reconstruction_out {
+        values.copy_from_slice(&reconstruction);
     }
     Ok(())
 }
@@ -2920,6 +2990,30 @@ mod tests {
         }
 
         assert_eq!(got_error.to_bits(), oracle_error.to_bits());
+    }
+
+    #[test]
+    fn assigned_codebook_reconstruction_matches_plane_sum_bitwise() {
+        let weights = [0.3, -1.4, 2.1, 0.0, 1.0e20, -1.0e20];
+        for scales in [&[1.0][..], &[1.0, 0.4], &[1.0, 0.4, 0.2]] {
+            let expected_trits = exact_ternary_assignment(&weights, scales).unwrap();
+            let expected_reconstruction =
+                reconstruct_planes(scales, &expected_trits, weights.len());
+            let mut actual_trits = (0..scales.len())
+                .map(|_| vec![0_i8; weights.len()])
+                .collect::<Vec<_>>();
+            let mut actual_reconstruction = vec![0.0_f32; weights.len()];
+
+            exact_ternary_assignment_into_validated_with_reconstruction(
+                &weights,
+                scales,
+                &mut actual_trits,
+                Some(&mut actual_reconstruction),
+            );
+
+            assert_eq!(actual_trits, expected_trits);
+            assert_eq!(actual_reconstruction, expected_reconstruction);
+        }
     }
 
     #[test]
