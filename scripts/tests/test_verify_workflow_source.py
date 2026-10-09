@@ -16,6 +16,25 @@ CI_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 
 
 class VerifyWorkflowSourceTests(unittest.TestCase):
+    def test_supply_chain_gate_avoids_docker_hub_without_weakening_checks(self):
+        workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+        start = workflow.index("  cargo-deny:")
+        end = workflow.index("  workflow-lint:", start)
+        job = workflow[start:end]
+        self.assertNotIn("EmbarkStudios/cargo-deny-action@", job)
+        self.assertIn(
+            "uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833",
+            job,
+        )
+        self.assertIn("tool: cargo-deny@0.20.2", job)
+        self.assertIn('checksum: "true"', job)
+        self.assertIn("fallback: none", job)
+        self.assertIn(
+            "cargo deny --locked --all-features check licenses bans sources advisories",
+            job,
+        )
+        self.assertNotIn("continue-on-error", job)
+
     def test_workflow_checks_every_checkout_before_building_or_admitting(self):
         workflow = WORKFLOW.read_text(encoding="utf-8")
         self.assertIn(

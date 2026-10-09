@@ -473,7 +473,10 @@ jobs:
     name: source-free wheel tutorial · Python 3.13 slim
     needs: wheels
     runs-on: ubuntu-24.04
-    container: python:3.13-slim
+    # Official Python 3.13 slim linux/amd64 manifest, byte-identical on Docker
+    # Hub and ECR Public. Avoid shared-runner Docker Hub anonymous pull quotas;
+    # keep the source-free/compiler-free qualification environment immutable.
+    container: public.ecr.aws/docker/library/python@sha256:8fb4cfa1a2616d7b8e0c2175cc6ad68f5729c34ea8488c0b360d2934b7be9024
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
