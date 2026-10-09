@@ -3387,3 +3387,21 @@ sample the runner reported four logical CPUs, `11.1 GiB` available memory,
 `81.9 GiB` temporary disk, and zero cgroup CPU throttling. This is functional
 success with a timing-gate failure, not a release pass; optimizing full-model
 PTQ conversion remains the dominant software task.
+
+### Inline weighted-absolute ordering experiment — 2026-10-09 (rejected)
+
+To remove one small heap allocation for the common G64/G128 initialization
+path, a candidate stored weighted absolute values in a 128-entry stack array
+with a heap fallback for wider groups. The candidate preserved the reference
+sort order, weighted totals and quantiles at lengths 128 and 129, and the full
+quantizer suite passed (`240 passed`, `4 ignored`, plus applicable integration
+tests). Strict Clippy initially objected to the intentionally large inline
+enum; the allowance was local to that candidate. The optimized pinned G64/P3
+profile measured `57.731`, `57.558`, and `57.300 ms` (median `57.558 ms`) over
+five repeats. The measured weighted-order phase was `0.255–0.257 ms`, versus
+`0.246 ms` in the immediately preceding single run. This does not show an
+improvement in the targeted phase; the total-time difference from the prior
+single `58.593 ms` observation is too small and uncontrolled to support a
+speed claim. The candidate was removed. No production source change or
+artifact change remains from this experiment, and the hosted 300-second
+tutorial gate remains open.
