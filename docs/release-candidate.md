@@ -3332,3 +3332,18 @@ TRITIUM_SMOLLM2_PROFILE_FIXTURE=/tmp/tritium-smollm2-profile-fixture.bin \
 
 This narrows a possible optimization target only; no solver behavior was
 changed. The pinned hosted tutorial timing gate remains independently open.
+
+### Exact-head hosted SmolLM2 tutorial rerun — 2026-10-09
+
+Wheel run [37877221634](https://github.com/Quitetall/tritium/actions/runs/37877221634)
+tested branch head `6cd455bc`. All platform wheels, the ABI3 matrix,
+installed-wheel smoke, and source-free tutorial passed; the CUDA wheel lane
+was skipped. The pinned SmolLM2 CPU tutorial completed every functional phase
+but failed the unchanged `300s` wall-time gate at `589.759s`. Conversion
+completed at `392.150s` cumulative (`391.601s` conversion); native checkpoint
+round-trip at `411.585s`; generation at `454.995s`; ONNX export at `557.836s`;
+ONNX replay at `583.514s`; and QAT resume at `589.759s`. At the final resource
+sample the runner reported four logical CPUs, `11.1 GiB` available memory,
+`81.9 GiB` temporary disk, and zero cgroup CPU throttling. This is functional
+success with a timing-gate failure, not a release pass; optimizing full-model
+PTQ conversion remains the dominant software task.
