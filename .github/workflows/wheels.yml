@@ -364,6 +364,8 @@ jobs:
       - name: qualify public PTQ row-fitting parallelism
         run: python -m unittest scripts.tests.test_ptq_parallelism -v
       - name: test exact-wheel public PTQ artifacts
+        env:
+          TRITIUM_TEST_INSTALLED_WHEEL: "1"
         run: >-
           python -I -m pytest -q
           crates/tritium-py/tests/test_ptq_artifacts.py

@@ -8,6 +8,7 @@ modules or a different native extension.
 from __future__ import annotations
 
 import importlib.metadata
+import os
 from pathlib import Path
 import sys
 
@@ -30,6 +31,13 @@ def _bind_source_package() -> None:
 
 def pytest_sessionstart(session) -> None:  # type: ignore[no-untyped-def]
     del session
+    if os.environ.get("TRITIUM_TEST_INSTALLED_WHEEL") == "1":
+        if not _installed_distribution_owns_source():
+            raise RuntimeError(
+                "installed-wheel pytest mode requires tritium to be owned by the "
+                "installed pytritium distribution"
+            )
+        return
     _bind_source_package()
     import tritium
 
