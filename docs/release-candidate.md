@@ -3104,3 +3104,21 @@ started against an active shared GPU workload. Physical Firefox and physical
 macOS Safari lanes remain separately required. The Chrome lane can be attempted
 after a compatible local WebDriver is available and exclusive GPU use is safe;
 the three-lane candidate receipt remains open.
+
+### Hosted exact-source SmolLM2 tutorial — 2026-10-08
+
+The hosted wheel workflow for `df14566869b10246ceee4b014eb690606c245767`
+([run 37870797284](https://github.com/Quitetall/tritium/actions/runs/37870797284))
+passed platform wheel builds, the installed-wheel functional suite, the full
+ABI3 matrix, and the source-free tutorial. The pinned SmolLM2 PTQ/QAT tutorial
+completed every functional stage but failed the frozen `300s` wall-time gate at
+`508.990s` (`208.990s` over budget). Stage markers were calibration `0.511s`,
+conversion `338.983s` cumulative, native checkpoint round-trip `355.219s`,
+generation `389.199s`, ONNX export `482.411s`, ONNX replay `503.237s`, and QAT
+resume `508.990s`. Thus conversion itself took `338.472s`; ONNX export added
+`93.091s`. The runner exposed four logical CPUs, roughly 12–14 GiB available
+memory, over 83 GiB temporary disk, and no cgroup CPU throttling. This is a
+compute-time miss, not an OOM, disk-space failure, or skipped functionality.
+The recipe and `300s` gate are unchanged; the CPU PTQ conversion remains the
+dominant software optimization target. CI, CodeQL, docs and capstone passed at
+this source; the pinned tutorial was the only failed wheel job.
