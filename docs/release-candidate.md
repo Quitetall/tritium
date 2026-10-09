@@ -3652,3 +3652,22 @@ and coincided with substantial runnable-thread pressure. The speculative
 setting was removed; the workflow again uses the runtime's default Rayon pool.
 Keep the `300s` contract unchanged and pursue solver-level improvements with
 matched artifact/quality checks.
+
+### Release-mode plane reconstruction unrolling probe — 2026-10-09 (rejected)
+
+The exact pinned G64 SmolLM2 profile fixture
+(`/mnt/4tb/tritium-evidence/ptq-profile-fdd5bd17-exact.bin`, SHA-256
+`2b4f5a522531a5894e98b2a0593db9764f1cef34962e62ecf9594e618437ff18`) was
+used to test explicit one-to-three-plane reconstruction unrolling. The probe
+preserved the established f32 summation order and retained the exact same
+P3 objective sum (`0.015994445`). The `tritium-quantize` suite passed with the
+candidate, including `fused_reconstruction_objective_is_bit_identical_to_reference_paths`.
+
+This did not demonstrate a production improvement. On the same host and
+release test profile, one baseline run at `fedf1b0a` measured `57.953ms` total
+for the five-repeat P3 fixture, while one candidate run measured `57.369ms`
+(about 1%). Reconstruction phase time changed from `10.401ms` to `10.071ms`;
+the compiler had already optimized away most loop overhead. The difference is
+within run-to-run noise and was not confirmed on the public conversion or
+hosted tutorial. The implementation was discarded; no production code change
+remains. Do not count this as a speedup or release-gate evidence.
