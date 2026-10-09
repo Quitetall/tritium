@@ -3688,6 +3688,15 @@ recipe-freeze compute is authorized. Implement and test source-bound runners
 against the frozen request/capability schemas; do not claim the smoke path or
 synthetic runner responses as recipe-freeze evidence.
 
+The separate Qwen PTQ evidence path does have a high-level adapter:
+`capture_qwen36_kronecker_evidence` resolves canonical language/MTP and
+embedding/output-head tasks through the resumable native catalog session. Its
+focused synthetic CPU coverage passed on this checkout (three dispatch,
+containing-oracle, and grouped-replay tests). This does not close the Stage-7
+runner gap, and it is not evidence from the pinned Qwen checkpoint: production
+model loading, calibration replay, and the complete 506-record collection have
+not run.
+
 An interface audit on 2026-10-09 confirmed that the missing producer is not
 just command-line glue. Keep two geometries distinct: ADR 0035 freezes the
 durable S2KF curvature evidence at G128, while ADR 0028 and plan 0043 make
