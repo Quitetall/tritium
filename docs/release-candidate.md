@@ -144,6 +144,44 @@ activation, evidence, recipe, algorithm and conversion content identities;
 compare those fields in the next exact-source hosted run before selecting a
 numerical or thread-pinning change.
 
+#### Exact-source hosted identity capture (2026-10-09)
+
+The follow-up wheels run
+[`37951055368`](https://github.com/Quitetall/tritium/actions/runs/37951055368)
+tested exact source commit `f53f0868986e5416c333be2f31f62d96553132c8`. Its
+Linux tutorial runner was AMD EPYC 7763, with four online CPUs and OMP/MKL
+thread variables unset. The source model digest exactly matched the local
+repeatability probe, but its activation/evidence IDs did not:
+
+| Identity | Local four-thread probe | Hosted run 37951055368 |
+|---|---|---|
+| Source model digest | `07b6b933f97ef0d84d39eab5f6761de34eb07f1d14c43f1f22f70a06d54266b7` | same |
+| Activation cache digest | `1d2d330288e5fa4335e2d1800616140a7900d7d18f9de9d3cba543ab42267dea` | `650266cc917befb52f54a996d3d9faf085d2a5c1d6eef5f45075086c0b370f71` |
+| Calibration evidence ID | `bfdf8ddcd58a33c50196566d0bb02593aa745ae06e8381d6368c84e3c0167ae6` | `e616fa4122200a6a74d61f96d3d965d7756d8d26bef62fb30c146aa51d9b803a` |
+| PTQ artifact ID | `e6c97ef3265a863571796a71eec08a6a792472574a0fb0e3d7b53be6705ae18c` | `e8558ba5bf7a3291e13061a0cac5e5a771c805a08c22657f9b42aad705fa83cb` |
+
+The hosted tutorial failed the unchanged `rtol=atol=1e-4` ONNX gate at 4 of
+344,064 logits: maximum failing absolute error `0.00010919570922851562` at
+`(0, 0, 34041)`, maximum relative error `1.7615385`. Its opt-in diagnostic
+artifact (`11626392613`, 37,075,617 compressed bytes; archive SHA-256
+`3a580fc517d4cec562431c7c4f8d41de3ff514cbd249048c49eb0c43465452b6`) was
+downloaded and all 112 referenced model/replay files passed size and SHA-256
+verification. The diagnostic manifest SHA-256 is
+`de1e997a6933f3264526b5a4df1bfed812ca35870171dfb8422561107ec62afb`.
+
+The checkpoint digest (`sha256:057411d950e9d681f3bcea79e1378eaada734e0a3556ff64590e200144fbd3e2`)
+and ONNX external-data digest (`sha256:5a8c3e5330da8e5a57ea2f0af81502aacbccbd43a1ed192fc8ea97afc860103b`) match the earlier AMD-hosted failure `37946168132`. The intervening Intel Xeon-hosted run `37948541947` had different checkpoint and external-data digests (`3bb026489b8ca00f2696a040bd48a0b4055906f097c7952348dc89259fffae2` and `6fe77ebb594aad20ac6c44896d83d9c1f9b20e9805b0986b8f5885a67cabf2d3`). This supports platform-sensitive activation calibration as an explanation for cross-run PTQ bytes, but does not isolate CPU ISA from native build, math libraries, or thread scheduling; the older runs did not log calibration IDs. The same PTQ checkpoint can still fail ONNX parity, so calibration-byte reproducibility and the terminal numerical parity defect are separate open problems.
+
+The block-11 trace again places the first large in-tolerance jump in the MLP
+down projection: `linear_83` differs from the reference by at most `0.0322266`
+with zero failures at that boundary; all 29 residual boundaries remain within
+tolerance, with peak ratio `0.663240` at `add_6606`. The failing terminal
+logits remain unchanged from the AMD run. Required CI, docs, capstone CPU smoke,
+CodeQL, platform wheel builds, installed-wheel checks, source-free tutorial,
+and abi3 matrix passed for this commit; CUDA, fuzz, GPU/backend physical, and
+performance gates were skipped. The overall wheels workflow remains FAIL
+because the pinned SmolLM2 ONNX parity gate fails.
+
 ## Gate status (measured 2026-09-03)
 
 ### Hugging Face distributed CPU software checks (2026-10-04)
