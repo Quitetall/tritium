@@ -1611,3 +1611,52 @@ def test_public_convert_persists_grouped_fit_artifact(tmp_path):
     torch.testing.assert_close(
         roomy_model(inputs), reopened_model(inputs), rtol=0, atol=0
     )
+
+
+def test_public_convert_persists_g64_grouped_fit_artifact(tmp_path):
+    """Public conversion must retain G64 scale geometry through reload."""
+
+    torch.manual_seed(29)
+    model = torch.nn.Linear(192, 4, bias=False)
+    prepared = prepare(
+        model,
+        TernaryConfig(
+            mode="ptq",
+            estimator="salt-v2",
+            target_modules=("Linear",),
+            planes=2,
+            profile="compact-v1",
+            target_bpw=None,
+        ),
+        inplace=False,
+    )
+    calibration = calibrate(
+        prepared,
+        [torch.randn(3, 192)],
+        evidence_dir=tmp_path / "g64-public-calibration",
+    )
+
+    result = convert(
+        prepared,
+        calibration,
+        work_dir=tmp_path / "g64-public-work",
+    )
+
+    fitted = result.weight("weight")
+    assert len(fitted.planes) == 2
+    assert all(plane.group_size == 64 for plane in fitted.planes)
+    assert all(plane.trits.shape == (4, 192) for plane in fitted.planes)
+    assert all(plane.scales.shape == (4, 3) for plane in fitted.planes)
+
+    reopened = load_module_conversion(result.artifact_dir)
+    assert reopened.artifact_id == result.artifact_id
+    for expected, actual in zip(fitted.planes, reopened.weight("weight").planes):
+        assert actual.group_size == 64
+        torch.testing.assert_close(actual.trits, expected.trits, rtol=0, atol=0)
+        torch.testing.assert_close(actual.scales, expected.scales, rtol=0, atol=0)
+
+    inputs = torch.randn(5, 192)
+    reopened_model = load_quantized_module(model, result.artifact_dir)
+    hard_weight = AdditiveTernaryWeight(fitted.planes).dense(dtype=inputs.dtype)
+    expected_output = torch.nn.functional.linear(inputs, hard_weight)
+    torch.testing.assert_close(reopened_model(inputs), expected_output, rtol=0, atol=0)
