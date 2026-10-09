@@ -75,6 +75,16 @@ candidate-bound `distributed-training` release receipt and does not qualify
 multi-GPU execution, CUDA checkpointing, or performance. The `pytorch-hf` gate
 remains PARTIAL until its required two-or-more-GPU evidence is registered.
 
+At source `3a7c1309`, the two-rank CPU FSDP worker was rerun with
+`PYTHONPATH=crates/tritium-py/python
+/home/brianklam/.cache/tritium-py313-ci/bin/python -m pytest -q
+crates/tritium-py/tests/test_huggingface_distributed.py::test_two_rank_cpu_fsdp_step_and_sharded_state_resume`;
+it passed (`1 passed` in `2.62s`). The test exports by merging the already-saved
+sharded DCP checkpoint into a fresh ordinary model; it does not call the
+segfaulting PyTorch 2.11 CPU FSDP full-state API. This confirms the bounded CPU
+workaround, not that upstream full-state export is fixed or that accelerator
+DDP/FSDP release evidence is complete.
+
 The source-tree PyTorch dispatcher checks also passed on this branch head:
 `/home/brianklam/.cache/tritium-py313-ci/bin/python -m pytest -q
 crates/tritium-py/tests/test_torch_dispatch.py -k
