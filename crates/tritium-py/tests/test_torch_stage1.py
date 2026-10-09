@@ -276,6 +276,17 @@ def test_envelope_rejects_missing_rng_state(tmp_path):
         ckpt.load_envelope(path)
 
 
+def test_envelope_rejects_malformed_rng_state(tmp_path):
+    path = tmp_path / "malformed-rng.ckpt"
+    torch.save(
+        {"model": {}, "opt": {}, "config": {}, "step": 1, "rng": None},
+        path,
+    )
+
+    with pytest.raises(ValueError, match="rng.*mapping"):
+        ckpt.load_envelope(path)
+
+
 def test_envelope_extra_key_collision(tmp_path):
     with pytest.raises(ValueError, match="collide"):
         ckpt.save_envelope(

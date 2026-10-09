@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import random
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Callable
 
@@ -170,4 +171,6 @@ def load_envelope(path: str | os.PathLike, map_location: str = "cpu") -> dict[st
     ]
     if missing:
         raise ValueError(f"not a v1 envelope (missing {missing}): {path}")
+    if not isinstance(payload["rng"], Mapping):
+        raise ValueError(f"not a v1 envelope (rng state must be a mapping): {path}")
     return payload
